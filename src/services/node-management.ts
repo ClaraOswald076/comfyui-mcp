@@ -2372,6 +2372,60 @@ async function assertPackPresentAfterOp(
   }
 }
 
+/**
+ * Pre-op resolution for update/reinstall (#730's gate moved BEFORE the queue,
+ * codex gate round 8): the queued task must name the pack's MANAGER module
+ * name — a caller's registry id can differ from it ("comfyui-impact-pack" vs
+ * "ComfyUI-Impact-Pack"), and the legacy routes resolve by module, so an
+ * update enqueued under the registry id no-ops while the post-check still
+ * matches the pre-existing record by cnr_id and reports "updated". Resolving
+ * first also means a target that resolves nowhere is refused with NOTHING
+ * queued rather than after a meaningless queue cycle. Returns the tracked
+ * entry; throws the truthful refusal otherwise.
+ */
+async function resolveTrackedForOp(
+  id: string,
+  op: "update" | "reinstall",
+  base: string,
+): Promise<InstalledNode> {
+  const presence = await resolvePackPresence(id, base);
+  switch (presence.state) {
+    case "manager-listed":
+      return presence.node as InstalledNode;
+    case "on-disk":
+      throw new NodeManagementError(
+        presence.managerListReadable
+          ? `"${id}" is present on disk at ${presence.dir} but ComfyUI-Manager does not ` +
+            `track it (a Comfy Registry zip install or a manual copy), so Manager cannot ` +
+            `${op} it and NOTHING was queued. To move it, reinstall it from its registry id ` +
+            `or repository URL (install_custom_node / reinstall_custom_node), or — when ` +
+            `${presence.dir} is a git checkout — pull it there directly.`
+          : `"${id}" is present on disk at ${presence.dir}, but ComfyUI-Manager's ` +
+            `installed-pack list could not be read (${presence.listError}), so whether ` +
+            `Manager can ${op} it could NOT be determined and NOTHING was queued. Check ` +
+            `that ComfyUI-Manager is reachable, then retry.`,
+      );
+    case "absent":
+      throw new NodeManagementError(
+        presence.evidence === "manager+disk"
+          ? `"${id}" is not installed — it is in neither ComfyUI-Manager's installed-pack ` +
+            `list NOR on disk under ${presence.scanned} — so there is nothing to ${op} ` +
+            `and NOTHING was queued. Check the pack id with list_installed_nodes, or find ` +
+            `the right id with search_custom_nodes.`
+          : `"${id}" is not in ComfyUI-Manager's installed-pack list, so there is nothing ` +
+            `to ${op} and NOTHING was queued. NOTE: this check reads the Manager list only ` +
+            `(remote session — no disk check possible). Check the pack id with ` +
+            `list_installed_nodes.`,
+      );
+    case "unverifiable":
+      throw new NodeManagementError(
+        `Whether "${id}" is installed could not be determined (${presence.reason}), so ` +
+          `the ${op} was NOT queued — a ${op} queued blind would drain silently whether ` +
+          `or not it did anything. Check that ComfyUI-Manager is reachable, then retry.`,
+      );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // update
 // ---------------------------------------------------------------------------
@@ -2600,8 +2654,14 @@ async function updateCustomNodeImpl(
     const { used } = await enqueueUpdateAll(mode, base);
     status = await runManagerQueue(used, base);
   } else {
+    // Resolve the target BEFORE queueing (codex gate round 8): the update body
+    // must name the pack's MANAGER module name — a caller's registry id can
+    // differ from it, a legacy route resolves by module, and a no-op update
+    // would still pass a post-check that matches by cnr_id. A target that
+    // resolves nowhere is refused with NOTHING queued.
+    const tracked = await resolveTrackedForOp(id, "update", base);
     // Single-pack update → unified task; UpdatePackParams uses node_name/node_ver.
-    status = await queueManagerTask("update", { node_name: id }, base);
+    status = await queueManagerTask("update", { node_name: tracked.module }, base);
     // VERIFY (#730): the drain passes trivially for an id Manager never
     // enqueued (total_count 0 — the "Queued + updated" lie in the issue).
     // Require the pack to resolve SOMEWHERE post-op before claiming success.
@@ -2715,7 +2775,12 @@ async function reinstallCustomNodeImpl(
   // cannot send the install to a different ComfyUI — which would leave the
   // user's server uninstalled while reporting success for another.
   const base = managerBaseUrl();
-  await queueManagerTask("uninstall", { node_name: id }, base);
+  // Resolve BEFORE the uninstall half (codex gate round 8): it must name the
+  // Manager module name, and a nowhere-resolving id is refused with NOTHING
+  // queued — previously both cycles no-op'd and the post-check could still
+  // match a pre-existing record by cnr_id.
+  const tracked = await resolveTrackedForOp(id, "reinstall", base);
+  await queueManagerTask("uninstall", { node_name: tracked.module }, base);
   const status = await queueManagerTask("install", {
     id,
     version: version ?? "latest",
@@ -3196,6 +3261,21 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
       };
     }
     if (disk?.state === "not-found") {
+      if (presence.state !== "on-disk" && presence.state !== "manager-listed") {
+        // The directory's absence may PREDATE the call — with the pre-state
+        // never established, "Uninstalled" would fabricate a transition.
+        return {
+          mechanism: "comfy-cli",
+          message:
+            `comfy-cli reported the uninstall of "${id}" successful, but whether the ` +
+            `pack was installed beforehand could NOT be established ` +
+            `(${presence.state === "unverifiable" ? presence.reason : "pre-state unknown"}), ` +
+            `and no matching directory exists under ${disk.scanned} NOW — which may ` +
+            `predate the call. NOT claiming an uninstall happened; if the pack was ` +
+            `never there, nothing needed removing.`,
+          details: out.trim(),
+        };
+      }
       return {
         mechanism: "comfy-cli",
         message:

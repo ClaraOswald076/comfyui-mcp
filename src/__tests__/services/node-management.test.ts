@@ -956,25 +956,45 @@ describe("node-management service", () => {
       expect(params).toMatchObject({ node_name: "my-pack" });
     });
 
-    it("fails truthfully for an id that resolves NOWHERE (#730: queue-drain is not proof)", async () => {
+    it("fails truthfully for an id that resolves NOWHERE — before anything is queued (#730: queue-drain is not proof)", async () => {
       // Live evidence: the Manager drains "done" with total_count 0 for an
       // unknown id, and update used to report "Queued + updated" anyway. The
-      // pack resolves nowhere post-op — Manager list empty AND an enumerable
-      // custom_nodes without it (#797 disk evidence) → hard failure, no
-      // success claim.
+      // target now resolves up front — Manager list empty AND an enumerable
+      // custom_nodes without it (#797 disk evidence) → refusal, NOTHING queued.
       fsCtl.readdirSync = () => [];
-      stubFetch({ installedBody: {} });
+      const { calls } = stubFetch({ installedBody: {} });
       const err = await updateCustomNode({ id: "mcp-sweep-nonexistent-pack" }).catch(
         (e: Error) => e,
       );
       expect(err).toBeInstanceOf(NodeManagementError);
-      expect((err as Error).message).toMatch(/not present afterward/);
+      expect((err as Error).message).toMatch(/not installed/);
+      expect((err as Error).message).toMatch(/NOTHING was queued/);
       expect((err as Error).message).not.toMatch(/updated/i);
+      expect(
+        calls.some(
+          (c) => (c.body as { kind?: string } | undefined)?.kind === "update",
+        ),
+      ).toBe(false);
+    });
+
+    it("update sends the MANAGER module name as node_name when it differs from the registry id", async () => {
+      const { calls } = stubFetch({
+        installedBody: {
+          "ComfyUI-Impact-Pack": { ver: "8.28.3", cnr_id: "comfyui-impact-pack", enabled: true },
+        },
+      });
+      const res = await updateCustomNode({ id: "comfyui-impact-pack" });
+      expect(res.mechanism).toBe("manager-http");
+      expect(taskOf(calls, "update").params).toMatchObject({
+        node_name: "ComfyUI-Impact-Pack",
+      });
     });
 
     it("still succeeds for an installed-but-not-in-registry (git-cloned) pack", async () => {
       // The #730 gate must not break packs the registry does not know: they
-      // match the installed list by module/auxId spellings.
+      // match the installed list by module/auxId spellings. The queued task
+      // names the MANAGER MODULE (the folder), which is what the routes
+      // resolve — not the caller's aux-id spelling.
       const { calls } = stubFetch({
         installedBody: {
           "some-git-node": { ver: "abc1234", aux_id: "user/some-git-node", enabled: true },
@@ -984,7 +1004,7 @@ describe("node-management service", () => {
       expect(res.mechanism).toBe("manager-http");
       expect(res.message).toMatch(/Queued \+ updated/);
       expect(taskOf(calls, "update").params).toMatchObject({
-        node_name: "user/some-git-node",
+        node_name: "some-git-node",
       });
     });
 
@@ -1027,17 +1047,23 @@ describe("node-management service", () => {
       });
     });
 
-    it("fails truthfully for an id that resolves NOWHERE (#730)", async () => {
+    it("fails truthfully for an id that resolves NOWHERE — before anything is queued (#730)", async () => {
       // Manager list empty AND an enumerable custom_nodes without the pack
-      // (#797 disk evidence) — absence asserted from BOTH sources.
+      // (#797 disk evidence) — refused up front, NOTHING queued.
       fsCtl.readdirSync = () => [];
-      stubFetch({ installedBody: {} });
+      const { calls } = stubFetch({ installedBody: {} });
       const err = await reinstallCustomNode({ id: "mcp-sweep-nonexistent-pack" }).catch(
         (e: Error) => e,
       );
       expect(err).toBeInstanceOf(NodeManagementError);
-      expect((err as Error).message).toMatch(/not present afterward/);
+      expect((err as Error).message).toMatch(/not installed/);
+      expect((err as Error).message).toMatch(/NOTHING was queued/);
       expect((err as Error).message).not.toMatch(/reinstalled/i);
+      expect(
+        calls.some(
+          (c) => (c.body as { kind?: string } | undefined)?.kind === "uninstall",
+        ),
+      ).toBe(false);
     });
 
     it("still succeeds for an installed-but-not-in-registry (git-cloned) pack", async () => {
@@ -1177,21 +1203,24 @@ describe("node-management service", () => {
         (e: Error) => e,
       );
       expect(err).toBeInstanceOf(NodeManagementError);
-      expect((err as Error).message).toMatch(/not present afterward/);
+      expect((err as Error).message).toMatch(/not installed/);
       // Says the disk was actually checked — not a Manager-list-only verdict.
       expect((err as Error).message).toMatch(/on disk under/);
+      expect((err as Error).message).toMatch(/NOTHING was queued/);
     });
 
     it("an unreadable disk check is UNVERIFIABLE, never absence", async () => {
       // readdirSync delegates to the real fs, which throws on the fake root —
-      // the disk could not answer, so the verdict must stay "could not verify".
+      // the disk could not answer, so the verdict must stay "could not
+      // determine", and nothing is queued.
       stubFetch({ installedBody: {} });
       const err = await updateCustomNode({ id: "mcp-sweep-nonexistent-pack" }).catch(
         (e: Error) => e,
       );
       expect(err).toBeInstanceOf(NodeManagementError);
-      expect((err as Error).message).toMatch(/could NOT be verified/);
-      expect((err as Error).message).not.toMatch(/not present afterward/);
+      expect((err as Error).message).toMatch(/could not be determined/);
+      expect((err as Error).message).toMatch(/NOTHING was queued|NOT queued/);
+      expect((err as Error).message).not.toMatch(/not installed —/);
     });
 
     it("on-disk pack + UNREADABLE Manager list → unverifiable, never 'Manager does not track it'", async () => {
@@ -1222,7 +1251,7 @@ describe("node-management service", () => {
       );
       expect(err).toBeInstanceOf(NodeManagementError);
       expect((err as Error).message).toMatch(/present on disk/);
-      expect((err as Error).message).toMatch(/could NOT be verified/);
+      expect((err as Error).message).toMatch(/could NOT be determined/);
       expect((err as Error).message).not.toMatch(/does not track/);
       expect((err as Error).message).not.toMatch(/resolved to NOTHING/);
     });
@@ -1532,9 +1561,9 @@ describe("node-management service", () => {
       expect(mockedExec).not.toHaveBeenCalled();
     });
 
-    it("uninstall via comfy-cli verifies on DISK when the Manager list is unreadable", async () => {
-      // The CLI works on the local install even when Manager's list is down —
-      // but then the postcondition is checked against the filesystem.
+    it("uninstall via comfy-cli with an unreadable list and NO pack anywhere is UNVERIFIED, not 'Uninstalled'", async () => {
+      // Absent before AND after: the post-op absence may predate the call, so
+      // claiming an uninstall would fabricate a transition.
       fsCtl.readdirSync = () => [];
       mockedExec.mockReturnValue(cliEnvelope({ message: "uninstalled" }) as never);
       vi.stubGlobal(
@@ -1557,8 +1586,8 @@ describe("node-management service", () => {
       );
       const res = await uninstallCustomNode({ id: "my-pack", useCmCli: true });
       expect(res.mechanism).toBe("comfy-cli");
-      expect(res.message).toMatch(/no matching pack directory remains/);
-      expect(res.message).toMatch(/NOT checked/);
+      expect(res.message).toMatch(/NOT claiming an uninstall happened/);
+      expect(res.message).not.toMatch(/no matching pack directory remains/);
     });
 
     it("uninstall via comfy-cli proceeds with an unreadable list when the pack IS on disk, verified on disk", async () => {
