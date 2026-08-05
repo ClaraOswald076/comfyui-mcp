@@ -391,6 +391,14 @@ describe("locality: 'could not look' is not 'it is not there'", () => {
   // The two states send the reader to two different fixes, so they must read differently.
 
   it("says the lookup FAILED (and does not claim a container) when realpath errors non-ENOENT", async () => {
+    // A local target must be configured for the READ assertion below: the display-only
+    // fallback lands on the local auto target, and with none configured `standaloneRoot`
+    // refuses on its own. Without this the test passed on a developer machine that
+    // happens to have a real ComfyUI Desktop config on disk and failed in CI — a test
+    // whose outcome depended on the host, which is not a test of this code at all.
+    const localRoot = await trackTmp();
+    config.comfyuiPath = localRoot;
+    process.env.COMFYUI_PATH = localRoot;
     const live = await trackTmp();
     const mainPy = join(live, "main.py");
     await writeFile(mainPy, "# comfyui\n", "utf-8");
