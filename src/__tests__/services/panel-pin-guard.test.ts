@@ -547,13 +547,19 @@ describe("reclaimAbandonedPanelLock — the explicit recovery for a wedged lock 
     ).resolves.toBe("recovered");
   });
 
-  it("REFUSES an old lock whose owner is still ALIVE, and leaves it in place", async () => {
+  it("REFUSES an old lock whose recorded pid still exists, and leaves it in place", async () => {
     // Age alone is not abandonment: this is exactly the lock a slow-but-live
     // operation holds, and reclaiming it would run two mutations at once.
+    //
+    // The REFUSAL is unchanged; what changed is the reason it gives. This used to
+    // assert "STILL RUNNING", which a bare `process.kill(pid, 0)` cannot support
+    // for a lock this old — the pid may since have been reused. Refusing on an
+    // honest "undetermined" protects the same live operation without making a
+    // claim the evidence does not carry.
     const path = await plantLock(JSON.stringify({ pid: process.pid }), 60 * 60_000);
     const res = reclaimAbandonedPanelLock();
     expect(res.outcome).toBe("refused");
-    expect(res.detail).toMatch(/STILL RUNNING/);
+    expect(res.detail).toMatch(/cannot be determined/i);
     expect(existsSync(path)).toBe(true);
   });
 
@@ -1109,6 +1115,36 @@ describe("#836 — a reclaimable lock needs ownership proofs everywhere", () => 
     void released;
   });
 
+  it("a lock that lands in the release GAP is restored, not deleted", async () => {
+    // The decisive interleaving, which the sibling test does not reach: there the
+    // replacement is written BEFORE release begins, so even a plain
+    // read-then-check would catch it. Here it lands in the release itself — the
+    // window that makes read-then-unlink insufficient, because a reclaimer can
+    // move the verified file aside and a third agent can take the freed pathname
+    // before the unlink.
+    //
+    // The hook fires as the release is about to take the path aside, so what it
+    // actually moves is the INTRUDER's lock — precisely the "this is not mine"
+    // case. It must go back, not into the bin.
+    const path = panelLockPath();
+    const intruder = JSON.stringify({ pid: process.pid, startedAt: "gap", token: "INTRUDER" });
+    fsyncTracker.onBeforeRename = (from) => {
+      if (from === path) writeFileSync(path, intruder);
+    };
+    try {
+      await withPanelMutationLock(async () => {
+        /* the guarded work is irrelevant; the release is the subject */
+      });
+      // Restored intact. A bare rmSync — or a read-then-unlink that lost the race
+      // — would have removed a lock its owner still believes it holds.
+      expect(existsSync(path)).toBe(true);
+      expect(JSON.parse(readFileSync(path, "utf-8")).token).toBe("INTRUDER");
+    } finally {
+      fsyncTracker.onBeforeRename = undefined;
+      rmSync(path, { force: true });
+    }
+  });
+
   it("the release DOES delete its own lock — the ownership check must not leak locks", async () => {
     // The other direction: an ownership check that never matches would leave a
     // lock behind after every operation and wedge the next one. This is what
@@ -1156,6 +1192,46 @@ describe("#836 — a reclaimable lock needs ownership proofs everywhere", () => 
     }
   });
 
+  it("does NOT cry phantom when the rollback ALREADY restored before it failed", async () => {
+    // `writeFileDurable` renames before it fsyncs the directory, so a throw from
+    // that last step can mean the rollback has ALREADY put the prior records back.
+    // Warning on the exception alone produced a false alarm — and with a real
+    // same-kind predecessor restored, the "delete that record" advice pointed at
+    // someone's LIVE record (codex gate). The disk is what settles it.
+    const first = recordPanelPendingOp("update-all", "first", 60_000);
+    const dir = dirname(panelPendingOpsPath());
+    // `failFsyncExact` is ONE-SHOT, so arming it once only fails our own write and
+    // lets the rollback succeed — which passes this assertion without ever
+    // reaching the guard it is about. Re-arm it for the ROLLBACK's write, so the
+    // rollback ALSO throws, and does so AFTER its rename has already restored the
+    // predecessor. That is the exact shape the false alarm came from.
+    let renames = 0;
+    fsyncTracker.failFsyncExact = { path: dir };
+    fsyncTracker.onBeforeRename = (_from, to) => {
+      if (to === panelPendingOpsPath() && ++renames >= 2) {
+        fsyncTracker.failFsyncExact = { path: dir };
+      }
+    };
+    try {
+      let message = "";
+      try {
+        recordPanelPendingOp("update-all", "second", 60_000);
+      } catch (e) {
+        message = e instanceof Error ? e.message : String(e);
+      }
+      expect(message).toMatch(/Could not persist the pending update-all marker/);
+      // The predecessor really is back...
+      const active = activePanelPendingOps();
+      expect(active.map((o) => o.id)).toEqual([first.id]);
+      // ...so there is no phantom, and the refusal must not claim one.
+      expect(message).not.toMatch(/may remain at/i);
+      expect(message).not.toMatch(/ALSO failed/i);
+    } finally {
+      fsyncTracker.failFsyncExact = undefined;
+      fsyncTracker.onBeforeRename = undefined;
+    }
+  });
+
   it("an OLD lock whose pid exists is reported as UNDETERMINED, not 'STILL RUNNING'", async () => {
     // PID recycling. `process.kill(pid, 0)` says a process with that NUMBER
     // exists; after a crashed holder's number is reused that is not our holder.
@@ -1177,16 +1253,21 @@ describe("#836 — a reclaimable lock needs ownership proofs everywhere", () => 
     expect(existsSync(path)).toBe(true);
   });
 
-  it("a RECENT lock whose pid exists still reports STILL RUNNING — the doubt is age-scoped", async () => {
-    // The inverse: within a plausible operation window, an existing pid IS
-    // evidence. Widening the doubt to every age would refuse to distinguish a
-    // live operation from a recycled number, which helps nobody.
-    await plantLock(
-      JSON.stringify({ pid: process.pid, startedAt: "recent" }),
-      45 * 60_000, // older than the stale window, far short of the reuse doubt
-    );
+  it("a lock INSIDE the stale window is refused on AGE, before liveness is consulted at all", async () => {
+    // The inverse direction, corrected. An earlier draft of this test asserted
+    // "STILL RUNNING" for a 45-minute-old lock — but the reuse doubt is bounded by
+    // STALE_LOCK_MS (10 minutes), the same line the age check draws, so 45 minutes
+    // is already past it. There is no age at which the reclaim path both consults
+    // liveness AND can trust the pid, which is why that branch was removed rather
+    // than left as unreachable code that reads like a guarantee.
+    //
+    // What this pins is that a young lock never gets there: it is refused for
+    // being young, which is a fact about the lock and not a guess about a pid.
+    await plantLock(JSON.stringify({ pid: process.pid, startedAt: "recent" }), 60_000);
     const res = reclaimAbandonedPanelLock();
     expect(res.outcome).toBe("refused");
-    expect(res.detail).toMatch(/STILL RUNNING/);
+    expect(res.detail).toMatch(/inside the/i);
+    expect(res.detail).not.toMatch(/STILL RUNNING/);
+    expect(res.detail).not.toMatch(/cannot be determined/i);
   });
 });

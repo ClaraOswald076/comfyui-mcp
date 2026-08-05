@@ -322,15 +322,20 @@ function pidLiveness(pid: unknown, ageMs: number): boolean | "unsure" {
     exists = (err as NodeJS.ErrnoException)?.code === "EPERM";
   }
   if (!exists) return false;
-  return ageMs > PID_REUSE_DOUBT_MS ? "unsure" : true;
+  // The boundary is STALE_LOCK_MS, not an invented interval (codex gate). Six
+  // hours was indefensible in both directions: PIDs can be recycled far sooner,
+  // and a genuine operation running longer would have been called undetermined.
+  //
+  // STALE_LOCK_MS is the line this module already draws for "no legitimate panel
+  // operation is still running", and it is exactly the right one here. Inside it,
+  // an existing pid IS evidence about our holder — the operation could still be
+  // going. Outside it, the holder should have finished, so an existing pid is
+  // equally well explained by a crash plus reuse, and claiming either is a guess.
+  //
+  // Note the reclaim path refuses on age before it ever consults liveness, so
+  // "unsure" only ever describes a lock old enough for the doubt to be real.
+  return ageMs > STALE_LOCK_MS ? "unsure" : true;
 }
-
-/**
- * Past this age, "a process with that pid exists" stops being evidence that OUR
- * holder is alive: no panel operation runs this long, so a crash plus PID reuse
- * is at least as likely an explanation as a still-running holder.
- */
-const PID_REUSE_DOUBT_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 /**
  * A lock is PROVABLY abandoned only when it is BOTH older than this AND owned
@@ -540,12 +545,12 @@ export function reclaimAbandonedPanelLock(): PanelLockReclaimResult {
         `delete ${path} by hand.`,
     );
   }
-  if (obs.alive) {
-    return refuse(
-      `it is ${describeLockAge(obs.ageMs)} old, but its owner — pid ${obs.pid} — is ` +
-        `STILL RUNNING, so a panel operation may be in progress right now.`,
-    );
-  }
+  // NOTE: there is deliberately no `obs.alive === true` branch here. With the
+  // reuse doubt bounded by STALE_LOCK_MS — the same line the age check above
+  // draws — any lock that reaches this point is already past it, so liveness is
+  // "unsure" or a proven dead pid. A `STILL RUNNING` branch would be unreachable
+  // code that reads like a live guarantee. `describeLock` still reports a running
+  // owner for YOUNGER locks, where an existing pid really is evidence.
 
   // Provably abandoned. Rename aside, verify the moved file is the EXACT bytes
   // that were judged abandoned, and only then delete.
@@ -724,56 +729,86 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
         throw initErr;
       }
       return () => {
-        // PROVE OWNERSHIP BEFORE DELETING (codex gate P0). This used to be a bare
-        // `rmSync`, which deletes whatever is at the path — including a lock some
-        // OTHER process took after ours was reclaimed. The sequence the gate walked:
-        // two unlocks observe the same stale lock, one reclaims it, B acquires a
-        // fresh lock, the other unlock renames B's lock aside, C acquires the freed
-        // path — and then this closure deletes C's lock while B and C both believe
-        // they hold it. The bug being fixed leaves a lock stuck, which is
-        // recoverable; this leaves the door open with two writers inside, which is
-        // worse.
+        // PROVE OWNERSHIP BEFORE DELETING — and do it in a way a concurrent
+        // reclaim cannot invalidate (codex gate P0, twice).
         //
-        // Same invariant as panel #621, from the other side: a lock only has an
-        // owner if EVERY path through it proves ownership. There a holder
-        // registered before its claim was true; here a holder releases a claim it
-        // no longer holds.
-        let held: string | undefined;
+        // A bare `rmSync(path)` deletes whatever is at the path, including a lock
+        // another process took after ours was reclaimed. Reading the token first
+        // is not enough either: read-then-unlink is TOCTOU, because a reclaimer
+        // can rename the verified file aside and a third agent can take the freed
+        // pathname in the gap — so the unlink still lands on a stranger.
+        //
+        // RENAME FIRST. That atomically removes whatever is at the path and puts
+        // it somewhere only we know, so the thing we then inspect is the thing we
+        // will act on. It is the same technique `reclaimAbandonedPanelLock` uses
+        // for the same reason, including the hard-link restore that can never
+        // overwrite a lock that landed in the gap.
+        const claim = `${path}.release-${randomUUID()}`;
         try {
-          held = readFileSync(path, "utf-8");
+          renameSync(path, claim);
         } catch (err) {
           if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return; // already gone
           logger.warn(
-            `[panel] could not read the panel op lock at ${path} to confirm it is still ` +
-              `ours (${err instanceof Error ? err.message : String(err)}); leaving it in ` +
-              `place rather than deleting a lock that may belong to another operation. ` +
-              `If no panel operation is running, delete that file by hand.`,
+            `[panel] could not take the panel op lock at ${path} aside to release it (${
+              err instanceof Error ? err.message : String(err)
+            }); it may still be held. If no panel operation is running, delete that file.`,
           );
           return;
+        }
+
+        // The path is free from here on, whatever we decide — so the only
+        // remaining question is what to do with the file in hand.
+        let held: string | undefined;
+        for (let attempt = 0; attempt < 2 && held === undefined; attempt++) {
+          try {
+            held = readFileSync(claim, "utf-8");
+          } catch {
+            held = undefined; // one retry: a transient read must not decide this
+          }
         }
         let heldToken: unknown;
-        try {
-          heldToken = (JSON.parse(held) as { token?: unknown }).token;
-        } catch {
-          heldToken = undefined;
+        if (held !== undefined) {
+          try {
+            heldToken = (JSON.parse(held) as { token?: unknown }).token;
+          } catch {
+            heldToken = undefined;
+          }
         }
-        if (heldToken !== token) {
-          // Not ours any more. Dropping the in-memory claim is right; deleting the
-          // file is not.
-          logger.warn(
-            `[panel] the panel op lock at ${path} is no longer the one this operation ` +
-              `took (it was reclaimed or replaced while the operation ran), so it was ` +
-              `left alone. Another operation may now hold it.`,
-          );
+
+        if (held !== undefined && heldToken === token) {
+          // Ours. Deleting the file we are holding aside cannot touch anyone else.
+          try {
+            rmSync(claim, { force: true });
+          } catch (err) {
+            logger.warn(
+              `[panel] released the panel op lock but could not delete ${claim}: ${
+                err instanceof Error ? err.message : String(err)
+              }. It is no longer at ${path}, so it blocks nothing; delete it at your leisure.`,
+            );
+          }
           return;
         }
+
+        // NOT ours, or unidentifiable. Either way we must not destroy it — put it
+        // back. `linkSync` (never `renameSync`) so a lock that landed at the path
+        // in the meantime is not overwritten.
         try {
-          rmSync(path, { force: true });
-        } catch (err) {
+          linkSync(claim, path);
+          rmSync(claim, { force: true });
           logger.warn(
-            `[panel] could not remove the panel op lock at ${path}: ${
-              err instanceof Error ? err.message : String(err)
-            } (use the restart-and-recovery instructions from the next panel operation).`,
+            `[panel] the panel op lock at ${path} was ${
+              held === undefined
+                ? "unreadable at release"
+                : "no longer the one this operation took (it was reclaimed or replaced while the operation ran)"
+            }, so it was restored rather than deleted. Another operation may hold it.`,
+          );
+        } catch {
+          logger.warn(
+            `[panel] the panel op lock at ${path} was ${
+              held === undefined ? "unreadable" : "not the one this operation took"
+            } at release, and restoring it failed — most likely because another lock ` +
+              `already occupies the path, which is the outcome that matters. Nothing was ` +
+              `deleted; the file taken aside is preserved at ${claim}.`,
           );
         }
       };
@@ -1233,10 +1268,41 @@ export function recordPanelPendingOp(
           }
         }
       } catch (rollbackErr) {
-        leftover =
-          `rolling it back ALSO failed (${
-            rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)
-          })`;
+        // DO NOT WARN ON THE FAILURE ALONE (codex gate). `writeFileDurable`
+        // renames before it fsyncs the directory, so a throw from that last step
+        // means the rollback may ALREADY have restored the prior records. Warning
+        // regardless produced a false alarm that told the user to delete a
+        // "phantom" — which, with a real same-kind predecessor restored, would
+        // have been someone's live record. Ask the disk what actually happened.
+        let ourRecordStillThere: boolean | undefined;
+        try {
+          const after = readPanelPendingOpsFile();
+          // No "impossible value" sentinel here: an op with no id cannot be
+          // matched by id at all, so that is its own answer — undetermined.
+          // Reaching for a placeholder is how a literal NUL got into this file
+          // once already, which made the whole source read as git-binary.
+          ourRecordStillThere = after.unreadable
+            ? undefined
+            : op.id === undefined
+              ? undefined
+              : after.ops.some((o) => o.id === op.id);
+        } catch {
+          ourRecordStillThere = undefined;
+        }
+        if (ourRecordStillThere === true) {
+          leftover =
+            `rolling it back ALSO failed (${
+              rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)
+            })`;
+        } else if (ourRecordStillThere === undefined) {
+          leftover =
+            `rolling it back also failed (${
+              rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)
+            }) and the file could not be read back, so whether this call's record ` +
+            `remains is UNKNOWN`;
+        }
+        // ourRecordStillThere === false: the rollback landed before the failure.
+        // Nothing was left behind, so nothing to warn about.
       }
     }
     throw new Error(
