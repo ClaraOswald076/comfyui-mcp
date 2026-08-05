@@ -36,9 +36,10 @@
  * model-facing text untouched.
  *
  * COVERAGE IS DELIBERATELY PARTIAL. The beginner path is covered end to end;
- * expert surfaces (training, RunPod, comfy-cli's 26 actions, node authoring) are
- * left on the skeleton until someone writes examples worth reading. A missing
- * example is an honest gap; a made-up one is a bug.
+ * expert surfaces (training, comfy-cli's 26 actions, node authoring) are left on
+ * the skeleton until someone writes examples worth reading. A missing example is
+ * an honest gap; a made-up one is a bug. RunPod left that list in 0.50.0 — see
+ * the note above its entries for why a skeleton stopped being adequate there.
  */
 
 export interface ToolDocExample {
@@ -790,6 +791,115 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
           "it with `action: \"run_status\"` and the same app_id plus that " +
           "prompt_id. The odd-looking `\"6.text\"` key is nodeId.widget — the " +
           "form from `action: \"get\"` tells you which keys exist.",
+      },
+    ],
+  },
+
+  // -------------------------------------------------------------------------
+  // RunPod (cloud GPU)
+  //
+  // The header above calls RunPod an expert surface left on the skeleton. It is
+  // no longer left there, and the reason is specific to the 0.50.0 fold: while
+  // each pod action was its own tool, `pod_id` was schema-REQUIRED, so the
+  // generated skeleton included it and copying the skeleton at least addressed a
+  // pod. Folding eleven tools into two makes `action` the only required field,
+  // so the skeleton collapses to `{"action": "watch"}` — a call that
+  // deterministically returns the handler's missing-field error. For a surface
+  // that rents billed hardware, "the documented call does not work" is not an
+  // acceptable gap, so these are real calls. Every `args` object below is
+  // validated against the live zod schema at generation time.
+  // -------------------------------------------------------------------------
+  runpod: {
+    gloss:
+      "Rent a GPU in the cloud and render on it when your own card cannot fit " +
+      "the job, then switch back. One tool for the whole pod lifecycle, chosen " +
+      "with `action`. Pods bill by the hour from the moment they boot, so the " +
+      "two actions that start one — `create` and `start` — are the ones to be " +
+      "deliberate about, and `stop` is how the meter stops.",
+    examples: [
+      {
+        ask: "What pods have I got out there?",
+        args: { action: "list" },
+        returns:
+          "Every pod on your RunPod account with its id, name, state, GPU and " +
+          "hourly cost — including any you forgot was running. Read-only.",
+      },
+      {
+        ask: "My 8 GB card can't do this video. Rent me a 4090.",
+        args: { action: "create", gpu_type: "NVIDIA GeForce RTX 4090" },
+        returns:
+          "A new pod deploying from this project's template, with its id and " +
+          "hourly rate. It takes 1-3 minutes to boot; connect to it after that.",
+        caution:
+          "This spends real money and starts billing as soon as the pod boots. " +
+          "Stop it with `action: \"stop\"` when you are done — a forgotten pod " +
+          "bills all night.",
+      },
+      {
+        ask: "Point everything at that pod.",
+        args: { action: "connect", pod_id: "qk29vt4mzx8lb3" },
+        returns:
+          "Confirmation that the pod's ComfyUI answered and that this session " +
+          "now renders there — every other tool follows it until you switch back.",
+      },
+      {
+        ask: "I'm done with the cloud, go back to my own machine.",
+        args: { action: "use_local" },
+        returns:
+          "Confirmation that rendering is back on the local ComfyUI. If a pod " +
+          "was in use it says so — it is still running, and still billing.",
+        caution:
+          "This does NOT stop the pod. Switching back to local leaves the pod " +
+          "running and charging; use `action: \"stop\"` to end billing.",
+      },
+      {
+        ask: "Shut the pod down, I don't want to pay for it overnight.",
+        args: { action: "stop", pod_id: "qk29vt4mzx8lb3" },
+        returns:
+          "Confirmation that the GPU was released and billing ended. The pod " +
+          "and its disk are kept, so you can start it again later.",
+        caution:
+          "Anything rendering on that pod dies with it. Check nothing is in " +
+          "flight first — `action: \"status\"` shows what the pod is doing.",
+      },
+    ],
+  },
+
+  runpod_watch: {
+    gloss:
+      "The live readout for a rented pod — what it is doing, what it is costing " +
+      "— plus the \"why won't it connect?\" check. These do not deploy or resume " +
+      "a pod; that is the `runpod` tool. Watching a pod DOES arm its idle " +
+      "auto-stop, which is a cost guard, not a surprise: an idle watched pod " +
+      "stops itself rather than billing for nothing.",
+    examples: [
+      {
+        ask: "Keep an eye on that pod while it boots.",
+        args: { action: "watch", pod_id: "qk29vt4mzx8lb3" },
+        returns:
+          "Live status starts appearing in the control panel — state, GPU and " +
+          "VRAM use, uptime, hourly cost — refreshed every ~15 seconds.",
+        caution:
+          "Watching also arms the idle auto-stop: if that pod's ComfyUI sits " +
+          "idle past the configured timeout it is stopped to save money.",
+      },
+      {
+        ask: "It says the pod is running but nothing connects. Why?",
+        args: { action: "troubleshoot", pod_id: "qk29vt4mzx8lb3" },
+        returns:
+          "The specific blocker and what to do about it — pod not running, no " +
+          "GPU attached, ComfyUI's port not exposed, or ComfyUI simply not " +
+          "answering yet. Read-only.",
+      },
+      {
+        ask: "Stop showing me that pod, it's cluttering the panel.",
+        args: { action: "unwatch" },
+        returns:
+          "Confirmation that the broadcast stopped, and a reminder that the pod " +
+          "itself is still running.",
+        caution:
+          "This turns the idle auto-stop OFF as well, so an unwatched pod bills " +
+          "until you stop it yourself.",
       },
     ],
   },
