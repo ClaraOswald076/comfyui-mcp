@@ -93,6 +93,46 @@ describe("secret-store test isolation", () => {
     }
   });
 
+  it("keys off the RUNNER, not off environment variables a real user can have set", async () => {
+    // The first version of this guard asked `NODE_ENV === "test" || VITEST ||
+    // VITEST_WORKER_ID`. Those are ORDINARY ENVIRONMENT VARIABLES: a user with a
+    // leftover `VITEST` export, or NODE_ENV=test inherited from an adjacent
+    // project, was REFUSED when saving their own API key (codex gate). Refusing
+    // a real user their credential is worse than the accidental store overwrite
+    // this guard replaced, so it must key off something only the runner makes.
+    //
+    // Asked directly, because it cannot be asked any other way: vitest's own
+    // `__vitest_index__` global is non-configurable, so a test running under
+    // vitest cannot remove it to see what the answer falls back to. Handing the
+    // predicate an EMPTY scope is that same question without the fight.
+    const { runningUnderTestRunner } = await import("../../services/panel-secrets.js");
+    const saved = {
+      VITEST: process.env.VITEST,
+      VITEST_WORKER_ID: process.env.VITEST_WORKER_ID,
+      NODE_ENV: process.env.NODE_ENV,
+    };
+    try {
+      // A plausible real user's shell:
+      process.env.VITEST = "true";
+      process.env.VITEST_WORKER_ID = "1";
+      process.env.NODE_ENV = "test";
+      // No runner in this scope, so the answer must be NO — whatever the shell
+      // says. If the predicate consults any of those variables, this fails.
+      expect(runningUnderTestRunner({})).toBe(false);
+      // And a real runner is still detected, from its own marker alone.
+      expect(runningUnderTestRunner({ __vitest_worker__: {} })).toBe(true);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+    // ...and the guard really is wired to that predicate: under THIS runner
+    // (where the marker genuinely is present) an unredirected write is refused.
+    // That case is covered by the test above.
+    expect(runningUnderTestRunner()).toBe(true);
+  });
+
   it("allows the write once the store IS redirected", async () => {
     const { setComfyuiSecret } = await import("../../services/panel-secrets.js");
     const saved = process.env.COMFYUI_MCP_ENV_FILE;

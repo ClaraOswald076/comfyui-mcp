@@ -159,7 +159,7 @@ describe("panel-secrets (canonical .env store)", () => {
       setComfyuiSecret("CIVITAI_API_TOKEN", "tok", { requested: true });
       const cb = vi.fn();
       const off = onComfyuiSecretsChanged(cb);
-      expect(removeComfyuiSecret("CIVITAI_API_TOKEN")).toBe(true);
+      expect(removeComfyuiSecret("CIVITAI_API_TOKEN").changed).toBe(true);
       off();
       expect(cb).toHaveBeenCalledTimes(1);
       expect(cb).toHaveBeenLastCalledWith(expect.objectContaining({ requested: false }));
@@ -168,11 +168,11 @@ describe("panel-secrets (canonical .env store)", () => {
 
   it("removes a secret from .env + process.env and reports absence", () => {
     setComfyuiSecret("CIVITAI_API_TOKEN", "tok");
-    expect(removeComfyuiSecret("CIVITAI_API_TOKEN")).toBe(true);
+    expect(removeComfyuiSecret("CIVITAI_API_TOKEN").changed).toBe(true);
     expect(loadComfyuiSecretEnv()).toEqual({});
     expect(process.env.CIVITAI_API_TOKEN).toBeUndefined();
     expect(readFileSync(envPath, "utf-8")).not.toMatch(/CIVITAI_API_TOKEN/);
-    expect(removeComfyuiSecret("CIVITAI_API_TOKEN")).toBe(false);
+    expect(removeComfyuiSecret("CIVITAI_API_TOKEN").changed).toBe(false);
   });
 
   it("rejects an invalid env var name without writing", () => {
@@ -256,7 +256,7 @@ describe("panel-secrets (canonical .env store)", () => {
       process.env.CIVITAI_API_TOKEN = "civ-legacy";
 
       const { removeEnvSecret, migrateSecretsToEnv } = await import("../../services/panel-secrets.js");
-      expect(removeEnvSecret("CIVITAI_API_TOKEN")).toBe(true);
+      expect(removeEnvSecret("CIVITAI_API_TOKEN").changed).toBe(true);
       // Gone from .env AND from the JSON map.
       expect(readFileSync(envPath, "utf-8")).not.toMatch(/CIVITAI_API_TOKEN/);
       const json = JSON.parse(readFileSync(jsonPath, "utf-8"));

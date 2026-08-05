@@ -29,6 +29,11 @@ const fsState = vi.hoisted(() => ({
    *  compare-and-swap re-read, which is the window the CAS exists to close.
    *  Fires immediately BEFORE the given store-read index. */
   concurrentWriteBeforeRead: null as null | { at: number; run: () => void },
+  /** Simulate another process writing the store AFTER a given store read — in
+   *  particular after read #2, the compare-and-swap re-check. That is the window
+   *  the CAS cannot close, and injecting only BEFORE read #2 is why a save that
+   *  clobbered such a writer went on reporting itself clean (codex gate). */
+  concurrentWriteAfterRead: null as null | { at: number; run: () => void },
   storeReads: 0,
   /** Replace what the rename installs, to force the whole-file verification to
    *  see keys go missing. */
@@ -37,6 +42,20 @@ const fsState = vi.hoisted(() => ({
   /** Every path ever passed to writeFileSync — proves the target is not written
    *  in place. */
   directWrites: [] as string[],
+  /** Directories whose handle was fsynced. A rename is not durable without this,
+   *  and it was missing entirely. */
+  dirFsyncs: [] as string[],
+  /** Break the FIRST store read that happens after a rename — the writer's own
+   *  whole-file verification. The rename has already landed by then, so this is
+   *  the case that must DISCLOSE rather than throw. */
+  failFirstReadAfterRename: false,
+  /** -1 until a rename has happened, so a read taken BEFORE the store was ever
+   *  swapped is never mistaken for the post-rename verification. */
+  readsSinceRename: -1,
+  /** Make the FILE fsync fail, the way a full/failing device would. */
+  failFileFsync: false,
+  /** Make the DIRECTORY fsync fail. */
+  failDirFsync: false,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -54,7 +73,9 @@ vi.mock("node:fs", async (importOriginal) => {
         actual.writeFileSync(from, tamper());
       }
     }
-    return actual.renameSync(from, to);
+    const out = actual.renameSync(from, to);
+    if (isStore(to)) fsState.readsSinceRename = 0;
+    return out;
   };
   const writeFileSyncSpy: typeof actual.writeFileSync = (path, ...rest) => {
     fsState.directWrites.push(String(path));
@@ -63,22 +84,66 @@ vi.mock("node:fs", async (importOriginal) => {
   const readFileSync: typeof actual.readFileSync = ((
     ...args: Parameters<typeof actual.readFileSync>
   ) => {
+    let after: null | { at: number; run: () => void } = null;
     if (isStore(args[0])) {
       fsState.storeReads++;
+      if (fsState.readsSinceRename >= 0) fsState.readsSinceRename++;
+      if (fsState.failFirstReadAfterRename && fsState.readsSinceRename === 1) {
+        throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
+      }
       const c = fsState.concurrentWriteBeforeRead;
       if (c && fsState.storeReads === c.at) {
         fsState.concurrentWriteBeforeRead = null; // once, so the retry can settle
         c.run();
       }
+      const a = fsState.concurrentWriteAfterRead;
+      if (a && fsState.storeReads === a.at) {
+        fsState.concurrentWriteAfterRead = null;
+        after = a;
+      }
     }
-    return actual.readFileSync(...args);
+    const out = actual.readFileSync(...args);
+    // The other process lands AFTER this read returned — so the value we just
+    // read is already stale by the time the caller acts on it.
+    if (after) after.run();
+    return out;
   }) as typeof actual.readFileSync;
+  // Track which fd belongs to which path so an fsync can be attributed to the
+  // FILE or to its DIRECTORY — they are different durability guarantees.
+  const fdPaths = new Map<number, string>();
+  const openSync: typeof actual.openSync = ((...args: Parameters<typeof actual.openSync>) => {
+    const fd = actual.openSync(...args);
+    fdPaths.set(fd, String(args[0]));
+    return fd;
+  }) as typeof actual.openSync;
+  const fsyncSync: typeof actual.fsyncSync = (fd) => {
+    const path = fdPaths.get(fd) ?? "";
+    let isDir = false;
+    try {
+      isDir = !!path && actual.statSync(path).isDirectory();
+    } catch {
+      /* gone already; treat as a file */
+    }
+    if (isDir) {
+      if (fsState.failDirFsync) {
+        throw Object.assign(new Error("EIO: i/o error, fsync"), { code: "EIO" });
+      }
+      fsState.dirFsyncs.push(path);
+      return; // Windows answers EPERM here; the real call is what we're standing in for
+    }
+    if (fsState.failFileFsync) {
+      throw Object.assign(new Error("EIO: i/o error, fsync"), { code: "EIO" });
+    }
+    return actual.fsyncSync(fd);
+  };
   return {
     ...actual,
-    default: { ...actual, renameSync, writeFileSync: writeFileSyncSpy, readFileSync },
+    default: { ...actual, renameSync, writeFileSync: writeFileSyncSpy, readFileSync, openSync, fsyncSync },
     renameSync,
     writeFileSync: writeFileSyncSpy,
     readFileSync,
+    openSync,
+    fsyncSync,
   };
 });
 
@@ -97,10 +162,16 @@ const POPULATED = "# my credentials\nRUNPOD_API_KEY=rp-keep-me\nHF_TOKEN=hf-keep
 beforeEach(() => {
   fsState.failRename = false;
   fsState.concurrentWriteBeforeRead = null;
+  fsState.concurrentWriteAfterRead = null;
   fsState.tamperOnRename = null;
   fsState.renames = 0;
   fsState.storeReads = 0;
   fsState.directWrites = [];
+  fsState.dirFsyncs = [];
+  fsState.failFileFsync = false;
+  fsState.failDirFsync = false;
+  fsState.failFirstReadAfterRename = false;
+  fsState.readsSinceRename = -1;
   dir = mkdtempSync(join(tmpdir(), "cmcp-atomic-"));
   envPath = join(dir, ".env");
   process.env.COMFYUI_MCP_ENV_FILE = envPath;
@@ -174,11 +245,46 @@ describe("the credential store is written ATOMICALLY", () => {
       },
     };
     const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
-    expect(r.persisted).toBe("yes");
     const after = parseEnvFile()!;
     expect(after.CIVITAI_API_TOKEN).toBe("civ-new"); // ours landed
     expect(after.RUNPOD_API_KEY).toBe("rp-from-other-process"); // and theirs survived
     expect(r.lostKeys ?? []).toEqual([]);
+    // And the receipt does NOT call it a confirmed save. The retry preserved the
+    // other writer's key, but a writer we collided with once can equally land in
+    // the check→rename window of the attempt that succeeded — where nothing can
+    // see it. `lostKeys: []` from an account taken under contention is not a
+    // statement that nothing was lost, and the verdict has to say so.
+    expect(r.persisted).toBe("unknown");
+    expect(r.uncertainty).toMatch(/another process was writing/);
+    expect(r.uncertainty).toMatch(/two adjacent operations/);
+  });
+
+  it("REPORTS the key of a writer that lands AFTER the compare-and-swap re-read", () => {
+    // THE window the compare-and-swap cannot close, and the case the receipt used
+    // to narrate as a clean save: writer B lands between our `current !== raw`
+    // check (read 2) and our rename, so our rename replaces B's file. Computing
+    // the loss account from the read we did EARLIER made B's key appear in
+    // neither snapshot — destroyed, and reported as "nothing lost". The old test
+    // only ever injected BEFORE read 2, which is why it survived (codex gate).
+    //
+    // The account is now taken from the file we ACTUALLY replaced, so B's key is
+    // reported rather than vanishing.
+    writeFileSync(envPath, "# base\n", { mode: 0o600 });
+    fsState.concurrentWriteAfterRead = {
+      at: 2,
+      run: () => {
+        writeFileSync(envPath, "# base\nRUNPOD_API_KEY=rp-from-other-process\n", { mode: 0o600 });
+      },
+    };
+    const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+    // Our key landed, and B's really is gone — that is the damage.
+    expect(parseEnvFile()!.CIVITAI_API_TOKEN).toBe("civ-new");
+    expect(parseEnvFile()!.RUNPOD_API_KEY).toBeUndefined();
+    // ...and it is REPORTED, not narrated away.
+    expect(r.lostKeys).toContain("RUNPOD_API_KEY");
+    // The verdict itself is what stops any caller rendering this as a save:
+    // every success test in the codebase is `persisted === "yes"`.
+    expect(r.persisted).toBe("damaged");
   });
 
   it("preserves comments and unrelated keys through a normal save", () => {
@@ -201,22 +307,142 @@ describe("a save is never CONFIRMED over lost credentials", () => {
     const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
     expect(r.lostKeys).toContain("RUNPOD_API_KEY");
     expect(r.lostKeys).toContain("HF_TOKEN");
-    // The key we set is present, so a per-key check would have said "yes" — the
-    // point is that "yes" must not be the whole story.
-    expect(r.persisted).toBe("yes");
+    // The key we set IS present, so a per-key check says "saved" — and that is
+    // exactly why the verdict itself has to carry the damage. `persisted` is the
+    // single field every consumer tests for success, so a damaged store can no
+    // longer read as a save at ANY of them by being overlooked at one.
+    expect(r.persisted).toBe("damaged");
+    expect(r.persisted).not.toBe("yes");
   });
 
   it("reports NO loss on a healthy save", () => {
     writeFileSync(envPath, POPULATED, { mode: 0o600 });
-    expect(setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new").lostKeys).toBeUndefined();
+    const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+    expect(r.lostKeys).toBeUndefined();
+    expect(r.persisted).toBe("yes");
   });
 
-  it("a REVOKE that loses other keys refuses rather than reporting success", () => {
+  it("a REVOKE that loses other keys DISCLOSES it instead of throwing", () => {
+    // It used to throw. But the removal had ALREADY HAPPENED by then, so the
+    // throw turned a completed destructive operation into a generic failure —
+    // which the console rendered as `ok:false` and the caller retried, running a
+    // second removal against a store that had already lost credentials (codex
+    // gate). After the rename there are only disclosures.
     writeFileSync(envPath, `${POPULATED}CIVITAI_API_TOKEN=civ-old\n`, { mode: 0o600 });
     fsState.tamperOnRename = () => "# everything else gone\n";
-    expect(() => removeComfyuiSecret("CIVITAI_API_TOKEN")).toThrow(/also lost/);
+    let out: ReturnType<typeof removeComfyuiSecret> | undefined;
+    expect(() => {
+      out = removeComfyuiSecret("CIVITAI_API_TOKEN");
+    }).not.toThrow();
+    expect(out!.changed).toBe(true); // it happened
+    expect(out!.lostKeys).toContain("RUNPOD_API_KEY");
+    expect(out!.lostKeys).toContain("HF_TOKEN");
+  });
+
+  it("DISCLOSES rather than throws when the post-rename verification read fails", () => {
+    // The rename has ALREADY happened when this read is attempted. Letting the
+    // failure propagate turned a completed write into a generic error — which
+    // the console rendered as `ok:false` and the caller retried, against a store
+    // that had already changed (codex gate). After the rename there are only
+    // disclosures: the outcome must come back, saying what is not established.
+    writeFileSync(envPath, POPULATED, { mode: 0o600 });
+    fsState.failFirstReadAfterRename = true;
+    let r: ReturnType<typeof setComfyuiSecret> | undefined;
+    expect(() => {
+      r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+    }).not.toThrow();
+    fsState.failFirstReadAfterRename = false;
+    // The write really did land...
+    expect(parseEnvFile()!.CIVITAI_API_TOKEN).toBe("civ-new");
+    // ...but the loss account was never taken, so it is not a confirmed save,
+    // and the empty lostKeys must not be read as "nothing was lost".
+    expect(r!.persisted).toBe("unknown");
+    expect(r!.lostKeys).toBeUndefined();
+    expect(r!.uncertainty).toMatch(/could not be read back afterwards/);
+    expect(r!.uncertainty).toMatch(/not established/);
+  });
+
+  it("a healthy REVOKE reports no loss", () => {
+    writeFileSync(envPath, `${POPULATED}CIVITAI_API_TOKEN=civ-old\n`, { mode: 0o600 });
+    const out = removeComfyuiSecret("CIVITAI_API_TOKEN");
+    expect(out.changed).toBe(true);
+    expect(out.lostKeys).toEqual([]);
+    expect(parseEnvFile()!.RUNPOD_API_KEY).toBe("rp-keep-me");
   });
 });
+
+describe("the write is made DURABLE, and says so when it could not be", () => {
+  it("fsyncs the DIRECTORY after the rename, so the rename itself survives a power loss", () => {
+    // A rename is not durable until the directory entry is flushed: the new name
+    // can be lost while the temp name is gone too, leaving NO file where the
+    // store used to be. This was simply missing (codex gate).
+    withPlatform("linux", () => {
+      writeFileSync(envPath, POPULATED, { mode: 0o600 });
+      fsState.dirFsyncs = [];
+      setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+      expect(fsState.dirFsyncs).toContain(dir);
+    });
+  });
+
+  it("does not silently swallow a failed fsync — the receipt carries the gap", () => {
+    writeFileSync(envPath, POPULATED, { mode: 0o600 });
+    fsState.failFileFsync = true;
+    const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+    fsState.failFileFsync = false;
+    // The save still LANDED — a rename is atomic either way — so this is a
+    // disclosure, not a failure.
+    expect(r.persisted).toBe("yes");
+    expect(parseEnvFile()!.CIVITAI_API_TOKEN).toBe("civ-new");
+    expect(r.durabilityGap).toMatch(/could not be flushed to the device/);
+    expect(r.durabilityGap).toMatch(/EIO/);
+  });
+
+  it("reports a failed DIRECTORY fsync too", () => {
+    withPlatform("linux", () => {
+      writeFileSync(envPath, POPULATED, { mode: 0o600 });
+      fsState.failDirFsync = true;
+      const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+      fsState.failDirFsync = false;
+      expect(r.persisted).toBe("yes");
+      expect(r.durabilityGap).toMatch(/rename was not made durable/);
+    });
+  });
+
+  it("claims NO durability gap on a healthy write", () => {
+    writeFileSync(envPath, POPULATED, { mode: 0o600 });
+    expect(setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new").durabilityGap).toBeUndefined();
+  });
+});
+
+describe("comment loss reaches the receipt", () => {
+  it("REPORTS comment lines the rewrite did not preserve", () => {
+    // The store's contract is that it keeps them. Losing them is the user's data
+    // going missing — and the count was computed and then dropped on the floor
+    // before it ever reached a receipt (codex gate).
+    writeFileSync(envPath, POPULATED, { mode: 0o600 });
+    fsState.tamperOnRename = () => "RUNPOD_API_KEY=rp-keep-me\nHF_TOKEN=hf-keep-me\nCIVITAI_API_TOKEN=civ-new\n";
+    const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+    expect(r.lostKeys).toBeUndefined(); // no CREDENTIAL was lost...
+    expect(r.lostCommentLines).toBe(1); // ...but "# my credentials" is gone
+  });
+
+  it("reports no comment loss on a normal save", () => {
+    writeFileSync(envPath, POPULATED, { mode: 0o600 });
+    expect(setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new").lostCommentLines).toBeUndefined();
+  });
+});
+
+/** Run `fn` with process.platform stubbed, so the POSIX-only directory sync is
+ *  testable on the Windows box this is developed on. */
+function withPlatform(platform: string, fn: () => void): void {
+  const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+  Object.defineProperty(process, "platform", { ...original, value: platform });
+  try {
+    fn();
+  } finally {
+    Object.defineProperty(process, "platform", original);
+  }
+}
 
 function readdirSyncSafe(d: string): string[] {
   try {
