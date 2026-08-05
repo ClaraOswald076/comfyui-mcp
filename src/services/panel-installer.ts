@@ -2704,12 +2704,39 @@ async function updateViaGitCheckoutFallback(opts: {
         `(git pull in ${dir}), then RESTART ComfyUI.`,
     );
   }
+  // An ABSENT revision is its own answer. `gitRevision` reports an unresolvable
+  // HEAD as undefined rather than by throwing, so folding it into the
+  // "HEAD moved" arm would narrate "could not determine what HEAD is" as
+  // "determined HEAD changed" — the defect this file keeps being fixed for.
+  // Both arms REFUSE (that is right: this is before the mutation, and an
+  // unverifiable tree does not license a merge), but only the arm with two
+  // readable, DIFFERENT revisions may say something changed.
+  //
+  // A DIRTY worktree is answered first, because it is established evidence in
+  // its own right and does not depend on HEAD resolving: the cleanliness gate
+  // proved this tree clean, so a non-empty porcelain here IS proof it changed.
+  // Only over a still-clean worktree does an unreadable HEAD mean "the
+  // comparison could not be made" — saying "not proof that anything changed"
+  // while holding a dirty status would be the mirror defect (codex gate r4).
+  if (casPorcelain === "" && !casRev) {
+    throw new PanelInstallError(
+      `Panel update did NOT apply: ${managerReason}, and the git fallback is ` +
+        `REFUSED: the panel checkout at ${dir} has an UNREADABLE HEAD (git ` +
+        `resolved no revision at all) ` +
+        `immediately before the merge, so whether it is still the tree the safety ` +
+        `gates inspected (${prePullRev.slice(0, 8)}) could NOT be determined — that ` +
+        `is unknown, NOT proof that anything changed. NO git mutation was made — ` +
+        `though whether the Manager call itself changed anything is precisely what ` +
+        `its own status could not say. Check the panel repo (git status / git log), ` +
+        `then re-check install_panel(action='status').`,
+    );
+  }
   if (casRev !== prePullRev || casPorcelain !== "") {
     throw new PanelInstallError(
       `Panel update did NOT apply: ${managerReason}, and the git fallback is ` +
         `REFUSED: the panel checkout at ${dir} CHANGED between the safety gates ` +
         `and the merge — ` +
-        `${casRev !== prePullRev ? `HEAD moved ${prePullRev.slice(0, 8)} → ${casRev ? casRev.slice(0, 8) : "unreadable"}` : `the worktree is no longer clean:\n${casPorcelain}`}. ` +
+        `${casPorcelain !== "" ? `the worktree is no longer clean:\n${casPorcelain}` : `HEAD moved ${prePullRev.slice(0, 8)} → ${casRev ? casRev.slice(0, 8) : "an unresolvable revision"}`}. ` +
         `Something other than this update is writing to that tree, and a ` +
         `fast-forward would race it. NO git mutation was made by this fallback ` +
         `— but something else evidently DID change the checkout, so re-read it ` +
@@ -2723,12 +2750,71 @@ async function updateViaGitCheckoutFallback(opts: {
     assertSameTarget("before fast-forwarding the panel checkout");
     gitOutput = deps.gitMergeFfOnly(dir, targetRev);
   } catch (err) {
-    // The Manager path failed AND the direct merge failed — name both, truthfully.
+    // The Manager path failed AND the direct merge failed — name both,
+    // truthfully. "Truthfully" is the whole point of the re-read below: a
+    // failed `merge --ff-only` USUALLY leaves the tree exactly as it was, but
+    // "usually" is not "provably", and the very thing most likely to make it
+    // fail here is another writer landing in this checkout — which by
+    // definition already changed it. Asserting "nothing changed on disk" from
+    // the merge's exit status alone would be a bucket ("the merge failed")
+    // narrated as a fact about the disk (codex gate). So OBSERVE it: report
+    // unchanged only when a fresh read says so, report what moved when it did,
+    // and say UNKNOWN when the read itself fails.
+    //
+    // The HEADLINE moves with that observation too (codex gate r2). "Panel
+    // update did NOT apply" is a claim about the disk, so it is only earned by
+    // the reading that shows an untouched tree. When the tree moved, or could
+    // not be read, the merge may have applied PARTIALLY — the register there is
+    // disclosure, not a flat denial that anything happened. Both reads live in
+    // ONE try, so an unreadable HEAD and an unreadable status land in the same
+    // honest answer; neither can escape and lose the merge error below.
+    let headline: string;
+    let treeNote: string;
+    try {
+      const afterRev = deps.gitRevision(dir);
+      const afterPorcelain = deps.gitStatusPorcelain(dir).trim();
+      if (afterPorcelain === "" && !afterRev) {
+        // `gitRevision` answers an unresolvable HEAD with undefined, not by
+        // throwing. "Could not read HEAD" is the same answer as a failed
+        // status read — UNKNOWN — and must not be routed into the arm that
+        // tells the user the tree is no longer in its pre-update state.
+        // A dirty status is checked FIRST though: that IS evidence of change,
+        // and it stands whether or not HEAD resolved (codex gate r4).
+        headline = `Panel update could NOT be confirmed`;
+        treeNote =
+          `The checkout was re-read afterwards but has an UNREADABLE HEAD ` +
+          `(git resolved no revision at all), so ` +
+          `whether the fast-forward applied partially — or anything else changed ` +
+          `${dir} — is UNKNOWN. Inspect it (git status / git log) before retrying.`;
+      } else if (afterRev === prePullRev && afterPorcelain === "") {
+        headline = `Panel update did NOT apply`;
+        treeNote =
+          `The checkout was re-read afterwards and is unchanged (HEAD still ` +
+          `${prePullRev.slice(0, 8)}, worktree clean), so the installed version is ` +
+          `still ${previousVersion ?? "unknown"}.`;
+      } else {
+        headline = `Panel update could NOT be confirmed`;
+        treeNote =
+          `The checkout was re-read afterwards and is NOT what it was before the ` +
+          `attempt — ` +
+          `${afterPorcelain !== "" ? `the worktree is dirty:\n${afterPorcelain}` : `HEAD is ${afterRev ? afterRev.slice(0, 8) : "unresolvable"}, not ${prePullRev.slice(0, 8)}`}. ` +
+          `The fast-forward may therefore have applied PARTIALLY, or another ` +
+          `writer touched ${dir} — either way the panel directory is NOT in the ` +
+          `pre-update state. Inspect it (git status / git log) before retrying, ` +
+          `and do not assume the version above is what is on disk.`;
+      }
+    } catch (readErr) {
+      headline = `Panel update could NOT be confirmed`;
+      treeNote =
+        `The checkout could not be re-read afterwards ` +
+        `(${readErr instanceof Error ? readErr.message : String(readErr)}), so ` +
+        `whether the fast-forward applied partially — or anything else changed ` +
+        `${dir} — is UNKNOWN. Inspect it (git status / git log) before retrying.`;
+    }
     throw new PanelInstallError(
-      `Panel update did NOT apply: nothing changed on disk at ${dir} (installed ` +
-        `version still ${previousVersion ?? "unknown"}). ${managerReason}, and ` +
-        `the direct git fallback on the panel repo failed too — ` +
-        `${err instanceof Error ? err.message : String(err)}. ` +
+      `${headline}: ${managerReason}, and the direct git fallback ` +
+        `on the panel repo failed too — ` +
+        `${err instanceof Error ? err.message : String(err)}. ${treeNote} ` +
         `Fix: update ComfyUI-Manager on the host (git pull in custom_nodes/` +
         `ComfyUI-Manager, or pip install -U comfyui_manager) and retry, or update ` +
         `the panel repo manually (git pull in ${dir}), then RESTART ComfyUI.`,
@@ -2763,12 +2849,29 @@ async function updateViaGitCheckoutFallback(opts: {
         `restarting ComfyUI.`,
     );
   }
+  // Same distinction as the pre-merge CAS: an unresolvable HEAD comes back as
+  // undefined, not as a throw, and "we could not read HEAD" is not "another
+  // writer touched this tree". Both DISCLOSE — the merge has run either way —
+  // but only the readable third-revision arm may name a cause. A DIRTY
+  // worktree is answered first either way: that is established evidence of an
+  // outside write, and it stands whether or not HEAD resolved (codex gate r4).
+  if (postMergePorcelain === "" && !postMergeRev) {
+    throw new PanelInstallError(
+      `Could not verify the panel update: the pinned fast-forward ALREADY RAN in ` +
+        `${dir}, but the checkout afterwards has an UNREADABLE HEAD (git ` +
+        `resolved no revision at all), so what ` +
+        `it now contains — and whether anything else wrote to it during the merge ` +
+        `— could NOT be determined. That is unknown, NOT evidence that something ` +
+        `else did. NOT reporting success. Inspect the panel repo (git status / ` +
+        `git log) before restarting ComfyUI.`,
+    );
+  }
   if (postMergePorcelain !== "" || (postMergeRev !== targetRev && postMergeRev !== prePullRev)) {
     throw new PanelInstallError(
       `Could not verify the panel update: the pinned fast-forward ALREADY RAN in ` +
         `${dir}, but the checkout afterwards is not what that merge alone would ` +
         `leave — ` +
-        `${postMergePorcelain !== "" ? `the worktree is dirty:\n${postMergePorcelain}` : `HEAD is ${postMergeRev ? postMergeRev.slice(0, 8) : "unreadable"}, neither the merged upstream (${targetRev.slice(0, 8)}) nor the pre-merge revision (${prePullRev.slice(0, 8)})`}. ` +
+        `${postMergePorcelain !== "" ? `the worktree is dirty:\n${postMergePorcelain}` : `HEAD is ${postMergeRev ? postMergeRev.slice(0, 8) : "unresolvable"}, neither the merged upstream (${targetRev.slice(0, 8)}) nor the pre-merge revision (${prePullRev.slice(0, 8)})`}. ` +
         `Another writer (a ComfyUI-Manager task, or a manual git operation) ` +
         `touched this tree during the merge, so the panel directory may now be ` +
         `INCONSISTENT. NOT reporting success. Inspect the panel repo (git ` +
@@ -2898,11 +3001,19 @@ async function updateViaGitCheckoutFallback(opts: {
   // from the Manager call that no-op'd — override its message too, so the
   // report never credits the Manager for a verification git did (codex gate).
   assertSameTarget("before reporting the checkout as current");
+  // Scope the closing claim to what was actually established. HEAD equalling
+  // the FETCHED upstream proves the tracked checkout is current; it does not
+  // prove the directory was untouched — `git status --porcelain` never reports
+  // ignored paths, and nothing is observed after the final read. So say what
+  // this fallback did (nothing: there was nothing to fast-forward) rather than
+  // issuing a whole-disk guarantee it is not in a position to make (codex gate).
   const atTipMessage =
     `Panel is already at the upstream tip (${post.version}) — ${managerReason}, ` +
     `but a pinned git merge --ff-only on ${dir} verified the checkout is ` +
-    `current (git: ${gitOutput || "no output"}). Nothing changed on disk; no ` +
-    `restart needed.`;
+    `current (git: ${gitOutput || "no output"}). HEAD already WAS the fetched ` +
+    `upstream, so this fallback fast-forwarded nothing and moved nothing itself; ` +
+    `no restart is needed on its account. (That verifies the TRACKED checkout — ` +
+    `git does not compare ignored files.)`;
   return {
     action: "update",
     result: { ...result, message: atTipMessage },
