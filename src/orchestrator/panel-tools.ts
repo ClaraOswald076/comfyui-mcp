@@ -2139,9 +2139,16 @@ function currentWorkflowFence(ctx: PanelToolCtx): FenceRead {
 //
 // This is the one place that answers the question `mode:"current"` actually asks
 // — "bind me to whatever workflow is live NOW" — by reading the panel's own
-// authoritative active record. It needs no path corroboration precisely because
+// authoritative active record. It needs no CALLER-PATH corroboration, because
 // there is no caller-supplied target to corroborate: the live active canvas IS
 // the target. That is also why it works for an unsaved canvas.
+//
+// But it DOES need RECORD corroboration, which is a different axis and was the
+// gate's P0 (see corroborateActiveForFence). "The caller named no target" does
+// not imply "any active record the reply happens to carry describes this tab".
+// A stale or mixed workflow_list can hand back another canvas's perfectly valid
+// uuid; adopting it would overwrite this tab's stamp, wedge the next command,
+// and report `bound` while doing so.
 //
 // It does NOT weaken #570. The fence still fails closed for every command issued
 // AFTER this point: if the user switches again, the next command carries what
@@ -2163,8 +2170,20 @@ export type WorkflowFenceRebind =
   | { status: "already_current"; uuid: string; before: FenceRead }
   /** The panel did not answer, or its reply was not readable. Unknown, not "fine". */
   | { status: "unreadable"; before: FenceRead; detail: string }
-  /** The panel answered, but its active canvas exposes no usable workflow uuid. */
-  | { status: "no_identity"; before: FenceRead }
+  /** The panel answered, but no usable identity could be adopted from it. TWO
+   *  different facts with different remedies, so they are discriminated rather
+   *  than bucketed: `no_uuid` = this panel build exposes no workflow identity at
+   *  all (a cached/older bundle — updating it is the fix); `uncorroborated` = it
+   *  DOES report one, but the reply did not hang together well enough to prove
+   *  the record describes the live canvas (a stale/mixed snapshot — retrying is
+   *  the fix). Telling a user to update a current panel would be as unactionable
+   *  as telling them to retry a build that will never answer. */
+  | {
+      status: "no_identity";
+      before: FenceRead;
+      kind: "no_uuid" | "uncorroborated";
+      why: string;
+    }
   /** A live identity was read, but the bridge declined to adopt it (the tab stopped
    *  being reachable, or the uuid failed the orchestrator's shape/origin check).
    *  A clean `false` — nothing was written. */
@@ -2174,6 +2193,85 @@ export type WorkflowFenceRebind =
    *  of the write, so whether the fence changed is UNKNOWN and must not be
    *  described either way. */
   | { status: "adopt_error"; uuid: string; before: FenceRead; detail: string };
+
+/**
+ * Is this `workflow_list` reply's top-level `active` record CORROBORATED — i.e.
+ * does the panel's own open-workflow list agree that this record describes the
+ * canvas that is live right now?
+ *
+ * THE RULE THIS RESTORES (independent gate, P0). `resolveOpenWorkflow` already
+ * decided that an uncorroborated top-level `active` object "may remain a
+ * compatibility-valid pin selector, but is never a safe source for replacing a
+ * command fence". The first version of the rebind bypassed that rule, reasoning
+ * that `mode:"current"` has no caller-supplied target to corroborate against.
+ * That was right about the CALLER and wrong about the axis. The question a fence
+ * adoption asks is not "did the caller name a target we must check", it is
+ * "does this record describe the canvas we are about to stamp" — and a MIXED or
+ * STALE reply answers that wrongly no matter what the caller asked for. Adopting
+ * another canvas's valid uuid passes the shape/origin validator, overwrites this
+ * tab's stamp, and gets reported as `bound`: a fresh wedge, announced as a
+ * recovery. That is strictly worse than the wedge this PR exists to fix.
+ *
+ * FAILS CLOSED. Anything that cannot be positively corroborated returns a reason
+ * and the caller lands in `no_identity`, which already says honestly that the
+ * fence was not replaced and names what to do. A recovery that declines is fine.
+ */
+function corroborateActiveForFence(
+  parsed: Record<string, unknown>,
+): { ok: true; active: Record<string, unknown> } | { ok: false; why: string } {
+  const active = parsed.active;
+  if (!active || typeof active !== "object") {
+    return { ok: false, why: "the reply carried no active-workflow record" };
+  }
+  // #514: the panel says so itself when its active record is not confirmed. An
+  // explicit `false` is the panel telling us the value is untrustworthy — never
+  // adopt through that. (Absent = an older panel that cannot say; the list
+  // corroboration below then has to carry the whole weight.)
+  if (parsed.active_confirmed === false) {
+    return { ok: false, why: "the panel reported its active workflow as UNCONFIRMED" };
+  }
+  const list = parsed.workflows;
+  if (!Array.isArray(list) || list.length === 0) {
+    return {
+      ok: false,
+      why: "the reply carried no open-workflow list to corroborate the active record against",
+    };
+  }
+  // Only an AFFIRMATIVE per-record flag can nominate the corroborating entry;
+  // inferring it from the active object would be circular.
+  const flaggedActive = list.filter(
+    (w): w is OpenWorkflowRecord =>
+      !!w && typeof w === "object" && (w as { active?: unknown }).active === true,
+  );
+  if (flaggedActive.length === 0) {
+    return { ok: false, why: "no entry in the open-workflow list is marked active" };
+  }
+  if (flaggedActive.length > 1) {
+    // A mixed/partial snapshot. Exactly the shape that would let another canvas's
+    // uuid through, so it is refused rather than arbitrated.
+    return {
+      ok: false,
+      why: `${flaggedActive.length} entries in the open-workflow list are marked active (a mixed reply)`,
+    };
+  }
+  // Same tri-state primitive the pin path uses. `false` = they name DIFFERENT
+  // canvases (the stale/mixed case). `undefined` = they share no comparable
+  // identity field, so agreement was never established — which is not agreement.
+  const verdict = identityVerdict(flaggedActive[0], active);
+  if (verdict === false) {
+    return {
+      ok: false,
+      why: "the active record and the entry marked active in the open-workflow list name DIFFERENT workflows (a stale or mixed reply)",
+    };
+  }
+  if (verdict !== true) {
+    return {
+      ok: false,
+      why: "the active record and the open-workflow list share no comparable identity field, so nothing corroborates it",
+    };
+  }
+  return { ok: true, active: active as Record<string, unknown> };
+}
 
 /**
  * Re-derive this session's command fence from the panel's live active canvas.
@@ -2215,9 +2313,24 @@ async function rebindWorkflowFence(ctx: PanelToolCtx): Promise<WorkflowFenceRebi
       detail: "the panel's workflow_list reply was not readable as JSON",
     };
   }
-  const active = (parsed as { active?: unknown }).active;
+  // CORROBORATE before adopting. The uuid must come from a record the panel's own
+  // open-workflow list agrees is the live canvas — otherwise a stale or mixed
+  // reply's uuid (valid in shape, belonging to ANOTHER canvas) would overwrite
+  // this tab's stamp and be reported as a successful rebind.
+  const corroborated = corroborateActiveForFence(parsed);
+  if (!corroborated.ok) {
+    return { status: "no_identity", before, kind: "uncorroborated", why: corroborated.why };
+  }
+  const active = corroborated.active;
   const uuid = responseWorkflowUuid(active);
-  if (!uuid) return { status: "no_identity", before };
+  if (!uuid) {
+    return {
+      status: "no_identity",
+      before,
+      kind: "no_uuid",
+      why: "the active workflow record carries no usable workflow_uuid",
+    };
+  }
   // "already current" requires a KNOWN prior fence equal to the live uuid. An
   // UNKNOWN prior fence must not short-circuit the adoption: we would be claiming
   // the stamp already matched without ever having read it.
@@ -2423,45 +2536,76 @@ function describeFenceRebind(
       //  - an UNREADABLE prior fence → we cannot say either way → unverified.
       //    Failing here would report a wedge nobody observed; succeeding would
       //    report a repair nobody observed. Neither is available, so say so.
+    {
+      // WHY nothing was adopted decides the remedy. A panel that exposes no
+      // identity needs UPDATING (retrying forever will not help); a reply that
+      // did not hang together needs RETRYING (the pack is fine). Bucketing them
+      // would hand half the callers an instruction they cannot act on.
+      const lead =
+        r.kind === "no_uuid"
+          ? ` The panel answered but reported NO workflow identity for the active canvas`
+          : ` The panel answered, but its reply could not be corroborated, so nothing was ` +
+            `adopted — ${r.why}. NOTHING was written to this session's fence: adopting an ` +
+            `uncorroborated record could have stamped ANOTHER canvas's identity onto this tab`;
+      const remedy =
+        r.kind === "no_uuid"
+          ? `\n\nWHAT TO DO: ${RELOAD_TAB_REMEDY} Make it a HARD refresh here specifically: a ` +
+            `plain reload can serve the same cached bundle again; only a hard refresh replaces ` +
+            `it. If a hard refresh does not help, the installed pack itself predates the ` +
+            `per-workflow identity and must be UPDATED — no rebind can add it.`
+          : `\n\nWHAT TO DO: call this again in a moment. A stale or mixed workflow list is ` +
+            `usually transient — it settles once the panel finishes reconciling its tabs. If ` +
+            `it persists across a few attempts: ${RELOAD_TAB_REMEDY}`;
       if (!r.before.known) {
         return {
           binding: "unverified",
           note:
-            ` The panel answered but reported NO workflow identity for the active canvas, and ` +
-            `this session's existing fence could not be read either — so whether its graph ` +
-            `binding is healthy could NOT be determined. Routing is set. Treat graph tools as ` +
-            `unconfirmed: if the next one fails with a workflow-instance mismatch, that is the ` +
-            `answer, and a cached older panel bundle is the usual cause.` +
-            `\n\nWHAT TO DO if it does fail: ${RELOAD_TAB_REMEDY}`,
+            `${lead}, and this session's existing fence could not be read either — so whether ` +
+            `its graph binding is healthy could NOT be determined. Routing is set. Treat graph ` +
+            `tools as unconfirmed: if the next one fails with a workflow-instance mismatch, ` +
+            `that is the answer.${remedy}`,
         };
       }
       return r.before.uuid
         ? {
             binding: "not_recovered",
             note:
-              ` The panel answered but reported NO workflow identity for the active canvas, so ` +
-              `this session is STILL fenced to the previous workflow instance ` +
-              `(${r.before.uuid}) and graph tools will keep failing. A cached older panel ` +
-              `bundle is the usual cause.` +
-              `\n\nWHAT TO DO: ${RELOAD_TAB_REMEDY} Make it a HARD refresh here specifically: a ` +
-              `plain reload can serve the same cached bundle again; only a hard refresh replaces ` +
-              `it. If a hard refresh does not help, the installed pack itself predates the ` +
-              `per-workflow identity and must be UPDATED — no rebind can add it.`,
+              `${lead}, so this session is STILL fenced to the previous workflow instance ` +
+              `(${r.before.uuid}) and graph tools will keep failing.${remedy}`,
           }
-        : {
-            binding: "reads_only",
-            // Honest limit (codex gate): "until it reconnects with one" was not
-            // actionable — a panel build that has no workflow identity will never
-            // acquire one merely by reconnecting. Name the remedy that exists.
-            note:
-              ` The panel answered but reports NO workflow identity for the active canvas. Graph ` +
-              `READS work; graph MUTATIONS stay refused, because there is no instance for the ` +
-              `panel to fence a write against. Routing is set.` +
-              `\n\nNOTE: reconnecting alone will NOT restore mutations — a panel build that ` +
-              `reports no workflow identity needs the comfyui-mcp-panel pack UPDATED (then a ` +
-              `hard refresh of the ComfyUI browser tab, since the open tab can keep running a ` +
-              `cached older bundle). Until then this session is read-only for graph tools.`,
-          };
+        : r.kind === "no_uuid"
+          ? {
+              binding: "reads_only",
+              // Honest limit (codex gate): "until it reconnects with one" was not
+              // actionable — a panel build that has no workflow identity will never
+              // acquire one merely by reconnecting. Name the remedy that exists.
+              note:
+                ` The panel answered but reports NO workflow identity for the active canvas. ` +
+                `Graph READS work; graph MUTATIONS stay refused, because there is no instance ` +
+                `for the panel to fence a write against. Routing is set.` +
+                `\n\nNOTE: reconnecting alone will NOT restore mutations — a panel build that ` +
+                `reports no workflow identity needs the comfyui-mcp-panel pack UPDATED (then a ` +
+                `hard refresh of the ComfyUI browser tab, since the open tab can keep running a ` +
+                `cached older bundle). Until then this session is read-only for graph tools.`,
+            }
+          : {
+              // A panel that DOES report identities, whose reply merely did not hang
+              // together this time. Nothing was stale (no prior fence) and nothing was
+              // adopted, so the session is no worse than before — but we did not
+              // establish a fence either, and saying "reads work, mutations don't"
+              // would describe a permanent limitation this is not.
+              binding: "unverified",
+              note:
+                ` The panel's reply could not be corroborated, so nothing was adopted — ` +
+                `${r.why}. NOTHING was written to this session's fence: adopting an ` +
+                `uncorroborated record could have stamped ANOTHER canvas's identity onto this ` +
+                `tab. This session had no fence to damage, so it is no worse off — but no ` +
+                `fence was established either, so graph mutations remain unconfirmed.` +
+                `\n\nWHAT TO DO: call this again in a moment. A stale or mixed workflow list ` +
+                `is usually transient — it settles once the panel finishes reconciling its ` +
+                `tabs. If it persists across a few attempts: ${RELOAD_TAB_REMEDY}`,
+            };
+    }
   }
 }
 
