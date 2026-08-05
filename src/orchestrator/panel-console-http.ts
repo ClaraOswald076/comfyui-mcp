@@ -18,6 +18,7 @@ import {
   listPanelSecretsMasked,
   receiptDisclosures,
   removeDisclosures,
+  revokeIsClean,
   slotRevokeState,
   slotSaveConfirmed,
   slotShellProvidedKeys,
@@ -493,8 +494,16 @@ export function startPanelConsoleHttpServer(opts: {
               });
               return;
             }
-            sendJson(res, 200, {
-              ok: true,
+            // `ok` asks the same question everywhere: is this a CLEAN revoke?
+            // The end state being verified "gone" is not enough — a revoke whose
+            // loss account was never completed, that the boot migration will
+            // undo, or that only partly ran was green-lit here while a warning
+            // beside it said exactly that, and a consumer reads the flag
+            // (codex gate). Comment loss and a durability gap stay warnings:
+            // they are what the revoke COST, not doubt about the revoke.
+            const cleanRevoke = revokeIsClean(clearOutcome);
+            sendJson(res, cleanRevoke ? 200 : 500, {
+              ok: cleanRevoke,
               slot,
               // `cleared` keeps its established meaning — an entry was removed
               // from the credential STORE — and `still_resolves` reports the

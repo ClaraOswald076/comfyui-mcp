@@ -283,7 +283,10 @@ describe("console /api/secrets", () => {
     const body = await r.json();
     // The revoke DID happen, so this is a disclosure, not a refusal...
     expect(body.cleared).toBe(true);
-    // ...but it must not read as a clean one.
+    // ...but it must not read as a clean one. The WARNING said the account was
+    // not established while `ok:true` sat beside it, and a consumer reads the
+    // flag (codex gate).
+    expect(body.ok).toBe(false);
     expect(Array.isArray(body.warnings)).toBe(true);
     expect(String(body.warnings.join(" "))).toMatch(/NOT established/);
     expect(JSON.stringify(body)).not.toContain("civ_key_to_revoke");
