@@ -355,7 +355,8 @@ describe("#790 — an endpoint that rejects the request after we attached audio"
       content: string;
     };
     expect(retried.images).toBeUndefined();
-    expect(retried.content).toContain("did NOT hear it");
+    expect(retried.content).toContain("did NOT receive them");
+    expect(retried.content).toContain("did not hear any audio");
   });
 });
 
@@ -539,6 +540,91 @@ describe("#790 — a later error must not fabricate a delivery failure", () => {
     expect(said).not.toContain("did NOT hear");
     expect(said).not.toContain("rejected");
     expect(events.some((e) => e.type === "error")).toBe(true);
+  });
+});
+
+describe("#790 — a strip must not fabricate a non-delivery for accepted media", () => {
+  it("tells the model that EARLIER, accepted media was only dropped from context", async () => {
+    // Turn 1's audio was accepted - the model heard it. Turn 2 attaches new
+    // audio that is rejected; the retry has to clear ALL media so it can
+    // succeed, but annotating turn 1 with "you did NOT hear it" would invent a
+    // failure for a file the model demonstrably received.
+    const backend = nativeBackend();
+    await collect(backend, turnsOf(AUDIO_TURN)); // accepted
+    rejectNextChatWith = "unsupported media type";
+    await collect(backend, turnsOf(AUDIO_TURN)); // new attachment, rejected
+    const retried = (chatRequests.at(-1)!.messages as Array<Record<string, unknown>>).filter(
+      (m) => m.role === "user",
+    ) as Array<{ content: string }>;
+    // The OLD message: dropped from context, but received.
+    expect(retried[0].content).toContain("You DID receive them earlier");
+    expect(retried[0].content).not.toContain("did NOT receive");
+    // The NEW message: genuinely never received.
+    expect(retried[retried.length - 1].content).toContain("did NOT receive them");
+  });
+});
+
+describe("#790 — a malformed capabilities payload is UNKNOWN, not a refusal", () => {
+  it("does not turn a broken /api/show response into a confident 'no audio'", async () => {
+    showCapabilities = [null as unknown as string];
+    const events = await collect(nativeBackend(), turnsOf(AUDIO_TURN));
+    const said = assistantText(events);
+    expect(said).not.toContain("no audio");
+    expect(said).toContain("cannot confirm"); // attempted, unconfirmed
+    const user = (chatRequests[0].messages as Array<Record<string, unknown>>).find((m) => m.role === "user") as {
+      images?: string[];
+    };
+    expect(user.images).toEqual([RIFF_B64]);
+  });
+
+  it("an EMPTY capabilities array is also unknown, not 'no audio'", async () => {
+    showCapabilities = [];
+    const said = assistantText(await collect(nativeBackend(), turnsOf(AUDIO_TURN)));
+    expect(said).not.toContain("no audio");
+    expect(said).toContain("cannot confirm");
+  });
+});
+
+describe("#788 — the session prompt follows the mode the child was spawned with", () => {
+  it("a FULL surface gets the full-surface prompt, not the compact router one", async () => {
+    // The decision and the prompt have to agree. Advertising the whole catalog
+    // while telling the model it "has exactly six tools" and must go through
+    // call_tool makes the auto-selected full surface worse than the default it
+    // replaced: the model keeps calling a router that is no longer the way in.
+    const backend = new OllamaBackend({
+      model: "llama3.3:70b",
+      mcpServers: { comfyui: { transport: "stdio", command: "node", args: [], env: {} } },
+    });
+    const anyBackend = backend as unknown as {
+      connectTools: () => Promise<void>;
+      comfy: unknown;
+      comfyTools: unknown[];
+      comfySpecEnv: Record<string, string> | undefined;
+      toolModeDecision: unknown;
+      model: string;
+    };
+    anyBackend.connectTools = async () => {
+      anyBackend.comfySpecEnv = {};
+      anyBackend.comfy = fakeMcpClient();
+      const { comfyuiSpawnToolMode } = await import("../../orchestrator/ollama-backend.js");
+      anyBackend.toolModeDecision = comfyuiSpawnToolMode({}, {}, anyBackend.model);
+      anyBackend.comfyTools = [];
+    };
+    await backend.prepare();
+    await collect(backend, turnsOf({ text: "hi" }));
+    const system = (chatRequests[0].messages as Array<Record<string, unknown>>).find(
+      (m) => m.role === "system",
+    ) as { content: string };
+    expect(system.content).toContain("advertised to you DIRECTLY");
+    expect(system.content).not.toContain("exactly six tools");
+  });
+
+  it("a COMPACT surface keeps the router prompt", async () => {
+    await collect(nativeBackend(), turnsOf({ text: "hi" }));
+    const system = (chatRequests[0].messages as Array<Record<string, unknown>>).find(
+      (m) => m.role === "system",
+    ) as { content: string };
+    expect(system.content).toContain("exactly six tools");
   });
 });
 

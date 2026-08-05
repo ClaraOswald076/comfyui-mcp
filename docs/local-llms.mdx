@@ -88,6 +88,13 @@ has actually asserted about this axis, so nothing is promoted on a guess.
 `COMFYUI_MCP_FULL_SURFACE_MIN_PARAMS_B=30` lowers it if you want to find where
 your hardware's ceiling really is.
 
+The **system prompt follows the mode**. The compact prompt tells the model it
+has six tools and routes ComfyUI through `call_tool`; when the full surface is
+selected that is simply untrue, so the full-mode prompt says the ComfyUI tools
+are advertised directly and keeps the router description for `panel_*` only.
+Auto-selecting full while denying the tools exist would be worse than the
+default it replaced.
+
 The active mode **and its reason** are printed on the backend's ready line,
 e.g. `Tool mode: compact — chosen for this MODEL: "qwen3:4b" is ~4B
 parameters, below the 70B full-surface threshold…`, so the lever is never

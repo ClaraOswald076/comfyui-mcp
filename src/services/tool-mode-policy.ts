@@ -1,13 +1,13 @@
 // Per-MODEL tool-mode selection (issue #788).
 //
-// Compact tool mode (list_tools / describe_tool / call_tool, on-demand loading)
-// has existed since #97 and became the DEFAULT in #667. #788's original
+// Compact tool mode -- an on-demand router in front of the catalog -- has
+// existed since #97 and became the DEFAULT in #667. #788's original
 // complaint — "a small local model gets the full surface and nobody tells you
 // --compact exists" — is therefore already half-answered: nothing gets the full
 // surface by accident any more. What is still missing, and what this module
 // adds, is the OTHER direction and the visibility:
 //
-//   • a large local model is needlessly held to the 3-tool facade,
+//   • a large local model is needlessly held behind the router,
 //   • an explicit user choice must win in BOTH directions,
 //   • and whichever mode is active must be SAID, not inferred.
 //

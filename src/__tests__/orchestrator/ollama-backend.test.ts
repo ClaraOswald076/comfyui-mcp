@@ -4,6 +4,7 @@ import {
   comfyuiSpawnEnv,
   comfyuiSpawnToolMode,
   isOllamaModel,
+  ollamaSystemPrompt,
   type McpToolClient,
 } from "../../orchestrator/ollama-backend.js";
 import { PANEL_TOOL_MCP_TIMEOUT_MS, __panelAskTestHooks } from "../../orchestrator/panel-tools.js";
@@ -575,7 +576,10 @@ describe("inline image delivery (per-model vision, graceful degradation)", () =>
     };
     expect(first.images).toHaveLength(1);
     expect(second.images).toBeUndefined();
-    expect(second.content).toContain("rejected image input");
+    // Model-facing note: it must be told it received NOTHING, in the wording
+    // that also covers a mixed image+audio strip (#790).
+    expect(second.content).toContain("did NOT receive them");
+    expect(second.content).toContain("did not see any image");
     // the user was told, and the turn still completed successfully
     const notes = events.filter((e) => e.type === "assistant").map((e) => (e as { text: string }).text);
     expect(notes.some((t) => t.includes("rejected image input"))).toBe(true);
@@ -608,6 +612,51 @@ describe("inline image delivery (per-model vision, graceful degradation)", () =>
     await collect(backend, turnsOf({ text: "hello" }));
     const user = chatRequests[0].messages.find((m) => m.role === "user") as { images?: string[] };
     expect(user.images).toBeUndefined();
+  });
+});
+
+describe("the system prompt describes the surface that was actually advertised (#788)", () => {
+  it("compact says six tools and routes through call_tool", () => {
+    const p = ollamaSystemPrompt("compact");
+    expect(p).toContain("exactly six tools");
+    expect(p).toContain("list_tools / describe_tool / call_tool");
+  });
+
+  it("FULL does NOT claim there are six tools, nor that comfyui goes through the router", () => {
+    // Auto-selecting full while telling the model the tools do not exist would
+    // make the new selection worse than the old default: the model keeps calling
+    // a router that is no longer the way in.
+    const p = ollamaSystemPrompt("full");
+    expect(p).not.toContain("exactly six tools");
+    expect(p).toContain("advertised to you DIRECTLY");
+    // The panel router IS still a router, and must still be described as one.
+    expect(p).toContain("panel_list_tools");
+    // No tool COUNT is stated for the full surface (#726 rewrites it).
+    expect(p).not.toMatch(/\d+\s*(comfyui )?tools are advertised/i);
+  });
+
+  it("both modes keep the same operating rules", () => {
+    for (const mode of ["compact", "full"] as const) {
+      expect(ollamaSystemPrompt(mode)).toContain("never invent results");
+      expect(ollamaSystemPrompt(mode)).toContain("PAID credits");
+    }
+  });
+});
+
+describe("isOllamaModel — gpt-oss is a LOCAL family, not a hosted OpenAI model", () => {
+  it("accepts gpt-oss tags so a live switch to one actually takes effect (#788)", () => {
+    // #788 names gpt-oss:120b as a model that auto-selects the full surface. A
+    // blanket ^gpt exclusion refused the switch, leaving the panel showing one
+    // model while the backend ran another — wrong-model confusion exactly where
+    // model-keyed selection is the promise.
+    expect(isOllamaModel("gpt-oss:120b")).toBe(true);
+    expect(isOllamaModel("gpt-oss:20b")).toBe(true);
+  });
+
+  it("still refuses the hosted OpenAI/Claude/Gemini ids the guard exists for", () => {
+    expect(isOllamaModel("gpt-5.6-terra")).toBe(false);
+    expect(isOllamaModel("claude-opus-5")).toBe(false);
+    expect(isOllamaModel("gemini-3-pro")).toBe(false);
   });
 });
 

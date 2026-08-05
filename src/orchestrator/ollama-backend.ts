@@ -27,6 +27,7 @@ import type {
 } from "./agent-backend.js";
 import type { ImageRef } from "./panel-agent.js";
 import { type ToolModeDecision, resolveToolModeForModel } from "../services/tool-mode-policy.js";
+import type { ToolMode } from "../transport/cli.js";
 import {
   type AudioConfidence,
   type AudioOutcome,
@@ -167,6 +168,12 @@ type ChatMessage = {
   audios?: string[];
   /** Mime types parallel to `audios`. */
   audioMimes?: string[];
+  /** True once a request carrying THIS message's media came back successfully
+   *  (#790). A later strip still removes the bytes - the retry has to be clean -
+   *  but the note it leaves must not tell the model it never received media it
+   *  demonstrably did. Fabricating a non-delivery for an accepted attachment is
+   *  the same class of error as hiding a real one. */
+  mediaDelivered?: boolean;
 };
 
 type OllamaToolCall = {
@@ -261,13 +268,40 @@ const MAX_TOOL_ROUNDS = 32;
  * is short, router-shaped, and (deliberately, for local models) does NOT carry
  * the NSFW consent-gate flow — only the absolute hard limits.
  */
-export const OLLAMA_SYSTEM_PROMPT = [
+const OLLAMA_PROMPT_HEAD = [
   "You are the ComfyUI agent in a sidebar panel, driving the user's live ComfyUI graph and server. Answer in normal Markdown.",
   "",
+];
+
+/** Tool-surface paragraph for the COMPACT router (the default surface). */
+const OLLAMA_PROMPT_TOOLS_COMPACT = [
   "You have exactly six tools:",
   '- list_tools / describe_tool / call_tool — the headless ComfyUI server (~200 capabilities: generate images/video/audio, models, custom nodes, queue, diagnostics). Flow: list_tools {"search": ...} → describe_tool {"name": ...} → call_tool {"name": ..., "args": {...}}.',
   "- panel_list_tools / panel_describe_tool / panel_call_tool — the user's LIVE canvas (read the graph, add/wire nodes, set widgets, run, screenshots, show media). Same flow.",
   "",
+];
+
+/**
+ * Tool-surface paragraph when the comfyui child was spawned FULL (#788).
+ *
+ * This has to vary with the mode. The compact wording tells the model it "has
+ * exactly six tools" and routes everything through call_tool — which is simply
+ * FALSE once the child advertises its whole catalog directly, and a model that
+ * believes it keeps calling a router that is no longer the way in. Auto-selecting
+ * full while asserting the tools don't exist would make the new selection worse
+ * than the old default, not better.
+ *
+ * The count is deliberately not stated: it is whatever the live catalog holds,
+ * and #726 rewrites it.
+ */
+const OLLAMA_PROMPT_TOOLS_FULL = [
+  "Your tools come in two groups:",
+  "- The headless ComfyUI server's tools are advertised to you DIRECTLY, by name, with their schemas — generate images/video/audio, manage models and custom nodes, drive the queue, run diagnostics. Call them straight; there is no router to go through for those.",
+  '- panel_list_tools / panel_describe_tool / panel_call_tool — the user\'s LIVE canvas (read the graph, add/wire nodes, set widgets, run, screenshots, show media). These ARE a router: panel_list_tools {"search": ...} → panel_describe_tool {"name": ...} → panel_call_tool {"name": ..., "args": {...}}.',
+  "",
+];
+
+const OLLAMA_PROMPT_RULES = [
   "Rules:",
   "- Catalog entries are tool NAMES, not data. Finish every task by actually running tools; never invent results.",
   "- Describe a tool before its first call so you use the right parameters. If a call errors, read the error — it includes the expected schema — fix the args and retry.",
@@ -275,7 +309,21 @@ export const OLLAMA_SYSTEM_PROMPT = [
   "- To EDIT the graph — add a node (e.g. a LoraLoader after a download), wire slots, set widgets, run — those are PANEL tools too: panel_call_tool with panel_add_node / panel_connect / panel_set_widget / panel_run. Do NOT search the headless list_tools catalog for graph editing; it is not there.",
   "- To see or show any generated image/video, run the panel_show_media tool via panel_call_tool.",
   "- Workflows with API nodes cost the user PAID credits; local-GPU workflows are free. Ask before anything that might spend credits.",
-].join("\n");
+];
+
+/** The built-in prompt for a given tool mode. `full` is reached only via #788's
+ *  per-model auto-selection or an explicit override. */
+export function ollamaSystemPrompt(mode: ToolMode = "compact"): string {
+  return [
+    ...OLLAMA_PROMPT_HEAD,
+    ...(mode === "full" ? OLLAMA_PROMPT_TOOLS_FULL : OLLAMA_PROMPT_TOOLS_COMPACT),
+    ...OLLAMA_PROMPT_RULES,
+  ].join("\n");
+}
+
+/** The COMPACT prompt as a named export: it is the default surface, and the text
+ *  the panel's prompt editor registers and can override. */
+export const OLLAMA_SYSTEM_PROMPT = ollamaSystemPrompt("compact");
 
 /**
  * Curated OpenRouter models that top the comfyui-mcp LLM Arena on the full tool
@@ -321,6 +369,12 @@ function firstSentence(text: string, maxLen = 160): string {
  *  carry a "/" vendor prefix (deepseek/deepseek-v3.2, anthropic/claude-…).
  *  Mirrors gemini-backend's isGeminiModel. */
 export function isOllamaModel(id: string): boolean {
+  // `gpt-oss:120b` is an Ollama tag for a LOCAL model, not a hosted OpenAI one,
+  // and #788 names it as a model that auto-selects the full tool surface. The
+  // blanket ^gpt exclusion refused to switch to it: the panel would show the new
+  // model while the backend kept running the old one and its tool surface -
+  // wrong-model confusion exactly where model-keyed selection is the promise.
+  if (/^gpt-oss/i.test(id)) return id.includes(":") || id.includes("/");
   return (id.includes(":") || id.includes("/")) && !/^claude|^gpt|^gemini/i.test(id);
 }
 
@@ -936,7 +990,15 @@ export class OllamaBackend implements AgentBackend {
     if (fresh) {
       // deps.systemAppend (the frontier panel prompt) is intentionally NOT
       // used — see OLLAMA_SYSTEM_PROMPT.
-      this.history = [{ role: "system", content: resolvePrompt("backend.ollama", OLLAMA_SYSTEM_PROMPT) }];
+      // #788 — the prompt must describe the surface that was ACTUALLY advertised
+      // to this model. A user override (the panel's prompt editor) still wins;
+      // only the built-in default varies by mode.
+      this.history = [
+        {
+          role: "system",
+          content: resolvePrompt("backend.ollama", ollamaSystemPrompt(this.toolModeDecision?.mode ?? "compact")),
+        },
+      ];
     }
     yield { type: "session", sessionId: this.sessionId, model: this.model };
 
@@ -980,18 +1042,22 @@ export class OllamaBackend implements AgentBackend {
    *  never pretends it saw them. One-shot per turn (see runTurn). */
   private stripImagesFromHistory(): void {
     for (const m of this.history) {
-      if (m.images?.length) {
-        delete m.images;
-        delete m.imageMimes;
-        m.content +=
-          "\n[note: the attached image(s) were removed — this model/endpoint rejected image input. You did NOT see them; tell the user so if it matters.]";
-      }
-      if (m.audios?.length) {
-        delete m.audios;
-        delete m.audioMimes;
-        m.content +=
-          "\n[note: the attached audio was removed — this model/endpoint rejected media input. You did NOT hear it; say so plainly rather than describing or transcribing anything.]";
-      }
+      const hadMedia = !!(m.images?.length || m.audios?.length);
+      if (!hadMedia) continue;
+      const delivered = m.mediaDelivered === true;
+      const kinds = [m.images?.length ? "image(s)" : null, m.audios?.length ? "audio" : null]
+        .filter(Boolean)
+        .join(" and ");
+      delete m.images;
+      delete m.imageMimes;
+      delete m.audios;
+      delete m.audioMimes;
+      m.content += delivered
+        ? // The model DID receive this earlier; it is only being dropped from
+          // context so the retry is clean. Telling it otherwise would fabricate
+          // a non-delivery.
+          `\n[note: the attached ${kinds} were removed from this message so a rejected request could be retried. You DID receive them earlier in this conversation - nothing was lost, but they are no longer in your context.]`
+        : `\n[note: the attached ${kinds} were removed - this model/endpoint rejected media input. You did NOT receive them: you did not see any image and did not hear any audio. Say so plainly rather than describing, transcribing or guessing at the contents.]`;
     }
   }
 
@@ -1035,7 +1101,15 @@ export class OllamaBackend implements AgentBackend {
         logger.warn(`[ollama-backend] /api/show for ${this.model} carried no capabilities array — unknown`);
         return null;
       }
-      return body.capabilities.filter((c): c is string => typeof c === "string");
+      const caps = body.capabilities.filter((c): c is string => typeof c === "string");
+      // A payload that is an array but yields no usable strings (or lost entries
+      // to the filter) is MALFORMED, not an answer. Reading it as "no audio"
+      // would turn a broken response into a confident refusal.
+      if (caps.length === 0 || caps.length !== body.capabilities.length) {
+        logger.warn(`[ollama-backend] /api/show for ${this.model} returned a malformed capabilities array - unknown`);
+        return null;
+      }
+      return caps;
     } catch (err) {
       logger.warn(`[ollama-backend] /api/show probe failed for ${this.model}: ${msgOf(err)} — model capabilities unknown`);
       return null;
@@ -1203,6 +1277,12 @@ export class OllamaBackend implements AgentBackend {
           // it (see the catch below) — that would fabricate a delivery failure
           // for media the model demonstrably received.
           if (turnSentImages || turnSentAudio) turnMediaAccepted = true;
+          // Mark every message whose media just rode a successful request, so a
+          // later strip can tell "you never got this" from "this was removed
+          // from context after you got it".
+          for (const m of this.history) {
+            if (m.images?.length || m.audios?.length) m.mediaDelivered = true;
+          }
         } catch (err) {
           // GRACEFUL IMAGE DEGRADATION: if the request carried inline images
           // and the endpoint rejected it (text-only model — e.g. DeepSeek 400s
