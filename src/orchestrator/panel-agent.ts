@@ -26,7 +26,7 @@ import { logger } from "../utils/logger.js";
 import { errorText, promptText } from "./error-text.js";
 import type { SessionStore } from "./session-store.js";
 import type { AgentBackend, AgentEvent, NeutralTurn } from "./agent-backend.js";
-import { type AudioRef, noAudioPartText } from "./audio-attachment.js";
+import { type AudioRef, dedupeAudioRefs, noAudioPartText } from "./audio-attachment.js";
 import {
   ClaudeBackend,
   fetchSupportedModels,
@@ -1083,7 +1083,12 @@ export class PanelAgent {
       // ingress would otherwise stringify to "[object Object]" here (#175).
       let text = batch.map((it) => promptText(it.text)).join("\n\n");
       let images = batch.flatMap((it) => it.images ?? []);
-      let audio = batch.flatMap((it) => it.audio ?? []);
+      // Deduped across the BATCH, not just within one message: two queued
+      // messages that each carried the same file become one turn here, and the
+      // duplicate would spend a second of the turn's two audio slots on bytes
+      // already attached — the user then hears that a file they sent "does not
+      // fit" while it is on the request twice.
+      let audio = dedupeAudioRefs(batch.flatMap((it) => it.audio ?? []));
       // #790 — the SAME contract as the image gate below, for hearing. A backend
       // with no audio content part must never simply receive `turn.audio` and
       // drop it: the user would ask about a sound and get an answer composed

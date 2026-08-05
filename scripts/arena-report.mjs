@@ -20,6 +20,90 @@ export function vramLabel(bytes) {
   return (bytes / (1024 * 1024 * 1024)).toFixed(1);
 }
 
+/**
+ * The condition axes (#792) for an entry that MERGED two runs.
+ *
+ * A best-of-N entry shows one score RANGE, and next to it one Params / Quant /
+ * VRAM cell. Keeping the winning run's axes there states that the whole range
+ * was recorded under that one condition — which is exactly what a re-pull from
+ * q4 to q8 breaks: the same tag, two different models, one displayed quant, and
+ * a reader comparing the ladder against a condition half those runs never had.
+ *
+ * So an axis survives the merge only when BOTH runs recorded the SAME value.
+ * Where they differ, or where one run recorded nothing at all, the axis is
+ * MIXED — reported as such rather than dropped, because "—" already means "not
+ * recorded" and collapsing "spans two conditions" into "unknown" would hide the
+ * thing the reader has to know. VRAM is the one exception worth a real number:
+ * it is a measurement of the same condition rather than a condition itself, so
+ * two known values become a RANGE.
+ *
+ * Callers that would rather not merge at all still have that option — the
+ * quantization guard in arena-bestof.mjs refuses outright when the two runs are
+ * demonstrably different quantizations, and this only ever sees what it lets by.
+ */
+export function mergeRunAxes(a, b) {
+  const mixedAxes = [];
+  const same = (x, y) => x !== undefined && x !== null && x === y;
+  const out = {};
+  for (const axis of ["params", "quant"]) {
+    if (same(a[axis], b[axis])) out[axis] = a[axis];
+    else if (a[axis] !== undefined || b[axis] !== undefined) mixedAxes.push(axis);
+  }
+  // An already-merged side carries a RANGE; folding only its top would quietly
+  // shrink the span each time another run joins.
+  const vramsOf = (m) =>
+    (Array.isArray(m.vramResidentBytesRange) ? m.vramResidentBytesRange : [m.vramResidentBytes]).filter(
+      (v) => typeof v === "number" && Number.isFinite(v) && v > 0,
+    );
+  const sideA = vramsOf(a);
+  const sideB = vramsOf(b);
+  const vrams = [...sideA, ...sideB];
+  if (sideA.length && sideB.length) {
+    out.vramResidentBytes = Math.max(...vrams);
+    if (Math.min(...vrams) !== Math.max(...vrams)) out.vramResidentBytesRange = [Math.min(...vrams), Math.max(...vrams)];
+  } else if (vrams.length) {
+    // One run measured it and the other did not: the range is not a measured
+    // range, so the entry must not present the one number as covering both.
+    mixedAxes.push("vram");
+  }
+  // `mixed` is STICKY. A third run that happens to match the surviving value
+  // does not un-mix a range that already spans two conditions — once an axis is
+  // unknown for some run in the range, it stays unknown for the range.
+  for (const axis of ["params", "quant", "vram"]) {
+    if (mixedAxes.includes(axis)) continue;
+    if (a.mixedAxes?.includes(axis) || b.mixedAxes?.includes(axis)) {
+      mixedAxes.push(axis);
+      delete out[axis];
+      if (axis === "vram") {
+        delete out.vramResidentBytes;
+        delete out.vramResidentBytesRange;
+      }
+    }
+  }
+  if (mixedAxes.length) out.mixedAxes = mixedAxes;
+  return out;
+}
+
+/** Cell text for an axis on a (possibly merged) entry: a value, `mixed` when
+ *  the entry's runs disagree, or `—` when nothing recorded it. */
+export function axisCell(entry, axis) {
+  if (entry.mixedAxes?.includes(axis)) return "mixed";
+  if (axis === "vram") {
+    const range = entry.vramResidentBytesRange;
+    if (Array.isArray(range) && range.length === 2) {
+      const lo = vramLabel(range[0]);
+      const hi = vramLabel(range[1]);
+      // Two measurements that round to the same tenth print as that one figure,
+      // deliberately: "5.0–5.0 GiB" is noise, and "5.0 GiB" is true of both at
+      // the precision the column is stated in. The raw pair stays in the JSON.
+      if (lo && hi) return lo === hi ? `${hi} GiB` : `${lo}–${hi} GiB`;
+    }
+    const one = vramLabel(entry.vramResidentBytes);
+    return one ? `${one} GiB` : "—";
+  }
+  return entry[axis] ?? "—";
+}
+
 const nudgesOf = (m) => m.results.reduce((s, r) => s + (r.nudges ?? 0), 0);
 const roundsOf = (m) => m.results.reduce((s, r) => s + (r.rounds ?? 0), 0);
 const secondsOf = (m) => m.results.reduce((s, r) => s + (r.seconds ?? 0), 0);
@@ -135,13 +219,20 @@ export function buildArenaReport(data) {
       totals && totals.length > 1
         ? `**${m.total}/${m.max}** (best of ${totals.length}: ${Math.min(...totals)}–${Math.max(...totals)})`
         : `**${m.total}/${m.max}**`;
-    const vram = vramLabel(m.vramResidentBytes);
     md.push(
-      `| \`${m.model}\` | ${m.tier ?? "local"} | ${m.params ?? "—"} | ${m.quant ?? "—"} | ${vram ? `${vram} GiB` : "—"} | ${cells.join(" | ")} | ${score} | ${nudgesOf(m)} | ${roundsOf(m)} | ${secondsOf(m)}s |`,
+      `| \`${m.model}\` | ${m.tier ?? "local"} | ${axisCell(m, "params")} | ${axisCell(m, "quant")} | ${axisCell(m, "vram")} | ${cells.join(" | ")} | ${score} | ${nudgesOf(m)} | ${roundsOf(m)} | ${secondsOf(m)}s |`,
     );
   }
   md.push("", `Scenarios: ${scen.map((s) => `**${s.id}** (${s.title.toLowerCase()})`).join(" · ")}`, "");
   md.push(`✅ completed & server-verified · 🟡 right tool family, incomplete outcome · ❌ failed`, "");
+  if (board.some((m) => m.mixedAxes?.length)) {
+    md.push(
+      `\`mixed\` in Params/Quant/VRAM: that row is a best-of range whose runs did not all record the same value for ` +
+        `that axis (a re-pulled tag, or a run from before the axis was recorded) — the score range there is not tied ` +
+        `to one condition. \`—\` means the axis was never recorded at all.`,
+      "",
+    );
+  }
 
   // Version comparability (#792 sequencing note): absolute scores move when the
   // tool surface changes, so the report must never invite a cross-version read.

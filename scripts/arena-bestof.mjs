@@ -9,7 +9,7 @@
 // Regenerates arena-report.md afterward.
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { buildArenaReport } from "./arena-report.mjs";
+import { buildArenaReport, mergeRunAxes } from "./arena-report.mjs";
 
 const [baseDir, ...runDirs] = process.argv.slice(2);
 if (!baseDir) {
@@ -55,18 +55,41 @@ for (const dir of runDirs) {
       );
       continue;
     }
+    // …and never merge two DIFFERENT quantizations of the same tag. `ollama
+    // pull` replaces the weights under the same name, so `gemma4:e4b` at Q4_K_M
+    // and at Q8_0 are two different models wearing one id — a best-of range
+    // across them is the same "scores from two conditions read as one" error the
+    // version guard above refuses, and the Quant column would name only one of
+    // them. Unknown on either side is NOT a mismatch (see mergeRunAxes: it comes
+    // out as `mixed` rather than a claim).
+    if (current.quant && candidate.quant && current.quant !== candidate.quant) {
+      console.warn(
+        `skip ${candidate.model} from ${dir}: the merge would mix quantizations ${current.quant} + ${candidate.quant} — those are different models under one tag`,
+      );
+      continue;
+    }
     const totals = [...(current.runs?.totals ?? [current.total]), candidate.total];
     const winner = better(current, candidate) > 0 ? candidate : current;
     // If either side predates version stamping, the merged range mixes a
     // stamped and an unstamped run — the entry must NOT keep claiming the
     // version (the report flags unversioned entries as not comparable).
     const mergedVersion = current.mcpVersion && candidate.mcpVersion ? winner.mcpVersion : undefined;
+    // The condition axes belong to a RUN, not to the winner: keeping the
+    // winner's Params/Quant/VRAM would state that the whole best-of range was
+    // recorded under that one condition. mergeRunAxes keeps only what both runs
+    // agree on and marks the rest `mixed`.
     base.leaderboard[i] = {
       ...winner,
       tier: current.tier,
       runs: { totals },
       mcpVersion: mergedVersion,
       mcpVersions: knownVersions,
+      params: undefined,
+      quant: undefined,
+      vramResidentBytes: undefined,
+      vramResidentBytesRange: undefined,
+      mixedAxes: undefined,
+      ...mergeRunAxes(current, candidate),
     };
     console.log(`${candidate.model}: run=${candidate.total} → keeping ${winner.total} (all: ${totals.join(", ")})`);
   }

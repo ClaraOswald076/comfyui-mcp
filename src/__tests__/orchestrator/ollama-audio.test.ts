@@ -784,6 +784,98 @@ describe("#788 — a live model switch reconciles the tool surface", () => {
     // The explanation still catches up to the model actually in use.
     expect(anyBackend.toolModeDecision?.model).toBe("gemma4:e2b");
   });
+
+  it("the post-switch rewrite KEEPS the panel-router retraction", async () => {
+    // The rewrite replaces the whole system message. A rebuild that emitted only
+    // the mode text would silently restore "you have panel_list_tools /
+    // panel_describe_tool / panel_call_tool" in a session whose router never
+    // registered — the false capability claim the retraction exists to remove,
+    // reintroduced by the fix for a different problem.
+    const backend = new OllamaBackend({
+      model: "qwen3:4b",
+      // NOTE: no panel entry — the router is NOT registered in this session.
+      mcpServers: { comfyui: { transport: "stdio", command: "node", args: [], env: {} } },
+    });
+    const anyBackend = backend as unknown as {
+      connectTools: () => Promise<void>;
+      comfy: unknown;
+      comfyTools: unknown[];
+      comfySpecEnv: Record<string, string> | undefined;
+      toolModeDecision: unknown;
+      model: string;
+    };
+    anyBackend.connectTools = async () => {
+      anyBackend.comfySpecEnv = {};
+      anyBackend.comfy = fakeMcpClient();
+      const { comfyuiSpawnToolMode } = await import("../../orchestrator/ollama-backend.js");
+      anyBackend.toolModeDecision = comfyuiSpawnToolMode({}, {}, anyBackend.model);
+      anyBackend.comfyTools = [];
+    };
+    await backend.prepare();
+    await collect(backend, turnsOf({ text: "first" }));
+    const firstSystem = (chatRequests[0].messages as Array<Record<string, unknown>>).find(
+      (m) => m.role === "system",
+    ) as { content: string };
+    expect(firstSystem.content).toContain("DO NOT EXIST right now");
+
+    await backend.setModel("llama3.3:70b"); // respawns onto the full surface
+    await collect(backend, turnsOf({ text: "second" }));
+    const laterSystem = (chatRequests.at(-1)!.messages as Array<Record<string, unknown>>).find(
+      (m) => m.role === "system",
+    ) as { content: string };
+    expect(laterSystem.content).toContain("advertised to you DIRECTLY"); // the new surface
+    expect(laterSystem.content).toContain("DO NOT EXIST right now"); // …and the retraction survived
+  });
+
+  it("ADDS the retraction when the respawn loses a router the session had", async () => {
+    // The reconcile tears the PANEL client down too. If the respawn fails to
+    // bring it back, a session that opened WITH a working router is left holding
+    // a prompt that still names panel_list_tools / panel_describe_tool /
+    // panel_call_tool — and nothing else in the conversation retracts it. The
+    // rewrite therefore has to happen on the failure branch as well, and it has
+    // to re-derive the retraction from the router that is live NOW.
+    let first = true;
+    const backend = new OllamaBackend({
+      model: "qwen3:4b",
+      mcpServers: { comfyui: { transport: "stdio", command: "node", args: [], env: {} } },
+    });
+    const anyBackend = backend as unknown as {
+      connectTools: () => Promise<void>;
+      comfy: unknown;
+      comfyTools: unknown[];
+      panel: unknown;
+      panelTools: unknown[];
+      comfySpecEnv: Record<string, string> | undefined;
+      toolModeDecision: unknown;
+      model: string;
+    };
+    anyBackend.connectTools = async () => {
+      anyBackend.comfySpecEnv = {};
+      if (!first) throw new Error("spawn failed");
+      first = false;
+      anyBackend.comfy = fakeMcpClient();
+      anyBackend.panel = fakeMcpClient();
+      anyBackend.panelTools = [{ name: "panel_list_tools", inputSchema: { type: "object" } }];
+      const { comfyuiSpawnToolMode } = await import("../../orchestrator/ollama-backend.js");
+      anyBackend.toolModeDecision = comfyuiSpawnToolMode({}, {}, anyBackend.model);
+      anyBackend.comfyTools = [];
+    };
+    await backend.prepare();
+    await collect(backend, turnsOf({ text: "first" }));
+    const firstSystem = (chatRequests[0].messages as Array<Record<string, unknown>>).find(
+      (m) => m.role === "system",
+    ) as { content: string };
+    // The router WAS there when the session opened — nothing to retract.
+    expect(firstSystem.content).not.toContain("DO NOT EXIST right now");
+
+    await backend.setModel("llama3.3:70b");
+    await collect(backend, turnsOf({ text: "second" }));
+    expect(anyBackend.panel).toBeNull(); // the respawn really did lose it
+    const laterSystem = (chatRequests.at(-1)!.messages as Array<Record<string, unknown>>).find(
+      (m) => m.role === "system",
+    ) as { content: string };
+    expect(laterSystem.content).toContain("DO NOT EXIST right now");
+  });
 });
 
 describe("#790 — the capability probe is never memoised", () => {

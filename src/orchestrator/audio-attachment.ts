@@ -439,6 +439,38 @@ export async function fetchAudioAttachment(
  * `song.wma` is audio the user is trying to share, and it belongs on the path
  * that can tell them what to convert it to.
  */
+/**
+ * Collapse refs that name the SAME ComfyUI file to one attachment.
+ *
+ * The panel has two carriers for a sound — the dedicated `audio` array and the
+ * legacy `images` array a older/compatible composer still uses — and a panel
+ * that populates both sends the same file twice. Without this, one attachment
+ * counts twice against MAX_AUDIO_ATTACHMENTS: the second copy is REFUSED, and
+ * the user is told out loud that a file they attached once did not fit, while
+ * the identical bytes are also sitting on the request. A duplicate of a file we
+ * are already sending is not a second attachment.
+ *
+ * Identity is the tuple ComfyUI's /view is addressed by (filename + subfolder +
+ * type), normalised the same way `fetchAudioAttachment` builds that URL, so two
+ * refs are merged only when they would fetch byte-for-byte the same file. A
+ * missing `type` really does mean "input" on both sides — that is the fetcher's
+ * default, not a guess made here.
+ *
+ * Order is preserved and the FIRST occurrence wins, so the earlier carrier
+ * decides nothing beyond position.
+ */
+export function dedupeAudioRefs<T extends AudioRef>(refs: readonly T[]): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const ref of refs) {
+    const key = JSON.stringify([ref.filename, ref.subfolder ?? "", ref.type || "input"]);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(ref);
+  }
+  return out;
+}
+
 export function splitAudioAttachments<T extends { filename: string }>(
   refs: readonly T[] | undefined,
 ): { images: T[]; audio: T[] } {

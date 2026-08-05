@@ -1063,6 +1063,28 @@ export class OllamaBackend implements AgentBackend {
     return { content, toolCalls, usage, streamId: streamOpen ? streamId : null };
   }
 
+  /**
+   * The system prompt for the surface that ACTUALLY exists right now: the tool
+   * mode the comfyui child was really spawned with, plus the retraction for a
+   * panel router that was never registered.
+   *
+   * ONE builder, used by both the session opener and the post-switch rewrite,
+   * because those are the two places the prompt is written and they must not
+   * disagree. An earlier shape rebuilt the prompt after a live model switch
+   * WITHOUT the retraction, which silently restored the "you have panel_*"
+   * claim in a session whose router had failed to bind.
+   *
+   * `resolvePrompt` still returns a user override unchanged; the retraction is
+   * appended either way, because it corrects what was REGISTERED and no prompt
+   * override or tool mode changes that.
+   */
+  protected systemPromptForSurface(): string {
+    return (
+      resolvePrompt("backend.ollama", ollamaSystemPrompt(this.toolModeDecision?.mode ?? "compact")) +
+      ollamaPanelRetraction(this.panelRouterAvailable())
+    );
+  }
+
   async *run(opts: BackendStartOptions): AsyncIterable<AgentEvent> {
     await this.prepare();
     if (opts.model && acceptsModelId(opts.model, this.api)) this.model = opts.model;
@@ -1082,15 +1104,10 @@ export class OllamaBackend implements AgentBackend {
       // lane via systemAppend (this adapter drops that), so it is re-derived from
       // what this backend knows first-hand — whether it actually registered the
       // panel router — and appended here. Without it the prompt goes on promising
-      // panel routers that were never registered (#841 lineage).
-      this.history = [
-        {
-          role: "system",
-          content:
-            resolvePrompt("backend.ollama", ollamaSystemPrompt(this.toolModeDecision?.mode ?? "compact")) +
-            ollamaPanelRetraction(this.panelRouterAvailable()),
-        },
-      ];
+      // panel routers that were never registered (#841 lineage). Built by
+      // systemPromptForSurface(), which the post-model-switch rewrite also uses,
+      // so the two writers cannot disagree about what this session was told.
+      this.history = [{ role: "system", content: this.systemPromptForSurface() }];
     }
     yield { type: "session", sessionId: this.sessionId, model: this.model };
 
@@ -1382,20 +1399,30 @@ export class OllamaBackend implements AgentBackend {
           // build), retry ONCE with the images stripped and an honest note in
           // both directions. Any other failure re-throws to the normal handler.
           //
-          // `attachmentsAccepted` is the guard against fabricating a failure:
-          // once ANY request carrying attachments has come back successfully,
-          // this endpoint demonstrably takes them, so a later error — a middle
-          // tool round, a subsequent turn whose history still holds the earlier
-          // media — is something else. Stripping then, and telling the user
-          // "you were not heard", would report a delivery failure that never
-          // happened for media the model had already received.
-          const hadAudio = this.history.some((m) => m.audios?.length);
-          const hadImages = this.history.some((m) => m.images?.length);
-          // …and it must be an OBSERVED rejection. Only a 4xx from the endpoint
-          // is evidence that the request was refused; a connection reset, a
-          // truncated body, or a mid-stream failure after a 200 says nothing
-          // about the attachment, and stripping on those would tell the user the
+          // `turnMediaAccepted` is the guard against fabricating a failure:
+          // once a request carrying THIS TURN's attachments has come back
+          // successfully, the endpoint demonstrably took them, so a later error
+          // — a middle tool round, a subsequent turn whose history still holds
+          // the earlier media — is something else. Stripping then, and telling
+          // the user "you were not heard", would report a delivery failure that
+          // never happened for media the model had already received.
+          //
+          // …and it must be an OBSERVED rejection: the endpoint answered the
+          // request carrying the media with an error STATUS, so nothing was
+          // generated from it. A connection reset, a truncated body, or a
+          // mid-stream failure after a 200 carries no status and says nothing
+          // about the attachment — stripping on those would tell the user the
           // model "did NOT hear" something we never saw it refuse.
+          //
+          // 4xx ONLY, deliberately. A 5xx is the endpoint failing, not the
+          // endpoint refusing what we sent: an upstream outage or a crashed
+          // worker would be narrated as "${model} rejected the request carrying
+          // the audio" — a cause we never observed — and the retry cannot help
+          // anyway, because the next request meets the same broken endpoint. The
+          // media-rejection statuses this recovers from are 4xx on both wires:
+          // Ollama answers an unusable image part with 400 ("this model is
+          // missing data required for image input") and the OpenAI dialect with
+          // 400 ("invalid image input"), both reproduced live.
           const status = (err as { httpStatus?: number } | null)?.httpStatus;
           const requestWasRejected = typeof status === "number" && status >= 400 && status < 500;
           // Arm ONLY when THIS turn attached media that has not yet come back
@@ -1689,18 +1716,23 @@ export class OllamaBackend implements AgentBackend {
     } catch (err) {
       logger.warn(`[ollama-backend] tool-server respawn failed after model switch: ${msgOf(err)}`);
     }
+    // The system prompt is written once, when a session opens — but a LIVE
+    // model switch changes the surface underneath an existing conversation.
+    // Leaving the old prompt in history is not a cosmetic mismatch: it tells a
+    // model now holding the whole catalog that it "has exactly six tools" and
+    // must go through call_tool, so the auto-selected surface goes unused.
+    // Rewrite it to match what was actually spawned.
+    //
+    // Rewritten on BOTH outcomes, and always through systemPromptForSurface():
+    // the respawn tore the PANEL client down too, so the retraction has to be
+    // re-derived from the router that is live NOW. Dropping it here — or
+    // skipping the rewrite when the respawn failed — would put the "you have
+    // panel_list_tools / panel_describe_tool / panel_call_tool" claim back into
+    // a conversation whose router is gone, which is the exact false capability
+    // claim ollamaPanelRetraction exists to retract.
+    const system = this.history[0];
+    if (system?.role === "system") system.content = this.systemPromptForSurface();
     if (this.toolModeDecision) {
-      // The system prompt is written once, when a session opens — but a LIVE
-      // model switch changes the surface underneath an existing conversation.
-      // Leaving the old prompt in history is not a cosmetic mismatch: it tells a
-      // model now holding the whole catalog that it "has exactly six tools" and
-      // must go through call_tool, so the auto-selected surface goes unused.
-      // Rewrite it to match what was actually spawned. resolvePrompt still
-      // returns a USER override unchanged, so a customised prompt is untouched.
-      const system = this.history[0];
-      if (system?.role === "system") {
-        system.content = resolvePrompt("backend.ollama", ollamaSystemPrompt(this.toolModeDecision.mode));
-      }
       logger.info(`[ollama-backend] ${this.toolModeDecision.explain}`);
     } else {
       // connectTools swallows a connect failure, so an absent decision here is

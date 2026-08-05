@@ -8,7 +8,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 // @ts-expect-error plain-JS module under scripts/, no type declarations
-import { buildArenaReport, suspectScenarioLines, vramLabel } from "../../scripts/arena-report.mjs";
+import { axisCell, buildArenaReport, mergeRunAxes, suspectScenarioLines, vramLabel } from "../../scripts/arena-report.mjs";
 
 function entry(over: Record<string, unknown>) {
   return {
@@ -318,6 +318,32 @@ describe("arena-bestof cross-version merge guard (#792)", () => {
     expect(merged.leaderboard[0].runs).toBeUndefined();
   });
 
+  it("refuses to merge two different QUANTIZATIONS of one tag — those are different models", () => {
+    // `ollama pull` replaces the weights under the same name, so a q4 run and a
+    // q8 run are not two samples of one model.
+    const { base, extra } = fixture(
+      { ...mkEntry("0.49.6", 20), quant: "Q4_K_M" },
+      { ...mkEntry("0.49.6", 19), quant: "Q8_0" },
+    );
+    const { out, merged } = run(base, extra);
+    expect(out).toContain("different models under one tag");
+    expect(merged.leaderboard[0].runs).toBeUndefined(); // NOT merged
+    expect(merged.leaderboard[0].quant).toBe("Q4_K_M");
+  });
+
+  it("a merge whose runs did not all record an axis reports it as mixed, not as the winner's value", () => {
+    const { base, extra } = fixture(
+      { ...mkEntry("0.49.6", 20), quant: "Q4_K_M", vramResidentBytes: 5 * 1024 * 1024 * 1024 },
+      mkEntry("0.49.6", 19), // an older run with no axes recorded at all
+    );
+    const { merged } = run(base, extra);
+    expect(merged.leaderboard[0].runs.totals).toEqual([20, 19]);
+    // The winning run was q4 — but the RANGE was not, so the cell must not say q4.
+    expect(merged.leaderboard[0].quant).toBeUndefined();
+    expect(merged.leaderboard[0].mixedAxes).toEqual(expect.arrayContaining(["quant", "vram"]));
+    expect(readFileSync(join(base, "arena-report.md"), "utf8")).toContain("mixed");
+  });
+
   it("an unversioned intermediate merge does not launder a later cross-version run into the range", () => {
     const { base, extra } = fixture(mkEntry("0.49.6", 20), mkEntry(undefined, 19));
     run(base, extra); // merges; entry is now unversioned but remembers v0.49.6
@@ -335,5 +361,68 @@ describe("arena-bestof cross-version merge guard (#792)", () => {
     const { out, merged } = run(base, extra2);
     expect(out).toContain("not directly comparable"); // refused — v0.50.0 vs the v0.49.6 already in the range
     expect(merged.leaderboard[0].runs.totals).toEqual([20, 19]); // unchanged
+  });
+});
+
+describe("a best-of range must not display ONE condition it did not all run under (#792)", () => {
+  const GIB = 1024 * 1024 * 1024;
+
+  it("keeps an axis only when both runs recorded the SAME value", () => {
+    const merged = mergeRunAxes(
+      { params: "8.0B", quant: "Q4_K_M", vramResidentBytes: 5 * GIB },
+      { params: "8.0B", quant: "Q4_K_M", vramResidentBytes: 5 * GIB },
+    );
+    expect(merged.params).toBe("8.0B");
+    expect(merged.quant).toBe("Q4_K_M");
+    expect(merged.mixedAxes).toBeUndefined();
+  });
+
+  it("marks an axis MIXED when only one run recorded it — not `—`, which means never recorded", () => {
+    const merged = mergeRunAxes({ quant: "Q4_K_M" }, {});
+    expect(merged.quant).toBeUndefined();
+    expect(merged.mixedAxes).toContain("quant");
+    expect(axisCell(merged, "quant")).toBe("mixed");
+    // …and an axis nobody recorded stays the honest "not recorded" dash.
+    expect(axisCell({}, "quant")).toBe("—");
+  });
+
+  it("turns two measured VRAM figures into a RANGE rather than the winner's number", () => {
+    const merged = mergeRunAxes({ vramResidentBytes: 5 * GIB }, { vramResidentBytes: 6 * GIB });
+    expect(axisCell(merged, "vram")).toBe("5.0–6.0 GiB");
+    // and a third run widens it rather than folding to the last pair
+    const wider = mergeRunAxes(merged, { vramResidentBytes: 7 * GIB });
+    expect(axisCell(wider, "vram")).toBe("5.0–7.0 GiB");
+  });
+
+  it("VRAM measured by only ONE of the runs is mixed, never presented as the range's figure", () => {
+    const merged = mergeRunAxes({ vramResidentBytes: 5 * GIB }, {});
+    expect(axisCell(merged, "vram")).toBe("mixed");
+  });
+
+  it("`mixed` is sticky: a later matching run does not un-mix the range", () => {
+    const first = mergeRunAxes({ quant: "Q4_K_M" }, {});
+    const second = mergeRunAxes(first, { quant: "Q4_K_M" });
+    expect(second.mixedAxes).toContain("quant");
+    expect(axisCell(second, "quant")).toBe("mixed");
+  });
+
+  it("the report renders the merged cells and explains what `mixed` means", () => {
+    const md = buildArenaReport({
+      gpu: "4090",
+      scenarios: SCEN,
+      leaderboard: [
+        entry({
+          model: "m:e4b",
+          runs: { totals: [20, 19] },
+          quant: undefined,
+          mixedAxes: ["quant"],
+          vramResidentBytesRange: [5 * GIB, 6 * GIB],
+          vramResidentBytes: 6 * GIB,
+        }),
+      ],
+    });
+    expect(md).toContain("| mixed |"); // the quant cell
+    expect(md).toContain("5.0–6.0 GiB");
+    expect(md).toContain("not tied");
   });
 });

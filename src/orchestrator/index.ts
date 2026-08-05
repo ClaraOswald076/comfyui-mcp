@@ -109,7 +109,7 @@ import { OAUTH_PROVIDERS } from "../services/oauth-flow.js";
 import { startPanelMcpHttpServer, type PanelMcpHttpServer } from "./panel-mcp-http.js";
 import { resolveHttpLaneComfyToolMode } from "./http-backend-tools.js";
 import type { ToolMode } from "../transport/cli.js";
-import { splitAudioAttachments } from "./audio-attachment.js";
+import { dedupeAudioRefs, splitAudioAttachments } from "./audio-attachment.js";
 import { startPanelConsoleHttpServer, type PanelConsoleHttpServer } from "./panel-console-http.js";
 import type { AgentBackend } from "./agent-backend.js";
 import { readComfyuiCrashLog, formatCrashNote } from "../services/crash-log.js";
@@ -4851,7 +4851,11 @@ export async function runPanelOrchestrator(): Promise<void> {
       .audio;
     const attachmentSplit = splitAudioAttachments(rawAttached);
     const attachedImages = attachmentSplit.images;
-    const attachedAudio = [...attachmentSplit.audio, ...(declaredAudio ?? [])];
+    // Deduped across the two carriers: a panel that populates BOTH arrays for
+    // the same sound would otherwise spend two of the turn's attachment slots on
+    // one file, and the user would be told the duplicate "did not fit" while the
+    // very same bytes rode the request anyway.
+    const attachedAudio = dedupeAudioRefs([...attachmentSplit.audio, ...(declaredAudio ?? [])]);
     const tabIsBlind = blindTabs.has(event.tab_id);
     if (tabIsBlind && attachedImages?.length) {
       outText += `\n\n[panel note: ${attachedImages.length} image attachment(s) withheld — Blind mode is ON. You cannot see them; ask the user to describe the content or turn Blind off.]`;
