@@ -3,6 +3,7 @@ import {
   OllamaBackend,
   comfyuiSpawnEnv,
   comfyuiSpawnToolMode,
+  acceptsModelId,
   isOllamaModel,
   ollamaSystemPrompt,
   type McpToolClient,
@@ -640,6 +641,41 @@ describe("the system prompt describes the surface that was actually advertised (
       expect(ollamaSystemPrompt(mode)).toContain("never invent results");
       expect(ollamaSystemPrompt(mode)).toContain("PAID credits");
     }
+  });
+});
+
+describe("acceptsModelId — a live switch must not be silently ignored (#788)", () => {
+  it("takes any id the OpenAI-compatible endpoint's own catalog can return", () => {
+    // LM Studio and friends name models whatever they like: `local-model-70b`
+    // has neither a colon nor a slash. Refusing those meant the picker recorded
+    // and displayed the new model while the backend kept running the old one on
+    // the old tool surface — the wrong-model confusion model-keyed selection is
+    // supposed to prevent.
+    expect(acceptsModelId("local-model-70b", "openai")).toBe(true);
+    expect(acceptsModelId("Meta-Llama-3.1-405B-Instruct", "openai")).toBe(true);
+    expect(acceptsModelId("deepseek/deepseek-v4-pro", "openai")).toBe(true);
+  });
+
+  it("keeps the Ollama-tag shape rule on the NATIVE dialect", () => {
+    expect(acceptsModelId("qwen3:4b", "ollama")).toBe(true);
+    expect(acceptsModelId("artokun/gemma4-comfyui-mcp:e4b", "ollama")).toBe(true);
+    expect(acceptsModelId("local-model-70b", "ollama")).toBe(false); // not a tag
+  });
+
+  it("still refuses the hosted frontier ids PanelAgent passes through, on BOTH dialects", () => {
+    // This is the one thing the guard actually exists for.
+    for (const api of ["ollama", "openai"] as const) {
+      expect(acceptsModelId("claude-opus-5", api)).toBe(false);
+      expect(acceptsModelId("gpt-5.6-terra", api)).toBe(false);
+      expect(acceptsModelId("gemini-3-pro", api)).toBe(false);
+      expect(acceptsModelId("", api)).toBe(false);
+      expect(acceptsModelId("   ", api)).toBe(false);
+    }
+  });
+
+  it("gpt-oss is local, on both dialects", () => {
+    expect(acceptsModelId("gpt-oss:120b", "ollama")).toBe(true);
+    expect(acceptsModelId("gpt-oss-120b", "openai")).toBe(true);
   });
 });
 

@@ -374,8 +374,38 @@ export function isOllamaModel(id: string): boolean {
   // blanket ^gpt exclusion refused to switch to it: the panel would show the new
   // model while the backend kept running the old one and its tool surface -
   // wrong-model confusion exactly where model-keyed selection is the promise.
-  if (/^gpt-oss/i.test(id)) return id.includes(":") || id.includes("/");
-  return (id.includes(":") || id.includes("/")) && !/^claude|^gpt|^gemini/i.test(id);
+  return (id.includes(":") || id.includes("/")) && !isHostedFrontierModel(id);
+}
+
+/** The hosted families PanelAgent may pass through unconditionally. This is the
+ *  ONLY thing the model-id guards are really defending against. */
+function isHostedFrontierModel(id: string): boolean {
+  return /^claude|^gemini/i.test(id) || (/^gpt/i.test(id) && !/^gpt-oss/i.test(id));
+}
+
+/**
+ * Will THIS backend instance take `id` as its model?
+ *
+ * The shape rules above are an Ollama-tag heuristic, and they are wrong for the
+ * OpenAI-compatible dialect: that picker is populated from the endpoint's OWN
+ * `/models` catalog, which returns whatever the server calls its models -
+ * LM Studio's `local-model-70b` has neither a colon nor a slash. Rejecting those
+ * meant a live switch was silently ignored while PanelAgent recorded and
+ * displayed the new model: the next turn ran the OLD model on the OLD tool
+ * surface, which is exactly the wrong-model confusion #788's model-keyed
+ * selection exists to prevent.
+ *
+ * The one thing worth guarding stays guarded on both dialects: PanelAgent passes
+ * the panel's Claude model into every backend, and that must never be adopted.
+ */
+export function acceptsModelId(id: string, api: "ollama" | "openai"): boolean {
+  if (!id.trim()) return false;
+  if (isHostedFrontierModel(id)) return false;
+  // Native Ollama: a real tag always carries a ":" or an org "/" prefix, and the
+  // heuristic is what keeps a stray bare word from being adopted as a model.
+  if (api === "ollama") return id.includes(":") || id.includes("/");
+  // OpenAI-compatible: the id came from this endpoint's own catalog.
+  return true;
 }
 
 export class OllamaBackend implements AgentBackend {
@@ -981,7 +1011,7 @@ export class OllamaBackend implements AgentBackend {
 
   async *run(opts: BackendStartOptions): AsyncIterable<AgentEvent> {
     await this.prepare();
-    if (opts.model && isOllamaModel(opts.model)) this.model = opts.model;
+    if (opts.model && acceptsModelId(opts.model, this.api)) this.model = opts.model;
 
     // Ollama is stateless — "session" is our in-memory history. A resume id is
     // honored in name (the panel replays the transcript as context anyway).
@@ -1535,7 +1565,7 @@ export class OllamaBackend implements AgentBackend {
     // back) would otherwise leave the new model on the old model's surface while
     // the ready line still explained the old decision. Flag it here and let the
     // next turn re-spawn at a point where nothing is in flight.
-    if (!isOllamaModel(model)) return;
+    if (!acceptsModelId(model, this.api)) return;
     this.model = model;
   }
 
@@ -1555,10 +1585,9 @@ export class OllamaBackend implements AgentBackend {
   }
 
   protected async reconcileToolModeForModel(): Promise<void> {
-    // NOTE this reads `this.model` — the model actually in use — not whatever
-    // the panel last displayed. `setModel` refuses ids that don't look like this
-    // backend's (isOllamaModel, pre-existing: it stops PanelAgent's
-    // unconditional Claude-model pass-through from hijacking the session), and a
+    // NOTE this reads `this.model` - the model actually in use - not whatever the
+    // panel last displayed. `setModel` still refuses the hosted frontier ids
+    // PanelAgent passes through unconditionally (see acceptsModelId), and a
     // refused switch leaves `this.model` alone. Reading the live value is what
     // keeps the tool surface consistent with the model that will actually serve
     // the turn, rather than with a selection that never took effect.
