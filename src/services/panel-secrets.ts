@@ -149,12 +149,37 @@ let emitSuspendDepth = 0;
 let suspendedComfyuiChange = false;
 let suspendedAgentChange = false;
 
+/**
+ * Fire a change event WITHOUT letting a listener's failure escape.
+ *
+ * `emit` is synchronous, and these listeners do real work — rebuilding an MCP
+ * server's env, scheduling a respawn. They run AFTER the store has already been
+ * rewritten, so a throw from one of them propagated out of `setEnvSecret`, past
+ * the receipt, and reached the caller as a generic failure for a save that had
+ * in fact landed (codex gate). Notifying is not part of the write's transaction:
+ * the credential is on disk either way, and a listener that fails is a
+ * respawn-didn't-happen problem, which the receipt's own `respawn` field already
+ * reports as "nothing was scheduled".
+ */
+function emitGuarded(event: "change" | "agentChange", payload?: Partial<ComfyuiSecretChange>): void {
+  try {
+    if (payload === undefined) emitter.emit(event);
+    else emitter.emit(event, payload);
+  } catch (err) {
+    logger.warn(
+      `[panel-secrets] a "${event}" listener failed after the store was written ` +
+        `(${err instanceof Error ? err.message : String(err)}); the credential IS saved, ` +
+        `but whatever that listener drives — a tool-session respawn, a readiness refresh — did not happen.`,
+    );
+  }
+}
+
 function emitComfyuiChange(payload: Partial<ComfyuiSecretChange>): void {
   if (emitSuspendDepth > 0) {
     suspendedComfyuiChange = true;
     return;
   }
-  emitter.emit("change", payload);
+  emitGuarded("change", payload);
 }
 
 function emitAgentChange(): void {
@@ -162,7 +187,7 @@ function emitAgentChange(): void {
     suspendedAgentChange = true;
     return;
   }
-  emitter.emit("agentChange");
+  emitGuarded("agentChange");
 }
 
 /**
@@ -192,9 +217,19 @@ function withSuspendedEmissions<T>(
     const suppressed = { comfyui: suspendedComfyuiChange, agent: suspendedAgentChange };
     suspendedComfyuiChange = outerComfyui;
     suspendedAgentChange = outerAgent;
-    const plan = decide(result, suppressed);
-    if (plan.comfyui) emitComfyuiChange(plan.comfyui);
-    if (plan.agent) emitAgentChange();
+    // A `finally` that throws REPLACES the outcome of the block it guards — the
+    // receipt, or the real error — so nothing in it may escape. The emits are
+    // already guarded; `decide` is guarded here for the same reason.
+    try {
+      const plan = decide(result, suppressed);
+      if (plan.comfyui) emitComfyuiChange(plan.comfyui);
+      if (plan.agent) emitAgentChange();
+    } catch (err) {
+      logger.warn(
+        `[panel-secrets] deciding what to notify after a secret write failed ` +
+          `(${err instanceof Error ? err.message : String(err)}); the store is unaffected, but no change event was fired.`,
+      );
+    }
   }
 }
 
@@ -1427,6 +1462,22 @@ export function migrateSecretsToEnv(): string[] {
       }
       if (outcome.durabilityGap) {
         logger.warn(`[panel-secrets] migrating ${k}: ${outcome.durabilityGap}`);
+      }
+      // VERIFY OUR OWN KEY, exactly as the setter does. The migration never
+      // did: it wrote, then reported the key migrated and hydrated it into
+      // process.env from the value it happened to hold — so a competitor that
+      // replaced the file after the rename produced a "migrated" key that the
+      // resolver, reading the file, treats as absent (codex gate). A boot line
+      // saying a credential is in place while nothing can resolve it is the
+      // #826 shape at startup.
+      const readBack = parseEnvFile();
+      if (readBack === null || readBack[k] !== v) {
+        logger.warn(
+          `[panel-secrets] ${k} was written to ${envFilePath()} during migration, but ` +
+            `${readBack === null ? "the file could not be re-read" : "it does not read back with that value"} — ` +
+            `NOT reporting it as migrated. The legacy entry is untouched, so the next start retries.`,
+        );
+        continue; // no process.env, no file-derived mark, not counted as migrated
       }
       process.env[k] = v;
       // The canonical file is this value's AUTHORITY now — it lives there. Without

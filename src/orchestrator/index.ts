@@ -61,7 +61,12 @@ import {
 } from "./panel-agent.js";
 import { promptText } from "./error-text.js";
 import { callToolAdmission } from "./call-tool-admission.js";
-import { createPanelMcpServer, makePanelToolCtx, resolvePinTarget } from "./panel-tools.js";
+import {
+  createPanelMcpServer,
+  makePanelToolCtx,
+  resolvePinTarget,
+  secretSavedReply,
+} from "./panel-tools.js";
 import {
   optionsAckFrame,
   optionsErrorAckFrame,
@@ -82,6 +87,7 @@ import {
   setAgentSecret,
   setComfyuiSecret,
   isAllowedComfyuiSecretKey,
+  type SecretSaveReceipt,
 } from "../services/panel-secrets.js";
 import { CodexBackend } from "./codex-backend.js";
 import { GeminiBackend, GEMINI_DEFAULT_MODEL } from "./gemini-backend.js";
@@ -4118,19 +4124,38 @@ export async function runPanelOrchestrator(): Promise<void> {
       const key = typeof rawKey === "string" ? rawKey : "";
       const value = typeof rawValue === "string" ? rawValue : "";
       let error: string | undefined;
+      // The RECEIPT, not merely "did the call throw". This route discarded it
+      // entirely and answered `ok:true` for every verdict — including a save
+      // whose read-back could not be taken, and one that PROVED other
+      // credentials were destroyed (codex gate). `ok` is the same question the
+      // console endpoint and the tool ack ask: `persisted === "yes"`.
+      let receipt: SecretSaveReceipt | undefined;
       try {
         if (!value.trim()) throw new Error("No token entered — nothing was saved.");
-        if (isAllowedComfyuiSecretKey(key)) setComfyuiSecret(key, value.trim());
-        else setAgentSecret(key, value.trim());
+        receipt = isAllowedComfyuiSecretKey(key)
+          ? setComfyuiSecret(key, value.trim())
+          : setAgentSecret(key, value.trim());
         logger.info(`[panel-orchestrator] secret set from panel Settings: ${key} (redacted)`);
       } catch (err) {
         error = err instanceof Error ? err.message : String(err);
       }
+      // ONE derivation of "may the panel paint this green", shared with every
+      // other consumer of a receipt (see secretSavedReply).
+      const reply = receipt ? secretSavedReply(receipt) : { ok: false, error };
       bridge.push(
-        { type: "secret_saved", key, ok: !error, ...(error ? { error } : {}) },
+        {
+          type: "secret_saved",
+          key,
+          ok: reply.ok,
+          ...(reply.error ?? error ? { error: reply.error ?? error } : {}),
+          ...(reply.warnings?.length ? { warnings: reply.warnings } : {}),
+        },
         event.tab_id,
       );
-      if (!error) pushReadiness(event.tab_id);
+      // Readiness still reflects whatever the store ACTUALLY carries now, so it
+      // is refreshed whenever a write happened at all — a damaged or unverified
+      // save changed the world and the panel must not keep showing the old view.
+      if (receipt) pushReadiness(event.tab_id);
       return;
     }
 

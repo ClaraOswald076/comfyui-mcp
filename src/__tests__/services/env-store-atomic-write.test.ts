@@ -542,6 +542,63 @@ describe("the boot MIGRATION does not swallow what its write cost", () => {
   });
 });
 
+describe("notifying is not part of the write's transaction", () => {
+  it("a listener that THROWS after the rename does not destroy the receipt", async () => {
+    // `emit` is synchronous and these listeners do real work — rebuilding an MCP
+    // server's env, scheduling a respawn — AFTER the store has been rewritten.
+    // A throw from one propagated out past the receipt and reached the caller as
+    // a generic failure for a save that had in fact landed (codex gate).
+    const { onComfyuiSecretsChanged } = await import("../../services/panel-secrets.js");
+    const off = onComfyuiSecretsChanged(() => {
+      throw new Error("respawn scheduling blew up");
+    });
+    try {
+      writeFileSync(envPath, POPULATED, { mode: 0o600 });
+      let r: ReturnType<typeof setComfyuiSecret> | undefined;
+      expect(() => {
+        r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+      }).not.toThrow();
+      // The credential really is saved, and the receipt says so.
+      expect(r!.persisted).toBe("yes");
+      expect(parseEnvFile()!.CIVITAI_API_TOKEN).toBe("civ-new");
+      // ...and the respawn it drives is reported as NOT having happened, rather
+      // than as a number nobody observed.
+      expect(r!.respawn).toBeNull();
+    } finally {
+      off();
+    }
+  });
+});
+
+describe("the boot MIGRATION verifies its own key, not just that it wrote", () => {
+  it("does NOT report a key migrated when the store does not read it back", async () => {
+    // It wrote, then reported the key migrated and hydrated it into process.env
+    // from the value it happened to hold. A competitor replacing the file after
+    // the rename therefore produced a "migrated" credential the resolver — which
+    // reads the FILE — treats as absent (codex gate).
+    const { logger } = await import("../../utils/logger.js");
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    try {
+      writeFileSync(envPath, "", { mode: 0o600 });
+      writeFileSync(
+        join(dir, "panel-secrets.json"),
+        JSON.stringify({ comfyuiEnv: { CIVITAI_API_TOKEN: "civ-legacy" } }),
+      );
+      // The rename installs a file WITHOUT the key it was supposed to add.
+      fsState.tamperOnRename = () => "# somebody else won\n";
+      const migrated = migrateSecretsToEnv();
+      expect(migrated).not.toContain("CIVITAI_API_TOKEN");
+      expect(process.env.CIVITAI_API_TOKEN).toBeUndefined(); // not hydrated either
+      const lines = warn.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(lines).toMatch(/NOT reporting it as migrated/);
+      expect(lines).not.toContain("civ-legacy"); // names only
+    } finally {
+      warn.mockRestore();
+      delete process.env.CIVITAI_API_TOKEN;
+    }
+  });
+});
+
 describe("the write is made DURABLE, and says so when it could not be", () => {
   it("fsyncs the DIRECTORY after the rename, so the rename itself survives a power loss", () => {
     // A rename is not durable until the directory entry is flushed: the new name
