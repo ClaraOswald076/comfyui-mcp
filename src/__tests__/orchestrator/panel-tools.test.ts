@@ -4694,6 +4694,7 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
     // The REASON — an unknown, explicitly not a rebind — and the stale uuid still in force.
     expect(text).toMatch(/Could NOT read the live canvas identity/);
     expect(text).toMatch(/This is not a rebind — it is an unknown/);
+    expect(text).toMatch(/NOTHING about this session's graph binding was observed/);
     expect(text).toContain(STALE);
     expect(refresh).not.toHaveBeenCalled();
     expect(currentStamp()).toBe(STALE); // the fence was left intact, not cleared
@@ -4704,10 +4705,23 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
     // and explicitly disarmed, and our own remedy is stated BEFORE it.
     expect(text).toMatch(/disregard any rebind advice inside it/);
     expect(text.indexOf("WHAT TO DO")).toBeLessThan(text.indexOf("UNDERLYING CAUSE"));
-    expect(text).toMatch(/Repeating this call WITHOUT that refresh will fail the same way/);
     // …and the remedy never sends the caller to panel_reload, which #803 observed
     // leaving the tab permanently unresponsive from exactly this state.
     expect(text).toMatch(/Do NOT use panel_reload/);
+  });
+
+  it("an UNREADABLE read is an unknown even with NO prior fence — it never claims reads work", async () => {
+    // The read that would have told us whether this session is usable is the one
+    // that failed. Reporting "graph READS work" from a failed observation is the
+    // same could-not-determine/therefore-not fold, pointed at a positive.
+    const { bridge, tab } = fenceBridge({ fence: undefined, listThrows: "no connected tab" });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/whether graph reads work is unknown/i);
+    expect(text).not.toMatch(/graph READS work/);
+    // …and the FIRST remedy offered is the one reachable right now.
+    expect(text).toMatch(/WHAT TO DO: retry in a moment/);
   });
 
   it("distinguishes NO_IDENTITY from UNREADABLE — same wedge, different remedy", async () => {
@@ -4759,6 +4773,11 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
       graph_binding_status: "no_identity",
     });
     expect(text).toMatch(/graph MUTATIONS stay refused/);
+    // The remedy must be reachable: a panel build with no workflow identity will
+    // NEVER acquire one by reconnecting, so "wait for a reconnect" would be an
+    // aspirational instruction. Name the thing that does work.
+    expect(text).toMatch(/reconnecting alone will NOT restore mutations/);
+    expect(text).toMatch(/pack UPDATED/);
   });
 
   it("does NOT read the live canvas at all when the rebind DEFERRED (zero tabs connected)", async () => {
@@ -4834,6 +4853,52 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
     expect(res.isError).toBe(true);
     expect(refresh).not.toHaveBeenCalled();
   });
+
+  it("COMMITS the target store BEFORE the live-canvas round trip, so a concurrent pin isn't clobbered", async () => {
+    // The store is shared by every session bound to this tab. An await placed
+    // between the decision and the write widens the window in which THIS call's
+    // staler `current` overwrites a concurrent agent's later, successful pin —
+    // and that agent was told its edits were pinned. It also makes the failure
+    // text's "APPLIED (do not repeat this part)" literally true.
+    const store = new WorkflowTargetStore();
+    const order: string[] = [];
+    const tab = "wf:workflows/a.json";
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) => {
+        if (cmd.cmd === "workflow_list") {
+          order.push("workflow_list");
+          // The target must ALREADY be committed by the time we are asked to read.
+          expect(store.get(tab)).toMatchObject({ mode: "current" });
+          throw new Error("no connected tab");
+        }
+        return { ok: true };
+      },
+      push: () => {
+        order.push("push");
+        return 1;
+      },
+      canReach: (id: string) => id === tab,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: tab, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => tab,
+      refreshWorkflowUuid: () => true,
+      workflowUuidFor: () => STALE,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, tab, store);
+
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    // The fence read failed, so the call reports failure…
+    expect(res.isError).toBe(true);
+    // …but the target write it already performed is NOT retracted, and it landed
+    // before the round trip (the push precedes the read).
+    expect(store.get(tab)).toMatchObject({ mode: "current" });
+    // The push (which follows the store write) precedes EVERY workflow_list probe —
+    // ctx.call retries a retry-safe read once, so there may be more than one.
+    expect(order[0]).toBe("push");
+    expect(order.filter((o) => o === "workflow_list").length).toBeGreaterThan(0);
+    expect(order.indexOf("push")).toBeLessThan(order.indexOf("workflow_list"));
+    expect((res.content[0] as { text: string }).text).toMatch(/APPLIED \(do not repeat this part\)/);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -4847,7 +4912,8 @@ describe("panel-tools: panel_run scoped-run stamp-race retry (#772)", () => {
     "was queued - the deferred dispatch would render a modified workflow, not the one that was " +
     "scoped. Nothing was queued - refusing to fall through to a full-graph execution (#556).";
 
-  /** A ctx whose graph_run replies are scripted per attempt. */
+  /** A ctx whose graph_run replies are scripted per attempt. A reply of
+   *  `{__error}` is an isError ToolResult; `{__throw}` makes ctx.call THROW. */
   function runCtx(replies: Array<Record<string, unknown>>) {
     const runs: Record<string, unknown>[] = [];
     const ctx: PanelToolCtx = {
@@ -4855,6 +4921,7 @@ describe("panel-tools: panel_run scoped-run stamp-race retry (#772)", () => {
         if (cmd.cmd !== "graph_run") return { content: [{ type: "text", text: "{}" }] };
         const reply = replies[runs.length] ?? { queued: true };
         runs.push(cmd);
+        if (typeof reply.__throw === "string") throw new Error(reply.__throw);
         if (typeof reply.__error === "string") {
           return { content: [{ type: "text", text: `Error: ${reply.__error}` }], isError: true };
         }
@@ -4931,12 +4998,72 @@ describe("panel-tools: panel_run scoped-run stamp-race retry (#772)", () => {
     expect(runText(res)).not.toMatch(/Exactly one render was queued/);
   });
 
+  it("STRUCTURED queue evidence vetoes the prose — `queued:true` alongside the race never retries", async () => {
+    // detectRunRejection deliberately calls any non-empty `error` a rejection even
+    // with a stale `queued:true` (#213). For the RETRY decision that same reply is
+    // the opposite case: an OBSERVED positive queue signal. "Nothing was queued" is
+    // prose the panel wrote; `queued:true` is a fact it reported. Retrying here
+    // would put a SECOND render in the queue.
+    const { ctx, runs } = runCtx([{ queued: true, error: RACE }, { queued: true }]);
+    const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(runs).toHaveLength(1);
+  });
+
+  it("a reported prompt_id also vetoes the retry", async () => {
+    const { ctx, runs } = runCtx([{ error: RACE, prompt_id: "p-already-queued" }, { queued: true }]);
+    const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(runs).toHaveLength(1);
+  });
+
+  it("does NOT retry an unparseable reply — unreadable is an unknown, not a clean queue", async () => {
+    const runs: Record<string, unknown>[] = [];
+    const ctx = {
+      call: async (cmd: Record<string, unknown>) => {
+        if (cmd.cmd !== "graph_run") return { content: [{ type: "text", text: "{}" }] };
+        runs.push(cmd);
+        // Non-JSON body that still carries both phrases.
+        return { content: [{ type: "text", text: RACE }] };
+      },
+      confirm: async () => "yes" as const,
+      bridge: { push: () => 1 } as unknown as PanelToolCtx["bridge"],
+      tabId: "t",
+    } as unknown as PanelToolCtx;
+    await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+    expect(runs).toHaveLength(1);
+  });
+
+  it("a THROWING second dispatch reports both facts instead of destroying them", async () => {
+    // The one point where a throw would lose evidence we already hold: that the
+    // first dispatch was certified not-queued, and that a second went out whose
+    // outcome is now unknown. Never claim the queue is clean; never invite a third.
+    const { ctx, runs } = runCtx([{ error: RACE }, { __throw: "socket exploded" }]);
+    const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(runs).toHaveLength(2);
+    const t = runText(res);
+    expect(t).toMatch(/outcome is UNKNOWN and it may have queued a render/);
+    expect(t).toMatch(/FIRST dispatch was certified by the panel to have queued nothing/);
+    expect(t).toMatch(/Do NOT re-run blindly/);
+    expect(t).toMatch(/socket exploded/); // the cause is preserved, not swallowed
+  });
+
   it("the retryable-race classifier itself refuses an unknown outcome", () => {
     const race: ToolResult = { content: [{ type: "text", text: RACE }] };
     const answered: ToolResult = { content: [{ type: "text", text: "{}" }] };
     const errored: ToolResult = { content: [{ type: "text", text: "boom" }], isError: true };
+    const queued: ToolResult = {
+      content: [{ type: "text", text: JSON.stringify({ queued: true, error: RACE }) }],
+    };
+    const unparseable: ToolResult = { content: [{ type: "text", text: "not json" }] };
     expect(__panelRunTestHooks.isRetryableRunToNodeStampRace(answered, race)).toBe(true);
     expect(__panelRunTestHooks.isRetryableRunToNodeStampRace(errored, race)).toBe(false);
+    expect(__panelRunTestHooks.isRetryableRunToNodeStampRace(queued, race)).toBe(false);
+    expect(__panelRunTestHooks.isRetryableRunToNodeStampRace(unparseable, race)).toBe(false);
   });
 });
 
@@ -4971,6 +5098,42 @@ describe("panel-tools: ack-timeout classification survives a full, spaced tab id
   it("still classifies the unspaced and legacy sliced forms", () => {
     expect(__openWorkflowTestHooks.isAckTimeout(timeout("wf:workflows/a.json"))).toBe(true);
     expect(__openWorkflowTestHooks.isAckTimeout(timeout("wf:workf"))).toBe(true);
+  });
+
+  it("accepts the wrapper's `Error: ` prefix and an APPENDED retry token", () => {
+    // ctx.call surfaces a reply timeout as exactly `Error: ` + the bridge message,
+    // and #694 may append a retry-token sentence. Both must still classify, or the
+    // recovery silently switches off.
+    const wrapped: ToolResult = {
+      content: [
+        {
+          type: "text",
+          text:
+            `Error: Panel tab wf:workflows/My Graph.json did not reply to "workflow_open" within ` +
+            `15000 ms — the ComfyUI tab may be backgrounded or frozen\n\nTo retry this exact ` +
+            `mutation, re-issue identical args plus retry_of:"abc"; otherwise call normally.`,
+        },
+      ],
+      isError: true,
+    };
+    expect(__openWorkflowTestHooks.isAckTimeout(wrapped)).toBe(true);
+  });
+
+  it("REFUSES an acked executor error that merely EMBEDS the timeout phrase", () => {
+    // Only the bridge's own no-reply message STARTS with the preamble. A relayed
+    // executor failure that quotes it is a real, acked error — treating it as a
+    // no-reply sends it down the receipt-recovery path, where it can be reported
+    // as a "recovered" success for something that genuinely failed.
+    const embedded: ToolResult = {
+      content: [
+        {
+          type: "text",
+          text: `relay failed: Panel tab wf:workflows/a.json did not reply to "workflow_open" within 15000 ms — reconnecting`,
+        },
+      ],
+      isError: true,
+    };
+    expect(__openWorkflowTestHooks.isAckTimeout(embedded)).toBe(false);
   });
 
   it("still refuses a timeout for a DIFFERENT command, and any non-error result", () => {

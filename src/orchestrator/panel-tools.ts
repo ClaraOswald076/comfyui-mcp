@@ -1181,7 +1181,20 @@ function isAckTimeout(res: ToolResult): boolean {
   // workflows these reports were filed against: a guard quietly answering "no"
   // because it could not parse, which is the very fold this cluster is about.
   // Mirrors isReplyTimeoutError's identical `.+?` segmentation.
-  return /Panel tab .+? did not reply to "workflow_open" within \d+\s*ms/i.test(text);
+  //
+  // START-ANCHORED (codex gate). The old form matched the phrase ANYWHERE, so an
+  // ACKED executor error that merely EMBEDS or WRAPS it — `relay failed: Panel tab
+  // … did not reply to "workflow_open" …` — was treated as a no-reply and sent
+  // down the receipt-recovery path, where it could be reported as a "recovered"
+  // success. Only the bridge's own message starts with the preamble; ctx.call
+  // surfaces a reply timeout as exactly `Error: ` + that message (and may APPEND a
+  // retry token), so the optional prefix plus a start anchor is the tight form
+  // that still admits every real ack timeout. The tail stays open on purpose —
+  // anchoring the end would reject the appended-token variant and silently switch
+  // the recovery off, which is the same failure in the opposite direction.
+  return /^(?:Error: )?Panel tab .+? did not reply to "workflow_open" within \d+\s*ms/i.test(
+    text.trimStart(),
+  );
 }
 
 /** Parse a ctx.call ToolResult's text payload as JSON, or null if not parseable. */
@@ -1937,7 +1950,16 @@ function detectRunRejection(res: ToolResult): ToolResult | null {
  *  - the reply must be a panel ANSWER (`!isError`). A transport error, a reply
  *    timeout, or a mid-command drop leaves the outcome UNKNOWN — the command may
  *    already be queued — and an unknown must never be retried;
- *  - the text must carry BOTH the race verdict and the explicit
+ *  - the reply must PARSE. An unreadable reply is an unknown, not a clean queue;
+ *  - STRUCTURED queue evidence VETOES the retry, and beats prose (codex gate).
+ *    `detectRunRejection` classifies any non-empty `error` as a rejection even
+ *    when the same reply carries `queued:true` (#213) — deliberately, because a
+ *    stale success flag must not mask a validation failure. But for the RETRY
+ *    decision that reply is the opposite case: an OBSERVED positive queue signal.
+ *    "Nothing was queued" is prose the panel wrote; `queued:true` / a `prompt_id`
+ *    is a fact it reported. A wrong "yes" here queues a second render, so any
+ *    positive queue evidence wins and the run is never re-issued;
+ *  - the text must then carry BOTH the race verdict and the explicit
  *    "Nothing was queued" certification. Either alone is not proof, so a future
  *    panel that drops the certification simply stops qualifying;
  *  - the caller must actually have sent a scoped run — checked at the call site
@@ -1945,6 +1967,10 @@ function detectRunRejection(res: ToolResult): ToolResult | null {
  */
 function isRetryableRunToNodeStampRace(res: ToolResult, rejection: ToolResult): boolean {
   if (res?.isError) return false; // outcome unknown — never retry
+  const parsed = parseToolResultJson(res);
+  if (!parsed) return false; // unreadable reply — an unknown, not a clean queue
+  if (parsed.queued === true) return false; // observed queue evidence vetoes prose
+  if (typeof parsed.prompt_id === "string" && parsed.prompt_id.trim() !== "") return false;
   const text = toolResultText(rejection);
   return (
     /workflow graph CHANGED after the run was queued/i.test(text) &&
@@ -2219,29 +2245,34 @@ function describeFenceRebind(r: WorkflowFenceRebind): {
           `graph tools will keep failing.\n\nWHAT TO DO: ${RELOAD_TAB_REMEDY}`,
       };
     case "unreadable":
-      return r.previous
-        ? {
-            binding: "not_recovered",
-            // The quoted cause is a WRAPPED transport error whose own text may
-            // suggest rebinding with mode:"current" — the call that just failed.
-            // Quote it last, label it as a quote, and disarm it explicitly rather
-            // than letting the reader end on advice that provably cannot work.
-            note:
-              ` Could NOT read the live canvas identity, so this session is STILL fenced to the ` +
-              `previous workflow instance (${r.previous}) and graph tools will keep failing with ` +
-              `a workflow-instance mismatch. This is not a rebind — it is an unknown.` +
-              `\n\nWHAT TO DO: ${RELOAD_TAB_REMEDY} Repeating this call WITHOUT that refresh ` +
-              `will fail the same way.` +
-              `\n\nUNDERLYING CAUSE (quoted verbatim — disregard any rebind advice inside it; ` +
-              `rebinding is what just failed): ${r.detail}`,
-          }
-        : {
-            binding: "reads_only",
-            note:
-              ` Could not read the live canvas identity, so this session has no graph command ` +
-              `fence: routing is set and graph READS work, but graph MUTATIONS stay refused. ` +
-              `(Cause, quoted verbatim: ${r.detail})`,
-          };
+      // ALWAYS not_recovered, with or without a prior fence (codex gate). The read
+      // we just attempted FAILED, so nothing about this session was observed —
+      // including whether graph READS work. The earlier draft reported the
+      // no-prior-fence case as a usable `reads_only`, which asserted a capability
+      // straight out of a failed observation: the exact "could not determine X,
+      // therefore X" fold this cluster exists to remove. Say UNKNOWN and say what
+      // is possible.
+      //
+      // The quoted cause is a WRAPPED transport error whose own text may suggest
+      // rebinding with mode:"current" — the call that just failed. Quote it last,
+      // label it as a quote, and disarm it explicitly rather than letting the
+      // reader end on advice that provably cannot work.
+      return {
+        binding: "not_recovered",
+        note:
+          ` Could NOT read the live canvas identity — the panel did not answer, so NOTHING ` +
+          `about this session's graph binding was observed.` +
+          (r.previous
+            ? ` It is still fenced to the previous workflow instance (${r.previous}), which the ` +
+              `panel will keep refusing.`
+            : ` It has no graph command fence; whether graph reads work is unknown, because the ` +
+              `read that would have told us is the one that failed.`) +
+          ` This is not a rebind — it is an unknown.` +
+          `\n\nWHAT TO DO: retry in a moment — a busy or mid-reconnect panel often answers on ` +
+          `the next attempt. If it keeps failing: ${RELOAD_TAB_REMEDY}` +
+          `\n\nUNDERLYING CAUSE (quoted verbatim — disregard any rebind advice inside it; ` +
+          `rebinding is what just failed): ${r.detail}`,
+      };
     case "no_identity":
       return r.previous
         ? {
@@ -2251,14 +2282,23 @@ function describeFenceRebind(r: WorkflowFenceRebind): {
               `this session is STILL fenced to the previous workflow instance (${r.previous}) ` +
               `and graph tools will keep failing. A cached older panel bundle is the usual cause.` +
               `\n\nWHAT TO DO: ${RELOAD_TAB_REMEDY} Make it a HARD refresh here specifically: a ` +
-              `plain reload can serve the same cached bundle again; only a hard refresh replaces it.`,
+              `plain reload can serve the same cached bundle again; only a hard refresh replaces ` +
+              `it. If a hard refresh does not help, the installed pack itself predates the ` +
+              `per-workflow identity and must be UPDATED — no rebind can add it.`,
           }
         : {
             binding: "reads_only",
+            // Honest limit (codex gate): "until it reconnects with one" was not
+            // actionable — a panel build that has no workflow identity will never
+            // acquire one merely by reconnecting. Name the remedy that exists.
             note:
-              ` The panel reported no workflow identity for the active canvas, so graph READS ` +
-              `work but graph MUTATIONS stay refused for this tab until it reconnects with one. ` +
-              `Routing is set.`,
+              ` The panel answered but reports NO workflow identity for the active canvas. Graph ` +
+              `READS work; graph MUTATIONS stay refused, because there is no instance for the ` +
+              `panel to fence a write against. Routing is set.` +
+              `\n\nNOTE: reconnecting alone will NOT restore mutations — a panel build that ` +
+              `reports no workflow identity needs the comfyui-mcp-panel pack UPDATED (then a ` +
+              `hard refresh of the ComfyUI browser tab, since the open tab can keep running a ` +
+              `cached older bundle). Until then this session is read-only for graph tools.`,
           };
   }
 }
@@ -5865,8 +5905,24 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           isRetryableRunToNodeStampRace(res, rejection)
         ) {
           scopeRebuilt = true;
-          res = await ctx.call(runCmd, 20000);
-          rejection = detectRunRejection(res);
+          try {
+            res = await ctx.call(runCmd, 20000);
+            rejection = detectRunRejection(res);
+          } catch (err) {
+            // ctx.call settles every panel/transport failure into a ToolResult and does
+            // not throw today — but this await is the one point where a throw would
+            // DESTROY evidence we already hold: that the first dispatch was certified
+            // not-queued, and that a second dispatch went out whose outcome is now
+            // unknown. Propagating the raw throw would lose both and invite a third
+            // dispatch. Report what we observed, claim nothing we did not.
+            return fail(
+              `panel_run re-issued the scoped run after the panel's certified run-to-node ` +
+                `stamp race, and that SECOND dispatch failed before any reply could be read — ` +
+                `its outcome is UNKNOWN and it may have queued a render. The FIRST dispatch was ` +
+                `certified by the panel to have queued nothing. Do NOT re-run blindly: check the ` +
+                `queue (action:"list") or get_history before deciding. (${err instanceof Error ? err.message : String(err)})`,
+            );
+          }
         }
         if (rejection) {
           // Disclose the re-issue on the failure path too: the caller must know a SECOND
@@ -6796,15 +6852,6 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           if (!deferredBind && ctx.tabId !== before) {
             rebindNote = ` Rebound this session from tab ${before.slice(0, 8)} onto the active tab ${ctx.tabId.slice(0, 8)}.`;
           }
-          // #770/#803/#716 — ROUTING is only half of "follow the tab that's live now".
-          // rebindToActiveTab is a NO-OP whenever the bound tab is still REACHABLE, which
-          // is the dominant wedge: the socket is fine, the canvas was replaced (or
-          // re-registered) under it, and the command fence still names the workflow
-          // instance that is gone. Re-derive the fence from the panel's live active
-          // record so this call delivers the recovery its own documentation promises.
-          // Deferred (zero-tab) sessions are skipped: there is nothing to read from yet,
-          // and their note already says exactly that.
-          if (!deferredBind) fenceRebind = await rebindWorkflowFence(ctx);
         }
         // PIN: bind to the EXACT open-workflow identity from the authoritative
         // workflow_list, canonicalizing to its stable `key`, FAILING CLOSED when the
@@ -6834,6 +6881,28 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           refreshWorkflowUuid(ctx, { workflow_uuid: pinnedWorkflowUuid });
         }
         ctx.bridge.push({ type: "workflow_target", target }, ctx.tabId);
+        // #770/#803/#716 — ROUTING is only half of "follow the tab that's live now".
+        // rebindToActiveTab is a NO-OP whenever the bound tab is still REACHABLE, which
+        // is the dominant wedge: the socket is fine, the canvas was replaced (or
+        // re-registered) under it, and the command fence still names the workflow
+        // instance that is gone. Re-derive the fence from the panel's live active record
+        // so this call delivers the recovery its own documentation promises. Deferred
+        // (zero-tab) sessions are skipped: there is nothing to read from yet, and their
+        // note already says exactly that.
+        //
+        // ORDER MATTERS (codex gate): this round trip runs AFTER the target store write
+        // and the panel push, never between the decision and the write. The store is
+        // shared by every session bound to this tab (panel-mcp-http mounts one per
+        // connection), so an await placed BEFORE the write would widen the window in
+        // which a concurrent agent's later, successful pin can be clobbered by this
+        // call's staler `current` — and that agent would have been told its edits were
+        // pinned. The pre-existing awaitReachable/resolvePinTarget awaits already sit
+        // ahead of the write; this change must not add another. It is also what makes
+        // the failure text's "APPLIED (do not repeat this part)" literally true: the
+        // target write is already committed and pushed by the time we can fail.
+        if (mode === "current" && ctx.rebindToActiveTab && !deferredBind) {
+          fenceRebind = await rebindWorkflowFence(ctx);
+        }
         const hint =
           target.mode === "pinned"
             ? `Pinned to "${target.filename ?? target.path}". Graph tools will target that workflow without switching the user's view.`
