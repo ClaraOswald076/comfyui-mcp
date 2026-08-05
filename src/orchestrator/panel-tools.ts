@@ -7480,7 +7480,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // ENDPOINT BINDING: restartComfyUI() acts on the orchestrator's GLOBAL config
             // target (a hello can retarget it). Only run it when the bound tab fronts our
             // OWN boot URL AND that URL is the CURRENT global target — so the relaunch
-            // cycles the endpoint this tab rebooted, not one it was retargeted away from.
+            // cycles the endpoint this tab TARGETED, not one it was retargeted away from.
+            // Targeted, not rebooted: this branch runs only when `rebootNoEndpoint`
+            // says the Manager reboot was refused for want of an endpoint, so nothing
+            // was rebooted here at all.
             //
             // "Endpoint", not "instance": `sameHttpBase` compares URLs, which cannot see a
             // server replaced at the same URL between the reboot and here. That gap is real
