@@ -448,11 +448,15 @@ async function corroborateBaseByModelInventory(
 
   // Bounded: stop at the first category that yields a COMPLETE match, and never walk
   // the whole list — this sits in front of a download, not in a background job.
-  let checked = 0;
+  let attempted = 0;
   let unreadableCategories = 0;
   let lastReason: string | undefined;
   for (const category of categories) {
-    if (checked >= MAX_INVENTORY_CATEGORIES) break;
+    // Bounds the REQUESTS, not just the successful comparisons. Counting only readable
+    // non-empty listings meant a server with thousands of empty or failing categories
+    // issued thousands of synchronous HTTP calls in front of a download.
+    if (attempted >= MAX_INVENTORY_CATEGORIES) break;
+    attempted += 1;
     let files: string[];
     try {
       const client = getClient();
@@ -466,13 +470,24 @@ async function corroborateBaseByModelInventory(
         unreadableCategories += 1;
         continue;
       }
-      files = json.filter((n): n is string => typeof n === "string" && n.trim() !== "");
+      // A malformed ENTRY makes the whole listing inconclusive. Dropping it and matching
+      // "the rest" would approve a destination while quietly not accounting for
+      // everything the server said it sees — a complete match that is not complete.
+      const malformed = json.filter((n) => typeof n !== "string" || n.trim() === "");
+      if (malformed.length > 0) {
+        unreadableCategories += 1;
+        lastReason =
+          `the server's listing for "${category}" contained ${malformed.length} entr(y/ies) that ` +
+          "are not usable filenames, so what it sees there could not be established — and a " +
+          "match on only the readable remainder would not be the complete match this check requires";
+        continue;
+      }
+      files = json as string[];
     } catch {
       unreadableCategories += 1;
       continue;
     }
     if (files.length === 0) continue;
-    checked += 1;
     const categoryDir = join(modelsDir, category);
     // The CATEGORY name comes from the server too, so it gets the same containment
     // check as the files under it.
@@ -534,9 +549,10 @@ async function corroborateBaseByModelInventory(
   };
 }
 
-/** How many non-empty categories the inventory corroboration will compare before
- *  giving up. One complete match is proof; scanning further only costs latency. */
-const MAX_INVENTORY_CATEGORIES = 4;
+/** How many category listings the inventory corroboration will REQUEST before giving up
+ *  — attempts, not successes, so an empty or failing category still consumes budget. One
+ *  complete match is proof; scanning further only costs latency in front of a download. */
+const MAX_INVENTORY_CATEGORIES = 8;
 
 export async function resolveModelsDirWithBases(): Promise<{
   modelsDir: string;
