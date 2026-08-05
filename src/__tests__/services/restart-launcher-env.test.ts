@@ -2333,6 +2333,10 @@ n127.0.0.1:8188
     // The claim is scoped to OUR relaunch. Our child dying does not establish that
     // nothing is serving the port now (codex gate).
     expect(result.message).not.toMatch(/ComfyUI is DOWN/);
+    // …nor that the API never came up: a poll only establishes what the SCHEDULED
+    // PROBES saw, and the server could have answered between two of them.
+    expect(result.message).not.toMatch(/before the API came up/i);
+    expect(result.message).toMatch(/the last one included/i);
 
     killSpy.mockRestore();
   });

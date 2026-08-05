@@ -468,6 +468,13 @@ describe("process-control startup readiness", () => {
     // a present global state from a fact about our own process (codex gate).
     expect(result.message).not.toMatch(/ComfyUI is DOWN/);
     expect(result.message).toMatch(/re-check with health_check/i);
+    // Nor may it claim the API NEVER came up. A poll establishes only what the
+    // SCHEDULED PROBES saw; the server could have answered in a gap between two of
+    // them, so the supportable statement is about the probes (codex gate round 3).
+    expect(result.message).not.toMatch(/before the API came up/i);
+    expect(result.message).not.toMatch(/did not become ready/i);
+    expect(result.message).toMatch(/no readiness probe got a response/i);
+    expect(result.message).toMatch(/the last one included/i);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
