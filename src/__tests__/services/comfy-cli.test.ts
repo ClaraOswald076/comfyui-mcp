@@ -7,8 +7,11 @@ import { join } from "node:path";
 // Keep config.comfyuiPath deterministically unset so the saved-default-workspace
 // resolution path (#506/#403) is what's under test, not any real auto-detected
 // install on the host running the suite.
-const cfg = vi.hoisted(() => ({ comfyuiPath: undefined as string | undefined }));
-vi.mock("../../config.js", () => ({ config: cfg }));
+const cfg = vi.hoisted(() => ({
+  comfyuiPath: undefined as string | undefined,
+  remote: false,
+}));
+vi.mock("../../config.js", () => ({ config: cfg, isRemoteMode: () => cfg.remote }));
 
 // Control the saved default workspace resolveEffectiveComfyUIBase() returns.
 const wsMock = vi.hoisted(() => ({ base: undefined as string | undefined }));
@@ -23,6 +26,7 @@ import {
   normalizeComfyCliResult,
   parseComfyCliEnvelope,
   resolveComfyCliExecutable,
+  runComfyCliSync,
   shouldUseComfyCli,
 } from "../../services/comfy-cli.js";
 
@@ -34,6 +38,7 @@ afterEach(() => {
   else process.env.COMFY_CLI_PATH = originalCliPath;
   wsMock.base = undefined;
   cfg.comfyuiPath = undefined;
+  cfg.remote = false;
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -277,5 +282,57 @@ describe("comfy-cli adapter", () => {
     writeFileSync(executable, "@echo off\n");
     process.env.COMFY_CLI_PATH = executable;
     expect(resolveComfyCliExecutable()).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #490's repair makes this MORE dangerous, not less: in remote mode the
+// workspace resolver now correctly returns nothing, `buildArgs` therefore omits
+// `--workspace`, the PATH fallback still finds a global `comfy`, and the CLI
+// falls back to whatever install IT defaults to. "No workspace could be
+// resolved" is not "no workspace will be used" — it hands the choice away.
+
+describe("comfy-cli refuses to act locally while the session targets a remote ComfyUI", () => {
+  it("does NOT run anything when remote and no workspace was resolved", () => {
+    // A real `comfy` on PATH is the whole point of the case: executable
+    // resolution succeeds, so nothing downstream stops it.
+    const dir = mkdtempSync(join(tmpdir(), "cmcp-cli-"));
+    tempDirs.push(dir);
+    const exe = join(dir, process.platform === "win32" ? "comfy.exe" : "comfy");
+    writeFileSync(exe, "");
+    process.env.COMFY_CLI_PATH = exe;
+    cfg.remote = true;
+
+    // `models_remove` goes through this path. Deleting from an unrelated local
+    // install while connected elsewhere is the harm.
+    expect(() => runComfyCliSync(["model", "remove", "--name", "x"])).toThrow(
+      /REMOTE ComfyUI/i,
+    );
+    expect(() => runComfyCliSync(["model", "remove", "--name", "x"])).toThrow(
+      /Nothing was run/i,
+    );
+  });
+
+  it("STILL runs when the caller names an explicit workspace — the refusal is about the unknown target", () => {
+    // The inverse direction. A caller that says which install it means has not
+    // left the choice to the CLI, so refusing it would be a false refusal of
+    // something real. Without this, guarding on `isRemoteMode()` alone would
+    // look correct.
+    const dir = mkdtempSync(join(tmpdir(), "cmcp-cli-"));
+    tempDirs.push(dir);
+    const exe = join(dir, process.platform === "win32" ? "comfy.exe" : "comfy");
+    writeFileSync(exe, "");
+    process.env.COMFY_CLI_PATH = exe;
+    cfg.remote = true;
+
+    // It gets PAST the refusal — it fails later, on the version probe of a stub
+    // executable, which is a different and expected failure.
+    let message = "";
+    try {
+      runComfyCliSync(["model", "list"], { workspace: dir });
+    } catch (e) {
+      message = e instanceof Error ? e.message : String(e);
+    }
+    expect(message).not.toMatch(/REMOTE ComfyUI/i);
   });
 });

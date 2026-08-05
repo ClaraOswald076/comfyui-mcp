@@ -1,7 +1,7 @@
 import * as childProcess from "node:child_process";
 import { existsSync } from "node:fs";
 import { delimiter, dirname, extname, join } from "node:path";
-import { config } from "../config.js";
+import { config, isRemoteMode } from "../config.js";
 import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
 
 /**
@@ -287,6 +287,28 @@ export function normalizeComfyCliResult<T = unknown>(
 }
 
 function requireExecutable(options: ComfyCliRunOptions): string {
+  // REFUSE BEFORE RESOLVING, in remote mode (codex gate P0).
+  //
+  // comfy-cli acts on a LOCAL install. With `--comfyui-url` the workspace
+  // resolver now correctly returns nothing — but that is exactly what makes this
+  // dangerous rather than safe: `buildArgs` then omits `--workspace`, the PATH
+  // fallback below still finds a global `comfy`, and the CLI falls back to
+  // WHATEVER workspace it defaults to. `models_remove` therefore deletes models
+  // from some unrelated local install while the session is connected elsewhere.
+  //
+  // "No workspace could be resolved" was being treated as "no workspace will be
+  // used". It is not: it hands the choice to the CLI. This is the one choke-point
+  // both `runComfyCli` and `runComfyCliSync` pass through, which is why the
+  // refusal belongs here — nothing has run at this point.
+  if (isRemoteMode() && !options.workspace) {
+    throw new Error(
+      "This session targets a REMOTE ComfyUI (--comfyui-url), and comfy-cli only acts on a " +
+        "LOCAL install. No local workspace could be resolved, so the CLI would fall back to " +
+        "whatever install it defaults to — which is not the server you are connected to, and " +
+        "for a destructive command would mean deleting from the wrong one. Nothing was run. " +
+        "Run comfy-cli on the machine the install lives on.",
+    );
+  }
   const executable = resolveComfyCliExecutable({ workspace: options.workspace });
   if (!executable) {
     throw new Error(
