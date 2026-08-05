@@ -1051,6 +1051,40 @@ describe("getEnvironment", () => {
     }
   });
 
+  it("does not accept a stray mention of the phrase as pip's not-found warning", async () => {
+    // The evidence has to be pip's STRUCTURED line. A traceback or wrapper that merely
+    // quotes "Package(s) not found" would otherwise license the "none of these are
+    // installed" claim off a `pip show` that never ran.
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      statsReachable("3.13.12");
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 16 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") && !args.includes("pip")) {
+          return { stdout: "Python 3.13.12\n" };
+        }
+        if (args.includes("pip")) {
+          return Object.assign(new Error("Command failed: exit 1"), {
+            stdout: "",
+            stderr:
+              "Traceback (most recent call last):\n" +
+              '  File "<frozen importlib>", line 1, in <module>\n' +
+              "RuntimeError: broken plugin said Package(s) not found somewhere\n",
+          });
+        }
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.note).toMatch(/pip did not answer at all/);
+      expect(env.local.note).not.toMatch(/pip answered and none of/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("does not treat a KILLED pip show as a completed no-match", async () => {
     // The shortcut this replaced: `pip show` dies on the 8s timeout, a follow-up
     // `pip --version` answers instantly, and the silence of the FIRST query gets

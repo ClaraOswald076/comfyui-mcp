@@ -283,6 +283,29 @@ describe("get_image save_dir resolution (#768)", () => {
     expect(text).not.toMatch(/RELATIVE save_dir/);
   });
 
+  it("says WHOSE drive it used when an explicit save_dir is drive-relative on Windows", async () => {
+    // `\out` passes isAbsolute() on Windows but picks up the process's CURRENT drive.
+    // It is a legal spelling the caller typed, so it is honoured rather than refused —
+    // refusing a real request would be its own bug. The hazard is silence about which
+    // drive was chosen, so the failure message names the source of the drive.
+    if (process.platform !== "win32") return;
+    cwdSpy = vi.spyOn(process, "cwd").mockReturnValue("C:\\work\\proj");
+    vi.mocked(mkdir).mockRejectedValueOnce(
+      Object.assign(new Error("EPERM: operation not permitted, mkdir"), { code: "EPERM" }),
+    );
+
+    const out = await getHandler("get_image")({ filename: "g.png", save_dir: "\\out" });
+
+    const text = out.content.map((c) => c.text ?? "").join("");
+    expect(text).toMatch(/DRIVE-RELATIVE save_dir/);
+    expect(text).toMatch(/came from this process's working directory, not from your argument/);
+    // …and NOT described as an ordinary relative path, which would send the caller to
+    // the wrong fix.
+    expect(text).not.toMatch(/a RELATIVE save_dir/);
+    // The resolved path it reports is drive-qualified, so nothing is hidden.
+    expect(text).toContain("C:\\out\\g.png");
+  });
+
   it("resolveImageSaveDir treats blank/whitespace save_dir as omitted", () => {
     expect(resolveImageSaveDir(undefined)).toBe(defaultImageSaveDir());
     expect(resolveImageSaveDir("   ")).toBe(defaultImageSaveDir());

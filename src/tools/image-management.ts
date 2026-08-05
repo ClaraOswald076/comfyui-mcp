@@ -64,6 +64,21 @@ function isFullyQualified(p: string | undefined): boolean {
  * back is absolute. A bare relative `savePath` echoed to an agent is unreadable
  * evidence: it names a different file depending on who reads it.
  */
+/**
+ * A Windows path that is "absolute" to `path.isAbsolute` but still picks up the
+ * process's CURRENT DRIVE — `\out`, `/out`. `resolve()` turns it into `C:\out` or
+ * `D:\out` depending on where we were launched.
+ *
+ * This is NOT refused. It is a legal Windows path spelling, the caller typed it, and
+ * refusing a real request is its own bug — the hazard is silence, not the path. So it is
+ * DISCLOSED instead: the returned `Saved to:` line is always drive-qualified, and a
+ * failure message says that the drive came from this process rather than from the
+ * argument.
+ */
+function isDriveRelative(p: string): boolean {
+  return process.platform === "win32" && /^[\\/](?![\\/])/.test(p);
+}
+
 export function resolveImageSaveDir(saveDir: string | undefined): string {
   const raw = saveDir?.trim();
   if (!raw) return defaultImageSaveDir();
@@ -103,7 +118,10 @@ export function registerImageManagementTools(server: McpServer): void {
             "'comfyui-images' folder inside the platform temp directory " +
             "(os.tmpdir()), which is created if missing. A RELATIVE value is " +
             "resolved against this MCP process's working directory, which is the " +
-            "client's choice and may not be writable — prefer an absolute path.",
+            "client's choice and may not be writable. On Windows a drive-less path " +
+            "like \\out is resolved against this process's CURRENT DRIVE, not a drive " +
+            "you chose. Prefer a fully-qualified path (C:\\... or \\\\server\\share); " +
+            "the returned 'Saved to:' line always names the resolved absolute path.",
         ),
     },
     async (args) => {
@@ -158,9 +176,12 @@ export function registerImageManagementTools(server: McpServer): void {
             (explicitDir
               ? `The destination came from the save_dir argument you passed ` +
                 `("${explicitDir}")` +
-                (isAbsolute(explicitDir)
-                  ? ""
-                  : ` — a RELATIVE save_dir, resolved against this process's working directory`) +
+                (!isAbsolute(explicitDir)
+                  ? ` — a RELATIVE save_dir, resolved against this process's working directory`
+                  : isDriveRelative(explicitDir)
+                    ? ` — a DRIVE-RELATIVE save_dir, so the drive above came from this ` +
+                      `process's working directory, not from your argument`
+                    : "") +
                 `. Retry with an absolute save_dir you can write to` +
                 (fallbackDefault ? `, or omit save_dir to use the default ${fallbackDefault}.` : ".")
               : `That is the default destination${fallbackDefault ? ` (${fallbackDefault})` : ""}. ` +
