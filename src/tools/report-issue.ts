@@ -397,10 +397,24 @@ export function normalizeReportedVersion(
   //    nightly; 0.49.6 is now installed on disk …)` — matched nothing, fell through
   //    to a disk read, and reported the INSTALLED 0.49.6 as the running version.
   //    That is #846 exactly, for the one user whose version needed the most care.
-  const labelled = new RegExp(`${label}[\\s:=]+([^\\s·,;)]+)`, "i").exec(trimmed);
-  if (labelled) {
-    const value = asVersionToken(labelled[1]);
-    if (value) return value;
+  //
+  //    A SHORT RUN of tokens is examined, not just the first (codex gate round 4):
+  //    `MCP version: 0.48.18` puts the word `version` where the number goes, and
+  //    taking only the adjacent token dropped a perfectly good reading straight
+  //    into the disk-read fallback — #846 again. The run is capped at three so a
+  //    label followed by prose cannot wander into some OTHER component's version
+  //    further along the line.
+  //
+  //    The left boundary keeps `other-mcp 1.2.3` from being read as ours.
+  const after = new RegExp(
+    `(?<![A-Za-z0-9-])${label}[\\s:=]+(.{0,64})`,
+    "is",
+  ).exec(trimmed);
+  if (after) {
+    for (const token of after[1].split(/[\s·,;]+/).slice(0, 3)) {
+      const value = asVersionToken(token);
+      if (value) return value;
+    }
   }
 
   // 2. LEADING — the caller sent the version itself, possibly with the #846 drift

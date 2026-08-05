@@ -766,6 +766,22 @@ describe("restart_comfyui — irreproducible launcher environments (#776)", () =
     await expect(preflightLocalRestart()).resolves.toMatchObject({ ok: true });
   });
 
+  it("REPORTS the launch arguments it observed, so the caller can compare them (#848)", async () => {
+    // The panel's argv-drift note is built from THIS field. Every panel test injects
+    // a fake preflight, so without a direct assertion here `observedLaunch` and both
+    // of its spreads could be deleted and the whole suite would stay green (codex
+    // gate round 4) — the note would simply go silent forever, and #848 would be
+    // un-fixed with nothing to show it.
+    usePinokio();
+    mockLivePortThenFree();
+
+    const result = await preflightLocalRestart();
+
+    expect(result.ok).toBe(true);
+    expect(result.observedArgv).toEqual([PINOKIO_MAIN, "--port", "8188"]);
+    expect(result.isDesktopApp).toBe(false);
+  });
+
   it("does NOT refuse from start_comfyui when the server is ALREADY down — it launches and warns", async () => {
     // The refusal exists to protect a RUNNING server. Once ComfyUI is already
     // stopped, refusing would leave it down forever — the one outcome worse than a

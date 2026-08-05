@@ -222,7 +222,13 @@ describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]",
     // change them — and offers the remedy CONDITIONALLY. It must not claim the
     // user's saved settings were ignored: we never opened them, and their edit may
     // have been to something argv does not carry (codex gate).
-    expect(res.message).toContain("the same arguments were observed before and after");
+    expect(res.message).toContain(
+      "the same arguments were observed before this restart request and again now",
+    );
+    // "before this restart REQUEST", not "across this restart": on the Manager path
+    // the observations are an accepted request and a later healthy probe — no
+    // down→up cycle is required — so a completed restart may not be taken as given.
+    expect(res.message).not.toMatch(/across this restart/i);
     // NOT "this restart did not change them" — two equal snapshots cannot show the
     // restart had no effect (a value can change and change back), and an accepted
     // Manager request is not proof a cycle even happened (codex gate round 3).
