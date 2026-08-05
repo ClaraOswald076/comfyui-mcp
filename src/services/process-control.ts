@@ -202,12 +202,14 @@ interface StopResult {
 
 interface StartResult {
   /**
-   * Did THIS call start the server?
+   * Does THIS call have positive evidence it started the server?
    *
    * READ IT WITH `startup`, never alone. `started:false` paired with
    * `startup:"unconfirmed"` means NOT CONFIRMED STARTED — it never means CONFIRMED
-   * NOT STARTED. The boolean cannot carry a third state, so `startup` is the
-   * authoritative field and this one is a conservative projection of it.
+   * NOT STARTED, and it is emphatically not "the server is down": check `ready`,
+   * which is the field that answers that. The boolean cannot carry a third state,
+   * so `startup` is the authoritative field and this one is a conservative
+   * projection of it.
    */
   started: boolean;
   message: string;
@@ -2983,7 +2985,10 @@ async function rebootViaManager(): Promise<RebootResult> {
           acked: false, // inferred from the proxy status, not acknowledged
           endpoint: path,
           method,
-          note: `reboot fired — the origin dropped behind a proxy (HTTP ${res.status}) as it went down`,
+          // The OBSERVED fact only. "the origin dropped … as it went down" narrated
+          // one of the two causes this branch covers as though it were established
+          // (codex gate round 8); what we saw is a status code from a proxy.
+          note: `a proxy in front of ComfyUI answered HTTP ${res.status}`,
         };
       }
       // 404 / other non-OK: wrong route for this Manager build — try the next.
@@ -2995,7 +3000,7 @@ async function rebootViaManager(): Promise<RebootResult> {
           acked: false, // inferred from the dropped connection, not acknowledged
           endpoint: path,
           method,
-          note: "connection dropped (origin going down) — reboot fired",
+          note: "the connection dropped mid-request",
         };
       }
       failures.push(
@@ -3168,7 +3173,7 @@ async function restartViaManagerReboot(context: {
         // claimed.
         (reboot.acked
           ? "The ComfyUI-Manager reboot request was acknowledged"
-          : "A ComfyUI-Manager reboot was dispatched (no acknowledgement came back)") +
+          : `A ComfyUI-Manager reboot was dispatched but not acknowledged (${reboot.note ?? "no reply"})`) +
         ", but no readiness probe got a " +
         `healthy response from ${readiness.probe_url} within ${waitedS}s ` +
         `(${readiness.attempts}/${readiness.max_tries} probes over a ` +
@@ -3213,17 +3218,25 @@ async function restartViaManagerReboot(context: {
 
   return {
     stopped: true,
-    // THE FIELDS MUST AGREE WITH THE SENTENCE (codex gate round 7). A message that
-    // says the cycle was not observed, beside `startup:"confirmed"`, hands a caller
-    // reading the JSON the definite signal the prose just withheld — and the JSON is
-    // what an agent keys on.
+    // THE FIELDS MUST AGREE WITH THE SENTENCE (codex gate rounds 7 and 8). A message
+    // saying the cycle was not observed, beside `startup:"confirmed"` and
+    // `started:true`, hands a caller reading the JSON the definite signal the prose
+    // just withheld — and the JSON is what an agent keys on.
     //
-    // `started` stays TRUE on the same standing ruling as `listener_ownership`: a
-    // restart WAS dispatched and the server IS serving, and denying that would
-    // report every ordinary Desktop and remote restart as failed — a far more
-    // common and more damaging lie than an unconfirmed success the message
-    // qualifies. `startup` is what carries the gap.
-    started: true,
+    // I twice kept `started:true` here by analogy with `listener_ownership`, where
+    // an unconfirmed attribution deliberately keeps it. That analogy does not
+    // transfer, and the difference is the whole point: THERE, a process of ours
+    // demonstrably existed and only its attribution was uncertain. HERE this call
+    // spawned nothing at all, and an acknowledged Manager request can be a no-op —
+    // so there is no positive evidence that this call started anything, and
+    // `started` is exactly the claim that it did.
+    //
+    // The fear that drove the earlier choice — that `false` reads as a failed
+    // restart — is answered by the fields beside it rather than by overstating this
+    // one: `stopped:true` and `ready:true` say the server is up, and the message
+    // leads with it. `started` now means the same thing on every path in this file:
+    // THIS CALL HAS POSITIVE EVIDENCE IT STARTED SOMETHING.
+    started: false,
     ready: true,
     startup: "unconfirmed",
     readiness,
@@ -3241,10 +3254,14 @@ async function restartViaManagerReboot(context: {
     // apply. Both halves are therefore stated as what they are.
     message:
       (reboot.acked
-        ? "The ComfyUI-Manager reboot request was acknowledged"
-        : "A ComfyUI-Manager reboot was dispatched (no acknowledgement came back — the " +
-          "connection dropped as it was sent, which usually means the handler took it)") +
-      ` and ComfyUI is healthy now (${readiness.waited_ms}ms) — ${context.label}/supervised ` +
+        ? "The ComfyUI-Manager reboot request was acknowledged."
+        : // The OBSERVED signal is named, not a cause chosen for it: this branch
+          // covers a proxy status AND a dropped connection, and the earlier sentence
+          // told every user the connection dropped (codex gate round 8). The
+          // inference is offered as one, which is all it is.
+          `A ComfyUI-Manager reboot was dispatched but not acknowledged (${reboot.note ?? "no reply"}), ` +
+          "which usually means the handler accepted it and the server went down.") +
+      ` ComfyUI is healthy now (${readiness.waited_ms}ms) — ${context.label}/supervised ` +
       "restart. The cycle itself was not directly observed from here, so verify with " +
       "health_check if you need certainty that it actually restarted." +
       argvNote,

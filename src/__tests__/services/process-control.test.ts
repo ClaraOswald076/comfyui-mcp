@@ -675,7 +675,10 @@ describe("process-control restart relaunch preflight (#368/#370)", () => {
     const result = await restartComfyUI();
 
     expect(result.stopped).toBe(true);
-    expect(result.started).toBe(true);
+    expect(result.ready).toBe(true);
+    // See desktop-restart.test.ts — a Manager reboot spawns nothing of ours, so
+    // `started` has no evidence to rest on and `ready` carries the outcome.
+    expect(result.started).toBe(false);
     expect(result.message).toMatch(/reboot request was acknowledged/i);
     expect(result.message).toMatch(/Desktop\/supervised/i);
     // Never killed / re-spawned.
