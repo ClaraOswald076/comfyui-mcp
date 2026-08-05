@@ -355,7 +355,13 @@ export async function analyzeColor(opts: AnalyzeColorOptions): Promise<AnalyzeCo
   const stats = computeStats(raw);
 
   const content: AnalyzeColorResult["content"] = [];
-  let summary = `get_image (action:"analyze_color") — ${stats.width}x${stats.height}\n${stats.verdict}\n\n` +
+  // This header used to be the TOOL's name, which 0.50.0 slice 15 retired. It is
+  // a label on a SUCCESS response, not remedy guidance, so it does not want to be
+  // a call form (`get_image (action:"analyze_color") — 1024x1024` reads as an
+  // instruction where none is wanted). It says what the block is instead — the
+  // same information the tool name carried, minus a name that would 404. Every
+  // other field of the response is unchanged.
+  let summary = `Color analysis — ${stats.width}x${stats.height}\n${stats.verdict}\n\n` +
     JSON.stringify(stats, null, 2);
 
   if (opts.reference_path) {

@@ -232,6 +232,16 @@ describe("image/asset registration", () => {
     expect((shape.effort as z.ZodTypeAny).parse(6)).toBe(6);
     expect(() => (shape.limit as z.ZodTypeAny).parse(0)).toThrow();
     expect(() => (shape.limit as z.ZodTypeAny).parse(2.5)).toThrow();
+    // …and NO ceiling at the zod layer: the asset listing never had one, so
+    // re-adding .max(100) here to match the output listing would be a false
+    // refusal for every list_assets caller asking for more than 100 records.
+    // The 100 bound lives in the list_outputs branch of the handler instead.
+    expect((shape.limit as z.ZodTypeAny).parse(500)).toBe(500);
+    // The format enum must carry BOTH halves of the union; narrowing it to one
+    // action's values would make the other action's legal values unreachable.
+    for (const f of ["markdown", "json", "png", "jpeg", "webp"]) {
+      expect((shape.format as z.ZodTypeAny).parse(f), f).toBe(f);
+    }
     expect(() => (shape.type as z.ZodTypeAny).parse("elsewhere")).toThrow();
     expect(() => (shape.format as z.ZodTypeAny).parse("tiff")).toThrow();
     expect(() => (shape.since as z.ZodTypeAny).parse("last tuesday")).toThrow();
