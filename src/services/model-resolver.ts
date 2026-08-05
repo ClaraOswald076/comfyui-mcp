@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { existsSync, type Stats } from "node:fs";
 import { platform } from "node:os";
 import { readdir, stat, mkdir, readFile, lstat, realpath } from "node:fs/promises";
-import { dirname, join, basename, resolve, relative, sep, isAbsolute, extname } from "node:path";
+import { dirname, join, basename, normalize, resolve, relative, sep, isAbsolute, extname } from "node:path";
 import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
 import { getClient, getSystemStats } from "../comfyui/client.js";
 import { getExtraModelRoots, getLiveExtraModelRoots } from "./extra-paths.js";
@@ -1240,8 +1240,21 @@ export async function resolveModelSubfolderWithLiveRoot(
   // model roots from server B with code bases from server A; #633 codex).
   // The category is passed so the #851 inventory rescue can corroborate the folder this
   // download actually writes into. A sibling category's match would not establish it.
+  //
+  // Derived from the NORMALIZED subfolder, not the raw string: `target_subfolder` accepts
+  // equivalent spellings, and `loras/../checkpoints` writes to `checkpoints` while its
+  // raw first segment is `loras`. Taking the raw one would corroborate `loras`, whose
+  // listing may well match, and authorize a `checkpoints` destination nothing vouched
+  // for — the sibling-category hole re-opened through a spelling. An escaping form gets
+  // an empty category (so no rescue can happen); the containment check just below is
+  // what refuses it.
+  const normalizedSub = normalize(raw);
+  const escapes =
+    normalizedSub === ".." ||
+    normalizedSub.startsWith(`..${sep}`) ||
+    normalizedSub.startsWith("../");
   const { modelsDir, baseDirs, snapshot, source } = await resolveModelsDirWithBases({
-    targetCategory: categoryOf(raw),
+    targetCategory: escapes ? "" : categoryOf(normalizedSub),
   });
   const modelsRoot = resolve(modelsDir);
   const targetDir = resolve(modelsRoot, raw);
