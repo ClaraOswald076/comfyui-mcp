@@ -52,6 +52,10 @@ const script = vi.hoisted(() => ({
   /** Per-path QUEUE of realpath answers, consumed before `realpath`. Used to prove the
    *  live root is resolved exactly ONCE (a second answer must never be reached). */
   realpathQueue: {} as Record<string, string[]>,
+  /** Per-path errno for realpathSync. Models the lookup FAILING for a reason that says
+   *  nothing about whether the file is there (EACCES on a parent dir, ELOOP, a stalled
+   *  mount) — as distinct from ENOENT, which really is an absence. */
+  realpathError: {} as Record<string, string>,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -74,6 +78,12 @@ vi.mock("node:fs", async (importOriginal) => {
       return (actual.statSync as (...a: unknown[]) => unknown)(p, ...rest);
     }) as typeof actual.statSync,
     realpathSync: ((p: string, ...rest: unknown[]) => {
+      const errno = script.realpathError[String(p)];
+      if (errno) {
+        const err = new Error(`${errno}: realpath '${p}'`);
+        (err as NodeJS.ErrnoException).code = errno;
+        throw err;
+      }
       const queued = script.realpathQueue[String(p)];
       if (queued && queued.length > 0) return queued.shift() as string;
       const mapped = script.realpath[String(p)];
@@ -122,6 +132,7 @@ beforeEach(() => {
   script.consumed = 0;
   script.realpath = {};
   script.realpathQueue = {};
+  script.realpathError = {};
 });
 
 afterEach(async () => {
@@ -130,6 +141,7 @@ afterEach(async () => {
   script.queue = [];
   script.realpath = {};
   script.realpathQueue = {};
+  script.realpathError = {};
   await Promise.all(dirs.map((d) => rm(d, { recursive: true, force: true })));
 });
 
@@ -356,5 +368,51 @@ describe("inferred root revalidation at the point of use", () => {
 
     const added = await addExtraPath({ target: "standalone", category: "vae", path: "E:/vae" });
     expect(added.changed).toBe(true);
+  });
+});
+
+describe("locality: 'could not look' is not 'it is not there'", () => {
+  // realLiveRoot used to catch EVERY realpathSync failure and return undefined, and the
+  // caller narrated that single bucket as one specific cause: "the server is running in
+  // a container, WSL, or on another host reached over the network". An EACCES on an
+  // intermediate directory — a macOS app bundle, a Windows ACL, a stalled network mount —
+  // produces exactly the same undefined while proving nothing about where the server is.
+  // The two states send the reader to two different fixes, so they must read differently.
+
+  it("says the lookup FAILED (and does not claim a container) when realpath errors non-ENOENT", async () => {
+    const live = await trackTmp();
+    const mainPy = join(live, "main.py");
+    await writeFile(mainPy, "# comfyui\n", "utf-8");
+    mockGetSystemStats.mockResolvedValue({ system: { argv: ["python", mainPy] } });
+    script.realpathError[mainPy] = "EACCES";
+
+    // Assert the REASON, not merely that it refused: the old message asserted a cause
+    // that was never observed, and a state-only assertion passes on both.
+    const err = await listExtraPaths().then(
+      () => undefined,
+      (e: Error) => e,
+    );
+    expect(err).toBeDefined();
+    expect(err?.message).toMatch(/could not determine whether that path/);
+    expect(err?.message).toContain("EACCES");
+    expect(err?.message).toMatch(/NOT a finding that the path is absent/);
+    expect(err?.message).not.toMatch(/running in a container/);
+  });
+
+  it("keeps the container/WSL wording for a genuine ENOENT", async () => {
+    // The other direction: where the file really is absent, the specific diagnosis is
+    // correct and useful, and must not be watered down into "something went wrong".
+    const live = await trackTmp();
+    const mainPy = join(live, "main.py");
+    await writeFile(mainPy, "# comfyui\n", "utf-8");
+    mockGetSystemStats.mockResolvedValue({ system: { argv: ["python", mainPy] } });
+    script.realpathError[mainPy] = "ENOENT";
+
+    const err = await listExtraPaths().then(
+      () => undefined,
+      (e: Error) => e,
+    );
+    expect(err?.message).toMatch(/running in a container, WSL, or on another/);
+    expect(err?.message).not.toMatch(/could not determine whether/);
   });
 });

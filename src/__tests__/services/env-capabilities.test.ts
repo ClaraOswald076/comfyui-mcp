@@ -87,14 +87,30 @@ describe("formatEnvBlock", () => {
     expect(out).not.toContain(" · .");
   });
 
-  it("treats triton/sageattention 'unknown' as omitted", () => {
+  it("SAYS 'unknown' for triton/sageattention instead of omitting it (#401)", () => {
+    // Omitting "unknown" was the last place the tri-state collapsed into a negative:
+    // an omitted Triton line and an absent Triton read identically, and the guidance
+    // tail told the agent that absence means "default to sdpa + no torch.compile".
+    // Every careful degrade-to-unknown upstream therefore still landed on the agent as
+    // the false negative it was avoiding.
     const out = formatEnvBlock({
       os: "Windows 11",
       triton: "unknown",
       sageattention: "unknown",
     });
-    // The field labels ("Triton: …" / "SageAttention: …") must be absent — the
-    // guidance tail's "Triton/SageAttention" mention is fine.
+    expect(out).toContain("Triton: UNKNOWN");
+    expect(out).toContain("SageAttention: UNKNOWN");
+    // …and it must not be mistakable for a negative on a skim.
+    expect(out).not.toMatch(/Triton: not installed/);
+    expect(out).toMatch(/NOT a negative/);
+    // The guidance must scope the disable-acceleration advice to "not installed" only.
+    expect(out).toMatch(/ONLY where this line says "not installed"/);
+  });
+
+  it("omits triton/sageattention entirely when the field was never populated", () => {
+    // `undefined` (never probed) is a different thing from a probe that ran and could
+    // not decide, and must not be dressed up as the latter.
+    const out = formatEnvBlock({ os: "Windows 11" });
     expect(out).not.toContain("Triton:");
     expect(out).not.toContain("SageAttention:");
   });

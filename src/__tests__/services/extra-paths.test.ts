@@ -711,11 +711,13 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
     );
   });
 
-  it("REFUSES an ABSOLUTE flag when argv reveals NO main.py at all (locality unproven)", async () => {
-    // The sibling of the case above: a reachable server whose argv has no main.py
-    // entry at all (e.g. `python -m comfyui` in a container) cannot be correlated
-    // with this filesystem, so its absolute flag is a same-spelled path on ANOTHER
-    // tree. Writing it would fabricate success — fail closed instead.
+  it("SHOWS an absolute flag whose locality is unproven, unconfirmed — and still refuses to WRITE it (#764)", async () => {
+    // The sibling of the case above: a reachable server whose argv has no main.py entry
+    // at all (e.g. `python -m comfyui`, or macOS ComfyUI Desktop 2) cannot be correlated
+    // with this filesystem. That is a failure to PROVE the file is the server's — not a
+    // finding that it is not. Refusing the read reported the second, and rejected a
+    // reachable instance whose config was sitting right there (#764 recurrence on
+    // 0.49.4/0.49.5). The read now discloses; only the WRITE fails closed.
     const hostLookalike = join(await trackTmp(), "extra.yaml");
     await writeFile(hostLookalike, "h:\n  vae: E:/host\n", "utf-8");
     mockGetSystemStats.mockResolvedValue({
@@ -724,12 +726,44 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
       },
     });
 
-    await expect(listExtraPaths()).rejects.toThrow(/UNRESOLVED.*not proven local/s);
-    // …and the write path refuses too, leaving the lookalike file byte-for-byte intact.
+    const listed = await listExtraPaths();
+    // It is the SERVER-NAMED file that is read, not the local heuristic's guess.
+    expect(listed.path).toBe(hostLookalike);
+    expect(listed.groups.map((g) => g.name)).toContain("h");
+    // …and the caption says plainly what was not established. Asserting the reason,
+    // not just the state: showing the right file with a confident caption would be a
+    // different bug wearing the same passing assertion.
+    expect(listed.notes.join(" ")).toMatch(/NOT CONFIRMED/);
+    expect(listed.notes.join(" ")).toMatch(/could not prove the server's file tree/i);
+
+    // …and the write path refuses, leaving the lookalike file byte-for-byte intact.
+    await expect(
+      addExtraPath({ category: "loras", path: "E:/loras" }),
+    ).rejects.toThrow(/UNRESOLVED.*not proven local/s);
+    expect(await readFile(hostLookalike, "utf-8")).toBe("h:\n  vae: E:/host\n");
+  });
+
+  it("falls back to the local target when the server names a config that does not exist here", async () => {
+    // Same unproven state, but the server's path resolves to nothing on this machine —
+    // so there is no file to disclose. Show the local auto target instead, and say the
+    // server's config is NOT it rather than implying the two are the same.
+    const localRoot = await trackTmp();
+    config.comfyuiPath = localRoot;
+    process.env.COMFYUI_PATH = localRoot;
+    const missing = join(await trackTmp(), "nope", "extra.yaml");
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: ["python", "-m", "comfyui", "--extra-model-paths-config", missing],
+      },
+    });
+
+    const listed = await listExtraPaths();
+    expect(listed.path).not.toBe(missing);
+    expect(listed.notes.join(" ")).toMatch(/no such file exists on this machine/i);
+    expect(listed.notes.join(" ")).toMatch(/NOT the file the live server reads/i);
     await expect(
       addExtraPath({ category: "loras", path: "E:/loras" }),
     ).rejects.toThrow(/UNRESOLVED/);
-    expect(await readFile(hostLookalike, "utf-8")).toBe("h:\n  vae: E:/host\n");
   });
 
   it("REFUSES when the ONLY main.py in argv is a flag VALUE (no self-proven locality)", async () => {
@@ -746,11 +780,15 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
       },
     });
 
-    await expect(listExtraPaths()).rejects.toThrow(/UNRESOLVED.*not proven local/s);
-    // …and the write path refuses too, leaving the lookalike file byte-for-byte intact.
+    // The flag VALUE must never be promoted to "the launch script", so locality stays
+    // unproven: the read is an explicitly unconfirmed disclosure, never an authoritative
+    // one, and the WRITE still refuses — the lookalike file is byte-for-byte intact.
+    const listed = await listExtraPaths();
+    expect(listed.serverResolved).not.toBe(true);
+    expect(listed.notes.join(" ")).toMatch(/NOT CONFIRMED/);
     await expect(
       addExtraPath({ category: "loras", path: "E:/loras" }),
-    ).rejects.toThrow(/UNRESOLVED/);
+    ).rejects.toThrow(/UNRESOLVED.*not proven local/s);
     expect(await readFile(hostLookalike, "utf-8")).toBe("h:\n  vae: E:/host\n");
   });
 
@@ -844,7 +882,7 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
     if (disclosure) expect(disclosure).not.toContain("two.yaml");
   });
 
-  it("REFUSES a RELATIVE flag only when there is no main.py either", async () => {
+  it("REFUSES to WRITE a RELATIVE flag with no main.py either — the read degrades instead", async () => {
     const stale = await trackTmp();
     config.comfyuiPath = stale;
     process.env.COMFYUI_PATH = stale;
@@ -852,7 +890,19 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
       system: { argv: ["python", "-m", "comfyui", "--extra-model-paths-config", "cfg.yaml"] },
     });
 
-    await expect(listExtraPaths()).rejects.toThrow(/UNRESOLVED.*RELATIVE/s);
+    // A mutation would anchor "cfg.yaml" to the wrong tree, so it still fails closed and
+    // creates nothing.
+    await expect(
+      addExtraPath({ category: "loras", path: "E:/loras" }),
+    ).rejects.toThrow(/UNRESOLVED.*RELATIVE/s);
+    expect(existsSync(join(stale, "cfg.yaml"))).toBe(false);
+
+    // The read shows the local auto target, naming the flag it could not locate — and
+    // still writes nothing.
+    const listed = await listExtraPaths();
+    expect(listed.serverResolved).not.toBe(true);
+    expect(listed.notes.join(" ")).toMatch(/RELATIVE --extra-model-paths-config \("cfg\.yaml"\)/);
+    expect(listed.notes.join(" ")).toMatch(/not confirmation that the live server reads it/i);
     expect(existsSync(join(stale, "cfg.yaml"))).toBe(false);
   });
 

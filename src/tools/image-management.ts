@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { writeFile, mkdir } from "node:fs/promises";
-import { join, basename } from "node:path";
+import { join, basename, isAbsolute, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   extractWorkflowFromImage,
@@ -12,6 +13,39 @@ import {
   stageOutputAsInput,
 } from "../services/image-management.js";
 import { errorToToolResult } from "../utils/errors.js";
+
+/**
+ * Where get_image writes when the caller names no directory (#768).
+ *
+ * It used to be `process.cwd()`, which is not a location this process chose — it is
+ * whatever directory the MCP client happened to launch us from. On Windows that is
+ * routinely `C:\Windows\System32`, and the write died with EPERM *after* the image had
+ * already been fetched. The schema had always DOCUMENTED `/tmp/comfyui-images/`; the
+ * string existed nowhere in the code, and `/tmp` is not a real directory on Windows
+ * anyway. `os.tmpdir()` is the platform-correct, process-writable spelling of the same
+ * promise (`%LOCALAPPDATA%\Temp` on Windows, `/tmp` on Linux, `$TMPDIR` on macOS).
+ *
+ * Computed per call rather than at module load so a test (or a caller) that repoints
+ * TMPDIR/TEMP is honoured instead of being silently pinned to the value at import time.
+ */
+export function defaultImageSaveDir(): string {
+  return join(tmpdir(), "comfyui-images");
+}
+
+/**
+ * Turn the caller's `save_dir` into an ABSOLUTE destination directory.
+ *
+ * Omitted → the documented default. A relative value keeps its historical meaning
+ * (resolved against this process's cwd — the issue asked for explicit `save_dir`
+ * behaviour to be left alone) but is resolved EAGERLY, so every path this tool reports
+ * back is absolute. A bare relative `savePath` echoed to an agent is unreadable
+ * evidence: it names a different file depending on who reads it.
+ */
+export function resolveImageSaveDir(saveDir: string | undefined): string {
+  const raw = saveDir?.trim();
+  if (!raw) return defaultImageSaveDir();
+  return isAbsolute(raw) ? resolve(raw) : resolve(process.cwd(), raw);
+}
 
 export function registerImageManagementTools(server: McpServer): void {
   // ── get_image ────────────────────────────────────────────────────────────
@@ -42,7 +76,11 @@ export function registerImageManagementTools(server: McpServer): void {
         .string()
         .optional()
         .describe(
-          "Local directory to save the image file. Defaults to /tmp/comfyui-images/.",
+          "Absolute local directory to save the file in. Defaults to a " +
+            "'comfyui-images' folder inside the platform temp directory " +
+            "(os.tmpdir()), which is created if missing. A RELATIVE value is " +
+            "resolved against this MCP process's working directory, which is the " +
+            "client's choice and may not be writable — prefer an absolute path.",
         ),
     },
     async (args) => {
@@ -54,15 +92,47 @@ export function registerImageManagementTools(server: McpServer): void {
           { allowMedia: true },
         );
 
-        // Save to local file
-        const saveDir = args.save_dir ?? process.cwd();
-        await mkdir(saveDir, { recursive: true });
+        // The bytes are already in hand at this point. Saving them is a SEPARATE
+        // operation that can fail on its own (EPERM/EACCES/ENOSPC/read-only volume),
+        // and its failure says nothing about the fetch. Reporting the whole call as an
+        // error there threw away a successfully retrieved image and invited a retry of
+        // the fetch that could never fix the disk problem (#768) — so the save is
+        // isolated and its outcome is DISCLOSED rather than allowed to fail the tool.
+        const saveDir = resolveImageSaveDir(args.save_dir);
         const localFilename = basename(args.filename);
         const savePath = join(saveDir, localFilename);
-        await writeFile(savePath, Buffer.from(base64, "base64"));
+        let saveError: string | undefined;
+        try {
+          await mkdir(saveDir, { recursive: true });
+          await writeFile(savePath, Buffer.from(base64, "base64"));
+        } catch (err) {
+          const detail = err instanceof Error ? err.message : String(err);
+          saveError =
+            `NOT SAVED. The image was fetched from ComfyUI successfully, but writing it ` +
+            `to ${savePath} failed: ${detail}. ` +
+            (args.save_dir
+              ? `That directory came from the save_dir argument you passed` +
+                (isAbsolute(args.save_dir.trim())
+                  ? ""
+                  : ` (a RELATIVE save_dir, resolved against this process's working directory)`) +
+                `. Retry with an absolute save_dir you can write to, or omit save_dir to ` +
+                `use the default ${defaultImageSaveDir()}.`
+              : `That is the default destination (the platform temp directory). Retry with ` +
+                `an explicit absolute save_dir you can write to.`) +
+            ` Do NOT re-run the render — the output already exists on the server.`;
+        }
 
         // Only images render inline; video/audio are save-to-disk only (#663).
         if (!mimeType.toLowerCase().startsWith("image/")) {
+          // Nothing can be handed back inline for media, so an unsaved fetch really did
+          // deliver nothing — but the message still names the exact destination and a
+          // remedy that works from here, instead of a bare EPERM.
+          if (saveError) {
+            return {
+              content: [{ type: "text" as const, text: `${saveError} (${mimeType})` }],
+              isError: true,
+            };
+          }
           return {
             content: [
               {
@@ -77,7 +147,9 @@ export function registerImageManagementTools(server: McpServer): void {
           content: [
             {
               type: "text" as const,
-              text: `Saved to: ${savePath}`,
+              text: saveError
+                ? `${saveError} The image itself is returned inline below.`
+                : `Saved to: ${savePath}`,
             },
             {
               type: "image" as const,

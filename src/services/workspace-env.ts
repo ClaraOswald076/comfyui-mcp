@@ -1428,12 +1428,34 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
         `we did not launch this ComfyUI and could not read the interpreter of the ` +
         `process serving port ${config.resolvedPort} from the OS${deployed}. Package ` +
         `versions are omitted rather than attributed to the wrong environment`;
+    } else if (!runningPy) {
+      // NOT a mismatch. `pythonVersionsAgree` returns false when EITHER side is missing,
+      // so this used to fall into the branch below and report "does not match the running
+      // ComfyUI python (unreported)" — asserting a disagreement that was never observed.
+      // One verdict, two causes; the message picked the wrong one. Say which happened.
+      if (groundTruth.source === "launched-by-us") {
+        // Nothing to cross-check against, and nothing that needs cross-checking: we
+        // CHOSE this interpreter and spawned the process, and its PID + creation time
+        // still match. Refusing here would be the opposite error — withholding a package
+        // list we genuinely know, because a corroboration we never needed was missing.
+        trusted = true;
+        reason =
+          `this MCP server launched ComfyUI (PID ${groundTruth.pid}) with this exact ` +
+          `interpreter. The running ComfyUI did not report its own python version, so no ` +
+          `cross-check was possible — none is needed, the interpreter is the one we chose`;
+      } else {
+        reason =
+          `the observed interpreter (${groundTruth.source}) reports python ${shortVer}, but ` +
+          `the running ComfyUI did not report a python version of its own, so the two could ` +
+          `NOT be compared. That is an unverified match, not a mismatch — refusing to ` +
+          `attribute this interpreter's packages to the server on an unmade comparison`;
+      }
     } else if (!pythonVersionsAgree(ver, runningPy)) {
       // We DID observe the interpreter, yet it disagrees with the running server.
       // Something is off (a stale PID, a wrapper); report unknown, not a wrong list.
       reason =
         `the observed interpreter (${groundTruth.source}) reports python ${shortVer}, which ` +
-        `does not match the running ComfyUI python ${runningPy ?? "(unreported)"} — ` +
+        `does not match the running ComfyUI python ${runningPy} — ` +
         `refusing to attribute its packages to the server`;
     } else {
       trusted = true;
@@ -1451,7 +1473,24 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
 
     if (trusted && probeExe) {
       pkgs = await probePipPackages(probeExe, KEY_PACKAGES);
-      if (Object.keys(pkgs).length > 0) local.packages = pkgs;
+      if (Object.keys(pkgs).length > 0) {
+        local.packages = pkgs;
+      } else {
+        // An absent `packages` field otherwise reads identically to the deliberate
+        // withholding below, and a reader would take it as "none of these are
+        // installed". `pip show` returning nothing means the QUERY failed (no pip in
+        // this interpreter, or it timed out) — it establishes nothing about what is
+        // installed. Say that, rather than let the empty shape speak.
+        local.note = [
+          local.note,
+          `Package versions could not be READ from ${probeExe} (\`python -m pip show\` ` +
+            `returned nothing — pip may be absent from this interpreter, or the probe ` +
+            `timed out). The interpreter itself IS trusted (${reason}); the empty list ` +
+            `is a failed query, NOT evidence that these packages are missing.`,
+        ]
+          .filter(Boolean)
+          .join(" ");
+      }
     } else {
       local.note = [
         local.note,
