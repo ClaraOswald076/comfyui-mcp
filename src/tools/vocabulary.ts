@@ -384,6 +384,11 @@ export const DEAD_NAMES: readonly DeadName[] = [
         context: "| `get_workspace` | `workspace` with `action: \"get\"` |",
         why: "The old-name → new-form migration table on the human-facing tools guide. A community reader (#660-adjacent confusion) read the 0.49.0 consolidation as capability being REMOVED; the table exists to show the same behaviour under a new label, so the left column must spell the retired name. It is a mapping AWAY from the name, never an instruction to call it.",
       },
+      {
+        path: "src/tools/retired-redirect.ts",
+        context: '"Tool get_workspace not found"',
+        why: "A verbatim quotation of MEASURED output: the three-row table in that module's header records what each call path actually answered on 0.49.0 for an already-retired name, which is the evidence the module exists at all. Quoting the SDK's bare 404 is the opposite of instructing anyone to call the name — it is the defect being removed. Deliberately the ONLY mention left in that file: the surrounding prose was reworded to say 'a name the 0.49.0 slices had already retired', and its test file derives the name from this ledger rather than spelling it, so this exemption covers one quoted line instead of seven comments. Pinned to the quotation because a quotation is the part least likely to be reworded — and if it IS reworded the gate should fire.",
+      },
     ],
   },
   {

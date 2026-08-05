@@ -77,6 +77,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { registerAllTools } from "../tools/index.js";
+import { tryInstallRetiredNameRedirect } from "../tools/retired-redirect.js";
 import { isForceRemoteFlagSet, isLoopbackHost, detectLocalComfyUIPath, setComfyuiTarget, onComfyuiTargetChanged, isTargetingLocal, isTargetingLocalOrLan, isTargetingPod, getComfyUIBaseUrl, getLocalComfyuiUrl, rescopeLocalTargetFile, getComfyUIAuthHeaders } from "../config.js";
 import {
   buildComfyuiMcpEnv,
@@ -785,10 +786,18 @@ function getCallToolClient(): Promise<Client> {
     callToolClientPromise = (async () => {
       const server = new McpServer({ name: "comfyui-mcp-calltool", version: "1.0.0" });
       await registerAllTools(server);
+      // The panel's `call_tool` bridge command dispatches through client.callTool()
+      // below, i.e. the DIRECT tools/call path — the same gap the MCP server had, and
+      // it is not new in 0.50.0: a retired name here has always come back to the panel
+      // as `error: "Tool <name> not found"` with nothing to act on. Same one-line fix.
+      const redirects = await tryInstallRetiredNameRedirect(server);
       const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
       const client = new Client({ name: "orchestrator-calltool", version: "1.0.0" });
       await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-      logger.info("[panel-orchestrator] call_tool in-process MCP client ready");
+      logger.info(
+        `[panel-orchestrator] call_tool in-process MCP client ready ` +
+          `(retired-name redirects: ${redirects ? "active" : "INACTIVE"})`,
+      );
       return client;
     })().catch((err) => {
       callToolClientPromise = null; // allow retry on next call

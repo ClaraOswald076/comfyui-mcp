@@ -9,6 +9,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { collectToolCatalog, registerFullTools } from "./tools/index.js";
 import { registerCompactTools } from "./tools/compact.js";
+import { tryInstallRetiredNameRedirect } from "./tools/retired-redirect.js";
 import { logger } from "./utils/logger.js";
 import { JobWatcher } from "./services/job-watcher.js";
 import { parseCliArgs, validateConnectUrl, exportExplicitToolMode, type ToolMode } from "./transport/cli.js";
@@ -146,6 +147,42 @@ async function createConfiguredServer(toolMode: ToolMode = "compact"): Promise<M
     // with COMFYUI_MCP_NO_FACADE=1.
     await registerFullTools(server);
   }
+
+  // Serve the retirement ledger on the DIRECT tools/call path too, not only through
+  // the call_tool facade — see src/tools/retired-redirect.ts. Installed here, after
+  // BOTH branches, because both need it and for different reasons:
+  //
+  //  - full mode is the one the 0.50.0 flip (#726) makes the default, where 121
+  //    retired names would otherwise answer with a bare "Tool X not found";
+  //  - compact mode advertises only the 3 meta-tools, so a client calling a retired
+  //    name DIRECTLY is exactly the stale-snapshot client the facade exists for (#616)
+  //    — it holds a cached binding for a name this surface no longer lists, and the
+  //    ledger is the only thing that can tell it where the capability went.
+  //
+  // Additive: a registered name, and any name the ledger does not know, dispatches
+  // through the SDK unchanged. Deliberately BEFORE server.connect() (the callers
+  // below connect the returned server), so no request can arrive mid-swap.
+  //
+  // The result is REPORTED rather than discarded. If it is false the server still
+  // boots (see tryInstallRetiredNameRedirect for why bricking startup is the worse
+  // failure), but "boots normally while silently answering 121 retired names with a
+  // bare 404" is exactly the shape of failure this whole change exists to remove — so
+  // it is stated on the same startup line an operator already reads to confirm the
+  // surface came up, not left as one error line among registration noise.
+  //
+  // Residual risk, stated plainly rather than papered over: nothing here can make the
+  // degraded state visible to the CALLER, because the wrapper is the only thing that
+  // could have changed what the caller sees. What actually holds the guarantee is the
+  // `~1.29.0` cap on `@modelcontextprotocol/sdk` in package.json — this is normally run
+  // as `npx comfyui-mcp`, which resolves fresh, so an open range would have let a user
+  // silently pick up internals nothing ever ran against.
+  const redirects = await tryInstallRetiredNameRedirect(server);
+  logger.info(
+    `Tool mode: ${toolMode}. Retired-name redirects on direct tools/call: ` +
+      (redirects
+        ? "active"
+        : "INACTIVE — a call to a name removed in an earlier release will 404 without naming its replacement"),
+  );
 
   server.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
     resources: [],
