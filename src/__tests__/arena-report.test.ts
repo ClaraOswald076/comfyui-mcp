@@ -167,6 +167,27 @@ describe("arena-report (#792)", () => {
     };
     expect(suspectScenarioLines(withPartial)).toHaveLength(1);
 
+    // two models on DIFFERENT comfyui-mcp versions are not one field —
+    // tool descriptions may differ between versions
+    const crossVersion = {
+      ...data,
+      leaderboard: [
+        entry({ model: "a", mcpVersion: "0.49.6", results: [mkFail("panel_screenshot")] }),
+        entry({ model: "b", mcpVersion: "0.50.0", results: [mkFail("panel_screenshot")] }),
+      ],
+    };
+    expect(suspectScenarioLines(crossVersion)).toHaveLength(0);
+
+    // an unversioned entry is excluded from the signal entirely
+    const oneUnversioned = {
+      ...data,
+      leaderboard: [
+        entry({ model: "a", results: [mkFail("panel_screenshot")] }),
+        entry({ model: "b", mcpVersion: undefined, results: [mkFail("panel_screenshot")] }),
+      ],
+    };
+    expect(suspectScenarioLines(oneUnversioned)).toHaveLength(0);
+
     // two entries for the SAME model are one model, not a field-wide signal
     const dupModel = {
       ...data,

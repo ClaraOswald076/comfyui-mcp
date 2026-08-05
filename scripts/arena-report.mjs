@@ -35,6 +35,19 @@ export function suspectScenarioLines(data) {
   const lines = [];
   const scen = data.scenarios ?? [];
   const board = data.leaderboard ?? [];
+  // Tool descriptions move with the version, so the field-wide signal is only
+  // meaningful WITHIN one known version: pool the majority cohort, exclude
+  // unversioned entries (their version is unknown, not "the same") and any
+  // minority-version ones. An all-legacy board yields no suspects at all.
+  const versionOf = (m) =>
+    m.mcpVersion ?? (Array.isArray(m.mcpVersions) && m.mcpVersions.length === 1 ? m.mcpVersions[0] : undefined);
+  const cohorts = new Map();
+  for (const m of board) {
+    const v = versionOf(m);
+    if (v) cohorts.set(v, (cohorts.get(v) ?? 0) + 1);
+  }
+  const majority = [...cohorts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+  if (majority === undefined) return lines;
   for (const s of scen) {
     // A legacy (pre-#792) results file carries no primary/partial lists — with
     // no notion of the RIGHT tool, any shared selection could be flagged
@@ -44,6 +57,7 @@ export function suspectScenarioLines(data) {
     const failed = [];
     const passed = [];
     for (const m of board) {
+      if (versionOf(m) !== majority) continue;
       const r = (m.results ?? []).find((x) => x.scenario === s.id);
       if (!r) continue;
       // Only a SELECTION failure counts: a run that reached a primary/partial
