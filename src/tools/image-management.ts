@@ -65,18 +65,25 @@ function isFullyQualified(p: string | undefined): boolean {
  * evidence: it names a different file depending on who reads it.
  */
 /**
- * A Windows path that is "absolute" to `path.isAbsolute` but still picks up the
- * process's CURRENT DRIVE — `\out`, `/out`. `resolve()` turns it into `C:\out` or
- * `D:\out` depending on where we were launched.
+ * A Windows path whose final location depends on state this process did not state.
+ * Two spellings, and they are unresolved differently:
  *
- * This is NOT refused. It is a legal Windows path spelling, the caller typed it, and
- * refusing a real request is its own bug — the hazard is silence, not the path. So it is
- * DISCLOSED instead: the returned `Saved to:` line is always drive-qualified, and a
- * failure message says that the drive came from this process rather than from the
- * argument.
+ *   `\out`, `/out`  — rooted but drive-less. `isAbsolute` says true; `resolve()` supplies
+ *                     the CURRENT drive, so it lands on C: or D: by where we launched.
+ *   `C:out`, `D:out` — drive-qualified but rooted-less. `isAbsolute` says FALSE, so it
+ *                     used to be described as "resolved against this process's working
+ *                     directory" — which is not what happens: Windows keeps a working
+ *                     directory PER DRIVE, and `resolve()` uses the named drive's, which
+ *                     need not be ours at all. The old message named the wrong base.
+ *
+ * Neither is refused. Both are legal Windows spellings the caller typed, and refusing a
+ * real request is its own bug — the hazard is silence, not the path. They are DISCLOSED:
+ * the returned `Saved to:` line is always fully qualified, and a failure message says the
+ * missing piece came from process state rather than from the argument.
  */
 function isDriveRelative(p: string): boolean {
-  return process.platform === "win32" && /^[\\/](?![\\/])/.test(p);
+  if (process.platform !== "win32") return false;
+  return /^[\\/](?![\\/])/.test(p) || /^[a-zA-Z]:(?![\\/])/.test(p);
 }
 
 export function resolveImageSaveDir(saveDir: string | undefined): string {
@@ -176,11 +183,17 @@ export function registerImageManagementTools(server: McpServer): void {
             (explicitDir
               ? `The destination came from the save_dir argument you passed ` +
                 `("${explicitDir}")` +
-                (!isAbsolute(explicitDir)
-                  ? ` — a RELATIVE save_dir, resolved against this process's working directory`
-                  : isDriveRelative(explicitDir)
-                    ? ` — a DRIVE-RELATIVE save_dir, so the drive above came from this ` +
-                      `process's working directory, not from your argument`
+                // Drive-relative is checked FIRST: `C:out` is not `isAbsolute`, so the
+                // generic relative branch would have claimed it resolved against this
+                // process's working directory, when Windows actually uses the named
+                // DRIVE's own working directory. Naming the wrong base is the same
+                // defect as naming the wrong cause.
+                (isDriveRelative(explicitDir)
+                  ? ` — a DRIVE-RELATIVE save_dir, so the part you did not give (the ` +
+                    `drive, or that drive's current directory) came from this process's ` +
+                    `state, not from your argument`
+                  : !isAbsolute(explicitDir)
+                    ? ` — a RELATIVE save_dir, resolved against this process's working directory`
                     : "") +
                 `. Retry with an absolute save_dir you can write to` +
                 (fallbackDefault ? `, or omit save_dir to use the default ${fallbackDefault}.` : ".")
