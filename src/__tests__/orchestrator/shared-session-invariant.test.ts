@@ -58,6 +58,11 @@ class RecordingBackend implements AgentBackend {
   readonly capabilities = CLAUDE_CAPABILITIES;
   turnTexts: string[] = [];
   resumes: Array<string | undefined> = [];
+  /** Each run() is one SDK session standing up — and with it every MCP child
+   *  (comfyui + the user's inherited servers). close() is that session (and its
+   *  children) being torn down. #902's "every MCP server disconnected" is one
+   *  close+run cycle of this. */
+  closes = 0;
   sessionId = "sess-shared";
   async *run(opts: BackendStartOptions): AsyncGenerator<AgentEvent> {
     this.resumes.push(opts.resume);
@@ -68,6 +73,9 @@ class RecordingBackend implements AgentBackend {
     }
   }
   async interrupt(): Promise<void> {}
+  async close(): Promise<void> {
+    this.closes += 1;
+  }
   async listModels(): Promise<ModelChoice[]> {
     return [];
   }
@@ -104,10 +112,17 @@ describe("sessions are orchestrator-scoped, never workflow-scoped (#884)", () =>
     const end = src.indexOf("Record this tab's trusted per-workflow COMMAND STAMP", start);
     expect(end, "post-migration anchor not found").toBeGreaterThan(start);
     const block = src.slice(start, end);
-    // No agent lifecycle calls: the conversation deliberately CONTINUES.
+    // No agent lifecycle calls: the conversation deliberately CONTINUES. This is
+    // also the #902 fix: retiring the CALLING agent here tore down its SDK
+    // session mid-panel_open_workflow — and with it every MCP child (comfyui +
+    // the user's inherited servers), the reported "89 deferred tools are no
+    // longer available" disconnect.
     expect(block).not.toContain("manager.retire(");
     expect(block).not.toContain("manager.reset(");
     expect(block).not.toContain("manager.rebindAgent(");
+    // …and no bridge-route revocation: the in-flight open's verify probes must
+    // keep routing (the other half of #902's failed rebind guard).
+    expect(block).not.toContain("revokeTabMigration");
     // Pending deliveries FOLLOW the socket instead of being dropped.
     expect(block).toContain("RunCompletions.moveKey(migratedFrom, panelTab)");
     expect(block).toContain("AskAnswers.moveKey(migratedFrom, panelTab)");
@@ -190,6 +205,12 @@ describe("sessions are orchestrator-scoped, never workflow-scoped (#884)", () =>
     expect(backend.turnTexts).toEqual(["from workflow A", "from workflow B (after Workflow → New)"]);
     // Only one spawn ever happened (no fresh agent on the workflow change)…
     expect(backend.resumes).toHaveLength(1);
+    // …and the session was NEVER torn down across the workflow change (#902):
+    // one run(), zero close() — the SDK session and every MCP child connection
+    // riding it (comfyui + the user's inherited servers) survive a workflow
+    // switch intact, instead of the retire→respawn cycle that dropped and
+    // reconnected all of them ("89 deferred tools are no longer available").
+    expect(backend.closes).toBe(0);
     expect(manager.hasLiveAgent(key)).toBe(true);
     // …and the session persisted under the SHARED key on disk (the orchestrator
     // owns it; the browser holds at most a hint).
