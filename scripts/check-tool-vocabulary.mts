@@ -50,6 +50,7 @@ import {
   baselineIntegrity,
   deadNameRe,
   panelBaselineIntegrity,
+  rotMentions,
   type DeadName,
 } from "../src/tools/vocabulary.js";
 import { buildPanelToolDefs } from "../src/orchestrator/panel-tools.js";
@@ -292,6 +293,21 @@ for (const path of files) {
     const re = deadNameRe(dead.name);
     for (const [i, text] of lines.entries()) {
       if (!re.test(text)) continue;
+      // A mention sitting inside a verbatim copy of this name's OWN declared
+      // replacement is the migration target, not rot — see rotMentions() in
+      // src/tools/vocabulary.ts for why that is principled rather than a loophole.
+      //
+      // Checked BEFORE `seenIn` on purpose: a replacement form is not a mention of
+      // the dead name for ANY purpose, staleness included. Recording it would let a
+      // file whose only remaining occurrences are legitimate replacement forms keep
+      // an obsolete `allowedIn` entry looking fresh — and a stale exception is a
+      // hole that opens later, which is the whole reason the expiry check exists.
+      //
+      // Also BEFORE `allowedIn`, and independent of it: this is the one new decision
+      // point, it needs no ledger entry (it is self-derived), and a line carrying
+      // BOTH an allowedIn-covered mention and a replacement form still fails the
+      // occurrence count below — fail-closed on the ambiguous case.
+      if (rotMentions(dead, text).length === 0) continue;
       const key = seenKey(dead.name, path);
       if (!seenIn.has(key)) seenIn.set(key, []);
       seenIn.get(key)!.push(text);

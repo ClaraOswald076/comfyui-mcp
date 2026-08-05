@@ -6,9 +6,12 @@ import {
   retirementBaseline,
   TOOL_NAMES,
   baselineIntegrity,
+  deadNameMentions,
   deadNameRe,
   findDeadName,
   retiredToolMessage,
+  rotMentions,
+  type DeadName,
 } from "../../tools/vocabulary.js";
 
 /**
@@ -60,6 +63,316 @@ describe("deadNameRe", () => {
     expect(() => deadNameRe("weird.name+v2")).not.toThrow();
     expect(matches("weird.name+v2", "weird.name+v2")).toBe(true);
     expect(matches("weird.name+v2", "weirdXnameXv2")).toBe(false);
+  });
+});
+
+/**
+ * The replacement-form exemption — the one place the dead-name gate is allowed to
+ * see its own name and stay quiet.
+ *
+ * Every test here is about the SAME question asked from a different angle: can
+ * this exemption be used to launder a live instruction? Because the ratchet is
+ * the whole migration's safety net, and a too-broad exemption is the same class
+ * of harm as deleting a baseline line — just less visible in a diff. The
+ * mutation-check that matters is therefore not "does the exemption work" but
+ * "does a WIDER exemption fail a test": ignore which tool the replacement names,
+ * or exempt the line rather than the span, and one of these must go red.
+ */
+describe("rotMentions", () => {
+  /**
+   * The brief's worked example. `clear_vram` is the OOM panic button and folds
+   * into get_system_stats under its own name, so the migration target the prose
+   * sweep is required to write contains the retired token verbatim.
+   */
+  const clearVram: DeadName = {
+    name: "clear_vram",
+    since: "0.50.0",
+    replacement: 'get_system_stats (action:"clear_vram")',
+  };
+  const rot = (dead: DeadName, line: string) => rotMentions(dead, line);
+
+  it("exempts a mention inside the name's own declared replacement", () => {
+    expect(rot(clearVram, 'get_system_stats (action:"clear_vram")')).toEqual([]);
+    expect(rot(clearVram, 'Call `get_system_stats (action:"clear_vram")` to free VRAM.')).toEqual(
+      [],
+    );
+  });
+
+  it("still reports a bare mention", () => {
+    expect(rot(clearVram, "clear_vram")).toHaveLength(1);
+    expect(rot(clearVram, "| `clear_vram` | frees VRAM |")).toHaveLength(1);
+  });
+
+  it("still reports prose that instructs a model to call it", () => {
+    expect(rot(clearVram, "call clear_vram to free VRAM")).toHaveLength(1);
+  });
+
+  // The exemption is per-name and SELF-derived: it is the ledger's own output for
+  // THIS name, not "any tool with a matching action". A mention pointing at the
+  // wrong migration target sends the model somewhere that will not answer, which
+  // is a defect worth catching rather than one to wave through.
+  it("still reports a mention that names the WRONG replacement tool", () => {
+    expect(rot(clearVram, 'some_other_tool (action:"clear_vram")')).toHaveLength(1);
+    expect(rot(clearVram, 'queue (action:"clear_vram")')).toHaveLength(1);
+  });
+
+  /**
+   * The wrong tool CAN be a superstring of the right one, and a plain substring
+   * search does not notice: `not_get_system_stats (action:"clear_vram")` contains
+   * the declared replacement starting at index 4. The copy has to BEGIN at a token
+   * boundary, exactly as a name does — otherwise any tool whose name merely ends
+   * with the survivor's is a free pass.
+   */
+  it("still reports a wrong tool whose name merely ENDS with the right one", () => {
+    expect(rot(clearVram, 'not_get_system_stats (action:"clear_vram")')).toHaveLength(1);
+    expect(rot(clearVram, 'xget_system_stats (action:"clear_vram")')).toHaveLength(1);
+    // The mcp__<server>__ allowance must not become a hole either: only a real
+    // prefix passes, `xmcp__…` is just another identifier run.
+    expect(rot(clearVram, 'xmcp__comfyui__get_system_stats (action:"clear_vram")')).toHaveLength(1);
+  });
+
+  /**
+   * The `mcp__<server>__` allowance is where a wrong tool could sneak back in, so
+   * the server segment forbids `__`. Otherwise `[A-Za-z0-9_]+` swallows
+   * `comfyui__wrong` and the line — which reads as server `comfyui`'s tool
+   * `wrong__get_system_stats` — is exempted. `deadNameRe`'s own prefix is looser on
+   * purpose: there greediness only MATCHES more, which is fail-safe; here it would
+   * EXEMPT more, which is not.
+   */
+  it("does not let the mcp server segment swallow a second name", () => {
+    expect(
+      rot(clearVram, 'mcp__comfyui__wrong__get_system_stats (action:"clear_vram")'),
+    ).toHaveLength(1);
+    // A single underscore in the server name is ordinary and must still work.
+    expect(rot(clearVram, 'mcp__comfyui_panel__get_system_stats (action:"clear_vram")')).toEqual([]);
+  });
+
+  /**
+   * The boundary rule stops at the LEFT on purpose — a replacement names its tool
+   * at the start, so trailing text cannot change which tool is named. Pinning the
+   * asymmetry: a copy followed by more identifier characters is still the correct
+   * call form and must not be reported, or a sweep gets sent to "fix" right text.
+   */
+  it("does not require a boundary after the replacement copy", () => {
+    const trailing: DeadName = {
+      name: "clear_vram",
+      since: "0.50.0",
+      replacement: 'get_system_stats (action:"clear_vram") see docs',
+    };
+    expect(rot(trailing, `${trailing.replacement}_v2`)).toEqual([]);
+  });
+
+  // THE SUBTLEST CASE, and the one that separates a positional exemption from a
+  // line-wide one. A line-wide `text.includes(replacement)` check passes this line
+  // — and that is exactly how a live instruction launders itself by standing next
+  // to correct prose, the same laundering the allowedIn logic already had to close.
+  // Asserting the SPAN, not just the count, pins which mention survived.
+  it("reports the bare mention on a line that also carries the replacement form", () => {
+    const line = 'Use get_system_stats (action:"clear_vram"); the old clear_vram is gone.';
+    const hits = rot(clearVram, line);
+    expect(hits).toHaveLength(1);
+    expect(line.slice(hits[0]!.start, hits[0]!.end)).toBe("clear_vram");
+    // ...and it is the SECOND one — the bare instruction, not the one inside the
+    // replacement. Without this the test would pass on an implementation that
+    // exempted the wrong occurrence.
+    expect(hits[0]!.start).toBe(line.lastIndexOf("clear_vram"));
+  });
+
+  it("does not match a longer action name that merely starts with the dead name", () => {
+    expect(deadNameMentions("clear_vram", 'get_system_stats (action:"clear_vram_now")')).toEqual([]);
+    expect(rot(clearVram, 'get_system_stats (action:"clear_vram_now")')).toEqual([]);
+  });
+
+  // deadNameRe deliberately matches through an mcp__<server>__ prefix, so both
+  // directions need pinning: a prefixed replacement form is still the migration
+  // target, and a prefixed BARE name is still rot.
+  it("handles the mcp__<server>__ prefix form in both directions", () => {
+    expect(rot(clearVram, 'mcp__comfyui__get_system_stats (action:"clear_vram")')).toEqual([]);
+    expect(rot(clearVram, "mcp__comfyui__clear_vram")).toHaveLength(1);
+    // A prefixed name INSIDE the action slot is not the declared replacement.
+    expect(rot(clearVram, 'get_system_stats (action:"mcp__comfyui__clear_vram")')).toHaveLength(1);
+  });
+
+  it("exempts every copy when the replacement form repeats, and only those", () => {
+    const twice = 'get_system_stats (action:"clear_vram") get_system_stats (action:"clear_vram")';
+    expect(rot(clearVram, twice)).toEqual([]);
+    expect(rot(clearVram, `${twice} — formerly clear_vram`)).toHaveLength(1);
+  });
+
+  /**
+   * The copies above are ADJACENT; these OVERLAP, which needs the scan to advance
+   * one character at a time rather than by the replacement's length. A real call
+   * form cannot overlap itself (it starts with a tool name and ends with `)`), so
+   * this uses a deliberately self-bordering replacement. The failure it prevents is
+   * a false POSITIVE — a legitimate replacement form reported as rot, which is how
+   * a sweep gets told to "fix" text that is already correct.
+   */
+  it("finds overlapping copies of the replacement, not just adjacent ones", () => {
+    const replacement = "get_system_stats-clear_vram-get_system_stats-";
+    const bordering: DeadName = { name: "clear_vram", since: "0.50.0", replacement };
+    const line = `${replacement}clear_vram-get_system_stats-`;
+    // Sanity: two copies, and the second starts before the first one ends.
+    expect(line.indexOf(replacement)).toBe(0);
+    expect(line.indexOf(replacement, 1)).toBe(28);
+    expect(28).toBeLessThan(replacement.length);
+    expect(rot(bordering, line)).toEqual([]);
+  });
+
+  /**
+   * The replacements are full call forms, so they carry `(`, `)`, `"` and `|`.
+   * Matching them as a compiled PATTERN rather than a literal would be a silent
+   * widening: `/comfy_cli \(action:"models_list"|"models_show"\)/` alternates, so
+   * the partial form below would match its left branch and be exempted. Literal
+   * `indexOf` means the exemption covers the declared string and nothing else.
+   */
+  it("matches the replacement literally, so regex metacharacters cannot widen it", () => {
+    const multi: DeadName = {
+      name: "models_list",
+      since: "0.50.0",
+      replacement: 'comfy_cli (action:"models_list"|"models_show")',
+    };
+    expect(rot(multi, 'comfy_cli (action:"models_list"|"models_show")')).toEqual([]);
+    // A PARTIAL of the declared replacement is not the declared replacement.
+    expect(rot(multi, 'comfy_cli (action:"models_list")')).toHaveLength(1);
+  });
+
+  /**
+   * Degenerate ledger data must fail CLOSED, because `DEAD_NAMES` is
+   * hand-maintained: `"".indexOf` semantics would make an empty replacement match
+   * at every index and exempt every line, and a replacement that says nothing
+   * beyond the dead name would exempt every mention of it — blinding the gate for
+   * that name entirely, which is exactly the bypass this rule must not become.
+   */
+  it("exempts nothing for a degenerate replacement", () => {
+    const empty: DeadName = { name: "clear_vram", since: "0.50.0", replacement: "" };
+    expect(rot(empty, "call clear_vram now")).toHaveLength(1);
+    expect(rot(empty, 'get_system_stats (action:"clear_vram")')).toHaveLength(1);
+    // "call the tool that no longer exists" — no migration target, so no exemption.
+    // Punctuation, markup and PROSE do not make one: `Use` is an identifier but not
+    // a tool, so what must survive cutting the name out is the name of a tool that
+    // actually exists.
+    const useless = [
+      "clear_vram",
+      " clear_vram ",
+      "`clear_vram`",
+      "clear_vram.",
+      '"clear_vram"',
+      "Use clear_vram",
+      "call clear_vram instead",
+      // A survivor that is not a real tool — a typo in the ledger, or a name the
+      // slice forgot to register. Nothing to migrate to, so nothing is exempted.
+      'get_system_stat (action:"clear_vram")',
+    ];
+    for (const replacement of useless) {
+      const circular: DeadName = { name: "clear_vram", since: "0.50.0", replacement };
+      expect(rot(circular, replacement), replacement).toHaveLength(1);
+      expect(rot(circular, "call clear_vram now"), replacement).toHaveLength(1);
+    }
+    // ...while a replacement that DOES name another tool still works, markup and all.
+    const real: DeadName = {
+      name: "clear_vram",
+      since: "0.50.0",
+      replacement: '`get_system_stats (action:"clear_vram")`',
+    };
+    expect(rot(real, real.replacement)).toEqual([]);
+  });
+
+  /**
+   * A replacement may spell the retired name exactly ONCE — in the action slot,
+   * which is the whole reason this exemption exists. A second mention makes the
+   * ledger entry carry its own live instruction, and exempting a verbatim copy
+   * would launder that instruction into every page that quotes the ledger. Note the
+   * bare mention here is INSIDE the declared replacement, so span containment alone
+   * would exempt it; only counting the mentions in the ledger data catches it.
+   */
+  it("exempts nothing when the replacement spells the dead name more than once", () => {
+    const chatty: DeadName = {
+      name: "clear_vram",
+      since: "0.50.0",
+      replacement: 'get_system_stats (action:"clear_vram") then call clear_vram',
+    };
+    expect(rot(chatty, chatty.replacement)).toHaveLength(2);
+    expect(rot(chatty, 'get_system_stats (action:"clear_vram")')).toHaveLength(1);
+  });
+
+  /**
+   * CONTAINMENT, not overlap — the difference only shows up on a mention that
+   * STRADDLES the edge of a replacement copy, which a truncated `replacement`
+   * produces. It is contrived data on purpose: the point is that one mistyped
+   * ledger string must not be able to silence a real mention next to it, and an
+   * overlap test would let it.
+   */
+  it("does not exempt a mention that merely straddles the replacement's edge", () => {
+    const truncated: DeadName = {
+      name: "clear_vram",
+      since: "0.50.0",
+      // Pasted with a truncated tail, so a verbatim copy of it ends mid-mention.
+      replacement: 'get_system_stats (action:"clear_vram") not clear_vr',
+    };
+    const line = 'get_system_stats (action:"clear_vram") not clear_vram")';
+    // Sanity: the copy really is present and really does end inside the second
+    // mention, which is therefore overlapped but NOT contained.
+    expect(line.startsWith(truncated.replacement)).toBe(true);
+    const hits = rot(truncated, line);
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.start).toBe(line.lastIndexOf("clear_vram"));
+  });
+
+  /**
+   * The live end-to-end proof. These are the slice-13 folds whose natural action
+   * name IS the retired tool name — the collision that made this change necessary.
+   *
+   * Slice 13 owns the actual fold map, so the survivors here are illustrative; what
+   * is under test is the SHAPE, which is fixed: `<tool> (action:"<dead>")`. They are
+   * nonetheless all names that are LIVE in TOOL_NAMES, because the exemption
+   * requires the replacement to name a tool that exists — an invented survivor
+   * would (correctly) not be exempted at all.
+   */
+  it("passes the slice-13 replacement forms while their bare forms still fail", () => {
+    const folds: Array<[string, string]> = [
+      ["update_all", 'update_comfyui (action:"update_all")'],
+      ["self_update", 'install_panel (action:"self_update")'],
+      ["configure_manager", 'install_custom_node (action:"configure_manager")'],
+      ["apply_manifest", 'install_workflow_dependencies (action:"apply_manifest")'],
+      ["clear_vram", 'get_system_stats (action:"clear_vram")'],
+      ["report_issue", 'health_check (action:"report_issue")'],
+      ["calculate", 'get_environment (action:"calculate")'],
+    ];
+    // The fold map is slice 13's, but "the survivor must be a real tool" is not.
+    for (const [, replacement] of folds) {
+      expect(TOOL_NAMES as readonly string[]).toContain(replacement.split(" ")[0]);
+    }
+    for (const [name, replacement] of folds) {
+      const dead: DeadName = { name, since: "0.50.0", replacement };
+      expect(rot(dead, replacement), `${name}: its own replacement must pass`).toEqual([]);
+      expect(rot(dead, `call ${name} now`), `${name}: a bare mention must fail`).toHaveLength(1);
+      expect(
+        rot(dead, `other_tool (action:"${name}")`),
+        `${name}: the wrong replacement tool must fail`,
+      ).toHaveLength(1);
+    }
+  });
+
+  // Ledger-wide, and true no matter what future slices append: the exemption can
+  // never silence a BARE mention of any dead name. If a change to rotMentions ever
+  // makes it whole-line or name-agnostic, this goes red across the whole ledger.
+  it("still reports a bare mention of every name in the real ledger", () => {
+    const silenced = DEAD_NAMES.filter(
+      (d) => rotMentions(d, `call ${d.name} now`).length !== 1,
+    ).map((d) => d.name);
+    expect(silenced).toEqual([]);
+  });
+
+  // The no-op guarantee for the majority. An entry whose replacement does not spell
+  // its own name cannot have a mention contained in a replacement copy, so its
+  // verdicts must be identical to plain deadNameRe matching — byte for byte.
+  it("is inert for entries whose replacement does not name them", () => {
+    const unaffected = DEAD_NAMES.filter((d) => !d.replacement.includes(d.name));
+    expect(unaffected.length).toBeGreaterThan(0);
+    for (const d of unaffected) {
+      const line = `${d.replacement} replaces ${d.name}, formerly mcp__comfyui__${d.name}`;
+      expect(rotMentions(d, line), d.name).toEqual(deadNameMentions(d.name, line));
+    }
   });
 });
 
@@ -126,6 +439,32 @@ describe("DEAD_NAMES ledger", () => {
 
   it("gives every dead name an actionable replacement", () => {
     expect(DEAD_NAMES.filter((d) => !d.replacement.trim()).map((d) => d.name)).toEqual([]);
+  });
+
+  /**
+   * The obligation that arrived with the replacement-form exemption. An entry whose
+   * replacement spells its own name is only usable if `rotMentions` actually
+   * exempts that replacement — and it refuses to when the replacement names no LIVE
+   * tool, e.g. a mistyped survivor (`get_system_stat`) or one the slice forgot to
+   * register. Left to CI that surfaces as an unfixable prose sweep: every mention
+   * flagged, and rewriting it to the documented form flagged too. Here it surfaces
+   * as one clear failure naming the entry.
+   *
+   * Vacuous today (no entry spells its own name) and binding from slice 13 on.
+   * Scoped to self-naming entries deliberately: an entry whose replacement does not
+   * spell its own name is never exempted anyway, which is what keeps the PANEL
+   * replacements — whose targets are not in the core TOOL_NAMES — out of scope.
+   */
+  it("makes every self-naming replacement usable (it must point at a live tool)", () => {
+    const unusable = DEAD_NAMES.filter((d) => d.replacement.includes(d.name)).filter(
+      (d) => rotMentions(d, d.replacement).length !== 0,
+    );
+    expect(
+      unusable.map((d) => `${d.name} → ${d.replacement}`),
+      "This replacement spells its own dead name but names no live tool, so the gate " +
+        "will flag the very text the prose sweep is required to write. Name the " +
+        "surviving tool exactly as it appears in TOOL_NAMES.",
+    ).toEqual([]);
   });
 
   // An exception without a reason is indistinguishable from someone silencing

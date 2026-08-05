@@ -346,6 +346,193 @@ export function deadNameRe(name: string): RegExp {
   return new RegExp(`(?<![A-Za-z0-9_])(?:mcp__[A-Za-z0-9_]+__)?${escaped}(?![A-Za-z0-9_])`);
 }
 
+/** A half-open `[start, end)` slice of one line. */
+export interface Span {
+  start: number;
+  end: number;
+}
+
+/**
+ * WHERE on a line `deadNameRe(name)` matches, not merely whether.
+ *
+ * `deadNameRe` answers a boolean, which is all the scanner needed while every
+ * mention of a dead name was equally bad. `rotMentions` below has to tell two
+ * mentions on the SAME line apart, so it needs positions — and it must get them
+ * from the identical pattern, or the exemption would be reasoning about spans the
+ * gate does not actually flag. Hence the shared `.source` rather than a second
+ * hand-written regex.
+ *
+ * The `g` flag is applied to a FRESH RegExp each call: `deadNameRe`'s result is
+ * unflagged and shared with `.test()` callers, and a stateful `lastIndex` leaking
+ * between them is the classic way a scan starts skipping matches.
+ */
+export function deadNameMentions(name: string, line: string): Span[] {
+  const re = new RegExp(deadNameRe(name).source, "g");
+  const spans: Span[] = [];
+  for (let m = re.exec(line); m !== null; m = re.exec(line)) {
+    // Defensive: a zero-length match would spin forever. Unreachable for a
+    // non-empty name, and a ledger entry with an empty name is already a bug.
+    if (m[0].length === 0) {
+      re.lastIndex += 1;
+      continue;
+    }
+    spans.push({ start: m.index, end: m.index + m[0].length });
+  }
+  return spans;
+}
+
+const IDENT = /[A-Za-z0-9_]/;
+
+/**
+ * The `mcp__<server>__` prefix, anchored to end exactly where a replacement copy
+ * begins.
+ *
+ * The server segment forbids `__` — `[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*` allows
+ * `comfyui_panel` but not `comfyui__wrong`. `deadNameRe`'s own prefix is the
+ * looser `[A-Za-z0-9_]+`, and that difference is deliberate rather than an
+ * oversight: there, greediness only makes it MATCH more, which is fail-safe for a
+ * gate that hunts mentions. Here the same greediness EXEMPTS more, and
+ * `mcp__comfyui__wrong__get_system_stats (action:"clear_vram")` would slip
+ * through by letting the segment swallow `comfyui__wrong` — a line that, read the
+ * ordinary way, names server `comfyui`'s tool `wrong__get_system_stats`. Strict
+ * where it exempts, loose where it flags.
+ */
+const MCP_PREFIX_END = /(?:^|[^A-Za-z0-9_])mcp__[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*__$/;
+
+/** Live tool names, for the "the replacement must name a real tool" guard below. */
+const LIVE_TOOLS: ReadonlySet<string> = new Set<string>(TOOL_NAMES);
+
+/**
+ * Every verbatim occurrence of `needle` in `line` that BEGINS at a token
+ * boundary, INCLUDING occurrences that overlap each other.
+ *
+ * The boundary rule is not decoration. Without it `indexOf` treats the
+ * replacement as an unbounded substring, and
+ *
+ *     not_get_system_stats (action:"clear_vram")
+ *
+ * contains `get_system_stats (action:"clear_vram")` starting at index 4 — so a
+ * mention naming a DIFFERENT tool would be exempted by the mere suffix of that
+ * tool's name, which is precisely the case this whole exemption must not admit.
+ * Requiring a non-identifier character (or start of line) before the copy is the
+ * same contract `deadNameRe` already applies to names, `mcp__<server>__` allowance
+ * included: a namespacing client writes `mcp__comfyui__get_system_stats (…)`,
+ * which is the same tool and must still count. See MCP_PREFIX_END for why that
+ * allowance is stricter here than in `deadNameRe`.
+ *
+ * The asymmetry is deliberate: there is no matching rule on the RIGHT. A
+ * replacement names its tool at the START, so an identifier run before the copy
+ * changes WHICH tool is named, while one after it only extends trailing prose —
+ * `foo (action:"old_tool") x` inside `foo (action:"old_tool") xy` still names foo
+ * and still carries the correct call form, so flagging it would be a false
+ * positive that sends a sweep to "fix" text that is already right.
+ */
+function literalSpans(needle: string, line: string): Span[] {
+  const spans: Span[] = [];
+  if (needle.length === 0) return spans;
+  for (let i = line.indexOf(needle); i !== -1; i = line.indexOf(needle, i + 1)) {
+    const startsAtBoundary =
+      i === 0 || !IDENT.test(line[i - 1]!) || MCP_PREFIX_END.test(line.slice(0, i));
+    if (startsAtBoundary) spans.push({ start: i, end: i + needle.length });
+  }
+  return spans;
+}
+
+/**
+ * The mentions of a dead name on one line that are ROT — i.e. all of them except
+ * those sitting inside a verbatim copy of THAT SAME name's own declared
+ * `replacement`.
+ *
+ * WHY THIS EXEMPTION EXISTS. For many 0.50.0 folds the natural action name IS the
+ * retired tool name, so the migration target the prose sweep is REQUIRED to write —
+ *
+ *     get_system_stats (action:"clear_vram")
+ *
+ * — contains the bare token `clear_vram`, and `deadNameRe("clear_vram")` matches
+ * it (`"` is a non-word character on both sides). Without this rule the gate
+ * flags the very text it demands, and no sweep for those names can ever go green.
+ * That is not hypothetical: 14 names across slices 13/15/16 collide this way, and
+ * slice 9 only escaped by RENAMING its actions (`list_skills` → `skill_list`).
+ * Renaming does not scale to `apply_manifest` (93 mentions) or `clear_vram` (35) —
+ * contorting exactly the names models reach for is a real discoverability
+ * regression.
+ *
+ * WHY IT DOES NOT WEAKEN THE RATCHET. The exempted string is not chosen by a
+ * human; it is the ledger's OWN generated output, per name, self-derived. There is
+ * no knob. Concretely, all four of these still fail:
+ *
+ *   - a bare `clear_vram` anywhere on the line;
+ *   - `call clear_vram to free VRAM` — prose naming it;
+ *   - `some_other_tool (action:"clear_vram")` — a mention naming the WRONG
+ *     migration target, which is itself a defect worth catching;
+ *   - a bare mention sharing a line with a legitimate replacement form. The
+ *     exemption is POSITIONAL (span containment), never line-wide, so a live
+ *     instruction cannot launder itself by standing next to the migration target —
+ *     the same laundering the `allowedIn` logic already had to close.
+ *
+ * Matching is LITERAL (`indexOf`), never a regex built from `replacement`: the
+ * replacements are full call forms containing `(`, `)`, `"` and `|`, and a
+ * pattern compiled from `comfy_cli (action:"a"|"b")` would alternate rather than
+ * match. Literal also means an accidental partial cannot widen the exemption.
+ *
+ * Names whose replacement does not contain their own name — the large majority,
+ * and every entry in the ledger today — are byte-for-byte unaffected. That is
+ * structural, not a claim: a mention contained in a replacement copy would BE a
+ * copy of the name inside `replacement`, so the early return below cannot change
+ * a verdict, it only skips work.
+ *
+ * NOTE for a fold whose replacement names several actions: declare the SAME
+ * combined string (`manager (action:"update_all"|"self_update")`) on every entry
+ * it covers. The rule is per-name and self-derived on purpose, so a name is
+ * exempted only inside ITS OWN declared target — a name mentioned inside some
+ * OTHER entry's replacement is still reported, which is the correct answer when
+ * the two disagree about where a caller should go.
+ */
+export function rotMentions(dead: DeadName, line: string): Span[] {
+  const mentions = deadNameMentions(dead.name, line);
+  if (mentions.length === 0) return mentions;
+  if (!dead.replacement.includes(dead.name)) return mentions;
+  // The replacement must spell the retired name EXACTLY ONCE. One mention is the
+  // action slot — the whole reason this exemption exists. A second is something
+  // else, and `get_system_stats (action:"clear_vram") then call clear_vram` is a
+  // ledger entry carrying its own live instruction: exempting a verbatim copy would
+  // launder that instruction into every page that quotes the ledger. Zero mentions
+  // means the name only occurs inside a longer identifier (`clear_vram_stats`), so
+  // there is nothing to exempt either. Both fail CLOSED.
+  const inReplacement = deadNameMentions(dead.name, dead.replacement);
+  if (inReplacement.length !== 1) return mentions;
+
+  // The replacement must also name a tool that ACTUALLY EXISTS, other than the dead
+  // one. A replacement carrying nothing beyond the dead name — `clear_vram`,
+  // `` `clear_vram` ``, `clear_vram.`, and equally the prose `Use clear_vram` — is
+  // not a migration target; it says "call the tool that no longer exists".
+  // Exempting against it would blind the gate for that name completely, which is
+  // the one way this rule could turn into the bypass it is meant not to be. Merely
+  // requiring "some identifier survives" was not enough, because `Use` is an
+  // identifier. Requiring a LIVE tool name turns a heuristic into a checkable
+  // property, and catches a mistyped survivor in the ledger as a bonus.
+  //
+  // KNOWN LIMIT: `TOOL_NAMES` is core-only, so a fold whose replacement names a
+  // PANEL tool AND whose action reuses the retired name would not be exempted. No
+  // such entry exists (every panel replacement in the ledger names a different
+  // tool, so the `includes` guard above already returns first), and the failure
+  // direction is a visible false positive — the gate reports the line, and the
+  // DEAD_NAMES ledger test names the entry — never a silent pass.
+  const rest =
+    dead.replacement.slice(0, inReplacement[0]!.start) +
+    dead.replacement.slice(inReplacement[0]!.end);
+  if (!(rest.match(/[A-Za-z0-9_]+/g) ?? []).some((token) => LIVE_TOOLS.has(token))) {
+    return mentions;
+  }
+  const targets = literalSpans(dead.replacement, line);
+  if (targets.length === 0) return mentions;
+  // CONTAINMENT, not overlap. A mention that merely straddles the edge of a
+  // replacement copy — which a truncated or mistyped `replacement` produces — is
+  // not "inside a verbatim copy" of anything, and treating it as exempt would let
+  // one bad ledger string silence real mentions beside it.
+  return mentions.filter((m) => !targets.some((t) => m.start >= t.start && m.end <= t.end));
+}
+
 /**
  * Seeded with real rot rather than a hypothetical, so the gate proves itself on
  * day one: `panel_get_graph` was removed upstream but survives in FIVE live
