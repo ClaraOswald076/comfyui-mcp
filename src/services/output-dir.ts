@@ -1,5 +1,5 @@
 import { existsSync, statSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { config, isRemoteMode } from "../config.js";
 import { getClient, getSystemStats } from "../comfyui/client.js";
 import {
@@ -383,6 +383,31 @@ function anchorRelativeEntrypointOnBase(base: string, relDir: string): string | 
  * treating the destination as local configuration that was corroborated, not as a path
  * the server named.
  */
+/** Is `candidate` strictly inside `root`? The server's listing supplies both the category
+ *  and the file names, and a `..` segment in either (a stray path, a symlinked category)
+ *  would let `join` walk out of `<base>/models` and "find" a file that proves nothing
+ *  about this base. The root itself is not an entry, so equality is not containment. */
+function containedUnder(root: string, candidate: string): boolean {
+  const r = resolve(root);
+  const c = resolve(candidate);
+  if (c === r) return false;
+  const rel = relative(r, c);
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+/** What is at this path — keeping "could not look" out of "is not there", and out of
+ *  "is a regular file". A DIRECTORY named like a model would satisfy `existsSync` and
+ *  corroborate a base that holds none of the actual files. */
+function probeEntry(p: string): { kind: "file" | "absent" | "not-a-file" | "indeterminate"; detail?: string } {
+  try {
+    return statSync(p).isFile() ? { kind: "file" } : { kind: "not-a-file" };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") return { kind: "absent" };
+    return { kind: "indeterminate", detail: code ?? String(err) };
+  }
+}
+
 async function corroborateBaseByModelInventory(
   base: string,
 ): Promise<
@@ -424,32 +449,89 @@ async function corroborateBaseByModelInventory(
   // Bounded: stop at the first category that yields a COMPLETE match, and never walk
   // the whole list — this sits in front of a download, not in a background job.
   let checked = 0;
-  let lastReason = "the server reported no non-empty model category to compare against";
+  let unreadableCategories = 0;
+  let lastReason: string | undefined;
   for (const category of categories) {
     if (checked >= MAX_INVENTORY_CATEGORIES) break;
     let files: string[];
     try {
       const client = getClient();
       const res = await client.fetchApi(`/models/${encodeURIComponent(category)}`);
-      if (!res.ok) continue;
+      if (!res.ok) {
+        unreadableCategories += 1;
+        continue;
+      }
       const json = (await res.json()) as unknown;
-      if (!Array.isArray(json)) continue;
+      if (!Array.isArray(json)) {
+        unreadableCategories += 1;
+        continue;
+      }
       files = json.filter((n): n is string => typeof n === "string" && n.trim() !== "");
     } catch {
+      unreadableCategories += 1;
       continue;
     }
     if (files.length === 0) continue;
     checked += 1;
     const categoryDir = join(modelsDir, category);
-    const missing = files.filter((name) => !existsSync(join(categoryDir, name)));
-    if (missing.length === 0) {
+    // The CATEGORY name comes from the server too, so it gets the same containment
+    // check as the files under it.
+    if (!containedUnder(modelsDir, categoryDir)) {
+      lastReason = `the server's category name "${category}" does not name a directory inside "${modelsDir}", so nothing under it could corroborate this base`;
+      continue;
+    }
+    const missing: string[] = [];
+    const unreadable: string[] = [];
+    const notFiles: string[] = [];
+    const escaping: string[] = [];
+    for (const name of files) {
+      const full = join(categoryDir, name);
+      if (!containedUnder(categoryDir, full)) {
+        escaping.push(name);
+        continue;
+      }
+      const found = probeEntry(full);
+      if (found.kind === "file") continue;
+      if (found.kind === "absent") missing.push(name);
+      else if (found.kind === "not-a-file") notFiles.push(name);
+      else unreadable.push(`${name} (${found.detail ?? "unknown error"})`);
+    }
+    if (missing.length === 0 && unreadable.length === 0 && notFiles.length === 0 && escaping.length === 0) {
       return { ok: true, modelsDir, category, matched: files.length };
     }
-    lastReason =
-      `the server lists ${files.length} file(s) under "${category}" and ${missing.length} of them ` +
-      `are not under "${categoryDir}" (e.g. "${missing[0]}"), so this base does not explain what the server sees`;
+    // Each failure mode says what it actually was. "Could not read it" is not "it is not
+    // there", and neither is "something is there but it is not a file" — three different
+    // fixes, and the old single "are not under" phrasing named only one of them.
+    if (missing.length > 0) {
+      lastReason =
+        `the server lists ${files.length} file(s) under "${category}" and ${missing.length} of them ` +
+        `are not under "${categoryDir}" (e.g. "${missing[0]}"), so this base does not explain what the server sees`;
+    } else if (unreadable.length > 0) {
+      lastReason =
+        `the server lists ${files.length} file(s) under "${category}", and ${unreadable.length} of them ` +
+        `could not be inspected under "${categoryDir}" (e.g. "${unreadable[0]}") — that is NOT a finding ` +
+        "that they are missing, so nothing was established either way";
+    } else if (notFiles.length > 0) {
+      lastReason =
+        `the server lists ${files.length} file(s) under "${category}", and ${notFiles.length} of the ` +
+        `matching entries under "${categoryDir}" are not regular files (e.g. "${notFiles[0]}")`;
+    } else {
+      lastReason =
+        `the server lists ${escaping.length} entr(y/ies) under "${category}" whose path escapes ` +
+        `"${categoryDir}" (e.g. "${escaping[0]}"), so they cannot corroborate this base`;
+    }
   }
-  return { ok: false, reason: lastReason };
+  if (lastReason) return { ok: false, reason: lastReason };
+  // Nothing was COMPARED. Say which of the two reasons that was: every listing we could
+  // read was empty, or we could not read them. Reporting the second as the first would
+  // be the same fold this whole change is about.
+  return {
+    ok: false,
+    reason:
+      unreadableCategories > 0
+        ? `${unreadableCategories} of the server's model category listings could not be read, and any others were empty, so there was nothing to compare against`
+        : "the server reported no non-empty model category to compare against",
+  };
 }
 
 /** How many non-empty categories the inventory corroboration will compare before
@@ -600,7 +682,7 @@ export async function resolveModelsDirWithBases(): Promise<{
           `  - the OS process table did not identify an interpreter for the ComfyUI listening on ${config.resolvedPort} that sits inside an install tree${live.observedPython ? ` (observed "${live.observedPython}")` : ""};\n` +
           `  - ${
             base
-              ? `the configured local base "${base}" corroborates neither reading of that path: it does not contain "${join(live.relDir, "main.py")}" (the ComfyUI Desktop / launcher-root shape), and it is not itself "${live.relDir}" holding "main.py" (the portable shape where COMFYUI_PATH already points at the ComfyUI directory) — so it is a DIFFERENT install than the one that is running`
+              ? `the configured local base "${base}" corroborates neither reading of that path: it does not contain "${join(live.relDir, "main.py")}" (the ComfyUI Desktop / launcher-root shape), and it is not itself "${live.relDir}" holding "main.py" (the portable shape where COMFYUI_PATH already points at the ComfyUI directory) — so that check did NOT corroborate it, which is not the same as establishing it is a different install (a Docker/data-dir base legitimately has no main.py at all, #851)`
               : "no COMFYUI_PATH or default workspace is configured"
           }.\n` +
           `  - asking the running server what models it can SEE did not corroborate it either: ${inventory.reason} (this is the check that covers a Docker/data-dir COMFYUI_PATH, which holds models/ but no main.py).\n` +

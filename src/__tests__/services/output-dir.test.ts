@@ -15,24 +15,40 @@ let liveRootExists = true;
  *  the SERVER lists is present under `<base>/models/<category>`, which the flat boolean
  *  cannot express. Default keeps every pre-existing test on the boolean. */
 let existsFor: ((p: string) => boolean) | undefined;
-/** `<base>/models` stat for the #851 check: a directory, absent, or unreadable. */
+/** `<base>/models` stat for the #851 check: a directory, absent, or unreadable. Applies
+ *  ONLY to a path ending in `/models`, so the per-ENTRY stats below stay independent. */
 let modelsDirStat: "dir" | "file" | "enoent" | "eacces" = "dir";
+/** Per-ENTRY stat, for the model files the server lists. Default: a regular file when
+ *  `existsFor`/`liveRootExists` says it exists, ENOENT otherwise — so existing tests are
+ *  unaffected and the #851 cases can make one entry a directory or unreadable. */
+let statFor: ((p: string) => { isDirectory: () => boolean; isFile: () => boolean }) | undefined;
 vi.mock("node:fs", () => ({
   existsSync: (p: string) => (existsFor ? existsFor(String(p)) : liveRootExists),
   statSync: (p: string) => {
-    if (modelsDirStat === "enoent" || modelsDirStat === "eacces") {
-      const err = new Error(`stat ${String(p)}`) as NodeJS.ErrnoException;
-      err.code = modelsDirStat === "enoent" ? "ENOENT" : "EACCES";
+    const path = String(p);
+    if (/[\\/]models$/.test(path)) {
+      if (modelsDirStat === "enoent" || modelsDirStat === "eacces") {
+        const err = new Error(`stat ${path}`) as NodeJS.ErrnoException;
+        err.code = modelsDirStat === "enoent" ? "ENOENT" : "EACCES";
+        throw err;
+      }
+      return { isDirectory: () => modelsDirStat === "dir", isFile: () => modelsDirStat === "file" };
+    }
+    if (statFor) return statFor(path);
+    const there = existsFor ? existsFor(path) : liveRootExists;
+    if (!there) {
+      const err = new Error(`stat ${path}`) as NodeJS.ErrnoException;
+      err.code = "ENOENT";
       throw err;
     }
-    return { isDirectory: () => modelsDirStat === "dir" };
+    return { isDirectory: () => false, isFile: () => true };
   },
 }));
 
 const getSystemStats = vi.fn();
 /** The server's own model inventory: category → filenames it reports seeing. */
 let serverInventory: Record<string, string[]> | undefined;
-const fetchApi = vi.fn(async (path: string) => {
+const defaultFetchApi = async (path: string) => {
   if (!serverInventory) return { ok: false, status: 404, json: async () => ({}) };
   if (path === "/models") {
     return { ok: true, status: 200, json: async () => Object.keys(serverInventory as object) };
@@ -43,7 +59,8 @@ const fetchApi = vi.fn(async (path: string) => {
     return { ok: true, status: 200, json: async () => serverInventory![cat] };
   }
   return { ok: false, status: 404, json: async () => ({}) };
-});
+};
+const fetchApi = vi.fn(defaultFetchApi);
 vi.mock("../../comfyui/client.js", () => ({
   getSystemStats: (...a: unknown[]) => getSystemStats(...a),
   getClient: () => ({ fetchApi: (...a: unknown[]) => fetchApi(...(a as [string])) }),
@@ -122,8 +139,10 @@ beforeEach(() => {
   hasEntrypointFor = undefined;
   existsFor = undefined;
   modelsDirStat = "dir";
+  statFor = undefined;
   serverInventory = undefined;
   fetchApi.mockClear();
+  fetchApi.mockImplementation(defaultFetchApi);
 });
 
 afterEach(() => {
@@ -362,7 +381,13 @@ describe("models dir + extra-config argv parsing (#345/#346/#369)", () => {
       expect(msg).toMatch(/RELATIVE path/);
       expect(msg).toMatch(/did NOT report a working directory/);
       expect(msg).toMatch(/OS process table/);
-      expect(msg).toMatch(/DIFFERENT install/);
+      // It names the code-layout check as UNCORROBORATED, not as proof of a different
+      // install: #851 is the counterexample — a Docker/data-dir base legitimately has no
+      // main.py at all, so "did not corroborate" cannot imply "is another install".
+      expect(msg).toMatch(/did NOT corroborate it, which is not the same as establishing it is a different install/);
+      expect(msg).not.toMatch(/so it is a DIFFERENT install/);
+      // …and it reports the inventory check it also ran.
+      expect(msg).toMatch(/asking the running server what models it can SEE/);
       expect(msg).toMatch(/Refusing to write to a guessed directory/);
     });
 
@@ -797,6 +822,78 @@ describe("models dir — corroborating a data-dir base by the server's own inven
     serverInventory = { diffusion_models: ["a.safetensors"] };
 
     await expect(resolveModelsDirWithBases()).rejects.toThrow(/has no "models" directory/);
+  });
+
+  it("does not let a listing entry ESCAPE the category dir and corroborate from outside", async () => {
+    // The server supplies both the category and the file names. A `..` segment in either
+    // would let `join` walk out of <base>/models and "find" a file that says nothing
+    // about this base — a false corroboration, and this decides a download destination.
+    dockerServer();
+    serverInventory = { diffusion_models: ["../../../etc/hosts"] };
+    existsFor = () => true; // everything "exists" — containment is what must reject it
+
+    await expect(resolveModelsDirWithBases()).rejects.toThrow(/escapes/);
+  });
+
+  it("does not accept a DIRECTORY as one of the server's model files", async () => {
+    // `existsSync` is true for a directory, so a folder with a model-like name would
+    // have corroborated a base that holds none of the actual files.
+    dockerServer();
+    serverInventory = { diffusion_models: ["looks-like-a-model.safetensors"] };
+    existsFor = () => true;
+    statFor = () => ({ isDirectory: () => true, isFile: () => false });
+
+    await expect(resolveModelsDirWithBases()).rejects.toThrow(/are not regular files/);
+  });
+
+  it("does not report an UNREADABLE entry as missing", async () => {
+    dockerServer();
+    serverInventory = { diffusion_models: ["locked.safetensors"] };
+    statFor = () => {
+      const err = new Error("EACCES") as NodeJS.ErrnoException;
+      err.code = "EACCES";
+      throw err;
+    };
+
+    await expect(resolveModelsDirWithBases()).rejects.toThrow(
+      /could not be inspected under .* that is NOT a finding\s+that they are missing/s,
+    );
+    await expect(resolveModelsDirWithBases()).rejects.not.toThrow(/are not under/);
+  });
+
+  it("distinguishes 'every listing was empty' from 'no listing could be read'", async () => {
+    // Both leave nothing compared, and reporting the second as the first tells the user
+    // their server has no models when in fact we never got an answer.
+    dockerServer();
+    serverInventory = { diffusion_models: ["x"] };
+    // Category listings all fail; only /models itself answers.
+    fetchApi.mockImplementation(async (path: string) => {
+      if (path === "/models") return { ok: true, status: 200, json: async () => ["diffusion_models"] };
+      return { ok: false, status: 500, json: async () => ({}) };
+    });
+
+    await expect(resolveModelsDirWithBases()).rejects.toThrow(
+      /category listings could not be read/,
+    );
+    await expect(resolveModelsDirWithBases()).rejects.not.toThrow(
+      /reported no non-empty model category/,
+    );
+  });
+
+  it("does not call an uncorroborated base a DIFFERENT install", async () => {
+    // The code-layout check failing means it did not corroborate — and #851 is the proof
+    // that the inference "therefore it is another install" is invalid, since a data-dir
+    // base legitimately has no main.py at all.
+    dockerServer();
+    serverInventory = { diffusion_models: ["a.safetensors"] };
+    onDisk([]); // nothing matches → the full refusal is rendered
+
+    await expect(resolveModelsDirWithBases()).rejects.toThrow(
+      /did NOT corroborate it, which is not the same as establishing it is a different install/,
+    );
+    await expect(resolveModelsDirWithBases()).rejects.not.toThrow(
+      /so it is a DIFFERENT install/,
+    );
   });
 
   it("never runs the inventory probe when the destination already resolved", async () => {
