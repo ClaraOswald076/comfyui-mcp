@@ -171,8 +171,12 @@ describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]",
     const res = await restartComfyUI();
 
     expect(res.stopped).toBe(true);
-    expect(res.started).toBe(true);
     expect(res.ready).toBe(true);
+    // `started:false` beside `ready:true` (codex gate round 8). This call spawned
+    // NOTHING — an acknowledged Manager request can be a no-op — so it has no
+    // positive evidence it started anything, which is all `started` claims. That it
+    // does not mean "the server is down" is exactly what `ready:true` is for.
+    expect(res.started).toBe(false);
     expect(res.message).toContain("reboot request was acknowledged");
     expect(res.message).toContain("Desktop/supervised");
     // IT MUST NOT CLAIM A CYCLE IT NEVER WATCHED (codex gate round 6). This poller

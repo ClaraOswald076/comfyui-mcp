@@ -64,7 +64,7 @@ beforeEach(() => {
 });
 
 describe("restartComfyUI — remote (Manager reboot)", () => {
-  it("reboot POST 502, then /system_stats errors twice then 200 → started + ready", async () => {
+  it("reboot POST 502, then /system_stats errors twice then 200 → ready, dispatch UNacknowledged", async () => {
     __processControlTestHooks.setRemoteRebootTimingForTests({
       settleMs: 0,
       budgetMs: 1000,
@@ -88,15 +88,21 @@ describe("restartComfyUI — remote (Manager reboot)", () => {
     const res = await restartComfyUI();
 
     expect(res.stopped).toBe(true);
-    expect(res.started).toBe(true);
     expect(res.ready).toBe(true);
+    // No process of ours was spawned, so there is no positive evidence this call
+    // started anything; `ready:true` carries the good news (codex gate round 8).
+    expect(res.started).toBe(false);
     // A 502 is INFERRED to mean the handler took it and the origin dropped — a good
     // inference, and the reason this path works through a tunnel at all, but not an
     // acknowledgement. A tunnel hiccup in front of a server that was never restarted
     // produces the identical signal, so the report must not call it accepted (codex
     // gate round 7).
-    expect(res.message).toContain("no acknowledgement came back");
-    expect(res.message).not.toMatch(/was acknowledged/i);
+    expect(res.message).toContain("dispatched but not acknowledged");
+    expect(res.message).not.toMatch(/request was acknowledged/i);
+    // The OBSERVED signal is named — a proxy status here — rather than one of the
+    // two causes this branch covers being narrated as the fact (codex gate round 8).
+    expect(res.message).toContain("a proxy in front of ComfyUI answered HTTP 502");
+    expect(res.message).not.toMatch(/connection dropped/i);
     expect(res.startup).toBe("unconfirmed");
     expect(hoisted.resetClient).toHaveBeenCalledTimes(1);
     expect(hoisted.resetObjectInfoCache).toHaveBeenCalledTimes(1);
