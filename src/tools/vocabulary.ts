@@ -323,6 +323,30 @@ export interface DeadName {
    * added to an exempted file still fails.
    */
   allowedIn?: Array<{ path: string; context: string; why: string }>;
+  /**
+   * Files that IMPLEMENT the surviving tool, where this name still appears as a
+   * bare quoted action literal — `"regenerate"` as a `z.enum` member, a
+   * `case "regenerate":` label, an argument to a per-action error builder.
+   *
+   * Only meaningful when the fold reused the retired tool name as its action name
+   * (`replacement: 'generate_image (action:"regenerate")'`), which is what
+   * `declaredActions` checks. If the slice renamed the action, this licenses
+   * nothing.
+   *
+   * NOT a whole-file pass, and the difference is the whole point. It licenses ONE
+   * structural form: a complete quoted string literal whose entire content is the
+   * name. src/tools/generate-image.ts is thousands of lines of model-facing
+   * description strings, and `SELF`-listing it would pre-approve every live
+   * instruction added there later — the exact reasoning that made `allowedIn`
+   * per-occurrence. Here, `"Call regenerate to redo the render"` is still reported,
+   * because the literal's content is not the name; only `"regenerate"` standing
+   * alone is the action vocabulary.
+   *
+   * Exact paths, never globs, for the same reason as `allowedIn.path`. An entry
+   * whose file no longer contains such a literal is reported as stale by
+   * scripts/check-tool-vocabulary.mts — exceptions expire.
+   */
+  implementedIn?: string[];
 }
 
 /**
@@ -402,6 +426,137 @@ const MCP_PREFIX_END = /(?:^|[^A-Za-z0-9_])mcp__[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*__
 /** Live tool names, for the "the replacement must name a real tool" guard below. */
 const LIVE_TOOLS: ReadonlySet<string> = new Set<string>(TOOL_NAMES);
 
+/** Escape for embedding in a RegExp source. */
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * The action names a replacement declares:
+ *
+ *     'generate_image (action:"regenerate")'                  → ["regenerate"]
+ *     'comfy_cli (action:"models_list"|"models_show")'        → ["models_list", "models_show"]
+ *     'queue (action:"list")'                                 → ["list"]
+ *     'panel_get_errors'                                      → []
+ *
+ * This is how the ledger tells us that a retired TOOL name is now an ACTION name.
+ * Everything the action-form rules license keys off it, so a fold that RENAMED its
+ * action (slice 9's `list_skills` → `skill_list`) declares no collision and gets
+ * no new exemptions at all — the same self-derivation the replacement-copy rule
+ * uses, applied to the other half of the call form.
+ */
+export function declaredActions(replacement: string): string[] {
+  // ANCHORED to the call form: `<tool> (action:…)` at the START of the
+  // replacement, not the first `action:` anywhere in it. Otherwise prose that
+  // merely quotes the old spelling —
+  //     'generate_image (mode:"fast") — old syntax action:"regenerate" is retired'
+  // — reads as a declaration and switches the action rules on for a name the
+  // surviving tool has no action for.
+  const call =
+    /^\s*(?:mcp__[A-Za-z0-9_]+__)?[A-Za-z0-9_]+\s*\(\s*action\s*:\s*((?:["'`][A-Za-z0-9_]+["'`]\s*\|?\s*)+)\)/.exec(
+      replacement,
+    );
+  if (!call) return [];
+  return [...call[1]!.matchAll(/["'`]([A-Za-z0-9_]+)["'`]/g)].map((m) => m[1]!);
+}
+
+/**
+ * An `action:` key opening a call's argument list — `tool (action:"N")`.
+ *
+ * Just `\(\s*$`, not `<identifier>\s*\(\s*$`: the narrower shape missed
+ * `some_other_tool?.(action:"N")` and `some_other_tool /* note *\/ (action:"N")`,
+ * which name a tool exactly as much as the plain form does. Any `(` is the
+ * conservative reading, and it costs nothing — the legitimate forms are separated
+ * from a call by a quote (`fn('action:"N" …')`) or a brace (`{ action:"N" }`),
+ * never by a bare paren.
+ */
+const TOOL_CALL_OPEN = /\(\s*$/;
+
+/**
+ * Positions where a quoted literal is an ACTION rather than a tool argument:
+ * an array/enum member (`[` or `,` before it) or a `case` label. These are the
+ * three forms the slices measured.
+ *
+ * A call's FIRST argument — `callTool("regenerate", payload)` — is deliberately
+ * NOT one of them. It is indistinguishable from `z.literal("regenerate")`, and one
+ * of those two is a live dispatch to the retired tool. Fail closed: report it, and
+ * let a real case be an `allowedIn` with a reason.
+ */
+const ACTION_LITERAL_LEAD = /(?:[[,]|(?<![A-Za-z0-9_])case)\s*$/;
+
+/**
+ * Where `line` uses `name` as an ACTION VALUE — `action:"regenerate"`,
+ * `"action": "regenerate"`, `c.args?.action === "regenerate"`.
+ *
+ * WHY THIS IS NOT ROT AT ALL. After a fold, `regenerate` is no longer a tool name,
+ * but it IS a live action name, and `deadNameRe` cannot tell the two apart because
+ * they are spelled identically. The replacement-copy rule only covers prose that
+ * quotes the whole call form; slice 16 measured the rest and it is the majority —
+ * 57 of 84 hits are the token used as a value or identifier, where no replacement
+ * string can wrap it. The text here says `action` itself, so it is self-evidencing
+ * and needs no ledger entry, which is also what keeps `docs:gen` output stable:
+ * the generated `"action": "regenerate"` in docs/tools/*.mdx is covered by the same
+ * rule as the source string it was generated from.
+ *
+ * THE EXCLUSION IS THE LOAD-BEARING PART. `some_other_tool (action:"regenerate")`
+ * also contains `action:"regenerate"` — and it must still fail, because it names
+ * the WRONG tool. So an `action` key sitting directly in a `<identifier> (`
+ * argument position is a TOOL-CALL form: it claims a specific tool, and it is
+ * judged by the replacement-copy rule instead, which exempts it only when the tool
+ * is the declared survivor. A bare `- action:"regenerate" — …` bullet claims no
+ * tool and is licensed here.
+ *
+ * The prefix is measured to the `action` TOKEN, not to the match start, and that
+ * is what separates a call form from a string: `.describe('action:"regenerate" …')`
+ * has a quote between the `(` and the key, so a string opened and the text inside
+ * is prose, not an argument list. Testing from the match start instead classified
+ * every `fn('action:"…"')` as a tool call and flagged it — one of the measured
+ * forms.
+ *
+ * ACCEPTED LIMIT: a quoted key inside a call, `some_other_tool ("action": "x")`,
+ * is therefore not treated as a call form. It is not a shape anyone writes — the
+ * documented call form is `tool (action:"x")` — and the canonical one is excluded.
+ */
+export function actionValueSpans(name: string, line: string): Span[] {
+  const re = new RegExp(
+    `(?<![A-Za-z0-9_])(["'\`]?)action["'\`]?\\s*(?::|={1,3}|!={1,2})\\s*["'\`]${escapeRe(name)}["'\`]`,
+    "g",
+  );
+  const spans: Span[] = [];
+  for (let m = re.exec(line); m !== null; m = re.exec(line)) {
+    const keyStart = m.index + m[1]!.length;
+    if (TOOL_CALL_OPEN.test(line.slice(0, keyStart))) continue;
+    spans.push({ start: m.index, end: m.index + m[0].length });
+  }
+  return spans;
+}
+
+/**
+ * Where `line` spells `name` as a COMPLETE quoted string literal — `"regenerate"`.
+ *
+ * This is the residue slice 16 measured inside the file that registers the
+ * surviving tool: `z.enum([… "regenerate" …])`, `case "regenerate":`,
+ * `need(args.asset_id, "regenerate", …)`. Nothing on those lines says the word
+ * "action", so no self-evidencing rule can reach them; they are licensed only in
+ * the paths an entry names in `implementedIn`.
+ *
+ * Narrow on purpose, in two dimensions. The literal's ENTIRE content must be the
+ * name, so `"Call regenerate to redo the render"` is a quoted string in the same
+ * file and is still reported; backticks are excluded, so a markdown code span
+ * `` `regenerate` `` in a JSDoc block there is still reported too. And it must sit
+ * in an action POSITION — see ACTION_LITERAL_LEAD — so a dispatch by tool name,
+ * `callTool("regenerate", payload)`, is still reported even in a declared file.
+ */
+export function actionLiteralSpans(name: string, line: string): Span[] {
+  const re = new RegExp(`(["'])${escapeRe(name)}\\1`, "g");
+  const spans: Span[] = [];
+  for (let m = re.exec(line); m !== null; m = re.exec(line)) {
+    if (!ACTION_LITERAL_LEAD.test(line.slice(0, m.index))) continue;
+    spans.push({ start: m.index, end: m.index + m[0].length });
+  }
+  return spans;
+}
+
 /**
  * Every verbatim occurrence of `needle` in `line` that BEGINS at a token
  * boundary, INCLUDING occurrences that overlap each other.
@@ -439,59 +594,11 @@ function literalSpans(needle: string, line: string): Span[] {
 }
 
 /**
- * The mentions of a dead name on one line that are ROT — i.e. all of them except
- * those sitting inside a verbatim copy of THAT SAME name's own declared
- * `replacement`.
- *
- * WHY THIS EXEMPTION EXISTS. For many 0.50.0 folds the natural action name IS the
- * retired tool name, so the migration target the prose sweep is REQUIRED to write —
- *
- *     get_system_stats (action:"clear_vram")
- *
- * — contains the bare token `clear_vram`, and `deadNameRe("clear_vram")` matches
- * it (`"` is a non-word character on both sides). Without this rule the gate
- * flags the very text it demands, and no sweep for those names can ever go green.
- * That is not hypothetical: 14 names across slices 13/15/16 collide this way, and
- * slice 9 only escaped by RENAMING its actions (`list_skills` → `skill_list`).
- * Renaming does not scale to `apply_manifest` (93 mentions) or `clear_vram` (35) —
- * contorting exactly the names models reach for is a real discoverability
- * regression.
- *
- * WHY IT DOES NOT WEAKEN THE RATCHET. The exempted string is not chosen by a
- * human; it is the ledger's OWN generated output, per name, self-derived. There is
- * no knob. Concretely, all four of these still fail:
- *
- *   - a bare `clear_vram` anywhere on the line;
- *   - `call clear_vram to free VRAM` — prose naming it;
- *   - `some_other_tool (action:"clear_vram")` — a mention naming the WRONG
- *     migration target, which is itself a defect worth catching;
- *   - a bare mention sharing a line with a legitimate replacement form. The
- *     exemption is POSITIONAL (span containment), never line-wide, so a live
- *     instruction cannot launder itself by standing next to the migration target —
- *     the same laundering the `allowedIn` logic already had to close.
- *
- * Matching is LITERAL (`indexOf`), never a regex built from `replacement`: the
- * replacements are full call forms containing `(`, `)`, `"` and `|`, and a
- * pattern compiled from `comfy_cli (action:"a"|"b")` would alternate rather than
- * match. Literal also means an accidental partial cannot widen the exemption.
- *
- * Names whose replacement does not contain their own name — the large majority,
- * and every entry in the ledger today — are byte-for-byte unaffected. That is
- * structural, not a claim: a mention contained in a replacement copy would BE a
- * copy of the name inside `replacement`, so the early return below cannot change
- * a verdict, it only skips work.
- *
- * NOTE for a fold whose replacement names several actions: declare the SAME
- * combined string (`manager (action:"update_all"|"self_update")`) on every entry
- * it covers. The rule is per-name and self-derived on purpose, so a name is
- * exempted only inside ITS OWN declared target — a name mentioned inside some
- * OTHER entry's replacement is still reported, which is the correct answer when
- * the two disagree about where a caller should go.
+ * Is this entry a usable migration instruction at all? Every exemption below
+ * reads it as one, so a broken entry must license nothing.
  */
-export function rotMentions(dead: DeadName, line: string): Span[] {
-  const mentions = deadNameMentions(dead.name, line);
-  if (mentions.length === 0) return mentions;
-  if (!dead.replacement.includes(dead.name)) return mentions;
+function usableTarget(dead: DeadName): boolean {
+  if (!dead.replacement.includes(dead.name)) return false;
   // The replacement must spell the retired name EXACTLY ONCE. One mention is the
   // action slot — the whole reason this exemption exists. A second is something
   // else, and `get_system_stats (action:"clear_vram") then call clear_vram` is a
@@ -500,7 +607,7 @@ export function rotMentions(dead: DeadName, line: string): Span[] {
   // means the name only occurs inside a longer identifier (`clear_vram_stats`), so
   // there is nothing to exempt either. Both fail CLOSED.
   const inReplacement = deadNameMentions(dead.name, dead.replacement);
-  if (inReplacement.length !== 1) return mentions;
+  if (inReplacement.length !== 1) return false;
 
   // The replacement must also name a tool that ACTUALLY EXISTS, other than the dead
   // one. A replacement carrying nothing beyond the dead name — `clear_vram`,
@@ -521,15 +628,101 @@ export function rotMentions(dead: DeadName, line: string): Span[] {
   const rest =
     dead.replacement.slice(0, inReplacement[0]!.start) +
     dead.replacement.slice(inReplacement[0]!.end);
-  if (!(rest.match(/[A-Za-z0-9_]+/g) ?? []).some((token) => LIVE_TOOLS.has(token))) {
-    return mentions;
-  }
+  return (rest.match(/[A-Za-z0-9_]+/g) ?? []).some((token) => LIVE_TOOLS.has(token));
+}
+
+/**
+ * The mentions of a dead name on one line that are ROT.
+ *
+ * WHY ANY EXEMPTION EXISTS. For many 0.50.0 folds the natural action name IS the
+ * retired tool name. So `regenerate` stops being a tool and becomes an ACTION of
+ * `generate_image` — and `deadNameRe` cannot tell those apart, because they are
+ * spelled identically. Every remaining use of the token is then flagged, including
+ * the migration text the prose sweep is REQUIRED to write:
+ *
+ *     generate_image (action:"regenerate")
+ *
+ * Without a rule, no sweep for those names can ever go green. Slice 9 escaped only
+ * by RENAMING its actions (`list_skills` → `skill_list`); that does not scale to
+ * `apply_manifest` (93 mentions) or `clear_vram` (35), where contorting exactly the
+ * names models reach for is a real discoverability regression.
+ *
+ * THE THREE RULES, each self-derived from the entry and each POSITIONAL:
+ *
+ *   (a) MIGRATION TARGET — inside a verbatim copy of the entry's own
+ *       `replacement`. Covers prose: comments, README rows, docs. Measured at 27
+ *       of slice 16's 84 hits.
+ *   (b) ACTION VALUE — `action:"regenerate"`, `"action": "regenerate"`,
+ *       `args.action === "regenerate"`. Self-evidencing (the text says `action`),
+ *       so repo-wide and no ledger entry, which is what keeps `docs:gen` output
+ *       stable across regeneration. See actionValueSpans.
+ *   (c) ACTION LITERAL — `"regenerate"` as a complete quoted string, ONLY in the
+ *       paths the entry lists in `implementedIn`: enum members, `case` labels,
+ *       arguments to per-action helpers. See actionLiteralSpans.
+ *
+ * (b) and (c) require the entry's `replacement` to declare this exact name as an
+ * action (`declaredActions`), so a fold that renamed its action gets nothing.
+ *
+ * WHY THIS DOES NOT WEAKEN THE RATCHET. Nothing here is a human-chosen string:
+ * (a) is the ledger's own output, (b) is a syntactic form that names itself, (c) is
+ * one structural form in explicitly declared files. All of these still fail:
+ *
+ *   - a bare `regenerate` anywhere, and `call regenerate to redo the render`;
+ *   - `some_other_tool (action:"regenerate")` — the WRONG tool. (b) deliberately
+ *     skips any match preceded by `<identifier> (`, handing it to (a), which
+ *     exempts it only when the tool is the declared survivor;
+ *   - `not_generate_image (action:"regenerate")` — a tool whose name merely ENDS
+ *     with the survivor's;
+ *   - `"Call regenerate now"` in an `implementedIn` file — a quoted string whose
+ *     content is not exactly the name;
+ *   - a rotten bare mention sharing a line with a legitimate replacement form or
+ *     `action:"N"`. Exemption is by span CONTAINMENT, never line-wide.
+ *
+ * (a) matches LITERALLY (`indexOf`), never a regex built from `replacement`: the
+ * replacements are call forms containing `(`, `)`, `"` and `|`, and a pattern
+ * compiled from `comfy_cli (action:"a"|"b")` would alternate rather than match.
+ *
+ * Entries whose replacement does not contain their own name — the large majority,
+ * and every entry in the ledger today — are byte-for-byte unaffected by all three.
+ *
+ * NOTE for a fold whose replacement names several actions: declare the SAME
+ * combined string (`manager (action:"update_all"|"self_update")`) on every entry it
+ * covers. The rules are per-name and self-derived on purpose, so a name is exempted
+ * only against ITS OWN declared target.
+ *
+ * `path` is the repo-relative file being scanned; omit it and rule (c) is off.
+ */
+export function rotMentions(dead: DeadName, line: string, path?: string): Span[] {
+  const mentions = deadNameMentions(dead.name, line);
+  if (mentions.length === 0) return mentions;
+  // Every rule below reads the ledger entry as a migration instruction, so a broken
+  // entry licenses nothing at all. One gate, three rules, fail-closed.
+  if (!usableTarget(dead)) return mentions;
+
+  // (a) The migration TARGET, spelled exactly — the form the prose sweep writes.
   const targets = literalSpans(dead.replacement, line);
+
+  // (b) and (c) apply only when the fold reused the retired TOOL name as its
+  // ACTION name, which is the collision that creates the problem. A fold that
+  // renamed its action declares nothing here and gains nothing.
+  if (declaredActions(dead.replacement).includes(dead.name)) {
+    // (b) The name used as an action VALUE. Self-evidencing, so repo-wide.
+    targets.push(...actionValueSpans(dead.name, line));
+    // (c) The name as a bare quoted action literal, only in the declared
+    // implementing files. `path` is optional so a caller with no file context
+    // (call_tool, a unit test) simply never gets this rule.
+    if (path !== undefined && dead.implementedIn?.includes(path)) {
+      targets.push(...actionLiteralSpans(dead.name, line));
+    }
+  }
+
   if (targets.length === 0) return mentions;
-  // CONTAINMENT, not overlap. A mention that merely straddles the edge of a
-  // replacement copy — which a truncated or mistyped `replacement` produces — is
-  // not "inside a verbatim copy" of anything, and treating it as exempt would let
-  // one bad ledger string silence real mentions beside it.
+  // CONTAINMENT, not overlap, and it is what makes all three rules per-OCCURRENCE
+  // rather than per-line. A mention that merely straddles the edge of a replacement
+  // copy — which a truncated or mistyped `replacement` produces — is not "inside" a
+  // verbatim copy of anything; and a rotten bare mention sitting beside a legitimate
+  // `action:"N"` is outside that span, so it is still reported. A line-wide test
+  // would exempt both, which is the single most dangerous way to widen this.
   return mentions.filter((m) => !targets.some((t) => m.start >= t.start && m.end <= t.end));
 }
 

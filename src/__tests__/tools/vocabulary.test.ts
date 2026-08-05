@@ -6,6 +6,7 @@ import {
   retirementBaseline,
   TOOL_NAMES,
   baselineIntegrity,
+  declaredActions,
   deadNameMentions,
   deadNameRe,
   findDeadName,
@@ -89,7 +90,7 @@ describe("rotMentions", () => {
     since: "0.50.0",
     replacement: 'get_system_stats (action:"clear_vram")',
   };
-  const rot = (dead: DeadName, line: string) => rotMentions(dead, line);
+  const rot = (dead: DeadName, line: string, path?: string) => rotMentions(dead, line, path);
 
   it("exempts a mention inside the name's own declared replacement", () => {
     expect(rot(clearVram, 'get_system_stats (action:"clear_vram")')).toEqual([]);
@@ -353,6 +354,227 @@ describe("rotMentions", () => {
     }
   });
 
+  /**
+   * RULE (b) — the name used as an ACTION VALUE.
+   *
+   * Slice 16 swept every mention it controlled into the exact replacement form and
+   * then classified the 84 hits that remained: 27 were prose (rule (a)) and 57 were
+   * the token used as a value or identifier, where no replacement string can wrap
+   * it. Slice 15 measured the same shape independently (77 hits). These lines say
+   * the word `action` themselves, so the rule is self-evidencing and needs no
+   * ledger entry — which is also what makes it stable across `docs:gen`, since the
+   * generated `"action": "regenerate"` is covered by the same rule as the source
+   * string it was generated from.
+   */
+  const regenerate: DeadName = {
+    name: "regenerate",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"regenerate")',
+  };
+
+  it("exempts the name used as an action value, in every form the slices measured", () => {
+    const forms = [
+      '- action:"regenerate" — Re-enqueue the workflow that produced an image.',
+      '.describe(\'action:"regenerate" — max seconds to wait\')',
+      '  "action": "regenerate",',
+      "  action: 'regenerate',",
+      'c.args?.action === "regenerate"',
+      'if (args.action !== "regenerate") return;',
+      '{ action:"regenerate", asset_id: "x" }',
+    ];
+    for (const line of forms) expect(rot(regenerate, line), line).toEqual([]);
+  });
+
+  // THE CONSTRAINT THAT MATTERS MOST. Rule (b) as "the line matches action:\"N\""
+  // would exempt EVERY occurrence on the line, including a genuinely rotten one
+  // beside it. Containment means only the matched occurrence is exempt.
+  it("still reports a bare mention sharing a line with an action value", () => {
+    const line = '- action:"regenerate" — replaces the old regenerate tool; call regenerate';
+    const hits = rot(regenerate, line);
+    expect(hits).toHaveLength(2);
+    for (const h of hits) {
+      // Neither surviving hit is the one inside the action:"…" construct.
+      expect(h.start).toBeGreaterThan(line.indexOf('action:"regenerate"') + 18);
+    }
+  });
+
+  /**
+   * A tool-call form CLAIMS a tool, so it is judged by rule (a) — which exempts it
+   * only when the tool is the declared survivor. Without this exclusion, rule (b)
+   * would exempt `some_other_tool (action:"regenerate")`, breaking the wrong-tool
+   * guarantee outright.
+   */
+  it("does not let the action-value rule launder a wrong tool", () => {
+    expect(rot(regenerate, 'generate_image (action:"regenerate")')).toEqual([]);
+    for (const wrong of [
+      'some_other_tool (action:"regenerate")',
+      'queue (action:"regenerate")',
+      'not_generate_image (action:"regenerate")',
+      'generate_images (action:"regenerate")',
+    ]) {
+      expect(rot(regenerate, wrong), wrong).toHaveLength(1);
+    }
+  });
+
+  /**
+   * A wrong tool names itself just as much through `?.()`, through a comment, or
+   * with no space — so the call-form test is "an `action:` key opening ANY paren",
+   * not "an identifier immediately before the paren". The narrower shape let all
+   * three of these through.
+   */
+  it("treats every call syntax as a tool-call form, not just `<ident> (`", () => {
+    for (const wrong of [
+      'some_other_tool?.(action:"regenerate")',
+      "some_other_tool /* traced */ (action:\"regenerate\")",
+      'some_other_tool(action:"regenerate")',
+      'obj.method(action:"regenerate")',
+    ]) {
+      expect(rot(regenerate, wrong), wrong).toHaveLength(1);
+    }
+    // ...while the forms separated from a call by a quote or a brace are still
+    // action vocabulary. This is the line the paren rule must not cross.
+    expect(rot(regenerate, '.describe(\'action:"regenerate" — seconds\')')).toEqual([]);
+    expect(rot(regenerate, 'callTool({ name: "x", args: { action:"regenerate" } })')).toEqual([]);
+  });
+
+  it("does not exempt an action value for a name the replacement never declares", () => {
+    // The fold RENAMED the action (slice 9's escape hatch), so there is no
+    // collision and rule (b) must not fire for the old name.
+    const renamed: DeadName = {
+      name: "list_skills",
+      since: "0.50.0",
+      replacement: 'comfy_cli (action:"skill_list") — was list_skills',
+    };
+    expect(rot(renamed, 'action:"list_skills"')).toHaveLength(1);
+    // A DIFFERENT tool's action slot is not this name's licence either.
+    expect(rot(regenerate, 'action:"regenerate_all"')).toEqual([]); // no mention at all
+  });
+
+  /**
+   * The declaration is the `action:` CLAUSE, not any quoted token anywhere in the
+   * replacement. Here the fold renamed the action to `upscale` and the prose merely
+   * quotes the retired name — reading that as a declaration would switch rules (b)
+   * and (c) on for a name that has no action at all.
+   */
+  it("reads the action clause, not any quoted token in the replacement", () => {
+    const quoted: DeadName = {
+      name: "regenerate",
+      since: "0.50.0",
+      replacement: 'generate_image (action:"upscale") — replaces "regenerate"',
+    };
+    expect(declaredActions(quoted.replacement)).toEqual(["upscale"]);
+    expect(rot(quoted, 'action:"regenerate"')).toHaveLength(1);
+    expect(rot(quoted, '  case "regenerate":', "src/tools/generate-image.ts")).toHaveLength(1);
+  });
+
+  /**
+   * The declaration must be the call form's OWN action clause, anchored at the
+   * start of the replacement. Prose that merely spells `action:"N"` further along
+   * is not a declaration — reading it as one would switch both action rules on for
+   * a name the surviving tool has no action for, from a replacement that otherwise
+   * looks well-formed.
+   */
+  it("does not read a declaration out of prose after the call form", () => {
+    const prose: DeadName = {
+      name: "regenerate",
+      since: "0.50.0",
+      replacement: 'generate_image (mode:"fast") — old syntax action:"regenerate" is retired',
+      implementedIn: ["src/tools/generate-image.ts"],
+    };
+    expect(declaredActions(prose.replacement)).toEqual([]);
+    expect(rot(prose, 'action:"regenerate"')).toHaveLength(1);
+    expect(rot(prose, '  ["a", "regenerate"]', "src/tools/generate-image.ts")).toHaveLength(1);
+  });
+
+  it("reads a multi-action clause, and only from inside the parens", () => {
+    expect(declaredActions('comfy_cli (action:"models_list"|"models_show")')).toEqual([
+      "models_list",
+      "models_show",
+    ]);
+    expect(declaredActions('mcp__comfyui__apps (action:"run")')).toEqual(["run"]);
+    expect(declaredActions("panel_get_errors")).toEqual([]);
+    expect(declaredActions("panel_query_graph (token-bounded) or panel_graph_outline")).toEqual([]);
+  });
+
+  /**
+   * RULE (c) — the residue slice 16 measured inside the file that registers the
+   * surviving tool: `z.enum` members, `case` labels, arguments to per-action error
+   * builders. Nothing on those lines says "action", so only a declared path can
+   * license them.
+   */
+  const implemented: DeadName = {
+    ...regenerate,
+    implementedIn: ["src/tools/generate-image.ts"],
+  };
+
+  it("exempts a bare quoted action literal, but only in a declared file", () => {
+    const forms = [
+      '  .enum(["image", "audio", "regenerate", "upscale"])',
+      '    case "regenerate":',
+      '      need(args.asset_id, "regenerate", "asset_id", "the asset to re-run");',
+    ];
+    for (const line of forms) {
+      expect(rot(implemented, line, "src/tools/generate-image.ts"), line).toEqual([]);
+      // Same text, undeclared file — still rot. The licence is the path.
+      expect(rot(implemented, line, "src/tools/other.ts"), line).not.toEqual([]);
+      // ...and an entry with no implementedIn licenses nothing anywhere.
+      expect(rot(regenerate, line, "src/tools/generate-image.ts"), line).not.toEqual([]);
+    }
+  });
+
+  /**
+   * NOT a whole-file pass, which is the entire reason this is a structural form
+   * rather than a `SELF` entry. generate-image.ts is thousands of lines of
+   * model-facing description strings; a live instruction added there later must
+   * still fail, exactly as it would anywhere else.
+   */
+  it("still reports a live instruction inside a declared implementing file", () => {
+    const path = "src/tools/generate-image.ts";
+    for (const line of [
+      '    description: "Call regenerate to redo the last render",',
+      "    // TODO: regenerate is faster here",
+      '    hint: "use regenerate",',
+      // A markdown code span in a JSDoc block is PROSE, not an enum member, which
+      // is why the literal rule takes `"` and `'` but not backticks. Doc comments
+      // in the implementing file are exactly what a whole-file pass would swallow.
+      "     * Re-runs the last generation. See `regenerate`.",
+    ]) {
+      expect(rot(implemented, line, path), line).toHaveLength(1);
+    }
+    // The quoted literal is exempt; a bare mention BESIDE it on the same line is not.
+    const mixed = '    case "regenerate": // falls through to regenerate';
+    const hits = rot(implemented, mixed, path);
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.start).toBe(mixed.lastIndexOf("regenerate"));
+  });
+
+  /**
+   * The literal must sit in an ACTION position — an enum/array member or a `case`
+   * label. A call's first argument is not one: `callTool("regenerate", …)` is a
+   * live dispatch BY TOOL NAME, and the implementing file is a perfectly normal
+   * place for one to appear. It is indistinguishable from `z.literal("regenerate")`
+   * by syntax alone, so this fails closed and a real case takes an `allowedIn`.
+   */
+  it("still reports a dispatch by tool name inside a declared file", () => {
+    const path = "src/tools/generate-image.ts";
+    for (const line of [
+      '  await callTool("regenerate", payload);',
+      '  return client.call("regenerate");',
+      '  const TOOL = "regenerate";',
+    ]) {
+      expect(rot(implemented, line, path), line).toHaveLength(1);
+    }
+    // The measured forms all lead with `[`, `,` or `case`, and still pass.
+    for (const line of [
+      '  .enum(["regenerate", "upscale"])',
+      '  .enum(["image", "regenerate"])',
+      '    case "regenerate":',
+      '      need(args.asset_id, "regenerate", "asset_id", "the asset");',
+    ]) {
+      expect(rot(implemented, line, path), line).toEqual([]);
+    }
+  });
+
   // Ledger-wide, and true no matter what future slices append: the exemption can
   // never silence a BARE mention of any dead name. If a change to rotMentions ever
   // makes it whole-line or name-agnostic, this goes red across the whole ledger.
@@ -464,6 +686,25 @@ describe("DEAD_NAMES ledger", () => {
       "This replacement spells its own dead name but names no live tool, so the gate " +
         "will flag the very text the prose sweep is required to write. Name the " +
         "surviving tool exactly as it appears in TOOL_NAMES.",
+    ).toEqual([]);
+  });
+
+  /**
+   * `implementedIn` licenses a bare `"name"` literal, and it only means anything
+   * when the fold reused the retired TOOL name as its ACTION name. On an entry
+   * whose replacement declares no such action it is inert — and an inert exemption
+   * is worse than none, because it reads in review as though it were doing
+   * something. Vacuous today, binding from slice 13 on.
+   */
+  it("only lets implementedIn appear where the action reuses the retired name", () => {
+    const inert = DEAD_NAMES.filter(
+      (d) => d.implementedIn?.length && !declaredActions(d.replacement).includes(d.name),
+    );
+    expect(
+      inert.map((d) => `${d.name} → ${d.replacement}`),
+      "implementedIn licenses a quoted action literal, but this entry's replacement " +
+        "does not declare the retired name as an action, so it licenses nothing. " +
+        "Either fix the replacement or drop implementedIn.",
     ).toEqual([]);
   });
 
