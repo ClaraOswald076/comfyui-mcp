@@ -173,7 +173,7 @@ describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]",
     expect(res.stopped).toBe(true);
     expect(res.started).toBe(true);
     expect(res.ready).toBe(true);
-    expect(res.message).toContain("reboot request was accepted");
+    expect(res.message).toContain("reboot request was acknowledged");
     expect(res.message).toContain("Desktop/supervised");
     // IT MUST NOT CLAIM A CYCLE IT NEVER WATCHED (codex gate round 6). This poller
     // has no down→up requirement at all — unlike the panel path, which certifies
@@ -183,6 +183,10 @@ describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]",
     expect(res.message).not.toMatch(/came back/i);
     expect(res.message).not.toMatch(/rebooted via/i);
     expect(res.message).toMatch(/not directly observed/i);
+    // …AND THE STRUCTURED FIELDS MUST AGREE WITH IT (codex gate round 7). An agent
+    // keys on the JSON, so `startup:"confirmed"` beside a message that withholds
+    // confirmation hands back the definite signal the prose just refused.
+    expect(res.startup).toBe("unconfirmed");
 
     // The Manager reboot was fired.
     expect(findCall((p) => p === "/v2/manager/reboot")).toBeDefined();

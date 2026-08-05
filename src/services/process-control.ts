@@ -298,8 +298,14 @@ interface StartupReadinessResult {
  *                     message.) It does NOT say the port is unserved either — an
  *                     external launcher or supervisor may have restored one, which
  *                     is why the message tells the caller to re-check.
- *   "unconfirmed"   — the readiness budget expired with nothing contradicting the
- *                     start.
+ *   "unconfirmed"   — this call cannot tie what is (or is not) serving to the
+ *                     launch/reboot it made. Two shapes reach it, and neither is a
+ *                     failure: the readiness budget expired with nothing
+ *                     contradicting the start; or the server IS healthy but no cycle
+ *                     was observed, which is every ComfyUI-Manager reboot — that
+ *                     path watches for a healthy probe, never for a down→up, so an
+ *                     accepted request in front of a server that never restarted
+ *                     looks identical to a successful one.
  *   "not-attempted" — this call never launched or rebooted anything (a refusal, or
  *                     a server that was already running). Stated rather than
  *                     omitted so it can never be mistaken for an older build that
@@ -2857,6 +2863,19 @@ export async function startComfyUI(): Promise<StartResult> {
 
 interface RebootResult {
   rebooting: boolean;
+  /**
+   * Did the Manager ACKNOWLEDGE the request, or is `rebooting` an INFERENCE?
+   *
+   * Only a non-catchall 2xx is an acknowledgement. A 502/503/504 from a proxy, or a
+   * connection dropping mid-request, are read as "the handler took it and the origin
+   * went down" — a good inference, and the reason this path works at all through a
+   * tunnel, but not something anybody observed. A tunnel hiccup in front of a server
+   * that was never restarted produces exactly the same signals (codex gate round 7).
+   *
+   * Carried so the report can say which of the two happened instead of calling both
+   * "accepted".
+   */
+  acked?: boolean;
   endpoint?: string;
   method?: string;
   reason?: string;
@@ -2946,7 +2965,8 @@ async function rebootViaManager(): Promise<RebootResult> {
           failures.push(`${method} ${path} → HTTP 200 (frontend catchall, not a reboot route)`);
           continue;
         }
-        return { rebooting: true, endpoint: path, method };
+        // The one path with a real acknowledgement from the Manager itself.
+        return { rebooting: true, acked: true, endpoint: path, method };
       }
       if (res.status === 403) {
         return {
@@ -2960,6 +2980,7 @@ async function rebootViaManager(): Promise<RebootResult> {
       if (res.status === 502 || res.status === 503 || res.status === 504) {
         return {
           rebooting: true,
+          acked: false, // inferred from the proxy status, not acknowledged
           endpoint: path,
           method,
           note: `reboot fired — the origin dropped behind a proxy (HTTP ${res.status}) as it went down`,
@@ -2971,6 +2992,7 @@ async function rebootViaManager(): Promise<RebootResult> {
       if (isConnectionDrop(err)) {
         return {
           rebooting: true,
+          acked: false, // inferred from the dropped connection, not acknowledged
           endpoint: path,
           method,
           note: "connection dropped (origin going down) — reboot fired",
@@ -3144,7 +3166,10 @@ async function restartViaManagerReboot(context: {
         // equally consistent with a server that was never reachable from here. The
         // accepted reboot is the one thing we did observe, so it is the one thing
         // claimed.
-        "The ComfyUI-Manager reboot was accepted, but no readiness probe got a " +
+        (reboot.acked
+          ? "The ComfyUI-Manager reboot request was acknowledged"
+          : "A ComfyUI-Manager reboot was dispatched (no acknowledgement came back)") +
+        ", but no readiness probe got a " +
         `healthy response from ${readiness.probe_url} within ${waitedS}s ` +
         `(${readiness.attempts}/${readiness.max_tries} probes over a ` +
         `COMFYUI_REMOTE_REBOOT_BUDGET_S=${seconds(timing.budgetMs)}s budget). That budget ` +
@@ -3166,8 +3191,11 @@ async function restartViaManagerReboot(context: {
   resetClient();
   resetObjectInfoCache();
   resetManagerApiCache("comfyui rebooted via Manager");
-  // #742 r4/r5: the dispatched restart was observed back — clear OUR record
-  // (the process-wide slot only; never another session's record).
+  // #742 r4/r5: the instance this restart was dispatched to is ANSWERING again, so
+  // the record has served its purpose — a later DOWN report can no longer be about
+  // this dispatch. (Not "observed back": nothing here watched a cycle. Clearing on a
+  // healthy endpoint is the conservative direction — it only ever REMOVES grounds
+  // for naming causation.)
   clearRestartDispatch(PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
 
   // #848: it is back — now say whether it came back as the SAME thing. Read after
@@ -3185,27 +3213,44 @@ async function restartViaManagerReboot(context: {
 
   return {
     stopped: true,
+    // THE FIELDS MUST AGREE WITH THE SENTENCE (codex gate round 7). A message that
+    // says the cycle was not observed, beside `startup:"confirmed"`, hands a caller
+    // reading the JSON the definite signal the prose just withheld — and the JSON is
+    // what an agent keys on.
+    //
+    // `started` stays TRUE on the same standing ruling as `listener_ownership`: a
+    // restart WAS dispatched and the server IS serving, and denying that would
+    // report every ordinary Desktop and remote restart as failed — a far more
+    // common and more damaging lie than an unconfirmed success the message
+    // qualifies. `startup` is what carries the gap.
     started: true,
     ready: true,
-    startup: "confirmed",
+    startup: "unconfirmed",
     readiness,
-    // WHAT THIS PATH ACTUALLY SAW (codex gate round 6): the reboot request was
-    // ACCEPTED, and a later probe found the server healthy. It never watched
-    // ComfyUI go down and come back — this poller has no down→up requirement at
-    // all, unlike the panel path, which certifies only on an observed cycle. So
-    // "rebooted and came back ready" claimed the one thing nobody here observed.
+    // WHAT THIS PATH ACTUALLY SAW (codex gate rounds 6 and 7): a reboot request that
+    // was either acknowledged or INFERRED to have landed, and a later probe finding
+    // the server healthy. It never watched ComfyUI go down and come back — this
+    // poller has no down→up requirement at all, unlike the panel path, which
+    // certifies only on an observed cycle. So "rebooted and came back ready" claimed
+    // the one thing nobody here observed.
     //
     // The distinction is not academic: a Manager that accepts the request and then
-    // does nothing leaves a healthy server that was never restarted, and a user
-    // told it "came back" stops looking for the reason their change did not apply.
+    // does nothing — or a tunnel hiccup read as "the origin went down" in front of a
+    // server that never restarted — leaves a healthy instance that was never cycled,
+    // and a user told it "came back" stops looking for why their change did not
+    // apply. Both halves are therefore stated as what they are.
     message:
-      `The ComfyUI-Manager reboot request was accepted and ComfyUI is healthy now ` +
-      `(${readiness.waited_ms}ms) — ${context.label}/supervised restart. The cycle itself ` +
-      `was not directly observed from here, so verify with health_check if you need ` +
-      `certainty that it actually restarted.` +
+      (reboot.acked
+        ? "The ComfyUI-Manager reboot request was acknowledged"
+        : "A ComfyUI-Manager reboot was dispatched (no acknowledgement came back — the " +
+          "connection dropped as it was sent, which usually means the handler took it)") +
+      ` and ComfyUI is healthy now (${readiness.waited_ms}ms) — ${context.label}/supervised ` +
+      "restart. The cycle itself was not directly observed from here, so verify with " +
+      "health_check if you need certainty that it actually restarted." +
       argvNote,
-    // The supervisor that owns the process cycled it; we launched nothing, so we
-    // cannot (and must not) claim the listener as ours.
+    // We launched nothing on this path — a supervisor is what would have cycled the
+    // process — so the listener is never ours to claim. (Nor is it established that
+    // one DID cycle it; that is `startup`'s business, and it says "unconfirmed".)
     listener_ownership: unclassifiedOwnership(),
   };
 }
