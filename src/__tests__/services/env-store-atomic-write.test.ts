@@ -534,6 +534,24 @@ describe("a save is never CONFIRMED over lost credentials", () => {
     expect(r.uncertainty).toMatch(/not atomic/);
   });
 
+  it("REPORTS a pre-write snapshot it could not delete — the sweep will not catch it", async () => {
+    // The snapshot this operation just took is FRESH, and the stale sweep
+    // deliberately leaves fresh files alone (it cannot tell a live writer's from
+    // ours). So a failure to delete it was log-only and a revoke came back clean
+    // with a readable copy of the revoked credential beside the store (codex
+    // gate).
+    const { revokeIsClean } = await import("../../services/panel-secrets.js");
+    writeFileSync(envPath, "CIVITAI_API_TOKEN=civ-old\n", { mode: 0o600 });
+    fsState.failSentinelRemoval = true;
+    const out = removeComfyuiSecret("CIVITAI_API_TOKEN");
+    fsState.failSentinelRemoval = false;
+    expect(out.changed).toBe(true); // the revoke happened
+    expect(out.resurrectionRisk).toMatch(/pre-write snapshot this removal took could not be deleted/);
+    expect(out.resurrectionRisk).toMatch(/still contains the old credential/);
+    expect(revokeIsClean(out)).toBe(false);
+    expect(JSON.stringify(out)).not.toContain("civ-old"); // names only
+  });
+
   it("does not throw when the pre-write snapshot cannot be removed", () => {
     // The cleanup runs AFTER the rename. An unguarded `rmSync` that throws there
     // discards the whole disclosure about a store that has already changed —

@@ -625,6 +625,38 @@ describe("the diagnostic body prefix never carries our own credential back", () 
     }
   });
 
+  it("redacts NUMERIC html entities, not just the five named ones", () => {
+    // Only the named entities were generated, so a responder that escapes with
+    // the numeric forms — `&#38;` or `&#x26;`, which plenty of escapers emit —
+    // got a reflected credential through in recoverable form (codex gate). And
+    // the choice is per CHARACTER, so a list would again be exponential: each
+    // character is matched as "itself, or any entity spelling of itself".
+    const token = "ab&cd<ef>gh";
+    authHeaders.value = { "X-API-Key": token };
+    try {
+      const dec = token.replace(/[&<>]/g, (c) => `&#${c.charCodeAt(0)};`);
+      const hex = token.replace(/[&<>]/g, (c) => `&#x${c.charCodeAt(0).toString(16)};`);
+      const hexUpper = token.replace(/[&<>]/g, (c) => `&#X${c.charCodeAt(0).toString(16).toUpperCase()};`);
+      const padded = token.replace(/[&<>]/g, (c) => `&#000${c.charCodeAt(0)};`);
+      // A MIXED spelling — named for one character, numeric for another — which
+      // no fixed list of whole-string variants can contain.
+      const mixed = token.replace(/&/g, "&amp;").replace(/</g, "&#60;").replace(/>/g, "&#x3e;");
+      for (const form of [dec, hex, hexUpper, padded, mixed]) {
+        expect(form, "the fixture must not be the raw token").not.toBe(token);
+        const d = classifyNonJson({
+          url: URL_UNDER_TEST,
+          status: 403,
+          contentType: "text/html",
+          body: `<html>rejected ${form} sorry</html>`,
+        });
+        expect(d.message, form).not.toContain(form);
+        expect(d.bodyPrefix, form).not.toContain(form);
+      }
+    } finally {
+      authHeaders.value = {};
+    }
+  });
+
   it("redacts a credential-SHAPED run even when nothing is configured", () => {
     // The shape rule is the actual defence: a body can reflect a credential we
     // cannot prove is ours, in an encoding we never anticipated.

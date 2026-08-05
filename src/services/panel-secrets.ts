@@ -364,6 +364,9 @@ export interface SecretSaveReceipt {
    *  (an fsync of the file or of its directory failed). A disclosure, not a
    *  failure: the value is in the store now. */
   durabilityGap?: string;
+  /** A pre-write snapshot this write could not delete — a readable copy of the
+   *  store as it was, holding the PREVIOUS credential for this key. */
+  strayCopy?: string;
 }
 
 // ── What a receipt OBLIGES its renderer to say ───────────────────────────────
@@ -434,10 +437,22 @@ export function shadowedNote(receipt: SecretSaveReceipt): string | null {
 export function receiptDisclosures(receipt: SecretSaveReceipt): string[] {
   return [
     storeDamageNote(receipt),
+    strayCopyNote(receipt),
     commentLossNote(receipt),
     durabilityNote(receipt),
     shadowedNote(receipt),
   ].filter((n): n is string => n !== null);
+}
+
+/** A pre-write snapshot the write could not delete: a readable copy of the store
+ *  holding the PREVIOUS credential for this key. Harmless clutter after a
+ *  rotation on a single-user machine, but the user should know it is there. */
+export function strayCopyNote(receipt: SecretSaveReceipt): string | null {
+  if (!receipt.strayCopy) return null;
+  return (
+    `⚠️ A pre-write snapshot of ${receipt.path} could not be deleted: ${receipt.strayCopy}. ` +
+    `It is a copy of the store from before this change and still contains the PREVIOUS value of "${receipt.key}". Delete it by hand.`
+  );
 }
 
 /**
@@ -798,6 +813,11 @@ export interface EnvWriteOutcome {
    *  is not established is that it survives a power loss — and an ignored fsync
    *  failure made a receipt claim exactly that (codex gate). */
   durabilityGap: string | null;
+  /** A pre-write SNAPSHOT this operation could not delete. It holds the store as
+   *  it was — for a revoke, that is the credential just removed, in a readable
+   *  file next to the store. The stale sweep will not catch it either: a fresh
+   *  snapshot belongs to a live writer and is deliberately left alone. */
+  strayCopy?: string;
 }
 
 /** An errno for a message, without ever quoting file contents. */
@@ -1019,6 +1039,8 @@ function rewriteEnvFile(
     let targetExistedAtSwap = false;
     let fd: number | undefined;
     let durabilityGap: string | null = null;
+    /** A pre-write snapshot this operation could not delete. */
+    let strayCopy: string | null = null;
     try {
       fd = openSync(tmp, "wx", 0o600);
       writeAllSync(fd, body);
@@ -1144,6 +1166,13 @@ function rewriteEnvFile(
     try {
       rmSync(sentinel, { force: true });
     } catch (err) {
+      // REPORTED, not only logged. This snapshot holds the store as it was —
+      // for a REVOKE, that is the credential the user just removed, sitting in a
+      // readable file next to the store. The sweep will not catch it either: it
+      // deliberately skips fresh files, because a fresh one belongs to a live
+      // writer. So a revoke could come back clean with the old token still on
+      // disk (codex gate). It rides out on the outcome instead.
+      strayCopy = `${sentinel} (${errCode(err)})`;
       logger.warn(
         `[panel-secrets] could not remove the pre-write snapshot ${sentinel} (${errCode(err)}); ` +
           `it is a copy of the credential store and can be deleted by hand.`,
@@ -1177,6 +1206,7 @@ function rewriteEnvFile(
           `${p} was rewritten but could not be read back afterwards (${errCode(err)}), ` +
           `so whether it still carries the other credentials it held is not established`,
         durabilityGap,
+        ...(strayCopy ? { strayCopy } : {}),
       };
     }
     const after = dotenvParseSafe(afterRaw);
@@ -1215,6 +1245,7 @@ function rewriteEnvFile(
       lossCheck: lossCheckNote ? "unknown" : "clean",
       ...(lossCheckNote ? { lossCheckNote } : {}),
       durabilityGap,
+      ...(strayCopy ? { strayCopy } : {}),
     };
   }
   throw new Error(
@@ -1471,6 +1502,7 @@ export function setEnvSecret(
       ...(writeOutcome.lostKeys.length ? { lostKeys: writeOutcome.lostKeys } : {}),
       ...(writeOutcome.lostCommentLines ? { lostCommentLines: writeOutcome.lostCommentLines } : {}),
       ...(writeOutcome.durabilityGap ? { durabilityGap: writeOutcome.durabilityGap } : {}),
+    ...(writeOutcome.strayCopy ? { strayCopy: writeOutcome.strayCopy } : {}),
       // Whether a credential for this key is STILL in effect after the rollback.
       // "Nothing is configured" is false when a previous working value survived,
       // and telling the user that would send them hunting the wrong problem.
@@ -1511,6 +1543,7 @@ export function setEnvSecret(
     // (codex gate).
     ...(writeOutcome.lostCommentLines ? { lostCommentLines: writeOutcome.lostCommentLines } : {}),
     ...(writeOutcome.durabilityGap ? { durabilityGap: writeOutcome.durabilityGap } : {}),
+    ...(writeOutcome.strayCopy ? { strayCopy: writeOutcome.strayCopy } : {}),
     respawn: reports.length
       ? reports.reduce(
           (a, b) => ({
@@ -1624,6 +1657,15 @@ export function removeEnvSecret(key: string): SecretRemoveOutcome {
   // them, so this only names the ones that could not be removed: a revoke must
   // not report the credential gone while a copy of it is sitting next to the
   // store (codex gate).
+  // The snapshot THIS removal took and could not delete is fresh, so the sweep
+  // below deliberately leaves it — it cannot tell a live writer's from ours.
+  // It holds the credential we just revoked, so it must be named here.
+  if (outcome.strayCopy && !resurrectionRisk) {
+    resurrectionRisk =
+      `"${key}" was removed from ${envFilePath()}, but the pre-write snapshot this removal took could not be deleted: ${outcome.strayCopy}. ` +
+      `That file is a copy of the store from BEFORE the revoke and still contains the old credential. Delete it by hand.`;
+    logger.warn(`[panel-secrets] ${resurrectionRisk}`);
+  }
   const strayCopies = sweepStaleSidecars(envFilePath());
   if (strayCopies.length && !resurrectionRisk) {
     resurrectionRisk =
