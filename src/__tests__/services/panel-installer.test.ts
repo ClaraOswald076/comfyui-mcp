@@ -24,6 +24,10 @@ vi.mock("../../config.js", () => ({
 const workspace = vi.hoisted(() => ({ base: undefined as string | undefined }));
 vi.mock("../../services/workspace-env.js", () => ({
   resolveEffectiveComfyUIBase: () => workspace.base,
+  // Panel management asks the LOCAL-MACHINE question (it gates on isLocalMode itself),
+  // which #490 split out from the operation-target one. Same stub: in a local session
+  // the two agree, and these tests are a local session.
+  resolveLocalWorkspaceBase: () => workspace.base,
 }));
 
 import {

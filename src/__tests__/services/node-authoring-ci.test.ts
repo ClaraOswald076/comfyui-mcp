@@ -3,6 +3,10 @@ import { join } from "node:path";
 
 vi.mock("../../config.js", () => ({
   config: { comfyuiPath: "/fake/comfy" },
+  // The target resolver consults the mode for EVERY answer now, not only when
+  // comfyuiPath is unset — a COMFYUI_PATH that short-circuited the mode check is #490.
+  // These scaffolding tests are a local session.
+  isRemoteMode: () => false,
 }));
 
 import {
