@@ -108,6 +108,13 @@ describe("restartComfyUI — remote (Manager reboot)", () => {
     expect(res.message).toContain("the request returned HTTP 502");
     expect(res.message).not.toMatch(/connection dropped/i);
     expect(res.message).not.toMatch(/proxy/i);
+    // …and no causal HEDGE either. "which usually means the handler accepted it and
+    // the server went down" made two inferences and a frequency claim nobody
+    // measured, and it undercut the very next sentence, which correctly says the
+    // cycle was not directly observed (codex gate round 10).
+    expect(res.message).not.toMatch(/usually means/i);
+    expect(res.message).not.toMatch(/went down/i);
+    expect(res.message).toMatch(/not directly observed/i);
     expect(res.startup).toBe("unconfirmed");
     expect(hoisted.resetClient).toHaveBeenCalledTimes(1);
     expect(hoisted.resetObjectInfoCache).toHaveBeenCalledTimes(1);

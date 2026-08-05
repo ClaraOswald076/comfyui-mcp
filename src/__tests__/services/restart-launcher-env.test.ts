@@ -371,6 +371,15 @@ describe("restart_comfyui — Stability Matrix launcher environment (#776)", () 
     expect(result.stopped).toBe(true);
     expect(result.started).toBe(true);
     expect(result.ready).toBe(true);
+    // A HEALTHY restart whose listener could not be ATTRIBUTED is not the #367
+    // "not confirmed yet" shape, and must not be composed as one. Widening
+    // `startup:"unconfirmed"` to cover unmappable attribution briefly routed this
+    // case into that branch, telling the user "NOT CONFIRMED YET" about a server
+    // that was answering — and skipping the dispatch-record clear. `ready` is what
+    // separates the two, and the composition keys on it.
+    expect(result.startup).toBe("unconfirmed");
+    expect(result.message).not.toMatch(/NOT CONFIRMED YET/);
+    expect(result.message).toMatch(/up and ready after the restart/i);
 
     // The relaunch DID carry an explicit environment (the bug was `env` omitted,
     // silently inheriting the orchestrator's).
