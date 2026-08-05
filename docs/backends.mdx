@@ -154,7 +154,7 @@ the features a provider can't do:
 | In-process MCP tools | ✅ | ❌ | ❌ | ❌ (router over MCP clients) |
 | Model enumeration | ✅ | ✅ (`config/read`) | static catalog | ✅ (`/api/tags` or `/models`) |
 | Vision (image input) | ✅ | ✅ | ✅ | ❌ (model-dependent; off for now) |
-| Audio input | ❌ | ❌ | ⚠️ ACP-gated | ✅ Ollama (checked) · ⚠️ others (unverified) |
+| Audio input | ❌ | ❌ | ❌ | ✅ Ollama (checked) · ⚠️ others (unverified) |
 | Provider slash commands | ✅ | ❌ | ❌ | ❌ |
 
 ### Audio input — which backends, honestly
@@ -190,17 +190,43 @@ because a silently dropped attachment is worse than a refused one:
   verified against Ollama's OpenAI-compatible endpoint; whether any *given*
   third-party host honours it is not something we can check, and we don't claim
   to.
-- **Gemini / Grok (ACP)** — the `audio` ContentBlock is implemented, but ACP
-  requires the agent to advertise the `audio` prompt capability first, and the
-  CLIs are not known to. Unknown means **deny**, with a message saying so. This
-  path is untested against a live CLI.
-- **Claude, ChatGPT (Codex), Codex CLI, Antigravity, pi, Grok direct** — no
-  audio input at all. Attaching audio is refused before the turn is built, and
-  both you and the model are told, naming the provider and what would work
-  instead.
+- **Claude, ChatGPT (Codex), Codex CLI, Gemini, Grok, Antigravity, pi** — no
+  audio input in this build. Attaching audio is refused before the turn is
+  built, and both you and the model are told, naming the provider and what
+  would work instead.
+
+  On Gemini/Grok this is a deliberate omission rather than a protocol gap: ACP
+  *does* define an `audio` ContentBlock, but it requires the agent to advertise
+  an `audio` prompt capability first, and neither CLI has been observed doing
+  so. A send path that can never be exercised, whose failure mode is an
+  attachment the user is never told did not arrive, is worse than an honest
+  refusal — so it isn't shipped.
 
 The **Blind** toggle is about *pixels*: it withholds images and does **not**
 withhold audio.
+
+#### How an audio file gets onto a turn
+
+The orchestrator accepts audio on a panel `message` frame in two ways:
+
+```jsonc
+{ "type": "message", "text": "what key is this in?",
+  "audio":  [{ "filename": "song.mp3", "type": "input" }],   // preferred
+  "images": [{ "filename": "song.mp3", "type": "input" }] }  // also routed to audio
+```
+
+The second form exists because a panel build that only knows about `images`
+would otherwise hand an audio file to a vision content part. Anything with an
+audio extension is moved to the audio path automatically — including formats we
+cannot encode (`.wma`, `.mid`, `.aiff`), so you get "convert it to one of…"
+rather than an image error.
+
+<Note>
+A **composer control** for picking an audio file lives in the panel
+(`comfyui-mcp-panel`), which is a separate repository — that part is not in this
+release. Until it lands, the wire contract above is what a client sends, and the
+route is exercised end to end from the orchestrator side.
+</Note>
 
 Only the native-Ollama path above is verified end to end, and it is the only
 one where "this model can hear" is established rather than assumed. The

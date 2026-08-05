@@ -116,6 +116,16 @@ for a model that can hear — rather than being dropped into the request where
 the model would answer from your text alone. The same applies to a file that
 isn't an audio format, or that is present but zero bytes.
 
+Delivering the bytes is not quite the whole job. Measured live against
+`gemma4:e2b`: with the WAV demonstrably in context (555 prompt tokens,
+`/api/show` reporting `audio`), the model still answered *"I do not have the
+capability to transcribe audio — my functions are limited to operating
+ComfyUI"*. The panel system prompt casts it as a graph operator and a small
+model reasons itself out of a sense it actually has. So a turn whose audio was
+capability-checked and attached also carries a short note telling the model the
+audio is there and that it should answer from what it hears. With that note the
+same model transcribed correctly on four runs out of four.
+
 **On the OpenAI-compatible backends** (LM Studio, llama.cpp, OpenRouter,
 custom) there is no capability endpoint to ask. Audio is sent as an
 `input_audio` content part and the turn carries an explicit *"I cannot confirm

@@ -11,7 +11,6 @@ import {
   modelLacksAudioText,
   noAudioPartText,
   openAiAudioFormat,
-  sessionNotAdvertisedText,
   splitAudioAttachments,
   supportedAudioFormats,
   unsupportedFormatText,
@@ -108,12 +107,6 @@ describe("refusal texts name a remedy", () => {
     expect(t).toContain("ollama pull");
   });
 
-  it("an unadvertised ACP session explains the protocol rule, not just the failure", () => {
-    const t = sessionNotAdvertisedText("gemini", "song.mp3");
-    expect(t).toContain("audio");
-    expect(t).toContain("ollama pull");
-  });
-
   it("an unsupported format lists the formats that would work", () => {
     const t = unsupportedFormatText("clip.mp4", null);
     expect(t).toContain("mp3");
@@ -203,6 +196,30 @@ describe("fetchAudioAttachment", () => {
     if (r.ok) throw new Error("unreachable");
     expect(r.outcome.status === "refused" && r.outcome.reason).toBe("unsupported-format");
     expect(f).not.toHaveBeenCalled();
+  });
+
+  it("REFUSES a NON-audio Content-Type rather than trusting the extension", async () => {
+    // A 200 from a proxy or a mis-served file can be text/html or image/png
+    // under a .wav name. Attaching those bytes would produce a success message
+    // for a "delivery" that contains no sound — the silent failure this path
+    // exists to prevent, wearing a success message.
+    for (const ct of ["text/html", "image/png", "application/json", "video/mp4"]) {
+      const f = vi.fn(async () => okResponse(new Uint8Array([1, 2, 3]), ct));
+      const r = await fetchAudioAttachment(url, { filename: "song.wav" }, f as unknown as typeof fetch);
+      expect(r.ok).toBe(false);
+      if (r.ok) throw new Error("unreachable");
+      expect(r.outcome.status === "refused" && r.outcome.reason).toBe("unsupported-format");
+      expect(r.outcome.status === "refused" && r.outcome.text).toContain(ct);
+    }
+  });
+
+  it("still accepts the generic binary types ComfyUI's /view actually sends", async () => {
+    for (const ct of ["application/octet-stream", "binary/octet-stream", ""]) {
+      const f = vi.fn(async () => okResponse(new Uint8Array([1, 2, 3]), ct));
+      const r = await fetchAudioAttachment(url, { filename: "song.wav" }, f as unknown as typeof fetch);
+      expect(r.ok).toBe(true);
+      expect(r.ok && r.mime).toBe("audio/wav");
+    }
   });
 
   it("REFUSES an audio Content-Type we cannot encode, naming it", async () => {

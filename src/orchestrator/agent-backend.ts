@@ -311,7 +311,14 @@ export const GEMINI_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: true, // gemini-2.5 sees images; delivered as inline base64 image ContentBlocks
-  audio: true, // ACP audio ContentBlock is implemented; sent ONLY when the session advertises promptCapabilities.audio (#790)
+  // ACP defines an `audio` ContentBlock and requires the agent to advertise the
+  // `audio` prompt capability before a client may send one. Neither CLI has been
+  // observed advertising it, so the send path could never be exercised — and its
+  // failure mode (session/prompt rejecting after the bytes were attached) would
+  // surface as a generic error, i.e. an attachment the user is never told did not
+  // arrive. Shipping that is the overclaim #790 exists to remove, so this is false
+  // and the attachment is refused centrally, naming a path that works.
+  audio: false,
   turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
@@ -373,7 +380,14 @@ export const GROK_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: true,
-  audio: true, // ACP audio ContentBlock is implemented; sent ONLY when the session advertises promptCapabilities.audio (#790)
+  // ACP defines an `audio` ContentBlock and requires the agent to advertise the
+  // `audio` prompt capability before a client may send one. Neither CLI has been
+  // observed advertising it, so the send path could never be exercised — and its
+  // failure mode (session/prompt rejecting after the bytes were attached) would
+  // surface as a generic error, i.e. an attachment the user is never told did not
+  // arrive. Shipping that is the overclaim #790 exists to remove, so this is false
+  // and the attachment is refused centrally, naming a path that works.
+  audio: false,
   turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 

@@ -166,6 +166,39 @@ describe("#790 — a backend that SUPPORTS audio, with a model that can hear", (
     expect(assistantText(events)).not.toContain("cannot confirm");
   });
 
+  it("tells the MODEL the audio is there, so it doesn't reason itself out of a sense it has", async () => {
+    // Measured live: with the audio demonstrably in context (555 prompt tokens,
+    // /api/show reporting `audio`), gemma4:e2b still answered "I do not have the
+    // capability to transcribe audio" — the panel prompt casts it as a graph
+    // operator. With this note it transcribes correctly, four runs out of four.
+    await collect(nativeBackend(), turnsOf(AUDIO_TURN));
+    const user = (chatRequests[0].messages as Array<Record<string, unknown>>).find((m) => m.role === "user") as {
+      content: string;
+    };
+    expect(user.content).toContain("you can hear them");
+    expect(user.content).toContain("gemma4:e2b");
+    expect(user.content).toContain("Do NOT reply that you cannot process audio");
+  });
+
+  it("does NOT tell an unverified endpoint's model that it can hear", async () => {
+    // Only the probe licenses that claim. Without one, the note must hedge.
+    const backend = new OllamaBackend({
+      api: "openai",
+      host: "http://127.0.0.1:9999/v1",
+      apiKey: "sk-test",
+      model: "vendor/omni",
+      comfyuiUrl: "http://127.0.0.1:8188",
+      connectToolClients: async () => ({ comfyui: fakeMcpClient() }),
+    });
+    await collect(backend, turnsOf(AUDIO_TURN));
+    const user = (openaiChatRequests[0].messages as Array<Record<string, unknown>>).find(
+      (m) => m.role === "user",
+    ) as { content: Array<{ type: string; text?: string }> };
+    const text = user.content.find((p) => p.type === "text")?.text ?? "";
+    expect(text).toContain("UNCONFIRMED");
+    expect(text).not.toContain("you can hear them");
+  });
+
   it("establishes the capability from /api/show, NOT from the /api/tags listing", async () => {
     await collect(nativeBackend(), turnsOf(AUDIO_TURN));
     // The tags listing in this mock reports no audio for the same model; if the
@@ -311,7 +344,9 @@ describe("#790 — a request carrying BOTH an image and audio is rejected", () =
   it("does not pick a cause the endpoint never gave, and names BOTH lost senses", async () => {
     // The endpoint's error carries no attribution. Blaming the audio (or the
     // image) would be a diagnosis we cannot make — a fabricated observation.
-    viewContentType = "image/png";
+    // Leave the generic octet-stream Content-Type: the audio path accepts it and
+    // the image path clamps it, so BOTH attachments land and the rejection below
+    // is genuinely ambiguous - which is the point of this test.
     rejectNextChatWith = "cannot process input";
     const backend = nativeBackend();
     const events = await collect(
@@ -328,6 +363,35 @@ describe("#790 — a request carrying BOTH an image and audio is rejected", () =
     expect(said).toContain("did NOT hear the audio");
     // …and it must NOT assert the audio-only story.
     expect(said).not.toContain("rejected the request carrying the audio attachment,");
+  });
+});
+
+describe("#790 — only an OBSERVED rejection may be reported as one", () => {
+  it("a transport failure is NOT reported as the model refusing the audio", async () => {
+    // A connection reset says nothing about the attachment. Stripping it and
+    // saying "I did NOT hear it" would report a delivery state nobody observed.
+    const backend = nativeBackend();
+    const boom = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      if (String(input).endsWith("/api/chat")) throw new Error("ECONNRESET");
+      return fetchMock(input, init);
+    });
+    vi.stubGlobal("fetch", boom);
+    const events = await collect(backend, turnsOf(AUDIO_TURN));
+    const said = assistantText(events);
+    expect(said).not.toContain("did NOT hear");
+    expect(said).not.toContain("rejected the request carrying");
+    expect(events.some((e) => e.type === "error")).toBe(true);
+  });
+
+  it("a 5xx is not a rejection of the attachment either", async () => {
+    const backend = nativeBackend();
+    const boom = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      if (String(input).endsWith("/api/chat")) return new Response("upstream down", { status: 503 });
+      return fetchMock(input, init);
+    });
+    vi.stubGlobal("fetch", boom);
+    const said = assistantText(await collect(backend, turnsOf(AUDIO_TURN)));
+    expect(said).not.toContain("did NOT hear");
   });
 });
 

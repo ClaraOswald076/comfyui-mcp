@@ -23,9 +23,12 @@
 //   • OpenAI dialect POST /v1/chat/completions → {type:"input_audio",
 //     input_audio:{data,format}}. NOTE an audio data-URL in an `image_url` part
 //     is a hard 400 ("invalid image input") — audio must never ride that part.
-//   • ACP (Gemini/Grok CLI) session/prompt     → {type:"audio",data,mimeType},
-//     and the spec REQUIRES the agent to have advertised the `audio` prompt
-//     capability first, so unknown means deny (never a silent attempt).
+//
+// NOT shipped: ACP (Gemini/Grok CLI) session/prompt does define an audio
+// ContentBlock, but it requires the agent to advertise an `audio` prompt
+// capability first and neither CLI has been observed doing so — an unexercisable
+// send path whose failure mode is an unheard attachment is the overclaim this
+// module exists to remove. Those backends declare `audio: false` instead.
 
 /** A ComfyUI audio reference the panel sends so the orchestrator can fetch the
  *  bytes from /view and deliver them to the agent as an inline audio part.
@@ -158,7 +161,6 @@ export const MAX_AUDIO_BYTES = 24 * 1024 * 1024;
  *  remedy — that is the point of enumerating them rather than one "failed". */
 export type AudioRefusalReason =
   | "backend-has-no-audio-part"
-  | "session-did-not-advertise-audio"
   | "model-lacks-audio-capability"
   | "unsupported-format"
   | "empty-file"
@@ -175,8 +177,7 @@ export type AudioOutcome =
  * How confident we are that a delivered attachment actually reaches the model.
  *
  * "established" — the endpoint itself told us this model accepts audio (Ollama
- *   /api/show capabilities, or an ACP agent advertising the audio prompt
- *   capability). Nothing is claimed beyond what the server said.
+ *   /api/show capabilities). Nothing is claimed beyond what the server said.
  * "unverified"  — we have a correct content part for this dialect but NO probe
  *   to ask. We still attempt (refusing on a missing probe would deny audio to
  *   every endpoint that simply has no capability API), but the user is told the
@@ -194,6 +195,31 @@ export function audioModelNote(refusals: AudioOutcome[]): string {
     refused.map((r) => `${r.filename} (${r.reason})`).join("; ") +
     `. You did NOT hear them. Do not describe, transcribe, analyse or imply anything about their contents; ` +
     `say plainly that the audio did not reach you.]`
+  );
+}
+
+/**
+ * Model-facing note for audio we ESTABLISHED this model can take and did put on
+ * the request.
+ *
+ * Not decoration. Measured live on 2026-08-04 against gemma4:e2b: the WAV was
+ * demonstrably in context (555 prompt tokens, `/api/show` reporting the `audio`
+ * capability), and the model still answered *"I do not have the capability to
+ * transcribe audio; my functions are limited to operating ComfyUI"* — the panel
+ * system prompt casts it as a graph operator, and it reasons itself out of a
+ * sense it actually has. Delivering the bytes and letting that stand would be a
+ * different flavour of the same silent failure: the audio arrives, the user is
+ * told nothing, and the answer is composed as if it hadn't.
+ *
+ * Every claim here is backed by something observed: the server reported the
+ * capability, and the bytes are on the request.
+ */
+export function audioDeliveredModelNote(count: number, model: string): string {
+  return (
+    `\n\n[panel note: ${count} audio file(s) are attached to THIS message and you can hear them — the server ` +
+    `reports that ${model} has the audio capability, and the audio is in your context. Listen to it and answer ` +
+    `from what you actually hear. Do NOT reply that you cannot process audio or that no audio was provided; ` +
+    `if you genuinely perceive nothing, say that you received audio but could not make anything out.]`
   );
 }
 
@@ -254,17 +280,6 @@ export function noAudioPartText(backendId: string, filename: string): string {
     `the local Ollama-family providers (ollama / LM Studio / llama.cpp / OpenAI-compatible) — switch ` +
     `provider and re-send, or ask me to run a ComfyUI audio-analysis node over the file instead and read ` +
     `you the numbers.`
-  );
-}
-
-/** Refusal text: the backend can carry audio, but this SESSION never advertised
- *  the capability, and the protocol forbids sending it unasked. */
-export function sessionNotAdvertisedText(backendId: string, filename: string): string {
-  return (
-    `I can't send ${filename} to the model: this ${backendId} session did not advertise the ACP \`audio\` ` +
-    `prompt capability, and the protocol requires that before audio may be attached — sending anyway would ` +
-    `mean guessing whether the model heard it. Switch to a local Ollama-family provider with an ` +
-    `audio-capable model (e.g. \`ollama pull ${AUDIO_CAPABLE_OLLAMA_MODELS[0]}\`) and re-send.`
   );
 }
 
@@ -370,14 +385,23 @@ export async function fetchAudioAttachment(
     const res = await fetchImpl(u, { signal: AbortSignal.timeout(30000) });
     if (!res.ok) return refuse("fetch-failed", fetchFailedAudioText(ref.filename, `http ${res.status}`));
     const ct = (res.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
-    // An explicitly-audio Content-Type we cannot encode is a real answer and is
-    // refused by name. Anything else (missing, or the application/octet-stream
-    // ComfyUI's /view usually sends) falls back to the extension, which already
-    // passed the check above.
+    // The server's Content-Type outranks the filename, and only three answers
+    // are acceptable:
+    //   audio/* we can encode      -> use it
+    //   audio/* we cannot encode   -> refuse, naming the type
+    //   generic binary or absent   -> fall back to the extension
+    // Anything ELSE is refused rather than trusted to the extension. A 200 from
+    // a proxy or a mis-served file can be text/html or image/png under a .wav
+    // name, and attaching those bytes as audio would report a delivery that,
+    // from the model's side, contains no sound at all — the silent failure this
+    // whole path exists to prevent, wearing a success message.
+    const GENERIC_BINARY = new Set(["", "application/octet-stream", "binary/octet-stream", "application/binary"]);
     let mime = nameMime;
     if (ct.startsWith("audio/")) {
       if (!isDeliverableAudioMime(ct)) return refuse("unsupported-format", unsupportedFormatText(ref.filename, ct));
       mime = ct;
+    } else if (!GENERIC_BINARY.has(ct)) {
+      return refuse("unsupported-format", unsupportedFormatText(ref.filename, ct));
     }
     const buf = Buffer.from(await res.arrayBuffer());
     if (buf.length === 0) return refuse("empty-file", emptyAudioText(ref.filename));

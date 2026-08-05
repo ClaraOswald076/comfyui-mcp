@@ -33,6 +33,7 @@ import {
   type AudioRef,
   type AudioFetchResult,
   MAX_AUDIO_ATTACHMENTS,
+  audioDeliveredModelNote,
   audioModelNote,
   audioUnverifiedModelNote,
   audioUserNotice,
@@ -733,8 +734,16 @@ export class OllamaBackend implements AgentBackend {
       if (keepalive) clearInterval(keepalive);
     }
     if (!res.ok || !res.body) {
-      throw new Error(
-        `${this.api === "openai" ? `${this.host}/chat/completions` : "ollama /api/chat"} http ${res.status}: ${(await res.text().catch(() => "")).slice(0, 300)}`,
+      // Stamp the HTTP status on the error. The media strip-and-retry (#790)
+      // must fire ONLY on a request the endpoint actually rejected: a connection
+      // reset or a truncated stream is not evidence that the model refused the
+      // attachment, and saying "you were not heard" on one of those would report
+      // a delivery state nobody observed.
+      throw Object.assign(
+        new Error(
+          `${this.api === "openai" ? `${this.host}/chat/completions` : "ollama /api/chat"} http ${res.status}: ${(await res.text().catch(() => "")).slice(0, 300)}`,
+        ),
+        { httpStatus: res.status },
       );
     }
     if (this.api === "openai") {
@@ -1110,10 +1119,12 @@ export class OllamaBackend implements AgentBackend {
       ({ outcomes: audioOutcomes, confidence: audioConfidence } = await this.attachAudio(userMsg, turn.audio));
       const refusalNote = audioModelNote(audioOutcomes);
       if (refusalNote) userMsg.content += refusalNote;
-      if (audioConfidence === "unverified" && audioOutcomes.some((o) => o.status === "delivered")) {
-        userMsg.content += audioUnverifiedModelNote(
-          audioOutcomes.filter((o) => o.status === "delivered").length,
-        );
+      const deliveredCount = audioOutcomes.filter((o) => o.status === "delivered").length;
+      if (deliveredCount) {
+        userMsg.content +=
+          audioConfidence === "unverified"
+            ? audioUnverifiedModelNote(deliveredCount)
+            : audioDeliveredModelNote(deliveredCount, this.model);
       }
     }
     this.history.push(userMsg);
@@ -1187,8 +1198,16 @@ export class OllamaBackend implements AgentBackend {
           // happened for media the model had already received.
           const hadAudio = this.history.some((m) => m.audios?.length);
           const hadImages = this.history.some((m) => m.images?.length);
+          // …and it must be an OBSERVED rejection. Only a 4xx from the endpoint
+          // is evidence that the request was refused; a connection reset, a
+          // truncated body, or a mid-stream failure after a 200 says nothing
+          // about the attachment, and stripping on those would tell the user the
+          // model "did NOT hear" something we never saw it refuse.
+          const status = (err as { httpStatus?: number } | null)?.httpStatus;
+          const requestWasRejected = typeof status === "number" && status >= 400 && status < 500;
           if (
             !abort.signal.aborted &&
+            requestWasRejected &&
             !attachmentsStripped &&
             !this.attachmentsAccepted &&
             (hadImages || hadAudio)
