@@ -298,12 +298,30 @@ describe("get_image save_dir resolution (#768)", () => {
 
     const text = out.content.map((c) => c.text ?? "").join("");
     expect(text).toMatch(/DRIVE-RELATIVE save_dir/);
-    expect(text).toMatch(/came from this process's working directory, not from your argument/);
+    expect(text).toMatch(/came from this process's state, not from your argument/);
     // …and NOT described as an ordinary relative path, which would send the caller to
     // the wrong fix.
     expect(text).not.toMatch(/a RELATIVE save_dir/);
     // The resolved path it reports is drive-qualified, so nothing is hidden.
     expect(text).toContain("C:\\out\\g.png");
+  });
+
+  it("also treats a drive-qualified but ROOTLESS save_dir (C:out) as drive-relative", async () => {
+    // `path.isAbsolute("C:out")` is FALSE, so this fell into the generic relative branch
+    // and was described as resolving against this process's working directory. Windows
+    // keeps a working directory PER DRIVE and resolve() uses the NAMED drive's, which
+    // need not be ours — the message named the wrong base.
+    if (process.platform !== "win32") return;
+    cwdSpy = vi.spyOn(process, "cwd").mockReturnValue("C:\\work\\proj");
+    vi.mocked(mkdir).mockRejectedValueOnce(
+      Object.assign(new Error("EPERM: operation not permitted, mkdir"), { code: "EPERM" }),
+    );
+
+    const out = await getHandler("get_image")({ filename: "h.png", save_dir: "C:out" });
+
+    const text = out.content.map((c) => c.text ?? "").join("");
+    expect(text).toMatch(/DRIVE-RELATIVE save_dir/);
+    expect(text).not.toMatch(/a RELATIVE save_dir, resolved against this process's working directory/);
   });
 
   it("resolveImageSaveDir treats blank/whitespace save_dir as omitted", () => {

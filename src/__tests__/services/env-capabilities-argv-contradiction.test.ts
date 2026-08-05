@@ -180,6 +180,27 @@ describe("gatherEnvCapabilities — a contradicted probe cannot state ANY negati
     expect(caps.sageattention).toBe("installed");
   });
 
+  it("voids a contradicted probe's POSITIVES too, not only its negatives", async () => {
+    // The wrong venv happens to have Triton. Passing that positive through would tell an
+    // agent to enable triton kernels on a server that may not have them — the same false
+    // capability report as #401 with the sign flipped. A witness caught being wrong is
+    // not half-believed.
+    serveStats(["python", "main.py", "--use-sage-attention"]);
+    probeSays(true, false); // triton present in the probed env, sage absent (the lie)
+
+    const caps = await gatherEnvCapabilities({
+      comfyuiUrl: "http://127.0.0.1:8188",
+      statsTimeoutMs: 50,
+      tritonTimeoutMs: 50,
+    });
+
+    expect(caps.triton).toBe("unknown");
+    expect(caps.triton).not.toBe("installed");
+    // The genuinely observed positive survives — it comes from the server's own argv,
+    // not from the discredited interpreter.
+    expect(caps.sageattention).toBe("installed");
+  });
+
   it("still lets an OBSERVED, uncontradicted probe state a negative", async () => {
     // The guard must not swallow every negative — an over-strict version of this fix
     // would make the capability line permanently useless.

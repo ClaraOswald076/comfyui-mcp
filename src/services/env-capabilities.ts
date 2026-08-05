@@ -767,11 +767,21 @@ export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCap
   // while the probed interpreter reported BOTH sageattention and triton absent. Voiding
   // only sageattention would have left the false "Triton: not installed" standing, which
   // is the finding that made an agent strip working acceleration in the first place.
+  // …and a contradiction discredits the SOURCE, so its POSITIVES go too. The
+  // pass-positives-through asymmetry is right for an interpreter that is merely
+  // UNOBSERVED — a package really is installed somewhere, and saying so is harmless.
+  // It is wrong once we have proof the interpreter is not the server's environment:
+  // "Triton: installed" read off the wrong venv tells an agent to enable triton kernels
+  // on a server that may not have them, which fails the render. That is the SAME false
+  // capability report as #401 with the sign flipped, and voiding one direction while
+  // keeping the other would be believing a witness we have just caught being wrong.
+  // The genuinely observed positives survive anyway: the argv-proven flag is re-applied
+  // immediately below, and the ComfyUI-log markers after it.
   const provenByArgv = packagesProvenByServerArgv(statsArgv);
   const contradicted = contradictedPackage(ts, provenByArgv);
   if (contradicted) {
     logger.info(
-      "Discarding this interpreter's negative capability results: it contradicts the running ComfyUI's own launch flags",
+      "Discarding this interpreter's capability results entirely: it contradicts the running ComfyUI's own launch flags",
       {
         contradicted,
         probePython: ts?.pythonVersion ?? "(unreported)",
@@ -780,11 +790,13 @@ export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCap
     );
   }
   const reconcile = (state: TriState | undefined): TriState =>
-    reconcileProbeState(state, {
-      observed: observed && !contradicted,
-      runningPython: statsPythonRaw ?? caps.python,
-      probePython: ts?.pythonVersion,
-    });
+    contradicted
+      ? "unknown"
+      : reconcileProbeState(state, {
+          observed,
+          runningPython: statsPythonRaw ?? caps.python,
+          probePython: ts?.pythonVersion,
+        });
   caps.triton = reconcile(ts?.triton);
   caps.sageattention = reconcile(ts?.sageattention);
   // The launch flag is a stronger observation than any local import probe — it is the
