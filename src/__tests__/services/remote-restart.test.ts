@@ -99,10 +99,15 @@ describe("restartComfyUI — remote (Manager reboot)", () => {
     // gate round 7).
     expect(res.message).toContain("dispatched but not acknowledged");
     expect(res.message).not.toMatch(/request was acknowledged/i);
-    // The OBSERVED signal is named — a proxy status here — rather than one of the
-    // two causes this branch covers being narrated as the fact (codex gate round 8).
-    expect(res.message).toContain("a proxy in front of ComfyUI answered HTTP 502");
+    // The OBSERVED signal is named — the status, and only the status — rather than
+    // one of the causes this branch covers being narrated as the fact. Two earlier
+    // wordings each named a different one: "the origin dropped as it went down"
+    // (gate round 8) and "a proxy in front of ComfyUI answered" (gate round 9).
+    // Nothing here identifies a proxy, and ComfyUI or the Manager can return a 502
+    // directly.
+    expect(res.message).toContain("the request returned HTTP 502");
     expect(res.message).not.toMatch(/connection dropped/i);
+    expect(res.message).not.toMatch(/proxy/i);
     expect(res.startup).toBe("unconfirmed");
     expect(hoisted.resetClient).toHaveBeenCalledTimes(1);
     expect(hoisted.resetObjectInfoCache).toHaveBeenCalledTimes(1);

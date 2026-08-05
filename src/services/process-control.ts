@@ -292,14 +292,17 @@ interface StartupReadinessResult {
  * `JSON.stringify`, and it must be impossible to read as the definite negative.
  *
  *   "confirmed"     — the API answered. Observed.
- *   "failed"        — THIS RELAUNCH failed: the process this call launched is GONE —
- *                     a spawn error, a recorded exit, or a liveness probe that came
- *                     back DEFINITELY dead. (The spawn-error path can return before
- *                     the readiness poll has run at all, so this verdict carries no
- *                     claim about probes; the ones that DID poll say so in their own
- *                     message.) It does NOT say the port is unserved either — an
- *                     external launcher or supervisor may have restored one, which
- *                     is why the message tells the caller to re-check.
+ *   "failed"        — THIS CALL'S LAUNCH did not produce the serving instance, and
+ *                     that is OBSERVED rather than merely unproven. Two shapes: the
+ *                     process it launched is GONE (a spawn error, a recorded exit, or
+ *                     a liveness probe that came back DEFINITELY dead); or the port
+ *                     is provably owned by a DIFFERENT process, so something else is
+ *                     serving and our relaunch is not it. (The spawn-error path can
+ *                     return before the readiness poll has run at all, so this
+ *                     verdict carries no claim about probes; the ones that DID poll
+ *                     say so in their own message.) It does NOT say the port is
+ *                     unserved — an external launcher or supervisor may be serving
+ *                     it, which is why the message tells the caller to re-check.
  *   "unconfirmed"   — this call cannot tie what is (or is not) serving to the
  *                     launch/reboot it made. Two shapes reach it, and neither is a
  *                     failure: the readiness budget expired with nothing
@@ -2819,8 +2822,11 @@ export async function startComfyUI(): Promise<StartResult> {
     // needless recovery.
     started: mayClaimStart,
     ready: true,
-    // The API answered. This is the one path that may say so.
-    startup: "confirmed",
+    // The API answered — but WHOSE api (codex gate round 9). When the port is
+    // provably owned by a DIFFERENT process, this call's launch demonstrably did not
+    // produce the serving instance, and the message says exactly that. Emitting
+    // "confirmed" beside it would confirm the one thing just denied.
+    startup: ownership === "not-ours" ? "failed" : "confirmed",
     readiness,
     message:
       `ComfyUI ${ownership === "not-ours" ? "is ready" : "started"} on port ${port}${newPid ? ` (PID ${newPid})` : ""}` +
@@ -2985,10 +2991,12 @@ async function rebootViaManager(): Promise<RebootResult> {
           acked: false, // inferred from the proxy status, not acknowledged
           endpoint: path,
           method,
-          // The OBSERVED fact only. "the origin dropped … as it went down" narrated
-          // one of the two causes this branch covers as though it were established
-          // (codex gate round 8); what we saw is a status code from a proxy.
-          note: `a proxy in front of ComfyUI answered HTTP ${res.status}`,
+          // The OBSERVED fact ONLY. Two earlier versions of this string named a
+          // cause: "the origin dropped … as it went down" (gate round 8), then
+          // "a proxy in front of ComfyUI answered …" (gate round 9) — but nothing
+          // here identifies a proxy, and ComfyUI or the Manager can return these
+          // statuses directly. All that was seen is the status.
+          note: `the request returned HTTP ${res.status}`,
         };
       }
       // 404 / other non-OK: wrong route for this Manager build — try the next.
