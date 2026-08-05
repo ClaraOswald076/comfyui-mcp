@@ -6,6 +6,40 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.49.6] - 2026-08-04
+
+### MCP
+
+#### Fixed
+- **`download_model`: large-file timeouts, no resume, wrong base on Windows portable,
+  and non-unique job ids (#831).** Large HuggingFace downloads timed out at 600s with no
+  way to resume; a resume could silently discard a 96%-complete partial; a remote CivitAI
+  auth/error page could be saved as if it were a model; and `download_status` lost
+  in-flight ids. Destroying a staged file now requires re-proving, immediately before each
+  syscall, that it is still the file the caller checked — so a second download of the same
+  model can no longer delete the first one's resumable bytes or its validator. An
+  unreadable staged file is reported as unknown rather than folded into "absent", which
+  previously let a fresh response truncate an existing partial.
+  Fixes #343, #401, #467, #470, #473, #529, #547, #761, #813, #817, #822.
+- test reliability: a fixture bound a guessed random port and hung ~1 in 8 when that port
+  was already held; it now binds `listen(0)` and reads the assigned port back, and a bind
+  failure reports as a setup failure instead of a timeout in the behaviour under test (#843, #821)
+- preserve AUTOGROW dotted workflow inputs (#763)
+- truncated results name their own remedy — and one that works from where the caller is (#818)
+- never stop a ComfyUI that cannot be proven relaunchable, and attribute a listener without lsof (#814) (#830)
+
+
+## [0.49.5] - 2026-08-04
+
+### MCP
+
+#### Fixed
+- `panel_ask`: a validated answer is now durable and is never delivered across a tab or conversation boundary (#486) (#811)
+- `restart_comfyui`: preserve the launcher environment, and never report ownership or a restart that was not observed (#776) (#785)
+- `install_panel`: the panel swap is crash-safe by ordering, and the status report no longer claims what it never observed (#771) (#793)
+- `strip_workflow` / `panel_flatten_workflow`: preserve dynamic widget values and virtual-node links, and disclose anything dropped (#361) (#805)
+- panel agent: rebind the agent tab across id migration and keep the release fallback starvation-free (#568) (#802)
+
 ## [0.49.4] - 2026-08-03
 
 ### MCP
