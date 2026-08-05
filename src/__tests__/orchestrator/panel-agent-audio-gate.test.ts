@@ -168,3 +168,30 @@ describe("the vitest environment does not swallow the gate", () => {
     expect(onSay).toHaveBeenCalled();
   });
 });
+
+describe("two queued messages carrying the SAME file batch into one attachment", () => {
+  it("does not spend a second audio slot on bytes already attached", async () => {
+    // The batch merges the two messages into one turn. Without a dedupe the turn
+    // carries song.wav twice, which both wastes one of the two per-turn slots
+    // and — with a third, different file — refuses a real attachment out loud
+    // for "not fitting" while the duplicate rides the request.
+    const { backend, seen } = recordingBackend({ audio: true }, "ollama");
+    const { agent } = makeAgent(backend);
+    await runOneTurn(agent, () => {
+      agent.send("what key is this in?", { audio: [{ filename: "song.wav", type: "input" }] });
+      agent.send("and the tempo?", { audio: [{ filename: "song.wav", type: "input" }] });
+    });
+    expect(seen).toHaveLength(1); // they really did batch
+    expect(seen[0].audio).toEqual([{ filename: "song.wav", type: "input" }]);
+  });
+
+  it("still carries two genuinely different files", async () => {
+    const { backend, seen } = recordingBackend({ audio: true }, "ollama");
+    const { agent } = makeAgent(backend);
+    await runOneTurn(agent, () => {
+      agent.send("first", { audio: [{ filename: "a.wav", type: "input" }] });
+      agent.send("second", { audio: [{ filename: "b.wav", type: "input" }] });
+    });
+    expect(seen[0].audio).toHaveLength(2);
+  });
+});

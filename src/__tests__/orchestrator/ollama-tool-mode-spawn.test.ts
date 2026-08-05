@@ -9,21 +9,33 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-/** Every env the backend handed to a spawned stdio child, in order. */
+/**
+ * Every env a stdio child was actually CONNECTED with, in order.
+ *
+ * Recorded in the mocked `Client.connect`, not in the transport constructor: a
+ * transport that is built and never connected spawns nothing, so asserting on
+ * construction alone would let "we computed the right env and never used it"
+ * pass as "the child came up in the right mode".
+ */
 const spawnEnvs: Array<Record<string, string>> = [];
 
+class FakeStdioTransport {
+  env: Record<string, string>;
+  constructor(opts: { env?: Record<string, string> }) {
+    this.env = { ...(opts.env ?? {}) };
+  }
+  async close() {}
+}
+
 vi.mock("@modelcontextprotocol/sdk/client/stdio.js", () => ({
-  StdioClientTransport: class {
-    constructor(opts: { env?: Record<string, string> }) {
-      spawnEnvs.push({ ...(opts.env ?? {}) });
-    }
-    async close() {}
-  },
+  StdioClientTransport: FakeStdioTransport,
 }));
 
 vi.mock("@modelcontextprotocol/sdk/client/index.js", () => ({
   Client: class {
-    async connect() {}
+    async connect(transport: FakeStdioTransport) {
+      spawnEnvs.push(transport.env);
+    }
     async listTools() {
       return { tools: [{ name: "list_tools", description: "d", inputSchema: { type: "object" } }] };
     }

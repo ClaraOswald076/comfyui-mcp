@@ -93,6 +93,9 @@ export function axisCell(entry, axis) {
     if (Array.isArray(range) && range.length === 2) {
       const lo = vramLabel(range[0]);
       const hi = vramLabel(range[1]);
+      // Two measurements that round to the same tenth print as that one figure,
+      // deliberately: "5.0–5.0 GiB" is noise, and "5.0 GiB" is true of both at
+      // the precision the column is stated in. The raw pair stays in the JSON.
       if (lo && hi) return lo === hi ? `${hi} GiB` : `${lo}–${hi} GiB`;
     }
     const one = vramLabel(entry.vramResidentBytes);

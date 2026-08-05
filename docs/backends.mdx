@@ -221,6 +221,11 @@ audio extension is moved to the audio path automatically — including formats w
 cannot encode (`.wma`, `.mid`, `.aiff`), so you get "convert it to one of…"
 rather than an image error.
 
+Sending the same file in **both** arrays (as the example above does) is safe: a
+ref is identified by filename + subfolder + type, so it is delivered once and
+counts once against the two-attachments-per-turn limit. It is not mistaken for
+a second file and then refused for not fitting.
+
 <Note>
 A **composer control** for picking an audio file lives in the panel
 (`comfyui-mcp-panel`), which is a separate repository — that part is not in this
