@@ -1721,6 +1721,29 @@ export type PackPresence =
   | { state: "unverifiable"; reason: string };
 
 /**
+ * The disk half of a presence answer, captured at OPERATION ENTRY. Every
+ * presence check of one logical operation (pre-resolve, post-verify) must use
+ * the SAME context: computing it later from mutable global mode/config lets a
+ * mid-op retarget pair Manager A's answer with disk B (or no disk at all) —
+ * false "present on disk", false absence, false REMOVED (codex gate round 11).
+ */
+export interface PackPresenceContext {
+  /** The remote/local classification at entry. */
+  remote: boolean;
+  /** The local root captured at entry (undefined when remote or none exists). */
+  diskRoot?: string;
+}
+
+/** Capture the presence context for one operation, before its first await. */
+export function capturePackPresenceContext(diskRoot?: string): PackPresenceContext {
+  const remote = isRemoteMode();
+  return {
+    remote,
+    diskRoot: remote ? undefined : (diskRoot ?? resolveEffectiveComfyUIBase()),
+  };
+}
+
+/**
  * Answer "is this pack present?" across BOTH sources of truth, keeping
  * "could not determine" distinct from "determined absent" (#797, #796's
  * defect class):
@@ -1729,26 +1752,18 @@ export type PackPresence =
  *      disk we could read is not the server's, so it is never consulted.
  * The Manager list matching always wins; disk evidence is what keeps a
  * Manager-untracked zip install from reading as "not installed".
+ *
+ * `ctx` is the operation's entry-captured context (capturePackPresenceContext).
+ * When omitted it is captured here — still before this call's first await, so
+ * single-shot callers stay correct.
  */
 export async function resolvePackPresence(
   id: string,
   base: string,
-  /**
-   * The CALLER'S captured local root (an adopted/live workspace threaded
-   * through InstallOptions.comfyuiPath, or the entry-captured CLI workspace).
-   * When given, the disk scan reads exactly this root — never a global value
-   * recomputed after the list await. Remote mode still skips the disk
-   * entirely: a local path tells us nothing about a remote server.
-   */
-  diskRoot?: string,
+  ctx?: PackPresenceContext,
 ): Promise<PackPresence> {
-  // Capture the disk context BEFORE the first await: `base` is pinned by the
-  // caller, and the disk root must describe the SAME target. Reading the
-  // mutable global mode after the list request would let a mid-op retarget
-  // pair a remote Manager answer with a newly-local disk (or vice versa).
-  const diskBase = isRemoteMode()
-    ? undefined
-    : (diskRoot ?? resolveEffectiveComfyUIBase());
+  const context = ctx ?? capturePackPresenceContext();
+  const diskBase = context.remote ? undefined : context.diskRoot;
 
   let installed: InstalledNode[] | undefined;
   let listError: string | undefined;
@@ -2112,6 +2127,7 @@ async function installCustomNodeImpl(
   // checkout for want of a path (codex gate rounds 5-6).
   const managerBase = managerBaseUrl();
   const cliWorkspace = opts.comfyuiPath ?? resolveEffectiveComfyUIBase();
+  const presenceCtx = capturePackPresenceContext(cliWorkspace);
 
   // #808 — a requested comfy-cli that is not usable is a FALLBACK, not a fatal
   // error: the probe runs before anything is submitted, so dropping to Manager
@@ -2221,7 +2237,7 @@ async function installCustomNodeImpl(
   // #797: verify across BOTH sources (Manager list + local disk) and keep
   // "could not determine" distinct from "determined absent" — an unreadable
   // Manager list collapsed to [] used to read as "not found in the registry".
-  const presence = await resolvePackPresence(id, managerBase, cliWorkspace);
+  const presence = await resolvePackPresence(id, managerBase, presenceCtx);
   switch (presence.state) {
     case "manager-listed":
       return withCliNote({
@@ -2313,6 +2329,7 @@ async function assertPackPresentAfterOp(
   op: "update" | "reinstall",
   base: string,
   status: QueueStatus,
+  ctx?: PackPresenceContext,
 ): Promise<void> {
   // #771 — SAY WHAT WE ACTUALLY CHECKED; #797 — CHECK THE DISK TOO. This gate
   // consults up to TWO sources: the Manager's installed list AND (in a local
@@ -2326,7 +2343,7 @@ async function assertPackPresentAfterOp(
   // present (either source), absent (BOTH consulted sources agree), and
   // unverifiable (a source that could not answer — an unreadable list or an
   // unenumerable directory is never treated as absence).
-  const presence = await resolvePackPresence(id, base);
+  const presence = await resolvePackPresence(id, base, ctx);
   switch (presence.state) {
     case "manager-listed":
       return;
@@ -2402,8 +2419,9 @@ async function resolveTrackedForOp(
   id: string,
   op: "update" | "reinstall",
   base: string,
+  ctx?: PackPresenceContext,
 ): Promise<InstalledNode> {
-  const presence = await resolvePackPresence(id, base);
+  const presence = await resolvePackPresence(id, base, ctx);
   switch (presence.state) {
     case "manager-listed":
       return presence.node as InstalledNode;
@@ -2661,6 +2679,9 @@ async function updateCustomNodeImpl(
   // across two servers. The base travels back on the result so callers (the
   // #724 panel fallback's dialect probe) verify against the SAME Manager.
   const base = managerBaseUrl();
+  // Captured with the target, before any await: the pre-resolve AND the
+  // post-drain gate must read the SAME disk context (codex gate round 11).
+  const presenceCtx = capturePackPresenceContext();
   if (all) {
     // update_all keeps its own dedicated route (so it does NOT go through
     // queueManagerTask), but it is just as dialect-dependent — route it through
@@ -2674,13 +2695,13 @@ async function updateCustomNodeImpl(
     // differ from it, a legacy route resolves by module, and a no-op update
     // would still pass a post-check that matches by cnr_id. A target that
     // resolves nowhere is refused with NOTHING queued.
-    const tracked = await resolveTrackedForOp(id, "update", base);
+    const tracked = await resolveTrackedForOp(id, "update", base, presenceCtx);
     // Single-pack update → unified task; UpdatePackParams uses node_name/node_ver.
     status = await queueManagerTask("update", { node_name: tracked.module }, base);
     // VERIFY (#730): the drain passes trivially for an id Manager never
     // enqueued (total_count 0 — the "Queued + updated" lie in the issue).
     // Require the pack to resolve SOMEWHERE post-op before claiming success.
-    await assertPackPresentAfterOp(id, "update", base, status);
+    await assertPackPresentAfterOp(id, "update", base, status, presenceCtx);
   }
   return {
     mechanism: "manager-http",
@@ -2790,11 +2811,12 @@ async function reinstallCustomNodeImpl(
   // cannot send the install to a different ComfyUI — which would leave the
   // user's server uninstalled while reporting success for another.
   const base = managerBaseUrl();
+  const presenceCtx = capturePackPresenceContext();
   // Resolve BEFORE the uninstall half (codex gate round 8): it must name the
   // Manager module name, and a nowhere-resolving id is refused with NOTHING
   // queued — previously both cycles no-op'd and the post-check could still
   // match a pre-existing record by cnr_id.
-  const tracked = await resolveTrackedForOp(id, "reinstall", base);
+  const tracked = await resolveTrackedForOp(id, "reinstall", base, presenceCtx);
   await queueManagerTask("uninstall", { node_name: tracked.module }, base);
   // The install half must name an identity the registry can actually RESOLVE
   // (codex gate round 9): when the caller passed the module/folder spelling,
@@ -2817,7 +2839,7 @@ async function reinstallCustomNodeImpl(
   // already ran — the pack is REMOVED, not untouched); an UNVERIFIABLE
   // post-state keeps the gate's own "could not verify" message.
   try {
-    await assertPackPresentAfterOp(id, "reinstall", base, status);
+    await assertPackPresentAfterOp(id, "reinstall", base, status, presenceCtx);
   } catch (err) {
     // "Left the pack REMOVED" is only true when absence was OBSERVED — an
     // unverifiable post-state (unreadable list, inconclusive disk) establishes
@@ -2964,6 +2986,7 @@ async function setCustomNodeEnabled(
   // the pre/post checks describe, even if config.comfyuiPath is retargeted
   // during an await below (codex gate round 5).
   const cliWorkspace = resolveEffectiveComfyUIBase();
+  const presenceCtx = capturePackPresenceContext(cliWorkspace);
 
   // CLI availability probe FIRST (#808 fallback discipline), but NO subprocess
   // runs yet: the presence pre-check below comes before either mechanism,
@@ -2986,7 +3009,7 @@ async function setCustomNodeEnabled(
   // the pack's REAL installed version (node-bisect's controller does the same
   // — "never send 'unknown' for an installed pack"). Both need the installed
   // list read up front.
-  const presence = await resolvePackPresence(id, base, cliWorkspace);
+  const presence = await resolvePackPresence(id, base, presenceCtx);
   if (
     presence.state === "on-disk" &&
     // A READABLE list that doesn't track the pack: refuse — neither mechanism
@@ -3186,6 +3209,7 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
   const base = managerBaseUrl();
   // Pinned with the target, same as in setCustomNodeEnabled (codex gate round 5).
   const cliWorkspace = resolveEffectiveComfyUIBase();
+  const presenceCtx = capturePackPresenceContext(cliWorkspace);
 
   // CLI availability probe FIRST (#808 fallback discipline) — but nothing runs
   // until the presence pre-check below has answered what there is to remove.
@@ -3205,7 +3229,7 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
   // via Manager (drained queue) or comfy-cli (exit 0) alike — and reading
   // absence afterwards would "verify" a state that predated the call. Refuse
   // with the reason that is actually true.
-  const presence = await resolvePackPresence(id, base, cliWorkspace);
+  const presence = await resolvePackPresence(id, base, presenceCtx);
   if (
     presence.state === "on-disk" &&
     // A READABLE list that doesn't track the pack: refuse. An UNREADABLE list

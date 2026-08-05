@@ -1334,6 +1334,48 @@ describe("node-management service", () => {
       expect((err as Error).message).not.toMatch(/does not track/);
       expect((err as Error).message).not.toMatch(/resolved to NOTHING/);
     });
+
+    it("the post-op gate uses the ENTRY-captured presence context, not a mid-op retarget", async () => {
+      // The session is LOCAL at invocation and the pack is on disk. A retarget
+      // flipping the session to remote mid-drain must not strip the disk
+      // evidence from the post-op check.
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes") ? [dirEnt("my-pack")] : [];
+      fsCtl.readFileSync = () => {
+        throw new Error("ENOENT");
+      };
+      let listCalls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            listCalls++;
+            if (listCalls === 1) remoteFlags.remoteMode = true; // retarget mid-op
+            return jsonResponse(
+              listCalls === 1
+                ? { "my-pack": { ver: "1.0.0", cnr_id: "my-pack", enabled: true } }
+                : {},
+            );
+          }
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const err = await updateCustomNode({ id: "my-pack" }).catch((e: Error) => e);
+      expect(err).toBeInstanceOf(NodeManagementError);
+      // The entry context was local with the pack on disk — the verdict must
+      // say so, not fall back to a Manager-list-only absence.
+      expect((err as Error).message).toMatch(/present on disk/);
+      expect((err as Error).message).not.toMatch(/does not inspect custom_nodes/);
+    });
   });
 
   // ---- comfy-cli fallback (#808) --------------------------------------------
