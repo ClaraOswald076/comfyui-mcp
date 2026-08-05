@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { ComfyUIError } from "../../utils/errors.js";
 
 // #483: get_image for a valid `type:"input"` image must return the binary
@@ -115,9 +115,11 @@ describe("get_image — video/audio save-to-disk (#663)", () => {
       "Eros",
       { allowMedia: true },
     );
-    // Saved under the original filename/extension in the requested save_dir.
+    // Saved under the original filename/extension in the requested save_dir. The dir is
+    // resolved first, so on Windows a rootless "/tmp/x" becomes the drive-qualified path
+    // Node would actually have written to — the reported path and the real one agree.
     expect(vi.mocked(writeFile)).toHaveBeenCalledWith(
-      join("/tmp/x", "I2V_HD_FaceLock_00036-audio.mp4"),
+      join(resolve("/tmp/x"), "I2V_HD_FaceLock_00036-audio.mp4"),
       Buffer.from(base64, "base64"),
     );
     expect(out.content.find((c) => c.type === "image")).toBeUndefined();

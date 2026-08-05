@@ -252,10 +252,17 @@ function desktopConfigPath(): string {
  * `list_extra_paths` threw while `workspace`/`get_environment` happily reported the
  * saved default workspace — the same install, two different answers.
  *
- * Throws (never guesses) when neither is available, INCLUDING remote mode, where
- * `resolveEffectiveComfyUIBase()` deliberately refuses to hand back a local workspace:
- * reporting some other root's model dirs as if they were the live server's is a
- * wrong-destination hazard, so an explicit unresolved error is the only safe answer.
+ * Throws (never guesses) when neither is available, including when the session is not
+ * pointed at a local install: reporting some other root's model dirs as if they were the
+ * live server's is a wrong-destination hazard, so an explicit unresolved error is the
+ * only safe answer.
+ *
+ * That last clause is stated as a consequence of what `resolveEffectiveComfyUIBase()`
+ * returns, not as a guarantee this function independently enforces — the previous
+ * wording asserted the guarantee flatly while the resolver did not implement it (#490),
+ * and a confident absolute in a comment is precisely what stops the next reader from
+ * re-deriving it. If that resolver ever stops refusing, this text is wrong and the check
+ * belongs here.
  *
  * STALE-ROOT GUARD (codex rounds 2-3, P1): an INFERRED root — a saved default workspace
  * persisted once and maybe never revisited, or a startup AUTO-DETECTION that has since
@@ -523,9 +530,54 @@ function parseConfig(text: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
-async function readConfigFile(path: string): Promise<Record<string, unknown>> {
-  if (!existsSync(path)) return {};
-  return parseConfig(await readFile(path, "utf-8"));
+/**
+ * Is there a readable config FILE at this path — and if not, do we actually know that?
+ *
+ * `existsSync` answers false for every failure alike: ENOENT, an EACCES on a parent
+ * directory, a Windows sharing violation, a stalled network mount. Downstream that single
+ * false became "this config does not exist" and then "this config is empty", which is the
+ * defect this whole change is about. A directory at the path is a third thing again.
+ */
+type LocalFile =
+  | { kind: "file" }
+  | { kind: "absent" }
+  | { kind: "not-a-file" }
+  | { kind: "indeterminate"; detail: string };
+
+function probeLocalFile(path: string): LocalFile {
+  try {
+    return statSync(path).isFile() ? { kind: "file" } : { kind: "not-a-file" };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") return { kind: "absent" };
+    return { kind: "indeterminate", detail: code ?? String(err) };
+  }
+}
+
+async function readConfigFile(
+  path: string,
+): Promise<{ raw: Record<string, unknown>; exists: boolean }> {
+  const found = probeLocalFile(path);
+  // genuinely not there → genuinely no entries
+  if (found.kind === "absent") return { raw: {}, exists: false };
+  if (found.kind !== "file") {
+    // A config we could not LOOK AT must never be summarised as an empty one: "no extra
+    // paths are configured" is a claim, and we have not earned it. Nothing was read or
+    // written, so refusing is correct here — there is no partial result to disclose.
+    throw new ValidationError(
+      found.kind === "not-a-file"
+        ? `UNRESOLVED: "${path}" exists but is not a file (it is a directory or a special ` +
+          "file), so no extra-path configuration could be read from it. Nothing was read or " +
+          "written, and NO claim is being made about what paths are configured. Pass " +
+          "config_path with the real YAML file."
+        : `UNRESOLVED: "${path}" could not be inspected (${found.detail}), so this process ` +
+          "cannot tell whether a config is there. This is NOT a report that the file is " +
+          "missing or that no extra paths are configured — an empty result would be a claim " +
+          "we have not earned. Nothing was read or written. Check the permissions on that " +
+          "path (or the mount it lives on), or pass config_path with a file you can read.",
+    );
+  }
+  return { raw: parseConfig(await readFile(path, "utf-8")), exists: true };
 }
 
 function summarize(
@@ -534,6 +586,13 @@ function summarize(
   raw: Record<string, unknown>,
   extraNotes: string[] = [],
   serverResolved = false,
+  /**
+   * The read-time observation, threaded in rather than re-derived. Re-statting here
+   * would put a SECOND lookup between the successful read and the answer, and any
+   * failure of that second lookup (a transient sharing violation, a mount hiccup) would
+   * be reported as `exists: false` about a file we had just finished reading.
+   */
+  exists = false,
 ): ExtraPathsConfigInfo {
   const groups: ExtraPathGroup[] = [];
   for (const [name, value] of Object.entries(raw)) {
@@ -556,7 +615,7 @@ function summarize(
     "Categories are generic ComfyUI search-path keys, so model folders and custom_nodes can both be represented when supported by the running ComfyUI build.",
     "Restart ComfyUI after editing this file so startup path registration is rebuilt.",
   ];
-  return { target, path, exists: existsSync(path), groups, notes };
+  return { target, path, exists, groups, notes };
 }
 
 /**
@@ -565,6 +624,14 @@ function summarize(
  */
 function isDesktopGeneratedConfig(path: string): boolean {
   return /Comfy Desktop[\\/].*shared_model_paths\.ya?ml$/i.test(path);
+}
+
+/** Which `target` label a server-named config file should be reported under. */
+function looksLikeDesktopConfig(path: string): boolean {
+  return (
+    isDesktopGeneratedConfig(path) ||
+    /Comfy Desktop[\\/]|[\\/]ComfyUI[\\/]extra_models_config\.ya?ml$/i.test(path)
+  );
 }
 
 /**
@@ -582,15 +649,41 @@ function isDesktopGeneratedConfig(path: string): boolean {
  * reports a root we cannot see, and returning undefined there makes the caller refuse
  * explicitly instead of creating a lookalike tree locally and reporting success.
  */
-function realLiveRoot(scriptPath: string): string | undefined {
+/**
+ * Why the live root could not be established, when it could not.
+ *
+ * "absent" — the path genuinely does not exist here (ENOENT), or resolves to something
+ * that is not a file. That IS evidence the server's filesystem is not ours.
+ *
+ * "indeterminate" — the lookup itself failed for a reason that says nothing about
+ * whether the file is there: EACCES/EPERM on a parent directory, ELOOP, EIO, a Windows
+ * sharing violation, a stalled network mount. Collapsing that into "absent" turns "we
+ * could not look" into "we looked and it is not there", and then narrates it as
+ * "the server is running in a container, WSL, or on another host" — a cause the code
+ * never observed. Kept separate so the message can only assert what actually happened.
+ */
+type LiveRootResult =
+  | { root: string }
+  | { root?: undefined; why: "absent" | "indeterminate"; detail?: string };
+
+function realLiveRoot(scriptPath: string): LiveRootResult {
+  let real: string;
   try {
-    const real = realpathSync(scriptPath);
-    // A DIRECTORY named main.py would realpath fine and prove nothing (codex round 7).
-    if (!statSync(real).isFile()) return undefined;
-    return dirname(real);
-  } catch {
-    return undefined; // not visible from here (container/WSL/another host), or gone
+    real = realpathSync(scriptPath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") return { why: "absent" };
+    return { why: "indeterminate", detail: code ?? String(err) };
   }
+  try {
+    // A DIRECTORY named main.py would realpath fine and prove nothing (codex round 7).
+    if (!statSync(real).isFile()) return { why: "absent" };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") return { why: "absent" };
+    return { why: "indeterminate", detail: code ?? String(err) };
+  }
+  return { root: dirname(real) };
 }
 
 /**
@@ -712,17 +805,49 @@ async function resolveTargetPathPreferServer(
   // The REAL (symlink-resolved) install root, kept for every downstream use — notably the
   // "other configs" disclosure, which must name the file ComfyUI actually loads
   // (realpath(__file__) dir), not the launcher spelling (codex round 10).
-  const liveRoot = script ? realLiveRoot(script) : undefined;
-  if (script && !liveRoot) {
+  const rootResult: LiveRootResult = script ? realLiveRoot(script) : { why: "absent" };
+  const liveRoot = rootResult.root;
+
+  /** Why locality is unproven, stated as what was OBSERVED. Reused by the refusals and
+   *  by the read-only disclosures, so the two can never drift apart. */
+  const localityGap = !script || rootResult.root !== undefined
+    ? "its /system_stats launch argv does not reveal a main.py at all"
+    : rootResult.why === "indeterminate"
+      ? `this process could not determine whether its launch script "${script}" is a file on ` +
+        `this filesystem (the lookup failed with ${rootResult.detail ?? "an unknown error"}); ` +
+        "that is NOT a finding that the path is absent — a permission or mount problem on an " +
+        "intermediate directory looks exactly the same from here"
+      : `its launch script "${script}" does not resolve to a file on this filesystem (it may ` +
+        "never have been ours — a container, WSL, or another host behind a loopback port " +
+        "spells its paths the same way — or it may have been moved or deleted since the " +
+        "server started)";
+
+  if (script && rootResult.root === undefined && !allowUnprovenLocalListFallback) {
+    // A MUTATION still fails closed here: a config path derived from an unverified tree
+    // could name a different file, and the edit would be a silent no-op or a write into a
+    // stranger's config. A READ falls through instead, so the branches below can disclose
+    // an unproven file rather than reject a reachable server outright (#764).
+    //
+    // The message states the observation and offers the topologies as possibilities. The
+    // old wording asserted "the server is running in a container, WSL, or on another
+    // host" from a bare ENOENT — one bucket, several causes, and it named one.
     throw new ValidationError(
-      `UNRESOLVED: the running ComfyUI was launched from "${script}", which does not resolve to ` +
-        "a file on this filesystem — the server is running in a container, WSL, or on another " +
-        "host reached over the network. Its config paths name files on ITS disk, so a same-" +
-        "spelled path here would be a different file and the edit would be a silent no-op. " +
-        "Nothing was read or written — pass config_path explicitly with a file you can reach, " +
-        'or target: "standalone"/"desktop" to use the local heuristic deliberately.',
+      `UNRESOLVED: ${localityGap}, so the server's file tree is not proven to be this ` +
+        "machine's. Its config paths would then name files on ITS disk, and a same-spelled " +
+        "path here would be a different file, so the edit would be a silent no-op. Nothing " +
+        "was read or written — pass config_path explicitly with a file you can reach, or " +
+        'target: "standalone"/"desktop" to use the local heuristic deliberately.',
     );
   }
+
+  // Show the caller's already-known LOCAL target, loudly marked as unproven. Read-only
+  // callers get this instead of a refusal; mutations never reach it.
+  const unprovenListFallback = (
+    note: string,
+  ): ResolvedTarget & { serverResolved: boolean } => {
+    const fallback = resolveTargetPath(opts);
+    return { ...fallback, notes: [...fallback.notes, note], serverResolved: false };
+  };
 
   const rawFlags = parseExtraModelPathsConfigsFromArgvRaw(snapshot.argv);
   if (rawFlags.length === 0) {
@@ -735,15 +860,13 @@ async function resolveTargetPathPreferServer(
     // the response plainly says it is NOT a claim about the running server. Do not share
     // this fallback with add/remove: an edit here could be a silent no-op (#764).
     if (allowUnprovenLocalListFallback) {
-      const fallback = resolveTargetPath(opts);
-      return {
-        ...fallback,
-        notes: [
-          ...fallback.notes,
-          "NOTE: the connected ComfyUI is local and reachable, but its /system_stats launch argv does not reveal main.py, so the config the running server reads cannot be proven. Showing the local auto-selected config instead; this is a fallback, not confirmation that the live server reads it. Pass config_path or target: \"standalone\"/\"desktop\" to choose a file explicitly.",
-        ],
-        serverResolved: false,
-      };
+      return unprovenListFallback(
+        // Built from `localityGap`, never from a hardcoded "argv does not reveal
+        // main.py". Argv often DOES reveal one and the lookup failed (EACCES, a stalled
+        // mount, or a script deleted since startup) — stating the missing-argv cause
+        // there is a false cause in the caption, the same defect one level out.
+        `NOTE: the connected ComfyUI is local and reachable, but ${localityGap}, so the config the running server reads cannot be proven. Showing the local auto-selected config instead; this is a fallback, not confirmation that the live server reads it. Pass config_path or target: "standalone"/"desktop" to choose a file explicitly.`,
+      );
     }
     throw new ValidationError(
       "UNRESOLVED: the running ComfyUI was not launched with --extra-model-paths-config and " +
@@ -777,6 +900,11 @@ async function resolveTargetPathPreferServer(
     // `cd /opt/ComfyUI && python main.py --extra-model-paths-config extra.yaml` launch
     // outright (codex round 8, P1). Only when NEITHER file can be located do we refuse.
     if (script && liveRoot) return implicitLiveTarget(liveRoot, opts, rawFlag);
+    if (allowUnprovenLocalListFallback) {
+      return unprovenListFallback(
+        `NOTE: the connected ComfyUI is local and reachable, but it was launched with a RELATIVE --extra-model-paths-config ("${rawFlag}") and does not report its working directory, and ${localityGap} — so the file it actually reads cannot be located from this process. Showing the local auto-selected config instead; this is a fallback, not confirmation that the live server reads it. Pass config_path with the flag's absolute path to see the real one.`,
+      );
+    }
     throw new ValidationError(
       `UNRESOLVED: the running ComfyUI was launched with a RELATIVE --extra-model-paths-config ` +
         `("${rawFlag}") and reports neither its working directory nor a main.py, so no file it ` +
@@ -794,11 +922,64 @@ async function resolveTargetPathPreferServer(
   // flag's ABSOLUTE value pointing at a same-spelled file here that is a DIFFERENT tree;
   // writing it would fabricate success and could corrupt that tree. Refuse instead.
   if (!liveRoot) {
+    // #764 recurrence (0.49.4/0.49.5, macOS ComfyUI Desktop 2): the server NAMES an
+    // absolute config that exists right here, and the tool refused to show it because a
+    // DIFFERENT fact — the locality of its main.py — could not be established. "We could
+    // not prove this file is the server's" was reported as "this file is not the
+    // server's", and a reachable instance was rejected outright.
+    //
+    // The refusal is still exactly right for a WRITE: an unproven tree turns an edit
+    // into a silent no-op or, worse, a write into a stranger's config. It is wrong for a
+    // READ, which changes nothing and whose only failure mode is a caption. So the
+    // read-only caller gets the file, plus an unmissable statement of what was not
+    // proven; mutations fall through to the refusal below, unchanged.
+    if (allowUnprovenLocalListFallback) {
+      // Three distinct answers to "is the file the server named here?", kept distinct.
+      // `existsSync` collapsed them: an EACCES on a parent directory came back false and
+      // would have been narrated as "no such file exists on this machine — the server is
+      // very likely elsewhere", which is a conclusion drawn from a failed look.
+      const local = probeLocalFile(serverConfig);
+      if (local.kind === "file") {
+        return {
+          target: looksLikeDesktopConfig(serverConfig) ? "desktop" : "standalone",
+          path: serverConfig,
+          // The note deliberately does NOT restate "and this file exists" or "its
+          // entries were read". Selecting this path required one stat, and the read
+          // takes another; between them the file can be deleted, and a note that had
+          // asserted existence would then sit next to `exists: false` and an empty
+          // group list, contradicting the very response it is part of. `exists` is the
+          // field that answers that, from the read's own observation — the prose says
+          // only what selecting the path established, which is where it came from.
+          notes: [
+            `Showing "${serverConfig}" — the --extra-model-paths-config the running ComfyUI reports in its own launch argv. See "exists" for whether a file is there now, and the groups below for what was read from it.`,
+            `NOTE: NOT CONFIRMED to be the same file: ${localityGap}, so this process could not prove the server's file tree is this machine's. If the server is in a container, WSL, or on another host behind a loopback port, it spells its paths the same way and this would be a DIFFERENT file with the same name. Editing is refused in this state — pass config_path explicitly to edit deliberately.`,
+          ],
+          serverResolved: false,
+          // Not proven ours: never create a tree here on the strength of a path the
+          // server named.
+          createParents: false,
+        };
+      }
+      if (local.kind === "absent") {
+        // Absent HERE, now. That is consistent with a container/WSL/other-host server,
+        // and equally with a local server whose flagged YAML was deleted or renamed
+        // after it started (ComfyUI read it at launch and would go on loading its
+        // implicit <root>/extra_model_paths.yaml regardless). Naming one of those as the
+        // cause would be the same fold this change exists to remove.
+        return unprovenListFallback(
+          `NOTE: the running ComfyUI reports --extra-model-paths-config "${serverConfig}", but no file exists at that path on this machine right now, and ${localityGap}. That is consistent with the server running on a different filesystem (a container, WSL, or another host behind a loopback port) AND with a local server whose config was moved or deleted after it started — this process cannot tell which. Showing the local auto-selected config instead; it is a fallback and is NOT confirmed to be a file the live server reads. Pass config_path explicitly to inspect a file you can reach.`,
+        );
+      }
+      return unprovenListFallback(
+        local.kind === "not-a-file"
+          ? `NOTE: the running ComfyUI reports --extra-model-paths-config "${serverConfig}", and something exists at that path on this machine but it is not a file, so nothing was read from it. Showing the local auto-selected config instead; this is a fallback, and it is NOT confirmation of what the live server reads. Pass config_path explicitly to inspect a file you can reach.`
+          : `NOTE: the running ComfyUI reports --extra-model-paths-config "${serverConfig}", and this process could not determine whether a file is there (the lookup failed with ${local.detail}) — that is NOT a report that it is missing. Showing the local auto-selected config instead; this is a fallback, and it is NOT the file the live server reads. Check the permissions on that path, or pass config_path explicitly with a file you can read.`,
+      );
+    }
     throw new ValidationError(
       `UNRESOLVED: the running ComfyUI reports --extra-model-paths-config "${serverConfig}" ` +
-        "but its launch argv reveals no main.py that resolves to a file on this " +
-        "filesystem, so the server's file tree is not proven local — the path names a " +
-        "file on ITS disk and a same-spelled path here would be a different file. " +
+        `but ${localityGap}, so the server's file tree is not proven local — the path may ` +
+        "name a file on ITS disk, and a same-spelled path here would be a different file. " +
         "Nothing was read or written — pass config_path explicitly with a file you can " +
         'reach, or target: "standalone"/"desktop" to use the local heuristic deliberately.',
     );
@@ -847,9 +1028,7 @@ async function resolveTargetPathPreferServer(
   } catch {
     // No static guess available — the server-resolved path stands on its own.
   }
-  const isDesktop =
-    isDesktopGeneratedConfig(serverConfig) ||
-    /Comfy Desktop[\\/]|[\\/]ComfyUI[\\/]extra_models_config\.ya?ml$/i.test(serverConfig);
+  const isDesktop = looksLikeDesktopConfig(serverConfig);
   if (isDesktopGeneratedConfig(serverConfig)) {
     notes.push(
       "WARNING: this file is auto-generated by ComfyUI Desktop ('do not edit manually') and will be overwritten by the Desktop app. For a durable model path, place or symlink the models under the server's --base-directory models dir instead of editing this YAML.",
@@ -878,9 +1057,16 @@ async function readExtraPathsConfig(
   // surface as UNRESOLVED, NOT as a normal empty config (readConfigFile maps a missing
   // file to {}, which would look authoritative — the exact failure #648 is about).
   assertRootIntact(resolved.guard);
-  const raw = await readConfigFile(resolved.path);
+  const { raw, exists } = await readConfigFile(resolved.path);
   assertRootIntact(resolved.guard);
-  return summarize(resolved.target, resolved.path, raw, resolved.notes, resolved.serverResolved);
+  return summarize(
+    resolved.target,
+    resolved.path,
+    raw,
+    resolved.notes,
+    resolved.serverResolved,
+    exists,
+  );
 }
 
 export async function listExtraPaths(
@@ -1098,7 +1284,7 @@ export async function addExtraPath(
   }
 
   assertRootIntact(resolved.guard);
-  const raw = await readConfigFile(resolved.path);
+  const { raw, exists: existedBefore } = await readConfigFile(resolved.path);
   // The no-op path ("already present") returns data from THIS read, so a root REPLACED
   // during it must fail here too — not only when a write follows (#648 review).
   assertRootIntact(resolved.guard);
@@ -1114,7 +1300,15 @@ export async function addExtraPath(
     group[category] = paths.join("\n");
     await writeConfigFile(resolved.path, raw, resolved.createParents, resolved.guard);
   }
-  const info = summarize(resolved.target, resolved.path, raw, resolved.notes, resolved.serverResolved);
+  // A completed write is itself the observation that the file is there now.
+  const info = summarize(
+    resolved.target,
+    resolved.path,
+    raw,
+    resolved.notes,
+    resolved.serverResolved,
+    existedBefore || changed,
+  );
   return {
     ...info,
     changed,
@@ -1133,7 +1327,7 @@ export async function removeExtraPath(
   const removePath = assertPathValue(opts.path);
 
   assertRootIntact(resolved.guard);
-  const raw = await readConfigFile(resolved.path);
+  const { raw, exists: existedBefore } = await readConfigFile(resolved.path);
   // Same post-read gate as add: a no-op "was not present" built from a root REPLACED
   // during the read would report the PRIOR tree's data as current (#648 review).
   assertRootIntact(resolved.guard);
@@ -1149,7 +1343,14 @@ export async function removeExtraPath(
       await writeConfigFile(resolved.path, raw, resolved.createParents, resolved.guard);
     }
   }
-  const info = summarize(resolved.target, resolved.path, raw, resolved.notes, resolved.serverResolved);
+  const info = summarize(
+    resolved.target,
+    resolved.path,
+    raw,
+    resolved.notes,
+    resolved.serverResolved,
+    existedBefore || changed,
+  );
   return {
     ...info,
     changed,

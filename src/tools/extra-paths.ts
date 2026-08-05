@@ -16,9 +16,11 @@ const targetArgs = {
     .describe(
       "Config target. auto (default) is LIVE-FIRST: the running ComfyUI's own " +
         "--extra-model-paths-config, else the extra_model_paths.yaml next to its main.py. " +
-        "When no server is reachable, or a reachable LOCAL server does not expose main.py, " +
-        "auto shows the Desktop config if one exists, otherwise standalone; the latter case is " +
-        "explicitly marked as an unconfirmed display fallback. standalone forces <ComfyUI root>/extra_model_paths.yaml, " +
+        "When no server is reachable, auto shows the Desktop config if one exists, otherwise " +
+        "standalone. When a reachable LOCAL server does not expose main.py, listing degrades to " +
+        "the server-named config (if it exists here) or the local auto-selected one, explicitly " +
+        "marked as an unconfirmed display fallback; mutations refuse instead. " +
+        "standalone forces <ComfyUI root>/extra_model_paths.yaml, " +
         "where the root is COMFYUI_PATH (or an auto-detected install) and falls back to the " +
         "saved default workspace; desktop forces the OS app-data extra_models_config.yaml. " +
         "Use standalone/desktop (or config_path) to deliberately target a file the running " +
@@ -60,8 +62,11 @@ export function registerExtraPathsTools(server: McpServer): void {
       "extra_model_paths.yaml (COMFYUI_PATH, else the saved default workspace from " +
       "workspace action:\"set_default\") or the Desktop app-data extra_models_config.yaml. Reports generic " +
       "categories, so model categories and custom_nodes entries are both visible when present. " +
-      "Read-only. Exception: if a reachable LOCAL server does not expose main.py, auto returns " +
-      "a clearly marked unconfirmed local fallback instead of rejecting the list request.",
+      "Read-only. Because it is read-only it never refuses a reachable LOCAL server just " +
+      "because its argv does not prove which file it reads: it shows the server-named config " +
+      "when that file exists here, else the local auto-selected one, always labelled as " +
+      "unconfirmed rather than presented as the live server's. add_extra_path/remove_extra_path " +
+      "still refuse in that state — a write to an unproven file would be a silent no-op.",
     targetArgs,
     async (args) => {
       try {

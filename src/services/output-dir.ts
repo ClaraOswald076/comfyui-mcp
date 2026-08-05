@@ -1,7 +1,7 @@
-import { existsSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { config, isRemoteMode } from "../config.js";
-import { getSystemStats } from "../comfyui/client.js";
+import { getClient, getSystemStats } from "../comfyui/client.js";
 import {
   resolveEffectiveComfyUIBase,
   liveRootFromArgv,
@@ -66,6 +66,7 @@ export type ModelsDirSource =
   | "live-root"
   | "observed-root"
   | "base-anchored"
+  | "base-inventory-corroborated"
   | "configured-base";
 
 /** True when the models dir was established from the RUNNING server rather than
@@ -346,7 +347,315 @@ function anchorRelativeEntrypointOnBase(base: string, relDir: string): string | 
   return hasComfyUIEntrypoint(nested) ? nested : undefined;
 }
 
-export async function resolveModelsDirWithBases(): Promise<{
+/**
+ * Corroborate a configured base by asking the SERVER what models it can SEE (#851).
+ *
+ * `anchorRelativeEntrypointOnBase` corroborates using ComfyUI's CODE layout — it needs a
+ * `main.py` at or under the base. That is an assumption about what an install LOOKS
+ * like, and every deployment shape that does not match produces another false refusal:
+ * #813 was the Windows portable shape, #851 is the Docker/data-dir shape, where
+ * `COMFYUI_PATH` is a bind-mounted host directory holding `models/ input/ output/
+ * custom_nodes/` and the code lives inside the container at a path that does not exist
+ * on the host at all. No amount of layout-matching reaches that, because the evidence it
+ * looks for is genuinely not there — and "I could not determine which install this is"
+ * was being reported as "I determined it is a DIFFERENT install".
+ *
+ * But the question is "where does this server read MODELS from?", and for that there IS
+ * decisive evidence the running server volunteers: `/models/<category>` is ComfyUI
+ * listing the model files it can actually see. If everything it reports for a category
+ * is present under `<base>/models/<category>`, then that directory is (or is mounted as)
+ * the models root the server reads — established by the server, not by us recognising a
+ * layout. That is the same principle #813 used, applied to the evidence that exists in
+ * this deployment rather than the evidence that does not.
+ *
+ * Deliberately conservative, because this decides where multi-gigabyte files land:
+ *  - it runs ONLY where the alternative is today's hard refusal, so it can convert a
+ *    refusal into a corroborated destination but can never redirect a download that
+ *    already resolved;
+ *  - it requires a NON-EMPTY category that the base explains COMPLETELY. One reported
+ *    file missing from disk means the server is reading from somewhere else too, and the
+ *    match is not proof;
+ *  - anything unreadable, empty, or ambiguous returns a reason and the caller refuses.
+ *
+ * Residual, stated rather than hidden: a stale second install holding an identical copy
+ * of the same model files would also match. The source is reported as
+ * `base-inventory-corroborated` (NOT live-authoritative) precisely so downstream keeps
+ * treating the destination as local configuration that was corroborated, not as a path
+ * the server named.
+ */
+/** Is `candidate` strictly inside `root`? The server's listing supplies both the category
+ *  and the file names, and a `..` segment in either (a stray path, a symlinked category)
+ *  would let `join` walk out of `<base>/models` and "find" a file that proves nothing
+ *  about this base. The root itself is not an entry, so equality is not containment. */
+function containedUnder(root: string, candidate: string): boolean {
+  const r = resolve(root);
+  const c = resolve(candidate);
+  if (c === r) return false;
+  const rel = relative(r, c);
+  if (rel === "" || isAbsolute(rel)) return false;
+  // `..` only counts as escaping when it is a whole PATH SEGMENT. A bare
+  // `startsWith("..")` also rejects `..model.safetensors` — a perfectly ordinary
+  // filename that stays inside the directory — and that false refusal would block the
+  // very Docker download this corroboration exists to allow. Over-strict is the same
+  // defect as over-permissive, pointed the other way.
+  return rel !== ".." && !rel.startsWith(`..${sep}`) && !rel.startsWith("../");
+}
+
+/** What is at this path — keeping "could not look" out of "is not there", and out of
+ *  "is a regular file". A DIRECTORY named like a model would satisfy `existsSync` and
+ *  corroborate a base that holds none of the actual files. */
+function probeEntry(p: string): { kind: "file" | "absent" | "not-a-file" | "indeterminate"; detail?: string } {
+  try {
+    return statSync(p).isFile() ? { kind: "file" } : { kind: "not-a-file" };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") return { kind: "absent" };
+    return { kind: "indeterminate", detail: code ?? String(err) };
+  }
+}
+
+async function corroborateBaseByModelInventory(
+  base: string,
+  targetCategory: string,
+): Promise<
+  | {
+      ok: true;
+      modelsDir: string;
+      category: string;
+      matched: number;
+      /** How many the server listed, so a PARTIAL match can be reported as one. */
+      listed: number;
+    }
+  | { ok: false; reason: string }
+> {
+  // The corroboration must be about the category this download is FOR. A complete match
+  // on some OTHER category proves only that THAT folder is under this base — and a server
+  // can legitimately read `diffusion_models` from here via an extra_model_paths entry
+  // while reading `loras` from somewhere else entirely. Authorising the whole models root
+  // on a sibling's evidence would then write the loras file where the server never looks,
+  // and the downstream live-disagreement guard cannot catch it: an EMPTY local `loras/`
+  // has nothing to contradict, which is exactly the first-download case.
+  if (!targetCategory) {
+    return {
+      ok: false,
+      reason:
+        "this call did not name the model category it is downloading into, and corroboration " +
+        "has to be about that category — a match on a different one would not establish that " +
+        "the server reads THIS folder",
+    };
+  }
+  const modelsDir = resolve(base, "models");
+  let modelsDirIsDir: boolean;
+  try {
+    modelsDirIsDir = statSync(modelsDir).isDirectory();
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return {
+      ok: false,
+      reason:
+        code === "ENOENT" || code === "ENOTDIR"
+          ? `it has no "models" directory`
+          : `its "models" directory could not be inspected (${code ?? "unknown error"}), so nothing was established either way`,
+    };
+  }
+  if (!modelsDirIsDir) return { ok: false, reason: `its "models" entry is not a directory` };
+
+  // ONLY the target category — one question, one request. Scoping to it also removed the
+  // /models enumeration and its per-category request budget, which existed solely because
+  // this used to sweep for any category that happened to match.
+  let unreadableCategories = 0;
+  let lastReason: string | undefined;
+  for (const category of [targetCategory]) {
+    let files: string[];
+    try {
+      const client = getClient();
+      const res = await client.fetchApi(`/models/${encodeURIComponent(category)}`);
+      if (!res.ok) {
+        unreadableCategories += 1;
+        continue;
+      }
+      const json = (await res.json()) as unknown;
+      if (!Array.isArray(json)) {
+        unreadableCategories += 1;
+        continue;
+      }
+      // A malformed ENTRY makes the whole listing inconclusive. Dropping it and matching
+      // "the rest" would approve a destination while quietly not accounting for
+      // everything the server said it sees — a complete match that is not complete.
+      const malformed = json.filter((n) => typeof n !== "string" || n.trim() === "");
+      if (malformed.length > 0) {
+        unreadableCategories += 1;
+        lastReason =
+          `the server's listing for "${category}" contained ${malformed.length} entr(y/ies) that ` +
+          "are not usable filenames, so what it sees there could not be established — and a " +
+          "match on only the readable remainder would not be the complete match this check requires";
+        continue;
+      }
+      files = json as string[];
+    } catch {
+      unreadableCategories += 1;
+      continue;
+    }
+    if (files.length === 0) continue;
+    const categoryDir = join(modelsDir, category);
+    // The CATEGORY name comes from the server too, so it gets the same containment
+    // check as the files under it.
+    if (!containedUnder(modelsDir, categoryDir)) {
+      lastReason = `the server's category name "${category}" does not name a directory inside "${modelsDir}", so nothing under it could corroborate this base`;
+      continue;
+    }
+    const missing: string[] = [];
+    const unreadable: string[] = [];
+    const notFiles: string[] = [];
+    const escaping: string[] = [];
+    // Containment has to be PHYSICAL. Sharing model files between installs by symlinking
+    // them is ordinary practice, and a stale base whose `<category>/known.safetensors` is
+    // a link to the file the server really reads would satisfy a lexical check while
+    // proving the opposite: the evidence lives elsewhere, and a NEW download written here
+    // would never appear to the server. `statSync` follows links, so nothing else notices.
+    //
+    // The canonical category must ALSO stay inside the canonical models root. A category
+    // directory that is itself a link out of the tree is a real topology — writes through
+    // it do land in the server's dir — but the download authorizer downstream refuses a
+    // destination whose canonical path escapes the models root, so corroborating it here
+    // would hand the caller an approval the next layer rejects: a contradiction between
+    // two guards, which is worse than either answer. This check is deliberately the
+    // NARROWER of the two so the layers agree; that topology keeps today's refusal.
+    let realModelsDir: string;
+    let realCategoryDir: string;
+    try {
+      realModelsDir = realpathSync(modelsDir);
+      realCategoryDir = realpathSync(categoryDir);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      lastReason =
+        code === "ENOENT" || code === "ENOTDIR"
+          ? `"${categoryDir}" does not exist, so this base holds none of what the server lists under "${category}"`
+          : `"${categoryDir}" could not be canonicalized (${code ?? "unknown error"}), so nothing was established either way`;
+      continue;
+    }
+    if (!containedUnder(realModelsDir, realCategoryDir)) {
+      lastReason =
+        `"${categoryDir}" resolves to "${realCategoryDir}", outside "${realModelsDir}" — a ` +
+        "category directory linked out of the models tree. Writes through it would reach the " +
+        "server, but the download authorizer refuses a destination whose canonical path leaves " +
+        "the models root, so corroborating it here would only be overruled a step later. Point " +
+        "COMFYUI_PATH at the directory that physically holds the models instead";
+      continue;
+    }
+    for (const name of files) {
+      const full = join(categoryDir, name);
+      if (!containedUnder(categoryDir, full)) {
+        escaping.push(name);
+        continue;
+      }
+      const found = probeEntry(full);
+      if (found.kind === "absent") {
+        missing.push(name);
+        continue;
+      }
+      if (found.kind === "not-a-file") {
+        notFiles.push(name);
+        continue;
+      }
+      if (found.kind === "indeterminate") {
+        unreadable.push(`${name} (${found.detail ?? "unknown error"})`);
+        continue;
+      }
+      let realEntry: string;
+      try {
+        realEntry = realpathSync(full);
+      } catch (err) {
+        unreadable.push(`${name} (${(err as NodeJS.ErrnoException)?.code ?? "unresolvable link"})`);
+        continue;
+      }
+      if (!containedUnder(realCategoryDir, realEntry)) escaping.push(name);
+    }
+    // A PARTIAL match does NOT corroborate — and my first attempt at this had it
+    // backwards (codex gate, twice).
+    //
+    // The original complaint was real: requiring EVERY listed file to be here
+    // assumes one root per category, and `extra_model_paths.yaml` lets ComfyUI
+    // scan this directory AND others for the same one, so a file owned by an extra
+    // root is legitimately absent. I relaxed the rule to accept any overlap.
+    //
+    // That was worse than the bug. The listing is FILENAMES ONLY, so a stale clone
+    // holding `shared.safetensors` is indistinguishable from a genuine second root
+    // holding `shared.safetensors` — and under the relaxed rule a single common
+    // name authorized a multi-gigabyte download into an install the running server
+    // never reads. A false refusal here is recoverable and tells the user exactly
+    // what to set; a wrong destination reported as success is #369, which is the
+    // harm this whole path exists to prevent. Between an unrecoverable wrong answer
+    // and a recoverable refusal, an inconclusive rescue refuses.
+    //
+    // So the verdict returns to a full match. What actually needed fixing was the
+    // REASON: the old message said the base "does not explain what the server sees",
+    // which reads as "this base is wrong" when a multi-root layout is the likelier
+    // explanation. It now names that possibility and what to do about it.
+    if (missing.length === 0 && unreadable.length === 0 && notFiles.length === 0 && escaping.length === 0) {
+      return { ok: true, modelsDir, category, matched: files.length, listed: files.length };
+    }
+    // Each failure mode says what it actually was. "Could not read it" is not "it is not
+    // there", and neither is "something is there but it is not a file" — three different
+    // fixes, and the old single "are not under" phrasing named only one of them.
+    if (unreadable.length > 0) {
+      // ORDERED BEFORE `missing` (codex gate): a mixed result would otherwise be
+      // narrated purely as absence, and an entry we could not inspect is not an
+      // entry we found to be gone. The inconclusive half decides the wording,
+      // because it is the half that is not a finding.
+      lastReason =
+        `the server lists ${files.length} file(s) under "${category}", and ${unreadable.length} of them ` +
+        `could not be inspected under "${categoryDir}" (e.g. "${unreadable[0]}") — that is NOT a finding ` +
+        `that they are missing, so nothing was established either way` +
+        (missing.length > 0
+          ? ` (${missing.length} other(s) were not found there, but with the above unreadable that ` +
+            `does not settle it)`
+          : "");
+    } else if (missing.length > 0) {
+      const present = files.length - missing.length;
+      lastReason =
+        present === 0
+          ? `the server lists ${files.length} file(s) under "${category}" and NONE of them are under ` +
+            `"${categoryDir}" (e.g. "${missing[0]}"), so this base is not a directory the server ` +
+            `reads that category from`
+          : // The multi-root case, named rather than mislabelled as a wrong base.
+            `the server lists ${files.length} file(s) under "${category}" and ${present} of them are ` +
+            `under "${categoryDir}", but ${missing.length} are not (e.g. "${missing[0]}"). That is ` +
+            `consistent with an extra_model_paths layout where this is ONE of several roots for ` +
+            `"${category}" — but it is also what a stale copy sharing some filenames looks like, and ` +
+            `a filename listing cannot tell those apart. Rather than guess a destination, set ` +
+            `COMFYUI_PATH to the root that actually holds "${category}", or launch ComfyUI with an ` +
+            `absolute --base-directory`;
+    } else if (notFiles.length > 0) {
+      lastReason =
+        `the server lists ${files.length} file(s) under "${category}", and ${notFiles.length} of the ` +
+        `matching entries under "${categoryDir}" are not regular files (e.g. "${notFiles[0]}")`;
+    } else {
+      lastReason =
+        `the server lists ${escaping.length} entr(y/ies) under "${category}" whose path escapes ` +
+        `"${categoryDir}" (e.g. "${escaping[0]}"), so they cannot corroborate this base`;
+    }
+  }
+  if (lastReason) return { ok: false, reason: lastReason };
+  // Nothing was COMPARED. Say which of the two reasons that was: the listing could not be
+  // read, or it was empty. Reporting the first as the second would be the same fold this
+  // whole change is about — and an EMPTY target category genuinely cannot corroborate
+  // anything, which is the honest cost of scoping this to the category being written to.
+  return {
+    ok: false,
+    reason:
+      unreadableCategories > 0
+        ? `the server's "${targetCategory}" listing could not be read, so there was nothing to compare against`
+        : `the server lists no files under "${targetCategory}", so there is nothing there to show that this base is the directory it reads that category from`,
+  };
+}
+
+export async function resolveModelsDirWithBases(opts?: {
+  /** The model category this call is downloading INTO (`loras`, `diffusion_models`, …).
+   *  Required for the #851 inventory corroboration, which must be about the folder
+   *  actually being written to — a match on a sibling category proves nothing about it. */
+  targetCategory?: string;
+}): Promise<{
   modelsDir: string;
   baseDirs: string[];
   /** The SAME /system_stats snapshot the models/base dirs were derived from — so a
@@ -465,6 +774,44 @@ export async function resolveModelsDirWithBases(): Promise<{
         { modelsDir, relDir: live?.relDir, anchored },
       );
     } else if (snapshot.reachable && !isRemoteMode() && live?.source === "unresolved" && live.relDir !== undefined) {
+      // Before refusing: the code-layout corroboration above needed a `main.py` at or
+      // under the base, and a Docker/data-dir deployment genuinely has none — the code
+      // lives inside the container (#851). Ask the SERVER what models it can see and
+      // accept the base only if it explains that completely. Runs only here, so it can
+      // rescue a refusal but never redirect a download that already resolved.
+      const inventory = base
+        ? await corroborateBaseByModelInventory(base, (opts?.targetCategory ?? "").trim())
+        : { ok: false as const, reason: "no COMFYUI_PATH or default workspace is configured" };
+      if (inventory.ok) {
+        modelsDir = inventory.modelsDir;
+        source = "base-inventory-corroborated";
+        baseDirs.add(resolve(base as string));
+        // CORROBORATION, NOT PROOF (codex gate P1). The server's listing is
+        // filenames only, so a stale local clone holding files with the same names
+        // satisfies this check without being mounted into the running server at
+        // all. There is no stronger local evidence available — the listing carries
+        // no sizes or hashes to distinguish them — so this stays the last-resort
+        // rescue it was built as, and the log says what it actually established
+        // rather than implying the directory was proven live.
+        //
+        // Refusing on that doubt would be worse: it would reject the ordinary
+        // Docker/data-dir layout this rescue exists to serve. What it must not do
+        // is let a later reader take "corroborated" for "verified".
+        logger.info(
+          "Corroborated the configured base against the running server's model inventory " +
+            "(filename match — evidence that this base is one of the roots the server reads, " +
+            "not proof that it is)",
+          {
+            modelsDir,
+            category: inventory.category,
+            matched: inventory.matched,
+            listed: inventory.listed,
+            partial: inventory.matched < inventory.listed,
+            basis: "filename-inventory",
+          },
+        );
+        return { modelsDir, baseDirs: [...baseDirs], snapshot, source };
+      }
       throw new ValidationError(
         "The models directory of the CONNECTED ComfyUI could not be determined, so a " +
           "download has no verified destination. What could not be determined:\n" +
@@ -472,11 +819,12 @@ export async function resolveModelsDirWithBases(): Promise<{
           `  - the OS process table did not identify an interpreter for the ComfyUI listening on ${config.resolvedPort} that sits inside an install tree${live.observedPython ? ` (observed "${live.observedPython}")` : ""};\n` +
           `  - ${
             base
-              ? `the configured local base "${base}" corroborates neither reading of that path: it does not contain "${join(live.relDir, "main.py")}" (the ComfyUI Desktop / launcher-root shape), and it is not itself "${live.relDir}" holding "main.py" (the portable shape where COMFYUI_PATH already points at the ComfyUI directory) — so it is a DIFFERENT install than the one that is running`
+              ? `the configured local base "${base}" corroborates neither reading of that path: it does not contain "${join(live.relDir, "main.py")}" (the ComfyUI Desktop / launcher-root shape), and it is not itself "${live.relDir}" holding "main.py" (the portable shape where COMFYUI_PATH already points at the ComfyUI directory) — so that check did NOT corroborate it, which is not the same as establishing it is a different install (a Docker/data-dir base legitimately has no main.py at all, #851)`
               : "no COMFYUI_PATH or default workspace is configured"
           }.\n` +
+          `  - asking the running server what models it can SEE did not corroborate it either: ${inventory.reason} (this is the check that covers a Docker/data-dir COMFYUI_PATH, which holds models/ but no main.py).\n` +
           "Refusing to write to a guessed directory (that is how a model lands in a stale install and is reported as a success). " +
-          "Fix by launching ComfyUI with an ABSOLUTE --base-directory, or set COMFYUI_PATH to the install that is actually running.",
+          "Fix by launching ComfyUI with an ABSOLUTE --base-directory, or set COMFYUI_PATH to the directory whose models/ the server actually reads.",
       );
     } else if (base) {
       modelsDir = resolve(base, "models");

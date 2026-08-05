@@ -25,6 +25,10 @@ import { join, resolve } from "node:path";
 const h = vi.hoisted(() => ({
   config: { comfyuiPath: "/comfy" as string | undefined },
   isRemoteMode: false,
+  /** Whether the configured base corroborates the server's relative `main.py`. True for
+   *  every pre-existing test; the #851 case is precisely the one where it does NOT (a
+   *  Docker data dir holds no main.py), which is what reaches the inventory rescue. */
+  baseHasEntrypoint: true,
 }));
 vi.mock("../../config.js", () => ({
   config: h.config,
@@ -33,12 +37,22 @@ vi.mock("../../config.js", () => ({
 
 // resolveModelsDirWithBases consults existsSync only for an argv-derived live root;
 // not exercised here (base-directory / fallback paths). Default false.
-vi.mock("node:fs", () => ({ existsSync: () => false }));
+// `statSync` backs the #851 inventory rescue's `<base>/models` probe. Reporting it as a
+// directory is what lets the rescue get as far as asking the server, which is the wiring
+// the test below pins; the per-entry probes are irrelevant here because the listing is
+// never satisfied.
+vi.mock("node:fs", () => ({
+  existsSync: () => false,
+  statSync: () => ({ isDirectory: () => true, isFile: () => false }),
+}));
 
 const getSystemStats = vi.fn();
+/** Shared so a test can see WHICH category the #851 inventory rescue asked about — the
+ *  wiring that carries the download's own target category down to it. */
+const fetchApi = vi.fn(async () => ({ ok: false, status: 404, json: async () => ({}) }));
 vi.mock("../../comfyui/client.js", () => ({
   getSystemStats: (...a: unknown[]) => getSystemStats(...a),
-  getClient: () => ({ fetchApi: vi.fn() }),
+  getClient: () => ({ fetchApi: (...a: unknown[]) => fetchApi(...(a as [])) }),
 }));
 
 // Two injected root sources:
@@ -84,7 +98,7 @@ vi.mock("../../services/workspace-env.js", async () => {
     // configured base IS the live install here (it holds the `main.py` the server
     // reported), so the corroborated base-anchored fallback applies — the guard
     // scenarios below are unchanged by #369's refusal path.
-    hasComfyUIEntrypoint: () => true,
+    hasComfyUIEntrypoint: () => h.baseHasEntrypoint,
     resolveLiveServerRoot: (argv?: string[], cwd?: string) => {
       const root = actual.liveRootFromArgv(argv, cwd);
       return {
@@ -122,6 +136,7 @@ function symlinkTo(linkDir: string, realTarget: string): void {
 beforeEach(() => {
   h.config.comfyuiPath = COMFYUI_PATH;
   h.isRemoteMode = false;
+  h.baseHasEntrypoint = true;
   getSystemStats.mockReset();
   getExtraModelRootsMock.mockReset().mockResolvedValue([]);
   // Fail-closed default: no authoritative live roots (nothing authorizes an escape).
@@ -442,5 +457,51 @@ describe("(c) P0b — the PRIMARY models root itself must not be a code director
     await expect(resolveModelSubfolderPreferServer("checkpoints")).rejects.toThrow(
       /code directory/i,
     );
+  });
+});
+
+describe("(d) #851 — the inventory rescue is asked about THIS download's category", () => {
+  it("carries the caller's target category down to the corroboration", async () => {
+    // The wiring, not the rule. The rescue can only corroborate the folder actually being
+    // written to — a match on a sibling category would authorize the whole models root
+    // for a category the server may read from somewhere else entirely. If the download
+    // path stops passing its own category, the rescue silently starts answering a
+    // different question, and nothing else in the system would notice.
+    //
+    // This shape is the #851 report: relative `main.py`, no cwd, and a base that holds no
+    // main.py, so the code-layout corroboration cannot apply and the rescue is reached.
+    getSystemStats.mockResolvedValue({ system: { argv: ["python", "main.py"] } });
+    h.baseHasEntrypoint = false; // a data dir: no main.py, so only the rescue can apply
+    fetchApi.mockClear();
+
+    await resolveModelSubfolderPreferServer("loras/sdxl").catch(() => undefined);
+
+    // Exactly the caller's CATEGORY (not the full subfolder, not a sweep).
+    expect(fetchApi.mock.calls.map((c) => c[0])).toEqual(["/models/loras"]);
+  });
+
+  it("derives the category from the NORMALIZED subfolder, not its first raw segment", async () => {
+    // `target_subfolder` accepts equivalent spellings. `loras/../checkpoints` writes to
+    // `checkpoints` while its raw first segment is `loras` — so corroborating `loras`
+    // (whose listing may well match) would authorize a `checkpoints` destination nothing
+    // vouched for. The sibling-category hole, re-opened through a spelling.
+    getSystemStats.mockResolvedValue({ system: { argv: ["python", "main.py"] } });
+    h.baseHasEntrypoint = false;
+    fetchApi.mockClear();
+
+    await resolveModelSubfolderPreferServer("loras/../checkpoints").catch(() => undefined);
+
+    expect(fetchApi.mock.calls.map((c) => c[0])).toEqual(["/models/checkpoints"]);
+  });
+
+  it("asks about NOTHING when the subfolder escapes the models root", async () => {
+    // An escaping spelling gets no category at all, so no rescue can corroborate
+    // anything; the containment check refuses it immediately after.
+    getSystemStats.mockResolvedValue({ system: { argv: ["python", "main.py"] } });
+    h.baseHasEntrypoint = false;
+    fetchApi.mockClear();
+
+    await expect(resolveModelSubfolderPreferServer("../outside")).rejects.toThrow();
+    expect(fetchApi.mock.calls.map((c) => c[0])).not.toContain("/models/..");
   });
 });

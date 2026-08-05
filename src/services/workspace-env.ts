@@ -103,45 +103,72 @@ export function getSavedDefaultWorkspaceSync(): string | undefined {
 }
 
 /**
- * The SINGLE source of truth for the effective LOCAL ComfyUI base directory used
- * by every filesystem-backed tool (download_model, verify_custom_node, model
- * lookups, apply_manifest's adoption). Resolution order, applied consistently so
- * the tools never disagree about where ComfyUI lives when COMFYUI_PATH is unset:
+ * QUESTION 1 — "where is a ComfyUI install on THIS machine?"
+ *
+ * Answers only that. It says nothing about whether the current session is pointed at
+ * that install, and callers must not read it as though it did.
  *
  *   1. config.comfyuiPath — COMFYUI_PATH env or auto-detection (wins).
- *   2. When NOT targeting a remote ComfyUI, the saved DEFAULT WORKSPACE
- *      (set via workspace action:"set_default") — this is what workspace action:"get" /
- *      get_environment already report, so local downloads / model lookups /
- *      node verification work without COMFYUI_PATH.
+ *   2. the saved DEFAULT WORKSPACE (workspace action:"set_default").
  *
- * Never returns a local workspace in remote mode (that dir isn't the remote
- * target; remote-mode callers route through ComfyUI-Manager instead). Returns
- * undefined when no usable local path exists — callers then either detect a live
- * server base dir (/system_stats) or emit a clear, actionable error.
+ * Use this ONLY where the operation is about the local machine as such and the caller
+ * has established the session mode itself (panel installation is the real example: the
+ * panel lives in the local install, and its callers gate on `isLocalMode()` first).
+ */
+export function resolveLocalWorkspaceBase(): string | undefined {
+  return config.comfyuiPath ?? getSavedDefaultWorkspaceSync();
+}
+
+/**
+ * QUESTION 2 — "which install does THIS OPERATION act on?"
+ *
+ * The single source of truth for every filesystem-backed tool (download_model,
+ * verify_custom_node, model lookups, extra-paths, comfy-cli, apply_manifest's
+ * adoption). Returns undefined whenever the session is NOT pointed at a local install,
+ * because then no directory on this machine is the thing being operated on.
+ *
+ * The two questions used to share one answer, and that is #490: this function returned
+ * `config.comfyuiPath` BEFORE looking at the mode, so a remote `--comfyui-url` session
+ * with a stale local COMFYUI_PATH — the ordinary local configuration — was handed that
+ * unrelated local install as "the target". Its own docstring promised the opposite. A
+ * read-only caller got a wrong answer about the wrong tree; `comfy-cli uninstall` and
+ * named-snapshot save DELETED FROM and WROTE INTO an install nobody had asked about,
+ * while their replies talked only about the remote server. That is the #369 harm class,
+ * and it survived being closed once because the comment claimed the guarantee the code
+ * did not implement.
+ *
+ * SCOPE, stated precisely because an overclaiming comment is how this survived being
+ * closed once: this refuses in REMOTE (`--comfyui-url`) mode. It does NOT refuse in
+ * CLOUD mode (`isCloudMode()`, an API key), where the serving ComfyUI is equally not
+ * this machine and the same wrong-install hazard exists in principle. That variant is
+ * unfixed here and is not claimed to be fixed. Cloud is diverted at the client layer
+ * (`comfyui/client.ts`) rather than at this resolver, so it is a different seam and
+ * wants its own change; `isLocalMode()` is the check it would use.
+ *
+ * Returns undefined when no usable local target exists — callers then either detect a
+ * live server base dir (/system_stats) or emit a clear, actionable error. They must not
+ * substitute a local path of their own; doing so re-creates the bug one level up.
  */
 export function resolveEffectiveComfyUIBase(): string | undefined {
-  if (config.comfyuiPath) return config.comfyuiPath;
   if (isRemoteMode()) return undefined;
-  return getSavedDefaultWorkspaceSync();
+  return resolveLocalWorkspaceBase();
 }
 
 /**
  * The install root a LOCAL, DESTRUCTIVE operation may act on — or the reason it
  * must not act at all.
  *
- * `resolveEffectiveComfyUIBase()` returns `config.comfyuiPath` BEFORE it consults
- * remote mode, so with `--comfyui-url` set against a remote server and a stale
- * local `COMFYUI_PATH`, it hands back a local install that has nothing to do with
- * the server the session is talking to. Reading is survivable there; DELETING is
- * not — the Manager pre/post checks address the remote instance while the file
- * operations land on an unrelated local tree (#490, reopened).
+ * This began as a workaround for #490: `resolveEffectiveComfyUIBase()` used to
+ * return `config.comfyuiPath` BEFORE consulting remote mode, so with
+ * `--comfyui-url` and a stale local `COMFYUI_PATH` it handed back an install with
+ * nothing to do with the connected server. Reading through that is survivable;
+ * DELETING through it is not.
  *
- * Fixing that resolver is a separate change: it has twelve callers and at least
- * one (`comfy-cli.ts`) reads `config.comfyuiPath ?? resolveEffectiveComfyUIBase()`
- * in a way that suggests it depends on today's behaviour. So this does not fix
- * it — it REFUSES on top of it. An honest "I cannot tell which install this would
- * modify" beats modifying the wrong one, and refusing is the right shape here
- * because nothing has happened yet.
+ * That resolver is now fixed (it checks remote mode first), so this is no longer
+ * the only thing standing between a destructive path and the wrong tree. It stays
+ * because it answers a question `undefined` cannot: WHY there is no target. A
+ * caller that must refuse needs to tell the user whether the install is missing or
+ * merely unreachable from here, and those have different remedies.
  */
 export function resolveLocalMutationTarget():
   | { base: string; refusal?: undefined }
@@ -1169,19 +1196,51 @@ export async function resolveInstallInterpreter(
   );
 }
 
+/**
+ * `pip show` output for the packages we care about, plus WHETHER THE QUERY RAN.
+ *
+ * An empty map has two causes that a caller must not confuse: pip answered and none of
+ * these packages are installed, or pip never answered at all (absent from this
+ * interpreter — common in uv-created venvs — or the probe timed out). Reporting the
+ * second as the first invents a capability finding.
+ *
+ * The discriminator has to come from THIS invocation. A follow-up `pip --version` was
+ * the obvious shortcut and is wrong: it shows that pip can start NOW, which is not
+ * evidence that the query that already failed ever ran — a `pip show` killed by the 8s
+ * timeout would be vouched for by a fast `pip --version` and its silence read as "none
+ * installed". So `ran` requires POSITIVE evidence in pip's own output that pip looked:
+ * a parsed record, or pip's own `WARNING: Package(s) not found: …`. Anything else —
+ * pip absent, python itself failing, the probe killed, or that wording changing in some
+ * future pip — is `ran: false`, i.e. "we could not tell", which is the safe direction.
+ *
+ * `probe()` is deliberately NOT used here. It discards everything on a non-zero exit,
+ * and `pip show a b c` exits 1 whenever ANY named package is missing — which, with
+ * xformers and diffusers in the list, is the ordinary state of a real machine. That
+ * silently threw away the records for the packages pip DID find (torch among them) and
+ * left `packages` empty, so `get_environment` reported no packages on installs that had
+ * them. A non-zero exit here is a completed run whose output must still be read.
+ */
 async function probePipPackages(
   pythonExe: string,
   names: string[],
-): Promise<Record<string, string>> {
+): Promise<{ ran: boolean; packages: Record<string, string> }> {
   // `pip show` is portable across pip/uv-managed venvs.
   const found: Record<string, string> = {};
-  const out = await probe(pythonExe, [
-    "-m",
-    "pip",
-    "show",
-    ...names,
-  ]);
-  if (!out) return found;
+  let out = "";
+  try {
+    const res = await execFileAsync(pythonExe, ["-m", "pip", "show", ...names], {
+      timeout: 8000,
+      windowsHide: true,
+    });
+    out = `${res.stdout ?? ""}\n${res.stderr ?? ""}`;
+  } catch (err) {
+    // promisified execFile rejects on a non-zero exit but attaches the output it did
+    // collect. Read it: a partial match lives there, and so does pip's not-found
+    // warning. A spawn failure or a kill simply leaves both undefined.
+    const e = err as { stdout?: unknown; stderr?: unknown };
+    const parts = [e?.stdout, e?.stderr].filter((s): s is string => typeof s === "string");
+    out = parts.join("\n");
+  }
   // `pip show A B C` emits records separated by a line of "---".
   for (const block of out.split(/^---$/m)) {
     const nameMatch = block.match(/^Name:\s*(.+)$/m);
@@ -1190,7 +1249,14 @@ async function probePipPackages(
       found[nameMatch[1].trim().toLowerCase()] = verMatch[1].trim();
     }
   }
-  return found;
+  // A parsed record IS pip speaking, so the run is self-evident. With none, only pip's
+  // own not-found warning proves it looked — and it has to be pip's STRUCTURED line,
+  // anchored at the start of a line with the WARNING prefix and trailing colon. A bare
+  // substring match would be satisfied by any traceback or wrapper message that merely
+  // quotes the phrase, and that would license the "none of these are installed" claim
+  // off a `pip show` that never ran.
+  if (Object.keys(found).length > 0) return { ran: true, packages: found };
+  return { ran: /^\s*WARNING:\s*Package\(s\) not found:/im.test(out), packages: found };
 }
 
 async function probeGitRev(
@@ -1428,12 +1494,34 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
         `we did not launch this ComfyUI and could not read the interpreter of the ` +
         `process serving port ${config.resolvedPort} from the OS${deployed}. Package ` +
         `versions are omitted rather than attributed to the wrong environment`;
+    } else if (!runningPy) {
+      // NOT a mismatch. `pythonVersionsAgree` returns false when EITHER side is missing,
+      // so this used to fall into the branch below and report "does not match the running
+      // ComfyUI python (unreported)" — asserting a disagreement that was never observed.
+      // One verdict, two causes; the message picked the wrong one. Say which happened.
+      if (groundTruth.source === "launched-by-us") {
+        // Nothing to cross-check against, and nothing that needs cross-checking: we
+        // CHOSE this interpreter and spawned the process, and its PID + creation time
+        // still match. Refusing here would be the opposite error — withholding a package
+        // list we genuinely know, because a corroboration we never needed was missing.
+        trusted = true;
+        reason =
+          `this MCP server launched ComfyUI (PID ${groundTruth.pid}) with this exact ` +
+          `interpreter. The running ComfyUI did not report its own python version, so no ` +
+          `cross-check was possible — none is needed, the interpreter is the one we chose`;
+      } else {
+        reason =
+          `the observed interpreter (${groundTruth.source}) reports python ${shortVer}, but ` +
+          `the running ComfyUI did not report a python version of its own, so the two could ` +
+          `NOT be compared. That is an unverified match, not a mismatch — refusing to ` +
+          `attribute this interpreter's packages to the server on an unmade comparison`;
+      }
     } else if (!pythonVersionsAgree(ver, runningPy)) {
       // We DID observe the interpreter, yet it disagrees with the running server.
       // Something is off (a stale PID, a wrapper); report unknown, not a wrong list.
       reason =
         `the observed interpreter (${groundTruth.source}) reports python ${shortVer}, which ` +
-        `does not match the running ComfyUI python ${runningPy ?? "(unreported)"} — ` +
+        `does not match the running ComfyUI python ${runningPy} — ` +
         `refusing to attribute its packages to the server`;
     } else {
       trusted = true;
@@ -1450,8 +1538,30 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
     let pkgs: Record<string, string> | undefined;
 
     if (trusted && probeExe) {
-      pkgs = await probePipPackages(probeExe, KEY_PACKAGES);
-      if (Object.keys(pkgs).length > 0) local.packages = pkgs;
+      const probed = await probePipPackages(probeExe, KEY_PACKAGES);
+      pkgs = probed.packages;
+      if (Object.keys(pkgs).length > 0) {
+        local.packages = pkgs;
+      } else {
+        // An absent `packages` field otherwise reads identically to the deliberate
+        // withholding below, and a reader would take it as "none of these are
+        // installed". Which of the two actually happened is knowable, so say which —
+        // narrating one cause for both would be the same fold this fix is about.
+        local.note = [
+          local.note,
+          probed.ran
+            ? `No package versions to report from ${probeExe}: pip answered and none of ` +
+              `${KEY_PACKAGES.join(", ")} are installed in it. The interpreter IS trusted ` +
+              `(${reason}), so this IS an observation — not a failed query.`
+            : `Package versions could not be READ from ${probeExe}: pip did not answer at ` +
+              `all (it may be absent from this interpreter — uv-created venvs often have ` +
+              `no pip — or the probe timed out). The interpreter itself IS trusted ` +
+              `(${reason}); the empty list is a failed query, NOT evidence that these ` +
+              `packages are missing.`,
+        ]
+          .filter(Boolean)
+          .join(" ");
+      }
     } else {
       local.note = [
         local.note,

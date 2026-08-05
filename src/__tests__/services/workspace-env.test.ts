@@ -91,6 +91,8 @@ import {
   liveRootFromArgv,
   liveScriptFromArgv,
   resolveComfyuiPython,
+  resolveEffectiveComfyUIBase,
+  resolveLocalWorkspaceBase,
   resolveInstallInterpreter,
   resolveLiveComfyUIBase,
   resolveLiveServerRoot,
@@ -585,6 +587,67 @@ describe("listWorkspaces", () => {
 // get_environment
 // ---------------------------------------------------------------------------
 
+describe("resolveEffectiveComfyUIBase vs resolveLocalWorkspaceBase (#490)", () => {
+  // Two different questions that shared one answer. "Where is the user's local install?"
+  // was being read as "which install does this operation act on?", and the resolver
+  // returned config.comfyuiPath BEFORE looking at the mode — so a remote session with a
+  // stale local COMFYUI_PATH (the ordinary local configuration) got that unrelated
+  // install as its target. Read-only callers got a wrong answer; comfy-cli uninstall and
+  // named-snapshot save acted on it.
+  it("does NOT return COMFYUI_PATH as the operation target in remote mode", async () => {
+    const dir = await tmpDir();
+    try {
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      mockConfig.comfyuiPath = dir; // a stale local path, exactly as reported
+      h.remoteMode.value = true;
+
+      expect(resolveEffectiveComfyUIBase()).toBeUndefined();
+      // …while the LOCAL-machine question still answers, because that is a different
+      // question and a legitimate one. Collapsing them is the bug; deleting one is not
+      // the fix.
+      expect(resolveLocalWorkspaceBase()).toBe(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still returns COMFYUI_PATH as the target in a local session", async () => {
+    // The over-strict direction would be its own bug: every filesystem-backed tool
+    // depends on this answer.
+    const dir = await tmpDir();
+    try {
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      mockConfig.comfyuiPath = dir;
+      h.remoteMode.value = false;
+
+      expect(resolveEffectiveComfyUIBase()).toBe(dir);
+      expect(resolveLocalWorkspaceBase()).toBe(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls through to the saved default workspace locally, and refuses it remotely", async () => {
+    const dir = await tmpDir();
+    const install = join(dir, "Saved");
+    await mkdir(install, { recursive: true });
+    try {
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      await setDefaultWorkspace(install);
+      mockConfig.comfyuiPath = undefined;
+
+      h.remoteMode.value = false;
+      expect(resolveEffectiveComfyUIBase()).toBe(install);
+
+      h.remoteMode.value = true;
+      expect(resolveEffectiveComfyUIBase()).toBeUndefined();
+      expect(resolveLocalWorkspaceBase()).toBe(install);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("getEnvironment", () => {
   it("reports running instance from system_stats and degrades local probes when no path", async () => {
     const dir = await tmpDir();
@@ -892,6 +955,225 @@ describe("getEnvironment", () => {
       expect(env.local.python_probe_trusted).toBe(false);
       expect(env.local.packages).toBeUndefined();
       expect(env.local.python_probe_reason).toMatch(/does not match the running ComfyUI python/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("says the comparison could NOT BE MADE, not that it failed, when the server reports no python", async () => {
+    // `pythonVersionsAgree` returns false when EITHER side is missing, so an unreported
+    // server python fell into the mismatch branch and the reason read "does not match the
+    // running ComfyUI python (unreported)" — asserting a disagreement nobody observed.
+    // One verdict, two causes, and the message named the wrong one; a user reading it
+    // would go hunting for a version conflict that does not exist.
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      mockGetSystemStats.mockResolvedValueOnce({
+        system: { os: "nt", comfyui_version: "0.27.1", embedded_python: false, argv: [] },
+        devices: [],
+      });
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 77 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.13.12\n" };
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 9.9.9\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      // Still fail-closed — an unverified match is not a verified one.
+      expect(env.local.python_probe_trusted).toBe(false);
+      expect(env.local.packages).toBeUndefined();
+      // …but the REASON must describe what actually happened. Asserting only the state
+      // would pass on the old, wrong message too.
+      expect(env.local.python_probe_reason).toMatch(/could\s+NOT be compared/);
+      expect(env.local.python_probe_reason).toMatch(/unverified match, not a mismatch/);
+      expect(env.local.python_probe_reason).not.toMatch(/does not match the running/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("trusts a launched-by-us interpreter even when no cross-check was possible", async () => {
+    // The other direction. We CHOSE this interpreter and spawned the process; a
+    // corroboration we never needed being unavailable is not a reason to withhold a
+    // package list we genuinely know.
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      mockGetSystemStats.mockResolvedValueOnce({
+        system: { os: "nt", comfyui_version: "0.27.1", embedded_python: false, argv: [] },
+        devices: [],
+      });
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "launched-by-us", pid: 78 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.13.12\n" };
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 2.9.0\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python_probe_trusted).toBe(true);
+      expect(env.local.packages?.torch).toBe("2.9.0");
+      expect(env.local.python_probe_reason).toMatch(/no\s+cross-check was possible/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("distinguishes 'pip answered, nothing installed' from 'pip never answered'", async () => {
+    // An empty package map has two causes and the note used to assert one of them. On a
+    // uv-created venv — which frequently has NO pip at all — the "pip did not answer"
+    // case is the common one, and calling it "none of these are installed" would be a
+    // false capability report of exactly the kind #401 is about.
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      statsReachable("3.13.12");
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 12 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") && !args.includes("pip")) {
+          return { stdout: "Python 3.13.12\n" };
+        }
+        // pip's OWN full-miss output, from the SAME invocation. It EXITS 1 and warns on
+        // stderr, so the rejection carries the evidence — a separate later
+        // `pip --version` would prove only that pip can start now, never that this
+        // query ran.
+        if (args.includes("pip")) {
+          return Object.assign(new Error("Command failed: exit 1"), {
+            stdout: "",
+            stderr: "WARNING: Package(s) not found: torch, numpy\n",
+          });
+        }
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python_probe_trusted).toBe(true);
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.note).toMatch(/pip answered and none of/);
+      expect(env.local.note).not.toMatch(/did not answer at all/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("says the query FAILED when pip itself does not answer (uv venvs often have no pip)", async () => {
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      statsReachable("3.13.12");
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 13 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") && !args.includes("pip")) {
+          return { stdout: "Python 3.13.12\n" };
+        }
+        if (args.includes("pip")) return new Error("No module named pip");
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.note).toMatch(/pip did not answer at all/);
+      expect(env.local.note).toMatch(/NOT evidence that these packages are missing/);
+      expect(env.local.note).not.toMatch(/pip answered and none of/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the packages pip DID find when other requested ones are missing", async () => {
+    // `pip show a b c` exits 1 whenever ANY name is missing, and KEY_PACKAGES contains
+    // xformers and diffusers — absent on most real machines. The shared `probe()` helper
+    // discards everything on a non-zero exit, so the records pip HAD produced (torch
+    // among them) were thrown away and get_environment reported no packages at all on
+    // installs that plainly had them.
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      statsReachable("3.13.12");
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 15 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") && !args.includes("pip")) {
+          return { stdout: "Python 3.13.12\n" };
+        }
+        if (args.includes("pip")) {
+          return Object.assign(new Error("Command failed: exit 1"), {
+            stdout: "Name: torch\nVersion: 2.9.0\n---\nName: numpy\nVersion: 2.1.0\n",
+            stderr: "WARNING: Package(s) not found: xformers, diffusers\n",
+          });
+        }
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.packages?.torch).toBe("2.9.0");
+      expect(env.local.packages?.numpy).toBe("2.1.0");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not accept a stray mention of the phrase as pip's not-found warning", async () => {
+    // The evidence has to be pip's STRUCTURED line. A traceback or wrapper that merely
+    // quotes "Package(s) not found" would otherwise license the "none of these are
+    // installed" claim off a `pip show` that never ran.
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      statsReachable("3.13.12");
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 16 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") && !args.includes("pip")) {
+          return { stdout: "Python 3.13.12\n" };
+        }
+        if (args.includes("pip")) {
+          return Object.assign(new Error("Command failed: exit 1"), {
+            stdout: "",
+            stderr:
+              "Traceback (most recent call last):\n" +
+              '  File "<frozen importlib>", line 1, in <module>\n' +
+              "RuntimeError: broken plugin said Package(s) not found somewhere\n",
+          });
+        }
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.note).toMatch(/pip did not answer at all/);
+      expect(env.local.note).not.toMatch(/pip answered and none of/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not treat a KILLED pip show as a completed no-match", async () => {
+    // The shortcut this replaced: `pip show` dies on the 8s timeout, a follow-up
+    // `pip --version` answers instantly, and the silence of the FIRST query gets
+    // vouched for by the SECOND — reporting "none of these are installed" about a
+    // question that was never answered. Only evidence inside the failed invocation
+    // itself can settle it, and there is none here.
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      statsReachable("3.13.12");
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 14 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") && !args.includes("pip")) {
+          return { stdout: "Python 3.13.12\n" };
+        }
+        // `pip show` killed by the timeout: no output at all, no warning.
+        if (args.includes("show")) return new Error("Command failed: timed out, SIGTERM");
+        // A LATER `pip --version` would succeed — and must not be consulted.
+        if (args.includes("pip")) return { stdout: "pip 24.0 from …\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.note).toMatch(/pip did not answer at all/);
+      expect(env.local.note).not.toMatch(/pip answered and none of/);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -1444,9 +1726,15 @@ describe("resolveLocalMutationTarget — refuses what it cannot identify", () =>
     h.remoteMode.value = true;
     h.mockConfig.comfyuiPath = "/stale/local/ComfyUI";
 
-    // The bug, pinned: the shared resolver still hands back the stale local path.
-    expect(resolveEffectiveComfyUIBase()).toBe("/stale/local/ComfyUI");
-    // …and the mutation target refuses it, naming why.
+    // #490 IS NOW FIXED (by #835): the shared resolver checks remote mode before
+    // it returns `config.comfyuiPath`, so it no longer hands back a local install
+    // that has nothing to do with the connected server. This assertion used to
+    // pin the bug — it was written to start failing on the day the resolver was
+    // repaired, and it did exactly that on the rebase.
+    expect(resolveEffectiveComfyUIBase()).toBeUndefined();
+    // The mutation target still refuses, and still names why. Now defence in
+    // depth rather than the only defence: a destructive path must be able to say
+    // WHY it will not act, which an `undefined` cannot.
     const target = resolveLocalMutationTarget();
     expect(target.base).toBeUndefined();
     expect(target.refusal).toMatch(/REMOTE ComfyUI/i);

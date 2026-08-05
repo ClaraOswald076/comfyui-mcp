@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { writeFile, mkdir } from "node:fs/promises";
-import { join, basename } from "node:path";
+import { join, basename, isAbsolute, resolve } from "node:path";
+import { tmpdir, homedir } from "node:os";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   extractWorkflowFromImage,
@@ -12,6 +13,84 @@ import {
   stageOutputAsInput,
 } from "../services/image-management.js";
 import { errorToToolResult } from "../utils/errors.js";
+
+/**
+ * Where get_image writes when the caller names no directory (#768).
+ *
+ * It used to be `process.cwd()`, which is not a location this process chose — it is
+ * whatever directory the MCP client happened to launch us from. On Windows that is
+ * routinely `C:\Windows\System32`, and the write died with EPERM *after* the image had
+ * already been fetched. The schema had always DOCUMENTED `/tmp/comfyui-images/`; the
+ * string existed nowhere in the code, and `/tmp` is not a real directory on Windows
+ * anyway. `os.tmpdir()` is the platform-correct, process-writable spelling of the same
+ * promise (`%LOCALAPPDATA%\Temp` on Windows, `/tmp` on Linux, `$TMPDIR` on macOS).
+ *
+ * Computed per call rather than at module load so a test (or a caller) that repoints
+ * TMPDIR/TEMP is honoured instead of being silently pinned to the value at import time.
+ *
+ * `os.tmpdir()` returns %TEMP%/%TMP%/$TMPDIR verbatim, and nothing guarantees those are
+ * usable as a launch-independent base. Merely `resolve()`-ing a bad one would anchor it
+ * to the MCP process's cwd and land us straight back in System32, so an unqualified
+ * tmpdir is not used at all: `os.homedir()` is always fully qualified and always writable
+ * by us, and the whole point of this function is to name a directory that does not depend
+ * on where we were launched.
+ */
+export function defaultImageSaveDir(): string {
+  const tmp = tmpdir();
+  return resolve(isFullyQualified(tmp) ? tmp : homedir(), "comfyui-images");
+}
+
+/**
+ * Is this path independent of the process's current directory — INCLUDING its drive?
+ *
+ * `path.isAbsolute` is not that test on Windows. It answers true for `\Temp`, which is
+ * DRIVE-RELATIVE: `resolve("\\Temp", …)` picks up whatever drive the cwd happens to be
+ * on, so `TEMP=\Windows\System32` reproduces the very failure #768 is about on a
+ * C:-launched process. Only a drive-qualified path (`C:\…`) or a UNC path
+ * (`\\server\share\…`) is genuinely launch-independent.
+ */
+function isFullyQualified(p: string | undefined): boolean {
+  if (!p) return false;
+  if (process.platform !== "win32") return isAbsolute(p);
+  return /^[a-zA-Z]:[\\/]/.test(p) || /^[\\/]{2}[^\\/]/.test(p);
+}
+
+/**
+ * Turn the caller's `save_dir` into an ABSOLUTE destination directory.
+ *
+ * Omitted → the documented default. A relative value keeps its historical meaning
+ * (resolved against this process's cwd — the issue asked for explicit `save_dir`
+ * behaviour to be left alone) but is resolved EAGERLY, so every path this tool reports
+ * back is absolute. A bare relative `savePath` echoed to an agent is unreadable
+ * evidence: it names a different file depending on who reads it.
+ */
+/**
+ * A Windows path whose final location depends on state this process did not state.
+ * Two spellings, and they are unresolved differently:
+ *
+ *   `\out`, `/out`  — rooted but drive-less. `isAbsolute` says true; `resolve()` supplies
+ *                     the CURRENT drive, so it lands on C: or D: by where we launched.
+ *   `C:out`, `D:out` — drive-qualified but rooted-less. `isAbsolute` says FALSE, so it
+ *                     used to be described as "resolved against this process's working
+ *                     directory" — which is not what happens: Windows keeps a working
+ *                     directory PER DRIVE, and `resolve()` uses the named drive's, which
+ *                     need not be ours at all. The old message named the wrong base.
+ *
+ * Neither is refused. Both are legal Windows spellings the caller typed, and refusing a
+ * real request is its own bug — the hazard is silence, not the path. They are DISCLOSED:
+ * the returned `Saved to:` line is always fully qualified, and a failure message says the
+ * missing piece came from process state rather than from the argument.
+ */
+function isDriveRelative(p: string): boolean {
+  if (process.platform !== "win32") return false;
+  return /^[\\/](?![\\/])/.test(p) || /^[a-zA-Z]:(?![\\/])/.test(p);
+}
+
+export function resolveImageSaveDir(saveDir: string | undefined): string {
+  const raw = saveDir?.trim();
+  if (!raw) return defaultImageSaveDir();
+  return isAbsolute(raw) ? resolve(raw) : resolve(process.cwd(), raw);
+}
 
 export function registerImageManagementTools(server: McpServer): void {
   // ── get_image ────────────────────────────────────────────────────────────
@@ -42,7 +121,14 @@ export function registerImageManagementTools(server: McpServer): void {
         .string()
         .optional()
         .describe(
-          "Local directory to save the image file. Defaults to /tmp/comfyui-images/.",
+          "Absolute local directory to save the file in. Defaults to a " +
+            "'comfyui-images' folder inside the platform temp directory " +
+            "(os.tmpdir()), which is created if missing. A RELATIVE value is " +
+            "resolved against this MCP process's working directory, which is the " +
+            "client's choice and may not be writable. On Windows a drive-less path " +
+            "like \\out is resolved against this process's CURRENT DRIVE, not a drive " +
+            "you chose. Prefer a fully-qualified path (C:\\... or \\\\server\\share); " +
+            "the returned 'Saved to:' line always names the resolved absolute path.",
         ),
     },
     async (args) => {
@@ -54,15 +140,79 @@ export function registerImageManagementTools(server: McpServer): void {
           { allowMedia: true },
         );
 
-        // Save to local file
-        const saveDir = args.save_dir ?? process.cwd();
-        await mkdir(saveDir, { recursive: true });
+        // The bytes are already in hand at this point. Saving them is a SEPARATE
+        // operation that can fail on its own (EPERM/EACCES/ENOSPC/read-only volume),
+        // and its failure says nothing about the fetch. Reporting the whole call as an
+        // error there threw away a successfully retrieved image and invited a retry of
+        // the fetch that could never fix the disk problem (#768) — so the save is
+        // isolated and its outcome is DISCLOSED rather than allowed to fail the tool.
+        //
+        // RESOLUTION is inside the guarded region, not before it: `resolveImageSaveDir`
+        // calls `process.cwd()` for a relative save_dir, and cwd itself throws ENOENT
+        // when the launch directory has been deleted underneath us. Left outside, that
+        // throw would reach the outer catch and discard the fetched image — the same
+        // loss this block exists to prevent, one line earlier.
+        //
+        // `explicitDir` is the TRIMMED value actually used for resolution, so the
+        // message can never describe a whitespace-only save_dir as a directory the
+        // caller named (resolveImageSaveDir treats it as omitted).
+        const explicitDir = args.save_dir?.trim() || undefined;
         const localFilename = basename(args.filename);
-        const savePath = join(saveDir, localFilename);
-        await writeFile(savePath, Buffer.from(base64, "base64"));
+        let savePath: string | undefined;
+        let saveError: string | undefined;
+        try {
+          const saveDir = resolveImageSaveDir(args.save_dir);
+          savePath = join(saveDir, localFilename);
+          await mkdir(saveDir, { recursive: true });
+          await writeFile(savePath, Buffer.from(base64, "base64"));
+        } catch (err) {
+          const detail = err instanceof Error ? err.message : String(err);
+          // A default destination we can still NAME, even if resolution itself failed —
+          // never a remedy the caller cannot act on.
+          let fallbackDefault: string | undefined;
+          try {
+            fallbackDefault = defaultImageSaveDir();
+          } catch {
+            fallbackDefault = undefined;
+          }
+          saveError =
+            `NOT SAVED. The image was fetched from ComfyUI successfully, but ` +
+            (savePath
+              ? `writing it to ${savePath} failed: ${detail}. `
+              : `this process could not even work out where to put it: ${detail}. `) +
+            (explicitDir
+              ? `The destination came from the save_dir argument you passed ` +
+                `("${explicitDir}")` +
+                // Drive-relative is checked FIRST: `C:out` is not `isAbsolute`, so the
+                // generic relative branch would have claimed it resolved against this
+                // process's working directory, when Windows actually uses the named
+                // DRIVE's own working directory. Naming the wrong base is the same
+                // defect as naming the wrong cause.
+                (isDriveRelative(explicitDir)
+                  ? ` — a DRIVE-RELATIVE save_dir, so the part you did not give (the ` +
+                    `drive, or that drive's current directory) came from this process's ` +
+                    `state, not from your argument`
+                  : !isAbsolute(explicitDir)
+                    ? ` — a RELATIVE save_dir, resolved against this process's working directory`
+                    : "") +
+                `. Retry with an absolute save_dir you can write to` +
+                (fallbackDefault ? `, or omit save_dir to use the default ${fallbackDefault}.` : ".")
+              : `That is the default destination${fallbackDefault ? ` (${fallbackDefault})` : ""}. ` +
+                `Retry with an explicit absolute save_dir you can write to.`) +
+            ` Do NOT re-run the render — the output already exists on the server.`;
+        }
 
         // Only images render inline; video/audio are save-to-disk only (#663).
         if (!mimeType.toLowerCase().startsWith("image/")) {
+          // Nothing can be handed back inline for media, so an unsaved fetch really did
+          // deliver nothing — but the message still names the exact destination and a
+          // remedy that works from here, instead of a bare EPERM.
+          if (saveError) {
+            return {
+              content: [{ type: "text" as const, text: `${saveError} (${mimeType})` }],
+              isError: true,
+            };
+          }
           return {
             content: [
               {
@@ -77,7 +227,9 @@ export function registerImageManagementTools(server: McpServer): void {
           content: [
             {
               type: "text" as const,
-              text: `Saved to: ${savePath}`,
+              text: saveError
+                ? `${saveError} The image itself is returned inline below.`
+                : `Saved to: ${savePath}`,
             },
             {
               type: "image" as const,

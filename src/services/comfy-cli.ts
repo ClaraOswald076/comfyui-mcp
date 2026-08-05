@@ -1,19 +1,32 @@
 import * as childProcess from "node:child_process";
 import { existsSync } from "node:fs";
 import { delimiter, dirname, extname, join } from "node:path";
-import { config } from "../config.js";
+import { config, isRemoteMode } from "../config.js";
 import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
 
 /**
- * The LOCAL ComfyUI workspace a comfy-cli invocation should target when the
- * caller passed no explicit `workspace`. Prefers COMFYUI_PATH, then the saved
- * default workspace (set via workspace action:"set_default") when COMFYUI_PATH is unset —
- * so the workspace-venv `comfy` and `--workspace` routing keep working from the
- * saved default without COMFYUI_PATH (#506/#403). Never returns a local path in
- * remote mode (resolveEffectiveComfyUIBase already enforces that).
+ * The ComfyUI install a comfy-cli invocation TARGETS when the caller passed no explicit
+ * `workspace`. That is the operation-target question, and `resolveEffectiveComfyUIBase`
+ * is the only thing that answers it — including its refusal to name a local directory
+ * when the session is pointed somewhere else.
+ *
+ * This used to read `config.comfyuiPath ?? resolveEffectiveComfyUIBase()`, which failed
+ * twice over (#490): the resolver did not yet enforce the mode check this comment
+ * claimed for it, AND the `??` short-circuited past the resolver entirely whenever
+ * COMFYUI_PATH was set — the ordinary local configuration — so fixing the resolver alone
+ * would not have reached here. The two operands answer different questions ("where is
+ * the user's local install" vs "which install does this act on") and the `??` silently
+ * substituted the first for the second.
+ *
+ * It matters most here: this module runs `comfy-cli uninstall` and `comfy-cli disable`.
+ * With a remote `--comfyui-url` session and a stale local COMFYUI_PATH, those commands
+ * ran against the local install while the reply described only the remote server.
+ *
+ * Returning null when nothing is resolvable is the point — callers refuse rather than
+ * guess. Do not reintroduce a fallback here; a `??` at this seam is the bug.
  */
 function defaultWorkspace(): string | null {
-  return config.comfyuiPath ?? resolveEffectiveComfyUIBase() ?? null;
+  return resolveEffectiveComfyUIBase() ?? null;
 }
 
 export interface ComfyCliError {
@@ -274,6 +287,27 @@ export function normalizeComfyCliResult<T = unknown>(
 }
 
 function requireExecutable(options: ComfyCliRunOptions): string {
+  // REFUSE BEFORE RESOLVING, in remote mode (codex gate P0).
+  //
+  // comfy-cli acts on a LOCAL install. With `--comfyui-url` the workspace
+  // resolver now correctly returns nothing — but that is exactly what makes this
+  // dangerous rather than safe: `buildArgs` then omits `--workspace`, the PATH
+  // fallback below still finds a global `comfy`, and the CLI falls back to
+  // WHATEVER workspace it defaults to. `models_remove` therefore deletes models
+  // from some unrelated local install while the session is connected elsewhere.
+  //
+  // "No workspace could be resolved" was being treated as "no workspace will be
+  // used". It is not: it hands the choice to the CLI. This is the one choke-point
+  // both `runComfyCli` and `runComfyCliSync` pass through, which is why the
+  // refusal belongs here — nothing has run at this point.
+  if (isRemoteMode()) {
+    throw new Error(
+      "This session targets a REMOTE ComfyUI (--comfyui-url), and comfy-cli only acts on a " +
+        "LOCAL install — so there is no install here that this session is about. Nothing was " +
+        "run. Run comfy-cli on the machine the install lives on, or point this session at the " +
+        "local install first.",
+    );
+  }
   const executable = resolveComfyCliExecutable({ workspace: options.workspace });
   if (!executable) {
     throw new Error(
@@ -427,6 +461,12 @@ function getExecutableVersion(executable: string): string | null {
 }
 
 export function getComfyCliVersion(options: { workspace?: string | null } = {}): string | null {
+  // Read-only, but it still SPAWNS a local `comfy` (codex gate). In remote mode
+  // there is no local install this session is about, so probing one and reporting
+  // its version would describe a CLI that must never be used from here — and
+  // `isComfyCliUsable` below would then advertise it as available. "Not usable"
+  // is the honest answer, and it is the same answer `requireExecutable` gives.
+  if (isRemoteMode()) return null;
   const executable = resolveComfyCliExecutable({ workspace: options.workspace });
   return executable ? getExecutableVersion(executable) : null;
 }
