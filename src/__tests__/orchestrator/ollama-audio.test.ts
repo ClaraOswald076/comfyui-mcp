@@ -411,6 +411,27 @@ describe("#790 — a later error must not fabricate a delivery failure", () => {
     expect(events.some((e) => e.type === "error")).toBe(true);
   });
 
+  it("an accepted IMAGE is not evidence that audio is accepted", async () => {
+    // One shared latch would let an earlier image swallow a genuine audio
+    // rejection — the silent unheard attachment, hidden by the guard meant to
+    // prevent the opposite mistake.
+    const backend = nativeBackend();
+    await collect(backend, turnsOf({ text: "look", images: [{ filename: "shot.png", type: "input" }] }));
+    rejectNextChatWith = "unsupported media type";
+    const said = assistantText(await collect(backend, turnsOf(AUDIO_TURN)));
+    expect(said).toContain("did NOT hear it");
+  });
+
+  it("an accepted AUDIO turn still suppresses a later unrelated error", async () => {
+    // The other direction of the same rule: once audio HAS been accepted, a
+    // later error must not be reported as an audio rejection.
+    const backend = nativeBackend();
+    await collect(backend, turnsOf(AUDIO_TURN));
+    rejectNextChatWith = "rate limited";
+    const said = assistantText(await collect(backend, turnsOf({ text: "and?" })));
+    expect(said).not.toContain("did NOT hear");
+  });
+
   it("the acceptance proof does NOT survive a model switch", async () => {
     // It is proof about the model that took the media, not about the endpoint
     // forever. Carried across a switch it would swallow the NEW model's

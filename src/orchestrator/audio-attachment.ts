@@ -274,12 +274,16 @@ export const AUDIO_CAPABLE_OLLAMA_MODELS = ["gemma4:e2b", "gemma4:e4b", "nemotro
 /** Refusal text: this backend has no audio content part at all. Names the
  *  providers that DO, so the remedy is reachable from where the user is. */
 export function noAudioPartText(backendId: string, filename: string): string {
+  // The remedy names the ONE provider where audio is capability-checked and
+  // verified. Listing the OpenAI-compatible providers as equals here would send
+  // the user to a path that only *attempts* delivery — a remedy is no use if it
+  // is itself an overclaim.
   return (
     `I can't send ${filename} to the model: the ${backendId} provider has no audio input at all in this ` +
-    `build, so the file would be dropped without either of us noticing. Audio attachments are delivered on ` +
-    `the local Ollama-family providers (ollama / LM Studio / llama.cpp / OpenAI-compatible) — switch ` +
-    `provider and re-send, or ask me to run a ComfyUI audio-analysis node over the file instead and read ` +
-    `you the numbers.`
+    `build, so the file would be dropped without either of us noticing. Switch to the local Ollama provider ` +
+    `with a model that reports audio support (\`ollama pull ${AUDIO_CAPABLE_OLLAMA_MODELS[0]}\`) and ` +
+    `re-send — that path checks the model's capability before sending. Or ask me to run a ComfyUI ` +
+    `audio-analysis node over the file instead and read you the numbers.`
   );
 }
 
