@@ -68,6 +68,19 @@ root** on the pod, so a reconnect picks up where you were instead of starting
 over. Nothing about ai-toolkit itself changes — same unmodified `run.py`, same
 presets. It's the *transport* that's new, not the trainer.
 
+<Note>
+  Since this post was published, 0.50.0 consolidated the eighteen `train_*` tools into
+  three action-parameterized ones, so the names below are the tools **as they shipped
+  at the time**. The work is unchanged; the calls moved. Preflight and setup are now
+  `train_doctor` with `action: "doctor"` / `"build_image"` / `"bootstrap"`. Job
+  lifecycle and discovery are `train_start` with `action: "start"` / `"status"` /
+  `"cancel"` / `"delete"` / `"list_flows"` / `"job_config"` / `"preview_config"`.
+  Datasets are `train_prepare_dataset` with `action: "prepare"` / `"list"` /
+  `"detail"` / `"update"` / `"delete"` / `"file"` / `"caption_image"` /
+  `"caption_dataset"`. Same services, same behaviour — the rest of the post still
+  applies.
+</Note>
+
 ## How to train a FLUX LoRA on RunPod
 
 This is the part that matters: **there is no separate "cloud training" surface to

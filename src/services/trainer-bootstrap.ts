@@ -17,6 +17,7 @@ import {
   nativeToolkitReady,
   resolveAiToolkitDir,
   resolveAiToolkitPython,
+  TRAINER_COMMAND,
   type TrainerEnvelope,
 } from "./ai-toolkit.js";
 
@@ -104,18 +105,18 @@ export async function bootstrapToolkit(opts: { onLog?: (line: string) => void } 
         // (codex finding: the stale temp dir made every retry fail instantly).
         const { rmSync: rmTmp } = await import("node:fs");
         rmTmp(tmp, { recursive: true, force: true });
-        return fail("train_bootstrap", "clone_failed", `git clone exited ${r.code}`, r.tail);
+        return fail(TRAINER_COMMAND.bootstrap, "clone_failed", `git clone exited ${r.code}`, r.tail);
       }
       const { renameSync, rmSync } = await import("node:fs");
       rmSync(dir, { recursive: true, force: true });
       renameSync(tmp, dir);
     }
     let r = await stream("git", ["fetch", "--all"], dir, log);
-    if (r.code !== 0) return fail("train_bootstrap", "fetch_failed", `git fetch exited ${r.code}`, r.tail);
+    if (r.code !== 0) return fail(TRAINER_COMMAND.bootstrap, "fetch_failed", `git fetch exited ${r.code}`, r.tail);
     r = await stream("git", ["checkout", AI_TOOLKIT_REF], dir, log);
-    if (r.code !== 0) return fail("train_bootstrap", "checkout_failed", `git checkout ${AI_TOOLKIT_REF} exited ${r.code}`, r.tail);
+    if (r.code !== 0) return fail(TRAINER_COMMAND.bootstrap, "checkout_failed", `git checkout ${AI_TOOLKIT_REF} exited ${r.code}`, r.tail);
     r = await stream("git", ["submodule", "update", "--init", "--recursive"], dir, log);
-    if (r.code !== 0) return fail("train_bootstrap", "submodule_failed", `submodule update exited ${r.code}`, r.tail);
+    if (r.code !== 0) return fail(TRAINER_COMMAND.bootstrap, "submodule_failed", `submodule update exited ${r.code}`, r.tail);
 
     // Invalidate any previous completion marker BEFORE the install steps: a
     // recreated venv whose pip steps now fail must NOT inherit the old env's
@@ -126,28 +127,28 @@ export async function bootstrapToolkit(opts: { onLog?: (line: string) => void } 
 
     if (!existsSync(resolveAiToolkitPython())) {
       r = await stream(basePython(), ["-m", "venv", "venv"], dir, log);
-      if (r.code !== 0) return fail("train_bootstrap", "venv_failed", `venv creation exited ${r.code}`, r.tail);
+      if (r.code !== 0) return fail(TRAINER_COMMAND.bootstrap, "venv_failed", `venv creation exited ${r.code}`, r.tail);
     }
 
     const pip = [resolveAiToolkitPython(), "-m", "pip", "install", "--no-cache-dir"];
     r = await stream(pip[0], [...pip.slice(1), ...TORCH_PACKAGES, "--index-url", TORCH_INDEX], dir, log);
-    if (r.code !== 0) return fail("train_bootstrap", "torch_failed", `torch install exited ${r.code} (index ${TORCH_INDEX})`, r.tail);
+    if (r.code !== 0) return fail(TRAINER_COMMAND.bootstrap, "torch_failed", `torch install exited ${r.code} (index ${TORCH_INDEX})`, r.tail);
     r = await stream(pip[0], [...pip.slice(1), "hf_transfer"], dir, log);
-    if (r.code !== 0) return fail("train_bootstrap", "hf_transfer_failed", `hf_transfer install exited ${r.code}`, r.tail);
+    if (r.code !== 0) return fail(TRAINER_COMMAND.bootstrap, "hf_transfer_failed", `hf_transfer install exited ${r.code}`, r.tail);
     r = await stream(pip[0], [...pip.slice(1), "-r", "requirements.txt"], dir, log);
-    if (r.code !== 0) return fail("train_bootstrap", "requirements_failed", `requirements install exited ${r.code}`, r.tail);
+    if (r.code !== 0) return fail(TRAINER_COMMAND.bootstrap, "requirements_failed", `requirements install exited ${r.code}`, r.tail);
 
     const status = await bootstrapStatus();
     if (!status.ready) {
-      return fail("train_bootstrap", "verify_failed", "bootstrap finished but run.py/venv python are still missing");
+      return fail(TRAINER_COMMAND.bootstrap, "verify_failed", "bootstrap finished but run.py/venv python are still missing");
     }
     // Completion marker: every pip step exited 0 to get here. nativeToolkitReady
     // requires it (or a torch presence check for pre-marker envs) so a checkout
     // whose dependency install FAILED is never selected as "ready" (codex).
     writeFileSync(join(dir, ".bootstrap-ok"), `${AI_TOOLKIT_REF} ${new Date().toISOString()}\n`);
-    return ok("train_bootstrap", status);
+    return ok(TRAINER_COMMAND.bootstrap, status);
   } catch (err) {
-    return fail("train_bootstrap", "error", err instanceof Error ? err.message : String(err));
+    return fail(TRAINER_COMMAND.bootstrap, "error", err instanceof Error ? err.message : String(err));
   }
 }
 

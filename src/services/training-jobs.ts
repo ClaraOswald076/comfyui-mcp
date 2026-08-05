@@ -4,7 +4,7 @@
 // A job ties together: a dataset dir (staged by prepareDataset), a generated
 // ai-toolkit config (training-config.ts), and a running docker container
 // (ai-toolkit.ts). Jobs persist a small JSON record under
-// <trainingRoot>/jobs/<id>.json so `train_status`/`train_cancel` still work
+// <trainingRoot>/jobs/<id>.json so train_start's status/cancel actions still work
 // after an MCP restart (the container keeps running; we re-read the record).
 //
 // On success the final `.safetensors` is copied into ComfyUI models/loras/ and
@@ -36,6 +36,7 @@ import {
   startTraining,
   stopNativeByConfig,
   stopTraining,
+  TRAINER_COMMAND,
   type TrainingHandle,
   type TrainingProgress,
 } from "./ai-toolkit.js";
@@ -97,7 +98,7 @@ export interface TrainingJob {
   podId?: string;
   /** Pid of the MCP process that launched the container — the ONLY process
    *  allowed to finalize it. Other processes may recover an orphaned job only
-   *  when this owner is provably dead (train_status stays side-effect-free for
+   *  when this owner is provably dead (the status action stays side-effect-free for
    *  healthy-owner states; independent review finding #1). */
   ownerPid?: number;
   /** Host dataset dir mounted at /dataset (writable — ai-toolkit caches into it). */
@@ -106,7 +107,7 @@ export interface TrainingJob {
   jobDir: string;
   /** Host output dir mounted at /output. */
   outputDir: string;
-  /** Recent log lines (ring buffer, max 50) for train_status. */
+  /** Recent log lines (ring buffer, max 50) for train_start (action:"status"). */
   log: string[];
   error?: string;
   /** models/loras dir resolved at START — persisted so a mid-run ComfyUI
@@ -283,7 +284,7 @@ function persist(job: TrainingJob): boolean {
 
 // ---- per-job CAS lock ---------------------------------------------------------
 // Recovery (owner-dead handoff), owner finalization, and cancel all mutate the
-// same record across processes. Without a lock, a mobile train_status poll and
+// same record across processes. Without a lock, a mobile status poll and
 // the owner's finalize can both hand off, and a cancel can land between a
 // finalizer's cancel-check and its handoff (independent review findings #1/#2).
 // The lock is a file created exclusively; holders re-read the record inside it.
@@ -686,7 +687,7 @@ async function persistLiveStateLocked(job: TrainingJob): Promise<void> {
 
 /**
  * Merge the on-disk records into the in-memory map. Runs on EVERY read: the
- * orchestrator's long-lived in-process client (mobile `train_status`) is a
+ * orchestrator's long-lived in-process client (a mobile status poll) is a
  * different process from the one running `train_start`, so a load-once
  * registry would show stale/empty state forever (codex finding #1).
  *
@@ -701,7 +702,7 @@ async function persistLiveStateLocked(job: TrainingJob): Promise<void> {
  */
 /**
  * Merge the on-disk records into the in-memory map. Runs on EVERY read: the
- * orchestrator's long-lived in-process client (mobile `train_status`) is a
+ * orchestrator's long-lived in-process client (a mobile status poll) is a
  * different process from the one running `train_start`, so a load-once
  * registry would show stale/empty state forever (codex finding #1).
  *
@@ -748,7 +749,7 @@ async function refreshRegistry(deps: TrainingJobDeps = {}): Promise<void> {
     }
     jobs.set(job.id, job);
   }
-  // Prune ids whose record files are GONE (train_delete_job removed them) —
+  // Prune ids whose record files are GONE (train_start action:"delete" removed them) —
   // otherwise every long-lived sibling process keeps serving deleted jobs
   // from cache and can act on their stale jobDir (codex r3 MAJOR: a later
   // delete could wipe outputs previously spared with keep_outputs). Ids this
@@ -898,7 +899,7 @@ export function defaultTrainingStop(name: string, remoteConfigPath?: string): Re
   if (name.startsWith("native-")) {
     return remoteConfigPath
       ? stopNativeByConfig(remoteConfigPath)
-      : Promise.resolve({ ok: false as const, command: "train_cancel", error: { code: "no_config", message: `native job stop needs the job's config path (got none for ${name})` } });
+      : Promise.resolve({ ok: false as const, command: TRAINER_COMMAND.cancel, error: { code: "no_config", message: `native job stop needs the job's config path (got none for ${name})` } });
   }
   return stopTraining(name);
 }
@@ -926,7 +927,7 @@ export function hasActiveTrainingJob(target?: "pod", podId?: string): boolean {
 }
 
 /** Money guard (codex #263): a running/queued record whose OWNER process died
- *  mid-run stays "running" on disk forever if nobody calls train_status —
+ *  mid-run stays "running" on disk forever if nobody calls the status action —
  *  and hasActiveTrainingJob (a blind file scan, above) then suppresses the
  *  pod idle auto-stop indefinitely, billing the pod until a human notices.
  *  This reconciler probes ONLY dead-owner / stale-lease records (a healthy
@@ -1423,7 +1424,7 @@ async function finalizeJob(job: TrainingJob, code: number, tail: string, deps: T
     // the rig BEFORE the usual handoff so findSamples/findProducedLora see it
     // (samples mirror to panel/mobile through the same rig-local paths).
     const pulled = await pullPodOutput(job, deps);
-    // Surface the generated samples in train_status regardless of outcome —
+    // Surface the generated samples in train_start (action:"status") regardless of outcome —
     // ai-toolkit prints only "Generating Images" bars (no saved-file lines), so
     // onProgress never sees sample paths (codex finding; confirmed by the E2E).
     const samples = findSamples(job.outputDir, job.name, 4);
@@ -1652,7 +1653,7 @@ export async function startTrainingJob(input: StartJobInput, deps: TrainingJobDe
     job.updatedAt = new Date().toISOString();
     reportProgress(job, "downloading");
     // Throttled disk snapshot so OTHER processes (orchestrator call_tool
-    // client → mobile train_status) see live progress, not just the final
+    // client → a mobile status poll) see live progress, not just the final
     // state (codex finding: progress was memory-only until finalize).
     const last = lastProgressPersistAt.get(id) ?? 0;
     if (Date.now() - last >= PROGRESS_PERSIST_MS) {
@@ -1668,7 +1669,7 @@ export async function startTrainingJob(input: StartJobInput, deps: TrainingJobDe
     job.updatedAt = new Date().toISOString();
     // Log lines also snapshot (same throttle): during the long first-run
     // model download there are NO progress ticks, so without this a
-    // cross-process train_status sees an empty, apparently stalled record
+    // a cross-process status poll sees an empty, apparently stalled record
     // (codex finding).
     const last = lastProgressPersistAt.get(id) ?? 0;
     if (Date.now() - last >= PROGRESS_PERSIST_MS) {
@@ -1905,7 +1906,7 @@ export async function deleteJob(
   const job = await getJob(id, deps);
   if (!job) throw new Error(`no training job ${id}`);
   if (job.status === "running" || job.status === "queued") {
-    throw new Error(`job ${id} is ${job.status} — cancel it first (train_cancel), then delete`);
+    throw new Error(`job ${id} is ${job.status} — cancel it first (train_start action:"cancel"), then delete`);
   }
   if (job.status === "cancelled" && job.containerName) {
     const probe = deps.containerRunning ?? defaultContainerProbe;
@@ -1913,7 +1914,7 @@ export async function deleteJob(
     if (alive !== false) {
       throw new Error(
         `job ${id} is marked cancelled but its container state is unconfirmed — it may still be running. ` +
-          `Re-run train_cancel first (it re-stops and verifies), then delete.`,
+          `Re-run train_start (action:"cancel") first (it re-stops and verifies), then delete.`,
       );
     }
   }

@@ -212,16 +212,10 @@ const CATEGORIES: Array<{
     slug: "training",
     icon: "graduation-cap",
     description: "Train character LoRAs (FLUX.1-dev) via ostris ai-toolkit — locally in a GPU Docker image or on a rented RunPod pod — with a crash-safe job registry and streamed progress.",
-    tools: [
-      "train_list_flows", "train_doctor", "train_build_image", "train_bootstrap",
-      "train_prepare_dataset", "train_start", "train_status", "train_cancel",
-      // Dataset curation: stage/inspect/edit the images+captions a run consumes.
-      "train_list_datasets", "train_dataset_detail", "train_dataset_update",
-      "train_dataset_delete", "train_caption_image", "train_caption_dataset",
-      "train_file",
-      // Job introspection + cleanup.
-      "train_job_config", "train_preview_config", "train_delete_job",
-    ],
+    // 0.50.0 slice 10 folded eighteen train_* tools into three, split by
+    // work-domain: the datasets a run consumes, the jobs that consume them, and
+    // the trainer machinery itself.
+    tools: ["train_prepare_dataset", "train_start", "train_doctor"],
   },
   {
     group: "Apps (micro-apps)",
@@ -320,6 +314,22 @@ const EXAMPLE_ARG_OVERRIDES: Readonly<Record<string, Readonly<Record<string, unk
   workspace: {
     action: "set_default",
     path: "/opt/ComfyUI",
+  },
+  // 0.50.0 slice 10. Without these the generated skeletons are `{"action": …}`
+  // alone, which every one of these tools rejects with a missing-field error —
+  // an example a reader copies and watches fail. train_doctor needs no override:
+  // its default action:"doctor" takes no other parameters and is a valid call.
+  train_prepare_dataset: {
+    action: "prepare",
+    name: "aria_character",
+    items: [{ path: "/photos/aria_01.png", caption: "ohwx person, side profile, window light" }],
+    defaultCaption: "ohwx person",
+  },
+  train_start: {
+    action: "start",
+    name: "aria_character",
+    datasetPath: "/home/me/.comfyui-mcp/training/datasets/aria_character",
+    trigger: "ohwx person",
   },
 };
 

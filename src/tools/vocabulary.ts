@@ -140,23 +140,8 @@ export const TOOL_NAMES = [
   "write_node_file",
   "apply_node_patch",
   "node_pack_git",
-  "train_list_flows",
   "train_prepare_dataset",
   "train_start",
-  "train_bootstrap",
-  "train_status",
-  "train_list_datasets",
-  "train_dataset_detail",
-  "train_job_config",
-  "train_file",
-  "train_dataset_update",
-  "train_dataset_delete",
-  "train_preview_config",
-  "train_caption_image",
-  "train_caption_dataset",
-  "train_delete_job",
-  "train_cancel",
-  "train_build_image",
   "train_doctor",
   "apps",
   "get_template_schema",
@@ -287,7 +272,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 130;
+export const MAX_TOOLS = 115;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;
@@ -859,6 +844,183 @@ export const DEAD_NAMES: readonly DeadName[] = [
     name: "generate_node_skill",
     since: "0.50.0",
     replacement: 'list_packs (action:"generate_skill")',
+  },
+  // ── 0.50.0 slice 10: the eighteen train_* tools folded into three
+  // action-parameterized tools, split by work-domain: `train_prepare_dataset`
+  // owns the DATASETS, `train_start` owns the JOBS, `train_doctor` owns the
+  // TRAINER ITSELF. Same training services, same envelope return shapes — only
+  // the surface changed, so every mention of the old names is now rot pointing
+  // at a 404.
+  //
+  // The two `delete` actions are deliberately keyed differently: `train_delete_job`
+  // becomes train_start (action:"delete") keyed by `id`, while `train_dataset_delete`
+  // becomes train_prepare_dataset (action:"delete") keyed by `name`. Both
+  // replacements below spell the tool AND the key so a reader of the error can
+  // never land on the wrong one.
+  {
+    name: "train_status",
+    since: "0.50.0",
+    replacement: 'train_start (action:"status")',
+    allowedIn: [
+      {
+        path: "docs/blog/lora-trainer-p1.mdx",
+        context: "5. **`train_status`** — poll it whenever.",
+        why: "A DATED post announcing the train_* surface AS IT SHIPPED, narrating the seven-tool walkthrough of that release. The post carries a <Note> mapping every name in it to its 0.50.0 replacement, so a reader is never stranded; rewriting the walkthrough would falsify what the release contained.",
+      },
+      {
+        path: "docs/blog/lora-trainer-p1.mdx",
+        context: "(`train_status` and `train_list_flows` are whitelisted",
+        why: "Same post, stating which tools the mobile call_tool path whitelisted AT THE TIME. That is a fact about the 0.31 admission list, not an instruction — and the fact survives the fold (see call-tool-admission.ts).",
+      },
+      {
+        path: "docs/blog/lora-trainer-p1.mdx",
+        context: "with its catalog entry. `train_status`",
+        why: "Same post, the E2E receipts section: a past-tense record of what was observed on an RTX 4090 run of that exact code. Renaming the tool in a receipt would misreport the evidence.",
+      },
+      {
+        path: "docs/blog/train-lora-runpod.mdx",
+        context: "`train_status`, `train_cancel`, `train_list_flows` — backed by the",
+        why: "A DATED sequel post listing the seven P1 tools it reuses unchanged on a pod. Same <Note> treatment as lora-trainer-p1; the list is a statement about the P1 surface, not a call sequence.",
+      },
+      {
+        path: "docs/blog/train-lora-runpod.mdx",
+        context: "- **`train_status`** streams step/loss/sample progress",
+        why: "Same post, per-tool bullet describing the pod behaviour of that release's surface.",
+      },
+    ],
+  },
+  {
+    name: "train_cancel",
+    since: "0.50.0",
+    replacement: 'train_start (action:"cancel")',
+    allowedIn: [
+      {
+        path: "src/services/ai-toolkit.ts",
+        context: 'cancel: "train_cancel",',
+        why: "NOT a tool reference — the frozen envelope/1 `command` LABEL for the stop operation. TrainerEnvelope.command is a RETURN SHAPE that clients and tests key on, so slice 10 deliberately did not rename it; see TRAINER_COMMAND's doc comment. Hoisted to this one constant precisely so the string appears once, here, rather than at 13 call sites.",
+      },
+      {
+        path: "docs/blog/lora-trainer-p1.mdx",
+        context: "And if you change your mind: **`train_cancel`**",
+        why: "Same dated P1 announcement post, introducing the section on verified cancellation. See the train_status entries above.",
+      },
+      {
+        path: "docs/blog/lora-trainer-p1.mdx",
+        context: "can't prove.** `train_cancel` issues a",
+        why: "Same post, narrating the verify-before-reporting design of that release in the present tense of its publication date.",
+      },
+      {
+        path: "docs/blog/train-lora-runpod.mdx",
+        context: "`train_status`, `train_cancel`, `train_list_flows` — backed by the",
+        why: "Same seven-tool list in the dated sequel post — see the train_status entry for this line.",
+      },
+      {
+        path: "docs/blog/train-lora-runpod.mdx",
+        context: "- **`train_cancel`** stops the remote trainer with `pkill`",
+        why: "Same post, per-tool bullet describing the pod cancel path of that release's surface.",
+      },
+    ],
+  },
+  {
+    name: "train_delete_job",
+    since: "0.50.0",
+    replacement: 'train_start (action:"delete") — the JOB delete, keyed by `id`',
+  },
+  {
+    name: "train_list_flows",
+    since: "0.50.0",
+    replacement: 'train_start (action:"list_flows")',
+    allowedIn: [
+      {
+        path: "docs/blog/lora-trainer-p1.mdx",
+        context: "(`train_status` and `train_list_flows` are whitelisted",
+        why: "Same dated P1 post line as the train_status entry above — a statement about the mobile call_tool whitelist at that release, not an instruction to call either name.",
+      },
+      {
+        path: "docs/blog/train-lora-runpod.mdx",
+        context: "`train_status`, `train_cancel`, `train_list_flows` — backed by the",
+        why: "Same seven-tool list in the dated sequel post — see the train_status entry for this line.",
+      },
+    ],
+  },
+  {
+    name: "train_job_config",
+    since: "0.50.0",
+    replacement: 'train_start (action:"job_config")',
+  },
+  {
+    name: "train_preview_config",
+    since: "0.50.0",
+    replacement: 'train_start (action:"preview_config")',
+  },
+  {
+    name: "train_list_datasets",
+    since: "0.50.0",
+    replacement: 'train_prepare_dataset (action:"list")',
+  },
+  {
+    name: "train_dataset_detail",
+    since: "0.50.0",
+    replacement: 'train_prepare_dataset (action:"detail")',
+  },
+  {
+    name: "train_dataset_update",
+    since: "0.50.0",
+    replacement: 'train_prepare_dataset (action:"update")',
+  },
+  {
+    name: "train_dataset_delete",
+    since: "0.50.0",
+    replacement: 'train_prepare_dataset (action:"delete") — the DATASET delete, keyed by `name`',
+  },
+  {
+    name: "train_file",
+    since: "0.50.0",
+    replacement: 'train_prepare_dataset (action:"file")',
+  },
+  {
+    name: "train_caption_image",
+    since: "0.50.0",
+    replacement: 'train_prepare_dataset (action:"caption_image")',
+  },
+  {
+    name: "train_caption_dataset",
+    since: "0.50.0",
+    replacement: 'train_prepare_dataset (action:"caption_dataset")',
+  },
+  {
+    name: "train_bootstrap",
+    since: "0.50.0",
+    replacement: 'train_doctor (action:"bootstrap")',
+    allowedIn: [
+      {
+        path: "src/services/ai-toolkit.ts",
+        context: 'bootstrap: "train_bootstrap",',
+        why: "NOT a tool reference — the frozen envelope/1 `command` LABEL for the native-toolkit bootstrap operation, a RETURN SHAPE slice 10 deliberately did not rename. See TRAINER_COMMAND's doc comment.",
+      },
+    ],
+  },
+  {
+    name: "train_build_image",
+    since: "0.50.0",
+    replacement: 'train_doctor (action:"build_image")',
+    allowedIn: [
+      {
+        path: "src/services/ai-toolkit.ts",
+        context: 'buildImage: "train_build_image",',
+        why: "NOT a tool reference — the frozen envelope/1 `command` LABEL for the image-build operation, a RETURN SHAPE slice 10 deliberately did not rename. See TRAINER_COMMAND's doc comment.",
+      },
+      {
+        path: "docs/blog/lora-trainer-p1.mdx",
+        context: "2. **`train_build_image`** — one-time, several minutes.",
+        why: "Same dated P1 announcement post — step 2 of the seven-tool walkthrough as that release shipped it. The post's <Note> maps it to train_doctor (action:\"build_image\").",
+      },
+      {
+        path: "docs/blog/train-lora-runpod.mdx",
+        context: "`train_doctor`, `train_build_image`, `train_prepare_dataset`, `train_start`,",
+        why: "Same seven-tool list in the dated sequel post; the other three names on this line survive the fold, so only this one needs the exemption.",
+      },
+    ],
   },
 ];
 

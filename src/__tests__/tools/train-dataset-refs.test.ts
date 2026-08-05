@@ -47,7 +47,7 @@ function getTool(name: string): { handler: ToolHandler; shape: Record<string, { 
   return { handler, shape: shape as never };
 }
 
-const call = (items: unknown[]) => getTool("train_prepare_dataset").handler({ name: "ds", items });
+const call = (items: unknown[]) => getTool("train_prepare_dataset").handler({ action: "prepare", name: "ds", items });
 
 beforeEach(() => {
   vi.clearAllMocks();

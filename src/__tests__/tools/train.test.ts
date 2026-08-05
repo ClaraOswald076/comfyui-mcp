@@ -105,7 +105,7 @@ describe("train_doctor reports HF token PRESENCE from the resolved credential", 
   }
 
   async function doctorText(): Promise<string> {
-    const out = (await getHandler("train_doctor")({})) as { content: Array<{ text: string }> };
+    const out = (await getHandler("train_doctor")({ action: "doctor" })) as { content: Array<{ text: string }> };
     return out.content[0].text;
   }
 
