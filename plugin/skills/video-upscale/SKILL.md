@@ -118,7 +118,7 @@ restorers below when quality (or zero flicker) matters more than turnaround.
 
 **Pack:** `ComfyUI-SeedVR2_VideoUpscaler` (author **numz**) — GitHub
 `numz/ComfyUI-SeedVR2_VideoUpscaler`, installable via ComfyUI-Manager / registry
-by that name. Install with `panel_install_node` or `apply_manifest`.
+by that name. Install with `panel_install_node` or `install_comfyui (action:"apply_manifest")`.
 
 **Node classes (4):**
 
@@ -262,7 +262,7 @@ the intended output fps with the user rather than chasing a non-existent
 | **12–16 GB** | 3B/7B **fp8** + some block swap or VAE tiling; batch 5–13 | **Tiny** or Full + tiling | RIFE 2–4×; ensemble off |
 | **24 GB+** | **7B fp16** (or 3B fp16), no offload; batch 13–45 for max temporal stability | **Full** at 4x | RIFE 2–4× + ensemble; FILM if needed |
 
-General: **downscale first** to buy a bigger batch; always `clear_vram` before
+General: **downscale first** to buy a bigger batch; always `get_system_stats (action:"clear_vram")` before
 switching model families; reduce frame/batch counts first when you OOM.
 
 ---
@@ -325,5 +325,5 @@ and `Kosinkadink/ComfyUI-VideoHelperSuite` (already installed), optionally
 `1038lab/ComfyUI-FlashVSR`. SeedVR2 and FlashVSR weights **auto-download on first
 run**, so `models[]` can be left light — note that in `pack.yaml`. Install nodes
 ad-hoc with **`panel_install_node`** or apply a manifest with
-**`apply_manifest`**. Offer to contribute a finished pack upstream
+**`install_comfyui (action:"apply_manifest")`**. Offer to contribute a finished pack upstream
 (`github.com/artokun/comfyui-mcp`).

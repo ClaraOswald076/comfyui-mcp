@@ -1,4 +1,4 @@
-# LTX-2.3 Video install manifest — consumable by apply_manifest (src/services/manifest.ts).
+# LTX-2.3 Video install manifest — consumable by install_comfyui (action:"apply_manifest") (src/services/manifest.ts).
 # Ground truth: LTX-2-3-MODELS-NODES_INSTALL-V2.bat
 #   (cross-checked: LTX-2-3-ULTRA-COMFYUI-MANAGER_AUTO_INSTALL-V2.bat, LTX-2-3-AUTO_INSTALL-RUNPOD-V2.sh).
 # Mirror base (all weights below): https://huggingface.co/Aitrepreneur/FLX/resolve/main

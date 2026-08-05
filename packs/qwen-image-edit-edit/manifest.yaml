@@ -1,4 +1,4 @@
-# Qwen-Image-Edit (image edit / img2img) install manifest — consumable by apply_manifest.
+# Qwen-Image-Edit (image edit / img2img) install manifest — consumable by install_comfyui (action:"apply_manifest").
 # Sliced from the qwen-image-edit monolith's "GGUF QWEN IMAGE EDIT" pipeline
 # (groups un-bypassed into a standalone graph). The slice loads a primary image
 # plus an optional SECOND IMAGE (stitched via ImageStitch) and runs the

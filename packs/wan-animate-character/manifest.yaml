@@ -1,4 +1,4 @@
-# WAN Animate 2.2 — character-animation install manifest (consumable by apply_manifest).
+# WAN Animate 2.2 — character-animation install manifest (consumable by install_comfyui (action:"apply_manifest")).
 # Sliced from the wan-animate monolith's animate pipeline (PARAM-group outputs,
 # groups un-bypassed into a standalone graph). One pipeline, no group toggles.
 # Mirror base: https://huggingface.co/Aitrepreneur/FLX/resolve/main

@@ -337,7 +337,7 @@ Optional upstream: Ideogram4PromptBuilderKJ  OR  TextGenerate(gemma4) ─► CLI
 ## VRAM Considerations
 
 - Both diffusion models plus the Qwen3-VL encoder are large. Loading **two** ~13.8 GB UNETs is the main cost; expect this to be heavy on 24 GB GPUs. The official docs cite a 16 GB minimum for the FP8 models, but that assumes ComfyUI swaps models in/out rather than holding both resident.
-- **Always `clear_vram`** before switching to Ideogram 4 from another model family.
+- **Always `get_system_stats (action:"clear_vram")`** before switching to Ideogram 4 from another model family.
 - If you OOM: rely on ComfyUI's automatic model offloading, run `--lowvram`, or reduce resolution.
 - Exact VRAM numbers for the dual-model setup are **not verified** in the source files — treat the above as guidance, not measured figures.
 

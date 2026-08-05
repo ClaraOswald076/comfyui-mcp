@@ -443,7 +443,7 @@ ComfyUI manages VRAM by offloading models between passes. The Hi UNET is offload
 
 ### Tips
 
-1. **Always `clear_vram`** before switching to WAN from another model family
+1. **Always `get_system_stats (action:"clear_vram")`** before switching to WAN from another model family
 2. Use `VRAM_Debug` node between generation and SeedVR2 upscaling to free all VRAM
 3. For 24GB GPUs, 81 frames at 480x720 is the practical maximum
 4. Remix NSFW models have lightning baked in — no separate LoRA needed, 4 steps total

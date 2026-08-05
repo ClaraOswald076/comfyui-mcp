@@ -233,7 +233,7 @@ One tool, `queue`, driven by its `action` parameter:
 1. Check `get_system_stats` — look at VRAM usage (OOM causes hangs)
 2. Try `queue` (action:"cancel") to interrupt the stuck job
 3. If cancel fails, use `restart_comfyui` to force-restart
-4. Use `clear_vram` after restart to free GPU memory before retrying
+4. Use `get_system_stats (action:"clear_vram")` after restart to free GPU memory before retrying
 
 ## KSampler Parameters
 

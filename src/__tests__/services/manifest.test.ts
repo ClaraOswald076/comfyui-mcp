@@ -83,7 +83,7 @@ const installInterpreterMock = vi.hoisted(() =>
 
 vi.mock("../../config.js", () => ({
   config: mockConfig,
-  // apply_manifest routes models through the Manager in remote mode (no
+  // install_comfyui (action:"apply_manifest") routes models through the Manager in remote mode (no
   // comfyuiPath). isRemoteMode mirrors that gate for the tests.
   isRemoteMode: () => mockConfig.remote ?? !mockConfig.comfyuiPath,
 }));
@@ -336,7 +336,7 @@ describe("applyManifest", () => {
       { action: "custom_node", item: "bad-node", status: "failed" },
       { action: "model", item: "loras/model.safetensors", status: "applied" },
     ]);
-    // apply_manifest now routes local downloads through the background job
+    // install_comfyui (action:"apply_manifest") now routes local downloads through the background job
     // registry (#362), which calls downloadModel with an optional auth arg.
     expect(downloadModelMock).toHaveBeenCalledWith(
       "https://example.com/model.safetensors",

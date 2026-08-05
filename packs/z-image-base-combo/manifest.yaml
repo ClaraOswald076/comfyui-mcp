@@ -1,4 +1,4 @@
-# Z-Image Base combo install manifest — consumable by apply_manifest.
+# Z-Image Base combo install manifest — consumable by install_comfyui (action:"apply_manifest").
 # Sliced from the z-image-base monolith's "Z-IMAGE ULTRA COMBO TEXT TO IMAGE" +
 # "Z-IMAGE ULTRA COMBO IMAGE TO IMAGE" pipelines (un-bypassed into a standalone
 # graph). The combo chains the BASE and TURBO models. Verified: convert-only

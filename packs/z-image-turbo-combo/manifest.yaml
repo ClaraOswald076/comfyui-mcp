@@ -1,4 +1,4 @@
-# Z-Image-Turbo combo (two-times) install manifest — consumable by apply_manifest.
+# Z-Image-Turbo combo (two-times) install manifest — consumable by install_comfyui (action:"apply_manifest").
 # Sliced from the z-image-turbo monolith's
 # "Z-IMAGE TURBO TWO TIMES COMBO TEXT TO IMAGE" pipeline (un-bypassed standalone).
 # Mirror base: https://huggingface.co/Aitrepreneur/FLX/resolve/main  (third-party)

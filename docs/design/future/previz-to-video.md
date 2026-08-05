@@ -236,7 +236,7 @@ recipes reliably. Prior art either way:
 | --- | --- | --- |
 | **H0 — spike (manual)** | Prove the recipe on this rig, end-to-end, once | Meshy (or Trellis) asset → Mixamo character + clip → Blender blocking + camera → viewport render → Wan Animate local AND Seedance R2V; write down every snag. Must answer: does DWPose track a flat-grey mannequin, or does the previz need MatCap/toon shading + a visible face? |
 | **H1 — skill** | `previz-director` SKILL.md from H0's notes | Knowledge only, zero code; usable immediately from Claude Desktop/Code with both MCPs configured |
-| **H2 — pack + glue** | `wan-animate` pack; 3D-asset file awareness | Free path installable via `apply_manifest`; `kind: "model"` in output listing; H1 skill references both |
+| **H2 — pack + glue** | `wan-animate` pack; 3D-asset file awareness | Free path installable via `install_comfyui (action:"apply_manifest")`; `kind: "model"` in output listing; H1 skill references both |
 | **H3 — panel parity** | Companion MCP servers in the orchestrator | Panel agent gets Blender MCP; pairing-level UX ("Connect Blender" hint in panel) |
 | **H4 — storytelling** | Director × previz | Shot lists drive previz scenes; multi-shot continuity (same cast/set across shots); style sweeps as a first-class op |
 
@@ -332,7 +332,7 @@ shop, Mixamo auto-rigs its output, Blender is the stage Claude can fully see and
   commands, R2V prompt templates). Zero code; works today from Claude Desktop/Code with both MCPs
   configured.
 - **H2 — `wan-animate` + `character-shop` packs + 3D-asset file awareness.** The free video path
-  installable via `apply_manifest` (Wan 2.2 Animate 14B fp8 + DWPose + SAM2 + wired template); the
+  installable via `install_comfyui (action:"apply_manifest")` (Wan 2.2 Animate 14B fp8 + DWPose + SAM2 + wired template); the
   community-seeded character-shop pack (SDXL hero → Qwen-Edit 2511 multi-angle → Hunyuan3D v2 MV →
   GLB, `design/previz-assets/master-3d-model-maker.community.json`); plus `kind: "model"`
   (GLB/FBX/OBJ) in the output listing so import-to-Blender / stage-for-Mixamo resolve exact paths.

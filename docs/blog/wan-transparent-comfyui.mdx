@@ -31,7 +31,7 @@ the [sidebar Panel](../panel), instead of hand-wiring a GGUF video graph and a
 background-removal chain.
 
 > **TL;DR — one-command setup.** Install comfyui-mcp, apply the
-> `wan-transparent` pack (`apply_manifest --path packs/wan-transparent/manifest.yaml`,
+> `wan-transparent` pack (`install_comfyui (action:"apply_manifest") path:"packs/wan-transparent/manifest.yaml"`,
 > or run the generated installer), load the workflow, and let your own Claude
 > session drive the graph from the Panel. Jump to
 > [Install](#install-wan-transparent-expressions-in-comfyui).
@@ -111,7 +111,7 @@ drives both an MCP-native install and the generated double-click script:
 
 ```bash
 # MCP-native (from a Claude Code session, with COMFYUI_PATH set)
-apply_manifest --path packs/wan-transparent/manifest.yaml
+install_comfyui (action:"apply_manifest") path:"packs/wan-transparent/manifest.yaml"
 
 # or run the generated installer from your ComfyUI root
 WAN2_2-ULTRA-MODELS-NODES_INSTALL.bat

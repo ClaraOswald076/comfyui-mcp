@@ -1,4 +1,4 @@
-# WAN Animate 2.2 install manifest — consumable by apply_manifest (src/services/manifest.ts).
+# WAN Animate 2.2 install manifest — consumable by install_comfyui (action:"apply_manifest") (src/services/manifest.ts).
 # Ground truth: WAN-ANIMATE-MODELS-NODES_INSTALL.bat (cross-checked against
 #   WAN-ANIMATE-COMFYUI-MANAGER_AUTO_INSTALL.bat and WAN-ANIMATE-AUTO_INSTALL-RUNPOD.sh).
 # Mirror base: https://huggingface.co/Aitrepreneur/FLX/resolve/main

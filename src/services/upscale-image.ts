@@ -64,7 +64,7 @@ export async function upscaleImage(
         "or download one, e.g. download_model url=" +
         "https://huggingface.co/Aitrepreneur/FLX/resolve/main/4x-ClearRealityV1.pth " +
         "target_subfolder=upscale_models. The anima/ernie packs also provide upscale " +
-        "models via apply_manifest.",
+        'models via install_comfyui (action:"apply_manifest").',
     );
   }
 

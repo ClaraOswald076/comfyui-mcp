@@ -1,4 +1,4 @@
-# Z-Image Turbo (V2 ULTRA) install manifest — consumable by apply_manifest (src/services/manifest.ts).
+# Z-Image Turbo (V2 ULTRA) install manifest — consumable by install_comfyui (action:"apply_manifest") (src/services/manifest.ts).
 # Ground truth: Z-IMAGE-TURBO-MODELS-NODES_INSTALL-V2.bat
 #   (cross-checked vs Z-IMAGE-TURBO-ULTRA-COMFYUI-MANAGER_AUTO_INSTALL-V2.bat
 #    and Z-IMAGE-TURBO-AUTO_INSTALL-RUNPOD-V2.sh).

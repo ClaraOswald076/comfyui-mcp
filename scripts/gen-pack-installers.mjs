@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Generate one-click install-windows.bat + install-runpod.sh for each pack from
 // its pack.yaml + manifest.yaml. The manifest is the single source of truth
-// (also consumed by apply_manifest); never hand-edit the generated scripts.
+// (also consumed by install_comfyui (action:"apply_manifest")); never hand-edit the generated scripts.
 //
 //   node scripts/gen-pack-installers.mjs              # all packs/*
 //   node scripts/gen-pack-installers.mjs packs/anima  # one pack

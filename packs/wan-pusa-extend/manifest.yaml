@@ -1,11 +1,11 @@
-# WAN 2.2 Video Extend (Pusa) install manifest — consumable by apply_manifest.
+# WAN 2.2 Video Extend (Pusa) install manifest — consumable by install_comfyui (action:"apply_manifest").
 # Temporal video EXTENSION with Pusa V1 on the ComfyUI-WanVideoWrapper stack:
 # WAN 2.2 T2V A14B (HIGH/LOW) fp8 + Pusa V1 LoRAs + lightx2v distill, the
 # flowmatch_pusa scheduler + WanVideoAddPusaNoise, conditioning on the loaded
 # clip via WanVideoEncode, with a ColorMatchV2 seam-regrade. Skill: video-extend.
 #
 # NOTE: the T2V A14B UNets, UMT5 encoder and WAN VAE are SHARED with
-# wan-t2v-video — if you installed that pack you already have them (apply_manifest
+# wan-t2v-video — if you installed that pack you already have them (install_comfyui (action:"apply_manifest")
 # skips files that already exist). The only Pusa-specific pulls are the two Pusa
 # V1 LoRAs (~1.9 GB).
 

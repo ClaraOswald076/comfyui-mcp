@@ -1,5 +1,5 @@
 # 96GB Blackwell tier — full fp16 A14B via UNETLoader; launch ComfyUI with --highvram.
-# WAN 2.2 Transparent Expressions (image-to-video) — install manifest (consumable by apply_manifest, src/services/manifest.ts).
+# WAN 2.2 Transparent Expressions (image-to-video) — install manifest (consumable by install_comfyui (action:"apply_manifest"), src/services/manifest.ts).
 # Sliced from the wan-transparent monolith's single "WAN 2.2 IMAGE TO VIDEO" pipeline
 # (groups un-bypassed into a standalone graph). Static-checked: CONVERT-OK (custom nodes pending install).
 # Base WAN 2.2 models/nodes mirror the ULTRA installer (HF mirror: https://huggingface.co/Aitrepreneur/FLX/resolve/main).

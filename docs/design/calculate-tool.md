@@ -1,4 +1,4 @@
-# `calculate` — safe batch expression evaluator
+# `get_system_stats (action:"calculate")` — safe batch expression evaluator
 
 **Status:** implemented (this PR)
 
@@ -6,7 +6,7 @@
 
 ## Motivation
 
-Agents constantly do arithmetic they get wrong token-by-token: SDXL-legal resolutions from an aspect ratio (`floor(sqrt(1024*1024*ar)/64)*64`), tile/grid layout math, cfg/denoise sweeps, reproducible seed batches. A connection-free `calculate` tool answers these exactly, in one call, and is one of the few tools that works even when ComfyUI is down.
+Agents constantly do arithmetic they get wrong token-by-token: SDXL-legal resolutions from an aspect ratio (`floor(sqrt(1024*1024*ar)/64)*64`), tile/grid layout math, cfg/denoise sweeps, reproducible seed batches. A connection-free `get_system_stats (action:"calculate")` tool answers these exactly, in one call, and is one of the few tools that works even when ComfyUI is down.
 
 ## Parser decision: zero-dep hand-rolled Pratt parser
 
@@ -14,7 +14,7 @@ Verified: runtime deps are 8 heavyweight-for-a-reason packages; nothing expressi
 
 ## Tool API
 
-`calculate` — category `diagnostics`, pure, no ComfyUI connection (usable in cloud mode):
+`get_system_stats (action:"calculate")` — category `diagnostics`, pure, no ComfyUI connection (usable in cloud mode):
 
 ```ts
 {

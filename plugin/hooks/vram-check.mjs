@@ -91,7 +91,7 @@ async function check() {
 
     if (vramFreeMB < VRAM_WARNING_MB) {
       console.error(
-        `Warning: Only ${vramFreeMB.toFixed(0)}MB VRAM free. Consider running clear_vram first to avoid OOM errors.`,
+        `Warning: Only ${vramFreeMB.toFixed(0)}MB VRAM free. Consider running get_system_stats (action:"clear_vram") first to avoid OOM errors.`,
       );
     }
 

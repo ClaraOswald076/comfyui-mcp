@@ -1,4 +1,4 @@
-# Z-Image-Turbo inpainting install manifest — consumable by apply_manifest.
+# Z-Image-Turbo inpainting install manifest — consumable by install_comfyui (action:"apply_manifest").
 # Sliced from the z-image-turbo monolith's "Z-IMAGE TURBO INPAINTING" pipeline
 # (un-bypassed standalone). No film-grain / sharpen post-proc, so no librosa pin.
 # Mirror base: https://huggingface.co/Aitrepreneur/FLX/resolve/main  (third-party)

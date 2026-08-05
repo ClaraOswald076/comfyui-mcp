@@ -95,7 +95,7 @@ export async function advertiseBridge(comfyuiUrl: string, wssUrl: string, should
  * orchestrator consumes it as a LAST-RESORT source of the local ComfyUI base for
  * an embedded loopback session that has no CLI-configured workspace (COMFYUI_PATH
  * unset AND auto-detect empty), so the path-dependent LOCAL surface still works —
- * the comfyui MCP runs in LOCAL mode (download_model / apply_manifest / model
+ * the comfyui MCP runs in LOCAL mode (download_model / install_comfyui (action:"apply_manifest") / model
  * scans) and panel_load_workflow's local fallback can resolve names (#296).
  *
  * Best-effort and time-bounded: returns undefined on ANY failure (unreachable,

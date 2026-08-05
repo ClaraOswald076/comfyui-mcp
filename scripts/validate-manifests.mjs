@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Validate every pack manifest against the real manifestSchema (the same schema
-// apply_manifest uses). Requires a prior `npm run build` (imports from dist/).
+// install_comfyui (action:"apply_manifest") uses). Requires a prior `npm run build` (imports from dist/).
 //
 //   npm run build && node scripts/validate-manifests.mjs
 

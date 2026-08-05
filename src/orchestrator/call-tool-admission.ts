@@ -286,6 +286,15 @@ const CALL_TOOL_ACTION_WHITELIST: ReadonlyMap<string, ReadonlySet<string>> = new
   // tool entirely (`search_custom_nodes`), which is not whitelisted, so no
   // action-level scope is needed to keep them out.
   ["install_custom_node", new Set(["install", "list"])],
+  // NOT scoped, because they are not admitted AT ALL: 0.50.0 slice 13 folded
+  // fourteen names into `install_comfyui` and `get_system_stats`, and neither
+  // survivor is in the whitelist above — nor was any of the twelve names they
+  // absorbed (the slice 13 block in DEAD_NAMES lists them). So that fold could
+  // not broaden this channel the way `runpod`'s would have, and there is
+  // nothing to scope. Recorded here because the ABSENCE is the finding: the
+  // next reader should not have to re-derive it, and a later whitelist edit
+  // that admits either survivor has to delete this comment to do it.
+  // call-tool-admission.test.ts pins the refusal for every action of both.
 ]);
 
 /**

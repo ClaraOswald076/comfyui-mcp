@@ -1,4 +1,4 @@
-# Z-Image-Turbo ControlNet install manifest — consumable by apply_manifest.
+# Z-Image-Turbo ControlNet install manifest — consumable by install_comfyui (action:"apply_manifest").
 # Sliced from the z-image-turbo monolith's "Z-IMAGE TURBO PSEUDO CONTROLNET" pipeline
 # (un-bypassed standalone). Pose/Depth/Canny preprocessor groups are pulled in via
 # the slicer's backward closure.

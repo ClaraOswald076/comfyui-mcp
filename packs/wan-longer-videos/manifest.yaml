@@ -1,4 +1,4 @@
-# WAN 2.2 Longer Videos (GGUF) install manifest — consumable by apply_manifest (src/services/manifest.ts).
+# WAN 2.2 Longer Videos (GGUF) install manifest — consumable by install_comfyui (action:"apply_manifest") (src/services/manifest.ts).
 # Ground truth: WAN2_2-ULTRA-MODELS-NODES_INSTALL.bat (cross-checked against
 #   WAN2_2-ULTRA-COMFYUI-MANAGER_AUTO_INSTALL.bat and WAN2_2-ULTRA-AUTO_INSTALL-RUNPOD.sh).
 # Model set reconciled against WAN2_2-LONGER_VIDEOS_WORKFLOW.json (the workflow is the source of truth).

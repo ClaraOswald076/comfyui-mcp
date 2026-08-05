@@ -405,7 +405,7 @@ Practical chaining tips:
   the seam.
 - Keep the **same seed discipline** (fixed or deliberately varied) so motion
   cadence stays consistent.
-- Each hop is an independent generation — `clear_vram` is not needed between
+- Each hop is an independent generation — `get_system_stats (action:"clear_vram")` is not needed between
   hops, but **decode/cache** long chains to disk so you don't hold every segment
   in VRAM.
 
@@ -424,7 +424,7 @@ of LoRA. Use the wrapper's offload tooling.
 
 - `WanVideoModelLoader` quant `fp8_e4m3fn_scaled`, base precision `fp16_fast`,
   `offload_device`, `sageattn` (the example's settings).
-- **Always `clear_vram`** before switching to this from another model family.
+- **Always `get_system_stats (action:"clear_vram")`** before switching to this from another model family.
 - Encoder VAE tiling (`WanVideoEncode`) matters here because you're VAE-encoding
   real footage in addition to decoding output.
 
@@ -517,5 +517,5 @@ ensure those `custom_nodes[]` (kijai/ComfyUI-WanVideoWrapper,
 Kijai/ComfyUI-KJNodes, Kosinkadink/ComfyUI-VideoHelperSuite) plus the two Pusa V1
 LoRAs in `models[]` (from `Kijai/WanVideo_comfy/Pusa/`). The big T2V A14B models
 are shared with `wan-t2v-video` — don't re-download. Install nodes ad-hoc with
-`panel_install_node` or apply a manifest with `apply_manifest`. Contribute a
+`panel_install_node` or apply a manifest with `install_comfyui (action:"apply_manifest")`. Contribute a
 finished pack upstream (`github.com/artokun/comfyui-mcp`).

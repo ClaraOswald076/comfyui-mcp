@@ -46,7 +46,7 @@ import { ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
 /** Grace window (ms) to await a manifest model download before handing back a
- *  background job handle. Keeps apply_manifest under the MCP tools/call timeout
+ *  background job handle. Keeps install_comfyui (action:"apply_manifest") under the MCP tools/call timeout
  *  on large model packs (#362); small files still complete inline. */
 function manifestDownloadGraceMs(): number {
   const raw = Number(process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS);
@@ -55,7 +55,7 @@ function manifestDownloadGraceMs(): number {
 
 /** Overall wall-clock budget (ms) for the custom-node install phase. Node installs
  *  drive the ComfyUI-Manager queue, which can legitimately run for minutes on a
- *  big pack. Blocking apply_manifest until it drains blows past the MCP tools/call
+ *  big pack. Blocking install_comfyui (action:"apply_manifest") until it drains blows past the MCP tools/call
  *  timeout (300s) and the caller sees a FALSE failure while the Manager keeps
  *  installing (#489). Bounding the phase well under that cap lets us hand back a
  *  "pending" result (poll the Manager queue) instead. Env-tunable; default 240s. */
@@ -72,7 +72,7 @@ const BUDGET_TIMEOUT = Symbol("manifest-node-budget-timeout");
  * resolved value, or BUDGET_TIMEOUT if the deadline elapses first. Bounds EVERY
  * async wait in the custom-node phase (#489) — the install itself AND the
  * surrounding listInstalledNodes round-trips — so a slow Manager can never push
- * apply_manifest past the MCP tools/call timeout; it hands back "pending" instead.
+ * install_comfyui (action:"apply_manifest") past the MCP tools/call timeout; it hands back "pending" instead.
  *
  * CAVEAT (single-threaded runtime): this bounds ASYNC work only. A SYNCHRONOUS
  * subprocess install unit — the git-clone / cm-cli fallback (execFileSync), like
@@ -183,7 +183,7 @@ async function resolveManifest(opts: ApplyManifestOptions): Promise<ComfyManifes
   const hasPath = opts.path !== undefined && opts.path.trim().length > 0;
   if (hasInline === hasPath) {
     throw new ValidationError(
-      "Provide exactly one of `manifest` or `path` to apply_manifest.",
+      'Provide exactly one of `manifest` or `path` to install_comfyui (action:"apply_manifest").',
     );
   }
   if (hasInline) return manifestSchema.parse(opts.manifest);
@@ -590,9 +590,9 @@ function remoteModelTarget(model: ComfyManifest["models"][number]): {
 
 /**
  * #390: resolve a saved default workspace to adopt as the local FS target for
- * THIS apply_manifest call, WITHOUT persisting it process-wide. Returns a path
+ * THIS install_comfyui (action:"apply_manifest") call, WITHOUT persisting it process-wide. Returns a path
  * only when: we are in local mode (a loopback/local ComfyUI, not remote/cloud),
- * COMFYUI_PATH is unset, and the saved default (what get_environment resolves)
+ * COMFYUI_PATH is unset, and the saved default (what install_comfyui (action:"environment") resolves)
  * both exists and looks like a ComfyUI install (has models/ or custom_nodes/).
  * The connected server is local (isRemoteMode() === false), so the saved default
  * is a valid local mirror of it. Returns undefined otherwise.
@@ -645,7 +645,7 @@ export async function applyManifest(
 }
 
 /**
- * The effective LOCAL ComfyUI base for an apply_manifest call. Never mutates
+ * The effective LOCAL ComfyUI base for an install_comfyui (action:"apply_manifest") call. Never mutates
  * global config. Returns undefined in remote/cloud mode or when no local install
  * can be found (COMFYUI_PATH unset, no saved default, no reachable live server).
  */
@@ -665,7 +665,7 @@ async function resolveLocalManifestBase(): Promise<string | undefined> {
       existsSync(join(liveBase, "custom_nodes")))
   ) {
     logger.info(
-      "apply_manifest: targeting the live connected ComfyUI root for this call (COMFYUI_PATH unset)",
+      'install_comfyui (action:"apply_manifest"): targeting the live connected ComfyUI root for this call (COMFYUI_PATH unset)',
       { path: liveBase },
     );
     return liveBase;
@@ -699,7 +699,7 @@ async function applyManifestSections(
         pkg,
         "skipped",
         hasLocalFs
-          ? "System packages must be installed manually or with root privileges; apply_manifest does not run apt."
+          ? 'System packages must be installed manually or with root privileges; install_comfyui (action:"apply_manifest") does not run apt.'
           : "System packages are not supported against a remote ComfyUI (no local shell/root access); install them on the ComfyUI host.",
       ),
     );
@@ -741,17 +741,17 @@ async function applyManifestSections(
   // the budget wins, the install keeps running SERVER-SIDE (we stop awaiting it,
   // swallowing its late result) and is reported "pending" — never failed — and
   // every not-yet-started node is reported "pending" too. The caller polls the
-  // Manager queue / re-runs apply_manifest to finish. A node that SETTLES within
+  // Manager queue / re-runs install_comfyui (action:"apply_manifest") to finish. A node that SETTLES within
   // budget is verified and reported applied/failed exactly as before.
   const nodeDeadline = Date.now() + manifestNodeBudgetMs();
   const pendingBudgetMessage = (started: boolean): string =>
     started
-      ? "Still installing on the ComfyUI-Manager queue when the apply_manifest time " +
+      ? 'Still installing on the ComfyUI-Manager queue when the install_comfyui (action:"apply_manifest") time ' +
         "budget elapsed. This is NOT a failure — the install continues server-side. " +
         "Poll the Manager queue for completion; do not re-issue this node."
-      : "Not started: the apply_manifest time budget elapsed while ComfyUI-Manager " +
+      : 'Not started: the install_comfyui (action:"apply_manifest") time budget elapsed while ComfyUI-Manager ' +
         "was still installing earlier packs. This is NOT a failure — poll the " +
-        "Manager queue for completion, then re-run apply_manifest to continue.";
+        'Manager queue for completion, then re-run install_comfyui (action:"apply_manifest") to continue.';
   let nodeBudgetSpent = false;
   // Even the INITIAL installed-list probe is budget-bounded — a hung Manager here
   // must not blow the tools/call timeout before we can report anything.
@@ -761,7 +761,7 @@ async function applyManifestSections(
   for (const id of manifest.custom_nodes) {
     const isPanelTarget = targetsPanelPackExactly(id);
     if (isPanelTarget) {
-      // `apply_manifest` has a Manager target but no authoritative association
+      // `install_comfyui (action:"apply_manifest")` has a Manager target but no authoritative association
       // between that target and a local served-panel root. In particular,
       // config.comfyuiPath may name loopback instance A while Manager targets B.
       // Refuse rather than pre/post-scan A around a mutation of B, or report a
@@ -771,9 +771,9 @@ async function applyManifestSections(
           "custom_node",
           id,
           "failed",
-          "apply_manifest does not manage the sidebar panel because it cannot prove that its " +
+          'install_comfyui (action:"apply_manifest") does not manage the sidebar panel because it cannot prove that its ' +
             "ComfyUI-Manager target and local served-panel filesystem are the same instance. " +
-            "Use install_panel on the selected ComfyUI host, which verifies the served version and .bak shadows.",
+            "Use install_comfyui(action:'panel') on the selected ComfyUI host, which verifies the served version and .bak shadows.",
         ),
       );
       continue;

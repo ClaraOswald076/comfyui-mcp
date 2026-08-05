@@ -14,7 +14,7 @@ Comfy Registry.
 
 - **Released:** `0.7.0` on npm — Theme E stability/hardening (E1–E4, E7, E2-auth), custom-node
   authoring tools, experimental agent-panel backend, hosted docs.
-- **Complete (on main, unreleased → queued for `0.8.0`):** Theme E additive (E5 `apply_manifest`,
+- **Complete (on main, unreleased → queued for `0.8.0`):** Theme E additive (E5 `install_comfyui (action:"apply_manifest")`,
   E6/E2b cloud storage, E8 `convert_image`), Theme C (C3 `node_pack` (`action: "verify"`), C5 scaffold CI),
   Theme D (D1 `comfy-researcher` + skill cache). **Epics A, C, D, E are closed.**
 - **Pending release:** cut **`0.8.0`** for the unreleased surface above — `comfyui-mcp-yrp` (see beads).
@@ -107,7 +107,7 @@ stateless-server / Salad-specific bits (replicas, deletion-cost, k8s proxy).
 - **E11 — Unique output filenames.** Prefix a request id to output filenames to avoid collisions.
 
 **Additive capabilities**
-- **E5 — Declarative environment manifest.** `apply_manifest` (yaml/json): apt/pip/custom_nodes/
+- **E5 — Declarative environment manifest.** `install_comfyui (action:"apply_manifest")` (yaml/json): apt/pip/custom_nodes/
   models (before/after start), idempotent — reproducible setups. Pairs with Theme C + workspace.
 - **E6 — Output upload to cloud storage.** Push generated outputs to S3 / Azure / HF / HTTP and
   return URLs. (`remote-storage-manager.ts`, `storage-providers/*`)

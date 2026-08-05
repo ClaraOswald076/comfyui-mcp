@@ -125,7 +125,7 @@ This package also ships as a **Claude Code plugin**, providing slash commands, s
 
 35 skills total — model-family guides (Flux, WAN, LTX 2.3, Qwen, Z-Image, Ideogram 4, ERNIE, ANIMA + anime / WAN / Z-Image LoRA training), the **model-registry** (curated download URLs), the **civitai** pairing skill, node authoring, the **launch/performance-flags** matrix, and the core four below. Full list on the [plugin docs page](https://comfyui-mcp.artokun.io/docs/plugin).
 
-> **Installer packs.** [`packs/`](packs/) bundles 13 one-command ComfyUI setups — ANIMA, Ideogram 4, LTX-2.3, ERNIE, WAN (animate / longer-videos / transparent), Qwen (image / image-edit), Z-Image (turbo / base / xy-plot) and artokun-flow (WAN Animate — replace / animate). Each is a manifest of custom nodes + model URLs + workflow that drives both `apply_manifest` and generated `install-windows.bat` / `install-runpod.sh`, with CI that validates every model link + payload size. See [`packs/README.md`](packs/README.md).
+> **Installer packs.** [`packs/`](packs/) bundles 13 one-command ComfyUI setups — ANIMA, Ideogram 4, LTX-2.3, ERNIE, WAN (animate / longer-videos / transparent), Qwen (image / image-edit), Z-Image (turbo / base / xy-plot) and artokun-flow (WAN Animate — replace / animate). Each is a manifest of custom nodes + model URLs + workflow that drives both `install_comfyui (action:"apply_manifest")` and generated `install-windows.bat` / `install-runpod.sh`, with CI that validates every model link + payload size. See [`packs/README.md`](packs/README.md).
 
 | Skill | Description |
 |-------|-------------|
@@ -328,7 +328,7 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 | Tool | Description |
 |------|-------------|
-| `clear_vram` | Free GPU VRAM by unloading cached models — calls ComfyUI's `/free` endpoint, reports before/after stats |
+| `get_system_stats (action:"clear_vram")` | Free GPU VRAM by unloading cached models — calls ComfyUI's `/free` endpoint, reports before/after stats |
 
 ### Registry & Discovery
 
@@ -350,7 +350,7 @@ Install [comfy-cli](https://docs.comfy.org/comfy-cli/getting-started#install-cli
 
 | Tool | Description |
 |------|-------------|
-| `get_logs` | Get ComfyUI server logs with optional keyword filter (e.g., `error`, `warning`, a node name) |
+| `get_system_stats (action:"logs")` | Get ComfyUI server logs with optional keyword filter (e.g., `error`, `warning`, a node name) |
 | `get_history` | Get execution history with full error details, Python tracebacks, timing, and cached node info |
 
 ### Process Control
@@ -804,12 +804,12 @@ src/
     workflow-library.ts    # get_workflow (8 read actions), save_workflow (save/lock/verify_lock)
     image-management.ts    # upload_image, list_output_images
     model-management.ts    # download_model, list_local_models (the two consolidated model tools)
-    memory-management.ts   # clear_vram
+    memory-management.ts   # get_system_stats (action:"clear_vram")
     registry-search.ts     # search_custom_nodes (search/details)
     node-management.ts     # install_custom_node (install/update/fix/uninstall/enable/disable/list/…)
     node-pack.ts           # node_pack (scaffold/verify/publish/read/write/patch/git/…)
     generation-tracker.ts  # suggest_settings, generation_stats
-    diagnostics.ts         # get_logs, get_history
+    diagnostics.ts         # get_system_stats (action:"logs"), get_history
     process-control.ts     # restart_comfyui (restart/start/stop)
     index.ts               # Registers all tool groups
   utils/
@@ -865,10 +865,10 @@ This is informational — the server uses the first one found. Set `COMFYUI_PATH
 For HuggingFace gated models, set `HUGGINGFACE_TOKEN`. For CivitAI, set `CIVITAI_API_TOKEN`.
 
 **Workflow execution errors**
-Use `/comfy:debug` to automatically diagnose failures. Or use `get_history` / `get_logs` directly to see detailed error messages including Python tracebacks from ComfyUI.
+Use `/comfy:debug` to automatically diagnose failures. Or use `get_history` / `get_system_stats (action:"logs")` directly to see detailed error messages including Python tracebacks from ComfyUI.
 
 **Out of memory (OOM)**
-Use `clear_vram` to free GPU memory before running large workflows. The VRAM watchdog hook will warn you automatically if memory is critically low. See the **troubleshooting** skill for model-specific VRAM estimates.
+Use `get_system_stats (action:"clear_vram")` to free GPU memory before running large workflows. The VRAM watchdog hook will warn you automatically if memory is critically low. See the **troubleshooting** skill for model-specific VRAM estimates.
 
 **Missing custom nodes**
 Use `/comfy:install <pack>` to install missing node packs from the registry. The debug command will detect and suggest missing packs automatically.

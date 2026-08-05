@@ -2,7 +2,7 @@
 //
 // The ENV line is prose, and it grew a qualifying clause when the running build and
 // the installed one disagree ("comfyui-mcp 0.48.18 (this process is RUNNING 0.48.18;
-// 0.49.5 is now installed on disk — …)"). report_issue forwards `mcp_version`
+// 0.49.5 is now installed on disk — …)"). The issue reporter forwards `mcp_version`
 // straight to the triage worker, which version-matches it against the fix history to
 // tell the user whether upgrading already resolves their bug — the single most
 // common resolution, and exactly what #846 exists to protect. A sentence where a
@@ -131,21 +131,14 @@ describe("normalizeReportedVersion (#846)", () => {
 
 // ---------------------------------------------------------------------------
 // WIRING. Everything above tests `normalizeReportedVersion` directly, so every
-// one of those cases stays green if `report_issue` stops CALLING it (codex gate
+// one of those cases stays green if the reporter stops CALLING it (codex gate
 // P2) — and a normalizer nobody calls protects nothing. This drives the real
 // registered handler and inspects the bytes that leave for the triage worker.
 
-describe("report_issue actually normalizes before sending (#846 wiring)", () => {
+describe('get_system_stats (action:"report_issue") normalizes before sending (#846 wiring)', () => {
   it("sends the extracted version to the worker, not the sentence it came in", async () => {
-    const { registerReportIssueTools } = await import("../../tools/report-issue.js");
-
-    let handler: ((args: Record<string, unknown>) => Promise<unknown>) | undefined;
-    const fakeServer = {
-      tool: (name: string, _desc: string, _schema: unknown, fn: typeof handler) => {
-        if (name === "report_issue") handler = fn;
-      },
-    } as unknown as Parameters<typeof registerReportIssueTools>[0];
-    registerReportIssueTools(fakeServer);
+    const { reportIssueAction } = await import("../../tools/report-issue.js");
+    const handler = reportIssueAction as (args: Record<string, unknown>) => Promise<unknown>;
     expect(handler).toBeTypeOf("function");
 
     const bodies: string[] = [];
@@ -160,7 +153,7 @@ describe("report_issue actually normalizes before sending (#846 wiring)", () => 
     }) as typeof fetch;
 
     try {
-      await handler!({
+      await handler({
         title: "t",
         body: "b",
         repo: "artokun/comfyui-mcp",
@@ -200,12 +193,9 @@ describe("the OMITTED-version fallback reports what is RUNNING, not what is inst
     // code; only the files changed.
     onDisk.version = "0.49.99";
 
-    let handler: ((args: Record<string, unknown>) => Promise<unknown>) | undefined;
-    mod.registerReportIssueTools({
-      tool: (name: string, _d: string, _s: unknown, fn: typeof handler) => {
-        if (name === "report_issue") handler = fn;
-      },
-    } as never);
+    const handler = mod.reportIssueAction as (
+      args: Record<string, unknown>,
+    ) => Promise<unknown>;
 
     const bodies: string[] = [];
     const realFetch = globalThis.fetch;
@@ -219,7 +209,7 @@ describe("the OMITTED-version fallback reports what is RUNNING, not what is inst
 
     try {
       // No mcp_version — the fallback is the whole point.
-      await handler!({ title: "t", body: "b", repo: "artokun/comfyui-mcp" });
+      await handler({ title: "t", body: "b", repo: "artokun/comfyui-mcp" });
     } finally {
       globalThis.fetch = realFetch;
       vi.doUnmock("../../services/self-update.js");

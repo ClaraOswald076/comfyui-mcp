@@ -1,4 +1,4 @@
-# Ideogram 4 (Ideogram Ultra) install manifest — consumable by apply_manifest (src/services/manifest.ts).
+# Ideogram 4 (Ideogram Ultra) install manifest — consumable by install_comfyui (action:"apply_manifest") (src/services/manifest.ts).
 # Ground truth: IDEOGRAM_ULTRA-MODELS-NODES_INSTALL.bat.
 # Mirror base: https://huggingface.co/Aitrepreneur/FLX/resolve/main
 # Official weights: https://huggingface.co/Comfy-Org/Ideogram-4

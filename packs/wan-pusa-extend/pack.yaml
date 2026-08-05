@@ -24,7 +24,7 @@ sources:
   pusa_upstream: https://huggingface.co/RaphaelLiu/PusaV1
 notes:
   - The T2V A14B UNets, UMT5 encoder and WAN VAE are SHARED with wan-t2v-video —
-    if you have that pack you already have them (apply_manifest skips existing
+    if you have that pack you already have them (install_comfyui (action:"apply_manifest") skips existing
     files). Only the two Pusa V1 LoRAs (~1.9 GB) are Pusa-specific.
   - Set VHS_LoadVideo to your own clip (the bundled graph points at a placeholder).
   - "fps seam — if your clip was frame-interpolated (e.g. RIFE'd to 32/50 fps),

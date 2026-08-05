@@ -1,4 +1,4 @@
-# Z-Image Base controlnet install manifest — consumable by apply_manifest.
+# Z-Image Base controlnet install manifest — consumable by install_comfyui (action:"apply_manifest").
 # Sliced from the z-image-base monolith's "Z-IMAGE COMBO CONTROLNET" pipeline
 # (Pose / Depth / Canny via comfyui_controlnet_aux preprocessors), un-bypassed
 # into a standalone graph. Verified: convert-only static check passes (the

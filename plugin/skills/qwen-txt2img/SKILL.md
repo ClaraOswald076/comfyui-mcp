@@ -319,7 +319,7 @@ Tips:
 | FP8 UNET + fp8 CLIP + VAE | ~17-18GB | Fits comfortably on RTX 4090 |
 | bf16 UNET (edit model) | ~10GB UNET + 7GB CLIP | Also fits well |
 
-- **Always `clear_vram`** before switching to Qwen from another model family
+- **Always `get_system_stats (action:"clear_vram")`** before switching to Qwen from another model family
 - Lightning 4-step is extremely fast (~3-5s per image)
 
 ## Tips

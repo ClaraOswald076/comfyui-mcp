@@ -45,10 +45,10 @@ packs/<name>/
 ```
 
 The key move: `manifest.yaml` isn't a new format. It's a **`ComfyManifest`** —
-the exact shape the server's existing `apply_manifest` tool already consumes to
+the exact shape the server's existing `install_comfyui (action:"apply_manifest")` tool already consumes to
 install nodes + models on a live ComfyUI. So one file drives two things:
 
-- **MCP-native install** — from a Claude session: `apply_manifest --path
+- **MCP-native install** — from a Claude session: `install_comfyui (action:"apply_manifest") --path
   packs/anima/manifest.yaml`, idempotent, with the same engine that powers the
   rest of the server.
 - **The double-click scripts** — `npm run packs:gen` reads the manifest and

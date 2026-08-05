@@ -306,7 +306,7 @@ Standard: **16 fps** for WAN 2.2 output.
 | Single FP8 model (no dual) | ~14-16GB | Lower quality but safer |
 | With VACE modules | +5.8GB per module | Very tight, may need block swap |
 
-- **Always `clear_vram`** before switching to WAN T2V from another model family
+- **Always `get_system_stats (action:"clear_vram")`** before switching to WAN T2V from another model family
 - Lightning (4 steps) dramatically reduces generation time: ~70s vs ~5-10 min for 20 steps
 - Only one UNET is active during each pass — they swap in/out
 

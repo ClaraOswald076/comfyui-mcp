@@ -1,4 +1,4 @@
-# KREA 2 (krea2_turbo) COMBO — two-pass detail boost. V2. Consumable by apply_manifest.
+# KREA 2 (krea2_turbo) COMBO — two-pass detail boost. V2. Consumable by install_comfyui (action:"apply_manifest").
 # Sliced from the KREA2 ULTRA V2 monolith's "TWO TIMES COMBO" pipeline: a first
 # pass (8 steps, er_sde, denoise 1) then a low-denoise refine pass (4 steps, euler,
 # denoise 0.3), with the krea2 turbo LoRA @0.2 on both passes + the Krea2T-Enhancer

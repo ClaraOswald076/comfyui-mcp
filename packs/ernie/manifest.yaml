@@ -1,4 +1,4 @@
-# ERNIE-Image Ultra install manifest — consumable by apply_manifest (src/services/manifest.ts).
+# ERNIE-Image Ultra install manifest — consumable by install_comfyui (action:"apply_manifest") (src/services/manifest.ts).
 # Ground truth: ERNIE-IMAGE_ULTRA-MODELS-NODES_INSTALL.bat (cross-checked against
 # ...-COMFYUI-MANAGER_AUTO_INSTALL.bat, ...-AUTO_INSTALL-RUNPOD.sh, and the workflow).
 # Mirror base: https://huggingface.co/Aitrepreneur/FLX/resolve/main  (third-party mirror)

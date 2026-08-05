@@ -1,4 +1,4 @@
-# Z-Image Base inpaint install manifest — consumable by apply_manifest.
+# Z-Image Base inpaint install manifest — consumable by install_comfyui (action:"apply_manifest").
 # Sliced from the z-image-base monolith's "Z-IMAGE INPAINTING" pipeline
 # (un-bypassed into a standalone graph). Verified: convert-only static check passes.
 # Mirror base: https://huggingface.co/Aitrepreneur/FLX/resolve/main  (third-party)

@@ -277,7 +277,7 @@ Klein 9B LoRAs go in `loras/Flux.2 Klein 9B/` subfolder:
 | Klein 9B FP8 + Qwen3-8B | ~20GB | Fits comfortably on 4090 |
 | SRPO + Turbo LoRA | ~24GB | Same as SRPO base |
 
-- **Always `clear_vram`** before switching to Flux from another model family
+- **Always `get_system_stats (action:"clear_vram")`** before switching to Flux from another model family
 - T5XXL is the main VRAM consumer alongside the UNET — both stay loaded during sampling
 - CLIP-L is small (235MB) and negligible
 

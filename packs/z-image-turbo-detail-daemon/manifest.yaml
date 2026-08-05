@@ -1,4 +1,4 @@
-# Z-Image-Turbo Detail Daemon install manifest — consumable by apply_manifest.
+# Z-Image-Turbo Detail Daemon install manifest — consumable by install_comfyui (action:"apply_manifest").
 # Sliced from the z-image-turbo monolith's "Z-IMAGE TURBO DETAIL DEAMON" pipeline
 # (un-bypassed standalone). DetailDaemonSamplerNode comes from ComfyUI-Detail-Daemon.
 # Mirror base: https://huggingface.co/Aitrepreneur/FLX/resolve/main  (third-party)

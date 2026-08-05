@@ -29,10 +29,12 @@ Drive the official comfy-cli (envelope/1 JSON contract) for the selected ComfyUI
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which comfy-cli operation to perform. Families: status; server_* (lifecycle); jobs_* (list/status/wait/watch/cancel); search_nodes; workflow_* (validate/run); transfer_* (upload/download); models_* (list_folders/list_folder/search/show/download/remove); skills_* (list/show/validate/install/status/uninstall). Options: `status`, `server_start`, `server_stop`, `server_restart`, `jobs_list`, `jobs_status`, `jobs_wait`, `jobs_watch`, `jobs_cancel`, `search_nodes`, `workflow_validate`, `workflow_run`, `transfer_upload`, `transfer_download`, `models_list_folders`, `models_list_folder`, `models_search`, `models_show`, `models_download`, `models_remove`, `skills_list`, `skills_show`, `skills_validate`, `skills_install`, `skills_status`, `skills_uninstall`.
+  Which comfy-cli operation to perform. Families: status; server_* (lifecycle); jobs_* (list/status/wait/watch/cancel); search_nodes; workflow_* (validate/run); transfer_* (upload/download); models_* (list_folders/list_folder/search/show/download/remove); skills_* (list/show/validate/install/status/uninstall).
+  Options: `status`, `server_start`, `server_stop`, `server_restart`, `jobs_list`, `jobs_status`, `jobs_wait`, `jobs_watch`, `jobs_cancel`, `search_nodes`, `workflow_validate`, `workflow_run`, `transfer_upload`, `transfer_download`, `models_list_folders`, `models_list_folder`, `models_search`, `models_show`, `models_download`, `models_remove`, `skills_list`, `skills_show`, `skills_validate`, `skills_install`, `skills_status`, `skills_uninstall`.
 </ParamField>
 <ParamField path="detail" type="enum" default="env">
-  action:"status" — which inspection to run. Options: `version`, `which`, `env`, `discover`.
+  action:"status" — which inspection to run.
+  Options: `version`, `which`, `env`, `discover`.
 </ParamField>
 <ParamField path="workspace" type="string">
   Optional ComfyUI workspace override. Otherwise COMFYUI_PATH/auto-detection is used.
@@ -56,7 +58,8 @@ Drive the official comfy-cli (envelope/1 JSON contract) for the selected ComfyUI
   actions "jobs_wait"/"jobs_watch"/"workflow_run" — max seconds to wait.
 </ParamField>
 <ParamField path="where" type="enum">
-  Target for the jobs/search_nodes/workflow/transfer/models actions: "local" (default) or "cloud" (Comfy Cloud). Options: `local`, `cloud`.
+  Target for the jobs/search_nodes/workflow/transfer/models actions: "local" (default) or "cloud" (Comfy Cloud).
+  Options: `local`, `cloud`.
 </ParamField>
 <ParamField path="query" type="string">
   action:"search_nodes" — fuzzy search text. REQUIRED.
@@ -107,7 +110,8 @@ Drive the official comfy-cli (envelope/1 JSON contract) for the selected ComfyUI
   action:"skills_validate" — path to the skill to validate. REQUIRED.
 </ParamField>
 <ParamField path="scope" type="enum">
-  actions "skills_install"/"skills_uninstall"/"skills_status" — install scope. Options: `user`, `project`.
+  actions "skills_install"/"skills_uninstall"/"skills_status" — install scope.
+  Options: `user`, `project`.
 </ParamField>
 <ParamField path="projectDir" type="string">
   Working directory for project-scoped skill operations. Required when scope='project'.

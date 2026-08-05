@@ -1,4 +1,4 @@
-# WAN 2.2 Transparent Expressions — install manifest (consumable by apply_manifest, src/services/manifest.ts).
+# WAN 2.2 Transparent Expressions — install manifest (consumable by install_comfyui (action:"apply_manifest"), src/services/manifest.ts).
 # Source of truth: WAN2_2-IMG2VID_TRANSPARENT_WORKFLOW.json (a SillyTavern transparent-expression I2V workflow).
 # Base WAN 2.2 models/nodes mirror the ULTRA installer (WAN2_2-ULTRA-MODELS-NODES_INSTALL.bat):
 #   HF mirror: https://huggingface.co/Aitrepreneur/FLX/resolve/main

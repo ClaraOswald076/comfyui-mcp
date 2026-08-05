@@ -58,7 +58,7 @@ export async function removeBackground(
     if (installed === false) {
       throw new ValidationError(
         `The background-removal node "${REMBG_NODE}" (ComfyUI-RMBG) is not installed. ` +
-          "Install it with apply_manifest --path packs/wan-transparent/manifest.yaml, " +
+          'Install it with install_comfyui (action:"apply_manifest") path:"packs/wan-transparent/manifest.yaml", ' +
           "or install_custom_node id 'comfyui-rmbg'. The BiRefNet model auto-downloads " +
           "into models/RMBG/BiRefNet/ on first run.",
       );

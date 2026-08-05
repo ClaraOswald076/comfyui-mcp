@@ -203,7 +203,7 @@ MERGE / COMPOSE WORKFLOWS — to bring nodes from ONE workflow into ANOTHER (com
 
 REUSE SUBGRAPHS via the blueprint library — when the user builds a useful subgraph and wants to reuse it (now or in other workflows), SAVE it: panel_create_subgraph to group the nodes (if not already a subgraph), then panel_save_subgraph(node_id, name) publishes it to their library programmatically (no dialog). To drop a saved one into ANY workflow later, list them with panel_list_subgraphs and add with panel_add_subgraph(name). This is the durable way to reuse a building block across projects — distinct from copy/paste (a one-off merge of the current clipboard).
 
-PREFER READY EXPERTISE OVER HAND-BUILDING. When the user asks you to "set up", "build", or "make" a workflow for a specific model FAMILY (krea2, wan, flux, qwen, ltx, z-image, ideogram, anima, ernie, etc.), do NOT immediately hand-build a generic graph from scratch. FIRST, in order: (a) consult the matching SKILL for that family. If you already have a skill for it loaded in your context, use it. If you do NOT have its full guidance in front of you, do NOT guess from memory — actually CALL the comfyui MCP's list_packs(action:"skill_list") to see what's bundled, then list_packs(action:"skill_read", name:<name>) to load the real family expertise (model slots, the node graph, settings, gotchas) before you build; (b) check the installer PACKS by CALLING list_packs(action:"list") (each packs/<name>/ has a ready manifest.yaml AND a ready workflow.json). If a pack matches the family, PREFER it: apply_manifest --path <its manifest_path> installs the right custom nodes + model weights, and the pack's workflow.json is the expert graph — CALL list_packs(action:"read_workflow", name:<name>) to get that ready graph and recreate it on the live canvas via panel_add_node/panel_connect/panel_set_widget so the user watches it build (or enqueue it headlessly when they don't need it on-canvas), instead of inventing your own. Don't claim a skill or pack exists unless a tool result confirmed it; (c) check the ComfyUI workflow Templates — call list_packs(action:"list_templates") (it lists CUSTOM-NODE-contributed templates from the server's /api/workflow_templates index; it does NOT enumerate ComfyUI's own core bundled templates, which are served separately) for a matching starter, and ALSO point the user at the frontend's Templates browser directly, since core templates only appear there. Only build from scratch if NOTHING matches — and when you do, briefly say what you checked (skill, packs, templates) so the user knows you didn't reinvent the wheel. And never wipe the user's current canvas (no panel_clear) until the replacement is actually ready to drop in. To load a ready pack graph onto the live canvas in one shot (instead of recreating it node-by-node), use panel_load_workflow(pack:<name>) — the pack's UI workflow.json is read server-side and dropped onto the canvas, undoable.
+PREFER READY EXPERTISE OVER HAND-BUILDING. When the user asks you to "set up", "build", or "make" a workflow for a specific model FAMILY (krea2, wan, flux, qwen, ltx, z-image, ideogram, anima, ernie, etc.), do NOT immediately hand-build a generic graph from scratch. FIRST, in order: (a) consult the matching SKILL for that family. If you already have a skill for it loaded in your context, use it. If you do NOT have its full guidance in front of you, do NOT guess from memory — actually CALL the comfyui MCP's list_packs(action:"skill_list") to see what's bundled, then list_packs(action:"skill_read", name:<name>) to load the real family expertise (model slots, the node graph, settings, gotchas) before you build; (b) check the installer PACKS by CALLING list_packs(action:"list") (each packs/<name>/ has a ready manifest.yaml AND a ready workflow.json). If a pack matches the family, PREFER it: install_comfyui (action:"apply_manifest") --path <its manifest_path> installs the right custom nodes + model weights, and the pack's workflow.json is the expert graph — CALL list_packs(action:"read_workflow", name:<name>) to get that ready graph and recreate it on the live canvas via panel_add_node/panel_connect/panel_set_widget so the user watches it build (or enqueue it headlessly when they don't need it on-canvas), instead of inventing your own. Don't claim a skill or pack exists unless a tool result confirmed it; (c) check the ComfyUI workflow Templates — call list_packs(action:"list_templates") (it lists CUSTOM-NODE-contributed templates from the server's /api/workflow_templates index; it does NOT enumerate ComfyUI's own core bundled templates, which are served separately) for a matching starter, and ALSO point the user at the frontend's Templates browser directly, since core templates only appear there. Only build from scratch if NOTHING matches — and when you do, briefly say what you checked (skill, packs, templates) so the user knows you didn't reinvent the wheel. And never wipe the user's current canvas (no panel_clear) until the replacement is actually ready to drop in. To load a ready pack graph onto the live canvas in one shot (instead of recreating it node-by-node), use panel_load_workflow(pack:<name>) — the pack's UI workflow.json is read server-side and dropped onto the canvas, undoable.
 
 OPENING A STAGED / DOWNLOADED WORKFLOW. When you've saved or downloaded a workflow .json into the user's ComfyUI workflows folder (e.g. an example you fetched), open it with panel_open_workflow(path:<name-or-path>) — it now REFRESHES the frontend's (cached) workflow list before searching, so a just-staged file is found and opened natively in its own tab. For a workflow .json that lives OUTSIDE the workflows folder (any absolute path on the ComfyUI machine, or a downloaded example you didn't move into workflows/), load it directly onto the live canvas with panel_load_workflow(path:<file>) — the orchestrator reads + parses the JSON server-side and drops it on the canvas in one shot, so even a large (100KB+) workflow never has to shuttle through this chat. Prefer panel_load_workflow(path:<file>) over pasting a big workflow JSON inline as the graph arg.
 
@@ -213,7 +213,7 @@ RECOMMENDING CIVITAI MODELS — SHOW, DON'T JUST TELL. When the user asks about 
 
 DOWNLOADING MODELS — use the download_model tool, NOT a raw shell download. When a workflow needs model weights you don't have (checkpoints, LoRAs, VAEs, text encoders, etc.), download them with the comfyui MCP download_model tool, action:"download" (or action:"download_civitai" for CivitAI): it streams the file into the correct ComfyUI models/ subfolder AND surfaces live progress in the panel's download tray so the user can watch it. Pass target_subfolder to land the file exactly where it belongs (e.g. 'loras', 'checkpoints', 'vae', 'text_encoders', or a nested path like 'loras/<subdir>'). Do NOT shell out to curl/wget/aria2 for model files — a raw shell download has no progress in the panel and can drop the file in the wrong place. Reserve the shell for things download_model can't do.
 
-HARDWARE & RUNTIME STATS — use the MCP tools, NOT the shell. For GPU / VRAM / CPU / RAM, CUDA/torch/python versions, and ComfyUI runtime stats, call the comfyui MCP get_system_stats (raw /system_stats) or get_environment (a summarized snapshot) — they read the CONNECTED ComfyUI's /system_stats and work for LOCAL and REMOTE targets alike. Do NOT shell out (nvidia-smi, PowerShell, wmic, python) for hardware info: the managed shell is sandboxed/read-only and rejects multi-line scripts, so those probes fail and only reach the orchestrator host anyway, not a remote ComfyUI. The startup ENVIRONMENT line already summarizes the machine; when you need current or more detail, get_system_stats / get_environment are the source of truth.
+HARDWARE & RUNTIME STATS — use the MCP tools, NOT the shell. For GPU / VRAM / CPU / RAM, CUDA/torch/python versions, and ComfyUI runtime stats, call the comfyui MCP get_system_stats (raw /system_stats) or install_comfyui (action:"environment") (a summarized snapshot) — they read the CONNECTED ComfyUI's /system_stats and work for LOCAL and REMOTE targets alike. Do NOT shell out (nvidia-smi, PowerShell, wmic, python) for hardware info: the managed shell is sandboxed/read-only and rejects multi-line scripts, so those probes fail and only reach the orchestrator host anyway, not a remote ComfyUI. The startup ENVIRONMENT line already summarizes the machine; when you need current or more detail, get_system_stats / install_comfyui (action:"environment") are the source of truth.
 
 LOCAL-GPU (FREE) vs API NODES (PAID CREDITS) — and ASK before spending. ComfyUI workflows are either LOCAL — they run on the user's OWN GPU, which is free — or they use API NODES (hosted/partner services) that consume the user's PAID api credits. The bundled installer packs (list_packs action:"list") are ALL local/free; ComfyUI's official templates and any ad-hoc or generated workflow MAY use API nodes. BEFORE you build OR load any workflow that uses API nodes, you MUST ASK the user whether to use the free local GPU or paid api credits, and NEVER silently spend credits. To tell the difference reliably, call list_packs(action:"check_runtime", pack:<name> or graph:<json>) — it returns { runtime: 'local'|'api'|'mixed'|'unknown', usesApiNodes, apiNodes[] } by scanning the graph's nodes against the server's API-node set; treat 'api'/'mixed' (usesApiNodes:true) AND 'unknown' (unclassifiable nodes that could be paid) as POSSIBLY PAID and stop to ask — only 'local' is confirmed free. DEFAULT TO / PREFER the local pack unless the user explicitly opts into API nodes. Packs are always safe to load without asking; check ad-hoc/template workflows first.
 
@@ -261,7 +261,7 @@ Never invent component types beyond: Text, Heading, Button, Row, Column, Card, D
 const PI_CAPABILITY_OVERRIDE = `
 
 === IMPORTANT CAPABILITY OVERRIDE — READ THIS, IT SUPERSEDES THE ABOVE ===
-You are running on the pi (pi.dev) backend, which has NO ComfyUI tools. Disregard every instruction above about panel_* tools (panel_graph_outline, panel_query_graph, panel_add_node, panel_connect, panel_set_widget, panel_run, panel_save_workflow, panel_install_node, panel_free_vram, …) and the headless comfyui tools (generate_image, enqueue_workflow, list_packs, apply_manifest, …): NONE of them exist in your runtime. You cannot see, read, or edit the user's ComfyUI canvas, cannot queue renders, cannot install nodes, and cannot call any panel_*/comfyui tool — attempting one is impossible, and you must never claim to, pretend to, or narrate doing so. You have ONLY your own built-in tools (shell, file read/write/edit, search) operating on the local filesystem. If the user asks for canvas/workflow work (build/inspect/run a graph, install a node, fix a render), say plainly that the pi backend has no ComfyUI tools and they should switch to the Claude, Codex, Gemini, or Antigravity backend for canvas work — you can still help with local files, code, and shell tasks.`;
+You are running on the pi (pi.dev) backend, which has NO ComfyUI tools. Disregard every instruction above about panel_* tools (panel_graph_outline, panel_query_graph, panel_add_node, panel_connect, panel_set_widget, panel_run, panel_save_workflow, panel_install_node, panel_free_vram, …) and the headless comfyui tools (generate_image, enqueue_workflow, list_packs, install_comfyui (action:"apply_manifest"), …): NONE of them exist in your runtime. You cannot see, read, or edit the user's ComfyUI canvas, cannot queue renders, cannot install nodes, and cannot call any panel_*/comfyui tool — attempting one is impossible, and you must never claim to, pretend to, or narrate doing so. You have ONLY your own built-in tools (shell, file read/write/edit, search) operating on the local filesystem. If the user asks for canvas/workflow work (build/inspect/run a graph, install a node, fix a render), say plainly that the pi backend has no ComfyUI tools and they should switch to the Claude, Codex, Gemini, or Antigravity backend for canvas work — you can still help with local files, code, and shell tasks.`;
 
 /**
  * Appended when the loopback panel HTTP MCP FAILED TO BIND, for every backend that
@@ -1161,7 +1161,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     );
   })();
   // ComfyUI install path — when set AND the target is loopback, the spawned agent's
-  // MCP runs in LOCAL mode (download_model / apply_manifest / installer-pack /
+  // MCP runs in LOCAL mode (download_model / install_comfyui (action:"apply_manifest") / installer-pack /
   // model-scan tools). A REMOTE target (non-loopback) forces remote-only, so we
   // drop the path. `envComfyuiPath` is the orchestrator's own env value; the live
   // `comfyuiPath` is derived from it + the current target.
@@ -1190,7 +1190,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   // #296: an embedded LOCAL sidebar session with NO CLI-configured workspace
   // (COMFYUI_PATH unset AND auto-detect empty) would otherwise spawn path-less —
   // its comfyui MCP stuck in a degraded "local but path-less" state (no
-  // download_model/apply_manifest/model-scan LOCAL surface, panel_load_workflow's
+  // download_model/install_comfyui (action:"apply_manifest")/model-scan LOCAL surface, panel_load_workflow's
   // local fallback blind). The panel already KNOWS where ComfyUI lives and serves
   // it at GET /comfyui_mcp_panel/status (base_path). resolveComfyuiPathForTarget
   // consumes it as a last-resort fallback for a loopback, non-force-remote target
@@ -1211,7 +1211,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   }
   // Force the child remote only when opted in (--force-remote) or the target is
   // non-loopback; a default loopback panel user with no COMFYUI_PATH is left to
-  // auto-detect its local install (keeps download_model/apply_manifest/scans).
+  // auto-detect its local install (keeps download_model/install_comfyui (action:"apply_manifest")/scans).
   const forceRemoteEnv = (): Record<string, string> =>
     isForceRemoteFlagSet() || !isLoopbackUrl(comfyuiUrl)
       ? { COMFYUI_MCP_FORCE_REMOTE: "1" }
@@ -2054,7 +2054,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         // this tab's agent when a download settles (#547) — the child stamps its
         // own COMFYUI_MCP_TAB into each progress row, mirroring COMFYUI_MCP_BLIND.
         ...(panelTab ? { COMFYUI_MCP_TAB: panelTab } : {}),
-        // Local mode → enables download_model, apply_manifest (installer packs),
+        // Local mode → enables download_model, install_comfyui (action:"apply_manifest") (installer packs),
         // and model scans so the agent installs the right way instead of curl.
         ...(comfyuiPath ? { COMFYUI_PATH: comfyuiPath } : forceRemoteEnv()),
         // Blind tab (issue #90): this tab's tool server withholds image pixels.
@@ -3044,11 +3044,11 @@ export async function runPanelOrchestrator(): Promise<void> {
                 text:
                   `⚠️ Could not automatically sync the ComfyUI-MCP panel; no update was claimed. ` +
                   // #784 — this is pushed to the embedded panel chat, whose
-                  // tool set does not include install_panel. Name it only where
+                  // tool set does not include install_comfyui(action:'panel'). Name it only where
                   // it can be invoked.
                   `${
                     panelRecoveryContext().installPanelUsable
-                      ? "Run install_panel(action:'status') to inspect it, then retry install_panel(action:'sync') if appropriate."
+                      ? "Run install_comfyui(action:'panel', panel_action:'status') to inspect it, then retry install_comfyui(action:'panel', panel_action:'sync') if appropriate."
                       : "Inspect and update the panel pack on the ComfyUI host itself — no tool in this session can do it."
                   } (${detail})`,
               },
@@ -4967,7 +4967,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   // equivalent, so a "download then use the model" task stalled until the user
   // poked it. We observe the SAME first-terminal transition the tray-prune timer
   // uses and inject a completion event to the tab's agent — but COALESCED: an
-  // apply_manifest that pulls many files would otherwise fire one turn per file,
+  // install_comfyui (action:"apply_manifest") that pulls many files would otherwise fire one turn per file,
   // so completions accumulate per agent for a short window and flush as ONE event.
   const DOWNLOAD_DONE_DEBOUNCE_MS = 1500;
   // agentKey → { download identity → {name, terminal status} } accumulated since

@@ -47,7 +47,8 @@ Fetch a generated image from ComfyUI and return it as an inline image. Video/aud
   Output image filename, e.g. PulID_Klein_00001_.png
 </ParamField>
 <ParamField path="type" type="enum" default="output">
-  Image directory: output (default), input, or temp Options: `output`, `input`, `temp`.
+  Image directory: output (default), input, or temp
+  Options: `output`, `input`, `temp`.
 </ParamField>
 <ParamField path="subfolder" type="string" default="">
   Subfolder within the directory, if any
@@ -88,7 +89,8 @@ Re-encode a generated image to PNG, JPEG, or WebP and return it inline as an ima
   Path to a source image under COMFYUI_PATH/output. Provide exactly one of asset_id or path.
 </ParamField>
 <ParamField path="format" type="enum" required>
-  Target encoded image format. Options: `png`, `jpeg`, `webp`.
+  Target encoded image format.
+  Options: `png`, `jpeg`, `webp`.
 </ParamField>
 <ParamField path="quality" type="integer">
   Encoder quality, 1-100. Applies where supported by the selected format.
@@ -137,7 +139,8 @@ Measure the color of a rendered image (not by eye): returns black/white points, 
   Subfolder for the output ref (default empty).
 </ParamField>
 <ParamField path="type" type="enum">
-  ComfyUI dir for the output ref (default 'output'). Options: `output`, `input`, `temp`.
+  ComfyUI dir for the output ref (default 'output').
+  Options: `output`, `input`, `temp`.
 </ParamField>
 <ParamField path="path" type="string">
   Absolute image path, or a path under the ComfyUI output dir. Provide one source: asset_id, filename, or path. (Videos: extract a frame to PNG first.)
@@ -237,10 +240,12 @@ Stage an EXISTING ComfyUI output (or temp/preview) as an INPUT so the next stage
   Subfolder the asset currently lives in, if any
 </ParamField>
 <ParamField path="type" type="enum" default="output">
-  Source directory the asset lives in: output (default) or temp (previews) Options: `output`, `temp`.
+  Source directory the asset lives in: output (default) or temp (previews)
+  Options: `output`, `temp`.
 </ParamField>
 <ParamField path="kind" type="enum">
-  Force the media kind instead of inferring it from the file extension Options: `image`, `video`, `audio`.
+  Force the media kind instead of inferring it from the file extension
+  Options: `image`, `video`, `audio`.
 </ParamField>
 <ParamField path="as_filename" type="string">
   Override the filename it is registered under in the input/ directory (defaults to the source filename)
@@ -391,7 +396,8 @@ List recently generated image AND video files from ComfyUI's output/ directory, 
   Filter by filename pattern (case-insensitive substring match)
 </ParamField>
 <ParamField path="format" type="enum">
-  Response shape: markdown (default, human/agent-readable) or json (&#123;images:[&#123;filename,subfolder,kind,size,modified&#125;]&#125; — for app clients building pick grids). Options: `markdown`, `json`.
+  Response shape: markdown (default, human/agent-readable) or json (&#123;images:[&#123;filename,subfolder,kind,size,modified&#125;]&#125; — for app clients building pick grids).
+  Options: `markdown`, `json`.
 </ParamField>
 
 ### Examples

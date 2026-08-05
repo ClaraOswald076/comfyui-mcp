@@ -94,8 +94,8 @@ const CATEGORIES: Array<{
     icon: "play",
     description: "Enqueue workflows — one at a time, from a named template, or as a batch — and inspect the queue, jobs, history, and system stats.",
     tools: [
-      "enqueue_workflow", "rerun_generation", "get_system_stats", "queue", "get_history", "get_logs",
-      "health_check", "calculate", "diagnose_run",
+      "enqueue_workflow", "rerun_generation", "get_system_stats", "queue", "get_history",
+      "diagnose_run",
       // Template execution: run_template is an enqueue entrypoint, and
       // get_template_schema is the lookup you make first to fill its overrides.
       "get_template_schema", "run_template",
@@ -144,7 +144,6 @@ const CATEGORIES: Array<{
       // (8 actions) and list_local_models (6). Both survivors keep their names,
       // so this list simply shrinks.
       "download_model", "list_local_models",
-      "clear_vram",
       "model_metadata",
     ],
   },
@@ -174,9 +173,7 @@ const CATEGORIES: Array<{
     icon: "wrench",
     description: "Install/update ComfyUI and the sidebar panel, self-update the MCP server, apply a setup manifest, manage workspaces, inspect the environment, configure ComfyUI-Manager, report issues.",
     tools: [
-      "install_comfyui", "update_comfyui", "update_all", "install_panel", "self_update",
-      "apply_manifest", "workspace",
-      "get_environment", "configure_manager", "report_issue",
+      "install_comfyui", "workspace",
     ],
   },
   {
@@ -294,7 +291,13 @@ function renderParam(name: string, schema: JsonSchema, required: boolean): strin
   const body: string[] = [];
   if (schema.description) body.push(esc(schema.description));
   if (schema.enum) body.push(`Options: ${schema.enum.map((e) => `\`${String(e)}\``).join(", ")}.`);
-  return `<ParamField ${attrs.join(" ")}>\n  ${body.join(" ") || "—"}\n</ParamField>`;
+  // Description and the enum Options list go on SEPARATE lines, not joined by a
+  // space. The vocabulary gate exempts at most ONE occurrence of a name per line
+  // (more than one and it cannot tell which is history), and 0.50.0 slice 13 chose
+  // action names identical to the tools they replace — so `apply_manifest` appears
+  // in both the prose and the Options list of the same ParamField. Joined, that
+  // line is permanently unexemptable; split, each occurrence can be declared.
+  return `<ParamField ${attrs.join(" ")}>\n  ${body.join("\n  ") || "—"}\n</ParamField>`;
 }
 
 // Most examples can be derived from JSON Schema required fields. Flat action

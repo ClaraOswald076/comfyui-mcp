@@ -167,7 +167,8 @@ Generate an image guided by a reference image's style/subject via IP-Adapter, pl
   IPAdapterUnifiedLoader preset (default 'PLUS (high strength)')
 </ParamField>
 <ParamField path="weight_type" type="enum">
-  IPAdapter weight mode (default 'standard' — required by current IPAdapter_plus builds) Options: `standard`, `prompt is more important`, `style transfer`.
+  IPAdapter weight mode (default 'standard' — required by current IPAdapter_plus builds)
+  Options: `standard`, `prompt is more important`, `style transfer`.
 </ParamField>
 <ParamField path="negative_prompt" type="string">
   Negative prompt (default: empty / from defaults)
@@ -251,7 +252,8 @@ Generate audio from a text prompt — supports ACE Step 1.5 and Stable Audio 3 m
 ### Parameters
 
 <ParamField path="model_family" type="enum" required>
-  Audio model family — determines which workflow template and model loaders to use Options: `ace_step_1.5`, `stable_audio_3`.
+  Audio model family — determines which workflow template and model loaders to use
+  Options: `ace_step_1.5`, `stable_audio_3`.
 </ParamField>
 <ParamField path="prompt" type="string" required>
   Text description of the audio to generate (genre, mood, instruments, etc.)
@@ -308,7 +310,8 @@ Generate audio from a text prompt — supports ACE Step 1.5 and Stable Audio 3 m
   TextEncodeAceStepAudio1.5 tempo in beats per minute (ACE only, 10-300, default: 120)
 </ParamField>
 <ParamField path="timesignature" type="enum">
-  TextEncodeAceStepAudio1.5 time signature (ACE only, one of '2'/'3'/'4'/'6', default: '4') Options: `2`, `3`, `4`, `6`.
+  TextEncodeAceStepAudio1.5 time signature (ACE only, one of '2'/'3'/'4'/'6', default: '4')
+  Options: `2`, `3`, `4`, `6`.
 </ParamField>
 <ParamField path="temperature" type="number">
   TextEncodeAceStepAudio1.5 LLM sampling temperature (ACE only, 0-2, default: 0.85)
@@ -326,7 +329,8 @@ Generate audio from a text prompt — supports ACE Step 1.5 and Stable Audio 3 m
   TextEncodeAceStepAudio1.5 — generate audio codes via the LLM (ACE only, default: true)
 </ParamField>
 <ParamField path="audio_quality" type="enum">
-  SaveAudioMP3 bitrate/quality (ACE only, one of 'V0'/'128k'/'320k', default: '320k') Options: `V0`, `128k`, `320k`.
+  SaveAudioMP3 bitrate/quality (ACE only, one of 'V0'/'128k'/'320k', default: '320k')
+  Options: `V0`, `128k`, `320k`.
 </ParamField>
 <ParamField path="checkpoint" type="string">
   Stable Audio 3 checkpoint filename (in models/checkpoints/); auto-selected if omitted
@@ -357,7 +361,7 @@ Generate audio from a text prompt — supports ACE Step 1.5 and Stable Audio 3 m
 
 ## generate_video
 
-Generate a short video from a text prompt (text-to-video), or animate a start image (image-to-video when `image` is given) — the high-level entry point. Composes an LTX-2.3 distilled workflow on your LOCAL GPU using the render-verified Comfy-Org node stack (gemma text encoder + abliterated/distilled LoRAs). Needs the LTX-2.3 models (~24-46GB): install with apply_manifest --path packs/ltx-2.3-txt2vid/manifest.yaml (or ltx-2.3-img2vid for i2v); returns an actionable error if the checkpoint is missing. seconds is converted to an 8n+1 frame count. For i2v, higher `strength` means MORE adherence to the start frame but LESS motion (1.0 can freeze the clip) — keep ~0.6. This minimal path omits the synchronized audio + stage-2 spatial upscale that the full ltx-2.3 packs ship. Returns prompt_id immediately; the video is written under output/video/ — find it with list_output_images (VHS/SaveVideo outputs may not appear in /history).
+Generate a short video from a text prompt (text-to-video), or animate a start image (image-to-video when `image` is given) — the high-level entry point. Composes an LTX-2.3 distilled workflow on your LOCAL GPU using the render-verified Comfy-Org node stack (gemma text encoder + abliterated/distilled LoRAs). Needs the LTX-2.3 models (~24-46GB): install with install_comfyui (action:"apply_manifest") path:"packs/ltx-2.3-txt2vid/manifest.yaml" (or ltx-2.3-img2vid for i2v); returns an actionable error if the checkpoint is missing. seconds is converted to an 8n+1 frame count. For i2v, higher `strength` means MORE adherence to the start frame but LESS motion (1.0 can freeze the clip) — keep ~0.6. This minimal path omits the synchronized audio + stage-2 spatial upscale that the full ltx-2.3 packs ship. Returns prompt_id immediately; the video is written under output/video/ — find it with list_output_images (VHS/SaveVideo outputs may not appear in /history).
 
 ### Parameters
 
@@ -425,7 +429,8 @@ Generate a 3D model (glb/obj/fbx) from a text prompt or an input image, using th
 ### Parameters
 
 <ParamField path="mode" type="enum" required>
-  "text" = text-to-3D from prompt; "image" = image-to-3D from an uploaded input image. Options: `text`, `image`.
+  "text" = text-to-3D from prompt; "image" = image-to-3D from an uploaded input image.
+  Options: `text`, `image`.
 </ParamField>
 <ParamField path="prompt" type="string">
   REQUIRED when mode is 'text': text description of the 3D model. In mode 'image' it is optional and passed along only if the chosen node accepts a prompt. (Cross-field requirement enforced at runtime — the call fails with a clear error if omitted in text mode.)

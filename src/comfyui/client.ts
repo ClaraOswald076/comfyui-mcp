@@ -359,7 +359,7 @@ export async function interrupt(promptId?: string): Promise<void> {
 
 /**
  * POST /free — unload resident models and/or free cached memory. Used by
- * clear_vram and by the cancel escalation (a wedged sampler step can ignore an
+ * get_system_stats (action:"clear_vram") and by the cancel escalation (a wedged sampler step can ignore an
  * interrupt; freeing VRAM under it sometimes shakes it loose). No-op on cloud.
  */
 export async function freeMemory(opts: { unload_models?: boolean; free_memory?: boolean }): Promise<void> {

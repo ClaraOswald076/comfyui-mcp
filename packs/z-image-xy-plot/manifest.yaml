@@ -1,4 +1,4 @@
-# Z-Image Turbo XY-Plot (LoRA comparison) install manifest — consumable by apply_manifest (src/services/manifest.ts).
+# Z-Image Turbo XY-Plot (LoRA comparison) install manifest — consumable by install_comfyui (action:"apply_manifest") (src/services/manifest.ts).
 # Ground truth: XY-PLOT-LORA-Z-IMAGE-TURBO-MODELS-NODES_INSTALL.bat
 #   (cross-checked: XY-PLOT-LORA-Z-IMAGE-TURBO-ULTRA-COMFYUI-MANAGER_AUTO_INSTALL.bat, XY-PLOT-LORA-Z-IMAGE-TURBO-AUTO_INSTALL-RUNPOD.sh).
 # Reconciled against XY-PLOT-LORA-Z-IMAGE-WORKFLOW.json (workflow = source of truth).

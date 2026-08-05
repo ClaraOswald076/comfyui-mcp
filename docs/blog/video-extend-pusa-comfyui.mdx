@@ -265,7 +265,7 @@ The rules that keep a long chain from falling apart:
   color-match each new segment to the previous before concat.
 - **Overlap a few frames** between segments and drop duplicates at concat to hide
   the seam.
-- `clear_vram` isn't needed between hops, but **decode/cache long chains to disk** so
+- `get_system_stats (action:"clear_vram")` isn't needed between hops, but **decode/cache long chains to disk** so
   you don't hold every segment in VRAM.
 
 ## VRAM tiers
@@ -280,7 +280,7 @@ LoRA on top.
 | **8 GB** | Tight — heavy block swap + tiled VAE + 49 frames + tiny VAE preview decode. Expect slow. |
 
 VAE tiling on the **encoder** matters here specifically because you're VAE-encoding
-real footage in addition to decoding the output. Always `clear_vram` before
+real footage in addition to decoding the output. Always `get_system_stats (action:"clear_vram")` before
 switching to Pusa from another model family.
 
 ## Troubleshooting

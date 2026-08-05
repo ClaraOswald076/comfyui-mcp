@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { normalizeRepo, buildIssueUrl, isOurRepo, submitAndPoll, registerReportIssueTools } from "./report-issue.js";
+import { normalizeRepo, buildIssueUrl, isOurRepo, submitAndPoll, reportIssueAction } from "./report-issue.js";
 
 const noSleep = async () => {};
 
@@ -7,23 +7,13 @@ function res(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 }
 
-// Capture the registered report_issue handler by faking the McpServer.tool API.
-type ToolHandler = (args: Record<string, unknown>) => Promise<{ content: { text: string }[]; isError?: boolean }>;
-function getReportIssueHandler(): ToolHandler {
-  let handler: ToolHandler | undefined;
-  const fakeServer = {
-    tool: (_name: string, _desc: string, _schema: unknown, h: ToolHandler) => {
-      handler = h;
-    },
-  };
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  registerReportIssueTools(fakeServer as any);
-  if (!handler) throw new Error("report_issue handler not registered");
-  return handler;
-}
+// 0.50.0 slice 13 folded this tool into get_system_stats (action:"report_issue"),
+// so the unit under test is the exported action handler rather than a captured
+// server.tool registration. Same function body, same arguments, same result.
 async function callTool(args: Record<string, unknown>) {
-  const out = await getReportIssueHandler()(args);
-  const text = out.content[0].text;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const out = await reportIssueAction(args as any);
+  const text = (out.content[0] as { text: string }).text;
   let json: Record<string, unknown> = {};
   try {
     json = JSON.parse(text);
@@ -247,7 +237,7 @@ describe("submitAndPoll — async triage contract", () => {
   });
 });
 
-describe("report_issue tool (registered handler)", () => {
+describe('get_system_stats (action:"report_issue") tool (registered handler)', () => {
   const savedTimeout = process.env.COMFYUI_MCP_ISSUE_TIMEOUT_MS;
   afterEach(() => {
     vi.unstubAllGlobals();

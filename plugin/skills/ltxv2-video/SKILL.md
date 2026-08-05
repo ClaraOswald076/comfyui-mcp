@@ -515,7 +515,7 @@ Concept/style LoRAs CAN be stacked with camera control LoRAs.
 2. Start at 768x512 resolution, upscale in Stage 2
 3. Use FP4 Gemma text encoder (installed)
 4. For LTX-2.3, pick the GGUF quant to match VRAM: **Q4_K_S** (<12GB), **Q5_K_S** (12–16GB), **Q8_0** (24GB+). The dev GGUF needs ~20+ steps; the distilled LoRA path runs ~8 steps
-5. **Always `clear_vram`** before switching to LTX-V2 from another model family
+5. **Always `get_system_stats (action:"clear_vram")`** before switching to LTX-V2 from another model family
 6. Reduce frame count to 81 or 49 if OOM persists
 
 ## Prompt Style

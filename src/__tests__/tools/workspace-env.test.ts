@@ -49,11 +49,13 @@ function registered(): Registered[] {
   return tools;
 }
 
-/** The whole workspace surface is now ONE tool (0.49.0 slice 6); get_environment
- *  shares the registration module and is untouched by the consolidation. */
+/** The whole workspace surface is now ONE tool (0.49.0 slice 6). The environment
+ *  read that used to share this module left the surface in 0.50.0 slice 13 —
+ *  it is install_comfyui (action:"environment") now — so this module registers
+ *  exactly one tool. */
 function handler(): Handler {
   const tools = registered();
-  expect(tools.map((t) => t.name)).toEqual(["workspace", "get_environment"]);
+  expect(tools.map((t) => t.name)).toEqual(["workspace"]);
   return tools[0].handler;
 }
 
@@ -64,11 +66,10 @@ beforeEach(() => {
 });
 
 describe("workspace registration", () => {
-  it("registers exactly one workspace tool (3→1), alongside the untouched get_environment", () => {
+  it("registers exactly one workspace tool (3→1), and nothing else", () => {
     const tools = registered();
-    expect(tools).toHaveLength(2);
+    expect(tools).toHaveLength(1);
     expect(tools[0].name).toBe("workspace");
-    expect(tools[1].name).toBe("get_environment");
   });
 
   // The whole reason for the flat-enum shape rule: a z.discriminatedUnion renders

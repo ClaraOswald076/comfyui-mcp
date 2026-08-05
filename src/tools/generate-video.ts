@@ -27,8 +27,8 @@ export function registerGenerateVideoTool(server: McpServer): void {
     "Generate a short video from a text prompt (text-to-video), or animate a start image (image-to-video " +
       "when `image` is given) — the high-level entry point. Composes an LTX-2.3 distilled workflow on your " +
       "LOCAL GPU using the render-verified Comfy-Org node stack (gemma text encoder + abliterated/distilled " +
-      "LoRAs). Needs the LTX-2.3 models (~24-46GB): install with apply_manifest --path " +
-      "packs/ltx-2.3-txt2vid/manifest.yaml (or ltx-2.3-img2vid for i2v); returns an actionable error if the " +
+      'LoRAs). Needs the LTX-2.3 models (~24-46GB): install with install_comfyui (action:"apply_manifest") ' +
+      'path:"packs/ltx-2.3-txt2vid/manifest.yaml" (or ltx-2.3-img2vid for i2v); returns an actionable error if the ' +
       "checkpoint is missing. seconds is converted to an 8n+1 frame count. For i2v, higher `strength` means " +
       "MORE adherence to the start frame but LESS motion (1.0 can freeze the clip) — keep ~0.6. This minimal " +
       "path omits the synchronized audio + stage-2 spatial upscale that the full ltx-2.3 packs ship. Returns " +

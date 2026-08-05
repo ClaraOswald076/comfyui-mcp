@@ -112,10 +112,10 @@ double-click scripts:
 
 ```bash
 # Z-Image Turbo (fast, under 8 GB) — MCP-native from a Claude Code session
-apply_manifest --path packs/z-image-turbo/manifest.yaml
+install_comfyui (action:"apply_manifest") path:"packs/z-image-turbo/manifest.yaml"
 
 # Z-Image Base (trainable, more styles)
-apply_manifest --path packs/z-image-base/manifest.yaml
+install_comfyui (action:"apply_manifest") path:"packs/z-image-base/manifest.yaml"
 
 # or one-click, run from your ComfyUI root
 packs/z-image-turbo/install-windows.bat      # Windows
@@ -264,7 +264,7 @@ The packs ship tuned, but for reference (community-tested presets):
   The render-verified ControlNet packs (Turbo + Base) take a pose/canny/depth from
   your input image via DWPose and guide a fresh generation.
 - **OOM.** Drop to the **Q5_K_S** GGUF, lower the resolution, and confirm you've set
-  `clear_vram` before switching from another model family.
+  `get_system_stats (action:"clear_vram")` before switching from another model family.
 
 ## FAQ
 

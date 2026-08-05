@@ -554,7 +554,7 @@ describe("node-management service", () => {
     });
 
     it("clones an unregistered git pack into opts.comfyuiPath when global COMFYUI_PATH is unset (#463)", async () => {
-      // apply_manifest threads a call-scoped base (adopted saved-default/live root)
+      // install_comfyui (action:"apply_manifest") threads a call-scoped base (adopted saved-default/live root)
       // WITHOUT mutating global config. The clone fallback must honor it, or an
       // unregistered git URL fails despite a valid local workspace.
       config.comfyuiPath = undefined;
@@ -1284,7 +1284,7 @@ describe("node-management service", () => {
     });
 
     it("the install post-verify scans the CALL-SCOPED adopted root, not the global one", async () => {
-      // apply_manifest threads an adopted live root via opts.comfyuiPath; the
+      // install_comfyui (action:"apply_manifest") threads an adopted live root via opts.comfyuiPath; the
       // disk evidence must come from THAT root even when it differs from the
       // configured/saved one.
       fsCtl.readdirSync = (p) => {

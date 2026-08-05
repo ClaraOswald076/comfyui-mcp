@@ -1,4 +1,4 @@
-# Z-Image Base txt2img install manifest — consumable by apply_manifest.
+# Z-Image Base txt2img install manifest — consumable by install_comfyui (action:"apply_manifest").
 # Sliced from the z-image-base monolith's "Z-IMAGE TEXT TO IMAGE" pipeline
 # (un-bypassed into a standalone graph). Verified: convert-only static check passes.
 # Mirror base: https://huggingface.co/Aitrepreneur/FLX/resolve/main  (third-party)

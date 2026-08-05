@@ -1,4 +1,4 @@
-# WAN 2.2 Longer Text-to-Video (GGUF) install manifest — consumable by apply_manifest.
+# WAN 2.2 Longer Text-to-Video (GGUF) install manifest — consumable by install_comfyui (action:"apply_manifest").
 # Sliced from the wan-longer-videos monolith's "WAN 2.2 LONGER TEXT TO VIDEO"
 # pipeline (groups un-bypassed into a standalone graph). The longer-video extend
 # chain stitches successive clips with the I2V models, so this slice references

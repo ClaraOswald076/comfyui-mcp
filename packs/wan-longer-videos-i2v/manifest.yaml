@@ -1,4 +1,4 @@
-# WAN 2.2 Longer Image-to-Video (GGUF) install manifest — consumable by apply_manifest.
+# WAN 2.2 Longer Image-to-Video (GGUF) install manifest — consumable by install_comfyui (action:"apply_manifest").
 # Sliced from the wan-longer-videos monolith's "WAN 2.2 LONGER IMAGE TO VIDEO"
 # pipeline (groups un-bypassed into a standalone graph). Only the I2V A14B UNets
 # and the I2V Lightning 4-step LoRAs are referenced by this slice.

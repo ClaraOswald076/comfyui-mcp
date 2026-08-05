@@ -30,7 +30,7 @@ it, and the one import bug everyone hits.
 > **TL;DR — one-command setup.** Install comfyui-mcp, apply a ready-to-render
 > `ltx-2.3-txt2vid` / `ltx-2.3-img2vid` pack (run the generated
 > `install-windows.bat` / `install-runpod.sh`, or
-> `apply_manifest --path packs/ltx-2.3-txt2vid/manifest.yaml`), then drive the
+> `install_comfyui (action:"apply_manifest") path:"packs/ltx-2.3-txt2vid/manifest.yaml"`), then drive the
 > graph from your own Claude session via the [Panel](../panel).
 > Jump to [Install](#install-ltx-2-3-in-comfyui).
 
@@ -181,8 +181,8 @@ double-click scripts:
 
 ```bash
 # MCP-native (from a Claude Code session, with COMFYUI_PATH set)
-apply_manifest --path packs/ltx-2.3-txt2vid/manifest.yaml   # text→video
-apply_manifest --path packs/ltx-2.3-img2vid/manifest.yaml   # image→video
+install_comfyui (action:"apply_manifest") path:"packs/ltx-2.3-txt2vid/manifest.yaml"   # text→video
+install_comfyui (action:"apply_manifest") path:"packs/ltx-2.3-img2vid/manifest.yaml"   # image→video
 
 # or one-click — run from your ComfyUI root
 packs/ltx-2.3-txt2vid/install-windows.bat      # Windows

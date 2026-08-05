@@ -1,4 +1,4 @@
-# ERNIE-Image txt2img install manifest — consumable by apply_manifest.
+# ERNIE-Image txt2img install manifest — consumable by install_comfyui (action:"apply_manifest").
 # Sliced from the ernie monolith's "ERNIE TEXT TO IMAGE" pipeline (groups
 # un-bypassed into a standalone graph). Verified: renders headlessly via /prompt.
 # Mirror base: https://huggingface.co/Aitrepreneur/FLX/resolve/main  (third-party)

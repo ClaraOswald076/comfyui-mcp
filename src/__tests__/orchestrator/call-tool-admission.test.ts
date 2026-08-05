@@ -448,12 +448,51 @@ describe("call_tool admission", () => {
     expect(callToolAdmission("apps", { action: "run" })).toBeNull();
     // A non-whitelisted tool is refused with the byte-identical pre-change
     // string the dispatcher produced.
-    expect(callToolAdmission("clear_vram", {})).toBe('tool "clear_vram" is not permitted');
+    expect(callToolAdmission("get_system_stats", { action: "clear_vram" })).toBe(
+      'tool "get_system_stats" is not permitted',
+    );
     expect(callToolAdmission("restart_comfyui", {})).toBe(
       'tool "restart_comfyui" is not permitted',
     );
     expect(callToolAdmission("not_a_real_tool", {})).toBe(
       'tool "not_a_real_tool" is not permitted',
+    );
+  });
+
+  // 0.50.0 slice 13 folded fourteen names into `install_comfyui` and
+  // `get_system_stats`. NEITHER survivor was whitelisted, and neither was any of
+  // the twelve names they absorbed, so the fold cannot broaden this channel —
+  // unlike slice 8's `runpod`, which had to be action-scoped because nine of its
+  // eleven predecessors WERE admitted. Pinned in both directions: the survivors
+  // stay refused whatever action they carry, so a later whitelist edit that
+  // admits one has to change this test and be read on its own terms.
+  it("neither slice-13 survivor is reachable from the canvas-less channel", () => {
+    for (const action of [
+      "install",
+      "update",
+      "update_all",
+      "panel",
+      "self_update",
+      "environment",
+      "configure_manager",
+      "apply_manifest",
+    ]) {
+      expect(callToolAdmission("install_comfyui", { action })).toBe(
+        'tool "install_comfyui" is not permitted',
+      );
+    }
+    for (const action of ["stats", "logs", "health", "clear_vram", "report_issue", "calculate"]) {
+      expect(callToolAdmission("get_system_stats", { action })).toBe(
+        'tool "get_system_stats" is not permitted',
+      );
+    }
+    // ...including with no action at all, which is the shape a stale client
+    // would send for the retired single-purpose names.
+    expect(callToolAdmission("install_comfyui", {})).toBe(
+      'tool "install_comfyui" is not permitted',
+    );
+    expect(callToolAdmission("get_system_stats", {})).toBe(
+      'tool "get_system_stats" is not permitted',
     );
   });
 });

@@ -32,7 +32,7 @@ with [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the
 juggling two text encoders.
 
 > **TL;DR — one-command setup.** Install comfyui-mcp, apply the `qwen-image` pack
-> (`apply_manifest --path packs/qwen-image/manifest.yaml`) for the 20B T2I + WAN
+> (`install_comfyui (action:"apply_manifest") path:"packs/qwen-image/manifest.yaml"`) for the 20B T2I + WAN
 > combo, and/or the `qwen-image-edit` pack for instruction editing and
 > mask inpainting. Then drive the graph from your own Claude session via the
 > Panel. Jump to [Install](#install-qwen-image-in-comfyui).
@@ -116,10 +116,10 @@ Easy-Use, and more) and pulls each model to the right path, validated:
 
 ```bash
 # 20B T2I + WAN 2.2 refine combo
-apply_manifest --path packs/qwen-image/manifest.yaml
+install_comfyui (action:"apply_manifest") path:"packs/qwen-image/manifest.yaml"
 
 # Instruction editing + manual-mask "super inpainting"
-apply_manifest --path packs/qwen-image-edit/manifest.yaml
+install_comfyui (action:"apply_manifest") path:"packs/qwen-image-edit/manifest.yaml"
 ```
 
 Both packs run from a [Claude Code](https://github.com/artokun/comfyui-mcp)

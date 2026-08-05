@@ -1,5 +1,4 @@
-import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { detectInstallMode } from "../services/self-update.js";
 
 // Issue reporting. For OUR repos (comfyui-mcp / comfyui-mcp-panel) this FILES the
@@ -453,164 +452,150 @@ export function normalizeReportedVersion(
   return asVersionToken(trimmed);
 }
 
-export function registerReportIssueTools(server: McpServer): void {
-  server.tool(
-    "report_issue",
-    "File or triage a GitHub issue for a bug/problem you hit (ComfyUI, a workflow, a model, custom nodes, or comfyui-mcp/its panel). For OUR repos (artokun/comfyui-mcp, artokun/comfyui-mcp-panel) it sends the report to the AI triage worker, which searches existing OPEN and CLOSED issues, version-matches, and either files a new issue, adds context to an existing one, or — if the problem was already FIXED in a newer version than the user runs — answers with the fixing PR + fixed-in version and a recommendation to upgrade (no new issue). It returns that triage result plus an instant check of whether the user is on the latest versions. TIMING: this call BLOCKS while the triage runs — typically a few minutes — and that wait is normal, not a hang. It always returns eventually (every request is time-capped and the poll budget is bounded); on a failing network the caps make that wait longer, but never indefinite. Do not abort a slow call just to retry it: once the worker has accepted the report it keeps triaging on its own — filing, deduping into an existing issue, advising an upgrade, or (rarely) reporting that it could not file — so a blind retry can double-file. If triage outlasts the polling budget the call still returns, with pending:true (and a job_id when the worker gave one — an accepted submit whose acknowledgement was unreadable returns pending without it). If the worker is unreachable it falls back to a prefilled GitHub 'new issue' URL. For third-party repos it returns a prefilled URL to SHARE (it does not auto-file). ALWAYS pass mcp_version and panel_version from the known environment (the env line in your context, e.g. 'mcp=… panel=…') so the worker can tell the user if simply upgrading fixes it — the single most common resolution. Surface the worker's agent_message / upgrade advice to the user.",
-    {
-      title: z.string().min(1).describe("Short, specific issue title."),
-      body: z
-        .string()
-        .min(1)
-        .describe(
-          "Issue body: what happened, steps to reproduce, the exact error text, and environment (GPU/VRAM, ComfyUI version, OS) if known. Scrub secrets first.",
-        ),
-      repo: z
-        .string()
-        .optional()
-        .describe("owner/repo (default 'artokun/comfyui-mcp'; use 'artokun/comfyui-mcp-panel' for the sidebar panel)."),
-      labels: z.array(z.string()).optional().describe("Optional GitHub label names to prefill."),
-      mcp_version: z
-        .string()
-        .optional()
-        .describe("The running comfyui-mcp version (from the env line in your context). Auto-detected if omitted."),
-      panel_version: z
-        .string()
-        .optional()
-        .describe("The running comfyui-mcp-panel (sidebar) version, from the env line in your context, if known."),
-      no_file: z
-        .boolean()
-        .optional()
-        .describe("Force the prefilled-URL path even for our repos (skip the Worker). Rarely needed."),
-    },
-    async (args) => {
-      try {
-        const repo = normalizeRepo(args.repo);
-        const prefilledUrl = buildIssueUrl(repo, args.title, args.body, args.labels);
+/**
+ * `get_system_stats (action:"report_issue")` — what the retired `get_system_stats (action:"report_issue")`
+ * tool did (0.50.0 slice 13). This is the ONE action on that tool that reaches
+ * OUT of the machine: for our repos it hands the report to the AI triage worker,
+ * which can create or comment on a public GitHub issue. Every argument name, the
+ * worker submit/poll, the fallbacks and the JSON return shape are unchanged, and
+ * so is this handler's OWN catch — it answers "Error building issue link" with
+ * isError, which is not what errorToToolResult produces, so it stays here rather
+ * than bubbling to the folded tool's shared catch.
+ */
+export async function reportIssueAction(args: {
+  title: string;
+  body: string;
+  repo?: string;
+  labels?: string[];
+  mcp_version?: string;
+  panel_version?: string;
+  no_file?: boolean;
+}): Promise<CallToolResult> {
+  try {
+    const repo = normalizeRepo(args.repo);
+    const prefilledUrl = buildIssueUrl(repo, args.title, args.body, args.labels);
 
-        // Third-party (or explicitly disabled): prefilled link only, as before.
-        if (!isOurRepo(repo) || args.no_file) {
-          return jsonResult({
-            url: prefilledUrl,
-            repo,
-            filed: false,
-            note: "Prefilled issue link (not auto-filed). Share it with the user to review and submit.",
-          });
-        }
+    // Third-party (or explicitly disabled): prefilled link only, as before.
+    if (!isOurRepo(repo) || args.no_file) {
+      return jsonResult({
+        url: prefilledUrl,
+        repo,
+        filed: false,
+        note: "Prefilled issue link (not auto-filed). Share it with the user to review and submit.",
+      });
+    }
 
-        const workerUrl = process.env.COMFYUI_MCP_ISSUE_WORKER_URL || DEFAULT_WORKER_URL;
-        const clientKey = process.env.COMFYUI_MCP_ISSUE_CLIENT_KEY || DEFAULT_CLIENT_KEY;
-        const timeoutEnv = Number(process.env.COMFYUI_MCP_ISSUE_TIMEOUT_MS);
-        const timeoutMs = Number.isFinite(timeoutEnv) && timeoutEnv > 0 ? timeoutEnv : undefined;
-        const maxPollsEnv = Math.floor(Number(process.env.COMFYUI_MCP_ISSUE_MAX_POLLS));
-        // Clamp to a sane ceiling so a mis-set env can't poll for hours.
-        const maxPolls = Number.isFinite(maxPollsEnv) && maxPollsEnv > 0 ? Math.min(maxPollsEnv, 200) : undefined;
-        const pollMsEnv = Number(process.env.COMFYUI_MCP_ISSUE_POLL_MS);
-        const pollDelayMs =
-          Number.isFinite(pollMsEnv) && pollMsEnv >= 0 ? Math.min(pollMsEnv, 60000) : undefined;
-        const repoName = repo.split("/")[1];
+    const workerUrl = process.env.COMFYUI_MCP_ISSUE_WORKER_URL || DEFAULT_WORKER_URL;
+    const clientKey = process.env.COMFYUI_MCP_ISSUE_CLIENT_KEY || DEFAULT_CLIENT_KEY;
+    const timeoutEnv = Number(process.env.COMFYUI_MCP_ISSUE_TIMEOUT_MS);
+    const timeoutMs = Number.isFinite(timeoutEnv) && timeoutEnv > 0 ? timeoutEnv : undefined;
+    const maxPollsEnv = Math.floor(Number(process.env.COMFYUI_MCP_ISSUE_MAX_POLLS));
+    // Clamp to a sane ceiling so a mis-set env can't poll for hours.
+    const maxPolls = Number.isFinite(maxPollsEnv) && maxPollsEnv > 0 ? Math.min(maxPollsEnv, 200) : undefined;
+    const pollMsEnv = Number(process.env.COMFYUI_MCP_ISSUE_POLL_MS);
+    const pollDelayMs =
+      Number.isFinite(pollMsEnv) && pollMsEnv >= 0 ? Math.min(pollMsEnv, 60000) : undefined;
+    const repoName = repo.split("/")[1];
 
-        const reporterVersions: ReporterVersions = {
-          mcp:
-            normalizeReportedVersion(args.mcp_version, MCP_VERSION_LABEL) ??
-            detectMcpVersion(),
-          panel:
-            normalizeReportedVersion(args.panel_version, PANEL_VERSION_LABEL) ??
-            process.env.COMFYUI_MCP_PANEL_VERSION ??
-            undefined,
-        };
+    const reporterVersions: ReporterVersions = {
+      mcp:
+        normalizeReportedVersion(args.mcp_version, MCP_VERSION_LABEL) ??
+        detectMcpVersion(),
+      panel:
+        normalizeReportedVersion(args.panel_version, PANEL_VERSION_LABEL) ??
+        process.env.COMFYUI_MCP_PANEL_VERSION ??
+        undefined,
+    };
 
-        try {
-          const outcome = await submitAndPoll({
-            workerUrl,
-            clientKey,
-            repoName,
-            title: args.title,
-            body: args.body,
-            labels: args.labels,
-            reporterVersions,
-            timeoutMs,
-            maxPolls,
-            pollDelayMs,
-          });
+    try {
+      const outcome = await submitAndPoll({
+        workerUrl,
+        clientKey,
+        repoName,
+        title: args.title,
+        body: args.body,
+        labels: args.labels,
+        reporterVersions,
+        timeoutMs,
+        maxPolls,
+        pollDelayMs,
+      });
 
-          if (outcome.kind === "closed") {
-            const r = outcome.result;
-            return jsonResult({
-              // "filed" means a real issue was created/updated. advised_upgrade
-              // files nothing; and a closed result always has a url here (a
-              // no-url terminal is routed to "unfiled" above).
-              filed: !!r.url && r.action_taken !== "advised_upgrade",
-              repo,
-              url: r.url,
-              number: r.number,
-              classification: r.classification,
-              action_taken: r.action_taken,
-              deduped: r.deduped,
-              fixed_in_version: r.fixed_in_version,
-              fix_pr_url: r.fix_pr_url,
-              recommend_upgrade: r.recommend_upgrade,
-              possible_duplicate: r.possible_duplicate,
-              // Present (non-empty) when triage judged this a NEW symptom of an
-              // already-known defect; the issues are cross-linked on GitHub.
-              related_issues: r.related_issues?.length ? r.related_issues : undefined,
-              versions: outcome.ack.versions,
-              up_to_date: outcome.ack.up_to_date,
-              upgrade_hint: outcome.ack.upgrade_hint,
-              // The one line to relay to the user.
-              agent_message: r.agent_message,
-              note: "Triaged by the AI issue worker. Relay agent_message (and the upgrade advice) to the user.",
-            });
-          }
-
-          // Terminal without an issue: the worker's triage AND its own fallback
-          // both gave up — nothing was filed, so a prefilled URL is the safe
-          // last resort (no double-file risk).
-          if (outcome.kind === "unfiled") {
-            return jsonResult({
-              url: prefilledUrl,
-              repo,
-              filed: false,
-              versions: outcome.ack.versions,
-              up_to_date: outcome.ack.up_to_date,
-              upgrade_hint: outcome.ack.upgrade_hint,
-              note: "The triage worker could not file this report. Fallback: prefilled issue link for the user to submit in one click.",
-            });
-          }
-
-          // Still triaging at the budget: the worker WILL finish + file/dedup on
-          // its own. Do NOT prefill (would double-file). Surface the version-ack.
-          return jsonResult({
-            filed: false,
-            pending: true,
-            repo,
-            job_id: outcome.job_id,
-            versions: outcome.ack.versions,
-            up_to_date: outcome.ack.up_to_date,
-            upgrade_hint: outcome.ack.upgrade_hint,
-            agent_message: outcome.ack.upgrade_hint,
-            note: "The AI triage is still running; the worker will file or dedup this report autonomously. If the user is behind on versions (see upgrade_hint), suggest upgrading first — that often resolves it.",
-          });
-        } catch (workerErr) {
-          // SUBMIT failed (worker unreachable / non-OK) → the worker never took
-          // the report, so a prefilled URL is safe (no double-file risk).
-          return jsonResult({
-            url: prefilledUrl,
-            repo,
-            filed: false,
-            note: `Could not reach the AI triage worker (${workerErr instanceof Error ? workerErr.message : String(workerErr)}). Fallback: prefilled issue link for the user to submit in one click.`,
-          });
-        }
-      } catch (err) {
-        return {
-          content: [
-            { type: "text" as const, text: `Error building issue link: ${err instanceof Error ? err.message : String(err)}` },
-          ],
-          isError: true,
-        };
+      if (outcome.kind === "closed") {
+        const r = outcome.result;
+        return jsonResult({
+          // "filed" means a real issue was created/updated. advised_upgrade
+          // files nothing; and a closed result always has a url here (a
+          // no-url terminal is routed to "unfiled" above).
+          filed: !!r.url && r.action_taken !== "advised_upgrade",
+          repo,
+          url: r.url,
+          number: r.number,
+          classification: r.classification,
+          action_taken: r.action_taken,
+          deduped: r.deduped,
+          fixed_in_version: r.fixed_in_version,
+          fix_pr_url: r.fix_pr_url,
+          recommend_upgrade: r.recommend_upgrade,
+          possible_duplicate: r.possible_duplicate,
+          // Present (non-empty) when triage judged this a NEW symptom of an
+          // already-known defect; the issues are cross-linked on GitHub.
+          related_issues: r.related_issues?.length ? r.related_issues : undefined,
+          versions: outcome.ack.versions,
+          up_to_date: outcome.ack.up_to_date,
+          upgrade_hint: outcome.ack.upgrade_hint,
+          // The one line to relay to the user.
+          agent_message: r.agent_message,
+          note: "Triaged by the AI issue worker. Relay agent_message (and the upgrade advice) to the user.",
+        });
       }
-    },
-  );
+
+      // Terminal without an issue: the worker's triage AND its own fallback
+      // both gave up — nothing was filed, so a prefilled URL is the safe
+      // last resort (no double-file risk).
+      if (outcome.kind === "unfiled") {
+        return jsonResult({
+          url: prefilledUrl,
+          repo,
+          filed: false,
+          versions: outcome.ack.versions,
+          up_to_date: outcome.ack.up_to_date,
+          upgrade_hint: outcome.ack.upgrade_hint,
+          note: "The triage worker could not file this report. Fallback: prefilled issue link for the user to submit in one click.",
+        });
+      }
+
+      // Still triaging at the budget: the worker WILL finish + file/dedup on
+      // its own. Do NOT prefill (would double-file). Surface the version-ack.
+      return jsonResult({
+        filed: false,
+        pending: true,
+        repo,
+        job_id: outcome.job_id,
+        versions: outcome.ack.versions,
+        up_to_date: outcome.ack.up_to_date,
+        upgrade_hint: outcome.ack.upgrade_hint,
+        agent_message: outcome.ack.upgrade_hint,
+        note: "The AI triage is still running; the worker will file or dedup this report autonomously. If the user is behind on versions (see upgrade_hint), suggest upgrading first — that often resolves it.",
+      });
+    } catch (workerErr) {
+      // SUBMIT failed (worker unreachable / non-OK) → the worker never took
+      // the report, so a prefilled URL is safe (no double-file risk).
+      return jsonResult({
+        url: prefilledUrl,
+        repo,
+        filed: false,
+        note: `Could not reach the AI triage worker (${workerErr instanceof Error ? workerErr.message : String(workerErr)}). Fallback: prefilled issue link for the user to submit in one click.`,
+      });
+    }
+  } catch (err) {
+    return {
+      content: [
+        { type: "text" as const, text: `Error building issue link: ${err instanceof Error ? err.message : String(err)}` },
+      ],
+      isError: true,
+    };
+  }
 }
 
 function jsonResult(obj: unknown) {

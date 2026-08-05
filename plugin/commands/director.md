@@ -32,7 +32,7 @@ The user wants to create a short film from a story description. This command orc
 4. **Ask orientation.** Ask the user if they prefer portrait (480x720 video, 832x1472 frames) or landscape (832x480 video, 1472x832 frames). Default to portrait for character-focused stories, landscape for environment/action stories.
 
 5. **Phase 2 — Start Frame Generation.**
-   - `clear_vram` first
+   - `get_system_stats (action:"clear_vram")` first
    - For each scene, build and enqueue the Z-Image RedCraft DX1 workflow (see `director` skill, Phase 2 template)
    - Use `filename_prefix: "director_s{N}_start"` for each scene
    - After each generation completes, update the state file with the output filename and seed
@@ -47,7 +47,7 @@ The user wants to create a short film from a story description. This command orc
    - Update the state file after all reviews complete
 
 7. **Phase 4 — End Frame Generation.**
-   - `clear_vram` first
+   - `get_system_stats (action:"clear_vram")` first
    - For each scene with an approved start frame:
      - `upload_image` the start frame to make it available as `LoadImage` input
      - Build and enqueue the Qwen Edit workflow (see `director` skill, Phase 4 template)
@@ -62,7 +62,7 @@ The user wants to create a short film from a story description. This command orc
      - Regenerate from a different start frame
 
 9. **Phase 6 — Video Clip Generation.**
-   - `clear_vram` first
+   - `get_system_stats (action:"clear_vram")` first
    - For each scene with approved start AND end frames:
      - `upload_image` both the start and end frames
      - Build and enqueue the WAN 2.2 FLF dual Hi-Lo workflow (see `director` skill, Phase 6 template)
@@ -98,7 +98,7 @@ When the argument is `resume`:
    - Which scenes have approved start/end frames
    - Which scenes have completed video clips
 3. Pick up from `current_phase`. Within a phase, skip scenes whose assets are already approved.
-4. `clear_vram` before loading the model family for the current phase.
+4. `get_system_stats (action:"clear_vram")` before loading the model family for the current phase.
 5. Continue normal execution from that point.
 
 If the user says `resume <project_id>`, look for that specific state file.
@@ -127,7 +127,7 @@ Steps:
 - Always update the state file after any generation or approval
 - Each video clip is ~5 seconds at 81 frames / 16fps
 - A 4-scene production takes roughly 15 minutes of generation time on RTX 4090
-- VRAM management is critical: always `clear_vram` between model families
+- VRAM management is critical: always `get_system_stats (action:"clear_vram")` between model families
 - The Remix NSFW models have lightning baked in — no separate LoRA needed for WAN FLF
 - For the WAN FLF phase, both CLIP (via LoRA stacks) and CLIPVision must use the Hi Common stack's clip output
 - Negative prompt for WAN FLF is always the standard quality negative (see wan-flf-video skill)

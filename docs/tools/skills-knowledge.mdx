@@ -41,12 +41,12 @@ only required field; everything else is per-action.
 List the bundled **installer packs** — one-command setups for a model family:
 custom nodes + model weights (`manifest.yaml`) **plus** a ready `workflow.json`.
 Each entry reports its family/kind, its runtime, whether it has a ready workflow +
-manifest, and the manifest path for `apply_manifest`.
+manifest, and the manifest path for `install_comfyui (action:"apply_manifest")`.
 
 <Note>
   All bundled installer packs are **local-GPU / free** — they run on the user's own
   GPU and never spend paid API credits. Prefer applying the matching pack
-  (`apply_manifest`) and loading its ready workflow (`panel_load_workflow pack:<name>`)
+  (`install_comfyui (action:"apply_manifest")`) and loading its ready workflow (`panel_load_workflow pack:<name>`)
   over building a generic graph from scratch.
 </Note>
 

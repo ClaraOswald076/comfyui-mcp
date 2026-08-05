@@ -287,7 +287,7 @@ Bad: "masterpiece, best quality, 1girl, businesswoman, studio"
 | Z-Image Turbo separate | ~8GB UNET + CLIP | Very lightweight |
 | Z-Image Base separate | ~12GB | |
 
-- **Always `clear_vram`** before switching to Z-Image from another model family
+- **Always `get_system_stats (action:"clear_vram")`** before switching to Z-Image from another model family
 - RedCraft is one of the most VRAM-efficient quality models available
 
 ## Tips

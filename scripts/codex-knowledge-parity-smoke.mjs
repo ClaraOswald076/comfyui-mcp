@@ -10,7 +10,7 @@
 //   1) Codex DISCOVERED the krea2 family via action:"skill_list"/"skill_read" (or
 //      the pack equivalents action:"list"/"read_workflow") — NOT from-scratch guessing.
 //   2) Codex APPLIED the pack / loaded the pack's ready workflow (action:"read_workflow"
-//      and/or apply_manifest, then built nodes on the canvas) — NOT a generic graph.
+//      and/or install_comfyui (action:"apply_manifest"), then built nodes on the canvas) — NOT a generic graph.
 //
 //   node scripts/codex-knowledge-parity-smoke.mjs
 //
@@ -141,7 +141,7 @@ async function main() {
     PANEL_AGENT_BACKEND: "codex",
     COMFYUI_MCP_BRIDGE_PORT: String(PORT),
     COMFYUI_URL: DEAD_COMFY,
-    // Local mode so apply_manifest is available AND so the comfyui MCP resolves
+    // Local mode so install_comfyui (action:"apply_manifest") is available AND so the comfyui MCP resolves
     // packs/ + plugin/ against this real repo dir.
     COMFYUI_PATH: COMFY_PATH,
     COMFYUI_MCP_TOOL_TRACE: TRACE,

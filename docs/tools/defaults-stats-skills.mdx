@@ -21,7 +21,8 @@ Read and write settings — either OUR generation defaults or ComfyUI's own fron
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which settings operation to perform, and on WHICH store. "get"/"set" are the MCP server's own generation defaults (width, steps, cfg, …); "get_ui"/"set_ui" are ComfyUI's separate frontend UI settings (the Comfy.* ids). "get" takes no other parameters; "set" requires `values` (optional `persist`); "get_ui" takes an optional `id` or `filter`; "set_ui" requires `id` + `value`. Options: `get`, `set`, `get_ui`, `set_ui`.
+  Which settings operation to perform, and on WHICH store. "get"/"set" are the MCP server's own generation defaults (width, steps, cfg, …); "get_ui"/"set_ui" are ComfyUI's separate frontend UI settings (the Comfy.* ids). "get" takes no other parameters; "set" requires `values` (optional `persist`); "get_ui" takes an optional `id` or `filter`; "set_ui" requires `id` + `value`.
+  Options: `get`, `set`, `get_ui`, `set_ui`.
 </ParamField>
 <ParamField path="values" type="object">
   action:"set" — REQUIRED. Key/value map of GENERATION defaults to set. Keys are typically lowercase (e.g. width, steps). Not for Comfy.* UI ids — those go through action:"set_ui".

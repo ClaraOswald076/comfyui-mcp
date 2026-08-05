@@ -1,4 +1,4 @@
-# ANIMA 1.0 install manifest — consumable by apply_manifest (src/services/manifest.ts).
+# ANIMA 1.0 install manifest — consumable by install_comfyui (action:"apply_manifest") (src/services/manifest.ts).
 # Ground truth: ANIMA_BASE_ULTRA-MODELS-NODES_INSTALL.bat.
 # Mirror base: https://huggingface.co/Aitrepreneur/FLX/resolve/main
 # Official weights: https://huggingface.co/circlestone-labs/Anima

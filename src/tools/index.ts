@@ -12,7 +12,6 @@ import { registerWorkflowLibraryTools } from "./workflow-library.js";
 import { registerWorkflowUrlTools } from "./workflow-url.js";
 import { registerProcessControlTools } from "./process-control.js";
 import { registerImageManagementTools } from "./image-management.js";
-import { registerMemoryManagementTools } from "./memory-management.js";
 import { registerGenerationTrackerTools } from "./generation-tracker.js";
 import { registerAssetTools } from "./assets.js";
 import { registerAutoloadedWorkflows } from "./workflow-autoload.js";
@@ -27,23 +26,16 @@ import { registerConditionedGenerationTools } from "./generate-conditioned.js";
 import { registerNodeSnapshotsTools } from "./node-snapshots.js";
 import { registerNodeBisectTools } from "./node-bisect.js";
 import { registerNodeManagementTools } from "./node-management.js";
-import { registerReportIssueTools } from "./report-issue.js";
 import { registerNodePackTools } from "./node-pack.js";
+import { registerSystemStatsTools } from "./system-stats.js";
 import { registerInstallComfyUITools } from "./install-comfyui.js";
-import { registerUpdateComfyUITools } from "./update-comfyui.js";
 import { registerWorkspaceEnvTools } from "./workspace-env.js";
 import { registerApiNodesTools } from "./api-nodes.js";
-import { registerManagerConfigTools } from "./manager-config.js";
-import { registerManifestTools } from "./manifest.js";
 import { registerModelExplorerTools } from "./model-explorer.js";
 import { registerImageConvertTools } from "./image-convert.js";
 import { registerColorAnalysisTools } from "./color-analysis.js";
 import { registerStorageUploadTools } from "./storage-upload.js";
-import { registerHealthCheckTools } from "./health-check.js";
 import { registerSkillsAccessTools } from "./skills-access.js";
-import { registerInstallPanelTools } from "./install-panel.js";
-import { registerSelfUpdateTools } from "./self-update.js";
-import { registerCalculateTools } from "./calculate.js";
 import { registerComfyCliTools } from "./comfy-cli.js";
 import { registerTrainTools } from "./train.js";
 import { registerAppsTools } from "./apps.js";
@@ -76,7 +68,6 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["workflows", registerWorkflowUrlTools],
   ["server", registerProcessControlTools],
   ["images-assets", registerImageManagementTools],
-  ["server", registerMemoryManagementTools],
   ["generation", registerGenerationTrackerTools],
   ["images-assets", registerAssetTools],
   ["skills-config", registerDefaultsTools],
@@ -90,25 +81,18 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["custom-nodes", registerNodeSnapshotsTools],
   ["custom-nodes", registerNodeBisectTools],
   ["custom-nodes", registerNodeManagementTools],
-  ["diagnostics", registerReportIssueTools],
   // (0.50.0 slice 9: the workflow-deps group's two tools folded into `list_packs`
   // actions "extract_deps"/"install_deps" — same note as skill-generator above.)
+  ["workflows", registerSystemStatsTools],
   ["server", registerInstallComfyUITools],
-  ["server", registerUpdateComfyUITools],
   ["models", registerModelExplorerTools],
   ["server", registerWorkspaceEnvTools],
   ["generation", registerApiNodesTools],
-  ["server", registerManagerConfigTools],
   ["custom-nodes", registerNodePackTools],
-  ["models", registerManifestTools],
   ["images-assets", registerImageConvertTools],
   ["images-assets", registerColorAnalysisTools],
   ["images-assets", registerStorageUploadTools],
-  ["diagnostics", registerHealthCheckTools],
   ["skills-config", registerSkillsAccessTools],
-  ["server", registerInstallPanelTools],
-  ["server", registerSelfUpdateTools],
-  ["diagnostics", registerCalculateTools],
   // registerComfyUISettingsTools used to sit here. 0.50.0 slice 7 folded its two
   // tools into `get_defaults` as action:"get_ui"/"set_ui", so the group is gone
   // rather than empty — every surviving name keeps its position, which is what
@@ -200,7 +184,7 @@ export async function registerAllTools(server: McpServer): Promise<void> {
  * After the user restarts ComfyUI and the panel session resumes, that snapshot
  * can go stale — a previously-bound direct tool is briefly absent from the
  * refreshed surface, and calling the cached binding throws
- * `TypeError: tools.mcp__comfyui__get_environment is not a function` BEFORE
+ * `TypeError: tools.install_comfyui (action:"environment") is not a function` BEFORE
  * dispatch. Layering the facade (`list_tools` / `describe_tool` / `call_tool`)
  * onto the full direct surface guarantees EVERY advertised surface — compact or
  * full — carries a STABLE `call_tool` escape hatch, so such a client can always

@@ -19,7 +19,8 @@ Discover ComfyUI custom node PACKS in the public ComfyUI Registry (registry.comf
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which registry lookup to perform. "search" requires `query` (and takes optional `limit`/`page`); "details" requires `id`. Options: `search`, `details`.
+  Which registry lookup to perform. "search" requires `query` (and takes optional `limit`/`page`); "details" requires `id`.
+  Options: `search`, `details`.
 </ParamField>
 <ParamField path="query" type="string">
   action:"search" — REQUIRED. Keyword(s) to match against pack name/description, e.g. 'impact', 'controlnet aux'.
@@ -70,10 +71,10 @@ Discover ComfyUI custom node PACKS in the public ComfyUI Registry (registry.comf
 ## install_custom_node
 
 Install, repair, enable/disable and remove ComfyUI custom node packs on this ComfyUI. To FIND a pack in the public registry first, use search_custom_nodes. Driven by the `action` parameter:
-- action:"install" — Install a pack by registry id, git URL, or name. Local installs prefer official comfy-cli when available; remote or CLI-unavailable installs use the ComfyUI-Manager HTTP API. A ComfyUI restart may be required. Targeting the comfyui-mcp sidebar panel pack ('comfyui-agent-panel' / 'comfyui-mcp-panel') is routed through the verified install_panel path (the version is re-read from disk afterwards) and is REFUSED while the panel is version-pinned.
-- action:"update" — Update an installed pack, or pass id:'all' to update every installed pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP. Targeting the sidebar panel pack is routed through the verified install_panel path. While the panel is version-pinned, BOTH a direct panel target and 'all' are REFUSED — 'all' would move the pinned panel too; clear the pin with install_panel(action='unpin') or update other packs individually.
-- action:"reinstall" — Reinstall a pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP. A ComfyUI restart may be required. A panel target is routed through the verified install_panel path and is REFUSED while the panel is version-pinned.
-- action:"fix" — Repair a pack's install and Python dependencies, or pass id:'all' to repair every pack. Local operations prefer official comfy-cli; remote single-pack repairs use Manager HTTP. REFUSES the sidebar panel pack — 'fix' has no verified on-disk check, so use install_panel for the panel — and refuses 'all' while the panel is version-pinned.
+- action:"install" — Install a pack by registry id, git URL, or name. Local installs prefer official comfy-cli when available; remote or CLI-unavailable installs use the ComfyUI-Manager HTTP API. A ComfyUI restart may be required. Targeting the comfyui-mcp sidebar panel pack ('comfyui-agent-panel' / 'comfyui-mcp-panel') is routed through the verified install_comfyui (action:"panel") path (the version is re-read from disk afterwards) and is REFUSED while the panel is version-pinned.
+- action:"update" — Update an installed pack, or pass id:'all' to update every installed pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP. Targeting the sidebar panel pack is routed through the verified install_comfyui (action:"panel") path. While the panel is version-pinned, BOTH a direct panel target and 'all' are REFUSED — 'all' would move the pinned panel too; clear the pin with install_comfyui(action:"panel", panel_action:"unpin") or update other packs individually.
+- action:"reinstall" — Reinstall a pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP. A ComfyUI restart may be required. A panel target is routed through the verified install_comfyui (action:"panel") path and is REFUSED while the panel is version-pinned.
+- action:"fix" — Repair a pack's install and Python dependencies, or pass id:'all' to repair every pack. Local operations prefer official comfy-cli; remote single-pack repairs use Manager HTTP. REFUSES the sidebar panel pack — 'fix' has no verified on-disk check, so use install_comfyui (action:"panel") for the panel — and refuses 'all' while the panel is version-pinned.
 - action:"uninstall" — Uninstall a pack (removes it). IRREVERSIBLE through this tool — for a cleanup audit prefer action:"disable", which is reversible. The pack must be one ComfyUI-Manager tracks: an id that resolves nowhere is REFUSED before anything is queued (a drained queue would otherwise read exactly like a success), and a pack that is on disk but unmanaged is named so you can remove its directory yourself. After the queue drains the installed-pack list is re-read and the pack must be GONE before anything claims 'uninstalled'. A ComfyUI restart is required to unload it fully. REFUSES the sidebar panel pack.
 - action:"disable" — Disable an installed pack WITHOUT removing it — the reversible first step of a cleanup (re-enable with action:"enable"; action:"uninstall" removes a pack outright). Uses the ComfyUI-Manager HTTP API (works against remote instances) or official comfy-cli locally, and re-reads the installed-pack list afterwards so a Manager no-op is reported as NOT disabled rather than as success. A ComfyUI restart is required for the change to take effect. REFUSES the sidebar panel pack.
 - action:"enable" — Re-enable a pack previously disabled with action:"disable". Same Manager/comfy-cli mechanics and the same post-op re-read, so a Manager no-op is reported as NOT enabled rather than as success. A ComfyUI restart is required for the change to take effect. REFUSES the sidebar panel pack.
@@ -85,13 +86,15 @@ Install, repair, enable/disable and remove ComfyUI custom node packs on this Com
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which custom-node operation to perform. "install", "update", "reinstall", "fix", "uninstall", "enable" and "disable" require `id`; "list" and "sync_deps" take no required parameters. Options: `install`, `update`, `reinstall`, `fix`, `uninstall`, `enable`, `disable`, `list`, `sync_deps`.
+  Which custom-node operation to perform. "install", "update", "reinstall", "fix", "uninstall", "enable" and "disable" require `id`; "list" and "sync_deps" take no required parameters.
+  Options: `install`, `update`, `reinstall`, `fix`, `uninstall`, `enable`, `disable`, `list`, `sync_deps`.
 </ParamField>
 <ParamField path="id" type="string">
   The pack to act on. REQUIRED for actions "install", "update", "reinstall", "fix", "uninstall", "enable" and "disable". For "install" this is a registry id, git URL, or node-pack name (find one with search_custom_nodes); for "update"/"fix" it may also be 'all' (every installed pack); for "update"/"reinstall"/"fix"/"uninstall"/"enable"/"disable" it is a registry id / module name of an INSTALLED pack.
 </ParamField>
 <ParamField path="source" type="enum">
-  action:"install" — how to interpret `id` (default 'auto', which detects git URLs vs registry ids). Options: `registry`, `git`, `auto`.
+  action:"install" — how to interpret `id` (default 'auto', which detects git URLs vs registry ids).
+  Options: `registry`, `git`, `auto`.
 </ParamField>
 <ParamField path="version" type="string">
   Version to install. action:"install" — e.g. 'latest', 'nightly', or a semver; for git installs this is treated as a git ref unless `ref` is also provided, and registry installs default to 'latest'. action:"reinstall" — version to reinstall (default 'latest').
@@ -100,7 +103,8 @@ Install, repair, enable/disable and remove ComfyUI custom node packs on this Com
   action:"install" — git ref (commit SHA, branch, or tag) to pin when installing a git URL. Overrides any ref parsed from the URL and any `version` value. Ignored for registry-id installs.
 </ParamField>
 <ParamField path="mode" type="enum">
-  Two distinct meanings, one per action group. For actions "install"/"update"/"reinstall"/"fix": the ComfyUI-Manager data source (default 'remote'); 'remote' fetches the live node list, 'local'/'cache' use bundled/cached data. For action:"list": 'default' lists all installed packs, 'imported' lists only those successfully imported this session. Passing a value from the wrong group is refused, naming the ones the action accepts. Options: `remote`, `local`, `cache`, `default`, `imported`.
+  Two distinct meanings, one per action group. For actions "install"/"update"/"reinstall"/"fix": the ComfyUI-Manager data source (default 'remote'); 'remote' fetches the live node list, 'local'/'cache' use bundled/cached data. For action:"list": 'default' lists all installed packs, 'imported' lists only those successfully imported this session. Passing a value from the wrong group is refused, naming the ones the action accepts.
+  Options: `remote`, `local`, `cache`, `default`, `imported`.
 </ParamField>
 <ParamField path="channel" type="string">
   ComfyUI-Manager channel name (default 'default').
@@ -206,7 +210,8 @@ Author, edit, test and publish YOUR OWN ComfyUI custom-node pack under &lt;COMFY
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which node-pack operation to perform. "scaffold" requires `name` + `display_name`; "list_files" requires `pack`; "read" requires `path`; "search" requires `query`; "write" requires `path` + `content`; "patch" requires `patch`; "git" requires `pack` + `git_action`. "verify" and "publish" have no required parameters — "verify" resolves the pack from `name` (or checks `class_types` directly), "publish" from `name` or `path`. Options: `scaffold`, `verify`, `publish`, `list_files`, `read`, `search`, `write`, `patch`, `git`.
+  Which node-pack operation to perform. "scaffold" requires `name` + `display_name`; "list_files" requires `pack`; "read" requires `path`; "search" requires `query`; "write" requires `path` + `content`; "patch" requires `patch`; "git" requires `pack` + `git_action`. "verify" and "publish" have no required parameters — "verify" resolves the pack from `name` (or checks `class_types` directly), "publish" from `name` or `path`.
+  Options: `scaffold`, `verify`, `publish`, `list_files`, `read`, `search`, `write`, `patch`, `git`.
 </ParamField>
 <ParamField path="name" type="string">
   Pack folder name under &lt;COMFYUI_PATH&gt;/custom_nodes/. REQUIRED for action:"scaffold" — a safe lowercase slug (letters, digits, hyphens, underscores), e.g. 'my-cool-nodes', which becomes the directory under custom_nodes/ and the pyproject [project].name. For action:"verify", the pack whose __init__.py NODE_CLASS_MAPPINGS keys are inferred and checked when `class_types` is omitted. For action:"publish", the pack folder to publish (give this or `path`).
@@ -278,7 +283,8 @@ Author, edit, test and publish YOUR OWN ComfyUI custom-node pack under &lt;COMFY
   action:"search" — match case-sensitively (default false).
 </ParamField>
 <ParamField path="git_action" type="enum">
-  action:"git" — REQUIRED. Which git operation to run: status/diff/log are read-only; commit/push require COMFYUI_MCP_ALLOW_GIT_WRITES=1. Named `git_action` rather than `action` only because `action` is this tool's dispatch field; the git operation itself is unchanged. Options: `status`, `diff`, `log`, `commit`, `push`.
+  action:"git" — REQUIRED. Which git operation to run: status/diff/log are read-only; commit/push require COMFYUI_MCP_ALLOW_GIT_WRITES=1. Named `git_action` rather than `action` only because `action` is this tool's dispatch field; the git operation itself is unchanged.
+  Options: `status`, `diff`, `log`, `commit`, `push`.
 </ParamField>
 <ParamField path="message" type="string">
   action:"git" — commit message (required for git_action 'commit').
@@ -416,7 +422,8 @@ Custom-node snapshots via ComfyUI-Manager (mirrors `comfy node save-snapshot` / 
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which snapshot operation to perform. "list" takes no other parameters; "save" takes an optional `name`; "restore" requires `name`. Options: `list`, `save`, `restore`.
+  Which snapshot operation to perform. "list" takes no other parameters; "save" takes an optional `name`; "restore" requires `name`.
+  Options: `list`, `save`, `restore`.
 </ParamField>
 <ParamField path="name" type="string">
   Snapshot name (no extension, no path separators). REQUIRED for action:"restore" (as shown by action:"list"). OPTIONAL for action:"save" — omit to let ComfyUI-Manager assign a timestamped name. Ignored by action:"list".
@@ -469,7 +476,8 @@ All actions are argument-free; `action` is the only parameter. `good`/`bad` requ
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which bisect operation to perform. "start" begins a session; "good"/"bad" narrow it (require a running session); "reset" clears it and re-enables everything; "status" reports state. No other arguments are needed for any action. Options: `start`, `good`, `bad`, `reset`, `status`.
+  Which bisect operation to perform. "start" begins a session; "good"/"bad" narrow it (require a running session); "reset" clears it and re-enables everything; "status" reports state. No other arguments are needed for any action.
+  Options: `start`, `good`, `bad`, `reset`, `status`.
 </ParamField>
 
 ### Example

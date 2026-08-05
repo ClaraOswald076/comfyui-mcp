@@ -1,4 +1,4 @@
-# Qwen-Image-Edit install manifest — consumable by apply_manifest (src/services/manifest.ts).
+# Qwen-Image-Edit install manifest — consumable by install_comfyui (action:"apply_manifest") (src/services/manifest.ts).
 # Ground truth: QWEN-IMAGE-EDIT-MODELS-NODES_INSTALL.bat (cross-checked against the
 #   COMFYUI-MANAGER_AUTO_INSTALL.bat + AUTO_INSTALL-RUNPOD.sh) and reconciled against
 #   QWEN_IMAGE_EDIT_WORKFLOW.json / QWEN_IMAGE_EDIT_SUPER_INPAINTING.json (the workflows

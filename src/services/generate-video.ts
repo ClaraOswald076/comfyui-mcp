@@ -216,7 +216,7 @@ export async function generateVideo(
   if (missing.length > 0) {
     throw new ValidationError(
       `Missing required LTX-2.3 model file(s): ${missing.join("; ")}. Install them with ` +
-        "apply_manifest --path packs/ltx-2.3-txt2vid/manifest.yaml (or ltx-2.3-img2vid " +
+        'install_comfyui (action:"apply_manifest") path:"packs/ltx-2.3-txt2vid/manifest.yaml" (or ltx-2.3-img2vid ' +
         "for image-to-video), or pass an explicit `checkpoint` you already have.",
     );
   }

@@ -1,4 +1,4 @@
-# ERNIE×Z-Image-Turbo COMBO install manifest — consumable by apply_manifest.
+# ERNIE×Z-Image-Turbo COMBO install manifest — consumable by install_comfyui (action:"apply_manifest").
 # Sliced from the ernie monolith's combo pipelines (ERNIE chained with
 # Z-Image-Turbo), un-bypassed into a standalone graph. Verified: renders
 # headlessly via /prompt (6 images, ERNIE + z-image).

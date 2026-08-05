@@ -860,7 +860,7 @@ function hasAmbiguousForeignSibling(id: string, localTrayId: string): boolean {
  * What we ACTUALLY know about where a completed download landed (#369).
  *
  * This is THE single placement policy — every tool that renders a finished job
- * (`download_model`, `download_model action:"status"`, `download_model action:"download_civitai"`, `apply_manifest`)
+ * (`download_model`, `download_model action:"status"`, `download_model action:"download_civitai"`, `install_comfyui (action:"apply_manifest")`)
  * must go through it, or the wording drifts and one of them starts claiming a
  * success nobody verified. That is precisely how a 4.88 GB model in a stale install
  * came back as "downloaded successfully".

@@ -158,7 +158,7 @@ describe("generateVideo", () => {
       loras: [DISTILLED_LORA, ABLITERATED_LORA],
     });
     await expect(generateVideo({ prompt: "p" }, deps)).rejects.toThrow(
-      /ltx-2\.3|apply_manifest|checkpoint/i,
+      /ltx-2\.3|install_comfyui \(action:"install_comfyui (action:"apply_manifest")"\)|checkpoint/i,
     );
   });
 

@@ -1,4 +1,4 @@
-# LTX-2.3 3-stage distill install manifest — consumable by apply_manifest (src/services/manifest.ts).
+# LTX-2.3 3-stage distill install manifest — consumable by install_comfyui (action:"apply_manifest") (src/services/manifest.ts).
 # Ground truth: jcd315/comfyui-mcp-muse workflows/ltx23_distill_3stage.json
 #   (commits 63f3b2a feat, 6d2ccd2 rename, d087cdf resolution-defaults fix).
 # Every model below is referenced by a loader node in workflow.json; URLs verified

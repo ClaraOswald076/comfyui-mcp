@@ -21,7 +21,7 @@ The user wants to find out why a ComfyUI workflow execution failed and get a sug
 
    If the execution succeeded (no error), tell the user it completed normally and show the output summary.
 
-3. **Get relevant logs.** Call `get_logs` with a `keyword` filter matching the error — use the exception class name (e.g., "RuntimeError", "ValueError") or a distinctive phrase from the error message. Request up to 200 lines.
+3. **Get relevant logs.** Call `get_system_stats (action:"logs")` with a `keyword` filter matching the error — use the exception class name (e.g., "RuntimeError", "ValueError") or a distinctive phrase from the error message. Request up to 200 lines.
 
 4. **Inspect the failing node.** Call `create_workflow (action:"node_info")` with the `node_type` of the failing node. Check:
    - What inputs does the node expect?
@@ -46,7 +46,7 @@ The user wants to find out why a ComfyUI workflow execution failed and get a sug
 
 ## Common Failure Patterns
 
-- **OOM / CUDA out of memory**: Suggest reducing resolution, using FP8 models, or `clear_vram` before retrying
+- **OOM / CUDA out of memory**: Suggest reducing resolution, using FP8 models, or `get_system_stats (action:"clear_vram")` before retrying
 - **Missing checkpoint/model file**: Show what's installed, offer to download the right one
 - **Missing custom node**: Identify the pack and suggest installation
 - **Shape mismatch**: Usually a resolution or latent size issue — check width/height are multiples of 8 (or 64 for some models)
@@ -60,10 +60,10 @@ User: `/comfy-debug last`
 Steps:
 - Call `get_history` with no prompt_id
 - Find error: node 12 (KSampler) threw RuntimeError "Expected all tensors to be on the same device"
-- Call `get_logs` with keyword "RuntimeError"
+- Call `get_system_stats (action:"logs")` with keyword "RuntimeError"
 - Call `create_workflow (action:"node_info")` for "KSampler"
 - Diagnose: model and conditioning are on different devices, likely a VRAM issue
-- Suggest: restart ComfyUI or use `clear_vram` before retrying
+- Suggest: restart ComfyUI or use `get_system_stats (action:"clear_vram")` before retrying
 
 ## Notes
 

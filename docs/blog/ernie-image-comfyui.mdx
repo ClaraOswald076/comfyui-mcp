@@ -29,7 +29,7 @@ the fastest way to get it running — a one-command install with
 instead of hand-downloading GGUFs and untangling a contaminated installer.
 
 > **TL;DR — one-command setup.** Install comfyui-mcp, apply the `ernie` pack
-> (`apply_manifest --path packs/ernie/manifest.yaml`, or run the generated
+> (`install_comfyui (action:"apply_manifest") path:"packs/ernie/manifest.yaml"`, or run the generated
 > `install-windows.bat` / `install-runpod.sh`), and drive the graph from your own
 > Claude session via the Panel. Jump to [Install](#install-ernie-image-in-comfyui).
 
@@ -126,7 +126,7 @@ install and the generated double-click scripts:
 
 ```bash
 # MCP-native (from a Claude Code session, with COMFYUI_PATH set)
-apply_manifest --path packs/ernie/manifest.yaml
+install_comfyui (action:"apply_manifest") path:"packs/ernie/manifest.yaml"
 
 # or one-click
 packs/ernie/install-windows.bat      # Windows

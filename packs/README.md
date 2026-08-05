@@ -3,7 +3,7 @@
 Self-contained, one-command setups for popular ComfyUI model families — custom
 nodes + model weights + a ready-to-load workflow. Inspired by the community
 "1-click installer" packs, but built on this repo's existing
-[`apply_manifest`](../src/services/manifest.ts) engine so the **same source of
+[`install_comfyui (action:"apply_manifest")`](../src/services/manifest.ts) engine so the **same source of
 truth** drives both an MCP-native install and the generated double-click scripts.
 
 ## Layout
@@ -20,7 +20,7 @@ packs/<name>/
 `manifest.yaml` is consumable as-is by the MCP tool / engine:
 
 ```
-apply_manifest --path packs/<name>/manifest.yaml      # requires COMFYUI_PATH
+install_comfyui (action:"apply_manifest") path:"packs/<name>/manifest.yaml"      # requires COMFYUI_PATH
 ```
 
 It validates against `manifestSchema` in `src/services/manifest.ts`:

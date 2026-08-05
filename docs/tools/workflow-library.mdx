@@ -25,13 +25,15 @@ Return, list, summarize or query a SAVED workflow FILE — files on disk, named 
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which read to perform. "list" and "prompt_director" take no required parameters; "get" and "analyze" require `filename`; "strip", "slice" and "query" require exactly one of `path`/`filename`/`graph` (and "slice" also requires `groups`); "from_image" requires `image_path`. Options: `get`, `list`, `strip`, `slice`, `from_image`, `analyze`, `query`, `prompt_director`.
+  Which read to perform. "list" and "prompt_director" take no required parameters; "get" and "analyze" require `filename`; "strip", "slice" and "query" require exactly one of `path`/`filename`/`graph` (and "slice" also requires `groups`); "from_image" requires `image_path`.
+  Options: `get`, `list`, `strip`, `slice`, `from_image`, `analyze`, `query`, `prompt_director`.
 </ParamField>
 <ParamField path="filename" type="string">
   Workflow library name, exactly as action:"list" reports it. A workflow filed in a folder keeps its folder in the name ('VIDEO/MiniMaxH3/clip.json') and that whole string goes here. REQUIRED for action:"get" and action:"analyze"; one of the three sources for "strip", "slice" and "query".
 </ParamField>
 <ParamField path="format" type="enum" default="api">
-  action:"get" — 'api' (default, recommended) converts to compact API format with named inputs, connection references, and _meta.mode flags for muted/bypassed nodes; 'ui' returns the raw UI format with layout positions and links arrays. action:"strip" — 'api' (default) strips to the flat resolved graph; 'raw' returns the file/graph unchanged. Each action accepts only its own two values (this field is the union of what the two tools it replaces accepted) and refuses the third rather than guessing at an alias. Options: `ui`, `api`, `raw`.
+  action:"get" — 'api' (default, recommended) converts to compact API format with named inputs, connection references, and _meta.mode flags for muted/bypassed nodes; 'ui' returns the raw UI format with layout positions and links arrays. action:"strip" — 'api' (default) strips to the flat resolved graph; 'raw' returns the file/graph unchanged. Each action accepts only its own two values (this field is the union of what the two tools it replaces accepted) and refuses the third rather than guessing at an alias.
+  Options: `ui`, `api`, `raw`.
 </ParamField>
 <ParamField path="path" type="string">
   action:"strip" / "slice" / "query" — Absolute server-side path to a workflow .json on disk (e.g. C:\\Users\\you\\ComfyUI\\user\\default\\workflows\\pusa_extend.json). Read directly from disk — no library lookup.
@@ -46,7 +48,8 @@ Return, list, summarize or query a SAVED workflow FILE — files on disk, named 
   action:"from_image" (REQUIRED) — Absolute path to a ComfyUI-generated PNG file
 </ParamField>
 <ParamField path="view" type="enum" default="summary">
-  action:"analyze" — summary (default): structured text with sections, node IDs, key settings, virtual wires, and full connection graph — best for AI understanding. overview: mermaid diagram showing sections as summary nodes with cross-section data flow. detail: mermaid diagram for one section (requires section parameter). list: text listing of all sections with data flow summary. flat: single mermaid flowchart of the entire workflow (best for small workflows). health: graph-health heuristics (disconnected nodes, duplicate model loads, orphaned branches, muted/bypassed). Options: `summary`, `overview`, `detail`, `list`, `flat`, `health`.
+  action:"analyze" — summary (default): structured text with sections, node IDs, key settings, virtual wires, and full connection graph — best for AI understanding. overview: mermaid diagram showing sections as summary nodes with cross-section data flow. detail: mermaid diagram for one section (requires section parameter). list: text listing of all sections with data flow summary. flat: single mermaid flowchart of the entire workflow (best for small workflows). health: graph-health heuristics (disconnected nodes, duplicate model loads, orphaned branches, muted/bypassed).
+  Options: `summary`, `overview`, `detail`, `list`, `flat`, `health`.
 </ParamField>
 <ParamField path="section" type="string">
   action:"analyze" — Section name for detail view. Use view='list' first to see available section names.
@@ -76,10 +79,12 @@ Return, list, summarize or query a SAVED workflow FILE — files on disk, named 
   action:"query" — Max hops from the traversal seed (seed=0). Absent = full closure.
 </ParamField>
 <ParamField path="fields" type="enum">
-  action:"query" — Projection: compact one-liners (default), bare ids, or detail JSON rows. Options: `ids`, `compact`, `detail`.
+  action:"query" — Projection: compact one-liners (default), bare ids, or detail JSON rows.
+  Options: `ids`, `compact`, `detail`.
 </ParamField>
 <ParamField path="group_by" type="enum">
-  action:"query" — Aggregate: counts per class_type instead of listing. Options: `type`.
+  action:"query" — Aggregate: counts per class_type instead of listing.
+  Options: `type`.
 </ParamField>
 <ParamField path="limit" type="integer">
   action:"query" — Max nodes listed (default 40, max 200).
@@ -223,7 +228,8 @@ WRITE to the ComfyUI user library: persist a workflow, or capture/verify its pro
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which write/provenance operation to perform. All three require `filename`; "save" also requires `workflow`. Options: `save`, `lock`, `verify_lock`.
+  Which write/provenance operation to perform. All three require `filename`; "save" also requires `workflow`.
+  Options: `save`, `lock`, `verify_lock`.
 </ParamField>
 <ParamField path="filename" type="string">
   Workflow filename in the ComfyUI user library (e.g. 'my_workflow.json'). REQUIRED for every action. For action:"save" this OVERWRITES an existing file of the same name; for "lock"/"verify_lock" the lock is read/written as '&lt;filename&gt;.lock.json' alongside it.

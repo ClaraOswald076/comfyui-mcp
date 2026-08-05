@@ -19,7 +19,7 @@ The Director skill orchestrates a complete short film production from a text sto
 - Character reference images fed into Qwen Edit's extra image slots
 - State file persists to disk for context compaction survival
 - Each scene is independently retryable without affecting others
-- `clear_vram` between every model family switch
+- `get_system_stats (action:"clear_vram")` between every model family switch
 
 ## CRITICAL: Inspect modes + verify every output
 
@@ -103,7 +103,7 @@ Saved at `~/code/comfyui-mcp/workflows/director_state_{project_id}.json`. Update
 | 4: Edit Chain | Qwen Edit | `qwen_image_edit_2511_bf16.safetensors` + Lightning LoRA | ~17-18GB |
 | 6: Video Clips | WAN 2.2 I2V | Remix NSFW Hi+Lo (built-in lightning) | ~22-24GB |
 
-**CRITICAL**: `clear_vram` between every model family switch.
+**CRITICAL**: `get_system_stats (action:"clear_vram")` between every model family switch.
 
 ## Phase 1: Story Planning
 
@@ -293,7 +293,7 @@ After context compaction:
 1. Read state file AND `director_session_notes.md` if it exists
 2. Check `current_phase` and per-scene status
 3. Skip approved assets, continue from incomplete point
-4. `clear_vram` before loading the model family for the current phase
+4. `get_system_stats (action:"clear_vram")` before loading the model family for the current phase
 
 ## Timing Estimates (RTX 4090)
 
@@ -302,7 +302,7 @@ After context compaction:
 | Hero + Refs (Z-Image) | ~10s each | ~50s (one-time) |
 | Edit Chain (Qwen 4-step) | ~35s each | ~280s (8 edits) |
 | Video Clip (WAN FLF 81 frames) | ~140s | ~700s |
-| VRAM swaps (3x clear_vram) | ~30s each | ~90s |
+| VRAM swaps (3x get_system_stats (action:"clear_vram")) | ~30s each | ~90s |
 | **Total generation** | | **~19 min** |
 
 ## Storytelling Props for Continuity

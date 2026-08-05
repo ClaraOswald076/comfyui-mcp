@@ -255,7 +255,7 @@ function checkStalls() {
       job.stallWarned = true;
       if (job.status === "running" && job.step > 0) {
         console.log(
-          `[STALL] ${short(promptId)} | No progress for ${idleSec}s (stuck at step ${job.step}/${job.maxSteps}, elapsed ${totalSec}s) — possible OOM or hang. Try queue (action:"cancel") then clear_vram, or restart_comfyui.`,
+          `[STALL] ${short(promptId)} | No progress for ${idleSec}s (stuck at step ${job.step}/${job.maxSteps}, elapsed ${totalSec}s) — possible OOM or hang. Try queue (action:"cancel") then get_system_stats (action:"clear_vram"), or restart_comfyui.`,
         );
       } else if (job.status === "running") {
         console.log(

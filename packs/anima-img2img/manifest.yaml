@@ -1,4 +1,4 @@
-# ANIMA 1.0 img2img install manifest — consumable by apply_manifest.
+# ANIMA 1.0 img2img install manifest — consumable by install_comfyui (action:"apply_manifest").
 # Sliced from the anima monolith's "IMAGE TO IMAGE TURBO CONTROLNET" pipeline
 # (groups un-bypassed into a standalone graph). Static-check: CONVERT-OK (unknown
 # nodes DepthAnythingV2Preprocessor / DWPreprocessor / ttN seed / AnimaLLLiteApply

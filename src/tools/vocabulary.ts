@@ -42,7 +42,6 @@ export const TOOL_NAMES = [
   "search_custom_nodes",
   "download_model",
   "list_local_models",
-  "get_logs",
   "get_history",
   "diagnose_run",
   "runpod",
@@ -57,7 +56,6 @@ export const TOOL_NAMES = [
   "upload_audio",
   "stage_output_as_input",
   "list_output_images",
-  "clear_vram",
   "suggest_settings",
   "generation_stats",
   "view_image",
@@ -76,25 +74,15 @@ export const TOOL_NAMES = [
   "node_snapshot",
   "bisect",
   "install_custom_node",
-  "report_issue",
   "install_comfyui",
-  "update_comfyui",
-  "update_all",
   "model_metadata",
   "workspace",
-  "get_environment",
   "list_api_nodes",
-  "configure_manager",
   "node_pack",
-  "apply_manifest",
   "convert_image",
   "analyze_color",
   "upload_output",
-  "health_check",
   "list_packs",
-  "install_panel",
-  "self_update",
-  "calculate",
   "train_prepare_dataset",
   "train_start",
   "train_doctor",
@@ -227,7 +215,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 70;
+export const MAX_TOOLS = 58;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;
@@ -1666,6 +1654,223 @@ export const DEAD_NAMES: readonly DeadName[] = [
     name: "node_pack_git",
     since: "0.50.0",
     replacement: 'node_pack (action:"git", git_action:"status"|"diff"|"log"|"commit"|"push")',
+  },
+  {
+    name: "apply_manifest",
+    since: "0.50.0",
+    replacement: 'install_comfyui (action:"apply_manifest")',
+    allowedIn: [
+      {
+        path: "docs/tools/install-environment.mdx",
+        context: "Options: `install`, `update`, `update_all`, `panel`, `self_update`, `environment`, `configure_manager`, `apply_manifest`.",
+        why: "Second occurrence on the same generated line: the `action` enum's Options list. Same reasoning as the entry above — this is the surviving tool's own action value, emitted from its live schema.",
+      },
+      {
+        path: "docs/tools/install-environment.mdx",
+        context: "\"apply_manifest\" takes exactly one of",
+        why: "The generated reference page for the SURVIVING tool, where this token is that tool's own ACTION name — the fold kept the verb deliberately. Not a call to the retired tool; the page is regenerated from the live schema.",
+      },
+    ],
+  },
+  {
+    name: "calculate",
+    since: "0.50.0",
+    replacement: 'get_system_stats (action:"calculate")',
+    allowedIn: [
+      // `calculate` is the only retired name in this slice that is also a bare
+      // English word AND a source FILENAME. deadNameRe treats `.` and `-` as
+      // boundaries, so `src/tools/calculate.ts` and `docs/design/calculate-tool.md`
+      // match it. Renaming files to appease a prose scan would be the tail
+      // wagging the dog; these three mentions are paths, not calls.
+      {
+        path: "docs/design/calculate-tool.md",
+        context: "`src/tools/calculate.ts`",
+        why: "The design doc naming the module that implements the evaluator. A file path, not an instruction to call a tool.",
+      },
+      {
+        path: "docs/design/calculate-tool.md",
+        context: "`src/__tests__/tools/calculate.test.ts`",
+        why: "Same doc, naming the test file. A file path.",
+      },
+      {
+        path: "src/services/calc-evaluator.ts",
+        context: "See docs/design/calculate-tool.md",
+        why: "A pointer from the evaluator to its design doc, by path.",
+      },
+      {
+        path: "src/__tests__/tools/calculate.test.ts",
+        context: 'from "../../tools/calculate.js"',
+        why: "The module import in the test that still covers the evaluator behaviour. A module specifier, not a tool name.",
+      },
+      {
+        path: "src/__tests__/tools/calculate.test.ts",
+        context: 'from "../../tools/calculate.js"',
+        why: "The module PATH of the action implementation the successor calls, not a tool reference.",
+      },
+      {
+        path: "docs/tools/workflow-execution.mdx",
+        context: "\"calculate\"",
+        why: "The generated reference page for the SURVIVING tool, where this token is that tool's own ACTION name — the fold kept the verb deliberately. Not a call to the retired tool; the page is regenerated from the live schema.",
+      },
+    ],
+  },
+  {
+    name: "clear_vram",
+    since: "0.50.0",
+    replacement: 'get_system_stats (action:"clear_vram")',
+    allowedIn: [
+      {
+        path: "docs/tools/workflow-execution.mdx",
+        context: "\"clear_vram\" takes `unload_models`",
+        why: "The generated reference page for the SURVIVING tool, where this token is that tool's own ACTION name — the fold kept the verb deliberately. Not a call to the retired tool; the page is regenerated from the live schema.",
+      },
+    ],
+  },
+  {
+    name: "configure_manager",
+    since: "0.50.0",
+    replacement: 'install_comfyui (action:"configure_manager")',
+    allowedIn: [
+      {
+        path: "docs/tools/install-environment.mdx",
+        context: "Options: `install`, `update`, `update_all`, `panel`, `self_update`, `environment`, `configure_manager`, `apply_manifest`.",
+        why: "Second occurrence on the same generated line: the `action` enum's Options list. Same reasoning as the entry above — this is the surviving tool's own action value, emitted from its live schema.",
+      },
+      {
+        path: "docs/tools/install-environment.mdx",
+        context: "\"configure_manager\" requires `manager_setting`",
+        why: "The generated reference page for the SURVIVING tool, where this token is that tool's own ACTION name — the fold kept the verb deliberately. Not a call to the retired tool; the page is regenerated from the live schema.",
+      },
+    ],
+  },
+  {
+    name: "get_environment",
+    since: "0.50.0",
+    replacement: 'install_comfyui (action:"environment")',
+  },
+  {
+    name: "get_logs",
+    since: "0.50.0",
+    replacement: 'get_system_stats (action:"logs")',
+  },
+  {
+    name: "health_check",
+    since: "0.50.0",
+    replacement: 'get_system_stats (action:"health")',
+  },
+  {
+    name: "install_panel",
+    since: "0.50.0",
+    replacement: 'install_comfyui (action:"panel")',
+  },
+  {
+    name: "report_issue",
+    since: "0.50.0",
+    replacement: 'get_system_stats (action:"report_issue")',
+    allowedIn: [
+      {
+        path: "docs/tools/workflow-execution.mdx",
+        context: "\"report_issue\" requires `title`",
+        why: "The generated reference page for the SURVIVING tool, where this token is that tool's own ACTION name — the fold kept the verb deliberately. Not a call to the retired tool; the page is regenerated from the live schema.",
+      },
+    ],
+  },
+  {
+    name: "self_update",
+    since: "0.50.0",
+    replacement: 'install_comfyui (action:"self_update")',
+    allowedIn: [
+      {
+        path: "docs/tools/install-environment.mdx",
+        context: "Options: `install`, `update`, `update_all`, `panel`, `self_update`, `environment`, `configure_manager`, `apply_manifest`.",
+        why: "Second occurrence on the same generated line: the `action` enum's Options list. Same reasoning as the entry above — this is the surviving tool's own action value, emitted from its live schema.",
+      },
+      {
+        path: "docs/tools/install-environment.mdx",
+        context: "\"self_update\" takes `self_update_action`",
+        why: "The generated reference page for the SURVIVING tool, where this token is that tool's own ACTION name — the fold kept the verb deliberately. Not a call to the retired tool; the page is regenerated from the live schema.",
+      },
+    ],
+  },
+  {
+    name: "update_all",
+    since: "0.50.0",
+    replacement: 'install_comfyui (action:"update_all")',
+    allowedIn: [
+      {
+        path: "docs/tools/install-environment.mdx",
+        context: "Options: `install`, `update`, `update_all`, `panel`, `self_update`, `environment`, `configure_manager`, `apply_manifest`.",
+        why: "Second occurrence on the same generated line: the `action` enum's Options list. Same reasoning as the entry above — this is the surviving tool's own action value, emitted from its live schema.",
+      },
+      // ONE context per file, and it is the upstream ROUTE PATH — which is what
+      // keeps these narrow rather than whole-file: only a line containing
+      // "/manager/queue/update_all" is exempt, and the v4 route
+      // "/v2/manager/queue/update_all" contains it as a substring, so one entry
+      // covers both dialects. A live instruction to call the retired TOOL,
+      // added to any of these files later, still fails the gate.
+      {
+        path: "src/services/node-management.ts",
+        context: "/manager/queue/update_all",
+        why: "ComfyUI-Manager's own HTTP route, which this code POSTs to and its comments enumerate by path. Upstream API surface we cannot rename — rewriting it would break the request.",
+      },
+      {
+        path: "src/services/node-management.ts",
+        context: "endpoint: `${prefix}/update_all`",
+        why: "Builds that same upstream route path to report back as `endpoint`. A URL segment, not a tool name.",
+      },
+      {
+        path: "src/services/update-comfyui.ts",
+        context: "/manager/queue/update_all",
+        why: "A comment naming the two upstream Manager routes (legacy 3.x and v4) by their exact paths, which is the whole point of the line.",
+      },
+      {
+        path: "src/__tests__/services/update-comfyui.test.ts",
+        context: "/manager/queue/update_all",
+        why: "The tests pin WHICH upstream route the enqueue uses per Manager dialect (#656). The literal path is the assertion.",
+      },
+      {
+        path: "src/__tests__/services/manager-dialect-cache.test.ts",
+        context: "/manager/queue/update_all",
+        why: "Same: the dialect-cache tests stub and count calls to the upstream route by path.",
+      },
+      {
+        path: "src/__tests__/services/node-management.test.ts",
+        context: "/manager/queue/update_all",
+        why: "Same: asserts the 'all' id routes to the upstream v4 route with query params rather than a body.",
+      },
+      {
+        path: "src/__tests__/services/panel-pin-cancel.test.ts",
+        context: "/manager/queue/update_all",
+        why: "Same: the Manager persona stubs match on the upstream route path.",
+      },
+      {
+        path: "docs/tools/install-environment.mdx",
+        context: "`update_all`",
+        why: "The generated reference page for the SURVIVING tool, where this token is that tool's own ACTION name — the fold kept the verb deliberately. Not a call to the retired tool; the page is regenerated from the live schema.",
+      },
+    ],
+    // NOTE for reviewers: `update_all` is ALSO the name of ComfyUI-Manager's own
+    // bulk-update operation and the tail of its HTTP route
+    // (/manager/queue/update_all). About 120 of the ~134 in-repo occurrences
+    // were that UPSTREAM operation, not our tool. Exempting them one by one
+    // would have meant ~120 ledger entries; exempting them by file would have
+    // been the whole-file exemption this ledger exists to avoid. They were
+    // instead respelled in prose as "update-all" — a hyphen, so not a tool-name
+    // token, and already the spelling the pending-op ledger uses for the op
+    // kind — leaving the literal `update_all` only where it IS the upstream
+    // route string.
+  },
+  {
+    name: "update_comfyui",
+    since: "0.50.0",
+    replacement: 'install_comfyui (action:"update")',
+    allowedIn: [
+      {
+        path: "src/services/manager-config.ts",
+        context: "compared server-side (manager_server.py update_comfyui)",
+        why: "Names ComfyUI-Manager's OWN Python handler (manager_server.py's update_comfyui route), which is upstream code this repo does not own and cannot rename. It is not, and never was, a reference to our tool.",
+      },
+    ],
   },
 ];
 

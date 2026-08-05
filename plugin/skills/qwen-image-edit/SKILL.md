@@ -270,7 +270,7 @@ This produces a grid image showing all combinations — useful for finding optim
 - CLIP (fp8): ~7GB VRAM
 - VAE: ~200MB
 - Total: ~17-18GB — fits comfortably on 24GB GPUs
-- **Always `clear_vram` before loading** if switching from another model family
+- **Always `get_system_stats (action:"clear_vram")` before loading** if switching from another model family
 
 ## Tips
 

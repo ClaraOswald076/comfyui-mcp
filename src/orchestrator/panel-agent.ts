@@ -736,7 +736,7 @@ export class PanelAgent {
         `[panel event] The user's workflow run just ERRORED: ${ev.error ?? "unknown error"}. ` +
         `If it relates to what you were doing, diagnose it (panel_get_errors has the details) and offer a fix.`;
     } else if (ev.kind === "download_done") {
-      // A model download the agent kicked off (download_model / apply_manifest)
+      // A model download the agent kicked off (download_model / install_comfyui (action:"apply_manifest"))
       // just settled. Mirror the render-finished path so the agent is WOKEN with
       // the result instead of having to poll download_model action:"status" in sleep loops
       // (#547). NON-urgent: queued like `executed`, not front-inserted — a landed

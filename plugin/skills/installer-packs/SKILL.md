@@ -11,7 +11,7 @@ globs:
 `comfyui-mcp` ships **installer packs** under [`packs/`](../../packs) — one-command
 setups for a model family: custom nodes + model weights + a ready workflow. Each
 pack is driven by a single `manifest.yaml` (a `ComfyManifest`, the same shape the
-`apply_manifest` tool consumes), so one source of truth drives both an MCP-native
+`install_comfyui (action:"apply_manifest")` tool consumes), so one source of truth drives both an MCP-native
 install and generated double-click scripts.
 
 ```
@@ -26,7 +26,7 @@ packs/<name>/
 ## Installing a pack
 
 - **From a Claude session (MCP-native, idempotent):**
-  `apply_manifest --path packs/<name>/manifest.yaml` (requires `COMFYUI_PATH`).
+  `install_comfyui (action:"apply_manifest") path:"packs/<name>/manifest.yaml"` (requires `COMFYUI_PATH`).
   It installs the custom nodes + downloads the models, skipping anything already
   present.
 - **One-click for non-MCP users:** run `packs/<name>/install-windows.bat` (or

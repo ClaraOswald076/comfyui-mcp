@@ -121,6 +121,35 @@ const SELF = new Set([
   // Same, for 0.50.0 slice 8: asserts as FIXTURES that the ten retired runpod_*
   // names are in DEAD_NAMES with `runpod` / `runpod_watch` replacements.
   "src/__tests__/tools/runpod.test.ts",
+  // Same, for 0.50.0 slice 13 (install/environment and stats/diagnostics):
+  // asserts as FIXTURES that the twelve retired names are in DEAD_NAMES with
+  // `install_comfyui` / `get_system_stats` replacements.
+  "src/__tests__/tools/install-environment.test.ts",
+  "src/__tests__/tools/system-stats.test.ts",
+  // 0.50.0 slice 13 is the FIRST consolidation where an action is spelled
+  // exactly like a tool the same change retires: `install_comfyui` carries
+  // action:"update_all" / "install_comfyui (action:"self_update")" / "install_comfyui (action:"configure_manager")" /
+  // "install_comfyui (action:"apply_manifest")", and `get_system_stats` carries action:"get_system_stats (action:"clear_vram")" /
+  // "get_system_stats (action:"report_issue")" / "get_system_stats (action:"calculate")". These two modules DEFINE those enums, so they
+  // necessarily contain the strings — as `z.enum([...])` members, `case` labels
+  // and per-action description fragments. That is the same relationship
+  // vocabulary.ts and tool-surface.txt have to the names they list, and the
+  // reason those are here.
+  //
+  // This is NOT a licence for stale prose: the enum members are asserted
+  // against the ledger by the slice's own tests (only `action` is required,
+  // every action dispatches, an unknown action is rejected), the tool names
+  // themselves stay under the live-vs-baseline ratchet, and a retired name from
+  // ANY OTHER family appearing in these files would be caught by that ratchet
+  // rather than by this scan. Exact paths, never a src/tools/ glob.
+  "src/tools/install-comfyui.ts",
+  "src/tools/system-stats.ts",
+  // The curated Tool Reference examples, whose `args` objects carry the same
+  // action VALUES (`{ action: "get_system_stats (action:"clear_vram")" }`). Every example is validated
+  // against the tool's real zod schema at generation time (validateExamples in
+  // gen-tool-docs.ts), so a stale action name here fails `npm run docs:gen` —
+  // a stronger check than a text scan, not a weaker one.
+  "scripts/tool-doc-examples.ts",
   // Same, for 0.50.0 slice 7: each asserts as FIXTURES that the names its tool
   // replaced are in DEAD_NAMES (restart_comfyui ← 2, list_api_nodes ← 2,
   // get_defaults ← 3), and defaults.test.ts additionally asserts that the two
@@ -168,6 +197,12 @@ const SELF = new Set([
   // replacement — the names are call arguments under test, not live guidance.
   "src/__tests__/tools/compact.test.ts",
   "src/__tests__/orchestrator/ollama-backend.test.ts",
+  // Same shape, for 0.50.0 slice 13: the admission test passes every ACTION of
+  // both survivors as call arguments to prove neither is reachable from the
+  // canvas-less channel. Seven of those action names are spelled exactly like a
+  // tool this slice retires, so the fixtures necessarily contain them — they are
+  // arguments under test, never guidance to call anything.
+  "src/__tests__/orchestrator/call-tool-admission.test.ts",
   // Generated FROM the ledger by scripts/export-vocabulary.mts, so it reproduces
   // the dead names as data for the panel to consume. Caught this gate out a second
   // time, in the same way as the first: green while untracked, red once committed.
