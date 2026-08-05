@@ -18,7 +18,19 @@
 
 import dotenv from "dotenv";
 import { EventEmitter } from "node:events";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -273,6 +285,11 @@ export interface SecretSaveReceipt {
    *  outranks the store, so readers use that instead. Saying "saved" without
    *  saying this would report a configured state the tools do not use. */
   shadowedByEnv?: boolean;
+  /** OTHER credential keys the store held before this write and no longer
+   *  holds. Never empty on a healthy write. A save must NEVER be reported as
+   *  clean over this: "your token is saved" while the user's other tokens were
+   *  destroyed is a fabricated success on top of data loss. Names only. */
+  lostKeys?: string[];
 }
 
 /**
@@ -330,14 +347,11 @@ function read(home?: string): PanelSecrets {
 function write(secrets: PanelSecrets): void {
   const p = panelSecretsPath();
   mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(secrets, null, 2), { mode: 0o600 });
-  // mkdirSync may have created the file before the mode took effect on some
-  // platforms; re-assert owner-only. Best-effort (no-op / unsupported on Windows).
-  try {
-    chmodSync(p, 0o600);
-  } catch {
-    /* chmod is a no-op on Windows; ignore */
-  }
+  // Atomic for the same reason as the .env: an in-place truncate+write that is
+  // interrupted leaves the OAuth status mirror and any legacy tokens destroyed.
+  // (0600 is applied to the temp file before the rename, so the credential is
+  // never briefly world-readable.)
+  writeFileAtomic(p, JSON.stringify(secrets, null, 2));
 }
 
 // ── Canonical env-secret store: ~/.comfyui-mcp/.env ─────────────────────────
@@ -449,6 +463,168 @@ function envKeyLinePattern(key: string): RegExp {
   return new RegExp(`^\\s*(?:export\\s+)?${escaped}(?:\\s*=|:\\s)`);
 }
 
+/**
+ * REFUSE to write the real credential store from a test run.
+ *
+ * `console-secrets.test.ts` drove the live /api/secrets endpoint without
+ * redirecting COMFYUI_MCP_ENV_FILE, so every `npm test` overwrote the
+ * developer's actual ~/.comfyui-mcp/.env — their CivitAI token became a dummy
+ * and a revoke case deleted whichever slot it cleared. That ran unnoticed for
+ * weeks.
+ *
+ * A static sweep over test sources cannot close this: a test that imports the
+ * setter under an alias, or reaches a write through a helper, matches no marker
+ * and passes the sweep. The RUNTIME can, because it sees the write itself
+ * however the caller spelled it — so a forgotten redirect becomes a failing test
+ * at the moment of the write instead of a silent overwrite (coordinator finding).
+ */
+function assertStoreIsRedirectedInTests(): void {
+  const underTest =
+    !!process.env.VITEST ||
+    !!process.env.VITEST_WORKER_ID ||
+    process.env.NODE_ENV === "test";
+  if (!underTest || process.env.COMFYUI_MCP_ENV_FILE) return;
+  throw new Error(
+    "Refusing to write the credential store from a test run: COMFYUI_MCP_ENV_FILE is not set, " +
+      `so this would write the developer's real ${comfyuiEnvFilePath()} and can destroy live tokens. ` +
+      "Point COMFYUI_MCP_ENV_FILE at a temp file in the test's setup (see secret-store-test-isolation.test.ts).",
+  );
+}
+
+/** Keys this write is ALLOWED to change. Anything else that the store carried
+ *  before and does not carry after is DATA LOSS, and the caller must not report
+ *  a clean save over it. */
+export interface EnvWriteOutcome {
+  /** The file changed on disk. */
+  changed: boolean;
+  /** Keys the store held BEFORE and no longer holds, other than the one this
+   *  write was for. Never contains a value — names only. */
+  lostKeys: string[];
+  /** Non-assignment lines (comments, blanks) that did not survive the rewrite. */
+  lostCommentLines: number;
+}
+
+/**
+ * Rewrite the canonical .env ATOMICALLY, and prove nothing else was lost.
+ *
+ * The old in-place read/modify/write had two accidental failure modes on a real
+ * machine, and BOTH were invisible because the read-back only checked our own
+ * key (coordinator finding):
+ *   - a crash or a full disk between truncate and flush left the user's whole
+ *     credential store truncated — every token, not just the one being set;
+ *   - two writers each read the old file and the later write silently dropped
+ *     the other's newly saved key.
+ * And in both cases the per-key read-back still said "yes", so we confirmed a
+ * save over data loss — a fabricated success on top of destroyed credentials.
+ *
+ * So: write a temp file in the SAME directory, fsync it, then rename over the
+ * target (rename is atomic on both POSIX and Windows, so a reader sees either
+ * the whole old file or the whole new one — never a truncated one). Before the
+ * rename, re-read the target and abort if it changed since we read it, which is
+ * the compare-and-swap that stops a concurrent writer's key from being dropped;
+ * the caller retries against the newer content. After the rename, compare the
+ * parsed keys and the comment lines against what we started with, so a loss can
+ * be REPORTED rather than confirmed as success.
+ */
+function rewriteEnvFile(
+  mutate: (lines: string[]) => string[] | null,
+  opts: { intentionalKey?: string; removing?: boolean } = {},
+): EnvWriteOutcome {
+  assertStoreIsRedirectedInTests();
+  const p = envFilePath();
+  mkdirSync(dirname(p), { recursive: true });
+
+  const ATTEMPTS = 5;
+  let lastConflict = false;
+  for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
+    const existed = existsSync(p);
+    const raw = existed ? readFileSync(p, "utf-8") : "";
+    const before = dotenvParseSafe(raw);
+    const beforeComments = commentLines(raw);
+
+    const next = mutate(raw.length ? raw.split(/\r?\n/) : []);
+    if (next === null) return { changed: false, lostKeys: [], lostCommentLines: 0 };
+    const body = next.join("\n");
+
+    const tmp = `${p}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
+    let fd: number | undefined;
+    try {
+      fd = openSync(tmp, "wx", 0o600);
+      writeSync(fd, body);
+      // Flush to the device before the rename: a rename that lands while the
+      // bytes are still in the page cache can leave an empty file after a power
+      // loss, which is the truncation this whole change exists to prevent.
+      try {
+        fsyncSync(fd);
+      } catch {
+        /* fsync is unsupported on some filesystems; the rename is still atomic */
+      }
+      closeSync(fd);
+      fd = undefined;
+
+      // COMPARE-AND-SWAP: if the target changed since we read it, someone else
+      // wrote in the meantime and our `next` was computed from stale content.
+      // Retry against the newer file rather than clobbering their save.
+      const current = existsSync(p) ? readFileSync(p, "utf-8") : "";
+      if (current !== raw) {
+        rmSync(tmp, { force: true });
+        lastConflict = true;
+        continue;
+      }
+      renameSync(tmp, p);
+    } catch (err) {
+      if (fd !== undefined) {
+        try {
+          closeSync(fd);
+        } catch {
+          /* ignore */
+        }
+      }
+      rmSync(tmp, { force: true });
+      throw err;
+    }
+    try {
+      chmodSync(p, 0o600);
+    } catch {
+      /* chmod is a no-op on Windows; ignore */
+    }
+
+    // WHOLE-FILE verification. "Our key is present" is not enough — that is
+    // exactly the check that confirmed a save while other tokens were lost.
+    const afterRaw = existsSync(p) ? readFileSync(p, "utf-8") : "";
+    const after = dotenvParseSafe(afterRaw);
+    const lostKeys: string[] = [];
+    for (const k of Object.keys(before)) {
+      if (opts.intentionalKey && k === opts.intentionalKey) continue;
+      if (!(k in after)) lostKeys.push(k);
+    }
+    return {
+      changed: afterRaw !== raw,
+      lostKeys,
+      lostCommentLines: Math.max(0, beforeComments - commentLines(afterRaw)),
+    };
+  }
+  throw new Error(
+    `Could not update ${p}: another process changed it during each of ${ATTEMPTS} attempts` +
+      `${lastConflict ? "" : ""}. Nothing was written — retry, or close whatever else is writing the credential store.`,
+  );
+}
+
+/** dotenv.parse that never throws — an unreadable/garbage store yields {}. */
+function dotenvParseSafe(raw: string): Record<string, string> {
+  try {
+    return dotenv.parse(raw);
+  } catch {
+    return {};
+  }
+}
+
+/** How many non-empty, non-assignment lines (i.e. comments) the text carries.
+ *  Used only to DETECT loss; the lines themselves are never reported. */
+function commentLines(raw: string): number {
+  return raw.split(/\r?\n/).filter((l) => l.trim().startsWith("#")).length;
+}
+
 /** Upsert `KEY=value` into the canonical .env, 0600, preserving every other line
  *  (comments included). Replaces the FIRST uncommented `KEY=` line and DROPS any
  *  later duplicates, else appends. Dropping the duplicates matters: dotenv lets a
@@ -456,39 +632,35 @@ function envKeyLinePattern(key: string): RegExp {
  *  authoritative — the save would report a value the readers never resolve
  *  (codex gate, round 2, finding 3). The read-back would catch it, but leaving
  *  one line for the key means there is nothing to catch. */
-function upsertEnvFile(key: string, value: string): void {
+function upsertEnvFile(key: string, value: string): EnvWriteOutcome {
   // Encode + verify BEFORE touching the file, so an unrepresentable value never
   // half-lands (it would read back different and look like tampering).
   const line = encodeEnvLine(key, value);
-  const p = envFilePath();
-  mkdirSync(dirname(p), { recursive: true });
-  const raw = existsSync(p) ? readFileSync(p, "utf-8") : "";
-  const original = raw.length ? raw.split(/\r?\n/) : [];
   const re = envKeyLinePattern(key);
-  const lines: string[] = [];
-  let replaced = false;
-  for (const existing of original) {
-    if (re.test(existing)) {
-      if (!replaced) {
-        lines.push(line);
-        replaced = true;
+  return rewriteEnvFile(
+    (original) => {
+      const lines: string[] = [];
+      let replaced = false;
+      for (const existing of original) {
+        if (re.test(existing)) {
+          if (!replaced) {
+            lines.push(line);
+            replaced = true;
+          }
+          continue; // a later duplicate would outrank the line we just wrote
+        }
+        lines.push(existing);
       }
-      continue; // a later duplicate would outrank the line we just wrote
-    }
-    lines.push(existing);
-  }
-  if (!replaced) {
-    // Drop a single trailing empty line so we don't accumulate blanks, then add.
-    if (lines.length && lines[lines.length - 1] === "") lines.pop();
-    lines.push(line);
-    lines.push("");
-  }
-  writeFileSync(p, lines.join("\n"), { mode: 0o600 });
-  try {
-    chmodSync(p, 0o600);
-  } catch {
-    /* chmod is a no-op on Windows; ignore */
-  }
+      if (!replaced) {
+        // Drop a single trailing empty line so we don't accumulate blanks, then add.
+        if (lines.length && lines[lines.length - 1] === "") lines.pop();
+        lines.push(line);
+        lines.push("");
+      }
+      return lines;
+    },
+    { intentionalKey: key },
+  );
 }
 
 /** Remove EVERY uncommented assignment to `key` from the canonical .env
@@ -498,17 +670,54 @@ function upsertEnvFile(key: string, value: string): void {
 function removeEnvFileKey(key: string): boolean {
   const p = envFilePath();
   if (!existsSync(p)) return false;
-  const lines = readFileSync(p, "utf-8").split(/\r?\n/);
   const re = envKeyLinePattern(key);
-  const kept = lines.filter((l) => !re.test(l));
-  if (kept.length === lines.length) return false;
-  writeFileSync(p, kept.join("\n"), { mode: 0o600 });
+  const out = rewriteEnvFile(
+    (lines) => {
+      const kept = lines.filter((l) => !re.test(l));
+      return kept.length === lines.length ? null : kept; // nothing to remove
+    },
+    { intentionalKey: key, removing: true },
+  );
+  if (out.lostKeys.length) {
+    throw new Error(
+      `Removing "${key}" from ${p} also lost ${out.lostKeys.join(", ")} — the store was rewritten by something else mid-operation. ` +
+        `Check ${p} before relying on any credential.`,
+    );
+  }
+  return out.changed;
+}
+
+/** Legacy JSON store writer — kept atomic for the same reason. */
+function writeFileAtomic(target: string, body: string): void {
+  const tmp = `${target}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
+  let fd: number | undefined;
   try {
-    chmodSync(p, 0o600);
+    fd = openSync(tmp, "wx", 0o600);
+    writeSync(fd, body);
+    try {
+      fsyncSync(fd);
+    } catch {
+      /* best effort */
+    }
+    closeSync(fd);
+    fd = undefined;
+    renameSync(tmp, target);
+  } catch (err) {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
+    rmSync(tmp, { force: true });
+    throw err;
+  }
+  try {
+    chmodSync(target, 0o600);
   } catch {
     /* ignore */
   }
-  return true;
 }
 
 /** True when `key` may be persisted (union of the comfyui-tool + agent-provider
@@ -550,7 +759,7 @@ export function setEnvSecret(
   }
   const previous = process.env[trimmed];
   const previouslyShellProvided = isShellProvided(trimmed);
-  upsertEnvFile(trimmed, value);
+  const writeOutcome = upsertEnvFile(trimmed, value);
   // A REAL environment variable outranks the store — that is this codebase's own
   // rule, and the panel does not get to break it. Overwriting process.env here
   // (and calling markFileDerived on it) replaced the live shell value AND
@@ -624,6 +833,7 @@ export function setEnvSecret(
     persisted,
     livePickup: hasLivePickup(trimmed),
     ...(previouslyShellProvided ? { shadowedByEnv: true } : {}),
+    ...(writeOutcome.lostKeys.length ? { lostKeys: writeOutcome.lostKeys } : {}),
     respawn: reports.length
       ? reports.reduce(
           (a, b) => ({

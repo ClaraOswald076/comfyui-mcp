@@ -100,6 +100,15 @@ function reflectionVariants(value: string): string[] {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+  // BASE64 matters and the shape pass cannot cover it: a SHORT,
+  // punctuation-bearing credential base64s to a short opaque string, which is
+  // under the 24-char run threshold and carries no `token=` label — so it
+  // survived both shape passes and landed in a tool error (coordinator
+  // finding). We hold the secret; we do not have to infer it. Basic-auth style
+  // (`user:pass`) is included because that is how a proxy usually re-encodes it.
+  const b64 = Buffer.from(value, "utf8").toString("base64");
+  const b64NoPad = b64.replace(/=+$/, "");
+  const b64Url = b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   return [
     value,
     encodeURIComponent(value),
@@ -107,6 +116,9 @@ function reflectionVariants(value: string): string[] {
     html,
     value.toLowerCase(),
     value.toUpperCase(),
+    b64,
+    b64NoPad,
+    b64Url,
   ];
 }
 
@@ -167,9 +179,32 @@ export function redactComfyAuthValues(text: string): string | null {
   return scrubSecretShapedText(text);
 }
 
-function looksLikeHtml(contentType: string, body: string): boolean {
-  if (/\b(text\/html|application\/xhtml\+xml)\b/i.test(contentType)) return true;
-  return /^\s*(<!doctype html|<html\b)/i.test(body);
+/**
+ * Is the BODY actually markup?
+ *
+ * The Content-Type header is a CLAIM, not evidence — a `200 text/html` carrying
+ * a truncated `{"devices":[` was reported as "an HTML page" from "some HTTP
+ * responder other than the ComfyUI JSON API", sending the user to blame their
+ * base URL or their proxy when the real problem was a cut-off response
+ * (coordinator finding). A truncated body and a proxy error page have entirely
+ * different remedies, so the header alone must never pick one.
+ */
+function looksLikeHtml(body: string): boolean {
+  return /^\s*(<!doctype\b|<html\b|<\?xml\b|<[a-z!/])/i.test(body);
+}
+
+/** The body BEGINS like JSON but does not parse — a truncated, streamed-short or
+ *  otherwise cut-off response, which is a completely different fault from
+ *  "something else answered". */
+function looksLikeTruncatedJson(body: string): boolean {
+  const t = body.trim();
+  if (!t.startsWith("{") && !t.startsWith("[")) return false;
+  try {
+    JSON.parse(t);
+    return false; // it parses; not our case
+  } catch {
+    return true;
+  }
 }
 
 /**
@@ -214,7 +249,11 @@ export function classifyNonJson(args: {
 }): NonJsonDiagnosis {
   const { url, status, contentType, body } = args;
   const bodyPrefix = bodyPrefixOf(body);
-  const html = looksLikeHtml(contentType, body);
+  // EVIDENCE, not the header's claim. `claimsHtml` is reported as a claim; only
+  // `html` (the body really is markup) may drive a diagnosis.
+  const html = looksLikeHtml(body);
+  const claimsHtml = /\b(text\/html|application\/xhtml\+xml)\b/i.test(contentType);
+  const truncatedJson = looksLikeTruncatedJson(body);
 
   // A STATUS alone never proves who produced it — ComfyUI, or an application
   // layer in front of it, can emit 401/403 and 502/503/504 alike. Assert a cause
@@ -257,12 +296,30 @@ export function classifyNonJson(args: {
     cause = looksLikeComfyFrontend(body)
       ? "the ComfyUI web FRONTEND answered this path (its markers are in the body) instead of the ComfyUI HTTP API — typically a reverse proxy that forwards the UI but not the API routes, or a base URL pointing at the frontend's catch-all"
       : "some HTTP responder other than the ComfyUI JSON API answered this path; this body alone does not identify which. The usual candidates are the ComfyUI frontend's SPA catch-all, a reverse proxy that forwards the UI but not the API routes, a maintenance/WAF page, or an unrelated web app on this host";
+  } else if (truncatedJson) {
+    kind = "not-json";
+    // We observed exactly one thing: it starts like JSON and does not parse.
+    // Narrating that as "something else answered" would send the user to the
+    // wrong remedy entirely.
+    cause =
+      "the body BEGINS like JSON but does not parse — a truncated or cut-off response (a dropped connection, a proxy read/body-size limit, a stream that ended early) rather than a different responder. " +
+      "This response does not identify which of those it was";
   } else {
     kind = "not-json";
-    cause = "the response body is not JSON at all";
+    cause =
+      `the body did not parse as JSON and is not markup either` +
+      (claimsHtml
+        ? ", although the response DECLARES itself text/html — the declaration and the body disagree, so neither settles what answered" : "") +
+      ". The candidates are a truncated response, a non-JSON error payload, or a responder that is not the ComfyUI JSON API; this response does not identify which";
   }
 
-  const what = html ? "an HTML page" : contentType ? `a ${contentType} body` : "a non-JSON body";
+  const what = html
+    ? "an HTML page"
+    : truncatedJson
+      ? "a body that begins like JSON but does not parse"
+      : contentType
+        ? `a ${contentType} body that did not parse as JSON`
+        : "a body that did not parse as JSON";
   const message =
     `${url} answered ${status} with ${what} where JSON was expected. This means ${cause}. ` +
     `Content-Type: ${contentType || "(none)"}. Body starts: ${bodyPrefix || "(empty)"}. ` +

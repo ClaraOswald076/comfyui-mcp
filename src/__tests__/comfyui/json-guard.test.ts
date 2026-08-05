@@ -208,6 +208,46 @@ describe("classifyNonJson names what answered instead of ComfyUI (#828)", () => 
     expect(d.kind).toBe("not-found");
   });
 
+  it("does NOT call a TRUNCATED JSON body an HTML page just because the header says text/html", () => {
+    // The header is a claim, not evidence. Narrating `{"devices":[` as "an HTML
+    // page" from "some responder other than the ComfyUI JSON API" sends the user
+    // to blame their base URL or proxy when the response was simply cut off —
+    // completely different remedies.
+    const d = classifyNonJson({
+      url: URL_UNDER_TEST,
+      status: 200,
+      contentType: "text/html; charset=utf-8",
+      body: '{"devices":[',
+    });
+    expect(d.message).not.toContain("an HTML page");
+    expect(d.message).not.toContain("some HTTP responder other than the ComfyUI JSON API");
+    expect(d.message).toContain("BEGINS like JSON but does not parse");
+    expect(d.message).toContain("truncated");
+  });
+
+  it("names the header/body disagreement without letting either settle it", () => {
+    const d = classifyNonJson({
+      url: URL_UNDER_TEST,
+      status: 200,
+      contentType: "text/html",
+      body: "not markup and not json",
+    });
+    expect(d.message).toContain("DECLARES itself text/html");
+    expect(d.message).toContain("does not identify which");
+    expect(d.message).not.toContain("an HTML page");
+  });
+
+  it("still calls a REAL html body an HTML page", () => {
+    const d = classifyNonJson({
+      url: URL_UNDER_TEST,
+      status: 200,
+      contentType: "", // no header at all — the BODY is the evidence
+      body: "<!DOCTYPE html><html><body>hi</body></html>",
+    });
+    expect(d.kind).toBe("html-page");
+    expect(d.message).toContain("an HTML page");
+  });
+
   it("classifies a non-HTML, non-JSON body as plain not-json", () => {
     const d = classifyNonJson({
       url: URL_UNDER_TEST,
@@ -365,6 +405,47 @@ describe("the diagnostic body prefix never carries our own credential back", () 
       });
       expect(d.message).not.toContain(entity);
       expect(d.message).not.toContain(token);
+    } finally {
+      authHeaders.value = {};
+    }
+  });
+
+  it("redacts a SHORT punctuation-bearing credential reflected as BASE64", () => {
+    // The shape passes cannot reach this: base64 of a short credential is a
+    // short opaque string, under the run threshold and carrying no `token=`
+    // label. We HOLD the secret, so we match it rather than guessing at shape.
+    const token = "a/b+c=d";
+    authHeaders.value = { "X-API-Key": token };
+    try {
+      const b64 = Buffer.from(token, "utf8").toString("base64");
+      expect(b64.length).toBeLessThan(24); // i.e. invisible to the run rule
+      const d = classifyNonJson({
+        url: URL_UNDER_TEST,
+        status: 401,
+        contentType: "text/html",
+        body: `<html>rejected ${b64} bye</html>`,
+      });
+      expect(d.message).not.toContain(b64);
+      expect(d.message).not.toContain(token);
+    } finally {
+      authHeaders.value = {};
+    }
+  });
+
+  it("redacts the base64url and unpadded forms too", () => {
+    const token = "pa/ss+wo=rd";
+    authHeaders.value = { Authorization: `Bearer ${token}` };
+    try {
+      const b64 = Buffer.from(token, "utf8").toString("base64");
+      for (const form of [b64, b64.replace(/=+$/, ""), b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")]) {
+        const d = classifyNonJson({
+          url: URL_UNDER_TEST,
+          status: 403,
+          contentType: "text/html",
+          body: `<html>bad ${form} creds</html>`,
+        });
+        expect(d.message, form).not.toContain(form);
+      }
     } finally {
       authHeaders.value = {};
     }
