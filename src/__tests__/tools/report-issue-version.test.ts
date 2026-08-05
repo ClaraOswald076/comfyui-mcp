@@ -89,8 +89,12 @@ describe("normalizeReportedVersion (#846)", () => {
     // fallback — #846 again (codex gate round 4).
     expect(mcp("MCP version: 0.48.18")).toBe("0.48.18");
     expect(mcp("comfyui-mcp version 0.49.6")).toBe("0.49.6");
-    // …but the run is capped, so a label followed by prose cannot wander into some
-    // OTHER component's version further along the line.
+    // …but ONLY that named filler is skipped. Scanning ahead for "the next thing
+    // that looks like a version" walked straight over an indeterminate value into
+    // the NEXT component's, reporting the PANEL's version as the mcp one (codex gate
+    // round 6). An mcp version that cannot be determined must stay undetermined —
+    // that is the whole rule this cluster is about.
+    expect(mcp("comfyui-mcp unknown · panel 0.11.38.")).toBeUndefined();
     expect(mcp("comfyui-mcp could not be determined, torch 2.7.1")).toBeUndefined();
   });
 

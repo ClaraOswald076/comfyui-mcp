@@ -173,8 +173,16 @@ describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]",
     expect(res.stopped).toBe(true);
     expect(res.started).toBe(true);
     expect(res.ready).toBe(true);
-    expect(res.message).toContain("rebooted via ComfyUI-Manager");
+    expect(res.message).toContain("reboot request was accepted");
     expect(res.message).toContain("Desktop/supervised");
+    // IT MUST NOT CLAIM A CYCLE IT NEVER WATCHED (codex gate round 6). This poller
+    // has no down→up requirement at all — unlike the panel path, which certifies
+    // only on an observed cycle — so all that was seen is an accepted request and a
+    // later healthy probe. A Manager that accepts and then does nothing leaves a
+    // healthy server that never restarted, and "came back" stops the user looking.
+    expect(res.message).not.toMatch(/came back/i);
+    expect(res.message).not.toMatch(/rebooted via/i);
+    expect(res.message).toMatch(/not directly observed/i);
 
     // The Manager reboot was fired.
     expect(findCall((p) => p === "/v2/manager/reboot")).toBeDefined();
@@ -242,7 +250,7 @@ describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]",
     // reboot re-execs the running process) would assert a cause we never observed.
     expect(res.message).not.toMatch(/re-exec/i);
     // And it never contradicts the restart that genuinely happened.
-    expect(res.message).toContain("came back ready");
+    expect(res.message).toContain("ComfyUI is healthy now");
   });
 
   it("says the launch arguments CHANGED when they actually did (#848)", async () => {
@@ -313,7 +321,7 @@ describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]",
     expect(res.message).not.toMatch(/launch arguments/i);
     // The restart itself is still reported — a missing extra detail must not
     // degrade the verdict about the thing that did happen.
-    expect(res.message).toContain("came back ready");
+    expect(res.message).toContain("ComfyUI is healthy now");
   });
 
   it("says NOTHING about launch arguments when the target moved mid-restart (#848)", async () => {
@@ -345,7 +353,7 @@ describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]",
     expect(res.ready).toBe(true);
     // The identical argv would otherwise have produced the UNCHANGED note.
     expect(res.message).not.toMatch(/launch arguments/i);
-    expect(res.message).toContain("came back ready");
+    expect(res.message).toContain("ComfyUI is healthy now");
   });
 
   it("says NOTHING about launch arguments when the target moved BEFORE the reboot (#848)", async () => {
@@ -381,7 +389,7 @@ describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]",
 
     expect(res.ready).toBe(true);
     expect(res.message).not.toMatch(/launch arguments/i);
-    expect(res.message).toContain("came back ready");
+    expect(res.message).toContain("ComfyUI is healthy now");
   });
 
   it("refuses without killing when the Manager reboot cannot be fired (403)", async () => {
