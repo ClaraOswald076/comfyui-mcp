@@ -255,6 +255,11 @@ function withSuspendedEmissions<T>(
  *  no request was outstanding (#164). */
 export interface ComfyuiSecretChange {
   requested: boolean;
+  /** The save's VERDICT, so a listener that speaks more authoritatively than the
+   *  receipt — the "your token is now active, retry" nudge — can refuse to speak
+   *  at all unless the save was proven. Absent on a revoke or a reload, where
+   *  there is no save to verify. */
+  persisted?: SecretSaveReceipt["persisted"];
   /** The panel tab whose panel_request_secret this change answers, when
    *  `requested` — so the orchestrator can nudge ONLY that tab's agent to retry
    *  (never a broadcast to unrelated tabs). Undefined for non-request changes. */
@@ -512,6 +517,24 @@ export function revokeIsClean(outcome: SecretRemoveOutcome): boolean {
     !outcome.resurrectionRisk &&
     !outcome.incomplete
   );
+}
+
+/**
+ * May this change fire the "your token is now active — retry the action" nudge?
+ *
+ * The nudge is the loudest thing in the system: it is injected straight into the
+ * agent's turn as an instruction, and it OUTRANKS the receipt the tool reply is
+ * built from. It was gated on `requested` alone, so a save whose read-back could
+ * not be taken — or one that destroyed other credentials — produced an honest
+ * tool reply beside a message telling the agent it had worked, and the agent
+ * follows the instruction (codex gate). That is #826 itself, in the one place
+ * that speaks over the honest answer.
+ *
+ * A change with no verdict (a revoke, a background reload) never carries
+ * `requested`, so it cannot reach here claiming a save.
+ */
+export function changeJustifiesRetryNudge(change: ComfyuiSecretChange): boolean {
+  return change.requested === true && change.persisted === "yes" && !!change.tabId;
 }
 
 /**
@@ -1000,7 +1023,11 @@ function rewriteEnvFile(
   mkdirSync(dirname(p), { recursive: true });
   // Clear out anything a CRASHED writer left: a stale pre-write snapshot is a
   // readable copy of the credentials as they were, including ones since revoked.
-  sweepStaleSidecars(p);
+  // Survivors are REPORTED, not dropped — the revoke path carried this
+  // obligation and the save path did not, so a save could return
+  // `persisted: "yes"` with an old credential still readable beside the store
+  // (codex gate).
+  const preexistingStrays = sweepStaleSidecars(p);
 
   const ATTEMPTS = 5;
   // OBSERVED evidence that another process is writing this store right now. It
@@ -1014,13 +1041,18 @@ function rewriteEnvFile(
 
     const next = mutate(raw.length ? raw.split(/\r?\n/) : []);
     if (next === null) {
-      // Nothing to change: no rename, so nothing to account for.
+      // Nothing to change: no rename, so nothing to account for — except a
+      // crashed writer's snapshot the sweep could not clear, which is still a
+      // readable copy of the credentials and still the caller's to know about.
       return {
         changed: false,
         lostKeys: [],
         lostCommentLines: 0,
         lossCheck: "clean",
         durabilityGap: null,
+        ...(preexistingStrays.length
+          ? { strayCopy: `${preexistingStrays.join(", ")} (left by an interrupted earlier write)` }
+          : {}),
       };
     }
     const body = next.join("\n");
@@ -1039,8 +1071,11 @@ function rewriteEnvFile(
     let targetExistedAtSwap = false;
     let fd: number | undefined;
     let durabilityGap: string | null = null;
-    /** A pre-write snapshot this operation could not delete. */
-    let strayCopy: string | null = null;
+    /** A pre-write snapshot that could not be deleted — this operation's own, or
+     *  a crashed writer's that the sweep above could not clear. */
+    let strayCopy: string | null = preexistingStrays.length
+      ? `${preexistingStrays.join(", ")} (left by an interrupted earlier write)`
+      : null;
     try {
       fd = openSync(tmp, "wx", 0o600);
       writeAllSync(fd, body);
@@ -1172,7 +1207,9 @@ function rewriteEnvFile(
       // deliberately skips fresh files, because a fresh one belongs to a live
       // writer. So a revoke could come back clean with the old token still on
       // disk (codex gate). It rides out on the outcome instead.
-      strayCopy = `${sentinel} (${errCode(err)})`;
+      strayCopy = strayCopy
+        ? `${strayCopy}; ${sentinel} (${errCode(err)})`
+        : `${sentinel} (${errCode(err)})`;
       logger.warn(
         `[panel-secrets] could not remove the pre-write snapshot ${sentinel} (${errCode(err)}); ` +
           `it is a copy of the credential store and can be deleted by hand.`,
@@ -1525,6 +1562,9 @@ export function setEnvSecret(
   if (isAllowedComfyuiSecretKey(trimmed))
     emitComfyuiChange({
       requested: opts.requested === true,
+      // The verdict rides along, so a listener cannot make a louder claim than
+      // the receipt does. `persisted` is already settled at this point.
+      persisted,
       tabId: opts.tabId,
       report: (r: SecretRespawnReport) => reports.push(r),
     });

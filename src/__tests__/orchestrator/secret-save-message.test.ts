@@ -218,6 +218,31 @@ describe("secretSavedReply: the panel's green light is the same question as ever
   });
 });
 
+describe("the retry NUDGE never speaks over the receipt", () => {
+  it("fires only for a PROVEN save that answers an outstanding request", async () => {
+    // The nudge is injected straight into the agent's turn as an instruction and
+    // outranks the tool reply. Gated on `requested` alone, a save whose
+    // read-back could not be taken — or one that destroyed other credentials —
+    // produced an honest reply beside a message telling the agent it had worked,
+    // and the agent follows the instruction (codex gate). That is #826 itself,
+    // in the one place that speaks over the honest answer.
+    const { changeJustifiesRetryNudge } = await import("../../services/panel-secrets.js");
+    const asked = { requested: true, tabId: "tab-1" } as const;
+    expect(changeJustifiesRetryNudge({ ...asked, persisted: "yes" })).toBe(true);
+    expect(changeJustifiesRetryNudge({ ...asked, persisted: "unknown" })).toBe(false);
+    expect(changeJustifiesRetryNudge({ ...asked, persisted: "damaged" })).toBe(false);
+    expect(changeJustifiesRetryNudge({ ...asked, persisted: "no" })).toBe(false);
+    // A change with no verdict at all (a revoke, a background reload) is not a
+    // save and can never claim to be one.
+    expect(changeJustifiesRetryNudge(asked)).toBe(false);
+    // And a proven save with no requesting tab nudges nobody (#164).
+    expect(changeJustifiesRetryNudge({ requested: true, persisted: "yes" })).toBe(false);
+    expect(changeJustifiesRetryNudge({ requested: false, persisted: "yes", tabId: "tab-1" })).toBe(
+      false,
+    );
+  });
+});
+
 describe("secretNotPersisted: reflects whether a credential SURVIVED the rollback", () => {
   it("does NOT say 'nothing is configured' when a previous value is still in effect", () => {
     const err = secretNotPersisted({ ...base, persisted: "no", stillConfigured: true });

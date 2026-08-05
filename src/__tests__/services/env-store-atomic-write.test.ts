@@ -761,6 +761,24 @@ describe("a completed REVOKE is never turned back into a refusal", () => {
     expect(existsSync(stale)).toBe(false);
   });
 
+  it("REPORTS a stale snapshot it could not sweep, on a SAVE as well as a revoke", () => {
+    // The survivors of the sweep were discarded on the save path, so a save
+    // could return `persisted: "yes"` with an old credential still readable
+    // beside the store. The revoke path carried this obligation; the save path
+    // must carry the same one (codex gate).
+    writeFileSync(envPath, "CIVITAI_API_TOKEN=civ-old\n", { mode: 0o600 });
+    const stale = `${envPath}.pre-99997-0badc0ffee00`;
+    writeFileSync(stale, "CIVITAI_API_TOKEN=civ-old\n", { mode: 0o600 });
+    utimesSync(stale, new Date(Date.now() - 600_000), new Date(Date.now() - 600_000));
+    fsState.failSentinelRemoval = true; // the sweep cannot delete it either
+    const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+    fsState.failSentinelRemoval = false;
+    expect(r.persisted).toBe("yes"); // the save itself is fine
+    expect(r.strayCopy).toContain(".pre-99997-");
+    expect(r.strayCopy).toMatch(/interrupted earlier write/);
+    expect(JSON.stringify(r)).not.toContain("civ-old"); // names only
+  });
+
   it("leaves a FRESH snapshot alone — it may belong to a live writer", () => {
     writeFileSync(envPath, "CIVITAI_API_TOKEN=civ-old\n", { mode: 0o600 });
     const fresh = `${envPath}.pre-12345-abcdefabcdef`;

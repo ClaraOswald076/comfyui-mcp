@@ -657,6 +657,72 @@ describe("the diagnostic body prefix never carries our own credential back", () 
     }
   });
 
+  it("redacts UPPER-CASE named entities too (&AMP;)", () => {
+    // HTML accepts `&AMP;` as readily as `&amp;`, and only the lower-case names
+    // were generated (codex gate).
+    const token = "ab&cd<ef>gh";
+    authHeaders.value = { "X-API-Key": token };
+    try {
+      const upper = token.replace(/&/g, "&AMP;").replace(/</g, "&LT;").replace(/>/g, "&GT;");
+      const d = classifyNonJson({
+        url: URL_UNDER_TEST,
+        status: 403,
+        contentType: "text/html",
+        body: `<html>rejected ${upper} sorry</html>`,
+      });
+      expect(d.message).not.toContain(upper);
+      expect(d.bodyPrefix).not.toContain(upper);
+    } finally {
+      authHeaders.value = {};
+    }
+  });
+
+  it("WITHHOLDS the body when a configured credential was LINE-WRAPPED across it", () => {
+    // Every other pass matches contiguous text, so a proxy that wraps a long
+    // token — or inserts a soft break into it — leaves fragments individually
+    // under the 24-char run threshold and carrying no `token=` label: they all
+    // miss, and the credential goes out in pieces (codex gate). The wrapping is
+    // not reversible in place, so this detects in a whitespace-free view and
+    // fails CLOSED, exactly as a too-short credential does.
+    const token = "sk-live-9f3aQ2xR7pLmZ0vTbN4wYc8KdE1uHj6S";
+    authHeaders.value = { Authorization: `Bearer ${token}` };
+    try {
+      const wrapped = `${token.slice(0, 12)}\n${token.slice(12, 24)}\n${token.slice(24)}`;
+      // Each fragment on its own is invisible to every existing pass.
+      for (const piece of wrapped.split("\n")) expect(piece.length).toBeLessThan(24);
+      const d = classifyNonJson({
+        url: URL_UNDER_TEST,
+        status: 401,
+        contentType: "text/html",
+        body: `<html>bad credential\n${wrapped}\nsorry</html>`,
+      });
+      expect(d.bodyPrefix).toContain("body withheld");
+      for (const piece of wrapped.split("\n")) {
+        expect(d.message, piece).not.toContain(piece);
+      }
+    } finally {
+      authHeaders.value = {};
+    }
+  });
+
+  it("does NOT withhold an ordinary multi-line body that merely has whitespace", () => {
+    // The counterpart: the compacted-view check must not turn every wrapped
+    // page into a withheld one.
+    authHeaders.value = { Authorization: "Bearer sk-live-9f3aQ2xR7pLmZ0vTbN4wYc8KdE1uHj6S" };
+    try {
+      const d = classifyNonJson({
+        url: URL_UNDER_TEST,
+        status: 502,
+        contentType: "text/html",
+        body: "<html>\n<head><title>502 Bad Gateway</title></head>\n<body>\n<center>nginx</center>\n</body>\n</html>",
+      });
+      expect(d.bodyPrefix).not.toContain("body withheld");
+      expect(d.bodyPrefix).toContain("502 Bad Gateway");
+    } finally {
+      authHeaders.value = {};
+    }
+  });
+
   it("redacts a credential-SHAPED run even when nothing is configured", () => {
     // The shape rule is the actual defence: a body can reflect a credential we
     // cannot prove is ours, in an encoding we never anticipated.

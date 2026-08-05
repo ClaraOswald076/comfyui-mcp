@@ -87,6 +87,7 @@ import {
   setAgentSecret,
   setComfyuiSecret,
   isAllowedComfyuiSecretKey,
+  changeJustifiesRetryNudge,
   type SecretSaveReceipt,
 } from "../services/panel-secrets.js";
 import { CodexBackend } from "./codex-backend.js";
@@ -2703,7 +2704,9 @@ export async function runPanelOrchestrator(): Promise<void> {
     // Settings slot save, a background token (re)load, or a revoke leaves
     // `requested` false and nudges nothing. The per-tab pending-restart map
     // coalesces, so a repeat event for the same tab can't double-inject (#164).
-    const nudgedTab = change.requested && change.tabId ? change.tabId : null;
+    // ...and only for a PROVEN save — see `changeJustifiesRetryNudge`, which is
+    // where that rule lives and is tested.
+    const nudgedTab = changeJustifiesRetryNudge(change) ? (change.tabId ?? null) : null;
     let nudgeOutcome: McpEnvRestartOutcome | null = null;
     if (nudgedTab) nudgeOutcome = manager.restartForMcpEnv(agentKeyFor(nudgedTab), SECRET_RETRY_NUDGE);
     // Tell the SAVER what actually happened (#826). The emit is synchronous, so
