@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { writeFile, mkdir } from "node:fs/promises";
 import { join, resolve, isAbsolute } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 
 // #768 — get_image resolved its destination against process.cwd() when save_dir was
 // omitted. That is not a directory this process chose: it is wherever the MCP client
@@ -193,6 +193,35 @@ describe("get_image save_dir resolution (#768)", () => {
     expect(description).toMatch(/os\.tmpdir\(\)/);
     expect(description).toMatch(/comfyui-images/);
     expect(defaultImageSaveDir()).toBe(join(tmpdir(), "comfyui-images"));
+  });
+
+  it("stays absolute even when TEMP/TMPDIR is itself relative", async () => {
+    // os.tmpdir() returns %TEMP%/%TMP%/$TMPDIR verbatim, and nothing guarantees those are
+    // absolute. A relative one would be resolved by writeFile against the process cwd —
+    // which is the exact bug this default exists to escape.
+    const hostile = pretendUnwritableCwd();
+    const key = process.platform === "win32" ? "TEMP" : "TMPDIR";
+    const saved = process.env[key];
+    const savedTmp = process.env.TMP;
+    process.env[key] = "relative-temp";
+    if (process.platform === "win32") process.env.TMP = "relative-temp";
+    try {
+      // Absolute AND still not anchored to the launch directory: resolving a relative
+      // TEMP against cwd would have produced System32\relative-temp\comfyui-images,
+      // which is the same bug with an extra path segment.
+      expect(isAbsolute(defaultImageSaveDir())).toBe(true);
+      expect(defaultImageSaveDir()).toBe(join(homedir(), "comfyui-images"));
+      await getHandler("get_image")({ filename: "d.png" });
+      const [target] = vi.mocked(writeFile).mock.calls[0] as [string, Buffer];
+      expect(isAbsolute(target)).toBe(true);
+      expect(target.startsWith(hostile)).toBe(false);
+      expect(target).not.toContain("relative-temp");
+    } finally {
+      if (saved === undefined) delete process.env[key];
+      else process.env[key] = saved;
+      if (savedTmp === undefined) delete process.env.TMP;
+      else process.env.TMP = savedTmp;
+    }
   });
 
   it("resolveImageSaveDir treats blank/whitespace save_dir as omitted", () => {
