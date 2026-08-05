@@ -307,18 +307,24 @@ function detectMcpVersion(): string | undefined {
  * upgrading already fixes their bug — which is the single most common resolution,
  * and the outcome #846 was filed to protect.
  *
- * Deliberately anchored at the START, so the FIRST version wins: the ENV line leads
- * with the RUNNING build, which is the one the report is about. A clause naming a
- * newer installed version must never be the one that gets extracted.
- *
- * Returns undefined rather than a guess when nothing version-shaped is there, so
- * the caller falls back to detecting it — an unusable string is no reading at all,
- * and must not be reported as one.
+ * THE FIRST version in the string wins, wherever it appears. Anchoring at the very
+ * start was wrong twice over (codex gate): an agent copying the natural segment
+ * ("comfyui-mcp 0.48.18 …") matched nothing and fell through to a fresh disk read,
+ * which returns the INSTALLED version — silently swapping in exactly the number
+ * #846 exists to stop us reporting. First-wins keeps that fallback rare AND
+ * correct: the ENV line leads with the RUNNING build, so a clause naming a newer
+ * installed version can never be the one extracted.
  */
 export function normalizeReportedVersion(raw: string | undefined): string | undefined {
   if (typeof raw !== "string") return undefined;
-  const m = /^\s*v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/.exec(raw);
-  return m ? m[1] : undefined;
+  const m = /v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/.exec(raw);
+  if (m) return m[1];
+  // No semver anywhere. A COMPACT token is still a real version someone may be
+  // running ("nightly", "dev") and is PRESERVED — replacing it with a disk read
+  // would be the same version-swap in a different disguise. Only prose is
+  // discarded, and only then does the caller fall back to detecting a version.
+  const token = raw.trim();
+  return token !== "" && token.length <= 32 && !/\s/.test(token) ? token : undefined;
 }
 
 export function registerReportIssueTools(server: McpServer): void {
@@ -382,7 +388,6 @@ export function registerReportIssueTools(server: McpServer): void {
           mcp: normalizeReportedVersion(args.mcp_version) ?? detectMcpVersion(),
           panel:
             normalizeReportedVersion(args.panel_version) ??
-            args.panel_version ??
             process.env.COMFYUI_MCP_PANEL_VERSION ??
             undefined,
         };

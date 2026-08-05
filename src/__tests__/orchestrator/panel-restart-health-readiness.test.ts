@@ -172,7 +172,11 @@ describe("panel_restart_comfyui recovery after an ACCEPTED reboot (coordinator p
     expect(String(out.note)).toContain("healthy again");
     // …and the thing the user actually wanted to know is now in the same sentence.
     expect(String(out.note)).toContain("launch arguments are UNCHANGED");
-    expect(String(out.note)).toContain("Fully quit the ComfyUI Desktop app");
+    // Exactly what equal argv establishes, with the remedy offered CONDITIONALLY —
+    // we never read the user's saved settings, so we cannot say they were ignored.
+    expect(String(out.note)).toContain("this restart did not change them");
+    expect(String(out.note)).toContain("If you were expecting different arguments");
+    expect(String(out.note)).toMatch(/fully quit the ComfyUI Desktop app/i);
   });
 
   it("reports launch arguments CHANGED when the restart did apply them (#848)", async () => {
@@ -196,7 +200,7 @@ describe("panel_restart_comfyui recovery after an ACCEPTED reboot (coordinator p
     expect(String(out.note)).toContain("--disable-dynamic-vram");
     // A restart that DID apply the change must not send the user to redo it.
     expect(String(out.note)).not.toContain("UNCHANGED");
-    expect(String(out.note)).not.toContain("Fully quit");
+    expect(String(out.note)).not.toMatch(/fully quit/i);
   });
 
   it("says nothing about launch arguments when the before-reading is missing (#848)", async () => {
