@@ -61,9 +61,11 @@ export interface EnvCapabilities {
   otherBackendAvailable?: boolean; // is the OTHER provider resolvable?
   /**
    * The comfyui-mcp version this process is actually RUNNING, e.g. "0.48.4" — read
-   * from the package.json beside the `dist/` these modules were loaded from, at the
-   * moment the process started. A running process cannot hot-swap its own code, so
-   * this stays true for its whole life; it is `mcpVersionInstalled` that moves.
+   * from the package.json beside the `dist/` these modules were loaded from, at
+   * MODULE LOAD (the closest observable moment to "the build that was loaded"; the
+   * caller supplies it, see MCP_VERSION_RUNNING). A running process cannot hot-swap
+   * its own code, so this stays true for its whole life; `mcpVersionInstalled` is
+   * the one that moves.
    */
   mcpVersion?: string;
   /**

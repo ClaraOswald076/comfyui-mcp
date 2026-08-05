@@ -304,13 +304,20 @@ interface StartupReadinessResult {
  *                     unserved — an external launcher or supervisor may be serving
  *                     it, which is why the message tells the caller to re-check.
  *   "unconfirmed"   — this call cannot tie what is (or is not) serving to the
- *                     launch/reboot it made. Two shapes reach it, and neither is a
- *                     failure: the readiness budget expired with nothing
- *                     contradicting the start; or the server IS healthy but no cycle
- *                     was observed, which is every ComfyUI-Manager reboot — that
- *                     path watches for a healthy probe, never for a down→up, so an
- *                     accepted request in front of a server that never restarted
- *                     looks identical to a successful one.
+ *                     launch/reboot it made. THREE shapes reach it, none a failure,
+ *                     and `ready` is what tells them apart:
+ *                       • ready:false — the readiness budget expired with nothing
+ *                         contradicting the start (#367);
+ *                       • ready:true, local — the server is up but the port owner
+ *                         could not be mapped, so our process cannot be shown to be
+ *                         the listener (the #449 shape);
+ *                       • ready:true, Manager reboot — the server is up but no cycle
+ *                         was observed, which is EVERY Manager reboot: that path
+ *                         watches for a healthy probe, never for a down→up, so an
+ *                         accepted request in front of a server that never restarted
+ *                         looks identical to a successful one.
+ *                     A caller composing its own message MUST check `ready` before
+ *                     saying anything about the server being up.
  *   "not-attempted" — this call never launched or rebooted anything (a refusal, or
  *                     a server that was already running). Stated rather than
  *                     omitted so it can never be mistaken for an older build that
@@ -2822,11 +2829,26 @@ export async function startComfyUI(): Promise<StartResult> {
     // needless recovery.
     started: mayClaimStart,
     ready: true,
-    // The API answered — but WHOSE api (codex gate round 9). When the port is
-    // provably owned by a DIFFERENT process, this call's launch demonstrably did not
-    // produce the serving instance, and the message says exactly that. Emitting
-    // "confirmed" beside it would confirm the one thing just denied.
-    startup: ownership === "not-ours" ? "failed" : "confirmed",
+    // The API answered — but WHOSE API (codex gate rounds 9 and 10). `startup`
+    // answers "did this call confirm that the launch IT MADE is serving?", so on
+    // this path it simply MIRRORS the attribution verdict rather than reporting the
+    // healthy probe and stopping there:
+    //   ours        → confirmed. Our process is the listener.
+    //   not-ours    → failed. Observed: something else is serving, so our relaunch
+    //                 is not what came up.
+    //   unconfirmed → unconfirmed. The port owner could not be mapped; the message
+    //                 says so in as many words, and emitting "confirmed" beside it
+    //                 handed a structured consumer the attribution the prose had
+    //                 just withheld.
+    // `started` deliberately does NOT follow it down on `unconfirmed`: a process of
+    // ours demonstrably exists there and only its attribution is uncertain, which is
+    // the standing listener_ownership ruling. `startup` is what carries that gap.
+    startup:
+      ownership === "ours"
+        ? "confirmed"
+        : ownership === "not-ours"
+          ? "failed"
+          : "unconfirmed",
     readiness,
     message:
       `ComfyUI ${ownership === "not-ours" ? "is ready" : "started"} on port ${port}${newPid ? ` (PID ${newPid})` : ""}` +
@@ -3267,8 +3289,12 @@ async function restartViaManagerReboot(context: {
           // covers a proxy status AND a dropped connection, and the earlier sentence
           // told every user the connection dropped (codex gate round 8). The
           // inference is offered as one, which is all it is.
-          `A ComfyUI-Manager reboot was dispatched but not acknowledged (${reboot.note ?? "no reply"}), ` +
-          "which usually means the handler accepted it and the server went down.") +
+          // No "which usually means the handler accepted it and the server went
+          // down" (codex gate round 10). Handler acceptance and a down transition
+          // are both inferences, "usually" is a frequency claim nobody measured, and
+          // the sentence undercut the very next one, which correctly says the cycle
+          // was not observed. What was seen is enough.
+          `A ComfyUI-Manager reboot was dispatched but not acknowledged (${reboot.note ?? "no reply"}).`) +
       ` ComfyUI is healthy now (${readiness.waited_ms}ms) — ${context.label}/supervised ` +
       "restart. The cycle itself was not directly observed from here, so verify with " +
       "health_check if you need certainty that it actually restarted." +
@@ -3410,7 +3436,14 @@ export async function restartComfyUI(): Promise<RestartResult> {
   // The old `started:false` sent it down the other branch instead, printing "could
   // not be started" over a server that was usually seconds from ready. Both are the
   // same mistake: a boolean answering a question the evidence does not settle.
-  if (startResult.startup === "unconfirmed") {
+  // `ready !== true` is load-bearing, not belt-and-braces (caught by the suite when
+  // round 10 widened `unconfirmed` to cover unmappable ATTRIBUTION as well as an
+  // expired budget). Both are "we cannot tie the serving instance to our launch",
+  // but only one of them has nothing serving — and this composition is about that
+  // one. A healthy-but-unattributed restart taking this branch would have been told
+  // "NOT CONFIRMED YET" about a server that was answering, and would also have
+  // skipped the dispatch-record clear below.
+  if (startResult.startup === "unconfirmed" && startResult.ready !== true) {
     return {
       stopped: true,
       started: true,
