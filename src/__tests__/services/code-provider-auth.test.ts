@@ -257,3 +257,88 @@ describe("nativeCliStatus (CLI-auth detection for oauth_status)", () => {
     expect(JSON.stringify(rec)).not.toContain("rt-2");
   });
 });
+
+describe("readOAuthStatus — home scoping (#859)", () => {
+  // A SECOND temp dir stands in for the developer's real home, and `os.homedir()`
+  // is pointed at it. That is what makes these deterministic: the failure mode is
+  // "the mirror read falls through to the real home", and without a real home we
+  // control, a test can only assert the absence of its own fixture — which proves
+  // nothing, because a genuine leak surfaces a REAL provider like `codex`, not the
+  // fixture. (That was the first version of this test, and the gate was right to
+  // reject it: it passed identically whether the fix was present or reverted.)
+  let scopedHome: string;
+  let pretendRealHome: string;
+
+  beforeEach(async () => {
+    scopedHome = await mkdtemp(join(tmpdir(), "cmcp-oauth-scoped-"));
+    pretendRealHome = await mkdtemp(join(tmpdir(), "cmcp-oauth-realish-"));
+    // The env override is the OTHER redirect and outranks `home` by design; it must
+    // stay unset so these prove the `home` ARGUMENT alone scopes the read.
+    delete process.env.COMFYUI_MCP_PANEL_SECRETS;
+
+    // The stand-in real home holds an ordinary, plausible signed-in provider —
+    // exactly what a developer machine signed into codex would have.
+    await mkdir(join(pretendRealHome, ".comfyui-mcp"), { recursive: true });
+    await writeFile(
+      join(pretendRealHome, ".comfyui-mcp", "panel-secrets.json"),
+      JSON.stringify({
+        oauthStatus: {
+          codex: { provider: "codex", account_label: "dev@example.test", obtained_at: 1_700_000_000 },
+        },
+      }),
+      "utf-8",
+    );
+
+    vi.doMock("node:os", async () => {
+      const actual = await vi.importActual<typeof import("node:os")>("node:os");
+      return { ...actual, homedir: () => pretendRealHome };
+    });
+    vi.resetModules();
+  });
+
+  afterEach(async () => {
+    vi.doUnmock("node:os");
+    vi.resetModules();
+    await rm(scopedHome, { recursive: true, force: true });
+    await rm(pretendRealHome, { recursive: true, force: true });
+  });
+
+  it("an EMPTY injected home yields no records — the real home's logins do not leak in", async () => {
+    const { readOAuthStatus } = await import("../../services/code-provider-auth.js");
+    const records = readOAuthStatus(scopedHome);
+
+    // The assertion that actually discriminates: with the fix reverted, the mirror
+    // read resolves against homedir() and returns the `codex` record above.
+    expect(
+      records.find((r) => r.provider === "codex"),
+      "a provider from the real home must not appear for an empty injected home",
+    ).toBeUndefined();
+    expect(records, "nothing at all should be found under an empty home").toEqual([]);
+  });
+
+  it("reads the mirror from the injected home, not the real one", async () => {
+    await mkdir(join(scopedHome, ".comfyui-mcp"), { recursive: true });
+    await writeFile(
+      join(scopedHome, ".comfyui-mcp", "panel-secrets.json"),
+      JSON.stringify({
+        oauthStatus: {
+          "fixture-only-provider": {
+            provider: "fixture-only-provider",
+            account_label: "scoped@example.test",
+            obtained_at: 1_700_000_000,
+          },
+        },
+      }),
+      "utf-8",
+    );
+
+    const { readOAuthStatus } = await import("../../services/code-provider-auth.js");
+    const records = readOAuthStatus(scopedHome);
+
+    const scoped = records.find((r) => r.provider === "fixture-only-provider");
+    expect(scoped, "the injected home's mirror entry must be returned").toBeDefined();
+    expect(scoped?.account_label).toBe("scoped@example.test");
+    // Both directions in one place: the right file was read AND the wrong one was not.
+    expect(records.find((r) => r.provider === "codex")).toBeUndefined();
+  });
+});

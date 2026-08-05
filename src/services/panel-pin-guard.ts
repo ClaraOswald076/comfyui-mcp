@@ -26,9 +26,11 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
+  fsyncSync,
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
   writeSync,
@@ -494,7 +496,65 @@ function isPanelPendingOp(value: unknown): value is PanelPendingOp {
   );
 }
 
-function readPanelPendingOpsFile(): { ops: PanelPendingOp[]; unreadable: boolean } {
+/** Why a read produced no usable ops. The distinction that matters is `empty`
+ *  vs `unparseable`, and it exists because collapsing them wedged `update_all`
+ *  permanently (#847).
+ *
+ *  A ZERO-BYTE file is not "a record we cannot read" — it is a file with no
+ *  bytes, so there is no operation recorded in it and nothing to lose by
+ *  superseding it. An unparseable file with CONTENT may well describe a real
+ *  queued operation whose warning we simply cannot decode, and overwriting that
+ *  destroys the warning. Same "we got nothing usable", two different questions. */
+type PendingOpsReadState = "absent" | "empty" | "readable" | "unparseable";
+
+interface PendingOpsRead {
+  ops: PanelPendingOp[];
+  /** True when we cannot prove nothing is pending — `empty` counts, because an
+   *  interrupted write is indistinguishable from a file that never got content. */
+  unreadable: boolean;
+  state: PendingOpsReadState;
+}
+
+/**
+ * Replace the marker atomically: write a uniquely-named temp beside it, fsync,
+ * then rename over the target.
+ *
+ * `writeFileSync` TRUNCATES in place, so a crash after truncation and before the
+ * content lands leaves a ZERO-BYTE file that previously held real operations.
+ * That is what made "an empty file records nothing" untrue for this writer, and
+ * it is the hole the independent gate found in the first cut of #847 — the write
+ * path would have superseded such a file and silently dropped a queued
+ * operation's warning. A rename is atomic: a reader sees the whole old content or
+ * the whole new content, never nothing.
+ *
+ * The temp name carries a uuid because two agents share this rig, and a fixed
+ * `.tmp` would let concurrent writers clobber each other's staging file.
+ */
+function writePanelPendingOpsAtomic(path: string, body: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.${randomUUID()}.tmp`;
+  const fd = openSync(tmp, "wx");
+  try {
+    writeSync(fd, body);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  try {
+    renameSync(tmp, path);
+  } catch (err) {
+    // Never leave staging debris behind: it is not the marker, and a stray file
+    // beside it is one more thing for a later reader to misinterpret.
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      /* best effort */
+    }
+    throw err;
+  }
+}
+
+function readPanelPendingOpsFile(): PendingOpsRead {
   const path = panelPendingOpsPath();
   let raw: string;
   try {
@@ -503,9 +563,17 @@ function readPanelPendingOpsFile(): { ops: PanelPendingOp[]; unreadable: boolean
     // Only ENOENT proves there is no marker. Permission/I/O errors are
     // indeterminate and must keep a later pin from claiming clean protection.
     if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
-      return { ops: [], unreadable: false };
+      return { ops: [], unreadable: false, state: "absent" };
     }
-    return { ops: [], unreadable: true };
+    return { ops: [], unreadable: true, state: "unparseable" };
+  }
+  // A zero-byte (or whitespace-only) file: `JSON.parse("")` throws, so this used
+  // to land in `unparseable` and refuse forever. It stays `unreadable` for the
+  // READ question — an interrupted write is indistinguishable from a file that
+  // never got content, so a pin must still warn — but it is separately marked so
+  // the WRITE path can supersede it. See the type comment above.
+  if (raw.trim() === "") {
+    return { ops: [], unreadable: true, state: "empty" };
   }
   try {
     const parsed = JSON.parse(raw) as unknown;
@@ -514,12 +582,12 @@ function readPanelPendingOpsFile(): { ops: PanelPendingOp[]; unreadable: boolean
         ? (parsed as { ops?: unknown }).ops
         : undefined;
     if (Array.isArray(ops) && ops.every(isPanelPendingOp)) {
-      return { ops, unreadable: false };
+      return { ops, unreadable: false, state: "readable" };
     }
   } catch {
     // fall through
   }
-  return { ops: [], unreadable: true };
+  return { ops: [], unreadable: true, state: "unparseable" };
 }
 
 /**
@@ -557,10 +625,48 @@ export function recordPanelPendingOp(
   try {
     const path = panelPendingOpsPath();
     const prior = readPanelPendingOpsFile();
-    if (prior.unreadable) throw new Error("existing pending-operation record is unreadable");
+    // Refuse only when the prior file has CONTENT we cannot decode: that content
+    // may describe a real queued operation, and overwriting it destroys a warning
+    // we were never able to read.
+    //
+    // A zero-byte file is NOT that. It records no operation, so superseding it
+    // loses nothing — and refusing on it was self-perpetuating (#847): this write
+    // is gated behind the check, so the only thing that could replace the bad file
+    // was the thing the bad file blocked. Because `recordPanelPendingOp` runs
+    // BEFORE the Manager handoff, that wedged `update_all` permanently, until a
+    // human deleted the file by hand.
+    //
+    // The path is named either way. A refusal a user cannot act on from where they
+    // are is the other half of what made this a dead end.
+    if (prior.unreadable && prior.state !== "empty") {
+      throw new Error(
+        `existing pending-operation record at ${path} has content that could not be ` +
+          `decoded, so it may describe a queued operation whose warning would be lost. ` +
+          `Inspect it, then delete it to clear this.`,
+      );
+    }
     const kept = prior.ops.filter((o) => o.kind !== kind);
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify({ ops: [...kept, op] }, null, 2), "utf-8");
+    // Superseding an EMPTY marker unwedges the operation, but it must not also
+    // erase the possibility that the empty file masked a real queued op. A
+    // pre-existing zero-byte file (written by the old truncating writer, before
+    // writePanelPendingOpsAtomic) genuinely CAN be an interrupted write. So carry
+    // an explicit indeterminate record forward: the block is lifted, the warning
+    // is not. It warns rather than blocks, and clearPanelPendingOp can retire it.
+    const carried: PanelPendingOp[] =
+      prior.state === "empty"
+        ? [
+            {
+              kind: "unknown",
+              queuedAt: new Date(now).toISOString(),
+              expiresAt: new Date(now + ttlMs).toISOString(),
+              detail:
+                `an EMPTY pending-operation marker was found at ${path} and superseded. It recorded ` +
+                "no operation, but an interrupted write cannot be told from a file that never got " +
+                "content, so a previously queued update or deferred restore may still be outstanding.",
+            },
+          ]
+        : [];
+    writePanelPendingOpsAtomic(path, JSON.stringify({ ops: [...carried, ...kept, op] }, null, 2));
 
     // Verify the exact replacement record, not merely that JSON still parses.
     // A partial/redirected write that drops this operation would recreate the
@@ -619,8 +725,7 @@ export function clearPanelPendingOp(op: PanelPendingOp): boolean {
     if (prior.unreadable) return false;
     if (!prior.ops.some(matches)) return true; // already gone
     const kept = prior.ops.filter((candidate) => !matches(candidate));
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify({ ops: kept }, null, 2), "utf-8");
+    writePanelPendingOpsAtomic(path, JSON.stringify({ ops: kept }, null, 2));
     const confirmed = readPanelPendingOpsFile();
     return !confirmed.unreadable && !confirmed.ops.some(matches);
   } catch (err) {
@@ -642,16 +747,27 @@ export function clearPanelPendingOp(op: PanelPendingOp): boolean {
  * expiry are kept (indeterminate = still warn), never dropped.
  */
 export function activePanelPendingOps(now: number = Date.now()): PanelPendingOp[] {
-  const { ops, unreadable } = readPanelPendingOpsFile();
+  const { ops, unreadable, state } = readPanelPendingOpsFile();
   if (unreadable) {
+    // Both branches still WARN — for this question an empty file is genuinely
+    // indeterminate, because an interrupted write cannot be told from a file that
+    // never got content, and claiming nothing is pending would be the fabrication.
+    // They differ only in what the user is told to do, which is the part that was
+    // missing: the empty case clears itself, the other needs a decision (#847).
     return [
       {
         kind: "unknown",
         queuedAt: new Date(0).toISOString(),
         expiresAt: new Date(0).toISOString(),
         detail:
-          "the pending panel-operation record could not be read, so a queued " +
-          "update or deferred restore may still be outstanding",
+          state === "empty"
+            ? `the pending panel-operation record at ${panelPendingOpsPath()} is EMPTY, so a queued ` +
+              "update or deferred restore may still be outstanding and cannot be confirmed either way. " +
+              "It records no operation, so the next panel operation replaces it and this clears on its own — " +
+              "deleting the file also clears it immediately."
+            : `the pending panel-operation record at ${panelPendingOpsPath()} could not be read, so a queued ` +
+              "update or deferred restore may still be outstanding. Its content could not be decoded, so it " +
+              "is NOT replaced automatically — inspect it, then delete it to clear this.",
       },
     ];
   }
