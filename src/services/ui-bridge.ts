@@ -2221,18 +2221,57 @@ export class UiBridge {
    * needed to avoid an unfenced wrong-workflow write.
    */
   tabCanMutateGraph(tabId: string): boolean {
+    // FAIL-CLOSED convenience for the readiness callers: an unreadable probe is
+    // treated as "not ready", which is the right default when the question is
+    // "may I promise the user graph tools work?". Callers that must DESCRIBE the
+    // state to a human should use tabGraphMutationCapability instead — see below.
+    const r = this.tabGraphMutationCapability(tabId);
+    return r.known ? r.canMutate : false;
+  }
+
+  /**
+   * #770/#803 — the same question, TRI-STATE, for anyone who has to REPORT the
+   * answer rather than act on it.
+   *
+   * `tabCanMutateGraph` collapses an unreadable probe into `false`, which is a
+   * safe default for gating but a false statement when rendered: it made the
+   * recovery tell users their panel "does not advertise the write-boundary
+   * fence" when in truth we had merely failed to look. That is the same fold
+   * `workflowUuidFor` had, one method over, and it defeated the `unverified`
+   * distinction in exactly the production contexts it was added for.
+   *
+   *  - `{ known: true, canMutate }` — observed: this tab can (or cannot) mutate.
+   *  - `{ known: false, reason }`   — the probe itself failed; nothing is known.
+   */
+  tabGraphMutationCapability(
+    tabId: string,
+  ): { known: true; canMutate: boolean } | { known: false; reason: string } {
+    let conn: Conn;
     try {
-      const conn = this.resolveTarget(tabId);
-      const stamp = this.resolveTabWorkflowUuid?.(tabId);
-      return (
-        conn.sock.readyState === WebSocket.OPEN &&
-        conn.enforcesWorkflowStamp &&
-        conn.enforcesWorkflowStampAtWrite &&
-        typeof stamp === "string" &&
-        stamp.length > 0
-      );
+      conn = this.resolveTarget(tabId);
     } catch {
-      return false;
+      // Cannot route to the tab at all. That IS an observation about mutability —
+      // an unroutable tab mutates nothing — so it is `known`, not unknown.
+      return { known: true, canMutate: false };
+    }
+    try {
+      const stamp = this.resolveTabWorkflowUuid?.(tabId);
+      return {
+        known: true,
+        canMutate:
+          conn.sock.readyState === WebSocket.OPEN &&
+          conn.enforcesWorkflowStamp &&
+          conn.enforcesWorkflowStampAtWrite &&
+          typeof stamp === "string" &&
+          stamp.length > 0,
+      };
+    } catch (err) {
+      // The stamp resolver threw: the capability inputs could not be read, so the
+      // answer is unknown — NOT "the panel lacks the capability".
+      return {
+        known: false,
+        reason: err instanceof Error ? err.message : String(err ?? "unknown error"),
+      };
     }
   }
 

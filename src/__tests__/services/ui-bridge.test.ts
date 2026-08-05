@@ -2896,6 +2896,27 @@ describe("UiBridge.workflowUuidFor (#770 fence read)", () => {
     expect(read.known).toBe(false);
     expect(read).toMatchObject({ reason: expect.stringContaining("resolver exploded") });
   });
+
+  // #770/#803 — same fold, one method over. tabCanMutateGraph fails CLOSED, which
+  // is right for gating and wrong for prose: rendered, it told users their panel
+  // "does not advertise" a capability when we had merely failed to look.
+  it("tabGraphMutationCapability separates an unreadable probe from an observed 'cannot'", () => {
+    const b = new UiBridge(0);
+    // No tab at all → routable-nowhere is an OBSERVATION about mutability.
+    expect(b.tabGraphMutationCapability("nope")).toEqual({ known: true, canMutate: false });
+    expect(b.tabCanMutateGraph("nope")).toBe(false);
+
+    // A resolver that THROWS means the inputs could not be read → UNKNOWN…
+    b.setTabWorkflowUuidResolver(() => {
+      throw new Error("resolver exploded");
+    });
+    // …but only once there is a tab to resolve; with none, the routing answer wins.
+    const noTab = b.tabGraphMutationCapability("nope");
+    expect(noTab).toEqual({ known: true, canMutate: false });
+
+    // The fail-closed convenience keeps its contract for the readiness callers.
+    expect(b.tabCanMutateGraph("nope")).toBe(false);
+  });
 });
 
 describe("makeUnknownCommandError (old-panel version gate)", () => {

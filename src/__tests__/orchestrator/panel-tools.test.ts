@@ -4619,6 +4619,7 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
       // is standing in for the map that holds the stamp.
       workflowUuidFor: () => ({ known: true, uuid: stamp }),
       tabCanMutateGraph: () => true,
+      tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
     } as unknown as PanelToolCtx["bridge"];
     return { bridge, sent, refresh, tab, currentStamp: () => stamp };
   }
@@ -4681,9 +4682,15 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
     // Nothing to change — so nothing is claimed to have changed.
     expect(refresh).not.toHaveBeenCalled();
     expect(JSON.parse(text).graph_binding_status).toBe("already_current");
-    expect(text).toMatch(/already named the live canvas/);
-    // A DIFFERENT remedy from every failure branch: the disagreement is not here.
-    expect(text).toMatch(/the mismatch is coming from the panel/);
+    expect(text).toMatch(/already named the canvas the panel reported as active a moment ago/);
+    // The SAME post-probe switch window `refreshed` discloses — a switch in that
+    // instant leaves this stamp stale too, and the fix for that is this very call.
+    expect(text).toMatch(/cleared by calling this\s+again/);
+    // …so the reload is reserved for a mismatch that SURVIVES a repeat, which is
+    // the only thing that actually implicates the panel.
+    expect(text).toMatch(/call this once more/);
+    expect(text).toMatch(/If the\s+mismatch SURVIVES that repeat/);
+    expect(text.indexOf("call this once more")).toBeLessThan(text.indexOf("manually refresh"));
   });
 
   it("FAILS — and discloses what did apply — when the live identity is UNREADABLE and a stale fence remains", async () => {
@@ -4872,7 +4879,7 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
       active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
     });
     const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
-    ctx.tabCanMutateGraph = () => false; // stamp adopted, capability absent
+    ctx.tabGraphMutationCapability = () => ({ known: true, canMutate: false }); // observed absent
     const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
     const text = (res.content[0] as { text: string }).text;
 
@@ -4897,9 +4904,8 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
       active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
     });
     const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
-    ctx.tabCanMutateGraph = () => {
-      throw new Error("cannot tell");
-    };
+    // The PRODUCTION shape of "cannot tell": the bridge probe answers known:false.
+    ctx.tabGraphMutationCapability = () => ({ known: false, reason: "could not inspect the tab" });
     const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
     const text = (res.content[0] as { text: string }).text;
 
@@ -5064,7 +5070,7 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
       active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
     });
     const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
-    ctx.tabCanMutateGraph = () => true;
+    ctx.tabGraphMutationCapability = () => ({ known: true, canMutate: true });
     const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
     const text = (res.content[0] as { text: string }).text;
 

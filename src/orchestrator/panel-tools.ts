@@ -2359,11 +2359,23 @@ function describeFenceRebind(
       return {
         binding: okBinding,
         note:
-          ` The graph command fence already named the live canvas (workflow instance ${r.uuid}), ` +
-          `so nothing needed rebinding. If graph tools are still failing with a workflow-instance ` +
-          `mismatch, this session and the panel AGREE on the target and the mismatch is coming ` +
-          `from the panel, not from this binding.${mutationCaveat}${unknownCaveat}` +
-          (mutationsRefused ? "" : `\n\nWHAT TO DO: ${RELOAD_TAB_REMEDY}`),
+          ` The graph command fence already named the canvas the panel reported as active a ` +
+          `moment ago (workflow instance ${r.uuid}), so nothing needed rebinding.` +
+          // The SAME post-probe window as `refreshed` (codex gate). This branch used
+          // to jump straight to "the mismatch is coming from the panel" and send the
+          // caller to a browser reload — but a switch after workflow_list replied
+          // leaves the stamp stale here too, and the immediate remedy for that is
+          // this very call, not a reload. Reserve the reload for a mismatch that
+          // PERSISTS across a repeat, which is the only thing that actually
+          // implicates the panel.
+          ` (If the user switched tabs again in that instant, the next graph command ` +
+          `fails closed with a fresh instance mismatch — safe, and cleared by calling this ` +
+          `again.)${mutationCaveat}${unknownCaveat}` +
+          (mutationsRefused
+            ? ""
+            : `\n\nWHAT TO DO if graph tools are still failing: call this once more. If the ` +
+              `mismatch SURVIVES that repeat, this session and the panel agree on the target ` +
+              `and the disagreement is inside the panel — ${RELOAD_TAB_REMEDY}`),
       };
     case "rejected":
       return {
@@ -3827,6 +3839,16 @@ export interface PanelToolCtx {
    * Optional only for lightweight legacy test contexts.
    */
   tabCanMutateGraph?: () => boolean;
+  /**
+   * The same question TRI-STATE, for code that must REPORT the answer rather than
+   * gate on it. `tabCanMutateGraph` fails closed (an unreadable probe becomes
+   * `false`), which is right for gating and wrong for prose: it made the recovery
+   * tell users their panel lacked a capability when we had merely failed to look.
+   * Optional so lightweight test contexts can omit it.
+   */
+  tabGraphMutationCapability?: () =>
+    | { known: true; canMutate: boolean }
+    | { known: false; reason: string };
 }
 
 /** Build a tab-bound execution context shared by both transports. */
@@ -4252,6 +4274,7 @@ export function makePanelToolCtx(
   ctx.panelConnectionIdentity = panelConnectionIdentity;
   ctx.awaitPostRestartReachable = awaitPostRestartReachable;
   ctx.tabCanMutateGraph = () => bridge.tabCanMutateGraph(ctx.tabId);
+  ctx.tabGraphMutationCapability = () => bridge.tabGraphMutationCapability(ctx.tabId);
   return ctx;
 }
 
@@ -7148,9 +7171,18 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // must also advertise the write-boundary fence. Ask that question separately
         // (codex gate) so `bound` never overstates a read-only panel. A ctx that
         // cannot answer leaves it undefined: an unknown, which downgrades nothing.
+        // Prefer the TRI-STATE probe: the boolean one fails closed, so an
+        // unreadable capability would be RENDERED as "your panel lacks the write
+        // fence" — a claim about the panel built from our own failure to look
+        // (codex gate). Only an OBSERVED negative may say that.
         let canMutateNow: boolean | undefined;
         try {
-          canMutateNow = ctx.tabCanMutateGraph?.();
+          if (ctx.tabGraphMutationCapability) {
+            const cap = ctx.tabGraphMutationCapability();
+            canMutateNow = cap.known ? cap.canMutate : undefined;
+          } else {
+            canMutateNow = ctx.tabCanMutateGraph?.();
+          }
         } catch {
           canMutateNow = undefined; // a guard that can throw is not a guard
         }
