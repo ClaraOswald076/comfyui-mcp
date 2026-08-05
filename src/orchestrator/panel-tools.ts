@@ -6853,6 +6853,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // the no-await invariant between the binding capture and the reboot stands.
         let preflightArgv: string[] | undefined;
         let preflightIsDesktop = false;
+        // The target generation as of BEFORE the preflight resolved that argv, so the
+        // whole span up to the post-restart reading sits inside one instance fence.
+        let preflightArgvGeneration = -1;
         // Remote and cloud are excluded for the reason they always were: there is no
         // local process to assess, and the Manager reboot is their ONLY restart path —
         // a supervised remote (the tunnelled Desktop app) restarts through it by
@@ -6894,8 +6897,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // #848: keep the observed launch arguments. Recorded here and spent ONLY on
           // the success path far below, where the reboot has been proven to have
           // cycled THIS instance — it never influences any decision above.
+          // preflightTargetGeneration was captured before the preflight ran, so it is
+          // exactly the fence this reading needs.
           preflightArgv = preflight.observedArgv;
           preflightIsDesktop = preflight.isDesktopApp === true;
+          preflightArgvGeneration = preflightTargetGeneration;
           // r8/r9/r10: the preflight AWAIT makes the pre-decision captures
           // STALE — and the preflight itself reads MUTABLE config (target URL,
           // port, COMFYUI_PATH) throughout, so a config retarget during the
@@ -7390,19 +7396,27 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // read the first as the second — their new flag was silently absent. Compare
         // the two readings and report only what was observed.
         //
-        // Gated three ways, because a wrong-instance reading would be worse than no
-        // reading: the preflight must have OBSERVED a before-argv (it only runs on the
-        // bound path), and the configured target must STILL be the boot instance this
-        // reboot was proven to cycle — a retarget during the recovery wait would point
-        // getSystemStats at some other ComfyUI. Read after recovery, so a slow or
-        // missing answer costs only detail; describeArgvDrift says nothing without both.
+        // Gated because a wrong-instance reading would be worse than no reading: the
+        // preflight must have OBSERVED a before-argv (it only runs on the bound path),
+        // and the target must STILL be the instance that preflight described — a
+        // retarget would point getSystemStats at some other ComfyUI. Read after
+        // recovery, so a slow or missing answer costs only detail; describeArgvDrift
+        // says nothing without both readings.
+        //
+        // The generation is re-checked AFTER the await, not only before it (codex gate
+        // round 2): a base comparison taken before the read cannot see a retarget that
+        // lands DURING it, and an A→B→A round trip leaves the base equal either way.
+        // preflightArgvGeneration is captured at the preflight, so the whole span from
+        // the "before" reading to the "after" one is inside one fence.
         let argvNote = "";
-        if (preflightArgv?.length && sameHttpBase(getComfyUIBaseUrl(), healthBase)) {
-          argvNote = describeArgvDrift(
-            preflightArgv,
-            await readServingArgv(2000),
-            preflightIsDesktop,
-          );
+        if (preflightArgv?.length) {
+          const afterArgv = await readServingArgv(2000);
+          if (
+            getComfyuiTargetGeneration() === preflightArgvGeneration &&
+            sameHttpBase(getComfyUIBaseUrl(), healthBase)
+          ) {
+            argvNote = describeArgvDrift(preflightArgv, afterArgv, preflightIsDesktop);
+          }
         }
         return ok({
           rebooting: true,

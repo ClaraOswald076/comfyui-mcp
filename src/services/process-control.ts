@@ -2990,8 +2990,15 @@ async function restartViaManagerReboot(context: {
    * caller gathered them anyway. Supplied rather than re-read so no extra probe is
    * inserted ahead of an irreversible dispatch; when absent it is read here, from a
    * call that can neither throw nor hang.
+   *
+   * The target GENERATION AT THE MOMENT THOSE ARGUMENTS WERE READ travels with them
+   * and is not optional (codex gate round 2). Capturing the generation here instead
+   * would fence only the window this function can see, while the reading itself
+   * happened earlier in the caller — a retarget in between would leave the "before"
+   * argv belonging to instance A and everything afterwards to B, with no generation
+   * change left for the check to notice.
    */
-  priorArgv?: string[];
+  prior?: { argv: string[]; generation: number };
   /** Is this a ComfyUI Desktop instance? Selects the remedy in the #848 sentence. */
   isDesktop?: boolean;
 }): Promise<RestartResult> {
@@ -3009,11 +3016,18 @@ async function restartViaManagerReboot(context: {
   //
   // Judged by the monotonic GENERATION, not by a final-state base comparison: an
   // A→B→A round trip leaves the base equal and is exactly what the generation exists
-  // to catch (the same r11 rule the panel restart's preflight uses).
-  const argvGeneration = getComfyuiTargetGeneration();
-  const priorArgv = context.priorArgv?.length
-    ? context.priorArgv
+  // to catch (the same r11 rule the panel restart's preflight uses). The generation
+  // is taken FROM THE READING, not from this moment — see `prior`.
+  // Captured BEFORE our own read, not after it: a retarget landing mid-read would
+  // otherwise be stamped with the NEW generation and sail through the check below
+  // while the reading itself came from the old instance.
+  const selfReadGeneration = getComfyuiTargetGeneration();
+  const priorArgv = context.prior?.argv.length
+    ? context.prior.argv
     : await readServingArgv();
+  const argvGeneration = context.prior?.argv.length
+    ? context.prior.generation
+    : selfReadGeneration;
 
   const reboot = await rebootViaManager();
   if (!reboot.rebooting) {
@@ -3071,7 +3085,12 @@ async function restartViaManagerReboot(context: {
       startup: "unconfirmed",
       readiness,
       message:
-        "The ComfyUI-Manager reboot was accepted and ComfyUI went down, but it had not " +
+        // NOT "and ComfyUI went down" (codex gate round 2). Nothing observed a down
+        // transition: the poller only records that no probe got a 2xx, which is
+        // equally consistent with a server that was never reachable from here. The
+        // accepted reboot is the one thing we did observe, so it is the one thing
+        // claimed.
+        "The ComfyUI-Manager reboot was accepted, but ComfyUI had not " +
         `answered on ${readiness.probe_url} within ${waitedS}s ` +
         `(${readiness.attempts}/${readiness.max_tries} probes over a ` +
         `COMFYUI_REMOTE_REBOOT_BUDGET_S=${seconds(timing.budgetMs)}s budget). That budget ` +
@@ -3134,6 +3153,12 @@ export async function restartComfyUI(): Promise<RestartResult> {
   }
   logger.info("Restarting ComfyUI...");
 
+  // #848: the target generation as of BEFORE the instance is resolved, so the argv
+  // that resolution observes can be fenced to the instance it was actually read
+  // from. It travels with the argv into the Desktop reboot below; capturing it
+  // there instead would leave the read itself outside the fence (codex gate r2).
+  const infoGeneration = getComfyuiTargetGeneration();
+
   // Preflight: resolve the RUNNING instance and confirm we can relaunch it
   // BEFORE stopping anything. A restart must be atomic-ish — if the relaunch
   // command can't be built/validated (stale COMFYUI_PATH, unknown Desktop exe),
@@ -3182,7 +3207,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
     // no extra probe, and it is the reading taken closest to the stop.
     return restartViaManagerReboot({
       label: "Desktop",
-      priorArgv: info.argv,
+      prior: { argv: info.argv, generation: infoGeneration },
       isDesktop: true,
     });
   }

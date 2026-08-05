@@ -29,7 +29,11 @@ vi.mock("../../comfyui/client.js", () => ({
 const { buildPanelToolDefs, __panelToolsTestHooks } = await import(
   "../../orchestrator/panel-tools.js"
 );
-import { getBootLocalComfyUIBaseUrl } from "../../config.js";
+import {
+  getBootLocalComfyUIBaseUrl,
+  getComfyUIBaseUrl,
+  setComfyuiTarget,
+} from "../../config.js";
 import { markDispatched } from "../../services/ui-bridge.js";
 import type { PanelToolCtx, ToolResult } from "../../orchestrator/panel-tools.js";
 
@@ -201,6 +205,38 @@ describe("panel_restart_comfyui recovery after an ACCEPTED reboot (coordinator p
     // A restart that DID apply the change must not send the user to redo it.
     expect(String(out.note)).not.toContain("UNCHANGED");
     expect(String(out.note)).not.toMatch(/fully quit/i);
+  });
+
+  it("says nothing about launch arguments when the target round-trips mid-read (#848)", async () => {
+    // A→B→A DURING the post-restart argv read. The base comparison alone cannot see
+    // this — the final state matches — and checking it only BEFORE the await could
+    // not see a retarget landing inside the await either (codex gate round 2). The
+    // monotonic generation catches both, so the note is suppressed rather than
+    // comparing instance A's arguments against whatever the read actually reached.
+    const argv = ["main.py", "--port", "8188"];
+    const original = getComfyUIBaseUrl();
+    __panelToolsTestHooks.setLocalRestartPreflight(async () => ({
+      ok: true,
+      observedArgv: argv,
+      isDesktopApp: true,
+    }));
+    getSystemStats.mockImplementation(async () => {
+      setComfyuiTarget("http://127.0.0.1:9999");
+      setComfyuiTarget(original);
+      return { system: { argv: [...argv] } };
+    });
+    const seq: ProbeSeq = ["down", "healthy"];
+    let i = 0;
+    __panelToolsTestHooks.setHealthProbe(async () => seq[Math.min(i++, seq.length - 1)]);
+    const { ctx } = makeCtx({ reboot: { rebooting: true } });
+
+    const out = parse(await rebootHandler()({ force: false }, ctx));
+
+    // The target ends where it started, so the base check would have passed.
+    expect(getComfyUIBaseUrl()).toBe(original);
+    expect(out.ready).toBe(true);
+    // Identical argv would otherwise have produced the UNCHANGED note.
+    expect(String(out.note)).not.toMatch(/launch arguments/i);
   });
 
   it("says nothing about launch arguments when the before-reading is missing (#848)", async () => {

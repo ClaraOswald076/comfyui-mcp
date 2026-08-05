@@ -297,34 +297,74 @@ function detectMcpVersion(): string | undefined {
   }
 }
 
+/** A semver body, with the optional `v` prefix stripped by the capture group. */
+const SEMVER_BODY = String.raw`v?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)`;
+
+/**
+ * How each version is LABELLED in the ENVIRONMENT line.
+ *
+ * `comfyui-mcp-panel 0.11.38` is not readable as the mcp version because the label
+ * has to be followed by a separator and then A VERSION, and the word `panel` sits
+ * in between — the version is simply not adjacent to the mcp label. Stated plainly
+ * because two stronger-looking guards were tried here and both turned out to change
+ * no input at all: negative lookaheads on the label, and forbidding the hyphen as a
+ * separator. Neither was falsifiable, so neither is kept as protection; the covering
+ * test asserts the BEHAVIOUR (`comfyui-mcp-panel 0.11.38` yields no mcp version)
+ * rather than the mechanism.
+ */
+export const MCP_VERSION_LABEL = String.raw`(?:comfyui-mcp|mcp)`;
+/** Same, for the sidebar panel. The longer alias is listed first so it wins. */
+export const PANEL_VERSION_LABEL = String.raw`(?:comfyui-mcp-panel|panel)`;
+
 /**
  * Reduce a caller-supplied version to the VERSION IN IT, or undefined.
  *
  * These strings are copied by an agent out of a prose ENVIRONMENT line, and that
- * line grew a qualifying clause (#846: "…0.48.18 (this process is RUNNING …;
- * 0.49.6 is now installed on disk …)"). Passed through whole, the triage worker's
- * version match sees a sentence instead of a version and cannot tell the user that
- * upgrading already fixes their bug — which is the single most common resolution,
- * and the outcome #846 was filed to protect.
+ * line grew a qualifying clause (#846: "comfyui-mcp 0.48.18 (this process is
+ * RUNNING 0.48.18; 0.49.5 is now installed on disk …)"). Passed through whole, the
+ * triage worker's version match sees a sentence instead of a version and cannot
+ * tell the user that upgrading already fixes their bug — the single most common
+ * resolution, and the outcome #846 was filed to protect.
  *
- * THE FIRST version in the string wins, wherever it appears. Anchoring at the very
- * start was wrong twice over (codex gate): an agent copying the natural segment
- * ("comfyui-mcp 0.48.18 …") matched nothing and fell through to a fresh disk read,
- * which returns the INSTALLED version — silently swapping in exactly the number
- * #846 exists to stop us reporting. First-wins keeps that fallback rare AND
- * correct: the ENV line leads with the RUNNING build, so a clause naming a newer
- * installed version can never be the one extracted.
+ * THE LABEL IS TRIED FIRST, and it is what makes this correct rather than merely
+ * lucky (codex gate round 2). Two simpler rules were tried and both mis-read a
+ * realistic input:
+ *   - anchored at position 0: an agent pasting the natural segment
+ *     ("comfyui-mcp 0.48.18 …") matched nothing, fell through to a fresh disk read,
+ *     and reported the INSTALLED version — reintroducing #846 through its own fix;
+ *   - first semver ANYWHERE: the ENVIRONMENT line names `torch 2.7.1 · python
+ *     3.12.3` BEFORE `comfyui-mcp 0.48.18`, so an agent pasting the whole line —
+ *     which the tool description tells it to do — reported TORCH's version as the
+ *     reporter's. Wrong in a way nobody downstream could detect.
+ * Reading the label is the only rule that survives the input the tool actually asks
+ * for.
  */
-export function normalizeReportedVersion(raw: string | undefined): string | undefined {
+export function normalizeReportedVersion(
+  raw: string | undefined,
+  label: string,
+): string | undefined {
   if (typeof raw !== "string") return undefined;
-  const m = /v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/.exec(raw);
-  if (m) return m[1];
-  // No semver anywhere. A COMPACT token is still a real version someone may be
-  // running ("nightly", "dev") and is PRESERVED — replacing it with a disk read
-  // would be the same version-swap in a different disguise. Only prose is
-  // discarded, and only then does the caller fall back to detecting a version.
-  const token = raw.trim();
-  return token !== "" && token.length <= 32 && !/\s/.test(token) ? token : undefined;
+  const trimmed = raw.trim();
+  if (trimmed === "") return undefined;
+
+  // 1. LABELLED — survives a whole ENVIRONMENT line, other components' versions and
+  //    all. The separator covers both `comfyui-mcp 0.49.6` and `mcp=0.49.6`.
+  const labelled = new RegExp(`${label}[\\s:=]+${SEMVER_BODY}`, "i").exec(trimmed);
+  if (labelled) return labelled[1];
+
+  // 2. LEADING — the caller sent the version itself, possibly with the #846 drift
+  //    clause after it. The clause names a NEWER installed version second, so
+  //    taking the leading one keeps the RUNNING build, which is what the report is
+  //    about. Nothing in the ENV line begins with a bare version, so this cannot
+  //    pick up another component's.
+  const leading = new RegExp(`^${SEMVER_BODY}`).exec(trimmed);
+  if (leading) return leading[1];
+
+  // 3. A COMPACT TAG is still a real version someone may be running ("nightly",
+  //    "dev") and is PRESERVED — discarding it would send the caller to a disk
+  //    read, i.e. the same version-swap in a different disguise. Required to start
+  //    with a letter so that key=value fragments and prose fall through instead.
+  return /^[A-Za-z][A-Za-z0-9._-]{0,31}$/.test(trimmed) ? trimmed : undefined;
 }
 
 export function registerReportIssueTools(server: McpServer): void {
@@ -385,9 +425,11 @@ export function registerReportIssueTools(server: McpServer): void {
         const repoName = repo.split("/")[1];
 
         const reporterVersions: ReporterVersions = {
-          mcp: normalizeReportedVersion(args.mcp_version) ?? detectMcpVersion(),
+          mcp:
+            normalizeReportedVersion(args.mcp_version, MCP_VERSION_LABEL) ??
+            detectMcpVersion(),
           panel:
-            normalizeReportedVersion(args.panel_version) ??
+            normalizeReportedVersion(args.panel_version, PANEL_VERSION_LABEL) ??
             process.env.COMFYUI_MCP_PANEL_VERSION ??
             undefined,
         };
