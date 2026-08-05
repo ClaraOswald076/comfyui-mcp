@@ -9,6 +9,7 @@
 // Regenerates arena-report.md afterward.
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { buildArenaReport } from "./arena-report.mjs";
 
 const [baseDir, ...runDirs] = process.argv.slice(2);
 if (!baseDir) {
@@ -36,9 +37,37 @@ for (const dir of runDirs) {
     const i = base.leaderboard.findIndex((m) => m.model === candidate.model);
     if (i < 0) continue;
     const current = base.leaderboard[i];
+    // #792 — never best-of-merge runs recorded by DIFFERENT comfyui-mcp
+    // versions: absolute scores move with the tool surface, so a best-of range
+    // spanning versions would read as comparable numbers. The known versions
+    // accumulate on the entry (mcpVersions), on BOTH sides — a candidate that
+    // is itself an unversioned merged range still carries its mcpVersions, and
+    // the union must hold at most ONE known version for the merge to be honest.
+    const knownVersions = [
+      ...new Set([
+        ...(current.mcpVersions ?? (current.mcpVersion ? [current.mcpVersion] : [])),
+        ...(candidate.mcpVersions ?? (candidate.mcpVersion ? [candidate.mcpVersion] : [])),
+      ]),
+    ];
+    if (knownVersions.length > 1) {
+      console.warn(
+        `skip ${candidate.model} from ${dir}: the merge would mix comfyui-mcp ${knownVersions.map((v) => `v${v}`).join(" + ")} — scores across versions are not directly comparable`,
+      );
+      continue;
+    }
     const totals = [...(current.runs?.totals ?? [current.total]), candidate.total];
     const winner = better(current, candidate) > 0 ? candidate : current;
-    base.leaderboard[i] = { ...winner, tier: current.tier, runs: { totals } };
+    // If either side predates version stamping, the merged range mixes a
+    // stamped and an unstamped run — the entry must NOT keep claiming the
+    // version (the report flags unversioned entries as not comparable).
+    const mergedVersion = current.mcpVersion && candidate.mcpVersion ? winner.mcpVersion : undefined;
+    base.leaderboard[i] = {
+      ...winner,
+      tier: current.tier,
+      runs: { totals },
+      mcpVersion: mergedVersion,
+      mcpVersions: knownVersions,
+    };
     console.log(`${candidate.model}: run=${candidate.total} → keeping ${winner.total} (all: ${totals.join(", ")})`);
   }
 }
@@ -56,33 +85,8 @@ base.leaderboard.sort(
 );
 writeFileSync(basePath, JSON.stringify(base, null, 2));
 
-// regenerate the share-ready markdown (kept in sync with llm-arena.mjs)
-const icon = { 2: "✅", 1: "🟡", 0: "❌" };
-const scen = base.scenarios ?? [];
-const md = [];
-md.push("# ComfyUI LLM Arena", "");
-md.push(
-  `Models driving a real ComfyUI (${base.gpu}) through [comfyui-mcp](https://github.com/artokun/comfyui-mcp)'s ` +
-    `compact tool mode — 6 router tools instead of ~200 schemas, so every model class can play. ` +
-    `Each model gets the identical task set; results are verified against the ComfyUI server, not the model's claims. ` +
-    `Top-cluster models are best-of-N (range shown).`,
-  "",
-);
-const header = ["Model", "Tier", ...scen.map((s) => s.id), "Score", "Nudges", "Rounds", "Time"];
-md.push(`| ${header.join(" | ")} |`, `|${header.map(() => "---").join("|")}|`);
-for (const m of base.leaderboard) {
-  const cells = m.results.map((r) => icon[r.score]);
-  const totals = m.runs?.totals;
-  const score =
-    totals && totals.length > 1
-      ? `**${m.total}/${m.max}** (best of ${totals.length}: ${Math.min(...totals)}–${Math.max(...totals)})`
-      : `**${m.total}/${m.max}**`;
-  md.push(
-    `| \`${m.model}\` | ${m.tier ?? "local"} | ${cells.join(" | ")} | ${score} | ${nudgesOf(m)} | ${roundsOf(m)} | ${secondsOf(m)}s |`,
-  );
-}
-md.push("", `Scenarios: ${scen.map((s) => `**${s.id}** (${s.title.toLowerCase()})`).join(" · ")}`, "");
-md.push(`✅ completed & server-verified · 🟡 right tool family, incomplete outcome · ❌ failed`, "");
-md.push("Reproduce: `npm run arena` — bring your own models via `ARENA_MODELS=...` (see docs/arena)");
-writeFileSync(join(baseDir, "arena-report.md"), `${md.join("\n")}\n`);
+// regenerate the share-ready markdown from the SHARED builder (#792) — the
+// report shape (Quant/VRAM columns, version note, suspect scenarios) lives in
+// arena-report.mjs so this file and llm-arena.mjs can never drift apart again.
+writeFileSync(join(baseDir, "arena-report.md"), buildArenaReport(base));
 console.log("report regenerated");

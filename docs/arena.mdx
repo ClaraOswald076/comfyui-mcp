@@ -66,6 +66,30 @@ checkpoints folder leads with a non-txt2img model).
 plenty — scenarios are verified on content, not quality), `npm run build`
 once, and either Ollama or an API key.
 
+## What every run records
+
+Beyond the score, each leaderboard entry carries the axes that make a result
+actionable (#792):
+
+- **Quantization and parameter size** (Ollama `/api/show`) and **resident
+  VRAM** (`/api/ps`, sampled while the model is still loaded) — so "what can my
+  8 GB card actually run, and is a q4 good enough?" is answerable from the
+  table. Running the same model at q4 / q8 / fp16 through the ladder shows
+  where the score actually falls off. These fields are blank when the probe
+  can't answer (hosted endpoints have no equivalent) — never guessed.
+- **The comfyui-mcp version**, stamped on every entry whose run could read it
+  (a run that can't read its own package version is recorded *unversioned*,
+  exactly like a pre-stamping run). Absolute scores move when the tool surface
+  changes, so the report flags any leaderboard that mixes versions (or
+  unversioned runs) as **not directly comparable**.
+- **Every tool the model reached for** on a failure, not just the ones that
+  succeeded. When 2+ models fail the same scenario after selecting the same
+  wrong tool (and no passing run used it), the report flags a **suspect
+  scenario** — a field-wide wrong selection is a tool-*description* suspect,
+  not a capability gap (precedent: #557/#654, where our own wording, not the
+  models, was wrong). Check the description before trusting that scenario's
+  scores.
+
 ## Current leaderboard
 
 <img className="block dark:hidden" src="./images/arena-leaderboard-light.svg" alt="ComfyUI LLM Arena leaderboard" />
