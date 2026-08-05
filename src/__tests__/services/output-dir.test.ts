@@ -779,13 +779,36 @@ describe("models dir — corroborating a data-dir base by the server's own inven
     expect(res.baseDirs).toContain(resolve(DATA_DIR));
   });
 
-  it("REFUSES when the base explains only PART of what the server sees", async () => {
-    // One reported file missing means the server also reads somewhere else, so this
-    // directory is not established as its models root. A partial match is not proof, and
-    // guessing here is the #369 harm.
+  it("ACCEPTS a PARTIAL match — extra_model_paths means one category has several roots", async () => {
+    // This test used to assert a refusal, and that was the bug (codex gate P1).
+    // ComfyUI scans this directory AND any extra model roots for the same
+    // category, so a file owned by an extra root is legitimately absent here.
+    // Reading that as "this base does not explain what the server sees" refused a
+    // base that is real, present and writable — a false refusal of something real,
+    // which is this cluster's own defect class inverted.
+    //
+    // The evidence runs the other way: the server lists `present.safetensors` under
+    // this category and that file physically lives HERE, which is only true if this
+    // base is one of the roots it reads. The rest being elsewhere says nothing
+    // against it.
     dockerServer();
     serverInventory = { diffusion_models: ["present.safetensors", "elsewhere.safetensors"] };
     onDisk([join(DATA_DIR, "models", "diffusion_models", "present.safetensors")]);
+
+    const res = await resolveModelsDirWithBases({ targetCategory: "diffusion_models" });
+    expect(res.source).toBe("base-inventory-corroborated");
+    expect(res.modelsDir).toBe(resolve(DATA_DIR, "models"));
+  });
+
+  it("still REFUSES when NONE of the listed files are here — zero is what refutes", async () => {
+    // The line that actually carries meaning. A partial match is consistent with a
+    // multi-root layout; a ZERO match is not — if the server lists files under this
+    // category and none of them live here, this base is not one of the roots it
+    // reads. Without this, relaxing the rule above would corroborate any directory
+    // that merely exists.
+    dockerServer();
+    serverInventory = { diffusion_models: ["a.safetensors", "b.safetensors"] };
+    onDisk([]);
 
     await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(
       /could not be determined/,
@@ -795,7 +818,9 @@ describe("models dir — corroborating a data-dir base by the server's own inven
     await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(
       /asking the running server what models it can SEE did not corroborate it/,
     );
-    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(/elsewhere\.safetensors/);
+    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(
+      /NONE of them are under/,
+    );
   });
 
   it("REFUSES when the target category listing is empty", async () => {

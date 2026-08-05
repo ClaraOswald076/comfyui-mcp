@@ -418,7 +418,14 @@ async function corroborateBaseByModelInventory(
   base: string,
   targetCategory: string,
 ): Promise<
-  | { ok: true; modelsDir: string; category: string; matched: number }
+  | {
+      ok: true;
+      modelsDir: string;
+      category: string;
+      matched: number;
+      /** How many the server listed, so a PARTIAL match can be reported as one. */
+      listed: number;
+    }
   | { ok: false; reason: string }
 > {
   // The corroboration must be about the category this download is FOR. A complete match
@@ -564,16 +571,39 @@ async function corroborateBaseByModelInventory(
       }
       if (!containedUnder(realCategoryDir, realEntry)) escaping.push(name);
     }
-    if (missing.length === 0 && unreadable.length === 0 && notFiles.length === 0 && escaping.length === 0) {
-      return { ok: true, modelsDir, category, matched: files.length };
+    // A PARTIAL match corroborates; only a ZERO match refutes (codex gate P1).
+    //
+    // Requiring EVERY listed file to be here assumed one root per category. ComfyUI
+    // does not work that way: `extra_model_paths.yaml` lets it scan this directory
+    // AND others for the same category, so files owned by an extra root are
+    // legitimately absent from this base. Reading that as "this base does not
+    // explain what the server sees" turned an ordinary multi-root topology into a
+    // hard refusal of a base that is real, present, and writable — a false refusal
+    // of something real, which is this cluster's own defect class inverted.
+    //
+    // What actually carries the evidence is the OTHER direction: if the server
+    // lists a file under this category and that file physically lives here, this
+    // base is one of the roots it reads. One such file says that; the rest being
+    // elsewhere says nothing against it.
+    //
+    // The other three buckets stay fatal. `unreadable` is an inconclusive probe
+    // (not a finding of absence), and `notFiles`/`escaping` describe a topology
+    // the download authorizer refuses a step later — corroborating them here would
+    // hand the caller an approval the next layer rejects.
+    const present = files.length - missing.length;
+    if (present > 0 && unreadable.length === 0 && notFiles.length === 0 && escaping.length === 0) {
+      return { ok: true, modelsDir, category, matched: present, listed: files.length };
     }
     // Each failure mode says what it actually was. "Could not read it" is not "it is not
     // there", and neither is "something is there but it is not a file" — three different
     // fixes, and the old single "are not under" phrasing named only one of them.
     if (missing.length > 0) {
+      // Reached only when NONE were found (a partial match returned above), so the
+      // claim is about all of them and no longer overstates a multi-root layout.
       lastReason =
-        `the server lists ${files.length} file(s) under "${category}" and ${missing.length} of them ` +
-        `are not under "${categoryDir}" (e.g. "${missing[0]}"), so this base does not explain what the server sees`;
+        `the server lists ${files.length} file(s) under "${category}" and NONE of them are ` +
+        `under "${categoryDir}" (e.g. "${missing[0]}"), so this base is not a directory the ` +
+        `server reads that category from — not merely one of several roots holding part of it`;
     } else if (unreadable.length > 0) {
       lastReason =
         `the server lists ${files.length} file(s) under "${category}", and ${unreadable.length} of them ` +
@@ -739,9 +769,29 @@ export async function resolveModelsDirWithBases(opts?: {
         modelsDir = inventory.modelsDir;
         source = "base-inventory-corroborated";
         baseDirs.add(resolve(base as string));
+        // CORROBORATION, NOT PROOF (codex gate P1). The server's listing is
+        // filenames only, so a stale local clone holding files with the same names
+        // satisfies this check without being mounted into the running server at
+        // all. There is no stronger local evidence available — the listing carries
+        // no sizes or hashes to distinguish them — so this stays the last-resort
+        // rescue it was built as, and the log says what it actually established
+        // rather than implying the directory was proven live.
+        //
+        // Refusing on that doubt would be worse: it would reject the ordinary
+        // Docker/data-dir layout this rescue exists to serve. What it must not do
+        // is let a later reader take "corroborated" for "verified".
         logger.info(
-          "Corroborated the configured base against the running server's own model inventory",
-          { modelsDir, category: inventory.category, matched: inventory.matched },
+          "Corroborated the configured base against the running server's model inventory " +
+            "(filename match — evidence that this base is one of the roots the server reads, " +
+            "not proof that it is)",
+          {
+            modelsDir,
+            category: inventory.category,
+            matched: inventory.matched,
+            listed: inventory.listed,
+            partial: inventory.matched < inventory.listed,
+            basis: "filename-inventory",
+          },
         );
         return { modelsDir, baseDirs: [...baseDirs], snapshot, source };
       }
