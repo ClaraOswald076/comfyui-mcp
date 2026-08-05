@@ -200,9 +200,16 @@ export function secretNotPersisted(receipt: SecretSaveReceipt): Error {
   // (codex gate, round 2, finding 3): if a previous working value is still in
   // place, telling the user nothing is configured sends them after the wrong
   // problem, and telling them not to retry may be wrong too.
+  // `stillConfigured` is a PRESENCE check: some credential for this key
+  // resolves. It does not establish WHICH — the in-process value was rolled
+  // back, but the store was not, so what resolves may be the value that was
+  // there before, or one a competing writer put there in the meantime. Calling
+  // it "the credential that was in place BEFORE this attempt" asserted a
+  // predecessor state nobody observed (codex gate).
   const state = receipt.stillConfigured
-    ? `The new value was rolled back rather than left half-applied, so the credential that was in place BEFORE this attempt is still in effect — the new one is not. ` +
-      `If the action failed because the old value is wrong, it will still fail; do not read this as "now fixed".`
+    ? `The new value was rolled back in this process rather than left half-applied, and SOME credential for this key still resolves — ` +
+      `which one is not established: it may be the value that was in place before this attempt, or one another writer has since stored. ` +
+      `Either way it is NOT the value you just supplied, so do not read this as "now fixed"; check ${receipt.path} to see what is actually there.`
     : `The value was rolled back rather than left half-applied, so nothing is configured — do not retry the action that needed it.`;
   // A failed save can ALSO have destroyed other credentials on its way — the
   // rewrite happened, it just did not leave OUR key behind. Leading with "was
