@@ -4580,7 +4580,10 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
 
   /** A bridge modelling the ONE thing that matters here: the tab is REACHABLE,
    *  the session holds `fence`, and the panel's live active record reports
-   *  `active`. `workflow_list` answers from `active`; everything else acks. */
+   *  `active`. `workflow_list` answers from `active`; everything else acks.
+   *  `tabCanMutateGraph` defaults to TRUE — a current panel — so the common tests
+   *  exercise the realistic path rather than the can't-tell one. The false and
+   *  unanswerable cases get their own tests. */
   function fenceBridge(opts: {
     fence?: string;
     active?: Record<string, unknown> | null;
@@ -4612,6 +4615,7 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
       resolveActiveTabId: () => tab,
       refreshWorkflowUuid: refresh,
       workflowUuidFor: () => stamp,
+      tabCanMutateGraph: () => true,
     } as unknown as PanelToolCtx["bridge"];
     return { bridge, sent, refresh, tab, currentStamp: () => stamp };
   }
@@ -4881,6 +4885,85 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
     expect(text).toMatch(/including calling this tool again — can add it/);
   });
 
+  it("reports `unverified` — not `bound` — when the write capability cannot be determined", async () => {
+    // An unanswerable capability probe is an UNKNOWN. Rounding it up to `bound`
+    // (which the tool description defines as "graph tools are usable again") is
+    // the same could-not-determine/therefore-yes fold, one step further out.
+    const { bridge, tab } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+    });
+    const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
+    ctx.tabCanMutateGraph = () => {
+      throw new Error("cannot tell");
+    };
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(res.isError).toBeFalsy(); // the fence WAS repaired — that is not a failure
+    expect(JSON.parse(text).graph_binding).toBe("unverified");
+    expect(text).toMatch(/could not be determined from this context/);
+    expect(text).toMatch(/treat mutation readiness as unconfirmed/);
+  });
+
+  it("does not narrate an UNREADABLE prior fence as an ABSENT one", async () => {
+    // `workflowUuidFor` swallows a throwing resolver, so "could not read the
+    // fence" and "there is no fence" arrive as the same value unless the read is
+    // tri-state. Rendering the first as the second asserts an absence nobody saw.
+    const tab = "wf:workflows/a.json";
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) => {
+        if (cmd.cmd === "workflow_list") throw new Error("no connected tab");
+        return { ok: true };
+      },
+      push: () => 1,
+      canReach: (id: string) => id === tab,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: tab, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => tab,
+      refreshWorkflowUuid: () => true,
+      workflowUuidFor: () => {
+        throw new Error("resolver exploded");
+      },
+      tabCanMutateGraph: () => true,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/could not be read either, so its binding is\s+entirely unknown/);
+    expect(text).toMatch(/not known-good and not known-absent/);
+    // NOT the absent-fence wording.
+    expect(text).not.toMatch(/It has no graph command fence/);
+  });
+
+  it("reports `unverified` when the panel has no identity AND the prior fence is unreadable", async () => {
+    // Failing would report a wedge nobody observed; succeeding would report a
+    // repair nobody observed. Neither is available, so it says so.
+    const tab = "wf:workflows/a.json";
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) =>
+        cmd.cmd === "workflow_list" ? { active: { path: "workflows/a.json" } } : { ok: true },
+      push: () => 1,
+      canReach: (id: string) => id === tab,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: tab, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => tab,
+      refreshWorkflowUuid: () => true,
+      tabCanMutateGraph: () => true,
+      // no workflowUuidFor at all — this bridge cannot answer
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(text).graph_binding).toBe("unverified");
+    expect(text).toMatch(/could NOT be determined/);
+    expect(text).toMatch(/Treat graph tools as unconfirmed/);
+  });
+
   it("reports `bound` when the panel DOES advertise the write fence", async () => {
     const { bridge, tab } = fenceBridge({
       fence: STALE,
@@ -4939,9 +5022,14 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
     expect(store.get(NEW)).toMatchObject({ mode: "pinned", path: "workflows/other.json" });
     expect(text).toMatch(/did NOT take effect on the tab this session is now bound to/);
     expect(text).toMatch(/rebound from tab wf:workflows\/old\.json onto tab wf:workflows\/new\.json/);
-    expect(text).toMatch(/left untouched, because another session may own that pin/);
-    // …and the remedy is a call the caller can make right now.
-    expect(text).toMatch(/call panel_set_workflow_target\(\{mode:"current"\}\) again/);
+    expect(text).toMatch(/that pin was left untouched/);
+    // The remedy must not be SELF-DEFEATING: re-issuing mode:"current" on this tab
+    // would delete the very pin we just declined to clobber. Say that plainly
+    // instead of prescribing it, and name what to do when ownership is unclear.
+    expect(text).toMatch(/WILL REPLACE that pin — do that only if the pin is yours/);
+    expect(text).toMatch(/ask the user which workflow they want this session on/);
+    // …and disclose that the fence WAS refreshed, since that did happen.
+    expect(text).toMatch(/graph command fence WAS refreshed onto this tab's live canvas/);
   });
 
   it("re-applies mode:'current' onto the moved-to tab when that takes nothing away", async () => {
@@ -5276,6 +5364,24 @@ describe("panel-tools: ack-timeout classification survives a full, spaced tab id
       isError: true,
     };
     expect(__openWorkflowTestHooks.isAckTimeout(embedded)).toBe(false);
+  });
+
+  it("REFUSES a whitespace- or newline-prefixed message (the anchor is not trimmed away)", () => {
+    // The bridge message never carries leading whitespace, so trimming before the
+    // anchor buys nothing and only lets a prefixed acked error through.
+    for (const prefix of [" ", "\n", "\t", "  \n"]) {
+      expect(
+        __openWorkflowTestHooks.isAckTimeout({
+          content: [
+            {
+              type: "text",
+              text: `${prefix}Panel tab wf:a.json did not reply to "workflow_open" within 15000 ms — the ComfyUI tab may be backgrounded or frozen`,
+            },
+          ],
+          isError: true,
+        }),
+      ).toBe(false);
+    }
   });
 
   it("still refuses a timeout for a DIFFERENT command, and any non-error result", () => {
