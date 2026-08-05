@@ -1,4 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
+// Imported so the mocked fs/child_process functions can be scripted per-test;
+// these resolve to the vi.mock factories below.
+import { statSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 
 // Mock node:child_process and node:fs so NO real git/pip/clone/disk access runs,
 // even if the default deps path is exercised.
@@ -285,5 +289,28 @@ describe("installComfyUI — failure surfacing", () => {
     // Clone was attempted; pip never reached.
     expect(calls.some((c) => c.args.includes("clone"))).toBe(true);
     expect(calls.some((c) => c.args.includes("install"))).toBe(false);
+  });
+});
+
+describe("installComfyUI — the default never-clobber probe (#796)", () => {
+  // These exercise defaultIsNonEmptyDir itself (no injected isNonEmptyDir):
+  // "could not look" must never be read as "empty".
+  it("an UNREADABLE target is refused, not folded into 'empty'", () => {
+    vi.mocked(statSync).mockImplementationOnce(() => {
+      throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+    });
+    expect(() => installComfyUI({ targetPath: "/ws/comfy" })).toThrow(
+      /Refusing to install into a directory whose contents cannot be checked/,
+    );
+  });
+
+  it("a proven-ABSENT target (ENOENT) proceeds past the guard (control)", () => {
+    vi.mocked(statSync).mockImplementationOnce(() => {
+      throw Object.assign(new Error("ENOENT: no such file or directory"), { code: "ENOENT" });
+    });
+    vi.mocked(spawnSync).mockReturnValueOnce({ status: 1, stdout: "", stderr: "" } as never);
+    // The guard passes and the clone is what fails — a different error
+    // entirely, which is what proves we got past the guard.
+    expect(() => installComfyUI({ targetPath: "/ws/comfy" })).toThrow(/Command failed/);
   });
 });
