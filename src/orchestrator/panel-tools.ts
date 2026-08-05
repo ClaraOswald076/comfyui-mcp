@@ -7477,10 +7477,14 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           if (
             !isRemoteMode() &&
             rebootNoEndpoint(res) &&
-            // INSTANCE BINDING: restartComfyUI() acts on the orchestrator's GLOBAL config
-            // target (a hello can retarget it). Only run it when the bound tab provably
-            // fronts our OWN boot instance AND that boot instance is the CURRENT global
-            // target — so the relaunch cycles the SAME instance this tab rebooted.
+            // ENDPOINT BINDING: restartComfyUI() acts on the orchestrator's GLOBAL config
+            // target (a hello can retarget it). Only run it when the bound tab fronts our
+            // OWN boot URL AND that URL is the CURRENT global target — so the relaunch
+            // cycles the endpoint this tab rebooted, not one it was retargeted away from.
+            //
+            // "Endpoint", not "instance": `sameHttpBase` compares URLs, which cannot see a
+            // server replaced at the same URL between the reboot and here. That gap is real
+            // and tracked in #871; this gate narrows the window, it does not close it.
             healthBase != null &&
             sameHttpBase(getComfyUIBaseUrl(), healthBase)
           ) {

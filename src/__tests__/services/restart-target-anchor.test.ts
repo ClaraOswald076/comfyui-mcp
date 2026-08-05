@@ -275,6 +275,37 @@ describe("a local restart never abandons the instance it stopped", () => {
     expect(res.message).not.toMatch(/targeting a remote/i);
   });
 
+  it("does NOT say nothing answered when the endpoint returns 503 — not healthy is not not-there", async () => {
+    // `waitForApiReady` counts a 502/503/504 as not-ready, which is right for
+    // readiness and wrong as evidence of absence. Reading `ready:false` as
+    // "nothing is listening" is the same fold one level down: a proxy answering
+    // 503 in front of a starting server would be reported as a dead machine.
+    hoisted.remoteMode.value = false;
+    hoisted.getSystemStats.mockResolvedValue({ system: { argv: [PY, MAIN, "--port", "8188"] } });
+    liveThenFree();
+    __processControlTestHooks.setProcessIdentityResolver(() => ({
+      startedAt: "stable-stamp",
+      commandLine: `${PY} ${MAIN} --port 8188`,
+      argv: [PY, MAIN, "--port", "8188"],
+      argvFidelity: "exact" as const,
+    }));
+    __processControlTestHooks.setProcessExistsProbe(() => true);
+    hoisted.spawn.mockImplementation(() => {
+      throw new Error("relaunch could not be spawned");
+    });
+    hoisted.fetchMock.mockImplementation(
+      async () => new Response("service unavailable", { status: 503 }),
+    );
+
+    const res = await restartComfyUI();
+
+    expect(res.startup).toBe("unconfirmed");
+    expect(res.message).not.toMatch(/nothing answered/i);
+    // It may still say "most likely down" — that is a hedge, not a claim — but it
+    // must carry the caveat that something could be listening.
+    expect(res.message).toMatch(/not "?not there"?|may well be listening/i);
+  });
+
   it("does NOT report down when something IS answering after a failed relaunch", async () => {
     // The other half of the same finding: a supervisor may have brought the
     // instance back while we were unwinding, or the throw may have landed after

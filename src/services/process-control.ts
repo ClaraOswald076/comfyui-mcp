@@ -3230,8 +3230,14 @@ async function restartViaManagerReboot(context: {
   // generation on every successful call, including a same-URL reaffirmation
   // that moves nothing — refusing on that would be this very defect class
   // pointed the other way: a bucket ("the target was touched") standing in for
-  // the question that actually matters ("is the server I am about to reboot the
-  // one whose argv I just read?"). The base answers that directly.
+  // the question that actually matters.
+  //
+  // What this fences is the ENDPOINT: the reboot will go to the URL whose argv
+  // we read. It does NOT establish that the same INSTANCE is still serving that
+  // URL — a same-URL replacement moves neither the base nor the generation and
+  // is invisible to both. Closing that needs a per-instance identity this
+  // codebase does not have yet; tracked in #871. Do not read this fence as more
+  // than it is.
   //
   // The generation still governs the ARGV COMPARISON further down, where it is
   // the right test for a different question: an A→B→A round trip leaves the base
@@ -3629,9 +3635,11 @@ export async function restartComfyUI(): Promise<RestartResult> {
           ? `Something IS answering on ${restartProbeUrl} now — possibly a supervisor ` +
             `brought it back, or the relaunch got further than the error suggests. ` +
             `This call cannot claim that server as its own.`
-          : `Nothing answered on ${restartProbeUrl} when asked just now, so ComfyUI ` +
-            `is most likely down — but the relaunch failed in a way this call could ` +
-            `not interpret, so that is a single observation and not a settled fact. ` +
+          : `No healthy response from ${restartProbeUrl} when asked just now, so ` +
+            `ComfyUI is most likely down — but "not healthy" is not "not there": a ` +
+            `502/503/504 from a proxy counts as not-ready here, and something may ` +
+            `well be listening. The relaunch also failed in a way this call could ` +
+            `not interpret. Treat this as one observation, not a settled fact. ` +
             `Check the server, and use start_comfyui once the cause is cleared.`) +
         stopCaveat,
       listener_ownership: unclassifiedOwnership(),
