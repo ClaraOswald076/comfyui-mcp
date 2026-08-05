@@ -2369,6 +2369,17 @@ export class UiBridge {
     }
   }
 
+  /** #884 — is this tab's live socket currently ATTACHED as a mirror viewer
+   *  (driving a desktop tab)? Such a client already receives the conversation
+   *  through the mirror fan-out of its driven tab, so the orchestrator's
+   *  conversation fanout must not ALSO deliver to its own tab id — that
+   *  double-delivers every say/stream/turn frame to the phone (codex round 2).
+   *  Unknown/disconnected tabs → false. */
+  isAttachedViewerTab(tabId: string): boolean {
+    const conn = this.conns.get(tabId);
+    return !!conn && this.mirrorViewers.has(conn.sock);
+  }
+
   /** The id of the tab a NO-tabId command would target right now: the sole
    *  connection, else the last active tab. Throws the SAME clear errors as the
    *  no-tabId `send` path when it can't pick a single one (none connected, or

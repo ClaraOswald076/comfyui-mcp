@@ -142,32 +142,38 @@ describe("sessions are orchestrator-scoped, never workflow-scoped (#884)", () =>
     }
   });
 
-  it("SOURCE: scope mutations are stamped with the TURN's issue-time workflow, never re-resolved (codex r1 P0)", () => {
+  it("SOURCE: scope mutations are stamped with the TURN's issue-time workflow, never re-resolved (codex r1 P0 / r2)", () => {
     const src = indexSrc();
-    // Captured at user-message dispatch, PER conversation…
-    expect(src).toContain(
-      "lastTurnUuidByKey.set(agentKeyFor(event.tab_id), tabCommandWorkflowUuid.get(event.tab_id))",
-    );
+    // The issue-time uuid RIDES the message (recorded per mid at receipt)…
+    expect(src).toContain("if (userMid) recordTurnUuidForMid(userMid, issueUuid);");
+    // …and becomes the conversation's stamp when the turn DEQUEUES it (onSeen —
+    // never at receipt, which would flip an in-flight turn's fence; codex r2).
+    expect(src).toContain("lastTurnUuidByKey.set(key, turnUuidByMid.get(mid));");
     // …answered to scope-addressed callers by the stamp resolver…
     expect(src).toContain(
       "if (isScopeAddress(tabId)) return lastTurnUuidByKey.get(scopeAgentKeyOf(tabId));",
     );
-    // …and refreshed only by #716's validated explicit-open path.
+    // …refreshed only by #716's validated explicit-open path…
     expect(src).toContain(
       "if (isScopeAddress(tabId)) lastTurnUuidByKey.set(scopeAgentKeyOf(tabId), identity.uuid);",
     );
+    // …and cleared at every conversation boundary (new chat / resume / rewind).
+    expect((src.match(/lastTurnUuidByKey\.delete\(/g) ?? []).length).toBeGreaterThanOrEqual(3);
     // The panel MCP servers bind the backend-QUALIFIED scope address so the
     // per-conversation stamp is recoverable from the caller id.
     expect(src).toContain("createPanelMcpServer(bridge, key, workflowTargets)");
     expect(src).toContain("makeHttpBackendMcpServers(key)");
   });
 
-  it("SOURCE: download rows are stamped with the OWNING agent key, and resolved as such (codex r1 P1)", () => {
+  it("SOURCE: download rows are stamped with the OWNING agent key, and resolved as such (codex r1/r2 P1)", () => {
     const src = indexSrc();
+    // Both spawn lanes stamp the owning conversation (r2: the HTTP lane never did).
     expect(src).toContain("COMFYUI_MCP_TAB: agentKey");
-    expect(src).toContain(
-      "tab.startsWith(SHARED_SESSION_SCOPE + AGENT_KEY_SEP) ? tab : agentKeyFor(tab)",
-    );
+    expect(src).toContain("COMFYUI_MCP_TAB: tabId");
+    // A known owner is delivered-to or dropped — never re-routed to whichever
+    // sole agent happens to be live (r2: cross-conversation misattribution).
+    expect(src).toContain("if (tab.startsWith(SHARED_SESSION_SCOPE + AGENT_KEY_SEP)) {");
+    expect(src).toContain("not waking another conversation (#884)");
   });
 
   it("SOURCE: hello.resume is a last-resort hint — the orchestrator's disk store wins", () => {

@@ -1002,7 +1002,11 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     // and pushes it to whoever holds the tab, so a retired conversation's pick
     // must be counted there, not quoted. The durable LOG still gets everything —
     // two audiences, two buckets.
-    const exitAt2 = src.indexOf("AskAnswers.allOutstanding()");
+    // Anchor inside the EXIT-DISCLOSURE function: #884's boundary sweep and
+    // journal-flush helpers also call allOutstanding() earlier in the file.
+    const exitFnAt = src.indexOf("function reportLostCompletionsOnExit");
+    expect(exitFnAt, "exit-disclosure function not found").toBeGreaterThan(-1);
+    const exitAt2 = src.indexOf("AskAnswers.allOutstanding()", exitFnAt);
     expect(exitAt2, "exit disclosure not found").toBeGreaterThan(-1);
     const exitBlock = src.slice(exitAt2, exitAt2 + 900);
     expect(exitBlock, "the notice must gate content on the boundary").toContain(

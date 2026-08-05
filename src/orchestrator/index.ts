@@ -1520,6 +1520,23 @@ export async function runPanelOrchestrator(): Promise<void> {
   const lastTurnUuidByKey = new Map<string, string | undefined>();
   const scopeAgentKeyOf = (scopeId: string): string =>
     scopeId === SHARED_SESSION_SCOPE ? sharedKeyFor(defaultBackend) : scopeId;
+  // The issue-time uuid RIDES the message and is applied when the agent
+  // DEQUEUES it (onSeen — the true start of its turn), not at receipt: a
+  // message queued behind a busy turn, or held during a render, must not flip
+  // the IN-FLIGHT turn's stamp the moment it arrives (codex round 2, P0 —
+  // receipt-time overwrite re-created the race for queued/held messages).
+  // Bounded: entries are consumed at dequeue; a cap prevents pathological
+  // growth from mids that never dispatch.
+  const turnUuidByMid = new Map<string, string | undefined>();
+  const TURN_UUID_BY_MID_CAP = 500;
+  const recordTurnUuidForMid = (mid: string, uuid: string | undefined): void => {
+    turnUuidByMid.set(mid, uuid);
+    while (turnUuidByMid.size > TURN_UUID_BY_MID_CAP) {
+      const oldest = turnUuidByMid.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      turnUuidByMid.delete(oldest);
+    }
+  };
   // #884 — each shared conversation's last message origin (tab + workflow uuid),
   // so a message sent from a DIFFERENT workflow than the previous one carries a
   // one-line context note: session-bound agents keep knowledge of which canvas
@@ -1559,12 +1576,15 @@ export async function runPanelOrchestrator(): Promise<void> {
   // codex tab is open can never leak into the codex conversation — and flush to
   // the next hello on that backend (bounded; a backgrounded turn survives a
   // panel reload).
+  // An ATTACHED mirror viewer already receives the conversation through the
+  // mirror fan-out of the desktop tab it drives — delivering to its own tab id
+  // too would double every say/stream/turn frame on the phone (codex round 2).
   const conversationTabsFor = (key: string): string[] =>
     conversationTabs({
       connected: bridge.tabs().map((t) => t.tab_id),
       backendForTab,
       backend: backendOf(key),
-    });
+    }).filter((t) => !bridge.isAttachedViewerTab(t));
   const MAX_PARKED_CONVERSATION_FRAMES = 200;
   const parkedConversationFrames = new Map<string, Array<Record<string, unknown>>>();
   const pushToConversation = (key: string, frame: Record<string, unknown>): void => {
@@ -1581,17 +1601,33 @@ export async function runPanelOrchestrator(): Promise<void> {
     parkedConversationFrames.set(key, q);
   };
   // The REAL tab ids participating in the conversation that `originTab` belongs
-  // to (connected same-backend tabs + the originator itself) — used when a
-  // conversation BOUNDARY (New chat / resume switch / rewind) must close every
-  // participating tab's journaled tickets, not just the originator's (#884).
+  // to — used when a conversation BOUNDARY (New chat / resume switch / rewind)
+  // must close every participating tab's journaled tickets, not just the
+  // originator's (#884). This must include DISCONNECTED members (codex r2 P1):
+  // a tab that queued a render, disconnected, and whose backend maps to this
+  // conversation still holds tickets that the boundary replaces — otherwise a
+  // later flushAllJournaledEvents sweep injects its completion into the
+  // REPLACEMENT conversation as "the run YOU queued". Every tab that ever
+  // helloed is in tabBackends, and outstanding journal keys are swept too.
   const conversationMemberTabs = (originTab: string): string[] => {
     const backend = backendForTab(originTab);
-    const members = new Set(
-      bridge
-        .tabs()
-        .map((t) => t.tab_id)
-        .filter((t) => backendForTab(t) === backend),
-    );
+    const members = new Set<string>();
+    for (const t of bridge.tabs()) {
+      if (backendForTab(t.tab_id) === backend) members.add(t.tab_id);
+    }
+    for (const [t, b] of tabBackends) {
+      if (b === backend) members.add(t);
+    }
+    try {
+      for (const e of RunCompletions.allOutstanding()) {
+        if (backendForTab(e.key) === backend) members.add(e.key);
+      }
+      for (const e of AskAnswers.allOutstanding()) {
+        if (backendForTab(e.key) === backend) members.add(e.key);
+      }
+    } catch {
+      // journal enumeration is best-effort — connected + known tabs still close
+    }
     members.add(originTab);
     return [...members];
   };
@@ -1813,6 +1849,11 @@ export async function runPanelOrchestrator(): Promise<void> {
         ...(toolMode ? { COMFYUI_MCP_TOOL_MODE: toolMode } : {}),
         // #884 — the agent is shared, so Blind is conversation-wide (anyTabBlind).
         ...(anyTabBlind() ? { COMFYUI_MCP_BLIND: "1" } : {}),
+        // Self-scope downloads to the OWNING conversation (#547/#884 — codex r2:
+        // the HTTP lane never stamped, so with several agents live its settled
+        // downloads resolved to nobody and the owning conversation stalled).
+        // `tabId` here IS the agent key (the scope address the lane binds).
+        COMFYUI_MCP_TAB: tabId,
       }),
     },
     // Live-graph panel_* tools for THIS tab over the loopback HTTP MCP.
@@ -2215,7 +2256,15 @@ export async function runPanelOrchestrator(): Promise<void> {
     },
     // The agent dequeued a message (the true "read" moment) → flip that bubble
     // from queued/muted to read. Fanned out: tabs that don't know the mid ignore it.
+    // #884 — this is also the moment the message's TURN begins, so its recorded
+    // issue-time workflow uuid becomes the conversation's stamp NOW (not at
+    // receipt — codex round 2): scope mutations of this turn are fenced to the
+    // workflow the message was actually sent from.
     onSeen: (key, mid) => {
+      if (turnUuidByMid.has(mid)) {
+        lastTurnUuidByKey.set(key, turnUuidByMid.get(mid));
+        turnUuidByMid.delete(mid);
+      }
       pushToConversation(key, { type: "ack", ok: true, kind: "seen", mid });
     },
     // PER-BACKEND start failure (issue #250): a backend that rejects at
@@ -4300,6 +4349,8 @@ export async function runPanelOrchestrator(): Promise<void> {
       // reset() is synchronous (map cleared now), so no concurrent send() can
       // spawn an agent before we report the cleared session.
       manager.reset(key);
+      // The replaced conversation's issue-time stamp dies with it (codex r2).
+      lastTurnUuidByKey.delete(key);
       // #468 — the conversation that queued the outstanding renders is gone.
       // Close its run tickets so a render finishing after the New chat is
       // reported to the replacement agent as UNDETERMINED rather than as "the
@@ -4325,6 +4376,9 @@ export async function runPanelOrchestrator(): Promise<void> {
       const tabId = event.tab_id;
       const anchor = typeof event.anchor === "string" ? event.anchor : null;
       const ok = manager.rewind(agentKeyFor(tabId), anchor);
+      // The dropped branch's issue-time stamp must not outlive it; the edited
+      // message that follows re-stamps at its own dequeue (codex r2).
+      if (ok) lastTurnUuidByKey.delete(agentKeyFor(tabId));
       // #486 — a REWIND is a conversation boundary too, not just New chat and
       // resume: everything after the anchor is discarded, so a question card the
       // dropped branch put up was never asked by the conversation that now
@@ -4361,6 +4415,8 @@ export async function runPanelOrchestrator(): Promise<void> {
       const sid = typeof event.session_id === "string" ? event.session_id : undefined;
       const key = agentKeyFor(tabId);
       manager.reset(key);
+      // The replaced conversation's issue-time stamp dies with it (codex r2).
+      lastTurnUuidByKey.delete(key);
       // #468 — same as New chat: the conversation being replaced owns the open
       // runs, so a completion landing after the switch is UNDETERMINED, not the
       // historical session's own render. #884: the boundary is conversation-wide.
@@ -4539,12 +4595,18 @@ export async function runPanelOrchestrator(): Promise<void> {
     // previous message's in this conversation, prepend a one-line note. This is
     // how one session keeps "knowledge of all open workflows": the agent is
     // told, mechanically and only on a change, which canvas it is operating on.
-    // #884 — capture the workflow this TURN is issued for, per conversation.
-    // Scope-addressed mutations are stamped with THIS value (never re-resolved
-    // at dispatch), so a mid-turn switch to another workflow makes late edits
-    // fail the panel's fence loudly instead of silently re-aiming (codex
-    // round 1, P0).
-    lastTurnUuidByKey.set(agentKeyFor(event.tab_id), tabCommandWorkflowUuid.get(event.tab_id));
+    // #884 — capture the workflow this message's TURN will be issued for, per
+    // conversation. Scope-addressed mutations are stamped with the value the
+    // turn STARTED with (applied at dequeue via onSeen, never re-resolved at
+    // dispatch), so a mid-turn switch to another workflow makes late edits fail
+    // the panel's fence loudly instead of silently re-aiming (codex rounds
+    // 1–2). A mid-less message (rare: non-panel callers) applies immediately —
+    // there is no dequeue signal to ride.
+    {
+      const issueUuid = tabCommandWorkflowUuid.get(event.tab_id);
+      if (userMid) recordTurnUuidForMid(userMid, issueUuid);
+      else lastTurnUuidByKey.set(agentKeyFor(event.tab_id), issueUuid);
+    }
     {
       const originKey = agentKeyFor(event.tab_id);
       const origin = messageOrigin(event.tab_id, tabCommandWorkflowUuid.get(event.tab_id));
@@ -4686,10 +4748,21 @@ export async function runPanelOrchestrator(): Promise<void> {
   const resolveDownloadAgentKey = (row: Record<string, unknown>): string | null => {
     const tab = typeof row.tab === "string" ? row.tab.trim() : "";
     if (tab) {
-      const key = tab.startsWith(SHARED_SESSION_SCOPE + AGENT_KEY_SEP) ? tab : agentKeyFor(tab);
+      if (tab.startsWith(SHARED_SESSION_SCOPE + AGENT_KEY_SEP)) {
+        // Agent-key-shaped stamp: the OWNER is known. Deliver to it when live;
+        // when it is not, DROP with a log rather than fall through to the
+        // sole-live fallback — that would announce one conversation's download
+        // in another (codex r2 P1). The tray still shows the completion.
+        if (manager.hasLiveAgent(tab)) return tab;
+        logger.info(
+          `[panel-orchestrator] download settled for ${tab} but that conversation's agent is not live — not waking another conversation (#884)`,
+        );
+        return null;
+      }
+      // Legacy tab-id stamp (pre-#884 rows): best-effort via the tab's current
+      // backend, then the sole-live fallback below.
+      const key = agentKeyFor(tab);
       if (manager.hasLiveAgent(key)) return key;
-      // The owning agent is gone (provider retired) — fall through to the
-      // single-live-agent fallback rather than silently dropping the event.
     }
     const live = manager.liveKeys();
     return live.length === 1 ? live[0] : null;
