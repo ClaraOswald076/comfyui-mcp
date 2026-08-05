@@ -2071,7 +2071,6 @@ async function installCustomNodeImpl(
   opts: InstallOptions,
 ): Promise<NodeOpResult> {
   const { id, version, mode = "remote", channel = "default" } = opts;
-  const basePath = opts.comfyuiPath ?? config.comfyuiPath;
   const parsedGit = parseGitUrl(id);
   const gitId = parsedGit.baseUrl;
   const gitRefCandidate = opts.ref ?? parsedGit.ref ?? version;
@@ -2093,13 +2092,14 @@ async function installCustomNodeImpl(
   // actually used (runGitCheckout, cloneCustomNodeFallback).
   if (source === "git") assertSafeGitUrl(gitId);
 
-  // Keep both the mutation and its post-queue on-disk verification on the
-  // target selected for this invocation. Otherwise a panel retarget between
-  // them can turn an A-side install into a B-side fabricated success/fallback.
-  // The CLI workspace is pinned the same way: runCmCli reads mutable
-  // config.comfyuiPath when given no workspace, so capture the local root NOW
-  // (COMFYUI_PATH, an adopted root, or the saved default workspace — the CLI
-  // layer supports all three) and pass it down explicitly.
+  // Keep the mutation, its post-queue verification, AND any local filesystem
+  // work on the target selected for this invocation — captured NOW, before the
+  // first await: a panel retarget in between must not split them across two
+  // installs. cliWorkspace covers COMFYUI_PATH, an adopted root, and the saved
+  // default workspace (the CLI layer supports all three); the CLI probe, the
+  // ref checkout, and the clone fallback all take this ONE root, so a git
+  // install with a ref can never install into the workspace and then fail the
+  // checkout for want of a path (codex gate rounds 5-6).
   const managerBase = managerBaseUrl();
   const cliWorkspace = opts.comfyuiPath ?? resolveEffectiveComfyUIBase();
 
@@ -2117,7 +2117,7 @@ async function installCustomNodeImpl(
       const installId = source === "git" ? gitId : id;
       const out = runCmCli(["install", installId, "--mode", mode, "--channel", channel], cliWorkspace);
       if (source === "git" && gitRef) {
-        runGitCheckout(gitId, gitRef, basePath);
+        runGitCheckout(gitId, gitRef, cliWorkspace);
       }
       return {
         mechanism: "comfy-cli",
@@ -2192,7 +2192,7 @@ async function installCustomNodeImpl(
         details: status,
       });
     }
-    return withCliNote(await cloneCustomNodeFallback(gitId, repoName, gitRef, status, basePath));
+    return withCliNote(await cloneCustomNodeFallback(gitId, repoName, gitRef, status, cliWorkspace));
   }
 
   // Registry (plain CNR id). Keep the prior defaults channel "default" /
@@ -2871,7 +2871,14 @@ async function setCustomNodeEnabled(
   // — "never send 'unknown' for an installed pack"). Both need the installed
   // list read up front.
   const presence = await resolvePackPresence(id, base);
-  if (presence.state === "on-disk") {
+  if (
+    presence.state === "on-disk" &&
+    // A READABLE list that doesn't track the pack: refuse — neither mechanism
+    // can verify the op through it. An UNREADABLE list with the pack on disk
+    // only blocks the HTTP path; comfy-cli works on the local install directly,
+    // so it proceeds below with the uncertainty disclosed.
+    (presence.managerListReadable || !useCli)
+  ) {
     throw new NodeManagementError(
       presence.managerListReadable
         ? `"${id}" is present on disk at ${presence.dir} but ComfyUI-Manager does not ` +
@@ -2925,7 +2932,12 @@ async function setCustomNodeEnabled(
   }
 
   if (useCli) {
-    const preStateUnknown = presence.state !== "manager-listed";
+    const preStateReason =
+      presence.state === "unverifiable"
+        ? presence.reason
+        : presence.state === "on-disk"
+          ? `ComfyUI-Manager's installed-pack list could not be read (${presence.listError}); the pack is present on disk at ${presence.dir}`
+          : undefined;
     const out = runCmCli([op, id], cliWorkspace);
     // comfy-cli's exit is its OWN claim — verify against the Manager list
     // when it can be read rather than reporting the claim as the state.
@@ -2949,8 +2961,8 @@ async function setCustomNodeEnabled(
           : `${enable ? "Enabled" : "Disabled"} "${id}" via official comfy-cli ` +
             `(comfy-cli's own report — the post-state could not be independently ` +
             `verified: ${verdict.reason})`) +
-        (preStateUnknown
-          ? `. NOTE: the pre-operation state was never established (${presence.reason}), so this is not a verified transition`
+        (preStateReason
+          ? `. NOTE: the pre-operation state was never established (${preStateReason}), so this is not a verified transition`
           : "") +
         `. A ComfyUI restart is required for the change to take effect.`,
       details: out.trim(),
@@ -3074,7 +3086,13 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
   // absence afterwards would "verify" a state that predated the call. Refuse
   // with the reason that is actually true.
   const presence = await resolvePackPresence(id, base);
-  if (presence.state === "on-disk") {
+  if (
+    presence.state === "on-disk" &&
+    // A READABLE list that doesn't track the pack: refuse. An UNREADABLE list
+    // with the pack on disk only blocks the HTTP path — comfy-cli works on the
+    // local install directly, and its postcondition is verified on disk below.
+    (presence.managerListReadable || !useCli)
+  ) {
     throw new NodeManagementError(
       presence.managerListReadable
         ? `"${id}" is present on disk at ${presence.dir} but ComfyUI-Manager does not track ` +
@@ -3148,9 +3166,11 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
         details: out.trim(),
       };
     }
-    // List unreadable — the disk answers in a local session.
-    const diskBase = isRemoteMode() ? undefined : resolveEffectiveComfyUIBase();
-    const disk = diskBase ? findPackOnDisk(id, diskBase) : undefined;
+    // List unreadable — the disk answers in a local session. Use the workspace
+    // captured at ENTRY (cliWorkspace), never a recomputed one: a retarget
+    // during the awaits above must not verify against a different install
+    // (codex gate round 6).
+    const disk = cliWorkspace ? findPackOnDisk(id, cliWorkspace) : undefined;
     if (disk?.state === "found") {
       return {
         mechanism: "comfy-cli",

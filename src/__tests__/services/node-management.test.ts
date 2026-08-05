@@ -50,6 +50,10 @@ const remoteFlags = vi.hoisted(() => ({ forceRemote: false, remoteMode: false })
 /** The LIVE server's own install root, as /system_stats argv would report it. */
 const liveRoot = vi.hoisted(() => ({ value: undefined as string | undefined }));
 
+/** The saved default workspace resolveEffectiveComfyUIBase() falls back to.
+ *  Controlled here so "no local path" tests never read the real user config. */
+const savedDefault = vi.hoisted(() => ({ value: undefined as string | undefined }));
+
 vi.mock("../../services/workspace-env.js", async () => {
   const actual = await vi.importActual<
     typeof import("../../services/workspace-env.js")
@@ -57,6 +61,9 @@ vi.mock("../../services/workspace-env.js", async () => {
   return {
     ...actual,
     resolveLiveComfyUIBase: async () => liveRoot.value,
+    // Mirror the real resolution order (COMFYUI_PATH, then the saved default);
+    // the remote-mode gate is applied separately by callers via isRemoteMode.
+    resolveEffectiveComfyUIBase: () => config.comfyuiPath ?? savedDefault.value,
   };
 });
 
@@ -241,6 +248,7 @@ describe("node-management service", () => {
     // real fs (which throws on the fake root) unless a test installs one.
     fsCtl.readdirSync = undefined;
     fsCtl.readFileSync = undefined;
+    savedDefault.value = undefined;
     config.comfyuiPath = "/fake/comfy";
     config.githubToken = undefined;
     remoteFlags.forceRemote = false;
@@ -888,6 +896,47 @@ describe("node-management service", () => {
         "abc123",
       ]);
     });
+
+    it("cm-cli install with a ref works from the SAVED DEFAULT workspace when COMFYUI_PATH is unset (#808/#775 layout)", async () => {
+      // The CLI, the ref checkout, and the clone fallback must all take the ONE
+      // captured local root — previously the checkout read only
+      // config.comfyuiPath and threw AFTER the CLI install had already run.
+      config.comfyuiPath = undefined;
+      savedDefault.value = "/saved/ws";
+      mockedExec.mockReturnValue(cliEnvelope({ message: "installed ok" }) as never);
+
+      const res = await installCustomNode({
+        id: "https://github.com/foo/bar",
+        ref: "abc123",
+        useCmCli: true,
+      });
+
+      expect(res.mechanism).toBe("comfy-cli");
+      // The CLI ran against the saved default workspace...
+      expect(mockedExec.mock.calls[0][1]).toEqual([
+        "--json",
+        "--workspace",
+        "/saved/ws",
+        "--skip-prompt",
+        "node",
+        "install",
+        "https://github.com/foo/bar",
+        "--mode",
+        "remote",
+        "--channel",
+        "default",
+      ]);
+      // ...and the ref checkout ran THERE too, not nowhere.
+      const checkoutDir = resolve("/saved/ws", "custom_nodes", "bar");
+      expect(mockedExec.mock.calls[2][1]).toEqual([
+        "-C",
+        checkoutDir,
+        "checkout",
+        "--detach",
+        "--end-of-options",
+        "abc123",
+      ]);
+    });
   });
 
   // ---- update ------------------------------------------------------------
@@ -1470,6 +1519,102 @@ describe("node-management service", () => {
       expect(res.mechanism).toBe("comfy-cli");
       expect(res.message).toMatch(/no matching pack directory remains/);
       expect(res.message).toMatch(/NOT checked/);
+    });
+
+    it("uninstall via comfy-cli proceeds with an unreadable list when the pack IS on disk, verified on disk", async () => {
+      let removed = false;
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes") && !removed
+          ? [dirEnt("my-pack")]
+          : [];
+      fsCtl.readFileSync = () => {
+        throw new Error("ENOENT");
+      };
+      mockedExec.mockImplementation(() => {
+        removed = true;
+        return cliEnvelope({ message: "uninstalled" }) as never;
+      });
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            return new Response("boom", { status: 500 });
+          }
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse(drained);
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await uninstallCustomNode({ id: "my-pack", useCmCli: true });
+      expect(res.mechanism).toBe("comfy-cli");
+      expect(mockedExec).toHaveBeenCalled();
+      expect(res.message).toMatch(/no matching pack directory remains/);
+    });
+
+    it("the CLI uninstall disk verification uses the ENTRY-captured workspace, not a retargeted one", async () => {
+      // The CLI runs against /fake/comfy; the retarget flips config to
+      // /other/comfy (which still has the pack). Verifying against the
+      // retargeted root would falsely report "did NOT take effect".
+      let removed = false;
+      fsCtl.readdirSync = (p) => {
+        const norm = p.replace(/\\/g, "/");
+        if (norm.includes("/other/comfy/")) return [dirEnt("my-pack")];
+        if (norm.endsWith("/custom_nodes")) return removed ? [] : [dirEnt("my-pack")];
+        return [];
+      };
+      fsCtl.readFileSync = () => {
+        throw new Error("ENOENT");
+      };
+      mockedExec.mockImplementation(() => {
+        config.comfyuiPath = "/other/comfy";
+        removed = true;
+        return cliEnvelope({ message: "uninstalled" }) as never;
+      });
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            return new Response("boom", { status: 500 });
+          }
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse(drained);
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await uninstallCustomNode({ id: "my-pack", useCmCli: true });
+      expect(res.message).toMatch(/no matching pack directory remains/);
+      expect(res.message).not.toMatch(/did NOT take effect/);
+    });
+
+    it("disable via comfy-cli proceeds with an unreadable list when the pack IS on disk, disclosed", async () => {
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes") ? [dirEnt("my-pack")] : [];
+      fsCtl.readFileSync = () => {
+        throw new Error("ENOENT");
+      };
+      mockedExec.mockReturnValue(cliEnvelope({ message: "disabled" }) as never);
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            return new Response("boom", { status: 500 });
+          }
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse(drained);
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await disableCustomNode({ id: "my-pack", useCmCli: true });
+      expect(res.mechanism).toBe("comfy-cli");
+      expect(mockedExec).toHaveBeenCalled();
+      expect(res.message).toMatch(/comfy-cli's own report/);
+      expect(res.message).toMatch(/pre-operation state was never established/);
     });
   });
 
