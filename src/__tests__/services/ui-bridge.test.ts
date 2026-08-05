@@ -2864,6 +2864,48 @@ describe("defaultBridgeTimeoutMs — tolerant read timeout (#357)", () => {
     );
     a.close();
   });
+
+  // #770/#803 — the same fold as workflowUuidFor, one method over.
+  // tabCanMutateGraph fails CLOSED, which is right for gating and wrong for prose:
+  // rendered, it told users their panel "does not advertise" a capability when we
+  // had merely failed to look. Driven against a LIVE tab so resolveTarget succeeds
+  // and the stamp resolver is actually reached — probing a nonexistent tab exits
+  // before that and would pass with the collapse still in place.
+  it("tabGraphMutationCapability separates an UNREADABLE probe from an observed 'cannot' (#770)", async () => {
+    const tabId = "wf:workflows/cap.json";
+    const a = await connectPanel(tabId); // advertises both write fences
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+
+    // A stamp is present and both fences are advertised → observed CAN.
+    bridge.setTabWorkflowUuidResolver(() => "11111111-1111-4111-8111-111111111111");
+    expect(bridge.tabGraphMutationCapability(tabId)).toEqual({ known: true, canMutate: true });
+    expect(bridge.tabCanMutateGraph(tabId)).toBe(true);
+
+    // The resolver ANSWERS with no stamp → an observed CANNOT (nothing to fence).
+    bridge.setTabWorkflowUuidResolver(() => undefined);
+    expect(bridge.tabGraphMutationCapability(tabId)).toEqual({ known: true, canMutate: false });
+    expect(bridge.tabCanMutateGraph(tabId)).toBe(false);
+
+    // The resolver THROWS → the inputs could not be READ. That is UNKNOWN, and
+    // must never be rendered as "this panel lacks the write fence".
+    bridge.setTabWorkflowUuidResolver(() => {
+      throw new Error("resolver exploded");
+    });
+    const unknown = bridge.tabGraphMutationCapability(tabId);
+    expect(unknown.known).toBe(false);
+    expect(unknown).toMatchObject({ reason: expect.stringContaining("resolver exploded") });
+    // …while the fail-closed convenience keeps its contract for the readiness
+    // callers that GATE on it rather than describe it.
+    expect(bridge.tabCanMutateGraph(tabId)).toBe(false);
+
+    // An unroutable tab is `known`: routing nowhere IS an observation about
+    // mutability, not a failure to look.
+    expect(bridge.tabGraphMutationCapability("no-such-tab")).toEqual({
+      known: true,
+      canMutate: false,
+    });
+    a.close();
+  });
 });
 
 // #770/#803 — the fence READ the rebind needs to tell "repaired a stale fence"
@@ -2897,26 +2939,6 @@ describe("UiBridge.workflowUuidFor (#770 fence read)", () => {
     expect(read).toMatchObject({ reason: expect.stringContaining("resolver exploded") });
   });
 
-  // #770/#803 — same fold, one method over. tabCanMutateGraph fails CLOSED, which
-  // is right for gating and wrong for prose: rendered, it told users their panel
-  // "does not advertise" a capability when we had merely failed to look.
-  it("tabGraphMutationCapability separates an unreadable probe from an observed 'cannot'", () => {
-    const b = new UiBridge(0);
-    // No tab at all → routable-nowhere is an OBSERVATION about mutability.
-    expect(b.tabGraphMutationCapability("nope")).toEqual({ known: true, canMutate: false });
-    expect(b.tabCanMutateGraph("nope")).toBe(false);
-
-    // A resolver that THROWS means the inputs could not be read → UNKNOWN…
-    b.setTabWorkflowUuidResolver(() => {
-      throw new Error("resolver exploded");
-    });
-    // …but only once there is a tab to resolve; with none, the routing answer wins.
-    const noTab = b.tabGraphMutationCapability("nope");
-    expect(noTab).toEqual({ known: true, canMutate: false });
-
-    // The fail-closed convenience keeps its contract for the readiness callers.
-    expect(b.tabCanMutateGraph("nope")).toBe(false);
-  });
 });
 
 describe("makeUnknownCommandError (old-panel version gate)", () => {
