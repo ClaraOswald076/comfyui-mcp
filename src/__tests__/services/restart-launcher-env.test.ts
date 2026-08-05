@@ -31,6 +31,8 @@ class FakeChild extends EventEmitter {
 const mockConfig = vi.hoisted(() => ({
   resolvedPort: 8188,
   comfyuiPath: undefined as string | undefined,
+  /** Monotonic ComfyUI-target generation — bumped by the retarget tests. */
+  targetGeneration: 0,
 }));
 
 const mockExecSync = vi.hoisted(() => vi.fn());
@@ -66,11 +68,11 @@ const mockSettingsJsonRef = vi.hoisted(() => ({
 
 vi.mock("../../config.js", () => ({
   config: mockConfig,
-  getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
+  // Reads from the fixture so a retarget mid-restart can be modelled.
+  getComfyUIBaseUrl: () => `http://127.0.0.1:${mockConfig.resolvedPort}`,
   getComfyUIAuthHeaders: () => ({}),
-  // #848 instance fence — a stable target here; the retarget cases live in
-  // desktop-restart.test.ts and panel-restart-health-readiness.test.ts.
-  getComfyuiTargetGeneration: () => 0,
+  // Stable by default; the retarget tests below drive it.
+  getComfyuiTargetGeneration: () => mockConfig.targetGeneration,
   isRemoteMode: () => false,
 }));
 
@@ -274,6 +276,7 @@ beforeEach(() => {
   process.env.PATH = ORIGINAL_ENV.PATH ?? "/usr/bin";
   mockConfig.resolvedPort = 8188;
   mockConfig.comfyuiPath = undefined;
+  mockConfig.targetGeneration = 0;
   mockResolveBase.mockReturnValue(undefined);
   mockLiveRootFromArgv.mockReturnValue(undefined);
   __processControlTestHooks.reset();
@@ -2446,6 +2449,102 @@ n127.0.0.1:8188
     // The environment it was launched into is still named, so a slow start that
     // turns out to be a broken one is debuggable from this same report.
     expect(result.launch_env?.source).toBe("inherited");
+
+    killSpy.mockRestore();
+  });
+
+  // -------------------------------------------------------------------------
+  // The ComfyUI target is MUTABLE (a panel hello can retarget it) and every step of
+  // a restart is an await. Nothing here may end with a server stopped and a
+  // relaunch aimed somewhere else.
+  // -------------------------------------------------------------------------
+
+  it("stop_comfyui REFUSES when the target moved while it resolved the instance", async () => {
+    // A DIRECT stop had no fence at all, and its saved launch record does not repair
+    // the loss: start_comfyui afterwards consults the NEW live target, so it can
+    // refuse as remote or find that port occupied rather than relaunch what was
+    // killed (codex gate round 12).
+    usePlainInstall();
+    mockLivePortThenFree();
+    mockGetSystemStats.mockImplementation(async () => {
+      mockConfig.targetGeneration += 1; // a hello retarget lands during the resolve
+      return { system: { argv: [ABS_MAIN, "--port", "8188"] } };
+    });
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await stopComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.message).toMatch(/Refusing to stop/i);
+    expect(result.message).toMatch(/target changed while the running instance was being identified/i);
+    expect(result.message).toMatch(/Nothing was killed/i);
+    const killIssued = mockExecSync.mock.calls.some(([c]: [string]) =>
+      /taskkill|pkill|\bkill\b/i.test(String(c)),
+    );
+    expect(killIssued).toBe(false);
+    // A refusal has to be actionable from where the caller is.
+    expect(result.message).toMatch(/Let the target settle, then retry/i);
+    // …and it must not claim a relaunch is on file for an instance it declined to
+    // touch (#767: has_restart_info means a command was BUILT AND VALIDATED).
+    expect(result.has_restart_info).toBe(false);
+
+    killSpy.mockRestore();
+  });
+
+  it("the relaunch is ANCHORED to the instance that was stopped, not the live target", async () => {
+    // After the kill, restartComfyUI awaits the port release and a settle delay. A
+    // retarget in that window used to leave the relaunch probing the NEW target's
+    // port: if that port was occupied it returned "already running" WITHOUT
+    // spawning, and the instance just killed stayed dead (codex gate round 12).
+    //
+    // Modelled by pointing the live config at a DIFFERENT, occupied port after the
+    // stop. Anchored, the restart still relaunches and grades the original.
+    usePlainInstall();
+    mockLivePortThenFree();
+    spawnCapturingChildren();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+    // The retarget lands at the KILL — after the resolve, so the pre-stop fence
+    // (which spans only the resolve) passes and the post-stop window is what is
+    // exercised. Port 9999 is OCCUPIED, which is what makes the un-anchored version
+    // bail out with "already running" instead of relaunching.
+    let killed = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        mockConfig.resolvedPort = 9999; // config now points at a DIFFERENT instance
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        // `netstat -ano` carries no port argument — the caller filters the TABLE by
+        // the port it is asking about. So emit the whole table and let it choose:
+        // after the kill 8188 is free and an UNRELATED server holds 9999.
+        if (!killed) return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+        return "  TCP    0.0.0.0:9999   0.0.0.0:0   LISTENING       777";
+      }
+      if (/lsof/i.test(cmd)) {
+        // lsof IS asked per-port (`-iTCP:<port>`), so answer per-port.
+        if (!killed) return "p4321\nn127.0.0.1:8188\n";
+        if (/9999/.test(cmd)) return "p777\nn127.0.0.1:9999\n";
+        throw noListener();
+      }
+      return "";
+    });
+
+    const result = await restartComfyUI();
+
+    expect(killed).toBe(true);
+    expect(mockConfig.resolvedPort).toBe(9999); // the retarget really happened
+    // It RELAUNCHED rather than bailing out on the other target's occupied port…
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    expect(result.message).not.toMatch(/already running/i);
+    // …and the readiness verdict is about the anchored instance's URL, not the
+    // config's current one.
+    expect(result.readiness?.probe_url).toBe("http://127.0.0.1:8188/system_stats");
+    expect(result.ready).toBe(true);
 
     killSpy.mockRestore();
   });
