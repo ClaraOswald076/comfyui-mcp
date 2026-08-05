@@ -126,6 +126,51 @@ export function resolveEffectiveComfyUIBase(): string | undefined {
 }
 
 /**
+ * The install root a LOCAL, DESTRUCTIVE operation may act on — or the reason it
+ * must not act at all.
+ *
+ * `resolveEffectiveComfyUIBase()` returns `config.comfyuiPath` BEFORE it consults
+ * remote mode, so with `--comfyui-url` set against a remote server and a stale
+ * local `COMFYUI_PATH`, it hands back a local install that has nothing to do with
+ * the server the session is talking to. Reading is survivable there; DELETING is
+ * not — the Manager pre/post checks address the remote instance while the file
+ * operations land on an unrelated local tree (#490, reopened).
+ *
+ * Fixing that resolver is a separate change: it has twelve callers and at least
+ * one (`comfy-cli.ts`) reads `config.comfyuiPath ?? resolveEffectiveComfyUIBase()`
+ * in a way that suggests it depends on today's behaviour. So this does not fix
+ * it — it REFUSES on top of it. An honest "I cannot tell which install this would
+ * modify" beats modifying the wrong one, and refusing is the right shape here
+ * because nothing has happened yet.
+ */
+export function resolveLocalMutationTarget():
+  | { base: string; refusal?: undefined }
+  | { base?: undefined; refusal: string } {
+  if (isRemoteMode()) {
+    return {
+      refusal:
+        "this session targets a REMOTE ComfyUI (--comfyui-url), so there is no local " +
+        "install this operation can safely modify. " +
+        (config.comfyuiPath
+          ? `COMFYUI_PATH is set to ${config.comfyuiPath}, but that is a DIFFERENT install ` +
+            `from the server you are connected to — acting on it would modify something ` +
+            `you are not looking at, while the checks around it describe the remote server. `
+          : "") +
+        "Run this against the machine the install lives on.",
+    };
+  }
+  const base = resolveEffectiveComfyUIBase();
+  if (!base) {
+    return {
+      refusal:
+        "no local ComfyUI install path could be established: COMFYUI_PATH is unset and no " +
+        "default workspace is saved (set one with the workspace tool, action 'set_default').",
+    };
+  }
+  return { base };
+}
+
+/**
  * The LIVE connected server's own install root, derived from its /system_stats
  * launch argv (the `main.py` path — see liveRootFromArgv). This is the ComfyUI
  * that is ACTUALLY running, so it is the source of truth for where a download /

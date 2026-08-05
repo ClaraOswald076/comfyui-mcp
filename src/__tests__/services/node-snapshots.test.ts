@@ -30,14 +30,40 @@ vi.mock("../../config.js", () => ({
 // #775 — named saves resolve the local install root through
 // resolveEffectiveComfyUIBase (COMFYUI_PATH, then the saved default workspace),
 // not a bare config.comfyuiPath check. Control the saved-default half here.
-const wsMock = vi.hoisted(() => ({ saved: undefined as string | undefined }));
+const wsMock = vi.hoisted(() => ({
+  saved: undefined as string | undefined,
+  remote: false,
+}));
 vi.mock("../../services/workspace-env.js", async (importOriginal) => {
   const actual =
     await importOriginal<typeof import("../../services/workspace-env.js")>();
+  const effective = () => (config as { comfyuiPath?: string }).comfyuiPath ?? wsMock.saved;
   return {
     ...actual,
-    resolveEffectiveComfyUIBase: () =>
-      (config as { comfyuiPath?: string }).comfyuiPath ?? wsMock.saved,
+    resolveEffectiveComfyUIBase: effective,
+    // Destructive snapshot paths now resolve through this seam instead (codex
+    // gate P0), so it has to be controllable here too — the real one calls
+    // `resolveEffectiveComfyUIBase` module-internally, where the override above
+    // cannot reach it. `remote` is the case the gate was about: a stale local
+    // COMFYUI_PATH while connected to a remote server must REFUSE, not write.
+    resolveLocalMutationTarget: () => {
+      if (wsMock.remote) {
+        return {
+          refusal:
+            "this session targets a REMOTE ComfyUI (--comfyui-url), so there is no local " +
+            "install this operation can safely modify.",
+        };
+      }
+      const base = effective();
+      return base
+        ? { base }
+        : {
+            refusal:
+              "no local ComfyUI install path could be established: COMFYUI_PATH is unset and " +
+              "no default workspace is saved (set one with the workspace tool, action " +
+              "'set_default').",
+          };
+    },
   };
 });
 
@@ -430,5 +456,43 @@ describe("restoreNodeSnapshot", () => {
       else process.env.COMFYUI_MCP_PANEL_PENDING = previous;
       rmSync(blocker, { force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #490 (reopened) — `resolveEffectiveComfyUIBase` returns `config.comfyuiPath`
+// BEFORE it checks remote mode, so with --comfyui-url set and a stale local
+// COMFYUI_PATH it hands back an install that has nothing to do with the server
+// this session is talking to. Reading through it is survivable; WRITING and
+// DELETING are not. These paths must refuse rather than act on a tree they
+// cannot identify.
+
+describe("destructive snapshot paths refuse when the target install cannot be established", () => {
+  beforeEach(() => {
+    wsMock.remote = true;
+    wsMock.saved = undefined;
+  });
+  afterEach(() => {
+    wsMock.remote = false;
+  });
+
+  it("a named save REFUSES in remote mode even with COMFYUI_PATH set", async () => {
+    // The dangerous shape: a path IS available, so the old "no path" guard passes
+    // and the write lands on an unrelated local install while the snapshot content
+    // came from the remote server.
+    (config as { comfyuiPath?: string }).comfyuiPath = "C:/stale/local/ComfyUI";
+    await expect(saveNodeSnapshot("pinned")).rejects.toThrow(/REMOTE ComfyUI/i);
+    // Nothing was written anywhere.
+    expect(fsMocks.writeFileSync).not.toHaveBeenCalled();
+    expect(fsMocks.mkdirSync).not.toHaveBeenCalled();
+  });
+
+  it("cancelPendingSnapshotRestore REFUSES in remote mode even with COMFYUI_PATH set", () => {
+    (config as { comfyuiPath?: string }).comfyuiPath = "C:/stale/local/ComfyUI";
+    const res = cancelPendingSnapshotRestore();
+    expect(res.outcome).toBe("remote");
+    expect(res.detail).toMatch(/REMOTE ComfyUI/i);
+    expect(res.detail).toMatch(/Nothing was deleted/);
+    expect(res.deletedPaths).toEqual([]);
   });
 });

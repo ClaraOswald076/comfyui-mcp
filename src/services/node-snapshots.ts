@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
-import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
+import { resolveEffectiveComfyUIBase, resolveLocalMutationTarget } from "./workspace-env.js";
 import {
   recordPanelPendingOp,
   SNAPSHOT_RESTORE_PENDING_MS,
@@ -269,7 +269,18 @@ export async function saveNodeSnapshot(
   // workspace — never a bare "comfyuiPath unset ⇒ remote" conclusion, which
   // misclassified a local install connected via --comfyui-url as remote.
   validateSnapshotName(trimmed);
-  const comfyuiBase = resolveEffectiveComfyUIBase();
+  // A named save WRITES a file into the install tree, so it must know WHICH
+  // install — and in remote mode a stale local COMFYUI_PATH would send that write
+  // to an unrelated tree while the snapshot content came from the remote server
+  // (codex gate P0). Refuse instead of guessing.
+  const target = resolveLocalMutationTarget();
+  if (target.refusal) {
+    throw new NodeSnapshotError(
+      `Saving a named snapshot requires a local ComfyUI install, and ${target.refusal} ` +
+        "Omit the name to let ComfyUI-Manager assign a timestamped one on the server itself.",
+    );
+  }
+  const comfyuiBase: string | undefined = target.base;
   if (!comfyuiBase) {
     throw new NodeSnapshotError(
       "Saving a named snapshot requires a local ComfyUI install path, and none is " +
@@ -437,7 +448,19 @@ export function cancelPendingSnapshotRestore(): CancelSnapshotRestoreResult {
   // Same resolver as a named save (#775): the saved default workspace counts as
   // a local install path — a bare comfyuiPath check misclassified exactly that
   // session as "remote".
-  const comfyuiBase = resolveEffectiveComfyUIBase();
+  // Cancelling DELETES the pending-restore file. Same hazard as the save: in
+  // remote mode a stale local path would delete an unrelated install's pending
+  // restore (codex gate P0).
+  const cancelTarget = resolveLocalMutationTarget();
+  if (cancelTarget.refusal) {
+    return {
+      outcome: "remote",
+      deletedPaths: [],
+      checkedPaths: [],
+      detail: `cannot cancel — ${cancelTarget.refusal} Nothing was deleted.`,
+    };
+  }
+  const comfyuiBase: string | undefined = cancelTarget.base;
   if (!comfyuiBase) {
     return {
       outcome: "remote",

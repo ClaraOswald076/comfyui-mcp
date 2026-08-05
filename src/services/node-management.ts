@@ -2078,6 +2078,25 @@ export async function installCustomNode(opts: InstallOptions): Promise<NodeOpRes
  * supports natively (comfy-cli.ts defaultWorkspace).
  */
 function comfyCliUnavailableReason(workspace: string | undefined): string | undefined {
+  // REMOTE MODE FIRST (codex gate P0). comfy-cli runs against a LOCAL install,
+  // while every check around these calls — the pre-state, the post-verify — talks
+  // to the Manager on the REMOTE server. With a stale local COMFYUI_PATH the two
+  // describe different machines: the CLI uninstalls or disables a pack here, the
+  // verification reports on a pack over there, and the local destructive action is
+  // never disclosed at all.
+  //
+  // `workspace` is non-empty in exactly that case, which is why this cannot be
+  // folded into the check below: having a path is what makes it dangerous.
+  if (isRemoteMode()) {
+    return (
+      "this session targets a REMOTE ComfyUI (--comfyui-url), and comfy-cli only acts on a " +
+      "LOCAL install" +
+      (workspace
+        ? ` — running it would modify ${workspace}, which is NOT the server you are connected to`
+        : "") +
+      ". Run it on the machine the install lives on"
+    );
+  }
   if (!workspace) {
     return "no local ComfyUI install path is available (COMFYUI_PATH unset and no saved default workspace), which the comfy-cli subprocess needs";
   }
@@ -2128,6 +2147,16 @@ async function installCustomNodeImpl(
   const managerBase = managerBaseUrl();
   const cliWorkspace = opts.comfyuiPath ?? resolveEffectiveComfyUIBase();
   const presenceCtx = capturePackPresenceContext(cliWorkspace);
+  // THE PRE-STATE, OBSERVED BEFORE THE OPERATION (codex gate P0). The "already
+  // installed" verdict below used to be inferred from POST-op disk state alone:
+  // a pack that was absent before the call and installed as a registry ZIP —
+  // which Manager does not track — creates a directory the post-check then reads
+  // as "it was already there", telling the user nothing happened when their pack
+  // had just been installed. A pre-state cannot be recovered afterwards; it has
+  // to be taken now.
+  const diskBefore = presenceCtx.diskRoot
+    ? findPackOnDisk(id, presenceCtx.diskRoot)
+    : undefined;
 
   // #808 — a requested comfy-cli that is not usable is a FALLBACK, not a fatal
   // error: the probe runs before anything is submitted, so dropping to Manager
@@ -2260,16 +2289,44 @@ async function installCustomNodeImpl(
           details: status,
         });
       }
-      // The Manager install resolved to nothing, but the pack IS on disk — it
-      // was already there (registry zip / manual copy). Say so rather than
-      // claiming a fresh install OR reporting a not-found failure.
+      // The Manager install resolved to nothing and the pack IS on disk. WHICH of
+      // those two stories it is depends entirely on the PRE-state, which is why
+      // it is read here and not inferred.
+      if (diskBefore?.state === "not-found") {
+        // It was NOT there before and it is now: the install worked. Reporting
+        // "already installed" here hid a successful install behind a no-op.
+        return withCliNote({
+          mechanism: "manager-http",
+          message:
+            `Installed "${id}" — it is now present on disk at ${presence.dir}. It was NOT ` +
+            `there before this call, so the install DID take effect, even though ` +
+            `ComfyUI-Manager does not track it (a Comfy Registry zip install is not in its ` +
+            `installed-pack list). Restart ComfyUI to load it.`,
+          details: status,
+        });
+      }
+      if (diskBefore?.state === "found") {
+        return withCliNote({
+          mechanism: "manager-http",
+          message:
+            `"${id}" is present on disk at ${presence.dir}, but ComfyUI-Manager does not ` +
+            `track it (a Comfy Registry zip install or a manual copy), and it was ALREADY ` +
+            `there before this call — so the queued registry install resolved to nothing ` +
+            `new. Restart ComfyUI if it was just added.`,
+          details: status,
+        });
+      }
+      // No usable pre-state (no disk root, or the pre-check was unreadable). The
+      // pack is on disk NOW; whether this call put it there is undetermined, and
+      // saying either would be a guess dressed as a finding.
       return withCliNote({
         mechanism: "manager-http",
         message:
-          `"${id}" is present on disk at ${presence.dir}, but ComfyUI-Manager does not ` +
-          `track it (a Comfy Registry zip install or a manual copy), so the queued registry ` +
-          `install resolved to nothing new — the pack was ALREADY installed. Restart ComfyUI ` +
-          `if it was just added.`,
+          `"${id}" is present on disk at ${presence.dir}, and ComfyUI-Manager does not ` +
+          `track it (a Comfy Registry zip install or a manual copy). Whether THIS call ` +
+          `installed it could not be determined — the pack's state before the call was ` +
+          `${diskBefore?.state === "unreadable" ? `unreadable (${diskBefore.reason})` : "not observable in this session"}. ` +
+          `Restart ComfyUI if it was just added.`,
         details: status,
       });
     case "absent":
@@ -3415,11 +3472,37 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
       details: status,
     });
   }
+  // MANAGER'S LIST IS NOT THE DISK (codex gate P0). A partial uninstall can drop
+  // the tracking entry and leave `custom_nodes/<pack>` in place — and ComfyUI
+  // loads directories, not Manager's bookkeeping, so the pack comes back on the
+  // next restart while we have already called it uninstalled. A destructive
+  // postcondition deserves the strongest evidence available, not the most
+  // convenient, and this branch has the disk check the rest of this file uses.
+  const diskAfter = presenceCtx.diskRoot ? findPackOnDisk(id, presenceCtx.diskRoot) : undefined;
+  if (diskAfter?.state === "found") {
+    return withCliNote({
+      mechanism: "manager-http",
+      message:
+        `The uninstall of "${id}" removed it from ComfyUI-Manager's installed-pack list, ` +
+        `but the pack directory is STILL on disk at ${diskAfter.dir}. ComfyUI loads ` +
+        `directories, not Manager's list, so it will load again on the next restart — ` +
+        `this is NOT a completed uninstall. Remove the directory manually, or re-run the ` +
+        `uninstall, and check the ComfyUI server log for the underlying error.`,
+      details: status,
+    });
+  }
+  const diskNote =
+    diskAfter?.state === "not-found"
+      ? " and gone from disk"
+      : diskAfter?.state === "unreadable"
+        ? `; the disk check was inconclusive (${diskAfter.reason}), so the directory may ` +
+          `still be present`
+        : "; no disk check was possible in this session";
   return withCliNote({
     mechanism: "manager-http",
     message:
       `Uninstalled "${id}" via ComfyUI-Manager (verified absent from its installed-pack ` +
-      `list afterwards). A ComfyUI restart is required to unload it fully.`,
+      `list afterwards${diskNote}). A ComfyUI restart is required to unload it fully.`,
     details: status,
   });
 }

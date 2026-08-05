@@ -179,6 +179,8 @@ interface Call {
 function stubFetch(opts: {
   installedBody?: unknown;
   statusSequence?: unknown[];
+  /** Fires when a queue op is submitted — lets a test make the install REAL. */
+  onQueue?: () => void;
 } = {}) {
   const calls: Call[] = [];
   let statusIdx = 0;
@@ -203,6 +205,7 @@ function stubFetch(opts: {
         return jsonResponse(s);
       }
       // queue ops + start return empty bodies
+      if (path.includes("/queue/")) opts.onQueue?.();
       return new Response("", { status: 200 });
     },
   );
@@ -1245,12 +1248,34 @@ describe("node-management service", () => {
     });
 
     it("install of an on-disk-but-untracked pack discloses 'already installed' instead of a not-found failure", async () => {
+      // On disk BEFORE the call and still after: nothing new happened.
       impactOnDisk();
       stubFetch({ installedBody: {} });
       const res = await installCustomNode({ id: "comfyui-impact-pack" });
       expect(res.message).toMatch(/present on disk/);
-      expect(res.message).toMatch(/ALREADY installed/);
+      expect(res.message).toMatch(/ALREADY there before this call/);
       expect(res.message).not.toMatch(/not found in the/);
+    });
+
+    it("does NOT call a FRESH registry-zip install 'already installed' — the pre-state decides", async () => {
+      // The pack is ABSENT before the call and present after: the install worked.
+      // ComfyUI-Manager does not track registry-ZIP installs, so the post-state
+      // alone looks identical to the case above — and reading it as "already
+      // installed" told the user nothing happened when their pack had just been
+      // installed (codex gate P0). A pre-state cannot be recovered afterwards.
+      let installed = false;
+      // Reuse the on-disk fixture rather than re-deriving its path matching, then
+      // gate it on the flag: absent until the queue op fires, present after.
+      impactOnDisk();
+      const whenPresent = fsCtl.readdirSync;
+      fsCtl.readdirSync = (p) => (installed ? whenPresent(p) : []);
+      stubFetch({ installedBody: {}, onQueue: () => { installed = true; } });
+      const res = await installCustomNode({ id: "comfyui-impact-pack" });
+
+      expect(res.message).toMatch(/Installed "comfyui-impact-pack"/);
+      expect(res.message).toMatch(/was NOT there before this call/);
+      expect(res.message).not.toMatch(/ALREADY/);
+      expect(res.message).not.toMatch(/resolved to nothing/);
     });
 
     it("the install post-verify scans the CALL-SCOPED adopted root, not the global one", async () => {
@@ -1414,6 +1439,9 @@ describe("node-management service", () => {
   describe("disable/enable/uninstall (#775)", () => {
     const installedEnabled = {
       "my-pack": { ver: "1.0.0", cnr_id: "my-pack", enabled: true },
+    };
+    const installedImpact = {
+      "comfyui-impact-pack": { ver: "1.0.0", cnr_id: "comfyui-impact-pack", enabled: true },
     };
     const installedDisabled = {
       "my-pack": { ver: "1.0.0", cnr_id: "my-pack", enabled: false },
@@ -1662,11 +1690,69 @@ describe("node-management service", () => {
       expect(listCalls).toBeGreaterThanOrEqual(2);
     });
 
+    it("does NOT claim an uninstall when the DIRECTORY survives Manager's list", async () => {
+      // A partial uninstall can drop Manager's tracking entry and leave
+      // custom_nodes/<pack> on disk. ComfyUI loads directories, not Manager's
+      // bookkeeping — so the pack comes back on the next restart while we have
+      // already told the user it is gone (codex gate P0). A destructive
+      // postcondition deserves the strongest evidence available.
+      // The directory is there before AND after. Inlined rather than reusing the
+      // sibling block's helper, which is scoped elsewhere; `endsWith` avoids a
+      // separator regex entirely.
+      const impactToml = '[project]' + String.fromCharCode(10) +
+        'name = "comfyui-impact-pack"' + String.fromCharCode(10) +
+        'version = "8.28.3"' + String.fromCharCode(10);
+      fsCtl.readdirSync = (p) =>
+        p.endsWith("custom_nodes") ? [dirEnt("ComfyUI-Impact-Pack")] : [];
+      fsCtl.readFileSync = (p) => {
+        if (p.endsWith("pyproject.toml")) return impactToml;
+        throw new Error(`unexpected readFileSync: ${p}`);
+      };
+      let listCalls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            listCalls++;
+            return jsonResponse(listCalls === 1 ? installedImpact : {});
+          }
+          if (path === "/v2/manager/queue/status") return jsonResponse(drained);
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await uninstallCustomNode({ id: "comfyui-impact-pack" });
+
+      expect(res.message).toMatch(/STILL on disk/);
+      expect(res.message).toMatch(/NOT a completed uninstall/);
+      // The claim it must never make while the directory is there.
+      expect(res.message).not.toMatch(/^Uninstalled/);
+    });
+
     it("uninstall discloses when the pack is STILL present afterwards", async () => {
       stubFetch({ installedBody: installedEnabled });
       const res = await uninstallCustomNode({ id: "my-pack" });
       expect(res.message).toMatch(/did NOT take effect/);
       expect(res.message).not.toMatch(/Uninstalled "my-pack" via/);
+    });
+
+    it("comfy-cli REFUSES in remote mode — a local uninstall must not run behind remote checks", async () => {
+      // The dangerous shape: a local COMFYUI_PATH IS available, so the "no local
+      // path" guard passes and comfy-cli happily uninstalls from the local tree
+      // while the pre/post Manager checks describe the REMOTE server — and the
+      // local destructive action is never disclosed (codex gate P0). Having a
+      // path is what makes this case unsafe, not the lack of one.
+      // Manager is reachable and tracks the pack, so the presence pre-check
+      // passes and the CLI decision is actually reached.
+      stubFetch({ installedBody: installedEnabled });
+      remoteFlags.remoteMode = true;
+      try {
+        const res = await uninstallCustomNode({ id: "my-pack", useCmCli: true });
+        expect(JSON.stringify(res)).toMatch(/REMOTE ComfyUI/i);
+        expect(res.mechanism).not.toBe("comfy-cli");
+      } finally {
+        remoteFlags.remoteMode = false;
+      }
     });
 
     it("uninstall via comfy-cli refuses a pack that was never installed — nothing runs", async () => {
