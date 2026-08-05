@@ -1566,7 +1566,7 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
       local.note = [
         local.note,
         `Package versions omitted: ${reason}, so reporting them would be a false ` +
-          `capability report (#401). Start ComfyUI through start_comfyui, or run it ` +
+          `capability report (#401). Start ComfyUI through restart_comfyui (action:"start"), or run it ` +
           `locally where this process can read its command line, for an accurate report.`,
       ]
         .filter(Boolean)

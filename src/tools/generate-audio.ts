@@ -26,7 +26,7 @@ export function registerGenerateAudioTool(server: McpServer): void {
     "generate_audio",
     "Generate audio from a text prompt — supports ACE Step 1.5 and Stable Audio 3 model families. " +
       "Builds the appropriate workflow graph, filling unspecified parameters from your configured defaults " +
-      "(set_defaults / COMFYUI_DEFAULT_* / config file), auto-selecting local models when needed. " +
+      "(get_defaults (action:\"set\") / COMFYUI_DEFAULT_* / config file), auto-selecting local models when needed. " +
       "Returns the prompt_id immediately; the resulting audio asset_id arrives in the completion notification. " +
       "Requires a running ComfyUI with the corresponding model files installed.",
     {

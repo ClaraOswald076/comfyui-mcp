@@ -54,7 +54,6 @@ import { registerSkillsAccessTools } from "./skills-access.js";
 import { registerInstallPanelTools } from "./install-panel.js";
 import { registerSelfUpdateTools } from "./self-update.js";
 import { registerCalculateTools } from "./calculate.js";
-import { registerComfyUISettingsTools } from "./comfyui-settings.js";
 import { registerNodeDevTools } from "./node-dev.js";
 import { registerComfyCliTools } from "./comfy-cli.js";
 import { registerTrainTools } from "./train.js";
@@ -126,7 +125,10 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["server", registerInstallPanelTools],
   ["server", registerSelfUpdateTools],
   ["diagnostics", registerCalculateTools],
-  ["server", registerComfyUISettingsTools],
+  // registerComfyUISettingsTools used to sit here. 0.50.0 slice 7 folded its two
+  // tools into `get_defaults` as action:"get_ui"/"set_ui", so the group is gone
+  // rather than empty — every surviving name keeps its position, which is what
+  // registry-surface.test.ts pins.
   ["custom-nodes", registerNodeDevTools],
   ["training", registerTrainTools],
   ["apps", registerAppsTools],

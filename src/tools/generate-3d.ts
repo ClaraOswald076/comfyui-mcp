@@ -6,7 +6,7 @@ import { errorToToolResult } from "../utils/errors.js";
 /**
  * generate_3d — 3D model generation via the connected ComfyUI's hosted partner
  * 3D nodes (Tripo / Meshy / Rodin / Hunyuan3D), reusing the same machinery as
- * generate_with_api_node. See ../services/generate-3d.ts for the
+ * list_api_nodes (action:"generate"). See ../services/generate-3d.ts for the
  * path-selection rationale and capability detection.
  */
 export function registerGenerate3dTools(server: McpServer): void {
@@ -45,7 +45,7 @@ export function registerGenerate3dTools(server: McpServer): void {
         .record(z.string(), z.any())
         .optional()
         .describe(
-          "Provider-specific extra inputs passed through to the node (e.g. style, texture, quality). Use get_api_node_schema on the chosen node for valid keys.",
+          "Provider-specific extra inputs passed through to the node (e.g. style, texture, quality). Use list_api_nodes (action:\"schema\") on the chosen node for valid keys.",
         ),
       disable_random_seed: z
         .boolean()

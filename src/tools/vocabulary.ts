@@ -65,8 +65,6 @@ export const TOOL_NAMES = [
   "save_workflow",
   "analyze_workflow",
   "run_workflow_url",
-  "stop_comfyui",
-  "start_comfyui",
   "restart_comfyui",
   "get_image",
   "upload_image",
@@ -84,7 +82,6 @@ export const TOOL_NAMES = [
   "get_asset_metadata",
   "regenerate",
   "get_defaults",
-  "set_defaults",
   "generate_image",
   "generate_audio",
   "generate_3d",
@@ -125,8 +122,6 @@ export const TOOL_NAMES = [
   "workspace",
   "get_environment",
   "list_api_nodes",
-  "get_api_node_schema",
-  "generate_with_api_node",
   "configure_manager",
   "scaffold_custom_node",
   "publish_custom_node",
@@ -147,8 +142,6 @@ export const TOOL_NAMES = [
   "install_panel",
   "self_update",
   "calculate",
-  "get_comfyui_settings",
-  "set_comfyui_setting",
   "list_node_pack_files",
   "read_node_file",
   "search_node_packs",
@@ -302,7 +295,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 145;
+export const MAX_TOOLS = 138;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;
@@ -750,6 +743,70 @@ export const DEAD_NAMES: readonly DeadName[] = [
     name: "runpod_pod_troubleshoot",
     since: "0.50.0",
     replacement: 'runpod_watch (action:"troubleshoot")',
+  },
+  // ── 0.50.0 slice 7 (warmup): process control, API nodes, defaults ──────────
+  // Ten names folded into three action-parameterized tools. Same services, same
+  // arguments, same return shapes — only the surface changed, so every mention
+  // of a retired name is now rot pointing at a 404.
+  //
+  //   restart_comfyui ← start_comfyui, stop_comfyui
+  //   list_api_nodes  ← get_api_node_schema, generate_with_api_node
+  //   get_defaults    ← set_defaults, get_comfyui_settings, set_comfyui_setting
+  //
+  // The get_defaults fold spans TWO backing stores that must not be conflated:
+  // action:"get"/"set" are the MCP server's own generation defaults, while
+  // action:"get_ui"/"set_ui" are ComfyUI's separate frontend UI settings. The
+  // replacements below therefore keep the `_ui` suffix visible — a caller sent
+  // from set_comfyui_setting to action:"set" would silently write the wrong
+  // store.
+  {
+    name: "start_comfyui",
+    since: "0.50.0",
+    replacement: 'restart_comfyui (action:"start")',
+  },
+  {
+    name: "stop_comfyui",
+    since: "0.50.0",
+    replacement: 'restart_comfyui (action:"stop")',
+  },
+  {
+    name: "get_api_node_schema",
+    since: "0.50.0",
+    replacement: 'list_api_nodes (action:"schema")',
+  },
+  {
+    name: "generate_with_api_node",
+    since: "0.50.0",
+    replacement: 'list_api_nodes (action:"generate")',
+  },
+  {
+    name: "set_defaults",
+    since: "0.50.0",
+    replacement: 'get_defaults (action:"set")',
+  },
+  {
+    name: "get_comfyui_settings",
+    since: "0.50.0",
+    replacement: 'get_defaults (action:"get_ui")',
+    allowedIn: [
+      {
+        path: "docs/design/comfyui-settings-tools.md",
+        context: "The read tool shipped as `get_comfyui_settings`",
+        why: "The dated design spec for the PR that BUILT these two tools. Its superseded banner records the name each tool shipped under and maps it to today's action — the same mapping-away-from-the-name shape as the docs/using-tools.mdx migration table, never an instruction to call it. The banner's two mentions are on separate lines so each is a single occurrence bound to its own context.",
+      },
+    ],
+  },
+  {
+    name: "set_comfyui_setting",
+    since: "0.50.0",
+    replacement: 'get_defaults (action:"set_ui")',
+    allowedIn: [
+      {
+        path: "docs/design/comfyui-settings-tools.md",
+        context: "The write tool shipped as `set_comfyui_setting`",
+        why: "Second line of the same superseded banner — see the get_comfyui_settings entry above.",
+      },
+    ],
   },
 ];
 

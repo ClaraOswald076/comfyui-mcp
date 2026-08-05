@@ -582,7 +582,7 @@ export async function generateWithApiNode(
   if (missingRequired.length > 0) {
     notes.push(
       `Missing required input(s): ${missingRequired.join(", ")}. ` +
-        `The server may reject the job. Use get_api_node_schema for details.`,
+        `The server may reject the job. Use list_api_nodes (action:"schema") for details.`,
     );
   }
 

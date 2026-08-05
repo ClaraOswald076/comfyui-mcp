@@ -9,15 +9,15 @@
 //          said it "can't confirm it came back" — a verdict computed AFTER a stop
 //          it should never have made.
 //   #767 — a ComfyUI wedged by a CUDA OOM stopped answering /system_stats, so the
-//          launch arguments came back empty. `stop_comfyui` killed it anyway and
-//          reported `has_restart_info: true`; `start_comfyui` then answered "No
+//          launch arguments came back empty. `restart_comfyui (action:"stop")` killed it anyway and
+//          reported `has_restart_info: true`; `restart_comfyui (action:"start")` then answered "No
 //          command-line info captured from previous run". The OS had the whole
 //          command line the entire time.
 //
 // So: relaunch capability is established BEFORE the stop, refusal is loud, and the
 // claim that a restart is possible means a command was actually built and
 // validated. Where a relaunch genuinely cannot be proven but the launch command WAS
-// observed, the stop still happens (stop_comfyui is an explicit instruction, and a
+// observed, the stop still happens (restart_comfyui (action:"stop") is an explicit instruction, and a
 // wedged server is exactly when someone means it) — but it says so, and hands over
 // the command to run by hand.
 //
@@ -488,7 +488,7 @@ describe("tokenizeCommandLine — the OS's flattened command line back into argv
 // #767 — the stop and the start must agree
 // ---------------------------------------------------------------------------
 
-describe("stop_comfyui — has_restart_info means a relaunch was BUILT (#767)", () => {
+describe("restart_comfyui (action:\"stop\") — has_restart_info means a relaunch was BUILT (#767)", () => {
   /**
    * The #767 shape: a wedged server. `/system_stats` does not answer, so the launch
    * arguments come back EMPTY — every relaunch decision downstream used to have
@@ -623,7 +623,7 @@ describe("stop_comfyui — has_restart_info means a relaunch was BUILT (#767)", 
     killSpy.mockRestore();
   });
 
-  it("stops but says PLAINLY that start_comfyui cannot bring it back, and how to do it by hand", async () => {
+  it("stops but says PLAINLY that restart_comfyui (action:\"start\") cannot bring it back, and how to do it by hand", async () => {
     // FAIL-BEFORE: this reported `has_restart_info: true` and a bare success, and
     // the start that followed failed. The stop is still performed — it was asked
     // for, and a wedged server is exactly when someone means it — but the report
@@ -644,7 +644,12 @@ describe("stop_comfyui — has_restart_info means a relaunch was BUILT (#767)", 
 
     expect(stopped.stopped).toBe(true);
     expect(stopped.has_restart_info).toBe(false);
-    expect(stopped.message).toMatch(/start_comfyui will NOT be able to bring this back/i);
+    // Parens ESCAPED deliberately: the message names the action literally, as
+    // `restart_comfyui (action:"start")`. Unescaped they are a capture group and
+    // the pattern silently stops matching the text it is supposed to pin.
+    expect(stopped.message).toMatch(
+      /restart_comfyui \(action:"start"\) will NOT be able to bring this back/i,
+    );
     expect(stopped.relaunch_blocked).toBeTruthy();
     // The recovery command is handed over, not left in the process table.
     expect(stopped.restart_hint?.command).toContain(GONE_PY);

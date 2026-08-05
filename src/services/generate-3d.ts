@@ -17,7 +17,7 @@ import { ValidationError } from "../utils/errors.js";
  * 3D nodes in core (`comfy_api_nodes`) — Tripo, Meshy, Rodin and Hunyuan3D
  * (Tencent), all under categories like "partner/3d/Tripo" with FILE_3D_*
  * outputs and OUTPUT_NODE=true. We therefore route through the SAME
- * generateWithApiNode machinery used by the generate_with_api_node tool: no
+ * generateWithApiNode machinery used by the list_api_nodes (action:"generate") tool: no
  * local 3D pack install is required, only a comfy.org API key/login on the
  * server (or COMFY_API_KEY here). Detection is dynamic against /object_info,
  * so the tool degrades honestly when the server has no 3D-capable API nodes
@@ -209,7 +209,7 @@ export interface Generate3dArgs {
   image?: string;
   /** Explicit 3D API node class_type to use (overrides auto-selection). */
   node?: string;
-  /** Provider-specific extra inputs passed through to the node (see get_api_node_schema). */
+  /** Provider-specific extra inputs passed through to the node (see list_api_nodes (action:"schema")). */
   inputs?: Record<string, unknown>;
   disable_random_seed?: boolean;
 }
@@ -227,7 +227,7 @@ export interface Generate3dResult extends GenerateWithApiNodeResult {
 /**
  * Generate a 3D model from text or an image by enqueueing a minimal workflow
  * around a hosted partner 3D node (Tripo/Meshy/Rodin/Hunyuan3D), reusing the
- * generate_with_api_node machinery. Returns immediately with the prompt_id.
+ * list_api_nodes (action:"generate") machinery. Returns immediately with the prompt_id.
  */
 export async function generate3d(
   args: Generate3dArgs,

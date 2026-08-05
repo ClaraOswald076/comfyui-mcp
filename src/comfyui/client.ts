@@ -646,7 +646,8 @@ export async function getLogs(): Promise<string[]> {
  *   POST /settings/{id}    → persist one setting (JSON body is the raw value)
  *
  * These are the ComfyUI *frontend* UI settings (`Comfy.*` ids) and are entirely
- * unrelated to our own get_defaults/set_defaults SQLite store. Local and remote
+ * unrelated to our own generation-defaults store, which `get_defaults` reads and
+ * writes with action:"get"/"set". Local and remote
  * (`--comfyui-url`) both work over plain REST and inherit `comfyuiFetch` auth
  * headers. Comfy Cloud exposes no per-user settings store, so these throw
  * CLOUD_UNSUPPORTED via `requireLocalMode`.

@@ -113,7 +113,7 @@ stateless-server / Salad-specific bits (replicas, deletion-cost, k8s proxy).
   return URLs. (`remote-storage-manager.ts`, `storage-providers/*`)
 - **E8 — Server-side image conversion.** `sharp` PNG↔JPEG↔WebP + quality options for compact outputs. (`image-tools.ts`)
 - **E9 — Dynamic model loading.** URL in a model-loading node → auto-download + cache before exec. (`comfy-node-preprocessors.ts`)
-- **E10 — Warmup.** Run a warmup workflow after `start_comfyui` to preload models. (`comfy.warmupComfyUI`)
+- **E10 — Warmup.** Run a warmup workflow after `restart_comfyui (action:"start")` to preload models. (`comfy.warmupComfyUI`)
 - **E12 — Outbound webhooks (later).** Signed Standard Webhooks on completion/progress + retries —
   mainly for the headless/bridge path, not the interactive plugin. (`event-emitters.ts`)
 

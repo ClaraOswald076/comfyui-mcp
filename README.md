@@ -16,7 +16,7 @@ Works on **macOS**, **Linux**, and **Windows**. Auto-detects your ComfyUI instal
 
 **Stuck or have a question? [Join the Discord](https://discord.gg/cW9arBhzCu)** — help, model tips, and release announcements.
 
-**145 MCP tools** | **37 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
+**138 MCP tools** | **37 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
 
 The plugin ships **expert skills that grow with every release** — model-specific generation guides with curated download URLs, workflow recipes, troubleshooting, and custom-node authoring — so Claude knows the right sampler, CFG, resolution, and model files for each architecture without trial and error.
 
@@ -147,7 +147,7 @@ This package also ships as a **Claude Code plugin**, providing slash commands, s
 | Event | Trigger | Action |
 |-------|---------|--------|
 | PreToolUse | `enqueue_workflow` | **VRAM watchdog** — checks GPU memory via `/system_stats` and warns if < 1GB free before execution |
-| PreToolUse | `stop_comfyui`, `restart_comfyui` | **Save warning** — prompts user to save unsaved workflow changes before stopping ComfyUI |
+| PreToolUse | `restart_comfyui` (actions `stop`/`restart`) | **Save warning** — prompts user to save unsaved workflow changes before stopping ComfyUI |
 | PostToolUse | Any comfyui tool | **Job completion notify** — checks for completed jobs and injects completion summaries into the conversation |
 
 ### Background Scripts
@@ -248,7 +248,7 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 ## MCP Tools
 
-145 tools across workflow execution, generation, iteration, composition, models, and more:
+138 tools across workflow execution, generation, iteration, composition, models, and more:
 
 ### Image Generation (high-level)
 
@@ -278,8 +278,9 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 | Tool | Description |
 |------|-------------|
-| `get_defaults` | Show merged generation defaults with per-source attribution |
-| `set_defaults` | Update runtime defaults; `persist: true` writes the config file |
+| `get_defaults` `action:"get"` | Show merged generation defaults with per-source attribution |
+| `get_defaults` `action:"set"` | Update runtime defaults; `persist: true` writes the config file |
+| `get_defaults` `action:"get_ui"` / `action:"set_ui"` | Read/write ComfyUI's OWN frontend UI settings (the `Comfy.*` ids) — a separate store from the generation defaults above |
 
 ### Workflow Execution
 
@@ -374,9 +375,9 @@ Install [comfy-cli](https://docs.comfy.org/comfy-cli/getting-started#install-cli
 
 | Tool | Description |
 |------|-------------|
-| `stop_comfyui` | Stop the running ComfyUI process (saves PID and launch args for restart) |
-| `start_comfyui` | Start ComfyUI using info saved from a previous stop |
-| `restart_comfyui` | Stop and restart ComfyUI, preserving all launch arguments |
+| `restart_comfyui` `action:"restart"` | Stop and restart ComfyUI, preserving all launch arguments |
+| `restart_comfyui` `action:"stop"` | Stop the running ComfyUI process (saves PID and launch args for restart) |
+| `restart_comfyui` `action:"start"` | Start ComfyUI using info saved from a previous stop |
 
 ### Generation Tracker
 
@@ -826,7 +827,7 @@ src/
     skill-generator.ts     # generate_node_skill
     generation-tracker.ts  # suggest_settings, generation_stats
     diagnostics.ts         # get_logs, get_history
-    process-control.ts     # stop_comfyui, start_comfyui, restart_comfyui
+    process-control.ts     # restart_comfyui (restart/start/stop)
     index.ts               # Registers all tool groups
   utils/
     errors.ts              # Custom error hierarchy with MCP integration

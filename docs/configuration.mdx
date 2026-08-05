@@ -18,7 +18,7 @@ All configuration is via environment variables (set in the server's `env` block 
 | **Remote** | `--comfyui-url` / `COMFYUI_URL` points at a non-loopback host | no | no | yes |
 | **Cloud** | `COMFYUI_API_KEY` is set (targets Comfy Cloud) | no | no | no (HTTP polling) |
 
-Tools that require a local install (`start_comfyui` / `apply_manifest` / `remove_model` / `list_output_images` / etc.)
+Tools that require a local install (`restart_comfyui` with `action: "start"` / `apply_manifest` / `remove_model` / `list_output_images` / etc.)
 return a clear error when running in remote or cloud mode. In remote and cloud modes the server skips
 local `COMFYUI_PATH` auto-detection so a stale local install can't silently absorb uploads or model
 downloads the agent intends for the actual target — set `COMFYUI_PATH` explicitly if you want to
@@ -164,7 +164,7 @@ error. Architecture and `cloud-client` dispatcher originally contributed by
 
 ## Process supervision (local installs)
 
-Applies to `start_comfyui` / `restart_comfyui` when comfyui-mcp manages a local ComfyUI process.
+Applies to `restart_comfyui` (actions `start` and `restart`) when comfyui-mcp manages a local ComfyUI process.
 
 <ParamField path="COMFYUI_STARTUP_CHECK_INTERVAL_S" type="number" default="1">
   Seconds between readiness probes after launching ComfyUI.
@@ -173,7 +173,7 @@ Applies to `start_comfyui` / `restart_comfyui` when comfyui-mcp manages a local 
   Maximum readiness probes before reporting a startup timeout.
 </ParamField>
 <ParamField path="COMFYUI_ALWAYS_RESTART" type="boolean" default="false">
-  When enabled, a ComfyUI process that exits unexpectedly is automatically restarted. A deliberate `stop_comfyui` is never restarted.
+  When enabled, a ComfyUI process that exits unexpectedly is automatically restarted. A deliberate `restart_comfyui` with `action: "stop"` is never restarted.
 </ParamField>
 <ParamField path="COMFYUI_RESTART_MAX_ATTEMPTS" type="number" default="3">
   Maximum auto-restarts allowed within the restart window before giving up.

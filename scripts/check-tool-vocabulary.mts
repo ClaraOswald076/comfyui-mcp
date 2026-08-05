@@ -119,6 +119,15 @@ const SELF = new Set([
   // Same, for 0.50.0 slice 8: asserts as FIXTURES that the ten retired runpod_*
   // names are in DEAD_NAMES with `runpod` / `runpod_watch` replacements.
   "src/__tests__/tools/runpod.test.ts",
+  // Same, for 0.50.0 slice 7: each asserts as FIXTURES that the names its tool
+  // replaced are in DEAD_NAMES (restart_comfyui ← 2, list_api_nodes ← 2,
+  // get_defaults ← 3), and defaults.test.ts additionally asserts that the two
+  // UI-settings redirects point at the _ui actions rather than the
+  // generation-defaults ones — a check that cannot be written without spelling
+  // the retired names.
+  "src/__tests__/tools/process-control-tool.test.ts",
+  "src/__tests__/tools/api-nodes.test.ts",
+  "src/__tests__/tools/defaults.test.ts",
   // Same, for the #659 retired-name error: these pass dead names to call_tool /
   // the ollama dispatch as FIXTURES and assert the error quotes the ledger's
   // replacement — the names are call arguments under test, not live guidance.

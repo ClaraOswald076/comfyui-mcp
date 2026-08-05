@@ -18,7 +18,7 @@ export function registerGenerateImageTool(server: McpServer): void {
   server.tool(
     "generate_image",
     "Generate an image from a text prompt — the high-level entry point. Builds a txt2img workflow, " +
-      "filling any unspecified parameter from your configured defaults (set_defaults / COMFYUI_DEFAULT_* / config file), " +
+      "filling any unspecified parameter from your configured defaults (get_defaults (action:\"set\") / COMFYUI_DEFAULT_* / config file), " +
       "auto-selecting a local checkpoint when none is given. Returns the prompt_id immediately; the resulting " +
       "asset_id arrives in the completion notification and can be passed to view_image or regenerate. " +
       "For full control over the node graph, use create_workflow + enqueue_workflow instead.",
