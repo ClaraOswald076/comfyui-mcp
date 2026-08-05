@@ -773,6 +773,16 @@ export function makeUnknownCommandError(
  * the mutating-vs-read classification and the default-timeout policy share one
  * authoritative list. Everything not listed is treated as mutating.
  */
+/**
+ * #770/#803 — the result of reading a tab's trusted workflow command stamp.
+ * Three states, because "could not read it" is not "there is none": collapsing
+ * them is what let a recovery report an absence it never observed. See
+ * {@link UiBridge.workflowUuidFor}.
+ */
+export type TabWorkflowUuidRead =
+  | { known: true; uuid?: string }
+  | { known: false; reason: string };
+
 export const BRIDGE_READONLY_CMDS: ReadonlySet<string> = new Set<string>([
   "graph_serialize",
   "graph_outline",
@@ -3344,25 +3354,38 @@ export class UiBridge {
   }
 
   /**
-   * #770/#803 — READ the trusted command stamp currently fencing `tabId`, or
-   * `undefined` when this tab has none (no resolver injected, old panel, or an
-   * identity regression cleared it).
+   * #770/#803 — READ the trusted command stamp currently fencing `tabId`.
    *
-   * Exists so a rebind can tell the three DIFFERENT answers apart instead of
-   * folding them into one verdict: "the fence was stale and has been replaced",
-   * "the fence already named the live canvas", and "there was never a fence to
-   * repair". Those have three different remedies, and reporting any of them as
-   * the others is how a recovery came to claim success it had not achieved.
+   * TRI-STATE on purpose (codex gate). An earlier version returned
+   * `string | undefined` and swallowed a throwing resolver into `undefined`,
+   * which made "I could not read the fence" indistinguishable from "there is no
+   * fence" — so a failed read rendered to the user as a definite absence, and the
+   * recovery narrated a state nobody had observed. Since this is the ONLY window
+   * onto the stamp, the distinction has to survive here or it is lost for good.
+   *
+   *  - `{ known: true, uuid }` — this tab IS fenced, by this uuid.
+   *  - `{ known: true }`       — this tab is definitively NOT fenced (no resolver
+   *                              value: an old panel, or an identity regression
+   *                              cleared it).
+   *  - `{ known: false }`      — the read itself failed; nothing is known.
    *
    * Never throws: the resolver is orchestrator-supplied, and a guard that can
    * throw is not a guard.
    */
-  workflowUuidFor(tabId: string): string | undefined {
+  workflowUuidFor(tabId: string): TabWorkflowUuidRead {
+    if (!this.resolveTabWorkflowUuid) {
+      // No resolver injected at all — the stamp mechanism is not wired in this
+      // process. That is a genuine "cannot know", not proof of an absent fence.
+      return { known: false, reason: "no workflow-uuid resolver is installed on this bridge" };
+    }
     try {
-      const uuid = this.resolveTabWorkflowUuid?.(tabId);
-      return typeof uuid === "string" && uuid.length > 0 ? uuid : undefined;
-    } catch {
-      return undefined;
+      const uuid = this.resolveTabWorkflowUuid(tabId);
+      return { known: true, uuid: typeof uuid === "string" && uuid.length > 0 ? uuid : undefined };
+    } catch (err) {
+      return {
+        known: false,
+        reason: err instanceof Error ? err.message : String(err ?? "unknown error"),
+      };
     }
   }
 

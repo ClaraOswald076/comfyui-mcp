@@ -2125,8 +2125,19 @@ function currentWorkflowFence(ctx: PanelToolCtx): FenceRead {
   const read = (ctx.bridge as unknown as { workflowUuidFor?: unknown }).workflowUuidFor;
   if (typeof read !== "function") return { known: false };
   try {
-    const uuid = read.call(ctx.bridge, ctx.tabId) as unknown;
-    return { known: true, uuid: typeof uuid === "string" && uuid.length > 0 ? uuid : undefined };
+    const out = read.call(ctx.bridge, ctx.tabId) as unknown;
+    // The bridge answers TRI-STATE (TabWorkflowUuidRead). Preserve it: swallowing
+    // its `known:false` back into an absent fence here would undo the whole point,
+    // since the bridge is the only thing that can see the stamp.
+    if (out && typeof out === "object" && "known" in out) {
+      const r = out as { known: unknown; uuid?: unknown };
+      if (r.known !== true) return { known: false };
+      return { known: true, uuid: typeof r.uuid === "string" && r.uuid.length > 0 ? r.uuid : undefined };
+    }
+    // A lightweight/legacy stub that still returns a bare string|undefined: a
+    // string is a fence; anything else is NOT evidence of absence, only of a
+    // shape we cannot interpret.
+    return typeof out === "string" && out.length > 0 ? { known: true, uuid: out } : { known: false };
   } catch {
     return { known: false };
   }
@@ -2176,8 +2187,14 @@ export type WorkflowFenceRebind =
   /** The panel answered, but its active canvas exposes no usable workflow uuid. */
   | { status: "no_identity"; before: FenceRead }
   /** A live identity was read, but the bridge declined to adopt it (the tab stopped
-   *  being reachable, or the uuid failed the orchestrator's shape/origin check). */
-  | { status: "rejected"; uuid: string; before: FenceRead };
+   *  being reachable, or the uuid failed the orchestrator's shape/origin check).
+   *  A clean `false` — nothing was written. */
+  | { status: "rejected"; uuid: string; before: FenceRead }
+  /** The adoption itself THREW. Distinct from `rejected` (codex gate): a refusal
+   *  proves the old fence is untouched, whereas a throw can land on either side
+   *  of the write, so whether the fence changed is UNKNOWN and must not be
+   *  described either way. */
+  | { status: "adopt_error"; uuid: string; before: FenceRead; detail: string };
 
 /**
  * Re-derive this session's command fence from the panel's live active canvas.
@@ -2185,15 +2202,27 @@ export type WorkflowFenceRebind =
  * the caller — not this function — decides what that means for its own report.
  */
 async function rebindWorkflowFence(ctx: PanelToolCtx): Promise<WorkflowFenceRebind> {
-  const before = currentWorkflowFence(ctx);
+  const tabAtStart = ctx.tabId;
+  let before = currentWorkflowFence(ctx);
+  // `before` describes the tab we are ABOUT to compare against — but ctx.call can
+  // MOVE us (workflow_list is retry-safe; its retry runs ensureReachable, which
+  // rebinds an orphaned current-mode session). Re-read after any move, or we would
+  // compare the NEW tab's live canvas against the OLD tab's fence: an accidental
+  // `already_current` would then skip a refresh the new tab genuinely needed, and
+  // report a recovered binding that is still wedged (codex gate).
+  const syncFenceToCurrentTab = (): void => {
+    if (ctx.tabId !== tabAtStart) before = currentWorkflowFence(ctx);
+  };
   let parsed: Record<string, unknown> | null = null;
   try {
     const res = await ctx.call({ cmd: "workflow_list" }, 6000);
+    syncFenceToCurrentTab();
     if (res?.isError) {
       return { status: "unreadable", before, detail: toolResultText(res) };
     }
     parsed = parseToolResultJson(res);
   } catch (err) {
+    syncFenceToCurrentTab();
     return {
       status: "unreadable",
       before,
@@ -2218,9 +2247,26 @@ async function rebindWorkflowFence(ctx: PanelToolCtx): Promise<WorkflowFenceRebi
   // re-checks reachability and the uuid's shape/origin binding. A `false` here is
   // a REFUSAL, not a no-op, so it gets its own status rather than being reported
   // as a successful rebind.
-  return refreshWorkflowUuid(ctx, active)
-    ? { status: "refreshed", uuid, before }
-    : { status: "rejected", uuid, before };
+  // The adoption is itself an operation that can fail — the bridge hands the value
+  // to an orchestrator-supplied validator that reads live connection state. A
+  // throw here would escape this whole handler AFTER the target store write and
+  // push, taking the "APPLIED (do not repeat this part)" disclosure with it and
+  // leaving the caller unable to tell what happened (rules 3 and 4). Catch it, and
+  // do NOT claim the fence is unchanged: a throw can land on either side of the
+  // write, so `rejected`'s "the previous fence is unchanged" would be a state
+  // nobody observed.
+  try {
+    return refreshWorkflowUuid(ctx, active)
+      ? { status: "refreshed", uuid, before }
+      : { status: "rejected", uuid, before };
+  } catch (err) {
+    return {
+      status: "adopt_error",
+      uuid,
+      before,
+      detail: err instanceof Error ? err.message : String(err ?? "unknown error"),
+    };
+  }
 }
 
 /**
@@ -2325,8 +2371,23 @@ function describeFenceRebind(
         note:
           ` Read the live canvas identity (${r.uuid}) but could NOT adopt it as this session's ` +
           `graph command fence — the bound tab stopped being reachable, or the panel reported an ` +
-          `identity this orchestrator does not trust. The previous fence is unchanged, so graph ` +
-          `tools will keep failing.\n\nWHAT TO DO: ${RELOAD_TAB_REMEDY}`,
+          `identity this orchestrator does not trust. The adoption was REFUSED, so the previous ` +
+          `fence is unchanged and graph tools will keep failing.` +
+          `\n\nWHAT TO DO: ${RELOAD_TAB_REMEDY}`,
+      };
+    case "adopt_error":
+      return {
+        binding: "not_recovered",
+        note:
+          ` Read the live canvas identity (${r.uuid}), but adopting it as this session's graph ` +
+          `command fence THREW. Unlike a refusal, this does not tell us the previous fence ` +
+          `survived: the failure can have landed on either side of the write, so whether the ` +
+          `fence changed is UNKNOWN. Do not assume either way — the next graph command's ` +
+          `outcome is the reliable answer, and it is safe to find out (a mismatched fence is ` +
+          `refused, never misapplied).` +
+          `\n\nWHAT TO DO: call this again — a second attempt is safe and settles it. If it ` +
+          `keeps throwing: ${RELOAD_TAB_REMEDY}` +
+          `\n\nUNDERLYING CAUSE: ${r.detail}`,
       };
     case "unreadable":
       // ALWAYS not_recovered, with or without a prior fence (codex gate). The read
@@ -7037,6 +7098,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             const onNewTab = ctx.workflowTarget.get(ctx.tabId);
             if (onNewTab?.mode === "pinned") {
               const pinLabel = onNewTab.filename ?? onNewTab.path;
+              // Report the fence outcome from the actual status, never as a flat
+              // "it was refreshed" (codex gate): the probe that moved us may also
+              // have come back unreadable, identity-less, refused, or already
+              // matching, and only one of those is a refresh.
+              const fenceLine =
+                fenceRebind.status === "refreshed"
+                  ? `The graph command fence WAS refreshed onto this tab's live canvas (workflow instance ${fenceRebind.uuid}), which is correct for it either way.`
+                  : fenceRebind.status === "already_current"
+                    ? `The graph command fence already named this tab's live canvas, so it needed no change.`
+                    : `The graph command fence was NOT established on this tab (${fenceRebind.status}) — so graph tools may also fail here with a workflow-instance mismatch, independently of the pin below.`;
               return fail(
                 `panel_set_workflow_target({mode:"current"}) did NOT take effect on the tab this ` +
                   `session is now bound to.\n\nWHAT HAPPENED: the panel dropped mid-call, so this ` +
@@ -7044,14 +7115,14 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                   `request was in flight. Your mode:"current" was recorded against the PREVIOUS ` +
                   `tab. The tab you are on now is PINNED to "${pinLabel}", and that pin was left ` +
                   `untouched — the workflow-target store is shared, so another session may own ` +
-                  `it. The graph command fence WAS refreshed onto this tab's live canvas, which ` +
-                  `is correct for it either way.\n\nWHAT TO DO — read this before retrying: graph ` +
-                  `tools will currently target "${pinLabel}". If that is what you want, proceed ` +
-                  `normally; nothing else is needed. If you need to follow the tab the user is ` +
-                  `viewing instead, calling panel_set_workflow_target({mode:"current"}) again ` +
-                  `WILL REPLACE that pin — do that only if the pin is yours. If it is not, or ` +
-                  `you cannot tell, ask the user which workflow they want this session on rather ` +
-                  `than overwriting another session's binding.`,
+                  `it. ${fenceLine}\n\nWHAT TO DO — read this before retrying: graph tools will ` +
+                  `currently target "${pinLabel}". If that is what you want, try one graph call ` +
+                  `and let its outcome tell you whether the binding is usable. If you need to ` +
+                  `follow the tab the user is viewing instead, calling ` +
+                  `panel_set_workflow_target({mode:"current"}) again WILL REPLACE that pin — do ` +
+                  `that only if the pin is yours. If it is not, or you cannot tell, ask the user ` +
+                  `which workflow they want this session on rather than overwriting another ` +
+                  `session's binding.`,
               );
             }
             // Nothing to take away — re-apply the caller's request where it now counts.
