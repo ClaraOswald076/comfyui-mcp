@@ -45,7 +45,7 @@ The user wants to install a ComfyUI custom node pack from the registry or a GitH
 
 7. **Restart ComfyUI.** Tell the user that new nodes require a restart to be loaded. Offer to call `restart_comfyui` to restart automatically.
 
-8. **Generate a skill file (optional).** Ask the user if they'd like to generate a Claude Code skill for the new pack. If yes, call `generate_node_skill` with the pack source to create a skill file that helps Claude understand the new nodes.
+8. **Generate a skill file (optional).** Ask the user if they'd like to generate a Claude Code skill for the new pack. If yes, call `list_packs` with `action: "generate_skill"` and the pack source to create a skill file that helps Claude understand the new nodes.
 
 ## Example
 

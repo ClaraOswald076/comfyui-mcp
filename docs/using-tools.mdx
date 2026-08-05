@@ -27,7 +27,7 @@ A **tool** is a specific, named action we hand the model so it can actually reac
 | "Make me a red fox in the snow" | `generate_image` |
 | "Is it done yet?" | `queue` (the `list` job) |
 | "That failed and I don't understand why" | `diagnose_run` |
-| "Half the nodes are red" | `install_workflow_dependencies` |
+| "Half the nodes are red" | `list_packs` (the `install_deps` job) |
 | "I'm out of disk space, what's big?" | `list_local_models` |
 
 Notice the second row: one sentence, two tools, in an order you did not have to know. That is the point of the whole arrangement. You are not expected to know that finding a file and reading a file are separate operations.
@@ -124,6 +124,7 @@ What actually happened is that related tools were **merged**, not deleted:
 | `get_workspace` | `workspace` with `action: "get"` |
 | `get_queue` | `queue` with `action: "list"` |
 | `apps_run_status` | `apps` with `action: "run_status"` |
+| `install_workflow_dependencies` | `list_packs` with `action: "install_deps"` |
 
 Same code underneath, same behaviour, same answers. Only the label on the front changed.
 

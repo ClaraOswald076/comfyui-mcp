@@ -158,8 +158,7 @@ const CATEGORIES: Array<{
       "search_custom_nodes", "get_node_pack_details", "install_custom_node",
       "update_custom_node", "reinstall_custom_node", "fix_custom_node",
       "disable_custom_node", "enable_custom_node", "uninstall_custom_node",
-      "list_installed_nodes", "sync_node_dependencies", "extract_workflow_dependencies",
-      "install_workflow_dependencies", "node_snapshot", "bisect",
+      "list_installed_nodes", "sync_node_dependencies", "node_snapshot", "bisect",
       "scaffold_custom_node", "verify_custom_node", "publish_custom_node",
       "list_node_pack_files", "read_node_file", "search_node_packs", "write_node_file",
       "apply_node_patch", "node_pack_git",
@@ -197,7 +196,7 @@ const CATEGORIES: Array<{
     description: "Generation defaults, ComfyUI frontend UI settings, history-based suggestions, and skill generation.",
     tools: [
       "get_defaults",
-      "suggest_settings", "generation_stats", "generate_node_skill",
+      "suggest_settings", "generation_stats",
     ],
   },
   {
@@ -249,14 +248,9 @@ const CATEGORIES: Array<{
 const HAND_WRITTEN_PAGES: Array<{ slug: string; tools: string[] }> = [
   {
     slug: "skills-knowledge",
-    tools: [
-      "list_skills",
-      "read_skill",
-      "list_packs",
-      "read_pack_workflow",
-      "list_workflow_templates",
-      "check_workflow_runtime",
-    ],
+    // One tool since 0.50.0 slice 9: the nine knowledge tools folded into
+    // `list_packs`, whose nine actions this page documents by hand.
+    tools: ["list_packs"],
   },
 ];
 

@@ -120,7 +120,7 @@ async function loadTemplateApiGraph(wfFile: string): Promise<WorkflowJSON> {
 export function registerRunTemplateTools(server: McpServer): void {
   server.tool(
     "run_template",
-    "ONE-SHOT: run a named workflow template (a bundled pack from list_packs) with optional overrides. Resolves the template's expert graph, applies overrides, and enqueues it — replacing the manual read_pack_workflow → modify_workflow → enqueue_workflow chain. Override keys are '<nodeId>.<widget_name>' (e.g. {'6.text': 'a cat', '3.seed': 42}) — the SAME keys the companion get_template_schema tool reports (when available), so schema→run round-trips; only widget values can be overridden, never graph connections. By default returns {prompt_id} immediately; pass wait:true to block until the job completes and return its outputs (images etc.). Unresolvable template names return a clear error with near-matches.",
+    "ONE-SHOT: run a named workflow template (a bundled pack from list_packs) with optional overrides. Resolves the template's expert graph, applies overrides, and enqueues it — replacing the manual list_packs (action:\"read_workflow\") → modify_workflow → enqueue_workflow chain. Override keys are '<nodeId>.<widget_name>' (e.g. {'6.text': 'a cat', '3.seed': 42}) — the SAME keys the companion get_template_schema tool reports (when available), so schema→run round-trips; only widget values can be overridden, never graph connections. By default returns {prompt_id} immediately; pass wait:true to block until the job completes and return its outputs (images etc.). Unresolvable template names return a clear error with near-matches.",
     {
       template: z
         .string()
@@ -148,7 +148,7 @@ export function registerRunTemplateTools(server: McpServer): void {
     },
     async (args) => {
       try {
-        // 1. Resolve the template (same resolution as read_pack_workflow).
+        // 1. Resolve the template (same resolution as list_packs action:"read_workflow").
         const wfFile = resolvePackWorkflowFile(args.template);
         if (!wfFile) {
           const known = enumeratePacks()

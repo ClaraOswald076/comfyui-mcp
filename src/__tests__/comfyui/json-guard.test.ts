@@ -4,7 +4,7 @@
 //     Unexpected token '<', "<!DOCTYPE "... is not valid JSON
 //
 // which names neither the URL, the status, nor what actually answered — and sent
-// check_workflow_runtime into reporting "could not reach the ComfyUI server" for
+// the runtime check into reporting "could not reach the ComfyUI server" for
 // a server that answered perfectly well.
 //
 // The fix is to DETECT and SAY WHICH. These tests pin the classification (proxy

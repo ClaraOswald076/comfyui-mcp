@@ -102,7 +102,7 @@ whom, from what angle — which text prompting has never done reliably.
 | **Kling 2.6 Motion Control** | Simplest API path: character image + motion video (3–30s) → identity-locked transfer, 4-node graph | **Paid** API node — third restyle leg alongside Seedance/Wan |
 | **Self-filmed video** | A phone clip of the user performing IS a previz for single-character shots (community default); filming rules: full body, locked tripod, no cuts, even light | Free — the skill should accept it as a first-class motion source |
 | **Seedance 2.0 R2V** | ≤3 reference videos (≤15.1s total) + ≤9 reference images + ≤3 audio, `@Video1`/`@Image1` role-tagged prompts; follows choreography + camera; 4–15s out (sweet spot 6–8s) | **Paid** API node (`ByteDance2ReferenceNode`, ~$0.66 / 5s @ 720p; Mini ~$0.32); Seedance 2.5 exists (30s native) but has no Comfy nodes yet |
-| **Already in this repo** | `director` skill (story→scenes→clips), packs system, `upload_video`/`stage_output_as_input` I/O, `list_api_nodes` (actions `list`/`schema`/`generate`), `check_workflow_runtime` ask-before-spend | Shipped |
+| **Already in this repo** | `director` skill (story→scenes→clips), packs system, `upload_video`/`stage_output_as_input` I/O, `list_api_nodes` (actions `list`/`schema`/`generate`), `list_packs` action:"check_runtime" ask-before-spend | Shipped |
 
 ## Architecture — who talks to whom
 
@@ -213,7 +213,7 @@ recipes reliably. Prior art either way:
   hops. It's the ComfyUI half of the character loop, already panel-built.
 - **Meshy + Seedance guidance** — no pack needed (they're core API nodes);
   the skill documents the built-in templates and wraps both in the
-  `check_workflow_runtime` / ask-before-spending convention. Free alternates
+  `list_packs` action:"check_runtime" / ask-before-spending convention. Free alternates
   (Trellis/Hunyuan3D for assets, Wan Animate for video) are always named
   first.
 - **3D-asset file awareness** — extend the existing output-folder awareness
@@ -247,7 +247,7 @@ skill. H2 is manifest-writing. Only H3 touches the orchestrator.
 
 Two of the pieces are paid (Meshy, Seedance — Comfy credits billed to the
 user's Comfy account). Existing convention applies unchanged: the agent calls
-`check_workflow_runtime`, treats `api`/`mixed` as possibly-paid, and **asks
+`list_packs` with `action: "check_runtime"`, treats `api`/`mixed` as possibly-paid, and **asks
 before spending credits — never silently**. Every paid step has a named free
 alternative (local img2mesh; Wan Animate), and the skill presents the free
 path as the default. Blender MCP is local and free; its `execute_python` is
@@ -344,6 +344,7 @@ shop, Mixamo auto-rigs its output, Blender is the stage Claude can fully see and
 - **H4 — Director × previz.** Shot lists drive previz scenes; multi-shot cast/set continuity; style
   sweeps (one previz, N looks) as a first-class op.
 
-> Paid pieces (Meshy, Seedance) stay behind the existing `check_workflow_runtime` /
+> Paid pieces (Meshy, Seedance) stay behind the existing `list_packs`
+> `action: "check_runtime"` /
 > ask-before-spending convention; every paid step has a named free alternative.
 

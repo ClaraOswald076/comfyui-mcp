@@ -1,0 +1,510 @@
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DEAD_NAMES, TOOL_NAMES } from "../../tools/vocabulary.js";
+
+/**
+ * The consolidated `list_packs` tool (0.50.0 slice 9): the nine knowledge tools
+ * folded into one action-parameterized tool. Proves the consolidation did not
+ * change behaviour — every action calls the identical service the old tool
+ * called, with the same arguments and the same content block — and that the
+ * flat-enum shape actually EXPOSES its parameters (the discriminated-union trap
+ * renders zero params).
+ *
+ * The one thing this tool has that `queue` did not: EIGHT read actions and ONE
+ * that installs custom node packs (third-party code) on the connected ComfyUI.
+ * A read-only-looking tool that silently installs is a wrong-expectation defect,
+ * so "no read action reaches the install service" is asserted explicitly rather
+ * than left to the shape of the switch.
+ */
+
+const mocks = vi.hoisted(() => ({
+  extractWorkflowDependencies: vi.fn(),
+  installWorkflowDependencies: vi.fn(),
+  generateSkillCached: vi.fn(),
+  checkWorkflowRuntime: vi.fn(),
+}));
+
+vi.mock("../../services/workflow-deps.js", () => ({
+  extractWorkflowDependencies: (...args: unknown[]) => mocks.extractWorkflowDependencies(...args),
+  installWorkflowDependencies: (...args: unknown[]) => mocks.installWorkflowDependencies(...args),
+  defaultWorkflowDepsDeps: () => ({ deps: "sentinel" }),
+}));
+
+vi.mock("../../services/skill-cache.js", () => ({
+  generateSkillCached: (...args: unknown[]) => mocks.generateSkillCached(...args),
+}));
+
+vi.mock("../../services/api-nodes.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../services/api-nodes.js")>();
+  return {
+    ...actual,
+    checkWorkflowRuntime: (...args: unknown[]) => mocks.checkWorkflowRuntime(...args),
+  };
+});
+
+vi.mock("../../config.js", () => ({
+  getComfyUIBaseUrl: () => "http://comfy.test:8188",
+  getComfyUIAuthHeaders: () => ({}),
+}));
+
+import { registerSkillsAccessTools } from "../../tools/skills-access.js";
+
+type Handler = (args: Record<string, any>) => Promise<{
+  isError?: boolean;
+  content: Array<{ type: string; text: string }>;
+  structuredContent?: Record<string, unknown>;
+}>;
+
+interface Registered {
+  name: string;
+  shape: z.ZodRawShape;
+  handler: Handler;
+}
+
+function registered(): Registered[] {
+  const tools: Registered[] = [];
+  const server = {
+    tool: (name: string, _desc: string, shape: z.ZodRawShape, handler: Handler) => {
+      tools.push({ name, shape, handler });
+    },
+  };
+  registerSkillsAccessTools(server as never);
+  return tools;
+}
+
+/** The whole knowledge surface is now ONE tool (0.50.0 slice 9). */
+function handler(): Handler {
+  const tools = registered();
+  expect(tools).toHaveLength(1);
+  expect(tools[0].name).toBe("list_packs");
+  return tools[0].handler;
+}
+
+const text = (res: Awaited<ReturnType<Handler>>) => res.content.map((c) => c.text).join(" ");
+
+const ACTIONS = [
+  "list",
+  "read_workflow",
+  "list_templates",
+  "check_runtime",
+  "extract_deps",
+  "install_deps",
+  "skill_list",
+  "skill_read",
+  "generate_skill",
+] as const;
+
+const savedFetch = global.fetch;
+
+beforeEach(() => {
+  for (const mock of Object.values(mocks)) mock.mockReset();
+  // Every action that touches the network gets a healthy default so a test
+  // about SOMETHING ELSE never accidentally exercises an error path.
+  global.fetch = vi.fn(
+    async () =>
+      new Response('{"pack-a":[{"name":"t1"}]}', {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+  ) as unknown as typeof fetch;
+});
+
+afterAll(() => {
+  global.fetch = savedFetch;
+});
+
+describe("list_packs registration", () => {
+  it("registers exactly one tool named `list_packs` (9→1)", () => {
+    const tools = registered();
+    expect(tools).toHaveLength(1);
+    expect(tools[0].name).toBe("list_packs");
+  });
+
+  // The whole reason for the flat-enum shape rule: a z.discriminatedUnion renders
+  // as ZERO parameters, hiding every input from the model.
+  it("exposes a visible flat `action` enum with every per-action parameter", () => {
+    const [{ shape }] = registered();
+    // io: "input" — the conversion options the MCP SDK itself uses
+    // (sdk/server/zod-json-schema-compat.js, asserted by docs-schema-parity.test.ts),
+    // so this is the schema a client is actually given.
+    const json = z.toJSONSchema(z.object(shape), { reused: "inline", io: "input" }) as {
+      properties?: Record<string, { enum?: string[] }>;
+      required?: string[];
+    };
+    expect(Object.keys(json.properties ?? {}).sort()).toEqual([
+      "action",
+      "graph",
+      "install_in",
+      "name",
+      "pack",
+      "refresh",
+      "source",
+      "workflow",
+    ]);
+    expect(json.properties?.action.enum?.slice().sort()).toEqual([...ACTIONS].sort());
+    // Only `action` can be required — the rest are per-action, enforced in the handler.
+    expect(json.required).toEqual(["action"]);
+  });
+
+  it("an unknown action returns a clear error result naming the valid actions", async () => {
+    const res = await handler()({ action: "bogus" });
+    expect(res.isError).toBe(true);
+    expect(text(res)).toMatch(/unknown list_packs action/i);
+    expect(text(res)).toMatch(/install_deps/);
+    expect(text(res)).toMatch(/skill_read/);
+  });
+
+  // The description is the ONLY thing standing between a model and an unexpected
+  // write: seven actions read, one installs third-party code, and one overwrites
+  // a file when `install_in` is given. A reworded description that drops either
+  // warning re-opens exactly that wrong expectation — and a note that UNDERCOUNTS
+  // the mutations (the first draft of this said "eight of nine only read") is the
+  // same defect wearing a safety label, so both are pinned.
+  it("the description discloses BOTH mutating actions, and undercounts neither", () => {
+    let description = "";
+    registerSkillsAccessTools({
+      tool: (_n: string, d: string) => {
+        description = d;
+      },
+    } as never);
+    const bullet = (action: string) =>
+      description.split(/\r?\n/).find((l) => l.startsWith(`- action:"${action}"`)) ?? "";
+
+    // Asserted as the CLAIM, not as two independent keywords: the rejected
+    // wording ("the ONE action on this tool that CHANGES the user's machine")
+    // also contains MUTATING and INSTALL, so a keyword check would pass a revert
+    // to the very sentence that contradicts generate_skill's disk writes.
+    const install = bullet("install_deps");
+    expect(install).toContain("MUTATING");
+    expect(install).toMatch(/the ONE action on this tool that INSTALLS anything/);
+    expect(install).not.toMatch(/ONE action on this tool that CHANGES/);
+
+    // generate_skill writes TWICE over: its read-through cache on every miss
+    // (unconditional, in the user's home), and the caller's `install_in`
+    // directory when given. An earlier draft said "read-only otherwise", which
+    // the cache write makes false — so both writes are pinned, not just the
+    // conditional one.
+    //
+    // Both halves are asserted as the WRITE claim, not by keyword: the bullet
+    // also explains the cache mechanically ("On cache miss, fetches the repo
+    // README…"), so a bare /cache miss/ match passes even with the mutation
+    // warning deleted — which is how the first version of this assertion
+    // survived exactly that deletion.
+    const generate = bullet("generate_skill");
+    expect(generate).toContain("MUTATING");
+    expect(generate).toMatch(/WRITES to the read-through skill cache/);
+    expect(generate).toMatch(/`install_in` is set it ALSO creates/);
+    expect(generate).toMatch(/overwrit/i);
+
+    // ...and the action enum's own help repeats it, because a model that skims
+    // the bullets still reads the enum description. Asserted as a RELATIONSHIP
+    // ("generate_skill … WRITES … install_in") rather than the bare presence of
+    // the words: `install_deps` and `install_in` both appeared in the rejected
+    // wording that claimed install_deps was the only mutating action, so
+    // presence alone would pass a reverted description.
+    const actionDesc = String(
+      (registered()[0].shape.action as unknown as { description?: string }).description ?? "",
+    );
+    expect(actionDesc).toContain("INSTALLS");
+    expect(actionDesc).toMatch(/"generate_skill" also WRITES to disk[^.]*install_in/);
+    // The rejected claim must not come back.
+    expect(actionDesc).not.toMatch(/only mutating action/i);
+  });
+});
+
+describe("actions call the same services with the same arguments", () => {
+  it('action:"list" returns the pack listing with its local-GPU note', async () => {
+    const res = await handler()({ action: "list" });
+    const parsed = JSON.parse(text(res));
+    expect(typeof parsed.count).toBe("number");
+    expect(Array.isArray(parsed.packs)).toBe(true);
+    expect(parsed.note).toContain("LOCAL-GPU / FREE");
+  });
+
+  it('action:"skill_list" returns the bundled skill listing', async () => {
+    const res = await handler()({ action: "skill_list" });
+    const parsed = JSON.parse(text(res));
+    expect(typeof parsed.count).toBe("number");
+    expect(Array.isArray(parsed.skills)).toBe(true);
+  });
+
+  it('action:"read_workflow" resolves by pack name and reports an unknown one', async () => {
+    const res = await handler()({ action: "read_workflow", name: "definitely-not-a-pack" });
+    expect(res.isError).toBe(true);
+    expect(text(res)).toContain('No pack named "definitely-not-a-pack"');
+  });
+
+  it('action:"skill_read" resolves by skill name and reports an unknown one', async () => {
+    const res = await handler()({ action: "skill_read", name: "definitely-not-a-skill" });
+    expect(res.isError).toBe(true);
+    expect(text(res)).toContain('No skill named "definitely-not-a-skill"');
+  });
+
+  it('action:"list_templates" reads the connected server\'s template index', async () => {
+    const res = await handler()({ action: "list_templates" });
+    expect(global.fetch).toHaveBeenCalledWith(
+      "http://comfy.test:8188/api/workflow_templates",
+      expect.anything(),
+    );
+    const parsed = JSON.parse(text(res));
+    expect(parsed.source_count).toBe(1);
+    expect(parsed.template_count).toBe(1);
+  });
+
+  it('action:"check_runtime" classifies the given graph and adds the guidance line', async () => {
+    mocks.checkWorkflowRuntime.mockResolvedValueOnce({
+      runtime: "api",
+      usesApiNodes: true,
+      apiNodes: ["SomeApiNode"],
+      unknownNodes: [],
+    });
+    const graph = { "1": { class_type: "SomeApiNode", inputs: {} } };
+    const res = await handler()({ action: "check_runtime", graph });
+    expect(mocks.checkWorkflowRuntime).toHaveBeenCalledWith(graph, undefined, {
+      bundledLocalPack: false,
+    });
+    const parsed = JSON.parse(text(res));
+    expect(parsed.runtime).toBe("api");
+    expect(parsed.guidance).toContain("PAID api credits");
+  });
+
+  it('action:"check_runtime" with neither pack nor graph keeps the old "provide either" error', async () => {
+    const res = await handler()({ action: "check_runtime" });
+    expect(res.isError).toBe(true);
+    expect(text(res)).toContain("Provide either `pack`");
+    expect(mocks.checkWorkflowRuntime).not.toHaveBeenCalled();
+  });
+
+  it('action:"extract_deps" passes the parsed workflow + deps and renders the report', async () => {
+    mocks.extractWorkflowDependencies.mockResolvedValueOnce({
+      classTypes: ["KSampler", "ImpactNode"],
+      requiredPacks: ["impact-pack"],
+      missingPacks: ["impact-pack"],
+      unresolved: [],
+      dependencies: [{ class_type: "ImpactNode", pack: "impact-pack", installed: false }],
+    });
+    const workflow = { "1": { class_type: "ImpactNode", inputs: {} } };
+    const res = await handler()({ action: "extract_deps", workflow });
+    expect(mocks.extractWorkflowDependencies).toHaveBeenCalledWith(workflow, { deps: "sentinel" });
+    expect(text(res)).toContain("## Workflow dependencies (2 node type(s))");
+    expect(text(res)).toContain("**NOT INSTALLED**");
+    // The remediation pointer must name the LIVE call, not the retired tool.
+    expect(text(res)).toContain('list_packs (action:"install_deps")');
+    expect(mocks.installWorkflowDependencies).not.toHaveBeenCalled();
+  });
+
+  it('action:"extract_deps" accepts a JSON STRING workflow, as the old tool did', async () => {
+    mocks.extractWorkflowDependencies.mockResolvedValueOnce({
+      classTypes: [],
+      requiredPacks: [],
+      missingPacks: [],
+      unresolved: [],
+      dependencies: [],
+    });
+    await handler()({ action: "extract_deps", workflow: '{"1":{"class_type":"KSampler"}}' });
+    expect(mocks.extractWorkflowDependencies).toHaveBeenCalledWith(
+      { "1": { class_type: "KSampler" } },
+      { deps: "sentinel" },
+    );
+  });
+
+  it('action:"install_deps" passes the parsed workflow + deps and renders the install report', async () => {
+    mocks.installWorkflowDependencies.mockResolvedValueOnce({
+      installed: ["impact-pack"],
+      alreadyInstalled: [],
+      unresolved: [],
+      queue: { total_count: 1, done_count: 0, in_progress_count: 1, is_processing: true },
+    });
+    const workflow = { "1": { class_type: "ImpactNode", inputs: {} } };
+    const res = await handler()({ action: "install_deps", workflow });
+    expect(mocks.installWorkflowDependencies).toHaveBeenCalledWith(workflow, { deps: "sentinel" });
+    expect(text(res)).toContain("## Queued 1 node pack(s) for install");
+    expect(text(res)).toContain("### Manager queue status");
+  });
+
+  it('action:"generate_skill" forwards source + refresh and keeps structuredContent', async () => {
+    mocks.generateSkillCached.mockResolvedValueOnce({
+      markdown: "# SKILL",
+      cacheHit: true,
+      safeKey: "k",
+      cacheDir: "/cache",
+      metadata: { version: "1.2.3" },
+    });
+    const res = await handler()({
+      action: "generate_skill",
+      source: "comfyui-impact-pack",
+      refresh: true,
+    });
+    expect(mocks.generateSkillCached).toHaveBeenCalledWith("comfyui-impact-pack", {
+      refresh: true,
+    });
+    expect(text(res)).toBe("# SKILL");
+    // The return SHAPE is part of the contract the retired tool had.
+    expect(res.structuredContent).toEqual({
+      cache_hit: true,
+      cache_key: "k",
+      cache_dir: "/cache",
+      version: "1.2.3",
+    });
+  });
+
+  it('action:"generate_skill" still writes SKILL.md when install_in is given', async () => {
+    mocks.generateSkillCached.mockResolvedValueOnce({
+      markdown: "# WRITTEN",
+      cacheHit: false,
+      safeKey: "k",
+      cacheDir: "/cache",
+      metadata: { version: "9" },
+    });
+    const dir = await mkdtemp(join(tmpdir(), "comfyui-mcp-skillgen-"));
+    try {
+      const res = await handler()({
+        action: "generate_skill",
+        source: "x",
+        install_in: join(dir, "nested"),
+      });
+      expect(await readFile(join(dir, "nested", "SKILL.md"), "utf8")).toBe("# WRITTEN");
+      expect(text(res)).toContain("Skill file written to");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * THE MUTATION BOUNDARY. `list_packs` reads like a listing tool; one of its nine
+ * actions installs third-party code. Nothing but that action may reach it.
+ */
+describe("only action:\"install_deps\" can reach the install service", () => {
+  it("no other action calls installWorkflowDependencies, whatever else it is passed", async () => {
+    // Every action is driven with a FULL argument bag, so an action that
+    // mistakenly fell through to the install branch would have the workflow it
+    // needs to succeed rather than failing on a missing field.
+    mocks.checkWorkflowRuntime.mockResolvedValue({
+      runtime: "local",
+      usesApiNodes: false,
+      apiNodes: [],
+      unknownNodes: [],
+    });
+    mocks.extractWorkflowDependencies.mockResolvedValue({
+      classTypes: [],
+      requiredPacks: [],
+      missingPacks: [],
+      unresolved: [],
+      dependencies: [],
+    });
+    mocks.generateSkillCached.mockResolvedValue({
+      markdown: "#",
+      cacheHit: true,
+      safeKey: "k",
+      cacheDir: "/c",
+      metadata: { version: "1" },
+    });
+    for (const action of ACTIONS.filter((a) => a !== "install_deps")) {
+      await handler()({
+        action,
+        name: "krea2-txt2img",
+        pack: "krea2-txt2img",
+        graph: { "1": { class_type: "KSampler", inputs: {} } },
+        workflow: { "1": { class_type: "KSampler", inputs: {} } },
+        source: "comfyui-impact-pack",
+      });
+      expect(
+        mocks.installWorkflowDependencies,
+        `action:"${action}" must not reach the install service`,
+      ).not.toHaveBeenCalled();
+    }
+  });
+});
+
+describe("per-action presence guards (the flat shape cannot schema-require these)", () => {
+  it("read_workflow/skill_read without a name name the field and call nothing", async () => {
+    for (const action of ["read_workflow", "skill_read"]) {
+      const res = await handler()({ action });
+      expect(res.isError).toBe(true);
+      expect(text(res)).toContain(`list_packs action:"${action}" requires \`name\``);
+    }
+    for (const mock of Object.values(mocks)) expect(mock).not.toHaveBeenCalled();
+  });
+
+  it("extract_deps/install_deps without a workflow name the field and call nothing", async () => {
+    for (const action of ["extract_deps", "install_deps"]) {
+      const res = await handler()({ action });
+      expect(res.isError).toBe(true);
+      expect(text(res)).toContain(`list_packs action:"${action}" requires \`workflow\``);
+    }
+    expect(mocks.extractWorkflowDependencies).not.toHaveBeenCalled();
+    expect(mocks.installWorkflowDependencies).not.toHaveBeenCalled();
+  });
+
+  it('action:"generate_skill" without a source names the field and calls nothing', async () => {
+    const res = await handler()({ action: "generate_skill" });
+    expect(res.isError).toBe(true);
+    expect(text(res)).toContain('list_packs action:"generate_skill" requires `source`');
+    expect(mocks.generateSkillCached).not.toHaveBeenCalled();
+  });
+
+  // The guards test ABSENCE, not falsiness. `source: ""` passed z.string() before
+  // this consolidation and reached generateSkillCached, and `workflow: ""` passed
+  // the union and reached the parser, which answers with its own ValidationError.
+  // A `!x` guard would swallow both and substitute generic text.
+  it("an explicitly empty source still reaches the service, as before", async () => {
+    mocks.generateSkillCached.mockResolvedValueOnce({
+      markdown: "#",
+      cacheHit: false,
+      safeKey: "k",
+      cacheDir: "/c",
+      metadata: { version: "1" },
+    });
+    await handler()({ action: "generate_skill", source: "" });
+    expect(mocks.generateSkillCached).toHaveBeenCalledWith("", { refresh: undefined });
+  });
+
+  it("an explicitly empty workflow still reaches the parser's own error, as before", async () => {
+    const res = await handler()({ action: "extract_deps", workflow: "" });
+    expect(res.isError).toBe(true);
+    // The service's/parser's own validation error, NOT the presence guard's text.
+    expect(text(res)).toContain("Invalid JSON string");
+    expect(text(res)).not.toContain("requires `workflow`");
+  });
+});
+
+describe("the eight knowledge names are retired", () => {
+  const old = [
+    "read_pack_workflow",
+    "list_workflow_templates",
+    "check_workflow_runtime",
+    "extract_workflow_dependencies",
+    "install_workflow_dependencies",
+    "list_skills",
+    "read_skill",
+    "generate_node_skill",
+  ];
+
+  it("each old name is in DEAD_NAMES with a `list_packs` replacement", () => {
+    for (const name of old) {
+      const entry = DEAD_NAMES.find((d) => d.name === name);
+      expect(entry, `${name} must be declared dead`).toBeDefined();
+      expect(entry!.since).toBe("0.50.0");
+      expect(entry!.replacement).toContain("list_packs");
+    }
+  });
+
+  it("no old name is still in the live ledger, and `list_packs` is", () => {
+    for (const name of old) expect(TOOL_NAMES as readonly string[]).not.toContain(name);
+    expect(TOOL_NAMES as readonly string[]).toContain("list_packs");
+  });
+
+  // An action may never be spelled the same as a name the SAME fold retires: the
+  // dead-name gate matches the bare token, so the replacement text a prose sweep
+  // has to write (`list_packs (action:"list_skills")`) would itself read as a live
+  // reference to the dead tool, and no sweep could ever go green. This is why
+  // list_skills → action:"skill_list" and read_skill → action:"skill_read".
+  it("no action is spelled the same as any retired name", () => {
+    const dead = new Set(DEAD_NAMES.map((d) => d.name));
+    for (const action of ACTIONS) expect(dead.has(action)).toBe(false);
+  });
+});

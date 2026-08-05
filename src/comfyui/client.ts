@@ -162,7 +162,7 @@ export async function getSystemStats(): Promise<SystemStats> {
 // ComfyUI restart/install (Desktop Manager reboot, a manual restart, a node pack
 // installed outside an mcp tool) never calls resetObjectInfoCache(), so a
 // lifetime cache serves the PRE-restart schema forever — get_node_info /
-// check_workflow_runtime / validate_workflow all report the new nodes as unknown
+// list_packs (action:"check_runtime") / validate_workflow report the new nodes as unknown
 // (#528). A TTL bounds that staleness: within the window we serve the cached
 // snapshot (so a burst of validations stays ~0.5 s, the perf win flagged by
 // josephoibrahim/comfy-cozy), and the FIRST call after the window does a single

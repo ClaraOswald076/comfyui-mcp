@@ -9,7 +9,6 @@ import { registerRegistrySearchTools } from "./registry-search.js";
 import { registerModelManagementTools } from "./model-management.js";
 import { registerModelExtrasTools } from "./model-extras.js";
 import { registerExtraPathsTools } from "./extra-paths.js";
-import { registerSkillGeneratorTools } from "./skill-generator.js";
 import { registerDiagnosticsTools } from "./diagnostics.js";
 import { registerRunpodTools } from "./runpod.js";
 import { registerWorkflowLibraryTools } from "./workflow-library.js";
@@ -35,7 +34,6 @@ import { registerNodeManagementTools } from "./node-management.js";
 import { registerReportIssueTools } from "./report-issue.js";
 import { registerNodeAuthoringTools } from "./node-authoring.js";
 import { registerNodeVerifyTools } from "./node-verify.js";
-import { registerWorkflowDepsTools } from "./workflow-deps.js";
 import { registerMissingModelTools } from "./missing-models.js";
 import { registerInstallComfyUITools } from "./install-comfyui.js";
 import { registerUpdateComfyUITools } from "./update-comfyui.js";
@@ -79,7 +77,9 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["workflows", registerQueueManagementTools],
   ["custom-nodes", registerRegistrySearchTools],
   ["models", registerModelManagementTools],
-  ["skills-config", registerSkillGeneratorTools],
+  // (0.50.0 slice 9: the skill-generator group's single tool folded into
+  // `list_packs` action:"generate_skill", registered by registerSkillsAccessTools
+  // further down — the survivor keeps its own slot.)
   ["diagnostics", registerDiagnosticsTools],
   ["runpod", registerRunpodTools],
   ["workflow-authoring", registerWorkflowLibraryTools],
@@ -102,7 +102,8 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["custom-nodes", registerNodeBisectTools],
   ["custom-nodes", registerNodeManagementTools],
   ["diagnostics", registerReportIssueTools],
-  ["workflows", registerWorkflowDepsTools],
+  // (0.50.0 slice 9: the workflow-deps group's two tools folded into `list_packs`
+  // actions "extract_deps"/"install_deps" — same note as skill-generator above.)
   ["models", registerMissingModelTools],
   ["server", registerInstallComfyUITools],
   ["server", registerUpdateComfyUITools],

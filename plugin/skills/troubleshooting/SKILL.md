@@ -9,7 +9,8 @@ globs:
 
 > **Render *completes* but looks WRONG** (artifacts, wrong subject/pose/color, a
 > ControlNet/mask/LoRA not taking, a refiner degrading it)? That's not an error —
-> use the **debug-render** skill (`read_skill("debug-render")`): localize the bad
+> use the **debug-render** skill (`list_packs` with `action: "skill_read"`,
+> `name: "debug-render"`): localize the bad
 > stage with run-to-node (`panel_run` `to_node_id`) by previewing intermediate
 > steps. This guide is for runs that **fail** with an error/OOM/missing node.
 

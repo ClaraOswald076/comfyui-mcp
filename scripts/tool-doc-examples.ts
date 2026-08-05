@@ -549,22 +549,6 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
       },
     ],
   },
-  install_workflow_dependencies: {
-    gloss:
-      "For a workflow someone sent you that is full of red nodes: this installs " +
-      "the node PACKS it needs. Missing model files are a different problem — " +
-      "that is resolve_missing_models.",
-    examples: [
-      {
-        ask: "Someone sent me this workflow and half the nodes are red. Fix it.",
-        args: { workflow: WORKFLOW_FRAGMENT },
-        argsNote: FRAGMENT_NOTE,
-        returns:
-          "What it installed, what was already there, and anything it could not " +
-          "find. A restart is normally needed before the nodes load.",
-      },
-    ],
-  },
   node_snapshot: {
     gloss:
       "A restore point for your installed node packs. Take one before a round " +

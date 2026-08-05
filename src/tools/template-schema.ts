@@ -23,8 +23,8 @@ import type {
 // ── get_template_schema ──────────────────────────────────────────────────────
 // The template-level "what can I override" view: resolve a template (bundled
 // installer pack first, then an official ComfyUI workflow template on the live
-// server — the SAME sources list_packs / list_workflow_templates enumerate and
-// read_pack_workflow loads), normalize it to API/prompt format so every widget
+// server — the SAME sources list_packs action:"list"/"list_templates" enumerate
+// and action:"read_workflow" loads), normalize it to API/prompt format so every widget
 // has a NAME, then surface the meaningful run-time parameters ("slots").
 //
 // KEY CONVENTION (shared with run_template's `overrides`): every slot key is
@@ -331,12 +331,12 @@ export interface TemplateIndexMatch {
 
 /**
  * Resolve a template query against the /api/workflow_templates index — the SAME
- * index list_workflow_templates returns. Pure + offline so it is unit-testable
+ * index list_packs (action:"list_templates") returns. Pure + offline so it is unit-testable
  * independent of the live server.
  *
  * The query may be a bare template name ("i2mv_sdxl_ldm_view_selector") OR a
  * source-qualified id ("ComfyUI-MVAdapter/i2mv_sdxl_ldm_view_selector") — the
- * qualified form (module/name, matching how list_workflow_templates groups
+ * qualified form (module/name, matching how action:"list_templates" groups
  * entries) disambiguates when the same name is provided by multiple modules.
  */
 export function resolveTemplateFromIndex(
@@ -390,7 +390,7 @@ async function loadServerTemplate(
   // Use the SAME canonical base URL + auth headers as the connected ComfyUI
   // client (getObjectInfo/getClient). A bare protocol://host:port fetch drops
   // the reverse-proxy base path and any gateway auth headers, so a proxied or
-  // authed remote that list_workflow_templates (now) reaches would otherwise
+  // authed remote that list_packs (action:"list_templates") (now) reaches would otherwise
   // look "unreachable" here — the inconsistency this issue reported.
   const base = getComfyUIBaseUrl();
   const authHeaders = getComfyUIAuthHeaders();
@@ -465,7 +465,7 @@ async function loadServerTemplate(
       available_count: resolved.all.length,
       ...((near.length ? near.length : Math.min(resolved.all.length, 20)) < resolved.all.length
         ? {
-            available_truncated: `Showing ${near.length ? near.length : Math.min(resolved.all.length, 20)} of ${resolved.all.length} templates (fixed preview cap — no parameter raises it); list_workflow_templates returns every one.`,
+            available_truncated: `Showing ${near.length ? near.length : Math.min(resolved.all.length, 20)} of ${resolved.all.length} templates (fixed preview cap — no parameter raises it); list_packs (action:\"list_templates\") returns every one.`,
           }
         : {}),
     };
@@ -498,12 +498,12 @@ async function loadServerTemplate(
 export function registerTemplateSchemaTools(server: McpServer): void {
   server.tool(
     "get_template_schema",
-    "Get a template's OVERRIDABLE run-time parameters (its 'slots') before running it. Pass a bundled pack name (from list_packs) or a custom-node-contributed workflow template name (from list_workflow_templates). Returns `slots` — the meaningful knobs: positive/negative prompt, seed, steps, cfg, sampler/scheduler, width/height, checkpoint/LoRA/model files, denoise, batch_size, input image — plus `other_slots` (every remaining overridable widget), each with a stable key `\"<nodeId>.<widget_name>\"`, semantic role, type, current value, and min/max/options where the node schema is known. Feed the keys DIRECTLY into run_template's `overrides` (same convention) for a schema→run round-trip.",
+    "Get a template's OVERRIDABLE run-time parameters (its 'slots') before running it. Pass a bundled pack name (from list_packs action:\"list\") or a custom-node-contributed workflow template name (from list_packs action:\"list_templates\"). Returns `slots` — the meaningful knobs: positive/negative prompt, seed, steps, cfg, sampler/scheduler, width/height, checkpoint/LoRA/model files, denoise, batch_size, input image — plus `other_slots` (every remaining overridable widget), each with a stable key `\"<nodeId>.<widget_name>\"`, semantic role, type, current value, and min/max/options where the node schema is known. Feed the keys DIRECTLY into run_template's `overrides` (same convention) for a schema→run round-trip.",
     {
       template: z
         .string()
         .min(1)
-        .describe("Template name/id: a bundled pack directory name (list_packs) or a custom-node-contributed workflow template name (list_workflow_templates)."),
+        .describe("Template name/id: a bundled pack directory name (list_packs action:\"list\") or a custom-node-contributed workflow template name (list_packs action:\"list_templates\")."),
     },
     async (args) => {
       try {
@@ -529,7 +529,7 @@ export function registerTemplateSchemaTools(server: McpServer): void {
                     {
                       error: `Could not resolve template "${name}". ${res.error}`,
                       near_matches: [...near, ...res.available].slice(0, 20),
-                      hint: "Use list_packs for bundled packs or list_workflow_templates for custom-node-contributed templates (core templates only appear in the ComfyUI frontend's own Templates browser).",
+                      hint: "Use list_packs (action:\"list\") for bundled packs or list_packs (action:\"list_templates\") for custom-node-contributed templates (core templates only appear in the ComfyUI frontend's own Templates browser).",
                     },
                     null,
                     2,

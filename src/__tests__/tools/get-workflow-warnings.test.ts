@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 // (first) content block, with conversion warnings appended as a separate
 // trailing block. Consumers that read the first text result must always receive
 // parseable JSON — never Markdown warnings — so passing it straight to
-// JSON.parse / check_workflow_runtime works even when there are convert warnings.
+// JSON.parse / list_packs (action:"check_runtime") works even with convert warnings.
 
 const fetchApiMock = vi.fn();
 vi.mock("../../comfyui/client.js", () => ({
