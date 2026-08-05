@@ -4556,3 +4556,1281 @@ describe("panel_ask keeps a validated answer across a tool timeout (#486)", () =
     expect(__panelAskTestHooks.ASK_TOTAL_BUDGET_CAP_MS).toBeLessThan(300000);
   });
 });
+
+// ---------------------------------------------------------------------------
+// #770 / #803 / #716 — panel_set_workflow_target({mode:"current"}) as a recovery
+// that actually recovers.
+//
+// The reported wedge: after a reconnect, a soft reload, or a same-tab workflow
+// replacement, the active canvas gets a NEW workflow-instance uuid while the
+// session keeps the OLD one as its command stamp. Every stamped command is then
+// (correctly) refused by the panel's fence with `workflow instance mismatch`.
+// The error text names mode:"current" as the remedy — but that call only ever
+// re-pointed ROUTING, and routing is a no-op while the bound tab is still
+// reachable, so it returned "Following the user's current workflow tab." and
+// changed nothing. A documented recovery that could not recover.
+//
+// Every assertion below checks the REASON, not just the state: a refusal for the
+// wrong cause and a refusal for the right cause are different results, and one
+// bucket verdict covering four causes is what this cluster is about.
+// ---------------------------------------------------------------------------
+describe("panel-tools: mode:'current' re-derives the workflow command fence (#770/#803)", () => {
+  const STALE = "11111111-1111-4111-8111-111111111111";
+  const LIVE = "22222222-2222-4222-8222-222222222222";
+
+  /** A bridge modelling the ONE thing that matters here: the tab is REACHABLE,
+   *  the session holds `fence`, and the panel's live active record reports
+   *  `active`. `workflow_list` answers from `active`; everything else acks.
+   *  `tabCanMutateGraph` defaults to TRUE — a current panel — so the common tests
+   *  exercise the realistic path rather than the can't-tell one. The false and
+   *  unanswerable cases get their own tests. */
+  function fenceBridge(opts: {
+    fence?: string;
+    active?: Record<string, unknown> | null;
+    /** Override the `workflows` list. By DEFAULT the stub mirrors `active` into a
+     *  single `active:true` entry — the shape a healthy panel returns, and the
+     *  CORROBORATION a fence adoption requires. Pass this explicitly to model a
+     *  stale/mixed/absent list. Supplying only a top-level `active` object is NOT
+     *  a safe fixture: it is the exact reply shape that let another canvas's uuid
+     *  overwrite this tab's stamp, so the default must not encode it. */
+    workflows?: Array<Record<string, unknown>>;
+    activeConfirmed?: boolean;
+    listThrows?: string;
+    refreshReturns?: boolean;
+    tabId?: string;
+  }) {
+    const tab = opts.tabId ?? "wf:workflows/a.json";
+    let stamp = opts.fence;
+    const sent: Array<Record<string, unknown>> = [];
+    const refresh = vi.fn((_tabId: string, uuid: string) => {
+      if (opts.refreshReturns === false) return false;
+      stamp = uuid;
+      return true;
+    });
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) => {
+        sent.push(cmd);
+        if (cmd.cmd === "workflow_list") {
+          if (opts.listThrows) throw new Error(opts.listThrows);
+          if (opts.active == null) return { workflows: opts.workflows ?? [] };
+          // Mirror `active` into a corroborating `active:true` entry unless the
+          // test is deliberately modelling a stale/mixed/absent list.
+          const workflows = opts.workflows ?? [{ ...opts.active, active: true }];
+          return {
+            active: opts.active,
+            workflows,
+            ...(opts.activeConfirmed === undefined ? {} : { active_confirmed: opts.activeConfirmed }),
+          };
+        }
+        return { ok: true };
+      },
+      push: () => 1,
+      canReach: (id: string) => id === tab,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: tab, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => tab,
+      refreshWorkflowUuid: refresh,
+      // The REAL bridge contract: tri-state. `{known:true}` with no uuid means
+      // "definitively unfenced" — a claim the stub is entitled to make because it
+      // is standing in for the map that holds the stamp.
+      workflowUuidFor: () => ({ known: true, uuid: stamp }),
+      tabCanMutateGraph: () => true,
+      tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
+    } as unknown as PanelToolCtx["bridge"];
+    return { bridge, sent, refresh, tab, currentStamp: () => stamp };
+  }
+
+  async function setCurrent(bridge: PanelToolCtx["bridge"], tab: string) {
+    const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    return { res, ctx, text: (res.content[0] as { text: string }).text };
+  }
+
+  it("REBINDS a stale fence onto the live canvas — the wedge these reports describe", async () => {
+    // The tab never went away (canReach true), so the pre-existing routing rebind
+    // is a no-op; only the FENCE is wrong. This is the reported dominant case.
+    const { bridge, refresh, tab, currentStamp } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+    });
+    const { res, ctx, text } = await setCurrent(bridge, tab);
+
+    expect(res.isError).toBeFalsy();
+    expect(ctx.tabId).toBe(tab); // routing untouched — it was never the problem
+    expect(refresh).toHaveBeenCalledExactlyOnceWith(tab, LIVE);
+    expect(currentStamp()).toBe(LIVE); // the fence a later graph command will carry
+    expect(JSON.parse(text)).toMatchObject({
+      graph_binding: "bound",
+      graph_binding_status: "refreshed",
+    });
+    // The REASON, rendered: both uuids named, so a reader can verify the swap.
+    expect(text).toContain(LIVE);
+    expect(text).toContain(STALE);
+    expect(text).toMatch(/Rebound the graph command fence onto the live canvas/);
+  });
+
+  it("rebinds for an UNSAVED (tmp:) canvas, which the saved-path #716 refresh can never reach", async () => {
+    // No `path`/`routing_key` to corroborate — canonicalRequestedSavedIdentity()
+    // returns null for every unsaved token, which is why open/pin cannot refresh
+    // here. mode:"current" has no caller-supplied target to corroborate: the live
+    // active canvas IS the target.
+    const { bridge, refresh, tab, currentStamp } = fenceBridge({
+      fence: STALE,
+      // A real unsaved workflow has no saved path, but it DOES have a stable
+      // routing key — which is what corroborates it against the open list.
+      active: {
+        key: "tmp:abc123",
+        routing_key: "tmp:abc123",
+        workflow_uuid: LIVE,
+        filename: "Unsaved Workflow",
+      },
+      tabId: "tmp:abc123",
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(res.isError).toBeFalsy();
+    expect(refresh).toHaveBeenCalledExactlyOnceWith("tmp:abc123", LIVE);
+    expect(currentStamp()).toBe(LIVE);
+    expect(JSON.parse(text).graph_binding_status).toBe("refreshed");
+  });
+
+  // ---- The corroboration the fence adoption requires -----------------------
+  //
+  // A stale or MIXED workflow_list can carry a top-level `active` naming ANOTHER
+  // canvas, whose uuid is perfectly valid in shape and origin. Adopting it
+  // overwrites this tab's stamp, wedges the next graph command, and — because the
+  // adoption "succeeded" — gets reported as `bound`. A fresh wedge announced as a
+  // recovery is strictly worse than the wedge this whole PR exists to fix.
+  //
+  // `resolveOpenWorkflow` had already arrived at this rule for pins: an
+  // uncorroborated top-level `active` "is never a safe source for replacing a
+  // command fence". These cases hold the rebind to it.
+
+  it("ADOPTS when the identities differ only in path SYNTAX — a contradiction check must not refuse a real match", async () => {
+    // The contradiction check compares through the same canonicalizer the rest of
+    // this file uses. Comparing raw strings would call "./workflows/a.json" and
+    // "workflows/a.json" a contradiction and refuse a legitimate recovery — this
+    // defect class pointed the other way, which is precisely what the check was
+    // added to avoid committing (codex gate).
+    const { bridge, refresh, tab } = fenceBridge({
+      fence: STALE,
+      active: {
+        path: "./workflows/a.json",
+        routing_key: "wf:workflows/a.json",
+        workflow_uuid: LIVE,
+      },
+      workflows: [
+        { path: "workflows/a.json", routing_key: "wf:workflows/a.json", active: true },
+      ],
+    });
+    const { res } = await setCurrent(bridge, tab);
+
+    expect(refresh).toHaveBeenCalledExactlyOnceWith(tab, LIVE);
+    expect(res.isError).toBeFalsy();
+  });
+
+  it("REFUSES a PARTIAL contradiction — one matching field never outvotes a conflicting one", async () => {
+    const OTHER = "33333333-3333-4333-8333-333333333333";
+    const { bridge, refresh, tab, currentStamp } = fenceBridge({
+      fence: STALE,
+      // The pathological middle case the total-disagreement test above cannot
+      // reach: `routing_key` AGREES while `path` flatly contradicts. The verdict
+      // returned on the FIRST equal pair without ever reading the rest, so a
+      // reply that disagreed with itself was adopted as a positive identity
+      // (codex gate P0). A contradicted positive is worse than an unverified one.
+      active: {
+        path: "workflows/b.json",
+        routing_key: "wf:workflows/a.json",
+        workflow_uuid: OTHER,
+      },
+      workflows: [
+        { path: "workflows/a.json", routing_key: "wf:workflows/a.json", active: true },
+      ],
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(refresh).not.toHaveBeenCalled();
+    expect(currentStamp()).toBe(STALE);
+    expect(res.isError).toBe(true);
+    expect(text).not.toMatch(/"graph_binding": "bound"/);
+  });
+
+  it("REFUSES to adopt when the active record CONTRADICTS the open-workflow list (stale/mixed reply)", async () => {
+    const OTHER = "33333333-3333-4333-8333-333333333333";
+    const { bridge, refresh, tab, currentStamp } = fenceBridge({
+      fence: STALE,
+      // Top-level active names canvas B, carrying a VALID uuid…
+      active: { path: "workflows/b.json", routing_key: "wf:workflows/b.json", workflow_uuid: OTHER },
+      // …while the panel's own list says canvas A is the active one.
+      workflows: [{ path: "workflows/a.json", routing_key: "wf:workflows/a.json", active: true }],
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    // Nothing adopted — the other canvas's uuid never reaches the fence.
+    expect(refresh).not.toHaveBeenCalled();
+    expect(currentStamp()).toBe(STALE);
+    // …and it is NOT reported as a recovery.
+    expect(res.isError).toBe(true);
+    expect(text).not.toMatch(/"graph_binding": "bound"/);
+    expect(text).toMatch(/could not be corroborated, so nothing was adopted/);
+    expect(text).toMatch(/name DIFFERENT workflows \(a stale or mixed reply\)/);
+    // The reason it matters, stated: this is what protects the tab.
+    expect(text).toMatch(/could have stamped ANOTHER canvas's identity onto this tab/);
+    // The remedy fits the cause — transient, so retry; not "update your panel".
+    expect(text).toMatch(/call this again in a moment/);
+    expect(text).not.toMatch(/must be UPDATED/);
+  });
+
+  it("REFUSES to adopt from a reply with no open-workflow list to corroborate against", async () => {
+    const { bridge, refresh, tab, currentStamp } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+      workflows: [], // the exact shape the first version of this fix accepted
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(refresh).not.toHaveBeenCalled();
+    expect(currentStamp()).toBe(STALE);
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/no open-workflow list to corroborate the active record against/);
+  });
+
+  it("REFUSES a MIXED list with two entries marked active, rather than arbitrating", async () => {
+    const { bridge, refresh, tab } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+      workflows: [
+        { path: "workflows/a.json", routing_key: "wf:workflows/a.json", active: true },
+        { path: "workflows/b.json", routing_key: "wf:workflows/b.json", active: true },
+      ],
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(refresh).not.toHaveBeenCalled();
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/2 entries in the open-workflow list are marked active \(a mixed reply\)/);
+  });
+
+  it("REFUSES when the panel itself says its active record is UNCONFIRMED", async () => {
+    const { bridge, refresh, tab } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+      activeConfirmed: false,
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(refresh).not.toHaveBeenCalled();
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/reported its active workflow as UNCONFIRMED/);
+  });
+
+  it("an UNCORROBORATED reply with NO prior fence is `unverified`, not a wedge and not a repair", async () => {
+    // Nothing was stale, so nothing failed to be repaired — but nothing was
+    // established either. Calling it `reads_only` would describe a permanent
+    // limitation this is not (the panel DOES report identities); calling it
+    // `not_recovered` would report a wedge that does not exist.
+    const { bridge, refresh, tab } = fenceBridge({
+      fence: undefined,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+      workflows: [], // uncorroborated
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(res.isError).toBeFalsy();
+    expect(refresh).not.toHaveBeenCalled();
+    expect(JSON.parse(text)).toMatchObject({
+      graph_binding: "unverified",
+      graph_binding_status: "no_identity",
+    });
+    expect(text).toMatch(/had no fence to damage, so it is no worse off/);
+    expect(text).toMatch(/call this again in a moment/);
+    // NOT the update-your-panel remedy: this panel reports identities fine.
+    expect(text).not.toMatch(/must be UPDATED/);
+  });
+
+  it("REFUSES when the active record and the list share no comparable identity field", async () => {
+    // Agreement was never established — which is not agreement. Filename is
+    // deliberately not comparable: it collides across tabs.
+    const { bridge, refresh, tab } = fenceBridge({
+      fence: STALE,
+      active: { filename: "a.json", workflow_uuid: LIVE },
+      workflows: [{ filename: "a.json", active: true }],
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(refresh).not.toHaveBeenCalled();
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/share no comparable identity field/);
+  });
+
+  it("reports ALREADY_CURRENT (and points at the panel) rather than a hollow rebind", async () => {
+    const { bridge, refresh, tab } = fenceBridge({
+      fence: LIVE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(res.isError).toBeFalsy();
+    // Nothing to change — so nothing is claimed to have changed.
+    expect(refresh).not.toHaveBeenCalled();
+    expect(JSON.parse(text).graph_binding_status).toBe("already_current");
+    expect(text).toMatch(/already named the canvas the panel reported as active a moment ago/);
+    // The SAME post-probe switch window `refreshed` discloses — a switch in that
+    // instant leaves this stamp stale too, and the fix for that is this very call.
+    expect(text).toMatch(/cleared by calling this\s+again/);
+    // …so the reload is reserved for a mismatch that SURVIVES a repeat, which is
+    // the only thing that actually implicates the panel.
+    expect(text).toMatch(/call this once more/);
+    expect(text).toMatch(/If the\s+mismatch SURVIVES that repeat/);
+    expect(text.indexOf("call this once more")).toBeLessThan(text.indexOf("manually refresh"));
+  });
+
+  it("FAILS — and discloses what did apply — when the live identity is UNREADABLE and a stale fence remains", async () => {
+    const { bridge, refresh, tab, currentStamp } = fenceBridge({
+      fence: STALE,
+      listThrows: "no connected tab",
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    // Never "your recovery worked" when it did not.
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/did NOT restore this session's graph binding/);
+    // DISCLOSE, don't retract: the target write already happened.
+    expect(text).toMatch(/APPLIED \(do not repeat this part\)[\s\S]*mode:"current"/);
+    // The REASON — an unknown, explicitly not a rebind — and the stale uuid still in force.
+    expect(text).toMatch(/Could NOT read the live canvas identity/);
+    expect(text).toMatch(/This is not a rebind — it is an unknown/);
+    expect(text).toMatch(/NOTHING about this session's graph binding was observed/);
+    expect(text).toContain(STALE);
+    expect(refresh).not.toHaveBeenCalled();
+    expect(currentStamp()).toBe(STALE); // the fence was left intact, not cleared
+
+    // The remedy must be reachable AND must not contradict itself. The quoted
+    // transport cause can itself say "rebind with panel_set_workflow_target
+    // ({mode:'current'})" — the call that just failed — so the quote is labelled
+    // and explicitly disarmed, and our own remedy is stated BEFORE it.
+    expect(text).toMatch(/disregard any rebind advice inside it/);
+    expect(text.indexOf("WHAT TO DO")).toBeLessThan(text.indexOf("UNDERLYING CAUSE"));
+    // …and the remedy never sends the caller to panel_reload, which #803 observed
+    // leaving the tab permanently unresponsive from exactly this state.
+    expect(text).toMatch(/Do NOT use panel_reload/);
+  });
+
+  it("an UNREADABLE read is an unknown even with NO prior fence — it never claims reads work", async () => {
+    // The read that would have told us whether this session is usable is the one
+    // that failed. Reporting "graph READS work" from a failed observation is the
+    // same could-not-determine/therefore-not fold, pointed at a positive.
+    const { bridge, tab } = fenceBridge({ fence: undefined, listThrows: "no connected tab" });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/whether graph reads work is unknown/i);
+    expect(text).not.toMatch(/graph READS work/);
+    // …and the FIRST remedy offered is the one reachable right now.
+    expect(text).toMatch(/WHAT TO DO: retry in a moment/);
+  });
+
+  it("distinguishes NO_IDENTITY from UNREADABLE — same wedge, different remedy", async () => {
+    const { bridge, refresh, tab } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json" }, // panel answered; no workflow_uuid in it
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/reported NO workflow identity for the active canvas/);
+    // NOT the unreadable wording — the panel DID answer, which is a different fact.
+    expect(text).not.toMatch(/Could NOT read the live canvas identity/);
+    // …and NOT the uncorroborated wording either: this reply hung together fine,
+    // the panel simply has no identity to give. Different fact, different remedy.
+    expect(text).not.toMatch(/could not be corroborated/);
+    expect(text).toMatch(/cached bundle/);
+    // …and the remedy is the one that actually replaces a cached bundle.
+    expect(text).toMatch(/HARD refresh here specifically/);
+    expect(text).toMatch(/must be UPDATED — no rebind can add it/);
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes a REJECTED adoption — read the identity, could not take it", async () => {
+    const { bridge, refresh, tab, currentStamp } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+      refreshReturns: false, // the orchestrator's validator declined it
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(res.isError).toBe(true);
+    expect(refresh).toHaveBeenCalledExactlyOnceWith(tab, LIVE);
+    expect(currentStamp()).toBe(STALE); // fail closed — old fence untouched
+    expect(text).toMatch(/could NOT adopt it as this session's graph command fence/);
+    // Distinct from both "unreadable" and "no identity": we DID read it.
+    expect(text).not.toMatch(/Could NOT read the live canvas identity/);
+    expect(text).not.toMatch(/reported NO workflow identity/);
+    expect(text).toContain(LIVE);
+  });
+
+  it("does NOT fail a session that never had a fence (an old panel stays usable)", async () => {
+    // Nothing was stale, so nothing failed to be repaired. Reporting this as a
+    // failed recovery would be the same fold in the opposite direction.
+    const { bridge, tab } = fenceBridge({ fence: undefined, active: { path: "workflows/a.json" } });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(res.isError).toBeFalsy();
+    // …but it is NOT reported as a usable graph binding either: reads work,
+    // mutations do not. "bound" here would overstate in the other direction.
+    expect(JSON.parse(text)).toMatchObject({
+      graph_binding: "reads_only",
+      graph_binding_status: "no_identity",
+    });
+    expect(text).toMatch(/graph MUTATIONS stay refused/);
+    // The remedy must be reachable: a panel build with no workflow identity will
+    // NEVER acquire one by reconnecting, so "wait for a reconnect" would be an
+    // aspirational instruction. Name the thing that does work.
+    expect(text).toMatch(/reconnecting alone will NOT restore mutations/);
+    expect(text).toMatch(/pack UPDATED/);
+  });
+
+  it("does NOT read the live canvas at all when the rebind DEFERRED (zero tabs connected)", async () => {
+    // There is nothing to read from yet, and the deferred note already says so.
+    // Probing anyway would turn a truthful deferral into a spurious failure.
+    // Collapse the real ~20s reconnect wait — this asserts a branch, not a clock.
+    __panelToolsTestHooks.setReconnectWaitTiming({ budgetMs: 1, intervalMs: 1 });
+    const sent: Array<Record<string, unknown>> = [];
+    const refresh = vi.fn(() => true);
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) => {
+        sent.push(cmd);
+        throw new Error(`no connected tab with id "x". Connected: none`);
+      },
+      push: () => 1,
+      canReach: () => false,
+      isHeadless: () => false,
+      tabs: () => [],
+      resolveActiveTabId: () => {
+        throw new Error("Panel not reachable: no panel connected");
+      },
+      refreshWorkflowUuid: refresh,
+      workflowUuidFor: () => STALE,
+    } as unknown as PanelToolCtx["bridge"];
+    const { res, text } = await setCurrent(bridge, "wf:gone");
+
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(text)).toMatchObject({ deferred: true });
+    expect(sent.filter((c) => c.cmd === "workflow_list")).toHaveLength(0);
+    expect(text).not.toMatch(/graph command fence/);
+    __panelToolsTestHooks.setReconnectWaitTiming(null);
+  });
+
+  it("leaves mode:'pinned' on its own #716 path — no extra live-canvas adoption", async () => {
+    // The pinned path adopts only a uuid corroborated against the CALLER's exact
+    // saved path. It must not inherit the target-free adoption above.
+    const store = new WorkflowTargetStore();
+    const refresh = vi.fn(() => true);
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) =>
+        cmd.cmd === "workflow_list"
+          ? {
+              active: {
+                path: "workflows/other.json",
+                routing_key: "wf:workflows/other.json",
+                workflow_uuid: LIVE,
+              },
+              workflows: [
+                {
+                  path: "workflows/other.json",
+                  key: "k",
+                  routing_key: "wf:workflows/other.json",
+                  active: true,
+                },
+              ],
+            }
+          : { ok: true },
+      push: () => 1,
+      canReach: () => true,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: "t", title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => "t",
+      refreshWorkflowUuid: refresh,
+      workflowUuidFor: () => STALE,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "t", store);
+    const res = await defByName("panel_set_workflow_target").handler(
+      { mode: "pinned", path: "workflows/notthisone.json" },
+      ctx,
+    );
+    // Not open under that caller path → the #259 fail-closed refusal still wins,
+    // and no fence adoption happened on the way.
+    expect(res.isError).toBe(true);
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it("does NOT report `bound` when the panel cannot fence a WRITE — a stamp is not a capability", async () => {
+    // tabCanMutateGraph requires the panel to advertise BOTH write-boundary fences
+    // ON TOP of a valid stamp. An older bundle can report a perfectly good workflow
+    // uuid and still have every mutation refused at dispatch, so reporting "graph
+    // tools will now target the workflow in view" off the stamp alone answers a
+    // question nobody asked.
+    const { bridge, refresh, tab } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+    });
+    const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
+    // Observed absent, and the WHY is an old panel build — which is what makes
+    // the pack-update remedy below the right one. The sibling test covers the
+    // other why.
+    ctx.tabGraphMutationCapability = () => ({
+      known: true,
+      canMutate: false,
+      because: "capability" as const,
+    });
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    // The fence WAS repaired — that part really happened and is reported.
+    expect(res.isError).toBeFalsy();
+    expect(refresh).toHaveBeenCalledExactlyOnceWith(tab, LIVE);
+    expect(JSON.parse(text).graph_binding_status).toBe("refreshed");
+    // …but the session is read-only, and the remedy is the one that exists.
+    expect(JSON.parse(text).graph_binding).toBe("reads_only");
+    expect(text).toMatch(/graph MUTATIONS are still refused for this tab/);
+    expect(text).toMatch(/update the comfyui-mcp-panel pack/);
+    // The remedy must not tell the caller to re-run a tool that cannot help.
+    expect(text).toMatch(/including calling this tool again — can add it/);
+  });
+
+  it("does NOT blame the panel version when the tab is simply UNREACHABLE", async () => {
+    // Both whys yield canMutate:false, and they used to share one value — so this
+    // path told the user to update their panel pack and hard-refresh a tab that
+    // was gone, while their READS were failing too and the note said reads work
+    // (codex gate P1). A bucket narrated as a cause, with a remedy for a problem
+    // they did not have.
+    const { bridge, tab } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+    });
+    const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
+    ctx.tabGraphMutationCapability = () => ({
+      known: true,
+      canMutate: false,
+      because: "unroutable" as const,
+    });
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(text).toMatch(/NOT REACHABLE/);
+    // The wrong remedy must be absent, not merely accompanied by the right one.
+    expect(text).not.toMatch(/update the comfyui-mcp-panel pack/);
+    expect(text).toMatch(/NOT a panel-version problem/);
+    // And it must not leave "reads work" standing, which is false for a tab that
+    // cannot be routed to at all.
+    expect(text).toMatch(/reads are not working either/);
+  });
+
+  it("does NOT blame the panel version when the socket is merely CLOSING", async () => {
+    // Transport, not version. Folding this into "capability" told the user to
+    // update a pack that was already correct (codex gate).
+    const { bridge, tab } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+    });
+    const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
+    ctx.tabGraphMutationCapability = () => ({
+      known: true,
+      canMutate: false,
+      because: "disconnected" as const,
+    });
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(text).toMatch(/socket is CLOSING/);
+    expect(text).not.toMatch(/update the comfyui-mcp-panel pack/);
+    expect(text).toMatch(/wait for the panel to reconnect/);
+  });
+
+  it("does NOT blame the panel version when only the workflow IDENTITY is missing", async () => {
+    // A modern panel advertising both fences, with no trusted stamp. Reads work
+    // and a rebind is the fix — so "no rebind can add it" and "update the pack"
+    // are both false here (codex gate).
+    const { bridge, tab } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+    });
+    const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
+    ctx.tabGraphMutationCapability = () => ({
+      known: true,
+      canMutate: false,
+      because: "no_identity" as const,
+    });
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(text).toMatch(/no trusted workflow identity/);
+    expect(text).toMatch(/panel build is FINE/);
+    expect(text).not.toMatch(/update the comfyui-mcp-panel pack/);
+    // The old wording actively told the caller a retry could not help. It can.
+    expect(text).not.toMatch(/including calling this tool again — can add it/);
+    expect(text).toMatch(/call this tool again to bind an identity/);
+  });
+
+  it("reports `unverified` — not `bound` — when the write capability cannot be determined", async () => {
+    // An unanswerable capability probe is an UNKNOWN. Rounding it up to `bound`
+    // (which the tool description defines as "graph tools are usable again") is
+    // the same could-not-determine/therefore-yes fold, one step further out.
+    const { bridge, tab } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+    });
+    const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
+    // The PRODUCTION shape of "cannot tell": the bridge probe answers known:false.
+    ctx.tabGraphMutationCapability = () => ({ known: false, reason: "could not inspect the tab" });
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(res.isError).toBeFalsy(); // the fence WAS repaired — that is not a failure
+    expect(JSON.parse(text).graph_binding).toBe("unverified");
+    expect(text).toMatch(/could not be determined from this context/);
+    expect(text).toMatch(/treat mutation readiness as unconfirmed/);
+  });
+
+  it("a THROWING adoption is not narrated as a refusal — whether the fence changed is UNKNOWN", async () => {
+    // A refusal (`false`) proves the old fence survived. A THROW can land on
+    // either side of the write, so "the previous fence is unchanged" would be a
+    // state nobody observed. It also must not escape the handler: the target
+    // write and push already happened, and their disclosure would be lost.
+    const tab = "wf:workflows/a.json";
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) =>
+        cmd.cmd === "workflow_list"
+          ? {
+              active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+              workflows: [{ path: "workflows/a.json", routing_key: "wf:workflows/a.json", active: true }],
+            }
+          : { ok: true },
+      push: () => 1,
+      canReach: (id: string) => id === tab,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: tab, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => tab,
+      refreshWorkflowUuid: () => {
+        throw new Error("validator exploded");
+      },
+      workflowUuidFor: () => ({ known: true, uuid: STALE }),
+      tabCanMutateGraph: () => true,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
+
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(res.isError).toBe(true);
+    // The disclosure that survived the throw.
+    expect(text).toMatch(/APPLIED \(do not repeat this part\)/);
+    expect(text).toMatch(/adopting it as this session's graph command fence THREW/);
+    expect(text).toMatch(/whether the\s+fence changed is UNKNOWN/);
+    expect(text).toMatch(/validator exploded/);
+    // Explicitly NOT the refusal wording, which would claim the old fence survived.
+    expect(text).not.toMatch(/The adoption was REFUSED/);
+    // …and the remedy is safe to follow.
+    expect(text).toMatch(/call this again — a second attempt is safe and settles it/);
+  });
+
+  it("RE-READS the fence when the probe moved the session, instead of comparing against the old tab", async () => {
+    // ctx.call's retry can rebind ctx.tabId. Comparing the NEW tab's live canvas
+    // against the OLD tab's fence can yield a bogus `already_current` — skipping a
+    // refresh the new tab genuinely needed and reporting a binding that is still
+    // wedged. Here the OLD tab's fence happens to equal the new canvas's uuid,
+    // while the NEW tab is stale: the naive comparison says "nothing to do".
+    const OLD = "wf:workflows/old.json";
+    const NEW = "wf:workflows/new.json";
+    const stamps = new Map<string, string>([
+      [OLD, LIVE], // old tab already names the live canvas…
+      [NEW, STALE], // …but the tab we end up on does NOT
+    ]);
+    let live = OLD;
+    let dropped = false;
+    const refresh = vi.fn((tabId: string, uuid: string) => {
+      stamps.set(tabId, uuid);
+      return true;
+    });
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+        if (cmd.cmd === "workflow_list" && !dropped) {
+          dropped = true;
+          live = NEW;
+          throw new Error(`no connected tab with id "${opts?.tabId}". Connected: none`);
+        }
+        if (cmd.cmd === "workflow_list") {
+          return {
+            active: { path: "workflows/new.json", routing_key: "wf:workflows/new.json", workflow_uuid: LIVE },
+            workflows: [{ path: "workflows/new.json", routing_key: "wf:workflows/new.json", active: true }],
+          };
+        }
+        return { ok: true };
+      },
+      push: () => 1,
+      canReach: (id: string) => id === live,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: live, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => live,
+      refreshWorkflowUuid: refresh,
+      workflowUuidFor: (id: string) => ({ known: true, uuid: stamps.get(id) }),
+      tabCanMutateGraph: () => true,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, OLD, new WorkflowTargetStore());
+
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(ctx.tabId).toBe(NEW);
+    // The NEW tab's stale stamp was actually replaced — not skipped as "already current".
+    expect(refresh).toHaveBeenCalledWith(NEW, LIVE);
+    expect(stamps.get(NEW)).toBe(LIVE);
+    expect(JSON.parse(text).graph_binding_status).toBe("refreshed");
+    expect(JSON.parse(text).graph_binding_status).not.toBe("already_current");
+  });
+
+  it("does not narrate an UNREADABLE prior fence as an ABSENT one", async () => {
+    // `workflowUuidFor` swallows a throwing resolver, so "could not read the
+    // fence" and "there is no fence" arrive as the same value unless the read is
+    // tri-state. Rendering the first as the second asserts an absence nobody saw.
+    const tab = "wf:workflows/a.json";
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) => {
+        if (cmd.cmd === "workflow_list") throw new Error("no connected tab");
+        return { ok: true };
+      },
+      push: () => 1,
+      canReach: (id: string) => id === tab,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: tab, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => tab,
+      refreshWorkflowUuid: () => true,
+      workflowUuidFor: () => {
+        throw new Error("resolver exploded");
+      },
+      tabCanMutateGraph: () => true,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/could not be read either, so its binding is\s+entirely unknown/);
+    expect(text).toMatch(/not known-good and not known-absent/);
+    // NOT the absent-fence wording.
+    expect(text).not.toMatch(/It has no graph command fence/);
+  });
+
+  it("reports `unverified` when the panel has no identity AND the prior fence is unreadable", async () => {
+    // Failing would report a wedge nobody observed; succeeding would report a
+    // repair nobody observed. Neither is available, so it says so.
+    const tab = "wf:workflows/a.json";
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) =>
+        cmd.cmd === "workflow_list" ? { active: { path: "workflows/a.json" } } : { ok: true },
+      push: () => 1,
+      canReach: (id: string) => id === tab,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: tab, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => tab,
+      refreshWorkflowUuid: () => true,
+      tabCanMutateGraph: () => true,
+      // no workflowUuidFor at all — this bridge cannot answer
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(text).graph_binding).toBe("unverified");
+    expect(text).toMatch(/could NOT be determined/);
+    expect(text).toMatch(/Treat graph tools as unconfirmed/);
+  });
+
+  it("reports `bound` when the panel DOES advertise the write fence", async () => {
+    const { bridge, tab } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+    });
+    const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
+    ctx.tabGraphMutationCapability = () => ({ known: true, canMutate: true });
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(JSON.parse(text).graph_binding).toBe("bound");
+    expect(text).not.toMatch(/graph MUTATIONS are still refused/);
+  });
+
+  it("REFUSES to claim mode:'current' when the probe moved this session onto a PINNED tab", async () => {
+    // workflow_list is retry-safe: a transient drop makes ctx.call rebind onto
+    // another tab and retry there. The fence then belongs to the NEW tab while the
+    // mode:"current" record belongs to the OLD one — and if the new tab carries
+    // someone else's pin, the next graph command routes through that pin. Claiming
+    // "following the user's current workflow tab" would name a state that is not
+    // the case, and overwriting the pin would clobber another session's binding.
+    const store = new WorkflowTargetStore();
+    const OLD = "wf:workflows/old.json";
+    const NEW = "wf:workflows/new.json";
+    store.set(NEW, { mode: "pinned", path: "workflows/other.json", filename: "other.json" });
+    let live = OLD;
+    let dropped = false;
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+        if (cmd.cmd === "workflow_list" && !dropped) {
+          dropped = true;
+          live = NEW; // the old tab is gone; a different one is live now
+          throw new Error(`no connected tab with id "${opts?.tabId}". Connected: none`);
+        }
+        if (cmd.cmd === "workflow_list") {
+          return {
+            active: { path: "workflows/new.json", routing_key: "wf:workflows/new.json", workflow_uuid: LIVE },
+            workflows: [{ path: "workflows/new.json", routing_key: "wf:workflows/new.json", active: true }],
+          };
+        }
+        return { ok: true };
+      },
+      push: () => 1,
+      canReach: (id: string) => id === live,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: live, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => live,
+      refreshWorkflowUuid: () => true,
+      workflowUuidFor: () => STALE,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, OLD, store);
+
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(res.isError).toBe(true);
+    expect(ctx.tabId).toBe(NEW);
+    // The other session's pin is LEFT ALONE.
+    expect(store.get(NEW)).toMatchObject({ mode: "pinned", path: "workflows/other.json" });
+    expect(text).toMatch(/did NOT take effect on the tab this session is now bound to/);
+    expect(text).toMatch(/rebound from tab wf:workflows\/old\.json onto tab wf:workflows\/new\.json/);
+    expect(text).toMatch(/that pin was left untouched/);
+    // The remedy must not be SELF-DEFEATING: re-issuing mode:"current" on this tab
+    // would delete the very pin we just declined to clobber. Say that plainly
+    // instead of prescribing it, and name what to do when ownership is unclear.
+    expect(text).toMatch(/WILL REPLACE that pin — do that only if the pin is yours/);
+    expect(text).toMatch(/ask the user which workflow they want this session on/);
+    // …and disclose that the fence WAS refreshed, since that did happen.
+    expect(text).toMatch(/graph command fence WAS refreshed onto this tab's live canvas/);
+  });
+
+  it("does NOT claim the fence was refreshed on the moved-to pinned tab when it was not", async () => {
+    // The moved-to-pinned disclosure used to say "the fence WAS refreshed"
+    // unconditionally — false whenever the probe came back unreadable, identity-
+    // less, refused, or already matching. Here the panel answers with NO workflow
+    // identity, so nothing was adopted, and the text must say so.
+    const store = new WorkflowTargetStore();
+    const OLD = "wf:workflows/old.json";
+    const NEW = "wf:workflows/new.json";
+    store.set(NEW, { mode: "pinned", path: "workflows/other.json", filename: "other.json" });
+    let live = OLD;
+    let dropped = false;
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+        if (cmd.cmd === "workflow_list" && !dropped) {
+          dropped = true;
+          live = NEW;
+          throw new Error(`no connected tab with id "${opts?.tabId}". Connected: none`);
+        }
+        // Answers, but exposes no workflow identity → nothing to adopt.
+        if (cmd.cmd === "workflow_list") return { active: { path: "workflows/new.json" } };
+        return { ok: true };
+      },
+      push: () => 1,
+      canReach: (id: string) => id === live,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: live, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => live,
+      refreshWorkflowUuid: () => true,
+      workflowUuidFor: () => ({ known: true, uuid: STALE }),
+      tabCanMutateGraph: () => true,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, OLD, store);
+
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(res.isError).toBe(true);
+    expect(text).not.toMatch(/fence WAS refreshed/);
+    expect(text).toMatch(/fence was NOT established on this tab \(no_identity\)/);
+    expect(text).toMatch(/may also fail here with a workflow-instance mismatch/);
+  });
+
+  it("re-applies mode:'current' onto the moved-to tab when that takes nothing away", async () => {
+    const store = new WorkflowTargetStore();
+    const OLD = "wf:workflows/old.json";
+    const NEW = "wf:workflows/new.json";
+    let live = OLD;
+    let dropped = false;
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+        if (cmd.cmd === "workflow_list" && !dropped) {
+          dropped = true;
+          live = NEW;
+          throw new Error(`no connected tab with id "${opts?.tabId}". Connected: none`);
+        }
+        if (cmd.cmd === "workflow_list") {
+          return {
+            active: { path: "workflows/new.json", routing_key: "wf:workflows/new.json", workflow_uuid: LIVE },
+            workflows: [{ path: "workflows/new.json", routing_key: "wf:workflows/new.json", active: true }],
+          };
+        }
+        return { ok: true };
+      },
+      push: () => 1,
+      canReach: (id: string) => id === live,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: live, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => live,
+      refreshWorkflowUuid: () => true,
+      workflowUuidFor: () => STALE,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, OLD, store);
+
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(res.isError).toBeFalsy();
+    // The record now governs the tab the session is actually on…
+    expect(store.get(NEW)).toMatchObject({ mode: "current" });
+    // …and the move is DISCLOSED, not silently absorbed.
+    expect(text).toMatch(/moved from tab wf:workflows\/old\.json onto tab wf:workflows\/new\.json/);
+  });
+
+  it("COMMITS the target store BEFORE the live-canvas round trip, so a concurrent pin isn't clobbered", async () => {
+    // The store is shared by every session bound to this tab. An await placed
+    // between the decision and the write widens the window in which THIS call's
+    // staler `current` overwrites a concurrent agent's later, successful pin —
+    // and that agent was told its edits were pinned. It also makes the failure
+    // text's "APPLIED (do not repeat this part)" literally true.
+    const store = new WorkflowTargetStore();
+    const order: string[] = [];
+    const tab = "wf:workflows/a.json";
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) => {
+        if (cmd.cmd === "workflow_list") {
+          order.push("workflow_list");
+          // The target must ALREADY be committed by the time we are asked to read.
+          expect(store.get(tab)).toMatchObject({ mode: "current" });
+          throw new Error("no connected tab");
+        }
+        return { ok: true };
+      },
+      push: () => {
+        order.push("push");
+        return 1;
+      },
+      canReach: (id: string) => id === tab,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: tab, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => tab,
+      refreshWorkflowUuid: () => true,
+      workflowUuidFor: () => STALE,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, tab, store);
+
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    // The fence read failed, so the call reports failure…
+    expect(res.isError).toBe(true);
+    // …but the target write it already performed is NOT retracted, and it landed
+    // before the round trip (the push precedes the read).
+    expect(store.get(tab)).toMatchObject({ mode: "current" });
+    // The push (which follows the store write) precedes EVERY workflow_list probe —
+    // ctx.call retries a retry-safe read once, so there may be more than one.
+    expect(order[0]).toBe("push");
+    expect(order.filter((o) => o === "workflow_list").length).toBeGreaterThan(0);
+    expect(order.indexOf("push")).toBeLessThan(order.indexOf("workflow_list"));
+    expect((res.content[0] as { text: string }).text).toMatch(/APPLIED \(do not repeat this part\)/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #772 — the run-to-node graph-stamp race is the ONE rejection safe to re-issue,
+// because the panel CERTIFIES that nothing entered the queue. Everything else
+// stays terminal: a wrong "retryable" here queues a second render.
+// ---------------------------------------------------------------------------
+describe("panel-tools: panel_run scoped-run stamp-race retry (#772)", () => {
+  const RACE =
+    "run-to-node scope for node 650 was NOT applied: the workflow graph CHANGED after the run " +
+    "was queued - the deferred dispatch would render a modified workflow, not the one that was " +
+    "scoped. Nothing was queued - refusing to fall through to a full-graph execution (#556).";
+
+  /** A ctx whose graph_run replies are scripted per attempt. A reply of
+   *  `{__error}` is an isError ToolResult; `{__throw}` makes ctx.call THROW. */
+  function runCtx(replies: Array<Record<string, unknown>>) {
+    const runs: Record<string, unknown>[] = [];
+    const ctx: PanelToolCtx = {
+      call: async (cmd) => {
+        if (cmd.cmd !== "graph_run") return { content: [{ type: "text", text: "{}" }] };
+        const reply = replies[runs.length] ?? { queued: true };
+        runs.push(cmd);
+        if (typeof reply.__throw === "string") throw new Error(reply.__throw);
+        if (typeof reply.__error === "string") {
+          return { content: [{ type: "text", text: `Error: ${reply.__error}` }], isError: true };
+        }
+        return { content: [{ type: "text", text: JSON.stringify(reply) }] };
+      },
+      confirm: async () => "yes" as const,
+      bridge: { push: () => 1 } as unknown as PanelToolCtx["bridge"],
+      tabId: "t",
+    };
+    return { ctx, runs };
+  }
+
+  const runText = (r: ToolResult) => (r.content[0] as { text: string }).text;
+
+  it("re-issues the scoped run EXACTLY ONCE and discloses the extra dispatch", async () => {
+    const { ctx, runs } = runCtx([{ error: RACE }, { queued: true, prompt_id: "p1" }]);
+    const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+
+    expect(res.isError).toBeFalsy();
+    expect(runs).toHaveLength(2);
+    expect(runs[1]).toMatchObject({ cmd: "graph_run", to_node_id: 650 }); // same scope
+    expect(runText(res)).toMatch(/re-issued once/);
+    expect(runText(res)).toMatch(/first dispatch contributed NOTHING to the queue/);
+  });
+
+  it("does NOT claim a render COUNT — batch_count means the second dispatch can queue several", async () => {
+    // `batch_count` is "times to queue", and the panel reports one prompt id, not a
+    // count. The certified fact is about DISPATCHES ("the first queued nothing"),
+    // not renders. Naming a number would be an unobserved state.
+    const { ctx, runs } = runCtx([{ error: RACE }, { queued: true, prompt_id: "p1" }]);
+    const res = await defByName("panel_run").handler({ to_node_id: 650, batch_count: 3 }, ctx);
+
+    expect(res.isError).toBeFalsy();
+    expect(runs).toHaveLength(2);
+    expect(runs[1]).toMatchObject({ batch_count: 3 }); // the batch is preserved, not dropped
+    expect(runText(res)).not.toMatch(/Exactly one render/i);
+    expect(runText(res)).toMatch(/queued once, not twice/);
+  });
+
+  it("does NOT retry a rejection that is not the certified race (validation failure)", async () => {
+    const { ctx, runs } = runCtx([
+      { node_errors: { 5: { class_type: "KSampler", errors: [{ message: "bad seed" }] } } },
+    ]);
+    const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(runs).toHaveLength(1);
+    expect(runText(res)).toMatch(/bad seed/);
+    expect(runText(res)).not.toMatch(/re-issued/);
+  });
+
+  it("does NOT retry when the panel omits the 'Nothing was queued' certification", async () => {
+    // Same race verdict, no proof the queue is clean → a retry could double-queue.
+    const uncertified = RACE.replace("Nothing was queued - refusing", "Refusing");
+    const { ctx, runs } = runCtx([{ error: uncertified }, { queued: true }]);
+    const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(runs).toHaveLength(1);
+  });
+
+  it("does NOT retry an isError reply even when it quotes both phrases (outcome unknown)", async () => {
+    // A post-write timeout / transport drop may ALREADY have queued the run.
+    const { ctx, runs } = runCtx([{ __error: RACE }, { queued: true }]);
+    const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(runs).toHaveLength(1);
+  });
+
+  it("does NOT retry a FULL-graph run — the gate reads our own args, not panel prose", async () => {
+    const { ctx, runs } = runCtx([{ error: RACE }, { queued: true }]);
+    const res = await defByName("panel_run").handler({}, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(runs).toHaveLength(1);
+  });
+
+  it("re-races once and then STOPS, disclosing the second dispatch without claiming its outcome", async () => {
+    const { ctx, runs } = runCtx([{ error: RACE }, { error: RACE }]);
+    const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(runs).toHaveLength(2); // never a third
+    expect(runText(res)).toMatch(/re-issued exactly once/);
+    expect(runText(res)).toMatch(/the first dispatch definitely queued nothing/);
+    // It does NOT assert the second dispatch's queue state — only the first is certified.
+    expect(runText(res)).not.toMatch(/Exactly one render was queued/);
+  });
+
+  it("STRUCTURED queue evidence vetoes the prose — `queued:true` alongside the race never retries", async () => {
+    // detectRunRejection deliberately calls any non-empty `error` a rejection even
+    // with a stale `queued:true` (#213). For the RETRY decision that same reply is
+    // the opposite case: an OBSERVED positive queue signal. "Nothing was queued" is
+    // prose the panel wrote; `queued:true` is a fact it reported. Retrying here
+    // would put a SECOND render in the queue.
+    const { ctx, runs } = runCtx([{ queued: true, error: RACE }, { queued: true }]);
+    const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(runs).toHaveLength(1);
+  });
+
+  it("a reported prompt_id also vetoes the retry", async () => {
+    const { ctx, runs } = runCtx([{ error: RACE, prompt_id: "p-already-queued" }, { queued: true }]);
+    const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(runs).toHaveLength(1);
+  });
+
+  it("does NOT retry an unparseable reply — unreadable is an unknown, not a clean queue", async () => {
+    const runs: Record<string, unknown>[] = [];
+    const ctx = {
+      call: async (cmd: Record<string, unknown>) => {
+        if (cmd.cmd !== "graph_run") return { content: [{ type: "text", text: "{}" }] };
+        runs.push(cmd);
+        // Non-JSON body that still carries both phrases.
+        return { content: [{ type: "text", text: RACE }] };
+      },
+      confirm: async () => "yes" as const,
+      bridge: { push: () => 1 } as unknown as PanelToolCtx["bridge"],
+      tabId: "t",
+    } as unknown as PanelToolCtx;
+    await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+    expect(runs).toHaveLength(1);
+  });
+
+  it("a THROWING second dispatch reports both facts instead of destroying them", async () => {
+    // The one point where a throw would lose evidence we already hold: that the
+    // first dispatch was certified not-queued, and that a second went out whose
+    // outcome is now unknown. Never claim the queue is clean; never invite a third.
+    const { ctx, runs } = runCtx([{ error: RACE }, { __throw: "socket exploded" }]);
+    const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(runs).toHaveLength(2);
+    const t = runText(res);
+    expect(t).toMatch(/outcome is UNKNOWN and it may have queued a render/);
+    expect(t).toMatch(/FIRST dispatch was certified by the panel to have queued nothing/);
+    expect(t).toMatch(/Do NOT re-run blindly/);
+    expect(t).toMatch(/socket exploded/); // the cause is preserved, not swallowed
+  });
+
+  it("the retryable-race classifier itself refuses an unknown outcome", () => {
+    const race: ToolResult = { content: [{ type: "text", text: RACE }] };
+    const answered: ToolResult = { content: [{ type: "text", text: "{}" }] };
+    const errored: ToolResult = { content: [{ type: "text", text: "boom" }], isError: true };
+    const queued: ToolResult = {
+      content: [{ type: "text", text: JSON.stringify({ queued: true, error: RACE }) }],
+    };
+    const unparseable: ToolResult = { content: [{ type: "text", text: "not json" }] };
+    expect(__panelRunTestHooks.isRetryableRunToNodeStampRace(answered, race)).toBe(true);
+    expect(__panelRunTestHooks.isRetryableRunToNodeStampRace(errored, race)).toBe(false);
+    expect(__panelRunTestHooks.isRetryableRunToNodeStampRace(queued, race)).toBe(false);
+    expect(__panelRunTestHooks.isRetryableRunToNodeStampRace(unparseable, race)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #803 — the bridge now names the FULL routing tab id in its no-reply timeout.
+// The ack-timeout classifier must keep matching it, INCLUDING ids with spaces
+// (ComfyUI's own default workflow name has two), or the whole verify-after-
+// timeout recovery silently stops firing for exactly the workflows in these
+// reports: a guard answering "no" because it could not parse.
+// ---------------------------------------------------------------------------
+describe("panel-tools: ack-timeout classification survives a full, spaced tab id (#803)", () => {
+  const timeout = (tabId: string): ToolResult => ({
+    content: [
+      {
+        type: "text",
+        text:
+          `Panel tab ${tabId} did not reply to "workflow_open" within 15000 ms — ` +
+          `the ComfyUI tab may be backgrounded or frozen`,
+      },
+    ],
+    isError: true,
+  });
+
+  it("classifies a SPACED full routing id as an ack timeout", () => {
+    expect(
+      __openWorkflowTestHooks.isAckTimeout(
+        timeout("wf:workflows/Untitled 2026-08-04 06-15-58.json"),
+      ),
+    ).toBe(true);
+  });
+
+  it("still classifies the unspaced and legacy sliced forms", () => {
+    expect(__openWorkflowTestHooks.isAckTimeout(timeout("wf:workflows/a.json"))).toBe(true);
+    expect(__openWorkflowTestHooks.isAckTimeout(timeout("wf:workf"))).toBe(true);
+  });
+
+  it("accepts the wrapper's `Error: ` prefix and an APPENDED retry token", () => {
+    // ctx.call surfaces a reply timeout as exactly `Error: ` + the bridge message,
+    // and #694 may append a retry-token sentence. Both must still classify, or the
+    // recovery silently switches off.
+    const wrapped: ToolResult = {
+      content: [
+        {
+          type: "text",
+          text:
+            `Error: Panel tab wf:workflows/My Graph.json did not reply to "workflow_open" within ` +
+            `15000 ms — the ComfyUI tab may be backgrounded or frozen\n\nTo retry this exact ` +
+            `mutation, re-issue identical args plus retry_of:"abc"; otherwise call normally.`,
+        },
+      ],
+      isError: true,
+    };
+    expect(__openWorkflowTestHooks.isAckTimeout(wrapped)).toBe(true);
+  });
+
+  it("REFUSES an acked executor error that merely EMBEDS the timeout phrase", () => {
+    // Only the bridge's own no-reply message STARTS with the preamble. A relayed
+    // executor failure that quotes it is a real, acked error — treating it as a
+    // no-reply sends it down the receipt-recovery path, where it can be reported
+    // as a "recovered" success for something that genuinely failed.
+    const embedded: ToolResult = {
+      content: [
+        {
+          type: "text",
+          text: `relay failed: Panel tab wf:workflows/a.json did not reply to "workflow_open" within 15000 ms — reconnecting`,
+        },
+      ],
+      isError: true,
+    };
+    expect(__openWorkflowTestHooks.isAckTimeout(embedded)).toBe(false);
+  });
+
+  it("REFUSES a whitespace- or newline-prefixed message (the anchor is not trimmed away)", () => {
+    // The bridge message never carries leading whitespace, so trimming before the
+    // anchor buys nothing and only lets a prefixed acked error through.
+    for (const prefix of [" ", "\n", "\t", "  \n"]) {
+      expect(
+        __openWorkflowTestHooks.isAckTimeout({
+          content: [
+            {
+              type: "text",
+              text: `${prefix}Panel tab wf:a.json did not reply to "workflow_open" within 15000 ms — the ComfyUI tab may be backgrounded or frozen`,
+            },
+          ],
+          isError: true,
+        }),
+      ).toBe(false);
+    }
+  });
+
+  it("still refuses a timeout for a DIFFERENT command, and any non-error result", () => {
+    const other: ToolResult = {
+      content: [
+        {
+          type: "text",
+          text: `Panel tab wf:workflows/My Graph.json did not reply to "graph_run" within 20000 ms — the ComfyUI tab may be backgrounded or frozen`,
+        },
+      ],
+      isError: true,
+    };
+    expect(__openWorkflowTestHooks.isAckTimeout(other)).toBe(false);
+    expect(
+      __openWorkflowTestHooks.isAckTimeout({
+        ...timeout("wf:workflows/a.json"),
+        isError: undefined,
+      }),
+    ).toBe(false);
+  });
+});

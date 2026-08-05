@@ -773,6 +773,16 @@ export function makeUnknownCommandError(
  * the mutating-vs-read classification and the default-timeout policy share one
  * authoritative list. Everything not listed is treated as mutating.
  */
+/**
+ * #770/#803 — the result of reading a tab's trusted workflow command stamp.
+ * Three states, because "could not read it" is not "there is none": collapsing
+ * them is what let a recovery report an absence it never observed. See
+ * {@link UiBridge.workflowUuidFor}.
+ */
+export type TabWorkflowUuidRead =
+  | { known: true; uuid?: string }
+  | { known: false; reason: string };
+
 export const BRIDGE_READONLY_CMDS: ReadonlySet<string> = new Set<string>([
   "graph_serialize",
   "graph_outline",
@@ -2211,18 +2221,81 @@ export class UiBridge {
    * needed to avoid an unfenced wrong-workflow write.
    */
   tabCanMutateGraph(tabId: string): boolean {
+    // FAIL-CLOSED convenience for the readiness callers: an unreadable probe is
+    // treated as "not ready", which is the right default when the question is
+    // "may I promise the user graph tools work?". Callers that must DESCRIBE the
+    // state to a human should use tabGraphMutationCapability instead — see below.
+    const r = this.tabGraphMutationCapability(tabId);
+    return r.known ? r.canMutate : false;
+  }
+
+  /**
+   * #770/#803 — the same question, TRI-STATE, for anyone who has to REPORT the
+   * answer rather than act on it.
+   *
+   * `tabCanMutateGraph` collapses an unreadable probe into `false`, which is a
+   * safe default for gating but a false statement when rendered: it made the
+   * recovery tell users their panel "does not advertise the write-boundary
+   * fence" when in truth we had merely failed to look. That is the same fold
+   * `workflowUuidFor` had, one method over, and it defeated the `unverified`
+   * distinction in exactly the production contexts it was added for.
+   *
+   *  - `{ known: true, canMutate: true }` — observed: this tab can mutate.
+   *  - `{ known: true, canMutate: false, because }` — observed that it cannot, and
+   *    WHY. The two whys have different remedies, so they must not share a value
+   *    (codex gate P1): an old panel needs a pack update and a hard refresh, an
+   *    unroutable tab needs neither and cannot do READS either.
+   *  - `{ known: false, reason }`   — the probe itself failed; nothing is known.
+   */
+  tabGraphMutationCapability(
+    tabId: string,
+  ):
+    | { known: true; canMutate: true }
+    | {
+        known: true;
+        canMutate: false;
+        because: "unroutable" | "disconnected" | "no_identity" | "capability";
+      }
+    | { known: false; reason: string } {
+    let conn: Conn;
     try {
-      const conn = this.resolveTarget(tabId);
-      const stamp = this.resolveTabWorkflowUuid?.(tabId);
-      return (
-        conn.sock.readyState === WebSocket.OPEN &&
-        conn.enforcesWorkflowStamp &&
-        conn.enforcesWorkflowStampAtWrite &&
-        typeof stamp === "string" &&
-        stamp.length > 0
-      );
+      conn = this.resolveTarget(tabId);
     } catch {
-      return false;
+      // Cannot route to the tab at all. That IS an observation about mutability —
+      // an unroutable tab mutates nothing — so it is `known`, not unknown.
+      //
+      // It is NOT the same observation as "this panel build lacks the write
+      // fence", and sharing one value with that case sent users to a remedy for a
+      // problem they did not have — update the pack, hard-refresh — while the tab
+      // was simply gone and their reads were failing too.
+      return { known: true, canMutate: false, because: "unroutable" };
+    }
+    try {
+      const stamp = this.resolveTabWorkflowUuid?.(tabId);
+      // `canMutate` is a conjunction of four unrelated conditions, and folding
+      // all four into "capability" sent three of them to the one remedy that
+      // cannot help (codex gate). Each is reported as itself, most transient
+      // first — a closing socket is not an old panel, and a modern panel with no
+      // trusted stamp is a BINDING problem that reads survive and a rebind fixes.
+      if (conn.sock.readyState !== WebSocket.OPEN) {
+        return { known: true, canMutate: false, because: "disconnected" };
+      }
+      if (!conn.enforcesWorkflowStamp || !conn.enforcesWorkflowStampAtWrite) {
+        // The only genuinely version-shaped cause: this build does not advertise
+        // the write-boundary fence, and no retry can add it.
+        return { known: true, canMutate: false, because: "capability" };
+      }
+      if (typeof stamp !== "string" || stamp.length === 0) {
+        return { known: true, canMutate: false, because: "no_identity" };
+      }
+      return { known: true, canMutate: true };
+    } catch (err) {
+      // The stamp resolver threw: the capability inputs could not be read, so the
+      // answer is unknown — NOT "the panel lacks the capability".
+      return {
+        known: false,
+        reason: err instanceof Error ? err.message : String(err ?? "unknown error"),
+      };
     }
   }
 
@@ -3093,7 +3166,7 @@ export class UiBridge {
       ctx.reject(
         markReplyTimeout(
           new Error(
-            `Panel tab ${conn.tabId.slice(0, 8)} did not reply to "${cmd.cmd}" within ${ctx.timeoutMs} ms — the ComfyUI tab may be backgrounded or frozen`,
+            `Panel tab ${conn.tabId} did not reply to "${cmd.cmd}" within ${ctx.timeoutMs} ms — the ComfyUI tab may be backgrounded or frozen`,
           ),
         ),
       );
@@ -3149,11 +3222,20 @@ export class UiBridge {
       // dispatched:true so a mutating caller (e.g. comfy_reboot readiness) treats it as an
       // accepted-but-unacked dispatch and verifies by observation, rather than mistaking a
       // genuinely-sent command for one that never went out (#509).
+      //
+      // #803 — name the FULL tab id, never the log-style 8-char slice. Routing tab
+      // ids are `wf:<path>` / `tmp:<key>`, so an 8-char slice renders EVERY workflow
+      // tab as the identical, alarming-looking `wf:workf`: two tabs timing out are
+      // indistinguishable in the transcript and the id reads like a corrupted key
+      // (it sent one diagnosis down a wrong path outright). Same call as the #709
+      // refusal above. `isAckTimeout`/`isReplyTimeoutError` both segment the id with
+      // a lazy `.+?` bounded by the fixed ` did not reply to "` delimiter, so a full
+      // id CONTAINING SPACES (`wf:workflows/Untitled 2026-08-04.json`) still matches.
       ctx.reject(
         markReplyTimeout(
           markDispatched(
             new Error(
-              `Panel tab ${conn.tabId.slice(0, 8)} did not reply to "${cmd.cmd}" within ${ctx.timeoutMs} ms — the ComfyUI tab may be backgrounded or frozen`,
+              `Panel tab ${conn.tabId} did not reply to "${cmd.cmd}" within ${ctx.timeoutMs} ms — the ComfyUI tab may be backgrounded or frozen`,
             ),
             true,
           ),
@@ -3332,6 +3414,42 @@ export class UiBridge {
    */
   refreshWorkflowUuid(tabId: string, workflowUuid: string): boolean {
     return this.refreshTabWorkflowUuid?.(tabId, workflowUuid) ?? false;
+  }
+
+  /**
+   * #770/#803 — READ the trusted command stamp currently fencing `tabId`.
+   *
+   * TRI-STATE on purpose (codex gate). An earlier version returned
+   * `string | undefined` and swallowed a throwing resolver into `undefined`,
+   * which made "I could not read the fence" indistinguishable from "there is no
+   * fence" — so a failed read rendered to the user as a definite absence, and the
+   * recovery narrated a state nobody had observed. Since this is the ONLY window
+   * onto the stamp, the distinction has to survive here or it is lost for good.
+   *
+   *  - `{ known: true, uuid }` — this tab IS fenced, by this uuid.
+   *  - `{ known: true }`       — this tab is definitively NOT fenced (no resolver
+   *                              value: an old panel, or an identity regression
+   *                              cleared it).
+   *  - `{ known: false }`      — the read itself failed; nothing is known.
+   *
+   * Never throws: the resolver is orchestrator-supplied, and a guard that can
+   * throw is not a guard.
+   */
+  workflowUuidFor(tabId: string): TabWorkflowUuidRead {
+    if (!this.resolveTabWorkflowUuid) {
+      // No resolver injected at all — the stamp mechanism is not wired in this
+      // process. That is a genuine "cannot know", not proof of an absent fence.
+      return { known: false, reason: "no workflow-uuid resolver is installed on this bridge" };
+    }
+    try {
+      const uuid = this.resolveTabWorkflowUuid(tabId);
+      return { known: true, uuid: typeof uuid === "string" && uuid.length > 0 ? uuid : undefined };
+    } catch (err) {
+      return {
+        known: false,
+        reason: err instanceof Error ? err.message : String(err ?? "unknown error"),
+      };
+    }
   }
 
   /** The open DESKTOP tabs (non-headless primaries) for the mobile mirror picker. */
