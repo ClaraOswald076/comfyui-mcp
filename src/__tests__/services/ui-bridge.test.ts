@@ -2867,28 +2867,34 @@ describe("defaultBridgeTimeoutMs — tolerant read timeout (#357)", () => {
 });
 
 // #770/#803 — the fence READ the rebind needs to tell "repaired a stale fence"
-// apart from "there was never a fence". Both are answers; only one is a repair.
+// apart from "there was never a fence" apart from "I could not look". Three
+// answers, three remedies; this is the only window onto the stamp, so a
+// distinction lost here is lost for good.
 describe("UiBridge.workflowUuidFor (#770 fence read)", () => {
-  it("returns the resolver's value, and undefined for empty/missing/throwing resolvers", () => {
+  it("distinguishes a present fence, a definitively absent one, and an unreadable one", () => {
     const b = new UiBridge(0);
-    // No resolver injected at all → undefined (never a fabricated identity).
-    expect(b.workflowUuidFor("t")).toBeUndefined();
+    // No resolver at all → NOT KNOWN. Reporting this as "no fence" would assert
+    // an absence from a mechanism that was never wired up.
+    expect(b.workflowUuidFor("t")).toMatchObject({ known: false });
 
     b.setTabWorkflowUuidResolver((tabId) => (tabId === "t" ? "u-1" : undefined));
-    expect(b.workflowUuidFor("t")).toBe("u-1");
-    expect(b.workflowUuidFor("other")).toBeUndefined();
+    expect(b.workflowUuidFor("t")).toEqual({ known: true, uuid: "u-1" });
+    // A resolver that ANSWERS with nothing is a real, observed absence.
+    expect(b.workflowUuidFor("other")).toEqual({ known: true, uuid: undefined });
 
-    // An empty string is not an identity.
+    // An empty string is not an identity — but it is still an answer.
     b.setTabWorkflowUuidResolver(() => "");
-    expect(b.workflowUuidFor("t")).toBeUndefined();
+    expect(b.workflowUuidFor("t")).toEqual({ known: true, uuid: undefined });
 
-    // A guard that can throw is not a guard: a faulting resolver must not take
-    // down the recovery that reads it.
+    // A guard that can throw is not a guard: a faulting resolver must neither take
+    // down the recovery that reads it NOR be reported as "there is no fence".
     b.setTabWorkflowUuidResolver(() => {
       throw new Error("resolver exploded");
     });
     expect(() => b.workflowUuidFor("t")).not.toThrow();
-    expect(b.workflowUuidFor("t")).toBeUndefined();
+    const read = b.workflowUuidFor("t");
+    expect(read.known).toBe(false);
+    expect(read).toMatchObject({ reason: expect.stringContaining("resolver exploded") });
   });
 });
 

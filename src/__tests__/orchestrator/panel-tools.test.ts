@@ -4614,7 +4614,10 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
       tabs: () => [{ tab_id: tab, title: "wf", connected_at: 0 }],
       resolveActiveTabId: () => tab,
       refreshWorkflowUuid: refresh,
-      workflowUuidFor: () => stamp,
+      // The REAL bridge contract: tri-state. `{known:true}` with no uuid means
+      // "definitively unfenced" — a claim the stub is entitled to make because it
+      // is standing in for the map that holds the stamp.
+      workflowUuidFor: () => ({ known: true, uuid: stamp }),
       tabCanMutateGraph: () => true,
     } as unknown as PanelToolCtx["bridge"];
     return { bridge, sent, refresh, tab, currentStamp: () => stamp };
@@ -4906,6 +4909,97 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
     expect(text).toMatch(/treat mutation readiness as unconfirmed/);
   });
 
+  it("a THROWING adoption is not narrated as a refusal — whether the fence changed is UNKNOWN", async () => {
+    // A refusal (`false`) proves the old fence survived. A THROW can land on
+    // either side of the write, so "the previous fence is unchanged" would be a
+    // state nobody observed. It also must not escape the handler: the target
+    // write and push already happened, and their disclosure would be lost.
+    const tab = "wf:workflows/a.json";
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) =>
+        cmd.cmd === "workflow_list"
+          ? { active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE } }
+          : { ok: true },
+      push: () => 1,
+      canReach: (id: string) => id === tab,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: tab, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => tab,
+      refreshWorkflowUuid: () => {
+        throw new Error("validator exploded");
+      },
+      workflowUuidFor: () => ({ known: true, uuid: STALE }),
+      tabCanMutateGraph: () => true,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
+
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(res.isError).toBe(true);
+    // The disclosure that survived the throw.
+    expect(text).toMatch(/APPLIED \(do not repeat this part\)/);
+    expect(text).toMatch(/adopting it as this session's graph command fence THREW/);
+    expect(text).toMatch(/whether the\s+fence changed is UNKNOWN/);
+    expect(text).toMatch(/validator exploded/);
+    // Explicitly NOT the refusal wording, which would claim the old fence survived.
+    expect(text).not.toMatch(/The adoption was REFUSED/);
+    // …and the remedy is safe to follow.
+    expect(text).toMatch(/call this again — a second attempt is safe and settles it/);
+  });
+
+  it("RE-READS the fence when the probe moved the session, instead of comparing against the old tab", async () => {
+    // ctx.call's retry can rebind ctx.tabId. Comparing the NEW tab's live canvas
+    // against the OLD tab's fence can yield a bogus `already_current` — skipping a
+    // refresh the new tab genuinely needed and reporting a binding that is still
+    // wedged. Here the OLD tab's fence happens to equal the new canvas's uuid,
+    // while the NEW tab is stale: the naive comparison says "nothing to do".
+    const OLD = "wf:workflows/old.json";
+    const NEW = "wf:workflows/new.json";
+    const stamps = new Map<string, string>([
+      [OLD, LIVE], // old tab already names the live canvas…
+      [NEW, STALE], // …but the tab we end up on does NOT
+    ]);
+    let live = OLD;
+    let dropped = false;
+    const refresh = vi.fn((tabId: string, uuid: string) => {
+      stamps.set(tabId, uuid);
+      return true;
+    });
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+        if (cmd.cmd === "workflow_list" && !dropped) {
+          dropped = true;
+          live = NEW;
+          throw new Error(`no connected tab with id "${opts?.tabId}". Connected: none`);
+        }
+        if (cmd.cmd === "workflow_list") {
+          return { active: { path: "workflows/new.json", workflow_uuid: LIVE } };
+        }
+        return { ok: true };
+      },
+      push: () => 1,
+      canReach: (id: string) => id === live,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: live, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => live,
+      refreshWorkflowUuid: refresh,
+      workflowUuidFor: (id: string) => ({ known: true, uuid: stamps.get(id) }),
+      tabCanMutateGraph: () => true,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, OLD, new WorkflowTargetStore());
+
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(ctx.tabId).toBe(NEW);
+    // The NEW tab's stale stamp was actually replaced — not skipped as "already current".
+    expect(refresh).toHaveBeenCalledWith(NEW, LIVE);
+    expect(stamps.get(NEW)).toBe(LIVE);
+    expect(JSON.parse(text).graph_binding_status).toBe("refreshed");
+    expect(JSON.parse(text).graph_binding_status).not.toBe("already_current");
+  });
+
   it("does not narrate an UNREADABLE prior fence as an ABSENT one", async () => {
     // `workflowUuidFor` swallows a throwing resolver, so "could not read the
     // fence" and "there is no fence" arrive as the same value unless the read is
@@ -5030,6 +5124,48 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
     expect(text).toMatch(/ask the user which workflow they want this session on/);
     // …and disclose that the fence WAS refreshed, since that did happen.
     expect(text).toMatch(/graph command fence WAS refreshed onto this tab's live canvas/);
+  });
+
+  it("does NOT claim the fence was refreshed on the moved-to pinned tab when it was not", async () => {
+    // The moved-to-pinned disclosure used to say "the fence WAS refreshed"
+    // unconditionally — false whenever the probe came back unreadable, identity-
+    // less, refused, or already matching. Here the panel answers with NO workflow
+    // identity, so nothing was adopted, and the text must say so.
+    const store = new WorkflowTargetStore();
+    const OLD = "wf:workflows/old.json";
+    const NEW = "wf:workflows/new.json";
+    store.set(NEW, { mode: "pinned", path: "workflows/other.json", filename: "other.json" });
+    let live = OLD;
+    let dropped = false;
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+        if (cmd.cmd === "workflow_list" && !dropped) {
+          dropped = true;
+          live = NEW;
+          throw new Error(`no connected tab with id "${opts?.tabId}". Connected: none`);
+        }
+        // Answers, but exposes no workflow identity → nothing to adopt.
+        if (cmd.cmd === "workflow_list") return { active: { path: "workflows/new.json" } };
+        return { ok: true };
+      },
+      push: () => 1,
+      canReach: (id: string) => id === live,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: live, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => live,
+      refreshWorkflowUuid: () => true,
+      workflowUuidFor: () => ({ known: true, uuid: STALE }),
+      tabCanMutateGraph: () => true,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, OLD, store);
+
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(res.isError).toBe(true);
+    expect(text).not.toMatch(/fence WAS refreshed/);
+    expect(text).toMatch(/fence was NOT established on this tab \(no_identity\)/);
+    expect(text).toMatch(/may also fail here with a workflow-instance mismatch/);
   });
 
   it("re-applies mode:'current' onto the moved-to tab when that takes nothing away", async () => {
