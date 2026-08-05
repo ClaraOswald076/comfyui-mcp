@@ -145,10 +145,14 @@ describe("sessions are orchestrator-scoped, never workflow-scoped (#884)", () =>
   it("SOURCE: scope mutations are stamped with the TURN's issue-time workflow, never re-resolved (codex r1 P0 / r2)", () => {
     const src = indexSrc();
     // The issue-time uuid RIDES the message (recorded per mid at receipt)…
-    expect(src).toContain("if (userMid) recordTurnUuidForMid(userMid, issueUuid);");
-    // …and becomes the conversation's stamp when the turn DEQUEUES it (onSeen —
-    // never at receipt, which would flip an in-flight turn's fence; codex r2).
-    expect(src).toContain("lastTurnUuidByKey.set(key, turnUuidByMid.get(mid));");
+    expect(src).toContain("recordTurnUuidForMid(userMid, issueUuid);");
+    // …a mid-less message may only stamp while NO turn is in flight (codex r3)…
+    expect(src).toContain("} else if (!manager.isTurnActive(agentKeyFor(event.tab_id))) {");
+    // …and the stamp lands when the turn DEQUEUES its batch (onSeen), with a
+    // MIXED/unknown-origin batch failing closed instead of last-message-wins
+    // re-aiming the whole turn's mutations (codex r2/r3).
+    expect(src).toContain("batch.known.push(turnUuidByMid.get(mid));");
+    expect(src).toContain("if (closed.unknown || distinct.size > 1) {");
     // …answered to scope-addressed callers by the stamp resolver…
     expect(src).toContain(
       "if (isScopeAddress(tabId)) return lastTurnUuidByKey.get(scopeAgentKeyOf(tabId));",
@@ -174,6 +178,19 @@ describe("sessions are orchestrator-scoped, never workflow-scoped (#884)", () =>
     // sole agent happens to be live (r2: cross-conversation misattribution).
     expect(src).toContain("if (tab.startsWith(SHARED_SESSION_SCOPE + AGENT_KEY_SEP)) {");
     expect(src).toContain("not waking another conversation (#884)");
+  });
+
+  it("SOURCE: journal tickets are keyed by the REAL routed tab, never the scope address (codex r3 P1)", () => {
+    const tools = readFileSync(
+      new URL("../../orchestrator/panel-tools.ts", import.meta.url),
+      "utf8",
+    );
+    // A scope-keyed ticket can never correlate: the panel reports completions
+    // and answers under the REAL tab id, so the agent's own render would come
+    // back "foreign" and boundary sweeps could never close the ticket.
+    expect(tools).toContain("function journalTabFor(ctx: PanelToolCtx): string {");
+    expect(tools).toContain("tabId: journalTabFor(ctx),"); // panel_run's #468 ticket
+    expect(tools).toContain("const tabId = journalTabFor(ctx);"); // panel_ask's #486 ticket
   });
 
   it("SOURCE: hello.resume is a last-resort hint — the orchestrator's disk store wins", () => {

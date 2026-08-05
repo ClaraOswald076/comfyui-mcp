@@ -1173,6 +1173,16 @@ const MIRROR_SAFE_FRAME_TYPES: ReadonlySet<string> = new Set([
   "download_progress",
 ]);
 
+/** #884 — whether a frame type reaches mirror VIEWERS through the mirror
+ *  fan-out above. The orchestrator's conversation fanout excludes an attached
+ *  viewer's own tab for exactly these types (it already gets them via its
+ *  driven tab — direct delivery would double every frame on the phone), while
+ *  non-mirrored frames (e.g. seen-acks for a message the phone itself sent)
+ *  are still delivered directly (codex round 3, P2). */
+export function isMirrorSafeFrameType(frameType: string): boolean {
+  return MIRROR_SAFE_FRAME_TYPES.has(frameType);
+}
+
 export class UiBridge {
   /** Max EADDRINUSE retries before degrading to "panel unavailable". */
   private static readonly MAX_BIND_ATTEMPTS = 5;

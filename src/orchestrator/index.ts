@@ -25,7 +25,13 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import readline from "node:readline";
-import { startUiBridge, isLoopbackBindHost, SESSION_EPOCH, type UiBridge } from "../services/ui-bridge.js";
+import {
+  startUiBridge,
+  isLoopbackBindHost,
+  isMirrorSafeFrameType,
+  SESSION_EPOCH,
+  type UiBridge,
+} from "../services/ui-bridge.js";
 import { setupSecureBridge, resolveComfyuiPathForTarget, type SecureBridge } from "../services/secure-bridge.js";
 import { judgeHelloRetarget, canonComfyuiTargetUrl } from "../services/hello-retarget.js";
 import { startQuickTunnel } from "../services/tunnel.js";
@@ -1525,10 +1531,13 @@ export async function runPanelOrchestrator(): Promise<void> {
   // message queued behind a busy turn, or held during a render, must not flip
   // the IN-FLIGHT turn's stamp the moment it arrives (codex round 2, P0 —
   // receipt-time overwrite re-created the race for queued/held messages).
-  // Bounded: entries are consumed at dequeue; a cap prevents pathological
-  // growth from mids that never dispatch.
+  // Bounded: entries are consumed at dequeue and dropped on cancel; the cap is
+  // a last-resort ceiling sized so it is effectively unreachable by live
+  // queued messages (codex r3: evicting a LIVE mapping discards fail-closed
+  // state — and even then, an unknown mid at dequeue fails the batch closed
+  // below rather than inheriting a stale stamp).
   const turnUuidByMid = new Map<string, string | undefined>();
-  const TURN_UUID_BY_MID_CAP = 500;
+  const TURN_UUID_BY_MID_CAP = 5000;
   const recordTurnUuidForMid = (mid: string, uuid: string | undefined): void => {
     turnUuidByMid.set(mid, uuid);
     while (turnUuidByMid.size > TURN_UUID_BY_MID_CAP) {
@@ -1537,6 +1546,29 @@ export async function runPanelOrchestrator(): Promise<void> {
       turnUuidByMid.delete(oldest);
     }
   };
+  // Mids whose stamp was ALREADY applied at a previous dequeue — a re-queued
+  // item (interrupt + send-now) fires onSeen again, and it must contribute
+  // NOTHING to the new batch (its stamp is in force or superseded), while a
+  // genuinely unknown mid (evicted, foreign) must fail the batch closed.
+  const consumedTurnMids = new Set<string>();
+  const CONSUMED_TURN_MIDS_CAP = 500;
+  const noteConsumedTurnMid = (mid: string): void => {
+    consumedTurnMids.add(mid);
+    while (consumedTurnMids.size > CONSUMED_TURN_MIDS_CAP) {
+      const oldest = consumedTurnMids.values().next().value as string | undefined;
+      if (oldest === undefined) break;
+      consumedTurnMids.delete(oldest);
+    }
+  };
+  // Per-key aggregation of ONE dispatch batch's issue-time uuids (the manager
+  // fires onSeen synchronously per item; the microtask closes the batch before
+  // any backend I/O can run a tool call). A batch whose messages came from ONE
+  // workflow stamps it; a MIXED or unknown-origin batch stamps `undefined` —
+  // no single stamp is honest for it, so mutations fail the panel fence
+  // loudly until the agent explicitly opens/pins a workflow (#716) or the
+  // next single-origin message (codex r3, P1: last-message-wins let a merged
+  // batch mutate the wrong workflow).
+  const pendingBatchStamp = new Map<string, { known: Array<string | undefined>; unknown: boolean }>();
   // #884 — each shared conversation's last message origin (tab + workflow uuid),
   // so a message sent from a DIFFERENT workflow than the previous one carries a
   // one-line context note: session-bound agents keep knowledge of which canvas
@@ -1576,19 +1608,27 @@ export async function runPanelOrchestrator(): Promise<void> {
   // codex tab is open can never leak into the codex conversation — and flush to
   // the next hello on that backend (bounded; a backgrounded turn survives a
   // panel reload).
-  // An ATTACHED mirror viewer already receives the conversation through the
-  // mirror fan-out of the desktop tab it drives — delivering to its own tab id
-  // too would double every say/stream/turn frame on the phone (codex round 2).
   const conversationTabsFor = (key: string): string[] =>
     conversationTabs({
       connected: bridge.tabs().map((t) => t.tab_id),
       backendForTab,
       backend: backendOf(key),
-    }).filter((t) => !bridge.isAttachedViewerTab(t));
+    });
+  // An ATTACHED mirror viewer already receives MIRROR-SAFE frames through the
+  // mirror fan-out of the desktop tab it drives — delivering those to its own
+  // tab id too would double every say/stream/turn frame on the phone (codex
+  // round 2). Non-mirrored frames (e.g. the seen-ack for a message the phone
+  // itself sent) are still delivered directly, or the phone's bubble would
+  // stay "queued" forever (codex round 3).
+  const conversationDeliveryTabs = (key: string, frameType: unknown): string[] => {
+    const viaMirror = typeof frameType === "string" && isMirrorSafeFrameType(frameType);
+    const tabs = conversationTabsFor(key);
+    return viaMirror ? tabs.filter((t) => !bridge.isAttachedViewerTab(t)) : tabs;
+  };
   const MAX_PARKED_CONVERSATION_FRAMES = 200;
   const parkedConversationFrames = new Map<string, Array<Record<string, unknown>>>();
   const pushToConversation = (key: string, frame: Record<string, unknown>): void => {
-    const tabs = conversationTabsFor(key);
+    const tabs = conversationDeliveryTabs(key, frame.type);
     if (tabs.length) {
       for (const t of tabs) bridge.push(frame, t);
       return;
@@ -2207,7 +2247,8 @@ export async function runPanelOrchestrator(): Promise<void> {
     },
     // Per-response usage → the panel's context/usage meter (updates live).
     onStatus: (key, status) => {
-      for (const t of conversationTabsFor(key)) pushStatus(t, status);
+      // agent_status is mirror-safe — attached viewers get it via their driven tab.
+      for (const t of conversationDeliveryTabs(key, "agent_status")) pushStatus(t, status);
     },
     // Report the SDK session id so the panel can persist it and resume on reload.
     // (The orchestrator's own disk store — written by the manager before this
@@ -2221,7 +2262,8 @@ export async function runPanelOrchestrator(): Promise<void> {
       // resolved model differs (bannerCorrection returns null otherwise, so a resume
       // with no prior greeting is never "corrected" and a correct banner never
       // duplicates). Per tab: each participating tab advertised its own banner.
-      for (const panelTab of conversationTabsFor(key)) {
+      // Banner corrections are "say" frames (mirror-safe) — viewers via mirror.
+      for (const panelTab of conversationDeliveryTabs(key, "say")) {
         if (typeof model === "string" && model.trim()) resolvedModelByTab.set(panelTab, model);
         const corrected = bannerCorrection({
           backend: backendForTab(panelTab),
@@ -2257,13 +2299,44 @@ export async function runPanelOrchestrator(): Promise<void> {
     // The agent dequeued a message (the true "read" moment) → flip that bubble
     // from queued/muted to read. Fanned out: tabs that don't know the mid ignore it.
     // #884 — this is also the moment the message's TURN begins, so its recorded
-    // issue-time workflow uuid becomes the conversation's stamp NOW (not at
-    // receipt — codex round 2): scope mutations of this turn are fenced to the
-    // workflow the message was actually sent from.
+    // issue-time workflow uuid becomes the conversation's stamp (not at receipt
+    // — codex round 2). One dispatch may batch SEVERAL messages: the batch's
+    // uuids aggregate over a microtask and stamp only when they AGREE — a mixed
+    // or unknown-origin batch fails closed (undefined stamp) instead of letting
+    // the last message re-aim the whole turn's mutations (codex round 3).
     onSeen: (key, mid) => {
+      let batch = pendingBatchStamp.get(key);
+      const opensBatch = !batch;
+      if (!batch) {
+        batch = { known: [], unknown: false };
+        pendingBatchStamp.set(key, batch);
+      }
       if (turnUuidByMid.has(mid)) {
-        lastTurnUuidByKey.set(key, turnUuidByMid.get(mid));
+        batch.known.push(turnUuidByMid.get(mid));
         turnUuidByMid.delete(mid);
+        noteConsumedTurnMid(mid);
+      } else if (!consumedTurnMids.has(mid)) {
+        // Unknown mid (evicted / non-user item): its origin workflow cannot be
+        // known — the batch must fail closed, never inherit a stale stamp.
+        batch.unknown = true;
+      }
+      // A consumed mid (a re-queued item) contributes nothing: its stamp was
+      // applied at its first dequeue and any newer message supersedes it.
+      if (opensBatch) {
+        const closed = batch;
+        queueMicrotask(() => {
+          pendingBatchStamp.delete(key);
+          const distinct = new Set(closed.known);
+          if (closed.unknown || distinct.size > 1) {
+            lastTurnUuidByKey.set(key, undefined);
+            logger.warn(
+              `[panel-orchestrator] ${key} dispatched a mixed/unknown-origin batch — no single workflow stamp is honest for it, so graph mutations FAIL CLOSED until the agent opens/pins a workflow or the next single-origin message (#884)`,
+            );
+          } else if (distinct.size === 1) {
+            lastTurnUuidByKey.set(key, distinct.values().next().value);
+          }
+          // size 0 (all re-queued): the stamp already in force stands.
+        });
       }
       pushToConversation(key, { type: "ack", ok: true, kind: "seen", mid });
     },
@@ -4334,6 +4407,9 @@ export async function runPanelOrchestrator(): Promise<void> {
       const tabId = event.tab_id;
       const mid = typeof (event as { mid?: unknown }).mid === "string" ? (event as { mid?: string }).mid : undefined;
       const removed = mid ? manager.cancelQueued(agentKeyFor(tabId), mid) : false;
+      // #884 — a cancelled message's issue-time stamp mapping dies with it, so
+      // the bounded map only ever holds LIVE queued messages (codex r3).
+      if (mid) turnUuidByMid.delete(mid);
       bridge.push({ type: "ack", ok: true, kind: "cancel_message", mid, removed }, tabId);
       return;
     }
@@ -4604,8 +4680,16 @@ export async function runPanelOrchestrator(): Promise<void> {
     // there is no dequeue signal to ride.
     {
       const issueUuid = tabCommandWorkflowUuid.get(event.tab_id);
-      if (userMid) recordTurnUuidForMid(userMid, issueUuid);
-      else lastTurnUuidByKey.set(agentKeyFor(event.tab_id), issueUuid);
+      if (userMid) {
+        recordTurnUuidForMid(userMid, issueUuid);
+      } else if (!manager.isTurnActive(agentKeyFor(event.tab_id))) {
+        // Mid-less (non-panel/legacy) message with NO dequeue signal to ride:
+        // apply immediately, but only while no turn is in flight — a busy
+        // conversation's live fence must never be flipped at receipt (codex
+        // r3). While busy, the previous stamp stands; if the canvas moved, the
+        // late mutation fails the panel fence closed.
+        lastTurnUuidByKey.set(agentKeyFor(event.tab_id), issueUuid);
+      }
     }
     {
       const originKey = agentKeyFor(event.tab_id);

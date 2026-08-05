@@ -44,6 +44,19 @@ import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { UiBridge } from "../services/ui-bridge.js";
 import { isScopeAddress } from "../services/session-scope.js";
+
+/** #884 — journal TICKETS (run completions #468, ask answers #486) must be
+ *  keyed by the REAL tab a run/card was routed to: the panel reports back under
+ *  that tab id, and a ticket keyed by the shared scope address a tool ctx is
+ *  bound to can never correlate — the agent's own render would come back
+ *  labeled "foreign" and boundary sweeps could never close the ticket (codex
+ *  round 3, P1). Resolves the scope to the active tab; a real-tab ctx is
+ *  returned unchanged. */
+function journalTabFor(ctx: PanelToolCtx): string {
+  if (!isScopeAddress(ctx.tabId)) return ctx.tabId;
+  const b = ctx.bridge as { resolveSharedTabId?: () => string | undefined };
+  return b.resolveSharedTabId?.() ?? ctx.tabId;
+}
 import {
   dispatchOutcomeOf,
   isCapabilityRefusal,
@@ -5358,7 +5371,9 @@ async function askUserWithGrace(
   } catch (err) {
     return fail(err);
   }
-  const tabId = ctx.tabId;
+  // #884 — the journal key is the REAL tab the card renders on (the bridge's
+  // late-answer sink records answers under it), never the scope address.
+  const tabId = journalTabFor(ctx);
   const fingerprint = askFingerprint(ask);
   // Open the ticket BEFORE dispatching: the answer can validate the instant the
   // card renders, and an answer that arrives with no ticket is unattributable.
@@ -6549,7 +6564,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // journal an undelivered completion and replay it into the right run
         // instead of losing it while the agent works through a goal.
         const correlatable = RunCompletions.openRun(queuedId, {
-          tabId: ctx.tabId,
+          // #884 — key the ticket by the REAL routed tab (see journalTabFor):
+          // the panel's `executed` event arrives under that id.
+          tabId: journalTabFor(ctx),
           ...(typeof args.to_node_id === "number" ? { toNodeId: args.to_node_id } : {}),
         });
         // Append anti-poll guidance: the agent should go idle after queuing so the
