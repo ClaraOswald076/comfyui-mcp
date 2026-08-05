@@ -2704,12 +2704,32 @@ async function updateViaGitCheckoutFallback(opts: {
         `(git pull in ${dir}), then RESTART ComfyUI.`,
     );
   }
+  // An ABSENT revision is its own answer. `gitRevision` reports an unresolvable
+  // HEAD as undefined rather than by throwing, so folding it into the
+  // "HEAD moved" arm would narrate "could not determine what HEAD is" as
+  // "determined HEAD changed" — the defect this file keeps being fixed for.
+  // Both arms REFUSE (that is right: this is before the mutation, and an
+  // unverifiable tree does not license a merge), but only the arm with two
+  // readable, DIFFERENT revisions may say something changed.
+  if (!casRev) {
+    throw new PanelInstallError(
+      `Panel update did NOT apply: ${managerReason}, and the git fallback is ` +
+        `REFUSED: the panel checkout at ${dir} has an UNREADABLE HEAD (git ` +
+        `resolved no revision at all) ` +
+        `immediately before the merge, so whether it is still the tree the safety ` +
+        `gates inspected (${prePullRev.slice(0, 8)}) could NOT be determined — that ` +
+        `is unknown, NOT proof that anything changed. NO git mutation was made — ` +
+        `though whether the Manager call itself changed anything is precisely what ` +
+        `its own status could not say. Check the panel repo (git status / git log), ` +
+        `then re-check install_panel(action='status').`,
+    );
+  }
   if (casRev !== prePullRev || casPorcelain !== "") {
     throw new PanelInstallError(
       `Panel update did NOT apply: ${managerReason}, and the git fallback is ` +
         `REFUSED: the panel checkout at ${dir} CHANGED between the safety gates ` +
         `and the merge — ` +
-        `${casRev !== prePullRev ? `HEAD moved ${prePullRev.slice(0, 8)} → ${casRev ? casRev.slice(0, 8) : "unreadable"}` : `the worktree is no longer clean:\n${casPorcelain}`}. ` +
+        `${casRev !== prePullRev ? `HEAD moved ${prePullRev.slice(0, 8)} → ${casRev.slice(0, 8)}` : `the worktree is no longer clean:\n${casPorcelain}`}. ` +
         `Something other than this update is writing to that tree, and a ` +
         `fast-forward would race it. NO git mutation was made by this fallback ` +
         `— but something else evidently DID change the checkout, so re-read it ` +
@@ -2746,7 +2766,18 @@ async function updateViaGitCheckoutFallback(opts: {
     try {
       const afterRev = deps.gitRevision(dir);
       const afterPorcelain = deps.gitStatusPorcelain(dir).trim();
-      if (afterRev === prePullRev && afterPorcelain === "") {
+      if (!afterRev) {
+        // `gitRevision` answers an unresolvable HEAD with undefined, not by
+        // throwing. "Could not read HEAD" is the same answer as a failed
+        // status read — UNKNOWN — and must not be routed into the arm that
+        // tells the user the tree is no longer in its pre-update state.
+        headline = `Panel update could NOT be confirmed`;
+        treeNote =
+          `The checkout was re-read afterwards but has an UNREADABLE HEAD ` +
+          `(git resolved no revision at all), so ` +
+          `whether the fast-forward applied partially — or anything else changed ` +
+          `${dir} — is UNKNOWN. Inspect it (git status / git log) before retrying.`;
+      } else if (afterRev === prePullRev && afterPorcelain === "") {
         headline = `Panel update did NOT apply`;
         treeNote =
           `The checkout was re-read afterwards and is unchanged (HEAD still ` +
@@ -2809,12 +2840,27 @@ async function updateViaGitCheckoutFallback(opts: {
         `restarting ComfyUI.`,
     );
   }
+  // Same distinction as the pre-merge CAS: an unresolvable HEAD comes back as
+  // undefined, not as a throw, and "we could not read HEAD" is not "another
+  // writer touched this tree". Both DISCLOSE — the merge has run either way —
+  // but only the readable third-revision arm may name a cause.
+  if (!postMergeRev) {
+    throw new PanelInstallError(
+      `Could not verify the panel update: the pinned fast-forward ALREADY RAN in ` +
+        `${dir}, but the checkout afterwards has an UNREADABLE HEAD (git ` +
+        `resolved no revision at all), so what ` +
+        `it now contains — and whether anything else wrote to it during the merge ` +
+        `— could NOT be determined. That is unknown, NOT evidence that something ` +
+        `else did. NOT reporting success. Inspect the panel repo (git status / ` +
+        `git log) before restarting ComfyUI.`,
+    );
+  }
   if (postMergePorcelain !== "" || (postMergeRev !== targetRev && postMergeRev !== prePullRev)) {
     throw new PanelInstallError(
       `Could not verify the panel update: the pinned fast-forward ALREADY RAN in ` +
         `${dir}, but the checkout afterwards is not what that merge alone would ` +
         `leave — ` +
-        `${postMergePorcelain !== "" ? `the worktree is dirty:\n${postMergePorcelain}` : `HEAD is ${postMergeRev ? postMergeRev.slice(0, 8) : "unreadable"}, neither the merged upstream (${targetRev.slice(0, 8)}) nor the pre-merge revision (${prePullRev.slice(0, 8)})`}. ` +
+        `${postMergePorcelain !== "" ? `the worktree is dirty:\n${postMergePorcelain}` : `HEAD is ${postMergeRev.slice(0, 8)}, neither the merged upstream (${targetRev.slice(0, 8)}) nor the pre-merge revision (${prePullRev.slice(0, 8)})`}. ` +
         `Another writer (a ComfyUI-Manager task, or a manual git operation) ` +
         `touched this tree during the merge, so the panel directory may now be ` +
         `INCONSISTENT. NOT reporting success. Inspect the panel repo (git ` +
