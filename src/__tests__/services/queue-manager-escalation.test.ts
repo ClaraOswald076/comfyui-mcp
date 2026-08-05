@@ -26,6 +26,9 @@ const queueBehavior = vi.hoisted(() => ({
     | "dies-late"
     | "named-late"
     | "unwatched-then-wedged"
+    | "gapped-then-wedged"
+    | "gapped-final-wedged"
+    | "target-clears-other-starts"
     | "stops-on-interrupt",
   calls: 0,
   freeFails: false,
@@ -65,6 +68,27 @@ vi.mock("../../comfyui/client.js", () => ({
     if (queueBehavior.mode === "named-late") {
       if (queueBehavior.calls <= 3) throw new Error("ECONNRESET");
       return { queue_running: [[1, "prompt-xyz"]], queue_pending: [] };
+    }
+    // Running at every poll that answers, but one poll in the MIDDLE of the
+    // honor window fails — so the window has a hole in it while still ending on
+    // a live reading. (With COMFYUI_MCP_INTERRUPT_S=3.2 the honor window fits
+    // three polls, calls 2–4; call 3 is the hole.)
+    if (queueBehavior.mode === "gapped-then-wedged") {
+      if (queueBehavior.calls === 3) throw new Error("ECONNRESET");
+      return { queue_running: [[1, "prompt-xyz"]], queue_pending: [] };
+    }
+    // Mirror image: the honor window answers throughout, and the hole is in the
+    // FINAL window instead (calls 5-7; call 6 is the hole).
+    if (queueBehavior.mode === "gapped-final-wedged") {
+      if (queueBehavior.calls === 6) throw new Error("ECONNRESET");
+      return { queue_running: [[1, "prompt-xyz"]], queue_pending: [] };
+    }
+    // The NAMED target is running at the pre-check, and a DIFFERENT job holds
+    // the running slot from the first poll on: the target cleared, the queue
+    // did not go idle.
+    if (queueBehavior.mode === "target-clears-other-starts") {
+      if (queueBehavior.calls === 1) return { queue_running: [[1, "prompt-xyz"]], queue_pending: [] };
+      return { queue_running: [[2, "someone-else"]], queue_pending: [] };
     }
     // Observed running at pre-check, honor window fails, final window: running.
     if (queueBehavior.mode === "unwatched-then-wedged") {
@@ -139,6 +163,9 @@ describe("cancel escalation never folds a dead queue into a wedge verdict", () =
       expect(res.wedged).toBe(false);
       expect(res.unverified).toBe(true);
       expect(res.honored).toBe(false);
+      // Nothing about the queue was established, so nothing may read this as
+      // permission to carry on (the tool turns this into isError).
+      expect(res.target_state).toBe("unknown");
       expect(res.message).toMatch(/UNKNOWN/);
       // It never answered — the message must not claim a transition.
       expect(res.message).toMatch(/did not answer during verification/);
@@ -156,6 +183,7 @@ describe("cancel escalation never folds a dead queue into a wedge verdict", () =
       const res = await cancelRunningJobEscalating({});
       expect(res.wedged).toBe(false);
       expect(res.unverified).toBe(true);
+      expect(res.target_state).toBe("unknown");
       expect(res.message).toMatch(/UNKNOWN/);
       // The final verification window never answered.
       expect(res.message).toMatch(/did not answer during verification/);
@@ -188,6 +216,65 @@ describe("cancel escalation never folds a dead queue into a wedge verdict", () =
     },
   );
 
+  // `lastPollFailed` was cleared by any later successful poll, so a window that
+  // went running → poll failure → running came back as plain "still-running"
+  // and the wedge message called it "~Ns of VERIFIED polling". A restart or a
+  // disconnect inside that hole is exactly the case the "restart ComfyUI, do
+  // NOT queue another run" guidance would be wrong about — a sampled
+  // observation with a gap narrated as continuous verification.
+  it(
+    "a window with a FAILED poll in the middle is not narrated as verified polling",
+    { timeout: 30000 },
+    async () => {
+      process.env.COMFYUI_MCP_INTERRUPT_S = "3.2"; // two polls per window
+      queueBehavior.mode = "gapped-then-wedged";
+      const res = await cancelRunningJobEscalating({});
+      // The verdict itself is unchanged: the last poll of each window answered
+      // and showed it running, and that IS a live reading of now. Only the
+      // claim about the window narrows — turning this into "unobservable"
+      // would be the overshoot, refusing a wedge that was actually observed.
+      expect(res.wedged).toBe(true);
+      expect(res.target_state).toBe("running");
+      expect(res.message).toMatch(/wedged inside a single step/);
+      expect(res.message).not.toMatch(/of verified polling/);
+      expect(res.message).toMatch(/did NOT answer throughout/);
+    },
+  );
+
+  // The stated duration spans BOTH windows, so a hole in either one makes the
+  // span not continuously verified. Checking only the first window left the
+  // same overclaim standing over a gap in the second (codex gate).
+  it(
+    "a gap in the FINAL window is not narrated as verified polling either",
+    { timeout: 30000 },
+    async () => {
+      process.env.COMFYUI_MCP_INTERRUPT_S = "3.2";
+      queueBehavior.mode = "gapped-final-wedged";
+      const res = await cancelRunningJobEscalating({});
+      expect(res.wedged).toBe(true);
+      expect(res.target_state).toBe("running");
+      expect(res.message).not.toMatch(/of verified polling/);
+      expect(res.message).toMatch(/did NOT answer throughout/);
+    },
+  );
+
+  // target_state answers for the JOB THIS CALL ADDRESSED, not for the queue.
+  // The cancel did exactly what it promised; the queue advancing to the next
+  // job is normal, and failing the call for it would be a false failure —
+  // clear_pending is the switch for emptying the queue.
+  it(
+    "a named target that clears while ANOTHER job runs is stopped, not unsettled",
+    { timeout: 20000 },
+    async () => {
+      queueBehavior.mode = "target-clears-other-starts";
+      const res = await cancelRunningJobEscalating({ prompt_id: "prompt-xyz" });
+      expect(res.target_state).toBe("stopped");
+      expect(res.wedged).toBe(false);
+      expect(res.honored).toBe(true);
+      expect(res.message).toMatch(/Interrupted the running job/);
+    },
+  );
+
   it(
     "a wedged verdict with a failed /free does not claim freed VRAM",
     { timeout: 20000 },
@@ -209,6 +296,7 @@ describe("cancel escalation never folds a dead queue into a wedge verdict", () =
       const res = await cancelRunningJobEscalating({});
       expect(res.wedged).toBe(true);
       expect(res.unverified).toBeUndefined();
+      expect(res.target_state).toBe("running");
       expect(res.message).toMatch(/wedged inside a single step/);
       // The stated duration must be BOTH windows (2s honor + 2s re-check here),
       // not just the first.
@@ -281,7 +369,11 @@ describe("cancel escalation never folds a dead queue into a wedge verdict", () =
       const res = await cancelRunningJobEscalating({});
       expect(res.honored).toBe(true);
       expect(res.wedged).toBe(false);
-      // The stop is verified; its cause is not.
+      // The stop is verified; its cause is not. `unverified` covers the CAUSE
+      // here, and target_state must not borrow that doubt: /queue was read and
+      // is empty, so a consumer treating this as unsettled would refuse a
+      // caller the free queue it can see.
+      expect(res.target_state).toBe("stopped");
       expect(res.message).toMatch(/what stopped it is unknown/);
       expect(res.message).not.toMatch(/freeing VRAM cleared it/);
     },
@@ -299,6 +391,9 @@ describe("cancel escalation never folds a dead queue into a wedge verdict", () =
       expect(res.honored).toBe(false);
       expect(res.unverified).toBe(true);
       expect(res.wedged).toBe(false);
+      // Same split: the START was never observed, but the queue is verifiably
+      // empty NOW.
+      expect(res.target_state).toBe("stopped");
       expect(res.message).toMatch(/nothing is running now/);
       expect(res.message).toMatch(/UNKNOWN/);
       expect(res.message).not.toMatch(/Interrupted the running job/);
@@ -394,6 +489,10 @@ describe("cancel escalation never folds a dead queue into a wedge verdict", () =
       // A job IS verifiably wedged — but its identity was never established.
       expect(res.wedged).toBe(true);
       expect(res.unverified).toBe(true);
+      // …so the FIELD must not claim the identity the prose disclaims. With no
+      // prompt_id and no pre-interrupt read, the poll established that SOME job
+      // is running, not that it is the one the interrupt addressed.
+      expect(res.target_state).toBe("unknown");
       expect(res.message).toMatch(/wedged inside a single step/);
       expect(res.message).toMatch(/Whether this IS the job the interrupt addressed is UNKNOWN/);
       expect(res.message).not.toMatch(/The running job/);

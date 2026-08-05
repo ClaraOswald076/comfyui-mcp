@@ -12,16 +12,25 @@ const realFs = vi.hoisted(() => ({
   readFileSync: undefined as unknown as typeof import("node:fs").readFileSync,
   existsSync: undefined as unknown as typeof import("node:fs").existsSync,
   writeFileSync: undefined as unknown as typeof import("node:fs").writeFileSync,
+  renameSync: undefined as unknown as typeof import("node:fs").renameSync,
+  rmSync: undefined as unknown as typeof import("node:fs").rmSync,
 }));
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   realFs.readFileSync = actual.readFileSync;
   realFs.existsSync = actual.existsSync;
   realFs.writeFileSync = actual.writeFileSync;
+  realFs.renameSync = actual.renameSync;
+  realFs.rmSync = actual.rmSync;
   return {
     ...actual,
     readFileSync: vi.fn(actual.readFileSync),
     existsSync: vi.fn(actual.existsSync),
+    // The durable write's final step, and the only hook that lands INSIDE the
+    // read-to-write window: every check has passed and the bytes have not
+    // reached the catalog path yet.
+    renameSync: vi.fn(actual.renameSync),
+    rmSync: vi.fn(actual.rmSync),
   };
 });
 import {
@@ -30,8 +39,10 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -520,9 +531,11 @@ describe("cleanup never deletes on a corrupt read", () => {
     const catalog = new LoraCatalog();
     let catalogReads = 0;
     vi.mocked(readFileSync).mockImplementation(((p: unknown, ...rest: unknown[]) => {
-      if (p === catalogPath && ++catalogReads === 3) {
-        // persist's two reads passed; the preview-cleanup read finds the file
-        // crash-truncated — nothing is known about what references the preview.
+      if (p === catalogPath && ++catalogReads === 4) {
+        // persist's two identity reads and its post-write read-back passed; the
+        // preview-cleanup read finds the file crash-truncated — nothing is
+        // known about what references the preview. (Index only; the assertion
+        // below is about the cleanup, not about how many reads persist makes.)
         return `{"version": 1, "entries": {"truncated": `;
       }
       return (realFs.readFileSync as (...a: unknown[]) => unknown)(p, ...rest);
@@ -568,5 +581,379 @@ describe("inaccessible is not absent", () => {
       vi.mocked(existsSync).mockImplementation(realFs.existsSync as never);
       vi.mocked(readFileSync).mockImplementation(realFs.readFileSync as never);
     }
+  });
+});
+
+// The gate on #839: persist() had no atomic exclusion between its last read and
+// its write. Two processes both read healthy V1, both pass `unchanged`, A
+// writes entry A, B writes entry B — and B's write silently erases A's. Because
+// both probes were healthy neither takes the corrupt-file backup, so there is
+// nothing to recover from either. Two agents on one rig is ordinary here.
+describe("two writers racing the catalog: no write is silently erased", () => {
+  const lockPath = () => `${catalogPath}.lock`;
+  const V1 = JSON.stringify({ version: 1, entries: {} });
+  /** A pid that cannot be running (the max Node will accept, never allocated). */
+  const DEAD_PID = 2147483646;
+
+  afterEach(() => {
+    vi.mocked(renameSync).mockImplementation(realFs.renameSync as never);
+    vi.mocked(rmSync).mockImplementation(realFs.rmSync as never);
+  });
+
+  it(
+    "a second writer landing between the first's checks and its WRITE is refused, not lost",
+    { timeout: 30000 },
+    () => {
+      // A genuine interleaving, not a simulation of one: catalogB's whole
+      // read-modify-write runs from inside catalogA's window, at the last
+      // moment before A's bytes reach the path. Both instances were built from
+      // the same healthy V1, so both pass every staleness check — which is
+      // exactly the state the loss needs.
+      writeFileSync(catalogPath, V1);
+      const catalogA = new LoraCatalog();
+      const catalogB = new LoraCatalog();
+
+      let bError: Error | undefined;
+      let raced = false;
+      vi.mocked(renameSync).mockImplementation(((from: string, to: string) => {
+        if (to === catalogPath && !raced) {
+          raced = true;
+          try {
+            catalogB.upsert({ relPath: "loras/from-b.safetensors" });
+          } catch (e) {
+            bError = e as Error;
+          }
+        }
+        return (realFs.renameSync as (a: string, b: string) => void)(from, to);
+      }) as never);
+
+      catalogA.upsert({ relPath: "loras/from-a.safetensors" });
+      expect(raced).toBe(true);
+
+      // B was TOLD. Silence is the defect: a write that reports success and is
+      // then overwritten is indistinguishable, to its caller, from one that
+      // stuck.
+      expect(bError?.message).toMatch(/held the LoRA catalog lock/);
+
+      // A's write is intact and B's entry is not half-there.
+      const onDisk = JSON.parse(realFs.readFileSync(catalogPath, "utf-8") as string) as {
+        entries: Record<string, unknown>;
+      };
+      expect(Object.keys(onDisk.entries)).toEqual(["loras-from-a"]);
+
+      // And B did not keep a mutation it was told did not land.
+      expect(catalogB.get("from-b")).toBeNull();
+    },
+  );
+
+  it("the contender that gets its turn is refused on the STALE BASELINE, then reconciles", () => {
+    // What the same race looks like once serialized, which is the ordinary
+    // outcome: B waits a few milliseconds, gets the lock, and finds the file is
+    // no longer the one it read. It must be told — and telling it must not be
+    // terminal, or the lock would have traded a silent loss for a dead end.
+    writeFileSync(catalogPath, V1);
+    const catalogA = new LoraCatalog();
+    const catalogB = new LoraCatalog();
+
+    catalogA.upsert({ relPath: "loras/from-a.safetensors" });
+    expect(existsSync(lockPath())).toBe(false); // A's turn is over
+
+    expect(() => catalogB.upsert({ relPath: "loras/from-b.safetensors" })).toThrow(
+      /changed on disk since it was read/,
+    );
+    // The refusal re-synced B onto A's state, so the retry lands on top of it
+    // instead of erasing it.
+    expect(catalogB.get("from-a")?.id).toBe("loras-from-a");
+    catalogB.upsert({ relPath: "loras/from-b.safetensors" });
+    const onDisk = JSON.parse(realFs.readFileSync(catalogPath, "utf-8") as string) as {
+      entries: Record<string, unknown>;
+    };
+    expect(Object.keys(onDisk.entries).sort()).toEqual(["loras-from-a", "loras-from-b"]);
+  });
+
+  it("a write waits out, then refuses, while another writer holds the lock", { timeout: 30000 }, () => {
+    writeFileSync(catalogPath, V1);
+    const catalog = new LoraCatalog();
+    // A live holder: this process's own pid, so no staleness rule can reclaim it.
+    writeFileSync(
+      lockPath(),
+      JSON.stringify({ pid: process.pid, token: "another-writer", at: new Date().toISOString() }),
+    );
+    expect(() => catalog.upsert({ relPath: "loras/blocked.safetensors" })).toThrow(
+      /held the LoRA catalog lock/,
+    );
+    // Nothing was written past the holder, and nothing lingered in memory.
+    expect(realFs.readFileSync(catalogPath, "utf-8")).toBe(V1);
+    expect(catalog.get("blocked")).toBeNull();
+    // The lock is the OTHER writer's: refusing must not free it.
+    expect(existsSync(lockPath())).toBe(true);
+  });
+
+  it("the refusal is not permanent — the next write goes through (no false refusal)", () => {
+    writeFileSync(catalogPath, V1);
+    const catalog = new LoraCatalog();
+    rmSync(lockPath(), { force: true });
+    catalog.upsert({ relPath: "loras/allowed.safetensors" });
+    expect(catalog.get("allowed")?.id).toBe("loras-allowed");
+    // The lock does not outlive the write it guarded.
+    expect(existsSync(lockPath())).toBe(false);
+  });
+
+  it("an ABANDONED lock is reclaimed rather than wedging the catalog forever", () => {
+    // A crashed writer leaves its lock behind. Treating that as a live holder
+    // is the fold pointed the other way: every later write refused because a
+    // file exists that nothing is using.
+    writeFileSync(catalogPath, V1);
+    const catalog = new LoraCatalog();
+    writeFileSync(
+      lockPath(),
+      JSON.stringify({ pid: DEAD_PID, token: "crashed", at: new Date().toISOString() }),
+    );
+    const old = new Date(Date.now() - 120_000);
+    utimesSync(lockPath(), old, old);
+    catalog.upsert({ relPath: "loras/after-crash.safetensors" });
+    expect(catalog.get("after-crash")?.id).toBe("loras-after-crash");
+  });
+
+  it("a lock with NO recorded owner is never reclaimed", { timeout: 30000 }, () => {
+    // A crash between the exclusive create and the record write leaves exactly
+    // this, and so does a process paused between those two syscalls. Age past
+    // the ordinary threshold does not distinguish them, and "no owner recorded"
+    // is an absence of evidence, not evidence of absence.
+    writeFileSync(catalogPath, V1);
+    const catalog = new LoraCatalog();
+    writeFileSync(lockPath(), "");
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lockPath(), old, old);
+    expect(() => catalog.upsert({ relPath: "loras/nope.safetensors" })).toThrow(
+      /held the LoRA catalog lock/,
+    );
+    expect(existsSync(lockPath())).toBe(true);
+  });
+
+  it("age alone never licenses a reclaim, however old the lock", { timeout: 30000 }, () => {
+    // A process can be suspended, debugger-paused, or blocked in I/O for an
+    // arbitrary time while inside the critical section, so "old" is not "gone".
+    // Reclaiming on age would be "could not determine the holder is gone" acted
+    // on as "the holder is gone" — with two writers and a silent loss as the
+    // payout. Refuse, and say what a person needs to clear it.
+    writeFileSync(catalogPath, V1);
+    const catalog = new LoraCatalog();
+    writeFileSync(
+      lockPath(),
+      JSON.stringify({ pid: process.pid, token: "paused-holder", at: new Date().toISOString() }),
+    );
+    const ancient = new Date(Date.now() - 60 * 60_000);
+    utimesSync(lockPath(), ancient, ancient);
+    const err = (() => {
+      try {
+        catalog.upsert({ relPath: "loras/nope.safetensors" });
+        return undefined;
+      } catch (e) {
+        return e as Error;
+      }
+    })();
+    // The refusal has to hand over what it knows, or the wedge is unactionable.
+    expect(err?.message).toMatch(/still running/);
+    expect(err?.message).toContain(`pid ${process.pid}`);
+    expect(err?.message).toMatch(/delete that file/);
+    expect(existsSync(lockPath())).toBe(true);
+  });
+
+  it("a reclaim CLAIM held by another reclaimer stops this one from acting", { timeout: 30000 }, () => {
+    // Two reclaimers acting on one stale lock is the whole danger: the first
+    // frees the path, a third writer takes the freed pathname, and the second
+    // lifts THAT one off — two writers in the critical section. Serializing
+    // reclaim makes the sequence unreachable.
+    writeFileSync(catalogPath, V1);
+    const catalog = new LoraCatalog();
+    writeFileSync(
+      lockPath(),
+      JSON.stringify({ pid: DEAD_PID, token: "crashed", at: new Date().toISOString() }),
+    );
+    const old = new Date(Date.now() - 120_000);
+    utimesSync(lockPath(), old, old);
+    writeFileSync(`${lockPath()}.reclaim`, ""); // another reclaimer is deciding
+    expect(() => catalog.upsert({ relPath: "loras/nope.safetensors" })).toThrow(
+      /held the LoRA catalog lock/,
+    );
+    // Untouched: the other reclaimer's decision is the one that counts.
+    expect(existsSync(lockPath())).toBe(true);
+  });
+
+  it("a reclaim claim left by a DEAD reclaimer does not disable reclaim forever", () => {
+    // The claim is cleared by the SAME rule as the lock — a recorded owner that
+    // is provably gone — so a crashed reclaimer cannot disable reclaim for good.
+    writeFileSync(catalogPath, V1);
+    const catalog = new LoraCatalog();
+    writeFileSync(
+      lockPath(),
+      JSON.stringify({ pid: DEAD_PID, token: "crashed", at: new Date().toISOString() }),
+    );
+    const old = new Date(Date.now() - 120_000);
+    utimesSync(lockPath(), old, old);
+    writeFileSync(
+      `${lockPath()}.reclaim`,
+      JSON.stringify({ pid: DEAD_PID, token: "dead-reclaimer" }),
+    );
+    utimesSync(`${lockPath()}.reclaim`, old, old);
+    catalog.upsert({ relPath: "loras/unwedged.safetensors" });
+    expect(catalog.get("unwedged")?.id).toBe("loras-unwedged");
+  });
+
+  it("a claim whose owner is ALIVE is never cleared, however old", { timeout: 30000 }, () => {
+    // An age rule here would be the fold the main lock stopped committing, one
+    // level down: a reclaimer PAUSED inside its claim is not a dead one, and
+    // clearing its claim lets a second reclaimer run concurrently — the exact
+    // sequence the claim exists to prevent.
+    writeFileSync(catalogPath, V1);
+    const catalog = new LoraCatalog();
+    writeFileSync(
+      lockPath(),
+      JSON.stringify({ pid: DEAD_PID, token: "crashed", at: new Date().toISOString() }),
+    );
+    const old = new Date(Date.now() - 60 * 60_000);
+    utimesSync(lockPath(), old, old);
+    writeFileSync(
+      `${lockPath()}.reclaim`,
+      JSON.stringify({ pid: process.pid, token: "paused-reclaimer" }),
+    );
+    utimesSync(`${lockPath()}.reclaim`, old, old);
+    // The LOCK is reclaimable, but not by this call: the claim says someone
+    // else is already deciding.
+    expect(() => catalog.upsert({ relPath: "loras/nope.safetensors" })).toThrow(
+      /held the LoRA catalog lock/,
+    );
+    expect(existsSync(`${lockPath()}.reclaim`)).toBe(true);
+  });
+
+  it("a lock this process could not RELEASE is cleared by its own next write", () => {
+    // Nothing else can ever clear it: reclaim needs a provably dead owner, and
+    // the owner is this process, alive. Without a token-proved retry, one
+    // transient rmSync failure refuses every catalog write for the life of the
+    // server — a wedge born of the fix.
+    writeFileSync(catalogPath, V1);
+    const catalog = new LoraCatalog();
+    let failed = false;
+    vi.mocked(rmSync).mockImplementation(((target: string, opts?: unknown) => {
+      if (!failed && target === lockPath()) {
+        failed = true;
+        throw Object.assign(new Error("EBUSY: resource busy or locked"), { code: "EBUSY" });
+      }
+      return (realFs.rmSync as (a: string, b?: unknown) => void)(target, opts);
+    }) as never);
+
+    // The write itself succeeds — only its lock is left behind.
+    catalog.upsert({ relPath: "loras/first.safetensors" });
+    expect(failed).toBe(true);
+    expect(existsSync(lockPath())).toBe(true);
+
+    catalog.upsert({ relPath: "loras/second.safetensors" });
+    expect(catalog.get("second")?.id).toBe("loras-second");
+    expect(existsSync(lockPath())).toBe(false);
+  });
+
+  it("a lock that CHANGES mid-reclaim is put back, not stolen", { timeout: 30000 }, () => {
+    // The reclaim takes the lock aside before judging it, because a
+    // stat-then-unlink can free a path a third writer has already taken. If
+    // what it took is not the instance it judged, it must go back — and go back
+    // in a way that cannot clobber whatever landed in the meantime.
+    writeFileSync(catalogPath, V1);
+    const catalog = new LoraCatalog();
+    writeFileSync(
+      lockPath(),
+      JSON.stringify({ pid: DEAD_PID, token: "crashed", at: new Date().toISOString() }),
+    );
+    const old = new Date(Date.now() - 120_000);
+    utimesSync(lockPath(), old, old);
+    // Stand in for the fresh lock that replaced the stale one in the gap: what
+    // the reclaim lifts off the path is not what it judged.
+    vi.mocked(renameSync).mockImplementation(((from: string, to: string) => {
+      (realFs.renameSync as (a: string, b: string) => void)(from, to);
+      if (from === lockPath()) {
+        const now = new Date();
+        utimesSync(to, now, now);
+      }
+    }) as never);
+    expect(() => catalog.upsert({ relPath: "loras/nope.safetensors" })).toThrow(
+      /held the LoRA catalog lock/,
+    );
+    expect(existsSync(lockPath())).toBe(true);
+    expect(realFs.readFileSync(catalogPath, "utf-8")).toBe(V1);
+  });
+
+  it("an OLD lock whose owner is still alive is never reclaimed", { timeout: 30000 }, () => {
+    // Age alone does not license a reclaim: freeing a path a live writer is
+    // still inside reintroduces exactly the loss the lock prevents.
+    writeFileSync(catalogPath, V1);
+    const catalog = new LoraCatalog();
+    writeFileSync(
+      lockPath(),
+      JSON.stringify({ pid: process.pid, token: "slow-but-alive", at: new Date().toISOString() }),
+    );
+    const old = new Date(Date.now() - 120_000);
+    utimesSync(lockPath(), old, old);
+    expect(() => catalog.upsert({ relPath: "loras/nope.safetensors" })).toThrow(
+      /held the LoRA catalog lock/,
+    );
+    expect(existsSync(lockPath())).toBe(true);
+  });
+
+  it("a write that FAILED after its bytes landed is disclosed, not reported as unsaved", () => {
+    // writeFileDurable is strict by design: it throws when the directory entry's
+    // durability is unproven, which happens AFTER the atomic rename — the bytes
+    // are already on the path. Rethrowing that as a failed save tells the caller
+    // its change was not applied when it was: this file's own defect pointed the
+    // other way. Only the read-back can tell the two sides of the rename apart.
+    writeFileSync(catalogPath, V1);
+    const catalog = new LoraCatalog();
+    vi.mocked(renameSync).mockImplementation(((from: string, to: string) => {
+      (realFs.renameSync as (a: string, b: string) => void)(from, to);
+      if (to === catalogPath) {
+        throw Object.assign(new Error("EIO: directory fsync failed"), { code: "EIO" });
+      }
+    }) as never);
+    catalog.upsert({ relPath: "loras/landed.safetensors" });
+    expect(catalog.get("landed")?.id).toBe("loras-landed");
+    const onDisk = JSON.parse(realFs.readFileSync(catalogPath, "utf-8") as string) as {
+      entries: Record<string, unknown>;
+    };
+    expect(Object.keys(onDisk.entries)).toEqual(["loras-landed"]);
+  });
+
+  it("a write that failed BEFORE its bytes landed still fails (control)", () => {
+    writeFileSync(catalogPath, V1);
+    const catalog = new LoraCatalog();
+    vi.mocked(renameSync).mockImplementation(((from: string, to: string) => {
+      if (to === catalogPath) throw Object.assign(new Error("ENOSPC: no space"), { code: "ENOSPC" });
+      return (realFs.renameSync as (a: string, b: string) => void)(from, to);
+    }) as never);
+    expect(() => catalog.upsert({ relPath: "loras/lost.safetensors" })).toThrow(/ENOSPC/);
+    expect(realFs.readFileSync(catalogPath, "utf-8")).toBe(V1);
+    expect(catalog.get("lost")).toBeNull();
+  });
+
+  it("a write that does not read back as what was written is reported, not assumed", () => {
+    // The write returned without throwing, which is not the same as the bytes
+    // having arrived. Taking the INTENDED bytes as the new baseline is what
+    // would let the next persist pass its unchanged check against a file
+    // nobody ever wrote, and quietly overwrite whatever is really there.
+    writeFileSync(catalogPath, V1);
+    const catalog = new LoraCatalog();
+    vi.mocked(renameSync).mockImplementation(((from: string, to: string) => {
+      if (to === catalogPath) {
+        // The rename "succeeds" but something else is at the path.
+        realFs.writeFileSync(catalogPath, JSON.stringify({ version: 1, entries: {} }, null, 2));
+        rmSync(from, { force: true });
+        return;
+      }
+      return (realFs.renameSync as (a: string, b: string) => void)(from, to);
+    }) as never);
+    expect(() => catalog.upsert({ relPath: "loras/ghost.safetensors" })).toThrow(
+      /does not read back as what was just written/,
+    );
+    // Refuse-vs-disclose: the message says NOT CONFIRMED, never that the file
+    // was left alone — and memory is re-synced onto whatever is really there.
+    expect(catalog.get("ghost")).toBeNull();
   });
 });

@@ -171,7 +171,11 @@ describe("queue actions call the same services with the same arguments", () => {
   });
 
   it('action:"cancel" returns the escalation message as text, and isError when wedged', async () => {
-    mocks.cancelRunningJobEscalating.mockResolvedValueOnce({ wedged: false, message: "Job interrupted." });
+    mocks.cancelRunningJobEscalating.mockResolvedValueOnce({
+      wedged: false,
+      target_state: "stopped",
+      message: "Job interrupted.",
+    });
     const ok = await handler()({ action: "cancel", prompt_id: "p1", clear_pending: true });
     expect(mocks.cancelRunningJobEscalating).toHaveBeenCalledWith({
       prompt_id: "p1",
@@ -180,7 +184,11 @@ describe("queue actions call the same services with the same arguments", () => {
     expect(ok.isError).toBeUndefined();
     expect(text(ok)).toBe("Job interrupted.");
 
-    mocks.cancelRunningJobEscalating.mockResolvedValueOnce({ wedged: true, message: "WEDGED — restart." });
+    mocks.cancelRunningJobEscalating.mockResolvedValueOnce({
+      wedged: true,
+      target_state: "running",
+      message: "WEDGED — restart.",
+    });
     const wedged = await handler()({ action: "cancel" });
     expect(mocks.cancelRunningJobEscalating).toHaveBeenCalledWith({
       prompt_id: undefined,
@@ -188,6 +196,57 @@ describe("queue actions call the same services with the same arguments", () => {
     });
     expect(wedged.isError).toBe(true);
     expect(text(wedged)).toBe("WEDGED — restart.");
+  });
+
+  // The tri-state reached the service in #839 but not this consumer: `isError`
+  // keyed off `wedged` alone, so an unreadable /queue — reported honestly by
+  // the service as target_state:"unknown", wedged:false — came back as an MCP
+  // SUCCESS. A caller reads that as permission to queue more work against a
+  // queue whose state nobody established.
+  describe('action:"cancel" only reports success for an outcome /queue settled', () => {
+    it("an unreadable queue is NOT a success — and the disclosure survives", async () => {
+      mocks.cancelRunningJobEscalating.mockResolvedValueOnce({
+        wedged: false,
+        unverified: true,
+        target_state: "unknown",
+        message: "⚠️ /queue did not answer during verification, so whether it is still running is UNKNOWN.",
+      });
+      const res = await handler()({ action: "cancel" });
+      expect(res.isError).toBe(true);
+      // isError marks the outcome unsettled; it must not swallow the detail,
+      // which is the only thing telling the caller what to check.
+      expect(text(res)).toMatch(/UNKNOWN/);
+    });
+
+    it("a clear_pending that FAILED is not a success either", async () => {
+      mocks.cancelRunningJobEscalating.mockResolvedValueOnce({
+        wedged: false,
+        target_state: "stopped",
+        pending_clear_failed: true,
+        message: "Interrupted the running job. Clearing pending jobs FAILED — they may still be queued.",
+      });
+      const res = await handler()({ action: "cancel", clear_pending: true });
+      expect(res.isError).toBe(true);
+      expect(text(res)).toMatch(/FAILED/);
+    });
+
+    // THE INVERSE, which is how this fix would overshoot: `unverified` also
+    // covers "it demonstrably stopped, we just cannot say our interrupt is
+    // why". /queue was read and is empty. Failing that would refuse a caller
+    // the queue it can see is free.
+    it("a verifiably empty queue is a success even when the CAUSE is unverified", async () => {
+      mocks.cancelRunningJobEscalating.mockResolvedValueOnce({
+        wedged: false,
+        unverified: true,
+        target_state: "stopped",
+        message:
+          "Nothing is running now (verified via /queue), but the queue could not be read " +
+          "BEFORE the interrupt, so what stopped it is UNKNOWN.",
+      });
+      const res = await handler()({ action: "cancel" });
+      expect(res.isError).toBeUndefined();
+      expect(text(res)).toMatch(/verified via \/queue/);
+    });
   });
 
   it('action:"cancel_queued" returns the exact prose confirmation', async () => {
