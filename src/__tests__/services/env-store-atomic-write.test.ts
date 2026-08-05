@@ -76,6 +76,9 @@ const fsState = vi.hoisted(() => ({
   /** Make writing the LEGACY json store fail — it happens after the .env
    *  removal has already landed. */
   failJsonStoreWrite: false,
+  /** Make hard links unavailable, as exFAT and some network mounts do, so the
+   *  COPY fallback for the pre-write snapshot is exercised. */
+  failLink: false,
   /** Make writeSync accept only this many bytes per call (0 = unlimited), so a
    *  SHORT write is testable: an unchecked one installs a truncated store. */
   maxWriteBytes: 0,
@@ -177,6 +180,9 @@ vi.mock("node:fs", async (importOriginal) => {
   }) as typeof actual.writeSync;
   const linkSync: typeof actual.linkSync = (from, to) => {
     if (isStore(from)) fsState.links.push(String(from));
+    if (fsState.failLink && isStore(from)) {
+      throw Object.assign(new Error("EPERM: operation not permitted, link"), { code: "EPERM" });
+    }
     return actual.linkSync(from, to);
   };
   const existsSync: typeof actual.existsSync = (path) => {
@@ -259,6 +265,7 @@ beforeEach(() => {
   fsState.storeExists = 0;
   fsState.links = [];
   fsState.failJsonStoreWrite = false;
+  fsState.failLink = false;
   fsState.maxWriteBytes = 0;
   fsState.readsSinceRename = -1;
   dir = mkdtempSync(join(tmpdir(), "cmcp-atomic-"));
@@ -491,6 +498,23 @@ describe("a save is never CONFIRMED over lost credentials", () => {
     const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
     expect(r.persisted).toBe("yes");
     expect(r.lostKeys).toBeUndefined();
+  });
+
+  it("does not claim a CLEAN account when the snapshot had to be COPIED", () => {
+    // On a filesystem without hard links the snapshot falls back to a copy. A
+    // copy is not atomic and takes measurable time, so a writer landing during
+    // it — or between it and the rename — is invisible to it. Treating that as
+    // the same observation as the link claimed a completeness it does not have
+    // (codex gate). The key still saves; the ACCOUNT is what is downgraded.
+    writeFileSync(envPath, POPULATED, { mode: 0o600 });
+    fsState.failLink = true;
+    const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+    fsState.failLink = false;
+    expect(parseEnvFile()!.CIVITAI_API_TOKEN).toBe("civ-new"); // it did save
+    expect(r.persisted).not.toBe("yes");
+    expect(r.persisted).toBe("unknown");
+    expect(r.uncertainty).toMatch(/does not support hard links/);
+    expect(r.uncertainty).toMatch(/not atomic/);
   });
 
   it("does not throw when the pre-write snapshot cannot be removed", () => {

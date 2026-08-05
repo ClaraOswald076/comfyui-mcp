@@ -528,6 +528,10 @@ function read(home?: string): PanelSecrets {
 }
 
 function write(secrets: PanelSecrets): void {
+  // The LEGACY store is a credential file too, redirected by its own env var —
+  // and the runtime guard only ever covered the canonical one, so a test could
+  // still rewrite the developer's real panel-secrets.json (codex gate).
+  assertPanelSecretsRedirectedInTests();
   const p = panelSecretsPath();
   mkdirSync(dirname(p), { recursive: true });
   // Atomic for the same reason as the .env: an in-place truncate+write that is
@@ -672,6 +676,17 @@ function assertStoreIsRedirectedInTests(): void {
     "Refusing to write the credential store from a test run: COMFYUI_MCP_ENV_FILE is not set, " +
       `so this would write the developer's real ${comfyuiEnvFilePath()} and can destroy live tokens. ` +
       "Point COMFYUI_MCP_ENV_FILE at a temp file in the test's setup (see secret-store-test-isolation.test.ts).",
+  );
+}
+
+/** The same refusal for the LEGACY json store, which has its own redirect. */
+function assertPanelSecretsRedirectedInTests(): void {
+  if (!runningUnderTestRunner()) return; // uncertain → ALLOW the write
+  if (process.env.COMFYUI_MCP_PANEL_SECRETS) return;
+  throw new Error(
+    "Refusing to write the legacy credential store from a test run: COMFYUI_MCP_PANEL_SECRETS is not set, " +
+      `so this would write the developer's real ${panelSecretsPath()} and can destroy live tokens and OAuth state. ` +
+      "Point COMFYUI_MCP_PANEL_SECRETS at a temp file in the test's setup.",
   );
 }
 
@@ -903,6 +918,10 @@ function rewriteEnvFile(
     // The snapshot of what we REPLACE, captured at the swap itself.
     const sentinel = `${p}.pre-${process.pid}-${nonce}`;
     let sentinelTaken = false;
+    /** The snapshot came from a COPY, not a link. A copy is not atomic and takes
+     *  measurable time, so it is a weaker observation than the link: a writer
+     *  landing between the copy and the rename is invisible to it. */
+    let sentinelViaCopy = false;
     /** Was there a file to replace at the moment of the swap? When there was
      *  not, "nothing was there" IS the snapshot — there is nothing to lose. */
     let targetExistedAtSwap = false;
@@ -963,6 +982,7 @@ function rewriteEnvFile(
           try {
             copyFileSync(p, sentinel);
             sentinelTaken = true;
+            sentinelViaCopy = true;
             targetExistedAtSwap = true;
             // copyFileSync creates with the default mode, and this file is a
             // copy of the credential store — put it back to owner-only at once.
@@ -1087,7 +1107,11 @@ function rewriteEnvFile(
       : !basisIsSnapshot
         ? `the state this save replaced in ${p} could not be snapshotted, so the loss account rests on a read taken before the swap ` +
           `and cannot cover a write that landed after it`
-        : sawConcurrentWriter
+        : sentinelViaCopy
+          ? `this filesystem does not support hard links, so the state this save replaced was snapshotted by COPYING it — ` +
+            `which is not atomic and takes measurable time, unlike the link used elsewhere. A write landing during that copy, ` +
+            `or between it and the rename, is not covered by the account above`
+          : sawConcurrentWriter
           ? `another process was writing ${p} during this save (a compare-and-swap conflict was hit and retried). ` +
             `The snapshot of the replaced state and the rename are two adjacent operations, so a write landing exactly between them ` +
             `is replaced by this one without appearing in any read — this save cannot rule that out`
@@ -1173,6 +1197,13 @@ function upsertEnvFile(key: string, value: string): EnvWriteOutcome {
  * rename is a DISCLOSURE. The loss now rides out on the outcome.
  */
 function removeEnvFileKey(key: string): EnvWriteOutcome {
+  // BEFORE the early return. `rewriteEnvFile` asserts this, but the "no file, so
+  // nothing to do" shortcut returned in front of it — and the caller
+  // (`removeEnvSecret`) then went on to purge and REWRITE the legacy
+  // panel-secrets.json, so a test that reached a removal through a helper could
+  // still delete the developer's real legacy credential (codex gate). A guard
+  // with a path around it is not a guard.
+  assertStoreIsRedirectedInTests();
   const p = envFilePath();
   if (!existsSync(p)) {
     return { changed: false, lostKeys: [], lostCommentLines: 0, lossCheck: "clean", durabilityGap: null };

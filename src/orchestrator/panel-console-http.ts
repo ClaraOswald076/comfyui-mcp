@@ -434,12 +434,25 @@ export function startPanelConsoleHttpServer(opts: {
             // generic `ok:false` in the catch below and the caller retried a
             // removal that had already run, against a store that had already
             // lost keys (codex gate).
+            // Everything the removal owes the caller — lost keys, an incomplete
+            // loss account, dropped comments, a write that is not crash-durable,
+            // a legacy purge that failed. Built from the one shared list, not
+            // from this endpoint's own idea of which fields matter, and computed
+            // BEFORE any branch returns: the damage branch used to return in
+            // front of this and in front of the end-state check, so a revoke that
+            // lost keys reported neither its other obligations nor whether the
+            // credential still resolves (codex gate).
+            const clearWarnings = removeDisclosures(clearOutcome, envStorePath());
+            const state = slotRevokeState(slot);
             if (clearOutcome.lostKeys.length) {
               sendJson(res, 500, {
                 ok: false,
                 slot,
                 cleared: removed,
                 lost_keys: clearOutcome.lostKeys,
+                // The verified end state, which this branch skipped entirely.
+                still_resolves: state === "unknown" ? null : state === "still-resolves",
+                ...(clearWarnings.length ? { warnings: clearWarnings } : {}),
                 error:
                   `"${slot}" WAS removed from the credential store, but the store no longer carries ${clearOutcome.lostKeys.join(", ")} — ` +
                   `${clearOutcome.lostKeys.length > 1 ? "those credentials were" : "that credential was"} lost during the rewrite. ` +
@@ -447,13 +460,6 @@ export function startPanelConsoleHttpServer(opts: {
               });
               return;
             }
-            // Everything else the removal owes the caller — an incomplete loss
-            // account, dropped comments, a write that is not crash-durable.
-            // Built from the one shared list, not from this endpoint's own idea
-            // of which fields matter: reading only `changed` is how an
-            // unaccounted-for removal came back as a clean 200 (codex gate).
-            const clearWarnings = removeDisclosures(clearOutcome, envStorePath());
-            const state = slotRevokeState(slot);
             if (state === "still-resolves") {
               sendJson(res, 500, {
                 ok: false,
@@ -526,16 +532,32 @@ export function startPanelConsoleHttpServer(opts: {
             // "damaged"`, which is not "yes", so `confirmed` is false and this
             // branch is the only way out.
             if (outcome.lostKeys.length) {
+              // Say which post-state we are ACTUALLY in. "Nothing was rolled
+              // back" was asserted unconditionally here, but this branch is also
+              // reached when a FAILED save rolled back and the rollback is what
+              // lost the keys — so it stated a post-state that had not happened
+              // (codex gate). `rolledBack` is the outcome's own answer.
+              const rollbackNote = outcome.receipts.some((r) => r.persisted === "damaged")
+                ? `Nothing was rolled back: a rollback cannot bring them back and would be one more rewrite of a damaged store.`
+                : outcome.rolledBack
+                  ? `The slot itself was rolled back, but that rollback is what the store lost these entries during — it cannot be undone by repeating it.`
+                  : `The slot was NOT left in its previous state either; see stranded_keys / unverified_restore_keys.`;
               sendJson(res, 500, {
                 ok: false,
                 slot,
                 // Key NAMES only — never a value.
                 lost_keys: outcome.lostKeys,
                 saved_but_damaged: true,
+                rolled_back: outcome.rolledBack,
+                ...(outcome.strandedKeys.length ? { stranded_keys: outcome.strandedKeys } : {}),
+                ...(outcome.unverifiedKeys.length
+                  ? { unverified_restore_keys: outcome.unverifiedKeys }
+                  : {}),
+                ...(outcome.restoreWarnings?.length ? { warnings: outcome.restoreWarnings } : {}),
                 error:
                   `"${slot}" was written to the credential store, but the store no longer carries ${outcome.lostKeys.join(", ")} — ` +
                   `${outcome.lostKeys.length > 1 ? "those credentials were" : "that credential was"} lost during the write. This is NOT a successful save. ` +
-                  `Nothing was rolled back: a rollback cannot bring them back and would be one more rewrite of a damaged store. ` +
+                  `${rollbackNote} ` +
                   `Inspect the file and restore the missing ${outcome.lostKeys.length > 1 ? "entries" : "entry"} before relying on anything in it.`,
               });
               return;

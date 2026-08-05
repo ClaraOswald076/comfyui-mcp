@@ -11,7 +11,7 @@
 // hazard from coming back the next time a secrets test is added.
 
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join, relative, resolve } from "node:path";
@@ -131,6 +131,81 @@ describe("secret-store test isolation", () => {
     // (where the marker genuinely is present) an unredirected write is refused.
     // That case is covered by the test above.
     expect(runningUnderTestRunner()).toBe(true);
+  });
+
+  it("refuses a REMOVAL too — including when the .env does not exist yet", async () => {
+    // The guard was asserted inside the rewrite, but the "no file, so nothing to
+    // do" shortcut returned in front of it — and the caller then went on to
+    // purge and REWRITE the legacy panel-secrets.json, so a test reaching a
+    // removal through a helper could still delete the developer's real legacy
+    // credential (codex gate). A guard with a path around it is not a guard.
+    const { removeComfyuiSecret } = await import("../../services/panel-secrets.js");
+    const saved = process.env.COMFYUI_MCP_ENV_FILE;
+    const savedJson = process.env.COMFYUI_MCP_PANEL_SECRETS;
+    const savedHome = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+    const dir = mkdtempSync(join(tmpdir(), "cmcp-guard-rm-"));
+    try {
+      // Redirected: allowed, whether or not the file exists.
+      process.env.COMFYUI_MCP_ENV_FILE = join(dir, "definitely-absent", ".env");
+      expect(() => removeComfyuiSecret("CIVITAI_API_TOKEN")).not.toThrow();
+
+      // NOT redirected, and the un-redirected store genuinely does NOT exist —
+      // which is the whole point: the shortcut for "no file" is the path that
+      // ran in front of the guard. Home is pointed at an empty temp dir so this
+      // does not depend on whether the developer happens to have a real store,
+      // and so a regression writes there rather than to their home directory.
+      delete process.env.COMFYUI_MCP_ENV_FILE;
+      process.env.HOME = dir;
+      process.env.USERPROFILE = dir;
+      const { comfyuiEnvFilePath } = await import("../../env-file.js");
+      expect(resolve(comfyuiEnvFilePath()).startsWith(resolve(dir))).toBe(true);
+      expect(existsSync(comfyuiEnvFilePath())).toBe(false); // the shortcut's path
+      expect(() => removeComfyuiSecret("CIVITAI_API_TOKEN")).toThrow(
+        /Refusing to write the credential store from a test run/,
+      );
+    } finally {
+      if (saved === undefined) delete process.env.COMFYUI_MCP_ENV_FILE;
+      else process.env.COMFYUI_MCP_ENV_FILE = saved;
+      if (savedJson === undefined) delete process.env.COMFYUI_MCP_PANEL_SECRETS;
+      else process.env.COMFYUI_MCP_PANEL_SECRETS = savedJson;
+      if (savedHome.HOME === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome.HOME;
+      if (savedHome.USERPROFILE === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = savedHome.USERPROFILE;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to write the LEGACY store from a test that forgot to redirect it", async () => {
+    // panel-secrets.json holds legacy tokens and the OAuth status mirror, and it
+    // has its OWN redirect — which the runtime guard never covered.
+    const { setOAuthStatus } = await import("../../services/panel-secrets.js");
+    const saved = process.env.COMFYUI_MCP_PANEL_SECRETS;
+    const savedHome = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+    const dir = mkdtempSync(join(tmpdir(), "cmcp-guard-json-"));
+    try {
+      // HOME is redirected as well as the store, so that if the guard ever
+      // REGRESSES this test writes to a temp directory instead of the
+      // developer's real panel-secrets.json. A test for a guard must not depend
+      // on the guard it is testing — this one did, and a mutation run that
+      // removed the guard duly overwrote the real file's OAuth status mirror.
+      process.env.HOME = dir;
+      process.env.USERPROFILE = dir;
+      delete process.env.COMFYUI_MCP_PANEL_SECRETS;
+      const { panelSecretsPath } = await import("../../services/panel-secrets.js");
+      expect(resolve(panelSecretsPath()).startsWith(resolve(dir))).toBe(true);
+      expect(() => setOAuthStatus({ provider: "codex", account_label: "x", obtained_at: 1 })).toThrow(
+        /Refusing to write the legacy credential store from a test run/,
+      );
+    } finally {
+      if (saved === undefined) delete process.env.COMFYUI_MCP_PANEL_SECRETS;
+      else process.env.COMFYUI_MCP_PANEL_SECRETS = saved;
+      if (savedHome.HOME === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome.HOME;
+      if (savedHome.USERPROFILE === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = savedHome.USERPROFILE;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("allows the write once the store IS redirected", async () => {

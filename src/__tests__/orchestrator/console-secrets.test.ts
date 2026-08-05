@@ -30,15 +30,19 @@ const fsState = vi.hoisted(() => ({
   /** Replace what the rename installs, so the store comes back missing keys it
    *  held before — the data-loss case this endpoint used to answer ok:true to. */
   tamperOnRename: null as null | (() => string),
+  /** Per-rename tamper (1-based), so a specific write in a slot fan-out — or its
+   *  ROLLBACK — can be singled out. */
+  tamperAtRename: {} as Record<number, () => string>,
 }));
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   const isStore = (p: unknown) => String(p).endsWith(".env");
   const renameSync: typeof actual.renameSync = (from, to) => {
     if (isStore(to)) {
-      const tamper = fsState.tamperOnRename;
+      const tamper = fsState.tamperOnRename ?? fsState.tamperAtRename[fsState.renames + 1];
       if (tamper) {
         fsState.tamperOnRename = null;
+        delete fsState.tamperAtRename[fsState.renames + 1];
         actual.writeFileSync(from, tamper());
       }
     }
@@ -95,6 +99,7 @@ describe("console /api/secrets", () => {
     fsState.renames = 0;
     fsState.readsSinceRename = 0;
     fsState.tamperOnRename = null;
+    fsState.tamperAtRename = {};
     process.env.COMFYUI_MCP_PANEL_SECRETS = join(tmpdir(), `secrets-${randomUUID()}.json`);
     // ISOLATE THE CANONICAL CREDENTIAL STORE. Without this the suite writes to
     // the developer's REAL ~/.comfyui-mcp/.env: the "sets a key" case below
@@ -114,6 +119,7 @@ describe("console /api/secrets", () => {
     fsState.renames = 0;
     fsState.readsSinceRename = 0;
     fsState.tamperOnRename = null;
+    fsState.tamperAtRename = {};
     delete process.env.COMFYUI_MCP_ENV_FILE;
     delete process.env.COMFYUI_MCP_PANEL_SECRETS;
     rmSync(envPath, { force: true });
@@ -178,10 +184,43 @@ describe("console /api/secrets", () => {
     expect(body.lost_keys).toContain("RUNPOD_API_KEY");
     expect(body.lost_keys).toContain("HF_TOKEN");
     expect(String(body.error)).toMatch(/no longer carries/);
+    // The post-state is the one we are ACTUALLY in. "Nothing was rolled back"
+    // was asserted unconditionally here, including on the path where a failed
+    // save DID roll back and the rollback is what lost the keys (codex gate).
+    expect(body.rolled_back).toBe(false);
+    expect(String(body.error)).toMatch(/Nothing was rolled back/);
     // And it does not offer the panel anything it could render as a save.
     expect(body.masked).toBeUndefined();
     // The values never leave.
     expect(JSON.stringify(body)).not.toContain("civ_key_survivor");
+    expect(JSON.stringify(body)).not.toContain("rp_key_keep_me_123");
+  });
+
+  it("does not claim 'nothing was rolled back' when the ROLLBACK is what lost the keys", async () => {
+    // The damage branch asserted that post-state unconditionally. It is also
+    // reached when a FAILED save rolled back and the rollback destroyed the
+    // credentials — so it reported a state that had not happened (codex gate).
+    await fetch(`${base()}/api/secrets?token=${TOKEN}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ slot: "runpod", value: "rp_key_keep_me_123" }),
+    }); // store-rename 1
+    // Rename 2 = HF_TOKEN lands. Rename 3 = HUGGINGFACE_TOKEN is installed
+    // WITHOUT itself, so that alias reads back as not saved and the slot rolls
+    // back — nothing lost yet. Rename 4 IS the rollback, and it eats RunPod.
+    fsState.tamperAtRename[3] = () => "RUNPOD_API_KEY=rp_key_keep_me_123\nHF_TOKEN=hf_new_value\n";
+    fsState.tamperAtRename[4] = () => "# the rollback ate it\n";
+    const r = await fetch(`${base()}/api/secrets?token=${TOKEN}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ slot: "huggingface", value: "hf_new_value" }),
+    });
+    const body = await r.json();
+    expect(body.ok).toBe(false);
+    expect(body.lost_keys).toContain("RUNPOD_API_KEY");
+    // The rollback DID happen, so the post-state must say so...
+    expect(body.rolled_back).toBe(true);
+    expect(String(body.error)).not.toMatch(/Nothing was rolled back/);
+    expect(String(body.error)).toMatch(/that rollback is what the store lost these entries during/);
+    expect(JSON.stringify(body)).not.toContain("hf_new_value");
     expect(JSON.stringify(body)).not.toContain("rp_key_keep_me_123");
   });
 
@@ -213,6 +252,11 @@ describe("console /api/secrets", () => {
     expect(String(body.error)).toMatch(/WAS removed/);
     expect(String(body.error)).toMatch(/Do NOT repeat the revoke/);
     expect(JSON.stringify(body)).not.toContain("rp_key_keep_me_123");
+    // It also reports the VERIFIED end state. This branch used to return before
+    // the end-state check, so a revoke that lost keys never said whether the
+    // credential it was revoking still resolves (codex gate).
+    expect(body).toHaveProperty("still_resolves");
+    expect(body.still_resolves).toBe(false);
   });
 
   it("does not answer a revoke CLEAN when its loss account could not be completed", async () => {
