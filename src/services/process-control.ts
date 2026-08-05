@@ -3225,7 +3225,20 @@ async function restartViaManagerReboot(context: {
   // been dispatched yet, so this is a REFUSAL, not an uncertain outcome — the
   // one shape where refusing is strictly right (nothing has happened, and
   // proceeding would act on the wrong machine).
-  if (getComfyuiTargetGeneration() !== selfReadGeneration) {
+  //
+  // Tested on the BASE, not the generation. `setComfyuiTarget` bumps the
+  // generation on every successful call, including a same-URL reaffirmation
+  // that moves nothing — refusing on that would be this very defect class
+  // pointed the other way: a bucket ("the target was touched") standing in for
+  // the question that actually matters ("is the server I am about to reboot the
+  // one whose argv I just read?"). The base answers that directly.
+  //
+  // The generation still governs the ARGV COMPARISON further down, where it is
+  // the right test for a different question: an A→B→A round trip leaves the base
+  // equal but means the two readings may not describe the same server, so that
+  // comparison declines while this dispatch correctly proceeds — the reboot goes
+  // to the URL we read either way.
+  if (getComfyUIBaseUrl() !== anchoredBase) {
     return {
       stopped: false,
       started: false,

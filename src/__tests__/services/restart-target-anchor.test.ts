@@ -12,6 +12,9 @@
 // generation are mutable here rather than the constants the sibling suites use.
 
 import { describe, expect, it, beforeEach, vi } from "vitest";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const hoisted = vi.hoisted(() => ({
   remoteMode: { value: true },
@@ -108,6 +111,36 @@ describe("restart anchors to the instance it read", () => {
     expect(res.message).toContain("Nothing was restarted");
   });
 
+  it("does NOT refuse when the target is REAFFIRMED to the same URL mid-read", async () => {
+    // `setComfyuiTarget` bumps the generation on every successful call, including
+    // a same-URL reaffirmation that moves nothing. Fencing on the generation
+    // therefore refused a restart that was never in danger — this defect class
+    // pointed the other way, a bucket ("the target was touched") standing in for
+    // the question that matters ("is this the server whose argv I read?").
+    __processControlTestHooks.setRemoteRebootTimingForTests({
+      settleMs: 0,
+      budgetMs: 500,
+      intervalMs: 5,
+    });
+    hoisted.getSystemStats.mockImplementation(async () => {
+      hoisted.generation.value += 1; // reaffirmed, NOT moved
+      return { system: { argv: [] as string[] } };
+    });
+    hoisted.fetchMock.mockImplementation(async (url: string) =>
+      new URL(url).pathname.includes("/reboot")
+        ? new Response("ok", { status: 200 })
+        : new Response(JSON.stringify({ system: {} }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+    );
+
+    const res = await restartComfyUI();
+
+    expect(hostsHit("/reboot")).toEqual(["alpha.example:8188"]);
+    expect(res.message ?? "").not.toContain("target changed");
+  });
+
   it("sends the reboot, the readiness probe, and nothing else to the ANCHORED host when the target moves mid-flight", async () => {
     __processControlTestHooks.setRemoteRebootTimingForTests({
       settleMs: 0,
@@ -160,6 +193,75 @@ describe("startComfyUI's remote-mode refusal is for a DIRECT launch, not a relau
       port: 8188,
       probeUrl: "http://alpha.example:8188/system_stats",
     });
+    expect(res.message).not.toMatch(/targeting a remote/i);
+  });
+});
+
+describe("a local restart never abandons the instance it stopped", () => {
+  // Real on-disk paths: the restart REFUSES before stopping if the resolved
+  // interpreter or script is missing, which is correct behaviour and would mask
+  // the post-stop window this test is about.
+  const PY = process.execPath;
+  const MAIN = join(mkdtempSync(join(tmpdir(), "anchor-")), "main.py");
+  writeFileSync(MAIN, "# placeholder");
+
+  /** A live local server on 8188 that goes quiet once killed. */
+  const liveThenFree = (pid = 4321): { killed: () => boolean } => {
+    let killed = false;
+    hoisted.execSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        return killed ? "" : `  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       ${pid}`;
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed) throw Object.assign(new Error("no listener"), { status: 1 });
+        return `p${pid}\nn127.0.0.1:8188\n`;
+      }
+      return "";
+    });
+    return { killed: () => killed };
+  };
+
+  it("reports the stop honestly instead of throwing when another agent retargets to REMOTE mid-stop", async () => {
+    // The P0 in full: the stop commits, then the relaunch used to hit the
+    // remote-mode refusal and throw — unwinding past every report and leaving
+    // the caller with an exception where the fact "your server is down" should
+    // have been. This drives `restartComfyUI`, not the unit below it, so it
+    // fails if the refusal is reinstated OR if the post-stop catch is removed
+    // and something else throws past the same point.
+    hoisted.remoteMode.value = false;
+    hoisted.getSystemStats.mockResolvedValue({ system: { argv: [PY, MAIN, "--port", "8188"] } });
+    const port = liveThenFree();
+    __processControlTestHooks.setProcessIdentityResolver(() => ({
+      startedAt: "stable-stamp",
+      commandLine: `${PY} ${MAIN} --port 8188`,
+      argv: [PY, MAIN, "--port", "8188"],
+      argvFidelity: "exact" as const,
+    }));
+    __processControlTestHooks.setProcessExistsProbe(() => true);
+    // The retarget lands during the post-stop window, exactly as a second agent
+    // on this rig would do it.
+    hoisted.spawn.mockImplementation(() => {
+      hoisted.remoteMode.value = true;
+      hoisted.base.value = "http://beta.example:8188";
+      throw new Error("relaunch could not be spawned");
+    });
+    hoisted.fetchMock.mockImplementation(async () => new Response("{}", { status: 200 }));
+
+    // The whole assertion is that this RESOLVES. A rejection here is the bug.
+    const res = await restartComfyUI();
+
+    expect(port.killed()).toBe(true); // the stop really did happen
+    expect(res.stopped).toBe(true); // ...and the report says so
+    expect(res.started).toBe(false);
+    // The caller must be able to act on this: their server is down and they need
+    // to know how to bring it back.
+    expect(res.message).toMatch(/not running|could not/i);
+    // The one thing it must never say is the remote-mode refusal, which would be
+    // a bucket narrated as the cause of a dead local server.
     expect(res.message).not.toMatch(/targeting a remote/i);
   });
 });

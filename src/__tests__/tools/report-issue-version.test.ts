@@ -8,7 +8,7 @@
 // common resolution, and exactly what #846 exists to protect. A sentence where a
 // version was expected defeats that match silently, and so does the WRONG version.
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   MCP_VERSION_LABEL,
   PANEL_VERSION_LABEL,
@@ -178,5 +178,59 @@ describe("report_issue actually normalizes before sending (#846 wiring)", () => 
     // The failure this pins: the raw sentence forwarded verbatim, which the
     // worker cannot version-match — it just silently stops advising upgrades.
     expect(sent.reporter_versions?.mcp).not.toContain("ENVIRONMENT");
+  });
+});
+
+// The wiring test above SUPPLIES mcp_version, so it never reaches the fallback —
+// swapping the load-time snapshot back for a fresh disk read left it green
+// (codex gate P2). This omits the field, which is the only way in.
+
+describe("the OMITTED-version fallback reports what is RUNNING, not what is installed (#846)", () => {
+  it("keeps reporting the load-time version after the package on disk changes underneath", async () => {
+    vi.resetModules();
+    const onDisk = { version: "0.49.8" };
+    vi.doMock("../../services/self-update.js", () => ({
+      detectInstallMode: () => ({ currentVersion: onDisk.version }),
+    }));
+
+    // Loaded WHILE disk says 0.49.8 — this stands in for process start.
+    const mod = await import("../../tools/report-issue.js");
+
+    // Now the user runs an in-place update. The process keeps running the old
+    // code; only the files changed.
+    onDisk.version = "0.49.99";
+
+    let handler: ((args: Record<string, unknown>) => Promise<unknown>) | undefined;
+    mod.registerReportIssueTools({
+      tool: (name: string, _d: string, _s: unknown, fn: typeof handler) => {
+        if (name === "report_issue") handler = fn;
+      },
+    } as never);
+
+    const bodies: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (_u: string, init?: RequestInit) => {
+      if (typeof init?.body === "string") bodies.push(init.body);
+      return new Response(JSON.stringify({ status: "done", url: "https://e.invalid/1" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    try {
+      // No mcp_version — the fallback is the whole point.
+      await handler!({ title: "t", body: "b", repo: "artokun/comfyui-mcp" });
+    } finally {
+      globalThis.fetch = realFetch;
+      vi.doUnmock("../../services/self-update.js");
+      vi.resetModules();
+    }
+
+    const sent = JSON.parse(bodies[0]) as { reporter_versions?: { mcp?: string } };
+    // Filing under the INSTALLED version is #846: the worker version-matches the
+    // report against the fix history, so a report stamped with a version the user
+    // is not running silently stops the upgrade advice that usually resolves it.
+    expect(sent.reporter_versions?.mcp).toBe("0.49.8");
+    expect(sent.reporter_versions?.mcp).not.toBe("0.49.99");
   });
 });
