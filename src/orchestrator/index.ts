@@ -4408,8 +4408,12 @@ export async function runPanelOrchestrator(): Promise<void> {
       const mid = typeof (event as { mid?: unknown }).mid === "string" ? (event as { mid?: string }).mid : undefined;
       const removed = mid ? manager.cancelQueued(agentKeyFor(tabId), mid) : false;
       // #884 — a cancelled message's issue-time stamp mapping dies with it, so
-      // the bounded map only ever holds LIVE queued messages (codex r3).
-      if (mid) turnUuidByMid.delete(mid);
+      // the bounded map only ever holds LIVE queued messages (codex r3). ONLY
+      // when the removal actually happened (codex r4 P2): a message parked
+      // outside the manager queue (heldDuringGen) reports removed:false and can
+      // still dispatch later — deleting its mapping would make that dequeue an
+      // unknown mid and spuriously fail the turn's fence closed.
+      if (mid && removed) turnUuidByMid.delete(mid);
       bridge.push({ type: "ack", ok: true, kind: "cancel_message", mid, removed }, tabId);
       return;
     }
