@@ -1066,8 +1066,7 @@ describe("node-management service", () => {
       ).toBe(false);
     });
 
-    it("reinstalls a module-spelled target via its CNR id so the install half can resolve", async () => {
-      // Caller passes the FOLDER name; the registry resolves the CNR id. The
+    it("reinstalls a module-spelled target via its CNR id so the install half can resolve", async () => {      // Caller passes the FOLDER name; the registry resolves the CNR id. The
       // uninstall names the module; the reinstall names the registry id —
       // otherwise the pack is removed and not restored (codex gate round 9).
       const { calls } = stubFetch({
@@ -1083,6 +1082,67 @@ describe("node-management service", () => {
       expect(taskOf(calls, "install").params).toMatchObject({
         id: "comfyui-impact-pack",
       });
+    });
+
+    it("an OBSERVED post-reinstall absence reports the pack as REMOVED with the remedy", async () => {
+      // Pre-resolve finds the pack; after the two queue cycles it is gone from
+      // the list AND from disk — the uninstall half ran, the install half did
+      // not restore it.
+      fsCtl.readdirSync = () => [];
+      let listCalls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            listCalls++;
+            return jsonResponse(listCalls === 1 ? installedMyPack : {});
+          }
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const err = await reinstallCustomNode({ id: "my-pack" }).catch((e: Error) => e);
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect((err as Error).message).toMatch(/left the pack REMOVED/);
+      expect((err as Error).message).toMatch(/install_custom_node/);
+    });
+
+    it("an UNVERIFIABLE post-reinstall state is NOT reported as REMOVED", async () => {
+      // The post-op list cannot be read — removal was never observed, so the
+      // verdict must stay "could not verify".
+      let listCalls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            listCalls++;
+            if (listCalls > 1) return new Response("boom", { status: 500 });
+            return jsonResponse(installedMyPack);
+          }
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const err = await reinstallCustomNode({ id: "my-pack" }).catch((e: Error) => e);
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect((err as Error).message).toMatch(/could NOT be verified/);
+      expect((err as Error).message).not.toMatch(/REMOVED/);
     });
 
     it("still succeeds for an installed-but-not-in-registry (git-cloned) pack", async () => {

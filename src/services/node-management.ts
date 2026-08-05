@@ -2293,6 +2293,21 @@ async function installCustomNodeImpl(
  * nodeInstalledMatches covers the module/auxId spellings — so that path is
  * unaffected; only an id that resolves NOWHERE fails.
  */
+/**
+ * Thrown by assertPackPresentAfterOp ONLY when absence was actually observed
+ * (every consulted source agrees the pack is gone). An unverifiable post-state
+ * throws a plain NodeManagementError instead, so a caller wrapping failures —
+ * the reinstall path, which CAN truthfully say "left the pack REMOVED" for an
+ * observed absence but not for an unreadable one — can tell them apart
+ * (codex gate round 10).
+ */
+export class PackAbsentAfterOpError extends NodeManagementError {
+  constructor(message: string, details?: unknown) {
+    super(message, details);
+    this.name = "PackAbsentAfterOpError";
+  }
+}
+
 async function assertPackPresentAfterOp(
   id: string,
   op: "update" | "reinstall",
@@ -2343,7 +2358,7 @@ async function assertPackPresentAfterOp(
       );
     case "absent":
       if (presence.evidence === "manager+disk") {
-        throw new NodeManagementError(
+        throw new PackAbsentAfterOpError(
           `"${id}" was queued for ${op} but is not present afterward — it is in neither ` +
             `ComfyUI-Manager's installed-pack list NOR on disk under ${presence.scanned} — ` +
             `so the ${op} resolved to nothing. Check the pack id with list_installed_nodes, ` +
@@ -2352,7 +2367,7 @@ async function assertPackPresentAfterOp(
         );
       }
       // Remote session: only the Manager list could be consulted. Say exactly that.
-      throw new NodeManagementError(
+      throw new PackAbsentAfterOpError(
         `"${id}" was queued for ${op} but is not present afterward in ` +
           `ComfyUI-Manager's installed-pack list, so the ${op} resolved to nothing. NOTE: this ` +
           `check reads ComfyUI-Manager's registry/installed list ONLY — it does not ` +
@@ -2797,14 +2812,18 @@ async function reinstallCustomNodeImpl(
   }, base);
   // VERIFY (#730): same queue-drain trust hole as update — for an id that
   // resolves nowhere BOTH cycles no-op and both drains pass trivially. Require
-  // the pack to be present afterward before claiming a reinstall. When it is
-  // NOT present, say what actually happened: the uninstall half already ran —
-  // the pack is REMOVED, not untouched (refuse-vs-disclose: the removal
-  // already happened, only its pairing failed).
+  // the pack to be present afterward before claiming a reinstall. An OBSERVED
+  // post-op absence gets the reinstall-specific truth (the uninstall half
+  // already ran — the pack is REMOVED, not untouched); an UNVERIFIABLE
+  // post-state keeps the gate's own "could not verify" message.
   try {
     await assertPackPresentAfterOp(id, "reinstall", base, status);
   } catch (err) {
-    if (err instanceof NodeManagementError) {
+    // "Left the pack REMOVED" is only true when absence was OBSERVED — an
+    // unverifiable post-state (unreadable list, inconclusive disk) establishes
+    // neither removal nor a failed install, and keeps its own message
+    // (codex gate round 10).
+    if (err instanceof PackAbsentAfterOpError) {
       throw new NodeManagementError(
         `The reinstall of "${id}" left the pack REMOVED: the uninstall half drained, ` +
           `but the install half did not restore it. Install it again with ` +
