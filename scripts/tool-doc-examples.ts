@@ -856,8 +856,10 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
         ask: "Shut the pod down, I don't want to pay for it overnight.",
         args: { action: "stop", pod_id: "qk29vt4mzx8lb3" },
         returns:
-          "Confirmation that the GPU was released and billing ended. The pod " +
-          "and its disk are kept, so you can start it again later.",
+          "Confirmation that the GPU was released and GPU-time billing ended. The " +
+          "pod and its disk are KEPT so you can start it again later — which is " +
+          "the point, but note that retained storage can still be charged for. " +
+          "Deleting the pod outright is a RunPod console action, not this tool.",
         caution:
           "Anything rendering on that pod dies with it. Check nothing is in " +
           "flight first — `action: \"status\"` shows what the pod is doing.",
@@ -887,19 +889,21 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
         ask: "It says the pod is running but nothing connects. Why?",
         args: { action: "troubleshoot", pod_id: "qk29vt4mzx8lb3" },
         returns:
-          "The specific blocker and what to do about it — pod not running, no " +
-          "GPU attached, ComfyUI's port not exposed, or ComfyUI simply not " +
-          "answering yet. Read-only.",
+          "The specific blocker and what to do about it, in the order it checks: " +
+          "no such pod, pod not RUNNING, still booting (no runtime yet — GPU " +
+          "attaching / container starting), ComfyUI's port not exposed, or the " +
+          "port exposed but ComfyUI not answering. Read-only.",
       },
       {
         ask: "Stop showing me that pod, it's cluttering the panel.",
         args: { action: "unwatch" },
         returns:
-          "Confirmation that the broadcast stopped, and a reminder that the pod " +
-          "itself is still running.",
+          "Confirmation that the broadcast stopped. Unwatching never stops the " +
+          "pod, so whatever state it was in, it stays in.",
         caution:
-          "This turns the idle auto-stop OFF as well, so an unwatched pod bills " +
-          "until you stop it yourself.",
+          "This turns the idle auto-stop OFF as well: if the pod is still " +
+          "running it now bills until you stop it yourself, with nothing " +
+          "watching for it going idle.",
       },
     ],
   },
