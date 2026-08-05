@@ -48,6 +48,13 @@ type ToolHandler = (args: Record<string, unknown>) => Promise<{
   content: Array<{ type: string; text: string }>;
 }>;
 
+/**
+ * 0.50.0 slice 11 folded these three tools into two action-parameterized ones,
+ * so the behaviour tests below reach them through the dispatcher. Everything
+ * they assert — the #369 placement verdicts, the #822 ambiguous-id handling,
+ * the sidecar rendering — is unchanged by the fold, which is the point of
+ * routing rather than rewriting them.
+ */
 function makeServer() {
   const handlers = new Map<string, ToolHandler>();
   const server = {
@@ -56,10 +63,12 @@ function makeServer() {
     },
   };
   registerModelManagementTools(server as never);
+  const download = handlers.get("download_model")!;
+  const inventory = handlers.get("list_local_models")!;
   return {
-    downloadModel: handlers.get("download_model")!,
-    downloadStatus: handlers.get("download_status")!,
-    listLocalModels: handlers.get("list_local_models")!,
+    downloadModel: (args: Record<string, unknown>) => download({ ...args, action: "download" }),
+    downloadStatus: (args: Record<string, unknown>) => download({ ...args, action: "status" }),
+    listLocalModels: (args: Record<string, unknown>) => inventory({ ...args, action: "list" }),
   };
 }
 
@@ -206,7 +215,7 @@ describe("download_model tool", () => {
   });
 });
 
-describe("download_status tool", () => {
+describe('download_model action:"status"', () => {
   it("surfaces a landed-but-invisible download as a WARNING, not a bare 'landed at' (#369)", async () => {
     downloadModelMock.mockResolvedValueOnce("/stale/models/checkpoints/x.safetensors");
     verifyLandedModelMock.mockResolvedValueOnce({
@@ -258,7 +267,7 @@ describe("download_status tool", () => {
       const text = res.content[0].text;
       expect(text).toContain(id);
       expect(text).toContain("heartbeat stale for");
-      expect(text).toContain("Do NOT re-issue download_model while this warning remains");
+      expect(text).toContain('Do NOT re-issue download_model action:"download" while this warning remains');
       expect(text).toContain("only after confirming the .partial has stopped growing");
       expect(text).toContain("Do not report this download as failed or missing.");
     } finally {
@@ -309,7 +318,7 @@ describe("download_status tool", () => {
         const { downloadStatus } = makeServer();
         const text = (await downloadStatus({})).content[0].text;
 
-        // Both rows appear (download_status promises EVERY tracked download)…
+        // Both rows appear (the status action promises EVERY tracked download)…
         expect(text).toContain("livetray00000001");
         expect(text).toContain("orphantray000001");
         // …each carrying its tray id alongside the shared id, so the two lines are
@@ -334,14 +343,14 @@ describe("download_status tool", () => {
         expect(text).toContain("AMBIGUOUS id");
         // The remedy is stated in terms the caller can act on right now.
         expect(text).toMatch(/Use the `tray_id`/);
-        expect(text).toMatch(/cancel_download/);
+        expect(text).toMatch(/Pass that same tray_id to `action:"cancel"` to stop THIS one/);
       } finally {
         setProgressDir("");
         await rm(dir, { recursive: true, force: true });
       }
     });
 
-    it("download_status(id) on an ambiguous id names the candidates — it does NOT report 'no download'", async () => {
+    it("status(id) on an ambiguous id names the candidates — it does NOT report 'no download'", async () => {
       const dir = await mkdtemp(join(tmpdir(), "model-management-822-"));
       setProgressDir(dir);
       try {
@@ -359,14 +368,14 @@ describe("download_status tool", () => {
         // Both source URLs are shown, which is what lets a caller tell them apart.
         expect(text).toContain("Krea-2");
         expect(text).toContain("Aitrepreneur");
-        expect(text).toMatch(/Re-run download_status with `tray_id`/);
+        expect(text).toMatch(/Re-run download_model `action:"status"` with `tray_id`/);
       } finally {
         setProgressDir("");
         await rm(dir, { recursive: true, force: true });
       }
     });
 
-    it("download_status(id, tray_id) selects exactly one of the colliding rows", async () => {
+    it("status(id, tray_id) selects exactly one of the colliding rows", async () => {
       const dir = await mkdtemp(join(tmpdir(), "model-management-822-"));
       setProgressDir(dir);
       try {

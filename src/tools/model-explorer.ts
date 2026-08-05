@@ -185,7 +185,7 @@ export async function readSafetensorsEmbeddedMetadata(
 }
 
 /** Best-effort read of the `<file>.civitai.json` sidecar written next to each
- *  download_civitai_model install (trainedWords, baseModel, sourceUrl, …). */
+ *  download_model action:"download_civitai" install (trainedWords, baseModel, sourceUrl, …). */
 async function readCivitaiSidecar(filePath: string): Promise<Record<string, unknown> | null> {
   try {
     const parsed = JSON.parse(await readFile(`${filePath}.civitai.json`, "utf8")) as unknown;
@@ -260,7 +260,7 @@ export function registerModelExplorerTools(server: McpServer): void {
       '{action:"read", category:"loras", name:"my_model.safetensors"}. DEPENDENCY: the curated read proxies the OPTIONAL ' +
       "'comfyui-model-explorer' custom node. When that node is absent but the model file is reachable on the " +
       "LOCAL filesystem, the tool does NOT hard-fail — it degrades to a structured 'model_explorer: unavailable' " +
-      "result with local evidence (file stat, the download_civitai_model sidecar, and the raw embedded " +
+      "result with local evidence (file stat, the download_model action:\"download_civitai\" sidecar, and the raw embedded " +
        "safetensors metadata). Without local filesystem access, it still returns the same structured " +
        "unavailable result, but without file evidence.\n" +
       '- action:"propose" — PROPOSE cleaned embedded metadata into the user\'s diff-review window. This does NOT write ' +

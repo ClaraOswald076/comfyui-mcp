@@ -26,7 +26,7 @@ The user wants to generate an image using ComfyUI. Their prompt is provided as t
    - Use `download_model` with `target_subfolder: "checkpoints"` to download it
 
    **Option B — HuggingFace (default):**
-   - Use `search_models` to find a suitable checkpoint (e.g., query "SDXL" or "stable diffusion xl")
+   - Use `download_model` `action:"search"` to find a suitable checkpoint (e.g., query "SDXL" or "stable diffusion xl")
    - Find the direct `.safetensors` download URL from the model page (typically `https://huggingface.co/{repo}/resolve/main/{filename}`)
    - Use `download_model` with `target_subfolder: "checkpoints"` to download it
 

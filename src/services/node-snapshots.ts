@@ -264,7 +264,7 @@ export async function saveNodeSnapshot(
   }
 
   // Named snapshot — requires a local install to write the file. Resolve the
-  // install root through the SAME resolver get_environment / list_extra_paths /
+  // install root through the SAME resolver get_environment / list_local_models action:"list_paths" /
   // the comfy-cli wrapper use (#775): config.comfyuiPath, then the saved default
   // workspace — never a bare "comfyuiPath unset ⇒ remote" conclusion, which
   // misclassified a local install connected via --comfyui-url as remote.

@@ -139,6 +139,10 @@ const SELF = new Set([
   // train_* names are in DEAD_NAMES, and — the load-bearing one — that the two
   // retired DELETE names resolve to different tools keyed by different fields.
   "src/__tests__/tools/train-consolidation.test.ts",
+  // Same, for 0.50.0 slice 11: asserts as FIXTURES that the twelve retired model
+  // names are in DEAD_NAMES with their exact `download_model` /
+  // `list_local_models` action replacements.
+  "src/__tests__/tools/models-consolidated.test.ts",
   // Same, for the #659 retired-name error: these pass dead names to call_tool /
   // the ollama dispatch as FIXTURES and assert the error quotes the ledger's
   // replacement — the names are call arguments under test, not live guidance.

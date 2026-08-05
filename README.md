@@ -16,7 +16,7 @@ Works on **macOS**, **Linux**, and **Windows**. Auto-detects your ComfyUI instal
 
 **Stuck or have a question? [Join the Discord](https://discord.gg/cW9arBhzCu)** — help, model tips, and release announcements.
 
-**115 MCP tools** | **37 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
+**103 MCP tools** | **37 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
 
 The plugin ships **expert skills that grow with every release** — model-specific generation guides with curated download URLs, workflow recipes, troubleshooting, and custom-node authoring — so Claude knows the right sampler, CFG, resolution, and model files for each architecture without trial and error.
 
@@ -249,7 +249,7 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 ## MCP Tools
 
-115 tools across workflow execution, generation, iteration, composition, models, and more:
+103 tools across workflow execution, generation, iteration, composition, models, and more:
 
 ### Image Generation (high-level)
 
@@ -334,19 +334,14 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 | Tool | Description |
 |------|-------------|
-| `search_models` | Search HuggingFace for compatible models (checkpoints, LoRAs, VAEs, etc.) |
-| `download_model` | Download a model from a URL to the correct ComfyUI subdirectory |
-| `list_local_models` | List installed models by type: checkpoints, loras, vae, upscale_models, controlnet, embeddings, clip, unet, diffusion_models, text_encoders |
-| `list_extra_paths` | View standalone or Desktop ComfyUI extra search-path config |
-| `add_extra_path` | Add a model/custom_nodes search path to the extra paths YAML |
-| `remove_extra_path` | Remove a stored extra search path from the extra paths YAML |
+| `download_model` | Find and fetch model weights, and track the transfers. `action`: `download` (from a URL, into the correct ComfyUI subdirectory), `status`, `cancel`, `search` (HuggingFace), `search_civitai`, `search_creators`, `download_civitai`, `resolve_missing` |
+| `list_local_models` | What is installed, and where ComfyUI looks. `action`: `list` (installed models by type: checkpoints, loras, vae, upscale_models, controlnet, embeddings, clip, unet, diffusion_models, text_encoders), `remove` (**deletes a model file**), `embeddings`, `list_paths`, `add_path`, `remove_path` (the last three view/edit the extra search-path YAML) |
 
 ### Memory Management
 
 | Tool | Description |
 |------|-------------|
 | `clear_vram` | Free GPU VRAM by unloading cached models — calls ComfyUI's `/free` endpoint, reports before/after stats |
-| `get_embeddings` | List installed textual inversion embeddings |
 
 ### Registry & Discovery
 
@@ -822,8 +817,8 @@ src/
     workflow-validate.ts   # validate_workflow
     workflow-library.ts    # list_workflows, get_workflow, strip_workflow, slice_workflow, save_workflow
     image-management.ts    # upload_image, workflow_from_image, list_output_images
-    model-management.ts    # search_models, download_model, list_local_models
-    memory-management.ts   # clear_vram, get_embeddings
+    model-management.ts    # download_model, list_local_models (the two consolidated model tools)
+    memory-management.ts   # clear_vram
     registry-search.ts     # search_custom_nodes, get_node_pack_details
     generation-tracker.ts  # suggest_settings, generation_stats
     diagnostics.ts         # get_logs, get_history

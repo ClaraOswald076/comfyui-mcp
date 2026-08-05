@@ -31,7 +31,7 @@ The user wants to find out why a ComfyUI workflow execution failed and get a sug
 5. **Check for missing models.** If the error mentions a missing file, model, or checkpoint:
    - Call `list_local_models` to see what's installed
    - Compare against what the workflow references
-   - If a model is missing, suggest using `download_model` or provide a search query for `search_models`
+   - If a model is missing, suggest using `download_model` `action:"download"` or provide a search query for `action:"search"`
 
 6. **Check for missing nodes.** If the error is a `KeyError` or mentions an unknown node type:
    - The node pack may not be installed

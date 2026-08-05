@@ -39,7 +39,7 @@ Recommended flow when LoRA Manager is installed:
 
 | Tool | Role |
 |------|------|
-| `lora_catalog_sync` | Scan `list_local_models(loras)` and merge into catalog |
+| `lora_catalog_sync` | Scan `list_local_models({action:"list", model_type:"loras"})` and merge into catalog |
 | `lora_catalog_detect_lora_manager` | Detect LoRA Manager install + Civitai API key in its settings |
 | `lora_catalog_import_sidecars` | Import `.metadata.json` sidecars (Civitai trainedWords, usage_tips, previews) |
 | `lora_catalog_enrich_civitai` | Hash-based Civitai backfill when sidecars are absent |
