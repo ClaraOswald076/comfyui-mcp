@@ -719,10 +719,14 @@ function getRestartPolicy(): RestartPolicy {
  * env-tuned default; the remote reboot passes a longer budget.
  */
 async function waitForApiReady(
-  cfg?: { intervalMs: number; maxTries: number },
+  cfg?: { intervalMs: number; maxTries: number; probeUrl?: string },
 ): Promise<StartupReadinessResult> {
   const { intervalMs, maxTries } = cfg ?? getStartupReadinessConfig();
-  const probeUrl = `${getComfyUIBaseUrl()}/system_stats`;
+  // ANCHORABLE (codex gate round 12). The configured target is mutable, so a
+  // relaunch that resolved its instance before a retarget must be able to poll the
+  // instance it actually relaunched — not whatever the config points at by the time
+  // the probes run.
+  const probeUrl = cfg?.probeUrl ?? `${getComfyUIBaseUrl()}/system_stats`;
   const start = Date.now();
   let attempts = 0;
 
@@ -2270,6 +2274,15 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
 
   // Gather info before we kill it (or reuse the caller's pre-validated info so a
   // relaunch preflight in restartComfyUI is not discarded).
+  //
+  // The generation is captured BEFORE the resolve so a retarget landing inside that
+  // await is caught (codex gate round 12). `restartComfyUI` fences its own window
+  // and hands us pre-validated info; a DIRECT `stop_comfyui` had no fence at all,
+  // and its saved launch record does not repair the loss: `start_comfyui` afterwards
+  // consults the NEW live target, so it can refuse as remote or find that port
+  // occupied rather than relaunch what was killed. That falsifies this tool's whole
+  // contract — "captures process info so it can be restarted with start_comfyui".
+  const stopGeneration = getComfyuiTargetGeneration();
   let info = preInfo ?? null;
   let acquireDiagnostic: string | undefined;
   if (!info) {
@@ -2297,6 +2310,26 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
   // teardown below. A refusal leaves a still-RUNNING server, and tearing down its
   // crash supervision first would silently disarm auto-restart for a server we
   // then declined to touch — turning a safe refusal into a later lost server.
+  // …and the same refusal for a target that moved while we resolved it. Placed
+  // beside the identity check for the same reason it is: nothing has been touched
+  // yet, so refusing costs a stop and never the server. `preInfo` callers were
+  // already fenced by restartComfyUI, and re-checking here is harmless for them —
+  // their generation has not moved either.
+  if (getComfyuiTargetGeneration() !== stopGeneration) {
+    const retargetHint = recoveryHint(info);
+    return {
+      stopped: false,
+      message:
+        "Refusing to stop: the ComfyUI target changed while the running instance was being " +
+        "identified, so the instance resolved here is not provably the one this server is now " +
+        "configured for — and start_comfyui afterwards would consult the NEW target, which may " +
+        "not bring this one back. Nothing was killed. Let the target settle, then retry." +
+        describeRecovery(retargetHint),
+      has_restart_info: false,
+      restart_hint: retargetHint,
+    };
+  }
+
   const identity = processIdentityStillValid(info);
   if (!identity.ok) {
     return {
@@ -2509,14 +2542,30 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
   };
 }
 
-export async function startComfyUI(): Promise<StartResult> {
+/**
+ * `anchor` pins the relaunch to a SPECIFIC instance (codex gate round 12).
+ *
+ * `restartComfyUI` resolves and validates its instance, then kills it, then waits
+ * for the port to free and sleeps — and only then starts. The configured target is
+ * mutable across all of that. Left unanchored, the relaunch spawned the right
+ * command (it comes from the saved ProcessInfo) but probed the NEW target's port:
+ * if that port was occupied it returned "already running" WITHOUT spawning, and the
+ * instance we had just killed stayed dead. Anchoring the port and the readiness URL
+ * to the values captured before the stop makes the whole sequence act on one
+ * instance. A direct `start_comfyui` passes nothing and reads the live config, which
+ * is right for it — there is no earlier moment it is bound to.
+ */
+export async function startComfyUI(anchor?: {
+  port?: number;
+  probeUrl?: string;
+}): Promise<StartResult> {
   if (isRemoteMode()) {
     throw new ProcessControlError(
       "start_comfyui launches ComfyUI on the local machine and is not " +
         "available when targeting a remote instance via --comfyui-url.",
     );
   }
-  const port = config.resolvedPort;
+  const port = anchor?.port ?? config.resolvedPort;
 
   // Check if already running. TRI-STATE: "the lookup could not run" is NOT "the
   // port is free". Collapsing them let us spawn into a port the old server may
@@ -2628,9 +2677,14 @@ export async function startComfyUI(): Promise<StartResult> {
   // Manager upgrade), so re-probe rather than trust it (#646).
   resetManagerApiCache("comfyui started");
 
-  // Wait for API to become ready
+  // Wait for API to become ready — on the ANCHORED instance when we were given one,
+  // so a retarget during the launch cannot make us grade a different server.
   const startupResult = await Promise.race([
-    waitForApiReady().then((readiness) => ({ readiness })),
+    waitForApiReady(
+      anchor?.probeUrl
+        ? { ...getStartupReadinessConfig(), probeUrl: anchor.probeUrl }
+        : undefined,
+    ).then((readiness) => ({ readiness })),
     spawnError.then((error) => ({ spawn_error: error })),
   ]);
   if ("spawn_error" in startupResult) {
@@ -3158,18 +3212,21 @@ async function restartViaManagerReboot(context: {
     };
   }
 
-  logger.info("ComfyUI-Manager reboot fired", {
-    endpoint: reboot.endpoint,
-    method: reboot.method,
-    note: reboot.note,
-  });
+  logger.info(
+    reboot.acked
+      ? "ComfyUI-Manager reboot request acknowledged"
+      : "ComfyUI-Manager reboot dispatched, not acknowledged",
+    { endpoint: reboot.endpoint, method: reboot.method, note: reboot.note },
+  );
 
-  // The reboot HAS been accepted, so the server MAY cycle at any moment from here
-  // — whatever the readiness poll below concludes, and whether or not we ever see
-  // it happen (codex gate round 6: "the server is going down regardless" asserted a
-  // cycle nothing observed). Dropping the detected dialect now is the conservative
-  // move either way: the timed-out branch returns early, and must not leave the
-  // pre-reboot dialect pinned for an instance that may come back different (#646).
+  // The request is out, so the server MAY cycle at any moment from here — whatever
+  // the readiness poll below concludes, and whether or not we ever see it happen.
+  // (Not "HAS been accepted": on the unacknowledged branch nothing accepted
+  // anything that we saw — codex gate rounds 6 and 12, which caught this claim in
+  // the prose and then again in the comment and the log line beside it.) Dropping
+  // the detected dialect now is the conservative move either way: the timed-out
+  // branch returns early, and must not leave the pre-reboot dialect pinned for an
+  // instance that may come back different (#646).
   resetManagerApiCache("comfyui reboot fired via Manager");
   // #742 r4/r5: record the dispatch — a later decline-path DOWN report may
   // name restart causation only against such a record. No session identity
@@ -3325,6 +3382,14 @@ export async function restartComfyUI(): Promise<RestartResult> {
   // from. It travels with the argv into the Desktop reboot below; capturing it
   // there instead would leave the read itself outside the fence (codex gate r2).
   const infoGeneration = getComfyuiTargetGeneration();
+  // …and the ADDRESS of the instance this call is about, captured at the same
+  // moment. The stop, the port-free wait and the settle delay are all awaits, and
+  // the configured target is mutable across every one of them, so the relaunch is
+  // anchored to these rather than to whatever the config says when it finally runs
+  // (codex gate round 12 — otherwise the relaunch probes the NEW target's port,
+  // finds it occupied, returns "already running", and the instance we killed stays
+  // dead).
+  const restartProbeUrl = `${getComfyUIBaseUrl()}/system_stats`;
 
   // Preflight: resolve the RUNNING instance and confirm we can relaunch it
   // BEFORE stopping anything. A restart must be atomic-ish — if the relaunch
@@ -3461,8 +3526,11 @@ export async function restartComfyUI(): Promise<RestartResult> {
     ? ` NOTE from the stop: ${stopResult.unverified_exit}.`
     : "";
 
-  // Start
-  const startResult = await startComfyUI();
+  // Start — ANCHORED to the instance that was just stopped (see restartProbeUrl).
+  const startResult = await startComfyUI({
+    port: info.port,
+    probeUrl: restartProbeUrl,
+  });
   // #367: the relaunch was DISPATCHED and its process is alive, but the readiness
   // budget expired before the API answered. This is neither a success to claim nor
   // a failure to report, and it is checked BEFORE the `!started` branch so that it
