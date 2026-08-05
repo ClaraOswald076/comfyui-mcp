@@ -140,9 +140,12 @@ export function registerQueueManagementTools(server: McpServer): void {
               prompt_id: args.prompt_id,
               clear_pending: args.clear_pending,
             });
-            // An MCP success is read as permission to carry on and queue more
-            // work, so it may only be given for an outcome a LIVE /queue read
-            // settled. `wedged` alone is not that test: an unreachable /queue
+            // An MCP success is read as "the cancel did what it said", so it
+            // may only be given for an outcome a LIVE /queue read settled —
+            // about the job this call addressed, which is all a cancel ever
+            // promised (a queue that advances to the next job is not an error;
+            // clear_pending is the switch for emptying it). `wedged` alone is
+            // not that test: an unreachable /queue
             // makes the service report `target_state:"unknown"` with
             // `wedged:false`, and answering that with a plain success turns the
             // service's honest "could not determine" back into "determined it

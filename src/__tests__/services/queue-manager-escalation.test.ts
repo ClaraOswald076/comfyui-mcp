@@ -27,6 +27,8 @@ const queueBehavior = vi.hoisted(() => ({
     | "named-late"
     | "unwatched-then-wedged"
     | "gapped-then-wedged"
+    | "gapped-final-wedged"
+    | "target-clears-other-starts"
     | "stops-on-interrupt",
   calls: 0,
   freeFails: false,
@@ -74,6 +76,19 @@ vi.mock("../../comfyui/client.js", () => ({
     if (queueBehavior.mode === "gapped-then-wedged") {
       if (queueBehavior.calls === 3) throw new Error("ECONNRESET");
       return { queue_running: [[1, "prompt-xyz"]], queue_pending: [] };
+    }
+    // Mirror image: the honor window answers throughout, and the hole is in the
+    // FINAL window instead (calls 5-7; call 6 is the hole).
+    if (queueBehavior.mode === "gapped-final-wedged") {
+      if (queueBehavior.calls === 6) throw new Error("ECONNRESET");
+      return { queue_running: [[1, "prompt-xyz"]], queue_pending: [] };
+    }
+    // The NAMED target is running at the pre-check, and a DIFFERENT job holds
+    // the running slot from the first poll on: the target cleared, the queue
+    // did not go idle.
+    if (queueBehavior.mode === "target-clears-other-starts") {
+      if (queueBehavior.calls === 1) return { queue_running: [[1, "prompt-xyz"]], queue_pending: [] };
+      return { queue_running: [[2, "someone-else"]], queue_pending: [] };
     }
     // Observed running at pre-check, honor window fails, final window: running.
     if (queueBehavior.mode === "unwatched-then-wedged") {
@@ -223,6 +238,40 @@ describe("cancel escalation never folds a dead queue into a wedge verdict", () =
       expect(res.message).toMatch(/wedged inside a single step/);
       expect(res.message).not.toMatch(/of verified polling/);
       expect(res.message).toMatch(/did NOT answer throughout/);
+    },
+  );
+
+  // The stated duration spans BOTH windows, so a hole in either one makes the
+  // span not continuously verified. Checking only the first window left the
+  // same overclaim standing over a gap in the second (codex gate).
+  it(
+    "a gap in the FINAL window is not narrated as verified polling either",
+    { timeout: 30000 },
+    async () => {
+      process.env.COMFYUI_MCP_INTERRUPT_S = "3.2";
+      queueBehavior.mode = "gapped-final-wedged";
+      const res = await cancelRunningJobEscalating({});
+      expect(res.wedged).toBe(true);
+      expect(res.target_state).toBe("running");
+      expect(res.message).not.toMatch(/of verified polling/);
+      expect(res.message).toMatch(/did NOT answer throughout/);
+    },
+  );
+
+  // target_state answers for the JOB THIS CALL ADDRESSED, not for the queue.
+  // The cancel did exactly what it promised; the queue advancing to the next
+  // job is normal, and failing the call for it would be a false failure —
+  // clear_pending is the switch for emptying the queue.
+  it(
+    "a named target that clears while ANOTHER job runs is stopped, not unsettled",
+    { timeout: 20000 },
+    async () => {
+      queueBehavior.mode = "target-clears-other-starts";
+      const res = await cancelRunningJobEscalating({ prompt_id: "prompt-xyz" });
+      expect(res.target_state).toBe("stopped");
+      expect(res.wedged).toBe(false);
+      expect(res.honored).toBe(true);
+      expect(res.message).toMatch(/Interrupted the running job/);
     },
   );
 

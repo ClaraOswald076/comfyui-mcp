@@ -401,8 +401,14 @@ export interface EscalatedCancelResult {
    *  and takes the job with it). */
   unverified?: boolean;
   /**
-   * What a LIVE /queue read established about the target when the call ended —
-   * the one question a caller has to answer before dispatching more work.
+   * What a LIVE /queue read established about THE JOB THIS CALL ADDRESSED —
+   * which is the whole of what a cancel promises, and the question that decides
+   * whether its result is settled.
+   *
+   * NOT a statement that the queue is idle. With a `prompt_id`, "stopped" means
+   * that job is gone; another job may have advanced into the running slot, and
+   * pending jobs run next unless `clear_pending` was asked for (see
+   * `pending_cleared` / `pending_clear_failed`, and the message, for that half).
    *
    * Deliberately separate from `unverified`, which covers a DIFFERENT unknown:
    * `unverified` can mean "it demonstrably stopped, but we cannot say our
@@ -412,7 +418,7 @@ export interface EscalatedCancelResult {
    * caught, treating an unreadable queue as an empty one.
    *
    *  - "stopped" — a live read showed the target gone (or showed nothing to
-   *    interrupt in the first place). Safe to queue.
+   *    interrupt in the first place).
    *  - "running" — a live read showed it STILL running: the wedge.
    *  - "unknown" — /queue could not be read, so neither is established.
    */
@@ -568,13 +574,18 @@ export async function cancelRunningJobEscalating(opts: {
   // "restart ComfyUI, do NOT queue another run" sound settled. A restart or a
   // disconnect inside the gap is exactly the case that guidance would be wrong
   // about, so the gap is named rather than smoothed over.
+  // BOTH windows, because the duration claimed spans both: a hole anywhere in
+  // the stated span makes the span not continuously verified, and checking only
+  // the first window would leave the same claim standing over a gap in the
+  // second (codex gate).
   const escalationWindowS = Math.round(Math.min(interruptHonorMs(), 12000) / 1000);
-  const watchedDuration = (first: RunningClearance): string => {
+  const watchedDuration = (first: RunningClearance, final: RunningClearance): string => {
     if (first.outcome !== "still-running") {
+      // One check, not a window — a gap before it does not touch this claim.
       return ` at a verified check ~${escalationWindowS}s after the escalation`;
     }
     const totalS = Math.round((interruptHonorMs() + Math.min(interruptHonorMs(), 12000)) / 1000);
-    return first.continuous
+    return first.continuous && final.continuous
       ? ` across ~${totalS}s of verified polling`
       : ` across ~${totalS}s of polling that /queue did NOT answer throughout — it was ` +
           `seen running by the polls that did answer, including the most recent one, but ` +
@@ -698,7 +709,7 @@ export async function cancelRunningJobEscalating(opts: {
       message:
         `⚠️ ${opts.prompt_id ? `The job ${opts.prompt_id}` : "A job"} is still running after interrupt` +
         (freeFailed ? ` (${freeFailedPhrase})` : freeRan ? ` + VRAM free` : ``) +
-        watchedDuration(firstClearance) +
+        watchedDuration(firstClearance, finalClearance) +
         ` — it is wedged inside a single step (ComfyUI only honors interrupts ` +
         `BETWEEN steps). Whether this IS the job the interrupt addressed is UNKNOWN — ` +
         (opts.prompt_id
@@ -722,7 +733,7 @@ export async function cancelRunningJobEscalating(opts: {
     message:
       `⚠️ The running job${runningId ? ` (${runningId})` : ""} did NOT stop after interrupt` +
       (freeFailed ? ` (${freeFailedPhrase})` : freeRan ? ` + VRAM free` : ``) +
-      watchedDuration(firstClearance) +
+      watchedDuration(firstClearance, finalClearance) +
       ` — it is wedged inside a single step (ComfyUI only honors interrupts ` +
       `BETWEEN steps, so a multi-minute step ignores cancel). An HTTP cancel cannot kill this; restart ComfyUI ` +
       `(panel_restart_comfyui, or restart_comfyui) to clear it. ` +

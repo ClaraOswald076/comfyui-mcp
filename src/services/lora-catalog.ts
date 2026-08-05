@@ -7,9 +7,11 @@ import {
   closeSync,
   copyFileSync,
   existsSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   unlinkSync,
@@ -278,6 +280,24 @@ const CATALOG_LOCK_WAIT_MS = 2_000;
  *  safe (see there). */
 const CATALOG_LOCK_STALE_MS = 30_000;
 
+/**
+ * Past this, a lock is reclaimed WITHOUT asking about its recorded owner.
+ *
+ * Two states cannot be settled by a pid: one that was never recorded (a crash
+ * between the exclusive create and the record write), and one whose pid the OS
+ * has since handed to an unrelated live process. Both make `process.kill(pid,0)`
+ * answer about the wrong thing forever, so a pid-only rule turns a crash into a
+ * PERMANENT refusal of every catalog write — the fold pointed the other way,
+ * and the wedge class this repo keeps re-fixing (#760, #847).
+ *
+ * Time settles it instead, because the critical section is bounded by
+ * construction: two small reads, a parse, an optional copy of a small JSON
+ * file, and one durable write. Nothing in it waits on a network, a subprocess
+ * or a user. Ten minutes of slack over a milliseconds-long section is not a
+ * judgement call about a live holder; it is a statement that no holder is live.
+ */
+const CATALOG_LOCK_HARD_STALE_MS = 10 * 60_000;
+
 /** Cross-platform pid liveness. EPERM means a process with that number EXISTS
  *  and is simply not ours to signal — alive, not dead. Reading it as dead is
  *  what would let a live holder's lock be reclaimed out from under it. */
@@ -309,10 +329,21 @@ function readCatalogLockPid(lockPath: string): number | undefined {
   }
 }
 
-/** Remove a lock ONLY when it is provably abandoned: older than any live holder
- *  could be, AND owned by a pid that is gone (or by no readable pid at all).
- *  Every other state waits — deleting a lock whose holder is still inside its
- *  critical section reintroduces exactly the loss the lock prevents. */
+/**
+ * Free the lock path ONLY when nothing can still be holding it: old enough that
+ * no live holder could be inside its critical section, AND either owned by a pid
+ * that is gone or older than CATALOG_LOCK_HARD_STALE_MS. Every other state
+ * waits — freeing a lock whose holder is still working reintroduces exactly the
+ * loss the lock prevents.
+ *
+ * RENAME FIRST, then judge. A stat-then-unlink is TOCTOU: a second reclaimer can
+ * free the path and a third writer can take the freed pathname in the gap, so
+ * the unlink lands on a stranger's fresh lock and two writers end up inside
+ * `persistLocked` together. A rename atomically removes whatever is at the path
+ * and puts it somewhere only this call knows, so the file inspected afterwards
+ * is the file this call will act on. (Same technique, for the same reason, as
+ * the panel op lock in panel-pin-guard.)
+ */
 function reclaimAbandonedCatalogLock(lockPath: string): boolean {
   let observed: number;
   try {
@@ -320,24 +351,53 @@ function reclaimAbandonedCatalogLock(lockPath: string): boolean {
   } catch {
     return true; // already gone — the path is free, retry the create
   }
-  if (Date.now() - observed < CATALOG_LOCK_STALE_MS) return false;
+  const ageMs = Date.now() - observed;
+  if (ageMs < CATALOG_LOCK_STALE_MS) return false;
   const pid = readCatalogLockPid(lockPath);
-  if (pid !== undefined && catalogLockOwnerAlive(pid)) return false;
+  const ownerGone = pid !== undefined && !catalogLockOwnerAlive(pid);
+  if (!ownerGone && ageMs < CATALOG_LOCK_HARD_STALE_MS) return false;
+
+  const aside = `${lockPath}.stale-${randomUUID()}`;
   try {
-    // Delete only the exact instance just judged. A lock taken in the gap is
-    // brand new, so its mtime cannot match one already CATALOG_LOCK_STALE_MS
-    // old — and freeing a fresh holder's path is the one mistake a reclaim
-    // must never make.
-    if (statSync(lockPath).mtimeMs !== observed) return false;
-    rmSync(lockPath, { force: true });
+    renameSync(lockPath, aside);
+  } catch {
+    return false; // gone, or not ours to move — wait rather than assume
+  }
+  // The path is free from here on, so the only question left is whether it was
+  // right to free it.
+  let takenMtime: number | undefined;
+  try {
+    takenMtime = statSync(aside).mtimeMs;
+  } catch {
+    // Cannot confirm identity → treat it as somebody else's and restore.
+  }
+  if (takenMtime === observed) {
+    try {
+      rmSync(aside, { force: true });
+    } catch {
+      // The path is already free; a leftover copy blocks nothing.
+    }
     logger.warn(
       `[lora-catalog] reclaimed an abandoned write lock at ${lockPath} (owner ` +
-        `${pid === undefined ? "unrecorded" : `pid ${pid}`} is no longer running).`,
+        `${pid === undefined ? "unrecorded" : `pid ${pid}`}, ${Math.round(ageMs / 1000)}s old).`,
     );
     return true;
-  } catch {
-    return false; // could not remove it — wait it out rather than assume
   }
+  // NOT the lock that was judged — a fresh one landed in the gap and this call
+  // just took it off the path. Put it back with linkSync, NOT renameSync: link
+  // fails if the path is occupied, where a rename would silently clobber a lock
+  // that appeared in the meantime.
+  try {
+    linkSync(aside, lockPath);
+    rmSync(aside, { force: true });
+  } catch {
+    logger.warn(
+      `[lora-catalog] a write lock at ${lockPath} changed mid-reclaim and could not be ` +
+        `put back; the replaced lock is preserved at ${aside}. Catalog writes are not ` +
+        `blocked by it.`,
+    );
+  }
+  return false;
 }
 
 /** Take the catalog write lock, or THROW. Refuse-vs-disclose: nothing has been
@@ -666,7 +726,19 @@ export class LoraCatalog {
         }
       }
       const intended = JSON.stringify(this.data, null, 2);
-      writeCatalogFile(this.data);
+      // The durable write can throw on EITHER side of its atomic rename: with
+      // nothing on the path, or with the new bytes already there and only their
+      // directory entry's durability unproven (writeFileDurable is strict about
+      // that by design, for callers whose next action depends on the record
+      // surviving a crash). Only the read-back can tell those apart, and
+      // reporting the second as an unapplied save is this file's own defect
+      // pointed the other way — the mutation DID happen.
+      let writeError: unknown;
+      try {
+        writeCatalogFile(this.data);
+      } catch (err) {
+        writeError = err;
+      }
       // The baseline is what is ACTUALLY on disk, read back — not what we meant
       // to put there. Taking the intended bytes on faith is how a write that
       // landed somewhere else, or landed short, becomes the state every later
@@ -674,9 +746,21 @@ export class LoraCatalog {
       // file nobody ever wrote, and quietly overwrite whatever is really there.
       const written = readCatalogRaw(path);
       if (written.raw === intended) {
+        if (writeError) {
+          // Refuse-vs-disclose: the bytes are on the path, so this is a
+          // disclosure about durability, not a failed save.
+          logger.warn(
+            `[lora-catalog] ${path} holds this write, but completing it durably failed ` +
+              `(${writeError instanceof Error ? writeError.message : String(writeError)}) — ` +
+              `the change is saved and readable; it may not survive a power loss.`,
+          );
+        }
         this.baseline = { raw: written.raw };
         return;
       }
+      // Nothing of ours is on the path: the write genuinely failed, and its own
+      // error says why far better than a read-back mismatch would.
+      if (writeError) throw writeError;
       if (written.unreadable && probe.unreadable) {
         // The catalog could not be read BEFORE this write either, so the
         // read-back carries no new information — and refusing on it would
