@@ -1238,7 +1238,11 @@ export async function resolveModelSubfolderWithLiveRoot(
   // code-root veto needs, AND the snapshot the escape-authorizer uses — so they can
   // never disagree (a second stats call could straddle a server restart and combine
   // model roots from server B with code bases from server A; #633 codex).
-  const { modelsDir, baseDirs, snapshot, source } = await resolveModelsDirWithBases();
+  // The category is passed so the #851 inventory rescue can corroborate the folder this
+  // download actually writes into. A sibling category's match would not establish it.
+  const { modelsDir, baseDirs, snapshot, source } = await resolveModelsDirWithBases({
+    targetCategory: categoryOf(raw),
+  });
   const modelsRoot = resolve(modelsDir);
   const targetDir = resolve(modelsRoot, raw);
   if (targetDir !== modelsRoot && !targetDir.startsWith(modelsRoot + sep)) {

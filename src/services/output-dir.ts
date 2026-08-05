@@ -410,10 +410,27 @@ function probeEntry(p: string): { kind: "file" | "absent" | "not-a-file" | "inde
 
 async function corroborateBaseByModelInventory(
   base: string,
+  targetCategory: string,
 ): Promise<
   | { ok: true; modelsDir: string; category: string; matched: number }
   | { ok: false; reason: string }
 > {
+  // The corroboration must be about the category this download is FOR. A complete match
+  // on some OTHER category proves only that THAT folder is under this base — and a server
+  // can legitimately read `diffusion_models` from here via an extra_model_paths entry
+  // while reading `loras` from somewhere else entirely. Authorising the whole models root
+  // on a sibling's evidence would then write the loras file where the server never looks,
+  // and the downstream live-disagreement guard cannot catch it: an EMPTY local `loras/`
+  // has nothing to contradict, which is exactly the first-download case.
+  if (!targetCategory) {
+    return {
+      ok: false,
+      reason:
+        "this call did not name the model category it is downloading into, and corroboration " +
+        "has to be about that category — a match on a different one would not establish that " +
+        "the server reads THIS folder",
+    };
+  }
   const modelsDir = resolve(base, "models");
   let modelsDirIsDir: boolean;
   try {
@@ -430,33 +447,12 @@ async function corroborateBaseByModelInventory(
   }
   if (!modelsDirIsDir) return { ok: false, reason: `its "models" entry is not a directory` };
 
-  let categories: string[];
-  try {
-    const client = getClient();
-    const res = await client.fetchApi("/models");
-    if (!res.ok) return { ok: false, reason: `the server's /models listing returned HTTP ${res.status}` };
-    const json = (await res.json()) as unknown;
-    if (!Array.isArray(json)) return { ok: false, reason: "the server's /models listing was not a list" };
-    categories = json.filter((c): c is string => typeof c === "string" && c.trim() !== "");
-  } catch (err) {
-    return {
-      ok: false,
-      reason: `the server's /models listing could not be read (${err instanceof Error ? err.message : String(err)})`,
-    };
-  }
-  if (categories.length === 0) return { ok: false, reason: "the server reported no model categories" };
-
-  // Bounded: stop at the first category that yields a COMPLETE match, and never walk
-  // the whole list — this sits in front of a download, not in a background job.
-  let attempted = 0;
+  // ONLY the target category — one question, one request. Scoping to it also removed the
+  // /models enumeration and its per-category request budget, which existed solely because
+  // this used to sweep for any category that happened to match.
   let unreadableCategories = 0;
   let lastReason: string | undefined;
-  for (const category of categories) {
-    // Bounds the REQUESTS, not just the successful comparisons. Counting only readable
-    // non-empty listings meant a server with thousands of empty or failing categories
-    // issued thousands of synchronous HTTP calls in front of a download.
-    if (attempted >= MAX_INVENTORY_CATEGORIES) break;
-    attempted += 1;
+  for (const category of [targetCategory]) {
     let files: string[];
     try {
       const client = getClient();
@@ -537,24 +533,25 @@ async function corroborateBaseByModelInventory(
     }
   }
   if (lastReason) return { ok: false, reason: lastReason };
-  // Nothing was COMPARED. Say which of the two reasons that was: every listing we could
-  // read was empty, or we could not read them. Reporting the second as the first would
-  // be the same fold this whole change is about.
+  // Nothing was COMPARED. Say which of the two reasons that was: the listing could not be
+  // read, or it was empty. Reporting the first as the second would be the same fold this
+  // whole change is about — and an EMPTY target category genuinely cannot corroborate
+  // anything, which is the honest cost of scoping this to the category being written to.
   return {
     ok: false,
     reason:
       unreadableCategories > 0
-        ? `${unreadableCategories} of the server's model category listings could not be read, and any others were empty, so there was nothing to compare against`
-        : "the server reported no non-empty model category to compare against",
+        ? `the server's "${targetCategory}" listing could not be read, so there was nothing to compare against`
+        : `the server lists no files under "${targetCategory}", so there is nothing there to show that this base is the directory it reads that category from`,
   };
 }
 
-/** How many category listings the inventory corroboration will REQUEST before giving up
- *  — attempts, not successes, so an empty or failing category still consumes budget. One
- *  complete match is proof; scanning further only costs latency in front of a download. */
-const MAX_INVENTORY_CATEGORIES = 8;
-
-export async function resolveModelsDirWithBases(): Promise<{
+export async function resolveModelsDirWithBases(opts?: {
+  /** The model category this call is downloading INTO (`loras`, `diffusion_models`, …).
+   *  Required for the #851 inventory corroboration, which must be about the folder
+   *  actually being written to — a match on a sibling category proves nothing about it. */
+  targetCategory?: string;
+}): Promise<{
   modelsDir: string;
   baseDirs: string[];
   /** The SAME /system_stats snapshot the models/base dirs were derived from — so a
@@ -679,7 +676,7 @@ export async function resolveModelsDirWithBases(): Promise<{
       // accept the base only if it explains that completely. Runs only here, so it can
       // rescue a refusal but never redirect a download that already resolved.
       const inventory = base
-        ? await corroborateBaseByModelInventory(base)
+        ? await corroborateBaseByModelInventory(base, (opts?.targetCategory ?? "").trim())
         : { ok: false as const, reason: "no COMFYUI_PATH or default workspace is configured" };
       if (inventory.ok) {
         modelsDir = inventory.modelsDir;
