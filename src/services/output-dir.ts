@@ -1,4 +1,4 @@
-import { existsSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { config, isRemoteMode } from "../config.js";
 import { getClient, getSystemStats } from "../comfyui/client.js";
@@ -501,6 +501,25 @@ async function corroborateBaseByModelInventory(
     const unreadable: string[] = [];
     const notFiles: string[] = [];
     const escaping: string[] = [];
+    // Containment has to be PHYSICAL, so it is checked against the canonical category
+    // dir. Sharing model files between installs by symlinking them is ordinary practice,
+    // and a stale base whose `<category>/known.safetensors` is a link to the file the
+    // server really reads would satisfy a lexical check while proving the opposite: the
+    // evidence file lives elsewhere, and a NEW download written here would never appear
+    // to the server. Canonicalizing the DIRECTORY too is what keeps the legitimate case
+    // working — if `<base>/models/<category>` is itself a link into the server's tree,
+    // writes really do land there, and its entries resolve inside it.
+    let realCategoryDir: string;
+    try {
+      realCategoryDir = realpathSync(categoryDir);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      lastReason =
+        code === "ENOENT" || code === "ENOTDIR"
+          ? `"${categoryDir}" does not exist, so this base holds none of what the server lists under "${category}"`
+          : `"${categoryDir}" could not be canonicalized (${code ?? "unknown error"}), so nothing was established either way`;
+      continue;
+    }
     for (const name of files) {
       const full = join(categoryDir, name);
       if (!containedUnder(categoryDir, full)) {
@@ -508,10 +527,26 @@ async function corroborateBaseByModelInventory(
         continue;
       }
       const found = probeEntry(full);
-      if (found.kind === "file") continue;
-      if (found.kind === "absent") missing.push(name);
-      else if (found.kind === "not-a-file") notFiles.push(name);
-      else unreadable.push(`${name} (${found.detail ?? "unknown error"})`);
+      if (found.kind === "absent") {
+        missing.push(name);
+        continue;
+      }
+      if (found.kind === "not-a-file") {
+        notFiles.push(name);
+        continue;
+      }
+      if (found.kind === "indeterminate") {
+        unreadable.push(`${name} (${found.detail ?? "unknown error"})`);
+        continue;
+      }
+      let realEntry: string;
+      try {
+        realEntry = realpathSync(full);
+      } catch (err) {
+        unreadable.push(`${name} (${(err as NodeJS.ErrnoException)?.code ?? "unresolvable link"})`);
+        continue;
+      }
+      if (!containedUnder(realCategoryDir, realEntry)) escaping.push(name);
     }
     if (missing.length === 0 && unreadable.length === 0 && notFiles.length === 0 && escaping.length === 0) {
       return { ok: true, modelsDir, category, matched: files.length };
