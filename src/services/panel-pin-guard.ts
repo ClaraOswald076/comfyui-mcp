@@ -286,17 +286,51 @@ function sleep(ms: number): Promise<void> {
 }
 
 /** Is the process that wrote a lock still running? */
-function pidAlive(pid: unknown): boolean {
+/**
+ * Whether the process that took a lock is still running — as far as a PID can
+ * say, which is not very far.
+ *
+ * `process.kill(pid, 0)` answers "a process with that NUMBER exists". That is not
+ * "our holder is alive" (codex gate P1): PIDs are recycled, so after a crashed
+ * holder's number is reused by an unrelated program, the old answer was a
+ * confident "STILL RUNNING" that refused the reclaim FOREVER — leaving #760's
+ * wedge in place through the very fix meant to clear it. An existence check
+ * standing in for an identity check is this repo's dominant fold pointed at a
+ * positive.
+ *
+ * So this reports THREE states, and the caller must not collapse them:
+ *   - `false`   — no such process. Provably not our holder.
+ *   - `true`    — a process with that pid exists AND the lock is young enough
+ *                 that recycling is not a plausible explanation.
+ *   - `"unsure"` — a process exists, but the lock is old enough that the number
+ *                 may since have been reused. Liveness is UNDETERMINED.
+ *
+ * The `startedAt` on the record is the LOCK's creation time, not the process's,
+ * so it cannot establish identity either; closing that properly needs a
+ * per-process start time this module does not have. What it CAN do is stop
+ * asserting the strong claim.
+ */
+function pidLiveness(pid: unknown, ageMs: number): boolean | "unsure" {
   if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+  let exists: boolean;
   try {
     // Signal 0 performs the permission/existence check without delivering.
     process.kill(pid, 0);
-    return true;
+    exists = true;
   } catch (err) {
-    // EPERM = the process exists but belongs to someone else — still ALIVE.
-    return (err as NodeJS.ErrnoException)?.code === "EPERM";
+    // EPERM = the process exists but belongs to someone else — still there.
+    exists = (err as NodeJS.ErrnoException)?.code === "EPERM";
   }
+  if (!exists) return false;
+  return ageMs > PID_REUSE_DOUBT_MS ? "unsure" : true;
 }
+
+/**
+ * Past this age, "a process with that pid exists" stops being evidence that OUR
+ * holder is alive: no panel operation runs this long, so a crash plus PID reuse
+ * is at least as likely an explanation as a still-running holder.
+ */
+const PID_REUSE_DOUBT_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 /**
  * A lock is PROVABLY abandoned only when it is BOTH older than this AND owned
@@ -318,7 +352,8 @@ interface PanelLockObservation {
   /** When the lock was taken (the record's startedAt), for messages. */
   startedAt?: string;
   /** Pid liveness — only set when a valid pid was recorded. */
-  alive?: boolean;
+  /** Tri-state: see `pidLiveness`. "unsure" must NOT be read as either boolean. */
+  alive?: boolean | "unsure";
   /** Why the content proved nothing about the owner (unreadable/corrupt/pid). */
   contentProblem?: string;
 }
@@ -379,7 +414,7 @@ function observePanelLock(path: string): PanelLockObservation | undefined {
     if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
       return { ageMs, raw, startedAt, contentProblem: "records no valid owner pid" };
     }
-    return { ageMs, raw, pid, startedAt, alive: pidAlive(pid) };
+    return { ageMs, raw, pid, startedAt, alive: pidLiveness(pid, ageMs) };
   } catch (err) {
     // A mid-read failure (e.g. the fd turned out to be a directory). The age
     // here is display-only — the contentProblem is what the decision reads.
@@ -421,8 +456,14 @@ function describeObservedLock(path: string, obs: PanelLockObservation): string {
   }
   return (
     `The lock at ${path} was taken ${age} ago by pid ${obs.pid}` +
-    `${obs.startedAt ? ` (started ${obs.startedAt})` : ""}, and that process is ` +
-    `${obs.alive ? "STILL RUNNING" : "no longer running"}.`
+    `${obs.startedAt ? ` (started ${obs.startedAt})` : ""}, and ` +
+    (obs.alive === "unsure"
+      ? `a process with that pid exists — but the lock is old enough that the number may ` +
+        `since have been reused, so whether the ORIGINAL owner is still running cannot be ` +
+        `determined from the pid alone.`
+      : obs.alive
+        ? `that process is STILL RUNNING.`
+        : `that process is no longer running.`)
   );
 }
 
@@ -482,6 +523,21 @@ export function reclaimAbandonedPanelLock(): PanelLockReclaimResult {
       `it was taken only ${describeLockAge(obs.ageMs)} ago — inside the ` +
         `${STALE_LOCK_MS / 60_000}-minute window in which a slow ComfyUI-Manager ` +
         `operation is still legitimate, so it cannot be called abandoned.`,
+    );
+  }
+  if (obs.alive === "unsure") {
+    // NOT "STILL RUNNING" (codex gate P1). The old code asserted that from a bare
+    // existence check, so a recycled PID refused this reclaim indefinitely — #760's
+    // wedge surviving its own fix. Still refusing is right (deleting a live lock is
+    // worse than leaving a stuck one), but the reason has to be true, and the user
+    // needs the manual path that the false certainty used to hide.
+    return refuse(
+      `it is ${describeLockAge(obs.ageMs)} old and a process with pid ${obs.pid} exists, ` +
+        `but at that age the pid may have been REUSED by an unrelated program — so whether ` +
+        `the original owner is still running cannot be determined, and abandonment cannot ` +
+        `be proven. Nothing was deleted. If you are certain no panel operation is running ` +
+        `(check that pid: if it is not a comfyui-mcp orchestrator, it is not the owner), ` +
+        `delete ${path} by hand.`,
     );
   }
   if (obs.alive) {
@@ -599,6 +655,10 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
 
   for (;;) {
     try {
+      // Hoisted above the open so the RELEASE closure can close over it: the
+      // release must be able to prove the file it is about to delete is the one
+      // this iteration created (see the closure below).
+      const token = randomUUID();
       // "wx" = create-exclusive: atomic across processes, which is the whole point.
       const fd = openSync(path, "wx");
       try {
@@ -608,7 +668,17 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
         // never prove abandoned — the #760 wedge again), so fail the init and
         // let the cleanup below remove the husk (codex gate). The payload is
         // ASCII (pid + ISO timestamp), so string offsets track byte offsets.
-        const payload = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() });
+        // `token` is what makes this lock IDENTIFIABLE, not merely attributable
+        // (codex gate P0). pid+startedAt cannot distinguish two locks taken by the
+        // same process, and more importantly they cannot tell the release closure
+        // whether the file still at the path is the one it created — which is the
+        // question that matters once a lock can be RECLAIMED out from under a
+        // holder.
+        const payload = JSON.stringify({
+          pid: process.pid,
+          startedAt: new Date().toISOString(),
+          token,
+        });
         let written = 0;
         while (written < payload.length) {
           const n = writeSync(fd, payload.slice(written), null, "utf-8");
@@ -654,6 +724,49 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
         throw initErr;
       }
       return () => {
+        // PROVE OWNERSHIP BEFORE DELETING (codex gate P0). This used to be a bare
+        // `rmSync`, which deletes whatever is at the path — including a lock some
+        // OTHER process took after ours was reclaimed. The sequence the gate walked:
+        // two unlocks observe the same stale lock, one reclaims it, B acquires a
+        // fresh lock, the other unlock renames B's lock aside, C acquires the freed
+        // path — and then this closure deletes C's lock while B and C both believe
+        // they hold it. The bug being fixed leaves a lock stuck, which is
+        // recoverable; this leaves the door open with two writers inside, which is
+        // worse.
+        //
+        // Same invariant as panel #621, from the other side: a lock only has an
+        // owner if EVERY path through it proves ownership. There a holder
+        // registered before its claim was true; here a holder releases a claim it
+        // no longer holds.
+        let held: string | undefined;
+        try {
+          held = readFileSync(path, "utf-8");
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return; // already gone
+          logger.warn(
+            `[panel] could not read the panel op lock at ${path} to confirm it is still ` +
+              `ours (${err instanceof Error ? err.message : String(err)}); leaving it in ` +
+              `place rather than deleting a lock that may belong to another operation. ` +
+              `If no panel operation is running, delete that file by hand.`,
+          );
+          return;
+        }
+        let heldToken: unknown;
+        try {
+          heldToken = (JSON.parse(held) as { token?: unknown }).token;
+        } catch {
+          heldToken = undefined;
+        }
+        if (heldToken !== token) {
+          // Not ours any more. Dropping the in-memory claim is right; deleting the
+          // file is not.
+          logger.warn(
+            `[panel] the panel op lock at ${path} is no longer the one this operation ` +
+              `took (it was reclaimed or replaced while the operation ran), so it was ` +
+              `left alone. Another operation may now hold it.`,
+          );
+          return;
+        }
         try {
           rmSync(path, { force: true });
         } catch (err) {
@@ -1082,12 +1195,27 @@ export function recordPanelPendingOp(
     // Restore only when the file still holds exactly what this call wrote, so
     // a concurrent recorder's work is never erased; a failed restore leaves
     // the conservative over-warning, which is the safe direction.
+    // A CATCH THAT CAN THROW IS NOT A GUARD (codex gate P0). The rollback below
+    // lives inside the failure path, so its OWN failure had nowhere to go — it was
+    // swallowed, and the refusal was then reported as if the disk were clean. What
+    // actually remained was a phantom marker that a later pin reads as a real
+    // queued operation: false pending, false cancellation reporting, and no hint
+    // that anything was left behind.
+    //
+    // The rollback still cannot be made infallible here (the record must precede
+    // the handoff, so there is no ordering that removes the window). What CAN be
+    // made reliable is saying so: the outcome is tracked and disclosed.
+    let leftover: string | undefined;
     if (!extra.keepRecordOnFailure && priorOps !== undefined) {
       const recordKey = (o: PanelPendingOp): string => o.id ?? `${o.kind}:${o.queuedAt}`;
       try {
         const path = panelPendingOpsPath();
         const current = readPanelPendingOpsFile();
-        if (!current.unreadable) {
+        if (current.unreadable) {
+          leftover =
+            `the pending-operation file could not be read back, so whether this call's ` +
+            `record is still on disk is UNKNOWN`;
+        } else {
           const expected = new Set(
             [...priorOps.filter((o) => o.kind !== kind), op].map(recordKey),
           );
@@ -1096,16 +1224,31 @@ export function recordPanelPendingOp(
             current.ops.every((c) => expected.has(recordKey(c)));
           if (unchangedSinceOurWrite) {
             writeFileDurable(path, JSON.stringify({ ops: priorOps }, null, 2));
+          } else if (current.ops.some((c) => recordKey(c) === recordKey(op))) {
+            // Another recorder changed the file, so rolling back would erase their
+            // work. Ours is still in there, and that is a phantom.
+            leftover =
+              `another operation wrote to the pending-operation file meanwhile, so this ` +
+              `call's record was left in place rather than erasing theirs`;
           }
         }
-      } catch {
-        // best-effort — the refusal below is the operative signal
+      } catch (rollbackErr) {
+        leftover =
+          `rolling it back ALSO failed (${
+            rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)
+          })`;
       }
     }
     throw new Error(
       `Could not persist the pending ${kind} marker: ${
         err instanceof Error ? err.message : String(err)
-      }. Refusing to start an operation that could move the panel after a later pin.`,
+      }. Refusing to start an operation that could move the panel after a later pin.` +
+        (leftover
+          ? ` NOTE: ${leftover}, so a pending-${kind} record may remain at ` +
+            `${panelPendingOpsPath()} describing an operation that never started. Later ` +
+            `panel operations will warn about it until it expires or is cleared; if that ` +
+            `warning is wrong, delete that record.`
+          : ""),
     );
   }
   return op;

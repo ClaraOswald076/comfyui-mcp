@@ -1072,3 +1072,121 @@ describe("#847 gate P0 — superseding an empty marker must not hide a queued op
     expect(readFileSync(pendingPath(), "utf-8").length).toBeGreaterThan(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Once a lock can be TAKEN AWAY, every other operation on it has to prove it
+// still owns what it is about to touch. Reclaiming is the right fix for #760;
+// these are the failures reclaiming creates.
+
+describe("#836 — a reclaimable lock needs ownership proofs everywhere", () => {
+  /** Same helper as the reclaim suite above, which scopes it to its own block. */
+  async function plantLock(contents: string, ageMs = 0): Promise<string> {
+    const path = panelLockPath();
+    writeFileSync(path, contents);
+    if (ageMs > 0) {
+      const t = new Date(Date.now() - ageMs);
+      const { utimesSync } = await import("node:fs");
+      utimesSync(path, t, t);
+    }
+    return path;
+  }
+
+  it("the release does NOT delete a lock that replaced ours while we ran", async () => {
+    // The sequence the gate walked: our lock is reclaimed mid-operation and a
+    // DIFFERENT process takes the freed path. A bare `rmSync(path)` on release
+    // then deletes THEIR lock — leaving the door open with a writer inside. That
+    // is strictly worse than the stuck lock this PR set out to fix.
+    let released: (() => void) | undefined;
+    const path = panelLockPath();
+    await withPanelMutationLock(async () => {
+      // Someone reclaims ours and takes the path. Same shape as a reclaim
+      // followed by a fresh acquire.
+      writeFileSync(path, JSON.stringify({ pid: process.pid, startedAt: "theirs", token: "THEIRS" }));
+    });
+    // The successor's lock must still be there.
+    expect(existsSync(path)).toBe(true);
+    expect(JSON.parse(readFileSync(path, "utf-8")).token).toBe("THEIRS");
+    void released;
+  });
+
+  it("the release DOES delete its own lock — the ownership check must not leak locks", async () => {
+    // The other direction: an ownership check that never matches would leave a
+    // lock behind after every operation and wedge the next one. This is what
+    // stops the fix above from becoming the bug it replaced.
+    const path = panelLockPath();
+    await withPanelMutationLock(async () => {
+      expect(existsSync(path)).toBe(true); // held during the operation
+    });
+    expect(existsSync(path)).toBe(false); // and cleaned up after
+  });
+
+  it("a failed ROLLBACK is disclosed, not swallowed behind a clean-looking refusal", async () => {
+    // A catch that can throw is not a guard. The rollback runs INSIDE the failure
+    // path, so its own failure had nowhere to go: it was swallowed, and the
+    // refusal read as though the disk were clean. What actually remained was a
+    // phantom marker a later pin reads as a real queued operation.
+    //
+    // The record must precede the Manager handoff, so no ordering removes this
+    // window — what can be made reliable is SAYING so.
+    recordPanelPendingOp("update-all", "first", 60_000);
+    const pendingPath = panelPendingOpsPath();
+    let renames = 0;
+    fsyncTracker.failFsyncExact = { path: dirname(pendingPath) };
+    fsyncTracker.onBeforeRename = (_from, to) => {
+      // Let our own write land, then fail the ROLLBACK's rename.
+      if (to === pendingPath && ++renames >= 2) {
+        throw Object.assign(new Error("rollback rename refused"), { code: "EIO" });
+      }
+    };
+    try {
+      let message = "";
+      try {
+        recordPanelPendingOp("update-all", "second", 60_000);
+      } catch (e) {
+        message = e instanceof Error ? e.message : String(e);
+      }
+      expect(message).toMatch(/Could not persist the pending update-all marker/);
+      // The disclosure the swallow used to hide.
+      expect(message).toMatch(/rolling it back ALSO failed/i);
+      expect(message).toMatch(/may remain at/i);
+      expect(message).toMatch(/an operation that never started/i);
+    } finally {
+      fsyncTracker.onBeforeRename = undefined;
+      fsyncTracker.failFsyncExact = undefined;
+    }
+  });
+
+  it("an OLD lock whose pid exists is reported as UNDETERMINED, not 'STILL RUNNING'", async () => {
+    // PID recycling. `process.kill(pid, 0)` says a process with that NUMBER
+    // exists; after a crashed holder's number is reused that is not our holder.
+    // Asserting "STILL RUNNING" refused the reclaim forever — #760's wedge
+    // surviving its own fix.
+    const path = await plantLock(
+      JSON.stringify({ pid: process.pid, startedAt: "long ago" }),
+      7 * 24 * 60 * 60_000, // a week old: no panel operation runs this long
+    );
+    const res = reclaimAbandonedPanelLock();
+
+    expect(res.outcome).toBe("refused");
+    expect(res.detail).toMatch(/may have been REUSED/i);
+    expect(res.detail).toMatch(/cannot be determined/i);
+    // The false certainty, gone — and with it the dead end it created.
+    expect(res.detail).not.toMatch(/STILL RUNNING/);
+    expect(res.detail).toMatch(/delete .* by hand/i);
+    // Nothing was deleted: refusing is still right, only the reason changed.
+    expect(existsSync(path)).toBe(true);
+  });
+
+  it("a RECENT lock whose pid exists still reports STILL RUNNING — the doubt is age-scoped", async () => {
+    // The inverse: within a plausible operation window, an existing pid IS
+    // evidence. Widening the doubt to every age would refuse to distinguish a
+    // live operation from a recycled number, which helps nobody.
+    await plantLock(
+      JSON.stringify({ pid: process.pid, startedAt: "recent" }),
+      45 * 60_000, // older than the stale window, far short of the reuse doubt
+    );
+    const res = reclaimAbandonedPanelLock();
+    expect(res.outcome).toBe("refused");
+    expect(res.detail).toMatch(/STILL RUNNING/);
+  });
+});
