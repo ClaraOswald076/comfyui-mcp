@@ -460,7 +460,29 @@ export function removeDisclosures(outcome: SecretRemoveOutcome, path: string): s
     );
   }
   if (outcome.resurrectionRisk) out.push(`🛑 ${outcome.resurrectionRisk}`);
+  if (outcome.incomplete) out.push(`🛑 ${outcome.incomplete}`);
   return out;
+}
+
+/**
+ * May a caller present this removal as a clean revoke?
+ *
+ * Only when the store demonstrably no longer carries the credential AND the
+ * removal can account for what it cost. A revoke whose loss account was never
+ * completed, that will be undone by the boot migration, or that only partly
+ * ran, was still answering `200 {ok:true}` next to a warning saying exactly
+ * that (codex gate) — and a consumer reads the flag, not the prose.
+ *
+ * Comment loss and a durability gap are deliberately NOT here: they are things
+ * the revoke cost, not doubts about the revoke itself.
+ */
+export function revokeIsClean(outcome: SecretRemoveOutcome): boolean {
+  return (
+    outcome.lostKeys.length === 0 &&
+    !outcome.uncertainty &&
+    !outcome.resurrectionRisk &&
+    !outcome.incomplete
+  );
 }
 
 /**
@@ -797,11 +819,14 @@ function syncDirectory(dir: string): string | null {
     return null;
   } catch (err) {
     const code = errCode(err);
-    // Some filesystems simply do not implement it. That is the platform's
-    // answer, not a failure of this write.
-    if (code === "EINVAL" || code === "ENOTSUP" || code === "EISDIR" || code === "EACCES") {
-      return null;
-    }
+    // ONLY "this filesystem does not implement directory syncing" is the
+    // platform's answer rather than a failure of this write. EACCES and EISDIR
+    // were also being swallowed, and neither means that: a directory can be
+    // writable and searchable but not readable, so the rewrite succeeds while
+    // `openSync(dir, "r")` is refused — no sync happened, and the receipt said
+    // there was no gap. That is an unobserved durability claim, which is the
+    // thing this whole field exists to stop (codex gate).
+    if (code === "EINVAL" || code === "ENOTSUP") return null;
     return (
       `the rename was not made durable — syncing the directory ${dir} failed (${code}), ` +
       `so a power loss immediately after this save may leave the store without it`
@@ -1440,6 +1465,10 @@ export interface SecretRemoveOutcome {
    *  could not be purged — so the boot migration puts it back. A revoke that
    *  returns on the next start is not a revoke, and the caller must say so. */
   resurrectionRisk?: string;
+  /** Part of a multi-alias revoke could not be performed, while another part
+   *  already had been. Present only when something WAS removed — when nothing
+   *  was, the operation refuses instead. */
+  incomplete?: string;
 }
 
 /** Canonical remover: drop a token from .env + process.env + emit. Also PURGES
@@ -1912,6 +1941,13 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
   const restoreLostKeys = new Set<string>();
   /** Everything else the rollback's writes owe the caller. */
   const restoreWarnings: string[] = [];
+  /** The aliases this call actually tried to write. The rollback restores ONLY
+   *  these: it used to walk the whole alias list, so an alias the fan-out never
+   *  reached — one another writer may legitimately have updated in the meantime
+   *  — was overwritten with a stale snapshot, and because that key is the
+   *  restore's own intentional key the clobber was excluded from `lostKeys` and
+   *  reported as a successful restore (codex gate). */
+  const attempted = new Set<string>();
   /** Aggregated once, here, so no consumer of a slot save has to reach into the
    *  receipts to learn that the store lost credentials. */
   const lostKeysOf = (rs: SecretSaveReceipt[]) => [
@@ -1922,6 +1958,10 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
     (): SlotSaveOutcome => {
       for (const key of slot.envKeys) {
         try {
+          // Recorded BEFORE the call: a write that throws part-way may still
+          // have touched the store, so "attempted" is the set the rollback is
+          // allowed to act on — never the whole alias list.
+          attempted.add(key);
           const receipt = setEnvSecret(key, value);
           receipts.push(receipt);
           if (receipt.persisted === "damaged") {
@@ -1974,7 +2014,13 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
       // the in-process copy when the store is unreadable and would therefore
       // "confirm" a restore that never reached disk.
       for (const { key, previous, wasShellProvided } of before) {
-        const { state, lostKeys, disclosures } = restoreEnvKey(key, previous, wasShellProvided);
+        // An alias this call never wrote may be reconciled IN PROCESS (that is
+        // free and cannot clobber anything), but it must never be WRITTEN back:
+        // another ordinary writer may have updated it while we were failing, and
+        // the snapshot in hand is older than that.
+        const { state, lostKeys, disclosures } = restoreEnvKey(key, previous, wasShellProvided, {
+          mayWrite: attempted.has(key),
+        });
         if (state === "stranded") strandedKeys.push(key);
         else if (state === "unverified") unverifiedKeys.push(key);
         // A ROLLBACK is a store write like any other, so it can lose credentials
@@ -2060,14 +2106,19 @@ function restoreEnvKey(
   key: string,
   previous: string | undefined,
   wasShellProvided: boolean,
-): { state: "restored" | "stranded" | "unverified"; lostKeys: string[]; disclosures: string[] } {
+  opts: { mayWrite: boolean } = { mayWrite: true },
+): {
+  state: "restored" | "stranded" | "unverified" | "skipped";
+  lostKeys: string[];
+  disclosures: string[];
+} {
   const lostKeys = new Set<string>();
   // EVERYTHING the rollback's own writes owe the caller — not just lost keys.
   // A rollback that dropped comments, could not be made durable, or could not
   // complete its loss account is the user's data affected by an operation they
   // never asked for, and it was being discarded (codex gate).
   const disclosures: string[] = [];
-  const done = (state: "restored" | "stranded" | "unverified") => ({
+  const done = (state: "restored" | "stranded" | "unverified" | "skipped") => ({
     state,
     // A key this restore is itself putting back is not collateral.
     lostKeys: [...lostKeys].filter((k) => k !== key),
@@ -2093,6 +2144,13 @@ function restoreEnvKey(
       return done("restored");
     }
   }
+  // Past the no-write reconciliation above, every remaining path WRITES the
+  // store. For an alias this call never touched that is not a restore, it is a
+  // clobber: the value on disk is newer than the snapshot in hand, and putting
+  // the snapshot back would overwrite another writer's legitimate update — and
+  // because this key is the restore's own intentional key, the loss would be
+  // excluded from `lostKeys` and reported as a successful restore (codex gate).
+  if (!opts.mayWrite) return done("skipped");
   try {
     if (wasShellProvided) {
       // The value belongs to the ENVIRONMENT, not to the store: drop whatever we
@@ -2166,8 +2224,22 @@ export function clearPanelSecret(slotId: string): SecretRemoveOutcome {
   const uncertainties: string[] = [];
   const resurrectionRisks: string[] = [];
   let durabilityGap: string | undefined;
+  const failures: string[] = [];
+  let firstError: unknown = null;
   for (const key of slot.envKeys) {
-    const out = remove(key);
+    let out: SecretRemoveOutcome;
+    try {
+      out = remove(key);
+    } catch (err) {
+      // The fan-out is SERIAL, so an earlier alias may already be gone. Letting
+      // this throw discarded that completed removal entirely — the console saw
+      // only a generic failure, with no `cleared` and no "do not retry"
+      // (codex gate). Record it and carry on: the outcome reports both what was
+      // removed and what could not be.
+      if (firstError === null) firstError = err;
+      failures.push(`${key} (${err instanceof Error ? err.message : String(err)})`);
+      continue;
+    }
     changed = out.changed || changed;
     if (out.resurrectionRisk) resurrectionRisks.push(out.resurrectionRisk);
     // A key this fan-out itself removes is not collateral — the aliases of one
@@ -2177,8 +2249,19 @@ export function clearPanelSecret(slotId: string): SecretRemoveOutcome {
     if (out.uncertainty) uncertainties.push(out.uncertainty);
     if (out.durabilityGap && !durabilityGap) durabilityGap = out.durabilityGap;
   }
+  // Nothing was removed and something failed: nothing happened, so REFUSING is
+  // correct and the caller's "it is still there" is true. Anything else is a
+  // disclosure about a revoke that partly ran.
+  if (!changed && firstError !== null) throw firstError;
   return {
     changed,
+    ...(failures.length
+      ? {
+          incomplete:
+            `The revoke could not be completed for ${failures.join(", ")}. ` +
+            `What WAS removed has already been removed — do not simply repeat the revoke; check which aliases are still present first.`,
+        }
+      : {}),
     lostKeys: [...lostKeys],
     lostCommentLines,
     ...(uncertainties.length ? { uncertainty: uncertainties.join(" ") } : {}),

@@ -63,6 +63,8 @@ const fsState = vi.hoisted(() => ({
   failFileFsync: false,
   /** Make the DIRECTORY fsync fail. */
   failDirFsync: false,
+  /** Make OPENING the store's directory fail with this errno. */
+  dirOpenError: null as string | null,
   /** Make removal of the pre-write snapshot fail, the way EPERM/EBUSY does. */
   failSentinelRemoval: false,
   /** Simulate another process CREATING the store right after the given
@@ -139,6 +141,19 @@ vi.mock("node:fs", async (importOriginal) => {
   // FILE or to its DIRECTORY — they are different durability guarantees.
   const fdPaths = new Map<number, string>();
   const openSync: typeof actual.openSync = ((...args: Parameters<typeof actual.openSync>) => {
+    if (fsState.dirOpenError) {
+      let isDir = false;
+      try {
+        isDir = actual.statSync(String(args[0])).isDirectory();
+      } catch {
+        /* not a directory */
+      }
+      if (isDir) {
+        throw Object.assign(new Error(`${fsState.dirOpenError}: cannot open directory`), {
+          code: fsState.dirOpenError,
+        });
+      }
+    }
     const fd = actual.openSync(...args);
     fdPaths.set(fd, String(args[0]));
     return fd;
@@ -234,6 +249,7 @@ import {
   removeComfyuiSecret,
   setComfyuiSecret,
   setPanelSecret,
+  type SecretRemoveOutcome,
 } from "../../services/panel-secrets.js";
 import { parseEnvFile, resetEnvFileProvenanceForTests } from "../../env-file.js";
 
@@ -259,6 +275,7 @@ beforeEach(() => {
   fsState.dirFsyncs = [];
   fsState.failFileFsync = false;
   fsState.failDirFsync = false;
+  fsState.dirOpenError = null;
   fsState.failFirstReadAfterRename = false;
   fsState.failSentinelRemoval = false;
   fsState.concurrentCreateAfterExists = null;
@@ -584,6 +601,25 @@ describe("a ROLLBACK is a store write too, and reports what it cost", () => {
     expect(parseEnvFile()!.RUNPOD_API_KEY).toBeUndefined(); // it really is gone
   });
 
+  it("does not roll back an alias this call never wrote", () => {
+    // The rollback walked the WHOLE alias list from a snapshot taken before the
+    // fan-out started. An alias the fan-out never reached — which another
+    // ordinary writer may legitimately have updated meanwhile — was therefore
+    // overwritten with the stale snapshot, and because that key is the restore's
+    // own intentional key the clobber was excluded from `lostKeys` and reported
+    // as a successful restore (codex gate).
+    writeFileSync(envPath, "HF_TOKEN=hf-old\nHUGGINGFACE_TOKEN=hfl-old\n", { mode: 0o600 });
+    // Rename 1 = HF_TOKEN write, tampered so it reads back as NOT saved: the
+    // fan-out stops there and never touches HUGGINGFACE_TOKEN at all.
+    fsState.tamperAtRename[1] = () =>
+      "HF_TOKEN=hf-old\nHUGGINGFACE_TOKEN=hfl-updated-by-someone-else\n";
+    const outcome = setPanelSecret("huggingface", "hf-new");
+    expect(outcome.confirmed).toBe(false);
+    // The alias we never wrote keeps the OTHER writer's value — it is not ours
+    // to put back.
+    expect(parseEnvFile()!.HUGGINGFACE_TOKEN).toBe("hfl-updated-by-someone-else");
+  });
+
   it("does not let the RETHROW swallow what the rollback destroyed", () => {
     // When a per-key write THROWS, the slot rolls back and rethrows the original
     // reason — correct, the caller's value is not in place. But the rollback is
@@ -660,6 +696,38 @@ describe("a completed REVOKE is never turned back into a refusal", () => {
     // ...and the thing the user actually needs to know is stated.
     expect(out!.resurrectionRisk).toMatch(/COMES BACK on the next start/);
     expect(out!.resurrectionRisk).not.toContain("civ-legacy"); // never a value
+  });
+});
+
+describe("a PARTLY completed slot revoke reports itself instead of throwing", () => {
+  it("returns what WAS removed when a later alias cannot be removed", async () => {
+    // The alias fan-out is serial, so an earlier alias can already be gone when
+    // a later one fails. Throwing discarded that completed removal entirely: the
+    // console saw a generic failure with no `cleared` and no "do not retry"
+    // (codex gate).
+    const { clearPanelSecret } = await import("../../services/panel-secrets.js");
+    writeFileSync(envPath, "HF_TOKEN=hf-old\nHUGGINGFACE_TOKEN=hfl-old\n", { mode: 0o600 });
+    fsState.failRenameAt = 2; // HF_TOKEN goes; HUGGINGFACE_TOKEN cannot
+    let out: SecretRemoveOutcome | undefined;
+    expect(() => {
+      out = clearPanelSecret("huggingface");
+    }).not.toThrow();
+    fsState.failRenameAt = 0;
+    expect(out!.changed).toBe(true); // part of it HAPPENED
+    expect(out!.incomplete).toMatch(/HUGGINGFACE_TOKEN/);
+    expect(out!.incomplete).toMatch(/do not simply repeat the revoke/);
+    expect(parseEnvFile()!.HF_TOKEN).toBeUndefined(); // the completed half
+    expect(parseEnvFile()!.HUGGINGFACE_TOKEN).toBe("hfl-old"); // the failed half
+  });
+
+  it("REFUSES when nothing was removed at all", async () => {
+    // Nothing happened, so refusing is correct and "it is still there" is true.
+    const { clearPanelSecret } = await import("../../services/panel-secrets.js");
+    writeFileSync(envPath, "HF_TOKEN=hf-old\nHUGGINGFACE_TOKEN=hfl-old\n", { mode: 0o600 });
+    fsState.failRename = true;
+    expect(() => clearPanelSecret("huggingface")).toThrow(/ENOSPC/);
+    fsState.failRename = false;
+    expect(parseEnvFile()!.HF_TOKEN).toBe("hf-old");
   });
 });
 
@@ -744,6 +812,35 @@ describe("the write is made DURABLE, and says so when it could not be", () => {
     expect(parseEnvFile()!.CIVITAI_API_TOKEN).toBe("civ-new");
     expect(r.durabilityGap).toMatch(/could not be flushed to the device/);
     expect(r.durabilityGap).toMatch(/EIO/);
+  });
+
+  it("does not call an EACCES on the directory 'no gap' — it is not a platform answer", () => {
+    // A directory can be writable and searchable but not READABLE, so the
+    // rewrite succeeds while `openSync(dir, "r")` is refused. EACCES was being
+    // swallowed alongside the genuine "this filesystem does not implement
+    // directory syncing" codes, so no sync happened and the receipt still
+    // claimed no gap — an unobserved durability claim (codex gate).
+    withPlatform("linux", () => {
+      writeFileSync(envPath, POPULATED, { mode: 0o600 });
+      fsState.dirOpenError = "EACCES";
+      const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+      fsState.dirOpenError = null;
+      expect(r.persisted).toBe("yes"); // the save landed
+      expect(r.durabilityGap).toMatch(/rename was not made durable/);
+      expect(r.durabilityGap).toMatch(/EACCES/);
+    });
+  });
+
+  it("still treats a filesystem that does not IMPLEMENT directory sync as no gap", () => {
+    // The counterpart: ENOTSUP really is the platform's answer, not a failure of
+    // this write. Without this the fix above would just alarm on everything.
+    withPlatform("linux", () => {
+      writeFileSync(envPath, POPULATED, { mode: 0o600 });
+      fsState.dirOpenError = "ENOTSUP";
+      const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+      fsState.dirOpenError = null;
+      expect(r.durabilityGap).toBeUndefined();
+    });
   });
 
   it("reports a failed DIRECTORY fsync too", () => {
