@@ -204,7 +204,8 @@ function reflectionPatterns(value: string): { pattern: RegExp; length: number }[
         `&#0*${code};`, // decimal, with the leading zeros some escapers emit
         `&#[xX]0*${[...code.toString(16)].map(eitherCase).join("")};`, // hex, case-free
       ];
-      if (NAMED[c]) alts.push(`&${NAMED[c]};`);
+      // HTML accepts `&AMP;` as well as `&amp;`, so the NAME is case-free too.
+      if (NAMED[c]) alts.push(`&${[...NAMED[c]].map(eitherCase).join("")};`);
       return `(?:${alts.join("|")})`;
     });
     out.push({
@@ -258,6 +259,23 @@ export function scrubSecretShapedText(text: string): string | null {
         if (!new RegExp(pattern.source, "g").test(out)) continue;
         if (length < 8) return null; // too short to replace safely
         out = out.replace(new RegExp(pattern.source, "g"), REDACTED);
+      }
+      // LINE-WRAPPED reflections. Everything above matches CONTIGUOUS text, so a
+      // proxy that wraps a long token across lines — or inserts a soft break
+      // into it — leaves fragments that are individually under the 24-char
+      // opaque-run threshold and carry no `token=` label: every pass misses
+      // them, and the whole credential goes out in pieces (codex gate). The
+      // wrapping is not reversible in place, so this DETECTS in a
+      // whitespace-free view and FAILS CLOSED. It is the same policy as a
+      // too-short credential: a diagnostic is never worth a credential.
+      const compact = out.replace(/\s+/g, "");
+      if (compact !== out) {
+        for (const candidate of reflectionVariants(base)) {
+          if (candidate && candidate.length >= 8 && compact.includes(candidate)) return null;
+        }
+        for (const { pattern, length } of reflectionPatterns(base)) {
+          if (length >= 8 && new RegExp(pattern.source, "g").test(compact)) return null;
+        }
       }
     }
   }
