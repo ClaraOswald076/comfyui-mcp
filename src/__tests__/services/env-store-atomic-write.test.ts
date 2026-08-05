@@ -350,6 +350,33 @@ describe("the credential store is written ATOMICALLY", () => {
     expect(readFileSync(envPath, "utf-8")).toContain("# my credentials");
   });
 
+  it("names a snapshot it could not clean up when the write FAILED", () => {
+    // The refusal is correct — nothing was written — but the snapshot is a link
+    // to the store as it is RIGHT NOW and it is FRESH, so the stale sweep will
+    // skip it for the next minute as a live writer's. Dropping the cleanup
+    // failure left a readable copy of the credentials behind with nothing
+    // saying so, and a revoke moments later could report clean over it (codex
+    // gate).
+    writeFileSync(envPath, POPULATED, { mode: 0o600 });
+    fsState.failRename = true;
+    fsState.failSentinelRemoval = true;
+    let message = "";
+    try {
+      setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    }
+    fsState.failRename = false;
+    fsState.failSentinelRemoval = false;
+    expect(message).toMatch(/ENOSPC/); // the real reason survives
+    expect(message).toMatch(/Nothing was written/); // and it is still a refusal
+    expect(message).toMatch(/could not be cleaned up/);
+    expect(message).toContain(".pre-");
+    expect(message).not.toContain("civ-new"); // never a value
+    // The store really is untouched.
+    expect(readFileSync(envPath, "utf-8")).toBe(POPULATED);
+  });
+
   it("leaves no temp files behind when the write fails", () => {
     writeFileSync(envPath, POPULATED, { mode: 0o600 });
     fsState.failRename = true;
@@ -547,7 +574,9 @@ describe("a save is never CONFIRMED over lost credentials", () => {
     fsState.failSentinelRemoval = false;
     expect(out.changed).toBe(true); // the revoke happened
     expect(out.resurrectionRisk).toMatch(/pre-write snapshot this removal took could not be deleted/);
-    expect(out.resurrectionRisk).toMatch(/still contains the old credential/);
+    // It says what the file KIND establishes — a link to the store as it stood
+    // before the revoke — rather than asserting contents nobody read.
+    expect(out.resurrectionRisk).toMatch(/still holds the credential just removed/);
     expect(revokeIsClean(out)).toBe(false);
     expect(JSON.stringify(out)).not.toContain("civ-old"); // names only
   });
@@ -867,6 +896,52 @@ describe("notifying is not part of the write's transaction", () => {
     } finally {
       off();
     }
+  });
+});
+
+describe("the change EVENT carries the verdict all the way to the listener", () => {
+  it("delivers persisted:'yes' for a proven save, so the retry nudge can fire", async () => {
+    // The retry nudge is gated on this. Testing the gate predicate alone left
+    // the DELIVERY untested, and the subscription wrapper dropped the field —
+    // so the gate was always false and a confirmed save stopped nudging at all
+    // (codex gate). The predicate and the payload have to be tested together.
+    const { onComfyuiSecretsChanged, changeJustifiesRetryNudge } = await import(
+      "../../services/panel-secrets.js"
+    );
+    const seen: unknown[] = [];
+    const off = onComfyuiSecretsChanged((c) => seen.push(c));
+    try {
+      writeFileSync(envPath, POPULATED, { mode: 0o600 });
+      setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new", { requested: true, tabId: "tab-9" });
+    } finally {
+      off();
+    }
+    expect(seen).toHaveLength(1);
+    const change = seen[0] as Parameters<typeof changeJustifiesRetryNudge>[0];
+    expect(change.persisted).toBe("yes");
+    expect(changeJustifiesRetryNudge(change)).toBe(true);
+  });
+
+  it("delivers the UNPROVEN verdict too, so the nudge is withheld", async () => {
+    const { onComfyuiSecretsChanged, changeJustifiesRetryNudge } = await import(
+      "../../services/panel-secrets.js"
+    );
+    const seen: unknown[] = [];
+    const off = onComfyuiSecretsChanged((c) => seen.push(c));
+    try {
+      writeFileSync(envPath, POPULATED, { mode: 0o600 });
+      // A concurrent writer makes the loss account incomplete → "unknown".
+      fsState.concurrentWriteBeforeRead = {
+        at: 2,
+        run: () => writeFileSync(envPath, `${POPULATED}RUNPOD_API_KEY=rp-other\n`, { mode: 0o600 }),
+      };
+      setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new", { requested: true, tabId: "tab-9" });
+    } finally {
+      off();
+    }
+    const change = seen[0] as Parameters<typeof changeJustifiesRetryNudge>[0];
+    expect(change.persisted).toBe("unknown");
+    expect(changeJustifiesRetryNudge(change)).toBe(false);
   });
 });
 

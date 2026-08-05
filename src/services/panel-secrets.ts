@@ -278,6 +278,12 @@ export function onComfyuiSecretsChanged(cb: (change: ComfyuiSecretChange) => voi
   const handler = (payload?: Partial<ComfyuiSecretChange>) =>
     cb({
       requested: payload?.requested === true,
+      // The VERDICT must survive this wrapper. It is what the retry nudge is
+      // gated on, and dropping it here made the gate always-false — a confirmed
+      // save stopped nudging at all, which is #164 broken in the other
+      // direction (codex gate). This wrapper normalises; it does not get to
+      // decide what the listener may know.
+      persisted: payload?.persisted,
       tabId: payload?.requested === true ? payload?.tabId : undefined,
       report: payload?.report,
     });
@@ -442,9 +448,20 @@ export function receiptDisclosures(receipt: SecretSaveReceipt): string[] {
  *  rotation on a single-user machine, but the user should know it is there. */
 export function strayCopyNote(receipt: SecretSaveReceipt): string | null {
   if (!receipt.strayCopy) return null;
+  // Say only what the FILE KIND establishes. `.pre-*` is a snapshot of the store
+  // as it was, so it holds the previous value; `.tmp-*` is a failed writer's
+  // proposed new content, which is a different thing entirely — and both were
+  // being described as "the previous value", asserting contents nobody looked at
+  // (codex gate). Neither is ever opened to check: that would mean reading a
+  // credential in order to describe it.
+  const kinds = [
+    /\.pre-/.test(receipt.strayCopy) ? "a snapshot of the store from before a write" : null,
+    /\.tmp-/.test(receipt.strayCopy) ? "an unfinished write's proposed new store" : null,
+  ].filter((k): k is string => k !== null);
   return (
-    `⚠️ A pre-write snapshot of ${receipt.path} could not be deleted: ${receipt.strayCopy}. ` +
-    `It is a copy of the store from before this change and still contains the PREVIOUS value of "${receipt.key}". Delete it by hand.`
+    `⚠️ A leftover file beside ${receipt.path} could not be deleted: ${receipt.strayCopy}. ` +
+    `${kinds.length ? `It is ${kinds.join(" / ")}` : "Its provenance was not established"}, ` +
+    `so it may contain credential values — the file itself was not read. Delete it by hand.`
   );
 }
 
@@ -1149,13 +1166,27 @@ function rewriteEnvFile(
       } catch {
         /* a stray temp file is not worth losing the reason for */
       }
+      let leftBehind: string | null = null;
       try {
         rmSync(sentinel, { force: true });
-      } catch {
-        /* ditto */
+      } catch (rmErr) {
+        // The snapshot is a link to the store as it is RIGHT NOW, and it is
+        // FRESH — so the stale sweep will skip it for the next minute as a live
+        // writer's. Dropping this failure left a readable copy of the
+        // credentials behind with nothing saying so, and a revoke moments later
+        // could report clean over it (codex gate). The refusal below is still
+        // correct — the store is untouched — but it must carry this.
+        leftBehind = `${sentinel} (${errCode(rmErr)})`;
       }
       // Still BEFORE the rename: the store is untouched, so refusing is correct
       // and the caller's "nothing was written" is true.
+      if (leftBehind) {
+        throw new Error(
+          `${err instanceof Error ? err.message : String(err)} ` +
+            `Nothing was written to ${p}. However, a pre-write snapshot could not be cleaned up: ${leftBehind} — ` +
+            `it is a readable copy of the credential store as it is now. Delete it by hand.`,
+        );
+      }
       throw err;
     }
 
@@ -1685,14 +1716,18 @@ export function removeEnvSecret(key: string): SecretRemoveOutcome {
   if (outcome.strayCopy && !resurrectionRisk) {
     resurrectionRisk =
       `"${key}" was removed from ${envFilePath()}, but the pre-write snapshot this removal took could not be deleted: ${outcome.strayCopy}. ` +
-      `That file is a copy of the store from BEFORE the revoke and still contains the old credential. Delete it by hand.`;
+      `That file is a link to the store as it stood BEFORE the revoke — so it still holds the credential just removed. Delete it by hand.`;
     logger.warn(`[panel-secrets] ${resurrectionRisk}`);
   }
   const strayCopies = sweepStaleSidecars(envFilePath());
   if (strayCopies.length && !resurrectionRisk) {
+    // Provenance only as far as the file KIND establishes it. A `.pre-*` is a
+    // snapshot of the store as it was; a `.tmp-*` is an unfinished write's
+    // proposed content — a different thing, and neither is opened to look.
     resurrectionRisk =
-      `"${key}" was removed from ${envFilePath()}, but ${strayCopies.length} pre-write snapshot${strayCopies.length > 1 ? "s" : ""} left by an interrupted write could not be deleted ` +
-      `(${strayCopies.join(", ")}). ${strayCopies.length > 1 ? "They are copies" : "It is a copy"} of the store from before this change and still contain${strayCopies.length > 1 ? "" : "s"} the old credential. Delete ${strayCopies.length > 1 ? "them" : "it"} by hand.`;
+      `"${key}" was removed from ${envFilePath()}, but ${strayCopies.length} leftover file${strayCopies.length > 1 ? "s" : ""} from an interrupted write could not be deleted ` +
+      `(${strayCopies.join(", ")}). ${strayCopies.length > 1 ? "They are" : "It is"} a store snapshot or an unfinished write's content — not read here — so ${strayCopies.length > 1 ? "they" : "it"} may still hold this credential. ` +
+      `Delete ${strayCopies.length > 1 ? "them" : "it"} by hand.`;
     logger.warn(`[panel-secrets] ${resurrectionRisk}`);
   }
   const changed = removed || purgedJson || envDeleted;

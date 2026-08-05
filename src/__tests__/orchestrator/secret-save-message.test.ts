@@ -206,6 +206,22 @@ describe("secretSavedReply: the panel's green light is the same question as ever
     expect(String(reply.error)).toContain("another process was writing");
   });
 
+  it("describes a leftover file by its KIND, never by contents nobody read", () => {
+    // `.pre-*` is a snapshot of the store as it was; `.tmp-*` is an unfinished
+    // write's PROPOSED content — a different thing. Both were being described as
+    // "the previous value", asserting contents that were never looked at (codex
+    // gate). Neither file is opened: reading it would mean reading a credential
+    // in order to describe it.
+    const snapshot = secretSavedReply({ ...base, strayCopy: "/home/u/.env.pre-1-abc (EPERM)" });
+    expect(String(snapshot.warnings?.join(" "))).toContain("snapshot of the store from before a write");
+    expect(String(snapshot.warnings?.join(" "))).toContain("the file itself was not read");
+
+    const unfinished = secretSavedReply({ ...base, strayCopy: "/home/u/.env.tmp-1-abc (EPERM)" });
+    expect(String(unfinished.warnings?.join(" "))).toContain("unfinished write's proposed new store");
+    // ...and it must NOT be called the previous value, which it is not.
+    expect(String(unfinished.warnings?.join(" "))).not.toContain("PREVIOUS value");
+  });
+
   it("carries a confirmed save's remaining obligations as warnings", () => {
     const reply = secretSavedReply({ ...base, lostCommentLines: 2 });
     expect(reply.ok).toBe(true);
