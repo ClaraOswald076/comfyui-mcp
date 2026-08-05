@@ -1418,3 +1418,53 @@ describe("resolveLiveServerRoot (#369)", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// #490 (reopened). `resolveEffectiveComfyUIBase` returns `config.comfyuiPath`
+// BEFORE it consults remote mode, against its own docstring — so with
+// --comfyui-url and a stale local COMFYUI_PATH it hands back an install that has
+// nothing to do with the connected server. That resolver has twelve callers and
+// is not being changed here; `resolveLocalMutationTarget` is what destructive
+// paths use instead, and it must refuse rather than hand back the wrong tree.
+//
+// The consumer suites mock this function, which proves they HONOUR a refusal but
+// not that the production resolver ever ISSUES one (codex gate). This exercises
+// the real thing.
+
+describe("resolveLocalMutationTarget — refuses what it cannot identify", () => {
+  beforeEach(() => {
+    h.remoteMode.value = false;
+    h.mockConfig.comfyuiPath = undefined;
+  });
+
+  it("REFUSES in remote mode even when COMFYUI_PATH is set — the dangerous case", async () => {
+    const { resolveLocalMutationTarget, resolveEffectiveComfyUIBase } = await import(
+      "../../services/workspace-env.js"
+    );
+    h.remoteMode.value = true;
+    h.mockConfig.comfyuiPath = "/stale/local/ComfyUI";
+
+    // The bug, pinned: the shared resolver still hands back the stale local path.
+    expect(resolveEffectiveComfyUIBase()).toBe("/stale/local/ComfyUI");
+    // …and the mutation target refuses it, naming why.
+    const target = resolveLocalMutationTarget();
+    expect(target.base).toBeUndefined();
+    expect(target.refusal).toMatch(/REMOTE ComfyUI/i);
+    expect(target.refusal).toMatch(/stale\/local\/ComfyUI/);
+    expect(target.refusal).toMatch(/DIFFERENT install/i);
+  });
+
+  // The third case — no path establishable at all — is deliberately NOT tested
+  // here: with COMFYUI_PATH unset this resolver falls through to the machine's
+  // SAVED DEFAULT WORKSPACE, so on any developer rig that has one the assertion
+  // depends on the host rather than the code. The consumer suites cover it with
+  // that lookup mocked.
+  it("returns the base in LOCAL mode — the refusal must not swallow the normal case", async () => {
+    const { resolveLocalMutationTarget } = await import("../../services/workspace-env.js");
+    h.mockConfig.comfyuiPath = "/local/ComfyUI";
+    const target = resolveLocalMutationTarget();
+    expect(target.base).toBe("/local/ComfyUI");
+    expect(target.refusal).toBeUndefined();
+  });
+
+});

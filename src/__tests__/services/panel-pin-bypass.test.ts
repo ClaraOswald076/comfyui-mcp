@@ -40,6 +40,7 @@ vi.mock("../../config.js", () => {
   return {
     config,
     isLocalMode: () => true,
+    isRemoteMode: () => false,
     getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
     getComfyUIAuthHeaders: () => ({}),
   };

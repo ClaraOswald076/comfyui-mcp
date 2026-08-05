@@ -96,6 +96,116 @@ describe("searchNodes (upstream-bug client-side filter)", () => {
   });
 });
 
+describe("searchNodes exact-id fallback (#773)", () => {
+  // The client-side filter only ranks a 100-pack window; a query naming a real
+  // pack OUTSIDE that window (including its exact id) false-emptied. When the
+  // filter matches nothing, the query is normalized to a registry-id slug and
+  // tried against the direct pack-details endpoint before reporting no matches.
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it("falls back to the direct pack-details endpoint when the window matched nothing", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/nodes/comfyui-kjnodes")) {
+        return new Response(
+          JSON.stringify({
+            id: "comfyui-kjnodes",
+            name: "KJNodes",
+            description: "Utility nodes",
+            author: "kijai",
+            repository: "https://github.com/kijai/ComfyUI-KJNodes",
+            latest_version: { version: "1.4.8" },
+            total_install: 12345,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ nodes: NODES }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const results = await searchNodes("comfyui kjnodes");
+    expect(results.map((r) => r.id)).toEqual(["comfyui-kjnodes"]);
+    // The object-shaped latest_version is normalized for the fallback too.
+    expect(results[0]?.latest_version).toBe("1.4.8");
+    // Two calls: the window search, then the exact-id fallback.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(String(fetchMock.mock.calls[1]?.[0])).toContain("/nodes/comfyui-kjnodes");
+  });
+
+  it("still reports no matches when the fallback id does not exist (404)", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (/\/nodes\/[^?]+$/.test(url)) {
+        return new Response("not found", { status: 404 });
+      }
+      return new Response(JSON.stringify({ nodes: NODES }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const results = await searchNodes("definitely not a pack");
+    expect(results).toEqual([]);
+  });
+
+  it("a non-404 fallback failure is REFUSED — 'no matches' was never established", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (/\/nodes\/[^?]+$/.test(url)) {
+        return new Response("boom", { status: 500 });
+      }
+      return new Response(JSON.stringify({ nodes: NODES }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    await expect(searchNodes("definitely not a pack")).rejects.toThrow(
+      /could not be resolved/,
+    );
+  });
+
+  it("does NOT call the fallback when the search itself matched", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ nodes: NODES }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const results = await searchNodes("wan");
+    expect(results.length).toBeGreaterThan(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("the fallback only answers for page 1 (it has no pagination of its own)", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ nodes: NODES }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const results = await searchNodes("comfyui kjnodes", { page: 2 });
+    expect(results).toEqual([]);
+    // Only the window fetch — no /nodes/<id> call for a later page.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("extractVersionString (registry version is an object, not a string)", () => {
   it("returns a bare string as-is", () => {
     expect(extractVersionString("1.2.3")).toBe("1.2.3");

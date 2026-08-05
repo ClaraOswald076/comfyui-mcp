@@ -157,6 +157,7 @@ const CATEGORIES: Array<{
     tools: [
       "search_custom_nodes", "get_node_pack_details", "install_custom_node",
       "update_custom_node", "reinstall_custom_node", "fix_custom_node",
+      "disable_custom_node", "enable_custom_node", "uninstall_custom_node",
       "list_installed_nodes", "sync_node_dependencies", "extract_workflow_dependencies",
       "install_workflow_dependencies", "node_snapshot", "bisect",
       "scaffold_custom_node", "verify_custom_node", "publish_custom_node",

@@ -118,10 +118,72 @@ export async function searchNodes(
 
   const start = (page - 1) * limit;
   const paged = filtered.slice(start, start + limit);
+
+  // #773 — the client-side filter only ever sees a 100-pack WINDOW of a
+  // registry with thousands of packs, so a query naming a real pack outside
+  // that window (including its exact id, e.g. "comfyui kjnodes" →
+  // "comfyui-kjnodes") false-empties. When the filter matched NOTHING, try the
+  // direct pack-details endpoint with the query normalized to a registry-id
+  // slug before reporting no matches. The fallback can only ADD a result; only
+  // an observed 404 leaves the honest empty answer — any other failure means
+  // absence was never established and is refused with the reason. PAGE 1 ONLY:
+  // the fallback has no pagination of its own, so it must not answer for a
+  // later page (an out-of-window exact match would otherwise surface ON page 2).
+  if (lowerQuery && filtered.length === 0 && page === 1) {
+    const candidate = registryIdCandidateFromQuery(query);
+    if (candidate) {
+      try {
+        const details = await getNodePackDetails(candidate);
+        logger.info(
+          `Registry search "${query}" matched nothing in the fetched window, ` +
+            `but "${candidate}" resolved via the direct pack-details endpoint`,
+        );
+        return [normalizeSearchResult(details)];
+      } catch (err) {
+        // Only an observed 404 establishes "no pack with that id". Anything
+        // else (500, network) means the fallback could not answer — and the
+        // window search cannot establish absence on its own (that is why the
+        // fallback exists), so reporting "no matches" would be an unearned
+        // negative. Refuse with the reason instead.
+        const status =
+          err instanceof RegistryError
+            ? (err.details as { status?: number } | undefined)?.status
+            : undefined;
+        if (status !== 404) {
+          throw new RegistryError(
+            `Registry search "${query}" matched nothing in the fetched pack window, ` +
+              `and the exact-id fallback for "${candidate}" could not be resolved ` +
+              `(${err instanceof Error ? err.message : String(err)}) — so "no matches" ` +
+              `cannot be confirmed. Retry, or look the pack up directly with ` +
+              `get_node_pack_details.`,
+          );
+        }
+        logger.debug(
+          `Registry exact-id fallback for "${query}": no pack with id "${candidate}" (404)`,
+        );
+      }
+    }
+  }
+
   logger.info(
     `Registry search "${query}": fetched ${allNodes.length}, matched ${filtered.length}, returning ${paged.length} (page ${page}, limit ${limit})`,
   );
   return paged.map(normalizeSearchResult);
+}
+
+/**
+ * Normalize a free-text query to a candidate Comfy Registry pack id: lowercase,
+ * runs of non-alphanumerics collapsed to single hyphens, edges trimmed
+ * ("comfyui kjnodes" → "comfyui-kjnodes"). Undefined when nothing usable
+ * remains.
+ */
+export function registryIdCandidateFromQuery(query: string): string | undefined {
+  const slug = query
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug.length > 0 ? slug : undefined;
 }
 
 /** Coerce the registry's object-shaped `latest_version` into a string. */

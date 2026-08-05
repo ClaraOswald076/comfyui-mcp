@@ -4,13 +4,13 @@ description: "Discover, install, update, snapshot, bisect, scaffold, and publish
 icon: "puzzle"
 ---
 
-<Info>21 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
+<Info>24 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
 <Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
 
 ## search_custom_nodes
 
-Search the public ComfyUI Registry (registry.comfy.org) for custom node packs by keyword. Read-only and network-only: queries the hosted registry over HTTP and does NOT require a running ComfyUI or COMFYUI_PATH. Returns a ranked list of packs with id, name, author, install count, and latest version. Use to discover packs to install; pass a returned id to get_node_pack_details for full info. This searches node PACKS, not models (use search_models) and not local installs (use list_local_models).
+Search the public ComfyUI Registry (registry.comfy.org) for custom node packs by keyword. Read-only and network-only: queries the hosted registry over HTTP and does NOT require a running ComfyUI or COMFYUI_PATH. Returns a ranked list of packs with id, name, author, install count, and latest version. The keyword search ranks a fixed window of packs client-side, so when it matches nothing the query is also tried as an exact registry id automatically (e.g. 'comfyui kjnodes' → 'comfyui-kjnodes'). Use to discover packs to install; pass a returned id to get_node_pack_details for full info. This searches node PACKS, not models (use search_models) and not local installs (use list_local_models).
 
 ### Parameters
 
@@ -92,7 +92,7 @@ Install a ComfyUI custom node pack by registry id, git URL, or name. Local insta
   ComfyUI-Manager channel name (default 'default').
 </ParamField>
 <ParamField path="useCmCli" type="boolean">
-  Force the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install.
+  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
 </ParamField>
 
 ### Example
@@ -130,7 +130,7 @@ Update an installed ComfyUI custom node pack, or pass 'all' to update every inst
   ComfyUI-Manager channel name (default 'default').
 </ParamField>
 <ParamField path="useCmCli" type="boolean">
-  Force the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install.
+  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
 </ParamField>
 
 ### Example
@@ -167,7 +167,7 @@ Reinstall a ComfyUI custom node pack. Local operations prefer official comfy-cli
   ComfyUI-Manager channel name (default 'default').
 </ParamField>
 <ParamField path="useCmCli" type="boolean">
-  Force the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install.
+  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
 </ParamField>
 
 ### Example
@@ -201,7 +201,7 @@ Repair a ComfyUI custom node pack's install and Python dependencies, or pass 'al
   ComfyUI-Manager channel name (default 'default').
 </ParamField>
 <ParamField path="useCmCli" type="boolean">
-  Force the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install.
+  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
 </ParamField>
 
 ### Example
@@ -211,6 +211,90 @@ Repair a ComfyUI custom node pack's install and Python dependencies, or pass 'al
 ```json
 {
   "tool": "fix_custom_node",
+  "arguments": {
+    "id": "<id>"
+  }
+}
+```
+
+---
+
+## disable_custom_node
+
+Disable an installed ComfyUI custom node pack WITHOUT removing it — the reversible first step of a cleanup (re-enable with enable_custom_node; uninstall_custom_node removes a pack outright). Uses the ComfyUI-Manager HTTP API (works against remote instances) or official comfy-cli locally, and re-reads the installed-pack list afterwards so a Manager no-op is reported as NOT disabled rather than as success. A ComfyUI restart is required for the change to take effect. REFUSES the comfyui-mcp sidebar panel pack.
+
+### Parameters
+
+<ParamField path="id" type="string" required>
+  Registry id / module name of the installed pack to disable.
+</ParamField>
+<ParamField path="useCmCli" type="boolean">
+  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
+</ParamField>
+
+### Example
+
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+
+```json
+{
+  "tool": "disable_custom_node",
+  "arguments": {
+    "id": "<id>"
+  }
+}
+```
+
+---
+
+## enable_custom_node
+
+Re-enable a ComfyUI custom node pack previously disabled with disable_custom_node. Uses the ComfyUI-Manager HTTP API (works against remote instances) or official comfy-cli locally, and re-reads the installed-pack list afterwards so a Manager no-op is reported as NOT enabled rather than as success. A ComfyUI restart is required for the change to take effect. REFUSES the comfyui-mcp sidebar panel pack.
+
+### Parameters
+
+<ParamField path="id" type="string" required>
+  Registry id / module name of the installed pack to enable.
+</ParamField>
+<ParamField path="useCmCli" type="boolean">
+  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
+</ParamField>
+
+### Example
+
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+
+```json
+{
+  "tool": "enable_custom_node",
+  "arguments": {
+    "id": "<id>"
+  }
+}
+```
+
+---
+
+## uninstall_custom_node
+
+Uninstall a ComfyUI custom node pack (removes it). IRREVERSIBLE through this tool — for a cleanup audit prefer disable_custom_node, which is reversible. The pack must be one ComfyUI-Manager tracks: an id that resolves nowhere is REFUSED before anything is queued (a drained queue would otherwise read exactly like a success), and a pack that is on disk but unmanaged is named so you can remove its directory yourself. After the queue drains the installed-pack list is re-read and the pack must be GONE before anything claims 'uninstalled'. A ComfyUI restart is required to unload it fully. REFUSES the comfyui-mcp sidebar panel pack.
+
+### Parameters
+
+<ParamField path="id" type="string" required>
+  Registry id / module name of the installed pack to uninstall.
+</ParamField>
+<ParamField path="useCmCli" type="boolean">
+  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
+</ParamField>
+
+### Example
+
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+
+```json
+{
+  "tool": "uninstall_custom_node",
   "arguments": {
     "id": "<id>"
   }
@@ -229,7 +313,7 @@ List installed ComfyUI custom node packs with their version and enabled/disabled
   'default' lists all installed packs; 'imported' lists only those successfully imported this session. Options: `default`, `imported`.
 </ParamField>
 <ParamField path="useCmCli" type="boolean">
-  Force the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install.
+  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
 </ParamField>
 
 ### Example
@@ -341,7 +425,7 @@ Resolve and install the custom node packs a ComfyUI workflow requires via ComfyU
 
 Custom-node snapshots via ComfyUI-Manager (mirrors `comfy node save-snapshot` / `restore-snapshot`). Driven by the `action` parameter:
 - action:"list" — List the snapshots ComfyUI-Manager knows about. No other parameters. Read-only.
-- action:"save" — Save the current custom-node and version state. With no `name`, Manager assigns a timestamped snapshot (works against remote instances). Providing `name` writes a custom-named snapshot file, which requires a local ComfyUI install and is unavailable in remote (--comfyui-url) mode.
+- action:"save" — Save the current custom-node and version state. With no `name`, Manager assigns a timestamped snapshot (works against remote instances). Providing `name` writes a custom-named snapshot file, which requires a local ComfyUI install root (COMFYUI_PATH or a saved default workspace — see the workspace tool) and is unavailable against a genuinely remote ComfyUI.
 - action:"restore" — Restore a previously saved snapshot by `name` (required). ComfyUI-Manager applies the custom-node changes on the next ComfyUI restart; use action:"list" to find available names.
 
 <Tip>**In plain terms:** A restore point for your installed node packs. Take one before a round of installing, and you have a way back if something breaks.</Tip>

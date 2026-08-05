@@ -45,6 +45,8 @@ vi.mock("../../config.js", () => {
     // node-management's Manager self-update path (#424) imports this; the mock
     // must provide it or the named import fails at load.
     isLoopbackHost: (host?: string) => host === "127.0.0.1" || host === "localhost",
+    // The #797 presence gate gates its disk check on the session mode.
+    isRemoteMode: () => false,
   };
 });
 
