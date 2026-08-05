@@ -1339,10 +1339,44 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     const err = await runPanelAction("update", h.deps).catch((e) => e);
     expect(err).toBeInstanceOf(PanelInstallError);
     const msg = String(err?.message ?? err);
-    expect(msg).toMatch(/did NOT apply/);
+    // The HEADLINE moves with the observation: a tree that moved means the
+    // merge may have applied PARTIALLY, so "did NOT apply" is not available.
+    expect(msg).toMatch(/could NOT be confirmed/);
+    expect(msg).not.toMatch(/did NOT apply/);
     expect(msg).toMatch(/NOT what it was before the attempt/);
     expect(msg).toMatch(/the worktree is dirty/);
+    expect(msg).toMatch(/may therefore have applied PARTIALLY/);
     expect(msg).not.toMatch(/nothing changed on disk/);
+    // The original merge failure survives into the message either way.
+    expect(msg).toMatch(/persona has no working git fallback/);
+    expect(h.gitPulls).toEqual([dir]);
+  });
+
+  it("#824: a failed merge whose OWN re-read fails is disclosed as UNKNOWN, never as 'did NOT apply'", async () => {
+    // The re-read added above is itself two operations that can fail. Both live
+    // in one try, so an unreadable HEAD and an unreadable status reach the same
+    // handler; this drives it through `git status`. Failing to read is "could
+    // not determine whether the merge applied partially", which is not "it did
+    // not apply" — and it must not swallow the merge error either.
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: IDLE_SNAPSHOT,
+      upstreamRev: REV_B,
+      // 0 = cleanliness gate, 1 = pre-merge CAS, 2 = the post-failure re-read.
+      gitStatusThrowsAt: 2,
+      // onGitPull omitted -> the pinned merge THROWS.
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    const msg = String(err?.message ?? err);
+    expect(msg).toMatch(/could NOT be confirmed/);
+    expect(msg).not.toMatch(/did NOT apply/);
+    expect(msg).toMatch(/could not be re-read afterwards/);
+    expect(msg).toMatch(/is UNKNOWN/);
+    // The merge error is what the user needs most; it must not be lost.
+    expect(msg).toMatch(/persona has no working git fallback/);
     expect(h.gitPulls).toEqual([dir]);
   });
 
@@ -1364,6 +1398,9 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     expect(msg).toMatch(/re-read afterwards and is unchanged/);
     expect(msg).toMatch(/installed version is still 0\.11\.32/);
     expect(msg).not.toMatch(/NOT what it was before/);
+    // Only an OBSERVED untouched tree earns the flat "did NOT apply" headline.
+    expect(msg).toMatch(/did NOT apply/);
+    expect(msg).not.toMatch(/could NOT be confirmed/);
   });
 
   it("#824: 'already at the upstream tip' claims only what git proved, not an untouched directory", async () => {

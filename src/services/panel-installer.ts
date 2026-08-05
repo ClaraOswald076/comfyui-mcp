@@ -2733,29 +2733,46 @@ async function updateViaGitCheckoutFallback(opts: {
     // narrated as a fact about the disk (codex gate). So OBSERVE it: report
     // unchanged only when a fresh read says so, report what moved when it did,
     // and say UNKNOWN when the read itself fails.
+    //
+    // The HEADLINE moves with that observation too (codex gate r2). "Panel
+    // update did NOT apply" is a claim about the disk, so it is only earned by
+    // the reading that shows an untouched tree. When the tree moved, or could
+    // not be read, the merge may have applied PARTIALLY — the register there is
+    // disclosure, not a flat denial that anything happened. Both reads live in
+    // ONE try, so an unreadable HEAD and an unreadable status land in the same
+    // honest answer; neither can escape and lose the merge error below.
+    let headline: string;
     let treeNote: string;
     try {
       const afterRev = deps.gitRevision(dir);
       const afterPorcelain = deps.gitStatusPorcelain(dir).trim();
-      treeNote =
-        afterRev === prePullRev && afterPorcelain === ""
-          ? `The checkout was re-read afterwards and is unchanged (HEAD still ` +
-            `${prePullRev.slice(0, 8)}, worktree clean), so the installed version is ` +
-            `still ${previousVersion ?? "unknown"}.`
-          : `The checkout was re-read afterwards and is NOT what it was before the ` +
-            `attempt — ` +
-            `${afterRev !== prePullRev ? `HEAD is ${afterRev ? afterRev.slice(0, 8) : "unreadable"}, not ${prePullRev.slice(0, 8)}` : `the worktree is dirty:\n${afterPorcelain}`}. ` +
-            `Something changed ${dir}; inspect it (git status / git log) before ` +
-            `retrying, and do NOT assume the pre-update state.`;
+      if (afterRev === prePullRev && afterPorcelain === "") {
+        headline = `Panel update did NOT apply`;
+        treeNote =
+          `The checkout was re-read afterwards and is unchanged (HEAD still ` +
+          `${prePullRev.slice(0, 8)}, worktree clean), so the installed version is ` +
+          `still ${previousVersion ?? "unknown"}.`;
+      } else {
+        headline = `Panel update could NOT be confirmed`;
+        treeNote =
+          `The checkout was re-read afterwards and is NOT what it was before the ` +
+          `attempt — ` +
+          `${afterRev !== prePullRev ? `HEAD is ${afterRev ? afterRev.slice(0, 8) : "unreadable"}, not ${prePullRev.slice(0, 8)}` : `the worktree is dirty:\n${afterPorcelain}`}. ` +
+          `The fast-forward may therefore have applied PARTIALLY, or another ` +
+          `writer touched ${dir} — either way the panel directory is NOT in the ` +
+          `pre-update state. Inspect it (git status / git log) before retrying, ` +
+          `and do not assume the version above is what is on disk.`;
+      }
     } catch (readErr) {
+      headline = `Panel update could NOT be confirmed`;
       treeNote =
         `The checkout could not be re-read afterwards ` +
         `(${readErr instanceof Error ? readErr.message : String(readErr)}), so ` +
-        `whether anything changed in ${dir} is UNKNOWN — inspect it (git status / ` +
-        `git log) before retrying.`;
+        `whether the fast-forward applied partially — or anything else changed ` +
+        `${dir} — is UNKNOWN. Inspect it (git status / git log) before retrying.`;
     }
     throw new PanelInstallError(
-      `Panel update did NOT apply: ${managerReason}, and the direct git fallback ` +
+      `${headline}: ${managerReason}, and the direct git fallback ` +
         `on the panel repo failed too — ` +
         `${err instanceof Error ? err.message : String(err)}. ${treeNote} ` +
         `Fix: update ComfyUI-Manager on the host (git pull in custom_nodes/` +
