@@ -9,7 +9,12 @@ import { existsSync, readlinkSync, statSync } from "node:fs";
 import { platform } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { getSystemStats, resetClient, resetObjectInfoCache } from "../comfyui/client.js";
-import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
+import {
+  config,
+  getComfyUIBaseUrl,
+  getComfyuiTargetGeneration,
+  isRemoteMode,
+} from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -807,7 +812,16 @@ function describeLaunchedChildExit(
   exit: { code: number | null; signal: NodeJS.Signals | null } | undefined,
 ): string {
   if (!exit) return "";
-  return ` The process this call launched EXITED (${exitCause(exit)}) before the API came up, so ComfyUI is DOWN — this was a failed relaunch, not a slow start.`;
+  // WHAT THE EXIT PROVES, AND WHAT IT DOES NOT (codex gate). It proves THIS
+  // RELAUNCH failed — decisively, and that is the point: it separates a real
+  // failure from a slow start (#367). It does NOT prove ComfyUI is down NOW. The
+  // only evidence about the port is the readiness poll, whose last probe is already
+  // in the past, and an external supervisor restarting the server a moment later is
+  // exactly the case this file spends its length refusing to guess about. The
+  // earlier wording said "so ComfyUI is DOWN" — a claim about the machine's present
+  // state derived from a fact about our own child, which is the same
+  // observed-earlier-reported-as-now defect this change exists to remove.
+  return ` The process this call launched EXITED (${exitCause(exit)}) before the API came up, so THIS RELAUNCH FAILED — it was not a slow start. The API was still not answering at the last probe.`;
 }
 
 /** Whole seconds, never rounded down to a "within 0s" that reads as no wait. */
@@ -891,13 +905,17 @@ export function describeArgvDrift(
         .join(" ")} / now ${after.map(quoteToken).join(" ")}.`
     );
   }
+  // WHAT EQUAL ARGV ESTABLISHES (codex gate). It establishes that THIS RESTART did
+  // not change them — nothing more. It is not a reading of the user's saved settings
+  // (we never opened them), so it cannot say a saved change "was ignored": the edit
+  // may have been to something argv does not carry at all. The remedy is therefore
+  // offered CONDITIONALLY, on the user's own expectation, which only they can check.
   return (
-    ` Its launch arguments are UNCHANGED (${after.map(quoteToken).join(" ")}), so if you edited ` +
+    ` Its launch arguments are UNCHANGED (${after.map(quoteToken).join(" ")}) — this restart did not change them. ` +
+    "If you were expecting different arguments" +
     (isDesktop
-      ? "ComfyUI Desktop's saved launch arguments expecting this restart to pick them up, it did NOT. " +
-        "Fully quit the ComfyUI Desktop app and relaunch it, so it spawns the server from those saved settings."
-      : "the launch arguments on the host expecting this restart to pick them up, it did NOT. " +
-        "Stop ComfyUI and start it again from its own launcher so the new arguments are used.")
+      ? " (after editing ComfyUI Desktop's saved launch settings, say), they are not in effect here: fully quit the ComfyUI Desktop app and relaunch it so it spawns the server from those settings."
+      : " (after editing the launch command on the host, say), they are not in effect here: stop ComfyUI and start it again from its own launcher so the new arguments are used.")
   );
 }
 
@@ -2611,27 +2629,29 @@ export async function startComfyUI(): Promise<StartResult> {
       return {
         started: false,
         ready: false,
-        // OBSERVED death. ComfyUI is down, and we watched it happen.
+        // OBSERVED death of the process WE launched. `startup` is a verdict about
+        // this call's own launch, which is precisely the thing we watched — it never
+        // claimed to describe whatever may be serving the port.
         startup: "failed",
         readiness,
-        // TRUTHFUL FAILURE (#776): the process was spawned and then died, so
-        // ComfyUI is DOWN. Report that plainly — and name the environment it was
-        // launched into, which is the first thing to check when a relaunch of an
-        // otherwise-healthy install fails during import.
+        // TRUTHFUL FAILURE (#776): the process was spawned and then died, so the
+        // relaunch failed during startup. Report that plainly — and name the
+        // environment it was launched into, which is the first thing to check when a
+        // relaunch of an otherwise-healthy install fails during import.
         message:
           `ComfyUI process was launched but the API did not become ready after ${readiness.waited_ms}ms (${readiness.attempts}/${readiness.max_tries} probes).` +
           (launchedChildExit
             ? describeLaunchedChildExit(launchedChildExit)
             : launchedSpawnFailed
-              ? " The launch itself failed — the process could not be spawned — so ComfyUI is DOWN; this was a failed relaunch, not a slow start."
-              : " The process this call launched is no longer running, so ComfyUI is DOWN — this was a failed relaunch, not a slow start.") +
-          " Check the ComfyUI logs." +
+              ? " The launch itself failed — the process could not be spawned — so THIS RELAUNCH FAILED; it was not a slow start. The API was still not answering at the last probe."
+              : " The process this call launched is no longer running, so THIS RELAUNCH FAILED — it was not a slow start. The API was still not answering at the last probe.") +
+          " Check the ComfyUI logs, and re-check with health_check before assuming nothing is serving the port — an external launcher or supervisor may have brought one back since." +
           (env ? ` Launch environment: ${env.note}.` : "") +
           launchEnvWarning(info),
         auto_restart: supervisorResult(info),
         launch_env: env,
-        // Nothing is serving the port, so there is no listener to attribute — the
-        // down state is already carried by started:false / ready:false.
+        // Nothing answered during the poll, so there is no listener to attribute.
+        // This is the ABSENCE of an attribution, not a claim that the port is free.
         listener_ownership: unclassifiedOwnership(),
       };
     }
@@ -2980,6 +3000,17 @@ async function restartViaManagerReboot(context: {
   // #848: capture what it is running BEFORE the reboot, so the report afterwards can
   // say whether that changed. Total and bounded (see readServingArgv) — it is only
   // ever detail in a message, and must not be able to cost anyone their restart.
+  //
+  // INSTANCE FENCE (codex gate). Both argv reads go through the MUTABLE configured
+  // target, so a retarget between them would compare instance A's arguments against
+  // instance B's and narrate the difference as a change to one server. Comparing two
+  // readings of DIFFERENT servers is worse than not comparing at all — it would
+  // invent both the "UNCHANGED" no-op and the "CHANGED" confirmation.
+  //
+  // Judged by the monotonic GENERATION, not by a final-state base comparison: an
+  // A→B→A round trip leaves the base equal and is exactly what the generation exists
+  // to catch (the same r11 rule the panel restart's preflight uses).
+  const argvGeneration = getComfyuiTargetGeneration();
   const priorArgv = context.priorArgv?.length
     ? context.priorArgv
     : await readServingArgv();
@@ -3069,11 +3100,15 @@ async function restartViaManagerReboot(context: {
   // #848: it is back — now say whether it came back as the SAME thing. Read after
   // readiness, on a path where nothing destructive is pending, so a slow or missing
   // answer costs only the detail (describeArgvDrift stays silent without both).
-  const argvNote = describeArgvDrift(
-    priorArgv,
-    await readServingArgv(),
-    context.isDesktop === true,
-  );
+  // Suppressed entirely if the configured target moved at ANY point since the first
+  // reading — including during this one — because the two readings would then
+  // describe two different servers. The generation is re-checked AFTER the read, so
+  // a retarget that lands mid-read is caught too.
+  const afterArgv = await readServingArgv();
+  const argvNote =
+    getComfyuiTargetGeneration() === argvGeneration
+      ? describeArgvDrift(priorArgv, afterArgv, context.isDesktop === true)
+      : "";
 
   return {
     stopped: true,

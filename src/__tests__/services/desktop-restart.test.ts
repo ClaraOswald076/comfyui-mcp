@@ -9,6 +9,7 @@ import { describe, expect, it, afterEach, beforeEach, vi } from "vitest";
 
 const hoisted = vi.hoisted(() => ({
   remoteMode: { value: false },
+  targetGeneration: { value: 0 },
   fetchMock: vi.fn(),
   resetClient: vi.fn(),
   resetObjectInfoCache: vi.fn(),
@@ -28,6 +29,9 @@ const hoisted = vi.hoisted(() => ({
 vi.mock("../../config.js", () => ({
   config: { resolvedPort: 8188, comfyuiPath: "/fake/comfy", comfyuiBasePath: "" },
   getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
+  // #848 instance fence: the argv comparison is only spent while the configured
+  // target has not moved. Driven from the fixture so a retarget can be modelled.
+  getComfyuiTargetGeneration: () => hoisted.targetGeneration.value,
   isRemoteMode: () => hoisted.remoteMode.value,
 }));
 
@@ -80,6 +84,7 @@ const findCall = (pred: (path: string) => boolean): FetchCall | undefined =>
 
 beforeEach(() => {
   hoisted.remoteMode.value = false;
+  hoisted.targetGeneration.value = 0;
   hoisted.fetchMock.mockReset();
   hoisted.resetClient.mockClear();
   hoisted.resetObjectInfoCache.mockClear();
@@ -213,9 +218,16 @@ describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]",
 
     expect(res.ready).toBe(true);
     expect(res.message).toContain("launch arguments are UNCHANGED");
+    // It states exactly what equal argv establishes — that THIS RESTART did not
+    // change them — and offers the remedy CONDITIONALLY. It must not claim the
+    // user's saved settings were ignored: we never opened them, and their edit may
+    // have been to something argv does not carry (codex gate).
+    expect(res.message).toContain("this restart did not change them");
+    expect(res.message).toContain("If you were expecting different arguments");
+    expect(res.message).not.toMatch(/it did NOT\./);
     // The remedy has to be one the user can act on from where they are, and for a
     // Desktop install that is the app — not a COMFYUI_PATH or a CLI they never use.
-    expect(res.message).toContain("Fully quit the ComfyUI Desktop app");
+    expect(res.message).toMatch(/fully quit the ComfyUI Desktop app/i);
     // It reports the OBSERVATION and stops there. Naming the mechanism (a Manager
     // reboot re-execs the running process) would assert a cause we never observed.
     expect(res.message).not.toMatch(/re-exec/i);
@@ -256,7 +268,7 @@ describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]",
     // A genuine change must NOT be reported as the #848 no-op, and must not send
     // the user off to restart an app that already did what they asked.
     expect(res.message).not.toContain("UNCHANGED");
-    expect(res.message).not.toContain("Fully quit the ComfyUI Desktop app");
+    expect(res.message).not.toMatch(/fully quit the ComfyUI Desktop app/i);
   });
 
   it("says NOTHING about launch arguments when the post-restart reading is missing (#848)", async () => {
@@ -291,6 +303,38 @@ describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]",
     expect(res.message).not.toMatch(/launch arguments/i);
     // The restart itself is still reported — a missing extra detail must not
     // degrade the verdict about the thing that did happen.
+    expect(res.message).toContain("came back ready");
+  });
+
+  it("says NOTHING about launch arguments when the target moved mid-restart (#848)", async () => {
+    // Both argv readings go through the MUTABLE configured target. If it moves
+    // between them, the "before" belongs to instance A and the "after" to instance
+    // B — and reporting that as one server's arguments changing (or not) would
+    // invent a finding out of two unrelated observations (codex gate). Judged by the
+    // monotonic generation, so an A->B->A round trip is caught too.
+    __processControlTestHooks.setRemoteRebootTimingForTests({
+      settleMs: 0,
+      budgetMs: 1000,
+      intervalMs: 5,
+    });
+    hoisted.fetchMock.mockImplementation(async (url: string) => {
+      const path = pathOf(url);
+      if (path === "/v2/manager/reboot") {
+        // A hello retarget lands while the reboot is in flight.
+        hoisted.targetGeneration.value += 1;
+        return new Response("", { status: 200 });
+      }
+      if (path === "/system_stats") {
+        return new Response(JSON.stringify({ system: {} }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    const res = await restartComfyUI();
+
+    expect(res.ready).toBe(true);
+    // The identical argv would otherwise have produced the UNCHANGED note.
+    expect(res.message).not.toMatch(/launch arguments/i);
     expect(res.message).toContain("came back ready");
   });
 

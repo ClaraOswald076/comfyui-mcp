@@ -19,6 +19,8 @@ const hoisted = vi.hoisted(() => ({
 vi.mock("../../config.js", () => ({
   config: { resolvedPort: 8188, comfyuiPath: "/fake/comfy", comfyuiBasePath: "" },
   getComfyUIBaseUrl: () => "http://remote.example:8188",
+  // #848 instance fence — a stable target here; the retarget case has its own test.
+  getComfyuiTargetGeneration: () => 0,
   isRemoteMode: () => hoisted.remoteMode.value,
 }));
 

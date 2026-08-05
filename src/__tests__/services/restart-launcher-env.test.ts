@@ -2325,7 +2325,11 @@ n127.0.0.1:8188
     expect(result.stopped).toBe(true);
     expect(result.started).toBe(false);
     expect(result.message).toMatch(/EXITED \(exit code 1\)/);
-    expect(result.message).toMatch(/failed relaunch, not a slow start/i);
+    expect(result.message).toMatch(/THIS RELAUNCH FAILED/);
+    expect(result.message).toMatch(/not a slow start/i);
+    // The claim is scoped to OUR relaunch. Our child dying does not establish that
+    // nothing is serving the port now (codex gate).
+    expect(result.message).not.toMatch(/ComfyUI is DOWN/);
 
     killSpy.mockRestore();
   });
@@ -2439,9 +2443,11 @@ n127.0.0.1:8188
     expect(result.ready).toBe(false);
     expect(result.startup).toBe("failed");
     expect(result.message).toMatch(/stopped but could not be started/i);
-    expect(result.message).toMatch(/ComfyUI is DOWN/);
+    expect(result.message).toMatch(/THIS RELAUNCH FAILED/);
     // A real failure must NOT be softened into "it may still be coming up".
     expect(result.message).not.toMatch(/NOT CONFIRMED YET/);
+    // …nor overstated into a claim about the machine we did not observe.
+    expect(result.message).not.toMatch(/ComfyUI is DOWN/);
     expect(result.launch_env?.source).toBe("inherited");
 
     killSpy.mockRestore();

@@ -16,6 +16,8 @@ vi.mock("../../config.js", () => ({
   config: mockConfig,
   getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
   getComfyUIAuthHeaders: () => ({}),
+  // #848 instance fence — a stable target here; the retarget case has its own test.
+  getComfyuiTargetGeneration: () => 0,
   isRemoteMode: () => false,
 }));
 
@@ -454,12 +456,18 @@ describe("process-control startup readiness", () => {
     expect(result.ready).toBe(false);
     expect(result.startup).toBe("failed");
     expect(result.message).toMatch(/EXITED \(exit code 1\)/);
-    expect(result.message).toMatch(/ComfyUI is DOWN/);
-    expect(result.message).toMatch(/failed relaunch, not a slow start/i);
+    expect(result.message).toMatch(/THIS RELAUNCH FAILED/);
+    expect(result.message).toMatch(/not a slow start/i);
     // It must NOT be softened into the unconfirmed wording — a real failure
     // reported as "it may still be coming up" is the mirror-image lie.
     expect(result.message).not.toMatch(/NOT CONFIRMED YET/);
     expect(result.message).not.toMatch(/Do NOT kill it/i);
+    // …but the scope of the claim is OUR launch, not the machine. Our child dying
+    // does not establish that nothing is serving the port: an external supervisor
+    // may have brought one back since the last probe, and the old wording asserted
+    // a present global state from a fact about our own process (codex gate).
+    expect(result.message).not.toMatch(/ComfyUI is DOWN/);
+    expect(result.message).toMatch(/re-check with health_check/i);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 

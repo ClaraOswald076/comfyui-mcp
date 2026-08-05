@@ -23,18 +23,31 @@ describe("normalizeReportedVersion (#846)", () => {
     // The ENV line leads with the build that is executing, and that is the build
     // the report is about. Taking the LAST version in the string — or the largest —
     // would re-pin the issue to code nobody ran, which is the #846 harm restated.
-    const line =
+    const clause =
       "0.48.18 (this process is RUNNING 0.48.18; 0.49.5 is now installed on disk" +
       " — restart the orchestrator to load it, and report bugs against the RUNNING version)";
-    expect(normalizeReportedVersion(line)).toBe("0.48.18");
+    expect(normalizeReportedVersion(clause)).toBe("0.48.18");
+
+    // …and the form an agent ACTUALLY copies is the whole labelled segment. Matching
+    // only at position 0 missed this, fell through to a fresh disk read, and returned
+    // the INSTALLED version — reintroducing #846 through the fix for it.
+    expect(normalizeReportedVersion(`comfyui-mcp ${clause}`)).toBe("0.48.18");
+    expect(normalizeReportedVersion("mcp=0.49.6")).toBe("0.49.6");
+    expect(normalizeReportedVersion("comfyui-mcp 0.49.6 · panel 0.11.38")).toBe("0.49.6");
   });
 
-  it("returns undefined for anything not version-shaped, so the caller detects instead", () => {
-    // An unusable string is NO reading. Reporting it as one would hand the worker a
-    // version it cannot match while looking like a confident answer.
-    expect(normalizeReportedVersion("unknown")).toBeUndefined();
+  it("preserves a compact non-semver version instead of swapping in a disk read", () => {
+    // A real running version need not be semver. Discarding it would send the caller
+    // to detectMcpVersion(), i.e. the INSTALLED number — the same version-swap in a
+    // different disguise.
+    expect(normalizeReportedVersion("nightly")).toBe("nightly");
+    expect(normalizeReportedVersion("  dev  ")).toBe("dev");
+  });
+
+  it("discards prose, so the caller detects a version instead of reporting a sentence", () => {
     expect(normalizeReportedVersion("")).toBeUndefined();
-    expect(normalizeReportedVersion("mcp=0.49.6")).toBeUndefined();
+    expect(normalizeReportedVersion("   ")).toBeUndefined();
+    expect(normalizeReportedVersion("I could not find the version anywhere")).toBeUndefined();
     expect(normalizeReportedVersion(undefined)).toBeUndefined();
     expect(normalizeReportedVersion(0.49 as unknown as string)).toBeUndefined();
   });
