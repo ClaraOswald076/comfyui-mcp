@@ -1066,6 +1066,25 @@ describe("node-management service", () => {
       ).toBe(false);
     });
 
+    it("reinstalls a module-spelled target via its CNR id so the install half can resolve", async () => {
+      // Caller passes the FOLDER name; the registry resolves the CNR id. The
+      // uninstall names the module; the reinstall names the registry id —
+      // otherwise the pack is removed and not restored (codex gate round 9).
+      const { calls } = stubFetch({
+        installedBody: {
+          "ComfyUI-Impact-Pack": { ver: "8.28.3", cnr_id: "comfyui-impact-pack", enabled: true },
+        },
+      });
+      const res = await reinstallCustomNode({ id: "ComfyUI-Impact-Pack" });
+      expect(res.mechanism).toBe("manager-http");
+      expect(taskOf(calls, "uninstall").params).toMatchObject({
+        node_name: "ComfyUI-Impact-Pack",
+      });
+      expect(taskOf(calls, "install").params).toMatchObject({
+        id: "comfyui-impact-pack",
+      });
+    });
+
     it("still succeeds for an installed-but-not-in-registry (git-cloned) pack", async () => {
       stubFetch({
         installedBody: {
@@ -1619,7 +1638,8 @@ describe("node-management service", () => {
       const res = await uninstallCustomNode({ id: "my-pack", useCmCli: true });
       expect(res.mechanism).toBe("comfy-cli");
       expect(mockedExec).toHaveBeenCalled();
-      expect(res.message).toMatch(/no matching pack directory remains/);
+      expect(res.message).toMatch(/Uninstalled "my-pack"/);
+      expect(res.message).toMatch(/no matching directory remains/);
     });
 
     it("the CLI uninstall disk verification uses the ENTRY-captured workspace, not a retargeted one", async () => {
@@ -1655,7 +1675,7 @@ describe("node-management service", () => {
         }),
       );
       const res = await uninstallCustomNode({ id: "my-pack", useCmCli: true });
-      expect(res.message).toMatch(/no matching pack directory remains/);
+      expect(res.message).toMatch(/Uninstalled "my-pack"/);
       expect(res.message).not.toMatch(/did NOT take effect/);
     });
 

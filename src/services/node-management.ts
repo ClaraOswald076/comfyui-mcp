@@ -2781,8 +2781,15 @@ async function reinstallCustomNodeImpl(
   // match a pre-existing record by cnr_id.
   const tracked = await resolveTrackedForOp(id, "reinstall", base);
   await queueManagerTask("uninstall", { node_name: tracked.module }, base);
+  // The install half must name an identity the registry can actually RESOLVE
+  // (codex gate round 9): when the caller passed the module/folder spelling,
+  // installing it back under that spelling resolves nowhere — the pack would
+  // be removed and not restored. The tracked record's CNR id is the stable
+  // identity; a git/aux pack without one keeps the caller's spelling (the v4
+  // backend also resolves repo names), as before.
+  const reinstallId = tracked.cnrId ?? id;
   const status = await queueManagerTask("install", {
-    id,
+    id: reinstallId,
     version: version ?? "latest",
     selected_version: version ?? "latest",
     channel,
@@ -2790,8 +2797,23 @@ async function reinstallCustomNodeImpl(
   }, base);
   // VERIFY (#730): same queue-drain trust hole as update — for an id that
   // resolves nowhere BOTH cycles no-op and both drains pass trivially. Require
-  // the pack to be present afterward before claiming a reinstall.
-  await assertPackPresentAfterOp(id, "reinstall", base, status);
+  // the pack to be present afterward before claiming a reinstall. When it is
+  // NOT present, say what actually happened: the uninstall half already ran —
+  // the pack is REMOVED, not untouched (refuse-vs-disclose: the removal
+  // already happened, only its pairing failed).
+  try {
+    await assertPackPresentAfterOp(id, "reinstall", base, status);
+  } catch (err) {
+    if (err instanceof NodeManagementError) {
+      throw new NodeManagementError(
+        `The reinstall of "${id}" left the pack REMOVED: the uninstall half drained, ` +
+          `but the install half did not restore it. Install it again with ` +
+          `install_custom_node ("${reinstallId}"). Underlying detail: ${err.message}`,
+        err.details,
+      );
+    }
+    throw err;
+  }
   return {
     mechanism: "manager-http",
     message: `Queued + reinstalled "${id}" (uninstall + install) via ComfyUI-Manager. A restart may be required.`,
@@ -3211,10 +3233,34 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
 
   if (useCli) {
     const out = runCmCli(["uninstall", id], cliWorkspace);
-    // comfy-cli's exit is its OWN claim. Verify removal: the Manager installed
-    // list when it can be read; otherwise the on-disk directory (a CLI session
-    // is a local one, so the disk answers). A pack that is still discoverable
-    // afterwards means the uninstall did NOT take effect — disclose it.
+    // comfy-cli's exit is its OWN claim. "Uninstalled" requires BOTH an
+    // observed pre-op presence (manager-listed, or on-disk) AND observed
+    // post-op absence — absence alone may predate the call (codex gate rounds
+    // 8-9). A pack still discoverable afterwards means the uninstall did NOT
+    // take effect — disclose it.
+    const preObserved =
+      presence.state === "manager-listed" || presence.state === "on-disk";
+    const preUnknownNote =
+      presence.state === "unverifiable"
+        ? `whether the pack was installed beforehand could NOT be established (${presence.reason})`
+        : undefined;
+    // The disk postcondition applies to EVERY CLI uninstall (a CLI session is
+    // always a local one), and for a pack that was never Manager-tracked
+    // (on-disk pre-state) it is the ONLY meaningful one. Checked against the
+    // ENTRY-captured workspace, never a recomputed one: a retarget during the
+    // awaits must not verify against a different install (codex gate round 6).
+    const diskAfter = cliWorkspace ? findPackOnDisk(id, cliWorkspace) : undefined;
+    if (diskAfter?.state === "found") {
+      return {
+        mechanism: "comfy-cli",
+        message:
+          `comfy-cli reported the uninstall of "${id}" successful, but the pack ` +
+          `directory still exists at ${diskAfter.dir} — the uninstall did NOT take ` +
+          `effect. Check the ComfyUI server log for the underlying error.`,
+        details: out.trim(),
+      };
+    }
+
     let installed: InstalledNode[] | undefined;
     let listError: string | undefined;
     try {
@@ -3222,78 +3268,48 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
     } catch (err) {
       listError = err instanceof Error ? err.message : String(err);
     }
-    if (installed) {
-      if (findInstalledNode(id, installed)) {
-        return {
-          mechanism: "comfy-cli",
-          message:
-            `comfy-cli reported the uninstall of "${id}" successful, but the pack is ` +
-            `STILL in ComfyUI-Manager's installed-pack list — the uninstall did NOT ` +
-            `take effect. Check the ComfyUI server log for the underlying error.`,
-          details: out.trim(),
-        };
+    if (installed && findInstalledNode(id, installed)) {
+      return {
+        mechanism: "comfy-cli",
+        message:
+          `comfy-cli reported the uninstall of "${id}" successful, but the pack is ` +
+          `STILL in ComfyUI-Manager's installed-pack list — the uninstall did NOT ` +
+          `take effect. Check the ComfyUI server log for the underlying error.`,
+        details: out.trim(),
+      };
+    }
+    const listGone = installed !== undefined; // readable AND not in it
+    const diskGone = diskAfter?.state === "not-found";
+    if (preObserved && (listGone || diskGone)) {
+      const evidence: string[] = [];
+      if (listGone) evidence.push("the pack is absent from ComfyUI-Manager's installed-pack list");
+      if (diskGone) {
+        evidence.push(
+          `no matching directory remains under ${(diskAfter as { scanned: string }).scanned}`,
+        );
       }
       return {
         mechanism: "comfy-cli",
         message:
-          `Uninstalled "${id}" via official comfy-cli (verified absent from ` +
-          `ComfyUI-Manager's installed-pack list` +
-          (presence.state === "manager-listed"
-            ? ""
-            : `; whether it was there BEFORE the operation could not be established — the list was unreadable then`) +
-          `). A ComfyUI restart is required to unload it fully.`,
+          `Uninstalled "${id}" via official comfy-cli (verified: ${evidence.join(" and ")}). ` +
+          `A ComfyUI restart is required to unload it fully.`,
         details: out.trim(),
       };
     }
-    // List unreadable — the disk answers in a local session. Use the workspace
-    // captured at ENTRY (cliWorkspace), never a recomputed one: a retarget
-    // during the awaits above must not verify against a different install
-    // (codex gate round 6).
-    const disk = cliWorkspace ? findPackOnDisk(id, cliWorkspace) : undefined;
-    if (disk?.state === "found") {
-      return {
-        mechanism: "comfy-cli",
-        message:
-          `comfy-cli reported the uninstall of "${id}" successful, but the pack ` +
-          `directory still exists at ${disk.dir} — the uninstall did NOT take ` +
-          `effect. Check the ComfyUI server log for the underlying error.`,
-        details: out.trim(),
-      };
-    }
-    if (disk?.state === "not-found") {
-      if (presence.state !== "on-disk" && presence.state !== "manager-listed") {
-        // The directory's absence may PREDATE the call — with the pre-state
-        // never established, "Uninstalled" would fabricate a transition.
-        return {
-          mechanism: "comfy-cli",
-          message:
-            `comfy-cli reported the uninstall of "${id}" successful, but whether the ` +
-            `pack was installed beforehand could NOT be established ` +
-            `(${presence.state === "unverifiable" ? presence.reason : "pre-state unknown"}), ` +
-            `and no matching directory exists under ${disk.scanned} NOW — which may ` +
-            `predate the call. NOT claiming an uninstall happened; if the pack was ` +
-            `never there, nothing needed removing.`,
-          details: out.trim(),
-        };
-      }
-      return {
-        mechanism: "comfy-cli",
-        message:
-          `Uninstalled "${id}" via official comfy-cli (verified: no matching pack ` +
-          `directory remains under ${disk.scanned}; ComfyUI-Manager's installed-pack ` +
-          `list could not be read, so the list side was NOT checked). A ComfyUI ` +
-          `restart is required to unload it fully.`,
-        details: out.trim(),
-      };
-    }
+    // Either the pre-state was never observed (absence may predate the call)
+    // or nothing could be read post-op — disclose, never claim the removal.
     return {
       mechanism: "comfy-cli",
       message:
-        `Uninstalled "${id}" via official comfy-cli (comfy-cli's own report — the ` +
-        `post-state could not be independently verified: ComfyUI-Manager's ` +
-        `installed-pack list could not be read (${listError})` +
-        (disk?.state === "unreadable" ? ` and the disk check was inconclusive (${disk.reason})` : "") +
-        `). A ComfyUI restart is required to unload it fully.`,
+        `comfy-cli reported the uninstall of "${id}" successful, but the removal ` +
+        `could NOT be verified: ` +
+        (preUnknownNote ??
+          `ComfyUI-Manager's installed-pack list could not be read (${listError})` +
+            (diskAfter?.state === "unreadable"
+              ? ` and the disk check was inconclusive (${diskAfter.reason})`
+              : "")) +
+        `. NOT claiming an uninstall happened; if the pack was never there, nothing ` +
+        `needed removing — otherwise check list_installed_nodes / custom_nodes yourself.`,
       details: out.trim(),
     };
   }
