@@ -2711,7 +2711,14 @@ async function updateViaGitCheckoutFallback(opts: {
   // Both arms REFUSE (that is right: this is before the mutation, and an
   // unverifiable tree does not license a merge), but only the arm with two
   // readable, DIFFERENT revisions may say something changed.
-  if (!casRev) {
+  //
+  // A DIRTY worktree is answered first, because it is established evidence in
+  // its own right and does not depend on HEAD resolving: the cleanliness gate
+  // proved this tree clean, so a non-empty porcelain here IS proof it changed.
+  // Only over a still-clean worktree does an unreadable HEAD mean "the
+  // comparison could not be made" — saying "not proof that anything changed"
+  // while holding a dirty status would be the mirror defect (codex gate r4).
+  if (casPorcelain === "" && !casRev) {
     throw new PanelInstallError(
       `Panel update did NOT apply: ${managerReason}, and the git fallback is ` +
         `REFUSED: the panel checkout at ${dir} has an UNREADABLE HEAD (git ` +
@@ -2729,7 +2736,7 @@ async function updateViaGitCheckoutFallback(opts: {
       `Panel update did NOT apply: ${managerReason}, and the git fallback is ` +
         `REFUSED: the panel checkout at ${dir} CHANGED between the safety gates ` +
         `and the merge — ` +
-        `${casRev !== prePullRev ? `HEAD moved ${prePullRev.slice(0, 8)} → ${casRev.slice(0, 8)}` : `the worktree is no longer clean:\n${casPorcelain}`}. ` +
+        `${casPorcelain !== "" ? `the worktree is no longer clean:\n${casPorcelain}` : `HEAD moved ${prePullRev.slice(0, 8)} → ${casRev ? casRev.slice(0, 8) : "an unresolvable revision"}`}. ` +
         `Something other than this update is writing to that tree, and a ` +
         `fast-forward would race it. NO git mutation was made by this fallback ` +
         `— but something else evidently DID change the checkout, so re-read it ` +
@@ -2766,11 +2773,13 @@ async function updateViaGitCheckoutFallback(opts: {
     try {
       const afterRev = deps.gitRevision(dir);
       const afterPorcelain = deps.gitStatusPorcelain(dir).trim();
-      if (!afterRev) {
+      if (afterPorcelain === "" && !afterRev) {
         // `gitRevision` answers an unresolvable HEAD with undefined, not by
         // throwing. "Could not read HEAD" is the same answer as a failed
         // status read — UNKNOWN — and must not be routed into the arm that
         // tells the user the tree is no longer in its pre-update state.
+        // A dirty status is checked FIRST though: that IS evidence of change,
+        // and it stands whether or not HEAD resolved (codex gate r4).
         headline = `Panel update could NOT be confirmed`;
         treeNote =
           `The checkout was re-read afterwards but has an UNREADABLE HEAD ` +
@@ -2788,7 +2797,7 @@ async function updateViaGitCheckoutFallback(opts: {
         treeNote =
           `The checkout was re-read afterwards and is NOT what it was before the ` +
           `attempt — ` +
-          `${afterRev !== prePullRev ? `HEAD is ${afterRev ? afterRev.slice(0, 8) : "unreadable"}, not ${prePullRev.slice(0, 8)}` : `the worktree is dirty:\n${afterPorcelain}`}. ` +
+          `${afterPorcelain !== "" ? `the worktree is dirty:\n${afterPorcelain}` : `HEAD is ${afterRev ? afterRev.slice(0, 8) : "unresolvable"}, not ${prePullRev.slice(0, 8)}`}. ` +
           `The fast-forward may therefore have applied PARTIALLY, or another ` +
           `writer touched ${dir} — either way the panel directory is NOT in the ` +
           `pre-update state. Inspect it (git status / git log) before retrying, ` +
@@ -2843,8 +2852,10 @@ async function updateViaGitCheckoutFallback(opts: {
   // Same distinction as the pre-merge CAS: an unresolvable HEAD comes back as
   // undefined, not as a throw, and "we could not read HEAD" is not "another
   // writer touched this tree". Both DISCLOSE — the merge has run either way —
-  // but only the readable third-revision arm may name a cause.
-  if (!postMergeRev) {
+  // but only the readable third-revision arm may name a cause. A DIRTY
+  // worktree is answered first either way: that is established evidence of an
+  // outside write, and it stands whether or not HEAD resolved (codex gate r4).
+  if (postMergePorcelain === "" && !postMergeRev) {
     throw new PanelInstallError(
       `Could not verify the panel update: the pinned fast-forward ALREADY RAN in ` +
         `${dir}, but the checkout afterwards has an UNREADABLE HEAD (git ` +
@@ -2860,7 +2871,7 @@ async function updateViaGitCheckoutFallback(opts: {
       `Could not verify the panel update: the pinned fast-forward ALREADY RAN in ` +
         `${dir}, but the checkout afterwards is not what that merge alone would ` +
         `leave — ` +
-        `${postMergePorcelain !== "" ? `the worktree is dirty:\n${postMergePorcelain}` : `HEAD is ${postMergeRev.slice(0, 8)}, neither the merged upstream (${targetRev.slice(0, 8)}) nor the pre-merge revision (${prePullRev.slice(0, 8)})`}. ` +
+        `${postMergePorcelain !== "" ? `the worktree is dirty:\n${postMergePorcelain}` : `HEAD is ${postMergeRev ? postMergeRev.slice(0, 8) : "unresolvable"}, neither the merged upstream (${targetRev.slice(0, 8)}) nor the pre-merge revision (${prePullRev.slice(0, 8)})`}. ` +
         `Another writer (a ComfyUI-Manager task, or a manual git operation) ` +
         `touched this tree during the merge, so the panel directory may now be ` +
         `INCONSISTENT. NOT reporting success. Inspect the panel repo (git ` +

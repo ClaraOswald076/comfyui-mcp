@@ -1251,6 +1251,59 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     expect(h.gitPulls).toEqual([dir]);
   });
 
+  it("#824: unreadable HEAD AND a dirty worktree before the merge -> the DIRTY evidence wins", async () => {
+    // The mirror of the case above. An unreadable HEAD leaves the revision
+    // comparison undetermined, but porcelain answered — and the cleanliness
+    // gate had proved this tree clean, so a dirty status here IS proof it
+    // changed. Reporting "not proof that anything changed" while holding that
+    // status would be the same defect pointed the other way.
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: IDLE_SNAPSHOT,
+      upstreamRev: REV_B,
+      // 0 = cleanliness gate (clean), 1 = the pre-merge CAS (dirty).
+      gitStatusSeq: ["", " M web/js/comfyui-mcp-panel.js"],
+      onBeforeMerge: ({ revs }) => {
+        delete revs[dir];
+      },
+      onGitPull: () => FF,
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    const msg = String(err?.message ?? err);
+    expect(msg).toMatch(/CHANGED between the safety gates/);
+    expect(msg).toMatch(/no longer clean/);
+    expect(msg).not.toMatch(/NOT proof that anything changed/);
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("#824: unreadable HEAD AND a dirty worktree AFTER the merge -> the DIRTY evidence wins", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: IDLE_SNAPSHOT,
+      upstreamRev: REV_B,
+      // 0 = cleanliness gate, 1 = pre-merge CAS, 2 = the post-merge re-read.
+      gitStatusSeq: ["", "", " M web/js/comfyui-mcp-panel.js"],
+      onGitPull: ({ files, revs }) => {
+        files[pyPath] = pyproject(PANEL_REGISTRY_ID, "0.11.35");
+        delete revs[dir];
+        return FF;
+      },
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    const msg = String(err?.message ?? err);
+    expect(msg).toMatch(/ALREADY RAN/);
+    expect(msg).toMatch(/the worktree is dirty/);
+    expect(msg).toMatch(/may now be INCONSISTENT/);
+    expect(msg).not.toMatch(/NOT evidence that something else did/);
+    expect(h.gitPulls).toEqual([dir]);
+  });
+
   it("#824 P0: the worktree goes dirty between the cleanliness gate and the merge -> REFUSED", async () => {
     const h = makeDeps({
       comfyuiPath: COMFY,
@@ -1435,6 +1488,30 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     expect(msg).not.toMatch(/applied PARTIALLY/);
     // The original merge failure still survives into the message.
     expect(msg).toMatch(/local changes would be overwritten/);
+    expect(h.gitPulls).toEqual([dir]);
+  });
+
+  it("#824: a failed merge with an unreadable HEAD AND a dirty tree reports the DIRTY evidence", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: IDLE_SNAPSHOT,
+      upstreamRev: REV_B,
+      // 0 = cleanliness gate, 1 = pre-merge CAS, 2 = the post-failure re-read.
+      gitStatusSeq: ["", "", " M web/js/comfyui-mcp-panel.js"],
+      onGitPull: ({ revs }) => {
+        delete revs[dir];
+        throw new Error("error: Your local changes would be overwritten by merge");
+      },
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    const msg = String(err?.message ?? err);
+    expect(msg).toMatch(/could NOT be confirmed/);
+    expect(msg).toMatch(/the worktree is dirty/);
+    expect(msg).toMatch(/NOT what it was before the attempt/);
+    expect(msg).not.toMatch(/is UNKNOWN/);
     expect(h.gitPulls).toEqual([dir]);
   });
 
