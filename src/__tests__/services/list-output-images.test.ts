@@ -258,9 +258,13 @@ describe("listOutputImages — remote mode (derived from /history)", () => {
     expect((await listOutputImages({ limit: 1 })).length).toBe(1);
   });
 
-  it("returns [] when history is unavailable rather than throwing", async () => {
+  it("does NOT return [] when history is UNAVAILABLE — a failed request is not an empty history", async () => {
+    // This asserted the opposite, and that was the fold (#877): in remote mode
+    // /history is the ONLY source, so returning `[]` when the request failed made
+    // "we never got an answer" indistinguishable from "there are no outputs" —
+    // and `[]` was the whole reply.
     getHistoryMock.mockRejectedValue(new Error("unreachable"));
-    await expect(listOutputImages()).resolves.toEqual([]);
+    await expect(listOutputImages()).rejects.toThrow(/NOT a finding that there are no outputs/i);
   });
 
   it("uses /history even when comfyuiPath IS set, as long as isRemoteMode() is true", async () => {

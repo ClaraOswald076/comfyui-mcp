@@ -293,6 +293,11 @@ export async function listOutputImages(options?: {
   }
 
   const images: OutputImage[] = [];
+  // How many entries MATCHED the query, versus how many we could actually stat.
+  // A per-file stat failure is skipped silently, which is fine when it is one
+  // file among many — but if it swallows every match, the caller gets `[]` over
+  // a directory that demonstrably held what they asked for (codex gate).
+  let matched = 0;
 
   for (const dirent of dirents) {
     if (!dirent.isFile()) continue;
@@ -307,6 +312,7 @@ export async function listOutputImages(options?: {
     if (pattern && !relPath.toLowerCase().includes(pattern)) continue;
 
     const filePath = join(parent, dirent.name);
+    matched += 1;
     try {
       const info = await stat(filePath);
       images.push({
@@ -318,8 +324,24 @@ export async function listOutputImages(options?: {
         kind: mediaKind(ext),
       });
     } catch {
+      // One file that vanished between readdir and stat, or that we cannot read,
+      // is not worth failing the whole listing over — skip it. But see the check
+      // below: skipping EVERY match is a different statement entirely.
       continue;
     }
+  }
+
+  if (matched > 0 && images.length === 0) {
+    // Every entry that matched the query failed to stat. Returning `[]` here says
+    // "there are none" over a directory that demonstrably held what was asked for
+    // — the same fold as the two above, at the last place it can still happen
+    // (codex gate).
+    throw new ComfyUIError(
+      `Found ${matched} matching file(s) under "${outputDir}", but none of them could be read ` +
+        `(every stat failed — a permissions or I/O problem, or they were all removed mid-scan). ` +
+        `This is NOT a finding that there are no outputs.`,
+      "OUTPUT_ENTRIES_UNREADABLE",
+    );
   }
 
   // Sort newest first
@@ -344,8 +366,16 @@ async function listOutputImagesFromHistory(
   try {
     history = await getHistory();
   } catch (err) {
-    logger.debug("getHistory failed while listing remote output media", { err });
-    return [];
+    // A FAILED request is not an empty history (codex gate). Returning `[]` here
+    // told the caller there are no outputs when we never got an answer at all —
+    // and in remote mode this is the only source, so that `[]` was the whole
+    // reply. Throwing makes the difference visible; the caller upstream already
+    // distinguishes "history had nothing" from "history could not be asked".
+    throw new ComfyUIError(
+      `Could not read ComfyUI's generation history (${err instanceof Error ? err.message : String(err)}). ` +
+        `This is NOT a finding that there are no outputs — the history could not be read at all.`,
+      "HISTORY_UNREADABLE",
+    );
   }
 
   const seen = new Set<string>();
