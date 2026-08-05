@@ -28,7 +28,7 @@ import {
   clearPanelDiskObservation,
   recordPanelDiskObservation,
 } from "../../services/panel-workspace.js";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -784,6 +784,72 @@ describe("UiBridge (multi-tab)", () => {
       const msg = bridge.status();
       expect(msg).toMatch(/pack installed/);
       expect(msg).not.toMatch(/refresh/i);
+    });
+
+    // #804: the zero-tab-ever state is a BUCKET (no ComfyUI / no pack / pack
+    // pointing at another bridge). Naming one of them as the cause is what sent a
+    // user who had already installed the pack back to install it again, so the
+    // message must say what it observed, say that the observation does not
+    // separate the cases, and give the check that does.
+    it("never-connected states what was observed and does not assert a cause", () => {
+      const msg = bridge.status();
+      // The observation, scoped to this bridge AND to the kind of tab the flag
+      // behind it actually tracks: everConnectedDesktopTab is canvas-owning tabs
+      // only, so a headless client that connected and left must not be erased by
+      // a blanket "nothing has ever connected".
+      expect(msg).toMatch(/no ComfyUI canvas tab has connected to this bridge/);
+      expect(msg).not.toMatch(/nothing has connected/);
+      expect(msg).toMatch(/does not distinguish/);
+      // ...and the discriminating check, in order, ending at the case the old
+      // wording had no room for: present, but reaching a different bridge.
+      expect(msg).toMatch(/is ComfyUI open in a browser/);
+      expect(msg).toMatch(/has a provider been picked and Connect clicked/);
+      // Step 4 must NOT conclude "different bridge": `conns` fills only on a valid
+      // hello, so a token-rejected or never-helloed socket on THIS bridge leaves the
+      // count at zero identically. Both are offered, with the log as the separator.
+      expect(msg).toMatch(/splits two ways this state cannot tell apart/);
+      expect(msg).toMatch(/the handshake never completed/);
+      expect(msg).toMatch(/orchestrator log separates them/);
+      // The mismatch remedy must point at the panel setting that can fix it, not at
+      // the bind address printed here — under a 0.0.0.0 bind that is a wildcard no
+      // panel can dial, and it carries no token.
+      expect(msg).toMatch(/Settings → Advanced → Bridge URL/);
+      expect(msg).not.toMatch(/COMFYUI_MCP_BRIDGE_PORT/);
+      // install_panel is named with BOTH its conditions: holding the tool is not
+      // enough, since it is local-only and refuses in remote/cloud mode.
+      expect(msg).toMatch(/local-only and refuses in remote\/cloud mode/);
+    });
+
+    // panel-tools.ts classifies a resolve failure as "nothing connected, defer the
+    // rebind" vs "ambiguous, make the user choose" by MATCHING THIS TEXT, so
+    // rewording the guidance can silently flip a deferrable state into a hard
+    // failure. The classifier is an inline literal in a 7000-line file with no
+    // exported seam, so this reads the two regexes STRAIGHT OUT OF THAT SOURCE and
+    // applies them here. Copying them instead would prove only that the copy still
+    // matches: this way a change on either side — the string or the matcher —
+    // surfaces as a failure pointing at both.
+    it("stays classifiable by the deferred-rebind matcher in panel-tools", () => {
+      const src = readFileSync(
+        new URL("../../orchestrator/panel-tools.ts", import.meta.url),
+        "utf8",
+      );
+      const found = src.match(
+        /noTabsConnected =\s*(\/[^\n]*?\/i)\.test\(msg\) &&\s*!(\/[^\n]*?\/i)\.test\(msg\);/,
+      );
+      expect(
+        found,
+        "could not locate the deferred-rebind classifier in panel-tools.ts — if it moved or " +
+          "was restructured, re-point this test at it rather than deleting it",
+      ).not.toBeNull();
+      const [, positiveSrc, negativeSrc] = found!;
+      const toRe = (literal: string): RegExp =>
+        new RegExp(literal.slice(1, literal.lastIndexOf("/")), literal.slice(literal.lastIndexOf("/") + 1));
+      const positive = toRe(positiveSrc);
+      const negative = toRe(negativeSrc);
+      for (const msg of [bridge.status(), bridge.noPanelGuidance()]) {
+        expect(positive.test(msg), `not recognised as a no-tab state: ${msg}`).toBe(true);
+        expect(negative.test(msg), `wrongly reads as an ambiguous multi-tab state: ${msg}`).toBe(false);
+      }
     });
 
     it("after a tab connected then dropped, tells the user to refresh the browser tab (not install)", async () => {
