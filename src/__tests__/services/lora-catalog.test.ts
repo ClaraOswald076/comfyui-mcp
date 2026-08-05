@@ -711,7 +711,7 @@ describe("two writers racing the catalog: no write is silently erased", () => {
     expect(catalog.get("after-crash")?.id).toBe("loras-after-crash");
   });
 
-  it("a lock with NO recorded owner is not reclaimed on age alone", { timeout: 30000 }, () => {
+  it("a lock with NO recorded owner is never reclaimed", { timeout: 30000 }, () => {
     // A crash between the exclusive create and the record write leaves exactly
     // this, and so does a process paused between those two syscalls. Age past
     // the ordinary threshold does not distinguish them, and "no owner recorded"
@@ -727,19 +727,70 @@ describe("two writers racing the catalog: no write is silently erased", () => {
     expect(existsSync(lockPath())).toBe(true);
   });
 
-  it("but time settles it: a very old lock is reclaimed whatever its record says", () => {
-    // Otherwise a crash — or a pid the OS later handed to an unrelated live
-    // process — refuses every catalog write FOREVER. The critical section is
-    // two small reads and one write, so at this age there is no live holder to
-    // rob; a live pid in the record is a reused number, not a writer.
+  it("age alone never licenses a reclaim, however old the lock", { timeout: 30000 }, () => {
+    // A process can be suspended, debugger-paused, or blocked in I/O for an
+    // arbitrary time while inside the critical section, so "old" is not "gone".
+    // Reclaiming on age would be "could not determine the holder is gone" acted
+    // on as "the holder is gone" — with two writers and a silent loss as the
+    // payout. Refuse, and say what a person needs to clear it.
     writeFileSync(catalogPath, V1);
     const catalog = new LoraCatalog();
     writeFileSync(
       lockPath(),
-      JSON.stringify({ pid: process.pid, token: "reused-pid", at: new Date().toISOString() }),
+      JSON.stringify({ pid: process.pid, token: "paused-holder", at: new Date().toISOString() }),
     );
-    const ancient = new Date(Date.now() - 15 * 60_000);
+    const ancient = new Date(Date.now() - 60 * 60_000);
     utimesSync(lockPath(), ancient, ancient);
+    const err = (() => {
+      try {
+        catalog.upsert({ relPath: "loras/nope.safetensors" });
+        return undefined;
+      } catch (e) {
+        return e as Error;
+      }
+    })();
+    // The refusal has to hand over what it knows, or the wedge is unactionable.
+    expect(err?.message).toMatch(/still running/);
+    expect(err?.message).toContain(`pid ${process.pid}`);
+    expect(err?.message).toMatch(/delete that file/);
+    expect(existsSync(lockPath())).toBe(true);
+  });
+
+  it("a reclaim CLAIM held by another reclaimer stops this one from acting", { timeout: 30000 }, () => {
+    // Two reclaimers acting on one stale lock is the whole danger: the first
+    // frees the path, a third writer takes the freed pathname, and the second
+    // lifts THAT one off — two writers in the critical section. Serializing
+    // reclaim makes the sequence unreachable.
+    writeFileSync(catalogPath, V1);
+    const catalog = new LoraCatalog();
+    writeFileSync(
+      lockPath(),
+      JSON.stringify({ pid: DEAD_PID, token: "crashed", at: new Date().toISOString() }),
+    );
+    const old = new Date(Date.now() - 120_000);
+    utimesSync(lockPath(), old, old);
+    writeFileSync(`${lockPath()}.reclaim`, ""); // another reclaimer is deciding
+    expect(() => catalog.upsert({ relPath: "loras/nope.safetensors" })).toThrow(
+      /held the LoRA catalog lock/,
+    );
+    // Untouched: the other reclaimer's decision is the one that counts.
+    expect(existsSync(lockPath())).toBe(true);
+  });
+
+  it("a reclaim claim left by a DEAD reclaimer does not disable reclaim forever", () => {
+    // A claim covers a few syscalls, so one this old is a corpse. Sweeping it
+    // wrongly costs only serialization — never a stolen lock — which is the
+    // right way round for a self-heal.
+    writeFileSync(catalogPath, V1);
+    const catalog = new LoraCatalog();
+    writeFileSync(
+      lockPath(),
+      JSON.stringify({ pid: DEAD_PID, token: "crashed", at: new Date().toISOString() }),
+    );
+    const old = new Date(Date.now() - 120_000);
+    utimesSync(lockPath(), old, old);
+    writeFileSync(`${lockPath()}.reclaim`, "");
+    utimesSync(`${lockPath()}.reclaim`, old, old);
     catalog.upsert({ relPath: "loras/unwedged.safetensors" });
     expect(catalog.get("unwedged")?.id).toBe("loras-unwedged");
   });

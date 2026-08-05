@@ -489,6 +489,10 @@ describe("cancel escalation never folds a dead queue into a wedge verdict", () =
       // A job IS verifiably wedged — but its identity was never established.
       expect(res.wedged).toBe(true);
       expect(res.unverified).toBe(true);
+      // …so the FIELD must not claim the identity the prose disclaims. With no
+      // prompt_id and no pre-interrupt read, the poll established that SOME job
+      // is running, not that it is the one the interrupt addressed.
+      expect(res.target_state).toBe("unknown");
       expect(res.message).toMatch(/wedged inside a single step/);
       expect(res.message).toMatch(/Whether this IS the job the interrupt addressed is UNKNOWN/);
       expect(res.message).not.toMatch(/The running job/);

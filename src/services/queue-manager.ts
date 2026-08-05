@@ -702,7 +702,13 @@ export async function cancelRunningJobEscalating(opts: {
       freed_vram: freedVram,
       wedged: true,
       unverified: true,
-      target_state: "running",
+      // Only a NAMED target gets "running": waitForRunningCleared matched that
+      // prompt_id in the running slot, so the job this call addressed is the one
+      // observed. Without an id and with no pre-interrupt read, `runningId` is
+      // undefined and the poll only established that SOME job is running — which
+      // is what the message below already says. Calling that "running" would
+      // make the field claim the identity the prose disclaims (codex gate).
+      target_state: opts.prompt_id ? "running" : "unknown",
       pending_clear_failed: clearPendingFailed || undefined,
       pending_cleared,
       running_prompt_id: runningId,

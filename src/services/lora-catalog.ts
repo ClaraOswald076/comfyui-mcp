@@ -281,22 +281,12 @@ const CATALOG_LOCK_WAIT_MS = 2_000;
 const CATALOG_LOCK_STALE_MS = 30_000;
 
 /**
- * Past this, a lock is reclaimed WITHOUT asking about its recorded owner.
- *
- * Two states cannot be settled by a pid: one that was never recorded (a crash
- * between the exclusive create and the record write), and one whose pid the OS
- * has since handed to an unrelated live process. Both make `process.kill(pid,0)`
- * answer about the wrong thing forever, so a pid-only rule turns a crash into a
- * PERMANENT refusal of every catalog write — the fold pointed the other way,
- * and the wedge class this repo keeps re-fixing (#760, #847).
- *
- * Time settles it instead, because the critical section is bounded by
- * construction: two small reads, a parse, an optional copy of a small JSON
- * file, and one durable write. Nothing in it waits on a network, a subprocess
- * or a user. Ten minutes of slack over a milliseconds-long section is not a
- * judgement call about a live holder; it is a statement that no holder is live.
+ * A reclaim CLAIM is held for a few syscalls. One this old belongs to a
+ * reclaimer that died mid-decision, and leaving it would disable reclaim for
+ * good. Sweeping one wrongly costs only the serialization it provides — i.e.
+ * the behaviour before that serialization existed — never a stolen lock.
  */
-const CATALOG_LOCK_HARD_STALE_MS = 10 * 60_000;
+const CATALOG_RECLAIM_CLAIM_STALE_MS = 60_000;
 
 /** Cross-platform pid liveness. EPERM means a process with that number EXISTS
  *  and is simply not ours to signal — alive, not dead. Reading it as dead is
@@ -330,21 +320,74 @@ function readCatalogLockPid(lockPath: string): number | undefined {
 }
 
 /**
+ * Sweep a reclaim claim whose holder died mid-decision. Only the exact instance
+ * observed, and only when it is far older than the few syscalls a claim covers.
+ */
+function sweepStaleReclaimClaim(claimPath: string): void {
+  try {
+    const observed = statSync(claimPath).mtimeMs;
+    if (Date.now() - observed < CATALOG_RECLAIM_CLAIM_STALE_MS) return;
+    if (statSync(claimPath).mtimeMs !== observed) return;
+    rmSync(claimPath, { force: true });
+  } catch {
+    // Gone, replaced, or unreadable — a claim is advisory; leave it.
+  }
+}
+
+/**
  * Free the lock path ONLY when nothing can still be holding it: old enough that
- * no live holder could be inside its critical section, AND either owned by a pid
- * that is gone or older than CATALOG_LOCK_HARD_STALE_MS. Every other state
- * waits — freeing a lock whose holder is still working reintroduces exactly the
- * loss the lock prevents.
+ * no live holder could be inside its critical section, AND owned by a pid that
+ * is provably gone. Every other state waits — freeing a lock whose holder is
+ * still working reintroduces exactly the loss the lock prevents.
  *
- * RENAME FIRST, then judge. A stat-then-unlink is TOCTOU: a second reclaimer can
- * free the path and a third writer can take the freed pathname in the gap, so
- * the unlink lands on a stranger's fresh lock and two writers end up inside
- * `persistLocked` together. A rename atomically removes whatever is at the path
- * and puts it somewhere only this call knows, so the file inspected afterwards
- * is the file this call will act on. (Same technique, for the same reason, as
- * the panel op lock in panel-pin-guard.)
+ * PROVEN-DEAD OWNER, NOT AGE. Age cannot settle the two states a pid leaves
+ * open — a lock whose owner was never recorded, and one whose pid the OS has
+ * since handed to an unrelated live process — because a process can also be
+ * suspended or blocked in I/O for an arbitrarily long time while inside the
+ * critical section. Reclaiming on age alone would be "could not determine the
+ * holder is gone" acted on as "the holder is gone", with silent data loss as
+ * the payout. So those two states REFUSE, and the refusal names the file and
+ * its recorded owner so a person can clear it in one command (codex gate).
+ *
+ * SERIALIZED against other reclaimers by an exclusive claim, because the
+ * dangerous move is taking a lock OFF the path at all: two reclaimers judging
+ * the same stale lock can have the first free it, a third writer acquire the
+ * freed pathname, and the second lift THAT one off — leaving two writers inside
+ * the critical section. One reclaimer at a time makes that unreachable: the
+ * second re-reads the path under the claim, finds a FRESH lock, and never
+ * touches it.
+ *
+ * RENAME FIRST, then judge. A stat-then-unlink is TOCTOU: the file at the path
+ * when the unlink lands need not be the one that was judged. A rename
+ * atomically removes whatever is there and puts it somewhere only this call
+ * knows, so the file inspected afterwards is the file this call will act on.
+ * (Same technique, for the same reason, as the panel op lock in
+ * panel-pin-guard.)
  */
 function reclaimAbandonedCatalogLock(lockPath: string): boolean {
+  const claimPath = `${lockPath}.reclaim`;
+  try {
+    closeSync(openSync(claimPath, "wx"));
+  } catch (err) {
+    // Another reclaimer is deciding right now, or the claim cannot be created
+    // at all. Either way, acting concurrently is the thing that breaks
+    // exclusion — wait instead.
+    if ((err as NodeJS.ErrnoException)?.code === "EEXIST") sweepStaleReclaimClaim(claimPath);
+    return false;
+  }
+  try {
+    return reclaimUnderClaim(lockPath);
+  } finally {
+    try {
+      rmSync(claimPath, { force: true });
+    } catch {
+      // Best effort; a leftover claim only costs reclaim serialization, and
+      // sweepStaleReclaimClaim clears it.
+    }
+  }
+}
+
+function reclaimUnderClaim(lockPath: string): boolean {
   let observed: number;
   try {
     observed = statSync(lockPath).mtimeMs;
@@ -354,8 +397,7 @@ function reclaimAbandonedCatalogLock(lockPath: string): boolean {
   const ageMs = Date.now() - observed;
   if (ageMs < CATALOG_LOCK_STALE_MS) return false;
   const pid = readCatalogLockPid(lockPath);
-  const ownerGone = pid !== undefined && !catalogLockOwnerAlive(pid);
-  if (!ownerGone && ageMs < CATALOG_LOCK_HARD_STALE_MS) return false;
+  if (pid === undefined || catalogLockOwnerAlive(pid)) return false;
 
   const aside = `${lockPath}.stale-${randomUUID()}`;
   try {
@@ -378,8 +420,8 @@ function reclaimAbandonedCatalogLock(lockPath: string): boolean {
       // The path is already free; a leftover copy blocks nothing.
     }
     logger.warn(
-      `[lora-catalog] reclaimed an abandoned write lock at ${lockPath} (owner ` +
-        `${pid === undefined ? "unrecorded" : `pid ${pid}`}, ${Math.round(ageMs / 1000)}s old).`,
+      `[lora-catalog] reclaimed an abandoned write lock at ${lockPath} ` +
+        `(owner pid ${pid} is no longer running; ${Math.round(ageMs / 1000)}s old).`,
     );
     return true;
   }
@@ -441,10 +483,28 @@ function acquireCatalogLock(path: string): { lockPath: string; token: string } {
       }
       if (reclaimAbandonedCatalogLock(lockPath)) continue;
       if (Date.now() >= deadline) {
+        // Reclaim deliberately refuses the two states a pid cannot settle (no
+        // owner recorded, or a pid the OS may have reused), because guessing
+        // there means two writers and a silent loss. So the refusal has to hand
+        // over what it DOES know: a person can settle in one look what this
+        // process cannot settle at all.
+        const pid = readCatalogLockPid(lockPath);
+        let ageNote = "";
+        try {
+          ageNote = ` (${Math.round((Date.now() - statSync(lockPath).mtimeMs) / 1000)}s old)`;
+        } catch {
+          // The lock went away as this message was being built; the retry below
+          // is the right advice either way.
+        }
         throw new Error(
-          `Another writer has held the LoRA catalog lock at ${lockPath} for more than ` +
-            `${Math.round(CATALOG_LOCK_WAIT_MS / 1000)}s. This change was NOT saved — re-read ` +
-            `and retry. If no other comfyui-mcp process is running, delete that file.`,
+          `Another writer has held the LoRA catalog lock at ${lockPath}${ageNote} for more ` +
+            `than ${Math.round(CATALOG_LOCK_WAIT_MS / 1000)}s. This change was NOT saved — ` +
+            `re-read and retry. ` +
+            (pid === undefined
+              ? `The lock records no owner, so nothing here can prove it abandoned. If no ` +
+                `other comfyui-mcp process is running, delete that file.`
+              : `It records pid ${pid}, which is still running. If that process is not a ` +
+                `comfyui-mcp writing this catalog, delete that file.`),
         );
       }
       napSync(25);
