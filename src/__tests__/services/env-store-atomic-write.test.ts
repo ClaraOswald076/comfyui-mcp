@@ -697,6 +697,28 @@ describe("a completed REVOKE is never turned back into a refusal", () => {
     expect(out!.resurrectionRisk).toMatch(/COMES BACK on the next start/);
     expect(out!.resurrectionRisk).not.toContain("civ-legacy"); // never a value
   });
+
+  it("reports a legacy purge that LANDED but was not made crash-durable", async () => {
+    // The legacy store's durability gap was logged and then discarded, so it
+    // never reached the receipt — and `revokeIsClean` could therefore answer
+    // ok:true over a purge that a power loss undoes, after which the boot
+    // migration resurrects the credential just revoked (codex gate).
+    const { revokeIsClean } = await import("../../services/panel-secrets.js");
+    writeFileSync(envPath, "CIVITAI_API_TOKEN=civ-old\n", { mode: 0o600 });
+    writeFileSync(
+      join(dir, "panel-secrets.json"),
+      JSON.stringify({ comfyuiEnv: { CIVITAI_API_TOKEN: "civ-legacy" } }),
+    );
+    fsState.failFileFsync = true; // the fsync of the legacy store's temp file
+    const out = removeComfyuiSecret("CIVITAI_API_TOKEN");
+    fsState.failFileFsync = false;
+    expect(out.changed).toBe(true); // it happened
+    expect(out.resurrectionRisk).toMatch(/not made crash-durable/);
+    expect(out.resurrectionRisk).toMatch(/boot migration re-adds this credential/);
+    // ...and that is enough to stop any caller calling it a clean revoke.
+    expect(revokeIsClean(out)).toBe(false);
+    expect(JSON.stringify(out)).not.toContain("civ-legacy");
+  });
 });
 
 describe("a PARTLY completed slot revoke reports itself instead of throwing", () => {
