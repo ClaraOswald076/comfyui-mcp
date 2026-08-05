@@ -237,23 +237,40 @@ export async function listOutputImages(options?: {
   // REMOTE mode: no local filesystem to scan. Derive the output media from
   // ComfyUI's /history (HTTP, works against a remote instance) instead. Size and
   // modification time are unavailable over HTTP, so they come back as 0 / "".
-  // Key off isRemoteMode() (not mere comfyuiPath absence): when a remote target
-  // coexists with an unrelated local COMFYUI_PATH, scanning the local output dir
-  // would report the wrong machine's outputs. Also fall back to /history when no
-  // local path is configured at all.
-  if (isRemoteMode() || !config.comfyuiPath) {
+  // Keyed off isRemoteMode() ALONE (#877): when a remote target coexists with an
+  // unrelated local COMFYUI_PATH, scanning the local output dir would report the
+  // wrong machine's outputs — but the converse test, `!config.comfyuiPath`, was
+  // never a test for "no local path". It reads one ENV VAR, while a local
+  // portable install is perfectly well located by the SAVED DEFAULT WORKSPACE,
+  // which `resolveOutputDir` consults and `get_environment` reports. So a local
+  // install with `COMFYUI_PATH` unset silently took the remote branch, asked
+  // /history — which had been emptied by a restart — and returned `[]` over an
+  // output directory holding the files the caller was asking about. A silent
+  // wrong answer, not an error: the agent concludes the file does not exist.
+  if (isRemoteMode()) {
     return listOutputImagesFromHistory(limit, pattern);
   }
 
-  // Resolve the real local output dir. Asking the running ComfyUI can fail
-  // (unreachable, or a non-local --output-directory we can't read); treat any
-  // failure as "nothing to list" rather than throwing, so the tool degrades to
-  // an empty result instead of an opaque error.
+  // Local. `resolveOutputDir` already knows every way this path can be
+  // established, so let it answer rather than pre-judging on one env var.
   let outputDir: string;
   try {
     outputDir = await resolveOutputDir();
-  } catch {
-    return [];
+  } catch (err) {
+    // The local root could not be established. /history is the only source left,
+    // and it CANNOT see the disk — so a zero result from it does not establish
+    // that there are no outputs. Falling back is right; reporting its emptiness
+    // as an answer is not.
+    const fromHistory = await listOutputImagesFromHistory(limit, pattern);
+    if (fromHistory.length > 0) return fromHistory;
+    throw new ComfyUIError(
+      `Could not determine this ComfyUI's output directory (${err instanceof Error ? err.message : String(err)}), ` +
+        `so the local output folder was never scanned. ComfyUI's /history was asked instead and ` +
+        `returned nothing — but history is emptied by a restart and cannot see files on disk, so ` +
+        `that is NOT a finding that there are no outputs. Set COMFYUI_PATH, or save a default ` +
+        `workspace (workspace tool, action 'set_default'), so the output folder can be read directly.`,
+      "OUTPUT_DIR_UNKNOWN",
+    );
   }
 
   // RECURSIVE scan: ComfyUI writes to subfolders when a node's filename_prefix
@@ -263,11 +280,24 @@ export async function listOutputImages(options?: {
   let dirents;
   try {
     dirents = await readdir(outputDir, { recursive: true, withFileTypes: true });
-  } catch {
-    return [];
+  } catch (err) {
+    // We know WHERE the outputs are and could not read them. That is not an
+    // empty directory, and returning `[]` told the caller their file does not
+    // exist when the truth is we could not look (#877).
+    throw new ComfyUIError(
+      `Could not read the ComfyUI output directory "${outputDir}": ` +
+        `${err instanceof Error ? err.message : String(err)}. This is NOT a finding that there ` +
+        `are no outputs — the directory could not be listed at all.`,
+      "OUTPUT_DIR_UNREADABLE",
+    );
   }
 
   const images: OutputImage[] = [];
+  // How many entries MATCHED the query, versus how many we could actually stat.
+  // A per-file stat failure is skipped silently, which is fine when it is one
+  // file among many — but if it swallows every match, the caller gets `[]` over
+  // a directory that demonstrably held what they asked for (codex gate).
+  let matched = 0;
 
   for (const dirent of dirents) {
     if (!dirent.isFile()) continue;
@@ -282,6 +312,7 @@ export async function listOutputImages(options?: {
     if (pattern && !relPath.toLowerCase().includes(pattern)) continue;
 
     const filePath = join(parent, dirent.name);
+    matched += 1;
     try {
       const info = await stat(filePath);
       images.push({
@@ -293,8 +324,24 @@ export async function listOutputImages(options?: {
         kind: mediaKind(ext),
       });
     } catch {
+      // One file that vanished between readdir and stat, or that we cannot read,
+      // is not worth failing the whole listing over — skip it. But see the check
+      // below: skipping EVERY match is a different statement entirely.
       continue;
     }
+  }
+
+  if (matched > 0 && images.length === 0) {
+    // Every entry that matched the query failed to stat. Returning `[]` here says
+    // "there are none" over a directory that demonstrably held what was asked for
+    // — the same fold as the two above, at the last place it can still happen
+    // (codex gate).
+    throw new ComfyUIError(
+      `Found ${matched} matching file(s) under "${outputDir}", but none of them could be read ` +
+        `(every stat failed — a permissions or I/O problem, or they were all removed mid-scan). ` +
+        `This is NOT a finding that there are no outputs.`,
+      "OUTPUT_ENTRIES_UNREADABLE",
+    );
   }
 
   // Sort newest first
@@ -319,8 +366,16 @@ async function listOutputImagesFromHistory(
   try {
     history = await getHistory();
   } catch (err) {
-    logger.debug("getHistory failed while listing remote output media", { err });
-    return [];
+    // A FAILED request is not an empty history (codex gate). Returning `[]` here
+    // told the caller there are no outputs when we never got an answer at all —
+    // and in remote mode this is the only source, so that `[]` was the whole
+    // reply. Throwing makes the difference visible; the caller upstream already
+    // distinguishes "history had nothing" from "history could not be asked".
+    throw new ComfyUIError(
+      `Could not read ComfyUI's generation history (${err instanceof Error ? err.message : String(err)}). ` +
+        `This is NOT a finding that there are no outputs — the history could not be read at all.`,
+      "HISTORY_UNREADABLE",
+    );
   }
 
   const seen = new Set<string>();

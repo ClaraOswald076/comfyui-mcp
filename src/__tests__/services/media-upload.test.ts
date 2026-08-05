@@ -1,8 +1,26 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { resolve } from "node:path";
 
-vi.mock("../../config.js", () => ({
+// `isRemoteMode` is needed because the input/output dir fallbacks now resolve
+// through the shared workspace resolver (#877) rather than reading
+// `config.comfyuiPath` directly — a saved default workspace locates a local
+// install perfectly well, and the bare env-var check made one look pathless.
+const cfgRef = vi.hoisted(() => ({
   config: { comfyuiPath: "/comfy" as string | undefined },
+}));
+vi.mock("../../config.js", () => ({
+  config: cfgRef.config,
+  isRemoteMode: () => false,
+}));
+
+// The input/output dir fallbacks now resolve through the shared workspace
+// resolver (#877): a saved default workspace locates a local install perfectly
+// well, and the bare `config.comfyuiPath` check made one look pathless. Stubbed
+// to the env var alone so "no local path" is a property of the TEST rather than
+// of whichever machine runs it — this rig has a real saved workspace, which
+// otherwise silently satisfies the case below.
+vi.mock("../../services/workspace-env.js", () => ({
+  resolveEffectiveComfyUIBase: () => cfgRef.config.comfyuiPath,
 }));
 
 const copyFileMock = vi.fn();
@@ -110,7 +128,7 @@ describe("uploadVideoLocal / uploadAudioLocal (filesystem)", () => {
     expect(copyFileMock).not.toHaveBeenCalled();
   });
 
-  it("errors clearly when COMFYUI_PATH is unset (remote mode)", async () => {
+  it("errors clearly when NO local install path can be established", async () => {
     (config as { comfyuiPath?: string }).comfyuiPath = undefined;
     await expect(uploadVideoLocal("/src/clip.mp4")).rejects.toBeInstanceOf(
       ValidationError,

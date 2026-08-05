@@ -7,10 +7,24 @@ import { resolve } from "node:path";
 const OUTPUT_DIR = resolve("/comfy", "output");
 const outPath = (...segments: string[]): string => resolve(OUTPUT_DIR, ...segments);
 
+const cfgRef = vi.hoisted(() => ({
+  config: { comfyuiPath: "/comfy" as string | undefined },
+}));
 vi.mock("../../config.js", () => ({
-  config: {
-    comfyuiPath: "/comfy" as string | undefined,
-  },
+  config: cfgRef.config,
+  // Needed since #877 routed the output/input dir fallbacks through the shared
+  // workspace resolver, and #835 made that resolver consult remote mode FIRST —
+  // before, it returned `config.comfyuiPath` early and this export was never
+  // reached, so its absence from the mock went unnoticed. A merge seam, not a
+  // product change.
+  isRemoteMode: () => false,
+}));
+
+// Stubbed to the env var alone so "there is a local install path" is a property
+// of the TEST and not of whichever machine runs it: the real resolver also
+// consults the SAVED DEFAULT WORKSPACE, and this rig has one.
+vi.mock("../../services/workspace-env.js", () => ({
+  resolveEffectiveComfyUIBase: () => cfgRef.config.comfyuiPath,
 }));
 
 const getOutputImageMock = vi.fn();

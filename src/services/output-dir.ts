@@ -868,12 +868,26 @@ export async function resolveServerExtraModelConfig(): Promise<string | undefine
 
 /** <COMFYUI_PATH>/output fallback. Throws if COMFYUI_PATH is unset. */
 export function localOutputDirFallback(): string {
-  if (!config.comfyuiPath) {
+  // THE SAVED DEFAULT WORKSPACE COUNTS (#877). Reading `config.comfyuiPath`
+  // alone asks whether ONE ENVIRONMENT VARIABLE is set, and that is not the
+  // question — a local portable install is located perfectly well by the saved
+  // default workspace, which `get_environment` reports and every other resolver
+  // in this codebase already consults. Keying off the env var made a perfectly
+  // locatable install look pathless, and the caller upstream then fell through
+  // to a data source that cannot see the disk and reported no outputs at all.
+  //
+  // `resolveEffectiveComfyUIBase` is that shared resolver: COMFYUI_PATH, then
+  // the saved default workspace, and nothing in remote mode (where a local path
+  // would name the wrong machine).
+  const base = resolveEffectiveComfyUIBase();
+  if (!base) {
     throw new ValidationError(
-      "COMFYUI_PATH is not configured. Set the COMFYUI_PATH environment variable.",
+      "No local ComfyUI install path could be established: COMFYUI_PATH is not set and no " +
+        "default workspace is saved. Set COMFYUI_PATH, or save one with the workspace tool " +
+        "(action 'set_default').",
     );
   }
-  return resolve(config.comfyuiPath, "output");
+  return resolve(base, "output");
 }
 
 // ---------------------------------------------------------------------------
@@ -911,12 +925,18 @@ export function parseInputDirFromArgv(argv: string[] | undefined): string | unde
 
 /** <COMFYUI_PATH>/input fallback. Throws if COMFYUI_PATH is unset. */
 export function localInputDirFallback(): string {
-  if (!config.comfyuiPath) {
+  // The exact mirror of the output fallback above, and the same #877 reasoning:
+  // these two must agree about where the install is, or an upload and the listing
+  // of what was uploaded would disagree.
+  const base = resolveEffectiveComfyUIBase();
+  if (!base) {
     throw new ValidationError(
-      "COMFYUI_PATH is not configured. Set the COMFYUI_PATH environment variable.",
+      "No local ComfyUI install path could be established: COMFYUI_PATH is not set and no " +
+        "default workspace is saved. Set COMFYUI_PATH, or save one with the workspace tool " +
+        "(action 'set_default').",
     );
   }
-  return resolve(config.comfyuiPath, "input");
+  return resolve(base, "input");
 }
 
 /**
