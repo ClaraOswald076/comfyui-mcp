@@ -5,15 +5,28 @@ import { config } from "../config.js";
 import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
 
 /**
- * The LOCAL ComfyUI workspace a comfy-cli invocation should target when the
- * caller passed no explicit `workspace`. Prefers COMFYUI_PATH, then the saved
- * default workspace (set via workspace action:"set_default") when COMFYUI_PATH is unset —
- * so the workspace-venv `comfy` and `--workspace` routing keep working from the
- * saved default without COMFYUI_PATH (#506/#403). Never returns a local path in
- * remote mode (resolveEffectiveComfyUIBase already enforces that).
+ * The ComfyUI install a comfy-cli invocation TARGETS when the caller passed no explicit
+ * `workspace`. That is the operation-target question, and `resolveEffectiveComfyUIBase`
+ * is the only thing that answers it — including its refusal to name a local directory
+ * when the session is pointed somewhere else.
+ *
+ * This used to read `config.comfyuiPath ?? resolveEffectiveComfyUIBase()`, which failed
+ * twice over (#490): the resolver did not yet enforce the mode check this comment
+ * claimed for it, AND the `??` short-circuited past the resolver entirely whenever
+ * COMFYUI_PATH was set — the ordinary local configuration — so fixing the resolver alone
+ * would not have reached here. The two operands answer different questions ("where is
+ * the user's local install" vs "which install does this act on") and the `??` silently
+ * substituted the first for the second.
+ *
+ * It matters most here: this module runs `comfy-cli uninstall` and `comfy-cli disable`.
+ * With a remote `--comfyui-url` session and a stale local COMFYUI_PATH, those commands
+ * ran against the local install while the reply described only the remote server.
+ *
+ * Returning null when nothing is resolvable is the point — callers refuse rather than
+ * guess. Do not reintroduce a fallback here; a `??` at this seam is the bug.
  */
 function defaultWorkspace(): string | null {
-  return config.comfyuiPath ?? resolveEffectiveComfyUIBase() ?? null;
+  return resolveEffectiveComfyUIBase() ?? null;
 }
 
 export interface ComfyCliError {

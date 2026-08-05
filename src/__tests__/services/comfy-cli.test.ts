@@ -7,7 +7,8 @@ import { join } from "node:path";
 // Keep config.comfyuiPath deterministically unset so the saved-default-workspace
 // resolution path (#506/#403) is what's under test, not any real auto-detected
 // install on the host running the suite.
-vi.mock("../../config.js", () => ({ config: { comfyuiPath: undefined } }));
+const cfg = vi.hoisted(() => ({ comfyuiPath: undefined as string | undefined }));
+vi.mock("../../config.js", () => ({ config: cfg }));
 
 // Control the saved default workspace resolveEffectiveComfyUIBase() returns.
 const wsMock = vi.hoisted(() => ({ base: undefined as string | undefined }));
@@ -32,6 +33,7 @@ afterEach(() => {
   if (originalCliPath === undefined) delete process.env.COMFY_CLI_PATH;
   else process.env.COMFY_CLI_PATH = originalCliPath;
   wsMock.base = undefined;
+  cfg.comfyuiPath = undefined;
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -77,6 +79,47 @@ describe("comfy-cli adapter", () => {
     // No explicit workspace passed and COMFYUI_PATH unset — resolution must fall
     // through to the saved default workspace's venv rather than only scanning PATH.
     wsMock.base = workspace;
+    expect(resolveComfyCliExecutable()).toBe(executable);
+  });
+
+  it("does NOT reach past the target resolver to COMFYUI_PATH when it declines (#490)", () => {
+    // The #490 shape. `defaultWorkspace()` read `config.comfyuiPath ??
+    // resolveEffectiveComfyUIBase()`, so a set COMFYUI_PATH short-circuited the resolver
+    // entirely — meaning fixing the resolver could not fix this call site. In a remote
+    // session the resolver declines, and this module runs `comfy-cli uninstall` and
+    // `comfy-cli disable`: reaching past it targeted an unrelated LOCAL install while
+    // the reply described only the remote server.
+    delete process.env.COMFY_CLI_PATH;
+    const localInstall = mkdtempSync(join(tmpdir(), "comfy-cli-local-"));
+    tempDirs.push(localInstall);
+    const binDir = join(localInstall, ".venv", process.platform === "win32" ? "Scripts" : "bin");
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(join(binDir, process.platform === "win32" ? "comfy.exe" : "comfy"), "");
+
+    cfg.comfyuiPath = localInstall; // a stale local COMFYUI_PATH…
+    wsMock.base = undefined; // …and a resolver that says "not a local target"
+
+    // It must not pick up that install's venv comfy. (PATH may still hold a system
+    // comfy-cli — what matters is that the LOCAL INSTALL's binary is never chosen.)
+    expect(resolveComfyCliExecutable()).not.toBe(
+      join(binDir, process.platform === "win32" ? "comfy.exe" : "comfy"),
+    );
+  });
+
+  it("still uses COMFYUI_PATH's venv when the resolver DOES name it", () => {
+    // The other direction: the fix must not make a normal local session stop finding
+    // its own comfy-cli. An over-strict refusal here would be its own bug.
+    delete process.env.COMFY_CLI_PATH;
+    const localInstall = mkdtempSync(join(tmpdir(), "comfy-cli-local-ok-"));
+    tempDirs.push(localInstall);
+    const binDir = join(localInstall, ".venv", process.platform === "win32" ? "Scripts" : "bin");
+    mkdirSync(binDir, { recursive: true });
+    const executable = join(binDir, process.platform === "win32" ? "comfy.exe" : "comfy");
+    writeFileSync(executable, "");
+
+    cfg.comfyuiPath = localInstall;
+    wsMock.base = localInstall; // a local session: the resolver names the same install
+
     expect(resolveComfyCliExecutable()).toBe(executable);
   });
 

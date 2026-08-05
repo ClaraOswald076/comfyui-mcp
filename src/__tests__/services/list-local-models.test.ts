@@ -1,13 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Per-test control over the comfyuiPath toggle.
+//
+// `remote` used to be pinned true here as a blunt "yield no local base" lever, which
+// only worked because a set `comfyuiPath` short-circuited the mode check entirely —
+// i.e. the test relied on #490. Now the mode is consulted for every answer, so it is a
+// real toggle: local by default, flipped on for the tests that mean "no local install".
+// It cannot simply follow `comfyuiPath`, because with no path the resolver falls through
+// to the saved default workspace, which is read with the UNMOCKED node:fs and would pick
+// up the developer's real one.
+const mode = vi.hoisted(() => ({ remote: false }));
 vi.mock("../../config.js", () => ({
   config: {
     comfyuiPath: "/comfy" as string | undefined,
   },
-  // When comfyuiPath is unset the base resolver consults isRemoteMode; treat the
-  // "no local path" tests as remote so it cleanly yields no local base.
-  isRemoteMode: () => true,
+  isRemoteMode: () => mode.remote,
 }));
 
 // Stub getClient so we control whether the HTTP REST path succeeds, fails, or
@@ -47,6 +54,7 @@ beforeEach(() => {
   // Default: no sidecar next to any model file (enrichment is best-effort).
   readFile.mockRejectedValue(new Error("ENOENT"));
   config.comfyuiPath = "/comfy";
+  mode.remote = false;
 });
 
 afterEach(() => {
@@ -395,8 +403,10 @@ describe("listLocalModels — HTTP-first with FS fallback", () => {
   it("#526: GGUF categories are surfaced remotely (no local path, size 0)", async () => {
     // No comfyuiPath → no filesystem at all. The GGUF must still be visible via the
     // discovered REST category. This is the remote gap a filesystem-only patch cannot
-    // cover.
+    // cover. `remote` is set explicitly: without it the resolver would fall through to
+    // the saved default workspace and this would not be a no-local-path test at all.
     config.comfyuiPath = undefined;
+    mode.remote = true;
     getClient.mockReturnValue({ fetchApi });
     fetchApi.mockImplementation(async (path: string) => {
       if (path === "/models") return new Response(JSON.stringify(["clip_gguf"]), { status: 200 });
@@ -510,6 +520,7 @@ describe("listLocalModels — HTTP-first with FS fallback", () => {
 
   it("returns empty (no throw) in cloud mode when no comfyuiPath is set", async () => {
     config.comfyuiPath = undefined;
+    mode.remote = true; // no local install is in play for this case
     getClient.mockImplementation(() => {
       const err = new Error(
         "getClient is not supported in Comfy Cloud mode",
@@ -523,6 +534,7 @@ describe("listLocalModels — HTTP-first with FS fallback", () => {
 
   it("returns empty when HTTP is unreachable in remote mode (no FS path)", async () => {
     config.comfyuiPath = undefined;
+    mode.remote = true; // the test's own name — now actually expressed
     getClient.mockReturnValue({ fetchApi });
     fetchApi.mockResolvedValue(new Response("Not Found", { status: 404 }));
     const result = await listLocalModels("checkpoints");

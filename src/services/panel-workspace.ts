@@ -52,6 +52,7 @@ import {
   getLiveServerSnapshot,
   liveRootFromArgv,
   resolveEffectiveComfyUIBase,
+  resolveLocalWorkspaceBase,
 } from "./workspace-env.js";
 
 /** How the panel's ComfyUI base was resolved — reported so it is diagnosable. */
@@ -249,7 +250,10 @@ export async function primePanelBase(
   } catch {
     // A failed probe must not break panel management — fall back to the
     // ordinary sync answer rather than reporting "no local ComfyUI".
-    const configured = isLocalMode() ? resolveEffectiveComfyUIBase() : undefined;
+    // Asks the LOCAL-MACHINE question explicitly, having already established the mode
+    // on the line itself. Same answer as the target-scoped resolver, but the two are
+    // different questions and #490 is what happens when one stands in for the other.
+    const configured = isLocalMode() ? resolveLocalWorkspaceBase() : undefined;
     resolution = configured
       ? { base: configured, source: "configured" }
       : { source: "none" };
@@ -278,7 +282,9 @@ export function panelBaseSync(): string | undefined {
   const fresh = cachedResolution();
   if (fresh) return fresh.base;
   if (!isLocalMode()) return undefined;
-  return resolveEffectiveComfyUIBase();
+  // Mode established on the line above → the remaining question is purely "where is the
+  // local install?", so ask that one by name.
+  return resolveLocalWorkspaceBase();
 }
 
 /** The resolution behind `panelBaseSync()`, for reporting. undefined ⇒ unprimed. */

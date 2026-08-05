@@ -91,6 +91,8 @@ import {
   liveRootFromArgv,
   liveScriptFromArgv,
   resolveComfyuiPython,
+  resolveEffectiveComfyUIBase,
+  resolveLocalWorkspaceBase,
   resolveInstallInterpreter,
   resolveLiveComfyUIBase,
   resolveLiveServerRoot,
@@ -584,6 +586,67 @@ describe("listWorkspaces", () => {
 // ---------------------------------------------------------------------------
 // get_environment
 // ---------------------------------------------------------------------------
+
+describe("resolveEffectiveComfyUIBase vs resolveLocalWorkspaceBase (#490)", () => {
+  // Two different questions that shared one answer. "Where is the user's local install?"
+  // was being read as "which install does this operation act on?", and the resolver
+  // returned config.comfyuiPath BEFORE looking at the mode — so a remote session with a
+  // stale local COMFYUI_PATH (the ordinary local configuration) got that unrelated
+  // install as its target. Read-only callers got a wrong answer; comfy-cli uninstall and
+  // named-snapshot save acted on it.
+  it("does NOT return COMFYUI_PATH as the operation target in remote mode", async () => {
+    const dir = await tmpDir();
+    try {
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      mockConfig.comfyuiPath = dir; // a stale local path, exactly as reported
+      h.remoteMode.value = true;
+
+      expect(resolveEffectiveComfyUIBase()).toBeUndefined();
+      // …while the LOCAL-machine question still answers, because that is a different
+      // question and a legitimate one. Collapsing them is the bug; deleting one is not
+      // the fix.
+      expect(resolveLocalWorkspaceBase()).toBe(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still returns COMFYUI_PATH as the target in a local session", async () => {
+    // The over-strict direction would be its own bug: every filesystem-backed tool
+    // depends on this answer.
+    const dir = await tmpDir();
+    try {
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      mockConfig.comfyuiPath = dir;
+      h.remoteMode.value = false;
+
+      expect(resolveEffectiveComfyUIBase()).toBe(dir);
+      expect(resolveLocalWorkspaceBase()).toBe(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls through to the saved default workspace locally, and refuses it remotely", async () => {
+    const dir = await tmpDir();
+    const install = join(dir, "Saved");
+    await mkdir(install, { recursive: true });
+    try {
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      await setDefaultWorkspace(install);
+      mockConfig.comfyuiPath = undefined;
+
+      h.remoteMode.value = false;
+      expect(resolveEffectiveComfyUIBase()).toBe(install);
+
+      h.remoteMode.value = true;
+      expect(resolveEffectiveComfyUIBase()).toBeUndefined();
+      expect(resolveLocalWorkspaceBase()).toBe(install);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("getEnvironment", () => {
   it("reports running instance from system_stats and degrades local probes when no path", async () => {

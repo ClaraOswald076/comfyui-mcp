@@ -252,10 +252,17 @@ function desktopConfigPath(): string {
  * `list_extra_paths` threw while `workspace`/`get_environment` happily reported the
  * saved default workspace — the same install, two different answers.
  *
- * Throws (never guesses) when neither is available, INCLUDING remote mode, where
- * `resolveEffectiveComfyUIBase()` deliberately refuses to hand back a local workspace:
- * reporting some other root's model dirs as if they were the live server's is a
- * wrong-destination hazard, so an explicit unresolved error is the only safe answer.
+ * Throws (never guesses) when neither is available, including when the session is not
+ * pointed at a local install: reporting some other root's model dirs as if they were the
+ * live server's is a wrong-destination hazard, so an explicit unresolved error is the
+ * only safe answer.
+ *
+ * That last clause is stated as a consequence of what `resolveEffectiveComfyUIBase()`
+ * returns, not as a guarantee this function independently enforces — the previous
+ * wording asserted the guarantee flatly while the resolver did not implement it (#490),
+ * and a confident absolute in a comment is precisely what stops the next reader from
+ * re-deriving it. If that resolver ever stops refusing, this text is wrong and the check
+ * belongs here.
  *
  * STALE-ROOT GUARD (codex rounds 2-3, P1): an INFERRED root — a saved default workspace
  * persisted once and maybe never revisited, or a startup AUTO-DETECTION that has since

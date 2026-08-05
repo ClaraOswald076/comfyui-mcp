@@ -103,26 +103,55 @@ export function getSavedDefaultWorkspaceSync(): string | undefined {
 }
 
 /**
- * The SINGLE source of truth for the effective LOCAL ComfyUI base directory used
- * by every filesystem-backed tool (download_model, verify_custom_node, model
- * lookups, apply_manifest's adoption). Resolution order, applied consistently so
- * the tools never disagree about where ComfyUI lives when COMFYUI_PATH is unset:
+ * QUESTION 1 — "where is a ComfyUI install on THIS machine?"
+ *
+ * Answers only that. It says nothing about whether the current session is pointed at
+ * that install, and callers must not read it as though it did.
  *
  *   1. config.comfyuiPath — COMFYUI_PATH env or auto-detection (wins).
- *   2. When NOT targeting a remote ComfyUI, the saved DEFAULT WORKSPACE
- *      (set via workspace action:"set_default") — this is what workspace action:"get" /
- *      get_environment already report, so local downloads / model lookups /
- *      node verification work without COMFYUI_PATH.
+ *   2. the saved DEFAULT WORKSPACE (workspace action:"set_default").
  *
- * Never returns a local workspace in remote mode (that dir isn't the remote
- * target; remote-mode callers route through ComfyUI-Manager instead). Returns
- * undefined when no usable local path exists — callers then either detect a live
- * server base dir (/system_stats) or emit a clear, actionable error.
+ * Use this ONLY where the operation is about the local machine as such and the caller
+ * has established the session mode itself (panel installation is the real example: the
+ * panel lives in the local install, and its callers gate on `isLocalMode()` first).
+ */
+export function resolveLocalWorkspaceBase(): string | undefined {
+  return config.comfyuiPath ?? getSavedDefaultWorkspaceSync();
+}
+
+/**
+ * QUESTION 2 — "which install does THIS OPERATION act on?"
+ *
+ * The single source of truth for every filesystem-backed tool (download_model,
+ * verify_custom_node, model lookups, extra-paths, comfy-cli, apply_manifest's
+ * adoption). Returns undefined whenever the session is NOT pointed at a local install,
+ * because then no directory on this machine is the thing being operated on.
+ *
+ * The two questions used to share one answer, and that is #490: this function returned
+ * `config.comfyuiPath` BEFORE looking at the mode, so a remote `--comfyui-url` session
+ * with a stale local COMFYUI_PATH — the ordinary local configuration — was handed that
+ * unrelated local install as "the target". Its own docstring promised the opposite. A
+ * read-only caller got a wrong answer about the wrong tree; `comfy-cli uninstall` and
+ * named-snapshot save DELETED FROM and WROTE INTO an install nobody had asked about,
+ * while their replies talked only about the remote server. That is the #369 harm class,
+ * and it survived being closed once because the comment claimed the guarantee the code
+ * did not implement.
+ *
+ * SCOPE, stated precisely because an overclaiming comment is how this survived being
+ * closed once: this refuses in REMOTE (`--comfyui-url`) mode. It does NOT refuse in
+ * CLOUD mode (`isCloudMode()`, an API key), where the serving ComfyUI is equally not
+ * this machine and the same wrong-install hazard exists in principle. That variant is
+ * unfixed here and is not claimed to be fixed. Cloud is diverted at the client layer
+ * (`comfyui/client.ts`) rather than at this resolver, so it is a different seam and
+ * wants its own change; `isLocalMode()` is the check it would use.
+ *
+ * Returns undefined when no usable local target exists — callers then either detect a
+ * live server base dir (/system_stats) or emit a clear, actionable error. They must not
+ * substitute a local path of their own; doing so re-creates the bug one level up.
  */
 export function resolveEffectiveComfyUIBase(): string | undefined {
-  if (config.comfyuiPath) return config.comfyuiPath;
   if (isRemoteMode()) return undefined;
-  return getSavedDefaultWorkspaceSync();
+  return resolveLocalWorkspaceBase();
 }
 
 /**

@@ -64,6 +64,9 @@ const workspace = vi.hoisted(() => ({
 }));
 vi.mock("../../services/workspace-env.js", () => ({
   resolveEffectiveComfyUIBase: () => workspace.base,
+  // The LOCAL-MACHINE question #490 split out. Panel code gates on isLocalMode itself,
+  // so in a local session the two answers agree.
+  resolveLocalWorkspaceBase: () => workspace.base,
   liveRootFromArgv: (argv: string[] | undefined) => {
     // Minimal stand-in for the real argv→root derivation: the dir holding main.py.
     const main = argv?.find((a) => a.endsWith("main.py"));
