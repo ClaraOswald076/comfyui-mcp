@@ -17,7 +17,7 @@
 // verification that REPORTS a loss instead of confirming a save over it.
 
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -696,6 +696,59 @@ describe("a completed REVOKE is never turned back into a refusal", () => {
     // ...and the thing the user actually needs to know is stated.
     expect(out!.resurrectionRisk).toMatch(/COMES BACK on the next start/);
     expect(out!.resurrectionRisk).not.toContain("civ-legacy"); // never a value
+  });
+
+  it("does not call the legacy store EMPTY when it merely could not be read", async () => {
+    // `read()` folds "unreadable" into "{}", and for a revoke that is the
+    // difference between "there is nothing to purge" and "we cannot see whether
+    // there is". The revoke reported a clean result on the first while the file
+    // may still hold the key — and once it is readable again the boot migration
+    // puts the credential back (codex gate).
+    const { revokeIsClean } = await import("../../services/panel-secrets.js");
+    writeFileSync(envPath, "CIVITAI_API_TOKEN=civ-old\n", { mode: 0o600 });
+    writeFileSync(join(dir, "panel-secrets.json"), "{ this is not json");
+    const out = removeComfyuiSecret("CIVITAI_API_TOKEN");
+    expect(out.changed).toBe(true); // the .env removal happened
+    expect(out.resurrectionRisk).toMatch(/could not be READ/);
+    expect(out.resurrectionRisk).toMatch(/not established/);
+    expect(revokeIsClean(out)).toBe(false);
+  });
+
+  it("sweeps a pre-write snapshot a CRASHED writer left, and does not report one it cannot", async () => {
+    // The snapshot is a link/copy of the store, so a process killed before its
+    // cleanup leaves a readable file holding the credentials as they were —
+    // including one the user has since revoked. A later revoke was reporting the
+    // credential gone while a copy of it sat beside the store (codex gate).
+    const { revokeIsClean } = await import("../../services/panel-secrets.js");
+    writeFileSync(envPath, "CIVITAI_API_TOKEN=civ-old\n", { mode: 0o600 });
+    const stale = `${envPath}.pre-99999-deadbeefcafe`;
+    writeFileSync(stale, "CIVITAI_API_TOKEN=civ-old\n", { mode: 0o600 });
+    // Backdate it past the age threshold: a LIVE writer's snapshot lives for
+    // microseconds, and must never be swept out from under it.
+    utimesSync(stale, new Date(Date.now() - 600_000), new Date(Date.now() - 600_000));
+    const out = removeComfyuiSecret("CIVITAI_API_TOKEN");
+    expect(out.changed).toBe(true);
+    expect(existsSync(stale)).toBe(false); // the stale copy is gone
+    expect(revokeIsClean(out)).toBe(true); // ...so this really is a clean revoke
+  });
+
+  it("sweeps a stale snapshot on an ordinary SAVE too, not only on a revoke", () => {
+    // The sweep belongs to every write: a crashed writer's copy should not
+    // survive until someone happens to revoke something.
+    writeFileSync(envPath, "CIVITAI_API_TOKEN=civ-old\n", { mode: 0o600 });
+    const stale = `${envPath}.pre-99998-feedfacefeed`;
+    writeFileSync(stale, "CIVITAI_API_TOKEN=civ-old\n", { mode: 0o600 });
+    utimesSync(stale, new Date(Date.now() - 600_000), new Date(Date.now() - 600_000));
+    setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+    expect(existsSync(stale)).toBe(false);
+  });
+
+  it("leaves a FRESH snapshot alone — it may belong to a live writer", () => {
+    writeFileSync(envPath, "CIVITAI_API_TOKEN=civ-old\n", { mode: 0o600 });
+    const fresh = `${envPath}.pre-12345-abcdefabcdef`;
+    writeFileSync(fresh, "CIVITAI_API_TOKEN=civ-old\n", { mode: 0o600 });
+    setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+    expect(existsSync(fresh)).toBe(true);
   });
 
   it("reports a legacy purge that LANDED but was not made crash-durable", async () => {

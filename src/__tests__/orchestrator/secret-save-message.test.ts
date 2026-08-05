@@ -223,8 +223,14 @@ describe("secretNotPersisted: reflects whether a credential SURVIVED the rollbac
     const err = secretNotPersisted({ ...base, persisted: "no", stillConfigured: true });
     expect(err.message).toContain("was NOT saved");
     expect(err.message).not.toContain("nothing is configured");
-    expect(err.message).toContain("still in effect");
-    // And it must not be read as "now fixed" — the old value may be the problem.
+    expect(err.message).toContain("SOME credential for this key still resolves");
+    // ...but it must NOT say WHICH. `stillConfigured` is a presence check; the
+    // in-process value was rolled back and the store was not, so what resolves
+    // may be the predecessor or a competing writer's value — asserting the
+    // former is a state nobody observed (codex gate).
+    expect(err.message).toContain("which one is not established");
+    expect(err.message).not.toMatch(/the credential that was in place BEFORE this attempt is still in effect/);
+    // And it must not be read as "now fixed" — whatever resolves is not the new value.
     expect(err.message).toContain('do not read this as "now fixed"');
   });
 

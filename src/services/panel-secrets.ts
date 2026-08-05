@@ -28,13 +28,15 @@ import {
   linkSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   comfyuiEnvFilePath,
   freshSecretValue,
@@ -531,22 +533,37 @@ export function hasLivePickup(key: string): boolean {
   return LIVE_RELOAD_KEYS.has(key);
 }
 
-// Rebase resolution: the incoming commit added the receipt/live-pickup machinery
-// above; `main` (#859) had meanwhile threaded an optional `home` through this
-// reader so the suite can point the credential store at a temp dir instead of the
-// developer's real ~/.comfyui-mcp. Both are kept — they are unrelated, and losing
-// the `home` parameter would put the tests back to writing live credentials.
-function read(home?: string): PanelSecrets {
+/**
+ * The legacy store, or NULL when it exists but could not be read.
+ *
+ * The lenient `read()` below folds "unreadable" into "empty", and for a REVOKE
+ * that is the difference between "there is nothing to purge" and "we cannot see
+ * whether there is something to purge". The revoke reported a clean result on
+ * the strength of the first while the file may still hold the key — and once it
+ * becomes readable again the boot migration puts the credential back (codex
+ * gate). Callers that only need best-effort content keep using `read()`.
+ *
+ * Rebase resolution: `main` (#859) threaded an optional `home` through this
+ * reader so the suite can point the credential store at a temp dir instead of
+ * the developer's real ~/.comfyui-mcp. That parameter is carried onto BOTH
+ * functions here — dropping it would put the tests back to reading and writing
+ * live credentials, which is the bug #859 fixed.
+ */
+function readOrNull(home?: string): PanelSecrets | null {
   const p = panelSecretsPath(home);
-  if (!existsSync(p)) return {};
+  if (!existsSync(p)) return {}; // genuinely absent: nothing to purge, and that IS known
   try {
     const parsed = JSON.parse(readFileSync(p, "utf-8")) as unknown;
     return parsed && typeof parsed === "object" ? (parsed as PanelSecrets) : {};
   } catch (err) {
-    // Never echo file contents (they're secret) — just the parse failure.
+    // Never echo file contents (they're secret) — just the failure.
     logger.warn(`[panel-secrets] could not parse ${p}: ${err instanceof Error ? err.message : String(err)}`);
-    return {};
+    return null;
   }
+}
+
+function read(home?: string): PanelSecrets {
+  return readOrNull(home) ?? {};
 }
 
 function write(secrets: PanelSecrets): string | null {
@@ -815,6 +832,49 @@ function writeAllSync(fd: number, body: string): void {
 }
 
 /**
+ * Delete the temp files and pre-write snapshots a CRASHED writer left behind.
+ *
+ * The snapshot is a hard link (or a copy) of the credential store, so a process
+ * killed between the link and its cleanup leaves a readable file containing the
+ * credentials as they were — including one the user has since revoked. Nothing
+ * reads those files, but "revoked" has to mean the credential is gone, and a
+ * later revoke was reporting a clean result while a copy of the token sat in the
+ * same directory (codex gate).
+ *
+ * Only files OLDER than `ageMs` are touched: a live writer's sentinel exists for
+ * microseconds, so this can never delete one out from under a concurrent save
+ * (and if it somehow did, that save's account degrades to "unknown" — it does
+ * not silently claim to be clean).
+ *
+ * Best effort by design; returns the paths it could NOT remove so a revoke can
+ * disclose them.
+ */
+function sweepStaleSidecars(target: string, ageMs = 60_000): string[] {
+  const dir = dirname(target);
+  const base = `${basename(target)}.`;
+  const survivors: string[] = [];
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return survivors; // cannot list; nothing claimed either way
+  }
+  const cutoff = Date.now() - ageMs;
+  for (const entry of entries) {
+    if (!entry.startsWith(base)) continue;
+    if (!/\.(tmp|pre)-/.test(entry.slice(base.length - 1))) continue;
+    const full = join(dir, entry);
+    try {
+      if (statSync(full).mtimeMs > cutoff) continue; // a live writer's, leave it
+      rmSync(full, { force: true });
+    } catch {
+      survivors.push(full);
+    }
+  }
+  return survivors;
+}
+
+/**
  * Flush the DIRECTORY so a rename that happened is still there after a power
  * loss. `fsync` on the file makes its CONTENT durable; it says nothing about the
  * directory entry that now points at it, and a rename whose directory was never
@@ -918,6 +978,9 @@ function rewriteEnvFile(
   assertStoreIsRedirectedInTests();
   const p = envFilePath();
   mkdirSync(dirname(p), { recursive: true });
+  // Clear out anything a CRASHED writer left: a stale pre-write snapshot is a
+  // readable copy of the credentials as they were, including ones since revoked.
+  sweepStaleSidecars(p);
 
   const ATTEMPTS = 5;
   // OBSERVED evidence that another process is writing this store right now. It
@@ -1516,7 +1579,17 @@ export function removeEnvSecret(key: string): SecretRemoveOutcome {
   let purgedJson = false;
   let resurrectionRisk: string | undefined;
   try {
-    const s = read();
+    const s = readOrNull();
+    if (s === null) {
+      // NOT "there is nothing to purge" — we could not look. The file may still
+      // hold this key, and the boot migration re-adds any legacy key the
+      // canonical store no longer provides (codex gate).
+      resurrectionRisk =
+        `"${key}" was removed from ${envFilePath()}, but the legacy store ${panelSecretsPath()} could not be READ, ` +
+        `so whether it still holds an entry for this key is not established. If it does, the boot migration re-adds this credential on the next start. ` +
+        `Check that file before relying on the revoke.`;
+      logger.warn(`[panel-secrets] ${resurrectionRisk}`);
+    } else {
     for (const map of [s.comfyuiEnv, s.agentEnv]) {
       if (map && Object.prototype.hasOwnProperty.call(map, key)) {
         delete map[key];
@@ -1537,12 +1610,25 @@ export function removeEnvSecret(key: string): SecretRemoveOutcome {
           `Re-check ${panelSecretsPath()} after any unclean shutdown.`;
       }
     }
+    }
   } catch (err) {
     purgedJson = false;
     resurrectionRisk =
       `"${key}" was removed from ${envFilePath()}, but the legacy store ${panelSecretsPath()} could not be purged (${errCode(err)}). ` +
       `It still holds an entry for this key, and the boot migration re-adds any legacy key the canonical store does not provide — so this credential COMES BACK on the next start. ` +
       `Remove it from that file by hand to revoke it permanently.`;
+    logger.warn(`[panel-secrets] ${resurrectionRisk}`);
+  }
+  // A pre-write snapshot a crashed writer left behind is a readable copy of the
+  // store as it was — with this credential still in it. `rewriteEnvFile` sweeps
+  // them, so this only names the ones that could not be removed: a revoke must
+  // not report the credential gone while a copy of it is sitting next to the
+  // store (codex gate).
+  const strayCopies = sweepStaleSidecars(envFilePath());
+  if (strayCopies.length && !resurrectionRisk) {
+    resurrectionRisk =
+      `"${key}" was removed from ${envFilePath()}, but ${strayCopies.length} pre-write snapshot${strayCopies.length > 1 ? "s" : ""} left by an interrupted write could not be deleted ` +
+      `(${strayCopies.join(", ")}). ${strayCopies.length > 1 ? "They are copies" : "It is a copy"} of the store from before this change and still contain${strayCopies.length > 1 ? "" : "s"} the old credential. Delete ${strayCopies.length > 1 ? "them" : "it"} by hand.`;
     logger.warn(`[panel-secrets] ${resurrectionRisk}`);
   }
   const changed = removed || purgedJson || envDeleted;
