@@ -16,6 +16,7 @@ import {
   isRemoteMode,
 } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
+import { errorText } from "../orchestrator/error-text.js";
 import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { findComfyuiPython } from "./env-capabilities.js";
@@ -2559,7 +2560,15 @@ export async function startComfyUI(anchor?: {
   port?: number;
   probeUrl?: string;
 }): Promise<StartResult> {
-  if (isRemoteMode()) {
+  // The refusal is for a DIRECT `start_comfyui`, which has no instance in mind
+  // and would otherwise launch a local server while the caller is looking at a
+  // remote one. An ANCHORED call is a different question: a restart already
+  // stopped a specific local instance and is putting it back. Refusing there
+  // because another agent retargeted to remote during the stop window left that
+  // instance killed and abandoned, with the exception escaping past the point of
+  // no return (codex gate P0). The anchor is the evidence that this is a
+  // relaunch, not a fresh launch.
+  if (isRemoteMode() && !anchor) {
     throw new ProcessControlError(
       "start_comfyui launches ComfyUI on the local machine and is not " +
         "available when targeting a remote instance via --comfyui-url.",
@@ -3034,8 +3043,13 @@ async function looksLikeSpaCatchall(res: Response): Promise<boolean> {
   }
 }
 
-async function rebootViaManager(): Promise<RebootResult> {
-  const base = getComfyUIBaseUrl();
+/**
+ * @param base the ALREADY-PINNED target. Not re-read from config here (codex
+ * gate P0): the caller resolved which instance it is restarting before its own
+ * awaits, and re-reading the mutable base at dispatch time is how a reboot
+ * meant for A gets posted to B.
+ */
+async function rebootViaManager(base: string): Promise<RebootResult> {
   const failures: string[] = [];
 
   for (const { path, method } of REBOOT_ROUTES) {
@@ -3191,6 +3205,12 @@ async function restartViaManagerReboot(context: {
   // otherwise be stamped with the NEW generation and sail through the check below
   // while the reading itself came from the old instance.
   const selfReadGeneration = getComfyuiTargetGeneration();
+  // Pinned HERE, with the generation, and used for every step below: the
+  // dispatch, the dispatch record, and the readiness probe. Each of those used
+  // to call `getComfyUIBaseUrl()` afresh, so a retarget landing in any of the
+  // gaps between them sent the reboot to one server, recorded a second, and
+  // reported the health of a third (codex gate P0/P1).
+  const anchoredBase = getComfyUIBaseUrl();
   const priorArgv = context.prior?.argv.length
     ? context.prior.argv
     : await readServingArgv();
@@ -3198,7 +3218,28 @@ async function restartViaManagerReboot(context: {
     ? context.prior.generation
     : selfReadGeneration;
 
-  const reboot = await rebootViaManager();
+  // FENCE BEFORE DISPATCH. Everything above this line is observation; the reboot
+  // below is the irreversible act. A retarget that landed during the argv read
+  // means the arguments we hold describe a different server than the one the
+  // config now names, and we cannot know which the caller meant. Nothing has
+  // been dispatched yet, so this is a REFUSAL, not an uncertain outcome — the
+  // one shape where refusing is strictly right (nothing has happened, and
+  // proceeding would act on the wrong machine).
+  if (getComfyuiTargetGeneration() !== selfReadGeneration) {
+    return {
+      stopped: false,
+      started: false,
+      startup: "not-attempted",
+      message:
+        "The configured ComfyUI target changed while this restart was preparing, " +
+        "so the reboot was not sent — it would have gone to a different server " +
+        "than the one this call read. Nothing was restarted. Re-run the restart " +
+        "to act on the current target.",
+      listener_ownership: unclassifiedOwnership(),
+    };
+  }
+
+  const reboot = await rebootViaManager(anchoredBase);
   if (!reboot.rebooting) {
     return {
       stopped: false,
@@ -3232,7 +3273,7 @@ async function restartViaManagerReboot(context: {
   // name restart causation only against such a record. No session identity
   // exists here, so stamp the shared PROCESS-WIDE slot (never grounds
   // causation on its own).
-  recordRestartDispatch(getComfyUIBaseUrl(), PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
+  recordRestartDispatch(anchoredBase, PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
 
   const timing = getRemoteRebootTiming();
   if (timing.settleMs > 0) await sleep(timing.settleMs);
@@ -3242,7 +3283,14 @@ async function restartViaManagerReboot(context: {
   // hanging the tool call if the host never returns.
   const intervalMs = Math.max(250, timing.intervalMs);
   const maxTries = Math.max(1, Math.ceil(timing.budgetMs / intervalMs));
-  const readiness = await waitForApiReady({ intervalMs, maxTries });
+  const readiness = await waitForApiReady({
+    intervalMs,
+    maxTries,
+    // Poll the instance we rebooted, not whatever the config names by now —
+    // otherwise a retarget during the reboot window lets a healthy B stand in as
+    // proof that A came back (codex gate P1).
+    probeUrl: `${anchoredBase}/system_stats`,
+  });
 
   if (!readiness.ready) {
     const waitedS = seconds(readiness.waited_ms);
@@ -3527,10 +3575,31 @@ export async function restartComfyUI(): Promise<RestartResult> {
     : "";
 
   // Start — ANCHORED to the instance that was just stopped (see restartProbeUrl).
-  const startResult = await startComfyUI({
-    port: info.port,
-    probeUrl: restartProbeUrl,
-  });
+  //
+  // The stop already committed, so from here a THROWN error is the worst outcome
+  // available: it unwinds past every report below and leaves the caller with an
+  // exception instead of the fact that their server is now down (codex gate P0).
+  // Whatever went wrong, the relaunch attempt is describable — so describe it.
+  let startResult: StartResult;
+  try {
+    startResult = await startComfyUI({
+      port: info.port,
+      probeUrl: restartProbeUrl,
+    });
+  } catch (err) {
+    return {
+      stopped: true,
+      started: false,
+      // DISCLOSE, do not refuse: the stop is not undoable and the caller's server
+      // really is down. A refusal here would read as "nothing happened".
+      startup: "not-attempted",
+      message:
+        `ComfyUI was stopped, but the relaunch could not be attempted: ${errorText(err)}. ` +
+        `ComfyUI is NOT running. Start it with start_comfyui once the cause is cleared.` +
+        stopCaveat,
+      listener_ownership: unclassifiedOwnership(),
+    };
+  }
   // #367: the relaunch was DISPATCHED and its process is alive, but the readiness
   // budget expired before the API answered. This is neither a success to claim nor
   // a failure to report, and it is checked BEFORE the `!started` branch so that it

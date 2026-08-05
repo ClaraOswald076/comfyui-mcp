@@ -128,3 +128,55 @@ describe("normalizeReportedVersion (#846)", () => {
     expect(mcp("comfyui-mcp is broken")).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// WIRING. Everything above tests `normalizeReportedVersion` directly, so every
+// one of those cases stays green if `report_issue` stops CALLING it (codex gate
+// P2) — and a normalizer nobody calls protects nothing. This drives the real
+// registered handler and inspects the bytes that leave for the triage worker.
+
+describe("report_issue actually normalizes before sending (#846 wiring)", () => {
+  it("sends the extracted version to the worker, not the sentence it came in", async () => {
+    const { registerReportIssueTools } = await import("../../tools/report-issue.js");
+
+    let handler: ((args: Record<string, unknown>) => Promise<unknown>) | undefined;
+    const fakeServer = {
+      tool: (name: string, _desc: string, _schema: unknown, fn: typeof handler) => {
+        if (name === "report_issue") handler = fn;
+      },
+    } as unknown as Parameters<typeof registerReportIssueTools>[0];
+    registerReportIssueTools(fakeServer);
+    expect(handler).toBeTypeOf("function");
+
+    const bodies: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      if (typeof init?.body === "string") bodies.push(init.body);
+      // A terminal ack: filed, nothing to poll.
+      return new Response(
+        JSON.stringify({ status: "done", url: "https://example.invalid/issues/1", job_id: "j1" }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    try {
+      await handler!({
+        title: "t",
+        body: "b",
+        repo: "artokun/comfyui-mcp",
+        mcp_version: ENV_LINE,
+        panel_version: ENV_LINE,
+      });
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+
+    expect(bodies.length).toBeGreaterThan(0);
+    const sent = JSON.parse(bodies[0]) as { reporter_versions?: { mcp?: string; panel?: string } };
+    expect(sent.reporter_versions?.mcp).toBe("0.48.18");
+    expect(sent.reporter_versions?.panel).toBe("0.11.38");
+    // The failure this pins: the raw sentence forwarded verbatim, which the
+    // worker cannot version-match — it just silently stops advising upgrades.
+    expect(sent.reporter_versions?.mcp).not.toContain("ENVIRONMENT");
+  });
+});

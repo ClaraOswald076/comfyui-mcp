@@ -288,13 +288,32 @@ function isTerminalError(frame: StatusFrame): boolean {
   return frame.status === "error" && !frame.url && !frame.payload;
 }
 
-/** The running comfyui-mcp version (best-effort; undefined if undetectable). */
-function detectMcpVersion(): string | undefined {
+/**
+ * The RUNNING comfyui-mcp version, snapshotted once at module load.
+ *
+ * `detectInstallMode().currentVersion` reads the package on disk, which answers
+ * a different question: what is INSTALLED. Those agree until someone updates in
+ * place, and then every issue filed by the still-running old process is stamped
+ * with the new version — the exact misreport #846 was opened for, reintroduced
+ * through the auto-detect fallback after round 9 fixed the explicit path (codex
+ * gate P1).
+ *
+ * Reading at load time is not a perfect proxy for "the code executing right
+ * now", but it is bounded by process start, which is the property that matters:
+ * it cannot drift underneath a long-lived process the way a report-time read
+ * does.
+ */
+const RUNNING_MCP_VERSION: string | undefined = (() => {
   try {
     return detectInstallMode().currentVersion ?? undefined;
   } catch {
     return undefined;
   }
+})();
+
+/** The running comfyui-mcp version (best-effort; undefined if undetectable). */
+function detectMcpVersion(): string | undefined {
+  return RUNNING_MCP_VERSION;
 }
 
 /** A semver body, with the optional `v` prefix stripped by the capture group. */
