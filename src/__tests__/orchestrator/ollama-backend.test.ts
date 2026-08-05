@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { OllamaBackend, comfyuiSpawnEnv, isOllamaModel, type McpToolClient } from "../../orchestrator/ollama-backend.js";
+import {
+  OllamaBackend,
+  comfyuiSpawnEnv,
+  comfyuiSpawnToolMode,
+  isOllamaModel,
+  type McpToolClient,
+} from "../../orchestrator/ollama-backend.js";
 import { PANEL_TOOL_MCP_TIMEOUT_MS, __panelAskTestHooks } from "../../orchestrator/panel-tools.js";
 import type { AgentEvent, NeutralTurn } from "../../orchestrator/agent-backend.js";
 
@@ -630,6 +636,40 @@ describe("comfyuiSpawnEnv (#667)", () => {
   it("unset env AND no spec mode gets the documented compact default", () => {
     const env = comfyuiSpawnEnv(undefined, {});
     expect(env.COMFYUI_MCP_TOOL_MODE).toBe("compact");
+  });
+
+  // #788 — with nobody having chosen, the MODEL decides rather than the provider.
+  it("a LARGE local model gets the full surface when nobody has chosen (#788)", () => {
+    expect(comfyuiSpawnEnv(undefined, {}, "llama3.3:70b").COMFYUI_MCP_TOOL_MODE).toBe("full");
+    const d = comfyuiSpawnToolMode(undefined, {}, "llama3.3:70b");
+    // The REASON matters: the same "full" would also come out of an override.
+    expect(d.source).toBe("model-parameters");
+  });
+
+  it("a SMALL local model keeps compact, attributed to the model (#788)", () => {
+    expect(comfyuiSpawnEnv(undefined, {}, "qwen3:4b").COMFYUI_MCP_TOOL_MODE).toBe("compact");
+    expect(comfyuiSpawnToolMode(undefined, {}, "qwen3:4b").source).toBe("model-parameters");
+  });
+
+  it("an explicit user choice still beats the model rule, in BOTH directions (#788)", () => {
+    expect(
+      comfyuiSpawnEnv(undefined, { COMFYUI_MCP_TOOL_MODE: "compact" }, "llama3.3:70b").COMFYUI_MCP_TOOL_MODE,
+    ).toBe("compact");
+    expect(comfyuiSpawnToolMode(undefined, { COMFYUI_MCP_TOOL_MODE: "compact" }, "llama3.3:70b").source).toBe(
+      "user-explicit",
+    );
+    expect(comfyuiSpawnEnv(undefined, { COMFYUI_MCP_TOOL_MODE: "full" }, "qwen3:4b").COMFYUI_MCP_TOOL_MODE).toBe(
+      "full",
+    );
+    expect(comfyuiSpawnToolMode(undefined, { COMFYUI_MCP_TOOL_MODE: "full" }, "qwen3:4b").source).toBe(
+      "user-explicit",
+    );
+  });
+
+  it("a spec-pinned mode (the HTTP lane's #291 value) still outranks the model rule", () => {
+    const d = comfyuiSpawnToolMode({ COMFYUI_MCP_TOOL_MODE: "compact" }, {}, "llama3.3:70b");
+    expect(d.mode).toBe("compact");
+    expect(d.source).toBe("caller-explicit");
   });
 });
 

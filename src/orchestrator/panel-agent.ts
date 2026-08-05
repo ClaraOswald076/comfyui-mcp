@@ -26,6 +26,7 @@ import { logger } from "../utils/logger.js";
 import { errorText, promptText } from "./error-text.js";
 import type { SessionStore } from "./session-store.js";
 import type { AgentBackend, AgentEvent, NeutralTurn } from "./agent-backend.js";
+import { type AudioRef, noAudioPartText } from "./audio-attachment.js";
 import {
   ClaudeBackend,
   fetchSupportedModels,
@@ -170,6 +171,8 @@ export interface ImageRef {
 export interface QueueItem {
   text: string;
   images?: ImageRef[];
+  /** Audio attachments this item is carrying (#790). */
+  audio?: AudioRef[];
   mid?: string;
   /** Run-completion journal tokens this item is carrying (#468). */
   eventTokens?: string[];
@@ -186,6 +189,8 @@ export interface QueueItem {
 export interface InFlightTurn {
   text: string;
   images?: ImageRef[];
+  /** Audio attachments this turn is carrying (#790). */
+  audio?: AudioRef[];
   /** Run-completion journal tokens this turn is carrying (#468). */
   eventTokens?: string[];
   /** The ORIGINAL queue items this turn was built from. A re-queue restores
@@ -466,6 +471,7 @@ export class PanelAgent {
     opts?: {
       title?: string;
       images?: ImageRef[];
+      audio?: AudioRef[];
       mid?: string;
       eventTokens?: string[];
       /** Re-delivery of an injected panel event (#468). MUST be preserved by every
@@ -479,6 +485,7 @@ export class PanelAgent {
     this.queue.push({
       text,
       images: opts?.images,
+      audio: opts?.audio,
       mid: opts?.mid,
       ...(opts?.completionOnly ? { completionOnly: true } : {}),
       ...(opts?.eventTokens?.length ? { eventTokens: [...opts.eventTokens] } : {}),
@@ -1076,6 +1083,26 @@ export class PanelAgent {
       // ingress would otherwise stringify to "[object Object]" here (#175).
       let text = batch.map((it) => promptText(it.text)).join("\n\n");
       let images = batch.flatMap((it) => it.images ?? []);
+      let audio = batch.flatMap((it) => it.audio ?? []);
+      // #790 — the SAME contract as the image gate below, for hearing. A backend
+      // with no audio content part must never simply receive `turn.audio` and
+      // drop it: the user would ask about a sound and get an answer composed
+      // from the text alone, with nothing in the transcript revealing the model
+      // never heard it. Refuse here, once, for every audio-less adapter, and say
+      // so in BOTH directions (`audio` is undeclared → treated as false, the
+      // only safe reading for an out-of-tree backend).
+      if (audio.length && !this.backend.capabilities.audio) {
+        for (const ref of audio) {
+          this.deps.onSay(this.tabId, `🔇 ${noAudioPartText(this.backend.id, ref.filename)}`);
+        }
+        text +=
+          `\n\n[panel note: the user attached ${audio.length} audio file(s) (${audio
+            .map((a) => a.filename)
+            .join(", ")}), but this provider has NO audio input and you did NOT receive them. ` +
+          `Do not describe, transcribe or analyse their contents, and do not imply you heard them — ` +
+          `say plainly that the audio could not reach you on this provider.]`;
+        audio = [];
+      }
       if (images.length && !this.backend.capabilities.vision) {
         // Text-only backend: every non-vision adapter silently ignores image
         // refs, which reads to the user as "it ignored my screenshot". Say so
@@ -1113,6 +1140,7 @@ export class PanelAgent {
       this.inFlight = {
         text,
         ...(images.length ? { images } : {}),
+        ...(audio.length ? { audio } : {}),
         ...(carriedTokens.length ? { eventTokens: carriedTokens } : {}),
         items: batch,
       };
@@ -1146,7 +1174,7 @@ export class PanelAgent {
       // Subsequent events re-arm it (handleEvent → bumpIdleWatchdog); a clean
       // result disarms it.
       this.bumpIdleWatchdog();
-      yield { text, ...(images.length ? { images } : {}) };
+      yield { text, ...(images.length ? { images } : {}), ...(audio.length ? { audio } : {}) };
       // Hold the next batch until THIS turn completes. Race-free: if the result
       // already fired (completedTurns caught up) we don't park at all, so the
       // channel can never deadlock and strand later messages.
@@ -2436,7 +2464,11 @@ export class PanelAgentManager {
   /** Route a panel message to its tab's agent, creating the agent if needed.
    *  Never routes into a stopped agent (whose channel is closed) — respawns so
    *  the message reaches a live session. */
-  send(tabId: string, text: string, meta?: { title?: string; images?: ImageRef[]; mid?: string }): void {
+  send(
+    tabId: string,
+    text: string,
+    meta?: { title?: string; images?: ImageRef[]; audio?: AudioRef[]; mid?: string },
+  ): void {
     let agent = this.agents.get(tabId);
     if (agent?.isStopped) {
       this.agents.delete(tabId);
@@ -2471,7 +2503,7 @@ export class PanelAgentManager {
       this.pendingResume.delete(tabId);
       agent = this.spawn(tabId, resume);
     }
-    agent.send(text, { title: meta?.title, images: meta?.images, mid: meta?.mid });
+    agent.send(text, { title: meta?.title, images: meta?.images, audio: meta?.audio, mid: meta?.mid });
   }
 
   /**

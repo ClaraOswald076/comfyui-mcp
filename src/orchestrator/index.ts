@@ -108,6 +108,8 @@ import { readyBannerText, bannerCorrection } from "./ready-banner.js";
 import { OAUTH_PROVIDERS } from "../services/oauth-flow.js";
 import { startPanelMcpHttpServer, type PanelMcpHttpServer } from "./panel-mcp-http.js";
 import { resolveHttpLaneComfyToolMode } from "./http-backend-tools.js";
+import type { ToolMode } from "../transport/cli.js";
+import { splitAudioAttachments } from "./audio-attachment.js";
 import { startPanelConsoleHttpServer, type PanelConsoleHttpServer } from "./panel-console-http.js";
 import type { AgentBackend } from "./agent-backend.js";
 import { readComfyuiCrashLog, formatCrashNote } from "../services/crash-log.js";
@@ -1615,7 +1617,13 @@ export async function runPanelOrchestrator(): Promise<void> {
   // tools don't saturate the backend's tool budget and make codex silently drop
   // the panel_* HTTP-MCP tools (overridable via COMFYUI_MCP_TOOL_MODE=full).
   const httpLaneComfyToolMode = resolveHttpLaneComfyToolMode();
-  const makeHttpBackendMcpServers = (tabId: string) => ({
+  // #788 — `toolMode: null` OMITS the key entirely, which is NOT the same as
+  // passing "compact": a pre-baked value is read downstream as a caller-explicit
+  // pin and outranks per-model auto-selection, so the Ollama-family backends
+  // (the only lane where the constraint is the MODEL's capacity rather than a
+  // host's tool budget) must leave the slot empty for comfyuiSpawnToolMode to
+  // fill. The HTTP lane keeps its pinned #291 value.
+  const makeHttpBackendMcpServers = (tabId: string, toolMode: ToolMode | null = httpLaneComfyToolMode) => ({
     // Headless comfyui MCP (this build) over stdio — same as Claude.
     comfyui: {
       transport: "stdio" as const,
@@ -1627,7 +1635,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       // withholds image pixels from the model.
       env: buildComfyuiMcpEnv({
         ...comfyuiBaseEnv(),
-        COMFYUI_MCP_TOOL_MODE: httpLaneComfyToolMode,
+        ...(toolMode ? { COMFYUI_MCP_TOOL_MODE: toolMode } : {}),
         ...(blindTabs.has(tabId) ? { COMFYUI_MCP_BLIND: "1" } : {}),
       }),
     },
@@ -1744,7 +1752,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         model: ollamaModel,
         systemAppend: sysAppend,
         comfyuiUrl,
-        mcpServers: makeHttpBackendMcpServers(panelTabId),
+        mcpServers: makeHttpBackendMcpServers(panelTabId, null),
         ...ollamaDeps(),
       });
     }
@@ -1754,7 +1762,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         model: openrouterModel,
         systemAppend: sysAppend,
         comfyuiUrl,
-        mcpServers: makeHttpBackendMcpServers(panelTabId),
+        mcpServers: makeHttpBackendMcpServers(panelTabId, null),
         ...openrouterDeps(),
       });
     }
@@ -1764,7 +1772,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         model: lmstudioModel,
         systemAppend: sysAppend,
         comfyuiUrl,
-        mcpServers: makeHttpBackendMcpServers(panelTabId),
+        mcpServers: makeHttpBackendMcpServers(panelTabId, null),
         ...lmstudioDeps(),
       });
     }
@@ -1774,7 +1782,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         model: llamacppModel,
         systemAppend: sysAppend,
         comfyuiUrl,
-        mcpServers: makeHttpBackendMcpServers(panelTabId),
+        mcpServers: makeHttpBackendMcpServers(panelTabId, null),
         ...llamacppDeps(),
       });
     }
@@ -1784,7 +1792,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         model: customModel,
         systemAppend: sysAppend,
         comfyuiUrl,
-        mcpServers: makeHttpBackendMcpServers(panelTabId),
+        mcpServers: makeHttpBackendMcpServers(panelTabId, null),
         ...customDeps(),
       });
     }
@@ -4723,15 +4731,30 @@ export async function runPanelOrchestrator(): Promise<void> {
     // Blind tab (issue #90): the toggle promises the agent NEVER receives
     // pixels — that includes composer attachments. Withhold them with an
     // honest note (the user can toggle Blind off to share an image).
-    const attachedImages = (event as { images?: Array<{ filename: string; subfolder?: string; type?: string }> })
+    // #790 — the composer may attach audio as well as images. Two sources, one
+    // normalisation: a dedicated `audio` array (the wire contract), plus any
+    // audio-named file that arrived in the legacy `images` array. The second is
+    // not politeness — routing a .wav into an image content part is a hard 400
+    // on the OpenAI dialect and an image-slot mis-encode on the native one, so
+    // classifying by extension here is what stops a sound being sent as a picture.
+    const rawAttached = (event as { images?: Array<{ filename: string; subfolder?: string; type?: string }> })
       .images;
+    const declaredAudio = (event as { audio?: Array<{ filename: string; subfolder?: string; type?: string }> })
+      .audio;
+    const attachmentSplit = splitAudioAttachments(rawAttached);
+    const attachedImages = attachmentSplit.images;
+    const attachedAudio = [...attachmentSplit.audio, ...(declaredAudio ?? [])];
     const tabIsBlind = blindTabs.has(event.tab_id);
     if (tabIsBlind && attachedImages?.length) {
       outText += `\n\n[panel note: ${attachedImages.length} image attachment(s) withheld — Blind mode is ON. You cannot see them; ask the user to describe the content or turn Blind off.]`;
     }
     const sendOpts = {
       title: event.title,
-      images: tabIsBlind ? undefined : attachedImages,
+      images: tabIsBlind || !attachedImages.length ? undefined : attachedImages,
+      // Blind (#90) is a promise about PIXELS — "the agent's image tools now
+      // withhold pixels". Audio is a different sense and is deliberately NOT
+      // withheld by that toggle; documented in docs/backends.mdx.
+      audio: attachedAudio.length ? attachedAudio : undefined,
       mid: userMid,
     };
     // Local-agent VRAM pause: if this tab runs the local Ollama model AND a

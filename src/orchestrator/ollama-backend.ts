@@ -26,6 +26,21 @@ import type {
   NeutralTurn,
 } from "./agent-backend.js";
 import type { ImageRef } from "./panel-agent.js";
+import { type ToolModeDecision, resolveToolModeForModel } from "../services/tool-mode-policy.js";
+import {
+  type AudioConfidence,
+  type AudioOutcome,
+  type AudioRef,
+  type AudioFetchResult,
+  MAX_AUDIO_ATTACHMENTS,
+  audioModelNote,
+  audioUnverifiedModelNote,
+  audioUserNotice,
+  fetchAudioAttachment,
+  modelLacksAudioText,
+  openAiAudioFormat,
+  tooManyAudioText,
+} from "./audio-attachment.js";
 import { OLLAMA_CAPABILITIES, stampTurn } from "./agent-backend.js";
 import type { GeminiMcpServerSpec } from "./gemini-backend.js";
 import { resolvePrompt } from "../services/prompt-overrides.js";
@@ -87,26 +102,42 @@ export interface OllamaBackendDeps {
 }
 
 /**
- * Spawn env for the headless comfyui MCP child (#667).
+ * Tool mode for the headless comfyui MCP child this backend spawns (#667, #788).
  *
- * Compact is the default on this path because the backend feeds the advertised
- * tool defs straight into a small local model's context — the full ~200-schema
- * list can fill most of a 16k num_ctx before the conversation starts, so the
- * child must expose the 3 meta-tools unless the user asked otherwise.
+ * Compact is the floor on this path because the backend feeds the advertised
+ * tool defs straight into a local model's context — the full schema list can
+ * fill most of a 16k num_ctx before the conversation starts.
  *
- * Precedence: an explicit COMFYUI_MCP_TOOL_MODE — the spec's (the
- * orchestrator's resolved lane mode, see resolveHttpLaneComfyToolMode) or the
- * user's own env — WINS; the compact default applies only when neither sets it.
+ * #788 adds the missing direction: when nobody has chosen a mode, the MODEL
+ * decides. A large local model is no longer held to the 3-tool router just
+ * because it is local (provider was always a bad proxy — see
+ * services/tool-mode-policy.ts), and a small one keeps the compact default.
+ *
+ * Precedence is unchanged where it existed: an explicit COMFYUI_MCP_TOOL_MODE —
+ * the spec's or the user's own env — WINS, in BOTH directions. Auto-selection
+ * only fills the gap where the previous code applied a blind `?? "compact"`.
+ */
+export function comfyuiSpawnToolMode(
+  specEnv: Record<string, string> | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+  model?: string,
+): ToolModeDecision {
+  return resolveToolModeForModel({ model, env, callerEnv: specEnv });
+}
+
+/**
+ * Spawn env for the headless comfyui MCP child. Thin wrapper over
+ * comfyuiSpawnToolMode so callers that only need the env keep the old shape.
  */
 export function comfyuiSpawnEnv(
   specEnv: Record<string, string> | undefined,
   env: NodeJS.ProcessEnv = process.env,
+  model?: string,
 ) {
   return {
     ...env,
     ...specEnv,
-    COMFYUI_MCP_TOOL_MODE:
-      specEnv?.COMFYUI_MCP_TOOL_MODE ?? env.COMFYUI_MCP_TOOL_MODE ?? "compact",
+    COMFYUI_MCP_TOOL_MODE: comfyuiSpawnToolMode(specEnv, env, model).mode,
   };
 }
 
@@ -126,6 +157,15 @@ type ChatMessage = {
   images?: string[];
   /** Mime types parallel to `images` (for the openai-dialect data: URLs). */
   imageMimes?: string[];
+  /** Inline AUDIO payloads (raw base64, no data: prefix) — #790. Kept in a
+   *  SEPARATE field from `images` even though Ollama's native wire merges the
+   *  two, because the OpenAI dialect does not: audio there is an `input_audio`
+   *  part and an audio data-URL in an `image_url` part is a hard 400 ("invalid
+   *  image input", reproduced live). One field for both would guarantee that
+   *  mis-encode on every openai-dialect endpoint. */
+  audios?: string[];
+  /** Mime types parallel to `audios`. */
+  audioMimes?: string[];
 };
 
 type OllamaToolCall = {
@@ -159,19 +199,48 @@ function toOpenAiMessages(messages: ChatMessage[]): Array<Record<string, unknown
     if (m.role === "tool") {
       return { role: "tool", tool_call_id: m.tool_call_id ?? "call_0", content: m.content };
     }
-    if (m.role === "user" && m.images?.length) {
+    if (m.role === "user" && (m.images?.length || m.audios?.length)) {
       return {
         role: "user",
         content: [
           { type: "text", text: m.content },
-          ...m.images.map((b64, i) => ({
+          ...(m.images ?? []).map((b64, i) => ({
             type: "image_url",
             image_url: { url: `data:${m.imageMimes?.[i] ?? "image/png"};base64,${b64}` },
+          })),
+          // #790 — the OpenAI audio content part. Verified live against Ollama's
+          // /v1/chat/completions (gemma4:e2b transcribed a WAV delivered this
+          // way); it is also the shape OpenAI-compatible hosts implement.
+          ...(m.audios ?? []).map((b64, i) => ({
+            type: "input_audio",
+            input_audio: { data: b64, format: openAiAudioFormat(m.audioMimes?.[i] ?? "audio/wav") },
           })),
         ],
       };
     }
     return { role: m.role, content: m.content };
+  });
+}
+
+/**
+ * Convert the neutral in-memory history to the NATIVE Ollama wire shape.
+ *
+ * The one transform that matters: Ollama has no separate audio field — audio
+ * bytes ride in `message.images[]`, the same array as pictures. That is not a
+ * guess: Ollama's own OpenAI-compatible transcription endpoint does exactly this
+ * (`FromTranscriptionRequest` puts the uploaded AudioData into `Images`), and it
+ * was confirmed live on 2026-08-04 — a WAV posted in `images[]` to gemma4:e2b
+ * came back correctly transcribed, and cost +40 prompt tokens over the same
+ * text-only turn, while the same bytes under an `audio` key cost 0 extra tokens
+ * (i.e. were silently ignored). Our internal `audios`/`audioMimes` fields are
+ * dropped here so nothing ships a key the daemon would discard.
+ */
+function toOllamaMessages(messages: ChatMessage[]): Array<Record<string, unknown>> {
+  return messages.map((m) => {
+    const { audios, audioMimes, ...rest } = m;
+    void audioMimes; // native wire infers the container from the bytes
+    if (!audios?.length) return rest as unknown as Record<string, unknown>;
+    return { ...rest, images: [...(m.images ?? []), ...audios] } as unknown as Record<string, unknown>;
   });
 }
 
@@ -277,6 +346,12 @@ export class OllamaBackend implements AgentBackend {
   /** Wire dialect (see OllamaBackendDeps.api). */
   protected api: "ollama" | "openai";
   protected apiKey: string | undefined;
+  /** Server-reported capabilities per model id (#790). Successful probes only —
+   *  see probeModelCapabilities for why a failure is never memoised. */
+  protected modelCapabilities = new Map<string, string[]>();
+  /** The tool-mode decision the comfyui child was spawned with (#788), kept so
+   *  the active mode and its REASON are visible rather than inferred. */
+  protected toolModeDecision: ToolModeDecision | null = null;
 
   constructor(deps: OllamaBackendDeps = {}) {
     this.deps = deps;
@@ -370,7 +445,8 @@ export class OllamaBackend implements AgentBackend {
     await this.connectTools();
     this.prepared = true;
     logger.info(
-      `[ollama-backend] ready (${this.api === "openai" ? `openai-compatible @ ${this.host}` : `ollama ${version}`}, model ${this.model}, ${this.comfyTools.length} comfyui meta-tools, ${this.panelTools.length} panel tools behind the router)`,
+      `[ollama-backend] ready (${this.api === "openai" ? `openai-compatible @ ${this.host}` : `ollama ${version}`}, model ${this.model}, ${this.comfyTools.length} comfyui tools, ${this.panelTools.length} panel tools behind the router)` +
+        (this.toolModeDecision ? ` — ${this.toolModeDecision.explain}` : ""),
     );
   }
 
@@ -385,12 +461,16 @@ export class OllamaBackend implements AgentBackend {
         try {
           const client = new Client({ name: `ollama-backend-${name}`, version: "0.0.0" });
           if (spec.transport === "stdio") {
+            // #788 — record WHY this surface is what it is, so the ready line can
+            // say it. "compact was applied" and "compact was applied because of
+            // the model" are different facts and the user is owed the second one.
+            this.toolModeDecision = comfyuiSpawnToolMode(spec.env, process.env, this.model);
             const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
             await client.connect(
               new StdioClientTransport({
                 command: spec.command,
                 args: spec.args ?? [],
-                env: comfyuiSpawnEnv(spec.env),
+                env: comfyuiSpawnEnv(spec.env, process.env, this.model),
               }),
             );
             this.comfy = client as unknown as McpToolClient;
@@ -623,7 +703,7 @@ export class OllamaBackend implements AgentBackend {
               headers: { "content-type": "application/json" },
               body: JSON.stringify({
                 model: this.model,
-                messages,
+                messages: toOllamaMessages(messages),
                 tools,
                 stream: true,
                 // See OllamaBackendDeps.numCtx: omit for our fine-tune so the
@@ -870,7 +950,119 @@ export class OllamaBackend implements AgentBackend {
         m.content +=
           "\n[note: the attached image(s) were removed — this model/endpoint rejected image input. You did NOT see them; tell the user so if it matters.]";
       }
+      if (m.audios?.length) {
+        delete m.audios;
+        delete m.audioMimes;
+        m.content +=
+          "\n[note: the attached audio was removed — this model/endpoint rejected media input. You did NOT hear it; say so plainly rather than describing or transcribing anything.]";
+      }
     }
+  }
+
+  /**
+   * Capabilities the SERVER reports for the active model (#790), or null when we
+   * could not establish them.
+   *
+   * Only `POST /api/show` is authoritative. `GET /api/tags` also returns a
+   * `capabilities` array and it is NOT the same answer: measured live on
+   * 2026-08-04, `gemma4:e2b` came back as ["completion","tools","thinking"] from
+   * /api/tags and ["completion","vision","audio","tools","thinking"] from
+   * /api/show — the SAME model, one list missing both media capabilities. Using
+   * the cheap list would refuse audio to a model that can hear.
+   *
+   * null means UNKNOWN, never "no". A probe that fails (daemon busy loading a
+   * model, a non-Ollama OpenAI-compatible host with no such endpoint) is an
+   * operation that failed, not a capability verdict — callers must degrade to
+   * "attempt and say it is unconfirmed", not to a refusal.
+   *
+   * Only successful probes are memoised; caching a failure would make one bad
+   * moment permanent for the life of the backend.
+   */
+  protected async probeModelCapabilities(): Promise<string[] | null> {
+    if (this.api !== "ollama") return null; // no capability endpoint on this dialect
+    const cached = this.modelCapabilities.get(this.model);
+    if (cached) return cached;
+    try {
+      const res = await fetch(`${this.host}/api/show`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: this.model }),
+        signal: AbortSignal.timeout(20000),
+      });
+      if (!res.ok) {
+        logger.warn(`[ollama-backend] /api/show for ${this.model} returned http ${res.status} — model capabilities unknown`);
+        return null;
+      }
+      const body = (await res.json()) as { capabilities?: unknown };
+      if (!Array.isArray(body.capabilities)) {
+        logger.warn(`[ollama-backend] /api/show for ${this.model} carried no capabilities array — unknown`);
+        return null;
+      }
+      const caps = body.capabilities.filter((c): c is string => typeof c === "string");
+      this.modelCapabilities.set(this.model, caps);
+      return caps;
+    } catch (err) {
+      logger.warn(`[ollama-backend] /api/show probe failed for ${this.model}: ${msgOf(err)} — model capabilities unknown`);
+      return null;
+    }
+  }
+
+  /**
+   * Fetch one audio attachment out of ComfyUI and classify it (#790). Every
+   * failure path returns a REFUSAL carrying user-facing text, so no caller can
+   * accidentally treat "couldn't read it" as "nothing to attach".
+   */
+  protected async resolveAudio(ref: AudioRef): Promise<AudioFetchResult> {
+    return fetchAudioAttachment(this.deps.comfyuiUrl, ref);
+  }
+
+  /**
+   * Attach this turn's audio to `userMsg` and report what actually happened.
+   *
+   * Order matters: establish the model's capability BEFORE fetching anything, so
+   * a model that cannot hear produces a refusal naming a model that can rather
+   * than a download plus a shrug.
+   */
+  protected async attachAudio(
+    userMsg: ChatMessage,
+    refs: readonly AudioRef[],
+  ): Promise<{ outcomes: AudioOutcome[]; confidence: AudioConfidence }> {
+    const outcomes: AudioOutcome[] = [];
+    const caps = await this.probeModelCapabilities();
+    if (caps && !caps.includes("audio")) {
+      for (const ref of refs) {
+        outcomes.push({
+          status: "refused",
+          filename: ref.filename,
+          reason: "model-lacks-audio-capability",
+          text: modelLacksAudioText(this.model, caps, ref.filename),
+        });
+      }
+      return { outcomes, confidence: "established" };
+    }
+    // caps === null → the probe could not run. That is not a refusal (a guard
+    // that fails is not a verdict): attempt delivery and mark it unconfirmed.
+    const confidence: AudioConfidence = caps ? "established" : "unverified";
+    for (const [i, ref] of refs.entries()) {
+      if (i >= MAX_AUDIO_ATTACHMENTS) {
+        outcomes.push({
+          status: "refused",
+          filename: ref.filename,
+          reason: "too-large",
+          text: tooManyAudioText(ref.filename, MAX_AUDIO_ATTACHMENTS),
+        });
+        continue;
+      }
+      const r = await this.resolveAudio(ref);
+      if (!r.ok) {
+        outcomes.push(r.outcome);
+        continue;
+      }
+      (userMsg.audios ??= []).push(r.b64);
+      (userMsg.audioMimes ??= []).push(r.mime);
+      outcomes.push({ status: "delivered", filename: ref.filename, mime: r.mime, bytes: r.bytes });
+    }
+    return { outcomes, confidence };
   }
 
   private async *runTurn(turn: NeutralTurn, opts: BackendStartOptions): AsyncIterable<AgentEvent> {
@@ -891,7 +1083,28 @@ export class OllamaBackend implements AgentBackend {
         userMsg.imageMimes = resolved.map((r) => r.mime);
       }
     }
+    // #790 — audio. Unlike images this is NOT "always attempt": Ollama reports a
+    // per-model capability list, so a model that cannot hear is told so by name
+    // instead of being handed bytes it will ignore. Refusals are surfaced to the
+    // user AND written into the turn text, so neither side can proceed as if the
+    // sound had been heard.
+    let audioOutcomes: AudioOutcome[] = [];
+    let audioConfidence: AudioConfidence = "unverified";
+    if (turn.audio?.length) {
+      ({ outcomes: audioOutcomes, confidence: audioConfidence } = await this.attachAudio(userMsg, turn.audio));
+      const refusalNote = audioModelNote(audioOutcomes);
+      if (refusalNote) userMsg.content += refusalNote;
+      if (audioConfidence === "unverified" && audioOutcomes.some((o) => o.status === "delivered")) {
+        userMsg.content += audioUnverifiedModelNote(
+          audioOutcomes.filter((o) => o.status === "delivered").length,
+        );
+      }
+    }
     this.history.push(userMsg);
+    if (audioOutcomes.length) {
+      const notice = audioUserNotice(audioOutcomes, audioConfidence, this.model);
+      if (notice) yield { type: "assistant", text: notice };
+    }
 
     let resultEmitted = false;
     // Loop-breaker: small models (especially stock ones) can wedge into
@@ -913,7 +1126,7 @@ export class OllamaBackend implements AgentBackend {
     const DISCOVERY_TOOLS = new Set(["list_tools", "panel_list_tools", "search_models", "search_custom_nodes"]);
     const discoveryCounts = new Map<string, number>();
     let emptyFinalRetried = false;
-    let imagesStripped = false;
+    let attachmentsStripped = false;
     try {
       for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
         // Drain the chat stream manually: yield each delta event as it arrives,
@@ -938,13 +1151,23 @@ export class OllamaBackend implements AgentBackend {
           // on image parts; a non-vision Ollama model can error at prompt
           // build), retry ONCE with the images stripped and an honest note in
           // both directions. Any other failure re-throws to the normal handler.
-          if (!abort.signal.aborted && !imagesStripped && this.history.some((m) => m.images?.length)) {
-            imagesStripped = true;
-            logger.warn(`[ollama-backend] image input rejected (${msgOf(err).slice(0, 200)}) — retrying without images`);
+          const hadAudio = this.history.some((m) => m.audios?.length);
+          const hadImages = this.history.some((m) => m.images?.length);
+          if (!abort.signal.aborted && !attachmentsStripped && (hadImages || hadAudio)) {
+            attachmentsStripped = true;
+            logger.warn(
+              `[ollama-backend] media input rejected (${msgOf(err).slice(0, 200)}) — retrying without attachments`,
+            );
             this.stripImagesFromHistory();
+            // #790 — the correction for an attachment we had already told the
+            // user was on the request. Naming the SENSE that was lost matters:
+            // "can't see it" after an audio rejection would be a second wrong
+            // statement on top of the first.
             yield {
               type: "assistant",
-              text: `📎 ${this.model} rejected image input, so I'm continuing without the attachment — I can't see the image. Describe it in words, or switch to a vision-capable model.`,
+              text: hadAudio
+                ? `🔇 ${this.model} rejected the audio attachment, so I'm continuing without it — I did NOT hear it and won't describe it. Switch to an audio-capable model (\`ollama pull gemma4:e4b\`), or ask me to run a ComfyUI audio-analysis node over the file instead.`
+                : `📎 ${this.model} rejected image input, so I'm continuing without the attachment — I can't see the image. Describe it in words, or switch to a vision-capable model.`,
             };
             round--; // the rejected request didn't count as a tool round
             continue;
@@ -1104,7 +1327,13 @@ export class OllamaBackend implements AgentBackend {
             // Inline image payloads are elided — a single screenshot would
             // dwarf the whole conversation in the datagen transcript.
             messages: this.history.map((m) =>
-              m.images?.length ? { ...m, images: m.images.map(() => "[inline image omitted]") } : m,
+              m.images?.length || m.audios?.length
+                ? {
+                    ...m,
+                    ...(m.images?.length ? { images: m.images.map(() => "[inline image omitted]") } : {}),
+                    ...(m.audios?.length ? { audios: m.audios.map(() => "[inline audio omitted]") } : {}),
+                  }
+                : m,
             ),
           },
           null,

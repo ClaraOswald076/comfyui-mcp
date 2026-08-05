@@ -77,6 +77,15 @@ import {
   stampTurn,
 } from "./agent-backend.js";
 import type { ImageRef } from "./panel-agent.js";
+import {
+  type AudioOutcome,
+  MAX_AUDIO_ATTACHMENTS,
+  audioModelNote,
+  audioUserNotice,
+  fetchAudioAttachment,
+  sessionNotAdvertisedText,
+  tooManyAudioText,
+} from "./audio-attachment.js";
 
 function msgOf(err: unknown): string {
   return errorText(err);
@@ -1055,6 +1064,49 @@ export class GeminiBackend implements AgentBackend {
         const block = await this.fetchImageBlock(ref);
         if (block) prompt.push(block);
       }
+    }
+    // #790 - audio, as an ACP `audio` ContentBlock. Note the polarity is the
+    // OPPOSITE of images above: ACP says audio "must be explicitly opted into by
+    // the agent" and that clients MUST restrict content to the advertised prompt
+    // capabilities, so unknown means DENY. Default-allow would put bytes on a
+    // session that never claimed it could take them - the model would answer
+    // from the text alone and nobody would know it never heard the file.
+    const audioRefs = turn.audio ?? [];
+    const audioOutcomes: AudioOutcome[] = [];
+    if (audioRefs.length) {
+      if (this.agentCaps?.promptCapabilities?.audio !== true) {
+        for (const ref of audioRefs) {
+          audioOutcomes.push({
+            status: "refused",
+            filename: ref.filename,
+            reason: "session-did-not-advertise-audio",
+            text: sessionNotAdvertisedText("gemini", ref.filename),
+          });
+        }
+      } else {
+        for (const [i, ref] of audioRefs.entries()) {
+          if (i >= MAX_AUDIO_ATTACHMENTS) {
+            audioOutcomes.push({
+              status: "refused",
+              filename: ref.filename,
+              reason: "too-large",
+              text: tooManyAudioText(ref.filename, MAX_AUDIO_ATTACHMENTS),
+            });
+            continue;
+          }
+          const got = await fetchAudioAttachment(this.deps.comfyuiUrl, ref);
+          if (!got.ok) {
+            audioOutcomes.push(got.outcome);
+            continue;
+          }
+          prompt.push({ type: "audio", mimeType: got.mime, data: got.b64 });
+          audioOutcomes.push({ status: "delivered", filename: ref.filename, mime: got.mime, bytes: got.bytes });
+        }
+      }
+      const modelNote = audioModelNote(audioOutcomes);
+      if (modelNote) prompt[0] = { type: "text", text: `${turnText}${modelNote}` };
+      const notice = audioUserNotice(audioOutcomes, "established", this.model ?? "gemini");
+      if (notice) yield { type: "assistant", text: notice };
     }
 
     try {

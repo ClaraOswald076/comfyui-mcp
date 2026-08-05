@@ -154,7 +154,45 @@ the features a provider can't do:
 | In-process MCP tools | ✅ | ❌ | ❌ | ❌ (router over MCP clients) |
 | Model enumeration | ✅ | ✅ (`config/read`) | static catalog | ✅ (`/api/tags` or `/models`) |
 | Vision (image input) | ✅ | ✅ | ✅ | ❌ (model-dependent; off for now) |
+| Audio input | ❌ | ❌ | ⚠️ ACP-gated | ✅ (per-model, checked) |
 | Provider slash commands | ✅ | ❌ | ❌ | ❌ |
+
+### Audio input — which backends, honestly
+
+The agent can drive ComfyUI's audio tools on every backend. **Hearing** an
+audio file is narrower, and the table above is deliberately conservative
+because a silently dropped attachment is worse than a refused one:
+
+- **Ollama / LM Studio / llama.cpp / OpenAI-compatible — supported and
+  verified.** Audio rides the native `/api/chat` `images[]` array (which is
+  Ollama's own carrier for audio, not a hack) or the OpenAI-compatible
+  `input_audio` content part. Both were confirmed live against a local Ollama
+  with `gemma4:e2b`, which transcribed a real WAV.
+- **Per-model, not per-provider.** Before sending anything, the backend asks
+  `POST /api/show` whether *this* model reports the `audio` capability. If it
+  doesn't, the attachment is refused by name, the reported capability list is
+  quoted back to you, and you're told which models can hear
+  (`ollama pull gemma4:e2b` / `gemma4:e4b` / `nemotron3:33b`). Note `GET
+  /api/tags` also returns a `capabilities` array and is **not** the same
+  answer — the same model reported no audio there and audio from `/api/show`
+  — so only `/api/show` is consulted.
+- **If the probe itself fails** (daemon busy, non-Ollama host with no such
+  endpoint) that is not treated as "no audio". The audio is sent anyway and
+  you get an explicit *"I cannot confirm the model receives this"* line, so an
+  unconfirmed delivery is never mistaken for a confirmed one.
+- **Gemini / Grok (ACP)** — the `audio` ContentBlock is implemented, but ACP
+  requires the agent to advertise the `audio` prompt capability first, and the
+  CLIs are not known to. Unknown means **deny**, with a message saying so. This
+  path is untested against a live CLI.
+- **Claude, ChatGPT (Codex), Codex CLI, Antigravity, pi, Copilot, Grok
+  direct** — no audio input at all. Attaching audio is refused before the turn
+  is built, and both you and the model are told.
+
+The **Blind** toggle is about *pixels*: it withholds images and does **not**
+withhold audio.
+
+Only the Ollama-family path above is verified end to end. Everything else in
+this section describes a refusal, not a capability.
 
 **Conversation-rollback** (forking the chat back to a past turn) is
 Claude-only; the **code/graph** rollback (`/revert`, double-Esc, per-turn

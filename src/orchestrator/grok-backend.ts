@@ -77,6 +77,15 @@ import {
 } from "./agent-backend.js";
 import type { ImageRef } from "./panel-agent.js";
 import {
+  type AudioOutcome,
+  MAX_AUDIO_ATTACHMENTS,
+  audioModelNote,
+  audioUserNotice,
+  fetchAudioAttachment,
+  sessionNotAdvertisedText,
+  tooManyAudioText,
+} from "./audio-attachment.js";
+import {
   resolveGrokOAuth,
   type CodeProviderAuthDeps,
   type GrokOAuthCredentials,
@@ -574,7 +583,7 @@ export class GrokBackend implements AgentBackend {
       return this.resolvedDirect ? this.resolvedDirect.capabilities : GROK_CAPABILITIES;
     }
     const directReachable = !!this.deps.resolveGrokOAuth || existsSync(grokTokenFile);
-    return directReachable ? { ...GROK_CAPABILITIES, vision: false } : GROK_CAPABILITIES;
+    return directReachable ? { ...GROK_CAPABILITIES, vision: false, audio: false } : GROK_CAPABILITIES;
   }
 
   /**
@@ -1051,6 +1060,49 @@ export class GrokBackend implements AgentBackend {
         if (block) prompt.push(block);
       }
     }
+    // #790 - audio, as an ACP `audio` ContentBlock. Note the polarity is the
+    // OPPOSITE of images above: ACP says audio "must be explicitly opted into by
+    // the agent" and that clients MUST restrict content to the advertised prompt
+    // capabilities, so unknown means DENY. Default-allow would put bytes on a
+    // session that never claimed it could take them - the model would answer
+    // from the text alone and nobody would know it never heard the file.
+    const audioRefs = turn.audio ?? [];
+    const audioOutcomes: AudioOutcome[] = [];
+    if (audioRefs.length) {
+      if (this.agentCaps?.promptCapabilities?.audio !== true) {
+        for (const ref of audioRefs) {
+          audioOutcomes.push({
+            status: "refused",
+            filename: ref.filename,
+            reason: "session-did-not-advertise-audio",
+            text: sessionNotAdvertisedText("grok", ref.filename),
+          });
+        }
+      } else {
+        for (const [i, ref] of audioRefs.entries()) {
+          if (i >= MAX_AUDIO_ATTACHMENTS) {
+            audioOutcomes.push({
+              status: "refused",
+              filename: ref.filename,
+              reason: "too-large",
+              text: tooManyAudioText(ref.filename, MAX_AUDIO_ATTACHMENTS),
+            });
+            continue;
+          }
+          const got = await fetchAudioAttachment(this.deps.comfyuiUrl, ref);
+          if (!got.ok) {
+            audioOutcomes.push(got.outcome);
+            continue;
+          }
+          prompt.push({ type: "audio", mimeType: got.mime, data: got.b64 });
+          audioOutcomes.push({ status: "delivered", filename: ref.filename, mime: got.mime, bytes: got.bytes });
+        }
+      }
+      const modelNote = audioModelNote(audioOutcomes);
+      if (modelNote) prompt[0] = { type: "text", text: `${turnText}${modelNote}` };
+      const notice = audioUserNotice(audioOutcomes, "established", this.model ?? "grok");
+      if (notice) yield { type: "assistant", text: notice };
+    }
 
     try {
       // session/prompt is a REQUEST that RESOLVES with a stopReason at turn end.
@@ -1319,6 +1371,7 @@ const GROK_DIRECT_CAPABILITIES = {
   slashCommands: false,
   hooks: false,
   vision: false, // the 6-tool router is text-only (mirrors Ollama/ChatGPT); NeutralTurn.images unused here
+  audio: false, // xAI's audio-input contract is unverified, and an over-claim here means a SILENTLY unheard attachment (#790)
   // This adapter DOES stamp turn markers (see stampTurn in run() below), so it
   // must say so: #468's run-completion ack trusts the declaration, and a backend
   // that stamps but declares otherwise would let an unmarked straggler ack a
