@@ -21,7 +21,7 @@ import {
   unclassifiedGraphCommandsSeen,
   __resetUnclassifiedGraphCommands,
 } from "../../services/ui-bridge.js";
-import { carryWorkflowCommandStamp } from "../../orchestrator/session-store.js";
+import { SHARED_SESSION_SCOPE } from "../../services/session-scope.js";
 import {
   __resetPanelBaseCache,
   __setPanelBaseForTests,
@@ -941,15 +941,14 @@ describe("UiBridge (multi-tab)", () => {
 
   // The trusted workflow-uuid stamp registry (orchestrator's tabCommandWorkflowUuid)
   // is keyed by the CALLER's tab id, while command ROUTING resolves through the
-  // bridge's same-socket migration alias. A proven same-workflow migration (a save /
-  // rename, or a reconnect that re-registers the tab under a new id) used to retire
-  // the old id's stamp: a session still bound to the pre-migration id (a Codex HTTP
-  // MCP session is never re-pointed) kept reading through the alias while EVERY write
-  // was refused "no trusted identity" — and panel_set_workflow_target({mode:"current"})
-  // reported success without repairing anything (canReach is true through the alias).
-  // Only a browser refresh restored writes (#436 priority 3).
-  describe("the trusted stamp survives a proven same-workflow migration (#436.3)", () => {
-    it("a session bound to the pre-migration id keeps mutating once the stamp is carried", async () => {
+  // bridge's same-socket migration alias. #884 re-bound agent sessions to the
+  // SHARED SCOPE (no session is bound to a per-workflow tab id anymore), so the
+  // #436 stamp-carry is gone: a SHARED-SCOPE caller mutates via the stamp of the
+  // RESOLVED (active) conn, while a caller still naming a retired per-workflow id
+  // keeps FAILING CLOSED — a straggler command issued for the old workflow must
+  // never mutate the newly-shown one.
+  describe("workflow stamps after a same-socket migration (#436.3 → #884)", () => {
+    it("a shared-scope caller keeps mutating across the migration; the retired id fails closed", async () => {
       // Wire the stamp registry exactly as the orchestrator does (caller-keyed map).
       const stamps = new Map<string, string>();
       bridge.setTabWorkflowUuidResolver((tabId) => stamps.get(tabId));
@@ -1001,25 +1000,98 @@ describe("UiBridge (multi-tab)", () => {
         expect(bridge.tabs()[0].tab_id).toBe("wf:saved.json");
       });
       stamps.set("wf:saved.json", UUID); // the hello handler records the new id's stamp
+      stamps.delete("tmp:unsaved"); // …and retires the old id's stamp (#884)
 
-      // …but when the migration RETIRES the old id's stamp (the pre-fix behavior),
-      // the still-bound session reads fine while EVERY write is refused — the flap.
-      // Pinned here so the gate keeps failing closed whenever no stamp resolves.
-      stamps.delete("tmp:unsaved");
+      // The retired per-workflow id: reads still ride the migration alias, but a
+      // straggler WRITE issued for the old workflow keeps failing closed.
       const read = await bridge.send({ cmd: "graph_outline" }, { tabId: "tmp:unsaved" });
       expect(read).toMatchObject({ ok: true }); // reads ride the alias
       await expect(
         bridge.send({ cmd: "graph_add_node" }, { tabId: "tmp:unsaved" }),
       ).rejects.toThrow(/no trusted identity/);
 
-      // 3) The fix: the proven migration CARRIES the stamp (the exact call the
-      //    hello handler now makes) — the session writes again without a browser
-      //    refresh, stamped with the SAME trusted uuid the panel fences on.
-      carryWorkflowCommandStamp(stamps, "tmp:unsaved", { uuid: UUID });
-      const after = await bridge.send({ cmd: "graph_add_node" }, { tabId: "tmp:unsaved" });
+      // 3) #884: the agent's session is bound to the SHARED SCOPE, not a tab id.
+      //    A scope-addressed write resolves to the live (migrated) conn and is
+      //    stamped from THAT conn's registry entry — no carry, no browser
+      //    refresh, and the panel still fences on the trusted uuid.
+      const after = await bridge.send({ cmd: "graph_add_node" }, { tabId: SHARED_SESSION_SCOPE });
       expect(after).toMatchObject({ ok: true });
       expect(frames.pop()?.workflow_uuid).toBe(UUID);
 
+      sock.close();
+    });
+  });
+
+  // #884 — the SHARED SESSION SCOPE separates session identity from routing: one
+  // agent serves every tab/workflow, and a command addressed to the scope must
+  // reach the workflow the user is actually on. These drive the REAL WS bridge.
+  describe("shared-session-scope routing (#884)", () => {
+    it("a scope-addressed tool call reaches the tab the user LAST TALKED FROM", async () => {
+      const a = await connectPanel("wf:workflows/a.json", "a");
+      const b = await connectPanel("wf:workflows/b.json", "b");
+      autoReply(a, "tab-a");
+      autoReply(b, "tab-b");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+
+      // The user speaks from B → the scope routes there.
+      b.send(JSON.stringify({ type: "user_message", text: "hi from b" }));
+      await vi.waitFor(async () => {
+        const r = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
+        expect(r).toMatchObject({ from: "tab-b" });
+      });
+
+      // …then from A → the SAME scope now routes to A (several workflows open,
+      // one session; each call still reaches the right canvas).
+      a.send(JSON.stringify({ type: "user_message", text: "hi from a" }));
+      await vi.waitFor(async () => {
+        const r = await bridge.send({ cmd: "graph_get_state" }, { tabId: SHARED_SESSION_SCOPE });
+        expect(r).toMatchObject({ from: "tab-a" });
+      });
+
+      a.close();
+      b.close();
+    });
+
+    it("with no last-active tab, the scope prefers the most recent INTERACTIVE conn over a headless viewer", async () => {
+      const a = await connectPanel("wf:workflows/a.json", "a");
+      autoReply(a, "tab-a");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      // A headless (canvas-less) client connects LAST — it must not steal routing.
+      const phone = await connectPanel();
+      phone.send(
+        JSON.stringify({ type: "hello", tab_id: "mobile-1", title: "phone", headless: true }),
+      );
+      autoReply(phone, "phone");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+
+      const r = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
+      expect(r).toMatchObject({ from: "tab-a" });
+
+      a.close();
+      phone.close();
+    });
+
+    it("scope-addressed frames buffered while NO tab is connected replay to the first hello", async () => {
+      // Nobody connected: a background agent's turn output is buffered under the scope…
+      expect(bridge.push({ type: "say", text: "finished while you were away" }, SHARED_SESSION_SCOPE)).toBe(0);
+      // …and a scope-addressed command refuses with the authoritative dispatched:false.
+      const err = await bridge
+        .send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE, timeoutMs: 300 })
+        .catch((e) => e as Error);
+      expect(err).toBeInstanceOf(Error);
+      expect(dispatchOutcomeOf(err)).toBe(false);
+      expect((err as Error).message).toMatch(/no connected tab/);
+
+      // The first tab to hello picks the buffered conversation up.
+      const sock = await connectPanel();
+      const got: Array<Record<string, unknown>> = [];
+      sock.on("message", (buf) => got.push(JSON.parse(buf.toString())));
+      sock.send(JSON.stringify({ type: "hello", tab_id: "wf:back.json", title: "back" }));
+      await vi.waitFor(() => {
+        expect(got.some((f) => f.type === "say" && f.text === "finished while you were away")).toBe(
+          true,
+        );
+      });
       sock.close();
     });
   });

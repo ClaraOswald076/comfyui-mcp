@@ -1,39 +1,44 @@
-import { readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { logger } from "../utils/logger.js";
+import { SHARED_SESSION_SCOPE } from "../services/session-scope.js";
 
 /**
- * Durable per-tab SDK session ids, so an agent's memory survives the orchestrator
- * PROCESS dying — a wedge auto-restart, a crash, an OOM — not just a soft reload.
+ * Durable SDK session ids, so an agent's memory survives the orchestrator
+ * PROCESS dying — a wedge auto-restart, a crash, an OOM — not just a soft
+ * reload.
  *
- * The panel also persists the session id (onSession → a `session` frame → the
- * panel's localStorage), and resumes by re-sending it on reconnect. But that path
- * is the PANEL's: if the orchestrator is killed and a fresh one comes up before the
- * panel re-sends `hello.resume` — or the panel never sends it — the conversation is
- * silently lost (P0: the agent "forgets everything" after an auto-restart). This is
- * the orchestrator's own belt-and-suspenders copy: written when the agent reports
- * its session id, read as the resume fallback when a tab first spawns. Keyed by the
- * bridge port so two ComfyUI instances on one machine never cross-resume.
+ * SESSIONS ARE ORCHESTRATOR-SCOPED (#884, owner-stated invariant): one agent
+ * session spans every panel, browser tab and open workflow this orchestrator
+ * serves. The store is therefore keyed by the composite shared agent key
+ * (`orchestrator::<backend>` — see src/services/session-scope.ts), one entry
+ * per provider, and persisted in the user's config dir
+ * (~/.comfyui-mcp/sessions/panel-sessions-<port>.json) — on disk, owned by the
+ * orchestrator, never the browser. The panel's own localStorage copy is only a
+ * last-resort hint for a wiped store. Keyed by the bridge port so two ComfyUI
+ * instances on one machine never cross-resume.
  *
- * TWO indexes (#570):
- *  - `sessions` — keyed by the exact (composite `tabId::backend`) key. Authoritative
- *    when the tab id is STABLE across a reload (a SAVED workflow: `wf:<path>`).
- *  - `stable` — keyed by a caller-supplied identity that survives a panel reload
- *    even for an UNSAVED workflow, whose tab id is an ephemeral `tmp:<uuid>` that is
- *    REGENERATED every reload. See {@link deriveStableKey}: keyed on the panel's
- *    durable per-instance workflow uuid (globally unique — no cross-workflow
- *    collision); absent a valid uuid the index is skipped entirely (fail closed —
- *    never the collision-prone origin+title key). Without this, an orchestrator
- *    restart that also
- *    reloads the panel brings the tab back under a never-stored `tmp:` id → store
- *    miss → fresh session → conversation gone. The stable index is the resume
- *    FALLBACK: `sessions` (exact tab id) always wins when present, so this never
- *    weakens the precise path — it only rescues the ephemeral one.
+ * MIGRATIONS this constructor performs, once, on first load:
+ *  - LOCATION: earlier builds wrote the file into the OS temp dir
+ *    (world-writable on some systems, and routinely wiped). If the new file is
+ *    absent and the tmpdir file exists, its `sessions` map is imported so an
+ *    upgrade loses no history. The old file is left in place (an older
+ *    orchestrator build may still be running against it); the OS reclaims it.
+ *  - KEYING: earlier builds kept one session per (workflow tab, backend) —
+ *    `wf:<path>::claude`, `tmp:<uuid>::codex`, … When the shared key for a
+ *    backend has no entry yet, {@link get} adopts the MOST RECENTLY USED legacy
+ *    entry for that backend as the shared conversation, so the user's newest
+ *    per-workflow conversation becomes the one shared session instead of
+ *    starting everyone from zero. Older legacy entries stay resumable via the
+ *    panel's history picker (resume_session) and age out via GC.
+ *  - The legacy `stable` index (per-workflow resume fallback for unsaved
+ *    workflows, including its poison mechanism) is obsolete under a shared key
+ *    that never churns — it is dropped on load, never read, never written.
  *
- * Both indexes carry a write timestamp and are GC'd on load (entries older than
- * {@link SessionStore.GC_TTL_MS} are dropped), so the file can't grow unbounded with
- * dead `tmp:`/`e2e-*`/`spike-*` keys from prior runs.
+ * Entries carry a write timestamp and are GC'd on load (older than
+ * {@link SessionStore.GC_TTL_MS}), so the file can't grow unbounded with dead
+ * keys from prior runs.
  */
 
 interface Entry {
@@ -41,81 +46,26 @@ interface Entry {
   s: string;
   /** Epoch ms of the last write — for GC. */
   t: number;
-  /** STABLE index only: the panel tab (owner) that last wrote this key. Used to
-   *  distinguish "the SAME tab's session evolved (rewind/fork)" from "a DIFFERENT
-   *  same-title tab contends for this non-unique key". */
-  o?: string;
-  /** STABLE index only: POISONED — two different tabs wrote two different sessions
-   *  under this (title-collision) key, so it can no longer be trusted to resume
-   *  either. getStable refuses it; only clearStable (a NEW chat) revives the key. */
-  p?: boolean;
-  /** EXACT index only: the trusted workflow-identity uuid this session belongs to, so a
-   *  SAVED tab whose file is OVERWRITTEN in place (same `wf:<path>` tab id, new uuid) can
-   *  be detected — the tab-id-keyed exact record would otherwise resume the PRIOR
-   *  workflow's chat. Durable, so the check survives an orchestrator restart (#570 P0). */
+  /** Optional workflow-identity binding retained from the per-workflow era.
+   *  Unused for shared-scope keys (a shared session legitimately spans
+   *  workflows); preserved on legacy entries so nothing is rewritten. */
   u?: string;
 }
 
 interface StoreFileV2 {
   v: 2;
   sessions: Record<string, Entry>;
-  stable: Record<string, Entry>;
 }
 
-/**
- * Derive the STABLE resume key for an UNSAVED-workflow tab (#570).
- *
- * #587 keyed this on `origin + title + backend` — the only identity thought to
- * survive the tmp:<uuid> tab-id churn. But an unsaved workflow's title is the
- * DEFAULT "Unsaved Workflow" (ComfyUI even re-derives the "(N)" suffix as tabs
- * open/close), which is NOT unique: two DIFFERENT unsaved workflows collide on one
- * key. #587 documented the resulting sequential-collision as an accepted limitation
- * and pointed at a future per-instance id. That limitation is the #570 REOPEN: after
- * a workflow reset the stable index served an UNRELATED earlier on-disk session for a
- * turn (the wrong conversation), because a stale same-title sibling shared the key
- * (the concurrent-collision poison guard can't catch a sequential/cross-restart one).
- *
- * The panel now advertises its durable, globally-unique per-instance workflow id
- * (#186/#386 — minted with crypto.randomUUID, embedded in the graph's `extra` and so
- * carried across a browser reload by ComfyUI's unsaved-workflow persistence; it is the
- * very id that keys the durable chat transcript, which DID restore correctly in the
- * report; and it is FORKED to a fresh uuid whenever a graph is cloned/imported, so
- * two distinct instances never share it). Key on THAT: two distinct unsaved workflows
- * can never share a uuid, so the cross-resume is structurally impossible, and the id
- * survives the reload that regenerates the tmp: tab id. Backend partitions the key
- * (per-provider sessions); the ComfyUI ORIGIN is folded in too so a uuid replayed from
- * copied graph metadata onto a DIFFERENT instance can't bridge them. The identifier is
- * validated against the crypto.randomUUID() shape before it is trusted.
- *
- * FAIL CLOSED (#570 reopen): when no VALID uuid is supplied — an older/pre-capability
- * panel, or a malformed value — we return `undefined` and do NOT fall back to the
- * origin+title key. That legacy key is the collision mechanism the reopen is about;
- * reusing it would silently keep the wrong-resume alive for un-upgraded panels. Without
- * a unique identity the orchestrator simply forgoes the disk fallback: the panel's own
- * hello.resume still covers the common reload, and a miss starts fresh — a lost resume,
- * never a wrong one.
- *
- * LEGACY RECORDS: a store written by #587 may hold old `tmp::<origin>::<title>::<backend>`
- * stable entries. The new scheme NEVER produces or reads that key shape, so those records
- * are inert and age out via GC. We deliberately do NOT migrate them onto a uuid identity:
- * the legacy key is non-unique, so mapping it to a uuid would let a brand-new same-title
- * workflow inherit an unrelated abandoned session — reintroducing the exact wrong-resume
- * this fix removes. The upgrade cost is a lost (not wrong) resume for a pre-upgrade unsaved
- * session whose panel also fails to send hello.resume — an accepted, bounded trade-off.
- *
- * The poison guard (see {@link SessionStore.setStable}) is unchanged and still matters:
- * the SAME workflow opened in two live browser tabs shares one uuid, and two live tabs
- * writing distinct sessions to it still poison the key rather than cross-resume.
- */
 const WORKFLOW_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** The validated + canonicalized (origin, uuid) behind a stable key, or undefined when
- *  either is missing/untrusted (fail closed). The origin MUST be the caller's
- *  SERVER-OBSERVED (unspoofable) handshake origin — never the client-supplied
- *  hello.comfyui_url — so a spoofed origin can't let a copied uuid derive another
- *  instance's key. Shared by {@link deriveStableKey} (resume key) and
- *  {@link deriveWorkflowIdentity} (the backend-independent identity used to tell a
- *  same-socket tab-id MIGRATION of one workflow from a SWITCH to a different one). */
+/** The validated + canonicalized (origin, uuid) identity a panel hello/command
+ *  claims, or undefined when either half is missing/untrusted. The origin MUST
+ *  be the caller's SERVER-OBSERVED (unspoofable) handshake origin — never the
+ *  client-supplied hello.comfyui_url. Still used for the per-command workflow
+ *  STAMP (routing job: a command dispatched for workflow A must not mutate
+ *  workflow B after a switch) — deliberately NOT for session identity, which is
+ *  orchestrator-scoped (#884). */
 export function workflowIdentityParts(opts: {
   workflowUuid?: string | undefined;
   origin?: string | undefined;
@@ -129,160 +79,36 @@ export function workflowIdentityParts(opts: {
   return { origin, uuid };
 }
 
-export function deriveStableKey(opts: {
-  workflowUuid?: string | undefined;
-  origin?: string | undefined;
-  backend: string;
-}): string | undefined {
-  const p = workflowIdentityParts(opts);
-  if (!p) return undefined; // fail closed: no durable identity / no trusted origin
-  return `wfid::${p.origin}::${p.uuid}::${opts.backend}`;
-}
-
-/** Backend-INDEPENDENT workflow identity (origin+uuid), for distinguishing a
- *  same-socket tab-id migration (same identity) from a workflow switch (different
- *  identity). undefined when the identity can't be trusted (fail closed → treated as
- *  "no proof of continuity", so a rebind is refused rather than risked). */
-export function deriveWorkflowIdentity(opts: {
-  workflowUuid?: string | undefined;
-  origin?: string | undefined;
-}): string | undefined {
-  const p = workflowIdentityParts(opts);
-  return p ? `${p.origin}::${p.uuid}` : undefined;
-}
-
-/** #436 — on a PROVEN same-workflow tab-id migration (the hello handler has already
- *  established prior uuid === new uuid), KEEP the per-tab command stamp resolvable
- *  under the PRE-migration id, not only under the canonical new one. A session can
- *  stay bound to the old id across the migration — a Codex HTTP MCP session's URL
- *  names the spawn-time tab id and is never re-pointed (no rebindTab hook on that
- *  transport) — and UiBridge.send resolves the trusted workflow-uuid stamp by the
- *  CALLER's tab id. Deleting the old entry made every mutating command fail "no
- *  trusted identity" while reads kept routing through the bridge's migration alias
- *  (the #436 flap: panel_graph_outline succeeds, the next panel_add_node /
- *  panel_set_widget is refused, and panel_set_workflow_target({mode:"current"})
- *  reports success without repairing anything because canReach is true through the
- *  alias). Only a manual browser refresh re-registered the tab under an id the
- *  session could be rebound to.
- *
- *  Carrying is safe: the value is the SAME uuid by the proven-migration
- *  precondition, so commands addressed to the old id stamp exactly what the panel
- *  fences on; a later in-place replacement of the workflow keeps failing closed
- *  (the panel refuses the stale uuid); and any hello registered under the old id
- *  overwrites or clears the entry (fail closed). */
-export function carryWorkflowCommandStamp(
-  stamps: Map<string, string>,
-  migratedFrom: string,
-  identity: { uuid: string },
-): void {
-  stamps.set(migratedFrom, identity.uuid);
-}
-
-/** #570 — does the DESTINATION of a tab-id migration already hold state for a backend, so the
- *  incoming tab would inherit/leak it? Covers EVERY kind of per-backend state that must be reset
- *  before the source is rebound in: manager live/pending/held (`hasManagerState`), a dormant
- *  durable session (`hasDurableSession`), a RENDER-HELD queue (`renderHeldCount` — the
- *  orchestrator-level heldDuringGen, which manager.reset does NOT clear and which the source-held
- *  re-key would otherwise APPEND to, flushing the superseded tab's queued message into the incoming
- *  tab on render completion), OR a JOURNALED RUN COMPLETION (`journaledCompletionCount`, #468 — a
- *  tab whose agent and session were already cleared (New chat) can still hold an undelivered
- *  completion; without this it reads as UNOCCUPIED, the incoming source is rebound onto its id, and
- *  the next flush delivers the DESTINATION tab's render into the SOURCE tab's conversation. A tab
- *  holding a journal entry is not empty). Any of these ⇒ collision ⇒ reset + clear the
- *  destination's held state. */
-export function destinationHasCollisionState(opts: {
-  hasManagerState: boolean;
-  hasDurableSession: boolean;
-  renderHeldCount: number;
-  journaledCompletionCount?: number;
-}): boolean {
-  return (
-    opts.hasManagerState ||
-    opts.hasDurableSession ||
-    opts.renderHeldCount > 0 ||
-    (opts.journaledCompletionCount ?? 0) > 0
-  );
-}
-
-/** #570 — does a connected SIBLING tab own the session behind a candidate stable key? A stable key
- *  encodes (workflow identity, backend), so a sibling owns it when its identity derives to the SAME
- *  key for that backend AND it still RETAINS a session there. Ownership is a SET over every backend
- *  the sibling has ever used, NOT its current provider: a provider switch RETIRES (preserves) the
- *  old provider's session, so `siblingRetainsSession` (derived from the durable store OR live/held
- *  state on that backend key) — not the sibling's current-backend mapping — is what proves
- *  ownership. When true, a second honest tab must NOT arm/resume that key's session. */
-export function siblingOwnsStableKey(opts: {
-  siblingIdentity?: { origin: string; uuid: string } | undefined;
-  candidateKey: string;
-  candidateBackend: string;
-  siblingRetainsSession: boolean;
-}): boolean {
-  if (!opts.siblingIdentity || !opts.siblingRetainsSession) return false;
-  const k = deriveStableKey({
-    workflowUuid: opts.siblingIdentity.uuid,
-    origin: opts.siblingIdentity.origin,
-    backend: opts.candidateBackend,
-  });
-  return k !== undefined && k === opts.candidateKey;
-}
-
-/** #570 — may a panel-scoped `hello.resume` be ARMED? The EXACT tab-id session is unique to this
- *  tab, so a hint matching it (`exactOwned`) is always this tab's own — arm it. The STABLE-key
- *  session is SHARED by every tab of the same workflow identity (the same workflow open in two
- *  live tabs), so a hint matching it (`stableOwned`) may arm ONLY when no OTHER connected tab holds
- *  that stable key (`otherTabHoldsStableKey` false) — otherwise a concurrent sibling would attach
- *  to and contend for the first tab's live conversation (a cross-tab leak). Fail closed: an
- *  ambiguous stable-key hint is dropped (a fresh sibling is a mild miss; joining the live
- *  conversation is not). */
-export function armableResume(opts: {
-  exactOwned: boolean;
-  stableOwned: boolean;
-  otherTabHoldsStableKey: boolean;
-}): boolean {
-  if (opts.exactOwned) return true;
-  return opts.stableOwned && !opts.otherTabHoldsStableKey;
-}
-
-/** #570 — per-backend teardown decision at the identity boundary. When a hello is NOT proven
- *  for the SELECTED backend, each provider's state must be judged on its OWN merits rather than
- *  globally reset off the selected backend: a DORMANT provider's session is KEPT (resumable)
- *  only when the identity it belongs to PROVABLY matches this hello's workflow identity — its
- *  DURABLE stored identity (Entry.u), or, for the CURRENT hello's backend only, the tab's
- *  PRIOR-hello identity (covering the spawn→first-session live-agent window that has no durable
- *  record yet). This is what makes an orchestrator restart + provider switch preserve the other
- *  provider's SAME-workflow conversation instead of erasing it irreversibly. Returns true = KEEP,
- *  false = reset. Fails closed: any absent/mismatched identity resets. */
-export function keepsBackendState(opts: {
-  storedIdentity?: string | undefined;
-  priorIdentity?: string | undefined;
-  isCurrentBackend: boolean;
-  helloIdentity?: string | undefined;
-}): boolean {
-  const bIdentity = opts.storedIdentity ?? (opts.isCurrentBackend ? opts.priorIdentity : undefined);
-  return (
-    bIdentity !== undefined && opts.helloIdentity !== undefined && bIdentity === opts.helloIdentity
-  );
-}
+/** Legacy-adoption screen: tab-id halves that must never seed the shared
+ *  conversation (test/spike keys from prior runs). */
+const LEGACY_ADOPT_EXCLUDE = /^(e2e-|spike-)/;
 
 export class SessionStore {
   /** Entries untouched for longer than this are pruned on load. Resumes are
-   *  same-day / few-days in practice; three weeks is a generous ceiling that still
-   *  bounds growth (stale test + reloaded-`tmp:` keys never accumulate forever). */
+   *  same-day / few-days in practice; three weeks is a generous ceiling that
+   *  still bounds growth. */
   static readonly GC_TTL_MS = 21 * 24 * 60 * 60 * 1000;
 
   private readonly path: string;
+  /** The pre-#884 tmpdir location — read once for the location migration. */
+  private readonly legacyPath: string;
   private sessions: Record<string, Entry>;
-  private stable: Record<string, Entry>;
 
-  constructor(port: number) {
-    this.path = join(tmpdir(), `comfyui-mcp-panel-sessions-${port}.json`);
+  constructor(port: number, opts: { dir?: string } = {}) {
+    const dir = opts.dir ?? join(homedir(), ".comfyui-mcp", "sessions");
+    this.path = join(dir, `panel-sessions-${port}.json`);
+    this.legacyPath = join(tmpdir(), `comfyui-mcp-panel-sessions-${port}.json`);
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch (err) {
+      logger.warn(`[session-store] could not create ${dir}: ${String(err)}`);
+    }
     const loaded = this.read();
     this.sessions = loaded.sessions;
-    this.stable = loaded.stable;
-    // If load had to SANITIZE the file (migrate the legacy format, GC an expired
-    // entry, clamp a corrupt future timestamp), persist the cleaned version NOW.
-    // Otherwise a clamped-in-memory-only future timestamp survives on disk and is
-    // re-clamped to "now" on every load — immortal, never aging out (#570 P3).
+    // If load had to SANITIZE (migrate the legacy format/location, GC an expired
+    // entry, clamp a corrupt future timestamp), persist the cleaned version NOW —
+    // otherwise a clamped-in-memory-only value survives on disk and is re-clamped
+    // on every load, immortal.
     if (loaded.dirty) this.flush();
   }
 
@@ -290,89 +116,101 @@ export class SessionStore {
     return Date.now();
   }
 
-  private read(): { sessions: Record<string, Entry>; stable: Record<string, Entry>; dirty: boolean } {
-    const empty = { sessions: {}, stable: {}, dirty: false };
-    try {
-      const parsed: unknown = JSON.parse(readFileSync(this.path, "utf8"));
-      if (!parsed || typeof parsed !== "object") return empty;
-      const obj = parsed as Record<string, unknown>;
-      const cutoff = this.now() - SessionStore.GC_TTL_MS;
-      // `dirty` = the on-disk bytes no longer match what we hold, so the constructor
-      // must re-flush (drop GC'd/malformed rows, persist a clamped timestamp, migrate).
-      let dirty = false;
-      // Coerce an untrusted map into {key -> Entry}, dropping malformed/expired rows.
-      const coerce = (raw: unknown): Record<string, Entry> => {
-        const out: Record<string, Entry> = {};
-        if (raw === undefined) return out; // absent field — canonicalized on next write
-        if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
-          dirty = true; // malformed container → rewrite as a canonical {} on load
-          return out;
-        }
-        const nowMs = this.now();
-        for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
-          if (!v || typeof v !== "object") {
-            dirty = true;
-            continue;
-          }
-          const e = v as { s?: unknown; t?: unknown; o?: unknown; p?: unknown; u?: unknown };
-          if (typeof e.s !== "string") {
-            dirty = true;
-            continue;
-          }
-          // Sanitize the timestamp. A corrupt `1e999` parses as Infinity and would
-          // slip past `t < cutoff` forever (never GC'd, never refreshed); a finite
-          // FUTURE value (e.g. 1e100) likewise never ages out and makes touch() a
-          // no-op. Non-finite → epoch 0 (pruned as too old); future → clamped to now
-          // so the TTL is measured from load like any other entry.
-          const rawT = typeof e.t === "number" && Number.isFinite(e.t) ? e.t : 0;
-          let t = rawT;
-          if (t > nowMs) t = nowMs;
-          if (t !== rawT) dirty = true; // clamp/coerce must be persisted (P3)
-          if (t < cutoff) {
-            dirty = true; // GC drop must be persisted
-            continue;
-          }
-          const entry: Entry = { s: e.s, t };
-          if (typeof e.o === "string") entry.o = e.o;
-          if (e.p === true) entry.p = true;
-          if (typeof e.u === "string") entry.u = e.u;
-          out[k] = entry;
-        }
+  /** Parse one store file's bytes into a sessions map, dropping malformed and
+   *  expired rows. Handles the v2 shape and the ancient flat v1 map. */
+  private parse(text: string): { sessions: Record<string, Entry>; dirty: boolean } {
+    const empty = { sessions: {}, dirty: false };
+    const parsed: unknown = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object") return empty;
+    const obj = parsed as Record<string, unknown>;
+    const cutoff = this.now() - SessionStore.GC_TTL_MS;
+    let dirty = false;
+    const coerce = (raw: unknown): Record<string, Entry> => {
+      const out: Record<string, Entry> = {};
+      if (raw === undefined) return out;
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+        dirty = true;
         return out;
-      };
-      if (obj.v === 2) {
-        const sessions = coerce(obj.sessions);
-        const stable = coerce(obj.stable);
-        return { sessions, stable, dirty };
       }
-      // LEGACY flat format (Record<string,string>) — migrate. Stamp `now` so the
-      // migration itself never trips GC (a live install's keys stay resumable).
-      const sessions: Record<string, Entry> = {};
-      for (const [k, v] of Object.entries(obj)) {
-        if (typeof v === "string") sessions[k] = { s: v, t: this.now() };
+      const nowMs = this.now();
+      for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+        if (!v || typeof v !== "object") {
+          dirty = true;
+          continue;
+        }
+        const e = v as { s?: unknown; t?: unknown; u?: unknown };
+        if (typeof e.s !== "string") {
+          dirty = true;
+          continue;
+        }
+        // Sanitize the timestamp: non-finite → epoch 0 (pruned as too old);
+        // a finite FUTURE value is clamped to now so the TTL applies to it.
+        const rawT = typeof e.t === "number" && Number.isFinite(e.t) ? e.t : 0;
+        let t = rawT;
+        if (t > nowMs) t = nowMs;
+        if (t !== rawT) dirty = true;
+        if (t < cutoff) {
+          dirty = true;
+          continue;
+        }
+        const entry: Entry = { s: e.s, t };
+        if (typeof e.u === "string") entry.u = e.u;
+        out[k] = entry;
       }
-      return { sessions, stable: {}, dirty: true }; // format upgrade → re-flush as v2
-    } catch {
-      // Missing or corrupt — start empty. Resume falls back to a fresh session.
+      return out;
+    };
+    if (obj.v === 2) {
+      const sessions = coerce(obj.sessions);
+      // A pre-#884 v2 file also carried a `stable` index — obsolete under the
+      // shared key (see the class docstring). Dropping it must be persisted.
+      if (obj.stable !== undefined) dirty = true;
+      return { sessions, dirty };
     }
-    return empty;
+    // ANCIENT flat format (Record<string,string>) — migrate. Stamp `now` so the
+    // migration itself never trips GC.
+    const sessions: Record<string, Entry> = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof v === "string") sessions[k] = { s: v, t: this.now() };
+    }
+    return { sessions, dirty: true };
+  }
+
+  private read(): { sessions: Record<string, Entry>; dirty: boolean } {
+    try {
+      return this.parse(readFileSync(this.path, "utf8"));
+    } catch {
+      // Missing or corrupt at the NEW location — try the pre-#884 tmpdir file so
+      // an upgrade carries existing conversations over (location migration).
+    }
+    try {
+      if (existsSync(this.legacyPath)) {
+        const migrated = this.parse(readFileSync(this.legacyPath, "utf8"));
+        if (Object.keys(migrated.sessions).length) {
+          logger.info(
+            `[session-store] migrated ${Object.keys(migrated.sessions).length} session(s) from ${this.legacyPath} to ${this.path}`,
+          );
+        }
+        return { sessions: migrated.sessions, dirty: true }; // persist at the new location
+      }
+    } catch {
+      // Legacy unreadable/corrupt — start empty; resume falls back to fresh.
+    }
+    return { sessions: {}, dirty: false };
   }
 
   private flush(): void {
     try {
-      const payload: StoreFileV2 = { v: 2, sessions: this.sessions, stable: this.stable };
+      const payload: StoreFileV2 = { v: 2, sessions: this.sessions };
       writeFileSync(this.path, JSON.stringify(payload));
     } catch (err) {
       logger.debug(`[session-store] write failed: ${String(err)}`);
     }
   }
 
-  /** Touch an entry's timestamp on a resume hit so an actively-used session never
-   *  ages out of the store. GC only ever reclaims a key that hasn't been RESUMED
-   *  (spawned) within the TTL — i.e. a genuinely idle tab. Debounced (1h) so the
-   *  per-spawn read doesn't churn the disk. */
-  private touch(map: Record<string, Entry>, key: string): void {
-    const e = map[key];
+  /** Touch an entry's timestamp on a resume hit so an actively-used session
+   *  never ages out. Debounced (1h) so the per-spawn read doesn't churn disk. */
+  private touch(key: string): void {
+    const e = this.sessions[key];
     if (!e) return;
     const now = this.now();
     if (now - e.t < 60 * 60 * 1000) return;
@@ -380,94 +218,91 @@ export class SessionStore {
     this.flush();
   }
 
-  /** The persisted session id to resume for a tab, if any. */
-  get(tabId: string): string | undefined {
-    const s = this.sessions[tabId]?.s;
-    if (s !== undefined) this.touch(this.sessions, tabId);
-    return s;
+  /**
+   * KEYING migration (#884): the shared key for a backend has no entry yet, but
+   * per-workflow entries from the pre-#884 era may. Adopt the most recently
+   * used one for this backend as the shared conversation, persisting it under
+   * the shared key, so upgrading users keep their newest conversation's memory.
+   *
+   * Adoption CONSUMES every legacy entry for the backend (they are deleted).
+   * This is what makes it one-shot: after a deliberate New chat clears the
+   * shared key, a later get() finds no legacy entry to re-adopt — otherwise the
+   * cleared conversation would silently resurrect. The archived conversations
+   * themselves are untouched (the panel's history picker resumes them by
+   * explicit session id via resume_session, never through these keys).
+   */
+  private adoptLegacyForSharedKey(sharedKey: string): Entry | undefined {
+    const sep = sharedKey.indexOf("::");
+    if (sep < 0) return undefined;
+    const backend = sharedKey.slice(sep + 2);
+    if (!backend) return undefined;
+    const suffix = `::${backend}`;
+    let bestKey: string | undefined;
+    let best: Entry | undefined;
+    const legacyKeys: string[] = [];
+    for (const [k, e] of Object.entries(this.sessions)) {
+      if (!k.endsWith(suffix)) continue;
+      const tabHalf = k.slice(0, k.length - suffix.length);
+      if (tabHalf === SHARED_SESSION_SCOPE || tabHalf.includes("::")) continue;
+      if (LEGACY_ADOPT_EXCLUDE.test(tabHalf)) continue;
+      legacyKeys.push(k);
+      if (!best || e.t > best.t) {
+        best = e;
+        bestKey = k;
+      }
+    }
+    if (!best || !bestKey) return undefined;
+    const adopted: Entry = { s: best.s, t: this.now() };
+    for (const k of legacyKeys) delete this.sessions[k]; // consumed — see docstring
+    this.sessions[sharedKey] = adopted;
+    this.flush();
+    logger.info(
+      `[session-store] adopted legacy per-workflow session ${bestKey.slice(0, 24)}… as the shared ${backend} conversation (${legacyKeys.length} legacy ${backend} entr${legacyKeys.length === 1 ? "y" : "ies"} consumed, #884)`,
+    );
+    return adopted;
   }
 
-  /** The trusted workflow-identity uuid the exact session under this key belongs to
-   *  (#570 P0), or undefined. Lets the hello handler detect a SAVED workflow overwritten
-   *  in place (same tab id, new uuid) and clear the stale session. */
-  identityOf(tabId: string): string | undefined {
-    return this.sessions[tabId]?.u;
+  /** The persisted session id to resume for a key, if any. For a shared-scope
+   *  key with no entry, falls back to adopting the newest legacy per-workflow
+   *  entry for that backend (see the class docstring). */
+  get(key: string): string | undefined {
+    let e: Entry | undefined = this.sessions[key];
+    if (!e && key.startsWith(`${SHARED_SESSION_SCOPE}::`)) {
+      e = this.adoptLegacyForSharedKey(key);
+    }
+    if (!e) return undefined;
+    this.touch(key);
+    return e.s;
   }
 
-  /** Record (and persist) a tab's current session id, bound to its trusted workflow
-   *  identity uuid (when known). No-op if BOTH the id and the identity are unchanged. */
-  set(tabId: string, sessionId: string, identityUuid?: string): void {
+  /** The workflow-identity binding a legacy entry carries, if any. Retained for
+   *  the manager's rebind plumbing; shared-scope entries never carry one. */
+  identityOf(key: string): string | undefined {
+    return this.sessions[key]?.u;
+  }
+
+  /** Record (and persist) a key's current session id. `identityUuid` is the
+   *  legacy per-workflow binding — accepted for API compatibility, unused for
+   *  shared-scope keys. No-op if both the id and binding are unchanged. */
+  set(key: string, sessionId: string, identityUuid?: string): void {
     const u = typeof identityUuid === "string" && identityUuid ? identityUuid : undefined;
-    const existing = this.sessions[tabId];
+    const existing = this.sessions[key];
     if (existing?.s === sessionId && existing.u === u) {
-      // Same id AND identity — refresh the timestamp so an actively-used session never
-      // GCs out, but skip the disk write when the timestamp is already recent.
+      // Same id — refresh the timestamp so an active session never GCs out, but
+      // skip the disk write when the timestamp is already recent.
       if (this.now() - existing.t < 60 * 60 * 1000) return;
     }
     const entry: Entry = { s: sessionId, t: this.now() };
     if (u) entry.u = u;
-    this.sessions[tabId] = entry;
+    this.sessions[key] = entry;
     this.flush();
   }
 
-  /** Forget a tab's session — called when the panel starts a NEW chat, so the
-   *  disk fallback never resurrects a deliberately-reset conversation. */
-  clear(tabId: string): void {
-    if (!(tabId in this.sessions)) return;
-    delete this.sessions[tabId];
-    this.flush();
-  }
-
-  /** The resume session id for a STABLE identity (survives a panel reload for an
-   *  unsaved workflow), if any. A POISONED key (two tabs contended — see setStable)
-   *  returns undefined, so a collision degrades to a fresh session, never a resume of
-   *  the WRONG conversation. See the class docstring. */
-  getStable(stableKey: string): string | undefined {
-    const e = this.stable[stableKey];
-    if (!e || e.p) return undefined;
-    this.touch(this.stable, stableKey);
-    return e.s;
-  }
-
-  /** Record (and persist) the session id under a STABLE identity, so a reloaded
-   *  unsaved-workflow tab (new `tmp:` id) can still resume it. `owner` is the panel
-   *  tab writing it — the collision discriminator.
-   *
-   *  The stable key (origin+title+backend) is NOT unique: two unsaved tabs with the
-   *  same default title collide. If a DIFFERENT owner writes a DIFFERENT session
-   *  under an existing key, that key is POISONED — neither tab may resume it, so a
-   *  fresh sibling can never inherit the other's conversation. The SAME owner writing
-   *  a new session (a rewind/fork) is NOT a collision; a reloaded tab writing the
-   *  SAME (resumed) session under a new owner just refreshes it. */
-  setStable(stableKey: string, sessionId: string, owner?: string): void {
-    const existing = this.stable[stableKey];
-    if (existing?.p) return; // already poisoned — stays refused until clearStable
-    if (
-      existing &&
-      existing.s !== sessionId &&
-      existing.o !== undefined &&
-      owner !== undefined &&
-      existing.o !== owner
-    ) {
-      // Two different tabs, two different sessions, one non-unique key → poison it.
-      this.stable[stableKey] = { s: "", t: this.now(), p: true };
-      this.flush();
-      return;
-    }
-    if (existing && existing.s === sessionId && existing.o === owner) {
-      // Unchanged — refresh the timestamp (debounced) so an active session doesn't GC.
-      if (this.now() - existing.t < 60 * 60 * 1000) return;
-    }
-    const entry: Entry = { s: sessionId, t: this.now() };
-    if (owner !== undefined) entry.o = owner;
-    this.stable[stableKey] = entry;
-    this.flush();
-  }
-
-  /** Forget a stable identity's session (a deliberate NEW chat on that tab). */
-  clearStable(stableKey: string): void {
-    if (!(stableKey in this.stable)) return;
-    delete this.stable[stableKey];
+  /** Forget a key's session — called on a deliberate NEW chat, so the disk
+   *  fallback never resurrects a conversation the user reset. */
+  clear(key: string): void {
+    if (!(key in this.sessions)) return;
+    delete this.sessions[key];
     this.flush();
   }
 }

@@ -24,6 +24,7 @@ import {
 } from "./panel-recovery.js";
 import { primePanelBase, verifiedPanelDiskVersion } from "./panel-workspace.js";
 import { compareSemver, detectInstallMode } from "./self-update.js";
+import { SHARED_SESSION_SCOPE, isSharedScopeId } from "./session-scope.js";
 
 export const DEFAULT_BRIDGE_PORT = 9101;
 
@@ -1978,6 +1979,25 @@ export class UiBridge {
         }
         // Deliver anything that finished while this tab was away.
         this.flushMailbox(tabId);
+        // #884 — conversation frames/deliveries produced while ZERO tabs were
+        // connected are buffered under the SHARED SESSION SCOPE (the session is
+        // orchestrator-scoped, not tab-scoped). The first tab to hello picks them
+        // up: one shared conversation — whoever shows up sees it.
+        const sharedMissed = this.missedFrames.get(SHARED_SESSION_SCOPE);
+        if (sharedMissed?.length) {
+          this.missedFrames.delete(SHARED_SESSION_SCOPE);
+          for (const f of sharedMissed) {
+            try {
+              sock.send(JSON.stringify(f));
+            } catch {
+              break; // socket died mid-flush — frames stay lost, next turn recovers
+            }
+          }
+          logger.debug(
+            `[ui-bridge] replayed ${sharedMissed.length} shared-session frame(s) to tab ${tabId.slice(0, 8)}`,
+          );
+        }
+        this.flushMailbox(SHARED_SESSION_SCOPE, this.conns.get(tabId));
         // Resume any idempotent reads that were dropped mid-command by this tab's
         // previous socket (bounded reconnect grace) onto the fresh connection.
         this.resumeAwaitingReconnect(tabId);
@@ -2328,6 +2348,17 @@ export class UiBridge {
       const conn = this.resolveTarget(tabId);
       if (conn.sock.readyState !== WebSocket.OPEN || !conn.tabSessionId) return undefined;
       return { generation: conn.helloGeneration, tabSessionId: conn.tabSessionId };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** #884 — the real tab id the SHARED SESSION SCOPE currently resolves to (the
+   *  active tab: last user activity, else most recent interactive connect), or
+   *  undefined when no tab is connected. Never throws. */
+  resolveSharedTabId(): string | undefined {
+    try {
+      return this.resolveTarget(SHARED_SESSION_SCOPE).tabId;
     } catch {
       return undefined;
     }
@@ -2731,6 +2762,34 @@ export class UiBridge {
 
   /** Resolve which tab a command should go to. */
   private resolveTarget(tabId?: string): Conn {
+    // #884 — the SHARED SESSION SCOPE is not a tab: an agent session spans every
+    // tab/workflow, so a command addressed to the scope resolves to the ACTIVE
+    // tab at dispatch time (job (b): routing target, decoupled from session
+    // identity). Resolution order: the tab the user last talked from, else the
+    // most recently connected interactive (canvas-owning) tab, else the most
+    // recent headless one — deterministic whenever ANY tab is connected.
+    if (isSharedScopeId(tabId)) {
+      if (this.lastActiveTabId) {
+        const active = this.conns.get(this.lastActiveTabId);
+        if (active) return active;
+      }
+      let interactive: Conn | undefined;
+      let headless: Conn | undefined;
+      for (const c of this.conns.values()) {
+        if (c.headless) {
+          if (!headless || c.helloGeneration > headless.helloGeneration) headless = c;
+        } else if (!interactive || c.helloGeneration > interactive.helloGeneration) {
+          interactive = c;
+        }
+      }
+      const best = interactive ?? headless;
+      if (best) return best;
+      // Keep the machine-readable "no connected tab … Connected: none" phrase —
+      // the panel-tools transient classifier keys on it.
+      throw new Error(
+        `no connected tab with id "${tabId}". Connected: none — ${this.noPanelGuidance()}`,
+      );
+    }
     if (tabId) {
       // Accept full ids or unambiguous prefixes (status shows 8-char ids).
       const exact = this.conns.get(tabId);
@@ -2889,12 +2948,15 @@ export class UiBridge {
   /** Deliver any buffered render frames to a tab that just (re)connected, plus a
    *  `mailbox_flush` summary so the client can notify "N renders finished while
    *  you were away". Expired items (past TTL) are dropped. */
-  private flushMailbox(tabId: string): void {
+  private flushMailbox(tabId: string, deliverTo?: Conn): void {
     const box = this.mailbox.get(tabId);
     if (!box || box.length === 0) return;
-    this.mailbox.delete(tabId);
-    const conn = this.conns.get(tabId);
+    // #884 — `deliverTo` lets the SHARED-SCOPE mailbox (deliveries produced while
+    // zero tabs were connected) flush to the first tab that hellos; the scope
+    // itself never owns a conn.
+    const conn = deliverTo ?? this.conns.get(tabId);
     if (!conn) return;
+    this.mailbox.delete(tabId);
     const now = Date.now();
     const fresh = box.filter((m) => now - m.ts <= UiBridge.MAILBOX_TTL_MS);
     for (const m of fresh) {
@@ -2993,7 +3055,13 @@ export class UiBridge {
     // own workflow into their own workflow (self-attack, no privacy boundary). See the
     // enforcesWorkflowStamp field doc. Deliberately no attestation.
     if (requiresWorkflowStampEnforcement(cmd)) {
-      const stamp = this.resolveTabWorkflowUuid?.(opts.tabId ?? conn.tabId);
+      // #884 — a SHARED-SCOPE caller has no workflow of its own: its command is
+      // for whatever workflow the resolved (active) tab is showing, so the stamp
+      // comes from the RESOLVED conn. A real-tab caller keeps the #570 rule:
+      // stamp the workflow the command was ISSUED FOR (the caller's tab), so a
+      // late command after a switch is declined by the panel's fence.
+      const stampTab = !opts.tabId || isSharedScopeId(opts.tabId) ? conn.tabId : opts.tabId;
+      const stamp = this.resolveTabWorkflowUuid?.(stampTab);
       const hasTrustedStamp = typeof stamp === "string" && stamp.length > 0;
       if (!conn.enforcesWorkflowStamp || !conn.enforcesWorkflowStampAtWrite || !hasTrustedStamp) {
         // The two CAPABILITY branches (missing panel fences) are typed so the tool
@@ -3146,7 +3214,12 @@ export class UiBridge {
         // conn.tabId: after a same-socket switch the two differ, and we must stamp the
         // workflow the command was ISSUED FOR (so the panel, now showing a different one,
         // declines it) — never the workflow it happens to have landed on.
-        workflowUuid: this.resolveTabWorkflowUuid?.(opts.tabId ?? conn.tabId) ?? undefined,
+        // #884 — a SHARED-SCOPE caller has no workflow of its own; its stamp is the
+        // resolved (active) tab's, exactly like the pre-dispatch fence above.
+        workflowUuid:
+          this.resolveTabWorkflowUuid?.(
+            !opts.tabId || isSharedScopeId(opts.tabId) ? conn.tabId : opts.tabId,
+          ) ?? undefined,
         onDispatchedRid: opts.onDispatchedRid,
       };
       this.dispatch(conn, ctx);

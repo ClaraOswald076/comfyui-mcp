@@ -31,7 +31,6 @@ import {
   type CompletionPayload,
 } from "../../orchestrator/run-completion-journal.js";
 import { AskAnswerJournalImpl } from "../../orchestrator/ask-answer-journal.js";
-import { destinationHasCollisionState } from "../../orchestrator/session-store.js";
 
 let PanelAgentManager: typeof import("../../orchestrator/panel-agent.js").PanelAgentManager;
 
@@ -1462,38 +1461,19 @@ describe("run completion journal correlation (#468)", () => {
     expect(seen).toEqual([PROMPT_A]);
   });
 
-  it("a tab holding ONLY a journal entry counts as OCCUPIED for a tab-id migration", () => {
-    // CRITICAL: the destination of a same-workflow tab-id migration can have had
-    // its agent AND durable session cleared (New chat) and still hold an
-    // undelivered completion. If the occupancy check ignores the journal, the
-    // destination reads as empty, the source is rebound onto its id, and the
-    // next flush hands the DESTINATION tab's render to the SOURCE tab's
-    // conversation — a cross-conversation delivery, worse than a lost one.
-    expect(
-      destinationHasCollisionState({
-        hasManagerState: false,
-        hasDurableSession: false,
-        renderHeldCount: 0,
-        journaledCompletionCount: 1,
-      }),
-    ).toBe(true);
-    expect(
-      destinationHasCollisionState({
-        hasManagerState: false,
-        hasDurableSession: false,
-        renderHeldCount: 0,
-        journaledCompletionCount: 0,
-      }),
-    ).toBe(false);
-    // …and the purge that follows leaves nothing for the incoming agent to
-    // inherit, for BOTH pending and already-handed-off entries.
+  it("moveKey MERGES pending entries onto the destination without losing either side (#884)", () => {
+    // #884 retired the tab-id-migration collision purge (destinationHasCollisionState):
+    // the conversation is orchestrator-scoped, so a same-socket re-hello MOVES the
+    // journals onto the new tab id — a render finishing after a workflow switch
+    // still reaches the one shared conversation that queued it. What must hold now
+    // is that moveKey merges without dropping entries on either key.
     journal.record("wf:dest", { kind: "executed", prompt_id: PROMPT_B });
-    journal.deliverPending("wf:dest", () => true);
-    journal.record("wf:dest", { kind: "executed", prompt_id: PROMPT_A });
+    journal.record("wf:src", { kind: "executed", prompt_id: PROMPT_A });
+    journal.moveKey("wf:src", "wf:dest");
+    expect(journal.outstanding("wf:src")).toHaveLength(0);
     expect(journal.outstanding("wf:dest")).toHaveLength(2);
+    // forget() (no orchestrator call sites since #884) still purges when called.
     journal.forget("wf:dest");
-    expect(journal.outstanding("wf:dest")).toHaveLength(0);
-    journal.moveKey("wf:src", "wf:dest"); // then the source migrates in
     expect(journal.outstanding("wf:dest")).toHaveLength(0);
   });
 
