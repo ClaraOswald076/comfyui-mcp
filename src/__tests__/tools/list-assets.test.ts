@@ -1,10 +1,12 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
 
-// Tool-level test for list_assets (#751). The REAL reconcile path runs; only
-// the ComfyUI client/config boundary is mocked, so a panel-dispatched render
-// (never watched by this process) must surface via the history reconcile.
-// workflow-executor / view-image are mocked only to keep their heavier import
-// graphs (and side effects) out of this test — list_assets never calls them.
+// Tool-level test for get_image action:"list_assets" (#751), the surviving
+// call form of the retired list_assets tool (0.50.0 slice 15). The REAL
+// reconcile path runs; only the ComfyUI client/config boundary is mocked, so a
+// panel-dispatched render (never watched by this process) must surface via the
+// history reconcile. The image/convert/colour/upload services are mocked only
+// to keep their heavier import graphs (sharp, the storage clients) out of this
+// test — the list_assets action never calls them.
 const getHistoryMock = vi.fn();
 vi.mock("../../comfyui/client.js", () => ({
   getHistory: (...a: unknown[]) => getHistoryMock(...a),
@@ -16,14 +18,14 @@ vi.mock("../../config.js", () => ({
   getCloudUrl: () => "",
   getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
 }));
-vi.mock("../../services/workflow-executor.js", () => ({
-  enqueueWorkflow: vi.fn(),
-}));
 vi.mock("../../services/view-image.js", () => ({
   viewAssetImage: vi.fn(),
 }));
+vi.mock("../../services/image-convert.js", () => ({ convertImage: vi.fn() }));
+vi.mock("../../services/color-analysis.js", () => ({ analyzeColor: vi.fn() }));
+vi.mock("../../services/storage-upload.js", () => ({ uploadOutput: vi.fn() }));
 
-import { registerAssetTools } from "../../tools/assets.js";
+import { registerImageManagementTools } from "../../tools/image-management.js";
 import { AssetRegistry } from "../../services/asset-registry.js";
 import type { WorkflowJSON } from "../../comfyui/types.js";
 
@@ -39,7 +41,7 @@ function getHandler(name: string): ToolHandler {
       if (n === name) handler = h;
     },
   };
-  registerAssetTools(server as never);
+  registerImageManagementTools(server as never);
   if (!handler) throw new Error(`tool ${name} not registered`);
   return handler;
 }
@@ -62,7 +64,7 @@ interface ListResult {
 }
 
 async function callListAssets(args: Record<string, unknown> = {}): Promise<ListResult> {
-  const res = await getHandler("list_assets")(args);
+  const res = await getHandler("get_image")({ action: "list_assets", ...args });
   expect(res.isError).toBeUndefined();
   return JSON.parse(res.content[0].text) as ListResult;
 }
@@ -116,7 +118,7 @@ beforeEach(() => {
   AssetRegistry.clear();
 });
 
-describe("list_assets (#751)", () => {
+describe('get_image action:"list_assets" (#751)', () => {
   it("lists a panel-dispatched render that this session never watched", async () => {
     // The bug: panel_run queues via the browser's app.queuePrompt, so no
     // JobWatcher/AssetRegistry.register ever ran for this prompt — yet
@@ -148,8 +150,8 @@ describe("list_assets (#751)", () => {
     });
     expect(asset.asset_id).toMatch(/^a_[0-9a-f]{8}$/);
     expect(asset.url).toContain("type=output");
-    // The reconciled asset is genuinely registered — view_image / regenerate
-    // can resolve it by id afterwards.
+    // The reconciled asset is genuinely registered — get_image (action:"view")
+    // / regenerate can resolve it by id afterwards.
     expect(AssetRegistry.get(asset.asset_id)).toBeDefined();
   });
 

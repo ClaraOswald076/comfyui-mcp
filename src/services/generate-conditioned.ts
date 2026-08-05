@@ -101,14 +101,14 @@ function commonTemplateParams(
 
 /**
  * Build + enqueue a ControlNet-conditioned txt2img workflow. `control_image`
- * must already exist in ComfyUI's input dir (use upload_image first).
+ * must already exist in ComfyUI's input dir (use upload_image (action:"image") first).
  */
 export async function generateWithControlNet(
   args: ControlNetArgs,
   deps: ConditionedDeps,
 ): Promise<ConditionedResult> {
   if (!args.control_image) {
-    throw new ValidationError("control_image is required (upload it first with upload_image)");
+    throw new ValidationError("control_image is required (upload it first with upload_image (action:\"image\"))");
   }
   const resolved = withDefaults(args as unknown as Record<string, unknown>);
   const checkpoint = await resolveCheckpointOrThrow(args.checkpoint, resolved, deps.resolveCheckpoint);
@@ -138,14 +138,14 @@ export async function generateWithControlNet(
 /**
  * Build + enqueue an IP-Adapter-conditioned txt2img workflow. Requires the
  * ComfyUI_IPAdapter_plus custom nodes. `reference_image` must already exist in
- * ComfyUI's input dir (use upload_image first).
+ * ComfyUI's input dir (use upload_image (action:"image") first).
  */
 export async function generateWithIpAdapter(
   args: IpAdapterArgs,
   deps: ConditionedDeps,
 ): Promise<ConditionedResult> {
   if (!args.reference_image) {
-    throw new ValidationError("reference_image is required (upload it first with upload_image)");
+    throw new ValidationError("reference_image is required (upload it first with upload_image (action:\"image\"))");
   }
   const resolved = withDefaults(args as unknown as Record<string, unknown>);
   const checkpoint = await resolveCheckpointOrThrow(args.checkpoint, resolved, deps.resolveCheckpoint);

@@ -200,7 +200,7 @@ export interface OutputImage {
   /** Subfolder relative to the output dir ("" for top level), forward-slash
    *  normalized. ComfyUI writes to subfolders when a node's filename_prefix
    *  contains a path (e.g. SaveVideo "video/clip" → output/video/clip_00001.mp4).
-   *  Pass { filename, subfolder } to get_image / stage_output_as_input. */
+   *  Pass { filename, subfolder } to get_image (action:"get") / upload_image (action:"stage"). */
   subfolder: string;
   /** Media kind derived from the file extension. */
   kind: "image" | "video";
@@ -450,8 +450,8 @@ import { readFile as nodeReadFile } from "node:fs/promises";
  * onto the configured base directory; the server has historically been
  * permissive about ".." segments and absolute paths in those parameters
  * (see e.g. comfyanonymous/ComfyUI#785), so an attacker who can reach the
- * MCP tool surface could otherwise pivot through get_image / view_image /
- * stage_output_as_input to read arbitrary files from the ComfyUI host.
+ * MCP tool surface could otherwise pivot through get_image (action:"get"/"view") /
+ * upload_image (action:"stage") to read arbitrary files from the ComfyUI host.
  *
  * Legitimate ComfyUI values are a single filename (no separators) and a
  * relative subfolder produced by listOutputImages (forward-slash joined,
@@ -742,7 +742,7 @@ export async function getOutputImage(
       `ComfyUI /view did not return an image for "${filename}" (${where}); ` +
         `got ${result.base64.length === 0 ? "an empty response" : `content-type "${result.mimeType}"`}. ` +
         `The file may not exist in the ComfyUI ${type} directory — ` +
-        `check the filename/subfolder (e.g. via list_output_images or get_history).`,
+        `check the filename/subfolder (e.g. via get_image (action:"list_outputs") or get_history).`,
       "IMAGE_NOT_FOUND",
       { filename, type, subfolder, mimeType: result.mimeType },
     );
@@ -870,7 +870,7 @@ export const uploadAudioLocal = (sourcePath: string, filename?: string) =>
   uploadMediaLocal(sourcePath, filename, AUDIO_MIME, "audio");
 
 // ---------------------------------------------------------------------------
-// stage_output_as_input — pipe one pipeline stage's OUTPUT into the next stage's
+// upload_image (action:"stage") — pipe one pipeline stage's OUTPUT into the next stage's
 // loader (LoadImage / VHS_LoadVideo / LoadAudio) the CORRECT way: fetch the bytes
 // from the ComfyUI server (/view) and re-register them as an INPUT via the same
 // /upload/image endpoint the upload_* tools use. Because both legs go through the
@@ -913,7 +913,7 @@ function mimeForKind(filename: string, kind: MediaKind): string {
 }
 
 export interface StageOutputAsInputArgs {
-  /** Filename of the existing output/temp asset (from get_history / list_output_images). */
+  /** Filename of the existing output/temp asset (from get_history / get_image (action:"list_outputs")). */
   filename: string;
   /** Subfolder the asset lives in, if any. */
   subfolder?: string;
@@ -942,7 +942,7 @@ export interface StagedInput {
  *
  * Fetches the bytes from the server via /view (the same path get_image uses) and
  * re-registers them as an input via /upload/image (the same path upload_image /
- * upload_video / upload_audio use). Goes entirely through the server API, so it
+ * upload_image (action:"video") / upload_image (action:"audio") use). Goes entirely through the server API, so it
  * is correct even when ComfyUI runs with a custom input/output directory.
  */
 export async function stageOutputAsInput(

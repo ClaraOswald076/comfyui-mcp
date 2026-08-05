@@ -7,7 +7,7 @@ import { resolveOutputDir } from "./output-dir.js";
 import { ValidationError } from "../utils/errors.js";
 
 // ---------------------------------------------------------------------------
-// analyze_color — objective color scopes/stats for a rendered image.
+// get_image (action:"analyze_color") — objective color scopes/stats for a rendered image.
 //
 // Motivation: judging "washed out" by eye off a contact sheet is unreliable.
 // This computes the numbers a colorist reads off scopes — black/white points,
@@ -114,7 +114,7 @@ async function resolveBytes(opts: AnalyzeColorOptions): Promise<Buffer> {
   }
 
   throw new ValidationError(
-    "analyze_color requires one of: asset_id, filename (+optional subfolder/type), or path.",
+    "get_image (action:\"analyze_color\") requires one of: asset_id, filename (+optional subfolder/type), or path.",
   );
 }
 
@@ -355,7 +355,7 @@ export async function analyzeColor(opts: AnalyzeColorOptions): Promise<AnalyzeCo
   const stats = computeStats(raw);
 
   const content: AnalyzeColorResult["content"] = [];
-  let summary = `analyze_color — ${stats.width}x${stats.height}\n${stats.verdict}\n\n` +
+  let summary = `get_image (action:"analyze_color") — ${stats.width}x${stats.height}\n${stats.verdict}\n\n` +
     JSON.stringify(stats, null, 2);
 
   if (opts.reference_path) {

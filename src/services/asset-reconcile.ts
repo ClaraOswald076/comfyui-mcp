@@ -12,11 +12,11 @@ import { logger } from "../utils/logger.js";
  * submitted via enqueueWorkflow. A render dispatched any other way — panel_run
  * (the panel queues via the browser's own app.queuePrompt), an earlier MCP
  * session, or anything before a server restart — completes without a watcher,
- * so its outputs never registered and list_assets read as empty even though
+ * so its outputs never registered and get_image (action:"list_assets") read as empty even though
  * get_history showed them. Reconciling on demand closes that gap: outputs that
  * really exist in history are registered with source "history-reconcile",
  * with the prompt's recorded graph as the workflow snapshot (so regenerate /
- * get_asset_metadata keep working) and the run's real completion time as
+ * get_image (action:"asset_metadata") keep working) and the run's real completion time as
  * createdAt (so ordering, `since` filters, and TTL expiry stay truthful).
  *
  * Nothing is fabricated: an entry registers only when its history status
@@ -74,7 +74,7 @@ export async function reconcileAssetsFromHistory(opts: {
     // URL building.
     const notification = buildCompletionNotification(promptId, entry, now());
     if (notification.outputs.length === 0) continue;
-    // The recorded graph is the provenance regenerate / get_asset_metadata
+    // The recorded graph is the provenance regenerate / get_image (action:"asset_metadata")
     // rely on; without it there is nothing truthful to register.
     const workflow = extractWorkflowGraph(entry);
     if (!workflow) continue;

@@ -48,7 +48,7 @@ function enqueuedResult(result: { prompt_id: string; queue_remaining?: number; c
             prompt_id: result.prompt_id,
             queue_remaining: result.queue_remaining,
             checkpoint: result.checkpoint,
-            note: "asset_id will be available in the completion notification; use view_image or regenerate with it.",
+            note: "asset_id will be available in the completion notification; use get_image (action:\"view\") or regenerate with it.",
           },
           null,
           2,
@@ -61,7 +61,7 @@ function enqueuedResult(result: { prompt_id: string; queue_remaining?: number; c
 export function registerConditionedGenerationTools(server: McpServer): void {
   server.tool(
     "generate_with_controlnet",
-    "Generate an image conditioned by a ControlNet preprocessed image (pose skeleton, depth, canny, normal, etc.) plus a text prompt. Upload the control image first with upload_image, then pass its filename as control_image. Unspecified params fall back to your defaults; checkpoint and controlnet_model auto-resolve from local models. Returns prompt_id immediately; asset_id arrives in the completion notification. control_image must already be a preprocessed map (this tool does not run the preprocessor); requires a running ComfyUI with a matching controlnet model in models/controlnet/.",
+    "Generate an image conditioned by a ControlNet preprocessed image (pose skeleton, depth, canny, normal, etc.) plus a text prompt. Upload the control image first with upload_image (action:\"image\"), then pass its filename as control_image. Unspecified params fall back to your defaults; checkpoint and controlnet_model auto-resolve from local models. Returns prompt_id immediately; asset_id arrives in the completion notification. control_image must already be a preprocessed map (this tool does not run the preprocessor); requires a running ComfyUI with a matching controlnet model in models/controlnet/.",
     {
       prompt: z.string().describe("Positive text prompt"),
       control_image: z.string().describe("Filename of the (already-uploaded) control image in ComfyUI's input dir"),
@@ -80,7 +80,7 @@ export function registerConditionedGenerationTools(server: McpServer): void {
 
   server.tool(
     "generate_with_ip_adapter",
-    "Generate an image guided by a reference image's style/subject via IP-Adapter, plus a text prompt. Requires the ComfyUI_IPAdapter_plus custom nodes. Upload the reference first with upload_image, then pass its filename as reference_image. Unspecified params fall back to your defaults; checkpoint auto-resolves. Returns prompt_id immediately; asset_id arrives in the completion notification. Requires a running ComfyUI with ComfyUI_IPAdapter_plus and a matching IP-Adapter model installed, or the workflow will fail at execution time.",
+    "Generate an image guided by a reference image's style/subject via IP-Adapter, plus a text prompt. Requires the ComfyUI_IPAdapter_plus custom nodes. Upload the reference first with upload_image (action:\"image\"), then pass its filename as reference_image. Unspecified params fall back to your defaults; checkpoint auto-resolves. Returns prompt_id immediately; asset_id arrives in the completion notification. Requires a running ComfyUI with ComfyUI_IPAdapter_plus and a matching IP-Adapter model installed, or the workflow will fail at execution time.",
     {
       prompt: z.string().describe("Positive text prompt"),
       reference_image: z.string().describe("Filename of the (already-uploaded) reference image in ComfyUI's input dir"),

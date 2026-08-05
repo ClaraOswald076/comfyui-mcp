@@ -269,11 +269,11 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 | Tool | Description |
 |------|-------------|
-| `view_image` | Return a generated asset's bytes as an inline image so the agent can see the result |
-| `analyze_color` | Palette / contrast / color statistics for a generated image (dominant colors, average + luminance stats, contrast checks) so the agent can reason about color without a vision round-trip |
+| `get_image (action:"view")` | Return a generated asset's bytes as an inline image so the agent can see the result |
+| `get_image (action:"analyze_color")` | Palette / contrast / color statistics for a generated image (dominant colors, average + luminance stats, contrast checks) so the agent can reason about color without a vision round-trip |
 | `regenerate` | Re-run the workflow that produced an `asset_id`, with optional parameter overrides |
-| `list_assets` | Browse recently generated assets (newest-first) by `asset_id` |
-| `get_asset_metadata` | Full provenance for an asset, including the originating workflow |
+| `get_image (action:"list_assets")` | Browse recently generated assets (newest-first) by `asset_id` |
+| `get_image (action:"asset_metadata")` | Full provenance for an asset, including the originating workflow |
 
 ### Defaults
 
@@ -315,7 +315,7 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 | Tool | Description |
 |------|-------------|
 | `upload_image` | Copy a local image into ComfyUI's `input/` directory for img2img, inpaint, or ControlNet |
-| `list_output_images` | Browse recently generated images **and videos** from the output directory, sorted newest-first — recurses into subfolders (e.g. SaveVideo's `output/video/…`) and returns each result's `subfolder` |
+| `get_image (action:"list_outputs")` | Browse recently generated images **and videos** from the output directory, sorted newest-first — recurses into subfolders (e.g. SaveVideo's `output/video/…`) and returns each result's `subfolder` |
 
 ### Model Management
 
@@ -802,7 +802,7 @@ src/
     workflow-compose.ts    # create_workflow (create/modify/validate/node_info)
     workflow-validate.ts   # the validate action's body
     workflow-library.ts    # get_workflow (8 read actions), save_workflow (save/lock/verify_lock)
-    image-management.ts    # upload_image, list_output_images
+    image-management.ts    # get_image (7 read actions), upload_image (5 write actions)
     model-management.ts    # download_model, list_local_models (the two consolidated model tools)
     memory-management.ts   # clear_vram
     registry-search.ts     # search_custom_nodes (search/details)

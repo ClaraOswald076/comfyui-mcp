@@ -499,15 +499,24 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
   // -------------------------------------------------------------------------
   // Assets & Images
   // -------------------------------------------------------------------------
-  list_output_images: {
+  // The three read-side image tools are ONE tool since 0.50.0 slice 15, chosen
+  // with `action`. The skeleton the generator would otherwise emit is
+  // `{"action": "get"}` — a call that returns the handler's missing-`filename`
+  // error — so, as with runpod below, real calls are worth more than a skeleton
+  // here. Every `args` object is validated against the live zod schema at
+  // generation time.
+  get_image: {
     gloss:
-      "What has ComfyUI actually written to disk lately. Worth knowing: video " +
-      "nodes often finish without registering in ComfyUI's history, so this is " +
-      "the reliable way to confirm a video really rendered.",
+      "Everything the agent does to LOOK at what ComfyUI made: browse what has " +
+      "been written to disk, fetch one file, put a picture in front of the " +
+      "agent, re-encode it, or measure its colour. Worth knowing: video nodes " +
+      "often finish without registering in ComfyUI's history, so " +
+      "`action: \"list_outputs\"` is the reliable way to confirm a video really " +
+      "rendered.",
     examples: [
       {
         ask: "Show me the last few things I generated.",
-        args: { limit: 10 },
+        args: { action: "list_outputs", limit: 10 },
         returns:
           "The ten newest files, newest first, each with whether it is an image " +
           "or a video, its folder, size and time. Not the pictures themselves — " +
@@ -515,38 +524,96 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
       },
       {
         ask: "Did that fox render ever come out?",
-        args: { pattern: "fox", limit: 5 },
+        args: { action: "list_outputs", pattern: "fox", limit: 5 },
         returns: "Only files whose names contain \"fox\".",
       },
-    ],
-  },
-  view_image: {
-    gloss:
-      "Puts an image in front of the agent so it can actually look at it — for " +
-      "\"is this any good?\", \"compare these two\", \"what is wrong with the hands\".",
-    examples: [
       {
         ask: "Show me that one.",
-        args: { asset_id: "asset_01HQ8Z3K7V" },
+        args: { action: "view", asset_id: "asset_01HQ8Z3K7V" },
         returns:
           "The image inline, visible to both of you. The asset id comes from " +
-          "the completion message of the run that made it.",
+          "the completion message of the run that made it. Images only — for " +
+          "video and audio use `action: \"get\"`, which saves to disk.",
       },
-    ],
-  },
-  get_image: {
-    examples: [
       {
         ask: "Save that render onto my desktop.",
         args: {
+          action: "get",
           filename: "portrait_00042_.png",
           type: "output",
           save_dir: "C:/Users/me/Desktop",
         },
         returns:
           "The file copied to that folder, and the path it landed at. Use this " +
-          "rather than view_image for video and audio, which cannot be shown " +
-          "inline.",
+          "rather than `action: \"view\"` for video and audio, which cannot be " +
+          "shown inline.",
+      },
+      {
+        ask: "Why does this render look so washed out?",
+        args: { action: "analyze_color", filename: "portrait_00042_.png" },
+        returns:
+          "Measured numbers rather than an opinion: black and white points, " +
+          "contrast, saturation, per-channel colour cast and clipping, plus " +
+          "flags like washedOut/liftedBlacks and a one-line verdict. Read-only.",
+      },
+      {
+        ask: "Make me a smaller JPEG of that so I can email it.",
+        args: {
+          action: "convert",
+          path: "portrait_00042_.png",
+          format: "jpeg",
+          quality: 85,
+        },
+        returns:
+          "The re-encoded image inline, with the source and output sizes and how " +
+          "many bytes were saved.",
+        caution:
+          "Passing `out_path` also WRITES the converted file under the ComfyUI " +
+          "output directory, overwriting whatever is already at that path.",
+      },
+      {
+        ask: "What have I made recently?",
+        args: { action: "list_assets", limit: 5 },
+        returns:
+          "The five newest registered assets with their asset ids, prompt ids, " +
+          "filenames and when they were made — including renders this session " +
+          "never watched, which are reconciled from ComfyUI's history on the " +
+          "way. Feed an asset id to `action: \"view\"` to actually see one.",
+      },
+      {
+        ask: "What settings produced that image?",
+        args: { action: "asset_metadata", asset_id: "asset_01HQ8Z3K7V" },
+        returns:
+          "Full provenance for the asset, including the entire workflow that " +
+          "produced it — the prompt, sampler, steps, seed and so on. Read this " +
+          "before `regenerate` with overrides.",
+      },
+    ],
+  },
+
+  upload_image: {
+    gloss:
+      "The other direction: putting a file where ComfyUI can read it. A local " +
+      "file goes into ComfyUI's input/ folder (`image`/`video`/`audio`), an " +
+      "existing render is re-registered as an input without touching the disk " +
+      "(`stage` — the correct way to chain one stage into the next), and " +
+      "`output` is the only action that sends anything OFF this machine.",
+    examples: [
+      {
+        ask: "Use this photo as the starting image.",
+        args: { action: "image", source_path: "C:/Users/me/Pictures/cat.png" },
+        returns:
+          "The filename it was stored under in ComfyUI's input/ directory — drop " +
+          "that into a LoadImage node's `image` widget.",
+      },
+      {
+        ask: "Now feed that render into the video stage.",
+        args: { action: "stage", filename: "portrait_00042_.png" },
+        returns:
+          "The same file registered as an INPUT, with the filename to put in the " +
+          "next stage's loader. Goes through the server API, so it works even " +
+          "when ComfyUI was launched with custom input/output directories — " +
+          "never guess a filesystem `input/` path.",
       },
     ],
   },

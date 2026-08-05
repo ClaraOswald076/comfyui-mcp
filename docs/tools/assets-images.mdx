@@ -4,59 +4,124 @@ description: "View, convert, and upload generated images; analyze colors; stage 
 icon: "images"
 ---
 
-<Info>14 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
+<Info>4 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
 <Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
 
-## view_image
+## get_image
 
-Fetch a registered asset's bytes and return them as an inline image so the agent can see the result. Use this after enqueue_workflow completes (asset_id is included in the completion notification) to inspect, critique, or compare generated images. Only supports image mime types (PNG/JPEG/WebP); audio/video assets must be saved to disk via get_image.
+Fetch, browse and inspect ComfyUI images and registered assets. Driven by the `action` parameter:
+- action:"get" — Fetch a generated image from ComfyUI by FILENAME and return it as an inline image. Video/audio outputs (e.g. a VHS_VideoCombine .mp4) are saved to save_dir with their original extension instead of being rendered inline. Works with remote ComfyUI instances — does not require COMFYUI_PATH. Use get_history first to obtain the filename.
+- action:"view" — Fetch a registered asset's bytes by ASSET ID and return them as an inline image so the agent can see the result. Use this after enqueue_workflow completes (asset_id is included in the completion notification) to inspect, critique, or compare generated images. Only supports image mime types (PNG/JPEG/WebP); audio/video assets must be saved to disk via action:"get".
+- action:"list_outputs" — List recently generated image AND video files from ComfyUI's output/ directory, newest-first, with each file's kind ('image' | 'video'), subfolder, size, and modification time. Covers stills (.png/.jpg/.jpeg/.bmp) and video/animation outputs (.mp4/.webm/.mov/.mkv/.m4v/.avi/.gif/.webp). LOCAL ComfyUI (COMFYUI_PATH set): a RECURSIVE filesystem scan of output/ — includes subfolders like video/ that VHS/SaveVideo write to, and reports size + modification time. REMOTE ComfyUI: derives the list from /history over HTTP instead (size/modified are unavailable and omitted). It does NOT return the media bytes themselves — fetch those with action:"get". USE THIS TO CONFIRM A VIDEO RENDER (e.g. VHS_VideoCombine / LTX / WAN output) when get_history shows the prompt done but lists no output: VHS-style video nodes write the file but often do NOT register in ComfyUI's /history, so the local filesystem scan is the reliable way to verify the .mp4 exists — then chain it with upload_image (action:"stage"). Read-only.
+- action:"convert" — Re-encode a generated image to PNG, JPEG, or WebP and return it inline as an image content block. Source can be a registered asset_id or a path under the local ComfyUI output directory. Optionally writes the converted image back under the output directory and reports source/output size plus bytes saved.
+- action:"analyze_color" — Measure the color of a rendered image (not by eye): returns black/white points, contrast (luma std), saturation, per-channel means + cast, and clipping — plus heuristic flags (washedOut, lowContrast, liftedBlacks, dimHighlights, lowSaturation, colorCast) and a one-line verdict. Source = asset_id, a ComfyUI output ref (filename/subfolder/type), or an image path. Pass reference_path to shot-match against a known-good frame (target−reference deltas). Set histogram:true to also get an overlaid R/G/B/luma histogram PNG. Use this to diagnose 'washed out' objectively and decide a color fix; for a video, extract a frame to PNG first.
+- action:"list_assets" — List recently generated assets, newest-first. Each call first reconciles ComfyUI's /history, so outputs are listed even when this session did not watch the render complete (e.g. queued via panel_run, by an earlier session, or before a server restart) — those are tagged source:'history-reconcile', versus source:'watched' for renders this server saw finish. Returns count + assets (asset_id, prompt_id, filename, url, source, created_at). The registry is ephemeral and clears on server restart; records expire after COMFYUI_ASSET_TTL_HOURS (default 24h), and only the most recent completed runs are reconciled — use get_history / action:"get" by filename for anything older.
+- action:"asset_metadata" — Get full provenance for a registered asset including the workflow snapshot that produced it. Use this to inspect the parameters that generated an image before calling regenerate with overrides.
 
-<Tip>**In plain terms:** Puts an image in front of the agent so it can actually look at it — for "is this any good?", "compare these two", "what is wrong with the hands".</Tip>
+<Tip>**In plain terms:** Everything the agent does to LOOK at what ComfyUI made: browse what has been written to disk, fetch one file, put a picture in front of the agent, re-encode it, or measure its colour. Worth knowing: video nodes often finish without registering in ComfyUI's history, so `action: "list_outputs"` is the reliable way to confirm a video really rendered.</Tip>
 
 ### Parameters
 
-<ParamField path="asset_id" type="string" required>
-  Asset id returned by list_assets or job completion
+<ParamField path="action" type="enum" required>
+  Which image/asset operation to perform. "get" requires `filename`; "view" and "asset_metadata" require `asset_id`; "convert" requires `format` plus exactly one of `asset_id`/`path`; "analyze_color" takes one source (`asset_id`, `filename`, or `path`); "list_outputs" and "list_assets" take no required parameters. Options: `get`, `view`, `list_outputs`, `convert`, `analyze_color`, `list_assets`, `asset_metadata`.
+</ParamField>
+<ParamField path="filename" type="string">
+  Output image filename, e.g. PulID_Klein_00001_.png. REQUIRED for action:"get". OPTIONAL for action:"analyze_color", where it is one of the three ways to name a source (pair it with subfolder/type).
+</ParamField>
+<ParamField path="asset_id" type="string">
+  Asset id returned by action:"list_assets" or job completion. REQUIRED for actions "view" and "asset_metadata". OPTIONAL for "convert" (provide exactly one of asset_id or path) and "analyze_color" (one of asset_id, filename, or path).
+</ParamField>
+<ParamField path="type" type="enum">
+  ComfyUI directory the file lives in: output (default), input, or temp. Used by action:"get" and by action:"analyze_color" when the source is a `filename`. Options: `output`, `input`, `temp`.
+</ParamField>
+<ParamField path="subfolder" type="string">
+  Subfolder within the directory, if any (default empty). Used by action:"get" and by action:"analyze_color" when the source is a `filename`.
+</ParamField>
+<ParamField path="save_dir" type="string">
+  action:"get" — absolute local directory to save the file in. Defaults to a 'comfyui-images' folder inside the platform temp directory (os.tmpdir()), which is created if missing. A RELATIVE value is resolved against this MCP process's working directory, which is the client's choice and may not be writable. On Windows a drive-less path like \out is resolved against this process's CURRENT DRIVE, not a drive you chose. Prefer a fully-qualified path (C:\... or \\server\share); the returned 'Saved to:' line always names the resolved absolute path.
+</ParamField>
+<ParamField path="path" type="string">
+  A source image path. action:"convert" — a path under COMFYUI_PATH/output (provide exactly one of asset_id or path). action:"analyze_color" — an absolute image path, or a path under the ComfyUI output dir (videos: extract a frame to PNG first).
+</ParamField>
+<ParamField path="limit" type="integer">
+  action:"list_outputs" — max media files to return, 1..100 (default 20). action:"list_assets" — max records to return (default: all, no upper bound).
+</ParamField>
+<ParamField path="pattern" type="string">
+  action:"list_outputs" — filter by filename pattern (case-insensitive substring match).
+</ParamField>
+<ParamField path="format" type="enum">
+  Two unrelated meanings, one per action — the enum is the union of both and each action accepts only its own half. action:"list_outputs" — RESPONSE SHAPE: "markdown" (default, human/agent-readable) or "json" (&#123;images:[&#123;filename,subfolder,kind,size,modified&#125;]&#125; — for app clients building pick grids). action:"convert" — REQUIRED target encoded image format: "png", "jpeg" or "webp". Options: `markdown`, `json`, `png`, `jpeg`, `webp`.
+</ParamField>
+<ParamField path="quality" type="integer">
+  action:"convert" — encoder quality, 1-100. Applies where supported by the selected format.
+</ParamField>
+<ParamField path="progressive" type="boolean">
+  action:"convert" — JPEG only: write a progressive JPEG.
+</ParamField>
+<ParamField path="lossless" type="boolean">
+  action:"convert" — WebP only: write lossless WebP.
+</ParamField>
+<ParamField path="effort" type="integer">
+  action:"convert" — WebP only: encoder effort, 0-6.
+</ParamField>
+<ParamField path="out_path" type="string">
+  action:"convert" — optional output path under COMFYUI_PATH/output where the converted image should be written.
+</ParamField>
+<ParamField path="reference_path" type="string">
+  action:"analyze_color" — optional reference image to shot-match against; returns target−reference deltas for contrast, black/white points, saturation, and per-channel means.
+</ParamField>
+<ParamField path="histogram" type="boolean">
+  action:"analyze_color" — also return an overlaid R/G/B/luma histogram PNG for visual confirmation (default false).
+</ParamField>
+<ParamField path="since" type="string">
+  action:"list_assets" — ISO timestamp; only return assets created at or after this time.
 </ParamField>
 
-### Example
+### Examples
+
+**You say:** Show me the last few things I generated.
+
+```json
+{
+  "tool": "get_image",
+  "arguments": {
+    "action": "list_outputs",
+    "limit": 10
+  }
+}
+```
+
+**You get back:** The ten newest files, newest first, each with whether it is an image or a video, its folder, size and time. Not the pictures themselves — ask to see one and the agent fetches it.
+
+**You say:** Did that fox render ever come out?
+
+```json
+{
+  "tool": "get_image",
+  "arguments": {
+    "action": "list_outputs",
+    "pattern": "fox",
+    "limit": 5
+  }
+}
+```
+
+**You get back:** Only files whose names contain "fox".
 
 **You say:** Show me that one.
 
 ```json
 {
-  "tool": "view_image",
+  "tool": "get_image",
   "arguments": {
+    "action": "view",
     "asset_id": "asset_01HQ8Z3K7V"
   }
 }
 ```
 
-**You get back:** The image inline, visible to both of you. The asset id comes from the completion message of the run that made it.
-
----
-
-## get_image
-
-Fetch a generated image from ComfyUI and return it as an inline image. Video/audio outputs (e.g. a VHS_VideoCombine .mp4) are saved to save_dir with their original extension instead of being rendered inline. Works with remote ComfyUI instances — does not require COMFYUI_PATH. Use get_history first to obtain the filename.
-
-### Parameters
-
-<ParamField path="filename" type="string" required>
-  Output image filename, e.g. PulID_Klein_00001_.png
-</ParamField>
-<ParamField path="type" type="enum" default="output">
-  Image directory: output (default), input, or temp Options: `output`, `input`, `temp`.
-</ParamField>
-<ParamField path="subfolder" type="string" default="">
-  Subfolder within the directory, if any
-</ParamField>
-<ParamField path="save_dir" type="string">
-  Absolute local directory to save the file in. Defaults to a 'comfyui-images' folder inside the platform temp directory (os.tmpdir()), which is created if missing. A RELATIVE value is resolved against this MCP process's working directory, which is the client's choice and may not be writable. On Windows a drive-less path like \out is resolved against this process's CURRENT DRIVE, not a drive you chose. Prefer a fully-qualified path (C:\... or \\server\share); the returned 'Saved to:' line always names the resolved absolute path.
-</ParamField>
-
-### Example
+**You get back:** The image inline, visible to both of you. The asset id comes from the completion message of the run that made it. Images only — for video and audio use `action: "get"`, which saves to disk.
 
 **You say:** Save that render onto my desktop.
 
@@ -64,6 +129,7 @@ Fetch a generated image from ComfyUI and return it as an inline image. Video/aud
 {
   "tool": "get_image",
   "arguments": {
+    "action": "get",
     "filename": "portrait_00042_.png",
     "type": "output",
     "save_dir": "C:/Users/me/Desktop"
@@ -71,105 +137,154 @@ Fetch a generated image from ComfyUI and return it as an inline image. Video/aud
 }
 ```
 
-**You get back:** The file copied to that folder, and the path it landed at. Use this rather than view_image for video and audio, which cannot be shown inline.
+**You get back:** The file copied to that folder, and the path it landed at. Use this rather than `action: "view"` for video and audio, which cannot be shown inline.
 
----
-
-## convert_image
-
-Re-encode a generated image to PNG, JPEG, or WebP and return it inline as an image content block. Source can be a registered asset_id or a path under the local ComfyUI output directory. Optionally writes the converted image back under the output directory and reports source/output size plus bytes saved.
-
-### Parameters
-
-<ParamField path="asset_id" type="string">
-  Registered asset id from a completed job. Provide exactly one of asset_id or path.
-</ParamField>
-<ParamField path="path" type="string">
-  Path to a source image under COMFYUI_PATH/output. Provide exactly one of asset_id or path.
-</ParamField>
-<ParamField path="format" type="enum" required>
-  Target encoded image format. Options: `png`, `jpeg`, `webp`.
-</ParamField>
-<ParamField path="quality" type="integer">
-  Encoder quality, 1-100. Applies where supported by the selected format.
-</ParamField>
-<ParamField path="progressive" type="boolean">
-  JPEG only: write a progressive JPEG.
-</ParamField>
-<ParamField path="lossless" type="boolean">
-  WebP only: write lossless WebP.
-</ParamField>
-<ParamField path="effort" type="integer">
-  WebP only: encoder effort, 0-6.
-</ParamField>
-<ParamField path="out_path" type="string">
-  Optional output path under COMFYUI_PATH/output where the converted image should be written.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** Why does this render look so washed out?
 
 ```json
 {
-  "tool": "convert_image",
+  "tool": "get_image",
   "arguments": {
-    "format": "png"
+    "action": "analyze_color",
+    "filename": "portrait_00042_.png"
   }
 }
 ```
 
----
+**You get back:** Measured numbers rather than an opinion: black and white points, contrast, saturation, per-channel colour cast and clipping, plus flags like washedOut/liftedBlacks and a one-line verdict. Read-only.
 
-## analyze_color
-
-Measure the color of a rendered image (not by eye): returns black/white points, contrast (luma std), saturation, per-channel means + cast, and clipping — plus heuristic flags (washedOut, lowContrast, liftedBlacks, dimHighlights, lowSaturation, colorCast) and a one-line verdict. Source = asset_id, a ComfyUI output ref (filename/subfolder/type), or an image path. Pass reference_path to shot-match against a known-good frame (target−reference deltas). Set histogram:true to also get an overlaid R/G/B/luma histogram PNG. Use this to diagnose 'washed out' objectively and decide a color fix; for a video, extract a frame to PNG first.
-
-### Parameters
-
-<ParamField path="asset_id" type="string">
-  Registered asset id from a completed job. Provide one source: asset_id, filename, or path.
-</ParamField>
-<ParamField path="filename" type="string">
-  A ComfyUI output ref filename (pair with subfolder/type). Provide one source: asset_id, filename, or path.
-</ParamField>
-<ParamField path="subfolder" type="string">
-  Subfolder for the output ref (default empty).
-</ParamField>
-<ParamField path="type" type="enum">
-  ComfyUI dir for the output ref (default 'output'). Options: `output`, `input`, `temp`.
-</ParamField>
-<ParamField path="path" type="string">
-  Absolute image path, or a path under the ComfyUI output dir. Provide one source: asset_id, filename, or path. (Videos: extract a frame to PNG first.)
-</ParamField>
-<ParamField path="reference_path" type="string">
-  Optional reference image to shot-match against; returns target−reference deltas for contrast, black/white points, saturation, and per-channel means.
-</ParamField>
-<ParamField path="histogram" type="boolean">
-  Also return an overlaid R/G/B/luma histogram PNG for visual confirmation (default false).
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** Make me a smaller JPEG of that so I can email it.
 
 ```json
 {
-  "tool": "analyze_color",
-  "arguments": {}
+  "tool": "get_image",
+  "arguments": {
+    "action": "convert",
+    "path": "portrait_00042_.png",
+    "format": "jpeg",
+    "quality": 85
+  }
 }
 ```
+
+**You get back:** The re-encoded image inline, with the source and output sizes and how many bytes were saved.
+
+<Warning>Passing `out_path` also WRITES the converted file under the ComfyUI output directory, overwriting whatever is already at that path.</Warning>
+
+**You say:** What have I made recently?
+
+```json
+{
+  "tool": "get_image",
+  "arguments": {
+    "action": "list_assets",
+    "limit": 5
+  }
+}
+```
+
+**You get back:** The five newest registered assets with their asset ids, prompt ids, filenames and when they were made — including renders this session never watched, which are reconciled from ComfyUI's history on the way. Feed an asset id to `action: "view"` to actually see one.
+
+**You say:** What settings produced that image?
+
+```json
+{
+  "tool": "get_image",
+  "arguments": {
+    "action": "asset_metadata",
+    "asset_id": "asset_01HQ8Z3K7V"
+  }
+}
+```
+
+**You get back:** Full provenance for the asset, including the entire workflow that produced it — the prompt, sampler, steps, seed and so on. Read this before `regenerate` with overrides.
+
+---
+
+## upload_image
+
+Put a file where ComfyUI (or cloud storage) can read it. Driven by the `action` parameter:
+- action:"image" — Upload a local image file to the connected ComfyUI's input/ directory via the HTTP /upload/image endpoint so it can be referenced in LoadImage nodes. Works for both local and remote ComfyUI. Returns the stored filename.
+- action:"video" — Upload a local video file (.mp4, .mov, .webm, .avi, .mkv, .m4v) to the connected ComfyUI's input/ directory via the HTTP /upload/image endpoint for use in video-loading nodes such as VHS_LoadVideo (ComfyUI-VideoHelperSuite). Works for both local and remote ComfyUI. Returns the stored filename.
+- action:"audio" — Upload a local audio file (.wav, .mp3, .flac, .ogg, .m4a, .aac) to the connected ComfyUI's input/ directory via the HTTP /upload/image endpoint for use in audio-conditioned workflows (e.g. LoadAudio). Works for both local and remote ComfyUI. Returns the stored filename.
+- action:"stage" — Stage an EXISTING ComfyUI output (or temp/preview) as an INPUT so the next stage's loader (LoadImage / VHS_LoadVideo / LoadAudio) can read it. This is the CORRECT way to chain a multi-stage pipeline (e.g. Krea2 image → LTX video → WAN extend): it fetches the output's bytes from the server via /view and re-registers them as an input via /upload/image — the same endpoints get_image and the uploads above use. Because it goes entirely through the server API, it works even when ComfyUI was launched with a CUSTOM input/output directory. Do NOT instead copy the output file or guess a filesystem `input/` path — the server's input dir may be custom and it will reject the file ("Invalid image file"), wasting the render. Pass an existing output reference (&#123; filename, subfolder?, type? &#125;); the media kind (image/video/audio) is inferred from the extension unless you set `kind`. Returns the registered input &#123; filename, subfolder, type: "input", kind &#125; — drop the returned `filename` straight into the loader's image/video/audio widget.
+- action:"output" — Upload a generated ComfyUI output to CLOUD storage (this is the only action that sends bytes off the machine). Source can be asset_id or a local path under COMFYUI_PATH/output. Destination can be S3, Azure Blob, HTTP PUT, or HuggingFace via the hf CLI.
+
+<Tip>**In plain terms:** The other direction: putting a file where ComfyUI can read it. A local file goes into ComfyUI's input/ folder (`image`/`video`/`audio`), an existing render is re-registered as an input without touching the disk (`stage` — the correct way to chain one stage into the next), and `output` is the only action that sends anything OFF this machine.</Tip>
+
+### Parameters
+
+<ParamField path="action" type="enum" required>
+  What to upload and where. "image"/"video"/"audio" send a LOCAL file (`source_path`) to ComfyUI's input/ directory; "stage" re-registers an EXISTING server-side output (`filename`) as an input; "output" ships a generated output to cloud storage (`destination`). Options: `image`, `video`, `audio`, `output`, `stage`.
+</ParamField>
+<ParamField path="source_path" type="string">
+  Absolute path to the local file to upload. REQUIRED for actions "image", "video" and "audio".
+</ParamField>
+<ParamField path="filename" type="string">
+  Two meanings, one per action. actions "image"/"video"/"audio" — OPTIONAL override for the filename in ComfyUI's input/ directory (auto-detected from source_path if omitted). action:"stage" — REQUIRED filename of the EXISTING output/temp asset to re-register (from get_history or get_image action:"list_outputs"), e.g. LTX_video_00001.mp4; its destination name override is `as_filename`, not this field.
+</ParamField>
+<ParamField path="subfolder" type="string">
+  action:"stage" — subfolder the source asset currently lives in, if any.
+</ParamField>
+<ParamField path="type" type="enum">
+  action:"stage" — source directory the asset lives in: output (default) or temp (previews). Options: `output`, `temp`.
+</ParamField>
+<ParamField path="kind" type="enum">
+  action:"stage" — force the media kind instead of inferring it from the file extension. Options: `image`, `video`, `audio`.
+</ParamField>
+<ParamField path="as_filename" type="string">
+  action:"stage" — override the filename it is registered under in the input/ directory (defaults to the source filename).
+</ParamField>
+<ParamField path="asset_id" type="string">
+  action:"output" — registered asset id from a completed job. Provide exactly one of asset_id or path.
+</ParamField>
+<ParamField path="path" type="string">
+  action:"output" — path to a generated output under COMFYUI_PATH/output. Provide exactly one of asset_id or path.
+</ParamField>
+<ParamField path="destination" type="object">
+  action:"output" — REQUIRED. Exactly one upload destination.
+</ParamField>
+
+### Examples
+
+**You say:** Use this photo as the starting image.
+
+```json
+{
+  "tool": "upload_image",
+  "arguments": {
+    "action": "image",
+    "source_path": "C:/Users/me/Pictures/cat.png"
+  }
+}
+```
+
+**You get back:** The filename it was stored under in ComfyUI's input/ directory — drop that into a LoadImage node's `image` widget.
+
+**You say:** Now feed that render into the video stage.
+
+```json
+{
+  "tool": "upload_image",
+  "arguments": {
+    "action": "stage",
+    "filename": "portrait_00042_.png"
+  }
+}
+```
+
+**You get back:** The same file registered as an INPUT, with the filename to put in the next stage's loader. Goes through the server API, so it works even when ComfyUI was launched with custom input/output directories — never guess a filesystem `input/` path.
 
 ---
 
 ## remove_background
 
-Remove an image's background, returning a transparent (RGBA) cutout — the high-level entry point. Builds a LoadImage → BiRefNetRMBG → SaveImage workflow using the ComfyUI-RMBG (BiRefNet) matting node and enqueues it on your LOCAL GPU. Upload the source first with upload_image (or stage a prior output with stage_output_as_input), then pass its filename. Requires the ComfyUI-RMBG custom node (pack: wan-transparent, or install_custom_node 'comfyui-rmbg'); the BiRefNet model auto-downloads on first run. If the node isn't installed, returns an actionable error telling you how to install it. Returns prompt_id immediately; the cutout asset_id arrives in the completion notification.
+Remove an image's background, returning a transparent (RGBA) cutout — the high-level entry point. Builds a LoadImage → BiRefNetRMBG → SaveImage workflow using the ComfyUI-RMBG (BiRefNet) matting node and enqueues it on your LOCAL GPU. Upload the source first with upload_image (action:"image") (or stage a prior output with upload_image (action:"stage")), then pass its filename. Requires the ComfyUI-RMBG custom node (pack: wan-transparent, or install_custom_node 'comfyui-rmbg'); the BiRefNet model auto-downloads on first run. If the node isn't installed, returns an actionable error telling you how to install it. Returns prompt_id immediately; the cutout asset_id arrives in the completion notification.
 
 ### Parameters
 
 <ParamField path="image" type="string" required>
-  Filename of the source image in ComfyUI's input dir (upload it first with upload_image)
+  Filename of the source image in ComfyUI's input dir (upload it first with upload_image (action:"image"))
 </ParamField>
 <ParamField path="model" type="string">
   BiRefNet matting model (default 'BiRefNet_toonout'; auto-downloaded by ComfyUI-RMBG)
@@ -195,12 +310,12 @@ Remove an image's background, returning a transparent (RGBA) cutout — the high
 
 ## upscale_image
 
-Upscale an image with an ESRGAN super-resolution model — the high-level entry point. Builds an UpscaleModelLoader → ImageUpscaleWithModel workflow (scale=2 supersamples the 4x result back down for sharper output) and enqueues it on your LOCAL GPU. Upload the source first with upload_image (or stage a prior output with stage_output_as_input), then pass its filename. Needs an upscale model in models/upscale_models/ (e.g. 4x-ClearRealityV1 / 4x_foolhardy_Remacri, provided by the anima/ernie packs or download_model); returns an actionable error if none is found. Returns prompt_id immediately; the upscaled asset_id arrives in the completion notification.
+Upscale an image with an ESRGAN super-resolution model — the high-level entry point. Builds an UpscaleModelLoader → ImageUpscaleWithModel workflow (scale=2 supersamples the 4x result back down for sharper output) and enqueues it on your LOCAL GPU. Upload the source first with upload_image (action:"image") (or stage a prior output with upload_image (action:"stage")), then pass its filename. Needs an upscale model in models/upscale_models/ (e.g. 4x-ClearRealityV1 / 4x_foolhardy_Remacri, provided by the anima/ernie packs or download_model); returns an actionable error if none is found. Returns prompt_id immediately; the upscaled asset_id arrives in the completion notification.
 
 ### Parameters
 
 <ParamField path="image" type="string" required>
-  Filename of the source image in ComfyUI's input dir (upload it first with upload_image)
+  Filename of the source image in ComfyUI's input dir (upload it first with upload_image (action:"image"))
 </ParamField>
 <ParamField path="scale" type="number">
   Net upscale factor: 2 or 4 (default 4)
@@ -218,258 +333,6 @@ Upscale an image with an ESRGAN super-resolution model — the high-level entry 
   "tool": "upscale_image",
   "arguments": {
     "image": "<image>"
-  }
-}
-```
-
----
-
-## stage_output_as_input
-
-Stage an EXISTING ComfyUI output (or temp/preview) as an INPUT so the next stage's loader (LoadImage / VHS_LoadVideo / LoadAudio) can read it. This is the CORRECT way to chain a multi-stage pipeline (e.g. Krea2 image → LTX video → WAN extend): it fetches the output's bytes from the server via /view and re-registers them as an input via /upload/image — the same endpoints get_image and upload_image use. Because it goes entirely through the server API, it works even when ComfyUI was launched with a CUSTOM input/output directory. Do NOT instead copy the output file or guess a filesystem `input/` path — the server's input dir may be custom and it will reject the file ("Invalid image file"), wasting the render. Pass an existing output reference (&#123; filename, subfolder?, type? &#125;); the media kind (image/video/audio) is inferred from the extension unless you set `kind`. Returns the registered input &#123; filename, subfolder, type: "input", kind &#125; — drop the returned `filename` straight into the loader's image/video/audio widget.
-
-### Parameters
-
-<ParamField path="filename" type="string" required>
-  Filename of the existing output/temp asset (from get_history or list_output_images), e.g. LTX_video_00001.mp4
-</ParamField>
-<ParamField path="subfolder" type="string">
-  Subfolder the asset currently lives in, if any
-</ParamField>
-<ParamField path="type" type="enum" default="output">
-  Source directory the asset lives in: output (default) or temp (previews) Options: `output`, `temp`.
-</ParamField>
-<ParamField path="kind" type="enum">
-  Force the media kind instead of inferring it from the file extension Options: `image`, `video`, `audio`.
-</ParamField>
-<ParamField path="as_filename" type="string">
-  Override the filename it is registered under in the input/ directory (defaults to the source filename)
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "stage_output_as_input",
-  "arguments": {
-    "filename": "<filename>"
-  }
-}
-```
-
----
-
-## upload_output
-
-Upload a generated ComfyUI output to cloud storage. Source can be asset_id or a local path under COMFYUI_PATH/output. Destination can be S3, Azure Blob, HTTP PUT, or HuggingFace via the hf CLI.
-
-### Parameters
-
-<ParamField path="asset_id" type="string">
-  Registered asset id from a completed job. Provide exactly one of asset_id or path.
-</ParamField>
-<ParamField path="path" type="string">
-  Path to a generated output under COMFYUI_PATH/output. Provide exactly one of asset_id or path.
-</ParamField>
-<ParamField path="destination" type="object" required>
-  Exactly one upload destination.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "upload_output",
-  "arguments": {
-    "destination": "<destination>"
-  }
-}
-```
-
----
-
-## upload_image
-
-Upload a local image file to the connected ComfyUI's input/ directory via the HTTP /upload/image endpoint so it can be referenced in LoadImage nodes. Works for both local and remote ComfyUI. Returns the stored filename.
-
-### Parameters
-
-<ParamField path="source_path" type="string" required>
-  Absolute path to the local file to upload
-</ParamField>
-<ParamField path="filename" type="string">
-  Override the filename in ComfyUI's input/ directory. Auto-detected from source path if omitted.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "upload_image",
-  "arguments": {
-    "source_path": "<source_path>"
-  }
-}
-```
-
----
-
-## upload_video
-
-Upload a local video file (.mp4, .mov, .webm, .avi, .mkv, .m4v) to the connected ComfyUI's input/ directory via the HTTP /upload/image endpoint for use in video-loading nodes such as VHS_LoadVideo (ComfyUI-VideoHelperSuite). Works for both local and remote ComfyUI. Returns the stored filename. Use upload_image for images or upload_audio for audio.
-
-### Parameters
-
-<ParamField path="source_path" type="string" required>
-  Absolute path to the local file to upload
-</ParamField>
-<ParamField path="filename" type="string">
-  Override the filename in ComfyUI's input/ directory. Auto-detected from source path if omitted.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "upload_video",
-  "arguments": {
-    "source_path": "<source_path>"
-  }
-}
-```
-
----
-
-## upload_audio
-
-Upload a local audio file (.wav, .mp3, .flac, .ogg, .m4a, .aac) to the connected ComfyUI's input/ directory via the HTTP /upload/image endpoint for use in audio-conditioned workflows (e.g. LoadAudio). Works for both local and remote ComfyUI. Returns the stored filename. Use upload_image for images or upload_video for video.
-
-### Parameters
-
-<ParamField path="source_path" type="string" required>
-  Absolute path to the local file to upload
-</ParamField>
-<ParamField path="filename" type="string">
-  Override the filename in ComfyUI's input/ directory. Auto-detected from source path if omitted.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "upload_audio",
-  "arguments": {
-    "source_path": "<source_path>"
-  }
-}
-```
-
----
-
-## list_output_images
-
-List recently generated image AND video files from ComfyUI's output/ directory, newest-first, with each file's kind ('image' | 'video'), subfolder, size, and modification time. Covers stills (.png/.jpg/.jpeg/.bmp) and video/animation outputs (.mp4/.webm/.mov/.mkv/.m4v/.avi/.gif/.webp). LOCAL ComfyUI (COMFYUI_PATH set): a RECURSIVE filesystem scan of output/ — includes subfolders like video/ that VHS/SaveVideo write to, and reports size + modification time. REMOTE ComfyUI: derives the list from /history over HTTP instead (size/modified are unavailable and omitted). It does NOT return the media bytes themselves — fetch those with get_image. USE THIS TO CONFIRM A VIDEO RENDER (e.g. VHS_VideoCombine / LTX / WAN output) when get_history shows the prompt done but lists no output: VHS-style video nodes write the file but often do NOT register in ComfyUI's /history, so the local filesystem scan is the reliable way to verify the .mp4 exists — then chain it with stage_output_as_input. Read-only.
-
-<Tip>**In plain terms:** What has ComfyUI actually written to disk lately. Worth knowing: video nodes often finish without registering in ComfyUI's history, so this is the reliable way to confirm a video really rendered.</Tip>
-
-### Parameters
-
-<ParamField path="limit" type="integer">
-  Max images to return (default: 20)
-</ParamField>
-<ParamField path="pattern" type="string">
-  Filter by filename pattern (case-insensitive substring match)
-</ParamField>
-<ParamField path="format" type="enum">
-  Response shape: markdown (default, human/agent-readable) or json (&#123;images:[&#123;filename,subfolder,kind,size,modified&#125;]&#125; — for app clients building pick grids). Options: `markdown`, `json`.
-</ParamField>
-
-### Examples
-
-**You say:** Show me the last few things I generated.
-
-```json
-{
-  "tool": "list_output_images",
-  "arguments": {
-    "limit": 10
-  }
-}
-```
-
-**You get back:** The ten newest files, newest first, each with whether it is an image or a video, its folder, size and time. Not the pictures themselves — ask to see one and the agent fetches it.
-
-**You say:** Did that fox render ever come out?
-
-```json
-{
-  "tool": "list_output_images",
-  "arguments": {
-    "pattern": "fox",
-    "limit": 5
-  }
-}
-```
-
-**You get back:** Only files whose names contain "fox".
-
----
-
-## list_assets
-
-List recently generated assets, newest-first. Each call first reconciles ComfyUI's /history, so outputs are listed even when this session did not watch the render complete (e.g. queued via panel_run, by an earlier session, or before a server restart) — those are tagged source:'history-reconcile', versus source:'watched' for renders this server saw finish. Returns count + assets (asset_id, prompt_id, filename, url, source, created_at). The registry is ephemeral and clears on server restart; records expire after COMFYUI_ASSET_TTL_HOURS (default 24h), and only the most recent completed runs are reconciled — use get_history / get_image by filename for anything older.
-
-### Parameters
-
-<ParamField path="limit" type="integer">
-  Max records to return (default: all)
-</ParamField>
-<ParamField path="since" type="string">
-  ISO timestamp — only return assets created at or after this time
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "list_assets",
-  "arguments": {}
-}
-```
-
----
-
-## get_asset_metadata
-
-Get full provenance for a registered asset including the workflow snapshot that produced it. Use this to inspect the parameters that generated an image before calling regenerate with overrides.
-
-### Parameters
-
-<ParamField path="asset_id" type="string" required>
-  Asset id returned by list_assets or job completion
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "get_asset_metadata",
-  "arguments": {
-    "asset_id": "<asset_id>"
   }
 }
 ```

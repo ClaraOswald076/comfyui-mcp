@@ -58,7 +58,7 @@ export const SCENARIOS = [
     // 0.50.0 slice 14: the DSL conversion is now visualize_workflow
     // (action:"from_dsl"), and the harness matches on the TOOL name only.
     partial: ["create_workflow", "visualize_workflow"],
-    followup: ["queue", "get_history", "list_output_images", "view_image", "list_assets", "generation_stats"],
+    followup: ["queue", "get_history", "get_image", "generation_stats"],
     verify: async (call, t) => {
       // ground truth: the prompt_id the model started must be done with outputs
       const ids = [...t.toolText.matchAll(/"prompt_id":\s*"([0-9a-f-]{8,})"/g)].map((m) => m[1]);
@@ -133,7 +133,7 @@ export const SCENARIOS = [
       "(the asset registry lists recent assets), and regenerate that asset with a steps=8 override, waiting for the " +
       "second render to complete too. Report both prompt_ids.",
     primary: ["generate_image", "enqueue_workflow"],
-    partial: ["create_workflow", "list_assets", "get_asset_metadata"],
+    partial: ["create_workflow", "get_image"],
     verify: async (call, t) => {
       // regenerate must have actually run, and there must be two DISTINCT
       // completed prompts.
@@ -203,10 +203,15 @@ export const SCENARIOS = [
       "and wait for it too. Do NOT guess file paths — use the staging tool that feeds a previous output into the next " +
       "stage's loader. Report both prompt_ids.",
     primary: ["enqueue_workflow", "generate_image"],
-    partial: ["create_workflow", "stage_output_as_input"],
+    partial: ["create_workflow", "upload_image"],
     verify: async (call, t) => {
-      // the staging tool must have actually run…
-      if (!t.calls.some((c) => c.tool === "stage_output_as_input" && c.ok)) return false;
+      // the staging ACTION must have actually run. 0.50.0 slice 15 folded
+      // the standalone staging tool into upload_image, so the tool name alone no
+      // longer proves it: a plain action:"image" upload of a local file would
+      // satisfy a name-only check while doing the opposite of what the task
+      // asked. Assert the action too.
+      if (!t.calls.some((c) => c.tool === "upload_image" && c.args?.action === "stage" && c.ok))
+        return false;
       const base = process.env.COMFYUI_URL ?? "http://127.0.0.1:8188";
       const ids = [...new Set([...t.toolText.matchAll(/"prompt_id":\s*"([0-9a-f-]{8,})"/g)].map((m) => m[1]))];
       if (ids.length < 2) return false;

@@ -45,7 +45,7 @@ The user wants to run a predefined multi-step image generation pipeline. Each re
    - Final output: high-resolution image with more detail than direct high-res generation
 
 ### Style-Transfer Recipe
-   - **Step 1 — Load source image**: Ask the user for a source image path. Use `upload_image` to make it available.
+   - **Step 1 — Load source image**: Ask the user for a source image path. Use `upload_image (action:"image")` to make it available.
    - **Step 2 — img2img with style**: `create_workflow` with `img2img`, source image from Step 1, style prompt from user, denoise 0.5-0.7 (higher = more stylized, lower = more faithful to original), 25 steps
    - Final output: source image with the requested style applied
 
@@ -58,8 +58,8 @@ The user wants to run a predefined multi-step image generation pipeline. Each re
    - If the user provides two existing images, skip generation and go straight to Step 3.
 
    - **Step 1 — Generate anchor frame**: Use Z-Image Turbo (or user's preferred model) to generate the primary frame. Use portrait orientation (832x1472) for standing subjects, landscape (1664x928) for wide scenes. Clear VRAM after.
-   - **Step 2 — Edit to create second frame**: Upload the anchor frame with `upload_image`. Use Qwen Image Edit (lightning 4-step) to transform it into the second frame. Prompt should describe the desired change while specifying relative size/position (e.g., "Replace the woman with a small cat sitting at the bottom of the image"). Clear VRAM after.
-   - **Step 3 — Generate morph video**: Upload both frames with `upload_image`. Build the WAN 2.2 dual Hi-Lo FLF workflow per the `wan-flf-video` skill:
+   - **Step 2 — Edit to create second frame**: Upload the anchor frame with `upload_image (action:"image")`. Use Qwen Image Edit (lightning 4-step) to transform it into the second frame. Prompt should describe the desired change while specifying relative size/position (e.g., "Replace the woman with a small cat sitting at the bottom of the image"). Clear VRAM after.
+   - **Step 3 — Generate morph video**: Upload both frames with `upload_image (action:"image")`. Build the WAN 2.2 dual Hi-Lo FLF workflow per the `wan-flf-video` skill:
      - Two UNETs (Remix NSFW Hi+Lo with built-in lightning, or GGUF Q8 with lightning LoRAs)
      - `ModelSamplingSD3` shift=5 on both
      - `ImageResizeKJv2` to 480x720 (portrait) or 832x480 (landscape)

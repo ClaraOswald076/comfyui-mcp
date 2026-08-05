@@ -219,7 +219,7 @@ describe("arena-report (#792)", () => {
       ...data,
       leaderboard: [
         entry({ model: "a", results: [mkFail("panel_screenshot")] }),
-        entry({ model: "b", results: [mkFail("view_image")] }),
+        entry({ model: "b", results: [mkFail("get_image")] }),
       ],
     };
     expect(suspectScenarioLines(divergent)).toHaveLength(0);

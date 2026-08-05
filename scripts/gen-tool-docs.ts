@@ -127,11 +127,12 @@ const CATEGORIES: Array<{
     icon: "images",
     description: "View, convert, and upload generated images; analyze colors; stage outputs as inputs; upload media inputs; browse outputs.",
     tools: [
-      "view_image", "get_image", "convert_image", "analyze_color",
+      // 0.50.0 slice 15 folded twelve names into these two: `get_image` is the
+      // read/inspect half (get, view, list_outputs, convert, analyze_color,
+      // list_assets, asset_metadata) and `upload_image` the write half (image,
+      // video, audio, stage, output).
+      "get_image", "upload_image",
       "remove_background", "upscale_image",
-      "stage_output_as_input", "upload_output",
-      "upload_image", "upload_video", "upload_audio",
-      "list_output_images", "list_assets", "get_asset_metadata",
     ],
   },
   {

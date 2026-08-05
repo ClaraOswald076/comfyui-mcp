@@ -377,17 +377,17 @@ in**:
    register the output in ComfyUI's `/history` (the prompt shows done with no
    output and no error). Do **NOT** decide the render "silently dropped" from
    `get_history` / `queue` (action:"status") alone — confirm the file with
-   **`list_output_images`** (it now lists videos, each tagged `kind: "video"`):
+   **`get_image (action:"list_outputs")`** (it now lists videos, each tagged `kind: "video"`):
    match the `filename_prefix` and check the mtime is fresh, then stage it.
 0. **Stage the output clip as the next run's input** with
-   **`stage_output_as_input`** (pass the rendered clip's
+   **`upload_image (action:"stage")`** (pass the rendered clip's
    `{ filename, subfolder?, type? }`); use the returned input filename in
    `VHS_LoadVideo`. **NEVER copy the output .mp4 into, or guess, a filesystem
    `input/` path** — ComfyUI's input/output dirs may be CUSTOM
    (`--input-directory` / `--output-directory`), so a guessed path makes
    `VHS_LoadVideo` fail to find/decode the file and wastes the run. The tool
    routes through the server API (`/view` → `/upload/image`), which resolves the
-   real dirs correctly. (For a clip already on local disk, `upload_video`.)
+   real dirs correctly. (For a clip already on local disk, `upload_image (action:"video")`.)
 1. Run the extension → decode → save (or keep the frames in-graph).
 2. Take the **tail of the *new* output** (the last ~13 frames) as the next
    `WanVideoEncode` input.

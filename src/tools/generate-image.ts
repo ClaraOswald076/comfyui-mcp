@@ -49,7 +49,7 @@ export function registerGenerateImageTool(server: McpServer): void {
       "filling any unspecified parameter from your configured defaults (get_defaults (action:\"set\") / COMFYUI_DEFAULT_* / config file), " +
       "auto-selecting a local checkpoint when none is given — checkpoints known to lack a text encoder " +
       "(e.g. video models) are skipped. Returns the prompt_id immediately; the resulting " +
-      "asset_id arrives in the completion notification and can be passed to view_image or regenerate. " +
+      "asset_id arrives in the completion notification and can be passed to get_image (action:\"view\") or regenerate. " +
       "For full control over the node graph, use create_workflow + enqueue_workflow instead.",
     {
       prompt: z.string().describe("Positive text prompt"),
@@ -88,7 +88,7 @@ export function registerGenerateImageTool(server: McpServer): void {
                   prompt_id: result.prompt_id,
                   queue_remaining: result.queue_remaining,
                   checkpoint: result.checkpoint,
-                  note: "asset_id will be available in the completion notification; use view_image or regenerate with it.",
+                  note: "asset_id will be available in the completion notification; use get_image (action:\"view\") or regenerate with it.",
                 },
                 null,
                 2,

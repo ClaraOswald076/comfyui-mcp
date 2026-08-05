@@ -312,7 +312,7 @@ async function handleCompletion(
     const notification = buildCompletionNotification(promptId, entry, state.startTime);
 
     // Register outputs with the AssetRegistry so they can be referenced by
-    // asset_id for view_image / regenerate. Registration requires AFFIRMATIVE
+    // asset_id for get_image (action:"view") / regenerate. Registration requires AFFIRMATIVE
     // success evidence — the shared predicate (job-history) both registration
     // paths use. The live watch only detects "finished" (WS and poll both
     // route success AND error to this handler), and notification.status is a
@@ -410,7 +410,7 @@ export const JobWatcher = {
   /**
    * Start monitoring a prompt_id for completion via WS + polling dual-track.
    * Optionally pass the submitted workflow so completed outputs can be
-   * registered with the AssetRegistry for view_image / regenerate.
+   * registered with the AssetRegistry for get_image (action:"view") / regenerate.
    */
   watch(promptId: string, workflow?: WorkflowJSON): void {
     // Don't double-watch

@@ -1897,7 +1897,7 @@ function fitQueryGraphReply(res: ToolResult, requested: unknown): ToolResult {
 // (/comfyui_mcp_panel/civitai/media?… served by the ComfyUI server the
 // orchestrator is connected to), so we fetch the top-N NON-GATED thumbnails here
 // and hand them back as MCP image content blocks — the same {type:"image"} bytes
-// mechanism panel_show_media / view_image use.
+// mechanism panel_show_media / get_image (action:"view") use.
 //
 // NSFW/consent gate preservation is the load-bearing invariant: a result the
 // panel would render as a BLURRED/gated placeholder (rating outside the user's
@@ -6554,7 +6554,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // UNDETERMINED, so telling the agent to idle and wait would park it on a
         // promise we can't keep. Say so and point at the verification path instead.
         const note = correlatable
-          ? "\n\n[IMPORTANT] You will be notified automatically with the output image(s)/video when the render finishes — do NOT poll queue (action:\"list\"), get_history, or list_output_images. Just end your turn now and wait for the result to be delivered to you."
+          ? "\n\n[IMPORTANT] You will be notified automatically with the output image(s)/video when the render finishes — do NOT poll queue (action:\"list\"), get_history, or get_image (action:\"list_outputs\"). Just end your turn now and wait for the result to be delivered to you."
           : "\n\n[IMPORTANT] The run was queued, but the panel reported NO prompt id for it, so a completion event CANNOT be correlated back to this run — its outcome will be reported to you as UNDETERMINED. Do NOT simply idle and wait indefinitely: end your turn, and if nothing arrives, confirm the outcome with get_history before acting on it.";
         // Backpressure note. A backlog is only alarming when it's a job we did NOT
         // queue (possibly foreign/stuck). Deliberately batching renders — a sweep,
@@ -6643,7 +6643,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_refresh_nodes",
-      "Re-pull the live ComfyUI server's /object_info and rebuild every combo/loader option list in the user's open tab, so an asset that appeared server-side AFTER the tab loaded becomes SELECTABLE without a manual reload (the 'press R' step) or a restart. Use this right after stage_output_as_input (chaining a stage's output into a LoadImage / VHS_LoadVideo / LoadAudio loader — the returned filename won't be in the loader's dropdown until you refresh), after downloading a model / LoRA / VAE (a freshly downloaded file is otherwise 'not a valid option' in its loader), or after installing a node pack. Then panel_set_widget / panel_add_node will accept the new value. Non-destructive: it only re-registers node defs and refreshes combo option lists — it does NOT change your graph and is undo-neutral. Idempotent (safe to call repeatedly). Returns whether the refresh authoritatively fetched fresh defs.",
+      "Re-pull the live ComfyUI server's /object_info and rebuild every combo/loader option list in the user's open tab, so an asset that appeared server-side AFTER the tab loaded becomes SELECTABLE without a manual reload (the 'press R' step) or a restart. Use this right after upload_image (action:\"stage\") (chaining a stage's output into a LoadImage / VHS_LoadVideo / LoadAudio loader — the returned filename won't be in the loader's dropdown until you refresh), after downloading a model / LoRA / VAE (a freshly downloaded file is otherwise 'not a valid option' in its loader), or after installing a node pack. Then panel_set_widget / panel_add_node will accept the new value. Non-destructive: it only re-registers node defs and refreshes combo option lists — it does NOT change your graph and is undo-neutral. Idempotent (safe to call repeatedly). Returns whether the refresh authoritatively fetched fresh defs.",
       {},
       async (_args, ctx) =>
         // Same bounded ack budget as the refresh-before-validate writes (#599): a

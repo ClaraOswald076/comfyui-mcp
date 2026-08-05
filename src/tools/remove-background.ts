@@ -29,15 +29,15 @@ export function registerRemoveBackgroundTool(server: McpServer): void {
     "remove_background",
     "Remove an image's background, returning a transparent (RGBA) cutout — the high-level entry point. " +
       `Builds a LoadImage → ${REMBG_NODE} → SaveImage workflow using the ComfyUI-RMBG (BiRefNet) matting ` +
-      "node and enqueues it on your LOCAL GPU. Upload the source first with upload_image (or stage a prior " +
-      "output with stage_output_as_input), then pass its filename. Requires the ComfyUI-RMBG custom node " +
+      "node and enqueues it on your LOCAL GPU. Upload the source first with upload_image (action:\"image\") (or stage a prior " +
+      "output with upload_image (action:\"stage\")), then pass its filename. Requires the ComfyUI-RMBG custom node " +
       "(pack: wan-transparent, or install_custom_node 'comfyui-rmbg'); the BiRefNet model auto-downloads on " +
       "first run. If the node isn't installed, returns an actionable error telling you how to install it. " +
       "Returns prompt_id immediately; the cutout asset_id arrives in the completion notification.",
     {
       image: z
         .string()
-        .describe("Filename of the source image in ComfyUI's input dir (upload it first with upload_image)"),
+        .describe("Filename of the source image in ComfyUI's input dir (upload it first with upload_image (action:\"image\"))"),
       model: z
         .string()
         .optional()
@@ -61,7 +61,7 @@ export function registerRemoveBackgroundTool(server: McpServer): void {
                   prompt_id: result.prompt_id,
                   queue_remaining: result.queue_remaining,
                   model: result.model,
-                  note: "Transparent cutout asset_id arrives in the completion notification; use view_image with it.",
+                  note: "Transparent cutout asset_id arrives in the completion notification; use get_image (action:\"view\") with it.",
                 },
                 null,
                 2,

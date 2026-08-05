@@ -53,16 +53,9 @@ export const TOOL_NAMES = [
   "restart_comfyui",
   "get_image",
   "upload_image",
-  "upload_video",
-  "upload_audio",
-  "stage_output_as_input",
-  "list_output_images",
   "clear_vram",
   "suggest_settings",
   "generation_stats",
-  "view_image",
-  "list_assets",
-  "get_asset_metadata",
   "regenerate",
   "get_defaults",
   "generate_image",
@@ -87,9 +80,6 @@ export const TOOL_NAMES = [
   "configure_manager",
   "node_pack",
   "apply_manifest",
-  "convert_image",
-  "analyze_color",
-  "upload_output",
   "health_check",
   "list_packs",
   "install_panel",
@@ -227,7 +217,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 70;
+export const MAX_TOOLS = 60;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;
@@ -1666,6 +1656,99 @@ export const DEAD_NAMES: readonly DeadName[] = [
     name: "node_pack_git",
     since: "0.50.0",
     replacement: 'node_pack (action:"git", git_action:"status"|"diff"|"log"|"commit"|"push")',
+  },
+  // 0.50.0 slice 15: the twelve image/asset tools folded into TWO
+  // action-parameterized tools, both of them SURVIVORS keeping their
+  // registration slots — the READ/INSPECT half onto `get_image` (7 actions)
+  // and the WRITE half onto `upload_image` (5 actions). Same
+  // image-management / view-image / image-convert / color-analysis /
+  // asset-registry / storage-upload services, same arguments, same return
+  // shapes (inline image blocks, the markdown/json listings, the upload
+  // prose) — only the surface changed, so every mention of the old names is
+  // now rot pointing at a 404.
+  //
+  // Split by DIRECTION OF TRAVEL rather than into one twelve-action tool:
+  // everything on `get_image` reads (its one write is saving bytes it just
+  // fetched to the caller's own save_dir), while every action on
+  // `upload_image` puts a file somewhere — ComfyUI's input/ directory or a
+  // cloud bucket. The orchestrator's call_tool whitelist depends on that
+  // split: `get_image` was whitelisted (as was `list_output_images`) and is
+  // now ACTION-scoped to exactly those two actions — see
+  // CALL_TOOL_ACTION_WHITELIST in src/orchestrator/call-tool-admission.ts —
+  // while `upload_image` was never whitelisted and still is not.
+  {
+    name: "view_image",
+    since: "0.50.0",
+    replacement: 'get_image (action:"view")',
+    allowedIn: [
+      {
+        path: "docs/blog/blind-mode-privacy.mdx",
+        context: "but get_image and view_image fetched them straight from ComfyUI's /view anyway",
+        why: "A DATED post about the v0.42.0 Blind-mode fix, narrating the two tools that leaked pixels AT THAT TIME. Rewriting it to the folded form would make the sentence read 'get_image and get_image (action:\"view\")' — a false account of what the bug was, in a frontmatter description that is also a double-quoted YAML string the replacement's quotes would break.",
+      },
+      {
+        path: "docs/blog/blind-mode-privacy.mdx",
+        context: "(`get_image`, `view_image`) fetch bytes straight from ComfyUI's HTTP `/view`",
+        why: "Same post, body: the pair of tools the reporter proved were leaking. Same collapse into 'get_image, get_image' if rewritten.",
+      },
+      {
+        path: "docs/blog/blind-mode-privacy.mdx",
+        context: "`get_image`, then to `view_image`, then remember `convert_image` returns",
+        why: "Same post, listing the tools a whack-a-mole per-tool fix would have had to chase — the point being that the list is open-ended. It is an argument about the past, not an instruction to call anything.",
+      },
+    ],
+  },
+  {
+    name: "list_output_images",
+    since: "0.50.0",
+    replacement: 'get_image (action:"list_outputs")',
+  },
+  {
+    name: "convert_image",
+    since: "0.50.0",
+    replacement: 'get_image (action:"convert")',
+    allowedIn: [
+      {
+        path: "docs/blog/blind-mode-privacy.mdx",
+        context: "then remember `convert_image` returns",
+        why: "Same dated Blind-mode post as view_image above — the third name in the open-ended list of image-returning tools a per-tool fix would have had to chase, written in the past tense about v0.42.0.",
+      },
+    ],
+  },
+  {
+    name: "analyze_color",
+    since: "0.50.0",
+    replacement: 'get_image (action:"analyze_color")',
+  },
+  {
+    name: "list_assets",
+    since: "0.50.0",
+    replacement: 'get_image (action:"list_assets")',
+  },
+  {
+    name: "get_asset_metadata",
+    since: "0.50.0",
+    replacement: 'get_image (action:"asset_metadata")',
+  },
+  {
+    name: "upload_video",
+    since: "0.50.0",
+    replacement: 'upload_image (action:"video")',
+  },
+  {
+    name: "upload_audio",
+    since: "0.50.0",
+    replacement: 'upload_image (action:"audio")',
+  },
+  {
+    name: "upload_output",
+    since: "0.50.0",
+    replacement: 'upload_image (action:"output")',
+  },
+  {
+    name: "stage_output_as_input",
+    since: "0.50.0",
+    replacement: 'upload_image (action:"stage")',
   },
 ];
 
