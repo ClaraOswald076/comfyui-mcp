@@ -277,7 +277,7 @@ fi
 
 command -v croc >/dev/null 2>&1 && log "croc available (on-demand P2P transfer)"
 
-# Dead-man switch (#269): pods created via runpod_pod_create carry a heartbeat
+# Dead-man switch (#269): pods created via the runpod tool's create action carry a heartbeat
 # server (:8189, token-gated) + a watchdog loop that STOPS THE POD if
 # comfyui-mcp's heartbeats stop (orchestrator crash/offline = the in-process
 # idle auto-stop died with it). The stop is authorized by the POD-SCOPED
@@ -291,7 +291,7 @@ elif [ -n "${RUNPOD_API_KEY:-}" ] && [ -n "${RUNPOD_POD_ID:-}" ] && [ -n "${DEAD
   nohup "${COMFY_HOME}/venv/bin/python" /opt/comfyui-mcp-deadman/deadman_server.py >>"${LOG_DIR}/deadman.log" 2>&1 &
   LOG_DIR="${LOG_DIR}" nohup /opt/comfyui-mcp-deadman/deadman_watch.sh >>"${LOG_DIR}/deadman.log" 2>&1 &
 else
-  log "dead-man switch inert (no RUNPOD_API_KEY/DEADMAN_TOKEN on the pod — only runpod_pod_create pods carry it)"
+  log "dead-man switch inert (no RUNPOD_API_KEY/DEADMAN_TOKEN on the pod — only pods deployed by the runpod tool's create action carry it)"
 fi
 
 # File Browser — web file manager for /workspace (browse/upload/download/delete),

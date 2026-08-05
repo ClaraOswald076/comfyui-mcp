@@ -131,7 +131,7 @@ export interface RunpodWatcher {
  *  pod until it exits/vanishes (codex finding: a one-shot bridge push lets the
  *  only warning evaporate on the next routine poll). */
   markConnectFailed(podId: string, frame: RunpodAlertFrame): void;
-  /** Clear a pod's failure record (e.g. after a successful runpod_pod_stop —
+  /** Clear a pod's failure record (e.g. after a successful runpod action:"stop" —
  *  otherwise an unwatched failed pod reports "still billing" forever). */
   clearConnectFailed(podId: string): void;
   /** Poll once now (also driven internally by the interval). Exposed for tests. */
@@ -146,7 +146,7 @@ export interface RunpodWatcher {
 // The orchestrator owns the watcher (it has the bridge push + the ComfyUI queue
 // monitor). The runpod_* tools run in the same process and reach it here; in a
 // bare MCP-only setup (no orchestrator) it's null and watch/unwatch are no-ops
-// (the one-shot runpod_pod_status tool still works).
+// (the one-shot runpod action:"status" still works).
 let singleton: RunpodWatcher | null = null;
 export function initRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
   singleton?.stop();
@@ -205,7 +205,7 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
   /** Failure frames by pod — the seed channel, independent of `last`. */
   const failedById = new Map<string, RunpodAlertFrame>();
   /** Pods we OWE heartbeats — independent of the UI watch lifecycle (#269
-   *  codex finding): runpod_unwatch / use_local only change what we DISPLAY;
+   *  codex finding): the unwatch / use_local actions only change what we DISPLAY;
    *  they must not cut a managed pod's only heartbeat and let its watchdog
    *  self-stop a workload the tools promised would keep running. Membership
    *  ends only when the pod exits/vanishes (poll or janitor discovers it) —

@@ -55,17 +55,8 @@ export const TOOL_NAMES = [
   "get_logs",
   "get_history",
   "diagnose_run",
-  "runpod_pod_status",
-  "runpod_list_pods",
-  "runpod_pod_start",
-  "runpod_pod_stop",
-  "runpod_pod_create",
-  "runpod_use_local",
+  "runpod",
   "runpod_watch",
-  "runpod_unwatch",
-  "runpod_pod_troubleshoot",
-  "runpod_pod_connect",
-  "runpod_deploy_link",
   "list_workflows",
   "get_workflow",
   "strip_workflow",
@@ -212,10 +203,11 @@ export type ToolName = (typeof TOOL_NAMES)[number];
  * updating — it is history, not state.
  *
  * Read from docs/design/tool-surface.txt so there is exactly one copy of the
- * baseline names (193: the 182 frozen at 0.48.32 plus the eight consolidated tools
+ * baseline names (194: the 182 frozen at 0.48.32 plus the nine consolidated tools
  * appended as they shipped — `bisect` in 0.49.0 slice 1, then `node_snapshot`,
  * `apps` and `batch` in slice 2, then `comfy_cli` in slice 3, then `queue` in
- * slice 4, then `model_metadata` in slice 5, then `workspace` in slice 6 — plus
+ * slice 4, then `model_metadata` in slice 5, then `workspace` in slice 6, then
+ * `runpod` in 0.50.0 slice 8 — plus
  * `disable_custom_node` / `enable_custom_node` / `uninstall_custom_node`, the
  * #775 cleanup surface), and so the file committed
  * as the P0 evidence is load-bearing rather than
@@ -236,7 +228,7 @@ const BASELINE_URL = new URL("../../docs/design/tool-surface.txt", import.meta.u
  * 200-line rename. APPENDING is legitimate — new tools join the baseline when they
  * ship — so the workflow is: append, update this hash, say why in the message.
  */
-export const BASELINE_SHA256 = "af84bfb4f12f02b9c9b27c4cdaa83fbed02ea125bc51d5927c42155b2782f2f7";
+export const BASELINE_SHA256 = "c4854a510bf323a9ce6315dcac98faa91d0b87487d152a3221cfa0bf480d37c6";
 
 /**
  * LAZY on purpose, and this is not a micro-optimisation.
@@ -310,7 +302,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 154;
+export const MAX_TOOLS = 145;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;
@@ -688,6 +680,71 @@ export const DEAD_NAMES: readonly DeadName[] = [
         why: "Same post, explicitly narrating the OLD behaviour in the past tense.",
       },
     ],
+  },
+  // ─────────────────────────────────────────────────────────────────────────
+  // 0.50.0 slice 8: the eleven RunPod tools folded into TWO action-parameterized
+  // tools — the pod LIFECYCLE + local⇄pod host switch into the new name `runpod`
+  // (8 actions), and the live-status/diagnosis surface into the surviving
+  // `runpod_watch` (3 actions). Same runpod-client / runpod-watch services, same
+  // control-channel requests, same return shapes — only the surface changed, so
+  // every mention of the old names is now rot pointing at a 404.
+  //
+  // Split rather than one twelve-action tool because the two halves have
+  // different blast radii: `runpod` spends and saves real money and moves the
+  // orchestrator's render target; `runpod_watch` only changes what is DISPLAYED.
+  // The orchestrator's call_tool whitelist depends on that split — see
+  // CALL_TOOL_ACTION_WHITELIST in src/orchestrator/call-tool-admission.ts, which
+  // keeps action:"create"/"start" (the two BILLING actions) unreachable from a
+  // canvas-less client exactly as their retired standalone names were.
+  {
+    name: "runpod_pod_create",
+    since: "0.50.0",
+    replacement: 'runpod (action:"create")',
+  },
+  {
+    name: "runpod_pod_start",
+    since: "0.50.0",
+    replacement: 'runpod (action:"start")',
+  },
+  {
+    name: "runpod_pod_stop",
+    since: "0.50.0",
+    replacement: 'runpod (action:"stop")',
+  },
+  {
+    name: "runpod_pod_status",
+    since: "0.50.0",
+    replacement: 'runpod (action:"status")',
+  },
+  {
+    name: "runpod_list_pods",
+    since: "0.50.0",
+    replacement: 'runpod (action:"list")',
+  },
+  {
+    name: "runpod_pod_connect",
+    since: "0.50.0",
+    replacement: 'runpod (action:"connect")',
+  },
+  {
+    name: "runpod_use_local",
+    since: "0.50.0",
+    replacement: 'runpod (action:"use_local")',
+  },
+  {
+    name: "runpod_deploy_link",
+    since: "0.50.0",
+    replacement: 'runpod (action:"deploy_link")',
+  },
+  {
+    name: "runpod_unwatch",
+    since: "0.50.0",
+    replacement: 'runpod_watch (action:"unwatch")',
+  },
+  {
+    name: "runpod_pod_troubleshoot",
+    since: "0.50.0",
+    replacement: 'runpod_watch (action:"troubleshoot")',
   },
 ];
 

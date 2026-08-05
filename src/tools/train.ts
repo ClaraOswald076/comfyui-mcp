@@ -52,12 +52,12 @@ async function resolvePodForTraining(podId?: string): Promise<import("../service
   const { getRunpodWatcher } = await import("../services/runpod-watch.js");
   const id = podId ?? getRunpodWatcher()?.watchedPodId() ?? undefined;
   if (!id) {
-    return "No pod selected: pass pod_id, or runpod_pod_connect to a pod first (runpod_list_pods shows yours).";
+    return 'No pod selected: pass pod_id, or runpod action:"connect" to a pod first (runpod action:"list" shows yours).';
   }
   const pod = await getPod(id);
-  if (!pod) return `No pod ${id} on this RunPod account (runpod_list_pods).`;
+  if (!pod) return `No pod ${id} on this RunPod account (runpod action:"list").`;
   if (pod.desiredStatus !== "RUNNING") {
-    return `Pod ${pod.id} is ${pod.desiredStatus}, not RUNNING — start it first (runpod_pod_start).`;
+    return `Pod ${pod.id} is ${pod.desiredStatus}, not RUNNING — start it first (runpod action:"start").`;
   }
   return pod;
 }
