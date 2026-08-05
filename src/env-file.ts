@@ -55,16 +55,27 @@ export function comfyuiEnvFilePath(): string {
 }
 
 /**
- * Parse the canonical env file. Returns `null` when the file does not exist or
- * cannot be read/parsed — DELIBERATELY distinct from `{}` (an existing but empty
- * file). A caller must be able to tell "the file says this key is gone" (a
- * revoke) from "I could not read the file at all" (unknown), because collapsing
- * those two makes a revoked credential look live, or a live one look revoked.
+ * Parse the canonical env file. Returns `null` ONLY when the file could not be
+ * read or parsed — never merely because it is absent.
+ *
+ * The distinction this function exists for is "the file says this key is gone"
+ * (a revoke) versus "I could not read the file at all" (unknown), because
+ * collapsing them makes a revoked credential look live or a live one look
+ * revoked. The docstring said that; the code did not (codex gate P0). An ABSENT
+ * file was returning `null`, the unknown answer — so `freshSecretValue` skipped
+ * its revoke branch and fell back to the copy seeded from the file at boot. A
+ * long-lived child then kept using, and could re-inject, a token whose file had
+ * since disappeared.
+ *
+ * An absent file is not an unreadable one: it is a successful observation that
+ * the file carries NO keys, which is exactly what an existing-but-empty file
+ * says. So ENOENT returns `{}` and joins that path. First boot is unaffected —
+ * nothing was file-derived yet, so a shell-provided value still wins.
  */
 export function parseEnvFile(): Record<string, string> | null {
   try {
     const p = comfyuiEnvFilePath();
-    if (!existsSync(p)) return null;
+    if (!existsSync(p)) return {};
     return dotenv.parse(readFileSync(p, "utf-8"));
   } catch {
     return null;

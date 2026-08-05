@@ -11,7 +11,7 @@
 // (key removed from the file) must not be papered over by that same stale value.
 
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -62,10 +62,50 @@ describe("env-file: which file is 'the' credential file", () => {
     expect(comfyuiEnvFilePath()).toBe(envPath);
   });
 
-  it("distinguishes an ABSENT file (null) from an EMPTY one ({}) — a revoke must not read as unknown", () => {
-    expect(parseEnvFile()).toBeNull();
+  it("distinguishes UNREADABLE (null) from ABSENT-or-EMPTY ({}) — a revoke must not read as unknown", () => {
+    // This test used to assert the opposite for the absent case, and that was the
+    // bug (codex gate P0). The distinction that matters is "I could not read the
+    // file" versus "the file carries no keys" — and an absent file is the SECOND
+    // of those: it is a successful observation, not a failed one. Returning the
+    // unknown answer for it made `freshSecretValue` skip its revoke branch and
+    // fall back to the copy seeded at boot, so a long-lived child kept using a
+    // token whose file had disappeared.
+    expect(parseEnvFile()).toEqual({}); // absent — carries no keys, and we know it
     writeEnv("");
-    expect(parseEnvFile()).toEqual({});
+    expect(parseEnvFile()).toEqual({}); // present but empty — the same statement
+  });
+
+  it("a file that VANISHES after boot revokes the value it seeded, rather than resurrecting it", () => {
+    // The sequence the gate walked: boot from the file, then the file disappears
+    // (an accidental delete, an interrupted replacement). The value is
+    // file-derived, so nothing else vouches for it — and continuing to serve it
+    // means a child can re-inject a credential the file no longer holds.
+    writeEnv("CIVITAI_API_TOKEN=civ-seeded");
+    expect(loadEnvFileIntoProcess()).toEqual(["CIVITAI_API_TOKEN"]);
+    expect(freshSecretValue("CIVITAI_API_TOKEN")).toBe("civ-seeded");
+
+    rmSync(envPath, { force: true });
+
+    expect(freshSecretValue("CIVITAI_API_TOKEN")).toBeUndefined();
+    expect(secretKeyPresent("CIVITAI_API_TOKEN")).toBe(false);
+  });
+
+  it("an UNREADABLE file keeps the seeded value — inconclusive is not a revoke", () => {
+    // The inverse direction, and the reason this is not simply "absent means
+    // gone": a file we could not read says nothing about the credential, and
+    // dropping a working token on a transient EACCES would be a false revoke.
+    writeEnv("CIVITAI_API_TOKEN=civ-seeded");
+    expect(loadEnvFileIntoProcess()).toEqual(["CIVITAI_API_TOKEN"]);
+
+    // A directory where the file should be: present, and unreadable as a file.
+    rmSync(envPath, { force: true });
+    mkdirSync(envPath, { recursive: true });
+    try {
+      expect(parseEnvFile()).toBeNull();
+      expect(freshSecretValue("CIVITAI_API_TOKEN")).toBe("civ-seeded");
+    } finally {
+      rmSync(envPath, { recursive: true, force: true });
+    }
   });
 });
 

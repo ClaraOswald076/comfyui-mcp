@@ -1,4 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import { MANAGED_SECRET_KEYS_ENV, resetEnvFileProvenanceForTests } from "../../env-file.js";
 import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,6 +25,7 @@ const ALL_KEYS = [...new Set([...COMFYUI_SECRET_ENV_ALLOWLIST, ...AGENT_SECRET_E
 let dir: string;
 let envPath: string;
 let savedEnv: Record<string, string | undefined>;
+let savedManagedKeys: string | undefined;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "cmcp-secrets-"));
@@ -34,10 +36,28 @@ beforeEach(() => {
     savedEnv[k] = process.env[k];
     delete process.env[k];
   }
+  // The FILE-DERIVED marker leaks between tests, and it is load-bearing: a key
+  // marked file-derived is deliberately revoked when the file no longer carries
+  // it. A previous test that saved a secret therefore left the next one starting
+  // with that key "owned by a file" that its own fresh temp dir does not have —
+  // so a shell-provided value was silently dropped, for a reason belonging to a
+  // different test. Each test gets a clean store AND a clean provenance record.
+  savedManagedKeys = process.env[MANAGED_SECRET_KEYS_ENV];
+  delete process.env[MANAGED_SECRET_KEYS_ENV];
+  // …and the IN-MEMORY half of the same record, which is the one that actually
+  // decides. `resetEnvFileProvenanceForTests` exists for exactly this and was
+  // simply not being called here: a test that saved a secret left the module
+  // believing that key belongs to a file, and the NEXT test then started with a
+  // fresh temp store that has no such file. Before, an absent file read as
+  // "unknown" and the stale belief was harmless; now that an absent file
+  // correctly revokes a file-derived value, the leak became visible.
+  resetEnvFileProvenanceForTests();
 });
 
 afterEach(() => {
   delete process.env.COMFYUI_MCP_ENV_FILE;
+  if (savedManagedKeys === undefined) delete process.env[MANAGED_SECRET_KEYS_ENV];
+  else process.env[MANAGED_SECRET_KEYS_ENV] = savedManagedKeys;
   for (const k of ALL_KEYS) {
     if (savedEnv[k] === undefined) delete process.env[k];
     else process.env[k] = savedEnv[k];

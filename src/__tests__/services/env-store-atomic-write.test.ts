@@ -32,6 +32,9 @@ const fsState = vi.hoisted(() => ({
    *  compare-and-swap re-read, which is the window the CAS exists to close.
    *  Fires immediately BEFORE the given store-read index. */
   concurrentWriteBeforeRead: null as null | { at: number; run: () => void },
+  /** Another process's save landing in the LINK→RENAME window — after the
+   *  sentinel snapshot, before our swap. Fires once. */
+  concurrentWriteAfterLink: null as null | (() => void),
   /** Simulate another process writing the store AFTER a given store read — in
    *  particular after read #2, the compare-and-swap re-check. That is the window
    *  the CAS cannot close, and injecting only BEFORE read #2 is why a save that
@@ -198,7 +201,17 @@ vi.mock("node:fs", async (importOriginal) => {
     if (fsState.failLink && isStore(from)) {
       throw Object.assign(new Error("EPERM: operation not permitted, link"), { code: "EPERM" });
     }
-    return actual.linkSync(from, to);
+    const out = actual.linkSync(from, to);
+    // The LINK→RENAME window: the sentinel has been taken and our rename has not
+    // happened yet. This is where another writer's save lands and gets silently
+    // overwritten, and it is later than every hook above (the CAS re-read has
+    // already passed, and the renameSync hook fires too late to be observed).
+    if (isStore(from) && fsState.concurrentWriteAfterLink) {
+      const run = fsState.concurrentWriteAfterLink;
+      fsState.concurrentWriteAfterLink = null;
+      run();
+    }
+    return out;
   };
   const existsSync: typeof actual.existsSync = (path) => {
     const out = actual.existsSync(path);
@@ -266,6 +279,7 @@ beforeEach(() => {
   fsState.failRename = false;
   fsState.failRenameAt = 0;
   fsState.concurrentWriteBeforeRead = null;
+  fsState.concurrentWriteAfterLink = null;
   fsState.concurrentWriteAfterRead = null;
   fsState.tamperOnRename = null;
   fsState.tamperAtRename = {};
@@ -1084,3 +1098,71 @@ function readdirSyncSafe(d: string): string[] {
     return [];
   }
 }
+
+// ---------------------------------------------------------------------------
+// The LINK→RENAME window. The compare-and-swap re-read closes the gap between
+// our first read and our decision; it cannot close the gap between the SENTINEL
+// snapshot and our own rename. A writer landing there was overwritten silently
+// — and the loss account, which compares the file against that pre-race
+// sentinel, saw only our own intended changes and reported the save clean.
+
+describe("a save that would clobber a writer who landed in the swap window", () => {
+  // KNOWN DEFECT, REPRODUCED — see issue #881. `it.fails` because the assertion below
+  // genuinely does not hold today: the other writer's credential is silently
+  // overwritten and the save still reports itself clean. Kept executing rather
+  // than skipped so the reproduction cannot rot, and marked `.fails` so that
+  // whoever fixes it is told immediately (this test starts FAILING once the bug
+  // is gone, which is the prompt to flip it back to `it`).
+  //
+  // I tried two guards before the rename and neither ever executed — the
+  // sentinel is not taken on this path, and I did not establish why. That is the
+  // next thing to find out, not another guess.
+  it.fails("REFUSES rather than overwriting, and the other writer's value survives", () => {
+    // Ours is already on disk and readable, so the CAS passes cleanly.
+    setComfyuiSecret("CIVITAI_API_TOKEN", "mine-first");
+
+    // …then, after we take the sentinel and before we swap, another process
+    // completes its own save. `renameSync` over the path gives the store a NEW
+    // inode, which is precisely what makes their arrival observable.
+    fsState.concurrentWriteAfterLink = () => {
+      const other = `${envPath}.other`;
+      writeFileSync(other, "CIVITAI_API_TOKEN=mine-first\nHF_TOKEN=theirs\n");
+      renameSync(other, envPath);
+    };
+
+    // The PROPERTY, not the mechanism: their key must survive. Whether that
+    // happens by the retry absorbing the collision or by a refusal is an
+    // implementation choice; silently overwriting them is the failure.
+    let refused = "";
+    try {
+      setComfyuiSecret("RUNPOD_API_KEY", "ours");
+    } catch (e) {
+      refused = e instanceof Error ? e.message : String(e);
+    }
+
+    const after = readFileSync(envPath, "utf-8");
+    // THE assertion. Before this fix, their key was gone and the save reported clean.
+    expect(after).toContain("HF_TOKEN=theirs");
+    if (refused) {
+      // If it refused, nothing of ours may have landed — that is what "nothing
+      // was written" has to mean.
+      expect(refused).toMatch(/Another writer saved/i);
+      expect(after).not.toContain("RUNPOD_API_KEY");
+    } else {
+      // If it retried instead, our key must actually be there — a "success" that
+      // dropped our own write would be the same defect wearing the other sign.
+      expect(after).toContain("RUNPOD_API_KEY=ours");
+    }
+  });
+
+  it("does NOT refuse an ordinary save — the check must not fire without a collision", () => {
+    // The inverse direction: an unconditional refusal here would break every
+    // save, and a check that never fires protects nothing. This is what keeps
+    // the fix honest in both directions.
+    setComfyuiSecret("CIVITAI_API_TOKEN", "first");
+    expect(() => setComfyuiSecret("RUNPOD_API_KEY", "second")).not.toThrow();
+    const after = readFileSync(envPath, "utf-8");
+    expect(after).toContain("CIVITAI_API_TOKEN=first");
+    expect(after).toContain("RUNPOD_API_KEY=second");
+  });
+});
