@@ -911,10 +911,12 @@ describe("models dir — corroborating a data-dir base by the server's own inven
     ).rejects.toThrow(/escapes/);
   });
 
-  it("DOES accept a category directory that is itself a link into the server's tree", async () => {
-    // The other direction, and the reason canonicalization is applied to the DIRECTORY
-    // too: if `<base>/models/<category>` is a link into the server's real tree, writes
-    // land there for real. Refusing that would be the over-strict half of the same bug.
+  it("refuses a category directory linked OUT of the models tree, so the two guards agree", async () => {
+    // Writes through such a link really would reach the server — but the download
+    // authorizer downstream refuses any destination whose canonical path leaves the
+    // models root. Corroborating it here would hand the caller an approval the next
+    // layer overrules: two guards contradicting each other, which is worse than either
+    // answer alone. This check is deliberately the narrower one, and says why.
     dockerServer();
     serverInventory = { diffusion_models: ["known.safetensors"] };
     const categoryDir = join(DATA_DIR, "models", "diffusion_models");
@@ -929,8 +931,13 @@ describe("models dir — corroborating a data-dir base by the server's own inven
       return String(p);
     };
 
-    const res = await resolveModelsDirWithBases({ targetCategory: "diffusion_models" });
-    expect(res.source).toBe("base-inventory-corroborated");
+    await expect(
+      resolveModelsDirWithBases({ targetCategory: "diffusion_models" }),
+    ).rejects.toThrow(/outside .* a category directory linked out of the models tree/s);
+    // The refusal names the remedy that works from here.
+    await expect(
+      resolveModelsDirWithBases({ targetCategory: "diffusion_models" }),
+    ).rejects.toThrow(/Point COMFYUI_PATH at the directory that physically holds the models/);
   });
 
   it("does not accept a DIRECTORY as one of the server's model files", async () => {

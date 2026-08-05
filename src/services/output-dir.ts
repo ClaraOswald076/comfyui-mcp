@@ -501,16 +501,23 @@ async function corroborateBaseByModelInventory(
     const unreadable: string[] = [];
     const notFiles: string[] = [];
     const escaping: string[] = [];
-    // Containment has to be PHYSICAL, so it is checked against the canonical category
-    // dir. Sharing model files between installs by symlinking them is ordinary practice,
-    // and a stale base whose `<category>/known.safetensors` is a link to the file the
-    // server really reads would satisfy a lexical check while proving the opposite: the
-    // evidence file lives elsewhere, and a NEW download written here would never appear
-    // to the server. Canonicalizing the DIRECTORY too is what keeps the legitimate case
-    // working — if `<base>/models/<category>` is itself a link into the server's tree,
-    // writes really do land there, and its entries resolve inside it.
+    // Containment has to be PHYSICAL. Sharing model files between installs by symlinking
+    // them is ordinary practice, and a stale base whose `<category>/known.safetensors` is
+    // a link to the file the server really reads would satisfy a lexical check while
+    // proving the opposite: the evidence lives elsewhere, and a NEW download written here
+    // would never appear to the server. `statSync` follows links, so nothing else notices.
+    //
+    // The canonical category must ALSO stay inside the canonical models root. A category
+    // directory that is itself a link out of the tree is a real topology — writes through
+    // it do land in the server's dir — but the download authorizer downstream refuses a
+    // destination whose canonical path escapes the models root, so corroborating it here
+    // would hand the caller an approval the next layer rejects: a contradiction between
+    // two guards, which is worse than either answer. This check is deliberately the
+    // NARROWER of the two so the layers agree; that topology keeps today's refusal.
+    let realModelsDir: string;
     let realCategoryDir: string;
     try {
+      realModelsDir = realpathSync(modelsDir);
       realCategoryDir = realpathSync(categoryDir);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException)?.code;
@@ -518,6 +525,15 @@ async function corroborateBaseByModelInventory(
         code === "ENOENT" || code === "ENOTDIR"
           ? `"${categoryDir}" does not exist, so this base holds none of what the server lists under "${category}"`
           : `"${categoryDir}" could not be canonicalized (${code ?? "unknown error"}), so nothing was established either way`;
+      continue;
+    }
+    if (!containedUnder(realModelsDir, realCategoryDir)) {
+      lastReason =
+        `"${categoryDir}" resolves to "${realCategoryDir}", outside "${realModelsDir}" — a ` +
+        "category directory linked out of the models tree. Writes through it would reach the " +
+        "server, but the download authorizer refuses a destination whose canonical path leaves " +
+        "the models root, so corroborating it here would only be overruled a step later. Point " +
+        "COMFYUI_PATH at the directory that physically holds the models instead";
       continue;
     }
     for (const name of files) {
