@@ -815,6 +815,18 @@ function seconds(ms: number): number {
   return Math.max(1, Math.round(ms / 1000));
 }
 
+/**
+ * How long to tell the caller to wait before looking again.
+ *
+ * Deliberately NOT the budget that just expired. "Re-check in another 120s" is
+ * advice nobody follows, and the whole purpose of the sentence is to get the user
+ * to look once more instead of reaching for the kill. A short, fixed interval is
+ * also the safe direction to be wrong in: checking too early costs one cheap
+ * health probe, while checking too late is the window the destructive response
+ * happens in.
+ */
+const RECHECK_HINT_S = 30;
+
 /** A probe interval a human can read — sub-second budgets must not render as "0s". */
 function describeInterval(ms: number): string {
   return ms >= 1000 ? `${Math.round(ms / 1000)}s` : `${ms}ms`;
@@ -2643,9 +2655,10 @@ export async function startComfyUI(): Promise<StartResult> {
         "the startup is NOT CONFIRMED YET — it does NOT mean it failed: ComfyUI with a normal " +
         "set of custom nodes routinely answers well after this window. " +
         "Do NOT kill it and do NOT launch a second copy onto this port. " +
-        `Re-check with health_check in another ${waitedS}s; if it is still silent then, the ` +
-        "ComfyUI logs will say why. To wait longer next time, raise " +
-        `COMFYUI_STARTUP_CHECK_MAX_TRIES (currently ${readiness.max_tries}, one probe every ` +
+        `Re-check with health_check in another ${RECHECK_HINT_S}s; if it is still silent then, ` +
+        "the ComfyUI logs will say why. To wait longer next time, raise " +
+        `COMFYUI_STARTUP_CHECK_MAX_TRIES (currently ${readiness.max_tries} ` +
+        `${readiness.max_tries === 1 ? "probe" : "probes"}, one every ` +
         `${describeInterval(readiness.interval_ms)}).` +
         (env ? ` Launch environment: ${env.note}.` : "") +
         launchEnvWarning(info),
@@ -3029,13 +3042,14 @@ async function restartViaManagerReboot(context: {
       message:
         "The ComfyUI-Manager reboot was accepted and ComfyUI went down, but it had not " +
         `answered on ${readiness.probe_url} within ${waitedS}s ` +
-        `(${readiness.attempts}/${readiness.max_tries} probes). The budget expiring means the ` +
-        "restart is NOT CONFIRMED YET — it does NOT mean it failed; a supervised cold start " +
-        `can take longer than this. Re-check with health_check in another ${waitedS}s before ` +
-        "intervening. If it is still down then, start ComfyUI from whatever supervises it (" +
+        `(${readiness.attempts}/${readiness.max_tries} probes over a ` +
+        `COMFYUI_REMOTE_REBOOT_BUDGET_S=${seconds(timing.budgetMs)}s budget). That budget ` +
+        "expiring means the restart is NOT CONFIRMED YET — it does NOT mean it failed; a " +
+        "supervised cold start can take longer than this. Re-check with health_check in " +
+        `another ${RECHECK_HINT_S}s before intervening. If it is still down then, start ` +
+        "ComfyUI from whatever supervises it (" +
         (context.label === "Desktop" ? "the ComfyUI Desktop app" : "its host") +
-        "). To wait longer next time, raise COMFYUI_REMOTE_REBOOT_BUDGET_S (currently " +
-        `${seconds(timing.budgetMs)}s).`,
+        "), or raise that budget to wait longer next time.",
       listener_ownership: unclassifiedOwnership(),
     };
   }
@@ -3209,8 +3223,8 @@ export async function restartComfyUI(): Promise<RestartResult> {
       startup: "unconfirmed",
       readiness: startResult.readiness,
       message:
-        "ComfyUI was stopped and relaunched, but the restart is NOT CONFIRMED YET " +
-        `(it is not known to have failed either): ${startResult.message}` +
+        "ComfyUI was stopped and relaunched; the restart is NOT CONFIRMED YET, and it is " +
+        `not known to have failed either — ${startResult.message}` +
         stopCaveat,
       auto_restart: startResult.auto_restart,
       launch_env: startResult.launch_env,
