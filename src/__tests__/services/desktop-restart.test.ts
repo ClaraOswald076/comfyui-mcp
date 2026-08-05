@@ -338,6 +338,42 @@ describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]",
     expect(res.message).toContain("came back ready");
   });
 
+  it("says NOTHING about launch arguments when the target moved BEFORE the reboot (#848)", async () => {
+    // The "before" argv is read by acquireProcessInfo, which runs EARLIER than the
+    // reboot helper. Capturing the fence inside that helper covered only the window
+    // it could see — a retarget between the reading and the helper left the before
+    // argv belonging to A and everything after to B, with no generation change left
+    // for the check to notice (codex gate round 2). The generation now travels WITH
+    // the reading, so this is caught.
+    __processControlTestHooks.setRemoteRebootTimingForTests({
+      settleMs: 0,
+      budgetMs: 1000,
+      intervalMs: 5,
+    });
+    let statsReads = 0;
+    hoisted.getSystemStats.mockImplementation(async () => {
+      // The FIRST read is acquireProcessInfo's; a retarget lands right after it,
+      // before the reboot helper would have captured a generation of its own.
+      statsReads += 1;
+      if (statsReads === 1) hoisted.targetGeneration.value += 1;
+      return { system: { argv: [...hoisted.desktopArgv] } };
+    });
+    hoisted.fetchMock.mockImplementation(async (url: string) => {
+      const path = pathOf(url);
+      if (path === "/v2/manager/reboot") return new Response("", { status: 200 });
+      if (path === "/system_stats") {
+        return new Response(JSON.stringify({ system: {} }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    const res = await restartComfyUI();
+
+    expect(res.ready).toBe(true);
+    expect(res.message).not.toMatch(/launch arguments/i);
+    expect(res.message).toContain("came back ready");
+  });
+
   it("refuses without killing when the Manager reboot cannot be fired (403)", async () => {
     __processControlTestHooks.setRemoteRebootTimingForTests({
       settleMs: 0,

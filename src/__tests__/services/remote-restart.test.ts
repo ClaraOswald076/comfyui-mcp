@@ -149,6 +149,11 @@ describe("restartComfyUI — remote (Manager reboot)", () => {
     // expired budget never established — that phrasing must be gone, not merely
     // reworded around.
     expect(res.message).not.toMatch(/did not come back/i);
+    // Nor may it claim the server "went down": nothing observed a down transition —
+    // the poller only records that no probe got a 2xx, which is equally consistent
+    // with a server that was never reachable from here (codex gate round 2).
+    expect(res.message).not.toMatch(/went down/i);
+    expect(res.message).toMatch(/reboot was accepted/i);
     expect(res.message).toMatch(/NOT CONFIRMED YET/);
     expect(res.message).toMatch(/does NOT mean it failed/i);
     expect(res.message).toMatch(/health_check/);
