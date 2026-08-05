@@ -767,7 +767,7 @@ describe("models dir — corroborating a data-dir base by the server's own inven
       join(DATA_DIR, "models", "diffusion_models", "sub/wan22.safetensors"),
     ]);
 
-    const res = await resolveModelsDirWithBases();
+    const res = await resolveModelsDirWithBases({ targetCategory: "diffusion_models" });
     expect(res.modelsDir).toBe(resolve(DATA_DIR, "models"));
     // Reported as corroborated LOCAL CONFIG, not as a path the server named — the
     // distinction downstream writers use.
@@ -783,26 +783,64 @@ describe("models dir — corroborating a data-dir base by the server's own inven
     serverInventory = { diffusion_models: ["present.safetensors", "elsewhere.safetensors"] };
     onDisk([join(DATA_DIR, "models", "diffusion_models", "present.safetensors")]);
 
-    await expect(resolveModelsDirWithBases()).rejects.toThrow(
+    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(
       /could not be determined/,
     );
     // …and the refusal SAYS the inventory check ran and what it found, rather than
     // resting on the code-layout reason alone.
-    await expect(resolveModelsDirWithBases()).rejects.toThrow(
+    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(
       /asking the running server what models it can SEE did not corroborate it/,
     );
-    await expect(resolveModelsDirWithBases()).rejects.toThrow(/elsewhere\.safetensors/);
+    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(/elsewhere\.safetensors/);
   });
 
-  it("REFUSES when the server reports categories but every one is empty", async () => {
+  it("REFUSES when the target category listing is empty", async () => {
     // Nothing to compare is not a match. An empty listing would otherwise "corroborate"
-    // any directory at all — the emptiest possible false positive.
+    // any directory at all — the emptiest possible false positive. This is also the
+    // honest cost of scoping to the target category: a first-ever download into a
+    // category the server has never listed cannot be corroborated, and says so.
     dockerServer();
     serverInventory = { diffusion_models: [], loras: [] };
     onDisk([]);
 
+    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(
+      /lists no files under "diffusion_models", so there is nothing there to show/,
+    );
+  });
+
+  it("does NOT authorize the whole models root from a SIBLING category's match", async () => {
+    // A server can read `diffusion_models` from this base via an extra_model_paths entry
+    // while reading `loras` from somewhere else entirely. Matching a sibling and then
+    // writing the loras file here would put it where the server never looks — and the
+    // downstream live-disagreement guard cannot catch it, because an EMPTY local `loras/`
+    // has nothing to contradict. That is the first-download case exactly.
+    dockerServer();
+    serverInventory = {
+      diffusion_models: ["qwen-image-edit.safetensors"], // fully present here
+      loras: ["somewhere-else.safetensors"], // the server reads these elsewhere
+    };
+    onDisk([join(DATA_DIR, "models", "diffusion_models", "qwen-image-edit.safetensors")]);
+
+    // The sibling still corroborates its OWN category…
+    await expect(
+      resolveModelsDirWithBases({ targetCategory: "diffusion_models" }),
+    ).resolves.toMatchObject({ source: "base-inventory-corroborated" });
+    // …and cannot vouch for the one being written to.
+    await expect(resolveModelsDirWithBases({ targetCategory: "loras" })).rejects.toThrow(
+      /somewhere-else\.safetensors/,
+    );
+  });
+
+  it("refuses the rescue outright when the caller named no category", async () => {
+    // Corroboration has to be ABOUT something. A call with no category cannot be told
+    // which folder to establish, so it gets the refusal rather than a match on whatever
+    // category happened to be checked first.
+    dockerServer();
+    serverInventory = { diffusion_models: ["a.safetensors"] };
+    onDisk([join(DATA_DIR, "models", "diffusion_models", "a.safetensors")]);
+
     await expect(resolveModelsDirWithBases()).rejects.toThrow(
-      /no non-empty model category to compare against/,
+      /did not name the model category it is downloading into/,
     );
   });
 
@@ -811,7 +849,7 @@ describe("models dir — corroborating a data-dir base by the server's own inven
     modelsDirStat = "eacces";
     serverInventory = { diffusion_models: ["a.safetensors"] };
 
-    await expect(resolveModelsDirWithBases()).rejects.toThrow(
+    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(
       /could not be inspected \(EACCES\), so nothing was established either way/,
     );
   });
@@ -821,7 +859,7 @@ describe("models dir — corroborating a data-dir base by the server's own inven
     modelsDirStat = "enoent";
     serverInventory = { diffusion_models: ["a.safetensors"] };
 
-    await expect(resolveModelsDirWithBases()).rejects.toThrow(/has no "models" directory/);
+    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(/has no "models" directory/);
   });
 
   it("does not let a listing entry ESCAPE the category dir and corroborate from outside", async () => {
@@ -832,7 +870,7 @@ describe("models dir — corroborating a data-dir base by the server's own inven
     serverInventory = { diffusion_models: ["../../../etc/hosts"] };
     existsFor = () => true; // everything "exists" — containment is what must reject it
 
-    await expect(resolveModelsDirWithBases()).rejects.toThrow(/escapes/);
+    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(/escapes/);
   });
 
   it("does not accept a DIRECTORY as one of the server's model files", async () => {
@@ -843,7 +881,7 @@ describe("models dir — corroborating a data-dir base by the server's own inven
     existsFor = () => true;
     statFor = () => ({ isDirectory: () => true, isFile: () => false });
 
-    await expect(resolveModelsDirWithBases()).rejects.toThrow(/are not regular files/);
+    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(/are not regular files/);
   });
 
   it("does not report an UNREADABLE entry as missing", async () => {
@@ -855,28 +893,23 @@ describe("models dir — corroborating a data-dir base by the server's own inven
       throw err;
     };
 
-    await expect(resolveModelsDirWithBases()).rejects.toThrow(
+    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(
       /could not be inspected under .* that is NOT a finding\s+that they are missing/s,
     );
-    await expect(resolveModelsDirWithBases()).rejects.not.toThrow(/are not under/);
+    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.not.toThrow(/are not under/);
   });
 
-  it("distinguishes 'every listing was empty' from 'no listing could be read'", async () => {
+  it("distinguishes 'the listing was empty' from 'the listing could not be read'", async () => {
     // Both leave nothing compared, and reporting the second as the first tells the user
-    // their server has no models when in fact we never got an answer.
+    // their server has no models in that category when in fact we never got an answer.
     dockerServer();
-    serverInventory = { diffusion_models: ["x"] };
-    // Category listings all fail; only /models itself answers.
-    fetchApi.mockImplementation(async (path: string) => {
-      if (path === "/models") return { ok: true, status: 200, json: async () => ["diffusion_models"] };
-      return { ok: false, status: 500, json: async () => ({}) };
-    });
+    fetchApi.mockImplementation(async () => ({ ok: false, status: 500, json: async () => ({}) }));
 
-    await expect(resolveModelsDirWithBases()).rejects.toThrow(
-      /category listings could not be read/,
+    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(
+      /listing could not be read, so there was nothing to compare against/,
     );
-    await expect(resolveModelsDirWithBases()).rejects.not.toThrow(
-      /reported no non-empty model category/,
+    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.not.toThrow(
+      /lists no files under/,
     );
   });
 
@@ -888,10 +921,10 @@ describe("models dir — corroborating a data-dir base by the server's own inven
     serverInventory = { diffusion_models: ["a.safetensors"] };
     onDisk([]); // nothing matches → the full refusal is rendered
 
-    await expect(resolveModelsDirWithBases()).rejects.toThrow(
+    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(
       /did NOT corroborate it, which is not the same as establishing it is a different install/,
     );
-    await expect(resolveModelsDirWithBases()).rejects.not.toThrow(
+    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.not.toThrow(
       /so it is a DIFFERENT install/,
     );
   });
@@ -907,25 +940,27 @@ describe("models dir — corroborating a data-dir base by the server's own inven
     });
     existsFor = () => true; // the well-formed entry WOULD match
 
-    await expect(resolveModelsDirWithBases()).rejects.toThrow(
+    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(
       /are not usable filenames, so what it sees there could not be established/,
     );
   });
 
-  it("bounds the number of category REQUESTS, not just the comparisons", async () => {
-    // `checked` used to advance only on a readable non-empty listing, so a server with
-    // thousands of empty or failing categories issued thousands of synchronous HTTP
-    // calls in front of a download.
+  it("asks the server exactly ONE question — the target category's listing", async () => {
+    // Scoping to the target category also removed the enumeration entirely: there is no
+    // /models sweep and no per-category budget to get wrong, because only one category
+    // is ever the question. This sits in front of a download, so the request count is
+    // part of the contract, not an incidental.
     dockerServer();
-    const many = Array.from({ length: 500 }, (_, i) => `cat${i}`);
-    fetchApi.mockImplementation(async (path: string) => {
-      if (path === "/models") return { ok: true, status: 200, json: async () => many };
-      return { ok: true, status: 200, json: async () => [] }; // every one empty
-    });
+    serverInventory = {
+      diffusion_models: ["a.safetensors"],
+      loras: ["b.safetensors"],
+      vae: ["c.safetensors"],
+    };
+    onDisk([join(DATA_DIR, "models", "diffusion_models", "a.safetensors")]);
 
-    await expect(resolveModelsDirWithBases()).rejects.toThrow(/could not be determined/);
-    // 1 call for /models plus a bounded number of category listings.
-    expect(fetchApi.mock.calls.length).toBeLessThanOrEqual(1 + 8);
+    await resolveModelsDirWithBases({ targetCategory: "diffusion_models" });
+    expect(fetchApi.mock.calls.length).toBe(1);
+    expect(fetchApi.mock.calls[0][0]).toBe("/models/diffusion_models");
   });
 
   it("never runs the inventory probe when the destination already resolved", async () => {
@@ -937,7 +972,7 @@ describe("models dir — corroborating a data-dir base by the server's own inven
     (config as { comfyuiPath?: string }).comfyuiPath = DATA_DIR;
     serverInventory = { diffusion_models: ["a.safetensors"] };
 
-    const res = await resolveModelsDirWithBases();
+    const res = await resolveModelsDirWithBases({ targetCategory: "diffusion_models" });
     expect(res.source).toBe("live-root");
     expect(fetchApi).not.toHaveBeenCalled();
   });
