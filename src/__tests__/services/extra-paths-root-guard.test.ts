@@ -490,6 +490,40 @@ describe("locality: 'could not look' is not 'it is not there'", () => {
     expect(notes).not.toMatch(/probably not this one/);
   });
 
+  it("reports exists:true from the READ, not from a second stat that can fail on its own", async () => {
+    // `summarize` used to re-stat the path AFTER readConfigFile had already read and
+    // parsed it. Any failure of that second lookup — a transient Windows sharing
+    // violation while an editor holds the file, a mount hiccup — became `exists: false`
+    // about a file we had just finished reading, with its parsed groups sitting right
+    // next to the claim.
+    const root = await trackTmp();
+    config.comfyuiPath = root;
+    process.env.COMFYUI_PATH = root;
+    const cfg = join(root, "extra_model_paths.yaml");
+    await writeFile(cfg, "shared:\n  vae: E:/vae\n", "utf-8");
+    // The read succeeds; only a LATER stat of the same path would fail. Scripting the
+    // errno after the read is not possible with a plain map, so instead prove the
+    // property directly: no stat of the config happens after the read at all.
+    let statsOfConfig = 0;
+    const originalError = script.statError;
+    script.statError = new Proxy({} as Record<string, string>, {
+      get: (_t, key) => {
+        if (String(key) === cfg) statsOfConfig += 1;
+        return undefined;
+      },
+    });
+    try {
+      const listed = await listExtraPaths({ target: "standalone" });
+      expect(listed.exists).toBe(true);
+      expect(listed.groups.map((g) => g.name)).toContain("shared");
+      // Exactly one lookup — the one readConfigFile makes. A second would be a second
+      // chance to be wrong about a file already read.
+      expect(statsOfConfig).toBe(1);
+    } finally {
+      script.statError = originalError;
+    }
+  });
+
   it("a genuinely absent config is still an ordinary empty result, not a refusal", async () => {
     // The other direction — ENOENT really does mean "no entries", and turning that into a
     // refusal would break the ordinary first-run case.

@@ -547,9 +547,12 @@ function probeLocalFile(path: string): LocalFile {
   }
 }
 
-async function readConfigFile(path: string): Promise<Record<string, unknown>> {
+async function readConfigFile(
+  path: string,
+): Promise<{ raw: Record<string, unknown>; exists: boolean }> {
   const found = probeLocalFile(path);
-  if (found.kind === "absent") return {}; // genuinely not there → genuinely no entries
+  // genuinely not there → genuinely no entries
+  if (found.kind === "absent") return { raw: {}, exists: false };
   if (found.kind !== "file") {
     // A config we could not LOOK AT must never be summarised as an empty one: "no extra
     // paths are configured" is a claim, and we have not earned it. Nothing was read or
@@ -567,7 +570,7 @@ async function readConfigFile(path: string): Promise<Record<string, unknown>> {
           "path (or the mount it lives on), or pass config_path with a file you can read.",
     );
   }
-  return parseConfig(await readFile(path, "utf-8"));
+  return { raw: parseConfig(await readFile(path, "utf-8")), exists: true };
 }
 
 function summarize(
@@ -576,6 +579,13 @@ function summarize(
   raw: Record<string, unknown>,
   extraNotes: string[] = [],
   serverResolved = false,
+  /**
+   * The read-time observation, threaded in rather than re-derived. Re-statting here
+   * would put a SECOND lookup between the successful read and the answer, and any
+   * failure of that second lookup (a transient sharing violation, a mount hiccup) would
+   * be reported as `exists: false` about a file we had just finished reading.
+   */
+  exists = false,
 ): ExtraPathsConfigInfo {
   const groups: ExtraPathGroup[] = [];
   for (const [name, value] of Object.entries(raw)) {
@@ -598,9 +608,7 @@ function summarize(
     "Categories are generic ComfyUI search-path keys, so model folders and custom_nodes can both be represented when supported by the running ComfyUI build.",
     "Restart ComfyUI after editing this file so startup path registration is rebuilt.",
   ];
-  // `exists` is only ever reported once readConfigFile has proven the path is a readable
-  // file or is genuinely absent, so this stat can no longer launder an EACCES into false.
-  return { target, path, exists: probeLocalFile(path).kind === "file", groups, notes };
+  return { target, path, exists, groups, notes };
 }
 
 /**
@@ -1026,9 +1034,16 @@ async function readExtraPathsConfig(
   // surface as UNRESOLVED, NOT as a normal empty config (readConfigFile maps a missing
   // file to {}, which would look authoritative — the exact failure #648 is about).
   assertRootIntact(resolved.guard);
-  const raw = await readConfigFile(resolved.path);
+  const { raw, exists } = await readConfigFile(resolved.path);
   assertRootIntact(resolved.guard);
-  return summarize(resolved.target, resolved.path, raw, resolved.notes, resolved.serverResolved);
+  return summarize(
+    resolved.target,
+    resolved.path,
+    raw,
+    resolved.notes,
+    resolved.serverResolved,
+    exists,
+  );
 }
 
 export async function listExtraPaths(
@@ -1246,7 +1261,7 @@ export async function addExtraPath(
   }
 
   assertRootIntact(resolved.guard);
-  const raw = await readConfigFile(resolved.path);
+  const { raw, exists: existedBefore } = await readConfigFile(resolved.path);
   // The no-op path ("already present") returns data from THIS read, so a root REPLACED
   // during it must fail here too — not only when a write follows (#648 review).
   assertRootIntact(resolved.guard);
@@ -1262,7 +1277,15 @@ export async function addExtraPath(
     group[category] = paths.join("\n");
     await writeConfigFile(resolved.path, raw, resolved.createParents, resolved.guard);
   }
-  const info = summarize(resolved.target, resolved.path, raw, resolved.notes, resolved.serverResolved);
+  // A completed write is itself the observation that the file is there now.
+  const info = summarize(
+    resolved.target,
+    resolved.path,
+    raw,
+    resolved.notes,
+    resolved.serverResolved,
+    existedBefore || changed,
+  );
   return {
     ...info,
     changed,
@@ -1281,7 +1304,7 @@ export async function removeExtraPath(
   const removePath = assertPathValue(opts.path);
 
   assertRootIntact(resolved.guard);
-  const raw = await readConfigFile(resolved.path);
+  const { raw, exists: existedBefore } = await readConfigFile(resolved.path);
   // Same post-read gate as add: a no-op "was not present" built from a root REPLACED
   // during the read would report the PRIOR tree's data as current (#648 review).
   assertRootIntact(resolved.guard);
@@ -1297,7 +1320,14 @@ export async function removeExtraPath(
       await writeConfigFile(resolved.path, raw, resolved.createParents, resolved.guard);
     }
   }
-  const info = summarize(resolved.target, resolved.path, raw, resolved.notes, resolved.serverResolved);
+  const info = summarize(
+    resolved.target,
+    resolved.path,
+    raw,
+    resolved.notes,
+    resolved.serverResolved,
+    existedBefore || changed,
+  );
   return {
     ...info,
     changed,

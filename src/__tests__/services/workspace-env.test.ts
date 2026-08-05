@@ -958,6 +958,60 @@ describe("getEnvironment", () => {
     }
   });
 
+  it("distinguishes 'pip answered, nothing installed' from 'pip never answered'", async () => {
+    // An empty package map has two causes and the note used to assert one of them. On a
+    // uv-created venv — which frequently has NO pip at all — the "pip did not answer"
+    // case is the common one, and calling it "none of these are installed" would be a
+    // false capability report of exactly the kind #401 is about.
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      statsReachable("3.13.12");
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 12 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") && !args.includes("pip")) {
+          return { stdout: "Python 3.13.12\n" };
+        }
+        // `pip show` prints nothing, but pip ITSELF answers → it really did look.
+        if (args.includes("--version")) return { stdout: "pip 24.0 from …\n" };
+        if (args.includes("show")) return { stdout: "" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python_probe_trusted).toBe(true);
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.note).toMatch(/pip answered and none of/);
+      expect(env.local.note).not.toMatch(/did not answer at all/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("says the query FAILED when pip itself does not answer (uv venvs often have no pip)", async () => {
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      statsReachable("3.13.12");
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 13 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") && !args.includes("pip")) {
+          return { stdout: "Python 3.13.12\n" };
+        }
+        if (args.includes("pip")) return new Error("No module named pip");
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.note).toMatch(/pip did not answer at all/);
+      expect(env.local.note).toMatch(/NOT evidence that these packages are missing/);
+      expect(env.local.note).not.toMatch(/pip answered and none of/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("compares the FULL python version, not just major.minor", async () => {
     const dir = await tmpDir();
     const exe = await stageWorkspace(dir);

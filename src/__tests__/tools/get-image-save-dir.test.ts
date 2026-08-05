@@ -224,6 +224,65 @@ describe("get_image save_dir resolution (#768)", () => {
     }
   });
 
+  it("does not use a DRIVE-RELATIVE Windows TEMP as the default", () => {
+    // `path.isAbsolute("\\Temp")` is true on Windows, but the path is drive-relative:
+    // resolve() picks up whatever drive the cwd is on. TEMP=\Windows\System32 on a
+    // C:-launched process therefore reproduces the original failure exactly.
+    if (process.platform !== "win32") return; // the hazard is Windows-only
+    const saved = { TEMP: process.env.TEMP, TMP: process.env.TMP };
+    process.env.TEMP = "\\Windows\\System32";
+    process.env.TMP = "\\Windows\\System32";
+    try {
+      expect(defaultImageSaveDir()).toBe(join(homedir(), "comfyui-images"));
+      expect(defaultImageSaveDir().toLowerCase()).not.toContain("system32");
+    } finally {
+      if (saved.TEMP === undefined) delete process.env.TEMP;
+      else process.env.TEMP = saved.TEMP;
+      if (saved.TMP === undefined) delete process.env.TMP;
+      else process.env.TMP = saved.TMP;
+    }
+  });
+
+  it("keeps the image when the DESTINATION ITSELF cannot be resolved", async () => {
+    // `resolveImageSaveDir` calls process.cwd() for a relative save_dir, and cwd throws
+    // ENOENT when the launch directory has been deleted underneath us. With resolution
+    // outside the guarded region that throw reached the outer catch and discarded a
+    // fetched image — the same loss, one line earlier.
+    cwdSpy = vi.spyOn(process, "cwd").mockImplementation(() => {
+      throw Object.assign(new Error("ENOENT: no such file or directory, uv_cwd"), {
+        code: "ENOENT",
+      });
+    });
+
+    const out = await getHandler("get_image")({ filename: "e.png", save_dir: "out" });
+
+    expect(out.content.find((c) => c.type === "image")?.data).toBe(PNG);
+    const text = out.content.map((c) => c.text ?? "").join("");
+    expect(text).toContain("NOT SAVED");
+    expect(text).toMatch(/could not even work out where to put it/);
+    expect(text).toContain("ENOENT");
+    // The remedy must still be reachable: name a default the caller can switch to.
+    expect(text).toContain("comfyui-images");
+  });
+
+  it("does not blame a whitespace-only save_dir the caller effectively did not give", async () => {
+    // resolveImageSaveDir treats "   " as omitted, so a message that says "the
+    // destination came from the save_dir argument you passed (a RELATIVE save_dir …)"
+    // describes a resolution that never happened, and sends the caller to fix an
+    // argument that is not the problem.
+    vi.mocked(mkdir).mockRejectedValueOnce(
+      Object.assign(new Error("EPERM: operation not permitted, mkdir"), { code: "EPERM" }),
+    );
+
+    const out = await getHandler("get_image")({ filename: "f.png", save_dir: "   " });
+
+    const text = out.content.map((c) => c.text ?? "").join("");
+    expect(text).toContain("NOT SAVED");
+    expect(text).toMatch(/That is the default destination/);
+    expect(text).not.toMatch(/came from the save_dir argument/);
+    expect(text).not.toMatch(/RELATIVE save_dir/);
+  });
+
   it("resolveImageSaveDir treats blank/whitespace save_dir as omitted", () => {
     expect(resolveImageSaveDir(undefined)).toBe(defaultImageSaveDir());
     expect(resolveImageSaveDir("   ")).toBe(defaultImageSaveDir());
