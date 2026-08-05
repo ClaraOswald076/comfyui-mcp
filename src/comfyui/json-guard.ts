@@ -94,18 +94,21 @@ export function bodyPrefixOf(body: string): string {
  * Every encoding of `value` a responder might plausibly echo it back in.
  *
  * Each encoding here is a FAMILY with independent axes, and the way this list
- * has failed twice is by enumerating some members of a family by hand and
- * missing one. Base64 has two axes — alphabet (standard / url-safe) and padding
- * (kept / stripped) — so it has four members; three were generated, and the
- * missing one (url-safe WITH padding) let `Pj4-Pz8=` through into a tool error
- * (codex gate). Percent-encoding and hex each have a hex-digit CASE axis that
- * was not covered at all. So generate the whole cross-product of each family
- * rather than picking members: adding an axis is then the only way to miss one.
+ * has failed by enumerating some members of a family by hand and missing one.
+ * Base64 has two axes — alphabet (standard / url-safe) and padding (kept /
+ * stripped) — so it has four members, and all four are generated here.
  *
  * This matters precisely because the shape passes below cannot cover these: a
  * short, punctuation-bearing credential encodes to a short opaque string, under
  * the 24-char run threshold and carrying no `token=` label. We HOLD the secret;
  * we do not have to infer it.
+ *
+ * PERCENT-ENCODING AND HEX ARE NOT HERE. Their axis is the CASE of each hex
+ * digit, which is per-digit, not per-string: enumerating "all upper" and "all
+ * lower" leaves every mixed-case spelling — `%2F%3f`, `6a7B` — uncovered, and
+ * enumerating all of them is 2^n strings (codex gate). Those two families are
+ * matched by PATTERN instead, in `reflectionPatterns`, which is the only form of
+ * the answer that has no members to miss.
  */
 function reflectionVariants(value: string): string[] {
   const html = value
@@ -115,34 +118,69 @@ function reflectionVariants(value: string): string[] {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
 
-  // PERCENT-ENCODING family: axis = the case of the hex digits. Node emits
-  // upper (`%2F`); plenty of proxies and web frameworks emit lower (`%2f`).
-  const lowerHexEscapes = (s: string) => s.replace(/%[0-9A-Fa-f]{2}/g, (m) => m.toLowerCase());
-  const percentForms = [encodeURIComponent(value), encodeURI(value)].flatMap((s) => [
-    s,
-    lowerHexEscapes(s),
-  ]);
-
   // BASE64 family: axes = alphabet × padding, i.e. four members, all generated.
+  // (Base64's alphabet is case-SENSITIVE — `a` and `A` are different bytes — so
+  // unlike hex it genuinely is a fixed set of strings.)
   const b64 = Buffer.from(value, "utf8").toString("base64");
   const urlSafe = (s: string) => s.replace(/\+/g, "-").replace(/\//g, "_");
   const stripPad = (s: string) => s.replace(/=+$/, "");
   const base64Forms = [b64, stripPad(b64), urlSafe(b64), stripPad(urlSafe(b64))];
 
-  // HEX family: axis = case. Hex of an 8-char credential is 16 chars — still
-  // under the 24-char run threshold, so the shape pass misses it too.
-  const hex = Buffer.from(value, "utf8").toString("hex");
-  const hexForms = [hex, hex.toUpperCase()];
+  return [value, html, value.toLowerCase(), value.toUpperCase(), ...base64Forms];
+}
 
-  return [
-    value,
-    html,
-    value.toLowerCase(),
-    value.toUpperCase(),
-    ...percentForms,
-    ...base64Forms,
-    ...hexForms,
-  ];
+/** Regex-escape a literal. */
+function reEscape(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** A regex atom matching `c` in either case when it is a letter, else literally. */
+function eitherCase(c: string): string {
+  const lower = c.toLowerCase();
+  const upper = c.toUpperCase();
+  return lower === upper ? reEscape(c) : `[${lower}${upper}]`;
+}
+
+/**
+ * The encodings whose spelling is case-INSENSITIVE per hex digit, as patterns.
+ *
+ * `%2F` and `%2f` are the same byte, and so are `6A` and `6a` in hex — the case
+ * of each digit is an independent choice the responder makes, so a fixed list of
+ * strings would have to contain 2^(digits) members to be complete. A pattern has
+ * none to miss. The NON-hex parts of a percent-encoded value stay case-SENSITIVE,
+ * because there they are the credential's own characters.
+ *
+ * Every returned pattern matches text of exactly `length` characters, so the
+ * caller can apply the same "too short to substitute safely" rule it applies to
+ * the literal candidates.
+ */
+function reflectionPatterns(value: string): { pattern: RegExp; length: number }[] {
+  const out: { pattern: RegExp; length: number }[] = [];
+
+  // PERCENT-ENCODING: only the two digits after each `%` are case-free.
+  for (const encoded of [encodeURIComponent(value), encodeURI(value)]) {
+    let source = "";
+    for (let i = 0; i < encoded.length; i++) {
+      const esc = /^%[0-9A-Fa-f]{2}/.exec(encoded.slice(i, i + 3));
+      if (esc) {
+        source += `%${eitherCase(encoded[i + 1])}${eitherCase(encoded[i + 2])}`;
+        i += 2;
+      } else {
+        source += reEscape(encoded[i]);
+      }
+    }
+    out.push({ pattern: new RegExp(source, "g"), length: encoded.length });
+  }
+
+  // HEX: every character is a hex digit, so the whole string is case-free.
+  const hex = Buffer.from(value, "utf8").toString("hex");
+  if (hex) {
+    out.push({
+      pattern: new RegExp([...hex].map(eitherCase).join(""), "g"),
+      length: hex.length,
+    });
+  }
+  return out;
 }
 
 /**
@@ -176,6 +214,16 @@ export function scrubSecretShapedText(text: string): string | null {
         if (!candidate || !out.includes(candidate)) continue;
         if (candidate.length < 8) return null; // too short to replace safely
         out = out.split(candidate).join(REDACTED);
+      }
+      // The case-insensitive families (percent-encoding, hex), matched by
+      // pattern rather than by an enumeration that could never be complete.
+      for (const { pattern, length } of reflectionPatterns(base)) {
+        // A fresh regex per use: `lastIndex` on a /g pattern makes `test` and
+        // `replace` interfere otherwise, and a guard that mis-fires because of
+        // its own bookkeeping is not a guard.
+        if (!new RegExp(pattern.source, "g").test(out)) continue;
+        if (length < 8) return null; // too short to replace safely
+        out = out.replace(new RegExp(pattern.source, "g"), REDACTED);
       }
     }
   }

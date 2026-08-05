@@ -392,6 +392,42 @@ export function receiptDisclosures(receipt: SecretSaveReceipt): string[] {
 }
 
 /**
+ * The same obligations for a REMOVAL. A revoke is a store rewrite, so it can
+ * lose credentials, drop comments, and fail to be durable exactly as a save can
+ * — and its consumer was reading only "did anything change", so an incomplete
+ * loss account came back as a clean `200 {ok:true}` (codex gate). Defined here,
+ * beside the save's, so the two cannot drift into disagreeing about what a store
+ * write owes its caller.
+ */
+export function removeDisclosures(outcome: SecretRemoveOutcome, path: string): string[] {
+  const out: string[] = [];
+  if (outcome.lostKeys.length) {
+    out.push(
+      `🛑 The store no longer carries ${outcome.lostKeys.join(", ")} — ` +
+        `${outcome.lostKeys.length > 1 ? "those credentials were" : "that credential was"} lost during this removal. ` +
+        `Inspect ${path} and restore ${outcome.lostKeys.length > 1 ? "them" : "it"} before relying on anything in it.`,
+    );
+  }
+  if (outcome.uncertainty) {
+    out.push(
+      `⚠️ Whether this removal cost anything else is NOT established: ${outcome.uncertainty}. ` +
+        `The key itself is gone; check ${path} before relying on the rest of it.`,
+    );
+  }
+  if (outcome.lostCommentLines > 0) {
+    out.push(
+      `⚠️ ${outcome.lostCommentLines} comment line${outcome.lostCommentLines > 1 ? "s" : ""} in ${path} did not survive this removal.`,
+    );
+  }
+  if (outcome.durabilityGap) {
+    out.push(
+      `⚠️ The removal was not made crash-durable: ${outcome.durabilityGap}. If the machine loses power, the credential may come back.`,
+    );
+  }
+  return out;
+}
+
+/**
  * Keys whose EVERY reader resolves them at ACCESS time from the canonical .env
  * (via env-file.ts freshSecretValue), so a value saved after a process started
  * is visible to it with no respawn:
@@ -829,17 +865,42 @@ function rewriteEnvFile(
       // readers. Filesystems without hard links (exFAT, some network mounts) fall
       // back to a copy; if neither works the account falls back to `raw` and the
       // outcome says the swap could not be snapshotted.
-      targetExistedAtSwap = existsSync(p);
-      if (targetExistedAtSwap) {
-        try {
-          linkSync(p, sentinel);
-          sentinelTaken = true;
-        } catch {
+      // The link is ATTEMPTED unconditionally — never gated on an `existsSync`
+      // first. Asking "does it exist?" and then acting is another check-then-act
+      // pair, and it had exactly the bug the sentinel exists to fix: a writer
+      // that CREATED the store between the check and the rename was clobbered
+      // while we recorded "there was nothing there" and reported a clean save
+      // (codex gate). ENOENT from the link is itself the observation, taken at
+      // the same instant as the snapshot would have been.
+      try {
+        linkSync(p, sentinel);
+        sentinelTaken = true;
+        targetExistedAtSwap = true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+          targetExistedAtSwap = false; // OBSERVED: nothing to replace
+        } else {
+          // Filesystems without hard links (exFAT, some network mounts). A copy
+          // is not atomic, but it is still a snapshot taken at the swap.
           try {
             copyFileSync(p, sentinel);
             sentinelTaken = true;
-          } catch {
-            /* no snapshot; reported below as an incomplete account */
+            targetExistedAtSwap = true;
+            // copyFileSync creates with the default mode, and this file is a
+            // copy of the credential store — put it back to owner-only at once.
+            try {
+              chmodSync(sentinel, 0o600);
+            } catch {
+              /* no-op on Windows */
+            }
+          } catch (copyErr) {
+            if ((copyErr as NodeJS.ErrnoException)?.code === "ENOENT") {
+              targetExistedAtSwap = false;
+            } else {
+              // Neither worked: we are about to replace something we could not
+              // look at. Reported below as an incomplete account.
+              targetExistedAtSwap = true;
+            }
           }
         }
       }
@@ -852,8 +913,18 @@ function rewriteEnvFile(
           /* ignore */
         }
       }
-      rmSync(tmp, { force: true });
-      rmSync(sentinel, { force: true });
+      // Cleanup must not replace the real error with its own — a catch that can
+      // throw is not a catch.
+      try {
+        rmSync(tmp, { force: true });
+      } catch {
+        /* a stray temp file is not worth losing the reason for */
+      }
+      try {
+        rmSync(sentinel, { force: true });
+      } catch {
+        /* ditto */
+      }
       // Still BEFORE the rename: the store is untouched, so refusing is correct
       // and the caller's "nothing was written" is true.
       throw err;
@@ -874,7 +945,20 @@ function rewriteEnvFile(
         basisRaw = raw;
       }
     }
-    rmSync(sentinel, { force: true });
+    // GUARDED. `rmSync` can fail (EPERM, EBUSY on Windows), and this is after
+    // the rename — an unguarded cleanup that throws here would discard the whole
+    // disclosure about a store that has already changed, which is the very
+    // failure mode this section exists to prevent (codex gate). A sentinel we
+    // cannot remove is clutter in the user's own 0600 directory, so it is
+    // reported to the log by NAME and never allowed to cost the receipt.
+    try {
+      rmSync(sentinel, { force: true });
+    } catch (err) {
+      logger.warn(
+        `[panel-secrets] could not remove the pre-write snapshot ${sentinel} (${errCode(err)}); ` +
+          `it is a copy of the credential store and can be deleted by hand.`,
+      );
+    }
     const before = dotenvParseSafe(basisRaw);
     const beforeComments = commentLines(basisRaw);
 
@@ -1313,6 +1397,12 @@ export function removeEnvSecret(key: string): SecretRemoveOutcome {
  * .env / a real env var already provides it. NON-DESTRUCTIVE — it only ADDS
  * missing keys; it never rewrites unrelated .env lines and never deletes from the
  * JSON store (left inert). Idempotent. Returns the keys migrated.
+ *
+ * This runs at BOOT, where there is no receipt to hand anything back on — so
+ * what the write cost is LOGGED rather than dropped. It was being discarded
+ * outright, and the key then reported as migrated and hydrated into process.env,
+ * so a migration that destroyed another credential looked like a clean start
+ * (codex gate). Key NAMES only ever reach the log.
  */
 export function migrateSecretsToEnv(): string[] {
   const s = read();
@@ -1323,7 +1413,21 @@ export function migrateSecretsToEnv(): string[] {
       if (typeof v !== "string" || !v) continue;
       if (!isAllowedSecretKey(k)) continue;
       if (process.env[k]) continue; // .env / real env already wins
-      upsertEnvFile(k, v);
+      const outcome = upsertEnvFile(k, v);
+      if (outcome.lostKeys.length) {
+        logger.warn(
+          `[panel-secrets] migrating ${k} into ${envFilePath()} lost ${outcome.lostKeys.join(", ")} — ` +
+            `inspect that file and restore the missing entries before relying on it.`,
+        );
+      } else if (outcome.lossCheck === "unknown") {
+        logger.warn(
+          `[panel-secrets] migrating ${k} into ${envFilePath()}: whether it cost any other credential is NOT established — ` +
+            `${outcome.lossCheckNote ?? "the whole-file check could not be completed"}.`,
+        );
+      }
+      if (outcome.durabilityGap) {
+        logger.warn(`[panel-secrets] migrating ${k}: ${outcome.durabilityGap}`);
+      }
       process.env[k] = v;
       // The canonical file is this value's AUTHORITY now — it lives there. Without
       // the mark it would read as SHELL-provided, so buildComfyuiMcpEnv would
