@@ -1433,6 +1433,13 @@ export class OllamaBackend implements AgentBackend {
     // the ready line still explained the old decision. Flag it here and let the
     // next turn re-spawn at a point where nothing is in flight.
     if (!isOllamaModel(model)) return;
+    // #790 — `attachmentsAccepted` is proof about the model that accepted the
+    // media, not about the endpoint forever. Carrying it across a switch would
+    // let the NEW model's rejection fall through the guard: no strip-and-retry,
+    // no "I did NOT hear it", just a generic error — the silent unheard
+    // attachment again, this time hidden by the very flag that exists to stop
+    // the opposite mistake.
+    if (model !== this.model) this.attachmentsAccepted = false;
     this.model = model;
   }
 

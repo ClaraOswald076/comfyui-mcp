@@ -411,6 +411,21 @@ describe("#790 — a later error must not fabricate a delivery failure", () => {
     expect(events.some((e) => e.type === "error")).toBe(true);
   });
 
+  it("the acceptance proof does NOT survive a model switch", async () => {
+    // It is proof about the model that took the media, not about the endpoint
+    // forever. Carried across a switch it would swallow the NEW model's
+    // rejection — the silent unheard attachment again, hidden by the very flag
+    // that exists to prevent the opposite mistake.
+    const backend = nativeBackend();
+    await collect(backend, turnsOf(AUDIO_TURN)); // gemma4:e2b accepts it
+    await backend.setModel("qwen3:4b");
+    showCapabilities = "http-error"; // unverified, so delivery is attempted
+    rejectNextChatWith = "unsupported media type";
+    const said = assistantText(await collect(backend, turnsOf(AUDIO_TURN)));
+    expect(said).toContain("rejected the request carrying the audio attachment");
+    expect(said).toContain("did NOT hear it");
+  });
+
   it("when only an EARLIER turn's media is in history, it does not claim the user's new message lost anything", async () => {
     const b2 = nativeBackend();
     const anyB2 = b2 as unknown as { history: Array<Record<string, unknown>> };
