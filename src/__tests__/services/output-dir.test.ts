@@ -22,7 +22,10 @@ let modelsDirStat: "dir" | "file" | "enoent" | "eacces" = "dir";
  *  `existsFor`/`liveRootExists` says it exists, ENOENT otherwise — so existing tests are
  *  unaffected and the #851 cases can make one entry a directory or unreadable. */
 let statFor: ((p: string) => { isDirectory: () => boolean; isFile: () => boolean }) | undefined;
+/** Canonicalization, for the #851 physical-containment check. Identity by default. */
+let realpathFor: ((p: string) => string) | undefined;
 vi.mock("node:fs", () => ({
+  realpathSync: (p: string) => (realpathFor ? realpathFor(String(p)) : String(p)),
   existsSync: (p: string) => (existsFor ? existsFor(String(p)) : liveRootExists),
   statSync: (p: string) => {
     const path = String(p);
@@ -140,6 +143,7 @@ beforeEach(() => {
   existsFor = undefined;
   modelsDirStat = "dir";
   statFor = undefined;
+  realpathFor = undefined;
   serverInventory = undefined;
   fetchApi.mockClear();
   fetchApi.mockImplementation(defaultFetchApi);
@@ -884,6 +888,46 @@ describe("models dir — corroborating a data-dir base by the server's own inven
       join(DATA_DIR, "models", "diffusion_models", "..model.safetensors"),
       join(DATA_DIR, "models", "diffusion_models", "sub/..other.gguf"),
     ]);
+
+    const res = await resolveModelsDirWithBases({ targetCategory: "diffusion_models" });
+    expect(res.source).toBe("base-inventory-corroborated");
+  });
+
+  it("does not let a SYMLINKED evidence file corroborate a stale base", async () => {
+    // Sharing model files between installs by symlinking them is ordinary practice. A
+    // stale base whose `<category>/known.safetensors` is a link to the file the server
+    // really reads satisfies a lexical check while proving the opposite: the evidence
+    // lives elsewhere, and a NEW download written here would never appear to the server.
+    // `statSync` follows links, so nothing before this noticed.
+    dockerServer();
+    serverInventory = { diffusion_models: ["known.safetensors"] };
+    const linked = join(DATA_DIR, "models", "diffusion_models", "known.safetensors");
+    onDisk([linked]);
+    realpathFor = (p) =>
+      resolve(p) === resolve(linked) ? resolve("/elsewhere/real/known.safetensors") : String(p);
+
+    await expect(
+      resolveModelsDirWithBases({ targetCategory: "diffusion_models" }),
+    ).rejects.toThrow(/escapes/);
+  });
+
+  it("DOES accept a category directory that is itself a link into the server's tree", async () => {
+    // The other direction, and the reason canonicalization is applied to the DIRECTORY
+    // too: if `<base>/models/<category>` is a link into the server's real tree, writes
+    // land there for real. Refusing that would be the over-strict half of the same bug.
+    dockerServer();
+    serverInventory = { diffusion_models: ["known.safetensors"] };
+    const categoryDir = join(DATA_DIR, "models", "diffusion_models");
+    const realCategory = resolve("/srv/real/models/diffusion_models");
+    onDisk([join(categoryDir, "known.safetensors")]);
+    realpathFor = (p) => {
+      const r = resolve(p);
+      if (r === resolve(categoryDir)) return realCategory;
+      if (r === resolve(join(categoryDir, "known.safetensors"))) {
+        return join(realCategory, "known.safetensors");
+      }
+      return String(p);
+    };
 
     const res = await resolveModelsDirWithBases({ targetCategory: "diffusion_models" });
     expect(res.source).toBe("base-inventory-corroborated");
