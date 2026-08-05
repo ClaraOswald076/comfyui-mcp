@@ -10,12 +10,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
- * Every env a stdio child was actually CONNECTED with, in order.
+ * Every env a stdio child was handed by a COMPLETED `Client.connect`, in order.
  *
- * Recorded in the mocked `Client.connect`, not in the transport constructor: a
+ * Recorded in the mocked connect rather than in the transport constructor: a
  * transport that is built and never connected spawns nothing, so asserting on
  * construction alone would let "we computed the right env and never used it"
- * pass as "the child came up in the right mode".
+ * pass as "the child came up in the right mode". The mock also refuses to serve
+ * tools before that connect finishes, so a connect whose result is not waited
+ * for fails here the way it would in production — an unconnected client that
+ * still gets asked for its catalog.
  */
 const spawnEnvs: Array<Record<string, string>> = [];
 
@@ -33,10 +36,17 @@ vi.mock("@modelcontextprotocol/sdk/client/stdio.js", () => ({
 
 vi.mock("@modelcontextprotocol/sdk/client/index.js", () => ({
   Client: class {
+    connected = false;
     async connect(transport: FakeStdioTransport) {
+      // A real connect spawns a process and handshakes; it does not complete in
+      // the caller's tick. The macrotask makes "the caller didn't wait" visible
+      // rather than accidentally harmless.
+      await new Promise((r) => setTimeout(r, 0));
+      this.connected = true;
       spawnEnvs.push(transport.env);
     }
     async listTools() {
+      if (!this.connected) throw new Error("listTools before connect completed");
       return { tools: [{ name: "list_tools", description: "d", inputSchema: { type: "object" } }] };
     }
     async close() {}
@@ -62,6 +72,11 @@ afterEach(() => {
   delete process.env.COMFYUI_MCP_TOOL_MODE;
 });
 
+/** The tool surface this backend really ended up with. */
+function surfaceOf(backend: unknown) {
+  return backend as { toolModeDecision: { mode: string } | null; comfyTools: unknown[] };
+}
+
 function backendFor(model: string) {
   return new OllamaBackend({
     model,
@@ -71,9 +86,15 @@ function backendFor(model: string) {
 
 describe("#788 — the spawned comfyui child really gets the mode chosen for the MODEL", () => {
   it("spawns compact for a small model", async () => {
-    await backendFor("qwen3:4b").prepare();
+    const backend = backendFor("qwen3:4b");
+    await backend.prepare();
     expect(spawnEnvs).toHaveLength(1);
     expect(spawnEnvs[0].COMFYUI_MCP_TOOL_MODE).toBe("compact");
+    // …and the surface is LIVE: a connect that was fired and not waited for
+    // leaves the catalog unreadable, which connectTools turns into no decision
+    // at all. Asserting the env alone would not notice.
+    expect(surfaceOf(backend).toolModeDecision?.mode).toBe("compact");
+    expect(surfaceOf(backend).comfyTools).toHaveLength(1);
   });
 
   it("spawns full for a large model", async () => {
