@@ -336,6 +336,13 @@ interface RunningClearance {
    *  means the queue stopped answering PARTWAY through, not that it never
    *  answered — the messages must not conflate the two). */
   observed: boolean;
+  /** EVERY poll in the window answered. A single failure in the middle is a
+   *  HOLE in the observation: the job could have stopped and another started
+   *  inside it, or ComfyUI could have restarted. The outcome is still whatever
+   *  the last live poll saw — a hole does not make a present-tense reading
+   *  wrong — but nothing may narrate a gapped window as continuous verified
+   *  polling. */
+  continuous: boolean;
 }
 
 /** Poll /queue until the target running job is gone (or any-running is gone when
@@ -354,19 +361,24 @@ async function waitForRunningCleared(
   const start = Date.now();
   let everObserved = false;
   let lastPollFailed = false;
+  // Sticky, unlike `lastPollFailed`: a later successful poll re-establishes the
+  // PRESENT state, but it cannot retroactively fill in what happened while the
+  // queue was not answering.
+  let anyPollFailed = false;
   while (Date.now() - start < timeoutMs) {
     await sleep(1500);
     const q = await getQueueSummary().catch(() => null);
     if (!q) {
       lastPollFailed = true;
+      anyPollFailed = true;
       continue;
     }
     everObserved = true;
     lastPollFailed = false;
-    if (q.running === 0) return { outcome: "cleared", observed: true };
+    if (q.running === 0) return { outcome: "cleared", observed: true, continuous: !anyPollFailed };
     // A DIFFERENT job is now running → the one we targeted has cleared.
     if (promptId && !q.running_jobs.some((j) => j.prompt_id === promptId)) {
-      return { outcome: "cleared", observed: true };
+      return { outcome: "cleared", observed: true, continuous: !anyPollFailed };
     }
   }
   // Timed out. "Still running" is a claim about NOW, and only a poll that is
@@ -375,6 +387,7 @@ async function waitForRunningCleared(
   return {
     outcome: everObserved && !lastPollFailed ? "still-running" : "unobservable",
     observed: everObserved,
+    continuous: !anyPollFailed,
   };
 }
 
@@ -387,6 +400,27 @@ export interface EscalatedCancelResult {
    *  neither "stopped" nor "wedged" (a crashed ComfyUI also stops answering,
    *  and takes the job with it). */
   unverified?: boolean;
+  /**
+   * What a LIVE /queue read established about the target when the call ended —
+   * the one question a caller has to answer before dispatching more work.
+   *
+   * Deliberately separate from `unverified`, which covers a DIFFERENT unknown:
+   * `unverified` can mean "it demonstrably stopped, but we cannot say our
+   * interrupt is why". That is a caveat on the narration, not on the queue.
+   * Folding both into one flag is how a caller ends up refusing to proceed
+   * against a queue that is verifiably empty — or, the way round the gate
+   * caught, treating an unreadable queue as an empty one.
+   *
+   *  - "stopped" — a live read showed the target gone (or showed nothing to
+   *    interrupt in the first place). Safe to queue.
+   *  - "running" — a live read showed it STILL running: the wedge.
+   *  - "unknown" — /queue could not be read, so neither is established.
+   */
+  target_state: "stopped" | "running" | "unknown";
+  /** clear_pending was asked for and the clear did not complete — the pending
+   *  jobs may still be queued. Distinct from `pending_cleared: undefined`,
+   *  which is also what "clear_pending was never requested" looks like. */
+  pending_clear_failed?: boolean;
   pending_cleared?: number; // how many pending jobs were dropped (if clear_pending)
   running_prompt_id?: string;
   message: string;
@@ -439,6 +473,8 @@ export async function cancelRunningJobEscalating(opts: {
       honored: true,
       freed_vram: false,
       wedged: false,
+      target_state: "stopped",
+      pending_clear_failed: clearPendingFailed || undefined,
       pending_cleared,
       message: `No job is running.${opts.clear_pending ? ` ${pendingNote}` : ""}`,
     };
@@ -449,6 +485,8 @@ export async function cancelRunningJobEscalating(opts: {
       honored: true,
       freed_vram: false,
       wedged: false,
+      target_state: "stopped",
+      pending_clear_failed: clearPendingFailed || undefined,
       pending_cleared,
       message:
         `${opts.prompt_id} is not running (verified via /queue) — nothing to interrupt.` +
@@ -470,6 +508,8 @@ export async function cancelRunningJobEscalating(opts: {
         freed_vram: false,
         wedged: false,
         unverified: true,
+        target_state: "stopped",
+        pending_clear_failed: clearPendingFailed || undefined,
         pending_cleared,
         running_prompt_id: runningId,
         message:
@@ -484,6 +524,8 @@ export async function cancelRunningJobEscalating(opts: {
       honored: true,
       freed_vram: false,
       wedged: false,
+      target_state: "stopped",
+      pending_clear_failed: clearPendingFailed || undefined,
       pending_cleared,
       running_prompt_id: runningId,
       message: `Interrupted the running job${runningId ? ` (${runningId})` : ""}.${
@@ -518,10 +560,26 @@ export async function cancelRunningJobEscalating(opts: {
   // The duration the message may claim: continuous verified polling only when
   // the FIRST window was observed end-to-end; otherwise only the final check
   // was a live observation, and the message must not claim more.
-  const watchedDuration = (first: RunningClearance): string =>
-    first.outcome === "still-running"
-      ? ` across ~${Math.round((interruptHonorMs() + Math.min(interruptHonorMs(), 12000)) / 1000)}s of verified polling`
-      : ` at a verified check ~${Math.round(Math.min(interruptHonorMs(), 12000) / 1000)}s after the escalation`;
+  //
+  // "End-to-end" means EVERY poll answered. A window with a hole in it still
+  // supports the present-tense reading its last live poll made — but calling it
+  // "~Ns of verified polling" is a sampled observation with a gap narrated as
+  // continuous verification, and this claim is load-bearing: it is what makes
+  // "restart ComfyUI, do NOT queue another run" sound settled. A restart or a
+  // disconnect inside the gap is exactly the case that guidance would be wrong
+  // about, so the gap is named rather than smoothed over.
+  const escalationWindowS = Math.round(Math.min(interruptHonorMs(), 12000) / 1000);
+  const watchedDuration = (first: RunningClearance): string => {
+    if (first.outcome !== "still-running") {
+      return ` at a verified check ~${escalationWindowS}s after the escalation`;
+    }
+    const totalS = Math.round((interruptHonorMs() + Math.min(interruptHonorMs(), 12000)) / 1000);
+    return first.continuous
+      ? ` across ~${totalS}s of verified polling`
+      : ` across ~${totalS}s of polling that /queue did NOT answer throughout — it was ` +
+          `seen running by the polls that did answer, including the most recent one, but ` +
+          `the gap could hide a restart`;
+  };
   // "The job stopped" (or "this job is wedged") is only ours to claim when the
   // target was seen running BEFORE the interrupt. A named prompt first sighted
   // in a later window may have STARTED after the interrupt — the interrupt was
@@ -576,6 +634,8 @@ export async function cancelRunningJobEscalating(opts: {
       freed_vram: freedVram,
       wedged: false,
       unverified: stopVerified ? undefined : true,
+      target_state: "stopped",
+      pending_clear_failed: clearPendingFailed || undefined,
       pending_cleared,
       running_prompt_id: runningId,
       message,
@@ -601,6 +661,8 @@ export async function cancelRunningJobEscalating(opts: {
       freed_vram: freedVram,
       wedged: false,
       unverified: true,
+      target_state: "unknown",
+      pending_clear_failed: clearPendingFailed || undefined,
       pending_cleared,
       running_prompt_id: runningId,
       message:
@@ -629,6 +691,8 @@ export async function cancelRunningJobEscalating(opts: {
       freed_vram: freedVram,
       wedged: true,
       unverified: true,
+      target_state: "running",
+      pending_clear_failed: clearPendingFailed || undefined,
       pending_cleared,
       running_prompt_id: runningId,
       message:
@@ -651,6 +715,8 @@ export async function cancelRunningJobEscalating(opts: {
     honored: false,
     freed_vram: freedVram,
     wedged: true,
+    target_state: "running",
+    pending_clear_failed: clearPendingFailed || undefined,
     pending_cleared,
     running_prompt_id: runningId,
     message:

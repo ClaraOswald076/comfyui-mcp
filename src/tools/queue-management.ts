@@ -29,7 +29,8 @@ import { errorToToolResult } from "../utils/errors.js";
  * the one deliberate behavioural difference a flat enum permits. Each branch
  * calls the same service function the old tool called, with the same arguments,
  * and returns the identical content block (JSON for the query actions, the
- * prose messages for cancel/cancel_queued/clear, isError on a wedged cancel).
+ * prose messages for cancel/cancel_queued/clear, isError on a cancel whose
+ * outcome no live /queue read settled).
  */
 export function registerQueueManagementTools(server: McpServer): void {
   server.tool(
@@ -139,9 +140,30 @@ export function registerQueueManagementTools(server: McpServer): void {
               prompt_id: args.prompt_id,
               clear_pending: args.clear_pending,
             });
+            // An MCP success is read as permission to carry on and queue more
+            // work, so it may only be given for an outcome a LIVE /queue read
+            // settled. `wedged` alone is not that test: an unreachable /queue
+            // makes the service report `target_state:"unknown"` with
+            // `wedged:false`, and answering that with a plain success turns the
+            // service's honest "could not determine" back into "determined it
+            // stopped" — one level up. Same for a `clear_pending` the caller
+            // asked for that did not complete: the backlog it was meant to
+            // remove may still be there to stack behind.
+            //
+            // DISCLOSE, DO NOT HIDE: `result.message` is returned unchanged in
+            // both cases. The cancel may well have happened — for an unreadable
+            // queue that is one of the live possibilities — and the message says
+            // so, along with what to check. isError marks the outcome unsettled;
+            // it does not claim the cancel failed.
+            //
+            // And NOT on `unverified`, which is a caveat about WHY the job
+            // stopped, not WHETHER: `target_state:"stopped"` there comes from a
+            // live read of an empty queue. Failing that would refuse a caller
+            // the queue it can see is free.
+            const unsettled = result.target_state !== "stopped" || !!result.pending_clear_failed;
             return {
               content: [{ type: "text" as const, text: result.message }],
-              ...(result.wedged ? { isError: true } : {}),
+              ...(unsettled ? { isError: true } : {}),
             };
           }
           case "cancel_queued": {
