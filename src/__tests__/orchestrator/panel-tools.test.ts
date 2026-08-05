@@ -4876,8 +4876,9 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
     // …but the session is read-only, and the remedy is the one that exists.
     expect(JSON.parse(text).graph_binding).toBe("reads_only");
     expect(text).toMatch(/graph MUTATIONS are still refused for this tab/);
-    expect(text).toMatch(/UPDATE the comfyui-mcp-panel pack/);
-    expect(text).toMatch(/which no rebind can add/);
+    expect(text).toMatch(/update the comfyui-mcp-panel pack/);
+    // The remedy must not tell the caller to re-run a tool that cannot help.
+    expect(text).toMatch(/including calling this tool again — can add it/);
   });
 
   it("reports `bound` when the panel DOES advertise the write fence", async () => {

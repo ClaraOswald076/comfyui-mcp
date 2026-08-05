@@ -2252,11 +2252,18 @@ function describeFenceRebind(
 } {
   // A panel that cannot fence a WRITE gives reads only, however good the stamp is.
   const mutationsRefused = canMutate === false;
+  // Its own remedy, NOT the reload sentence: re-calling this tool cannot add a
+  // missing panel capability, so telling the caller to "call this again" here
+  // would be another instruction that provably cannot work.
   const mutationCaveat = mutationsRefused
     ? `\n\nBUT graph MUTATIONS are still refused for this tab: its panel build does not ` +
-      `advertise the write-boundary workflow fence a graph edit requires, which no rebind can ` +
-      `add. Reads work now. To make edits work, UPDATE the comfyui-mcp-panel pack, then ` +
-      `${RELOAD_TAB_REMEDY}`
+      `advertise the write-boundary workflow fence a graph edit requires, and no rebind — ` +
+      `including calling this tool again — can add it. Reads work now (this call just read the ` +
+      `live canvas).\n\nWHAT TO DO FOR EDITS: update the comfyui-mcp-panel pack, then have the ` +
+      `user HARD-refresh (Ctrl+Shift+R) the ComfyUI browser tab — an open tab keeps running its ` +
+      `cached bundle, so the capability lags the version on disk until it does. Do NOT use ` +
+      `panel_reload for this: it has been observed to leave the tab permanently unresponsive ` +
+      `(#803).`
     : "";
   switch (r.status) {
     case "refreshed":
