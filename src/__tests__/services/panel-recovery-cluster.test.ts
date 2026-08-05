@@ -2759,6 +2759,57 @@ describe("a wholesale replacement needs the RUNNING server to have chosen the tr
   });
 });
 
+describe("status does not let a live reading of ANOTHER tree certify the frozen one (#820)", () => {
+  it("a live-derived resolution naming a DIFFERENT tree does not prove the frozen tree's absence", async () => {
+    // The pin froze the CONFIGURED fallback (the probe failed at pin time); a
+    // re-resolution of the same target then named the server's real root — no
+    // retarget, no generation bump. The absence was observed in the frozen
+    // tree; a live reading about ANOTHER tree must not "prove" it and unblock
+    // an install there.
+    workspace.base = root;
+    workspace.reachable = false;
+    __resetPanelBaseCache();
+    const pinned = await pinPanelBase(defaultDeps);
+    expect(pinned.comfyuiPath()).toBe(root);
+    const otherRoot = mkdtempSync(join(tmpdir(), "cmcp-other-"));
+    mkdirSync(join(otherRoot, "custom_nodes"), { recursive: true });
+    try {
+      __setPanelBaseForTests(otherRoot, "live-argv-root");
+      const { panelStatus } = await import("../../services/panel-installer.js");
+      const { evaluatePanelSync } = await import("../../services/panel-sync.js");
+      const status = await panelStatus(pinned);
+      expect(status.installed).toBe(false);
+      expect(status.absenceProven).toBe(false);
+      expect(evaluatePanelSync(status).decision).toBe("blocked");
+      // The note must name the actual cause — not assert the plain
+      // "Not installed" the flipped resolution used to certify.
+      expect(status.note).toMatch(/DIFFERENT tree/);
+      expect(status.note).toContain(otherRoot);
+      expect(status.note).not.toMatch(/Not installed\. Run install_panel/);
+      // Nor may it attribute this scan to the live root it did not scan.
+      expect(status.note).not.toMatch(/Resolved (against|from) the RUNNING/);
+    } finally {
+      rmSync(otherRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("a live-derived resolution naming the SAME tree still proves the absence", async () => {
+    // The reverse fold — an over-strict check refusing a real finding — is the
+    // same defect pointed at a positive: a corroborated absence must still be
+    // reported as proven.
+    workspace.base = undefined;
+    workspace.reachable = true;
+    workspace.liveArgv = [`${root}/main.py`];
+    __resetPanelBaseCache();
+    const { panelStatus } = await import("../../services/panel-installer.js");
+    const status = await panelStatus();
+    expect(status.installed).toBe(false);
+    expect(status.absenceProven).toBe(true);
+    expect(status.note).toMatch(/Not installed\. Run install_panel/);
+    expect(status.note).toMatch(/Resolved from the RUNNING/);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // 4. Target resolution (#766, #769)
 // ---------------------------------------------------------------------------

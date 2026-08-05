@@ -258,6 +258,18 @@ describe("panel version pin", () => {
     });
   });
 
+  it("a ZERO-BYTE settings file (a torn write) reads as empty, not indeterminate (#798)", () => {
+    // Zero bytes provably contain no pin; treating the torn write as
+    // unreadable would hold the panel pinned-indeterminate forever over a file
+    // that records nothing.
+    mkdirSync(dirname(settingsPath), { recursive: true });
+    writeFileSync(settingsPath, "");
+    expect(getPanelPinState({})).toMatchObject({ pinned: false });
+    // And a new write lands cleanly on top of it.
+    setPanelVersionPin("0.11.20");
+    expect(getPanelPinState({})).toMatchObject({ pinned: true, version: "0.11.20" });
+  });
+
   it.each(["[]", '["a"]', "null", '"x"', "42"])(
     "valid JSON that isn't a plain object (%s) reads as PINNED-indeterminate",
     (body) => {

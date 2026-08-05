@@ -2845,6 +2845,135 @@ describe("defaultBridgeTimeoutMs — tolerant read timeout (#357)", () => {
     );
     a.close();
   });
+
+  // #803 — the no-reply timeout named `conn.tabId.slice(0, 8)`. Routing ids are
+  // `wf:<path>`, so EVERY workflow tab rendered as the identical, alarming
+  // `wf:workf`: two tabs timing out were indistinguishable in a transcript and
+  // the id read like a corrupted routing key (it sent one diagnosis down a wrong
+  // path outright). Evidence must not be destroyed before it can be reported.
+  it("names the FULL routing tab id in a no-reply timeout, not an 8-char slice (#803)", async () => {
+    const tabId = "wf:workflows/Untitled 2026-08-04 06-15-58.json";
+    const a = await connectPanel(tabId); // never replies
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await expect(bridge.send({ cmd: "graph_query" }, { timeoutMs: 120 })).rejects.toThrow(
+      `Panel tab ${tabId} did not reply to "graph_query" within 120 ms`,
+    );
+    // And specifically NOT the old collapsed form that made every workflow tab look alike.
+    await expect(bridge.send({ cmd: "graph_query" }, { timeoutMs: 120 })).rejects.not.toThrow(
+      /Panel tab wf:workf did not reply/,
+    );
+    a.close();
+  });
+
+  // #770/#803 — the same fold as workflowUuidFor, one method over.
+  // tabCanMutateGraph fails CLOSED, which is right for gating and wrong for prose:
+  // rendered, it told users their panel "does not advertise" a capability when we
+  // had merely failed to look. Driven against a LIVE tab so resolveTarget succeeds
+  // and the stamp resolver is actually reached — probing a nonexistent tab exits
+  // before that and would pass with the collapse still in place.
+  it("tabGraphMutationCapability separates an UNREADABLE probe from an observed 'cannot' (#770)", async () => {
+    const tabId = "wf:workflows/cap.json";
+    const a = await connectPanel(tabId); // advertises both write fences
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+
+    // A stamp is present and both fences are advertised → observed CAN.
+    bridge.setTabWorkflowUuidResolver(() => "11111111-1111-4111-8111-111111111111");
+    expect(bridge.tabGraphMutationCapability(tabId)).toEqual({ known: true, canMutate: true });
+    expect(bridge.tabCanMutateGraph(tabId)).toBe(true);
+
+    // The resolver ANSWERS with no stamp → an observed CANNOT (nothing to fence).
+    bridge.setTabWorkflowUuidResolver(() => undefined);
+    // A modern panel that advertises both fences but has NO trusted stamp is a
+    // BINDING problem, not an old-pack one: reads work and a rebind fixes it.
+    // Labelling it "capability" sent it to the one remedy that cannot help —
+    // update the pack, hard-refresh — for a pack that was already correct
+    // (codex gate). `canMutate` is a conjunction of four unrelated conditions and
+    // each has to answer for itself.
+    expect(bridge.tabGraphMutationCapability(tabId)).toEqual({
+      known: true,
+      canMutate: false,
+      because: "no_identity",
+    });
+    expect(bridge.tabCanMutateGraph(tabId)).toBe(false);
+
+    // The resolver THROWS → the inputs could not be READ. That is UNKNOWN, and
+    // must never be rendered as "this panel lacks the write fence".
+    bridge.setTabWorkflowUuidResolver(() => {
+      throw new Error("resolver exploded");
+    });
+    const unknown = bridge.tabGraphMutationCapability(tabId);
+    expect(unknown.known).toBe(false);
+    expect(unknown).toMatchObject({ reason: expect.stringContaining("resolver exploded") });
+    // …while the fail-closed convenience keeps its contract for the readiness
+    // callers that GATE on it rather than describe it.
+    expect(bridge.tabCanMutateGraph(tabId)).toBe(false);
+
+    // An unroutable tab is `known`: routing nowhere IS an observation about
+    // mutability, not a failure to look. But it is a DIFFERENT observation from
+    // a panel that lacks the write fence, and the two used to share one value —
+    // so the recovery told users to update their panel pack and hard-refresh
+    // when the tab was simply gone and their READS were failing too (codex gate
+    // P1). Same boolean, opposite remedy: the cause is what separates them.
+    // A socket that is CLOSING is reachable but cannot carry a write. That is a
+    // transport state, not an old panel — folding it into "capability" told the
+    // user to update a pack that was already correct (codex gate).
+    bridge.setTabWorkflowUuidResolver(() => "11111111-1111-4111-8111-111111111111");
+    const sock = (bridge as unknown as { conns: Map<string, { sock: { readyState: number } }> });
+    const conn = sock.conns?.get(tabId);
+    if (conn) {
+      Object.defineProperty(conn.sock, "readyState", {
+        value: 2 /* CLOSING */,
+        configurable: true,
+      });
+      expect(bridge.tabGraphMutationCapability(tabId)).toEqual({
+        known: true,
+        canMutate: false,
+        because: "disconnected",
+      });
+      Object.defineProperty(conn.sock, "readyState", { value: 1, configurable: true });
+    } else {
+      throw new Error("test setup: expected a live connection for " + tabId);
+    }
+
+    const unroutable = bridge.tabGraphMutationCapability("no-such-tab");
+    expect(unroutable).toEqual({ known: true, canMutate: false, because: "unroutable" });
+    // The load-bearing assertion is that these two do NOT compare equal.
+    expect(unroutable).not.toEqual({ known: true, canMutate: false, because: "capability" });
+    a.close();
+  });
+});
+
+// #770/#803 — the fence READ the rebind needs to tell "repaired a stale fence"
+// apart from "there was never a fence" apart from "I could not look". Three
+// answers, three remedies; this is the only window onto the stamp, so a
+// distinction lost here is lost for good.
+describe("UiBridge.workflowUuidFor (#770 fence read)", () => {
+  it("distinguishes a present fence, a definitively absent one, and an unreadable one", () => {
+    const b = new UiBridge(0);
+    // No resolver at all → NOT KNOWN. Reporting this as "no fence" would assert
+    // an absence from a mechanism that was never wired up.
+    expect(b.workflowUuidFor("t")).toMatchObject({ known: false });
+
+    b.setTabWorkflowUuidResolver((tabId) => (tabId === "t" ? "u-1" : undefined));
+    expect(b.workflowUuidFor("t")).toEqual({ known: true, uuid: "u-1" });
+    // A resolver that ANSWERS with nothing is a real, observed absence.
+    expect(b.workflowUuidFor("other")).toEqual({ known: true, uuid: undefined });
+
+    // An empty string is not an identity — but it is still an answer.
+    b.setTabWorkflowUuidResolver(() => "");
+    expect(b.workflowUuidFor("t")).toEqual({ known: true, uuid: undefined });
+
+    // A guard that can throw is not a guard: a faulting resolver must neither take
+    // down the recovery that reads it NOR be reported as "there is no fence".
+    b.setTabWorkflowUuidResolver(() => {
+      throw new Error("resolver exploded");
+    });
+    expect(() => b.workflowUuidFor("t")).not.toThrow();
+    const read = b.workflowUuidFor("t");
+    expect(read.known).toBe(false);
+    expect(read).toMatchObject({ reason: expect.stringContaining("resolver exploded") });
+  });
+
 });
 
 describe("makeUnknownCommandError (old-panel version gate)", () => {

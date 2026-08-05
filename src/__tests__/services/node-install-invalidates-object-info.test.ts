@@ -31,10 +31,15 @@ vi.mock("@stable-canvas/comfyui-client", () => ({
 }));
 
 // Stub the comfy-cli subprocess so the useCmCli install path returns cleanly
-// without spawning anything.
+// without spawning anything. The probe exports are stubbed too: installCustomNode
+// checks CLI usability before choosing the subprocess path (#808), and this test
+// exercises the subprocess path.
 vi.mock("../../services/comfy-cli.js", () => ({
   runComfyCliSync: vi.fn(() => ({ stdout: "{}", stderr: "", status: 0 })),
   assertComfyCliOk: vi.fn(() => ({ data: {} })),
+  resolveComfyCliExecutable: vi.fn(() => "/fake/comfy/.venv/bin/comfy"),
+  getComfyCliVersion: vi.fn(() => "1.11.1"),
+  isSupportedComfyCliVersion: vi.fn(() => true),
 }));
 
 const { installCustomNode } = await import("../../services/node-management.js");

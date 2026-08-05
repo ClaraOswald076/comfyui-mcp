@@ -210,7 +210,7 @@ credits (same tools on both backends — see
 |---|---|
 | `panel_add_mcp` / `panel_remove_mcp` | Connect / remove an MCP server in the user's agent MCP config (Claude or Codex) |
 | `panel_request_secret` | Securely collect an API token — the agent never sees the value |
-| `panel_reload` | Soft-reload the orchestrator (new code/tools) or the panel UI, then resume |
+| `panel_reload` | Soft-reload the agent + its comfyui tool server (new code/tools) or the panel UI, then resume. Does NOT restart the long-lived orchestrator process behind the `panel_*` tools — that takes a user-run process restart |
 
 ### Working with the user
 

@@ -9,9 +9,10 @@
 // the user's consent. It never overrides hard limits (no minors, no real-person
 // sexual deepfakes, no depictions of actual non-consensual acts).
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { writeFileDurable } from "../utils/durable-write.js";
 import { logger } from "../utils/logger.js";
 
 export interface NsfwConsent {
@@ -120,7 +121,14 @@ function readRaw(): { settings: PanelSettings; unreadable: boolean } {
   const p = panelSettingsPath();
   if (!existsSync(p)) return { settings: {}, unreadable: false };
   try {
-    const parsed = JSON.parse(readFileSync(p, "utf-8")) as unknown;
+    const raw = readFileSync(p, "utf-8");
+    // A zero-byte file is the signature of a torn write (crash between
+    // truncate and write). It provably contains NO settings — treating it as
+    // unreadable would report an indeterminate pin (which counts as PINNED)
+    // forever, over a file that holds nothing. Non-empty unparseable content
+    // stays unreadable: it could have held a pin, so it must fail closed.
+    if (raw.length === 0) return { settings: {}, unreadable: false };
+    const parsed = JSON.parse(raw) as unknown;
     // Valid JSON but not a plain object (`null`, `"x"`, and CRUCIALLY `[]`):
     // the file is present and structurally wrong, so a key's absence is not
     // proven. An array is the nasty one — `typeof [] === "object"`, so an
@@ -143,7 +151,26 @@ function read(): PanelSettings {
 function write(settings: PanelSettings): void {
   const p = panelSettingsPath();
   mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(settings, null, 2));
+  // Durable AND atomic (#798): this file carries the panel version PIN — a
+  // protection record the user is told is in force the moment this returns. A
+  // buffered write can be lost to a crash while the pin-write's report (and
+  // the user's belief) survives, leaving the panel unpinned when everyone
+  // thinks it is pinned; a torn write would read as unreadable, which the pin
+  // reader must treat as indeterminate (pinned) forever. Write to a temp file,
+  // fsync, and rename over the target so neither can happen.
+  try {
+    writeFileDurable(p, JSON.stringify(settings, null, 2));
+  } catch (err) {
+    // The write MAY have landed (the atomic rename can precede a directory
+    // sync failure), so a bare failure would misreport a possibly-in-force
+    // pin as absent. Say exactly what is and is not proven.
+    throw new Error(
+      `Could not durably write the panel settings at ${p}: ${
+        err instanceof Error ? err.message : String(err)
+      }. The change may still have landed on disk without a proven-durable ` +
+        `directory entry — re-read the setting before assuming it did not take.`,
+    );
+  }
 }
 
 /** Current NSFW consent state. Defaults to OFF when never set.

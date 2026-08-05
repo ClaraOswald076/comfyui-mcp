@@ -8,6 +8,7 @@ import {
   matchQuality,
   rankCandidates,
   resolveCandidates,
+  resolveCandidatesDetailed,
   type ObjectInfoLike,
 } from "../../services/missing-models.js";
 
@@ -264,6 +265,36 @@ describe("resolveCandidates", () => {
     }));
     // a checkpoint hunt must not return LoRAs
     expect(seenTypes).toEqual(["Checkpoint"]);
+  });
+
+  it("a FAILED lookup is reported as failed, never folded into an empty list (#796)", async () => {
+    const out = await resolveCandidatesDetailed(
+      MISSING,
+      deps({
+        searchCivitai: async () => { throw new Error("civitai 503"); },
+        searchHf: async () => { throw new Error("hf timeout"); },
+      }),
+    );
+    expect(out.candidates).toEqual([]);
+    expect(out.failedProviders).toEqual(["CivitAI", "HuggingFace"]);
+  });
+
+  it("a one-provider failure degrades AND is disclosed", async () => {
+    const out = await resolveCandidatesDetailed(
+      MISSING,
+      deps({ searchCivitai: async () => { throw new Error("civitai 503"); } }),
+    );
+    expect(out.candidates.length).toBeGreaterThan(0);
+    expect(out.failedProviders).toEqual(["CivitAI"]);
+  });
+
+  it("a genuinely empty answer carries NO failures — 'nothing found' is then honest", async () => {
+    const out = await resolveCandidatesDetailed(
+      MISSING,
+      deps({ searchCivitai: async () => [], searchHf: async () => [] }),
+    );
+    expect(out.candidates).toEqual([]);
+    expect(out.failedProviders).toEqual([]);
   });
 });
 

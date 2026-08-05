@@ -244,6 +244,67 @@ describe("startTrainingJob", () => {
     expect(done.result!.previewFile).toBe("loras-test-job.png");
   });
 
+  it("a failed CATALOG upsert does not fail a job whose LoRA was published (#796)", async () => {
+    // The LoRA copy lands BEFORE the catalog write, so a catalog that throws
+    // (a corrupt on-disk catalog it refuses to overwrite) is a disclosure on
+    // a completed job — never "output handoff failed" for a published model.
+    const d = deferred<{ code: number; tail: string }>();
+    const catalog = fakeCatalog();
+    catalog.upsert = () => {
+      throw new Error("Refusing to overwrite it — inspect or repair the file manually.");
+    };
+    const lorasDir = join(root, "loras");
+    const job = await startWith({
+      startTraining: (opts) => {
+        const outDir = join(opts.outputDir, "test_job");
+        mkdirSync(outDir, { recursive: true });
+        writeFileSync(join(outDir, "test_job.safetensors"), "weights");
+        setTimeout(() => d.resolve({ code: 0, tail: "" }), 5);
+        return fakeHandle(d);
+      },
+      lorasDir: () => lorasDir,
+      catalog,
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    const done = (await mod.getJob(job.id))!;
+    expect(done.status).toBe("completed");
+    expect(done.result!.loraPath).toBe(join(lorasDir, "test_job.safetensors"));
+    expect(existsSync(done.result!.loraPath)).toBe(true);
+    expect(done.result!.catalogId).toBeUndefined();
+    expect(done.result!.catalogError).toMatch(/Refusing to overwrite/);
+    expect(done.error).toBeUndefined();
+  });
+
+  it("a failed PREVIEW handoff is disclosed on the completed job, not dropped (#796)", async () => {
+    // setPreview can fail AFTER writing the preview file (it discloses exactly
+    // that). Silently logging it would report a completed job with neither
+    // previewFile nor error while the preview sits unreconciled.
+    const d = deferred<{ code: number; tail: string }>();
+    const catalog = fakeCatalog();
+    catalog.setPreview = () => {
+      throw new Error("The preview image was already written to /x.png, but recording it in the catalog FAILED");
+    };
+    const lorasDir = join(root, "loras");
+    const job = await startWith({
+      startTraining: (opts) => {
+        const outDir = join(opts.outputDir, "test_job");
+        mkdirSync(join(outDir, "samples"), { recursive: true });
+        writeFileSync(join(outDir, "test_job.safetensors"), "weights");
+        writeFileSync(join(outDir, "samples", "0001.png"), "sample");
+        setTimeout(() => d.resolve({ code: 0, tail: "" }), 5);
+        return fakeHandle(d);
+      },
+      lorasDir: () => lorasDir,
+      catalog,
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    const done = (await mod.getJob(job.id))!;
+    expect(done.status).toBe("completed");
+    expect(done.result!.catalogId).toBe("loras-test-job");
+    expect(done.result!.previewFile).toBeUndefined();
+    expect(done.result!.catalogError).toMatch(/preview:.*already written/);
+  });
+
   it("marks the job failed when the container exits non-zero", async () => {
     const d = deferred<{ code: number; tail: string }>();
     const job = await startWith({

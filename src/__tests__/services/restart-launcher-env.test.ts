@@ -31,6 +31,8 @@ class FakeChild extends EventEmitter {
 const mockConfig = vi.hoisted(() => ({
   resolvedPort: 8188,
   comfyuiPath: undefined as string | undefined,
+  /** Monotonic ComfyUI-target generation — bumped by the retarget tests. */
+  targetGeneration: 0,
 }));
 
 const mockExecSync = vi.hoisted(() => vi.fn());
@@ -66,8 +68,11 @@ const mockSettingsJsonRef = vi.hoisted(() => ({
 
 vi.mock("../../config.js", () => ({
   config: mockConfig,
-  getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
+  // Reads from the fixture so a retarget mid-restart can be modelled.
+  getComfyUIBaseUrl: () => `http://127.0.0.1:${mockConfig.resolvedPort}`,
   getComfyUIAuthHeaders: () => ({}),
+  // Stable by default; the retarget tests below drive it.
+  getComfyuiTargetGeneration: () => mockConfig.targetGeneration,
   isRemoteMode: () => false,
 }));
 
@@ -271,6 +276,7 @@ beforeEach(() => {
   process.env.PATH = ORIGINAL_ENV.PATH ?? "/usr/bin";
   mockConfig.resolvedPort = 8188;
   mockConfig.comfyuiPath = undefined;
+  mockConfig.targetGeneration = 0;
   mockResolveBase.mockReturnValue(undefined);
   mockLiveRootFromArgv.mockReturnValue(undefined);
   __processControlTestHooks.reset();
@@ -368,6 +374,15 @@ describe("restart_comfyui — Stability Matrix launcher environment (#776)", () 
     expect(result.stopped).toBe(true);
     expect(result.started).toBe(true);
     expect(result.ready).toBe(true);
+    // A HEALTHY restart whose listener could not be ATTRIBUTED is not the #367
+    // "not confirmed yet" shape, and must not be composed as one. Widening
+    // `startup:"unconfirmed"` to cover unmappable attribution briefly routed this
+    // case into that branch, telling the user "NOT CONFIRMED YET" about a server
+    // that was answering — and skipping the dispatch-record clear. `ready` is what
+    // separates the two, and the composition keys on it.
+    expect(result.startup).toBe("unconfirmed");
+    expect(result.message).not.toMatch(/NOT CONFIRMED YET/);
+    expect(result.message).toMatch(/up and ready after the restart/i);
 
     // The relaunch DID carry an explicit environment (the bug was `env` omitted,
     // silently inheriting the orchestrator's).
@@ -757,7 +772,26 @@ describe("restart_comfyui — irreproducible launcher environments (#776)", () =
     usePinokio();
     mockLivePortThenFree();
 
-    await expect(preflightLocalRestart()).resolves.toEqual({ ok: true });
+    // toMatchObject, not toEqual: the preflight also reports the launch arguments
+    // it OBSERVED (#848) so the caller can compare them after the reboot. What this
+    // test is about is the verdict.
+    await expect(preflightLocalRestart()).resolves.toMatchObject({ ok: true });
+  });
+
+  it("REPORTS the launch arguments it observed, so the caller can compare them (#848)", async () => {
+    // The panel's argv-drift note is built from THIS field. Every panel test injects
+    // a fake preflight, so without a direct assertion here `observedLaunch` and both
+    // of its spreads could be deleted and the whole suite would stay green (codex
+    // gate round 4) — the note would simply go silent forever, and #848 would be
+    // un-fixed with nothing to show it.
+    usePinokio();
+    mockLivePortThenFree();
+
+    const result = await preflightLocalRestart();
+
+    expect(result.ok).toBe(true);
+    expect(result.observedArgv).toEqual([PINOKIO_MAIN, "--port", "8188"]);
+    expect(result.isDesktopApp).toBe(false);
   });
 
   it("does NOT refuse from start_comfyui when the server is ALREADY down — it launches and warns", async () => {
@@ -1511,6 +1545,11 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     // call did not start the server. `ready` stays true — the server really is up.
     expect(result.started).toBe(false);
     expect(result.ready).toBe(true);
+    // …and `startup` must not CONFIRM the very attribution just denied (codex gate
+    // round 9). The API answered, but provably not as our relaunch: that is an
+    // OBSERVED failure of this call's launch, not a confirmation of it.
+    expect(result.startup).toBe("failed");
+    expect(JSON.parse(JSON.stringify(result)).startup).toBe("failed");
     expect(result.message).not.toMatch(/restarted successfully/i);
     expect(result.message).toMatch(/NOT as a result of this restart/i);
     expect(result.message).toMatch(/another launcher or supervisor owns it/i);
@@ -2322,7 +2361,15 @@ n127.0.0.1:8188
     expect(result.stopped).toBe(true);
     expect(result.started).toBe(false);
     expect(result.message).toMatch(/EXITED \(exit code 1\)/);
-    expect(result.message).toMatch(/failed relaunch, not a slow start/i);
+    expect(result.message).toMatch(/THIS RELAUNCH FAILED/);
+    expect(result.message).toMatch(/not a slow start/i);
+    // The claim is scoped to OUR relaunch. Our child dying does not establish that
+    // nothing is serving the port now (codex gate).
+    expect(result.message).not.toMatch(/ComfyUI is DOWN/);
+    // …nor that the API never came up: a poll only establishes what the SCHEDULED
+    // PROBES saw, and the server could have answered between two of them.
+    expect(result.message).not.toMatch(/before the API came up/i);
+    expect(result.message).toMatch(/the last one included/i);
 
     killSpy.mockRestore();
   });
@@ -2372,11 +2419,151 @@ n127.0.0.1:8188
     killSpy.mockRestore();
   });
 
-  it("reports the TRUTH when the relaunch never comes back (stopped, not started)", async () => {
+  it("reports the TRUTH when the relaunch has not answered YET (#367: stopped, dispatched, unconfirmed)", async () => {
     usePlainInstall();
     mockLivePortThenFree();
     spawnCapturingChildren();
-    // The process is spawned but the API never answers — the server is DOWN.
+    // The process is spawned and STILL ALIVE, but the API has not answered inside
+    // the budget. This test used to assert "stopped but could not be started",
+    // which is the #367 defect itself: the relaunched process is right there, and
+    // in the reported case it answered about two seconds after the deadline.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("ECONNREFUSED");
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(true);
+    expect(result.ready).toBe(false);
+    expect(result.startup).toBe("unconfirmed");
+    // NEITHER definite verdict may be printed. Both of these have been the wording
+    // at some point, and each is a lie in the opposite direction.
+    expect(result.message).not.toMatch(/could not be started/i);
+    expect(result.message).not.toMatch(/restarted successfully/i);
+    expect(result.message).toMatch(/NOT CONFIRMED YET/);
+    expect(result.message).toMatch(/not known to have failed/i);
+    // The environment it was launched into is still named, so a slow start that
+    // turns out to be a broken one is debuggable from this same report.
+    expect(result.launch_env?.source).toBe("inherited");
+
+    killSpy.mockRestore();
+  });
+
+  // -------------------------------------------------------------------------
+  // The ComfyUI target is MUTABLE (a panel hello can retarget it) and every step of
+  // a restart is an await. Nothing here may end with a server stopped and a
+  // relaunch aimed somewhere else.
+  // -------------------------------------------------------------------------
+
+  it("stop_comfyui REFUSES when the target moved while it resolved the instance", async () => {
+    // A DIRECT stop had no fence at all, and its saved launch record does not repair
+    // the loss: start_comfyui afterwards consults the NEW live target, so it can
+    // refuse as remote or find that port occupied rather than relaunch what was
+    // killed (codex gate round 12).
+    usePlainInstall();
+    mockLivePortThenFree();
+    mockGetSystemStats.mockImplementation(async () => {
+      mockConfig.targetGeneration += 1; // a hello retarget lands during the resolve
+      return { system: { argv: [ABS_MAIN, "--port", "8188"] } };
+    });
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await stopComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.message).toMatch(/Refusing to stop/i);
+    expect(result.message).toMatch(/target changed while the running instance was being identified/i);
+    expect(result.message).toMatch(/Nothing was killed/i);
+    const killIssued = mockExecSync.mock.calls.some(([c]: [string]) =>
+      /taskkill|pkill|\bkill\b/i.test(String(c)),
+    );
+    expect(killIssued).toBe(false);
+    // A refusal has to be actionable from where the caller is.
+    expect(result.message).toMatch(/Let the target settle, then retry/i);
+    // …and it must not claim a relaunch is on file for an instance it declined to
+    // touch (#767: has_restart_info means a command was BUILT AND VALIDATED).
+    expect(result.has_restart_info).toBe(false);
+
+    killSpy.mockRestore();
+  });
+
+  it("the relaunch is ANCHORED to the instance that was stopped, not the live target", async () => {
+    // After the kill, restartComfyUI awaits the port release and a settle delay. A
+    // retarget in that window used to leave the relaunch probing the NEW target's
+    // port: if that port was occupied it returned "already running" WITHOUT
+    // spawning, and the instance just killed stayed dead (codex gate round 12).
+    //
+    // Modelled by pointing the live config at a DIFFERENT, occupied port after the
+    // stop. Anchored, the restart still relaunches and grades the original.
+    usePlainInstall();
+    mockLivePortThenFree();
+    spawnCapturingChildren();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+    // The retarget lands at the KILL — after the resolve, so the pre-stop fence
+    // (which spans only the resolve) passes and the post-stop window is what is
+    // exercised. Port 9999 is OCCUPIED, which is what makes the un-anchored version
+    // bail out with "already running" instead of relaunching.
+    let killed = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        mockConfig.resolvedPort = 9999; // config now points at a DIFFERENT instance
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        // `netstat -ano` carries no port argument — the caller filters the TABLE by
+        // the port it is asking about. So emit the whole table and let it choose:
+        // after the kill 8188 is free and an UNRELATED server holds 9999.
+        if (!killed) return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+        return "  TCP    0.0.0.0:9999   0.0.0.0:0   LISTENING       777";
+      }
+      if (/lsof/i.test(cmd)) {
+        // lsof IS asked per-port (`-iTCP:<port>`), so answer per-port.
+        if (!killed) return "p4321\nn127.0.0.1:8188\n";
+        if (/9999/.test(cmd)) return "p777\nn127.0.0.1:9999\n";
+        throw noListener();
+      }
+      return "";
+    });
+
+    const result = await restartComfyUI();
+
+    expect(killed).toBe(true);
+    expect(mockConfig.resolvedPort).toBe(9999); // the retarget really happened
+    // It RELAUNCHED rather than bailing out on the other target's occupied port…
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    expect(result.message).not.toMatch(/already running/i);
+    // …and the readiness verdict is about the anchored instance's URL, not the
+    // config's current one.
+    expect(result.readiness?.probe_url).toBe("http://127.0.0.1:8188/system_stats");
+    expect(result.ready).toBe(true);
+
+    killSpy.mockRestore();
+  });
+
+  it("reports the TRUTH when the relaunched process DIED (stopped, not started)", async () => {
+    // The definite negative, and the evidence that licenses it: we watched the
+    // process we launched exit. #776's truthful DOWN report is unchanged here.
+    usePlainInstall();
+    mockLivePortThenFree();
+    // The relaunched child aborts during import the instant it is spawned — the
+    // #776 shape. Wired at the spawn site rather than raced from the test, so the
+    // exit is guaranteed to land before the readiness poll concludes: a mutant that
+    // survives only because a timer won a race is not a caught mutant.
+    mockSpawn.mockImplementation(() => {
+      const child = new FakeChild();
+      child.pid = 4321;
+      queueMicrotask(() => child.emit("exit", 1, null));
+      return child;
+    });
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => {
@@ -2390,9 +2577,13 @@ n127.0.0.1:8188
     expect(result.stopped).toBe(true);
     expect(result.started).toBe(false);
     expect(result.ready).toBe(false);
+    expect(result.startup).toBe("failed");
     expect(result.message).toMatch(/stopped but could not be started/i);
-    expect(result.message).not.toMatch(/restarted successfully/i);
-    // The environment it was launched into is named, so the failure is debuggable.
+    expect(result.message).toMatch(/THIS RELAUNCH FAILED/);
+    // A real failure must NOT be softened into "it may still be coming up".
+    expect(result.message).not.toMatch(/NOT CONFIRMED YET/);
+    // …nor overstated into a claim about the machine we did not observe.
+    expect(result.message).not.toMatch(/ComfyUI is DOWN/);
     expect(result.launch_env?.source).toBe("inherited");
 
     killSpy.mockRestore();

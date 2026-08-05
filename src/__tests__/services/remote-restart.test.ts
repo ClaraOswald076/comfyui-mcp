@@ -19,6 +19,8 @@ const hoisted = vi.hoisted(() => ({
 vi.mock("../../config.js", () => ({
   config: { resolvedPort: 8188, comfyuiPath: "/fake/comfy", comfyuiBasePath: "" },
   getComfyUIBaseUrl: () => "http://remote.example:8188",
+  // #848 instance fence — a stable target here; the retarget case has its own test.
+  getComfyuiTargetGeneration: () => 0,
   isRemoteMode: () => hoisted.remoteMode.value,
 }));
 
@@ -62,7 +64,7 @@ beforeEach(() => {
 });
 
 describe("restartComfyUI — remote (Manager reboot)", () => {
-  it("reboot POST 502, then /system_stats errors twice then 200 → started + ready", async () => {
+  it("reboot POST 502, then /system_stats errors twice then 200 → ready, dispatch UNacknowledged", async () => {
     __processControlTestHooks.setRemoteRebootTimingForTests({
       settleMs: 0,
       budgetMs: 1000,
@@ -86,9 +88,34 @@ describe("restartComfyUI — remote (Manager reboot)", () => {
     const res = await restartComfyUI();
 
     expect(res.stopped).toBe(true);
-    expect(res.started).toBe(true);
     expect(res.ready).toBe(true);
-    expect(res.message).toContain("rebooted via ComfyUI-Manager");
+    // No process of ours was spawned, so there is no positive evidence this call
+    // started anything; `ready:true` carries the good news (codex gate round 8).
+    expect(res.started).toBe(false);
+    // A 502 is INFERRED to mean the handler took it and the origin dropped — a good
+    // inference, and the reason this path works through a tunnel at all, but not an
+    // acknowledgement. A tunnel hiccup in front of a server that was never restarted
+    // produces the identical signal, so the report must not call it accepted (codex
+    // gate round 7).
+    expect(res.message).toContain("dispatched but not acknowledged");
+    expect(res.message).not.toMatch(/request was acknowledged/i);
+    // The OBSERVED signal is named — the status, and only the status — rather than
+    // one of the causes this branch covers being narrated as the fact. Two earlier
+    // wordings each named a different one: "the origin dropped as it went down"
+    // (gate round 8) and "a proxy in front of ComfyUI answered" (gate round 9).
+    // Nothing here identifies a proxy, and ComfyUI or the Manager can return a 502
+    // directly.
+    expect(res.message).toContain("the request returned HTTP 502");
+    expect(res.message).not.toMatch(/connection dropped/i);
+    expect(res.message).not.toMatch(/proxy/i);
+    // …and no causal HEDGE either. "which usually means the handler accepted it and
+    // the server went down" made two inferences and a frequency claim nobody
+    // measured, and it undercut the very next sentence, which correctly says the
+    // cycle was not directly observed (codex gate round 10).
+    expect(res.message).not.toMatch(/usually means/i);
+    expect(res.message).not.toMatch(/went down/i);
+    expect(res.message).toMatch(/not directly observed/i);
+    expect(res.startup).toBe("unconfirmed");
     expect(hoisted.resetClient).toHaveBeenCalledTimes(1);
     expect(hoisted.resetObjectInfoCache).toHaveBeenCalledTimes(1);
     // The 502 on the canonical POST route counts as "fired" — the legacy GET
@@ -121,7 +148,7 @@ describe("restartComfyUI — remote (Manager reboot)", () => {
     expect(hoisted.resetClient).not.toHaveBeenCalled();
   });
 
-  it("reboot fires but readiness never returns within budget → not started, timeout message", async () => {
+  it("reboot fires but readiness never returns within budget → NOT CONFIRMED, never 'did not come back' (#367)", async () => {
     __processControlTestHooks.setRemoteRebootTimingForTests({
       settleMs: 0,
       budgetMs: 30,
@@ -137,9 +164,25 @@ describe("restartComfyUI — remote (Manager reboot)", () => {
     const res = await restartComfyUI();
 
     expect(res.stopped).toBe(true);
+    // No process of OURS was spawned here — the supervisor is what brings it back —
+    // so `started` cannot be claimed. What changed is that it may no longer be READ
+    // as the other definite answer: `startup` says which, and the sentence agrees.
     expect(res.started).toBe(false);
     expect(res.ready).toBe(false);
-    expect(res.message).toContain("did not come back within 30ms");
+    expect(res.startup).toBe("unconfirmed");
+    // ASSERT THE REASON. "did not come back" asserted a definite negative the
+    // expired budget never established — that phrasing must be gone, not merely
+    // reworded around.
+    expect(res.message).not.toMatch(/did not come back/i);
+    // Nor may it claim the server "went down": nothing observed a down transition —
+    // the poller only records that no probe got a 2xx, which is equally consistent
+    // with a server that was never reachable from here (codex gate round 2).
+    expect(res.message).not.toMatch(/went down/i);
+    expect(res.message).toMatch(/reboot request was acknowledged/i);
+    expect(res.message).toMatch(/NOT CONFIRMED YET/);
+    expect(res.message).toMatch(/does NOT mean it failed/i);
+    expect(res.message).toMatch(/health_check/);
+    expect(res.message).toMatch(/COMFYUI_REMOTE_REBOOT_BUDGET_S/);
     expect(hoisted.resetClient).not.toHaveBeenCalled();
   });
 

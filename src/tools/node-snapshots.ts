@@ -28,7 +28,7 @@ export function registerNodeSnapshotsTools(server: McpServer): void {
     "node_snapshot",
     "Custom-node snapshots via ComfyUI-Manager (mirrors `comfy node save-snapshot` / `restore-snapshot`). Driven by the `action` parameter:\n" +
       "- action:\"list\" — List the snapshots ComfyUI-Manager knows about. No other parameters. Read-only.\n" +
-      '- action:"save" — Save the current custom-node and version state. With no `name`, Manager assigns a timestamped snapshot (works against remote instances). Providing `name` writes a custom-named snapshot file, which requires a local ComfyUI install and is unavailable in remote (--comfyui-url) mode.\n' +
+      '- action:"save" — Save the current custom-node and version state. With no `name`, Manager assigns a timestamped snapshot (works against remote instances). Providing `name` writes a custom-named snapshot file, which requires a local ComfyUI install root (COMFYUI_PATH or a saved default workspace — see the workspace tool) and is unavailable against a genuinely remote ComfyUI.\n' +
       '- action:"restore" — Restore a previously saved snapshot by `name` (required). ComfyUI-Manager applies the custom-node changes on the next ComfyUI restart; use action:"list" to find available names.',
     {
       action: z

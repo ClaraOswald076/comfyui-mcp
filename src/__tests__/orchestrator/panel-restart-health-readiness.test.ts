@@ -12,9 +12,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const resetClient = vi.fn();
 const resetObjectInfoCache = vi.fn();
+// #848: the post-restart argv read goes through getSystemStats. Default REJECTS, so
+// every pre-existing test keeps the "nothing observed → say nothing" behaviour and
+// only the tests that opt in exercise the drift note.
+const getSystemStats = vi.fn(async () => {
+  throw new Error("ECONNRESET");
+});
 vi.mock("../../comfyui/client.js", () => ({
   getObjectInfo: vi.fn(),
   backfillObjectInfo: vi.fn(),
+  getSystemStats: () => getSystemStats(),
   resetClient: () => resetClient(),
   resetObjectInfoCache: () => resetObjectInfoCache(),
 }));
@@ -22,7 +29,11 @@ vi.mock("../../comfyui/client.js", () => ({
 const { buildPanelToolDefs, __panelToolsTestHooks } = await import(
   "../../orchestrator/panel-tools.js"
 );
-import { getBootLocalComfyUIBaseUrl } from "../../config.js";
+import {
+  getBootLocalComfyUIBaseUrl,
+  getComfyUIBaseUrl,
+  setComfyuiTarget,
+} from "../../config.js";
 import { markDispatched } from "../../services/ui-bridge.js";
 import type { PanelToolCtx, ToolResult } from "../../orchestrator/panel-tools.js";
 
@@ -100,6 +111,10 @@ const DROP = markDispatched(
 beforeEach(() => {
   resetClient.mockClear();
   resetObjectInfoCache.mockClear();
+  getSystemStats.mockReset();
+  getSystemStats.mockImplementation(async () => {
+    throw new Error("ECONNRESET");
+  });
   // The #742 refuse-safe preflight passes by default here (the live one would
   // probe real processes/ports); these tests exercise the post-dispatch paths.
   __panelToolsTestHooks.setLocalRestartPreflight(async () => ({ ok: true }));
@@ -132,6 +147,118 @@ describe("panel_restart_comfyui recovery after an ACCEPTED reboot (coordinator p
     expect(out.via).toBe("observed-cycle");
     expect(resetClient).toHaveBeenCalledTimes(1);
     expect(resetObjectInfoCache).toHaveBeenCalledTimes(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // #848 — panel_restart_comfyui restarted the server and the user's newly-added
+  // Desktop launch flag was still absent. "It came back healthy" was reported, and
+  // it was true; it simply was not the answer to the question the user had.
+  // -------------------------------------------------------------------------
+
+  it("reports launch arguments UNCHANGED across a confirmed panel restart (#848)", async () => {
+    const argv = ["main.py", "--listen", "127.0.0.1", "--port", "8188"];
+    __panelToolsTestHooks.setLocalRestartPreflight(async () => ({
+      ok: true,
+      observedArgv: argv,
+      isDesktopApp: true,
+    }));
+    // The server comes back running exactly what it ran before — the #848 shape.
+    getSystemStats.mockImplementation(async () => ({ system: { argv: [...argv] } }));
+    const seq: ProbeSeq = ["down", "healthy"];
+    let i = 0;
+    __panelToolsTestHooks.setHealthProbe(async () => seq[Math.min(i++, seq.length - 1)]);
+    const { ctx } = makeCtx({ reboot: { rebooting: true } });
+
+    const out = parse(await rebootHandler()({ force: false }, ctx));
+    expect(out.ready).toBe(true);
+    expect(out.confirmed_cycle).toBe(true);
+    // The restart is still reported as the success it was…
+    expect(String(out.note)).toContain("healthy again");
+    // …and the thing the user actually wanted to know is now in the same sentence.
+    expect(String(out.note)).toContain("launch arguments are UNCHANGED");
+    // Exactly what equal argv establishes, with the remedy offered CONDITIONALLY —
+    // we never read the user's saved settings, so we cannot say they were ignored.
+    expect(String(out.note)).toContain(
+      "the same arguments were observed before this restart request and again now",
+    );
+    // Not a causal claim about the restart — see desktop-restart.test.ts.
+    expect(String(out.note)).not.toMatch(/this restart did not change/i);
+    expect(String(out.note)).toContain("If you were expecting different arguments");
+    expect(String(out.note)).toMatch(/fully quit the ComfyUI Desktop app/i);
+  });
+
+  it("reports launch arguments CHANGED when the restart did apply them (#848)", async () => {
+    const before = ["main.py", "--port", "8188"];
+    __panelToolsTestHooks.setLocalRestartPreflight(async () => ({
+      ok: true,
+      observedArgv: before,
+      isDesktopApp: true,
+    }));
+    getSystemStats.mockImplementation(async () => ({
+      system: { argv: [...before, "--disable-dynamic-vram"] },
+    }));
+    const seq: ProbeSeq = ["down", "healthy"];
+    let i = 0;
+    __panelToolsTestHooks.setHealthProbe(async () => seq[Math.min(i++, seq.length - 1)]);
+    const { ctx } = makeCtx({ reboot: { rebooting: true } });
+
+    const out = parse(await rebootHandler()({ force: false }, ctx));
+    expect(out.ready).toBe(true);
+    expect(String(out.note)).toContain("launch arguments CHANGED");
+    expect(String(out.note)).toContain("--disable-dynamic-vram");
+    // A restart that DID apply the change must not send the user to redo it.
+    expect(String(out.note)).not.toContain("UNCHANGED");
+    expect(String(out.note)).not.toMatch(/fully quit/i);
+  });
+
+  it("says nothing about launch arguments when the target round-trips mid-read (#848)", async () => {
+    // A→B→A DURING the post-restart argv read. The base comparison alone cannot see
+    // this — the final state matches — and checking it only BEFORE the await could
+    // not see a retarget landing inside the await either (codex gate round 2). The
+    // monotonic generation catches both, so the note is suppressed rather than
+    // comparing instance A's arguments against whatever the read actually reached.
+    const argv = ["main.py", "--port", "8188"];
+    const original = getComfyUIBaseUrl();
+    __panelToolsTestHooks.setLocalRestartPreflight(async () => ({
+      ok: true,
+      observedArgv: argv,
+      isDesktopApp: true,
+    }));
+    getSystemStats.mockImplementation(async () => {
+      setComfyuiTarget("http://127.0.0.1:9999");
+      setComfyuiTarget(original);
+      return { system: { argv: [...argv] } };
+    });
+    const seq: ProbeSeq = ["down", "healthy"];
+    let i = 0;
+    __panelToolsTestHooks.setHealthProbe(async () => seq[Math.min(i++, seq.length - 1)]);
+    const { ctx } = makeCtx({ reboot: { rebooting: true } });
+
+    const out = parse(await rebootHandler()({ force: false }, ctx));
+
+    // The target ends where it started, so the base check would have passed.
+    expect(getComfyUIBaseUrl()).toBe(original);
+    expect(out.ready).toBe(true);
+    // Identical argv would otherwise have produced the UNCHANGED note.
+    expect(String(out.note)).not.toMatch(/launch arguments/i);
+  });
+
+  it("says nothing about launch arguments when the before-reading is missing (#848)", async () => {
+    // The preflight observed no argv (a wedged server reports none). An unread
+    // before-state is not evidence of sameness, so the note must stay silent —
+    // never "unchanged" by default.
+    __panelToolsTestHooks.setLocalRestartPreflight(async () => ({ ok: true }));
+    getSystemStats.mockImplementation(async () => ({
+      system: { argv: ["main.py", "--port", "8188"] },
+    }));
+    const seq: ProbeSeq = ["down", "healthy"];
+    let i = 0;
+    __panelToolsTestHooks.setHealthProbe(async () => seq[Math.min(i++, seq.length - 1)]);
+    const { ctx } = makeCtx({ reboot: { rebooting: true } });
+
+    const out = parse(await rebootHandler()({ force: false }, ctx));
+    expect(out.ready).toBe(true);
+    expect(String(out.note)).not.toMatch(/launch arguments/i);
   });
 
   it("fast restart: a SINGLE down (would-be transient) after acceptance still CONFIRMS as observed-cycle", async () => {
