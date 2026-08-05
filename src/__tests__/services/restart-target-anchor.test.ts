@@ -18,6 +18,7 @@ import { join } from "node:path";
 
 const hoisted = vi.hoisted(() => ({
   remoteMode: { value: true },
+  platform: { value: "win32" as NodeJS.Platform },
   base: { value: "http://alpha.example:8188" },
   generation: { value: 0 },
   fetchMock: vi.fn(),
@@ -50,6 +51,15 @@ vi.mock("../../comfyui/client.js", () => ({
   resetClient: hoisted.resetClient,
   resetObjectInfoCache: hoisted.resetObjectInfoCache,
 }));
+
+// PLATFORM-PINNED. process-control branches on `platform()` for PID discovery,
+// termination and port probing, so an unpinned test asserts different code on
+// each CI runner — these tests passed on Windows and failed on ubuntu/macOS for
+// exactly that reason. Pin it so the suite exercises one path everywhere.
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  return { ...actual, platform: () => hoisted.platform.value };
+});
 
 vi.mock("node:child_process", () => ({
   execSync: hoisted.execSync,
@@ -183,12 +193,12 @@ describe("startComfyUI's remote-mode refusal is for a DIRECT launch, not a relau
     // A local restart stops the instance and then calls this. Refusing here left
     // it killed and abandoned, with the exception unwinding past every report —
     // the caller learned nothing about their now-dead server.
-    hoisted.spawn.mockImplementation(() => {
-      throw new Error("spawn refused by this test harness");
-    });
-    // It RESOLVES with a StartResult rather than throwing — which is the point:
-    // past a committed stop, a describable outcome is the whole deliverable, and
-    // an exception is the one shape that cannot be reported.
+    // No saved process info, so this returns before it ever reaches spawn — which
+    // is all this case needs. It RESOLVES with a StartResult rather than throwing,
+    // and that is the point: past a committed stop a describable outcome is the
+    // whole deliverable, and an exception is the one shape that cannot be
+    // reported. (The post-stop catch is covered by the restart-level tests below,
+    // where the relaunch really does reach spawn.)
     const res = await startComfyUI({
       port: 8188,
       probeUrl: "http://alpha.example:8188/system_stats",
