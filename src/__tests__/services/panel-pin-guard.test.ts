@@ -6,8 +6,7 @@
 // and `id="all"` reached the SAME ComfyUI-Manager mutation without ever passing
 // the guard. A pinned user was one generic call away from being moved.
 
-<<<<<<< HEAD
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   mkdtempSync,
   existsSync,
@@ -17,10 +16,6 @@ import {
   readdirSync,
   readFileSync,
 } from "node:fs";
-=======
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, existsSync, rmSync, writeFileSync, mkdirSync, readdirSync } from "node:fs";
->>>>>>> b556ff4 (fix(panel): explicit reclaim for a proven-abandoned op lock, durable marker/pin writes, honest panel_reload scope (#760, #798, #765))
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -914,15 +909,33 @@ describe("pending-op markers — record, read, and clear (#689)", () => {
     expect(activePanelPendingOps()).toEqual([]);
   });
 
-  it("a ZERO-BYTE marker file (a torn write) reads as empty, not unreadable-forever (#798)", () => {
-    // A crash between truncate and write leaves 0 bytes, which provably holds
-    // NO record. Reading that as "unreadable" refused every later update_all
-    // and warned on every pin permanently, with no recovery path.
+  it("a ZERO-BYTE marker file unwedges recording WITHOUT silently dropping the warning (#798 + #847)", () => {
+    // Two branches reached this case from opposite ends and `main` settled it.
+    //
+    // #798 argued a 0-byte file provably holds NO record, so reading it as
+    // "unreadable" refuses every later update_all and warns on every pin forever,
+    // with no recovery path. True — that wedge was real.
+    //
+    // #847 then observed the other half: an INTERRUPTED write cannot be told from
+    // a file that never got content, so treating it as a clean empty read drops a
+    // warning that may have described a genuinely queued operation.
+    //
+    // Both are right, and they are not in tension. The reconciled contract lifts
+    // the block but keeps the doubt: recording works again, and an explicit
+    // indeterminate record is carried forward so a later pin still warns.
     writeFileSync(panelPendingOpsPath(), "");
-    expect(activePanelPendingOps()).toEqual([]);
-    // And recording works again — the wedge self-heals.
+
+    // The wedge is gone — this is what #798 was for.
     const op = recordPanelPendingOp("update-all", "after the torn write", 60_000);
-    expect(activePanelPendingOps().map((o) => o.id)).toEqual([op.id]);
+    const ids = activePanelPendingOps().map((o) => o.id);
+    expect(ids).toContain(op.id);
+
+    // …and the doubt survives — this is what #847 was for. Asserting `[]` here,
+    // as the original did, is exactly the silent drop.
+    const carried = activePanelPendingOps().filter((o) => o.kind === "unknown");
+    expect(carried).toHaveLength(1);
+    expect(carried[0].detail).toMatch(/EMPTY pending-operation marker/i);
+    expect(carried[0].detail).toMatch(/may still be outstanding/i);
   });
 
   it("the marker write is atomic — no temp file is left behind (#798)", () => {

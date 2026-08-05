@@ -26,14 +26,10 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
-<<<<<<< HEAD
-  fsyncSync,
-=======
   existsSync,
   fstatSync,
   fsyncSync,
   linkSync,
->>>>>>> b556ff4 (fix(panel): explicit reclaim for a proven-abandoned op lock, durable marker/pin writes, honest panel_reload scope (#760, #798, #765))
   mkdirSync,
   openSync,
   readFileSync,
@@ -900,27 +896,18 @@ interface PendingOpsRead {
  * `.tmp` would let concurrent writers clobber each other's staging file.
  */
 function writePanelPendingOpsAtomic(path: string, body: string): void {
+  // Rebase reconciliation (#847 + #798). Both branches grew a temp+fsync+rename
+  // writer for this file. `writeFileDurable` is the stronger one: it does
+  // everything this function used to, and then fsyncs the CONTAINING DIRECTORY so
+  // the rename's directory entry is itself durable — tolerating the one platform
+  // that cannot do that (Windows EPERM) while still failing on a real I/O error.
+  // Without that last step a crash can lose the rename even though the file's own
+  // fsync succeeded, which is exactly the window this marker exists to cover.
+  //
+  // Keeping two near-identical writers would have meant one of them silently
+  // losing the directory fsync, so this delegates rather than duplicating.
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.${randomUUID()}.tmp`;
-  const fd = openSync(tmp, "wx");
-  try {
-    writeSync(fd, body);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  try {
-    renameSync(tmp, path);
-  } catch (err) {
-    // Never leave staging debris behind: it is not the marker, and a stray file
-    // beside it is one more thing for a later reader to misinterpret.
-    try {
-      rmSync(tmp, { force: true });
-    } catch {
-      /* best effort */
-    }
-    throw err;
-  }
+  writeFileDurable(path, body);
 }
 
 function readPanelPendingOpsFile(): PendingOpsRead {
@@ -950,7 +937,14 @@ function readPanelPendingOpsFile(): PendingOpsRead {
   // forever, with no recovery path, over a file we can read perfectly well.
   // (Non-empty unparseable content stays unreadable: it COULD have held a
   // record, and failing closed there is the whole point.)
-  if (raw.length === 0) return { ops: [], unreadable: false };
+  // Rebase resolution: `main` (#847) settled this as `unreadable: true` with an
+  // explicit `state`, NOT a clean empty read. Both facts are load-bearing and they
+  // are not in tension: `unreadable` keeps a later pin WARNING (an interrupted
+  // write cannot be told from a file that never got content), while `state:
+  // "empty"` is what lets a writer supersede it instead of refusing forever. This
+  // branch had been rewritten to `unreadable: false`, which silently dropped the
+  // warning half.
+  if (raw.length === 0) return { ops: [], unreadable: true, state: "empty" };
   try {
     const parsed = JSON.parse(raw) as unknown;
     const ops =
@@ -1013,7 +1007,6 @@ export function recordPanelPendingOp(
   try {
     const path = panelPendingOpsPath();
     const prior = readPanelPendingOpsFile();
-<<<<<<< HEAD
     // Refuse only when the prior file has CONTENT we cannot decode: that content
     // may describe a real queued operation, and overwriting it destroys a warning
     // we were never able to read.
@@ -1034,7 +1027,11 @@ export function recordPanelPendingOp(
           `Inspect it, then delete it to clear this.`,
       );
     }
+    // Captured for #798's rollback: if the durable write lands but the directory
+    // fsync fails, the caller restores exactly what was here before.
+    priorOps = prior.ops;
     const kept = prior.ops.filter((o) => o.kind !== kind);
+    mkdirSync(dirname(path), { recursive: true });
     // Superseding an EMPTY marker unwedges the operation, but it must not also
     // erase the possibility that the empty file masked a real queued op. A
     // pre-existing zero-byte file (written by the old truncating writer, before
@@ -1056,21 +1053,6 @@ export function recordPanelPendingOp(
           ]
         : [];
     writePanelPendingOpsAtomic(path, JSON.stringify({ ops: [...carried, ...kept, op] }, null, 2));
-=======
-    if (prior.unreadable) throw new Error("existing pending-operation record is unreadable");
-    priorOps = prior.ops;
-    const kept = prior.ops.filter((o) => o.kind !== kind);
-    mkdirSync(dirname(path), { recursive: true });
-    // DURABLE and ATOMIC, deliberately (#798): the next thing the caller does
-    // is hand the operation to ComfyUI-Manager, an action this process cannot
-    // serialize and which may land after a crash. A buffered marker could be
-    // lost while the operation it records survives — leaving a later pin free
-    // to claim clean protection over a window nothing on disk describes — and
-    // a torn one would read as "unreadable" and refuse every later update_all.
-    // That is precisely the crash this marker exists for, so it goes through
-    // writeFileDurable (temp + fsync + rename) before the handoff.
-    writeFileDurable(path, JSON.stringify({ ops: [...kept, op] }, null, 2));
->>>>>>> b556ff4 (fix(panel): explicit reclaim for a proven-abandoned op lock, durable marker/pin writes, honest panel_reload scope (#760, #798, #765))
 
     // Verify the exact replacement record, not merely that JSON still parses.
     // A partial/redirected write that drops this operation would recreate the
