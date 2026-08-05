@@ -249,7 +249,10 @@ describe("a local restart never abandons the instance it stopped", () => {
       hoisted.base.value = "http://beta.example:8188";
       throw new Error("relaunch could not be spawned");
     });
-    hoisted.fetchMock.mockImplementation(async () => new Response("{}", { status: 200 }));
+    // Nothing is listening after the failed relaunch — the ordinary case.
+    hoisted.fetchMock.mockImplementation(async () => {
+      throw new Error("ECONNREFUSED");
+    });
 
     // The whole assertion is that this RESOLVES. A rejection here is the bug.
     const res = await restartComfyUI();
@@ -257,11 +260,55 @@ describe("a local restart never abandons the instance it stopped", () => {
     expect(port.killed()).toBe(true); // the stop really did happen
     expect(res.stopped).toBe(true); // ...and the report says so
     expect(res.started).toBe(false);
-    // The caller must be able to act on this: their server is down and they need
-    // to know how to bring it back.
-    expect(res.message).toMatch(/not running|could not/i);
+    // The relaunch WAS attempted and threw partway, so what we cannot say is
+    // whether it took effect. "not-attempted" would be a different claim, and a
+    // false one.
+    expect(res.startup).toBe("unconfirmed");
+    expect(res.message).toMatch(/relaunch failed partway/i);
+    // NOT a bare "ComfyUI is NOT running": nothing answered when asked, which is
+    // one observation, and this branch exists to stop exactly that becoming a
+    // verdict. The wording must keep the two apart.
+    expect(res.message).toMatch(/most likely down/i);
+    expect(res.message).toMatch(/not a settled fact/i);
     // The one thing it must never say is the remote-mode refusal, which would be
     // a bucket narrated as the cause of a dead local server.
     expect(res.message).not.toMatch(/targeting a remote/i);
+  });
+
+  it("does NOT report down when something IS answering after a failed relaunch", async () => {
+    // The other half of the same finding: a supervisor may have brought the
+    // instance back while we were unwinding, or the throw may have landed after
+    // a spawn. Reporting "down" over a live server is the unverified negative in
+    // its most misleading form — the user goes looking for a dead process.
+    hoisted.remoteMode.value = false;
+    hoisted.getSystemStats.mockResolvedValue({ system: { argv: [PY, MAIN, "--port", "8188"] } });
+    liveThenFree();
+    __processControlTestHooks.setProcessIdentityResolver(() => ({
+      startedAt: "stable-stamp",
+      commandLine: `${PY} ${MAIN} --port 8188`,
+      argv: [PY, MAIN, "--port", "8188"],
+      argvFidelity: "exact" as const,
+    }));
+    __processControlTestHooks.setProcessExistsProbe(() => true);
+    hoisted.spawn.mockImplementation(() => {
+      throw new Error("relaunch could not be spawned");
+    });
+    // The post-failure probe finds a live server.
+    hoisted.fetchMock.mockImplementation(
+      async () =>
+        new Response(JSON.stringify({ system: {} }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+
+    const res = await restartComfyUI();
+
+    expect(res.startup).toBe("unconfirmed");
+    expect(res.message).toMatch(/IS answering/i);
+    expect(res.message).not.toMatch(/most likely down/i);
+    // And it must not claim that server either — this call did not start it.
+    expect(res.started).toBe(false);
+    expect(res.message).toMatch(/cannot claim that server as its own/i);
   });
 });

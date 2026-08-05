@@ -3600,15 +3600,39 @@ export async function restartComfyUI(): Promise<RestartResult> {
       probeUrl: restartProbeUrl,
     });
   } catch (err) {
+    // DISCLOSE, do not refuse: the stop is not undoable, so the caller needs a
+    // description of where things stand rather than "nothing happened".
+    //
+    // But do not overclaim the other way either. An earlier draft of this said
+    // "ComfyUI is NOT running" — an unverified negative, and this branch's own
+    // defect class (a throw we could not interpret, reported as a definite
+    // down). We do not know that: the throw may have landed AFTER a spawn, or a
+    // supervisor may have brought the instance back while we were unwinding. So
+    // ASK, once, and say only what the answer supports.
+    const probe = await waitForApiReady({
+      intervalMs: 250,
+      maxTries: 1,
+      probeUrl: restartProbeUrl,
+    });
     return {
       stopped: true,
       started: false,
-      // DISCLOSE, do not refuse: the stop is not undoable and the caller's server
-      // really is down. A refusal here would read as "nothing happened".
-      startup: "not-attempted",
+      ready: probe.ready,
+      // Not "not-attempted": the relaunch WAS attempted and threw partway. What
+      // we cannot say is whether it took effect — which is what `unconfirmed`
+      // means, and why it exists (#367).
+      startup: "unconfirmed",
+      readiness: probe,
       message:
-        `ComfyUI was stopped, but the relaunch could not be attempted: ${errorText(err)}. ` +
-        `ComfyUI is NOT running. Start it with start_comfyui once the cause is cleared.` +
+        `ComfyUI was stopped, and the relaunch failed partway: ${errorText(err)}. ` +
+        (probe.ready
+          ? `Something IS answering on ${restartProbeUrl} now — possibly a supervisor ` +
+            `brought it back, or the relaunch got further than the error suggests. ` +
+            `This call cannot claim that server as its own.`
+          : `Nothing answered on ${restartProbeUrl} when asked just now, so ComfyUI ` +
+            `is most likely down — but the relaunch failed in a way this call could ` +
+            `not interpret, so that is a single observation and not a settled fact. ` +
+            `Check the server, and use start_comfyui once the cause is cleared.`) +
         stopCaveat,
       listener_ownership: unclassifiedOwnership(),
     };
