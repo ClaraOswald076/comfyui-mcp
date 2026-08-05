@@ -2845,6 +2845,51 @@ describe("defaultBridgeTimeoutMs — tolerant read timeout (#357)", () => {
     );
     a.close();
   });
+
+  // #803 — the no-reply timeout named `conn.tabId.slice(0, 8)`. Routing ids are
+  // `wf:<path>`, so EVERY workflow tab rendered as the identical, alarming
+  // `wf:workf`: two tabs timing out were indistinguishable in a transcript and
+  // the id read like a corrupted routing key (it sent one diagnosis down a wrong
+  // path outright). Evidence must not be destroyed before it can be reported.
+  it("names the FULL routing tab id in a no-reply timeout, not an 8-char slice (#803)", async () => {
+    const tabId = "wf:workflows/Untitled 2026-08-04 06-15-58.json";
+    const a = await connectPanel(tabId); // never replies
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await expect(bridge.send({ cmd: "graph_query" }, { timeoutMs: 120 })).rejects.toThrow(
+      `Panel tab ${tabId} did not reply to "graph_query" within 120 ms`,
+    );
+    // And specifically NOT the old collapsed form that made every workflow tab look alike.
+    await expect(bridge.send({ cmd: "graph_query" }, { timeoutMs: 120 })).rejects.not.toThrow(
+      /Panel tab wf:workf did not reply/,
+    );
+    a.close();
+  });
+});
+
+// #770/#803 — the fence READ the rebind needs to tell "repaired a stale fence"
+// apart from "there was never a fence". Both are answers; only one is a repair.
+describe("UiBridge.workflowUuidFor (#770 fence read)", () => {
+  it("returns the resolver's value, and undefined for empty/missing/throwing resolvers", () => {
+    const b = new UiBridge(0);
+    // No resolver injected at all → undefined (never a fabricated identity).
+    expect(b.workflowUuidFor("t")).toBeUndefined();
+
+    b.setTabWorkflowUuidResolver((tabId) => (tabId === "t" ? "u-1" : undefined));
+    expect(b.workflowUuidFor("t")).toBe("u-1");
+    expect(b.workflowUuidFor("other")).toBeUndefined();
+
+    // An empty string is not an identity.
+    b.setTabWorkflowUuidResolver(() => "");
+    expect(b.workflowUuidFor("t")).toBeUndefined();
+
+    // A guard that can throw is not a guard: a faulting resolver must not take
+    // down the recovery that reads it.
+    b.setTabWorkflowUuidResolver(() => {
+      throw new Error("resolver exploded");
+    });
+    expect(() => b.workflowUuidFor("t")).not.toThrow();
+    expect(b.workflowUuidFor("t")).toBeUndefined();
+  });
 });
 
 describe("makeUnknownCommandError (old-panel version gate)", () => {
