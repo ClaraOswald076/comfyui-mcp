@@ -36,8 +36,12 @@ const fsState = vi.hoisted(() => ({
   concurrentWriteAfterRead: null as null | { at: number; run: () => void },
   storeReads: 0,
   /** Replace what the rename installs, to force the whole-file verification to
-   *  see keys go missing. */
+   *  see keys go missing. Fires on the NEXT store rename. */
   tamperOnRename: null as null | (() => string),
+  /** Per-rename tamper, indexed by store-rename number (1-based) — so a specific
+   *  write in a multi-write sequence (a slot fan-out, then its rollback) can be
+   *  singled out. */
+  tamperAtRename: {} as Record<number, () => string>,
   renames: 0,
   /** Every path ever passed to writeFileSync — proves the target is not written
    *  in place. */
@@ -67,9 +71,10 @@ vi.mock("node:fs", async (importOriginal) => {
       if (fsState.failRename) {
         throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
       }
-      const tamper = fsState.tamperOnRename;
+      const tamper = fsState.tamperOnRename ?? fsState.tamperAtRename[fsState.renames];
       if (tamper) {
         fsState.tamperOnRename = null;
+        delete fsState.tamperAtRename[fsState.renames];
         actual.writeFileSync(from, tamper());
       }
     }
@@ -147,7 +152,7 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 
-import { setComfyuiSecret, removeComfyuiSecret } from "../../services/panel-secrets.js";
+import { setComfyuiSecret, removeComfyuiSecret, setPanelSecret } from "../../services/panel-secrets.js";
 import { parseEnvFile, resetEnvFileProvenanceForTests } from "../../env-file.js";
 
 const KEYS = ["CIVITAI_API_TOKEN", "HF_TOKEN", "HUGGINGFACE_TOKEN", "RUNPOD_API_KEY"];
@@ -164,6 +169,7 @@ beforeEach(() => {
   fsState.concurrentWriteBeforeRead = null;
   fsState.concurrentWriteAfterRead = null;
   fsState.tamperOnRename = null;
+  fsState.tamperAtRename = {};
   fsState.renames = 0;
   fsState.storeReads = 0;
   fsState.directWrites = [];
@@ -368,6 +374,27 @@ describe("a save is never CONFIRMED over lost credentials", () => {
     expect(out.changed).toBe(true);
     expect(out.lostKeys).toEqual([]);
     expect(parseEnvFile()!.RUNPOD_API_KEY).toBe("rp-keep-me");
+  });
+});
+
+describe("a ROLLBACK is a store write too, and reports what it cost", () => {
+  it("carries credentials the ROLLBACK lost into the slot outcome", () => {
+    // A slot fan-out that fails part-way restores the alias it already wrote.
+    // That restore is a full store rewrite and can lose credentials exactly like
+    // the save it is undoing — and its damage was simply dropped, because only
+    // the SAVE receipts were aggregated. Same property, same place: the loss
+    // travels the one path every consumer already reads.
+    writeFileSync(envPath, "RUNPOD_API_KEY=rp-keep-me\n", { mode: 0o600 });
+    // Rename 1 = HF_TOKEN lands. Rename 2 = HUGGINGFACE_TOKEN is installed
+    // WITHOUT itself, so that alias reads back as not saved and the slot rolls
+    // back — while nothing else is lost yet.
+    fsState.tamperAtRename[2] = () => "RUNPOD_API_KEY=rp-keep-me\nHF_TOKEN=hf-new\n";
+    // Rename 3 IS the rollback (removing HF_TOKEN again) — and it drops RunPod.
+    fsState.tamperAtRename[3] = () => "# rollback ate it\n";
+    const outcome = setPanelSecret("huggingface", "hf-new");
+    expect(outcome.confirmed).toBe(false);
+    expect(outcome.lostKeys).toContain("RUNPOD_API_KEY");
+    expect(parseEnvFile()!.RUNPOD_API_KEY).toBeUndefined(); // it really is gone
   });
 });
 
