@@ -532,7 +532,7 @@ function read(): PanelSecrets {
   }
 }
 
-function write(secrets: PanelSecrets): void {
+function write(secrets: PanelSecrets): string | null {
   // The LEGACY store is a credential file too, redirected by its own env var —
   // and the runtime guard only ever covered the canonical one, so a test could
   // still rewrite the developer's real panel-secrets.json (codex gate).
@@ -544,10 +544,14 @@ function write(secrets: PanelSecrets): void {
   // (0600 is applied to the temp file before the rename, so the credential is
   // never briefly world-readable.)
   const durabilityGap = writeFileAtomic(p, JSON.stringify(secrets, null, 2));
-  // This store has no receipt to carry the gap out on — its callers return void
-  // — so it is LOGGED rather than swallowed. Never the contents: the message is
-  // built from a path and an errno only.
+  // RETURNED as well as logged. A caller that HAS a receipt must be able to
+  // carry this: a revoke whose legacy purge was not made crash-durable can be
+  // undone by a power loss, and the boot migration then resurrects the
+  // credential the user just revoked — so `revokeIsClean` was able to answer
+  // ok:true over it (codex gate). Callers with nowhere to put it still get the
+  // log. Never the contents: a path and an errno only.
   if (durabilityGap) logger.warn(`[panel-secrets] ${durabilityGap}`);
+  return durabilityGap;
 }
 
 // ── Canonical env-secret store: ~/.comfyui-mcp/.env ─────────────────────────
@@ -1502,7 +1506,20 @@ export function removeEnvSecret(key: string): SecretRemoveOutcome {
         purgedJson = true;
       }
     }
-    if (purgedJson) write(s);
+    if (purgedJson) {
+      const jsonGap = write(s);
+      if (jsonGap) {
+        // The purge LANDED but is not established to survive a power loss — and
+        // the consequence is specific: if it is lost, the legacy entry is back
+        // and the boot migration re-adds the credential. That is the same
+        // outcome as a failed purge, so it is reported the same way rather than
+        // as a generic durability note nobody connects to the revoke.
+        resurrectionRisk =
+          `"${key}" was removed from both stores, but purging the legacy store ${panelSecretsPath()} was not made crash-durable: ${jsonGap}. ` +
+          `If the machine loses power before the filesystem flushes on its own, that entry returns and the boot migration re-adds this credential. ` +
+          `Re-check ${panelSecretsPath()} after any unclean shutdown.`;
+      }
+    }
   } catch (err) {
     purgedJson = false;
     resurrectionRisk =
