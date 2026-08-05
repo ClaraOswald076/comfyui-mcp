@@ -1,4 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import { MANAGED_SECRET_KEYS_ENV, resetEnvFileProvenanceForTests } from "../../env-file.js";
 import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,6 +25,7 @@ const ALL_KEYS = [...new Set([...COMFYUI_SECRET_ENV_ALLOWLIST, ...AGENT_SECRET_E
 let dir: string;
 let envPath: string;
 let savedEnv: Record<string, string | undefined>;
+let savedManagedKeys: string | undefined;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "cmcp-secrets-"));
@@ -34,10 +36,28 @@ beforeEach(() => {
     savedEnv[k] = process.env[k];
     delete process.env[k];
   }
+  // The FILE-DERIVED marker leaks between tests, and it is load-bearing: a key
+  // marked file-derived is deliberately revoked when the file no longer carries
+  // it. A previous test that saved a secret therefore left the next one starting
+  // with that key "owned by a file" that its own fresh temp dir does not have —
+  // so a shell-provided value was silently dropped, for a reason belonging to a
+  // different test. Each test gets a clean store AND a clean provenance record.
+  savedManagedKeys = process.env[MANAGED_SECRET_KEYS_ENV];
+  delete process.env[MANAGED_SECRET_KEYS_ENV];
+  // …and the IN-MEMORY half of the same record, which is the one that actually
+  // decides. `resetEnvFileProvenanceForTests` exists for exactly this and was
+  // simply not being called here: a test that saved a secret left the module
+  // believing that key belongs to a file, and the NEXT test then started with a
+  // fresh temp store that has no such file. Before, an absent file read as
+  // "unknown" and the stale belief was harmless; now that an absent file
+  // correctly revokes a file-derived value, the leak became visible.
+  resetEnvFileProvenanceForTests();
 });
 
 afterEach(() => {
   delete process.env.COMFYUI_MCP_ENV_FILE;
+  if (savedManagedKeys === undefined) delete process.env[MANAGED_SECRET_KEYS_ENV];
+  else process.env[MANAGED_SECRET_KEYS_ENV] = savedManagedKeys;
   for (const k of ALL_KEYS) {
     if (savedEnv[k] === undefined) delete process.env[k];
     else process.env[k] = savedEnv[k];
@@ -126,7 +146,7 @@ describe("panel-secrets (canonical .env store)", () => {
       setComfyuiSecret("CIVITAI_API_TOKEN", "tok"); // Settings slot path omits opts
       off();
       expect(cb).toHaveBeenCalledTimes(1);
-      expect(cb).toHaveBeenLastCalledWith({ requested: false });
+      expect(cb).toHaveBeenLastCalledWith(expect.objectContaining({ requested: false }));
     });
 
     it("marks a panel_request_secret save (requested:true) as requested → nudge eligible", () => {
@@ -135,7 +155,7 @@ describe("panel-secrets (canonical .env store)", () => {
       setComfyuiSecret("CIVITAI_API_TOKEN", "tok", { requested: true });
       off();
       expect(cb).toHaveBeenCalledTimes(1);
-      expect(cb).toHaveBeenLastCalledWith({ requested: true });
+      expect(cb).toHaveBeenLastCalledWith(expect.objectContaining({ requested: true }));
     });
 
     it("carries the requesting tabId so ONLY that tab is nudged (never a broadcast)", () => {
@@ -143,7 +163,7 @@ describe("panel-secrets (canonical .env store)", () => {
       const off = onComfyuiSecretsChanged(cb);
       setComfyuiSecret("CIVITAI_API_TOKEN", "tok", { requested: true, tabId: "tab-xyz" });
       off();
-      expect(cb).toHaveBeenLastCalledWith({ requested: true, tabId: "tab-xyz" });
+      expect(cb).toHaveBeenLastCalledWith(expect.objectContaining({ requested: true, tabId: "tab-xyz" }));
     });
 
     it("drops tabId for a NON-requested change (a stray tabId can't smuggle a nudge)", () => {
@@ -152,27 +172,27 @@ describe("panel-secrets (canonical .env store)", () => {
       // Not requested, but a tabId is present on the raw event — must be ignored.
       setComfyuiSecret("CIVITAI_API_TOKEN", "tok", { tabId: "tab-xyz" });
       off();
-      expect(cb).toHaveBeenLastCalledWith({ requested: false, tabId: undefined });
+      expect(cb).toHaveBeenLastCalledWith(expect.objectContaining({ requested: false, tabId: undefined }));
     });
 
     it("marks a REVOKE as NOT requested → a removed token never nudges 'retry'", () => {
       setComfyuiSecret("CIVITAI_API_TOKEN", "tok", { requested: true });
       const cb = vi.fn();
       const off = onComfyuiSecretsChanged(cb);
-      expect(removeComfyuiSecret("CIVITAI_API_TOKEN")).toBe(true);
+      expect(removeComfyuiSecret("CIVITAI_API_TOKEN").changed).toBe(true);
       off();
       expect(cb).toHaveBeenCalledTimes(1);
-      expect(cb).toHaveBeenLastCalledWith({ requested: false });
+      expect(cb).toHaveBeenLastCalledWith(expect.objectContaining({ requested: false }));
     });
   });
 
   it("removes a secret from .env + process.env and reports absence", () => {
     setComfyuiSecret("CIVITAI_API_TOKEN", "tok");
-    expect(removeComfyuiSecret("CIVITAI_API_TOKEN")).toBe(true);
+    expect(removeComfyuiSecret("CIVITAI_API_TOKEN").changed).toBe(true);
     expect(loadComfyuiSecretEnv()).toEqual({});
     expect(process.env.CIVITAI_API_TOKEN).toBeUndefined();
     expect(readFileSync(envPath, "utf-8")).not.toMatch(/CIVITAI_API_TOKEN/);
-    expect(removeComfyuiSecret("CIVITAI_API_TOKEN")).toBe(false);
+    expect(removeComfyuiSecret("CIVITAI_API_TOKEN").changed).toBe(false);
   });
 
   it("rejects an invalid env var name without writing", () => {
@@ -256,7 +276,7 @@ describe("panel-secrets (canonical .env store)", () => {
       process.env.CIVITAI_API_TOKEN = "civ-legacy";
 
       const { removeEnvSecret, migrateSecretsToEnv } = await import("../../services/panel-secrets.js");
-      expect(removeEnvSecret("CIVITAI_API_TOKEN")).toBe(true);
+      expect(removeEnvSecret("CIVITAI_API_TOKEN").changed).toBe(true);
       // Gone from .env AND from the JSON map.
       expect(readFileSync(envPath, "utf-8")).not.toMatch(/CIVITAI_API_TOKEN/);
       const json = JSON.parse(readFileSync(jsonPath, "utf-8"));

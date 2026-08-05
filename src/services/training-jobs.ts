@@ -63,7 +63,7 @@ import {
 import { reportDownloadProgress } from "./download-progress.js";
 import { getLoraCatalog } from "./lora-catalog.js";
 import { resolveModelSubfolder } from "./model-resolver.js";
-import { getInstanceSlug } from "../config.js";
+import { config, getInstanceSlug } from "../config.js";
 import { logger } from "../utils/logger.js";
 
 export type TrainingJobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
@@ -1682,7 +1682,7 @@ export async function startTrainingJob(input: StartJobInput, deps: TrainingJobDe
         containerName: job.containerName!,
         remoteConfigPath: podPaths!.configPath,
         hfCacheDir: podPaths!.hfCacheDir,
-        hfToken: process.env.HF_TOKEN?.trim() || undefined,
+        hfToken: config.huggingfaceToken?.trim() || undefined,
         onProgress,
         onLog,
       });
@@ -1697,7 +1697,7 @@ export async function startTrainingJob(input: StartJobInput, deps: TrainingJobDe
         datasetPath,
         outputDir,
         hfCacheDir: hfCacheRoot(),
-        hfToken: process.env.HF_TOKEN?.trim() || undefined,
+        hfToken: config.huggingfaceToken?.trim() || undefined,
         onProgress,
         onLog,
       });
@@ -1708,7 +1708,7 @@ export async function startTrainingJob(input: StartJobInput, deps: TrainingJobDe
         datasetPath,
         outputDir,
         hfCacheDir: hfCacheRoot(),
-        hfToken: process.env.HF_TOKEN?.trim() || undefined,
+        hfToken: config.huggingfaceToken?.trim() || undefined,
         onProgress,
         onLog,
       });

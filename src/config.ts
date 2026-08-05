@@ -1,5 +1,4 @@
 import { z } from "zod";
-import dotenv from "dotenv";
 import { fileURLToPath } from "url";
 import { dirname, resolve, join } from "path";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -7,6 +6,7 @@ import { homedir } from "node:os";
 import { isIP } from "node:net";
 import { parseComfyUIUrl, type ComfyUITarget } from "./transport/comfyui-url.js";
 import { resetManagerApiCache } from "./services/manager-api-cache.js";
+import { comfyuiEnvFilePath, freshSecretValue, loadEnvFileIntoProcess } from "./env-file.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -34,7 +34,12 @@ try {
 } catch {
   // best-effort migration; real env vars and an existing home .env still work
 }
-dotenv.config({ path: homeEnvPath });
+// Load the canonical dotenv (path resolution — including the COMFYUI_MCP_ENV_FILE
+// override — lives in env-file.ts so the WRITER, services/panel-secrets.ts, and
+// every reader can never disagree about which file "the token was saved" means).
+// This also records which keys were seeded FROM the file, which is what lets
+// freshSecretValue() supersede them on a later re-read (#826).
+loadEnvFileIntoProcess();
 
 /**
  * Does `p` look like a real ComfyUI install root? A ComfyUI Desktop-installer
@@ -480,6 +485,58 @@ if (cloudActive) {
 }
 
 export const config: Config = { ...parsedConfig, resolvedPort };
+
+// ── LAZY DOWNLOAD CREDENTIALS (#826) ────────────────────────────────────────
+// The two download tokens above are snapshotted from process.env at MODULE LOAD,
+// and the canonical .env is read exactly once at boot. In the comfyui MCP CHILD
+// that is fatal: `panel_request_secret` writes the token to ~/.comfyui-mcp/.env
+// and then relies on the orchestrator RESPAWNING this process to inject it. When
+// that respawn does not fire, a snapshotted credential is invisible forever —
+// every download keeps returning 401 while a valid token sits on disk, and
+// nothing distinguishes "no token configured" from "token present but never
+// injected", so an agent following the tool's own advice loops.
+//
+// Resolve them at ACCESS time instead. A real environment variable still wins;
+// otherwise the canonical .env is re-read now (freshSecretValue also handles the
+// revoke case, so clearing the slot takes effect without a respawn too). One
+// getter covers every consumer of config.civitaiApiToken / config.huggingfaceToken,
+// so no call site changes. This removes the structural dependency on the respawn
+// rather than papering over it; the respawn remains, as a second path, not the
+// only one.
+// An EXPLICIT assignment still wins and still works. These fields were plain
+// writable properties before, and code (and tests) assign them; a getter-only
+// descriptor would make every such assignment throw in strict mode. The override
+// is remembered here and cleared by assigning undefined.
+const credentialOverrides: { civitaiApiToken?: string; huggingfaceToken?: string } = {};
+
+Object.defineProperty(config, "civitaiApiToken", {
+  get: () => credentialOverrides.civitaiApiToken ?? freshSecretValue("CIVITAI_API_TOKEN"),
+  set: (v: string | undefined) => {
+    credentialOverrides.civitaiApiToken = v;
+  },
+  enumerable: true,
+  configurable: true,
+});
+Object.defineProperty(config, "huggingfaceToken", {
+  // HF_TOKEN is the canonical var the huggingface_hub libs read; HUGGINGFACE_TOKEN
+  // is a legacy alias we still honor as a fallback (same order as the boot parse).
+  // freshSecretValue resolves each alias FULLY before the next, so the canonical
+  // name wins whichever side it came from.
+  get: () =>
+    credentialOverrides.huggingfaceToken ?? freshSecretValue("HF_TOKEN", "HUGGINGFACE_TOKEN"),
+  set: (v: string | undefined) => {
+    credentialOverrides.huggingfaceToken = v;
+  },
+  enumerable: true,
+  configurable: true,
+});
+
+/** The canonical dotenv path this process reads credentials from. Re-exported so
+ *  the orchestrator can name the file it wrote in a user-facing message without
+ *  duplicating the resolution rule. Contains no secret. */
+export function credentialEnvFilePath(): string {
+  return comfyuiEnvFilePath();
+}
 
 // Process-start ComfyUI target, captured before any runtime retarget (RunPod
 // connect / panel "Local" switch), so a "switch back to local" can restore it.

@@ -4,6 +4,12 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { errorToToolResult } from "../utils/errors.js";
 import { getComfyUIBaseUrl, getComfyUIAuthHeaders } from "../config.js";
 import { getObjectInfo } from "../comfyui/client.js";
+import {
+  bodyPrefixOf,
+  classifyNonJson,
+  isNonJsonResponseError,
+  readComfyJson,
+} from "../comfyui/json-guard.js";
 import { convertUiToApi, isApiFormat, isUiFormat } from "../services/workflow-converter.js";
 import { enumeratePacks, resolvePackWorkflowFile } from "./skills-access.js";
 import type {
@@ -388,14 +394,52 @@ async function loadServerTemplate(
   // look "unreachable" here — the inconsistency this issue reported.
   const base = getComfyUIBaseUrl();
   const authHeaders = getComfyUIAuthHeaders();
+  const url = `${base}/api/workflow_templates`;
   let index: Record<string, unknown> = {};
   try {
-    const res = await fetch(`${base}/api/workflow_templates`, {
+    const res = await fetch(url, {
       headers: authHeaders,
       signal: AbortSignal.timeout(8000),
     });
-    if (res.ok) index = (await res.json()) as Record<string, unknown>;
-  } catch {
+    // `.json()` on an HTML body threw into the catch below, which reported the
+    // server UNREACHABLE — for a server that answered (#828). readComfyJson
+    // names what actually answered instead, and that message is surfaced rather
+    // than collapsed into the unreachable text.
+    if (!res.ok) {
+      // An HTTP ERROR is not an empty index. Falling through with `index = {}`
+      // made a 502 from a proxy, a 403 from a sign-in gate, or a gateway's JSON
+      // error envelope read as "there is no template by that name" — a
+      // confident wrong verdict about the template, for an endpoint that
+      // answered and never told us anything about templates at all (codex gate,
+      // round 9, finding 1).
+      const contentType = res.headers.get("content-type") ?? "";
+      const body = await res.text().catch(() => "");
+      let parsedOk = false;
+      try {
+        JSON.parse(body);
+        parsedOk = true;
+      } catch {
+        parsedOk = false;
+      }
+      return {
+        error: parsedOk
+          ? `Not a bundled pack, and the template index could not be read: ${url} returned ${res.status} with this JSON body: ${bodyPrefixOf(body)}. Whether the requested template exists is UNKNOWN.`
+          : `Not a bundled pack, and the template index could not be read: ${classifyNonJson({ url, status: res.status, contentType, body }).message} Whether the requested template exists is UNKNOWN.`,
+        available: [],
+      };
+    }
+    index = await readComfyJson<Record<string, unknown>>(res, {
+      url,
+      expectShape: (v) => !!v && typeof v === "object" && !Array.isArray(v),
+      shapeHint: "the /api/workflow_templates index (an object keyed by source)",
+    });
+  } catch (err) {
+    if (isNonJsonResponseError(err)) {
+      return {
+        error: `Not a bundled pack, and the template index could not be read: ${err.message}`,
+        available: [],
+      };
+    }
     return {
       error: "Not a bundled pack, and the ComfyUI server is unreachable to look up custom-node-contributed workflow templates.",
       available: [],

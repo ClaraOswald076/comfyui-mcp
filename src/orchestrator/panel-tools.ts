@@ -60,7 +60,15 @@ import {
   removeUserMcpServer,
   setUserMcpServerSecret,
 } from "../services/user-mcp-config.js";
-import { setComfyuiSecret, setAgentSecret, isAllowedAgentSecretKey } from "../services/panel-secrets.js";
+import {
+  setComfyuiSecret,
+  setAgentSecret,
+  isAllowedAgentSecretKey,
+  receiptDisclosures,
+  shadowedNote,
+  storeDamageNote,
+  type SecretSaveReceipt,
+} from "../services/panel-secrets.js";
 import { flattenUiWorkflow } from "../services/flatten-workflow.js";
 import { listWorkflowLibraryKeys, userdataFetch } from "../services/userdata-library.js";
 import { getNsfwConsent, setNsfwConsent } from "../services/panel-settings.js";
@@ -183,6 +191,174 @@ function ok(value: unknown): ToolResult {
 function fail(err: unknown): ToolResult {
   const msg = err instanceof Error ? err.message : String(err);
   return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
+}
+
+// ── Honest secret-save reporting (#826) ─────────────────────────────────────
+// `panel_request_secret` used to answer "the comfyui tools respawn with it as
+// soon as this turn ends" unconditionally — a claim about a FUTURE event nothing
+// verified. When the respawn did not fire, the token sat on disk while every
+// download kept returning the same 401, and no signal separated "no token
+// configured" from "token present but never injected". These two helpers turn a
+// SecretSaveReceipt (all observed facts) into text that states only what was
+// checked. Neither ever touches, formats, or logs a secret VALUE.
+
+/** Error for a save a read-back proved did not take effect. Refusing here is
+ *  correct: the credential is not in place, so proceeding would send the caller
+ *  back into the same failure believing it was fixed. */
+export function secretNotPersisted(receipt: SecretSaveReceipt): Error {
+  // Whether a credential SURVIVED the rollback changes what the caller should do
+  // next, so it must not be flattened into a blanket "nothing is configured"
+  // (codex gate, round 2, finding 3): if a previous working value is still in
+  // place, telling the user nothing is configured sends them after the wrong
+  // problem, and telling them not to retry may be wrong too.
+  // `stillConfigured` is a PRESENCE check: some credential for this key
+  // resolves. It does not establish WHICH — the in-process value was rolled
+  // back, but the store was not, so what resolves may be the value that was
+  // there before, or one a competing writer put there in the meantime. Calling
+  // it "the credential that was in place BEFORE this attempt" asserted a
+  // predecessor state nobody observed (codex gate).
+  const state = receipt.stillConfigured
+    ? `The new value was rolled back in this process rather than left half-applied, and SOME credential for this key still resolves — ` +
+      `which one is not established: it may be the value that was in place before this attempt, or one another writer has since stored. ` +
+      `Either way it is NOT the value you just supplied, so do not read this as "now fixed"; check ${receipt.path} to see what is actually there.`
+    : `The value was rolled back rather than left half-applied, so nothing is configured — do not retry the action that needed it.`;
+  // A failed save can ALSO have destroyed other credentials on its way — the
+  // rewrite happened, it just did not leave OUR key behind. Leading with "was
+  // NOT saved, set it again" over that hides completed damage and sends the user
+  // to write over an already-damaged store (codex gate). Every obligation the
+  // receipt carries comes first, from the one shared list.
+  const disclosures = receiptDisclosures(receipt);
+  return new Error(
+    `${disclosures.length ? `${disclosures.join(" ")} ` : ""}` +
+      `"${receipt.key}" was NOT saved: writing ${receipt.path} appeared to succeed, but reading the file back does not show that key with the value just supplied. ` +
+      `${state} ` +
+      `${
+        disclosures.length
+          ? `Because the rewrite also cost the store other entries, restore ${receipt.path} FIRST — do not simply set the key again on top of it.`
+          : `Check that ${receipt.path} is writable and not being rewritten by another process, then set the key again (panel Settings › credentials, or the env var directly, which takes precedence over the file).`
+      }`,
+  );
+}
+
+/**
+ * The panel's `secret_saved` answer, derived from the receipt.
+ *
+ * The Settings-panel bridge route discarded the receipt entirely and replied
+ * `ok:true` whenever the call did not throw — so an unverifiable save, and one
+ * that PROVED other credentials were destroyed, both painted the panel green
+ * (codex gate). This is that decision, in one place, testable without standing
+ * up an orchestrator: `ok` is the same question every other consumer asks —
+ * `persisted === "yes"` — and the disclosures come from the one shared list.
+ *
+ * `error` on a non-"yes" verdict is a DISCLOSURE, not a claim the write did not
+ * happen: for "damaged" and "unknown" it says what did happen and what is not
+ * established. Only "no" is a proven failure.
+ */
+export function secretSavedReply(receipt: SecretSaveReceipt): {
+  ok: boolean;
+  error?: string;
+  warnings?: string[];
+} {
+  const warnings = receiptDisclosures(receipt);
+  if (receipt.persisted === "yes") {
+    return { ok: true, ...(warnings.length ? { warnings } : {}) };
+  }
+  const error =
+    receipt.persisted === "damaged"
+      ? (storeDamageNote(receipt) ??
+        `"${receipt.key}" was written, but the credential store lost other entries.`)
+      : receipt.persisted === "no"
+        ? secretNotPersisted(receipt).message
+        : `"${receipt.key}" was written to ${receipt.path}, but the save is NOT confirmed — treat it as UNKNOWN: ` +
+          `${receipt.uncertainty ?? "the file could not be re-read to confirm it"}.`;
+  return { ok: false, error, ...(warnings.length ? { warnings } : {}) };
+}
+
+// The note builders and the disclosure list live with the receipt they describe
+// (services/panel-secrets.ts) so that the console endpoint and this file cannot
+// drift apart on which of them matter — the drift that let `lostKeys` reach the
+// ack and nowhere else. Re-exported here because this is where callers and tests
+// have always imported them from.
+export {
+  storeDamageNote,
+  shadowedNote,
+  commentLossNote,
+  durabilityNote,
+  receiptDisclosures,
+} from "../services/panel-secrets.js";
+
+/** The ack for a comfyui tool secret: what was verified, how the running tools
+ *  pick it up, and the ACTUAL respawn disposition — never a promise. */
+export function describeComfyuiSecretSave(receipt: SecretSaveReceipt): string {
+  // Data loss outranks everything: never narrate a save over destroyed tokens.
+  const damaged = storeDamageNote(receipt);
+  if (damaged) return damaged;
+  // A shadowed save has no live pickup and no useful respawn story — the readers
+  // are using the environment variable regardless. Lead with that and stop.
+  const shadowed = shadowedNote(receipt);
+  if (shadowed) return shadowed;
+  const parts: string[] = [];
+  parts.push(
+    receipt.persisted === "yes"
+      ? `🔒 Saved env "${receipt.key}" to ${receipt.path} — verified by reading the file back (the value itself is never shown or logged).`
+      : // NOT a fixed cause. The verdict is "unknown" for more than one reason
+        // now — the file could not be re-read, OR it read back correctly but a
+        // concurrent writer means this save cannot account for the rest of the
+        // store — and asserting the wrong one sends the user to the wrong check
+        // (codex gate). Print what the receipt says was not established.
+        `🔒 Wrote env "${receipt.key}" to ${receipt.path}, but the save is NOT confirmed — treat it as UNKNOWN: ` +
+        `${receipt.uncertainty ?? `${receipt.path} could not be re-read to confirm it`}. ` +
+        `Treat the steps below as unconfirmed and re-check if the action still fails.`,
+  );
+  // Every remaining obligation the receipt carries — lost comment lines, a
+  // durability gap — from the one list every consumer uses. (Damage and
+  // shadowing already returned above; nothing else can appear twice.)
+  parts.push(...receiptDisclosures(receipt));
+  // Every claim below rests on the value actually being IN the store. When that
+  // could not be confirmed, none of them may be made (codex gate, round 2,
+  // finding 4): a running tool child falls back to whatever it inherited when
+  // the file is unreadable, so "it picks it up, retry now" would be a promise
+  // about a state nobody observed — the #826 defect again.
+  const confirmed = receipt.persisted === "yes";
+  if (!confirmed) {
+    parts.push(
+      `Because that could not be confirmed, I cannot say the comfyui tools can see the new value: a running tool session falls back to the credential it started with whenever the store is unreadable.`,
+    );
+  } else if (receipt.livePickup) {
+    // This is the property that makes the answer safe to act on immediately: the
+    // tools resolve this key from the file at USE time, so the already-running
+    // tool process sees it whether or not any respawn happens.
+    parts.push(
+      `The comfyui tools re-read that file each time they use this credential, so the tool process already running picks it up — no reload, and no respawn required.`,
+    );
+  } else {
+    parts.push(
+      `This key is read from the tool process's environment at startup, so only a respawned tool session will see it.`,
+    );
+  }
+  if (receipt.respawn === null) {
+    parts.push(
+      `No agent session reported back, so NO tool-session respawn was scheduled by this save.`,
+    );
+  } else {
+    const { applied, scheduled, live } = receipt.respawn;
+    const bits: string[] = [];
+    if (applied) bits.push(`${applied} replaced now`);
+    if (scheduled) bits.push(`${scheduled} queued for the end of this turn`);
+    parts.push(
+      bits.length
+        ? `Tool sessions being rebuilt with the new environment: ${bits.join(", ")} (of ${live} live).`
+        : `No live tool session needed rebuilding (${live} live).`,
+    );
+  }
+  parts.push(
+    !confirmed
+      ? `Before relying on it, re-check ${receipt.path} carries "${receipt.key}"; if the action fails again the same way, treat the credential as unset and set it again.`
+      : receipt.livePickup
+        ? `Retry the action that needed this credential now.`
+        : `Retry after the tool session is rebuilt.`,
+  );
+  return parts.join(" ");
 }
 
 /**
@@ -6628,7 +6804,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_request_secret",
-      "Securely collect an API token / secret from the user and write it straight to config — you NEVER see the value and it is never saved to chat history. The panel shows a masked input; the pasted value goes directly to the orchestrator, which stores it on the target MCP server, then applies it. Returns only a redacted confirmation.\n\nTWO targets:\n• The BUILT-IN comfyui server (mcp_server 'comfyui', target_kind 'env') — for tokens YOUR OWN comfyui tools need. The env key MUST be one of a fixed allowlist: CIVITAI_API_TOKEN (download_civitai_model), HUGGINGFACE_TOKEN or HF_TOKEN (HuggingFace downloads). Any other key is rejected. The secret is injected into the comfyui server's env and the server is RESPAWNED automatically — NO panel_reload needed; after this turn ends the tools restart with it and you'll be nudged to retry. THIS is what fixes a download that returned HTTP 401.\n• A user-added MCP server (e.g. the 'civitai' http server you added with panel_add_mcp) — use target_kind 'header' (e.g. Authorization, value_prefix 'Bearer ') for http/sse, or 'env' for stdio; then call panel_reload to load it.\n\nFor a CivitAI DOWNLOAD 401, target 'comfyui' env CIVITAI_API_TOKEN — NOT the 'civitai' MCP server (that's only the search MCP).",
+      "Securely collect an API token / secret from the user and write it straight to config — you NEVER see the value and it is never saved to chat history. The panel shows a masked input; the pasted value goes directly to the orchestrator, which stores it on the target MCP server, then applies it. Returns only a redacted confirmation.\n\nTWO targets:\n• The BUILT-IN comfyui server (mcp_server 'comfyui', target_kind 'env') — for tokens YOUR OWN comfyui tools need. The env key MUST be one of a fixed allowlist: CIVITAI_API_TOKEN (download_civitai_model), HUGGINGFACE_TOKEN or HF_TOKEN (HuggingFace downloads). Any other key is rejected. The secret is written to the canonical credential file, which the comfyui tools re-read each time they use a credential — so the running tools pick it up with NO panel_reload. The tool result states what was actually verified (that the file now carries the key) and what the live tool sessions did; if it reports the save could NOT be confirmed, treat it as unconfigured rather than retrying blindly. THIS is what fixes a download that returned HTTP 401.\n• A user-added MCP server (e.g. the 'civitai' http server you added with panel_add_mcp) — use target_kind 'header' (e.g. Authorization, value_prefix 'Bearer ') for http/sse, or 'env' for stdio; then call panel_reload to load it.\n\nFor a CivitAI DOWNLOAD 401, target 'comfyui' env CIVITAI_API_TOKEN — NOT the 'civitai' MCP server (that's only the search MCP).",
       {
         label: z.string().describe("Prompt shown above the masked input, e.g. 'Paste your CivitAI API token'."),
         target_kind: z.enum(["header", "env"]).describe("'header' for http/sse servers (e.g. Authorization); 'env' for stdio servers and the built-in comfyui server."),
@@ -6643,7 +6819,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             { cmd: "request_secret", label: args.label, hint: args.hint },
             { tabId: ctx.tabId, timeoutMs: 300000 },
           );
-          if (typeof secret !== "string" || secret.length === 0) {
+          // A whitespace-only paste must be treated as "nothing entered": it
+          // would write and read back cleanly (so the save would be CONFIRMED)
+          // while every reader treats a blank as absent, leaving the credential
+          // unset behind a success message (codex gate, round 2, finding 1).
+          if (typeof secret !== "string" || secret.trim().length === 0) {
             return ok("No token entered — nothing was saved.");
           }
           const server = (args.mcp_server as string) ?? "";
@@ -6652,10 +6832,55 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // orchestrator's OWN env, which flips the OpenRouter provider to ready
           // and lists its models. NOT injected into the comfyui child.
           if (server.toLowerCase() === "orchestrator" || isAllowedAgentSecretKey(args.key as string)) {
-            setAgentSecret(args.key as string, secret);
-            return ok(
-              `🔒 ${args.key} saved to your ~/.comfyui-mcp config. The OpenRouter provider is now enabled — pick it in the provider list.`,
-            );
+            const receipt = setAgentSecret(args.key as string, secret);
+            // EXHAUSTIVE on the three-valued verdict. Handling only "no" left
+            // "unknown" rendering as saved-and-enabled — a definite configured
+            // state asserted from a failed read-back, which is the #826 defect
+            // in the very vocabulary introduced to prevent it (coordinator
+            // finding). Provider keys are read IN this process, so a PROVEN save
+            // does take effect immediately — but say which provider the KEY
+            // enables rather than naming OpenRouter for every key.
+            switch (receipt.persisted) {
+              case "no":
+                return fail(secretNotPersisted(receipt));
+              case "damaged":
+                // The write HAPPENED and cost the user other credentials. That
+                // is a disclosure about a completed operation, never a refusal
+                // that invites a retry — and it can never be narrated as a save.
+                return ok(
+                  `${storeDamageNote(receipt)} (The key itself did land, so do not set it again before restoring the file — a second write is one more rewrite of a damaged store.)`,
+                );
+              case "unknown":
+                return ok(
+                  `⚠️ ${receipt.key} was written to ${receipt.path}, but the save is NOT confirmed — treat it as UNKNOWN: ` +
+                    `${receipt.uncertainty ?? `the file could not be re-read to confirm it`}. ` +
+                    `Do not treat the provider as configured: check ${receipt.path} carries the key, and set it again if the provider still reads as unconfigured.`,
+                );
+              case "yes": {
+                // A SHADOWED save is stored but not in use, so it must not be
+                // followed by "the provider is enabled now" — it leads instead.
+                const shadow = shadowedNote(receipt);
+                const headline =
+                  shadow ??
+                  `🔒 ${receipt.key} saved to ${receipt.path} (confirmed by reading the file back; the value is never shown or logged). ` +
+                    `The orchestrator reads provider keys in-process, so the provider this key belongs to is enabled now — pick it in the provider list.`;
+                return ok(
+                  [headline, ...receiptDisclosures(receipt).filter((n) => n !== shadow)].join(" "),
+                );
+              }
+              default: {
+                // Exhaustiveness: a new verdict added to the receipt is a COMPILE
+                // error here rather than a silent fall-through past this whole
+                // block into the user-MCP-server branch below.
+                const unhandled: never = receipt.persisted;
+                return fail(
+                  new Error(
+                    `${receipt.key}: the store returned a save verdict this build does not know how to report (${String(unhandled)}). ` +
+                      `Nothing about the save can be asserted — check ${receipt.path} directly.`,
+                  ),
+                );
+              }
+            }
           }
           // The BUILT-IN comfyui server is NOT in the user's ~/.claude.json — the
           // orchestrator spawns it with its own env. Route its secrets to the
@@ -6667,20 +6892,27 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 "The built-in comfyui server takes secrets as env vars — use target_kind 'env' (e.g. key 'CIVITAI_API_TOKEN').",
               );
             }
-            setComfyuiSecret(args.key as string, `${(args.value_prefix as string) ?? ""}${secret}`, {
-              // This save ANSWERS an outstanding agent secret request — mark it so
-              // the orchestrator injects the "retry the action" nudge, and carry
-              // the requesting tab so ONLY that tab's agent is nudged (never a
-              // broadcast to unrelated tabs). A Settings-panel slot save omits
-              // both and never nudges (#164).
-              requested: true,
-              tabId: ctx.tabId,
-            });
-            // Redacted ack ONLY — the secret never enters the agent's context. The
-            // respawn is deferred to this turn's end, so this is accurate.
-            return ok(
-              `🔒 Token saved for the built-in comfyui tools (env "${args.key}"). It's being applied now — the comfyui tools respawn with it as soon as this turn ends, then I'll retry. No reload needed.`,
+            const receipt = setComfyuiSecret(
+              args.key as string,
+              `${(args.value_prefix as string) ?? ""}${secret}`,
+              {
+                // This save ANSWERS an outstanding agent secret request — mark it so
+                // the orchestrator injects the "retry the action" nudge, and carry
+                // the requesting tab so ONLY that tab's agent is nudged (never a
+                // broadcast to unrelated tabs). A Settings-panel slot save omits
+                // both and never nudges (#164).
+                requested: true,
+                tabId: ctx.tabId,
+              },
             );
+            // The save either took effect or it did not — REFUSE when a read-back
+            // proves it did not, rather than returning a success the tools cannot
+            // act on (#826: a token that reports configured but is invisible is
+            // worse than an honest failure, because every later 401 then
+            // misdirects the caller).
+            if (receipt.persisted === "no") return fail(secretNotPersisted(receipt));
+            // Redacted ack ONLY — the secret never enters the agent's context.
+            return ok(describeComfyuiSecretSave(receipt));
           }
           setUserMcpServerSecret(
             {

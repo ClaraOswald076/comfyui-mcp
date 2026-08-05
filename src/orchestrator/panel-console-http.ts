@@ -11,7 +11,20 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { extname, join, resolve, sep } from "node:path";
 import { allBackendReadiness } from "./backend-readiness.js";
 import { getLoraCatalog, loraPreviewsDir } from "../services/lora-catalog.js";
-import { setPanelSecret, clearPanelSecret, listPanelSecretsMasked, CREDENTIAL_SLOTS } from "../services/panel-secrets.js";
+import {
+  setPanelSecret,
+  clearPanelSecret,
+  envFilePath as envStorePath,
+  listPanelSecretsMasked,
+  receiptDisclosures,
+  removeDisclosures,
+  revokeIsClean,
+  slotRevokeState,
+  slotSaveConfirmed,
+  slotShellProvidedKeys,
+  unconfirmedSlotKeys,
+  CREDENTIAL_SLOTS,
+} from "../services/panel-secrets.js";
 import { OPENAI_KEY_PROVIDER_IDS } from "../services/openai-provider-registry.js";
 import { logger } from "../utils/logger.js";
 
@@ -405,14 +418,232 @@ export function startPanelConsoleHttpServer(opts: {
         }
         try {
           if (clear) {
-            // Revoke path (issue #203): remove every alias key of the slot.
-            const removed = clearPanelSecret(slot);
-            sendJson(res, 200, { ok: true, slot, cleared: removed });
+            // Revoke path (issue #203): remove every alias key of the slot, then
+            // VERIFY the slot no longer resolves. Reporting `cleared:true` from
+            // "a line was removed" alone would call the credential revoked while
+            // another form of the assignment still supplies it (codex gate,
+            // round 3, finding 2).
+            // Captured BEFORE the clear: keys a real environment variable
+            // supplies come back on the next start, so the revoke is only
+            // effective for this process and must not be reported as complete.
+            const shellKeys = slotShellProvidedKeys(slot);
+            const clearOutcome = clearPanelSecret(slot);
+            const removed = clearOutcome.changed;
+            // The removal ALREADY HAPPENED. Anything it cost is disclosed here,
+            // with `ok:false` so no UI can render it as a clean revoke — it is
+            // never re-thrown, because the previous version's throw became a
+            // generic `ok:false` in the catch below and the caller retried a
+            // removal that had already run, against a store that had already
+            // lost keys (codex gate).
+            // Everything the removal owes the caller — lost keys, an incomplete
+            // loss account, dropped comments, a write that is not crash-durable,
+            // a legacy purge that failed. Built from the one shared list, not
+            // from this endpoint's own idea of which fields matter, and computed
+            // BEFORE any branch returns: the damage branch used to return in
+            // front of this and in front of the end-state check, so a revoke that
+            // lost keys reported neither its other obligations nor whether the
+            // credential still resolves (codex gate).
+            const clearWarnings = removeDisclosures(clearOutcome, envStorePath());
+            const state = slotRevokeState(slot);
+            if (clearOutcome.lostKeys.length) {
+              sendJson(res, 500, {
+                ok: false,
+                slot,
+                cleared: removed,
+                lost_keys: clearOutcome.lostKeys,
+                // The verified end state, which this branch skipped entirely.
+                still_resolves: state === "unknown" ? null : state === "still-resolves",
+                ...(clearWarnings.length ? { warnings: clearWarnings } : {}),
+                error:
+                  `"${slot}" WAS removed from the credential store, but the store no longer carries ${clearOutcome.lostKeys.join(", ")} — ` +
+                  `${clearOutcome.lostKeys.length > 1 ? "those credentials were" : "that credential was"} lost during the rewrite. ` +
+                  `Do NOT repeat the revoke: it already happened, and another write would rewrite an already-damaged store. Inspect the file and restore the missing entries first.`,
+              });
+              return;
+            }
+            if (state === "still-resolves") {
+              sendJson(res, 500, {
+                ok: false,
+                slot,
+                cleared: false,
+                still_resolves: true,
+                error:
+                  `Removed an entry for "${slot}", but the credential still resolves — something else is still providing it. It is NOT revoked.`,
+              });
+              return;
+            }
+            if (state === "unknown") {
+              // The store could not be read, so we cannot say the credential is
+              // gone: a tool process that CAN read it may still find the old
+              // value there. Report the uncertainty instead of either verdict.
+              //
+              // `ok:false`, deliberately. The warning below said the end state
+              // was UNKNOWN while the success flag next to it said the revoke
+              // worked — and a consumer reads the flag (codex gate). This is a
+              // DISCLOSURE, not a refusal: `cleared` still reports that the
+              // removal happened, so nobody is invited to retry it.
+              sendJson(res, 500, {
+                ok: false,
+                slot,
+                cleared: removed,
+                still_resolves: null,
+                warning:
+                  `"${slot}" no longer applies to this process, but the credential store could not be re-read, so whether it is gone from disk is UNKNOWN. ` +
+                  `A tool session that can read the store may still find the old value. Re-check before relying on the revoke.`,
+                ...(clearWarnings.length ? { warnings: clearWarnings } : {}),
+              });
+              return;
+            }
+            // `ok` asks the same question everywhere: is this a CLEAN revoke?
+            // The end state being verified "gone" is not enough — a revoke whose
+            // loss account was never completed, that the boot migration will
+            // undo, or that only partly ran was green-lit here while a warning
+            // beside it said exactly that, and a consumer reads the flag
+            // (codex gate). Comment loss and a durability gap stay warnings:
+            // they are what the revoke COST, not doubt about the revoke.
+            const cleanRevoke = revokeIsClean(clearOutcome);
+            sendJson(res, cleanRevoke ? 200 : 500, {
+              ok: cleanRevoke,
+              slot,
+              // `cleared` keeps its established meaning — an entry was removed
+              // from the credential STORE — and `still_resolves` reports the
+              // verified end state. Two fields, each true to its own question:
+              // conflating them is how `cleared:false` ended up sitting next to
+              // a "cleared for this session" note (codex gate, round 4,
+              // finding 5).
+              cleared: removed,
+              // Scoped claim: it no longer resolves HERE. A tool session that
+              // was already running keeps the value it was spawned with until it
+              // is rebuilt — the clear schedules that rebuild, it does not
+              // perform it, so the two are reported separately.
+              still_resolves: false,
+              live_sessions_rebuild_at_idle: true,
+              ...(shellKeys.length
+                ? {
+                    warning:
+                      `${shellKeys.join(", ")} ${shellKeys.length > 1 ? "are" : "is"} set as a real environment variable outside this app, not in the credential store. ` +
+                      `It no longer applies to the running process, but it returns on the next start — unset it where it is defined to revoke it permanently.`,
+                  }
+                : {}),
+              ...(clearWarnings.length ? { warnings: clearWarnings } : {}),
+            });
             return;
           }
-          setPanelSecret(slot, value);
+          // Report what the read-back PROVED, not that the call returned. The
+          // same failure panel_request_secret refuses was answered ok:true here.
+          const outcome = setPanelSecret(slot, value);
+          if (!slotSaveConfirmed(outcome)) {
+            // DATA LOSS FIRST. This endpoint answered `200 {ok:true, masked}`
+            // from `slotSaveConfirmed` alone, so a save that destroyed the
+            // user's other tokens was reported to the panel as a clean success —
+            // the PR's original defect, one layer further out (codex gate). It
+            // cannot recur by omission now: a damaged receipt is `persisted:
+            // "damaged"`, which is not "yes", so `confirmed` is false and this
+            // branch is the only way out.
+            if (outcome.lostKeys.length) {
+              // Say which post-state we are ACTUALLY in. "Nothing was rolled
+              // back" was asserted unconditionally here, but this branch is also
+              // reached when a FAILED save rolled back and the rollback is what
+              // lost the keys — so it stated a post-state that had not happened
+              // (codex gate). `rolledBack` is the outcome's own answer.
+              const rollbackNote = outcome.receipts.some((r) => r.persisted === "damaged")
+                ? `Nothing was rolled back: a rollback cannot bring them back and would be one more rewrite of a damaged store.`
+                : outcome.rolledBack
+                  ? `The slot itself was rolled back, but that rollback is what the store lost these entries during — it cannot be undone by repeating it.`
+                  : `The slot was NOT left in its previous state either; see stranded_keys / unverified_restore_keys.`;
+              sendJson(res, 500, {
+                ok: false,
+                slot,
+                // Key NAMES only — never a value.
+                lost_keys: outcome.lostKeys,
+                saved_but_damaged: true,
+                rolled_back: outcome.rolledBack,
+                ...(outcome.strandedKeys.length ? { stranded_keys: outcome.strandedKeys } : {}),
+                ...(outcome.unverifiedKeys.length
+                  ? { unverified_restore_keys: outcome.unverifiedKeys }
+                  : {}),
+                ...(outcome.restoreWarnings?.length ? { warnings: outcome.restoreWarnings } : {}),
+                error:
+                  `"${slot}" was written to the credential store, but the store no longer carries ${outcome.lostKeys.join(", ")} — ` +
+                  `${outcome.lostKeys.length > 1 ? "those credentials were" : "that credential was"} lost during the write. This is NOT a successful save. ` +
+                  `${rollbackNote} ` +
+                  `Inspect the file and restore the missing ${outcome.lostKeys.length > 1 ? "entries" : "entry"} before relying on anything in it.`,
+              });
+              return;
+            }
+            const unconfirmed = unconfirmedSlotKeys(outcome.receipts);
+            const failed = unconfirmed.filter((u) => u.persisted === "no");
+            // Describe the state we LEFT, not the state we intended. A slot with
+            // alias keys is written serially, so a failure part-way can leave an
+            // earlier alias live; `strandedKeys` names exactly that case, and
+            // "nothing was half-applied" is only claimed when the restore is
+            // proven complete.
+            const stranded = outcome.strandedKeys;
+            const unverifiedRestore = outcome.unverifiedKeys;
+            const aftermath = stranded.length
+              ? `Restoring the slot did not take effect for ${stranded.join(", ")}, which still carr${stranded.length > 1 ? "y" : "ies"} the new value — the slot is in a MIXED state; set it again, or clear it, before relying on it.`
+              : unverifiedRestore.length
+                ? `Restoring the slot could NOT be verified for ${unverifiedRestore.join(", ")} (the store was unreadable), so whether anything was half-applied is unknown — re-check before relying on it.`
+                : `The change was rolled back, so nothing was half-applied.`;
+            // `unknown` is NOT a success. Answering 200 ok:true for a write
+            // whose read-back could not be performed asserts a definite
+            // configured state from a failed verification — the #826 shape
+            // reappearing inside the vocabulary introduced to prevent it
+            // (coordinator finding). `ok` is true only for a PROVEN save, which
+            // this branch is not, by construction.
+            const unverifiedSave = unconfirmed.filter((u) => u.persisted === "unknown");
+            sendJson(res, 500, {
+              ok: false,
+              slot,
+              // Key NAMES and verdicts only — never a value.
+              unconfirmed,
+              rolled_back: outcome.rolledBack,
+              ...(unverifiedSave.length ? { unverified_keys: unverifiedSave.map((u) => u.key) } : {}),
+              ...(stranded.length ? { stranded_keys: stranded } : {}),
+              ...(unverifiedRestore.length ? { unverified_restore_keys: unverifiedRestore } : {}),
+              // What the ROLLBACK's own writes cost — a rollback is a store
+              // write the user never asked for, and it was reported nowhere.
+              ...(outcome.restoreWarnings?.length ? { warnings: outcome.restoreWarnings } : {}),
+              ...(failed.length
+                ? {
+                    error:
+                      `"${slot}" was NOT saved: the credential store does not come back carrying ${failed.map((f) => f.key).join(", ")}. ${aftermath}`,
+                  }
+                : stranded.length
+                  ? { error: `"${slot}" could not be saved cleanly. ${aftermath}` }
+                  : {
+                      // The REASON comes from the receipt. "unknown" no longer
+                      // means only "the file could not be re-read" — it also
+                      // covers a save whose key read back fine but whose loss
+                      // account a concurrent writer made impossible to complete,
+                      // and asserting the wrong one sends the user to check the
+                      // wrong thing (codex gate).
+                      error:
+                        `"${slot}" was written but the save is NOT confirmed (${unconfirmed.map((u) => u.key).join(", ")}), so treat it as UNKNOWN: ` +
+                        `${outcome.receipts.find((r) => r.uncertainty)?.uncertainty ?? "the store could not be re-read to confirm it"}. ` +
+                        `Do not treat it as configured. ${aftermath}`,
+                    }),
+            });
+            return;
+          }
           const masked = listPanelSecretsMasked().find((s) => s.id === slot)?.masked ?? null;
-          sendJson(res, 200, { ok: true, slot, masked });
+          // A CONFIRMED save can still owe the user a disclosure — comment lines
+          // the rewrite dropped, or a write that could not be made crash-durable.
+          // Built from the one shared list, so a new obligation on the receipt
+          // reaches this endpoint without anyone remembering to wire it up here.
+          const warnings = [
+            ...outcome.receipts.flatMap((r) => receiptDisclosures(r)),
+            // A confirmed slot save performs no rollback, so this is normally
+            // empty — but it is included from the same place either way, so the
+            // rollback's own costs can never be the field nobody rendered.
+            ...(outcome.restoreWarnings ?? []),
+          ];
+          sendJson(res, 200, {
+            ok: true,
+            slot,
+            masked,
+            ...(warnings.length ? { warnings } : {}),
+          });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           sendJson(res, /unknown credential slot/i.test(msg) ? 400 : 500, { ok: false, error: msg });

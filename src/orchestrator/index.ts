@@ -54,13 +54,19 @@ import {
   fetchSupportedCommands,
   isEffort,
   type Effort,
+  type McpEnvRestartOutcome,
   type ModelInfo,
   type SlashCommand,
   type UsageStatus,
 } from "./panel-agent.js";
 import { promptText } from "./error-text.js";
 import { callToolAdmission } from "./call-tool-admission.js";
-import { createPanelMcpServer, makePanelToolCtx, resolvePinTarget } from "./panel-tools.js";
+import {
+  createPanelMcpServer,
+  makePanelToolCtx,
+  resolvePinTarget,
+  secretSavedReply,
+} from "./panel-tools.js";
 import {
   optionsAckFrame,
   optionsErrorAckFrame,
@@ -81,6 +87,8 @@ import {
   setAgentSecret,
   setComfyuiSecret,
   isAllowedComfyuiSecretKey,
+  changeJustifiesRetryNudge,
+  type SecretSaveReceipt,
 } from "../services/panel-secrets.js";
 import { CodexBackend } from "./codex-backend.js";
 import { GeminiBackend, GEMINI_DEFAULT_MODEL } from "./gemini-backend.js";
@@ -1656,10 +1664,12 @@ export async function runPanelOrchestrator(): Promise<void> {
     COMFYUI_URL: comfyuiUrl,
     COMFYUI_MCP_PROGRESS_DIR: progressDir,
     ...(comfyuiPath ? { COMFYUI_PATH: comfyuiPath } : forceRemoteEnv()),
-    // Pass through optional credentials the comfyui MCP honors, when set in the
-    // orchestrator's env — so Codex can do everything Claude can (Civitai, HF).
-    ...(process.env.CIVITAI_API_TOKEN ? { CIVITAI_API_TOKEN: process.env.CIVITAI_API_TOKEN } : {}),
-    ...(process.env.HF_TOKEN ? { HF_TOKEN: process.env.HF_TOKEN } : {}),
+    // NO credentials here. buildComfyuiMcpEnv() is the single authority for every
+    // allowlisted credential key (it resolves each from the canonical store at
+    // spawn time and DELETES any the store no longer provides). Copying raw
+    // process.env tokens into the base defeated that: spreading cannot remove,
+    // so an externally revoked token survived here and the next child inherited
+    // it as a real env override — a revoke that did not revoke.
     // Test-only tool-call trace (knowledge-parity smoke). No-op unless set.
     ...(process.env.COMFYUI_MCP_TOOL_TRACE ? { COMFYUI_MCP_TOOL_TRACE: process.env.COMFYUI_MCP_TOOL_TRACE } : {}),
   });
@@ -2689,15 +2699,27 @@ export async function runPanelOrchestrator(): Promise<void> {
     // the action" nudge is not, so it must never broadcast to unrelated tabs.
     // restartAllForMcpEnv() is nudge-preserving, so this can't erase a per-request
     // nudge already queued on another tab (#164).
-    manager.restartAllForMcpEnv();
+    const tally = manager.restartAllForMcpEnv();
     // NUDGE only the tab whose panel_request_secret this change answers — a
     // Settings slot save, a background token (re)load, or a revoke leaves
     // `requested` false and nudges nothing. The per-tab pending-restart map
     // coalesces, so a repeat event for the same tab can't double-inject (#164).
-    const nudgedTab = change.requested && change.tabId ? change.tabId : null;
-    if (nudgedTab) manager.restartForMcpEnv(agentKeyFor(nudgedTab), SECRET_RETRY_NUDGE);
+    // ...and only for a PROVEN save — see `changeJustifiesRetryNudge`, which is
+    // where that rule lives and is tested.
+    const nudgedTab = changeJustifiesRetryNudge(change) ? (change.tabId ?? null) : null;
+    let nudgeOutcome: McpEnvRestartOutcome | null = null;
+    if (nudgedTab) nudgeOutcome = manager.restartForMcpEnv(agentKeyFor(nudgedTab), SECRET_RETRY_NUDGE);
+    // Tell the SAVER what actually happened (#826). The emit is synchronous, so
+    // this lands before setEnvSecret returns and the tool can describe the real
+    // disposition instead of promising a respawn nobody observed. A tab with no
+    // live agent contributes nothing — restartForMcpEnv already returned
+    // "no-agent" for it and the tally counts only agents that exist.
+    change.report?.(tally);
     logger.info(
-      `[panel-orchestrator] tool secret ${change.requested ? "saved (requested)" : "changed"} → comfyui MCP env updated + agents respawn on idle${nudgedTab ? ` + retry nudge → tab ${nudgedTab.slice(0, 8)}` : ""} (keys: ${comfyuiSecretKeys().join(", ") || "none"})`,
+      `[panel-orchestrator] tool secret ${change.requested ? "saved (requested)" : "changed"} → comfyui MCP env updated; ` +
+        `agent respawn: ${tally.applied} applied now, ${tally.scheduled} scheduled at idle, of ${tally.live} live` +
+        `${nudgedTab ? ` + retry nudge → tab ${nudgedTab.slice(0, 8)} (${nudgeOutcome})` : ""} ` +
+        `(keys: ${comfyuiSecretKeys().join(", ") || "none"})`,
     );
   });
 
@@ -4221,19 +4243,38 @@ export async function runPanelOrchestrator(): Promise<void> {
       const key = typeof rawKey === "string" ? rawKey : "";
       const value = typeof rawValue === "string" ? rawValue : "";
       let error: string | undefined;
+      // The RECEIPT, not merely "did the call throw". This route discarded it
+      // entirely and answered `ok:true` for every verdict — including a save
+      // whose read-back could not be taken, and one that PROVED other
+      // credentials were destroyed (codex gate). `ok` is the same question the
+      // console endpoint and the tool ack ask: `persisted === "yes"`.
+      let receipt: SecretSaveReceipt | undefined;
       try {
         if (!value.trim()) throw new Error("No token entered — nothing was saved.");
-        if (isAllowedComfyuiSecretKey(key)) setComfyuiSecret(key, value.trim());
-        else setAgentSecret(key, value.trim());
+        receipt = isAllowedComfyuiSecretKey(key)
+          ? setComfyuiSecret(key, value.trim())
+          : setAgentSecret(key, value.trim());
         logger.info(`[panel-orchestrator] secret set from panel Settings: ${key} (redacted)`);
       } catch (err) {
         error = err instanceof Error ? err.message : String(err);
       }
+      // ONE derivation of "may the panel paint this green", shared with every
+      // other consumer of a receipt (see secretSavedReply).
+      const reply = receipt ? secretSavedReply(receipt) : { ok: false, error };
       bridge.push(
-        { type: "secret_saved", key, ok: !error, ...(error ? { error } : {}) },
+        {
+          type: "secret_saved",
+          key,
+          ok: reply.ok,
+          ...(reply.error ?? error ? { error: reply.error ?? error } : {}),
+          ...(reply.warnings?.length ? { warnings: reply.warnings } : {}),
+        },
         event.tab_id,
       );
-      if (!error) pushReadiness(event.tab_id);
+      // Readiness still reflects whatever the store ACTUALLY carries now, so it
+      // is refreshed whenever a write happened at all — a damaged or unverified
+      // save changed the world and the panel must not keep showing the old view.
+      if (receipt) pushReadiness(event.tab_id);
       return;
     }
 

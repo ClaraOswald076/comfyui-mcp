@@ -2,10 +2,34 @@ import { describe, expect, it, vi } from "vitest";
 import type { z } from "zod";
 
 // The train tools pull config.js (env/port probes) — stub it the same way the
-// runpod tool tests do so registration is side-effect free.
+// runpod tool tests do so registration is side-effect free. `config` is part of
+// that surface: train_doctor reports `hfTokenSet` from config.huggingfaceToken
+// (access-time, both aliases — #826), so a mock without it would make that
+// handler throw rather than report.
+const mockConfig = vi.hoisted(() => ({ huggingfaceToken: undefined as string | undefined }));
 vi.mock("../../config.js", () => ({
   isRemoteMode: () => false,
+  config: mockConfig,
 }));
+
+// train_doctor probes the docker daemon and the trainer bootstrap. Those are
+// real I/O with real timeouts (5s+ on a runner with no docker), and none of it
+// is what these tests are about — stub them so the handler exercises only its
+// own reporting.
+vi.mock("../../services/ai-toolkit.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../services/ai-toolkit.js")>();
+  return {
+    ...actual,
+    trainerDoctor: async () => ({ ok: true, data: {} }),
+  };
+});
+vi.mock("../../services/trainer-bootstrap.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../services/trainer-bootstrap.js")>();
+  return {
+    ...actual,
+    bootstrapStatus: async () => ({ dir: "", cloned: false, venv: false, ready: false, ref: "" }),
+  };
+});
 
 import { registerTrainTools } from "../../tools/train.js";
 
@@ -55,5 +79,58 @@ describe("train_start params bounds (#104 — a Custom-preset typo must not star
     expect(params().safeParse({ steps: 200.5 }).success).toBe(false);
     expect(params().safeParse({ rank: 15.5 }).success).toBe(false);
     expect(params().safeParse({ resolution: [511.5] }).success).toBe(false);
+  });
+});
+
+// #826 — train_doctor's `hfTokenSet` used to read process.env.HF_TOKEN directly,
+// so it reported "no token" for a token saved after this process started and
+// ignored the HUGGINGFACE_TOKEN alias entirely. It now reports what the readers
+// actually resolve (config.huggingfaceToken). Presence only — never the value.
+describe("train_doctor reports HF token PRESENCE from the resolved credential", () => {
+  function getHandler(name: string) {
+    let handler: ((args: Record<string, unknown>) => Promise<unknown>) | undefined;
+    const server = {
+      tool: (
+        n: string,
+        _d: string,
+        _s: unknown,
+        h: (a: Record<string, unknown>) => Promise<unknown>,
+      ) => {
+        if (n === name) handler = h;
+      },
+    };
+    registerTrainTools(server as never);
+    if (!handler) throw new Error(`tool ${name} not registered`);
+    return handler;
+  }
+
+  async function doctorText(): Promise<string> {
+    const out = (await getHandler("train_doctor")({})) as { content: Array<{ text: string }> };
+    return out.content[0].text;
+  }
+
+  it("reports false when nothing resolves", async () => {
+    mockConfig.huggingfaceToken = undefined;
+    expect(JSON.parse(await doctorText()).data.hfTokenSet).toBe(false);
+  });
+
+  it("reports true for a resolved token, and never echoes it", async () => {
+    mockConfig.huggingfaceToken = "hf-resolved-value";
+    try {
+      const text = await doctorText();
+      expect(JSON.parse(text).data.hfTokenSet).toBe(true);
+      expect(text).not.toContain("hf-resolved-value");
+    } finally {
+      mockConfig.huggingfaceToken = undefined;
+    }
+  });
+
+  it("treats a whitespace-only value as NOT set", async () => {
+    mockConfig.huggingfaceToken = "   ";
+    try {
+      expect(JSON.parse(await doctorText()).data.hfTokenSet).toBe(false);
+    } finally {
+      mockConfig.huggingfaceToken = undefined;
+    }
   });
 });

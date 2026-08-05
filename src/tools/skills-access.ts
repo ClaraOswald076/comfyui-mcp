@@ -7,6 +7,14 @@ import { parse as parseYaml } from "yaml";
 import { errorToToolResult } from "../utils/errors.js";
 import { getComfyUIBaseUrl, getComfyUIAuthHeaders } from "../config.js";
 import { checkWorkflowRuntime, extractWorkflowClassTypes } from "../services/api-nodes.js";
+import {
+  bodyPrefixOf,
+  classifyNonJson,
+  isNonJsonResponseError,
+  looksLikeHtmlParsedAsJson,
+  readComfyJson,
+  redactErrorMessage,
+} from "../comfyui/json-guard.js";
 
 // Optional, opt-in observability hook for the knowledge-parity smoke test: when
 // COMFYUI_MCP_TOOL_TRACE points at a file, each of these tools appends a JSONL
@@ -311,22 +319,50 @@ export function registerSkillsAccessTools(server: McpServer): void {
         // get_template_schema uses, so a proxied/authed remote resolves
         // consistently between listing and schema lookup.
         const base = getComfyUIBaseUrl();
-        const res = await fetch(`${base}/api/workflow_templates`, {
+        const url = `${base}/api/workflow_templates`;
+        const res = await fetch(url, {
           headers: getComfyUIAuthHeaders(),
           signal: AbortSignal.timeout(8000),
         });
         if (!res.ok) {
+          // A NON-2xx may still be an HTML proxy/login page — say which, instead
+          // of blaming a possibly-fine ComfyUI version (#828).
+          const contentType = res.headers.get("content-type") ?? "";
+          const body = await res.text().catch(() => "");
+          let parsedOk = false;
+          try {
+            JSON.parse(body);
+            parsedOk = true;
+          } catch {
+            parsedOk = false;
+          }
           return {
             isError: true,
             content: [
               {
                 type: "text" as const,
-                text: `ComfyUI returned ${res.status} for /api/workflow_templates. Is the server running and recent enough to expose workflow templates?`,
+                text: parsedOk
+                  ? // Do NOT attribute the status to ComfyUI: a JSON error body
+                    // can just as easily be a gateway's own envelope that never
+                    // reached it (#828). Offer both readings, assert neither.
+                    // The body goes through the same credential redaction as the
+                    // non-JSON path — a gateway that reflects the request could
+                    // otherwise echo our ComfyUI token into this tool result.
+                    `The request to ${url} returned ${res.status} with this JSON body: ${bodyPrefixOf(body)}. ` +
+                    `If that is a ComfyUI error, the server may predate the workflow-templates endpoint; if it is a gateway's own error envelope, the request never reached ComfyUI.`
+                  : classifyNonJson({ url, status: res.status, contentType, body }).message,
               },
             ],
           };
         }
-        const index = (await res.json()) as Record<string, unknown>;
+        // A 200 whose body is an HTML document is the #828 case: the frontend's
+        // catch-all (or a proxy) answered a route it never forwarded to the API.
+        // readComfyJson names that instead of throwing "Unexpected token '<'".
+        const index = await readComfyJson<Record<string, unknown>>(res, {
+          url,
+          expectShape: (v) => !!v && typeof v === "object" && !Array.isArray(v),
+          shapeHint: "the /api/workflow_templates index (an object keyed by source)",
+        });
         const groups = Object.keys(index);
         const total = Object.values(index).reduce<number>(
           (n, v) => n + (Array.isArray(v) ? v.length : 0),
@@ -493,8 +529,21 @@ export function registerSkillsAccessTools(server: McpServer): void {
             ],
           };
         } catch (probeErr) {
-          // No live server (or /object_info failed): we can't authoritatively
-          // classify, but still surface the node list so the agent can reason.
+          // The classification failed. We can't authoritatively classify, but we
+          // still surface the node list so the agent can reason — AND we must not
+          // misattribute the cause. A server that answered with an HTML page was
+          // REACHED; calling that "could not reach the server" (#828) sends the
+          // user to check that ComfyUI is running when the real problem is a
+          // proxy or a sign-in gate in front of it.
+          // A diagnosed non-JSON response is the clearest case. But a RAW
+          // markup-parse failure also proves the server answered with something
+          // that is not JSON, even when the follow-up probe was inconclusive —
+          // filing that under "unavailable" loses the #828 diagnosis and sends
+          // the user to check that ComfyUI is running (codex gate, round 6).
+          // The message is redacted either way: it quotes the body it choked on.
+          const diagnosed = isNonJsonResponseError(probeErr);
+          const nonJson = diagnosed || looksLikeHtmlParsedAsJson(probeErr);
+          const detail = redactErrorMessage(probeErr);
           return {
             content: [
               {
@@ -504,7 +553,10 @@ export function registerSkillsAccessTools(server: McpServer): void {
                     runtime: "unknown",
                     usesApiNodes: null,
                     classTypes,
-                    note: `Could not reach the ComfyUI server to classify nodes (${(probeErr as Error).message}). API-node detection needs a running ComfyUI. If unsure, treat ad-hoc workflows as POSSIBLY paid and ask the user before spending credits.`,
+                    reason: nonJson ? "non_json_response" : "object_info_unavailable",
+                    note: nonJson
+                      ? `Could not classify the nodes: the ComfyUI server was reached but /object_info did not return JSON. ${detail}${diagnosed ? "" : " (The response could not be re-probed, so what answered is not identified.)"} Until that is fixed the runtime is genuinely UNDETERMINED — treat this workflow as POSSIBLY paid and ask the user before spending credits.`
+                      : `Could not classify the nodes: /object_info was unavailable (${detail}). API-node detection needs a reachable ComfyUI. If unsure, treat ad-hoc workflows as POSSIBLY paid and ask the user before spending credits.`,
                   },
                   null,
                   2,
