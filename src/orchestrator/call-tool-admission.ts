@@ -123,8 +123,29 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   // name, so admission is ACTION-scoped below to exactly what the retired entry
   // covered. Whitelisting the bare name would turn a read into an install.
   "list_packs",
-  "list_installed_nodes",
+  //
+  // 0.50.0 slice 12 folded NINE custom-node lifecycle names into
+  // `install_custom_node`, and only TWO of them were ever whitelisted here:
+  // install_custom_node itself and the installed-pack LIST tool (whose own
+  // entry sat right here until this slice retired the name). The other seven
+  // arrived as ACTIONS on a name that was already admitted, which is a
+  // broadening created purely by the fold — so the entry is ACTION-scoped below
+  // to exactly install + list. See CALL_TOOL_ACTION_WHITELIST.
   "install_custom_node",
+  // The other two thirds of slice 12 are deliberately ABSENT and must stay so:
+  //
+  //   `search_custom_nodes` (registry search + pack details) is read-only and
+  //   network-only, but neither of the two names it now covers was EVER
+  //   whitelisted here, and adding it would be inventing reachability rather
+  //   than preserving it. The dependency side-panel reads what a workflow needs
+  //   through download_model (action:"resolve_missing") and list_packs
+  //   (action:"extract_deps"), which are whitelisted above; nothing asks a
+  //   canvas-less client to browse the public registry.
+  //
+  //   `node_pack` (scaffold/verify/publish/read/write/patch/git on the user's
+  //   own source) has three actions that are arbitrary file writes and git
+  //   operations under custom_nodes/, and not one of the nine names it replaces
+  //   was ever reachable from a canvas-less client either.
 ]);
 
 /**
@@ -244,6 +265,27 @@ const CALL_TOOL_ACTION_WHITELIST: ReadonlyMap<string, ReadonlySet<string>> = new
   //
   // Without this scope the swap would have handed a mirrored/foreign tab both.
   ["save_workflow", new Set(["save"])],
+  // The `install_custom_node` entry above replaces NINE standalone names
+  // (0.50.0 slice 12), of which exactly TWO were whitelisted: install_custom_node
+  // (the panel's "install missing node" button, behind a client-side confirm) and
+  // the installed-pack list (read-only, the dependency side-panel's ✓ column).
+  //
+  // The seven that were NOT whitelisted are the reason this scope exists. Four of
+  // them RUN THIRD-PARTY PACK CODE on the user's machine — update, reinstall and
+  // fix all re-run a pack's install/dependency step, and sync_deps reinstalls
+  // EVERY pack's Python requirements. uninstall REMOVES an installed pack
+  // (irreversibly through this tool). disable/enable change what loads at the
+  // next ComfyUI start.
+  //
+  // Without this scope, swapping the two names for the folded one would hand a
+  // confirmation-less mirrored/foreign tab the ability to uninstall a pack or
+  // re-run arbitrary pack code — a privilege broadening manufactured by a pure
+  // surface change. Same failure shape as slice 8's billing actions.
+  //
+  // The registry lookups are NOT missing from this set — they are on a different
+  // tool entirely (`search_custom_nodes`), which is not whitelisted, so no
+  // action-level scope is needed to keep them out.
+  ["install_custom_node", new Set(["install", "list"])],
 ]);
 
 /**

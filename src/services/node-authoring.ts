@@ -452,7 +452,7 @@ jobs:
 }
 
 // ---------------------------------------------------------------------------
-// scaffold_custom_node
+// node_pack action:"scaffold"
 // ---------------------------------------------------------------------------
 
 export function scaffoldCustomNode(
@@ -528,7 +528,7 @@ export function scaffoldCustomNode(
       (publisherId === "your-publisher-id"
         ? `Set [tool.comfy].PublisherId in pyproject.toml before publishing. `
         : ``) +
-      `Restart ComfyUI (restart_comfyui) to load it, then publish with publish_custom_node.`,
+      `Restart ComfyUI (restart_comfyui) to load it, then publish with node_pack (action:"publish").`,
   };
 }
 
@@ -584,7 +584,7 @@ export function parsePyproject(toml: string): ParsedPyproject {
 }
 
 // ---------------------------------------------------------------------------
-// publish_custom_node
+// node_pack action:"publish"
 // ---------------------------------------------------------------------------
 
 /** Parse a registry URL out of comfy-cli publish output, if present. */

@@ -371,7 +371,7 @@ export function describePanelUpdateRecovery(
 
 /**
  * The same advice as a redirect for tools that REFUSE to manage the panel
- * themselves (panel_update_node, fix_custom_node). Those refusals used to end
+ * themselves (panel_update_node, install_custom_node (action:"fix")). Those refusals used to end
  * with a flat "Use install_panel instead", which is the #774/#784 dead end in
  * miniature.
  */

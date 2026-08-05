@@ -298,7 +298,7 @@ export function registerDiagnosticsTools(server: McpServer): void {
 
   server.tool(
     "diagnose_run",
-    "WHY DID MY RENDER FAIL / WHAT'S MISSING? Explains a failed run in ONE call, without needing a canvas — the headless counterpart to the panel's panel_get_errors (\"why is this red?\"), so mobile/remote sessions get the same answer. Returns: the failed node (id, type) with its `exception_type` + message and a trimmed traceback; **missing_models** (the exact model file that isn't installed and the widget holding it — feed the filename to download_model action:\"search_civitai\", then action:\"download_civitai\" — or action:\"search\" then action:\"download\" — to fix it); **missing_node_types** (node classes this install lacks — feed to search_custom_nodes/install_custom_node); and any other per-input validation errors. Call this whenever a run fails, an enqueue is rejected, or the user asks what's missing — instead of guessing from raw logs. With no prompt_id it diagnoses the most recent FAILED run (falling back to the most recent run). Read-only.",
+    "WHY DID MY RENDER FAIL / WHAT'S MISSING? Explains a failed run in ONE call, without needing a canvas — the headless counterpart to the panel's panel_get_errors (\"why is this red?\"), so mobile/remote sessions get the same answer. Returns: the failed node (id, type) with its `exception_type` + message and a trimmed traceback; **missing_models** (the exact model file that isn't installed and the widget holding it — feed the filename to download_model action:\"search_civitai\", then action:\"download_civitai\" — or action:\"search\" then action:\"download\" — to fix it); **missing_node_types** (node classes this install lacks — feed to search_custom_nodes, then install_custom_node); and any other per-input validation errors. Call this whenever a run fails, an enqueue is rejected, or the user asks what's missing — instead of guessing from raw logs. With no prompt_id it diagnoses the most recent FAILED run (falling back to the most recent run). Read-only.",
     {
       prompt_id: z
         .string()
@@ -367,7 +367,7 @@ export function registerDiagnosticsTools(server: McpServer): void {
             const uniq = [...new Set(missingNodeTypes.map((i) => i.node_type))];
             for (const t of uniq) lines.push(`- **${t}**`);
             lines.push(
-              "_Fix_: search_custom_nodes for the owning pack, install_custom_node, then restart ComfyUI to load it.",
+              "_Fix_: search_custom_nodes for the owning pack, install_custom_node with action:'install', then restart ComfyUI to load it.",
             );
           }
 

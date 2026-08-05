@@ -123,7 +123,7 @@ export function resolveLocalWorkspaceBase(): string | undefined {
  * QUESTION 2 — "which install does THIS OPERATION act on?"
  *
  * The single source of truth for every filesystem-backed tool (download_model,
- * verify_custom_node, model lookups, extra-paths, comfy-cli, apply_manifest's
+ * node_pack (action:"verify"), model lookups, extra-paths, comfy-cli, apply_manifest's
  * adoption). Returns undefined whenever the session is NOT pointed at a local install,
  * because then no directory on this machine is the thing being operated on.
  *

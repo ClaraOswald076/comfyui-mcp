@@ -36,10 +36,12 @@
  * model-facing text untouched.
  *
  * COVERAGE IS DELIBERATELY PARTIAL. The beginner path is covered end to end;
- * expert surfaces (training, comfy-cli's 26 actions, node authoring) are left on
- * the skeleton until someone writes examples worth reading. A missing example is
- * an honest gap; a made-up one is a bug. RunPod left that list in 0.50.0 — see
- * the note above its entries for why a skeleton stopped being adequate there.
+ * expert surfaces (training, comfy-cli's 26 actions) are left on the skeleton
+ * until someone writes examples worth reading. A missing example is an honest
+ * gap; a made-up one is a bug. RunPod left that list in 0.50.0, and node
+ * authoring left it in the same release — see the notes above their entries for
+ * why a skeleton stopped being adequate for a tool whose only required field is
+ * `action`.
  */
 
 export interface ToolDocExample {
@@ -638,21 +640,43 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
   // Custom Nodes
   // -------------------------------------------------------------------------
   search_custom_nodes: {
+    gloss:
+      "Finding a node pack in the public registry, before you install anything. " +
+      "Read-only and network-only — it does not need a running ComfyUI. " +
+      "Installing what you find is a different tool: `install_custom_node`.",
     examples: [
       {
         ask: "Is there a node pack for face detailing?",
-        args: { query: "face detailer", limit: 5 },
+        args: { action: "search", query: "face detailer", limit: 5 },
         returns:
           "Matching packs from the registry with their ids, authors and " +
           "descriptions. The id is what install_custom_node wants.",
       },
+      {
+        ask: "Tell me more about that Impact Pack before I install it.",
+        args: { action: "details", id: "comfyui-impact-pack" },
+        returns:
+          "The pack's description, author, license, repository, install count, " +
+          "the node types it provides, and its recent version changelogs.",
+      },
     ],
   },
   install_custom_node: {
+    // Same reason RunPod stopped being adequate on the skeleton (see the header):
+    // 0.50.0 slice 12 made `action` the only REQUIRED field, so the generated
+    // skeleton collapses to {"action": "install"} and the documented call
+    // deterministically hits the handler's missing-`id` error. For a surface that
+    // runs third-party code and can REMOVE an installed pack, "the documented
+    // call does not work" is not an acceptable gap.
+    gloss:
+      "Everything you do to someone ELSE'S node pack once you have found it: " +
+      "install it, keep it working, turn it off, remove it. One tool for the " +
+      "whole pack lifecycle, chosen with `action`. FINDING a pack is " +
+      "`search_custom_nodes`; writing your own is `node_pack`.",
     examples: [
       {
         ask: "Install the Impact Pack.",
-        args: { id: "comfyui-impact-pack" },
+        args: { action: "install", id: "comfyui-impact-pack" },
         returns:
           "Progress, then confirmation. New nodes do not appear until ComfyUI " +
           "restarts — the agent will normally offer to do that for you.",
@@ -660,6 +684,129 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
           "A custom node pack is third-party code that runs inside your " +
           "ComfyUI. Install packs you have reason to trust, the same as any " +
           "other plugin.",
+      },
+      {
+        ask: "What node packs have I got installed?",
+        args: { action: "list" },
+        returns:
+          "Every installed pack with its version and whether it is enabled or " +
+          "disabled. Read-only.",
+      },
+      {
+        ask: "That pack has been broken since the last update — repair it.",
+        args: { action: "fix", id: "comfyui-impact-pack" },
+        returns:
+          "What the repair did to the pack's install and Python dependencies. A " +
+          "restart is usually needed before the result is visible.",
+        caution:
+          "Repairing re-runs the pack's own install step, which is third-party " +
+          "code. Pass id \"all\" only if you mean every installed pack.",
+      },
+      {
+        ask: "Turn that pack off but don't delete it — I want to see if it's the culprit.",
+        args: { action: "disable", id: "comfyui-impact-pack" },
+        returns:
+          "Confirmation, re-read from the installed-pack list so a Manager no-op " +
+          "is reported as NOT disabled rather than as success. Restart ComfyUI " +
+          "for it to take effect; action \"enable\" puts it back.",
+      },
+      {
+        ask: "Get rid of that pack for good.",
+        args: { action: "uninstall", id: "comfyui-impact-pack" },
+        returns:
+          "Confirmation, but only after the installed-pack list is re-read and " +
+          "the pack is provably GONE. An id that resolves nowhere is refused " +
+          "before anything is queued.",
+        caution:
+          "This REMOVES the pack and is irreversible through this tool — any " +
+          "workflow using its nodes will go red. For a cleanup audit use action " +
+          "\"disable\" first, which is reversible.",
+      },
+    ],
+  },
+  node_pack: {
+    // Same reasoning as install_custom_node above: `action` is the only required
+    // field, so the skeleton documents a call that cannot work. This tool also
+    // WRITES files and runs git, so the examples carry the cautions.
+    gloss:
+      "The loop for authoring YOUR OWN node pack: scaffold it, read and edit its " +
+      "source, check it actually loads, commit it, publish it. Everything is " +
+      "local and jailed to `custom_nodes/`. Installing someone else's pack is " +
+      "`install_custom_node`.",
+    examples: [
+      {
+        ask: "Start me a new node pack called my-cool-nodes.",
+        args: {
+          action: "scaffold",
+          name: "my-cool-nodes",
+          display_name: "My Cool Nodes",
+        },
+        returns:
+          "The files it wrote under custom_nodes/my-cool-nodes/ — pyproject.toml, " +
+          "__init__.py and a runnable sample node. Restart ComfyUI to load it.",
+      },
+      {
+        ask: "Where is that pack's sampler class defined?",
+        args: { action: "search", query: "class .*Sampler", glob: "**/*.py" },
+        returns:
+          "File/line/text matches under custom_nodes/, capped so a broad regex " +
+          "cannot flood the reply. Read-only.",
+      },
+      {
+        ask: "Show me the top of that file.",
+        args: { action: "read", path: "my-cool-nodes/src/nodes.py", line_count: 60 },
+        returns:
+          "The requested line range, with a truncation notice if it was clipped.",
+      },
+      {
+        ask: "Replace that file with the fixed version.",
+        args: {
+          action: "write",
+          path: "my-cool-nodes/src/nodes.py",
+          content: "# ...the full new contents of the file...",
+          overwrite: true,
+        },
+        argsNote:
+          "`content` is the COMPLETE new file, shortened to one line here. For a " +
+          "small edit prefer action \"patch\", which applies a unified diff.",
+        returns: "The path written and its byte count.",
+        caution:
+          "With overwrite true this replaces the whole file. There is no undo " +
+          "here — commit first with action \"git\" if the pack is a repo.",
+      },
+      {
+        ask: "Does my pack actually load?",
+        args: { action: "verify", name: "my-cool-nodes" },
+        returns:
+          "Whether each of the pack's node classes appeared in /object_info. A " +
+          "class that is missing failed to import — that is your bug.",
+        caution:
+          "By default this RESTARTS your local ComfyUI, which aborts anything " +
+          "rendering. Pass restart false to check the live server as-is.",
+      },
+      {
+        ask: "Commit what I changed in that pack.",
+        args: {
+          action: "git",
+          pack: "my-cool-nodes",
+          git_action: "commit",
+          message: "fix: sampler returns the right latent",
+        },
+        returns:
+          "The git output, capped. status/diff/log always work; commit and push " +
+          "need COMFYUI_MCP_ALLOW_GIT_WRITES=1 and otherwise return a structured " +
+          "refusal naming that flag.",
+      },
+      {
+        ask: "Publish it to the registry.",
+        args: { action: "publish", name: "my-cool-nodes" },
+        returns:
+          "What comfy-cli published, after pyproject.toml is validated for a real " +
+          "name, version and PublisherId.",
+        caution:
+          "IRREVERSIBLE and PUBLIC: this creates or updates a version on " +
+          "registry.comfy.org that this tool cannot take back. Needs comfy-cli " +
+          "and REGISTRY_ACCESS_TOKEN.",
       },
     ],
   },

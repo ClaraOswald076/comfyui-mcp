@@ -64,8 +64,8 @@ If the error involves model loading or missing files:
 
 If the failing node type is not found:
 
-1. **Search the registry**: `search_custom_nodes("NodeClassName")`
-2. **Check pack details**: `get_node_pack_details(id="pack-name")`
+1. **Search the registry**: `search_custom_nodes(action="search", query="NodeClassName")`
+2. **Check pack details**: `search_custom_nodes(action="details", id="pack-name")`
 3. **Check import errors in logs**: `get_logs(keyword="import")` — a node pack may be installed but failing to load due to missing dependencies
 4. **Verify installation**: Check if the custom node directory exists and contains the expected files
 
@@ -134,7 +134,7 @@ If the user requests it, apply the fix directly:
 
 1. Get the full traceback from `get_history`
 2. Check `get_logs(keyword="import")` for load failures
-3. Search for the node pack: `search_custom_nodes`
+3. Search for the node pack: `search_custom_nodes` (`action: "search"`)
 4. Check if dependencies are met
 5. Look for known issues on the pack's GitHub
 

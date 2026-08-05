@@ -4,7 +4,7 @@
 // described as "the mutation choke point". It was not: the sidebar panel is an
 // ordinary custom node pack, so the GENERIC node mutations reach the very same
 // ComfyUI-Manager operation without touching install_panel at all. A pinned user
-// was one `update_custom_node(id="all")` away from being moved.
+// was one `install_custom_node(action:"update", id="all")` away from being moved.
 //
 // These tests call the REAL exported service functions (no fs mocking, a real
 // temp settings file) and assert they REFUSE while a pin is in force — and,
@@ -129,7 +129,7 @@ afterEach(() => {
 });
 
 describe("generic node mutations cannot walk past the panel pin", () => {
-  it('update_custom_node(id="comfyui-agent-panel") REFUSES while pinned', async () => {
+  it('install_custom_node update of "comfyui-agent-panel" REFUSES while pinned', async () => {
     setPanelVersionPin("0.11.3");
     await expect(updateCustomNode({ id: "comfyui-agent-panel" })).rejects.toThrow(
       PanelPinnedError,
@@ -137,7 +137,7 @@ describe("generic node mutations cannot walk past the panel pin", () => {
     expect(managerCalls).toEqual([]); // refused before any Manager request
   });
 
-  it('update_custom_node(id="all") REFUSES while pinned — the bulk door', async () => {
+  it('install_custom_node update of id="all" REFUSES while pinned — the bulk door', async () => {
     // Nothing about "all" names the panel, yet it moves it. This is the exact
     // scenario that made the original guard placement wrong.
     setPanelVersionPin("0.11.3");

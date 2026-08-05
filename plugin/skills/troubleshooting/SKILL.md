@@ -181,7 +181,7 @@ The workflow references a node type that is not installed. This happens when:
 
 1. **Search for the node pack**:
    ```
-   search_custom_nodes("NodeClassName")
+   search_custom_nodes(action="search", query="NodeClassName")
    ```
 2. **Install via ComfyUI Manager** or the registry
 3. **Check logs for import errors**:

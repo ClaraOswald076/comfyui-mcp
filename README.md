@@ -16,7 +16,7 @@ Works on **macOS**, **Linux**, and **Windows**. Auto-detects your ComfyUI instal
 
 **Stuck or have a question? [Join the Discord](https://discord.gg/cW9arBhzCu)** — help, model tips, and release announcements.
 
-**87 MCP tools** | **37 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
+**70 MCP tools** | **37 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
 
 The plugin ships **expert skills that grow with every release** — model-specific generation guides with curated download URLs, workflow recipes, troubleshooting, and custom-node authoring — so Claude knows the right sampler, CFG, resolution, and model files for each architecture without trial and error.
 
@@ -249,7 +249,7 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 ## MCP Tools
 
-87 tools across workflow execution, generation, iteration, composition, models, and more:
+70 tools across workflow execution, generation, iteration, composition, models, and more:
 
 ### Image Generation (high-level)
 
@@ -334,8 +334,7 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 | Tool | Description |
 |------|-------------|
-| `search_custom_nodes` | Search the ComfyUI Registry for custom node packs by keyword |
-| `get_node_pack_details` | Get full details of a custom node pack (description, author, nodes, install info) |
+| `search_custom_nodes` | Search the ComfyUI Registry for node packs by keyword (`action: "search"`), or get one pack's full details (`action: "details"`) |
 | `list_packs` (`action: "generate_skill"`) | Generate a Claude skill `.md` file from a Registry ID or GitHub URL |
 | `comfy_cli` | Search actual loaded node classes through official `comfy nodes search` (action:"search_nodes") |
 
@@ -594,7 +593,7 @@ npx -y comfyui-mcp@latest --comfyui-url http://localhost:8188 --force-remote
 | `CIVITAI_API_TOKEN` | | CivitAI API token for model downloads |
 | `HUGGINGFACE_TOKEN` | | HuggingFace token for higher API rate limits |
 | `GITHUB_TOKEN` | | GitHub token for skill generation (avoids rate limits) |
-| `REGISTRY_ACCESS_TOKEN` | | Comfy Registry API key for `publish_custom_node` (env-only, never logged) |
+| `REGISTRY_ACCESS_TOKEN` | | Comfy Registry API key for `node_pack` (`action: "publish"`) (env-only, never logged) |
 | `COMFYUI_DOWNLOAD_CACHE_DIR` | `~/.comfyui-mcp/cache` | Content-addressed model-download cache (dedup + concurrent coalescing) |
 | `COMFYUI_LRU_CACHE_SIZE_GB` | `0` | Cap the download cache in GB; `0` disables LRU eviction |
 | `COMFYUI_STARTUP_CHECK_INTERVAL_S` / `…_MAX_TRIES` | `1` / `20` | Readiness-probe interval + max tries when starting a local ComfyUI |
@@ -806,7 +805,9 @@ src/
     image-management.ts    # upload_image, list_output_images
     model-management.ts    # download_model, list_local_models (the two consolidated model tools)
     memory-management.ts   # clear_vram
-    registry-search.ts     # search_custom_nodes, get_node_pack_details
+    registry-search.ts     # search_custom_nodes (search/details)
+    node-management.ts     # install_custom_node (install/update/fix/uninstall/enable/disable/list/…)
+    node-pack.ts           # node_pack (scaffold/verify/publish/read/write/patch/git/…)
     generation-tracker.ts  # suggest_settings, generation_stats
     diagnostics.ts         # get_logs, get_history
     process-control.ts     # restart_comfyui (restart/start/stop)

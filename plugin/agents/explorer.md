@@ -21,7 +21,7 @@ Given a custom node pack name or GitHub URL, you will:
 
 ### Step 1: Identify the Pack
 
-- Use `search_custom_nodes` or `get_node_pack_details` to find the pack in the ComfyUI registry
+- Use `search_custom_nodes` with `action: "search"` (then `action: "details"`) to find the pack in the ComfyUI registry
 - Note the pack's ID, description, GitHub repo URL, and list of provided nodes
 - If not found in the registry, use the GitHub URL directly
 

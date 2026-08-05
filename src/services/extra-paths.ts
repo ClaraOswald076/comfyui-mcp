@@ -241,7 +241,7 @@ function desktopConfigPath(): string {
 /**
  * The local ComfyUI root whose `extra_model_paths.yaml` a standalone/manual install
  * uses. Delegates to `resolveEffectiveComfyUIBase()` — the SINGLE source of truth every
- * other filesystem-backed tool (download_model, model lookups, verify_custom_node,
+ * other filesystem-backed tool (download_model, model lookups, node_pack (action:"verify"),
  * get_environment) already uses — so this file can never disagree with them about where
  * ComfyUI lives. That order is:
  *

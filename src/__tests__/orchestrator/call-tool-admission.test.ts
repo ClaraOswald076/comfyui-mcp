@@ -332,6 +332,114 @@ describe("call_tool admission", () => {
     }
   });
 
+  /**
+   * The same trap a third time, with THIRD-PARTY CODE EXECUTION attached
+   * (0.50.0 slice 12). Nine standalone custom-node lifecycle names folded into
+   * `install_custom_node`, and only TWO of them were ever whitelisted:
+   * install_custom_node itself (the panel's "install missing node" button) and
+   * the installed-pack list (the dependency side-panel's read-only ✓ column).
+   *
+   * The seven that were not include uninstall (REMOVES an installed pack) and
+   * update/reinstall/fix/sync_deps (each re-runs a pack's install/dependency
+   * step, i.e. runs third-party code on the user's machine). Without an action
+   * scope, a pure surface change would have made all of them reachable from a
+   * confirmation-less mirrored/foreign tab.
+   */
+  describe("install_custom_node: the folded pack-code actions stay unreachable", () => {
+    it("admits exactly the two actions whose standalone names were whitelisted", () => {
+      expect(callToolAdmission("install_custom_node", { action: "install" })).toBeNull();
+      expect(callToolAdmission("install_custom_node", { action: "list" })).toBeNull();
+      // …with the arguments those entries forwarded: the panel's install button
+      // sends a registry id, and the ✓ column sends list's own `mode`.
+      expect(
+        callToolAdmission("install_custom_node", { action: "install", id: "comfyui-kjnodes" }),
+      ).toBeNull();
+      expect(
+        callToolAdmission("install_custom_node", { action: "list", mode: "imported" }),
+      ).toBeNull();
+    });
+
+    it("refuses uninstall — a pack removal that was never reachable this way", () => {
+      expect(callToolAdmission("install_custom_node", { action: "uninstall" })).toBe(
+        'tool "install_custom_node" is not permitted for action "uninstall"',
+      );
+      // Including the shape a client would actually send, so the refusal cannot
+      // be argued away as "only the bare action is blocked".
+      expect(
+        callToolAdmission("install_custom_node", {
+          action: "uninstall",
+          id: "comfyui-impact-pack",
+        }),
+      ).toBe('tool "install_custom_node" is not permitted for action "uninstall"');
+    });
+
+    it("refuses the actions that RUN third-party pack code", () => {
+      for (const action of ["update", "reinstall", "fix", "sync_deps"]) {
+        expect(
+          callToolAdmission("install_custom_node", { action, id: "comfyui-impact-pack" }),
+          `action:"${action}"`,
+        ).toBe(`tool "install_custom_node" is not permitted for action "${action}"`);
+      }
+      // "all" is the shape that would have hit EVERY installed pack at once.
+      expect(callToolAdmission("install_custom_node", { action: "update", id: "all" })).toBe(
+        'tool "install_custom_node" is not permitted for action "update"',
+      );
+    });
+
+    it("refuses enable/disable — neither was whitelisted", () => {
+      for (const action of ["enable", "disable"]) {
+        expect(
+          callToolAdmission("install_custom_node", { action }),
+          `action:"${action}"`,
+        ).toBe(`tool "install_custom_node" is not permitted for action "${action}"`);
+      }
+    });
+
+    /**
+     * The registry-discovery pair is on a DIFFERENT tool after the owner's
+     * split, and that tool was never whitelisted — neither `search_custom_nodes`
+     * (which survives) nor the retired pack-details lookup it absorbs. Keeping
+     * it out is preserving reachability; adding it would be inventing it, which
+     * is the same defect as the broadening this whole describe block exists to
+     * prevent, just pointing the other way. The refusal is NAME-level, so no
+     * action scope is needed.
+     */
+    it("search_custom_nodes is not whitelisted at all — it was never reachable here", () => {
+      for (const action of ["search", "details"]) {
+        expect(callToolAdmission("search_custom_nodes", { action }), `action:"${action}"`).toBe(
+          'tool "search_custom_nodes" is not permitted',
+        );
+      }
+      // …including the shapes a client would actually send.
+      expect(
+        callToolAdmission("search_custom_nodes", { action: "search", query: "impact", limit: 5 }),
+      ).toBe('tool "search_custom_nodes" is not permitted');
+      expect(callToolAdmission("search_custom_nodes", {})).toBe(
+        'tool "search_custom_nodes" is not permitted',
+      );
+    });
+
+    it("refuses install_custom_node with a missing or non-string action", () => {
+      // The pre-fold call shape: the retired list tool took no `action` at all,
+      // so a client that merely swapped the NAME must be refused rather than
+      // silently defaulting into one of the eleven actions.
+      expect(callToolAdmission("install_custom_node", {})).toBe(
+        'tool "install_custom_node" is not permitted for action "(missing)"',
+      );
+      expect(callToolAdmission("install_custom_node", { action: 42 })).toBe(
+        'tool "install_custom_node" is not permitted for action "(missing)"',
+      );
+    });
+
+    it("node_pack is not whitelisted at all — it writes files and runs git", () => {
+      for (const action of ["scaffold", "verify", "publish", "list_files", "read", "search", "write", "patch", "git"]) {
+        expect(callToolAdmission("node_pack", { action }), `action:"${action}"`).toBe(
+          'tool "node_pack" is not permitted',
+        );
+      }
+    });
+  });
+
   it("name-level behavior is unchanged for everything else", () => {
     // A whitelisted tool with no action scope is admitted regardless of args…
     expect(callToolAdmission("list_output_images", {})).toBeNull();
