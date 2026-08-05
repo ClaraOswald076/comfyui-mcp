@@ -24,6 +24,7 @@ import { isForceRemoteFlagSet } from "../config.js";
 import { resolveComfyuiPython, pythonVersionsAgree } from "./workspace-env.js";
 import { resolveLiveInterpreter } from "./live-interpreter.js";
 import { parsePyproject } from "./node-authoring.js";
+import { detectInstallMode } from "./self-update.js";
 
 // The interpreter resolver lives in workspace-env (which owns ComfyUI-base
 // resolution) so get_environment and this panel probe share ONE live-first
@@ -58,7 +59,30 @@ export interface EnvCapabilities {
   sageattention?: TriState;
   backend?: string; // active provider (human label, e.g. "Claude" / "Grok" / "unknown")
   otherBackendAvailable?: boolean; // is the OTHER provider resolvable?
-  mcpVersion?: string; // comfyui-mcp package version, e.g. "0.48.4"
+  /**
+   * The comfyui-mcp version this process is actually RUNNING, e.g. "0.48.4" — read
+   * from the package.json beside the `dist/` these modules were loaded from, at
+   * MODULE LOAD (the closest observable moment to "the build that was loaded"; the
+   * caller supplies it, see MCP_VERSION_RUNNING). A running process cannot hot-swap
+   * its own code, so this stays true for its whole life; `mcpVersionInstalled` is
+   * the one that moves.
+   */
+  mcpVersion?: string;
+  /**
+   * The comfyui-mcp version installed ON DISK right now, re-read at each refresh.
+   *
+   * #846: only `mcpVersion` was ever carried, so the ENV line reported a version
+   * captured once at orchestrator startup as though it were still the current state
+   * of the machine. After an in-place upgrade the two diverge, and BOTH readings are
+   * separately true — the process really is running the old build, and the newer one
+   * really is installed. Reporting either alone is what misleads: a bug filed from
+   * that session gets version-pinned to a build nobody is running, and triage chases
+   * it against the wrong code.
+   *
+   * Carried so the line can DISCLOSE the drift instead of picking a side. Equal to
+   * `mcpVersion` in the ordinary case, where nothing is rendered.
+   */
+  mcpVersionInstalled?: string;
   panelVersion?: string; // sidebar panel version from the panel's hello, e.g. "0.11.3" / "nightly"
 }
 
@@ -541,8 +565,22 @@ export interface GatherOptions {
   comfyuiPath?: string;
   /** "claude" | "codex" — the active PANEL_AGENT_BACKEND. */
   backendId?: string;
-  /** comfyui-mcp package version (caller supplies; kept out of this module). */
+  /** comfyui-mcp package version this process is RUNNING (caller supplies; kept out
+   *  of this module). */
   mcpVersion?: string;
+  /**
+   * Read the comfyui-mcp version currently INSTALLED on disk (#846). Injectable
+   * for tests; defaults to the live package read.
+   *
+   * This is GATHERED here rather than supplied by the caller, and that placement
+   * is the fix. `mcpVersion` is the caller's own build — a constant for the life
+   * of its process — so it is passed in. The installed version is a fact about the
+   * MACHINE that can change while we run, which makes it a probe like every other
+   * one in this module, refreshed on every gather by construction. The bug was a
+   * caller reading it ONCE at startup beside the version it was legitimately
+   * caching; there is now no place left to cache it by accident.
+   */
+  readInstalledMcpVersion?: () => string | undefined;
   /** Sidebar panel version, learned from the panel's `hello` frame. */
   panelVersion?: string;
   /** Port the connected ComfyUI listens on — used to find the server PROCESS and read
@@ -592,11 +630,35 @@ export function readInstalledPanelVersion(comfyuiPath?: string): string | undefi
   return undefined;
 }
 
+/**
+ * The comfyui-mcp version INSTALLED on disk right now (#846) — undefined when it
+ * cannot be read.
+ *
+ * Distinct from the version the calling process is RUNNING, which cannot change
+ * while it runs (a Node process cannot hot-swap its own code) and is therefore
+ * passed in. After an in-place upgrade the two diverge, and reporting only the
+ * cached one described a moment that had passed.
+ */
+export function readInstalledMcpVersion(): string | undefined {
+  try {
+    return detectInstallMode().currentVersion ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCapabilities> {
   const caps: EnvCapabilities = {};
 
   // --- our own build versions (caller-supplied; panel version rides the hello) ---
   caps.mcpVersion = opts.mcpVersion;
+  // Re-read EVERY gather (#846). Guarded: a failed read must leave the line saying
+  // nothing about drift, never invent a mismatch out of a missing reading.
+  try {
+    caps.mcpVersionInstalled = (opts.readInstalledMcpVersion ?? readInstalledMcpVersion)();
+  } catch {
+    caps.mcpVersionInstalled = undefined;
+  }
   // Prefer the live hello's panel version; fall back to the INSTALLED panel's
   // pyproject version so a stale (cached) panel that omits it from the hello
   // still gets the agent's ENV line stamped (report_issue can version-match).
@@ -801,8 +863,22 @@ export function formatEnvBlock(caps: EnvCapabilities): string {
 
   // Our own build versions — so the agent can stamp them into bug reports without
   // digging (report-bug skill requires both).
+  //
+  // #846: the version named FIRST is the one this process is RUNNING, because that
+  // is the build whose behaviour the agent is about to describe in a bug report. An
+  // upgrade that landed while the orchestrator was up does not change that, and
+  // silently reporting the newer on-disk number instead would pin every issue to
+  // code nobody executed. So the drift is DISCLOSED, with the action that resolves
+  // it — a restart is the only thing that makes the two agree.
+  const upgradeClause =
+    caps.mcpVersion &&
+    caps.mcpVersionInstalled &&
+    caps.mcpVersionInstalled !== caps.mcpVersion
+      ? ` (this process is RUNNING ${caps.mcpVersion}; ${caps.mcpVersionInstalled} is now installed on disk` +
+        " — restart the orchestrator to load it, and report bugs against the RUNNING version)"
+      : "";
   const versions = [
-    caps.mcpVersion && `comfyui-mcp ${caps.mcpVersion}`,
+    caps.mcpVersion && `comfyui-mcp ${caps.mcpVersion}${upgradeClause}`,
     caps.panelVersion && `panel ${caps.panelVersion}`,
   ].filter(Boolean);
   if (versions.length) parts.push(versions.join(" · "));

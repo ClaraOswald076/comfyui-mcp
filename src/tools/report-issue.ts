@@ -288,13 +288,169 @@ function isTerminalError(frame: StatusFrame): boolean {
   return frame.status === "error" && !frame.url && !frame.payload;
 }
 
-/** The running comfyui-mcp version (best-effort; undefined if undetectable). */
-function detectMcpVersion(): string | undefined {
+/**
+ * The RUNNING comfyui-mcp version, snapshotted once at module load.
+ *
+ * `detectInstallMode().currentVersion` reads the package on disk, which answers
+ * a different question: what is INSTALLED. Those agree until someone updates in
+ * place, and then every issue filed by the still-running old process is stamped
+ * with the new version — the exact misreport #846 was opened for, reintroduced
+ * through the auto-detect fallback after round 9 fixed the explicit path (codex
+ * gate P1).
+ *
+ * Reading at load time is not a perfect proxy for "the code executing right
+ * now", but it is bounded by process start, which is the property that matters:
+ * it cannot drift underneath a long-lived process the way a report-time read
+ * does.
+ */
+const RUNNING_MCP_VERSION: string | undefined = (() => {
   try {
     return detectInstallMode().currentVersion ?? undefined;
   } catch {
     return undefined;
   }
+})();
+
+/** The running comfyui-mcp version (best-effort; undefined if undetectable). */
+function detectMcpVersion(): string | undefined {
+  return RUNNING_MCP_VERSION;
+}
+
+/** A semver body, with the optional `v` prefix stripped by the capture group. */
+const SEMVER_BODY = String.raw`v?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)`;
+
+/**
+ * How each version is LABELLED in the ENVIRONMENT line.
+ *
+ * `comfyui-mcp-panel 0.11.38` is not readable as the mcp version because the label
+ * has to be followed by a separator and then A VERSION, and the word `panel` sits
+ * in between — the version is simply not adjacent to the mcp label. Stated plainly
+ * because two stronger-looking guards were tried here and both turned out to change
+ * no input at all: negative lookaheads on the label, and forbidding the hyphen as a
+ * separator. Neither was falsifiable, so neither is kept as protection; the covering
+ * test asserts the BEHAVIOUR (`comfyui-mcp-panel 0.11.38` yields no mcp version)
+ * rather than the mechanism.
+ */
+export const MCP_VERSION_LABEL = String.raw`(?:comfyui-mcp|mcp)`;
+/** Same, for the sidebar panel. The longer alias is listed first so it wins. */
+export const PANEL_VERSION_LABEL = String.raw`(?:comfyui-mcp-panel|panel)`;
+
+/**
+ * Reduce a caller-supplied version to the VERSION IN IT, or undefined.
+ *
+ * These strings are copied by an agent out of a prose ENVIRONMENT line, and that
+ * line grew a qualifying clause (#846: "comfyui-mcp 0.48.18 (this process is
+ * RUNNING 0.48.18; 0.49.5 is now installed on disk …)"). Passed through whole, the
+ * triage worker's version match sees a sentence instead of a version and cannot
+ * tell the user that upgrading already fixes their bug — the single most common
+ * resolution, and the outcome #846 was filed to protect.
+ *
+ * THE LABEL IS TRIED FIRST, and it is what makes this correct rather than merely
+ * lucky (codex gate round 2). Two simpler rules were tried and both mis-read a
+ * realistic input:
+ *   - anchored at position 0: an agent pasting the natural segment
+ *     ("comfyui-mcp 0.48.18 …") matched nothing, fell through to a fresh disk read,
+ *     and reported the INSTALLED version — reintroducing #846 through its own fix;
+ *   - first semver ANYWHERE: the ENVIRONMENT line names `torch 2.7.1 · python
+ *     3.12.3` BEFORE `comfyui-mcp 0.48.18`, so an agent pasting the whole line —
+ *     which the tool description tells it to do — reported TORCH's version as the
+ *     reporter's. Wrong in a way nobody downstream could detect.
+ * Reading the label is the only rule that survives the input the tool actually asks
+ * for.
+ */
+/** Release channels that are legitimate version values without carrying a digit. */
+const CHANNEL_TAGS = new Set([
+  "nightly",
+  "dev",
+  "development",
+  "edge",
+  "canary",
+  "beta",
+  "alpha",
+  "rc",
+  "latest",
+  "main",
+  "master",
+  "local",
+]);
+
+/**
+ * Is this token a VERSION, as opposed to a word that merely stands where one was
+ * expected? Semver wins outright; otherwise it must carry a digit (`0.49.6-dev3`,
+ * `2026.08.04`) or be a recognised channel name.
+ *
+ * The point is what it REJECTS: `unknown`, `unspecified`, `none`, and any stray word
+ * an agent might drop in ("comfyui-mcp is broken"). Those are not versions, and
+ * forwarding them would hand the triage worker something unmatchable while looking
+ * like a confident answer — the caller falls through to detection instead, which is
+ * the right move precisely when the agent had nothing.
+ */
+function asVersionToken(rawToken: string): string | undefined {
+  // The ENVIRONMENT line ends in a full stop, so the last component's token arrives
+  // as `0.11.38.` — which passes every shape test and is then reported with the
+  // trailing dot attached, defeating the exact-version match downstream. No version
+  // ends in punctuation, so stripping it is unambiguous.
+  const token = rawToken.replace(/[.,;:)\]}]+$/, "");
+  if (token === "") return undefined;
+  const semver = new RegExp(`^${SEMVER_BODY}$`, "i").exec(token);
+  if (semver) return semver[1];
+  if (!/^[A-Za-z0-9][A-Za-z0-9._+-]{0,31}$/.test(token)) return undefined;
+  if (/\d/.test(token)) return token;
+  return CHANNEL_TAGS.has(token.toLowerCase()) ? token : undefined;
+}
+
+export function normalizeReportedVersion(
+  raw: string | undefined,
+  label: string,
+): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  if (trimmed === "") return undefined;
+
+  // 1. LABELLED — survives a whole ENVIRONMENT line, other components' versions and
+  //    all. The separator covers both `comfyui-mcp 0.49.6` and `mcp=0.49.6`.
+  //
+  //    The value is captured as a TOKEN and validated after, not required to be
+  //    semver in the pattern (codex gate round 3). Requiring semver here meant a
+  //    non-semver running build — `comfyui-mcp nightly (this process is RUNNING
+  //    nightly; 0.49.6 is now installed on disk …)` — matched nothing, fell through
+  //    to a disk read, and reported the INSTALLED 0.49.6 as the running version.
+  //    That is #846 exactly, for the one user whose version needed the most care.
+  //
+  //    ONE named filler word may stand between the label and the number (codex gate
+  //    round 4): `MCP version: 0.48.18` puts `version` where the value goes, and
+  //    taking only the adjacent token dropped a perfectly good reading straight into
+  //    the disk-read fallback — #846 again.
+  //
+  //    It is a NAMED filler and not "scan the next few tokens" (codex gate round 6).
+  //    Scanning walked straight over an indeterminate value into the NEXT
+  //    component's: `comfyui-mcp unknown · panel 0.11.38.` returned the PANEL's
+  //    version as the mcp one. An mcp version that cannot be determined has to stay
+  //    undetermined — that is the whole rule this cluster is about — so anything that
+  //    is neither the filler nor a version stops the search here.
+  //
+  //    The left boundary keeps `other-mcp 1.2.3` from being read as ours.
+  const after = new RegExp(
+    `(?<![A-Za-z0-9-])${label}[\\s:=]+(?:versions?[\\s:=]+)?([^\\s·,;)]+)`,
+    "i",
+  ).exec(trimmed);
+  if (after) {
+    const value = asVersionToken(after[1]);
+    if (value) return value;
+  }
+
+  // 2. LEADING — the caller sent the version itself, possibly with the #846 drift
+  //    clause after it. The clause names a NEWER installed version second, so
+  //    taking the leading one keeps the RUNNING build, which is what the report is
+  //    about. Nothing in the ENV line begins with a bare version, so this cannot
+  //    pick up another component's.
+  const leading = new RegExp(`^${SEMVER_BODY}`).exec(trimmed);
+  if (leading) return leading[1];
+
+  // 3. THE WHOLE STRING as a version token — the caller sent just `nightly`, with no
+  //    label. Preserved for the same reason as above: discarding it would send the
+  //    caller to a disk read, i.e. the version-swap in a different disguise.
+  return asVersionToken(trimmed);
 }
 
 export function registerReportIssueTools(server: McpServer): void {
@@ -355,8 +511,13 @@ export function registerReportIssueTools(server: McpServer): void {
         const repoName = repo.split("/")[1];
 
         const reporterVersions: ReporterVersions = {
-          mcp: args.mcp_version ?? detectMcpVersion(),
-          panel: args.panel_version ?? process.env.COMFYUI_MCP_PANEL_VERSION ?? undefined,
+          mcp:
+            normalizeReportedVersion(args.mcp_version, MCP_VERSION_LABEL) ??
+            detectMcpVersion(),
+          panel:
+            normalizeReportedVersion(args.panel_version, PANEL_VERSION_LABEL) ??
+            process.env.COMFYUI_MCP_PANEL_VERSION ??
+            undefined,
         };
 
         try {

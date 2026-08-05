@@ -80,6 +80,9 @@ vi.mock("../../config.js", () => ({
   config: mockConfig,
   getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
   getComfyUIAuthHeaders: () => ({}),
+  // #848 instance fence — a stable target here; the retarget cases live in
+  // desktop-restart.test.ts and panel-restart-health-readiness.test.ts.
+  getComfyuiTargetGeneration: () => 0,
   isRemoteMode: () => false,
 }));
 

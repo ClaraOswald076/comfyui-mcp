@@ -73,6 +73,8 @@ const mockLiveRootFromArgv = vi.hoisted(() =>
 vi.mock("../../config.js", () => ({
   config: mockConfig,
   getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
+  // #848 instance fence — a stable target here; the retarget case has its own test.
+  getComfyuiTargetGeneration: () => 0,
   getComfyUIAuthHeaders: () => ({}),
   isRemoteMode: () => false,
 }));
