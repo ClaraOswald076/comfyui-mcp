@@ -90,9 +90,23 @@ export function bodyPrefixOf(body: string): string {
   return flat.length > 160 ? `${flat.slice(0, 160)}…` : flat;
 }
 
-/** Every encoding of `value` a responder might plausibly echo it back in.
- *  Not exhaustive by design — the SHAPE passes below are the real defence; this
- *  just catches the common forms exactly, so the message keeps more context. */
+/**
+ * Every encoding of `value` a responder might plausibly echo it back in.
+ *
+ * Each encoding here is a FAMILY with independent axes, and the way this list
+ * has failed twice is by enumerating some members of a family by hand and
+ * missing one. Base64 has two axes — alphabet (standard / url-safe) and padding
+ * (kept / stripped) — so it has four members; three were generated, and the
+ * missing one (url-safe WITH padding) let `Pj4-Pz8=` through into a tool error
+ * (codex gate). Percent-encoding and hex each have a hex-digit CASE axis that
+ * was not covered at all. So generate the whole cross-product of each family
+ * rather than picking members: adding an axis is then the only way to miss one.
+ *
+ * This matters precisely because the shape passes below cannot cover these: a
+ * short, punctuation-bearing credential encodes to a short opaque string, under
+ * the 24-char run threshold and carrying no `token=` label. We HOLD the secret;
+ * we do not have to infer it.
+ */
 function reflectionVariants(value: string): string[] {
   const html = value
     .replace(/&/g, "&amp;")
@@ -100,25 +114,34 @@ function reflectionVariants(value: string): string[] {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
-  // BASE64 matters and the shape pass cannot cover it: a SHORT,
-  // punctuation-bearing credential base64s to a short opaque string, which is
-  // under the 24-char run threshold and carries no `token=` label — so it
-  // survived both shape passes and landed in a tool error (coordinator
-  // finding). We hold the secret; we do not have to infer it. Basic-auth style
-  // (`user:pass`) is included because that is how a proxy usually re-encodes it.
+
+  // PERCENT-ENCODING family: axis = the case of the hex digits. Node emits
+  // upper (`%2F`); plenty of proxies and web frameworks emit lower (`%2f`).
+  const lowerHexEscapes = (s: string) => s.replace(/%[0-9A-Fa-f]{2}/g, (m) => m.toLowerCase());
+  const percentForms = [encodeURIComponent(value), encodeURI(value)].flatMap((s) => [
+    s,
+    lowerHexEscapes(s),
+  ]);
+
+  // BASE64 family: axes = alphabet × padding, i.e. four members, all generated.
   const b64 = Buffer.from(value, "utf8").toString("base64");
-  const b64NoPad = b64.replace(/=+$/, "");
-  const b64Url = b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const urlSafe = (s: string) => s.replace(/\+/g, "-").replace(/\//g, "_");
+  const stripPad = (s: string) => s.replace(/=+$/, "");
+  const base64Forms = [b64, stripPad(b64), urlSafe(b64), stripPad(urlSafe(b64))];
+
+  // HEX family: axis = case. Hex of an 8-char credential is 16 chars — still
+  // under the 24-char run threshold, so the shape pass misses it too.
+  const hex = Buffer.from(value, "utf8").toString("hex");
+  const hexForms = [hex, hex.toUpperCase()];
+
   return [
     value,
-    encodeURIComponent(value),
-    encodeURI(value),
     html,
     value.toLowerCase(),
     value.toUpperCase(),
-    b64,
-    b64NoPad,
-    b64Url,
+    ...percentForms,
+    ...base64Forms,
+    ...hexForms,
   ];
 }
 
@@ -193,10 +216,19 @@ function looksLikeHtml(body: string): boolean {
   return /^\s*(<!doctype\b|<html\b|<\?xml\b|<[a-z!/])/i.test(body);
 }
 
-/** The body BEGINS like JSON but does not parse — a truncated, streamed-short or
- *  otherwise cut-off response, which is a completely different fault from
- *  "something else answered". */
-function looksLikeTruncatedJson(body: string): boolean {
+/**
+ * The body BEGINS like JSON and does not parse.
+ *
+ * That is the WHOLE of what this predicate establishes: the body is malformed
+ * JSON. It does NOT establish truncation. A complete gateway payload such as
+ * `{"error": invalid}` satisfies it exactly as a cut-off body does, and so does
+ * a JSON-shaped body from a responder that is not the ComfyUI API. Naming it
+ * `looksLikeTruncatedJson` and narrating it as "a truncated or cut-off response
+ * rather than a different responder" handed one candidate's remedy to all three
+ * and explicitly ruled out another — the same defect as inferring HTML from the
+ * Content-Type header, relocated to the body (codex gate).
+ */
+function looksLikeMalformedJson(body: string): boolean {
   const t = body.trim();
   if (!t.startsWith("{") && !t.startsWith("[")) return false;
   try {
@@ -253,7 +285,7 @@ export function classifyNonJson(args: {
   // `html` (the body really is markup) may drive a diagnosis.
   const html = looksLikeHtml(body);
   const claimsHtml = /\b(text\/html|application\/xhtml\+xml)\b/i.test(contentType);
-  const truncatedJson = looksLikeTruncatedJson(body);
+  const malformedJson = looksLikeMalformedJson(body);
 
   // A STATUS alone never proves who produced it — ComfyUI, or an application
   // layer in front of it, can emit 401/403 and 502/503/504 alike. Assert a cause
@@ -296,14 +328,20 @@ export function classifyNonJson(args: {
     cause = looksLikeComfyFrontend(body)
       ? "the ComfyUI web FRONTEND answered this path (its markers are in the body) instead of the ComfyUI HTTP API — typically a reverse proxy that forwards the UI but not the API routes, or a base URL pointing at the frontend's catch-all"
       : "some HTTP responder other than the ComfyUI JSON API answered this path; this body alone does not identify which. The usual candidates are the ComfyUI frontend's SPA catch-all, a reverse proxy that forwards the UI but not the API routes, a maintenance/WAF page, or an unrelated web app on this host";
-  } else if (truncatedJson) {
+  } else if (malformedJson) {
     kind = "not-json";
-    // We observed exactly one thing: it starts like JSON and does not parse.
-    // Narrating that as "something else answered" would send the user to the
-    // wrong remedy entirely.
+    // OBSERVED: the body starts with `{` or `[` and JSON.parse rejects it. That
+    // is malformed JSON and nothing more. Calling it "a truncated or cut-off
+    // response rather than a different responder" asserted BOTH a cause and the
+    // exclusion of a rival cause from a predicate that supports neither (codex
+    // gate). Name what was seen, list every candidate it is consistent with, and
+    // assert none of them.
     cause =
-      "the body BEGINS like JSON but does not parse — a truncated or cut-off response (a dropped connection, a proxy read/body-size limit, a stream that ended early) rather than a different responder. " +
-      "This response does not identify which of those it was";
+      "the body BEGINS like JSON and does not parse — that is all this response establishes. " +
+      "It is equally consistent with a body cut off mid-document (a dropped connection, a proxy read/body-size or buffer limit, a stream that ended early), " +
+      "with a COMPLETE but invalid JSON payload (a gateway, WAF or error handler that emits malformed JSON), " +
+      "and with a JSON-shaped body from a responder that is not the ComfyUI API. " +
+      "Nothing in this response distinguishes them, so compare the body prefix below against the length the response declared, and check whatever sits between you and ComfyUI, before assuming truncation";
   } else {
     kind = "not-json";
     cause =
@@ -315,7 +353,7 @@ export function classifyNonJson(args: {
 
   const what = html
     ? "an HTML page"
-    : truncatedJson
+    : malformedJson
       ? "a body that begins like JSON but does not parse"
       : contentType
         ? `a ${contentType} body that did not parse as JSON`

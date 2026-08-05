@@ -15,6 +15,7 @@ import {
   setPanelSecret,
   clearPanelSecret,
   listPanelSecretsMasked,
+  receiptDisclosures,
   slotRevokeState,
   slotSaveConfirmed,
   slotShellProvidedKeys,
@@ -423,7 +424,27 @@ export function startPanelConsoleHttpServer(opts: {
             // supplies come back on the next start, so the revoke is only
             // effective for this process and must not be reported as complete.
             const shellKeys = slotShellProvidedKeys(slot);
-            const removed = clearPanelSecret(slot);
+            const clearOutcome = clearPanelSecret(slot);
+            const removed = clearOutcome.changed;
+            // The removal ALREADY HAPPENED. Anything it cost is disclosed here,
+            // with `ok:false` so no UI can render it as a clean revoke — it is
+            // never re-thrown, because the previous version's throw became a
+            // generic `ok:false` in the catch below and the caller retried a
+            // removal that had already run, against a store that had already
+            // lost keys (codex gate).
+            if (clearOutcome.lostKeys.length) {
+              sendJson(res, 500, {
+                ok: false,
+                slot,
+                cleared: removed,
+                lost_keys: clearOutcome.lostKeys,
+                error:
+                  `"${slot}" WAS removed from the credential store, but the store no longer carries ${clearOutcome.lostKeys.join(", ")} — ` +
+                  `${clearOutcome.lostKeys.length > 1 ? "those credentials were" : "that credential was"} lost during the rewrite. ` +
+                  `Do NOT repeat the revoke: it already happened, and another write would rewrite an already-damaged store. Inspect the file and restore the missing entries first.`,
+              });
+              return;
+            }
             const state = slotRevokeState(slot);
             if (state === "still-resolves") {
               sendJson(res, 500, {
@@ -481,6 +502,28 @@ export function startPanelConsoleHttpServer(opts: {
           // same failure panel_request_secret refuses was answered ok:true here.
           const outcome = setPanelSecret(slot, value);
           if (!slotSaveConfirmed(outcome)) {
+            // DATA LOSS FIRST. This endpoint answered `200 {ok:true, masked}`
+            // from `slotSaveConfirmed` alone, so a save that destroyed the
+            // user's other tokens was reported to the panel as a clean success —
+            // the PR's original defect, one layer further out (codex gate). It
+            // cannot recur by omission now: a damaged receipt is `persisted:
+            // "damaged"`, which is not "yes", so `confirmed` is false and this
+            // branch is the only way out.
+            if (outcome.lostKeys.length) {
+              sendJson(res, 500, {
+                ok: false,
+                slot,
+                // Key NAMES only — never a value.
+                lost_keys: outcome.lostKeys,
+                saved_but_damaged: true,
+                error:
+                  `"${slot}" was written to the credential store, but the store no longer carries ${outcome.lostKeys.join(", ")} — ` +
+                  `${outcome.lostKeys.length > 1 ? "those credentials were" : "that credential was"} lost during the write. This is NOT a successful save. ` +
+                  `Nothing was rolled back: a rollback cannot bring them back and would be one more rewrite of a damaged store. ` +
+                  `Inspect the file and restore the missing ${outcome.lostKeys.length > 1 ? "entries" : "entry"} before relying on anything in it.`,
+              });
+              return;
+            }
             const unconfirmed = unconfirmedSlotKeys(outcome.receipts);
             const failed = unconfirmed.filter((u) => u.persisted === "no");
             // Describe the state we LEFT, not the state we intended. A slot with
@@ -519,14 +562,32 @@ export function startPanelConsoleHttpServer(opts: {
                 : stranded.length
                   ? { error: `"${slot}" could not be saved cleanly. ${aftermath}` }
                   : {
+                      // The REASON comes from the receipt. "unknown" no longer
+                      // means only "the file could not be re-read" — it also
+                      // covers a save whose key read back fine but whose loss
+                      // account a concurrent writer made impossible to complete,
+                      // and asserting the wrong one sends the user to check the
+                      // wrong thing (codex gate).
                       error:
-                        `"${slot}" was written but the store could not be re-read to confirm it (${unconfirmed.map((u) => u.key).join(", ")}), so whether it is saved is UNKNOWN — do not treat it as configured. ${aftermath}`,
+                        `"${slot}" was written but the save is NOT confirmed (${unconfirmed.map((u) => u.key).join(", ")}), so treat it as UNKNOWN: ` +
+                        `${outcome.receipts.find((r) => r.uncertainty)?.uncertainty ?? "the store could not be re-read to confirm it"}. ` +
+                        `Do not treat it as configured. ${aftermath}`,
                     }),
             });
             return;
           }
           const masked = listPanelSecretsMasked().find((s) => s.id === slot)?.masked ?? null;
-          sendJson(res, 200, { ok: true, slot, masked });
+          // A CONFIRMED save can still owe the user a disclosure — comment lines
+          // the rewrite dropped, or a write that could not be made crash-durable.
+          // Built from the one shared list, so a new obligation on the receipt
+          // reaches this endpoint without anyone remembering to wire it up here.
+          const warnings = outcome.receipts.flatMap((r) => receiptDisclosures(r));
+          sendJson(res, 200, {
+            ok: true,
+            slot,
+            masked,
+            ...(warnings.length ? { warnings } : {}),
+          });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           sendJson(res, /unknown credential slot/i.test(msg) ? 400 : 500, { ok: false, error: msg });

@@ -284,7 +284,7 @@ describe("`export KEY=` lines are the SAME key (#826 gate round 3)", () => {
     // reported the slot cleared.
     writeFileSync(envPath, "export CIVITAI_API_TOKEN=old-exported\n", { mode: 0o600 });
     expect(buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN).toBe("old-exported");
-    expect(removeComfyuiSecret("CIVITAI_API_TOKEN")).toBe(true);
+    expect(removeComfyuiSecret("CIVITAI_API_TOKEN").changed).toBe(true);
     expect(buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN).toBeUndefined();
     expect(readFileSync(envPath, "utf-8")).not.toContain("old-exported");
   });
@@ -292,7 +292,7 @@ describe("`export KEY=` lines are the SAME key (#826 gate round 3)", () => {
   it("a revoke removes the COLON form dotenv also accepts", () => {
     writeFileSync(envPath, "CIVITAI_API_TOKEN: old-colon\n", { mode: 0o600 });
     expect(buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN).toBe("old-colon");
-    expect(removeComfyuiSecret("CIVITAI_API_TOKEN")).toBe(true);
+    expect(removeComfyuiSecret("CIVITAI_API_TOKEN").changed).toBe(true);
     expect(buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN).toBeUndefined();
   });
 
@@ -608,7 +608,7 @@ describe("slot saves report what the read-back PROVED (#826 gate round 3)", () =
     const cb = vi.fn();
     const off = onComfyuiSecretsChanged(cb);
     try {
-      expect(removeComfyuiSecret("CIVITAI_API_TOKEN")).toBe(true);
+      expect(removeComfyuiSecret("CIVITAI_API_TOKEN").changed).toBe(true);
       expect(cb).toHaveBeenCalledTimes(1);
       expect(buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN).toBeUndefined();
     } finally {
@@ -620,7 +620,7 @@ describe("slot saves report what the read-back PROVED (#826 gate round 3)", () =
     const cb = vi.fn();
     const off = onComfyuiSecretsChanged(cb);
     try {
-      expect(removeComfyuiSecret("CIVITAI_API_TOKEN")).toBe(false);
+      expect(removeComfyuiSecret("CIVITAI_API_TOKEN").changed).toBe(false);
       expect(cb).not.toHaveBeenCalled();
     } finally {
       off();

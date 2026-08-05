@@ -22,8 +22,10 @@ import { randomBytes } from "node:crypto";
 import {
   chmodSync,
   closeSync,
+  copyFileSync,
   existsSync,
   fsyncSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -265,12 +267,36 @@ export interface SecretSaveReceipt {
   key: string;
   /** The canonical file it was written to (contains no secret). */
   path: string;
-  /** "yes"      — a read-back of the file proved the key now carries this value.
+  /**
+   * THE single field that decides whether a caller may narrate success. It is a
+   * verdict about the SAVE, not merely about the key.
+   *
+   *  "yes"      — a read-back proved the key carries this value AND the
+   *               whole-file check accounted for every other key the store held.
+   *               Nothing less than that is "yes".
    *  "no"       — the read-back proved it does NOT: the save did not take effect.
-   *  "unknown"  — the file could not be re-read, so neither verdict is available.
-   *  Deliberately three-valued: "could not determine" must never harden into a
-   *  definite answer in either direction. */
-  persisted: "yes" | "no" | "unknown";
+   *  "unknown"  — neither verdict is established. `uncertainty` says exactly
+   *               what could not be established; a renderer must print THAT
+   *               rather than assume a cause.
+   *  "damaged"  — the key IS in the store, and OTHER credentials it held are
+   *               proven gone. `lostKeys` names them. Never a success.
+   *
+   * "damaged" exists so that data loss cannot be narrated as a save by ANY
+   * caller rather than by the callers that remembered to check `lostKeys`. Every
+   * success test in this codebase is `persisted === "yes"`, so a damaged receipt
+   * fails all of them at once — that is the point, and it is why the answer is a
+   * new variant here rather than another check at each call site (codex gate:
+   * `storeDamageNote` guarded the ack while `slotSaveConfirmed` and the console's
+   * `/api/secrets` both still reported a clean save over destroyed tokens).
+   *
+   * Deliberately never collapsed: "could not determine" must not harden into a
+   * definite answer in either direction, and proven loss must not soften into
+   * "could not determine".
+   */
+  persisted: "yes" | "no" | "unknown" | "damaged";
+  /** Why `persisted` is not "yes", when the reason is not self-evident from the
+   *  verdict alone. One sentence, no values. */
+  uncertainty?: string;
   /** True when every consumer of this key resolves it from the canonical file at
    *  ACCESS time, so an already-running tool process sees it with no respawn. */
   livePickup: boolean;
@@ -288,8 +314,93 @@ export interface SecretSaveReceipt {
   /** OTHER credential keys the store held before this write and no longer
    *  holds. Never empty on a healthy write. A save must NEVER be reported as
    *  clean over this: "your token is saved" while the user's other tokens were
-   *  destroyed is a fabricated success on top of data loss. Names only. */
+   *  destroyed is a fabricated success on top of data loss. Names only.
+   *  Present only alongside `persisted: "damaged"` — the two are set together. */
   lostKeys?: string[];
+  /** Comment / non-assignment lines the rewrite did not preserve. The store's
+   *  own contract is that it keeps them, so losing them is the user's data going
+   *  missing — a disclosure every renderer owes, not a detail to compute and
+   *  discard (codex gate). A count, never the lines themselves: a comment in a
+   *  credential file can contain a credential. */
+  lostCommentLines?: number;
+  /** Set when the write LANDED but was not established to survive a power loss
+   *  (an fsync of the file or of its directory failed). A disclosure, not a
+   *  failure: the value is in the store now. */
+  durabilityGap?: string;
+}
+
+// ── What a receipt OBLIGES its renderer to say ───────────────────────────────
+//
+// These live next to the receipt, not next to any one renderer, on purpose. Each
+// of the three consumers (the panel_request_secret ack, the agent-secret ack,
+// and the console's /api/secrets) grew its own idea of which fields mattered,
+// and `lostKeys` reached exactly one of them — so a save that destroyed the
+// user's other tokens was narrated as a success by the other two (codex gate).
+// A new obligation added to the receipt belongs in `receiptDisclosures` once,
+// and every consumer picks it up at the same moment.
+
+/** The store lost OTHER credentials while saving this one. This outranks every
+ *  other clause: "your token is saved" while the user's other tokens were
+ *  destroyed is a fabricated success on top of data loss. Names only, no values. */
+export function storeDamageNote(receipt: SecretSaveReceipt): string | null {
+  const lost = receipt.lostKeys ?? [];
+  if (!lost.length) return null;
+  return (
+    `🛑 "${receipt.key}" was written to ${receipt.path}, but the store NO LONGER carries ${lost.join(", ")} — ` +
+    `${lost.length > 1 ? "those credentials were" : "that credential was"} lost during the write. Do not treat this as a successful save. ` +
+    `Inspect ${receipt.path} and restore the missing ${lost.length > 1 ? "entries" : "entry"} before relying on anything in it.`
+  );
+}
+
+/** The rewrite did not preserve the user's comment lines, which this store
+ *  promises to keep. Not a failed save — the credential is there — but it is the
+ *  user's data going missing, and it was computed and then discarded before it
+ *  ever reached a receipt (codex gate). A count only: a comment in a credential
+ *  file can itself contain a credential. */
+export function commentLossNote(receipt: SecretSaveReceipt): string | null {
+  const n = receipt.lostCommentLines ?? 0;
+  if (n <= 0) return null;
+  return (
+    `⚠️ ${n} comment line${n > 1 ? "s" : ""} in ${receipt.path} did not survive this write. ` +
+    `The credential itself is unaffected, but this store is meant to preserve them — check the file if those notes mattered.`
+  );
+}
+
+/** The write landed but was not established to survive a power loss. */
+export function durabilityNote(receipt: SecretSaveReceipt): string | null {
+  if (!receipt.durabilityGap) return null;
+  return (
+    `⚠️ The value IS in ${receipt.path} now, but this write was not made crash-durable: ${receipt.durabilityGap}. ` +
+    `If the machine loses power before the filesystem flushes on its own, set the credential again.`
+  );
+}
+
+/** The store holds the value, but a real environment variable of the same name
+ *  outranks it, so the readers use THAT. Reporting "saved" without this is a
+ *  configured state the tools do not use. */
+export function shadowedNote(receipt: SecretSaveReceipt): string | null {
+  if (!receipt.shadowedByEnv) return null;
+  return (
+    `⚠️ "${receipt.key}" was stored in ${receipt.path}, but it is NOT the value in use: a real environment variable named ${receipt.key} is set outside this app and takes precedence over the store. ` +
+    `Nothing changed for the tools. To make the value you just supplied take effect, unset ${receipt.key} in the environment this app was started from and restart it — or leave the environment variable as the source of truth. ` +
+    `(The value itself is never shown or logged.)`
+  );
+}
+
+/**
+ * EVERY clause this receipt obliges its renderer to state, most severe first.
+ *
+ * THE choke point: a consumer renders these and is done, instead of knowing
+ * which receipt fields exist. Empty means the receipt carries no obligation —
+ * which is not the same as "the save succeeded"; that question is `persisted`.
+ */
+export function receiptDisclosures(receipt: SecretSaveReceipt): string[] {
+  return [
+    storeDamageNote(receipt),
+    commentLossNote(receipt),
+    durabilityNote(receipt),
+    shadowedNote(receipt),
+  ].filter((n): n is string => n !== null);
 }
 
 /**
@@ -351,7 +462,11 @@ function write(secrets: PanelSecrets): void {
   // interrupted leaves the OAuth status mirror and any legacy tokens destroyed.
   // (0600 is applied to the temp file before the rename, so the credential is
   // never briefly world-readable.)
-  writeFileAtomic(p, JSON.stringify(secrets, null, 2));
+  const durabilityGap = writeFileAtomic(p, JSON.stringify(secrets, null, 2));
+  // This store has no receipt to carry the gap out on — its callers return void
+  // — so it is LOGGED rather than swallowed. Never the contents: the message is
+  // built from a path and an errno only.
+  if (durabilityGap) logger.warn(`[panel-secrets] ${durabilityGap}`);
 }
 
 // ── Canonical env-secret store: ~/.comfyui-mcp/.env ─────────────────────────
@@ -479,15 +594,46 @@ function envKeyLinePattern(key: string): RegExp {
  * at the moment of the write instead of a silent overwrite (coordinator finding).
  */
 function assertStoreIsRedirectedInTests(): void {
-  const underTest =
-    !!process.env.VITEST ||
-    !!process.env.VITEST_WORKER_ID ||
-    process.env.NODE_ENV === "test";
-  if (!underTest || process.env.COMFYUI_MCP_ENV_FILE) return;
+  if (!runningUnderTestRunner()) return; // detection is uncertain → ALLOW the write
+  if (process.env.COMFYUI_MCP_ENV_FILE) return;
   throw new Error(
     "Refusing to write the credential store from a test run: COMFYUI_MCP_ENV_FILE is not set, " +
       `so this would write the developer's real ${comfyuiEnvFilePath()} and can destroy live tokens. ` +
       "Point COMFYUI_MCP_ENV_FILE at a temp file in the test's setup (see secret-store-test-isolation.test.ts).",
+  );
+}
+
+/**
+ * Are we running INSIDE the test runner?
+ *
+ * The first version of this guard asked `NODE_ENV === "test" || VITEST ||
+ * VITEST_WORKER_ID` — ordinary environment variables that any user can have set,
+ * for reasons of their own, in the shell this app was launched from. A user with
+ * a leftover `VITEST` export, or `NODE_ENV=test` from an adjacent project, was
+ * then REFUSED when saving their own API key (codex gate). Refusing a real user
+ * their credential is a worse outcome than the accidental store overwrite this
+ * guard replaced, so the guard must key off something only the runner itself
+ * produces.
+ *
+ * Vitest injects these into the global scope of every worker it runs. They are
+ * not environment variables and there is no plausible way for a user's shell to
+ * put them there. When none is present we do NOT know we are under a runner —
+ * and in that uncertainty the write is ALLOWED, deliberately: the failure mode
+ * we accept is "a rogue test slips past the runtime guard and is caught by the
+ * static sweep instead", never "a real user cannot save a token".
+ *
+ * `scope` is a parameter so this can be tested for what it must NOT do. Some of
+ * the runner's own globals are non-configurable, so a test cannot remove them to
+ * check that the answer does not fall back to `VITEST` / `NODE_ENV`; passing a
+ * bare object asks the question directly.
+ */
+export function runningUnderTestRunner(
+  scope: Record<string, unknown> = globalThis as unknown as Record<string, unknown>,
+): boolean {
+  return (
+    "__vitest_worker__" in scope ||
+    "__vitest_index__" in scope ||
+    "__vitest_environment__" in scope
   );
 }
 
@@ -502,6 +648,78 @@ export interface EnvWriteOutcome {
   lostKeys: string[];
   /** Non-assignment lines (comments, blanks) that did not survive the rewrite. */
   lostCommentLines: number;
+  /**
+   * Whether `lostKeys` is a COMPLETE account of what this write cost.
+   *   "clean"   — the whole file was read back afterwards and every key it held
+   *               before is accounted for.
+   *   "unknown" — it is not established. Either the read-back could not be
+   *               performed, or the store changed under us in a way that makes
+   *               the account incomplete. NOT proof of loss — and not proof of
+   *               safety either, which is the only reason it exists: an empty
+   *               `lostKeys` from an account that was never taken must never be
+   *               narrated as "nothing was lost".
+   */
+  lossCheck: "clean" | "unknown";
+  /** Why `lossCheck` is "unknown" — one sentence, no values. Absent when clean. */
+  lossCheckNote?: string;
+  /** Null when the bytes reached the device and the rename was made durable as
+   *  far as this platform allows. Otherwise a sentence naming exactly what could
+   *  NOT be flushed. The write still LANDED (a rename is atomic either way); what
+   *  is not established is that it survives a power loss — and an ignored fsync
+   *  failure made a receipt claim exactly that (codex gate). */
+  durabilityGap: string | null;
+}
+
+/** An errno for a message, without ever quoting file contents. */
+function errCode(err: unknown): string {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return code ?? (err instanceof Error ? err.name : "unknown error");
+}
+
+/**
+ * Flush the DIRECTORY so a rename that happened is still there after a power
+ * loss. `fsync` on the file makes its CONTENT durable; it says nothing about the
+ * directory entry that now points at it, and a rename whose directory was never
+ * synced can be lost while the temp file is gone too — leaving no file at all
+ * where the store used to be. Omitting this is why "the write is durable" was a
+ * claim rather than an observation (codex gate).
+ *
+ * Windows has no syncable directory handle: the open succeeds and `fsync`
+ * answers EPERM, on every version. There is therefore nothing to attempt and
+ * nothing that failed — NTFS journals the rename's own metadata. This function
+ * says so by returning null there rather than reporting a durability gap on
+ * every single save on that platform; what it never does is claim, anywhere,
+ * that a directory sync happened when it did not.
+ *
+ * Returns null when there is no gap, or a sentence naming the gap.
+ */
+function syncDirectory(dir: string): string | null {
+  if (process.platform === "win32") return null;
+  let fd: number | undefined;
+  try {
+    fd = openSync(dir, "r");
+    fsyncSync(fd);
+    return null;
+  } catch (err) {
+    const code = errCode(err);
+    // Some filesystems simply do not implement it. That is the platform's
+    // answer, not a failure of this write.
+    if (code === "EINVAL" || code === "ENOTSUP" || code === "EISDIR" || code === "EACCES") {
+      return null;
+    }
+    return (
+      `the rename was not made durable — syncing the directory ${dir} failed (${code}), ` +
+      `so a power loss immediately after this save may leave the store without it`
+    );
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* nothing to do; the sync verdict above already stands */
+      }
+    }
+  }
 }
 
 /**
@@ -519,12 +737,38 @@ export interface EnvWriteOutcome {
  *
  * So: write a temp file in the SAME directory, fsync it, then rename over the
  * target (rename is atomic on both POSIX and Windows, so a reader sees either
- * the whole old file or the whole new one — never a truncated one). Before the
- * rename, re-read the target and abort if it changed since we read it, which is
- * the compare-and-swap that stops a concurrent writer's key from being dropped;
- * the caller retries against the newer content. After the rename, compare the
- * parsed keys and the comment lines against what we started with, so a loss can
- * be REPORTED rather than confirmed as success.
+ * the whole old file or the whole new one — never a truncated one), then fsync
+ * the directory so the rename itself is durable. Before the rename, re-read the
+ * target and abort if it changed since we read it, which is the compare-and-swap
+ * that stops a concurrent writer's key from being dropped; the caller retries
+ * against the newer content. After the rename, compare the parsed keys and the
+ * comment lines against what we started with, so a loss can be REPORTED rather
+ * than confirmed as success.
+ *
+ * THE LOSS ACCOUNT IS TAKEN FROM THE FILE WE ACTUALLY REPLACED. This is the
+ * part that was wrong. The compare-and-swap is a CHECK followed by a RENAME, and
+ * those are two operations: a writer that lands between them is replaced by our
+ * rename, and if the account is computed from the read we did EARLIER it appears
+ * in neither snapshot — so its key was silently destroyed and the receipt still
+ * said "saved, nothing lost" (codex gate). So immediately before the rename we
+ * `link` the target to a sentinel — atomic, and it leaves the target in place —
+ * and the account is computed against the SENTINEL: the content that was really
+ * there at the swap. A writer that landed after the compare-and-swap check is
+ * then reported as lost instead of vanishing.
+ *
+ * What remains unobservable is a writer landing between the `link` and the
+ * `rename` — two adjacent syscalls with nothing in between. Closing even that
+ * needs an OS-level lock this store does not take. So on top of the account we
+ * refuse to claim it is COMPLETE whenever there is evidence of a live competitor
+ * (a compare-and-swap conflict on an earlier attempt, a post-rename read that is
+ * not what we wrote, or a sentinel we could not capture), which is what
+ * `lossCheck` reports.
+ *
+ * Everything after the rename is a DISCLOSURE, never a refusal. The store has
+ * already changed by then, so a failure to verify, chmod or sync must ride out
+ * on the outcome. Throwing there turned a completed destructive operation into a
+ * generic error the caller retried against a store that had already lost keys
+ * (codex gate).
  */
 function rewriteEnvFile(
   mutate: (lines: string[]) => string[] | null,
@@ -535,19 +779,38 @@ function rewriteEnvFile(
   mkdirSync(dirname(p), { recursive: true });
 
   const ATTEMPTS = 5;
-  let lastConflict = false;
+  // OBSERVED evidence that another process is writing this store right now. It
+  // survives a successful retry on purpose: the writer we collided with a moment
+  // ago can equally have landed inside this attempt's check→rename window, where
+  // nothing can see it.
+  let sawConcurrentWriter = false;
   for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
     const existed = existsSync(p);
     const raw = existed ? readFileSync(p, "utf-8") : "";
-    const before = dotenvParseSafe(raw);
-    const beforeComments = commentLines(raw);
 
     const next = mutate(raw.length ? raw.split(/\r?\n/) : []);
-    if (next === null) return { changed: false, lostKeys: [], lostCommentLines: 0 };
+    if (next === null) {
+      // Nothing to change: no rename, so nothing to account for.
+      return {
+        changed: false,
+        lostKeys: [],
+        lostCommentLines: 0,
+        lossCheck: "clean",
+        durabilityGap: null,
+      };
+    }
     const body = next.join("\n");
 
-    const tmp = `${p}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
+    const nonce = randomBytes(6).toString("hex");
+    const tmp = `${p}.tmp-${process.pid}-${nonce}`;
+    // The snapshot of what we REPLACE, captured at the swap itself.
+    const sentinel = `${p}.pre-${process.pid}-${nonce}`;
+    let sentinelTaken = false;
+    /** Was there a file to replace at the moment of the swap? When there was
+     *  not, "nothing was there" IS the snapshot — there is nothing to lose. */
+    let targetExistedAtSwap = false;
     let fd: number | undefined;
+    let durabilityGap: string | null = null;
     try {
       fd = openSync(tmp, "wx", 0o600);
       writeSync(fd, body);
@@ -556,8 +819,14 @@ function rewriteEnvFile(
       // loss, which is the truncation this whole change exists to prevent.
       try {
         fsyncSync(fd);
-      } catch {
-        /* fsync is unsupported on some filesystems; the rename is still atomic */
+      } catch (err) {
+        // NOT swallowed. Proceeding is right — the rename is still atomic, so
+        // the store is never left half-written — but a receipt that then says
+        // "saved" over an unflushed write claims a durability nobody
+        // established (codex gate). The gap rides out on the outcome instead.
+        durabilityGap =
+          `the new content could not be flushed to the device before the rename (fsync: ${errCode(err)}), ` +
+          `so a power loss immediately after this save may leave ${p} without it`;
       }
       closeSync(fd);
       fd = undefined;
@@ -568,8 +837,28 @@ function rewriteEnvFile(
       const current = existsSync(p) ? readFileSync(p, "utf-8") : "";
       if (current !== raw) {
         rmSync(tmp, { force: true });
-        lastConflict = true;
+        sawConcurrentWriter = true;
         continue;
+      }
+      // Capture the file we are about to replace, as late as it can be captured.
+      // `link` is atomic and does NOT disturb the target, so unlike a
+      // rename-aside it never leaves a moment where the store does not exist for
+      // readers. Filesystems without hard links (exFAT, some network mounts) fall
+      // back to a copy; if neither works the account falls back to `raw` and the
+      // outcome says the swap could not be snapshotted.
+      targetExistedAtSwap = existsSync(p);
+      if (targetExistedAtSwap) {
+        try {
+          linkSync(p, sentinel);
+          sentinelTaken = true;
+        } catch {
+          try {
+            copyFileSync(p, sentinel);
+            sentinelTaken = true;
+          } catch {
+            /* no snapshot; reported below as an incomplete account */
+          }
+        }
       }
       renameSync(tmp, p);
     } catch (err) {
@@ -581,8 +870,33 @@ function rewriteEnvFile(
         }
       }
       rmSync(tmp, { force: true });
+      rmSync(sentinel, { force: true });
+      // Still BEFORE the rename: the store is untouched, so refusing is correct
+      // and the caller's "nothing was written" is true.
       throw err;
     }
+
+    // ─── AFTER THE RENAME. The store has changed. Nothing below may throw. ───
+    // The BASIS for the loss account: what was really under the rename, not what
+    // we read before deciding. When the two differ, a writer landed after the
+    // compare-and-swap check — the exact case that used to disappear without
+    // trace, and the reason `basisRaw` exists at all.
+    let basisRaw = targetExistedAtSwap ? raw : "";
+    let basisIsSnapshot = !targetExistedAtSwap || sentinelTaken;
+    if (sentinelTaken) {
+      try {
+        basisRaw = readFileSync(sentinel, "utf-8");
+      } catch {
+        basisIsSnapshot = false;
+        basisRaw = raw;
+      }
+    }
+    rmSync(sentinel, { force: true });
+    const before = dotenvParseSafe(basisRaw);
+    const beforeComments = commentLines(basisRaw);
+
+    const dirGap = syncDirectory(dirname(p));
+    if (dirGap && !durabilityGap) durabilityGap = dirGap;
     try {
       chmodSync(p, 0o600);
     } catch {
@@ -591,22 +905,60 @@ function rewriteEnvFile(
 
     // WHOLE-FILE verification. "Our key is present" is not enough — that is
     // exactly the check that confirmed a save while other tokens were lost.
-    const afterRaw = existsSync(p) ? readFileSync(p, "utf-8") : "";
+    let afterRaw: string | null;
+    try {
+      afterRaw = existsSync(p) ? readFileSync(p, "utf-8") : "";
+    } catch (err) {
+      // The rename already happened. We cannot say what is in the store, and we
+      // must not say "nothing was lost" from an account we could not take.
+      return {
+        changed: body !== raw,
+        lostKeys: [],
+        lostCommentLines: 0,
+        lossCheck: "unknown",
+        lossCheckNote:
+          `${p} was rewritten but could not be read back afterwards (${errCode(err)}), ` +
+          `so whether it still carries the other credentials it held is not established`,
+        durabilityGap,
+      };
+    }
     const after = dotenvParseSafe(afterRaw);
     const lostKeys: string[] = [];
     for (const k of Object.keys(before)) {
       if (opts.intentionalKey && k === opts.intentionalKey) continue;
       if (!(k in after)) lostKeys.push(k);
     }
+    // Verify against what we ACTUALLY WROTE, not merely against what we expected
+    // to find. A file that is no longer our content means a writer landed after
+    // our rename — observable, unlike the link→rename window, and it makes the
+    // key account incomplete in exactly the same way.
+    const raced = afterRaw !== body;
+    // `lostKeys` is a COMPLETE account only when we snapshotted what we replaced
+    // and nothing rewrote the file afterwards. Anything else and the empty list
+    // means "we did not see any", not "there were none".
+    const lossCheckNote = raced
+      ? `${p} does not read back as the content this save wrote, so something else rewrote it in the meantime; ` +
+        `what that write kept or dropped is not established here`
+      : !basisIsSnapshot
+        ? `the state this save replaced in ${p} could not be snapshotted, so the loss account rests on a read taken before the swap ` +
+          `and cannot cover a write that landed after it`
+        : sawConcurrentWriter
+          ? `another process was writing ${p} during this save (a compare-and-swap conflict was hit and retried). ` +
+            `The snapshot of the replaced state and the rename are two adjacent operations, so a write landing exactly between them ` +
+            `is replaced by this one without appearing in any read — this save cannot rule that out`
+          : null;
     return {
       changed: afterRaw !== raw,
       lostKeys,
       lostCommentLines: Math.max(0, beforeComments - commentLines(afterRaw)),
+      lossCheck: lossCheckNote ? "unknown" : "clean",
+      ...(lossCheckNote ? { lossCheckNote } : {}),
+      durabilityGap,
     };
   }
   throw new Error(
-    `Could not update ${p}: another process changed it during each of ${ATTEMPTS} attempts` +
-      `${lastConflict ? "" : ""}. Nothing was written — retry, or close whatever else is writing the credential store.`,
+    `Could not update ${p}: another process changed it during each of ${ATTEMPTS} attempts. ` +
+      `Nothing was written — retry, or close whatever else is writing the credential store.`,
   );
 }
 
@@ -663,41 +1015,51 @@ function upsertEnvFile(key: string, value: string): EnvWriteOutcome {
   );
 }
 
-/** Remove EVERY uncommented assignment to `key` from the canonical .env
- *  (including the `export KEY=` form dotenv honors). Returns whether anything
- *  was removed. A revoke that leaves one form behind reports the credential
- *  cleared while it is still in effect. */
-function removeEnvFileKey(key: string): boolean {
+/**
+ * Remove EVERY uncommented assignment to `key` from the canonical .env
+ * (including the `export KEY=` form dotenv honors). A revoke that leaves one
+ * form behind reports the credential cleared while it is still in effect.
+ *
+ * This used to THROW when the rewrite also lost other keys. That inverted the
+ * repo's own rule: the removal had already happened, so the throw turned a
+ * COMPLETED destructive operation into a generic failure, which the console then
+ * rendered as `ok:false` and the caller retried — a second removal against a
+ * store that had already lost credentials (codex gate). Everything after the
+ * rename is a DISCLOSURE. The loss now rides out on the outcome.
+ */
+function removeEnvFileKey(key: string): EnvWriteOutcome {
   const p = envFilePath();
-  if (!existsSync(p)) return false;
+  if (!existsSync(p)) {
+    return { changed: false, lostKeys: [], lostCommentLines: 0, lossCheck: "clean", durabilityGap: null };
+  }
   const re = envKeyLinePattern(key);
-  const out = rewriteEnvFile(
+  return rewriteEnvFile(
     (lines) => {
       const kept = lines.filter((l) => !re.test(l));
       return kept.length === lines.length ? null : kept; // nothing to remove
     },
     { intentionalKey: key, removing: true },
   );
-  if (out.lostKeys.length) {
-    throw new Error(
-      `Removing "${key}" from ${p} also lost ${out.lostKeys.join(", ")} — the store was rewritten by something else mid-operation. ` +
-        `Check ${p} before relying on any credential.`,
-    );
-  }
-  return out.changed;
 }
 
-/** Legacy JSON store writer — kept atomic for the same reason. */
-function writeFileAtomic(target: string, body: string): void {
+/** Legacy JSON store writer — kept atomic, and durable, for the same reasons.
+ *  Returns a durability gap sentence, or null. Like the .env writer it never
+ *  throws for anything that happens AFTER the rename. */
+function writeFileAtomic(target: string, body: string): string | null {
   const tmp = `${target}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
   let fd: number | undefined;
+  let durabilityGap: string | null = null;
   try {
     fd = openSync(tmp, "wx", 0o600);
     writeSync(fd, body);
     try {
       fsyncSync(fd);
-    } catch {
-      /* best effort */
+    } catch (err) {
+      // Same rule as the .env writer: an ignored fsync failure is a durability
+      // claim nobody checked (codex gate). Proceed, but report it.
+      durabilityGap =
+        `the new content could not be flushed to the device before the rename (fsync: ${errCode(err)}), ` +
+        `so a power loss immediately after this write may leave ${target} without it`;
     }
     closeSync(fd);
     fd = undefined;
@@ -711,13 +1073,21 @@ function writeFileAtomic(target: string, body: string): void {
       }
     }
     rmSync(tmp, { force: true });
+    // Still BEFORE the rename — the target is untouched, so refusing is correct.
     throw err;
   }
+  // ─── AFTER THE RENAME. Nothing below may throw. ───
+  // A rename is not durable until the DIRECTORY it happened in is synced: the
+  // new name can be lost while the temp name is gone too, leaving no file where
+  // the store used to be. This was missing here as well as in the .env writer.
+  const dirGap = syncDirectory(dirname(target));
+  if (dirGap && !durabilityGap) durabilityGap = dirGap;
   try {
     chmodSync(target, 0o600);
   } catch {
     /* ignore */
   }
+  return durabilityGap;
 }
 
 /** True when `key` may be persisted (union of the comfyui-tool + agent-provider
@@ -778,10 +1148,34 @@ export function setEnvSecret(
   // the mere absence of a throw is how a caller ends up believing it is
   // configured while nothing downstream can see the value (#826). The comparison
   // is against the value we already hold; neither the stored nor the supplied
-  // value is logged, and only the three-valued verdict leaves this function.
+  // value is logged, and only the verdict leaves this function.
+  //
+  // ORDER MATTERS. "yes" is the verdict for a save that is BOTH proven and
+  // clean, so every weaker outcome has to be able to displace it:
+  //   - the store unreadable            → unknown (nothing established)
+  //   - the key not carrying the value  → no
+  //   - other credentials proven gone   → damaged (worse than unknown; say so)
+  //   - the loss account not completed  → unknown (an empty lostKeys from an
+  //                                       account never taken is not "nothing
+  //                                       was lost")
   const readBack = parseEnvFile();
-  const persisted: SecretSaveReceipt["persisted"] =
-    readBack === null ? "unknown" : readBack[trimmed] === value ? "yes" : "no";
+  let persisted: SecretSaveReceipt["persisted"];
+  let uncertainty: string | undefined;
+  if (readBack === null) {
+    persisted = "unknown";
+    uncertainty = `${envFilePath()} could not be read back, so whether the value reached the store is not established`;
+  } else if (readBack[trimmed] !== value) {
+    persisted = "no";
+  } else if (writeOutcome.lostKeys.length) {
+    persisted = "damaged";
+  } else if (writeOutcome.lossCheck === "unknown") {
+    persisted = "unknown";
+    uncertainty =
+      `${trimmed} does read back from ${envFilePath()} with the value supplied, but this save cannot account for the rest of the store: ` +
+      `${writeOutcome.lossCheckNote ?? "the whole-file check could not be completed"}`;
+  } else {
+    persisted = "yes";
+  }
   if (persisted === "no") {
     // The durable store demonstrably does not carry this value. ROLL BACK the
     // in-process assignment and emit NOTHING, so the system is left exactly as it
@@ -799,8 +1193,16 @@ export function setEnvSecret(
       key: trimmed,
       path: envFilePath(),
       persisted,
+      ...(uncertainty ? { uncertainty } : {}),
       livePickup: hasLivePickup(trimmed),
       respawn: null,
+      // The store may ALSO have lost other keys on the way to not saving this
+      // one. That is the same disclosure as on any other verdict, and dropping
+      // it here because the headline is already a refusal would hide the worse
+      // half of what happened.
+      ...(writeOutcome.lostKeys.length ? { lostKeys: writeOutcome.lostKeys } : {}),
+      ...(writeOutcome.lostCommentLines ? { lostCommentLines: writeOutcome.lostCommentLines } : {}),
+      ...(writeOutcome.durabilityGap ? { durabilityGap: writeOutcome.durabilityGap } : {}),
       // Whether a credential for this key is STILL in effect after the rollback.
       // "Nothing is configured" is false when a previous working value survived,
       // and telling the user that would send them hunting the wrong problem.
@@ -831,9 +1233,16 @@ export function setEnvSecret(
     key: trimmed,
     path: envFilePath(),
     persisted,
+    ...(uncertainty ? { uncertainty } : {}),
     livePickup: hasLivePickup(trimmed),
     ...(previouslyShellProvided ? { shadowedByEnv: true } : {}),
     ...(writeOutcome.lostKeys.length ? { lostKeys: writeOutcome.lostKeys } : {}),
+    // Computed by the writer and, until now, dropped on the floor right here —
+    // so a rewrite that lost the user's comments was acknowledged as a healthy
+    // save on every consumer path while the code claimed it preserved them
+    // (codex gate).
+    ...(writeOutcome.lostCommentLines ? { lostCommentLines: writeOutcome.lostCommentLines } : {}),
+    ...(writeOutcome.durabilityGap ? { durabilityGap: writeOutcome.durabilityGap } : {}),
     respawn: reports.length
       ? reports.reduce(
           (a, b) => ({
@@ -847,12 +1256,36 @@ export function setEnvSecret(
   };
 }
 
+/**
+ * What a removal actually did. A revoke is DESTRUCTIVE, so it returns the same
+ * account a save does: a boolean cannot carry "and it also lost your other
+ * tokens", and the version that threw that fact instead turned a completed
+ * removal into a retryable-looking failure (codex gate).
+ */
+export interface SecretRemoveOutcome {
+  /** Something changed: a store line removed, the in-process copy dropped, or a
+   *  legacy JSON entry purged. */
+  changed: boolean;
+  /** OTHER credential keys the store held before and no longer holds. Names
+   *  only. Non-empty means the revoke happened AND cost something else. */
+  lostKeys: string[];
+  /** Comment lines the rewrite did not preserve. */
+  lostCommentLines: number;
+  /** Present when the removal's whole-file account could not be completed —
+   *  `lostKeys` is then not a statement that nothing else was lost. */
+  uncertainty?: string;
+  /** Present when the removal LANDED but was not established to survive a power
+   *  loss. */
+  durabilityGap?: string;
+}
+
 /** Canonical remover: drop a token from .env + process.env + emit. Also PURGES
  *  the legacy panel-secrets.json maps (#269): without this a key revoked from
  *  .env would RESURRECT on the next boot, because migrateSecretsToEnv() re-adds
  *  any key still present in the JSON store that .env no longer provides. */
-export function removeEnvSecret(key: string): boolean {
-  const removed = removeEnvFileKey(key);
+export function removeEnvSecret(key: string): SecretRemoveOutcome {
+  const outcome = removeEnvFileKey(key);
+  const removed = outcome.changed;
   // Dropping the IN-PROCESS value is a change in its own right. A SHELL-provided
   // key has no line in the store, so `removed` is false — and gating the emit on
   // `removed` alone meant no child was ever respawned for it, leaving a live
@@ -876,7 +1309,19 @@ export function removeEnvSecret(key: string): boolean {
     if (isAllowedComfyuiSecretKey(key)) emitComfyuiChange({}); // comfyui-only restart (#269)
     if (isAllowedAgentSecretKey(key)) emitAgentChange();
   }
-  return changed;
+  return {
+    changed,
+    lostKeys: outcome.lostKeys,
+    lostCommentLines: outcome.lostCommentLines,
+    ...(outcome.lossCheck === "unknown"
+      ? {
+          uncertainty:
+            outcome.lossCheckNote ??
+            `the whole-file check could not be completed, so whether removing "${key}" cost anything else is not established`,
+        }
+      : {}),
+    ...(outcome.durabilityGap ? { durabilityGap: outcome.durabilityGap } : {}),
+  };
 }
 
 /**
@@ -1008,7 +1453,7 @@ export function setComfyuiSecret(
 }
 
 /** Remove a stored comfyui secret. Returns false if absent. Emits on removal. */
-export function removeComfyuiSecret(key: string): boolean {
+export function removeComfyuiSecret(key: string): SecretRemoveOutcome {
   return removeEnvSecret(key);
 }
 
@@ -1063,7 +1508,7 @@ export function setAgentSecret(key: string, value: string): SecretSaveReceipt {
 /** Remove a stored agent secret. Returns false if absent. Also drops it from
  *  process.env (setAgentSecret put it there — a revoked key must stop applying
  *  NOW, not on the next restart). Emits on removal. */
-export function removeAgentSecret(key: string): boolean {
+export function removeAgentSecret(key: string): SecretRemoveOutcome {
   return removeEnvSecret(key);
 }
 
@@ -1204,6 +1649,12 @@ export interface SlotSaveOutcome {
    *  unreadable). Neither proven restored nor proven stranded — the caller must
    *  say so rather than pick one (codex gate, round 5, finding 2). */
   unverifiedKeys: string[];
+  /** OTHER credential keys the store lost while this slot was being written.
+   *  Aggregated from the receipts so no consumer has to know that receipts carry
+   *  it. Non-empty ⇒ `confirmed` is false, by construction: a receipt that
+   *  carries lost keys has `persisted: "damaged"`, and `confirmed` is derived
+   *  from `persisted === "yes"`. */
+  lostKeys: string[];
 }
 
 /**
@@ -1236,8 +1687,14 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
   const receipts: SecretSaveReceipt[] = [];
   let thrown: unknown = null;
   let failed = false;
+  let damaged = false;
   let strandedKeys: string[] = [];
   let unverifiedKeys: string[] = [];
+  /** Aggregated once, here, so no consumer of a slot save has to reach into the
+   *  receipts to learn that the store lost credentials. */
+  const lostKeysOf = (rs: SecretSaveReceipt[]) => [
+    ...new Set(rs.flatMap((r) => r.lostKeys ?? [])),
+  ];
 
   const outcome = withSuspendedEmissions(
     (): SlotSaveOutcome => {
@@ -1245,6 +1702,15 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
         try {
           const receipt = setEnvSecret(key, value);
           receipts.push(receipt);
+          if (receipt.persisted === "damaged") {
+            // The store lost OTHER credentials. Stop the fan-out — but do NOT
+            // roll back: a rollback cannot bring the lost keys back, and it is
+            // one more destructive rewrite of a store already known to be
+            // damaged. What the user needs is the truth about the state we are
+            // in, not another write on top of it.
+            damaged = true;
+            break;
+          }
           if (receipt.persisted !== "yes") {
             // "unknown" is not a proven failure, but it is not a proven success
             // either — stop rather than layering more unverified writes on it.
@@ -1257,6 +1723,19 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
           break;
         }
       }
+      if (damaged) {
+        return {
+          slot: slotId,
+          receipts,
+          // Derived from the receipts, so a damaged one can never read as
+          // confirmed anywhere: `slotSaveConfirmed` is this field.
+          confirmed: false,
+          rolledBack: false,
+          strandedKeys: [],
+          unverifiedKeys: [],
+          lostKeys: lostKeysOf(receipts),
+        };
+      }
       if (!failed) {
         return {
           slot: slotId,
@@ -1265,6 +1744,7 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
           rolledBack: false,
           strandedKeys: [],
           unverifiedKeys: [],
+          lostKeys: [],
         };
       }
       // Restore every alias this call actually changed, and PROVE each restore
@@ -1283,6 +1763,7 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
         rolledBack: strandedKeys.length === 0 && unverifiedKeys.length === 0,
         strandedKeys,
         unverifiedKeys,
+        lostKeys: lostKeysOf(receipts),
       };
     },
     (result) => {
@@ -1390,16 +1871,37 @@ export function unconfirmedSlotKeys(
 }
 
 /** Clear a slot: remove EVERY env key (alias fan-out, mirroring setPanelSecret)
- *  from its store. Returns true if anything was removed. Throws on unknown slot.
+ *  from its store. Throws on unknown slot — that is a refusal BEFORE anything is
+ *  removed, which is the only place a refusal belongs on this path. Everything
+ *  the removals cost is DISCLOSED in the returned outcome instead.
  *  This is the revoke path (issue #203) — without it a saved key could only be
  *  overwritten, never removed, short of hand-editing panel-secrets.json. */
-export function clearPanelSecret(slotId: string): boolean {
+export function clearPanelSecret(slotId: string): SecretRemoveOutcome {
   const slot = SLOT_BY_ID.get(slotId);
   if (!slot) throw new Error(`unknown credential slot "${slotId}"`);
   const remove = slot.store === "agent" ? removeAgentSecret : removeComfyuiSecret;
-  let removed = false;
-  for (const key of slot.envKeys) removed = remove(key) || removed;
-  return removed;
+  let changed = false;
+  const lostKeys = new Set<string>();
+  let lostCommentLines = 0;
+  const uncertainties: string[] = [];
+  let durabilityGap: string | undefined;
+  for (const key of slot.envKeys) {
+    const out = remove(key);
+    changed = out.changed || changed;
+    // A key this fan-out itself removes is not collateral — the aliases of one
+    // slot are all being cleared on purpose.
+    for (const k of out.lostKeys) if (!slot.envKeys.includes(k)) lostKeys.add(k);
+    lostCommentLines += out.lostCommentLines;
+    if (out.uncertainty) uncertainties.push(out.uncertainty);
+    if (out.durabilityGap && !durabilityGap) durabilityGap = out.durabilityGap;
+  }
+  return {
+    changed,
+    lostKeys: [...lostKeys],
+    lostCommentLines,
+    ...(uncertainties.length ? { uncertainty: uncertainties.join(" ") } : {}),
+    ...(durabilityGap ? { durabilityGap } : {}),
+  };
 }
 
 /** Whether a slot still resolves to a credential — read AFTER a revoke to prove

@@ -64,6 +64,9 @@ import {
   setComfyuiSecret,
   setAgentSecret,
   isAllowedAgentSecretKey,
+  receiptDisclosures,
+  shadowedNote,
+  storeDamageNote,
   type SecretSaveReceipt,
 } from "../services/panel-secrets.js";
 import { flattenUiWorkflow } from "../services/flatten-workflow.js";
@@ -219,35 +222,18 @@ export function secretNotPersisted(receipt: SecretSaveReceipt): Error {
   );
 }
 
-/**
- * The one thing that outranks everything else in the ack: the value was stored,
- * but a real environment variable of the same name outranks the store, so the
- * readers use THAT and not what was just saved. Reporting "saved" without this
- * is a configured state the tools do not use. Returns null when not shadowed.
- */
-/**
- * The store lost OTHER credentials while saving this one. This outranks every
- * other clause: "your token is saved" while the user's other tokens were
- * destroyed is a fabricated success on top of data loss. Names only, no values.
- */
-export function storeDamageNote(receipt: SecretSaveReceipt): string | null {
-  const lost = receipt.lostKeys ?? [];
-  if (!lost.length) return null;
-  return (
-    `🛑 "${receipt.key}" was written to ${receipt.path}, but the store NO LONGER carries ${lost.join(", ")} — ` +
-    `${lost.length > 1 ? "those credentials were" : "that credential was"} lost during the write. Do not treat this as a successful save. ` +
-    `Inspect ${receipt.path} and restore the missing ${lost.length > 1 ? "entries" : "entry"} before relying on anything in it.`
-  );
-}
-
-export function shadowedNote(receipt: SecretSaveReceipt): string | null {
-  if (!receipt.shadowedByEnv) return null;
-  return (
-    `⚠️ "${receipt.key}" was stored in ${receipt.path}, but it is NOT the value in use: a real environment variable named ${receipt.key} is set outside this app and takes precedence over the store. ` +
-    `Nothing changed for the tools. To make the value you just supplied take effect, unset ${receipt.key} in the environment this app was started from and restart it — or leave the environment variable as the source of truth. ` +
-    `(The value itself is never shown or logged.)`
-  );
-}
+// The note builders and the disclosure list live with the receipt they describe
+// (services/panel-secrets.ts) so that the console endpoint and this file cannot
+// drift apart on which of them matter — the drift that let `lostKeys` reach the
+// ack and nowhere else. Re-exported here because this is where callers and tests
+// have always imported them from.
+export {
+  storeDamageNote,
+  shadowedNote,
+  commentLossNote,
+  durabilityNote,
+  receiptDisclosures,
+} from "../services/panel-secrets.js";
 
 /** The ack for a comfyui tool secret: what was verified, how the running tools
  *  pick it up, and the ACTUAL respawn disposition — never a promise. */
@@ -263,8 +249,19 @@ export function describeComfyuiSecretSave(receipt: SecretSaveReceipt): string {
   parts.push(
     receipt.persisted === "yes"
       ? `🔒 Saved env "${receipt.key}" to ${receipt.path} — verified by reading the file back (the value itself is never shown or logged).`
-      : `🔒 Wrote env "${receipt.key}" to ${receipt.path}, but the file could not be re-read to confirm it, so whether it persisted is UNKNOWN — treat the steps below as unconfirmed and re-check if the action still fails.`,
+      : // NOT a fixed cause. The verdict is "unknown" for more than one reason
+        // now — the file could not be re-read, OR it read back correctly but a
+        // concurrent writer means this save cannot account for the rest of the
+        // store — and asserting the wrong one sends the user to the wrong check
+        // (codex gate). Print what the receipt says was not established.
+        `🔒 Wrote env "${receipt.key}" to ${receipt.path}, but the save is NOT confirmed — treat it as UNKNOWN: ` +
+        `${receipt.uncertainty ?? `${receipt.path} could not be re-read to confirm it`}. ` +
+        `Treat the steps below as unconfirmed and re-check if the action still fails.`,
   );
+  // Every remaining obligation the receipt carries — lost comment lines, a
+  // durability gap — from the one list every consumer uses. (Damage and
+  // shadowing already returned above; nothing else can appear twice.)
+  parts.push(...receiptDisclosures(receipt));
   // Every claim below rests on the value actually being IN the store. When that
   // could not be confirmed, none of them may be made (codex gate, round 2,
   // finding 4): a running tool child falls back to whatever it inherited when
@@ -6794,18 +6791,43 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             switch (receipt.persisted) {
               case "no":
                 return fail(secretNotPersisted(receipt));
+              case "damaged":
+                // The write HAPPENED and cost the user other credentials. That
+                // is a disclosure about a completed operation, never a refusal
+                // that invites a retry — and it can never be narrated as a save.
+                return ok(
+                  `${storeDamageNote(receipt)} (The key itself did land, so do not set it again before restoring the file — a second write is one more rewrite of a damaged store.)`,
+                );
               case "unknown":
                 return ok(
-                  `⚠️ ${receipt.key} was written to ${receipt.path}, but the file could not be re-read to confirm it — whether it is saved is UNKNOWN. ` +
+                  `⚠️ ${receipt.key} was written to ${receipt.path}, but the save is NOT confirmed — treat it as UNKNOWN: ` +
+                    `${receipt.uncertainty ?? `the file could not be re-read to confirm it`}. ` +
                     `Do not treat the provider as configured: check ${receipt.path} carries the key, and set it again if the provider still reads as unconfigured.`,
                 );
-              case "yes":
+              case "yes": {
+                // A SHADOWED save is stored but not in use, so it must not be
+                // followed by "the provider is enabled now" — it leads instead.
+                const shadow = shadowedNote(receipt);
+                const headline =
+                  shadow ??
+                  `🔒 ${receipt.key} saved to ${receipt.path} (confirmed by reading the file back; the value is never shown or logged). ` +
+                    `The orchestrator reads provider keys in-process, so the provider this key belongs to is enabled now — pick it in the provider list.`;
                 return ok(
-                  storeDamageNote(receipt) ??
-                    shadowedNote(receipt) ??
-                    `🔒 ${receipt.key} saved to ${receipt.path} (confirmed by reading the file back; the value is never shown or logged). ` +
-                      `The orchestrator reads provider keys in-process, so the provider this key belongs to is enabled now — pick it in the provider list.`,
+                  [headline, ...receiptDisclosures(receipt).filter((n) => n !== shadow)].join(" "),
                 );
+              }
+              default: {
+                // Exhaustiveness: a new verdict added to the receipt is a COMPILE
+                // error here rather than a silent fall-through past this whole
+                // block into the user-MCP-server branch below.
+                const unhandled: never = receipt.persisted;
+                return fail(
+                  new Error(
+                    `${receipt.key}: the store returned a save verdict this build does not know how to report (${String(unhandled)}). ` +
+                      `Nothing about the save can be asserted — check ${receipt.path} directly.`,
+                  ),
+                );
+              }
             }
           }
           // The BUILT-IN comfyui server is NOT in the user's ~/.claude.json — the

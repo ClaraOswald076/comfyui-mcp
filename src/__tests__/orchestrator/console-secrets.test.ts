@@ -11,11 +11,24 @@ import { rmSync } from "node:fs";
 // whole-file verification; read 2 is the caller's read-back. Breaking the 2nd
 // leaves the write PROVEN on disk with no verdict about its content — the exact
 // shape of "written, but could not be verified".
-const fsState = vi.hoisted(() => ({ breakSecondReadAfterRename: false, readsSinceRename: 0 }));
+const fsState = vi.hoisted(() => ({
+  breakSecondReadAfterRename: false,
+  readsSinceRename: 0,
+  /** Replace what the rename installs, so the store comes back missing keys it
+   *  held before — the data-loss case this endpoint used to answer ok:true to. */
+  tamperOnRename: null as null | (() => string),
+}));
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   const isStore = (p: unknown) => String(p).endsWith(".env");
   const renameSync: typeof actual.renameSync = (from, to) => {
+    if (isStore(to)) {
+      const tamper = fsState.tamperOnRename;
+      if (tamper) {
+        fsState.tamperOnRename = null;
+        actual.writeFileSync(from, tamper());
+      }
+    }
     const out = actual.renameSync(from, to);
     if (isStore(to)) fsState.readsSinceRename = 0;
     return out;
@@ -45,6 +58,7 @@ describe("console /api/secrets", () => {
   beforeEach(async () => {
     fsState.breakSecondReadAfterRename = false;
     fsState.readsSinceRename = 0;
+    fsState.tamperOnRename = null;
     process.env.COMFYUI_MCP_PANEL_SECRETS = join(tmpdir(), `secrets-${randomUUID()}.json`);
     // ISOLATE THE CANONICAL CREDENTIAL STORE. Without this the suite writes to
     // the developer's REAL ~/.comfyui-mcp/.env: the "sets a key" case below
@@ -59,6 +73,7 @@ describe("console /api/secrets", () => {
     await srv.stop();
     fsState.breakSecondReadAfterRename = false;
     fsState.readsSinceRename = 0;
+    fsState.tamperOnRename = null;
     delete process.env.COMFYUI_MCP_ENV_FILE;
     delete process.env.COMFYUI_MCP_PANEL_SECRETS;
     rmSync(envPath, { force: true });
@@ -90,6 +105,74 @@ describe("console /api/secrets", () => {
       body: JSON.stringify({ slot: "nope", value: "x" }),
     });
     expect(bad.status).toBe(400);
+  });
+
+  it("does NOT report ok:true for a save that DESTROYED other credentials", async () => {
+    // THE defect this PR opened on, surviving one layer further out: the save
+    // read back saying "yes", `slotSaveConfirmed` looked only at `confirmed`,
+    // and this endpoint sent `200 {ok:true, masked}` without ever inspecting a
+    // receipt's `lostKeys`. So the console reported a clean save while the
+    // user's HuggingFace and RunPod tokens were gone (codex gate).
+    //
+    // It cannot recur by omission now: a receipt that carries lost keys is
+    // `persisted: "damaged"`, which is not "yes", so `confirmed` is false and
+    // this endpoint has no path to ok:true at all.
+    await fetch(`${base()}/api/secrets?token=${TOKEN}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ slot: "runpod", value: "rp_key_keep_me_123" }),
+    });
+    await fetch(`${base()}/api/secrets?token=${TOKEN}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ slot: "huggingface", value: "hf_key_keep_me_123" }),
+    });
+    // The next write installs a store containing ONLY the key being saved.
+    fsState.tamperOnRename = () => "CIVITAI_API_TOKEN=civ_key_survivor\n";
+    const r = await fetch(`${base()}/api/secrets?token=${TOKEN}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ slot: "civitai", value: "civ_key_survivor" }),
+    });
+    const body = await r.json();
+    expect(body.ok).toBe(false);
+    expect(r.status).toBe(500);
+    // It names WHICH credentials are gone — by key name only.
+    expect(body.lost_keys).toContain("RUNPOD_API_KEY");
+    expect(body.lost_keys).toContain("HF_TOKEN");
+    expect(String(body.error)).toMatch(/no longer carries/);
+    // And it does not offer the panel anything it could render as a save.
+    expect(body.masked).toBeUndefined();
+    // The values never leave.
+    expect(JSON.stringify(body)).not.toContain("civ_key_survivor");
+    expect(JSON.stringify(body)).not.toContain("rp_key_keep_me_123");
+  });
+
+  it("DISCLOSES a revoke that lost other credentials instead of failing generically", async () => {
+    // `removeEnvFileKey` used to THROW here. The removal had already happened,
+    // so the throw became a generic `ok:false` in the endpoint's catch — with no
+    // sign that anything was removed at all — and the caller retried a removal
+    // that had already run, against a store that had already lost keys (codex
+    // gate). Everything after the rename is a disclosure.
+    await fetch(`${base()}/api/secrets?token=${TOKEN}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ slot: "runpod", value: "rp_key_keep_me_123" }),
+    });
+    await fetch(`${base()}/api/secrets?token=${TOKEN}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ slot: "civitai", value: "civ_key_to_revoke" }),
+    });
+    fsState.tamperOnRename = () => "# everything else gone\n";
+    const r = await fetch(`${base()}/api/secrets?token=${TOKEN}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ slot: "civitai", clear: true }),
+    });
+    const body = await r.json();
+    expect(body.ok).toBe(false);
+    // It says the removal HAPPENED — that is the difference between a
+    // disclosure and a refusal, and it is what stops the caller retrying.
+    expect(body.cleared).toBe(true);
+    expect(body.lost_keys).toContain("RUNPOD_API_KEY");
+    expect(String(body.error)).toMatch(/WAS removed/);
+    expect(String(body.error)).toMatch(/Do NOT repeat the revoke/);
+    expect(JSON.stringify(body)).not.toContain("rp_key_keep_me_123");
   });
 
   it("clears a set slot with clear:true (issue #203) — removes all alias keys", async () => {
