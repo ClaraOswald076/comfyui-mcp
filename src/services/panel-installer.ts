@@ -5193,12 +5193,21 @@ async function runPanelActionCore(
       const provenLegacyEmptyQueue = isProvenLegacyEmptyQueue(result.details);
       // The Manager-side clause every fallback message narrates around — the
       // caller knows what the Manager actually reported; the fallback must not
-      // assert the stale-3.x cause for a signature that doesn't prove it.
+      // assert the stale-3.x cause for a signature that doesn't prove it, and
+      // must not call a merely-PARTIAL status "incoherent" either (a missing
+      // field is unproven, not contradictory).
+      const countsContradict =
+        c.total !== undefined && c.done !== undefined && c.done > c.total;
       const managerReason = provenLegacyEmptyQueue
         ? `ComfyUI-Manager never enqueued the update (the stale legacy 3.x silent no-op, #639/#724)`
-        : `ComfyUI-Manager's drained-queue counts are incoherent (total=` +
-          `${c.total ?? "?"}, done=${c.done ?? "?"}, pending=${c.pending ?? "?"}, ` +
-          `in_progress=${c.inProgress ?? "?"}) and can neither confirm nor explain the no-op`;
+        : countsContradict
+          ? `ComfyUI-Manager's drained-queue counts are incoherent (total=` +
+            `${c.total ?? "?"}, done=${c.done ?? "?"}, pending=${c.pending ?? "?"}, ` +
+            `in_progress=${c.inProgress ?? "?"}) and can neither confirm nor explain the no-op`
+          : `ComfyUI-Manager's drained-queue status is partial (total=` +
+            `${c.total ?? "?"}, done=${c.done ?? "?"}, pending=${c.pending ?? "?"}, ` +
+            `in_progress=${c.inProgress ?? "?"} — fields the status contract requires ` +
+            `are missing) and can neither confirm nor explain the no-op`;
       if (!provenLegacyEmptyQueue) {
         // #824 — SIGNATURE GATE, second form. An incoherent/partial signature
         // (e.g. total 0, done 1) is not proof of the stale-3.x no-op, so it
@@ -5228,6 +5237,13 @@ async function runPanelActionCore(
         // warrant comes from the checkout's own state (clean, corroborated,
         // behind-or-at-tip proven against the fetched upstream), not from any
         // Manager signature, so the Manager's API dialect is irrelevant to it.
+        // Quiescence is a SNAPSHOT, like every proof in this path (the legacy
+        // empty-queue signature is one too): a Manager task enqueued by another
+        // client in the interim is not excluded by it. What bounds that race is
+        // the mutation itself — a pinned `git merge --ff-only` takes git's own
+        // locks and fails LOUDLY on contention rather than corrupting or
+        // silently losing work, and the post-merge verification re-reads the
+        // on-disk identity fresh instead of trusting the merge's output.
       } else {
         // DIALECT GATE — the empty-queue signature only MEANS "stale Manager 3.x"
         // on a legacy host. On a v4 host (or with the dialect unproven) the same

@@ -979,6 +979,24 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     expect(r.installedVersion).toBe("0.11.35");
   });
 
+  it("#824: partial-but-idle status (done_count ABSENT, live fields clear) → verifies, and names the status partial, NOT incoherent", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      // total 0 reads as a no-op, but the historical done counter is MISSING —
+      // the status is partial, not contradictory. The live fields prove idle.
+      updateDetails: { total_count: 0, pending_count: 0, in_progress_count: 0, is_processing: false },
+      onGitPull: () => "Already up to date.",
+    });
+    const r = await runPanelAction("update", h.deps);
+    expect(r.restartRequired).toBe(false);
+    expect(r.message).toMatch(/already at the upstream tip/);
+    expect(r.message).toMatch(/partial/);
+    expect(r.message).not.toMatch(/incoherent/);
+    expect(r.message).not.toMatch(/stale legacy 3\.x/);
+  });
+
   it("#824: incoherent signature with live work NOT disproven (pending 1) → verification REFUSED, no git mutation", async () => {
     const h = makeDeps({
       comfyuiPath: COMFY,
