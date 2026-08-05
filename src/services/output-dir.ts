@@ -1,5 +1,5 @@
 import { existsSync, statSync } from "node:fs";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { config, isRemoteMode } from "../config.js";
 import { getClient, getSystemStats } from "../comfyui/client.js";
 import {
@@ -392,7 +392,13 @@ function containedUnder(root: string, candidate: string): boolean {
   const c = resolve(candidate);
   if (c === r) return false;
   const rel = relative(r, c);
-  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+  if (rel === "" || isAbsolute(rel)) return false;
+  // `..` only counts as escaping when it is a whole PATH SEGMENT. A bare
+  // `startsWith("..")` also rejects `..model.safetensors` — a perfectly ordinary
+  // filename that stays inside the directory — and that false refusal would block the
+  // very Docker download this corroboration exists to allow. Over-strict is the same
+  // defect as over-permissive, pointed the other way.
+  return rel !== ".." && !rel.startsWith(`..${sep}`) && !rel.startsWith("../");
 }
 
 /** What is at this path — keeping "could not look" out of "is not there", and out of
