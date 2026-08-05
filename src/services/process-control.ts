@@ -277,16 +277,25 @@ interface StartupReadinessResult {
 }
 
 /**
- * Did this call CONFIRM that ComfyUI is serving after the launch/reboot it made?
+ * Did this call CONFIRM that the launch/reboot IT MADE is serving?
+ *
+ * THE SUBJECT IS THIS CALL'S OWN ATTEMPT, never the machine (codex gate round 5 —
+ * the wording below said "ComfyUI is down" after the messages had already been
+ * corrected not to, which is the same bucket-narrated-as-a-cause defect hiding in a
+ * doc comment). Whatever else may be serving the port is `listener_ownership`'s
+ * subject, and on the failure path nothing has been observed about it at all.
  *
  * A STRING tri-state (four-state, with the never-tried case named) for the same
  * reason `listener_ownership` is one: the uncertain case has to survive
  * `JSON.stringify`, and it must be impossible to read as the definite negative.
  *
  *   "confirmed"     — the API answered. Observed.
- *   "failed"        — the process this call launched is GONE: a spawn error, a
- *                     recorded exit, or a liveness probe that came back
- *                     DEFINITELY dead. ComfyUI is down, and that is observed too.
+ *   "failed"        — THIS RELAUNCH failed: the process this call launched is GONE
+ *                     (a spawn error, a recorded exit, or a liveness probe that came
+ *                     back DEFINITELY dead) and no readiness probe got a healthy
+ *                     response. It does NOT say the port is unserved — an external
+ *                     launcher or supervisor may have restored one since the last
+ *                     probe, which is why the message tells the caller to re-check.
  *   "unconfirmed"   — the readiness budget expired with nothing contradicting the
  *                     start.
  *   "not-attempted" — this call never launched or rebooted anything (a refusal, or
