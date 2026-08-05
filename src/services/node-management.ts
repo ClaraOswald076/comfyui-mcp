@@ -1733,12 +1733,22 @@ export type PackPresence =
 export async function resolvePackPresence(
   id: string,
   base: string,
+  /**
+   * The CALLER'S captured local root (an adopted/live workspace threaded
+   * through InstallOptions.comfyuiPath, or the entry-captured CLI workspace).
+   * When given, the disk scan reads exactly this root — never a global value
+   * recomputed after the list await. Remote mode still skips the disk
+   * entirely: a local path tells us nothing about a remote server.
+   */
+  diskRoot?: string,
 ): Promise<PackPresence> {
   // Capture the disk context BEFORE the first await: `base` is pinned by the
   // caller, and the disk root must describe the SAME target. Reading the
   // mutable global mode after the list request would let a mid-op retarget
   // pair a remote Manager answer with a newly-local disk (or vice versa).
-  const diskBase = isRemoteMode() ? undefined : resolveEffectiveComfyUIBase();
+  const diskBase = isRemoteMode()
+    ? undefined
+    : (diskRoot ?? resolveEffectiveComfyUIBase());
 
   let installed: InstalledNode[] | undefined;
   let listError: string | undefined;
@@ -2211,7 +2221,7 @@ async function installCustomNodeImpl(
   // #797: verify across BOTH sources (Manager list + local disk) and keep
   // "could not determine" distinct from "determined absent" — an unreadable
   // Manager list collapsed to [] used to read as "not found in the registry".
-  const presence = await resolvePackPresence(id, managerBase);
+  const presence = await resolvePackPresence(id, managerBase, cliWorkspace);
   switch (presence.state) {
     case "manager-listed":
       return withCliNote({
@@ -2870,7 +2880,7 @@ async function setCustomNodeEnabled(
   // the pack's REAL installed version (node-bisect's controller does the same
   // — "never send 'unknown' for an installed pack"). Both need the installed
   // list read up front.
-  const presence = await resolvePackPresence(id, base);
+  const presence = await resolvePackPresence(id, base, cliWorkspace);
   if (
     presence.state === "on-disk" &&
     // A READABLE list that doesn't track the pack: refuse — neither mechanism
@@ -2983,13 +2993,17 @@ async function setCustomNodeEnabled(
     op,
     // The body is dialect-specific: v2 keys enable on cnr_id / disable on
     // node_name; the legacy 3.x bodies key on node_name + the REAL installed
-    // version (legacyTaskRequest maps node_ver → version).
+    // version (legacyTaskRequest maps node_ver → version). node_name is the
+    // MANAGER'S module/folder name (tracked.module), never the caller's id —
+    // a registry id ("comfyui-impact-pack") and the module name
+    // ("ComfyUI-Impact-Pack") can differ, and the 3.x routes resolve by module
+    // (codex gate round 7).
     (api) =>
       api === "v2"
         ? enable
-          ? { cnr_id: tracked.cnrId ?? id, node_name: id }
-          : { node_name: id, is_unknown: false }
-        : { node_name: id, node_ver: tracked.version ?? "unknown" },
+          ? { cnr_id: tracked.cnrId ?? id, node_name: tracked.module }
+          : { node_name: tracked.module, is_unknown: false }
+        : { node_name: tracked.module, node_ver: tracked.version ?? "unknown" },
     base,
   );
   const verdict = await readEnabledVerdict(id, enable, base);
@@ -3085,7 +3099,7 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
   // via Manager (drained queue) or comfy-cli (exit 0) alike — and reading
   // absence afterwards would "verify" a state that predated the call. Refuse
   // with the reason that is actually true.
-  const presence = await resolvePackPresence(id, base);
+  const presence = await resolvePackPresence(id, base, cliWorkspace);
   if (
     presence.state === "on-disk" &&
     // A READABLE list that doesn't track the pack: refuse. An UNREADABLE list
@@ -3221,10 +3235,15 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
     "uninstall",
     // Legacy 3.x keys the body on node_name + the REAL installed version
     // (legacyTaskRequest maps node_ver → version); v2 needs only node_name.
+    // node_name is the Manager's module name (presence.node.module), which can
+    // differ from the caller's registry-id spelling (codex gate round 7).
     (api) =>
       api === "v2"
-        ? { node_name: id }
-        : { node_name: id, node_ver: presence.node?.version ?? "unknown" },
+        ? { node_name: presence.node?.module ?? id }
+        : {
+            node_name: presence.node?.module ?? id,
+            node_ver: presence.node?.version ?? "unknown",
+          },
     base,
   );
 

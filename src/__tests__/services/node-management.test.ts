@@ -1148,6 +1148,28 @@ describe("node-management service", () => {
       expect(res.message).not.toMatch(/not found in the/);
     });
 
+    it("the install post-verify scans the CALL-SCOPED adopted root, not the global one", async () => {
+      // apply_manifest threads an adopted live root via opts.comfyuiPath; the
+      // disk evidence must come from THAT root even when it differs from the
+      // configured/saved one.
+      fsCtl.readdirSync = (p) => {
+        const norm = p.replace(/\\/g, "/");
+        if (norm === "/adopted/ws/custom_nodes") return [dirEnt("ComfyUI-Impact-Pack")];
+        return [];
+      };
+      fsCtl.readFileSync = (p) => {
+        if (p.endsWith("pyproject.toml")) return impactPyproject;
+        throw new Error(`unexpected readFileSync: ${p}`);
+      };
+      stubFetch({ installedBody: {} });
+      const res = await installCustomNode({
+        id: "comfyui-impact-pack",
+        comfyuiPath: "/adopted/ws",
+      });
+      expect(res.message).toMatch(/present on disk/);
+      expect(res.message).toContain(join("/adopted/ws", "custom_nodes", "ComfyUI-Impact-Pack"));
+    });
+
     it("absence is asserted from BOTH sources when both were readable", async () => {
       fsCtl.readdirSync = () => [];
       stubFetch({ installedBody: {} });
@@ -1411,6 +1433,24 @@ describe("node-management service", () => {
       expect(res.mechanism).toBe("comfy-cli");
       const cliArgs = mockedExec.mock.calls[0]?.[1] as string[];
       expect(cliArgs[cliArgs.indexOf("--workspace") + 1]).toBe(COMFY);
+    });
+
+    it("disable sends the MANAGER module name as node_name when it differs from the registry id", async () => {
+      // Manager's installed list keys on the folder name; the caller's registry
+      // id only MATCHES it. The queued op must use the module name or the 3.x
+      // routes resolve nothing.
+      const pre = {
+        "ComfyUI-Impact-Pack": { ver: "8.28.3", cnr_id: "comfyui-impact-pack", enabled: true },
+      };
+      const post = {
+        "ComfyUI-Impact-Pack": { ver: "8.28.3", cnr_id: "comfyui-impact-pack", enabled: false },
+      };
+      const { calls } = stubChangingList(pre, post);
+      const res = await disableCustomNode({ id: "comfyui-impact-pack" });
+      expect(taskOf(calls, "disable").params).toMatchObject({
+        node_name: "ComfyUI-Impact-Pack",
+      });
+      expect(res.message).toMatch(/Disabled "comfyui-impact-pack"/);
     });
 
     it("enable queues an enable task keyed by cnr_id and verifies the pack reports enabled", async () => {
