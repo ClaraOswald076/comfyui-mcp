@@ -297,6 +297,30 @@ function detectMcpVersion(): string | undefined {
   }
 }
 
+/**
+ * Reduce a caller-supplied version to the VERSION IN IT, or undefined.
+ *
+ * These strings are copied by an agent out of a prose ENVIRONMENT line, and that
+ * line grew a qualifying clause (#846: "…0.48.18 (this process is RUNNING …;
+ * 0.49.6 is now installed on disk …)"). Passed through whole, the triage worker's
+ * version match sees a sentence instead of a version and cannot tell the user that
+ * upgrading already fixes their bug — which is the single most common resolution,
+ * and the outcome #846 was filed to protect.
+ *
+ * Deliberately anchored at the START, so the FIRST version wins: the ENV line leads
+ * with the RUNNING build, which is the one the report is about. A clause naming a
+ * newer installed version must never be the one that gets extracted.
+ *
+ * Returns undefined rather than a guess when nothing version-shaped is there, so
+ * the caller falls back to detecting it — an unusable string is no reading at all,
+ * and must not be reported as one.
+ */
+export function normalizeReportedVersion(raw: string | undefined): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const m = /^\s*v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/.exec(raw);
+  return m ? m[1] : undefined;
+}
+
 export function registerReportIssueTools(server: McpServer): void {
   server.tool(
     "report_issue",
@@ -355,8 +379,12 @@ export function registerReportIssueTools(server: McpServer): void {
         const repoName = repo.split("/")[1];
 
         const reporterVersions: ReporterVersions = {
-          mcp: args.mcp_version ?? detectMcpVersion(),
-          panel: args.panel_version ?? process.env.COMFYUI_MCP_PANEL_VERSION ?? undefined,
+          mcp: normalizeReportedVersion(args.mcp_version) ?? detectMcpVersion(),
+          panel:
+            normalizeReportedVersion(args.panel_version) ??
+            args.panel_version ??
+            process.env.COMFYUI_MCP_PANEL_VERSION ??
+            undefined,
         };
 
         try {

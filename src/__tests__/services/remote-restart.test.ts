@@ -121,7 +121,7 @@ describe("restartComfyUI — remote (Manager reboot)", () => {
     expect(hoisted.resetClient).not.toHaveBeenCalled();
   });
 
-  it("reboot fires but readiness never returns within budget → not started, timeout message", async () => {
+  it("reboot fires but readiness never returns within budget → NOT CONFIRMED, never 'did not come back' (#367)", async () => {
     __processControlTestHooks.setRemoteRebootTimingForTests({
       settleMs: 0,
       budgetMs: 30,
@@ -137,9 +137,20 @@ describe("restartComfyUI — remote (Manager reboot)", () => {
     const res = await restartComfyUI();
 
     expect(res.stopped).toBe(true);
+    // No process of OURS was spawned here — the supervisor is what brings it back —
+    // so `started` cannot be claimed. What changed is that it may no longer be READ
+    // as the other definite answer: `startup` says which, and the sentence agrees.
     expect(res.started).toBe(false);
     expect(res.ready).toBe(false);
-    expect(res.message).toContain("did not come back within 30ms");
+    expect(res.startup).toBe("unconfirmed");
+    // ASSERT THE REASON. "did not come back" asserted a definite negative the
+    // expired budget never established — that phrasing must be gone, not merely
+    // reworded around.
+    expect(res.message).not.toMatch(/did not come back/i);
+    expect(res.message).toMatch(/NOT CONFIRMED YET/);
+    expect(res.message).toMatch(/does NOT mean it failed/i);
+    expect(res.message).toMatch(/health_check/);
+    expect(res.message).toMatch(/COMFYUI_REMOTE_REBOOT_BUDGET_S/);
     expect(hoisted.resetClient).not.toHaveBeenCalled();
   });
 

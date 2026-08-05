@@ -10,6 +10,7 @@ import {
   reconcileProbeState,
   resolveBackends,
   readInstalledPanelVersion,
+  gatherEnvCapabilities,
   type EnvCapabilities,
 } from "../../services/env-capabilities.js";
 
@@ -107,6 +108,111 @@ describe("formatEnvBlock", () => {
     expect(bare).not.toContain("comfyui-mcp ");
     expect(bare).not.toContain("panel ");
   });
+
+  // ---------------------------------------------------------------------------
+  // #846 — the version line described a moment that had passed
+  //
+  // The ENV line reported comfyui-mcp 0.48.18 while 0.49.5 was installed, because
+  // the version was read once when the orchestrator process started and then
+  // rendered forever as the current state of the machine. Every bug filed from
+  // that session carried the wrong number, and triage chased them against a build
+  // nobody was running.
+  //
+  // Both readings are separately TRUE — this process really is running the old
+  // build, and the newer one really is installed. So neither is suppressed: the
+  // running build leads (it is what the report is about) and the drift is stated.
+  // ---------------------------------------------------------------------------
+
+  it("discloses an installed version that has moved past the RUNNING one (#846)", () => {
+    const out = formatEnvBlock({
+      os: "Linux",
+      mcpVersion: "0.48.18",
+      mcpVersionInstalled: "0.49.5",
+    });
+    // The RUNNING build leads — a report generated from this session is about it.
+    expect(out).toContain("comfyui-mcp 0.48.18");
+    expect(out).toContain("RUNNING 0.48.18");
+    expect(out).toContain("0.49.5 is now installed on disk");
+    // A remedy that works from where the caller is.
+    expect(out).toContain("restart the orchestrator to load it");
+    // The newer number must never be presented as the version in use — that is the
+    // mirror-image lie, and it would re-pin bug reports to unexecuted code.
+    expect(out).not.toMatch(/comfyui-mcp 0\.49\.5/);
+  });
+
+  it("says nothing about drift when the two readings agree (#846)", () => {
+    const out = formatEnvBlock({
+      os: "Linux",
+      mcpVersion: "0.49.6",
+      mcpVersionInstalled: "0.49.6",
+    });
+    expect(out).toContain("comfyui-mcp 0.49.6");
+    expect(out).not.toMatch(/RUNNING/);
+    expect(out).not.toMatch(/installed on disk/);
+  });
+
+  it("says nothing about drift when the installed version could not be read (#846)", () => {
+    // An unread version is not evidence that nothing changed — and it is certainly
+    // not evidence that something did. Silence is the only honest output.
+    const out = formatEnvBlock({ os: "Linux", mcpVersion: "0.49.6" });
+    expect(out).toContain("comfyui-mcp 0.49.6");
+    expect(out).not.toMatch(/installed on disk/);
+    expect(out).not.toMatch(/undefined/);
+  });
+
+  it(
+    "re-reads the installed version on EVERY gather, and never caches it (#846)",
+    async () => {
+      // THE ACTUAL ROOT CAUSE, not just its rendering: the reported version was read
+      // ONCE at orchestrator startup and reused for the life of the process, so an
+      // upgrade that landed afterwards was invisible. Deleting the per-gather read
+      // must break THIS test — asserting only the formatting would leave the fix
+      // itself uncovered.
+      //
+      // Runs the real probe set (they are internally timed out and degrade to
+      // "unknown"), which is slow but is the point: it exercises the wiring end to
+      // end rather than a stub that could not go stale.
+      let onDisk: string | undefined = "0.48.18";
+      let shouldThrow = false;
+      const reads: (string | undefined)[] = [];
+      const readInstalledMcpVersion = (): string | undefined => {
+        if (shouldThrow) throw new Error("package.json unreadable");
+        reads.push(onDisk);
+        return onDisk;
+      };
+      const gather = () =>
+        gatherEnvCapabilities({
+          mcpVersion: "0.48.18",
+          readInstalledMcpVersion,
+          statsTimeoutMs: 1,
+          tritonTimeoutMs: 1,
+        });
+
+      const first = await gather();
+      expect(first.mcpVersionInstalled).toBe("0.48.18");
+      expect(formatEnvBlock(first)).not.toMatch(/installed on disk/);
+
+      // An in-place upgrade lands while this process keeps running the old build.
+      onDisk = "0.49.5";
+
+      const second = await gather();
+      expect(reads).toEqual(["0.48.18", "0.49.5"]);
+      // The RUNNING version is unchanged — this process did not hot-swap its code.
+      expect(second.mcpVersion).toBe("0.48.18");
+      // …and the drift is now visible instead of silently reported as current state.
+      expect(second.mcpVersionInstalled).toBe("0.49.5");
+      expect(formatEnvBlock(second)).toContain("0.49.5 is now installed on disk");
+
+      // A read that THROWS leaves the line silent rather than wrong: the guard is
+      // itself an operation that can fail, so it is fenced.
+      shouldThrow = true;
+      const third = await gather();
+      expect(third.mcpVersion).toBe("0.48.18");
+      expect(third.mcpVersionInstalled).toBeUndefined();
+      expect(formatEnvBlock(third)).not.toMatch(/installed on disk/);
+    },
+    60_000,
+  );
 
   it("renders ComfyUI location even when the version is unknown", () => {
     const out = formatEnvBlock({ location: "LOCAL" });

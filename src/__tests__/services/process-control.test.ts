@@ -405,8 +405,12 @@ describe("process-control startup readiness", () => {
     await vi.advanceTimersByTimeAsync(10);
     const result = await pending;
 
-    expect(result.started).toBe(false);
+    // #367: the budget expired while the launched process was STILL ALIVE, so the
+    // verdict is "not confirmed yet", not "failed". `ready` stays false — nothing
+    // answered — but the launch itself is reported as the thing that did happen.
+    expect(result.started).toBe(true);
     expect(result.ready).toBe(false);
+    expect(result.startup).toBe("unconfirmed");
     expect(result.readiness).toMatchObject({
       ready: false,
       timed_out: true,
@@ -415,7 +419,47 @@ describe("process-control startup readiness", () => {
       interval_ms: 10,
       probe_url: "http://127.0.0.1:8188/system_stats",
     });
-    expect(result.message).toMatch(/did not become ready/i);
+    expect(result.message).toMatch(/NOT CONFIRMED YET/);
+    // ASSERT THE REASON, NOT THE STATE: the whole bug was a message that read as a
+    // failure. A test that only checked "an error came back" passes either way.
+    expect(result.message).toMatch(/does NOT mean it failed/i);
+    expect(result.message).not.toMatch(/failed relaunch/i);
+    expect(result.message).not.toMatch(/ComfyUI is DOWN/);
+    // …and it must steer the caller AWAY from the destructive response.
+    expect(result.message).toMatch(/Do NOT kill it/i);
+    expect(result.message).toMatch(/health_check/);
+    expect(result.message).toMatch(/COMFYUI_STARTUP_CHECK_MAX_TRIES/);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("a launched process that DIED before the API answered is a failure, not 'not yet' (#367)", async () => {
+    // The other side of the same split. Only an OBSERVED death may produce the
+    // definite negative — and when we have one, #776's truthful DOWN report is
+    // preserved exactly.
+    vi.useFakeTimers();
+    process.env.COMFYUI_STARTUP_CHECK_INTERVAL_S = "0.01";
+    process.env.COMFYUI_STARTUP_CHECK_MAX_TRIES = "2";
+    setLaunchInfo();
+    const children = mockSpawnedChildren();
+    mockNoPortProcess();
+    const fetchMock = mockFetchOk(false);
+
+    const pending = startComfyUI();
+    // The relaunch aborts during import — the #776 shape.
+    children[0].emit("exit", 1, null);
+    await vi.advanceTimersByTimeAsync(10);
+    const result = await pending;
+
+    expect(result.started).toBe(false);
+    expect(result.ready).toBe(false);
+    expect(result.startup).toBe("failed");
+    expect(result.message).toMatch(/EXITED \(exit code 1\)/);
+    expect(result.message).toMatch(/ComfyUI is DOWN/);
+    expect(result.message).toMatch(/failed relaunch, not a slow start/i);
+    // It must NOT be softened into the unconfirmed wording — a real failure
+    // reported as "it may still be coming up" is the mirror-image lie.
+    expect(result.message).not.toMatch(/NOT CONFIRMED YET/);
+    expect(result.message).not.toMatch(/Do NOT kill it/i);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 

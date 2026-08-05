@@ -83,6 +83,8 @@ import { convertUiToApi, collectNodeTypes } from "../services/workflow-converter
 import {
   restartComfyUI,
   preflightLocalRestart,
+  readServingArgv,
+  describeArgvDrift,
   recordRestartDispatch,
   clearRestartDispatch,
   getRestartDispatchRecord,
@@ -353,7 +355,14 @@ export const __panelToolsTestHooks = {
   /** Inject a fake #742 restart preflight so reboot tests don't probe real
    *  processes/ports. null restores the live preflightLocalRestart. */
   setLocalRestartPreflight(
-    fn: (() => Promise<{ ok: boolean; reason?: string }>) | null,
+    fn:
+      | (() => Promise<{
+          ok: boolean;
+          reason?: string;
+          observedArgv?: string[];
+          isDesktopApp?: boolean;
+        }>)
+      | null,
   ): void {
     localRestartPreflightOverride = fn;
   },
@@ -968,7 +977,12 @@ let healthProbeOverride:
 /** Test injection for the #742 refuse-safe restart preflight (the real one is
  *  preflightLocalRestart in process-control). null → the live preflight. */
 let localRestartPreflightOverride:
-  | (() => Promise<{ ok: boolean; reason?: string }>)
+  | (() => Promise<{
+      ok: boolean;
+      reason?: string;
+      observedArgv?: string[];
+      isDesktopApp?: boolean;
+    }>)
   | null = null;
 
 /** Test injection for the #742 decline-probe recheck window, so tests don't
@@ -7186,6 +7200,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         const preflightBound =
           preflightHealthBase != null &&
           sameHttpBase(getComfyUIBaseUrl(), preflightHealthBase);
+        // #848: what the instance was OBSERVED running with, taken from the preflight
+        // that already had to resolve it. Nothing new is probed before the dispatch —
+        // the no-await invariant between the binding capture and the reboot stands.
+        let preflightArgv: string[] | undefined;
+        let preflightIsDesktop = false;
         // Remote and cloud are excluded for the reason they always were: there is no
         // local process to assess, and the Manager reboot is their ONLY restart path —
         // a supervised remote (the tunnelled Desktop app) restarts through it by
@@ -7224,6 +7243,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // same base, is caught.
           const preflightTargetGeneration = getComfyuiTargetGeneration();
           const preflight = await (localRestartPreflightOverride ?? preflightLocalRestart)();
+          // #848: keep the observed launch arguments. Recorded here and spent ONLY on
+          // the success path far below, where the reboot has been proven to have
+          // cycled THIS instance — it never influences any decision above.
+          preflightArgv = preflight.observedArgv;
+          preflightIsDesktop = preflight.isDesktopApp === true;
           // r8/r9/r10: the preflight AWAIT makes the pre-decision captures
           // STALE — and the preflight itself reads MUTABLE config (target URL,
           // port, COMFYUI_PATH) throughout, so a config retarget during the
@@ -7712,6 +7736,26 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // Old/lightweight contexts have no capability accessor, so preserve their historical
         // contract rather than claiming a production tab passed a check it never ran.
         const graphToolsReady = tabBack && (ctx.tabCanMutateGraph ? ctx.tabCanMutateGraph() : true);
+        // #848: WHAT THIS RESTART DID NOT DO. "It came back healthy" answers a
+        // different question from "did it come back with the launch arguments I just
+        // configured?", and a user who had edited ComfyUI Desktop's saved launch args
+        // read the first as the second — their new flag was silently absent. Compare
+        // the two readings and report only what was observed.
+        //
+        // Gated three ways, because a wrong-instance reading would be worse than no
+        // reading: the preflight must have OBSERVED a before-argv (it only runs on the
+        // bound path), and the configured target must STILL be the boot instance this
+        // reboot was proven to cycle — a retarget during the recovery wait would point
+        // getSystemStats at some other ComfyUI. Read after recovery, so a slow or
+        // missing answer costs only detail; describeArgvDrift says nothing without both.
+        let argvNote = "";
+        if (preflightArgv?.length && sameHttpBase(getComfyUIBaseUrl(), healthBase)) {
+          argvNote = describeArgvDrift(
+            preflightArgv,
+            await readServingArgv(2000),
+            preflightIsDesktop,
+          );
+        }
         return ok({
           rebooting: true,
           ready: graphToolsReady, // graph tools require a bound AND workflow-stamp-capable tab
@@ -7738,7 +7782,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               : "; ComfyUI is back but the panel tab has NOT reconnected yet (ready:false) — " +
                 'wait a moment then retry, or rebind with panel_set_workflow_target({mode:"current"}) ' +
                 "before issuing graph tools.") +
-            "."),
+            ".") + argvNote,
         });
       },
     ),

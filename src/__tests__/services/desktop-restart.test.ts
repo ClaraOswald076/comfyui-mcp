@@ -13,17 +13,14 @@ const hoisted = vi.hoisted(() => ({
   resetClient: vi.fn(),
   resetObjectInfoCache: vi.fn(),
   // argv that marks this as a Comfy Desktop install (see isDesktopApp()).
-  getSystemStats: vi.fn(async () => ({
-    system: {
-      argv: [
-        "C:\\Users\\x\\AppData\\Local\\Programs\\Comfy Desktop\\resources\\ComfyUI\\main.py",
-        "--listen",
-        "127.0.0.1",
-        "--port",
-        "8188",
-      ],
-    },
-  })),
+  desktopArgv: [
+    "C:\\Users\\x\\AppData\\Local\\Programs\\Comfy Desktop\\resources\\ComfyUI\\main.py",
+    "--listen",
+    "127.0.0.1",
+    "--port",
+    "8188",
+  ],
+  getSystemStats: vi.fn(),
   execSync: vi.fn(() => ""),
   spawn: vi.fn(),
 }));
@@ -86,7 +83,13 @@ beforeEach(() => {
   hoisted.fetchMock.mockReset();
   hoisted.resetClient.mockClear();
   hoisted.resetObjectInfoCache.mockClear();
-  hoisted.getSystemStats.mockClear();
+  // RESET, not clear: a test that installs its own implementation (the #848 argv
+  // cases below do) would otherwise leak it into every later test in this file —
+  // and a getSystemStats that throws silently un-Desktops the whole fixture.
+  hoisted.getSystemStats.mockReset();
+  hoisted.getSystemStats.mockImplementation(async () => ({
+    system: { argv: [...hoisted.desktopArgv] },
+  }));
   hoisted.spawn.mockReset();
   hoisted.execSync.mockReset();
   // Map the running Desktop server's :8188 listener to a PID so gatherProcessInfo
@@ -177,6 +180,118 @@ describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]",
     );
     expect(killed).toBe(false);
     expect(hoisted.resetClient).toHaveBeenCalledTimes(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // #848 — "it restarted" is not the answer to "did it pick up my new flag?"
+  //
+  // The reporter added `--disable-dynamic-vram` to their Desktop installation's
+  // launch arguments, restarted, and was told the restart succeeded. It had, and
+  // the flag was still absent: the server came back running exactly what it ran
+  // before. Nothing in the report distinguished those two things, so the only way
+  // to find out was to go and read /system_stats by hand.
+  // -------------------------------------------------------------------------
+
+  it("says the launch arguments are UNCHANGED across a Desktop reboot (#848)", async () => {
+    __processControlTestHooks.setRemoteRebootTimingForTests({
+      settleMs: 0,
+      budgetMs: 1000,
+      intervalMs: 5,
+    });
+    // The default getSystemStats mock returns the SAME argv before and after —
+    // which is precisely the shape #848 was filed about.
+    hoisted.fetchMock.mockImplementation(async (url: string) => {
+      const path = pathOf(url);
+      if (path === "/v2/manager/reboot") return new Response("", { status: 200 });
+      if (path === "/system_stats") {
+        return new Response(JSON.stringify({ system: {} }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    const res = await restartComfyUI();
+
+    expect(res.ready).toBe(true);
+    expect(res.message).toContain("launch arguments are UNCHANGED");
+    // The remedy has to be one the user can act on from where they are, and for a
+    // Desktop install that is the app — not a COMFYUI_PATH or a CLI they never use.
+    expect(res.message).toContain("Fully quit the ComfyUI Desktop app");
+    // It reports the OBSERVATION and stops there. Naming the mechanism (a Manager
+    // reboot re-execs the running process) would assert a cause we never observed.
+    expect(res.message).not.toMatch(/re-exec/i);
+    // And it never contradicts the restart that genuinely happened.
+    expect(res.message).toContain("came back ready");
+  });
+
+  it("says the launch arguments CHANGED when they actually did (#848)", async () => {
+    __processControlTestHooks.setRemoteRebootTimingForTests({
+      settleMs: 0,
+      budgetMs: 1000,
+      intervalMs: 5,
+    });
+    const baseArgv = hoisted.desktopArgv;
+    let rebooted = false;
+    hoisted.getSystemStats.mockImplementation(async () => ({
+      system: {
+        argv: rebooted ? [...baseArgv, "--disable-dynamic-vram"] : [...baseArgv],
+      },
+    }));
+    hoisted.fetchMock.mockImplementation(async (url: string) => {
+      const path = pathOf(url);
+      if (path === "/v2/manager/reboot") {
+        rebooted = true;
+        return new Response("", { status: 200 });
+      }
+      if (path === "/system_stats") {
+        return new Response(JSON.stringify({ system: {} }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    const res = await restartComfyUI();
+
+    expect(res.ready).toBe(true);
+    expect(res.message).toContain("launch arguments CHANGED");
+    expect(res.message).toContain("--disable-dynamic-vram");
+    // A genuine change must NOT be reported as the #848 no-op, and must not send
+    // the user off to restart an app that already did what they asked.
+    expect(res.message).not.toContain("UNCHANGED");
+    expect(res.message).not.toContain("Fully quit the ComfyUI Desktop app");
+  });
+
+  it("says NOTHING about launch arguments when the post-restart reading is missing (#848)", async () => {
+    // An unread argv is not evidence of sameness. Silence is the only honest
+    // output here — inferring "unchanged" from a failed read would manufacture the
+    // very claim the user would act on.
+    __processControlTestHooks.setRemoteRebootTimingForTests({
+      settleMs: 0,
+      budgetMs: 1000,
+      intervalMs: 5,
+    });
+    let rebooted = false;
+    hoisted.getSystemStats.mockImplementation(async () => {
+      if (rebooted) throw new Error("ECONNRESET");
+      return { system: { argv: [...hoisted.desktopArgv] } };
+    });
+    hoisted.fetchMock.mockImplementation(async (url: string) => {
+      const path = pathOf(url);
+      if (path === "/v2/manager/reboot") {
+        rebooted = true;
+        return new Response("", { status: 200 });
+      }
+      if (path === "/system_stats") {
+        return new Response(JSON.stringify({ system: {} }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    const res = await restartComfyUI();
+
+    expect(res.ready).toBe(true);
+    expect(res.message).not.toMatch(/launch arguments/i);
+    // The restart itself is still reported — a missing extra detail must not
+    // degrade the verdict about the thing that did happen.
+    expect(res.message).toContain("came back ready");
   });
 
   it("refuses without killing when the Manager reboot cannot be fired (403)", async () => {
