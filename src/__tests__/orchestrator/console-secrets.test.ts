@@ -19,6 +19,9 @@ const fsState = vi.hoisted(() => ({
    *  rename because a test does its setup writes through the same endpoint, and
    *  a break armed by a flag alone fires on the setup instead. */
   breakFirstReadAfterRenameNo: null as number | null,
+  /** Break read #`read` after store-rename #`rename` — the general form, for a
+   *  request that does its own setup writes through the same endpoint. */
+  breakReadAfterRename: null as null | { rename: number; read: number },
   readsSinceRename: 0,
   /** Only count reads once a rename has actually happened — a read taken BEFORE
    *  the store was ever swapped is not the post-rename verification. */
@@ -53,9 +56,21 @@ vi.mock("node:fs", async (importOriginal) => {
     const breakFirstNow =
       fsState.breakFirstReadAfterRenameNo !== null &&
       fsState.renames === fsState.breakFirstReadAfterRenameNo;
-    if (fsState.sawRename && (fsState.breakSecondReadAfterRename || breakFirstNow) && isStore(args[0])) {
+    const targeted =
+      fsState.breakReadAfterRename !== null &&
+      fsState.renames === fsState.breakReadAfterRename.rename;
+    if (
+      fsState.sawRename &&
+      (fsState.breakSecondReadAfterRename || breakFirstNow || targeted) &&
+      isStore(args[0])
+    ) {
       fsState.readsSinceRename++;
-      if (fsState.readsSinceRename === (breakFirstNow ? 1 : 2)) {
+      const breakAt = targeted
+        ? fsState.breakReadAfterRename!.read
+        : breakFirstNow
+          ? 1
+          : 2;
+      if (fsState.readsSinceRename === breakAt) {
         throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
       }
     }
@@ -75,6 +90,7 @@ describe("console /api/secrets", () => {
   beforeEach(async () => {
     fsState.breakSecondReadAfterRename = false;
     fsState.breakFirstReadAfterRenameNo = null;
+    fsState.breakReadAfterRename = null;
     fsState.sawRename = false;
     fsState.renames = 0;
     fsState.readsSinceRename = 0;
@@ -93,6 +109,7 @@ describe("console /api/secrets", () => {
     await srv.stop();
     fsState.breakSecondReadAfterRename = false;
     fsState.breakFirstReadAfterRenameNo = null;
+    fsState.breakReadAfterRename = null;
     fsState.sawRename = false;
     fsState.renames = 0;
     fsState.readsSinceRename = 0;
@@ -228,6 +245,33 @@ describe("console /api/secrets", () => {
     expect(JSON.stringify(body)).not.toContain("civ_key_to_revoke");
   });
 
+  it("does not answer ok:true when the revoke's END STATE is unknown", async () => {
+    // The warning said the end state was UNKNOWN while the success flag next to
+    // it said the revoke worked — and a consumer reads the flag (codex gate).
+    // `cleared` still reports that the removal happened, so this stays a
+    // disclosure and nobody is invited to retry a completed operation.
+    await fetch(`${base()}/api/secrets?token=${TOKEN}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ slot: "civitai", value: "civ_key_to_revoke" }),
+    });
+    // Break the read `slotRevokeState` uses — read #2 after the REVOKE's rename
+    // (#1 is the writer's own whole-file verification; the save above was
+    // store-rename #1, so the revoke is #2).
+    fsState.breakReadAfterRename = { rename: 2, read: 2 };
+    const r = await fetch(`${base()}/api/secrets?token=${TOKEN}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ slot: "civitai", clear: true }),
+    });
+    fsState.breakReadAfterRename = null;
+    const body = await r.json();
+    // We really are in the unknown-end-state branch (never assert vacuously).
+    expect(body.still_resolves).toBeNull();
+    expect(String(body.warning)).toMatch(/UNKNOWN/);
+    expect(body.ok).toBe(false); // the flag agrees with the warning
+    expect(body.cleared).toBe(true); // ...and still says the removal happened
+    expect(JSON.stringify(body)).not.toContain("civ_key_to_revoke");
+  });
+
   it("clears a set slot with clear:true (issue #203) — removes all alias keys", async () => {
     // set → confirm set → clear → confirm gone
     await fetch(`${base()}/api/secrets?token=${TOKEN}`, {
@@ -282,6 +326,7 @@ describe("console /api/secrets", () => {
     const body = await r.json();
     fsState.breakSecondReadAfterRename = false;
     fsState.breakFirstReadAfterRenameNo = null;
+    fsState.breakReadAfterRename = null;
     fsState.sawRename = false;
     fsState.renames = 0;
     fsState.readsSinceRename = 0;

@@ -25,6 +25,9 @@ const fsState = vi.hoisted(() => ({
   /** Make the rename fail, as a crash/full-disk would, AFTER the temp file was
    *  written — the moment the old in-place write had already truncated. */
   failRename: false,
+  /** Fail only the Nth store rename (1-based) — so one alias of a slot fan-out
+   *  can be made to throw while an earlier one has already landed. */
+  failRenameAt: 0,
   /** Simulate another process writing the store between our first read and the
    *  compare-and-swap re-read, which is the window the CAS exists to close.
    *  Fires immediately BEFORE the given store-read index. */
@@ -70,6 +73,12 @@ const fsState = vi.hoisted(() => ({
   storeExists: 0,
   /** Source paths the pre-write snapshot was linked FROM. */
   links: [] as string[],
+  /** Make writing the LEGACY json store fail — it happens after the .env
+   *  removal has already landed. */
+  failJsonStoreWrite: false,
+  /** Make writeSync accept only this many bytes per call (0 = unlimited), so a
+   *  SHORT write is testable: an unchecked one installs a truncated store. */
+  maxWriteBytes: 0,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -78,7 +87,7 @@ vi.mock("node:fs", async (importOriginal) => {
   const renameSync: typeof actual.renameSync = (from, to) => {
     if (isStore(to)) {
       fsState.renames++;
-      if (fsState.failRename) {
+      if (fsState.failRename || fsState.renames === fsState.failRenameAt) {
         throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
       }
       const tamper = fsState.tamperOnRename ?? fsState.tamperAtRename[fsState.renames];
@@ -151,6 +160,21 @@ vi.mock("node:fs", async (importOriginal) => {
     }
     return actual.fsyncSync(fd);
   };
+  const writeSync = ((fd: number, ...rest: unknown[]) => {
+    const path = fdPaths.get(fd) ?? "";
+    if (fsState.failJsonStoreWrite && path.includes("panel-secrets.json")) {
+      throw Object.assign(new Error("EACCES: permission denied, write"), { code: "EACCES" });
+    }
+    // Short write: accept only part of what was offered, exactly as a real
+    // filesystem is allowed to. An unchecked caller then fsyncs and renames a
+    // TRUNCATED file over the store.
+    if (fsState.maxWriteBytes > 0 && Buffer.isBuffer(rest[0])) {
+      const [buf, offset, length] = rest as [Buffer, number, number];
+      const take = Math.min(length, fsState.maxWriteBytes);
+      return (actual.writeSync as (...a: unknown[]) => number)(fd, buf, offset, take);
+    }
+    return (actual.writeSync as (...a: unknown[]) => number)(fd, ...rest);
+  }) as typeof actual.writeSync;
   const linkSync: typeof actual.linkSync = (from, to) => {
     if (isStore(from)) fsState.links.push(String(from));
     return actual.linkSync(from, to);
@@ -185,6 +209,7 @@ vi.mock("node:fs", async (importOriginal) => {
       rmSync,
       existsSync,
       linkSync,
+      writeSync,
     },
     renameSync,
     writeFileSync: writeFileSyncSpy,
@@ -194,6 +219,7 @@ vi.mock("node:fs", async (importOriginal) => {
     rmSync,
     existsSync,
     linkSync,
+    writeSync,
   };
 });
 
@@ -216,6 +242,7 @@ const POPULATED = "# my credentials\nRUNPOD_API_KEY=rp-keep-me\nHF_TOKEN=hf-keep
 
 beforeEach(() => {
   fsState.failRename = false;
+  fsState.failRenameAt = 0;
   fsState.concurrentWriteBeforeRead = null;
   fsState.concurrentWriteAfterRead = null;
   fsState.tamperOnRename = null;
@@ -231,6 +258,8 @@ beforeEach(() => {
   fsState.concurrentCreateAfterExists = null;
   fsState.storeExists = 0;
   fsState.links = [];
+  fsState.failJsonStoreWrite = false;
+  fsState.maxWriteBytes = 0;
   fsState.readsSinceRename = -1;
   dir = mkdtempSync(join(tmpdir(), "cmcp-atomic-"));
   envPath = join(dir, ".env");
@@ -276,6 +305,25 @@ describe("the credential store is written ATOMICALLY", () => {
     const after = parseEnvFile()!;
     expect(after.RUNPOD_API_KEY).toBe("rp-keep-me");
     expect(after.HF_TOKEN).toBe("hf-keep-me");
+  });
+
+  it("writes EVERY byte — a short write never becomes the installed store", () => {
+    // `writeSync` is allowed to write fewer bytes than it was given, and its
+    // return value was ignored. A short write followed by an fsync makes a
+    // TRUNCATED temp file durable, and the rename then installs it over the
+    // store — the whole-file truncation this atomic write exists to prevent,
+    // arriving by the one route nobody was checking (codex gate).
+    writeFileSync(envPath, POPULATED, { mode: 0o600 });
+    fsState.maxWriteBytes = 7; // every write is chopped to 7 bytes
+    const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new-and-fairly-long-value");
+    fsState.maxWriteBytes = 0;
+    expect(r.persisted).toBe("yes");
+    const after = parseEnvFile()!;
+    expect(after.CIVITAI_API_TOKEN).toBe("civ-new-and-fairly-long-value");
+    // Nothing was silently dropped off the end.
+    expect(after.RUNPOD_API_KEY).toBe("rp-keep-me");
+    expect(after.HF_TOKEN).toBe("hf-keep-me");
+    expect(readFileSync(envPath, "utf-8")).toContain("# my credentials");
   });
 
   it("leaves no temp files behind when the write fails", () => {
@@ -511,6 +559,29 @@ describe("a ROLLBACK is a store write too, and reports what it cost", () => {
     expect(outcome.lostKeys).toContain("RUNPOD_API_KEY");
     expect(parseEnvFile()!.RUNPOD_API_KEY).toBeUndefined(); // it really is gone
   });
+
+  it("does not let the RETHROW swallow what the rollback destroyed", () => {
+    // When a per-key write THROWS, the slot rolls back and rethrows the original
+    // reason — correct, the caller's value is not in place. But the rollback is
+    // itself a store write, and its damage was collected and then discarded at
+    // exactly that rethrow, so a destroyed credential vanished behind an
+    // unrelated ENOSPC (codex gate).
+    writeFileSync(envPath, "RUNPOD_API_KEY=rp-keep-me\n", { mode: 0o600 });
+    fsState.failRenameAt = 2; // HF_TOKEN lands; HUGGINGFACE_TOKEN cannot
+    fsState.tamperAtRename[3] = () => "# the rollback ate it\n"; // ...and the rollback loses RunPod
+    let message = "";
+    try {
+      setPanelSecret("huggingface", "hf-new");
+      throw new Error("expected setPanelSecret to rethrow");
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    }
+    fsState.failRenameAt = 0;
+    expect(message).toMatch(/ENOSPC/); // the original reason survives...
+    expect(message).toMatch(/also lost RUNPOD_API_KEY/); // ...and so does the damage
+    expect(parseEnvFile()!.RUNPOD_API_KEY).toBeUndefined();
+    expect(message).not.toContain("hf-new"); // never a value
+  });
 });
 
 describe("the boot MIGRATION does not swallow what its write cost", () => {
@@ -539,6 +610,32 @@ describe("the boot MIGRATION does not swallow what its write cost", () => {
       warn.mockRestore();
       delete process.env.CIVITAI_API_TOKEN;
     }
+  });
+});
+
+describe("a completed REVOKE is never turned back into a refusal", () => {
+  it("DISCLOSES a legacy-store purge that failed instead of throwing over the revoke", () => {
+    // The legacy JSON purge runs AFTER the .env removal has landed. A throw
+    // there made the console answer a generic failure with no `cleared` and no
+    // "do not retry" — a completed destructive operation presented as a refusal
+    // (codex gate). And the specific consequence matters: an unpurged legacy
+    // entry means the boot migration puts the credential BACK.
+    writeFileSync(envPath, "CIVITAI_API_TOKEN=civ-old\n", { mode: 0o600 });
+    writeFileSync(
+      join(dir, "panel-secrets.json"),
+      JSON.stringify({ comfyuiEnv: { CIVITAI_API_TOKEN: "civ-legacy" } }),
+    );
+    fsState.failJsonStoreWrite = true;
+    let out: ReturnType<typeof removeComfyuiSecret> | undefined;
+    expect(() => {
+      out = removeComfyuiSecret("CIVITAI_API_TOKEN");
+    }).not.toThrow();
+    fsState.failJsonStoreWrite = false;
+    expect(out!.changed).toBe(true); // the revoke HAPPENED
+    expect(parseEnvFile()!.CIVITAI_API_TOKEN).toBeUndefined();
+    // ...and the thing the user actually needs to know is stated.
+    expect(out!.resurrectionRisk).toMatch(/COMES BACK on the next start/);
+    expect(out!.resurrectionRisk).not.toContain("civ-legacy"); // never a value
   });
 });
 

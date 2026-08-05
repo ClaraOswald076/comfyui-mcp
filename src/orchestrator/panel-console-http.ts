@@ -469,8 +469,14 @@ export function startPanelConsoleHttpServer(opts: {
               // The store could not be read, so we cannot say the credential is
               // gone: a tool process that CAN read it may still find the old
               // value there. Report the uncertainty instead of either verdict.
-              sendJson(res, 200, {
-                ok: true,
+              //
+              // `ok:false`, deliberately. The warning below said the end state
+              // was UNKNOWN while the success flag next to it said the revoke
+              // worked — and a consumer reads the flag (codex gate). This is a
+              // DISCLOSURE, not a refusal: `cleared` still reports that the
+              // removal happened, so nobody is invited to retry it.
+              sendJson(res, 500, {
+                ok: false,
                 slot,
                 cleared: removed,
                 still_resolves: null,
@@ -564,6 +570,9 @@ export function startPanelConsoleHttpServer(opts: {
               ...(unverifiedSave.length ? { unverified_keys: unverifiedSave.map((u) => u.key) } : {}),
               ...(stranded.length ? { stranded_keys: stranded } : {}),
               ...(unverifiedRestore.length ? { unverified_restore_keys: unverifiedRestore } : {}),
+              // What the ROLLBACK's own writes cost — a rollback is a store
+              // write the user never asked for, and it was reported nowhere.
+              ...(outcome.restoreWarnings?.length ? { warnings: outcome.restoreWarnings } : {}),
               ...(failed.length
                 ? {
                     error:
@@ -591,7 +600,13 @@ export function startPanelConsoleHttpServer(opts: {
           // the rewrite dropped, or a write that could not be made crash-durable.
           // Built from the one shared list, so a new obligation on the receipt
           // reaches this endpoint without anyone remembering to wire it up here.
-          const warnings = outcome.receipts.flatMap((r) => receiptDisclosures(r));
+          const warnings = [
+            ...outcome.receipts.flatMap((r) => receiptDisclosures(r)),
+            // A confirmed slot save performs no rollback, so this is normally
+            // empty — but it is included from the same place either way, so the
+            // rollback's own costs can never be the field nobody rendered.
+            ...(outcome.restoreWarnings ?? []),
+          ];
           sendJson(res, 200, {
             ok: true,
             slot,
