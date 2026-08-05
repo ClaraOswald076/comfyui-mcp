@@ -48,12 +48,22 @@ export function suspectScenarioLines(data) {
       if (!r) continue;
       // Only a SELECTION failure counts: a run that reached a primary/partial
       // tool and still failed lost on execution or verification, not on tool
-      // choice — its other tool calls prove nothing about descriptions.
-      const tried = r.attemptedTools ?? r.okTools ?? [];
-      if (r.score === 0 && !tried.some((t) => rightTools.has(t))) failed.push(r);
+      // choice — its other tool calls prove nothing about descriptions. And
+      // only runs that RECORD attempts qualify: legacy results carry okTools
+      // (successes only), so a legacy fail that tried the right tool and
+      // watched it error looks identical to one that never selected it —
+      // reading okTools as attempts would flag that as a wrong selection.
+      if (
+        r.score === 0 &&
+        Array.isArray(r.attemptedTools) &&
+        !r.attemptedTools.some((t) => rightTools.has(t))
+      ) {
+        failed.push(r);
+      }
       // Only a full PASS vindicates a tool: a PARTIAL is right-family but
       // incomplete — its tool use proves nothing about the selection being
-      // right, so it must not suppress a suspect flag.
+      // right, so it must not suppress a suspect flag. (okTools suffices here:
+      // a tool in a passing run's successes genuinely ran.)
       if (r.score === 2) passed.push(r);
     }
     if (failed.length < 2) continue;

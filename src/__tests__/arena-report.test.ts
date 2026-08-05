@@ -124,6 +124,18 @@ describe("arena-report (#792)", () => {
     };
     expect(suspectScenarioLines(withPasser)).toHaveLength(0);
 
+    // legacy entries record only okTools (successes) — a legacy fail that TRIED
+    // the right tool reads as "never selected it" if okTools stand in for
+    // attempts, so they must not count as selection failures at all
+    const legacyOkToolsOnly = {
+      ...data,
+      leaderboard: [
+        entry({ model: "a", results: [{ ...result({ score: 0 }), attemptedTools: undefined, okTools: ["panel_screenshot"] }] }),
+        entry({ model: "b", results: [{ ...result({ score: 0 }), attemptedTools: undefined, okTools: ["panel_screenshot"] }] }),
+      ],
+    };
+    expect(suspectScenarioLines(legacyOkToolsOnly)).toHaveLength(0);
+
     // "?" (an unparseable call_tool from an older run) is not a real selection
     const questionMarks = {
       ...data,
