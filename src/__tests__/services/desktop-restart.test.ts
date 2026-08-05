@@ -364,13 +364,15 @@ describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]",
     expect(res.message).toContain("ComfyUI is healthy now");
   });
 
-  it("says NOTHING about launch arguments when the target moved BEFORE the reboot (#848)", async () => {
-    // The "before" argv is read by acquireProcessInfo, which runs EARLIER than the
-    // reboot helper. Capturing the fence inside that helper covered only the window
-    // it could see — a retarget between the reading and the helper left the before
-    // argv belonging to A and everything after to B, with no generation change left
-    // for the check to notice (codex gate round 2). The generation now travels WITH
-    // the reading, so this is caught.
+  it("REFUSES, without dispatching, when the target moved while the instance was identified", async () => {
+    // A retarget landing inside `acquireProcessInfo`'s await leaves `info` describing
+    // instance A while the config — which the Manager reboot's base URL and the
+    // relaunch port both read LIVE — points at B. Every assessment that would
+    // authorize the stop was about A, so sending it is the #368/#814 lost server by
+    // another route (codex gate round 11).
+    //
+    // This case used to be covered only as "the argv note is suppressed"; suppressing
+    // a sentence was never the guarantee that mattered.
     __processControlTestHooks.setRemoteRebootTimingForTests({
       settleMs: 0,
       budgetMs: 1000,
@@ -378,8 +380,7 @@ describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]",
     });
     let statsReads = 0;
     hoisted.getSystemStats.mockImplementation(async () => {
-      // The FIRST read is acquireProcessInfo's; a retarget lands right after it,
-      // before the reboot helper would have captured a generation of its own.
+      // The FIRST read is acquireProcessInfo's; the retarget lands during it.
       statsReads += 1;
       if (statsReads === 1) hoisted.targetGeneration.value += 1;
       return { system: { argv: [...hoisted.desktopArgv] } };
@@ -395,9 +396,21 @@ describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]",
 
     const res = await restartComfyUI();
 
-    expect(res.ready).toBe(true);
-    expect(res.message).not.toMatch(/launch arguments/i);
-    expect(res.message).toContain("ComfyUI is healthy now");
+    expect(res.stopped).toBe(false);
+    expect(res.started).toBe(false);
+    expect(res.startup).toBe("not-attempted");
+    expect(res.message).toMatch(/Refusing to restart/i);
+    expect(res.message).toMatch(/target changed while the running instance was being identified/i);
+    expect(res.message).toMatch(/Nothing was stopped/i);
+    // REFUSE BEFORE: no reboot may have been dispatched, and nothing killed.
+    expect(findCall((p) => p === "/v2/manager/reboot")).toBeUndefined();
+    expect(hoisted.spawn).not.toHaveBeenCalled();
+    const killed = hoisted.execSync.mock.calls.some(([c]: [string]) =>
+      /taskkill|\bkill\b|pkill/i.test(c),
+    );
+    expect(killed).toBe(false);
+    // …and the user is handed the command to start it by hand.
+    expect(res.restart_hint).toBeDefined();
   });
 
   it("refuses without killing when the Manager reboot cannot be fired (403)", async () => {

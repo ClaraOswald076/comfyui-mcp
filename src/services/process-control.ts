@@ -2930,9 +2930,15 @@ const REBOOT_ROUTES: ReadonlyArray<{ path: string; method: "POST" | "GET" }> = [
 ];
 
 /**
- * A dropped/aborted connection is the SUCCESS signal for a reboot: the Manager
- * handler calls exit(0) the instant it accepts the request, so the origin dies
- * before it can send an HTTP response and `fetch` rejects.
+ * A dropped/aborted connection is the signal this path READS AS a fired reboot: the
+ * Manager handler calls exit(0) the instant it accepts the request, so the origin
+ * dies before it can send an HTTP response and `fetch` rejects.
+ *
+ * It is an INFERENCE, not a success signal (codex gate round 11 — this contract
+ * still said "SUCCESS" after the code and the messages had stopped treating it as
+ * one). The same drop is produced by a tunnel or a network blip in front of a server
+ * that was never rebooted, which is why the caller marks it `acked: false` and the
+ * report says the request was not acknowledged.
  */
 function isConnectionDrop(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
@@ -3334,6 +3340,36 @@ export async function restartComfyUI(): Promise<RestartResult> {
       message:
         diagnostic ??
         `No ComfyUI process found on port ${config.resolvedPort} to restart. Is ComfyUI running?`,
+      listener_ownership: unclassifiedOwnership(),
+    };
+  }
+  // NEVER STOP AN INSTANCE THE REST OF THIS CALL WILL NOT BE ACTING ON (codex gate
+  // round 11). `acquireProcessInfo` is awaited, and the target is MUTABLE: a hello
+  // retarget landing inside that await leaves `info` describing instance A while the
+  // config — which `stopComfyUI`'s port waits, the Manager reboot's base URL, and
+  // `startComfyUI`'s relaunch port all read LIVE — now points at B.
+  //
+  // The loss is concrete and is the #368/#814 shape again: A is killed from its
+  // already-resolved pid, then the relaunch consults B's port, finds it occupied,
+  // and returns "already running" without spawning anything. A is down, nothing
+  // brings it back, and every assessment that authorized the stop was about A.
+  //
+  // Judged by the monotonic GENERATION captured before the resolve, so a retarget
+  // that lands mid-await is caught and an A→B→A round trip cannot slip through a
+  // final-state comparison. REFUSE, because nothing has been stopped yet — the
+  // refuse-before/disclose-after rule this whole path is built on.
+  if (getComfyuiTargetGeneration() !== infoGeneration) {
+    return {
+      stopped: false,
+      started: false,
+      startup: "not-attempted",
+      restart_hint: recoveryHint(info),
+      message:
+        "Refusing to restart: the ComfyUI target changed while the running instance was " +
+        "being identified, so the instance that was checked is not provably the one this " +
+        "restart would act on — and a stop is never sent to an instance whose relaunch was " +
+        "not the one verified. Nothing was stopped. Let the target settle, then retry." +
+        describeRecovery(recoveryHint(info)),
       listener_ownership: unclassifiedOwnership(),
     };
   }
