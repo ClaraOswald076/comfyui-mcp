@@ -873,6 +873,22 @@ describe("models dir — corroborating a data-dir base by the server's own inven
     await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(/escapes/);
   });
 
+  it("accepts an ordinary filename that merely STARTS with two dots", async () => {
+    // `relative()` returns "..model.safetensors" for a file sitting right inside the
+    // directory, and a bare startsWith("..") called that an escape. The result was a
+    // refusal of the exact Docker download this check exists to allow — over-strict is
+    // the same defect as over-permissive, pointed the other way.
+    dockerServer();
+    serverInventory = { diffusion_models: ["..model.safetensors", "sub/..other.gguf"] };
+    onDisk([
+      join(DATA_DIR, "models", "diffusion_models", "..model.safetensors"),
+      join(DATA_DIR, "models", "diffusion_models", "sub/..other.gguf"),
+    ]);
+
+    const res = await resolveModelsDirWithBases({ targetCategory: "diffusion_models" });
+    expect(res.source).toBe("base-inventory-corroborated");
+  });
+
   it("does not accept a DIRECTORY as one of the server's model files", async () => {
     // `existsSync` is true for a directory, so a folder with a model-like name would
     // have corroborated a base that holds none of the actual files.
