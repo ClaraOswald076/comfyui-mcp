@@ -256,6 +256,163 @@ describe("compact mode over a real MCP client/server pair", () => {
     expect(text).not.toContain("removed in");
   });
 
+  // #804 in miniature: a tool the caller could not SEE must not be narrated as a
+  // tool that does not EXIST. panel_* names are served by the orchestrator's
+  // per-tab surface, never by this catalog, so this catalog's silence about them
+  // is evidence about the SURFACE, not about the tool. Our own prose walks callers
+  // into this (visualize_workflow's description points at panel_graph_outline; the
+  // bundled debug-render / director skills name panel_* tools), and an outside MCP
+  // client reading it holds none of them.
+  describe("a panel_* name is answered as a wrong-surface fact, not as non-existence (#804)", () => {
+    it("names the panel surface, and gives a remedy for BOTH surfaces the caller might hold", async () => {
+      const client = await compactPair(fakeCatalog());
+      const res = (await client.callTool({
+        name: "call_tool",
+        arguments: { name: "panel_graph_outline" },
+      })) as { isError?: boolean };
+      expect(res.isError).toBe(true);
+      const text = textOf(res as never);
+      // Scoped to THIS server, and explicit that it is answering a different
+      // question than "does this tool exist".
+      expect(text).toMatch(/in THIS server.s call_tool catalog/);
+      expect(text).toMatch(/says nothing about whether 'panel_graph_outline' exists/);
+      expect(text).toMatch(/ComfyUI sidebar panel's own per-tab MCP server/);
+      // Refuses to pick between the two states it cannot observe, and defers to
+      // the one source that can settle it — the caller's own tool list.
+      expect(text).toMatch(/cannot see what else your client holds/);
+      expect(text).toMatch(/check the tool list your client gave you/);
+      // Each state gets a remedy reachable FROM that state...
+      expect(text).toMatch(/panel_graph_outline, or a panel router such as panel_call_tool/);
+      expect(text).toMatch(/\bget_workflow\b/);
+      // ...and neither prescribes a CALL FORM we cannot see: the Ollama backend
+      // fronts the panel with a three-tool router, so an unconditional "call it
+      // directly" would be wrong advice on a host that genuinely has the canvas.
+      expect(text).not.toMatch(/call panel_graph_outline DIRECTLY/);
+      // The sidebar fallback carries its condition — the pi backend has no MCP
+      // client, so "the Agent tab has these tools" is not true everywhere.
+      expect(text).toMatch(/on a backend that has ComfyUI tools/);
+      // The bare unknown-name path must not also fire — "Did you mean" here would
+      // offer a same-server near-miss for a name that was never a same-server tool.
+      expect(text).not.toContain("Did you mean");
+    });
+
+    it("claims nothing about whether the name is a real panel tool", async () => {
+      // A typo reaches this branch too. The namespace fact is true of it; "it
+      // exists on the other surface" is not, so the message must not say so.
+      const client = await compactPair(fakeCatalog());
+      const res = (await client.callTool({
+        name: "call_tool",
+        arguments: { name: "panel_not_a_real_tool_xyz" },
+      })) as { isError?: boolean };
+      const text = textOf(res as never);
+      expect(text).toMatch(/says nothing about whether 'panel_not_a_real_tool_xyz' exists/);
+      // Conditional on the caller's list containing it, never asserted outright.
+      expect(text).toMatch(/If it offers panel_not_a_real_tool_xyz/);
+    });
+
+    it("applies through a client's mcp__<server>__ namespacing", async () => {
+      const client = await compactPair(fakeCatalog());
+      const res = (await client.callTool({
+        name: "call_tool",
+        arguments: { name: "mcp__comfyui__panel_query_graph" },
+      })) as { isError?: boolean };
+      expect(res.isError).toBe(true);
+      expect(textOf(res as never)).toMatch(/in THIS server.s call_tool catalog/);
+    });
+
+    it("describe_tool answers identically (one message, both entry points)", async () => {
+      const client = await compactPair(fakeCatalog());
+      const res = (await client.callTool({
+        name: "describe_tool",
+        arguments: { name: "panel_set_widget" },
+      })) as { isError?: boolean };
+      expect(res.isError).toBe(true);
+      expect(textOf(res as never)).toMatch(/in THIS server.s call_tool catalog/);
+    });
+
+    it("a RETIRED panel name keeps its named replacement instead", async () => {
+      // panel_get_graph is in the retirement ledger. "Ask the panel agent" would
+      // dead-end there too — the ledger's answer (call panel_query_graph) is the
+      // one that actually resolves, so retirement has to win the ordering.
+      const client = await compactPair(fakeCatalog());
+      const res = (await client.callTool({
+        name: "call_tool",
+        arguments: { name: "panel_get_graph" },
+      })) as { isError?: boolean };
+      expect(res.isError).toBe(true);
+      const text = textOf(res as never);
+      expect(text).toContain("panel_query_graph");
+      expect(text).not.toMatch(/in THIS server.s call_tool catalog/);
+    });
+
+    it("never shadows a real same-server tool that happens to start with panel_", async () => {
+      // An autoloaded workflow file is registered under its slugified filename, so
+      // `panel_custom.json` genuinely is a `panel_custom` tool on THIS server. The
+      // namespace branch runs only after catalog.get() misses, so that tool must
+      // still dispatch normally rather than be talked about as someone else's.
+      const catalog = fakeCatalog();
+      catalog.setCategory("saved-workflows");
+      catalog
+        .asRegistrar()
+        .tool("panel_custom", "An autoloaded workflow whose filename slugified to panel_custom.", {}, async () => ({
+          content: [{ type: "text" as const, text: "ran the autoloaded workflow" }],
+        }));
+      const client = await compactPair(catalog);
+      const res = (await client.callTool({
+        name: "call_tool",
+        arguments: { name: "panel_custom" },
+      })) as { isError?: boolean };
+      expect(res.isError).not.toBe(true);
+      expect(textOf(res as never)).toBe("ran the autoloaded workflow");
+
+      // ...and the same tool reached under a client's namespacing misses the exact
+      // catalog lookup, so it lands in the unknown-name path. It must NOT be told
+      // the prefix belongs to another server — that is a tool this server serves.
+      const ns = (await client.callTool({
+        name: "call_tool",
+        arguments: { name: "mcp__comfyui__panel_custom" },
+      })) as { isError?: boolean };
+      const nsText = textOf(ns as never);
+      expect(nsText).not.toMatch(/live-canvas surface/);
+      expect(nsText).toContain("Did you mean");
+      expect(nsText).toContain("panel_custom");
+
+      // ...and a DIFFERENT panel_ name against this same catalog must not claim the
+      // prefix is "not this server's to serve" — that catalog demonstrably serves
+      // one. The ownership sentence is derived from the catalog, so it names what is
+      // really there and says only that the requested name is not among it.
+      const other = (await client.callTool({
+        name: "call_tool",
+        arguments: { name: "panel_typo" },
+      })) as { isError?: boolean };
+      const otherText = textOf(other as never);
+      expect(otherText).toContain("This catalog does hold 1 name(s) under `panel_`");
+      expect(otherText).toContain("panel_custom");
+      expect(otherText).toContain("'panel_typo' is not among them");
+      expect(otherText).not.toMatch(/holds no `panel_` names at all/);
+    });
+
+    it("says it serves no panel_ names only when the catalog really has none", async () => {
+      const client = await compactPair(fakeCatalog());
+      const res = (await client.callTool({
+        name: "call_tool",
+        arguments: { name: "panel_graph_outline" },
+      })) as { isError?: boolean };
+      expect(textOf(res as never)).toContain("This catalog holds no `panel_` names at all");
+    });
+
+    it("leaves a non-panel unknown name on the fuzzy path", async () => {
+      const client = await compactPair(fakeCatalog());
+      const res = (await client.callTool({
+        name: "call_tool",
+        arguments: { name: "gen" },
+      })) as { isError?: boolean };
+      const text = textOf(res as never);
+      expect(text).toContain("Did you mean");
+      expect(text).not.toMatch(/in THIS server.s call_tool catalog/);
+    });
+  });
+
   it("call_tool converts handler throws into isError results", async () => {
     const client = await compactPair(fakeCatalog());
     const res = (await client.callTool({

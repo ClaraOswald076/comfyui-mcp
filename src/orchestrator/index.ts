@@ -232,6 +232,67 @@ const PI_CAPABILITY_OVERRIDE = `
 You are running on the pi (pi.dev) backend, which has NO ComfyUI tools. Disregard every instruction above about panel_* tools (panel_graph_outline, panel_query_graph, panel_add_node, panel_connect, panel_set_widget, panel_run, panel_save_workflow, panel_install_node, panel_free_vram, …) and the headless comfyui tools (generate_image, enqueue_workflow, list_packs, apply_manifest, read_skill, …): NONE of them exist in your runtime. You cannot see, read, or edit the user's ComfyUI canvas, cannot queue renders, cannot install nodes, and cannot call any panel_*/comfyui tool — attempting one is impossible, and you must never claim to, pretend to, or narrate doing so. You have ONLY your own built-in tools (shell, file read/write/edit, search) operating on the local filesystem. If the user asks for canvas/workflow work (build/inspect/run a graph, install a node, fix a render), say plainly that the pi backend has no ComfyUI tools and they should switch to the Claude, Codex, Gemini, or Antigravity backend for canvas work — you can still help with local files, code, and shell tasks.`;
 
 /**
+ * Appended when the loopback panel HTTP MCP FAILED TO BIND, for every backend that
+ * would otherwise have been handed it.
+ *
+ * PANEL_SYSTEM_APPEND tells the agent it can see and edit the canvas through
+ * panel_* tools. That is true only when `panelMcpHttp` came up: those tools reach
+ * an HTTP-lane backend through exactly one server, and when the bind fails
+ * makeHttpBackendMcpServers() simply omits it. The prompt was left claiming them
+ * anyway, so the model was told it held a toolset it demonstrably did not — and
+ * models improvise, which the user reads as the panel being broken.
+ *
+ * This is #804's shape (a capability we cannot deliver, asserted as available) with
+ * one crucial difference that makes it worth fixing here rather than documenting:
+ * **we observed it**. Most of that cluster is hard because a client-side permission
+ * block never reaches us. A failed bind is our own return value. Saying so is a
+ * claim we are entitled to make.
+ *
+ * Narrower than PI_CAPABILITY_OVERRIDE, and deliberately so: pi has no MCP client at
+ * all, whereas a failed panel bind removes only the live-canvas surface. Telling the
+ * agent it had lost the rest would be the same defect pointing the other way.
+ *
+ * But narrow is not the same as making the OPPOSITE claim, which two earlier drafts
+ * did. They said the headless tools were "UNAFFECTED and still work" and that
+ * restarting the orchestrator "restores" the canvas ones. A failed panel bind
+ * establishes neither: the stdio child is a separate connection that can fail on its
+ * own, and a bind failure whose cause persists (the port simply stays occupied)
+ * survives a restart. So this says what was observed — the panel server did not
+ * start — and then explicitly declines to speak for the other server or for the
+ * future. Retracting one false capability claim while attaching two new ones is the
+ * defect this whole change exists to remove, wearing the fix's clothes.
+ */
+const NO_PANEL_TOOLS_OVERRIDE = `
+
+=== CAPABILITY CORRECTION — READ THIS, IT SUPERSEDES THE ABOVE ===
+The live-canvas tools are NOT available in this session. The loopback panel MCP server failed to start, so no panel_* tool (panel_graph_outline, panel_query_graph, panel_add_node, panel_connect, panel_set_widget, panel_run, panel_save_workflow, …) exists in your runtime this run. Disregard every instruction above about reading or editing the user's open canvas: you cannot see it, cannot change it, and must never claim to, pretend to, or narrate doing so.
+That is ALL this tells you. The headless comfyui server is a SEPARATE connection that succeeds or fails on its own, so this says nothing about whether you have its tools — go by the tool list you were actually given. If it is there, the file-based route (list_workflows, get_workflow, analyze_workflow, query_workflow) is your way to work on a saved workflow; if it is not, say that plainly instead of guessing.
+The panel tools cannot come back during this session — the tool set was fixed when it started. If the user asks for work on the graph in front of them, tell them the live-canvas tools failed to start this run and that you cannot reach the canvas until the orchestrator is restarted. Do not promise a restart will fix it: whether it does depends on why the bind failed, and a port still held by something else will fail the same way again.`;
+
+/**
+ * Whether this backend's prompt has to retract its panel_* claim, given whether the
+ * loopback panel MCP actually came up.
+ *
+ * Exported and pure so the decision is testable on its own — the alternative is a
+ * ternary buried in a 5000-line function that nothing can reach, and "the prompt
+ * lies when the bind fails" is precisely the kind of thing that stays broken when
+ * only the happy path is exercised.
+ */
+export function panelToolsRetraction(backend: string, panelToolsAvailable: boolean): string {
+  if (panelToolsAvailable) return "";
+  // pi has no MCP client at all; PI_CAPABILITY_OVERRIDE already retracts strictly
+  // more than this would, and stacking a second, narrower retraction on top would
+  // only muddy it.
+  if (backend === "pi") return "";
+  // claude drives the canvas through its own IN-PROCESS panel server, so a failed
+  // HTTP bind takes nothing away from it. Listed explicitly rather than relying on
+  // makeBackend returning undefined for it: this function must be right on its own
+  // terms, not only in the one place it happens to be called from today.
+  if (backend === "claude") return "";
+  return NO_PANEL_TOOLS_OVERRIDE;
+}
+
+/**
  * The panel auto-sends one of a few fixed "resume" nudges after ComfyUI restarts
  * (or the agent soft-reloads / drops mid-task). They all begin with the ✅ check
  * and tell the agent to continue. We key the crash-dump injection off these so a
@@ -1686,7 +1747,14 @@ export async function runPanelOrchestrator(): Promise<void> {
     const backend = backendOf(key);
     const panelTabId = panelTabOf(key);
     // The ENVIRONMENT block's `Backend:` line must name THIS backend (#358).
-    const sysAppend = systemAppendForBackend(backend);
+    //
+    // …plus the panel-tools retraction when the loopback panel MCP failed to bind.
+    // Applied HERE, once, rather than at each of the thirteen construction sites,
+    // because the condition is a property of the RUN and not of the backend: every
+    // branch below that returns a backend is handed makeHttpBackendMcpServers(),
+    // which drops the `panel` entry on exactly this failure.
+    const sysAppend =
+      systemAppendForBackend(backend) + panelToolsRetraction(backend, panelMcpHttp !== null);
     try {
     if (backend === "codex") {
       return new CodexBackend({

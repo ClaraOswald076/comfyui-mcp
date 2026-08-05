@@ -254,12 +254,121 @@ export function registerCompactTools(
   );
 }
 
+/**
+ * `panel_…`, optionally behind a client's `mcp__<server>__` namespacing — which is
+ * how tool names appear in agent transcripts and skill files.
+ *
+ * The namespace part is `[A-Za-z0-9_]+` and nothing else, deliberately: this is the
+ * SAME form `deadNameRe`/`findDeadName` accept in vocabulary.ts, and the two have to
+ * agree or a name could get the panel-surface answer while the retirement ledger
+ * declined to recognise it (or the reverse). So a namespace carrying any other
+ * character — a hyphenated server label, say — matches neither, and falls through to
+ * the fuzzy unknown-tool path. That is a real gap rather than a claimed guarantee,
+ * and it is written down here so the next reader does not assume coverage this
+ * pattern does not have.
+ */
+const PANEL_NAMESPACE_RE = /^(?:mcp__[A-Za-z0-9_]+__)?panel_/;
+
+/**
+ * The answer for a `panel_*` name, which is NOT the same question as "does this
+ * tool exist".
+ *
+ * The panel_* live-canvas tools are registered by a DIFFERENT server — the
+ * orchestrator's per-tab surface (registerPanelTools / startPanelMcpHttpServer),
+ * never by this one. So this catalog's silence about `panel_graph_outline` says
+ * nothing whatsoever about whether that tool exists; it only says this server
+ * does not serve it. The bare "Unknown tool 'panel_graph_outline'." that used to
+ * come back is the #804 defect in miniature: a tool the caller could not SEE,
+ * narrated as a tool that does not EXIST — and a model that reads it that way
+ * tells the user the capability is missing, which is false and sends them to
+ * reinstall something that is already fine.
+ *
+ * This path is reachable through our own prose, not just through a model's
+ * imagination: `visualize_workflow` and `visualize_workflow_hierarchical` both
+ * tell the reader to "use panel_graph_outline instead" for the live canvas, and
+ * the bundled plugin's debug-render / director skills name panel_* tools too —
+ * all of which an outside MCP client reads while holding none of them (#784, same
+ * family: recovery guidance naming a tool the caller cannot invoke).
+ *
+ * What this message must NOT do is replace one asserted cause with another. The
+ * test is only a PREFIX, so four separate things stay deliberately unclaimed:
+ *
+ *  - whether `name` is a real panel tool at all. `panel_typo` reaches here too,
+ *    and the namespace fact is true of it while "it exists elsewhere" is not.
+ *  - that NO `panel_`-prefixed tool can be on this surface. An autoloaded workflow
+ *    file (registerAutoloadedWorkflows) is registered under its slugified filename,
+ *    so `panel_custom.json` really is a `panel_custom` tool here — this patch's own
+ *    test proves it. An earlier draft said the prefix "is not this server's to
+ *    serve", which that same test disproves, and an absolute a colleague can falsify
+ *    from the diff is exactly the overclaim this change exists to remove. So the
+ *    sentence is now DERIVED: the catalog is asked what `panel_` names it actually
+ *    holds, and the message says only what the answer supports.
+ *  - which surfaces the caller holds. From inside this catalog a panel-hosted
+ *    session and an outside client are indistinguishable, so both are addressed.
+ *  - HOW the caller would reach the panel surface if it has one. Not every host
+ *    exposes the panel tools by their own names: the Ollama backend advertises a
+ *    three-tool panel router (panel_list_tools / panel_describe_tool /
+ *    panel_call_tool) instead, so "call it directly" would be wrong advice there.
+ *    The caller's own tool list is the authority, and it is the one thing the
+ *    caller can read and we cannot.
+ *  - that the sidebar's agent necessarily holds these tools. It usually does, but
+ *    the `pi` backend has no MCP client at all (see pi-backend.ts) and therefore
+ *    gets no ComfyUI tools whatever is installed — so that fallback is stated
+ *    with its condition rather than as a guarantee.
+ */
+function panelNamespaceMessage(catalog: ToolCatalog, name: string): string {
+  // Derived, not asserted — and scoped to the ONE thing it is derived from.
+  //
+  // The claim is about THIS CATALOG, never about "this server", because in full mode
+  // the facade's catalog comes from a SECOND workflow discovery pass (see
+  // registerFullTools) and the two can legitimately disagree for a moment: a
+  // workflow file removed between the passes stays directly registered on the live
+  // server while being absent here. "This server serves no panel_ names" would be
+  // false in exactly that window. "This catalog holds none" is what was measured,
+  // and it is also the only thing that matters to the caller, since call_tool
+  // dispatches through this catalog and nothing else.
+  const localPanelTools = [...catalog.tools.keys()].filter((n) => n.startsWith("panel_"));
+  const localNote = localPanelTools.length
+    ? `This catalog does hold ${localPanelTools.length} name(s) under \`panel_\` — ` +
+      `${localPanelTools.slice(0, 5).join(", ")}${localPanelTools.length > 5 ? ", …" : ""} ` +
+      `(autoloaded workflow files take their tool name from their filename) — but '${name}' is not among them. ` +
+      "The LIVE-CANVAS panel_* tools are a different thing entirely: they are served "
+    : "This catalog holds no `panel_` names at all: that prefix is the live-canvas surface, served ";
+  return (
+    `Unknown tool '${name}' — no tool by that name is in THIS server's call_tool catalog. ` +
+    localNote +
+    "separately by the ComfyUI sidebar panel's own per-tab MCP server. So this answers WHICH " +
+    `SURFACE you reached, and says nothing about whether '${name}' exists. This server cannot ` +
+    "see what else your client holds, so check the tool list your client gave you. " +
+    `If it offers ${name}, or a panel router such as panel_call_tool, go that way — call_tool ` +
+    "dispatches only within this server's own catalog and can never reach the panel surface. " +
+    "If it offers nothing under `panel_`, there is no live-canvas route from here: read the " +
+    "workflow from disk instead (list_workflows, get_workflow, analyze_workflow, query_workflow), " +
+    "or ask the user to make the request from the Agent tab in the ComfyUI sidebar, on a backend " +
+    "that has ComfyUI tools (the pi backend has no MCP client and so has none)."
+  );
+}
+
 function unknownToolMessage(catalog: ToolCatalog, name: string): string {
   // A name in the retirement ledger gets a specific answer — which version
   // removed it and what to call instead (#659). Exact matches only: partial
   // names still get the fuzzy suggestions below.
+  //
+  // Checked BEFORE the panel namespace, because the ledger holds retired panel_*
+  // names too and has a strictly better answer for them — a named live replacement
+  // — than "wrong surface" does. Answering "ask the panel agent" for a name no
+  // panel agent serves either would send the caller to a second dead end.
   const retired = retiredToolMessage(name);
   if (retired) return retired;
+  // The namespace answer is only correct when the name is not ALSO a real tool on
+  // this surface under its bare form. `catalog.get()` above is an exact lookup, so
+  // a client that namespaces its calls (`mcp__comfyui__panel_custom`) misses an
+  // autoloaded `panel_custom` workflow and would land here — where "that prefix
+  // belongs to another server" is exactly the wrong thing to say about a tool this
+  // server does serve. Fall through to the fuzzy path instead, which suggests the
+  // bare name (the behaviour every other namespaced live tool already gets).
+  const bare = name.replace(/^mcp__[A-Za-z0-9_]+__/, "");
+  if (PANEL_NAMESPACE_RE.test(name) && !catalog.get(bare)) return panelNamespaceMessage(catalog, name);
   const needle = name.toLowerCase();
   const close = [...catalog.tools.keys()]
     .filter((n) => n.includes(needle) || needle.includes(n))
