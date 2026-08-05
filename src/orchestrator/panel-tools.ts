@@ -43,6 +43,7 @@ import { parse as parseYaml } from "yaml";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { UiBridge } from "../services/ui-bridge.js";
+import { isSharedScopeId } from "../services/session-scope.js";
 import {
   dispatchOutcomeOf,
   isCapabilityRefusal,
@@ -5080,13 +5081,19 @@ function desktopCanvasRedirect(
     isHeadless?: (id: string) => boolean;
     tabs?: () => Array<{ tab_id: string }>;
     resolveActiveTabId?: () => string;
+    resolveSharedTabId?: () => string | undefined;
   };
   // Older / lightweight bridges can't classify tabs — leave routing exactly as-is.
   if (typeof b.isHeadless !== "function" || typeof b.tabs !== "function") return null;
   // Only intervene when THIS session is bound to a canvas-less (mobile/remote) client.
   // A desktop-bound session — healthy, or merely orphaned by a reconnect — is left to
   // the normal ctx.call path and its reconnect/rebind machinery untouched.
-  if (!b.isHeadless(ctx.tabId)) return null;
+  // #884 — a SHARED-SCOPE session is bound to whatever the scope resolves to right
+  // now; when that is a canvas-less client (only a phone is connected), the same
+  // redirect / honest canvas-less error applies instead of blasting the command
+  // at the phone.
+  const boundTab = isSharedScopeId(ctx.tabId) ? b.resolveSharedTabId?.() : ctx.tabId;
+  if (!boundTab || !b.isHeadless(boundTab)) return null;
   // Bound to a headless client: find the interactive (canvas-owning) DESKTOP tabs, the
   // SAME filter rebindToActiveTab/ensureReachable use for graph/workflow bindings.
   const live = b.tabs();

@@ -39,7 +39,7 @@ import { SessionStore, workflowIdentityParts } from "./session-store.js";
 import {
   SHARED_SESSION_SCOPE,
   isSharedScopeId,
-  conversationTargets,
+  conversationTabs,
   shouldRetireSharedAgent,
   messageOrigin,
   workflowOriginNote,
@@ -1543,18 +1543,33 @@ export async function runPanelOrchestrator(): Promise<void> {
     return i >= 0 ? key.slice(i + AGENT_KEY_SEP.length) : defaultBackend;
   };
   // #884 — ROUTING for agent output: every connected tab participating in this
-  // key's backend conversation; the shared scope itself when none is (the bridge
-  // buffers scope-addressed frames and replays them to the first tab that
-  // hellos). Fanout goes through bridge.push PER TAB so the mirror allowlist
-  // (MIRROR_SAFE_FRAME_TYPES) and canonical-id fanout keep their invariants.
+  // key's backend conversation. Fanout goes through bridge.push PER TAB so the
+  // mirror allowlist (MIRROR_SAFE_FRAME_TYPES) and canonical-id fanout keep
+  // their invariants. When NO participating tab is connected, frames PARK here
+  // per agent key — keyed by backend, so a claude turn finishing while only a
+  // codex tab is open can never leak into the codex conversation — and flush to
+  // the next hello on that backend (bounded; a backgrounded turn survives a
+  // panel reload).
   const conversationTabsFor = (key: string): string[] =>
-    conversationTargets({
+    conversationTabs({
       connected: bridge.tabs().map((t) => t.tab_id),
       backendForTab,
       backend: backendOf(key),
     });
+  const MAX_PARKED_CONVERSATION_FRAMES = 200;
+  const parkedConversationFrames = new Map<string, Array<Record<string, unknown>>>();
   const pushToConversation = (key: string, frame: Record<string, unknown>): void => {
-    for (const t of conversationTabsFor(key)) bridge.push(frame, t);
+    const tabs = conversationTabsFor(key);
+    if (tabs.length) {
+      for (const t of tabs) bridge.push(frame, t);
+      return;
+    }
+    const q = parkedConversationFrames.get(key) ?? [];
+    q.push(frame);
+    if (q.length > MAX_PARKED_CONVERSATION_FRAMES) {
+      q.splice(0, q.length - MAX_PARKED_CONVERSATION_FRAMES);
+    }
+    parkedConversationFrames.set(key, q);
   };
   // The REAL tab ids participating in the conversation that `originTab` belongs
   // to (connected same-backend tabs + the originator itself) — used when a
@@ -2152,7 +2167,6 @@ export async function runPanelOrchestrator(): Promise<void> {
       // with no prior greeting is never "corrected" and a correct banner never
       // duplicates). Per tab: each participating tab advertised its own banner.
       for (const panelTab of conversationTabsFor(key)) {
-        if (isSharedScopeId(panelTab)) continue; // buffered-offline target — no banner state
         if (typeof model === "string" && model.trim()) resolvedModelByTab.set(panelTab, model);
         const corrected = bannerCorrection({
           backend: backendForTab(panelTab),
@@ -3301,6 +3315,20 @@ export async function runPanelOrchestrator(): Promise<void> {
       else headlessTabs.delete(panelTab);
       const key = sharedKeyFor(backend);
 
+      // #884 — deliver conversation frames that were PARKED while no tab on this
+      // backend was connected (a turn finishing during a panel reload). Parked
+      // per agent key, so only a matching-backend hello receives them.
+      {
+        const parked = parkedConversationFrames.get(key);
+        if (parked?.length) {
+          parkedConversationFrames.delete(key);
+          for (const f of parked) bridge.push(f, panelTab);
+          logger.debug(
+            `[panel-orchestrator] delivered ${parked.length} parked conversation frame(s) for ${backend} to tab ${panelTab.slice(0, 8)}`,
+          );
+        }
+      }
+
       // #884 — hello.resume is now only a LAST-RESORT hint. Sessions are
       // orchestrator-scoped and the orchestrator's own disk store is the source
       // of truth (it wins inside manager.send()); the panel's stored id matters
@@ -3578,6 +3606,15 @@ export async function runPanelOrchestrator(): Promise<void> {
         }
       }
       tabBackends.set(panelTab, reqBackend);
+      // #884 — this tab just joined the NEW backend's conversation without a
+      // re-hello; deliver any frames parked while that conversation had no tab.
+      {
+        const parked = parkedConversationFrames.get(sharedKeyFor(reqBackend));
+        if (parked?.length) {
+          parkedConversationFrames.delete(sharedKeyFor(reqBackend));
+          for (const f of parked) bridge.push(f, panelTab);
+        }
+      }
       // #468 — the retire() above handed back any run completion the outgoing
       // provider's agent held, but that flush ran while agentKeyFor() still
       // resolved the OLD backend. Re-address it now that the tab points at the

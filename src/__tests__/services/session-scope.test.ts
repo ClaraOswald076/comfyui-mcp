@@ -8,7 +8,6 @@ import {
   sharedAgentKey,
   isSharedScopeId,
   conversationTabs,
-  conversationTargets,
   shouldRetireSharedAgent,
   messageOrigin,
   workflowOriginNote,
@@ -41,13 +40,12 @@ describe("shared session scope (#884)", () => {
       ).toEqual(["b-codex"]);
     });
 
-    it("with no participating tab connected, targets the SCOPE so the bridge buffers the frame", () => {
-      expect(conversationTargets({ connected: [], backendForTab, backend: "claude" })).toEqual([
-        SHARED_SESSION_SCOPE,
-      ]);
+    it("returns EMPTY (never another backend's tab) when no participating tab is connected — the orchestrator parks the frame per backend", () => {
+      expect(conversationTabs({ connected: [], backendForTab, backend: "claude" })).toEqual([]);
+      // A connected codex tab must NEVER receive the claude conversation's frames.
       expect(
-        conversationTargets({ connected: ["b-codex"], backendForTab, backend: "claude" }),
-      ).toEqual([SHARED_SESSION_SCOPE]);
+        conversationTabs({ connected: ["b-codex"], backendForTab, backend: "claude" }),
+      ).toEqual([]);
     });
   });
 

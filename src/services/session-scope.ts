@@ -41,6 +41,10 @@ export function isSharedScopeId(id: string | undefined | null): boolean {
  * The connected panel tabs participating in a backend's shared conversation —
  * every tab whose selected backend matches. Agent output (say/stream/turn/…)
  * fans out to ALL of them: the same conversation is visible from every tab.
+ * When this is EMPTY the orchestrator PARKS the frame per agent key (backend-
+ * qualified — a claude turn finishing while only a codex tab is open must never
+ * leak into the codex conversation) and flushes it to the next hello /
+ * set_backend join on that backend.
  */
 export function conversationTabs(opts: {
   connected: string[];
@@ -48,21 +52,6 @@ export function conversationTabs(opts: {
   backend: string;
 }): string[] {
   return opts.connected.filter((t) => opts.backendForTab(t) === opts.backend);
-}
-
-/**
- * Delivery targets for one shared-conversation frame. When no participating tab
- * is connected, the frame is addressed to the SCOPE id itself so the bridge
- * buffers it (missedFrames) and replays it to the first tab that hellos —
- * a backgrounded agent's turn survives a panel reload.
- */
-export function conversationTargets(opts: {
-  connected: string[];
-  backendForTab: (tabId: string) => string;
-  backend: string;
-}): string[] {
-  const tabs = conversationTabs(opts);
-  return tabs.length ? tabs : [SHARED_SESSION_SCOPE];
 }
 
 /**
