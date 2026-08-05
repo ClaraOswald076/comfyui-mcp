@@ -214,6 +214,21 @@ export function secretNotPersisted(receipt: SecretSaveReceipt): Error {
  * readers use THAT and not what was just saved. Reporting "saved" without this
  * is a configured state the tools do not use. Returns null when not shadowed.
  */
+/**
+ * The store lost OTHER credentials while saving this one. This outranks every
+ * other clause: "your token is saved" while the user's other tokens were
+ * destroyed is a fabricated success on top of data loss. Names only, no values.
+ */
+export function storeDamageNote(receipt: SecretSaveReceipt): string | null {
+  const lost = receipt.lostKeys ?? [];
+  if (!lost.length) return null;
+  return (
+    `🛑 "${receipt.key}" was written to ${receipt.path}, but the store NO LONGER carries ${lost.join(", ")} — ` +
+    `${lost.length > 1 ? "those credentials were" : "that credential was"} lost during the write. Do not treat this as a successful save. ` +
+    `Inspect ${receipt.path} and restore the missing ${lost.length > 1 ? "entries" : "entry"} before relying on anything in it.`
+  );
+}
+
 export function shadowedNote(receipt: SecretSaveReceipt): string | null {
   if (!receipt.shadowedByEnv) return null;
   return (
@@ -226,6 +241,9 @@ export function shadowedNote(receipt: SecretSaveReceipt): string | null {
 /** The ack for a comfyui tool secret: what was verified, how the running tools
  *  pick it up, and the ACTUAL respawn disposition — never a promise. */
 export function describeComfyuiSecretSave(receipt: SecretSaveReceipt): string {
+  // Data loss outranks everything: never narrate a save over destroyed tokens.
+  const damaged = storeDamageNote(receipt);
+  if (damaged) return damaged;
   // A shadowed save has no live pickup and no useful respawn story — the readers
   // are using the environment variable regardless. Lead with that and stop.
   const shadowed = shadowedNote(receipt);
@@ -5639,7 +5657,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 );
               case "yes":
                 return ok(
-                  shadowedNote(receipt) ??
+                  storeDamageNote(receipt) ??
+                    shadowedNote(receipt) ??
                     `🔒 ${receipt.key} saved to ${receipt.path} (confirmed by reading the file back; the value is never shown or logged). ` +
                       `The orchestrator reads provider keys in-process, so the provider this key belongs to is enabled now — pick it in the provider list.`,
                 );

@@ -18,51 +18,60 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 // The read-back is what makes "saved" an observation instead of an assumption,
-// so the tests must be able to reproduce the case it exists for: the write call
-// RETURNS NORMALLY and the store does not end up carrying the value (a read-only
+// so the tests must reproduce the case it exists for: the write call RETURNS
+// NORMALLY and the store does not end up carrying the value (a read-only
 // overlay, a filesystem that discarded it, another process rewriting the file).
-// That is modelled at the lowest honest level — writeFileSync becomes a no-op —
-// so the ENTIRE real read-back path runs, including env-file's own internal file
-// read, which a module-level mock of parseEnvFile would not intercept.
+//
+// The store is now written ATOMICALLY — temp file, fsync, rename — so the file
+// the readers see changes at exactly one instant: the RENAME. Intercepting that
+// (rather than writeFileSync) is what "the write returned but the store did not
+// take it" means for this write path, and it leaves the entire real read-back
+// running, including env-file's own internal file read.
 const fsState = vi.hoisted(() => ({
-  /** The write returns normally but the store never takes it. */
+  /** Every rename is dropped: the store keeps its old content. */
   swallowWrites: false,
-  /** The write lands, then the store becomes unreadable — so the read-back
-   *  cannot reach a verdict either way. */
-  breakReadsAfterWrite: false,
-  readsBroken: false,
-  /** Swallow only SOME writes — used to fail one alias of a slot fan-out. */
+  /** Drop only SOME renames — used to fail one alias of a slot fan-out. */
   failWriteOnCall: null as null | (() => boolean),
-  /** Once this many writes have completed, arm `breakNextReads` failing reads —
-   *  so a restore's WRITE can land while only its verification read fails, which
-   *  is exactly the case where a restore is genuinely unverifiable. */
-  breakReadsAfterWriteCount: null as number | null,
-  breakNextReads: 0,
+  /** All reads of the store throw (an unreadable store). */
+  readsBroken: false,
+  /** The store becomes unreadable immediately after the next successful rename,
+   *  so a write LANDS and its read-back cannot reach a verdict. */
+  breakReadsAfterWrite: false,
+  /** Break the Nth read AFTER a successful rename (1 = the whole-file
+   *  verification, 2 = the setter's own read-back). Lets a restore's write land
+   *  while only its verification is unavailable. */
+  breakReadAfterRename: null as number | null,
+  readsSinceRename: 0,
   writeCount: 0,
 }));
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
-  const writeFileSync: typeof actual.writeFileSync = (...args) => {
-    if (fsState.swallowWrites) return;
-    if (fsState.failWriteOnCall?.()) return; // this write silently does not land
-    const out = actual.writeFileSync(...args);
-    fsState.writeCount++;
-    if (fsState.breakReadsAfterWrite) fsState.readsBroken = true;
-    if (
-      fsState.breakReadsAfterWriteCount !== null &&
-      fsState.writeCount === fsState.breakReadsAfterWriteCount
-    ) {
-      fsState.breakNextReads = 2; // the setter's read-back, then the restore check
+  const isStore = (p: unknown) => String(p).endsWith(".env");
+  const renameSync: typeof actual.renameSync = (from, to) => {
+    if (isStore(to)) {
+      if (fsState.swallowWrites || fsState.failWriteOnCall?.()) {
+        actual.rmSync(from, { force: true }); // the temp file must not linger
+        return;
+      }
+    }
+    const out = actual.renameSync(from, to);
+    if (isStore(to)) {
+      fsState.writeCount++;
+      fsState.readsSinceRename = 0;
+      if (fsState.breakReadsAfterWrite) fsState.readsBroken = true;
     }
     return out;
   };
   const readFileSync: typeof actual.readFileSync = ((...args: Parameters<typeof actual.readFileSync>) => {
-    if (String(args[0]).endsWith(".env")) {
+    if (isStore(args[0])) {
       if (fsState.readsBroken) {
         throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
       }
-      if (fsState.breakNextReads > 0) {
-        fsState.breakNextReads--;
+      fsState.readsSinceRename++;
+      if (
+        fsState.breakReadAfterRename !== null &&
+        fsState.readsSinceRename === fsState.breakReadAfterRename
+      ) {
         throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
       }
     }
@@ -70,8 +79,8 @@ vi.mock("node:fs", async (importOriginal) => {
   }) as typeof actual.readFileSync;
   return {
     ...actual,
-    default: { ...actual, writeFileSync, readFileSync },
-    writeFileSync,
+    default: { ...actual, renameSync, readFileSync },
+    renameSync,
     readFileSync,
   };
 });
@@ -114,8 +123,8 @@ beforeEach(() => {
   fsState.breakReadsAfterWrite = false;
   fsState.readsBroken = false;
   fsState.failWriteOnCall = null;
-  fsState.breakReadsAfterWriteCount = null;
-  fsState.breakNextReads = 0;
+  fsState.breakReadAfterRename = null;
+  fsState.readsSinceRename = 0;
   fsState.writeCount = 0;
   dir = mkdtempSync(join(tmpdir(), "cmcp-receipt-"));
   envPath = join(dir, ".env");
@@ -137,8 +146,8 @@ afterEach(() => {
   fsState.breakReadsAfterWrite = false;
   fsState.readsBroken = false;
   fsState.failWriteOnCall = null;
-  fsState.breakReadsAfterWriteCount = null;
-  fsState.breakNextReads = 0;
+  fsState.breakReadAfterRename = null;
+  fsState.readsSinceRename = 0;
   fsState.writeCount = 0;
   delete process.env.COMFYUI_MCP_ENV_FILE;
   delete process.env.COMFYUI_MCP_PANEL_SECRETS;
@@ -163,13 +172,16 @@ function withSwallowedWrites<T>(fn: () => T): T {
   }
 }
 
-/** Reproduce "the write landed, then the store could not be re-read". */
+/** Reproduce "the write landed, then the store could not be re-read".
+ *  Read 1 after the rename is the atomic writer's own whole-file verification;
+ *  read 2 is the setter's read-back. Breaking the SECOND is what leaves a write
+ *  proven on disk with no verdict about its content. */
 function withUnreadableReadBack<T>(fn: () => T): T {
-  fsState.breakReadsAfterWrite = true;
+  fsState.breakReadAfterRename = 2;
   try {
     return fn();
   } finally {
-    fsState.breakReadsAfterWrite = false;
+    fsState.breakReadAfterRename = null;
     fsState.readsBroken = false;
   }
 }
@@ -406,23 +418,22 @@ describe("slot saves report what the read-back PROVED (#826 gate round 3)", () =
     // unreadable, so comparing against it would "confirm" a restore that never
     // reached disk. The verdict must come from the store, and stay UNKNOWN when
     // the store cannot be read.
-    setPanelSecret("huggingface", "hf-old"); // writes 1 and 2
-    let call = 0;
-    // Fail the SECOND alias of the new save, then let the FIRST alias's restore
-    // write land and break reads immediately afterwards — so the restore itself
-    // succeeded but cannot be verified.
-    fsState.failWriteOnCall = () => ++call === 2;
-    fsState.breakReadsAfterWriteCount = 4;
+    // A SINGLE-alias slot with nothing configured before, so the sequence is
+    // short and exact: every landed write is followed by the atomic writer's
+    // whole-file verification read (1) and then one more read (2). Breaking the
+    // 2nd makes the save's read-back unavailable AND, after the rollback's own
+    // write, makes the restore's verification unavailable — a restore that
+    // reached disk but cannot be proven.
+    fsState.breakReadAfterRename = 2;
     let outcome: ReturnType<typeof setPanelSecret>;
     try {
-      outcome = setPanelSecret("huggingface", "hf-new");
+      outcome = setPanelSecret("civitai", "civ-new");
     } finally {
-      fsState.failWriteOnCall = null;
-      fsState.breakReadsAfterWriteCount = null;
+      fsState.breakReadAfterRename = null;
       fsState.readsBroken = false;
     }
     expect(outcome.confirmed).toBe(false);
-    expect(outcome.unverifiedKeys).toContain("HF_TOKEN");
+    expect(outcome.unverifiedKeys).toContain("CIVITAI_API_TOKEN");
     // NOT a clean rollback: an UNPROVEN restore is not a proven one, and
     // `rolledBack` is what the caller turns into "nothing was half-applied".
     expect(outcome.strandedKeys).toEqual([]);

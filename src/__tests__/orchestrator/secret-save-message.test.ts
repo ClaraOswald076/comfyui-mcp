@@ -111,6 +111,27 @@ describe("describeComfyuiSecretSave: says only what was observed (#826)", () => 
     expect(text).toContain("no respawn required");
   });
 
+  it("LEADS with data loss and never narrates a save over it", () => {
+    // "Your token is saved" while the user's other tokens were destroyed is a
+    // fabricated success on top of data loss — the worst outcome in this
+    // codebase's ranking, so it outranks every other clause in the ack.
+    const text = describeComfyuiSecretSave({
+      ...base,
+      lostKeys: ["HF_TOKEN", "RUNPOD_API_KEY"],
+      respawn: { live: 1, applied: 1, scheduled: 0 },
+    });
+    expect(text).toContain("NO LONGER carries HF_TOKEN, RUNPOD_API_KEY");
+    expect(text).toContain("Do not treat this as a successful save");
+    // None of the success narration survives.
+    expect(text).not.toContain("verified by reading the file back");
+    expect(text).not.toContain("Retry the action that needed this credential now");
+    expect(text).not.toContain("replaced now");
+  });
+
+  it("says nothing about loss on a healthy save", () => {
+    expect(describeComfyuiSecretSave(base)).not.toContain("NO LONGER carries");
+  });
+
   it("never contains a secret value — the receipt carries none to leak", () => {
     const text = describeComfyuiSecretSave({
       ...base,
