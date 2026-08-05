@@ -479,4 +479,29 @@ describe("(d) #851 — the inventory rescue is asked about THIS download's categ
     // Exactly the caller's CATEGORY (not the full subfolder, not a sweep).
     expect(fetchApi.mock.calls.map((c) => c[0])).toEqual(["/models/loras"]);
   });
+
+  it("derives the category from the NORMALIZED subfolder, not its first raw segment", async () => {
+    // `target_subfolder` accepts equivalent spellings. `loras/../checkpoints` writes to
+    // `checkpoints` while its raw first segment is `loras` — so corroborating `loras`
+    // (whose listing may well match) would authorize a `checkpoints` destination nothing
+    // vouched for. The sibling-category hole, re-opened through a spelling.
+    getSystemStats.mockResolvedValue({ system: { argv: ["python", "main.py"] } });
+    h.baseHasEntrypoint = false;
+    fetchApi.mockClear();
+
+    await resolveModelSubfolderPreferServer("loras/../checkpoints").catch(() => undefined);
+
+    expect(fetchApi.mock.calls.map((c) => c[0])).toEqual(["/models/checkpoints"]);
+  });
+
+  it("asks about NOTHING when the subfolder escapes the models root", async () => {
+    // An escaping spelling gets no category at all, so no rescue can corroborate
+    // anything; the containment check refuses it immediately after.
+    getSystemStats.mockResolvedValue({ system: { argv: ["python", "main.py"] } });
+    h.baseHasEntrypoint = false;
+    fetchApi.mockClear();
+
+    await expect(resolveModelSubfolderPreferServer("../outside")).rejects.toThrow();
+    expect(fetchApi.mock.calls.map((c) => c[0])).not.toContain("/models/..");
+  });
 });
