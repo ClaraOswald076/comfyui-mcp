@@ -690,9 +690,10 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
     expect(existsSync(join(stale, "extra_model_paths.yaml"))).toBe(false);
   });
 
-  it("REFUSES an ABSOLUTE flag too when the server's main.py is not on this filesystem", async () => {
+  it("refuses to WRITE an ABSOLUTE flag when the server's main.py is not on this filesystem", async () => {
     // A container/WSL server behind a loopback port names files on ITS disk. A same-
-    // spelled absolute path here is a different file, so nothing argv-derived is usable.
+    // spelled absolute path here is a different file, so nothing argv-derived may be
+    // WRITTEN. The read shows it, unconfirmed — see the sibling test below.
     const hostLookalike = join(await trackTmp(), "extra.yaml");
     await writeFile(hostLookalike, "h:\n  vae: E:/host\n", "utf-8");
     mockGetSystemStats.mockResolvedValue({
@@ -706,9 +707,14 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
       },
     });
 
-    await expect(listExtraPaths()).rejects.toThrow(
-      /UNRESOLVED.*does not resolve to\s+a file on this filesystem/s,
+    await expect(addExtraPath({ category: "loras", path: "E:/loras" })).rejects.toThrow(
+      /UNRESOLVED.*does not resolve to a file on this filesystem/s,
     );
+    expect(await readFile(hostLookalike, "utf-8")).toBe("h:\n  vae: E:/host\n");
+
+    const listed = await listExtraPaths();
+    expect(listed.path).toBe(hostLookalike);
+    expect(listed.notes.join(" ")).toMatch(/NOT CONFIRMED/);
   });
 
   it("SHOWS an absolute flag whose locality is unproven, unconfirmed — and still refuses to WRITE it (#764)", async () => {
@@ -759,7 +765,7 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
 
     const listed = await listExtraPaths();
     expect(listed.path).not.toBe(missing);
-    expect(listed.notes.join(" ")).toMatch(/no such file exists on this machine/i);
+    expect(listed.notes.join(" ")).toMatch(/no file exists at that path on this machine/i);
     expect(listed.notes.join(" ")).toMatch(/NOT the file the live server reads/i);
     await expect(
       addExtraPath({ category: "loras", path: "E:/loras" }),
@@ -949,7 +955,7 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
     expect(result.path).toBe(join(workspaceA, "extra_model_paths.yaml"));
   });
 
-  it("REFUSES when the live root cannot be resolved from here (container/WSL/another host)", async () => {
+  it("refuses to WRITE when the live root cannot be resolved from here (container/WSL/another host)", async () => {
     // Reachable server reporting a root whose main.py we cannot see. Falling back to the
     // saved workspace would be exactly the wrong-tree write this branch exists to stop.
     const workspaceA = await trackTmp();
@@ -959,13 +965,17 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
       system: { argv: ["python", join(await trackTmp(), "not-mounted", "main.py")] },
     });
 
-    await expect(listExtraPaths()).rejects.toThrow(
-      /UNRESOLVED.*does not resolve to\s+a file on this filesystem/s,
-    );
-    // …and it did NOT quietly write into the saved workspace instead.
     await expect(
       addExtraPath({ category: "loras", path: "E:/loras" }),
-    ).rejects.toThrow(/UNRESOLVED/);
+    ).rejects.toThrow(/UNRESOLVED.*does not resolve to a file on this filesystem/s);
+    // …and it did NOT quietly write into the saved workspace instead.
+    expect(existsSync(join(workspaceA, "extra_model_paths.yaml"))).toBe(false);
+
+    // The read degrades to the saved workspace, plainly labelled as unproven — and
+    // still writes nothing.
+    const listed = await listExtraPaths();
+    expect(listed.path).toBe(join(workspaceA, "extra_model_paths.yaml"));
+    expect(listed.serverResolved).not.toBe(true);
     expect(existsSync(join(workspaceA, "extra_model_paths.yaml"))).toBe(false);
   });
 

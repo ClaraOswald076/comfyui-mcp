@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { writeFile, mkdir } from "node:fs/promises";
 import { join, basename, isAbsolute, resolve } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   extractWorkflowFromImage,
@@ -27,9 +27,19 @@ import { errorToToolResult } from "../utils/errors.js";
  *
  * Computed per call rather than at module load so a test (or a caller) that repoints
  * TMPDIR/TEMP is honoured instead of being silently pinned to the value at import time.
+ *
+ * `os.tmpdir()` returns %TEMP%/%TMP%/$TMPDIR verbatim, and nothing guarantees those are
+ * absolute — a `TEMP=relative-temp` in the environment we inherit yields
+ * `relative-temp\comfyui-images`. Merely `resolve()`-ing that would anchor it to the MCP
+ * process's cwd and land us straight back in System32, so a non-absolute tmpdir is not
+ * used at all: `os.homedir()` is always absolute and always writable by us, and the whole
+ * point of this function is to name a directory that does not depend on where we were
+ * launched.
  */
 export function defaultImageSaveDir(): string {
-  return join(tmpdir(), "comfyui-images");
+  const tmp = tmpdir();
+  const base = tmp && isAbsolute(tmp) ? tmp : homedir();
+  return resolve(base, "comfyui-images");
 }
 
 /**

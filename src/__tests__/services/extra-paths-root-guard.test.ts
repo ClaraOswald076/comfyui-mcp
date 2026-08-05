@@ -56,6 +56,9 @@ const script = vi.hoisted(() => ({
    *  nothing about whether the file is there (EACCES on a parent dir, ELOOP, a stalled
    *  mount) — as distinct from ENOENT, which really is an absence. */
   realpathError: {} as Record<string, string>,
+  /** Per-path errno for statSync, for the same reason: an EACCES must not be
+   *  indistinguishable from an ENOENT to the code that reports what it found. */
+  statError: {} as Record<string, string>,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -63,6 +66,12 @@ vi.mock("node:fs", async (importOriginal) => {
   return {
     ...actual,
     statSync: ((p: string, ...rest: unknown[]) => {
+      const errno = script.statError[String(p)];
+      if (errno) {
+        const err = new Error(`${errno}: stat '${p}'`);
+        (err as NodeJS.ErrnoException).code = errno;
+        throw err;
+      }
       if (script.path && String(p) === script.path && script.queue.length > 0) {
         const next = script.queue.shift() as StatStep;
         script.consumed += 1;
@@ -133,6 +142,7 @@ beforeEach(() => {
   script.realpath = {};
   script.realpathQueue = {};
   script.realpathError = {};
+  script.statError = {};
 });
 
 afterEach(async () => {
@@ -142,6 +152,7 @@ afterEach(async () => {
   script.realpath = {};
   script.realpathQueue = {};
   script.realpathError = {};
+  script.statError = {};
   await Promise.all(dirs.map((d) => rm(d, { recursive: true, force: true })));
 });
 
@@ -386,33 +397,108 @@ describe("locality: 'could not look' is not 'it is not there'", () => {
     mockGetSystemStats.mockResolvedValue({ system: { argv: ["python", mainPy] } });
     script.realpathError[mainPy] = "EACCES";
 
-    // Assert the REASON, not merely that it refused: the old message asserted a cause
-    // that was never observed, and a state-only assertion passes on both.
-    const err = await listExtraPaths().then(
+    // The WRITE still fails closed — but assert the REASON, not merely that it refused:
+    // the old message asserted a cause that was never observed, and a state-only
+    // assertion passes on both.
+    const err = await addExtraPath({ category: "loras", path: "E:/loras" }).then(
       () => undefined,
       (e: Error) => e,
     );
     expect(err).toBeDefined();
-    expect(err?.message).toMatch(/could not determine whether that path/);
+    expect(err?.message).toMatch(/could not determine whether its launch script/);
     expect(err?.message).toContain("EACCES");
     expect(err?.message).toMatch(/NOT a finding that the path is absent/);
-    expect(err?.message).not.toMatch(/running in a container/);
+    expect(err?.message).not.toMatch(/is running in a container/);
+
+    // The READ does not refuse at all: it shows the local target and carries the same
+    // observation forward as a caption.
+    const listed = await listExtraPaths();
+    expect(listed.serverResolved).not.toBe(true);
   });
 
-  it("keeps the container/WSL wording for a genuine ENOENT", async () => {
-    // The other direction: where the file really is absent, the specific diagnosis is
-    // correct and useful, and must not be watered down into "something went wrong".
+  it("does not assert a container/WSL topology from a bare ENOENT either", async () => {
+    // A local server whose main.py was renamed or deleted after startup produces exactly
+    // this ENOENT. The old wording stated the topology as fact; the observation is that
+    // the path does not resolve here, and the topologies are possibilities.
     const live = await trackTmp();
     const mainPy = join(live, "main.py");
     await writeFile(mainPy, "# comfyui\n", "utf-8");
     mockGetSystemStats.mockResolvedValue({ system: { argv: ["python", mainPy] } });
     script.realpathError[mainPy] = "ENOENT";
 
-    const err = await listExtraPaths().then(
+    const err = await addExtraPath({ category: "loras", path: "E:/loras" }).then(
       () => undefined,
       (e: Error) => e,
     );
-    expect(err?.message).toMatch(/running in a container, WSL, or on another/);
+    expect(err?.message).toMatch(/does not resolve to a file on this filesystem/);
+    // Offered as a possibility ("it may never have been ours"), never asserted.
+    expect(err?.message).toMatch(/it may never have been ours/);
+    expect(err?.message).toMatch(/moved or deleted since the server started/);
     expect(err?.message).not.toMatch(/could not determine whether/);
+  });
+
+  it("an UNREADABLE config is never summarised as an empty one", async () => {
+    // readConfigFile used `existsSync`, which answers false for EACCES exactly as it does
+    // for ENOENT — so a config we could not look at came back as `{}` and was rendered as
+    // "exists: false, no extra paths configured". That is a claim, made from a failed
+    // look, in the one place a user would act on it (by adding a path that is already
+    // there, or concluding their models are unconfigured).
+    const root = await trackTmp();
+    config.comfyuiPath = root;
+    process.env.COMFYUI_PATH = root;
+    const cfg = join(root, "extra_model_paths.yaml");
+    await writeFile(cfg, "shared:\n  vae: E:/vae\n", "utf-8");
+    script.path = cfg;
+    script.queue = [];
+    // Make statSync on the config file fail with EACCES rather than ENOENT.
+    script.statError = { [cfg]: "EACCES" };
+
+    const err = await listExtraPaths({ target: "standalone" }).then(
+      () => undefined,
+      (e: Error) => e,
+    );
+    expect(err?.message).toMatch(/could not be inspected \(EACCES\)/);
+    expect(err?.message).toMatch(/NOT a report that the file is missing/);
+    expect(err?.message).toMatch(/an empty result would be a claim we have not earned/);
+    // …and the file is untouched.
+    expect(await readFile(cfg, "utf-8")).toBe("shared:\n  vae: E:/vae\n");
+  });
+
+  it("does not report the server-named config as missing when it merely could not be inspected", async () => {
+    // The unproven-locality display path asked `existsSync(serverConfig)`, which answers
+    // false for EACCES exactly as for ENOENT — and the caption then said "no file exists
+    // at that path on this machine … the server's file tree is probably not this one".
+    // That is a topology conclusion drawn from a failed stat.
+    const root = await trackTmp();
+    config.comfyuiPath = root;
+    process.env.COMFYUI_PATH = root;
+    const serverCfg = join(await trackTmp(), "shared_model_paths.yaml");
+    await writeFile(serverCfg, "s:\n  vae: E:/v\n", "utf-8");
+    // No main.py in argv → locality unproven; the config stat then fails with EACCES.
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["python", "-m", "comfyui", "--extra-model-paths-config", serverCfg] },
+    });
+    script.statError = { [serverCfg]: "EACCES" };
+
+    const listed = await listExtraPaths();
+    const notes = listed.notes.join(" ");
+    expect(notes).toMatch(/could not determine whether a file is there/);
+    expect(notes).toContain("EACCES");
+    expect(notes).toMatch(/NOT a report that it is missing/);
+    // The two wrong conclusions the old code reached must both be absent.
+    expect(notes).not.toMatch(/no file exists at that path/);
+    expect(notes).not.toMatch(/probably not this one/);
+  });
+
+  it("a genuinely absent config is still an ordinary empty result, not a refusal", async () => {
+    // The other direction — ENOENT really does mean "no entries", and turning that into a
+    // refusal would break the ordinary first-run case.
+    const root = await trackTmp();
+    config.comfyuiPath = root;
+    process.env.COMFYUI_PATH = root;
+
+    const listed = await listExtraPaths({ target: "standalone" });
+    expect(listed.exists).toBe(false);
+    expect(listed.groups).toEqual([]);
   });
 });

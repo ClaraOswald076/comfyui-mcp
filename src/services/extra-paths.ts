@@ -523,8 +523,50 @@ function parseConfig(text: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+/**
+ * Is there a readable config FILE at this path — and if not, do we actually know that?
+ *
+ * `existsSync` answers false for every failure alike: ENOENT, an EACCES on a parent
+ * directory, a Windows sharing violation, a stalled network mount. Downstream that single
+ * false became "this config does not exist" and then "this config is empty", which is the
+ * defect this whole change is about. A directory at the path is a third thing again.
+ */
+type LocalFile =
+  | { kind: "file" }
+  | { kind: "absent" }
+  | { kind: "not-a-file" }
+  | { kind: "indeterminate"; detail: string };
+
+function probeLocalFile(path: string): LocalFile {
+  try {
+    return statSync(path).isFile() ? { kind: "file" } : { kind: "not-a-file" };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") return { kind: "absent" };
+    return { kind: "indeterminate", detail: code ?? String(err) };
+  }
+}
+
 async function readConfigFile(path: string): Promise<Record<string, unknown>> {
-  if (!existsSync(path)) return {};
+  const found = probeLocalFile(path);
+  if (found.kind === "absent") return {}; // genuinely not there → genuinely no entries
+  if (found.kind !== "file") {
+    // A config we could not LOOK AT must never be summarised as an empty one: "no extra
+    // paths are configured" is a claim, and we have not earned it. Nothing was read or
+    // written, so refusing is correct here — there is no partial result to disclose.
+    throw new ValidationError(
+      found.kind === "not-a-file"
+        ? `UNRESOLVED: "${path}" exists but is not a file (it is a directory or a special ` +
+          "file), so no extra-path configuration could be read from it. Nothing was read or " +
+          "written, and NO claim is being made about what paths are configured. Pass " +
+          "config_path with the real YAML file."
+        : `UNRESOLVED: "${path}" could not be inspected (${found.detail}), so this process ` +
+          "cannot tell whether a config is there. This is NOT a report that the file is " +
+          "missing or that no extra paths are configured — an empty result would be a claim " +
+          "we have not earned. Nothing was read or written. Check the permissions on that " +
+          "path (or the mount it lives on), or pass config_path with a file you can read.",
+    );
+  }
   return parseConfig(await readFile(path, "utf-8"));
 }
 
@@ -556,7 +598,9 @@ function summarize(
     "Categories are generic ComfyUI search-path keys, so model folders and custom_nodes can both be represented when supported by the running ComfyUI build.",
     "Restart ComfyUI after editing this file so startup path registration is rebuilt.",
   ];
-  return { target, path, exists: existsSync(path), groups, notes };
+  // `exists` is only ever reported once readConfigFile has proven the path is a readable
+  // file or is genuinely absent, so this stat can no longer launder an EACCES into false.
+  return { target, path, exists: probeLocalFile(path).kind === "file", groups, notes };
 }
 
 /**
@@ -748,26 +792,36 @@ async function resolveTargetPathPreferServer(
   // (realpath(__file__) dir), not the launcher spelling (codex round 10).
   const rootResult: LiveRootResult = script ? realLiveRoot(script) : { why: "absent" };
   const liveRoot = rootResult.root;
-  if (script && rootResult.root === undefined) {
-    // Only the ENOENT case licenses the container/WSL/other-host claim. When the lookup
-    // itself failed we say THAT, because "we could not read it" and "it is not there"
-    // send the reader to two different fixes.
+
+  /** Why locality is unproven, stated as what was OBSERVED. Reused by the refusals and
+   *  by the read-only disclosures, so the two can never drift apart. */
+  const localityGap = !script || rootResult.root !== undefined
+    ? "its /system_stats launch argv does not reveal a main.py at all"
+    : rootResult.why === "indeterminate"
+      ? `this process could not determine whether its launch script "${script}" is a file on ` +
+        `this filesystem (the lookup failed with ${rootResult.detail ?? "an unknown error"}); ` +
+        "that is NOT a finding that the path is absent — a permission or mount problem on an " +
+        "intermediate directory looks exactly the same from here"
+      : `its launch script "${script}" does not resolve to a file on this filesystem (it may ` +
+        "never have been ours — a container, WSL, or another host behind a loopback port " +
+        "spells its paths the same way — or it may have been moved or deleted since the " +
+        "server started)";
+
+  if (script && rootResult.root === undefined && !allowUnprovenLocalListFallback) {
+    // A MUTATION still fails closed here: a config path derived from an unverified tree
+    // could name a different file, and the edit would be a silent no-op or a write into a
+    // stranger's config. A READ falls through instead, so the branches below can disclose
+    // an unproven file rather than reject a reachable server outright (#764).
+    //
+    // The message states the observation and offers the topologies as possibilities. The
+    // old wording asserted "the server is running in a container, WSL, or on another
+    // host" from a bare ENOENT — one bucket, several causes, and it named one.
     throw new ValidationError(
-      rootResult.why === "indeterminate"
-        ? `UNRESOLVED: the running ComfyUI was launched from "${script}", and this process could ` +
-          `not determine whether that path is a file on this filesystem (the lookup failed with ` +
-          `${rootResult.detail ?? "an unknown error"}). This is NOT a finding that the path is ` +
-          "absent — a permission or mount problem on an intermediate directory looks the same " +
-          "from here. Nothing was read or written, because a config path derived from an " +
-          "unverified tree could name a different file. Pass config_path explicitly with a file " +
-          'you can reach, or target: "standalone"/"desktop" to use the local heuristic ' +
-          "deliberately."
-        : `UNRESOLVED: the running ComfyUI was launched from "${script}", which does not resolve to ` +
-          "a file on this filesystem — the server is running in a container, WSL, or on another " +
-          "host reached over the network. Its config paths name files on ITS disk, so a same-" +
-          "spelled path here would be a different file and the edit would be a silent no-op. " +
-          "Nothing was read or written — pass config_path explicitly with a file you can reach, " +
-          'or target: "standalone"/"desktop" to use the local heuristic deliberately.',
+      `UNRESOLVED: ${localityGap}, so the server's file tree is not proven to be this ` +
+        "machine's. Its config paths would then name files on ITS disk, and a same-spelled " +
+        "path here would be a different file, so the edit would be a silent no-op. Nothing " +
+        "was read or written — pass config_path explicitly with a file you can reach, or " +
+        'target: "standalone"/"desktop" to use the local heuristic deliberately.',
     );
   }
 
@@ -861,13 +915,18 @@ async function resolveTargetPathPreferServer(
     // read-only caller gets the file, plus an unmissable statement of what was not
     // proven; mutations fall through to the refusal below, unchanged.
     if (allowUnprovenLocalListFallback) {
-      if (existsSync(serverConfig)) {
+      // Three distinct answers to "is the file the server named here?", kept distinct.
+      // `existsSync` collapsed them: an EACCES on a parent directory came back false and
+      // would have been narrated as "no such file exists on this machine — the server is
+      // very likely elsewhere", which is a conclusion drawn from a failed look.
+      const local = probeLocalFile(serverConfig);
+      if (local.kind === "file") {
         return {
           target: looksLikeDesktopConfig(serverConfig) ? "desktop" : "standalone",
           path: serverConfig,
           notes: [
             `Showing "${serverConfig}" — the --extra-model-paths-config the running ComfyUI reports in its own launch argv, and a file that exists on this machine.`,
-            `NOTE: NOT CONFIRMED to be the same file. That argv also reveals no main.py resolving on this filesystem, so this process could not prove the server's file tree is this machine's. If the server is in a container, WSL, or on another host behind a loopback port, it spells its paths the same way and this is a DIFFERENT file with the same name. The entries below are read from the local file at that path. Editing is refused in this state — pass config_path explicitly to edit deliberately.`,
+            `NOTE: NOT CONFIRMED to be the same file: ${localityGap}, so this process could not prove the server's file tree is this machine's. If the server is in a container, WSL, or on another host behind a loopback port, it spells its paths the same way and this would be a DIFFERENT file with the same name. The entries reported here are read from the local file at that path. Editing is refused in this state — pass config_path explicitly to edit deliberately.`,
           ],
           serverResolved: false,
           // Not proven ours: never create a tree here on the strength of a path the
@@ -875,15 +934,21 @@ async function resolveTargetPathPreferServer(
           createParents: false,
         };
       }
+      if (local.kind === "absent") {
+        return unprovenListFallback(
+          `NOTE: the running ComfyUI reports --extra-model-paths-config "${serverConfig}", but no file exists at that path on this machine, and ${localityGap}. The server's file tree is probably not this one (a container, WSL, or another host behind a loopback port). Showing the local auto-selected config instead; this is a fallback, and it is NOT the file the live server reads. Pass config_path explicitly to inspect a file you can reach.`,
+        );
+      }
       return unprovenListFallback(
-        `NOTE: the running ComfyUI reports --extra-model-paths-config "${serverConfig}", but no such file exists on this machine and its argv reveals no main.py that resolves here — the server's file tree is very likely not this one (a container, WSL, or another host behind a loopback port). Showing the local auto-selected config instead; this is a fallback, and it is NOT the file the live server reads. Pass config_path explicitly to inspect a file you can reach.`,
+        local.kind === "not-a-file"
+          ? `NOTE: the running ComfyUI reports --extra-model-paths-config "${serverConfig}", and something exists at that path on this machine but it is not a file, so nothing was read from it. Showing the local auto-selected config instead; this is a fallback, and it is NOT confirmation of what the live server reads. Pass config_path explicitly to inspect a file you can reach.`
+          : `NOTE: the running ComfyUI reports --extra-model-paths-config "${serverConfig}", and this process could not determine whether a file is there (the lookup failed with ${local.detail}) — that is NOT a report that it is missing. Showing the local auto-selected config instead; this is a fallback, and it is NOT the file the live server reads. Check the permissions on that path, or pass config_path explicitly with a file you can read.`,
       );
     }
     throw new ValidationError(
       `UNRESOLVED: the running ComfyUI reports --extra-model-paths-config "${serverConfig}" ` +
-        "but its launch argv reveals no main.py that resolves to a file on this " +
-        "filesystem, so the server's file tree is not proven local — the path names a " +
-        "file on ITS disk and a same-spelled path here would be a different file. " +
+        `but ${localityGap}, so the server's file tree is not proven local — the path may ` +
+        "name a file on ITS disk, and a same-spelled path here would be a different file. " +
         "Nothing was read or written — pass config_path explicitly with a file you can " +
         'reach, or target: "standalone"/"desktop" to use the local heuristic deliberately.',
     );
