@@ -1352,6 +1352,25 @@ export function nonInteractiveGitEnv(): NodeJS.ProcessEnv {
  * CLI at a different install than the pre/post checks described.
  */
 function runCmCli(args: string[], workspace?: string): string {
+  // THE CHOKE-POINT (codex gate P0). An earlier fix put this guard in
+  // `comfyCliUnavailableReason`, which install/enable/disable/uninstall consult —
+  // but `update`, `reinstall`, `fix all` and dependency sync call the CLI without
+  // going through it, so a stale local COMFYUI_PATH was still mutable in remote
+  // mode by four other routes. Every comfy-cli invocation passes through HERE, so
+  // this is where the refusal belongs. Nothing has run yet at this point, which is
+  // what makes refusing the right shape.
+  if (isRemoteMode()) {
+    throw new ProcessControlError(
+      "This session targets a REMOTE ComfyUI (--comfyui-url), and comfy-cli only acts on a " +
+        "LOCAL install" +
+        (workspace ?? config.comfyuiPath
+          ? ` — running it would modify ${workspace ?? config.comfyuiPath}, which is NOT the ` +
+            `server you are connected to`
+          : "") +
+        ". Nothing was run. Use the ComfyUI-Manager HTTP path, which addresses the server you " +
+        "are actually connected to, or run comfy-cli on the machine the install lives on.",
+    );
+  }
   const ws = workspace ?? config.comfyuiPath;
   if (!ws) {
     throw new ProcessControlError(
@@ -1896,12 +1915,25 @@ async function cloneCustomNodeFallback(
   // panel-connected local session with no COMFYUI_PATH can still clone an
   // unregistered git pack); fall back to config.comfyuiPath.
   const comfyuiBase = basePath ?? config.comfyuiPath;
+  // Same hazard as the CLI paths (codex gate P0): the guard below catches "no
+  // path", but the dangerous case is HAVING one while connected elsewhere. A
+  // clone into a stale local tree would report a successful install of a pack the
+  // connected server will never see.
+  if (isRemoteMode()) {
+    throw new ProcessControlError(
+      `"${repoName}" is not in the ComfyUI-Manager registry, and cloning it would write to a ` +
+        `LOCAL install` +
+        (comfyuiBase ? ` (${comfyuiBase})` : "") +
+        ` — but this session targets a REMOTE ComfyUI (--comfyui-url), so that is not the ` +
+        `server you are connected to. Nothing was cloned. Install it on the ComfyUI host, or ` +
+        `pass a registered pack id the Manager can resolve there.`,
+    );
+  }
   if (!comfyuiBase) {
     throw new ProcessControlError(
       `"${repoName}" is not in the ComfyUI-Manager registry and cloning it ` +
-        `requires a local ComfyUI install, but no ComfyUI path is set ` +
-        `(running in remote --comfyui-url mode). Install it on the ComfyUI host, ` +
-        `or pass a registered pack id.`,
+        `requires a local ComfyUI install, but no ComfyUI path is set. ` +
+        `Install it on the ComfyUI host, or pass a registered pack id.`,
     );
   }
 
@@ -2295,13 +2327,23 @@ async function installCustomNodeImpl(
       if (diskBefore?.state === "not-found") {
         // It was NOT there before and it is now: the install worked. Reporting
         // "already installed" here hid a successful install behind a no-op.
+        // STATES THE OBSERVATION, NOT A CAUSE (codex gate P1). `diskBefore` is a
+        // filesystem snapshot with nothing binding it to this operation, so under
+        // two concurrent agents on one rig — which is in scope — the pack could
+        // have been created by the OTHER agent between our pre-check and our
+        // post-check. "It was absent before and is present now" is exactly what we
+        // saw; "this call installed it" is an inference the evidence does not
+        // support, and it is the same bucket-narrated-as-cause fold this cluster
+        // is about. The user's next action (restart to load it) is identical
+        // either way, so the weaker claim costs them nothing.
         return withCliNote({
           mechanism: "manager-http",
           message:
-            `Installed "${id}" — it is now present on disk at ${presence.dir}. It was NOT ` +
-            `there before this call, so the install DID take effect, even though ` +
-            `ComfyUI-Manager does not track it (a Comfy Registry zip install is not in its ` +
-            `installed-pack list). Restart ComfyUI to load it.`,
+            `"${id}" is now present on disk at ${presence.dir}, and was NOT there before ` +
+            `this call — so it was installed, though ComfyUI-Manager does not track it (a ` +
+            `Comfy Registry zip install is not in its installed-pack list). If another agent ` +
+            `is working on this ComfyUI, it may have been the one that installed it. Restart ` +
+            `ComfyUI to load it.`,
           details: status,
         });
       }
@@ -3479,7 +3521,15 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
   // postcondition deserves the strongest evidence available, not the most
   // convenient, and this branch has the disk check the rest of this file uses.
   const diskAfter = presenceCtx.diskRoot ? findPackOnDisk(id, presenceCtx.diskRoot) : undefined;
-  if (diskAfter?.state === "found") {
+  // `findPackOnDisk` accepts a matching SYMLINK without following it, so a
+  // dangling link would be reported as a pack that survived the uninstall
+  // (codex gate P2). ComfyUI cannot load a dead link, so calling that an
+  // incomplete removal is a false alarm on a destructive operation — the one
+  // place a spurious warning does real damage, because it sends the user to
+  // delete something by hand. `existsSync` follows the link, which is exactly
+  // the question: is there anything at the other end?
+  const diskAfterReal = diskAfter?.state === "found" && existsSync(diskAfter.dir);
+  if (diskAfterReal) {
     return withCliNote({
       mechanism: "manager-http",
       message:
@@ -3492,7 +3542,10 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
     });
   }
   const diskNote =
-    diskAfter?.state === "not-found"
+    diskAfter?.state === "found"
+      ? ` and gone from disk (a dangling symlink remains at ${diskAfter.dir}, which ComfyUI ` +
+        `cannot load — remove it at your leisure)`
+      : diskAfter?.state === "not-found"
       ? " and gone from disk"
       : diskAfter?.state === "unreadable"
         ? `; the disk check was inconclusive (${diskAfter.reason}), so the directory may ` +

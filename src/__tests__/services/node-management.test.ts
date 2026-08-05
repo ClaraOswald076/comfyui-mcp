@@ -1272,8 +1272,13 @@ describe("node-management service", () => {
       stubFetch({ installedBody: {}, onQueue: () => { installed = true; } });
       const res = await installCustomNode({ id: "comfyui-impact-pack" });
 
-      expect(res.message).toMatch(/Installed "comfyui-impact-pack"/);
+      // States the OBSERVATION, not a causal claim: `diskBefore` is a filesystem
+      // snapshot with nothing binding it to this operation, so under two agents
+      // on one rig the other one could have created the directory. What we saw
+      // is "absent before, present now", and that is what it says.
+      expect(res.message).toMatch(/is now present on disk/);
       expect(res.message).toMatch(/was NOT there before this call/);
+      expect(res.message).toMatch(/another agent/i);
       expect(res.message).not.toMatch(/ALREADY/);
       expect(res.message).not.toMatch(/resolved to nothing/);
     });
@@ -1734,6 +1739,27 @@ describe("node-management service", () => {
       const res = await uninstallCustomNode({ id: "my-pack" });
       expect(res.message).toMatch(/did NOT take effect/);
       expect(res.message).not.toMatch(/Uninstalled "my-pack" via/);
+    });
+
+    it("EVERY comfy-cli route refuses in remote mode, not just the ones with an availability probe", async () => {
+      // The first fix guarded `comfyCliUnavailableReason`, which only
+      // install/enable/disable/uninstall consult — `update`, `reinstall`, `fix
+      // all` and dependency sync call the CLI without it, so four routes could
+      // still mutate a stale local install in remote mode (codex gate P0). The
+      // guard now sits in `runCmCli`, which every one of them passes through.
+      stubFetch({ installedBody: installedEnabled });
+      remoteFlags.remoteMode = true;
+      try {
+        const err = await updateCustomNode({ id: "my-pack", useCmCli: true }).catch(
+          (e: unknown) => e,
+        );
+        expect(String(err)).toMatch(/REMOTE ComfyUI/i);
+        expect(String(err)).toMatch(/Nothing was run/i);
+        // And the CLI subprocess was never spawned.
+        expect(mockedExec).not.toHaveBeenCalled();
+      } finally {
+        remoteFlags.remoteMode = false;
+      }
     });
 
     it("comfy-cli REFUSES in remote mode — a local uninstall must not run behind remote checks", async () => {
