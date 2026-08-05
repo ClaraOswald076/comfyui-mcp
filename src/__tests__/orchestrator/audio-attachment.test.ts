@@ -7,6 +7,7 @@ import {
   audioUserNotice,
   fetchAudioAttachment,
   isDeliverableAudioMime,
+  looksLikeAudioFilename,
   modelLacksAudioText,
   noAudioPartText,
   openAiAudioFormat,
@@ -72,6 +73,23 @@ describe("splitAudioAttachments", () => {
 
   it("handles an undefined list without inventing entries", () => {
     expect(splitAudioAttachments(undefined)).toEqual({ images: [], audio: [] });
+  });
+
+  it("claims audio we CANNOT encode too — so the user gets a convert-to hint, not an image error", () => {
+    // Classification and encodability are different questions. A .wma left on
+    // the image path becomes a 400 (OpenAI dialect) or an image-slot mis-encode
+    // (native) — neither of which tells the user to convert the file.
+    const { images, audio } = splitAudioAttachments([
+      { filename: "song.wma" },
+      { filename: "tune.mid" },
+      { filename: "master.aiff" },
+      { filename: "shot.png" },
+    ]);
+    expect(audio.map((a) => a.filename)).toEqual(["song.wma", "tune.mid", "master.aiff"]);
+    expect(images.map((i) => i.filename)).toEqual(["shot.png"]);
+    // …and they are still NOT encodable, so the fetch path refuses them.
+    expect(audioMimeForFilename("song.wma")).toBeNull();
+    expect(looksLikeAudioFilename("song.wma")).toBe(true);
   });
 });
 

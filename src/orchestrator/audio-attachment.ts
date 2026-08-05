@@ -56,6 +56,47 @@ export const AUDIO_MIME_BY_EXT: Readonly<Record<string, string>> = Object.freeze
   webm: "audio/webm",
 });
 
+/**
+ * Extensions that are unmistakably AUDIO but that we cannot encode.
+ *
+ * These exist so classification and encodability stay separate questions. A
+ * `song.wma` routed onto the image path would be handed to a vision content
+ * part — a hard 400 on the OpenAI dialect, an image-slot mis-encode on the
+ * native one, and in neither case an explanation the user can act on. Claiming
+ * it here means it reaches the audio path and gets the real answer: "that isn't
+ * a format I can encode; convert it to one of …".
+ */
+export const AUDIO_EXT_NOT_ENCODABLE: readonly string[] = Object.freeze([
+  "wma",
+  "mid",
+  "midi",
+  "aiff",
+  "aif",
+  "aifc",
+  "alac",
+  "amr",
+  "au",
+  "snd",
+  "ra",
+  "rm",
+  "ape",
+  "wv",
+  "dsf",
+  "dff",
+  "caf",
+  "voc",
+  "8svx",
+]);
+
+/** True when a filename is audio-SHAPED, whether or not we can encode it. Used
+ *  to decide which path an attachment belongs on — never whether it can be sent. */
+export function looksLikeAudioFilename(filename: string): boolean {
+  const dot = filename.lastIndexOf(".");
+  if (dot < 0 || dot === filename.length - 1) return false;
+  const ext = filename.slice(dot + 1).toLowerCase();
+  return ext in AUDIO_MIME_BY_EXT || AUDIO_EXT_NOT_ENCODABLE.includes(ext);
+}
+
 /** The formats a refusal message offers, derived from AUDIO_MIME_BY_EXT so the
  *  prose can never claim support the encoder table doesn't actually have. */
 export function supportedAudioFormats(): string {
@@ -354,6 +395,10 @@ export async function fetchAudioAttachment(
  * to an image content part is not a harmless no-op: on the OpenAI dialect it is
  * a hard 400, and on the native dialect it lands in an image slot. Splitting
  * here means the audio path claims it (and can refuse it honestly) instead.
+ *
+ * Classification uses `looksLikeAudioFilename`, NOT "can we encode it" — a
+ * `song.wma` is audio the user is trying to share, and it belongs on the path
+ * that can tell them what to convert it to.
  */
 export function splitAudioAttachments<T extends { filename: string }>(
   refs: readonly T[] | undefined,
@@ -361,7 +406,7 @@ export function splitAudioAttachments<T extends { filename: string }>(
   const images: T[] = [];
   const audio: T[] = [];
   for (const ref of refs ?? []) {
-    if (audioMimeForFilename(ref.filename)) audio.push(ref);
+    if (looksLikeAudioFilename(ref.filename)) audio.push(ref);
     else images.push(ref);
   }
   return { images, audio };

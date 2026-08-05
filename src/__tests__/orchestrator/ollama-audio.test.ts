@@ -331,6 +331,39 @@ describe("#790 — a request carrying BOTH an image and audio is rejected", () =
   });
 });
 
+describe("#790 — a later error must not fabricate a delivery failure", () => {
+  it("does not blame the attachment once a request carrying it has already succeeded", async () => {
+    // Turn 1 delivers the audio fine. Turn 2 (whose history still holds it)
+    // fails for an unrelated reason. Telling the user "I did NOT hear it" then
+    // would report a failure that never happened for media the model received.
+    const backend = nativeBackend();
+    await collect(backend, turnsOf(AUDIO_TURN));
+    rejectNextChatWith = "rate limited";
+    const events = await collect(backend, turnsOf({ text: "and now?" }));
+    const said = assistantText(events);
+    expect(said).not.toContain("did NOT hear");
+    expect(said).not.toContain("rejected the request carrying");
+    // The error surfaces as a normal error rather than a false attachment story.
+    expect(events.some((e) => e.type === "error")).toBe(true);
+  });
+
+  it("when only an EARLIER turn's media is in history, it does not claim the user's new message lost anything", async () => {
+    const b2 = nativeBackend();
+    const anyB2 = b2 as unknown as { history: Array<Record<string, unknown>> };
+    // Turn 1 carries NO media, so nothing has proven the endpoint accepts
+    // attachments and the degradation path stays armed. It also establishes the
+    // session, so turn 2 keeps this history rather than starting fresh.
+    await collect(b2, turnsOf({ text: "first" }));
+    anyB2.history.push({ role: "user", content: "older turn", images: ["QUJD"] });
+    rejectNextChatWith = "cannot process input";
+    const events = await collect(b2, turnsOf({ text: "plain follow-up" }));
+    const said = assistantText(events);
+    expect(said).toContain("earlier attachments");
+    expect(said).toContain("Nothing you sent just now was lost");
+    expect(said).not.toContain("did NOT hear it");
+  });
+});
+
 describe("#788 — a live model switch reconciles the tool surface", () => {
   it("respawns the comfyui tool server when the new model wants a different surface", async () => {
     let connects = 0;
@@ -344,6 +377,7 @@ describe("#788 — a live model switch reconciles the tool surface", () => {
     // Stub the spawn so the test drives reconciliation, not a real child.
     const anyBackend = backend as unknown as {
       connectTools: () => Promise<void>;
+      comfy: unknown;
       comfyTools: unknown[];
       comfySpecEnv: Record<string, string> | undefined;
       toolModeDecision: { mode: string; source: string } | null;
@@ -352,6 +386,7 @@ describe("#788 — a live model switch reconciles the tool surface", () => {
     anyBackend.connectTools = async () => {
       connects++;
       anyBackend.comfySpecEnv = {};
+      anyBackend.comfy = fakeMcpClient();
       const { comfyuiSpawnToolMode } = await import("../../orchestrator/ollama-backend.js");
       anyBackend.toolModeDecision = comfyuiSpawnToolMode({}, {}, anyBackend.model);
       anyBackend.comfyTools = [];
@@ -368,6 +403,54 @@ describe("#788 — a live model switch reconciles the tool surface", () => {
     expect(anyBackend.toolModeDecision?.source).toBe("model-parameters");
   });
 
+  it("a FAILED respawn is retried on the next turn instead of being treated as done", async () => {
+    let connects = 0;
+    let failNext = false;
+    const backend = new OllamaBackend({
+      model: "qwen3:4b",
+      mcpServers: { comfyui: { transport: "stdio", command: "node", args: [], env: {} } },
+    });
+    const anyBackend = backend as unknown as {
+      connectTools: () => Promise<void>;
+      comfy: unknown;
+      comfyTools: unknown[];
+      comfySpecEnv: Record<string, string> | undefined;
+      toolModeDecision: { mode: string } | null;
+      model: string;
+    };
+    anyBackend.connectTools = async () => {
+      connects++;
+      anyBackend.comfySpecEnv = {};
+      if (failNext) {
+        // connectTools SWALLOWS a connect failure. Simulate the WORST shape:
+        // the mode was recorded but no client came up. "The surface is in the
+        // right mode" must be judged on a LIVE client, not on the record alone,
+        // or the missing surface is never rebuilt.
+        anyBackend.comfy = null;
+        const { comfyuiSpawnToolMode } = await import("../../orchestrator/ollama-backend.js");
+        anyBackend.toolModeDecision = comfyuiSpawnToolMode({}, {}, anyBackend.model);
+        return;
+      }
+      anyBackend.comfy = fakeMcpClient();
+      const { comfyuiSpawnToolMode } = await import("../../orchestrator/ollama-backend.js");
+      anyBackend.toolModeDecision = comfyuiSpawnToolMode({}, {}, anyBackend.model);
+      anyBackend.comfyTools = [];
+    };
+    await backend.prepare();
+    expect(connects).toBe(1);
+
+    failNext = true;
+    await backend.setModel("llama3.3:70b");
+    await collect(backend, turnsOf({ text: "one" }));
+    expect(connects).toBe(2);
+    expect(anyBackend.comfy).toBeNull(); // the surface really is missing
+
+    failNext = false;
+    await collect(backend, turnsOf({ text: "two" }));
+    expect(connects).toBe(3); // retried
+    expect(anyBackend.toolModeDecision?.mode).toBe("full");
+  });
+
   it("does NOT respawn when the new model wants the same surface", async () => {
     let connects = 0;
     const backend = new OllamaBackend({
@@ -376,6 +459,7 @@ describe("#788 — a live model switch reconciles the tool surface", () => {
     });
     const anyBackend = backend as unknown as {
       connectTools: () => Promise<void>;
+      comfy: unknown;
       comfyTools: unknown[];
       comfySpecEnv: Record<string, string> | undefined;
       toolModeDecision: { mode: string; model?: string } | null;
@@ -384,6 +468,7 @@ describe("#788 — a live model switch reconciles the tool surface", () => {
     anyBackend.connectTools = async () => {
       connects++;
       anyBackend.comfySpecEnv = {};
+      anyBackend.comfy = fakeMcpClient();
       const { comfyuiSpawnToolMode } = await import("../../orchestrator/ollama-backend.js");
       anyBackend.toolModeDecision = comfyuiSpawnToolMode({}, {}, anyBackend.model);
       anyBackend.comfyTools = [];
