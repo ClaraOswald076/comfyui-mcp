@@ -440,7 +440,14 @@ const ARGV_PROVEN_PACKAGES: ReadonlyArray<{
 
 /**
  * Which of the packages we report are proven present by the running server's argv.
- * Tolerant of `--flag=value` spellings and of argv entries that are not strings.
+ *
+ * EXACT token match only. These are argparse `store_true` flags, so `--use-sage-attention`
+ * never legitimately carries an `=value`, and there is nothing to be tolerant of. An
+ * earlier version split every token on `=` to accept `--flag=value`; that spelling cannot
+ * occur for a boolean flag, so the leniency bought nothing and only widened what could be
+ * mistaken for the flag. This function's whole job is to assert a POSITIVE, and a
+ * fabricated positive here reads to an agent as "the acceleration is there" — the exact
+ * false report in the other direction from the one #401 is about.
  */
 export function packagesProvenByServerArgv(
   argv: string[] | undefined,
@@ -449,7 +456,7 @@ export function packagesProvenByServerArgv(
   if (!Array.isArray(argv)) return proven;
   const tokens = argv
     .filter((t): t is string => typeof t === "string")
-    .map((t) => t.trim().split("=")[0].toLowerCase());
+    .map((t) => t.trim().toLowerCase());
   for (const { pkg, flag } of ARGV_PROVEN_PACKAGES) {
     if (tokens.includes(flag)) proven.add(pkg);
   }
