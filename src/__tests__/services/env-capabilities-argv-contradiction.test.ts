@@ -88,12 +88,31 @@ describe("packagesProvenByServerArgv (pure)", () => {
     ]);
   });
 
-  it("tolerates --flag=value spellings and non-string argv entries", () => {
+  it("requires the EXACT flag token and survives non-string argv entries", () => {
+    // `--use-sage-attention` is an argparse store_true flag, so `=value` is not a
+    // spelling it can have. Accepting one bought nothing and only widened what could be
+    // mistaken for it — and this function's job is to assert a POSITIVE, where a
+    // fabricated one tells an agent the acceleration is present when it is not.
     expect(
-      packagesProvenByServerArgv(["main.py", "--use-sage-attention=auto", 7 as never]).has(
+      packagesProvenByServerArgv(["main.py", "--use-sage-attention=auto", 7 as never]).size,
+    ).toBe(0);
+    expect(
+      packagesProvenByServerArgv(["main.py", "--use-sage-attention", 7 as never]).has(
         "sageattention",
       ),
     ).toBe(true);
+  });
+
+  it("does not read a flag NAME appearing as another flag's VALUE as the flag itself", () => {
+    // `--base-directory` takes a string. A directory literally spelled
+    // `--use-sage-attention` is absurd, but it is the shape that turns a value into a
+    // capability claim, and the claim is what an agent acts on.
+    expect(
+      packagesProvenByServerArgv([
+        "main.py",
+        "--base-directory=--use-sage-attention",
+      ]).size,
+    ).toBe(0);
   });
 
   it("claims nothing when the flag is absent, and never from a lookalike token", () => {

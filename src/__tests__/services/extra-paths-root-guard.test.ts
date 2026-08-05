@@ -524,6 +524,39 @@ describe("locality: 'could not look' is not 'it is not there'", () => {
     }
   });
 
+  it("does not leave a note asserting a file that vanished before the read", async () => {
+    // Selecting the server-named path takes one stat; reading it takes another. If the
+    // file is deleted in between, a note that had said "a file that exists on this
+    // machine … its entries are reported here" would sit next to `exists: false` and an
+    // empty group list — the response contradicting itself, with the prose asserting the
+    // more confident half.
+    const root = await trackTmp();
+    config.comfyuiPath = root;
+    process.env.COMFYUI_PATH = root;
+    const serverCfg = join(await trackTmp(), "shared_model_paths.yaml");
+    await writeFile(serverCfg, "s:\n  vae: E:/v\n", "utf-8");
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["python", "-m", "comfyui", "--extra-model-paths-config", serverCfg] },
+    });
+    // Present for the selecting stat, gone for every stat after it.
+    let seen = 0;
+    script.statError = new Proxy({} as Record<string, string>, {
+      get: (_t, key) => (String(key) === serverCfg && seen++ > 0 ? "ENOENT" : undefined),
+    });
+
+    const listed = await listExtraPaths();
+    expect(listed.path).toBe(serverCfg);
+    expect(listed.exists).toBe(false);
+    expect(listed.groups).toEqual([]);
+    const notes = listed.notes.join(" ");
+    // The prose must not claim what `exists` just denied.
+    expect(notes).not.toMatch(/a file that exists on this machine/i);
+    expect(notes).not.toMatch(/entries reported here are read from/i);
+    // …and it still says where the path came from, and that it is unconfirmed.
+    expect(notes).toMatch(/reports in its own launch argv/);
+    expect(notes).toMatch(/NOT CONFIRMED/);
+  });
+
   it("a genuinely absent config is still an ordinary empty result, not a refusal", async () => {
     // The other direction — ENOENT really does mean "no entries", and turning that into a
     // refusal would break the ordinary first-run case.

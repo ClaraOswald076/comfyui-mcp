@@ -939,9 +939,16 @@ async function resolveTargetPathPreferServer(
         return {
           target: looksLikeDesktopConfig(serverConfig) ? "desktop" : "standalone",
           path: serverConfig,
+          // The note deliberately does NOT restate "and this file exists" or "its
+          // entries were read". Selecting this path required one stat, and the read
+          // takes another; between them the file can be deleted, and a note that had
+          // asserted existence would then sit next to `exists: false` and an empty
+          // group list, contradicting the very response it is part of. `exists` is the
+          // field that answers that, from the read's own observation — the prose says
+          // only what selecting the path established, which is where it came from.
           notes: [
-            `Showing "${serverConfig}" — the --extra-model-paths-config the running ComfyUI reports in its own launch argv, and a file that exists on this machine.`,
-            `NOTE: NOT CONFIRMED to be the same file: ${localityGap}, so this process could not prove the server's file tree is this machine's. If the server is in a container, WSL, or on another host behind a loopback port, it spells its paths the same way and this would be a DIFFERENT file with the same name. The entries reported here are read from the local file at that path. Editing is refused in this state — pass config_path explicitly to edit deliberately.`,
+            `Showing "${serverConfig}" — the --extra-model-paths-config the running ComfyUI reports in its own launch argv. See "exists" for whether a file is there now, and the groups below for what was read from it.`,
+            `NOTE: NOT CONFIRMED to be the same file: ${localityGap}, so this process could not prove the server's file tree is this machine's. If the server is in a container, WSL, or on another host behind a loopback port, it spells its paths the same way and this would be a DIFFERENT file with the same name. Editing is refused in this state — pass config_path explicitly to edit deliberately.`,
           ],
           serverResolved: false,
           // Not proven ours: never create a tree here on the strength of a path the
