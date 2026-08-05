@@ -997,6 +997,23 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     expect(r.message).not.toMatch(/stale legacy 3\.x/);
   });
 
+  it("#824: malformed historical counter (done_count: \"1\") with live fields clear → verifies, named missing-or-malformed, never incoherent", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      // done_count is PRESENT but invalid — the message must not call it missing.
+      updateDetails: { total_count: 0, done_count: "1", pending_count: 0, in_progress_count: 0, is_processing: false },
+      onGitPull: () => "Already up to date.",
+    });
+    const r = await runPanelAction("update", h.deps);
+    expect(r.restartRequired).toBe(false);
+    expect(r.message).toMatch(/already at the upstream tip/);
+    expect(r.message).toMatch(/missing or malformed/);
+    expect(r.message).not.toMatch(/incoherent/);
+    expect(r.message).not.toMatch(/stale legacy 3\.x/);
+  });
+
   it("#824: incoherent signature with live work NOT disproven (pending 1) → verification REFUSED, no git mutation", async () => {
     const h = makeDeps({
       comfyuiPath: COMFY,

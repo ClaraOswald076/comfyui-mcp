@@ -5207,7 +5207,7 @@ async function runPanelActionCore(
           : `ComfyUI-Manager's drained-queue status is partial (total=` +
             `${c.total ?? "?"}, done=${c.done ?? "?"}, pending=${c.pending ?? "?"}, ` +
             `in_progress=${c.inProgress ?? "?"} — fields the status contract requires ` +
-            `are missing) and can neither confirm nor explain the no-op`;
+            `are missing or malformed) and can neither confirm nor explain the no-op`;
       if (!provenLegacyEmptyQueue) {
         // #824 — SIGNATURE GATE, second form. An incoherent/partial signature
         // (e.g. total 0, done 1) is not proof of the stale-3.x no-op, so it
