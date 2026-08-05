@@ -50,6 +50,10 @@ const remoteFlags = vi.hoisted(() => ({ forceRemote: false, remoteMode: false })
 /** The LIVE server's own install root, as /system_stats argv would report it. */
 const liveRoot = vi.hoisted(() => ({ value: undefined as string | undefined }));
 
+/** The saved default workspace resolveEffectiveComfyUIBase() falls back to.
+ *  Controlled here so "no local path" tests never read the real user config. */
+const savedDefault = vi.hoisted(() => ({ value: undefined as string | undefined }));
+
 vi.mock("../../services/workspace-env.js", async () => {
   const actual = await vi.importActual<
     typeof import("../../services/workspace-env.js")
@@ -57,6 +61,9 @@ vi.mock("../../services/workspace-env.js", async () => {
   return {
     ...actual,
     resolveLiveComfyUIBase: async () => liveRoot.value,
+    // Mirror the real resolution order (COMFYUI_PATH, then the saved default);
+    // the remote-mode gate is applied separately by callers via isRemoteMode.
+    resolveEffectiveComfyUIBase: () => config.comfyuiPath ?? savedDefault.value,
   };
 });
 
@@ -77,10 +84,28 @@ vi.mock("node:child_process", () => ({
 // else delegates to the REAL fs: panel-targeting mutations now take the panel
 // mutation lock (panel-pin-guard), which is a real file — a partial mock left
 // the lock's mkdir/open/write undefined and every id="all" op failed closed.
-vi.mock("node:fs", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("node:fs")>()),
-  existsSync: vi.fn(() => true),
+// readdirSync/readFileSync delegate to the real fs by default too, but route
+// through fsCtl so the #797 on-disk presence scan can be given a fixture
+// custom_nodes without touching the disk.
+const fsCtl = vi.hoisted(() => ({
+  readdirSync: undefined as ((path: string) => unknown[]) | undefined,
+  readFileSync: undefined as ((path: string) => string) | undefined,
 }));
+vi.mock("node:fs", async (importOriginal) => {
+  const real = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...real,
+    existsSync: vi.fn(() => true),
+    readdirSync: vi.fn((path: unknown, options?: unknown) =>
+      fsCtl.readdirSync
+        ? fsCtl.readdirSync(String(path))
+        : (real.readdirSync as (p: unknown, o?: unknown) => unknown)(path, options)),
+    readFileSync: vi.fn((path: unknown, options?: unknown) =>
+      fsCtl.readFileSync
+        ? fsCtl.readFileSync(String(path))
+        : (real.readFileSync as (p: unknown, o?: unknown) => unknown)(path, options)),
+  };
+});
 
 // The panel mutation lock is a FILE (panel-pin-guard). Point it at a temp path
 // so the suite never touches ~/.comfyui-mcp, and so parallel vitest workers get
@@ -112,6 +137,11 @@ import {
   updateCustomNode,
   reinstallCustomNode,
   fixCustomNode,
+  disableCustomNode,
+  enableCustomNode,
+  uninstallCustomNode,
+  normalizeGitUrlInstallArgs,
+  nodesInstallCommandArgs,
   listInstalledNodes,
   syncNodeDependencies,
   setQueueTimingForTests,
@@ -149,6 +179,8 @@ interface Call {
 function stubFetch(opts: {
   installedBody?: unknown;
   statusSequence?: unknown[];
+  /** Fires when a queue op is submitted — lets a test make the install REAL. */
+  onQueue?: () => void;
 } = {}) {
   const calls: Call[] = [];
   let statusIdx = 0;
@@ -173,6 +205,7 @@ function stubFetch(opts: {
         return jsonResponse(s);
       }
       // queue ops + start return empty bodies
+      if (path.includes("/queue/")) opts.onQueue?.();
       return new Response("", { status: 200 });
     },
   );
@@ -186,6 +219,15 @@ function jsonResponse(obj: unknown): Response {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+/** A minimal fs.Dirent stand-in for the #797 on-disk presence scan fixtures. */
+function dirEnt(name: string) {
+  return {
+    name,
+    isDirectory: () => true,
+    isSymbolicLink: () => false,
+  };
 }
 
 /** Find a queued task of a given kind and return its (envelope, params). */
@@ -205,6 +247,11 @@ describe("node-management service", () => {
     mockedExec.mockReset();
     mockedExists.mockReset();
     mockedExists.mockReturnValue(true);
+    // Default: no custom_nodes fixture — the #797 disk scan delegates to the
+    // real fs (which throws on the fake root) unless a test installs one.
+    fsCtl.readdirSync = undefined;
+    fsCtl.readFileSync = undefined;
+    savedDefault.value = undefined;
     config.comfyuiPath = "/fake/comfy";
     config.githubToken = undefined;
     remoteFlags.forceRemote = false;
@@ -852,6 +899,47 @@ describe("node-management service", () => {
         "abc123",
       ]);
     });
+
+    it("cm-cli install with a ref works from the SAVED DEFAULT workspace when COMFYUI_PATH is unset (#808/#775 layout)", async () => {
+      // The CLI, the ref checkout, and the clone fallback must all take the ONE
+      // captured local root — previously the checkout read only
+      // config.comfyuiPath and threw AFTER the CLI install had already run.
+      config.comfyuiPath = undefined;
+      savedDefault.value = "/saved/ws";
+      mockedExec.mockReturnValue(cliEnvelope({ message: "installed ok" }) as never);
+
+      const res = await installCustomNode({
+        id: "https://github.com/foo/bar",
+        ref: "abc123",
+        useCmCli: true,
+      });
+
+      expect(res.mechanism).toBe("comfy-cli");
+      // The CLI ran against the saved default workspace...
+      expect(mockedExec.mock.calls[0][1]).toEqual([
+        "--json",
+        "--workspace",
+        "/saved/ws",
+        "--skip-prompt",
+        "node",
+        "install",
+        "https://github.com/foo/bar",
+        "--mode",
+        "remote",
+        "--channel",
+        "default",
+      ]);
+      // ...and the ref checkout ran THERE too, not nowhere.
+      const checkoutDir = resolve("/saved/ws", "custom_nodes", "bar");
+      expect(mockedExec.mock.calls[2][1]).toEqual([
+        "-C",
+        checkoutDir,
+        "checkout",
+        "--detach",
+        "--end-of-options",
+        "abc123",
+      ]);
+    });
   });
 
   // ---- update ------------------------------------------------------------
@@ -871,22 +959,45 @@ describe("node-management service", () => {
       expect(params).toMatchObject({ node_name: "my-pack" });
     });
 
-    it("fails truthfully for an id that resolves NOWHERE (#730: queue-drain is not proof)", async () => {
+    it("fails truthfully for an id that resolves NOWHERE — before anything is queued (#730: queue-drain is not proof)", async () => {
       // Live evidence: the Manager drains "done" with total_count 0 for an
       // unknown id, and update used to report "Queued + updated" anyway. The
-      // pack resolves nowhere post-op → hard failure, no success claim.
-      stubFetch({ installedBody: {} });
+      // target now resolves up front — Manager list empty AND an enumerable
+      // custom_nodes without it (#797 disk evidence) → refusal, NOTHING queued.
+      fsCtl.readdirSync = () => [];
+      const { calls } = stubFetch({ installedBody: {} });
       const err = await updateCustomNode({ id: "mcp-sweep-nonexistent-pack" }).catch(
         (e: Error) => e,
       );
       expect(err).toBeInstanceOf(NodeManagementError);
-      expect((err as Error).message).toMatch(/not present afterward/);
+      expect((err as Error).message).toMatch(/not installed/);
+      expect((err as Error).message).toMatch(/NOTHING was queued/);
       expect((err as Error).message).not.toMatch(/updated/i);
+      expect(
+        calls.some(
+          (c) => (c.body as { kind?: string } | undefined)?.kind === "update",
+        ),
+      ).toBe(false);
+    });
+
+    it("update sends the MANAGER module name as node_name when it differs from the registry id", async () => {
+      const { calls } = stubFetch({
+        installedBody: {
+          "ComfyUI-Impact-Pack": { ver: "8.28.3", cnr_id: "comfyui-impact-pack", enabled: true },
+        },
+      });
+      const res = await updateCustomNode({ id: "comfyui-impact-pack" });
+      expect(res.mechanism).toBe("manager-http");
+      expect(taskOf(calls, "update").params).toMatchObject({
+        node_name: "ComfyUI-Impact-Pack",
+      });
     });
 
     it("still succeeds for an installed-but-not-in-registry (git-cloned) pack", async () => {
       // The #730 gate must not break packs the registry does not know: they
-      // match the installed list by module/auxId spellings.
+      // match the installed list by module/auxId spellings. The queued task
+      // names the MANAGER MODULE (the folder), which is what the routes
+      // resolve — not the caller's aux-id spelling.
       const { calls } = stubFetch({
         installedBody: {
           "some-git-node": { ver: "abc1234", aux_id: "user/some-git-node", enabled: true },
@@ -896,7 +1007,7 @@ describe("node-management service", () => {
       expect(res.mechanism).toBe("manager-http");
       expect(res.message).toMatch(/Queued \+ updated/);
       expect(taskOf(calls, "update").params).toMatchObject({
-        node_name: "user/some-git-node",
+        node_name: "some-git-node",
       });
     });
 
@@ -939,14 +1050,102 @@ describe("node-management service", () => {
       });
     });
 
-    it("fails truthfully for an id that resolves NOWHERE (#730)", async () => {
-      stubFetch({ installedBody: {} });
+    it("fails truthfully for an id that resolves NOWHERE — before anything is queued (#730)", async () => {
+      // Manager list empty AND an enumerable custom_nodes without the pack
+      // (#797 disk evidence) — refused up front, NOTHING queued.
+      fsCtl.readdirSync = () => [];
+      const { calls } = stubFetch({ installedBody: {} });
       const err = await reinstallCustomNode({ id: "mcp-sweep-nonexistent-pack" }).catch(
         (e: Error) => e,
       );
       expect(err).toBeInstanceOf(NodeManagementError);
-      expect((err as Error).message).toMatch(/not present afterward/);
+      expect((err as Error).message).toMatch(/not installed/);
+      expect((err as Error).message).toMatch(/NOTHING was queued/);
       expect((err as Error).message).not.toMatch(/reinstalled/i);
+      expect(
+        calls.some(
+          (c) => (c.body as { kind?: string } | undefined)?.kind === "uninstall",
+        ),
+      ).toBe(false);
+    });
+
+    it("reinstalls a module-spelled target via its CNR id so the install half can resolve", async () => {      // Caller passes the FOLDER name; the registry resolves the CNR id. The
+      // uninstall names the module; the reinstall names the registry id —
+      // otherwise the pack is removed and not restored (codex gate round 9).
+      const { calls } = stubFetch({
+        installedBody: {
+          "ComfyUI-Impact-Pack": { ver: "8.28.3", cnr_id: "comfyui-impact-pack", enabled: true },
+        },
+      });
+      const res = await reinstallCustomNode({ id: "ComfyUI-Impact-Pack" });
+      expect(res.mechanism).toBe("manager-http");
+      expect(taskOf(calls, "uninstall").params).toMatchObject({
+        node_name: "ComfyUI-Impact-Pack",
+      });
+      expect(taskOf(calls, "install").params).toMatchObject({
+        id: "comfyui-impact-pack",
+      });
+    });
+
+    it("an OBSERVED post-reinstall absence reports the pack as REMOVED with the remedy", async () => {
+      // Pre-resolve finds the pack; after the two queue cycles it is gone from
+      // the list AND from disk — the uninstall half ran, the install half did
+      // not restore it.
+      fsCtl.readdirSync = () => [];
+      let listCalls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            listCalls++;
+            return jsonResponse(listCalls === 1 ? installedMyPack : {});
+          }
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const err = await reinstallCustomNode({ id: "my-pack" }).catch((e: Error) => e);
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect((err as Error).message).toMatch(/left the pack REMOVED/);
+      expect((err as Error).message).toMatch(/install_custom_node/);
+    });
+
+    it("an UNVERIFIABLE post-reinstall state is NOT reported as REMOVED", async () => {
+      // The post-op list cannot be read — removal was never observed, so the
+      // verdict must stay "could not verify".
+      let listCalls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            listCalls++;
+            if (listCalls > 1) return new Response("boom", { status: 500 });
+            return jsonResponse(installedMyPack);
+          }
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const err = await reinstallCustomNode({ id: "my-pack" }).catch((e: Error) => e);
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect((err as Error).message).toMatch(/could NOT be verified/);
+      expect((err as Error).message).not.toMatch(/REMOVED/);
     });
 
     it("still succeeds for an installed-but-not-in-registry (git-cloned) pack", async () => {
@@ -980,6 +1179,827 @@ describe("node-management service", () => {
       expect(args).toContain("all");
     });
   });
+
+  // ---- on-disk presence evidence (#797) -------------------------------------
+
+  describe("on-disk presence evidence (#797)", () => {
+    // A registry-ZIP (or manually copied) pack is present in custom_nodes while
+    // the Manager's installed list says nothing about it. The presence gate
+    // must not read a Manager-list miss as "not installed locally".
+    const impactPyproject =
+      '[project]\nname = "comfyui-impact-pack"\nversion = "8.28.3"\n';
+    const impactOnDisk = () => {
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes")
+          ? [dirEnt("ComfyUI-Impact-Pack")]
+          : [];
+      fsCtl.readFileSync = (p) => {
+        if (p.endsWith("pyproject.toml")) return impactPyproject;
+        throw new Error(`unexpected readFileSync: ${p}`);
+      };
+    };
+
+    it("update of an on-disk-but-untracked pack refuses with the TRUTH, naming the directory", async () => {
+      impactOnDisk();
+      stubFetch({ installedBody: {} });
+      const err = await updateCustomNode({ id: "comfyui-impact-pack" }).catch(
+        (e: Error) => e,
+      );
+      expect(err).toBeInstanceOf(NodeManagementError);
+      // The REASON is the assertion: present-on-disk, not "absent".
+      expect((err as Error).message).toMatch(/present on disk/);
+      expect((err as Error).message).toMatch(/does not track/);
+      expect((err as Error).message).toContain("ComfyUI-Impact-Pack");
+      expect((err as Error).message).not.toMatch(/not present afterward/);
+      expect((err as Error).message).not.toMatch(/not installed locally/);
+    });
+
+    it("matches a pack by directory name even when its pyproject cannot be read", async () => {
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes")
+          ? [dirEnt("comfyui-impact-pack")]
+          : [];
+      fsCtl.readFileSync = () => {
+        throw new Error("EACCES");
+      };
+      stubFetch({ installedBody: {} });
+      const err = await updateCustomNode({ id: "comfyui-impact-pack" }).catch(
+        (e: Error) => e,
+      );
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect((err as Error).message).toMatch(/present on disk/);
+    });
+
+    it("matches a Manager-DISABLED pack directory (<name>.disabled) as present", async () => {
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes")
+          ? [dirEnt("comfyui-impact-pack.disabled")]
+          : [];
+      fsCtl.readFileSync = (p) => {
+        if (p.endsWith("pyproject.toml")) return impactPyproject;
+        throw new Error(`unexpected readFileSync: ${p}`);
+      };
+      stubFetch({ installedBody: {} });
+      const err = await updateCustomNode({ id: "comfyui-impact-pack" }).catch(
+        (e: Error) => e,
+      );
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect((err as Error).message).toMatch(/present on disk/);
+    });
+
+    it("install of an on-disk-but-untracked pack discloses 'already installed' instead of a not-found failure", async () => {
+      // On disk BEFORE the call and still after: nothing new happened.
+      impactOnDisk();
+      stubFetch({ installedBody: {} });
+      const res = await installCustomNode({ id: "comfyui-impact-pack" });
+      expect(res.message).toMatch(/present on disk/);
+      expect(res.message).toMatch(/ALREADY there before this call/);
+      expect(res.message).not.toMatch(/not found in the/);
+    });
+
+    it("does NOT call a FRESH registry-zip install 'already installed' — the pre-state decides", async () => {
+      // The pack is ABSENT before the call and present after: the install worked.
+      // ComfyUI-Manager does not track registry-ZIP installs, so the post-state
+      // alone looks identical to the case above — and reading it as "already
+      // installed" told the user nothing happened when their pack had just been
+      // installed (codex gate P0). A pre-state cannot be recovered afterwards.
+      let installed = false;
+      // Reuse the on-disk fixture rather than re-deriving its path matching, then
+      // gate it on the flag: absent until the queue op fires, present after.
+      impactOnDisk();
+      const whenPresent = fsCtl.readdirSync;
+      fsCtl.readdirSync = (p) => (installed ? whenPresent(p) : []);
+      stubFetch({ installedBody: {}, onQueue: () => { installed = true; } });
+      const res = await installCustomNode({ id: "comfyui-impact-pack" });
+
+      // States the OBSERVATION, not a causal claim: `diskBefore` is a filesystem
+      // snapshot with nothing binding it to this operation, so under two agents
+      // on one rig the other one could have created the directory. What we saw
+      // is "absent before, present now", and that is what it says.
+      expect(res.message).toMatch(/is now present on disk/);
+      expect(res.message).toMatch(/was NOT there before this call/);
+      expect(res.message).toMatch(/another agent/i);
+      expect(res.message).not.toMatch(/ALREADY/);
+      expect(res.message).not.toMatch(/resolved to nothing/);
+    });
+
+    it("the install post-verify scans the CALL-SCOPED adopted root, not the global one", async () => {
+      // apply_manifest threads an adopted live root via opts.comfyuiPath; the
+      // disk evidence must come from THAT root even when it differs from the
+      // configured/saved one.
+      fsCtl.readdirSync = (p) => {
+        const norm = p.replace(/\\/g, "/");
+        if (norm === "/adopted/ws/custom_nodes") return [dirEnt("ComfyUI-Impact-Pack")];
+        return [];
+      };
+      fsCtl.readFileSync = (p) => {
+        if (p.endsWith("pyproject.toml")) return impactPyproject;
+        throw new Error(`unexpected readFileSync: ${p}`);
+      };
+      stubFetch({ installedBody: {} });
+      const res = await installCustomNode({
+        id: "comfyui-impact-pack",
+        comfyuiPath: "/adopted/ws",
+      });
+      expect(res.message).toMatch(/present on disk/);
+      expect(res.message).toContain(join("/adopted/ws", "custom_nodes", "ComfyUI-Impact-Pack"));
+    });
+
+    it("absence is asserted from BOTH sources when both were readable", async () => {
+      fsCtl.readdirSync = () => [];
+      stubFetch({ installedBody: {} });
+      const err = await updateCustomNode({ id: "mcp-sweep-nonexistent-pack" }).catch(
+        (e: Error) => e,
+      );
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect((err as Error).message).toMatch(/not installed/);
+      // Says the disk was actually checked — not a Manager-list-only verdict.
+      expect((err as Error).message).toMatch(/on disk under/);
+      expect((err as Error).message).toMatch(/NOTHING was queued/);
+    });
+
+    it("an unreadable disk check is UNVERIFIABLE, never absence", async () => {
+      // readdirSync delegates to the real fs, which throws on the fake root —
+      // the disk could not answer, so the verdict must stay "could not
+      // determine", and nothing is queued.
+      stubFetch({ installedBody: {} });
+      const err = await updateCustomNode({ id: "mcp-sweep-nonexistent-pack" }).catch(
+        (e: Error) => e,
+      );
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect((err as Error).message).toMatch(/could not be determined/);
+      expect((err as Error).message).toMatch(/NOTHING was queued|NOT queued/);
+      expect((err as Error).message).not.toMatch(/not installed —/);
+    });
+
+    it("on-disk pack + UNREADABLE Manager list → unverifiable, never 'Manager does not track it'", async () => {
+      // The disk says present, but the list could not be read — so neither
+      // "Manager does not track it" nor "the op resolved to nothing" was
+      // observed, and the message must not claim them.
+      impactOnDisk();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            return new Response("boom", { status: 500 });
+          }
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const err = await updateCustomNode({ id: "comfyui-impact-pack" }).catch(
+        (e: Error) => e,
+      );
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect((err as Error).message).toMatch(/present on disk/);
+      expect((err as Error).message).toMatch(/could NOT be determined/);
+      expect((err as Error).message).not.toMatch(/does not track/);
+      expect((err as Error).message).not.toMatch(/resolved to NOTHING/);
+    });
+
+    it("the post-op gate uses the ENTRY-captured presence context, not a mid-op retarget", async () => {
+      // The session is LOCAL at invocation and the pack is on disk. A retarget
+      // flipping the session to remote mid-drain must not strip the disk
+      // evidence from the post-op check.
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes") ? [dirEnt("my-pack")] : [];
+      fsCtl.readFileSync = () => {
+        throw new Error("ENOENT");
+      };
+      let listCalls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            listCalls++;
+            if (listCalls === 1) remoteFlags.remoteMode = true; // retarget mid-op
+            return jsonResponse(
+              listCalls === 1
+                ? { "my-pack": { ver: "1.0.0", cnr_id: "my-pack", enabled: true } }
+                : {},
+            );
+          }
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const err = await updateCustomNode({ id: "my-pack" }).catch((e: Error) => e);
+      expect(err).toBeInstanceOf(NodeManagementError);
+      // The entry context was local with the pack on disk — the verdict must
+      // say so, not fall back to a Manager-list-only absence.
+      expect((err as Error).message).toMatch(/present on disk/);
+      expect((err as Error).message).not.toMatch(/does not inspect custom_nodes/);
+    });
+  });
+
+  // ---- comfy-cli fallback (#808) --------------------------------------------
+
+  describe("comfy-cli fallback (#808)", () => {
+    it("useCmCli falls back to Manager HTTP when comfy-cli is not installed, and says so", async () => {
+      // No comfy binary anywhere: not in the workspace venv, not on PATH.
+      mockedExists.mockReturnValue(false);
+      const { calls } = stubFetch({
+        installedBody: {
+          "my-pack": { ver: "1.0.0", cnr_id: "my-pack", enabled: true },
+        },
+      });
+      const res = await installCustomNode({ id: "my-pack", useCmCli: true });
+      // The mechanism switch is DISCLOSED, with the reason — not a silent
+      // fallback, and not the old NODE_MANAGEMENT_ERROR dead end.
+      expect(res.mechanism).toBe("manager-http");
+      expect(res.message).toMatch(/comfy-cli was requested/);
+      expect(res.message).toMatch(/not found on PATH/);
+      expect(res.message).toMatch(/Installed "my-pack" via ComfyUI-Manager/);
+      // Nothing was run through the CLI.
+      expect(mockedExec).not.toHaveBeenCalled();
+      expect(taskOf(calls, "install").params).toMatchObject({ id: "my-pack" });
+    });
+
+    it("useCmCli still uses comfy-cli when it IS available", async () => {
+      mockedExec.mockReturnValue(cliEnvelope({ message: "ok" }) as never);
+      const res = await installCustomNode({ id: "my-pack", useCmCli: true });
+      expect(res.mechanism).toBe("comfy-cli");
+      expect(res.message).not.toMatch(/falling back|requested \(useCmCli\)/);
+    });
+  });
+
+  // ---- disable / enable / uninstall (#775) ----------------------------------
+
+  describe("disable/enable/uninstall (#775)", () => {
+    const installedEnabled = {
+      "my-pack": { ver: "1.0.0", cnr_id: "my-pack", enabled: true },
+    };
+    const installedImpact = {
+      "comfyui-impact-pack": { ver: "1.0.0", cnr_id: "comfyui-impact-pack", enabled: true },
+    };
+    const installedDisabled = {
+      "my-pack": { ver: "1.0.0", cnr_id: "my-pack", enabled: false },
+    };
+    const drained = {
+      total_count: 1,
+      done_count: 1,
+      in_progress_count: 0,
+      is_processing: false,
+    };
+
+    /** Installed-list responses that CHANGE between the pre-op and post-op
+     *  reads: the pre-check sees `pre`, the post-op verification sees `post`. */
+    const stubChangingList = (pre: unknown, post: unknown) => {
+      let listCalls = 0;
+      const calls: Call[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string, init?: RequestInit) => {
+          const method = init?.method ?? "GET";
+          const body = init?.body ? JSON.parse(init.body as string) : undefined;
+          calls.push({ url, method, body });
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            listCalls++;
+            return jsonResponse(listCalls === 1 ? pre : post);
+          }
+          if (path === "/v2/manager/queue/status") return jsonResponse(drained);
+          return new Response("", { status: 200 });
+        }),
+      );
+      return { calls };
+    };
+
+    it("disable queues a disable task and verifies the pack reports disabled", async () => {
+      const { calls } = stubChangingList(installedEnabled, installedDisabled);
+      const res = await disableCustomNode({ id: "my-pack" });
+      expect(taskOf(calls, "disable").params).toMatchObject({
+        node_name: "my-pack",
+      });
+      expect(res.message).toMatch(/Disabled "my-pack"/);
+      expect(res.message).toMatch(/verified/);
+    });
+
+    it("disable of an ALREADY-DISABLED pack queues nothing and says so (no fabricated transition)", async () => {
+      const { calls } = stubChangingList(installedDisabled, installedDisabled);
+      const res = await disableCustomNode({ id: "my-pack" });
+      expect(res.message).toMatch(/already disabled/);
+      expect(res.message).toMatch(/NOTHING was run/);
+      expect(res.message).not.toMatch(/Disabled "my-pack" via/);
+      expect(
+        calls.some(
+          (c) => (c.body as { kind?: string } | undefined)?.kind === "disable",
+        ),
+      ).toBe(false);
+    });
+
+    it("disable discloses when Manager still reports the pack enabled", async () => {
+      stubFetch({ installedBody: installedEnabled });
+      const res = await disableCustomNode({ id: "my-pack" });
+      expect(res.message).toMatch(/did NOT take effect/);
+      expect(res.message).not.toMatch(/Disabled "my-pack" via/);
+    });
+
+    it("disable reports UNVERIFIED — neither success nor failure — when the post-op list cannot be read", async () => {
+      // Pre-op read succeeds (the target validates), the POST-OP read fails.
+      let listCalls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string, init?: RequestInit) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            listCalls++;
+            if (listCalls > 1) return new Response("boom", { status: 500 });
+            return jsonResponse(installedEnabled);
+          }
+          if (path === "/v2/manager/queue/status") return jsonResponse(drained);
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await disableCustomNode({ id: "my-pack" });
+      expect(res.message).toMatch(/could NOT be verified/);
+      expect(res.message).not.toMatch(/Disabled "my-pack"/);
+      expect(res.message).not.toMatch(/did NOT take effect/);
+    });
+
+    it("disable refuses an id that resolves nowhere — NOTHING is queued", async () => {
+      fsCtl.readdirSync = () => [];
+      const { calls } = stubFetch({ installedBody: {} });
+      const err = await disableCustomNode({ id: "ghost-pack" }).catch((e: Error) => e);
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect((err as Error).message).toMatch(/not installed/);
+      expect((err as Error).message).toMatch(/NOTHING was queued/);
+      expect(
+        calls.some(
+          (c) => (c.body as { kind?: string } | undefined)?.kind === "disable",
+        ),
+      ).toBe(false);
+    });
+
+    it("disable stays UNVERIFIED when Manager reports no enabled flag at all", async () => {
+      // A build that carries neither `enabled` nor `is_disabled` — the flag
+      // must not be invented as "enabled" and then "verified".
+      stubFetch({ installedBody: { "my-pack": { ver: "1.0.0", cnr_id: "my-pack" } } });
+      const res = await disableCustomNode({ id: "my-pack" });
+      expect(res.message).toMatch(/could NOT be verified/);
+      expect(res.message).not.toMatch(/Disabled "my-pack" via/);
+    });
+
+    it("disable via comfy-cli verifies against the Manager list afterwards", async () => {
+      mockedExec.mockReturnValue(cliEnvelope({ message: "disabled" }) as never);
+      stubChangingList(installedEnabled, installedDisabled);
+      const res = await disableCustomNode({ id: "my-pack", useCmCli: true });
+      expect(res.mechanism).toBe("comfy-cli");
+      expect(res.message).toMatch(/via official comfy-cli/);
+      expect(res.message).toMatch(/verified against ComfyUI-Manager/);
+    });
+
+    it("disable via comfy-cli of an ALREADY-DISABLED pack runs nothing and says so", async () => {
+      stubChangingList(installedDisabled, installedDisabled);
+      const res = await disableCustomNode({ id: "my-pack", useCmCli: true });
+      expect(res.mechanism).toBe("comfy-cli");
+      expect(res.message).toMatch(/already disabled/);
+      expect(res.message).toMatch(/NOTHING was run/);
+      expect(mockedExec).not.toHaveBeenCalled();
+    });
+
+    it("disable via comfy-cli discloses when the CLI's success claim doesn't hold", async () => {
+      mockedExec.mockReturnValue(cliEnvelope({ message: "disabled" }) as never);
+      // CLI claims success; Manager still reports the pack enabled.
+      stubFetch({ installedBody: installedEnabled });
+      const res = await disableCustomNode({ id: "my-pack", useCmCli: true });
+      expect(res.message).toMatch(/did NOT take effect/);
+      expect(res.message).not.toMatch(/^Disabled/);
+    });
+
+    it("disable with useCmCli falls back to Manager HTTP when the CLI is unavailable, disclosed", async () => {
+      // No comfy binary anywhere (workspace venv or PATH).
+      mockedExists.mockReturnValue(false);
+      stubChangingList(installedEnabled, installedDisabled);
+      const res = await disableCustomNode({ id: "my-pack", useCmCli: true });
+      expect(res.mechanism).toBe("manager-http");
+      expect(res.message).toMatch(/comfy-cli was requested/);
+      expect(res.message).toMatch(/Disabled "my-pack"/);
+      expect(mockedExec).not.toHaveBeenCalled();
+    });
+
+    it("the CLI workspace is pinned with the target across the pre-check await (retarget mid-op)", async () => {
+      mockedExec.mockReturnValue(cliEnvelope({ message: "disabled" }) as never);
+      let listCalls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            listCalls++;
+            // A retarget landing between the pre-check and the CLI run must not
+            // move the CLI to a different install.
+            if (listCalls === 1) config.comfyuiPath = "/other/comfy";
+            return jsonResponse(listCalls === 1 ? installedEnabled : installedDisabled);
+          }
+          if (path === "/v2/manager/queue/status") return jsonResponse(drained);
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await disableCustomNode({ id: "my-pack", useCmCli: true });
+      expect(res.mechanism).toBe("comfy-cli");
+      const cliArgs = mockedExec.mock.calls[0]?.[1] as string[];
+      expect(cliArgs[cliArgs.indexOf("--workspace") + 1]).toBe(COMFY);
+    });
+
+    it("disable sends the MANAGER module name as node_name when it differs from the registry id", async () => {
+      // Manager's installed list keys on the folder name; the caller's registry
+      // id only MATCHES it. The queued op must use the module name or the 3.x
+      // routes resolve nothing.
+      const pre = {
+        "ComfyUI-Impact-Pack": { ver: "8.28.3", cnr_id: "comfyui-impact-pack", enabled: true },
+      };
+      const post = {
+        "ComfyUI-Impact-Pack": { ver: "8.28.3", cnr_id: "comfyui-impact-pack", enabled: false },
+      };
+      const { calls } = stubChangingList(pre, post);
+      const res = await disableCustomNode({ id: "comfyui-impact-pack" });
+      expect(taskOf(calls, "disable").params).toMatchObject({
+        node_name: "ComfyUI-Impact-Pack",
+      });
+      expect(res.message).toMatch(/Disabled "comfyui-impact-pack"/);
+    });
+
+    it("enable queues an enable task keyed by cnr_id and verifies the pack reports enabled", async () => {
+      const { calls } = stubChangingList(installedDisabled, installedEnabled);
+      const res = await enableCustomNode({ id: "my-pack" });
+      expect(taskOf(calls, "enable").params).toMatchObject({ cnr_id: "my-pack" });
+      expect(res.message).toMatch(/Enabled "my-pack"/);
+    });
+
+    it("uninstall refuses a pack that resolves nowhere — NOTHING is queued", async () => {
+      fsCtl.readdirSync = () => [];
+      const { calls } = stubFetch({ installedBody: {} });
+      const err = await uninstallCustomNode({ id: "ghost-pack" }).catch(
+        (e: Error) => e,
+      );
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect((err as Error).message).toMatch(/not installed/);
+      expect((err as Error).message).toMatch(/NOTHING was queued/);
+      expect(
+        calls.some(
+          (c) => (c.body as { kind?: string } | undefined)?.kind === "uninstall",
+        ),
+      ).toBe(false);
+    });
+
+    it("uninstall refuses an on-disk-but-untracked pack and names the directory to remove", async () => {
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes") ? [dirEnt("ghost-pack")] : [];
+      fsCtl.readFileSync = () => {
+        throw new Error("ENOENT");
+      };
+      stubFetch({ installedBody: {} });
+      const err = await uninstallCustomNode({ id: "ghost-pack" }).catch(
+        (e: Error) => e,
+      );
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect((err as Error).message).toMatch(/does not track/);
+      expect((err as Error).message).toContain("ghost-pack");
+      expect((err as Error).message).toMatch(/NOTHING was queued/);
+    });
+
+    it("uninstall verifies the pack is GONE before claiming success", async () => {
+      let listCalls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            listCalls++;
+            // Pre-queue presence check sees the pack; post-op it is gone.
+            return jsonResponse(listCalls === 1 ? installedEnabled : {});
+          }
+          if (path === "/v2/manager/queue/status") return jsonResponse(drained);
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await uninstallCustomNode({ id: "my-pack" });
+      expect(res.message).toMatch(/Uninstalled "my-pack"/);
+      expect(listCalls).toBeGreaterThanOrEqual(2);
+    });
+
+    it("does NOT claim an uninstall when the DIRECTORY survives Manager's list", async () => {
+      // A partial uninstall can drop Manager's tracking entry and leave
+      // custom_nodes/<pack> on disk. ComfyUI loads directories, not Manager's
+      // bookkeeping — so the pack comes back on the next restart while we have
+      // already told the user it is gone (codex gate P0). A destructive
+      // postcondition deserves the strongest evidence available.
+      // The directory is there before AND after. Inlined rather than reusing the
+      // sibling block's helper, which is scoped elsewhere; `endsWith` avoids a
+      // separator regex entirely.
+      const impactToml = '[project]' + String.fromCharCode(10) +
+        'name = "comfyui-impact-pack"' + String.fromCharCode(10) +
+        'version = "8.28.3"' + String.fromCharCode(10);
+      fsCtl.readdirSync = (p) =>
+        p.endsWith("custom_nodes") ? [dirEnt("ComfyUI-Impact-Pack")] : [];
+      fsCtl.readFileSync = (p) => {
+        if (p.endsWith("pyproject.toml")) return impactToml;
+        throw new Error(`unexpected readFileSync: ${p}`);
+      };
+      let listCalls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            listCalls++;
+            return jsonResponse(listCalls === 1 ? installedImpact : {});
+          }
+          if (path === "/v2/manager/queue/status") return jsonResponse(drained);
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await uninstallCustomNode({ id: "comfyui-impact-pack" });
+
+      expect(res.message).toMatch(/STILL on disk/);
+      expect(res.message).toMatch(/NOT a completed uninstall/);
+      // The claim it must never make while the directory is there.
+      expect(res.message).not.toMatch(/^Uninstalled/);
+    });
+
+    it("uninstall discloses when the pack is STILL present afterwards", async () => {
+      stubFetch({ installedBody: installedEnabled });
+      const res = await uninstallCustomNode({ id: "my-pack" });
+      expect(res.message).toMatch(/did NOT take effect/);
+      expect(res.message).not.toMatch(/Uninstalled "my-pack" via/);
+    });
+
+    it("EVERY comfy-cli route refuses in remote mode, not just the ones with an availability probe", async () => {
+      // The first fix guarded `comfyCliUnavailableReason`, which only
+      // install/enable/disable/uninstall consult — `update`, `reinstall`, `fix
+      // all` and dependency sync call the CLI without it, so four routes could
+      // still mutate a stale local install in remote mode (codex gate P0). The
+      // guard now sits in `runCmCli`, which every one of them passes through.
+      stubFetch({ installedBody: installedEnabled });
+      remoteFlags.remoteMode = true;
+      try {
+        const err = await updateCustomNode({ id: "my-pack", useCmCli: true }).catch(
+          (e: unknown) => e,
+        );
+        expect(String(err)).toMatch(/REMOTE ComfyUI/i);
+        expect(String(err)).toMatch(/Nothing was run/i);
+        // And the CLI subprocess was never spawned.
+        expect(mockedExec).not.toHaveBeenCalled();
+      } finally {
+        remoteFlags.remoteMode = false;
+      }
+    });
+
+    it("comfy-cli REFUSES in remote mode — a local uninstall must not run behind remote checks", async () => {
+      // The dangerous shape: a local COMFYUI_PATH IS available, so the "no local
+      // path" guard passes and comfy-cli happily uninstalls from the local tree
+      // while the pre/post Manager checks describe the REMOTE server — and the
+      // local destructive action is never disclosed (codex gate P0). Having a
+      // path is what makes this case unsafe, not the lack of one.
+      // Manager is reachable and tracks the pack, so the presence pre-check
+      // passes and the CLI decision is actually reached.
+      stubFetch({ installedBody: installedEnabled });
+      remoteFlags.remoteMode = true;
+      try {
+        const res = await uninstallCustomNode({ id: "my-pack", useCmCli: true });
+        expect(JSON.stringify(res)).toMatch(/REMOTE ComfyUI/i);
+        expect(res.mechanism).not.toBe("comfy-cli");
+      } finally {
+        remoteFlags.remoteMode = false;
+      }
+    });
+
+    it("uninstall via comfy-cli refuses a pack that was never installed — nothing runs", async () => {
+      // CLI usable (default mocks), but the pre-check resolves nowhere —
+      // the CLI must not run so its exit 0 can be "verified" as a no-op.
+      fsCtl.readdirSync = () => [];
+      stubFetch({ installedBody: {} });
+      const err = await uninstallCustomNode({ id: "ghost-pack", useCmCli: true }).catch(
+        (e: Error) => e,
+      );
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect((err as Error).message).toMatch(/not installed/);
+      expect(mockedExec).not.toHaveBeenCalled();
+    });
+
+    it("uninstall via comfy-cli with an unreadable list and NO pack anywhere is UNVERIFIED, not 'Uninstalled'", async () => {
+      // Absent before AND after: the post-op absence may predate the call, so
+      // claiming an uninstall would fabricate a transition.
+      fsCtl.readdirSync = () => [];
+      mockedExec.mockReturnValue(cliEnvelope({ message: "uninstalled" }) as never);
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            return new Response("boom", { status: 500 });
+          }
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await uninstallCustomNode({ id: "my-pack", useCmCli: true });
+      expect(res.mechanism).toBe("comfy-cli");
+      expect(res.message).toMatch(/NOT claiming an uninstall happened/);
+      expect(res.message).not.toMatch(/no matching pack directory remains/);
+    });
+
+    it("uninstall via comfy-cli proceeds with an unreadable list when the pack IS on disk, verified on disk", async () => {
+      let removed = false;
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes") && !removed
+          ? [dirEnt("my-pack")]
+          : [];
+      fsCtl.readFileSync = () => {
+        throw new Error("ENOENT");
+      };
+      mockedExec.mockImplementation(() => {
+        removed = true;
+        return cliEnvelope({ message: "uninstalled" }) as never;
+      });
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            return new Response("boom", { status: 500 });
+          }
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse(drained);
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await uninstallCustomNode({ id: "my-pack", useCmCli: true });
+      expect(res.mechanism).toBe("comfy-cli");
+      expect(mockedExec).toHaveBeenCalled();
+      expect(res.message).toMatch(/Uninstalled "my-pack"/);
+      expect(res.message).toMatch(/no matching directory remains/);
+    });
+
+    it("the CLI uninstall disk verification uses the ENTRY-captured workspace, not a retargeted one", async () => {
+      // The CLI runs against /fake/comfy; the retarget flips config to
+      // /other/comfy (which still has the pack). Verifying against the
+      // retargeted root would falsely report "did NOT take effect".
+      let removed = false;
+      fsCtl.readdirSync = (p) => {
+        const norm = p.replace(/\\/g, "/");
+        if (norm.includes("/other/comfy/")) return [dirEnt("my-pack")];
+        if (norm.endsWith("/custom_nodes")) return removed ? [] : [dirEnt("my-pack")];
+        return [];
+      };
+      fsCtl.readFileSync = () => {
+        throw new Error("ENOENT");
+      };
+      mockedExec.mockImplementation(() => {
+        config.comfyuiPath = "/other/comfy";
+        removed = true;
+        return cliEnvelope({ message: "uninstalled" }) as never;
+      });
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            return new Response("boom", { status: 500 });
+          }
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse(drained);
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await uninstallCustomNode({ id: "my-pack", useCmCli: true });
+      expect(res.message).toMatch(/Uninstalled "my-pack"/);
+      expect(res.message).not.toMatch(/did NOT take effect/);
+    });
+
+    it("disable via comfy-cli proceeds with an unreadable list when the pack IS on disk, disclosed", async () => {
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes") ? [dirEnt("my-pack")] : [];
+      fsCtl.readFileSync = () => {
+        throw new Error("ENOENT");
+      };
+      mockedExec.mockReturnValue(cliEnvelope({ message: "disabled" }) as never);
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            return new Response("boom", { status: 500 });
+          }
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse(drained);
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await disableCustomNode({ id: "my-pack", useCmCli: true });
+      expect(res.mechanism).toBe("comfy-cli");
+      expect(mockedExec).toHaveBeenCalled();
+      expect(res.message).toMatch(/comfy-cli's own report/);
+      expect(res.message).toMatch(/pre-operation state was never established/);
+    });
+  });
+
+  // ---- panel_install_node git-URL normalization (#789) ----------------------
+
+  describe("normalizeGitUrlInstallArgs (#789)", () => {
+    const URL = "https://github.com/ltdrdata/ComfyUI-Impact-Pack";
+
+    it("routes a git-URL id with no version to a nightly from-source install, disclosed", () => {
+      const out = normalizeGitUrlInstallArgs({ id: URL });
+      expect(out.repository).toBe(URL);
+      expect(out.version).toBe("nightly");
+      expect(out.note).toMatch(/from-source/);
+      // The URL is NOT forwarded as `id` too — the reroute off the id path is
+      // the whole point; sending both leaves it to downstream precedence.
+      expect(out.id).toBeUndefined();
+    });
+
+    it("translates an explicit 'latest' on a git URL to 'nightly' (the #789 failure shape)", () => {
+      const out = normalizeGitUrlInstallArgs({ id: URL, version: "latest" });
+      expect(out.version).toBe("nightly");
+      expect(out.note).toBeTruthy();
+      expect(out.id).toBeUndefined();
+    });
+
+    it("leaves an explicit non-latest version untouched — the caller's choice stands", () => {
+      const out = normalizeGitUrlInstallArgs({ id: URL, version: "8.28.3" });
+      expect(out.version).toBe("8.28.3");
+      expect(out.note).toBeUndefined();
+      expect(out.id).toBeUndefined();
+    });
+
+    it("leaves a plain registry id install untouched", () => {
+      expect(normalizeGitUrlInstallArgs({ id: "comfyui-kjnodes" })).toEqual({});
+      expect(
+        normalizeGitUrlInstallArgs({ id: "comfyui-kjnodes", version: "latest" }),
+      ).toEqual({});
+    });
+
+    it("honours an explicit repository as the git target", () => {
+      const out = normalizeGitUrlInstallArgs({ repository: URL });
+      expect(out.repository).toBe(URL);
+      expect(out.version).toBe("nightly");
+    });
+
+    it("refuses when BOTH id and repository are given — two targets, not one", () => {
+      const out = normalizeGitUrlInstallArgs({
+        id: "comfyui-kjnodes",
+        repository: URL,
+      });
+      expect(out.conflict).toMatch(/BOTH/);
+      expect(out.version).toBeUndefined();
+      expect(out.repository).toBeUndefined();
+    });
+  });
+
+  describe("nodesInstallCommandArgs (#789 dispatch shape)", () => {
+    const URL = "https://github.com/ltdrdata/ComfyUI-Impact-Pack";
+
+    it("the dispatched command drops `id` for a URL-as-id target — no ??-merge can restore it", () => {
+      const out = nodesInstallCommandArgs({ id: URL, version: "latest", mode: "remote" });
+      expect(out.id).toBeUndefined();
+      expect(out.repository).toBe(URL);
+      expect(out.version).toBe("nightly");
+      expect(out.mode).toBe("remote");
+      expect(out.note).toBeTruthy();
+      expect(out.conflict).toBeUndefined();
+    });
+
+    it("passes a plain registry id through untouched", () => {
+      const out = nodesInstallCommandArgs({ id: "comfyui-kjnodes", version: "latest" });
+      expect(out.id).toBe("comfyui-kjnodes");
+      expect(out.version).toBe("latest");
+      expect(out.repository).toBeUndefined();
+    });
+
+    it("surfaces the id+repository conflict", () => {
+      const out = nodesInstallCommandArgs({ id: "comfyui-kjnodes", repository: URL });
+      expect(out.conflict).toMatch(/BOTH/);
+    });
+  });
+
 
   // ---- list --------------------------------------------------------------
 
@@ -1028,16 +2048,111 @@ describe("node-management service", () => {
       expect(nodes[0].module).toBe("PackA");
     });
 
-    it("treats missing enabled as enabled unless is_disabled is set", async () => {
+    it("missing enabled/is_disabled is UNKNOWN, never defaulted to a definite state", async () => {
       stubFetch({
         installedBody: {
           A: { ver: "1" },
           B: { ver: "1", is_disabled: true },
+          C: { ver: "1", is_disabled: false },
         },
       });
       const nodes = await listInstalledNodes();
-      expect(nodes.find((n) => n.module === "A")!.enabled).toBe(true);
+      // A reported nothing — claiming "enabled" would be inventing state the
+      // verification paths then treat as observed.
+      expect(nodes.find((n) => n.module === "A")!.enabled).toBeUndefined();
       expect(nodes.find((n) => n.module === "B")!.enabled).toBe(false);
+      expect(nodes.find((n) => n.module === "C")!.enabled).toBe(true);
+    });
+
+    it("an installed-list ERROR ENVELOPE ({\"error\": …}) is unreadable, not an empty list", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname;
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          if (path.startsWith("/v2/customnode/installed")) {
+            // Parses as an object — but its values are scalars, not pack records.
+            return jsonResponse({ error: "temporary failure" });
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      await expect(listInstalledNodes()).rejects.toThrow(/unreadable payload/);
+    });
+
+    it("a NESTED error envelope ({\"error\": {\"message\": …}}) is unreadable, not a pack named 'error'", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname;
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          if (path.startsWith("/v2/customnode/installed")) {
+            return jsonResponse({ error: { message: "temporary failure" } });
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      await expect(listInstalledNodes()).rejects.toThrow(/unreadable payload/);
+    });
+
+    it("a STRING-array installed payload is unreadable — parseInstalled drops bare strings", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname;
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          if (path.startsWith("/v2/customnode/installed")) {
+            return jsonResponse(["temporary failure"]);
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      await expect(listInstalledNodes()).rejects.toThrow(/unreadable payload/);
+    });
+
+    it("an unreadable installed-list payload is an ERROR, not an empty list", async () => {
+      // A 200 whose body is HTML/text parses to a raw string in managerFetch;
+      // parseInstalled would silently read it as "nothing installed".
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname;
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          if (path.startsWith("/v2/customnode/installed")) {
+            return new Response("<!doctype html><html>catchall</html>", { status: 200 });
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      await expect(listInstalledNodes()).rejects.toThrow(/unreadable payload/);
     });
   });
 
@@ -1254,6 +2369,89 @@ describe("node-management service", () => {
       // start + status polled on the UNPREFIXED routes; the task route never used
       expect(legacyCallTo(calls, "/manager/queue/start")).toBeDefined();
       expect(legacyCallTo(calls, "/v2/manager/queue/task")).toBeUndefined();
+    });
+
+    it("disable sends the pack's REAL installed version as node_ver (legacy body keys on it)", async () => {
+      let listCalls = 0;
+      const calls: Call[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+          const method = init?.method ?? "GET";
+          const body = init?.body ? JSON.parse(init.body as string) : undefined;
+          calls.push({ url, method, body });
+          const path = new URL(url).pathname;
+          if (path.startsWith("/v2/")) {
+            return new Response("405: Method Not Allowed", { status: 405 });
+          }
+          if (path === "/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          if (path === "/customnode/installed") {
+            listCalls++;
+            // Pre-check sees the pack enabled; post-op it reports disabled.
+            return jsonResponse(
+              listCalls === 1
+                ? { "my-pack": { ver: "1.2.3", cnr_id: "my-pack", enabled: true } }
+                : { "my-pack": { ver: "1.2.3", cnr_id: "my-pack", enabled: false } },
+            );
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await disableCustomNode({ id: "my-pack" });
+      expect(res.mechanism).toBe("manager-http");
+      expect(legacyCallTo(calls, "/manager/queue/disable")?.body).toMatchObject({
+        id: "my-pack",
+        version: "1.2.3",
+      });
+      expect(res.message).toMatch(/Disabled "my-pack"/);
+    });
+
+    it("uninstall sends the pack's REAL installed version as node_ver (legacy body keys on it)", async () => {
+      let listCalls = 0;
+      const calls: Call[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+          const method = init?.method ?? "GET";
+          const body = init?.body ? JSON.parse(init.body as string) : undefined;
+          calls.push({ url, method, body });
+          const path = new URL(url).pathname;
+          if (path.startsWith("/v2/")) {
+            return new Response("405: Method Not Allowed", { status: 405 });
+          }
+          if (path === "/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          if (path === "/customnode/installed") {
+            listCalls++;
+            // Pre-check sees the pack; post-op it is gone.
+            return jsonResponse(
+              listCalls === 1
+                ? { "my-pack": { ver: "4.5.6", cnr_id: "my-pack", enabled: true } }
+                : {},
+            );
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await uninstallCustomNode({ id: "my-pack" });
+      expect(res.message).toMatch(/Uninstalled "my-pack"/);
+      expect(legacyCallTo(calls, "/manager/queue/uninstall")?.body).toMatchObject({
+        id: "my-pack",
+        version: "4.5.6",
+      });
     });
 
     it("installs a git URL natively via { version:'unknown', files:[url] }", async () => {
@@ -1992,6 +3190,92 @@ describe("node-management service", () => {
       expect(msg).toMatch(/pip install -U comfyui_manager/i);
       expect(msg).toMatch(/disable the old custom_nodes\/ComfyUI-Manager clone/i);
       expect(msg).toMatch(/--enable-manager/i);
+    });
+
+    // ---- #817: a model download is not a node install ----------------------
+    describe("#817 the queue budget for a model download", () => {
+      /** A Manager whose queue NEVER drains, so the wait always times out. */
+      function stubNeverDrainingQueue(): void {
+        vi.stubGlobal(
+          "fetch",
+          vi.fn(async (url: string): Promise<Response> => {
+            const path = new URL(url).pathname;
+            if (path === "/v2/manager/queue/status") {
+              return jsonResponse({
+                total_count: 1,
+                done_count: 0,
+                in_progress_count: 1,
+                pending_count: 0,
+                is_processing: true,
+              });
+            }
+            if (path === "/v2/manager/is_legacy_manager_ui") {
+              return jsonResponse({ is_legacy_manager_ui: false });
+            }
+            return new Response("", { status: 200 });
+          }),
+        );
+      }
+
+      it("uses the MODEL budget, not the 600s node-install budget", async () => {
+        // The node budget is 5000 ms in this suite; the model budget is set to a
+        // distinct, larger value. If install-model wrongly took the node budget,
+        // the message would name 5 seconds — which is #817 in miniature: a model
+        // download timed out on a ceiling that was never sized for one.
+        setQueueTimingForTests({ timeoutMs: 5000, modelTimeoutMs: 90 });
+        stubNeverDrainingQueue();
+
+        const err = await installModelViaManager({
+          name: "big.safetensors",
+          url: "https://example.com/big.safetensors",
+          filename: "big.safetensors",
+          type: "diffusion_models",
+        }).catch((e) => e as Error);
+
+        expect((err as Error).message).toMatch(/did not finish within 0s|did not finish within/);
+        expect((err as Error).message).not.toMatch(/did not finish within 5s/);
+      });
+
+      it("says the wait gave up — NOT that the download failed — and forbids a re-issue", async () => {
+        setQueueTimingForTests({ modelTimeoutMs: 90 });
+        stubNeverDrainingQueue();
+
+        const err = await installModelViaManager({
+          name: "big.safetensors",
+          url: "https://example.com/big.safetensors",
+          filename: "big.safetensors",
+          type: "diffusion_models",
+        }).catch((e) => e as Error);
+        const msg = (err as Error).message;
+
+        // The wait ended; the host was never told to stop. Claiming failure here is
+        // what made #817's reporter re-issue — and a second concurrent server-side
+        // fetch of one file is how the destination ended up truncated.
+        expect(msg).toMatch(/NOT proof the download failed/i);
+        expect(msg).toMatch(/Do NOT re-issue/i);
+        expect(msg).toMatch(/corrupt model/i);
+        // …and it names moves the caller can actually make from here.
+        expect(msg).toMatch(/list_local_models/);
+        expect(msg).toMatch(/COMFYUI_MANAGER_DOWNLOAD_TIMEOUT_S/);
+        expect(msg).toMatch(/LOCAL ComfyUI/);
+      });
+
+      it("leaves a NODE install's timeout message alone — it must not inherit the download advice", async () => {
+        setQueueTimingForTests({ timeoutMs: 60 });
+        stubNeverDrainingQueue();
+
+        const err = await installCustomNode({ id: "comfyui-impact-pack" }).catch(
+          (e) => e as Error,
+        );
+        const msg = (err as Error).message;
+
+        expect(msg).toMatch(/did not finish within/);
+        // A node install has no half-downloaded model to protect and no
+        // COMFYUI_MANAGER_DOWNLOAD_TIMEOUT_S knob — telling it the model story would
+        // be advice that does not apply.
+        expect(msg).not.toMatch(/Do NOT re-issue/i);
+        expect(msg).not.toMatch(/COMFYUI_MANAGER_DOWNLOAD_TIMEOUT_S/);
+      });
     });
   });
 });

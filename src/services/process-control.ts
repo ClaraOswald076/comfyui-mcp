@@ -9,8 +9,14 @@ import { existsSync, readlinkSync, statSync } from "node:fs";
 import { platform } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { getSystemStats, resetClient, resetObjectInfoCache } from "../comfyui/client.js";
-import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
+import {
+  config,
+  getComfyUIBaseUrl,
+  getComfyuiTargetGeneration,
+  isRemoteMode,
+} from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
+import { errorText } from "../orchestrator/error-text.js";
 import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { findComfyuiPython } from "./env-capabilities.js";
@@ -196,10 +202,23 @@ interface StopResult {
 }
 
 interface StartResult {
+  /**
+   * Does THIS call have positive evidence it started the server?
+   *
+   * READ IT WITH `startup`, never alone. `started:false` paired with
+   * `startup:"unconfirmed"` means NOT CONFIRMED STARTED — it never means CONFIRMED
+   * NOT STARTED, and it is emphatically not "the server is down": check `ready`,
+   * which is the field that answers that. The boolean cannot carry a third state,
+   * so `startup` is the authoritative field and this one is a conservative
+   * projection of it.
+   */
   started: boolean;
   message: string;
   pid?: number;
   ready?: boolean;
+  /** See StartupConfirmation. REQUIRED on every path, including the ones that
+   *  never launched anything (#367). */
+  startup: StartupConfirmation;
   readiness?: StartupReadinessResult;
   auto_restart?: SupervisorResult;
   spawn_error?: ChildProcessErrorDetails;
@@ -221,7 +240,10 @@ interface StartResult {
 
 interface RestartResult {
   stopped: boolean;
+  /** Same contract as StartResult.started — read it with `startup`. */
   started: boolean;
+  /** See StartupConfirmation. REQUIRED on every path (#367). */
+  startup: StartupConfirmation;
   message: string;
   /** How to start it by hand — carried on every refusal, so a user who is told
    *  "not restarting" is never left to dig the command out of the process table
@@ -256,6 +278,68 @@ interface StartupReadinessResult {
   waited_ms: number;
   probe_url: string;
 }
+
+/**
+ * Did this call CONFIRM that the launch/reboot IT MADE is serving?
+ *
+ * THE SUBJECT IS THIS CALL'S OWN ATTEMPT, never the machine (codex gate round 5 —
+ * the wording below said "ComfyUI is down" after the messages had already been
+ * corrected not to, which is the same bucket-narrated-as-a-cause defect hiding in a
+ * doc comment). Whatever else may be serving the port is `listener_ownership`'s
+ * subject, and on the failure path nothing has been observed about it at all.
+ *
+ * A STRING tri-state (four-state, with the never-tried case named) for the same
+ * reason `listener_ownership` is one: the uncertain case has to survive
+ * `JSON.stringify`, and it must be impossible to read as the definite negative.
+ *
+ *   "confirmed"     — the API answered. Observed.
+ *   "failed"        — THIS CALL'S LAUNCH did not produce the serving instance, and
+ *                     that is OBSERVED rather than merely unproven. Two shapes: the
+ *                     process it launched is GONE (a spawn error, a recorded exit, or
+ *                     a liveness probe that came back DEFINITELY dead); or the port
+ *                     is provably owned by a DIFFERENT process, so something else is
+ *                     serving and our relaunch is not it. (The spawn-error path can
+ *                     return before the readiness poll has run at all, so this
+ *                     verdict carries no claim about probes; the ones that DID poll
+ *                     say so in their own message.) It does NOT say the port is
+ *                     unserved — an external launcher or supervisor may be serving
+ *                     it, which is why the message tells the caller to re-check.
+ *   "unconfirmed"   — this call cannot tie what is (or is not) serving to the
+ *                     launch/reboot it made. THREE shapes reach it, none a failure,
+ *                     and `ready` is what tells them apart:
+ *                       • ready:false — the readiness budget expired with nothing
+ *                         contradicting the start (#367);
+ *                       • ready:true, local — the server is up but the port owner
+ *                         could not be mapped, so our process cannot be shown to be
+ *                         the listener (the #449 shape);
+ *                       • ready:true, Manager reboot — the server is up but no cycle
+ *                         was observed, which is EVERY Manager reboot: that path
+ *                         watches for a healthy probe, never for a down→up, so an
+ *                         accepted request in front of a server that never restarted
+ *                         looks identical to a successful one.
+ *                     A caller composing its own message MUST check `ready` before
+ *                     saying anything about the server being up.
+ *   "not-attempted" — this call never launched or rebooted anything (a refusal, or
+ *                     a server that was already running). Stated rather than
+ *                     omitted so it can never be mistaken for an older build that
+ *                     did not carry the field.
+ *
+ * A DEADLINE EXPIRING ESTABLISHES THAT STARTUP WAS NOT CONFIRMED YET — NOT THAT IT
+ * FAILED (#367). The two were one verdict, and the message asserted whichever it
+ * happened to name: "the API did not become ready … Check the ComfyUI logs", with
+ * `started:false`, reported seconds before a healthy instance came up. That lie is
+ * worse than an unconfirmed success, because a user told their restart broke
+ * reaches for the thing that actually breaks it — kill the process, launch a second
+ * copy onto the same port — on a server that was about to be fine.
+ *
+ * Only an OBSERVATION may turn "not yet" into "no": we know the launch failed when
+ * we watched the process die, and never merely because we stopped waiting.
+ */
+type StartupConfirmation =
+  | "confirmed"
+  | "failed"
+  | "unconfirmed"
+  | "not-attempted";
 
 interface SupervisorResult {
   enabled: boolean;
@@ -636,10 +720,14 @@ function getRestartPolicy(): RestartPolicy {
  * env-tuned default; the remote reboot passes a longer budget.
  */
 async function waitForApiReady(
-  cfg?: { intervalMs: number; maxTries: number },
+  cfg?: { intervalMs: number; maxTries: number; probeUrl?: string },
 ): Promise<StartupReadinessResult> {
   const { intervalMs, maxTries } = cfg ?? getStartupReadinessConfig();
-  const probeUrl = `${getComfyUIBaseUrl()}/system_stats`;
+  // ANCHORABLE (codex gate round 12). The configured target is mutable, so a
+  // relaunch that resolved its instance before a retarget must be able to poll the
+  // instance it actually relaunched — not whatever the config points at by the time
+  // the probes run.
+  const probeUrl = cfg?.probeUrl ?? `${getComfyUIBaseUrl()}/system_stats`;
   const start = Date.now();
   let attempts = 0;
 
@@ -758,7 +846,132 @@ function describeLaunchedChildExit(
   exit: { code: number | null; signal: NodeJS.Signals | null } | undefined,
 ): string {
   if (!exit) return "";
-  return ` The process this call launched EXITED (${exitCause(exit)}) before the API came up, so ComfyUI is DOWN — this was a failed relaunch, not a slow start.`;
+  // WHAT THE EXIT PROVES, AND WHAT IT DOES NOT (codex gate, twice). It proves THIS
+  // RELAUNCH failed — decisively, and that is the point: it separates a real
+  // failure from a slow start (#367). It does NOT prove ComfyUI is down NOW: the
+  // only evidence about the port is the readiness poll, whose last probe is already
+  // in the past, and an external supervisor restarting the server a moment later is
+  // exactly the case this file spends its length refusing to guess about.
+  //
+  // Nor does it prove the API never came up: a poll only establishes that no
+  // SCHEDULED PROBE got a 2xx, and the server could have answered between two of
+  // them. So "before the API came up" is gone too — every clause here now names an
+  // observation rather than an inference from a gap between observations.
+  return ` The process this call launched EXITED (${exitCause(exit)}), so THIS RELAUNCH FAILED — it was not a slow start. No readiness probe got a healthy response, the last one included.`;
+}
+
+/** Whole seconds, never rounded down to a "within 0s" that reads as no wait. */
+function seconds(ms: number): number {
+  return Math.max(1, Math.round(ms / 1000));
+}
+
+/**
+ * How long to tell the caller to wait before looking again.
+ *
+ * Deliberately NOT the budget that just expired. "Re-check in another 120s" is
+ * advice nobody follows, and the whole purpose of the sentence is to get the user
+ * to look once more instead of reaching for the kill. A short, fixed interval is
+ * also the safe direction to be wrong in: checking too early costs one cheap
+ * health probe, while checking too late is the window the destructive response
+ * happens in.
+ */
+const RECHECK_HINT_S = 30;
+
+/** A probe interval a human can read — sub-second budgets must not render as "0s". */
+function describeInterval(ms: number): string {
+  return ms >= 1000 ? `${Math.round(ms / 1000)}s` : `${ms}ms`;
+}
+
+/**
+ * The argv the server is serving with RIGHT NOW, or undefined when it could not be
+ * read. Bounded and total: it is called on a success path where the only thing at
+ * stake is how much detail the report carries, so it must never throw and never
+ * hang the tool. The timer resolves the race without awaiting anything, so it is
+ * genuinely outside the window it bounds.
+ */
+export async function readServingArgv(
+  timeoutMs = 3000,
+): Promise<string[] | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const argv = await Promise.race([
+      getSystemStats().then((s) => s.system.argv),
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+    return Array.isArray(argv) && argv.length > 0 ? [...argv] : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    // THE GUARD IS ITSELF AN OPERATION THAT CAN FAIL (codex gate round 4). A throw
+    // from `finally` REPLACES the guarded result and escapes this function, which
+    // would turn a best-effort detail into a thrown restart. Nothing here may be
+    // allowed to do that.
+    try {
+      clearTimeout(timer);
+    } catch {
+      /* a timer we cannot clear is a leak at worst; it is unref'd and self-resolves */
+    }
+  }
+}
+
+/**
+ * The sentence about whether the launch ARGUMENTS survived a restart (#848).
+ *
+ * #848 is this cluster's defect pointed at a POSITIVE: "the restart succeeded" was
+ * read as the answer to a question it was never computed for — "did it come back
+ * with the arguments I just configured?" The server came back healthy, the report
+ * said so, and the user's newly-added flag was silently absent.
+ *
+ * This is strictly a report of TWO OBSERVATIONS: what the server ran before, and
+ * what it reports running now. It deliberately does NOT explain WHY they match. A
+ * Manager reboot re-execing the running process is a plausible cause and not one we
+ * observed, and naming it would assert a cause the evidence only permits as a
+ * possibility. What the user needs — that the change did not take, and what does
+ * apply it — is sayable from the observation alone.
+ *
+ * Silent when either reading is missing: an unread argv is not evidence of sameness.
+ */
+export function describeArgvDrift(
+  before: string[] | undefined,
+  after: string[] | undefined,
+  isDesktop: boolean,
+): string {
+  if (!before?.length || !after?.length) return "";
+  const unchanged =
+    before.length === after.length && before.every((tok, i) => tok === after[i]);
+  if (!unchanged) {
+    // "before this restart REQUEST", not "across this restart" (codex gate round 4).
+    // On the Manager path the only observations are an accepted request and a later
+    // healthy probe — no down→up cycle is required there — so a completed restart is
+    // not something these two readings may take as given.
+    return (
+      ` Its launch arguments CHANGED between the reading taken before this restart request and the one taken now: before ${before
+        .map(quoteToken)
+        .join(" ")} / now ${after.map(quoteToken).join(" ")}.`
+    );
+  }
+  // WHAT EQUAL ARGV ESTABLISHES (codex gate, twice). Two readings matched. That is
+  // all — and it is deliberately phrased as the pair of observations it is:
+  //   - it is NOT a reading of the user's saved settings (we never opened them), so
+  //     it cannot say a saved change "was ignored"; the edit may have been to
+  //     something argv does not carry at all; and
+  //   - it is NOT a causal claim about the restart either. "This restart did not
+  //     change them" says the restart had no effect on argv, which two equal
+  //     snapshots cannot show: a value can change and change back, and an accepted
+  //     Manager request is not proof a cycle even happened.
+  // What IS supportable is the present state — the arguments in force NOW are the
+  // old ones — so the remedy hangs off that, conditioned on the user's own
+  // expectation, which only they can check.
+  return (
+    ` Its launch arguments are UNCHANGED (${after.map(quoteToken).join(" ")}) — the same arguments were observed before this restart request and again now. ` +
+    "If you were expecting different arguments" +
+    (isDesktop
+      ? " (after editing ComfyUI Desktop's saved launch settings, say), they are not in effect here: fully quit the ComfyUI Desktop app and relaunch it so it spawns the server from those settings."
+      : " (after editing the launch command on the host, say), they are not in effect here: stop ComfyUI and start it again from its own launcher so the new arguments are used.")
+  );
 }
 
 /**
@@ -2062,6 +2275,15 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
 
   // Gather info before we kill it (or reuse the caller's pre-validated info so a
   // relaunch preflight in restartComfyUI is not discarded).
+  //
+  // The generation is captured BEFORE the resolve so a retarget landing inside that
+  // await is caught (codex gate round 12). `restartComfyUI` fences its own window
+  // and hands us pre-validated info; a DIRECT `stop_comfyui` had no fence at all,
+  // and its saved launch record does not repair the loss: `start_comfyui` afterwards
+  // consults the NEW live target, so it can refuse as remote or find that port
+  // occupied rather than relaunch what was killed. That falsifies this tool's whole
+  // contract — "captures process info so it can be restarted with start_comfyui".
+  const stopGeneration = getComfyuiTargetGeneration();
   let info = preInfo ?? null;
   let acquireDiagnostic: string | undefined;
   if (!info) {
@@ -2089,6 +2311,26 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
   // teardown below. A refusal leaves a still-RUNNING server, and tearing down its
   // crash supervision first would silently disarm auto-restart for a server we
   // then declined to touch — turning a safe refusal into a later lost server.
+  // …and the same refusal for a target that moved while we resolved it. Placed
+  // beside the identity check for the same reason it is: nothing has been touched
+  // yet, so refusing costs a stop and never the server. `preInfo` callers were
+  // already fenced by restartComfyUI, and re-checking here is harmless for them —
+  // their generation has not moved either.
+  if (getComfyuiTargetGeneration() !== stopGeneration) {
+    const retargetHint = recoveryHint(info);
+    return {
+      stopped: false,
+      message:
+        "Refusing to stop: the ComfyUI target changed while the running instance was being " +
+        "identified, so the instance resolved here is not provably the one this server is now " +
+        "configured for — and start_comfyui afterwards would consult the NEW target, which may " +
+        "not bring this one back. Nothing was killed. Let the target settle, then retry." +
+        describeRecovery(retargetHint),
+      has_restart_info: false,
+      restart_hint: retargetHint,
+    };
+  }
+
   const identity = processIdentityStillValid(info);
   if (!identity.ok) {
     return {
@@ -2301,14 +2543,38 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
   };
 }
 
-export async function startComfyUI(): Promise<StartResult> {
-  if (isRemoteMode()) {
+/**
+ * `anchor` pins the relaunch to a SPECIFIC instance (codex gate round 12).
+ *
+ * `restartComfyUI` resolves and validates its instance, then kills it, then waits
+ * for the port to free and sleeps — and only then starts. The configured target is
+ * mutable across all of that. Left unanchored, the relaunch spawned the right
+ * command (it comes from the saved ProcessInfo) but probed the NEW target's port:
+ * if that port was occupied it returned "already running" WITHOUT spawning, and the
+ * instance we had just killed stayed dead. Anchoring the port and the readiness URL
+ * to the values captured before the stop makes the whole sequence act on one
+ * instance. A direct `start_comfyui` passes nothing and reads the live config, which
+ * is right for it — there is no earlier moment it is bound to.
+ */
+export async function startComfyUI(anchor?: {
+  port?: number;
+  probeUrl?: string;
+}): Promise<StartResult> {
+  // The refusal is for a DIRECT `start_comfyui`, which has no instance in mind
+  // and would otherwise launch a local server while the caller is looking at a
+  // remote one. An ANCHORED call is a different question: a restart already
+  // stopped a specific local instance and is putting it back. Refusing there
+  // because another agent retargeted to remote during the stop window left that
+  // instance killed and abandoned, with the exception escaping past the point of
+  // no return (codex gate P0). The anchor is the evidence that this is a
+  // relaunch, not a fresh launch.
+  if (isRemoteMode() && !anchor) {
     throw new ProcessControlError(
       "start_comfyui launches ComfyUI on the local machine and is not " +
         "available when targeting a remote instance via --comfyui-url.",
     );
   }
-  const port = config.resolvedPort;
+  const port = anchor?.port ?? config.resolvedPort;
 
   // Check if already running. TRI-STATE: "the lookup could not run" is NOT "the
   // port is free". Collapsing them let us spawn into a port the old server may
@@ -2319,6 +2585,8 @@ export async function startComfyUI(): Promise<StartResult> {
   if (preLaunchProbe.state === "owned") {
     return {
       started: false,
+      // Nothing was launched, so there is no startup of ours to have confirmed.
+      startup: "not-attempted",
       message: `ComfyUI is already running on port ${port} (PID ${preLaunchProbe.pid})`,
       pid: preLaunchProbe.pid,
       // Something is serving the port and we never got as far as spawning. We did
@@ -2351,6 +2619,7 @@ export async function startComfyUI(): Promise<StartResult> {
     } else {
       return {
         started: false,
+        startup: "not-attempted",
         message:
           "No previous process info and could not find ComfyUI Desktop app. Start ComfyUI manually.",
         listener_ownership: unclassifiedOwnership(),
@@ -2367,6 +2636,8 @@ export async function startComfyUI(): Promise<StartResult> {
   if (!launched) {
     return {
       started: false,
+      // No command was ever spawned — a refusal, not a startup that went wrong.
+      startup: "not-attempted",
       message: info.isDesktopApp
         ? "Could not determine ComfyUI Desktop executable path. Please start it manually."
         : "No command-line info captured from previous run. Start ComfyUI manually.",
@@ -2415,15 +2686,23 @@ export async function startComfyUI(): Promise<StartResult> {
   // Manager upgrade), so re-probe rather than trust it (#646).
   resetManagerApiCache("comfyui started");
 
-  // Wait for API to become ready
+  // Wait for API to become ready — on the ANCHORED instance when we were given one,
+  // so a retarget during the launch cannot make us grade a different server.
   const startupResult = await Promise.race([
-    waitForApiReady().then((readiness) => ({ readiness })),
+    waitForApiReady(
+      anchor?.probeUrl
+        ? { ...getStartupReadinessConfig(), probeUrl: anchor.probeUrl }
+        : undefined,
+    ).then((readiness) => ({ readiness })),
     spawnError.then((error) => ({ spawn_error: error })),
   ]);
   if ("spawn_error" in startupResult) {
     return {
       started: false,
       ready: false,
+      // OBSERVED: the spawn itself errored. This is the definite negative, and the
+      // only kind of evidence allowed to produce one.
+      startup: "failed",
       message:
         `ComfyUI process failed to launch: ${startupResult.spawn_error.message}`,
       spawn_error: startupResult.spawn_error,
@@ -2438,23 +2717,109 @@ export async function startComfyUI(): Promise<StartResult> {
   const readiness = startupResult.readiness;
   if (!readiness.ready) {
     const env = launchEnvInfo(info);
+    // WHAT A DEADLINE ACTUALLY ESTABLISHES (#367).
+    //
+    // The budget expiring is a fact about how long WE waited, not a fact about the
+    // server. It says startup was not confirmed WITHIN it. Only an observation of
+    // the launched process being GONE turns that into a failure — and we can make
+    // that observation, so the two stop sharing a verdict whose message asserted
+    // whichever it happened to name.
+    //
+    // The old branch reported the #776 failure shape (ComfyUI aborting during
+    // import) for BOTH, because for a dead child it was right and nobody separated
+    // the live one. #776's truthfulness is preserved exactly — a child that died
+    // still reports DOWN, with the same sentence — while the live child stops being
+    // told it failed.
+    //
+    // `launchedChildStillRunning` is tri-state on purpose: `undefined` is "cannot
+    // tell", and it must not be spent as either answer, so it falls on the
+    // unconfirmed side with the uncertainty stated. Only a DEFINITE death fails.
+    const childAlive = launchedChildStillRunning(launched.child);
+    const childIsGone =
+      launchedSpawnFailed || launchedChildExit != null || childAlive === false;
+    const waitedS = seconds(readiness.waited_ms);
+    if (childIsGone) {
+      return {
+        started: false,
+        ready: false,
+        // OBSERVED death of the process WE launched. `startup` is a verdict about
+        // this call's own launch, which is precisely the thing we watched — it never
+        // claimed to describe whatever may be serving the port.
+        startup: "failed",
+        readiness,
+        // TRUTHFUL FAILURE (#776): the process was spawned and then died, so the
+        // relaunch failed during startup. Report that plainly — and name the
+        // environment it was launched into, which is the first thing to check when a
+        // relaunch of an otherwise-healthy install fails during import.
+        message:
+          // "no probe got a HEALTHY response", not "the API did not become ready":
+          // a poll establishes only what the SCHEDULED PROBES saw (the server could
+          // have answered in a gap between two of them), and the poller treats any
+          // non-2xx as not-ready — so a 503 from a half-started server IS a
+          // response, and saying none came back would be false (codex gate r3/r4).
+          //
+          // A SPAWN FAILURE DOES NOT LEAD WITH "was launched" (codex gate round 4):
+          // the readiness race can resolve first and the `error` event land before
+          // the liveness check, which produced a report that said the process was
+          // launched and then that it could not be spawned.
+          //
+          // DEFENSIVE AND UNCOVERED, stated so nobody mistakes it for tested: an
+          // `error` arriving before the race settles makes `spawnError` win instead,
+          // and that path returns above. Reaching HERE needs the event to land in
+          // the microtask window between the readiness result resolving and this
+          // line reading the flag — an interleaving no test can schedule. The branch
+          // costs nothing and removes a self-contradictory verdict if it ever runs.
+          (launchedSpawnFailed && !launchedChildExit
+            ? `The ComfyUI process could not be spawned, and no readiness probe got a healthy response in ${readiness.waited_ms}ms (${readiness.attempts}/${readiness.max_tries} probes). THIS RELAUNCH FAILED — it was not a slow start.`
+            : `ComfyUI process was launched, but no readiness probe got a healthy response in ${readiness.waited_ms}ms (${readiness.attempts}/${readiness.max_tries} probes).` +
+              (launchedChildExit
+                ? describeLaunchedChildExit(launchedChildExit)
+                : " The process this call launched is no longer running, so THIS RELAUNCH FAILED — it was not a slow start.")) +
+          " Check the ComfyUI logs, and re-check with health_check before assuming nothing is serving the port — an external launcher or supervisor may have brought one back since." +
+          (env ? ` Launch environment: ${env.note}.` : "") +
+          launchEnvWarning(info),
+        auto_restart: supervisorResult(info),
+        launch_env: env,
+        // Nothing answered during the poll, so there is no listener to attribute.
+        // This is the ABSENCE of an attribution, not a claim that the port is free.
+        listener_ownership: unclassifiedOwnership(),
+      };
+    }
     return {
-      started: false,
+      // The launch HAPPENED and nothing observed contradicts it: a process was
+      // spawned, no spawn error fired, and no exit has been seen. `started` reports
+      // that dispatch; `ready:false` and `startup:"unconfirmed"` carry what is still
+      // unknown. Refuse before, disclose after — the irreversible step is behind us,
+      // so the honest move is to describe it, not to deny it happened.
+      started: true,
       ready: false,
+      startup: "unconfirmed",
       readiness,
-      // TRUTHFUL FAILURE (#776): the process was spawned but never answered, so
-      // ComfyUI is DOWN. Report that plainly — and name the environment it was
-      // launched into, which is the first thing to check when a relaunch of an
-      // otherwise-healthy install fails during import.
       message:
-        `ComfyUI process was launched but the API did not become ready after ${readiness.waited_ms}ms (${readiness.attempts}/${readiness.max_tries} probes). Check the ComfyUI logs.` +
-        describeLaunchedChildExit(launchedChildExit) +
+        `ComfyUI was launched${launched.child.pid ? ` (PID ${launched.child.pid})` : ""} and ` +
+        (childAlive === true
+          ? "that process is still running"
+          : "no exit has been observed from that process") +
+        // "no healthy response" rather than "had not answered": the poller counts
+        // any non-2xx as not-ready, so a 503 from a half-started server is an
+        // answer, and claiming none came would be false (codex gate round 4).
+        `, but no readiness probe got a healthy response from ${readiness.probe_url} within ${waitedS}s ` +
+        `(${readiness.attempts}/${readiness.max_tries} probes). The budget expiring means ` +
+        "the startup is NOT CONFIRMED YET — it does NOT mean it failed: ComfyUI with a normal " +
+        "set of custom nodes routinely answers well after this window. " +
+        "Do NOT kill it and do NOT launch a second copy onto this port. " +
+        `Re-check with health_check in another ${RECHECK_HINT_S}s; if it is still silent then, ` +
+        "the ComfyUI logs will say why. To wait longer next time, raise " +
+        `COMFYUI_STARTUP_CHECK_MAX_TRIES (currently ${readiness.max_tries} ` +
+        `${readiness.max_tries === 1 ? "probe" : "probes"}, one every ` +
+        `${describeInterval(readiness.interval_ms)}).` +
         (env ? ` Launch environment: ${env.note}.` : "") +
         launchEnvWarning(info),
+      pid: launched.child.pid,
       auto_restart: supervisorResult(info),
       launch_env: env,
-      // Nothing is serving the port, so there is no listener to attribute — the
-      // down state is already carried by started:false / ready:false.
+      // Nothing has answered on the port yet, so there is no listener to attribute.
+      // This says nothing about the launched process, which is reported above.
       listener_ownership: unclassifiedOwnership(),
     };
   }
@@ -2527,6 +2892,26 @@ export async function startComfyUI(): Promise<StartResult> {
     // needless recovery.
     started: mayClaimStart,
     ready: true,
+    // The API answered — but WHOSE API (codex gate rounds 9 and 10). `startup`
+    // answers "did this call confirm that the launch IT MADE is serving?", so on
+    // this path it simply MIRRORS the attribution verdict rather than reporting the
+    // healthy probe and stopping there:
+    //   ours        → confirmed. Our process is the listener.
+    //   not-ours    → failed. Observed: something else is serving, so our relaunch
+    //                 is not what came up.
+    //   unconfirmed → unconfirmed. The port owner could not be mapped; the message
+    //                 says so in as many words, and emitting "confirmed" beside it
+    //                 handed a structured consumer the attribution the prose had
+    //                 just withheld.
+    // `started` deliberately does NOT follow it down on `unconfirmed`: a process of
+    // ours demonstrably exists there and only its attribution is uncertain, which is
+    // the standing listener_ownership ruling. `startup` is what carries that gap.
+    startup:
+      ownership === "ours"
+        ? "confirmed"
+        : ownership === "not-ours"
+          ? "failed"
+          : "unconfirmed",
     readiness,
     message:
       `ComfyUI ${ownership === "not-ours" ? "is ready" : "started"} on port ${port}${newPid ? ` (PID ${newPid})` : ""}` +
@@ -2571,6 +2956,19 @@ export async function startComfyUI(): Promise<StartResult> {
 
 interface RebootResult {
   rebooting: boolean;
+  /**
+   * Did the Manager ACKNOWLEDGE the request, or is `rebooting` an INFERENCE?
+   *
+   * Only a non-catchall 2xx is an acknowledgement. A 502/503/504 from a proxy, or a
+   * connection dropping mid-request, are read as "the handler took it and the origin
+   * went down" — a good inference, and the reason this path works at all through a
+   * tunnel, but not something anybody observed. A tunnel hiccup in front of a server
+   * that was never restarted produces exactly the same signals (codex gate round 7).
+   *
+   * Carried so the report can say which of the two happened instead of calling both
+   * "accepted".
+   */
+  acked?: boolean;
   endpoint?: string;
   method?: string;
   reason?: string;
@@ -2595,9 +2993,15 @@ const REBOOT_ROUTES: ReadonlyArray<{ path: string; method: "POST" | "GET" }> = [
 ];
 
 /**
- * A dropped/aborted connection is the SUCCESS signal for a reboot: the Manager
- * handler calls exit(0) the instant it accepts the request, so the origin dies
- * before it can send an HTTP response and `fetch` rejects.
+ * A dropped/aborted connection is the signal this path READS AS a fired reboot: the
+ * Manager handler calls exit(0) the instant it accepts the request, so the origin
+ * dies before it can send an HTTP response and `fetch` rejects.
+ *
+ * It is an INFERENCE, not a success signal (codex gate round 11 — this contract
+ * still said "SUCCESS" after the code and the messages had stopped treating it as
+ * one). The same drop is produced by a tunnel or a network blip in front of a server
+ * that was never rebooted, which is why the caller marks it `acked: false` and the
+ * report says the request was not acknowledged.
  */
 function isConnectionDrop(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
@@ -2639,8 +3043,13 @@ async function looksLikeSpaCatchall(res: Response): Promise<boolean> {
   }
 }
 
-async function rebootViaManager(): Promise<RebootResult> {
-  const base = getComfyUIBaseUrl();
+/**
+ * @param base the ALREADY-PINNED target. Not re-read from config here (codex
+ * gate P0): the caller resolved which instance it is restarting before its own
+ * awaits, and re-reading the mutable base at dispatch time is how a reboot
+ * meant for A gets posted to B.
+ */
+async function rebootViaManager(base: string): Promise<RebootResult> {
   const failures: string[] = [];
 
   for (const { path, method } of REBOOT_ROUTES) {
@@ -2660,7 +3069,8 @@ async function rebootViaManager(): Promise<RebootResult> {
           failures.push(`${method} ${path} → HTTP 200 (frontend catchall, not a reboot route)`);
           continue;
         }
-        return { rebooting: true, endpoint: path, method };
+        // The one path with a real acknowledgement from the Manager itself.
+        return { rebooting: true, acked: true, endpoint: path, method };
       }
       if (res.status === 403) {
         return {
@@ -2674,9 +3084,15 @@ async function rebootViaManager(): Promise<RebootResult> {
       if (res.status === 502 || res.status === 503 || res.status === 504) {
         return {
           rebooting: true,
+          acked: false, // inferred from the proxy status, not acknowledged
           endpoint: path,
           method,
-          note: `reboot fired — the origin dropped behind a proxy (HTTP ${res.status}) as it went down`,
+          // The OBSERVED fact ONLY. Two earlier versions of this string named a
+          // cause: "the origin dropped … as it went down" (gate round 8), then
+          // "a proxy in front of ComfyUI answered …" (gate round 9) — but nothing
+          // here identifies a proxy, and ComfyUI or the Manager can return these
+          // statuses directly. All that was seen is the status.
+          note: `the request returned HTTP ${res.status}`,
         };
       }
       // 404 / other non-OK: wrong route for this Manager build — try the next.
@@ -2685,9 +3101,10 @@ async function rebootViaManager(): Promise<RebootResult> {
       if (isConnectionDrop(err)) {
         return {
           rebooting: true,
+          acked: false, // inferred from the dropped connection, not acknowledged
           endpoint: path,
           method,
-          note: "connection dropped (origin going down) — reboot fired",
+          note: "the connection dropped mid-request",
         };
       }
       failures.push(
@@ -2751,14 +3168,103 @@ function getRemoteRebootTiming(): RemoteRebootTiming {
 async function restartViaManagerReboot(context: {
   /** Human label for logs and the success message ("remote" | "Desktop"). */
   label: string;
+  /**
+   * The arguments the server was ALREADY observed running with (#848), when the
+   * caller gathered them anyway. Supplied rather than re-read so no extra probe is
+   * inserted ahead of an irreversible dispatch; when absent it is read here, from a
+   * call that can neither throw nor hang.
+   *
+   * The target GENERATION AT THE MOMENT THOSE ARGUMENTS WERE READ travels with them
+   * and is not optional (codex gate round 2). Capturing the generation here instead
+   * would fence only the window this function can see, while the reading itself
+   * happened earlier in the caller — a retarget in between would leave the "before"
+   * argv belonging to instance A and everything afterwards to B, with no generation
+   * change left for the check to notice.
+   */
+  prior?: { argv: string[]; generation: number };
+  /** Is this a ComfyUI Desktop instance? Selects the remedy in the #848 sentence. */
+  isDesktop?: boolean;
 }): Promise<RestartResult> {
   logger.info(`Restarting ${context.label} ComfyUI via ComfyUI-Manager reboot...`);
 
-  const reboot = await rebootViaManager();
+  // #848: capture what it is running BEFORE the reboot, so the report afterwards can
+  // say whether that changed. Total and bounded (see readServingArgv) — it is only
+  // ever detail in a message, and must not be able to cost anyone their restart.
+  //
+  // INSTANCE FENCE (codex gate). Both argv reads go through the MUTABLE configured
+  // target, so a retarget between them would compare instance A's arguments against
+  // instance B's and narrate the difference as a change to one server. Comparing two
+  // readings of DIFFERENT servers is worse than not comparing at all — it would
+  // invent both the "UNCHANGED" no-op and the "CHANGED" confirmation.
+  //
+  // Judged by the monotonic GENERATION, not by a final-state base comparison: an
+  // A→B→A round trip leaves the base equal and is exactly what the generation exists
+  // to catch (the same r11 rule the panel restart's preflight uses). The generation
+  // is taken FROM THE READING, not from this moment — see `prior`.
+  // Captured BEFORE our own read, not after it: a retarget landing mid-read would
+  // otherwise be stamped with the NEW generation and sail through the check below
+  // while the reading itself came from the old instance.
+  const selfReadGeneration = getComfyuiTargetGeneration();
+  // Pinned HERE, with the generation, and used for every step below: the
+  // dispatch, the dispatch record, and the readiness probe. Each of those used
+  // to call `getComfyUIBaseUrl()` afresh, so a retarget landing in any of the
+  // gaps between them sent the reboot to one server, recorded a second, and
+  // reported the health of a third (codex gate P0/P1).
+  const anchoredBase = getComfyUIBaseUrl();
+  const priorArgv = context.prior?.argv.length
+    ? context.prior.argv
+    : await readServingArgv();
+  const argvGeneration = context.prior?.argv.length
+    ? context.prior.generation
+    : selfReadGeneration;
+
+  // FENCE BEFORE DISPATCH. Everything above this line is observation; the reboot
+  // below is the irreversible act. A retarget that landed during the argv read
+  // means the arguments we hold describe a different server than the one the
+  // config now names, and we cannot know which the caller meant. Nothing has
+  // been dispatched yet, so this is a REFUSAL, not an uncertain outcome — the
+  // one shape where refusing is strictly right (nothing has happened, and
+  // proceeding would act on the wrong machine).
+  //
+  // Tested on the BASE, not the generation. `setComfyuiTarget` bumps the
+  // generation on every successful call, including a same-URL reaffirmation
+  // that moves nothing — refusing on that would be this very defect class
+  // pointed the other way: a bucket ("the target was touched") standing in for
+  // the question that actually matters.
+  //
+  // What this fences is the ENDPOINT: the reboot will go to the URL whose argv
+  // we read. It does NOT establish that the same INSTANCE is still serving that
+  // URL — a same-URL replacement moves neither the base nor the generation and
+  // is invisible to both. Closing that needs a per-instance identity this
+  // codebase does not have yet; tracked in #871. Do not read this fence as more
+  // than it is.
+  //
+  // The generation still governs the ARGV COMPARISON further down, where it is
+  // the right test for a different question: an A→B→A round trip leaves the base
+  // equal but means the two readings may not describe the same server, so that
+  // comparison declines while this dispatch correctly proceeds — the reboot goes
+  // to the URL we read either way.
+  if (getComfyUIBaseUrl() !== anchoredBase) {
+    return {
+      stopped: false,
+      started: false,
+      startup: "not-attempted",
+      message:
+        "The configured ComfyUI target changed while this restart was preparing, " +
+        "so the reboot was not sent — it would have gone to a different server " +
+        "than the one this call read. Nothing was restarted. Re-run the restart " +
+        "to act on the current target.",
+      listener_ownership: unclassifiedOwnership(),
+    };
+  }
+
+  const reboot = await rebootViaManager(anchoredBase);
   if (!reboot.rebooting) {
     return {
       stopped: false,
       started: false,
+      // Nothing was dispatched — this is a refusal, not an uncertain outcome.
+      startup: "not-attempted",
       message: reboot.note ?? "ComfyUI-Manager reboot could not be triggered.",
       // The Manager reboot path never spawns a process of ours, so ownership of
       // whatever serves the port is never something this call can claim.
@@ -2766,22 +3272,27 @@ async function restartViaManagerReboot(context: {
     };
   }
 
-  logger.info("ComfyUI-Manager reboot fired", {
-    endpoint: reboot.endpoint,
-    method: reboot.method,
-    note: reboot.note,
-  });
+  logger.info(
+    reboot.acked
+      ? "ComfyUI-Manager reboot request acknowledged"
+      : "ComfyUI-Manager reboot dispatched, not acknowledged",
+    { endpoint: reboot.endpoint, method: reboot.method, note: reboot.note },
+  );
 
-  // The reboot HAS been accepted — the server is going down regardless of what
-  // the readiness poll below concludes. Drop the detected dialect now so the
-  // timed-out branch (which returns early) can't leave the pre-reboot dialect
-  // pinned for the instance that eventually comes back (#646).
+  // The request is out, so the server MAY cycle at any moment from here — whatever
+  // the readiness poll below concludes, and whether or not we ever see it happen.
+  // (Not "HAS been accepted": on the unacknowledged branch nothing accepted
+  // anything that we saw — codex gate rounds 6 and 12, which caught this claim in
+  // the prose and then again in the comment and the log line beside it.) Dropping
+  // the detected dialect now is the conservative move either way: the timed-out
+  // branch returns early, and must not leave the pre-reboot dialect pinned for an
+  // instance that may come back different (#646).
   resetManagerApiCache("comfyui reboot fired via Manager");
   // #742 r4/r5: record the dispatch — a later decline-path DOWN report may
   // name restart causation only against such a record. No session identity
   // exists here, so stamp the shared PROCESS-WIDE slot (never grounds
   // causation on its own).
-  recordRestartDispatch(getComfyUIBaseUrl(), PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
+  recordRestartDispatch(anchoredBase, PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
 
   const timing = getRemoteRebootTiming();
   if (timing.settleMs > 0) await sleep(timing.settleMs);
@@ -2791,17 +3302,48 @@ async function restartViaManagerReboot(context: {
   // hanging the tool call if the host never returns.
   const intervalMs = Math.max(250, timing.intervalMs);
   const maxTries = Math.max(1, Math.ceil(timing.budgetMs / intervalMs));
-  const readiness = await waitForApiReady({ intervalMs, maxTries });
+  const readiness = await waitForApiReady({
+    intervalMs,
+    maxTries,
+    // Poll the instance we rebooted, not whatever the config names by now —
+    // otherwise a retarget during the reboot window lets a healthy B stand in as
+    // proof that A came back (codex gate P1).
+    probeUrl: `${anchoredBase}/system_stats`,
+  });
 
   if (!readiness.ready) {
+    const waitedS = seconds(readiness.waited_ms);
     return {
       stopped: true,
+      // NO POSITIVE EVIDENCE EITHER WAY, and the two halves of that are not
+      // symmetric here. Unlike the local relaunch, this call spawned nothing: the
+      // SUPERVISOR is what brings the process back, so there is no child of ours
+      // whose liveness could stand in for a start. `started` therefore cannot be
+      // claimed — but the reader must not take the `false` for the other definite
+      // answer, which is exactly what `startup` is here to prevent (#367).
       started: false,
       ready: false,
+      startup: "unconfirmed",
       readiness,
       message:
-        `Reboot was triggered but ComfyUI did not come back within ${timing.budgetMs}ms — ` +
-        "check the host (is it the Desktop app / supervised?).",
+        // NOT "and ComfyUI went down" (codex gate round 2). Nothing observed a down
+        // transition: the poller only records that no probe got a 2xx, which is
+        // equally consistent with a server that was never reachable from here. The
+        // accepted reboot is the one thing we did observe, so it is the one thing
+        // claimed.
+        (reboot.acked
+          ? "The ComfyUI-Manager reboot request was acknowledged"
+          : `A ComfyUI-Manager reboot was dispatched but not acknowledged (${reboot.note ?? "no reply"})`) +
+        ", but no readiness probe got a " +
+        `healthy response from ${readiness.probe_url} within ${waitedS}s ` +
+        `(${readiness.attempts}/${readiness.max_tries} probes over a ` +
+        `COMFYUI_REMOTE_REBOOT_BUDGET_S=${seconds(timing.budgetMs)}s budget). That budget ` +
+        "expiring means the restart is NOT CONFIRMED YET — it does NOT mean it failed; a " +
+        "supervised cold start can take longer than this. Re-check with health_check in " +
+        `another ${RECHECK_HINT_S}s before intervening. If it is still down then, start ` +
+        "ComfyUI from whatever supervises it (" +
+        (context.label === "Desktop" ? "the ComfyUI Desktop app" : "its host") +
+        "), or raise that budget to wait longer next time.",
       listener_ownership: unclassifiedOwnership(),
     };
   }
@@ -2814,20 +3356,82 @@ async function restartViaManagerReboot(context: {
   resetClient();
   resetObjectInfoCache();
   resetManagerApiCache("comfyui rebooted via Manager");
-  // #742 r4/r5: the dispatched restart was observed back — clear OUR record
-  // (the process-wide slot only; never another session's record).
+  // #742 r4/r5: the instance this restart was dispatched to is ANSWERING again, so
+  // the record has served its purpose — a later DOWN report can no longer be about
+  // this dispatch. (Not "observed back": nothing here watched a cycle. Clearing on a
+  // healthy endpoint is the conservative direction — it only ever REMOVES grounds
+  // for naming causation.)
   clearRestartDispatch(PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
+
+  // #848: it is back — now say whether it came back as the SAME thing. Read after
+  // readiness, on a path where nothing destructive is pending, so a slow or missing
+  // answer costs only the detail (describeArgvDrift stays silent without both).
+  // Suppressed entirely if the configured target moved at ANY point since the first
+  // reading — including during this one — because the two readings would then
+  // describe two different servers. The generation is re-checked AFTER the read, so
+  // a retarget that lands mid-read is caught too.
+  const afterArgv = await readServingArgv();
+  const argvNote =
+    getComfyuiTargetGeneration() === argvGeneration
+      ? describeArgvDrift(priorArgv, afterArgv, context.isDesktop === true)
+      : "";
 
   return {
     stopped: true,
-    started: true,
+    // THE FIELDS MUST AGREE WITH THE SENTENCE (codex gate rounds 7 and 8). A message
+    // saying the cycle was not observed, beside `startup:"confirmed"` and
+    // `started:true`, hands a caller reading the JSON the definite signal the prose
+    // just withheld — and the JSON is what an agent keys on.
+    //
+    // I twice kept `started:true` here by analogy with `listener_ownership`, where
+    // an unconfirmed attribution deliberately keeps it. That analogy does not
+    // transfer, and the difference is the whole point: THERE, a process of ours
+    // demonstrably existed and only its attribution was uncertain. HERE this call
+    // spawned nothing at all, and an acknowledged Manager request can be a no-op —
+    // so there is no positive evidence that this call started anything, and
+    // `started` is exactly the claim that it did.
+    //
+    // The fear that drove the earlier choice — that `false` reads as a failed
+    // restart — is answered by the fields beside it rather than by overstating this
+    // one: `stopped:true` and `ready:true` say the server is up, and the message
+    // leads with it. `started` now means the same thing on every path in this file:
+    // THIS CALL HAS POSITIVE EVIDENCE IT STARTED SOMETHING.
+    started: false,
     ready: true,
+    startup: "unconfirmed",
     readiness,
+    // WHAT THIS PATH ACTUALLY SAW (codex gate rounds 6 and 7): a reboot request that
+    // was either acknowledged or INFERRED to have landed, and a later probe finding
+    // the server healthy. It never watched ComfyUI go down and come back — this
+    // poller has no down→up requirement at all, unlike the panel path, which
+    // certifies only on an observed cycle. So "rebooted and came back ready" claimed
+    // the one thing nobody here observed.
+    //
+    // The distinction is not academic: a Manager that accepts the request and then
+    // does nothing — or a tunnel hiccup read as "the origin went down" in front of a
+    // server that never restarted — leaves a healthy instance that was never cycled,
+    // and a user told it "came back" stops looking for why their change did not
+    // apply. Both halves are therefore stated as what they are.
     message:
-      `ComfyUI rebooted via ComfyUI-Manager and came back ready (${readiness.waited_ms}ms) — ` +
-      `${context.label}/supervised restart.`,
-    // The supervisor that owns the process cycled it; we launched nothing, so we
-    // cannot (and must not) claim the listener as ours.
+      (reboot.acked
+        ? "The ComfyUI-Manager reboot request was acknowledged."
+        : // The OBSERVED signal is named, not a cause chosen for it: this branch
+          // covers a proxy status AND a dropped connection, and the earlier sentence
+          // told every user the connection dropped (codex gate round 8). The
+          // inference is offered as one, which is all it is.
+          // No "which usually means the handler accepted it and the server went
+          // down" (codex gate round 10). Handler acceptance and a down transition
+          // are both inferences, "usually" is a frequency claim nobody measured, and
+          // the sentence undercut the very next one, which correctly says the cycle
+          // was not observed. What was seen is enough.
+          `A ComfyUI-Manager reboot was dispatched but not acknowledged (${reboot.note ?? "no reply"}).`) +
+      ` ComfyUI is healthy now (${readiness.waited_ms}ms) — ${context.label}/supervised ` +
+      "restart. The cycle itself was not directly observed from here, so verify with " +
+      "health_check if you need certainty that it actually restarted." +
+      argvNote,
+    // We launched nothing on this path — a supervisor is what would have cycled the
+    // process — so the listener is never ours to claim. (Nor is it established that
+    // one DID cycle it; that is `startup`'s business, and it says "unconfirmed".)
     listener_ownership: unclassifiedOwnership(),
   };
 }
@@ -2840,6 +3444,20 @@ export async function restartComfyUI(): Promise<RestartResult> {
   }
   logger.info("Restarting ComfyUI...");
 
+  // #848: the target generation as of BEFORE the instance is resolved, so the argv
+  // that resolution observes can be fenced to the instance it was actually read
+  // from. It travels with the argv into the Desktop reboot below; capturing it
+  // there instead would leave the read itself outside the fence (codex gate r2).
+  const infoGeneration = getComfyuiTargetGeneration();
+  // …and the ADDRESS of the instance this call is about, captured at the same
+  // moment. The stop, the port-free wait and the settle delay are all awaits, and
+  // the configured target is mutable across every one of them, so the relaunch is
+  // anchored to these rather than to whatever the config says when it finally runs
+  // (codex gate round 12 — otherwise the relaunch probes the NEW target's port,
+  // finds it occupied, returns "already running", and the instance we killed stays
+  // dead).
+  const restartProbeUrl = `${getComfyUIBaseUrl()}/system_stats`;
+
   // Preflight: resolve the RUNNING instance and confirm we can relaunch it
   // BEFORE stopping anything. A restart must be atomic-ish — if the relaunch
   // command can't be built/validated (stale COMFYUI_PATH, unknown Desktop exe),
@@ -2850,9 +3468,40 @@ export async function restartComfyUI(): Promise<RestartResult> {
     return {
       stopped: false,
       started: false,
+      startup: "not-attempted",
       message:
         diagnostic ??
         `No ComfyUI process found on port ${config.resolvedPort} to restart. Is ComfyUI running?`,
+      listener_ownership: unclassifiedOwnership(),
+    };
+  }
+  // NEVER STOP AN INSTANCE THE REST OF THIS CALL WILL NOT BE ACTING ON (codex gate
+  // round 11). `acquireProcessInfo` is awaited, and the target is MUTABLE: a hello
+  // retarget landing inside that await leaves `info` describing instance A while the
+  // config — which `stopComfyUI`'s port waits, the Manager reboot's base URL, and
+  // `startComfyUI`'s relaunch port all read LIVE — now points at B.
+  //
+  // The loss is concrete and is the #368/#814 shape again: A is killed from its
+  // already-resolved pid, then the relaunch consults B's port, finds it occupied,
+  // and returns "already running" without spawning anything. A is down, nothing
+  // brings it back, and every assessment that authorized the stop was about A.
+  //
+  // Judged by the monotonic GENERATION captured before the resolve, so a retarget
+  // that lands mid-await is caught and an A→B→A round trip cannot slip through a
+  // final-state comparison. REFUSE, because nothing has been stopped yet — the
+  // refuse-before/disclose-after rule this whole path is built on.
+  if (getComfyuiTargetGeneration() !== infoGeneration) {
+    return {
+      stopped: false,
+      started: false,
+      startup: "not-attempted",
+      restart_hint: recoveryHint(info),
+      message:
+        "Refusing to restart: the ComfyUI target changed while the running instance was " +
+        "being identified, so the instance that was checked is not provably the one this " +
+        "restart would act on — and a stop is never sent to an instance whose relaunch was " +
+        "not the one verified. Nothing was stopped. Let the target settle, then retry." +
+        describeRecovery(recoveryHint(info)),
       listener_ownership: unclassifiedOwnership(),
     };
   }
@@ -2873,6 +3522,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
       return {
         stopped: false,
         started: false,
+        startup: "not-attempted",
         message:
           `Refusing to restart: ${desktop.reason} ComfyUI was left running (not stopped) so ` +
           `you don't lose the server. Restart it from the ComfyUI Desktop app.` +
@@ -2882,7 +3532,13 @@ export async function restartComfyUI(): Promise<RestartResult> {
         listener_ownership: unclassifiedOwnership(),
       };
     }
-    return restartViaManagerReboot({ label: "Desktop" });
+    // #848: hand over the argv already gathered by acquireProcessInfo moments ago —
+    // no extra probe, and it is the reading taken closest to the stop.
+    return restartViaManagerReboot({
+      label: "Desktop",
+      prior: { argv: info.argv, generation: infoGeneration },
+      isDesktop: true,
+    });
   }
 
   // requireReproducibleEnv: this path KILLS the process and spawns a fresh one, so
@@ -2892,6 +3548,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
     return {
       stopped: false,
       started: false,
+      startup: "not-attempted",
       restart_hint: recoveryHint(info),
       message:
         `Refusing to restart: ${relaunch.reason} ComfyUI was left running (not stopped) ` +
@@ -2912,6 +3569,8 @@ export async function restartComfyUI(): Promise<RestartResult> {
     return {
       stopped: false,
       started: false,
+      // The stop failed, so no relaunch was ever attempted.
+      startup: "not-attempted",
       message: `Could not stop ComfyUI: ${stopResult.message}`,
       // Nothing was stopped and nothing launched — whatever is on the port is not
       // this call's doing.
@@ -2934,12 +3593,100 @@ export async function restartComfyUI(): Promise<RestartResult> {
     ? ` NOTE from the stop: ${stopResult.unverified_exit}.`
     : "";
 
-  // Start
-  const startResult = await startComfyUI();
+  // Start — ANCHORED to the instance that was just stopped (see restartProbeUrl).
+  //
+  // The stop already committed, so from here a THROWN error is the worst outcome
+  // available: it unwinds past every report below and leaves the caller with an
+  // exception instead of the fact that their server is now down (codex gate P0).
+  // Whatever went wrong, the relaunch attempt is describable — so describe it.
+  let startResult: StartResult;
+  try {
+    startResult = await startComfyUI({
+      port: info.port,
+      probeUrl: restartProbeUrl,
+    });
+  } catch (err) {
+    // DISCLOSE, do not refuse: the stop is not undoable, so the caller needs a
+    // description of where things stand rather than "nothing happened".
+    //
+    // But do not overclaim the other way either. An earlier draft of this said
+    // "ComfyUI is NOT running" — an unverified negative, and this branch's own
+    // defect class (a throw we could not interpret, reported as a definite
+    // down). We do not know that: the throw may have landed AFTER a spawn, or a
+    // supervisor may have brought the instance back while we were unwinding. So
+    // ASK, once, and say only what the answer supports.
+    const probe = await waitForApiReady({
+      intervalMs: 250,
+      maxTries: 1,
+      probeUrl: restartProbeUrl,
+    });
+    return {
+      stopped: true,
+      started: false,
+      ready: probe.ready,
+      // Not "not-attempted": the relaunch WAS attempted and threw partway. What
+      // we cannot say is whether it took effect — which is what `unconfirmed`
+      // means, and why it exists (#367).
+      startup: "unconfirmed",
+      readiness: probe,
+      message:
+        `ComfyUI was stopped, and the relaunch failed partway: ${errorText(err)}. ` +
+        (probe.ready
+          ? `Something IS answering on ${restartProbeUrl} now — possibly a supervisor ` +
+            `brought it back, or the relaunch got further than the error suggests. ` +
+            `This call cannot claim that server as its own.`
+          : `No healthy response from ${restartProbeUrl} when asked just now, so ` +
+            `ComfyUI is most likely down — but "not healthy" is not "not there": a ` +
+            `502/503/504 from a proxy counts as not-ready here, and something may ` +
+            `well be listening. The relaunch also failed in a way this call could ` +
+            `not interpret. Treat this as one observation, not a settled fact. ` +
+            `Check the server, and use start_comfyui once the cause is cleared.`) +
+        stopCaveat,
+      listener_ownership: unclassifiedOwnership(),
+    };
+  }
+  // #367: the relaunch was DISPATCHED and its process is alive, but the readiness
+  // budget expired before the API answered. This is neither a success to claim nor
+  // a failure to report, and it is checked BEFORE the `!started` branch so that it
+  // can never fall through to either of them: `started` is TRUE here, so without
+  // this the composition below would have printed "ComfyUI restarted successfully"
+  // over a server nobody has heard from — fabricated success, the worst outcome.
+  // The old `started:false` sent it down the other branch instead, printing "could
+  // not be started" over a server that was usually seconds from ready. Both are the
+  // same mistake: a boolean answering a question the evidence does not settle.
+  // `ready !== true` is load-bearing, not belt-and-braces (caught by the suite when
+  // round 10 widened `unconfirmed` to cover unmappable ATTRIBUTION as well as an
+  // expired budget). Both are "we cannot tie the serving instance to our launch",
+  // but only one of them has nothing serving — and this composition is about that
+  // one. A healthy-but-unattributed restart taking this branch would have been told
+  // "NOT CONFIRMED YET" about a server that was answering, and would also have
+  // skipped the dispatch-record clear below.
+  if (startResult.startup === "unconfirmed" && startResult.ready !== true) {
+    return {
+      stopped: true,
+      started: true,
+      ready: false,
+      startup: "unconfirmed",
+      readiness: startResult.readiness,
+      message:
+        "ComfyUI was stopped and relaunched; the restart is NOT CONFIRMED YET, and it is " +
+        `not known to have failed either — ${startResult.message}` +
+        stopCaveat,
+      auto_restart: startResult.auto_restart,
+      launch_env: startResult.launch_env,
+      listener_ownership: startResult.listener_ownership,
+    };
+  }
   if (!startResult.started) {
     return {
       stopped: true,
       started: false,
+      // Forwarded, never re-derived: startComfyUI is the only thing that watched
+      // the launch, so it is the only thing entitled to name the verdict. Reaching
+      // here with started:false means it was "failed" (observed death) or
+      // "not-attempted" (nothing was spawnable), or the healthy listener is provably
+      // somebody else's — never "unconfirmed", which returned above.
+      startup: startResult.startup,
       ready: startResult.ready,
       readiness: startResult.readiness,
       // Two distinct failures share this branch, and they must NOT read alike: the
@@ -2966,6 +3713,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
   return {
     stopped: true,
     started: true,
+    startup: startResult.startup,
     ready: startResult.ready,
     readiness: startResult.readiness,
     // Reached only when startComfyUI reported started:true — i.e. the healthy
@@ -3081,6 +3829,16 @@ export function getRestartDispatchRecord(
 export async function preflightLocalRestart(): Promise<{
   ok: boolean;
   reason?: string;
+  /**
+   * The arguments the instance being assessed was OBSERVED running with (#848).
+   * Reported so a caller that dispatches an out-of-band reboot can compare them
+   * against what comes back WITHOUT inserting a probe of its own ahead of the
+   * dispatch. Absent whenever nothing was observed — an unread argv is not
+   * evidence, and callers must treat it as "say nothing" rather than "unchanged".
+   */
+  observedArgv?: string[];
+  /** Whether the assessed instance is ComfyUI Desktop — selects the #848 remedy. */
+  isDesktopApp?: boolean;
 }> {
   if (isRemoteMode()) return { ok: true };
   const { info, diagnostic } = await acquireProcessInfo();
@@ -3111,7 +3869,7 @@ export async function preflightLocalRestart(): Promise<{
     // property of the install. See assessDesktopSupervision for why UNCONFIRMED
     // refuses here while it is merely disclosed on the post-launch ownership path.
     const desktop = assessDesktopSupervision(info);
-    if (desktop.ok) return { ok: true };
+    if (desktop.ok) return { ok: true, ...observedLaunch(info) };
     return { ok: false, reason: `${desktop.reason}${describeRecovery(recoveryHint(info))}` };
   }
   // NOTE (#776): the launch-ENVIRONMENT check is deliberately NOT applied here.
@@ -3120,8 +3878,23 @@ export async function preflightLocalRestart(): Promise<{
   // Stability Matrix / Pinokio environment survives that restart for free.
   // Refusing on it would cost those users a restart path that actually works.
   const relaunch = assessRelaunch(info);
-  if (relaunch.ok) return { ok: true };
+  if (relaunch.ok) return { ok: true, ...observedLaunch(info) };
   return { ok: false, reason: relaunch.reason };
+}
+
+/**
+ * The launch facts this preflight OBSERVED, in the shape preflightLocalRestart
+ * reports them. `argv` is omitted when empty — a wedged server reports none, and an
+ * empty array would read as "it was running with no arguments" (#848).
+ */
+function observedLaunch(info: ProcessInfo): {
+  observedArgv?: string[];
+  isDesktopApp?: boolean;
+} {
+  return {
+    observedArgv: info.argv.length > 0 ? [...info.argv] : undefined,
+    isDesktopApp: info.isDesktopApp === true,
+  };
 }
 
 export const __processControlTestHooks = {

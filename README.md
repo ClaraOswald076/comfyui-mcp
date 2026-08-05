@@ -16,7 +16,7 @@ Works on **macOS**, **Linux**, and **Windows**. Auto-detects your ComfyUI instal
 
 **Stuck or have a question? [Join the Discord](https://discord.gg/cW9arBhzCu)** — help, model tips, and release announcements.
 
-**151 MCP tools** | **37 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
+**154 MCP tools** | **37 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
 
 The plugin ships **expert skills that grow with every release** — model-specific generation guides with curated download URLs, workflow recipes, troubleshooting, and custom-node authoring — so Claude knows the right sampler, CFG, resolution, and model files for each architecture without trial and error.
 
@@ -248,7 +248,7 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 ## MCP Tools
 
-151 tools across workflow execution, generation, iteration, composition, models, and more:
+154 tools across workflow execution, generation, iteration, composition, models, and more:
 
 ### Image Generation (high-level)
 
@@ -639,43 +639,6 @@ npx -y comfyui-mcp@latest --http --host 0.0.0.0 --port 9100   # bind/port overri
 | `--port <n>` | `MCP_PORT` | `9100` | HTTP port |
 | `--comfyui-url <url>` | `COMFYUI_URL` | *(auto-detect)* | Target a specific (incl. remote) ComfyUI |
 | `--force-remote` | `COMFYUI_MCP_FORCE_REMOTE` | `false` | Force remote mode for a loopback `--comfyui-url` (e.g. dstack/RunPod port-forwards to `localhost`) |
-
-### Other agents & local LLMs (Hermes, OpenClaw, Copilot CLI, Ollama)
-
-comfyui-mcp has **first-class support for non-Claude harnesses**. One command
-writes the server entry into the harness's own config (merging, not
-clobbering):
-
-```bash
-npx -y comfyui-mcp setup hermes     # → ~/.hermes/config.yaml      (compact by default)
-npx -y comfyui-mcp setup openclaw   # → ~/.openclaw/openclaw.json  (compact by default)
-npx -y comfyui-mcp setup copilot    # → ~/.copilot/mcp-config.json (full by default)
-# flags: --compact | --full, --comfyui-url <url>, --dry-run
-```
-
-**Model requirements**: tool calling is a hard requirement (no tool calling =
-doesn't work). Thinking and vision are strongly recommended — without
-thinking, multi-step tool chains degrade; without vision the agent can
-generate but can't see its own outputs.
-
-**Compact tool mode is the default**: the server registers 3 meta-tools
-(`list_tools` → `describe_tool` → `call_tool`) instead of the full ~200-schema
-surface (~200 KB / ~50k tokens per `tools/list`), pulling schemas into context
-one tool at a time. Frontier-model harnesses opt back into the full surface
-with `--full` / `COMFYUI_MCP_TOOL_MODE=full`. **Run it locally
-for free with our fine-tuned models**: `ollama pull artokun/gemma4-comfyui-mcp:e4b`
-(also `:e2b` for ~2 GB VRAM, `:12b` for ~8 GB) — Gemma 4 QLoRA-trained on 1,055
-server-verified trajectories over the full comfyui-mcp tool surface, and the
-panel's Ollama default. Stock `gemma4:*`/`qwen3:4b` also validated end-to-end
-(`npm run test:local-llm`); gemma3 has no native tool calling and is
-unsupported. Full guide — hosted-model guidance (DeepSeek/MiMo/GLM class),
-per-harness setup, troubleshooting:
-**[Local LLMs & other agents](https://comfyui-mcp.artokun.io/docs/local-llms)**.
-
-| Flag | Env | Default | Description |
-|------|-----|---------|-------------|
-| `setup <agent>` | | | Write the comfyui entry into hermes / openclaw / copilot config, then exit |
-| `--full` / `--tool-mode full` | `COMFYUI_MCP_TOOL_MODE=full` | `compact` | Opt into the full ~200-schema surface; the default compact mode registers 3 meta-tools instead |
 
 ### Other agents & local LLMs (Hermes, OpenClaw, Copilot CLI, Ollama)
 

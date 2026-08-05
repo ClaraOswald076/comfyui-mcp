@@ -188,3 +188,6 @@ comfy_cli
 queue
 model_metadata
 workspace
+disable_custom_node
+enable_custom_node
+uninstall_custom_node

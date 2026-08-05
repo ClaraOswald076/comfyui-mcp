@@ -6,6 +6,86 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.49.8] - 2026-08-05
+
+### MCP
+
+#### Added
+- add --help, deriving every default from the parser rather than restating it (#864)
+
+#### Fixed
+- **a zero-byte pending-ops marker wedged `update_all` permanently (#847).** The wedge was
+  self-perpetuating: `recordPanelPendingOp` threw on any unreadable prior marker, and
+  `JSON.parse("")` throws — so a zero-byte `~/.comfyui-mcp/panel-pending-ops.json` made it
+  throw forever. It runs BEFORE the ComfyUI-Manager handoff by design, so `update_all` could
+  never start again, and the write that would have replaced the bad file was gated behind the
+  same check the bad file failed. Deleting the file by hand was the only escape.
+
+  An empty file and an undecodable one now answer different questions: overwriting an empty
+  one loses nothing (so it is superseded), while content we cannot decode may describe a real
+  queued operation (so it is still refused). Both refusals name the file path, and the two
+  warnings differ in what they tell you to do. Both writers are now atomic (temp + fsync +
+  rename), so a crash can no longer leave a zero-byte file at all, and superseding a
+  pre-existing one carries an indeterminate record forward — the block lifts, the warning
+  does not.
+
+  Also fixed on the way: the test suite was writing live pending-op markers into the real
+  `~/.comfyui-mcp`, where the orchestrator reads them and warns on every pin write about
+  operations that never happened. Third such leak found (after the real `.env` and the real
+  OAuth mirror); a runtime guard covering all of them is tracked in #866.
+- readOAuthStatus threaded home to one of its two halves (#863)
+
+#### Changed
+- .env.example advertised the wrong default, and the README shipped a section twice (#861)
+- tell absent from blocked from undiscoverable — and stop our own messages asserting causes they did not observe (#841)
+- truncated results fit the budget they report, and a library listing that looks in the folders (#807, #810) (#838)
+
+
+## [0.49.7] - 2026-08-05
+
+### MCP
+
+#### Fixed
+- attribute a changelog entry to the PR, not the first issue it cites (#856)
+- the changelog generator silently dropped the entries that mattered most (#855)
+
+#### Changed
+- **panel version floor: blocked mutations with no self-service path, and "up-to-date"
+  that means "meets the minimum" (#832).** A read was being blocked by a WRITE gate: the
+  workflow fence asked "can this reach the wrong workflow's content?" and answered it with
+  a set that exists to answer "is this safe to re-dispatch after a reconnect?". Eight graph
+  commands that are genuine reads were refused as canvas mutations on older panels. There
+  is now a single effect ledger with enforcement a rename cannot step over. Separately,
+  a non-parseable advertised version (`nightly`, which is what ComfyUI-Manager reports for
+  a git-installed pack) was rendered as an observed version and an age verdict; it is now
+  screened by parseability and shown verbatim as evidence. Closes #819, #812, #806, #778;
+  #823 remains partly open.
+- give the suite a real timeout — the "rotating cast of flaky files" was runner starvation (#852) (#853)
+
+
+## [0.49.6] - 2026-08-04
+
+### MCP
+
+#### Fixed
+- **`download_model`: large-file timeouts, no resume, wrong base on Windows portable,
+  and non-unique job ids (#831).** Large HuggingFace downloads timed out at 600s with no
+  way to resume; a resume could silently discard a 96%-complete partial; a remote CivitAI
+  auth/error page could be saved as if it were a model; and `download_status` lost
+  in-flight ids. Destroying a staged file now requires re-proving, immediately before each
+  syscall, that it is still the file the caller checked — so a second download of the same
+  model can no longer delete the first one's resumable bytes or its validator. An
+  unreadable staged file is reported as unknown rather than folded into "absent", which
+  previously let a fresh response truncate an existing partial.
+  Fixes #343, #401, #467, #470, #473, #529, #547, #761, #813, #817, #822.
+- test reliability: a fixture bound a guessed random port and hung ~1 in 8 when that port
+  was already held; it now binds `listen(0)` and reads the assigned port back, and a bind
+  failure reports as a setup failure instead of a timeout in the behaviour under test (#843, #821)
+- preserve AUTOGROW dotted workflow inputs (#763)
+- truncated results name their own remedy — and one that works from where the caller is (#818)
+- never stop a ComfyUI that cannot be proven relaunchable, and attribute a listener without lsof (#814) (#830)
+
+
 ## [0.49.5] - 2026-08-04
 
 ### MCP

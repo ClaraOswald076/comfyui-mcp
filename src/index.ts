@@ -34,8 +34,15 @@ function ensurePanelOnLoad(): void {
             res,
           );
           break;
-        case "up-to-date":
-          logger.info("Panel auto-install: panel already present.", res);
+        // #806 — "already present" is the whole claim. The line used to be paired
+        // with `action: "up-to-date"`, and users read the pair as "you are on the
+        // newest panel"; nothing on this path compares versions.
+        case "present":
+          logger.info(
+            "Panel auto-install: panel already present — NOT a version check. " +
+              "Run install_panel(action='status') to compare it against what this build needs.",
+            res,
+          );
           break;
         case "skipped-dev":
           logger.info(
@@ -240,6 +247,20 @@ function isRemoteHttpsPod(u: string): boolean {
 
 async function main() {
   const cli = parseCliArgs(process.argv);
+
+  // `--help` / `-h`: print usage and exit BEFORE anything else. It must precede
+  // every other branch — including `setup` and `connect` — because a user who
+  // asks for help has by definition not decided what to run yet, and starting a
+  // server or writing a harness config in response to a help request is doing
+  // something they did not ask for. Exits 0: asking for help is not an error.
+  //
+  // stdout, not stderr: this is the requested output, and a user piping it to a
+  // pager or grep should get it on the stream that carries results.
+  if (cli.help) {
+    const { renderCliHelp } = await import("./transport/cli.js");
+    process.stdout.write(renderCliHelp());
+    return;
+  }
 
   // `setup <agent>`: write the comfyui MCP entry into a non-Claude harness's
   // config (Hermes Agent / OpenClaw / Copilot CLI — issue #97), print next

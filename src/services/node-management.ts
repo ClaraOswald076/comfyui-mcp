@@ -1,11 +1,12 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
-import { config, getComfyUIBaseUrl } from "../config.js";
+import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { resetObjectInfoCache } from "../comfyui/client.js";
 import { progressEnabled, reportDownloadProgress } from "./download-progress.js";
+import { parsePyproject } from "./node-authoring.js";
 import {
   type ManagerApi,
   cacheManagerApi,
@@ -18,8 +19,14 @@ import {
   suppressDialectRecheck,
 } from "./manager-api-cache.js";
 export type { ManagerApi } from "./manager-api-cache.js";
-import { resolveInstallInterpreter } from "./workspace-env.js";
-import { assertComfyCliOk, runComfyCliSync } from "./comfy-cli.js";
+import { resolveEffectiveComfyUIBase, resolveInstallInterpreter } from "./workspace-env.js";
+import {
+  assertComfyCliOk,
+  getComfyCliVersion,
+  isSupportedComfyCliVersion,
+  resolveComfyCliExecutable,
+  runComfyCliSync,
+} from "./comfy-cli.js";
 import { withPanelPinGuard } from "./panel-pin-guard.js";
 import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -95,8 +102,13 @@ export interface InstalledNode {
   auxId?: string;
   /** Installed version (semver, commit hash, "nightly", or "unknown"). */
   version?: string;
-  /** Whether the pack is currently enabled. */
-  enabled: boolean;
+  /**
+   * Whether the pack is currently enabled. UNDEFINED when Manager reported no
+   * enabled/is_disabled flag at all — an unreported state is unknown, NOT
+   * enabled: collapsing it to a definite value lets a verification claim a
+   * state nobody observed (codex gate on #775).
+   */
+  enabled?: boolean;
 }
 
 export interface NodeOpResult {
@@ -635,8 +647,42 @@ const queueTiming = {
   // counts queued items). Give the worker a grace window to spin up before
   // treating an idle-looking status as "done".
   startupGraceMs: 8000,
+  // Budget for node installs/updates/fixes: bounded by how long `pip install`
+  // and a git clone plausibly take.
   timeoutMs: 600_000,
+  /**
+   * Budget for an `install-model` task (#817). A model download is NOT the same
+   * shape of work as a node install: 600s is a hard guarantee of failure for any
+   * multi-GB file on a normal link (a 15 GB file at 25 MB/s needs 600s just for
+   * the bytes, before any CDN slowness), and #817 is exactly that — the queue
+   * timing out at 600s every time.
+   *
+   * We cannot make the REMOTE transfer resumable — ComfyUI-Manager fetches
+   * server-side and exposes no per-task progress or byte count — so unlike the
+   * local path (#470) there is nothing here to bound an attempt AGAINST. All we
+   * can honestly do is stop declaring failure while the host is still working.
+   * The value is deliberately generous rather than tuned; the timeout's job is to
+   * stop us waiting forever, not to police the download.
+   */
+  modelTimeoutMs: 4 * 60 * 60_000,
 };
+
+/** Per-kind queue budget. Only `install-model` gets the large one — a node
+ *  install that hangs for four hours is a real failure worth reporting. */
+function queueTimeoutFor(kind?: ManagerTaskKind): number {
+  if (kind !== "install-model") return queueTiming.timeoutMs;
+  const raw = process.env.COMFYUI_MANAGER_DOWNLOAD_TIMEOUT_S;
+  if (raw !== undefined && raw.trim() !== "") {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) {
+      return Math.min(24 * 60 * 60_000, Math.max(60_000, Math.round(n) * 1000));
+    }
+    logger.warn(
+      `Ignoring COMFYUI_MANAGER_DOWNLOAD_TIMEOUT_S="${raw}" — not a positive number of seconds.`,
+    );
+  }
+  return queueTiming.modelTimeoutMs;
+}
 
 /** @internal — test hook to shrink polling timings; not part of the tool API. */
 export function setQueueTimingForTests(
@@ -805,8 +851,15 @@ export async function fetchManagerTaskHistoryEntry(
  * work that is really running — and inviting a caller retry that double-executes
  * it (#646).
  */
-async function runManagerQueue(api: ManagerApi, base: string): Promise<QueueStatus> {
+async function runManagerQueue(
+  api: ManagerApi,
+  base: string,
+  /** Selects the queue budget — a model download gets a far larger one than a
+   *  node install (#817). Omitted ⇒ the node-install budget. */
+  kind?: ManagerTaskKind,
+): Promise<QueueStatus> {
   const prefix = managerQueuePrefixFor(api);
+  const timeoutMs = queueTimeoutFor(kind);
   // queue/start returns 200 (worker started) or 201 (already running) — both
   // are 2xx, so managerFetch accepts either. Same on both generations. Some
   // legacy 3.x builds expose start as GET-only, so negotiate POST→GET on a 405
@@ -815,7 +868,7 @@ async function runManagerQueue(api: ManagerApi, base: string): Promise<QueueStat
 
   const start = Date.now();
   let lastStatus: QueueStatus | undefined;
-  while (Date.now() - start < queueTiming.timeoutMs) {
+  while (Date.now() - start < timeoutMs) {
     await sleep(queueTiming.pollIntervalMs);
     const status = await managerFetch<QueueStatus>(`${prefix}/status`, {
       base,
@@ -834,8 +887,26 @@ async function runManagerQueue(api: ManagerApi, base: string): Promise<QueueStat
       }
     }
   }
+  // TIMED OUT. Be precise about what that does and does NOT mean (#817): we
+  // stopped WAITING; the ComfyUI host's queue worker was never told to stop and,
+  // for a model download, is very likely still streaming. Reporting this as a
+  // plain failure is what led #817's reporter to re-issue — starting a SECOND
+  // server-side fetch of the same file, which is how the destination ended up
+  // truncated and failing safetensors shape checks. There is no Manager API to
+  // recall a queued task, so the only honest remedy is: look, don't re-issue.
   throw new NodeManagementError(
-    `ComfyUI-Manager queue did not finish within ${queueTiming.timeoutMs / 1000}s`,
+    `ComfyUI-Manager queue did not finish within ${Math.round(timeoutMs / 1000)}s. ` +
+      (kind === "install-model"
+        ? `This is the WAIT giving up, NOT proof the download failed — ComfyUI-Manager fetches the file ` +
+          `server-side and there is no API to stop or inspect an individual task, so the host is probably ` +
+          `still downloading. Do NOT re-issue the download: a second server-side fetch writes the SAME ` +
+          `destination file concurrently, and the interleaved result is a corrupt model (that is the ` +
+          `"shape is invalid for input of size N" failure). Instead, wait and check list_local_models on ` +
+          `the connected server until the file appears and its size stops changing. If your files are ` +
+          `genuinely larger than this budget, raise COMFYUI_MANAGER_DOWNLOAD_TIMEOUT_S (seconds), or ` +
+          `download to a LOCAL ComfyUI, where the transfer is streamed here — resumable, retried ` +
+          `automatically, and size-verified before anything is reported as landed.`
+        : `The Manager worker may still be running the task on the host; check its state before retrying.`),
     lastStatus,
   );
 }
@@ -864,7 +935,8 @@ async function queueManagerTask(
     enqueueManagerTask(api, kind, resolve, randomUUID(), base, epoch),
     base,
   );
-  return runManagerQueue(used, base);
+  // Thread the kind so a model download gets the model budget, not the node one (#817).
+  return runManagerQueue(used, base, kind);
 }
 
 /** Params for a Manager task: a fixed body, or a resolver invoked with the
@@ -1274,19 +1346,43 @@ export function nonInteractiveGitEnv(): NodeJS.ProcessEnv {
 
 /**
  * Run an official `comfy node` subcommand. Returns normalized JSON data.
- * Throws ProcessControlError if comfyuiPath is undefined (remote mode).
+ * Throws ProcessControlError when no local workspace is available (remote
+ * mode). `workspace` is the CALL-SCOPED local ComfyUI root, captured by the
+ * caller BEFORE its first await — a retarget mid-operation must not send the
+ * CLI at a different install than the pre/post checks described.
  */
-function runCmCli(args: string[]): string {
-  if (!config.comfyuiPath) {
+function runCmCli(args: string[], workspace?: string): string {
+  // THE CHOKE-POINT (codex gate P0). An earlier fix put this guard in
+  // `comfyCliUnavailableReason`, which install/enable/disable/uninstall consult —
+  // but `update`, `reinstall`, `fix all` and dependency sync call the CLI without
+  // going through it, so a stale local COMFYUI_PATH was still mutable in remote
+  // mode by four other routes. Every comfy-cli invocation passes through HERE, so
+  // this is where the refusal belongs. Nothing has run yet at this point, which is
+  // what makes refusing the right shape.
+  if (isRemoteMode()) {
     throw new ProcessControlError(
-      "This operation requires a local ComfyUI install. Set COMFYUI_PATH or use the Manager HTTP API.",
+      "This session targets a REMOTE ComfyUI (--comfyui-url), and comfy-cli only acts on a " +
+        "LOCAL install" +
+        (workspace ?? config.comfyuiPath
+          ? ` — running it would modify ${workspace ?? config.comfyuiPath}, which is NOT the ` +
+            `server you are connected to`
+          : "") +
+        ". Nothing was run. Use the ComfyUI-Manager HTTP path, which addresses the server you " +
+        "are actually connected to, or run comfy-cli on the machine the install lives on.",
+    );
+  }
+  const ws = workspace ?? config.comfyuiPath;
+  if (!ws) {
+    throw new ProcessControlError(
+      "This operation requires a local ComfyUI install. Set COMFYUI_PATH or a " +
+        "default workspace (workspace action 'set_default'), or use the Manager HTTP API.",
     );
   }
   logger.info("Running comfy-cli", { args: ["node", ...args].join(" ") });
   try {
     const envelope = assertComfyCliOk(
       runComfyCliSync(["node", ...args], {
-        workspace: config.comfyuiPath,
+        workspace: ws,
         timeoutMs: COMFY_CLI_TIMEOUT,
         env: config.githubToken ? { GITHUB_TOKEN: config.githubToken } : undefined,
       }),
@@ -1326,14 +1422,15 @@ function parseInstalled(raw: unknown): InstalledNode[] {
     auxId:
       typeof v.aux_id === "string" && v.aux_id.length > 0 ? v.aux_id : undefined,
     version: typeof v.ver === "string" ? v.ver : undefined,
-    // `enabled` may be absent on some builds; treat missing as enabled,
-    // but honor an explicit is_disabled flag if present.
+    // `enabled` is reported as a boolean on current builds; an explicit
+    // is_disabled flag is honored too. When NEITHER is present the state is
+    // UNKNOWN — left undefined, never defaulted to a definite value.
     enabled:
       typeof v.enabled === "boolean"
         ? v.enabled
-        : v.is_disabled === true
-          ? false
-          : true,
+        : typeof v.is_disabled === "boolean"
+          ? !v.is_disabled
+          : undefined,
   });
 
   if (Array.isArray(raw)) {
@@ -1521,11 +1618,24 @@ function nodeInstalledMatches(
   idOrUrl: string,
   installed: InstalledNode[],
 ): boolean {
+  return findInstalledNode(idOrUrl, installed) !== undefined;
+}
+
+/**
+ * The installed-list entry matching the wanted id/url, if any — the same
+ * matching nodeInstalledMatches applies, but returning the node so callers can
+ * also inspect its enabled flag / version (disable/uninstall post-state
+ * verification, #775).
+ */
+function findInstalledNode(
+  idOrUrl: string,
+  installed: InstalledNode[],
+): InstalledNode | undefined {
   const wanted = idOrUrl.trim().toLowerCase();
   const repoName = looksLikeGitUrl(idOrUrl)
     ? gitCheckoutDir(parseGitUrl(idOrUrl).baseUrl).toLowerCase()
     : wanted;
-  return installed.some((node) => {
+  return installed.find((node) => {
     const candidates: string[] = [];
     for (const v of [node.module, node.cnrId, node.auxId]) {
       if (!v) continue;
@@ -1535,6 +1645,196 @@ function nodeInstalledMatches(
     }
     return candidates.includes(wanted) || candidates.includes(repoName);
   });
+}
+
+// ---------------------------------------------------------------------------
+// On-disk presence evidence (#797)
+//
+// The Manager installed-list is keyed on what the MANAGER tracks. A pack
+// installed as a Comfy Registry zip (no .git) or copied into custom_nodes by
+// hand is present on disk while the list says nothing about it — and a gate
+// that only asks the list has no basis for asserting "not installed locally".
+// The disk check below answers the SAME question the list was asked ("is this
+// pack here?") against the filesystem, keeping the three outcomes distinct:
+// found / scanned-and-not-there / could-not-look.
+// ---------------------------------------------------------------------------
+
+/** Directory names a pack could plausibly be installed under for `id`. */
+function packDirNameCandidates(id: string): Set<string> {
+  const wanted = id.trim().toLowerCase();
+  const names = new Set<string>([wanted, basename(wanted)]);
+  if (looksLikeGitUrl(id)) {
+    names.add(gitCheckoutDir(parseGitUrl(id).baseUrl).toLowerCase());
+  }
+  return names;
+}
+
+export type DiskPackPresence =
+  | { state: "found"; dir: string }
+  /** custom_nodes was enumerated and the pack is not in it. */
+  | { state: "not-found"; scanned: string }
+  /** The disk could not answer (no dir, unreadable, …) — NOT absence. */
+  | { state: "unreadable"; reason: string };
+
+/**
+ * Look for a pack on disk under <comfyuiBase>/custom_nodes. A directory counts
+ * when its name matches (a Manager-disabled "<name>.disabled" suffix is still
+ * the pack — disabled is not uninstalled) or its pyproject.toml [project].name
+ * matches (the registry-id identity a zip install keeps even when the folder
+ * was renamed). An unrelated pack's unreadable pyproject simply does not vouch
+ * for that directory; it never turns the whole scan into a failure.
+ */
+export function findPackOnDisk(id: string, comfyuiBase: string): DiskPackPresence {
+  const customNodes = join(comfyuiBase, "custom_nodes");
+  let entries: import("node:fs").Dirent[];
+  try {
+    if (!existsSync(customNodes)) {
+      return {
+        state: "unreadable",
+        reason: `${customNodes} does not exist (is ${comfyuiBase} a ComfyUI install root?)`,
+      };
+    }
+    entries = readdirSync(customNodes, { withFileTypes: true });
+  } catch (err) {
+    return {
+      state: "unreadable",
+      reason: `could not enumerate ${customNodes}: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  const wanted = packDirNameCandidates(id);
+  for (const entry of entries) {
+    if (!(entry.isDirectory() || entry.isSymbolicLink())) continue;
+    if (entry.name.startsWith(".")) continue;
+    const dirName = entry.name.toLowerCase().replace(/\.disabled$/, "");
+    let pyprojectName: string | undefined;
+    const pyproject = join(customNodes, entry.name, "pyproject.toml");
+    try {
+      if (existsSync(pyproject)) {
+        pyprojectName = parsePyproject(readFileSync(pyproject, "utf-8"))
+          .projectName?.trim()
+          .toLowerCase();
+      }
+    } catch {
+      // An unreadable/corrupt pyproject means THIS directory cannot vouch by
+      // identity — it does not make the whole scan unreadable.
+    }
+    if (wanted.has(dirName) || (pyprojectName !== undefined && wanted.has(pyprojectName))) {
+      return { state: "found", dir: join(customNodes, entry.name) };
+    }
+  }
+  return { state: "not-found", scanned: customNodes };
+}
+
+export type PackPresence =
+  | { state: "manager-listed"; node?: InstalledNode }
+  /**
+   * On disk, and a READABLE Manager list does not track it (registry zip /
+   * manual copy). When the list could not be read (managerListReadable false)
+   * the tracking claim is unknown — callers must not assert "Manager does not
+   * track it" or that a queued op resolved to nothing.
+   */
+  | { state: "on-disk"; dir: string; managerListReadable: boolean; listError?: string }
+  /** Every source that could be consulted agrees the pack is not there. */
+  | { state: "absent"; evidence: "manager-only" | "manager+disk"; scanned?: string }
+  /** No consulted source could answer — never reported as absence. */
+  | { state: "unverifiable"; reason: string };
+
+/**
+ * The disk half of a presence answer, captured at OPERATION ENTRY. Every
+ * presence check of one logical operation (pre-resolve, post-verify) must use
+ * the SAME context: computing it later from mutable global mode/config lets a
+ * mid-op retarget pair Manager A's answer with disk B (or no disk at all) —
+ * false "present on disk", false absence, false REMOVED (codex gate round 11).
+ */
+export interface PackPresenceContext {
+  /** The remote/local classification at entry. */
+  remote: boolean;
+  /** The local root captured at entry (undefined when remote or none exists). */
+  diskRoot?: string;
+}
+
+/** Capture the presence context for one operation, before its first await. */
+export function capturePackPresenceContext(diskRoot?: string): PackPresenceContext {
+  const remote = isRemoteMode();
+  return {
+    remote,
+    diskRoot: remote ? undefined : (diskRoot ?? resolveEffectiveComfyUIBase()),
+  };
+}
+
+/**
+ * Answer "is this pack present?" across BOTH sources of truth, keeping
+ * "could not determine" distinct from "determined absent" (#797, #796's
+ * defect class):
+ *   1. ComfyUI-Manager's installed list (works remotely, covers tracked packs);
+ *   2. the on-disk custom_nodes scan — LOCAL sessions only. In remote mode the
+ *      disk we could read is not the server's, so it is never consulted.
+ * The Manager list matching always wins; disk evidence is what keeps a
+ * Manager-untracked zip install from reading as "not installed".
+ *
+ * `ctx` is the operation's entry-captured context (capturePackPresenceContext).
+ * When omitted it is captured here — still before this call's first await, so
+ * single-shot callers stay correct.
+ */
+export async function resolvePackPresence(
+  id: string,
+  base: string,
+  ctx?: PackPresenceContext,
+): Promise<PackPresence> {
+  const context = ctx ?? capturePackPresenceContext();
+  const diskBase = context.remote ? undefined : context.diskRoot;
+
+  let installed: InstalledNode[] | undefined;
+  let listError: string | undefined;
+  try {
+    installed = await listInstalledNodesAt(base);
+  } catch (err) {
+    listError = err instanceof Error ? err.message : String(err);
+  }
+  if (installed) {
+    const node = findInstalledNode(id, installed);
+    if (node) return { state: "manager-listed", node };
+  }
+
+  const disk = diskBase ? findPackOnDisk(id, diskBase) : undefined;
+  if (disk?.state === "found") {
+    return {
+      state: "on-disk",
+      dir: disk.dir,
+      managerListReadable: installed !== undefined,
+      listError,
+    };
+  }
+
+  if (!installed) {
+    // The Manager list could not be read — "absent" is off the table no matter
+    // what the disk says: a pack Manager tracks but the disk missed (an
+    // adopted/extra-paths root) would be falsely condemned.
+    const diskNote =
+      disk?.state === "not-found"
+        ? ` The disk check found no matching pack under ${disk.scanned} either, but with the Manager list unreadable that still does not prove absence.`
+        : disk?.state === "unreadable"
+          ? ` The disk check was inconclusive too (${disk.reason}).`
+          : " No local disk check was possible in this session.";
+    return {
+      state: "unverifiable",
+      reason:
+        `ComfyUI-Manager's installed-pack list could not be read (${listError}).` + diskNote,
+    };
+  }
+  if (disk?.state === "not-found") {
+    return { state: "absent", evidence: "manager+disk", scanned: disk.scanned };
+  }
+  if (disk?.state === "unreadable") {
+    return {
+      state: "unverifiable",
+      reason:
+        `"${id}" is not in ComfyUI-Manager's installed-pack list, and the on-disk ` +
+        `check could not answer (${disk.reason}).`,
+    };
+  }
+  // Remote session: only the Manager list could be consulted at all.
+  return { state: "absent", evidence: "manager-only" };
 }
 
 /**
@@ -1615,12 +1915,25 @@ async function cloneCustomNodeFallback(
   // panel-connected local session with no COMFYUI_PATH can still clone an
   // unregistered git pack); fall back to config.comfyuiPath.
   const comfyuiBase = basePath ?? config.comfyuiPath;
+  // Same hazard as the CLI paths (codex gate P0): the guard below catches "no
+  // path", but the dangerous case is HAVING one while connected elsewhere. A
+  // clone into a stale local tree would report a successful install of a pack the
+  // connected server will never see.
+  if (isRemoteMode()) {
+    throw new ProcessControlError(
+      `"${repoName}" is not in the ComfyUI-Manager registry, and cloning it would write to a ` +
+        `LOCAL install` +
+        (comfyuiBase ? ` (${comfyuiBase})` : "") +
+        ` — but this session targets a REMOTE ComfyUI (--comfyui-url), so that is not the ` +
+        `server you are connected to. Nothing was cloned. Install it on the ComfyUI host, or ` +
+        `pass a registered pack id the Manager can resolve there.`,
+    );
+  }
   if (!comfyuiBase) {
     throw new ProcessControlError(
       `"${repoName}" is not in the ComfyUI-Manager registry and cloning it ` +
-        `requires a local ComfyUI install, but no ComfyUI path is set ` +
-        `(running in remote --comfyui-url mode). Install it on the ComfyUI host, ` +
-        `or pass a registered pack id.`,
+        `requires a local ComfyUI install, but no ComfyUI path is set. ` +
+        `Install it on the ComfyUI host, or pass a registered pack id.`,
     );
   }
 
@@ -1787,11 +2100,53 @@ export async function installCustomNode(opts: InstallOptions): Promise<NodeOpRes
   );
 }
 
+/**
+ * Why the comfy-cli subprocess path cannot run against `workspace`, or
+ * undefined when it can. Probed BEFORE anything is submitted (#808): an
+ * explicit useCmCli on a host without a usable CLI must fall back to Manager
+ * HTTP, not die with NODE_MANAGEMENT_ERROR after the tool description promised
+ * a fallback. `workspace` is the caller's captured local root — COMFYUI_PATH,
+ * an adopted root, or the saved default workspace, which the CLI layer
+ * supports natively (comfy-cli.ts defaultWorkspace).
+ */
+function comfyCliUnavailableReason(workspace: string | undefined): string | undefined {
+  // REMOTE MODE FIRST (codex gate P0). comfy-cli runs against a LOCAL install,
+  // while every check around these calls — the pre-state, the post-verify — talks
+  // to the Manager on the REMOTE server. With a stale local COMFYUI_PATH the two
+  // describe different machines: the CLI uninstalls or disables a pack here, the
+  // verification reports on a pack over there, and the local destructive action is
+  // never disclosed at all.
+  //
+  // `workspace` is non-empty in exactly that case, which is why this cannot be
+  // folded into the check below: having a path is what makes it dangerous.
+  if (isRemoteMode()) {
+    return (
+      "this session targets a REMOTE ComfyUI (--comfyui-url), and comfy-cli only acts on a " +
+      "LOCAL install" +
+      (workspace
+        ? ` — running it would modify ${workspace}, which is NOT the server you are connected to`
+        : "") +
+      ". Run it on the machine the install lives on"
+    );
+  }
+  if (!workspace) {
+    return "no local ComfyUI install path is available (COMFYUI_PATH unset and no saved default workspace), which the comfy-cli subprocess needs";
+  }
+  const executable = resolveComfyCliExecutable({ workspace });
+  if (!executable) {
+    return "comfy-cli was not found on PATH or in the workspace's .venv (install comfy-cli>=1.11.1, set COMFY_CLI_PATH, or install it into the workspace venv)";
+  }
+  const version = getComfyCliVersion({ workspace });
+  if (!isSupportedComfyCliVersion(version)) {
+    return `comfy-cli >=1.11.1 is required; found ${version ?? "an unrecognized version"}`;
+  }
+  return undefined;
+}
+
 async function installCustomNodeImpl(
   opts: InstallOptions,
 ): Promise<NodeOpResult> {
   const { id, version, mode = "remote", channel = "default" } = opts;
-  const basePath = opts.comfyuiPath ?? config.comfyuiPath;
   const parsedGit = parseGitUrl(id);
   const gitId = parsedGit.baseUrl;
   const gitRefCandidate = opts.ref ?? parsedGit.ref ?? version;
@@ -1813,24 +2168,61 @@ async function installCustomNodeImpl(
   // actually used (runGitCheckout, cloneCustomNodeFallback).
   if (source === "git") assertSafeGitUrl(gitId);
 
-  // Keep both the mutation and its post-queue on-disk verification on the
-  // target selected for this invocation. Otherwise a panel retarget between
-  // them can turn an A-side install into a B-side fabricated success/fallback.
+  // Keep the mutation, its post-queue verification, AND any local filesystem
+  // work on the target selected for this invocation — captured NOW, before the
+  // first await: a panel retarget in between must not split them across two
+  // installs. cliWorkspace covers COMFYUI_PATH, an adopted root, and the saved
+  // default workspace (the CLI layer supports all three); the CLI probe, the
+  // ref checkout, and the clone fallback all take this ONE root, so a git
+  // install with a ref can never install into the workspace and then fail the
+  // checkout for want of a path (codex gate rounds 5-6).
   const managerBase = managerBaseUrl();
+  const cliWorkspace = opts.comfyuiPath ?? resolveEffectiveComfyUIBase();
+  const presenceCtx = capturePackPresenceContext(cliWorkspace);
+  // THE PRE-STATE, OBSERVED BEFORE THE OPERATION (codex gate P0). The "already
+  // installed" verdict below used to be inferred from POST-op disk state alone:
+  // a pack that was absent before the call and installed as a registry ZIP —
+  // which Manager does not track — creates a directory the post-check then reads
+  // as "it was already there", telling the user nothing happened when their pack
+  // had just been installed. A pre-state cannot be recovered afterwards; it has
+  // to be taken now.
+  const diskBefore = presenceCtx.diskRoot
+    ? findPackOnDisk(id, presenceCtx.diskRoot)
+    : undefined;
 
+  // #808 — a requested comfy-cli that is not usable is a FALLBACK, not a fatal
+  // error: the probe runs before anything is submitted, so dropping to Manager
+  // HTTP cannot double-run anything, and the git path below keeps its own
+  // direct-clone fallback for an unregistered repo. The note is prepended to
+  // whichever result the HTTP path produces, so the mechanism switch is
+  // disclosed rather than silent.
+  let cliFallbackNote: string | undefined;
   if (opts.useCmCli) {
-    // cm-cli install accepts registry ids and git urls alike.
-    const installId = source === "git" ? gitId : id;
-    const out = runCmCli(["install", installId, "--mode", mode, "--channel", channel]);
-    if (source === "git" && gitRef) {
-      runGitCheckout(gitId, gitRef, basePath);
+    const cliProblem = comfyCliUnavailableReason(cliWorkspace);
+    if (cliProblem === undefined) {
+      // cm-cli install accepts registry ids and git urls alike.
+      const installId = source === "git" ? gitId : id;
+      const out = runCmCli(["install", installId, "--mode", mode, "--channel", channel], cliWorkspace);
+      if (source === "git" && gitRef) {
+        runGitCheckout(gitId, gitRef, cliWorkspace);
+      }
+      return {
+        mechanism: "comfy-cli",
+        message: `Installed "${id}" via official comfy-cli.`,
+        details: out.trim(),
+      };
     }
-    return {
-      mechanism: "comfy-cli",
-      message: `Installed "${id}" via official comfy-cli.`,
-      details: out.trim(),
-    };
+    logger.info("comfy-cli requested (useCmCli) but unavailable — falling back to Manager HTTP", {
+      reason: cliProblem,
+    });
+    cliFallbackNote =
+      `comfy-cli was requested (useCmCli) but is not usable here: ${cliProblem}. ` +
+      `NOTHING was run through comfy-cli — the install below used ComfyUI-Manager instead.`;
   }
+  const withCliNote = (result: NodeOpResult): NodeOpResult =>
+    cliFallbackNote
+      ? { ...result, message: `${cliFallbackNote} ${result.message}` }
+      : result;
 
   if (source === "git") {
     const repoName = gitCheckoutDir(gitId);
@@ -1881,13 +2273,13 @@ async function installCustomNodeImpl(
       () => [] as InstalledNode[],
     );
     if (nodeInstalledMatches(gitId, installed)) {
-      return {
+      return withCliNote({
         mechanism: "manager-http",
         message: `Installed "${repoName}" via ComfyUI-Manager. Restart may be required to load new nodes.`,
         details: status,
-      };
+      });
     }
-    return await cloneCustomNodeFallback(gitId, repoName, gitRef, status, basePath);
+    return withCliNote(await cloneCustomNodeFallback(gitId, repoName, gitRef, status, cliWorkspace));
   }
 
   // Registry (plain CNR id). Keep the prior defaults channel "default" /
@@ -1903,22 +2295,102 @@ async function installCustomNodeImpl(
     channel,
     mode,
   }, managerBase);
-  const installed = await listInstalledNodesAt(managerBase).catch(
-    () => [] as InstalledNode[],
-  );
-  if (!nodeInstalledMatches(id, installed)) {
-    throw new NodeManagementError(
-      `"${id}" was queued but is not present afterward — it was not found in the ` +
-        `ComfyUI-Manager registry. Check the pack id, or pass a git URL to clone ` +
-        `it directly.`,
-      status,
-    );
+  // #797: verify across BOTH sources (Manager list + local disk) and keep
+  // "could not determine" distinct from "determined absent" — an unreadable
+  // Manager list collapsed to [] used to read as "not found in the registry".
+  const presence = await resolvePackPresence(id, managerBase, presenceCtx);
+  switch (presence.state) {
+    case "manager-listed":
+      return withCliNote({
+        mechanism: "manager-http",
+        message: `Installed "${id}" via ComfyUI-Manager. Restart may be required to load new nodes.`,
+        details: status,
+      });
+    case "on-disk":
+      if (!presence.managerListReadable) {
+        // Present on disk, but the Manager list could not be read — claiming
+        // "already installed, nothing new happened" would assert an outcome
+        // nobody observed.
+        return withCliNote({
+          mechanism: "manager-http",
+          message:
+            `"${id}" is present on disk at ${presence.dir}. Whether the queued install ` +
+            `changed anything could NOT be verified: ComfyUI-Manager's installed-pack ` +
+            `list could not be read (${presence.listError}). NOT claiming a fresh install ` +
+            `— check list_installed_nodes.`,
+          details: status,
+        });
+      }
+      // The Manager install resolved to nothing and the pack IS on disk. WHICH of
+      // those two stories it is depends entirely on the PRE-state, which is why
+      // it is read here and not inferred.
+      if (diskBefore?.state === "not-found") {
+        // It was NOT there before and it is now: the install worked. Reporting
+        // "already installed" here hid a successful install behind a no-op.
+        // STATES THE OBSERVATION, NOT A CAUSE (codex gate P1). `diskBefore` is a
+        // filesystem snapshot with nothing binding it to this operation, so under
+        // two concurrent agents on one rig — which is in scope — the pack could
+        // have been created by the OTHER agent between our pre-check and our
+        // post-check. "It was absent before and is present now" is exactly what we
+        // saw; "this call installed it" is an inference the evidence does not
+        // support, and it is the same bucket-narrated-as-cause fold this cluster
+        // is about. The user's next action (restart to load it) is identical
+        // either way, so the weaker claim costs them nothing.
+        return withCliNote({
+          mechanism: "manager-http",
+          message:
+            `"${id}" is now present on disk at ${presence.dir}, and was NOT there before ` +
+            `this call — so it was installed, though ComfyUI-Manager does not track it (a ` +
+            `Comfy Registry zip install is not in its installed-pack list). If another agent ` +
+            `is working on this ComfyUI, it may have been the one that installed it. Restart ` +
+            `ComfyUI to load it.`,
+          details: status,
+        });
+      }
+      if (diskBefore?.state === "found") {
+        return withCliNote({
+          mechanism: "manager-http",
+          message:
+            `"${id}" is present on disk at ${presence.dir}, but ComfyUI-Manager does not ` +
+            `track it (a Comfy Registry zip install or a manual copy), and it was ALREADY ` +
+            `there before this call — so the queued registry install resolved to nothing ` +
+            `new. Restart ComfyUI if it was just added.`,
+          details: status,
+        });
+      }
+      // No usable pre-state (no disk root, or the pre-check was unreadable). The
+      // pack is on disk NOW; whether this call put it there is undetermined, and
+      // saying either would be a guess dressed as a finding.
+      return withCliNote({
+        mechanism: "manager-http",
+        message:
+          `"${id}" is present on disk at ${presence.dir}, and ComfyUI-Manager does not ` +
+          `track it (a Comfy Registry zip install or a manual copy). Whether THIS call ` +
+          `installed it could not be determined — the pack's state before the call was ` +
+          `${diskBefore?.state === "unreadable" ? `unreadable (${diskBefore.reason})` : "not observable in this session"}. ` +
+          `Restart ComfyUI if it was just added.`,
+        details: status,
+      });
+    case "absent":
+      throw new NodeManagementError(
+        presence.evidence === "manager+disk"
+          ? `"${id}" was queued but is not present afterward — it is in neither the ` +
+            `ComfyUI-Manager installed-pack list NOR on disk under ${presence.scanned}. ` +
+            `It was not found in the ComfyUI-Manager registry. Check the pack id, or pass ` +
+            `a git URL to clone it directly.`
+          : `"${id}" was queued but is not present afterward — it was not found in the ` +
+            `ComfyUI-Manager registry. Check the pack id, or pass a git URL to clone ` +
+            `it directly.`,
+        status,
+      );
+    case "unverifiable":
+      throw new NodeManagementError(
+        `"${id}" was queued, but whether it landed could NOT be verified: ${presence.reason} ` +
+          `NOT reporting success on an unverified install. Check list_installed_nodes, ` +
+          `then retry if it is genuinely absent.`,
+        status,
+      );
   }
-  return {
-    mechanism: "manager-http",
-    message: `Installed "${id}" via ComfyUI-Manager. Restart may be required to load new nodes.`,
-    details: status,
-  };
 }
 
 /**
@@ -1936,52 +2408,153 @@ async function installCustomNodeImpl(
  * nodeInstalledMatches covers the module/auxId spellings — so that path is
  * unaffected; only an id that resolves NOWHERE fails.
  */
+/**
+ * Thrown by assertPackPresentAfterOp ONLY when absence was actually observed
+ * (every consulted source agrees the pack is gone). An unverifiable post-state
+ * throws a plain NodeManagementError instead, so a caller wrapping failures —
+ * the reinstall path, which CAN truthfully say "left the pack REMOVED" for an
+ * observed absence but not for an unreadable one — can tell them apart
+ * (codex gate round 10).
+ */
+export class PackAbsentAfterOpError extends NodeManagementError {
+  constructor(message: string, details?: unknown) {
+    super(message, details);
+    this.name = "PackAbsentAfterOpError";
+  }
+}
+
 async function assertPackPresentAfterOp(
   id: string,
   op: "update" | "reinstall",
   base: string,
   status: QueueStatus,
+  ctx?: PackPresenceContext,
 ): Promise<void> {
-  // #771 — SAY WHAT WE ACTUALLY CHECKED. This gate consults ONE source: the
-  // Manager's own installed list. It never looks at the filesystem, so it is in
-  // no position to assert that a pack "is not installed locally" — and for the
-  // sidebar panel installed from the Comfy Registry as a zip, that assertion was
-  // flatly false while install_panel(action='status') was reporting the same
-  // pack at a concrete directory and version. Two tools, two answers, and the
-  // wrong one was the one that sounded certain.
+  // #771 — SAY WHAT WE ACTUALLY CHECKED; #797 — CHECK THE DISK TOO. This gate
+  // consults up to TWO sources: the Manager's installed list AND (in a local
+  // session) the on-disk custom_nodes scan. The Manager list alone never sees a
+  // Comfy Registry zip install or a manual copy, so a list-only miss is NOT
+  // proof the pack "is not installed locally" — for the sidebar panel installed
+  // as a zip, that assertion was flatly false while install_panel(action='status')
+  // reported the same pack at a concrete directory and version.
   //
-  // A LIST THAT COULD NOT BE READ IS NOT AN EMPTY LIST, either. Collapsing the
-  // failure to `[]` made an unreachable Manager indistinguishable from a
-  // genuinely absent pack. Both still REFUSE — the #730 contract is that an
-  // unverifiable op never reports success — but they now refuse with the reason
-  // that is actually true.
-  let installed: InstalledNode[] | undefined;
-  let listError: string | undefined;
-  try {
-    installed = await listInstalledNodesAt(base);
-  } catch (err) {
-    listError = err instanceof Error ? err.message : String(err);
+  // The three outcomes stay distinct (this fold is #796's recurring defect):
+  // present (either source), absent (BOTH consulted sources agree), and
+  // unverifiable (a source that could not answer — an unreadable list or an
+  // unenumerable directory is never treated as absence).
+  const presence = await resolvePackPresence(id, base, ctx);
+  switch (presence.state) {
+    case "manager-listed":
+      return;
+    case "on-disk":
+      if (!presence.managerListReadable) {
+        // The pack IS on disk, but Manager's list could not be read — so whether
+        // Manager tracked it, and whether the queued op did anything, are both
+        // UNKNOWN. Asserting "resolved to nothing" would be a guess.
+        throw new NodeManagementError(
+          `"${id}" was queued for ${op}. The pack IS present on disk at ${presence.dir}, ` +
+            `but ComfyUI-Manager's installed-pack list could not be read (${presence.listError}), ` +
+            `so whether the ${op} took effect could NOT be verified. NOT reporting success ` +
+            `on an unverified ${op}. Check that ComfyUI-Manager is reachable, then retry.`,
+          status,
+        );
+      }
+      // The pack IS installed — the op still resolved to nothing, because
+      // Manager can only update/reinstall packs IT tracks. Refuse, but with the
+      // truth: where the pack is and why Manager could not touch it.
+      throw new NodeManagementError(
+        `"${id}" was queued for ${op}, which resolved to NOTHING: the pack is present ` +
+          `on disk at ${presence.dir} but ComfyUI-Manager does not track it (a Comfy ` +
+          `Registry zip install or a manual copy), and Manager can only ${op} packs in ` +
+          `its own installed list. ` +
+          `The pack was NOT ${op === "update" ? "updated" : "reinstalled"}. To move it, reinstall it from its ` +
+          `registry id or repository URL (install_custom_node / reinstall_custom_node), ` +
+          `or — when ${presence.dir} is a git checkout — pull it there directly.`,
+        status,
+      );
+    case "absent":
+      if (presence.evidence === "manager+disk") {
+        throw new PackAbsentAfterOpError(
+          `"${id}" was queued for ${op} but is not present afterward — it is in neither ` +
+            `ComfyUI-Manager's installed-pack list NOR on disk under ${presence.scanned} — ` +
+            `so the ${op} resolved to nothing. Check the pack id with list_installed_nodes, ` +
+            `or find the right id with search_custom_nodes.`,
+          status,
+        );
+      }
+      // Remote session: only the Manager list could be consulted. Say exactly that.
+      throw new PackAbsentAfterOpError(
+        `"${id}" was queued for ${op} but is not present afterward in ` +
+          `ComfyUI-Manager's installed-pack list, so the ${op} resolved to nothing. NOTE: this ` +
+          `check reads ComfyUI-Manager's registry/installed list ONLY — it does not ` +
+          `inspect custom_nodes, so a pack that IS on disk but unknown to the Manager ` +
+          `(a Comfy Registry zip install, or a manual copy) reaches here too. Check ` +
+          `the pack id with list_installed_nodes, and for the sidebar panel use ` +
+          `install_panel(action='status'), which reads the directory itself.`,
+        status,
+      );
+    case "unverifiable":
+      throw new NodeManagementError(
+        `"${id}" was queued for ${op}, but whether it landed could NOT be verified: ` +
+          `${presence.reason} NOT reporting success on an unverified ${op}. Check that ` +
+          `ComfyUI-Manager is reachable on the host, then retry.`,
+        status,
+      );
   }
-  if (!installed) {
-    throw new NodeManagementError(
-      `"${id}" was queued for ${op}, but whether it landed could NOT be verified: ` +
-        `ComfyUI-Manager's installed-pack list could not be read (${listError}). ` +
-        `NOT reporting success on an unverified ${op}. Check that ComfyUI-Manager ` +
-        `is reachable on the host, then retry.`,
-      status,
-    );
-  }
-  if (!nodeInstalledMatches(id, installed)) {
-    throw new NodeManagementError(
-      `"${id}" was queued for ${op} but is not present afterward in ` +
-        `ComfyUI-Manager's installed-pack list, so the ${op} resolved to nothing. NOTE: this ` +
-        `check reads ComfyUI-Manager's registry/installed list ONLY — it does not ` +
-        `inspect custom_nodes, so a pack that IS on disk but unknown to the Manager ` +
-        `(a Comfy Registry zip install, or a manual copy) reaches here too. Check ` +
-        `the pack id with list_installed_nodes, and for the sidebar panel use ` +
-        `install_panel(action='status'), which reads the directory itself.`,
-      status,
-    );
+}
+
+/**
+ * Pre-op resolution for update/reinstall (#730's gate moved BEFORE the queue,
+ * codex gate round 8): the queued task must name the pack's MANAGER module
+ * name — a caller's registry id can differ from it ("comfyui-impact-pack" vs
+ * "ComfyUI-Impact-Pack"), and the legacy routes resolve by module, so an
+ * update enqueued under the registry id no-ops while the post-check still
+ * matches the pre-existing record by cnr_id and reports "updated". Resolving
+ * first also means a target that resolves nowhere is refused with NOTHING
+ * queued rather than after a meaningless queue cycle. Returns the tracked
+ * entry; throws the truthful refusal otherwise.
+ */
+async function resolveTrackedForOp(
+  id: string,
+  op: "update" | "reinstall",
+  base: string,
+  ctx?: PackPresenceContext,
+): Promise<InstalledNode> {
+  const presence = await resolvePackPresence(id, base, ctx);
+  switch (presence.state) {
+    case "manager-listed":
+      return presence.node as InstalledNode;
+    case "on-disk":
+      throw new NodeManagementError(
+        presence.managerListReadable
+          ? `"${id}" is present on disk at ${presence.dir} but ComfyUI-Manager does not ` +
+            `track it (a Comfy Registry zip install or a manual copy), so Manager cannot ` +
+            `${op} it and NOTHING was queued. To move it, reinstall it from its registry id ` +
+            `or repository URL (install_custom_node / reinstall_custom_node), or — when ` +
+            `${presence.dir} is a git checkout — pull it there directly.`
+          : `"${id}" is present on disk at ${presence.dir}, but ComfyUI-Manager's ` +
+            `installed-pack list could not be read (${presence.listError}), so whether ` +
+            `Manager can ${op} it could NOT be determined and NOTHING was queued. Check ` +
+            `that ComfyUI-Manager is reachable, then retry.`,
+      );
+    case "absent":
+      throw new NodeManagementError(
+        presence.evidence === "manager+disk"
+          ? `"${id}" is not installed — it is in neither ComfyUI-Manager's installed-pack ` +
+            `list NOR on disk under ${presence.scanned} — so there is nothing to ${op} ` +
+            `and NOTHING was queued. Check the pack id with list_installed_nodes, or find ` +
+            `the right id with search_custom_nodes.`
+          : `"${id}" is not in ComfyUI-Manager's installed-pack list, so there is nothing ` +
+            `to ${op} and NOTHING was queued. NOTE: this check reads the Manager list only ` +
+            `(remote session — no disk check possible). Check the pack id with ` +
+            `list_installed_nodes.`,
+      );
+    case "unverifiable":
+      throw new NodeManagementError(
+        `Whether "${id}" is installed could not be determined (${presence.reason}), so ` +
+          `the ${op} was NOT queued — a ${op} queued blind would drain silently whether ` +
+          `or not it did anything. Check that ComfyUI-Manager is reachable, then retry.`,
+      );
   }
 }
 
@@ -2205,6 +2778,9 @@ async function updateCustomNodeImpl(
   // across two servers. The base travels back on the result so callers (the
   // #724 panel fallback's dialect probe) verify against the SAME Manager.
   const base = managerBaseUrl();
+  // Captured with the target, before any await: the pre-resolve AND the
+  // post-drain gate must read the SAME disk context (codex gate round 11).
+  const presenceCtx = capturePackPresenceContext();
   if (all) {
     // update_all keeps its own dedicated route (so it does NOT go through
     // queueManagerTask), but it is just as dialect-dependent — route it through
@@ -2213,12 +2789,18 @@ async function updateCustomNodeImpl(
     const { used } = await enqueueUpdateAll(mode, base);
     status = await runManagerQueue(used, base);
   } else {
+    // Resolve the target BEFORE queueing (codex gate round 8): the update body
+    // must name the pack's MANAGER module name — a caller's registry id can
+    // differ from it, a legacy route resolves by module, and a no-op update
+    // would still pass a post-check that matches by cnr_id. A target that
+    // resolves nowhere is refused with NOTHING queued.
+    const tracked = await resolveTrackedForOp(id, "update", base, presenceCtx);
     // Single-pack update → unified task; UpdatePackParams uses node_name/node_ver.
-    status = await queueManagerTask("update", { node_name: id }, base);
+    status = await queueManagerTask("update", { node_name: tracked.module }, base);
     // VERIFY (#730): the drain passes trivially for an id Manager never
     // enqueued (total_count 0 — the "Queued + updated" lie in the issue).
     // Require the pack to resolve SOMEWHERE post-op before claiming success.
-    await assertPackPresentAfterOp(id, "update", base, status);
+    await assertPackPresentAfterOp(id, "update", base, status, presenceCtx);
   }
   return {
     mechanism: "manager-http",
@@ -2328,9 +2910,22 @@ async function reinstallCustomNodeImpl(
   // cannot send the install to a different ComfyUI — which would leave the
   // user's server uninstalled while reporting success for another.
   const base = managerBaseUrl();
-  await queueManagerTask("uninstall", { node_name: id }, base);
+  const presenceCtx = capturePackPresenceContext();
+  // Resolve BEFORE the uninstall half (codex gate round 8): it must name the
+  // Manager module name, and a nowhere-resolving id is refused with NOTHING
+  // queued — previously both cycles no-op'd and the post-check could still
+  // match a pre-existing record by cnr_id.
+  const tracked = await resolveTrackedForOp(id, "reinstall", base, presenceCtx);
+  await queueManagerTask("uninstall", { node_name: tracked.module }, base);
+  // The install half must name an identity the registry can actually RESOLVE
+  // (codex gate round 9): when the caller passed the module/folder spelling,
+  // installing it back under that spelling resolves nowhere — the pack would
+  // be removed and not restored. The tracked record's CNR id is the stable
+  // identity; a git/aux pack without one keeps the caller's spelling (the v4
+  // backend also resolves repo names), as before.
+  const reinstallId = tracked.cnrId ?? id;
   const status = await queueManagerTask("install", {
-    id,
+    id: reinstallId,
     version: version ?? "latest",
     selected_version: version ?? "latest",
     channel,
@@ -2338,8 +2933,27 @@ async function reinstallCustomNodeImpl(
   }, base);
   // VERIFY (#730): same queue-drain trust hole as update — for an id that
   // resolves nowhere BOTH cycles no-op and both drains pass trivially. Require
-  // the pack to be present afterward before claiming a reinstall.
-  await assertPackPresentAfterOp(id, "reinstall", base, status);
+  // the pack to be present afterward before claiming a reinstall. An OBSERVED
+  // post-op absence gets the reinstall-specific truth (the uninstall half
+  // already ran — the pack is REMOVED, not untouched); an UNVERIFIABLE
+  // post-state keeps the gate's own "could not verify" message.
+  try {
+    await assertPackPresentAfterOp(id, "reinstall", base, status, presenceCtx);
+  } catch (err) {
+    // "Left the pack REMOVED" is only true when absence was OBSERVED — an
+    // unverifiable post-state (unreadable list, inconclusive disk) establishes
+    // neither removal nor a failed install, and keeps its own message
+    // (codex gate round 10).
+    if (err instanceof PackAbsentAfterOpError) {
+      throw new NodeManagementError(
+        `The reinstall of "${id}" left the pack REMOVED: the uninstall half drained, ` +
+          `but the install half did not restore it. Install it again with ` +
+          `install_custom_node ("${reinstallId}"). Underlying detail: ${err.message}`,
+        err.details,
+      );
+    }
+    throw err;
+  }
   return {
     mechanism: "manager-http",
     message: `Queued + reinstalled "${id}" (uninstall + install) via ComfyUI-Manager. A restart may be required.`,
@@ -2394,6 +3008,664 @@ async function fixCustomNodeImpl(opts: FixOptions): Promise<NodeOpResult> {
 }
 
 // ---------------------------------------------------------------------------
+// disable / enable / uninstall (#775)
+//
+// The cleanup surface was install/update/reinstall/fix only — there was no
+// reversible "take this pack out of the running install" action at all, so a
+// safe cleanup audit meant hand-moving directories. Manager has native
+// disable/enable/uninstall task kinds on every dialect (legacyTaskRequest maps
+// them for 3.x); these wrap them with post-state verification against the
+// installed list, because a drained queue is not proof the state changed.
+// ---------------------------------------------------------------------------
+
+export interface NodeStateOptions {
+  /** Registry id / module name of an INSTALLED pack. */
+  id: string;
+  useCmCli?: boolean;
+}
+
+/**
+ * The post-op verdict for disable/enable, read back from the Manager installed
+ * list — shared by the HTTP path (after the queue drain) and the comfy-cli
+ * path (after the CLI's own success report, which is a CLAIM, not an
+ * observation). Three outcomes, reported as what they are: applied /
+ * not-applied / could-not-verify (unreadable list, pack vanished from it, or
+ * no enabled flag reported at all).
+ */
+type EnabledVerdict =
+  | { state: "applied" }
+  | { state: "not-applied"; reported: "enabled" | "disabled" }
+  | { state: "inconclusive"; reason: string };
+
+async function readEnabledVerdict(
+  id: string,
+  expectEnabled: boolean,
+  base: string,
+): Promise<EnabledVerdict> {
+  let installed: InstalledNode[] | undefined;
+  let listError: string | undefined;
+  try {
+    installed = await listInstalledNodesAt(base);
+  } catch (err) {
+    listError = err instanceof Error ? err.message : String(err);
+  }
+  if (!installed) {
+    return {
+      state: "inconclusive",
+      reason: `ComfyUI-Manager's installed-pack list could not be read (${listError})`,
+    };
+  }
+  const node = findInstalledNode(id, installed);
+  if (!node) {
+    return {
+      state: "inconclusive",
+      reason: `"${id}" no longer appears in ComfyUI-Manager's installed-pack list`,
+    };
+  }
+  if (node.enabled === undefined) {
+    return {
+      state: "inconclusive",
+      reason: `ComfyUI-Manager did not report an enabled/disabled flag for "${id}"`,
+    };
+  }
+  if (node.enabled === !expectEnabled) {
+    return { state: "not-applied", reported: node.enabled ? "enabled" : "disabled" };
+  }
+  return { state: "applied" };
+}
+
+async function setCustomNodeEnabled(
+  opts: NodeStateOptions,
+  enable: boolean,
+): Promise<NodeOpResult> {
+  const { id } = opts;
+  const op = enable ? "enable" : "disable";
+  const base = managerBaseUrl();
+  // Pinned with the target: the CLI must run against the SAME local install
+  // the pre/post checks describe, even if config.comfyuiPath is retargeted
+  // during an await below (codex gate round 5).
+  const cliWorkspace = resolveEffectiveComfyUIBase();
+  const presenceCtx = capturePackPresenceContext(cliWorkspace);
+
+  // CLI availability probe FIRST (#808 fallback discipline), but NO subprocess
+  // runs yet: the presence pre-check below comes before either mechanism,
+  // because a CLI run of an already-satisfied/no-such-pack request reports a
+  // pre-existing state as a fresh transition exactly like a queued no-op.
+  const cliProblem = opts.useCmCli ? comfyCliUnavailableReason(cliWorkspace) : undefined;
+  const useCli = opts.useCmCli === true && cliProblem === undefined;
+  let cliFallbackNote: string | undefined;
+  if (opts.useCmCli && !useCli) {
+    logger.info(`comfy-cli requested (useCmCli) but unavailable — falling back to Manager HTTP for ${op}`, {
+      reason: cliProblem,
+    });
+    cliFallbackNote =
+      `comfy-cli was requested (useCmCli) but is not usable here: ${cliProblem}. ` +
+      `NOTHING was run through comfy-cli — ComfyUI-Manager was used for what follows instead.`;
+  }
+
+  // Pre-op validation: a disable/enable for an id Manager never heard of is a
+  // silent no-op (queue or CLI alike), and the LEGACY dialects key the body on
+  // the pack's REAL installed version (node-bisect's controller does the same
+  // — "never send 'unknown' for an installed pack"). Both need the installed
+  // list read up front.
+  const presence = await resolvePackPresence(id, base, presenceCtx);
+  if (
+    presence.state === "on-disk" &&
+    // A READABLE list that doesn't track the pack: refuse — neither mechanism
+    // can verify the op through it. An UNREADABLE list with the pack on disk
+    // only blocks the HTTP path; comfy-cli works on the local install directly,
+    // so it proceeds below with the uncertainty disclosed.
+    (presence.managerListReadable || !useCli)
+  ) {
+    throw new NodeManagementError(
+      presence.managerListReadable
+        ? `"${id}" is present on disk at ${presence.dir} but ComfyUI-Manager does not ` +
+          `track it (a Comfy Registry zip install or a manual copy), so Manager cannot ` +
+          `${op} it and NOTHING was queued. To ${op} it yourself, ${
+            enable
+              ? `remove any ".disabled" suffix from that directory's name`
+              : `rename that directory with a ".disabled" suffix (Manager's own convention)`
+          }, then restart ComfyUI.`
+        : `"${id}" is present on disk at ${presence.dir}, but ComfyUI-Manager's ` +
+          `installed-pack list could not be read (${presence.listError}), so whether ` +
+          `Manager can ${op} it could NOT be determined and NOTHING was queued. Check ` +
+          `that ComfyUI-Manager is reachable, then retry.`,
+    );
+  }
+  if (presence.state === "absent") {
+    throw new NodeManagementError(
+      presence.evidence === "manager+disk"
+        ? `"${id}" is not installed — it is in neither ComfyUI-Manager's installed-pack ` +
+          `list NOR on disk under ${presence.scanned} — so there is nothing to ${op} ` +
+          `and NOTHING was queued. Check the id with list_installed_nodes.`
+        : `"${id}" is not in ComfyUI-Manager's installed-pack list, so there is ` +
+          `nothing to ${op} and NOTHING was queued. NOTE: this check reads the Manager ` +
+          `list only (remote session — no disk check possible). Check the id with ` +
+          `list_installed_nodes.`,
+    );
+  }
+  if (presence.state === "unverifiable" && !useCli) {
+    // The HTTP path cannot validate or verify without the Manager list. The
+    // comfy-cli path CAN still act (it works on the local install directly) —
+    // it proceeds below, disclosing that the pre-state was never established.
+    throw new NodeManagementError(
+      `Whether "${id}" is installed could not be determined (${presence.reason}), so ` +
+        `the ${op} was NOT queued — a ${op} queued blind would drain silently whether ` +
+        `or not it did anything. Check that ComfyUI-Manager is reachable, then retry.`,
+    );
+  }
+
+  // Already in the requested state: running anything would be a no-op whose
+  // post-op read-back would "verify" a state that predates the call. Say so
+  // and do nothing. (An UNREPORTED enabled flag is not this case: proceed and
+  // let the post-op verdict be inconclusive if it stays unreported.)
+  if (presence.state === "manager-listed" && presence.node?.enabled === enable) {
+    return {
+      mechanism: useCli ? "comfy-cli" : "manager-http",
+      message:
+        `"${id}" is already ${enable ? "enabled" : "disabled"} in ComfyUI-Manager's ` +
+        `installed-pack list — NOTHING was run.` +
+        (cliFallbackNote ? ` ${cliFallbackNote}` : ""),
+    };
+  }
+
+  if (useCli) {
+    const preStateReason =
+      presence.state === "unverifiable"
+        ? presence.reason
+        : presence.state === "on-disk"
+          ? `ComfyUI-Manager's installed-pack list could not be read (${presence.listError}); the pack is present on disk at ${presence.dir}`
+          : undefined;
+    const out = runCmCli([op, id], cliWorkspace);
+    // comfy-cli's exit is its OWN claim — verify against the Manager list
+    // when it can be read rather than reporting the claim as the state.
+    const verdict = await readEnabledVerdict(id, enable, base);
+    if (verdict.state === "not-applied") {
+      return {
+        mechanism: "comfy-cli",
+        message:
+          `comfy-cli reported the ${op} of "${id}" successful, but ComfyUI-Manager ` +
+          `still reports the pack as ${verdict.reported} — the ${op} did NOT take ` +
+          `effect. Check the ComfyUI server log for the underlying error.`,
+        details: out.trim(),
+      };
+    }
+    return {
+      mechanism: "comfy-cli",
+      message:
+        (verdict.state === "applied"
+          ? `${enable ? "Enabled" : "Disabled"} "${id}" via official comfy-cli ` +
+            `(verified against ComfyUI-Manager's installed-pack list)`
+          : `${enable ? "Enabled" : "Disabled"} "${id}" via official comfy-cli ` +
+            `(comfy-cli's own report — the post-state could not be independently ` +
+            `verified: ${verdict.reason})`) +
+        (preStateReason
+          ? `. NOTE: the pre-operation state was never established (${preStateReason}), so this is not a verified transition`
+          : "") +
+        `. A ComfyUI restart is required for the change to take effect.`,
+      details: out.trim(),
+    };
+  }
+
+  if (presence.state !== "manager-listed") {
+    // Unreachable by construction (absent/on-disk threw; unverifiable without a
+    // usable CLI threw; unverifiable WITH one returned inside the CLI branch) —
+    // a guard, not a load-bearing check.
+    throw new NodeManagementError(
+      `Whether "${id}" is installed could not be determined, so the ${op} was NOT queued.`,
+    );
+  }
+  const tracked = presence.node as InstalledNode;
+
+  const status = await queueManagerTask(
+    op,
+    // The body is dialect-specific: v2 keys enable on cnr_id / disable on
+    // node_name; the legacy 3.x bodies key on node_name + the REAL installed
+    // version (legacyTaskRequest maps node_ver → version). node_name is the
+    // MANAGER'S module/folder name (tracked.module), never the caller's id —
+    // a registry id ("comfyui-impact-pack") and the module name
+    // ("ComfyUI-Impact-Pack") can differ, and the 3.x routes resolve by module
+    // (codex gate round 7).
+    (api) =>
+      api === "v2"
+        ? enable
+          ? { cnr_id: tracked.cnrId ?? id, node_name: tracked.module }
+          : { node_name: tracked.module, is_unknown: false }
+        : { node_name: tracked.module, node_ver: tracked.version ?? "unknown" },
+    base,
+  );
+  const verdict = await readEnabledVerdict(id, enable, base);
+  const result: NodeOpResult =
+    verdict.state === "applied"
+      ? {
+          mechanism: "manager-http",
+          message:
+            `${enable ? "Enabled" : "Disabled"} "${id}" via ComfyUI-Manager (verified ` +
+            `against its installed-pack list). A ComfyUI restart is required for the ` +
+            `change to take effect.`,
+          details: status,
+        }
+      : verdict.state === "not-applied"
+        ? {
+            mechanism: "manager-http",
+            message:
+              `The ${op} of "${id}" was queued and the queue drained, but ComfyUI-Manager ` +
+              `still reports the pack as ${verdict.reported} — the ${op} did NOT take ` +
+              `effect. Check the ComfyUI server log for the underlying error.`,
+            details: status,
+          }
+        : {
+            mechanism: "manager-http",
+            message:
+              `The ${op} of "${id}" was queued and the queue drained, but the result ` +
+              `could NOT be verified: ${verdict.reason}. NOT claiming it took effect — ` +
+              `check list_installed_nodes.`,
+            details: status,
+          };
+  return cliFallbackNote
+    ? { ...result, message: `${cliFallbackNote} ${result.message}` }
+    : result;
+}
+
+/**
+ * Disable an installed pack WITHOUT removing it — the reversible cleanup step
+ * (#775). Verified against the Manager installed list afterwards; a restart is
+ * required for the change to take effect.
+ */
+export async function disableCustomNode(opts: NodeStateOptions): Promise<NodeOpResult> {
+  // PIN GUARD — disabling the panel kills the agent's own UI; a pinned panel
+  // must not be moved through this door either (withPanelPinGuard).
+  return withPanelPinGuard("disable", opts.id, () =>
+    withObjectInfoInvalidation(() => setCustomNodeEnabled(opts, false)),
+  );
+}
+
+/** Re-enable a pack previously disabled with disable_custom_node (#775). */
+export async function enableCustomNode(opts: NodeStateOptions): Promise<NodeOpResult> {
+  return withPanelPinGuard("enable", opts.id, () =>
+    withObjectInfoInvalidation(() => setCustomNodeEnabled(opts, true)),
+  );
+}
+
+/**
+ * Uninstall an installed pack (#775). Irreversible through this tool — prefer
+ * disableCustomNode for a cleanup audit. The pack must be one ComfyUI-Manager
+ * TRACKS: a pre-queue check refuses an id that resolves nowhere (nothing would
+ * be uninstalled, and a drained queue would look exactly like success), naming
+ * the on-disk directory when the pack is present but unmanaged so the caller
+ * can remove it themselves. Post-op, the installed list is re-read and the
+ * pack must be GONE before anything claims "uninstalled".
+ */
+export async function uninstallCustomNode(opts: NodeStateOptions): Promise<NodeOpResult> {
+  // PIN GUARD — same door as install/update (withPanelPinGuard).
+  return withPanelPinGuard("uninstall", opts.id, () =>
+    withObjectInfoInvalidation(() => uninstallCustomNodeImpl(opts)),
+  );
+}
+
+async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpResult> {
+  const { id } = opts;
+  const base = managerBaseUrl();
+  // Pinned with the target, same as in setCustomNodeEnabled (codex gate round 5).
+  const cliWorkspace = resolveEffectiveComfyUIBase();
+  const presenceCtx = capturePackPresenceContext(cliWorkspace);
+
+  // CLI availability probe FIRST (#808 fallback discipline) — but nothing runs
+  // until the presence pre-check below has answered what there is to remove.
+  const cliProblem = opts.useCmCli ? comfyCliUnavailableReason(cliWorkspace) : undefined;
+  const useCli = opts.useCmCli === true && cliProblem === undefined;
+  let cliFallbackNote: string | undefined;
+  if (opts.useCmCli && !useCli) {
+    logger.info("comfy-cli requested (useCmCli) but unavailable — falling back to Manager HTTP for uninstall", {
+      reason: cliProblem,
+    });
+    cliFallbackNote =
+      `comfy-cli was requested (useCmCli) but is not usable here: ${cliProblem}. ` +
+      `NOTHING was run through comfy-cli — ComfyUI-Manager was used for what follows instead.`;
+  }
+
+  // Pre-op: an uninstall of an id that resolves nowhere is a silent no-op —
+  // via Manager (drained queue) or comfy-cli (exit 0) alike — and reading
+  // absence afterwards would "verify" a state that predated the call. Refuse
+  // with the reason that is actually true.
+  const presence = await resolvePackPresence(id, base, presenceCtx);
+  if (
+    presence.state === "on-disk" &&
+    // A READABLE list that doesn't track the pack: refuse. An UNREADABLE list
+    // with the pack on disk only blocks the HTTP path — comfy-cli works on the
+    // local install directly, and its postcondition is verified on disk below.
+    (presence.managerListReadable || !useCli)
+  ) {
+    throw new NodeManagementError(
+      presence.managerListReadable
+        ? `"${id}" is present on disk at ${presence.dir} but ComfyUI-Manager does not track ` +
+          `it (a Comfy Registry zip install or a manual copy), so Manager cannot uninstall ` +
+          `it and NOTHING was queued. To remove it, delete or move that directory yourself ` +
+          `(moving it into a custom_nodes/.disabled folder keeps it reversible), then ` +
+          `restart ComfyUI.`
+        : `"${id}" is present on disk at ${presence.dir}, but ComfyUI-Manager's ` +
+          `installed-pack list could not be read (${presence.listError}), so whether ` +
+          `Manager can uninstall it could NOT be determined and NOTHING was queued. ` +
+          `Check that ComfyUI-Manager is reachable, then retry.`,
+    );
+  }
+  if (presence.state === "absent") {
+    throw new NodeManagementError(
+      presence.evidence === "manager+disk"
+        ? `"${id}" is not installed — it is in neither ComfyUI-Manager's installed-pack ` +
+          `list NOR on disk under ${presence.scanned} — so there is nothing to uninstall ` +
+          `and NOTHING was queued. Check the id with list_installed_nodes.`
+        : `"${id}" is not in ComfyUI-Manager's installed-pack list, so there is nothing ` +
+          `for Manager to uninstall and NOTHING was queued. NOTE: this check reads the ` +
+          `Manager list only (remote session — no disk check possible); a pack present on ` +
+          `disk but unknown to Manager must be removed on the ComfyUI host. Check the id ` +
+          `with list_installed_nodes.`,
+    );
+  }
+  if (presence.state === "unverifiable" && !useCli) {
+    // The HTTP path cannot validate or verify without the Manager list. The
+    // comfy-cli path can still act on the local install — it proceeds below,
+    // with the postcondition checked on disk instead.
+    throw new NodeManagementError(
+      `Whether "${id}" is installed could not be determined (${presence.reason}), so the ` +
+        `uninstall was NOT queued — an uninstall queued blind would drain silently whether ` +
+        `or not it did anything. Check that ComfyUI-Manager is reachable, then retry.`,
+    );
+  }
+
+  if (useCli) {
+    const out = runCmCli(["uninstall", id], cliWorkspace);
+    // comfy-cli's exit is its OWN claim. "Uninstalled" requires BOTH an
+    // observed pre-op presence (manager-listed, or on-disk) AND observed
+    // post-op absence — absence alone may predate the call (codex gate rounds
+    // 8-9). A pack still discoverable afterwards means the uninstall did NOT
+    // take effect — disclose it.
+    const preObserved =
+      presence.state === "manager-listed" || presence.state === "on-disk";
+    const preUnknownNote =
+      presence.state === "unverifiable"
+        ? `whether the pack was installed beforehand could NOT be established (${presence.reason})`
+        : undefined;
+    // The disk postcondition applies to EVERY CLI uninstall (a CLI session is
+    // always a local one), and for a pack that was never Manager-tracked
+    // (on-disk pre-state) it is the ONLY meaningful one. Checked against the
+    // ENTRY-captured workspace, never a recomputed one: a retarget during the
+    // awaits must not verify against a different install (codex gate round 6).
+    const diskAfter = cliWorkspace ? findPackOnDisk(id, cliWorkspace) : undefined;
+    if (diskAfter?.state === "found") {
+      return {
+        mechanism: "comfy-cli",
+        message:
+          `comfy-cli reported the uninstall of "${id}" successful, but the pack ` +
+          `directory still exists at ${diskAfter.dir} — the uninstall did NOT take ` +
+          `effect. Check the ComfyUI server log for the underlying error.`,
+        details: out.trim(),
+      };
+    }
+
+    let installed: InstalledNode[] | undefined;
+    let listError: string | undefined;
+    try {
+      installed = await listInstalledNodesAt(base);
+    } catch (err) {
+      listError = err instanceof Error ? err.message : String(err);
+    }
+    if (installed && findInstalledNode(id, installed)) {
+      return {
+        mechanism: "comfy-cli",
+        message:
+          `comfy-cli reported the uninstall of "${id}" successful, but the pack is ` +
+          `STILL in ComfyUI-Manager's installed-pack list — the uninstall did NOT ` +
+          `take effect. Check the ComfyUI server log for the underlying error.`,
+        details: out.trim(),
+      };
+    }
+    const listGone = installed !== undefined; // readable AND not in it
+    const diskGone = diskAfter?.state === "not-found";
+    if (preObserved && (listGone || diskGone)) {
+      const evidence: string[] = [];
+      if (listGone) evidence.push("the pack is absent from ComfyUI-Manager's installed-pack list");
+      if (diskGone) {
+        evidence.push(
+          `no matching directory remains under ${(diskAfter as { scanned: string }).scanned}`,
+        );
+      }
+      return {
+        mechanism: "comfy-cli",
+        message:
+          `Uninstalled "${id}" via official comfy-cli (verified: ${evidence.join(" and ")}). ` +
+          `A ComfyUI restart is required to unload it fully.`,
+        details: out.trim(),
+      };
+    }
+    // Either the pre-state was never observed (absence may predate the call)
+    // or nothing could be read post-op — disclose, never claim the removal.
+    return {
+      mechanism: "comfy-cli",
+      message:
+        `comfy-cli reported the uninstall of "${id}" successful, but the removal ` +
+        `could NOT be verified: ` +
+        (preUnknownNote ??
+          `ComfyUI-Manager's installed-pack list could not be read (${listError})` +
+            (diskAfter?.state === "unreadable"
+              ? ` and the disk check was inconclusive (${diskAfter.reason})`
+              : "")) +
+        `. NOT claiming an uninstall happened; if the pack was never there, nothing ` +
+        `needed removing — otherwise check list_installed_nodes / custom_nodes yourself.`,
+      details: out.trim(),
+    };
+  }
+
+  const withCliNote = (result: NodeOpResult): NodeOpResult =>
+    cliFallbackNote
+      ? { ...result, message: `${cliFallbackNote} ${result.message}` }
+      : result;
+
+  if (presence.state !== "manager-listed") {
+    // Unreachable by construction (absent/on-disk threw; unverifiable without a
+    // usable CLI threw; unverifiable WITH one returned inside the CLI branch) —
+    // a guard, not a load-bearing check.
+    throw new NodeManagementError(
+      `Whether "${id}" is installed could not be determined, so the uninstall was NOT queued.`,
+    );
+  }
+  const status = await queueManagerTask(
+    "uninstall",
+    // Legacy 3.x keys the body on node_name + the REAL installed version
+    // (legacyTaskRequest maps node_ver → version); v2 needs only node_name.
+    // node_name is the Manager's module name (presence.node.module), which can
+    // differ from the caller's registry-id spelling (codex gate round 7).
+    (api) =>
+      api === "v2"
+        ? { node_name: presence.node?.module ?? id }
+        : {
+            node_name: presence.node?.module ?? id,
+            node_ver: presence.node?.version ?? "unknown",
+          },
+    base,
+  );
+
+  // Post-op: the pack must be GONE from the installed list. A drained queue is
+  // not proof (#639); "still there" is disclosed, never reported as removed.
+  let installed: InstalledNode[] | undefined;
+  let listError: string | undefined;
+  try {
+    installed = await listInstalledNodesAt(base);
+  } catch (err) {
+    listError = err instanceof Error ? err.message : String(err);
+  }
+  if (!installed) {
+    return withCliNote({
+      mechanism: "manager-http",
+      message:
+        `The uninstall of "${id}" was queued and the queue drained, but the result could ` +
+        `NOT be verified: ComfyUI-Manager's installed-pack list could not be read ` +
+        `(${listError}). NOT claiming the pack was uninstalled — check list_installed_nodes.`,
+      details: status,
+    });
+  }
+  if (findInstalledNode(id, installed)) {
+    return withCliNote({
+      mechanism: "manager-http",
+      message:
+        `The uninstall of "${id}" was queued and the queue drained, but the pack is STILL ` +
+        `in ComfyUI-Manager's installed-pack list — the uninstall did NOT take effect. ` +
+        `Check the ComfyUI server log for the underlying error.`,
+      details: status,
+    });
+  }
+  // MANAGER'S LIST IS NOT THE DISK (codex gate P0). A partial uninstall can drop
+  // the tracking entry and leave `custom_nodes/<pack>` in place — and ComfyUI
+  // loads directories, not Manager's bookkeeping, so the pack comes back on the
+  // next restart while we have already called it uninstalled. A destructive
+  // postcondition deserves the strongest evidence available, not the most
+  // convenient, and this branch has the disk check the rest of this file uses.
+  const diskAfter = presenceCtx.diskRoot ? findPackOnDisk(id, presenceCtx.diskRoot) : undefined;
+  // `findPackOnDisk` accepts a matching SYMLINK without following it, so a
+  // dangling link would be reported as a pack that survived the uninstall
+  // (codex gate P2). ComfyUI cannot load a dead link, so calling that an
+  // incomplete removal is a false alarm on a destructive operation — the one
+  // place a spurious warning does real damage, because it sends the user to
+  // delete something by hand. `existsSync` follows the link, which is exactly
+  // the question: is there anything at the other end?
+  const diskAfterReal = diskAfter?.state === "found" && existsSync(diskAfter.dir);
+  if (diskAfterReal) {
+    return withCliNote({
+      mechanism: "manager-http",
+      message:
+        `The uninstall of "${id}" removed it from ComfyUI-Manager's installed-pack list, ` +
+        `but the pack directory is STILL on disk at ${diskAfter.dir}. ComfyUI loads ` +
+        `directories, not Manager's list, so it will load again on the next restart — ` +
+        `this is NOT a completed uninstall. Remove the directory manually, or re-run the ` +
+        `uninstall, and check the ComfyUI server log for the underlying error.`,
+      details: status,
+    });
+  }
+  const diskNote =
+    diskAfter?.state === "found"
+      ? ` and gone from disk (a dangling symlink remains at ${diskAfter.dir}, which ComfyUI ` +
+        `cannot load — remove it at your leisure)`
+      : diskAfter?.state === "not-found"
+      ? " and gone from disk"
+      : diskAfter?.state === "unreadable"
+        ? `; the disk check was inconclusive (${diskAfter.reason}), so the directory may ` +
+          `still be present`
+        : "; no disk check was possible in this session";
+  return withCliNote({
+    mechanism: "manager-http",
+    message:
+      `Uninstalled "${id}" via ComfyUI-Manager (verified absent from its installed-pack ` +
+      `list afterwards${diskNote}). A ComfyUI restart is required to unload it fully.`,
+    details: status,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// panel_install_node argument normalization (#789)
+// ---------------------------------------------------------------------------
+
+export interface GitUrlInstallArgs {
+  id?: string;
+  repository?: string;
+  version?: string;
+}
+
+export interface NormalizedGitUrlInstallArgs extends GitUrlInstallArgs {
+  /** Human-facing disclosure of any rewrite, for the tool result. */
+  note?: string;
+  /** Set when the call names two targets; the caller must REFUSE, not pick one. */
+  conflict?: string;
+}
+
+/**
+ * #789 — panel_search_nodes can return a REPOSITORY URL as a pack's `id` (the
+ * Manager's legacy/repository-style entries). Feeding that URL back as `id`
+ * with the default version "latest" asks the Manager to resolve
+ * `<RepoName>@latest` as a REGISTRY install, which it rejects ("not available
+ * node: ComfyUI-Impact-Pack@8.28.3") — while the same URL passed as
+ * `repository` with version "nightly" installs fine. So when the effective
+ * target is a git URL:
+ *   - carry it as `repository` (the from-source install path), and
+ *   - translate an absent or "latest" version to "nightly" (git HEAD — the only
+ *     channel a from-source install can resolve).
+ * An explicit non-"latest" version is the caller's own choice and passes
+ * through untouched; the rewrite is always disclosed in `note`.
+ *
+ * `id` AND `repository` together name TWO targets (the schema presents them as
+ * alternatives); that is a conflict to refuse, not a precedence to pick.
+ */
+export function normalizeGitUrlInstallArgs(
+  args: GitUrlInstallArgs,
+): NormalizedGitUrlInstallArgs {
+  if (args.id && args.repository) {
+    return {
+      conflict:
+        `panel_install_node was given BOTH id ("${args.id}") and repository ` +
+        `("${args.repository}") — those are two different ways to name the target and ` +
+        `they may not name the same pack. Pass exactly one: the registry id, or the ` +
+        `git repository URL.`,
+    };
+  }
+  const gitTarget =
+    args.repository && looksLikeGitUrl(args.repository)
+      ? args.repository
+      : args.id && looksLikeGitUrl(args.id)
+        ? args.id
+        : undefined;
+  if (!gitTarget) return {};
+  const version = args.version?.trim();
+  // The URL travels as `repository` ONLY: a URL that arrived as `id` is not
+  // forwarded as both (routing off the id path is the whole point), and
+  // id+repository together were refused above.
+  const out: NormalizedGitUrlInstallArgs = { repository: gitTarget };
+  if (version === undefined || version.length === 0 || version.toLowerCase() === "latest") {
+    out.version = "nightly";
+    out.note =
+      `"${gitTarget}" is a git repository URL, so this was queued as a from-source ` +
+      `install with version "nightly" (git HEAD): ComfyUI-Manager cannot resolve a ` +
+      `registry "latest" for a repository-style entry and rejects it ("not available ` +
+      `node: <repo>@<version>"). Pass an explicit version/ref to override.`;
+  } else {
+    out.version = args.version;
+  }
+  return out;
+}
+
+/**
+ * The FINAL dispatch fields for the panel's `nodes_install` command, after
+ * #789 normalization. Built here — not by `??`-merging with the raw args at
+ * the call site — because a rerouted git URL must DROP `id`, and a
+ * `norm.id ?? args.id` merge silently restores it (codex gate round 4).
+ */
+export function nodesInstallCommandArgs(args: {
+  id?: string;
+  repository?: string;
+  version?: string;
+  channel?: string;
+  mode?: string;
+}): {
+  id?: string;
+  repository?: string;
+  version?: string;
+  channel?: string;
+  mode?: string;
+  note?: string;
+  conflict?: string;
+} {
+  const norm = normalizeGitUrlInstallArgs(args);
+  if (norm.conflict) return { conflict: norm.conflict };
+  const rerouted = norm.repository !== undefined;
+  return {
+    id: rerouted ? norm.id : args.id,
+    repository: rerouted ? norm.repository : args.repository,
+    version: rerouted ? norm.version : args.version,
+    channel: args.channel,
+    mode: args.mode,
+    ...(norm.note ? { note: norm.note } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // list installed
 // ---------------------------------------------------------------------------
 
@@ -2410,7 +3682,9 @@ async function listInstalledNodesAt(
 
   if (opts.useCmCli) {
     // cm-cli `show installed` prints a formatted table — return raw lines as
-    // pseudo-nodes since structured data is HTTP-only.
+    // pseudo-nodes since structured data is HTTP-only. `enabled` is left
+    // undefined: the table does not report it, so claiming a value would be
+    // inventing state.
     const out = runCmCli(["show", "installed"]);
     const lines = out
       .split("\n")
@@ -2418,7 +3692,6 @@ async function listInstalledNodesAt(
       .filter((l) => l.length > 0 && !l.startsWith("#"));
     return lines.map((line) => ({
       module: line,
-      enabled: true,
       version: undefined,
     }));
   }
@@ -2430,6 +3703,39 @@ async function listInstalledNodesAt(
     `${prefix}/customnode/installed?mode=${encodeURIComponent(mode)}`,
     { base },
   );
+  // A 200 with an empty or non-JSON body parses to undefined / a raw string in
+  // managerFetch, and an ERROR ENVELOPE parses to an object whose values are
+  // scalars ({"error": "…"}) or an object keyed by "error"/"detail"
+  // ({"error": {"message": …}}, FastAPI's {"detail": …}) — parseInstalled
+  // would silently turn ALL of these into an empty or junk list, which
+  // downstream gates read as "the pack is absent". An unreadable payload is
+  // NOT an empty list: refuse to answer from it. ({} is a legitimate
+  // "nothing installed"; a module literally named "error" is the pathological
+  // case accepted as collateral.)
+  let readable = false;
+  if (Array.isArray(raw)) {
+    // parseInstalled only understands entry OBJECTS — a bare string element
+    // (["temporary failure"]) would be silently dropped, reading as empty.
+    readable = raw.every(
+      (el) => el !== null && typeof el === "object" && !Array.isArray(el),
+    );
+  } else if (raw !== undefined && raw !== null && typeof raw === "object") {
+    const rec = raw as Record<string, unknown>;
+    readable =
+      !("error" in rec) &&
+      !("detail" in rec) &&
+      Object.values(rec).every(
+        (v) => v !== null && typeof v === "object" && !Array.isArray(v),
+      );
+  }
+  if (!readable) {
+    throw new NodeManagementError(
+      `ComfyUI-Manager's installed-pack list returned an unreadable payload ` +
+        `(expected a JSON object of pack records or an array, got ${
+          raw === undefined ? "an empty body" : `a ${typeof raw}`
+        }) — treating the list as UNREADABLE, not as empty.`,
+    );
+  }
   return parseInstalled(raw);
 }
 

@@ -110,6 +110,9 @@ export const TOOL_NAMES = [
   "update_custom_node",
   "reinstall_custom_node",
   "fix_custom_node",
+  "disable_custom_node",
+  "enable_custom_node",
+  "uninstall_custom_node",
   "list_installed_nodes",
   "sync_node_dependencies",
   "report_issue",
@@ -209,11 +212,12 @@ export type ToolName = (typeof TOOL_NAMES)[number];
  * updating — it is history, not state.
  *
  * Read from docs/design/tool-surface.txt so there is exactly one copy of the
- * baseline names (190: the 182 frozen at 0.48.32 plus the eight consolidated tools
+ * baseline names (193: the 182 frozen at 0.48.32 plus the eight consolidated tools
  * appended as they shipped — `bisect` in 0.49.0 slice 1, then `node_snapshot`,
  * `apps` and `batch` in slice 2, then `comfy_cli` in slice 3, then `queue` in
- * slice 4, then `model_metadata` in slice 5, then `workspace` in slice 6), and so
- * the file committed
+ * slice 4, then `model_metadata` in slice 5, then `workspace` in slice 6 — plus
+ * `disable_custom_node` / `enable_custom_node` / `uninstall_custom_node`, the
+ * #775 cleanup surface), and so the file committed
  * as the P0 evidence is load-bearing rather than
  * decorative.
  */
@@ -232,7 +236,7 @@ const BASELINE_URL = new URL("../../docs/design/tool-surface.txt", import.meta.u
  * 200-line rename. APPENDING is legitimate — new tools join the baseline when they
  * ship — so the workflow is: append, update this hash, say why in the message.
  */
-export const BASELINE_SHA256 = "72f079e20cb20a02043338cc337c2afc6b5f683683ebe8148c4b0c9ac854c1cf";
+export const BASELINE_SHA256 = "af84bfb4f12f02b9c9b27c4cdaa83fbed02ea125bc51d5927c42155b2782f2f7";
 
 /**
  * LAZY on purpose, and this is not a micro-optimisation.
@@ -306,7 +310,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 151;
+export const MAX_TOOLS = 154;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;

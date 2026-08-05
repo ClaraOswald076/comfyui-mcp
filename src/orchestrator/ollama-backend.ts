@@ -268,6 +268,51 @@ const MAX_TOOL_ROUNDS = 32;
  * is short, router-shaped, and (deliberately, for local models) does NOT carry
  * the NSFW consent-gate flow — only the absolute hard limits.
  */
+/**
+ * Retraction appended to OLLAMA_SYSTEM_PROMPT when the panel router was NOT
+ * registered for this session (the loopback panel MCP failed to bind, or this
+ * backend could not connect to it).
+ *
+ * The prompt above opens with "You have exactly six tools" and names all three
+ * panel_* routers. When `panelRouterAvailable()` is false only three of those six
+ * exist, and a small local model told otherwise will call a router that is not
+ * there — the same false capability claim the orchestrator retracts for the
+ * frontier backends, arriving here by a different road because this adapter
+ * deliberately ignores `deps.systemAppend`.
+ *
+ * Kept blunt and short on purpose: this prompt is written for small models, and the
+ * surrounding file's own comment records what happens to them when a prompt names a
+ * tool they cannot reach (they hit "unknown tool" and give up).
+ *
+ * States NO tool COUNT, deliberately. An earlier draft said "THREE tools, not six",
+ * which is only true under COMFYUI_MCP_TOOL_MODE=compact — in full mode the headless
+ * child registers its whole direct surface and buildModelTools advertises all of it,
+ * so the correction would have been a second wrong number replacing the first. It
+ * names the three tools that are GONE, which is what was actually observed, and
+ * points the model at the list it was really handed.
+ *
+ * And it makes NO claim about the headless server, for the same reason. Two earlier
+ * drafts said its tools were "unaffected" and that a restart would bring the canvas
+ * back. Neither is observed here: connectTools() catches a failed headless connection
+ * independently and leaves `comfy` null, so this prompt can be emitted with NOTHING
+ * connected; and the tool set is fixed for the life of the session, so the panel
+ * router cannot return within it — while a restart only helps if the bind succeeds
+ * next time, which a still-occupied port will not. Retracting a false capability
+ * claim and attaching two fresh unverified ones in its place is the same defect
+ * wearing the fix's clothes.
+ */
+export function ollamaPanelRetraction(panelRouterAvailable: boolean): string {
+  if (panelRouterAvailable) return "";
+  return [
+    "",
+    "",
+    "CORRECTION — THIS OVERRIDES THE TOOL LIST ABOVE:",
+    "The live-canvas router did not start this session. panel_list_tools, panel_describe_tool and panel_call_tool DO NOT EXIST right now — do not call them, and never claim to have read or edited the user's canvas.",
+    "That is ALL this tells you. It says nothing about the headless ComfyUI server, which is a separate connection that can succeed or fail on its own — so go by the tool list you were actually handed, not by any count named above. If it carries list_tools / describe_tool / call_tool, use them; if it carries nothing either, say so rather than guessing.",
+    "The panel tools cannot come back during this session — the tool set was fixed when it started. If the user asks about the graph open in front of them, tell them the live-canvas tools failed to start and that you have no way to reach the canvas until the orchestrator is restarted. Do not promise that a restart will fix it: whether it does depends on why the bind failed, and a port that is still occupied will fail the same way again.",
+  ].join("\n");
+}
+
 const OLLAMA_PROMPT_HEAD = [
   "You are the ComfyUI agent in a sidebar panel, driving the user's live ComfyUI graph and server. Answer in normal Markdown.",
   "",
@@ -602,7 +647,16 @@ export class OllamaBackend implements AgentBackend {
     }
   }
 
-  /** The six OpenAI-style tool defs the model sees. */
+  /** Whether the three panel_* router tools were actually registered for this
+   *  session. ONE predicate, consulted by both the tool-def builder and the system
+   *  prompt, so the prompt can never promise a router the surface does not carry —
+   *  the two drifting apart is precisely the bug this exists to prevent. */
+  protected panelRouterAvailable(): boolean {
+    return this.panel !== null && this.panelTools.length > 0;
+  }
+
+  /** The six OpenAI-style tool defs the model sees (three, when the panel router
+   *  is unavailable — see panelRouterAvailable). */
   protected buildModelTools(): Array<Record<string, unknown>> {
     const defs: Array<Record<string, unknown>> = [];
     for (const t of this.comfyTools) {
@@ -611,7 +665,7 @@ export class OllamaBackend implements AgentBackend {
         function: { name: t.name, description: t.description ?? "", parameters: t.inputSchema ?? { type: "object", properties: {} } },
       });
     }
-    if (this.panel && this.panelTools.length) {
+    if (this.panelRouterAvailable()) {
       defs.push(
         {
           type: "function",
@@ -1023,10 +1077,18 @@ export class OllamaBackend implements AgentBackend {
       // #788 — the prompt must describe the surface that was ACTUALLY advertised
       // to this model. A user override (the panel's prompt editor) still wins;
       // only the built-in default varies by mode.
+      //
+      // The panel-tools retraction rides the same message: it cannot reach this
+      // lane via systemAppend (this adapter drops that), so it is re-derived from
+      // what this backend knows first-hand — whether it actually registered the
+      // panel router — and appended here. Without it the prompt goes on promising
+      // panel routers that were never registered (#841 lineage).
       this.history = [
         {
           role: "system",
-          content: resolvePrompt("backend.ollama", ollamaSystemPrompt(this.toolModeDecision?.mode ?? "compact")),
+          content:
+            resolvePrompt("backend.ollama", ollamaSystemPrompt(this.toolModeDecision?.mode ?? "compact")) +
+            ollamaPanelRetraction(this.panelRouterAvailable()),
         },
       ];
     }
