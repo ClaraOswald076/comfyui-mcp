@@ -2409,18 +2409,18 @@ async function updateViaGitCheckoutFallback(opts: {
    */
   managerReason: string;
   /**
-   * #824 — present ONLY when this fallback was authorized by a QUIESCENCE
-   * SNAPSHOT of the Manager queue (`isProvenQuiescentQueue` over the counts the
-   * update call returned) rather than by the proven stale-3.x signature.
+   * The Manager this update was actually spoken to, for the #824 live re-probe
+   * around the merge. Taken from the observed result rather than re-resolved
+   * from config, so a mid-op retarget cannot make us ask a different host
+   * whether THIS one is busy.
    *
-   * That snapshot establishes "the queue reported nothing in flight at the
-   * moment we asked" — NOT "nothing is writing to this tree", which is the only
-   * claim that licenses a destructive merge. Its presence therefore switches on
-   * the live re-probe that brackets the mutation; it carries the base of the
-   * Manager that was actually observed, so the re-probe asks the same host the
-   * update call did rather than whatever the config currently resolves to.
+   * EVERY entry to this helper passes it. The three warrants that reach here
+   * (the proven stale-3.x no-op, an incoherent-but-idle queue, a Manager that
+   * cannot resolve the pack) all say something about the Manager's VERDICT and
+   * nothing about whether a Manager task is writing to the checkout right now —
+   * so none of them may skip the bracket (codex gate r1).
    */
-  quiescenceGuard?: { managerBase: string | undefined };
+  managerBase: string | undefined;
   /**
    * Refuse if the orchestrator retargeted mid-operation. This helper MUTATES a
    * checkout and then reports the result, so both must belong to the ComfyUI the
@@ -2435,7 +2435,7 @@ async function updateViaGitCheckoutFallback(opts: {
     previousRev,
     result,
     managerReason,
-    quiescenceGuard,
+    managerBase,
     assertSameTarget,
   } = opts;
 
@@ -2556,27 +2556,43 @@ async function updateViaGitCheckoutFallback(opts: {
     );
   }
 
-  // ---- CONCURRENT-WRITE EXCLUSION (#824 codex gate) -----------------------
+  // ---- CONCURRENT-WRITE BRACKET (#824 codex gate) -------------------------
   // Everything above proves things about a MOMENT: the queue counts came back
   // with the update call, `git status` ran several awaits ago. None of that
   // says "nothing is writing to this tree NOW", and git's index lock does not
-  // synchronize an arbitrary Manager write (a pip install, a file copy, an
-  // unpack) against this merge — only against another git process. So prove
-  // exclusivity positively, and as close to the mutation as it can be taken:
+  // hold back an arbitrary ComfyUI-Manager write (a pip install, a file copy,
+  // an unpack) — only another git process. So bracket the mutation:
   //
-  //   1. RE-PROBE the live queue (quiescence-authorized entry only), so the
-  //      idleness that licenses the merge is milliseconds old rather than
-  //      however long the Manager call took. An unreadable probe is "cannot
-  //      determine", which REFUSES — it is never read as idle.
+  //   1. RE-PROBE the live queue, so the idleness that licenses the merge is
+  //      milliseconds old rather than however long the Manager call took. An
+  //      unreadable probe is "cannot determine", which REFUSES — never idle.
   //   2. COMPARE-AND-SWAP the tree itself: HEAD and the worktree must still be
-  //      EXACTLY what the gates above inspected. If either moved, something
-  //      other than us is writing here, whatever the queue says.
-  //   3. After the merge, re-verify both (below), so a write that landed
+  //      EXACTLY what the gates above inspected. A writer that never touches
+  //      the queue is caught here and nowhere else.
+  //   3. After the merge, re-read all three (below), so a write that landed
   //      INSIDE the window is DISCLOSED rather than reported as a clean update.
   //
-  // Each check refuses BEFORE any mutation, so its own failure costs nothing.
-  if (quiescenceGuard) {
-    const live = await readLiveQueueCounts(deps, quiescenceGuard.managerBase);
+  // What this is NOT: mutual exclusion. ComfyUI-Manager is a separate,
+  // third-party process with no lease or lock protocol we could join, so
+  // nothing here can PREVENT a concurrent write — it can only make the
+  // unobserved window as small as an out-of-process check can be, and turn a
+  // write that lands anywhere near it into a disclosure instead of a silent
+  // success. Two residues are known and deliberately left:
+  //   - a Manager task that both STARTS and FINISHES inside the merge, leaving
+  //     a tracked tree that still matches the pinned rev, is undetectable from
+  //     here by construction;
+  //   - `git status --porcelain` omits IGNORED paths, so a write confined to
+  //     one is invisible to the CAS. What bounds the damage there is the pinned
+  //     ignored-collision gate above: the merge's file set is fixed at
+  //     `targetRev` and was already proven not to overlap an ignored local
+  //     file, so such a write is not clobbered by this merge.
+  // Neither residue is asserted away in any message we emit; nothing below
+  // claims the window was exclusive, only what was actually observed in it.
+  //
+  // Each pre-merge check refuses BEFORE any mutation, so its own failure is
+  // free — the guard cannot itself damage the tree it is protecting.
+  {
+    const live = await readLiveQueueCounts(deps, managerBase);
     if (!isLiveQueueIdle(live)) {
       throw new PanelInstallError(
         `Panel update did NOT apply: ${managerReason}, and the git fallback is ` +
@@ -2584,9 +2600,11 @@ async function updateViaGitCheckoutFallback(opts: {
           `ComfyUI-Manager was re-probed immediately before the merge — and ` +
           `${describeLiveQueue(live)}. That does not exclude a Manager task ` +
           `writing to ${dir} while a git merge --ff-only rewrites it, and git's ` +
-          `index lock does not hold back a non-git writer. NOTHING WAS CHANGED. ` +
-          `Wait for the Manager queue to drain and retry, or update the panel ` +
-          `repo manually (git pull in ${dir}), then RESTART ComfyUI.`,
+          `index lock does not hold back a non-git writer. NO git mutation was ` +
+          `made — though whether the Manager call itself changed anything is ` +
+          `precisely what its own status could not say. Wait for the Manager ` +
+          `queue to drain and retry, or update the panel repo manually (git ` +
+          `pull in ${dir}), then RESTART ComfyUI.`,
       );
     }
   }
@@ -2600,8 +2618,10 @@ async function updateViaGitCheckoutFallback(opts: {
       `Panel update did NOT apply: ${managerReason}, and the git fallback is ` +
         `REFUSED: the panel checkout at ${dir} could not be re-confirmed ` +
         `unchanged immediately before the merge (${err instanceof Error ? err.message : String(err)}), ` +
-        `so nothing rules out a concurrent write. NOTHING WAS CHANGED. Update ` +
-        `the panel repo manually (git pull in ${dir}), then RESTART ComfyUI.`,
+        `so nothing rules out a concurrent write. NO git mutation was made — ` +
+        `though whether the Manager call itself changed anything is precisely ` +
+        `what its own status could not say. Update the panel repo manually ` +
+        `(git pull in ${dir}), then RESTART ComfyUI.`,
     );
   }
   if (casRev !== prePullRev || casPorcelain !== "") {
@@ -2611,8 +2631,10 @@ async function updateViaGitCheckoutFallback(opts: {
         `and the merge — ` +
         `${casRev !== prePullRev ? `HEAD moved ${prePullRev.slice(0, 8)} → ${casRev ? casRev.slice(0, 8) : "unreadable"}` : `the worktree is no longer clean:\n${casPorcelain}`}. ` +
         `Something other than this update is writing to that tree, and a ` +
-        `fast-forward would race it. NOTHING WAS CHANGED. Let the other ` +
-        `operation finish, then re-check install_panel(action='status').`,
+        `fast-forward would race it. NO git mutation was made by this fallback ` +
+        `— but something else evidently DID change the checkout, so re-read it ` +
+        `rather than assuming the pre-update state. Let the other operation ` +
+        `finish, then re-check install_panel(action='status').`,
     );
   }
 
@@ -2633,13 +2655,15 @@ async function updateViaGitCheckoutFallback(opts: {
     );
   }
 
-  // ---- CONCURRENT-WRITE EXCLUSION, closing half (#824 codex gate) ---------
-  // The ff-only merge is the ONLY write this path authorized, so prove it is
-  // the only one that landed. A fast-forward from a clean tree leaves HEAD at
-  // exactly the rev we pinned (or, when the checkout already contained it,
-  // exactly where it was) and the worktree clean. Anything else — a dirty
-  // tree, a third HEAD, a Manager task that appeared mid-window — means some
-  // other writer touched this checkout while we rewrote it.
+  // ---- CONCURRENT-WRITE BRACKET, closing half (#824 codex gate) -----------
+  // The ff-only merge is the only write this path authorized. A fast-forward
+  // from a clean tree leaves HEAD at exactly the rev we pinned (or, when the
+  // checkout already contained it, exactly where it was) and the worktree
+  // clean. Anything else — a dirty tree, a third HEAD, a Manager task that
+  // appeared mid-window — is evidence that another writer touched this
+  // checkout while we rewrote it. Absence of that evidence is not proof of
+  // exclusivity (see the residues noted above); it is only the absence of
+  // evidence, and nothing below is worded as more than that.
   //
   // Note the change of register: the merge HAS run, so these do not "refuse".
   // They DISCLOSE — the tree may be inconsistent and the caller must be told
@@ -2671,8 +2695,8 @@ async function updateViaGitCheckoutFallback(opts: {
         `status / git log) and repair it before restarting ComfyUI.`,
     );
   }
-  if (quiescenceGuard) {
-    const live = await readLiveQueueCounts(deps, quiescenceGuard.managerBase);
+  {
+    const live = await readLiveQueueCounts(deps, managerBase);
     if (!isLiveQueueIdle(live)) {
       throw new PanelInstallError(
         `Could not verify the panel update: the pinned fast-forward ALREADY RAN ` +
@@ -5291,6 +5315,14 @@ async function runPanelActionCore(
           previousRev: freshRev,
           assertSameTarget,
           managerReason,
+          // The Manager errored on its OWN pack list, not on its queue — and
+          // an erroring Manager is no less likely to have a task writing to
+          // this checkout, so the merge is bracketed here exactly as it is
+          // everywhere else. There is no observed base to pin to on this path
+          // (the call threw before returning one), so the re-probe resolves the
+          // configured Manager; the assertSameTarget checks around the mutation
+          // are what catch a retarget in the meantime.
+          managerBase: undefined,
           // Synthesize the shape the fallback reports around; there is no real
           // Manager result because the Manager call failed.
           result: {
@@ -5376,8 +5408,6 @@ async function runPanelActionCore(
     if (verdict.outcome === "no-op" && previousRev && post.dir) {
       const c = readQueueCounts(result.details);
       const provenLegacyEmptyQueue = isProvenLegacyEmptyQueue(result.details);
-      // Set only on the #824 quiescence-authorized entry — see below.
-      let quiescenceGuard: { managerBase: string | undefined } | undefined;
       // The Manager-side clause every fallback message narrates around — the
       // caller knows what the Manager actually reported; the fallback must not
       // assert the stale-3.x cause for a signature that doesn't prove it, and
@@ -5430,10 +5460,9 @@ async function runPanelActionCore(
         // when we asked" is a statement about one poll; "nothing is writing to
         // this tree" is a statement about the merge window, and git's index
         // lock only excludes other GIT processes — a Manager pip install or
-        // file copy is not held back by it. So this entry hands the fallback a
-        // `quiescenceGuard`, which brackets the mutation with a live re-probe
-        // and a tree compare-and-swap: refuse before it, disclose after it.
-        quiescenceGuard = { managerBase: result.managerBase };
+        // file copy is not held back by it. The fallback brackets its own
+        // mutation with a live re-probe and a tree compare-and-swap for
+        // exactly that reason (and does so on EVERY entry, not just this one).
       } else {
         // DIALECT GATE — the empty-queue signature only MEANS "stale Manager 3.x"
         // on a legacy host. On a v4 host (or with the dialect unproven) the same
@@ -5490,7 +5519,7 @@ async function runPanelActionCore(
         previousRev,
         result,
         managerReason,
-        quiescenceGuard,
+        managerBase: result.managerBase,
         assertSameTarget,
       });
     }

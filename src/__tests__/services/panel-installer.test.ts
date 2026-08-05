@@ -116,6 +116,8 @@ function makeDeps(opts: {
   dialect?: "v2" | "v2-batch" | "legacy" | "unproven";
   /** Ignored-file collisions the fallback gate reports (default: none). */
   ignoredConflicts?: string[];
+  /** When set, the Manager `update` mock throws this — the #771 direct path. */
+  updateThrows?: string;
   /**
    * #824 concurrency bracket — the answers the LIVE Manager queue re-probe
    * gives, in call order (`undefined` = the probe could not read the queue at
@@ -207,6 +209,7 @@ function makeDeps(opts: {
     },
     update: async (o) => {
       updates.push(o);
+      if (opts.updateThrows) throw new Error(opts.updateThrows);
       // Mutate the on-disk view BEFORE returning, so the post-update re-read in
       // runPanelAction sees exactly what "landed" (or didn't).
       opts.onUpdate?.({ files, revs });
@@ -1130,7 +1133,11 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     // Assert the REASON, not merely that it threw: the snapshot was re-probed.
     expect(msg).toMatch(/re-probed immediately before the merge/);
     expect(msg).toMatch(/pending=1/);
-    expect(msg).toMatch(/NOTHING WAS CHANGED/);
+    // Scoped to what was observed: this fallback did not merge. It must NOT
+    // extend that to the Manager call, whose own effect is exactly what its
+    // incoherent status could not report.
+    expect(msg).toMatch(/NO git mutation was made/);
+    expect(msg).toMatch(/whether the Manager call itself changed anything/);
     expect(h.gitPulls).toEqual([]);
     expect(h.counters.liveQueueProbes).toBe(1);
   });
@@ -1149,7 +1156,7 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     expect(err).toBeInstanceOf(PanelInstallError);
     const msg = String(err?.message ?? err);
     expect(msg).toMatch(/could not be read at all/);
-    expect(msg).toMatch(/NOTHING WAS CHANGED/);
+    expect(msg).toMatch(/NO git mutation was made/);
     expect(h.gitPulls).toEqual([]);
   });
 
@@ -1172,7 +1179,7 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     const msg = String(err?.message ?? err);
     expect(msg).toMatch(/CHANGED between the safety gates/);
     expect(msg).toMatch(/HEAD moved/);
-    expect(msg).toMatch(/NOTHING WAS CHANGED/);
+    expect(msg).toMatch(/NO git mutation was made by this fallback/);
     expect(h.gitPulls).toEqual([]);
   });
 
@@ -1216,7 +1223,8 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     // The merge DID run — refusing language here would be a lie.
     expect(msg).toMatch(/ALREADY RAN/);
     expect(msg).toMatch(/may now be INCONSISTENT/);
-    expect(msg).not.toMatch(/NOTHING WAS CHANGED/);
+    // The merge ran — refusal language would be a lie about a mutation.
+    expect(msg).not.toMatch(/NO git mutation was made/);
     expect(h.gitPulls).toEqual([dir]);
   });
 
@@ -1264,24 +1272,49 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     expect(h.counters.liveQueueProbes).toBe(2);
   });
 
-  it("#824: the legacy-3.x entry does NOT take the live re-probe - its warrant is a different proof", async () => {
+  it("#824: the legacy-3.x entry brackets its merge TOO - a stale-3.x verdict is not an idle checkout", async () => {
+    // The #724 warrant is about the Manager's VERDICT (it never enqueued the
+    // task). That says nothing about whether some OTHER Manager task is
+    // writing to this checkout right now, so the same bracket applies.
     const h = makeDeps({
       comfyuiPath: COMFY,
       files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
       revs: { [dir]: REV_A },
       updateDetails: LEGACY_NOOP,
       upstreamRev: REV_B,
-      // A busy answer would refuse the #824 entry; this one must never ask.
-      liveQueue: [BUSY, BUSY],
+      liveQueue: [BUSY],
       onGitPull: ({ files, revs }) => {
         files[pyPath] = pyproject(PANEL_REGISTRY_ID, "0.11.35");
         revs[dir] = REV_B;
         return FF;
       },
     });
-    const r = await runPanelAction("update", h.deps);
-    expect(r.installedVersion).toBe("0.11.35");
-    expect(h.counters.liveQueueProbes).toBe(0);
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/re-probed immediately before the merge/);
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("#824: the Manager-ERROR entry brackets its merge TOO (#771 direct path)", async () => {
+    // The Manager threw on its own installed-pack list while the pack is on
+    // disk. An erroring Manager is no less likely to have a task in flight.
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      upstreamRev: REV_B,
+      updateThrows: "ComfyUI-Manager: 'comfyui-mcp-panel' is not installed locally",
+      liveQueue: [WORKING],
+      onGitPull: ({ files, revs }) => {
+        files[pyPath] = pyproject(PANEL_REGISTRY_ID, "0.11.35");
+        revs[dir] = REV_B;
+        return FF;
+      },
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/re-probed immediately before the merge/);
+    expect(h.gitPulls).toEqual([]);
   });
 
   it("empty queue with pending work (total 0, pending 1) -> fallback REFUSED: not the proven signature", async () => {
