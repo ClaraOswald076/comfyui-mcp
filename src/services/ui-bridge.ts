@@ -2240,31 +2240,43 @@ export class UiBridge {
    * `workflowUuidFor` had, one method over, and it defeated the `unverified`
    * distinction in exactly the production contexts it was added for.
    *
-   *  - `{ known: true, canMutate }` — observed: this tab can (or cannot) mutate.
+   *  - `{ known: true, canMutate: true }` — observed: this tab can mutate.
+   *  - `{ known: true, canMutate: false, because }` — observed that it cannot, and
+   *    WHY. The two whys have different remedies, so they must not share a value
+   *    (codex gate P1): an old panel needs a pack update and a hard refresh, an
+   *    unroutable tab needs neither and cannot do READS either.
    *  - `{ known: false, reason }`   — the probe itself failed; nothing is known.
    */
   tabGraphMutationCapability(
     tabId: string,
-  ): { known: true; canMutate: boolean } | { known: false; reason: string } {
+  ):
+    | { known: true; canMutate: true }
+    | { known: true; canMutate: false; because: "unroutable" | "capability" }
+    | { known: false; reason: string } {
     let conn: Conn;
     try {
       conn = this.resolveTarget(tabId);
     } catch {
       // Cannot route to the tab at all. That IS an observation about mutability —
       // an unroutable tab mutates nothing — so it is `known`, not unknown.
-      return { known: true, canMutate: false };
+      //
+      // It is NOT the same observation as "this panel build lacks the write
+      // fence", and sharing one value with that case sent users to a remedy for a
+      // problem they did not have — update the pack, hard-refresh — while the tab
+      // was simply gone and their reads were failing too.
+      return { known: true, canMutate: false, because: "unroutable" };
     }
     try {
       const stamp = this.resolveTabWorkflowUuid?.(tabId);
-      return {
-        known: true,
-        canMutate:
-          conn.sock.readyState === WebSocket.OPEN &&
-          conn.enforcesWorkflowStamp &&
-          conn.enforcesWorkflowStampAtWrite &&
-          typeof stamp === "string" &&
-          stamp.length > 0,
-      };
+      const canMutate =
+        conn.sock.readyState === WebSocket.OPEN &&
+        conn.enforcesWorkflowStamp &&
+        conn.enforcesWorkflowStampAtWrite &&
+        typeof stamp === "string" &&
+        stamp.length > 0;
+      return canMutate
+        ? { known: true, canMutate: true }
+        : { known: true, canMutate: false, because: "capability" };
     } catch (err) {
       // The stamp resolver threw: the capability inputs could not be read, so the
       // answer is unknown — NOT "the panel lacks the capability".

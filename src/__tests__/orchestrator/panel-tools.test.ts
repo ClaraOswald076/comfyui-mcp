@@ -4706,6 +4706,32 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
   // uncorroborated top-level `active` "is never a safe source for replacing a
   // command fence". These cases hold the rebind to it.
 
+  it("REFUSES a PARTIAL contradiction — one matching field never outvotes a conflicting one", async () => {
+    const OTHER = "33333333-3333-4333-8333-333333333333";
+    const { bridge, refresh, tab, currentStamp } = fenceBridge({
+      fence: STALE,
+      // The pathological middle case the total-disagreement test above cannot
+      // reach: `routing_key` AGREES while `path` flatly contradicts. The verdict
+      // returned on the FIRST equal pair without ever reading the rest, so a
+      // reply that disagreed with itself was adopted as a positive identity
+      // (codex gate P0). A contradicted positive is worse than an unverified one.
+      active: {
+        path: "workflows/b.json",
+        routing_key: "wf:workflows/a.json",
+        workflow_uuid: OTHER,
+      },
+      workflows: [
+        { path: "workflows/a.json", routing_key: "wf:workflows/a.json", active: true },
+      ],
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(refresh).not.toHaveBeenCalled();
+    expect(currentStamp()).toBe(STALE);
+    expect(res.isError).toBe(true);
+    expect(text).not.toMatch(/"graph_binding": "bound"/);
+  });
+
   it("REFUSES to adopt when the active record CONTRADICTS the open-workflow list (stale/mixed reply)", async () => {
     const OTHER = "33333333-3333-4333-8333-333333333333";
     const { bridge, refresh, tab, currentStamp } = fenceBridge({
@@ -5026,7 +5052,14 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
       active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
     });
     const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
-    ctx.tabGraphMutationCapability = () => ({ known: true, canMutate: false }); // observed absent
+    // Observed absent, and the WHY is an old panel build — which is what makes
+    // the pack-update remedy below the right one. The sibling test covers the
+    // other why.
+    ctx.tabGraphMutationCapability = () => ({
+      known: true,
+      canMutate: false,
+      because: "capability" as const,
+    });
     const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
     const text = (res.content[0] as { text: string }).text;
 
@@ -5040,6 +5073,34 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
     expect(text).toMatch(/update the comfyui-mcp-panel pack/);
     // The remedy must not tell the caller to re-run a tool that cannot help.
     expect(text).toMatch(/including calling this tool again — can add it/);
+  });
+
+  it("does NOT blame the panel version when the tab is simply UNREACHABLE", async () => {
+    // Both whys yield canMutate:false, and they used to share one value — so this
+    // path told the user to update their panel pack and hard-refresh a tab that
+    // was gone, while their READS were failing too and the note said reads work
+    // (codex gate P1). A bucket narrated as a cause, with a remedy for a problem
+    // they did not have.
+    const { bridge, tab } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+    });
+    const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
+    ctx.tabGraphMutationCapability = () => ({
+      known: true,
+      canMutate: false,
+      because: "unroutable" as const,
+    });
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(text).toMatch(/NOT REACHABLE/);
+    // The wrong remedy must be absent, not merely accompanied by the right one.
+    expect(text).not.toMatch(/update the comfyui-mcp-panel pack/);
+    expect(text).toMatch(/NOT a panel-version problem/);
+    // And it must not leave "reads work" standing, which is false for a tab that
+    // cannot be routed to at all.
+    expect(text).toMatch(/reads are not working either/);
   });
 
   it("reports `unverified` — not `bound` — when the write capability cannot be determined", async () => {

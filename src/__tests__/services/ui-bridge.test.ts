@@ -2883,7 +2883,11 @@ describe("defaultBridgeTimeoutMs — tolerant read timeout (#357)", () => {
 
     // The resolver ANSWERS with no stamp → an observed CANNOT (nothing to fence).
     bridge.setTabWorkflowUuidResolver(() => undefined);
-    expect(bridge.tabGraphMutationCapability(tabId)).toEqual({ known: true, canMutate: false });
+    expect(bridge.tabGraphMutationCapability(tabId)).toEqual({
+      known: true,
+      canMutate: false,
+      because: "capability",
+    });
     expect(bridge.tabCanMutateGraph(tabId)).toBe(false);
 
     // The resolver THROWS → the inputs could not be READ. That is UNKNOWN, and
@@ -2899,11 +2903,15 @@ describe("defaultBridgeTimeoutMs — tolerant read timeout (#357)", () => {
     expect(bridge.tabCanMutateGraph(tabId)).toBe(false);
 
     // An unroutable tab is `known`: routing nowhere IS an observation about
-    // mutability, not a failure to look.
-    expect(bridge.tabGraphMutationCapability("no-such-tab")).toEqual({
-      known: true,
-      canMutate: false,
-    });
+    // mutability, not a failure to look. But it is a DIFFERENT observation from
+    // a panel that lacks the write fence, and the two used to share one value —
+    // so the recovery told users to update their panel pack and hard-refresh
+    // when the tab was simply gone and their READS were failing too (codex gate
+    // P1). Same boolean, opposite remedy: the cause is what separates them.
+    const unroutable = bridge.tabGraphMutationCapability("no-such-tab");
+    expect(unroutable).toEqual({ known: true, canMutate: false, because: "unroutable" });
+    // The load-bearing assertion is that these two do NOT compare equal.
+    expect(unroutable).not.toEqual({ known: true, canMutate: false, because: "capability" });
     a.close();
   });
 });

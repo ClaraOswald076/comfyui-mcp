@@ -2426,6 +2426,12 @@ const RELOAD_TAB_REMEDY =
 function describeFenceRebind(
   r: WorkflowFenceRebind,
   canMutate: boolean | undefined,
+  /**
+   * WHY mutations are refused, when they are. An unroutable tab and an old panel
+   * both yield `canMutate:false` but need opposite advice, and narrating the
+   * first as the second is a bucket standing in for a cause (codex gate P1).
+   */
+  refusalCause?: "unroutable" | "capability",
 ): {
   binding: "bound" | "reads_only" | "unverified" | "not_recovered";
   note: string;
@@ -2446,7 +2452,14 @@ function describeFenceRebind(
   // Its own remedy, NOT the reload sentence: re-calling this tool cannot add a
   // missing panel capability, so telling the caller to "call this again" here
   // would be another instruction that provably cannot work.
-  const mutationCaveat = mutationsRefused
+  const mutationCaveat = mutationsRefused && refusalCause === "unroutable"
+    ? `\n\nBUT this tab is NOT REACHABLE from the orchestrator right now, so graph mutations ` +
+      `are refused — and reads are not working either, whatever this note says about them. ` +
+      `This is NOT a panel-version problem: updating the pack and hard-refreshing cannot help, ` +
+      `because there is nothing to refresh until the tab is connected again.` +
+      `\n\nWHAT TO DO: check that the ComfyUI browser tab is still open and its panel is ` +
+      `connected, then call this again.`
+    : mutationsRefused
     ? `\n\nBUT graph MUTATIONS are still refused for this tab: its panel build does not ` +
       `advertise the write-boundary workflow fence a graph edit requires, and no rebind — ` +
       `including calling this tool again — can add it. Reads work now (this call just read the ` +
@@ -3013,6 +3026,27 @@ function identityVerdict(rec: OpenWorkflowRecord, activeObj: unknown): boolean |
     [r.key, a.routing_key],
     [r.routing_key, a.key],
   ];
+  // A CONTRADICTION OUTRANKS AN AGREEMENT (codex gate P0). Returning `true` on
+  // the first equal pair meant a mixed reply — matching `key`, conflicting
+  // `path` — was adopted as a positive identity without the disagreeing field
+  // ever being read. That is not merely an unverified positive; it is a
+  // contradicted one, and it could mint the very instance-mismatch wedge this
+  // recovery exists to clear.
+  //
+  // Only SAME-FIELD pairs can contradict. The cross pairs below (key↔routing_key)
+  // are alias attempts: their agreement is evidence, but their disagreement means
+  // only "these two namespaces differ", which is ordinary. Treating that as a
+  // contradiction would be this same fold pointed the other way — a false refusal
+  // of a real match.
+  const sameField: Array<[unknown, unknown]> = [
+    [r.key, a.key],
+    [r.path, a.path],
+    [r.routing_key, a.routing_key],
+  ];
+  for (const [x, y] of sameField) {
+    if (nonEmpty(x) && nonEmpty(y) && x !== y) return false;
+  }
+
   let comparable = false;
   for (const [x, y] of pairs) {
     if (nonEmpty(x) && nonEmpty(y)) {
@@ -3991,7 +4025,8 @@ export interface PanelToolCtx {
    * Optional so lightweight test contexts can omit it.
    */
   tabGraphMutationCapability?: () =>
-    | { known: true; canMutate: boolean }
+    | { known: true; canMutate: true }
+    | { known: true; canMutate: false; because: "unroutable" | "capability" }
     | { known: false; reason: string };
 }
 
@@ -7320,17 +7355,25 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // fence" — a claim about the panel built from our own failure to look
         // (codex gate). Only an OBSERVED negative may say that.
         let canMutateNow: boolean | undefined;
+        let refusalCause: "unroutable" | "capability" | undefined;
         try {
           if (ctx.tabGraphMutationCapability) {
             const cap = ctx.tabGraphMutationCapability();
             canMutateNow = cap.known ? cap.canMutate : undefined;
+            if (cap.known && !cap.canMutate) refusalCause = cap.because;
           } else {
+            // The legacy boolean probe cannot say WHY, and guessing would put us
+            // back where the tri-state started. Leave the cause undefined so the
+            // narration falls back to the generic wording rather than inventing one.
             canMutateNow = ctx.tabCanMutateGraph?.();
           }
         } catch {
           canMutateNow = undefined; // a guard that can throw is not a guard
+          refusalCause = undefined;
         }
-        const fence = fenceRebind ? describeFenceRebind(fenceRebind, canMutateNow) : undefined;
+        const fence = fenceRebind
+          ? describeFenceRebind(fenceRebind, canMutateNow, refusalCause)
+          : undefined;
         if (fence && fence.binding === "not_recovered") {
           return fail(
             `panel_set_workflow_target({mode:"current"}) did NOT restore this session's graph ` +
