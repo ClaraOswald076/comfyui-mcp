@@ -19,6 +19,7 @@ import { describe, expect, it } from "vitest";
 import {
   describeComfyuiSecretSave,
   secretNotPersisted,
+  secretSavedReply,
 } from "../../orchestrator/panel-tools.js";
 import type { SecretSaveReceipt } from "../../services/panel-secrets.js";
 
@@ -139,6 +140,81 @@ describe("describeComfyuiSecretSave: says only what was observed (#826)", () => 
     });
     expect(Object.values(base).join(" ")).not.toContain("civ-");
     expect(text).not.toMatch(/civ-|sk-|hf_/);
+  });
+});
+
+describe("a FAILED save still discloses the damage it did on the way", () => {
+  it("leads with the lost credentials and does NOT say 'set it again'", () => {
+    // A save can fail to leave OUR key behind AND destroy other entries in the
+    // same rewrite. Leading with "was NOT saved, set the key again" over that
+    // hides completed damage and sends the user to write over an already-damaged
+    // store (codex gate).
+    const err = secretNotPersisted({
+      ...base,
+      persisted: "no",
+      stillConfigured: false,
+      lostKeys: ["HF_TOKEN", "RUNPOD_API_KEY"],
+    });
+    expect(err.message).toContain("NO LONGER carries HF_TOKEN, RUNPOD_API_KEY");
+    expect(err.message).toContain("restore");
+    expect(err.message).not.toContain("then set the key again");
+    // The damage is stated BEFORE the "was NOT saved" headline.
+    expect(err.message.indexOf("NO LONGER carries")).toBeLessThan(
+      err.message.indexOf("was NOT saved"),
+    );
+  });
+
+  it("keeps the ordinary retry advice when nothing else was lost", () => {
+    const err = secretNotPersisted({ ...base, persisted: "no", stillConfigured: false });
+    expect(err.message).toContain("then set the key again");
+    expect(err.message).not.toContain("NO LONGER carries");
+  });
+});
+
+describe("secretSavedReply: the panel's green light is the same question as everyone else's", () => {
+  it("is ok ONLY for a proven, clean save", () => {
+    expect(secretSavedReply(base).ok).toBe(true);
+    expect(secretSavedReply({ ...base, persisted: "unknown" }).ok).toBe(false);
+    expect(secretSavedReply({ ...base, persisted: "no" }).ok).toBe(false);
+    expect(secretSavedReply({ ...base, persisted: "damaged", lostKeys: ["HF_TOKEN"] }).ok).toBe(
+      false,
+    );
+  });
+
+  it("never answers ok over DESTROYED credentials, and names them", () => {
+    // The Settings-panel bridge route discarded the receipt and replied ok:true
+    // whenever the call did not throw, so this exact receipt painted the panel
+    // green over the user's lost HuggingFace token (codex gate).
+    const reply = secretSavedReply({
+      ...base,
+      persisted: "damaged",
+      lostKeys: ["HF_TOKEN", "RUNPOD_API_KEY"],
+    });
+    expect(reply.ok).toBe(false);
+    expect(String(reply.error)).toContain("HF_TOKEN, RUNPOD_API_KEY");
+    expect(String(reply.error)).toContain("Do not treat this as a successful save");
+  });
+
+  it("says WHAT was not established for an unverified save, not a fixed guess", () => {
+    const reply = secretSavedReply({
+      ...base,
+      persisted: "unknown",
+      uncertainty: "another process was writing the store during this save",
+    });
+    expect(reply.ok).toBe(false);
+    expect(String(reply.error)).toContain("UNKNOWN");
+    expect(String(reply.error)).toContain("another process was writing");
+  });
+
+  it("carries a confirmed save's remaining obligations as warnings", () => {
+    const reply = secretSavedReply({ ...base, lostCommentLines: 2 });
+    expect(reply.ok).toBe(true);
+    expect(String(reply.warnings?.join(" "))).toContain("2 comment lines");
+  });
+
+  it("never contains a secret value", () => {
+    const reply = secretSavedReply({ ...base, persisted: "damaged", lostKeys: ["HF_TOKEN"] });
+    expect(JSON.stringify(reply)).not.toMatch(/civ-|sk-|hf_/);
   });
 });
 

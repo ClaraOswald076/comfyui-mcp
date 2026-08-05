@@ -215,11 +215,56 @@ export function secretNotPersisted(receipt: SecretSaveReceipt): Error {
     ? `The new value was rolled back rather than left half-applied, so the credential that was in place BEFORE this attempt is still in effect — the new one is not. ` +
       `If the action failed because the old value is wrong, it will still fail; do not read this as "now fixed".`
     : `The value was rolled back rather than left half-applied, so nothing is configured — do not retry the action that needed it.`;
+  // A failed save can ALSO have destroyed other credentials on its way — the
+  // rewrite happened, it just did not leave OUR key behind. Leading with "was
+  // NOT saved, set it again" over that hides completed damage and sends the user
+  // to write over an already-damaged store (codex gate). Every obligation the
+  // receipt carries comes first, from the one shared list.
+  const disclosures = receiptDisclosures(receipt);
   return new Error(
-    `"${receipt.key}" was NOT saved: writing ${receipt.path} appeared to succeed, but reading the file back does not show that key with the value just supplied. ` +
+    `${disclosures.length ? `${disclosures.join(" ")} ` : ""}` +
+      `"${receipt.key}" was NOT saved: writing ${receipt.path} appeared to succeed, but reading the file back does not show that key with the value just supplied. ` +
       `${state} ` +
-      `Check that ${receipt.path} is writable and not being rewritten by another process, then set the key again (panel Settings › credentials, or the env var directly, which takes precedence over the file).`,
+      `${
+        disclosures.length
+          ? `Because the rewrite also cost the store other entries, restore ${receipt.path} FIRST — do not simply set the key again on top of it.`
+          : `Check that ${receipt.path} is writable and not being rewritten by another process, then set the key again (panel Settings › credentials, or the env var directly, which takes precedence over the file).`
+      }`,
   );
+}
+
+/**
+ * The panel's `secret_saved` answer, derived from the receipt.
+ *
+ * The Settings-panel bridge route discarded the receipt entirely and replied
+ * `ok:true` whenever the call did not throw — so an unverifiable save, and one
+ * that PROVED other credentials were destroyed, both painted the panel green
+ * (codex gate). This is that decision, in one place, testable without standing
+ * up an orchestrator: `ok` is the same question every other consumer asks —
+ * `persisted === "yes"` — and the disclosures come from the one shared list.
+ *
+ * `error` on a non-"yes" verdict is a DISCLOSURE, not a claim the write did not
+ * happen: for "damaged" and "unknown" it says what did happen and what is not
+ * established. Only "no" is a proven failure.
+ */
+export function secretSavedReply(receipt: SecretSaveReceipt): {
+  ok: boolean;
+  error?: string;
+  warnings?: string[];
+} {
+  const warnings = receiptDisclosures(receipt);
+  if (receipt.persisted === "yes") {
+    return { ok: true, ...(warnings.length ? { warnings } : {}) };
+  }
+  const error =
+    receipt.persisted === "damaged"
+      ? (storeDamageNote(receipt) ??
+        `"${receipt.key}" was written, but the credential store lost other entries.`)
+      : receipt.persisted === "no"
+        ? secretNotPersisted(receipt).message
+        : `"${receipt.key}" was written to ${receipt.path}, but the save is NOT confirmed — treat it as UNKNOWN: ` +
+          `${receipt.uncertainty ?? "the file could not be re-read to confirm it"}.`;
+  return { ok: false, error, ...(warnings.length ? { warnings } : {}) };
 }
 
 // The note builders and the disclosure list live with the receipt they describe
