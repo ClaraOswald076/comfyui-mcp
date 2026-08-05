@@ -83,6 +83,22 @@ describe("normalizeReportedVersion (#846)", () => {
     expect(mcp("comfyui-mcp 2026.08.04")).toBe("2026.08.04");
   });
 
+  it("looks PAST a word standing where the number goes, but not into the next component", () => {
+    // `MCP version: 0.48.18` puts `version` in the slot the number occupies. Taking
+    // only the adjacent token dropped a perfectly good reading into the disk-read
+    // fallback — #846 again (codex gate round 4).
+    expect(mcp("MCP version: 0.48.18")).toBe("0.48.18");
+    expect(mcp("comfyui-mcp version 0.49.6")).toBe("0.49.6");
+    // …but the run is capped, so a label followed by prose cannot wander into some
+    // OTHER component's version further along the line.
+    expect(mcp("comfyui-mcp could not be determined, torch 2.7.1")).toBeUndefined();
+  });
+
+  it("does not read ANOTHER product's mcp-suffixed label as ours", () => {
+    expect(mcp("other-mcp 1.2.3")).toBeUndefined();
+    expect(mcp("somethingmcp 1.2.3")).toBeUndefined();
+  });
+
   it("strips the sentence-ending punctuation the ENV line leaves on the last token", () => {
     // The line ends in a full stop, so the LAST component's version arrives as
     // `0.11.38.` — which passes every shape test and then fails the worker's exact

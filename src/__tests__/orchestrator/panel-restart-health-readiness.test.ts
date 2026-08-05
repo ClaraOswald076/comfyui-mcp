@@ -179,7 +179,7 @@ describe("panel_restart_comfyui recovery after an ACCEPTED reboot (coordinator p
     // Exactly what equal argv establishes, with the remedy offered CONDITIONALLY —
     // we never read the user's saved settings, so we cannot say they were ignored.
     expect(String(out.note)).toContain(
-      "the same arguments were observed before and after",
+      "the same arguments were observed before this restart request and again now",
     );
     // Not a causal claim about the restart — see desktop-restart.test.ts.
     expect(String(out.note)).not.toMatch(/this restart did not change/i);

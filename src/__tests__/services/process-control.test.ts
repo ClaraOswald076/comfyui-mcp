@@ -473,7 +473,10 @@ describe("process-control startup readiness", () => {
     // them, so the supportable statement is about the probes (codex gate round 3).
     expect(result.message).not.toMatch(/before the API came up/i);
     expect(result.message).not.toMatch(/did not become ready/i);
-    expect(result.message).toMatch(/no readiness probe got a response/i);
+    // "HEALTHY response": the poller counts any non-2xx as not-ready, so a 503 from
+    // a half-started server IS a response and "no response" would be false.
+    expect(result.message).toMatch(/no readiness probe got a healthy response/i);
+    expect(result.message).not.toMatch(/no readiness probe got a response\b/i);
     expect(result.message).toMatch(/the last one included/i);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });

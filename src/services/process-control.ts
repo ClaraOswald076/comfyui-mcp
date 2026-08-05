@@ -823,7 +823,7 @@ function describeLaunchedChildExit(
   // SCHEDULED PROBE got a 2xx, and the server could have answered between two of
   // them. So "before the API came up" is gone too — every clause here now names an
   // observation rather than an inference from a gap between observations.
-  return ` The process this call launched EXITED (${exitCause(exit)}), so THIS RELAUNCH FAILED — it was not a slow start. No readiness probe got a response, the last one included.`;
+  return ` The process this call launched EXITED (${exitCause(exit)}), so THIS RELAUNCH FAILED — it was not a slow start. No readiness probe got a healthy response, the last one included.`;
 }
 
 /** Whole seconds, never rounded down to a "within 0s" that reads as no wait. */
@@ -871,7 +871,15 @@ export async function readServingArgv(
   } catch {
     return undefined;
   } finally {
-    clearTimeout(timer);
+    // THE GUARD IS ITSELF AN OPERATION THAT CAN FAIL (codex gate round 4). A throw
+    // from `finally` REPLACES the guarded result and escapes this function, which
+    // would turn a best-effort detail into a thrown restart. Nothing here may be
+    // allowed to do that.
+    try {
+      clearTimeout(timer);
+    } catch {
+      /* a timer we cannot clear is a leak at worst; it is unref'd and self-resolves */
+    }
   }
 }
 
@@ -901,8 +909,12 @@ export function describeArgvDrift(
   const unchanged =
     before.length === after.length && before.every((tok, i) => tok === after[i]);
   if (!unchanged) {
+    // "before this restart REQUEST", not "across this restart" (codex gate round 4).
+    // On the Manager path the only observations are an accepted request and a later
+    // healthy probe — no down→up cycle is required there — so a completed restart is
+    // not something these two readings may take as given.
     return (
-      ` Its launch arguments CHANGED across this restart: before ${before
+      ` Its launch arguments CHANGED between the reading taken before this restart request and the one taken now: before ${before
         .map(quoteToken)
         .join(" ")} / now ${after.map(quoteToken).join(" ")}.`
     );
@@ -920,7 +932,7 @@ export function describeArgvDrift(
   // old ones — so the remedy hangs off that, conditioned on the user's own
   // expectation, which only they can check.
   return (
-    ` Its launch arguments are UNCHANGED (${after.map(quoteToken).join(" ")}) — the same arguments were observed before and after this restart. ` +
+    ` Its launch arguments are UNCHANGED (${after.map(quoteToken).join(" ")}) — the same arguments were observed before this restart request and again now. ` +
     "If you were expecting different arguments" +
     (isDesktop
       ? " (after editing ComfyUI Desktop's saved launch settings, say), they are not in effect here: fully quit the ComfyUI Desktop app and relaunch it so it spawns the server from those settings."
@@ -2648,15 +2660,29 @@ export async function startComfyUI(): Promise<StartResult> {
         // environment it was launched into, which is the first thing to check when a
         // relaunch of an otherwise-healthy install fails during import.
         message:
-          // "no probe got a response in Nms", not "the API did not become ready": a
-          // poll establishes only what the SCHEDULED PROBES saw, and the server could
-          // have answered in a gap between two of them (codex gate round 3).
-          `ComfyUI process was launched, but no readiness probe got a response in ${readiness.waited_ms}ms (${readiness.attempts}/${readiness.max_tries} probes).` +
-          (launchedChildExit
-            ? describeLaunchedChildExit(launchedChildExit)
-            : launchedSpawnFailed
-              ? " The launch itself failed — the process could not be spawned — so THIS RELAUNCH FAILED; it was not a slow start."
-              : " The process this call launched is no longer running, so THIS RELAUNCH FAILED — it was not a slow start.") +
+          // "no probe got a HEALTHY response", not "the API did not become ready":
+          // a poll establishes only what the SCHEDULED PROBES saw (the server could
+          // have answered in a gap between two of them), and the poller treats any
+          // non-2xx as not-ready — so a 503 from a half-started server IS a
+          // response, and saying none came back would be false (codex gate r3/r4).
+          //
+          // A SPAWN FAILURE DOES NOT LEAD WITH "was launched" (codex gate round 4):
+          // the readiness race can resolve first and the `error` event land before
+          // the liveness check, which produced a report that said the process was
+          // launched and then that it could not be spawned.
+          //
+          // DEFENSIVE AND UNCOVERED, stated so nobody mistakes it for tested: an
+          // `error` arriving before the race settles makes `spawnError` win instead,
+          // and that path returns above. Reaching HERE needs the event to land in
+          // the microtask window between the readiness result resolving and this
+          // line reading the flag — an interleaving no test can schedule. The branch
+          // costs nothing and removes a self-contradictory verdict if it ever runs.
+          (launchedSpawnFailed && !launchedChildExit
+            ? `The ComfyUI process could not be spawned, and no readiness probe got a healthy response in ${readiness.waited_ms}ms (${readiness.attempts}/${readiness.max_tries} probes). THIS RELAUNCH FAILED — it was not a slow start.`
+            : `ComfyUI process was launched, but no readiness probe got a healthy response in ${readiness.waited_ms}ms (${readiness.attempts}/${readiness.max_tries} probes).` +
+              (launchedChildExit
+                ? describeLaunchedChildExit(launchedChildExit)
+                : " The process this call launched is no longer running, so THIS RELAUNCH FAILED — it was not a slow start.")) +
           " Check the ComfyUI logs, and re-check with health_check before assuming nothing is serving the port — an external launcher or supervisor may have brought one back since." +
           (env ? ` Launch environment: ${env.note}.` : "") +
           launchEnvWarning(info),
@@ -2682,7 +2708,10 @@ export async function startComfyUI(): Promise<StartResult> {
         (childAlive === true
           ? "that process is still running"
           : "no exit has been observed from that process") +
-        `, but the API had not answered on ${readiness.probe_url} within ${waitedS}s ` +
+        // "no healthy response" rather than "had not answered": the poller counts
+        // any non-2xx as not-ready, so a 503 from a half-started server is an
+        // answer, and claiming none came would be false (codex gate round 4).
+        `, but no readiness probe got a healthy response from ${readiness.probe_url} within ${waitedS}s ` +
         `(${readiness.attempts}/${readiness.max_tries} probes). The budget expiring means ` +
         "the startup is NOT CONFIRMED YET — it does NOT mean it failed: ComfyUI with a normal " +
         "set of custom nodes routinely answers well after this window. " +
@@ -3102,8 +3131,8 @@ async function restartViaManagerReboot(context: {
         // equally consistent with a server that was never reachable from here. The
         // accepted reboot is the one thing we did observe, so it is the one thing
         // claimed.
-        "The ComfyUI-Manager reboot was accepted, but ComfyUI had not " +
-        `answered on ${readiness.probe_url} within ${waitedS}s ` +
+        "The ComfyUI-Manager reboot was accepted, but no readiness probe got a " +
+        `healthy response from ${readiness.probe_url} within ${waitedS}s ` +
         `(${readiness.attempts}/${readiness.max_tries} probes over a ` +
         `COMFYUI_REMOTE_REBOOT_BUDGET_S=${seconds(timing.budgetMs)}s budget). That budget ` +
         "expiring means the restart is NOT CONFIRMED YET — it does NOT mean it failed; a " +
