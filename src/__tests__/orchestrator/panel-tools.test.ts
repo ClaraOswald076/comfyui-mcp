@@ -4587,6 +4587,14 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
   function fenceBridge(opts: {
     fence?: string;
     active?: Record<string, unknown> | null;
+    /** Override the `workflows` list. By DEFAULT the stub mirrors `active` into a
+     *  single `active:true` entry — the shape a healthy panel returns, and the
+     *  CORROBORATION a fence adoption requires. Pass this explicitly to model a
+     *  stale/mixed/absent list. Supplying only a top-level `active` object is NOT
+     *  a safe fixture: it is the exact reply shape that let another canvas's uuid
+     *  overwrite this tab's stamp, so the default must not encode it. */
+    workflows?: Array<Record<string, unknown>>;
+    activeConfirmed?: boolean;
     listThrows?: string;
     refreshReturns?: boolean;
     tabId?: string;
@@ -4604,7 +4612,15 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
         sent.push(cmd);
         if (cmd.cmd === "workflow_list") {
           if (opts.listThrows) throw new Error(opts.listThrows);
-          return opts.active == null ? { workflows: [] } : { active: opts.active };
+          if (opts.active == null) return { workflows: opts.workflows ?? [] };
+          // Mirror `active` into a corroborating `active:true` entry unless the
+          // test is deliberately modelling a stale/mixed/absent list.
+          const workflows = opts.workflows ?? [{ ...opts.active, active: true }];
+          return {
+            active: opts.active,
+            workflows,
+            ...(opts.activeConfirmed === undefined ? {} : { active_confirmed: opts.activeConfirmed }),
+          };
         }
         return { ok: true };
       },
@@ -4660,7 +4676,14 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
     // active canvas IS the target.
     const { bridge, refresh, tab, currentStamp } = fenceBridge({
       fence: STALE,
-      active: { workflow_uuid: LIVE, filename: "Unsaved Workflow" },
+      // A real unsaved workflow has no saved path, but it DOES have a stable
+      // routing key — which is what corroborates it against the open list.
+      active: {
+        key: "tmp:abc123",
+        routing_key: "tmp:abc123",
+        workflow_uuid: LIVE,
+        filename: "Unsaved Workflow",
+      },
       tabId: "tmp:abc123",
     });
     const { res, text } = await setCurrent(bridge, tab);
@@ -4669,6 +4692,126 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
     expect(refresh).toHaveBeenCalledExactlyOnceWith("tmp:abc123", LIVE);
     expect(currentStamp()).toBe(LIVE);
     expect(JSON.parse(text).graph_binding_status).toBe("refreshed");
+  });
+
+  // ---- The corroboration the fence adoption requires -----------------------
+  //
+  // A stale or MIXED workflow_list can carry a top-level `active` naming ANOTHER
+  // canvas, whose uuid is perfectly valid in shape and origin. Adopting it
+  // overwrites this tab's stamp, wedges the next graph command, and — because the
+  // adoption "succeeded" — gets reported as `bound`. A fresh wedge announced as a
+  // recovery is strictly worse than the wedge this whole PR exists to fix.
+  //
+  // `resolveOpenWorkflow` had already arrived at this rule for pins: an
+  // uncorroborated top-level `active` "is never a safe source for replacing a
+  // command fence". These cases hold the rebind to it.
+
+  it("REFUSES to adopt when the active record CONTRADICTS the open-workflow list (stale/mixed reply)", async () => {
+    const OTHER = "33333333-3333-4333-8333-333333333333";
+    const { bridge, refresh, tab, currentStamp } = fenceBridge({
+      fence: STALE,
+      // Top-level active names canvas B, carrying a VALID uuid…
+      active: { path: "workflows/b.json", routing_key: "wf:workflows/b.json", workflow_uuid: OTHER },
+      // …while the panel's own list says canvas A is the active one.
+      workflows: [{ path: "workflows/a.json", routing_key: "wf:workflows/a.json", active: true }],
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    // Nothing adopted — the other canvas's uuid never reaches the fence.
+    expect(refresh).not.toHaveBeenCalled();
+    expect(currentStamp()).toBe(STALE);
+    // …and it is NOT reported as a recovery.
+    expect(res.isError).toBe(true);
+    expect(text).not.toMatch(/"graph_binding": "bound"/);
+    expect(text).toMatch(/could not be corroborated, so nothing was adopted/);
+    expect(text).toMatch(/name DIFFERENT workflows \(a stale or mixed reply\)/);
+    // The reason it matters, stated: this is what protects the tab.
+    expect(text).toMatch(/could have stamped ANOTHER canvas's identity onto this tab/);
+    // The remedy fits the cause — transient, so retry; not "update your panel".
+    expect(text).toMatch(/call this again in a moment/);
+    expect(text).not.toMatch(/must be UPDATED/);
+  });
+
+  it("REFUSES to adopt from a reply with no open-workflow list to corroborate against", async () => {
+    const { bridge, refresh, tab, currentStamp } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+      workflows: [], // the exact shape the first version of this fix accepted
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(refresh).not.toHaveBeenCalled();
+    expect(currentStamp()).toBe(STALE);
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/no open-workflow list to corroborate the active record against/);
+  });
+
+  it("REFUSES a MIXED list with two entries marked active, rather than arbitrating", async () => {
+    const { bridge, refresh, tab } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+      workflows: [
+        { path: "workflows/a.json", routing_key: "wf:workflows/a.json", active: true },
+        { path: "workflows/b.json", routing_key: "wf:workflows/b.json", active: true },
+      ],
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(refresh).not.toHaveBeenCalled();
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/2 entries in the open-workflow list are marked active \(a mixed reply\)/);
+  });
+
+  it("REFUSES when the panel itself says its active record is UNCONFIRMED", async () => {
+    const { bridge, refresh, tab } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+      activeConfirmed: false,
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(refresh).not.toHaveBeenCalled();
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/reported its active workflow as UNCONFIRMED/);
+  });
+
+  it("an UNCORROBORATED reply with NO prior fence is `unverified`, not a wedge and not a repair", async () => {
+    // Nothing was stale, so nothing failed to be repaired — but nothing was
+    // established either. Calling it `reads_only` would describe a permanent
+    // limitation this is not (the panel DOES report identities); calling it
+    // `not_recovered` would report a wedge that does not exist.
+    const { bridge, refresh, tab } = fenceBridge({
+      fence: undefined,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+      workflows: [], // uncorroborated
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(res.isError).toBeFalsy();
+    expect(refresh).not.toHaveBeenCalled();
+    expect(JSON.parse(text)).toMatchObject({
+      graph_binding: "unverified",
+      graph_binding_status: "no_identity",
+    });
+    expect(text).toMatch(/had no fence to damage, so it is no worse off/);
+    expect(text).toMatch(/call this again in a moment/);
+    // NOT the update-your-panel remedy: this panel reports identities fine.
+    expect(text).not.toMatch(/must be UPDATED/);
+  });
+
+  it("REFUSES when the active record and the list share no comparable identity field", async () => {
+    // Agreement was never established — which is not agreement. Filename is
+    // deliberately not comparable: it collides across tabs.
+    const { bridge, refresh, tab } = fenceBridge({
+      fence: STALE,
+      active: { filename: "a.json", workflow_uuid: LIVE },
+      workflows: [{ filename: "a.json", active: true }],
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(refresh).not.toHaveBeenCalled();
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/share no comparable identity field/);
   });
 
   it("reports ALREADY_CURRENT (and points at the panel) rather than a hollow rebind", async () => {
@@ -4749,9 +4892,13 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
     expect(text).toMatch(/reported NO workflow identity for the active canvas/);
     // NOT the unreadable wording — the panel DID answer, which is a different fact.
     expect(text).not.toMatch(/Could NOT read the live canvas identity/);
-    expect(text).toMatch(/cached[\s\S]{0,30}older panel bundle/);
+    // …and NOT the uncorroborated wording either: this reply hung together fine,
+    // the panel simply has no identity to give. Different fact, different remedy.
+    expect(text).not.toMatch(/could not be corroborated/);
+    expect(text).toMatch(/cached bundle/);
     // …and the remedy is the one that actually replaces a cached bundle.
     expect(text).toMatch(/HARD refresh here specifically/);
+    expect(text).toMatch(/must be UPDATED — no rebind can add it/);
     expect(refresh).not.toHaveBeenCalled();
   });
 
@@ -4924,7 +5071,10 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
     const bridge = {
       send: async (cmd: Record<string, unknown>) =>
         cmd.cmd === "workflow_list"
-          ? { active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE } }
+          ? {
+              active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+              workflows: [{ path: "workflows/a.json", routing_key: "wf:workflows/a.json", active: true }],
+            }
           : { ok: true },
       push: () => 1,
       canReach: (id: string) => id === tab,
@@ -4980,7 +5130,10 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
           throw new Error(`no connected tab with id "${opts?.tabId}". Connected: none`);
         }
         if (cmd.cmd === "workflow_list") {
-          return { active: { path: "workflows/new.json", workflow_uuid: LIVE } };
+          return {
+            active: { path: "workflows/new.json", routing_key: "wf:workflows/new.json", workflow_uuid: LIVE },
+            workflows: [{ path: "workflows/new.json", routing_key: "wf:workflows/new.json", active: true }],
+          };
         }
         return { ok: true };
       },
@@ -5099,7 +5252,10 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
           throw new Error(`no connected tab with id "${opts?.tabId}". Connected: none`);
         }
         if (cmd.cmd === "workflow_list") {
-          return { active: { path: "workflows/new.json", workflow_uuid: LIVE } };
+          return {
+            active: { path: "workflows/new.json", routing_key: "wf:workflows/new.json", workflow_uuid: LIVE },
+            workflows: [{ path: "workflows/new.json", routing_key: "wf:workflows/new.json", active: true }],
+          };
         }
         return { ok: true };
       },
@@ -5188,7 +5344,10 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
           throw new Error(`no connected tab with id "${opts?.tabId}". Connected: none`);
         }
         if (cmd.cmd === "workflow_list") {
-          return { active: { path: "workflows/new.json", workflow_uuid: LIVE } };
+          return {
+            active: { path: "workflows/new.json", routing_key: "wf:workflows/new.json", workflow_uuid: LIVE },
+            workflows: [{ path: "workflows/new.json", routing_key: "wf:workflows/new.json", active: true }],
+          };
         }
         return { ok: true };
       },
