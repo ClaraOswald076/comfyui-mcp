@@ -110,6 +110,17 @@ export class PanelInstallError extends Error {
 // Injectable deps (mirrors node-authoring's pattern for clean unit tests)
 // ---------------------------------------------------------------------------
 
+/**
+ * The Manager's LIVE work indicators, re-read straight from the queue rather
+ * than lifted out of a stored result payload. Mirrors node-management's
+ * ManagerQueueCounts, which is where the default implementation comes from.
+ */
+export interface LiveQueueCounts {
+  pending: number;
+  inProgress: number;
+  processing: boolean;
+}
+
 export interface PanelInstallerDeps {
   /**
    * True only in LOCAL mode. In remote (--comfyui-url) / cloud mode the Manager
@@ -271,6 +282,14 @@ export interface PanelInstallerDeps {
    * detectManagerApi; tests stub it.
    */
   detectManagerDialect?: ((base?: string) => Promise<"v2" | "v2-batch" | "legacy" | undefined>) | undefined;
+  /**
+   * Re-read the Manager's LIVE queue counts (#824 concurrent-write exclusion).
+   * Returns undefined whenever idleness cannot be PROVEN — unreachable, an
+   * unreadable status, missing or incoherent fields. Callers treat undefined
+   * as "cannot determine", which refuses; it is NEVER read as idle. Default is
+   * the real fetchManagerQueueCounts; tests stub it.
+   */
+  fetchLiveQueueCounts?: ((base?: string) => Promise<LiveQueueCounts | undefined>) | undefined;
   /** Is the target ComfyUI reachable right now? Never throws. */
   isReachable: () => Promise<boolean>;
   install: (opts: { id: string; version?: string }) => Promise<NodeOpResult>;
@@ -2059,6 +2078,36 @@ export function isProvenQuiescentQueue(details: unknown): boolean {
   return c.pending === 0 && c.inProgress === 0 && c.processing === false;
 }
 
+/**
+ * Re-read the Manager's LIVE queue counts. NEVER throws: any failure is
+ * `undefined`, which every caller must treat as "idleness could not be
+ * determined" — the refusing answer — and never as idle (#824 codex gate).
+ */
+async function readLiveQueueCounts(
+  deps: PanelInstallerDeps,
+  base: string | undefined,
+): Promise<LiveQueueCounts | undefined> {
+  try {
+    if (deps.fetchLiveQueueCounts) return await deps.fetchLiveQueueCounts(base);
+    const { fetchManagerQueueCounts } = await import("./node-management.js");
+    return await fetchManagerQueueCounts(base);
+  } catch {
+    return undefined;
+  }
+}
+
+/** True only when the probe SUCCEEDED and every live indicator reports clear. */
+function isLiveQueueIdle(c: LiveQueueCounts | undefined): boolean {
+  return !!c && c.pending === 0 && c.inProgress === 0 && c.processing === false;
+}
+
+/** Render a live probe for a message — including the "no answer at all" case. */
+function describeLiveQueue(c: LiveQueueCounts | undefined): string {
+  return c
+    ? `pending=${c.pending}, in_progress=${c.inProgress}, is_processing=${c.processing}`
+    : `the live queue could not be read at all`;
+}
+
 export type UpdateOutcome =
   | "updated" // version OR git-HEAD moved on disk → the update definitely applied.
   | "downgraded" // the version PROVABLY went backwards — applied, but not an update.
@@ -2360,13 +2409,35 @@ async function updateViaGitCheckoutFallback(opts: {
    */
   managerReason: string;
   /**
+   * #824 — present ONLY when this fallback was authorized by a QUIESCENCE
+   * SNAPSHOT of the Manager queue (`isProvenQuiescentQueue` over the counts the
+   * update call returned) rather than by the proven stale-3.x signature.
+   *
+   * That snapshot establishes "the queue reported nothing in flight at the
+   * moment we asked" — NOT "nothing is writing to this tree", which is the only
+   * claim that licenses a destructive merge. Its presence therefore switches on
+   * the live re-probe that brackets the mutation; it carries the base of the
+   * Manager that was actually observed, so the re-probe asks the same host the
+   * update call did rather than whatever the config currently resolves to.
+   */
+  quiescenceGuard?: { managerBase: string | undefined };
+  /**
    * Refuse if the orchestrator retargeted mid-operation. This helper MUTATES a
    * checkout and then reports the result, so both must belong to the ComfyUI the
    * request was made for — see the note on runPanelActionInner's binding.
    */
   assertSameTarget: (stage: string) => void;
 }): Promise<PanelActionResult> {
-  const { deps, dir, previousVersion, previousRev, result, managerReason, assertSameTarget } = opts;
+  const {
+    deps,
+    dir,
+    previousVersion,
+    previousRev,
+    result,
+    managerReason,
+    quiescenceGuard,
+    assertSameTarget,
+  } = opts;
 
   // PRE-PULL REVISION GATE — the post-Manager detection's HEAD must be
   // readable before we mutate. An unreadable revision at this point means the
@@ -2485,6 +2556,66 @@ async function updateViaGitCheckoutFallback(opts: {
     );
   }
 
+  // ---- CONCURRENT-WRITE EXCLUSION (#824 codex gate) -----------------------
+  // Everything above proves things about a MOMENT: the queue counts came back
+  // with the update call, `git status` ran several awaits ago. None of that
+  // says "nothing is writing to this tree NOW", and git's index lock does not
+  // synchronize an arbitrary Manager write (a pip install, a file copy, an
+  // unpack) against this merge — only against another git process. So prove
+  // exclusivity positively, and as close to the mutation as it can be taken:
+  //
+  //   1. RE-PROBE the live queue (quiescence-authorized entry only), so the
+  //      idleness that licenses the merge is milliseconds old rather than
+  //      however long the Manager call took. An unreadable probe is "cannot
+  //      determine", which REFUSES — it is never read as idle.
+  //   2. COMPARE-AND-SWAP the tree itself: HEAD and the worktree must still be
+  //      EXACTLY what the gates above inspected. If either moved, something
+  //      other than us is writing here, whatever the queue says.
+  //   3. After the merge, re-verify both (below), so a write that landed
+  //      INSIDE the window is DISCLOSED rather than reported as a clean update.
+  //
+  // Each check refuses BEFORE any mutation, so its own failure costs nothing.
+  if (quiescenceGuard) {
+    const live = await readLiveQueueCounts(deps, quiescenceGuard.managerBase);
+    if (!isLiveQueueIdle(live)) {
+      throw new PanelInstallError(
+        `Panel update did NOT apply: ${managerReason}, and the git fallback is ` +
+          `REFUSED: the queue counts that authorized it were a snapshot, so ` +
+          `ComfyUI-Manager was re-probed immediately before the merge — and ` +
+          `${describeLiveQueue(live)}. That does not exclude a Manager task ` +
+          `writing to ${dir} while a git merge --ff-only rewrites it, and git's ` +
+          `index lock does not hold back a non-git writer. NOTHING WAS CHANGED. ` +
+          `Wait for the Manager queue to drain and retry, or update the panel ` +
+          `repo manually (git pull in ${dir}), then RESTART ComfyUI.`,
+      );
+    }
+  }
+  let casRev: string | undefined;
+  let casPorcelain: string;
+  try {
+    casRev = deps.gitRevision(dir);
+    casPorcelain = deps.gitStatusPorcelain(dir).trim();
+  } catch (err) {
+    throw new PanelInstallError(
+      `Panel update did NOT apply: ${managerReason}, and the git fallback is ` +
+        `REFUSED: the panel checkout at ${dir} could not be re-confirmed ` +
+        `unchanged immediately before the merge (${err instanceof Error ? err.message : String(err)}), ` +
+        `so nothing rules out a concurrent write. NOTHING WAS CHANGED. Update ` +
+        `the panel repo manually (git pull in ${dir}), then RESTART ComfyUI.`,
+    );
+  }
+  if (casRev !== prePullRev || casPorcelain !== "") {
+    throw new PanelInstallError(
+      `Panel update did NOT apply: ${managerReason}, and the git fallback is ` +
+        `REFUSED: the panel checkout at ${dir} CHANGED between the safety gates ` +
+        `and the merge — ` +
+        `${casRev !== prePullRev ? `HEAD moved ${prePullRev.slice(0, 8)} → ${casRev ? casRev.slice(0, 8) : "unreadable"}` : `the worktree is no longer clean:\n${casPorcelain}`}. ` +
+        `Something other than this update is writing to that tree, and a ` +
+        `fast-forward would race it. NOTHING WAS CHANGED. Let the other ` +
+        `operation finish, then re-check install_panel(action='status').`,
+    );
+  }
+
   let gitOutput: string;
   try {
     assertSameTarget("before fast-forwarding the panel checkout");
@@ -2500,6 +2631,60 @@ async function updateViaGitCheckoutFallback(opts: {
         `ComfyUI-Manager, or pip install -U comfyui_manager) and retry, or update ` +
         `the panel repo manually (git pull in ${dir}), then RESTART ComfyUI.`,
     );
+  }
+
+  // ---- CONCURRENT-WRITE EXCLUSION, closing half (#824 codex gate) ---------
+  // The ff-only merge is the ONLY write this path authorized, so prove it is
+  // the only one that landed. A fast-forward from a clean tree leaves HEAD at
+  // exactly the rev we pinned (or, when the checkout already contained it,
+  // exactly where it was) and the worktree clean. Anything else — a dirty
+  // tree, a third HEAD, a Manager task that appeared mid-window — means some
+  // other writer touched this checkout while we rewrote it.
+  //
+  // Note the change of register: the merge HAS run, so these do not "refuse".
+  // They DISCLOSE — the tree may be inconsistent and the caller must be told
+  // that, rather than handed a success report the evidence does not support.
+  let postMergeRev: string | undefined;
+  let postMergePorcelain: string;
+  try {
+    postMergeRev = deps.gitRevision(dir);
+    postMergePorcelain = deps.gitStatusPorcelain(dir).trim();
+  } catch (err) {
+    throw new PanelInstallError(
+      `Could not verify the panel update: the pinned fast-forward ALREADY RAN in ` +
+        `${dir}, but the checkout could not be re-read afterwards ` +
+        `(${err instanceof Error ? err.message : String(err)}), so whether ` +
+        `anything else wrote to it during the merge is UNKNOWN. NOT reporting ` +
+        `success. Inspect the panel repo (git status / git log) before ` +
+        `restarting ComfyUI.`,
+    );
+  }
+  if (postMergePorcelain !== "" || (postMergeRev !== targetRev && postMergeRev !== prePullRev)) {
+    throw new PanelInstallError(
+      `Could not verify the panel update: the pinned fast-forward ALREADY RAN in ` +
+        `${dir}, but the checkout afterwards is not what that merge alone would ` +
+        `leave — ` +
+        `${postMergePorcelain !== "" ? `the worktree is dirty:\n${postMergePorcelain}` : `HEAD is ${postMergeRev ? postMergeRev.slice(0, 8) : "unreadable"}, neither the merged upstream (${targetRev.slice(0, 8)}) nor the pre-merge revision (${prePullRev.slice(0, 8)})`}. ` +
+        `Another writer (a ComfyUI-Manager task, or a manual git operation) ` +
+        `touched this tree during the merge, so the panel directory may now be ` +
+        `INCONSISTENT. NOT reporting success. Inspect the panel repo (git ` +
+        `status / git log) and repair it before restarting ComfyUI.`,
+    );
+  }
+  if (quiescenceGuard) {
+    const live = await readLiveQueueCounts(deps, quiescenceGuard.managerBase);
+    if (!isLiveQueueIdle(live)) {
+      throw new PanelInstallError(
+        `Could not verify the panel update: the pinned fast-forward ALREADY RAN ` +
+          `in ${dir}, but re-probing ComfyUI-Manager afterwards showed ` +
+          `${describeLiveQueue(live)} — the idle window this merge was ` +
+          `authorized inside did not hold all the way through it, so whether a ` +
+          `Manager task wrote to the panel directory during the merge is ` +
+          `UNKNOWN. NOT reporting success. Let the Manager queue drain, inspect ` +
+          `the panel repo (git status / git log), then re-check ` +
+          `install_panel(action='status').`,
+      );
+    }
   }
 
   // The merge ran clean — VERIFY with the same machinery (#639/#641): re-read
@@ -5191,6 +5376,8 @@ async function runPanelActionCore(
     if (verdict.outcome === "no-op" && previousRev && post.dir) {
       const c = readQueueCounts(result.details);
       const provenLegacyEmptyQueue = isProvenLegacyEmptyQueue(result.details);
+      // Set only on the #824 quiescence-authorized entry — see below.
+      let quiescenceGuard: { managerBase: string | undefined } | undefined;
       // The Manager-side clause every fallback message narrates around — the
       // caller knows what the Manager actually reported; the fallback must not
       // assert the stale-3.x cause for a signature that doesn't prove it, and
@@ -5237,13 +5424,16 @@ async function runPanelActionCore(
         // warrant comes from the checkout's own state (clean, corroborated,
         // behind-or-at-tip proven against the fetched upstream), not from any
         // Manager signature, so the Manager's API dialect is irrelevant to it.
-        // Quiescence is a SNAPSHOT, like every proof in this path (the legacy
-        // empty-queue signature is one too): a Manager task enqueued by another
-        // client in the interim is not excluded by it. What bounds that race is
-        // the mutation itself — a pinned `git merge --ff-only` takes git's own
-        // locks and fails LOUDLY on contention rather than corrupting or
-        // silently losing work, and the post-merge verification re-reads the
-        // on-disk identity fresh instead of trusting the merge's output.
+        //
+        // What this snapshot does NOT establish is the thing a destructive
+        // merge actually needs. "pending/in_progress/is_processing were clear
+        // when we asked" is a statement about one poll; "nothing is writing to
+        // this tree" is a statement about the merge window, and git's index
+        // lock only excludes other GIT processes — a Manager pip install or
+        // file copy is not held back by it. So this entry hands the fallback a
+        // `quiescenceGuard`, which brackets the mutation with a live re-probe
+        // and a tree compare-and-swap: refuse before it, disclose after it.
+        quiescenceGuard = { managerBase: result.managerBase };
       } else {
         // DIALECT GATE — the empty-queue signature only MEANS "stale Manager 3.x"
         // on a legacy host. On a v4 host (or with the dialect unproven) the same
@@ -5300,6 +5490,7 @@ async function runPanelActionCore(
         previousRev,
         result,
         managerReason,
+        quiescenceGuard,
         assertSameTarget,
       });
     }
