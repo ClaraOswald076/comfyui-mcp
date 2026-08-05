@@ -1175,9 +1175,23 @@ export async function resolveInstallInterpreter(
  * An empty map has two causes that a caller must not confuse: pip answered and none of
  * these packages are installed, or pip never answered at all (absent from this
  * interpreter — common in uv-created venvs — or the probe timed out). Reporting the
- * second as the first invents a capability finding; reporting the first as the second
- * withholds a real one. Only a second, cheap observation separates them, so the probe
- * makes it rather than letting one shape stand for both.
+ * second as the first invents a capability finding.
+ *
+ * The discriminator has to come from THIS invocation. A follow-up `pip --version` was
+ * the obvious shortcut and is wrong: it shows that pip can start NOW, which is not
+ * evidence that the query that already failed ever ran — a `pip show` killed by the 8s
+ * timeout would be vouched for by a fast `pip --version` and its silence read as "none
+ * installed". So `ran` requires POSITIVE evidence in pip's own output that pip looked:
+ * a parsed record, or pip's own `WARNING: Package(s) not found: …`. Anything else —
+ * pip absent, python itself failing, the probe killed, or that wording changing in some
+ * future pip — is `ran: false`, i.e. "we could not tell", which is the safe direction.
+ *
+ * `probe()` is deliberately NOT used here. It discards everything on a non-zero exit,
+ * and `pip show a b c` exits 1 whenever ANY named package is missing — which, with
+ * xformers and diffusers in the list, is the ordinary state of a real machine. That
+ * silently threw away the records for the packages pip DID find (torch among them) and
+ * left `packages` empty, so `get_environment` reported no packages on installs that had
+ * them. A non-zero exit here is a completed run whose output must still be read.
  */
 async function probePipPackages(
   pythonExe: string,
@@ -1185,17 +1199,20 @@ async function probePipPackages(
 ): Promise<{ ran: boolean; packages: Record<string, string> }> {
   // `pip show` is portable across pip/uv-managed venvs.
   const found: Record<string, string> = {};
-  const out = await probe(pythonExe, [
-    "-m",
-    "pip",
-    "show",
-    ...names,
-  ]);
-  if (!out) {
-    // `pip show` prints nothing both when pip is missing and when it simply matched
-    // nothing. Ask whether pip itself is usable to tell those apart.
-    const pipItself = await probe(pythonExe, ["-m", "pip", "--version"]);
-    return { ran: !!pipItself, packages: found };
+  let out = "";
+  try {
+    const res = await execFileAsync(pythonExe, ["-m", "pip", "show", ...names], {
+      timeout: 8000,
+      windowsHide: true,
+    });
+    out = `${res.stdout ?? ""}\n${res.stderr ?? ""}`;
+  } catch (err) {
+    // promisified execFile rejects on a non-zero exit but attaches the output it did
+    // collect. Read it: a partial match lives there, and so does pip's not-found
+    // warning. A spawn failure or a kill simply leaves both undefined.
+    const e = err as { stdout?: unknown; stderr?: unknown };
+    const parts = [e?.stdout, e?.stderr].filter((s): s is string => typeof s === "string");
+    out = parts.join("\n");
   }
   // `pip show A B C` emits records separated by a line of "---".
   for (const block of out.split(/^---$/m)) {
@@ -1205,7 +1222,10 @@ async function probePipPackages(
       found[nameMatch[1].trim().toLowerCase()] = verMatch[1].trim();
     }
   }
-  return { ran: true, packages: found };
+  // A parsed record IS pip speaking, so the run is self-evident. With none, only pip's
+  // own not-found warning proves it looked.
+  if (Object.keys(found).length > 0) return { ran: true, packages: found };
+  return { ran: /Package\(s\) not found/i.test(out), packages: found };
 }
 
 async function probeGitRev(

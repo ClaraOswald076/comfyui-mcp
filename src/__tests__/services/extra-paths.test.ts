@@ -766,7 +766,11 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
     const listed = await listExtraPaths();
     expect(listed.path).not.toBe(missing);
     expect(listed.notes.join(" ")).toMatch(/no file exists at that path on this machine/i);
-    expect(listed.notes.join(" ")).toMatch(/NOT the file the live server reads/i);
+    expect(listed.notes.join(" ")).toMatch(/NOT confirmed to be a file the live server reads/i);
+    // The absence is local and current; it does not establish WHY. Both causes are
+    // named and neither is asserted.
+    expect(listed.notes.join(" ")).toMatch(/moved or deleted after it started/i);
+    expect(listed.notes.join(" ")).toMatch(/cannot tell which/i);
     await expect(
       addExtraPath({ category: "loras", path: "E:/loras" }),
     ).rejects.toThrow(/UNRESOLVED/);

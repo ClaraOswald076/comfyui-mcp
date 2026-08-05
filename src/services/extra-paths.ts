@@ -943,8 +943,13 @@ async function resolveTargetPathPreferServer(
         };
       }
       if (local.kind === "absent") {
+        // Absent HERE, now. That is consistent with a container/WSL/other-host server,
+        // and equally with a local server whose flagged YAML was deleted or renamed
+        // after it started (ComfyUI read it at launch and would go on loading its
+        // implicit <root>/extra_model_paths.yaml regardless). Naming one of those as the
+        // cause would be the same fold this change exists to remove.
         return unprovenListFallback(
-          `NOTE: the running ComfyUI reports --extra-model-paths-config "${serverConfig}", but no file exists at that path on this machine, and ${localityGap}. The server's file tree is probably not this one (a container, WSL, or another host behind a loopback port). Showing the local auto-selected config instead; this is a fallback, and it is NOT the file the live server reads. Pass config_path explicitly to inspect a file you can reach.`,
+          `NOTE: the running ComfyUI reports --extra-model-paths-config "${serverConfig}", but no file exists at that path on this machine right now, and ${localityGap}. That is consistent with the server running on a different filesystem (a container, WSL, or another host behind a loopback port) AND with a local server whose config was moved or deleted after it started — this process cannot tell which. Showing the local auto-selected config instead; it is a fallback and is NOT confirmed to be a file the live server reads. Pass config_path explicitly to inspect a file you can reach.`,
         );
       }
       return unprovenListFallback(

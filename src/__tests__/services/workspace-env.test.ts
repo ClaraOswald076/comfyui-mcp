@@ -972,9 +972,16 @@ describe("getEnvironment", () => {
         if (args.includes("--version") && !args.includes("pip")) {
           return { stdout: "Python 3.13.12\n" };
         }
-        // `pip show` prints nothing, but pip ITSELF answers → it really did look.
-        if (args.includes("--version")) return { stdout: "pip 24.0 from …\n" };
-        if (args.includes("show")) return { stdout: "" };
+        // pip's OWN full-miss output, from the SAME invocation. It EXITS 1 and warns on
+        // stderr, so the rejection carries the evidence — a separate later
+        // `pip --version` would prove only that pip can start now, never that this
+        // query ran.
+        if (args.includes("pip")) {
+          return Object.assign(new Error("Command failed: exit 1"), {
+            stdout: "",
+            stderr: "WARNING: Package(s) not found: torch, numpy\n",
+          });
+        }
         return new Error("nope");
       });
 
@@ -1006,6 +1013,69 @@ describe("getEnvironment", () => {
       expect(env.local.packages).toBeUndefined();
       expect(env.local.note).toMatch(/pip did not answer at all/);
       expect(env.local.note).toMatch(/NOT evidence that these packages are missing/);
+      expect(env.local.note).not.toMatch(/pip answered and none of/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the packages pip DID find when other requested ones are missing", async () => {
+    // `pip show a b c` exits 1 whenever ANY name is missing, and KEY_PACKAGES contains
+    // xformers and diffusers — absent on most real machines. The shared `probe()` helper
+    // discards everything on a non-zero exit, so the records pip HAD produced (torch
+    // among them) were thrown away and get_environment reported no packages at all on
+    // installs that plainly had them.
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      statsReachable("3.13.12");
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 15 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") && !args.includes("pip")) {
+          return { stdout: "Python 3.13.12\n" };
+        }
+        if (args.includes("pip")) {
+          return Object.assign(new Error("Command failed: exit 1"), {
+            stdout: "Name: torch\nVersion: 2.9.0\n---\nName: numpy\nVersion: 2.1.0\n",
+            stderr: "WARNING: Package(s) not found: xformers, diffusers\n",
+          });
+        }
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.packages?.torch).toBe("2.9.0");
+      expect(env.local.packages?.numpy).toBe("2.1.0");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not treat a KILLED pip show as a completed no-match", async () => {
+    // The shortcut this replaced: `pip show` dies on the 8s timeout, a follow-up
+    // `pip --version` answers instantly, and the silence of the FIRST query gets
+    // vouched for by the SECOND — reporting "none of these are installed" about a
+    // question that was never answered. Only evidence inside the failed invocation
+    // itself can settle it, and there is none here.
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      statsReachable("3.13.12");
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 14 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version") && !args.includes("pip")) {
+          return { stdout: "Python 3.13.12\n" };
+        }
+        // `pip show` killed by the timeout: no output at all, no warning.
+        if (args.includes("show")) return new Error("Command failed: timed out, SIGTERM");
+        // A LATER `pip --version` would succeed — and must not be consulted.
+        if (args.includes("pip")) return { stdout: "pip 24.0 from …\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.note).toMatch(/pip did not answer at all/);
       expect(env.local.note).not.toMatch(/pip answered and none of/);
     } finally {
       await rm(dir, { recursive: true, force: true });
