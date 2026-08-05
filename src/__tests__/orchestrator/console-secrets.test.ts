@@ -13,7 +13,17 @@ import { rmSync } from "node:fs";
 // shape of "written, but could not be verified".
 const fsState = vi.hoisted(() => ({
   breakSecondReadAfterRename: false,
+  /** Break the FIRST store read after the Nth store rename — the writer's own
+   *  whole-file verification. The rename has landed by then, so this is the "it
+   *  happened but its account could not be taken" case. Keyed to a specific
+   *  rename because a test does its setup writes through the same endpoint, and
+   *  a break armed by a flag alone fires on the setup instead. */
+  breakFirstReadAfterRenameNo: null as number | null,
   readsSinceRename: 0,
+  /** Only count reads once a rename has actually happened — a read taken BEFORE
+   *  the store was ever swapped is not the post-rename verification. */
+  sawRename: false,
+  renames: 0,
   /** Replace what the rename installs, so the store comes back missing keys it
    *  held before — the data-loss case this endpoint used to answer ok:true to. */
   tamperOnRename: null as null | (() => string),
@@ -30,15 +40,22 @@ vi.mock("node:fs", async (importOriginal) => {
       }
     }
     const out = actual.renameSync(from, to);
-    if (isStore(to)) fsState.readsSinceRename = 0;
+    if (isStore(to)) {
+      fsState.readsSinceRename = 0;
+      fsState.sawRename = true;
+      fsState.renames++;
+    }
     return out;
   };
   const readFileSync: typeof actual.readFileSync = ((
     ...args: Parameters<typeof actual.readFileSync>
   ) => {
-    if (fsState.breakSecondReadAfterRename && isStore(args[0])) {
+    const breakFirstNow =
+      fsState.breakFirstReadAfterRenameNo !== null &&
+      fsState.renames === fsState.breakFirstReadAfterRenameNo;
+    if (fsState.sawRename && (fsState.breakSecondReadAfterRename || breakFirstNow) && isStore(args[0])) {
       fsState.readsSinceRename++;
-      if (fsState.readsSinceRename === 2) {
+      if (fsState.readsSinceRename === (breakFirstNow ? 1 : 2)) {
         throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
       }
     }
@@ -57,6 +74,9 @@ const base = () => srv.url;
 describe("console /api/secrets", () => {
   beforeEach(async () => {
     fsState.breakSecondReadAfterRename = false;
+    fsState.breakFirstReadAfterRenameNo = null;
+    fsState.sawRename = false;
+    fsState.renames = 0;
     fsState.readsSinceRename = 0;
     fsState.tamperOnRename = null;
     process.env.COMFYUI_MCP_PANEL_SECRETS = join(tmpdir(), `secrets-${randomUUID()}.json`);
@@ -72,6 +92,9 @@ describe("console /api/secrets", () => {
   afterEach(async () => {
     await srv.stop();
     fsState.breakSecondReadAfterRename = false;
+    fsState.breakFirstReadAfterRenameNo = null;
+    fsState.sawRename = false;
+    fsState.renames = 0;
     fsState.readsSinceRename = 0;
     fsState.tamperOnRename = null;
     delete process.env.COMFYUI_MCP_ENV_FILE;
@@ -175,6 +198,36 @@ describe("console /api/secrets", () => {
     expect(JSON.stringify(body)).not.toContain("rp_key_keep_me_123");
   });
 
+  it("does not answer a revoke CLEAN when its loss account could not be completed", async () => {
+    // A revoke is a store rewrite: it can lose credentials, drop comments, and
+    // fail to be durable, exactly as a save can. This endpoint was reading only
+    // "did anything change", so a removal whose whole-file account was never
+    // taken came back as a clean 200 once the final state read happened to
+    // succeed (codex gate). The obligations now come from the same shared list
+    // the save path uses.
+    await fetch(`${base()}/api/secrets?token=${TOKEN}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ slot: "civitai", value: "civ_key_to_revoke" }),
+    });
+    // Break the writer's own post-rename verification read (read 1 after the
+    // REVOKE's rename, which is store-rename #2 — #1 was the save above): the
+    // removal LANDS, but nothing is established about the rest of the store.
+    fsState.breakFirstReadAfterRenameNo = 2;
+    const r = await fetch(`${base()}/api/secrets?token=${TOKEN}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ slot: "civitai", clear: true }),
+    });
+    fsState.breakFirstReadAfterRenameNo = null;
+    fsState.readsSinceRename = 0;
+    const body = await r.json();
+    // The revoke DID happen, so this is a disclosure, not a refusal...
+    expect(body.cleared).toBe(true);
+    // ...but it must not read as a clean one.
+    expect(Array.isArray(body.warnings)).toBe(true);
+    expect(String(body.warnings.join(" "))).toMatch(/NOT established/);
+    expect(JSON.stringify(body)).not.toContain("civ_key_to_revoke");
+  });
+
   it("clears a set slot with clear:true (issue #203) — removes all alias keys", async () => {
     // set → confirm set → clear → confirm gone
     await fetch(`${base()}/api/secrets?token=${TOKEN}`, {
@@ -228,6 +281,9 @@ describe("console /api/secrets", () => {
     });
     const body = await r.json();
     fsState.breakSecondReadAfterRename = false;
+    fsState.breakFirstReadAfterRenameNo = null;
+    fsState.sawRename = false;
+    fsState.renames = 0;
     fsState.readsSinceRename = 0;
     expect(body.ok).toBe(false);
     expect(r.status).toBe(500);

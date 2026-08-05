@@ -14,8 +14,10 @@ import { getLoraCatalog, loraPreviewsDir } from "../services/lora-catalog.js";
 import {
   setPanelSecret,
   clearPanelSecret,
+  envFilePath as envStorePath,
   listPanelSecretsMasked,
   receiptDisclosures,
+  removeDisclosures,
   slotRevokeState,
   slotSaveConfirmed,
   slotShellProvidedKeys,
@@ -445,6 +447,12 @@ export function startPanelConsoleHttpServer(opts: {
               });
               return;
             }
+            // Everything else the removal owes the caller — an incomplete loss
+            // account, dropped comments, a write that is not crash-durable.
+            // Built from the one shared list, not from this endpoint's own idea
+            // of which fields matter: reading only `changed` is how an
+            // unaccounted-for removal came back as a clean 200 (codex gate).
+            const clearWarnings = removeDisclosures(clearOutcome, envStorePath());
             const state = slotRevokeState(slot);
             if (state === "still-resolves") {
               sendJson(res, 500, {
@@ -469,6 +477,7 @@ export function startPanelConsoleHttpServer(opts: {
                 warning:
                   `"${slot}" no longer applies to this process, but the credential store could not be re-read, so whether it is gone from disk is UNKNOWN. ` +
                   `A tool session that can read the store may still find the old value. Re-check before relying on the revoke.`,
+                ...(clearWarnings.length ? { warnings: clearWarnings } : {}),
               });
               return;
             }
@@ -495,6 +504,7 @@ export function startPanelConsoleHttpServer(opts: {
                       `It no longer applies to the running process, but it returns on the next start — unset it where it is defined to revoke it permanently.`,
                   }
                 : {}),
+              ...(clearWarnings.length ? { warnings: clearWarnings } : {}),
             });
             return;
           }

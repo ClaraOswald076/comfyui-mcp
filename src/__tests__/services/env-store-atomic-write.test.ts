@@ -60,6 +60,16 @@ const fsState = vi.hoisted(() => ({
   failFileFsync: false,
   /** Make the DIRECTORY fsync fail. */
   failDirFsync: false,
+  /** Make removal of the pre-write snapshot fail, the way EPERM/EBUSY does. */
+  failSentinelRemoval: false,
+  /** Simulate another process CREATING the store right after the given
+   *  existsSync answered "no". When the store is absent there is no read to
+   *  hang this off — the absent path never calls readFileSync — so the
+   *  check-then-act pair that has to be tested is the existsSync one. */
+  concurrentCreateAfterExists: null as null | { at: number; run: () => void },
+  storeExists: 0,
+  /** Source paths the pre-write snapshot was linked FROM. */
+  links: [] as string[],
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -141,18 +151,58 @@ vi.mock("node:fs", async (importOriginal) => {
     }
     return actual.fsyncSync(fd);
   };
+  const linkSync: typeof actual.linkSync = (from, to) => {
+    if (isStore(from)) fsState.links.push(String(from));
+    return actual.linkSync(from, to);
+  };
+  const existsSync: typeof actual.existsSync = (path) => {
+    const out = actual.existsSync(path);
+    if (isStore(path)) {
+      fsState.storeExists++;
+      const c = fsState.concurrentCreateAfterExists;
+      if (c && fsState.storeExists === c.at) {
+        fsState.concurrentCreateAfterExists = null;
+        c.run(); // lands AFTER this answer, so the answer is already stale
+      }
+    }
+    return out;
+  };
+  const rmSync: typeof actual.rmSync = (path, options) => {
+    if (fsState.failSentinelRemoval && String(path).includes(".pre-")) {
+      throw Object.assign(new Error("EPERM: operation not permitted, unlink"), { code: "EPERM" });
+    }
+    return actual.rmSync(path, options);
+  };
   return {
     ...actual,
-    default: { ...actual, renameSync, writeFileSync: writeFileSyncSpy, readFileSync, openSync, fsyncSync },
+    default: {
+      ...actual,
+      renameSync,
+      writeFileSync: writeFileSyncSpy,
+      readFileSync,
+      openSync,
+      fsyncSync,
+      rmSync,
+      existsSync,
+      linkSync,
+    },
     renameSync,
     writeFileSync: writeFileSyncSpy,
     readFileSync,
     openSync,
     fsyncSync,
+    rmSync,
+    existsSync,
+    linkSync,
   };
 });
 
-import { setComfyuiSecret, removeComfyuiSecret, setPanelSecret } from "../../services/panel-secrets.js";
+import {
+  migrateSecretsToEnv,
+  removeComfyuiSecret,
+  setComfyuiSecret,
+  setPanelSecret,
+} from "../../services/panel-secrets.js";
 import { parseEnvFile, resetEnvFileProvenanceForTests } from "../../env-file.js";
 
 const KEYS = ["CIVITAI_API_TOKEN", "HF_TOKEN", "HUGGINGFACE_TOKEN", "RUNPOD_API_KEY"];
@@ -177,6 +227,10 @@ beforeEach(() => {
   fsState.failFileFsync = false;
   fsState.failDirFsync = false;
   fsState.failFirstReadAfterRename = false;
+  fsState.failSentinelRemoval = false;
+  fsState.concurrentCreateAfterExists = null;
+  fsState.storeExists = 0;
+  fsState.links = [];
   fsState.readsSinceRename = -1;
   dir = mkdtempSync(join(tmpdir(), "cmcp-atomic-"));
   envPath = join(dir, ".env");
@@ -345,6 +399,67 @@ describe("a save is never CONFIRMED over lost credentials", () => {
     expect(out!.lostKeys).toContain("HF_TOKEN");
   });
 
+  it("ATTEMPTS the pre-write snapshot even when the store looks absent", () => {
+    // When the store did not exist, the snapshot used to be skipped on the
+    // strength of a SEPARATE `existsSync` — a second check-then-act pair sitting
+    // in front of the one the sentinel exists to narrow (codex gate). The link
+    // is attempted unconditionally now, and its ENOENT is itself the
+    // observation, taken at the swap rather than earlier.
+    //
+    // HONEST LIMIT: this makes the absent case symmetric with the present one
+    // and removes a whole extra window, but it does NOT close the residual
+    // link→rename window — nothing in-process can, and that is stated in
+    // `rewriteEnvFile`. What is asserted here is the attempt, which is the part
+    // that actually changed.
+    rmSync(envPath, { force: true });
+    fsState.links = [];
+    setComfyuiSecret("CIVITAI_API_TOKEN", "civ-first");
+    expect(fsState.links).toContain(envPath);
+  });
+
+  it("REPORTS a writer that CREATES the store before the snapshot is taken", () => {
+    rmSync(envPath, { force: true }); // start with NO store at all
+    // existsSync #1 is the writer's own "does it exist?"; #2 is the
+    // compare-and-swap's. The other process creates the file right after #2 —
+    // i.e. inside the window the old code walked straight through.
+    fsState.concurrentCreateAfterExists = {
+      at: 2,
+      run: () => {
+        writeFileSync(envPath, "RUNPOD_API_KEY=rp-from-other-process\n", { mode: 0o600 });
+      },
+    };
+    const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+    expect(parseEnvFile()!.CIVITAI_API_TOKEN).toBe("civ-new");
+    expect(parseEnvFile()!.RUNPOD_API_KEY).toBeUndefined(); // theirs really is gone
+    expect(r.lostKeys).toContain("RUNPOD_API_KEY"); // ...and it is REPORTED
+    expect(r.persisted).toBe("damaged");
+  });
+
+  it("still reports a clean save on a genuinely FIRST write (no prior store)", () => {
+    // The counterpart: when nothing was there and nothing appeared, the account
+    // is complete and the save is confirmed. Without this the fix above could
+    // "pass" by calling every first write damaged.
+    rmSync(envPath, { force: true });
+    const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+    expect(r.persisted).toBe("yes");
+    expect(r.lostKeys).toBeUndefined();
+  });
+
+  it("does not throw when the pre-write snapshot cannot be removed", () => {
+    // The cleanup runs AFTER the rename. An unguarded `rmSync` that throws there
+    // discards the whole disclosure about a store that has already changed —
+    // the exact failure this section exists to prevent (codex gate).
+    writeFileSync(envPath, POPULATED, { mode: 0o600 });
+    fsState.failSentinelRemoval = true;
+    let r: ReturnType<typeof setComfyuiSecret> | undefined;
+    expect(() => {
+      r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+    }).not.toThrow();
+    fsState.failSentinelRemoval = false;
+    expect(r!.persisted).toBe("yes");
+    expect(parseEnvFile()!.RUNPOD_API_KEY).toBe("rp-keep-me");
+  });
+
   it("DISCLOSES rather than throws when the post-rename verification read fails", () => {
     // The rename has ALREADY happened when this read is attempted. Letting the
     // failure propagate turned a completed write into a generic error — which
@@ -395,6 +510,35 @@ describe("a ROLLBACK is a store write too, and reports what it cost", () => {
     expect(outcome.confirmed).toBe(false);
     expect(outcome.lostKeys).toContain("RUNPOD_API_KEY");
     expect(parseEnvFile()!.RUNPOD_API_KEY).toBeUndefined(); // it really is gone
+  });
+});
+
+describe("the boot MIGRATION does not swallow what its write cost", () => {
+  it("LOGS the credentials a migration write destroyed, by name", async () => {
+    // The migration runs at boot, where there is no receipt to hand anything
+    // back on — so it simply discarded the write outcome, then reported the key
+    // as migrated and hydrated it into process.env. A migration that destroyed
+    // another credential therefore looked like a clean start (codex gate).
+    const { logger } = await import("../../utils/logger.js");
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    try {
+      writeFileSync(envPath, "RUNPOD_API_KEY=rp-keep-me\n", { mode: 0o600 });
+      writeFileSync(
+        join(dir, "panel-secrets.json"),
+        JSON.stringify({ comfyuiEnv: { CIVITAI_API_TOKEN: "civ-legacy" } }),
+      );
+      fsState.tamperOnRename = () => "CIVITAI_API_TOKEN=civ-legacy\n"; // RunPod gone
+      const migrated = migrateSecretsToEnv();
+      expect(migrated).toContain("CIVITAI_API_TOKEN");
+      const lines = warn.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(lines).toMatch(/lost RUNPOD_API_KEY/);
+      // Key NAMES only — never a value.
+      expect(lines).not.toContain("civ-legacy");
+      expect(lines).not.toContain("rp-keep-me");
+    } finally {
+      warn.mockRestore();
+      delete process.env.CIVITAI_API_TOKEN;
+    }
   });
 });
 

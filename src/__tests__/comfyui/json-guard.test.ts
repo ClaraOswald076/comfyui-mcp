@@ -535,6 +535,51 @@ describe("the diagnostic body prefix never carries our own credential back", () 
     }
   });
 
+  it("redacts hex and percent reflections in MIXED case, not just all-upper/all-lower", () => {
+    // The case of each hex digit is an INDEPENDENT choice the responder makes,
+    // so enumerating "all upper" and "all lower" leaves every mixed spelling
+    // uncovered — and enumerating them all is 2^n strings (codex gate). These
+    // families are matched by pattern instead, which has no members to miss.
+    // Several percent-escapes, so "some upper, some lower" is genuinely a third
+    // spelling rather than collapsing back onto the all-lower one.
+    const token = "s3cr3t/tok?x=y";
+    authHeaders.value = { "X-API-Key": token };
+    try {
+      const hex = Buffer.from(token, "utf8").toString("hex");
+      // Alternate the case of every hex letter — a spelling no list contains.
+      let flip = false;
+      const mixedHex = [...hex]
+        .map((c) => (/[a-f]/i.test(c) ? ((flip = !flip) ? c.toUpperCase() : c.toLowerCase()) : c))
+        .join("");
+      expect(mixedHex).not.toBe(hex);
+      expect(mixedHex).not.toBe(hex.toUpperCase());
+      expect(mixedHex).not.toBe(hex.toLowerCase());
+
+      const pct = encodeURIComponent(token);
+      // `%2F` -> `%2f`, but only on SOME escapes, so neither all-case form matches.
+      let n = 0;
+      const mixedPct = pct.replace(/%[0-9A-F]{2}/g, (m) => (n++ % 2 === 0 ? m.toLowerCase() : m));
+      const allLowerPct = pct.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase());
+      expect(mixedPct).not.toBe(pct); // not the all-upper spelling
+      expect(mixedPct).not.toBe(allLowerPct); // and not the all-lower one either
+
+      for (const form of [mixedHex, mixedPct]) {
+        const d = classifyNonJson({
+          url: URL_UNDER_TEST,
+          status: 401,
+          contentType: "text/html",
+          // No `token=`/`key=` label, so the keyed-assignment pass cannot cover
+          // for a missing variant: this is the pattern or nothing.
+          body: `<html>upstream said ${form} sorry</html>`,
+        });
+        expect(d.message, form).not.toContain(form);
+        expect(d.bodyPrefix, form).not.toContain(form);
+      }
+    } finally {
+      authHeaders.value = {};
+    }
+  });
+
   it("redacts a HEX reflection, in either case", () => {
     // Hex has the same gap: hex of an 8-char credential is 16 characters, still
     // under the run threshold, and it was not generated at all.
