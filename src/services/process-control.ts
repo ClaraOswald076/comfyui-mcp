@@ -290,12 +290,14 @@ interface StartupReadinessResult {
  * `JSON.stringify`, and it must be impossible to read as the definite negative.
  *
  *   "confirmed"     — the API answered. Observed.
- *   "failed"        — THIS RELAUNCH failed: the process this call launched is GONE
- *                     (a spawn error, a recorded exit, or a liveness probe that came
- *                     back DEFINITELY dead) and no readiness probe got a healthy
- *                     response. It does NOT say the port is unserved — an external
- *                     launcher or supervisor may have restored one since the last
- *                     probe, which is why the message tells the caller to re-check.
+ *   "failed"        — THIS RELAUNCH failed: the process this call launched is GONE —
+ *                     a spawn error, a recorded exit, or a liveness probe that came
+ *                     back DEFINITELY dead. (The spawn-error path can return before
+ *                     the readiness poll has run at all, so this verdict carries no
+ *                     claim about probes; the ones that DID poll say so in their own
+ *                     message.) It does NOT say the port is unserved either — an
+ *                     external launcher or supervisor may have restored one, which
+ *                     is why the message tells the caller to re-check.
  *   "unconfirmed"   — the readiness budget expired with nothing contradicting the
  *                     start.
  *   "not-attempted" — this call never launched or rebooted anything (a refusal, or
@@ -3099,10 +3101,12 @@ async function restartViaManagerReboot(context: {
     note: reboot.note,
   });
 
-  // The reboot HAS been accepted — the server is going down regardless of what
-  // the readiness poll below concludes. Drop the detected dialect now so the
-  // timed-out branch (which returns early) can't leave the pre-reboot dialect
-  // pinned for the instance that eventually comes back (#646).
+  // The reboot HAS been accepted, so the server MAY cycle at any moment from here
+  // — whatever the readiness poll below concludes, and whether or not we ever see
+  // it happen (codex gate round 6: "the server is going down regardless" asserted a
+  // cycle nothing observed). Dropping the detected dialect now is the conservative
+  // move either way: the timed-out branch returns early, and must not leave the
+  // pre-reboot dialect pinned for an instance that may come back different (#646).
   resetManagerApiCache("comfyui reboot fired via Manager");
   // #742 r4/r5: record the dispatch — a later decline-path DOWN report may
   // name restart causation only against such a record. No session identity
@@ -3185,9 +3189,20 @@ async function restartViaManagerReboot(context: {
     ready: true,
     startup: "confirmed",
     readiness,
+    // WHAT THIS PATH ACTUALLY SAW (codex gate round 6): the reboot request was
+    // ACCEPTED, and a later probe found the server healthy. It never watched
+    // ComfyUI go down and come back — this poller has no down→up requirement at
+    // all, unlike the panel path, which certifies only on an observed cycle. So
+    // "rebooted and came back ready" claimed the one thing nobody here observed.
+    //
+    // The distinction is not academic: a Manager that accepts the request and then
+    // does nothing leaves a healthy server that was never restarted, and a user
+    // told it "came back" stops looking for the reason their change did not apply.
     message:
-      `ComfyUI rebooted via ComfyUI-Manager and came back ready (${readiness.waited_ms}ms) — ` +
-      `${context.label}/supervised restart.` +
+      `The ComfyUI-Manager reboot request was accepted and ComfyUI is healthy now ` +
+      `(${readiness.waited_ms}ms) — ${context.label}/supervised restart. The cycle itself ` +
+      `was not directly observed from here, so verify with health_check if you need ` +
+      `certainty that it actually restarted.` +
       argvNote,
     // The supervisor that owns the process cycled it; we launched nothing, so we
     // cannot (and must not) claim the listener as ours.

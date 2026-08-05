@@ -398,23 +398,26 @@ export function normalizeReportedVersion(
   //    to a disk read, and reported the INSTALLED 0.49.6 as the running version.
   //    That is #846 exactly, for the one user whose version needed the most care.
   //
-  //    A SHORT RUN of tokens is examined, not just the first (codex gate round 4):
-  //    `MCP version: 0.48.18` puts the word `version` where the number goes, and
-  //    taking only the adjacent token dropped a perfectly good reading straight
-  //    into the disk-read fallback — #846 again. The run is capped at three so a
-  //    label followed by prose cannot wander into some OTHER component's version
-  //    further along the line.
+  //    ONE named filler word may stand between the label and the number (codex gate
+  //    round 4): `MCP version: 0.48.18` puts `version` where the value goes, and
+  //    taking only the adjacent token dropped a perfectly good reading straight into
+  //    the disk-read fallback — #846 again.
+  //
+  //    It is a NAMED filler and not "scan the next few tokens" (codex gate round 6).
+  //    Scanning walked straight over an indeterminate value into the NEXT
+  //    component's: `comfyui-mcp unknown · panel 0.11.38.` returned the PANEL's
+  //    version as the mcp one. An mcp version that cannot be determined has to stay
+  //    undetermined — that is the whole rule this cluster is about — so anything that
+  //    is neither the filler nor a version stops the search here.
   //
   //    The left boundary keeps `other-mcp 1.2.3` from being read as ours.
   const after = new RegExp(
-    `(?<![A-Za-z0-9-])${label}[\\s:=]+(.{0,64})`,
-    "is",
+    `(?<![A-Za-z0-9-])${label}[\\s:=]+(?:versions?[\\s:=]+)?([^\\s·,;)]+)`,
+    "i",
   ).exec(trimmed);
   if (after) {
-    for (const token of after[1].split(/[\s·,;]+/).slice(0, 3)) {
-      const value = asVersionToken(token);
-      if (value) return value;
-    }
+    const value = asVersionToken(after[1]);
+    if (value) return value;
   }
 
   // 2. LEADING — the caller sent the version itself, possibly with the #846 drift

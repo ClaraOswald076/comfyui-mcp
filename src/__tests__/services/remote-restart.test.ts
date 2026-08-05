@@ -90,7 +90,7 @@ describe("restartComfyUI — remote (Manager reboot)", () => {
     expect(res.stopped).toBe(true);
     expect(res.started).toBe(true);
     expect(res.ready).toBe(true);
-    expect(res.message).toContain("rebooted via ComfyUI-Manager");
+    expect(res.message).toContain("reboot request was accepted");
     expect(hoisted.resetClient).toHaveBeenCalledTimes(1);
     expect(hoisted.resetObjectInfoCache).toHaveBeenCalledTimes(1);
     // The 502 on the canonical POST route counts as "fired" — the legacy GET
