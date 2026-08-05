@@ -69,8 +69,12 @@ Do this every time; don't wait to be asked and don't downgrade it to optional.
 
 - `comfyui-mcp`: find the running install from the stack path. If a source
   checkout exists, fix the `.ts` source and `npm run build`; if only the built
-  package is present, patch the `dist/*.js` directly. Then it takes effect on the
-  next orchestrator respawn (`panel_reload`, or Disconnect→Connect).
+  package is present, patch the `dist/*.js` directly. Then it takes effect on
+  the next respawn that reloads it: `panel_reload` covers the agent and its
+  comfyui tool server, but the long-lived orchestrator process (which serves
+  the `panel_*` tools) only reloads code on a full process restart
+  (Disconnect→Connect does NOT restart it either — say so when the patch is in
+  that process).
 - `comfyui-mcp-panel`: patch the file under the pack (`web/js/…` for UI,
   `__init__.py` for the pack) — UI changes need a hard-refresh.
 

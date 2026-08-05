@@ -1439,6 +1439,34 @@ describe("panel-tools: post-reconnect retry-once (#278/#310/#332/#481)", () => {
     });
   });
 
+  it("panel_reload (orchestrator scope) states that the panel_* tool process was NOT reloaded (#765)", async () => {
+    // #765: an agent that patched orchestrator/service code called panel_reload
+    // and then reported the change as live — but the panel_* tools run inside
+    // the long-lived orchestrator process a soft reload never restarts. The
+    // tool result (the agent's last context before the bounce, and read again
+    // after the resume) must say so.
+    const store = new WorkflowTargetStore();
+    const { bridge } = methodIsHeadlessBridge(["only-live-tab"]);
+    const ctx = makePanelToolCtx(bridge, "orphaned-tab", store);
+    const res = await defByName("panel_reload").handler({}, ctx);
+    expect(res.isError).toBeUndefined();
+    const text = (res.content[0] as { text: string }).text;
+    expect(text).toMatch(/does NOT reload/i);
+    expect(text).toMatch(/orchestrator process must be restarted/);
+  });
+
+  it("panel_reload (frontend scope) does NOT append the orchestrator disclosure", async () => {
+    // A frontend reload leaves the agent process untouched, so the "your agent
+    // restarts fresh" framing would be wrong there.
+    const store = new WorkflowTargetStore();
+    const { bridge } = methodIsHeadlessBridge(["only-live-tab"]);
+    const ctx = makePanelToolCtx(bridge, "orphaned-tab", store);
+    const res = await defByName("panel_reload").handler({ scope: "frontend" }, ctx);
+    expect(res.isError).toBeUndefined();
+    const text = (res.content[0] as { text: string }).text;
+    expect(text).not.toMatch(/does NOT reload/i);
+  });
+
   it("panel_set_workflow_target recovery filters isHeadless bound, not detached (#478 sibling site)", async () => {
     const store = new WorkflowTargetStore();
     // Dead session + 2 ambiguous live non-headless tabs → rebindToActiveTab throws, and
