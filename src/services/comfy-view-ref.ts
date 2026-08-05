@@ -256,9 +256,34 @@ export async function resolveServableViewRef(
         );
       }
       if (!isStrictlyInside(file.path, realRoot.path)) continue;
+      // A MATCH made against a path we could not canonicalise is not a proven
+      // match (independent gate P0). `inconclusive` was consulted only on the
+      // matched-nothing path below, so a lexical fallback that happened to land
+      // under a root returned `servable` and forwarded a /view reference nobody
+      // had verified — a 404, or a different file, presented as servable.
+      //
+      // The doubt is tested against THIS pair rather than the whole run: a
+      // failure canonicalising some OTHER root says nothing about the one that
+      // matched, and refusing on it would be the same fold pointed the other way.
+      // An ENOENT root is excluded for the reason given above — a directory that
+      // does not exist cannot contain anything, so failing to canonicalise it
+      // carries no uncertainty.
+      const rootUnproven = !realRoot.resolved && realRoot.code !== "ENOENT";
+      if (!file.resolved || rootUnproven) {
+        return {
+          status: "unknown",
+          reason:
+            `it looks like it is under ComfyUI's ${root.kind} directory, but ` +
+            `${
+              !file.resolved
+                ? `the file's real location could not be resolved (${file.why ?? "unknown error"})`
+                : `that directory could not be canonicalised (${realRoot.why ?? "unknown error"})`
+            } — so the match was made against an unverified path and whether ComfyUI can serve it is undetermined`,
+        };
+      }
       // Derived from the same pair the containment test just passed, so the
       // relative path is exactly the one ComfyUI joins onto its own configured
-      // root — whether that pair was canonical or lexical.
+      // root — and both sides of that pair are now proven canonical.
       const rel = relative(realRoot.path, file.path);
       const filename = basename(rel);
       const parent = dirname(rel);

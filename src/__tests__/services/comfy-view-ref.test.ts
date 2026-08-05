@@ -217,6 +217,45 @@ describe("resolveServableViewRef — a failed canonicalisation is a doubt, not a
     expect(res.reason).toContain("real location could not be resolved");
   });
 
+  // The two cases above both use a file lexically OUTSIDE every root, so they
+  // exercise only the matched-NOTHING path — where the doubt was already being
+  // consulted. They passed identically while a lexical fallback that landed
+  // UNDER a root still returned `servable` without ever looking at the doubt
+  // (independent gate P0). These two put the lexical path INSIDE the candidate
+  // root, which is the only shape that reaches the match.
+
+  it("does NOT claim servable when the FILE's realpath failed but its lexical path is UNDER a root", async () => {
+    const target = touch(join(outDir, "takes", "clip.mp4"));
+    state.realpathFail.set(resolve(target), "ELOOP");
+    const res = await resolveServableViewRef(target);
+    // A /view reference derived from an unverified path is a 404, or a different
+    // file, presented to the caller as servable.
+    expect(res.status).toBe("unknown");
+    if (res.status !== "unknown") return;
+    expect(res.reason).toContain("unverified path");
+    expect(res.reason).toContain("real location could not be resolved");
+  });
+
+  it("does NOT claim servable when the matching ROOT could not be canonicalised", async () => {
+    const target = touch(join(outDir, "takes", "clip2.mp4"));
+    state.realpathFail.set(resolve(outDir), "EACCES");
+    const res = await resolveServableViewRef(target);
+    expect(res.status).toBe("unknown");
+    if (res.status !== "unknown") return;
+    expect(res.reason).toContain("unverified path");
+    expect(res.reason).toContain("could not be canonicalised");
+  });
+
+  it("STILL serves a file under a root when both sides canonicalise — the doubt is tied to the matching pair", async () => {
+    // Discrimination in the other direction: a failure canonicalising an
+    // UNRELATED root says nothing about the one that matched, and refusing on it
+    // would be the same fold pointed the other way.
+    const target = touch(join(outDir, "takes", "clip3.mp4"));
+    state.realpathFail.set(resolve(inDir), "EACCES");
+    const res = await resolveServableViewRef(target);
+    expect(res.status).toBe("servable");
+  });
+
   it("reports UNKNOWN when a ROOT could not be canonicalised for a reason other than absence", async () => {
     state.realpathFail.set(resolve(outDir), "EACCES");
     const res = await resolveServableViewRef(touch(join(root, "elsewhere", "b.mp4")));
