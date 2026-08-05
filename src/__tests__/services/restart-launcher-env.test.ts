@@ -757,7 +757,10 @@ describe("restart_comfyui — irreproducible launcher environments (#776)", () =
     usePinokio();
     mockLivePortThenFree();
 
-    await expect(preflightLocalRestart()).resolves.toEqual({ ok: true });
+    // toMatchObject, not toEqual: the preflight also reports the launch arguments
+    // it OBSERVED (#848) so the caller can compare them after the reboot. What this
+    // test is about is the verdict.
+    await expect(preflightLocalRestart()).resolves.toMatchObject({ ok: true });
   });
 
   it("does NOT refuse from start_comfyui when the server is ALREADY down — it launches and warns", async () => {
@@ -2372,11 +2375,55 @@ n127.0.0.1:8188
     killSpy.mockRestore();
   });
 
-  it("reports the TRUTH when the relaunch never comes back (stopped, not started)", async () => {
+  it("reports the TRUTH when the relaunch has not answered YET (#367: stopped, dispatched, unconfirmed)", async () => {
     usePlainInstall();
     mockLivePortThenFree();
     spawnCapturingChildren();
-    // The process is spawned but the API never answers — the server is DOWN.
+    // The process is spawned and STILL ALIVE, but the API has not answered inside
+    // the budget. This test used to assert "stopped but could not be started",
+    // which is the #367 defect itself: the relaunched process is right there, and
+    // in the reported case it answered about two seconds after the deadline.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("ECONNREFUSED");
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(true);
+    expect(result.ready).toBe(false);
+    expect(result.startup).toBe("unconfirmed");
+    // NEITHER definite verdict may be printed. Both of these have been the wording
+    // at some point, and each is a lie in the opposite direction.
+    expect(result.message).not.toMatch(/could not be started/i);
+    expect(result.message).not.toMatch(/restarted successfully/i);
+    expect(result.message).toMatch(/NOT CONFIRMED YET/);
+    expect(result.message).toMatch(/not known to have failed/i);
+    // The environment it was launched into is still named, so a slow start that
+    // turns out to be a broken one is debuggable from this same report.
+    expect(result.launch_env?.source).toBe("inherited");
+
+    killSpy.mockRestore();
+  });
+
+  it("reports the TRUTH when the relaunched process DIED (stopped, not started)", async () => {
+    // The definite negative, and the evidence that licenses it: we watched the
+    // process we launched exit. #776's truthful DOWN report is unchanged here.
+    usePlainInstall();
+    mockLivePortThenFree();
+    // The relaunched child aborts during import the instant it is spawned — the
+    // #776 shape. Wired at the spawn site rather than raced from the test, so the
+    // exit is guaranteed to land before the readiness poll concludes: a mutant that
+    // survives only because a timer won a race is not a caught mutant.
+    mockSpawn.mockImplementation(() => {
+      const child = new FakeChild();
+      child.pid = 4321;
+      queueMicrotask(() => child.emit("exit", 1, null));
+      return child;
+    });
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => {
@@ -2390,9 +2437,11 @@ n127.0.0.1:8188
     expect(result.stopped).toBe(true);
     expect(result.started).toBe(false);
     expect(result.ready).toBe(false);
+    expect(result.startup).toBe("failed");
     expect(result.message).toMatch(/stopped but could not be started/i);
-    expect(result.message).not.toMatch(/restarted successfully/i);
-    // The environment it was launched into is named, so the failure is debuggable.
+    expect(result.message).toMatch(/ComfyUI is DOWN/);
+    // A real failure must NOT be softened into "it may still be coming up".
+    expect(result.message).not.toMatch(/NOT CONFIRMED YET/);
     expect(result.launch_env?.source).toBe("inherited");
 
     killSpy.mockRestore();

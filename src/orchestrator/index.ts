@@ -1457,7 +1457,22 @@ export async function runPanelOrchestrator(): Promise<void> {
   // reports are version-pinned without the agent digging. mcp version is a local
   // fact; panel version is learned from the panel's `hello` frame (below) and, on
   // first sight, triggers an env refresh so the block picks it up.
-  const mcpVersion = detectInstallMode().currentVersion ?? undefined;
+  // WHICH MOMENT EACH OF THESE DESCRIBES (#846).
+  //
+  // This one is read ONCE, on purpose: a running Node process cannot hot-swap its
+  // own code, so the package.json beside the dist/ we were loaded from names the
+  // build that is executing, and it stays true for the life of this process. It is
+  // the version a bug filed from this session must be pinned to.
+  //
+  // What was wrong was not the caching — it was that this was the ONLY reading, so
+  // a value captured at startup was rendered as the current state of the machine.
+  // An in-place upgrade moves the on-disk package while this process keeps running
+  // the old one; the ENV line then reported a version that had passed, triage
+  // version-matched against the wrong build, and the line offered no way to notice.
+  // So the installed version is re-read on EVERY refresh below and the difference
+  // is disclosed. Re-reading it into THIS constant instead would have been the
+  // mirror-image lie: claiming to be a build we are not running.
+  const mcpVersionRunning = detectInstallMode().currentVersion ?? undefined;
   let latestPanelVersion: string | undefined;
   let panelSystemAppend = resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND);
   // Set once the manager exists so a later refresh (after a ComfyUI restart) feeds
@@ -1475,7 +1490,10 @@ export async function runPanelOrchestrator(): Promise<void> {
   async function refreshEnvCapabilities(): Promise<void> {
     const gen = ++envRefreshGen;
     try {
-      const caps = await gatherEnvCapabilities({ comfyuiUrl, comfyuiPath, backendId, mcpVersion, panelVersion: latestPanelVersion });
+      // The INSTALLED version is re-read inside gatherEnvCapabilities on every
+      // refresh (#846) — it is a machine fact that can move while we run, so it is
+      // probed there rather than captured here beside the constant below.
+      const caps = await gatherEnvCapabilities({ comfyuiUrl, comfyuiPath, backendId, mcpVersion: mcpVersionRunning, panelVersion: latestPanelVersion });
       if (gen !== envRefreshGen) return; // a newer refresh superseded us — drop this stale result
       envCaps = caps;
       panelSystemAppend = buildPanelSystemAppend(resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND), envCaps);
