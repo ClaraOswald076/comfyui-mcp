@@ -246,12 +246,29 @@ describe("resolveServableViewRef — a failed canonicalisation is a doubt, not a
     expect(res.reason).toContain("could not be canonicalised");
   });
 
-  it("STILL serves a file under a root when both sides canonicalise — the doubt is tied to the matching pair", async () => {
-    // Discrimination in the other direction: a failure canonicalising an
-    // UNRELATED root says nothing about the one that matched, and refusing on it
-    // would be the same fold pointed the other way.
-    const target = touch(join(outDir, "takes", "clip3.mp4"));
-    state.realpathFail.set(resolve(inDir), "EACCES");
+  it("does NOT claim servable when the matching ROOT is ENOENT — absence only settles the NON-match", async () => {
+    // The ENOENT carve-out is sound in the negative direction: a directory that
+    // does not exist cannot contain the file. It is not sound here, past a
+    // containment test that passed against the root's lexical fallback — a
+    // concurrent agent renaming the directory between our stat and our realpath
+    // would otherwise yield a /view ref for a root that is no longer there.
+    const target = touch(join(outDir, "takes", "gone.mp4"));
+    state.realpathFail.set(resolve(outDir), "ENOENT");
+    const res = await resolveServableViewRef(target);
+    expect(res.status).toBe("unknown");
+  });
+
+  it("STILL serves a file under a root when an UNRELATED root failed — the doubt is tied to the matching pair", async () => {
+    // Discrimination in the other direction: a failure canonicalising a root the
+    // file is not under says nothing about the one that matched, and refusing on
+    // it would be the same fold pointed the other way — an over-strict check
+    // refusing something real. The target is under `inDir` and the FAILING root
+    // is `outDir`, which is visited FIRST: an earlier draft had these swapped, so
+    // the resolver matched and returned before ever touching the failing root and
+    // the test proved nothing. This ordering is what makes it fail against a
+    // whole-`inconclusive` check at the match point.
+    const target = touch(join(inDir, "clip3.mp4"));
+    state.realpathFail.set(resolve(outDir), "EACCES");
     const res = await resolveServableViewRef(target);
     expect(res.status).toBe("servable");
   });

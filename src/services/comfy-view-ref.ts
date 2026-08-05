@@ -265,10 +265,14 @@ export async function resolveServableViewRef(
       // The doubt is tested against THIS pair rather than the whole run: a
       // failure canonicalising some OTHER root says nothing about the one that
       // matched, and refusing on it would be the same fold pointed the other way.
-      // An ENOENT root is excluded for the reason given above — a directory that
-      // does not exist cannot contain anything, so failing to canonicalise it
-      // carries no uncertainty.
-      const rootUnproven = !realRoot.resolved && realRoot.code !== "ENOENT";
+      // ENOENT is NOT carved out here, unlike on the non-match path below. That
+      // exclusion is sound only in the negative direction: an absent directory
+      // cannot contain the file, so it adds no doubt to an "outside" answer. This
+      // line is reached only AFTER containment passed against the root's lexical
+      // fallback, and there an ENOENT root is load-bearing — a concurrent agent
+      // renaming the directory between our stat and our realpath would hand back
+      // a /view ref for a root that is no longer there.
+      const rootUnproven = !realRoot.resolved;
       if (!file.resolved || rootUnproven) {
         return {
           status: "unknown",
