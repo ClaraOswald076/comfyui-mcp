@@ -471,6 +471,7 @@ export function removeDisclosures(outcome: SecretRemoveOutcome, path: string): s
       `⚠️ The removal was not made crash-durable: ${outcome.durabilityGap}. If the machine loses power, the credential may come back.`,
     );
   }
+  if (outcome.resurrectionRisk) out.push(`🛑 ${outcome.resurrectionRisk}`);
   return out;
 }
 
@@ -748,6 +749,31 @@ function errCode(err: unknown): string {
 }
 
 /**
+ * Write EVERY byte, or throw before anything is renamed.
+ *
+ * `writeSync` is allowed to write fewer bytes than it was given, and both
+ * writers took its word for it: a short write followed by an fsync makes a
+ * TRUNCATED temp file durable, and the rename then installs it over the store —
+ * the exact whole-file truncation this atomic write exists to prevent, arriving
+ * by the one route nobody was checking (codex gate). Loop until the buffer is
+ * out, and refuse to progress if it ever stops making progress; both happen
+ * BEFORE the rename, so the store is untouched and refusing is correct.
+ */
+function writeAllSync(fd: number, body: string): void {
+  const buf = Buffer.from(body, "utf8");
+  let written = 0;
+  while (written < buf.length) {
+    const n = writeSync(fd, buf, written, buf.length - written);
+    if (n <= 0) {
+      throw new Error(
+        `Could not write the credential store: the filesystem accepted ${written} of ${buf.length} bytes and then stopped. Nothing was written — the store is unchanged.`,
+      );
+    }
+    written += n;
+  }
+}
+
+/**
  * Flush the DIRECTORY so a rename that happened is still there after a power
  * loss. `fsync` on the file makes its CONTENT durable; it says nothing about the
  * directory entry that now points at it, and a rename whose directory was never
@@ -884,7 +910,7 @@ function rewriteEnvFile(
     let durabilityGap: string | null = null;
     try {
       fd = openSync(tmp, "wx", 0o600);
-      writeSync(fd, body);
+      writeAllSync(fd, body);
       // Flush to the device before the rename: a rename that lands while the
       // bytes are still in the page cache can leave an empty file after a power
       // loss, which is the truncation this whole change exists to prevent.
@@ -1170,7 +1196,7 @@ function writeFileAtomic(target: string, body: string): string | null {
   let durabilityGap: string | null = null;
   try {
     fd = openSync(tmp, "wx", 0o600);
-    writeSync(fd, body);
+    writeAllSync(fd, body);
     try {
       fsyncSync(fd);
     } catch (err) {
@@ -1396,6 +1422,10 @@ export interface SecretRemoveOutcome {
   /** Present when the removal LANDED but was not established to survive a power
    *  loss. */
   durabilityGap?: string;
+  /** The canonical store no longer carries the key, but the LEGACY json store
+   *  could not be purged — so the boot migration puts it back. A revoke that
+   *  returns on the next start is not a revoke, and the caller must say so. */
+  resurrectionRisk?: string;
 }
 
 /** Canonical remover: drop a token from .env + process.env + emit. Also PURGES
@@ -1414,15 +1444,30 @@ export function removeEnvSecret(key: string): SecretRemoveOutcome {
   const envDeleted = process.env[key] !== undefined;
   if (envDeleted) delete process.env[key];
   // Purge the legacy JSON maps so a revoked key can't resurrect via migration.
-  const s = read();
+  // This runs AFTER the .env removal has already landed, so it must not throw:
+  // the revoke has happened, and a throw here made the console answer a generic
+  // failure with no `cleared` and no "do not retry" — turning a completed
+  // destructive operation back into a refusal (codex gate). A purge that failed
+  // is a DISCLOSURE, and a specific one: the key comes back on the next start.
   let purgedJson = false;
-  for (const map of [s.comfyuiEnv, s.agentEnv]) {
-    if (map && Object.prototype.hasOwnProperty.call(map, key)) {
-      delete map[key];
-      purgedJson = true;
+  let resurrectionRisk: string | undefined;
+  try {
+    const s = read();
+    for (const map of [s.comfyuiEnv, s.agentEnv]) {
+      if (map && Object.prototype.hasOwnProperty.call(map, key)) {
+        delete map[key];
+        purgedJson = true;
+      }
     }
+    if (purgedJson) write(s);
+  } catch (err) {
+    purgedJson = false;
+    resurrectionRisk =
+      `"${key}" was removed from ${envFilePath()}, but the legacy store ${panelSecretsPath()} could not be purged (${errCode(err)}). ` +
+      `It still holds an entry for this key, and the boot migration re-adds any legacy key the canonical store does not provide — so this credential COMES BACK on the next start. ` +
+      `Remove it from that file by hand to revoke it permanently.`;
+    logger.warn(`[panel-secrets] ${resurrectionRisk}`);
   }
-  if (purgedJson) write(s);
   const changed = removed || purgedJson || envDeleted;
   if (changed) {
     if (isAllowedComfyuiSecretKey(key)) emitComfyuiChange({}); // comfyui-only restart (#269)
@@ -1440,6 +1485,7 @@ export function removeEnvSecret(key: string): SecretRemoveOutcome {
         }
       : {}),
     ...(outcome.durabilityGap ? { durabilityGap: outcome.durabilityGap } : {}),
+    ...(resurrectionRisk ? { resurrectionRisk } : {}),
   };
 }
 
@@ -1810,6 +1856,10 @@ export interface SlotSaveOutcome {
    *  carries lost keys has `persisted: "damaged"`, and `confirmed` is derived
    *  from `persisted === "yes"`. */
   lostKeys: string[];
+  /** Everything the ROLLBACK's own writes owe the caller — dropped comments, a
+   *  durability gap, an account it could not complete. A rollback is a store
+   *  write the user never asked for; what it cost is theirs to know. */
+  restoreWarnings?: string[];
 }
 
 /**
@@ -1847,6 +1897,8 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
   let unverifiedKeys: string[] = [];
   /** Credentials the ROLLBACK's own writes cost, on top of the fan-out's. */
   const restoreLostKeys = new Set<string>();
+  /** Everything else the rollback's writes owe the caller. */
+  const restoreWarnings: string[] = [];
   /** Aggregated once, here, so no consumer of a slot save has to reach into the
    *  receipts to learn that the store lost credentials. */
   const lostKeysOf = (rs: SecretSaveReceipt[]) => [
@@ -1909,7 +1961,7 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
       // the in-process copy when the store is unreadable and would therefore
       // "confirm" a restore that never reached disk.
       for (const { key, previous, wasShellProvided } of before) {
-        const { state, lostKeys } = restoreEnvKey(key, previous, wasShellProvided);
+        const { state, lostKeys, disclosures } = restoreEnvKey(key, previous, wasShellProvided);
         if (state === "stranded") strandedKeys.push(key);
         else if (state === "unverified") unverifiedKeys.push(key);
         // A ROLLBACK is a store write like any other, so it can lose credentials
@@ -1917,6 +1969,7 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
         // already a failure would hide the worse half of what happened. Same
         // rule, same place, no second mechanism.
         for (const k of lostKeys) restoreLostKeys.add(k);
+        restoreWarnings.push(...disclosures);
       }
       return {
         slot: slotId,
@@ -1926,6 +1979,7 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
         strandedKeys,
         unverifiedKeys,
         lostKeys: [...new Set([...lostKeysOf(receipts), ...restoreLostKeys])],
+        ...(restoreWarnings.length ? { restoreWarnings } : {}),
       };
     },
     (result) => {
@@ -1946,12 +2000,30 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
     },
   );
   if (thrown) {
-    if (strandedKeys.length || unverifiedKeys.length) {
-      const mixed = [...strandedKeys, ...unverifiedKeys];
+    // The rethrow is a refusal — correct, because the value the caller supplied
+    // is not in place. But the ROLLBACK on the way out is a store write, and
+    // what it cost must not be swallowed by that refusal: `restoreLostKeys` was
+    // collected and then discarded here, so a rollback that destroyed another
+    // credential vanished behind the original validation error (codex gate).
+    const damageOnTheWayOut = [
+      ...(restoreLostKeys.size
+        ? [
+            `🛑 Rolling the slot back also lost ${[...restoreLostKeys].join(", ")} from ${envFilePath()} — ` +
+              `restore that file before relying on anything in it.`,
+          ]
+        : []),
+      ...restoreWarnings,
+    ];
+    const mixed = [...strandedKeys, ...unverifiedKeys];
+    if (mixed.length || damageOnTheWayOut.length) {
       throw new Error(
         `${thrown instanceof Error ? thrown.message : String(thrown)} ` +
-          `Restoring the slot could not be confirmed for ${mixed.join(", ")}, so it may be in a MIXED state. ` +
-          `Set "${slotId}" again, or clear it, before relying on it.`,
+          `${damageOnTheWayOut.length ? `${damageOnTheWayOut.join(" ")} ` : ""}` +
+          `${
+            mixed.length
+              ? `Restoring the slot could not be confirmed for ${mixed.join(", ")}, so it may be in a MIXED state. Set "${slotId}" again, or clear it, before relying on it.`
+              : `The slot itself was restored.`
+          }`,
       );
     }
     throw thrown;
@@ -1975,12 +2047,18 @@ function restoreEnvKey(
   key: string,
   previous: string | undefined,
   wasShellProvided: boolean,
-): { state: "restored" | "stranded" | "unverified"; lostKeys: string[] } {
+): { state: "restored" | "stranded" | "unverified"; lostKeys: string[]; disclosures: string[] } {
   const lostKeys = new Set<string>();
+  // EVERYTHING the rollback's own writes owe the caller — not just lost keys.
+  // A rollback that dropped comments, could not be made durable, or could not
+  // complete its loss account is the user's data affected by an operation they
+  // never asked for, and it was being discarded (codex gate).
+  const disclosures: string[] = [];
   const done = (state: "restored" | "stranded" | "unverified") => ({
     state,
     // A key this restore is itself putting back is not collateral.
     lostKeys: [...lostKeys].filter((k) => k !== key),
+    disclosures,
   });
   // Already as it was? Then this call never changed it — rewriting would be a
   // pointless write that can itself fail and manufacture a "stranded" verdict
@@ -2006,14 +2084,30 @@ function restoreEnvKey(
     if (wasShellProvided) {
       // The value belongs to the ENVIRONMENT, not to the store: drop whatever we
       // wrote and hand precedence back, rather than persisting a shell secret.
-      for (const k of removeEnvFileKey(key).lostKeys) lostKeys.add(k);
+      const out = removeEnvFileKey(key);
+      for (const k of out.lostKeys) lostKeys.add(k);
+      if (out.lossCheck === "unknown" && out.lossCheckNote) {
+        disclosures.push(`⚠️ Rolling "${key}" back: ${out.lossCheckNote}.`);
+      }
+      if (out.durabilityGap) {
+        disclosures.push(`⚠️ Rolling "${key}" back was not made crash-durable: ${out.durabilityGap}.`);
+      }
+      if (out.lostCommentLines > 0) {
+        disclosures.push(
+          `⚠️ Rolling "${key}" back cost ${out.lostCommentLines} comment line${out.lostCommentLines > 1 ? "s" : ""} in the store.`,
+        );
+      }
       if (previous === undefined) delete process.env[key];
       else process.env[key] = previous;
       unmarkFileDerived(key);
     } else if (previous === undefined) {
-      for (const k of removeEnvSecret(key).lostKeys) lostKeys.add(k);
+      const out = removeEnvSecret(key);
+      for (const k of out.lostKeys) lostKeys.add(k);
+      disclosures.push(...removeDisclosures(out, envFilePath()).map((d) => `Rolling "${key}" back: ${d}`));
     } else {
-      for (const k of setEnvSecret(key, previous).lostKeys ?? []) lostKeys.add(k);
+      const receipt = setEnvSecret(key, previous);
+      for (const k of receipt.lostKeys ?? []) lostKeys.add(k);
+      disclosures.push(...receiptDisclosures(receipt).map((d) => `Rolling "${key}" back: ${d}`));
     }
   } catch {
     return done("stranded");
@@ -2057,10 +2151,12 @@ export function clearPanelSecret(slotId: string): SecretRemoveOutcome {
   const lostKeys = new Set<string>();
   let lostCommentLines = 0;
   const uncertainties: string[] = [];
+  const resurrectionRisks: string[] = [];
   let durabilityGap: string | undefined;
   for (const key of slot.envKeys) {
     const out = remove(key);
     changed = out.changed || changed;
+    if (out.resurrectionRisk) resurrectionRisks.push(out.resurrectionRisk);
     // A key this fan-out itself removes is not collateral — the aliases of one
     // slot are all being cleared on purpose.
     for (const k of out.lostKeys) if (!slot.envKeys.includes(k)) lostKeys.add(k);
@@ -2074,6 +2170,7 @@ export function clearPanelSecret(slotId: string): SecretRemoveOutcome {
     lostCommentLines,
     ...(uncertainties.length ? { uncertainty: uncertainties.join(" ") } : {}),
     ...(durabilityGap ? { durabilityGap } : {}),
+    ...(resurrectionRisks.length ? { resurrectionRisk: resurrectionRisks.join(" ") } : {}),
   };
 }
 
