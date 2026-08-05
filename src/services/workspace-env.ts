@@ -158,19 +158,17 @@ export function resolveEffectiveComfyUIBase(): string | undefined {
  * The install root a LOCAL, DESTRUCTIVE operation may act on — or the reason it
  * must not act at all.
  *
- * `resolveEffectiveComfyUIBase()` returns `config.comfyuiPath` BEFORE it consults
- * remote mode, so with `--comfyui-url` set against a remote server and a stale
- * local `COMFYUI_PATH`, it hands back a local install that has nothing to do with
- * the server the session is talking to. Reading is survivable there; DELETING is
- * not — the Manager pre/post checks address the remote instance while the file
- * operations land on an unrelated local tree (#490, reopened).
+ * This began as a workaround for #490: `resolveEffectiveComfyUIBase()` used to
+ * return `config.comfyuiPath` BEFORE consulting remote mode, so with
+ * `--comfyui-url` and a stale local `COMFYUI_PATH` it handed back an install with
+ * nothing to do with the connected server. Reading through that is survivable;
+ * DELETING through it is not.
  *
- * Fixing that resolver is a separate change: it has twelve callers and at least
- * one (`comfy-cli.ts`) reads `config.comfyuiPath ?? resolveEffectiveComfyUIBase()`
- * in a way that suggests it depends on today's behaviour. So this does not fix
- * it — it REFUSES on top of it. An honest "I cannot tell which install this would
- * modify" beats modifying the wrong one, and refusing is the right shape here
- * because nothing has happened yet.
+ * That resolver is now fixed (it checks remote mode first), so this is no longer
+ * the only thing standing between a destructive path and the wrong tree. It stays
+ * because it answers a question `undefined` cannot: WHY there is no target. A
+ * caller that must refuse needs to tell the user whether the install is missing or
+ * merely unreachable from here, and those have different remedies.
  */
 export function resolveLocalMutationTarget():
   | { base: string; refusal?: undefined }

@@ -1726,9 +1726,15 @@ describe("resolveLocalMutationTarget — refuses what it cannot identify", () =>
     h.remoteMode.value = true;
     h.mockConfig.comfyuiPath = "/stale/local/ComfyUI";
 
-    // The bug, pinned: the shared resolver still hands back the stale local path.
-    expect(resolveEffectiveComfyUIBase()).toBe("/stale/local/ComfyUI");
-    // …and the mutation target refuses it, naming why.
+    // #490 IS NOW FIXED (by #835): the shared resolver checks remote mode before
+    // it returns `config.comfyuiPath`, so it no longer hands back a local install
+    // that has nothing to do with the connected server. This assertion used to
+    // pin the bug — it was written to start failing on the day the resolver was
+    // repaired, and it did exactly that on the rebase.
+    expect(resolveEffectiveComfyUIBase()).toBeUndefined();
+    // The mutation target still refuses, and still names why. Now defence in
+    // depth rather than the only defence: a destructive path must be able to say
+    // WHY it will not act, which an `undefined` cannot.
     const target = resolveLocalMutationTarget();
     expect(target.base).toBeUndefined();
     expect(target.refusal).toMatch(/REMOTE ComfyUI/i);
