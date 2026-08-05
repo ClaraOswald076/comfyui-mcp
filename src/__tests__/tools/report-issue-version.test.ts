@@ -65,13 +65,31 @@ describe("normalizeReportedVersion (#846)", () => {
     expect(mcp("comfyui-mcp 0.49.6 · panel 0.11.38")).toBe("0.49.6");
   });
 
-  it("preserves a compact non-semver version instead of swapping in a disk read", () => {
-    // A real running version need not be semver. Discarding it would send the caller
-    // to detectMcpVersion(), i.e. the INSTALLED number — the same version-swap in a
-    // different disguise.
+  it("preserves a non-semver running version — LABELLED as well as bare (#846)", () => {
+    // A real running version need not be semver, and requiring semver AFTER the label
+    // was a third way of getting #846 wrong: `comfyui-mcp nightly (…RUNNING nightly;
+    // 0.49.6 is now installed…)` matched nothing, fell through to a disk read, and
+    // reported the INSTALLED 0.49.6 as the running version — for exactly the user
+    // whose version needed the most care (codex gate round 3).
     expect(mcp("nightly")).toBe("nightly");
     expect(mcp("  dev  ")).toBe("dev");
     expect(panel("nightly")).toBe("nightly");
+    expect(
+      mcp(
+        "comfyui-mcp nightly (this process is RUNNING nightly; 0.49.6 is now installed on disk" +
+          " — restart the orchestrator to load it, and report bugs against the RUNNING version)",
+      ),
+    ).toBe("nightly");
+    expect(mcp("comfyui-mcp 2026.08.04")).toBe("2026.08.04");
+  });
+
+  it("strips the sentence-ending punctuation the ENV line leaves on the last token", () => {
+    // The line ends in a full stop, so the LAST component's version arrives as
+    // `0.11.38.` — which passes every shape test and then fails the worker's exact
+    // version match with a dot glued on.
+    expect(panel(ENV_LINE)).toBe("0.11.38");
+    expect(panel("panel 0.11.38.")).toBe("0.11.38");
+    expect(mcp("comfyui-mcp 0.49.6, panel 0.11.38")).toBe("0.49.6");
   });
 
   it("discards prose, so the caller detects a version instead of reporting a sentence", () => {
@@ -82,5 +100,11 @@ describe("normalizeReportedVersion (#846)", () => {
     expect(mcp(0.49 as unknown as string)).toBeUndefined();
     // A key=value fragment for some OTHER key is not our version either.
     expect(mcp("torch=2.7.1")).toBeUndefined();
+    // Words that STAND WHERE a version was expected are not versions. Forwarding
+    // them would hand the worker something unmatchable while looking confident;
+    // falling through to detection is right precisely when the agent had nothing.
+    expect(mcp("unknown")).toBeUndefined();
+    expect(mcp("comfyui-mcp unknown")).toBeUndefined();
+    expect(mcp("comfyui-mcp is broken")).toBeUndefined();
   });
 });

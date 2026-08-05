@@ -178,7 +178,11 @@ describe("panel_restart_comfyui recovery after an ACCEPTED reboot (coordinator p
     expect(String(out.note)).toContain("launch arguments are UNCHANGED");
     // Exactly what equal argv establishes, with the remedy offered CONDITIONALLY —
     // we never read the user's saved settings, so we cannot say they were ignored.
-    expect(String(out.note)).toContain("this restart did not change them");
+    expect(String(out.note)).toContain(
+      "the same arguments were observed before and after",
+    );
+    // Not a causal claim about the restart — see desktop-restart.test.ts.
+    expect(String(out.note)).not.toMatch(/this restart did not change/i);
     expect(String(out.note)).toContain("If you were expecting different arguments");
     expect(String(out.note)).toMatch(/fully quit the ComfyUI Desktop app/i);
   });

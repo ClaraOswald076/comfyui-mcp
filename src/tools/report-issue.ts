@@ -339,6 +339,47 @@ export const PANEL_VERSION_LABEL = String.raw`(?:comfyui-mcp-panel|panel)`;
  * Reading the label is the only rule that survives the input the tool actually asks
  * for.
  */
+/** Release channels that are legitimate version values without carrying a digit. */
+const CHANNEL_TAGS = new Set([
+  "nightly",
+  "dev",
+  "development",
+  "edge",
+  "canary",
+  "beta",
+  "alpha",
+  "rc",
+  "latest",
+  "main",
+  "master",
+  "local",
+]);
+
+/**
+ * Is this token a VERSION, as opposed to a word that merely stands where one was
+ * expected? Semver wins outright; otherwise it must carry a digit (`0.49.6-dev3`,
+ * `2026.08.04`) or be a recognised channel name.
+ *
+ * The point is what it REJECTS: `unknown`, `unspecified`, `none`, and any stray word
+ * an agent might drop in ("comfyui-mcp is broken"). Those are not versions, and
+ * forwarding them would hand the triage worker something unmatchable while looking
+ * like a confident answer — the caller falls through to detection instead, which is
+ * the right move precisely when the agent had nothing.
+ */
+function asVersionToken(rawToken: string): string | undefined {
+  // The ENVIRONMENT line ends in a full stop, so the last component's token arrives
+  // as `0.11.38.` — which passes every shape test and is then reported with the
+  // trailing dot attached, defeating the exact-version match downstream. No version
+  // ends in punctuation, so stripping it is unambiguous.
+  const token = rawToken.replace(/[.,;:)\]}]+$/, "");
+  if (token === "") return undefined;
+  const semver = new RegExp(`^${SEMVER_BODY}$`, "i").exec(token);
+  if (semver) return semver[1];
+  if (!/^[A-Za-z0-9][A-Za-z0-9._+-]{0,31}$/.test(token)) return undefined;
+  if (/\d/.test(token)) return token;
+  return CHANNEL_TAGS.has(token.toLowerCase()) ? token : undefined;
+}
+
 export function normalizeReportedVersion(
   raw: string | undefined,
   label: string,
@@ -349,8 +390,18 @@ export function normalizeReportedVersion(
 
   // 1. LABELLED — survives a whole ENVIRONMENT line, other components' versions and
   //    all. The separator covers both `comfyui-mcp 0.49.6` and `mcp=0.49.6`.
-  const labelled = new RegExp(`${label}[\\s:=]+${SEMVER_BODY}`, "i").exec(trimmed);
-  if (labelled) return labelled[1];
+  //
+  //    The value is captured as a TOKEN and validated after, not required to be
+  //    semver in the pattern (codex gate round 3). Requiring semver here meant a
+  //    non-semver running build — `comfyui-mcp nightly (this process is RUNNING
+  //    nightly; 0.49.6 is now installed on disk …)` — matched nothing, fell through
+  //    to a disk read, and reported the INSTALLED 0.49.6 as the running version.
+  //    That is #846 exactly, for the one user whose version needed the most care.
+  const labelled = new RegExp(`${label}[\\s:=]+([^\\s·,;)]+)`, "i").exec(trimmed);
+  if (labelled) {
+    const value = asVersionToken(labelled[1]);
+    if (value) return value;
+  }
 
   // 2. LEADING — the caller sent the version itself, possibly with the #846 drift
   //    clause after it. The clause names a NEWER installed version second, so
@@ -360,11 +411,10 @@ export function normalizeReportedVersion(
   const leading = new RegExp(`^${SEMVER_BODY}`).exec(trimmed);
   if (leading) return leading[1];
 
-  // 3. A COMPACT TAG is still a real version someone may be running ("nightly",
-  //    "dev") and is PRESERVED — discarding it would send the caller to a disk
-  //    read, i.e. the same version-swap in a different disguise. Required to start
-  //    with a letter so that key=value fragments and prose fall through instead.
-  return /^[A-Za-z][A-Za-z0-9._-]{0,31}$/.test(trimmed) ? trimmed : undefined;
+  // 3. THE WHOLE STRING as a version token — the caller sent just `nightly`, with no
+  //    label. Preserved for the same reason as above: discarding it would send the
+  //    caller to a disk read, i.e. the version-swap in a different disguise.
+  return asVersionToken(trimmed);
 }
 
 export function registerReportIssueTools(server: McpServer): void {

@@ -222,7 +222,11 @@ describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]",
     // change them — and offers the remedy CONDITIONALLY. It must not claim the
     // user's saved settings were ignored: we never opened them, and their edit may
     // have been to something argv does not carry (codex gate).
-    expect(res.message).toContain("this restart did not change them");
+    expect(res.message).toContain("the same arguments were observed before and after");
+    // NOT "this restart did not change them" — two equal snapshots cannot show the
+    // restart had no effect (a value can change and change back), and an accepted
+    // Manager request is not proof a cycle even happened (codex gate round 3).
+    expect(res.message).not.toMatch(/this restart did not change/i);
     expect(res.message).toContain("If you were expecting different arguments");
     expect(res.message).not.toMatch(/it did NOT\./);
     // The remedy has to be one the user can act on from where they are, and for a

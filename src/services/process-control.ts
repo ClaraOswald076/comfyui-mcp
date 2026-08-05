@@ -812,16 +812,18 @@ function describeLaunchedChildExit(
   exit: { code: number | null; signal: NodeJS.Signals | null } | undefined,
 ): string {
   if (!exit) return "";
-  // WHAT THE EXIT PROVES, AND WHAT IT DOES NOT (codex gate). It proves THIS
+  // WHAT THE EXIT PROVES, AND WHAT IT DOES NOT (codex gate, twice). It proves THIS
   // RELAUNCH failed — decisively, and that is the point: it separates a real
-  // failure from a slow start (#367). It does NOT prove ComfyUI is down NOW. The
+  // failure from a slow start (#367). It does NOT prove ComfyUI is down NOW: the
   // only evidence about the port is the readiness poll, whose last probe is already
   // in the past, and an external supervisor restarting the server a moment later is
-  // exactly the case this file spends its length refusing to guess about. The
-  // earlier wording said "so ComfyUI is DOWN" — a claim about the machine's present
-  // state derived from a fact about our own child, which is the same
-  // observed-earlier-reported-as-now defect this change exists to remove.
-  return ` The process this call launched EXITED (${exitCause(exit)}) before the API came up, so THIS RELAUNCH FAILED — it was not a slow start. The API was still not answering at the last probe.`;
+  // exactly the case this file spends its length refusing to guess about.
+  //
+  // Nor does it prove the API never came up: a poll only establishes that no
+  // SCHEDULED PROBE got a 2xx, and the server could have answered between two of
+  // them. So "before the API came up" is gone too — every clause here now names an
+  // observation rather than an inference from a gap between observations.
+  return ` The process this call launched EXITED (${exitCause(exit)}), so THIS RELAUNCH FAILED — it was not a slow start. No readiness probe got a response, the last one included.`;
 }
 
 /** Whole seconds, never rounded down to a "within 0s" that reads as no wait. */
@@ -905,13 +907,20 @@ export function describeArgvDrift(
         .join(" ")} / now ${after.map(quoteToken).join(" ")}.`
     );
   }
-  // WHAT EQUAL ARGV ESTABLISHES (codex gate). It establishes that THIS RESTART did
-  // not change them — nothing more. It is not a reading of the user's saved settings
-  // (we never opened them), so it cannot say a saved change "was ignored": the edit
-  // may have been to something argv does not carry at all. The remedy is therefore
-  // offered CONDITIONALLY, on the user's own expectation, which only they can check.
+  // WHAT EQUAL ARGV ESTABLISHES (codex gate, twice). Two readings matched. That is
+  // all — and it is deliberately phrased as the pair of observations it is:
+  //   - it is NOT a reading of the user's saved settings (we never opened them), so
+  //     it cannot say a saved change "was ignored"; the edit may have been to
+  //     something argv does not carry at all; and
+  //   - it is NOT a causal claim about the restart either. "This restart did not
+  //     change them" says the restart had no effect on argv, which two equal
+  //     snapshots cannot show: a value can change and change back, and an accepted
+  //     Manager request is not proof a cycle even happened.
+  // What IS supportable is the present state — the arguments in force NOW are the
+  // old ones — so the remedy hangs off that, conditioned on the user's own
+  // expectation, which only they can check.
   return (
-    ` Its launch arguments are UNCHANGED (${after.map(quoteToken).join(" ")}) — this restart did not change them. ` +
+    ` Its launch arguments are UNCHANGED (${after.map(quoteToken).join(" ")}) — the same arguments were observed before and after this restart. ` +
     "If you were expecting different arguments" +
     (isDesktop
       ? " (after editing ComfyUI Desktop's saved launch settings, say), they are not in effect here: fully quit the ComfyUI Desktop app and relaunch it so it spawns the server from those settings."
@@ -2639,12 +2648,15 @@ export async function startComfyUI(): Promise<StartResult> {
         // environment it was launched into, which is the first thing to check when a
         // relaunch of an otherwise-healthy install fails during import.
         message:
-          `ComfyUI process was launched but the API did not become ready after ${readiness.waited_ms}ms (${readiness.attempts}/${readiness.max_tries} probes).` +
+          // "no probe got a response in Nms", not "the API did not become ready": a
+          // poll establishes only what the SCHEDULED PROBES saw, and the server could
+          // have answered in a gap between two of them (codex gate round 3).
+          `ComfyUI process was launched, but no readiness probe got a response in ${readiness.waited_ms}ms (${readiness.attempts}/${readiness.max_tries} probes).` +
           (launchedChildExit
             ? describeLaunchedChildExit(launchedChildExit)
             : launchedSpawnFailed
-              ? " The launch itself failed — the process could not be spawned — so THIS RELAUNCH FAILED; it was not a slow start. The API was still not answering at the last probe."
-              : " The process this call launched is no longer running, so THIS RELAUNCH FAILED — it was not a slow start. The API was still not answering at the last probe.") +
+              ? " The launch itself failed — the process could not be spawned — so THIS RELAUNCH FAILED; it was not a slow start."
+              : " The process this call launched is no longer running, so THIS RELAUNCH FAILED — it was not a slow start.") +
           " Check the ComfyUI logs, and re-check with health_check before assuming nothing is serving the port — an external launcher or supervisor may have brought one back since." +
           (env ? ` Launch environment: ${env.note}.` : "") +
           launchEnvWarning(info),
