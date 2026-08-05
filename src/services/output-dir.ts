@@ -571,44 +571,61 @@ async function corroborateBaseByModelInventory(
       }
       if (!containedUnder(realCategoryDir, realEntry)) escaping.push(name);
     }
-    // A PARTIAL match corroborates; only a ZERO match refutes (codex gate P1).
+    // A PARTIAL match does NOT corroborate — and my first attempt at this had it
+    // backwards (codex gate, twice).
     //
-    // Requiring EVERY listed file to be here assumed one root per category. ComfyUI
-    // does not work that way: `extra_model_paths.yaml` lets it scan this directory
-    // AND others for the same category, so files owned by an extra root are
-    // legitimately absent from this base. Reading that as "this base does not
-    // explain what the server sees" turned an ordinary multi-root topology into a
-    // hard refusal of a base that is real, present, and writable — a false refusal
-    // of something real, which is this cluster's own defect class inverted.
+    // The original complaint was real: requiring EVERY listed file to be here
+    // assumes one root per category, and `extra_model_paths.yaml` lets ComfyUI
+    // scan this directory AND others for the same one, so a file owned by an extra
+    // root is legitimately absent. I relaxed the rule to accept any overlap.
     //
-    // What actually carries the evidence is the OTHER direction: if the server
-    // lists a file under this category and that file physically lives here, this
-    // base is one of the roots it reads. One such file says that; the rest being
-    // elsewhere says nothing against it.
+    // That was worse than the bug. The listing is FILENAMES ONLY, so a stale clone
+    // holding `shared.safetensors` is indistinguishable from a genuine second root
+    // holding `shared.safetensors` — and under the relaxed rule a single common
+    // name authorized a multi-gigabyte download into an install the running server
+    // never reads. A false refusal here is recoverable and tells the user exactly
+    // what to set; a wrong destination reported as success is #369, which is the
+    // harm this whole path exists to prevent. Between an unrecoverable wrong answer
+    // and a recoverable refusal, an inconclusive rescue refuses.
     //
-    // The other three buckets stay fatal. `unreadable` is an inconclusive probe
-    // (not a finding of absence), and `notFiles`/`escaping` describe a topology
-    // the download authorizer refuses a step later — corroborating them here would
-    // hand the caller an approval the next layer rejects.
-    const present = files.length - missing.length;
-    if (present > 0 && unreadable.length === 0 && notFiles.length === 0 && escaping.length === 0) {
-      return { ok: true, modelsDir, category, matched: present, listed: files.length };
+    // So the verdict returns to a full match. What actually needed fixing was the
+    // REASON: the old message said the base "does not explain what the server sees",
+    // which reads as "this base is wrong" when a multi-root layout is the likelier
+    // explanation. It now names that possibility and what to do about it.
+    if (missing.length === 0 && unreadable.length === 0 && notFiles.length === 0 && escaping.length === 0) {
+      return { ok: true, modelsDir, category, matched: files.length, listed: files.length };
     }
     // Each failure mode says what it actually was. "Could not read it" is not "it is not
     // there", and neither is "something is there but it is not a file" — three different
     // fixes, and the old single "are not under" phrasing named only one of them.
-    if (missing.length > 0) {
-      // Reached only when NONE were found (a partial match returned above), so the
-      // claim is about all of them and no longer overstates a multi-root layout.
-      lastReason =
-        `the server lists ${files.length} file(s) under "${category}" and NONE of them are ` +
-        `under "${categoryDir}" (e.g. "${missing[0]}"), so this base is not a directory the ` +
-        `server reads that category from — not merely one of several roots holding part of it`;
-    } else if (unreadable.length > 0) {
+    if (unreadable.length > 0) {
+      // ORDERED BEFORE `missing` (codex gate): a mixed result would otherwise be
+      // narrated purely as absence, and an entry we could not inspect is not an
+      // entry we found to be gone. The inconclusive half decides the wording,
+      // because it is the half that is not a finding.
       lastReason =
         `the server lists ${files.length} file(s) under "${category}", and ${unreadable.length} of them ` +
         `could not be inspected under "${categoryDir}" (e.g. "${unreadable[0]}") — that is NOT a finding ` +
-        "that they are missing, so nothing was established either way";
+        `that they are missing, so nothing was established either way` +
+        (missing.length > 0
+          ? ` (${missing.length} other(s) were not found there, but with the above unreadable that ` +
+            `does not settle it)`
+          : "");
+    } else if (missing.length > 0) {
+      const present = files.length - missing.length;
+      lastReason =
+        present === 0
+          ? `the server lists ${files.length} file(s) under "${category}" and NONE of them are under ` +
+            `"${categoryDir}" (e.g. "${missing[0]}"), so this base is not a directory the server ` +
+            `reads that category from`
+          : // The multi-root case, named rather than mislabelled as a wrong base.
+            `the server lists ${files.length} file(s) under "${category}" and ${present} of them are ` +
+            `under "${categoryDir}", but ${missing.length} are not (e.g. "${missing[0]}"). That is ` +
+            `consistent with an extra_model_paths layout where this is ONE of several roots for ` +
+            `"${category}" — but it is also what a stale copy sharing some filenames looks like, and ` +
+            `a filename listing cannot tell those apart. Rather than guess a destination, set ` +
+            `COMFYUI_PATH to the root that actually holds "${category}", or launch ComfyUI with an ` +
+            `absolute --base-directory`;
     } else if (notFiles.length > 0) {
       lastReason =
         `the server lists ${files.length} file(s) under "${category}", and ${notFiles.length} of the ` +

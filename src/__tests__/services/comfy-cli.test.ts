@@ -13,6 +13,22 @@ const cfg = vi.hoisted(() => ({
 }));
 vi.mock("../../config.js", () => ({ config: cfg, isRemoteMode: () => cfg.remote }));
 
+// The version probe SPAWNS a local `comfy`. A stub executable fails to spawn
+// either way, so asserting on its return value cannot tell a guarded probe from
+// an unguarded one — the observable difference is whether the process is
+// launched at all.
+const spawnSpy = vi.hoisted(() => ({ sync: vi.fn() }));
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return {
+    ...actual,
+    spawnSync: (...args: unknown[]) => {
+      spawnSpy.sync(...args);
+      return (actual.spawnSync as (...a: unknown[]) => unknown)(...args);
+    },
+  };
+});
+
 // Control the saved default workspace resolveEffectiveComfyUIBase() returns.
 const wsMock = vi.hoisted(() => ({ base: undefined as string | undefined }));
 vi.mock("../../services/workspace-env.js", () => ({
@@ -21,6 +37,7 @@ vi.mock("../../services/workspace-env.js", () => ({
 
 import {
   assertComfyCliOk,
+  getComfyCliVersion,
   awaitProcessWithIdleTimeout,
   isSupportedComfyCliVersion,
   normalizeComfyCliResult,
@@ -313,11 +330,13 @@ describe("comfy-cli refuses to act locally while the session targets a remote Co
     );
   });
 
-  it("STILL runs when the caller names an explicit workspace — the refusal is about the unknown target", () => {
-    // The inverse direction. A caller that says which install it means has not
-    // left the choice to the CLI, so refusing it would be a false refusal of
-    // something real. Without this, guarding on `isRemoteMode()` alone would
-    // look correct.
+  it("refuses EVEN WITH an explicit workspace — a named target is not a verified one", () => {
+    // An earlier draft of this fix let an explicit `workspace` through, reasoning
+    // that a caller naming its target had not left the choice to the CLI. That was
+    // wrong (codex gate): `workspace` is an unverified caller-supplied string, so a
+    // remote session could still pass `models_remove` a stale or simply mistaken
+    // path and delete there. Naming a target is not evidence it is the right one,
+    // and in remote mode there is no local install this session is about at all.
     const dir = mkdtempSync(join(tmpdir(), "cmcp-cli-"));
     tempDirs.push(dir);
     const exe = join(dir, process.platform === "win32" ? "comfy.exe" : "comfy");
@@ -325,14 +344,26 @@ describe("comfy-cli refuses to act locally while the session targets a remote Co
     process.env.COMFY_CLI_PATH = exe;
     cfg.remote = true;
 
-    // It gets PAST the refusal — it fails later, on the version probe of a stub
-    // executable, which is a different and expected failure.
-    let message = "";
-    try {
-      runComfyCliSync(["model", "list"], { workspace: dir });
-    } catch (e) {
-      message = e instanceof Error ? e.message : String(e);
-    }
-    expect(message).not.toMatch(/REMOTE ComfyUI/i);
+    expect(() => runComfyCliSync(["model", "remove", "--name", "x"], { workspace: dir })).toThrow(
+      /REMOTE ComfyUI/i,
+    );
+  });
+
+  it("reports NO usable comfy-cli in remote mode, rather than advertising a local one", () => {
+    // `getComfyCliVersion` spawns a local `comfy` to read its version. Read-only,
+    // but it still describes a CLI that must never be used from here — and
+    // `isComfyCliUsable` would then advertise it as available, which is the same
+    // claim the refusal above denies.
+    const dir = mkdtempSync(join(tmpdir(), "cmcp-cli-"));
+    tempDirs.push(dir);
+    const exe = join(dir, process.platform === "win32" ? "comfy.exe" : "comfy");
+    writeFileSync(exe, "");
+    process.env.COMFY_CLI_PATH = exe;
+    cfg.remote = true;
+
+    spawnSpy.sync.mockClear();
+    expect(getComfyCliVersion()).toBeNull();
+    // The load-bearing assertion: no local CLI was launched at all.
+    expect(spawnSpy.sync).not.toHaveBeenCalled();
   });
 });

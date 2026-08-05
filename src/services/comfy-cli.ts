@@ -300,13 +300,12 @@ function requireExecutable(options: ComfyCliRunOptions): string {
   // used". It is not: it hands the choice to the CLI. This is the one choke-point
   // both `runComfyCli` and `runComfyCliSync` pass through, which is why the
   // refusal belongs here — nothing has run at this point.
-  if (isRemoteMode() && !options.workspace) {
+  if (isRemoteMode()) {
     throw new Error(
       "This session targets a REMOTE ComfyUI (--comfyui-url), and comfy-cli only acts on a " +
-        "LOCAL install. No local workspace could be resolved, so the CLI would fall back to " +
-        "whatever install it defaults to — which is not the server you are connected to, and " +
-        "for a destructive command would mean deleting from the wrong one. Nothing was run. " +
-        "Run comfy-cli on the machine the install lives on.",
+        "LOCAL install — so there is no install here that this session is about. Nothing was " +
+        "run. Run comfy-cli on the machine the install lives on, or point this session at the " +
+        "local install first.",
     );
   }
   const executable = resolveComfyCliExecutable({ workspace: options.workspace });
@@ -462,6 +461,12 @@ function getExecutableVersion(executable: string): string | null {
 }
 
 export function getComfyCliVersion(options: { workspace?: string | null } = {}): string | null {
+  // Read-only, but it still SPAWNS a local `comfy` (codex gate). In remote mode
+  // there is no local install this session is about, so probing one and reporting
+  // its version would describe a CLI that must never be used from here — and
+  // `isComfyCliUsable` below would then advertise it as available. "Not usable"
+  // is the honest answer, and it is the same answer `requireExecutable` gives.
+  if (isRemoteMode()) return null;
   const executable = resolveComfyCliExecutable({ workspace: options.workspace });
   return executable ? getExecutableVersion(executable) : null;
 }

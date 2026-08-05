@@ -779,48 +779,75 @@ describe("models dir — corroborating a data-dir base by the server's own inven
     expect(res.baseDirs).toContain(resolve(DATA_DIR));
   });
 
-  it("ACCEPTS a PARTIAL match — extra_model_paths means one category has several roots", async () => {
-    // This test used to assert a refusal, and that was the bug (codex gate P1).
-    // ComfyUI scans this directory AND any extra model roots for the same
-    // category, so a file owned by an extra root is legitimately absent here.
-    // Reading that as "this base does not explain what the server sees" refused a
-    // base that is real, present and writable — a false refusal of something real,
-    // which is this cluster's own defect class inverted.
+  it("REFUSES a PARTIAL match, but names the multi-root possibility instead of blaming the base", async () => {
+    // I had this backwards once. Relaxing to "any overlap corroborates" fixed a
+    // real false refusal under extra_model_paths — and opened a worse hole: the
+    // listing is FILENAMES ONLY, so a stale clone sharing one name is
+    // indistinguishable from a genuine second root, and a single common filename
+    // then authorized a multi-gigabyte download into an install the server never
+    // reads (codex gate). A refusal here is recoverable; a wrong destination
+    // reported as success is #369.
     //
-    // The evidence runs the other way: the server lists `present.safetensors` under
-    // this category and that file physically lives HERE, which is only true if this
-    // base is one of the roots it reads. The rest being elsewhere says nothing
-    // against it.
+    // So the verdict stays a refusal. What had to change was the REASON: the old
+    // message read as "this base is wrong" when a multi-root layout is the likelier
+    // explanation, and gave the user nothing to act on.
     dockerServer();
     serverInventory = { diffusion_models: ["present.safetensors", "elsewhere.safetensors"] };
     onDisk([join(DATA_DIR, "models", "diffusion_models", "present.safetensors")]);
 
-    const res = await resolveModelsDirWithBases({ targetCategory: "diffusion_models" });
-    expect(res.source).toBe("base-inventory-corroborated");
-    expect(res.modelsDir).toBe(resolve(DATA_DIR, "models"));
+    const err = await resolveModelsDirWithBases({ targetCategory: "diffusion_models" }).catch(
+      (e: unknown) => e,
+    );
+    const message = err instanceof Error ? err.message : String(err);
+    expect(message).toMatch(/could not be determined/);
+    // It credits what WAS found rather than implying nothing was...
+    expect(message).toMatch(/1 of them are under/);
+    // ...names the layout that would explain it...
+    expect(message).toMatch(/extra_model_paths/);
+    // ...admits why that cannot be distinguished from a stale copy...
+    expect(message).toMatch(/stale copy sharing some filenames/);
+    // ...and tells the user what to actually do.
+    expect(message).toMatch(/set COMFYUI_PATH to the root that actually holds/);
   });
 
-  it("still REFUSES when NONE of the listed files are here — zero is what refutes", async () => {
-    // The line that actually carries meaning. A partial match is consistent with a
-    // multi-root layout; a ZERO match is not — if the server lists files under this
-    // category and none of them live here, this base is not one of the roots it
-    // reads. Without this, relaxing the rule above would corroborate any directory
-    // that merely exists.
+  it("still REFUSES when NONE of the listed files are here, and says so plainly", async () => {
+    // The unambiguous end of the same spectrum: no overlap at all is not a
+    // multi-root layout, and the message should not hedge as if it might be.
     dockerServer();
     serverInventory = { diffusion_models: ["a.safetensors", "b.safetensors"] };
     onDisk([]);
 
-    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(
-      /could not be determined/,
+    const err = await resolveModelsDirWithBases({ targetCategory: "diffusion_models" }).catch(
+      (e: unknown) => e,
     );
-    // …and the refusal SAYS the inventory check ran and what it found, rather than
-    // resting on the code-layout reason alone.
-    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(
-      /asking the running server what models it can SEE did not corroborate it/,
+    const message = err instanceof Error ? err.message : String(err);
+    expect(message).toMatch(/NONE of them are under/);
+    expect(message).not.toMatch(/extra_model_paths/);
+  });
+
+  it("an UNREADABLE entry decides the wording over a missing one — inconclusive is not absence", async () => {
+    // A mixed result was narrated purely as absence because `missing` won the
+    // diagnostic branch (codex gate). An entry we could not inspect is not an entry
+    // we found to be gone, and the half that is NOT a finding has to set the tone.
+    dockerServer();
+    serverInventory = { diffusion_models: ["gone.safetensors", "unreadable.safetensors"] };
+    onDisk([]);
+    // `statFor` is the harness's seam for a probe that neither finds nor fails to
+    // find: EACCES is "could not look", not "not there".
+    const blocked = resolve(join(DATA_DIR, "models", "diffusion_models", "unreadable.safetensors"));
+    statFor = (path: string) => {
+      const err = new Error(`stat ${path}`) as NodeJS.ErrnoException;
+      err.code = resolve(path) === blocked ? "EACCES" : "ENOENT";
+      throw err;
+    };
+
+    const err = await resolveModelsDirWithBases({ targetCategory: "diffusion_models" }).catch(
+      (e: unknown) => e,
     );
-    await expect(resolveModelsDirWithBases({ targetCategory: "diffusion_models" })).rejects.toThrow(
-      /NONE of them are under/,
-    );
+    const message = err instanceof Error ? err.message : String(err);
+    expect(message).toMatch(/could not be inspected/);
+    expect(message).toMatch(/NOT a finding/);
+    expect(message).not.toMatch(/NONE of them are under/);
   });
 
   it("REFUSES when the target category listing is empty", async () => {
