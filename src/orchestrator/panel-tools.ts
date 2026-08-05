@@ -6494,6 +6494,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // job once let three more pile up). Snapshot the watchdog BEFORE we queue.
         const pre = QueueMonitor.snapshot();
         const runCmd = { cmd: "graph_run", batch_count: args.batch_count, to_node_id: args.to_node_id };
+        // #884 — capture the journal tab BEFORE dispatch: this is the tab the
+        // bridge is about to route the run to (both read the same active-tab
+        // resolution), so the #468 ticket keys the tab whose panel will report
+        // the completion. Resolving AFTER the (seconds-long) queue round-trip
+        // could key a tab the user has since moved to (codex r3/r4 timing).
+        const runTicketTab = journalTabFor(ctx);
         let res = await ctx.call(runCmd, 20000);
         // Derive the verdict from the AUTHORITATIVE reply, not a bare `queued`
         // flag. A rejection — a no-connected-tab / thrown-queuePrompt error
@@ -6564,9 +6570,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // journal an undelivered completion and replay it into the right run
         // instead of losing it while the agent works through a goal.
         const correlatable = RunCompletions.openRun(queuedId, {
-          // #884 — key the ticket by the REAL routed tab (see journalTabFor):
+          // #884 — the REAL routed tab, captured at dispatch (see runTicketTab):
           // the panel's `executed` event arrives under that id.
-          tabId: journalTabFor(ctx),
+          tabId: runTicketTab,
           ...(typeof args.to_node_id === "number" ? { toNodeId: args.to_node_id } : {}),
         });
         // Append anti-poll guidance: the agent should go idle after queuing so the

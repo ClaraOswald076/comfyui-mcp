@@ -189,8 +189,11 @@ describe("sessions are orchestrator-scoped, never workflow-scoped (#884)", () =>
     // and answers under the REAL tab id, so the agent's own render would come
     // back "foreign" and boundary sweeps could never close the ticket.
     expect(tools).toContain("function journalTabFor(ctx: PanelToolCtx): string {");
-    expect(tools).toContain("tabId: journalTabFor(ctx),"); // panel_run's #468 ticket
-    expect(tools).toContain("const tabId = journalTabFor(ctx);"); // panel_ask's #486 ticket
+    // panel_run's #468 ticket — the tab is captured at DISPATCH time…
+    expect(tools).toContain("const runTicketTab = journalTabFor(ctx);");
+    expect(tools).toContain("tabId: runTicketTab,");
+    // …and panel_ask's #486 ticket (opened before dispatch already).
+    expect(tools).toContain("const tabId = journalTabFor(ctx);");
   });
 
   it("SOURCE: hello.resume is a last-resort hint — the orchestrator's disk store wins", () => {
