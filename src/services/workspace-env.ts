@@ -1124,10 +1124,20 @@ export async function resolveInstallInterpreter(
   );
 }
 
+/**
+ * `pip show` output for the packages we care about, plus WHETHER THE QUERY RAN.
+ *
+ * An empty map has two causes that a caller must not confuse: pip answered and none of
+ * these packages are installed, or pip never answered at all (absent from this
+ * interpreter — common in uv-created venvs — or the probe timed out). Reporting the
+ * second as the first invents a capability finding; reporting the first as the second
+ * withholds a real one. Only a second, cheap observation separates them, so the probe
+ * makes it rather than letting one shape stand for both.
+ */
 async function probePipPackages(
   pythonExe: string,
   names: string[],
-): Promise<Record<string, string>> {
+): Promise<{ ran: boolean; packages: Record<string, string> }> {
   // `pip show` is portable across pip/uv-managed venvs.
   const found: Record<string, string> = {};
   const out = await probe(pythonExe, [
@@ -1136,7 +1146,12 @@ async function probePipPackages(
     "show",
     ...names,
   ]);
-  if (!out) return found;
+  if (!out) {
+    // `pip show` prints nothing both when pip is missing and when it simply matched
+    // nothing. Ask whether pip itself is usable to tell those apart.
+    const pipItself = await probe(pythonExe, ["-m", "pip", "--version"]);
+    return { ran: !!pipItself, packages: found };
+  }
   // `pip show A B C` emits records separated by a line of "---".
   for (const block of out.split(/^---$/m)) {
     const nameMatch = block.match(/^Name:\s*(.+)$/m);
@@ -1145,7 +1160,7 @@ async function probePipPackages(
       found[nameMatch[1].trim().toLowerCase()] = verMatch[1].trim();
     }
   }
-  return found;
+  return { ran: true, packages: found };
 }
 
 async function probeGitRev(
@@ -1427,21 +1442,26 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
     let pkgs: Record<string, string> | undefined;
 
     if (trusted && probeExe) {
-      pkgs = await probePipPackages(probeExe, KEY_PACKAGES);
+      const probed = await probePipPackages(probeExe, KEY_PACKAGES);
+      pkgs = probed.packages;
       if (Object.keys(pkgs).length > 0) {
         local.packages = pkgs;
       } else {
         // An absent `packages` field otherwise reads identically to the deliberate
         // withholding below, and a reader would take it as "none of these are
-        // installed". `pip show` returning nothing means the QUERY failed (no pip in
-        // this interpreter, or it timed out) — it establishes nothing about what is
-        // installed. Say that, rather than let the empty shape speak.
+        // installed". Which of the two actually happened is knowable, so say which —
+        // narrating one cause for both would be the same fold this fix is about.
         local.note = [
           local.note,
-          `Package versions could not be READ from ${probeExe} (\`python -m pip show\` ` +
-            `returned nothing — pip may be absent from this interpreter, or the probe ` +
-            `timed out). The interpreter itself IS trusted (${reason}); the empty list ` +
-            `is a failed query, NOT evidence that these packages are missing.`,
+          probed.ran
+            ? `No package versions to report from ${probeExe}: pip answered and none of ` +
+              `${KEY_PACKAGES.join(", ")} are installed in it. The interpreter IS trusted ` +
+              `(${reason}), so this IS an observation — not a failed query.`
+            : `Package versions could not be READ from ${probeExe}: pip did not answer at ` +
+              `all (it may be absent from this interpreter — uv-created venvs often have ` +
+              `no pip — or the probe timed out). The interpreter itself IS trusted ` +
+              `(${reason}); the empty list is a failed query, NOT evidence that these ` +
+              `packages are missing.`,
         ]
           .filter(Boolean)
           .join(" ");

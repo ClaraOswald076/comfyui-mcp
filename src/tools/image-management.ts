@@ -29,17 +29,30 @@ import { errorToToolResult } from "../utils/errors.js";
  * TMPDIR/TEMP is honoured instead of being silently pinned to the value at import time.
  *
  * `os.tmpdir()` returns %TEMP%/%TMP%/$TMPDIR verbatim, and nothing guarantees those are
- * absolute — a `TEMP=relative-temp` in the environment we inherit yields
- * `relative-temp\comfyui-images`. Merely `resolve()`-ing that would anchor it to the MCP
- * process's cwd and land us straight back in System32, so a non-absolute tmpdir is not
- * used at all: `os.homedir()` is always absolute and always writable by us, and the whole
- * point of this function is to name a directory that does not depend on where we were
- * launched.
+ * usable as a launch-independent base. Merely `resolve()`-ing a bad one would anchor it
+ * to the MCP process's cwd and land us straight back in System32, so an unqualified
+ * tmpdir is not used at all: `os.homedir()` is always fully qualified and always writable
+ * by us, and the whole point of this function is to name a directory that does not depend
+ * on where we were launched.
  */
 export function defaultImageSaveDir(): string {
   const tmp = tmpdir();
-  const base = tmp && isAbsolute(tmp) ? tmp : homedir();
-  return resolve(base, "comfyui-images");
+  return resolve(isFullyQualified(tmp) ? tmp : homedir(), "comfyui-images");
+}
+
+/**
+ * Is this path independent of the process's current directory — INCLUDING its drive?
+ *
+ * `path.isAbsolute` is not that test on Windows. It answers true for `\Temp`, which is
+ * DRIVE-RELATIVE: `resolve("\\Temp", …)` picks up whatever drive the cwd happens to be
+ * on, so `TEMP=\Windows\System32` reproduces the very failure #768 is about on a
+ * C:-launched process. Only a drive-qualified path (`C:\…`) or a UNC path
+ * (`\\server\share\…`) is genuinely launch-independent.
+ */
+function isFullyQualified(p: string | undefined): boolean {
+  if (!p) return false;
+  if (process.platform !== "win32") return isAbsolute(p);
+  return /^[a-zA-Z]:[\\/]/.test(p) || /^[\\/]{2}[^\\/]/.test(p);
 }
 
 /**
@@ -108,27 +121,50 @@ export function registerImageManagementTools(server: McpServer): void {
         // error there threw away a successfully retrieved image and invited a retry of
         // the fetch that could never fix the disk problem (#768) — so the save is
         // isolated and its outcome is DISCLOSED rather than allowed to fail the tool.
-        const saveDir = resolveImageSaveDir(args.save_dir);
+        //
+        // RESOLUTION is inside the guarded region, not before it: `resolveImageSaveDir`
+        // calls `process.cwd()` for a relative save_dir, and cwd itself throws ENOENT
+        // when the launch directory has been deleted underneath us. Left outside, that
+        // throw would reach the outer catch and discard the fetched image — the same
+        // loss this block exists to prevent, one line earlier.
+        //
+        // `explicitDir` is the TRIMMED value actually used for resolution, so the
+        // message can never describe a whitespace-only save_dir as a directory the
+        // caller named (resolveImageSaveDir treats it as omitted).
+        const explicitDir = args.save_dir?.trim() || undefined;
         const localFilename = basename(args.filename);
-        const savePath = join(saveDir, localFilename);
+        let savePath: string | undefined;
         let saveError: string | undefined;
         try {
+          const saveDir = resolveImageSaveDir(args.save_dir);
+          savePath = join(saveDir, localFilename);
           await mkdir(saveDir, { recursive: true });
           await writeFile(savePath, Buffer.from(base64, "base64"));
         } catch (err) {
           const detail = err instanceof Error ? err.message : String(err);
+          // A default destination we can still NAME, even if resolution itself failed —
+          // never a remedy the caller cannot act on.
+          let fallbackDefault: string | undefined;
+          try {
+            fallbackDefault = defaultImageSaveDir();
+          } catch {
+            fallbackDefault = undefined;
+          }
           saveError =
-            `NOT SAVED. The image was fetched from ComfyUI successfully, but writing it ` +
-            `to ${savePath} failed: ${detail}. ` +
-            (args.save_dir
-              ? `That directory came from the save_dir argument you passed` +
-                (isAbsolute(args.save_dir.trim())
+            `NOT SAVED. The image was fetched from ComfyUI successfully, but ` +
+            (savePath
+              ? `writing it to ${savePath} failed: ${detail}. `
+              : `this process could not even work out where to put it: ${detail}. `) +
+            (explicitDir
+              ? `The destination came from the save_dir argument you passed ` +
+                `("${explicitDir}")` +
+                (isAbsolute(explicitDir)
                   ? ""
-                  : ` (a RELATIVE save_dir, resolved against this process's working directory)`) +
-                `. Retry with an absolute save_dir you can write to, or omit save_dir to ` +
-                `use the default ${defaultImageSaveDir()}.`
-              : `That is the default destination (the platform temp directory). Retry with ` +
-                `an explicit absolute save_dir you can write to.`) +
+                  : ` — a RELATIVE save_dir, resolved against this process's working directory`) +
+                `. Retry with an absolute save_dir you can write to` +
+                (fallbackDefault ? `, or omit save_dir to use the default ${fallbackDefault}.` : ".")
+              : `That is the default destination${fallbackDefault ? ` (${fallbackDefault})` : ""}. ` +
+                `Retry with an explicit absolute save_dir you can write to.`) +
             ` Do NOT re-run the render — the output already exists on the server.`;
         }
 
