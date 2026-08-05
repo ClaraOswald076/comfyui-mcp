@@ -676,7 +676,7 @@ describe("process-control restart relaunch preflight (#368/#370)", () => {
 
     expect(result.stopped).toBe(true);
     expect(result.started).toBe(true);
-    expect(result.message).toMatch(/reboot request was accepted/i);
+    expect(result.message).toMatch(/reboot request was acknowledged/i);
     expect(result.message).toMatch(/Desktop\/supervised/i);
     // Never killed / re-spawned.
     expect(mockSpawn).not.toHaveBeenCalled();

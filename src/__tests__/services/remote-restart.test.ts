@@ -90,7 +90,14 @@ describe("restartComfyUI — remote (Manager reboot)", () => {
     expect(res.stopped).toBe(true);
     expect(res.started).toBe(true);
     expect(res.ready).toBe(true);
-    expect(res.message).toContain("reboot request was accepted");
+    // A 502 is INFERRED to mean the handler took it and the origin dropped — a good
+    // inference, and the reason this path works through a tunnel at all, but not an
+    // acknowledgement. A tunnel hiccup in front of a server that was never restarted
+    // produces the identical signal, so the report must not call it accepted (codex
+    // gate round 7).
+    expect(res.message).toContain("no acknowledgement came back");
+    expect(res.message).not.toMatch(/was acknowledged/i);
+    expect(res.startup).toBe("unconfirmed");
     expect(hoisted.resetClient).toHaveBeenCalledTimes(1);
     expect(hoisted.resetObjectInfoCache).toHaveBeenCalledTimes(1);
     // The 502 on the canonical POST route counts as "fired" — the legacy GET
@@ -153,7 +160,7 @@ describe("restartComfyUI — remote (Manager reboot)", () => {
     // the poller only records that no probe got a 2xx, which is equally consistent
     // with a server that was never reachable from here (codex gate round 2).
     expect(res.message).not.toMatch(/went down/i);
-    expect(res.message).toMatch(/reboot was accepted/i);
+    expect(res.message).toMatch(/reboot request was acknowledged/i);
     expect(res.message).toMatch(/NOT CONFIRMED YET/);
     expect(res.message).toMatch(/does NOT mean it failed/i);
     expect(res.message).toMatch(/health_check/);
