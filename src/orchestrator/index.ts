@@ -5343,7 +5343,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       if (Date.now() > p.deadline) {
         pendingPodConnects.delete(podId);
         persistPendingConnects();
-        logger.warn(`[panel-orchestrator] pod ${podId} was not ready within 8 minutes — NOT auto-connecting (connect manually with runpod_pod_connect)`);
+        logger.warn(`[panel-orchestrator] pod ${podId} was not ready within 8 minutes — NOT auto-connecting (connect manually with runpod action:"connect")`);
         // The tool call is long gone and idle auto-stop can't fire on a pod we
         // never connected to (renderingOnPod is false) — the failed pod keeps
         // billing with no visible failure unless we say so (codex finding).
@@ -5412,7 +5412,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   queueStatusTimer.unref?.();
 
   // RunPod live-status broadcast + idle auto-stop (services/runpod-watch.ts).
-  // Polls the WATCHED pod (set by runpod_pod_connect / runpod_watch) every ~15s
+  // Polls the WATCHED pod (set by runpod action:"connect" / runpod_watch action:"watch") every ~15s
   // and pushes a `runpod_status` frame to the panel/mobile control panels; when
   // the connected pod's ComfyUI sits idle past RUNPOD_IDLE_STOP_MINUTES (default
   // 15; 0 disables) it auto-stops the pod to save GPU cost (gpu-cli parity). No

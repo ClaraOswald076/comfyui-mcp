@@ -45,6 +45,57 @@ describe("call_tool admission", () => {
     );
   });
 
+  /**
+   * The same trap, with money attached (0.50.0 slice 8). Nine standalone
+   * runpod_* entries folded into `runpod`, and the two the whitelist
+   * deliberately never contained — the pod DEPLOY and the pod RESUME, the two
+   * that put a pod into a billing state — are now merely actions on a name that
+   * IS whitelisted. Without an action scope, swapping the names would hand a
+   * confirmation-less mirrored/foreign tab the ability to spend money.
+   */
+  describe("runpod: the folded billing actions stay unreachable (#269/#278)", () => {
+    it("admits exactly the six actions whose standalone names were whitelisted", () => {
+      for (const action of ["status", "list", "stop", "connect", "use_local", "deploy_link"]) {
+        expect(callToolAdmission("runpod", { action }), `action:"${action}"`).toBeNull();
+      }
+      // …with the arguments those entries forwarded.
+      expect(callToolAdmission("runpod", { action: "stop", pod_id: "pod123" })).toBeNull();
+    });
+
+    it("refuses the two actions that BILL — deploying and resuming a pod", () => {
+      for (const action of ["create", "start"]) {
+        expect(callToolAdmission("runpod", { action }), `action:"${action}"`).toBe(
+          `tool "runpod" is not permitted for action "${action}"`,
+        );
+      }
+      // Including the create shape a client would actually send, so the refusal
+      // cannot be argued away as "only the bare action is blocked".
+      expect(
+        callToolAdmission("runpod", { action: "create", gpu_type: "NVIDIA A40", connect: true }),
+      ).toBe('tool "runpod" is not permitted for action "create"');
+      expect(callToolAdmission("runpod", { action: "start", pod_id: "pod123", gpu_count: 8 })).toBe(
+        'tool "runpod" is not permitted for action "start"',
+      );
+    });
+
+    it("refuses runpod with a missing or non-string action", () => {
+      expect(callToolAdmission("runpod", {})).toBe(
+        'tool "runpod" is not permitted for action "(missing)"',
+      );
+      expect(callToolAdmission("runpod", { action: 42 })).toBe(
+        'tool "runpod" is not permitted for action "(missing)"',
+      );
+    });
+
+    it("runpod_watch stays name-admitted — none of its actions bills", () => {
+      // watch/unwatch/troubleshoot each replaced a name that was already
+      // whitelisted, so the folded tool covers the same ground it always did.
+      for (const action of ["watch", "unwatch", "troubleshoot"]) {
+        expect(callToolAdmission("runpod_watch", { action }), `action:"${action}"`).toBeNull();
+      }
+    });
+  });
+
   it("name-level behavior is unchanged for everything else", () => {
     // A whitelisted tool with no action scope is admitted regardless of args…
     expect(callToolAdmission("list_workflows", {})).toBeNull();

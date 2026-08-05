@@ -353,7 +353,7 @@ image still boots ComfyUI fine.
 
 ### Dead-man switch (#269)
 
-Pods **created via `runpod_pod_create`** carry a billing dead-man switch. The
+Pods **created via `runpod` / `action: "create"`** carry a billing dead-man switch. The
 in-process idle auto-stop dies with the orchestrator (crash / closed laptop);
 without a pod-side guard the pod would bill forever. So:
 
@@ -366,8 +366,8 @@ without a pod-side guard the pod would bill forever. So:
 
 The stop is authorized by the **pod-scoped `RUNPOD_API_KEY` RunPod auto-injects
 into every pod** — the owner's account-wide key never leaves the orchestrator.
-Arming is signaled by the pod env carrying `DEADMAN_TOKEN` (injected by
-`runpod_pod_create`; a sha256 of key + unique deploy name, authorizes
+Arming is signaled by the pod env carrying `DEADMAN_TOKEN` (injected by the
+`create` action; a sha256 of key + unique deploy name, authorizes
 heartbeats **only** — it is not an API key and cannot stop the pod).
 Console-deployed pods have no token, so their watchdog stays inert. Opt out of
 arming with `deadman:false` / `RUNPOD_DEADMAN=0` at create, or

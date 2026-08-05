@@ -4,100 +4,47 @@ description: "Deploy, connect, monitor, and stop RunPod cloud GPU pods, and swit
 icon: "server"
 ---
 
-<Info>11 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
+<Info>2 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
 <Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
 
-## runpod_pod_create
+## runpod
 
-Deploy a BRAND-NEW RunPod pod from our comfyui-mcp template (image with the panel + Manager + our nodes preinstalled), then it can be started/connected like any pod. One-tap alternative to the console deploy link for a user who already has a RunPod account + API key. Because our template is used, the agent can install the user's exact custom nodes/LoRAs + download models on it → full canvas parity. Tries several GPU types until one has capacity (on-demand availability fluctuates). NOTE: this bills GPU-time as soon as the pod boots — confirm with the user first, and stop it (runpod_pod_stop) when done. Created pods carry a DEAD-MAN SWITCH: if comfyui-mcp stops minding the pod (crash/offline), the pod STOPS ITSELF after a grace period so it can't bill forever — it uses the pod-scoped key RunPod auto-injects, so your account key never leaves this machine (disable with deadman:false). For onboarding a NEW RunPod user, prefer runpod_deploy_link so their signup credits our referral.
-
-### Parameters
-
-<ParamField path="name" type="string">
-  Pod name (default 'comfyui-mcp').
-</ParamField>
-<ParamField path="gpu_type" type="string">
-  GPU type to prefer, e.g. "NVIDIA GeForce RTX 4090". Default tries: NVIDIA GeForce RTX 4090, NVIDIA RTX A6000, NVIDIA RTX PRO 4500 Blackwell, NVIDIA A40, NVIDIA RTX A5000.
-</ParamField>
-<ParamField path="cloud_type" type="enum">
-  COMMUNITY (cheaper, default) or SECURE. Options: `COMMUNITY`, `SECURE`.
-</ParamField>
-<ParamField path="connect" type="boolean">
-  Auto-connect when booted: the ORCHESTRATOR waits for ComfyUI to answer (1-3min), then retargets + watches — this call returns immediately (default false: deploy only; connect later with runpod_pod_connect).
-</ParamField>
-<ParamField path="deadman" type="boolean">
-  Arm the pod-side dead-man watchdog (default true for OUR stock template): the pod STOPS ITSELF if comfyui-mcp's heartbeats stop (process crash/offline — boot grace ~45min, then ~20min without beats). Uses the pod-scoped API key RunPod auto-injects into every pod — your account key never leaves this machine. false deploys without the watchdog. With a custom template (RUNPOD_TEMPLATE_ID) the default is OFF — pass true only if that image ships our watchdog.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "runpod_pod_create",
-  "arguments": {}
-}
-```
-
----
-
-## runpod_pod_connect
-
-Connect comfyui-mcp to a RunPod pod's ComfyUI so ALL the other comfyui tools (generate, workflows, models, panel, …) run against that pod. Give it a pod ID: it verifies the pod is RUNNING with ComfyUI reachable, resolves the pod's proxy URL, and retargets this orchestrator's ComfyUI client to it. If the pod isn't ready it tells you what's missing (run runpod_pod_start / runpod_pod_troubleshoot first). This is the 'live connection' — after it succeeds, the rest of the session talks to the pod.
+Deploy, start, stop, inspect and connect to RunPod cloud GPU pods, and switch rendering between your local machine and a pod. Driven by the `action` parameter. SPENDS MONEY: action:"create" and action:"start" put a pod into a billing state; action:"stop" ends GPU billing. Confirm with the user before creating or starting a pod, and stop pods when the work is done.
+- action:"create" — Deploy a BRAND-NEW RunPod pod from our comfyui-mcp template (image with the panel + Manager + our nodes preinstalled), then it can be started/connected like any pod. One-tap alternative to the console deploy link for a user who already has a RunPod account + API key. Because our template is used, the agent can install the user's exact custom nodes/LoRAs + download models on it → full canvas parity. Tries several GPU types until one has capacity (on-demand availability fluctuates). NOTE: this bills GPU-time as soon as the pod boots — confirm with the user first, and stop it (action:"stop") when done. Created pods carry a DEAD-MAN SWITCH: if comfyui-mcp stops minding the pod (crash/offline), the pod STOPS ITSELF after a grace period so it can't bill forever — it uses the pod-scoped key RunPod auto-injects, so your account key never leaves this machine (disable with deadman:false). For onboarding a NEW RunPod user, prefer action:"deploy_link" so their signup credits our referral.
+- action:"start" — Start (resume) a stopped/exited RunPod pod by ID — RunPod re-attaches a GPU and boots the container (billing resumes). Returns immediately once RunPod accepts the resume; the pod then takes ~30-90s to become reachable, so follow with action:"status" (or action:"connect", which verifies readiness) rather than assuming it's instantly up. If RunPod can't allocate the requested GPU it errors — try a different gpu_count or GPU type in the console.
+- action:"stop" — Stop a running RunPod pod by ID — releases the GPU and stops GPU-time billing while KEEPING the pod and its disk (so you can start it again later). Use when the user is done rendering. Does NOT terminate/delete the pod (that's a console action). Confirm with the user before stopping a pod that has work in progress.
+- action:"status" — Get the live state of a pod by ID: its desired status (RUNNING / EXITED / TERMINATED), GPU, uptime, $/hr cost, GPU/VRAM utilization, and — when it's running and exposes ComfyUI — the proxy URL to connect to. Call this first to see what state a pod is in before starting/stopping/connecting. Read-only.
+- action:"list" — List all RunPod pods on the account (id, name, status, GPU, cost). Use when the user hasn't given a pod ID, or to find the one they mean. If the account has no pods, tell the user to create one and share action:"deploy_link". Read-only.
+- action:"connect" — Connect comfyui-mcp to a pod's ComfyUI so ALL the other comfyui tools (generate, workflows, models, panel, …) run against that pod. Give it a pod ID: it verifies the pod is RUNNING with ComfyUI reachable, resolves the pod's proxy URL, and retargets this orchestrator's ComfyUI client to it. If the pod isn't ready it tells you what's missing (run action:"start" / runpod_watch action:"troubleshoot" first). This is the 'live connection' — after it succeeds, the rest of the session talks to the pod.
+- action:"use_local" — Switch comfyui-mcp back to the LOCAL ComfyUI on this machine (the 'Local' half of the local⇄pod switch) — retargets rendering to loopback so generate/workflows run on the local GPU again. Stops broadcasting the pod's status but does NOT stop the pod itself (use action:"stop" to end billing). Use when the user wants to render locally again after working on a pod.
+- action:"deploy_link" — Get the RunPod DEPLOY link for spinning up a NEW comfyui-mcp pod. Share this with the user whenever they have no pod, or want to create one — it opens RunPod pre-configured with our template AND carries our referral code, so their signup/spend credits us. Prefer handing over THIS link for pod creation (rather than describing the console steps), so the referral attaches. Read-only.
 
 ### Parameters
 
-<ParamField path="pod_id" type="string" required>
-  The RunPod pod ID to connect to.
+<ParamField path="action" type="enum" required>
+  Which RunPod operation to perform. "start", "stop", "status" and "connect" require `pod_id`; "create" takes the optional deploy parameters (name/gpu_type/cloud_type/connect/deadman); "list", "use_local" and "deploy_link" take no other parameters. "create" and "start" BILL; "stop" ends billing. Options: `create`, `start`, `stop`, `status`, `list`, `connect`, `use_local`, `deploy_link`.
 </ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "runpod_pod_connect",
-  "arguments": {
-    "pod_id": "<pod_id>"
-  }
-}
-```
-
----
-
-## runpod_use_local
-
-Switch comfyui-mcp back to the LOCAL ComfyUI on this machine (the 'Local' half of the local⇄pod switch) — retargets rendering to loopback so generate/workflows run on the local GPU again. Stops broadcasting the pod's status but does NOT stop the pod itself (use runpod_pod_stop to end billing). Use when the user wants to render locally again after working on a pod.
-
-<Note>This tool takes no parameters.</Note>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "runpod_use_local",
-  "arguments": {}
-}
-```
-
----
-
-## runpod_pod_start
-
-Start (resume) a stopped/exited RunPod pod by ID — RunPod re-attaches a GPU and boots the container (billing resumes). Returns immediately once RunPod accepts the resume; the pod then takes ~30-90s to become reachable, so follow with runpod_pod_status (or runpod_pod_connect, which waits) rather than assuming it's instantly up. If RunPod can't allocate the requested GPU it errors — try a different gpu_count or GPU type in the console.
-
-### Parameters
-
-<ParamField path="pod_id" type="string" required>
-  The RunPod pod ID to start.
+<ParamField path="pod_id" type="string">
+  The RunPod pod ID (from console.runpod.io, or action:"list"). REQUIRED for actions "start", "stop", "status" and "connect". Ignored by "create", "list", "use_local" and "deploy_link".
 </ParamField>
 <ParamField path="gpu_count" type="integer">
-  GPUs to attach on resume (default 1).
+  action:"start" — GPUs to attach on resume (default 1).
+</ParamField>
+<ParamField path="name" type="string">
+  action:"create" — pod name (default 'comfyui-mcp').
+</ParamField>
+<ParamField path="gpu_type" type="string">
+  action:"create" — GPU type to prefer, e.g. "NVIDIA GeForce RTX 4090". Default tries: NVIDIA GeForce RTX 4090, NVIDIA RTX A6000, NVIDIA RTX PRO 4500 Blackwell, NVIDIA A40, NVIDIA RTX A5000.
+</ParamField>
+<ParamField path="cloud_type" type="enum">
+  action:"create" — COMMUNITY (cheaper, default) or SECURE. Options: `COMMUNITY`, `SECURE`.
+</ParamField>
+<ParamField path="connect" type="boolean">
+  action:"create" — auto-connect when booted: the ORCHESTRATOR waits for ComfyUI to answer (1-3min), then retargets + watches — this call returns immediately (default false: deploy only; connect later with action:"connect"). This is the create-time flag, NOT the action of the same name.
+</ParamField>
+<ParamField path="deadman" type="boolean">
+  action:"create" — arm the pod-side dead-man watchdog (default true for OUR stock template): the pod STOPS ITSELF if comfyui-mcp's heartbeats stop (process crash/offline — boot grace ~45min, then ~20min without beats). Uses the pod-scoped API key RunPod auto-injects into every pod — your account key never leaves this machine. false deploys without the watchdog. With a custom template (RUNPOD_TEMPLATE_ID) the default is OFF — pass true only if that image ships our watchdog.
 </ParamField>
 
 ### Example
@@ -106,103 +53,9 @@ Start (resume) a stopped/exited RunPod pod by ID — RunPod re-attaches a GPU an
 
 ```json
 {
-  "tool": "runpod_pod_start",
+  "tool": "runpod",
   "arguments": {
-    "pod_id": "<pod_id>"
-  }
-}
-```
-
----
-
-## runpod_pod_stop
-
-Stop a running RunPod pod by ID — releases the GPU and stops GPU-time billing while KEEPING the pod and its disk (so you can start it again later). Use when the user is done rendering. Does NOT terminate/delete the pod (that's a console action). Confirm with the user before stopping a pod that has work in progress.
-
-### Parameters
-
-<ParamField path="pod_id" type="string" required>
-  The RunPod pod ID to stop.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "runpod_pod_stop",
-  "arguments": {
-    "pod_id": "<pod_id>"
-  }
-}
-```
-
----
-
-## runpod_pod_status
-
-Get the live state of a RunPod pod by ID: its desired status (RUNNING / EXITED / TERMINATED), GPU, uptime, $/hr cost, GPU/VRAM utilization, and — when it's running and exposes ComfyUI — the proxy URL to connect to. Call this first to see what state a pod is in before starting/stopping/connecting. Read-only.
-
-### Parameters
-
-<ParamField path="pod_id" type="string" required>
-  The RunPod pod ID (from console.runpod.io, or runpod_list_pods).
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "runpod_pod_status",
-  "arguments": {
-    "pod_id": "<pod_id>"
-  }
-}
-```
-
----
-
-## runpod_list_pods
-
-List all RunPod pods on the account (id, name, status, GPU, cost). Use when the user hasn't given a pod ID, or to find the one they mean. If the account has no pods, tell the user to create one and share runpod_deploy_link. Read-only.
-
-<Note>This tool takes no parameters.</Note>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "runpod_list_pods",
-  "arguments": {}
-}
-```
-
----
-
-## runpod_pod_troubleshoot
-
-Diagnose why a RunPod pod isn't usable — call this when the pod 'won't connect', ComfyUI is unreachable, or a render can't reach the pod. Checks: does the pod exist, is it RUNNING (vs stopped/exited — then start it), is a GPU attached, is ComfyUI's port exposed as an HTTP proxy port, and does ComfyUI actually ANSWER at its proxy URL (probes /system_stats). Returns the specific blocker and the next step. Read-only.
-
-### Parameters
-
-<ParamField path="pod_id" type="string" required>
-  The RunPod pod ID to troubleshoot.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "runpod_pod_troubleshoot",
-  "arguments": {
-    "pod_id": "<pod_id>"
+    "action": "create"
   }
 }
 ```
@@ -211,12 +64,18 @@ Diagnose why a RunPod pod isn't usable — call this when the pod 'won't connect
 
 ## runpod_watch
 
-Start broadcasting a pod's LIVE status to the control panel (desktop + mobile) — status, GPU/VRAM utilization, uptime, $/hr, and an idle-auto-stop countdown — refreshed every ~15s. runpod_pod_connect already starts this for the pod it connects to; call this to watch a pod WITHOUT retargeting comfyui-mcp at it (e.g. monitor a pod that's still booting). While watched, if the pod's ComfyUI sits idle past the configured timeout it is auto-stopped to save cost.
+Watch a RunPod pod's live status in the control panel, stop watching it, or diagnose why it isn't usable. Driven by the `action` parameter. None of these actions starts or stops a pod — the runpod tool does that.
+- action:"watch" — Start broadcasting a pod's LIVE status to the control panel (desktop + mobile) — status, GPU/VRAM utilization, uptime, $/hr, and an idle-auto-stop countdown — refreshed every ~15s. runpod action:"connect" already starts this for the pod it connects to; call this to watch a pod WITHOUT retargeting comfyui-mcp at it (e.g. monitor a pod that's still booting). While watched, if the pod's ComfyUI sits idle past the configured timeout it is auto-stopped to save cost.
+- action:"unwatch" — Stop broadcasting a pod's live status to the control panel (does NOT stop the pod itself — use runpod action:"stop" for that). Also disables idle auto-stop for it.
+- action:"troubleshoot" — Diagnose why a RunPod pod isn't usable — call this when the pod 'won't connect', ComfyUI is unreachable, or a render can't reach the pod. Checks: does the pod exist, is it RUNNING (vs stopped/exited — then start it), is a GPU attached, is ComfyUI's port exposed as an HTTP proxy port, and does ComfyUI actually ANSWER at its proxy URL (probes /system_stats). Returns the specific blocker and the next step. Read-only.
 
 ### Parameters
 
-<ParamField path="pod_id" type="string" required>
-  The RunPod pod ID to watch.
+<ParamField path="action" type="enum" required>
+  Which watch operation to perform. "watch" and "troubleshoot" require `pod_id`; "unwatch" takes no other parameters (it clears whichever pod is currently watched). Options: `watch`, `unwatch`, `troubleshoot`.
+</ParamField>
+<ParamField path="pod_id" type="string">
+  The RunPod pod ID. REQUIRED for actions "watch" and "troubleshoot". Ignored by "unwatch", which clears the single currently watched pod.
 </ParamField>
 
 ### Example
@@ -227,46 +86,8 @@ Start broadcasting a pod's LIVE status to the control panel (desktop + mobile) �
 {
   "tool": "runpod_watch",
   "arguments": {
-    "pod_id": "<pod_id>"
+    "action": "watch"
   }
-}
-```
-
----
-
-## runpod_unwatch
-
-Stop broadcasting a pod's live status to the control panel (does NOT stop the pod itself — use runpod_pod_stop for that). Also disables idle auto-stop for it.
-
-<Note>This tool takes no parameters.</Note>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "runpod_unwatch",
-  "arguments": {}
-}
-```
-
----
-
-## runpod_deploy_link
-
-Get the RunPod DEPLOY link for spinning up a NEW comfyui-mcp pod. Share this with the user whenever they have no pod, or want to create one — it opens RunPod pre-configured with our template AND carries our referral code, so their signup/spend credits us. Prefer handing over THIS link for pod creation (rather than describing the console steps), so the referral attaches. Read-only.
-
-<Note>This tool takes no parameters.</Note>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "runpod_deploy_link",
-  "arguments": {}
 }
 ```
 

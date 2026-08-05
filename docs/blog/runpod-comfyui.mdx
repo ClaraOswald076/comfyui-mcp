@@ -41,7 +41,7 @@ the pod, not a stripped-down stand-in.
 
 ## Deploy ComfyUI on RunPod in one tap
 
-The `runpod_pod_create` tool deploys the project's own RunPod template
+The `runpod` tool's `create` action deploys the project's own RunPod template
 (`artokun/comfyui-mcp-runpod`) through a referral deploy link — no console
 clicking, no template hunting. Just ask:
 
@@ -85,7 +85,7 @@ burning your local GPU, or vice versa. The panel toolbar shows an unambiguous
 
 That pill is driven by a `comfyui_target` broadcast pushed on **every retarget**,
 so it's never stale — it reflects where the next render will actually execute. A
-one-tap **Local ⇄ Pod** switch (`runpod_use_local`) moves you between them
+one-tap **Local ⇄ Pod** switch (`runpod` with `action: "use_local"`) moves you between them
 instantly. Point the pod at your canvas for the heavy job, flip back to local for
 quick iteration, and the pill tells you the truth the whole time. It's the same
 honest-target philosophy behind
@@ -108,7 +108,7 @@ no surprises.
 Renting a GPU bills by the hour — the idle auto-stop is your safety net, not a
 substitute for stopping pods you're done with. Note that a **stopped SECURE pod
 can't always resume** (its GPU may get taken by someone else); if resume fails,
-just redeploy with `runpod_pod_create`.
+just redeploy with `runpod` / `action: "create"`.
 </Warning>
 
 ## Desktop and phone — full parity
@@ -149,7 +149,7 @@ cents to a couple of dollars, not a monthly bill.
 For most workflows a **24 GB** card (RTX 4090 or A5000) is the sweet spot — it
 fits SDXL, Flux, and krea2 comfortably at a low hourly rate. Reach for a **48 GB+**
 card (A6000, RTX PRO 6000 Blackwell, L40S) only for heavy video (WAN 2.2 batches)
-or large upscales. You don't have to pick perfectly: `runpod_pod_create` **falls
+or large upscales. You don't have to pick perfectly: `action: "create"` **falls
 back across GPU types** automatically, so if your first choice is out of capacity
 you still get a working pod.
 

@@ -205,11 +205,8 @@ const CATEGORIES: Array<{
     slug: "runpod",
     icon: "server",
     description: "Deploy, connect, monitor, and stop RunPod cloud GPU pods, and switch rendering between your local rig and a pod — the tools behind the panel/mobile RunPod control panel.",
-    tools: [
-      "runpod_pod_create", "runpod_pod_connect", "runpod_use_local",
-      "runpod_pod_start", "runpod_pod_stop", "runpod_pod_status", "runpod_list_pods",
-      "runpod_pod_troubleshoot", "runpod_watch", "runpod_unwatch", "runpod_deploy_link",
-    ],
+    // 0.50.0 slice 8 folded the eleven runpod_* tools into these two.
+    tools: ["runpod", "runpod_watch"],
   },
   {
     group: "LoRA Training",

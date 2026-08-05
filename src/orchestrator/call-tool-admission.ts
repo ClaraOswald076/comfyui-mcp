@@ -72,22 +72,26 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   // local⇄pod host switch. Read-only status/list/troubleshoot, the COST-SAVING
   // actions (stop/use_local), connect (retarget only — a pod must already be
   // RUNNING, so it neither spins nor keeps one billing), watch/unwatch, and the
-  // referral deploy link. Each tool validates its own pod state; the whitelist
+  // referral deploy link. Each action validates its own pod state; the whitelist
   // only gates reachability from a canvas-less client.
-  // NOTE: runpod_pod_create AND runpod_pod_start are deliberately EXCLUDED
-  // (#269/#278) — both put a pod into a BILLING state (create deploys; start
-  // RESUMES billing on a stopped pod). A confirmation-less mirrored/foreign tab
-  // must not be able to spend money, so both go through an agent turn / explicit
-  // UI action. stop is kept (it SAVES money).
-  "runpod_pod_status",
-  "runpod_list_pods",
-  "runpod_pod_stop",
-  "runpod_pod_connect",
-  "runpod_pod_troubleshoot",
-  "runpod_use_local",
+  // NOTE: the create AND start actions are deliberately EXCLUDED (#269/#278) —
+  // both put a pod into a BILLING state (create deploys; start RESUMES billing
+  // on a stopped pod). A confirmation-less mirrored/foreign tab must not be able
+  // to spend money, so both go through an agent turn / explicit UI action. stop
+  // is kept (it SAVES money).
+  //
+  // 0.50.0 slice 8 folded eleven runpod_* names into these two, so the exclusion
+  // can no longer be expressed by simply omitting a name: `runpod` carries
+  // create and start as ACTIONS. It is therefore ACTION-scoped below to exactly
+  // the six actions whose retired standalone names were whitelisted — see
+  // CALL_TOOL_ACTION_WHITELIST.
+  "runpod",
+  // `runpod_watch` is NOT action-scoped: all three of its actions (watch,
+  // unwatch, troubleshoot) map 1:1 onto three names that were each already
+  // whitelisted here, and none of them starts, stops or bills a pod — they only
+  // change what the control panel DISPLAYS, plus a read-only diagnosis. Its
+  // whitelist entry therefore covers the same ground it always did.
   "runpod_watch",
-  "runpod_unwatch",
-  "runpod_deploy_link",
   // Micro-Apps (panel "Apps" feature): the canvas-less client's list/run/poll
   // surface, plus registry install. One tool since 0.49.0 slice 2, so the
   // whitelist can no longer distinguish the actions — the risk posture is judged
@@ -138,6 +142,17 @@ const CALL_TOOL_ACTION_WHITELIST: ReadonlyMap<string, ReadonlySet<string>> = new
   // SPARING the running job, a combination the old entry could not express;
   // and list/status/get_workflow, though read-only, were never whitelisted.
   ["queue", new Set(["cancel"])],
+  // The `runpod` entry above replaces NINE standalone entries (0.50.0 slice 8),
+  // of which SIX were whitelisted: status, list, stop, connect, use_local and
+  // deploy_link. The two that were not — create and start — are the two that
+  // SPEND MONEY, and they are the whole reason this scope exists: without it,
+  // swapping the nine names for the folded one would hand a canvas-less client
+  // the ability to deploy a pod and start billing with no agent turn and no
+  // confirmation. That is a money regression, not a permissions nicety.
+  //
+  // troubleshoot is absent here because it now lives on `runpod_watch`, whose
+  // own (unscoped) whitelist entry covers it.
+  ["runpod", new Set(["status", "list", "stop", "connect", "use_local", "deploy_link"])],
 ]);
 
 /**
