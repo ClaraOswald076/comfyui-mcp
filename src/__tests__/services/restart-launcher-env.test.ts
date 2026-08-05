@@ -1533,6 +1533,11 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     // call did not start the server. `ready` stays true — the server really is up.
     expect(result.started).toBe(false);
     expect(result.ready).toBe(true);
+    // …and `startup` must not CONFIRM the very attribution just denied (codex gate
+    // round 9). The API answered, but provably not as our relaunch: that is an
+    // OBSERVED failure of this call's launch, not a confirmation of it.
+    expect(result.startup).toBe("failed");
+    expect(JSON.parse(JSON.stringify(result)).startup).toBe("failed");
     expect(result.message).not.toMatch(/restarted successfully/i);
     expect(result.message).toMatch(/NOT as a result of this restart/i);
     expect(result.message).toMatch(/another launcher or supervisor owns it/i);
