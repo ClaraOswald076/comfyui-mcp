@@ -38,6 +38,21 @@ export function isSharedScopeId(id: string | undefined | null): boolean {
 }
 
 /**
+ * Is this id a scope ADDRESS — the bare scope, or a backend-qualified scope
+ * (`orchestrator::<backend>`, i.e. an agent key used as a routing address)?
+ * The panel MCP servers bind the QUALIFIED form so the workflow-stamp resolver
+ * can answer per CONVERSATION (two backends' concurrently in-flight turns must
+ * not share one issue-time stamp); the bridge routes both forms to the active
+ * tab. A real panel tab id (`wf:…`/`tmp:…`) never matches.
+ */
+export function isScopeAddress(id: string | undefined | null): boolean {
+  return (
+    typeof id === "string" &&
+    (id === SHARED_SESSION_SCOPE || id.startsWith(SHARED_SESSION_SCOPE + "::"))
+  );
+}
+
+/**
  * The connected panel tabs participating in a backend's shared conversation —
  * every tab whose selected backend matches. Agent output (say/stream/turn/…)
  * fans out to ALL of them: the same conversation is visible from every tab.

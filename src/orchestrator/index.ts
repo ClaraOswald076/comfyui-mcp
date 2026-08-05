@@ -38,7 +38,7 @@ import { SelfRestarter } from "../services/self-restart.js";
 import { SessionStore, workflowIdentityParts } from "./session-store.js";
 import {
   SHARED_SESSION_SCOPE,
-  isSharedScopeId,
+  isScopeAddress,
   conversationTabs,
   shouldRetireSharedAgent,
   messageOrigin,
@@ -1506,15 +1506,20 @@ export async function runPanelOrchestrator(): Promise<void> {
   // Set from each hello's trusted identity; #716 lets a successful explicit
   // open/re-pin refresh it between hellos.
   const tabCommandWorkflowUuid = new Map<string, string>();
-  // #884 — the trusted workflow uuid of the workflow the CURRENT TURN was
-  // ISSUED FOR, captured at user-message dispatch (and refreshed by #716's
-  // explicit-open path). This is what a SHARED-SCOPE command is STAMPED with:
-  // #570's issue-time rule at conversation level. If the user switches to a
-  // different workflow mid-turn, a late scope mutation still carries THIS
-  // uuid and the panel (now showing another workflow) declines it — the fence
-  // must never be re-resolved from whatever tab happens to be active at
-  // dispatch, which would silently re-aim the mutation (codex round 1, P0).
-  let lastDispatchedTurnUuid: string | undefined;
+  // #884 — PER CONVERSATION, the trusted workflow uuid of the workflow its
+  // CURRENT TURN was issued for, captured at user-message dispatch (and
+  // refreshed by #716's explicit-open path). This is what a scope-addressed
+  // command is STAMPED with: #570's issue-time rule at conversation level. If
+  // the user switches to a different workflow mid-turn, a late scope mutation
+  // still carries THIS uuid and the panel (now showing another workflow)
+  // declines it — the fence must never be re-resolved from whatever tab
+  // happens to be active at dispatch, which would silently re-aim the mutation
+  // (codex round 1, P0). Keyed by agent key so two backends' concurrently
+  // in-flight turns never share one stamp; the panel MCP servers bind the
+  // backend-QUALIFIED scope address to make the key recoverable here.
+  const lastTurnUuidByKey = new Map<string, string | undefined>();
+  const scopeAgentKeyOf = (scopeId: string): string =>
+    scopeId === SHARED_SESSION_SCOPE ? sharedKeyFor(defaultBackend) : scopeId;
   // #884 — each shared conversation's last message origin (tab + workflow uuid),
   // so a message sent from a DIFFERENT workflow than the previous one carries a
   // one-line context note: session-bound agents keep knowledge of which canvas
@@ -1863,7 +1868,6 @@ export async function runPanelOrchestrator(): Promise<void> {
 
   const makeBackend = (key: string): AgentBackend | undefined => {
     const backend = backendOf(key);
-    const panelTabId = panelTabOf(key);
     // The ENVIRONMENT block's `Backend:` line must name THIS backend (#358).
     //
     // …plus the panel-tools retraction when the loopback panel MCP failed to bind.
@@ -1880,7 +1884,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         model: codexModel,
         systemAppend: sysAppend,
         comfyuiUrl,
-        mcpServers: makeHttpBackendMcpServers(panelTabId),
+        mcpServers: makeHttpBackendMcpServers(key),
       });
     }
     if (backend === "gemini") {
@@ -1889,7 +1893,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         model: geminiModel,
         systemAppend: sysAppend,
         comfyuiUrl,
-        mcpServers: makeHttpBackendMcpServers(panelTabId),
+        mcpServers: makeHttpBackendMcpServers(key),
       });
     }
     if (backend === "antigravity") {
@@ -1897,7 +1901,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         cwd: comfyuiPath ?? process.cwd(),
         ...(antigravityModel ? { model: antigravityModel } : {}),
         systemAppend: sysAppend,
-        mcpServers: makeHttpBackendMcpServers(panelTabId),
+        mcpServers: makeHttpBackendMcpServers(key),
       });
     }
     if (backend === "pi") {
@@ -1921,7 +1925,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         model: grokModel,
         systemAppend: sysAppend,
         comfyuiUrl,
-        mcpServers: makeHttpBackendMcpServers(panelTabId),
+        mcpServers: makeHttpBackendMcpServers(key),
       });
     }
     if (backend === "ollama") {
@@ -1930,7 +1934,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         model: ollamaModel,
         systemAppend: sysAppend,
         comfyuiUrl,
-        mcpServers: makeHttpBackendMcpServers(panelTabId, null),
+        mcpServers: makeHttpBackendMcpServers(key, null),
         ...ollamaDeps(),
       });
     }
@@ -1940,7 +1944,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         model: openrouterModel,
         systemAppend: sysAppend,
         comfyuiUrl,
-        mcpServers: makeHttpBackendMcpServers(panelTabId, null),
+        mcpServers: makeHttpBackendMcpServers(key, null),
         ...openrouterDeps(),
       });
     }
@@ -1950,7 +1954,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         model: lmstudioModel,
         systemAppend: sysAppend,
         comfyuiUrl,
-        mcpServers: makeHttpBackendMcpServers(panelTabId, null),
+        mcpServers: makeHttpBackendMcpServers(key, null),
         ...lmstudioDeps(),
       });
     }
@@ -1960,7 +1964,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         model: llamacppModel,
         systemAppend: sysAppend,
         comfyuiUrl,
-        mcpServers: makeHttpBackendMcpServers(panelTabId, null),
+        mcpServers: makeHttpBackendMcpServers(key, null),
         ...llamacppDeps(),
       });
     }
@@ -1970,7 +1974,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         model: customModel,
         systemAppend: sysAppend,
         comfyuiUrl,
-        mcpServers: makeHttpBackendMcpServers(panelTabId, null),
+        mcpServers: makeHttpBackendMcpServers(key, null),
         ...customDeps(),
       });
     }
@@ -1980,7 +1984,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         model: chatgptModel,
         systemAppend: sysAppend,
         comfyuiUrl,
-        mcpServers: makeHttpBackendMcpServers(panelTabId),
+        mcpServers: makeHttpBackendMcpServers(key),
       });
     }
     const simpleKeyReg = simpleKeyProvider(backend);
@@ -1989,7 +1993,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       return makeOpenAiKeyBackend(simpleKeyReg, {
         systemAppend: sysAppend,
         comfyuiUrl,
-        mcpServers: makeHttpBackendMcpServers(panelTabId),
+        mcpServers: makeHttpBackendMcpServers(key),
       });
     }
     if (backend === "kimi") {
@@ -1998,7 +2002,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         model: kimiModel,
         systemAppend: sysAppend,
         comfyuiUrl,
-        mcpServers: makeHttpBackendMcpServers(panelTabId),
+        mcpServers: makeHttpBackendMcpServers(key),
       });
     }
     if (backend === "copilot") {
@@ -2011,7 +2015,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         model: copilotModel,
         systemAppend: sysAppend,
         comfyuiUrl,
-        mcpServers: makeHttpBackendMcpServers(panelTabId),
+        mcpServers: makeHttpBackendMcpServers(key),
       });
     }
     return undefined; // claude → built-in ClaudeBackend
@@ -2132,12 +2136,15 @@ export async function runPanelOrchestrator(): Promise<void> {
     makeSystemAppend: (key) => systemAppendForBackend(backendOf(key)),
     pluginPath: pluginAvailable ? pluginPath : undefined,
     // In-process live-graph MCP for CLAUDE keys only (codex/gemini drive the
-    // canvas through the loopback HTTP MCP instead). Bound to the SHARED SCOPE:
-    // panel_* tools resolve to the ACTIVE tab at each dispatch (#884), so one
-    // agent serves whichever workflow the user is on.
+    // canvas through the loopback HTTP MCP instead). Bound to the backend-
+    // QUALIFIED scope address (the agent key): panel_* tools resolve to the
+    // ACTIVE tab at each dispatch (#884) — one agent serves whichever workflow
+    // the user is on — while the workflow-stamp resolver can answer per
+    // CONVERSATION (concurrently in-flight turns on two backends never share
+    // one issue-time stamp).
     makePanelServer: (key) =>
       backendOf(key) === "claude"
-        ? createPanelMcpServer(bridge, SHARED_SESSION_SCOPE, workflowTargets)
+        ? createPanelMcpServer(bridge, key, workflowTargets)
         : undefined,
     mcpServers: buildMcpServers(),
     // Per-KEY factory — spawns must reflect live state (the Blind gate) and
@@ -2594,17 +2601,17 @@ export async function runPanelOrchestrator(): Promise<void> {
   // (the generation-bound-command leak). Resolved from the CALLER's tab id: during the switch
   // race the retiring tab still maps to its own uuid, so a late command stamps the ORIGIN
   // workflow's uuid and the panel (now showing the new one) fails it closed.
-  // #884 — a SHARED-SCOPE caller's stamp is the workflow the CURRENT TURN was
-  // issued for (lastDispatchedTurnUuid — captured at user-message dispatch,
-  // refreshed by #716's explicit open/re-pin), NOT the active tab's current
-  // workflow: re-resolving at dispatch would let a mutation conceived on
-  // workflow A silently land on workflow B after a mid-turn switch (codex
+  // #884 — a scope-addressed caller's stamp is the workflow its conversation's
+  // CURRENT TURN was issued for (lastTurnUuidByKey — captured at user-message
+  // dispatch, refreshed by #716's explicit open/re-pin), NOT the active tab's
+  // current workflow: re-resolving at dispatch would let a mutation conceived
+  // on workflow A silently land on workflow B after a mid-turn switch (codex
   // round 1, P0). A real-tab caller keeps the per-tab stamp.
   const scopeToRealTab = (tabId: string): string | undefined =>
-    isSharedScopeId(tabId) ? bridge.resolveSharedTabId() : panelTabOf(tabId);
+    isScopeAddress(tabId) ? bridge.resolveSharedTabId() : panelTabOf(tabId);
   bridge.setTabWorkflowUuidResolver(
     (tabId) => {
-      if (isSharedScopeId(tabId)) return lastDispatchedTurnUuid;
+      if (isScopeAddress(tabId)) return lastTurnUuidByKey.get(scopeAgentKeyOf(tabId));
       const t = panelTabOf(tabId);
       return t ? tabCommandWorkflowUuid.get(t) : undefined;
     },
@@ -2627,11 +2634,11 @@ export async function runPanelOrchestrator(): Promise<void> {
       if (!identity) return false;
       tabCommandWorkflowUuid.set(panelTab, identity.uuid);
       // #716/#884 — an explicit, VALIDATED open/re-pin from the shared agent is
-      // the agent deliberately moving its turn to another workflow: refresh the
-      // TURN's issue-time stamp too, so its subsequent edits target the
-      // workflow it just opened instead of being declined until the next user
-      // message.
-      if (isSharedScopeId(tabId)) lastDispatchedTurnUuid = identity.uuid;
+      // the agent deliberately moving its turn to another workflow: refresh
+      // that CONVERSATION's issue-time stamp too, so its subsequent edits
+      // target the workflow it just opened instead of being declined until the
+      // next user message.
+      if (isScopeAddress(tabId)) lastTurnUuidByKey.set(scopeAgentKeyOf(tabId), identity.uuid);
       return true;
     },
   );
@@ -3367,7 +3374,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       // switcher stops falsely showing "CLI not installed" behind a remote pod.
       pushReadiness(panelTab);
       if (backend === "claude") pushCommands(panelTab);
-      bridge.push({ type: "workflow_target", target: workflowTargets.get(SHARED_SESSION_SCOPE) }, panelTab);
+      bridge.push({ type: "workflow_target", target: workflowTargets.get(key) }, panelTab);
       // #717: panel tray rows belong to the bridge session, while progress files
       // are process-private. Reconcile THIS hello/re-hello directly, including
       // an empty snapshot, rather than waiting for an unrelated future change.
@@ -3693,13 +3700,15 @@ export async function runPanelOrchestrator(): Promise<void> {
         );
         return;
       }
-      // #884 — the pin belongs to the AGENT (whose tool ctx is bound to the
-      // shared scope), not to one tab: store + sequence live under the scope so
-      // the agent's command injection and this picker agree, and a newer
-      // selection from ANY tab supersedes an in-flight async pin.
-      const seq = (workflowTargetSeq.get(SHARED_SESSION_SCOPE) ?? 0) + 1;
-      workflowTargetSeq.set(SHARED_SESSION_SCOPE, seq);
-      const isCurrent = () => workflowTargetSeq.get(SHARED_SESSION_SCOPE) === seq;
+      // #884 — the pin belongs to the CONVERSATION (whose tool ctx is bound to
+      // the backend-qualified scope address), not to one tab: store + sequence
+      // live under that key so the agent's command injection and this picker
+      // agree, and a newer selection from any tab on the backend supersedes an
+      // in-flight async pin.
+      const pinKey = sharedKeyFor(backendForTab(panelTab));
+      const seq = (workflowTargetSeq.get(pinKey) ?? 0) + 1;
+      workflowTargetSeq.set(pinKey, seq);
+      const isCurrent = () => workflowTargetSeq.get(pinKey) === seq;
       const ackTarget = (t: ReturnType<typeof workflowTargets.set>) => {
         bridge.push({ type: "ack", ok: true, kind: "workflow_target", target: t }, panelTab);
         // The pin is shared — every connected tab's picker reflects it.
@@ -3729,7 +3738,7 @@ export async function runPanelOrchestrator(): Promise<void> {
             return;
           }
           ackTarget(
-            workflowTargets.set(SHARED_SESSION_SCOPE, {
+            workflowTargets.set(pinKey, {
               mode: "pinned",
               path: res.pinPath,
               filename: res.pinFilename,
@@ -3751,7 +3760,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       }
       // mode === "current" — no target to validate; follow the active tab. Writes
       // synchronously and is the latest sequence, so it wins over any in-flight pin.
-      ackTarget(workflowTargets.set(SHARED_SESSION_SCOPE, { mode, path, filename }));
+      ackTarget(workflowTargets.set(pinKey, { mode, path, filename }));
       return;
     }
 
@@ -4530,11 +4539,12 @@ export async function runPanelOrchestrator(): Promise<void> {
     // previous message's in this conversation, prepend a one-line note. This is
     // how one session keeps "knowledge of all open workflows": the agent is
     // told, mechanically and only on a change, which canvas it is operating on.
-    // #884 — capture the workflow this TURN is issued for. Scope-addressed
-    // mutations are stamped with THIS value (never re-resolved at dispatch), so
-    // a mid-turn switch to another workflow makes late edits fail the panel's
-    // fence loudly instead of silently re-aiming (codex round 1, P0).
-    lastDispatchedTurnUuid = tabCommandWorkflowUuid.get(event.tab_id);
+    // #884 — capture the workflow this TURN is issued for, per conversation.
+    // Scope-addressed mutations are stamped with THIS value (never re-resolved
+    // at dispatch), so a mid-turn switch to another workflow makes late edits
+    // fail the panel's fence loudly instead of silently re-aiming (codex
+    // round 1, P0).
+    lastTurnUuidByKey.set(agentKeyFor(event.tab_id), tabCommandWorkflowUuid.get(event.tab_id));
     {
       const originKey = agentKeyFor(event.tab_id);
       const origin = messageOrigin(event.tab_id, tabCommandWorkflowUuid.get(event.tab_id));

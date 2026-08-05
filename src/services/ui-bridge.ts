@@ -24,7 +24,7 @@ import {
 } from "./panel-recovery.js";
 import { primePanelBase, verifiedPanelDiskVersion } from "./panel-workspace.js";
 import { compareSemver, detectInstallMode } from "./self-update.js";
-import { SHARED_SESSION_SCOPE, isSharedScopeId } from "./session-scope.js";
+import { SHARED_SESSION_SCOPE, isScopeAddress } from "./session-scope.js";
 
 export const DEFAULT_BRIDGE_PORT = 9101;
 
@@ -1980,12 +1980,15 @@ export class UiBridge {
         // Deliver anything that finished while this tab was away.
         this.flushMailbox(tabId);
         // #884 — conversation frames/deliveries produced while ZERO tabs were
-        // connected are buffered under the SHARED SESSION SCOPE (the session is
-        // orchestrator-scoped, not tab-scoped). The first tab to hello picks them
-        // up: one shared conversation — whoever shows up sees it.
-        const sharedMissed = this.missedFrames.get(SHARED_SESSION_SCOPE);
-        if (sharedMissed?.length) {
-          this.missedFrames.delete(SHARED_SESSION_SCOPE);
+        // connected are buffered under a SCOPE ADDRESS (bare `orchestrator` or
+        // the backend-qualified agent key — the session is orchestrator-scoped,
+        // not tab-scoped). The first tab to hello picks them up: one shared
+        // conversation — whoever shows up sees it.
+        for (const scopeKey of [...this.missedFrames.keys()]) {
+          if (!isScopeAddress(scopeKey)) continue;
+          const sharedMissed = this.missedFrames.get(scopeKey);
+          this.missedFrames.delete(scopeKey);
+          if (!sharedMissed?.length) continue;
           for (const f of sharedMissed) {
             try {
               sock.send(JSON.stringify(f));
@@ -1997,7 +2000,9 @@ export class UiBridge {
             `[ui-bridge] replayed ${sharedMissed.length} shared-session frame(s) to tab ${tabId.slice(0, 8)}`,
           );
         }
-        this.flushMailbox(SHARED_SESSION_SCOPE, this.conns.get(tabId));
+        for (const scopeKey of [...this.mailbox.keys()]) {
+          if (isScopeAddress(scopeKey)) this.flushMailbox(scopeKey, this.conns.get(tabId));
+        }
         // Resume any idempotent reads that were dropped mid-command by this tab's
         // previous socket (bounded reconnect grace) onto the fresh connection.
         this.resumeAwaitingReconnect(tabId);
@@ -2762,13 +2767,14 @@ export class UiBridge {
 
   /** Resolve which tab a command should go to. */
   private resolveTarget(tabId?: string): Conn {
-    // #884 — the SHARED SESSION SCOPE is not a tab: an agent session spans every
+    // #884 — a SCOPE ADDRESS (`orchestrator` or the backend-qualified
+    // `orchestrator::<backend>`) is not a tab: an agent session spans every
     // tab/workflow, so a command addressed to the scope resolves to the ACTIVE
     // tab at dispatch time (job (b): routing target, decoupled from session
     // identity). Resolution order: the tab the user last talked from, else the
     // most recently connected interactive (canvas-owning) tab, else the most
     // recent headless one — deterministic whenever ANY tab is connected.
-    if (isSharedScopeId(tabId)) {
+    if (isScopeAddress(tabId)) {
       if (this.lastActiveTabId) {
         const active = this.conns.get(this.lastActiveTabId);
         if (active) return active;

@@ -1066,6 +1066,17 @@ describe("UiBridge (multi-tab)", () => {
       b.close();
     });
 
+    it("a backend-QUALIFIED scope address routes exactly like the bare scope", async () => {
+      // The panel MCP servers bind `orchestrator::<backend>` (so the workflow
+      // stamp resolves per conversation); routing must treat it as the scope.
+      const a = await connectPanel("wf:workflows/a.json", "a");
+      autoReply(a, "tab-a");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      const r = await bridge.send({ cmd: "graph_outline" }, { tabId: `${SHARED_SESSION_SCOPE}::claude` });
+      expect(r).toMatchObject({ from: "tab-a" });
+      a.close();
+    });
+
     it("with no last-active tab, the scope prefers the most recent INTERACTIVE conn over a headless viewer", async () => {
       const a = await connectPanel("wf:workflows/a.json", "a");
       autoReply(a, "tab-a");

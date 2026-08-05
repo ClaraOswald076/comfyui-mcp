@@ -7,6 +7,7 @@ import {
   SHARED_SESSION_SCOPE,
   sharedAgentKey,
   isSharedScopeId,
+  isScopeAddress,
   conversationTabs,
   shouldRetireSharedAgent,
   messageOrigin,
@@ -25,6 +26,15 @@ describe("shared session scope (#884)", () => {
     expect(isSharedScopeId(SHARED_SESSION_SCOPE)).toBe(true);
     for (const id of ["wf:a.json", "tmp:1234", "orchestrator2", "", undefined, null]) {
       expect(isSharedScopeId(id)).toBe(false);
+    }
+  });
+
+  it("isScopeAddress matches the bare scope AND backend-qualified agent keys, never tab ids", () => {
+    expect(isScopeAddress(SHARED_SESSION_SCOPE)).toBe(true);
+    expect(isScopeAddress(sharedAgentKey("claude"))).toBe(true);
+    expect(isScopeAddress(sharedAgentKey("codex"))).toBe(true);
+    for (const id of ["wf:a.json", "tmp:1234", "orchestrator2", "orchestrator2::claude", "", undefined, null]) {
+      expect(isScopeAddress(id)).toBe(false);
     }
   });
 

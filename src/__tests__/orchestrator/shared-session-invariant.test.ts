@@ -129,12 +129,22 @@ describe("sessions are orchestrator-scoped, never workflow-scoped (#884)", () =>
 
   it("SOURCE: scope mutations are stamped with the TURN's issue-time workflow, never re-resolved (codex r1 P0)", () => {
     const src = indexSrc();
-    // Captured at user-message dispatch…
-    expect(src).toContain("lastDispatchedTurnUuid = tabCommandWorkflowUuid.get(event.tab_id)");
-    // …answered to scope callers by the stamp resolver…
-    expect(src).toContain("if (isSharedScopeId(tabId)) return lastDispatchedTurnUuid;");
+    // Captured at user-message dispatch, PER conversation…
+    expect(src).toContain(
+      "lastTurnUuidByKey.set(agentKeyFor(event.tab_id), tabCommandWorkflowUuid.get(event.tab_id))",
+    );
+    // …answered to scope-addressed callers by the stamp resolver…
+    expect(src).toContain(
+      "if (isScopeAddress(tabId)) return lastTurnUuidByKey.get(scopeAgentKeyOf(tabId));",
+    );
     // …and refreshed only by #716's validated explicit-open path.
-    expect(src).toContain("if (isSharedScopeId(tabId)) lastDispatchedTurnUuid = identity.uuid;");
+    expect(src).toContain(
+      "if (isScopeAddress(tabId)) lastTurnUuidByKey.set(scopeAgentKeyOf(tabId), identity.uuid);",
+    );
+    // The panel MCP servers bind the backend-QUALIFIED scope address so the
+    // per-conversation stamp is recoverable from the caller id.
+    expect(src).toContain("createPanelMcpServer(bridge, key, workflowTargets)");
+    expect(src).toContain("makeHttpBackendMcpServers(key)");
   });
 
   it("SOURCE: download rows are stamped with the OWNING agent key, and resolved as such (codex r1 P1)", () => {

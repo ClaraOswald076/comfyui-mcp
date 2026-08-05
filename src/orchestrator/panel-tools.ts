@@ -43,7 +43,7 @@ import { parse as parseYaml } from "yaml";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { UiBridge } from "../services/ui-bridge.js";
-import { isSharedScopeId } from "../services/session-scope.js";
+import { isScopeAddress } from "../services/session-scope.js";
 import {
   dispatchOutcomeOf,
   isCapabilityRefusal,
@@ -5092,7 +5092,7 @@ function desktopCanvasRedirect(
   // now; when that is a canvas-less client (only a phone is connected), the same
   // redirect / honest canvas-less error applies instead of blasting the command
   // at the phone.
-  const boundTab = isSharedScopeId(ctx.tabId) ? b.resolveSharedTabId?.() : ctx.tabId;
+  const boundTab = isScopeAddress(ctx.tabId) ? b.resolveSharedTabId?.() : ctx.tabId;
   if (!boundTab || !b.isHeadless(boundTab)) return null;
   // Bound to a headless client: find the interactive (canvas-owning) DESKTOP tabs, the
   // SAME filter rebindToActiveTab/ensureReachable use for graph/workflow bindings.
