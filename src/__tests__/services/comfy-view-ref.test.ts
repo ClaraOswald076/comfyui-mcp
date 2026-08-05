@@ -16,11 +16,31 @@ const state = vi.hoisted(() => ({
   inputDir: "" as string,
   outputError: null as string | null,
   inputError: null as string | null,
+  /** A raw value (not necessarily an Error) the resolvers should reject with. */
+  rejectWith: null as { value: unknown } | null,
   remote: false,
   cloud: false,
   outputCalls: 0,
   inputCalls: 0,
+  /** absolute path -> errno code that realpath should fail with. */
+  realpathFail: new Map<string, string>(),
 }));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    realpath: (async (p: string, ...rest: unknown[]) => {
+      const code = state.realpathFail.get(String(p));
+      if (code) {
+        const err = new Error(`${code}: injected realpath failure`) as NodeJS.ErrnoException;
+        err.code = code;
+        throw err;
+      }
+      return (actual.realpath as (...a: unknown[]) => unknown)(p, ...rest);
+    }) as unknown as typeof actual.realpath,
+  };
+});
 
 vi.mock("../../services/output-dir.js", async (importOriginal) => {
   const actual =
@@ -29,11 +49,13 @@ vi.mock("../../services/output-dir.js", async (importOriginal) => {
     ...actual,
     resolveOutputDir: async () => {
       state.outputCalls += 1;
+      if (state.rejectWith) throw state.rejectWith.value;
       if (state.outputError) throw new Error(state.outputError);
       return state.outputDir;
     },
     resolveInputDir: async () => {
       state.inputCalls += 1;
+      if (state.rejectWith) throw state.rejectWith.value;
       if (state.inputError) throw new Error(state.inputError);
       return state.inputDir;
     },
@@ -73,6 +95,8 @@ beforeEach(() => {
   state.cloud = false;
   state.outputCalls = 0;
   state.inputCalls = 0;
+  state.rejectWith = null;
+  state.realpathFail.clear();
 });
 
 afterEach(() => {
@@ -177,6 +201,60 @@ describe("resolveServableViewRef — unknown is not 'outside'", () => {
     state.outputDir = "";
     state.inputDir = "";
     const res = await resolveServableViewRef(join(root, "elsewhere", "clip.mp4"));
+    expect(res.status).toBe("unknown");
+  });
+});
+
+describe("resolveServableViewRef — a failed canonicalisation is a doubt, not a verdict", () => {
+  it("reports UNKNOWN when the FILE's real location could not be resolved", async () => {
+    // A link this process cannot follow may point straight into a served
+    // directory, so a lexical miss is not evidence the file is elsewhere.
+    const target = touch(join(root, "elsewhere", "clip.mp4"));
+    state.realpathFail.set(resolve(target), "ELOOP");
+    const res = await resolveServableViewRef(target);
+    expect(res.status).toBe("unknown");
+    if (res.status !== "unknown") return;
+    expect(res.reason).toContain("real location could not be resolved");
+  });
+
+  it("reports UNKNOWN when a ROOT could not be canonicalised for a reason other than absence", async () => {
+    state.realpathFail.set(resolve(outDir), "EACCES");
+    const res = await resolveServableViewRef(touch(join(root, "elsewhere", "b.mp4")));
+    expect(res.status).toBe("unknown");
+    if (res.status !== "unknown") return;
+    expect(res.reason).toContain("could not be canonicalised");
+  });
+
+  it("still reports OUTSIDE when a root merely does not exist", async () => {
+    // ENOENT carries no uncertainty: a directory that is not there cannot hold
+    // the file, so this must NOT be softened into "unknown".
+    state.inputDir = join(root, "ComfyUI", "never-created");
+    const res = await resolveServableViewRef(touch(join(root, "elsewhere", "c.mp4")));
+    expect(res.status).toBe("outside");
+  });
+});
+
+describe("resolveServableViewRef — never throws", () => {
+  it("returns UNKNOWN when a resolver rejects with a value that cannot be stringified", async () => {
+    // Object.create(null) has no toString; an unguarded String(err) inside the
+    // catch would reject this function instead of reporting the failure — the
+    // agent would get an opaque transport error with no remedy in it.
+    state.rejectWith = { value: Object.create(null) as never };
+    const res = await resolveServableViewRef(join(root, "elsewhere", "d.mp4"));
+    expect(res.status).toBe("unknown");
+    if (res.status !== "unknown") return;
+    expect(res.reason).toContain("could not be described");
+  });
+
+  it("returns UNKNOWN when an Error's message getter throws", async () => {
+    const nasty = new Error("x");
+    Object.defineProperty(nasty, "message", {
+      get() {
+        throw new Error("the message getter itself failed");
+      },
+    });
+    state.rejectWith = { value: nasty };
+    const res = await resolveServableViewRef(join(root, "elsewhere", "e.mp4"));
     expect(res.status).toBe("unknown");
   });
 });

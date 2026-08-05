@@ -7870,14 +7870,26 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             try {
               buf = readFileSync(p);
             } catch (err) {
-              // The file was stat-able a moment ago, so this is a read failure —
-              // not a missing file, and not a size problem.
+              // statSync proves METADATA access, not read access — a mode/ACL
+              // can permit one and deny the other — so "it was readable a moment
+              // ago" would assert something never observed. State only what the
+              // stat established, and keep ENOENT (a delete that raced this
+              // read) distinct from a permission wall.
+              const code = (err as NodeJS.ErrnoException)?.code;
+              const detail = err instanceof Error ? err.message : String(err);
+              if (code === "ENOENT") {
+                return fail(
+                  "the file disappeared between being measured and being read: " +
+                    p +
+                    " — it existed a moment ago; re-check the path and retry",
+                );
+              }
               return fail(
                 "could not read file contents for " +
                   p +
                   ": " +
-                  (err instanceof Error ? err.message : String(err)) +
-                  " — it was readable a moment ago, so this is not an absent file and not a size limit",
+                  detail +
+                  " — its metadata was readable but its contents were not, which is a permissions or device problem, not a size limit",
               );
             }
             const dataUrl = "data:" + mime + ";base64," + buf.toString("base64");

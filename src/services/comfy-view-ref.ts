@@ -73,27 +73,59 @@ export type ViewRefResolution =
   | { status: "remote"; reason: string }
   | { status: "unknown"; reason: string };
 
-const errText = (err: unknown): string =>
-  err instanceof Error ? err.message : String(err);
+/**
+ * Describe a caught failure, without becoming one.
+ *
+ * `String(err)` is itself an operation that can fail — a rejection carrying
+ * `Object.create(null)` has no `toString`, and a getter on `.message` can throw.
+ * Unguarded, describing the error rejected the function that was handling it, so
+ * a resolver failure that should have become `unknown` reached the agent as an
+ * opaque transport error with no remedy in it. A catch that can throw is not a
+ * catch (codex finding).
+ */
+const errText = (err: unknown): string => {
+  try {
+    if (err instanceof Error) {
+      const m = err.message;
+      if (typeof m === "string" && m) return m;
+    }
+    const s = String(err);
+    return s || "an error with no description";
+  } catch {
+    return "an error that could not be described";
+  }
+};
 
 /** Windows compares paths case-insensitively; POSIX does not. */
 const norm = (p: string): string =>
   process.platform === "win32" ? p.toLowerCase() : p;
 
 /**
- * The real path, or the lexical one when it cannot be resolved.
+ * A path canonicalised as far as it could be, and whether that succeeded.
  *
- * Resolving a symlink is itself an operation that can fail (a broken link, a
- * permission wall, a dead network share). Falling back to the lexical path keeps
- * this a guard rather than a new failure mode — and the containment test below
- * is still applied to whatever comes back, so a fallback can only ever make the
- * check stricter, never let something through.
+ * `canonical` is never allowed to reject — resolving a symlink can fail on a
+ * broken link, a permission wall or a dead share — but WHETHER it failed is
+ * load-bearing and must not be swallowed. A lexical fallback that misses every
+ * root is not evidence the file is outside them: the link it could not follow
+ * may well point straight into one. Callers that find no match while `resolved`
+ * is false owe the caller "unknown", not "move your file" (codex finding).
+ *
+ * `code` distinguishes the one failure that carries NO uncertainty: a root that
+ * does not exist (ENOENT) cannot contain anything, so missing it is a real
+ * "outside", not an open question.
  */
-async function realOrLexical(p: string): Promise<string> {
+type Canonical = { path: string; resolved: boolean; code?: string; why?: string };
+
+async function canonical(p: string): Promise<Canonical> {
   try {
-    return await realpath(p);
-  } catch {
-    return p;
+    return { path: await realpath(p), resolved: true };
+  } catch (err) {
+    return {
+      path: p,
+      resolved: false,
+      code: (err as NodeJS.ErrnoException)?.code,
+      why: errText(err),
+    };
   }
 }
 
@@ -201,16 +233,33 @@ export async function resolveServableViewRef(
     };
   }
 
+  // Canonicalisations that FAILED, and so left a comparison inconclusive. A miss
+  // against a root we could not canonicalise is not a proven miss.
+  const inconclusive: string[] = [];
   try {
-    const real = await realOrLexical(resolve(absPath));
+    const file = await canonical(resolve(absPath));
+    if (!file.resolved) {
+      // The caller already stat'ed this file successfully, so it exists and is
+      // reachable; a realpath that still fails means a link this process cannot
+      // follow, which could point into a served directory.
+      inconclusive.push(
+        `the file's real location could not be resolved (${file.why ?? "unknown error"})`,
+      );
+    }
     for (const root of roots) {
-      const realRoot = await realOrLexical(root.dir);
-      if (!isStrictlyInside(real, realRoot)) continue;
-      // Derived from the REAL paths on both sides, so a symlinked entry inside
-      // the root cannot name a file outside it. realRoot and root.dir are the
-      // same directory, so the relative path is valid against either — which is
-      // what ComfyUI joins onto its own configured root.
-      const rel = relative(realRoot, real);
+      const realRoot = await canonical(root.dir);
+      // A root that does not exist cannot contain anything, so failing to
+      // canonicalise it carries no uncertainty. Any OTHER failure does.
+      if (!realRoot.resolved && realRoot.code !== "ENOENT") {
+        inconclusive.push(
+          `ComfyUI's ${root.kind} directory could not be canonicalised (${realRoot.why ?? "unknown error"})`,
+        );
+      }
+      if (!isStrictlyInside(file.path, realRoot.path)) continue;
+      // Derived from the same pair the containment test just passed, so the
+      // relative path is exactly the one ComfyUI joins onto its own configured
+      // root — whether that pair was canonical or lexical.
+      const rel = relative(realRoot.path, file.path);
       const filename = basename(rel);
       const parent = dirname(rel);
       const subfolder =
@@ -236,15 +285,17 @@ export async function resolveServableViewRef(
   }
 
   // Matched nothing. Whether that means "outside" depends on whether every
-  // directory was actually checked: with one unresolved, the file could be
-  // sitting in it, and reporting "outside" would send the caller to move a file
-  // that is already in the right place.
-  if (failures.length > 0) {
+  // comparison was actually conclusive — a directory that would not resolve, or
+  // a path that would not canonicalise, leaves room for the file to be sitting
+  // somewhere ComfyUI serves. Reporting "outside" then would send the caller to
+  // move a file that is already in the right place.
+  const doubts = [...failures, ...inconclusive];
+  if (doubts.length > 0) {
     return {
       status: "unknown",
       reason:
         `it is not under ${roots.map((r) => `ComfyUI's ${r.kind} directory (${r.dir})`).join(" or ")}, ` +
-        `but ${failures.join("; ")} — so whether ComfyUI can serve it is undetermined`,
+        `but ${doubts.join("; ")} — so whether ComfyUI can serve it is undetermined`,
     };
   }
   return { status: "outside", checked: roots };

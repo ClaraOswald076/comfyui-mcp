@@ -24,6 +24,8 @@ const state = vi.hoisted(() => ({
   cloud: false,
   /** Paths statSync should fail on with a non-ENOENT error. */
   statEacces: new Set<string>(),
+  /** absolute path -> errno code readFileSync should fail with. */
+  readFail: new Map<string, string>(),
 }));
 
 vi.mock("../../services/output-dir.js", async (importOriginal) => {
@@ -66,6 +68,17 @@ vi.mock("node:fs", async (importOriginal) => {
       }
       return (actual.statSync as (...a: unknown[]) => unknown)(p, ...rest);
     }) as typeof actual.statSync,
+    // A file whose METADATA reads fine but whose CONTENTS do not — statSync
+    // proves the former, never the latter.
+    readFileSync: ((p: Parameters<typeof actual.readFileSync>[0], ...rest: unknown[]) => {
+      const code = typeof p === "string" ? state.readFail.get(p) : undefined;
+      if (code) {
+        const err = new Error(`${code}: injected read failure, open '${String(p)}'`) as NodeJS.ErrnoException;
+        err.code = code;
+        throw err;
+      }
+      return (actual.readFileSync as (...a: unknown[]) => unknown)(p, ...rest);
+    }) as typeof actual.readFileSync,
   };
 });
 
@@ -144,6 +157,7 @@ beforeEach(() => {
   state.remote = false;
   state.cloud = false;
   state.statEacces.clear();
+  state.readFail.clear();
 });
 
 describe("panel_show_media: an oversized file UNDER a ComfyUI root is forwarded", () => {
@@ -288,6 +302,26 @@ describe("panel_show_media: the other outcomes stay distinct", () => {
     expect(text).not.toContain("file not found");
     expect(text).not.toContain("file too large");
     expect(text).not.toContain("inline cap");
+  });
+
+  it("does not claim a file was readable when only its metadata was", async () => {
+    // statSync proves METADATA access; a mode/ACL can permit that and deny the
+    // read. Asserting "it was readable a moment ago" would state something this
+    // process never observed (codex finding).
+    state.readFail.set(smallImage, "EACCES");
+    const { res } = await showMedia([{ source: { path: smallImage } }]);
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain("metadata was readable but its contents were not");
+    expect(text).not.toContain("was readable a moment ago");
+    expect(text).not.toContain("size limit,"); // not misreported as a cap problem
+  });
+
+  it("reports a file deleted mid-call as having disappeared, not as unreadable", async () => {
+    state.readFail.set(smallImage, "ENOENT");
+    const { res } = await showMedia([{ source: { path: smallImage } }]);
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("disappeared between being measured and being read");
   });
 
   it("still rejects a relative path", async () => {
