@@ -58,7 +58,7 @@ export function suspectScenarioLines(data) {
         Array.isArray(r.attemptedTools) &&
         !r.attemptedTools.some((t) => rightTools.has(t))
       ) {
-        failed.push(r);
+        failed.push({ model: m.model, r });
       }
       // Only a full PASS vindicates a tool: a PARTIAL is right-family but
       // incomplete — its tool use proves nothing about the selection being
@@ -66,26 +66,31 @@ export function suspectScenarioLines(data) {
       // a tool in a passing run's successes genuinely ran.)
       if (r.score === 2) passed.push(r);
     }
-    if (failed.length < 2) continue;
-    // Count, per non-primary tool, how many FAILING runs attempted it.
+    // The signal is FIELD-WIDE: it needs 2+ DISTINCT failing models. Duplicate
+    // entries for one model (a repeated ARENA_MODELS entry, an un-merged extra
+    // run) are one model, not a field.
+    const failedModels = new Set(failed.map((f) => f.model));
+    if (failedModels.size < 2) continue;
+    // Count, per non-primary tool, how many DISTINCT failing models reached it.
     const byTool = new Map();
-    for (const r of failed) {
-      for (const t of new Set(r.attemptedTools ?? r.okTools ?? [])) {
+    for (const f of failed) {
+      for (const t of new Set(f.r.attemptedTools)) {
         // "?" is how older runs recorded an unparseable call_tool — not a real
         // selection, never a suspect.
         if (t === "?" || rightTools.has(t)) continue;
-        byTool.set(t, (byTool.get(t) ?? 0) + 1);
+        if (!byTool.has(t)) byTool.set(t, new Set());
+        byTool.get(t).add(f.model);
       }
     }
-    for (const [tool, count] of byTool) {
-      if (count < 2) continue;
+    for (const [tool, models] of byTool) {
+      if (models.size < 2) continue;
       // A tool a PASSING run also used is not "wrong" for this scenario.
       const usedByPasser = passed.some((r) =>
         (r.attemptedTools ?? r.okTools ?? []).includes(tool),
       );
       if (usedByPasser) continue;
       lines.push(
-        `- **${s.id}**: ${count} of ${failed.length} failing models reached for \`${tool}\` (none of the passing runs did). A field-wide wrong selection reads as a tool-description suspect, not a capability gap — check that tool's description before trusting this scenario's scores.`,
+        `- **${s.id}**: ${models.size} of ${failedModels.size} failing models reached for \`${tool}\` (none of the passing runs did). A field-wide wrong selection reads as a tool-description suspect, not a capability gap — check that tool's description before trusting this scenario's scores.`,
       );
     }
   }

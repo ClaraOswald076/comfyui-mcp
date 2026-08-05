@@ -167,6 +167,16 @@ describe("arena-report (#792)", () => {
     };
     expect(suspectScenarioLines(withPartial)).toHaveLength(1);
 
+    // two entries for the SAME model are one model, not a field-wide signal
+    const dupModel = {
+      ...data,
+      leaderboard: [
+        entry({ model: "a", results: [mkFail("panel_screenshot")] }),
+        entry({ model: "a", results: [mkFail("panel_screenshot")] }),
+      ],
+    };
+    expect(suspectScenarioLines(dupModel)).toHaveLength(0);
+
     // a single failing model is not a field-wide signal
     expect(
       suspectScenarioLines({ ...data, leaderboard: data.leaderboard.slice(0, 1) }),
