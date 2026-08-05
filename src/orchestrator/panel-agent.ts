@@ -2155,6 +2155,11 @@ export class PanelAgentManager {
     for (const item of pending) {
       fresh.send(item.text, {
         images: item.images,
+        // #790 — carry AUDIO across the restart too. Dropping it here would
+        // re-deliver the message as text-only with no refusal and no notice:
+        // the user's question about a sound, answered from the text alone,
+        // with nothing anywhere saying the audio went missing.
+        audio: item.audio,
         mid: item.mid,
         // #468 — carry the run-completion tokens over so the replacement agent
         // acks the completion it inherited (rather than the journal replaying it
@@ -2260,6 +2265,7 @@ export class PanelAgentManager {
       for (const item of held) {
         agent.send(item.text, {
           images: item.images,
+          audio: item.audio, // #790 — see restartAgentResume: never re-deliver an audio turn as text-only
           mid: item.mid,
           // #468 — preserve the completionOnly marker across EVERY re-delivery.
           // A second consecutive failed start would otherwise return this item to

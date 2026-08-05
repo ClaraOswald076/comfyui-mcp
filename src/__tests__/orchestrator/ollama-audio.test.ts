@@ -23,6 +23,12 @@ let viewStatus = 200;
 let chatRequests: Array<Record<string, unknown>> = [];
 let openaiChatRequests: Array<Record<string, unknown>> = [];
 let rejectNextChatWith: string | null = null;
+/** Reject the Nth /api/chat request of the file (1-based); null = never. */
+let rejectChatRequestNo: number | null = null;
+let chatRequestCount = 0;
+/** Tool calls to return on the FIRST chat response, so a turn can run a
+ *  successful round and then fail on a later one. */
+let firstResponseToolCalls: Array<Record<string, unknown>> | null = null;
 let showCalls = 0;
 
 function ndjson(chunks: Array<Record<string, unknown>>): ReadableStream<Uint8Array> {
@@ -82,10 +88,20 @@ const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Pr
   }
   if (url.endsWith("/api/chat")) {
     chatRequests.push(JSON.parse(String(init?.body)));
+    chatRequestCount += 1;
+    if (rejectChatRequestNo !== null && chatRequestCount === rejectChatRequestNo) {
+      return new Response("unsupported media type", { status: 400 });
+    }
     if (rejectNextChatWith) {
       const m = rejectNextChatWith;
       rejectNextChatWith = null;
       return new Response(m, { status: 400 });
+    }
+    if (chatRequestCount === 1 && firstResponseToolCalls) {
+      return new Response(
+        ndjson([{ message: { content: "", tool_calls: firstResponseToolCalls }, done: true }]),
+        { status: 200 },
+      );
     }
     return new Response(ndjson([{ message: { content: "ok" }, done: true }]), { status: 200 });
   }
@@ -142,6 +158,9 @@ beforeEach(() => {
   chatRequests = [];
   openaiChatRequests = [];
   rejectNextChatWith = null;
+  rejectChatRequestNo = null;
+  chatRequestCount = 0;
+  firstResponseToolCalls = null;
   showCalls = 0;
   vi.stubGlobal("fetch", fetchMock);
   fetchMock.mockClear();
@@ -396,6 +415,27 @@ describe("#790 — only an OBSERVED rejection may be reported as one", () => {
 });
 
 describe("#790 — a later error must not fabricate a delivery failure", () => {
+  it("a failure in a LATER ROUND of the same turn does not blame audio the model already got", async () => {
+    // Round 1 carries the audio and succeeds — the model has it. Round 2 (after
+    // a tool call) fails. Stripping then, and saying "you were not heard",
+    // reports a delivery failure that did not happen, for a file the model
+    // demonstrably received. This is the case the per-turn proof exists for.
+    firstResponseToolCalls = [{ function: { name: "call_tool", arguments: {} } }];
+    rejectChatRequestNo = 2;
+    const said = assistantText(await collect(nativeBackend(), turnsOf(AUDIO_TURN)));
+    expect(said).not.toContain("did NOT hear");
+    expect(said).not.toContain("rejected the request carrying");
+  });
+
+  it("but a failure on the FIRST round, before anything landed, IS reported", async () => {
+    // The mirror image: nothing has come back, so the audio plausibly did not
+    // arrive — and after the strip it certainly hasn't.
+    rejectChatRequestNo = 1;
+    const said = assistantText(await collect(nativeBackend(), turnsOf(AUDIO_TURN)));
+    expect(said).toContain("rejected the request carrying the audio attachment");
+    expect(said).toContain("did NOT hear it");
+  });
+
   it("does not blame the attachment once a request carrying it has already succeeded", async () => {
     // Turn 1 delivers the audio fine. Turn 2 (whose history still holds it)
     // fails for an unrelated reason. Telling the user "I did NOT hear it" then
@@ -422,6 +462,42 @@ describe("#790 — a later error must not fabricate a delivery failure", () => {
     expect(said).toContain("did NOT hear it");
   });
 
+  it("a NEW audio file is judged on its own, not on an earlier file's success", async () => {
+    // Session-wide proof is too coarse in this direction: an earlier clip
+    // landing says nothing about the one attached NOW (a codec the model cannot
+    // decode, a longer file). Suppressing the correction here would leave the
+    // user with a generic failure and no idea the audio never arrived.
+    const backend = nativeBackend();
+    await collect(backend, turnsOf(AUDIO_TURN)); // accepted
+    rejectNextChatWith = "unsupported media type";
+    const said = assistantText(await collect(backend, turnsOf(AUDIO_TURN))); // a NEW attachment
+    expect(said).toContain("rejected the request carrying the audio attachment");
+    expect(said).toContain("did NOT hear it");
+  });
+
+  it("a tool-listing failure drops the surface instead of claiming one it does not have", async () => {
+    // A client can CONNECT and still fail to enumerate. Keeping the decision
+    // would report a mode for a catalog the model does not actually have, and
+    // reconcile would read it as live-and-matching and never retry.
+    const backend = new OllamaBackend({
+      model: "gemma4:e2b",
+      connectToolClients: async () => ({
+        comfyui: {
+          listTools: async () => {
+            throw new Error("mcp closed");
+          },
+          callTool: (async () => ({ content: [] })) as unknown as McpToolClient["callTool"],
+          close: async () => {},
+        },
+      }),
+    });
+    const anyBackend = backend as unknown as { comfy: unknown; comfyTools: unknown[]; toolModeDecision: unknown };
+    await backend.prepare();
+    expect(anyBackend.comfy).toBeNull();
+    expect(anyBackend.comfyTools).toEqual([]);
+    expect(anyBackend.toolModeDecision).toBeNull();
+  });
+
   it("an accepted AUDIO turn still suppresses a later unrelated error", async () => {
     // The other direction of the same rule: once audio HAS been accepted, a
     // later error must not be reported as an audio rejection.
@@ -432,11 +508,10 @@ describe("#790 — a later error must not fabricate a delivery failure", () => {
     expect(said).not.toContain("did NOT hear");
   });
 
-  it("the acceptance proof does NOT survive a model switch", async () => {
-    // It is proof about the model that took the media, not about the endpoint
-    // forever. Carried across a switch it would swallow the NEW model's
-    // rejection — the silent unheard attachment again, hidden by the very flag
-    // that exists to prevent the opposite mistake.
+  it("the proof does not carry across a MODEL SWITCH either", async () => {
+    // The per-turn rule gets this for free, and it is the case that matters
+    // most: the new model has never taken anything, so its rejection must be
+    // reported rather than swallowed by what the previous model accepted.
     const backend = nativeBackend();
     await collect(backend, turnsOf(AUDIO_TURN)); // gemma4:e2b accepts it
     await backend.setModel("qwen3:4b");
@@ -458,9 +533,12 @@ describe("#790 — a later error must not fabricate a delivery failure", () => {
     rejectNextChatWith = "cannot process input";
     const events = await collect(b2, turnsOf({ text: "plain follow-up" }));
     const said = assistantText(events);
-    expect(said).toContain("earlier attachments");
-    expect(said).toContain("Nothing you sent just now was lost");
-    expect(said).not.toContain("did NOT hear it");
+    // A turn that attached nothing makes NO claim about media inherited from an
+    // earlier turn: that media was already delivered, so "you did not hear it"
+    // would be false, and "I dropped it" is noise on an unrelated error.
+    expect(said).not.toContain("did NOT hear");
+    expect(said).not.toContain("rejected");
+    expect(events.some((e) => e.type === "error")).toBe(true);
   });
 });
 

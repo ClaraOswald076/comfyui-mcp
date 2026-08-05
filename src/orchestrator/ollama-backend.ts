@@ -355,17 +355,6 @@ export class OllamaBackend implements AgentBackend {
   /** The comfyui child's spawn-spec env, retained so a live model switch can
    *  re-decide the tool mode against the same caller-level pins (#788). */
   protected comfySpecEnv: Record<string, string> | undefined;
-  /** True once a request carrying INLINE IMAGES came back successfully (#790).
-   *  Proof that this model takes images — after which a later error can no
-   *  longer be reported as an image rejection, which would fabricate a delivery
-   *  failure for media the model demonstrably received. */
-  protected imagesAccepted = false;
-  /** The same proof for AUDIO, kept SEPARATE on purpose: a model accepting an
-   *  image says nothing about whether it accepts an `input_audio` part, and one
-   *  shared latch would let an earlier image swallow a genuine audio rejection —
-   *  the silent unheard attachment again, hidden by the guard meant to prevent
-   *  the opposite mistake. Both reset on a model change (see setModel). */
-  protected audioAccepted = false;
 
   constructor(deps: OllamaBackendDeps = {}) {
     this.deps = deps;
@@ -506,8 +495,27 @@ export class OllamaBackend implements AgentBackend {
         }
       }
     }
-    if (this.comfy) this.comfyTools = (await this.comfy.listTools()).tools;
-    if (this.panel) this.panelTools = (await this.panel.listTools()).tools;
+    // A client that CONNECTED can still fail to enumerate. Leaving `comfy` and
+    // the tool-mode decision in place with an empty catalog would report a
+    // surface the model does not actually have, and reconcile would read it as
+    // live-and-matching and never retry the spawn. Tear it down instead.
+    try {
+      if (this.comfy) this.comfyTools = (await this.comfy.listTools()).tools;
+    } catch (err) {
+      logger.warn(`[ollama-backend] comfyui tool listing failed: ${msgOf(err)} — dropping the tool surface`);
+      await this.comfy?.close().catch(() => {});
+      this.comfy = null;
+      this.comfyTools = [];
+      this.clearToolModeDecision();
+    }
+    try {
+      if (this.panel) this.panelTools = (await this.panel.listTools()).tools;
+    } catch (err) {
+      logger.warn(`[ollama-backend] panel tool listing failed: ${msgOf(err)} — dropping the panel surface`);
+      await this.panel?.close().catch(() => {});
+      this.panel = null;
+      this.panelTools = [];
+    }
   }
 
   /** The six OpenAI-style tool defs the model sees. */
@@ -1143,6 +1151,12 @@ export class OllamaBackend implements AgentBackend {
     // sent — not whatever happens to be left in the retained history.
     const turnSentAudio = !!userMsg.audios?.length;
     const turnSentImages = !!userMsg.images?.length;
+    // Has THIS turn's media survived a successful request yet? Session-wide
+    // proof is too coarse in the other direction: an earlier audio file landing
+    // is not evidence that the one attached NOW was accepted (a codec the model
+    // can't decode, a longer clip). Per-turn is the boundary at which "the model
+    // did not receive it" is both plausible and, after the strip, true.
+    let turnMediaAccepted = false;
 
     let resultEmitted = false;
     // Loop-breaker: small models (especially stock ones) can wedge into
@@ -1175,8 +1189,7 @@ export class OllamaBackend implements AgentBackend {
         let usage: Record<string, number> | undefined;
         let streamId: string | null = null;
         try {
-          const requestHadImages = this.history.some((m) => m.images?.length);
-          const requestHadAudio = this.history.some((m) => m.audios?.length);
+
           for (;;) {
             const r = await stream.next();
             if (r.done) {
@@ -1185,12 +1198,11 @@ export class OllamaBackend implements AgentBackend {
             }
             yield r.value;
           }
-          // A request carrying media came back. From here on this model is
-          // KNOWN to accept that KIND of media, so a later error must not be
-          // reported as a rejection of it (see the catch below). Per kind: an
-          // accepted image is not evidence about audio.
-          if (requestHadImages) this.imagesAccepted = true;
-          if (requestHadAudio) this.audioAccepted = true;
+          // A request carrying THIS TURN's media came back. The model has it,
+          // so a later error in this turn must not be reported as a rejection of
+          // it (see the catch below) — that would fabricate a delivery failure
+          // for media the model demonstrably received.
+          if (turnSentImages || turnSentAudio) turnMediaAccepted = true;
         } catch (err) {
           // GRACEFUL IMAGE DEGRADATION: if the request carried inline images
           // and the endpoint rejected it (text-only model — e.g. DeepSeek 400s
@@ -1214,10 +1226,16 @@ export class OllamaBackend implements AgentBackend {
           // model "did NOT hear" something we never saw it refuse.
           const status = (err as { httpStatus?: number } | null)?.httpStatus;
           const requestWasRejected = typeof status === "number" && status >= 400 && status < 500;
-          // Arm only for media whose acceptance is still UNPROVEN for this
-          // model. Proven-image + unproven-audio still arms; proven-both does
-          // not (that error is something else).
-          const unprovenMedia = (hadImages && !this.imagesAccepted) || (hadAudio && !this.audioAccepted);
+          // Arm ONLY when THIS turn attached media that has not yet come back
+          // from a successful request. Two things follow, and both matter:
+          //   • media accepted earlier in this turn is never blamed for a later
+          //     error (it demonstrably arrived), and
+          //   • a turn that attached nothing makes no claim at all about media
+          //     inherited from an earlier turn — that media was already
+          //     delivered, and "you did not hear it" would be false.
+          // A NEW file is always judged on its own: an earlier clip landing is
+          // not evidence about a different one (codec, length).
+          const unprovenMedia = (turnSentImages || turnSentAudio) && !turnMediaAccepted;
           if (!abort.signal.aborted && requestWasRejected && !attachmentsStripped && unprovenMedia) {
             attachmentsStripped = true;
             logger.warn(
@@ -1248,9 +1266,7 @@ export class OllamaBackend implements AgentBackend {
                   ? `📎🔇 ${this.model} rejected the request carrying the attachments, so I'm continuing without them — I did NOT see the image and did NOT hear the audio, and the endpoint didn't say which one it objected to. Describe the image in words, and switch to a model that reports audio support (\`ollama pull gemma4:e4b\`) if you need me to listen.`
                   : turnSentAudio
                     ? `🔇 ${this.model} rejected the request carrying the audio attachment, so I'm continuing without it — I did NOT hear it and won't describe it. Switch to an audio-capable model (\`ollama pull gemma4:e4b\`), or ask me to run a ComfyUI audio-analysis node over the file instead.`
-                    : turnSentImages
-                      ? `📎 ${this.model} rejected image input, so I'm continuing without the attachment — I can't see the image. Describe it in words, or switch to a vision-capable model.`
-                      : `📎 ${this.model} rejected this request while earlier attachments were still in the conversation, so I've dropped them from context and carried on. Nothing you sent just now was lost; re-attach the earlier file if I still need it.`,
+                    : `📎 ${this.model} rejected image input, so I'm continuing without the attachment — I can't see the image. Describe it in words, or switch to a vision-capable model.`,
             };
             round--; // the rejected request didn't count as a tool round
             continue;
@@ -1440,16 +1456,6 @@ export class OllamaBackend implements AgentBackend {
     // the ready line still explained the old decision. Flag it here and let the
     // next turn re-spawn at a point where nothing is in flight.
     if (!isOllamaModel(model)) return;
-    // #790 — `attachmentsAccepted` is proof about the model that accepted the
-    // media, not about the endpoint forever. Carrying it across a switch would
-    // let the NEW model's rejection fall through the guard: no strip-and-retry,
-    // no "I did NOT hear it", just a generic error — the silent unheard
-    // attachment again, this time hidden by the very flag that exists to stop
-    // the opposite mistake.
-    if (model !== this.model) {
-      this.imagesAccepted = false;
-      this.audioAccepted = false;
-    }
     this.model = model;
   }
 
