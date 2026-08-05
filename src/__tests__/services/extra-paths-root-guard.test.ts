@@ -437,6 +437,27 @@ describe("locality: 'could not look' is not 'it is not there'", () => {
     expect(err?.message).not.toMatch(/could not determine whether/);
   });
 
+  it("the read-only fallback caption does not claim argv lacked main.py when it had one", async () => {
+    // The fallback note hardcoded "its launch argv does not reveal main.py". Argv often
+    // DOES reveal one and the lookup failed (EACCES, a stalled mount, a script deleted
+    // since startup) — so the caption asserted a cause that had not happened, which is
+    // the same defect the surrounding change exists to remove, one layer out.
+    const root = await trackTmp();
+    config.comfyuiPath = root;
+    process.env.COMFYUI_PATH = root;
+    const live = await trackTmp();
+    const mainPy = join(live, "main.py");
+    await writeFile(mainPy, "# comfyui\n", "utf-8");
+    mockGetSystemStats.mockResolvedValue({ system: { argv: ["python", mainPy] } });
+    script.realpathError[mainPy] = "EACCES";
+
+    const notes = (await listExtraPaths()).notes.join(" ");
+    expect(notes).toMatch(/could not determine whether its launch script/);
+    expect(notes).toContain("EACCES");
+    expect(notes).not.toMatch(/argv does not reveal main\.py/);
+    expect(notes).not.toMatch(/does not reveal a main\.py at all/);
+  });
+
   it("an UNREADABLE config is never summarised as an empty one", async () => {
     // readConfigFile used `existsSync`, which answers false for EACCES exactly as it does
     // for ENOENT — so a config we could not look at came back as `{}` and was rendered as

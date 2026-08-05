@@ -896,6 +896,38 @@ describe("models dir — corroborating a data-dir base by the server's own inven
     );
   });
 
+  it("treats a listing with a MALFORMED entry as inconclusive, not a match on the rest", async () => {
+    // `["known.safetensors", null]`: dropping the null and matching the remainder would
+    // approve a download destination while not accounting for everything the server
+    // said it sees — a "complete match" that is not complete.
+    dockerServer();
+    fetchApi.mockImplementation(async (path: string) => {
+      if (path === "/models") return { ok: true, status: 200, json: async () => ["diffusion_models"] };
+      return { ok: true, status: 200, json: async () => ["known.safetensors", null] };
+    });
+    existsFor = () => true; // the well-formed entry WOULD match
+
+    await expect(resolveModelsDirWithBases()).rejects.toThrow(
+      /are not usable filenames, so what it sees there could not be established/,
+    );
+  });
+
+  it("bounds the number of category REQUESTS, not just the comparisons", async () => {
+    // `checked` used to advance only on a readable non-empty listing, so a server with
+    // thousands of empty or failing categories issued thousands of synchronous HTTP
+    // calls in front of a download.
+    dockerServer();
+    const many = Array.from({ length: 500 }, (_, i) => `cat${i}`);
+    fetchApi.mockImplementation(async (path: string) => {
+      if (path === "/models") return { ok: true, status: 200, json: async () => many };
+      return { ok: true, status: 200, json: async () => [] }; // every one empty
+    });
+
+    await expect(resolveModelsDirWithBases()).rejects.toThrow(/could not be determined/);
+    // 1 call for /models plus a bounded number of category listings.
+    expect(fetchApi.mock.calls.length).toBeLessThanOrEqual(1 + 8);
+  });
+
   it("never runs the inventory probe when the destination already resolved", async () => {
     // The corroboration must be a rescue for a refusal, never a second opinion that
     // could redirect a download that already had a live-authoritative answer.

@@ -115,6 +115,16 @@ describe("packagesProvenByServerArgv (pure)", () => {
     ).toBe(0);
   });
 
+  it("does not normalise argv: a padded or case-variant token is not the flag", () => {
+    // sys.argv is what argparse ITSELF parsed. `" --use-sage-attention "` and
+    // `"--USE-SAGE-ATTENTION"` are tokens ComfyUI did not recognise, so the backend was
+    // never enabled and nothing was proven — trimming or lower-casing here would
+    // manufacture the positive out of a token that had no effect.
+    expect(packagesProvenByServerArgv(["main.py", " --use-sage-attention "]).size).toBe(0);
+    expect(packagesProvenByServerArgv(["main.py", "--USE-SAGE-ATTENTION"]).size).toBe(0);
+    expect(packagesProvenByServerArgv(["main.py", "--Use-Sage-Attention"]).size).toBe(0);
+  });
+
   it("claims nothing when the flag is absent, and never from a lookalike token", () => {
     expect(packagesProvenByServerArgv(["python", "main.py"]).size).toBe(0);
     expect(packagesProvenByServerArgv(["--no-use-sage-attention"]).size).toBe(0);

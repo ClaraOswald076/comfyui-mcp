@@ -465,12 +465,16 @@ const ARGV_PROVEN_PACKAGES: ReadonlyArray<{
 /**
  * Which of the packages we report are proven present by the running server's argv.
  *
- * EXACT token match only. These are argparse `store_true` flags, so `--use-sage-attention`
- * never legitimately carries an `=value`, and there is nothing to be tolerant of. An
- * earlier version split every token on `=` to accept `--flag=value`; that spelling cannot
- * occur for a boolean flag, so the leniency bought nothing and only widened what could be
- * mistaken for the flag. This function's whole job is to assert a POSITIVE, and a
- * fabricated positive here reads to an agent as "the acceleration is there" — the exact
+ * EXACT token match only — the RAW argv string, not a trimmed or lower-cased version of
+ * it. `sys.argv` is what argparse itself parsed: `" --use-sage-attention "` and
+ * `"--USE-SAGE-ATTENTION"` are tokens ComfyUI did NOT recognise as the flag, so the
+ * server did not enable the backend and nothing was proven. Normalising them here would
+ * manufacture the positive out of a token that had no effect.
+ *
+ * Earlier versions also split on `=` to accept `--flag=value`; that spelling cannot occur
+ * for an argparse `store_true` flag, so the leniency bought nothing and only widened what
+ * could be mistaken for the flag. This function's whole job is to assert a POSITIVE, and
+ * a fabricated positive reads to an agent as "the acceleration is there" — the exact
  * false report in the other direction from the one #401 is about.
  */
 export function packagesProvenByServerArgv(
@@ -478,9 +482,7 @@ export function packagesProvenByServerArgv(
 ): Set<"triton" | "sageattention"> {
   const proven = new Set<"triton" | "sageattention">();
   if (!Array.isArray(argv)) return proven;
-  const tokens = argv
-    .filter((t): t is string => typeof t === "string")
-    .map((t) => t.trim().toLowerCase());
+  const tokens = argv.filter((t): t is string => typeof t === "string");
   for (const { pkg, flag } of ARGV_PROVEN_PACKAGES) {
     if (tokens.includes(flag)) proven.add(pkg);
   }

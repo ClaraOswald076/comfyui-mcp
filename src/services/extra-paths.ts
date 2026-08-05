@@ -861,7 +861,11 @@ async function resolveTargetPathPreferServer(
     // this fallback with add/remove: an edit here could be a silent no-op (#764).
     if (allowUnprovenLocalListFallback) {
       return unprovenListFallback(
-        "NOTE: the connected ComfyUI is local and reachable, but its /system_stats launch argv does not reveal main.py, so the config the running server reads cannot be proven. Showing the local auto-selected config instead; this is a fallback, not confirmation that the live server reads it. Pass config_path or target: \"standalone\"/\"desktop\" to choose a file explicitly.",
+        // Built from `localityGap`, never from a hardcoded "argv does not reveal
+        // main.py". Argv often DOES reveal one and the lookup failed (EACCES, a stalled
+        // mount, or a script deleted since startup) — stating the missing-argv cause
+        // there is a false cause in the caption, the same defect one level out.
+        `NOTE: the connected ComfyUI is local and reachable, but ${localityGap}, so the config the running server reads cannot be proven. Showing the local auto-selected config instead; this is a fallback, not confirmation that the live server reads it. Pass config_path or target: "standalone"/"desktop" to choose a file explicitly.`,
       );
     }
     throw new ValidationError(
@@ -898,7 +902,7 @@ async function resolveTargetPathPreferServer(
     if (script && liveRoot) return implicitLiveTarget(liveRoot, opts, rawFlag);
     if (allowUnprovenLocalListFallback) {
       return unprovenListFallback(
-        `NOTE: the connected ComfyUI is local and reachable, but it was launched with a RELATIVE --extra-model-paths-config ("${rawFlag}") and reports neither its working directory nor a main.py, so the file it actually reads cannot be located from this process. Showing the local auto-selected config instead; this is a fallback, not confirmation that the live server reads it. Pass config_path with the flag's absolute path to see the real one.`,
+        `NOTE: the connected ComfyUI is local and reachable, but it was launched with a RELATIVE --extra-model-paths-config ("${rawFlag}") and does not report its working directory, and ${localityGap} — so the file it actually reads cannot be located from this process. Showing the local auto-selected config instead; this is a fallback, not confirmation that the live server reads it. Pass config_path with the flag's absolute path to see the real one.`,
       );
     }
     throw new ValidationError(
