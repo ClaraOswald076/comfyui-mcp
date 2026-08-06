@@ -51,6 +51,34 @@ vi.mock("../../services/storage/index.js", async () => {
   return { ...actual, downloadCloudUrlToFile: vi.fn() };
 });
 
+/** Foreign-writer coordination seam (#869). The retry loop calls abortableDelay
+ *  at exactly ONE point: after a failed attempt has fully unwound AND its
+ *  baseline snapshot of the staged file has been recorded, and before the next
+ *  attempt re-proves that snapshot. That is precisely the window in which a
+ *  competing writer must act for the interference check to observe it. Arming a
+ *  one-shot hook here makes the interference tests deterministic BY CONSTRUCTION
+ *  — the previous shape (a background writer polling the file, then overwriting
+ *  it after a fixed 250 ms) raced the attempt's unwinding, and on a loaded CI
+ *  runner the unwinding side of the race could observe the file mid-overwrite
+ *  (0 bytes between truncate and write) and take the 0-byte refusal branch
+ *  instead of the interference one. The hook fires before the real delay runs,
+ *  so abort/backoff semantics are unchanged for every other caller. */
+const backoffHook = vi.hoisted(() => ({ current: null as null | (() => void | Promise<void>) }));
+vi.mock("../../services/download-retry.js", async () => {
+  const actual = await vi.importActual<typeof import("../../services/download-retry.js")>(
+    "../../services/download-retry.js",
+  );
+  return {
+    ...actual,
+    abortableDelay: async (ms: number, signal?: AbortSignal): Promise<void> => {
+      const hook = backoffHook.current;
+      backoffHook.current = null; // one-shot: each test arms exactly one foreign write
+      if (hook) await hook();
+      return actual.abortableDelay(ms, signal);
+    },
+  };
+});
+
 import { config } from "../../config.js";
 import { downloadCacheFs } from "../../services/download-cache.js";
 import { downloadModel } from "../../services/model-resolver.js";
@@ -284,6 +312,7 @@ describe("download retry + resume, end to end (#470)", () => {
     });
     await mkdir(cacheDir, { recursive: true });
     progressRows.length = 0;
+    backoffHook.current = null;
   });
 
   afterEach(async () => {
@@ -623,23 +652,18 @@ describe("download retry + resume, end to end (#470)", () => {
     // so any size change is proof of another writer.
     const url = "https://example.com/models/contended.safetensors";
     const { partial } = cachePaths(url);
-    // A backoff long enough that the other writer provably acts DURING it, after
-    // our own attempt has fully unwound (which takes single-digit ms here).
-    setDownloadRetryPolicyForTests({ backoffBaseMs: 2_000, backoffCapMs: 2_000 });
+    // The other writer acts INSIDE the backoff window — deterministically (#869):
+    // the hook runs after this attempt has fully unwound and its baseline
+    // snapshot of the staged file has been recorded, and before the next attempt
+    // re-proves that snapshot. (This used to be a background writer on a 250 ms
+    // timer, which raced the attempt's unwinding and once observed the file
+    // mid-overwrite on a loaded CI runner — the 0-byte branch fired instead of
+    // the interference one.)
+    backoffHook.current = async () => {
+      await writeFile(partial, "SOMEONE-ELSES-LONGER-CONTENT");
+    };
 
-    fetchMock.mockImplementationOnce(async () => {
-      // Simulate the other writer replacing the staged file during our backoff.
-      void (async () => {
-        for (let i = 0; i < 400; i += 1) {
-          const size = await stat(partial).then((s) => s.size).catch(() => 0);
-          if (size >= 4) break;
-          await new Promise((r) => setTimeout(r, 5));
-        }
-        await new Promise((r) => setTimeout(r, 250)); // our attempt has ended; the backoff is running
-        await writeFile(partial, "SOMEONE-ELSES-LONGER-CONTENT");
-      })();
-      return shortBody("AAAA", 64, { etag: '"v"' });
-    });
+    fetchMock.mockImplementationOnce(async () => shortBody("AAAA", 64, { etag: '"v"' }));
     fetchMock.mockImplementation(async () => new Response("MUST-NOT-BE-FETCHED", { status: 200 }));
 
     const err = await downloadModel(url, "checkpoints", "contended-out.safetensors").catch(
@@ -687,22 +711,15 @@ describe("download retry + resume, end to end (#470)", () => {
     // which is why the snapshot covers the sidecar and not just the size.
     const url = "https://example.com/models/same-size-swap.safetensors";
     const { partial, sidecar } = cachePaths(url);
-    setDownloadRetryPolicyForTests({ backoffBaseMs: 2_000, backoffCapMs: 2_000 });
+    // The swap lands inside the backoff window, driven by the deterministic
+    // hook (#869) — after our baseline snapshot, before the next attempt's check.
+    backoffHook.current = async () => {
+      // SAME length, DIFFERENT object — byte count is unchanged.
+      await writeFile(partial, "ZZZZ");
+      await writeFile(sidecar, '"obj-v2"');
+    };
 
-    fetchMock.mockImplementationOnce(async () => {
-      void (async () => {
-        for (let i = 0; i < 400; i += 1) {
-          const size = await stat(partial).then((s) => s.size).catch(() => 0);
-          if (size >= 4) break;
-          await new Promise((r) => setTimeout(r, 5));
-        }
-        await new Promise((r) => setTimeout(r, 250));
-        // SAME length, DIFFERENT object — byte count is unchanged.
-        await writeFile(partial, "ZZZZ");
-        await writeFile(sidecar, '"obj-v2"');
-      })();
-      return shortBody("AAAA", 64, { etag: '"obj-v1"' });
-    });
+    fetchMock.mockImplementationOnce(async () => shortBody("AAAA", 64, { etag: '"obj-v1"' }));
     fetchMock.mockImplementation(async () => new Response("MUST-NOT-BE-FETCHED", { status: 200 }));
 
     const err = await downloadModel(url, "checkpoints", "same-size-swap-out.safetensors").catch(
@@ -780,11 +797,12 @@ describe("download retry + resume, end to end (#470)", () => {
       stagedPath = targetPath as string;
       if (call === 1) {
         await writeFile(stagedPath, "OURS");
-        // The other writer stages substantial progress during our backoff.
-        void (async () => {
-          await new Promise((r) => setTimeout(r, 250));
+        // The other writer stages substantial progress during our backoff —
+        // deterministically (#869): the hook fires after this attempt has fully
+        // unwound and its baseline snapshot was recorded, before the retry check.
+        backoffHook.current = async () => {
           await writeFile(stagedPath, "SOMEONE-ELSES-MANY-GIGABYTES");
-        })();
+        };
         throw Object.assign(new Error("connection reset by peer"), { code: "ECONNRESET" });
       }
       // A later attempt must never get here with the other writer's bytes staged.

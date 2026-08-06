@@ -32,6 +32,7 @@ import {
   readPersistedDownloadJob,
   listPersistedDownloadJobs,
   findPersistedDownloadJob,
+  removePersistedDownloadJobFor,
   clearDownloadProgress,
   persistedRecordsEnabled,
   PERSIST_OWNER,
@@ -129,6 +130,10 @@ export interface DownloadJob {
   staleInflight?: boolean;
   /** Age of the missing persisted heartbeat, used only for status diagnostics. */
   staleForMs?: number;
+  /** This "cancelled" record was written by a LATER session reclaiming a stale
+   *  in-flight record whose writer was PROVEN dead (#858) — no live transfer was
+   *  aborted, so no renderer may claim a resumable partial was deliberately left. */
+  reclaimedDead?: boolean;
 }
 
 interface Entry {
@@ -798,6 +803,7 @@ function persistJobRecord(job: DownloadJob): boolean {
     verify_note: job.verify_note,
     disk_verified: job.disk_verified,
     verified_root: job.verified_root,
+    reclaimed_dead: job.reclaimedDead,
   });
 }
 
@@ -829,6 +835,7 @@ function jobFromPersisted(rec: PersistedDownloadJob): DownloadJob {
     verified_root: rec.verified_root,
     staleInflight: rec.staleInflight,
     staleForMs: rec.staleForMs,
+    reclaimedDead: rec.reclaimed_dead,
   };
 }
 
@@ -1189,6 +1196,109 @@ export function listDownloadJobs(): DownloadJob[] {
 }
 
 /**
+ * Is the process that wrote this persisted record GONE? (#858)
+ *
+ * A stale heartbeat only says PERSISTENCE stopped — a reconnect can interrupt
+ * the heartbeat while the HTTP stream keeps writing (#761), so staleness alone
+ * never licenses touching another session's record. What proves the writer dead
+ * is that no process answers to the pid stamped on the record: the transfer
+ * lives in that process, so a dead pid means a dead writer.
+ *
+ *   true      — ESRCH: no such process exists. PROVEN gone.
+ *   false     — a process answers to the pid. (It could be an unrelated process
+ *               reusing the pid — that direction only ever refuses, never
+ *               destroys, so the error is safe.)
+ *   undefined — cannot tell: no pid recorded (pre-#858 record) or the probe
+ *               itself failed. Absence of evidence is NOT evidence of absence.
+ */
+function writerProcessGone(rec: PersistedDownloadJob): boolean | undefined {
+  // Our own record belongs to THIS very process — alive by definition.
+  if (rec.owner === PERSIST_OWNER) return false;
+  const pid = rec.pid;
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return undefined;
+  if (pid === process.pid) return false;
+  try {
+    process.kill(pid, 0); // signal 0: existence probe, nothing is signalled
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === "ESRCH" ? true : undefined;
+  }
+}
+
+/**
+ * Close a STALE in-flight persisted record whose writer is PROVEN gone (#858) —
+ * the recovery the jammed cancel in #858 needed: the record is rewritten as a
+ * terminal "cancelled" owned by THIS session, the dead owner's record file is
+ * removed, and the dead writer's panel tray row is cleared unless a live job
+ * still shares it. The download can then be safely re-issued (it resumes from
+ * whatever .partial the dead writer left, or restarts cleanly).
+ *
+ * Order is deliberate (report before you destroy): the replacement terminal
+ * record is made durable FIRST, so a transient persistence failure leaves the
+ * stale record untouched — never a download with no record at all.
+ *
+ * Nothing here fabricates a cancellation of live work: it only runs once the
+ * writer is proven dead, which means the physical transfer had ALREADY stopped
+ * on its own. The record is marked `reclaimed_dead` so renderers disclose that
+ * instead of narrating an abort that never happened.
+ */
+function reclaimDeadPersistedDownload(
+  rec: PersistedDownloadJob,
+): {
+  reclaimed: boolean;
+  denied?: "owner-alive" | "owner-unknown" | "persist-failed";
+  /** The replacement terminal record is durable, but the dead owner's original
+   *  record file could not be deleted — the caller must DISCLOSE the leftover,
+   *  not claim a clean close (codex gate, round 2). */
+  staleRecordLeft?: boolean;
+} {
+  const gone = writerProcessGone(rec);
+  if (gone !== true) {
+    return { reclaimed: false, denied: gone === false ? "owner-alive" : "owner-unknown" };
+  }
+  const durable = persistDownloadJob({
+    ...rec,
+    // The staleness diagnostics are read-only annotations and are never persisted.
+    staleInflight: undefined,
+    staleForMs: undefined,
+    status: "cancelled",
+    finished_at: rec.finished_at ?? Date.now(),
+    reclaimed_dead: true,
+  });
+  if (!durable) return { reclaimed: false, denied: "persist-failed" };
+  const removed = removePersistedDownloadJobFor(rec.id, rec.owner ?? "");
+  // The dead writer's tray row would linger in the panel otherwise. Clear it
+  // ONLY when no possibly-live job could share it. Rows are keyed by the
+  // writer-reported progressId, but a job whose writer has not reported yet is
+  // identifiable only by trayId, so count BOTH ids of every candidate. And a
+  // STALE foreign record is counted too: a stale heartbeat is not proof its
+  // writer stopped (#761) — only THIS record's death has been proven (it is
+  // already removed by this point, or the failure is reported via
+  // staleRecordLeft). Over-counting only ever skips a clear (safe), never wipes
+  // a live row (the #515 invariant).
+  const rowIds = new Set(
+    [rec.progressId, rec.trayId].filter((x): x is string => typeof x === "string" && x.length > 0),
+  );
+  if (rowIds.size > 0) {
+    const liveRowIds = new Set<string>();
+    for (const e of new Set(jobs.values())) {
+      if (e.job.status !== "downloading") continue;
+      if (e.job.progressId) liveRowIds.add(e.job.progressId);
+      liveRowIds.add(e.job.trayId);
+    }
+    for (const r of listPersistedDownloadJobs()) {
+      if (r.status !== "downloading") continue;
+      if (r.progressId) liveRowIds.add(r.progressId);
+      if (r.trayId) liveRowIds.add(r.trayId);
+    }
+    for (const rowId of rowIds) {
+      if (!liveRowIds.has(rowId)) clearDownloadProgress(rowId);
+    }
+  }
+  return { reclaimed: true, staleRecordLeft: !removed };
+}
+
+/**
  * Cancel an in-flight download by id (#515): abort its stream and mark it
  * cancelled. The abort unwinds the fetch + pipeline; the .partial is left on disk
  * (resumable) and NEVER renamed to the destination, so nothing is reported as
@@ -1196,8 +1306,12 @@ export function listDownloadJobs(): DownloadJob[] {
  * Returns the resulting status plus whether this call performed the abort.
  *
  * Only a download owned by THIS process can be aborted (its AbortController lives
- * here). A job resolvable only via the persisted store (started by another/previous
- * session after a reconnect) cannot be aborted from here — reported as not-owned.
+ * here). A job resolvable only via the persisted store belongs to another
+ * session: while that session may still be alive the cancel REFUSES (#761) — but
+ * a stale in-flight record whose writer is PROVEN gone (its process no longer
+ * exists) is reclaimed instead (#858): closed as cancelled so the user is no
+ * longer wedged between a status that says "do not re-issue" and a cancel that
+ * says "not yours".
  */
 export function cancelDownloadJob(
   id: string,
@@ -1214,6 +1328,18 @@ export function cancelDownloadJob(
    *  session shares it with a different trayId) — declined, nothing was aborted.
    *  Pass `trayId` to resolve it. */
   ambiguous?: boolean;
+  /** A stale foreign in-flight record whose writer was PROVEN gone was closed as
+   *  cancelled (#858). No live transfer was aborted — there was none left. */
+  reclaimed?: boolean;
+  /** The reclaim's terminal record is durable, but the dead owner's original
+   *  record file could not be deleted — disclose the leftover, don't claim a
+   *  clean close. */
+  staleRecordLeft?: boolean;
+  /** Why a stale foreign record was NOT reclaimed: the owning process is still
+   *  alive (the transfer may still be writing), its death cannot be proven from
+   *  here (no writer identity on the record), or closing the record failed
+   *  transiently (retry). */
+  reclaimDenied?: "owner-alive" | "owner-unknown" | "persist-failed";
   /** Every download the id answers to — so an ambiguity refusal can NAME the
    *  choices instead of leaving the caller with no next move. */
   candidates?: DownloadJob[];
@@ -1238,9 +1364,38 @@ export function cancelDownloadJob(
       if (!controller.signal.aborted) controller.abort();
       return { found: true, owned: true, aborted: true, status: "downloading", job };
     }
-    // Not ours. It may be another session's (persisted) — reportable, not abortable.
+    // Not ours. It may be another session's (persisted). A LIVE one is reportable,
+    // not abortable — but a STALE one whose writer is proven gone is reclaimed
+    // (#858): closed as cancelled so the download can be safely re-issued.
     const foreign = listDownloadJobCandidates(id).find((j) => j.trayId === trayId);
     if (foreign) {
+      if (foreign.status === "downloading" && foreign.staleInflight) {
+        const rec = listPersistedDownloadJobs().find(
+          (r) => r.id === id && r.trayId === trayId && r.status === "downloading",
+        );
+        if (rec) {
+          const re = reclaimDeadPersistedDownload(rec);
+          if (re.reclaimed) {
+            return {
+              found: true,
+              owned: false,
+              aborted: false,
+              reclaimed: true,
+              staleRecordLeft: re.staleRecordLeft,
+              status: "cancelled",
+              job: { ...jobFromPersisted(rec), status: "cancelled", reclaimedDead: true },
+            };
+          }
+          return {
+            found: true,
+            owned: false,
+            aborted: false,
+            reclaimDenied: re.denied,
+            status: foreign.status,
+            job: foreign,
+          };
+        }
+      }
       return { found: true, owned: false, aborted: false, status: foreign.status, job: foreign };
     }
     return { found: false, owned: false, aborted: false, candidates: listDownloadJobCandidates(id) };
@@ -1312,6 +1467,30 @@ export function cancelDownloadJob(
   }
   const persisted = readPersistedDownloadJob(id);
   if (persisted) {
+    // A STALE in-flight record whose writer is proven gone is reclaimed (#858);
+    // a live or unprovable one stays refused exactly as before (#761).
+    if (persisted.status === "downloading" && persisted.staleInflight) {
+      const re = reclaimDeadPersistedDownload(persisted);
+      if (re.reclaimed) {
+        return {
+          found: true,
+          owned: false,
+          aborted: false,
+          reclaimed: true,
+          staleRecordLeft: re.staleRecordLeft,
+          status: "cancelled",
+          job: { ...jobFromPersisted(persisted), status: "cancelled", reclaimedDead: true },
+        };
+      }
+      return {
+        found: true,
+        owned: false,
+        aborted: false,
+        reclaimDenied: re.denied,
+        status: persisted.status,
+        job: jobFromPersisted(persisted),
+      };
+    }
     return {
       found: true,
       owned: false,
