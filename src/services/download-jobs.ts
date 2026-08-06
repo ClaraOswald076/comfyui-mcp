@@ -1268,16 +1268,18 @@ function reclaimDeadPersistedDownload(
   if (!durable) return { reclaimed: false, denied: "persist-failed" };
   const removed = removePersistedDownloadJobFor(rec.id, rec.owner ?? "");
   // The dead writer's tray row would linger in the panel otherwise. Clear it
-  // ONLY when no LIVE job — this process's in-flight entries or a FRESH foreign
-  // record — could share it. Rows are keyed by the writer-reported progressId,
-  // but a job whose writer has not reported yet is identifiable only by trayId,
-  // so count BOTH ids of every live job: over-counting a live id only ever
-  // skips a clear (safe), never wipes a live row (the #515 invariant).
+  // ONLY when no possibly-live job could share it. Rows are keyed by the
+  // writer-reported progressId, but a job whose writer has not reported yet is
+  // identifiable only by trayId, so count BOTH ids of every candidate. And a
+  // STALE foreign record is counted too: a stale heartbeat is not proof its
+  // writer stopped (#761) — only THIS record's death has been proven (it is
+  // already removed by this point, or the failure is reported via
+  // staleRecordLeft). Over-counting only ever skips a clear (safe), never wipes
+  // a live row (the #515 invariant).
   const rowIds = new Set(
     [rec.progressId, rec.trayId].filter((x): x is string => typeof x === "string" && x.length > 0),
   );
   if (rowIds.size > 0) {
-    const now = Date.now();
     const liveRowIds = new Set<string>();
     for (const e of new Set(jobs.values())) {
       if (e.job.status !== "downloading") continue;
@@ -1286,7 +1288,6 @@ function reclaimDeadPersistedDownload(
     }
     for (const r of listPersistedDownloadJobs()) {
       if (r.status !== "downloading") continue;
-      if (now - (r.updated ?? 0) >= PERSISTED_INFLIGHT_STALE_MS) continue;
       if (r.progressId) liveRowIds.add(r.progressId);
       if (r.trayId) liveRowIds.add(r.trayId);
     }

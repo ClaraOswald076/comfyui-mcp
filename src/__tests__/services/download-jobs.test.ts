@@ -1583,6 +1583,46 @@ describe("download job registry", () => {
         }
       });
 
+      it("reclaim does NOT clear a row id shared by a STALE-but-alive sibling — a stale heartbeat is not death (#761)", async () => {
+        // The sibling's heartbeat is stale, but its process provably exists, so it
+        // may still be writing rows under the shared id; the reclaim of a PROVEN-
+        // dead record must not wipe them (codex gate, round 3).
+        const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
+        setProgressDir(dir);
+        const clearSpy = vi.spyOn(progressModule, "clearDownloadProgress");
+        try {
+          const id = "deadsibling858xx1";
+          await writeForeignJobRecord(dir, {
+            id,
+            trayId: "deadownsthistray01",
+            progressId: "shared-stale-prog",
+            url: URL_A,
+            owner: "dead-session",
+            ageMs: 10 * 60 * 1000,
+            pid: deadPid(),
+          });
+          // Stale heartbeat, LIVE process (this pid stands in for it).
+          await writeForeignJobRecord(dir, {
+            id: "stalelivesib858xx1",
+            trayId: "stalelivetray0001",
+            progressId: "shared-stale-prog",
+            url: URL_B,
+            owner: "stale-live-session",
+            ageMs: 10 * 60 * 1000,
+            pid: process.pid,
+          });
+          clearSpy.mockClear();
+
+          const res = cancelDownloadJob(id);
+          expect(res.reclaimed).toBe(true);
+          expect(clearSpy).not.toHaveBeenCalledWith("shared-stale-prog");
+        } finally {
+          clearSpy.mockRestore();
+          setProgressDir("");
+          await fsRm(dir, { recursive: true, force: true });
+        }
+      });
+
       it("reclaim does NOT clear a row id a live download shares via TRAY id when its progress id differs", async () => {
         // The inverse shape of the test above: the live download's rows are keyed
         // by a DIFFERENT progress id (query-auth/rewrite), but it shares the dead
