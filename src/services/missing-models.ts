@@ -1,7 +1,7 @@
 // Missing-model resolution: figure out which model files a workflow wants but
 // this ComfyUI doesn't have, then find installable candidates for them.
 //
-// WHY THIS EXISTS: `extract_workflow_dependencies` / `install_workflow_dependencies`
+// WHY THIS EXISTS: `list_packs` action:"extract_deps" / action:"install_deps"
 // resolve the custom NODE PACKS a workflow needs — they never touch the missing
 // MODEL side of the same problem. So "open this Template and make it runnable"
 // took two manual hops: the agent had to infer which checkpoint/VAE/LoRA was

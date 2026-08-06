@@ -18,11 +18,20 @@ function captureToolDescriptions(
   return descriptions;
 }
 
-describe("list_workflow_templates description (#359 — no core-template overclaim)", () => {
+// 0.50.0 slice 9 folded the template listing into `list_packs`
+// (action:"list_templates"), so the #359 wording now lives in that action's
+// bullet inside the consolidated description. The guard follows it there rather
+// than lapsing: an overclaim would mislead exactly as much from a bullet.
+describe('list_packs action:"list_templates" description (#359 — no core-template overclaim)', () => {
   const descriptions = captureToolDescriptions(registerSkillsAccessTools as never);
-  const desc = descriptions.get("list_workflow_templates") ?? "";
+  const full = descriptions.get("list_packs") ?? "";
+  // The bullet for this action only — so a phrase elsewhere in the (now much
+  // longer) description cannot satisfy an assertion about this one.
+  const desc =
+    full.split(/\r?\n/).find((line) => line.startsWith('- action:"list_templates"')) ?? "";
 
-  it("registers the tool with a description", () => {
+  it("registers the tool with a description that has this action's bullet", () => {
+    expect(full.length).toBeGreaterThan(0);
     expect(desc.length).toBeGreaterThan(0);
   });
 

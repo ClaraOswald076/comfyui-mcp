@@ -256,9 +256,10 @@ provider switch by mapping to the nearest valid level for the target backend
 ## Knowledge & cost parity
 
 Because only Claude can load native skills, the bundled expertise is
-published as MCP tools any backend can call — `list_skills`, `read_skill`,
-`list_packs`, `read_pack_workflow`, `list_workflow_templates` — plus the
-local-GPU-vs-paid-API guardrail (`check_workflow_runtime`) and one-shot
+published as one MCP tool any backend can call — `list_packs`, whose actions
+cover the skills (`skill_list`, `skill_read`), the installer packs (`list`,
+`read_workflow`) and the server's templates (`list_templates`) — plus the
+local-GPU-vs-paid-API guardrail (`action: "check_runtime"`) and one-shot
 `panel_load_workflow`. See [Skills, Packs & Runtime Cost](./tools/skills-knowledge).
 
 ## See also

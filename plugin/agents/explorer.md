@@ -44,7 +44,7 @@ Given a custom node pack name or GitHub URL, you will:
 
 ### Step 5: Generate the Skill
 
-- Use `generate_node_skill` to create the initial skill, OR write a comprehensive SKILL.md manually if you have richer information from your research
+- Use `list_packs` with `action: "generate_skill"` to create the initial skill, OR write a comprehensive SKILL.md manually if you have richer information from your research
 - The skill file should include:
   - **Overview**: What the pack does, when to use it
   - **Node Reference**: Every node with its class_type, inputs, outputs, and description

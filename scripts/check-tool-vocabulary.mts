@@ -128,6 +128,11 @@ const SELF = new Set([
   "src/__tests__/tools/process-control-tool.test.ts",
   "src/__tests__/tools/api-nodes.test.ts",
   "src/__tests__/tools/defaults.test.ts",
+  // Same, for 0.50.0 slice 9: asserts as FIXTURES that the eight retired
+  // knowledge names are in DEAD_NAMES with `list_packs` replacements — and that
+  // no ACTION is spelled the same as one of them, which is the invariant that
+  // keeps this gate's own replacement text writable.
+  "src/__tests__/tools/skills-access.test.ts",
   // Same, for the #659 retired-name error: these pass dead names to call_tool /
   // the ollama dispatch as FIXTURES and assert the error quotes the ledger's
   // replacement — the names are call arguments under test, not live guidance.

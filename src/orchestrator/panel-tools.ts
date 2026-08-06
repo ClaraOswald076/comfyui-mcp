@@ -6211,7 +6211,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_load_workflow",
-      "Load a full ComfyUI workflow onto the live canvas in one shot (replaces the current graph). Three ways to specify it: `pack:<name>` for a bundled installer pack's local-GPU workflow; `path:<file>` to read an arbitrary workflow .json off DISK server-side (absolute, or relative to the ComfyUI workflows folder) — use this to open a staged/downloaded example without shuttling its JSON through chat; or an inline `graph` object/JSON string. `pack` and `path` are read SERVER-SIDE so a large graph never enters your context. The replaced graph is captured as an undo point (double-Esc / revert). Pack workflows are LOCAL/free; for a `path`/`graph` that may use API nodes, check the runtime first (check_workflow_runtime) and ASK the user before spending paid api credits.",
+      "Load a full ComfyUI workflow onto the live canvas in one shot (replaces the current graph). Three ways to specify it: `pack:<name>` for a bundled installer pack's local-GPU workflow; `path:<file>` to read an arbitrary workflow .json off DISK server-side (absolute, or relative to the ComfyUI workflows folder) — use this to open a staged/downloaded example without shuttling its JSON through chat; or an inline `graph` object/JSON string. `pack` and `path` are read SERVER-SIDE so a large graph never enters your context. The replaced graph is captured as an undo point (double-Esc / revert). Pack workflows are LOCAL/free; for a `path`/`graph` that may use API nodes, check the runtime first (list_packs action:\"check_runtime\") and ASK the user before spending paid api credits.",
       {
         pack: z
           .string()

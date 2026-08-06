@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // install (Desktop Manager reboot, a manual restart — anything that does NOT go
 // through an mcp tool and so never calls resetObjectInfoCache()). The old cache
 // was memoized for the whole process lifetime, so get_node_info /
-// check_workflow_runtime / validate_workflow reported the newly-installed nodes
+// list_packs (action:"check_runtime") / validate_workflow reported the new nodes
 // as unknown forever. A bounded freshness window (TTL) must let the NEXT call
 // after the window pick up the live server's changed node set on its own.
 

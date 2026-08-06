@@ -51,7 +51,6 @@ export const TOOL_NAMES = [
   "download_status",
   "cancel_download",
   "list_local_models",
-  "generate_node_skill",
   "get_logs",
   "get_history",
   "diagnose_run",
@@ -104,8 +103,6 @@ export const TOOL_NAMES = [
   "list_installed_nodes",
   "sync_node_dependencies",
   "report_issue",
-  "extract_workflow_dependencies",
-  "install_workflow_dependencies",
   "resolve_missing_models",
   "install_comfyui",
   "update_comfyui",
@@ -133,12 +130,7 @@ export const TOOL_NAMES = [
   "health_check",
   "lock_workflow",
   "verify_workflow_lock",
-  "list_skills",
-  "read_skill",
   "list_packs",
-  "list_workflow_templates",
-  "read_pack_workflow",
-  "check_workflow_runtime",
   "install_panel",
   "self_update",
   "calculate",
@@ -295,7 +287,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 138;
+export const MAX_TOOLS = 130;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;
@@ -807,6 +799,66 @@ export const DEAD_NAMES: readonly DeadName[] = [
         why: "Second line of the same superseded banner — see the get_comfyui_settings entry above.",
       },
     ],
+  },
+  // 0.50.0 slice 9: the nine knowledge tools — bundled skills, installer packs,
+  // the connected server's workflow templates, and the two workflow-readiness
+  // checks — folded into one action-parameterized `list_packs` tool. Same
+  // enumeration/reading helpers, same api-nodes + workflow-deps + skill-cache
+  // services, same return shapes (JSON for the listings, raw markdown/graph text
+  // for the reads, the markdown report for the deps actions, and
+  // generate_skill's `structuredContent`) — only the surface changed, so every
+  // mention of the old names is now rot pointing at a 404.
+  {
+    name: "read_pack_workflow",
+    since: "0.50.0",
+    replacement: 'list_packs (action:"read_workflow")',
+  },
+  {
+    name: "list_workflow_templates",
+    since: "0.50.0",
+    replacement: 'list_packs (action:"list_templates")',
+  },
+  {
+    name: "check_workflow_runtime",
+    since: "0.50.0",
+    replacement: 'list_packs (action:"check_runtime")',
+  },
+  {
+    name: "extract_workflow_dependencies",
+    since: "0.50.0",
+    replacement: 'list_packs (action:"extract_deps")',
+  },
+  {
+    name: "install_workflow_dependencies",
+    since: "0.50.0",
+    replacement: 'list_packs (action:"install_deps")',
+    allowedIn: [
+      {
+        path: "docs/using-tools.mdx",
+        context: '| `install_workflow_dependencies` | `list_packs` with `action: "install_deps"` |',
+        why: "The old-name → new-form migration table on the human-facing tools guide, same as the get_workspace/get_queue rows above. The left column must spell the retired name; it is a mapping AWAY from the name, never an instruction to call it.",
+      },
+    ],
+  },
+  {
+    name: "list_skills",
+    since: "0.50.0",
+    // NOT action:"list_skills". An action may never be spelled the same as a
+    // name the same fold retires: the dead-name gate matches the bare token, so
+    // `list_packs (action:"list_skills")` — the very replacement text every
+    // sweep would have to write — reads as a live reference to the dead tool and
+    // can never go green. Same for read_skill → action:"skill_read" below.
+    replacement: 'list_packs (action:"skill_list")',
+  },
+  {
+    name: "read_skill",
+    since: "0.50.0",
+    replacement: 'list_packs (action:"skill_read")',
+  },
+  {
+    name: "generate_node_skill",
+    since: "0.50.0",
+    replacement: 'list_packs (action:"generate_skill")',
   },
 ];
 

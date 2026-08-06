@@ -111,7 +111,13 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   // explicit themed confirm client-side. (Revisit if a canvas-less/foreign tab
   // must not be able to trigger a node install.)
   "resolve_missing_models",
-  "extract_workflow_dependencies",
+  // 0.50.0 slice 9 folded the nine knowledge tools into this one name, and the
+  // entry it replaces was the READ-ONLY dependency EXTRACTOR (see DEAD_NAMES).
+  // The fold brings install_deps — which installs custom node packs through
+  // ComfyUI-Manager, i.e. downloads and runs third-party code — under the same
+  // name, so admission is ACTION-scoped below to exactly what the retired entry
+  // covered. Whitelisting the bare name would turn a read into an install.
+  "list_packs",
   "list_installed_nodes",
   "install_custom_node",
 ]);
@@ -153,6 +159,17 @@ const CALL_TOOL_ACTION_WHITELIST: ReadonlyMap<string, ReadonlySet<string>> = new
   // troubleshoot is absent here because it now lives on `runpod_watch`, whose
   // own (unscoped) whitelist entry covers it.
   ["runpod", new Set(["status", "list", "stop", "connect", "use_local", "deploy_link"])],
+  // The `list_packs` entry above replaces the retired standalone
+  // dependency-extractor entry (0.50.0 slice 9), which admitted exactly
+  // one thing: READ which custom node packs a workflow needs and which are
+  // missing. That is action:"extract_deps" and nothing else. In particular
+  // action:"install_deps" stays REFUSED — it queues ComfyUI-Manager installs,
+  // which download and execute third-party code on the rig, and no
+  // confirmation-less call_tool frame ever had that reach. The remaining actions
+  // (list/read_workflow/list_templates/check_runtime/skill_list/skill_read),
+  // though read-only, were never whitelisted either, and generate_skill writes a
+  // file when `install_in` is set.
+  ["list_packs", new Set(["extract_deps"])],
 ]);
 
 /**

@@ -31,7 +31,7 @@ Given a problem statement, you will discover candidate custom node packs and ret
 
 - Use `mcp__comfyui__get_node_pack_details` for each shortlisted pack
 - Record: pack id, name, repository, latest version, installs, node types, and any license or compatibility notes
-- For the strongest candidates, call `mcp__comfyui__generate_node_skill` to get deeper node/workflow context; rely on its cache and use `refresh: true` only when stale results would materially change the recommendation
+- For the strongest candidates, call `mcp__comfyui__list_packs` with `action: "generate_skill"` to get deeper node/workflow context; rely on its cache and use `refresh: true` only when stale results would materially change the recommendation
 - Optionally use `WebSearch` or `WebFetch` for community signal, examples, maintenance concerns, or known pitfalls
 
 ### Step 4: Rank and Recommend

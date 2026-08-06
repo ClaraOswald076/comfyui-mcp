@@ -96,6 +96,50 @@ describe("call_tool admission", () => {
     });
   });
 
+  /**
+   * The same trap, one slice later and with money-free but machine-changing
+   * stakes: 0.50.0 slice 9 folded the nine knowledge tools into `list_packs`,
+   * replacing a whitelist entry that admitted the READ-ONLY dependency
+   * extractor. The fold brings action:"install_deps" — ComfyUI-Manager installs,
+   * i.e. downloading and running third-party code — under the same name, so the
+   * bare name must NOT be admitted.
+   */
+  it('admits list_packs for action:"extract_deps" — exactly what the retired read-only entry covered', () => {
+    expect(callToolAdmission("list_packs", { action: "extract_deps" })).toBeNull();
+    expect(
+      callToolAdmission("list_packs", { action: "extract_deps", workflow: { "1": {} } }),
+    ).toBeNull();
+  });
+
+  it("REFUSES list_packs action:\"install_deps\" — a read entry must never become an install", () => {
+    expect(callToolAdmission("list_packs", { action: "install_deps" })).toBe(
+      'tool "list_packs" is not permitted for action "install_deps"',
+    );
+    // Not reachable by omitting or fuzzing the action, either.
+    expect(callToolAdmission("list_packs", {})).toBe(
+      'tool "list_packs" is not permitted for action "(missing)"',
+    );
+    expect(callToolAdmission("list_packs", { action: 42 })).toBe(
+      'tool "list_packs" is not permitted for action "(missing)"',
+    );
+  });
+
+  it("refuses every other list_packs action — none was whitelisted before either", () => {
+    for (const action of [
+      "list",
+      "read_workflow",
+      "list_templates",
+      "check_runtime",
+      "skill_list",
+      "skill_read",
+      "generate_skill",
+    ]) {
+      expect(callToolAdmission("list_packs", { action }), `action:"${action}"`).toBe(
+        `tool "list_packs" is not permitted for action "${action}"`,
+      );
+    }
+  });
+
   it("name-level behavior is unchanged for everything else", () => {
     // A whitelisted tool with no action scope is admitted regardless of args…
     expect(callToolAdmission("list_workflows", {})).toBeNull();

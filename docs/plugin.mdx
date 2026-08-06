@@ -1,6 +1,6 @@
 ---
 title: "Claude Code Plugin"
-description: "comfyui-mcp is a full Claude Code plugin: 37 AI skills, 11 slash commands, 4 autonomous agents, and 3 hooks on top of the 138 MCP tools — expert ComfyUI knowledge that grows with every release."
+description: "comfyui-mcp is a full Claude Code plugin: 37 AI skills, 11 slash commands, 4 autonomous agents, and 3 hooks on top of the 130 MCP tools — expert ComfyUI knowledge that grows with every release."
 icon: "puzzle-piece"
 ---
 
@@ -48,7 +48,7 @@ and failure-mode guidance:
 | `comfyui-launch-flags` | The VRAM/attention/cache/perf launch-flag matrix — `--reserve-vram`, `--novram`+`--cache-none`, `--use-sage-attention` vs `--use-pytorch-cross-attention` (Z-Image), plus Blackwell/RTX 5000 accel-stack notes |
 
 New skills land with each release — generated from popular registry packs via
-the built-in `generate_node_skill` tool, then human-curated.
+the built-in `list_packs` tool (`action: "generate_skill"`), then human-curated.
 
 **Try the knowledge before wiring anything up** — every skill is a plain
 markdown file, useful on its own. The most broadly applicable one is
@@ -57,7 +57,8 @@ markdown file, useful on its own. The most broadly applicable one is
 strategy (why Flux wants natural language and no negative prompt while SD1.5
 wants tags). Read it in the browser, or paste it into any agent's context as a
 system prompt — no ComfyUI, MCP, or install required. When you do connect the
-full plugin, agents load the same files automatically (`read_skill`).
+full plugin, agents load the same files automatically (`list_packs` with
+`action: "skill_read"`).
 
 ### Civitai search — built in
 

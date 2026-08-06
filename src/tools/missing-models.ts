@@ -122,7 +122,7 @@ export function registerMissingModelTools(server: McpServer): void {
       "Detects by comparing each model widget against the option list the server actually publishes, so it covers checkpoints, LoRAs, VAEs, ControlNets, UNets, CLIP and custom-pack model types without any per-node mapping. " +
       "Each candidate reports size, source, precision/quantisation (fp16 / fp8 / GGUF Q4_K_M …) and whether it FITS this GPU's VRAM — so when the exact file is too big you can see the quantised variant that isn't. " +
       "Read-only: it downloads nothing. Pass a chosen candidate to download_model (url) or download_civitai_model (id), using the reported directory as target_subfolder. " +
-      "For missing custom NODE PACKS (not models) use install_workflow_dependencies instead.",
+      'For missing custom NODE PACKS (not models) use list_packs (action:"install_deps") instead.',
     {
       workflow: z
         .union([z.string(), z.record(z.string(), z.any())])
@@ -146,7 +146,7 @@ export function registerMissingModelTools(server: McpServer): void {
             content: [
               {
                 type: "text" as const,
-                text: "## No missing models\n\nEvery model this workflow references is present on the connected ComfyUI. (If it still fails to run, check missing custom node packs with extract_workflow_dependencies.)",
+                text: "## No missing models\n\nEvery model this workflow references is present on the connected ComfyUI. (If it still fails to run, check missing custom node packs with list_packs (action:\"extract_deps\").)",
               },
             ],
           };

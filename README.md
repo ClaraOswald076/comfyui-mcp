@@ -16,7 +16,7 @@ Works on **macOS**, **Linux**, and **Windows**. Auto-detects your ComfyUI instal
 
 **Stuck or have a question? [Join the Discord](https://discord.gg/cW9arBhzCu)** — help, model tips, and release announcements.
 
-**138 MCP tools** | **37 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
+**130 MCP tools** | **37 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
 
 The plugin ships **expert skills that grow with every release** — model-specific generation guides with curated download URLs, workflow recipes, troubleshooting, and custom-node authoring — so Claude knows the right sampler, CFG, resolution, and model files for each architecture without trial and error.
 
@@ -233,10 +233,11 @@ New tools that give every backend the same expertise and a cost guardrail:
 
 | Tool | Description |
 |------|-------------|
-| `list_skills` / `read_skill` | Discover and read bundled model-family + workflow skills — the knowledge Claude loads natively, exposed to any MCP client (e.g. the Codex backend) |
-| `list_packs` / `read_pack_workflow` | List one-command installer packs (custom nodes + weights + ready workflow; all local-GPU / free) and read a pack's graph |
-| `list_workflow_templates` | List the connected ComfyUI's official workflow templates (the templates package + custom-node-provided templates) |
-| `check_workflow_runtime` | Classify a workflow as **local** (your GPU, free) or **api** / **mixed** / **unknown** (hosted API nodes = paid credits) so the agent asks before spending paid API credits |
+| `list_packs` (`action: "skill_list"` / `"skill_read"`) | Discover and read bundled model-family + workflow skills — the knowledge Claude loads natively, exposed to any MCP client (e.g. the Codex backend) |
+| `list_packs` (`action: "list"` / `"read_workflow"`) | List one-command installer packs (custom nodes + weights + ready workflow; all local-GPU / free) and read a pack's graph |
+| `list_packs` (`action: "list_templates"`) | List the connected ComfyUI's custom-node-contributed workflow templates |
+| `list_packs` (`action: "check_runtime"`) | Classify a workflow as **local** (your GPU, free) or **api** / **mixed** / **unknown** (hosted API nodes = paid credits) so the agent asks before spending paid API credits |
+| `list_packs` (`action: "extract_deps"` / `"install_deps"`) | Work out which custom node packs a workflow needs, and install the missing ones through ComfyUI-Manager |
 | `panel_load_workflow` | (panel tool) Load a full workflow onto the live canvas in one shot — by bundled `pack` name (read server-side, never shuttled through chat) or by graph JSON |
 | `panel_strip_workflow` / `panel_slice_workflow` | (panel tools) De-virtualize a tangled graph (Get/Set buses, Reroutes, subgraphs, bypass → real connections) or carve one rgthree-toggled pipeline out of a monolith — by `pack`, server-side `path`, or inline graph; for understanding/rebuilding expert workflows without hand-tracing |
 
@@ -248,7 +249,7 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 ## MCP Tools
 
-138 tools across workflow execution, generation, iteration, composition, models, and more:
+130 tools across workflow execution, generation, iteration, composition, models, and more:
 
 ### Image Generation (high-level)
 
@@ -353,7 +354,7 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 |------|-------------|
 | `search_custom_nodes` | Search the ComfyUI Registry for custom node packs by keyword |
 | `get_node_pack_details` | Get full details of a custom node pack (description, author, nodes, install info) |
-| `generate_node_skill` | Generate a Claude skill `.md` file from a Registry ID or GitHub URL |
+| `list_packs` (`action: "generate_skill"`) | Generate a Claude skill `.md` file from a Registry ID or GitHub URL |
 | `comfy_cli` | Search actual loaded node classes through official `comfy nodes search` (action:"search_nodes") |
 
 ### Official comfy-cli
@@ -824,7 +825,6 @@ src/
     model-management.ts    # search_models, download_model, list_local_models
     memory-management.ts   # clear_vram, get_embeddings
     registry-search.ts     # search_custom_nodes, get_node_pack_details
-    skill-generator.ts     # generate_node_skill
     generation-tracker.ts  # suggest_settings, generation_stats
     diagnostics.ts         # get_logs, get_history
     process-control.ts     # restart_comfyui (restart/start/stop)

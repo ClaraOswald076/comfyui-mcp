@@ -1,13 +1,17 @@
-// #828 (end to end) — on a connected REMOTE ComfyUI, list_workflow_templates,
-// get_system_stats and check_workflow_runtime received an HTML document where
-// JSON was promised and surfaced only
+// #828 (end to end) — on a connected REMOTE ComfyUI, the template listing, the
+// runtime classifier and get_system_stats received an HTML document where JSON
+// was promised and surfaced only
 //
 //     Unexpected token '<', "<!DOCTYPE "... is not valid JSON
 //
 // These tests drive the actual tool handlers against a server that answers with
 // a proxy/frontend HTML page and assert that the tool now names what answered —
-// and, for check_workflow_runtime, that it does NOT report the server as
+// and, for action:"check_runtime", that it does NOT report the server as
 // unreachable when the server plainly answered.
+//
+// 0.50.0 slice 9 folded both of these into `list_packs`, so the same handler is
+// now reached by action rather than by tool name; the assertions are unchanged,
+// which is the point — the fold was a surface change.
 
 import { describe, expect, it, beforeEach, vi } from "vitest";
 
@@ -17,7 +21,7 @@ vi.mock("../../config.js", () => ({
   getComfyUIAuthHeaders: () => authHeaders.value,
 }));
 
-// check_workflow_runtime classifies nodes through this service; make it throw the
+// action:"check_runtime" classifies nodes through this service; make it throw the
 // SAME non-JSON error the shared client would, so the tool's error branch is the
 // one under test.
 const checkWorkflowRuntimeMock = vi.fn();
@@ -59,10 +63,10 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
-describe("list_workflow_templates on an HTML-answering remote (#828)", () => {
+describe('list_packs action:"list_templates" on an HTML-answering remote (#828)', () => {
   it("names the HTML page and the responder instead of 'Unexpected token <'", async () => {
     global.fetch = vi.fn(async () => htmlResponse(200)) as unknown as typeof fetch;
-    const out = await getHandler("list_workflow_templates")({});
+    const out = await getHandler("list_packs")({ action: "list_templates" });
     const text = out.content[0].text;
     expect(text).not.toMatch(/Unexpected token/);
     expect(text).toContain("http://remote.example:8188/api/workflow_templates");
@@ -74,7 +78,7 @@ describe("list_workflow_templates on an HTML-answering remote (#828)", () => {
 
   it("does not blame the ComfyUI VERSION when a non-2xx is actually a proxy page", async () => {
     global.fetch = vi.fn(async () => htmlResponse(502)) as unknown as typeof fetch;
-    const out = await getHandler("list_workflow_templates")({});
+    const out = await getHandler("list_packs")({ action: "list_templates" });
     const text = out.content[0].text;
     expect(out.isError).toBe(true);
     // The old message guessed at an outdated server; the body says otherwise.
@@ -90,7 +94,7 @@ describe("list_workflow_templates on an HTML-answering remote (#828)", () => {
           headers: { "content-type": "application/json" },
         }),
     ) as unknown as typeof fetch;
-    const out = await getHandler("list_workflow_templates")({});
+    const out = await getHandler("list_packs")({ action: "list_templates" });
     expect(out.isError).toBe(true);
     const text = out.content[0].text;
     expect(text).toContain('{"error":"unknown route"}');
@@ -114,7 +118,7 @@ describe("list_workflow_templates on an HTML-answering remote (#828)", () => {
             headers: { "content-type": "application/json" },
           }),
       ) as unknown as typeof fetch;
-      const out = await getHandler("list_workflow_templates")({});
+      const out = await getHandler("list_packs")({ action: "list_templates" });
       expect(out.content[0].text).not.toContain("reflected-secret-token");
     } finally {
       authHeaders.value = {};
@@ -129,7 +133,7 @@ describe("list_workflow_templates on an HTML-answering remote (#828)", () => {
           headers: { "content-type": "application/json" },
         }),
     ) as unknown as typeof fetch;
-    const out = await getHandler("list_workflow_templates")({});
+    const out = await getHandler("list_packs")({ action: "list_templates" });
     expect(out.isError).toBeUndefined();
     const parsed = JSON.parse(out.content[0].text);
     expect(parsed.source_count).toBe(1);
@@ -137,7 +141,7 @@ describe("list_workflow_templates on an HTML-answering remote (#828)", () => {
   });
 });
 
-describe("check_workflow_runtime must not call an answering server unreachable (#828)", () => {
+describe('list_packs action:"check_runtime" must not call an answering server unreachable (#828)', () => {
   const graph = { "1": { class_type: "KSampler", inputs: {} } };
 
   it("reports the non-JSON reason rather than 'could not reach the ComfyUI server'", async () => {
@@ -151,7 +155,7 @@ describe("check_workflow_runtime must not call an answering server unreachable (
         }),
       ),
     );
-    const out = await getHandler("check_workflow_runtime")({ graph });
+    const out = await getHandler("list_packs")({ action: "check_runtime", graph });
     const parsed = JSON.parse(out.content[0].text);
     expect(parsed.runtime).toBe("unknown");
     expect(parsed.reason).toBe("non_json_response");
@@ -169,7 +173,7 @@ describe("check_workflow_runtime must not call an answering server unreachable (
     checkWorkflowRuntimeMock.mockRejectedValue(
       new SyntaxError(`Unexpected token '<', "<!DOCTYPE "... is not valid JSON`),
     );
-    const out = await getHandler("check_workflow_runtime")({ graph });
+    const out = await getHandler("list_packs")({ action: "check_runtime", graph });
     const parsed = JSON.parse(out.content[0].text);
     expect(parsed.reason).toBe("non_json_response");
     expect(parsed.note).toContain("was reached");
@@ -185,7 +189,7 @@ describe("check_workflow_runtime must not call an answering server unreachable (
           `Unexpected token '<', "<html>Bearer echoed-secret-token-here</html>" is not valid JSON`,
         ),
       );
-      const out = await getHandler("check_workflow_runtime")({ graph });
+      const out = await getHandler("list_packs")({ action: "check_runtime", graph });
       expect(out.content[0].text).not.toContain("echoed-secret-token-here");
     } finally {
       authHeaders.value = {};
@@ -194,7 +198,7 @@ describe("check_workflow_runtime must not call an answering server unreachable (
 
   it("keeps the unreachable wording for a genuine transport failure", async () => {
     checkWorkflowRuntimeMock.mockRejectedValue(new Error("fetch failed"));
-    const out = await getHandler("check_workflow_runtime")({ graph });
+    const out = await getHandler("list_packs")({ action: "check_runtime", graph });
     const parsed = JSON.parse(out.content[0].text);
     expect(parsed.reason).toBe("object_info_unavailable");
     expect(parsed.note).toContain("unavailable");
@@ -208,7 +212,7 @@ describe("check_workflow_runtime must not call an answering server unreachable (
       apiNodes: [],
       unknownNodes: [],
     });
-    const out = await getHandler("check_workflow_runtime")({ graph });
+    const out = await getHandler("list_packs")({ action: "check_runtime", graph });
     const parsed = JSON.parse(out.content[0].text);
     expect(parsed.runtime).toBe("local");
     expect(parsed.reason).toBeUndefined();

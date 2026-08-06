@@ -4,7 +4,7 @@ description: "Discover, install, update, snapshot, bisect, scaffold, and publish
 icon: "puzzle"
 ---
 
-<Info>24 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
+<Info>22 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
 <Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
 
@@ -345,79 +345,6 @@ Reconcile the Python dependencies of all installed custom node packs through off
   "arguments": {}
 }
 ```
-
----
-
-## extract_workflow_dependencies
-
-Analyze a ComfyUI workflow (API JSON) and determine which custom node packs it requires. Maps each node class_type to its owning node pack using ComfyUI-Manager mappings and the server's installed node definitions, reporting which packs are installed vs missing. Works remotely (HTTP only) — mirrors `comfy-cli node deps-in-workflow`.
-
-### Parameters
-
-<ParamField path="workflow" type="string | object" required>
-  ComfyUI workflow in API format (JSON string or object)
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "extract_workflow_dependencies",
-  "arguments": {
-    "workflow": "<workflow>"
-  }
-}
-```
-
----
-
-## install_workflow_dependencies
-
-Resolve and install the custom node packs a ComfyUI workflow requires via ComfyUI-Manager. Determines the missing packs, resets the Manager queue, queues the installs, starts the worker, and reports what was installed/already-present/unresolved. Runs server-side through ComfyUI-Manager on the connected instance (works against a local OR remote --comfyui-url target); a ComfyUI restart is typically needed before new nodes load. Mirrors `comfy-cli node install-deps`.
-
-<Tip>**In plain terms:** For a workflow someone sent you that is full of red nodes: this installs the node PACKS it needs. Missing model files are a different problem — that is resolve_missing_models.</Tip>
-
-### Parameters
-
-<ParamField path="workflow" type="string | object" required>
-  ComfyUI workflow in API format (JSON string or object)
-</ParamField>
-
-### Example
-
-**You say:** Someone sent me this workflow and half the nodes are red. Fix it.
-
-```json
-{
-  "tool": "install_workflow_dependencies",
-  "arguments": {
-    "workflow": {
-      "4": {
-        "class_type": "CheckpointLoaderSimple",
-        "inputs": {
-          "ckpt_name": "sd_xl_base_1.0.safetensors"
-        }
-      },
-      "9": {
-        "class_type": "SaveImage",
-        "inputs": {
-          "filename_prefix": "portrait",
-          "images": [
-            "8",
-            0
-          ]
-        }
-      }
-    }
-  }
-}
-```
-
-<Note>Shortened for readability — two nodes of a real API-format graph are shown. In practice the agent passes the whole thing: the graph it just loaded with get_workflow, or the one it built for you.</Note>
-
-**You get back:** What it installed, what was already there, and anything it could not find. A restart is normally needed before the nodes load.
 
 ---
 

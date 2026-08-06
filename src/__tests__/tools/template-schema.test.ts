@@ -242,7 +242,7 @@ describe("classifyWidget", () => {
   });
 });
 
-describe("resolveTemplateFromIndex (id/key alignment with list_workflow_templates)", () => {
+describe('resolveTemplateFromIndex (id/key alignment with action:"list_templates")', () => {
   // Mirrors what /api/workflow_templates returns: modules → arrays of names.
   // Custom-node modules (ComfyUI-MVAdapter) list plain string names; the core
   // comfyui-workflow-templates package lists objects with a `name` field.
@@ -252,7 +252,7 @@ describe("resolveTemplateFromIndex (id/key alignment with list_workflow_template
     "OtherPack": ["i2mv_sdxl_ldm_lora"], // same name, different module → ambiguous
   };
 
-  it("resolves a bare custom-node template name that list_workflow_templates returned", () => {
+  it('resolves a bare custom-node template name that action:"list_templates" returned', () => {
     const r = resolveTemplateFromIndex(INDEX, "i2mv_sdxl_ldm_view_selector");
     expect(r).toEqual({ match: { module: "ComfyUI-MVAdapter", name: "i2mv_sdxl_ldm_view_selector" } });
   });

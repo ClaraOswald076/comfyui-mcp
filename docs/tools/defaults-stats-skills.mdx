@@ -4,7 +4,7 @@ description: "Generation defaults, ComfyUI frontend UI settings, history-based s
 icon: "sliders"
 ---
 
-<Info>4 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
+<Info>3 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
 <Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
 
@@ -140,37 +140,6 @@ Show statistics from this MCP server's local generation-history database (popula
 {
   "tool": "generation_stats",
   "arguments": {}
-}
-```
-
----
-
-## generate_node_skill
-
-Generate a Claude skill (SKILL.md) documenting a ComfyUI custom node pack: its nodes, inputs/outputs, and example workflows. Accepts a ComfyUI Registry ID (resolved via api.comfy.org) or a GitHub repository URL. Uses a read-through cache under ~/.comfyui-mcp/skill-cache (override COMFYUI_SKILL_CACHE_DIR); set refresh:true to bypass it. On cache miss, fetches the repo README and scans its Python NODE_CLASS_MAPPINGS and example workflows over the network (uses GITHUB_TOKEN if set to avoid rate limits), so internet access is required. If a ComfyUI server is reachable it enriches node input/output types from /object_info, but the server is optional. Returns the SKILL.md markdown with structured cache metadata; if install_in is set, also creates that directory (recursively) and writes SKILL.md there, overwriting any existing file.
-
-### Parameters
-
-<ParamField path="source" type="string" required>
-  ComfyUI Registry node ID (e.g. 'comfyui-impact-pack') or GitHub repository URL
-</ParamField>
-<ParamField path="install_in" type="string">
-  Optional directory to write the generated SKILL.md into. Created recursively if missing; an existing SKILL.md is overwritten. Omit to only return the markdown without touching disk.
-</ParamField>
-<ParamField path="refresh" type="boolean">
-  Bypass the read-through cache and regenerate the SKILL.md, overwriting the cached entry.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "generate_node_skill",
-  "arguments": {
-    "source": "<source>"
-  }
 }
 ```
 

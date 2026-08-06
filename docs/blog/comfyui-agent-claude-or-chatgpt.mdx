@@ -103,8 +103,9 @@ reimplements a tool — they both consume the shared definitions — parity is
 That same loopback-MCP trick is how **knowledge parity** works. Claude loads
 comfyui-mcp's bundled model-family skills natively (IDEOGRAM, WAN, LTX, Qwen, and
 more). Codex can't, so that expertise is published as MCP tools any backend can
-call — `list_skills`, `read_skill`, `list_packs`, `read_pack_workflow`,
-`list_workflow_templates` — alongside the `check_workflow_runtime` cost guardrail.
+call — the `list_packs` tool's `skill_list`, `skill_read`, `list`,
+`read_workflow` and `list_templates` actions — alongside its `check_runtime`
+cost guardrail.
 So the ChatGPT agent isn't a blank slate either; it knows the models you run.
 
 ### Vision and effort, on both

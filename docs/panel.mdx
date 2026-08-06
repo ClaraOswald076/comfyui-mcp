@@ -97,7 +97,8 @@ the panel chat.
 It can also **load a whole workflow or installer pack in one shot**
 (`panel_load_workflow pack:<name>`) and is **cost-aware**: bundled packs are
 local-GPU / free, and for an ad-hoc graph the agent checks the runtime
-(`check_workflow_runtime`) and **asks before spending paid API credits**. See
+(`list_packs` with `action: "check_runtime"`) and **asks before spending paid API
+credits**. See
 [Skills, Packs & Runtime Cost](./tools/skills-knowledge).
 
 ## Driving the live graph
@@ -183,10 +184,10 @@ credits (same tools on both backends — see
 
 | Tool | Effect |
 |---|---|
-| `list_skills` / `read_skill` | Discover and read bundled model-family + workflow skills |
-| `list_packs` / `read_pack_workflow` | List one-command installer packs (local-GPU / free) and read a pack's graph |
-| `list_workflow_templates` | List the connected server's official ComfyUI workflow templates |
-| `check_workflow_runtime` | Classify a graph as **local** (free) or **api/mixed/unknown** (paid) — the agent asks before spending paid API credits |
+| `list_packs` (`action: "skill_list"` / `"skill_read"`) | Discover and read bundled model-family + workflow skills |
+| `list_packs` (`action: "list"` / `"read_workflow"`) | List one-command installer packs (local-GPU / free) and read a pack's graph |
+| `list_packs` (`action: "list_templates"`) | List the connected server's custom-node-contributed workflow templates |
+| `list_packs` (`action: "check_runtime"`) | Classify a graph as **local** (free) or **api/mixed/unknown** (paid) — the agent asks before spending paid API credits |
 
 ### Run & view
 

@@ -370,12 +370,12 @@ WHY DID MY RENDER FAIL / WHAT'S MISSING? Explains a failed run in ONE call, with
 
 ## get_template_schema
 
-Get a template's OVERRIDABLE run-time parameters (its 'slots') before running it. Pass a bundled pack name (from list_packs) or a custom-node-contributed workflow template name (from list_workflow_templates). Returns `slots` — the meaningful knobs: positive/negative prompt, seed, steps, cfg, sampler/scheduler, width/height, checkpoint/LoRA/model files, denoise, batch_size, input image — plus `other_slots` (every remaining overridable widget), each with a stable key `"&lt;nodeId&gt;.&lt;widget_name&gt;"`, semantic role, type, current value, and min/max/options where the node schema is known. Feed the keys DIRECTLY into run_template's `overrides` (same convention) for a schema→run round-trip.
+Get a template's OVERRIDABLE run-time parameters (its 'slots') before running it. Pass a bundled pack name (from list_packs action:"list") or a custom-node-contributed workflow template name (from list_packs action:"list_templates"). Returns `slots` — the meaningful knobs: positive/negative prompt, seed, steps, cfg, sampler/scheduler, width/height, checkpoint/LoRA/model files, denoise, batch_size, input image — plus `other_slots` (every remaining overridable widget), each with a stable key `"&lt;nodeId&gt;.&lt;widget_name&gt;"`, semantic role, type, current value, and min/max/options where the node schema is known. Feed the keys DIRECTLY into run_template's `overrides` (same convention) for a schema→run round-trip.
 
 ### Parameters
 
 <ParamField path="template" type="string" required>
-  Template name/id: a bundled pack directory name (list_packs) or a custom-node-contributed workflow template name (list_workflow_templates).
+  Template name/id: a bundled pack directory name (list_packs action:"list") or a custom-node-contributed workflow template name (list_packs action:"list_templates").
 </ParamField>
 
 ### Example
@@ -397,7 +397,7 @@ Get a template's OVERRIDABLE run-time parameters (its 'slots') before running it
 
 ## run_template
 
-ONE-SHOT: run a named workflow template (a bundled pack from list_packs) with optional overrides. Resolves the template's expert graph, applies overrides, and enqueues it — replacing the manual read_pack_workflow → modify_workflow → enqueue_workflow chain. Override keys are '&lt;nodeId&gt;.&lt;widget_name&gt;' (e.g. &#123;'6.text': 'a cat', '3.seed': 42&#125;) — the SAME keys the companion get_template_schema tool reports (when available), so schema→run round-trips; only widget values can be overridden, never graph connections. By default returns &#123;prompt_id&#125; immediately; pass wait:true to block until the job completes and return its outputs (images etc.). Unresolvable template names return a clear error with near-matches.
+ONE-SHOT: run a named workflow template (a bundled pack from list_packs) with optional overrides. Resolves the template's expert graph, applies overrides, and enqueues it — replacing the manual list_packs (action:"read_workflow") → modify_workflow → enqueue_workflow chain. Override keys are '&lt;nodeId&gt;.&lt;widget_name&gt;' (e.g. &#123;'6.text': 'a cat', '3.seed': 42&#125;) — the SAME keys the companion get_template_schema tool reports (when available), so schema→run round-trips; only widget values can be overridden, never graph connections. By default returns &#123;prompt_id&#125; immediately; pass wait:true to block until the job completes and return its outputs (images etc.). Unresolvable template names return a clear error with near-matches.
 
 ### Parameters
 
