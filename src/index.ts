@@ -130,10 +130,12 @@ async function createConfiguredServer(toolMode: ToolMode = "compact"): Promise<M
     // into a catalog and expose only the list_tools/describe_tool/call_tool
     // meta-tools, keeping the client's context cost near-zero until a tool is
     // actually needed. Built for small/local LLMs (Hermes Agent, Ollama —
-    // issue #97), but the right default for every harness that injects
-    // tools/list into context: the full surface is ~200KB (~50k tokens) per
-    // read. --full / COMFYUI_MCP_TOOL_MODE=full opts back into the classic
-    // direct surface below.
+    // issue #97), and the DEFAULT from #667 until 0.50.0, when it became the
+    // OPT-IN: the reason it was default was that the direct surface cost
+    // ~200KB (~50k tokens) per tools/list at 154 tools, and consolidation took
+    // that to 37. Reach for `--compact` when the client's context is the
+    // binding constraint — a small local model, or a harness that re-injects
+    // tools/list on every read.
     const catalog = await collectToolCatalog();
     registerCompactTools(server, catalog);
     logger.info(

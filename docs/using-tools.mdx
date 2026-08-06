@@ -295,11 +295,15 @@ Ask the agent, in plain words:
   <Step title="Ask what it can see">
     > What tools do you have from comfyui-mcp? Just list the names.
 
-    **Three names** — `list_tools`, `describe_tool`, `call_tool` — is normal and
-    healthy. That is [compact mode](#if-you-run-a-small-local-model), the default:
-    the rest of the catalogue is one `list_tools` call away, so ask it to run that
-    and you will see the real list. A long list is equally fine; that is the same
-    surface with nothing held back.
+    A list of a few dozen names is normal and healthy — that is the direct
+    surface, which has been the default since 0.50.0.
+
+    **Three names** — `list_tools`, `describe_tool`, `call_tool` — is *also*
+    normal and healthy. That is [compact mode](#if-you-run-a-small-local-model),
+    which you get by passing `--compact`, and which small local models still
+    select automatically. The rest of the catalogue is one `list_tools` call
+    away, so ask it to run that and you will see the real list. Neither answer
+    means anything is held back.
 
     **No names at all**, or "I don't have any tools for ComfyUI", rules out the
     third case and nothing else. It does **not** mean absent. A permission policy

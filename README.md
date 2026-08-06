@@ -664,7 +664,7 @@ per-harness setup, troubleshooting:
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
 | `setup <agent>` | | | Write the comfyui entry into hermes / openclaw / copilot config, then exit |
-| `--full` / `--tool-mode full` | `COMFYUI_MCP_TOOL_MODE=full` | `compact` | Opt into the full ~200-schema surface; the default compact mode registers 3 meta-tools instead |
+| `--compact` / `--tool-mode compact` | `COMFYUI_MCP_TOOL_MODE=compact` | `full` | Opt into the 3 meta-tools (`list_tools` / `describe_tool` / `call_tool`) instead of the direct surface — recommended for small local models. `--full` is still accepted and is now a no-op |
 
 ### Remote ComfyUI
 
