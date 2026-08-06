@@ -17,6 +17,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { logger } from "../utils/logger.js";
+import { assertNotWritingRealHomeInTests } from "./test-isolation-guard.js";
 
 export interface PromptDef {
   id: string;
@@ -66,6 +67,9 @@ function readOverrides(): Record<string, string> {
 
 function writeOverrides(o: Record<string, string>): void {
   const p = panelPromptsPath();
+  // User-authored prompt text lives here — a test run writing the real file
+  // rewrites what the user's prompts say. Refuse at the write.
+  assertNotWritingRealHomeInTests(p, "the panel prompt overrides");
   mkdirSync(dirname(p), { recursive: true });
   writeFileSync(p, JSON.stringify(o, null, 2), "utf-8");
 }
