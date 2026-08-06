@@ -469,7 +469,7 @@ export async function resolveCivitaiModel(
 // Keyword search (native — replaces the previously-bundled Civitai MCP for the
 // search→download loop). GET /api/v1/models works UNAUTHENTICATED with query,
 // type, and base-model filters, and each hit carries exactly what
-// download_civitai_model consumes (model id + version id) plus the trigger
+// download_model action:"download_civitai" consumes (model id + version id) plus the trigger
 // words the prompt will need. Field driver: a local-model user asked to "find
 // a good Flux LoRA on Civitai" and there was no tool that could.
 // ---------------------------------------------------------------------------
@@ -482,7 +482,7 @@ export interface CivitaiSearchHit {
   downloads?: number;
   thumbs_up?: number;
   nsfw?: boolean;
-  /** Latest version — the one download_civitai_model fetches by default. */
+  /** Latest version — the one download_model action:"download_civitai" fetches by default. */
   version_id?: number;
   version_name?: string;
   base_model?: string;

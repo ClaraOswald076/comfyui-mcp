@@ -210,7 +210,8 @@ export function enumeratePacks(): Array<Record<string, unknown>> {
 /** Locate a pack's workflow.json file path (name-guarded, must exist). Returns
  *  null when the pack or its workflow is missing. Shared by action:"read_workflow"
  *  and action:"check_runtime" so they resolve the file identically. Also
- *  exported for run_template, which resolves templates the same way. */
+ *  exported for enqueue_workflow (action:"run_template"), which resolves
+ *  templates the same way. */
 export function resolvePackWorkflowFile(packName: string): string | null {
   const name = packName.trim();
   if (!SAFE_NAME.test(name)) return null;
@@ -347,7 +348,7 @@ export function registerSkillsAccessTools(server: McpServer): void {
         .boolean()
         .optional()
         .describe(
-          'action:"generate_skill" — bypass the read-through cache and regenerate the SKILL.md, overwriting the cached entry.',
+          'action:"generate_skill" — bypass the read-through cache and rebuild the SKILL.md, overwriting the cached entry.',
         ),
     },
     async (args) => {
@@ -521,7 +522,8 @@ function readPackWorkflowAction(rawName: string): ToolText {
 async function listWorkflowTemplatesAction(): Promise<ToolText> {
   traceToolCall("list_packs", { action: "list_templates" });
   // Canonical base URL + auth headers — same connected-ComfyUI path
-  // get_template_schema uses, so a proxied/authed remote resolves
+  // enqueue_workflow (action:"template_schema") uses, so a proxied/authed
+  // remote resolves
   // consistently between listing and schema lookup.
   const base = getComfyUIBaseUrl();
   const url = `${base}/api/workflow_templates`;

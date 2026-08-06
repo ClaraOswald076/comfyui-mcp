@@ -9,7 +9,7 @@ import {
 
 export interface RemoveBackgroundArgs {
   /** Filename (in ComfyUI's input dir) of the image to cut out. Upload it first
-   *  with upload_image, or stage an output with stage_output_as_input. */
+   *  with upload_image (action:"image"), or stage an output with upload_image (action:"stage"). */
   image: string;
   /** BiRefNet matting model; auto-downloaded by ComfyUI-RMBG on first run. */
   model?: string;
@@ -48,7 +48,7 @@ export async function removeBackground(
   if (!args.image || !args.image.trim()) {
     throw new ValidationError(
       "image is required — the filename of an image already in ComfyUI's input dir " +
-        "(upload it first with upload_image, or stage an output with stage_output_as_input).",
+        "(upload it first with upload_image (action:\"image\"), or stage an output with upload_image (action:\"stage\")).",
     );
   }
   assertSafeInputFilename(args.image, "image");

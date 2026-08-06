@@ -9,7 +9,7 @@ import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/err
 import { logger } from "../utils/logger.js";
 
 // ---------------------------------------------------------------------------
-// verify_custom_node — the "test" step of the custom-node author loop.
+// node_pack action:"verify" — the "test" step of the custom-node author loop.
 //
 // Restarts the local ComfyUI (reusing the bounded readiness wait), then checks
 // that the pack's node class_types actually registered in /object_info. This
@@ -215,7 +215,7 @@ export async function verifyCustomNode(
   // unsupported here.
   if (!resolveEffectiveComfyUIBase()) {
     throw new ProcessControlError(
-      "verify_custom_node is local-only: it restarts and inspects a local ComfyUI " +
+      'node_pack (action:"verify") is local-only: it restarts and inspects a local ComfyUI ' +
         "install. It cannot verify a remote --comfyui-url target. Set the COMFYUI_PATH " +
         "environment variable, or save a default workspace with workspace (action:\"set_default\").",
     );

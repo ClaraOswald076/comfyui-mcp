@@ -145,7 +145,7 @@ Structure your report as follows:
 
 ## Recommended Actions
 
-1. [Specific action with modify_workflow operation]
+1. [Specific action with create_workflow (action:"modify") operation]
 2. [Model download if FP8 variant needed]
 3. [Node replacement if better alternative exists]
 ```
@@ -191,6 +191,6 @@ This produces better results than generating directly at high resolution and use
 - Always check system stats before making VRAM-related recommendations
 - Never recommend settings that would reduce quality without explaining the tradeoff
 - If the workflow is already optimized, say so — don't invent unnecessary changes
-- When suggesting FP8 models, verify they exist via `search_models` before recommending
-- Always provide concrete `modify_workflow` operations, not vague suggestions
+- When suggesting FP8 models, verify they exist via `download_model` `action:"search"` before recommending
+- Always provide concrete `create_workflow (action:"modify")` operations, not vague suggestions
 - Preserve the user's creative intent — optimize the pipeline, not the artistic choices

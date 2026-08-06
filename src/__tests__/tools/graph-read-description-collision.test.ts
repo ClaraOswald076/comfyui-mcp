@@ -71,10 +71,10 @@ const FAMILY = [
   "panel_find_nodes",
   "panel_view_nodes_in_viewport",
   "panel_screenshot",
+  // 0.50.0 slice 14: the hierarchical renderer, the saved-file query and the
+  // saved-file summary are now actions on these two, so the family is the two
+  // TOOL names a model chooses between — which is the level #557 is about.
   "visualize_workflow",
-  "visualize_workflow_hierarchical",
-  "query_workflow",
-  "analyze_workflow",
   "get_workflow",
 ] as const;
 
@@ -150,7 +150,7 @@ describe("graph-reading tool descriptions are distinguishable (#557)", () => {
   });
 
   describe("the file-based readers say FILE, the panel ones say canvas", () => {
-    for (const name of ["visualize_workflow", "query_workflow", "analyze_workflow", "get_workflow"]) {
+    for (const name of ["visualize_workflow", "get_workflow"]) {
       it(`${name} states up front that its input is passed in / on disk`, () => {
         const lead = leadingPhrase(describeTool(name), 90);
         expect(lead).toMatch(/pass in|saved|file|json/);
@@ -200,8 +200,18 @@ describe("graph-reading tool descriptions are distinguishable (#557)", () => {
    * scan that quietly stops scanning.
    */
   const EXPECTED_CLAIMANTS = [
-    "analyze_workflow",
-    "diagnose_run",
+    // NOT get_history. The standalone failure-diagnosis tool used to be a
+    // claimant — its opening said "without needing a canvas" — and 0.50.0 slice
+    // 16 folded it in as get_history's `diagnose` job. get_history now opens on
+    // "Read what has already been generated on this machine", and the canvas
+    // sentence sits well past the OPENING window, so it no longer competes for
+    // "show me the canvas" at all. That is a tool LEAVING scope for the right
+    // reason, not drifting out of it while still competing.
+    // 0.50.0 slice 14: get_workflow's opening now covers the whole saved-file
+    // read surface, so it names the canvas to rule it OUT — and it hands the
+    // model back to panel_graph_outline in the same clause, which is what the
+    // last test in this file requires of a claimant.
+    "get_workflow",
     "panel_canvas",
     "panel_enter_subgraph",
     "panel_find_nodes",
@@ -216,9 +226,7 @@ describe("graph-reading tool descriptions are distinguishable (#557)", () => {
     "panel_screenshot",
     "panel_strip_workflow",
     "panel_view_nodes_in_viewport",
-    "query_workflow",
     "visualize_workflow",
-    "visualize_workflow_hierarchical",
   ];
 
   it("reaches exactly the tools it is documented to reach (the ratchet is not vacuous)", () => {
@@ -239,7 +247,6 @@ describe("graph-reading tool descriptions are distinguishable (#557)", () => {
    * human had to write down and a reviewer had to read.
    */
   const NOT_A_CANVAS_READ = new Map<string, string>([
-    ["diagnose_run", "explains a FAILED RUN and says so — 'without needing a canvas' is why it matches"],
     ["panel_strip_workflow", "TRANSFORMS a graph into a resolved form; the result is a conversion, not a view"],
     ["panel_load_workflow", "WRITES the canvas (replaces the open graph); nothing about it answers a read"],
     ["panel_run", "QUEUES the open workflow — the canvas is the input, not the output"],

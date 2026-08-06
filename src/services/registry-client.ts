@@ -155,7 +155,7 @@ export async function searchNodes(
               `and the exact-id fallback for "${candidate}" could not be resolved ` +
               `(${err instanceof Error ? err.message : String(err)}) — so "no matches" ` +
               `cannot be confirmed. Retry, or look the pack up directly with ` +
-              `get_node_pack_details.`,
+              `search_custom_nodes (action:"details").`,
           );
         }
         logger.debug(

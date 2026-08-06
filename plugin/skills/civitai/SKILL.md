@@ -1,11 +1,11 @@
 ---
 name: civitai
-description: Discover Civitai models with the BUILT-IN search_civitai_models tool and install/generate them locally — find a checkpoint/LoRA/embedding on Civitai, download it into ComfyUI, and use its trigger words. Optionally pair the official Civitai MCP for community features (images browsing, posting, collections).
+description: Discover Civitai models with the BUILT-IN download_model action:"search_civitai" and install/generate them locally — find a checkpoint/LoRA/embedding on Civitai, download it into ComfyUI, and use its trigger words. Optionally pair the official Civitai MCP for community features (images browsing, posting, collections).
 ---
 
 # Civitai + comfyui-mcp
 
-comfyui-mcp has **native Civitai search built in** — `search_civitai_models` —
+comfyui-mcp has **native Civitai search built in** — `download_model` `action:"search_civitai"` —
 plus the local half of the loop: download, wire, queue, tag. The full flow
 (find → install → generate) needs no other server, no API key, and works on
 EVERY backend, including small local models behind the compact router.
@@ -13,13 +13,13 @@ EVERY backend, including small local models behind the compact router.
 ## The built-in flow (default path)
 
 ```
-search_civitai_models({ query, types: ["LORA"], base_models: ["Flux.1 D"] })
+download_model({ action: "search_civitai", query, types: ["LORA"], base_models: ["Flux.1 D"] })
         │                    each hit: model_id · model_version_id · trigger words
         ▼
-download_civitai_model({ model_version_id, target_subfolder: "loras" })
+download_model({ action: "download_civitai", model_version_id, target_subfolder: "loras" })
         │
         ▼
-list_local_models  →  panel_add_node loader / generate_image   # use it
+list_local_models({ action: "list" })  →  panel_add_node loader / generate_image   # use it
 ```
 
 - **ALWAYS filter `base_models`** when the user's checkpoint family is known —
@@ -40,18 +40,18 @@ search results — set it once (panel Settings › "Set CivitAI token…" or env
 ## Recipes
 
 **"Find me a good anime LoRA for Flux and install it"**
-1. `search_civitai_models({ query: "anime style", types: ["LORA"], base_models: ["Flux.1 D"] })`.
+1. `download_model({ action: "search_civitai", query: "anime style", types: ["LORA"], base_models: ["Flux.1 D"] })`.
 2. Present the top 3–5 with name, creator, base model, downloads, and the
    version id. Let the user pick.
-3. `download_civitai_model({ model_version_id, target_subfolder: "loras" })`.
+3. `download_model({ action: "download_civitai", model_version_id, target_subfolder: "loras" })`.
 4. In the panel: `panel_add_node` a `LoraLoader`, `panel_set_widget` the
    `lora_name`, wire it between checkpoint and sampler — and use the hit's
-   trigger words in the prompt. Headless: `generate_image` / build the workflow.
+   trigger words in the prompt. Headless: `generate_image(action="image")` / build the workflow.
 
 **"Download this Civitai page for me"** (user pastes a URL)
 - Parse the `modelVersionId` from the URL if present; otherwise pass the model
-  id from the URL to `download_civitai_model` (it resolves the latest version).
-  A raw `civitai.com/api/download/...` URL also works via `download_model`
+  id from the URL to `action:"download_civitai"` (it resolves the latest version).
+  A raw `civitai.com/api/download/...` URL also works via `action:"download"`
   with `CIVITAI_API_TOKEN` set.
 
 ## Optional: the official Civitai MCP (community surface)
@@ -66,7 +66,7 @@ claude mcp add --transport http civitai https://mcp.civitai.com/mcp \
 ```
 
 Then `mcp__civitai__*` tools appear alongside comfyui-mcp's. Its discovery
-results hand off identically (`modelVersions[].id` → `download_civitai_model`).
+results hand off identically (`modelVersions[].id` → `action:"download_civitai"`).
 
 **Boundaries:** that server also exposes **write/social** tools (post,
 comment, review, DM, follow). Those publish on the user's behalf — surface

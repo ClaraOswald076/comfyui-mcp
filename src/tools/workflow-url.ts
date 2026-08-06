@@ -1,5 +1,3 @@
-import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { WorkflowJSON } from "../comfyui/types.js";
 import {
   getObjectInfo,
@@ -14,7 +12,7 @@ import { validateWorkflow } from "../services/workflow-validator.js";
 import { enqueueWorkflow } from "../services/workflow-executor.js";
 import { applyOverrides } from "../services/asset-registry.js";
 import { fetchWorkflowFromUrl } from "../services/workflow-url.js";
-import { errorToToolResult, ValidationError } from "../utils/errors.js";
+import { ValidationError } from "../utils/errors.js";
 
 /**
  * Detect a ComfyUI API-format prompt graph: a plain object whose values all look
@@ -75,126 +73,103 @@ function summarizeWorkflow(workflow: WorkflowJSON): string {
   return lines.join("\n");
 }
 
-export function registerWorkflowUrlTools(server: McpServer): void {
-  server.tool(
-    "run_workflow_url",
-    "Read (and optionally execute) a shared ComfyUI workflow from a URL. " +
-      "Fetches the workflow JSON, accepts API-format prompt graphs or UI-format exports " +
-      "(UI is auto-converted via the same converter as get_workflow), validates it, and " +
-      "summarizes it. Supports raw .json links and GitHub blob/raw URLs (blob is normalized " +
-      "to raw); other share hosts that need a site API return a clear 'paste the raw JSON URL' " +
-      "error. The fetch is bounded (http/https only, timeout + size cap, loopback/private/" +
-      "metadata IPs rejected to prevent SSRF). " +
-      "READ-ONLY unless run=true; when run=true it enqueues the workflow (applying optional " +
-      "`inputs` overrides) and returns the prompt_id.",
-    {
-      url: z
-        .string()
-        .describe(
-          "URL of the workflow JSON. Raw .json links and GitHub blob/raw URLs work directly.",
+/**
+ * `enqueue_workflow (action:"run_url")` — the handler the standalone
+ * run-from-URL tool used to carry (0.50.0 slice 16), unchanged apart from losing
+ * its own registration.
+ *
+ * The body is byte-for-byte the old handler's: same fetch, same UI→API
+ * conversion, same validation, same two content blocks in read-only mode and
+ * the same enqueued JSON when `run` is true. The try/catch moved OUT to the
+ * dispatcher in workflow-execute.ts, which wraps every action in the identical
+ * `errorToToolResult`, so a thrown ValidationError still comes back as the same
+ * error result it always did.
+ */
+export async function runWorkflowUrlAction(args: {
+  url: string;
+  run?: boolean;
+  inputs?: Record<string, unknown>;
+}): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+  const { url, run, inputs } = args;
+  const { json, finalUrl } = await fetchWorkflowFromUrl(url);
+
+  // Resolve to an API-format graph: convert UI exports, unwrap /prompt bodies.
+  let workflow: WorkflowJSON;
+  const warnings: string[] = [];
+  if (isUiFormat(json)) {
+    const bulk = await getObjectInfo();
+    const objectInfo = await backfillObjectInfo(bulk, collectNodeTypes(json));
+    const converted = convertUiToApi(json, objectInfo);
+    workflow = converted.workflow;
+    warnings.push(...converted.warnings);
+  } else {
+    const candidate = unwrapApiWorkflow(json);
+    if (!isApiFormat(candidate)) {
+      throw new ValidationError(
+        "The URL returned JSON that is not a recognized ComfyUI workflow " +
+          "(neither an API-format prompt graph of {class_type, inputs} nodes, " +
+          "nor a UI-format export with nodes[]/links[]).",
+      );
+    }
+    workflow = candidate;
+  }
+
+  if (Object.keys(workflow).length === 0) {
+    throw new ValidationError("The workflow contains no nodes.");
+  }
+
+  // Validate (best-effort — never throws; reports 'cannot reach ComfyUI' as an issue).
+  const validation = await validateWorkflow(workflow);
+
+  if (!run) {
+    const lines: string[] = [];
+    lines.push(`# Workflow loaded from ${finalUrl}`);
+    if (warnings.length > 0) {
+      lines.push("");
+      lines.push(`**Conversion warnings (${warnings.length}):**`);
+      lines.push(...warnings.map((w) => `- ${w}`));
+    }
+    lines.push("");
+    lines.push(summarizeWorkflow(workflow));
+    lines.push("");
+    lines.push(`Validation: ${validation.summary}`);
+    for (const issue of validation.issues) {
+      const loc = issue.node_id
+        ? `${issue.node_id} (${issue.node_type})`
+        : "workflow";
+      lines.push(`- [${issue.severity}] ${loc}: ${issue.message}`);
+    }
+    lines.push("");
+    lines.push("Re-call with run=true to enqueue this workflow.");
+    return {
+      content: [
+        { type: "text" as const, text: lines.join("\n") },
+        { type: "text" as const, text: JSON.stringify(workflow, null, 2) },
+      ],
+    };
+  }
+
+  // run=true → apply overrides and enqueue.
+  const next = applyOverrides(workflow, inputs);
+  const result = await enqueueWorkflow(next);
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(
+          {
+            status: "enqueued",
+            prompt_id: result.prompt_id,
+            queue_remaining: result.queue_remaining,
+            source_url: finalUrl,
+            overrides_applied: inputs ?? {},
+            conversion_warnings: warnings,
+            validation: validation.summary,
+          },
+          null,
+          2,
         ),
-      run: z
-        .boolean()
-        .optional()
-        .default(false)
-        .describe(
-          "If true, enqueue the workflow for execution and return the prompt_id. " +
-            "Default false: only fetch, validate, and summarize (read-only).",
-        ),
-      inputs: z
-        .record(z.string(), z.any())
-        .optional()
-        .describe(
-          "Optional parameter overrides applied (only when run=true) to every node that " +
-            "already has a matching input name. Common keys: cfg, steps, sampler_name, seed, text.",
-        ),
-    },
-    async ({ url, run, inputs }) => {
-      try {
-        const { json, finalUrl } = await fetchWorkflowFromUrl(url);
-
-        // Resolve to an API-format graph: convert UI exports, unwrap /prompt bodies.
-        let workflow: WorkflowJSON;
-        const warnings: string[] = [];
-        if (isUiFormat(json)) {
-          const bulk = await getObjectInfo();
-          const objectInfo = await backfillObjectInfo(bulk, collectNodeTypes(json));
-          const converted = convertUiToApi(json, objectInfo);
-          workflow = converted.workflow;
-          warnings.push(...converted.warnings);
-        } else {
-          const candidate = unwrapApiWorkflow(json);
-          if (!isApiFormat(candidate)) {
-            throw new ValidationError(
-              "The URL returned JSON that is not a recognized ComfyUI workflow " +
-                "(neither an API-format prompt graph of {class_type, inputs} nodes, " +
-                "nor a UI-format export with nodes[]/links[]).",
-            );
-          }
-          workflow = candidate;
-        }
-
-        if (Object.keys(workflow).length === 0) {
-          throw new ValidationError("The workflow contains no nodes.");
-        }
-
-        // Validate (best-effort — never throws; reports 'cannot reach ComfyUI' as an issue).
-        const validation = await validateWorkflow(workflow);
-
-        if (!run) {
-          const lines: string[] = [];
-          lines.push(`# Workflow loaded from ${finalUrl}`);
-          if (warnings.length > 0) {
-            lines.push("");
-            lines.push(`**Conversion warnings (${warnings.length}):**`);
-            lines.push(...warnings.map((w) => `- ${w}`));
-          }
-          lines.push("");
-          lines.push(summarizeWorkflow(workflow));
-          lines.push("");
-          lines.push(`Validation: ${validation.summary}`);
-          for (const issue of validation.issues) {
-            const loc = issue.node_id
-              ? `${issue.node_id} (${issue.node_type})`
-              : "workflow";
-            lines.push(`- [${issue.severity}] ${loc}: ${issue.message}`);
-          }
-          lines.push("");
-          lines.push("Re-call with run=true to enqueue this workflow.");
-          return {
-            content: [
-              { type: "text" as const, text: lines.join("\n") },
-              { type: "text" as const, text: JSON.stringify(workflow, null, 2) },
-            ],
-          };
-        }
-
-        // run=true → apply overrides and enqueue.
-        const next = applyOverrides(workflow, inputs);
-        const result = await enqueueWorkflow(next);
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                {
-                  status: "enqueued",
-                  prompt_id: result.prompt_id,
-                  queue_remaining: result.queue_remaining,
-                  source_url: finalUrl,
-                  overrides_applied: inputs ?? {},
-                  conversion_warnings: warnings,
-                  validation: validation.summary,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
+      },
+    ],
+  };
 }

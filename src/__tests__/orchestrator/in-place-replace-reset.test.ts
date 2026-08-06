@@ -1,12 +1,16 @@
-// #570 P0 — a SAVED workflow overwritten IN PLACE (same wf:<path> tab id, new uuid) must
-// start FRESH. The hello handler detects the durable identity mismatch and calls
-// manager.reset(key) — a FULL session boundary. This pins the manager-lifecycle half:
-// (1) the exact session is BOUND to the identity uuid (identityForKey → SessionStore.u),
-// and (2) reset() stops the LIVE agent AND clears the durable session + pending resume, so
-// the next message can't continue the replaced workflow's conversation.
+// Manager teardown mechanics, originally pinned for #570's in-place workflow
+// replacement. #884 (orchestrator-scoped sessions) removed the hello handler's
+// per-workflow identity boundary — a workflow switch/replacement no longer
+// resets anything — but the SAME manager primitives now back the explicit
+// conversation boundaries (new_session / resume_session), so what these pin is
+// still load-bearing: (1) the durable identity binding plumbing
+// (identityForKey → SessionStore.u) stays coherent, and (2) reset() stops the
+// LIVE agent AND clears the durable session + pending resume + held mail, so
+// the next message after an explicit boundary can't continue the cleared
+// conversation.
 
-import { describe, expect, it, beforeAll, afterEach } from "vitest";
-import { rmSync } from "node:fs";
+import { describe, expect, it, beforeAll, afterAll, afterEach } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -24,12 +28,30 @@ beforeAll(async () => {
 });
 
 const PORT = 59244;
-const FILE = join(tmpdir(), `comfyui-mcp-panel-sessions-${PORT}.json`);
+// #884 — SessionStore lives in ~/.comfyui-mcp/sessions by default; tests pin it
+// to a scratch dir so they never touch the real home (and never leak state
+// between tests through the shared file).
+const DIR = mkdtempSync(join(tmpdir(), "cmcp-sessions-"));
+const FILE = join(DIR, `panel-sessions-${PORT}.json`);
 afterEach(() => {
   try {
     rmSync(FILE);
   } catch {
     /* already gone */
+  }
+  // A stale pre-#884 tmpdir file would be silently MIGRATED into the next
+  // store — remove it so tests are hermetic.
+  try {
+    rmSync(join(tmpdir(), `comfyui-mcp-panel-sessions-${PORT}.json`));
+  } catch {
+    /* already gone */
+  }
+});
+afterAll(() => {
+  try {
+    rmSync(DIR, { recursive: true, force: true });
+  } catch {
+    /* best-effort */
   }
 });
 
@@ -65,7 +87,7 @@ const IDENTITY_A = `http://127.0.0.1:8188::${UUID_A}`;
 describe("in-place workflow replacement resets the live session (#570 P0)", () => {
   it("binds the exact session to its identity uuid and reset() clears the live agent + session", async () => {
     const backend = new SessioningBackend();
-    const store = new SessionStore(PORT);
+    const store = new SessionStore(PORT, { dir: DIR });
     const manager = new PanelAgentManager({
       mcpServers: {},
       systemAppend: "",
@@ -103,7 +125,7 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
     // a save/rename changes the wf: tab id. The migration must move the dormant Claude session to
     // the new id too — not only the current (Codex) one — or switching back to Claude starts fresh.
     const backend = new SessioningBackend();
-    const store = new SessionStore(PORT);
+    const store = new SessionStore(PORT, { dir: DIR });
     const manager = new PanelAgentManager({
       mcpServers: {},
       systemAppend: "",
@@ -132,7 +154,7 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
     expect(store.get("wf:old.json::claude")).toBeUndefined();
     expect(store.get("wf:old.json::codex")).toBeUndefined();
     // …and durably: switching back to Claude on the new id resumes its original conversation.
-    expect(new SessionStore(PORT).get("wf:new.json::claude")).toBe("sess-claude");
+    expect(new SessionStore(PORT, { dir: DIR }).get("wf:new.json::claude")).toBe("sess-claude");
 
     await manager.stopAll();
   });
@@ -142,7 +164,7 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
     // bridge has already SUPERSEDED the destination's socket, so its still-mapped agent would
     // render into the incoming tab. Reset the superseded destination, THEN rebind the source into
     // the freed id so the incoming tab keeps its OWN conversation.
-    const store = new SessionStore(PORT);
+    const store = new SessionStore(PORT, { dir: DIR });
     const manager = new PanelAgentManager({
       mcpServers: {},
       systemAppend: "",
@@ -182,7 +204,7 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
     // destination's session → the incoming tab resumes the OTHER tab's conversation on a later
     // switch. The collision handling must reset the destination for ANY state (incl. a dormant
     // durable session / held mail), not just a live agent.
-    const store = new SessionStore(PORT);
+    const store = new SessionStore(PORT, { dir: DIR });
     const manager = new PanelAgentManager({
       mcpServers: {},
       systemAppend: "",
@@ -207,7 +229,7 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
 
     // B's dormant session is GONE — the incoming tab starts fresh on Claude, never inherits it.
     expect(store.get(newKey)).toBeUndefined();
-    expect(new SessionStore(PORT).get(newKey)).toBeUndefined(); // durable
+    expect(new SessionStore(PORT, { dir: DIR }).get(newKey)).toBeUndefined(); // durable
 
     await manager.stopAll();
   });
@@ -220,7 +242,7 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
     // stops the live agent but keeps the identity-bound session, so a later switch-back
     // continues the original conversation (codex round-trip). This pins that shared operation.
     const backend = new SessioningBackend();
-    const store = new SessionStore(PORT);
+    const store = new SessionStore(PORT, { dir: DIR });
     const manager = new PanelAgentManager({
       mcpServers: {},
       systemAppend: "",
@@ -246,7 +268,7 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
     expect(store.get(claudeKey)).toBe("sess-A");
     expect(store.identityOf(claudeKey)).toBe(IDENTITY_A);
     // Durable across a fresh process too (a restart between switches).
-    expect(new SessionStore(PORT).get(claudeKey)).toBe("sess-A");
+    expect(new SessionStore(PORT, { dir: DIR }).get(claudeKey)).toBe("sess-A");
 
     await manager.stopAll();
   });
@@ -279,7 +301,7 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
       }
     }
     const backend = new NoSessionBackend();
-    const store = new SessionStore(PORT);
+    const store = new SessionStore(PORT, { dir: DIR });
     const manager = new PanelAgentManager({
       mcpServers: {},
       systemAppend: "",
@@ -321,7 +343,7 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
         return [];
       }
     }
-    const store = new SessionStore(PORT);
+    const store = new SessionStore(PORT, { dir: DIR });
     const manager = new PanelAgentManager({
       mcpServers: {},
       systemAppend: "",
