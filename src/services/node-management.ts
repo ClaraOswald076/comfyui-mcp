@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
@@ -1903,6 +1903,53 @@ export function assertSafeRepoName(repoName: string): void {
  * Dep failures DON'T fail the install (clone succeeded) — they're surfaced as
  * warnings. A clone failure throws NodeManagementError.
  */
+/**
+ * Does this directory hold something ComfyUI could actually load?
+ *
+ * A clone that git created and then abandoned leaves a directory containing only
+ * `.git`. ComfyUI loads DIRECTORIES, so it will try to import that on every
+ * start and fail — forever, silently, long after whoever ran the install has
+ * forgotten about it (#900). "The directory exists" was never the question.
+ */
+function looksLikeAPack(dir: string): boolean {
+  try {
+    return readdirSync(dir).some((entry) => entry !== ".git");
+  } catch {
+    // Unreadable is not a finding either way; let the caller's other checks
+    // speak rather than condemning a pack we could not look at.
+    return true;
+  }
+}
+
+/**
+ * Remove a clone directory THIS call created, after the clone failed.
+ *
+ * Returns a sentence to append to the error — a leftover nobody was told about
+ * is how the husk in #900 survived a month.
+ *
+ * `alreadyPresent` is a PRECONDITION, not live logic: every call site today sits
+ * inside `if (!alreadyPresent)`, so it is always false here and the guard below
+ * cannot fire. It is kept, and named, because the rule it encodes is the one that
+ * would do real damage if a later caller broke it — an existing pack is the
+ * user's, and a failed operation must never take it away. Being explicit about
+ * its unreachability is deliberate: an unreachable check that reads like live
+ * protection is worse than one that says what it is.
+ */
+function discardFailedClone(nodeDir: string, alreadyPresent: boolean): string {
+  if (alreadyPresent) return ""; // precondition — see above; unreachable today
+  if (!existsSync(nodeDir)) return ""; // git cleaned up after itself
+  try {
+    rmSync(nodeDir, { recursive: true, force: true });
+    return "";
+  } catch (rmErr) {
+    return (
+      ` NOTE: the partial clone at ${nodeDir} could NOT be removed ` +
+      `(${rmErr instanceof Error ? rmErr.message : String(rmErr)}). ComfyUI will try to ` +
+      `import it on every start and log an error — delete that directory by hand.`
+    );
+  }
+}
+
 async function cloneCustomNodeFallback(
   gitId: string,
   repoName: string,
@@ -1976,21 +2023,52 @@ async function cloneCustomNodeFallback(
         stdout?: Buffer | string;
         stderr?: Buffer | string;
       };
+      const leftover = discardFailedClone(nodeDir, alreadyPresent);
       throw new NodeManagementError(
-        `Failed to clone "${gitId}" into custom_nodes/${repoName}: ${e.message}`,
+        `Failed to clone "${gitId}" into custom_nodes/${repoName}: ${e.message}${leftover}`,
         {
           stdout: e.stdout ? e.stdout.toString() : "",
           stderr: e.stderr ? e.stderr.toString() : "",
         },
       );
     }
-    if (gitRef) runGitCheckout(gitId, gitRef, comfyuiBase);
+    if (gitRef) {
+      // The checkout is part of producing the pack, so its failure leaves the
+      // same husk as a failed clone — and the clone directory is ours either way.
+      try {
+        runGitCheckout(gitId, gitRef, comfyuiBase);
+      } catch (err) {
+        const leftover = discardFailedClone(nodeDir, alreadyPresent);
+        throw new NodeManagementError(
+          `Cloned "${gitId}" but could not check out "${gitRef}": ` +
+            `${err instanceof Error ? err.message : String(err)}${leftover}`,
+        );
+      }
+    }
   }
 
-  // VERIFY the clone landed before attempting deps.
+  // VERIFY the clone produced a PACK, not merely a directory (#900).
+  //
+  // `existsSync(nodeDir)` passed for a directory containing nothing but `.git` —
+  // which is exactly what a clone killed by the timeout leaves behind. One such
+  // husk sat in a user's custom_nodes for over a month, and ComfyUI logged an
+  // import failure for it on EVERY boot, because ComfyUI loads directories and
+  // does not care what we think we installed.
+  //
+  // Worse than useless: to any later reader — including our own disk-presence
+  // checks — it is indistinguishable from a pack the user installed on purpose
+  // that is now broken.
   if (!existsSync(nodeDir)) {
     throw new NodeManagementError(
       `Clone of "${gitId}" reported success but ${nodeDir} is missing.`,
+    );
+  }
+  if (!alreadyPresent && !looksLikeAPack(nodeDir)) {
+    const leftover = discardFailedClone(nodeDir, alreadyPresent);
+    throw new NodeManagementError(
+      `Clone of "${gitId}" reported success but produced no loadable pack in ` +
+        `custom_nodes/${repoName} — the directory holds nothing but git metadata, which ` +
+        `ComfyUI cannot import and would log an error for on every start.${leftover}`,
     );
   }
 
