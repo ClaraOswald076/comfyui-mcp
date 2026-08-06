@@ -23,7 +23,8 @@ Stage and curate the training DATASETS a LoRA run consumes — the images and th
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which dataset operation to perform. "list" takes no other parameters; "prepare" requires `name` + `items`; "detail", "update", "delete" and "caption_dataset" require `name`; "file" and "caption_image" require `path`. NOTE "delete" here destroys a DATASET (images + captions) — deleting a training JOB is train_start action:"delete". Options: `action:"prepare"`, `action:"list"`, `action:"detail"`, `action:"update"`, `action:"delete"`, `action:"file"`, `action:"caption_image"`, `action:"caption_dataset"`.
+  Which dataset operation to perform. "list" takes no other parameters; "prepare" requires `name` + `items`; "detail", "update", "delete" and "caption_dataset" require `name`; "file" and "caption_image" require `path`. NOTE "delete" here destroys a DATASET (images + captions) — deleting a training JOB is train_start action:"delete".
+  Options: `action:"prepare"`, `action:"list"`, `action:"detail"`, `action:"update"`, `action:"delete"`, `action:"file"`, `action:"caption_image"`, `action:"caption_dataset"`.
 </ParamField>
 <ParamField path="name" type="string">
   Dataset name — the staging dir name. REQUIRED for actions "prepare" (it is created), "detail", "update", "delete" and "caption_dataset" (from action:"list"). This is a DATASET name, never a training job id.
@@ -90,7 +91,8 @@ Run and inspect LoRA training JOBS — launch a run, poll it, stop it, delete it
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which training-job operation to perform. "list_flows" takes no other parameters; "status" takes an OPTIONAL `id` (omit for all jobs); "cancel", "delete" and "job_config" require `id`; "start" and "preview_config" require `name` + `datasetPath`. NOTE "delete" here destroys a training JOB — deleting a staged DATASET is train_prepare_dataset action:"delete". Options: `action:"start"`, `action:"status"`, `action:"cancel"`, `action:"delete"`, `action:"list_flows"`, `action:"job_config"`, `action:"preview_config"`.
+  Which training-job operation to perform. "list_flows" takes no other parameters; "status" takes an OPTIONAL `id` (omit for all jobs); "cancel", "delete" and "job_config" require `id`; "start" and "preview_config" require `name` + `datasetPath`. NOTE "delete" here destroys a training JOB — deleting a staged DATASET is train_prepare_dataset action:"delete".
+  Options: `action:"start"`, `action:"status"`, `action:"cancel"`, `action:"delete"`, `action:"list_flows"`, `action:"job_config"`, `action:"preview_config"`.
 </ParamField>
 <ParamField path="id" type="string">
   Training job id, as returned by action:"start" (e.g. "t8f3k2ab") — NEVER a dataset name. REQUIRED and must be non-empty for actions "cancel", "delete" and "job_config". OPTIONAL for action:"status": omit it (or pass an empty string) to list every job newest-first. Unused by "start", "list_flows" and "preview_config".
@@ -99,10 +101,12 @@ Run and inspect LoRA training JOBS — launch a run, poll it, stop it, delete it
   Job name — becomes the output .safetensors basename (e.g. 'aria_character'). REQUIRED for actions "start" and "preview_config". This names the RUN, not the dataset it reads.
 </ParamField>
 <ParamField path="flow" type="enum" default="character">
-  action:"start" — training flow (see action:"list_flows"). Options: `character`.
+  action:"start" — training flow (see action:"list_flows").
+  Options: `character`.
 </ParamField>
 <ParamField path="model" type="enum" default="flux1-dev">
-  action:"start" — base model (see action:"list_flows"). Options: `flux1-dev`.
+  action:"start" — base model (see action:"list_flows").
+  Options: `flux1-dev`.
 </ParamField>
 <ParamField path="datasetPath" type="string">
   Dataset dir from train_prepare_dataset (images + same-basename .txt captions). REQUIRED for actions "start" and "preview_config".
@@ -117,13 +121,15 @@ Run and inspect LoRA training JOBS — launch a run, poll it, stop it, delete it
   action:"start" — GPU selector, default cuda:0.
 </ParamField>
 <ParamField path="target" type="enum" default="local">
-  action:"start" — 'local' = docker on this rig; 'pod' = pod-native over ssh on a RunPod pod. Options: `local`, `pod`.
+  action:"start" — 'local' = docker on this rig; 'pod' = pod-native over ssh on a RunPod pod.
+  Options: `local`, `pod`.
 </ParamField>
 <ParamField path="pod_id" type="string">
   action:"start" — RunPod pod to train on (target 'pod'). Default: the connector's currently connected/watched pod.
 </ParamField>
 <ParamField path="deliverTo" type="enum" default="both">
-  action:"start", pod jobs only: where the finished LoRA lands. Options: `pod`, `local`, `both`.
+  action:"start", pod jobs only: where the finished LoRA lands.
+  Options: `pod`, `local`, `both`.
 </ParamField>
 <ParamField path="model_path" type="string">
   action:"start" — override the base model path AS THE TRAINER SEES IT (pod path for target 'pod', container path for 'local') — e.g. a pre-uploaded local HF snapshot dir when the default HF repo id is gated/unreachable.
@@ -160,10 +166,12 @@ Preflight and set up the TRAINER ITSELF — the docker/GPU/venv machinery every 
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which trainer-setup operation to perform. "doctor" is read-only and takes no other parameters; "bootstrap" takes `target` (+ `pod_id` for target 'pod'); "build_image" takes an optional `aiToolkitRef`. None of them touches a dataset or a job. Options: `action:"doctor"`, `action:"bootstrap"`, `action:"build_image"`.
+  Which trainer-setup operation to perform. "doctor" is read-only and takes no other parameters; "bootstrap" takes `target` (+ `pod_id` for target 'pod'); "build_image" takes an optional `aiToolkitRef`. None of them touches a dataset or a job.
+  Options: `action:"doctor"`, `action:"bootstrap"`, `action:"build_image"`.
 </ParamField>
 <ParamField path="target" type="enum" default="local">
-  action:"bootstrap" — where to install the native trainer. Default local. Options: `local`, `pod`.
+  action:"bootstrap" — where to install the native trainer. Default local.
+  Options: `local`, `pod`.
 </ParamField>
 <ParamField path="pod_id" type="string">
   action:"bootstrap" — pod to bootstrap (target 'pod'). Default: the connected pod.

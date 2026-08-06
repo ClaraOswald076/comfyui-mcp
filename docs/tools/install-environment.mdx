@@ -24,7 +24,8 @@ Install, update and configure the local ComfyUI installation, its sidebar panel,
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which install/environment operation to perform. action:"update", action:"update_all" and action:"environment" take no other parameters; action:"install" requires `target_path`; action:"panel" takes `panel_action` (+ `version`/`reason` for a pin); action:"self_update" takes `self_update_action`; action:"configure_manager" requires `manager_setting` (+ `value`). Options: `action:"install"`, `action:"update"`, `action:"update_all"`, `action:"panel"`, `action:"self_update"`, `action:"environment"`, `action:"configure_manager"`.
+  Which install/environment operation to perform. action:"update", action:"update_all" and action:"environment" take no other parameters; action:"install" requires `target_path`; action:"panel" takes `panel_action` (+ `version`/`reason` for a pin); action:"self_update" takes `self_update_action`; action:"configure_manager" requires `manager_setting` (+ `value`).
+  Options: `action:"install"`, `action:"update"`, `action:"update_all"`, `action:"panel"`, `action:"self_update"`, `action:"environment"`, `action:"configure_manager"`.
 </ParamField>
 <ParamField path="target_path" type="string">
   action:"install" — REQUIRED absolute path to the workspace directory to install ComfyUI into. Must be empty or non-existent.
@@ -39,16 +40,19 @@ Install, update and configure the local ComfyUI installation, its sidebar panel,
   action:"install" — ComfyUI version to install (comfy-cli semantics): "nightly" (default-branch HEAD), "latest" (newest release tag), or a semantic version like "0.3.40" (checked out as tag v0.3.40). Raw git refs/branches are rejected. Omit to track the default branch HEAD. ALSO used by action:"panel" + panel_action:"pin", where it is the PANEL version to hold at, e.g. '0.11.20' (take it from the installedVersion that panel_action:"status" reports).
 </ParamField>
 <ParamField path="panel_action" type="enum" default="status">
-  action:"panel" — which sidebar-panel operation to run. status: report installed/version/dev-symlink/pin plus a sync assessment (never errors). sync: bring the panel up to what this orchestrator needs — no-ops when already current, WARNS ONLY when pinned, and reports the version re-read from disk afterwards. install: add the panel (nightly). update: pull the latest nightly. Works on either install shape — a git checkout is fast-forwarded, and a Comfy Registry ZIP install (which has no .git) is replaced with a verified fresh clone, keeping the previous copy outside custom_nodes. Success is always re-read from disk. reinstall: uninstall + reinstall (nightly). pin: hold the panel at a version (requires `version`). unpin: clear the pin so a sync can proceed. unlock: recover from a crashed/killed orchestrator's leftover panel operation lock — reclaims it ONLY when it is provably abandoned (older than the stale threshold AND its recorded owner process is dead), and refuses with the observed state otherwise. install/update/reinstall/sync refuse on a dev symlink or an active pin, and require a local workspace (COMFYUI_PATH or the saved default workspace). Options: `status`, `install`, `update`, `reinstall`, `sync`, `pin`, `unpin`, `unlock`.
+  action:"panel" — which sidebar-panel operation to run. status: report installed/version/dev-symlink/pin plus a sync assessment (never errors). sync: bring the panel up to what this orchestrator needs — no-ops when already current, WARNS ONLY when pinned, and reports the version re-read from disk afterwards. install: add the panel (nightly). update: pull the latest nightly. Works on either install shape — a git checkout is fast-forwarded, and a Comfy Registry ZIP install (which has no .git) is replaced with a verified fresh clone, keeping the previous copy outside custom_nodes. Success is always re-read from disk. reinstall: uninstall + reinstall (nightly). pin: hold the panel at a version (requires `version`). unpin: clear the pin so a sync can proceed. unlock: recover from a crashed/killed orchestrator's leftover panel operation lock — reclaims it ONLY when it is provably abandoned (older than the stale threshold AND its recorded owner process is dead), and refuses with the observed state otherwise. install/update/reinstall/sync refuse on a dev symlink or an active pin, and require a local workspace (COMFYUI_PATH or the saved default workspace).
+  Options: `status`, `install`, `update`, `reinstall`, `sync`, `pin`, `unpin`, `unlock`.
 </ParamField>
 <ParamField path="reason" type="string">
   action:"panel" + panel_action:"pin" only: why the user is pinning (stored with the pin).
 </ParamField>
 <ParamField path="self_update_action" type="enum" default="status">
-  action:"self_update" — status: report install mode + current vs latest version + dev-link note (never errors). update: update to the latest published version (refuses on a dev link; no-op when already up to date or for npx). Options: `status`, `update`.
+  action:"self_update" — status: report install mode + current vs latest version + dev-link note (never errors). update: update to the latest published version (refuses on a dev link; no-op when already up to date or for npx).
+  Options: `status`, `update`.
 </ParamField>
 <ParamField path="manager_setting" type="enum">
-  action:"configure_manager" — REQUIRED. Which ComfyUI-Manager setting to change. HTTP API: set_preview_method, set_db_mode, set_component_policy, set_update_policy, set_channel, reset_queue. config.ini fallback: set_network_mode, set_security_level. Options: `set_preview_method`, `set_db_mode`, `set_component_policy`, `set_update_policy`, `set_channel`, `reset_queue`, `set_network_mode`, `set_security_level`.
+  action:"configure_manager" — REQUIRED. Which ComfyUI-Manager setting to change. HTTP API: set_preview_method, set_db_mode, set_component_policy, set_update_policy, set_channel, reset_queue. config.ini fallback: set_network_mode, set_security_level.
+  Options: `set_preview_method`, `set_db_mode`, `set_component_policy`, `set_update_policy`, `set_channel`, `reset_queue`, `set_network_mode`, `set_security_level`.
 </ParamField>
 <ParamField path="value" type="string">
   action:"configure_manager" — value for the chosen `manager_setting` (omit only for reset_queue). Allowed values per setting — set_preview_method: auto | latent2rgb | taesd | none; set_db_mode: local | cache | remote; set_component_policy: workflow | higher | mine; set_update_policy: stable-comfyui | nightly-comfyui; set_channel: a channel name (e.g. default); set_network_mode: public | private | offline; set_security_level: strong | normal | normal- | weak. HTTP-API settings take effect live; the config.ini ones (set_network_mode, set_security_level) apply only after a ComfyUI restart.
@@ -182,7 +186,8 @@ Inspect and manage ComfyUI workspaces (local installs). Driven by the `action` p
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which workspace operation to perform. "get" and "list" take no other parameters; "set_default" requires `path`. Options: `action:"get"`, `action:"set_default"`, `action:"list"`.
+  Which workspace operation to perform. "get" and "list" take no other parameters; "set_default" requires `path`.
+  Options: `action:"get"`, `action:"set_default"`, `action:"list"`.
 </ParamField>
 <ParamField path="path" type="string">
   action:"set_default" — REQUIRED absolute path to a ComfyUI installation directory to remember as the default workspace.

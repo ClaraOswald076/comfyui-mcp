@@ -299,7 +299,16 @@ function renderParam(name: string, schema: JsonSchema, required: boolean): strin
     const opt = (e: unknown) => (name === "action" ? `\`action:"${String(e)}"\`` : `\`${String(e)}\``);
     body.push(`Options: ${schema.enum.map(opt).join(", ")}.`);
   }
-  return `<ParamField ${attrs.join(" ")}>\n  ${body.join(" ") || "—"}\n</ParamField>`;
+  // A description and its `Options:` list go on SEPARATE lines. Joining them with a
+  // space is not merely cosmetic here: the dead-name gate reasons PER LINE, and its
+  // exemptions cover one occurrence of a name per line on purpose (a line carrying two
+  // mentions is ambiguous, so it fails closed and "must be split"). Welding the two
+  // pieces together manufactures exactly that ambiguity — a description that mentions a
+  // retired name as history, glued to an `action:"…"` option that legitimately contains
+  // it, becomes one unsplittable line the gate cannot accept and no author can fix
+  // without editing generated output. Emitting them separately keeps each piece
+  // individually judgeable, which is what the per-line rule assumes.
+  return `<ParamField ${attrs.join(" ")}>\n  ${body.join("\n  ") || "—"}\n</ParamField>`;
 }
 
 // Most examples can be derived from JSON Schema required fields. Flat action
