@@ -7,8 +7,6 @@ import { registerQueueManagementTools } from "./queue-management.js";
 import { registerBatchTools } from "./batches.js";
 import { registerRegistrySearchTools } from "./registry-search.js";
 import { registerModelManagementTools } from "./model-management.js";
-import { registerModelExtrasTools } from "./model-extras.js";
-import { registerExtraPathsTools } from "./extra-paths.js";
 import { registerDiagnosticsTools } from "./diagnostics.js";
 import { registerRunpodTools } from "./runpod.js";
 import { registerWorkflowLibraryTools } from "./workflow-library.js";
@@ -34,7 +32,6 @@ import { registerNodeManagementTools } from "./node-management.js";
 import { registerReportIssueTools } from "./report-issue.js";
 import { registerNodeAuthoringTools } from "./node-authoring.js";
 import { registerNodeVerifyTools } from "./node-verify.js";
-import { registerMissingModelTools } from "./missing-models.js";
 import { registerInstallComfyUITools } from "./install-comfyui.js";
 import { registerUpdateComfyUITools } from "./update-comfyui.js";
 import { registerWorkspaceEnvTools } from "./workspace-env.js";
@@ -104,13 +101,10 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["diagnostics", registerReportIssueTools],
   // (0.50.0 slice 9: the workflow-deps group's two tools folded into `list_packs`
   // actions "extract_deps"/"install_deps" — same note as skill-generator above.)
-  ["models", registerMissingModelTools],
   ["server", registerInstallComfyUITools],
   ["server", registerUpdateComfyUITools],
-  ["models", registerModelExtrasTools],
   ["models", registerModelExplorerTools],
   ["workflow-authoring", registerPromptDirectorTools],
-  ["models", registerExtraPathsTools],
   ["server", registerWorkspaceEnvTools],
   ["generation", registerApiNodesTools],
   ["server", registerManagerConfigTools],

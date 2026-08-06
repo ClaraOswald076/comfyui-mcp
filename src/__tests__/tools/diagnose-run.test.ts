@@ -141,7 +141,7 @@ describe("diagnose_run — failure explanation", () => {
     expect(text).toContain("Missing models");
     expect(text).toContain("sdxl_base.safetensors");
     expect(text).toContain("ckpt_name");
-    expect(text).toContain("search_civitai_models"); // actionable next step
+    expect(text).toContain('download_model action:"search_civitai"'); // actionable next step
   });
 
   it("surfaces missing node types, de-duplicated", async () => {

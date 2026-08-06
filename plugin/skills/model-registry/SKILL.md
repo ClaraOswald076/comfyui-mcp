@@ -1,20 +1,20 @@
 ---
 name: model-registry
-description: Curated download URLs and target directories for every model the comfyui-mcp skills reference — checkpoints, VAEs, text encoders, LoRAs — organized by family (Flux, WAN, LTX, Qwen, Z-Image, SD15/SDXL). Use when downloading models with download_model / download_civitai_model, when a workflow fails with a missing-model error, or when setting up a new machine.
+description: Curated download URLs and target directories for every model the comfyui-mcp skills reference — checkpoints, VAEs, text encoders, LoRAs — organized by family (Flux, WAN, LTX, Qwen, Z-Image, SD15/SDXL). Use when downloading models with download_model (action:"download" / action:"download_civitai"), when a workflow fails with a missing-model error, or when setting up a new machine.
 ---
 
 # Model Registry
 
 One table per family: filename → source URL → target subdir under
-`<COMFYUI>/models/`. Use with `download_model(url, target_subfolder, filename)`.
+`<COMFYUI>/models/`. Use with `download_model({ action: "download", url, target_subfolder, filename })`.
 This registry grows with every release — if a model you need is missing, use
-`search_models` (HuggingFace) or `download_civitai_model` and consider
+`action:"search"` (HuggingFace) or `action:"download_civitai"` and consider
 contributing the row.
 
 **Conventions**
 - HF "resolve" URLs download directly: `https://huggingface.co/<repo>/resolve/main/<path>`
 - 🔒 = gated repo — needs `HUGGINGFACE_TOKEN` (accept the license on the HF page first)
-- CivitAI model-page URLs need `download_civitai_model` (resolves version → file); raw `civitai.com/api/download/...` URLs work with `download_model` + `CIVITAI_API_TOKEN`
+- CivitAI model-page URLs need `download_model` `action:"download_civitai"` (resolves version → file); raw `civitai.com/api/download/...` URLs work with `action:"download"` + `CIVITAI_API_TOKEN`
 - Always verify the exact filename a workflow's loader expects — `model-compatibility` skill covers which VAE/CLIP pairs with which architecture
 
 ## Shared VAEs & text encoders (download these once)
@@ -47,7 +47,7 @@ Comfy-Org repackages everything: `huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repac
 | `wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors` | `split_files/loras/` | `loras/` |
 | `wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors` | `split_files/loras/` | `loras/` |
 | Magical-morph I2V LoRAs (high/low) | `huggingface.co/NikolaSigmoid/wan2.2-i2v-loras-magical-morph` | `loras/` |
-| SkinMorph Redmond I2V 14B | `civitai.com/models/2210162` (use `download_civitai_model`) | `loras/` |
+| SkinMorph Redmond I2V 14B | `civitai.com/models/2210162` (use `action:"download_civitai"`) | `loras/` |
 
 ## LTX-2 19B video (see `ltxv2-video` skill)
 
@@ -80,7 +80,7 @@ Comfy-Org repackages everything: `huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repac
 
 ## SDXL / SD1.5 community checkpoints (CivitAI)
 
-Use `download_civitai_model(model_id)` — it resolves the latest version and
+Use `download_model({ action: "download_civitai", model_id })` — it resolves the latest version and
 handles auth:
 
 | Model | CivitAI |

@@ -450,22 +450,26 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
   // -------------------------------------------------------------------------
   // Models
   // -------------------------------------------------------------------------
-  search_models: {
+  download_model: {
+    gloss:
+      "Everything to do with GETTING a model: searching HuggingFace or CivitAI, " +
+      "fetching the file, and watching or stopping the transfer. " +
+      'The `action:"resolve_missing"` one is the answer to "this workflow says a ' +
+      'model is missing" — it works out what is actually absent and finds ' +
+      "downloadable candidates, including smaller quantised versions when the " +
+      "full file will not fit your GPU.",
     examples: [
       {
         ask: "Find me a Flux model I can actually run.",
-        args: { query: "flux schnell", limit: 5 },
+        args: { action: "search", query: "flux schnell", limit: 5 },
         returns:
           "Matching models with their download URLs and file sizes. Nothing is " +
           "downloaded — this is a search.",
       },
-    ],
-  },
-  download_model: {
-    examples: [
       {
         ask: "Get that one.",
         args: {
+          action: "download",
           url: "https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/flux1-schnell.safetensors",
           target_subfolder: "checkpoints",
         },
@@ -477,28 +481,16 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
           "Model files are large — many are 5-25 GB. Check you have the disk " +
           "space before agreeing to a few of these.",
       },
-    ],
-  },
-  list_local_models: {
-    examples: [
       {
-        ask: "Which checkpoints do I already have?",
-        args: { model_type: "checkpoints" },
+        ask: "Is that download still going?",
+        args: { action: "status" },
         returns:
-          "The model filenames in that folder — the exact strings a workflow " +
-          "needs. Omit `model_type` to see every folder at once.",
+          "Every tracked download with its state and byte progress. Pass an " +
+          "`id` to ask about just one.",
       },
-    ],
-  },
-  resolve_missing_models: {
-    gloss:
-      "The answer to \"this workflow says a model is missing\". It works out " +
-      "what is actually absent and finds downloadable candidates, including " +
-      "smaller quantised versions when the full file will not fit your GPU.",
-    examples: [
       {
         ask: "This workflow won't run, it says something's missing. Find it for me.",
-        args: { workflow: WORKFLOW_FRAGMENT },
+        args: { action: "resolve_missing", workflow: WORKFLOW_FRAGMENT },
         argsNote: FRAGMENT_NOTE,
         returns:
           "Each missing file with candidate downloads, their sizes and " +
@@ -507,15 +499,35 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
       },
     ],
   },
-  remove_model: {
+  list_local_models: {
+    gloss:
+      "Everything to do with what you ALREADY have: the installed model files, " +
+      "the embeddings, and the extra folders ComfyUI searches. It also has the " +
+      'one delete: `action:"remove"` unlinks a model file.',
     examples: [
       {
+        ask: "Which checkpoints do I already have?",
+        args: { action: "list", model_type: "checkpoints" },
+        returns:
+          "The model filenames in that folder — the exact strings a workflow " +
+          "needs. Omit `model_type` to see every folder at once.",
+      },
+      {
         ask: "Delete that old LoRA, I'm out of disk space.",
-        args: { path: "loras/old-character-v1.safetensors" },
+        args: { action: "remove", path: "loras/old-character-v1.safetensors" },
         returns: "Confirmation, and how much space came back.",
         caution:
           "This deletes the file. There is no undo and no recycle bin — you " +
-          "would have to download it again. Check the path is the one you mean.",
+          "would have to download it again. Check the path is the one you mean. " +
+          'Note that `action:"remove_path"` is a different thing entirely: it ' +
+          "edits the search-path config and deletes nothing.",
+      },
+      {
+        ask: "Also look for models on my E: drive.",
+        args: { action: "add_path", category: "checkpoints", path: "E:/Models/checkpoints" },
+        returns:
+          "The updated extra-search-path config. ComfyUI needs a restart before " +
+          "it picks the folder up.",
       },
     ],
   },

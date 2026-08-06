@@ -1,5 +1,4 @@
-import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { unlink, writeFile } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { isLocalMode, config } from "../config.js";
@@ -7,7 +6,6 @@ import { logger } from "../utils/logger.js";
 import {
   resolveExistingModelFile,
   currentLiveModelsRoot,
-  MODEL_SUBDIRS,
 } from "../services/model-resolver.js";
 import { startDownloadJob, describePlacement } from "../services/download-jobs.js";
 
@@ -25,9 +23,25 @@ import {
   searchCivitaiModels,
   searchCivitaiCreators,
   fetchCivitaiTopCreators,
+  type CivitaiLeaderboard,
   type CivitaiMetadata,
+  type CivitaiSort,
 } from "../services/civitai-resolver.js";
 import { ValidationError, errorToToolResult } from "../utils/errors.js";
+
+/**
+ * The four model "extras" handlers, no longer registered as tools of their own.
+ *
+ * 0.50.0 slice 11 folded them into the two action-parameterized survivors in
+ * ./model-management.ts — the model-file deleter became list_local_models
+ * (action:"remove") and the three CivitAI tools became download_model
+ * (action:"search_civitai"|"search_creators"|"download_civitai"). The BODIES are
+ * unchanged and stay here, next to the CivitAI resolver imports and the sidecar
+ * writer they use; only the wrapper changed, from `server.tool(...)` to an
+ * exported function the dispatcher calls. Per-action requiredness is enforced by
+ * the dispatcher before it calls these, so each one still receives exactly the
+ * arguments its old schema guaranteed.
+ */
 
 /**
  * Write the CivitAI metadata sidecars next to a freshly downloaded model:
@@ -60,30 +74,10 @@ function remoteUnsupported(message: string) {
   return { content: [{ type: "text" as const, text: message }] };
 }
 
-export function registerModelExtrasTools(server: McpServer): void {
-  server.tool(
-    "remove_model",
-    "Delete a model file from the local ComfyUI models directories. Resolves the " +
-      "path across ALL configured roots — the primary <COMFYUI_PATH>/models AND " +
-      "every directory in extra_model_paths.yaml / extra_models_config.yaml (e.g. " +
-      "models stored on another drive like E:\\) — the same roots ComfyUI loads " +
-      "from. The path must stay within a known root (path traversal and absolute " +
-      "escapes are rejected). LOCAL-ONLY: deletes from the local filesystem, so it " +
-      "is not supported against a remote ComfyUI (remove the file on the host).",
-    {
-      path: z
-        .string()
-        .min(1)
-        .describe(
-          "Model file path relative to the ComfyUI models/ directory " +
-            "(e.g. 'checkpoints/sd_xl_base_1.0.safetensors'). The leading segment " +
-            "is the category used to locate the file in extra roots too.",
-        ),
-    },
-    async (args) => {
+export async function removeModelAction(args: { path: string }): Promise<CallToolResult> {
       if (!isLocalMode()) {
         return remoteUnsupported(
-          "remove_model is not supported against a remote ComfyUI. It deletes a " +
+          'list_local_models action:"remove" is not supported against a remote ComfyUI. It deletes a ' +
             "file on the ComfyUI host's local filesystem, which the MCP cannot " +
             "reach in remote (--comfyui-url / COMFYUI_URL) mode. Delete the file " +
             "directly on the ComfyUI host instead.",
@@ -112,55 +106,17 @@ export function registerModelExtrasTools(server: McpServer): void {
       } catch (err) {
         return errorToToolResult(err);
       }
-    },
-  );
+}
 
-  server.tool(
-    "search_civitai_models",
-    "Search CivitAI by keyword for checkpoints, LoRAs, embeddings, VAEs, and ControlNets — THE tool for " +
-      "'find me a <base model> LoRA on Civitai'. Read-only and network-only (public CivitAI REST API; no " +
-      "token or running ComfyUI required; CIVITAI_API_TOKEN unlocks gated results). Filter by `types` " +
-      "(LORA, Checkpoint, TextualInversion, VAE, Controlnet, …) and `base_models` (CivitAI labels: " +
-      "'Flux.1 D', 'SDXL 1.0', 'SD 1.5', 'Pony', 'Illustrious', 'Wan Video') — ALWAYS pass base_models when " +
-      "the user's checkpoint family is known, so results actually fit their setup. Each hit returns the " +
-      "model_id and version_id that download_civitai_model takes directly, plus trigger words to use in the " +
-      "prompt after installing. Flow: search_civitai_models → pick a hit → download_civitai_model " +
-      "{model_version_id, target_subfolder} → wire/prompt with the trained words. Pass `creator` (exact " +
-      "username, e.g. from search_civitai_creators) to list ONE creator's models — with or without a query. " +
-      "SFW-only by default. For HuggingFace search use search_models.",
-    {
-      query: z
-        .string()
-        .min(1)
-        .optional()
-        .describe(
-          "Keyword search (e.g. 'detail enhancer', 'anime style', a character name). " +
-            "Optional when creator is given (then it narrows that creator's models).",
-        ),
-      creator: z
-        .string()
-        .min(1)
-        .optional()
-        .describe(
-          "Only models by this CivitAI creator (EXACT username — find it with " +
-            "search_civitai_creators). At least one of query/creator is required.",
-        ),
-      types: z
-        .array(z.enum(["Checkpoint", "LORA", "LoCon", "DoRA", "TextualInversion", "VAE", "Controlnet", "Upscaler", "MotionModule", "Workflows"]))
-        .optional()
-        .describe("Only these model types (e.g. ['LORA'])."),
-      base_models: z
-        .array(z.string())
-        .optional()
-        .describe("Only these base-model families, CivitAI labels: 'Flux.1 D', 'SDXL 1.0', 'SD 1.5', 'Pony', 'Illustrious', 'Wan Video', …"),
-      sort: z
-        .enum(["Highest Rated", "Most Downloaded", "Newest"])
-        .optional()
-        .describe("Ranking (default 'Highest Rated')."),
-      nsfw: z.boolean().optional().describe("Include NSFW results (default false)."),
-      limit: z.number().int().min(1).max(25).optional().describe("Max results (default 10)."),
-    },
-    async (args) => {
+export async function searchCivitaiModelsAction(args: {
+  query?: string;
+  creator?: string;
+  types?: string[];
+  base_models?: string[];
+  sort?: CivitaiSort;
+  nsfw?: boolean;
+  limit?: number;
+}): Promise<CallToolResult> {
       try {
         if (!args.query?.trim() && !args.creator?.trim()) {
           throw new ValidationError(
@@ -196,9 +152,9 @@ export function registerModelExtrasTools(server: McpServer): void {
                   (args.base_models?.length ? ` for base ${args.base_models.join("/")}` : "") +
                   `. Try a broader query, drop the filters` +
                   (args.creator
-                    ? `, check the exact username with search_civitai_creators (creators with only NSFW models need nsfw:true)`
+                    ? `, check the exact username with download_model action:"search_creators" (creators with only NSFW models need nsfw:true)`
                     : "") +
-                  `, or search HuggingFace with search_models.` +
+                  `, or search HuggingFace with download_model action:"search".` +
                   capNote,
               },
             ],
@@ -231,7 +187,7 @@ export function registerModelExtrasTools(server: McpServer): void {
               type: "text",
               text:
                 `${hits.length} CivitAI result(s) for ${what}:\n\n${lines.join("\n\n")}\n\n` +
-                `Next: download_civitai_model {"model_version_id": <id>, "target_subfolder": "<loras|checkpoints|...>"} — then use the trigger words in the prompt.` +
+                `Next: download_model {"action": "download_civitai", "model_version_id": <id>, "target_subfolder": "<loras|checkpoints|...>"} — then use the trigger words in the prompt.` +
                 capNote +
                 tokenNote,
             },
@@ -240,39 +196,13 @@ export function registerModelExtrasTools(server: McpServer): void {
       } catch (err) {
         return errorToToolResult(err);
       }
-    },
-  );
+}
 
-  server.tool(
-    "search_civitai_creators",
-    "Find CivitAI CREATORS — THE tool for 'who are the top creators on Civitai' and 'find creator <name>'. " +
-      "Read-only and network-only (no token or running ComfyUI required). Two modes: with NO query it returns " +
-      "the site's creator LEADERBOARD (civitai.com/leaderboard — rank, score, downloads, likes; pick a `board`: " +
-      "'overall' [default], 'overall_90' [last 90 days], 'overall_nsfw' [mature], 'new_creators' [first model " +
-      "<30 days ago]); with a `query` it searches usernames (public /api/v1/creators; partial match, returns " +
-      "model counts, NOT ranked). Each hit's username feeds search_civitai_models {creator: <username>} " +
-      "directly. Flow: search_civitai_creators → pick a creator → search_civitai_models {creator, types?} → " +
-      "download_civitai_model. SCOPE CAVEAT: the /api/v1/creators index only lists creators who have published " +
-      "MODELS. A creator who posts only images/videos (no models) legitimately returns 0 hits here — that is a " +
-      "gap in this endpoint, NOT proof the creator doesn't exist. For a media-only creator, browse their images " +
-      "via the panel CivitAI browser (panel_open_civitai {creator}) or the logged-in browser session instead.",
-    {
-      query: z
-        .string()
-        .min(1)
-        .optional()
-        .describe(
-          "Username search (partial match, e.g. 'alcait'). Omit to get the top-creators leaderboard instead.",
-        ),
-      board: z
-        .enum(["overall", "overall_90", "overall_nsfw", "new_creators"])
-        .optional()
-        .describe(
-          "Leaderboard to rank by when no query is given (default 'overall'). Ignored with a query.",
-        ),
-      limit: z.number().int().min(1).max(50).optional().describe("Max results (default 10)."),
-    },
-    async (args) => {
+export async function searchCivitaiCreatorsAction(args: {
+  query?: string;
+  board?: CivitaiLeaderboard;
+  limit?: number;
+}): Promise<CallToolResult> {
       try {
         if (args.query?.trim()) {
           const { hits, total } = await searchCivitaiCreators(args.query, {
@@ -305,7 +235,7 @@ export function registerModelExtrasTools(server: McpServer): void {
                   `${hits.length} CivitAI creator(s) for "${args.query}"` +
                   (total != null ? ` (${total.toLocaleString()} total match${total === 1 ? "" : "es"})` : "") +
                   `:\n\n${lines.join("\n")}\n\n` +
-                  `Next: search_civitai_models {"creator": "<username>"} to list a creator's models.`,
+                  `Next: download_model {"action": "search_civitai", "creator": "<username>"} to list a creator's models.`,
               },
             ],
           };
@@ -340,68 +270,21 @@ export function registerModelExtrasTools(server: McpServer): void {
               type: "text",
               text:
                 `Top ${hits.length} CivitAI creators ("${board}" leaderboard):\n\n${lines.join("\n\n")}\n\n` +
-                `Next: search_civitai_models {"creator": "<username>"} to list a creator's models, then download_civitai_model.`,
+                `Next: download_model {"action": "search_civitai", "creator": "<username>"} to list a creator's models, then action:"download_civitai".`,
             },
           ],
         };
       } catch (err) {
         return errorToToolResult(err);
       }
-    },
-  );
+}
 
-  server.tool(
-    "download_civitai_model",
-    "Download a model from CivitAI into the connected ComfyUI's models/ directory. " +
-      "Resolves a CivitAI model id (latest version) or a model-version id to a download " +
-      "URL via the CivitAI REST API. LOCAL ComfyUI (COMFYUI_PATH set): streams the file " +
-      "to disk under <COMFYUI_PATH>/models/<target_subfolder>/ and returns the saved " +
-      "absolute path. REMOTE ComfyUI: dispatches the download to the ComfyUI host via " +
-      "the ComfyUI-Manager install-model HTTP API (fetched server-side). Provide at least " +
-      "one of model_id or model_version_id. Gated/early-access models require " +
-      "CIVITAI_API_TOKEN locally (sent as a bearer header, never in the URL); remote " +
-      "Manager-side fetches rely on tokens configured on the ComfyUI host. NOTE " +
-      "(remote): the server-side install requires the host's ComfyUI-Manager to run " +
-      "with network_mode=personal_cloud (or loopback) and a permissive security level; " +
-      "a stricter gate silently rejects the download, and Manager reports the queue " +
-      "task 'done' even on failure — so a remote dispatch does not guarantee the file landed.",
-    {
-      target_subfolder: z
-        .string()
-        .min(1)
-        .describe(
-          `Target subfolder under ComfyUI models/. Standard names: ${MODEL_SUBDIRS.join(", ")}. ` +
-            `Any other relative subfolder (incl. nested like 'loras/<subdir>') is allowed; ` +
-            `absolute paths and '..' escapes are rejected.`,
-        ),
-      model_version_id: z
-        .number()
-        .int()
-        .positive()
-        .optional()
-        .describe(
-          "CivitAI model-version id (from the URL ?modelVersionId=...). " +
-            "If both model_id and model_version_id are given, this selects the " +
-            "specific version of that model.",
-        ),
-      model_id: z
-        .number()
-        .int()
-        .positive()
-        .optional()
-        .describe(
-          "CivitAI model id. The latest version is used unless model_version_id " +
-            "is also provided.",
-        ),
-      filename: z
-        .string()
-        .optional()
-        .describe(
-          "Override the saved filename (defaults to the CivitAI file name, or " +
-            "the URL basename).",
-        ),
-    },
-    async (args) => {
+export async function downloadCivitaiModelAction(args: {
+  target_subfolder: string;
+  model_version_id?: number;
+  model_id?: number;
+  filename?: string;
+}): Promise<CallToolResult> {
       try {
         if (args.model_id === undefined && args.model_version_id === undefined) {
           throw new ValidationError(
@@ -432,7 +315,7 @@ export function registerModelExtrasTools(server: McpServer): void {
           if ((civitaiType && NON_MODEL_TYPES.has(civitaiType)) || (fileExt && NON_MODEL_EXTS.has(fileExt))) {
             lines.push(
               `  WARNING: this CivitAI entry is type "${civitaiType ?? "unknown"}" (file: .${fileExt ?? "?"}) — it is NOT a loadable model file and will not appear in a ${args.target_subfolder} loader. ` +
-                `If the user wanted a LoRA/checkpoint, re-run search_civitai_models with types:["LORA"] (or ["Checkpoint"]) and download a hit whose type matches. Do not tell the user a model was installed.`,
+                `If the user wanted a LoRA/checkpoint, re-run download_model action:"search_civitai" with types:["LORA"] (or ["Checkpoint"]) and download a hit whose type matches. Do not tell the user a model was installed.`,
             );
           }
 
@@ -493,14 +376,14 @@ export function registerModelExtrasTools(server: McpServer): void {
                   `  Version id: ${resolved.versionId}\n\n` +
                   `This is NOT a failure. The file is streaming to disk and will land on its own; ` +
                   `trigger words and metadata are written when it completes. Tell the user it is ` +
-                  `downloading, then read \`download_status\` with this id — do not re-issue the ` +
+                  `downloading, then read download_model \`action:"status"\` with this id — do not re-issue the ` +
                   `download and do not report it as incomplete.`,
               },
             ],
           };
         }
         if (job.status === "cancelled") {
-          // A concurrent cancel_download landed during this grace window — do NOT fall
+          // A concurrent download_model action:"cancel" landed during this grace window — do NOT fall
           // through to the success renderer (which would dereference an unset job.path).
           return {
             content: [
@@ -515,7 +398,7 @@ export function registerModelExtrasTools(server: McpServer): void {
         }
 
         const savedPath = job.path!;
-        // ONE placement policy shared with download_model / download_status (#369):
+        // ONE placement policy shared with download_model action:"download"/"status" (#369):
         // "downloaded successfully" is licensed ONLY by a placement the connected
         // ComfyUI actually confirmed. Anything else is reported with its caveat.
         const placement = describePlacement(job, {
@@ -554,6 +437,4 @@ export function registerModelExtrasTools(server: McpServer): void {
       } catch (err) {
         return errorToToolResult(err);
       }
-    },
-  );
 }

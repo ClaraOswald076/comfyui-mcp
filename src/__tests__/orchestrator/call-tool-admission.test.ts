@@ -197,6 +197,60 @@ describe("call_tool admission", () => {
     });
   });
 
+  /**
+   * 0.50.0 slice 11 folded six inventory tools into `list_local_models`. The
+   * retired entry was a READ-ONLY listing; the folded name also carries
+   * action:"remove", which UNLINKS a model file with no undo. Admitting the name
+   * unscoped would have handed a confirmation-less mobile/mirrored client a
+   * delete button it never had — the #839 shape, a fold turning a refusal into
+   * an acceptance.
+   */
+  it('admits list_local_models for action:"list" only — the delete is refused', () => {
+    expect(callToolAdmission("list_local_models", { action: "list" })).toBeNull();
+    expect(
+      callToolAdmission("list_local_models", { action: "list", model_type: "checkpoints" }),
+    ).toBeNull();
+    for (const action of ["remove", "remove_path", "add_path", "embeddings", "list_paths"]) {
+      expect(
+        callToolAdmission("list_local_models", { action, path: "loras/x.safetensors" }),
+        `action:"${action}"`,
+      ).toBe(`tool "list_local_models" is not permitted for action "${action}"`);
+    }
+    // An omitted action cannot fall through to the delete either.
+    expect(callToolAdmission("list_local_models", { path: "loras/x.safetensors" })).toBe(
+      'tool "list_local_models" is not permitted for action "(missing)"',
+    );
+  });
+
+  /**
+   * Same for `download_model`, which folded eight tools. It admits exactly the
+   * five actions whose retired single-purpose tools were whitelisted.
+   */
+  it("admits download_model for the five actions its retired entries covered", () => {
+    for (const action of [
+      "download",
+      "download_civitai",
+      "search_civitai",
+      "search_creators",
+      "resolve_missing",
+    ]) {
+      expect(callToolAdmission("download_model", { action }), `action:"${action}"`).toBeNull();
+    }
+  });
+
+  it("refuses the download_model actions no retired entry covered", () => {
+    // "cancel" is the one with teeth: a wrong id from a canvas-less client would
+    // abort a transfer the user is watching.
+    for (const action of ["search", "status", "cancel"]) {
+      expect(callToolAdmission("download_model", { action }), `action:"${action}"`).toBe(
+        `tool "download_model" is not permitted for action "${action}"`,
+      );
+    }
+    expect(callToolAdmission("download_model", {})).toBe(
+      'tool "download_model" is not permitted for action "(missing)"',
+    );
+  });
+
   // Read from the ledger rather than spelled: a consolidation that removes a
   // name from TOOL_NAMES but forgets to remove it from the whitelist would leave
   // a phantom entry admitting a tool that no longer exists, and every slice adds

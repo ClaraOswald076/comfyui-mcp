@@ -464,7 +464,7 @@ export async function listLocalModels(
 
 /**
  * Best-effort: attach `triggerWords` + `baseModel` from each model's CivitAI
- * sidecar (`<file>.civitai.json`, written by download_civitai_model) so the
+ * sidecar (`<file>.civitai.json`, written by download_model action:"download_civitai") so the
  * agent applies the trigger words automatically when generating. Silent when a
  * sidecar is missing or there's no local filesystem (remote/cloud).
  */
@@ -1016,7 +1016,7 @@ const LIVE_VISIBILITY_RETRY_MS = 1000;
  * Confirm, AFTER a download lands, that the bytes are (a) really on disk and
  * (b) somewhere the LIVE server reads from — then report the path we actually
  * confirmed. Reporting the INTENDED path is what made #369 a fabricated success:
- * `download_status` said "done … landed at <stale install>" while the running
+ * `download_model action:"status"` said "done … landed at <stale install>" while the running
  * ComfyUI could not see the file at all.
  *
  * Never throws: a completed transfer must not be turned into a failure by a
@@ -1992,14 +1992,14 @@ export async function downloadModel(
    *  on that job (#467). Omitted by direct callers (no job to report to). */
   onResume?: ResumeReporter,
   /** Per-download abort signal, threaded from the job's AbortController into the
-   *  fetch + stream pipeline so cancel_download aborts exactly this transfer (#515).
+   *  fetch + stream pipeline so download_model action:"cancel" aborts exactly this transfer (#515).
    *  Omitted by direct callers (no cancellation handle). */
   signal?: AbortSignal,
   /** Reports the ACTUAL progress-tray id (a hash of the post-auth/post-HF-rewrite
    *  request URL) back to the job, so the job's trayId matches the id the streaming
    *  and done rows are written under. Without it a query-auth or HF_ENDPOINT-rewritten
    *  download's tray row is keyed differently from the job's original-URL trayId — so
-   *  download_status byte display AND cancel cleanup would target the wrong id. Called
+   *  download_model action:"status" byte display AND cancel cleanup would target the wrong id. Called
    *  only on the LOCAL streaming path (the Manager path writes no streaming rows). */
   onTrayId?: (trayId: string) => void,
   /** Fired the instant the completed, validated file is renamed into its destination
