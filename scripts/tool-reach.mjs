@@ -35,7 +35,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFi
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { REQUESTS, checkRequestSet, referencedCapabilities } from "./tool-reach-requests.mjs";
-import { missingCoverage } from "./tool-reach-merge.mjs";
+import { missingCoverage, surfaceDigest } from "./tool-reach-merge.mjs";
 import { FINAL_SURFACE, FOLD_MAP, resolveExpectation } from "./tool-reach-foldmap.mjs";
 import {
   REACH_WINDOW,
@@ -267,6 +267,7 @@ function report() {
       entries.push({
         arm: run.arm,
         ref: run.ref,
+        surface: surfaceDigest(run),
         mode: run.mode,
         surfaceSize: run.mode === "compact" ? `3 (+${run.catalogNames.length})` : run.advertisedCount,
         model,
@@ -297,15 +298,20 @@ function report() {
   md.push("|---|---|---|---|---|---|");
   // One row per (arm, ref, mode). Two result files for the same arm are two
   // halves of one field, not two arms.
+  // Grouped on the SURFACE, not on the git ref. A harness commit moves HEAD
+  // without changing a single tool the model sees, and grouping on the ref
+  // rendered one arm as two, with near-identical numbers side by side and
+  // nothing to say they were the same measurement.
   const armGroups = new Map();
   for (const run of runs) {
-    const key = `${run.arm}|${run.ref}|${run.mode}`;
-    if (!armGroups.has(key)) armGroups.set(key, { ...run, modelsRun: [] });
+    const key = `${run.arm}|${run.mode}|${surfaceDigest(run)}`;
+    if (!armGroups.has(key)) armGroups.set(key, { ...run, modelsRun: [], refs: [] });
     armGroups.get(key).modelsRun.push(...run.modelsRun);
+    armGroups.get(key).refs.push(String(run.ref).slice(0, 7));
   }
   for (const run of armGroups.values()) {
     md.push(
-      `| \`${run.arm}\` | \`${String(run.ref).slice(0, 7)}\` | ${run.mode} | ` +
+      `| \`${run.arm}\` | \`${[...new Set(run.refs)].join(", ")}\` | ${run.mode} | ` +
         `${run.mode === "compact" ? `3 meta (+${run.catalogNames.length} catalog)` : run.advertisedCount} | ` +
         `${(run.surfaceBytes / 1024).toFixed(0)} KB | ${[...new Set(run.modelsRun)].join(", ") || "—"} |`,
     );

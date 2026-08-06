@@ -106,6 +106,30 @@ export function mergeEpisodes(prior, fresh, expected) {
 }
 
 /**
+ * Identity of a tool SURFACE, independent of the commit that produced it.
+ *
+ * The git ref is provenance, not identity. Committing a fix to the harness
+ * moves HEAD, so two runs of the same arm against the byte-identical surface
+ * were recorded under different refs — and then refused to merge and rendered as
+ * two separate arms in the report, as if the surface had changed. What actually
+ * decides comparability is what the model was SHOWN: the advertised tool names
+ * and, in compact mode, the catalog behind `call_tool`.
+ *
+ * Names only, deliberately. Descriptions and schemas move with ordinary product
+ * work, and a digest that changed on every reworded tool description would
+ * invalidate expensive hosted runs for a reason that has nothing to do with
+ * which tool a model reaches for.
+ *
+ * @param {{advertisedNames?: string[], catalogNames?: string[]}} run
+ */
+export function surfaceDigest(run) {
+  return createHash("sha256")
+    .update(JSON.stringify([run.advertisedNames ?? [], run.catalogNames ?? []]))
+    .digest("hex")
+    .slice(0, 12);
+}
+
+/**
  * Requests a (model, arm) pair is MISSING relative to the full set.
  *
  * A partial arm is not wrong, but publishing it as if it were complete is. The

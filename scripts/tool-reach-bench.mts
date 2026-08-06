@@ -45,7 +45,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { REQUESTS } from "./tool-reach-requests.mjs";
 import { REACH_WINDOW } from "./tool-reach-score.mjs";
 import { createDispatcher } from "./tool-reach-dispatch.mjs";
-import { episodeFingerprint, mergeEpisodes } from "./tool-reach-merge.mjs";
+import { episodeFingerprint, mergeEpisodes, surfaceDigest } from "./tool-reach-merge.mjs";
 
 // ───────────────────────────────────────────────────────── argv
 const argv = process.argv.slice(2);
@@ -817,8 +817,11 @@ function writeResults(done: Episode[]): void {
   if (existsSync(OUT)) {
     try {
       const p = JSON.parse(readFileSync(OUT, "utf8"));
-      if (p.arm === ARM && p.ref === REF && p.mode === MODE) prior = p;
-      else console.error(`[reach] ignoring ${OUT}: different arm/ref/mode, not comparable`);
+      // Keyed on the SURFACE, not on the git ref: a harness commit moves HEAD
+      // without changing a single tool the model sees, and refusing to merge on
+      // that would render one arm as two.
+      if (p.arm === ARM && p.mode === MODE && surfaceDigest(p) === surfaceDigest({ advertisedNames: advertised.map((t) => t.name), catalogNames })) prior = p;
+      else console.error(`[reach] ignoring ${OUT}: different arm/mode/surface, not comparable`);
     } catch {
       console.error(`[reach] ignoring unreadable ${OUT}`);
     }
@@ -837,6 +840,7 @@ function writeResults(done: Episode[]): void {
         advertisedCount: advertised.length,
         advertisedNames: advertised.map((t) => t.name),
         catalogNames,
+        surfaceDigest: surfaceDigest({ advertisedNames: advertised.map((t) => t.name), catalogNames }),
         surfaceBytes: JSON.stringify(chatTools()).length,
         ollamaNumCtx: ready.some((r) => r.kind === "ollama") ? ollamaNumCtx() : null,
         reachWindow: REACH_WINDOW,
