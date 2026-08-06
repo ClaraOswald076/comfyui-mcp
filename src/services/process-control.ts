@@ -2096,76 +2096,75 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
     if (before && !before.startedAt) {
       witness = await acquireInstanceWitness(getComfyUIBaseUrl());
     }
+    // The finally is the ONLY cleanup: the bracket logic below exits by break,
+    // continue AND throw, and a close that depends on each path remembering it
+    // leaks a live socket the first time one doesn't (codex gate).
     try {
-      const stats = await getSystemStats();
-      argv = stats.system.argv ?? [];
-    } catch {
-      argv = [];
-      logger.warn("Could not fetch system_stats — will rely on PID detection");
-    }
-    const after = observeOwner();
-    pid = after?.pid ?? before?.pid ?? null;
-    if (pid == null) {
       try {
-        pid = findPidByPort(port);
+        const stats = await getSystemStats();
+        argv = stats.system.argv ?? [];
       } catch {
-        pid = null;
+        argv = [];
+        logger.warn("Could not fetch system_stats — will rely on PID detection");
       }
-    }
-    // No answer to bind means there is nothing to mis-bind: the pid-only paths
-    // below (including #449's reachable-but-unmapped) own that case.
-    if (argv.length === 0) {
-      witness?.close();
-      break;
-    }
-    if (before && after) {
-      if (before.pid !== after.pid) {
-        witness?.close();
-        const err = new ProcessControlError(
-          `The process listening on port ${port} changed while ComfyUI was being identified ` +
-            `(PID ${before.pid} answered; PID ${after.pid} holds the port now). Nothing was ` +
-            `stopped: the launch arguments we hold describe the instance that has gone, not ` +
-            `the one running now. Re-run once the server has settled.`,
-        );
-        err.identityAmbiguous = true;
-        throw err;
+      const after = observeOwner();
+      pid = after?.pid ?? before?.pid ?? null;
+      if (pid == null) {
+        try {
+          pid = findPidByPort(port);
+        } catch {
+          pid = null;
+        }
       }
-      if (before.startedAt && after.startedAt) {
-        witness?.close();
-        if (before.startedAt !== after.startedAt) {
+      // No answer to bind means there is nothing to mis-bind: the pid-only paths
+      // below (including #449's reachable-but-unmapped) own that case.
+      if (argv.length === 0) break;
+      if (before && after) {
+        if (before.pid !== after.pid) {
           const err = new ProcessControlError(
             `The process listening on port ${port} changed while ComfyUI was being identified ` +
-              `(PID ${before.pid} answered and still holds the port, but it is a different ` +
-              `process reusing that number). Nothing was stopped: the launch arguments we ` +
-              `hold describe the instance that has gone, not the one running now. Re-run ` +
-              `once the server has settled.`,
+              `(PID ${before.pid} answered; PID ${after.pid} holds the port now). Nothing was ` +
+              `stopped: the launch arguments we hold describe the instance that has gone, not ` +
+              `the one running now. Re-run once the server has settled.`,
           );
           err.identityAmbiguous = true;
           throw err;
         }
-        bracketed = true;
-        break;
+        if (before.startedAt && after.startedAt) {
+          if (before.startedAt !== after.startedAt) {
+            const err = new ProcessControlError(
+              `The process listening on port ${port} changed while ComfyUI was being identified ` +
+                `(PID ${before.pid} answered and still holds the port, but it is a different ` +
+                `process reusing that number). Nothing was stopped: the launch arguments we ` +
+                `hold describe the instance that has gone, not the one running now. Re-run ` +
+                `once the server has settled.`,
+            );
+            err.identityAmbiguous = true;
+            throw err;
+          }
+          bracketed = true;
+          break;
+        }
+        // At least one end could not stamp the process. A stable pid NUMBER across
+        // the fetch is not identity — pid reuse defeats it — so the window closes on
+        // the witness instead (#914): still open here means one continuous instance
+        // held the port for the whole fetch.
+        if (witness?.alive()) {
+          bracketed = true;
+          break;
+        }
+        missingCapability =
+          `the creation time of PID ${before.pid} could not be read at both ends of the ` +
+          `request (this host does not reliably expose process start times to us), and ` +
+          `the fallback continuity check — a WebSocket held open to the server for the ` +
+          `duration of the request — could not be established or did not stay open`;
+        // One identity source may be flapping — retry once before giving up.
+        continue;
       }
-      // At least one end could not stamp the process. A stable pid NUMBER across
-      // the fetch is not identity — pid reuse defeats it — so the window closes on
-      // the witness instead (#914): still open here means one continuous instance
-      // held the port for the whole fetch.
-      if (witness?.alive()) {
-        bracketed = true;
-        witness.close();
-        break;
-      }
+      // One side of the bracket was unobservable — retry once before giving up.
+    } finally {
       witness?.close();
-      missingCapability =
-        `the creation time of PID ${before.pid} could not be read at both ends of the ` +
-        `request (this host does not reliably expose process start times to us), and ` +
-        `the fallback continuity check — a WebSocket held open to the server for the ` +
-        `duration of the request — could not be established or did not stay open`;
-      // One identity source may be flapping — retry once before giving up.
-      continue;
     }
-    witness?.close();
-    // One side of the bracket was unobservable — retry once before giving up.
   }
   if (argv.length > 0 && pid != null && !bracketed) {
     const err = new ProcessControlError(
@@ -3493,7 +3492,11 @@ async function restartViaManagerRebootDispatch(
             ? "unavailable"
             : witnessClosedAt === undefined
               ? "open"
-              : "closed-before-dispatch",
+              : // NOT "closed-before-dispatch": the boundary is strict precisely
+                // because a same-millisecond stamp is ambiguous (event-delivery
+                // slack), so the log must not assert the ordering the fence
+                // itself declined to trust (codex gate).
+                "closed-at-or-before-dispatch",
       },
     );
   }
