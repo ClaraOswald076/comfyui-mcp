@@ -36,7 +36,7 @@ async function resolveCheckpoint(): Promise<string | undefined> {
       `every one lacks text-encoder weights in its safetensors header (a video or ` +
       `UNet-only model) or is a GGUF file CheckpointLoaderSimple cannot load ` +
       `(${listed}${more}). Download an image checkpoint with download_model ` +
-      `(search_civitai_models can find one), then pass it as \`checkpoint\` or save ` +
+      `(action:"search_civitai" can find one), then pass it as \`checkpoint\` or save ` +
       `it with get_defaults (action:"set"). If you believe one was misdetected, ` +
       `pass \`checkpoint\` explicitly to bypass this check.`,
   );
