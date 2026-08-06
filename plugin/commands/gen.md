@@ -42,7 +42,7 @@ The user wants to generate an image using ComfyUI. Their prompt is provided as t
    - `template`: `"txt2img"`
    - `params`: Include `positive_prompt` from the user's input. Set `checkpoint` to the model filename. Use sensible defaults (1024x1024 for SDXL, 20 steps, cfg 8).
 
-5. **Enqueue the workflow.** Pass the workflow JSON from step 3 to `enqueue_workflow`. This returns immediately with a `prompt_id`.
+5. **Enqueue the workflow.** Pass the workflow JSON from step 3 to `enqueue_workflow(action="enqueue")`. This returns immediately with a `prompt_id`.
 
 6. **Monitor progress in background.** Start a background task to track the job:
 
@@ -55,7 +55,7 @@ The user wants to generate an image using ComfyUI. Their prompt is provided as t
 
    Continue the conversation while waiting. Check the background task output when notified it completed.
 
-   If the job fails, the monitor prints error details (node, message). Use `get_history` for the full traceback if needed.
+   If the job fails, the monitor prints error details (node, message). Use `get_history(action="diagnose")` for the full traceback plus anything missing.
 
    **Fallback**: If the background script is unavailable, use `queue` (action:"status") to poll until `done` is true.
 

@@ -139,7 +139,7 @@ describe("generateAudio", () => {
       expect(["V0", "128k", "320k"]).toContain(save?.inputs.quality);
     });
 
-    // Regression for #501 (bug 5): the generate_audio tool/service dropped the
+    // Regression for #501 (bug 5): the audio generation service dropped the
     // ACE encoder's musical controls (bpm, timesignature, temperature, top_p,
     // top_k, min_p, generate_audio_codes) and SaveAudioMP3 `quality` — they were
     // absent from DEFAULTABLE_KEYS and the createWorkflow passthrough, so callers

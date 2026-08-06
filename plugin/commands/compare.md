@@ -16,8 +16,8 @@ The user wants to see the differences between two ComfyUI workflows — what nod
    Split the argument on `" vs "` or `" VS "` to get two sources. Each source can be:
    - **File path**: a path to a workflow JSON file — read it with the Read tool
    - **Saved workflow name**: a name from ComfyUI's library — load with `get_workflow`
-   - **`last`**: the most recent execution — load from `get_history`
-   - **Prompt ID**: a specific execution ID — load from `get_history` with that ID
+   - **`last`**: the most recent execution — load from `get_history(action="list")`
+   - **Prompt ID**: a specific execution ID — load from `get_history(action="list")` with that ID
 
 2. **Load both workflows.** Read/fetch both workflow sources. Label them **Workflow A** (first) and **Workflow B** (second).
 

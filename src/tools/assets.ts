@@ -1,80 +1,62 @@
-import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { AssetRegistry, applyOverrides } from "../services/asset-registry.js";
 import { enqueueWorkflow } from "../services/workflow-executor.js";
-import { errorToToolResult } from "../utils/errors.js";
 
 /**
- * What is left of the asset tool group after the 0.50.0 slice 15 fold.
+ * `generate_image (action:"regenerate")` — the handler the standalone
+ * re-enqueue-an-asset tool used to carry (0.50.0 slice 16), unchanged apart from
+ * losing its own registration.
  *
- * The three READ tools that lived here — the inline viewer, the registry
- * listing and the provenance reader — became actions on `get_image`
- * (src/tools/image-management.ts), which is where the rest of the image/asset
- * read surface already was. `regenerate` stays: it ENQUEUES a render, so it
- * belongs to the generation family (slice 16), not to the image readers.
+ * 0.50.0 slice 15 emptied the rest of this module: the inline viewer, the
+ * registry listing and the provenance reader became actions on `get_image`, and
+ * it left this one behind with a note that it ENQUEUES a render and so belongs
+ * to the generation family — which is this slice. The module now holds exactly
+ * that handler, and `registerAssetTools` is gone.
  *
- * Its registration slot is unchanged — the three names ahead of it were
- * removed, not reordered, so every surviving name keeps its position in
- * tools/list.
+ * Same AssetRegistry lookup, the same not-found error text, the same
+ * applyOverrides + enqueue — including #865's `preserve_seed_inputs`, so an
+ * override like `{ seed: 42 }` still survives while the other seeds
+ * re-randomize — and the same JSON payload. It stays here rather than moving
+ * into generate-image.ts because the asset registry is this module's concern;
+ * the dispatcher imports it. The try/catch moved OUT to that dispatcher, which
+ * applies the identical `errorToToolResult` — including for the not-found case,
+ * which was already an errorToToolResult RETURN and is now a throw of the same
+ * Error carrying the same message.
  */
-export function registerAssetTools(server: McpServer): void {
-  server.tool(
-    "regenerate",
-    "Re-enqueue the workflow that produced an existing asset, optionally applying parameter overrides. Overrides are applied to any node input matching the key name (e.g. cfg, steps, sampler_name, scheduler, seed, denoise, text). Seeds are re-randomized by default so each regenerate yields a fresh image unless seed is explicitly passed in overrides.",
-    {
-      asset_id: z.string().describe("Asset id of the source generation"),
-      overrides: z
-        .record(z.string(), z.any())
-        .optional()
-        .describe(
-          "Map of input-name → new value applied to every node that already has that input. " +
-            "Common keys: cfg, steps, sampler_name, scheduler, seed, denoise, text.",
+export async function regenerateAction(args: {
+  asset_id: string;
+  overrides?: Record<string, unknown>;
+  disable_random_seed?: boolean;
+}): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+  const { asset_id, overrides, disable_random_seed } = args;
+  const record = AssetRegistry.get(asset_id);
+  if (!record) {
+    throw new Error(
+      `No asset found for id "${asset_id}". It may have expired or never been registered.`,
+    );
+  }
+  const next = applyOverrides(record.workflow, overrides);
+  // An override like overrides.seed is a caller-fixed value; keep it
+  // while the other seeds re-randomize (issue #865).
+  const result = await enqueueWorkflow(next, {
+    disable_random_seed,
+    preserve_seed_inputs: Object.keys(overrides ?? {}),
+  });
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(
+          {
+            status: "enqueued",
+            prompt_id: result.prompt_id,
+            queue_remaining: result.queue_remaining,
+            source_asset_id: asset_id,
+            overrides_applied: overrides ?? {},
+          },
+          null,
+          2,
         ),
-      disable_random_seed: z
-        .boolean()
-        .optional()
-        .describe(
-          "If true, do not randomize seed fields. Combine with `overrides.seed` to reproduce the exact original image.",
-        ),
-    },
-    async ({ asset_id, overrides, disable_random_seed }) => {
-      try {
-        const record = AssetRegistry.get(asset_id);
-        if (!record) {
-          return errorToToolResult(
-            new Error(
-              `No asset found for id "${asset_id}". It may have expired or never been registered.`,
-            ),
-          );
-        }
-        const next = applyOverrides(record.workflow, overrides);
-        // An override like overrides.seed is a caller-fixed value; keep it
-        // while the other seeds re-randomize (issue #865).
-        const result = await enqueueWorkflow(next, {
-          disable_random_seed,
-          preserve_seed_inputs: Object.keys(overrides ?? {}),
-        });
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                {
-                  status: "enqueued",
-                  prompt_id: result.prompt_id,
-                  queue_remaining: result.queue_remaining,
-                  source_asset_id: asset_id,
-                  overrides_applied: overrides ?? {},
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
+      },
+    ],
+  };
 }

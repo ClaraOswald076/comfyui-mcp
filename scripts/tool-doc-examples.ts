@@ -103,14 +103,17 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
   // -------------------------------------------------------------------------
   generate_image: {
     gloss:
-      "The one-line way to get a picture. You do not need a workflow open, or " +
-      "any workflow at all — describe the image and this builds and runs a " +
-      "sensible graph for you. Everything except the prompt is optional and " +
-      "falls back to your saved defaults.",
+      "The one-line way to get a picture — and, through `action`, the same " +
+      "one-line way to get audio, a video clip, a 3D model, a re-run of an " +
+      "earlier image, an upscale, or a background removed. You do not need a " +
+      "workflow open, or any workflow at all: describe what you want and this " +
+      "builds and runs a sensible graph for you. Everything except `action` " +
+      "and the one or two fields that action needs is optional and falls back " +
+      "to your saved defaults.",
     examples: [
       {
         ask: "Make me a picture of a red fox in the snow.",
-        args: { prompt: "a red fox in deep snow, golden hour, sharp focus" },
+        args: { action: "image", prompt: "a red fox in deep snow, golden hour, sharp focus" },
         returns:
           "The finished image, inline in the conversation, plus the seed and " +
           "settings that produced it so you can ask for the same thing again.",
@@ -118,6 +121,7 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
       {
         ask: "Same fox, but widescreen, more detail, and keep it repeatable.",
         args: {
+          action: "image",
           prompt: "a red fox in deep snow, golden hour, sharp focus",
           negative_prompt: "blurry, watermark, text",
           width: 1344,
@@ -131,13 +135,10 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
           "this again with the same settings gives the same picture — that is " +
           "how you iterate on one image instead of rolling a new one each time.",
       },
-    ],
-  },
-  generate_video: {
-    examples: [
       {
         ask: "Turn that fox picture into a short clip of it walking.",
         args: {
+          action: "video",
           prompt: "a red fox walking through deep snow, camera slowly pushing in",
           seconds: 5,
           resolution: "832x480",
@@ -147,6 +148,18 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
           "A path to the rendered video file plus the settings used. Video takes " +
           "far longer than a still — minutes, not seconds — so the agent will " +
           "usually tell you it has started and then report back.",
+      },
+      {
+        ask: "That one was nearly right — run it again with more steps.",
+        args: {
+          action: "regenerate",
+          asset_id: "a3f9c1",
+          overrides: { steps: 40 },
+        },
+        returns:
+          "A new render from the EXACT graph that produced that asset, with " +
+          "only the fields you named changed. The seed is re-rolled unless you " +
+          "pass one, so this gives you a fresh take rather than the same image.",
       },
     ],
   },
@@ -208,28 +221,34 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
     ],
   },
   get_history: {
+    gloss:
+      "Everything about runs that have already happened: what a run produced, " +
+      "why one failed, and what settings your past renders actually used.",
     examples: [
       {
         ask: "Did that finish? What did it produce?",
-        args: { prompt_id: "8f3c1a02-6d4e-4b9a-9f21-77c0be5d1e44" },
+        args: { action: "list", prompt_id: "8f3c1a02-6d4e-4b9a-9f21-77c0be5d1e44" },
         returns:
           "That run's outcome and the files it wrote. Omit `prompt_id` to get " +
-          "recent runs instead of one specific one.",
+          "the most recent run instead of one specific one.",
       },
-    ],
-  },
-  diagnose_run: {
-    gloss:
-      "For when a run failed and the error text does not mean anything to you. " +
-      "This reads the failure and tells you what to do about it.",
-    examples: [
       {
         ask: "That render failed and I don't understand the error.",
-        args: { prompt_id: "8f3c1a02-6d4e-4b9a-9f21-77c0be5d1e44" },
+        args: { action: "diagnose", prompt_id: "8f3c1a02-6d4e-4b9a-9f21-77c0be5d1e44" },
         returns:
           "A plain reading of what went wrong — a missing model, a bad " +
           "connection, not enough VRAM — and the suggested fix. Omit " +
-          "`prompt_id` and it looks at the most recent failure.",
+          "`prompt_id` and it looks at the most recent failure. This is the " +
+          "one to reach for when a run fails: it says everything action " +
+          '"list" would, plus what is missing.',
+      },
+      {
+        ask: "What sampler settings have actually worked for me on SDXL?",
+        args: { action: "suggest", model_family: "sdxl" },
+        returns:
+          "A ranked list of sampler/scheduler/steps/CFG combinations you have " +
+          "used before, most-reused first. Read from this machine's own " +
+          "generation log, so it is empty until you have rendered a few things.",
       },
     ],
   },
@@ -246,45 +265,58 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
   },
   enqueue_workflow: {
     gloss:
-      "Runs a workflow that the agent is holding in the conversation — one it " +
-      "just built or loaded from a file. If you want to run the graph you are " +
+      "Starts a render. `action` says where the graph comes from: one the " +
+      "agent is holding in the conversation, an earlier run, a URL someone " +
+      "shared, or a bundled template. If you want to run the graph you are " +
       "LOOKING at in ComfyUI, that is the panel's run tool instead, and if you " +
       "just want a picture, use generate_image.",
     examples: [
       {
         ask: "Run it.",
-        args: { workflow: WORKFLOW_FRAGMENT },
+        args: { action: "enqueue", workflow: WORKFLOW_FRAGMENT },
         argsNote: FRAGMENT_NOTE,
         returns:
           "A prompt_id straight away, then the finished images once the render " +
           "completes.",
       },
-    ],
-  },
-  get_template_schema: {
-    examples: [
       {
-        ask: "What can I change about the Flux template?",
-        args: { template: "flux_dev_full_text_to_image" },
+        ask: "What can I change about the anima text-to-image pack?",
+        args: { action: "template_schema", template: "anima-txt2img" },
         returns:
           "The knobs that template exposes — prompt, size, steps, which model " +
-          "file — with their current values, so you know what to pass to " +
-          "run_template.",
+          "file — with their current values, and the exact keys to pass as " +
+          "`overrides` when you run it. Read-only.",
       },
-    ],
-  },
-  run_template: {
-    examples: [
       {
-        ask: "Run the Flux template with my prompt and wait for it.",
+        ask: "Run the anima pack with my prompt and wait for it.",
         args: {
-          template: "flux_dev_full_text_to_image",
-          overrides: { prompt: "a lighthouse in a storm, dramatic sky" },
+          action: "run_template",
+          template: "anima-txt2img",
+          overrides: { "45.text": "a lighthouse in a storm, dramatic sky" },
           wait: true,
         },
+        argsNote:
+          "Override keys are `\"<nodeId>.<widget_name>\"`, not bare parameter names — " +
+          "a plain `\"prompt\"` is rejected. 45 is the positive CLIPTextEncode in THIS " +
+          "pack; every template numbers its nodes differently, so read the keys off " +
+          "the schema call above rather than copying this one.",
         returns:
           "With `wait: true`, the finished result in one go. Leave it off and " +
           "you get a prompt_id immediately and check back later.",
+      },
+      {
+        ask: "Someone posted this workflow — what is in it?",
+        args: {
+          action: "run_url",
+          url: "https://raw.githubusercontent.com/comfyanonymous/ComfyUI_examples/master/flux/flux_dev_example.json",
+        },
+        returns:
+          "A summary of the graph and a validation report, WITHOUT running it. " +
+          "Add `run: true` to enqueue it once you have read what it does.",
+        caution:
+          "`run: true` executes a graph you did not write on your own GPU. " +
+          "Read the summary first — a shared workflow can pull in models and " +
+          "custom nodes you do not have, and will fail late if so.",
       },
     ],
   },
@@ -586,7 +618,7 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
         returns:
           "Full provenance for the asset, including the entire workflow that " +
           "produced it — the prompt, sampler, steps, seed and so on. Read this " +
-          "before `regenerate` with overrides.",
+          'before generate_image (action:"regenerate") with overrides.',
       },
     ],
   },

@@ -34,7 +34,6 @@ import { readFileSync } from "node:fs";
 export const TOOL_NAMES = [
   "comfy_cli",
   "enqueue_workflow",
-  "rerun_generation",
   "get_system_stats",
   "visualize_workflow",
   "create_workflow",
@@ -44,28 +43,16 @@ export const TOOL_NAMES = [
   "list_local_models",
   "get_logs",
   "get_history",
-  "diagnose_run",
   "runpod",
   "runpod_watch",
   "get_workflow",
   "save_workflow",
-  "run_workflow_url",
   "restart_comfyui",
   "get_image",
   "upload_image",
   "clear_vram",
-  "suggest_settings",
-  "generation_stats",
-  "regenerate",
   "get_defaults",
   "generate_image",
-  "generate_audio",
-  "generate_3d",
-  "generate_video",
-  "remove_background",
-  "upscale_image",
-  "generate_with_controlnet",
-  "generate_with_ip_adapter",
   "node_snapshot",
   "bisect",
   "install_custom_node",
@@ -89,8 +76,6 @@ export const TOOL_NAMES = [
   "train_start",
   "train_doctor",
   "apps",
-  "get_template_schema",
-  "run_template",
   "batch",
 ] as const;
 
@@ -217,7 +202,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 60;
+export const MAX_TOOLS = 45;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;
@@ -1760,6 +1745,186 @@ export const DEAD_NAMES: readonly DeadName[] = [
     name: "stage_output_as_input",
     since: "0.50.0",
     replacement: 'upload_image (action:"stage")',
+  },
+  // ─────────────────────────────────────────────────────────────────────────
+  // 0.50.0 slice 16 (the FINAL slice): eighteen execution / generation /
+  // observability names folded into the THREE survivors models reach for first
+  // — `enqueue_workflow` (5 actions), `generate_image` (9) and `get_history`
+  // (4). Same workflow-executor / generate-* / tracker / history services, same
+  // arguments, same return shapes — only the surface changed, so every mention
+  // of the old names is now rot pointing at a 404.
+  //
+  // `enqueue_workflow` REMAINS A NAMED ENTRY POINT: its four satellite entry
+  // points fold INTO it and it is never itself subsumed. Its call_tool
+  // admission is ACTION-scoped to exactly ["enqueue"] — see
+  // CALL_TOOL_ACTION_WHITELIST in src/orchestrator/call-tool-admission.ts,
+  // where action:"run_url" (fetch a workflow from an ARBITRARY URL and execute
+  // it) must stay unreachable from a canvas-less client. `get_history` is ADDED
+  // to that whitelist, action-scoped to ["diagnose"], because the retired
+  // `diagnose_run` was whitelisted and the panel's "why did my render fail?"
+  // would otherwise break with a false refusal.
+  {
+    name: "rerun_generation",
+    since: "0.50.0",
+    replacement: 'enqueue_workflow (action:"rerun")',
+  },
+  {
+    name: "run_workflow_url",
+    since: "0.50.0",
+    replacement: 'enqueue_workflow (action:"run_url")',
+  },
+  {
+    name: "get_template_schema",
+    since: "0.50.0",
+    replacement: 'enqueue_workflow (action:"template_schema")',
+  },
+  {
+    name: "run_template",
+    since: "0.50.0",
+    replacement: 'enqueue_workflow (action:"run_template")',
+    implementedIn: [
+      "src/tools/workflow-execute.ts",
+      "src/__tests__/tools/workflow-execute.test.ts",
+    ],
+  },
+  {
+    name: "generate_audio",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"audio")',
+  },
+  {
+    name: "generate_video",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"video")',
+  },
+  {
+    name: "generate_3d",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"3d")',
+  },
+  {
+    name: "generate_with_controlnet",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"controlnet")',
+  },
+  {
+    name: "generate_with_ip_adapter",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"ip_adapter")',
+  },
+  // The highest-traffic retirement in the consolidation (19 live mentions), and
+  // the one whose name is ALSO an ordinary English verb. Most of the exemptions
+  // below are therefore NOT "history" in the usual sense — they are prose where
+  // "regenerate" is a verb about rebuilding a file or re-synthesising image
+  // detail, and has nothing to do with any tool. Rewriting correct prose to
+  // dodge a name collision is the failure mode the per-occurrence mechanism
+  // exists to prevent, so each one is listed, read, and reasoned about here.
+  {
+    name: "regenerate",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"regenerate")',
+    // The tool that answers for this name, and the two files that drive it under
+    // test — the only places a bare "regenerate" literal is the action vocabulary
+    // rather than a tool name.
+    implementedIn: [
+      "src/tools/generate-image.ts",
+      "src/__tests__/tools/generate-image.test.ts",
+    ],
+    allowedIn: [
+      {
+        path: "docs/blog/flatten-workflows.mdx",
+        context: "then regenerate a UI graph from it and",
+        why: "The ENGLISH VERB, in a dated post narrating an algorithm: rebuild a UI-format graph from an API-format one. Nothing to do with any tool. Rewriting published prose to dodge a name collision is exactly the 'fix' the per-occurrence mechanism exists to prevent.",
+      },
+      {
+        path: "docs/blog/flatten-workflows.mdx",
+        context: "regenerate positions wholesale, every group on the canvas becomes an empty box",
+        why: "Same post, same English verb — recomputing node POSITIONS, in the sentence that explains why litegraph groups break when you do.",
+      },
+      {
+        path: "docs/blog/video-upscale-comfyui.mdx",
+        context: "FlashVSR *regenerate* detail.",
+        why: "The English verb, and load-bearing technical vocabulary: a restorer model literally re-generates image detail rather than magnifying it. No synonym says this as precisely, and the post is dated.",
+      },
+      {
+        path: "docs/blog/video-upscale-comfyui.mdx",
+        context: "**Why downscale before upscaling?** Restorers regenerate detail.",
+        why: "Same post, same claim in the body copy.",
+      },
+      {
+        path: "plugin/skills/video-upscale/SKILL.md",
+        context: "(and FlashVSR) regenerate detail. Feeding them a small frame forces the model",
+        why: "The same technical claim in the bundled skill the post documents. Model-facing, but it is describing what an UPSCALER MODEL does to pixels — it is not an instruction to call a tool.",
+      },
+      {
+        path: "packs/z-image-base-inpaint/pack.yaml",
+        context: "an input image and regenerate only the masked area from a text prompt",
+        why: "The English verb in a pack DESCRIPTION of inpainting — regenerating the masked region is literally what the pack does. packs/*/workflow.json is path-exempt as data, but pack.yaml is prose, so this occurrence is exempted on its own.",
+      },
+    ],
+  },
+  {
+    name: "upscale_image",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"upscale")',
+    allowedIn: [
+      {
+        path: "src/__tests__/tools/generate-image.test.ts",
+        context: 'expect(schema.action.safeParse("upscale_image").success).toBe(false)',
+        why: "A deliberate NEGATIVE fixture: the action is `upscale`, so the RETIRED tool name must be rejected by the enum. `implementedIn` cannot license it — that rule only covers a name the fold reused AS an action, and this one it did not. The assertion is that nothing serves this name.",
+      },
+      {
+        path: "src/__tests__/tools/generate-image.test.ts",
+        context: 'const res = await handler({ action: "upscale_image" });',
+        why: "The same fixture one layer down: the unknown-action branch must reject it at runtime too, not merely at the schema. A call argument under test.",
+      },
+    ],
+  },
+  {
+    name: "remove_background",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"remove_background")',
+    implementedIn: [
+      "src/tools/generate-image.ts",
+      "src/__tests__/tools/generate-image.test.ts",
+    ],
+    allowedIn: [
+      {
+        path: "src/services/workflow-composer.ts",
+        context: "remove_background: (p) => buildRemoveBackground(",
+        why: "A create_workflow TEMPLATE KEY in the builder registry, not a tool name. It happens to be spelled the same because both name the same operation. Renaming it would change a service (the key is part of create_workflow's public template enum), which a pure surface consolidation must not do.",
+      },
+      {
+        path: "src/services/remove-background.ts",
+        context: 'const workflow = createWorkflow("remove_background", {',
+        why: "The call site of that same template key — the service asking the composer for the cutout graph.",
+      },
+      {
+        path: "docs/tools/workflow-authoring.mdx",
+        context: "ace_step_15, stable_audio_3, remove_background, ltx_video). Pure local generation",
+        why: "GENERATED from create_workflow's description, which lists the template keys above. Fixing it at the source would mean renaming the template.",
+      },
+      {
+        path: "docs/tools/workflow-authoring.mdx",
+        context: "`stable_audio_3`, `remove_background`, `ltx_video`.",
+        why: "Generated from the same template enum, rendered as the parameter's option list.",
+      },
+    ],
+  },
+  {
+    name: "generation_stats",
+    since: "0.50.0",
+    replacement: 'get_history (action:"stats")',
+  },
+  {
+    name: "suggest_settings",
+    since: "0.50.0",
+    replacement: 'get_history (action:"suggest")',
+  },
+  {
+    name: "diagnose_run",
+    since: "0.50.0",
+    replacement: 'get_history (action:"diagnose")',
   },
 ];
 

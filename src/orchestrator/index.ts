@@ -367,11 +367,11 @@ const HEADLESS_DIRECTIVE =
   "do everything through the comfyui MCP tools (generate_image, or create_workflow + enqueue_workflow). " +
   "There is NO panel to auto-deliver a finished render, so you MUST deliver the result YOURSELF IN THIS SAME TURN: " +
   "enqueuing returns a prompt_id immediately, so wait for it with queue (action:\"status\", prompt_id) — poll it briefly until " +
-  "it reports completion (this is the ONE case where polling IS correct) — then fetch the output with get_history and " +
+  'it reports completion (this is the ONE case where polling IS correct) — then fetch the output with get_history (action:"list", prompt_id) and ' +
   "show it with panel_show_media. Do NOT end your turn expecting an automatic notification; none will arrive. " +
-  "If the run FAILED — or the user asks why a render failed / what's missing — call diagnose_run FIRST, and do NOT use " +
-  "get_history for that: diagnose_run returns everything get_history would (failed node + exception + traceback) PLUS the " +
-  "missing models (exact file + the widget holding it) and missing node types that get_history omits, in one call. It is " +
+  'If the run FAILED — or the user asks why a render failed / what\'s missing — call get_history (action:"diagnose") FIRST, and do NOT use ' +
+  'action:"list" for that: the diagnose action returns everything the list action would (failed node + exception + traceback) PLUS the ' +
+  "missing models (exact file + the widget holding it) and missing node types that the list action omits, in one call. It is " +
   "the canvas-less equivalent of the panel's \"why is this red?\", so also do NOT try panel_get_errors here.";
 
 /** Live stall threshold (seconds) pushed from the panel setting via a `set_config`
@@ -2322,7 +2322,8 @@ export async function runPanelOrchestrator(): Promise<void> {
     // lost the same way but they are not the same loss, and their remedies are
     // not interchangeable: a render can be looked up in ComfyUI's history, an
     // answer NEVER can — it only ever existed in this journal, so the only thing
-    // the user can do is give it again. Telling someone to check `get_history`
+    // the user can do is give it again. Telling someone to check
+    // `get_history (action:"list")`
     // for a lost answer names a lever that cannot work, in the one moment they
     // are already dealing with a failure.
     // Three buckets per tab, because the DURABLE RECORD and the CHAT NOTICE are
@@ -2431,7 +2432,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         if (runs.length) {
           parts.push(
             `${runs.length} finished render result(s) could not be delivered (${runs.join("; ")}). ` +
-              `Their outcome is UNDETERMINED from the agent's point of view — ask it to check \`get_history\` ` +
+              `Their outcome is UNDETERMINED from the agent's point of view — ask it to check \`get_history (action:"list")\` ` +
               `for those runs once it reconnects rather than assuming it saw them.`,
           );
         }

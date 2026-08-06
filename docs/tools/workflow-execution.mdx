@@ -4,26 +4,58 @@ description: "Enqueue workflows — one at a time, from a named template, or as 
 icon: "play"
 ---
 
-<Info>12 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
+<Info>8 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
 <Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
 
 ## enqueue_workflow
 
-Submit a ComfyUI workflow for execution and return immediately with the prompt_id and queue position. Does not wait for completion. Seed values in the workflow are used exactly as supplied — they are NOT re-randomized, so a run is reproducible by resubmitting the same workflow (for a fresh-seed re-run of a past job, use rerun_generation). Use queue (action:"status") to check progress later, or get_history to retrieve results and images after completion.
+Submit work to the ComfyUI execution queue — the primary way an agent starts a render. Driven by the `action` parameter:
+- action:"enqueue" — Submit an API-format workflow you are already holding (one you built with create_workflow, loaded with get_workflow, or edited with create_workflow action:"modify"). Returns immediately with the prompt_id and queue position; does NOT wait for completion. Seed values in the workflow are used EXACTLY as supplied — they are NOT re-randomized, so a run is reproducible by resubmitting the same workflow (for a fresh-seed re-run of a past job, use action:"rerun"). `workflow` is required. Use queue (action:"status") to check progress later, or get_history (action:"list") to retrieve results and images after completion.
+- action:"rerun" — Re-run the workflow behind a PREVIOUS generation. Retrieves the prompt graph from execution history (by `prompt_id`, or the most recent run when omitted — chosen by ComfyUI's queue number, same logic as get_history) and re-enqueues it, optionally applying `inputs` overrides. Seeds are re-randomized (within each node's declared range) unless disable_random_seed is set or the seed is pinned via `inputs`. Returns the new prompt_id and the source prompt_id it came from. Clear error if no matching history exists. To re-run from a registered ASSET instead of history, use generate_image (action:"regenerate").
+- action:"run_url" — Read (and optionally execute) a SHARED workflow from a URL. Fetches the workflow JSON, accepts API-format prompt graphs or UI-format exports (UI is auto-converted via the same converter as get_workflow), validates it, and summarizes it. Supports raw .json links and GitHub blob/raw URLs (blob is normalized to raw); other share hosts that need a site API return a clear 'paste the raw JSON URL' error. The fetch is bounded (http/https only, timeout + size cap, loopback/private/metadata IPs rejected to prevent SSRF). READ-ONLY unless run=true; when run=true it enqueues the workflow (applying optional `inputs` overrides) and returns the prompt_id. `url` is required.
+- action:"template_schema" — Get a template's OVERRIDABLE run-time parameters (its 'slots') BEFORE running it. Pass a bundled pack name (from list_packs action:"list") or a custom-node-contributed workflow template name (from list_packs action:"list_templates") as `template`. Returns `slots` — the meaningful knobs: positive/negative prompt, seed, steps, cfg, sampler/scheduler, width/height, checkpoint/LoRA/model files, denoise, batch_size, input image — plus `other_slots` (every remaining overridable widget), each with a stable key "&lt;nodeId&gt;.&lt;widget_name&gt;", semantic role, type, current value, and min/max/options where the node schema is known. Read-only. Feed the keys DIRECTLY into action:"run_template"'s `overrides` (same convention) for a schema→run round-trip.
+- action:"run_template" — ONE-SHOT: run a named workflow template (a bundled pack from list_packs) with optional `overrides`. Resolves the template's expert graph, applies overrides, and enqueues it — replacing the manual list_packs (action:"read_workflow") → create_workflow (action:"modify") → action:"enqueue" chain. Override keys are '&lt;nodeId&gt;.&lt;widget_name&gt;' (e.g. &#123;'6.text': 'a cat', '3.seed': 42&#125;) — the SAME keys action:"template_schema" reports (when available), so schema→run round-trips; only widget values can be overridden, never graph connections. By default returns &#123;prompt_id&#125; immediately; pass wait:true to block until the job completes and return its outputs (images etc.). Unresolvable template names return a clear error with near-matches. `template` is required.
 
-<Tip>**In plain terms:** Runs a workflow that the agent is holding in the conversation — one it just built or loaded from a file. If you want to run the graph you are LOOKING at in ComfyUI, that is the panel's run tool instead, and if you just want a picture, use generate_image.</Tip>
+<Tip>**In plain terms:** Starts a render. `action` says where the graph comes from: one the agent is holding in the conversation, an earlier run, a URL someone shared, or a bundled template. If you want to run the graph you are LOOKING at in ComfyUI, that is the panel's run tool instead, and if you just want a picture, use generate_image.</Tip>
 
 ### Parameters
 
-<ParamField path="workflow" type="object" required>
-  ComfyUI workflow in API format (node ID -&gt; &#123;class_type, inputs&#125;)
+<ParamField path="action" type="enum" required>
+  Which enqueue entry point to use. action:"enqueue" requires `workflow`; action:"rerun" takes an optional `prompt_id` (+ `inputs`); action:"run_url" requires `url` (+ `run`/`inputs`); action:"template_schema" and action:"run_template" require `template`; with action:"run_template" you may also pass `overrides`/`wait`/`timeout_s`. Options: `action:"enqueue"`, `action:"rerun"`, `action:"run_url"`, `action:"template_schema"`, `action:"run_template"`.
+</ParamField>
+<ParamField path="workflow" type="object">
+  action:"enqueue" — ComfyUI workflow in API format (node ID -&gt; &#123;class_type, inputs&#125;). REQUIRED for that action.
 </ParamField>
 <ParamField path="disable_random_seed" type="boolean">
-  No-op kept for backward compatibility: seed values are always used exactly as supplied.
+  If true, do not randomize seed values — applies to action:"rerun" and action:"run_template" (for action:"rerun", combine with inputs.seed to reproduce exactly). It is a NO-OP for action:"enqueue", whose seeds are always used exactly as supplied (issue #865).
+</ParamField>
+<ParamField path="prompt_id" type="string">
+  action:"rerun" — prompt ID of the generation to re-run. If omitted, uses the most recent execution.
+</ParamField>
+<ParamField path="inputs" type="object">
+  Overrides applied to every node with a matching input name (e.g. cfg, steps, sampler_name, seed, text). Used by action:"rerun", and by action:"run_url" only when run=true.
+</ParamField>
+<ParamField path="url" type="string">
+  action:"run_url" — URL of the workflow JSON. Raw .json links and GitHub blob/raw URLs work directly. REQUIRED for that action.
+</ParamField>
+<ParamField path="run" type="boolean" default="false">
+  action:"run_url" — if true, enqueue the fetched workflow for execution and return the prompt_id. Default false: only fetch, validate, and summarize (read-only).
+</ParamField>
+<ParamField path="template" type="string">
+  Template name/id: a bundled pack directory name (list_packs action:"list") or a custom-node-contributed workflow template name (list_packs action:"list_templates"). REQUIRED for action:"template_schema" and action:"run_template".
+</ParamField>
+<ParamField path="overrides" type="object">
+  action:"run_template" — widget overrides keyed '&lt;nodeId&gt;.&lt;widget_name&gt;' (action:"template_schema"'s keys), e.g. &#123;'6.text': 'a red fox', '3.steps': 20&#125;.
+</ParamField>
+<ParamField path="wait" type="boolean">
+  action:"run_template" — block until the job completes and return its outputs. Default false: return &#123;prompt_id&#125; immediately.
+</ParamField>
+<ParamField path="timeout_s" type="number">
+  action:"run_template" — max seconds to wait when wait:true (default 300). On timeout the job keeps running; poll queue (action:"status").
 </ParamField>
 
-### Example
+### Examples
 
 **You say:** Run it.
 
@@ -31,6 +63,7 @@ Submit a ComfyUI workflow for execution and return immediately with the prompt_i
 {
   "tool": "enqueue_workflow",
   "arguments": {
+    "action": "enqueue",
     "workflow": {
       "4": {
         "class_type": "CheckpointLoaderSimple",
@@ -57,34 +90,55 @@ Submit a ComfyUI workflow for execution and return immediately with the prompt_i
 
 **You get back:** A prompt_id straight away, then the finished images once the render completes.
 
----
-
-## rerun_generation
-
-Re-run the workflow behind a previous generation. Retrieves the prompt graph from execution history (by prompt_id, or the most recent run when omitted — chosen by ComfyUI's queue number, same logic as get_history) and re-enqueues it, optionally applying `inputs` overrides. Seeds are re-randomized (within each node's declared range) unless disable_random_seed is set or the seed is pinned via `inputs`. Returns the new prompt_id and the source prompt_id it came from. Clear error if no matching history exists.
-
-### Parameters
-
-<ParamField path="prompt_id" type="string">
-  Prompt ID of the generation to re-run. If omitted, uses the most recent execution.
-</ParamField>
-<ParamField path="inputs" type="object">
-  Optional overrides applied to every node with a matching input name (e.g. cfg, steps, sampler_name, seed, text).
-</ParamField>
-<ParamField path="disable_random_seed" type="boolean">
-  If true, do not randomize seed fields (combine with inputs.seed to reproduce exactly).
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** What can I change about the anima text-to-image pack?
 
 ```json
 {
-  "tool": "rerun_generation",
-  "arguments": {}
+  "tool": "enqueue_workflow",
+  "arguments": {
+    "action": "template_schema",
+    "template": "anima-txt2img"
+  }
 }
 ```
+
+**You get back:** The knobs that template exposes — prompt, size, steps, which model file — with their current values, and the exact keys to pass as `overrides` when you run it. Read-only.
+
+**You say:** Run the anima pack with my prompt and wait for it.
+
+```json
+{
+  "tool": "enqueue_workflow",
+  "arguments": {
+    "action": "run_template",
+    "template": "anima-txt2img",
+    "overrides": {
+      "45.text": "a lighthouse in a storm, dramatic sky"
+    },
+    "wait": true
+  }
+}
+```
+
+<Note>Override keys are `"&lt;nodeId&gt;.&lt;widget_name&gt;"`, not bare parameter names — a plain `"prompt"` is rejected. 45 is the positive CLIPTextEncode in THIS pack; every template numbers its nodes differently, so read the keys off the schema call above rather than copying this one.</Note>
+
+**You get back:** With `wait: true`, the finished result in one go. Leave it off and you get a prompt_id immediately and check back later.
+
+**You say:** Someone posted this workflow — what is in it?
+
+```json
+{
+  "tool": "enqueue_workflow",
+  "arguments": {
+    "action": "run_url",
+    "url": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI_examples/master/flux/flux_dev_example.json"
+  }
+}
+```
+
+**You get back:** A summary of the graph and a validation report, WITHOUT running it. Add `run: true` to enqueue it once you have read what it does.
+
+<Warning>`run: true` executes a graph you did not write on your own GPU. Read the summary first — a shared workflow can pull in models and custom nodes you do not have, and will fail late if so.</Warning>
 
 ---
 
@@ -198,15 +252,36 @@ Inspect and manage the ComfyUI execution queue. Driven by the `action` parameter
 
 ## get_history
 
-Get execution history for a ComfyUI prompt: status, timing, cached nodes, and output details (media filenames for get_image action:"get"). Also carries the raw error/traceback. To diagnose WHY a run FAILED or what's missing, prefer `diagnose_run` — it returns the same failure info PLUS missing models (with the file + widget) and missing node types, which this tool does not. Use get_history when you need the run's OUTPUTS or timing for a specific prompt_id.
+Read what has already been generated on this machine — execution history, why a run failed, and the settings your past renders actually used. Driven by the `action` parameter:
+- action:"list" — Execution history for a ComfyUI prompt: status, timing, cached nodes, and output details (media filenames for get_image action:"get"). Also carries the raw error/traceback. To diagnose WHY a run FAILED or what is missing, prefer action:"diagnose" — it returns the same failure info PLUS missing models (with the file + widget) and missing node types, which this action does not. Use action:"list" when you need the run's OUTPUTS or timing for a specific prompt_id.
+- action:"diagnose" — WHY DID MY RENDER FAIL / WHAT IS MISSING? Explains a failed run in ONE call, without needing a canvas — the headless counterpart to the panel's panel_get_errors ("why is this red?"), so mobile/remote sessions get the same answer. Returns: the failed node (id, type) with its `exception_type` + message and a trimmed traceback; **missing_models** (the exact model file that is not installed and the widget holding it — feed the filename to download_model action:'search_civitai', then action:'download_civitai' — or action:'search' then action:'download' — to fix it); **missing_node_types** (node classes this install lacks — feed to search_custom_nodes, then install_custom_node); and any other per-input validation errors. Call this whenever a run fails, an enqueue is rejected, or the user asks what is missing — instead of guessing from raw logs. With no prompt_id it diagnoses the most recent FAILED run (falling back to the most recent run). Read-only.
+- action:"stats" — Statistics from this MCP server's LOCAL generation-history database (populated as you run workflows; NOT from ComfyUI, and not the same source as action:"list"): total generations, count of unique sampler/scheduler/steps/CFG combos, a per-model-family breakdown, and the most-reused settings. Read-only; works without a running ComfyUI. Returns empty stats until you have generated images. For concrete recommended settings rather than aggregate counts, use action:"suggest".
+- action:"suggest" — Recommend concrete, proven sampler/scheduler/steps/CFG (and denoise/shift/LoRA) settings derived from that same LOCAL generation-history database. Read-only and works without a running ComfyUI. Narrow results by `model_family`, `lora_hash`, or a name `search`; with no filter it returns the top settings across all history. Returns a ranked list with each combo's reuse count, or a "no history" message until you have generated images. Use this for ready-to-apply values; use action:"stats" for aggregate counts and breakdowns rather than specific suggestions.
+
+<Tip>**In plain terms:** Everything about runs that have already happened: what a run produced, why one failed, and what settings your past renders actually used.</Tip>
 
 ### Parameters
 
+<ParamField path="action" type="enum" required>
+  Which history view to return. "list" and "diagnose" read ComfyUI's execution history and take an optional `prompt_id`; "stats" and "suggest" read this server's own local generation-settings database and take `model_family` (plus `lora_hash`/`search`/`limit` for "suggest"). No action requires any other field. Options: `action:"list"`, `action:"diagnose"`, `action:"stats"`, `action:"suggest"`.
+</ParamField>
 <ParamField path="prompt_id" type="string">
-  Specific prompt ID to look up (returned by enqueue_workflow). If omitted, returns the most recent COMMITTED execution (chosen by ComfyUI's queue number, not dict order). Note: immediately after a run finishes it can briefly lag by one until ComfyUI commits the new entry — pass the prompt_id from enqueue_workflow to get that exact run, and prefer the run-finished event for naming a just-produced output.
+  Actions "list" and "diagnose" — the prompt ID to look up (returned by enqueue_workflow). For action:"list", if omitted, returns the most recent COMMITTED execution (chosen by ComfyUI's queue number, not dict order); immediately after a run finishes it can briefly lag by one until ComfyUI commits the new entry, so pass the prompt_id from enqueue_workflow to get that exact run, and prefer the run-finished event for naming a just-produced output. For action:"diagnose", omit to diagnose the most recent FAILED run — preferred over a newer successful one — falling back to the most recent run if nothing failed.
+</ParamField>
+<ParamField path="model_family" type="string">
+  Actions "stats" and "suggest" — model-family key to scope to, e.g. 'sdxl', 'flux', 'qwen_image', 'illustrious'.
+</ParamField>
+<ParamField path="lora_hash" type="string">
+  action:"suggest" — AutoV2 hash (10 chars) of a specific LoRA to find settings for.
+</ParamField>
+<ParamField path="search" type="string">
+  action:"suggest" — full-text search on model/LoRA filenames (e.g. 'copax', 'lightning').
+</ParamField>
+<ParamField path="limit" type="integer">
+  action:"suggest" — max results (default 10).
 </ParamField>
 
-### Example
+### Examples
 
 **You say:** Did that finish? What did it produce?
 
@@ -214,12 +289,41 @@ Get execution history for a ComfyUI prompt: status, timing, cached nodes, and ou
 {
   "tool": "get_history",
   "arguments": {
+    "action": "list",
     "prompt_id": "8f3c1a02-6d4e-4b9a-9f21-77c0be5d1e44"
   }
 }
 ```
 
-**You get back:** That run's outcome and the files it wrote. Omit `prompt_id` to get recent runs instead of one specific one.
+**You get back:** That run's outcome and the files it wrote. Omit `prompt_id` to get the most recent run instead of one specific one.
+
+**You say:** That render failed and I don't understand the error.
+
+```json
+{
+  "tool": "get_history",
+  "arguments": {
+    "action": "diagnose",
+    "prompt_id": "8f3c1a02-6d4e-4b9a-9f21-77c0be5d1e44"
+  }
+}
+```
+
+**You get back:** A plain reading of what went wrong — a missing model, a bad connection, not enough VRAM — and the suggested fix. Omit `prompt_id` and it looks at the most recent failure. This is the one to reach for when a run fails: it says everything action "list" would, plus what is missing.
+
+**You say:** What sampler settings have actually worked for me on SDXL?
+
+```json
+{
+  "tool": "get_history",
+  "arguments": {
+    "action": "suggest",
+    "model_family": "sdxl"
+  }
+}
+```
+
+**You get back:** A ranked list of sampler/scheduler/steps/CFG combinations you have used before, most-reused first. Read from this machine's own generation log, so it is empty until you have rendered a few things.
 
 ---
 
@@ -336,105 +440,6 @@ spec="3 + 0*0.5\n3 + 1*0.5\n3 + 2*0.5\n3 + 3*0.5"
   }
 }
 ```
-
----
-
-## diagnose_run
-
-WHY DID MY RENDER FAIL / WHAT'S MISSING? Explains a failed run in ONE call, without needing a canvas — the headless counterpart to the panel's panel_get_errors ("why is this red?"), so mobile/remote sessions get the same answer. Returns: the failed node (id, type) with its `exception_type` + message and a trimmed traceback; **missing_models** (the exact model file that isn't installed and the widget holding it — feed the filename to download_model action:"search_civitai", then action:"download_civitai" — or action:"search" then action:"download" — to fix it); **missing_node_types** (node classes this install lacks — feed to search_custom_nodes, then install_custom_node); and any other per-input validation errors. Call this whenever a run fails, an enqueue is rejected, or the user asks what's missing — instead of guessing from raw logs. With no prompt_id it diagnoses the most recent FAILED run (falling back to the most recent run). Read-only.
-
-<Tip>**In plain terms:** For when a run failed and the error text does not mean anything to you. This reads the failure and tells you what to do about it.</Tip>
-
-### Parameters
-
-<ParamField path="prompt_id" type="string">
-  Specific run to diagnose (the prompt_id from enqueue_workflow). Omit to diagnose the most recent FAILED run — preferred over a newer successful one — falling back to the most recent run if nothing failed.
-</ParamField>
-
-### Example
-
-**You say:** That render failed and I don't understand the error.
-
-```json
-{
-  "tool": "diagnose_run",
-  "arguments": {
-    "prompt_id": "8f3c1a02-6d4e-4b9a-9f21-77c0be5d1e44"
-  }
-}
-```
-
-**You get back:** A plain reading of what went wrong — a missing model, a bad connection, not enough VRAM — and the suggested fix. Omit `prompt_id` and it looks at the most recent failure.
-
----
-
-## get_template_schema
-
-Get a template's OVERRIDABLE run-time parameters (its 'slots') before running it. Pass a bundled pack name (from list_packs action:"list") or a custom-node-contributed workflow template name (from list_packs action:"list_templates"). Returns `slots` — the meaningful knobs: positive/negative prompt, seed, steps, cfg, sampler/scheduler, width/height, checkpoint/LoRA/model files, denoise, batch_size, input image — plus `other_slots` (every remaining overridable widget), each with a stable key `"&lt;nodeId&gt;.&lt;widget_name&gt;"`, semantic role, type, current value, and min/max/options where the node schema is known. Feed the keys DIRECTLY into run_template's `overrides` (same convention) for a schema→run round-trip.
-
-### Parameters
-
-<ParamField path="template" type="string" required>
-  Template name/id: a bundled pack directory name (list_packs action:"list") or a custom-node-contributed workflow template name (list_packs action:"list_templates").
-</ParamField>
-
-### Example
-
-**You say:** What can I change about the Flux template?
-
-```json
-{
-  "tool": "get_template_schema",
-  "arguments": {
-    "template": "flux_dev_full_text_to_image"
-  }
-}
-```
-
-**You get back:** The knobs that template exposes — prompt, size, steps, which model file — with their current values, so you know what to pass to run_template.
-
----
-
-## run_template
-
-ONE-SHOT: run a named workflow template (a bundled pack from list_packs) with optional overrides. Resolves the template's expert graph, applies overrides, and enqueues it — replacing the manual list_packs (action:"read_workflow") → create_workflow (action:"modify") → enqueue_workflow chain. Override keys are '&lt;nodeId&gt;.&lt;widget_name&gt;' (e.g. &#123;'6.text': 'a cat', '3.seed': 42&#125;) — the SAME keys the companion get_template_schema tool reports (when available), so schema→run round-trips; only widget values can be overridden, never graph connections. By default returns &#123;prompt_id&#125; immediately; pass wait:true to block until the job completes and return its outputs (images etc.). Unresolvable template names return a clear error with near-matches.
-
-### Parameters
-
-<ParamField path="template" type="string" required>
-  Template name — a bundled pack directory (from list_packs), e.g. 'anima-txt2img'.
-</ParamField>
-<ParamField path="overrides" type="object">
-  Widget overrides keyed '&lt;nodeId&gt;.&lt;widget_name&gt;' (get_template_schema's keys), e.g. &#123;'6.text': 'a red fox', '3.steps': 20&#125;.
-</ParamField>
-<ParamField path="wait" type="boolean">
-  Block until the job completes and return its outputs. Default false: return &#123;prompt_id&#125; immediately.
-</ParamField>
-<ParamField path="timeout_s" type="number">
-  Max seconds to wait when wait:true (default 300). On timeout the job keeps running; poll queue (action:"status").
-</ParamField>
-<ParamField path="disable_random_seed" type="boolean">
-  If true, do not randomize seed values (combine with a seed override to reproduce exactly).
-</ParamField>
-
-### Example
-
-**You say:** Run the Flux template with my prompt and wait for it.
-
-```json
-{
-  "tool": "run_template",
-  "arguments": {
-    "template": "flux_dev_full_text_to_image",
-    "overrides": {
-      "prompt": "a lighthouse in a storm, dramatic sky"
-    },
-    "wait": true
-  }
-}
-```
-
-**You get back:** With `wait: true`, the finished result in one go. Leave it off and you get a prompt_id immediately and check back later.
 
 ---
 

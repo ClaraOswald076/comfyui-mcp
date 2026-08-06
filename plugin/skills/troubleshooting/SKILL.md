@@ -18,7 +18,7 @@ globs:
 
 When a workflow fails, follow this systematic approach:
 
-1. **Get the error**: Use `get_history` to retrieve the execution result with full traceback
+1. **Get the error**: Use `get_history(action="diagnose")` to retrieve the execution result with the full traceback, plus any missing models/nodes
 2. **Check logs**: Use `get_logs` with keyword filters like `"error"`, `"warning"`, `"traceback"`
 3. **Identify the failing node**: The history response includes the `node_id` and `node_type` that failed
 4. **Cross-reference inputs**: Use `create_workflow (action:"node_info")` to verify the failing node's expected input schema
@@ -442,8 +442,9 @@ PyTorch and CUDA version incompatibility, usually after:
 ### Workflow Failed — Get Details
 
 ```
-get_history()                           # Most recent execution
-get_history(prompt_id="abc-123")        # Specific execution
+get_history(action="list")                       # Most recent execution
+get_history(action="list", prompt_id="abc-123")  # Specific execution
+get_history(action="diagnose")                   # Why the last run failed
 ```
 
 The response includes:

@@ -17,7 +17,8 @@ export interface EnqueueWorkflowOptions {
    * Seed input names (e.g. "seed") whose values the caller fixed deliberately
    * and which re-randomization must NOT overwrite (issue #865: an explicit
    * seed replaced by a random one silently loses a reproducible run). Used by
-   * rerun/regenerate so an override like `{ seed: 42 }` survives while the
+   * enqueue_workflow (action:"rerun") / generate_image (action:"regenerate")
+   * so an override like `{ seed: 42 }` survives while the
    * remaining seeds still get fresh values.
    */
   preserve_seed_inputs?: readonly string[];
@@ -155,7 +156,7 @@ export async function enqueueWorkflow(
 
   // Start background watcher for completion detection. Capture the workflow
   // that was actually sent (post-seed-randomization) so the AssetRegistry can
-  // store an exact reproducible snapshot for `regenerate`.
+  // store an exact reproducible snapshot for generate_image (action:"regenerate").
   JobWatcher.watch(result.prompt_id, workflow);
 
   return result;

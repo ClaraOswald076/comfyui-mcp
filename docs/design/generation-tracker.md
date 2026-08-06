@@ -407,15 +407,15 @@ Called automatically when `enqueue_workflow` is invoked.
 Extracts settings from the executed workflow and logs to SQLite.
 Not exposed to the user — internal hook.
 
-### `suggest_settings`
+### `get_history` — the `suggest` job
 ```
-Input:  { model_family: "qwen_image", use_case?: "portrait" | "landscape" | ... }
+Input:  { action: "suggest", model_family: "qwen_image", use_case?: "portrait" | "landscape" | ... }
 Output: Top local + community settings for the given model, ranked by reuse.
 ```
 
-### `generation_stats`
+### `get_history` — the `stats` job
 ```
-Input:  { model_family?: string }
+Input:  { action: "stats", model_family?: string }
 Output: Local generation statistics summary.
 ```
 
@@ -428,7 +428,7 @@ Output: Local generation statistics summary.
 2. Create `src/services/generation-tracker.ts` — DB init, log, query
 3. Create `src/services/lora-identifier.ts` — SHA256 hashing + cache
 4. Hook into workflow executor — log after successful run
-5. Add `suggest_settings` MCP tool
+5. Add the settings-suggestion MCP surface
 6. Add `npm run generations:stats` script
 
 ### Phase 2: CivitAI identification

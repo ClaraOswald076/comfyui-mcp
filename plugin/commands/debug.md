@@ -10,8 +10,8 @@ The user wants to find out why a ComfyUI workflow execution failed and get a sug
 ## Instructions
 
 1. **Get the execution history.** The argument is: $ARGUMENTS
-   - If a prompt_id is provided, call `get_history` with that prompt_id
-   - If "last" is provided or no argument given, call `get_history` with no prompt_id to get the most recent execution
+   - If a prompt_id is provided, call `get_history(action="list")` with that prompt_id
+   - If "last" is provided or no argument given, call `get_history(action="list")` with no prompt_id to get the most recent execution
 
 2. **Extract the error.** From the history response, identify:
    - `node_id`: the node where execution failed
@@ -58,7 +58,7 @@ The user wants to find out why a ComfyUI workflow execution failed and get a sug
 User: `/comfy-debug last`
 
 Steps:
-- Call `get_history` with no prompt_id
+- Call `get_history(action="list")` with no prompt_id
 - Find error: node 12 (KSampler) threw RuntimeError "Expected all tensors to be on the same device"
 - Call `get_logs` with keyword "RuntimeError"
 - Call `create_workflow (action:"node_info")` for "KSampler"

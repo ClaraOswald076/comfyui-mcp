@@ -707,6 +707,10 @@ describe("the ledger", () => {
   it("keeps the surviving names in their original relative order", () => {
     const idx = (n: string) => (TOOL_NAMES as readonly string[]).indexOf(n);
     expect(idx("get_image")).toBeLessThan(idx("upload_image"));
-    expect(idx("upload_image")).toBeLessThan(idx("regenerate"));
+    // The name that used to anchor the far end of this check was retired by
+    // 0.50.0 slice 16 (it folded into generate_image), so the anchor moves to
+    // the next surviving name after it. The property is unchanged: slice 15's
+    // survivors keep their positions relative to the tools around them.
+    expect(idx("upload_image")).toBeLessThan(idx("clear_vram"));
   });
 });

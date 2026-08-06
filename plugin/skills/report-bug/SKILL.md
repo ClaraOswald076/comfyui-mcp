@@ -48,7 +48,7 @@ in doubt during beta, file it and move on.
 
 ## Step 1 — Diagnose (root cause, not symptom)
 
-- Read the exact error + stack. For ComfyUI runs: `get_history`, `get_logs`.
+- Read the exact error + stack. For ComfyUI runs: `get_history(action="diagnose")`, `get_logs`.
 - Follow the stack to the actual file/line. Read the code there.
 - Form a concrete root cause + a minimal fix you can defend.
 

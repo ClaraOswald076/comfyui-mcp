@@ -24,9 +24,9 @@ A **tool** is a specific, named action we hand the model so it can actually reac
 | --- | --- |
 | "What have I got saved?" | `get_workflow` with `action: "list"` |
 | "Open the portrait one and tell me what it does" | `get_workflow` with `action: "list"`, then `action: "analyze"` |
-| "Make me a red fox in the snow" | `generate_image` |
+| "Make me a red fox in the snow" | `generate_image` (the `image` job) |
 | "Is it done yet?" | `queue` (the `list` job) |
-| "That failed and I don't understand why" | `diagnose_run` |
+| "That failed and I don't understand why" | `get_history` (the `diagnose` job) |
 | "Half the nodes are red" | `list_packs` (the `install_deps` job) |
 | "I'm out of disk space, what's big?" | `list_local_models` |
 

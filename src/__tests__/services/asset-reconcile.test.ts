@@ -104,8 +104,8 @@ describe("reconcileAssetsFromHistory", () => {
     });
     expect(record.assetId).toMatch(/^a_[0-9a-f]{8}$/);
     expect(record.url).toContain("filename=panel-prompt_00001_.png");
-    // The recorded graph is the regenerate / get_image (action:"asset_metadata")
-    // provenance.
+    // The recorded graph is the generate_image (action:"regenerate") /
+    // get_image (action:"asset_metadata") provenance.
     expect(AssetRegistry.get(record.assetId)?.workflow["3"].class_type).toBe("KSampler");
   });
 

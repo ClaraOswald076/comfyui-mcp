@@ -9,21 +9,12 @@ import { registerModelManagementTools } from "./model-management.js";
 import { registerDiagnosticsTools } from "./diagnostics.js";
 import { registerRunpodTools } from "./runpod.js";
 import { registerWorkflowLibraryTools } from "./workflow-library.js";
-import { registerWorkflowUrlTools } from "./workflow-url.js";
 import { registerProcessControlTools } from "./process-control.js";
 import { registerImageManagementTools } from "./image-management.js";
 import { registerMemoryManagementTools } from "./memory-management.js";
-import { registerGenerationTrackerTools } from "./generation-tracker.js";
-import { registerAssetTools } from "./assets.js";
 import { registerAutoloadedWorkflows } from "./workflow-autoload.js";
 import { registerDefaultsTools } from "./defaults.js";
 import { registerGenerateImageTool } from "./generate-image.js";
-import { registerGenerateAudioTool } from "./generate-audio.js";
-import { registerGenerate3dTools } from "./generate-3d.js";
-import { registerGenerateVideoTool } from "./generate-video.js";
-import { registerRemoveBackgroundTool } from "./remove-background.js";
-import { registerUpscaleImageTool } from "./upscale-image.js";
-import { registerConditionedGenerationTools } from "./generate-conditioned.js";
 import { registerNodeSnapshotsTools } from "./node-snapshots.js";
 import { registerNodeBisectTools } from "./node-bisect.js";
 import { registerNodeManagementTools } from "./node-management.js";
@@ -48,8 +39,6 @@ import { registerCalculateTools } from "./calculate.js";
 import { registerComfyCliTools } from "./comfy-cli.js";
 import { registerTrainTools } from "./train.js";
 import { registerAppsTools } from "./apps.js";
-import { registerTemplateSchemaTools } from "./template-schema.js";
-import { registerRunTemplateTools } from "./run-template.js";
 import { DefaultsManager } from "../services/defaults-manager.js";
 import { ToolCatalog } from "./catalog.js";
 import { registerCompactTools } from "./compact.js";
@@ -74,20 +63,15 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["diagnostics", registerDiagnosticsTools],
   ["runpod", registerRunpodTools],
   ["workflow-authoring", registerWorkflowLibraryTools],
-  ["workflows", registerWorkflowUrlTools],
   ["server", registerProcessControlTools],
   ["images-assets", registerImageManagementTools],
   ["server", registerMemoryManagementTools],
-  ["generation", registerGenerationTrackerTools],
-  ["images-assets", registerAssetTools],
   ["skills-config", registerDefaultsTools],
+  // 0.50.0 slice 16 folded eight sibling generation tools into `generate_image`
+  // and four observability tools into `get_history`, so the groups that used to
+  // register them are gone from this list (their handlers live on as action
+  // functions imported by the survivors). `generate_image` keeps this slot.
   ["generation", registerGenerateImageTool],
-  ["generation", registerGenerateAudioTool],
-  ["generation", registerGenerate3dTools],
-  ["generation", registerGenerateVideoTool],
-  ["generation", registerRemoveBackgroundTool],
-  ["generation", registerUpscaleImageTool],
-  ["generation", registerConditionedGenerationTools],
   ["custom-nodes", registerNodeSnapshotsTools],
   ["custom-nodes", registerNodeBisectTools],
   ["custom-nodes", registerNodeManagementTools],
@@ -117,8 +101,6 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   // (the scaffold tool) held, further up.
   ["training", registerTrainTools],
   ["apps", registerAppsTools],
-  ["workflows", registerTemplateSchemaTools],
-  ["workflows", registerRunTemplateTools],
   // Appended (not inserted next to queue-management) because tools/list order
   // is observable and must not shift for existing tools.
   ["workflows", registerBatchTools],
@@ -131,7 +113,7 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
 // tool paths share — the live McpServer and the compact-mode ToolCatalog both
 // receive handlers wrapped here — so the guarantee holds for every current and
 // future image-returning tool (get_image's fetch/view/convert/colour-measure
-// actions, generate_image, upscale_image, ...) without per-tool opt-ins. It
+// actions, generate_image, get_image, ...) without per-tool opt-ins. It
 // wraps the RESULT, so folding several image-returning tools into one name
 // (0.50.0 slice 15) changes nothing here: the wrapper never reads a tool name
 // or an action.

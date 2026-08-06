@@ -46,7 +46,7 @@ search results — set it once (panel Settings › "Set CivitAI token…" or env
 3. `download_model({ action: "download_civitai", model_version_id, target_subfolder: "loras" })`.
 4. In the panel: `panel_add_node` a `LoraLoader`, `panel_set_widget` the
    `lora_name`, wire it between checkpoint and sampler — and use the hit's
-   trigger words in the prompt. Headless: `generate_image` / build the workflow.
+   trigger words in the prompt. Headless: `generate_image(action="image")` / build the workflow.
 
 **"Download this Civitai page for me"** (user pastes a URL)
 - Parse the `modelVersionId` from the URL if present; otherwise pass the model

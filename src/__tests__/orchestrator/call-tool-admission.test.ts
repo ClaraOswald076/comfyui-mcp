@@ -579,12 +579,140 @@ describe("call_tool admission", () => {
     });
   });
 
+  describe("enqueue_workflow: the fold must not admit fetch-and-execute (slice 16)", () => {
+    // The dispatcher authorizes by NAME and forwards arbitrary action arguments,
+    // so this is the whole guarantee: `enqueue_workflow` was whitelisted for the
+    // ONE thing it did — submit a graph the client already has — and 0.50.0
+    // slice 16 gave that name four more jobs, none of whose standalone names was
+    // ever on this list.
+    it("admits the bare submit, with the arguments the pre-fold entry forwarded", () => {
+      expect(callToolAdmission("enqueue_workflow", { action: "enqueue" })).toBeNull();
+      expect(
+        callToolAdmission("enqueue_workflow", {
+          action: "enqueue",
+          workflow: { "1": { class_type: "KSampler", inputs: {} } },
+          disable_random_seed: true,
+        }),
+      ).toBeNull();
+    });
+
+    it("REFUSES action:\"run_url\" — fetching and executing a caller-chosen URL", () => {
+      // The one that matters. run:true executes a graph nobody on this machine
+      // wrote, on the user's GPU, with no agent turn and no confirmation.
+      expect(callToolAdmission("enqueue_workflow", { action: "run_url" })).toBe(
+        'tool "enqueue_workflow" is not permitted for action "run_url"',
+      );
+      expect(
+        callToolAdmission("enqueue_workflow", {
+          action: "run_url",
+          url: "https://example.com/wf.json",
+          run: true,
+        }),
+      ).toBe('tool "enqueue_workflow" is not permitted for action "run_url"');
+      // …and read-only is refused too: the entry never covered this tool at all.
+      expect(
+        callToolAdmission("enqueue_workflow", {
+          action: "run_url",
+          url: "https://example.com/wf.json",
+          run: false,
+        }),
+      ).toBe('tool "enqueue_workflow" is not permitted for action "run_url"');
+    });
+
+    it("refuses the other three folded actions, whose names were never whitelisted", () => {
+      for (const action of ["rerun", "template_schema", "run_template"]) {
+        expect(callToolAdmission("enqueue_workflow", { action }), `action:"${action}"`).toBe(
+          `tool "enqueue_workflow" is not permitted for action "${action}"`,
+        );
+      }
+      expect(
+        callToolAdmission("enqueue_workflow", { action: "run_template", template: "anima-txt2img" }),
+      ).toBe('tool "enqueue_workflow" is not permitted for action "run_template"');
+    });
+
+    it("refuses enqueue_workflow with a missing or non-string action", () => {
+      expect(callToolAdmission("enqueue_workflow", {})).toBe(
+        'tool "enqueue_workflow" is not permitted for action "(missing)"',
+      );
+      expect(callToolAdmission("enqueue_workflow", { action: 42 })).toBe(
+        'tool "enqueue_workflow" is not permitted for action "(missing)"',
+      );
+    });
+  });
+
+  describe("get_history: the fold must not cause a FALSE REFUSAL (slice 16)", () => {
+    // The opposite trap. The standalone failure-diagnosis tool WAS whitelisted —
+    // it is how a canvas-less client answers "why did my render fail?" — and the
+    // name it folded into was not. Without the added entry the panel feature
+    // breaks with a refusal that looks like a permissions decision and is really
+    // a rename nobody followed through.
+    it("admits action:\"diagnose\", with and without a prompt_id", () => {
+      expect(callToolAdmission("get_history", { action: "diagnose" })).toBeNull();
+      expect(
+        callToolAdmission("get_history", { action: "diagnose", prompt_id: "abc-123" }),
+      ).toBeNull();
+    });
+
+    it("admits NOTHING ELSE — the scope grants exactly what the retired entry did", () => {
+      for (const action of ["list", "stats", "suggest"]) {
+        expect(callToolAdmission("get_history", { action }), `action:"${action}"`).toBe(
+          `tool "get_history" is not permitted for action "${action}"`,
+        );
+      }
+      expect(callToolAdmission("get_history", {})).toBe(
+        'tool "get_history" is not permitted for action "(missing)"',
+      );
+    });
+  });
+
+  it("generate_image is not on the whitelist at all, before or after the fold", () => {
+    // Neither the survivor nor any of the eight names it absorbed was ever
+    // whitelisted, so the largest fold in the consolidation adds no reachability
+    // to this channel. Asserted rather than assumed: `apps` action:"run" IS
+    // admitted and queues a render, so "generation is reachable from here" is a
+    // plausible-sounding mistake to make.
+    expect(callToolAdmission("generate_image", { action: "image" })).toBe(
+      'tool "generate_image" is not permitted',
+    );
+    expect(callToolAdmission("generate_image", { action: "regenerate", asset_id: "a" })).toBe(
+      'tool "generate_image" is not permitted',
+    );
+  });
+
+  it("the three slice-16 SURVIVORS are never answered as retired (#911)", () => {
+    // #911 made admission consult the retirement ledger BEFORE the whitelist, so
+    // a name that no longer exists gets a redirect instead of a permission error.
+    // The inverse has to hold too: these three names are LIVE — they are what the
+    // eighteen folded into — so nothing may answer for them out of the ledger.
+    // Getting this backwards would tell a caller its live tool was removed.
+    for (const name of ["enqueue_workflow", "generate_image", "get_history"]) {
+      expect(TOOL_NAMES as readonly string[], `${name} must still be a live tool`).toContain(name);
+      expect(retiredToolMessage(name), `${name} must not be in the ledger`).toBeUndefined();
+      const refusal = callToolAdmission(name, {});
+      if (refusal !== null) {
+        expect(refusal, `${name} refusal must not read as a retirement`).not.toContain(
+          "removed in",
+        );
+        expect(refusal, `${name} refusal must not read as a retirement`).not.toContain(
+          "Unknown tool",
+        );
+      }
+    }
+    // And the two that ARE whitelisted still admit their one scoped action, so
+    // the ledger-first ordering did not shadow them.
+    expect(callToolAdmission("enqueue_workflow", { action: "enqueue" })).toBeNull();
+    expect(callToolAdmission("get_history", { action: "diagnose" })).toBeNull();
+  });
+
   it("name-level behavior is unchanged for everything else", () => {
     // A whitelisted tool with no action scope is admitted regardless of args…
-    // (this used to name the standalone output listing; 0.50.0 slice 15 folded
-    // that into get_image, which IS action-scoped, so the example moved to a
-    // whitelist entry that still carries no scope.)
-    expect(callToolAdmission("enqueue_workflow", {})).toBeNull();
+    // (this example has moved twice as the consolidation scoped its previous
+    // subjects: 0.50.0 slice 15 folded the standalone output listing into
+    // get_image, and slice 16 action-scoped enqueue_workflow so run_url cannot
+    // reach this channel. runpod_watch is the current unscoped entry — all three
+    // of its actions map onto names that were each already whitelisted, so it is
+    // judged over the whole tool.)
+    expect(callToolAdmission("runpod_watch", {})).toBeNull();
     // …including a consolidated tool whose whole-tool posture was judged at
     // whitelist time (apps, 0.49.0 slice 2) — deliberately NOT rescoped here.
     expect(callToolAdmission("apps", { action: "run" })).toBeNull();
