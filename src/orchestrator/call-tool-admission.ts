@@ -5,11 +5,20 @@
  * call site.
  */
 
+import { retiredToolMessage } from "../tools/vocabulary.js";
+
 /** The direct tool channel: a mobile client can invoke these READ/DOWNLOAD backend
  *  tools without an agent turn (structured nav data + rig downloads). The
  *  bridge is already token-gated; this whitelist keeps call_tool to non-destructive
- *  tools (no restart/remove/clear/install). */
-const CALL_TOOL_WHITELIST = new Set<string>([
+ *  tools (no restart/remove/clear/install).
+ *
+ *  Exported for the tests only — nothing outside this module reads it, and no
+ *  package entry point re-exports it. The tests need it to assert two properties
+ *  over the WHOLE set rather than over a handful of spelled names that the 0.50.0
+ *  consolidation would rot within hours: that every whitelisted name is still a
+ *  LIVE tool, and that every live tool it does NOT carry is refused with the
+ *  byte-identical legacy string. */
+export const CALL_TOOL_WHITELIST = new Set<string>([
   // The canvas-less client's whole read side of the saved-workflow library.
   // FIVE separate entries lived here — the library listing, the file read, the
   // summary, the graph query and the PNG-metadata extractor — until 0.50.0
@@ -161,8 +170,12 @@ const CALL_TOOL_WHITELIST = new Set<string>([
  * whitelist entry was already judged over the whole tool).
  *
  * Wired ONLY where a slice's whitelist swap would otherwise broaden admission.
+ *
+ * Exported for the tests only, on the same terms as CALL_TOOL_WHITELIST above:
+ * the money guard has to be asserted over every entry in this map, not over the
+ * one or two a test happened to spell.
  */
-const CALL_TOOL_ACTION_WHITELIST: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+export const CALL_TOOL_ACTION_WHITELIST: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   // The `queue` entry above replaces the retired standalone cancel entry
   // (0.49.0 slice 4), which admitted CANCEL semantics only: interrupt the
   // running job, optionally prompt_id-matched, optionally with clear_pending —
@@ -300,6 +313,42 @@ export function callToolAdmission(
   tool: string,
   args: Record<string, unknown>,
 ): string | null {
+  // A name the consolidation RETIRED reports as RETIRED — ahead of the whitelist,
+  // for ANY retired name, whether or not it was ever whitelisted.
+  //
+  // Without this, a client calling a folded-away name gets `tool "X" is not
+  // permitted`, which is not merely a worse answer than the ledger's — it is a
+  // WRONG one. "Not permitted" says *you lack permission*, and sends a developer
+  // to check tokens, whitelists and trust boundaries. The truth is *that tool no
+  // longer exists under that name*, and the ledger already knows what to call
+  // instead. Both the compact `call_tool` facade and the direct MCP `tools/call`
+  // path (#895) answer a retired name from the ledger; this channel was the one
+  // that overwrote it, and it is exactly the channel the panel's RunPod control
+  // panel and the mobile app reach for the eleven runpod_* names 0.50.0 slice 8
+  // folded away.
+  //
+  // Ahead of the whitelist, and not merely for names the whitelist once carried,
+  // because a name that no longer exists cannot meaningfully be "permitted": the
+  // retirement is the prior fact. A caller who migrates to the surviving name then
+  // receives the action-scoped or permission answer below, which is the accurate
+  // answer AT THAT POINT. Two truthful steps beat one misleading dead end — and
+  // "was it previously whitelisted?" is not even derivable, because a slice SWAPS
+  // the retired entry for its survivor, so answering it would need a second
+  // append-only artifact whose omissions nothing gates.
+  //
+  // SAFETY — why this cannot weaken the money guard below (#269/#278). This branch
+  // has exactly two outcomes: return a non-empty refusal string, or fall through to
+  // the untouched original code. There is no input for which it returns null, so it
+  // cannot turn a refusal into an admission — the "false refusal becomes false
+  // acceptance" failure the #839 gate was about. Beyond that it is never even
+  // REACHED for an action-scoped tool: every key of CALL_TOOL_ACTION_WHITELIST is a
+  // live name, so retiredToolMessage() is undefined for it and control reaches the
+  // action check unchanged. Both properties are pinned in the tests, the second
+  // structurally, so a future slice that retires an action-scoped name (folding
+  // `runpod` onward, say) fails loudly here rather than quietly returning early.
+  const retired = retiredToolMessage(tool);
+  if (retired !== undefined) return retired;
+
   if (!CALL_TOOL_WHITELIST.has(tool)) return `tool "${tool}" is not permitted`;
   const actions = CALL_TOOL_ACTION_WHITELIST.get(tool);
   if (actions !== undefined) {
