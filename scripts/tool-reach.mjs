@@ -50,14 +50,18 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "..");
 const OUT_DIR = process.env.REACH_OUT ?? join(ROOT, "bench-results");
 
-/** Files the runner needs inside whichever worktree an arm resolves to. */
-const BENCH_FILES = [
-  "tool-reach-bench.mts",
-  "tool-reach-requests.mjs",
-  "tool-reach-foldmap.mjs",
-  "tool-reach-score.mjs",
-  "tool-reach-stub-server.mjs",
-];
+/**
+ * Files the runner needs inside whichever worktree an arm resolves to.
+ *
+ * DISCOVERED, not listed. A hand-maintained list went stale the moment the
+ * interception policy and the merge logic were split into their own modules:
+ * the in-place arms kept working and only the `baseline` arm — the one that runs
+ * in a worktree at an old ref — died on ERR_MODULE_NOT_FOUND, so the omission
+ * surfaced as "one arm is broken" rather than "a file is missing".
+ */
+const BENCH_FILES = readdirSync(HERE).filter(
+  (f) => f.startsWith("tool-reach") && (f.endsWith(".mjs") || f.endsWith(".mts")),
+);
 
 const ARMS = {
   baseline: { ref: "d9e8971", mode: "full", blurb: "154 flat tools (pre-slice-8)" },
