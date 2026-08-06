@@ -266,9 +266,9 @@ function redirectedStatePath(envVar: string, fallback: string): string {
   if (value !== undefined && value.trim() === "") {
     throw new Error(
       `${envVar} is set but EMPTY. An empty override does not mean "use the default" — ` +
-        `it silently resolves to the real default (${fallback}), which is how a test run ` +
-        `came to write the developer's real home directory. Set ${envVar} to a real path ` +
-        `or unset it entirely.`,
+        `it falls through to the default (${fallback}) with no sign anything was wrong, ` +
+        `which is how a test run came to write the developer's real home directory (#866). ` +
+        `Set ${envVar} to a real path or unset it entirely.`,
     );
   }
   return value ?? fallback;
