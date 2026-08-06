@@ -330,6 +330,47 @@ describe("pre-write: a destination the LIVE server does not read from is refused
       resolveModelSubfolderPreferServer("diffusion_models"),
     ).resolves.toBeTruthy();
   });
+
+  it("PROCEEDS when the only 'mismatch' is a diffusers folder the server CONTRACTUALLY never lists (#844)", async () => {
+    // The exact reported shape: nested Diffusers component files under
+    // models/diffusers that /models/diffusers never lists — ComfyUI registers
+    // that category with a ["folder"] extension contract (no file matches it),
+    // so the component files' absence is contractual, not evidence of a
+    // different install. The old rule read it as positive proof and refused a
+    // correct workspace.
+    h.onDisk = {
+      vae: [],
+      diffusers: [
+        "hunyuan3d-paint-v2-0-turbo/vae/diffusion_pytorch_model.bin",
+        "hunyuan3d-paint-v2-0-turbo/text_encoder/pytorch_model.bin",
+      ],
+    };
+    h.liveListings["vae"] = ["server-vae.safetensors"];
+    h.liveListings["diffusers"] = []; // what the real endpoint answers, by contract
+    await expect(resolveModelSubfolderPreferServer("vae")).resolves.toBe(
+      resolve("/comfy/models/vae"),
+    );
+    // Assert the REASON, not just the state: the category was excused by its
+    // enumeration contract, so the server was never even asked about it.
+    expect(h.fetchCalls).not.toContain("/models/diffusers");
+  });
+
+  it("STILL REFUSES a real mismatch in a sibling category when a diffusers folder is present (#844 is not a blind spot)", async () => {
+    // Excusing the contract-empty category must not excuse anything else: a
+    // populated checkpoints/ the server demonstrably does not read is still the
+    // #369 signature.
+    h.onDisk = {
+      diffusers: ["hunyuan3d-paint-v2-0-turbo/vae/diffusion_pytorch_model.bin"],
+      checkpoints: ["stale-ckpt.safetensors"],
+    };
+    h.liveListings["diffusers"] = [];
+    h.liveListings["checkpoints"] = ["live-ckpt.safetensors"];
+    const err = await resolveModelSubfolderPreferServer("vae").catch((e: Error) => e);
+    expect(err).toBeInstanceOf(ModelError);
+    expect((err as Error).message).toMatch(/DIFFERENT install/);
+    // The refusal must name the category with REAL evidence, not the excused one.
+    expect((err as Error).message).toMatch(/"checkpoints"/);
+  });
 });
 
 describe("currentLiveModelsRoot — only a LIVE-AUTHORITATIVE answer (#369)", () => {
@@ -645,5 +686,77 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     h.liveListings["loras"] = ["sub\\new.safetensors"];
     const res = await verifyLandedModel(target, "loras/sub", { attempts: 1, retryMs: 0 });
     expect(res.liveVisible).toBe("visible");
+  });
+
+  it("confirms a file landed through a category-level JUNCTION onto undeclared storage (StabilityMatrix, #870)", async () => {
+    // `models/vae` is a junction to the StabilityMatrix shared store. The server
+    // scans that path THROUGH the junction (its recursive_search follows links)
+    // and lists the file, so membership is answered by the LEXICAL write path —
+    // a realpath-only check would call the file "outside every directory the
+    // server reads", the post-write twin of the pre-write refusal.
+    const smTarget = resolve("/comfy/models/vae/new.safetensors");
+    const real = resolve("/E/StabilityMatrix/models/VAE/new.safetensors");
+    realpathMock.mockImplementation(async (p: string) => {
+      const s = String(p);
+      if (s === smTarget) return real;
+      if (resolve(s) === resolve("/comfy/models/vae")) {
+        return resolve("/E/StabilityMatrix/models/VAE");
+      }
+      return resolve(s);
+    });
+    h.modelsDirSource = "observed-root";
+    h.destModelsDir = "/comfy/models";
+    h.liveExtraRoots = { authoritative: true, roots: [] };
+    h.liveListings["vae"] = ["new.safetensors"];
+    const res = await verifyLandedModel(smTarget, "vae", {
+      attempts: 1,
+      retryMs: 0,
+      listedBefore: false,
+    });
+    expect(res.liveVisible).toBe("visible");
+    expect(res.verifiedPath).toBe(real);
+  });
+
+  it("confirms a file landed through a NESTED in-tree link (`models/vae/vendor -> ...`, #870 gate)", async () => {
+    // The junction need not sit at the category folder: the server follows links
+    // at any depth, so a file under `models/vae/vendor` is listed as
+    // "vendor/new.safetensors" wherever that link points.
+    const nestedTarget = resolve("/comfy/models/vae/vendor/new.safetensors");
+    const real = resolve("/E/shared/vendor/new.safetensors");
+    realpathMock.mockImplementation(async (p: string) => {
+      const s = String(p);
+      if (s === nestedTarget) return real;
+      if (resolve(s) === resolve("/comfy/models/vae/vendor")) {
+        return resolve("/E/shared/vendor");
+      }
+      return resolve(s);
+    });
+    h.modelsDirSource = "observed-root";
+    h.destModelsDir = "/comfy/models";
+    h.liveExtraRoots = { authoritative: true, roots: [] };
+    h.liveListings["vae"] = ["vendor/new.safetensors"];
+    const res = await verifyLandedModel(nestedTarget, "vae/vendor", {
+      attempts: 1,
+      retryMs: 0,
+      listedBefore: false,
+    });
+    expect(res.liveVisible).toBe("visible");
+    expect(res.verifiedPath).toBe(real);
+  });
+
+  it("reports UNKNOWN — never a false not-visible — for a diffusers file the listing contractually cannot contain (#844)", async () => {
+    // /models/diffusers can never list FILES (the folder is registered with a
+    // ["folder"] extension contract no file matches), so a landed file's absence
+    // from it is the contract speaking, not the server. The verdict must be an
+    // honest unconfirmed, not "the server does NOT list it".
+    const dTarget = resolve("/live/ComfyUI/models/diffusers/model.safetensors");
+    h.modelsDirSource = "observed-root";
+    h.destModelsDir = "/live/ComfyUI/models";
+    h.liveListings["diffusers"] = []; // what the real endpoint answers, by contract
+    const res = await verifyLandedModel(dTarget, "diffusers", { attempts: 1, retryMs: 0 });
+    expect(res.liveVisible).toBe("unknown");
+    expect(res.verifiedPath).toBe(dTarget);
+    expect(res.note).toMatch(/never lists individual files/);
+    expect(res.note).not.toMatch(/does NOT list/);
   });
 });
