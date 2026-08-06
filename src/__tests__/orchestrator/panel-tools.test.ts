@@ -597,7 +597,13 @@ describe("panel-tools: transport parity", () => {
 describe("panel-tools: panel_run (run-to-node partial execution)", () => {
   it("exposes a batch_count + optional to_node_id schema", () => {
     const def = defByName("panel_run");
-    expect(Object.keys(def.schema).sort()).toEqual(["batch_count", "retry_of", "to_node_id"]);
+    // allow_duplicate (#862) opts out of the pre-queue duplicate fence.
+    expect(Object.keys(def.schema).sort()).toEqual([
+      "allow_duplicate",
+      "batch_count",
+      "retry_of",
+      "to_node_id",
+    ]);
     // to_node_id is an optional int — accepts a node id, rejects non-numbers,
     // and (being optional) accepts undefined for a normal full run.
     const toNode = def.schema.to_node_id as {
@@ -606,6 +612,13 @@ describe("panel-tools: panel_run (run-to-node partial execution)", () => {
     expect(toNode.safeParse(27).success).toBe(true);
     expect(toNode.safeParse("x").success).toBe(false);
     expect(toNode.safeParse(undefined).success).toBe(true);
+    // allow_duplicate is an optional boolean — defaults to the fenced behavior.
+    const allowDup = def.schema.allow_duplicate as {
+      safeParse: (v: unknown) => { success: boolean };
+    };
+    expect(allowDup.safeParse(true).success).toBe(true);
+    expect(allowDup.safeParse("yes").success).toBe(false);
+    expect(allowDup.safeParse(undefined).success).toBe(true);
   });
 
   it("forwards graph_run with to_node_id undefined for a full run", async () => {

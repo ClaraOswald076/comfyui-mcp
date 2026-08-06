@@ -30,7 +30,7 @@ import { setupSecureBridge, resolveComfyuiPathForTarget, type SecureBridge } fro
 import { judgeHelloRetarget, canonComfyuiTargetUrl } from "../services/hello-retarget.js";
 import { startQuickTunnel } from "../services/tunnel.js";
 import { detectInstallMode } from "../services/self-update.js";
-import { performPanelSync } from "../services/panel-sync.js";
+import { performPanelSync, reassessPanelAfterSyncFailure } from "../services/panel-sync.js";
 import { clearPanelDiskObservation } from "../services/panel-workspace.js";
 import { panelRecoveryContext } from "../services/panel-recovery.js";
 import { isPanelAutoInstallDisabled } from "../services/panel-installer.js";
@@ -3038,22 +3038,53 @@ export async function runPanelOrchestrator(): Promise<void> {
             // The explicit tool remains available for diagnosis and retry.
             const detail = err instanceof Error ? err.message : String(err);
             logger.warn(`[panel-orchestrator] panel auto-sync on hello failed: ${detail}`);
-            bridge.push(
-              {
-                type: "say",
-                text:
-                  `⚠️ Could not automatically sync the ComfyUI-MCP panel; no update was claimed. ` +
-                  // #784 — this is pushed to the embedded panel chat, whose
-                  // tool set does not include install_panel. Name it only where
-                  // it can be invoked.
-                  `${
-                    panelRecoveryContext().installPanelUsable
-                      ? "Run install_panel(action:'status') to inspect it, then retry install_panel(action:'sync') if appropriate."
-                      : "Inspect and update the panel pack on the ComfyUI host itself — no tool in this session can do it."
-                  } (${detail})`,
-              },
-              panelTab,
-            );
+            // #888 — the failure detail can be STALE: the sync's pre-scan ran
+            // inside the reconnect/retarget window and can describe a tree the
+            // retarget has since corrected away from, so "the pack is not present
+            // in custom_nodes" can reach the user while the panel is in fact
+            // installed and compatible. Before warning, re-run the same
+            // authoritative disk scan install_panel(action:'status') uses; a
+            // PROVEN meets-floor verdict means the sync's goal is already met and
+            // the warning would be false — suppress it (logged, never pushed).
+            // Any "can't tell" (the re-scan failed, the version is not
+            // comparable, the panel is still behind) keeps the original warning
+            // verbatim: a failed re-check never certifies the failure as false.
+            void reassessPanelAfterSyncFailure()
+              .then((reassessment) => {
+                if (reassessment?.decision === "meets-floor") {
+                  logger.info(
+                    `[panel-orchestrator] auto-sync failure on hello suppressed after authoritative ` +
+                      `re-scan: panel ${reassessment.installedVersion ?? "?"} meets the floor ` +
+                      `${reassessment.requiredPanelVersion} (suppressed failure detail: ${detail})`,
+                  );
+                  return;
+                }
+                bridge.push(
+                  {
+                    type: "say",
+                    text:
+                      `⚠️ Could not automatically sync the ComfyUI-MCP panel; no update was claimed. ` +
+                      // #784 — this is pushed to the embedded panel chat, whose
+                      // tool set does not include install_panel. Name it only where
+                      // it can be invoked.
+                      `${
+                        panelRecoveryContext().installPanelUsable
+                          ? "Run install_panel(action:'status') to inspect it, then retry install_panel(action:'sync') if appropriate."
+                          : "Inspect and update the panel pack on the ComfyUI host itself — no tool in this session can do it."
+                      } (${detail})`,
+                  },
+                  panelTab,
+                );
+              })
+              .catch((pushErr) => {
+                // reassessPanelAfterSyncFailure null-guards its own failures, so a
+                // throw here is the push/log path itself. The sync failure is
+                // already logged above; never let the failure HANDLER throw.
+                logger.warn(
+                  `[panel-orchestrator] could not deliver the auto-sync failure notice: ` +
+                    `${pushErr instanceof Error ? pushErr.message : String(pushErr)}`,
+                );
+              });
           });
       }
       // Retarget ComfyUI to the URL the browser was served from (window.location),
