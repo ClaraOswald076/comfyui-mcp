@@ -152,12 +152,32 @@ describe("sessions are orchestrator-scoped, never workflow-scoped (#884)", () =>
     // MIXED/unknown-origin batch failing closed instead of last-message-wins
     // re-aiming the whole turn's mutations (codex r2/r3).
     expect(src).toContain("batch.known.push(rec.uuid);");
-    expect(src).toContain("if (closed.unknown || distinct.size > 1) {");
+    // Confirming gate 2 split this into its two honest halves, so BOTH are
+    // pinned — the old single condition can't come back by satisfying one.
+    // A mixed/unknown TAB batch fails closed on routing AND stamp (no single
+    // target is honest for it)…
+    expect(src).toContain("if (closed.unknown || closed.tabs.size > 1) {");
+    // …while one tab whose workflow changed between messages keeps its routing
+    // pin (same browser surface) and fails closed on the STAMP alone.
+    expect(src).toContain(
+      "const uuid = distinct.size === 1 ? distinct.values().next().value : undefined;",
+    );
     // The TURN-TARGET PIN lands in the same batch close and is released at turn
     // end: an in-flight turn's tool calls route to the tab the turn was issued
     // from, never re-resolved mid-turn (confirming-gate P0).
-    expect(src).toContain("turnTargetTabByKey.set(key, closed.tabs.values().next().value as string);");
+    expect(src).toContain("turnTargetTabByKey.set(key, tab);");
     expect(src).toContain('if (state === "done") turnTargetTabByKey.delete(key);');
+    // Confirming gate 2, P0 — EVERY turn has an origin, not just user-message
+    // turns. A turn that contributes none (an injected run error whose queue
+    // item carried no mid, a pure re-queue, a restart nudge) inherits the
+    // conversation's LAST ESTABLISHED origin; with none it refuses. It must
+    // never fall through to "whatever tab is active" — that is how a render
+    // error on tab A silently edited tab B.
+    expect(src).toContain("const last = lastOriginByKey.get(key);");
+    expect(src).toContain("turnTargetTabByKey.set(key, last.tab);");
+    expect(src).toContain("lastOriginByKey.set(key, { tab, uuid });");
+    // …and the injection paths mint that origin rather than going in bare.
+    expect(src).toContain("mid: mintInjectionOrigin(event.tab_id),");
     expect(src).toContain("bridge.setScopeTargetResolver((scopeId) => {");
     // …answered to scope-addressed callers by the stamp resolver…
     expect(src).toContain(

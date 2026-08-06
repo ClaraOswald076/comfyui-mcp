@@ -4650,11 +4650,19 @@ export function makePanelToolCtx(
   // active tab can't be picked.
   const rebindToActiveTab = (): { previous: string; current: string; rebound: boolean } => {
     const previous = ctx.tabId;
-    // #884 P0 — a SCOPE-bound ctx needs no rebind and must never be pinned to a
-    // real tab id (that would permanently narrow the shared conversation's
-    // routing to one tab). Routing recovers by itself: the dead-pin state ends
-    // with the turn, and the next message re-pins fresh.
-    if (isScopeAddress(previous)) return { previous, current: previous, rebound: false };
+    // #884 P0 — a SCOPE-bound ctx must never be REPLACED by a real tab id (that
+    // would permanently narrow the shared conversation's routing to one tab).
+    // The ctx therefore stays scope-bound. But it is NOT a no-op: this is the
+    // explicit "use what's live now" consent, and a turn whose pin is dead or
+    // ambiguous has no other way out — the bridge's own refusal names this tool
+    // as the recovery, and before this it could not deliver one (confirming
+    // gate 2, P1: both escape hatches no-op'd, so awaitReachable stayed false
+    // and panel_open_workflow refused before dispatch for the rest of the turn).
+    // Re-pin the in-flight turn onto the live tab instead, keeping the address.
+    if (isScopeAddress(previous)) {
+      const repinned = bridge.repinScopeToActive?.(previous);
+      return { previous, current: previous, rebound: Boolean(repinned) };
+    }
     // A healthy binding is left untouched (never disturb a live session). Recovery only
     // fires for an orphaned/stale tab id.
     if (bridge.canReach(previous)) return { previous, current: previous, rebound: false };

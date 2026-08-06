@@ -1242,6 +1242,17 @@ export class UiBridge {
    *  undefined when no turn is in flight (fall back to active-tab resolution).
    *  See resolveTarget's scope branch. */
   private scopeTargetResolver: ((scopeId: string) => string | null | undefined) | null = null;
+  /** #884 — orchestrator-injected EXPLICIT recovery: re-pin a conversation's
+   *  in-flight turn onto the tab that is active now (the documented
+   *  panel_set_workflow_target({mode:"current"}) consent). Returns the tab it
+   *  repinned to, or undefined when nothing is resolvable. */
+  private scopeRepinHandler: ((scopeId: string) => string | undefined) | null = null;
+  /** #884 — orchestrator-injected: normalize a hello's raw `backend` value the
+   *  same way the orchestrator does (unknown/absent → the default backend), so
+   *  the backend-qualified scope-buffer replay matches the conversation the
+   *  tab actually JOINS. Without it, a hello omitting `backend` never drained
+   *  the default conversation's mailbox (confirming-gate 2, P1). */
+  private helloBackendNormalizer: ((raw: unknown) => string) | null = null;
   /**
    * #716 — an explicit workflow navigation can establish a newer command-stamp
    * identity before the panel's next hello.  The orchestrator owns the value and
@@ -2002,9 +2013,16 @@ export class UiBridge {
         // backend — a Codex tab helloing first must never receive a Claude
         // conversation's buffered output (confirming-gate P1). Bare-scope
         // buffers (backend-unattributed) drain to any hello, as before.
-        const helloBackend =
-          typeof (msg as { backend?: unknown }).backend === "string"
-            ? ((msg as { backend?: string }).backend as string).toLowerCase()
+        // The backend this hello JOINS, normalized exactly as the orchestrator
+        // will map it (unknown/absent → the default backend) — an omitted or
+        // misspelled `backend` must still drain the default conversation's
+        // buffers (confirming-gate 2, P1). Without a normalizer (tests, bare
+        // bridges) only an exact advertised backend matches.
+        const rawHelloBackend = (msg as { backend?: unknown }).backend;
+        const helloBackend = this.helloBackendNormalizer
+          ? this.helloBackendNormalizer(rawHelloBackend)
+          : typeof rawHelloBackend === "string"
+            ? rawHelloBackend.toLowerCase()
             : undefined;
         const scopeKeyMatchesHello = (scopeKey: string): boolean =>
           scopeKey === SHARED_SESSION_SCOPE ||
@@ -2398,6 +2416,24 @@ export class UiBridge {
    *  resolveTarget's scope branch). */
   setScopeTargetResolver(fn: (scopeId: string) => string | null | undefined): void {
     this.scopeTargetResolver = fn;
+  }
+
+  /** #884 — inject the explicit-repin recovery handler (see the field doc). */
+  setScopeRepinHandler(fn: (scopeId: string) => string | undefined): void {
+    this.scopeRepinHandler = fn;
+  }
+
+  /** #884 — EXPLICIT recovery consent (panel_set_workflow_target
+   *  mode:"current" on a scope-bound session): re-pin the conversation's
+   *  in-flight turn onto the tab that is active now, escaping a dead or
+   *  ambiguous pin. Returns the repinned tab id, or undefined. */
+  repinScopeToActive(scopeId: string): string | undefined {
+    return this.scopeRepinHandler?.(scopeId);
+  }
+
+  /** #884 — inject the hello-backend normalizer (see the field doc). */
+  setHelloBackendNormalizer(fn: (raw: unknown) => string): void {
+    this.helloBackendNormalizer = fn;
   }
 
   /** #884 — the real tab id a SCOPE ADDRESS currently resolves to (the pinned
@@ -2861,26 +2897,7 @@ export class UiBridge {
         // never a silent re-target.
         return this.resolveTarget(pin);
       }
-      if (this.lastActiveTabId) {
-        const active = this.conns.get(this.lastActiveTabId);
-        if (active) return active;
-      }
-      let interactive: Conn | undefined;
-      let headless: Conn | undefined;
-      for (const c of this.conns.values()) {
-        if (c.headless) {
-          if (!headless || c.helloGeneration > headless.helloGeneration) headless = c;
-        } else if (!interactive || c.helloGeneration > interactive.helloGeneration) {
-          interactive = c;
-        }
-      }
-      const best = interactive ?? headless;
-      if (best) return best;
-      // Keep the machine-readable "no connected tab … Connected: none" phrase —
-      // the panel-tools transient classifier keys on it.
-      throw new Error(
-        `no connected tab with id "${tabId}". Connected: none — ${this.noPanelGuidance()}`,
-      );
+      return this.resolveScopeActive(tabId);
     }
     if (tabId) {
       // Accept full ids or unambiguous prefixes (status shows 8-char ids).
@@ -2932,6 +2949,46 @@ export class UiBridge {
     throw new Error(
       `Multiple panel tabs are connected and none is "last active" — pass tab_id. ${this.status()}`,
     );
+  }
+
+  /** #884 — the ACTIVE-tab resolution for a scope address with NO turn pin in
+   *  force: the tab the user last talked from, else the most recently connected
+   *  interactive (canvas-owning) tab, else the most recent headless one. Also
+   *  the basis of the EXPLICIT repin recovery (repinScopeToActive), which must
+   *  bypass a dead pin by construction. */
+  private resolveScopeActive(tabId: string): Conn {
+    if (this.lastActiveTabId) {
+      const active = this.conns.get(this.lastActiveTabId);
+      if (active) return active;
+    }
+    let interactive: Conn | undefined;
+    let headless: Conn | undefined;
+    for (const c of this.conns.values()) {
+      if (c.headless) {
+        if (!headless || c.helloGeneration > headless.helloGeneration) headless = c;
+      } else if (!interactive || c.helloGeneration > interactive.helloGeneration) {
+        interactive = c;
+      }
+    }
+    const best = interactive ?? headless;
+    if (best) return best;
+    // Keep the machine-readable "no connected tab … Connected: none" phrase —
+    // the panel-tools transient classifier keys on it.
+    throw new Error(
+      `no connected tab with id "${tabId}". Connected: none — ${this.noPanelGuidance()}`,
+    );
+  }
+
+  /** #884 — the tab id the ACTIVE-tab (pin-bypassing) scope resolution picks
+   *  right now, or undefined when no tab is connected. Never throws. The
+   *  orchestrator's explicit-repin handler uses this — the whole point of that
+   *  recovery is to escape a dead/ambiguous pin, so it must not consult it. */
+  resolveActiveScopeTab(): string | undefined {
+    try {
+      return this.resolveScopeActive(SHARED_SESSION_SCOPE).tabId;
+    } catch {
+      return undefined;
+    }
   }
 
   /** The LIVE connection for a (possibly RETIRED) canonical tab id, scoped to the SOCKET

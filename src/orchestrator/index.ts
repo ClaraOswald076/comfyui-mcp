@@ -23,7 +23,7 @@ import { execFileSync } from "node:child_process";
 import { tmpdir, homedir, networkInterfaces } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import readline from "node:readline";
 import {
   startUiBridge,
@@ -1556,6 +1556,24 @@ export async function runPanelOrchestrator(): Promise<void> {
   // Value string = pinned tab; null = ambiguous origin (refuse); absent = no
   // turn in flight (active-tab resolution).
   const turnTargetTabByKey = new Map<string, string | null>();
+  // #884 P0 (confirming gate 2) — each conversation's LAST ESTABLISHED origin
+  // (the tab+uuid its most recent origin-bearing turn agreed on). Turns that
+  // dequeue with NO origin contribution of their own — a restart nudge, a
+  // coalesced download event, a pure re-queue — pin and stamp from THIS, never
+  // from "whatever tab is active": every entry point that can start a turn now
+  // acquires an origin. A conversation with no established origin at all pins
+  // `null` (loud refusal until an explicit target or the next origin-bearing
+  // message).
+  const lastOriginByKey = new Map<string, { tab: string; uuid: string | undefined }>();
+  // Origin for an orchestrator-side INJECTED turn (run errors, completions,
+  // ask answers, panel events): a synthetic mid rides the queue item so the
+  // dequeue fires onSeen and the injected turn pins/stamps like any user turn
+  // (a run error on tab A must pin A — confirming-gate 2, P0).
+  const mintInjectionOrigin = (originTab: string): string => {
+    const mid = `evt-${randomUUID()}`;
+    recordTurnUuidForMid(mid, tabCommandWorkflowUuid.get(originTab), originTab);
+    return mid;
+  };
   // Mids whose stamp was ALREADY applied at a previous dequeue — a re-queued
   // item (interrupt + send-now) fires onSeen again, and it must contribute
   // NOTHING to the new batch (its stamp is in force or superseded), while a
@@ -2345,24 +2363,47 @@ export async function runPanelOrchestrator(): Promise<void> {
         queueMicrotask(() => {
           pendingBatchStamp.delete(key);
           const distinct = new Set(closed.known);
-          if (closed.unknown || distinct.size > 1) {
-            lastTurnUuidByKey.set(key, undefined);
-            logger.warn(
-              `[panel-orchestrator] ${key} dispatched a mixed/unknown-origin batch — no single workflow stamp is honest for it, so graph mutations FAIL CLOSED until the agent opens/pins a workflow or the next single-origin message (#884)`,
-            );
-          } else if (distinct.size === 1) {
-            lastTurnUuidByKey.set(key, distinct.values().next().value);
-          }
-          // size 0 (all re-queued): the stamp already in force stands.
-          //
-          // TURN-TARGET PIN (confirming-gate P0): this turn's tool calls route
-          // to the tab the turn was ISSUED from — never re-resolved mid-turn.
-          // One origin tab pins it; mixed/unknown origins pin `null` (the
-          // bridge refuses loudly); all-requeued leaves the pin as-is.
           if (closed.unknown || closed.tabs.size > 1) {
+            // Mixed/unknown-TAB batch: no single stamp or target is honest for
+            // it — fail BOTH closed (the bridge refuses routing; the panel
+            // fence refuses mutations) until an explicit target
+            // (panel_set_workflow_target/open, the #716 refresh) or the next
+            // single-origin message. (A single tab whose uuid changed between
+            // messages keeps its ROUTING pin below — same surface — with the
+            // stamp failing closed on its own.)
+            lastTurnUuidByKey.set(key, undefined);
             turnTargetTabByKey.set(key, null);
+            logger.warn(
+              `[panel-orchestrator] ${key} dispatched a mixed/unknown-origin batch — no single workflow stamp/target is honest for it, so scope routing and graph mutations FAIL CLOSED until the agent opens/pins a workflow or the next single-origin message (#884)`,
+            );
           } else if (closed.tabs.size === 1) {
-            turnTargetTabByKey.set(key, closed.tabs.values().next().value as string);
+            // TURN-TARGET PIN (confirming-gate P0): this turn's tool calls
+            // route to the tab the turn was ISSUED from — never re-resolved
+            // mid-turn — and its mutations are fenced to that tab's issue-time
+            // workflow. This agreed origin becomes the conversation's LAST
+            // ESTABLISHED origin for origin-less turns that follow.
+            const tab = closed.tabs.values().next().value as string;
+            const uuid = distinct.size === 1 ? distinct.values().next().value : undefined;
+            lastTurnUuidByKey.set(key, uuid);
+            turnTargetTabByKey.set(key, tab);
+            lastOriginByKey.set(key, { tab, uuid });
+          } else {
+            // NO origin contribution (a pure re-queue, a restart nudge, a
+            // coalesced event with no per-tab origin): the turn inherits the
+            // conversation's LAST ESTABLISHED origin — NEVER "whatever tab is
+            // active", which is how a non-user turn mutated the wrong workflow
+            // (confirming-gate 2, P0). No established origin at all → refuse.
+            const last = lastOriginByKey.get(key);
+            if (last) {
+              lastTurnUuidByKey.set(key, last.uuid);
+              turnTargetTabByKey.set(key, last.tab);
+            } else {
+              lastTurnUuidByKey.set(key, undefined);
+              turnTargetTabByKey.set(key, null);
+              logger.warn(
+                `[panel-orchestrator] ${key} dispatched a turn with no origin and no established prior origin — scope routing FAILS CLOSED until an explicit target or an origin-bearing message (#884)`,
+              );
+            }
           }
         });
       }
@@ -2666,7 +2707,10 @@ export async function runPanelOrchestrator(): Promise<void> {
   function flushRunCompletions(panelTabId: string): void {
     const key = agentKeyFor(panelTabId);
     const { blockedOn } = RunCompletions.deliverPending(panelTabId, (payload, token) =>
-      manager.injectEvent(key, payload, { eventToken: token }),
+      // #884 P0 — the injected turn carries the completion's ORIGIN tab, so it
+      // pins/stamps there (show the render on the tab that ran it), never on
+      // whatever tab is active (confirming-gate 2).
+      manager.injectEvent(key, payload, { eventToken: token, mid: mintInjectionOrigin(panelTabId) }),
     );
     if (blockedOn) {
       logger.warn(
@@ -2692,7 +2736,8 @@ export async function runPanelOrchestrator(): Promise<void> {
   function flushAskAnswers(panelTabId: string): void {
     const key = agentKeyFor(panelTabId);
     const { blockedOn } = AskAnswers.deliverPending(panelTabId, (payload, token) =>
-      manager.injectEvent(key, payload, { eventToken: token }),
+      // #884 P0 — same origin ride as run completions (confirming-gate 2).
+      manager.injectEvent(key, payload, { eventToken: token, mid: mintInjectionOrigin(panelTabId) }),
     );
     if (blockedOn) {
       logger.warn(
@@ -2766,6 +2811,41 @@ export async function runPanelOrchestrator(): Promise<void> {
   bridge.setScopeTargetResolver((scopeId) => {
     const key = scopeAgentKeyOf(scopeId);
     return turnTargetTabByKey.has(key) ? turnTargetTabByKey.get(key)! : undefined;
+  });
+  // #884 P1 (confirming gate 2) — EXPLICIT recovery from a dead or ambiguous
+  // pin. The bridge's refusal names panel_set_workflow_target/panel_open_workflow
+  // as the way out; without this the pin was unchangeable for the rest of the
+  // turn and BOTH escape hatches no-op'd for a scope ctx, so the advertised
+  // recovery could not work. This is the ONLY path that rewrites an in-flight
+  // pin, and it requires the agent's explicit consent (mode:"current") — never
+  // a silent re-target, which is the P0 this whole change exists to prevent.
+  bridge.setScopeRepinHandler((scopeId) => {
+    const key = scopeAgentKeyOf(scopeId);
+    const tab = bridge.resolveActiveScopeTab();
+    if (!tab) return undefined;
+    turnTargetTabByKey.set(key, tab);
+    // Re-derive the fence from the tab we just adopted: a repin that left the
+    // OLD workflow's stamp in force would hand back a session whose very next
+    // mutation fails closed (or, worse, is fenced to a workflow the agent is no
+    // longer pointed at). Both move together or neither does.
+    const uuid = tabCommandWorkflowUuid.get(tab);
+    lastTurnUuidByKey.set(key, uuid);
+    lastOriginByKey.set(key, { tab, uuid });
+    logger.info(
+      `[panel-orchestrator] ${key} re-pinned onto ${tab.slice(0, 8)} by explicit target request (#884 recovery)`,
+    );
+    return tab;
+  });
+  // #884 P1 (confirming gate 2) — a hello whose `backend` is absent or unknown
+  // JOINS the default conversation, so its backend-qualified buffers must drain
+  // to it too. Matching on the raw string alone stranded that tab's mailbox
+  // (offline show_media never arriving), which is silent output loss.
+  // Mirrors the hello handler's own mapping EXACTLY (lowercase, then unknown or
+  // absent → defaultBackend); if these two ever disagree, a tab joins one
+  // conversation and drains another's buffers.
+  bridge.setHelloBackendNormalizer((raw) => {
+    const named = typeof raw === "string" ? raw.toLowerCase() : undefined;
+    return named && KNOWN_BACKENDS.has(named) ? named : defaultBackend;
   });
   bridge.setTabWorkflowUuidResolver(
     (tabId) => {
@@ -4369,7 +4449,13 @@ export async function runPanelOrchestrator(): Promise<void> {
       // look at me") so the agent stops and fixes it instead of running blind.
       // Everything else (e.g. a finished render's images) is enqueued normally.
       if (ev.kind === "run_error") {
-        void manager.injectRunError(agentKeyFor(event.tab_id), ev.error ?? "unknown error");
+        // #884 P0 (confirming-gate 2) — the error-handling turn PINS to the
+        // ERRORING workflow's tab: "diagnose and fix it" must edit the graph
+        // that failed, never whichever tab was last active. This was the P0's
+        // exact sequence — a render error on A silently editing B.
+        void manager.injectRunError(agentKeyFor(event.tab_id), ev.error ?? "unknown error", {
+          mid: mintInjectionOrigin(event.tab_id),
+        });
         logger.info(`[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} run_error → agent (interrupt)`);
         return;
       }
@@ -4396,7 +4482,10 @@ export async function runPanelOrchestrator(): Promise<void> {
         flushRunCompletions(event.tab_id);
         return;
       }
-      const delivered = manager.injectEvent(agentKeyFor(event.tab_id), evForTab);
+      const delivered = manager.injectEvent(agentKeyFor(event.tab_id), evForTab, {
+        // #884 P0 — panel events pin their originating tab (confirming-gate 2).
+        mid: mintInjectionOrigin(event.tab_id),
+      });
       if (delivered) {
         logger.info(`[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} event → agent: ${event.kind}`);
       }
@@ -4552,10 +4641,15 @@ export async function runPanelOrchestrator(): Promise<void> {
       const tabId = event.tab_id;
       const sid = typeof event.session_id === "string" ? event.session_id : undefined;
       const key = agentKeyFor(tabId);
-      // A failed durable clear is benign HERE: within this process the
-      // in-memory store is cleared and setResume below arms the chosen id; the
-      // resumed conversation re-persists on its first onSession.
-      manager.reset(key);
+      // #884 P1 (codex confirming gate 2) — a failed durable clear is NOT benign
+      // here, which is what the previous comment claimed. In-process the arming
+      // below wins, but the chosen id lives only in memory until the resumed
+      // conversation's first `onSession`; if the process exits inside that
+      // window the stale on-disk entry survives and OUTRANKS the pending hint on
+      // restart, resuming the very conversation the user switched away from.
+      // Closing the window rather than disclosing it: persist the user's choice
+      // immediately, so disk agrees with intent from this instant on.
+      const { durableCleared: clearedDurably } = manager.reset(key);
       // The replaced conversation's issue-time stamp and turn pin die with it.
       lastTurnUuidByKey.delete(key);
       turnTargetTabByKey.delete(key);
@@ -4569,7 +4663,17 @@ export async function runPanelOrchestrator(): Promise<void> {
         AskAnswers.closeAsks(t);
       }
       if (sid) manager.setResume(key, sid);
-      bridge.push({ type: "ack", ok: true, kind: "resume_session" }, tabId);
+      // Persist the selection NOW (not at first onSession) so a restart inside
+      // that window resumes what the user picked. When the store itself can't
+      // write, say so on the ack rather than reporting a clean switch — the
+      // false-success class this gate exists to catch.
+      const durable = sid ? sessionStore.set(key, sid) : clearedDurably;
+      if (!durable) {
+        logger.warn(
+          `[panel-orchestrator] ${key} resume_session could not be persisted — a restart before the resumed conversation's first session event may reopen the previous conversation (#884)`,
+        );
+      }
+      bridge.push({ type: "ack", ok: true, kind: "resume_session", durable }, tabId);
       bridge.broadcastTabList(); // live agent dropped → refresh mirror pickers
       return;
     }
@@ -5122,6 +5226,10 @@ export async function runPanelOrchestrator(): Promise<void> {
       // a queued terminal cancelled by a newer live attempt. Don't fire an empty
       // "download_done" turn in that case.
       if (settled.length === 0) continue;
+      // #884 — deliberately NO origin mid here: a download has no originating
+      // TAB (its row names the owning conversation), so the turn inherits the
+      // conversation's LAST ESTABLISHED origin at batch close — never the
+      // active tab (confirming-gate 2, P0 rule: every turn has an origin).
       manager.injectEvent(key, { kind: "download_done", downloads: settled });
     }
     // MCP-child control channel (#269): runpod_* tools that ran in spawned

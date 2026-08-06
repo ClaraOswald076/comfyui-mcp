@@ -202,6 +202,43 @@ describe("SessionStore", () => {
       expect(new SessionStore(PORT, { dir }).get(key)).toBe("sess-newest");
     });
 
+    // Confirming gate 2, P1: both set() and clear() had an in-memory shortcut
+    // that answered `true` WITHOUT touching disk. After an earlier write
+    // failure that answer is a lie — the shortcut describes RAM while the
+    // stale file survives a restart. These pin the honest answer.
+    it("a REPEATED set after a failed write does not claim durability it never achieved", () => {
+      const dir = scratchDir();
+      const key = sharedAgentKey("claude");
+      const store = new SessionStore(PORT, { dir });
+      blockTmp(dir);
+      expect(store.set(key, "sess-x")).toBe(false); // write failed, reported
+      // Same id again, well inside the 1h timestamp-skip window: the shortcut
+      // used to return true here, so New chat looked clean and the next
+      // restart resurrected the old conversation anyway.
+      expect(store.set(key, "sess-x")).toBe(false);
+      // …and once the filesystem recovers, the retry actually repairs the store.
+      rmSync(`${fileFor(dir)}.tmp`, { recursive: true, force: true });
+      expect(store.set(key, "sess-x")).toBe(true);
+      expect(new SessionStore(PORT, { dir }).get(key)).toBe("sess-x");
+    });
+
+    it("a SECOND clear after a failed clear still reports the stale on-disk entry", () => {
+      const dir = scratchDir();
+      const key = sharedAgentKey("claude");
+      const store = new SessionStore(PORT, { dir });
+      expect(store.set(key, "sess-1")).toBe(true);
+      blockTmp(dir);
+      expect(store.clear(key)).toBe(false);
+      // The key is already gone from memory, so the old `!(key in sessions)`
+      // shortcut returned true — a clean-looking New chat over a live stale
+      // entry. It must stay false while the file still holds it.
+      expect(store.clear(key)).toBe(false);
+      rmSync(`${fileFor(dir)}.tmp`, { recursive: true, force: true });
+      // Filesystem back: the retry clears disk for real, and now it IS durable.
+      expect(store.clear(key)).toBe(true);
+      expect(new SessionStore(PORT, { dir }).get(key)).toBeUndefined();
+    });
+
     it("a CORRUPT leftover .tmp (crash mid-write) falls back to the main file", () => {
       const dir = scratchDir();
       const key = sharedAgentKey("claude");

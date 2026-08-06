@@ -94,6 +94,11 @@ export class SessionStore {
   /** The pre-#884 tmpdir location — read once for the location migration. */
   private readonly legacyPath: string;
   private sessions: Record<string, Entry>;
+  /** #884 P1 (codex confirming gate 2) — TRUE when the in-memory state is known
+   *  NOT to be on disk, i.e. a write failed and was reported. Every path that
+   *  would otherwise take an in-memory shortcut and answer `true` consults this
+   *  first, so a durability claim always describes the DISK, never just RAM. */
+  private undurable = false;
 
   constructor(port: number, opts: { dir?: string } = {}) {
     // #866 — guard at the WRITE, not per-test: this store lives in the user's
@@ -249,8 +254,10 @@ export class SessionStore {
     try {
       writeFileSync(tmp, payload);
       renameSync(tmp, this.path);
+      this.undurable = false;
       return true;
     } catch (err) {
+      this.undurable = true;
       const tmpHoldsState = ((): boolean => {
         try {
           return existsSync(tmp) && readFileSync(tmp, "utf8") === payload;
@@ -353,8 +360,11 @@ export class SessionStore {
     const existing = this.sessions[key];
     if (existing?.s === sessionId && existing.u === u) {
       // Same id — refresh the timestamp so an active session never GCs out, but
-      // skip the disk write when the timestamp is already recent.
-      if (this.now() - existing.t < 60 * 60 * 1000) return true;
+      // skip the disk write when the timestamp is already recent. NOT a blanket
+      // `true`: if an earlier write failed, this state has never reached disk,
+      // and the shortcut would report a durability we never achieved (codex
+      // confirming-gate 2, P1). Retry the write instead and answer honestly.
+      if (this.now() - existing.t < 60 * 60 * 1000) return this.settled();
     }
     const entry: Entry = { s: sessionId, t: this.now() };
     if (u) entry.u = u;
@@ -370,8 +380,21 @@ export class SessionStore {
    *  disclose that instead of reporting a clean New chat (codex
    *  confirming-gate P1). */
   clear(key: string): boolean {
-    if (!(key in this.sessions)) return true;
+    // Absent in memory does NOT mean absent on disk. After a failed clear the
+    // entry is already gone from memory, so a naive `true` here let the SECOND
+    // New chat report a clean durable clear while the stale on-disk entry sat
+    // there waiting to resurrect the conversation on the next restart (codex
+    // confirming-gate 2, P1). Retry the write and report what actually happened.
+    if (!(key in this.sessions)) return this.settled();
     delete this.sessions[key];
     return this.flush();
+  }
+
+  /** Durability of the CURRENT in-memory state when a caller took an in-memory
+   *  shortcut (nothing to change). Clean → already on disk. Otherwise a prior
+   *  write failed, so retry it now: that both repairs the store the moment the
+   *  filesystem recovers and keeps the answer honest while it hasn't. */
+  private settled(): boolean {
+    return this.undurable ? this.flush() : true;
   }
 }

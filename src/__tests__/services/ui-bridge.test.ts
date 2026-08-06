@@ -1121,6 +1121,67 @@ describe("UiBridge (multi-tab)", () => {
       b.close();
     });
 
+    it("the EXPLICIT repin escapes a dead pin — the recovery the refusal advertises actually works (confirming-gate 2, P1)", async () => {
+      const a = await connectPanel("wf:workflows/a.json", "a");
+      const b = await connectPanel("wf:workflows/b.json", "b");
+      autoReply(a, "tab-a");
+      autoReply(b, "tab-b");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+
+      // A turn pinned to a tab that is now GONE: every scope-addressed call
+      // refuses, and the refusal names panel_set_workflow_target as the way out.
+      let pin: string | null | undefined = "wf:workflows/gone.json";
+      bridge.setScopeTargetResolver(() => pin);
+      await expect(
+        bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE }),
+      ).rejects.toThrow(/no connected tab/);
+
+      // That tool's handler calls repinScopeToActive. Before this fix the scope
+      // branch no-op'd, so the pin never moved and the advertised recovery was
+      // a dead end for the rest of the turn.
+      bridge.setScopeRepinHandler(() => {
+        const tab = bridge.resolveActiveScopeTab();
+        if (tab) pin = tab; // the orchestrator's handler rewrites the pin
+        return tab;
+      });
+      const repinned = bridge.repinScopeToActive(SHARED_SESSION_SCOPE);
+      expect(repinned).toBeDefined();
+
+      // …and the SAME turn can now reach the panel again.
+      const after = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
+      expect(after).toMatchObject({ from: expect.stringMatching(/^tab-/) });
+      a.close();
+      b.close();
+    });
+
+    it("a hello that OMITS backend still drains the default conversation's mailbox (confirming-gate 2, P1)", async () => {
+      // Offline show_media buffers under the BACKEND-QUALIFIED scope address.
+      const qualified = `${SHARED_SESSION_SCOPE}::claude`;
+      const res = await bridge.send(
+        { cmd: "show_media", items: [{ url: "/view?x=1" }] },
+        { tabId: qualified },
+      );
+      expect(res).toMatchObject({ mailboxed: true });
+
+      // The tab hellos WITHOUT a backend field. The orchestrator maps absent →
+      // default ("claude"), so it JOINS that conversation — and must therefore
+      // drain its mailbox. Matching the raw string alone stranded it here, and
+      // the media silently never arrived.
+      bridge.setHelloBackendNormalizer((raw) =>
+        typeof raw === "string" && raw ? raw.toLowerCase() : "claude",
+      );
+      // Open the socket and start listening BEFORE the hello — the drain happens
+      // during hello processing, so a listener attached afterwards misses it.
+      const tab = await connectPanel();
+      const got: Array<Record<string, unknown>> = [];
+      tab.on("message", (buf) => got.push(JSON.parse(buf.toString())));
+      tab.send(JSON.stringify({ type: "hello", tab_id: "wf:workflows/a.json", title: "a" }));
+      await vi.waitFor(() => {
+        expect(got.find((m) => m.cmd === "show_media")).toMatchObject({ mailbox: true });
+      });
+      tab.close();
+    });
+
     it("a pinned turn FOLLOWS its own tab's same-socket migration, and REFUSES when the tab is gone or ambiguous", async () => {
       const a = await connectPanel("wf:workflows/a.json", "a");
       const b = await connectPanel("wf:workflows/b.json", "b");
