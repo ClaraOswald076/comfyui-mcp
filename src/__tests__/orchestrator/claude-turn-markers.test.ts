@@ -15,7 +15,15 @@
 // are collected and asserted on.
 
 import { describe, expect, it, beforeEach, vi } from "vitest";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentEvent } from "../../orchestrator/agent-backend.js";
+
+// Keep the durable turn registry (#886) hermetic per test file — the backend
+// writes it on every submission, and the fixed INIT session id would otherwise
+// share one real-tmpdir file across files.
+process.env.COMFYUI_MCP_TURN_REGISTRY_DIR = mkdtempSync(join(tmpdir(), "claude-turn-markers-registry-"));
 
 const hoisted = vi.hoisted(() => ({
   /** A push-based async message source — stands in for the live SDK query stream. */
