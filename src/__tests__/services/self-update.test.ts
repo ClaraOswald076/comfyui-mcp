@@ -587,6 +587,30 @@ describe("#912 — Windows global/local: EBUSY on the orchestrator's OWN sharp D
     expect(res.note).toContain("EBUSY: resource busy or locked");
   });
 
+  it("a lock error ANYWHERE in npm's output still classifies as locked (not just the last 8 lines)", async () => {
+    // The display tail is the last 8 lines — but the classification must read
+    // the FULL capture (codex gate): an EBUSY high in a long log, buried under
+    // trailing diagnostics, is still a locked-files failure.
+    const longLog = [
+      "npm error code EBUSY",
+      "npm error EBUSY: resource busy or locked, copyfile",
+      ...Array.from({ length: 30 }, (_, i) => `npm error diagnostic line ${i + 1}`),
+    ].join("\n");
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: longLog,
+      platform: "win32",
+      scheduleOk: true,
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("scheduled");
+    expect(res.reason).toBe("locked-by-running-process");
+    expect(h.scheduleCalls).toHaveLength(1);
+  });
+
   it("a NON-lock npm failure on win32 is NOT scheduled (a 404 won't heal by waiting)", async () => {
     const h = makeDeps({
       packageDir: GLOBAL_DIR,
@@ -656,17 +680,23 @@ describe("#912 — the deferred helper script itself", () => {
     expect(s).toContain(`& npm.cmd i -g ${PACKAGE_NAME}@latest --no-audit --no-fund *>> $log`);
     expect(s).toContain("Remove-Item -LiteralPath $MyInvocation.MyCommand.Path");
     expect(s).toContain(`$log = '${LOG}'`);
-    expect(s).not.toContain("Set-Location");
+    expect(s).toContain("$cwd = ''"); // global: npm -g has no cwd dependence
   });
 
-  it("local: runs npm in the project root, no -g", () => {
+  it("local: runs npm in the project root, no -g, and the root is re-validated before every attempt", () => {
     const s = buildDeferredUpdateScript(
       { mode: "local", projectRoot: "C:\\proj", packageDir: LOCAL_DIR, to: "0.20.0" },
       LOG,
     );
-    expect(s).toContain("Set-Location -LiteralPath 'C:\\proj'");
+    expect(s).toContain("$cwd = 'C:\\proj'");
+    expect(s).toContain("Set-Location -LiteralPath $cwd -ErrorAction Stop");
     expect(s).toContain(`& npm.cmd i ${PACKAGE_NAME}@latest --no-audit --no-fund *>> $log`);
     expect(s).not.toContain("i -g");
+    // A vanished/moved project root aborts the helper WITHOUT running npm in
+    // whatever directory it inherited — and the guard sits before the npm line.
+    expect(s).toContain("ABORTED without running npm");
+    expect(s).toContain("Test-Path -LiteralPath $cwd -PathType Container");
+    expect(s.indexOf("Test-Path -LiteralPath $cwd")).toBeLessThan(s.indexOf("& npm.cmd"));
   });
 
   it("single quotes in paths are escaped (PowerShell literal doubling)", () => {
@@ -674,7 +704,7 @@ describe("#912 — the deferred helper script itself", () => {
       { mode: "local", projectRoot: "C:\\it's here", packageDir: LOCAL_DIR, to: "0.20.0" },
       LOG,
     );
-    expect(s).toContain("Set-Location -LiteralPath 'C:\\it''s here'");
+    expect(s).toContain("$cwd = 'C:\\it''s here'");
   });
 
   it("the generated script parses as valid PowerShell (validated on Windows hosts only)", () => {

@@ -27,7 +27,7 @@
 // stopped; the result is honestly reported as "scheduled", never "updated",
 // and npm's own error output travels in the note either way (#912/#916-a).
 
-import { existsSync, lstatSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { execFile, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -159,9 +159,18 @@ export interface DeferredUpdateOpts {
   to: string;
 }
 
-/** Where the helper writes its script and its log (named in user-facing notes). */
-const HELPER_SCRIPT_NAME = "comfyui-mcp-self-update.ps1";
+/** Where the helper writes its log (named in user-facing notes). */
 const HELPER_LOG_NAME = "comfyui-mcp-self-update.log";
+/**
+ * Helper scripts are named UNIQUELY per launch (`…-<pid>-<ms>.ps1`): a shared
+ * fixed name let two orchestrators stat-miss the same path and each spawn a
+ * helper running the OTHER caller's freshly-overwritten script — for a local
+ * install that is `npm i` in the wrong project (codex gate r1).
+ */
+const HELPER_SCRIPT_RE = /^comfyui-mcp-self-update-.+\.ps1$/;
+
+/** Once per process: the auto-update tick must not pile up helpers. */
+let helperScheduledThisProcess = false;
 
 /**
  * Per-wait budget inside the helper, and the staleness window for the dedupe
@@ -206,15 +215,17 @@ export function buildDeferredUpdateScript(opts: DeferredUpdateOpts, logPath: str
     opts.mode === "global"
       ? `i -g ${PACKAGE_NAME}@latest --no-audit --no-fund`
       : `i ${PACKAGE_NAME}@latest --no-audit --no-fund`;
-  const cwdLine =
-    opts.mode === "local" && opts.projectRoot
-      ? `Set-Location -LiteralPath ${psLiteral(opts.projectRoot)}`
-      : "";
+  // Local installs run npm IN the project root — re-validated immediately before
+  // EVERY attempt: the helper can wait hours, and a project moved meanwhile must
+  // abort the helper, never let npm run in whatever directory it inherited
+  // (codex gate r1). Empty for global installs (npm -g has no cwd dependence).
+  const cwd = opts.mode === "local" && opts.projectRoot ? opts.projectRoot : "";
   return [
     `# comfyui-mcp deferred self-update helper (#912). Log: ${logPath}`,
     `$ErrorActionPreference = 'Continue'`,
     `$log = ${psLiteral(logPath)}`,
     `$dll = ${psLiteral(dll)}`,
+    `$cwd = ${psLiteral(cwd)}`,
     `function Wait-LockFree {`,
     `  $deadline = (Get-Date).AddMinutes(${HELPER_WAIT_CAP_MINUTES})`,
     `  while ((Get-Date) -lt $deadline) {`,
@@ -228,17 +239,27 @@ export function buildDeferredUpdateScript(opts: DeferredUpdateOpts, logPath: str
     `  return $false`,
     `}`,
     `"$(Get-Date -Format o) helper started (mode=${opts.mode}, target=${opts.to})" | Out-File -Append -LiteralPath $log`,
-    cwdLine,
     `$ok = $false`,
-    `for ($i = 0; $i -lt ${HELPER_ATTEMPTS} -and -not $ok; $i++) {`,
+    `$aborted = ''`,
+    `for ($i = 0; $i -lt ${HELPER_ATTEMPTS} -and -not $ok -and -not $aborted; $i++) {`,
     `  if (-not (Wait-LockFree)) {`,
-    `    "$(Get-Date -Format o) gave up: the sharp DLL stayed locked" | Out-File -Append -LiteralPath $log`,
-    `    break`,
+    `    $aborted = 'the sharp DLL stayed locked'`,
+    `  } elseif ($cwd -and -not (Test-Path -LiteralPath $cwd -PathType Container)) {`,
+    `    $aborted = "the project root $cwd no longer exists"`,
+    `  } elseif ($cwd) {`,
+    `    try { Set-Location -LiteralPath $cwd -ErrorAction Stop } catch {`,
+    `      $aborted = "could not enter the project root $cwd ($($_.Exception.Message))"`,
+    `    }`,
     `  }`,
+    `  if ($aborted) { break }`,
     `  & npm.cmd ${npmArgs} *>> $log`,
     `  if ($LASTEXITCODE -eq 0) { $ok = $true } else { Start-Sleep -Seconds 10 }`,
     `}`,
-    `"$(Get-Date -Format o) npm update $(if ($ok) { 'SUCCEEDED' } else { 'FAILED' })" | Out-File -Append -LiteralPath $log`,
+    `if ($aborted) {`,
+    `  "$(Get-Date -Format o) ABORTED without running npm: $aborted" | Out-File -Append -LiteralPath $log`,
+    `} else {`,
+    `  "$(Get-Date -Format o) npm update $(if ($ok) { 'SUCCEEDED' } else { 'FAILED' })" | Out-File -Append -LiteralPath $log`,
+    `}`,
     `Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue`,
     ``,
   ]
@@ -250,23 +271,32 @@ export function buildDeferredUpdateScript(opts: DeferredUpdateOpts, logPath: str
  * Launch the detached helper. Resolves true only when the script was written
  * AND powershell actually spawned — a false here must surface as "not
  * scheduled", never as a claimed scheduled update. Never throws.
+ *
+ * Dedupe: once per process (the auto-update tick), and cross-process by
+ * helper-script freshness — a script younger than the staleness window is a
+ * helper still waiting/working (or one that died mid-wait; its log says
+ * which), so a second is not stacked. Stale leftovers from killed helpers are
+ * our own artifacts and are cleaned up as they are found.
  */
 async function defaultScheduleDeferredUpdate(opts: DeferredUpdateOpts): Promise<boolean> {
   if (process.platform !== "win32") return false;
   try {
-    const scriptPath = join(tmpdir(), HELPER_SCRIPT_NAME);
-    const logPath = join(tmpdir(), HELPER_LOG_NAME);
-    // Dedupe: a fresh script means a helper is still waiting/working (or died
-    // mid-wait — its log says which). Either way the update is already in
-    // flight and stacking another npm on the same prefix helps nothing.
-    try {
-      const st = statSync(scriptPath);
-      if (Date.now() - st.mtimeMs < HELPER_STALE_MS) return true;
-    } catch {
-      /* no script yet → schedule below */
+    const dir = tmpdir();
+    const logPath = join(dir, HELPER_LOG_NAME);
+    if (helperScheduledThisProcess) return true;
+    for (const name of readdirSync(dir)) {
+      if (!HELPER_SCRIPT_RE.test(name)) continue;
+      try {
+        const st = statSync(join(dir, name));
+        if (Date.now() - st.mtimeMs < HELPER_STALE_MS) return true; // already scheduled
+        unlinkSync(join(dir, name)); // stale leftover from a killed helper
+      } catch {
+        /* vanished between listing and stat — fine */
+      }
     }
+    const scriptPath = join(dir, `comfyui-mcp-self-update-${process.pid}-${Date.now()}.ps1`);
     writeFileSync(scriptPath, buildDeferredUpdateScript(opts, logPath), "utf-8");
-    return await new Promise<boolean>((resolveP) => {
+    const spawned = await new Promise<boolean>((resolveP) => {
       const child = spawn(
         "powershell.exe",
         ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
@@ -278,6 +308,18 @@ async function defaultScheduleDeferredUpdate(opts: DeferredUpdateOpts): Promise<
         resolveP(true);
       });
     });
+    // A spawn failure leaves the script behind; remove it so the dedupe scan
+    // does not read it as a pending helper.
+    if (!spawned) {
+      try {
+        unlinkSync(scriptPath);
+      } catch {
+        /* best effort */
+      }
+      return false;
+    }
+    helperScheduledThisProcess = true;
+    return true;
   } catch {
     return false;
   }
@@ -545,6 +587,8 @@ function npmInstallArgs(mode: "global" | "local"): string[] {
  * The last few lines of npm's output, trimmed and capped so a tool result stays
  * readable. stderr is preferred (npm writes its `npm error code …` block there);
  * stdout is the fallback for a failure that logged nothing to stderr.
+ * DISPLAY ONLY — classification reads the FULL output (a lock error older than
+ * the last 8 lines must still classify, codex gate).
  */
 function npmOutputTail(res: { stdout?: string; stderr?: string }): string {
   const raw = String(res.stderr ?? "").trim() || String(res.stdout ?? "").trim();
@@ -592,7 +636,9 @@ async function applyNpmUpdate(
   }
 
   const tail = npmOutputTail(res);
-  const locked = NPM_LOCK_RE.test(tail);
+  // Classify on the FULL capture, not the display tail: the lock error can sit
+  // anywhere in npm's output (the tail is only the last few lines of stderr).
+  const locked = NPM_LOCK_RE.test(`${res.stderr ?? ""}\n${res.stdout ?? ""}`);
   const isWin = (deps.platform?.() ?? process.platform) === "win32";
   if (locked && isWin) {
     // The lock is held by THIS process, so no in-process retry can succeed.
