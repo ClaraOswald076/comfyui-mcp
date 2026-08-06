@@ -477,7 +477,11 @@ export function registerModelManagementTools(server: McpServer): void {
                 type: "text",
                 text:
                   `Download \`${args.id}\` was still listed as downloading from a previous session, but that session is confirmed GONE — its process no longer exists and its heartbeat had stopped — so there was no live transfer left to abort. ` +
-                  `The stale record has been closed as **cancelled**.\n\n` +
+                  `The stale record has been closed as **cancelled**.` +
+                  (res.staleRecordLeft
+                    ? ` The dead session's original record file could not be deleted (a transient filesystem error), so download_status may keep showing its stale row for a while — it no longer blocks cancelling or re-issuing, and it expires on its own.`
+                    : "") +
+                  `\n\n` +
                   (res.job?.viaManager
                     ? `It was a remote ComfyUI-Manager dispatch, so the host MAY still be fetching server-side (there is no Manager recall API) — check list_local_models to see whether the file landed. Re-issuing starts a NEW dispatch, not a resume.`
                     : `To get the file, re-issue the same download_model request: it resumes from any .partial the dead session left on disk, or restarts cleanly if there is none.`),

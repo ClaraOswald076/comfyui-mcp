@@ -1543,6 +1543,46 @@ describe("download job registry", () => {
         }
       });
 
+      it("reclaim DISCLOSES when the dead record file cannot be deleted — it never claims a clean close it did not observe", async () => {
+        const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
+        setProgressDir(dir);
+        const removeSpy = vi
+          .spyOn(progressModule, "removePersistedDownloadJobFor")
+          .mockReturnValue(false);
+        try {
+          const id = "deadundeletable858";
+          const owner = "dead-session";
+          await writeForeignJobRecord(dir, {
+            id,
+            trayId: "undeletabletray01",
+            progressId: "undeletable-prog",
+            url: URL_A,
+            owner,
+            ageMs: 10 * 60 * 1000,
+            pid: deadPid(),
+          });
+
+          const res = cancelDownloadJob(id);
+          // The terminal record is durable, so the reclaim DID happen…
+          expect(res.reclaimed).toBe(true);
+          // …but the leftover is REPORTED, not hidden behind a success claim.
+          expect(res.staleRecordLeft).toBe(true);
+          // And the state really is what was reported: our cancelled record is
+          // durable; the dead record file is (simulated) still present.
+          const ours = JSON.parse(
+            await readFile(pathJoin(dir, `control-job-${id}-${PERSIST_OWNER}.json`), "utf8"),
+          );
+          expect(ours.status).toBe("cancelled");
+          await expect(
+            readFile(pathJoin(dir, `control-job-${id}-${owner}.json`), "utf8"),
+          ).resolves.toContain(id);
+        } finally {
+          removeSpy.mockRestore();
+          setProgressDir("");
+          await fsRm(dir, { recursive: true, force: true });
+        }
+      });
+
       it("reclaim does NOT clear a row id a live download shares via TRAY id when its progress id differs", async () => {
         // The inverse shape of the test above: the live download's rows are keyed
         // by a DIFFERENT progress id (query-auth/rewrite), but it shares the dead

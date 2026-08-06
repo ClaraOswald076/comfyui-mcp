@@ -644,15 +644,24 @@ export function removePersistedDownloadJob(id: string): void {
  *  session's state: call it only for a record whose writer is PROVEN dead (see
  *  cancelDownloadJob), and only after the replacement terminal record is durable,
  *  so a failure here never leaves the download with no record at all.
- *  Best-effort. */
-export function removePersistedDownloadJobFor(id: string, owner: string): void {
+ *
+ *  Returns TRUE only when the file is gone. A transient Windows sharing violation
+ *  (a reader briefly holding the file) is retried, mirroring the persist rename;
+ *  a persistent failure is reported to the caller so it can DISCLOSE the leftover
+ *  instead of claiming a clean close it did not observe (codex gate, round 2). */
+export function removePersistedDownloadJobFor(id: string, owner: string): boolean {
   const dir = channelDir();
-  if (!dir || !owner) return;
-  try {
-    rmSync(join(dir, `${JOB_PREFIX}${sanitizeIdPart(id)}-${sanitizeIdPart(owner)}.json`), { force: true });
-  } catch {
-    // ignore
+  if (!dir || !owner) return false;
+  const path = join(dir, `${JOB_PREFIX}${sanitizeIdPart(id)}-${sanitizeIdPart(owner)}.json`);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      rmSync(path, { force: true });
+      return true;
+    } catch {
+      /* transient — retry */
+    }
   }
+  return false;
 }
 
 // A missed heartbeat is only a liveness hint, not proof the transfer stopped:

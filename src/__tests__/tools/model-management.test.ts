@@ -39,6 +39,7 @@ vi.mock("../../services/model-resolver.js", async () => {
 
 import { registerModelManagementTools } from "../../tools/model-management.js";
 import { setProgressDir } from "../../services/download-progress.js";
+import * as progressModule from "../../services/download-progress.js";
 import { spawnSync } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -520,6 +521,30 @@ describe("download_status tool", () => {
         expect(text).toContain("already **done** — nothing to cancel");
         expect(text).not.toContain("can't be aborted");
       } finally {
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("cancel_download DISCLOSES when the dead session's record file could not be deleted", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-858-"));
+      setProgressDir(dir);
+      const removeSpy = vi
+        .spyOn(progressModule, "removePersistedDownloadJobFor")
+        .mockReturnValue(false);
+      try {
+        const id = "stale-undeletable-858";
+        await seedStaleRecord(dir, id, { pid: deadPid() });
+
+        const { cancelDownload } = makeServer();
+        const text = (await cancelDownload({ id, tray_id: "staletray8580000" })).content[0].text;
+        // The reclaim happened (the terminal record is durable)…
+        expect(text).toContain("closed as **cancelled**");
+        // …but the leftover is disclosed, not hidden behind a clean-close claim.
+        expect(text).toContain("could not be deleted");
+        expect(text).toContain("no longer blocks cancelling or re-issuing");
+      } finally {
+        removeSpy.mockRestore();
         setProgressDir("");
         await rm(dir, { recursive: true, force: true });
       }

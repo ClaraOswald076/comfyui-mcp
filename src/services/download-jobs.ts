@@ -1244,7 +1244,14 @@ function writerProcessGone(rec: PersistedDownloadJob): boolean | undefined {
  */
 function reclaimDeadPersistedDownload(
   rec: PersistedDownloadJob,
-): { reclaimed: boolean; denied?: "owner-alive" | "owner-unknown" | "persist-failed" } {
+): {
+  reclaimed: boolean;
+  denied?: "owner-alive" | "owner-unknown" | "persist-failed";
+  /** The replacement terminal record is durable, but the dead owner's original
+   *  record file could not be deleted — the caller must DISCLOSE the leftover,
+   *  not claim a clean close (codex gate, round 2). */
+  staleRecordLeft?: boolean;
+} {
   const gone = writerProcessGone(rec);
   if (gone !== true) {
     return { reclaimed: false, denied: gone === false ? "owner-alive" : "owner-unknown" };
@@ -1259,7 +1266,7 @@ function reclaimDeadPersistedDownload(
     reclaimed_dead: true,
   });
   if (!durable) return { reclaimed: false, denied: "persist-failed" };
-  removePersistedDownloadJobFor(rec.id, rec.owner ?? "");
+  const removed = removePersistedDownloadJobFor(rec.id, rec.owner ?? "");
   // The dead writer's tray row would linger in the panel otherwise. Clear it
   // ONLY when no LIVE job — this process's in-flight entries or a FRESH foreign
   // record — could share it. Rows are keyed by the writer-reported progressId,
@@ -1287,7 +1294,7 @@ function reclaimDeadPersistedDownload(
       if (!liveRowIds.has(rowId)) clearDownloadProgress(rowId);
     }
   }
-  return { reclaimed: true };
+  return { reclaimed: true, staleRecordLeft: !removed };
 }
 
 /**
@@ -1323,6 +1330,10 @@ export function cancelDownloadJob(
   /** A stale foreign in-flight record whose writer was PROVEN gone was closed as
    *  cancelled (#858). No live transfer was aborted — there was none left. */
   reclaimed?: boolean;
+  /** The reclaim's terminal record is durable, but the dead owner's original
+   *  record file could not be deleted — disclose the leftover, don't claim a
+   *  clean close. */
+  staleRecordLeft?: boolean;
   /** Why a stale foreign record was NOT reclaimed: the owning process is still
    *  alive (the transfer may still be writing), its death cannot be proven from
    *  here (no writer identity on the record), or closing the record failed
@@ -1369,6 +1380,7 @@ export function cancelDownloadJob(
               owned: false,
               aborted: false,
               reclaimed: true,
+              staleRecordLeft: re.staleRecordLeft,
               status: "cancelled",
               job: { ...jobFromPersisted(rec), status: "cancelled", reclaimedDead: true },
             };
@@ -1464,6 +1476,7 @@ export function cancelDownloadJob(
           owned: false,
           aborted: false,
           reclaimed: true,
+          staleRecordLeft: re.staleRecordLeft,
           status: "cancelled",
           job: { ...jobFromPersisted(persisted), status: "cancelled", reclaimedDead: true },
         };
