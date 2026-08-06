@@ -111,6 +111,11 @@ export interface QueueSnapshot {
   lastCompleted: CompletionEvent | null;
   /** True when the in-flight work is attributable to THIS session (#559). */
   selfAttributed: boolean;
+  /** STRICT attribution for the panel_run duplicate fence (#862): true only
+   *  when every visible in-flight prompt id is one this session queued AND the
+   *  reported depth is fully accounted for — the coarse recent-self-queue
+   *  fallback never counts here. */
+  selfAttributedProven: boolean;
 }
 
 const RECONNECT_MS = 5000;
@@ -308,6 +313,29 @@ class QueueMonitorImpl {
     // No ids to match against (the panel never surfaced one) or nothing identifiable
     // in flight yet → fall back to the coarse recent-self-queue timestamp.
     return recentSelfQueue;
+  }
+
+  /** The STRICT form of isSelfAttributed, for the panel_run duplicate fence
+   *  (#862): true only when the in-flight work is PROVABLY this session's own —
+   *  every visible in-flight prompt id is one we queued AND the poll has fully
+   *  accounted for the reported depth. The coarse recent-self-queue timestamp
+   *  fallback NEVER proves attribution here: it shows this session queued
+   *  SOMETHING recently, not that the work in flight is it, and a fence that
+   *  refuses a dispatch needs a stronger warrant than a backlog warning does
+   *  (codex gate: under the fallback, an unrelated render appearing inside the
+   *  10-minute window would have sailed past the fence). The cost is deliberate:
+   *  a rapid self-queued burst whose ids the 1 Hz poll has not captured yet, or
+   *  a panel that returned no prompt_id, reads as unproven, and the run is
+   *  refused with the allow_duplicate override named — a false refusal with an
+   *  actionable remedy, never a silent duplicate. */
+  private isSelfAttributedProven(): boolean {
+    const inFlight: string[] = [];
+    if (this.state.runningPromptId) inFlight.push(this.state.runningPromptId);
+    inFlight.push(...this.state.pendingPromptIds);
+    if (this.selfQueuedIds.size === 0 || inFlight.length === 0) return false;
+    if (inFlight.some((id) => !this.selfQueuedIds.has(id))) return false;
+    const depth = Math.max(inFlight.length, Math.max(0, this.state.queueRemaining));
+    return inFlight.length >= depth;
   }
 
   stop(): void {
@@ -726,6 +754,7 @@ class QueueMonitorImpl {
       progressMax: this.state.progressMax,
       lastCompleted: this.state.lastCompleted,
       selfAttributed: this.isSelfAttributed(),
+      selfAttributedProven: this.isSelfAttributedProven(),
     };
   }
 

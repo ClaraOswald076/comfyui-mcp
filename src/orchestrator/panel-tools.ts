@@ -6481,24 +6481,32 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // reconnect the resumed agent has no running-state signal, and the old
         // order queued first and only THEN appended the "[QUEUE] already running"
         // note — a duplicate the agent then had to find and cancel. When in-flight
-        // work is NOT attributable to this session, refuse to enqueue: name what
-        // is in flight and require an explicit allow_duplicate to stack behind it.
-        // "Not attributable" is the honest phrasing, not "foreign": the self-queue
-        // ledger is in-memory and does not survive an orchestrator restart, so the
-        // agent's OWN earlier render reads as unaccounted-for after a reconnect —
-        // which is exactly the duplicate this fence exists to stop. A
-        // self-attributed in-flight batch (a deliberate sweep, #559) still queues,
-        // exactly as before; an unconnected watchdog proves nothing either way, so
-        // the call proceeds and the post-queue note remains the disclosure of last
-        // resort (and the TOCTOU net: work can start between this snapshot and the
-        // dispatch). This composes with #694's retry_of rather than duplicating
-        // it: that token dedupes an EXPLICIT retry of an outcome-unknown dispatch
-        // at the panel; this fence stops a BLIND re-issue before any dispatch.
+        // work is not PROVABLY this session's own, refuse to enqueue: name what
+        // is in flight and require an explicit allow_duplicate to stack behind
+        // it. "Not provably ours" is the honest phrasing, not "foreign": the
+        // self-queue ledger is in-memory and prompt-id-based, so after an
+        // orchestrator restart — or whenever the panel's queue reply carried no
+        // prompt id — the agent's OWN earlier render reads as unproven, which is
+        // exactly the duplicate this fence exists to stop. The fence therefore
+        // keys on selfAttributedProven, the strict id-matched form; the coarse
+        // recent-self-queue fallback that softens the #559 backlog warning would
+        // also wave an unrelated render through (codex gate). The deliberate cost:
+        // a fast self-queued burst whose ids the 1 Hz poll has not captured yet
+        // is refused too, with the override named — a false refusal with an
+        // actionable remedy, never a silent duplicate. A provably self-attributed
+        // in-flight batch (a sweep whose ids are recorded and accounted for)
+        // still queues, exactly as before; an unconnected watchdog proves nothing
+        // either way, so the call proceeds and the post-queue note remains the
+        // disclosure of last resort (and the TOCTOU net: work can start between
+        // this snapshot and the dispatch). This composes with #694's retry_of
+        // rather than duplicating it: that token dedupes an EXPLICIT retry of an
+        // outcome-unknown dispatch at the panel; this fence stops a BLIND
+        // re-issue before any dispatch.
         if (
           args.allow_duplicate !== true &&
           pre.connected &&
           (pre.running || pre.queueDepth > 0) &&
-          !pre.selfAttributed
+          !pre.selfAttributedProven
         ) {
           const pending = Math.max(0, pre.queueDepth - (pre.running ? 1 : 0));
           const pendingTxt = pending > 0 ? ` + ${pending} pending` : "";
@@ -6507,15 +6515,15 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               (pre.runningPromptId
                 ? ` (running prompt ${pre.runningPromptId}${pre.currentNode ? `, currently at node ${pre.currentNode}` : ""}${pendingTxt})`
                 : ` (${pre.queueDepth} job(s) in the queue)`) +
-              `, and this session has NO record of having queued it. That record is in-memory and ` +
-              `does not survive a reconnect/restart — so after a reconnect this is very likely YOUR ` +
-              `earlier render still running, and queueing now would stack a DUPLICATE behind it ` +
-              `(#862). Nothing was queued. Inspect with queue (action:"list"): if the in-flight job ` +
-              `is the render you already started, wait for it and confirm the outcome with ` +
-              `get_history instead of re-running it. If you genuinely intend to stack another render ` +
-              `behind it (a deliberate sweep/batch), re-call panel_run with allow_duplicate:true. If ` +
-              `the in-flight job is actually wedged, queue (action:"cancel") with clear_pending:true ` +
-              `interrupts it AND drops everything pending.`,
+              `, and this session cannot confirm it as its own — the queue record is in-memory and ` +
+              `prompt-id-based, so after a reconnect/restart (or when an earlier queue reply carried ` +
+              `no prompt id) even YOUR OWN earlier render reads as unconfirmable, and queueing now ` +
+              `would stack a DUPLICATE behind it (#862). Nothing was queued. Inspect with queue ` +
+              `(action:"list"): if the in-flight job is the render you already started, wait for it ` +
+              `and confirm the outcome with get_history instead of re-running it. If you genuinely ` +
+              `intend to stack another render behind it (a deliberate sweep/batch), re-call panel_run ` +
+              `with allow_duplicate:true. If the in-flight job is actually wedged, queue ` +
+              `(action:"cancel") with clear_pending:true interrupts it AND drops everything pending.`,
           );
         }
         const runCmd = { cmd: "graph_run", batch_count: args.batch_count, to_node_id: args.to_node_id };

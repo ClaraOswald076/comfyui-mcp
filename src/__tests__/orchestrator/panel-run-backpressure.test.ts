@@ -141,13 +141,57 @@ describe("panel_run backpressure note (#559)", () => {
     expect(text).toContain("refused to queue");
     expect(text).toContain("p-foreign"); // the running prompt id is returned
     expect(text).toContain("Nothing was queued");
-    // The reason is stated honestly: NO RECORD of queueing it — not "you didn't
-    // queue it" (the ledger does not survive a restart).
-    expect(text).toContain("NO record of having queued it");
+    // The reason is stated honestly: CANNOT CONFIRM it as this session's own —
+    // not "you didn't queue it" (the ledger does not survive a restart).
+    expect(text).toContain("cannot confirm it as its own");
     // Actionable remedies: inspect, deliberate override, wedge escape.
     expect(text).toContain('queue (action:"list")');
     expect(text).toContain("allow_duplicate:true");
     expect(text).toContain("clear_pending:true");
+  });
+
+  it("a RECENT self-queue with no recorded ids does NOT wave a foreign render through (strict attribution, #862 codex gate)", async () => {
+    // The coarse #559 fallback ("we queued SOMETHING in the last 10 minutes")
+    // would call this self-attributed — but the in-flight job's id is visible
+    // and is NOT ours. A fence that refuses dispatches needs the strict warrant.
+    QueueMonitor.markSelfQueued(null); // a queue whose reply carried no prompt_id
+    qm.state.runningPromptId = "p-foreign";
+    qm.state.queueRemaining = 1;
+
+    let dispatched = 0;
+    const ctx = makeCtx({ queued: true, prompt_id: "p-mine" });
+    (ctx as { call: PanelToolCtx["call"] }).call = async () => {
+      dispatched++;
+      return { content: [{ type: "text", text: "{}" }] };
+    };
+
+    const res = await defByName("panel_run").handler({}, ctx);
+    expect(dispatched).toBe(0);
+    expect(res.isError).toBe(true);
+    expect(firstText(res)).toContain("refused to queue");
+  });
+
+  it("an own batch whose depth the poll has NOT fully accounted for is refused — the documented burst tradeoff (#862)", async () => {
+    // We queued two jobs, but the 1 Hz poll has only captured one of them
+    // (queueRemaining is live; pendingPromptIds lags). Not PROVABLY ours → the
+    // fence refuses and names the override, rather than risk a blind duplicate.
+    QueueMonitor.markSelfQueued("p-own-1");
+    QueueMonitor.markSelfQueued("p-own-2");
+    qm.state.runningPromptId = "p-own-1";
+    qm.state.pendingPromptIds = []; // poll hasn't captured p-own-2 yet
+    qm.state.queueRemaining = 2;
+
+    let dispatched = 0;
+    const ctx = makeCtx({ queued: true, prompt_id: "p-own-3" });
+    (ctx as { call: PanelToolCtx["call"] }).call = async () => {
+      dispatched++;
+      return { content: [{ type: "text", text: "{}" }] };
+    };
+
+    const res = await defByName("panel_run").handler({}, ctx);
+    expect(dispatched).toBe(0);
+    expect(res.isError).toBe(true);
+    expect(firstText(res)).toContain("allow_duplicate:true");
   });
 
   it("unaccounted-for PENDING-only work (nothing running yet) → also refused (#862)", async () => {
