@@ -227,10 +227,34 @@ function mediaKind(ext: string): "image" | "video" {
  * video outputs — so a filesystem scan is the reliable way to confirm a finished
  * video render.
  */
-export async function listOutputImages(options?: {
+/** Where a listing came from, and what established it. */
+export interface OutputListingSource {
+  /** The directory that was actually scanned. Absent on the /history path,
+   *  which has no directory to name — it is a listing from the server's
+   *  in-memory history, not from disk. */
+  directory?: string;
+  /** How the answer was produced, so a caller never has to guess which. */
+  basis: "local-scan" | "server-history";
+}
+
+/**
+ * The listing PLUS where it came from.
+ *
+ * `listOutputImages` returns bare filenames, which forces any caller that needs
+ * the path to reconstruct it — and the obvious reconstruction (the workspace
+ * path from `install_comfyui (action:"environment")`) is WRONG on every install launched with
+ * `--output-directory`, in the silent way: the filenames look plausible against
+ * it, so a caller that does not stat them reports a directory holding nothing
+ * (#899, observed live).
+ *
+ * The directory is resolved exactly ONCE, here, and travels with the entries it
+ * describes. Resolving it a second time in the caller would be the same class of
+ * bug this fixes: two answers to one question, free to disagree.
+ */
+export async function listOutputMedia(options?: {
   limit?: number;
   pattern?: string;
-}): Promise<OutputImage[]> {
+}): Promise<{ images: OutputImage[]; source: OutputListingSource }> {
   const limit = options?.limit ?? 20;
   const pattern = options?.pattern?.toLowerCase();
 
@@ -248,7 +272,10 @@ export async function listOutputImages(options?: {
   // output directory holding the files the caller was asking about. A silent
   // wrong answer, not an error: the agent concludes the file does not exist.
   if (isRemoteMode()) {
-    return listOutputImagesFromHistory(limit, pattern);
+    return {
+      images: await listOutputImagesFromHistory(limit, pattern),
+      source: { basis: "server-history" },
+    };
   }
 
   // Local. `resolveOutputDir` already knows every way this path can be
@@ -262,7 +289,9 @@ export async function listOutputImages(options?: {
     // that there are no outputs. Falling back is right; reporting its emptiness
     // as an answer is not.
     const fromHistory = await listOutputImagesFromHistory(limit, pattern);
-    if (fromHistory.length > 0) return fromHistory;
+    if (fromHistory.length > 0) {
+      return { images: fromHistory, source: { basis: "server-history" } };
+    }
     throw new ComfyUIError(
       `Could not determine this ComfyUI's output directory (${err instanceof Error ? err.message : String(err)}), ` +
         `so the local output folder was never scanned. ComfyUI's /history was asked instead and ` +
@@ -347,7 +376,22 @@ export async function listOutputImages(options?: {
   // Sort newest first
   images.sort((a, b) => b.modified.localeCompare(a.modified));
 
-  return images.slice(0, limit);
+  return {
+    images: images.slice(0, limit),
+    source: { directory: outputDir, basis: "local-scan" },
+  };
+}
+
+/**
+ * Just the entries. Kept because most callers only want the list; anything that
+ * needs to SAY where the files are must use `listOutputMedia`, so the path it
+ * reports is the path that was scanned.
+ */
+export async function listOutputImages(options?: {
+  limit?: number;
+  pattern?: string;
+}): Promise<OutputImage[]> {
+  return (await listOutputMedia(options)).images;
 }
 
 /**
