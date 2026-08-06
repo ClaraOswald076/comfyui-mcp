@@ -1,4 +1,5 @@
-// #796 — resolve_missing_models folded a FAILED provider lookup into an empty
+// #796 — the missing-model resolver (download_model action:"resolve_missing")
+// folded a FAILED provider lookup into an empty
 // result and then asserted "No candidates found on CivitAI or HuggingFace —
 // try a different query": "could not look" narrated as "nothing exists",
 // with advice that blames the query. The message must state the failure.
@@ -28,20 +29,17 @@ vi.mock("../../services/model-resolver.js", () => ({
   },
 }));
 
-import { registerMissingModelTools } from "../../tools/missing-models.js";
+import { resolveMissingModelsAction } from "../../tools/missing-models.js";
 
-type Handler = (args: unknown) => Promise<{ content: Array<{ text: string }> }>;
+type Handler = (args: any) => Promise<{ content: Array<{ text?: unknown }> }>;
 
+/**
+ * 0.50.0 slice 11 retired the tool into download_model action:"resolve_missing".
+ * The HANDLER is unchanged, so this file calls it directly; dispatch and the
+ * `workflow` presence guard are covered in models-consolidated.test.ts.
+ */
 function captureHandler(): Handler {
-  let handler: Handler | undefined;
-  const fakeServer = {
-    tool: (_name: string, _desc: string, _schema: unknown, h: Handler) => {
-      handler = h;
-    },
-  };
-  registerMissingModelTools(fakeServer as never);
-  if (!handler) throw new Error("tool was not registered");
-  return handler;
+  return resolveMissingModelsAction;
 }
 
 const WORKFLOW = {
@@ -56,10 +54,10 @@ beforeEach(() => {
   providers.hfDown = true;
 });
 
-describe("resolve_missing_models never calls a failed lookup an empty one", () => {
+describe('action:"resolve_missing" never calls a failed lookup an empty one', () => {
   it("both providers down → 'could not look', NOT 'nothing exists'", async () => {
     const res = await captureHandler()({ workflow: WORKFLOW });
-    const text = res.content[0]!.text;
+    const text = res.content[0]!.text as string;
     expect(text).toMatch(/the lookup FAILED/);
     expect(text).toMatch(/could not look/);
     expect(text).not.toMatch(/No candidates found on CivitAI or HuggingFace/);
@@ -68,7 +66,7 @@ describe("resolve_missing_models never calls a failed lookup an empty one", () =
   it("one provider down with zero hits from the other → still not 'nothing exists'", async () => {
     providers.hfDown = false; // answers, but with nothing
     const res = await captureHandler()({ workflow: WORKFLOW });
-    const text = res.content[0]!.text;
+    const text = res.content[0]!.text as string;
     expect(text).toMatch(/the lookup FAILED \(CivitAI\)/);
     expect(text).not.toMatch(/No candidates found on CivitAI or HuggingFace/);
   });
@@ -77,7 +75,7 @@ describe("resolve_missing_models never calls a failed lookup an empty one", () =
     providers.civitaiDown = false;
     providers.hfDown = false;
     const res = await captureHandler()({ workflow: WORKFLOW });
-    const text = res.content[0]!.text;
+    const text = res.content[0]!.text as string;
     expect(text).toMatch(/No candidates found on CivitAI or HuggingFace/);
     expect(text).not.toMatch(/lookup FAILED/);
   });

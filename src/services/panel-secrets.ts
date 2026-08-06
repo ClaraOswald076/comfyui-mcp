@@ -3,7 +3,7 @@
 // The orchestrator spawns the comfyui MCP server (this build, in normal/stdio
 // mode) as a subprocess with a FIXED env it controls (COMFYUI_URL, progress dir,
 // COMFYUI_PATH…). Tool secrets the user supplies at runtime through the panel —
-// e.g. a CivitAI API token for download_civitai_model, a HuggingFace token for
+// e.g. a CivitAI API token for download_model action:"download_civitai", a HuggingFace token for
 // download_model — must reach THAT subprocess's env. They can't go into the
 // user's ~/.claude.json mcpServers map (user-mcp-config.ts), because that map is
 // for the user's OWN, inherited MCP servers; the built-in comfyui server doesn't
@@ -83,7 +83,7 @@ export interface OAuthStatusRecord {
 // clobber it. We therefore permit ONLY known credential vars the comfyui tools
 // read — both on SAVE (reject otherwise) and on LOAD (filter), so even a hand-
 // edited or corrupt panel-secrets.json can never inject anything else.
-//   CIVITAI_API_TOKEN  → download_civitai_model (config.civitaiApiToken)
+//   CIVITAI_API_TOKEN  → download_model action:"download_civitai" (config.civitaiApiToken)
 //   HUGGINGFACE_TOKEN  → HuggingFace downloads   (config.huggingfaceToken)
 //   HF_TOKEN           → HuggingFace alias some tooling/hub libs honor
 export const COMFYUI_SECRET_ENV_ALLOWLIST = [

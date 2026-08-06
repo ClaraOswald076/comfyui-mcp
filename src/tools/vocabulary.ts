@@ -46,10 +46,7 @@ export const TOOL_NAMES = [
   "queue",
   "search_custom_nodes",
   "get_node_pack_details",
-  "search_models",
   "download_model",
-  "download_status",
-  "cancel_download",
   "list_local_models",
   "get_logs",
   "get_history",
@@ -73,7 +70,6 @@ export const TOOL_NAMES = [
   "workflow_from_image",
   "list_output_images",
   "clear_vram",
-  "get_embeddings",
   "suggest_settings",
   "generation_stats",
   "view_image",
@@ -103,19 +99,11 @@ export const TOOL_NAMES = [
   "list_installed_nodes",
   "sync_node_dependencies",
   "report_issue",
-  "resolve_missing_models",
   "install_comfyui",
   "update_comfyui",
   "update_all",
-  "remove_model",
-  "search_civitai_models",
-  "search_civitai_creators",
-  "download_civitai_model",
   "model_metadata",
   "prompt_director_inspect",
-  "list_extra_paths",
-  "add_extra_path",
-  "remove_extra_path",
   "workspace",
   "get_environment",
   "list_api_nodes",
@@ -272,7 +260,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 115;
+export const MAX_TOOLS = 103;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;
@@ -1401,6 +1389,85 @@ export const DEAD_NAMES: readonly DeadName[] = [
         why: "Same seven-tool list in the dated sequel post; the other three names on this line survive the fold, so only this one needs the exemption.",
       },
     ],
+  },
+  // ── 0.50.0 slice 11: models ───────────────────────────────────────────────
+  // The fourteen model tools folded into two action-parameterized survivors:
+  // `download_model` (acquire) and `list_local_models` (inventory). Same
+  // services, same return shapes, same error paths — only the surface changed,
+  // so every mention of the eight retired names below is now rot pointing at a
+  // 404. APPENDED at the end of the array, not prepended: concurrent slices all
+  // edit this file and prepending makes every one of them collide on the same
+  // three lines.
+  {
+    name: "search_models",
+    since: "0.50.0",
+    replacement: 'download_model (action:"search")',
+    allowedIn: [
+      {
+        path: "docs/blog/comfyui-mcp-tdqs-case-study.mdx",
+        context: "`search_models`, and the rest of the",
+        why: "A DATED case study of a tool-description audit, naming the tools whose descriptions were rewritten AS THEY WERE NAMED when they were scored. Rewriting the name would falsify the record of what was measured — and the sentence is a past-tense result, not an instruction to call anything.",
+      },
+    ],
+  },
+  {
+    name: "download_status",
+    since: "0.50.0",
+    replacement: 'download_model (action:"status")',
+  },
+  {
+    name: "cancel_download",
+    since: "0.50.0",
+    replacement: 'download_model (action:"cancel")',
+  },
+  {
+    name: "search_civitai_models",
+    since: "0.50.0",
+    replacement: 'download_model (action:"search_civitai")',
+  },
+  {
+    name: "search_civitai_creators",
+    since: "0.50.0",
+    replacement: 'download_model (action:"search_creators")',
+  },
+  {
+    name: "download_civitai_model",
+    since: "0.50.0",
+    replacement: 'download_model (action:"download_civitai")',
+  },
+  {
+    name: "resolve_missing_models",
+    since: "0.50.0",
+    replacement: 'download_model (action:"resolve_missing")',
+  },
+  {
+    name: "remove_model",
+    since: "0.50.0",
+    // The one destructive action in the slice: it unlinks a model FILE, with no
+    // undo and no recycle bin. The replacement names the action explicitly so a
+    // stale caller is redirected to the exact enum value rather than guessing at
+    // `remove_path`, which edits a YAML config and deletes nothing.
+    replacement: 'list_local_models (action:"remove")',
+  },
+  {
+    name: "get_embeddings",
+    since: "0.50.0",
+    replacement: 'list_local_models (action:"embeddings")',
+  },
+  {
+    name: "list_extra_paths",
+    since: "0.50.0",
+    replacement: 'list_local_models (action:"list_paths")',
+  },
+  {
+    name: "add_extra_path",
+    since: "0.50.0",
+    replacement: 'list_local_models (action:"add_path")',
+  },
+  {
+    name: "remove_extra_path",
+    since: "0.50.0",
+    replacement: 'list_local_models (action:"remove_path")',
   },
 ];
 

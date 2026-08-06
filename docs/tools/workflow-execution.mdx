@@ -10,7 +10,7 @@ icon: "play"
 
 ## enqueue_workflow
 
-Submit a ComfyUI workflow for execution and return immediately with the prompt_id and queue position. Does not wait for completion. Use queue (action:"status") to check progress later, or get_history to retrieve results and images after completion.
+Submit a ComfyUI workflow for execution and return immediately with the prompt_id and queue position. Does not wait for completion. Seed values in the workflow are used exactly as supplied — they are NOT re-randomized, so a run is reproducible by resubmitting the same workflow (for a fresh-seed re-run of a past job, use rerun_generation). Use queue (action:"status") to check progress later, or get_history to retrieve results and images after completion.
 
 <Tip>**In plain terms:** Runs a workflow that the agent is holding in the conversation — one it just built or loaded from a file. If you want to run the graph you are LOOKING at in ComfyUI, that is the panel's run tool instead, and if you just want a picture, use generate_image.</Tip>
 
@@ -20,7 +20,7 @@ Submit a ComfyUI workflow for execution and return immediately with the prompt_i
   ComfyUI workflow in API format (node ID -&gt; &#123;class_type, inputs&#125;)
 </ParamField>
 <ParamField path="disable_random_seed" type="boolean">
-  If true, do not randomize seed values
+  No-op kept for backward compatibility: seed values are always used exactly as supplied.
 </ParamField>
 
 ### Example
@@ -61,7 +61,7 @@ Submit a ComfyUI workflow for execution and return immediately with the prompt_i
 
 ## rerun_generation
 
-Re-run the workflow behind a previous generation. Retrieves the prompt graph from execution history (by prompt_id, or the most recent run when omitted — chosen by ComfyUI's queue number, same logic as get_history) and re-enqueues it, optionally applying `inputs` overrides. Seeds are re-randomized unless disable_random_seed is set. Returns the new prompt_id and the source prompt_id it came from. Clear error if no matching history exists.
+Re-run the workflow behind a previous generation. Retrieves the prompt graph from execution history (by prompt_id, or the most recent run when omitted — chosen by ComfyUI's queue number, same logic as get_history) and re-enqueues it, optionally applying `inputs` overrides. Seeds are re-randomized (within each node's declared range) unless disable_random_seed is set or the seed is pinned via `inputs`. Returns the new prompt_id and the source prompt_id it came from. Clear error if no matching history exists.
 
 ### Parameters
 
@@ -341,7 +341,7 @@ spec="3 + 0*0.5\n3 + 1*0.5\n3 + 2*0.5\n3 + 3*0.5"
 
 ## diagnose_run
 
-WHY DID MY RENDER FAIL / WHAT'S MISSING? Explains a failed run in ONE call, without needing a canvas — the headless counterpart to the panel's panel_get_errors ("why is this red?"), so mobile/remote sessions get the same answer. Returns: the failed node (id, type) with its `exception_type` + message and a trimmed traceback; **missing_models** (the exact model file that isn't installed and the widget holding it — feed the filename to search_civitai_models/download_model to fix it); **missing_node_types** (node classes this install lacks — feed to search_custom_nodes/install_custom_node); and any other per-input validation errors. Call this whenever a run fails, an enqueue is rejected, or the user asks what's missing — instead of guessing from raw logs. With no prompt_id it diagnoses the most recent FAILED run (falling back to the most recent run). Read-only.
+WHY DID MY RENDER FAIL / WHAT'S MISSING? Explains a failed run in ONE call, without needing a canvas — the headless counterpart to the panel's panel_get_errors ("why is this red?"), so mobile/remote sessions get the same answer. Returns: the failed node (id, type) with its `exception_type` + message and a trimmed traceback; **missing_models** (the exact model file that isn't installed and the widget holding it — feed the filename to download_model action:"search_civitai", then action:"download_civitai" — or action:"search" then action:"download" — to fix it); **missing_node_types** (node classes this install lacks — feed to search_custom_nodes/install_custom_node); and any other per-input validation errors. Call this whenever a run fails, an enqueue is rejected, or the user asks what's missing — instead of guessing from raw logs. With no prompt_id it diagnoses the most recent FAILED run (falling back to the most recent run). Read-only.
 
 <Tip>**In plain terms:** For when a run failed and the error text does not mean anything to you. This reads the failure and tells you what to do about it.</Tip>
 

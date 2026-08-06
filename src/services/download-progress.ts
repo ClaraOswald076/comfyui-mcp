@@ -183,7 +183,7 @@ export function reportDownloadProgress(
 }
 
 /**
- * Read back one download's latest snapshot, so `download_status` can report
+ * Read back one download's latest snapshot, so `download_model action:"status"` can report
  * bytes/throughput instead of a bare "still going". Progress files are
  * TARGET-SCOPED ({id}-{disc}.json — the same URL can download for local AND a
  * pod at once), so scan every variant for this id and return the most recently
@@ -473,7 +473,7 @@ export function consumeTargetChange(file: string): void {
 // ── Persisted download-job records (cross-session adoption, #529) ─────────────
 // The in-memory download-job registry (download-jobs.ts) is process-global, so a
 // sidebar/tool-session RECONNECT — which respawns the MCP child — starts with an
-// EMPTY registry and `download_status(id)` can no longer resolve an id returned by
+// EMPTY registry and `download_model action:"status"(id)` can no longer resolve an id returned by
 // a previous session ("Downloads are tracked per server session"). The live download
 // itself keeps running and keeps writing its progress row, so the STATE exists on
 // disk; it just isn't discoverable by the new session's registry.
@@ -533,7 +533,7 @@ export interface PersistedDownloadJob {
    *  "downloaded but invisible to the running server" warning instead of a bare
    *  "done". Absent on pre-fix records. */
   live_visible?: "visible" | "not-visible" | "unknown" | "pending";
-  /** The verification explanation, surfaced verbatim by download_status. */
+  /** The verification explanation, surfaced verbatim by download_model action:"status". */
   verify_note?: string;
   /** Whether the post-landing on-disk stat succeeded. False = the file was NOT
    *  found when checked, so no renderer may claim "verified on disk". */
@@ -675,7 +675,7 @@ function parseJobFile(dir: string, f: string): PersistedDownloadJob | null {
     const raw = JSON.parse(readFileSync(join(dir, f), "utf8")) as PersistedDownloadJob;
     if (!raw || typeof raw !== "object" || typeof raw.id !== "string") return null;
     const age = typeof raw.updated === "number" ? Date.now() - raw.updated : 0;
-    // This parser backs read paths (including download_status). A heartbeat gap
+    // This parser backs read paths (including download_model action:"status"). A heartbeat gap
     // beyond the short freshness window is not sufficient evidence to destructively
     // delete a potentially live transfer; adoption/cancel freshness checks below
     // still treat it as non-live. Reap only after the bounded long retention.

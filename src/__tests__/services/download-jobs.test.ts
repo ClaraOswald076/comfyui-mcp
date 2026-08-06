@@ -569,7 +569,7 @@ describe("download job registry", () => {
   //
   // `id` is a hash of the DESTINATION (+auth), deliberately: two URLs landing on
   // one file are one writer. The consequence is that `id` is a DESTINATION handle
-  // while download_status renders it as though it were a JOB handle — and when a
+  // while download_model action:"status" renders it as though it were a JOB handle — and when a
   // reconnect leaves an orphaned in-flight record, two rows carry the same id and
   // neither can be selected. The composite (id, trayId) is the real identity; this
   // block is about making it reachable from the public surface.
@@ -670,7 +670,7 @@ describe("download job registry", () => {
       }
     });
 
-    it("cancel_download with a tray_id aborts EXACTLY the named row of a COLLIDING id, and leaves the other alone", async () => {
+    it('download_model action:"cancel" with a tray_id aborts EXACTLY the named row of a COLLIDING id, and leaves the other alone', async () => {
       // The real #822 collision: one live local download and one orphaned in-flight
       // record from before a reconnect, sharing an id because they resolve to the
       // same destination file. `tray_id` must pick out precisely one of them.
@@ -877,7 +877,7 @@ describe("download job registry", () => {
           owner: `${PERSIST_OWNER}-other`,
         });
 
-        // cancel_download by id must DECLINE (could hit the wrong concurrent download).
+        // download_model action:"cancel" by id must DECLINE (could hit the wrong concurrent download).
         const res = cancelDownloadJob(a.job.id);
         expect(res.ambiguous).toBe(true);
         expect(res.aborted).toBe(false);
@@ -1210,7 +1210,7 @@ describe("download job registry", () => {
         // store where both records (same id, different trayId) coexist.
         resetDownloadJobs();
 
-        // download_status with no selector must list BOTH, not silently drop one.
+        // download_model action:"status" with no selector must list BOTH, not silently drop one.
         const all = listDownloadJobs();
         const mine = all.filter((j) => j.id === id);
         expect(new Set(mine.map((j) => j.trayId))).toEqual(new Set([trayA, "distincttrayid00"]));
@@ -1247,7 +1247,7 @@ describe("download job registry", () => {
         expect(got?.id).toBe(id);
         expect(got?.trayId).toBe(trayA);
         expect(got?.status).toBe("downloading");
-        // cancel_download reports it as tracked-but-not-owned (another session), NOT "not found".
+        // download_model action:"cancel" reports it as tracked-but-not-owned (another session), NOT "not found".
         const res = cancelDownloadJob(id);
         expect(res.found).toBe(true);
         expect(res.owned).toBe(false);
@@ -1948,7 +1948,7 @@ describe("download job registry", () => {
           ageMs: 0, // now (newer than the done)
         });
 
-        // download_status(id) MUST report the validated DONE, not the newer cancelled.
+        // download_model action:"status"(id) MUST report the validated DONE, not the newer cancelled.
         const got = getDownloadJob(sharedId);
         expect(got?.status).toBe("done");
         expect(got?.path).toBe("/M/checkpoints/m.safetensors");

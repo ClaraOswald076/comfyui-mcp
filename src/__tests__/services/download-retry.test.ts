@@ -676,7 +676,7 @@ describe("download retry + resume, end to end (#470)", () => {
     // And it DESTROYS NOTHING: the other writer's bytes are exactly as they left them.
     await expect(readFile(partial, "utf-8")).resolves.toBe("SOMEONE-ELSES-LONGER-CONTENT");
     // The remedy names what the caller can do from here.
-    expect(message).toMatch(/download_status/);
+    expect(message).toMatch(/download_model action:"status"/);
     expect(message).toMatch(/re-issue/i);
   });
 

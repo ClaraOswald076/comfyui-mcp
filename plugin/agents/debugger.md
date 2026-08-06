@@ -55,10 +55,10 @@ Use `get_node_info(node_type="FailingNodeType")` to retrieve the node's expected
 
 If the error involves model loading or missing files:
 
-1. **Verify model exists**: `list_local_models(model_type="checkpoints")` (or loras, vae, controlnet, etc.)
+1. **Verify model exists**: `list_local_models({ action: "list", model_type: "checkpoints" })` (or loras, vae, controlnet, etc.)
 2. **Check exact filename**: Model names are case-sensitive and must match exactly
 3. **Check file integrity**: Very small files (< 1MB for a checkpoint) indicate corrupted downloads
-4. **Search for alternatives**: If a model is missing, use `search_models()` to find it
+4. **Search for alternatives**: If a model is missing, use `download_model({ action: "search" })` to find it
 
 ### Step 5: Check Custom Node Availability
 
