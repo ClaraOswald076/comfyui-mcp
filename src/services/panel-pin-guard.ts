@@ -6,10 +6,12 @@
 // panel IS an ordinary custom node pack, so the generic node tools are a second,
 // wider door into exactly the same ComfyUI-Manager mutation:
 //
-//     update_custom_node(id="comfyui-agent-panel")   → updateCustomNode(...)
-//     update_custom_node(id="all")                   → updateCustomNode(...)
-//     reinstall_custom_node(id="comfyui-mcp-panel")  → reinstallCustomNode(...)
-//     update_all                                     → updateAllCustomNodes()
+//     install_custom_node(action:"update", id="comfyui-agent-panel")
+//                                                     → updateCustomNode(...)
+//     install_custom_node(action:"update", id="all")  → updateCustomNode(...)
+//     install_custom_node(action:"reinstall", id="comfyui-mcp-panel")
+//                                                     → reinstallCustomNode(...)
+//     update_all                                      → updateAllCustomNodes()
 //
 // None of those go through `runPanelAction`, so none of them saw the pin. A
 // pinned user was one `id="all"` away from being moved. The guard therefore
@@ -203,7 +205,7 @@ export function assertPanelPinAllows(action: string, id: string): void {
  * Refuse a panel-pack mutation on a path that has NO on-disk verification —
  * currently the sidebar `panel_install_node` / `panel_update_node` tools (which
  * drive the user's built-in ComfyUI Manager through the browser) and
- * `fix_custom_node`.
+ * `install_custom_node` action:"fix".
  *
  * These cannot be redirected into the verified path: `panel_*` acts on the
  * panel's own host through the browser Manager (which may not even be the
@@ -972,8 +974,8 @@ export function withPanelPinGuard<T>(
 // delete the deferred-restore file), clears the marker only for what was
 // PROVABLY cancelled or proven no longer pending, and keeps the warning for
 // the residue — in-flight work, remote hosts, anything unverifiable. The
-// lock-held variants — update_custom_node(id="all"), which waits for the
-// drain inside the lock, and every install_panel mutation — need no marker:
+// lock-held variants — install_custom_node(action:"update", id="all"), which waits
+// for the drain inside the lock, and every install_panel mutation — need no marker:
 // no pin can be written inside their window at all.
 // ---------------------------------------------------------------------------
 

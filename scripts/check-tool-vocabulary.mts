@@ -154,6 +154,15 @@ const SELF = new Set([
   // name. They are call arguments under test — the assertion is that nothing
   // serves them — not guidance to call anything.
   "src/__tests__/orchestrator/call-tool-admission.test.ts",
+  // Same, for 0.50.0 slice 12: the three parts of the custom-node fold each
+  // assert as FIXTURES that the names their tool replaced are in DEAD_NAMES
+  // (install_custom_node ← 8, search_custom_nodes ← 1, node_pack ← 9). The
+  // registry-search file also asserts the INVERSE — that `search_custom_nodes`
+  // is NOT in DEAD_NAMES, because the owner's split kept it alive — which it
+  // can only do by naming both it and the name it absorbed.
+  "src/__tests__/tools/node-management.test.ts",
+  "src/__tests__/tools/registry-search.test.ts",
+  "src/__tests__/tools/node-pack.test.ts",
   // Same, for the #659 retired-name error: these pass dead names to call_tool /
   // the ollama dispatch as FIXTURES and assert the error quotes the ledger's
   // replacement — the names are call arguments under test, not live guidance.

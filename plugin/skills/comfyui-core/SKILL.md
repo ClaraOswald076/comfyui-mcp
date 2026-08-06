@@ -167,8 +167,7 @@ HuggingFace is preferred for official/base models (SDXL, Flux, SD 1.5).
 
 ### Custom Nodes
 
-- `search_custom_nodes` — search the ComfyUI Registry
-- `get_node_pack_details` — get details about a specific pack
+- `search_custom_nodes` — search the ComfyUI Registry (`action: "search"`), or get one pack's details (`action: "details"`)
 - `list_packs` (`action: "generate_skill"`) — auto-generate a skill file for a node pack
 
 ### Workflow Execution

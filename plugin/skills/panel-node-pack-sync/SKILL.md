@@ -148,7 +148,7 @@ While it's set, everything that could move the panel refuses — not just
 `install_panel`. The panel is an ordinary custom node pack, so the generic node
 tools are a second door into the same operation, and they are guarded too:
 
-- `install_custom_node` / `update_custom_node` / `reinstall_custom_node`
+- `install_custom_node` / `install_custom_node` (`action: "update"`) / `install_custom_node` (`action: "reinstall"`)
   targeting the panel by **any** spelling — the registry id, the repo name, or a
   git URL including ref-carrying forms like `…/comfyui-mcp-panel.git@v0.11.28`
   and `…/comfyui-mcp-panel/tree/main`. These also **route through the verified
@@ -159,7 +159,7 @@ tools are a second door into the same operation, and they are guarded too:
   while pinned these refuse outright. If the user wants the rest updated, either
   unpin first or update the other packs individually by id. Say that plainly
   rather than quietly unpinning to make `all` work.
-- `fix_custom_node`, `panel_install_node` and `panel_update_node` **refuse** a
+- `install_custom_node` (`action: "fix"`), `panel_install_node` and `panel_update_node` **refuse** a
   panel target outright — pinned or not. They report success as soon as the
   ComfyUI-Manager queue drains, which proves nothing, and there's no verified
   equivalent to route them into. Use `install_panel` instead; don't work around

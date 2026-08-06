@@ -35,7 +35,7 @@ The user wants to find out why a ComfyUI workflow execution failed and get a sug
 
 6. **Check for missing nodes.** If the error is a `KeyError` or mentions an unknown node type:
    - The node pack may not be installed
-   - Call `search_custom_nodes` with the node class name to find which pack provides it
+   - Call `search_custom_nodes` (`action: "search"`) with the node class name as `query` to find which pack provides it
    - Suggest installing the pack
 
 7. **Present the diagnosis.** Provide a clear summary:

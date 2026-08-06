@@ -1395,7 +1395,16 @@ export class OllamaBackend implements AgentBackend {
       "list_tools",
       "panel_list_tools",
       'download_model action:"search"',
-      "search_custom_nodes",
+      // 0.50.0 slice 12: was the bare name. `search_custom_nodes` SURVIVES the
+      // fold, but it now also covers the retired pack-DETAILS lookup as
+      // action:"details" — and that name was never counted here. Keying the bare
+      // name would start counting a call that never counted, on the workflow
+      // that is CORRECT: search once, then read `details` for three or four
+      // candidate packs. The fourth would be answered with "STOP searching"
+      // while the model is doing exactly the right thing, and at eight the turn
+      // breaks. Same #839 shape as the download_model case above, so the same
+      // remedy: key the ACTION, and count only the keyword search.
+      'search_custom_nodes action:"search"',
     ]);
     const discoveryCounts = new Map<string, number>();
     let emptyFinalRetried = false;

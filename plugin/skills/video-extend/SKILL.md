@@ -34,7 +34,7 @@ that workflow plus the live node schemas.
 > confirmed against the live ComfyUI `/object_info` (WanVideoWrapper installed)
 > and against kijai's example workflow JSON + HF repo (June 2026). Where a value
 > is a starting recommendation rather than a hard requirement it's flagged. Don't
-> substitute a node you can't confirm with `list_installed_nodes` /
+> substitute a node you can't confirm with `install_custom_node` (`action: "list"`) /
 > `create_workflow (action:"node_info")`.
 
 ---
@@ -219,7 +219,7 @@ optional accelerators with extra deps that a stock Windows ComfyUI usually lacks
   these two if you've actually installed sageattention / triton-windows.
 
 Check first with the ComfyUI startup log (it prints `Could not load
-sageattention…` and `triton: unavailable`) or `list_installed_nodes`.
+sageattention…` and `triton: unavailable`) or `install_custom_node` (`action: "list"`).
 
 ### Preferred end-to-end order
 

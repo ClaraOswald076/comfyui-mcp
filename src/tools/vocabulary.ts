@@ -40,7 +40,6 @@ export const TOOL_NAMES = [
   "create_workflow",
   "queue",
   "search_custom_nodes",
-  "get_node_pack_details",
   "download_model",
   "list_local_models",
   "get_logs",
@@ -77,14 +76,6 @@ export const TOOL_NAMES = [
   "node_snapshot",
   "bisect",
   "install_custom_node",
-  "update_custom_node",
-  "reinstall_custom_node",
-  "fix_custom_node",
-  "disable_custom_node",
-  "enable_custom_node",
-  "uninstall_custom_node",
-  "list_installed_nodes",
-  "sync_node_dependencies",
   "report_issue",
   "install_comfyui",
   "update_comfyui",
@@ -94,9 +85,7 @@ export const TOOL_NAMES = [
   "get_environment",
   "list_api_nodes",
   "configure_manager",
-  "scaffold_custom_node",
-  "publish_custom_node",
-  "verify_custom_node",
+  "node_pack",
   "apply_manifest",
   "convert_image",
   "analyze_color",
@@ -106,12 +95,6 @@ export const TOOL_NAMES = [
   "install_panel",
   "self_update",
   "calculate",
-  "list_node_pack_files",
-  "read_node_file",
-  "search_node_packs",
-  "write_node_file",
-  "apply_node_patch",
-  "node_pack_git",
   "train_prepare_dataset",
   "train_start",
   "train_doctor",
@@ -170,7 +153,7 @@ const BASELINE_URL = new URL("../../docs/design/tool-surface.txt", import.meta.u
  * 200-line rename. APPENDING is legitimate — new tools join the baseline when they
  * ship — so the workflow is: append, update this hash, say why in the message.
  */
-export const BASELINE_SHA256 = "c4854a510bf323a9ce6315dcac98faa91d0b87487d152a3221cfa0bf480d37c6";
+export const BASELINE_SHA256 = "984b006e468063be6fb8a5ad5432b21a2246f1510829d30775cfafd06693bc75";
 
 /**
  * LAZY on purpose, and this is not a micro-optimisation.
@@ -244,7 +227,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 87;
+export const MAX_TOOLS = 70;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;
@@ -1559,6 +1542,130 @@ export const DEAD_NAMES: readonly DeadName[] = [
     name: "verify_workflow_lock",
     since: "0.50.0",
     replacement: 'save_workflow (action:"verify_lock")',
+  },
+  // ─────────────────────────────────────────────────────────────────────────
+  // 0.50.0 slice 12: the twenty custom-node tools folded into THREE
+  // action-parameterized tools — the pack LIFECYCLE into the surviving
+  // `install_custom_node` (9 actions), the public-registry DISCOVERY pair into
+  // the surviving `search_custom_nodes` (2 actions), and the AUTHOR loop into
+  // the new name `node_pack` (9 actions). Same node-management / registry-client
+  // / node-authoring / node-verify / node-dev services, same panel-pin redirects,
+  // same return shapes — only the surface changed, so every mention of a RETIRED
+  // name is now rot pointing at a 404. (`search_custom_nodes` is NOT retired: it
+  // survives as the discovery tool and absorbs get_node_pack_details.)
+  //
+  // Three tools rather than one grab-bag because the thirds have different blast
+  // radii, and the NAME is the unit that the call_tool whitelist and the ollama
+  // loop-breaker both reason about:
+  //   • install_custom_node runs third-party pack code and mutates what is
+  //     installed. See CALL_TOOL_ACTION_WHITELIST in
+  //     src/orchestrator/call-tool-admission.ts, which keeps it reachable from a
+  //     canvas-less client for exactly the two actions its retired standalone
+  //     entries covered (install + list) and leaves uninstall/update/reinstall/
+  //     fix unreachable.
+  //   • search_custom_nodes is read-only and network-only — no ComfyUI, no
+  //     COMFYUI_PATH. Never whitelisted before, so it is not whitelisted now.
+  //   • node_pack reads and WRITES your own source on disk and runs git in it.
+  //     Not whitelisted at all.
+  {
+    name: "update_custom_node",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"update")',
+  },
+  {
+    name: "reinstall_custom_node",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"reinstall")',
+  },
+  {
+    name: "fix_custom_node",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"fix")',
+  },
+  {
+    name: "uninstall_custom_node",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"uninstall")',
+  },
+  {
+    name: "enable_custom_node",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"enable")',
+  },
+  {
+    name: "disable_custom_node",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"disable")',
+  },
+  {
+    name: "list_installed_nodes",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"list")',
+  },
+  {
+    name: "sync_node_dependencies",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"sync_deps")',
+  },
+  {
+    name: "get_node_pack_details",
+    since: "0.50.0",
+    replacement: 'search_custom_nodes (action:"details")',
+  },
+  {
+    name: "scaffold_custom_node",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"scaffold")',
+  },
+  {
+    name: "verify_custom_node",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"verify")',
+  },
+  {
+    name: "publish_custom_node",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"publish")',
+  },
+  {
+    name: "list_node_pack_files",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"list_files")',
+  },
+  {
+    name: "read_node_file",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"read")',
+  },
+  {
+    name: "search_node_packs",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"search")',
+  },
+  {
+    name: "write_node_file",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"write")',
+  },
+  {
+    name: "apply_node_patch",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"patch")',
+  },
+  // node_pack_git's own `action` parameter is the one argument this whole
+  // consolidation could not preserve — it collided with the tool's dispatch
+  // field — so the replacement names BOTH levels, or a caller rewriting
+  // `node_pack_git(pack, action:"commit")` would silently produce
+  // `node_pack(action:"commit")`, which is not an action at all.
+  //
+  // The comment sits ABOVE the entry rather than inside it on purpose: a
+  // leading comment between `{` and `name:` hides the entry from every
+  // name-extracting scanner that anchors on `^  \{\n    name:` — including the
+  // ratchet verifier — so an entry that IS in the ledger reads as missing.
+  {
+    name: "node_pack_git",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"git", git_action:"status"|"diff"|"log"|"commit"|"push")',
   },
 ];
 

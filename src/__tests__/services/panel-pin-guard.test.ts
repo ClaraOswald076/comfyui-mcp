@@ -2,7 +2,7 @@
 //
 // The bug these tests exist for: the pin was originally enforced only inside
 // `runPanelAction`, which was described as "the mutation choke point". It wasn't
-// — the panel is an ordinary custom node pack, so `update_custom_node(id=...)`
+// — the panel is an ordinary custom node pack, so `install_custom_node(action:"update")`
 // and `id="all"` reached the SAME ComfyUI-Manager mutation without ever passing
 // the guard. A pinned user was one generic call away from being moved.
 
@@ -812,7 +812,7 @@ describe("durable writes (#798) — records that must not outlive the action the
 
 describe("assertPanelNotTargetedUnverifiable — paths that cannot verify", () => {
   it("refuses a panel target even when NOTHING is pinned", async () => {
-    // panel_install_node / panel_update_node / fix_custom_node report success
+    // panel_install_node / panel_update_node / the fix action report success
     // straight off the Manager queue, which a stale Manager drains without doing
     // any work. There is no verified redirect for them, so they refuse and name
     // install_panel rather than move the panel unverifiably.

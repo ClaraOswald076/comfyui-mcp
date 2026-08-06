@@ -275,7 +275,7 @@ export function formatCrashNote(result: CrashParseResult): string | null {
     "\n```\n" +
     culprit +
     " Update or fix that node before retrying — do NOT just re-run the same graph " +
-    "(escalate per your crash-recovery steps: panel_update_node / update_custom_node → " +
+    "(escalate per your crash-recovery steps: panel_update_node / install_custom_node (action:'update') → " +
     "git pull in custom_nodes → targeted patch + verify)."
   );
 }

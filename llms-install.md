@@ -96,7 +96,7 @@ Set in the `env` block above. None are required for the local-default flow.
 - `COMFYUI_LRU_CACHE_SIZE_GB` — cap the cache; `0` disables eviction
 - `CIVITAI_API_TOKEN`, `HUGGINGFACE_TOKEN`, `GITHUB_TOKEN` — for gated
   downloads and higher API rate limits
-- `REGISTRY_ACCESS_TOKEN` — Comfy Registry API key for `publish_custom_node`
+- `REGISTRY_ACCESS_TOKEN` — Comfy Registry API key for `node_pack` (`action: "publish"`)
 - `COMFY_API_KEY` — comfy.org API key for hosted partner nodes (different
   from `COMFYUI_API_KEY`, which is for Comfy Cloud)
 - `COMFYUI_CLOUD_URL` — override the Comfy Cloud endpoint

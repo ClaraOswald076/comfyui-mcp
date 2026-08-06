@@ -210,7 +210,7 @@ to someone else's tracker are the user's calls, not yours:
   custom node so the user isn't blocked) — but apply it only once the user says
   yes. Same keep-the-patch logic once approved.
 - **Ask before filing.** Identify the node/project's GitHub repo (from its
-  metadata / `list_installed_nodes` / its folder), then — with the user's
+  metadata / `install_custom_node` (`action: "list"`) / its folder), then — with the user's
   go-ahead — use `report_issue` with that `owner/repo` (it returns a **prefilled
   link the user reviews and submits**; it does not auto-file into third-party
   repos), OR `gh issue create -R owner/repo` if `gh` is authed and they agree.

@@ -28,8 +28,7 @@ import { registerNodeSnapshotsTools } from "./node-snapshots.js";
 import { registerNodeBisectTools } from "./node-bisect.js";
 import { registerNodeManagementTools } from "./node-management.js";
 import { registerReportIssueTools } from "./report-issue.js";
-import { registerNodeAuthoringTools } from "./node-authoring.js";
-import { registerNodeVerifyTools } from "./node-verify.js";
+import { registerNodePackTools } from "./node-pack.js";
 import { registerInstallComfyUITools } from "./install-comfyui.js";
 import { registerUpdateComfyUITools } from "./update-comfyui.js";
 import { registerWorkspaceEnvTools } from "./workspace-env.js";
@@ -45,7 +44,6 @@ import { registerSkillsAccessTools } from "./skills-access.js";
 import { registerInstallPanelTools } from "./install-panel.js";
 import { registerSelfUpdateTools } from "./self-update.js";
 import { registerCalculateTools } from "./calculate.js";
-import { registerNodeDevTools } from "./node-dev.js";
 import { registerComfyCliTools } from "./comfy-cli.js";
 import { registerTrainTools } from "./train.js";
 import { registerAppsTools } from "./apps.js";
@@ -101,8 +99,7 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["server", registerWorkspaceEnvTools],
   ["generation", registerApiNodesTools],
   ["server", registerManagerConfigTools],
-  ["custom-nodes", registerNodeAuthoringTools],
-  ["custom-nodes", registerNodeVerifyTools],
+  ["custom-nodes", registerNodePackTools],
   ["models", registerManifestTools],
   ["images-assets", registerImageConvertTools],
   ["images-assets", registerColorAnalysisTools],
@@ -116,7 +113,10 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   // tools into `get_defaults` as action:"get_ui"/"set_ui", so the group is gone
   // rather than empty — every surviving name keeps its position, which is what
   // registry-surface.test.ts pins.
-  ["custom-nodes", registerNodeDevTools],
+  //
+  // registerNodeDevTools sat here too, until 0.50.0 slice 12 folded its six
+  // tools into `node_pack` — registered at the slot its family’s first member
+  // (the scaffold tool) held, further up.
   ["training", registerTrainTools],
   ["apps", registerAppsTools],
   ["workflows", registerTemplateSchemaTools],

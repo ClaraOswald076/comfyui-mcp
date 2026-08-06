@@ -1043,7 +1043,7 @@ function dialectChangedError(
       `re-detected the dialect, so the next call routes correctly. The "${label}" request ` +
       `was NOT retried automatically: this failure does not prove the server left it ` +
       `unexecuted, and Manager offers no idempotency key, so an automatic retry could run ` +
-      `it TWICE. VERIFY whether it took effect (list_installed_nodes / list_local_models, ` +
+      `it TWICE. VERIFY whether it took effect (install_custom_node (action:"list") / list_local_models, ` +
       `or the ComfyUI server log), then reissue it if it did not.`,
     cause instanceof NodeManagementError ? cause.details : undefined,
   );
@@ -2318,7 +2318,7 @@ async function installCustomNodeImpl(
             `"${id}" is present on disk at ${presence.dir}. Whether the queued install ` +
             `changed anything could NOT be verified: ComfyUI-Manager's installed-pack ` +
             `list could not be read (${presence.listError}). NOT claiming a fresh install ` +
-            `— check list_installed_nodes.`,
+            `— check install_custom_node (action:"list").`,
           details: status,
         });
       }
@@ -2387,7 +2387,7 @@ async function installCustomNodeImpl(
     case "unverifiable":
       throw new NodeManagementError(
         `"${id}" was queued, but whether it landed could NOT be verified: ${presence.reason} ` +
-          `NOT reporting success on an unverified install. Check list_installed_nodes, ` +
+          `NOT reporting success on an unverified install. Check install_custom_node (action:"list"), ` +
           `then retry if it is genuinely absent.`,
         status,
       );
@@ -2469,7 +2469,7 @@ async function assertPackPresentAfterOp(
           `Registry zip install or a manual copy), and Manager can only ${op} packs in ` +
           `its own installed list. ` +
           `The pack was NOT ${op === "update" ? "updated" : "reinstalled"}. To move it, reinstall it from its ` +
-          `registry id or repository URL (install_custom_node / reinstall_custom_node), ` +
+          `registry id or repository URL (install_custom_node action:"install" / action:"reinstall"), ` +
           `or — when ${presence.dir} is a git checkout — pull it there directly.`,
         status,
       );
@@ -2478,7 +2478,7 @@ async function assertPackPresentAfterOp(
         throw new PackAbsentAfterOpError(
           `"${id}" was queued for ${op} but is not present afterward — it is in neither ` +
             `ComfyUI-Manager's installed-pack list NOR on disk under ${presence.scanned} — ` +
-            `so the ${op} resolved to nothing. Check the pack id with list_installed_nodes, ` +
+            `so the ${op} resolved to nothing. Check the pack id with install_custom_node (action:"list"), ` +
             `or find the right id with search_custom_nodes.`,
           status,
         );
@@ -2490,7 +2490,7 @@ async function assertPackPresentAfterOp(
           `check reads ComfyUI-Manager's registry/installed list ONLY — it does not ` +
           `inspect custom_nodes, so a pack that IS on disk but unknown to the Manager ` +
           `(a Comfy Registry zip install, or a manual copy) reaches here too. Check ` +
-          `the pack id with list_installed_nodes, and for the sidebar panel use ` +
+          `the pack id with install_custom_node (action:"list"), and for the sidebar panel use ` +
           `install_panel(action='status'), which reads the directory itself.`,
         status,
       );
@@ -2531,7 +2531,7 @@ async function resolveTrackedForOp(
           ? `"${id}" is present on disk at ${presence.dir} but ComfyUI-Manager does not ` +
             `track it (a Comfy Registry zip install or a manual copy), so Manager cannot ` +
             `${op} it and NOTHING was queued. To move it, reinstall it from its registry id ` +
-            `or repository URL (install_custom_node / reinstall_custom_node), or — when ` +
+            `or repository URL (install_custom_node action:"install" / action:"reinstall"), or — when ` +
             `${presence.dir} is a git checkout — pull it there directly.`
           : `"${id}" is present on disk at ${presence.dir}, but ComfyUI-Manager's ` +
             `installed-pack list could not be read (${presence.listError}), so whether ` +
@@ -2543,12 +2543,12 @@ async function resolveTrackedForOp(
         presence.evidence === "manager+disk"
           ? `"${id}" is not installed — it is in neither ComfyUI-Manager's installed-pack ` +
             `list NOR on disk under ${presence.scanned} — so there is nothing to ${op} ` +
-            `and NOTHING was queued. Check the pack id with list_installed_nodes, or find ` +
+            `and NOTHING was queued. Check the pack id with install_custom_node (action:"list"), or find ` +
             `the right id with search_custom_nodes.`
           : `"${id}" is not in ComfyUI-Manager's installed-pack list, so there is nothing ` +
             `to ${op} and NOTHING was queued. NOTE: this check reads the Manager list only ` +
             `(remote session — no disk check possible). Check the pack id with ` +
-            `list_installed_nodes.`,
+            `install_custom_node (action:"list").`,
       );
     case "unverifiable":
       throw new NodeManagementError(
@@ -3138,11 +3138,11 @@ async function setCustomNodeEnabled(
       presence.evidence === "manager+disk"
         ? `"${id}" is not installed — it is in neither ComfyUI-Manager's installed-pack ` +
           `list NOR on disk under ${presence.scanned} — so there is nothing to ${op} ` +
-          `and NOTHING was queued. Check the id with list_installed_nodes.`
+          `and NOTHING was queued. Check the id with install_custom_node (action:"list").`
         : `"${id}" is not in ComfyUI-Manager's installed-pack list, so there is ` +
           `nothing to ${op} and NOTHING was queued. NOTE: this check reads the Manager ` +
           `list only (remote session — no disk check possible). Check the id with ` +
-          `list_installed_nodes.`,
+          `install_custom_node (action:"list").`,
     );
   }
   if (presence.state === "unverifiable" && !useCli) {
@@ -3260,7 +3260,7 @@ async function setCustomNodeEnabled(
             message:
               `The ${op} of "${id}" was queued and the queue drained, but the result ` +
               `could NOT be verified: ${verdict.reason}. NOT claiming it took effect — ` +
-              `check list_installed_nodes.`,
+              `check install_custom_node (action:"list").`,
             details: status,
           };
   return cliFallbackNote
@@ -3281,7 +3281,7 @@ export async function disableCustomNode(opts: NodeStateOptions): Promise<NodeOpR
   );
 }
 
-/** Re-enable a pack previously disabled with disable_custom_node (#775). */
+/** Re-enable a pack previously disabled with install_custom_node (action:"disable") (#775). */
 export async function enableCustomNode(opts: NodeStateOptions): Promise<NodeOpResult> {
   return withPanelPinGuard("enable", opts.id, () =>
     withObjectInfoInvalidation(() => setCustomNodeEnabled(opts, true)),
@@ -3355,12 +3355,12 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
       presence.evidence === "manager+disk"
         ? `"${id}" is not installed — it is in neither ComfyUI-Manager's installed-pack ` +
           `list NOR on disk under ${presence.scanned} — so there is nothing to uninstall ` +
-          `and NOTHING was queued. Check the id with list_installed_nodes.`
+          `and NOTHING was queued. Check the id with install_custom_node (action:"list").`
         : `"${id}" is not in ComfyUI-Manager's installed-pack list, so there is nothing ` +
           `for Manager to uninstall and NOTHING was queued. NOTE: this check reads the ` +
           `Manager list only (remote session — no disk check possible); a pack present on ` +
           `disk but unknown to Manager must be removed on the ComfyUI host. Check the id ` +
-          `with list_installed_nodes.`,
+          `with install_custom_node (action:"list").`,
     );
   }
   if (presence.state === "unverifiable" && !useCli) {
@@ -3452,7 +3452,7 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
               ? ` and the disk check was inconclusive (${diskAfter.reason})`
               : "")) +
         `. NOT claiming an uninstall happened; if the pack was never there, nothing ` +
-        `needed removing — otherwise check list_installed_nodes / custom_nodes yourself.`,
+        `needed removing — otherwise check install_custom_node (action:"list") / custom_nodes yourself.`,
       details: out.trim(),
     };
   }
@@ -3501,7 +3501,7 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
       message:
         `The uninstall of "${id}" was queued and the queue drained, but the result could ` +
         `NOT be verified: ComfyUI-Manager's installed-pack list could not be read ` +
-        `(${listError}). NOT claiming the pack was uninstalled — check list_installed_nodes.`,
+        `(${listError}). NOT claiming the pack was uninstalled — check install_custom_node (action:"list").`,
       details: status,
     });
   }

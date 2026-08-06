@@ -46,7 +46,7 @@ import {
  *     be dressed as one.
  *   • A SIBLING TOOL is named bare and must be a registered tool.
  *   • A stated ceiling is written "`param` up to N", and N must equal the schema's real
- *     maximum — not the prose's idea of it. (`node_pack_git`'s true 24000 ceiling was a
+ *     maximum — not the prose's idea of it. (The git action's true 24000 ceiling was a
  *     code clamp its description never mentioned, so callers raised past it and saw
  *     nothing change.)
  */
@@ -160,7 +160,7 @@ describe("#809 truncation remedies name a lever that actually exists", () => {
       // Only enforce where the schema publishes a REAL maximum. `z.number().int()` with
       // no `.max()` still emits `maximum: Number.MAX_SAFE_INTEGER` — the int-range
       // sentinel, not a ceiling — and treating it as one would demand that every remedy
-      // quote 9007199254740991. Those tools clamp in code instead (node_pack_git's
+      // quote 9007199254740991. Those tools clamp in code instead (the git action's
       // hidden 24000 is the case the issue names), and their remedies are pinned against
       // the exported clamp constant by their own cases below.
       const published =
@@ -657,28 +657,30 @@ describe("#809 truncation remedies name a lever that actually exists", () => {
   // ---- node-dev: the same schema check, on the builders those tools emit -------------
   //
   // These are exported precisely so the check needs no filesystem. `boundText` is shared
-  // by tools with DIFFERENT levers (read_node_file has `max_chars`, apply_node_patch has
-  // none), which is how a shared default would have shipped a dead remedy.
+  // by ACTIONS with DIFFERENT levers (node_pack action:"read" has `max_chars`,
+  // action:"patch" has none), which is how a shared default would have shipped a dead
+  // remedy. 0.50.0 slice 12 folded the six node-dev tools into `node_pack`, so the
+  // schema these remedies are checked against is now the union of its nine actions.
 
   const nodeDevRemedies: Array<{ tool: string; where: string; text: string }> = [
     {
-      tool: "read_node_file",
-      where: "read_node_file bound notice",
+      tool: "node_pack",
+      where: 'node_pack action:"read" bound notice',
       text: readBoundNotice(12_000, 1, 240)(5_000),
     },
     {
-      tool: "node_pack_git",
-      where: "node_pack_git bound notice",
+      tool: "node_pack",
+      where: 'node_pack action:"git" bound notice',
       text: gitBoundNotice(12_000)(5_000),
     },
     {
-      tool: "search_node_packs",
-      where: "search_node_packs result cap",
+      tool: "node_pack",
+      where: 'node_pack action:"search" result cap',
       text: searchTruncationHint("max_results", 50, 50),
     },
     {
-      tool: "search_node_packs",
-      where: "search_node_packs scanned-file bound",
+      tool: "node_pack",
+      where: 'node_pack action:"search" scanned-file bound',
       text: searchTruncationHint("scanned_files", 12, 50),
     },
   ];
@@ -699,7 +701,7 @@ describe("#809 truncation remedies name a lever that actually exists", () => {
     expect(searchTruncationHint("max_results", 1, 1)).toContain(`up to ${SEARCH_MAX_RESULTS}`);
   });
 
-  it("node_pack_git's remedy quotes the CODE clamp its description used to hide", () => {
+  it('node_pack action:"git" remedy quotes the CODE clamp its description used to hide', () => {
     // The issue records this specifically: the real ceiling (24000) is a runtime clamp,
     // and the schema publishes no `maximum`, so the schema-driven ceiling check cannot
     // see it. Pin it against the constant the clamp itself uses.
@@ -708,16 +710,20 @@ describe("#809 truncation remedies name a lever that actually exists", () => {
     expect(text).toContain("a hard clamp");
   });
 
-  it("apply_node_patch's remedy names NO lever, because it has none", () => {
+  it('node_pack action:"patch" remedy names NO lever, because it has none', () => {
     const text = patchBoundNotice(500);
     // Its only parameter is `patch`. A remedy naming `max_chars` here would be defect 1
-    // pointing the other way: a lever the caller cannot pull.
-    assertRemedyIsActionable("apply_node_patch", "apply_node_patch bound notice", text);
+    // pointing the other way: a lever the caller cannot pull. NOTE the fold makes this
+    // check STRICTER, not weaker: `max_chars` IS a property of `node_pack` now (action
+    // "read"/"git" have it), so a remedy that named it would still pass the
+    // parameter-exists bar — which is why the explicit assertions below matter.
+    assertRemedyIsActionable("node_pack", 'node_pack action:"patch" bound notice', text);
     expect(text).toMatch(/has no parameter to raise it/);
-    // Nor may it hand off to a tool that cannot run the same command: node_pack_git's
-    // actions are status/diff/log/commit/push — it cannot `git apply` (codex gate). The
-    // only real remedy is a smaller patch.
-    expect(text).not.toContain("node_pack_git");
+    expect(text).not.toContain("max_chars");
+    // Nor may it hand off to an action that cannot run the same command: the git
+    // action's git_action values are status/diff/log/commit/push — none of them can
+    // `git apply` (codex gate). The only real remedy is a smaller patch.
+    expect(text).not.toContain('action:"git"');
     expect(text).toMatch(/Split the patch into smaller per-file hunks/);
   });
 
@@ -725,7 +731,7 @@ describe("#809 truncation remedies name a lever that actually exists", () => {
     const clipped = clipMatchLine("q".repeat(5_000));
     expect(clipped.length).toBeLessThanOrEqual(SEARCH_LINE_MAX);
     expect(clipped).toMatch(/fixed 600-char per-line cap/);
-    expect(clipped).toContain("read_node_file");
+    expect(clipped).toContain('node_pack (action:"read")');
   });
 
   // ---- sites with NO lever: they must say so, and must not promise one ---------------
