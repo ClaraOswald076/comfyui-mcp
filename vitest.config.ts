@@ -45,6 +45,12 @@ export default defineConfig({
     // If a test starts needing MORE than this, that is a signal to make it
     // deterministic (inject the clock, remove the real timer), not to raise this
     // number again.
+    // Redirect every store this app persists to at a throwaway directory for the
+    // whole run, BEFORE any worker forks. Four separate times a test wrote to the
+    // developer's real ~/.comfyui-mcp (#837, #859, #866, #879); the runtime
+    // guards cannot close it because they only see worker scope. See the file for
+    // why this is a floor rather than a replacement for them.
+    globalSetup: ["./vitest.global-setup.ts"],
     testTimeout: 30_000,
     hookTimeout: 30_000,
   },
