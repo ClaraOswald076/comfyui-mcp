@@ -163,6 +163,12 @@ const SELF = new Set([
   "src/__tests__/tools/node-management.test.ts",
   "src/__tests__/tools/registry-search.test.ts",
   "src/__tests__/tools/node-pack.test.ts",
+  // Same, for 0.50.0 slice 15: asserts as FIXTURES that the ten retired
+  // image/asset names are in DEAD_NAMES with their exact `get_image` /
+  // `upload_image` action replacements. Eight of the ten had their action
+  // RENAMED (view_image -> action:"view"), so the action-literal rule cannot
+  // reach them — they are a migration TABLE under assertion, not guidance.
+  "src/__tests__/tools/image-assets.test.ts",
   // Same, for the #659 retired-name error: these pass dead names to call_tool /
   // the ollama dispatch as FIXTURES and assert the error quotes the ledger's
   // replacement — the names are call arguments under test, not live guidance.

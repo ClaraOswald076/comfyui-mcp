@@ -24,13 +24,13 @@ Fetch, browse and inspect ComfyUI images and registered assets. Driven by the `a
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which image/asset operation to perform. "get" requires `filename`; "view" and "asset_metadata" require `asset_id`; "convert" requires `format` plus exactly one of `asset_id`/`path`; "analyze_color" takes one source (`asset_id`, `filename`, or `path`); "list_outputs" and "list_assets" take no required parameters. Options: `get`, `view`, `list_outputs`, `convert`, `analyze_color`, `list_assets`, `asset_metadata`.
+  Which image/asset operation to perform. "get" requires `filename`; "view" and "asset_metadata" require `asset_id`; "convert" requires `format` plus exactly one of `asset_id`/`path`; action:"analyze_color" takes one source (`asset_id`, `filename`, or `path`); "list_outputs" and action:"list_assets" take no required parameters. Options: `action:"get"`, `action:"view"`, `action:"list_outputs"`, `action:"convert"`, `action:"analyze_color"`, `action:"list_assets"`, `action:"asset_metadata"`.
 </ParamField>
 <ParamField path="filename" type="string">
   Output image filename, e.g. PulID_Klein_00001_.png. REQUIRED for action:"get". OPTIONAL for action:"analyze_color", where it is one of the three ways to name a source (pair it with subfolder/type).
 </ParamField>
 <ParamField path="asset_id" type="string">
-  Asset id returned by action:"list_assets" or job completion. REQUIRED for actions "view" and "asset_metadata". OPTIONAL for "convert" (provide exactly one of asset_id or path) and "analyze_color" (one of asset_id, filename, or path).
+  Asset id returned by action:"list_assets" or job completion. REQUIRED for actions "view" and "asset_metadata". OPTIONAL for "convert" (provide exactly one of asset_id or path) and action:"analyze_color" (one of asset_id, filename, or path).
 </ParamField>
 <ParamField path="type" type="enum">
   ComfyUI directory the file lives in: output (default), input, or temp. Used by action:"get" and by action:"analyze_color" when the source is a `filename`. Options: `output`, `input`, `temp`.
@@ -215,7 +215,7 @@ Put a file where ComfyUI (or cloud storage) can read it. Driven by the `action` 
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  What to upload and where. "image"/"video"/"audio" send a LOCAL file (`source_path`) to ComfyUI's input/ directory; "stage" re-registers an EXISTING server-side output (`filename`) as an input; "output" ships a generated output to cloud storage (`destination`). Options: `image`, `video`, `audio`, `output`, `stage`.
+  What to upload and where. "image"/"video"/"audio" send a LOCAL file (`source_path`) to ComfyUI's input/ directory; "stage" re-registers an EXISTING server-side output (`filename`) as an input; "output" ships a generated output to cloud storage (`destination`). Options: `action:"image"`, `action:"video"`, `action:"audio"`, `action:"output"`, `action:"stage"`.
 </ParamField>
 <ParamField path="source_path" type="string">
   Absolute path to the local file to upload. REQUIRED for actions "image", "video" and "audio".

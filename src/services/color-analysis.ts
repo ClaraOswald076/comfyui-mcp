@@ -114,7 +114,7 @@ async function resolveBytes(opts: AnalyzeColorOptions): Promise<Buffer> {
   }
 
   throw new ValidationError(
-    "get_image (action:\"analyze_color\") requires one of: asset_id, filename (+optional subfolder/type), or path.",
+    'get_image (action:"analyze_color") requires one of: asset_id, filename (+optional subfolder/type), or path.',
   );
 }
 

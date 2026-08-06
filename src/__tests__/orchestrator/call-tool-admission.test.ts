@@ -570,7 +570,10 @@ describe("call_tool admission", () => {
 
   it("name-level behavior is unchanged for everything else", () => {
     // A whitelisted tool with no action scope is admitted regardless of args…
-    expect(callToolAdmission("list_output_images", {})).toBeNull();
+    // (this used to name the standalone output listing; 0.50.0 slice 15 folded
+    // that into get_image, which IS action-scoped, so the example moved to a
+    // whitelist entry that still carries no scope.)
+    expect(callToolAdmission("enqueue_workflow", {})).toBeNull();
     // …including a consolidated tool whose whole-tool posture was judged at
     // whitelist time (apps, 0.49.0 slice 2) — deliberately NOT rescoped here.
     expect(callToolAdmission("apps", { action: "run" })).toBeNull();

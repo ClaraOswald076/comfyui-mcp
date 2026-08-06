@@ -25,7 +25,7 @@ Find model weights and get them onto the connected ComfyUI, and track the transf
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which model operation to perform. "download" requires `url` + `target_subfolder`; "status" takes an optional `id`/`tray_id`/`url` (omit all three to list everything); "cancel" requires `id` (optional `tray_id`); "search" requires `query`; "search_civitai" requires `query` and/or `creator`; "search_creators" takes an optional `query` (omit for the leaderboard `board`); "download_civitai" requires `target_subfolder` plus `model_id` and/or `model_version_id`; "resolve_missing" requires `workflow`. Options: `download`, `status`, `cancel`, `search`, `search_civitai`, `search_creators`, `download_civitai`, `resolve_missing`.
+  Which model operation to perform. "download" requires `url` + `target_subfolder`; "status" takes an optional `id`/`tray_id`/`url` (omit all three to list everything); "cancel" requires `id` (optional `tray_id`); "search" requires `query`; "search_civitai" requires `query` and/or `creator`; "search_creators" takes an optional `query` (omit for the leaderboard `board`); "download_civitai" requires `target_subfolder` plus `model_id` and/or `model_version_id`; "resolve_missing" requires `workflow`. Options: `action:"download"`, `action:"status"`, `action:"cancel"`, `action:"search"`, `action:"search_civitai"`, `action:"search_creators"`, `action:"download_civitai"`, `action:"resolve_missing"`.
 </ParamField>
 <ParamField path="url" type="string">
   REQUIRED for action:"download" — the direct download URL for the model file. OPTIONAL for action:"status" — adopt an in-flight download by its source URL when you don't have the id (e.g. after a reconnect); reports the matching job without starting a duplicate.
@@ -179,7 +179,7 @@ Inspect what models this ComfyUI has installed, and where it looks for them. Dri
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which inventory operation to perform. "list" (optional `model_type`), "embeddings" and "list_paths" are READ-ONLY. "remove" DELETES the model file named by `path` — required, and destructive. "add_path"/"remove_path" edit the extra-search-path YAML and require `category` + `path`; they never touch model files. Options: `list`, `remove`, `embeddings`, `list_paths`, `add_path`, `remove_path`.
+  Which inventory operation to perform. "list" (optional `model_type`), "embeddings" and "list_paths" are READ-ONLY. "remove" DELETES the model file named by `path` — required, and destructive. "add_path"/"remove_path" edit the extra-search-path YAML and require `category` + `path`; they never touch model files. Options: `action:"list"`, `action:"remove"`, `action:"embeddings"`, `action:"list_paths"`, `action:"add_path"`, `action:"remove_path"`.
 </ParamField>
 <ParamField path="model_type" type="enum">
   action:"list" — filter by model type (e.g. 'checkpoints', 'loras'). Lists all types if omitted. Options: `checkpoints`, `loras`, `vae`, `upscale_models`, `controlnet`, `embeddings`, `clip`, `diffusers`, `diffusion_models`, `gligen`, `hypernetworks`, `photomaker`, `style_models`, `text_encoders`, `unet`.
@@ -288,7 +288,7 @@ Curate a model file's embedded .safetensors metadata (Model Explorer). Driven by
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which metadata operation to perform. All three actions require `category` + `name`; "propose" also requires `fields` (optional `note`); "fetch_civitai" takes an optional `version_id`. Options: `read`, `propose`, `fetch_civitai`.
+  Which metadata operation to perform. All three actions require `category` + `name`; "propose" also requires `fields` (optional `note`); "fetch_civitai" takes an optional `version_id`. Options: `action:"read"`, `action:"propose"`, `action:"fetch_civitai"`.
 </ParamField>
 <ParamField path="category" type="string">
   ComfyUI model folder, e.g. 'loras'. REQUIRED for all three actions.

@@ -19,7 +19,7 @@ Discover ComfyUI custom node PACKS in the public ComfyUI Registry (registry.comf
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which registry lookup to perform. "search" requires `query` (and takes optional `limit`/`page`); "details" requires `id`. Options: `search`, `details`.
+  Which registry lookup to perform. "search" requires `query` (and takes optional `limit`/`page`); "details" requires `id`. Options: `action:"search"`, `action:"details"`.
 </ParamField>
 <ParamField path="query" type="string">
   action:"search" — REQUIRED. Keyword(s) to match against pack name/description, e.g. 'impact', 'controlnet aux'.
@@ -85,7 +85,7 @@ Install, repair, enable/disable and remove ComfyUI custom node packs on this Com
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which custom-node operation to perform. "install", "update", "reinstall", "fix", "uninstall", "enable" and "disable" require `id`; "list" and "sync_deps" take no required parameters. Options: `install`, `update`, `reinstall`, `fix`, `uninstall`, `enable`, `disable`, `list`, `sync_deps`.
+  Which custom-node operation to perform. "install", "update", "reinstall", "fix", "uninstall", "enable" and "disable" require `id`; "list" and "sync_deps" take no required parameters. Options: `action:"install"`, `action:"update"`, `action:"reinstall"`, `action:"fix"`, `action:"uninstall"`, `action:"enable"`, `action:"disable"`, `action:"list"`, `action:"sync_deps"`.
 </ParamField>
 <ParamField path="id" type="string">
   The pack to act on. REQUIRED for actions "install", "update", "reinstall", "fix", "uninstall", "enable" and "disable". For "install" this is a registry id, git URL, or node-pack name (find one with search_custom_nodes); for "update"/"fix" it may also be 'all' (every installed pack); for "update"/"reinstall"/"fix"/"uninstall"/"enable"/"disable" it is a registry id / module name of an INSTALLED pack.
@@ -206,7 +206,7 @@ Author, edit, test and publish YOUR OWN ComfyUI custom-node pack under &lt;COMFY
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which node-pack operation to perform. "scaffold" requires `name` + `display_name`; "list_files" requires `pack`; "read" requires `path`; "search" requires `query`; "write" requires `path` + `content`; "patch" requires `patch`; "git" requires `pack` + `git_action`. "verify" and "publish" have no required parameters — "verify" resolves the pack from `name` (or checks `class_types` directly), "publish" from `name` or `path`. Options: `scaffold`, `verify`, `publish`, `list_files`, `read`, `search`, `write`, `patch`, `git`.
+  Which node-pack operation to perform. "scaffold" requires `name` + `display_name`; "list_files" requires `pack`; "read" requires `path`; "search" requires `query`; "write" requires `path` + `content`; "patch" requires `patch`; "git" requires `pack` + `git_action`. "verify" and "publish" have no required parameters — "verify" resolves the pack from `name` (or checks `class_types` directly), "publish" from `name` or `path`. Options: `action:"scaffold"`, `action:"verify"`, `action:"publish"`, `action:"list_files"`, `action:"read"`, `action:"search"`, `action:"write"`, `action:"patch"`, `action:"git"`.
 </ParamField>
 <ParamField path="name" type="string">
   Pack folder name under &lt;COMFYUI_PATH&gt;/custom_nodes/. REQUIRED for action:"scaffold" — a safe lowercase slug (letters, digits, hyphens, underscores), e.g. 'my-cool-nodes', which becomes the directory under custom_nodes/ and the pyproject [project].name. For action:"verify", the pack whose __init__.py NODE_CLASS_MAPPINGS keys are inferred and checked when `class_types` is omitted. For action:"publish", the pack folder to publish (give this or `path`).
@@ -416,7 +416,7 @@ Custom-node snapshots via ComfyUI-Manager (mirrors `comfy node save-snapshot` / 
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which snapshot operation to perform. "list" takes no other parameters; "save" takes an optional `name`; "restore" requires `name`. Options: `list`, `save`, `restore`.
+  Which snapshot operation to perform. "list" takes no other parameters; "save" takes an optional `name`; "restore" requires `name`. Options: `action:"list"`, `action:"save"`, `action:"restore"`.
 </ParamField>
 <ParamField path="name" type="string">
   Snapshot name (no extension, no path separators). REQUIRED for action:"restore" (as shown by action:"list"). OPTIONAL for action:"save" — omit to let ComfyUI-Manager assign a timestamped name. Ignored by action:"list".
@@ -469,7 +469,7 @@ All actions are argument-free; `action` is the only parameter. `good`/`bad` requ
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which bisect operation to perform. "start" begins a session; "good"/"bad" narrow it (require a running session); "reset" clears it and re-enables everything; "status" reports state. No other arguments are needed for any action. Options: `start`, `good`, `bad`, `reset`, `status`.
+  Which bisect operation to perform. "start" begins a session; "good"/"bad" narrow it (require a running session); "reset" clears it and re-enables everything; "status" reports state. No other arguments are needed for any action. Options: `action:"start"`, `action:"good"`, `action:"bad"`, `action:"reset"`, `action:"status"`.
 </ParamField>
 
 ### Example

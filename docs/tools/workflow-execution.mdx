@@ -126,7 +126,7 @@ Inspect and manage the ComfyUI execution queue. Driven by the `action` parameter
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which queue operation to perform. "list" and "clear" take no other parameters; "status", "get_workflow" and "cancel_queued" require `prompt_id`; "move" requires `prompt_id` + `position`; "edit" requires `prompt_id` (optional `workflow`/`node_inputs`/`position`); "cancel" takes an optional `prompt_id` and `clear_pending`. Options: `list`, `status`, `get_workflow`, `move`, `edit`, `cancel`, `cancel_queued`, `clear`.
+  Which queue operation to perform. "list" and "clear" take no other parameters; "status", "get_workflow" and "cancel_queued" require `prompt_id`; "move" requires `prompt_id` + `position`; "edit" requires `prompt_id` (optional `workflow`/`node_inputs`/`position`); "cancel" takes an optional `prompt_id` and `clear_pending`. Options: `action:"list"`, `action:"status"`, `action:"get_workflow"`, `action:"move"`, `action:"edit"`, `action:"cancel"`, `action:"cancel_queued"`, `action:"clear"`.
 </ParamField>
 <ParamField path="prompt_id" type="string">
   The prompt_id of a job (the id returned by enqueue_workflow). REQUIRED for actions "status", "get_workflow", "move", "edit" and "cancel_queued" (a PENDING queue item for all but "status"). OPTIONAL for action:"cancel" — if given, only interrupts the running job when its prompt_id matches; omit to interrupt whatever is currently running.
@@ -450,7 +450,7 @@ Batch ids are durable — they survive server restarts.
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which batch operation to perform. "submit" takes workflows | workflow+sweep; "status"/"output"/"wait" each require `batch_id` ("wait" also takes `timeout_s`). Options: `submit`, `status`, `output`, `wait`.
+  Which batch operation to perform. "submit" takes workflows | workflow+sweep; "status"/"output"/"wait" each require `batch_id` ("wait" also takes `timeout_s`). Options: `action:"submit"`, `action:"status"`, `action:"output"`, `action:"wait"`.
 </ParamField>
 <ParamField path="workflows" type="object[]">
   action:"submit" — array of ComfyUI workflows in API format (node ID -&gt; &#123;class_type, inputs&#125;). Mutually exclusive with workflow+sweep.

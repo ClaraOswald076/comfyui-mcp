@@ -139,14 +139,12 @@ beforeEach(() => {
 });
 
 describe("image/asset registration", () => {
-  it("registers get_image, then upload_image, then workflow_from_image (12→2)", () => {
+  it("registers exactly get_image then upload_image (12→2)", () => {
     // Registration order is observable in tools/list and pinned by
-    // registry-surface.test.ts — the survivors keep their slots.
-    expect(registered().map((t) => t.name)).toEqual([
-      "get_image",
-      "upload_image",
-      "workflow_from_image",
-    ]);
+    // registry-surface.test.ts — the survivors keep their slots. The
+    // PNG-metadata tool that used to register third left this file in 0.50.0
+    // slice 14 (it is get_workflow action:"from_image" now).
+    expect(registered().map((t) => t.name)).toEqual(["get_image", "upload_image"]);
   });
 
   // The whole reason for the flat-enum shape rule: a z.discriminatedUnion renders
@@ -180,15 +178,9 @@ describe("image/asset registration", () => {
       "subfolder",
       "type",
     ]);
-    expect(json.properties?.action.enum?.slice().sort()).toEqual([
-      "analyze_color",
-      "asset_metadata",
-      "convert",
-      "get",
-      "list_assets",
-      "list_outputs",
-      "view",
-    ]);
+    // prettier-ignore — same reason as GET_IMAGE_ACTIONS in the tool: an action
+    // literal is licensed only where it follows `[` or `,` on its own line.
+    expect(json.properties?.action.enum?.slice().sort()).toEqual(["analyze_color", "asset_metadata", "convert", "get", "list_assets", "list_outputs", "view"]);
     // Only `action` can be required — the rest are per-action, enforced in the handler.
     expect(json.required).toEqual(["action"]);
   });
@@ -234,7 +226,7 @@ describe("image/asset registration", () => {
     expect(() => (shape.limit as z.ZodTypeAny).parse(2.5)).toThrow();
     // …and NO ceiling at the zod layer: the asset listing never had one, so
     // re-adding .max(100) here to match the output listing would be a false
-    // refusal for every list_assets caller asking for more than 100 records.
+    // refusal for every action:"list_assets" caller asking for more than 100 records.
     // The 100 bound lives in the list_outputs branch of the handler instead.
     expect((shape.limit as z.ZodTypeAny).parse(500)).toBe(500);
     // The format enum must carry BOTH halves of the union; narrowing it to one
@@ -321,7 +313,7 @@ describe("get_image: each action reaches exactly one service", () => {
     expect(getOutputImageMock).toHaveBeenCalledWith("p.png", "output", "", { allowMedia: true });
   });
 
-  it('action:"convert" forwards exactly the encoder options convert_image took', async () => {
+  it('action:"convert" forwards exactly the encoder options the retired converter took', async () => {
     await getImage()({
       action: "convert",
       asset_id: "a_123",
@@ -715,7 +707,6 @@ describe("the ledger", () => {
   it("keeps the surviving names in their original relative order", () => {
     const idx = (n: string) => (TOOL_NAMES as readonly string[]).indexOf(n);
     expect(idx("get_image")).toBeLessThan(idx("upload_image"));
-    expect(idx("upload_image")).toBeLessThan(idx("workflow_from_image"));
-    expect(idx("workflow_from_image")).toBeLessThan(idx("regenerate"));
+    expect(idx("upload_image")).toBeLessThan(idx("regenerate"));
   });
 });

@@ -1719,11 +1719,22 @@ export const DEAD_NAMES: readonly DeadName[] = [
     name: "analyze_color",
     since: "0.50.0",
     replacement: 'get_image (action:"analyze_color")',
+    // The fold reused the retired TOOL name as its ACTION name, so the tool
+    // that implements it necessarily spells the bare token twice: as a member
+    // of get_image's action enum, and as the `case` label that dispatches it.
+    // Rule (c) licenses exactly that one structural form — a complete quoted
+    // literal whose whole content is the name — in these two files, and
+    // nothing else: a live `call analyze_color` sentence in either of them is
+    // still reported, which is why this is not a SELF entry.
+    implementedIn: ["src/tools/image-management.ts"],
   },
   {
     name: "list_assets",
     since: "0.50.0",
     replacement: 'get_image (action:"list_assets")',
+    // Same collision as analyze_color above, same two structural forms, same
+    // two files. See that entry for why this is implementedIn and not SELF.
+    implementedIn: ["src/tools/image-management.ts"],
   },
   {
     name: "get_asset_metadata",

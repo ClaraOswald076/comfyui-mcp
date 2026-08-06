@@ -169,9 +169,10 @@ function summarizeRecord(record: ReturnType<typeof AssetRegistry.get>) {
  * parameters, hiding every input from the model.
  *
  * REQUIREDNESS: only `action` can be schema-required. `filename` is required for
- * action:"get" but optional for "analyze_color" and meaningless for
- * "list_assets"; `asset_id` is required for "view"/"asset_metadata" and optional
- * for "convert"/"analyze_color"; `format` is required for "convert" and optional
+ * action:"get" but optional for action:"analyze_color" and meaningless for
+ * action:"list_assets"; `asset_id` is required for "view"/"asset_metadata" and
+ * optional for "convert"/action:"analyze_color"; `format` is required for
+ * "convert" and optional
  * for "list_outputs". The handler enforces per-action PRESENCE and names the
  * missing field — the one deliberate behavioural difference a flat enum permits.
  * Guards test ABSENCE, never falsiness: `filename: ""` passed z.string() before
@@ -185,6 +186,19 @@ function summarizeRecord(record: ReturnType<typeof AssetRegistry.get>) {
  * the caller did not ask for without failing, so upload-image.test.ts pins each
  * action to exactly one service in BOTH directions.
  */
+/**
+ * The action vocabularies, declared once each.
+ *
+ * The zod enum and the unreachable-default error both read from these, so the
+ * message a caller gets for a bad action can never drift from the list the
+ * schema actually accepts — and neither list has to spell the actions twice.
+ */
+// prettier-ignore — one line so each member follows `[` or `,`, which is the
+// shape the dead-name gate licenses for a declared action literal.
+const GET_IMAGE_ACTIONS = ["get", "view", "list_outputs", "convert", "analyze_color", "list_assets", "asset_metadata"] as const;
+
+const UPLOAD_IMAGE_ACTIONS = ["image", "video", "audio", "output", "stage"] as const;
+
 export function registerImageManagementTools(server: McpServer): void {
   // ── get_image (7 actions) ────────────────────────────────────────────────
   server.tool(
@@ -199,9 +213,9 @@ export function registerImageManagementTools(server: McpServer): void {
       '- action:"asset_metadata" — Get full provenance for a registered asset including the workflow snapshot that produced it. Use this to inspect the parameters that generated an image before calling regenerate with overrides.',
     {
       action: z
-        .enum(["get", "view", "list_outputs", "convert", "analyze_color", "list_assets", "asset_metadata"])
+        .enum(GET_IMAGE_ACTIONS)
         .describe(
-          'Which image/asset operation to perform. "get" requires `filename`; "view" and "asset_metadata" require `asset_id`; "convert" requires `format` plus exactly one of `asset_id`/`path`; "analyze_color" takes one source (`asset_id`, `filename`, or `path`); "list_outputs" and "list_assets" take no required parameters.',
+          'Which image/asset operation to perform. "get" requires `filename`; "view" and "asset_metadata" require `asset_id`; "convert" requires `format` plus exactly one of `asset_id`/`path`; action:"analyze_color" takes one source (`asset_id`, `filename`, or `path`); "list_outputs" and action:"list_assets" take no required parameters.',
         ),
       filename: z
         .string()
@@ -213,7 +227,7 @@ export function registerImageManagementTools(server: McpServer): void {
         .string()
         .optional()
         .describe(
-          'Asset id returned by action:"list_assets" or job completion. REQUIRED for actions "view" and "asset_metadata". OPTIONAL for "convert" (provide exactly one of asset_id or path) and "analyze_color" (one of asset_id, filename, or path).',
+          'Asset id returned by action:"list_assets" or job completion. REQUIRED for actions "view" and "asset_metadata". OPTIONAL for "convert" (provide exactly one of asset_id or path) and action:"analyze_color" (one of asset_id, filename, or path).',
         ),
       type: z
         .enum(["output", "input", "temp"])
@@ -462,9 +476,9 @@ export function registerImageManagementTools(server: McpServer): void {
           // ── LIST_OUTPUTS (browse output/ — the video-render check) ─────────
           case "list_outputs": {
             // The retired output-listing tool's schema carried `.int().min(1).max(100)`
-            // while list_assets carried `.int().positive()` with NO upper bound.
+            // while action:"list_assets" carried `.int().positive()` with no ceiling.
             // A single zod field cannot express both: the intersection would
-            // REFUSE a list_assets limit of 500 that was legal before (a false
+            // REFUSE an action:"list_assets" limit of 500 that was legal before (a false
             // refusal), and the union alone would let a list_outputs caller ask
             // for 5000 entries and blow the context. So the shared field keeps
             // the loosest zod constraint both agreed on (positive integer) and
@@ -617,7 +631,7 @@ export function registerImageManagementTools(server: McpServer): void {
                 reconcileErr instanceof Error
                   ? reconcileErr.message
                   : String(reconcileErr);
-              logger.warn("list_assets history reconcile failed", { error: message });
+              logger.warn('get_image action:"list_assets" history reconcile failed', { error: message });
               // Truthful degradation: previously reconciled records stay listed
               // (they name real outputs) — the note must not claim watched-only.
               note =
@@ -664,7 +678,7 @@ export function registerImageManagementTools(server: McpServer): void {
             // silent undefined if the schema and switch ever drift apart.
             const exhaustive: never = args.action;
             throw new Error(
-              `Unknown get_image action "${String(exhaustive)}". Expected one of: get, view, list_outputs, convert, analyze_color, list_assets, asset_metadata.`,
+              `Unknown get_image action "${String(exhaustive)}". Expected one of: ${GET_IMAGE_ACTIONS.join(", ")}.`,
             );
           }
         }
@@ -712,7 +726,7 @@ export function registerImageManagementTools(server: McpServer): void {
       '- action:"output" — Upload a generated ComfyUI output to CLOUD storage (this is the only action that sends bytes off the machine). Source can be asset_id or a local path under COMFYUI_PATH/output. Destination can be S3, Azure Blob, HTTP PUT, or HuggingFace via the hf CLI.',
     {
       action: z
-        .enum(["image", "video", "audio", "output", "stage"])
+        .enum(UPLOAD_IMAGE_ACTIONS)
         .describe(
           'What to upload and where. "image"/"video"/"audio" send a LOCAL file (`source_path`) to ComfyUI\'s input/ directory; "stage" re-registers an EXISTING server-side output (`filename`) as an input; "output" ships a generated output to cloud storage (`destination`).',
         ),
@@ -883,7 +897,7 @@ export function registerImageManagementTools(server: McpServer): void {
           default: {
             const exhaustive: never = args.action;
             throw new Error(
-              `Unknown upload_image action "${String(exhaustive)}". Expected one of: image, video, audio, output, stage.`,
+              `Unknown upload_image action "${String(exhaustive)}". Expected one of: ${UPLOAD_IMAGE_ACTIONS.join(", ")}.`,
             );
           }
         }

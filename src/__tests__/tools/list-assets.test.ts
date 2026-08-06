@@ -1,12 +1,12 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
 
 // Tool-level test for get_image action:"list_assets" (#751), the surviving
-// call form of the retired list_assets tool (0.50.0 slice 15). The REAL
+// call form of the retired asset-listing tool (0.50.0 slice 15). The REAL
 // reconcile path runs; only the ComfyUI client/config boundary is mocked, so a
 // panel-dispatched render (never watched by this process) must surface via the
 // history reconcile. The image/convert/colour/upload services are mocked only
 // to keep their heavier import graphs (sharp, the storage clients) out of this
-// test — the list_assets action never calls them.
+// test — the action:"list_assets" branch never calls them.
 const getHistoryMock = vi.fn();
 vi.mock("../../comfyui/client.js", () => ({
   getHistory: (...a: unknown[]) => getHistoryMock(...a),
@@ -122,7 +122,7 @@ describe('get_image action:"list_assets" (#751)', () => {
   it("lists a panel-dispatched render that this session never watched", async () => {
     // The bug: panel_run queues via the browser's app.queuePrompt, so no
     // JobWatcher/AssetRegistry.register ever ran for this prompt — yet
-    // get_history has the output. list_assets must surface it via reconcile.
+    // get_history has the output. action:"list_assets" must surface it via reconcile.
     const successTs = Date.now() - 4000;
     getHistoryMock.mockResolvedValue({
       "6afad7e0-59f1-422c-9298-e2dcb34058e0": panelHistoryEntry(
