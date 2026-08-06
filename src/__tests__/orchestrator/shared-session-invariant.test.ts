@@ -189,6 +189,16 @@ describe("sessions are orchestrator-scoped, never workflow-scoped (#884)", () =>
     // …and cleared at every conversation boundary (new chat / resume / rewind).
     expect((src.match(/turnOrigins\.forgetConversation\(/g) ?? []).length).toBeGreaterThanOrEqual(2);
     expect(src).toContain("turnOrigins.dropBranch(agentKeyFor(tabId));");
+    // A provider switch INVALIDATES any cross-backend in-flight pin ROUTING to
+    // the switching tab — at BOTH switch sites (hello re-hello + set_backend),
+    // so a Claude turn can't keep routing onto a tab Codex now owns (gate-3
+    // confirm, P0-1: the pin was validated only when set). Pins are judged by
+    // the BRIDGE's resolution (liveTabIdFor), so a pin naming any retired
+    // predecessor id of the surface — path-compressed migration aliases
+    // included (codex gate 4: A→B then B→C rewrites A→C, and no single hello
+    // ever names A) — is caught too.
+    expect((src.match(/turnOrigins\.tabChangedBackend\(panelTab\);/g) ?? []).length).toBe(2);
+    expect(src).toContain("liveTabOf: (tab) => bridge.liveTabIdFor(tab),");
     // A cancelled queued message's origin dies with it.
     expect(src).toContain("turnOrigins.cancelMid(mid);");
     // The panel MCP servers bind the backend-QUALIFIED scope address so the
@@ -385,6 +395,82 @@ describe("sessions are orchestrator-scoped, never workflow-scoped (#884)", () =>
     // this pin simply never exists — the pre-fix behavior.)
     await waitFor(() => tracker.pinOf(key) === "wf:a.json");
     expect(tracker.stampOf(key)).toBe("issue-uuid-a");
+    backend.release!();
+
+    await manager.stopAll();
+  });
+
+  it("send-now across tabs drives the REAL requeue path and fails the MERGED batch closed (gate-3 confirm P0-2)", async () => {
+    // The laundering sequence, through the real PanelAgentManager: message A
+    // (tab A) is mid-turn; interrupt-with-requeue restores A's ORIGINAL queue
+    // item; a new message from tab B lands behind it; the next turn drains
+    // BOTH into one merged batch. Before this fix, A's already-applied mid
+    // contributed no origin, so the merged A+B turn was pinned and stamped
+    // entirely to B — and A's requested edit ran against B's graph.
+    class HoldingBackend extends RecordingBackend {
+      release: (() => void) | null = null;
+      async *run(opts: BackendStartOptions): AsyncGenerator<AgentEvent> {
+        for await (const turn of opts.channel) {
+          yield { type: "session", sessionId: this.sessionId };
+          this.turnTexts.push(turn.text);
+          await new Promise<void>((r) => {
+            this.release = r;
+          });
+          yield { type: "result", ok: true, subtype: "success" } as AgentEvent;
+        }
+      }
+    }
+    const backend = new HoldingBackend();
+    const store = new SessionStore(PORT, { dir: DIR });
+    const uuids = new Map<string, string>([
+      ["wf:a.json", "uuid-a"],
+      ["wf:b.json", "uuid-b"],
+    ]);
+    const tracker = new TurnOriginTracker({
+      backendForTab: () => "claude",
+      backendOfKey: (k) => k.slice(k.lastIndexOf("::") + 2),
+      uuidOfTab: (t) => uuids.get(t),
+      warn: () => {},
+    });
+    const key = sharedAgentKey("claude");
+    const manager = new PanelAgentManager({
+      mcpServers: {},
+      systemAppend: "",
+      model: "claude-test",
+      onSay: () => {},
+      onSeen: (k: string, mid: string) => tracker.onSeen(k, mid),
+      onTurn: (k: string, state: string) => {
+        if (state === "done") tracker.turnEnded(k);
+      },
+      onSession: () => {},
+      sessionStore: store,
+      makeBackend: () => backend,
+    } as never);
+
+    // Turn 1: message A from tab wf:a.json, held mid-turn, pinned to A.
+    tracker.recordForMid("m-a", "uuid-a", "wf:a.json");
+    manager.send(key, "edit the sampler on MY workflow", { mid: "m-a" });
+    await waitFor(() => backend.turnTexts.length === 1);
+    await waitFor(() => tracker.pinOf(key) === "wf:a.json");
+
+    // Interrupt with requeue (the "send now" flow): A's original item goes
+    // back on the queue…
+    void manager.interrupt(key, { requeueInFlight: true });
+    // …the new message from tab B lands behind it BEFORE the aborted turn
+    // settles…
+    tracker.recordForMid("m-b", "uuid-b", "wf:b.json");
+    manager.send(key, "also do this over here", { mid: "m-b" });
+    // …then the aborted turn's result releases the gate and the next turn
+    // drains BOTH as one batch.
+    backend.release!();
+    await waitFor(() => backend.turnTexts.length === 2);
+    // The merged prompt really carries both messages (the laundering shape)…
+    expect(backend.turnTexts[1]).toContain("edit the sampler on MY workflow");
+    expect(backend.turnTexts[1]).toContain("also do this over here");
+    // …and the batch is recognized as MIXED: routing and mutations fail
+    // closed instead of pinning/stamping everything to B.
+    await waitFor(() => tracker.pinOf(key) === null);
+    expect(tracker.stampOf(key)).toBeUndefined();
     backend.release!();
 
     await manager.stopAll();

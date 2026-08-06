@@ -20,6 +20,10 @@ const KEY = "orchestrator::claude";
 function makeTracker(opts?: { defaultBackend?: string }) {
   const tabBackends = new Map<string, string>();
   const tabUuids = new Map<string, string>();
+  // Retired id → the live id it currently ROUTES to (mirrors the bridge's
+  // path-compressed migration aliases; ids not listed resolve to themselves;
+  // `null` marks an id that resolves to NOTHING — a disconnected surface).
+  const tabAliases = new Map<string, string | null>();
   const warnings: string[] = [];
   const def = opts?.defaultBackend ?? "claude";
   const tracker = new TurnOriginTracker({
@@ -29,9 +33,13 @@ function makeTracker(opts?: { defaultBackend?: string }) {
       return i >= 0 ? key.slice(i + 2) : def;
     },
     uuidOfTab: (tab) => tabUuids.get(tab),
+    liveTabOf: (tab) => {
+      const a = tabAliases.get(tab);
+      return a === null ? undefined : (a ?? tab);
+    },
     warn: (msg) => warnings.push(msg),
   });
-  return { tracker, tabBackends, tabUuids, warnings };
+  return { tracker, tabBackends, tabUuids, tabAliases, warnings };
 }
 
 const flushMicrotasks = () => new Promise<void>((r) => setTimeout(r, 0));
@@ -74,18 +82,73 @@ describe("TurnOriginTracker — pins and stamps land at dequeue (#884)", () => {
     expect(tracker.stampOf(KEY)).toBeUndefined();
   });
 
-  it("a re-queued (already consumed) mid contributes nothing and the turn inherits the last established origin", async () => {
+  it("a re-queued (already applied) mid RE-CONTRIBUTES its own origin — its re-run pins its own tab", async () => {
     const { tracker } = makeTracker();
     tracker.recordForMid("m1", "uuid-a", "tab-a");
     tracker.onSeen(KEY, "m1");
     await flushMicrotasks();
     tracker.turnEnded(KEY);
-    // Interrupt + send-now re-dispatches the same mid: its origin was consumed
-    // at the first dequeue, so the new batch has NO contribution and inherits.
+    // Interrupt + send-now re-dispatches the same mid. The request is still
+    // about tab-a's workflow, so its origin applies again — DIRECTLY, not via
+    // inheritance ("already applied" means "no NEW stamp of its own", never
+    // "origin-less" — independent gate on gate 3, P0-2).
     tracker.onSeen(KEY, "m1");
     await flushMicrotasks();
     expect(tracker.pinOf(KEY)).toBe("tab-a");
     expect(tracker.stampOf(KEY)).toBe("uuid-a");
+  });
+
+  it("send-now cannot LAUNDER a mixed batch: a re-queued item merged with another tab's message fails BOTH closed (gate-3 confirm P0-2)", async () => {
+    const { tracker, warnings } = makeTracker();
+    // Message A (tab-a) dequeues and its turn runs…
+    tracker.recordForMid("m-a", "uuid-a", "tab-a");
+    tracker.onSeen(KEY, "m-a");
+    await flushMicrotasks();
+    expect(tracker.pinOf(KEY)).toBe("tab-a");
+    // …the user interrupts with send-now from tab B: A's original item is
+    // restored to the queue and B's new message lands behind it, so the next
+    // turn drains BOTH into ONE batch. Before this fix A's applied mid
+    // contributed nothing, so ONLY B counted — the merged A+B turn was pinned
+    // and stamped entirely to B, and A's requested edit landed on B's graph.
+    tracker.recordForMid("m-b", "uuid-b", "tab-b");
+    tracker.onSeen(KEY, "m-a"); // the re-queued item
+    tracker.onSeen(KEY, "m-b"); // the send-now message
+    await flushMicrotasks();
+    expect(tracker.pinOf(KEY)).toBeNull(); // MIXED — refuse routing
+    expect(tracker.stampOf(KEY)).toBeUndefined(); // …and mutations
+    expect(warnings.join("\n")).toMatch(/mixed\/unknown-origin/);
+  });
+
+  it("same-tab send-now keeps the routing pin (one tab), with the stamp per the distinct-uuid rule", async () => {
+    const { tracker } = makeTracker();
+    tracker.recordForMid("m-a", "uuid-1", "tab-a");
+    tracker.onSeen(KEY, "m-a");
+    await flushMicrotasks();
+    // Send-now from the SAME tab, same workflow: the merged batch agrees.
+    tracker.recordForMid("m-b", "uuid-1", "tab-a");
+    tracker.onSeen(KEY, "m-a");
+    tracker.onSeen(KEY, "m-b");
+    await flushMicrotasks();
+    expect(tracker.pinOf(KEY)).toBe("tab-a");
+    expect(tracker.stampOf(KEY)).toBe("uuid-1");
+  });
+
+  it("a re-queued item's origin is BACKEND-verified on re-application too", async () => {
+    const { tracker, tabBackends, tabUuids } = makeTracker();
+    tabBackends.set("tab-a", "claude");
+    tabUuids.set("tab-a", "uuid-a");
+    tracker.recordForMid("m-a", "uuid-a", "tab-a");
+    tracker.onSeen(KEY, "m-a");
+    await flushMicrotasks();
+    expect(tracker.pinOf(KEY)).toBe("tab-a");
+    tracker.turnEnded(KEY);
+    // tab-a joins Codex before the re-queued item re-dispatches: its applied
+    // origin must fail the batch closed, exactly like a live record would.
+    tabBackends.set("tab-a", "codex");
+    tracker.onSeen(KEY, "m-a");
+    await flushMicrotasks();
+    expect(tracker.pinOf(KEY)).toBeNull();
+    expect(tracker.stampOf(KEY)).toBeUndefined();
   });
 });
 
@@ -247,6 +310,99 @@ describe("TurnOriginTracker — origins are BACKEND-BOUND (gate 3, P0)", () => {
     await flushMicrotasks();
     expect(tracker.pinOf(KEY)).toBeNull();
     expect(warnings.join("\n")).toMatch(/now belongs to another backend's conversation/);
+  });
+
+  it("a mid-turn provider switch INVALIDATES a live pin on that tab — closes the post-dequeue door (gate-3 confirm P0-1)", async () => {
+    const { tracker, tabBackends, tabUuids, warnings } = makeTracker();
+    tabBackends.set("tab-a", "claude");
+    tabUuids.set("tab-a", "uuid-a");
+    // A Claude turn is RUNNING, pinned to tab-a (dequeue-time check passed —
+    // the tab was Claude's then)…
+    tracker.recordForMid("m-a", "uuid-a", "tab-a");
+    tracker.onSeen(KEY, "m-a");
+    await flushMicrotasks();
+    expect(tracker.pinOf(KEY)).toBe("tab-a");
+    // …then tab-a switches to Codex MID-TURN while another Claude tab keeps
+    // the agent alive. The pin was validated only when SET; nothing re-checked
+    // it at resolution, and the workflow uuid is unchanged by a provider
+    // switch, so a late Claude mutation would land on Codex's tab and pass
+    // the fence. The switch must invalidate the pin NOW.
+    tabBackends.set("tab-a", "codex");
+    tracker.tabChangedBackend("tab-a");
+    expect(tracker.pinOf(KEY)).toBeNull(); // refuse loudly
+    expect(tracker.stampOf(KEY)).toBeUndefined(); // mutations refuse too
+    expect(warnings.join("\n")).toMatch(/switched to the codex conversation/);
+  });
+
+  it("a MULTI-HOP migrated pin routing onto the switched tab is invalidated (path-compressed aliases — codex gate 4)", async () => {
+    const { tracker, tabBackends, tabUuids, tabAliases, warnings } = makeTracker();
+    tabBackends.set("tmp:id-A", "claude");
+    tabUuids.set("tmp:id-A", "uuid-a");
+    // A Claude turn pinned to the tab's ORIGINAL id A…
+    tracker.recordForMid("m-a", "uuid-a", "tmp:id-A");
+    tracker.onSeen(KEY, "m-a");
+    await flushMicrotasks();
+    expect(tracker.pinOf(KEY)).toBe("tmp:id-A");
+    // …then the surface re-hellos A→B (no switch), then B→C WITH a provider
+    // switch. The bridge path-compresses the chain, so the pin naming A
+    // resolves straight onto C — and no single hello ever reported A as
+    // migrated_from. The invalidation must judge the pin by where it ROUTES.
+    tabAliases.set("tmp:id-A", "wf:id-C");
+    tabAliases.set("wf:id-B", "wf:id-C");
+    tabBackends.delete("tmp:id-A");
+    tabBackends.set("wf:id-C", "codex");
+    tracker.tabChangedBackend("wf:id-C");
+    expect(tracker.pinOf(KEY)).toBeNull();
+    expect(tracker.stampOf(KEY)).toBeUndefined();
+    expect(warnings.join("\n")).toMatch(/switched to the codex conversation/);
+  });
+
+  it("a REVIVED pin id is refused AT RESOLUTION — ownership is checked at use, not only at the switch event (codex gate-4 delta P0)", async () => {
+    const { tracker, tabBackends, tabUuids, tabAliases, warnings } = makeTracker();
+    tabBackends.set("wf:recurring-id", "claude");
+    tabUuids.set("wf:recurring-id", "uuid-a");
+    // A Claude turn pins the tab…
+    tracker.recordForMid("m-a", "uuid-a", "wf:recurring-id");
+    tracker.onSeen(KEY, "m-a");
+    await flushMicrotasks();
+    expect(tracker.resolvedPinOf(KEY)).toBe("wf:recurring-id"); // healthy
+    // …then the surface migrates away (its backend record dies with the old
+    // id) and disconnects (its alias is pruned): the pin is unroutable and
+    // passes through — the bridge fails loudly for it, nothing to invalidate.
+    tabBackends.delete("wf:recurring-id");
+    tabAliases.set("wf:recurring-id", null);
+    expect(tracker.resolvedPinOf(KEY)).toBe("wf:recurring-id");
+    expect(tracker.pinOf(KEY)).toBe("wf:recurring-id");
+    // …then a NEW socket hellos under the SAME deterministic id on Codex. No
+    // switch event fires (`prev` was deleted with the old id), so the
+    // event-driven invalidation never sees it — the USE-time check must.
+    tabAliases.delete("wf:recurring-id");
+    tabBackends.set("wf:recurring-id", "codex");
+    expect(tracker.resolvedPinOf(KEY)).toBeNull(); // refused at resolution
+    expect(tracker.pinOf(KEY)).toBeNull(); // persisted — the stamp dies with it
+    expect(tracker.stampOf(KEY)).toBeUndefined();
+    expect(warnings.join("\n")).toMatch(/verified at resolution/);
+  });
+
+  it("the provider-switch invalidation touches ONLY cross-backend pins on THAT tab", async () => {
+    const { tracker, tabBackends, tabUuids } = makeTracker();
+    tabBackends.set("tab-a", "claude");
+    tabBackends.set("tab-b", "claude");
+    tabUuids.set("tab-b", "uuid-b");
+    // A Claude turn pinned to tab-b, and a Codex turn pinned to tab-a.
+    tracker.recordForMid("m-b", "uuid-b", "tab-b");
+    tracker.onSeen(KEY, "m-b");
+    tabBackends.set("tab-a", "codex");
+    tracker.recordForMid("m-a", "uuid-a", "tab-a");
+    tracker.onSeen("orchestrator::codex", "m-a");
+    await flushMicrotasks();
+    expect(tracker.pinOf(KEY)).toBe("tab-b");
+    expect(tracker.pinOf("orchestrator::codex")).toBe("tab-a");
+    // tab-a switching (again) to codex is a no-op for BOTH: the codex pin
+    // matches the tab's backend, and the claude pin names a different tab.
+    tracker.tabChangedBackend("tab-a");
+    expect(tracker.pinOf(KEY)).toBe("tab-b"); // untouched
+    expect(tracker.pinOf("orchestrator::codex")).toBe("tab-a"); // same-backend pin stands
   });
 
   it("a backend-mismatched origin is NOT marked consumed: its re-queue fails closed again rather than inheriting", async () => {

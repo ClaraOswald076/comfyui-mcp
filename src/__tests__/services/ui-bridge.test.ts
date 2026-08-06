@@ -1055,11 +1055,15 @@ describe("UiBridge (multi-tab)", () => {
     function wireRealScopeRouting() {
       const backendOfKey = (key: string): string =>
         key.includes("::") ? key.slice(key.lastIndexOf("::") + 2) : "claude";
-      const backendForTab = (): string => "claude"; // single-provider deployment
+      // Mirrors the orchestrator's live tabBackends map: tabs default to
+      // claude; a test flips an entry to simulate a provider switch/revival.
+      const tabBackends = new Map<string, string>();
+      const backendForTab = (tab: string): string => tabBackends.get(tab) ?? "claude";
       const tracker = new TurnOriginTracker({
         backendForTab,
         backendOfKey,
         uuidOfTab: () => undefined,
+        liveTabOf: (tab) => bridge.liveTabIdFor(tab), // the production wiring
         warn: () => {},
       });
       const scopeAgentKeyOf = (scopeId: string): string =>
@@ -1075,7 +1079,7 @@ describe("UiBridge (multi-tab)", () => {
           info: () => {},
         }),
       );
-      return { tracker };
+      return { tracker, tabBackends };
     }
     it("a scope-addressed tool call reaches the tab the user LAST TALKED FROM", async () => {
       const a = await connectPanel("wf:workflows/a.json", "a");
@@ -1329,6 +1333,59 @@ describe("UiBridge (multi-tab)", () => {
         expect(got.find((m) => m.cmd === "show_media")).toMatchObject({ mailbox: true });
       });
       tab.close();
+    });
+
+    it("liveTabIdFor follows a PATH-COMPRESSED multi-hop migration chain to the live tab (codex gate 4)", async () => {
+      // A→B then B→C on the SAME socket: the bridge rewrites every historical
+      // alias to the newest id in one step, so a pin naming A must be judged
+      // as routing to C — no single hello ever reports A as migrated_from for
+      // the second hop. This is the resolution the provider-switch pin
+      // invalidation (TurnOriginTracker.tabChangedBackend) consults.
+      const sock = await connectPanel("tmp:hop-a", "a");
+      autoReply(sock, "surface");
+      await vi.waitFor(() => expect(bridge.tabs().map((t) => t.tab_id)).toContain("tmp:hop-a"));
+      sock.send(JSON.stringify({ type: "hello", tab_id: "wf:hop-b", title: "b" }));
+      await vi.waitFor(() => expect(bridge.tabs().map((t) => t.tab_id)).toContain("wf:hop-b"));
+      sock.send(JSON.stringify({ type: "hello", tab_id: "wf:hop-c", title: "c" }));
+      await vi.waitFor(() => expect(bridge.tabs().map((t) => t.tab_id)).toContain("wf:hop-c"));
+
+      expect(bridge.liveTabIdFor("tmp:hop-a")).toBe("wf:hop-c"); // two hops, compressed
+      expect(bridge.liveTabIdFor("wf:hop-b")).toBe("wf:hop-c");
+      expect(bridge.liveTabIdFor("wf:hop-c")).toBe("wf:hop-c");
+      expect(bridge.liveTabIdFor("wf:never-seen")).toBeUndefined();
+      sock.close();
+    });
+
+    it("a pin whose id is REVIVED by another backend's tab is refused at resolution (codex gate-4 delta P0)", async () => {
+      // wf:<hash> ids are deterministic and recur. A Claude turn pins tab A;
+      // A disconnects (no switch event will ever fire for it); a NEW socket
+      // hellos under the SAME id on Codex. The pin now resolves exact-match
+      // onto the revived tab, and a provider switch does not change the
+      // workflow uuid — so only a USE-time ownership check refuses it.
+      const a = await connectPanel("wf:revive.json", "a");
+      autoReply(a, "old-claude-tab");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      const { tracker, tabBackends } = wireRealScopeRouting();
+
+      tracker.recordForMid("m-a", undefined, "wf:revive.json");
+      tracker.onSeen(SCOPE_KEY, "m-a");
+      await vi.waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:revive.json"));
+
+      a.close();
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(0));
+      // The revival: a different browser tab, same deterministic id, Codex.
+      const revived = await connectPanel("wf:revive.json", "a-again");
+      autoReply(revived, "new-codex-tab");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      tabBackends.set("wf:revive.json", "codex");
+
+      // The scope command must be REFUSED — never delivered to the revived
+      // Codex tab under the old Claude pin.
+      await expect(
+        bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE, timeoutMs: 300 }),
+      ).rejects.toThrow(/ambiguous/);
+      expect(tracker.pinOf(SCOPE_KEY)).toBeNull(); // invalidated at first use
+      revived.close();
     });
 
     it("a pinned turn FOLLOWS its own tab's same-socket migration, and REFUSES when the tab is gone or ambiguous", async () => {

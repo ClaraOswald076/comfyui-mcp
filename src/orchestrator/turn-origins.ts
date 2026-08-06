@@ -36,6 +36,14 @@ export interface TurnOriginDeps {
   backendOfKey: (key: string) => string;
   /** The trusted per-tab command workflow uuid (issue-time stamp source). */
   uuidOfTab: (tabId: string) => string | undefined;
+  /** The LIVE tab id a (possibly retired/aliased) tab id currently ROUTES to
+   *  (UiBridge.liveTabIdFor), or undefined when nothing resolves. The
+   *  provider-switch pin invalidation judges a pin by where it routes: the
+   *  bridge path-compresses migration chains (A→B then B→C rewrites A→C), so
+   *  a pin can name an id no single hello ever reported as migrated_from and
+   *  still resolve onto the switched tab (codex gate 4). Optional only for
+   *  lightweight test trackers; production always wires it. */
+  liveTabOf?: (tabId: string) => string | undefined;
   warn: (msg: string) => void;
 }
 
@@ -66,15 +74,25 @@ export class TurnOriginTracker {
   private readonly turnUuidByMid = new Map<string, MidOrigin>();
   private static readonly TURN_UUID_BY_MID_CAP = 5000;
 
-  // Mids that must contribute NOTHING to a batch without poisoning it: a
-  // re-queued item whose stamp was already applied at a previous dequeue
-  // (interrupt + send-now fires onSeen again), and deliberately ORIGIN-LESS
-  // injected turns (mintInheritedOrigin — e.g. a coalesced download_done,
-  // which has no originating tab and must INHERIT the conversation's last
-  // established origin at batch close). A genuinely unknown mid (evicted,
-  // foreign) still fails the batch closed.
-  private readonly consumedTurnMids = new Set<string>();
-  private static readonly CONSUMED_TURN_MIDS_CAP = 500;
+  // Mids already APPLIED at a previous dequeue, WITH the origin they applied.
+  // "Applied" deliberately does NOT mean "origin-less" (independent gate on
+  // gate 3, P0-2): a re-queued item (interrupt + send-now restores the
+  // original queue items, so its mid fires onSeen again) still HAS an origin —
+  // the request is still about the workflow it was issued from. It therefore
+  // RE-CONTRIBUTES that origin at every dequeue: alone, its re-run pins its
+  // own tab again; merged with another tab's message, the batch is genuinely
+  // MIXED and fails closed. The previous design ("contributes nothing") let
+  // send-now launder a mixed batch — A's re-queued item contributed no origin,
+  // so the merged A+B turn was pinned and stamped entirely to B, and A's
+  // requested edit landed on B's graph.
+  //
+  // A `null` origin marks a deliberately ORIGIN-LESS injected turn
+  // (mintInheritedOrigin — e.g. a coalesced download_done, which has no
+  // originating tab and must INHERIT the conversation's last established
+  // origin at batch close). A genuinely unknown mid (evicted, foreign) still
+  // fails the batch closed.
+  private readonly appliedTurnMids = new Map<string, MidOrigin | null>();
+  private static readonly APPLIED_TURN_MIDS_CAP = 500;
 
   // Per-key aggregation of ONE dispatch batch's issue-time origins (the manager
   // fires onSeen synchronously per item; the microtask closes the batch before
@@ -139,22 +157,24 @@ export class TurnOriginTracker {
    *  branch was unreachable for the very case it documents). */
   mintInheritedOrigin(): string {
     const mid = `evt-${randomUUID()}`;
-    this.noteConsumedTurnMid(mid);
+    this.noteAppliedTurnMid(mid, null);
     return mid;
   }
 
   /** A still-queued message was cancelled and REMOVED — its origin dies with it
-   *  so the bounded map only ever holds live queued messages (codex r3/r4). */
+   *  so the bounded maps only ever hold live queued messages (codex r3/r4). A
+   *  RE-QUEUED item can be cancelled too, so the applied record goes with it. */
   cancelMid(mid: string): void {
     this.turnUuidByMid.delete(mid);
+    this.appliedTurnMids.delete(mid);
   }
 
-  private noteConsumedTurnMid(mid: string): void {
-    this.consumedTurnMids.add(mid);
-    while (this.consumedTurnMids.size > TurnOriginTracker.CONSUMED_TURN_MIDS_CAP) {
-      const oldest = this.consumedTurnMids.values().next().value as string | undefined;
+  private noteAppliedTurnMid(mid: string, origin: MidOrigin | null): void {
+    this.appliedTurnMids.set(mid, origin);
+    while (this.appliedTurnMids.size > TurnOriginTracker.APPLIED_TURN_MIDS_CAP) {
+      const oldest = this.appliedTurnMids.keys().next().value as string | undefined;
       if (oldest === undefined) break;
-      this.consumedTurnMids.delete(oldest);
+      this.appliedTurnMids.delete(oldest);
     }
   }
 
@@ -173,7 +193,17 @@ export class TurnOriginTracker {
       batch = { known: [], tabs: new Set<string>(), unknown: false };
       this.pendingBatchStamp.set(key, batch);
     }
-    const rec = this.turnUuidByMid.get(mid);
+    // A mid's origin comes from the LIVE record (first dequeue) or the APPLIED
+    // record (a re-queued item — interrupt + send-now restores the original
+    // queue items, so the same mid dequeues again). BOTH contribute: a
+    // re-queued request is still about the workflow it was issued from, so its
+    // re-run alone re-pins its own tab, and a batch merging it with another
+    // tab's message is genuinely MIXED and fails closed — the previous
+    // contributes-nothing treatment let send-now launder a mixed A+B batch
+    // entirely onto B (independent gate on gate 3, P0-2). An applied `null`
+    // marks a deliberately origin-less injected turn (contributes nothing;
+    // inherits at batch close).
+    const rec = this.turnUuidByMid.get(mid) ?? this.appliedTurnMids.get(mid);
     if (rec) {
       // BACKEND-BOUND (confirming gate 3, P0): the origin must still belong to
       // THIS conversation's backend — both as recorded at mint AND as the tab
@@ -183,9 +213,10 @@ export class TurnOriginTracker {
       // would hand this conversation a tab that now belongs to another one.
       const backend = this.deps.backendOfKey(key);
       if (rec.backend !== backend || this.deps.backendForTab(rec.tab) !== backend) {
-        // NOT marked consumed: a re-queue of this item must fail closed again,
-        // not silently inherit the last established origin.
+        // Dropped from BOTH maps: a re-queue of this item must fail closed
+        // again (unknown), not silently inherit the last established origin.
         this.turnUuidByMid.delete(mid);
+        this.appliedTurnMids.delete(mid);
         batch.unknown = true;
         this.deps.warn(
           `[panel-orchestrator] ${key} dequeued a message whose origin tab ${rec.tab.slice(0, 8)} ` +
@@ -197,16 +228,15 @@ export class TurnOriginTracker {
         batch.known.push(rec.uuid);
         batch.tabs.add(rec.tab);
         this.turnUuidByMid.delete(mid);
-        this.noteConsumedTurnMid(mid);
+        this.noteAppliedTurnMid(mid, rec); // keeps its origin for a re-queue
       }
-    } else if (!this.consumedTurnMids.has(mid)) {
+    } else if (!this.appliedTurnMids.has(mid)) {
       // Unknown mid (evicted / foreign): its origin workflow cannot be known —
       // the batch must fail closed, never inherit a stale stamp.
       batch.unknown = true;
     }
-    // A consumed mid (a re-queued item, or a deliberately origin-less injected
-    // turn) contributes nothing: it either already applied its stamp at its
-    // first dequeue, or it inherits at the batch close below.
+    // An applied-null mid (a deliberately origin-less injected turn)
+    // contributes nothing and inherits at the batch close below.
     if (opensBatch) {
       const closed = batch;
       queueMicrotask(() => {
@@ -234,12 +264,13 @@ export class TurnOriginTracker {
           this.turnTargetTabByKey.set(key, tab);
           this.lastOriginByKey.set(key, { tab, uuid });
         } else {
-          // NO origin contribution (a pure re-queue, or a deliberately
-          // origin-less injected turn such as a coalesced download_done): the
-          // turn inherits the conversation's LAST ESTABLISHED origin — NEVER
-          // "whatever tab is active" (confirming gate 2, P0). The inherited tab
-          // must STILL belong to this conversation's backend (confirming gate
-          // 3, P0); no established/valid origin at all → refuse.
+          // NO origin contribution (a deliberately origin-less injected turn
+          // such as a coalesced download_done — re-queued items now contribute
+          // their own origin, see appliedTurnMids): the turn inherits the
+          // conversation's LAST ESTABLISHED origin — NEVER "whatever tab is
+          // active" (confirming gate 2, P0). The inherited tab must STILL
+          // belong to this conversation's backend (confirming gate 3, P0); no
+          // established/valid origin at all → refuse.
           const last = this.lastOriginByKey.get(key);
           if (last && this.deps.backendForTab(last.tab) === this.deps.backendOfKey(key)) {
             this.lastTurnUuidByKey.set(key, last.uuid);
@@ -262,6 +293,43 @@ export class TurnOriginTracker {
    *  follows the active tab again (the next turn re-pins). */
   turnEnded(key: string): void {
     this.turnTargetTabByKey.delete(key);
+  }
+
+  /**
+   * A tab changed provider. Any conversation whose IN-FLIGHT turn is pinned to
+   * this tab and whose backend no longer matches the tab's fails closed NOW
+   * (null pin, undefined stamp — the mixed-batch treatment): the dequeue-time
+   * verification closed the pre-dequeue door, and this closes the post-dequeue
+   * one (independent gate on gate 3, P0-1) — a pin must be INVALIDATED when
+   * its tab's ownership changes, not merely validated when it is set. Without
+   * this, a Claude turn running on tab A kept its pin after A joined Codex
+   * (nothing re-checks a live pin at resolution, and the workflow uuid is
+   * unchanged by a provider switch, so the stamp still passed): a late Claude
+   * mutation landed on a tab the Codex conversation now owns. Routing refuses
+   * loudly until an explicit target or the next origin-bearing message.
+   */
+  tabChangedBackend(tab: string): void {
+    const backend = this.deps.backendForTab(tab); // the tab's NEW backend
+    // Judge each pin by where it ROUTES, not by the id it carries: a pin may
+    // name a retired PREDECESSOR id of this browser surface (a same-socket
+    // re-hello renames the tab; the bridge PATH-COMPRESSES the alias chain, so
+    // after A→B then B→C a pin naming A resolves straight onto C without any
+    // single hello ever reporting A as migrated_from — codex gate 4). The
+    // bridge's own resolution is the one authority on that routing.
+    for (const [key, pin] of this.turnTargetTabByKey) {
+      if (typeof pin !== "string") continue;
+      const routesTo = this.deps.liveTabOf ? this.deps.liveTabOf(pin) : pin;
+      if (routesTo === tab && this.deps.backendOfKey(key) !== backend) {
+        this.turnTargetTabByKey.set(key, null);
+        this.lastTurnUuidByKey.set(key, undefined);
+        this.deps.warn(
+          `[panel-orchestrator] ${key}'s in-flight turn was pinned to tab ${pin.slice(0, 8)} ` +
+            `(routing to ${tab.slice(0, 8)}), which just switched to the ${backend} ` +
+            `conversation — scope routing and graph mutations FAIL CLOSED until an explicit ` +
+            `target or the next origin-bearing message (#884 gate-3 confirm, P0)`,
+        );
+      }
+    }
   }
 
   /** A conversation boundary (New chat / resume switch): the replaced
@@ -291,9 +359,51 @@ export class TurnOriginTracker {
 
   /** The in-flight turn's routing pin: string = pinned tab; null = ambiguous
    *  origin (refuse loudly); undefined = no turn in flight (active-tab
-   *  resolution applies). */
+   *  resolution applies). Raw state — ROUTING must go through
+   *  {@link resolvedPinOf}, which additionally verifies ownership at the
+   *  moment of use. */
   pinOf(key: string): string | null | undefined {
     return this.turnTargetTabByKey.has(key) ? this.turnTargetTabByKey.get(key)! : undefined;
+  }
+
+  /**
+   * The pin as ROUTING must use it: ownership is verified AT RESOLUTION, not
+   * only at the switch event (codex gate-4 delta, P0). Event-driven
+   * invalidation ({@link tabChangedBackend}) fires when a switch is
+   * OBSERVABLE, but a pin can land on a foreign-backend tab with no event at
+   * all: wf:<hash> ids are deterministic and recur, so after the pinned
+   * surface migrates away (deleting its backend record) and disconnects
+   * (pruning its alias), a NEW socket can hello under the pin's exact id on
+   * another backend — `prev` is gone, no switch is seen, and the stale pin
+   * resolves straight onto the revived tab (same workflow uuid → the stamp
+   * passes too). Checking at use closes every arrival order.
+   *
+   * A pin whose routed tab no longer belongs to this conversation fails
+   * closed PERSISTENTLY (null pin, undefined stamp — first use invalidates,
+   * with a warn) so the stamp cannot outlive the refusal and the explicit
+   * recovery sees the recoverable state. An UNROUTABLE pin is returned as-is:
+   * the bridge's own resolution fails loudly for it (parked/retried), which
+   * is the documented dead-pin behavior.
+   */
+  resolvedPinOf(key: string): string | null | undefined {
+    const pin = this.pinOf(key);
+    if (typeof pin !== "string") return pin;
+    const live = this.deps.liveTabOf ? this.deps.liveTabOf(pin) : pin;
+    if (live === undefined) return pin; // unroutable — fails loudly downstream
+    const backend = this.deps.backendOfKey(key);
+    if (this.deps.backendForTab(live) !== backend) {
+      this.turnTargetTabByKey.set(key, null);
+      this.lastTurnUuidByKey.set(key, undefined);
+      this.deps.warn(
+        `[panel-orchestrator] ${key}'s in-flight turn is pinned to tab ${pin.slice(0, 8)}, ` +
+          `which now routes to a tab owned by the ${this.deps.backendForTab(live)} ` +
+          `conversation — scope routing and graph mutations FAIL CLOSED until an explicit ` +
+          `target or the next origin-bearing message (#884 gate-4 confirm, P0: ownership ` +
+          `is verified at resolution, not only at the switch event)`,
+      );
+      return null;
+    }
+    return pin;
   }
 
   /** The conversation's issue-time workflow stamp (what scope-addressed
@@ -331,13 +441,15 @@ export class TurnOriginTracker {
 
 /** The scope target resolver the UiBridge consults while resolving a
  *  scope-addressed command: the in-flight turn's pin (string), an ambiguous
- *  origin (`null` → refuse loudly), or no turn in flight (undefined →
- *  active-tab resolution). Built here so tests drive the REAL resolver. */
+ *  or ownership-refused origin (`null` → refuse loudly), or no turn in flight
+ *  (undefined → active-tab resolution). Goes through resolvedPinOf so the
+ *  pin's OWNERSHIP is verified at every use (codex gate-4 delta, P0). Built
+ *  here so tests drive the REAL resolver. */
 export function makeScopeTargetResolver(opts: {
   tracker: TurnOriginTracker;
   scopeAgentKeyOf: (scopeId: string) => string;
 }): (scopeId: string) => string | null | undefined {
-  return (scopeId) => opts.tracker.pinOf(opts.scopeAgentKeyOf(scopeId));
+  return (scopeId) => opts.tracker.resolvedPinOf(opts.scopeAgentKeyOf(scopeId));
 }
 
 /** The slice of UiBridge the repin recovery consults. */
@@ -376,9 +488,13 @@ export function makeScopeRepinHandler(opts: {
 }): (scopeId: string) => string | undefined {
   return (scopeId) => {
     const key = opts.scopeAgentKeyOf(scopeId);
-    // RECOVERY ONLY: a pin that still reaches a live tab is healthy — never
-    // displace it (null = ambiguous and absent = no pin are both recoverable).
-    const existing = opts.tracker.pinOf(key);
+    // RECOVERY ONLY: a pin that still reaches a live tab OF THIS conversation
+    // is healthy — never displace it (null = ambiguous/ownership-refused and
+    // absent = no pin are both recoverable). resolvedPinOf, not raw pinOf: a
+    // pin whose tab was revived by another backend "reaches" but is NOT
+    // healthy — treating it as healthy would deadlock the advertised recovery
+    // against the resolution-time refusal (codex gate-4 delta).
+    const existing = opts.tracker.resolvedPinOf(key);
     if (typeof existing === "string" && opts.bridge.canReach(existing)) {
       return undefined;
     }

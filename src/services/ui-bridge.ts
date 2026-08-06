@@ -2285,6 +2285,22 @@ export class UiBridge {
     }
   }
 
+  /** The LIVE tab id `tabId` currently resolves to (exact id, unambiguous
+   *  prefix, or the same-socket migration-alias chain — the SAME acceptance
+   *  {@link canReach}/resolveTarget use), or undefined when nothing resolves.
+   *  The orchestrator's provider-switch pin invalidation judges a pin by where
+   *  it ROUTES, not by the id it carries: path compression rewrites every
+   *  historical alias to the newest live id in one step (see the migration
+   *  block in the hello handler), so a pin can name an id no single hello ever
+   *  reported as `migrated_from` and still resolve onto the switched tab. */
+  liveTabIdFor(tabId: string): string | undefined {
+    try {
+      return this.resolveTarget(tabId).tabId;
+    } catch {
+      return undefined;
+    }
+  }
+
   /**
    * Whether the live tab resolved for `tabId` can safely accept a mutation of
    * its active workflow. This mirrors the two pre-dispatch conditions in

@@ -1565,6 +1565,9 @@ export async function runPanelOrchestrator(): Promise<void> {
     backendForTab,
     backendOfKey: backendOf,
     uuidOfTab: (tab) => tabCommandWorkflowUuid.get(tab),
+    // The provider-switch pin invalidation judges a pin by where the BRIDGE
+    // routes it (path-compressed migration aliases included) — codex gate 4.
+    liveTabOf: (tab) => bridge.liveTabIdFor(tab),
     warn: (msg) => logger.warn(msg),
   });
   // #884 — ROUTING for agent output: every connected tab participating in this
@@ -3415,6 +3418,15 @@ export async function runPanelOrchestrator(): Promise<void> {
         providerSwitched = true;
       }
       tabBackends.set(panelTab, backend);
+      // #884 gate-3 confirm (P0) — a provider switch changes which conversation
+      // OWNS this tab, so any OTHER conversation's in-flight turn ROUTING to it
+      // must fail closed now: the pin was validated when set (dequeue-time
+      // backend check), but nothing re-checked it at resolution, so a Claude
+      // turn kept mutating a tab that had joined Codex mid-turn. The
+      // invalidation judges pins by the bridge's own resolution, so a pin
+      // naming any retired predecessor id of this surface (path-compressed
+      // migration aliases — codex gate 4) is caught too.
+      if (providerSwitched) turnOrigins.tabChangedBackend(panelTab);
       // #468 — retire() handed back any run completion the OLD provider held, but
       // the flush it triggered ran while agentKeyFor() still resolved the OLD
       // backend, so it could only re-journal it. Re-address it now that the tab
@@ -3728,6 +3740,11 @@ export async function runPanelOrchestrator(): Promise<void> {
         }
       }
       tabBackends.set(panelTab, reqBackend);
+      // #884 gate-3 confirm (P0) — same rule as the hello switch path: the tab
+      // now belongs to another conversation, so any in-flight turn of a
+      // DIFFERENT backend still pinned to it fails closed instead of keeping a
+      // live route onto a tab it no longer owns.
+      if (prev !== reqBackend) turnOrigins.tabChangedBackend(panelTab);
       // #884 — this tab just joined the NEW backend's conversation without a
       // re-hello; deliver any frames parked while that conversation had no tab.
       {
