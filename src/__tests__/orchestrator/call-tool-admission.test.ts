@@ -318,8 +318,17 @@ describe("call_tool admission", () => {
     it("the retired standalone names are no longer admitted under their own names", () => {
       // They are not registered tools any more, so the channel must refuse them at
       // the NAME level rather than silently accepting a name nothing serves.
+      //
+      // The REFUSAL is the invariant; its wording is not. This assertion used to
+      // spell `tool "x" is not permitted`, which was the honest answer only while
+      // admission ran ahead of the retirement ledger — it told a caller its
+      // PERMISSION was wrong when the truth was that the tool had been RENAMED,
+      // sending them to check tokens and whitelists instead of to the new name.
+      // Admission now consults the ledger first, so the correct expectation is
+      // the redirect. What must never change is that the result is non-null.
       for (const name of ["list_workflows", "analyze_workflow", "query_workflow"]) {
-        expect(callToolAdmission(name, {}), name).toBe(`tool "${name}" is not permitted`);
+        expect(callToolAdmission(name, {}), `${name} must not be admitted`).not.toBeNull();
+        expect(callToolAdmission(name, {}), name).toBe(retiredToolMessage(name));
       }
     });
   });
@@ -330,9 +339,25 @@ describe("call_tool admission", () => {
   // more candidates. Slice-agnostic, so it keeps holding as 0.50.0 lands.
   it("no name the ledger declares dead is admitted by the whitelist", () => {
     for (const dead of DEAD_NAMES) {
-      expect(callToolAdmission(dead.name, {}), dead.name).toBe(
-        `tool "${dead.name}" is not permitted`,
-      );
+      // NEVER ADMITTED is the property under test — assert that first and on its
+      // own, so this keeps failing loudly if a future change makes a dead name
+      // return null, regardless of how refusals are worded.
+      expect(callToolAdmission(dead.name, {}), `${dead.name} must not be admitted`).not.toBeNull();
+      // And the refusal must be the ledger's redirect rather than a permission
+      // error: for a name that no longer exists, "not permitted" is a wrong
+      // answer, not merely a terse one.
+      //
+      // Anchored on a LITERAL as well as on the helper. Comparing only against
+      // `retiredToolMessage(...)` would be tautological for the wording — the
+      // implementation calls that same helper, so the assertion would hold no
+      // matter what the helper returned. vocabulary.test.ts owns the exact
+      // phrasing against a literal; here we independently require that the
+      // answer identifies the tool by name and does NOT claim a permission
+      // problem, which is the specific wrong answer this change removes.
+      const refusal = callToolAdmission(dead.name, {});
+      expect(refusal, dead.name).toBe(retiredToolMessage(dead.name));
+      expect(refusal, dead.name).toContain(`Unknown tool '${dead.name}'`);
+      expect(refusal, dead.name).not.toContain("is not permitted");
     }
   });
 
