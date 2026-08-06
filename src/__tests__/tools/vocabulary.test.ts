@@ -328,17 +328,27 @@ describe("rotMentions", () => {
    * nonetheless all names that are LIVE in TOOL_NAMES, because the exemption
    * requires the replacement to name a tool that exists — an invented survivor
    * would (correctly) not be exempted at all.
+   *
+   * The survivor is one of the eight tools the 0.50.0 plan FREEZES (`queue`, shipped
+   * in the 0.49.0 slices and explicitly "do not re-open"), rather than whichever tool
+   * slice 13 happens to fold these into. An earlier revision spelled real mid-flight
+   * survivors and broke the moment a DIFFERENT slice landed: slice 9 retired
+   * `install_workflow_dependencies`, and this test started failing for a reason that
+   * had nothing to do with the rule under test. Anchoring to a frozen name keeps the
+   * fixture about the SHAPE, which is the stated intent, and immune to every
+   * remaining slice.
    */
   it("passes the slice-13 replacement forms while their bare forms still fail", () => {
+    const SURVIVOR = "queue"; // frozen by the 0.50.0 plan; see above
     const folds: Array<[string, string]> = [
-      ["update_all", 'update_comfyui (action:"update_all")'],
-      ["self_update", 'install_panel (action:"self_update")'],
-      ["configure_manager", 'install_custom_node (action:"configure_manager")'],
-      ["apply_manifest", 'install_workflow_dependencies (action:"apply_manifest")'],
-      ["clear_vram", 'get_system_stats (action:"clear_vram")'],
-      ["report_issue", 'health_check (action:"report_issue")'],
-      ["calculate", 'get_environment (action:"calculate")'],
-    ];
+      "update_all",
+      "self_update",
+      "configure_manager",
+      "apply_manifest",
+      "clear_vram",
+      "report_issue",
+      "calculate",
+    ].map((name) => [name, `${SURVIVOR} (action:"${name}")`]);
     // The fold map is slice 13's, but "the survivor must be a real tool" is not.
     for (const [, replacement] of folds) {
       expect(TOOL_NAMES as readonly string[]).toContain(replacement.split(" ")[0]);
