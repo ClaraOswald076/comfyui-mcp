@@ -87,7 +87,8 @@ export const SEARCH_LINE_MAX = 600;
 /** Bound on any subprocess (git / patch) stdout+stderr surfaced to the caller. */
 export const CMD_OUTPUT_MAX = 12_000;
 /**
- * #809 (codex gate): the FLOOR for any `max_chars`, mirroring query_workflow's own 500.
+ * #809 (codex gate): the FLOOR for any `max_chars`, mirroring get_workflow (action:"query")'s
+ * own 500.
  * A budget of 1 cannot hold the sentence that explains why the output was cut, so it
  * used to produce either an unexplained empty field or a marker that breached the very
  * bound it described. Neither is honest. This raises a FLOOR, not a cap — the ceiling is

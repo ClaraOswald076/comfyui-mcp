@@ -32,6 +32,7 @@ import {
   readPersistedDownloadJob,
   listPersistedDownloadJobs,
   findPersistedDownloadJob,
+  removePersistedDownloadJobFor,
   clearDownloadProgress,
   persistedRecordsEnabled,
   PERSIST_OWNER,
@@ -43,7 +44,7 @@ import { logger } from "../utils/logger.js";
 export interface DownloadJob {
   /** DISTINCT public id, derived from URL AND destination, so the same URL
    *  fetched to two different targets is two separately-pollable jobs
-   *  (download_status(id) resolves each independently). Also the registry key. */
+   *  (download_model action:"status"(id) resolves each independently). Also the registry key. */
   id: string;
   /** The panel tray / progress-file id — a hash of the ORIGINAL source URL only.
    *  STABLE for the life of the job and used to ADOPT this download by URL after a
@@ -53,12 +54,12 @@ export interface DownloadJob {
   /** The id the PHYSICAL progress rows are actually written under — a hash of the
    *  POST-auth/post-HF-rewrite request URL, reported by the writer (#515). Differs
    *  from `trayId` only for query-auth or HF_ENDPOINT-rewritten URLs; equals it for
-   *  the common case. download_status byte display and cancel cleanup key on THIS id
+   *  the common case. download_model action:"status" byte display and cancel cleanup key on THIS id
    *  (falling back to trayId when unset). Never used for URL adoption (that needs the
    *  stable original-URL trayId). */
   progressId?: string;
   /** This job's OWN resume decision (#467), reported by its physical download via
-   *  a callback and stored here — so download_status surfaces exactly this job's
+   *  a callback and stored here — so download_model action:"status" surfaces exactly this job's
    *  outcome and never a stale/other job's. Absent when no resumable download ran
    *  (Manager dispatch, cache hit, a job that coalesced onto another's stream, or
    *  a failure before streaming). */
@@ -88,7 +89,7 @@ export interface DownloadJob {
    *  fetch) rather than streamed to local disk. A "done" viaManager job means the
    *  dispatch was ACCEPTED — NOT that the file has verifiably landed (Manager reports
    *  its queue task done even on failure), and a cancel can't recall the server task.
-   *  download_status renders it as "dispatched (not verified here)" so it isn't
+   *  download_model action:"status" renders it as "dispatched (not verified here)" so it isn't
    *  mistaken for a validated local completion. */
   viaManager?: boolean;
   /** Lines produced by post-download work (trigger words, sidecar paths,
@@ -129,6 +130,10 @@ export interface DownloadJob {
   staleInflight?: boolean;
   /** Age of the missing persisted heartbeat, used only for status diagnostics. */
   staleForMs?: number;
+  /** This "cancelled" record was written by a LATER session reclaiming a stale
+   *  in-flight record whose writer was PROVEN dead (#858) — no live transfer was
+   *  aborted, so no renderer may claim a resumable partial was deliberately left. */
+  reclaimedDead?: boolean;
 }
 
 interface Entry {
@@ -139,7 +144,7 @@ interface Entry {
    *  unregister ALL of a stale entry's keys — no orphaned index rows. */
   keys: string[];
   /** Per-download abort handle (#515). Its `signal` is threaded through
-   *  downloadModel → the fetch + stream pipeline, so `cancel_download` can abort
+   *  downloadModel → the fetch + stream pipeline, so `download_model action:"cancel"` can abort
    *  exactly THIS job's transfer without touching any other in-flight download. */
   controller: AbortController;
   /** While in flight, periodically re-persists the record so its `updated` stamp
@@ -283,7 +288,7 @@ export function downloadIdFor(url: string): string {
  * that resolve to the SAME file with the SAME auth are one job/one writer (even
  * from different URLs), but the SAME file with DIFFERENT auth are DIFFERENT
  * downloads (a different representation) and must not dedup. Requests to different
- * destinations are separately pollable via download_status.
+ * destinations are separately pollable via download_model action:"status".
  */
 export function downloadJobIdFor(identity: string): string {
   return createHash("sha256").update(identity).digest("hex").slice(0, 16);
@@ -410,7 +415,7 @@ export async function startDownloadJob(
   } else {
     serializeKey = remoteSerializeKey(url, targetSubfolder, filename);
   }
-  // The PUBLIC id (download_status handle): the destination key when we have one
+  // The PUBLIC id (download_model action:"status" handle): the destination key when we have one
   // (so distinct destinations are separately pollable), else the request key.
   const id = destKey ?? reqKey;
   // This call's keys: the route-independent request key, plus the destination key
@@ -455,7 +460,7 @@ export async function startDownloadJob(
   // process's own live jobs were already checked above. The adopted view is READ-ONLY (we
   // hold no handle on the other session's writer): it is NOT registered in this registry,
   // runs no writer/heartbeat/AbortController, and its `settled` resolves immediately — the
-  // tool then reports it as in-flight and the caller polls download_status (which reads
+  // tool then reports it as in-flight and the caller polls download_model action:"status" (which reads
   // the live persisted record) for the resolved state.
   //
   // SCOPE: this dedup is BEST-EFFORT and covers the reported case — a SEQUENTIAL reconnect
@@ -526,7 +531,7 @@ export async function startDownloadJob(
   };
 
   // Per-download abort handle (#515). The signal is threaded through downloadModel
-  // into the fetch + stream pipeline, so cancel_download aborts exactly THIS job.
+  // into the fetch + stream pipeline, so download_model action:"cancel" aborts exactly THIS job.
   const controller = new AbortController();
 
   // The liveness heartbeat timer (assigned below, after the settled closure). Hoisted
@@ -585,7 +590,7 @@ export async function startDownloadJob(
           // Record the id the tray rows are ACTUALLY written under (post-auth/HF
           // rewrite) as job.progressId — WITHOUT touching job.trayId, which must stay
           // the stable original-URL hash so URL reconnect adoption (#529) still
-          // resolves. download_status byte display and cancel cleanup key on
+          // resolves. download_model action:"status" byte display and cancel cleanup key on
           // progressId (falling back to trayId); it only differs for query-auth /
           // mirror-rewritten URLs. Persist so a reconnecting session reads live bytes.
           if (progressId && progressId !== job.progressId) {
@@ -654,7 +659,7 @@ export async function startDownloadJob(
         // …but if the cancellation cleanup threw a recovery-critical ModelError (e.g. the
         // Windows backup of the PREVIOUS destination file could not be restored, so it's
         // preserved under a random .bak path), surface that message on the job so
-        // download_status shows the recoverable path instead of masking it behind a plain
+        // download_model action:"status" shows the recoverable path instead of masking it behind a plain
         // "cancelled, resumable partial". (Ordinary cancellation throws an AbortError,
         // which is NOT a ModelError, so it never sets this.)
         if (err instanceof ModelError) job.error = err.message;
@@ -798,13 +803,14 @@ function persistJobRecord(job: DownloadJob): boolean {
     verify_note: job.verify_note,
     disk_verified: job.disk_verified,
     verified_root: job.verified_root,
+    reclaimed_dead: job.reclaimedDead,
   });
 }
 
 /** Rebuild an in-memory DownloadJob view from a persisted record (#529 adoption
  *  after a reconnect). It is a read-only snapshot — there is no live AbortController
  *  in THIS process for a job another/previous session started, so it can be polled
- *  by download_status but not cancelled from here. */
+ *  by download_model action:"status" but not cancelled from here. */
 function jobFromPersisted(rec: PersistedDownloadJob): DownloadJob {
   return {
     id: rec.id,
@@ -829,6 +835,7 @@ function jobFromPersisted(rec: PersistedDownloadJob): DownloadJob {
     verified_root: rec.verified_root,
     staleInflight: rec.staleInflight,
     staleForMs: rec.staleForMs,
+    reclaimedDead: rec.reclaimed_dead,
   };
 }
 
@@ -853,7 +860,7 @@ function hasAmbiguousForeignSibling(id: string, localTrayId: string): boolean {
  * What we ACTUALLY know about where a completed download landed (#369).
  *
  * This is THE single placement policy — every tool that renders a finished job
- * (`download_model`, `download_status`, `download_civitai_model`, `apply_manifest`)
+ * (`download_model`, `download_model action:"status"`, `download_model action:"download_civitai"`, `apply_manifest`)
  * must go through it, or the wording drifts and one of them starts claiming a
  * success nobody verified. That is precisely how a 4.88 GB model in a stale install
  * came back as "downloaded successfully".
@@ -926,7 +933,7 @@ export function describePlacement(
       warning: !ctx?.liveModelsDir
         ? "this download was confirmed earlier, but the connected ComfyUI could not be asked " +
           "just now which models directory it reads, so that confirmation cannot be re-established " +
-          "for the server you are connected to. Re-check with download_status, or confirm with " +
+          "for the server you are connected to. Re-check with download_model action:\"status\", or confirm with " +
           "list_local_models."
         : job.verified_root
         ? `this download was verified against a ComfyUI reading "${job.verified_root}", but the ` +
@@ -987,7 +994,7 @@ export function describePlacement(
         pathQualifier: "",
         warning:
           "the file was materialized locally, but placement has NOT been confirmed yet — the " +
-          "check against the connected ComfyUI has not completed. Re-check with download_status, " +
+          "check against the connected ComfyUI has not completed. Re-check with download_model action:\"status\", " +
           "or confirm with list_local_models.",
       };
   }
@@ -1156,7 +1163,7 @@ export function listDownloadJobs(): DownloadJob[] {
   // One Entry is indexed under multiple keys — dedup by identity so a job appears once
   // regardless of how many keys point at it. Identity is (id, trayId), NOT id alone:
   // two distinct URLs to one dest+auth share an id but are distinct physical downloads
-  // (different trayId), and both must be listed — download_status with no selector
+  // (different trayId), and both must be listed — download_model action:"status" with no selector
   // promises EVERY tracked download.
   const seen = new Set<Entry>();
   const keyOf = (j: DownloadJob): string => `${j.id}\n${j.trayId}`;
@@ -1169,7 +1176,7 @@ export function listDownloadJobs(): DownloadJob[] {
     if (!cur || (e.job.status === "done" && cur.status !== "done")) byKey.set(keyOf(e.job), e.job);
   }
   // #529: fold in persisted records for jobs THIS session's registry doesn't hold
-  // (started before a reconnect), so download_status still lists in-flight downloads.
+  // (started before a reconnect), so download_model action:"status" still lists in-flight downloads.
   // INTEGRITY TRUTH: a validated DONE (file landed) WINS over a cancelled/error record for
   // the SAME (id, trayId) — whether that other record is a persisted counterpart OR this
   // session's own in-memory cancelled/error. So a persisted DONE overrides any current
@@ -1189,6 +1196,109 @@ export function listDownloadJobs(): DownloadJob[] {
 }
 
 /**
+ * Is the process that wrote this persisted record GONE? (#858)
+ *
+ * A stale heartbeat only says PERSISTENCE stopped — a reconnect can interrupt
+ * the heartbeat while the HTTP stream keeps writing (#761), so staleness alone
+ * never licenses touching another session's record. What proves the writer dead
+ * is that no process answers to the pid stamped on the record: the transfer
+ * lives in that process, so a dead pid means a dead writer.
+ *
+ *   true      — ESRCH: no such process exists. PROVEN gone.
+ *   false     — a process answers to the pid. (It could be an unrelated process
+ *               reusing the pid — that direction only ever refuses, never
+ *               destroys, so the error is safe.)
+ *   undefined — cannot tell: no pid recorded (pre-#858 record) or the probe
+ *               itself failed. Absence of evidence is NOT evidence of absence.
+ */
+function writerProcessGone(rec: PersistedDownloadJob): boolean | undefined {
+  // Our own record belongs to THIS very process — alive by definition.
+  if (rec.owner === PERSIST_OWNER) return false;
+  const pid = rec.pid;
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return undefined;
+  if (pid === process.pid) return false;
+  try {
+    process.kill(pid, 0); // signal 0: existence probe, nothing is signalled
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === "ESRCH" ? true : undefined;
+  }
+}
+
+/**
+ * Close a STALE in-flight persisted record whose writer is PROVEN gone (#858) —
+ * the recovery the jammed cancel in #858 needed: the record is rewritten as a
+ * terminal "cancelled" owned by THIS session, the dead owner's record file is
+ * removed, and the dead writer's panel tray row is cleared unless a live job
+ * still shares it. The download can then be safely re-issued (it resumes from
+ * whatever .partial the dead writer left, or restarts cleanly).
+ *
+ * Order is deliberate (report before you destroy): the replacement terminal
+ * record is made durable FIRST, so a transient persistence failure leaves the
+ * stale record untouched — never a download with no record at all.
+ *
+ * Nothing here fabricates a cancellation of live work: it only runs once the
+ * writer is proven dead, which means the physical transfer had ALREADY stopped
+ * on its own. The record is marked `reclaimed_dead` so renderers disclose that
+ * instead of narrating an abort that never happened.
+ */
+function reclaimDeadPersistedDownload(
+  rec: PersistedDownloadJob,
+): {
+  reclaimed: boolean;
+  denied?: "owner-alive" | "owner-unknown" | "persist-failed";
+  /** The replacement terminal record is durable, but the dead owner's original
+   *  record file could not be deleted — the caller must DISCLOSE the leftover,
+   *  not claim a clean close (codex gate, round 2). */
+  staleRecordLeft?: boolean;
+} {
+  const gone = writerProcessGone(rec);
+  if (gone !== true) {
+    return { reclaimed: false, denied: gone === false ? "owner-alive" : "owner-unknown" };
+  }
+  const durable = persistDownloadJob({
+    ...rec,
+    // The staleness diagnostics are read-only annotations and are never persisted.
+    staleInflight: undefined,
+    staleForMs: undefined,
+    status: "cancelled",
+    finished_at: rec.finished_at ?? Date.now(),
+    reclaimed_dead: true,
+  });
+  if (!durable) return { reclaimed: false, denied: "persist-failed" };
+  const removed = removePersistedDownloadJobFor(rec.id, rec.owner ?? "");
+  // The dead writer's tray row would linger in the panel otherwise. Clear it
+  // ONLY when no possibly-live job could share it. Rows are keyed by the
+  // writer-reported progressId, but a job whose writer has not reported yet is
+  // identifiable only by trayId, so count BOTH ids of every candidate. And a
+  // STALE foreign record is counted too: a stale heartbeat is not proof its
+  // writer stopped (#761) — only THIS record's death has been proven (it is
+  // already removed by this point, or the failure is reported via
+  // staleRecordLeft). Over-counting only ever skips a clear (safe), never wipes
+  // a live row (the #515 invariant).
+  const rowIds = new Set(
+    [rec.progressId, rec.trayId].filter((x): x is string => typeof x === "string" && x.length > 0),
+  );
+  if (rowIds.size > 0) {
+    const liveRowIds = new Set<string>();
+    for (const e of new Set(jobs.values())) {
+      if (e.job.status !== "downloading") continue;
+      if (e.job.progressId) liveRowIds.add(e.job.progressId);
+      liveRowIds.add(e.job.trayId);
+    }
+    for (const r of listPersistedDownloadJobs()) {
+      if (r.status !== "downloading") continue;
+      if (r.progressId) liveRowIds.add(r.progressId);
+      if (r.trayId) liveRowIds.add(r.trayId);
+    }
+    for (const rowId of rowIds) {
+      if (!liveRowIds.has(rowId)) clearDownloadProgress(rowId);
+    }
+  }
+  return { reclaimed: true, staleRecordLeft: !removed };
+}
+
+/**
  * Cancel an in-flight download by id (#515): abort its stream and mark it
  * cancelled. The abort unwinds the fetch + pipeline; the .partial is left on disk
  * (resumable) and NEVER renamed to the destination, so nothing is reported as
@@ -1196,8 +1306,12 @@ export function listDownloadJobs(): DownloadJob[] {
  * Returns the resulting status plus whether this call performed the abort.
  *
  * Only a download owned by THIS process can be aborted (its AbortController lives
- * here). A job resolvable only via the persisted store (started by another/previous
- * session after a reconnect) cannot be aborted from here — reported as not-owned.
+ * here). A job resolvable only via the persisted store belongs to another
+ * session: while that session may still be alive the cancel REFUSES (#761) — but
+ * a stale in-flight record whose writer is PROVEN gone (its process no longer
+ * exists) is reclaimed instead (#858): closed as cancelled so the user is no
+ * longer wedged between a status that says "do not re-issue" and a cancel that
+ * says "not yours".
  */
 export function cancelDownloadJob(
   id: string,
@@ -1214,6 +1328,18 @@ export function cancelDownloadJob(
    *  session shares it with a different trayId) — declined, nothing was aborted.
    *  Pass `trayId` to resolve it. */
   ambiguous?: boolean;
+  /** A stale foreign in-flight record whose writer was PROVEN gone was closed as
+   *  cancelled (#858). No live transfer was aborted — there was none left. */
+  reclaimed?: boolean;
+  /** The reclaim's terminal record is durable, but the dead owner's original
+   *  record file could not be deleted — disclose the leftover, don't claim a
+   *  clean close. */
+  staleRecordLeft?: boolean;
+  /** Why a stale foreign record was NOT reclaimed: the owning process is still
+   *  alive (the transfer may still be writing), its death cannot be proven from
+   *  here (no writer identity on the record), or closing the record failed
+   *  transiently (retry). */
+  reclaimDenied?: "owner-alive" | "owner-unknown" | "persist-failed";
   /** Every download the id answers to — so an ambiguity refusal can NAME the
    *  choices instead of leaving the caller with no next move. */
   candidates?: DownloadJob[];
@@ -1238,9 +1364,38 @@ export function cancelDownloadJob(
       if (!controller.signal.aborted) controller.abort();
       return { found: true, owned: true, aborted: true, status: "downloading", job };
     }
-    // Not ours. It may be another session's (persisted) — reportable, not abortable.
+    // Not ours. It may be another session's (persisted). A LIVE one is reportable,
+    // not abortable — but a STALE one whose writer is proven gone is reclaimed
+    // (#858): closed as cancelled so the download can be safely re-issued.
     const foreign = listDownloadJobCandidates(id).find((j) => j.trayId === trayId);
     if (foreign) {
+      if (foreign.status === "downloading" && foreign.staleInflight) {
+        const rec = listPersistedDownloadJobs().find(
+          (r) => r.id === id && r.trayId === trayId && r.status === "downloading",
+        );
+        if (rec) {
+          const re = reclaimDeadPersistedDownload(rec);
+          if (re.reclaimed) {
+            return {
+              found: true,
+              owned: false,
+              aborted: false,
+              reclaimed: true,
+              staleRecordLeft: re.staleRecordLeft,
+              status: "cancelled",
+              job: { ...jobFromPersisted(rec), status: "cancelled", reclaimedDead: true },
+            };
+          }
+          return {
+            found: true,
+            owned: false,
+            aborted: false,
+            reclaimDenied: re.denied,
+            status: foreign.status,
+            job: foreign,
+          };
+        }
+      }
       return { found: true, owned: false, aborted: false, status: foreign.status, job: foreign };
     }
     return { found: false, owned: false, aborted: false, candidates: listDownloadJobCandidates(id) };
@@ -1287,7 +1442,7 @@ export function cancelDownloadJob(
     // physically completed but its promise continuation (→ onLanded) hasn't run yet:
     // commitDone only advances a still-"downloading" job, so a synchronous "cancelled"
     // would strand a landed file as cancelled (#515 codex). The tool reports this as a
-    // best-effort request and points the caller at download_status for the resolved state.
+    // best-effort request and points the caller at download_model action:"status" for the resolved state.
     if (!controller.signal.aborted) controller.abort();
     return { found: true, owned: true, aborted: true, status: "downloading", job };
   }
@@ -1312,6 +1467,30 @@ export function cancelDownloadJob(
   }
   const persisted = readPersistedDownloadJob(id);
   if (persisted) {
+    // A STALE in-flight record whose writer is proven gone is reclaimed (#858);
+    // a live or unprovable one stays refused exactly as before (#761).
+    if (persisted.status === "downloading" && persisted.staleInflight) {
+      const re = reclaimDeadPersistedDownload(persisted);
+      if (re.reclaimed) {
+        return {
+          found: true,
+          owned: false,
+          aborted: false,
+          reclaimed: true,
+          staleRecordLeft: re.staleRecordLeft,
+          status: "cancelled",
+          job: { ...jobFromPersisted(persisted), status: "cancelled", reclaimedDead: true },
+        };
+      }
+      return {
+        found: true,
+        owned: false,
+        aborted: false,
+        reclaimDenied: re.denied,
+        status: persisted.status,
+        job: jobFromPersisted(persisted),
+      };
+    }
     return {
       found: true,
       owned: false,

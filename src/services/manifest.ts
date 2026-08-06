@@ -855,7 +855,7 @@ async function applyManifestSections(
   // 300s tools/call timeout. A single batch-wide grace is bounded regardless of
   // count: quick/local files finish inside it (reported "applied"), the rest keep
   // streaming and are reported "pending" with a job id to poll via
-  // download_status. A still-running download is NEVER counted as "applied", so
+  // download_model action:"status". A still-running download is NEVER counted as "applied", so
   // top-level success never claims an unfinished download succeeded.
   const enqueued: Array<{ item: string; job: DownloadJob; settled: Promise<void> }> = [];
   for (const model of manifest.models) {
@@ -1073,7 +1073,7 @@ async function applyManifestSections(
             item,
             "pending",
             `Model download is RUNNING in the background (job ${job.id}) — NOT yet complete, ` +
-              `and NOT a failure. Poll download_status with this id; the file lands on its own. ` +
+              `and NOT a failure. Poll download_model action:"status" with this id; the file lands on its own. ` +
               `Do not re-issue the download.`,
           ),
         );

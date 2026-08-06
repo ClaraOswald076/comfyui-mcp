@@ -6,7 +6,7 @@ import { errorToToolResult } from "../utils/errors.js";
 export function registerRegistrySearchTools(server: McpServer): void {
   server.tool(
     "search_custom_nodes",
-    "Search the public ComfyUI Registry (registry.comfy.org) for custom node packs by keyword. Read-only and network-only: queries the hosted registry over HTTP and does NOT require a running ComfyUI or COMFYUI_PATH. Returns a ranked list of packs with id, name, author, install count, and latest version. The keyword search ranks a fixed window of packs client-side, so when it matches nothing the query is also tried as an exact registry id automatically (e.g. 'comfyui kjnodes' → 'comfyui-kjnodes'). Use to discover packs to install; pass a returned id to get_node_pack_details for full info. This searches node PACKS, not models (use search_models) and not local installs (use list_local_models).",
+    "Search the public ComfyUI Registry (registry.comfy.org) for custom node packs by keyword. Read-only and network-only: queries the hosted registry over HTTP and does NOT require a running ComfyUI or COMFYUI_PATH. Returns a ranked list of packs with id, name, author, install count, and latest version. The keyword search ranks a fixed window of packs client-side, so when it matches nothing the query is also tried as an exact registry id automatically (e.g. 'comfyui kjnodes' → 'comfyui-kjnodes'). Use to discover packs to install; pass a returned id to get_node_pack_details for full info. This searches node PACKS, not models (use download_model action:\"search\") and not local installs (use list_local_models).",
     {
       query: z.string().describe("Keyword(s) to match against pack name/description, e.g. 'impact', 'controlnet aux'"),
       limit: z

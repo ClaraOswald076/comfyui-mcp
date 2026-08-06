@@ -139,7 +139,7 @@ function interferenceError(why: string, when: string, logUrl: string): ModelErro
     `Download stopped: another download is writing the same staged file, or this attempt cannot ` +
       `establish that it is not (${why} ${when}). Writing now could interleave two transfers into ` +
       `one file, or throw away another download's progress. Nothing was deleted — anything on disk ` +
-      `is intact. Check download_status; if another download of this file is running, wait for it ` +
+      `is intact. Check download_model action:"status"; if another download of this file is running, wait for it ` +
       `and then re-issue this one (it will reuse the completed file rather than re-fetching it).`,
     { url: logUrl, retryable: false },
   );
@@ -1084,7 +1084,7 @@ export interface DownloadCacheOptions {
    *  path (no physical resume happened). */
   onResume?: ResumeReporter;
   /** Per-download abort signal (#515), threaded into the fetch + stream pipeline so
-   *  cancel_download aborts exactly this transfer. On abort the partial is left on
+   *  download_model action:"cancel" aborts exactly this transfer. On abort the partial is left on
    *  disk (resumable) and is NEVER renamed to the destination — no false-complete. */
   signal?: AbortSignal;
   /** Fired SYNCHRONOUSLY the instant the completed, validated file is renamed into its
@@ -2075,7 +2075,7 @@ async function streamUrlToFile(
       await writeValidatorSidecar(validatorSidecar, validator, fullTotal, validatorIsContentHash);
   } else if (appendMode) {
     // A resume was actually taken (validated 206 append). Record it so
-    // download_status can report the partial was reused, not discarded (#467).
+    // download_model action:"status" can report the partial was reused, not discarded (#467).
     onResume?.({ outcome: "resumed", discardedBytes: 0, discarded: false });
   }
 
@@ -2845,7 +2845,7 @@ async function downloadIntoCache(
                 ? `The partial download's size could NOT be read, so how much progress survived is unknown — check the download cache before assuming either way.`
                 : kept > 0
                   ? sidecar === undefined
-                    ? `${gb(kept)} GB of partial data is on disk, but its resume-validator sidecar could not be read, so whether a re-issue can RESUME those bytes or must re-download them could not be determined here. Re-issue and watch download_status, which reports the resume decision the next attempt actually makes.`
+                    ? `${gb(kept)} GB of partial data is on disk, but its resume-validator sidecar could not be read, so whether a re-issue can RESUME those bytes or must re-download them could not be determined here. Re-issue and watch download_model action:"status", which reports the resume decision the next attempt actually makes.`
                     : sidecar.trim().length > 0
                       ? `${gb(kept)} GB of partial data is preserved on disk; re-issuing the SAME download resumes from there (it is not re-fetched) provided the host still serves the same object.`
                       : `${gb(kept)} GB of partial data is on disk, but the host never sent an ETag/Last-Modified validator for it, so there is no recorded proof of WHICH object those bytes belong to. A re-issue will therefore restart from the beginning rather than resume — appending to a prefix of unknown provenance is how a model gets silently corrupted (#343/#467).`

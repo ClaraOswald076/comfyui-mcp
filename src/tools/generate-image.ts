@@ -2,16 +2,44 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { generateImage } from "../services/generate-image.js";
 import { enqueueWorkflow } from "../services/workflow-executor.js";
-import { listLocalModels } from "../services/model-resolver.js";
-import { errorToToolResult } from "../utils/errors.js";
+import {
+  listLocalModels,
+  type LocalModel,
+} from "../services/model-resolver.js";
+import { selectTxt2ImgCheckpoint } from "../services/checkpoint-capability.js";
+import { errorToToolResult, ValidationError } from "../utils/errors.js";
 
 async function resolveCheckpoint(): Promise<string | undefined> {
+  let models: LocalModel[];
   try {
-    const models = await listLocalModels("checkpoints");
-    return models[0]?.name;
+    models = await listLocalModels("checkpoints");
   } catch {
+    // Listing failed (server unreachable, …) — the caller's generic
+    // "no checkpoint found" error is the accurate report for that.
     return undefined;
   }
+  if (models.length === 0) return undefined;
+  // Skip checkpoints that cannot drive a txt2img graph (video models without
+  // a text encoder, GGUF files) instead of taking the alphabetically-first
+  // entry and failing at CLIPTextEncode every time (issue #892).
+  const choice = await selectTxt2ImgCheckpoint(models);
+  if (choice) return choice.name;
+  const MAX_LISTED = 5;
+  const listed = models
+    .slice(0, MAX_LISTED)
+    .map((m) => m.name)
+    .join(", ");
+  const more =
+    models.length > MAX_LISTED ? `, … and ${models.length - MAX_LISTED} more` : "";
+  throw new ValidationError(
+    `Found ${models.length} local checkpoint(s), but none appears txt2img-capable: ` +
+      `every one lacks text-encoder weights in its safetensors header (a video or ` +
+      `UNet-only model) or is a GGUF file CheckpointLoaderSimple cannot load ` +
+      `(${listed}${more}). Download an image checkpoint with download_model ` +
+      `(action:"search_civitai" can find one), then pass it as \`checkpoint\` or save ` +
+      `it with get_defaults (action:"set"). If you believe one was misdetected, ` +
+      `pass \`checkpoint\` explicitly to bypass this check.`,
+  );
 }
 
 export function registerGenerateImageTool(server: McpServer): void {
@@ -19,7 +47,8 @@ export function registerGenerateImageTool(server: McpServer): void {
     "generate_image",
     "Generate an image from a text prompt — the high-level entry point. Builds a txt2img workflow, " +
       "filling any unspecified parameter from your configured defaults (get_defaults (action:\"set\") / COMFYUI_DEFAULT_* / config file), " +
-      "auto-selecting a local checkpoint when none is given. Returns the prompt_id immediately; the resulting " +
+      "auto-selecting a local checkpoint when none is given — checkpoints known to lack a text encoder " +
+      "(e.g. video models) are skipped. Returns the prompt_id immediately; the resulting " +
       "asset_id arrives in the completion notification and can be passed to view_image or regenerate. " +
       "For full control over the node graph, use create_workflow + enqueue_workflow instead.",
     {
@@ -42,7 +71,12 @@ export function registerGenerateImageTool(server: McpServer): void {
       try {
         const result = await generateImage(args, {
           resolveCheckpoint,
-          enqueue: (workflow) => enqueueWorkflow(workflow),
+          // The workflow composer already draws a random seed when none is
+          // given, so executor-side re-randomization would only ever clobber
+          // the seed this tool just resolved — including an explicit one
+          // (issue #865).
+          enqueue: (workflow) =>
+            enqueueWorkflow(workflow, { disable_random_seed: true }),
         });
         return {
           content: [

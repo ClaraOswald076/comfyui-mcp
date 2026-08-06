@@ -3,7 +3,7 @@
 //
 // The reported failure: the tool answered "Token saved … the comfyui tools
 // respawn with it as soon as this turn ends, then I'll retry" while the child
-// that runs download_civitai_model was never respawned. Retrying in a later turn
+// that runs download_model action:"download_civitai" was never respawned. Retrying in a later turn
 // returned the identical 401, and nothing in the tool's own answer let the agent
 // tell "no token configured" from "valid token on disk but not injected" — so it
 // looped.

@@ -42,7 +42,7 @@ diff against the branch when resuming.
    relies on that base's console port + `lora-catalog.ts` copy + Windows `path.sep` fix.
    **#197 must land first** (or the stack must be rebased onto whatever superseded it).
 2. **Civitai-metadata redundancy vs #186.** Main already writes `<file>.civitai.json`/`.md`
-   sidecars from `download_civitai_model`, and `model-resolver` reads them. This stack's
+   sidecars from `download_model` (`action:"download_civitai"`), and `model-resolver` reads them. This stack's
    `lora-civitai-enrich` fetches overlapping Civitai metadata into the **catalog DB** instead (no
    file-format collision, but two fetch paths). Stance recorded at port time: **upstream's on-disk
    sidecar stays source of truth**; at merge time either make the catalog read the #186 sidecars or

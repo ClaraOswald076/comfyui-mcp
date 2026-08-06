@@ -18,7 +18,7 @@ import { logger } from "../utils/logger.js";
 export function registerWorkflowExecuteTools(server: McpServer): void {
   server.tool(
     "enqueue_workflow",
-    "Submit a ComfyUI workflow for execution and return immediately with the prompt_id and queue position. Does not wait for completion. Use queue (action:\"status\") to check progress later, or get_history to retrieve results and images after completion.",
+    "Submit a ComfyUI workflow for execution and return immediately with the prompt_id and queue position. Does not wait for completion. Seed values in the workflow are used exactly as supplied — they are NOT re-randomized, so a run is reproducible by resubmitting the same workflow (for a fresh-seed re-run of a past job, use rerun_generation). Use queue (action:\"status\") to check progress later, or get_history to retrieve results and images after completion.",
     {
       workflow: z
         .record(z.string(), z.any())
@@ -26,12 +26,17 @@ export function registerWorkflowExecuteTools(server: McpServer): void {
       disable_random_seed: z
         .boolean()
         .optional()
-        .describe("If true, do not randomize seed values"),
+        .describe(
+          "No-op kept for backward compatibility: seed values are always used exactly as supplied.",
+        ),
     },
     async (args) => {
       try {
+        // Every seed in this caller-built workflow is caller-fixed; replacing
+        // one with a random value silently destroyed reproducible runs and
+        // could exceed the node's declared max (issue #865).
         const result = await enqueueWorkflow(args.workflow, {
-          disable_random_seed: args.disable_random_seed,
+          disable_random_seed: true,
         });
 
         // Log generation settings (best-effort, don't fail the response)
@@ -75,7 +80,8 @@ export function registerWorkflowExecuteTools(server: McpServer): void {
     "Re-run the workflow behind a previous generation. Retrieves the prompt graph from " +
       "execution history (by prompt_id, or the most recent run when omitted — chosen by " +
       "ComfyUI's queue number, same logic as get_history) and re-enqueues it, optionally " +
-      "applying `inputs` overrides. Seeds are re-randomized unless disable_random_seed is set. " +
+      "applying `inputs` overrides. Seeds are re-randomized (within each node's declared " +
+      "range) unless disable_random_seed is set or the seed is pinned via `inputs`. " +
       "Returns the new prompt_id and the source prompt_id it came from. Clear error if no " +
       "matching history exists.",
     {
@@ -120,6 +126,9 @@ export function registerWorkflowExecuteTools(server: McpServer): void {
         const next = applyOverrides(workflow, args.inputs);
         const result = await enqueueWorkflow(next, {
           disable_random_seed: args.disable_random_seed,
+          // An override like inputs.seed is a caller-fixed value; keep it while
+          // the other seeds re-randomize (issue #865).
+          preserve_seed_inputs: Object.keys(args.inputs ?? {}),
         });
 
         return {

@@ -1,5 +1,4 @@
-import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { WorkflowJSON } from "../comfyui/types.js";
 import { getObjectInfo, getSystemStats } from "../comfyui/client.js";
 import { searchCivitaiModels } from "../services/civitai-resolver.js";
@@ -111,31 +110,22 @@ function renderCandidate(c: ModelCandidate): string {
   let line = bits.join("  ·  ");
   if (c.requires_pack) line += `\n    ⚠️ needs the **${c.requires_pack}** node pack — a GGUF will NOT load in CheckpointLoaderSimple.`;
   if (c.url) line += `\n    ${c.url}`;
-  else if (c.civitai_model_id) line += `\n    civitai model ${c.civitai_model_id}${c.civitai_version_id ? ` (version ${c.civitai_version_id})` : ""} → download_civitai_model`;
+  else if (c.civitai_model_id) line += `\n    civitai model ${c.civitai_model_id}${c.civitai_version_id ? ` (version ${c.civitai_version_id})` : ""} → download_model action:"download_civitai"`;
   return line;
 }
 
-export function registerMissingModelTools(server: McpServer): void {
-  server.tool(
-    "resolve_missing_models",
-    "Find the model files a workflow needs but this ComfyUI does NOT have, and search CivitAI + HuggingFace for installable candidates. THE tool for 'this Template says a model is missing — go get it'. " +
-      "Detects by comparing each model widget against the option list the server actually publishes, so it covers checkpoints, LoRAs, VAEs, ControlNets, UNets, CLIP and custom-pack model types without any per-node mapping. " +
-      "Each candidate reports size, source, precision/quantisation (fp16 / fp8 / GGUF Q4_K_M …) and whether it FITS this GPU's VRAM — so when the exact file is too big you can see the quantised variant that isn't. " +
-      "Read-only: it downloads nothing. Pass a chosen candidate to download_model (url) or download_civitai_model (id), using the reported directory as target_subfolder. " +
-      'For missing custom NODE PACKS (not models) use list_packs (action:"install_deps") instead.',
-    {
-      workflow: z
-        .union([z.string(), z.record(z.string(), z.any())])
-        .describe("ComfyUI workflow in API format (JSON string or object)"),
-      limit: z
-        .number()
-        .int()
-        .min(1)
-        .max(20)
-        .optional()
-        .describe("Max candidates per missing model (default 8)."),
-    },
-    async (args) => {
+/**
+ * The missing-model resolver, no longer a tool of its own.
+ *
+ * 0.50.0 slice 11 folded it into `download_model` (action:"resolve_missing");
+ * see ./model-management.ts for the dispatcher. The body below is the old
+ * handler verbatim — same object-info read, same candidate lookup, same
+ * "could not look" vs "nothing exists" distinction (#796).
+ */
+export async function resolveMissingModelsAction(args: {
+  workflow: string | Record<string, unknown>;
+  limit?: number;
+}): Promise<CallToolResult> {
       try {
         const workflow = parseWorkflow(args.workflow);
         const objectInfo = (await getObjectInfo()) as unknown as ObjectInfoLike;
@@ -174,8 +164,8 @@ export function registerMissingModelTools(server: McpServer): void {
               lookup.failedProviders.length > 0
                 ? `_No candidates — but the lookup FAILED (${lookup.failedProviders.join("; ")}), so ` +
                   `this is "could not look", NOT "nothing exists". Check the network/provider and retry, ` +
-                  `or try search_models / search_civitai_models with a different query._`
-                : `_No candidates found on CivitAI or HuggingFace — try search_models / search_civitai_models with a different query._`,
+                  `or try download_model action:"search" / action:"search_civitai" with a different query._`
+                : `_No candidates found on CivitAI or HuggingFace — try download_model action:"search" / action:"search_civitai" with a different query._`,
               "",
             );
             continue;
@@ -191,7 +181,8 @@ export function registerMissingModelTools(server: McpServer): void {
 
         lines.push(
           "---",
-          "Nothing was downloaded. Pick a candidate and call **download_model** (url) or **download_civitai_model** (id)" +
+          "Nothing was downloaded. Pick a candidate and call **download_model** with " +
+            '`action:"download"` (url) or `action:"download_civitai"` (id)' +
             ", passing the model's directory as `target_subfolder`.",
           "Names can collide across quantisations and base models — prefer an **exact name** match, and check `base:` before taking a fuzzy one.",
         );
@@ -200,6 +191,4 @@ export function registerMissingModelTools(server: McpServer): void {
       } catch (err) {
         return errorToToolResult(err);
       }
-    },
-  );
 }

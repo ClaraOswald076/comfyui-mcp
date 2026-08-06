@@ -1,8 +1,9 @@
-// #810 — list_workflows read the library SHALLOWLY and reported the result as empty.
+// #810 — the library listing read the library SHALLOWLY and reported the result as
+// empty. It is get_workflow (action:"list") since 0.50.0 slice 14.
 //
 // The reporter had six workflows saved, all of them filed under `IMAGE/` and
 // `VIDEO/MiniMaxH3/` — the folder tree the ComfyUI web UI sidebar shows — and
-// list_workflows answered "No saved workflows found." That is the repo's dominant
+// the listing answered "No saved workflows found." That is the repo's dominant
 // defect class wearing its most expensive hat: "could not determine X" rendered as
 // "determined X is not the case", where acting on the wrong answer means recreating a
 // workflow that already exists.
@@ -118,7 +119,7 @@ function tools(): Map<string, ToolHandler> {
 }
 
 const listWorkflows = async (): Promise<string> =>
-  (await tools().get("list_workflows")!({})).content[0].text;
+  (await tools().get("get_workflow")!({ action: "list" })).content[0].text;
 
 // A name with characters that must survive URL encoding on the way back to the server:
 // spaces, an ampersand, a hash, a plus and non-ASCII.
@@ -147,7 +148,7 @@ afterEach(() => {
   rmSync(userRoot, { recursive: true, force: true });
 });
 
-describe("#810 — list_workflows sees the whole library, subfolders included", () => {
+describe('#810 — get_workflow (action:"list") sees the whole library, subfolders included', () => {
   it("lists workflows that exist only in subfolders instead of reporting none", async () => {
     // The reported repro exactly: nothing at the top level, everything in folders.
     const text = await listWorkflows();
@@ -209,7 +210,11 @@ describe("#810 — list_workflows sees the whole library, subfolders included", 
       .find((l) => l.endsWith("my workflow (v2).json"));
     expect(name).toBe(AWKWARD_FILE);
 
-    const loaded = await tools().get("get_workflow")!({ filename: name!, format: "ui" });
+    const loaded = await tools().get("get_workflow")!({
+      action: "get",
+      filename: name!,
+      format: "ui",
+    });
     expect(loaded.isError).toBeFalsy();
     expect(JSON.parse(loaded.content[0].text)).toEqual({ nodes: [{ id: 7 }], links: [] });
   });

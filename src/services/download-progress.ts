@@ -183,7 +183,7 @@ export function reportDownloadProgress(
 }
 
 /**
- * Read back one download's latest snapshot, so `download_status` can report
+ * Read back one download's latest snapshot, so `download_model action:"status"` can report
  * bytes/throughput instead of a bare "still going". Progress files are
  * TARGET-SCOPED ({id}-{disc}.json — the same URL can download for local AND a
  * pod at once), so scan every variant for this id and return the most recently
@@ -473,7 +473,7 @@ export function consumeTargetChange(file: string): void {
 // ── Persisted download-job records (cross-session adoption, #529) ─────────────
 // The in-memory download-job registry (download-jobs.ts) is process-global, so a
 // sidebar/tool-session RECONNECT — which respawns the MCP child — starts with an
-// EMPTY registry and `download_status(id)` can no longer resolve an id returned by
+// EMPTY registry and `download_model action:"status"(id)` can no longer resolve an id returned by
 // a previous session ("Downloads are tracked per server session"). The live download
 // itself keeps running and keeps writing its progress row, so the STATE exists on
 // disk; it just isn't discoverable by the new session's registry.
@@ -515,13 +515,25 @@ export interface PersistedDownloadJob {
    *  running the same logical download share an `id` but differ here, so a sibling
    *  check can distinguish them. Absent on pre-fix records. */
   owner?: string;
+  /** The writing process's pid (#858). A stale heartbeat only says PERSISTENCE
+   *  stopped — the transfer may still be streaming (#761). What proves the writer
+   *  dead is that no process answers to this pid (the HTTP stream lives in the
+   *  process that wrote the record), which is what lets a later session reclaim a
+   *  stale in-flight record instead of refusing forever. Absent on pre-fix
+   *  records: those stay UNPROVABLE and are never reclaimed. */
+  pid?: number;
+  /** Set on a terminal record written by a LATER session that reclaimed a stale
+   *  in-flight record whose writer was proven dead (#858). The "cancelled" state
+   *  is then administrative — no live transfer was aborted — so renderers must
+   *  not claim a resumable partial was deliberately left by a cancel. */
+  reclaimed_dead?: boolean;
   resume?: unknown;
   /** Post-landing live-server verification (#369): whether the CONNECTED ComfyUI
    *  actually lists the landed file, so a reconnecting session still sees the
    *  "downloaded but invisible to the running server" warning instead of a bare
    *  "done". Absent on pre-fix records. */
   live_visible?: "visible" | "not-visible" | "unknown" | "pending";
-  /** The verification explanation, surfaced verbatim by download_status. */
+  /** The verification explanation, surfaced verbatim by download_model action:"status". */
   verify_note?: string;
   /** Whether the post-landing on-disk stat succeeded. False = the file was NOT
    *  found when checked, so no renderer may claim "verified on disk". */
@@ -577,6 +589,7 @@ export function persistDownloadJob(job: Omit<PersistedDownloadJob, "updated">): 
     const safe: PersistedDownloadJob = {
       ...job,
       owner: PERSIST_OWNER,
+      pid: process.pid,
       url: job.url ? redactUrl(job.url) : job.url,
       updated: Date.now(),
     };
@@ -626,6 +639,31 @@ export function removePersistedDownloadJob(id: string): void {
   }
 }
 
+/** Remove a SPECIFIC session's persisted record, named by its owner nonce — the
+ *  reclaim half of #858. This is the ONE destructive operation on another
+ *  session's state: call it only for a record whose writer is PROVEN dead (see
+ *  cancelDownloadJob), and only after the replacement terminal record is durable,
+ *  so a failure here never leaves the download with no record at all.
+ *
+ *  Returns TRUE only when the file is gone. A transient Windows sharing violation
+ *  (a reader briefly holding the file) is retried, mirroring the persist rename;
+ *  a persistent failure is reported to the caller so it can DISCLOSE the leftover
+ *  instead of claiming a clean close it did not observe (codex gate, round 2). */
+export function removePersistedDownloadJobFor(id: string, owner: string): boolean {
+  const dir = channelDir();
+  if (!dir || !owner) return false;
+  const path = join(dir, `${JOB_PREFIX}${sanitizeIdPart(id)}-${sanitizeIdPart(owner)}.json`);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      rmSync(path, { force: true });
+      return true;
+    } catch {
+      /* transient — retry */
+    }
+  }
+  return false;
+}
+
 // A missed heartbeat is only a liveness hint, not proof the transfer stopped:
 // an orchestrator/session reconnect can interrupt persistence while the HTTP
 // stream continues. Keep in-flight records for the same bounded retention as
@@ -637,7 +675,7 @@ function parseJobFile(dir: string, f: string): PersistedDownloadJob | null {
     const raw = JSON.parse(readFileSync(join(dir, f), "utf8")) as PersistedDownloadJob;
     if (!raw || typeof raw !== "object" || typeof raw.id !== "string") return null;
     const age = typeof raw.updated === "number" ? Date.now() - raw.updated : 0;
-    // This parser backs read paths (including download_status). A heartbeat gap
+    // This parser backs read paths (including download_model action:"status"). A heartbeat gap
     // beyond the short freshness window is not sufficient evidence to destructively
     // delete a potentially live transfer; adoption/cancel freshness checks below
     // still treat it as non-live. Reap only after the bounded long retention.

@@ -33,7 +33,7 @@ Given a custom node pack name or GitHub URL, you will:
 
 ### Step 3: Query Node Definitions
 
-- Use `get_node_info` with the node class names to get their exact input/output schemas from ComfyUI
+- Use `create_workflow (action:"node_info")` with the node class names to get their exact input/output schemas from ComfyUI
 - If the nodes aren't installed locally, document what you found from the README and registry
 - Record each node's: class_type, required inputs (with types), optional inputs, outputs (with types)
 

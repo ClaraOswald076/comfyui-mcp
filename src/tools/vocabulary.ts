@@ -37,32 +37,19 @@ export const TOOL_NAMES = [
   "rerun_generation",
   "get_system_stats",
   "visualize_workflow",
-  "mermaid_to_workflow",
-  "visualize_workflow_hierarchical",
   "create_workflow",
-  "modify_workflow",
-  "get_node_info",
-  "validate_workflow",
   "queue",
   "search_custom_nodes",
   "get_node_pack_details",
-  "search_models",
   "download_model",
-  "download_status",
-  "cancel_download",
   "list_local_models",
   "get_logs",
   "get_history",
   "diagnose_run",
   "runpod",
   "runpod_watch",
-  "list_workflows",
   "get_workflow",
-  "strip_workflow",
-  "query_workflow",
-  "slice_workflow",
   "save_workflow",
-  "analyze_workflow",
   "run_workflow_url",
   "restart_comfyui",
   "get_image",
@@ -70,10 +57,8 @@ export const TOOL_NAMES = [
   "upload_video",
   "upload_audio",
   "stage_output_as_input",
-  "workflow_from_image",
   "list_output_images",
   "clear_vram",
-  "get_embeddings",
   "suggest_settings",
   "generation_stats",
   "view_image",
@@ -89,8 +74,6 @@ export const TOOL_NAMES = [
   "upscale_image",
   "generate_with_controlnet",
   "generate_with_ip_adapter",
-  "workflow_to_dsl",
-  "dsl_to_workflow",
   "node_snapshot",
   "bisect",
   "install_custom_node",
@@ -103,19 +86,10 @@ export const TOOL_NAMES = [
   "list_installed_nodes",
   "sync_node_dependencies",
   "report_issue",
-  "resolve_missing_models",
   "install_comfyui",
   "update_comfyui",
   "update_all",
-  "remove_model",
-  "search_civitai_models",
-  "search_civitai_creators",
-  "download_civitai_model",
   "model_metadata",
-  "prompt_director_inspect",
-  "list_extra_paths",
-  "add_extra_path",
-  "remove_extra_path",
   "workspace",
   "get_environment",
   "list_api_nodes",
@@ -128,8 +102,6 @@ export const TOOL_NAMES = [
   "analyze_color",
   "upload_output",
   "health_check",
-  "lock_workflow",
-  "verify_workflow_lock",
   "list_packs",
   "install_panel",
   "self_update",
@@ -272,7 +244,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 115;
+export const MAX_TOOLS = 87;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;
@@ -1401,6 +1373,192 @@ export const DEAD_NAMES: readonly DeadName[] = [
         why: "Same seven-tool list in the dated sequel post; the other three names on this line survive the fold, so only this one needs the exemption.",
       },
     ],
+  },
+  // ── 0.50.0 slice 11: models ───────────────────────────────────────────────
+  // The fourteen model tools folded into two action-parameterized survivors:
+  // `download_model` (acquire) and `list_local_models` (inventory). Same
+  // services, same return shapes, same error paths — only the surface changed,
+  // so every mention of the eight retired names below is now rot pointing at a
+  // 404. APPENDED at the end of the array, not prepended: concurrent slices all
+  // edit this file and prepending makes every one of them collide on the same
+  // three lines.
+  {
+    name: "search_models",
+    since: "0.50.0",
+    replacement: 'download_model (action:"search")',
+    allowedIn: [
+      {
+        path: "docs/blog/comfyui-mcp-tdqs-case-study.mdx",
+        context: "`search_models`, and the rest of the",
+        why: "A DATED case study of a tool-description audit, naming the tools whose descriptions were rewritten AS THEY WERE NAMED when they were scored. Rewriting the name would falsify the record of what was measured — and the sentence is a past-tense result, not an instruction to call anything.",
+      },
+    ],
+  },
+  {
+    name: "download_status",
+    since: "0.50.0",
+    replacement: 'download_model (action:"status")',
+  },
+  {
+    name: "cancel_download",
+    since: "0.50.0",
+    replacement: 'download_model (action:"cancel")',
+  },
+  {
+    name: "search_civitai_models",
+    since: "0.50.0",
+    replacement: 'download_model (action:"search_civitai")',
+  },
+  {
+    name: "search_civitai_creators",
+    since: "0.50.0",
+    replacement: 'download_model (action:"search_creators")',
+  },
+  {
+    name: "download_civitai_model",
+    since: "0.50.0",
+    replacement: 'download_model (action:"download_civitai")',
+  },
+  {
+    name: "resolve_missing_models",
+    since: "0.50.0",
+    replacement: 'download_model (action:"resolve_missing")',
+  },
+  {
+    name: "remove_model",
+    since: "0.50.0",
+    // The one destructive action in the slice: it unlinks a model FILE, with no
+    // undo and no recycle bin. The replacement names the action explicitly so a
+    // stale caller is redirected to the exact enum value rather than guessing at
+    // `remove_path`, which edits a YAML config and deletes nothing.
+    replacement: 'list_local_models (action:"remove")',
+  },
+  {
+    name: "get_embeddings",
+    since: "0.50.0",
+    replacement: 'list_local_models (action:"embeddings")',
+  },
+  {
+    name: "list_extra_paths",
+    since: "0.50.0",
+    replacement: 'list_local_models (action:"list_paths")',
+  },
+  {
+    name: "add_extra_path",
+    since: "0.50.0",
+    replacement: 'list_local_models (action:"add_path")',
+  },
+  {
+    name: "remove_extra_path",
+    since: "0.50.0",
+    replacement: 'list_local_models (action:"remove_path")',
+  },
+  // 0.50.0 slice 14: the twenty workflow-authoring and workflow-library tools
+  // folded into four action-parameterized survivors — create_workflow (4),
+  // visualize_workflow (5), get_workflow (8) and save_workflow (3). Same
+  // composer/validator/converter/slicer/graph-query/lock services, same return
+  // shapes; only the surface changed, so every mention of the old names is now
+  // rot pointing at a 404.
+  {
+    name: "modify_workflow",
+    since: "0.50.0",
+    replacement: 'create_workflow (action:"modify")',
+  },
+  {
+    name: "validate_workflow",
+    since: "0.50.0",
+    replacement: 'create_workflow (action:"validate")',
+    allowedIn: [
+      {
+        path: "docs/using-tools.mdx",
+        context: "| `validate_workflow` | `create_workflow` with `action: \"validate\"` |",
+        why: "The old-name -> new-form migration table on the human-facing tools guide, the same row-per-retirement the get_workspace entry above documents. Readers watching the tool count fall read a consolidation as capability being REMOVED; the table exists to show the same behaviour under a new label, so the left column must spell the retired name. It is a mapping AWAY from the name, never an instruction to call it.",
+      },
+    ],
+  },
+  {
+    name: "get_node_info",
+    since: "0.50.0",
+    replacement: 'create_workflow (action:"node_info")',
+  },
+  {
+    name: "visualize_workflow_hierarchical",
+    since: "0.50.0",
+    replacement: 'visualize_workflow (action:"render_hierarchical")',
+  },
+  {
+    name: "mermaid_to_workflow",
+    since: "0.50.0",
+    replacement: 'visualize_workflow (action:"mermaid")',
+  },
+  {
+    name: "workflow_to_dsl",
+    since: "0.50.0",
+    replacement: 'visualize_workflow (action:"to_dsl")',
+  },
+  {
+    name: "dsl_to_workflow",
+    since: "0.50.0",
+    replacement: 'visualize_workflow (action:"from_dsl")',
+  },
+  {
+    name: "list_workflows",
+    since: "0.50.0",
+    replacement: 'get_workflow (action:"list")',
+    allowedIn: [
+      {
+        path: "docs/using-tools.mdx",
+        context: "| `list_workflows` | `get_workflow` with `action: \"list\"` |",
+        why: "The old-name -> new-form migration table on the human-facing tools guide, the same row-per-retirement the get_workspace entry above documents. Readers watching the tool count fall read a consolidation as capability being REMOVED; the table exists to show the same behaviour under a new label, so the left column must spell the retired name. It is a mapping AWAY from the name, never an instruction to call it.",
+      },
+    ],
+  },
+  {
+    name: "strip_workflow",
+    since: "0.50.0",
+    replacement: 'get_workflow (action:"strip")',
+  },
+  {
+    name: "slice_workflow",
+    since: "0.50.0",
+    replacement: 'get_workflow (action:"slice")',
+  },
+  {
+    name: "workflow_from_image",
+    since: "0.50.0",
+    replacement: 'get_workflow (action:"from_image")',
+  },
+  {
+    name: "analyze_workflow",
+    since: "0.50.0",
+    replacement: 'get_workflow (action:"analyze")',
+    allowedIn: [
+      {
+        path: "docs/using-tools.mdx",
+        context: "| `analyze_workflow` | `get_workflow` with `action: \"analyze\"` |",
+        why: "The old-name -> new-form migration table on the human-facing tools guide, the same row-per-retirement the get_workspace entry above documents. Readers watching the tool count fall read a consolidation as capability being REMOVED; the table exists to show the same behaviour under a new label, so the left column must spell the retired name. It is a mapping AWAY from the name, never an instruction to call it.",
+      },
+    ],
+  },
+  {
+    name: "query_workflow",
+    since: "0.50.0",
+    replacement: 'get_workflow (action:"query")',
+  },
+  {
+    name: "prompt_director_inspect",
+    since: "0.50.0",
+    replacement: 'get_workflow (action:"prompt_director")',
+  },
+  {
+    name: "lock_workflow",
+    since: "0.50.0",
+    replacement: 'save_workflow (action:"lock")',
+  },
+  {
+    name: "verify_workflow_lock",
+    since: "0.50.0",
+    replacement: 'save_workflow (action:"verify_lock")',
   },
 ];
 

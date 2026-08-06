@@ -1,7 +1,7 @@
 // #547: a finished download must wake the agent, mirroring the render-finished
 // path (manager.injectEvent kind:"executed"). This locks the manager+agent side
 // of the wiring: injectEvent(kind:"download_done") enqueues a NON-urgent turn
-// whose text names the settled downloads and points at download_status, and a
+// whose text names the settled downloads and points at download_model action:"status", and a
 // coalesced batch of several files produces ONE turn (not N). liveKeys() exposes
 // the single-live-agent fallback the orchestrator uses for un-stamped rows.
 
@@ -60,7 +60,7 @@ async function waitFor(cond: () => boolean, timeoutMs = 2000): Promise<void> {
 }
 
 describe("download-completion agent event (#547)", () => {
-  it("injectEvent(download_done) wakes the agent with a turn naming the download and download_status", async () => {
+  it("injectEvent(download_done) wakes the agent with a turn naming the download and download_model action:\"status\"", async () => {
     const backend = new TurnRecordingBackend();
     const manager = makeManager(backend);
     const tab = "tab-dl";
@@ -78,7 +78,7 @@ describe("download-completion agent event (#547)", () => {
     const evText = backend.turns[1];
     expect(evText).toContain("z_image_turbo_bf16.safetensors");
     expect(evText).toContain("finished");
-    expect(evText).toContain("download_status");
+    expect(evText).toContain('download_model action:"status"');
   });
 
   it("a coalesced batch (many files) produces ONE turn listing all of them", async () => {

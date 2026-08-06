@@ -2,13 +2,10 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerWorkflowExecuteTools } from "./workflow-execute.js";
 import { registerWorkflowVisualizeTools } from "./workflow-visualize.js";
 import { registerWorkflowComposeTools } from "./workflow-compose.js";
-import { registerWorkflowValidateTools } from "./workflow-validate.js";
 import { registerQueueManagementTools } from "./queue-management.js";
 import { registerBatchTools } from "./batches.js";
 import { registerRegistrySearchTools } from "./registry-search.js";
 import { registerModelManagementTools } from "./model-management.js";
-import { registerModelExtrasTools } from "./model-extras.js";
-import { registerExtraPathsTools } from "./extra-paths.js";
 import { registerDiagnosticsTools } from "./diagnostics.js";
 import { registerRunpodTools } from "./runpod.js";
 import { registerWorkflowLibraryTools } from "./workflow-library.js";
@@ -27,14 +24,12 @@ import { registerGenerateVideoTool } from "./generate-video.js";
 import { registerRemoveBackgroundTool } from "./remove-background.js";
 import { registerUpscaleImageTool } from "./upscale-image.js";
 import { registerConditionedGenerationTools } from "./generate-conditioned.js";
-import { registerWorkflowDslTools } from "./workflow-dsl.js";
 import { registerNodeSnapshotsTools } from "./node-snapshots.js";
 import { registerNodeBisectTools } from "./node-bisect.js";
 import { registerNodeManagementTools } from "./node-management.js";
 import { registerReportIssueTools } from "./report-issue.js";
 import { registerNodeAuthoringTools } from "./node-authoring.js";
 import { registerNodeVerifyTools } from "./node-verify.js";
-import { registerMissingModelTools } from "./missing-models.js";
 import { registerInstallComfyUITools } from "./install-comfyui.js";
 import { registerUpdateComfyUITools } from "./update-comfyui.js";
 import { registerWorkspaceEnvTools } from "./workspace-env.js";
@@ -42,12 +37,10 @@ import { registerApiNodesTools } from "./api-nodes.js";
 import { registerManagerConfigTools } from "./manager-config.js";
 import { registerManifestTools } from "./manifest.js";
 import { registerModelExplorerTools } from "./model-explorer.js";
-import { registerPromptDirectorTools } from "./prompt-director.js";
 import { registerImageConvertTools } from "./image-convert.js";
 import { registerColorAnalysisTools } from "./color-analysis.js";
 import { registerStorageUploadTools } from "./storage-upload.js";
 import { registerHealthCheckTools } from "./health-check.js";
-import { registerWorkflowLockTools } from "./workflow-lock.js";
 import { registerSkillsAccessTools } from "./skills-access.js";
 import { registerInstallPanelTools } from "./install-panel.js";
 import { registerSelfUpdateTools } from "./self-update.js";
@@ -73,7 +66,6 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["workflows", registerWorkflowExecuteTools],
   ["workflow-authoring", registerWorkflowVisualizeTools],
   ["workflow-authoring", registerWorkflowComposeTools],
-  ["workflow-authoring", registerWorkflowValidateTools],
   ["workflows", registerQueueManagementTools],
   ["custom-nodes", registerRegistrySearchTools],
   ["models", registerModelManagementTools],
@@ -97,20 +89,15 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["generation", registerRemoveBackgroundTool],
   ["generation", registerUpscaleImageTool],
   ["generation", registerConditionedGenerationTools],
-  ["workflow-authoring", registerWorkflowDslTools],
   ["custom-nodes", registerNodeSnapshotsTools],
   ["custom-nodes", registerNodeBisectTools],
   ["custom-nodes", registerNodeManagementTools],
   ["diagnostics", registerReportIssueTools],
   // (0.50.0 slice 9: the workflow-deps group's two tools folded into `list_packs`
   // actions "extract_deps"/"install_deps" — same note as skill-generator above.)
-  ["models", registerMissingModelTools],
   ["server", registerInstallComfyUITools],
   ["server", registerUpdateComfyUITools],
-  ["models", registerModelExtrasTools],
   ["models", registerModelExplorerTools],
-  ["workflow-authoring", registerPromptDirectorTools],
-  ["models", registerExtraPathsTools],
   ["server", registerWorkspaceEnvTools],
   ["generation", registerApiNodesTools],
   ["server", registerManagerConfigTools],
@@ -121,7 +108,6 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["images-assets", registerColorAnalysisTools],
   ["images-assets", registerStorageUploadTools],
   ["diagnostics", registerHealthCheckTools],
-  ["workflow-authoring", registerWorkflowLockTools],
   ["skills-config", registerSkillsAccessTools],
   ["server", registerInstallPanelTools],
   ["server", registerSelfUpdateTools],

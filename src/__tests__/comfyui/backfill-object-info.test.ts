@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // backfillObjectInfo honors the LIVE /object_info/<Type> registration key even
 // when it differs from the requested string in case, namespace, or
-// display-vs-class name (#404: get_node_info reported "no match" for the
+// display-vs-class name (#404: create_workflow (action:"node_info") reported "no match" for the
 // clearly-registered DetectorForNSFW because the strict def[t] guard narrowed
 // away the node whose returned key differed).
 
@@ -46,7 +46,7 @@ describe("backfillObjectInfo (#404)", () => {
   it("still merges the node when the live registration key differs (case/namespace/display)", async () => {
     // The requested string is `DetectorForNSFW` but the server returns the def
     // under a namespaced/canonical key. The old `def[t]`-only guard dropped it,
-    // making get_node_info report no match. Now we honor whatever key comes back.
+    // making create_workflow (action:"node_info") report no match. Now we honor whatever key comes back.
     comfyuiFetch.mockResolvedValueOnce(
       okJson({
         "utils-nodes/DetectorForNSFW": { input: {}, name: "DetectorForNSFW" },
@@ -57,7 +57,7 @@ describe("backfillObjectInfo (#404)", () => {
       ["DetectorForNSFW"],
     )) as unknown as Record<string, unknown>;
     expect(merged["utils-nodes/DetectorForNSFW"]).toBeDefined();
-    // A case-insensitive substring filter (what get_node_info uses) now finds it.
+    // A case-insensitive substring filter (what create_workflow (action:"node_info") uses) now finds it.
     const hit = Object.keys(merged).some((k) =>
       k.toLowerCase().includes("detectorfornsfw"),
     );

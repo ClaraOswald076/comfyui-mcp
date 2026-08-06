@@ -23,7 +23,7 @@ The user wants to find out why a ComfyUI workflow execution failed and get a sug
 
 3. **Get relevant logs.** Call `get_logs` with a `keyword` filter matching the error — use the exception class name (e.g., "RuntimeError", "ValueError") or a distinctive phrase from the error message. Request up to 200 lines.
 
-4. **Inspect the failing node.** Call `get_node_info` with the `node_type` of the failing node. Check:
+4. **Inspect the failing node.** Call `create_workflow (action:"node_info")` with the `node_type` of the failing node. Check:
    - What inputs does the node expect?
    - Are there required inputs that might be missing or mistyped?
    - What data types are expected for each input?
@@ -31,7 +31,7 @@ The user wants to find out why a ComfyUI workflow execution failed and get a sug
 5. **Check for missing models.** If the error mentions a missing file, model, or checkpoint:
    - Call `list_local_models` to see what's installed
    - Compare against what the workflow references
-   - If a model is missing, suggest using `download_model` or provide a search query for `search_models`
+   - If a model is missing, suggest using `download_model` `action:"download"` or provide a search query for `action:"search"`
 
 6. **Check for missing nodes.** If the error is a `KeyError` or mentions an unknown node type:
    - The node pack may not be installed
@@ -61,7 +61,7 @@ Steps:
 - Call `get_history` with no prompt_id
 - Find error: node 12 (KSampler) threw RuntimeError "Expected all tensors to be on the same device"
 - Call `get_logs` with keyword "RuntimeError"
-- Call `get_node_info` for "KSampler"
+- Call `create_workflow (action:"node_info")` for "KSampler"
 - Diagnose: model and conditioning are on different devices, likely a VRAM issue
 - Suggest: restart ComfyUI or use `clear_vram` before retrying
 

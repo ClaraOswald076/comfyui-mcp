@@ -328,6 +328,83 @@ describe("OllamaBackend", () => {
     ]);
   });
 
+  /**
+   * 0.50.0 slice 11 folded the HuggingFace model search into
+   * download_model action:"search", so the discovery counter had to become
+   * action-aware. Keyed on the bare name it would count a download as a catalog
+   * search — and four downloads in one turn would be answered with SEARCH LIMIT
+   * instead of downloading, which is a fold turning legitimate calls into
+   * refusals (#839).
+   */
+  it("the discovery breaker counts download_model's SEARCH action, never its downloads", async () => {
+    const tools = [
+      ...COMFY_META,
+      { name: "download_model", description: "Models.", inputSchema: { type: "object", properties: {} } },
+    ];
+
+    // Six DIFFERENT downloads in one turn: distinct args, so the exact-repeat
+    // breaker cannot fire either. Every one must dispatch.
+    {
+      const { client, callTool } = fakeMcpClient(tools);
+      const backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: client }) });
+      const dl = (n: number) => [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                function: {
+                  name: "download_model",
+                  arguments: { action: "download", url: `https://h/${n}.safetensors`, target_subfolder: "loras" },
+                },
+              },
+            ],
+          },
+          done: true,
+        },
+      ];
+      chatScript.push(dl(1), dl(2), dl(3), dl(4), dl(5), dl(6), [{ message: { content: "all six queued" }, done: true }]);
+      await collect(backend, turnsOf({ text: "grab these six LoRAs" }));
+      expect(callTool).toHaveBeenCalledTimes(6);
+      const nudges = chatRequests
+        .flatMap((r) => r.messages)
+        .filter((m) => m.role === "tool" && String(m.content).startsWith("SEARCH LIMIT"));
+      expect(nudges).toEqual([]);
+    }
+
+    // …while the SEARCH action still wedges out at the same threshold.
+    {
+      chatRequests = [];
+      const { client, callTool } = fakeMcpClient(tools);
+      const backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: client }) });
+      const search = (q: string) => [
+        {
+          message: {
+            content: "",
+            tool_calls: [{ function: { name: "download_model", arguments: { action: "search", query: q } } }],
+          },
+          done: true,
+        },
+      ];
+      chatScript.push(
+        search("flux"), search("sdxl"), search("wan"), search("qwen"),
+        search("ltx"), search("krea"), search("pony"), search("hunyuan"),
+      );
+      const events = await collect(backend, turnsOf({ text: "find me anything" }));
+      expect(callTool).toHaveBeenCalledTimes(3);
+      const nudges = chatRequests
+        .flatMap((r) => r.messages)
+        .filter((m) => m.role === "tool" && String(m.content).startsWith("SEARCH LIMIT"));
+      expect(nudges.length).toBeGreaterThanOrEqual(1);
+      // The nudge names the ACTION, so the model is not told to stop calling
+      // download_model altogether.
+      expect(String(nudges[0].content)).toContain('download_model action:"search"');
+      expect(events.filter((e) => e.type === "result")).toEqual([
+        { type: "result", ok: false, subtype: "tool_loop", turn: 1 },
+      ]);
+    }
+  });
+
   it("dispatches comfyui meta-tool calls and feeds results back to the next request", async () => {
     const { client, callTool } = fakeMcpClient(COMFY_META);
     const backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: client }) });

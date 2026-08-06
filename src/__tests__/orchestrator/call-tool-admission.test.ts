@@ -197,6 +197,129 @@ describe("call_tool admission", () => {
     });
   });
 
+  /**
+   * 0.50.0 slice 11 folded six inventory tools into `list_local_models`. The
+   * retired entry was a READ-ONLY listing; the folded name also carries
+   * action:"remove", which UNLINKS a model file with no undo. Admitting the name
+   * unscoped would have handed a confirmation-less mobile/mirrored client a
+   * delete button it never had — the #839 shape, a fold turning a refusal into
+   * an acceptance.
+   */
+  it('admits list_local_models for action:"list" only — the delete is refused', () => {
+    expect(callToolAdmission("list_local_models", { action: "list" })).toBeNull();
+    expect(
+      callToolAdmission("list_local_models", { action: "list", model_type: "checkpoints" }),
+    ).toBeNull();
+    for (const action of ["remove", "remove_path", "add_path", "embeddings", "list_paths"]) {
+      expect(
+        callToolAdmission("list_local_models", { action, path: "loras/x.safetensors" }),
+        `action:"${action}"`,
+      ).toBe(`tool "list_local_models" is not permitted for action "${action}"`);
+    }
+    // An omitted action cannot fall through to the delete either.
+    expect(callToolAdmission("list_local_models", { path: "loras/x.safetensors" })).toBe(
+      'tool "list_local_models" is not permitted for action "(missing)"',
+    );
+  });
+
+  /**
+   * Same for `download_model`, which folded eight tools. It admits exactly the
+   * five actions whose retired single-purpose tools were whitelisted.
+   */
+  it("admits download_model for the five actions its retired entries covered", () => {
+    for (const action of [
+      "download",
+      "download_civitai",
+      "search_civitai",
+      "search_creators",
+      "resolve_missing",
+    ]) {
+      expect(callToolAdmission("download_model", { action }), `action:"${action}"`).toBeNull();
+    }
+  });
+
+  it("refuses the download_model actions no retired entry covered", () => {
+    // "cancel" is the one with teeth: a wrong id from a canvas-less client would
+    // abort a transfer the user is watching.
+    for (const action of ["search", "status", "cancel"]) {
+      expect(callToolAdmission("download_model", { action }), `action:"${action}"`).toBe(
+        `tool "download_model" is not permitted for action "${action}"`,
+      );
+    }
+    expect(callToolAdmission("download_model", {})).toBe(
+      'tool "download_model" is not permitted for action "(missing)"',
+    );
+  });
+
+  /**
+   * 0.50.0 slice 14 folded ELEVEN workflow-library names into two, and only SEVEN
+   * of them were whitelisted — five reads under `get_workflow` and the save under
+   * `save_workflow`. Without an action scope the swap would admit the other four
+   * for free, including `lock`, which WRITES a second file into the user library
+   * and SHA-256s every model the workflow references.
+   */
+  describe("get_workflow / save_workflow: the fold admits only what was admitted", () => {
+    it("get_workflow admits exactly the five read actions whose names were whitelisted", () => {
+      for (const action of ["get", "list", "analyze", "query", "from_image"]) {
+        expect(callToolAdmission("get_workflow", { action }), `action:"${action}"`).toBeNull();
+      }
+      // …with the arguments those entries forwarded.
+      expect(callToolAdmission("get_workflow", { action: "get", filename: "a.json" })).toBeNull();
+      expect(
+        callToolAdmission("get_workflow", { action: "query", graph: {}, types: ["KSampler"] }),
+      ).toBeNull();
+    });
+
+    it("get_workflow refuses the three actions no standalone entry ever covered", () => {
+      for (const action of ["strip", "slice", "prompt_director"]) {
+        expect(callToolAdmission("get_workflow", { action }), `action:"${action}"`).toBe(
+          `tool "get_workflow" is not permitted for action "${action}"`,
+        );
+      }
+      // Including the shapes a client would actually send, so the refusal cannot be
+      // argued away as "only the bare action is blocked".
+      expect(
+        callToolAdmission("get_workflow", { action: "strip", path: "C:/wf/expert.json" }),
+      ).toBe('tool "get_workflow" is not permitted for action "strip"');
+      expect(
+        callToolAdmission("get_workflow", { action: "slice", graph: {}, groups: "TXT" }),
+      ).toBe('tool "get_workflow" is not permitted for action "slice"');
+    });
+
+    it("save_workflow admits SAVE only — lock writes, and verify_lock was never admitted", () => {
+      expect(
+        callToolAdmission("save_workflow", { action: "save", filename: "a.json", workflow: {} }),
+      ).toBeNull();
+      for (const action of ["lock", "verify_lock"]) {
+        expect(callToolAdmission("save_workflow", { action }), `action:"${action}"`).toBe(
+          `tool "save_workflow" is not permitted for action "${action}"`,
+        );
+      }
+      expect(callToolAdmission("save_workflow", { action: "lock", filename: "a.json" })).toBe(
+        'tool "save_workflow" is not permitted for action "lock"',
+      );
+    });
+
+    it("refuses either tool with a missing or non-string action", () => {
+      for (const tool of ["get_workflow", "save_workflow"]) {
+        expect(callToolAdmission(tool, {})).toBe(
+          `tool "${tool}" is not permitted for action "(missing)"`,
+        );
+        expect(callToolAdmission(tool, { action: 42 })).toBe(
+          `tool "${tool}" is not permitted for action "(missing)"`,
+        );
+      }
+    });
+
+    it("the retired standalone names are no longer admitted under their own names", () => {
+      // They are not registered tools any more, so the channel must refuse them at
+      // the NAME level rather than silently accepting a name nothing serves.
+      for (const name of ["list_workflows", "analyze_workflow", "query_workflow"]) {
+        expect(callToolAdmission(name, {}), name).toBe(`tool "${name}" is not permitted`);
+      }
+    });
+  });
+
   // Read from the ledger rather than spelled: a consolidation that removes a
   // name from TOOL_NAMES but forgets to remove it from the whitelist would leave
   // a phantom entry admitting a tool that no longer exists, and every slice adds
@@ -211,7 +334,7 @@ describe("call_tool admission", () => {
 
   it("name-level behavior is unchanged for everything else", () => {
     // A whitelisted tool with no action scope is admitted regardless of args…
-    expect(callToolAdmission("list_workflows", {})).toBeNull();
+    expect(callToolAdmission("list_output_images", {})).toBeNull();
     // …including a consolidated tool whose whole-tool posture was judged at
     // whitelist time (apps, 0.49.0 slice 2) — deliberately NOT rescoped here.
     expect(callToolAdmission("apps", { action: "run" })).toBeNull();

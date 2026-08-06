@@ -22,7 +22,7 @@
  *
  * WHAT MAKES A GOOD ENTRY:
  *  - `ask` is what a PERSON says out loud, not a restatement of the tool name.
- *    Nobody says "call list_workflows"; they say "what have I got saved?".
+ *    Nobody says "call the library listing"; they say "what have I got saved?".
  *  - `args` uses plausible real values — a real filename, a real prompt, a real
  *    HuggingFace URL — not `<placeholder>` echoes of the field name.
  *  - `returns` says what lands back in the conversation, in a sentence.
@@ -290,76 +290,120 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
   // -------------------------------------------------------------------------
   // Workflow Library
   // -------------------------------------------------------------------------
-  list_workflows: {
+  get_workflow: {
     gloss:
-      "The saved workflow FILES in your ComfyUI — the same list you see in the " +
-      "ComfyUI sidebar, folders and all. Usually the first call in any " +
-      "\"open my…\" request.",
+      "Everything you can READ about a saved workflow FILE, chosen with " +
+      "`action` — the library listing, the raw JSON, a plain-English summary, a " +
+      "targeted query. Never the graph currently open on your canvas. If you " +
+      "only want to know what a workflow does, `action: \"analyze\"` is a far " +
+      "shorter answer than the full JSON.",
     examples: [
       {
         ask: "What workflows have I got saved?",
-        args: {},
+        args: { action: "list" },
         returns:
           "A numbered list of names, each relative to the library root — one filed " +
           "in a folder shows as VIDEO/MiniMaxH3/clip.json. Pick one and hand the " +
-          "whole name to analyze_workflow or get_workflow.",
+          "whole name back as `filename`.",
       },
-    ],
-  },
-  get_workflow: {
-    gloss:
-      "Reads a saved FILE, not the graph currently open on your canvas. Ask for " +
-      "this when the agent needs the actual JSON to change or run; if you only " +
-      "want to know what a workflow does, analyze_workflow is the shorter answer.",
-    examples: [
       {
         ask: "Open my portrait workflow so we can change the prompt.",
-        args: { filename: "portrait-flux.json" },
+        args: { action: "get", filename: "portrait-flux.json" },
         returns:
           "The full workflow as runnable API-format JSON. This is a big " +
           "response — it is meant for the agent to work on, not for you to read.",
       },
       {
         ask: "Give me the raw file exactly as ComfyUI saved it.",
-        args: { filename: "portrait-flux.json", format: "ui" },
+        args: { action: "get", filename: "portrait-flux.json", format: "ui" },
         returns:
           "The on-disk UI format, including node positions and colours — what " +
           "you want if the file is going to be loaded back into the canvas " +
           "rather than executed.",
       },
-    ],
-  },
-  analyze_workflow: {
-    gloss:
-      "\"Explain this workflow to me.\" Cheaper and far more readable than " +
-      "get_workflow when you just want to understand what a file does.",
-    examples: [
       {
         ask: "What does my portrait workflow actually do?",
-        args: { filename: "portrait-flux.json" },
+        args: { action: "analyze", filename: "portrait-flux.json" },
         returns:
           "A short summary: the model it loads, the prompts, the sampler " +
           "settings, and what it saves.",
       },
       {
         ask: "Is that workflow going to run, or is something missing?",
-        args: { filename: "portrait-flux.json", view: "health" },
+        args: { action: "analyze", filename: "portrait-flux.json", view: "health" },
         returns:
           "Problems only — missing models, unconnected inputs, nodes whose " +
           "packs are not installed.",
       },
+      {
+        ask: "Which samplers in that graph are running above cfg 7?",
+        args: {
+          action: "query",
+          filename: "portrait-flux.json",
+          types: ["KSampler"],
+          where: ["cfg>7"],
+        },
+        returns:
+          "One line per matching node instead of the whole file — the only " +
+          "context-safe way to ask a question of a 100-node graph.",
+      },
+      {
+        ask: "How was this picture made?",
+        args: {
+          action: "from_image",
+          image_path: "C:/ComfyUI/output/ComfyUI_00042_.png",
+        },
+        returns:
+          "The workflow ComfyUI embedded in the PNG when it saved it, in both " +
+          "API and UI form — the way to reverse-engineer someone else's image.",
+      },
+      {
+        ask: "This graph is a mess of Get/Set nodes. What is actually wired to what?",
+        args: { action: "strip", path: "C:/ComfyUI/user/default/workflows/expert.json" },
+        returns:
+          "The same graph with the virtual wiring resolved into real " +
+          "connections, plus a note wherever the stripped form DIFFERS from the " +
+          "source. Read those notes before running it.",
+      },
     ],
   },
   save_workflow: {
+    gloss:
+      "The WRITE half of the library: store a workflow, or record/check the " +
+      "exact models and node-pack commits it ran against so it can be " +
+      "reproduced later.",
     examples: [
       {
         ask: "Save that as a new file so I don't lose the original.",
-        args: { filename: "portrait-flux-v2.json", workflow: WORKFLOW_FRAGMENT },
+        args: {
+          action: "save",
+          filename: "portrait-flux-v2.json",
+          workflow: WORKFLOW_FRAGMENT,
+        },
         argsNote: FRAGMENT_NOTE,
         returns: "Confirmation and the path it was written to.",
         caution:
           "Writing to a filename that already exists replaces that file. Ask " +
           "for a new name — as above — when you want to keep the original.",
+      },
+      {
+        ask: "Pin this one down so it renders the same in six months.",
+        args: { action: "lock", filename: "portrait-flux-v2.json" },
+        returns:
+          "A lock file written alongside the workflow, recording a SHA-256 for " +
+          "every model it loads and the git commit of every custom node pack it " +
+          "uses. Needs a local install — hashing reads the model files.",
+        caution:
+          "This writes a second file (<filename>.lock.json) and hashes every " +
+          "referenced model, which on a large install is minutes of disk work.",
+      },
+      {
+        ask: "Has anything changed since I locked that workflow?",
+        args: { action: "verify_lock", filename: "portrait-flux-v2.json" },
+        returns:
+          "A drift report: which models now hash differently, which node packs " +
+          "moved to a new commit, whether ComfyUI itself was updated. Empty " +
+          "everywhere means it will behave exactly as it did. Read-only.",
       },
     ],
   },
@@ -367,11 +411,47 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
   // -------------------------------------------------------------------------
   // Workflow Authoring
   // -------------------------------------------------------------------------
-  get_node_info: {
+  create_workflow: {
+    gloss:
+      "Building a graph, and the schema lookup you make while building it — " +
+      "start one from a template, patch an existing one, check it before you " +
+      "queue it, or ask what a node's inputs are. Chosen with `action`.",
     examples: [
       {
+        ask: "Give me a basic text-to-image workflow to start from.",
+        args: {
+          action: "create",
+          template: "txt2img",
+          params: { positive_prompt: "a snow leopard on a rooftop at dusk", steps: 25 },
+        },
+        returns:
+          "A complete, runnable API-format workflow. Anything you left out uses " +
+          "the template default, so check the checkpoint it picked actually " +
+          "exists on your server before running it.",
+      },
+      {
+        ask: "Turn the steps up to 40 on node 3.",
+        args: {
+          action: "modify",
+          workflow: WORKFLOW_FRAGMENT,
+          operations: [{ op: "set_input", node_id: "3", input_name: "steps", value: 40 }],
+        },
+        argsNote: FRAGMENT_NOTE,
+        returns:
+          "The modified workflow plus the ids of any nodes the operations added. " +
+          "Nothing is written to disk and nothing is queued.",
+      },
+      {
+        ask: "Will this run?",
+        args: { action: "validate", workflow: WORKFLOW_FRAGMENT },
+        argsNote: FRAGMENT_NOTE,
+        returns:
+          "Either a clean bill of health or the specific problems, without " +
+          "queuing anything.",
+      },
+      {
         ask: "What settings does the KSampler node have?",
-        args: { node_type: "KSampler" },
+        args: { action: "node_info", node_type: "KSampler" },
         returns:
           "That node's inputs and outputs with their types. Dropdown options are " +
           "summarised as a count by default, because a model-loader dropdown can " +
@@ -379,15 +459,37 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
       },
     ],
   },
-  validate_workflow: {
+  visualize_workflow: {
+    gloss:
+      "Turn a workflow you PASS IN into something readable — a Mermaid diagram " +
+      "or the compact DSL — and back again. It never looks at the graph open on " +
+      "your canvas.",
     examples: [
       {
-        ask: "Will this run?",
-        args: { workflow: WORKFLOW_FRAGMENT },
+        ask: "Draw me a diagram of this workflow.",
+        args: { action: "render", workflow: WORKFLOW_FRAGMENT },
         argsNote: FRAGMENT_NOTE,
         returns:
-          "Either a clean bill of health or the specific problems, without " +
-          "queuing anything.",
+          "Mermaid flowchart syntax, nodes grouped by role and every connection " +
+          "labelled with the data type flowing along it.",
+      },
+      {
+        ask: "That chart is unreadable, it's a 60-node graph.",
+        args: { action: "render_hierarchical", workflow: WORKFLOW_FRAGMENT, view: "overview" },
+        argsNote: FRAGMENT_NOTE,
+        returns:
+          "The same graph collapsed to one box per section with the data flow " +
+          "between them. `view: \"list\"` names the sections; `view: \"detail\"` " +
+          "with a `section` opens one of them up.",
+      },
+      {
+        ask: "Show me this workflow in a form I can actually edit by hand.",
+        args: { action: "to_dsl", workflow: WORKFLOW_FRAGMENT },
+        argsNote: FRAGMENT_NOTE,
+        returns:
+          "The compact DSL: one block per node, connections as " +
+          "`key <- nodeId.outputIndex`. `action: \"from_dsl\"` converts it back " +
+          "to runnable JSON when you are done editing.",
       },
     ],
   },
@@ -450,22 +552,26 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
   // -------------------------------------------------------------------------
   // Models
   // -------------------------------------------------------------------------
-  search_models: {
+  download_model: {
+    gloss:
+      "Everything to do with GETTING a model: searching HuggingFace or CivitAI, " +
+      "fetching the file, and watching or stopping the transfer. " +
+      'The `action:"resolve_missing"` one is the answer to "this workflow says a ' +
+      'model is missing" — it works out what is actually absent and finds ' +
+      "downloadable candidates, including smaller quantised versions when the " +
+      "full file will not fit your GPU.",
     examples: [
       {
         ask: "Find me a Flux model I can actually run.",
-        args: { query: "flux schnell", limit: 5 },
+        args: { action: "search", query: "flux schnell", limit: 5 },
         returns:
           "Matching models with their download URLs and file sizes. Nothing is " +
           "downloaded — this is a search.",
       },
-    ],
-  },
-  download_model: {
-    examples: [
       {
         ask: "Get that one.",
         args: {
+          action: "download",
           url: "https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/flux1-schnell.safetensors",
           target_subfolder: "checkpoints",
         },
@@ -477,28 +583,16 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
           "Model files are large — many are 5-25 GB. Check you have the disk " +
           "space before agreeing to a few of these.",
       },
-    ],
-  },
-  list_local_models: {
-    examples: [
       {
-        ask: "Which checkpoints do I already have?",
-        args: { model_type: "checkpoints" },
+        ask: "Is that download still going?",
+        args: { action: "status" },
         returns:
-          "The model filenames in that folder — the exact strings a workflow " +
-          "needs. Omit `model_type` to see every folder at once.",
+          "Every tracked download with its state and byte progress. Pass an " +
+          "`id` to ask about just one.",
       },
-    ],
-  },
-  resolve_missing_models: {
-    gloss:
-      "The answer to \"this workflow says a model is missing\". It works out " +
-      "what is actually absent and finds downloadable candidates, including " +
-      "smaller quantised versions when the full file will not fit your GPU.",
-    examples: [
       {
         ask: "This workflow won't run, it says something's missing. Find it for me.",
-        args: { workflow: WORKFLOW_FRAGMENT },
+        args: { action: "resolve_missing", workflow: WORKFLOW_FRAGMENT },
         argsNote: FRAGMENT_NOTE,
         returns:
           "Each missing file with candidate downloads, their sizes and " +
@@ -507,15 +601,35 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
       },
     ],
   },
-  remove_model: {
+  list_local_models: {
+    gloss:
+      "Everything to do with what you ALREADY have: the installed model files, " +
+      "the embeddings, and the extra folders ComfyUI searches. It also has the " +
+      'one delete: `action:"remove"` unlinks a model file.',
     examples: [
       {
+        ask: "Which checkpoints do I already have?",
+        args: { action: "list", model_type: "checkpoints" },
+        returns:
+          "The model filenames in that folder — the exact strings a workflow " +
+          "needs. Omit `model_type` to see every folder at once.",
+      },
+      {
         ask: "Delete that old LoRA, I'm out of disk space.",
-        args: { path: "loras/old-character-v1.safetensors" },
+        args: { action: "remove", path: "loras/old-character-v1.safetensors" },
         returns: "Confirmation, and how much space came back.",
         caution:
           "This deletes the file. There is no undo and no recycle bin — you " +
-          "would have to download it again. Check the path is the one you mean.",
+          "would have to download it again. Check the path is the one you mean. " +
+          'Note that `action:"remove_path"` is a different thing entirely: it ' +
+          "edits the search-path config and deletes nothing.",
+      },
+      {
+        ask: "Also look for models on my E: drive.",
+        args: { action: "add_path", category: "checkpoints", path: "E:/Models/checkpoints" },
+        returns:
+          "The updated extra-search-path config. ComfyUI needs a restart before " +
+          "it picks the folder up.",
       },
     ],
   },
