@@ -24,6 +24,7 @@ import {
 } from "./panel-recovery.js";
 import { primePanelBase, verifiedPanelDiskVersion } from "./panel-workspace.js";
 import { compareSemver, detectInstallMode } from "./self-update.js";
+import { SHARED_SESSION_SCOPE, isScopeAddress } from "./session-scope.js";
 
 export const DEFAULT_BRIDGE_PORT = 9101;
 
@@ -1172,6 +1173,16 @@ const MIRROR_SAFE_FRAME_TYPES: ReadonlySet<string> = new Set([
   "download_progress",
 ]);
 
+/** #884 — whether a frame type reaches mirror VIEWERS through the mirror
+ *  fan-out above. The orchestrator's conversation fanout excludes an attached
+ *  viewer's own tab for exactly these types (it already gets them via its
+ *  driven tab — direct delivery would double every frame on the phone), while
+ *  non-mirrored frames (e.g. seen-acks for a message the phone itself sent)
+ *  are still delivered directly (codex round 3, P2). */
+export function isMirrorSafeFrameType(frameType: string): boolean {
+  return MIRROR_SAFE_FRAME_TYPES.has(frameType);
+}
+
 export class UiBridge {
   /** Max EADDRINUSE retries before degrading to "panel unavailable". */
   private static readonly MAX_BIND_ATTEMPTS = 5;
@@ -1226,6 +1237,22 @@ export class UiBridge {
    *  to (the generation-bound-command leak: the server can't retract a frame already
    *  delivered to the browser, but the browser can decline to APPLY a stale one). */
   private resolveTabWorkflowUuid: ((tabId: string) => string | undefined) | null = null;
+  /** #884 P0 — orchestrator-injected: the tab a conversation's IN-FLIGHT turn is
+   *  PINNED to (string), `null` when the turn's origin is ambiguous (refuse), or
+   *  undefined when no turn is in flight (fall back to active-tab resolution).
+   *  See resolveTarget's scope branch. */
+  private scopeTargetResolver: ((scopeId: string) => string | null | undefined) | null = null;
+  /** #884 — orchestrator-injected EXPLICIT recovery: re-pin a conversation's
+   *  in-flight turn onto the tab that is active now (the documented
+   *  panel_set_workflow_target({mode:"current"}) consent). Returns the tab it
+   *  repinned to, or undefined when nothing is resolvable. */
+  private scopeRepinHandler: ((scopeId: string) => string | undefined) | null = null;
+  /** #884 — orchestrator-injected: normalize a hello's raw `backend` value the
+   *  same way the orchestrator does (unknown/absent → the default backend), so
+   *  the backend-qualified scope-buffer replay matches the conversation the
+   *  tab actually JOINS. Without it, a hello omitting `backend` never drained
+   *  the default conversation's mailbox (confirming-gate 2, P1). */
+  private helloBackendNormalizer: ((raw: unknown) => string) | null = null;
   /**
    * #716 — an explicit workflow navigation can establish a newer command-stamp
    * identity before the panel's next hello.  The orchestrator owns the value and
@@ -1978,6 +2005,58 @@ export class UiBridge {
         }
         // Deliver anything that finished while this tab was away.
         this.flushMailbox(tabId);
+        // #884 — conversation frames/deliveries produced while ZERO tabs were
+        // connected are buffered under a SCOPE ADDRESS (bare `orchestrator` or
+        // the backend-qualified agent key — the session is orchestrator-scoped,
+        // not tab-scoped). The first tab of the MATCHING conversation picks
+        // them up: a backend-qualified buffer only drains to a hello on that
+        // backend — a Codex tab helloing first must never receive a Claude
+        // conversation's buffered output (confirming-gate P1). Bare-scope
+        // buffers (backend-unattributed) drain to any hello, as before.
+        // The backend this hello JOINS, normalized exactly as the orchestrator
+        // will map it (unknown/absent → the default backend) — an omitted or
+        // misspelled `backend` must still drain the default conversation's
+        // buffers (confirming-gate 2, P1). Without a normalizer (tests, bare
+        // bridges) only an exact advertised backend matches.
+        const rawHelloBackend = (msg as { backend?: unknown }).backend;
+        const helloBackend = this.helloBackendNormalizer
+          ? this.helloBackendNormalizer(rawHelloBackend)
+          : typeof rawHelloBackend === "string"
+            ? rawHelloBackend.toLowerCase()
+            : undefined;
+        const scopeKeyMatchesHello = (scopeKey: string): boolean =>
+          scopeKey === SHARED_SESSION_SCOPE ||
+          (helloBackend !== undefined && scopeKey === `${SHARED_SESSION_SCOPE}::${helloBackend}`);
+        for (const scopeKey of [...this.missedFrames.keys()]) {
+          if (!isScopeAddress(scopeKey) || !scopeKeyMatchesHello(scopeKey)) continue;
+          const sharedMissed = this.missedFrames.get(scopeKey);
+          if (!sharedMissed?.length) {
+            this.missedFrames.delete(scopeKey);
+            continue;
+          }
+          // Deliver first, delete after: a socket failing mid-flush keeps the
+          // REMAINDER buffered for the next hello instead of losing it
+          // (confirming-gate P1 — the old delete-first shape dropped it).
+          let sent = 0;
+          for (const f of sharedMissed) {
+            try {
+              sock.send(JSON.stringify(f));
+              sent += 1;
+            } catch {
+              break; // socket died mid-flush — the remainder stays buffered
+            }
+          }
+          if (sent >= sharedMissed.length) this.missedFrames.delete(scopeKey);
+          else this.missedFrames.set(scopeKey, sharedMissed.slice(sent));
+          logger.debug(
+            `[ui-bridge] replayed ${sent}/${sharedMissed.length} shared-session frame(s) to tab ${tabId.slice(0, 8)}`,
+          );
+        }
+        for (const scopeKey of [...this.mailbox.keys()]) {
+          if (isScopeAddress(scopeKey) && scopeKeyMatchesHello(scopeKey)) {
+            this.flushMailbox(scopeKey, this.conns.get(tabId));
+          }
+        }
         // Resume any idempotent reads that were dropped mid-command by this tab's
         // previous socket (bounded reconnect grace) onto the fresh connection.
         this.resumeAwaitingReconnect(tabId);
@@ -2206,6 +2285,22 @@ export class UiBridge {
     }
   }
 
+  /** The LIVE tab id `tabId` currently resolves to (exact id, unambiguous
+   *  prefix, or the same-socket migration-alias chain — the SAME acceptance
+   *  {@link canReach}/resolveTarget use), or undefined when nothing resolves.
+   *  The orchestrator's provider-switch pin invalidation judges a pin by where
+   *  it ROUTES, not by the id it carries: path compression rewrites every
+   *  historical alias to the newest live id in one step (see the migration
+   *  block in the hello handler), so a pin can name an id no single hello ever
+   *  reported as `migrated_from` and still resolve onto the switched tab. */
+  liveTabIdFor(tabId: string): string | undefined {
+    try {
+      return this.resolveTarget(tabId).tabId;
+    } catch {
+      return undefined;
+    }
+  }
+
   /**
    * Whether the live tab resolved for `tabId` can safely accept a mutation of
    * its active workflow. This mirrors the two pre-dispatch conditions in
@@ -2331,6 +2426,55 @@ export class UiBridge {
     } catch {
       return undefined;
     }
+  }
+
+  /** #884 P0 — inject the orchestrator's turn-target pin (see the field doc and
+   *  resolveTarget's scope branch). */
+  setScopeTargetResolver(fn: (scopeId: string) => string | null | undefined): void {
+    this.scopeTargetResolver = fn;
+  }
+
+  /** #884 — inject the explicit-repin recovery handler (see the field doc). */
+  setScopeRepinHandler(fn: (scopeId: string) => string | undefined): void {
+    this.scopeRepinHandler = fn;
+  }
+
+  /** #884 — EXPLICIT recovery consent (panel_set_workflow_target
+   *  mode:"current" on a scope-bound session): re-pin the conversation's
+   *  in-flight turn onto the tab that is active now, escaping a dead or
+   *  ambiguous pin. Returns the repinned tab id, or undefined. */
+  repinScopeToActive(scopeId: string): string | undefined {
+    return this.scopeRepinHandler?.(scopeId);
+  }
+
+  /** #884 — inject the hello-backend normalizer (see the field doc). */
+  setHelloBackendNormalizer(fn: (raw: unknown) => string): void {
+    this.helloBackendNormalizer = fn;
+  }
+
+  /** #884 — the real tab id a SCOPE ADDRESS currently resolves to (the pinned
+   *  in-flight-turn tab when one is set, else the active tab: last user
+   *  activity, else most recent interactive connect), or undefined when it
+   *  cannot resolve (no tab connected / pin gone / ambiguous). Never throws.
+   *  Pass the caller's own (possibly backend-qualified) scope address so the
+   *  pin of the RIGHT conversation is consulted; defaults to the bare scope. */
+  resolveSharedTabId(scopeId: string = SHARED_SESSION_SCOPE): string | undefined {
+    try {
+      return this.resolveTarget(scopeId).tabId;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** #884 — is this tab's live socket currently ATTACHED as a mirror viewer
+   *  (driving a desktop tab)? Such a client already receives the conversation
+   *  through the mirror fan-out of its driven tab, so the orchestrator's
+   *  conversation fanout must not ALSO deliver to its own tab id — that
+   *  double-delivers every say/stream/turn frame to the phone (codex round 2).
+   *  Unknown/disconnected tabs → false. */
+  isAttachedViewerTab(tabId: string): boolean {
+    const conn = this.conns.get(tabId);
+    return !!conn && this.mirrorViewers.has(conn.sock);
   }
 
   /** The id of the tab a NO-tabId command would target right now: the sole
@@ -2731,6 +2875,46 @@ export class UiBridge {
 
   /** Resolve which tab a command should go to. */
   private resolveTarget(tabId?: string): Conn {
+    // #884 — a SCOPE ADDRESS (`orchestrator` or the backend-qualified
+    // `orchestrator::<backend>`) is not a tab: an agent session spans every
+    // tab/workflow, so a command addressed to the scope resolves to a routing
+    // target at dispatch time (job (b): routing target, decoupled from session
+    // identity).
+    //
+    // WHILE A TURN IS IN FLIGHT the target is PINNED to the tab the turn was
+    // issued from (the orchestrator-injected scopeTargetResolver): "the active
+    // tab" is ambiguous by construction mid-turn — a queued message from
+    // another tab would otherwise re-aim the running turn's tool calls at a
+    // workflow the turn was never about (confirming-gate P0: navigate-then-
+    // mutate on the WRONG tab, laundered by the #716 stamp refresh). A pinned
+    // tab resolves like any real tab id — including the same-socket migration
+    // alias, so a workflow switch on the turn's OWN tab still follows — and
+    // when it is GONE the resolution THROWS the standard no-connected-tab
+    // error (parked/retried by the reconnect machinery) instead of silently
+    // falling back to another tab. `null` from the resolver = the turn's
+    // origin is ambiguous (a mixed-origin batch) → refuse loudly.
+    //
+    // With NO turn in flight (resolver returns undefined): the tab the user
+    // last talked from, else the most recently connected interactive
+    // (canvas-owning) tab, else the most recent headless one.
+    if (isScopeAddress(tabId)) {
+      const pin = this.scopeTargetResolver?.(tabId);
+      if (pin === null) {
+        throw new Error(
+          `no connected tab can be chosen for "${tabId}": the current turn was issued from ` +
+            `multiple workflows at once, so its target is ambiguous. Target a workflow ` +
+            `explicitly (panel_set_workflow_target / panel_open_workflow) or wait for the ` +
+            `next single-origin message.`,
+        );
+      }
+      if (typeof pin === "string" && pin.length > 0) {
+        // Resolve the pinned tab as a normal tab id (exact / prefix / same-
+        // socket migration alias). A miss throws the standard error — loud,
+        // never a silent re-target.
+        return this.resolveTarget(pin);
+      }
+      return this.resolveScopeActive(tabId);
+    }
     if (tabId) {
       // Accept full ids or unambiguous prefixes (status shows 8-char ids).
       const exact = this.conns.get(tabId);
@@ -2781,6 +2965,46 @@ export class UiBridge {
     throw new Error(
       `Multiple panel tabs are connected and none is "last active" — pass tab_id. ${this.status()}`,
     );
+  }
+
+  /** #884 — the ACTIVE-tab resolution for a scope address with NO turn pin in
+   *  force: the tab the user last talked from, else the most recently connected
+   *  interactive (canvas-owning) tab, else the most recent headless one. Also
+   *  the basis of the EXPLICIT repin recovery (repinScopeToActive), which must
+   *  bypass a dead pin by construction. */
+  private resolveScopeActive(tabId: string): Conn {
+    if (this.lastActiveTabId) {
+      const active = this.conns.get(this.lastActiveTabId);
+      if (active) return active;
+    }
+    let interactive: Conn | undefined;
+    let headless: Conn | undefined;
+    for (const c of this.conns.values()) {
+      if (c.headless) {
+        if (!headless || c.helloGeneration > headless.helloGeneration) headless = c;
+      } else if (!interactive || c.helloGeneration > interactive.helloGeneration) {
+        interactive = c;
+      }
+    }
+    const best = interactive ?? headless;
+    if (best) return best;
+    // Keep the machine-readable "no connected tab … Connected: none" phrase —
+    // the panel-tools transient classifier keys on it.
+    throw new Error(
+      `no connected tab with id "${tabId}". Connected: none — ${this.noPanelGuidance()}`,
+    );
+  }
+
+  /** #884 — the tab id the ACTIVE-tab (pin-bypassing) scope resolution picks
+   *  right now, or undefined when no tab is connected. Never throws. The
+   *  orchestrator's explicit-repin handler uses this — the whole point of that
+   *  recovery is to escape a dead/ambiguous pin, so it must not consult it. */
+  resolveActiveScopeTab(): string | undefined {
+    try {
+      return this.resolveScopeActive(SHARED_SESSION_SCOPE).tabId;
+    } catch {
+      return undefined;
+    }
   }
 
   /** The LIVE connection for a (possibly RETIRED) canonical tab id, scoped to the SOCKET
@@ -2889,12 +3113,15 @@ export class UiBridge {
   /** Deliver any buffered render frames to a tab that just (re)connected, plus a
    *  `mailbox_flush` summary so the client can notify "N renders finished while
    *  you were away". Expired items (past TTL) are dropped. */
-  private flushMailbox(tabId: string): void {
+  private flushMailbox(tabId: string, deliverTo?: Conn): void {
     const box = this.mailbox.get(tabId);
     if (!box || box.length === 0) return;
-    this.mailbox.delete(tabId);
-    const conn = this.conns.get(tabId);
+    // #884 — `deliverTo` lets the SHARED-SCOPE mailbox (deliveries produced while
+    // zero tabs were connected) flush to the first tab that hellos; the scope
+    // itself never owns a conn.
+    const conn = deliverTo ?? this.conns.get(tabId);
     if (!conn) return;
+    this.mailbox.delete(tabId);
     const now = Date.now();
     const fresh = box.filter((m) => now - m.ts <= UiBridge.MAILBOX_TTL_MS);
     for (const m of fresh) {
@@ -2993,6 +3220,12 @@ export class UiBridge {
     // own workflow into their own workflow (self-attack, no privacy boundary). See the
     // enforcesWorkflowStamp field doc. Deliberately no attestation.
     if (requiresWorkflowStampEnforcement(cmd)) {
+      // #884 — the resolver is passed the CALLER's id, including the SHARED
+      // SCOPE: the orchestrator answers a scope caller with the workflow the
+      // CURRENT TURN was issued for (captured at user-message dispatch, #570's
+      // issue-time rule preserved), so a mutation conceived while the user was
+      // on workflow A is still declined by the panel after a switch to B —
+      // never silently re-aimed at whatever the active tab shows now.
       const stamp = this.resolveTabWorkflowUuid?.(opts.tabId ?? conn.tabId);
       const hasTrustedStamp = typeof stamp === "string" && stamp.length > 0;
       if (!conn.enforcesWorkflowStamp || !conn.enforcesWorkflowStampAtWrite || !hasTrustedStamp) {
@@ -3145,7 +3378,9 @@ export class UiBridge {
         // #570 — resolve from the CALLER'S intended tab (opts.tabId), NOT the canonical
         // conn.tabId: after a same-socket switch the two differ, and we must stamp the
         // workflow the command was ISSUED FOR (so the panel, now showing a different one,
-        // declines it) — never the workflow it happens to have landed on.
+        // declines it) — never the workflow it happens to have landed on. #884: for the
+        // SHARED SCOPE the orchestrator's resolver answers with the current TURN's
+        // issue-time workflow — same rule, conversation-level.
         workflowUuid: this.resolveTabWorkflowUuid?.(opts.tabId ?? conn.tabId) ?? undefined,
         onDispatchedRid: opts.onDispatchedRid,
       };

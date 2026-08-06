@@ -274,10 +274,24 @@ export async function primePanelBase(
     return { source: "none" };
   }
 
-  // A newer writer (a concurrent prime that already landed, a test seed, a
-  // cache reset) holds the cache now. This probe's answer is no fresher than
-  // theirs for the same target and generation, so keep theirs.
-  if (cached !== cacheAtStart) return resolution;
+  // A NEWER cache write landed while we were asking (a later prime settled, a
+  // test seed, a cache reset). Same rule as the retarget guard above: a probe
+  // that STARTED earlier holds older information, so it must not clobber the
+  // newer write — the fire-and-forget prime a capability refusal kicks off (see
+  // resolveStaleBundleSkew) can settle seconds later, mid-way through someone
+  // else's operation.
+  //
+  // MERGE NOTE (#884 branch × main): both sides fixed this independently and
+  // agreed the newer write must win in the CACHE. They differed on what the
+  // caller gets back — main returned this probe's older answer, this branch
+  // serves the newer cached one. Kept the branch's shape because the other
+  // leaves the caller holding a value the cache has already superseded, which
+  // is the same "two sources of truth" split the guard exists to close. The
+  // expiry fallback preserves main's behavior exactly when the newer entry has
+  // already aged out.
+  if (cached !== cacheAtStart) {
+    return cachedResolution() ?? resolution;
+  }
 
   cached = { at: Date.now(), target: atTarget, generation: atGeneration, resolution };
   return resolution;

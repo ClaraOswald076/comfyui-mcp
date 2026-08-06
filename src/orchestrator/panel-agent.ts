@@ -636,7 +636,14 @@ export class PanelAgent {
       ask_answered_at?: number;
       dropped_answers?: number;
     },
-    opts?: { eventToken?: string },
+    opts?: {
+      eventToken?: string;
+      /** #884 P0 — synthetic origin mid: rides the queue so the injected turn
+       *  fires onSeen at dequeue and acquires its origin pin/stamp like any
+       *  user turn (a run error on tab A must pin A, never follow the active
+       *  tab — confirming-gate 2). */
+      mid?: string;
+    },
   ): boolean {
     // A closed agent's queue is never drained again, so accepting an event here
     // would silently swallow it (#468). REFUSE — and deliberately do NOT hand the
@@ -771,6 +778,12 @@ export class PanelAgent {
       text,
       images,
       completionOnly: true, // the whole item IS the event — safe to drop wholesale
+      // #884 P0 — the (synthetic) mid carries the event's ORIGIN through the
+      // queue so the dequeue fires onSeen and the injected turn acquires its
+      // origin pin/stamp like any user turn. Without it, an injected turn never
+      // pinned and its tool calls followed whatever tab was active (a run
+      // error on A silently editing B — confirming-gate 2, P0).
+      ...(opts?.mid ? { mid: opts.mid } : {}),
       ...(opts?.eventToken ? { eventTokens: [opts.eventToken] } : {}),
     });
     const wake = this.waiting;
@@ -785,7 +798,7 @@ export class PanelAgent {
    *  run succeeded. INTERRUPT any live turn (re-queued so it resumes AFTER the
    *  error), then put the error at the FRONT of the queue so the agent addresses
    *  it before anything else. */
-  async injectRunError(error: string): Promise<void> {
+  async injectRunError(error: string, opts?: { mid?: string }): Promise<void> {
     if (this.closed) return;
     const text =
       `[panel event] ⚠️ The workflow run you just queued ERRORED on the user's canvas: ${error}. ` +
@@ -798,7 +811,10 @@ export class PanelAgent {
     }
     this.busy = true;
     this.deps.onTurn?.(this.tabId, "working");
-    this.queue.unshift({ text }); // front: ahead of any re-queued interrupted turn
+    // #884 P0 — the synthetic origin mid pins the error-handling turn to the
+    // ERRORING workflow's tab (via onSeen at dequeue), so "diagnose and fix it"
+    // edits the graph that failed — never whichever tab happens to be active.
+    this.queue.unshift({ text, ...(opts?.mid ? { mid: opts.mid } : {}) }); // front: ahead of any re-queued interrupted turn
     const wake = this.waiting;
     this.waiting = null;
     wake?.();
@@ -2256,7 +2272,14 @@ export class PanelAgentManager {
       ask_answered_at?: number;
       dropped_answers?: number;
     },
-    opts?: { eventToken?: string },
+    opts?: {
+      eventToken?: string;
+      /** #884 P0 — synthetic origin mid: rides the queue so the injected turn
+       *  fires onSeen at dequeue and acquires its origin pin/stamp like any
+       *  user turn (a run error on tab A must pin A, never follow the active
+       *  tab — confirming-gate 2). */
+      mid?: string;
+    },
   ): boolean {
     const agent = this.agents.get(tabId);
     if (!agent || agent.isStopped) return false; // best-effort; don't enqueue into a closed agent
@@ -2292,10 +2315,10 @@ export class PanelAgentManager {
 
   /** Push a ComfyUI execution error to a tab's agent — interrupt the live turn
    *  and front-queue the error so the agent stops and addresses it. */
-  async injectRunError(tabId: string, error: string): Promise<boolean> {
+  async injectRunError(tabId: string, error: string, opts?: { mid?: string }): Promise<boolean> {
     const agent = this.agents.get(tabId);
     if (!agent || agent.isStopped) return false;
-    await agent.injectRunError(error);
+    await agent.injectRunError(error, opts);
     return true;
   }
 
@@ -2746,8 +2769,12 @@ export class PanelAgentManager {
   /** Forget a tab's agent so the next message starts a brand-new session. The
    *  map mutation is synchronous and the old agent is stopped fire-and-forget,
    *  so the caller (e.g. resume_session) can set a new pendingResume right after
-   *  without a concurrent send() spawning a non-resumed agent in an await gap. */
-  reset(tabId: string): void {
+   *  without a concurrent send() spawning a non-resumed agent in an await gap.
+   *  Returns whether the durable session clear actually reached disk — false
+   *  means this process starts fresh but an orchestrator restart could resume
+   *  the cleared conversation, which the caller must disclose rather than
+   *  report a clean New chat (codex confirming-gate P1: false-success). */
+  reset(tabId: string): { durableCleared: boolean } {
     // Unbind through the SHARED teardown seam (#468) — it is what guarantees a
     // run completion parked in held mail is handed back rather than discarded.
     const agent = this.unbindAgent(tabId, { dropHeldMail: true, reason: "reset" });
@@ -2756,7 +2783,7 @@ export class PanelAgentManager {
     // fallback in send() can't resurrect the conversation the user just cleared.
     // (resume_session calls reset() then setResume() with the chosen id, so the
     // historical session is re-armed right after and re-persisted on next onSession.)
-    this.opts.sessionStore?.clear(tabId);
+    const durableCleared = this.opts.sessionStore ? this.opts.sessionStore.clear(tabId) : true;
     this.pendingEffortRestart.delete(tabId); // a reset supersedes any deferred restart
     this.pendingMcpRestart.delete(tabId);
     // Drop this key's picker override so a provider switch (which reset()s the old
@@ -2767,6 +2794,7 @@ export class PanelAgentManager {
       logger.info(`[panel-orchestrator] tab ${tabId.slice(0, 8)} reset — new session next message`);
       void agent.stop();
     }
+    return { durableCleared };
   }
 
   /** Stop and UNBIND a tab's live agent WITHOUT touching its durable session — used
