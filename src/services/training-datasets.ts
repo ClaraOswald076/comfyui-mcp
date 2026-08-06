@@ -1,6 +1,6 @@
 // Dataset + job-config readers behind the training surfaces (panel Jobs/
 // Datasets tabs, the mobile monitor). READ-ONLY, and bounded to the training
-// root: dataset names are basename-checked, train_file paths are realpath-
+// root: dataset names are basename-checked, action:"file" paths are realpath-
 // contained, and inlining is size-capped (a phone is the other end).
 
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
@@ -9,7 +9,7 @@ import { parse as parseYaml } from "yaml";
 import { datasetsRoot, getJob, trainingRoot } from "./training-jobs.js";
 
 const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
-/** train_file inlining cap — a sample/dataset photo, not a checkpoint. */
+/** train_prepare_dataset (action:"file") inlining cap — a sample/dataset photo, not a checkpoint. */
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
 export interface DatasetSummary {
@@ -223,7 +223,7 @@ export function previewConfig(input: {
   return { jobName: built.jobName, yaml: built.yaml };
 }
 
-// ── train_file: bounded inline reads under the training root ───────────────
+// ── action:"file": bounded inline reads under the training root ────────────
 
 /** Read an image under the training root (dataset images, job samples) as
  *  base64 for the MCP image channel. Contained, image-only, size-capped. */
@@ -244,7 +244,7 @@ export function readTrainingFile(absPath: string): { data: string; mimeType: str
   return { data: readFileSync(p).toString("base64"), mimeType };
 }
 
-// ── train_job_config: "what settings did this run use?" ────────────────────
+// ── action:"job_config": "what settings did this run use?" ─────────────────
 
 export interface JobConfigView {
   id: string;

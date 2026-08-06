@@ -19,10 +19,10 @@ The user wants to install a ComfyUI custom node pack from the registry or a GitH
    - **Descriptive name**: like "Impact Pack" or "ControlNet" — search for it
 
 2. **Find the pack.** If not a direct GitHub URL:
-   - Call `search_custom_nodes` with the argument as the query
+   - Call `search_custom_nodes` (`action: "search"`) with the argument as `query`
    - Present the top results: name, description, author, star count
    - If multiple matches, ask the user to confirm which one they want
-   - Call `get_node_pack_details` with the selected pack ID for full info including the repository URL
+   - Call `search_custom_nodes` (`action: "details"`) with the selected pack ID for full info including the repository URL
 
 3. **Confirm with the user.** Before installing, show:
    - Pack name and description
@@ -45,7 +45,7 @@ The user wants to install a ComfyUI custom node pack from the registry or a GitH
 
 7. **Restart ComfyUI.** Tell the user that new nodes require a restart to be loaded. Offer to call `restart_comfyui` to restart automatically.
 
-8. **Generate a skill file (optional).** Ask the user if they'd like to generate a Claude Code skill for the new pack. If yes, call `generate_node_skill` with the pack source to create a skill file that helps Claude understand the new nodes.
+8. **Generate a skill file (optional).** Ask the user if they'd like to generate a Claude Code skill for the new pack. If yes, call `list_packs` with `action: "generate_skill"` and the pack source to create a skill file that helps Claude understand the new nodes.
 
 ## Example
 
@@ -65,4 +65,4 @@ Steps:
 - Some packs have complex dependencies (e.g., GroundingDINO, SAM) — if pip install fails, show the error and suggest manual intervention
 - If `git clone` fails due to the directory already existing, offer `git pull` to update instead
 - Some packs require additional model downloads after installation — check the pack README for post-install steps
-- After installation and restart, verify the nodes loaded by calling `get_node_info` with one of the pack's node names
+- After installation and restart, verify the nodes loaded by calling `create_workflow (action:"node_info")` with one of the pack's node names

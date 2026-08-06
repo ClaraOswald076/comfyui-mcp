@@ -1,7 +1,4 @@
-import { z } from "zod";
 import { readFileSync } from "node:fs";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { errorToToolResult } from "../utils/errors.js";
 import { getComfyUIBaseUrl, getComfyUIAuthHeaders } from "../config.js";
 import { getObjectInfo } from "../comfyui/client.js";
 import {
@@ -20,19 +17,21 @@ import type {
   UiWorkflow,
 } from "../comfyui/types.js";
 
-// ── get_template_schema ──────────────────────────────────────────────────────
+// ── enqueue_workflow (action:"template_schema") ──────────────────────────────
 // The template-level "what can I override" view: resolve a template (bundled
 // installer pack first, then an official ComfyUI workflow template on the live
-// server — the SAME sources list_packs / list_workflow_templates enumerate and
-// read_pack_workflow loads), normalize it to API/prompt format so every widget
+// server — the SAME sources list_packs action:"list"/"list_templates" enumerate
+// and action:"read_workflow" loads), normalize it to API/prompt format so every widget
 // has a NAME, then surface the meaningful run-time parameters ("slots").
 //
-// KEY CONVENTION (shared with run_template's `overrides`): every slot key is
+// KEY CONVENTION (shared with enqueue_workflow (action:"run_template")'s
+// `overrides`): every slot key is
 //   "<nodeId>.<widget_name>"        e.g.  "3.seed", "6.text", "5.width"
-// so get_template_schema → run_template round-trips with zero translation.
+// so schema → run round-trips with zero translation.
 
 export interface TemplateSlot {
-  /** Stable override key: "<nodeId>.<widget_name>" — feed straight into run_template overrides. */
+  /** Stable override key: "<nodeId>.<widget_name>" — feed straight into
+   *  enqueue_workflow (action:"run_template")'s overrides. */
   key: string;
   node_id: string;
   class_type: string;
@@ -331,12 +330,12 @@ export interface TemplateIndexMatch {
 
 /**
  * Resolve a template query against the /api/workflow_templates index — the SAME
- * index list_workflow_templates returns. Pure + offline so it is unit-testable
+ * index list_packs (action:"list_templates") returns. Pure + offline so it is unit-testable
  * independent of the live server.
  *
  * The query may be a bare template name ("i2mv_sdxl_ldm_view_selector") OR a
  * source-qualified id ("ComfyUI-MVAdapter/i2mv_sdxl_ldm_view_selector") — the
- * qualified form (module/name, matching how list_workflow_templates groups
+ * qualified form (module/name, matching how action:"list_templates" groups
  * entries) disambiguates when the same name is provided by multiple modules.
  */
 export function resolveTemplateFromIndex(
@@ -390,7 +389,7 @@ async function loadServerTemplate(
   // Use the SAME canonical base URL + auth headers as the connected ComfyUI
   // client (getObjectInfo/getClient). A bare protocol://host:port fetch drops
   // the reverse-proxy base path and any gateway auth headers, so a proxied or
-  // authed remote that list_workflow_templates (now) reaches would otherwise
+  // authed remote that list_packs (action:"list_templates") (now) reaches would otherwise
   // look "unreachable" here — the inconsistency this issue reported.
   const base = getComfyUIBaseUrl();
   const authHeaders = getComfyUIAuthHeaders();
@@ -465,7 +464,7 @@ async function loadServerTemplate(
       available_count: resolved.all.length,
       ...((near.length ? near.length : Math.min(resolved.all.length, 20)) < resolved.all.length
         ? {
-            available_truncated: `Showing ${near.length ? near.length : Math.min(resolved.all.length, 20)} of ${resolved.all.length} templates (fixed preview cap — no parameter raises it); list_workflow_templates returns every one.`,
+            available_truncated: `Showing ${near.length ? near.length : Math.min(resolved.all.length, 20)} of ${resolved.all.length} templates (fixed preview cap — no parameter raises it); list_packs (action:\"list_templates\") returns every one.`,
           }
         : {}),
     };
@@ -495,107 +494,107 @@ async function loadServerTemplate(
   };
 }
 
-export function registerTemplateSchemaTools(server: McpServer): void {
-  server.tool(
-    "get_template_schema",
-    "Get a template's OVERRIDABLE run-time parameters (its 'slots') before running it. Pass a bundled pack name (from list_packs) or a custom-node-contributed workflow template name (from list_workflow_templates). Returns `slots` — the meaningful knobs: positive/negative prompt, seed, steps, cfg, sampler/scheduler, width/height, checkpoint/LoRA/model files, denoise, batch_size, input image — plus `other_slots` (every remaining overridable widget), each with a stable key `\"<nodeId>.<widget_name>\"`, semantic role, type, current value, and min/max/options where the node schema is known. Feed the keys DIRECTLY into run_template's `overrides` (same convention) for a schema→run round-trip.",
-    {
-      template: z
-        .string()
-        .min(1)
-        .describe("Template name/id: a bundled pack directory name (list_packs) or a custom-node-contributed workflow template name (list_workflow_templates)."),
-    },
-    async (args) => {
-      try {
-        const name = args.template.trim();
-        let graph: unknown;
-        let source: string;
+/**
+ * `enqueue_workflow (action:"template_schema")` — the handler the standalone
+ * template-schema tool used to carry (0.50.0 slice 16), unchanged apart from
+ * losing its own registration.
+ *
+ * Same resolution order (bundled pack, then the live server's template index),
+ * same slot extraction, same JSON payload, and the same two `isError` RETURNS
+ * for an unresolvable name and an unrecognised graph — those are returns, not
+ * throws, so they survive the move untouched. The try/catch moved OUT to the
+ * dispatcher in workflow-execute.ts, which applies the identical
+ * `errorToToolResult`.
+ */
+export async function templateSchemaAction(args: { template: string }): Promise<{
+  isError?: true;
+  content: Array<{ type: "text"; text: string }>;
+}> {
+  const name = args.template.trim();
+  let graph: unknown;
+  let source: string;
 
-        const packFile = resolvePackWorkflowFile(name);
-        if (packFile) {
-          graph = JSON.parse(readFileSync(packFile, "utf8"));
-          source = `pack:${name}`;
-        } else {
-          const res = await loadServerTemplate(name);
-          if ("error" in res) {
-            const packs = enumeratePacks().map((p) => String(p.name));
-            const near = packs.filter((p) => p.toLowerCase().includes(name.toLowerCase()));
-            return {
-              isError: true,
-              content: [
-                {
-                  type: "text" as const,
-                  text: JSON.stringify(
-                    {
-                      error: `Could not resolve template "${name}". ${res.error}`,
-                      near_matches: [...near, ...res.available].slice(0, 20),
-                      hint: "Use list_packs for bundled packs or list_workflow_templates for custom-node-contributed templates (core templates only appear in the ComfyUI frontend's own Templates browser).",
-                    },
-                    null,
-                    2,
-                  ),
-                },
-              ],
-            };
-          }
-          graph = res.graph;
-          source = res.source;
-        }
-
-        // Live node schema enriches types/min/max/options and names UI widgets;
-        // fall back to the built-in core-node table offline.
-        let live: ObjectInfo | null = null;
-        try {
-          live = await getObjectInfo();
-        } catch {
-          live = null;
-        }
-        const normalized = templateGraphToApi(graph, live);
-        if (!normalized) {
-          return {
-            isError: true,
-            content: [
+  const packFile = resolvePackWorkflowFile(name);
+  if (packFile) {
+    graph = JSON.parse(readFileSync(packFile, "utf8"));
+    source = `pack:${name}`;
+  } else {
+    const res = await loadServerTemplate(name);
+    if ("error" in res) {
+      const packs = enumeratePacks().map((p) => String(p.name));
+      const near = packs.filter((p) => p.toLowerCase().includes(name.toLowerCase()));
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
               {
-                type: "text" as const,
-                text: `Template "${name}" resolved (${source}) but its JSON is neither a UI-format nor an API-format ComfyUI workflow.`,
+                error: `Could not resolve template "${name}". ${res.error}`,
+                near_matches: [...near, ...res.available].slice(0, 20),
+                hint: "Use list_packs (action:\"list\") for bundled packs or list_packs (action:\"list_templates\") for custom-node-contributed templates (core templates only appear in the ComfyUI frontend's own Templates browser).",
               },
-            ],
-          };
-        }
-        const { slots, other_slots } = extractTemplateSlots(normalized.api, normalized.objectInfo);
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                {
-                  template: name,
-                  source,
-                  node_schema: live ? "live-object_info" : "builtin-fallback (server unreachable — types/options are best-effort)",
-                  slot_key_format: "<nodeId>.<widget_name> — pass these keys as run_template overrides",
-                  slot_count: slots.length,
-                  slots,
-                  other_slot_count: other_slots.length,
-                  other_slots,
-                  // #809: a warnings array silently clipped at 20 reads as "these are
-                  // all the warnings". Report the true count alongside the preview.
-                  warning_count: normalized.warnings.length,
-                  warnings: normalized.warnings.slice(0, 20),
-                  ...(normalized.warnings.length > 20
-                    ? {
-                        warnings_truncated: `Showing 20 of ${normalized.warnings.length} warnings (fixed preview cap — no parameter raises it); fix these and re-run to surface the rest.`,
-                      }
-                    : {}),
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+    graph = res.graph;
+    source = res.source;
+  }
+
+  // Live node schema enriches types/min/max/options and names UI widgets;
+  // fall back to the built-in core-node table offline.
+  let live: ObjectInfo | null = null;
+  try {
+    live = await getObjectInfo();
+  } catch {
+    live = null;
+  }
+  const normalized = templateGraphToApi(graph, live);
+  if (!normalized) {
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text" as const,
+          text: `Template "${name}" resolved (${source}) but its JSON is neither a UI-format nor an API-format ComfyUI workflow.`,
+        },
+      ],
+    };
+  }
+  const { slots, other_slots } = extractTemplateSlots(normalized.api, normalized.objectInfo);
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(
+          {
+            template: name,
+            source,
+            node_schema: live ? "live-object_info" : "builtin-fallback (server unreachable — types/options are best-effort)",
+            slot_key_format:
+              '<nodeId>.<widget_name> — pass these keys as enqueue_workflow (action:"run_template") overrides',
+            slot_count: slots.length,
+            slots,
+            other_slot_count: other_slots.length,
+            other_slots,
+            // #809: a warnings array silently clipped at 20 reads as "these are
+            // all the warnings". Report the true count alongside the preview.
+            warning_count: normalized.warnings.length,
+            warnings: normalized.warnings.slice(0, 20),
+            ...(normalized.warnings.length > 20
+              ? {
+                  warnings_truncated: `Showing 20 of ${normalized.warnings.length} warnings (fixed preview cap — no parameter raises it); fix these and re-run to surface the rest.`,
+                }
+              : {}),
+          },
+          null,
+          2,
+        ),
+      },
+    ],
+  };
 }

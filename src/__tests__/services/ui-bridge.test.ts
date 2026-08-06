@@ -1942,7 +1942,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     });
     // A tool_result for the desktop tab must NOT leak to the mirror viewer.
     bridge.push(
-      { type: "tool_result", cid: "x", tool: "list_workflows", ok: true, result: [] },
+      { type: "tool_result", cid: "x", tool: "get_workflow", ok: true, result: [] },
       "desktop-4",
     );
     await settle();
@@ -2404,6 +2404,16 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
   });
 
   it("names the versioned panel-sync remedy when stamp enforcement is absent (#706)", async () => {
+    // The remedy names install_panel ONLY when a local ComfyUI install is
+    // resolvable from here. That used to come from the developer's REAL
+    // machine state (COMFYUI_PATH in the real ~/.comfyui-mcp/.env), so the
+    // test failed on any machine without one — and under the suite-wide home
+    // redirect (#879/#866), which hides that ambient config on purpose.
+    // Prime the resolution the assertion actually depends on: a resolved
+    // local base, no disk observation (cleared by this file's afterEach).
+    const base = mkdtempSync(join(tmpdir(), "cmcp-bridge-base-"));
+    tempRoots.push(base);
+    __setPanelBaseForTests(base);
     const old = new WebSocket(`ws://127.0.0.1:${port}`);
     await new Promise<void>((res, rej) => {
       old.on("open", () => {

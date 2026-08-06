@@ -123,7 +123,7 @@ export function resolveLocalWorkspaceBase(): string | undefined {
  * QUESTION 2 — "which install does THIS OPERATION act on?"
  *
  * The single source of truth for every filesystem-backed tool (download_model,
- * verify_custom_node, model lookups, extra-paths, comfy-cli, apply_manifest's
+ * node_pack (action:"verify"), model lookups, extra-paths, comfy-cli, apply_manifest's
  * adoption). Returns undefined whenever the session is NOT pointed at a local install,
  * because then no directory on this machine is the thing being operated on.
  *
@@ -1566,7 +1566,7 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
       local.note = [
         local.note,
         `Package versions omitted: ${reason}, so reporting them would be a false ` +
-          `capability report (#401). Start ComfyUI through start_comfyui, or run it ` +
+          `capability report (#401). Start ComfyUI through restart_comfyui (action:"start"), or run it ` +
           `locally where this process can read its command line, for an accurate report.`,
       ]
         .filter(Boolean)

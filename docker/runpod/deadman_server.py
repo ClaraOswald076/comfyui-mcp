@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """comfyui-mcp dead-man heartbeat server (pod side) — #269.
 
-Part of the dead-man switch: pods created via runpod_pod_create carry a
+Part of the dead-man switch: pods created via the runpod tool's create action carry a
 watchdog (deadman_watch.sh) that STOPS THE POD when comfyui-mcp's heartbeats
 stop (orchestrator crash / laptop closed = the in-process idle auto-stop is
 gone too, and without this the pod would bill forever). This tiny stdlib-only

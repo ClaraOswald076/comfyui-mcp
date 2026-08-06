@@ -21,7 +21,7 @@ Given a custom node pack name or GitHub URL, you will:
 
 ### Step 1: Identify the Pack
 
-- Use `search_custom_nodes` or `get_node_pack_details` to find the pack in the ComfyUI registry
+- Use `search_custom_nodes` with `action: "search"` (then `action: "details"`) to find the pack in the ComfyUI registry
 - Note the pack's ID, description, GitHub repo URL, and list of provided nodes
 - If not found in the registry, use the GitHub URL directly
 
@@ -33,7 +33,7 @@ Given a custom node pack name or GitHub URL, you will:
 
 ### Step 3: Query Node Definitions
 
-- Use `get_node_info` with the node class names to get their exact input/output schemas from ComfyUI
+- Use `create_workflow (action:"node_info")` with the node class names to get their exact input/output schemas from ComfyUI
 - If the nodes aren't installed locally, document what you found from the README and registry
 - Record each node's: class_type, required inputs (with types), optional inputs, outputs (with types)
 
@@ -44,7 +44,7 @@ Given a custom node pack name or GitHub URL, you will:
 
 ### Step 5: Generate the Skill
 
-- Use `generate_node_skill` to create the initial skill, OR write a comprehensive SKILL.md manually if you have richer information from your research
+- Use `list_packs` with `action: "generate_skill"` to create the initial skill, OR write a comprehensive SKILL.md manually if you have richer information from your research
 - The skill file should include:
   - **Overview**: What the pack does, when to use it
   - **Node Reference**: Every node with its class_type, inputs, outputs, and description

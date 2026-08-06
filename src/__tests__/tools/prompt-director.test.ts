@@ -1,28 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { registerPromptDirectorTools } from "../../tools/prompt-director.js";
-
-type ToolHandler = (args: Record<string, unknown>) => Promise<{
-  isError?: boolean;
-  content: Array<{ type: string; text: string }>;
-}>;
-
-function makeServer() {
-  const handlers = new Map<string, ToolHandler>();
-  const server = {
-    tool: (name: string, _description: string, _schema: unknown, handler: ToolHandler) => {
-      handlers.set(name, handler);
-    },
-  };
-  registerPromptDirectorTools(server as never);
-  return handlers.get("prompt_director_inspect")!;
-}
+// 0.50.0 slice 14: this is get_workflow (action:"prompt_director") now, so the
+// inspection body is exercised directly rather than through a registrar; the
+// dispatch that reaches it is covered by
+// src/__tests__/tools/workflow-library.test.ts.
+import { promptDirectorInspectAction } from "../../tools/prompt-director.js";
 
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("prompt_director_inspect tool", () => {
+describe('get_workflow (action:"prompt_director") inspection', () => {
   it("reads the bounded runtime inspection registry and filters by node id", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
@@ -34,8 +22,7 @@ describe("prompt_director_inspect tool", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const inspect = makeServer();
-    const result = await inspect({ node_id: "42" });
+    const result = await promptDirectorInspectAction("42");
 
     // Routed through comfyuiFetch now (so CF Access / COMFYUI_AUTH_* headers reach
     // this endpoint too); with no auth configured it calls fetch(url, {}).

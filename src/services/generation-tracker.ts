@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { join } from "node:path";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import BetterSqlite3 from "better-sqlite3";
 import type Database from "better-sqlite3";
@@ -145,6 +145,13 @@ export class GenerationTracker {
     const dir = join(resolvedPath, "..");
     mkdirSync(dir, { recursive: true });
 
+    // Existing installs have real generation history at the OLD in-tree path.
+    // Moving where we look without bringing it along would silently orphan it —
+    // the tracker would come up empty and every past generation would look like
+    // it never happened. Only when the caller did not name a path: an explicit
+    // `dbPath` is the caller's business.
+    if (!dbPath) this.migrateLegacyInTreeDb(resolvedPath);
+
     this.db = new BetterSqlite3(resolvedPath);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
@@ -155,12 +162,77 @@ export class GenerationTracker {
     logger.info(`Generation tracker DB: ${resolvedPath}`);
   }
 
-  private defaultDbPath(): string {
-    if (config.comfyuiPath) {
-      return join(config.comfyuiPath, "comfyui-mcp", "generations.db");
+  /**
+   * One-time move of the pre-#872 database out of the ComfyUI git tree.
+   *
+   * WAL means THREE files (`.db`, `-wal`, `-shm`) and all of them have to travel
+   * together: a `.db` carried across without its `-wal` loses every transaction
+   * that had not been checkpointed, which is silent data loss dressed as a
+   * successful migration.
+   *
+   * Best-effort by design. This runs at construction, and failing to move an old
+   * database is not a reason to refuse to track new generations — but it IS a
+   * reason to say so loudly, because the alternative is a user quietly wondering
+   * where their history went.
+   */
+  private migrateLegacyInTreeDb(target: string): void {
+    if (!config.comfyuiPath) return;
+    const legacy = join(config.comfyuiPath, "comfyui-mcp", "generations.db");
+    if (legacy === target || !existsSync(legacy)) return;
+
+    if (existsSync(target)) {
+      // Both exist. The new one is authoritative — this process may already have
+      // written to it — and overwriting either would destroy history. Say where
+      // the old one is and leave it alone.
+      logger.warn(
+        `[generation-tracker] a legacy generation database is still at ${legacy}, inside the ` +
+          `ComfyUI install, but ${target} already exists so it was NOT moved. The legacy file ` +
+          `is not being read. Note that its presence can break ComfyUI's own git updater ` +
+          `(#872) — move or delete it once you have salvaged anything you need.`,
+      );
+      return;
     }
-    // Remote/cloud/undetected: comfyuiPath is undefined by design. Use a stable
-    // per-user data dir (override: COMFYUI_MCP_DATA_DIR) instead of littering CWD.
+
+    const suffixes = ["", "-wal", "-shm"];
+    try {
+      for (const suffix of suffixes) {
+        const from = `${legacy}${suffix}`;
+        if (existsSync(from)) renameSync(from, `${target}${suffix}`);
+      }
+      logger.info(
+        `[generation-tracker] moved the generation database out of the ComfyUI install ` +
+          `(${legacy} → ${target}). It lived inside ComfyUI's git working tree, where it could ` +
+          `break ComfyUI's updater (#872).`,
+      );
+    } catch (err) {
+      // A partial move is the dangerous outcome: the `.db` here and its `-wal`
+      // there is a corrupt pair. Report the whole state rather than a bare error.
+      logger.warn(
+        `[generation-tracker] could not move the legacy generation database out of the ComfyUI ` +
+          `install (${legacy} → ${target}): ${err instanceof Error ? err.message : String(err)}. ` +
+          `Some of the .db/-wal/-shm set may have moved and some may not — check BOTH locations ` +
+          `before deleting anything, and keep the .db together with its -wal.`,
+      );
+    }
+  }
+
+  private defaultDbPath(): string {
+    // NEVER inside the ComfyUI install (#872). This used to return
+    // `<comfyuiPath>/comfyui-mcp/generations.db` for every local install, which
+    // put a live WAL SQLite database — three open files — inside ComfyUI's own
+    // GIT WORKING TREE, in a directory its `.gitignore` does not cover.
+    //
+    // ComfyUI's updater saves uncommitted work with `git add -A`, so it commits
+    // our database, then `git reset --hard` tries to remove it — and Windows
+    // refuses to delete a file whose handle we hold for the orchestrator's entire
+    // lifetime. The user's ComfyUI update ABORTS, and its rollback fails too,
+    // leaving them on a backup branch. Writing our state into someone else's
+    // version-controlled tree was the mistake; the file being locked is just what
+    // made it visible.
+    //
+    // The per-user data dir was already the path for remote/cloud, and its
+    // instance slug (host+port) keeps separate installs separate — which is the
+    // only thing the in-tree location was really achieving.
     const baseDir = process.env.COMFYUI_MCP_DATA_DIR?.trim() || join(homedir(), ".comfyui-mcp");
     return join(baseDir, "instances", getInstanceSlug(), "generations.db");
   }

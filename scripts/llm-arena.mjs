@@ -207,7 +207,19 @@ async function runScenario(mcp, ollamaTools, model, scenario) {
         // whose target name never parsed is not evidence about any tool's
         // description, and must not be able to form a suspect pattern.
         if (typeof inner === "string" && inner) {
-          t.calls.push({ tool: inner, ok });
+          // `args` rides along because tool NAME alone stopped being evidence
+          // once the 0.49.0/0.50.0 consolidation folded families behind an
+          // `action` parameter: "the model called upload_image" no longer
+          // distinguishes staging a prior output from uploading a local file.
+          // Scenarios that need that distinction assert on c.args.action.
+          // `args`/`arguments` are aliases in call_tool's own schema, so read
+          // both — a model that used the alias must not look argument-less.
+          const innerArgs = args?.args ?? args?.arguments;
+          t.calls.push({
+            tool: inner,
+            ok,
+            args: innerArgs && typeof innerArgs === "object" && !Array.isArray(innerArgs) ? innerArgs : {},
+          });
           console.log(`      ${inner} ${ok ? "ok" : "ERR"}`);
         }
       }

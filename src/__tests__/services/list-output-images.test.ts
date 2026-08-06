@@ -6,8 +6,13 @@ import { join } from "node:path";
 // Mock resolveOutputDir so the scan targets our temp dir; everything else
 // (readdir/stat/extname classification) runs for real.
 let outputDir = "";
+// #877 needs the FAILING resolution too: "the output dir could not be
+// determined" is a distinct state from "it resolved and was empty", and the bug
+// was those two producing the same answer.
+let outputDirError: Error | null = null;
 vi.mock("../../services/output-dir.js", () => ({
-  resolveOutputDir: () => Promise.resolve(outputDir),
+  resolveOutputDir: () =>
+    outputDirError ? Promise.reject(outputDirError) : Promise.resolve(outputDir),
   resolveInputDir: () => Promise.resolve(outputDir),
 }));
 
@@ -162,8 +167,17 @@ describe("listOutputImages", () => {
 
 describe("listOutputImages — remote mode (derived from /history)", () => {
   beforeEach(() => {
-    // No local filesystem → the history-derived branch is used.
+    // ACTUALLY remote (#877). This block called itself "remote mode" while only
+    // clearing `config.comfyuiPath` — which is the very conflation the bug was:
+    // one env var being unset is not "there is no local filesystem", because a
+    // local portable install is located by the SAVED DEFAULT WORKSPACE. Keying
+    // the /history branch off that check sent a local install to a data source
+    // that cannot see its disk, and an emptied history then read as "no outputs".
+    remoteFlag = true;
     config.comfyuiPath = undefined;
+  });
+  afterEach(() => {
+    remoteFlag = false;
   });
 
   it("derives images + videos from history, newest-first, with kind", async () => {
@@ -244,9 +258,13 @@ describe("listOutputImages — remote mode (derived from /history)", () => {
     expect((await listOutputImages({ limit: 1 })).length).toBe(1);
   });
 
-  it("returns [] when history is unavailable rather than throwing", async () => {
+  it("does NOT return [] when history is UNAVAILABLE — a failed request is not an empty history", async () => {
+    // This asserted the opposite, and that was the fold (#877): in remote mode
+    // /history is the ONLY source, so returning `[]` when the request failed made
+    // "we never got an answer" indistinguishable from "there are no outputs" —
+    // and `[]` was the whole reply.
     getHistoryMock.mockRejectedValue(new Error("unreachable"));
-    await expect(listOutputImages()).resolves.toEqual([]);
+    await expect(listOutputImages()).rejects.toThrow(/NOT a finding that there are no outputs/i);
   });
 
   it("uses /history even when comfyuiPath IS set, as long as isRemoteMode() is true", async () => {
@@ -274,5 +292,69 @@ describe("listOutputImages — remote mode (derived from /history)", () => {
     // …and ONLY the history-derived entry came back (readdir scan did NOT run).
     expect(results.map((r) => r.filename)).toEqual(["from_history.png"]);
     expect(results.find((r) => r.filename === "local_only.png")).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #877 — a LOCAL portable install with COMFYUI_PATH unset. `get_environment`
+// locates it perfectly well from the saved default workspace, but
+// The output listing keyed its remote branch off `!config.comfyuiPath` and so
+// asked /history, which had been emptied by a restart. It returned `[]` over a
+// directory holding exactly the files the caller was asking about — a silent
+// wrong answer, not an error, and the agent concludes the file does not exist.
+
+describe("#877 — a local install whose path comes from the saved workspace, not COMFYUI_PATH", () => {
+  beforeEach(() => {
+    remoteFlag = false; // LOCAL…
+    config.comfyuiPath = undefined; // …but the env var is unset
+    outputDirError = null;
+  });
+  afterEach(() => {
+    outputDirError = null;
+  });
+
+  it("scans the resolved output dir instead of falling back to /history", async () => {
+    // The output dir resolves (as it does from a saved default workspace), and
+    // the files are right there.
+    await writeFile(join(outputDir, "fairy_redhair_00001_.png"), "x");
+    // /history is EMPTY — a restart cleared it. Under the bug this is what the
+    // caller got back, dressed as an answer.
+    getHistoryMock.mockResolvedValue({});
+
+    const images = await listOutputImages({});
+
+    expect(images.map((i) => i.filename)).toContain("fairy_redhair_00001_.png");
+    // And it never consulted the source that cannot see the disk.
+    expect(getHistoryMock).not.toHaveBeenCalled();
+  });
+
+  it("does NOT report an empty result when the output dir could not be determined", async () => {
+    // No local root AND nothing in history. Returning `[]` here asserts there are
+    // no outputs, which neither source established: one was never consulted and
+    // the other cannot see files on disk.
+    outputDirError = new Error("no COMFYUI_PATH, no saved workspace");
+    getHistoryMock.mockResolvedValue({});
+
+    await expect(listOutputImages({})).rejects.toThrow(/NOT a finding that there are no outputs/i);
+  });
+
+  it("still ANSWERS from history when the dir is unknown but history has something", async () => {
+    // The inverse: falling back is right, and refusing when the fallback actually
+    // produced an answer would be a false refusal of a real result.
+    outputDirError = new Error("no local root");
+    getHistoryMock.mockResolvedValue({
+      j1: { outputs: { "9": { images: [{ filename: "from-history.png", subfolder: "", type: "output" }] } } },
+    });
+
+    const images = await listOutputImages({});
+    expect(images.map((i) => i.filename)).toEqual(["from-history.png"]);
+  });
+
+  it("does NOT report an empty result when the output dir is known but unreadable", async () => {
+    // We know WHERE the outputs are and could not read them. That is not an empty
+    // directory, and `[]` told the caller their file does not exist.
+    outputDir = join(outputDir, "does-not-exist-at-all");
+
+    await expect(listOutputImages({})).rejects.toThrow(/could not be listed at all/i);
   });
 });

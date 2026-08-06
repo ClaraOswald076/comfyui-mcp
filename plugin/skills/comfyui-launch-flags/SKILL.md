@@ -23,12 +23,12 @@ is the decision matrix for choosing them.
 > flag: **`--enable-triton-backend` is a SwarmUI backend flag, NOT a ComfyUI
 > `main.py` flag** — don't pass it to ComfyUI directly.
 
-> ℹ️ **How to apply today.** The MCP's `start_comfyui` currently *replays the
-> exact argv of the previous run* — it does not compose fresh flags. So set
-> these when you launch ComfyUI yourself (the `python main.py …` line, a
-> `run.bat`/shell alias, or the SwarmUI backend args box), then `start_comfyui`
-> will preserve them on restart. (Injecting flags through the tool is a tracked
-> follow-up.)
+> ℹ️ **How to apply today.** The MCP's `restart_comfyui` (with `action: "start"`)
+> currently *replays the exact argv of the previous run* — it does not compose
+> fresh flags. So set these when you launch ComfyUI yourself (the
+> `python main.py …` line, a `run.bat`/shell alias, or the SwarmUI backend args
+> box), and the tool will preserve them on restart. (Injecting flags through the
+> tool is a tracked follow-up.)
 
 ---
 

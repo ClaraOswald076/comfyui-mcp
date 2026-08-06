@@ -14,7 +14,8 @@ The user wants to generate a Claude Code skill file for a ComfyUI custom node pa
    - A GitHub repository URL (e.g., `https://github.com/ltdrdata/ComfyUI-Impact-Pack`)
    - Nothing — ask the user which node pack they want to generate a skill for
 
-2. **Generate the skill.** Use the `generate_node_skill` tool with:
+2. **Generate the skill.** Use the `list_packs` tool with:
+   - `action`: `"generate_skill"`
    - `source`: the registry ID or GitHub URL
    - `install_in`: save to `skills/<pack-name>/` inside the plugin directory
 
@@ -28,7 +29,7 @@ The user wants to generate a Claude Code skill file for a ComfyUI custom node pa
 User: `/comfy-skill comfyui-impact-pack`
 
 Steps:
-- Call `generate_node_skill` with source `"comfyui-impact-pack"` and `install_in` set to the skills directory
+- Call `list_packs` with `action: "generate_skill"`, source `"comfyui-impact-pack"` and `install_in` set to the skills directory
 - Show the user where the file was saved and what it covers
 
 ## Notes

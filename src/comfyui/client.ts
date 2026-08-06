@@ -161,8 +161,8 @@ export async function getSystemStats(): Promise<SystemStats> {
 // bounded FRESHNESS WINDOW rather than the whole process lifetime: an out-of-band
 // ComfyUI restart/install (Desktop Manager reboot, a manual restart, a node pack
 // installed outside an mcp tool) never calls resetObjectInfoCache(), so a
-// lifetime cache serves the PRE-restart schema forever — get_node_info /
-// check_workflow_runtime / validate_workflow all report the new nodes as unknown
+// lifetime cache serves the PRE-restart schema forever — create_workflow's
+// node_info and validate actions, and list_packs (action:"check_runtime"), all report the new nodes as unknown
 // (#528). A TTL bounds that staleness: within the window we serve the cached
 // snapshot (so a burst of validations stays ~0.5 s, the perf win flagged by
 // josephoibrahim/comfy-cozy), and the FIRST call after the window does a single
@@ -319,7 +319,7 @@ export async function backfillObjectInfo(
         // case, namespace prefix, or display-vs-class name (#404,
         // `DetectorForNSFW`). Honor whatever key(s) ComfyUI actually returns
         // rather than narrowing to an exact `def[t]` match (which silently
-        // dropped the node and made get_node_info report "no match" for a node
+        // dropped the node and made the node_info lookup report "no match" for a node
         // the server clearly registers). Prefer the exact key when present,
         // otherwise merge every returned definition.
         if (def[t]) {
@@ -646,7 +646,8 @@ export async function getLogs(): Promise<string[]> {
  *   POST /settings/{id}    → persist one setting (JSON body is the raw value)
  *
  * These are the ComfyUI *frontend* UI settings (`Comfy.*` ids) and are entirely
- * unrelated to our own get_defaults/set_defaults SQLite store. Local and remote
+ * unrelated to our own generation-defaults store, which `get_defaults` reads and
+ * writes with action:"get"/"set". Local and remote
  * (`--comfyui-url`) both work over plain REST and inherit `comfyuiFetch` auth
  * headers. Comfy Cloud exposes no per-user settings store, so these throw
  * CLOUD_UNSUPPORTED via `requireLocalMode`.
@@ -769,7 +770,7 @@ export async function fetchImage(
         (res.status === 404
           ? `No such file in the ComfyUI ${type} directory` +
             (subfolder ? ` under subfolder "${subfolder}"` : "") +
-            `. Check the filename/subfolder (e.g. via list_output_images or get_history).`
+            `. Check the filename/subfolder (e.g. via get_image (action:"list_outputs") or get_history).`
           : `The ComfyUI server rejected the request.`),
       res.status === 404 ? "IMAGE_NOT_FOUND" : "VIEW_ERROR",
       { status: res.status, filename, type, subfolder },

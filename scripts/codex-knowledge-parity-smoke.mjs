@@ -1,15 +1,15 @@
 // CODEX KNOWLEDGE-PARITY SMOKE — proves the Codex backend has the SAME bundled
 // family expertise Claude gets natively. Claude loads all plugin skills; Codex
 // loads none, but now reaches the identical knowledge through the comfyui MCP's
-// list_skills / read_skill / list_packs / read_pack_workflow tools.
+// list_packs tool (actions "skill_list" / "skill_read" / "list" / "read_workflow").
 //
 // Starts a codex-mode orchestrator + a headless mock panel (graph executors),
 // points the headless comfyui MCP's COMFYUI_MCP_TOOL_TRACE at a temp JSONL file
 // so we can observe the skill/pack tool calls (they ride the stdio MCP, not the
 // panel bridge), then prompts "set up a krea2 workflow on my canvas" and asserts:
-//   1) Codex DISCOVERED the krea2 family via list_skills/read_skill (or the pack
-//      equivalents list_packs/read_pack_workflow) — NOT pure from-scratch guessing.
-//   2) Codex APPLIED the pack / loaded the pack's ready workflow (read_pack_workflow
+//   1) Codex DISCOVERED the krea2 family via action:"skill_list"/"skill_read" (or
+//      the pack equivalents action:"list"/"read_workflow") — NOT from-scratch guessing.
+//   2) Codex APPLIED the pack / loaded the pack's ready workflow (action:"read_workflow"
 //      and/or apply_manifest, then built nodes on the canvas) — NOT a generic graph.
 //
 //   node scripts/codex-knowledge-parity-smoke.mjs
@@ -159,14 +159,17 @@ async function main() {
     const r = await runScenario("Clear my workflow and set up a krea2 text-to-image workflow on my canvas. Use whatever ready expertise comfyui-mcp already ships if there is any — don't reinvent the graph.");
 
     const trace = readTrace();
-    const tools = trace.map((t) => t.tool);
-    const readSkillArgs = trace.filter((t) => t.tool === "read_skill").map((t) => t.args?.name);
-    const readPackArgs = trace.filter((t) => t.tool === "read_pack_workflow").map((t) => t.args?.name);
+    // Since 0.50.0 slice 9 every knowledge call is `list_packs` and the action
+    // rides in args, so the trace is keyed by action rather than by tool name.
+    const actions = trace.map((t) => t.args?.action);
+    const byAction = (action) => trace.filter((t) => t.args?.action === action);
+    const readSkillArgs = byAction("skill_read").map((t) => t.args?.name);
+    const readPackArgs = byAction("read_workflow").map((t) => t.args?.name);
 
-    const calledListSkills = tools.includes("list_skills");
-    const calledReadSkill = tools.includes("read_skill");
-    const calledListPacks = tools.includes("list_packs");
-    const calledReadPack = tools.includes("read_pack_workflow");
+    const calledListSkills = actions.includes("skill_list");
+    const calledReadSkill = actions.includes("skill_read");
+    const calledListPacks = actions.includes("list");
+    const calledReadPack = actions.includes("read_workflow");
     const discoveredKrea2 =
       readSkillArgs.some((n) => String(n || "").includes("krea2")) ||
       readPackArgs.some((n) => String(n || "").includes("krea2"));
@@ -179,12 +182,12 @@ async function main() {
     const appliedPack = calledReadPack || discoveredKrea2;
 
     console.log(`\n===== CODEX KNOWLEDGE-PARITY SMOKE =====`);
-    console.log(`tool trace (skill/pack calls): ${JSON.stringify(tools)}`);
-    console.log(`read_skill names: ${JSON.stringify(readSkillArgs)}`);
-    console.log(`read_pack_workflow names: ${JSON.stringify(readPackArgs)}`);
+    console.log(`tool trace (list_packs actions): ${JSON.stringify(actions)}`);
+    console.log(`action:"skill_read" names: ${JSON.stringify(readSkillArgs)}`);
+    console.log(`action:"read_workflow" names: ${JSON.stringify(readPackArgs)}`);
     console.log(`all bridge commands: ${JSON.stringify(r.counts)}`);
     console.log(`---`);
-    console.log(`Codex consulted bundled skills/packs (list_skills/read_skill/list_packs/read_pack_workflow): ${discovery ? "YES" : "NO"}`);
+    console.log(`Codex consulted bundled skills/packs (list_packs actions skill_list/skill_read/list/read_workflow): ${discovery ? "YES" : "NO"}`);
     console.log(`Codex discovered the krea2 family (krea2-* skill or pack): ${discoveredKrea2 ? "YES" : "NO"}`);
     console.log(`Codex applied the pack / read its ready workflow: ${appliedPack ? "YES" : "NO"}`);
     console.log(`Codex built nodes on the live canvas: ${builtOnCanvas ? "YES" : "NO"}`);

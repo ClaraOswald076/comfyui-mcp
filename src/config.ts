@@ -793,8 +793,8 @@ export function getApiKey(): string {
  * Retarget the shared `config` (and thus getComfyUIApiHost()/getClient()) to a new
  * ComfyUI URL at runtime. The panel orchestrator calls this from applyComfyuiUrl when
  * the desktop `hello` points at a different ComfyUI, so the orchestrator's OWN
- * in-process client — the direct call_tool path used by the mobile app (list_workflows,
- * get_image, …) — follows the retarget instead of staying pinned to the process-start
+ * in-process client — the direct call_tool path used by the mobile app
+ * (get_workflow, get_image, …) — follows the retarget instead of staying pinned to the process-start
  * ComfyUI. Callers MUST resetClient() afterwards so the cached client rebuilds against
  * the new host. Returns false on a malformed URL (target left unchanged).
  */

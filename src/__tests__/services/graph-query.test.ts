@@ -1,4 +1,4 @@
-// The query engine behind query_workflow (headless) — and the SEMANTIC SPEC for
+// The query engine behind get_workflow (action:"query") (headless) — and the SEMANTIC SPEC for
 // the panel's graph_query executor twin (comfyui-mcp-panel), which mirrors it
 // by hand in live-graph JS. If a behavior changes here, port it there.
 

@@ -9,7 +9,7 @@
 //     Unexpected token '<', "<!DOCTYPE "... is not valid JSON
 //
 // which tells the user nothing about what actually answered them, and pushed
-// callers toward the wrong conclusion — check_workflow_runtime reported "could
+// callers toward the wrong conclusion — the runtime check reported "could
 // not reach the ComfyUI server" for a server that answered perfectly well.
 //
 // The fix is to DETECT and SAY WHICH, not to parse harder. We look at the status

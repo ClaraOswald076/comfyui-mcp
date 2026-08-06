@@ -6,10 +6,12 @@
 // panel IS an ordinary custom node pack, so the generic node tools are a second,
 // wider door into exactly the same ComfyUI-Manager mutation:
 //
-//     update_custom_node(id="comfyui-agent-panel")   → updateCustomNode(...)
-//     update_custom_node(id="all")                   → updateCustomNode(...)
-//     reinstall_custom_node(id="comfyui-mcp-panel")  → reinstallCustomNode(...)
-//     update_all                                     → updateAllCustomNodes()
+//     install_custom_node(action:"update", id="comfyui-agent-panel")
+//                                                     → updateCustomNode(...)
+//     install_custom_node(action:"update", id="all")  → updateCustomNode(...)
+//     install_custom_node(action:"reinstall", id="comfyui-mcp-panel")
+//                                                     → reinstallCustomNode(...)
+//     update_all                                      → updateAllCustomNodes()
 //
 // None of those go through `runPanelAction`, so none of them saw the pin. A
 // pinned user was one `id="all"` away from being moved. The guard therefore
@@ -52,6 +54,7 @@ import {
   PANEL_PIN_ENV_VAR,
   type PanelPinState,
 } from "./panel-settings.js";
+import { assertNotWritingRealHomeInTests } from "./test-isolation-guard.js";
 
 /** Thrown when a pin forbids a mutation. Distinct so callers can recognise it. */
 export class PanelPinnedError extends Error {
@@ -202,7 +205,7 @@ export function assertPanelPinAllows(action: string, id: string): void {
  * Refuse a panel-pack mutation on a path that has NO on-disk verification —
  * currently the sidebar `panel_install_node` / `panel_update_node` tools (which
  * drive the user's built-in ComfyUI Manager through the browser) and
- * `fix_custom_node`.
+ * `install_custom_node` action:"fix".
  *
  * These cannot be redirected into the verified path: `panel_*` acts on the
  * panel's own host through the browser Manager (which may not even be the
@@ -253,11 +256,31 @@ export function assertPanelNotTargetedUnverifiable(
 // function while already holding it.
 // ---------------------------------------------------------------------------
 
+/**
+ * An explicitly-set-but-EMPTY redirect is a mistake, not an intent to use the
+ * default — and treating it as unset hid exactly that mistake once already:
+ * node-snapshots.test.ts assigned `"\0"` intending an fs-rejected path, Node
+ * truncated the assignment to `""`, and the write silently fell through to the
+ * developer's real home (#866). Fail loudly at resolution time instead.
+ */
+function redirectedStatePath(envVar: string, fallback: string): string {
+  const value = process.env[envVar];
+  if (value !== undefined && value.trim() === "") {
+    throw new Error(
+      `${envVar} is set but EMPTY. An empty override does not mean "use the default" — ` +
+        `it falls through to the default (${fallback}) with no sign anything was wrong, ` +
+        `which is how a test run came to write the developer's real home directory (#866). ` +
+        `Set ${envVar} to a real path or unset it entirely.`,
+    );
+  }
+  return value ?? fallback;
+}
+
 /** Lock file path. Overridable so tests never touch the real home directory. */
 export function panelLockPath(): string {
-  return (
-    process.env.COMFYUI_MCP_PANEL_LOCK ||
-    join(homedir(), ".comfyui-mcp", "panel-op.lock")
+  return redirectedStatePath(
+    "COMFYUI_MCP_PANEL_LOCK",
+    join(homedir(), ".comfyui-mcp", "panel-op.lock"),
   );
 }
 
@@ -498,6 +521,9 @@ export interface PanelLockReclaimResult {
  */
 export function reclaimAbandonedPanelLock(): PanelLockReclaimResult {
   const path = panelLockPath();
+  // A test pointed at the real home must never move or delete a lock a live
+  // orchestrator is holding — reclaim is exactly the operation that does.
+  assertNotWritingRealHomeInTests(path, "the panel operation lock");
   const obs = observePanelLock(path);
   if (!obs) {
     return {
@@ -655,6 +681,7 @@ export function reclaimAbandonedPanelLock(): PanelLockReclaimResult {
 
 async function acquireFileLock(timeoutMs: number): Promise<() => void> {
   const path = panelLockPath();
+  assertNotWritingRealHomeInTests(path, "the panel operation lock");
   mkdirSync(dirname(path), { recursive: true });
   const deadline = Date.now() + timeoutMs;
 
@@ -947,8 +974,8 @@ export function withPanelPinGuard<T>(
 // delete the deferred-restore file), clears the marker only for what was
 // PROVABLY cancelled or proven no longer pending, and keeps the warning for
 // the residue — in-flight work, remote hosts, anything unverifiable. The
-// lock-held variants — update_custom_node(id="all"), which waits for the
-// drain inside the lock, and every install_panel mutation — need no marker:
+// lock-held variants — install_custom_node(action:"update", id="all"), which waits
+// for the drain inside the lock, and every install_panel mutation — need no marker:
 // no pin can be written inside their window at all.
 // ---------------------------------------------------------------------------
 
@@ -990,9 +1017,9 @@ export const SNAPSHOT_RESTORE_PENDING_MS = 7 * 24 * 60 * 60_000;
 
 /** Marker file path. Overridable so tests never touch the real home directory. */
 export function panelPendingOpsPath(): string {
-  return (
-    process.env.COMFYUI_MCP_PANEL_PENDING ||
-    join(homedir(), ".comfyui-mcp", "panel-pending-ops.json")
+  return redirectedStatePath(
+    "COMFYUI_MCP_PANEL_PENDING",
+    join(homedir(), ".comfyui-mcp", "panel-pending-ops.json"),
   );
 }
 
@@ -1044,6 +1071,12 @@ interface PendingOpsRead {
  * `.tmp` would let concurrent writers clobber each other's staging file.
  */
 function writePanelPendingOpsAtomic(path: string, body: string): void {
+  // The third time the suite wrote the developer's real state it was THIS
+  // file (#866): the orchestrator reads these markers, so leftovers make every
+  // pin write warn about operations that never happened. Refuse at the write —
+  // per-test scoping of COMFYUI_MCP_PANEL_PENDING kept eroding exactly the way
+  // the issue predicted.
+  assertNotWritingRealHomeInTests(path, "the pending panel-operation record");
   // Rebase reconciliation (#847 + #798). Both branches grew a temp+fsync+rename
   // writer for this file. `writeFileDurable` is the stronger one: it does
   // everything this function used to, and then fsyncs the CONTAINING DIRECTORY so

@@ -1,6 +1,6 @@
 // The connected ComfyUI's SAVED workflow library, read through its userdata API.
 //
-// #810: `list_workflows` asked for `/api/userdata?dir=workflows` — a SHALLOW read —
+// #810: `get_workflow (action:"list")` asked for `/api/userdata?dir=workflows` — a SHALLOW read —
 // and reported the resulting empty array as "No saved workflows found." A user whose
 // six workflows all live in `IMAGE/` and `VIDEO/MiniMaxH3/` (the folder tree the
 // ComfyUI web UI sidebar shows) was told their library was empty. That is the repo's
@@ -10,7 +10,7 @@
 //
 // One listing read, in one place, so a second caller cannot re-introduce the shallow
 // spelling: panel_load_workflow's resolver already used `recurse=true` (it was fixed
-// for #202) while list_workflows did not, which is exactly the drift a shared helper
+// for #202) while get_workflow (action:"list") did not, which is exactly the drift a shared helper
 // removes.
 import { getClient } from "../comfyui/client.js";
 
@@ -121,8 +121,8 @@ function entryKey(entry: unknown): string | null {
  * Keys are store-relative and INCLUDE any subfolder ("VIDEO/MiniMaxH3/x.json"). They
  * are used verbatim: nothing is stripped, case-folded or separator-folded here,
  * because a depth-0 request must only ever match a depth-0 entry (panel #202 gate
- * MAJOR) and because those keys are what `get_workflow`/`analyze_workflow`/
- * `query_workflow` take as `filename`.
+ * MAJOR) and because those keys are what `get_workflow`'s get/analyze/query
+ * actions take as `filename`.
  *
  * Never throws.
  */

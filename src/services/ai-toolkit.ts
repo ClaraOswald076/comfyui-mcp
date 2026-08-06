@@ -22,6 +22,27 @@ export interface TrainerEnvelope<T = unknown> {
   stderr?: string;
 }
 
+/**
+ * Envelope `command` labels — RETURN-SHAPE data, NOT tool names.
+ *
+ * `TrainerEnvelope.command` says which OPERATION a result came from, and both
+ * clients and this repo's tests key on the exact string. 0.50.0 slice 10 folded
+ * the eighteen train_* TOOLS into three action-parameterized ones and
+ * deliberately left these labels untouched: renaming them would change a return
+ * shape, which a pure surface consolidation must not do.
+ *
+ * They are named constants so each label appears exactly ONCE in the tree, with
+ * this note attached, instead of being sprayed across four files where a reader
+ * would fairly mistake a string that looks like a retired tool name for a live
+ * instruction to call one. Each of the three lines below is covered by exactly
+ * one `allowedIn` entry in src/tools/vocabulary.ts, which points back here.
+ */
+export const TRAINER_COMMAND = {
+  cancel: "train_cancel",
+  bootstrap: "train_bootstrap",
+  buildImage: "train_build_image",
+} as const;
+
 /** Image tag we build/run. */
 export const TRAINER_IMAGE = process.env.COMFYUI_MCP_TRAINER_IMAGE?.trim() || "comfyui-mcp-trainer:latest";
 
@@ -110,7 +131,7 @@ export async function trainerDoctor(): Promise<TrainerEnvelope<{
   }
   const gpu = await gpuDockerAvailable();
   if (!gpu) hints.push("`docker run --gpus all` failed — install the NVIDIA Container Toolkit and enable GPU support in Docker.");
-  if (!image) hints.push(`Trainer image ${TRAINER_IMAGE} not built yet — run train_build_image (one-time, several minutes).`);
+  if (!image) hints.push(`Trainer image ${TRAINER_IMAGE} not built yet — run train_doctor (action:"build_image") (one-time, several minutes).`);
   return ok("train_doctor", { docker, gpu, image, image_tag: TRAINER_IMAGE, hints });
 }
 
@@ -127,7 +148,7 @@ export function buildTrainerImage(opts: {
   if (opts.aiToolkitRef) args.push("--build-arg", `AI_TOOLKIT_REF=${opts.aiToolkitRef}`);
   args.push(opts.contextDir);
   return streamDocker(args, opts.onLog).then((r) =>
-    r.code === 0 ? ok("train_build_image", { image: TRAINER_IMAGE }) : fail("train_build_image", "build_failed", `docker build exited ${r.code}`, r.tail),
+    r.code === 0 ? ok(TRAINER_COMMAND.buildImage, { image: TRAINER_IMAGE }) : fail(TRAINER_COMMAND.buildImage, "build_failed", `docker build exited ${r.code}`, r.tail),
   );
 }
 
@@ -272,7 +293,7 @@ export async function nativeToolkitReady(): Promise<boolean> {
 /** Is the ai-toolkit checkout on the pinned ref? Unverifiable WITHOUT .git
  *  (a plain copy) → trust the package probe; a git checkout on the WRONG ref
  *  (stale after an app upgrade changed AI_TOOLKIT_REF) → not ready, so
- *  train_bootstrap re-pins it (codex finding: package-only probing selected
+ *  train_doctor (action:"bootstrap") re-pins it (codex finding: package-only probing selected
  *  the stale checkout). */
 function checkoutMatchesRef(dir: string): boolean {
   if (!existsSync(join(dir, ".git"))) return true;
@@ -347,9 +368,9 @@ export async function stopNativeTraining(child: childProcess.ChildProcess): Prom
         process.kill(child.pid, "SIGTERM");
       }
     }
-    return ok("train_cancel", { stopped: String(child.pid ?? "unknown") });
+    return ok(TRAINER_COMMAND.cancel, { stopped: String(child.pid ?? "unknown") });
   } catch (err) {
-    return fail("train_cancel", "stop_failed", `could not stop native training (pid ${child.pid}): ${err instanceof Error ? err.message : String(err)}`);
+    return fail(TRAINER_COMMAND.cancel, "stop_failed", `could not stop native training (pid ${child.pid}): ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -396,7 +417,7 @@ export async function stopNativeByConfig(configPath: string): Promise<TrainerEnv
       // confirm exit so an immediate liveness re-probe can't see a zombie
       // (codex finding: cancel reverted to running, then finalized as failed).
       await waitNativeGone(configPath, 7_000);
-      return ok("train_cancel", { stopped: out.trim() || jobKey });
+      return ok(TRAINER_COMMAND.cancel, { stopped: out.trim() || jobKey });
     }
     // POSIX: signal the trainer's whole PROCESS GROUP, not just cmdline
     // matches — spawnTrainer detaches (the trainer is its group leader) and
@@ -415,13 +436,13 @@ export async function stopNativeByConfig(configPath: string): Promise<TrainerEnv
     // trainer is still dying gets probed as "still running" and wrongly
     // reverts to running (codex finding) — wait for disappearance.
     if (await waitNativeGone(configPath, 7_000)) {
-      return ok("train_cancel", { stopped: jobKey });
+      return ok(TRAINER_COMMAND.cancel, { stopped: jobKey });
     }
-    return fail("train_cancel", "still_running", `SIGTERM sent but the trainer for ${jobKey} is still alive after 7s`);  } catch (err) {
+    return fail(TRAINER_COMMAND.cancel, "still_running", `SIGTERM sent but the trainer for ${jobKey} is still alive after 7s`);  } catch (err) {
     // pkill exits 1 on no match — that is success for an idempotent cancel.
     const code = (err as { status?: number })?.status;
-    if (process.platform !== "win32" && code === 1) return ok("train_cancel", { stopped: `${jobKey} (already gone)` });
-    return fail("train_cancel", "stop_failed", `could not stop native training for ${jobKey}: ${err instanceof Error ? err.message : String(err)}`);
+    if (process.platform !== "win32" && code === 1) return ok(TRAINER_COMMAND.cancel, { stopped: `${jobKey} (already gone)` });
+    return fail(TRAINER_COMMAND.cancel, "stop_failed", `could not stop native training for ${jobKey}: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -512,9 +533,9 @@ function spawnTrainer(
 export async function stopTraining(containerName: string): Promise<TrainerEnvelope<{ stopped: string }>> {
   const r = await execDocker(["stop", "-t", "10", containerName], 30_000);
   if (r.code !== 0 && !/no such (object|container)/i.test(r.stderr)) {
-    return fail("train_cancel", "stop_failed", `docker stop ${containerName} failed: ${r.stderr.trim() || `exit ${r.code}`}`, r.stderr);
+    return fail(TRAINER_COMMAND.cancel, "stop_failed", `docker stop ${containerName} failed: ${r.stderr.trim() || `exit ${r.code}`}`, r.stderr);
   }
-  return ok("train_cancel", { stopped: containerName });
+  return ok(TRAINER_COMMAND.cancel, { stopped: containerName });
 }
 
 /** Is this training container currently running? `false` when it definitively

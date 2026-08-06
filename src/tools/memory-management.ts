@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { getClient, getSystemStats } from "../comfyui/client.js";
 import { errorToToolResult } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -80,11 +81,17 @@ export function registerMemoryManagementTools(server: McpServer): void {
     },
   );
 
-  server.tool(
-    "get_embeddings",
-    "List textual-inversion embeddings installed on the connected ComfyUI server (read from its /api/embeddings endpoint, i.e. the models/embeddings folder). Requires a running, reachable ComfyUI (local or remote); takes no parameters. Returns the embedding names; reference them in positive or negative prompts as embedding:name (e.g. embedding:easynegative). Read-only.",
-    {},
-    async () => {
+}
+
+/**
+ * The embeddings listing, no longer a tool of its own.
+ *
+ * 0.50.0 slice 11 folded it into `list_local_models` (action:"embeddings") —
+ * both read what the connected ComfyUI has installed, so they belong on the same
+ * tool. The body is the old handler verbatim: same /api/embeddings read, same
+ * rendering, same "No embeddings installed." degradation.
+ */
+export async function getEmbeddingsAction(): Promise<CallToolResult> {
       try {
         const client = getClient();
         const res = await client.fetchApi("/api/embeddings");
@@ -114,6 +121,4 @@ export function registerMemoryManagementTools(server: McpServer): void {
       } catch (err) {
         return errorToToolResult(err);
       }
-    },
-  );
 }

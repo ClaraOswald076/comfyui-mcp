@@ -48,8 +48,10 @@ import {
   retirementBaseline,
   TOOL_NAMES,
   baselineIntegrity,
+  actionLiteralSpans,
   deadNameRe,
   panelBaselineIntegrity,
+  rotMentions,
   type DeadName,
 } from "../src/tools/vocabulary.js";
 import { buildPanelToolDefs } from "../src/orchestrator/panel-tools.js";
@@ -116,6 +118,57 @@ const SELF = new Set([
   // Same, for 0.49.0 slice 6: asserts as FIXTURES that the three retired
   // workspace names are in DEAD_NAMES with `workspace` replacements.
   "src/__tests__/tools/workspace-env.test.ts",
+  // Same, for 0.50.0 slice 8: asserts as FIXTURES that the ten retired runpod_*
+  // names are in DEAD_NAMES with `runpod` / `runpod_watch` replacements.
+  "src/__tests__/tools/runpod.test.ts",
+  // Same, for 0.50.0 slice 7: each asserts as FIXTURES that the names its tool
+  // replaced are in DEAD_NAMES (restart_comfyui ← 2, list_api_nodes ← 2,
+  // get_defaults ← 3), and defaults.test.ts additionally asserts that the two
+  // UI-settings redirects point at the _ui actions rather than the
+  // generation-defaults ones — a check that cannot be written without spelling
+  // the retired names.
+  "src/__tests__/tools/process-control-tool.test.ts",
+  "src/__tests__/tools/api-nodes.test.ts",
+  "src/__tests__/tools/defaults.test.ts",
+  // Same, for 0.50.0 slice 9: asserts as FIXTURES that the eight retired
+  // knowledge names are in DEAD_NAMES with `list_packs` replacements — and that
+  // no ACTION is spelled the same as one of them, which is the invariant that
+  // keeps this gate's own replacement text writable.
+  "src/__tests__/tools/skills-access.test.ts",
+  // Same, for 0.50.0 slice 10: asserts as FIXTURES that the fifteen retired
+  // train_* names are in DEAD_NAMES, and — the load-bearing one — that the two
+  // retired DELETE names resolve to different tools keyed by different fields.
+  "src/__tests__/tools/train-consolidation.test.ts",
+  // Same, for 0.50.0 slice 11: asserts as FIXTURES that the twelve retired model
+  // names are in DEAD_NAMES with their exact `download_model` /
+  // `list_local_models` action replacements.
+  "src/__tests__/tools/models-consolidated.test.ts",
+  // Same, for 0.50.0 slice 14: each asserts as FIXTURES that the names its tool
+  // replaced are in DEAD_NAMES (create_workflow ← 3, visualize_workflow ← 4,
+  // get_workflow ← 7 and save_workflow ← 2).
+  "src/__tests__/tools/workflow-compose.test.ts",
+  "src/__tests__/tools/workflow-visualize.test.ts",
+  "src/__tests__/tools/workflow-library.test.ts",
+  // Same slice, one layer out: this passes three retired names to
+  // callToolAdmission as FIXTURES and asserts the direct channel REFUSES them by
+  // name. They are call arguments under test — the assertion is that nothing
+  // serves them — not guidance to call anything.
+  "src/__tests__/orchestrator/call-tool-admission.test.ts",
+  // Same, for 0.50.0 slice 12: the three parts of the custom-node fold each
+  // assert as FIXTURES that the names their tool replaced are in DEAD_NAMES
+  // (install_custom_node ← 8, search_custom_nodes ← 1, node_pack ← 9). The
+  // registry-search file also asserts the INVERSE — that `search_custom_nodes`
+  // is NOT in DEAD_NAMES, because the owner's split kept it alive — which it
+  // can only do by naming both it and the name it absorbed.
+  "src/__tests__/tools/node-management.test.ts",
+  "src/__tests__/tools/registry-search.test.ts",
+  "src/__tests__/tools/node-pack.test.ts",
+  // Same, for 0.50.0 slice 15: asserts as FIXTURES that the ten retired
+  // image/asset names are in DEAD_NAMES with their exact `get_image` /
+  // `upload_image` action replacements. Eight of the ten had their action
+  // RENAMED (view_image -> action:"view"), so the action-literal rule cannot
+  // reach them — they are a migration TABLE under assertion, not guidance.
+  "src/__tests__/tools/image-assets.test.ts",
   // Same, for the #659 retired-name error: these pass dead names to call_tool /
   // the ollama dispatch as FIXTURES and assert the error quotes the ledger's
   // replacement — the names are call arguments under test, not live guidance.
@@ -243,6 +296,8 @@ const hits: Hit[] = [];
 const splitHits: Array<{ path: string; line: number; text: string }> = [];
 /** `${name}\u0000${path}` → the lines it was seen on, to expire stale exceptions. */
 const seenIn = new Map<string, string[]>();
+/** Same key, for `implementedIn` paths that actually licensed an action literal. */
+const implementedUsed = new Set<string>();
 const seenKey = (name: string, path: string) => `${name}\u0000${path}`;
 
 for (const path of files) {
@@ -275,6 +330,25 @@ for (const path of files) {
     const re = deadNameRe(dead.name);
     for (const [i, text] of lines.entries()) {
       if (!re.test(text)) continue;
+      // A mention sitting inside a verbatim copy of this name's OWN declared
+      // replacement is the migration target, not rot — see rotMentions() in
+      // src/tools/vocabulary.ts for why that is principled rather than a loophole.
+      //
+      // Checked BEFORE `seenIn` on purpose: a replacement form is not a mention of
+      // the dead name for ANY purpose, staleness included. Recording it would let a
+      // file whose only remaining occurrences are legitimate replacement forms keep
+      // an obsolete `allowedIn` entry looking fresh — and a stale exception is a
+      // hole that opens later, which is the whole reason the expiry check exists.
+      //
+      // Also BEFORE `allowedIn`, and independent of it: this is the one new decision
+      // point, it needs no ledger entry (it is self-derived), and a line carrying
+      // BOTH an allowedIn-covered mention and a replacement form still fails the
+      // occurrence count below — fail-closed on the ambiguous case.
+      // `path` enables the `implementedIn` rule for this file — see rotMentions.
+      if (dead.implementedIn?.includes(path) && actionLiteralSpans(dead.name, text).length > 0) {
+        implementedUsed.add(seenKey(dead.name, path));
+      }
+      if (rotMentions(dead, text, path).length === 0) continue;
       const key = seenKey(dead.name, path);
       if (!seenIn.has(key)) seenIn.set(key, []);
       seenIn.get(key)!.push(text);
@@ -389,6 +463,29 @@ if (stale.length > 0) {
       "",
       "Delete the exception. Leaving it means a future reference to that file is",
       "pre-approved by an entry nobody re-reviewed.",
+    ].join("\n"),
+  );
+}
+
+// Same expiry rule for `implementedIn`, and for the same reason: a path that no
+// longer spells the name as a quoted action literal has stopped meaning anything,
+// and leaving it there pre-approves whatever lands in that file next. This is the
+// half of the exemption that is scoped by PATH rather than by syntax, so it is the
+// half that can rot.
+const staleImplemented = DEAD_NAMES.flatMap((d) =>
+  (d.implementedIn ?? [])
+    .filter((p) => !implementedUsed.has(seenKey(d.name, p)))
+    .map((p) => `  ${d.name} → ${p}`),
+);
+if (staleImplemented.length > 0) {
+  errors.push(
+    [
+      `${staleImplemented.length} stale implementedIn path(s) — no quoted action literal remains:`,
+      "",
+      ...staleImplemented,
+      "",
+      "Either the file no longer implements that action, or the path is wrong. Delete",
+      "it: an implementedIn path is an exception, and exceptions expire.",
     ].join("\n"),
   );
 }

@@ -34,157 +34,48 @@ import { readFileSync } from "node:fs";
 export const TOOL_NAMES = [
   "comfy_cli",
   "enqueue_workflow",
-  "rerun_generation",
   "get_system_stats",
   "visualize_workflow",
-  "mermaid_to_workflow",
-  "visualize_workflow_hierarchical",
   "create_workflow",
-  "modify_workflow",
-  "get_node_info",
-  "validate_workflow",
   "queue",
   "search_custom_nodes",
-  "get_node_pack_details",
-  "search_models",
   "download_model",
-  "download_status",
-  "cancel_download",
   "list_local_models",
-  "generate_node_skill",
   "get_logs",
   "get_history",
-  "diagnose_run",
-  "runpod_pod_status",
-  "runpod_list_pods",
-  "runpod_pod_start",
-  "runpod_pod_stop",
-  "runpod_pod_create",
-  "runpod_use_local",
+  "runpod",
   "runpod_watch",
-  "runpod_unwatch",
-  "runpod_pod_troubleshoot",
-  "runpod_pod_connect",
-  "runpod_deploy_link",
-  "list_workflows",
   "get_workflow",
-  "strip_workflow",
-  "query_workflow",
-  "slice_workflow",
   "save_workflow",
-  "analyze_workflow",
-  "run_workflow_url",
-  "stop_comfyui",
-  "start_comfyui",
   "restart_comfyui",
   "get_image",
   "upload_image",
-  "upload_video",
-  "upload_audio",
-  "stage_output_as_input",
-  "workflow_from_image",
-  "list_output_images",
   "clear_vram",
-  "get_embeddings",
-  "suggest_settings",
-  "generation_stats",
-  "view_image",
-  "list_assets",
-  "get_asset_metadata",
-  "regenerate",
   "get_defaults",
-  "set_defaults",
   "generate_image",
-  "generate_audio",
-  "generate_3d",
-  "generate_video",
-  "remove_background",
-  "upscale_image",
-  "generate_with_controlnet",
-  "generate_with_ip_adapter",
-  "workflow_to_dsl",
-  "dsl_to_workflow",
   "node_snapshot",
   "bisect",
   "install_custom_node",
-  "update_custom_node",
-  "reinstall_custom_node",
-  "fix_custom_node",
-  "disable_custom_node",
-  "enable_custom_node",
-  "uninstall_custom_node",
-  "list_installed_nodes",
-  "sync_node_dependencies",
   "report_issue",
-  "extract_workflow_dependencies",
-  "install_workflow_dependencies",
-  "resolve_missing_models",
   "install_comfyui",
   "update_comfyui",
   "update_all",
-  "remove_model",
-  "search_civitai_models",
-  "search_civitai_creators",
-  "download_civitai_model",
   "model_metadata",
-  "prompt_director_inspect",
-  "list_extra_paths",
-  "add_extra_path",
-  "remove_extra_path",
   "workspace",
   "get_environment",
   "list_api_nodes",
-  "get_api_node_schema",
-  "generate_with_api_node",
   "configure_manager",
-  "scaffold_custom_node",
-  "publish_custom_node",
-  "verify_custom_node",
+  "node_pack",
   "apply_manifest",
-  "convert_image",
-  "analyze_color",
-  "upload_output",
   "health_check",
-  "lock_workflow",
-  "verify_workflow_lock",
-  "list_skills",
-  "read_skill",
   "list_packs",
-  "list_workflow_templates",
-  "read_pack_workflow",
-  "check_workflow_runtime",
   "install_panel",
   "self_update",
   "calculate",
-  "get_comfyui_settings",
-  "set_comfyui_setting",
-  "list_node_pack_files",
-  "read_node_file",
-  "search_node_packs",
-  "write_node_file",
-  "apply_node_patch",
-  "node_pack_git",
-  "train_list_flows",
   "train_prepare_dataset",
   "train_start",
-  "train_bootstrap",
-  "train_status",
-  "train_list_datasets",
-  "train_dataset_detail",
-  "train_job_config",
-  "train_file",
-  "train_dataset_update",
-  "train_dataset_delete",
-  "train_preview_config",
-  "train_caption_image",
-  "train_caption_dataset",
-  "train_delete_job",
-  "train_cancel",
-  "train_build_image",
   "train_doctor",
   "apps",
-  "get_template_schema",
-  "run_template",
   "batch",
 ] as const;
 
@@ -212,10 +103,11 @@ export type ToolName = (typeof TOOL_NAMES)[number];
  * updating — it is history, not state.
  *
  * Read from docs/design/tool-surface.txt so there is exactly one copy of the
- * baseline names (193: the 182 frozen at 0.48.32 plus the eight consolidated tools
+ * baseline names (194: the 182 frozen at 0.48.32 plus the nine consolidated tools
  * appended as they shipped — `bisect` in 0.49.0 slice 1, then `node_snapshot`,
  * `apps` and `batch` in slice 2, then `comfy_cli` in slice 3, then `queue` in
- * slice 4, then `model_metadata` in slice 5, then `workspace` in slice 6 — plus
+ * slice 4, then `model_metadata` in slice 5, then `workspace` in slice 6, then
+ * `runpod` in 0.50.0 slice 8 — plus
  * `disable_custom_node` / `enable_custom_node` / `uninstall_custom_node`, the
  * #775 cleanup surface), and so the file committed
  * as the P0 evidence is load-bearing rather than
@@ -236,7 +128,7 @@ const BASELINE_URL = new URL("../../docs/design/tool-surface.txt", import.meta.u
  * 200-line rename. APPENDING is legitimate — new tools join the baseline when they
  * ship — so the workflow is: append, update this hash, say why in the message.
  */
-export const BASELINE_SHA256 = "af84bfb4f12f02b9c9b27c4cdaa83fbed02ea125bc51d5927c42155b2782f2f7";
+export const BASELINE_SHA256 = "984b006e468063be6fb8a5ad5432b21a2246f1510829d30775cfafd06693bc75";
 
 /**
  * LAZY on purpose, and this is not a micro-optimisation.
@@ -310,7 +202,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 154;
+export const MAX_TOOLS = 45;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;
@@ -346,6 +238,30 @@ export interface DeadName {
    * added to an exempted file still fails.
    */
   allowedIn?: Array<{ path: string; context: string; why: string }>;
+  /**
+   * Files that IMPLEMENT the surviving tool, where this name still appears as a
+   * bare quoted action literal — `"regenerate"` as a `z.enum` member, a
+   * `case "regenerate":` label, an argument to a per-action error builder.
+   *
+   * Only meaningful when the fold reused the retired tool name as its action name
+   * (`replacement: 'generate_image (action:"regenerate")'`), which is what
+   * `declaredActions` checks. If the slice renamed the action, this licenses
+   * nothing.
+   *
+   * NOT a whole-file pass, and the difference is the whole point. It licenses ONE
+   * structural form: a complete quoted string literal whose entire content is the
+   * name. src/tools/generate-image.ts is thousands of lines of model-facing
+   * description strings, and `SELF`-listing it would pre-approve every live
+   * instruction added there later — the exact reasoning that made `allowedIn`
+   * per-occurrence. Here, `"Call regenerate to redo the render"` is still reported,
+   * because the literal's content is not the name; only `"regenerate"` standing
+   * alone is the action vocabulary.
+   *
+   * Exact paths, never globs, for the same reason as `allowedIn.path`. An entry
+   * whose file no longer contains such a literal is reported as stale by
+   * scripts/check-tool-vocabulary.mts — exceptions expire.
+   */
+  implementedIn?: string[];
 }
 
 /**
@@ -367,6 +283,362 @@ export interface DeadName {
 export function deadNameRe(name: string): RegExp {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`(?<![A-Za-z0-9_])(?:mcp__[A-Za-z0-9_]+__)?${escaped}(?![A-Za-z0-9_])`);
+}
+
+/** A half-open `[start, end)` slice of one line. */
+export interface Span {
+  start: number;
+  end: number;
+}
+
+/**
+ * WHERE on a line `deadNameRe(name)` matches, not merely whether.
+ *
+ * `deadNameRe` answers a boolean, which is all the scanner needed while every
+ * mention of a dead name was equally bad. `rotMentions` below has to tell two
+ * mentions on the SAME line apart, so it needs positions — and it must get them
+ * from the identical pattern, or the exemption would be reasoning about spans the
+ * gate does not actually flag. Hence the shared `.source` rather than a second
+ * hand-written regex.
+ *
+ * The `g` flag is applied to a FRESH RegExp each call: `deadNameRe`'s result is
+ * unflagged and shared with `.test()` callers, and a stateful `lastIndex` leaking
+ * between them is the classic way a scan starts skipping matches.
+ */
+export function deadNameMentions(name: string, line: string): Span[] {
+  const re = new RegExp(deadNameRe(name).source, "g");
+  const spans: Span[] = [];
+  for (let m = re.exec(line); m !== null; m = re.exec(line)) {
+    // Defensive: a zero-length match would spin forever. Unreachable for a
+    // non-empty name, and a ledger entry with an empty name is already a bug.
+    if (m[0].length === 0) {
+      re.lastIndex += 1;
+      continue;
+    }
+    spans.push({ start: m.index, end: m.index + m[0].length });
+  }
+  return spans;
+}
+
+const IDENT = /[A-Za-z0-9_]/;
+
+/**
+ * The `mcp__<server>__` prefix, anchored to end exactly where a replacement copy
+ * begins.
+ *
+ * The server segment forbids `__` — `[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*` allows
+ * `comfyui_panel` but not `comfyui__wrong`. `deadNameRe`'s own prefix is the
+ * looser `[A-Za-z0-9_]+`, and that difference is deliberate rather than an
+ * oversight: there, greediness only makes it MATCH more, which is fail-safe for a
+ * gate that hunts mentions. Here the same greediness EXEMPTS more, and
+ * `mcp__comfyui__wrong__get_system_stats (action:"clear_vram")` would slip
+ * through by letting the segment swallow `comfyui__wrong` — a line that, read the
+ * ordinary way, names server `comfyui`'s tool `wrong__get_system_stats`. Strict
+ * where it exempts, loose where it flags.
+ */
+const MCP_PREFIX_END = /(?:^|[^A-Za-z0-9_])mcp__[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*__$/;
+
+/** Live tool names, for the "the replacement must name a real tool" guard below. */
+const LIVE_TOOLS: ReadonlySet<string> = new Set<string>(TOOL_NAMES);
+
+/** Escape for embedding in a RegExp source. */
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * The action names a replacement declares:
+ *
+ *     'generate_image (action:"regenerate")'                  → ["regenerate"]
+ *     'comfy_cli (action:"models_list"|"models_show")'        → ["models_list", "models_show"]
+ *     'queue (action:"list")'                                 → ["list"]
+ *     'panel_get_errors'                                      → []
+ *
+ * This is how the ledger tells us that a retired TOOL name is now an ACTION name.
+ * Everything the action-form rules license keys off it, so a fold that RENAMED its
+ * action (slice 9's `list_skills` → `skill_list`) declares no collision and gets
+ * no new exemptions at all — the same self-derivation the replacement-copy rule
+ * uses, applied to the other half of the call form.
+ */
+export function declaredActions(replacement: string): string[] {
+  // ANCHORED to the call form: `<tool> (action:…)` at the START of the
+  // replacement, not the first `action:` anywhere in it. Otherwise prose that
+  // merely quotes the old spelling —
+  //     'generate_image (mode:"fast") — old syntax action:"regenerate" is retired'
+  // — reads as a declaration and switches the action rules on for a name the
+  // surviving tool has no action for.
+  const call =
+    /^\s*(?:mcp__[A-Za-z0-9_]+__)?[A-Za-z0-9_]+\s*\(\s*action\s*:\s*((?:["'`][A-Za-z0-9_]+["'`]\s*\|?\s*)+)\)/.exec(
+      replacement,
+    );
+  if (!call) return [];
+  return [...call[1]!.matchAll(/["'`]([A-Za-z0-9_]+)["'`]/g)].map((m) => m[1]!);
+}
+
+/**
+ * An `action:` key opening a call's argument list — `tool (action:"N")`.
+ *
+ * Just `\(\s*$`, not `<identifier>\s*\(\s*$`: the narrower shape missed
+ * `some_other_tool?.(action:"N")` and `some_other_tool /* note *\/ (action:"N")`,
+ * which name a tool exactly as much as the plain form does. Any `(` is the
+ * conservative reading, and it costs nothing — the legitimate forms are separated
+ * from a call by a quote (`fn('action:"N" …')`) or a brace (`{ action:"N" }`),
+ * never by a bare paren.
+ */
+const TOOL_CALL_OPEN = /\(\s*$/;
+
+/**
+ * Positions where a quoted literal is an ACTION rather than a tool argument:
+ * an array/enum member (`[` or `,` before it) or a `case` label. These are the
+ * three forms the slices measured.
+ *
+ * A call's FIRST argument — `callTool("regenerate", payload)` — is deliberately
+ * NOT one of them. It is indistinguishable from `z.literal("regenerate")`, and one
+ * of those two is a live dispatch to the retired tool. Fail closed: report it, and
+ * let a real case be an `allowedIn` with a reason.
+ */
+const ACTION_LITERAL_LEAD = /(?:[[,]|(?<![A-Za-z0-9_])case)\s*$/;
+
+/**
+ * Where `line` uses `name` as an ACTION VALUE — `action:"regenerate"`,
+ * `"action": "regenerate"`, `c.args?.action === "regenerate"`.
+ *
+ * WHY THIS IS NOT ROT AT ALL. After a fold, `regenerate` is no longer a tool name,
+ * but it IS a live action name, and `deadNameRe` cannot tell the two apart because
+ * they are spelled identically. The replacement-copy rule only covers prose that
+ * quotes the whole call form; slice 16 measured the rest and it is the majority —
+ * 57 of 84 hits are the token used as a value or identifier, where no replacement
+ * string can wrap it. The text here says `action` itself, so it is self-evidencing
+ * and needs no ledger entry, which is also what keeps `docs:gen` output stable:
+ * the generated `"action": "regenerate"` in docs/tools/*.mdx is covered by the same
+ * rule as the source string it was generated from.
+ *
+ * THE EXCLUSION IS THE LOAD-BEARING PART. `some_other_tool (action:"regenerate")`
+ * also contains `action:"regenerate"` — and it must still fail, because it names
+ * the WRONG tool. So an `action` key sitting directly in a `<identifier> (`
+ * argument position is a TOOL-CALL form: it claims a specific tool, and it is
+ * judged by the replacement-copy rule instead, which exempts it only when the tool
+ * is the declared survivor. A bare `- action:"regenerate" — …` bullet claims no
+ * tool and is licensed here.
+ *
+ * The prefix is measured to the `action` TOKEN, not to the match start, and that
+ * is what separates a call form from a string: `.describe('action:"regenerate" …')`
+ * has a quote between the `(` and the key, so a string opened and the text inside
+ * is prose, not an argument list. Testing from the match start instead classified
+ * every `fn('action:"…"')` as a tool call and flagged it — one of the measured
+ * forms.
+ *
+ * ACCEPTED LIMIT: a quoted key inside a call, `some_other_tool ("action": "x")`,
+ * is therefore not treated as a call form. It is not a shape anyone writes — the
+ * documented call form is `tool (action:"x")` — and the canonical one is excluded.
+ */
+export function actionValueSpans(name: string, line: string): Span[] {
+  const re = new RegExp(
+    `(?<![A-Za-z0-9_])(["'\`]?)action["'\`]?\\s*(?::|={1,3}|!={1,2})\\s*["'\`]${escapeRe(name)}["'\`]`,
+    "g",
+  );
+  const spans: Span[] = [];
+  for (let m = re.exec(line); m !== null; m = re.exec(line)) {
+    const keyStart = m.index + m[1]!.length;
+    if (TOOL_CALL_OPEN.test(line.slice(0, keyStart))) continue;
+    spans.push({ start: m.index, end: m.index + m[0].length });
+  }
+  return spans;
+}
+
+/**
+ * Where `line` spells `name` as a COMPLETE quoted string literal — `"regenerate"`.
+ *
+ * This is the residue slice 16 measured inside the file that registers the
+ * surviving tool: `z.enum([… "regenerate" …])`, `case "regenerate":`,
+ * `need(args.asset_id, "regenerate", …)`. Nothing on those lines says the word
+ * "action", so no self-evidencing rule can reach them; they are licensed only in
+ * the paths an entry names in `implementedIn`.
+ *
+ * Narrow on purpose, in two dimensions. The literal's ENTIRE content must be the
+ * name, so `"Call regenerate to redo the render"` is a quoted string in the same
+ * file and is still reported; backticks are excluded, so a markdown code span
+ * `` `regenerate` `` in a JSDoc block there is still reported too. And it must sit
+ * in an action POSITION — see ACTION_LITERAL_LEAD — so a dispatch by tool name,
+ * `callTool("regenerate", payload)`, is still reported even in a declared file.
+ */
+export function actionLiteralSpans(name: string, line: string): Span[] {
+  const re = new RegExp(`(["'])${escapeRe(name)}\\1`, "g");
+  const spans: Span[] = [];
+  for (let m = re.exec(line); m !== null; m = re.exec(line)) {
+    if (!ACTION_LITERAL_LEAD.test(line.slice(0, m.index))) continue;
+    spans.push({ start: m.index, end: m.index + m[0].length });
+  }
+  return spans;
+}
+
+/**
+ * Every verbatim occurrence of `needle` in `line` that BEGINS at a token
+ * boundary, INCLUDING occurrences that overlap each other.
+ *
+ * The boundary rule is not decoration. Without it `indexOf` treats the
+ * replacement as an unbounded substring, and
+ *
+ *     not_get_system_stats (action:"clear_vram")
+ *
+ * contains `get_system_stats (action:"clear_vram")` starting at index 4 — so a
+ * mention naming a DIFFERENT tool would be exempted by the mere suffix of that
+ * tool's name, which is precisely the case this whole exemption must not admit.
+ * Requiring a non-identifier character (or start of line) before the copy is the
+ * same contract `deadNameRe` already applies to names, `mcp__<server>__` allowance
+ * included: a namespacing client writes `mcp__comfyui__get_system_stats (…)`,
+ * which is the same tool and must still count. See MCP_PREFIX_END for why that
+ * allowance is stricter here than in `deadNameRe`.
+ *
+ * The asymmetry is deliberate: there is no matching rule on the RIGHT. A
+ * replacement names its tool at the START, so an identifier run before the copy
+ * changes WHICH tool is named, while one after it only extends trailing prose —
+ * `foo (action:"old_tool") x` inside `foo (action:"old_tool") xy` still names foo
+ * and still carries the correct call form, so flagging it would be a false
+ * positive that sends a sweep to "fix" text that is already right.
+ */
+function literalSpans(needle: string, line: string): Span[] {
+  const spans: Span[] = [];
+  if (needle.length === 0) return spans;
+  for (let i = line.indexOf(needle); i !== -1; i = line.indexOf(needle, i + 1)) {
+    const startsAtBoundary =
+      i === 0 || !IDENT.test(line[i - 1]!) || MCP_PREFIX_END.test(line.slice(0, i));
+    if (startsAtBoundary) spans.push({ start: i, end: i + needle.length });
+  }
+  return spans;
+}
+
+/**
+ * Is this entry a usable migration instruction at all? Every exemption below
+ * reads it as one, so a broken entry must license nothing.
+ */
+function usableTarget(dead: DeadName): boolean {
+  if (!dead.replacement.includes(dead.name)) return false;
+  // The replacement must spell the retired name EXACTLY ONCE. One mention is the
+  // action slot — the whole reason this exemption exists. A second is something
+  // else, and `get_system_stats (action:"clear_vram") then call clear_vram` is a
+  // ledger entry carrying its own live instruction: exempting a verbatim copy would
+  // launder that instruction into every page that quotes the ledger. Zero mentions
+  // means the name only occurs inside a longer identifier (`clear_vram_stats`), so
+  // there is nothing to exempt either. Both fail CLOSED.
+  const inReplacement = deadNameMentions(dead.name, dead.replacement);
+  if (inReplacement.length !== 1) return false;
+
+  // The replacement must also name a tool that ACTUALLY EXISTS, other than the dead
+  // one. A replacement carrying nothing beyond the dead name — `clear_vram`,
+  // `` `clear_vram` ``, `clear_vram.`, and equally the prose `Use clear_vram` — is
+  // not a migration target; it says "call the tool that no longer exists".
+  // Exempting against it would blind the gate for that name completely, which is
+  // the one way this rule could turn into the bypass it is meant not to be. Merely
+  // requiring "some identifier survives" was not enough, because `Use` is an
+  // identifier. Requiring a LIVE tool name turns a heuristic into a checkable
+  // property, and catches a mistyped survivor in the ledger as a bonus.
+  //
+  // KNOWN LIMIT: `TOOL_NAMES` is core-only, so a fold whose replacement names a
+  // PANEL tool AND whose action reuses the retired name would not be exempted. No
+  // such entry exists (every panel replacement in the ledger names a different
+  // tool, so the `includes` guard above already returns first), and the failure
+  // direction is a visible false positive — the gate reports the line, and the
+  // DEAD_NAMES ledger test names the entry — never a silent pass.
+  const rest =
+    dead.replacement.slice(0, inReplacement[0]!.start) +
+    dead.replacement.slice(inReplacement[0]!.end);
+  return (rest.match(/[A-Za-z0-9_]+/g) ?? []).some((token) => LIVE_TOOLS.has(token));
+}
+
+/**
+ * The mentions of a dead name on one line that are ROT.
+ *
+ * WHY ANY EXEMPTION EXISTS. For many 0.50.0 folds the natural action name IS the
+ * retired tool name. So `regenerate` stops being a tool and becomes an ACTION of
+ * `generate_image` — and `deadNameRe` cannot tell those apart, because they are
+ * spelled identically. Every remaining use of the token is then flagged, including
+ * the migration text the prose sweep is REQUIRED to write:
+ *
+ *     generate_image (action:"regenerate")
+ *
+ * Without a rule, no sweep for those names can ever go green. Slice 9 escaped only
+ * by RENAMING its actions (`list_skills` → `skill_list`); that does not scale to
+ * `apply_manifest` (93 mentions) or `clear_vram` (35), where contorting exactly the
+ * names models reach for is a real discoverability regression.
+ *
+ * THE THREE RULES, each self-derived from the entry and each POSITIONAL:
+ *
+ *   (a) MIGRATION TARGET — inside a verbatim copy of the entry's own
+ *       `replacement`. Covers prose: comments, README rows, docs. Measured at 27
+ *       of slice 16's 84 hits.
+ *   (b) ACTION VALUE — `action:"regenerate"`, `"action": "regenerate"`,
+ *       `args.action === "regenerate"`. Self-evidencing (the text says `action`),
+ *       so repo-wide and no ledger entry, which is what keeps `docs:gen` output
+ *       stable across regeneration. See actionValueSpans.
+ *   (c) ACTION LITERAL — `"regenerate"` as a complete quoted string, ONLY in the
+ *       paths the entry lists in `implementedIn`: enum members, `case` labels,
+ *       arguments to per-action helpers. See actionLiteralSpans.
+ *
+ * (b) and (c) require the entry's `replacement` to declare this exact name as an
+ * action (`declaredActions`), so a fold that renamed its action gets nothing.
+ *
+ * WHY THIS DOES NOT WEAKEN THE RATCHET. Nothing here is a human-chosen string:
+ * (a) is the ledger's own output, (b) is a syntactic form that names itself, (c) is
+ * one structural form in explicitly declared files. All of these still fail:
+ *
+ *   - a bare `regenerate` anywhere, and `call regenerate to redo the render`;
+ *   - `some_other_tool (action:"regenerate")` — the WRONG tool. (b) deliberately
+ *     skips any match preceded by `<identifier> (`, handing it to (a), which
+ *     exempts it only when the tool is the declared survivor;
+ *   - `not_generate_image (action:"regenerate")` — a tool whose name merely ENDS
+ *     with the survivor's;
+ *   - `"Call regenerate now"` in an `implementedIn` file — a quoted string whose
+ *     content is not exactly the name;
+ *   - a rotten bare mention sharing a line with a legitimate replacement form or
+ *     `action:"N"`. Exemption is by span CONTAINMENT, never line-wide.
+ *
+ * (a) matches LITERALLY (`indexOf`), never a regex built from `replacement`: the
+ * replacements are call forms containing `(`, `)`, `"` and `|`, and a pattern
+ * compiled from `comfy_cli (action:"a"|"b")` would alternate rather than match.
+ *
+ * Entries whose replacement does not contain their own name — the large majority,
+ * and every entry in the ledger today — are byte-for-byte unaffected by all three.
+ *
+ * NOTE for a fold whose replacement names several actions: declare the SAME
+ * combined string (`manager (action:"update_all"|"self_update")`) on every entry it
+ * covers. The rules are per-name and self-derived on purpose, so a name is exempted
+ * only against ITS OWN declared target.
+ *
+ * `path` is the repo-relative file being scanned; omit it and rule (c) is off.
+ */
+export function rotMentions(dead: DeadName, line: string, path?: string): Span[] {
+  const mentions = deadNameMentions(dead.name, line);
+  if (mentions.length === 0) return mentions;
+  // Every rule below reads the ledger entry as a migration instruction, so a broken
+  // entry licenses nothing at all. One gate, three rules, fail-closed.
+  if (!usableTarget(dead)) return mentions;
+
+  // (a) The migration TARGET, spelled exactly — the form the prose sweep writes.
+  const targets = literalSpans(dead.replacement, line);
+
+  // (b) and (c) apply only when the fold reused the retired TOOL name as its
+  // ACTION name, which is the collision that creates the problem. A fold that
+  // renamed its action declares nothing here and gains nothing.
+  if (declaredActions(dead.replacement).includes(dead.name)) {
+    // (b) The name used as an action VALUE. Self-evidencing, so repo-wide.
+    targets.push(...actionValueSpans(dead.name, line));
+    // (c) The name as a bare quoted action literal, only in the declared
+    // implementing files. `path` is optional so a caller with no file context
+    // (call_tool, a unit test) simply never gets this rule.
+    if (path !== undefined && dead.implementedIn?.includes(path)) {
+      targets.push(...actionLiteralSpans(dead.name, line));
+    }
+  }
+
+  if (targets.length === 0) return mentions;
+  // CONTAINMENT, not overlap, and it is what makes all three rules per-OCCURRENCE
+  // rather than per-line. A mention that merely straddles the edge of a replacement
+  // copy — which a truncated or mistyped `replacement` produces — is not "inside" a
+  // verbatim copy of anything; and a rotten bare mention sitting beside a legitimate
+  // `action:"N"` is outside that span, so it is still reported. A line-wide test
+  // would exempt both, which is the single most dangerous way to widen this.
+  return mentions.filter((m) => !targets.some((t) => m.start >= t.start && m.end <= t.end));
 }
 
 /**
@@ -391,6 +663,11 @@ export const DEAD_NAMES: readonly DeadName[] = [
         path: "docs/using-tools.mdx",
         context: "| `get_workspace` | `workspace` with `action: \"get\"` |",
         why: "The old-name → new-form migration table on the human-facing tools guide. A community reader (#660-adjacent confusion) read the 0.49.0 consolidation as capability being REMOVED; the table exists to show the same behaviour under a new label, so the left column must spell the retired name. It is a mapping AWAY from the name, never an instruction to call it.",
+      },
+      {
+        path: "src/tools/retired-redirect.ts",
+        context: '"Tool get_workspace not found"',
+        why: "A verbatim quotation of MEASURED output: the three-row table in that module's header records what each call path actually answered on 0.49.0 for an already-retired name, which is the evidence the module exists at all. Quoting the SDK's bare 404 is the opposite of instructing anyone to call the name — it is the defect being removed. Deliberately the ONLY mention left in that file: the surrounding prose was reworded to say 'a name the 0.49.0 slices had already retired', and its test file derives the name from this ledger rather than spelling it, so this exemption covers one quoted line instead of seven comments. Pinned to the quotation because a quotation is the part least likely to be reworded — and if it IS reworded the gate should fire.",
       },
     ],
   },
@@ -688,6 +965,966 @@ export const DEAD_NAMES: readonly DeadName[] = [
         why: "Same post, explicitly narrating the OLD behaviour in the past tense.",
       },
     ],
+  },
+  // ─────────────────────────────────────────────────────────────────────────
+  // 0.50.0 slice 8: the eleven RunPod tools folded into TWO action-parameterized
+  // tools — the pod LIFECYCLE + local⇄pod host switch into the new name `runpod`
+  // (8 actions), and the live-status/diagnosis surface into the surviving
+  // `runpod_watch` (3 actions). Same runpod-client / runpod-watch services, same
+  // control-channel requests, same return shapes — only the surface changed, so
+  // every mention of the old names is now rot pointing at a 404.
+  //
+  // Split rather than one twelve-action tool because the two halves have
+  // different blast radii: `runpod` spends and saves real money and moves the
+  // orchestrator's render target; `runpod_watch` only changes what is DISPLAYED.
+  // The orchestrator's call_tool whitelist depends on that split — see
+  // CALL_TOOL_ACTION_WHITELIST in src/orchestrator/call-tool-admission.ts, which
+  // keeps action:"create"/"start" (the two BILLING actions) unreachable from a
+  // canvas-less client exactly as their retired standalone names were.
+  {
+    name: "runpod_pod_create",
+    since: "0.50.0",
+    replacement: 'runpod (action:"create")',
+  },
+  {
+    name: "runpod_pod_start",
+    since: "0.50.0",
+    replacement: 'runpod (action:"start")',
+  },
+  {
+    name: "runpod_pod_stop",
+    since: "0.50.0",
+    replacement: 'runpod (action:"stop")',
+  },
+  {
+    name: "runpod_pod_status",
+    since: "0.50.0",
+    replacement: 'runpod (action:"status")',
+  },
+  {
+    name: "runpod_list_pods",
+    since: "0.50.0",
+    replacement: 'runpod (action:"list")',
+  },
+  {
+    name: "runpod_pod_connect",
+    since: "0.50.0",
+    replacement: 'runpod (action:"connect")',
+  },
+  {
+    name: "runpod_use_local",
+    since: "0.50.0",
+    replacement: 'runpod (action:"use_local")',
+  },
+  {
+    name: "runpod_deploy_link",
+    since: "0.50.0",
+    replacement: 'runpod (action:"deploy_link")',
+  },
+  {
+    name: "runpod_unwatch",
+    since: "0.50.0",
+    replacement: 'runpod_watch (action:"unwatch")',
+  },
+  {
+    name: "runpod_pod_troubleshoot",
+    since: "0.50.0",
+    replacement: 'runpod_watch (action:"troubleshoot")',
+  },
+  // ── 0.50.0 slice 7 (warmup): process control, API nodes, defaults ──────────
+  // Ten names folded into three action-parameterized tools. Same services, same
+  // arguments, same return shapes — only the surface changed, so every mention
+  // of a retired name is now rot pointing at a 404.
+  //
+  //   restart_comfyui ← start_comfyui, stop_comfyui
+  //   list_api_nodes  ← get_api_node_schema, generate_with_api_node
+  //   get_defaults    ← set_defaults, get_comfyui_settings, set_comfyui_setting
+  //
+  // The get_defaults fold spans TWO backing stores that must not be conflated:
+  // action:"get"/"set" are the MCP server's own generation defaults, while
+  // action:"get_ui"/"set_ui" are ComfyUI's separate frontend UI settings. The
+  // replacements below therefore keep the `_ui` suffix visible — a caller sent
+  // from set_comfyui_setting to action:"set" would silently write the wrong
+  // store.
+  {
+    name: "start_comfyui",
+    since: "0.50.0",
+    replacement: 'restart_comfyui (action:"start")',
+  },
+  {
+    name: "stop_comfyui",
+    since: "0.50.0",
+    replacement: 'restart_comfyui (action:"stop")',
+  },
+  {
+    name: "get_api_node_schema",
+    since: "0.50.0",
+    replacement: 'list_api_nodes (action:"schema")',
+  },
+  {
+    name: "generate_with_api_node",
+    since: "0.50.0",
+    replacement: 'list_api_nodes (action:"generate")',
+  },
+  {
+    name: "set_defaults",
+    since: "0.50.0",
+    replacement: 'get_defaults (action:"set")',
+  },
+  {
+    name: "get_comfyui_settings",
+    since: "0.50.0",
+    replacement: 'get_defaults (action:"get_ui")',
+    allowedIn: [
+      {
+        path: "docs/design/comfyui-settings-tools.md",
+        context: "The read tool shipped as `get_comfyui_settings`",
+        why: "The dated design spec for the PR that BUILT these two tools. Its superseded banner records the name each tool shipped under and maps it to today's action — the same mapping-away-from-the-name shape as the docs/using-tools.mdx migration table, never an instruction to call it. The banner's two mentions are on separate lines so each is a single occurrence bound to its own context.",
+      },
+    ],
+  },
+  {
+    name: "set_comfyui_setting",
+    since: "0.50.0",
+    replacement: 'get_defaults (action:"set_ui")',
+    allowedIn: [
+      {
+        path: "docs/design/comfyui-settings-tools.md",
+        context: "The write tool shipped as `set_comfyui_setting`",
+        why: "Second line of the same superseded banner — see the get_comfyui_settings entry above.",
+      },
+    ],
+  },
+  // 0.50.0 slice 9: the nine knowledge tools — bundled skills, installer packs,
+  // the connected server's workflow templates, and the two workflow-readiness
+  // checks — folded into one action-parameterized `list_packs` tool. Same
+  // enumeration/reading helpers, same api-nodes + workflow-deps + skill-cache
+  // services, same return shapes (JSON for the listings, raw markdown/graph text
+  // for the reads, the markdown report for the deps actions, and
+  // generate_skill's `structuredContent`) — only the surface changed, so every
+  // mention of the old names is now rot pointing at a 404.
+  {
+    name: "read_pack_workflow",
+    since: "0.50.0",
+    replacement: 'list_packs (action:"read_workflow")',
+  },
+  {
+    name: "list_workflow_templates",
+    since: "0.50.0",
+    replacement: 'list_packs (action:"list_templates")',
+  },
+  {
+    name: "check_workflow_runtime",
+    since: "0.50.0",
+    replacement: 'list_packs (action:"check_runtime")',
+  },
+  {
+    name: "extract_workflow_dependencies",
+    since: "0.50.0",
+    replacement: 'list_packs (action:"extract_deps")',
+  },
+  {
+    name: "install_workflow_dependencies",
+    since: "0.50.0",
+    replacement: 'list_packs (action:"install_deps")',
+    allowedIn: [
+      {
+        path: "docs/using-tools.mdx",
+        context: '| `install_workflow_dependencies` | `list_packs` with `action: "install_deps"` |',
+        why: "The old-name → new-form migration table on the human-facing tools guide, same as the get_workspace/get_queue rows above. The left column must spell the retired name; it is a mapping AWAY from the name, never an instruction to call it.",
+      },
+    ],
+  },
+  {
+    name: "list_skills",
+    since: "0.50.0",
+    // NOT action:"list_skills". An action may never be spelled the same as a
+    // name the same fold retires: the dead-name gate matches the bare token, so
+    // `list_packs (action:"list_skills")` — the very replacement text every
+    // sweep would have to write — reads as a live reference to the dead tool and
+    // can never go green. Same for read_skill → action:"skill_read" below.
+    replacement: 'list_packs (action:"skill_list")',
+  },
+  {
+    name: "read_skill",
+    since: "0.50.0",
+    replacement: 'list_packs (action:"skill_read")',
+  },
+  {
+    name: "generate_node_skill",
+    since: "0.50.0",
+    replacement: 'list_packs (action:"generate_skill")',
+  },
+  // ── 0.50.0 slice 10: the eighteen train_* tools folded into three
+  // action-parameterized tools, split by work-domain: `train_prepare_dataset`
+  // owns the DATASETS, `train_start` owns the JOBS, `train_doctor` owns the
+  // TRAINER ITSELF. Same training services, same envelope return shapes — only
+  // the surface changed, so every mention of the old names is now rot pointing
+  // at a 404.
+  //
+  // The two `delete` actions are deliberately keyed differently: `train_delete_job`
+  // becomes train_start (action:"delete") keyed by `id`, while `train_dataset_delete`
+  // becomes train_prepare_dataset (action:"delete") keyed by `name`. Both
+  // replacements below spell the tool AND the key so a reader of the error can
+  // never land on the wrong one.
+  {
+    name: "train_status",
+    since: "0.50.0",
+    replacement: 'train_start (action:"status")',
+    allowedIn: [
+      {
+        path: "docs/blog/lora-trainer-p1.mdx",
+        context: "5. **`train_status`** — poll it whenever.",
+        why: "A DATED post announcing the train_* surface AS IT SHIPPED, narrating the seven-tool walkthrough of that release. The post carries a <Note> mapping every name in it to its 0.50.0 replacement, so a reader is never stranded; rewriting the walkthrough would falsify what the release contained.",
+      },
+      {
+        path: "docs/blog/lora-trainer-p1.mdx",
+        context: "(`train_status` and `train_list_flows` are whitelisted",
+        why: "Same post, stating which tools the mobile call_tool path whitelisted AT THE TIME. That is a fact about the 0.31 admission list, not an instruction — and the fact survives the fold (see call-tool-admission.ts).",
+      },
+      {
+        path: "docs/blog/lora-trainer-p1.mdx",
+        context: "with its catalog entry. `train_status`",
+        why: "Same post, the E2E receipts section: a past-tense record of what was observed on an RTX 4090 run of that exact code. Renaming the tool in a receipt would misreport the evidence.",
+      },
+      {
+        path: "docs/blog/train-lora-runpod.mdx",
+        context: "`train_status`, `train_cancel`, `train_list_flows` — backed by the",
+        why: "A DATED sequel post listing the seven P1 tools it reuses unchanged on a pod. Same <Note> treatment as lora-trainer-p1; the list is a statement about the P1 surface, not a call sequence.",
+      },
+      {
+        path: "docs/blog/train-lora-runpod.mdx",
+        context: "- **`train_status`** streams step/loss/sample progress",
+        why: "Same post, per-tool bullet describing the pod behaviour of that release's surface.",
+      },
+    ],
+  },
+  {
+    name: "train_cancel",
+    since: "0.50.0",
+    replacement: 'train_start (action:"cancel")',
+    allowedIn: [
+      {
+        path: "src/services/ai-toolkit.ts",
+        context: 'cancel: "train_cancel",',
+        why: "NOT a tool reference — the frozen envelope/1 `command` LABEL for the stop operation. TrainerEnvelope.command is a RETURN SHAPE that clients and tests key on, so slice 10 deliberately did not rename it; see TRAINER_COMMAND's doc comment. Hoisted to this one constant precisely so the string appears once, here, rather than at 13 call sites.",
+      },
+      {
+        path: "docs/blog/lora-trainer-p1.mdx",
+        context: "And if you change your mind: **`train_cancel`**",
+        why: "Same dated P1 announcement post, introducing the section on verified cancellation. See the train_status entries above.",
+      },
+      {
+        path: "docs/blog/lora-trainer-p1.mdx",
+        context: "can't prove.** `train_cancel` issues a",
+        why: "Same post, narrating the verify-before-reporting design of that release in the present tense of its publication date.",
+      },
+      {
+        path: "docs/blog/train-lora-runpod.mdx",
+        context: "`train_status`, `train_cancel`, `train_list_flows` — backed by the",
+        why: "Same seven-tool list in the dated sequel post — see the train_status entry for this line.",
+      },
+      {
+        path: "docs/blog/train-lora-runpod.mdx",
+        context: "- **`train_cancel`** stops the remote trainer with `pkill`",
+        why: "Same post, per-tool bullet describing the pod cancel path of that release's surface.",
+      },
+    ],
+  },
+  {
+    name: "train_delete_job",
+    since: "0.50.0",
+    replacement: 'train_start (action:"delete") — the JOB delete, keyed by `id`',
+  },
+  {
+    name: "train_list_flows",
+    since: "0.50.0",
+    replacement: 'train_start (action:"list_flows")',
+    allowedIn: [
+      {
+        path: "docs/blog/lora-trainer-p1.mdx",
+        context: "(`train_status` and `train_list_flows` are whitelisted",
+        why: "Same dated P1 post line as the train_status entry above — a statement about the mobile call_tool whitelist at that release, not an instruction to call either name.",
+      },
+      {
+        path: "docs/blog/train-lora-runpod.mdx",
+        context: "`train_status`, `train_cancel`, `train_list_flows` — backed by the",
+        why: "Same seven-tool list in the dated sequel post — see the train_status entry for this line.",
+      },
+    ],
+  },
+  {
+    name: "train_job_config",
+    since: "0.50.0",
+    replacement: 'train_start (action:"job_config")',
+  },
+  {
+    name: "train_preview_config",
+    since: "0.50.0",
+    replacement: 'train_start (action:"preview_config")',
+  },
+  {
+    name: "train_list_datasets",
+    since: "0.50.0",
+    replacement: 'train_prepare_dataset (action:"list")',
+  },
+  {
+    name: "train_dataset_detail",
+    since: "0.50.0",
+    replacement: 'train_prepare_dataset (action:"detail")',
+  },
+  {
+    name: "train_dataset_update",
+    since: "0.50.0",
+    replacement: 'train_prepare_dataset (action:"update")',
+  },
+  {
+    name: "train_dataset_delete",
+    since: "0.50.0",
+    replacement: 'train_prepare_dataset (action:"delete") — the DATASET delete, keyed by `name`',
+  },
+  {
+    name: "train_file",
+    since: "0.50.0",
+    replacement: 'train_prepare_dataset (action:"file")',
+  },
+  {
+    name: "train_caption_image",
+    since: "0.50.0",
+    replacement: 'train_prepare_dataset (action:"caption_image")',
+  },
+  {
+    name: "train_caption_dataset",
+    since: "0.50.0",
+    replacement: 'train_prepare_dataset (action:"caption_dataset")',
+  },
+  {
+    name: "train_bootstrap",
+    since: "0.50.0",
+    replacement: 'train_doctor (action:"bootstrap")',
+    allowedIn: [
+      {
+        path: "src/services/ai-toolkit.ts",
+        context: 'bootstrap: "train_bootstrap",',
+        why: "NOT a tool reference — the frozen envelope/1 `command` LABEL for the native-toolkit bootstrap operation, a RETURN SHAPE slice 10 deliberately did not rename. See TRAINER_COMMAND's doc comment.",
+      },
+    ],
+  },
+  {
+    name: "train_build_image",
+    since: "0.50.0",
+    replacement: 'train_doctor (action:"build_image")',
+    allowedIn: [
+      {
+        path: "src/services/ai-toolkit.ts",
+        context: 'buildImage: "train_build_image",',
+        why: "NOT a tool reference — the frozen envelope/1 `command` LABEL for the image-build operation, a RETURN SHAPE slice 10 deliberately did not rename. See TRAINER_COMMAND's doc comment.",
+      },
+      {
+        path: "docs/blog/lora-trainer-p1.mdx",
+        context: "2. **`train_build_image`** — one-time, several minutes.",
+        why: "Same dated P1 announcement post — step 2 of the seven-tool walkthrough as that release shipped it. The post's <Note> maps it to train_doctor (action:\"build_image\").",
+      },
+      {
+        path: "docs/blog/train-lora-runpod.mdx",
+        context: "`train_doctor`, `train_build_image`, `train_prepare_dataset`, `train_start`,",
+        why: "Same seven-tool list in the dated sequel post; the other three names on this line survive the fold, so only this one needs the exemption.",
+      },
+    ],
+  },
+  // ── 0.50.0 slice 11: models ───────────────────────────────────────────────
+  // The fourteen model tools folded into two action-parameterized survivors:
+  // `download_model` (acquire) and `list_local_models` (inventory). Same
+  // services, same return shapes, same error paths — only the surface changed,
+  // so every mention of the eight retired names below is now rot pointing at a
+  // 404. APPENDED at the end of the array, not prepended: concurrent slices all
+  // edit this file and prepending makes every one of them collide on the same
+  // three lines.
+  {
+    name: "search_models",
+    since: "0.50.0",
+    replacement: 'download_model (action:"search")',
+    allowedIn: [
+      {
+        path: "docs/blog/comfyui-mcp-tdqs-case-study.mdx",
+        context: "`search_models`, and the rest of the",
+        why: "A DATED case study of a tool-description audit, naming the tools whose descriptions were rewritten AS THEY WERE NAMED when they were scored. Rewriting the name would falsify the record of what was measured — and the sentence is a past-tense result, not an instruction to call anything.",
+      },
+    ],
+  },
+  {
+    name: "download_status",
+    since: "0.50.0",
+    replacement: 'download_model (action:"status")',
+  },
+  {
+    name: "cancel_download",
+    since: "0.50.0",
+    replacement: 'download_model (action:"cancel")',
+  },
+  {
+    name: "search_civitai_models",
+    since: "0.50.0",
+    replacement: 'download_model (action:"search_civitai")',
+  },
+  {
+    name: "search_civitai_creators",
+    since: "0.50.0",
+    replacement: 'download_model (action:"search_creators")',
+  },
+  {
+    name: "download_civitai_model",
+    since: "0.50.0",
+    replacement: 'download_model (action:"download_civitai")',
+  },
+  {
+    name: "resolve_missing_models",
+    since: "0.50.0",
+    replacement: 'download_model (action:"resolve_missing")',
+  },
+  {
+    name: "remove_model",
+    since: "0.50.0",
+    // The one destructive action in the slice: it unlinks a model FILE, with no
+    // undo and no recycle bin. The replacement names the action explicitly so a
+    // stale caller is redirected to the exact enum value rather than guessing at
+    // `remove_path`, which edits a YAML config and deletes nothing.
+    replacement: 'list_local_models (action:"remove")',
+  },
+  {
+    name: "get_embeddings",
+    since: "0.50.0",
+    replacement: 'list_local_models (action:"embeddings")',
+  },
+  {
+    name: "list_extra_paths",
+    since: "0.50.0",
+    replacement: 'list_local_models (action:"list_paths")',
+  },
+  {
+    name: "add_extra_path",
+    since: "0.50.0",
+    replacement: 'list_local_models (action:"add_path")',
+  },
+  {
+    name: "remove_extra_path",
+    since: "0.50.0",
+    replacement: 'list_local_models (action:"remove_path")',
+  },
+  // 0.50.0 slice 14: the twenty workflow-authoring and workflow-library tools
+  // folded into four action-parameterized survivors — create_workflow (4),
+  // visualize_workflow (5), get_workflow (8) and save_workflow (3). Same
+  // composer/validator/converter/slicer/graph-query/lock services, same return
+  // shapes; only the surface changed, so every mention of the old names is now
+  // rot pointing at a 404.
+  {
+    name: "modify_workflow",
+    since: "0.50.0",
+    replacement: 'create_workflow (action:"modify")',
+  },
+  {
+    name: "validate_workflow",
+    since: "0.50.0",
+    replacement: 'create_workflow (action:"validate")',
+    allowedIn: [
+      {
+        path: "docs/using-tools.mdx",
+        context: "| `validate_workflow` | `create_workflow` with `action: \"validate\"` |",
+        why: "The old-name -> new-form migration table on the human-facing tools guide, the same row-per-retirement the get_workspace entry above documents. Readers watching the tool count fall read a consolidation as capability being REMOVED; the table exists to show the same behaviour under a new label, so the left column must spell the retired name. It is a mapping AWAY from the name, never an instruction to call it.",
+      },
+    ],
+  },
+  {
+    name: "get_node_info",
+    since: "0.50.0",
+    replacement: 'create_workflow (action:"node_info")',
+  },
+  {
+    name: "visualize_workflow_hierarchical",
+    since: "0.50.0",
+    replacement: 'visualize_workflow (action:"render_hierarchical")',
+  },
+  {
+    name: "mermaid_to_workflow",
+    since: "0.50.0",
+    replacement: 'visualize_workflow (action:"mermaid")',
+  },
+  {
+    name: "workflow_to_dsl",
+    since: "0.50.0",
+    replacement: 'visualize_workflow (action:"to_dsl")',
+  },
+  {
+    name: "dsl_to_workflow",
+    since: "0.50.0",
+    replacement: 'visualize_workflow (action:"from_dsl")',
+  },
+  {
+    name: "list_workflows",
+    since: "0.50.0",
+    replacement: 'get_workflow (action:"list")',
+    allowedIn: [
+      {
+        path: "docs/using-tools.mdx",
+        context: "| `list_workflows` | `get_workflow` with `action: \"list\"` |",
+        why: "The old-name -> new-form migration table on the human-facing tools guide, the same row-per-retirement the get_workspace entry above documents. Readers watching the tool count fall read a consolidation as capability being REMOVED; the table exists to show the same behaviour under a new label, so the left column must spell the retired name. It is a mapping AWAY from the name, never an instruction to call it.",
+      },
+    ],
+  },
+  {
+    name: "strip_workflow",
+    since: "0.50.0",
+    replacement: 'get_workflow (action:"strip")',
+  },
+  {
+    name: "slice_workflow",
+    since: "0.50.0",
+    replacement: 'get_workflow (action:"slice")',
+  },
+  {
+    name: "workflow_from_image",
+    since: "0.50.0",
+    replacement: 'get_workflow (action:"from_image")',
+  },
+  {
+    name: "analyze_workflow",
+    since: "0.50.0",
+    replacement: 'get_workflow (action:"analyze")',
+    allowedIn: [
+      {
+        path: "docs/using-tools.mdx",
+        context: "| `analyze_workflow` | `get_workflow` with `action: \"analyze\"` |",
+        why: "The old-name -> new-form migration table on the human-facing tools guide, the same row-per-retirement the get_workspace entry above documents. Readers watching the tool count fall read a consolidation as capability being REMOVED; the table exists to show the same behaviour under a new label, so the left column must spell the retired name. It is a mapping AWAY from the name, never an instruction to call it.",
+      },
+    ],
+  },
+  {
+    name: "query_workflow",
+    since: "0.50.0",
+    replacement: 'get_workflow (action:"query")',
+  },
+  {
+    name: "prompt_director_inspect",
+    since: "0.50.0",
+    replacement: 'get_workflow (action:"prompt_director")',
+  },
+  {
+    name: "lock_workflow",
+    since: "0.50.0",
+    replacement: 'save_workflow (action:"lock")',
+  },
+  {
+    name: "verify_workflow_lock",
+    since: "0.50.0",
+    replacement: 'save_workflow (action:"verify_lock")',
+  },
+  // ─────────────────────────────────────────────────────────────────────────
+  // 0.50.0 slice 12: the twenty custom-node tools folded into THREE
+  // action-parameterized tools — the pack LIFECYCLE into the surviving
+  // `install_custom_node` (9 actions), the public-registry DISCOVERY pair into
+  // the surviving `search_custom_nodes` (2 actions), and the AUTHOR loop into
+  // the new name `node_pack` (9 actions). Same node-management / registry-client
+  // / node-authoring / node-verify / node-dev services, same panel-pin redirects,
+  // same return shapes — only the surface changed, so every mention of a RETIRED
+  // name is now rot pointing at a 404. (`search_custom_nodes` is NOT retired: it
+  // survives as the discovery tool and absorbs get_node_pack_details.)
+  //
+  // Three tools rather than one grab-bag because the thirds have different blast
+  // radii, and the NAME is the unit that the call_tool whitelist and the ollama
+  // loop-breaker both reason about:
+  //   • install_custom_node runs third-party pack code and mutates what is
+  //     installed. See CALL_TOOL_ACTION_WHITELIST in
+  //     src/orchestrator/call-tool-admission.ts, which keeps it reachable from a
+  //     canvas-less client for exactly the two actions its retired standalone
+  //     entries covered (install + list) and leaves uninstall/update/reinstall/
+  //     fix unreachable.
+  //   • search_custom_nodes is read-only and network-only — no ComfyUI, no
+  //     COMFYUI_PATH. Never whitelisted before, so it is not whitelisted now.
+  //   • node_pack reads and WRITES your own source on disk and runs git in it.
+  //     Not whitelisted at all.
+  {
+    name: "update_custom_node",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"update")',
+  },
+  {
+    name: "reinstall_custom_node",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"reinstall")',
+  },
+  {
+    name: "fix_custom_node",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"fix")',
+  },
+  {
+    name: "uninstall_custom_node",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"uninstall")',
+  },
+  {
+    name: "enable_custom_node",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"enable")',
+  },
+  {
+    name: "disable_custom_node",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"disable")',
+  },
+  {
+    name: "list_installed_nodes",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"list")',
+  },
+  {
+    name: "sync_node_dependencies",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"sync_deps")',
+  },
+  {
+    name: "get_node_pack_details",
+    since: "0.50.0",
+    replacement: 'search_custom_nodes (action:"details")',
+  },
+  {
+    name: "scaffold_custom_node",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"scaffold")',
+  },
+  {
+    name: "verify_custom_node",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"verify")',
+  },
+  {
+    name: "publish_custom_node",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"publish")',
+  },
+  {
+    name: "list_node_pack_files",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"list_files")',
+  },
+  {
+    name: "read_node_file",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"read")',
+  },
+  {
+    name: "search_node_packs",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"search")',
+  },
+  {
+    name: "write_node_file",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"write")',
+  },
+  {
+    name: "apply_node_patch",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"patch")',
+  },
+  // node_pack_git's own `action` parameter is the one argument this whole
+  // consolidation could not preserve — it collided with the tool's dispatch
+  // field — so the replacement names BOTH levels, or a caller rewriting
+  // `node_pack_git(pack, action:"commit")` would silently produce
+  // `node_pack(action:"commit")`, which is not an action at all.
+  //
+  // The comment sits ABOVE the entry rather than inside it on purpose: a
+  // leading comment between `{` and `name:` hides the entry from every
+  // name-extracting scanner that anchors on `^  \{\n    name:` — including the
+  // ratchet verifier — so an entry that IS in the ledger reads as missing.
+  {
+    name: "node_pack_git",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"git", git_action:"status"|"diff"|"log"|"commit"|"push")',
+  },
+  // 0.50.0 slice 15: the twelve image/asset tools folded into TWO
+  // action-parameterized tools, both of them SURVIVORS keeping their
+  // registration slots — the READ/INSPECT half onto `get_image` (7 actions)
+  // and the WRITE half onto `upload_image` (5 actions). Same
+  // image-management / view-image / image-convert / color-analysis /
+  // asset-registry / storage-upload services, same arguments, same return
+  // shapes (inline image blocks, the markdown/json listings, the upload
+  // prose) — only the surface changed, so every mention of the old names is
+  // now rot pointing at a 404.
+  //
+  // Split by DIRECTION OF TRAVEL rather than into one twelve-action tool:
+  // everything on `get_image` reads (its one write is saving bytes it just
+  // fetched to the caller's own save_dir), while every action on
+  // `upload_image` puts a file somewhere — ComfyUI's input/ directory or a
+  // cloud bucket. The orchestrator's call_tool whitelist depends on that
+  // split: `get_image` was whitelisted (as was `list_output_images`) and is
+  // now ACTION-scoped to exactly those two actions — see
+  // CALL_TOOL_ACTION_WHITELIST in src/orchestrator/call-tool-admission.ts —
+  // while `upload_image` was never whitelisted and still is not.
+  {
+    name: "view_image",
+    since: "0.50.0",
+    replacement: 'get_image (action:"view")',
+    allowedIn: [
+      {
+        path: "docs/blog/blind-mode-privacy.mdx",
+        context: "but get_image and view_image fetched them straight from ComfyUI's /view anyway",
+        why: "A DATED post about the v0.42.0 Blind-mode fix, narrating the two tools that leaked pixels AT THAT TIME. Rewriting it to the folded form would make the sentence read 'get_image and get_image (action:\"view\")' — a false account of what the bug was, in a frontmatter description that is also a double-quoted YAML string the replacement's quotes would break.",
+      },
+      {
+        path: "docs/blog/blind-mode-privacy.mdx",
+        context: "(`get_image`, `view_image`) fetch bytes straight from ComfyUI's HTTP `/view`",
+        why: "Same post, body: the pair of tools the reporter proved were leaking. Same collapse into 'get_image, get_image' if rewritten.",
+      },
+      {
+        path: "docs/blog/blind-mode-privacy.mdx",
+        context: "`get_image`, then to `view_image`, then remember `convert_image` returns",
+        why: "Same post, listing the tools a whack-a-mole per-tool fix would have had to chase — the point being that the list is open-ended. It is an argument about the past, not an instruction to call anything.",
+      },
+    ],
+  },
+  {
+    name: "list_output_images",
+    since: "0.50.0",
+    replacement: 'get_image (action:"list_outputs")',
+  },
+  {
+    name: "convert_image",
+    since: "0.50.0",
+    replacement: 'get_image (action:"convert")',
+    allowedIn: [
+      {
+        path: "docs/blog/blind-mode-privacy.mdx",
+        context: "then remember `convert_image` returns",
+        why: "Same dated Blind-mode post as view_image above — the third name in the open-ended list of image-returning tools a per-tool fix would have had to chase, written in the past tense about v0.42.0.",
+      },
+    ],
+  },
+  {
+    name: "analyze_color",
+    since: "0.50.0",
+    replacement: 'get_image (action:"analyze_color")',
+    // The fold reused the retired TOOL name as its ACTION name, so the tool
+    // that implements it necessarily spells the bare token twice: as a member
+    // of get_image's action enum, and as the `case` label that dispatches it.
+    // Rule (c) licenses exactly that one structural form — a complete quoted
+    // literal whose whole content is the name — in these two files, and
+    // nothing else: a live `call analyze_color` sentence in either of them is
+    // still reported, which is why this is not a SELF entry.
+    implementedIn: ["src/tools/image-management.ts"],
+  },
+  {
+    name: "list_assets",
+    since: "0.50.0",
+    replacement: 'get_image (action:"list_assets")',
+    // Same collision as analyze_color above, same two structural forms, same
+    // two files. See that entry for why this is implementedIn and not SELF.
+    implementedIn: ["src/tools/image-management.ts"],
+  },
+  {
+    name: "get_asset_metadata",
+    since: "0.50.0",
+    replacement: 'get_image (action:"asset_metadata")',
+  },
+  {
+    name: "upload_video",
+    since: "0.50.0",
+    replacement: 'upload_image (action:"video")',
+  },
+  {
+    name: "upload_audio",
+    since: "0.50.0",
+    replacement: 'upload_image (action:"audio")',
+  },
+  {
+    name: "upload_output",
+    since: "0.50.0",
+    replacement: 'upload_image (action:"output")',
+  },
+  {
+    name: "stage_output_as_input",
+    since: "0.50.0",
+    replacement: 'upload_image (action:"stage")',
+  },
+  // ─────────────────────────────────────────────────────────────────────────
+  // 0.50.0 slice 16 (the FINAL slice): eighteen execution / generation /
+  // observability names folded into the THREE survivors models reach for first
+  // — `enqueue_workflow` (5 actions), `generate_image` (9) and `get_history`
+  // (4). Same workflow-executor / generate-* / tracker / history services, same
+  // arguments, same return shapes — only the surface changed, so every mention
+  // of the old names is now rot pointing at a 404.
+  //
+  // `enqueue_workflow` REMAINS A NAMED ENTRY POINT: its four satellite entry
+  // points fold INTO it and it is never itself subsumed. Its call_tool
+  // admission is ACTION-scoped to exactly ["enqueue"] — see
+  // CALL_TOOL_ACTION_WHITELIST in src/orchestrator/call-tool-admission.ts,
+  // where action:"run_url" (fetch a workflow from an ARBITRARY URL and execute
+  // it) must stay unreachable from a canvas-less client. `get_history` is ADDED
+  // to that whitelist, action-scoped to ["diagnose"], because the retired
+  // `diagnose_run` was whitelisted and the panel's "why did my render fail?"
+  // would otherwise break with a false refusal.
+  {
+    name: "rerun_generation",
+    since: "0.50.0",
+    replacement: 'enqueue_workflow (action:"rerun")',
+  },
+  {
+    name: "run_workflow_url",
+    since: "0.50.0",
+    replacement: 'enqueue_workflow (action:"run_url")',
+  },
+  {
+    name: "get_template_schema",
+    since: "0.50.0",
+    replacement: 'enqueue_workflow (action:"template_schema")',
+  },
+  {
+    name: "run_template",
+    since: "0.50.0",
+    replacement: 'enqueue_workflow (action:"run_template")',
+    implementedIn: [
+      "src/tools/workflow-execute.ts",
+      "src/__tests__/tools/workflow-execute.test.ts",
+    ],
+  },
+  {
+    name: "generate_audio",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"audio")',
+  },
+  {
+    name: "generate_video",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"video")',
+  },
+  {
+    name: "generate_3d",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"3d")',
+  },
+  {
+    name: "generate_with_controlnet",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"controlnet")',
+  },
+  {
+    name: "generate_with_ip_adapter",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"ip_adapter")',
+  },
+  // The highest-traffic retirement in the consolidation (19 live mentions), and
+  // the one whose name is ALSO an ordinary English verb. Most of the exemptions
+  // below are therefore NOT "history" in the usual sense — they are prose where
+  // "regenerate" is a verb about rebuilding a file or re-synthesising image
+  // detail, and has nothing to do with any tool. Rewriting correct prose to
+  // dodge a name collision is the failure mode the per-occurrence mechanism
+  // exists to prevent, so each one is listed, read, and reasoned about here.
+  {
+    name: "regenerate",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"regenerate")',
+    // The tool that answers for this name, and the two files that drive it under
+    // test — the only places a bare "regenerate" literal is the action vocabulary
+    // rather than a tool name.
+    implementedIn: [
+      "src/tools/generate-image.ts",
+      "src/__tests__/tools/generate-image.test.ts",
+    ],
+    allowedIn: [
+      {
+        path: "docs/blog/flatten-workflows.mdx",
+        context: "then regenerate a UI graph from it and",
+        why: "The ENGLISH VERB, in a dated post narrating an algorithm: rebuild a UI-format graph from an API-format one. Nothing to do with any tool. Rewriting published prose to dodge a name collision is exactly the 'fix' the per-occurrence mechanism exists to prevent.",
+      },
+      {
+        path: "docs/blog/flatten-workflows.mdx",
+        context: "regenerate positions wholesale, every group on the canvas becomes an empty box",
+        why: "Same post, same English verb — recomputing node POSITIONS, in the sentence that explains why litegraph groups break when you do.",
+      },
+      {
+        path: "docs/blog/video-upscale-comfyui.mdx",
+        context: "FlashVSR *regenerate* detail.",
+        why: "The English verb, and load-bearing technical vocabulary: a restorer model literally re-generates image detail rather than magnifying it. No synonym says this as precisely, and the post is dated.",
+      },
+      {
+        path: "docs/blog/video-upscale-comfyui.mdx",
+        context: "**Why downscale before upscaling?** Restorers regenerate detail.",
+        why: "Same post, same claim in the body copy.",
+      },
+      {
+        path: "plugin/skills/video-upscale/SKILL.md",
+        context: "(and FlashVSR) regenerate detail. Feeding them a small frame forces the model",
+        why: "The same technical claim in the bundled skill the post documents. Model-facing, but it is describing what an UPSCALER MODEL does to pixels — it is not an instruction to call a tool.",
+      },
+      {
+        path: "packs/z-image-base-inpaint/pack.yaml",
+        context: "an input image and regenerate only the masked area from a text prompt",
+        why: "The English verb in a pack DESCRIPTION of inpainting — regenerating the masked region is literally what the pack does. packs/*/workflow.json is path-exempt as data, but pack.yaml is prose, so this occurrence is exempted on its own.",
+      },
+    ],
+  },
+  {
+    name: "upscale_image",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"upscale")',
+    allowedIn: [
+      {
+        path: "src/__tests__/tools/generate-image.test.ts",
+        context: 'expect(schema.action.safeParse("upscale_image").success).toBe(false)',
+        why: "A deliberate NEGATIVE fixture: the action is `upscale`, so the RETIRED tool name must be rejected by the enum. `implementedIn` cannot license it — that rule only covers a name the fold reused AS an action, and this one it did not. The assertion is that nothing serves this name.",
+      },
+      {
+        path: "src/__tests__/tools/generate-image.test.ts",
+        context: 'const res = await handler({ action: "upscale_image" });',
+        why: "The same fixture one layer down: the unknown-action branch must reject it at runtime too, not merely at the schema. A call argument under test.",
+      },
+    ],
+  },
+  {
+    name: "remove_background",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"remove_background")',
+    implementedIn: [
+      "src/tools/generate-image.ts",
+      "src/__tests__/tools/generate-image.test.ts",
+    ],
+    allowedIn: [
+      {
+        path: "src/services/workflow-composer.ts",
+        context: "remove_background: (p) => buildRemoveBackground(",
+        why: "A create_workflow TEMPLATE KEY in the builder registry, not a tool name. It happens to be spelled the same because both name the same operation. Renaming it would change a service (the key is part of create_workflow's public template enum), which a pure surface consolidation must not do.",
+      },
+      {
+        path: "src/services/remove-background.ts",
+        context: 'const workflow = createWorkflow("remove_background", {',
+        why: "The call site of that same template key — the service asking the composer for the cutout graph.",
+      },
+      {
+        path: "docs/tools/workflow-authoring.mdx",
+        context: "ace_step_15, stable_audio_3, remove_background, ltx_video). Pure local generation",
+        why: "GENERATED from create_workflow's description, which lists the template keys above. Fixing it at the source would mean renaming the template.",
+      },
+      {
+        path: "docs/tools/workflow-authoring.mdx",
+        context: "`stable_audio_3`, `remove_background`, `ltx_video`.",
+        why: "Generated from the same template enum, rendered as the parameter's option list.",
+      },
+    ],
+  },
+  {
+    name: "generation_stats",
+    since: "0.50.0",
+    replacement: 'get_history (action:"stats")',
+  },
+  {
+    name: "suggest_settings",
+    since: "0.50.0",
+    replacement: 'get_history (action:"suggest")',
+  },
+  {
+    name: "diagnose_run",
+    since: "0.50.0",
+    replacement: 'get_history (action:"diagnose")',
   },
 ];
 

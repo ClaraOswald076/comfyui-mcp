@@ -12,7 +12,7 @@
         ]
       },
       {
-        "matcher": "mcp__plugin_comfy_comfyui__(stop|restart)_comfyui",
+        "matcher": "mcp__plugin_comfy_comfyui__restart_comfyui",
         "hooks": [
           {
             "type": "command",

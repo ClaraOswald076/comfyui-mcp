@@ -243,6 +243,11 @@ export async function primePanelBase(
   // to a wrong-tree mutation reported as success.
   const atTarget = targetKey();
   const atGeneration = targetGeneration();
+  // The cache entry as the probe STARTS. A probe that lands after another
+  // writer refreshed (or deliberately seeded) the cache must not overwrite
+  // that newer entry with its older answer — the in-flight `void
+  // primePanelBase()` a refusal fires in the background did exactly that to a
+  // base seeded after it started (#879 test isolation surfaced it).
   const cacheAtStart = cached;
 
   let resolution: PanelBaseResolution;
@@ -269,13 +274,21 @@ export async function primePanelBase(
     return { source: "none" };
   }
 
-  // A NEWER cache write landed while we were asking (a later prime settled, or
-  // a deliberate seed). Same rule as the retarget guard above: a probe that
-  // STARTED earlier holds older information, so it must not clobber the newer
-  // write — the fire-and-forget prime a capability refusal kicks off (see
+  // A NEWER cache write landed while we were asking (a later prime settled, a
+  // test seed, a cache reset). Same rule as the retarget guard above: a probe
+  // that STARTED earlier holds older information, so it must not clobber the
+  // newer write — the fire-and-forget prime a capability refusal kicks off (see
   // resolveStaleBundleSkew) can settle seconds later, mid-way through someone
-  // else's operation. Serve the newer cache when it is still fresh; fall back
-  // to this probe's answer (without caching it) when it has already expired.
+  // else's operation.
+  //
+  // MERGE NOTE (#884 branch × main): both sides fixed this independently and
+  // agreed the newer write must win in the CACHE. They differed on what the
+  // caller gets back — main returned this probe's older answer, this branch
+  // serves the newer cached one. Kept the branch's shape because the other
+  // leaves the caller holding a value the cache has already superseded, which
+  // is the same "two sources of truth" split the guard exists to close. The
+  // expiry fallback preserves main's behavior exactly when the newer entry has
+  // already aged out.
   if (cached !== cacheAtStart) {
     return cachedResolution() ?? resolution;
   }

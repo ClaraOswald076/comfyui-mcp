@@ -14,7 +14,7 @@ import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { extname, resolve, sep } from "node:path";
 
 /** Captioning reads staged TRAINING images, not phone-bound display thumbs —
- *  the 2MB train_file cap is a display budget, not a property of the data
+ *  the 2MB action:"file" cap is a display budget, not a property of the data
  *  (codex finding: a valid 8MP training PNG must still caption). 10MB keeps
  *  the vision context sane without rejecting real sets. Contained + image-only
  *  like readTrainingFile. */

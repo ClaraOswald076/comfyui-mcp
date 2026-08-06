@@ -70,8 +70,8 @@ interface ProcessInfo {
    * report its own (#767).
    *
    * A ComfyUI wedged by a CUDA OOM stops answering `/system_stats`, so `argv` comes
-   * back empty — and with it went every way to relaunch: `stop_comfyui` killed the
-   * process anyway, announced `has_restart_info: true`, and `start_comfyui` then had
+   * back empty — and with it went every way to relaunch: `restart_comfyui (action:"stop")` killed the
+   * process anyway, announced `has_restart_info: true`, and `restart_comfyui (action:"start")` then had
    * nothing to start. The OS knew the whole command line the entire time. The user's
    * own recovery was to read it out of the process table by hand.
    *
@@ -180,7 +180,7 @@ interface StopResult {
   stopped: boolean;
   message: string;
   /**
-   * Can `start_comfyui` actually bring this back?
+   * Can `restart_comfyui (action:"start")` actually bring this back?
    *
    * It used to mean "we stored a ProcessInfo", which was true even when that info
    * held nothing runnable — so a stop reported `true` and the start that followed
@@ -1069,7 +1069,7 @@ function spawnFromProcessInfo(info: ProcessInfo): SpawnedComfyUI | null {
   if (!cmd) return null;
   // #776: the relaunch ENVIRONMENT is as load-bearing as the relaunch command.
   // Resolve it here too (not only in assessRelaunch) so EVERY spawn site — the
-  // restart relaunch, a bare start_comfyui, and the crash supervisor — launches
+  // restart relaunch, a bare restart_comfyui (action:"start"), and the crash supervisor — launches
   // into the SAME environment the preflight approved.
   //
   // This site never REFUSES: reaching it means nothing is listening on the port,
@@ -2267,7 +2267,7 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
 export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
   if (isRemoteMode()) {
     throw new ProcessControlError(
-      "stop_comfyui operates on the local machine's ComfyUI process and is not " +
+      "restart_comfyui (action:\"stop\") operates on the local machine's ComfyUI process and is not " +
         "available when targeting a remote instance via --comfyui-url.",
     );
   }
@@ -2278,11 +2278,11 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
   //
   // The generation is captured BEFORE the resolve so a retarget landing inside that
   // await is caught (codex gate round 12). `restartComfyUI` fences its own window
-  // and hands us pre-validated info; a DIRECT `stop_comfyui` had no fence at all,
-  // and its saved launch record does not repair the loss: `start_comfyui` afterwards
+  // and hands us pre-validated info; a DIRECT `restart_comfyui (action:"stop")` had no fence at all,
+  // and its saved launch record does not repair the loss: `restart_comfyui (action:"start")` afterwards
   // consults the NEW live target, so it can refuse as remote or find that port
   // occupied rather than relaunch what was killed. That falsifies this tool's whole
-  // contract — "captures process info so it can be restarted with start_comfyui".
+  // contract — "captures process info so it can be restarted with restart_comfyui (action:\"start\")".
   const stopGeneration = getComfyuiTargetGeneration();
   let info = preInfo ?? null;
   let acquireDiagnostic: string | undefined;
@@ -2323,7 +2323,7 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
       message:
         "Refusing to stop: the ComfyUI target changed while the running instance was being " +
         "identified, so the instance resolved here is not provably the one this server is now " +
-        "configured for — and start_comfyui afterwards would consult the NEW target, which may " +
+        "configured for — and restart_comfyui (action:\"start\") afterwards would consult the NEW target, which may " +
         "not bring this one back. Nothing was killed. Let the target settle, then retry." +
         describeRecovery(retargetHint),
       has_restart_info: false,
@@ -2337,7 +2337,7 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
       stopped: false,
       message:
         `Refusing to stop: ${identity.reason}. Nothing was killed. ` +
-        "Re-run once ComfyUI is running again (or start it with start_comfyui).",
+        "Re-run once ComfyUI is running again (or start it with restart_comfyui (action:\"start\")).",
       has_restart_info: false,
     };
   }
@@ -2354,19 +2354,19 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
   // The stop used to report `has_restart_info: true` on the strength of having
   // stored a ProcessInfo — which is true even when that info holds nothing runnable.
   // A user recovering a wedged server was told the restart information was there,
-  // and `start_comfyui` then answered "No command-line info captured from previous
+  // and `restart_comfyui (action:"start")` then answered "No command-line info captured from previous
   // run". By then the server was gone.
   //
   // A REFUSAL is reserved for the genuinely unrecoverable case: no launch command
   // from the server, none from the OS, nothing to tell the user to run. Then the stop
   // is a one-way door and it is not ours to walk through. When a command WAS observed
-  // the stop proceeds — `stop_comfyui` is an explicit instruction to stop, and a
+  // the stop proceeds — `restart_comfyui (action:"stop")` is an explicit instruction to stop, and a
   // wedged server is precisely when someone means it — but `has_restart_info` states
   // whether we can do the starting, and the hint says how to do it by hand.
   //
   // `requireReproducibleEnv` is deliberately NOT set here, and the distinction is the
   // point: this flag answers "is there a command to run?", which is what #767 was
-  // about and what start_comfyui needs to exist at all. An irreproducible launcher
+  // about and what restart_comfyui (action:"start") needs to exist at all. An irreproducible launcher
   // environment is a different, weaker fact — the spawn still happens, it may simply
   // fail during import — and it is reported as its own caveat below rather than
   // collapsed into "there is no restart information", which would say something
@@ -2397,7 +2397,7 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
 
   // Remember HOW to relaunch before doing anything irreversible. Saving this only
   // after a committed stop meant that any later refusal — including one taken while
-  // the server may already be dead — left `start_comfyui` with no launch info to
+  // the server may already be dead — left `restart_comfyui (action:"start")` with no launch info to
   // recover from (codex gate). It is only a record of what we observed; a start
   // still re-validates and refuses to double-launch onto an occupied port.
   lastProcessInfo = info;
@@ -2523,15 +2523,15 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
       `ComfyUI (PID ${info.pid}) stopped on port ${info.port}` +
       (unverified ? ` — NOTE: ${unverified}; continuing so the server can be brought back.` : "") +
       // Said PLAINLY and up front, not left to a boolean the caller may not read:
-      // start_comfyui will not be able to do this, so the human has to.
+      // restart_comfyui (action:"start") will not be able to do this, so the human has to.
       (relaunch.ok
         ? // A command exists, but the environment it was launched into may not be
           // reproducible — a weaker claim, stated as one.
           envPlan && !envPlan.reproducible
-          ? ` NOTE: ${envPlan.reason ?? envPlan.info.note} start_comfyui will still try, but the relaunch may fail during import.` +
+          ? ` NOTE: ${envPlan.reason ?? envPlan.info.note} restart_comfyui (action:"start") will still try, but the relaunch may fail during import.` +
             describeRecovery(hint)
           : ""
-        : ` WARNING: start_comfyui will NOT be able to bring this back — ${relaunch.reason}` +
+        : ` WARNING: restart_comfyui (action:"start") will NOT be able to bring this back — ${relaunch.reason}` +
           describeRecovery(hint)),
     // The one claim #767 was about: it now means a relaunch command was built AND
     // validated, not merely that some process info was stored.
@@ -2553,14 +2553,14 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
  * if that port was occupied it returned "already running" WITHOUT spawning, and the
  * instance we had just killed stayed dead. Anchoring the port and the readiness URL
  * to the values captured before the stop makes the whole sequence act on one
- * instance. A direct `start_comfyui` passes nothing and reads the live config, which
+ * instance. A direct `restart_comfyui (action:"start")` passes nothing and reads the live config, which
  * is right for it — there is no earlier moment it is bound to.
  */
 export async function startComfyUI(anchor?: {
   port?: number;
   probeUrl?: string;
 }): Promise<StartResult> {
-  // The refusal is for a DIRECT `start_comfyui`, which has no instance in mind
+  // The refusal is for a DIRECT `restart_comfyui (action:"start")`, which has no instance in mind
   // and would otherwise launch a local server while the caller is looking at a
   // remote one. An ANCHORED call is a different question: a restart already
   // stopped a specific local instance and is putting it back. Refusing there
@@ -2570,7 +2570,7 @@ export async function startComfyUI(anchor?: {
   // relaunch, not a fresh launch.
   if (isRemoteMode() && !anchor) {
     throw new ProcessControlError(
-      "start_comfyui launches ComfyUI on the local machine and is not " +
+      "restart_comfyui (action:\"start\") launches ComfyUI on the local machine and is not " +
         "available when targeting a remote instance via --comfyui-url.",
     );
   }
@@ -2681,7 +2681,7 @@ export async function startComfyUI(anchor?: {
   }
 
   // A NEW server instance is coming up on this port — whatever Manager dialect we
-  // classified belonged to whatever ran here before (start_comfyui is also
+  // classified belonged to whatever ran here before (restart_comfyui (action:"start") is also
   // reachable without a preceding stopComfyUI, e.g. after an external kill or a
   // Manager upgrade), so re-probe rather than trust it (#646).
   resetManagerApiCache("comfyui started");
@@ -3640,7 +3640,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
             `502/503/504 from a proxy counts as not-ready here, and something may ` +
             `well be listening. The relaunch also failed in a way this call could ` +
             `not interpret. Treat this as one observation, not a settled fact. ` +
-            `Check the server, and use start_comfyui once the cause is cleared.`) +
+            `Check the server, and use restart_comfyui (action:"start") once the cause is cleared.`) +
         stopCaveat,
       listener_ownership: unclassifiedOwnership(),
     };

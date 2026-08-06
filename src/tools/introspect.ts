@@ -34,7 +34,24 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { registerAllTools } from "./index.js";
+import { registerAllTools, registerFullTools } from "./index.js";
+
+/**
+ * Which registration pass to introspect.
+ *
+ * `"registration"` — `registerAllTools()`: the surface the vocabulary ledger
+ * describes, one entry per `TOOL_NAMES` name. This is what the ledger gate compares
+ * against.
+ *
+ * `"served"` — `registerFullTools()`: what a full-mode client is actually OFFERED,
+ * which is the ledger surface PLUS the three facade meta-tools layered on top for
+ * reconnect resilience (#616). The two counts differ by exactly 3, and that gap is
+ * real rather than cosmetic — a client's `tools/list` returns `MAX_TOOLS + 3`, so any
+ * consumer that expects the ledger count off the wire is off by three. Kept as an
+ * explicit mode rather than a second copy of this function so the pagination and
+ * cleanup below stay in one place.
+ */
+export type ToolSurface = "registration" | "served";
 
 export interface RegisteredTool {
   name: string;
@@ -51,9 +68,12 @@ export interface RegisteredTool {
  * Follows `nextCursor` to completion: `tools/list` is a paginated request, and a
  * single-page assumption would silently under-report once the surface grows.
  */
-export async function listRegisteredTools(): Promise<RegisteredTool[]> {
+export async function listRegisteredTools(
+  surface: ToolSurface = "registration",
+): Promise<RegisteredTool[]> {
   const server = new McpServer({ name: "comfyui-mcp-introspect", version: "0.0.0" });
-  await registerAllTools(server);
+  if (surface === "served") await registerFullTools(server);
+  else await registerAllTools(server);
 
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "comfyui-mcp-introspect", version: "0.0.0" });
@@ -103,6 +123,6 @@ export async function listRegisteredTools(): Promise<RegisteredTool[]> {
 }
 
 /** Just the names, in registration order (which `tools/list` preserves). */
-export async function listRegisteredToolNames(): Promise<string[]> {
-  return (await listRegisteredTools()).map((t) => t.name);
+export async function listRegisteredToolNames(surface: ToolSurface = "registration"): Promise<string[]> {
+  return (await listRegisteredTools(surface)).map((t) => t.name);
 }

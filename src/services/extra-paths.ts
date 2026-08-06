@@ -241,7 +241,7 @@ function desktopConfigPath(): string {
 /**
  * The local ComfyUI root whose `extra_model_paths.yaml` a standalone/manual install
  * uses. Delegates to `resolveEffectiveComfyUIBase()` — the SINGLE source of truth every
- * other filesystem-backed tool (download_model, model lookups, verify_custom_node,
+ * other filesystem-backed tool (download_model, model lookups, node_pack (action:"verify"),
  * get_environment) already uses — so this file can never disagree with them about where
  * ComfyUI lives. That order is:
  *
@@ -249,7 +249,7 @@ function desktopConfigPath(): string {
  *   2. the SAVED DEFAULT WORKSPACE (workspace action:"set_default"), local mode only.
  *
  * Before #648 this read `config.comfyuiPath` DIRECTLY, so with COMFYUI_PATH unset
- * `list_extra_paths` threw while `workspace`/`get_environment` happily reported the
+ * `list_local_models action:"list_paths"` threw while `workspace`/`get_environment` happily reported the
  * saved default workspace — the same install, two different answers.
  *
  * Throws (never guesses) when neither is available, including when the session is not
@@ -267,7 +267,7 @@ function desktopConfigPath(): string {
  * STALE-ROOT GUARD (codex rounds 2-3, P1): an INFERRED root — a saved default workspace
  * persisted once and maybe never revisited, or a startup AUTO-DETECTION that has since
  * gone away — has to prove the directory is still THERE before it can be used. Without
- * that check `add_extra_path` would resolve to `<gone root>/extra_model_paths.yaml`,
+ * that check `list_local_models action:"add_path"` would resolve to `<gone root>/extra_model_paths.yaml`,
  * `writeConfigFile`'s recursive `mkdir` would MATERIALIZE the whole vanished tree, and
  * the tool would report "Added … Restart ComfyUI" for a file no ComfyUI will ever read —
  * a silent wrong-destination write. A missing/non-directory inferred root is therefore
@@ -752,7 +752,7 @@ function implicitLiveTarget(
  * argv) when the caller didn't pin an explicit target/config_path. On ComfyUI
  * Desktop the live file is `…\Comfy Desktop\shared_model_paths.yaml`, NOT the
  * app-data `ComfyUI\extra_models_config.yaml` the static heuristic guesses — so
- * without this, list_extra_paths reports fiction and add_extra_path is a silent
+ * without this, list_local_models action:"list_paths" reports fiction and list_local_models action:"add_path" is a silent
  * no-op against a file the server never reads (issue #345). Returns the resolved
  * target plus any warning notes to surface. Best-effort: falls back to the
  * static resolveTargetPath when the server is unreachable.
@@ -774,7 +774,7 @@ function implicitLiveTarget(
  * `--extra-model-paths-config` with no reported cwd, or an argv with no `main.py` — the
  * answer is normally an explicit UNRESOLVED, never a quiet fall-through to the local
  * heuristic: a mutation would otherwise report success for a file the running server may
- * not read. `list_extra_paths` is deliberately narrower: when the connected target is
+ * not read. `list_local_models action:"list_paths"` is deliberately narrower: when the connected target is
  * already classified LOCAL but its argv simply omits main.py, it may show the known local
  * auto target with an explicit non-authoritative note (#764). Mutations keep refusing that
  * state, so the fallback cannot fabricate a successful edit. `target`/`config_path` remain

@@ -1,6 +1,6 @@
 ---
 title: "Claude Code Plugin"
-description: "comfyui-mcp is a full Claude Code plugin: 37 AI skills, 11 slash commands, 4 autonomous agents, and 3 hooks on top of the 154 MCP tools — expert ComfyUI knowledge that grows with every release."
+description: "comfyui-mcp is a full Claude Code plugin: 37 AI skills, 11 slash commands, 4 autonomous agents, and 3 hooks on top of the 45 MCP tools — expert ComfyUI knowledge that grows with every release."
 icon: "puzzle-piece"
 ---
 
@@ -38,7 +38,7 @@ and failure-mode guidance:
 | `panel-node-pack-sync` | Keep the sidebar panel node-pack in step with the orchestrator after an update — version-mismatch detection, a version pin that is warned about rather than overridden, and a sync whose result is re-read from disk |
 | `model-compatibility` | Which VAE/CLIP/text-encoder pairs with which architecture — the #1 source of broken workflows |
 | `model-registry` | Curated download URLs + target dirs for every model the skills reference — grows each release |
-| `civitai` | Native Civitai discovery → local download/wire/generate loop via built-in `search_civitai_models` (no key, no extra server); the official [Civitai MCP](https://mcp.civitai.com/mcp) is an optional community-surface add-on, not bundled |
+| `civitai` | Native Civitai discovery → local download/wire/generate loop via built-in `download_model` `action:"search_civitai"` (no key, no extra server); the official [Civitai MCP](https://mcp.civitai.com/mcp) is an optional community-surface add-on, not bundled |
 | `comfyui-core` | Queue, history, and API semantics |
 | `comfyui-node-registry` | Authoring + publishing custom node packs to the Comfy Registry |
 | `comfyui-frontend-extensions` | v1/v2 frontend extension authoring (sidebar tabs, widgets) |
@@ -48,7 +48,7 @@ and failure-mode guidance:
 | `comfyui-launch-flags` | The VRAM/attention/cache/perf launch-flag matrix — `--reserve-vram`, `--novram`+`--cache-none`, `--use-sage-attention` vs `--use-pytorch-cross-attention` (Z-Image), plus Blackwell/RTX 5000 accel-stack notes |
 
 New skills land with each release — generated from popular registry packs via
-the built-in `generate_node_skill` tool, then human-curated.
+the built-in `list_packs` tool (`action: "generate_skill"`), then human-curated.
 
 **Try the knowledge before wiring anything up** — every skill is a plain
 markdown file, useful on its own. The most broadly applicable one is
@@ -57,14 +57,15 @@ markdown file, useful on its own. The most broadly applicable one is
 strategy (why Flux wants natural language and no negative prompt while SD1.5
 wants tags). Read it in the browser, or paste it into any agent's context as a
 system prompt — no ComfyUI, MCP, or install required. When you do connect the
-full plugin, agents load the same files automatically (`read_skill`).
+full plugin, agents load the same files automatically (`list_packs` with
+`action: "skill_read"`).
 
 ### Civitai search — built in
 
-`search_civitai_models` searches Civitai natively (public REST API, no key, no
+`download_model` `action:"search_civitai"` searches Civitai natively (public REST API, no key, no
 extra server): keyword + `types` + `base_models` filters ("a **Flux** LoRA"),
 SFW-only by default, and every hit returns the `model_version_id` that
-`download_civitai_model` takes directly — plus the model's **trigger words**
+`action:"download_civitai"` takes directly — plus the model's **trigger words**
 for the prompt. Because it's a first-class tool it works on **every backend**,
 including small local models behind the compact router. The `civitai` skill
 teaches the full discovery → download → generate handoff.

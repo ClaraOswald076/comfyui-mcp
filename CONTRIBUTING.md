@@ -23,7 +23,7 @@ npm test           # vitest
 - **`npm run lint`** — type-check only (`tsc --noEmit`).
 - **`npm test`** / **`npm run test:watch`** — the vitest suite.
 - **`npm run dev`** — run the server from source via `tsx`.
-- **`npm run docs:gen`** — regenerate the docs tool reference from the live schemas (see [Docs](#documentation)).
+- **`npm run docs:gen`** — rebuild the docs tool reference from the live schemas (see [Docs](#documentation)).
 
 > **pnpm users:** pnpm 10 blocks dependency build scripts unless allow-listed. The native deps are
 > already declared in `package.json` `pnpm.onlyBuiltDependencies` (`better-sqlite3`, `sharp`); if you
@@ -130,7 +130,7 @@ npm run release:major  # major
 ```
 
 Each script runs `npm version <bump>` (creating the commit + tag) and `git push --follow-tags`.
-Update `CHANGELOG.md` (Keep a Changelog) and regenerate docs before tagging.
+Update `CHANGELOG.md` (Keep a Changelog) and rebuild the docs before tagging.
 
 ## Questions
 

@@ -63,12 +63,12 @@ function runIdentityPreamble(ev: { prompt_id?: string; run_correlation?: string 
     case "foreign":
       return (
         `This run (prompt ${pid}) does NOT match any run you queued with panel_run — its origin is UNDETERMINED. ` +
-        `Do NOT treat it as the render you are waiting on; if you are still waiting on your own run, verify it with get_history before acting. `
+        `Do NOT treat it as the render you are waiting on; if you are still waiting on your own run, verify it with get_history (action:"list") before acting. `
       );
     case "unidentified":
       return (
         `The panel reported NO prompt id for this run, so it CANNOT be correlated to the render you queued — its origin is UNDETERMINED. ` +
-        `Do NOT assume it is your run; verify yours with get_history before acting on it. `
+        `Do NOT assume it is your run; verify yours with get_history (action:"list") before acting on it. `
       );
     default:
       return pid ? `(prompt ${pid}) ` : ``;
@@ -670,13 +670,13 @@ export class PanelAgent {
         // An eviction dropped older completions for this tab — say so rather than
         // let them disappear (#468). The agent must treat those runs as unknown.
         (typeof ev.dropped_completions === "number" && ev.dropped_completions > 0
-          ? `⚠️ ${ev.dropped_completions} EARLIER completion(s) for this tab could not be delivered and were dropped — treat the outcome of those runs as UNDETERMINED and check get_history if you were waiting on one. `
+          ? `⚠️ ${ev.dropped_completions} EARLIER completion(s) for this tab could not be delivered and were dropped — treat the outcome of those runs as UNDETERMINED and check get_history (action:"list") if you were waiting on one. `
           : ``) +
         // An id-less completion whose content matches one already reported. We
         // will NOT swallow it (identical content is not proof of identity, and a
         // swallowed render is a silent loss), so hand the judgement to the agent.
         (ev.possible_repeat
-          ? `⚠️ POSSIBLE REPEAT: a completion with identical outputs was already reported to you recently, and this one carries no prompt id to tell them apart. It may be the same event re-sent, or a second render that produced identical filenames — do NOT count it twice without checking (get_history). `
+          ? `⚠️ POSSIBLE REPEAT: a completion with identical outputs was already reported to you recently, and this one carries no prompt id to tell them apart. It may be the same event re-sent, or a second render that produced identical filenames — do NOT count it twice without checking with get_history (action:"list"). `
           : ``) +
         runIdentityPreamble(ev) +
         (note
@@ -745,7 +745,7 @@ export class PanelAgent {
     } else if (ev.kind === "download_done") {
       // A model download the agent kicked off (download_model / apply_manifest)
       // just settled. Mirror the render-finished path so the agent is WOKEN with
-      // the result instead of having to poll download_status in sleep loops
+      // the result instead of having to poll download_model action:"status" in sleep loops
       // (#547). NON-urgent: queued like `executed`, not front-inserted — a landed
       // download never interrupts a live turn. Coalesced upstream (one event per
       // batch of settled downloads for this tab), so a multi-file pack install
@@ -759,7 +759,7 @@ export class PanelAgent {
       // check against the connected ComfyUI does. Saying "finished" here would be a
       // bare success claim during that window (#369) — a model can land in an
       // install the running server never reads — so the wording says only what the
-      // event actually proves and points at download_status for the verdict.
+      // event actually proves and points at download_model action:"status" for the verdict.
       if (done.length) parts.push(`transfer completed: ${done.join(", ")}`);
       if (failed.length) parts.push(`FAILED: ${failed.join(", ")}`);
       const plural = dl.length > 1 ? "these downloads" : "it";
@@ -767,8 +767,8 @@ export class PanelAgent {
         `[panel event] Model download ${parts.join("; ")}. ` +
         `The bytes finished transferring; whether the connected ComfyUI can actually LOAD ` +
         `${plural} is confirmed separately. If you were waiting on ${plural} to continue a task, ` +
-        `call download_status FIRST for the verified path and placement verdict${failed.length ? " or the error detail" : ""} — ` +
-        `do not tell the user a model is ready until download_status confirms it. ` +
+        `call download_model action:"status" FIRST for the verified path and placement verdict${failed.length ? " or the error detail" : ""} — ` +
+        `do not tell the user a model is ready until download_model action:"status" confirms it. ` +
         `Otherwise reply with ONE short sentence acknowledging it and no tool calls.`;
     }
     if (!text) return false;

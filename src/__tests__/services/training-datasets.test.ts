@@ -79,7 +79,7 @@ describe("listDatasets / getDataset", () => {
   });
 });
 
-describe("readTrainingFile (train_file)", () => {
+describe('readTrainingFile (train_prepare_dataset action:"file")', () => {
   it("inlines an image under the training root with its mime type", () => {
     const f = readTrainingFile(join(root, "datasets", "alpha", "img_00001.png"));
     expect(f.mimeType).toBe("image/png");

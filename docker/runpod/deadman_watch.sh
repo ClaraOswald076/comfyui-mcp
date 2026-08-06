@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # comfyui-mcp dead-man watchdog (pod side) — #269.
 # =============================================================================
-# Pods created via runpod_pod_create carry this loop + the heartbeat server
+# Pods created via the runpod tool's create action carry this loop + the heartbeat server
 # (deadman_server.py). While comfyui-mcp minds the pod it heartbeats every
 # poll; if the beats STOP (orchestrator crash, laptop closed, network gone),
 # the in-process idle auto-stop is gone too — so this loop stops the pod

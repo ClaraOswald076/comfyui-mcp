@@ -317,7 +317,7 @@ RUN chmod +x /post_start.sh
 
 # Dead-man switch (#269) — heartbeat server + self-stop watchdog, launched by
 # post_start.sh only when the pod env carries RUNPOD_API_KEY + DEADMAN_TOKEN
-# (i.e. pods created via runpod_pod_create). See deadman_watch.sh's header.
+# (i.e. pods created via the runpod tool's create action). See deadman_watch.sh's header.
 COPY deadman_server.py deadman_watch.sh /opt/comfyui-mcp-deadman/
 RUN chmod +x /opt/comfyui-mcp-deadman/deadman_watch.sh
 

@@ -327,7 +327,7 @@ export async function beatDeadman(pod: { id: string; name: string | null }): Pro
 // The referral in runpodDeployLink() attaches a NEW signup to our account; once
 // a user is a referred signup, EVERY pod they create — API or console — credits
 // us. So a user with a RunPod account + API key can one-tap deploy our template
-// here, while runpod_deploy_link onboards brand-new users. GPU availability is
+// here, while runpod action:"deploy_link" onboards brand-new users. GPU availability is
 // spotty on-demand, so createPod tries a list of GPU types in order until one
 // deploys (all 24GB+, enough for krea2 etc.).
 
@@ -517,7 +517,7 @@ async function reconcileCreatedPod(
  *  GPU type, then SECURE (reliable, pricier) — the first slot with capacity wins,
  *  so one-tap deploy survives community supply constraints. Throws a descriptive
  *  error listing what RunPod rejected if nothing is available. The returned pod
- *  is fresh (runtime null — still booting; follow with getPod/runpod_pod_connect).
+ *  is fresh (runtime null — still booting; follow with getPod / runpod action:"connect").
  *
  *  BILLING SAFETY: podFindAndDeployOnDemand is a non-idempotent, BILLED mutation.
  *  We only move on to the next cloud/GPU slot when RunPod EXPLICITLY rejected the
@@ -582,13 +582,13 @@ export async function createPod(opts: RunpodCreateOptions = {}): Promise<RunpodP
               `this one, so which pod belongs to this call can't be determined. NOT retrying and ` +
               `NOT claiming any of them automatically (a wrong guess could auto-stop someone else's ` +
               `pod or leak a billable one). Reconcile manually at console.runpod.io (or ` +
-              `runpod_pod_status).` + suffix,
+              `runpod action:"status").` + suffix,
           );
         }
         throw new Error(
           `RunPod pod creation failed on ${cloudType}/${gpuTypeId} and it could not be confirmed ` +
             `whether a pod was created (${msg}). NOT retrying automatically — a retry could create ` +
-            `a second billable pod. Check your pods at console.runpod.io (or runpod_pod_status) ` +
+            `a second billable pod. Check your pods at console.runpod.io (or runpod action:"status") ` +
             `before trying again.` + suffix,
         );
       }
@@ -598,6 +598,6 @@ export async function createPod(opts: RunpodCreateOptions = {}): Promise<RunpodP
     `Could not deploy a pod on any of [${gpuTypeIds.join(", ")}] in ${cloudTypes.join("/")}. RunPod reported:\n` +
       attempts.map((a) => `  • ${a}`).join("\n") +
       `\nTry again shortly (capacity fluctuates), set RUNPOD_GPU_TYPES to other GPUs, ` +
-      `or deploy from the console with runpod_deploy_link.`,
+      `or deploy from the console with runpod action:"deploy_link".`,
   );
 }

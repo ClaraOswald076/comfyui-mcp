@@ -7,16 +7,22 @@ import { join, resolve } from "node:path";
 //
 //   (a) #346 — a server with --base-directory != COMFYUI_PATH roots the download
 //       at the SERVER's models dir (where the running ComfyUI actually reads).
-//   (b) #633 — a symlinked target_subfolder resolving into a LIVE, authoritatively
-//       registered extra_model_path is ALLOWED (that's where ComfyUI reads).
-//   (c) path-safety — the symlink allowance never becomes an arbitrary-write /
-//       write-into-code-dir (RCE) hole. Covers the codex + independent-codex P0s:
+//   (b) #633/#870 — a symlink/junction INSIDE the models tree may redirect the
+//       write: into a live-registered extra root (#633), or anywhere else the
+//       code-root veto does not cover (#870 — the StabilityMatrix layout, where
+//       junctioned category folders ARE the registration mechanism and no config
+//       can vouch for their targets; ComfyUI's scanner follows the links).
+//   (c) path-safety — the symlink allowance never becomes a write-into-code-dir
+//       (RCE) hole, and a broken link is never silently followed. Covers:
 //         P0a  dangling / uncanonicalizable symlink -> REFUSED (not skipped).
 //         P0b  primary models root that resolves into custom_nodes -> REFUSED.
 //         P0c  (TOCTOU — inherent to pathname checks in Node; not asserted here).
-//         P0d  authorization is FAIL-CLOSED: only a LIVE, server-authoritative
-//              config may authorize an escape — a stale/static config cannot, and
-//              an unreachable server authorizes nothing.
+//         P0d  SUPERSEDED by #870: authorization used to require a LIVE,
+//              server-authoritative registration of the escape target. That
+//              rule could never cover a junction the server never declares, so
+//              it refused correct StabilityMatrix installs. Authorization now
+//              comes from the symlink's LOCATION (inside the user's own models
+//              tree); the code-root veto below is unaffected by the change.
 //
 // The REAL resolver + guard run; only /system_stats, the filesystem, config, and
 // the static/live registered roots are controlled.
@@ -55,10 +61,11 @@ vi.mock("../../comfyui/client.js", () => ({
   getClient: () => ({ fetchApi: (...a: unknown[]) => fetchApi(...(a as [])) }),
 }));
 
-// Two injected root sources:
+// Two injected root sources, both feeding the code-root VETO only:
 //  - getExtraModelRoots (STATIC-capable): contributes to the code-root VETO only.
-//  - getLiveExtraModelRoots (LIVE, server-authoritative): the ONLY source that may
-//    AUTHORIZE an escaping symlink (fail-closed), plus its custom_nodes veto.
+//  - getLiveExtraModelRoots (LIVE, server-authoritative): its custom_nodes roots
+//    also feed the veto. Since #870 NEITHER source authorizes anything — an
+//    in-tree symlink's redirect is authorized by its location.
 const getExtraModelRootsMock = vi.fn();
 const getLiveExtraModelRootsMock = vi.fn();
 vi.mock("../../services/extra-paths.js", () => ({
@@ -218,30 +225,53 @@ describe("(b) #633 — a symlink into a LIVE authoritatively-registered model ro
   });
 });
 
-describe("(c) P0d — fail-closed authorization", () => {
-  it("REFUSES an escape a STATIC config would list but the LIVE server does NOT (no stale authorization)", async () => {
+describe("(b) #870 — a StabilityMatrix junction into UNDECLARED storage is allowed", () => {
+  it("permits models/vae -> E:/StabilityMatrix/models/VAE with NO registered root covering it", async () => {
+    // The reported #870 shape: StabilityMatrix junctions each shared model folder
+    // into the package's models dir and registers nothing — the junction IS the
+    // registration, and ComfyUI's scanner follows it (followlinks=True). The old
+    // live-roots authorization could never vouch for the target, so a correct
+    // install was refused.
+    getSystemStats.mockResolvedValue({ system: { argv: ["python", "main.py"] } });
+    const modelsRoot = resolve(COMFYUI_PATH, "models");
+    const linkDir = resolve(modelsRoot, "vae");
+    const junctionTarget = resolve("/E/comfy/StabilityMatrix/models/VAE");
+
+    // Nothing authorizes this target: no static config, no live roots.
+    getExtraModelRootsMock.mockResolvedValue([]);
+    getLiveExtraModelRootsMock.mockResolvedValue({ authoritative: false, roots: [] });
+    symlinkTo(linkDir, junctionTarget);
+
+    const dir = await resolveModelSubfolderPreferServer("vae");
+    expect(dir).toBe(linkDir);
+  });
+});
+
+describe("(b) #870 — authorization comes from the symlink's LOCATION, not from any config", () => {
+  it("ALLOWS an escape a STATIC config would list but the LIVE server does NOT (config no longer AUTHORIZES — it feeds the veto only)", async () => {
+    // Pre-#870 this was refused ("no stale authorization", codex P0d). The symlink
+    // sits inside the user's own models tree, so its redirect needs no config's
+    // blessing — staleness is moot when authorization never came from config.
     getSystemStats.mockResolvedValue({ system: { argv: ["python", "main.py"] } });
     const modelsRoot = resolve(COMFYUI_PATH, "models");
     const linkDir = resolve(modelsRoot, "external_unet_download");
     const externalRoot = resolve("/Volumes/Render/00_AI/models/unet");
 
-    // Only the STATIC config lists it; the live server is NOT authoritative for it.
     getExtraModelRootsMock.mockResolvedValue([{ category: "unet", dir: externalRoot, group: "static" }]);
     getLiveExtraModelRootsMock.mockResolvedValue({ authoritative: false, roots: [] });
     symlinkTo(linkDir, externalRoot);
 
     await expect(
       resolveModelSubfolderPreferServer("external_unet_download"),
-    ).rejects.toBeInstanceOf(ModelError);
+    ).resolves.toBe(linkDir);
   });
 
-  it("REFUSES an escape when the live-root lookup is non-authoritative even if it returns roots", async () => {
+  it("ALLOWS an escape when the live-root lookup is non-authoritative (the lookup feeds the veto only)", async () => {
     getSystemStats.mockResolvedValue({ system: { argv: ["python", "main.py"] } });
     const modelsRoot = resolve(COMFYUI_PATH, "models");
     const linkDir = resolve(modelsRoot, "external_unet_download");
     const externalRoot = resolve("/Volumes/Render/00_AI/models/unet");
 
-    // authoritative:false must NOT authorize, regardless of any roots present.
     getLiveExtraModelRootsMock.mockResolvedValue({
       authoritative: false,
       roots: [{ category: "unet", dir: externalRoot, group: "x" }],
@@ -250,23 +280,30 @@ describe("(c) P0d — fail-closed authorization", () => {
 
     await expect(
       resolveModelSubfolderPreferServer("external_unet_download"),
-    ).rejects.toBeInstanceOf(ModelError);
+    ).resolves.toBe(linkDir);
   });
 });
 
-describe("(c) escape floor + code-root veto", () => {
-  it("rejects models/<link> -> /tmp/evil when it lands in NO registered root", async () => {
+describe("(c) escape landing — only a CODE-root landing is still refused", () => {
+  it("ALLOWS models/<link> -> an unregistered location (the user's own redirect; post-write reports visibility)", async () => {
+    // Pre-#870 this was the "escape floor" refusal. There is no structural
+    // difference between `E:\StabilityMatrix\models\VAE` (legitimate) and
+    // `/tmp/evil` (pointless) — both are undeclared targets of an in-tree link —
+    // so the guard no longer refuses either. A landing the server cannot see is
+    // reported honestly by the post-write check instead of being pre-emptively
+    // refused (and a pre-existing in-tree symlink is the user's own fixture on
+    // their own machine — single trust domain).
     getSystemStats.mockResolvedValue({ system: { argv: ["python", "main.py"] } });
     const modelsRoot = resolve(COMFYUI_PATH, "models");
     const linkDir = resolve(modelsRoot, "external_unet_download");
-    const evilOutside = resolve("/tmp/evil-outside");
+    const outside = resolve("/tmp/evil-outside");
 
     liveAuthoritative([{ category: "unet", dir: resolve("/Volumes/Render/00_AI/models/unet"), group: "comfyui" }]);
-    symlinkTo(linkDir, evilOutside);
+    symlinkTo(linkDir, outside);
 
-    await expect(
-      resolveModelSubfolderPreferServer("external_unet_download"),
-    ).rejects.toThrow(/outside the models directory/i);
+    await expect(resolveModelSubfolderPreferServer("external_unet_download")).resolves.toBe(
+      linkDir,
+    );
   });
 
   it("REFUSES a symlink into a registered custom_nodes root (no arbitrary CODE write)", async () => {
@@ -280,7 +317,7 @@ describe("(c) escape floor + code-root veto", () => {
     symlinkTo(linkDir, customNodesRoot);
 
     await expect(resolveModelSubfolderPreferServer("sneaky")).rejects.toThrow(
-      /outside the models directory/i,
+      /code directory/i,
     );
   });
 

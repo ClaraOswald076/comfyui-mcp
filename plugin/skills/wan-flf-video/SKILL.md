@@ -521,7 +521,7 @@ When the start and end frames have different subject sizes (e.g., small cat → 
 1. **Generate anchor frame** with Z-Image/SDXL/Flux (portrait orientation for standing subjects)
 2. **Qwen Edit to create second frame** — the edit preserves scene context
 3. **Clear VRAM** between model families
-4. **Stage both frames as inputs.** When the frames are ComfyUI OUTPUTS from a prior stage (the generated/edited frames above), use **`stage_output_as_input`** with each output's `{ filename, subfolder?, type? }` and feed the returned input filename into each `LoadImage`. (For a frame already on local disk, use `upload_image`.) **NEVER copy the output file into, or guess, a filesystem `input/` path** — ComfyUI's input/output dirs may be CUSTOM (`--input-directory` / `--output-directory`), so a guessed path makes `LoadImage` reject the file (`Invalid image file`) and wastes the render. `stage_output_as_input` routes through the server API (`/view` → `/upload/image`), which resolves the real dirs correctly.
+4. **Stage both frames as inputs.** When the frames are ComfyUI OUTPUTS from a prior stage (the generated/edited frames above), use **`upload_image (action:"stage")`** with each output's `{ filename, subfolder?, type? }` and feed the returned input filename into each `LoadImage`. (For a frame already on local disk, use `upload_image (action:"image")`.) **NEVER copy the output file into, or guess, a filesystem `input/` path** — ComfyUI's input/output dirs may be CUSTOM (`--input-directory` / `--output-directory`), so a guessed path makes `LoadImage` reject the file (`Invalid image file`) and wastes the render. `upload_image (action:"stage")` routes through the server API (`/view` → `/upload/image`), which resolves the real dirs correctly.
 5. **Run dual hi-lo FLF** with morph LoRA if morphing is desired
 6. **Optionally upscale** with SeedVR2 to 1080p
 
@@ -529,11 +529,11 @@ Proven timing on RTX 4090: Z-Image (35s) → Qwen Edit (78s) → WAN FLF 81 fram
 
 ## Working with Saved Workflows
 
-Use `analyze_workflow` to understand any saved WAN FLF workflow before modifying or executing it. It returns a structured summary with sections, node IDs, key settings, and virtual wire connections — no raw JSON needed.
+Use `get_workflow (action:"analyze")` to understand any saved WAN FLF workflow before modifying or executing it. It returns a structured summary with sections, node IDs, key settings, and virtual wire connections — no raw JSON needed.
 
 ```
-analyze_workflow("Wan FirstLastFrame Advanced.json")           # summary view (default)
-analyze_workflow("Wan FirstLastFrame Advanced.json", view="flat")  # mermaid diagram
+get_workflow(action="analyze", filename="Wan FirstLastFrame Advanced.json")                # summary view (default)
+get_workflow(action="analyze", filename="Wan FirstLastFrame Advanced.json", view="flat")   # mermaid diagram
 ```
 
-Only use `get_workflow` when you need the raw JSON for `enqueue_workflow` or `modify_workflow`.
+Only use `get_workflow` when you need the raw JSON for `enqueue_workflow` or `create_workflow (action:"modify")`.

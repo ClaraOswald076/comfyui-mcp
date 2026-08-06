@@ -72,7 +72,7 @@ async function check() {
             hookEventName: "PreToolUse",
             permissionDecision: "deny",
             permissionDecisionReason:
-              "ComfyUI is not running. Use start_comfyui to start it first.",
+              "ComfyUI is not running. Use restart_comfyui (action:\"start\") to start it first.",
           },
         }),
       );
@@ -104,7 +104,7 @@ async function check() {
           hookEventName: "PreToolUse",
           permissionDecision: "deny",
           permissionDecisionReason:
-            "ComfyUI is not running. Use start_comfyui to start it first.",
+            "ComfyUI is not running. Use restart_comfyui (action:\"start\") to start it first.",
         },
       }),
     );
