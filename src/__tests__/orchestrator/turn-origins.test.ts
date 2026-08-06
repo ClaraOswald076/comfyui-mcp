@@ -150,6 +150,55 @@ describe("TurnOriginTracker — pins and stamps land at dequeue (#884)", () => {
     expect(tracker.pinOf(KEY)).toBeNull();
     expect(tracker.stampOf(KEY)).toBeUndefined();
   });
+
+  it("a re-queue AFTER a same-backend migration keeps its origin — ownership is judged on the live id, not the retired one (gate 4, P1)", async () => {
+    // The combined sequence the gate found uncovered: requeue and migration were
+    // each tested, never together. Default backend is claude; this conversation
+    // is codex, so a lookup that falls back to the default reads as "foreign".
+    const KEY_CODEX = "orchestrator::codex";
+    const { tracker, tabBackends, tabAliases } = makeTracker({ defaultBackend: "claude" });
+    tabBackends.set("tab-a", "codex");
+    tracker.recordForMid("m-a", "uuid-a", "tab-a");
+    tracker.onSeen(KEY_CODEX, "m-a");
+    await flushMicrotasks();
+    expect(tracker.pinOf(KEY_CODEX)).toBe("tab-a");
+    tracker.turnEnded(KEY_CODEX);
+
+    // The SAME socket legitimately migrates tab-a → tab-b (a workflow switch or
+    // a save), staying on codex. The bridge moves the backend mapping to the new
+    // id and drops the old one, so backendForTab("tab-a") now answers with the
+    // DEFAULT — which is a different backend, though nothing changed hands.
+    tabAliases.set("tab-a", "tab-b");
+    tabBackends.delete("tab-a");
+    tabBackends.set("tab-b", "codex");
+
+    // The backend crashes and re-queues the original item. Judged on the retired
+    // id this failed closed and wedged a healthy turn; judged on the live id it
+    // is still codex's, so it re-pins — at tab-a's recorded identity, which the
+    // bridge itself resolves onward to tab-b.
+    tracker.onSeen(KEY_CODEX, "m-a");
+    await flushMicrotasks();
+    expect(tracker.pinOf(KEY_CODEX)).toBe("tab-a");
+    expect(tracker.stampOf(KEY_CODEX)).toBe("uuid-a");
+  });
+
+  it("a re-queue whose origin resolves NOWHERE still fails closed — unprovable ownership is not ownership", async () => {
+    const KEY_CODEX = "orchestrator::codex";
+    const { tracker, tabBackends, tabAliases } = makeTracker({ defaultBackend: "claude" });
+    tabBackends.set("tab-a", "codex");
+    tracker.recordForMid("m-a", "uuid-a", "tab-a");
+    tracker.onSeen(KEY_CODEX, "m-a");
+    await flushMicrotasks();
+    tracker.turnEnded(KEY_CODEX);
+    // The surface is gone entirely (no alias, no mapping) — the live-id lookup
+    // must NOT become a way to launder an origin whose tab cannot be proven.
+    tabAliases.set("tab-a", null);
+    tabBackends.delete("tab-a");
+    tracker.onSeen(KEY_CODEX, "m-a");
+    await flushMicrotasks();
+    expect(tracker.pinOf(KEY_CODEX)).toBeNull();
+    expect(tracker.stampOf(KEY_CODEX)).toBeUndefined();
+  });
 });
 
 describe("TurnOriginTracker — inherited origins for tab-less turns (gate 3, P1)", () => {

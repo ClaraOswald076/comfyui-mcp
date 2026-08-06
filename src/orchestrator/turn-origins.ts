@@ -212,7 +212,17 @@ export class TurnOriginTracker {
       // workflow fence cannot catch it (A's uuid is unchanged), and inheriting
       // would hand this conversation a tab that now belongs to another one.
       const backend = this.deps.backendOfKey(key);
-      if (rec.backend !== backend || this.deps.backendForTab(rec.tab) !== backend) {
+      // Judge ownership on the tab the origin ROUTES to today, not on the id it
+      // was minted under — the same view resolvedPinOf() uses. A same-socket
+      // migration (A→B: a workflow switch, a save, tmp:→wf:) moves the backend
+      // mapping to B and deletes A, so asking backendForTab(A) returns the
+      // DEFAULT backend and a perfectly healthy Codex turn requeued after such a
+      // migration was judged foreign and wedged until explicit recovery
+      // (independent gate on gate 4, P1 — a false refusal, not a leak). When the
+      // origin resolves nowhere at all we keep the strict reading: unprovable
+      // ownership still fails closed.
+      const liveOrigin = this.deps.liveTabOf ? (this.deps.liveTabOf(rec.tab) ?? rec.tab) : rec.tab;
+      if (rec.backend !== backend || this.deps.backendForTab(liveOrigin) !== backend) {
         // Dropped from BOTH maps: a re-queue of this item must fail closed
         // again (unknown), not silently inherit the last established origin.
         this.turnUuidByMid.delete(mid);
