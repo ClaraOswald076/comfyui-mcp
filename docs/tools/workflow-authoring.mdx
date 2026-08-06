@@ -21,10 +21,12 @@ Author and check ComfyUI workflow JSON. Driven by the `action` parameter:
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which authoring operation to perform. "create" requires `template` (optional `params`); "modify" requires `workflow` + `operations`; "validate" requires `workflow` (optional `health`); "node_info" takes no required parameters (optional `node_type`, `verbose`, `refresh`). Options: `action:"create"`, `action:"modify"`, `action:"validate"`, `action:"node_info"`.
+  Which authoring operation to perform. "create" requires `template` (optional `params`); "modify" requires `workflow` + `operations`; "validate" requires `workflow` (optional `health`); "node_info" takes no required parameters (optional `node_type`, `verbose`, `refresh`).
+  Options: `action:"create"`, `action:"modify"`, `action:"validate"`, `action:"node_info"`.
 </ParamField>
 <ParamField path="template" type="enum">
-  action:"create" (REQUIRED) — Template name: txt2img, img2img, upscale, or inpaint Options: `txt2img`, `img2img`, `upscale`, `inpaint`, `controlnet`, `ip_adapter`, `ace_step_15`, `stable_audio_3`, `remove_background`, `ltx_video`.
+  action:"create" (REQUIRED) — Template name: txt2img, img2img, upscale, or inpaint
+  Options: `txt2img`, `img2img`, `upscale`, `inpaint`, `controlnet`, `ip_adapter`, `ace_step_15`, `stable_audio_3`, `remove_background`, `ltx_video`.
 </ParamField>
 <ParamField path="params" type="object" default="[object Object]">
   action:"create" — Template parameters; recognized keys depend on the template. txt2img: checkpoint, positive_prompt, negative_prompt, width, height, steps, cfg, seed, sampler_name, scheduler. img2img/inpaint add image_path (and mask_path for inpaint) and denoise. upscale adds upscale_model. Unknown keys are ignored; omitted keys use template defaults.
@@ -172,7 +174,8 @@ DRAW a diagram of, or convert, workflow JSON you PASS IN (a JSON string or objec
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which rendering/conversion to perform. "render", "render_hierarchical" and "to_dsl" require `workflow`; "mermaid" requires `mermaid`; "from_dsl" requires `dsl`. Options: `action:"render"`, `action:"render_hierarchical"`, `action:"mermaid"`, `action:"to_dsl"`, `action:"from_dsl"`.
+  Which rendering/conversion to perform. "render", "render_hierarchical" and "to_dsl" require `workflow`; "mermaid" requires `mermaid`; "from_dsl" requires `dsl`.
+  Options: `action:"render"`, `action:"render_hierarchical"`, `action:"mermaid"`, `action:"to_dsl"`, `action:"from_dsl"`.
 </ParamField>
 <ParamField path="workflow" type="string | object">
   ComfyUI workflow JSON (as a JSON string or object; API or UI format is auto-detected). REQUIRED for action:"render", action:"render_hierarchical" and action:"to_dsl" — "to_dsl" expects API format (node ID -&gt; &#123;class_type, inputs&#125;).
@@ -181,10 +184,12 @@ DRAW a diagram of, or convert, workflow JSON you PASS IN (a JSON string or objec
   action:"render" / action:"render_hierarchical" — Include widget values (seed, steps, cfg, etc.) in node labels (detail view only, for the hierarchical action).
 </ParamField>
 <ParamField path="direction" type="enum">
-  action:"render" / action:"render_hierarchical" — Flowchart direction: LR (left-to-right) or TB (top-to-bottom). Default LR for "render" and for the hierarchical detail view, TB for the hierarchical overview. Options: `LR`, `TB`.
+  action:"render" / action:"render_hierarchical" — Flowchart direction: LR (left-to-right) or TB (top-to-bottom). Default LR for "render" and for the hierarchical detail view, TB for the hierarchical overview.
+  Options: `LR`, `TB`.
 </ParamField>
 <ParamField path="view" type="enum" default="overview">
-  action:"render_hierarchical" — overview: compact diagram with sections as summary nodes; detail: full diagram for one section; list: text summary of all sections; summary: structured text optimized for AI ingestion with node IDs, key settings, virtual wires, and full connection graph Options: `overview`, `detail`, `list`, `summary`.
+  action:"render_hierarchical" — overview: compact diagram with sections as summary nodes; detail: full diagram for one section; list: text summary of all sections; summary: structured text optimized for AI ingestion with node IDs, key settings, virtual wires, and full connection graph
+  Options: `overview`, `detail`, `list`, `summary`.
 </ParamField>
 <ParamField path="section" type="string">
   action:"render_hierarchical" — Section name to show in detail view (required when view=detail). Use view=list to see available section names.

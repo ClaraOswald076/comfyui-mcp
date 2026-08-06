@@ -24,7 +24,8 @@ Fetch, browse and inspect ComfyUI images and registered assets. Driven by the `a
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which image/asset operation to perform. "get" requires `filename`; "view" and "asset_metadata" require `asset_id`; "convert" requires `format` plus exactly one of `asset_id`/`path`; action:"analyze_color" takes one source (`asset_id`, `filename`, or `path`); "list_outputs" and action:"list_assets" take no required parameters. Options: `action:"get"`, `action:"view"`, `action:"list_outputs"`, `action:"convert"`, `action:"analyze_color"`, `action:"list_assets"`, `action:"asset_metadata"`.
+  Which image/asset operation to perform. "get" requires `filename`; "view" and "asset_metadata" require `asset_id`; "convert" requires `format` plus exactly one of `asset_id`/`path`; action:"analyze_color" takes one source (`asset_id`, `filename`, or `path`); "list_outputs" and action:"list_assets" take no required parameters.
+  Options: `action:"get"`, `action:"view"`, `action:"list_outputs"`, `action:"convert"`, `action:"analyze_color"`, `action:"list_assets"`, `action:"asset_metadata"`.
 </ParamField>
 <ParamField path="filename" type="string">
   Output image filename, e.g. PulID_Klein_00001_.png. REQUIRED for action:"get". OPTIONAL for action:"analyze_color", where it is one of the three ways to name a source (pair it with subfolder/type).
@@ -33,7 +34,8 @@ Fetch, browse and inspect ComfyUI images and registered assets. Driven by the `a
   Asset id returned by action:"list_assets" or job completion. REQUIRED for actions "view" and "asset_metadata". OPTIONAL for "convert" (provide exactly one of asset_id or path) and action:"analyze_color" (one of asset_id, filename, or path).
 </ParamField>
 <ParamField path="type" type="enum">
-  ComfyUI directory the file lives in: output (default), input, or temp. Used by action:"get" and by action:"analyze_color" when the source is a `filename`. Options: `output`, `input`, `temp`.
+  ComfyUI directory the file lives in: output (default), input, or temp. Used by action:"get" and by action:"analyze_color" when the source is a `filename`.
+  Options: `output`, `input`, `temp`.
 </ParamField>
 <ParamField path="subfolder" type="string">
   Subfolder within the directory, if any (default empty). Used by action:"get" and by action:"analyze_color" when the source is a `filename`.
@@ -51,7 +53,8 @@ Fetch, browse and inspect ComfyUI images and registered assets. Driven by the `a
   action:"list_outputs" — filter by filename pattern (case-insensitive substring match).
 </ParamField>
 <ParamField path="format" type="enum">
-  Two unrelated meanings, one per action — the enum is the union of both and each action accepts only its own half. action:"list_outputs" — RESPONSE SHAPE: "markdown" (default, human/agent-readable) or "json" (&#123;images:[&#123;filename,subfolder,kind,size,modified&#125;]&#125; — for app clients building pick grids). action:"convert" — REQUIRED target encoded image format: "png", "jpeg" or "webp". Options: `markdown`, `json`, `png`, `jpeg`, `webp`.
+  Two unrelated meanings, one per action — the enum is the union of both and each action accepts only its own half. action:"list_outputs" — RESPONSE SHAPE: "markdown" (default, human/agent-readable) or "json" (&#123;images:[&#123;filename,subfolder,kind,size,modified&#125;]&#125; — for app clients building pick grids). action:"convert" — REQUIRED target encoded image format: "png", "jpeg" or "webp".
+  Options: `markdown`, `json`, `png`, `jpeg`, `webp`.
 </ParamField>
 <ParamField path="quality" type="integer">
   action:"convert" — encoder quality, 1-100. Applies where supported by the selected format.
@@ -215,7 +218,8 @@ Put a file where ComfyUI (or cloud storage) can read it. Driven by the `action` 
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  What to upload and where. "image"/"video"/"audio" send a LOCAL file (`source_path`) to ComfyUI's input/ directory; "stage" re-registers an EXISTING server-side output (`filename`) as an input; "output" ships a generated output to cloud storage (`destination`). Options: `action:"image"`, `action:"video"`, `action:"audio"`, `action:"output"`, `action:"stage"`.
+  What to upload and where. "image"/"video"/"audio" send a LOCAL file (`source_path`) to ComfyUI's input/ directory; "stage" re-registers an EXISTING server-side output (`filename`) as an input; "output" ships a generated output to cloud storage (`destination`).
+  Options: `action:"image"`, `action:"video"`, `action:"audio"`, `action:"output"`, `action:"stage"`.
 </ParamField>
 <ParamField path="source_path" type="string">
   Absolute path to the local file to upload. REQUIRED for actions "image", "video" and "audio".
@@ -227,10 +231,12 @@ Put a file where ComfyUI (or cloud storage) can read it. Driven by the `action` 
   action:"stage" — subfolder the source asset currently lives in, if any.
 </ParamField>
 <ParamField path="type" type="enum">
-  action:"stage" — source directory the asset lives in: output (default) or temp (previews). Options: `output`, `temp`.
+  action:"stage" — source directory the asset lives in: output (default) or temp (previews).
+  Options: `output`, `temp`.
 </ParamField>
 <ParamField path="kind" type="enum">
-  action:"stage" — force the media kind instead of inferring it from the file extension. Options: `image`, `video`, `audio`.
+  action:"stage" — force the media kind instead of inferring it from the file extension.
+  Options: `image`, `video`, `audio`.
 </ParamField>
 <ParamField path="as_filename" type="string">
   action:"stage" — override the filename it is registered under in the input/ directory (defaults to the source filename).

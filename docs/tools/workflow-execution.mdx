@@ -22,7 +22,8 @@ Submit work to the ComfyUI execution queue — the primary way an agent starts a
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which enqueue entry point to use. action:"enqueue" requires `workflow`; action:"rerun" takes an optional `prompt_id` (+ `inputs`); action:"run_url" requires `url` (+ `run`/`inputs`); action:"template_schema" and action:"run_template" require `template`; with action:"run_template" you may also pass `overrides`/`wait`/`timeout_s`. Options: `action:"enqueue"`, `action:"rerun"`, `action:"run_url"`, `action:"template_schema"`, `action:"run_template"`.
+  Which enqueue entry point to use. action:"enqueue" requires `workflow`; action:"rerun" takes an optional `prompt_id` (+ `inputs`); action:"run_url" requires `url` (+ `run`/`inputs`); action:"template_schema" and action:"run_template" require `template`; with action:"run_template" you may also pass `overrides`/`wait`/`timeout_s`.
+  Options: `action:"enqueue"`, `action:"rerun"`, `action:"run_url"`, `action:"template_schema"`, `action:"run_template"`.
 </ParamField>
 <ParamField path="workflow" type="object">
   action:"enqueue" — ComfyUI workflow in API format (node ID -&gt; &#123;class_type, inputs&#125;). REQUIRED for that action.
@@ -154,7 +155,8 @@ Inspect the connected ComfyUI server: what it is running on, what it has logged,
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which read to perform. "stats" takes no other parameters; "logs" takes `max_lines`/`keyword`; "health" takes `model_categories`/`recent_errors`. None of them is required. Options: `action:"stats"`, `action:"logs"`, `action:"health"`.
+  Which read to perform. "stats" takes no other parameters; "logs" takes `max_lines`/`keyword`; "health" takes `model_categories`/`recent_errors`. None of them is required.
+  Options: `action:"stats"`, `action:"logs"`, `action:"health"`.
 </ParamField>
 <ParamField path="max_lines" type="integer">
   action:"logs" — maximum number of log lines to return from the end (default: 100).
@@ -247,7 +249,8 @@ Inspect and manage the ComfyUI execution queue. Driven by the `action` parameter
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which queue operation to perform. "list" and "clear" take no other parameters; "status", "get_workflow" and "cancel_queued" require `prompt_id`; "move" requires `prompt_id` + `position`; "edit" requires `prompt_id` (optional `workflow`/`node_inputs`/`position`); "cancel" takes an optional `prompt_id` and `clear_pending`. Options: `action:"list"`, `action:"status"`, `action:"get_workflow"`, `action:"move"`, `action:"edit"`, `action:"cancel"`, `action:"cancel_queued"`, `action:"clear"`.
+  Which queue operation to perform. "list" and "clear" take no other parameters; "status", "get_workflow" and "cancel_queued" require `prompt_id`; "move" requires `prompt_id` + `position`; "edit" requires `prompt_id` (optional `workflow`/`node_inputs`/`position`); "cancel" takes an optional `prompt_id` and `clear_pending`.
+  Options: `action:"list"`, `action:"status"`, `action:"get_workflow"`, `action:"move"`, `action:"edit"`, `action:"cancel"`, `action:"cancel_queued"`, `action:"clear"`.
 </ParamField>
 <ParamField path="prompt_id" type="string">
   The prompt_id of a job (the id returned by enqueue_workflow). REQUIRED for actions "status", "get_workflow", "move", "edit" and "cancel_queued" (a PENDING queue item for all but "status"). OPTIONAL for action:"cancel" — if given, only interrupts the running job when its prompt_id matches; omit to interrupt whatever is currently running.
@@ -256,7 +259,8 @@ Inspect and manage the ComfyUI execution queue. Driven by the `action` parameter
   action:"list" — include each running/pending job's workflow payload and extra_data. Can be large.
 </ParamField>
 <ParamField path="position" type="enum">
-  Where to requeue the job. REQUIRED for action:"move". OPTIONAL for action:"edit" — defaults to back. Options: `front`, `back`.
+  Where to requeue the job. REQUIRED for action:"move". OPTIONAL for action:"edit" — defaults to back.
+  Options: `front`, `back`.
 </ParamField>
 <ParamField path="workflow" type="object">
   action:"edit" — optional complete replacement API-format workflow. If omitted, the existing queued workflow is patched with `node_inputs`.
@@ -294,7 +298,8 @@ Read what has already been generated on this machine — execution history, why 
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which history view to return. "list" and "diagnose" read ComfyUI's execution history and take an optional `prompt_id`; "stats" and "suggest" read this server's own local generation-settings database and take `model_family` (plus `lora_hash`/`search`/`limit` for "suggest"). No action requires any other field. Options: `action:"list"`, `action:"diagnose"`, `action:"stats"`, `action:"suggest"`.
+  Which history view to return. "list" and "diagnose" read ComfyUI's execution history and take an optional `prompt_id`; "stats" and "suggest" read this server's own local generation-settings database and take `model_family` (plus `lora_hash`/`search`/`limit` for "suggest"). No action requires any other field.
+  Options: `action:"list"`, `action:"diagnose"`, `action:"stats"`, `action:"suggest"`.
 </ParamField>
 <ParamField path="prompt_id" type="string">
   Actions "list" and "diagnose" — the prompt ID to look up (returned by enqueue_workflow). For action:"list", if omitted, returns the most recent COMMITTED execution (chosen by ComfyUI's queue number, not dict order); immediately after a run finishes it can briefly lag by one until ComfyUI commits the new entry, so pass the prompt_id from enqueue_workflow to get that exact run, and prefer the run-finished event for naming a just-produced output. For action:"diagnose", omit to diagnose the most recent FAILED run — preferred over a newer successful one — falling back to the most recent run if nothing failed.
@@ -382,7 +387,8 @@ Batch ids are durable — they survive server restarts.
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which batch operation to perform. "submit" takes workflows | workflow+sweep; "status"/"output"/"wait" each require `batch_id` ("wait" also takes `timeout_s`). Options: `action:"submit"`, `action:"status"`, `action:"output"`, `action:"wait"`.
+  Which batch operation to perform. "submit" takes workflows | workflow+sweep; "status"/"output"/"wait" each require `batch_id` ("wait" also takes `timeout_s`).
+  Options: `action:"submit"`, `action:"status"`, `action:"output"`, `action:"wait"`.
 </ParamField>
 <ParamField path="workflows" type="object[]">
   action:"submit" — array of ComfyUI workflows in API format (node ID -&gt; &#123;class_type, inputs&#125;). Mutually exclusive with workflow+sweep.

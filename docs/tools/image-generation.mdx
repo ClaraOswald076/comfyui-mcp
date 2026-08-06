@@ -26,7 +26,8 @@ Generate media from a prompt or an existing image — the high-level entry point
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  What to generate. action:"image"/action:"video" require `prompt`; action:"audio" requires `model_family`+`prompt`+`duration`; action:"3d" requires `mode` (+ `prompt` or `image`); action:"controlnet" requires `prompt`+`control_image`; action:"ip_adapter" requires `prompt`+`reference_image`; action:"regenerate" requires `asset_id`; action:"upscale" and action:"remove_background" require `image`. Options: `action:"image"`, `action:"audio"`, `action:"video"`, `action:"3d"`, `action:"controlnet"`, `action:"ip_adapter"`, `action:"regenerate"`, `action:"upscale"`, `action:"remove_background"`.
+  What to generate. action:"image"/action:"video" require `prompt`; action:"audio" requires `model_family`+`prompt`+`duration`; action:"3d" requires `mode` (+ `prompt` or `image`); action:"controlnet" requires `prompt`+`control_image`; action:"ip_adapter" requires `prompt`+`reference_image`; action:"regenerate" requires `asset_id`; action:"upscale" and action:"remove_background" require `image`.
+  Options: `action:"image"`, `action:"audio"`, `action:"video"`, `action:"3d"`, `action:"controlnet"`, `action:"ip_adapter"`, `action:"regenerate"`, `action:"upscale"`, `action:"remove_background"`.
 </ParamField>
 <ParamField path="prompt" type="string">
   Positive text prompt. REQUIRED for actions "image", "audio", "video", "controlnet" and "ip_adapter"; for action:"3d" it is required in mode "text" and optional (passed through only if the chosen node accepts it) in mode "image". Unused by action:"regenerate", action:"upscale" and action:"remove_background".
@@ -89,7 +90,8 @@ Generate media from a prompt or an existing image — the high-level entry point
   action:"ip_adapter" — IPAdapterUnifiedLoader preset (default 'PLUS (high strength)').
 </ParamField>
 <ParamField path="weight_type" type="enum">
-  action:"ip_adapter" — IPAdapter weight mode (default 'standard' — required by current IPAdapter_plus builds). Options: `standard`, `prompt is more important`, `style transfer`.
+  action:"ip_adapter" — IPAdapter weight mode (default 'standard' — required by current IPAdapter_plus builds).
+  Options: `standard`, `prompt is more important`, `style transfer`.
 </ParamField>
 <ParamField path="strength" type="number">
   Two DIFFERENT knobs sharing one field, each with its own range, checked when the action runs: action:"video" (i2v only) — adherence to the start frame, 0-1 inclusive (default 0.6; higher = LESS motion); action:"controlnet" — conditioning strength, must be &gt; 0, typically 0.0-2.0 (default 1.0; higher = stronger adherence to the control image).
@@ -104,7 +106,8 @@ Generate media from a prompt or an existing image — the high-level entry point
   action:"video" — frames per second (default 25).
 </ParamField>
 <ParamField path="mode" type="enum">
-  action:"3d" — "text" = text-to-3D from `prompt`; "image" = image-to-3D from an uploaded input `image`. REQUIRED for that action. Options: `text`, `image`.
+  action:"3d" — "text" = text-to-3D from `prompt`; "image" = image-to-3D from an uploaded input `image`. REQUIRED for that action.
+  Options: `text`, `image`.
 </ParamField>
 <ParamField path="node" type="string">
   action:"3d" — explicit 3D API node class_type to use (e.g. "MeshyTextToModelNode"); auto-selected if omitted. Use list_api_nodes with filter "3d" to see options.
@@ -113,7 +116,8 @@ Generate media from a prompt or an existing image — the high-level entry point
   action:"3d" — provider-specific extra inputs passed through to the node (e.g. style, texture, quality). Use list_api_nodes (action:"schema") on the chosen node for valid keys.
 </ParamField>
 <ParamField path="model_family" type="enum">
-  action:"audio" — audio model family; determines which workflow template and model loaders to use. REQUIRED for that action. Options: `ace_step_1.5`, `stable_audio_3`.
+  action:"audio" — audio model family; determines which workflow template and model loaders to use. REQUIRED for that action.
+  Options: `ace_step_1.5`, `stable_audio_3`.
 </ParamField>
 <ParamField path="duration" type="number">
   action:"audio" — audio duration in seconds. REQUIRED for that action.
@@ -152,7 +156,8 @@ Generate media from a prompt or an existing image — the high-level entry point
   action:"audio" — TextEncodeAceStepAudio1.5 tempo in beats per minute (ACE only, 10-300, default: 120).
 </ParamField>
 <ParamField path="timesignature" type="enum">
-  action:"audio" — TextEncodeAceStepAudio1.5 time signature (ACE only, one of '2'/'3'/'4'/'6', default: '4'). Options: `2`, `3`, `4`, `6`.
+  action:"audio" — TextEncodeAceStepAudio1.5 time signature (ACE only, one of '2'/'3'/'4'/'6', default: '4').
+  Options: `2`, `3`, `4`, `6`.
 </ParamField>
 <ParamField path="temperature" type="number">
   action:"audio" — TextEncodeAceStepAudio1.5 LLM sampling temperature (ACE only, 0-2, default: 0.85).
@@ -170,7 +175,8 @@ Generate media from a prompt or an existing image — the high-level entry point
   action:"audio" — generate audio codes via the TextEncodeAceStepAudio1.5 LLM (ACE only, default: true).
 </ParamField>
 <ParamField path="audio_quality" type="enum">
-  action:"audio" — SaveAudioMP3 bitrate/quality (ACE only, one of 'V0'/'128k'/'320k', default: '320k'). Options: `V0`, `128k`, `320k`.
+  action:"audio" — SaveAudioMP3 bitrate/quality (ACE only, one of 'V0'/'128k'/'320k', default: '320k').
+  Options: `V0`, `128k`, `320k`.
 </ParamField>
 <ParamField path="asset_id" type="string">
   action:"regenerate" — asset id of the source generation. REQUIRED for that action.

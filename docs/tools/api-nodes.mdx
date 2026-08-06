@@ -18,7 +18,8 @@ Discover and run hosted partner/API nodes on the connected ComfyUI (e.g. Flux/BF
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which API-node operation to perform. "list" takes an optional `filter`; "schema" requires `class_type`; "generate" requires `class_type` + `inputs` (optional `disable_random_seed`). Options: `action:"list"`, `action:"schema"`, `action:"generate"`.
+  Which API-node operation to perform. "list" takes an optional `filter`; "schema" requires `class_type`; "generate" requires `class_type` + `inputs` (optional `disable_random_seed`).
+  Options: `action:"list"`, `action:"schema"`, `action:"generate"`.
 </ParamField>
 <ParamField path="filter" type="string">
   action:"list" — case-insensitive substring to narrow results, matched against class_type, display name, or category (e.g. "image", "video", "kling").

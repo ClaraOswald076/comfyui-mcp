@@ -49,6 +49,7 @@ import {
   TOOL_NAMES,
   baselineIntegrity,
   actionLiteralSpans,
+  deadNameMentions,
   deadNameRe,
   panelBaselineIntegrity,
   rotMentions,
@@ -377,7 +378,19 @@ for (const path of files) {
       // instruction, not the history. Binding the name to the context string means the
       // exempted text must itself contain the name, so an instruction added beside it is
       // a second occurrence and fails.
-      const occurrences = text.split(dead.name).length - 1;
+      // COUNT THE WAY EVERY OTHER CHECK HERE DETECTS. `split(dead.name)` is a raw
+      // SUBSTRING split, while `deadNameRe`/`rotMentions`/`actionLiteralSpans` are all
+      // token-bounded — so the two disagreed exactly where a live name CONTAINS a dead
+      // one. With `self_update` retired, a line naming `self_update_action` (the real
+      // parameter on the consolidated tool) counted as an occurrence here while matching
+      // nowhere else, pushing a legitimately exempted line to `occurrences === 2` and
+      // failing it. That is a FALSE REFUSAL: the gate rejecting a valid `allowedIn`
+      // entry over a name that is not a mention at all.
+      //
+      // The fail-closed intent above is unchanged — a line carrying two REAL mentions
+      // still fails, because the ambiguity it guards against is real. This only stops
+      // counting things that were never mentions.
+      const occurrences = deadNameMentions(dead.name, text).length;
       if (
         occurrences === 1 &&
         dead.allowedIn?.some(
