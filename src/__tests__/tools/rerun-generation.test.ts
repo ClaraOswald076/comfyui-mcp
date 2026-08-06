@@ -104,6 +104,21 @@ describe("rerun_generation", () => {
     expect(enqueued["1"].inputs.cfg).toBe(12);
   });
 
+  it("pins an override-supplied seed against re-randomization (#865)", async () => {
+    getHistoryMock.mockResolvedValue({ "abc-123": entry(7, "abc-123", GRAPH_A) });
+    const handler = getHandler("rerun_generation");
+
+    await handler({ prompt_id: "abc-123", inputs: { seed: 42 } });
+
+    const enqueued = enqueueWorkflowMock.mock.calls[0][0] as typeof GRAPH_A;
+    expect(enqueued["1"].inputs.seed).toBe(42);
+    // The executor is told which inputs the caller fixed, so randomization
+    // skips them instead of silently replacing the explicit seed.
+    expect(enqueueWorkflowMock.mock.calls[0][1]).toMatchObject({
+      preserve_seed_inputs: ["seed"],
+    });
+  });
+
   it("errors clearly when there is no history", async () => {
     getHistoryMock.mockResolvedValue({});
     const handler = getHandler("rerun_generation");
