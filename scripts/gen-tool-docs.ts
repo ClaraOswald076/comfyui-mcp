@@ -77,15 +77,9 @@ const CATEGORIES: Array<{
     group: "Image & Audio Generation",
     slug: "image-generation",
     icon: "image",
-    description: "High-level text-to-image and text-to-audio generation, plus conditioned image variants.",
+    description: "High-level text-to-image, audio, video and 3D generation, conditioned image variants, and the two post-processing passes — all nine actions of one tool since 0.50.0 slice 16.",
     tools: [
       "generate_image",
-      "generate_with_controlnet",
-      "generate_with_ip_adapter",
-      "regenerate",
-      "generate_audio",
-      "generate_video",
-      "generate_3d",
     ],
   },
   {
@@ -94,11 +88,11 @@ const CATEGORIES: Array<{
     icon: "play",
     description: "Enqueue workflows — one at a time, from a named template, or as a batch — and inspect the queue, jobs, history, and system stats.",
     tools: [
-      "enqueue_workflow", "rerun_generation", "get_system_stats", "queue", "get_history", "get_logs",
-      "health_check", "calculate", "diagnose_run",
-      // Template execution: run_template is an enqueue entrypoint, and
-      // get_template_schema is the lookup you make first to fill its overrides.
-      "get_template_schema", "run_template",
+      // 0.50.0 slice 16 folded the re-run, run-from-URL and template
+      // entrypoints into `enqueue_workflow`, and the diagnosis + local
+      // settings-history views into `get_history`.
+      "enqueue_workflow", "get_system_stats", "queue", "get_history",
+      "calculate",
       // Batch execution: submit many prompts under one batch_id, then poll/await it.
       "batch",
     ],
@@ -119,7 +113,7 @@ const CATEGORIES: Array<{
     slug: "workflow-library",
     icon: "folder-open",
     description: "Save, load, strip/slice, analyze, and extract workflows.",
-    tools: ["get_workflow", "save_workflow", "run_workflow_url"],
+    tools: ["get_workflow", "save_workflow"],
   },
   {
     group: "Assets & Images",
@@ -127,11 +121,11 @@ const CATEGORIES: Array<{
     icon: "images",
     description: "View, convert, and upload generated images; analyze colors; stage outputs as inputs; upload media inputs; browse outputs.",
     tools: [
-      "view_image", "get_image", "convert_image", "analyze_color",
-      "remove_background", "upscale_image",
-      "stage_output_as_input", "upload_output",
-      "upload_image", "upload_video", "upload_audio",
-      "list_output_images", "list_assets", "get_asset_metadata",
+      // 0.50.0 slice 15 folded twelve names into these two: `get_image` is the
+      // read/inspect half (get, view, list_outputs, convert, plus the colour
+      // measure and the asset-registry reads) and `upload_image` the write half
+      // (image, video, audio, stage, output).
+      "get_image", "upload_image",
     ],
   },
   {
@@ -154,13 +148,11 @@ const CATEGORIES: Array<{
     icon: "puzzle",
     description: "Discover, install, update, snapshot, bisect, scaffold, and publish custom node packs.",
     tools: [
-      "search_custom_nodes", "get_node_pack_details", "install_custom_node",
-      "update_custom_node", "reinstall_custom_node", "fix_custom_node",
-      "disable_custom_node", "enable_custom_node", "uninstall_custom_node",
-      "list_installed_nodes", "sync_node_dependencies", "node_snapshot", "bisect",
-      "scaffold_custom_node", "verify_custom_node", "publish_custom_node",
-      "list_node_pack_files", "read_node_file", "search_node_packs", "write_node_file",
-      "apply_node_patch", "node_pack_git",
+      // 0.50.0 slice 12 folded twenty names into these three: registry
+      // discovery into `search_custom_nodes`, Manager lifecycle into
+      // `install_custom_node`, the author loop into `node_pack`.
+      "search_custom_nodes", "install_custom_node", "node_pack",
+      "node_snapshot", "bisect",
     ],
   },
   {
@@ -176,9 +168,9 @@ const CATEGORIES: Array<{
     icon: "wrench",
     description: "Install/update ComfyUI and the sidebar panel, self-update the MCP server, apply a setup manifest, manage workspaces, inspect the environment, configure ComfyUI-Manager, report issues.",
     tools: [
-      "install_comfyui", "update_comfyui", "update_all", "install_panel", "self_update",
+      "install_comfyui",
       "apply_manifest", "workspace",
-      "get_environment", "configure_manager", "report_issue",
+      "report_issue",
     ],
   },
   {
@@ -192,10 +184,9 @@ const CATEGORIES: Array<{
     group: "Defaults, Stats & Skills",
     slug: "defaults-stats-skills",
     icon: "sliders",
-    description: "Generation defaults, ComfyUI frontend UI settings, history-based suggestions, and skill generation.",
+    description: "Generation defaults, ComfyUI frontend UI settings, and skill generation. (History-based suggestions and stats moved onto get_history in 0.50.0 slice 16.)",
     tools: [
       "get_defaults",
-      "suggest_settings", "generation_stats",
     ],
   },
   {
@@ -295,7 +286,19 @@ function renderParam(name: string, schema: JsonSchema, required: boolean): strin
   }
   const body: string[] = [];
   if (schema.description) body.push(esc(schema.description));
-  if (schema.enum) body.push(`Options: ${schema.enum.map((e) => `\`${String(e)}\``).join(", ")}.`);
+  if (schema.enum) {
+    // The `action` field gets its options rendered as the CALL FORM rather than
+    // bare values. Two reasons, and the first is the reader's: on the 0.50.0
+    // surface `action` is the only required field on most tools, so `action:"get"`
+    // is the thing to copy, where a bare `get` still has to be assembled. The
+    // second is mechanical — several folds reused a retired TOOL name as an
+    // action name, and a bare option value in generated prose is then
+    // indistinguishable from an instruction to call a tool that 404s. The call
+    // form says which it is, in the one syntax the dead-name gate recognises
+    // repo-wide. Any other enum field keeps the plain value list.
+    const opt = (e: unknown) => (name === "action" ? `\`action:"${String(e)}"\`` : `\`${String(e)}\``);
+    body.push(`Options: ${schema.enum.map(opt).join(", ")}.`);
+  }
   return `<ParamField ${attrs.join(" ")}>\n  ${body.join(" ") || "—"}\n</ParamField>`;
 }
 

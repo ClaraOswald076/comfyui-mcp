@@ -16,7 +16,7 @@ Works on **macOS**, **Linux**, and **Windows**. Auto-detects your ComfyUI instal
 
 **Stuck or have a question? [Join the Discord](https://discord.gg/cW9arBhzCu)** — help, model tips, and release announcements.
 
-**87 MCP tools** | **37 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
+**37 MCP tools** | **37 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
 
 The plugin ships **expert skills that grow with every release** — model-specific generation guides with curated download URLs, workflow recipes, troubleshooting, and custom-node authoring — so Claude knows the right sampler, CFG, resolution, and model files for each architecture without trial and error.
 
@@ -249,31 +249,34 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 ## MCP Tools
 
-87 tools across workflow execution, generation, iteration, composition, models, and more:
+37 tools across workflow execution, generation, iteration, composition, models, and more:
 
 ### Image Generation (high-level)
 
 | Tool | Description |
 |------|-------------|
-| `generate_image` | Generate from a text prompt — builds a txt2img workflow, fills unspecified params from your defaults, auto-selects a checkpoint |
-| `generate_with_controlnet` | Generate conditioned by a ControlNet image (pose/depth/canny/normal) + prompt |
-| `generate_with_ip_adapter` | Generate guided by a reference image's style/subject via IP-Adapter (needs ComfyUI_IPAdapter_plus) |
+| `generate_image` `action: "image"` | Generate from a text prompt — builds a txt2img workflow, fills unspecified params from your defaults, auto-selects a checkpoint |
+| `generate_image` `action: "controlnet"` | Generate conditioned by a ControlNet image (pose/depth/canny/normal) + prompt |
+| `generate_image` `action: "ip_adapter"` | Generate guided by a reference image's style/subject via IP-Adapter (needs ComfyUI_IPAdapter_plus) |
+| `generate_image` `action: "video"` / `"3d"` | Generate a short video clip (LTX-2.3, local GPU) or a 3D model (hosted partner API nodes) from the same one-line entry point |
+| `generate_image` `action: "upscale"` | Post-process an uploaded or staged image with ESRGAN super-resolution |
+| generate_image (action:"remove_background") | Post-process an uploaded or staged image into a transparent BiRefNet cutout |
 
 ### Audio Generation (high-level)
 
 | Tool | Description |
 |------|-------------|
-| `generate_audio` | Generate audio from a text prompt — supports ACE Step 1.5 (music with lyrics/structure) and Stable Audio 3 (music, instruments, SFX); auto-selects local models |
+| `generate_image` `action: "audio"` | Generate audio from a text prompt — supports ACE Step 1.5 (music with lyrics/structure) and Stable Audio 3 (music, instruments, SFX); auto-selects local models |
 
 ### Assets & Iteration
 
 | Tool | Description |
 |------|-------------|
-| `view_image` | Return a generated asset's bytes as an inline image so the agent can see the result |
-| `analyze_color` | Palette / contrast / color statistics for a generated image (dominant colors, average + luminance stats, contrast checks) so the agent can reason about color without a vision round-trip |
-| `regenerate` | Re-run the workflow that produced an `asset_id`, with optional parameter overrides |
-| `list_assets` | Browse recently generated assets (newest-first) by `asset_id` |
-| `get_asset_metadata` | Full provenance for an asset, including the originating workflow |
+| `get_image (action:"view")` | Return a generated asset's bytes as an inline image so the agent can see the result |
+| `get_image (action:"analyze_color")` | Palette / contrast / color statistics for a generated image (dominant colors, average + luminance stats, contrast checks) so the agent can reason about color without a vision round-trip |
+| generate_image (action:"regenerate") | Re-run the workflow that produced an `asset_id`, with optional parameter overrides |
+| `get_image (action:"list_assets")` | Browse recently generated assets (newest-first) by `asset_id` |
+| `get_image (action:"asset_metadata")` | Full provenance for an asset, including the originating workflow |
 
 ### Defaults
 
@@ -287,7 +290,9 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 | Tool | Description |
 |------|-------------|
-| `enqueue_workflow` | Submit a workflow (API format JSON) — returns `prompt_id` immediately, non-blocking |
+| `enqueue_workflow` `action: "enqueue"` | Submit a workflow (API format JSON) — returns `prompt_id` immediately, non-blocking |
+| `enqueue_workflow` `action: "rerun"` / `"run_url"` / `"template_schema"` | Re-run a past generation, or read/run a shared workflow from a URL, or inspect a bundled template's overridable slots |
+| enqueue_workflow (action:"run_template") | One-shot: resolve a bundled pack's expert graph, apply `<nodeId>.<widget>` overrides, and enqueue it |
 | `queue` | One action-parameterized tool for the execution queue: `list` (running + pending), `status` (one job by prompt ID), `get_workflow` (a pending job's full payload), `move`/`edit` (requeue a pending job front/back, patched or replaced, with a new prompt ID), `cancel` (interrupt the running job — escalates interrupt → verify → `/free`, reports WEDGED if it won't die; `clear_pending: true` also drops all pending), `cancel_queued`, `clear` |
 | `get_system_stats` | Get system info — GPU, VRAM, Python version, OS |
 
@@ -315,7 +320,7 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 | Tool | Description |
 |------|-------------|
 | `upload_image` | Copy a local image into ComfyUI's `input/` directory for img2img, inpaint, or ControlNet |
-| `list_output_images` | Browse recently generated images **and videos** from the output directory, sorted newest-first — recurses into subfolders (e.g. SaveVideo's `output/video/…`) and returns each result's `subfolder` |
+| `get_image (action:"list_outputs")` | Browse recently generated images **and videos** from the output directory, sorted newest-first — recurses into subfolders (e.g. SaveVideo's `output/video/…`) and returns each result's `subfolder` |
 
 ### Model Management
 
@@ -334,8 +339,7 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 | Tool | Description |
 |------|-------------|
-| `search_custom_nodes` | Search the ComfyUI Registry for custom node packs by keyword |
-| `get_node_pack_details` | Get full details of a custom node pack (description, author, nodes, install info) |
+| `search_custom_nodes` | Search the ComfyUI Registry for node packs by keyword (`action: "search"`), or get one pack's full details (`action: "details"`) |
 | `list_packs` (`action: "generate_skill"`) | Generate a Claude skill `.md` file from a Registry ID or GitHub URL |
 | `comfy_cli` | Search actual loaded node classes through official `comfy nodes search` (action:"search_nodes") |
 
@@ -351,8 +355,9 @@ Install [comfy-cli](https://docs.comfy.org/comfy-cli/getting-started#install-cli
 
 | Tool | Description |
 |------|-------------|
-| `get_logs` | Get ComfyUI server logs with optional keyword filter (e.g., `error`, `warning`, a node name) |
-| `get_history` | Get execution history with full error details, Python tracebacks, timing, and cached node info |
+| `get_system_stats (action:"logs")` | Get ComfyUI server logs with optional keyword filter (e.g., `error`, `warning`, a node name) |
+| `get_history` `action: "list"` | Get execution history with full error details, Python tracebacks, timing, and cached node info |
+| `get_history` `action: "diagnose"` | Explain a FAILED run in one call — the failed node and traceback PLUS the missing models (file + widget) and missing node types |
 
 ### Process Control
 
@@ -366,8 +371,8 @@ Install [comfy-cli](https://docs.comfy.org/comfy-cli/getting-started#install-cli
 
 | Tool | Description |
 |------|-------------|
-| `suggest_settings` | Suggest proven sampler/scheduler/steps/CFG settings from local generation history — query by model family, LoRA hash, or text search |
-| `generation_stats` | Show local generation tracking statistics — total runs, unique combos, breakdown by model family |
+| `get_history` `action: "suggest"` | Suggest proven sampler/scheduler/steps/CFG settings from local generation history — query by model family, LoRA hash, or text search |
+| `get_history` `action: "stats"` | Show local generation tracking statistics — total runs, unique combos, breakdown by model family |
 
 Every `enqueue_workflow` call automatically logs settings to a local SQLite database (`generations.db`). Same settings combos get a `reuse_count` bump instead of duplicates, creating a natural popularity signal. Models and LoRAs are identified by content hash (AutoV2 / SHA256), not filenames — so renamed files still group together.
 
@@ -585,7 +590,7 @@ npx -y comfyui-mcp@latest --comfyui-url http://localhost:8188 --force-remote
 | `COMFYUI_PYTHON` | `python` | Python interpreter used by legacy git-clone dependency fallbacks. Point it at your ComfyUI venv's Python when needed. |
 | `COMFYUI_MCP_BRIDGE_HOST` | `127.0.0.1` | Panel-bridge bind host. Set `0.0.0.0` (or a LAN IP) to run the orchestrator on a 24/7 server and connect panels from other machines — **requires a token** (below); the orchestrator prints a ready-to-paste `ws://…/?token=…` Bridge URL. |
 | `COMFYUI_MCP_BRIDGE_TOKEN` | *(generated when needed)* | Shared secret gating every bridge connection (checked constant-time on the WS upgrade). Mandatory for a non-loopback `COMFYUI_MCP_BRIDGE_HOST`; pin it so the Bridge URL survives restarts. Never logged beyond the startup banner. |
-| `COMFYUI_MCP_DATA_DIR` | `~/.comfyui-mcp` | Base dir for per-instance data (the `generations.db` used by `suggest_settings`) when there's no local `COMFYUI_PATH` (remote/cloud/undetected). Scoped per target under `instances/<host_port>/`. |
+| `COMFYUI_MCP_DATA_DIR` | `~/.comfyui-mcp` | Base dir for per-instance data (the `generations.db` behind `get_history` `action: "suggest"`) when there's no local `COMFYUI_PATH` (remote/cloud/undetected). Scoped per target under `instances/<host_port>/`. |
 | `COMFYUI_API_KEY` | | Comfy Cloud API key. When set, **cloud mode** is active and the server talks to `cloud.comfy.org`. Never logged. |
 | `COMFYUI_CLOUD_URL` | `https://cloud.comfy.org` | Override the Comfy Cloud endpoint (testing/staging). |
 | `COMFYUI_AUTH_TOKEN` | | Generic auth token for a **self-hosted ComfyUI behind a reverse proxy / API gateway** (distinct from Comfy Cloud). When set, attached to every ComfyUI request. Never logged. |
@@ -594,7 +599,7 @@ npx -y comfyui-mcp@latest --comfyui-url http://localhost:8188 --force-remote
 | `CIVITAI_API_TOKEN` | | CivitAI API token for model downloads |
 | `HUGGINGFACE_TOKEN` | | HuggingFace token for higher API rate limits |
 | `GITHUB_TOKEN` | | GitHub token for skill generation (avoids rate limits) |
-| `REGISTRY_ACCESS_TOKEN` | | Comfy Registry API key for `publish_custom_node` (env-only, never logged) |
+| `REGISTRY_ACCESS_TOKEN` | | Comfy Registry API key for `node_pack` (`action: "publish"`) (env-only, never logged) |
 | `COMFYUI_DOWNLOAD_CACHE_DIR` | `~/.comfyui-mcp/cache` | Content-addressed model-download cache (dedup + concurrent coalescing) |
 | `COMFYUI_LRU_CACHE_SIZE_GB` | `0` | Cap the download cache in GB; `0` disables LRU eviction |
 | `COMFYUI_STARTUP_CHECK_INTERVAL_S` / `…_MAX_TRIES` | `1` / `20` | Readiness-probe interval + max tries when starting a local ComfyUI |
@@ -659,7 +664,7 @@ per-harness setup, troubleshooting:
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
 | `setup <agent>` | | | Write the comfyui entry into hermes / openclaw / copilot config, then exit |
-| `--full` / `--tool-mode full` | `COMFYUI_MCP_TOOL_MODE=full` | `compact` | Opt into the full ~200-schema surface; the default compact mode registers 3 meta-tools instead |
+| `--compact` / `--tool-mode compact` | `COMFYUI_MCP_TOOL_MODE=compact` | `full` | Opt into the 3 meta-tools (`list_tools` / `describe_tool` / `call_tool`) instead of the direct surface — recommended for small local models. `--full` is still accepted and is now a no-op |
 
 ### Remote ComfyUI
 
@@ -803,12 +808,14 @@ src/
     workflow-compose.ts    # create_workflow (create/modify/validate/node_info)
     workflow-validate.ts   # the validate action's body
     workflow-library.ts    # get_workflow (8 read actions), save_workflow (save/lock/verify_lock)
-    image-management.ts    # upload_image, list_output_images
+    image-management.ts    # get_image (7 read actions), upload_image (5 write actions)
     model-management.ts    # download_model, list_local_models (the two consolidated model tools)
     memory-management.ts   # clear_vram
-    registry-search.ts     # search_custom_nodes, get_node_pack_details
-    generation-tracker.ts  # suggest_settings, generation_stats
-    diagnostics.ts         # get_logs, get_history
+    registry-search.ts     # search_custom_nodes (search/details)
+    node-management.ts     # install_custom_node (install/update/fix/uninstall/enable/disable/list/…)
+    node-pack.ts           # node_pack (scaffold/verify/publish/read/write/patch/git/…)
+    generation-tracker.ts  # the get_history suggest/stats jobs
+    diagnostics.ts         # get_system_stats (action:"logs"), get_history
     process-control.ts     # restart_comfyui (restart/start/stop)
     index.ts               # Registers all tool groups
   utils/
@@ -864,7 +871,7 @@ This is informational — the server uses the first one found. Set `COMFYUI_PATH
 For HuggingFace gated models, set `HUGGINGFACE_TOKEN`. For CivitAI, set `CIVITAI_API_TOKEN`.
 
 **Workflow execution errors**
-Use `/comfy:debug` to automatically diagnose failures. Or use `get_history` / `get_logs` directly to see detailed error messages including Python tracebacks from ComfyUI.
+Use `/comfy:debug` to automatically diagnose failures. Or use `get_history` (`action: "diagnose"`) / `get_system_stats (action:"logs")` directly to see detailed error messages including Python tracebacks from ComfyUI.
 
 **Out of memory (OOM)**
 Use `clear_vram` to free GPU memory before running large workflows. The VRAM watchdog hook will warn you automatically if memory is critically low. See the **troubleshooting** skill for model-specific VRAM estimates.

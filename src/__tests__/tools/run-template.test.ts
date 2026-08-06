@@ -37,7 +37,7 @@ vi.mock("../../comfyui/client.js", () => ({
   getObjectInfo: () => getObjectInfoMock(),
 }));
 
-import { registerRunTemplateTools } from "../../tools/run-template.js";
+import { registerWorkflowExecuteTools } from "../../tools/workflow-execute.js";
 
 type ToolHandler = (args: Record<string, unknown>) => Promise<{
   isError?: boolean;
@@ -48,11 +48,11 @@ function getHandler(): ToolHandler {
   let handler: ToolHandler | undefined;
   const server = {
     tool: (n: string, _d: string, _s: unknown, h: ToolHandler) => {
-      if (n === "run_template") handler = h;
+      if (n === "enqueue_workflow") handler = h;
     },
   };
-  registerRunTemplateTools(server as never);
-  if (!handler) throw new Error("run_template not registered");
+  registerWorkflowExecuteTools(server as never);
+  if (!handler) throw new Error("enqueue_workflow not registered");
   return handler;
 }
 
@@ -83,11 +83,12 @@ beforeEach(() => {
   getHistoryMock.mockReset();
 });
 
-describe("run_template", () => {
+describe('enqueue_workflow (action:"run_template")', () => {
   it("applies '<nodeId>.<widget>' overrides so the ENQUEUED workflow reflects them", async () => {
     const handler = getHandler();
 
     const res = await handler({
+      action: "run_template",
       template: "anima-txt2img",
       overrides: { "6.text": "a red fox in snow", "3.steps": 8, "3.cfg": 1.5 },
     });
@@ -110,7 +111,7 @@ describe("run_template", () => {
 
   it("enqueues the template unmodified when no overrides given", async () => {
     const handler = getHandler();
-    const res = await handler({ template: "anima-txt2img" });
+    const res = await handler({ action: "run_template", template: "anima-txt2img" });
     expect(res.isError).toBeFalsy();
     const enqueued = enqueueWorkflowMock.mock.calls[0][0] as typeof TEMPLATE_GRAPH;
     expect(enqueued["6"].inputs.text).toBe("default prompt");
@@ -120,7 +121,7 @@ describe("run_template", () => {
     resolvePackWorkflowFileMock.mockReturnValue(null);
     const handler = getHandler();
 
-    const res = await handler({ template: "anima-txt2mg" });
+    const res = await handler({ action: "run_template", template: "anima-txt2mg" });
 
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/No template named .{0,2}anima-txt2mg/);
@@ -130,7 +131,7 @@ describe("run_template", () => {
 
   it("rejects override keys without the nodeId.widget shape", async () => {
     const handler = getHandler();
-    const res = await handler({ template: "anima-txt2img", overrides: { steps: 8 } });
+    const res = await handler({ action: "run_template", template: "anima-txt2img", overrides: { steps: 8 } });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/<nodeId>\.<widget_name>/);
     expect(enqueueWorkflowMock).not.toHaveBeenCalled();
@@ -139,11 +140,11 @@ describe("run_template", () => {
   it("rejects overrides naming a missing node or widget, listing what exists", async () => {
     const handler = getHandler();
 
-    const badNode = await handler({ template: "anima-txt2img", overrides: { "99.text": "x" } });
+    const badNode = await handler({ action: "run_template", template: "anima-txt2img", overrides: { "99.text": "x" } });
     expect(badNode.isError).toBe(true);
     expect(badNode.content[0].text).toMatch(/no node .{0,2}99/);
 
-    const badWidget = await handler({ template: "anima-txt2img", overrides: { "6.nope": "x" } });
+    const badWidget = await handler({ action: "run_template", template: "anima-txt2img", overrides: { "6.nope": "x" } });
     expect(badWidget.isError).toBe(true);
     expect(badWidget.content[0].text).toMatch(/has no input .{0,2}nope/);
     expect(badWidget.content[0].text).toMatch(/text/); // lists available inputs
@@ -153,6 +154,7 @@ describe("run_template", () => {
   it("allows overriding an array-valued widget (not a link — first element isn't a node id)", async () => {
     const handler = getHandler();
     const res = await handler({
+      action: "run_template",
       template: "anima-txt2img",
       overrides: { "6.size": [512, 768] },
     });
@@ -164,7 +166,7 @@ describe("run_template", () => {
   it("rejects overrides targeting a graph CONNECTION (link) input", async () => {
     const handler = getHandler();
     // "3.positive" is ["6", 0] and node "6" exists → a real connection.
-    const res = await handler({ template: "anima-txt2img", overrides: { "3.positive": "x" } });
+    const res = await handler({ action: "run_template", template: "anima-txt2img", overrides: { "3.positive": "x" } });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/CONNECTION/);
     expect(res.content[0].text).toMatch(/seed/); // lists overridable widgets
@@ -182,7 +184,7 @@ describe("run_template", () => {
     });
     const handler = getHandler();
 
-    const p = handler({ template: "anima-txt2img", wait: true, timeout_s: 30 });
+    const p = handler({ action: "run_template", template: "anima-txt2img", wait: true, timeout_s: 30 });
     // first poll: not done → 1.5s sleep → second poll: done
     await vi.waitFor(async () => {
       const res = await p;

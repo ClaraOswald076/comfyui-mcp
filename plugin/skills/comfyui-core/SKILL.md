@@ -130,9 +130,9 @@ SetLatentNoiseMask (samples, mask) → LATENT → KSampler.latent_image
 ### Quick Generation
 
 1. `create_workflow` with template `"txt2img"` and your params
-2. `enqueue_workflow` with the returned JSON — returns `prompt_id` immediately
+2. `enqueue_workflow(action="enqueue")` with the returned JSON — returns `prompt_id` immediately
 3. Poll `queue` (action:"status") with the `prompt_id` until `done` is true
-4. Use `list_output_images` (limit 1) to find the generated image, then `Read` to display it
+4. Use `get_image (action:"list_outputs")` (limit 1) to find the generated image, then `Read` to display it
 
 ### Inspect & Modify
 
@@ -167,8 +167,7 @@ HuggingFace is preferred for official/base models (SDXL, Flux, SD 1.5).
 
 ### Custom Nodes
 
-- `search_custom_nodes` — search the ComfyUI Registry
-- `get_node_pack_details` — get details about a specific pack
+- `search_custom_nodes` — search the ComfyUI Registry (`action: "search"`), or get one pack's details (`action: "details"`)
 - `list_packs` (`action: "generate_skill"`) — auto-generate a skill file for a node pack
 
 ### Workflow Execution
@@ -195,10 +194,10 @@ The script connects to ComfyUI's WebSocket and reports:
 - Errors with node details and messages
 
 **Standard generation pattern:**
-1. `create_workflow` or build workflow JSON + `enqueue_workflow` (repeat for batch)
+1. `create_workflow` or build workflow JSON + `enqueue_workflow(action="enqueue")` (repeat for batch)
 2. Start background monitor with all prompt_ids
 3. Continue conversation — results appear when jobs finish
-4. Use `list_output_images` or `Read` to display the generated images
+4. Use `get_image (action:"list_outputs")` or `Read` to display the generated images
 
 **Do NOT** poll `queue` (action:"status") in a loop. The background monitor replaces polling entirely.
 

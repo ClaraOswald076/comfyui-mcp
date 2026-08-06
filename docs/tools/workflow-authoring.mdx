@@ -21,7 +21,7 @@ Author and check ComfyUI workflow JSON. Driven by the `action` parameter:
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which authoring operation to perform. "create" requires `template` (optional `params`); "modify" requires `workflow` + `operations`; "validate" requires `workflow` (optional `health`); "node_info" takes no required parameters (optional `node_type`, `verbose`, `refresh`). Options: `create`, `modify`, `validate`, `node_info`.
+  Which authoring operation to perform. "create" requires `template` (optional `params`); "modify" requires `workflow` + `operations`; "validate" requires `workflow` (optional `health`); "node_info" takes no required parameters (optional `node_type`, `verbose`, `refresh`). Options: `action:"create"`, `action:"modify"`, `action:"validate"`, `action:"node_info"`.
 </ParamField>
 <ParamField path="template" type="enum">
   action:"create" (REQUIRED) — Template name: txt2img, img2img, upscale, or inpaint Options: `txt2img`, `img2img`, `upscale`, `inpaint`, `controlnet`, `ip_adapter`, `ace_step_15`, `stable_audio_3`, `remove_background`, `ltx_video`.
@@ -172,7 +172,7 @@ DRAW a diagram of, or convert, workflow JSON you PASS IN (a JSON string or objec
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which rendering/conversion to perform. "render", "render_hierarchical" and "to_dsl" require `workflow`; "mermaid" requires `mermaid`; "from_dsl" requires `dsl`. Options: `render`, `render_hierarchical`, `mermaid`, `to_dsl`, `from_dsl`.
+  Which rendering/conversion to perform. "render", "render_hierarchical" and "to_dsl" require `workflow`; "mermaid" requires `mermaid`; "from_dsl" requires `dsl`. Options: `action:"render"`, `action:"render_hierarchical"`, `action:"mermaid"`, `action:"to_dsl"`, `action:"from_dsl"`.
 </ParamField>
 <ParamField path="workflow" type="string | object">
   ComfyUI workflow JSON (as a JSON string or object; API or UI format is auto-detected). REQUIRED for action:"render", action:"render_hierarchical" and action:"to_dsl" — "to_dsl" expects API format (node ID -&gt; &#123;class_type, inputs&#125;).

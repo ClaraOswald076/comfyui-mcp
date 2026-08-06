@@ -48,7 +48,7 @@ describe("get_history (no prompt_id) selection", () => {
     });
 
     const handler = getHandler("get_history");
-    const res = await handler({});
+    const res = await handler({ action: "list" });
     expect(res.content[0].text).toContain("Execution: newest-run");
     expect(res.content[0].text).not.toContain("Execution: older-run");
   });
@@ -56,7 +56,7 @@ describe("get_history (no prompt_id) selection", () => {
   it("still returns the exact entry when a prompt_id is given", async () => {
     getHistoryMock.mockResolvedValue({ "abc-123": entry(7, "abc-123") });
     const handler = getHandler("get_history");
-    const res = await handler({ prompt_id: "abc-123" });
+    const res = await handler({ action: "list", prompt_id: "abc-123" });
     expect(res.content[0].text).toContain("Execution: abc-123");
   });
 });

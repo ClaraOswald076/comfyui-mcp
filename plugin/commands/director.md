@@ -39,7 +39,7 @@ The user wants to create a short film from a story description. This command orc
 
 6. **Phase 3 — Start Frame Review.**
    - For each scene's start frame:
-     - Find the output with `list_output_images(pattern="director_s{N}_start")`
+     - Find the output with `get_image(action:"list_outputs", pattern="director_s{N}_start")`
      - Read the image with `Read` to visually inspect it
      - Show the image to the user and describe what was generated
      - If the user approves, mark `start_frame.approved = true` in state
@@ -49,7 +49,7 @@ The user wants to create a short film from a story description. This command orc
 7. **Phase 4 — End Frame Generation.**
    - `clear_vram` first
    - For each scene with an approved start frame:
-     - `upload_image` the start frame to make it available as `LoadImage` input
+     - `upload_image (action:"image")` the start frame to make it available as `LoadImage` input
      - Build and enqueue the Qwen Edit workflow (see `director` skill, Phase 4 template)
      - Use `filename_prefix: "director_s{N}_end"`
    - After each generation, update state file
@@ -64,7 +64,7 @@ The user wants to create a short film from a story description. This command orc
 9. **Phase 6 — Video Clip Generation.**
    - `clear_vram` first
    - For each scene with approved start AND end frames:
-     - `upload_image` both the start and end frames
+     - `upload_image (action:"image")` both the start and end frames
      - Build and enqueue the WAN 2.2 FLF dual Hi-Lo workflow (see `director` skill, Phase 6 template)
      - Use `filename_prefix: "director_s{N}"`
      - **CRITICAL**: Use dual KSamplerAdvanced (Hi pass steps 0→2, Lo pass steps 2→4). NEVER use single KSampler.

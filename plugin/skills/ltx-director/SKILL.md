@@ -99,7 +99,7 @@ Sibling hidden widgets: `local_prompts`, `segment_lengths`, `guide_strength`,
 image segment just points at a file already in ComfyUI's **input** dir. Full
 agent-drivable recipe:
 
-1. `upload_image` → puts the file in the input dir (note its `subfolder`/name)
+1. `upload_image (action:"image")` → puts the file in the input dir (note its `subfolder`/name)
 2. `imageFile` = `"<subfolder>/<name>.png"`
 3. `imageB64` = `"/api/view?filename=<name>.png&type=input&subfolder=<subfolder>"`
 

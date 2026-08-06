@@ -13,7 +13,7 @@ export const SCENARIOS = [
     id: "health",
     title: "Server health & GPU report",
     task: "Check whether the ComfyUI server is healthy and tell me the GPU name and how much free VRAM it has.",
-    primary: ["health_check", "get_system_stats"],
+    primary: ["get_system_stats"],
     verify: async (_call, t) => /(cuda|nvidia|rtx|gtx|radeon|vram)/i.test(t.finalAnswer),
   },
   {
@@ -44,7 +44,7 @@ export const SCENARIOS = [
     id: "queue",
     title: "Queue inspection",
     task: "How many jobs are currently running or pending in the ComfyUI queue? Answer with the numbers.",
-    primary: ["queue", "health_check", "get_system_stats"],
+    primary: ["queue", "get_system_stats"],
     verify: async (_call, t) => /\d/.test(t.finalAnswer),
   },
   {
@@ -58,7 +58,7 @@ export const SCENARIOS = [
     // 0.50.0 slice 14: the DSL conversion is now visualize_workflow
     // (action:"from_dsl"), and the harness matches on the TOOL name only.
     partial: ["create_workflow", "visualize_workflow"],
-    followup: ["queue", "get_history", "list_output_images", "view_image", "list_assets", "generation_stats"],
+    followup: ["queue", "get_history", "get_image"],
     verify: async (call, t) => {
       // ground truth: the prompt_id the model started must be done with outputs
       const ids = [...t.toolText.matchAll(/"prompt_id":\s*"([0-9a-f-]{8,})"/g)].map((m) => m[1]);
@@ -127,17 +127,29 @@ export const SCENARIOS = [
   },
   {
     id: "provenance",
-    title: "Generate → find asset → regenerate with override",
+    title: "Generate → find asset → re-render it with an override",
     task:
       "Render a 512x512 image of 'a red bicycle' and wait for it to complete. Then find the ASSET it produced " +
-      "(the asset registry lists recent assets), and regenerate that asset with a steps=8 override, waiting for the " +
+      "(the asset registry lists recent assets), and re-render that asset with a steps=8 override, waiting for the " +
       "second render to complete too. Report both prompt_ids.",
     primary: ["generate_image", "enqueue_workflow"],
-    partial: ["create_workflow", "list_assets", "get_asset_metadata"],
+    partial: ["create_workflow", "get_image"],
     verify: async (call, t) => {
-      // regenerate must have actually run, and there must be two DISTINCT
+      // The re-render must have actually run, and there must be two DISTINCT
       // completed prompts.
-      if (!t.calls.some((c) => c.tool === "regenerate" && c.ok)) return false;
+      //
+      // 0.50.0 slice 16 folded the standalone re-render tool into
+      // generate_image, so the tool NAME no longer identifies it — the model
+      // calls generate_image for the first render too, and matching on the name
+      // alone would pass this scenario on the opening call. The ACTION is what
+      // separates them, which is why llm-arena.mjs records the arguments.
+      if (
+        !t.calls.some(
+          (c) => c.tool === "generate_image" && c.args?.action === "regenerate" && c.ok,
+        )
+      ) {
+        return false;
+      }
       const ids = [...new Set([...t.toolText.matchAll(/"prompt_id":\s*"([0-9a-f-]{8,})"/g)].map((m) => m[1]))];
       if (ids.length < 2) return false;
       let done = 0;
@@ -203,10 +215,15 @@ export const SCENARIOS = [
       "and wait for it too. Do NOT guess file paths — use the staging tool that feeds a previous output into the next " +
       "stage's loader. Report both prompt_ids.",
     primary: ["enqueue_workflow", "generate_image"],
-    partial: ["create_workflow", "stage_output_as_input"],
+    partial: ["create_workflow", "upload_image"],
     verify: async (call, t) => {
-      // the staging tool must have actually run…
-      if (!t.calls.some((c) => c.tool === "stage_output_as_input" && c.ok)) return false;
+      // the staging ACTION must have actually run. 0.50.0 slice 15 folded
+      // the standalone staging tool into upload_image, so the tool name alone no
+      // longer proves it: a plain action:"image" upload of a local file would
+      // satisfy a name-only check while doing the opposite of what the task
+      // asked. Assert the action too.
+      if (!t.calls.some((c) => c.tool === "upload_image" && c.args?.action === "stage" && c.ok))
+        return false;
       const base = process.env.COMFYUI_URL ?? "http://127.0.0.1:8188";
       const ids = [...new Set([...t.toolText.matchAll(/"prompt_id":\s*"([0-9a-f-]{8,})"/g)].map((m) => m[1]))];
       if (ids.length < 2) return false;

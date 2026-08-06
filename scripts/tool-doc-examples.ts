@@ -36,10 +36,12 @@
  * model-facing text untouched.
  *
  * COVERAGE IS DELIBERATELY PARTIAL. The beginner path is covered end to end;
- * expert surfaces (training, comfy-cli's 26 actions, node authoring) are left on
- * the skeleton until someone writes examples worth reading. A missing example is
- * an honest gap; a made-up one is a bug. RunPod left that list in 0.50.0 — see
- * the note above its entries for why a skeleton stopped being adequate there.
+ * expert surfaces (training, comfy-cli's 26 actions) are left on the skeleton
+ * until someone writes examples worth reading. A missing example is an honest
+ * gap; a made-up one is a bug. RunPod left that list in 0.50.0, and node
+ * authoring left it in the same release — see the notes above their entries for
+ * why a skeleton stopped being adequate for a tool whose only required field is
+ * `action`.
  */
 
 export interface ToolDocExample {
@@ -101,14 +103,17 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
   // -------------------------------------------------------------------------
   generate_image: {
     gloss:
-      "The one-line way to get a picture. You do not need a workflow open, or " +
-      "any workflow at all — describe the image and this builds and runs a " +
-      "sensible graph for you. Everything except the prompt is optional and " +
-      "falls back to your saved defaults.",
+      "The one-line way to get a picture — and, through `action`, the same " +
+      "one-line way to get audio, a video clip, a 3D model, a re-run of an " +
+      "earlier image, an upscale, or a background removed. You do not need a " +
+      "workflow open, or any workflow at all: describe what you want and this " +
+      "builds and runs a sensible graph for you. Everything except `action` " +
+      "and the one or two fields that action needs is optional and falls back " +
+      "to your saved defaults.",
     examples: [
       {
         ask: "Make me a picture of a red fox in the snow.",
-        args: { prompt: "a red fox in deep snow, golden hour, sharp focus" },
+        args: { action: "image", prompt: "a red fox in deep snow, golden hour, sharp focus" },
         returns:
           "The finished image, inline in the conversation, plus the seed and " +
           "settings that produced it so you can ask for the same thing again.",
@@ -116,6 +121,7 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
       {
         ask: "Same fox, but widescreen, more detail, and keep it repeatable.",
         args: {
+          action: "image",
           prompt: "a red fox in deep snow, golden hour, sharp focus",
           negative_prompt: "blurry, watermark, text",
           width: 1344,
@@ -129,13 +135,10 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
           "this again with the same settings gives the same picture — that is " +
           "how you iterate on one image instead of rolling a new one each time.",
       },
-    ],
-  },
-  generate_video: {
-    examples: [
       {
         ask: "Turn that fox picture into a short clip of it walking.",
         args: {
+          action: "video",
           prompt: "a red fox walking through deep snow, camera slowly pushing in",
           seconds: 5,
           resolution: "832x480",
@@ -146,143 +149,114 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
           "far longer than a still — minutes, not seconds — so the agent will " +
           "usually tell you it has started and then report back.",
       },
+      {
+        ask: "That one was nearly right — run it again with more steps.",
+        args: {
+          action: "regenerate",
+          asset_id: "a3f9c1",
+          overrides: { steps: 40 },
+        },
+        returns:
+          "A new render from the EXACT graph that produced that asset, with " +
+          "only the fields you named changed. The seed is re-rolled unless you " +
+          "pass one, so this gives you a fresh take rather than the same image.",
+      },
     ],
   },
 
   // -------------------------------------------------------------------------
   // Workflow Execution
   // -------------------------------------------------------------------------
-  health_check: {
+  get_system_stats: {
     gloss:
-      "The first thing to try when something is not working. It answers \"is " +
-      "ComfyUI actually up, and can it see my models?\" in one call.",
+      'Three read-only views of the connected ComfyUI: action:"stats" for what ' +
+      'it is running on, action:"logs" for what it has said, and ' +
+      'action:"health" for whether it is fit to dispatch work to. Nothing here ' +
+      "changes anything — freeing VRAM is clear_vram, and filing a bug is " +
+      "report_issue.",
     examples: [
       {
+        ask: "How much VRAM have I got left?",
+        args: { action: "stats" },
+        returns:
+          "The GPU, its total and free VRAM, system RAM, and the ComfyUI and " +
+          "Python versions.",
+      },
+      {
         ask: "Is everything working?",
-        args: {},
+        args: { action: "health" },
         returns:
           "Whether the server is reachable, what it is running on, and whether " +
           "the model folders have anything in them.",
       },
       {
         ask: "Check the setup, and tell me if any recent runs blew up.",
-        args: { model_categories: ["checkpoints", "loras"], recent_errors: 5 },
+        args: { action: "health", model_categories: ["checkpoints", "loras"], recent_errors: 5 },
         returns:
           "The same report, narrowed to the two model folders you asked about, " +
           "with the last five errors from history attached.",
       },
-    ],
-  },
-  queue: {
-    gloss:
-      "One tool for everything to do with the job queue — see what is waiting, " +
-      "reorder it, cancel something. Which job it does is set by `action`. This " +
-      "is the shape most of the newer tools have; see " +
-      "[Using the tools](/using-tools) for why.",
-    examples: [
       {
-        ask: "What's still running?",
-        args: { action: "list" },
-        returns:
-          "The job currently rendering and everything queued behind it, each " +
-          "with its prompt_id — the receipt you use to ask about one job later.",
-      },
-      {
-        ask: "Kill the one that's running, it's wrong.",
-        args: { action: "cancel", prompt_id: "8f3c1a02-6d4e-4b9a-9f21-77c0be5d1e44" },
-        returns: "Confirmation that the job was interrupted.",
-        caution:
-          "This stops work in progress and you do not get the partial result. " +
-          "If you share this ComfyUI with anyone else, make sure the job is yours.",
-      },
-      {
-        ask: "Clear the whole queue, I want to start over.",
-        args: { action: "clear", clear_pending: true },
-        returns: "Confirmation of how many jobs were dropped.",
-        caution:
-          "Destructive and not undoable — every waiting job is discarded, " +
-          "including any that someone else queued.",
-      },
-    ],
-  },
-  get_history: {
-    examples: [
-      {
-        ask: "Did that finish? What did it produce?",
-        args: { prompt_id: "8f3c1a02-6d4e-4b9a-9f21-77c0be5d1e44" },
-        returns:
-          "That run's outcome and the files it wrote. Omit `prompt_id` to get " +
-          "recent runs instead of one specific one.",
-      },
-    ],
-  },
-  diagnose_run: {
-    gloss:
-      "For when a run failed and the error text does not mean anything to you. " +
-      "This reads the failure and tells you what to do about it.",
-    examples: [
-      {
-        ask: "That render failed and I don't understand the error.",
-        args: { prompt_id: "8f3c1a02-6d4e-4b9a-9f21-77c0be5d1e44" },
-        returns:
-          "A plain reading of what went wrong — a missing model, a bad " +
-          "connection, not enough VRAM — and the suggested fix. Omit " +
-          "`prompt_id` and it looks at the most recent failure.",
-      },
-    ],
-  },
-  get_system_stats: {
-    examples: [
-      {
-        ask: "How much VRAM have I got left?",
-        args: {},
-        returns:
-          "The GPU, its total and free VRAM, system RAM, and the ComfyUI and " +
-          "Python versions.",
+        ask: "Show me the last errors from the server log.",
+        args: { action: "logs", keyword: "error", max_lines: 50 },
+        returns: "The last fifty log lines that mention 'error', ANSI codes stripped.",
       },
     ],
   },
   enqueue_workflow: {
     gloss:
-      "Runs a workflow that the agent is holding in the conversation — one it " +
-      "just built or loaded from a file. If you want to run the graph you are " +
+      "Starts a render. `action` says where the graph comes from: one the " +
+      "agent is holding in the conversation, an earlier run, a URL someone " +
+      "shared, or a bundled template. If you want to run the graph you are " +
       "LOOKING at in ComfyUI, that is the panel's run tool instead, and if you " +
       "just want a picture, use generate_image.",
     examples: [
       {
         ask: "Run it.",
-        args: { workflow: WORKFLOW_FRAGMENT },
+        args: { action: "enqueue", workflow: WORKFLOW_FRAGMENT },
         argsNote: FRAGMENT_NOTE,
         returns:
           "A prompt_id straight away, then the finished images once the render " +
           "completes.",
       },
-    ],
-  },
-  get_template_schema: {
-    examples: [
       {
-        ask: "What can I change about the Flux template?",
-        args: { template: "flux_dev_full_text_to_image" },
+        ask: "What can I change about the anima text-to-image pack?",
+        args: { action: "template_schema", template: "anima-txt2img" },
         returns:
           "The knobs that template exposes — prompt, size, steps, which model " +
-          "file — with their current values, so you know what to pass to " +
-          "run_template.",
+          "file — with their current values, and the exact keys to pass as " +
+          "`overrides` when you run it. Read-only.",
       },
-    ],
-  },
-  run_template: {
-    examples: [
       {
-        ask: "Run the Flux template with my prompt and wait for it.",
+        ask: "Run the anima pack with my prompt and wait for it.",
         args: {
-          template: "flux_dev_full_text_to_image",
-          overrides: { prompt: "a lighthouse in a storm, dramatic sky" },
+          action: "run_template",
+          template: "anima-txt2img",
+          overrides: { "45.text": "a lighthouse in a storm, dramatic sky" },
           wait: true,
         },
+        argsNote:
+          "Override keys are `\"<nodeId>.<widget_name>\"`, not bare parameter names — " +
+          "a plain `\"prompt\"` is rejected. 45 is the positive CLIPTextEncode in THIS " +
+          "pack; every template numbers its nodes differently, so read the keys off " +
+          "the schema call above rather than copying this one.",
         returns:
           "With `wait: true`, the finished result in one go. Leave it off and " +
           "you get a prompt_id immediately and check back later.",
+      },
+      {
+        ask: "Someone posted this workflow — what is in it?",
+        args: {
+          action: "run_url",
+          url: "https://raw.githubusercontent.com/comfyanonymous/ComfyUI_examples/master/flux/flux_dev_example.json",
+        },
+        returns:
+          "A summary of the graph and a validation report, WITHOUT running it. " +
+          "Add `run: true` to enqueue it once you have read what it does.",
+        caution:
+          "`run: true` executes a graph you did not write on your own GPU. " +
+          "Read the summary first — a shared workflow can pull in models and " +
+          "custom nodes you do not have, and will fail late if so.",
       },
     ],
   },
@@ -497,15 +471,24 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
   // -------------------------------------------------------------------------
   // Assets & Images
   // -------------------------------------------------------------------------
-  list_output_images: {
+  // The three read-side image tools are ONE tool since 0.50.0 slice 15, chosen
+  // with `action`. The skeleton the generator would otherwise emit is
+  // `{"action": "get"}` — a call that returns the handler's missing-`filename`
+  // error — so, as with runpod below, real calls are worth more than a skeleton
+  // here. Every `args` object is validated against the live zod schema at
+  // generation time.
+  get_image: {
     gloss:
-      "What has ComfyUI actually written to disk lately. Worth knowing: video " +
-      "nodes often finish without registering in ComfyUI's history, so this is " +
-      "the reliable way to confirm a video really rendered.",
+      "Everything the agent does to LOOK at what ComfyUI made: browse what has " +
+      "been written to disk, fetch one file, put a picture in front of the " +
+      "agent, re-encode it, or measure its colour. Worth knowing: video nodes " +
+      "often finish without registering in ComfyUI's history, so " +
+      "`action: \"list_outputs\"` is the reliable way to confirm a video really " +
+      "rendered.",
     examples: [
       {
         ask: "Show me the last few things I generated.",
-        args: { limit: 10 },
+        args: { action: "list_outputs", limit: 10 },
         returns:
           "The ten newest files, newest first, each with whether it is an image " +
           "or a video, its folder, size and time. Not the pictures themselves — " +
@@ -513,38 +496,96 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
       },
       {
         ask: "Did that fox render ever come out?",
-        args: { pattern: "fox", limit: 5 },
+        args: { action: "list_outputs", pattern: "fox", limit: 5 },
         returns: "Only files whose names contain \"fox\".",
       },
-    ],
-  },
-  view_image: {
-    gloss:
-      "Puts an image in front of the agent so it can actually look at it — for " +
-      "\"is this any good?\", \"compare these two\", \"what is wrong with the hands\".",
-    examples: [
       {
         ask: "Show me that one.",
-        args: { asset_id: "asset_01HQ8Z3K7V" },
+        args: { action: "view", asset_id: "asset_01HQ8Z3K7V" },
         returns:
           "The image inline, visible to both of you. The asset id comes from " +
-          "the completion message of the run that made it.",
+          "the completion message of the run that made it. Images only — for " +
+          "video and audio use `action: \"get\"`, which saves to disk.",
       },
-    ],
-  },
-  get_image: {
-    examples: [
       {
         ask: "Save that render onto my desktop.",
         args: {
+          action: "get",
           filename: "portrait_00042_.png",
           type: "output",
           save_dir: "C:/Users/me/Desktop",
         },
         returns:
           "The file copied to that folder, and the path it landed at. Use this " +
-          "rather than view_image for video and audio, which cannot be shown " +
-          "inline.",
+          "rather than `action: \"view\"` for video and audio, which cannot be " +
+          "shown inline.",
+      },
+      {
+        ask: "Why does this render look so washed out?",
+        args: { action: "analyze_color", filename: "portrait_00042_.png" },
+        returns:
+          "Measured numbers rather than an opinion: black and white points, " +
+          "contrast, saturation, per-channel colour cast and clipping, plus " +
+          "flags like washedOut/liftedBlacks and a one-line verdict. Read-only.",
+      },
+      {
+        ask: "Make me a smaller JPEG of that so I can email it.",
+        args: {
+          action: "convert",
+          path: "portrait_00042_.png",
+          format: "jpeg",
+          quality: 85,
+        },
+        returns:
+          "The re-encoded image inline, with the source and output sizes and how " +
+          "many bytes were saved.",
+        caution:
+          "Passing `out_path` also WRITES the converted file under the ComfyUI " +
+          "output directory, overwriting whatever is already at that path.",
+      },
+      {
+        ask: "What have I made recently?",
+        args: { action: "list_assets", limit: 5 },
+        returns:
+          "The five newest registered assets with their asset ids, prompt ids, " +
+          "filenames and when they were made — including renders this session " +
+          "never watched, which are reconciled from ComfyUI's history on the " +
+          "way. Feed an asset id to `action: \"view\"` to actually see one.",
+      },
+      {
+        ask: "What settings produced that image?",
+        args: { action: "asset_metadata", asset_id: "asset_01HQ8Z3K7V" },
+        returns:
+          "Full provenance for the asset, including the entire workflow that " +
+          "produced it — the prompt, sampler, steps, seed and so on. Read this " +
+          'before generate_image (action:"regenerate") with overrides.',
+      },
+    ],
+  },
+
+  upload_image: {
+    gloss:
+      "The other direction: putting a file where ComfyUI can read it. A local " +
+      "file goes into ComfyUI's input/ folder (`image`/`video`/`audio`), an " +
+      "existing render is re-registered as an input without touching the disk " +
+      "(`stage` — the correct way to chain one stage into the next), and " +
+      "`output` is the only action that sends anything OFF this machine.",
+    examples: [
+      {
+        ask: "Use this photo as the starting image.",
+        args: { action: "image", source_path: "C:/Users/me/Pictures/cat.png" },
+        returns:
+          "The filename it was stored under in ComfyUI's input/ directory — drop " +
+          "that into a LoadImage node's `image` widget.",
+      },
+      {
+        ask: "Now feed that render into the video stage.",
+        args: { action: "stage", filename: "portrait_00042_.png" },
+        returns:
+          "The same file registered as an INPUT, with the filename to put in the " +
+          "next stage's loader. Goes through the server API, so it works even " +
+          "when ComfyUI was launched with custom input/output directories — " +
+          "never guess a filesystem `input/` path.",
       },
     ],
   },
@@ -638,21 +679,43 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
   // Custom Nodes
   // -------------------------------------------------------------------------
   search_custom_nodes: {
+    gloss:
+      "Finding a node pack in the public registry, before you install anything. " +
+      "Read-only and network-only — it does not need a running ComfyUI. " +
+      "Installing what you find is a different tool: `install_custom_node`.",
     examples: [
       {
         ask: "Is there a node pack for face detailing?",
-        args: { query: "face detailer", limit: 5 },
+        args: { action: "search", query: "face detailer", limit: 5 },
         returns:
           "Matching packs from the registry with their ids, authors and " +
           "descriptions. The id is what install_custom_node wants.",
       },
+      {
+        ask: "Tell me more about that Impact Pack before I install it.",
+        args: { action: "details", id: "comfyui-impact-pack" },
+        returns:
+          "The pack's description, author, license, repository, install count, " +
+          "the node types it provides, and its recent version changelogs.",
+      },
     ],
   },
   install_custom_node: {
+    // Same reason RunPod stopped being adequate on the skeleton (see the header):
+    // 0.50.0 slice 12 made `action` the only REQUIRED field, so the generated
+    // skeleton collapses to {"action": "install"} and the documented call
+    // deterministically hits the handler's missing-`id` error. For a surface that
+    // runs third-party code and can REMOVE an installed pack, "the documented
+    // call does not work" is not an acceptable gap.
+    gloss:
+      "Everything you do to someone ELSE'S node pack once you have found it: " +
+      "install it, keep it working, turn it off, remove it. One tool for the " +
+      "whole pack lifecycle, chosen with `action`. FINDING a pack is " +
+      "`search_custom_nodes`; writing your own is `node_pack`.",
     examples: [
       {
         ask: "Install the Impact Pack.",
-        args: { id: "comfyui-impact-pack" },
+        args: { action: "install", id: "comfyui-impact-pack" },
         returns:
           "Progress, then confirmation. New nodes do not appear until ComfyUI " +
           "restarts — the agent will normally offer to do that for you.",
@@ -660,6 +723,129 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
           "A custom node pack is third-party code that runs inside your " +
           "ComfyUI. Install packs you have reason to trust, the same as any " +
           "other plugin.",
+      },
+      {
+        ask: "What node packs have I got installed?",
+        args: { action: "list" },
+        returns:
+          "Every installed pack with its version and whether it is enabled or " +
+          "disabled. Read-only.",
+      },
+      {
+        ask: "That pack has been broken since the last update — repair it.",
+        args: { action: "fix", id: "comfyui-impact-pack" },
+        returns:
+          "What the repair did to the pack's install and Python dependencies. A " +
+          "restart is usually needed before the result is visible.",
+        caution:
+          "Repairing re-runs the pack's own install step, which is third-party " +
+          "code. Pass id \"all\" only if you mean every installed pack.",
+      },
+      {
+        ask: "Turn that pack off but don't delete it — I want to see if it's the culprit.",
+        args: { action: "disable", id: "comfyui-impact-pack" },
+        returns:
+          "Confirmation, re-read from the installed-pack list so a Manager no-op " +
+          "is reported as NOT disabled rather than as success. Restart ComfyUI " +
+          "for it to take effect; action \"enable\" puts it back.",
+      },
+      {
+        ask: "Get rid of that pack for good.",
+        args: { action: "uninstall", id: "comfyui-impact-pack" },
+        returns:
+          "Confirmation, but only after the installed-pack list is re-read and " +
+          "the pack is provably GONE. An id that resolves nowhere is refused " +
+          "before anything is queued.",
+        caution:
+          "This REMOVES the pack and is irreversible through this tool — any " +
+          "workflow using its nodes will go red. For a cleanup audit use action " +
+          "\"disable\" first, which is reversible.",
+      },
+    ],
+  },
+  node_pack: {
+    // Same reasoning as install_custom_node above: `action` is the only required
+    // field, so the skeleton documents a call that cannot work. This tool also
+    // WRITES files and runs git, so the examples carry the cautions.
+    gloss:
+      "The loop for authoring YOUR OWN node pack: scaffold it, read and edit its " +
+      "source, check it actually loads, commit it, publish it. Everything is " +
+      "local and jailed to `custom_nodes/`. Installing someone else's pack is " +
+      "`install_custom_node`.",
+    examples: [
+      {
+        ask: "Start me a new node pack called my-cool-nodes.",
+        args: {
+          action: "scaffold",
+          name: "my-cool-nodes",
+          display_name: "My Cool Nodes",
+        },
+        returns:
+          "The files it wrote under custom_nodes/my-cool-nodes/ — pyproject.toml, " +
+          "__init__.py and a runnable sample node. Restart ComfyUI to load it.",
+      },
+      {
+        ask: "Where is that pack's sampler class defined?",
+        args: { action: "search", query: "class .*Sampler", glob: "**/*.py" },
+        returns:
+          "File/line/text matches under custom_nodes/, capped so a broad regex " +
+          "cannot flood the reply. Read-only.",
+      },
+      {
+        ask: "Show me the top of that file.",
+        args: { action: "read", path: "my-cool-nodes/src/nodes.py", line_count: 60 },
+        returns:
+          "The requested line range, with a truncation notice if it was clipped.",
+      },
+      {
+        ask: "Replace that file with the fixed version.",
+        args: {
+          action: "write",
+          path: "my-cool-nodes/src/nodes.py",
+          content: "# ...the full new contents of the file...",
+          overwrite: true,
+        },
+        argsNote:
+          "`content` is the COMPLETE new file, shortened to one line here. For a " +
+          "small edit prefer action \"patch\", which applies a unified diff.",
+        returns: "The path written and its byte count.",
+        caution:
+          "With overwrite true this replaces the whole file. There is no undo " +
+          "here — commit first with action \"git\" if the pack is a repo.",
+      },
+      {
+        ask: "Does my pack actually load?",
+        args: { action: "verify", name: "my-cool-nodes" },
+        returns:
+          "Whether each of the pack's node classes appeared in /object_info. A " +
+          "class that is missing failed to import — that is your bug.",
+        caution:
+          "By default this RESTARTS your local ComfyUI, which aborts anything " +
+          "rendering. Pass restart false to check the live server as-is.",
+      },
+      {
+        ask: "Commit what I changed in that pack.",
+        args: {
+          action: "git",
+          pack: "my-cool-nodes",
+          git_action: "commit",
+          message: "fix: sampler returns the right latent",
+        },
+        returns:
+          "The git output, capped. status/diff/log always work; commit and push " +
+          "need COMFYUI_MCP_ALLOW_GIT_WRITES=1 and otherwise return a structured " +
+          "refusal naming that flag.",
+      },
+      {
+        ask: "Publish it to the registry.",
+        args: { action: "publish", name: "my-cool-nodes" },
+        returns:
+          "What comfy-cli published, after pyproject.toml is validated for a real " +
+          "name, version and PublisherId.",
+        caution:
+          "IRREVERSIBLE and PUBLIC: this creates or updates a version on " +
+          "registry.comfy.org that this tool cannot take back. Needs comfy-cli " +
+          "and REGISTRY_ACCESS_TOKEN.",
       },
     ],
   },
@@ -710,54 +896,62 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
       },
     ],
   },
-  install_panel: {
+  install_comfyui: {
     gloss:
-      "Installs and updates the Agent sidebar inside ComfyUI. This is the fix " +
-      "when a tool refuses with \"this panel is too old\".",
+      "One tool for everything that INSTALLS or UPDATES: ComfyUI itself, every " +
+      "custom node pack, the Agent sidebar panel, this MCP server, and " +
+      "ComfyUI-Manager's own settings. `action` picks which — and nothing here " +
+      'is read-only except action:"environment" and the two "status" ' +
+      "sub-actions.",
     examples: [
       {
+        ask: "Tell me about my setup — useful when I'm reporting a bug.",
+        args: { action: "environment" },
+        returns:
+          "Where ComfyUI is installed, the Python and torch versions, the GPU, " +
+          "and which settings are in force. The first thing to paste into an " +
+          "issue.",
+      },
+      {
         ask: "What version of the panel have I got?",
-        args: { action: "status" },
+        args: { action: "panel", panel_action: "status" },
         returns:
           "The installed panel version, where it lives, and whether it is " +
-          "pinned. This action changes nothing.",
+          "pinned. This changes nothing.",
       },
       {
         ask: "It says my panel is too old — update it.",
-        args: { action: "update" },
+        args: { action: "panel", panel_action: "update" },
         returns:
           "The update result. Two more steps are yours: restart ComfyUI, then " +
           "hard-refresh the ComfyUI browser tab (Ctrl+Shift+R). Without that " +
           "refresh the tab keeps running the old cached panel code and the same " +
           "refusal comes back.",
       },
-    ],
-  },
-  get_environment: {
-    examples: [
       {
-        ask: "Tell me about my setup — useful when I'm reporting a bug.",
-        args: {},
-        returns:
-          "Where ComfyUI is installed, the Python and torch versions, the GPU, " +
-          "and which settings are in force. The first thing to paste into an " +
-          "issue.",
-      },
-    ],
-  },
-  self_update: {
-    examples: [
-      {
-        ask: "Am I on the latest version?",
-        args: { action: "status" },
+        ask: "Am I on the latest comfyui-mcp?",
+        args: { action: "self_update", self_update_action: "status" },
         returns: "Your version, the latest published version, and whether they differ.",
       },
       {
-        ask: "Update it.",
-        args: { action: "update" },
+        ask: "Update comfyui-mcp itself.",
+        args: { action: "self_update", self_update_action: "update" },
         returns:
           "The upgrade result. Your MCP client has to be restarted afterwards " +
           "to pick up the new server.",
+        caution:
+          "This updates THIS server, not ComfyUI and not the sidebar panel — " +
+          'those are action:"update" and action:"panel".',
+      },
+      {
+        ask: "Update every custom node I have installed.",
+        args: { action: "update_all" },
+        returns:
+          "Confirmation that the bulk update was queued with ComfyUI-Manager. " +
+          "It runs asynchronously and ComfyUI usually needs a restart after.",
+        caution:
+          "This moves EVERY installed pack, not just the one that is broken. " +
+          "It is refused while the sidebar panel is version-pinned.",
       },
     ],
   },

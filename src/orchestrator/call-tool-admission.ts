@@ -5,11 +5,20 @@
  * call site.
  */
 
+import { retiredToolMessage } from "../tools/vocabulary.js";
+
 /** The direct tool channel: a mobile client can invoke these READ/DOWNLOAD backend
  *  tools without an agent turn (structured nav data + rig downloads). The
  *  bridge is already token-gated; this whitelist keeps call_tool to non-destructive
- *  tools (no restart/remove/clear/install). */
-const CALL_TOOL_WHITELIST = new Set<string>([
+ *  tools (no restart/remove/clear/install).
+ *
+ *  Exported for the tests only — nothing outside this module reads it, and no
+ *  package entry point re-exports it. The tests need it to assert two properties
+ *  over the WHOLE set rather than over a handful of spelled names that the 0.50.0
+ *  consolidation would rot within hours: that every whitelisted name is still a
+ *  LIVE tool, and that every live tool it does NOT carry is refused with the
+ *  byte-identical legacy string. */
+export const CALL_TOOL_WHITELIST = new Set<string>([
   // The canvas-less client's whole read side of the saved-workflow library.
   // FIVE separate entries lived here — the library listing, the file read, the
   // summary, the graph query and the PNG-metadata extractor — until 0.50.0
@@ -18,7 +27,19 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   // admitted for free by the swap, so admission is ACTION-scoped below to
   // exactly the five that were already reachable — see CALL_TOOL_ACTION_WHITELIST.
   "get_workflow",
-  "list_output_images",
+  // The image browsing surface a canvas-less/mobile client actually uses: the
+  // output listing and the fetch-by-filename. Both names were whitelisted
+  // individually until 0.50.0 slice 15 folded twelve image/asset tools into
+  // `get_image` (7 actions) + `upload_image` (5). One entry now stands where
+  // two did, so admission is ACTION-scoped below to exactly the two actions the
+  // two retired entries covered — see CALL_TOOL_ACTION_WHITELIST.
+  //
+  // NOTE: `upload_image` was NOT whitelisted before the fold and is deliberately
+  // still absent. Every one of its actions WRITES — a local file into ComfyUI's
+  // input/ directory, a server-side output back into that directory, or a
+  // generated output off the machine into an S3/Azure/HTTP/HuggingFace
+  // destination the caller names. None of that was reachable from a canvas-less
+  // client and none of it becomes reachable here.
   "get_image",
   // Inventory listing only. 0.50.0 slice 11 folded six model tools into this
   // name — including `remove`, which UNLINKS a model file — so admission is
@@ -32,6 +53,17 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   // CivitAI download, the URL download, and the app-panel's missing-model
   // resolver) and nothing else.
   "download_model",
+  // Queue a render the user explicitly tapped. 0.50.0 slice 16 folded FOUR more
+  // enqueue entry points into this name — re-run from history, run-from-URL,
+  // template-schema and template-run — and NOT ONE of their standalone names
+  // was whitelisted here.
+  // The dispatcher authorizes by tool NAME and then forwards arbitrary action
+  // arguments, so leaving this entry unscoped would silently admit all four, and
+  // action:"run_url" in particular FETCHES A WORKFLOW FROM AN ARBITRARY URL AND
+  // EXECUTES IT. A confirmation-less mirrored/foreign tab must not be able to do
+  // that, so this name is ACTION-scoped below to exactly ["enqueue"] — the
+  // ground its pre-fold entry actually covered. See
+  // CALL_TOOL_ACTION_WHITELIST.
   "enqueue_workflow",
   // Persist a workflow to the ComfyUI library (mobile "pull workflow from a
   // CivitAI example" → save_workflow). Writes a workflow file (auto-converts
@@ -56,7 +88,18 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   // live canvas state (panel_get_errors); a phone has no canvas, so it reads
   // the same story server-side from history + re-validating the graph that ran.
   // Read-only.
-  "diagnose_run",
+  //
+  // 0.50.0 slice 16 retired that standalone diagnosis name into `get_history`
+  // (action:"diagnose"), and `get_history` was NOT on this whitelist — so the
+  // fold cuts the OTHER way from enqueue_workflow above. Doing nothing would
+  // have left the panel calling a name that no longer exists, admission
+  // refusing the name that replaced it, and the feature breaking with a FALSE
+  // REFUSAL — a regression no vocabulary gate can see, because it hunts prose,
+  // not allowlist entries. The name is therefore ADDED here and ACTION-scoped
+  // below to exactly ["diagnose"], which is precisely the capability the
+  // retired entry admitted: list/stats/suggest were never reachable from this
+  // channel and still are not.
+  "get_history",
   // The training surface for the panel/mobile Training tab: flow/model
   // discovery, progress polling, dataset curation, job introspection and
   // cleanup, plus the user-initiated ops (stage a dataset, launch a run, cancel
@@ -123,8 +166,29 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   // name, so admission is ACTION-scoped below to exactly what the retired entry
   // covered. Whitelisting the bare name would turn a read into an install.
   "list_packs",
-  "list_installed_nodes",
+  //
+  // 0.50.0 slice 12 folded NINE custom-node lifecycle names into
+  // `install_custom_node`, and only TWO of them were ever whitelisted here:
+  // install_custom_node itself and the installed-pack LIST tool (whose own
+  // entry sat right here until this slice retired the name). The other seven
+  // arrived as ACTIONS on a name that was already admitted, which is a
+  // broadening created purely by the fold — so the entry is ACTION-scoped below
+  // to exactly install + list. See CALL_TOOL_ACTION_WHITELIST.
   "install_custom_node",
+  // The other two thirds of slice 12 are deliberately ABSENT and must stay so:
+  //
+  //   `search_custom_nodes` (registry search + pack details) is read-only and
+  //   network-only, but neither of the two names it now covers was EVER
+  //   whitelisted here, and adding it would be inventing reachability rather
+  //   than preserving it. The dependency side-panel reads what a workflow needs
+  //   through download_model (action:"resolve_missing") and list_packs
+  //   (action:"extract_deps"), which are whitelisted above; nothing asks a
+  //   canvas-less client to browse the public registry.
+  //
+  //   `node_pack` (scaffold/verify/publish/read/write/patch/git on the user's
+  //   own source) has three actions that are arbitrary file writes and git
+  //   operations under custom_nodes/, and not one of the nine names it replaces
+  //   was ever reachable from a canvas-less client either.
 ]);
 
 /**
@@ -140,8 +204,12 @@ const CALL_TOOL_WHITELIST = new Set<string>([
  * whitelist entry was already judged over the whole tool).
  *
  * Wired ONLY where a slice's whitelist swap would otherwise broaden admission.
+ *
+ * Exported for the tests only, on the same terms as CALL_TOOL_WHITELIST above:
+ * the money guard has to be asserted over every entry in this map, not over the
+ * one or two a test happened to spell.
  */
-const CALL_TOOL_ACTION_WHITELIST: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+export const CALL_TOOL_ACTION_WHITELIST: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   // The `queue` entry above replaces the retired standalone cancel entry
   // (0.49.0 slice 4), which admitted CANCEL semantics only: interrupt the
   // running job, optionally prompt_id-matched, optionally with clear_pending —
@@ -164,6 +232,15 @@ const CALL_TOOL_ACTION_WHITELIST: ReadonlyMap<string, ReadonlySet<string>> = new
   // troubleshoot is absent here because it now lives on `runpod_watch`, whose
   // own (unscoped) whitelist entry covers it.
   ["runpod", new Set(["status", "list", "stop", "connect", "use_local", "deploy_link"])],
+  // NOT scoped, because they are not admitted AT ALL: 0.50.0 slice 13 folded
+  // ten names into `install_comfyui` and `get_system_stats`, and neither
+  // survivor is in the whitelist above — nor was any of the eight names they
+  // absorbed (the slice 13 block in DEAD_NAMES lists them). So that fold could
+  // not broaden this channel the way `runpod`'s would have, and there is
+  // nothing to scope. Recorded here because the ABSENCE is the finding: the
+  // next reader should not have to re-derive it, and a later whitelist edit
+  // that admits either survivor has to delete this comment to do it.
+  // call-tool-admission.test.ts pins the refusal for every action of both.
   // The `list_packs` entry above replaces the retired standalone
   // dependency-extractor entry (0.50.0 slice 9), which admitted exactly
   // one thing: READ which custom node packs a workflow needs and which are
@@ -244,6 +321,76 @@ const CALL_TOOL_ACTION_WHITELIST: ReadonlyMap<string, ReadonlySet<string>> = new
   //
   // Without this scope the swap would have handed a mirrored/foreign tab both.
   ["save_workflow", new Set(["save"])],
+  // The `install_custom_node` entry above replaces NINE standalone names
+  // (0.50.0 slice 12), of which exactly TWO were whitelisted: install_custom_node
+  // (the panel's "install missing node" button, behind a client-side confirm) and
+  // the installed-pack list (read-only, the dependency side-panel's ✓ column).
+  //
+  // The seven that were NOT whitelisted are the reason this scope exists. Four of
+  // them RUN THIRD-PARTY PACK CODE on the user's machine — update, reinstall and
+  // fix all re-run a pack's install/dependency step, and sync_deps reinstalls
+  // EVERY pack's Python requirements. uninstall REMOVES an installed pack
+  // (irreversibly through this tool). disable/enable change what loads at the
+  // next ComfyUI start.
+  //
+  // Without this scope, swapping the two names for the folded one would hand a
+  // confirmation-less mirrored/foreign tab the ability to uninstall a pack or
+  // re-run arbitrary pack code — a privilege broadening manufactured by a pure
+  // surface change. Same failure shape as slice 8's billing actions.
+  //
+  // The registry lookups are NOT missing from this set — they are on a different
+  // tool entirely (`search_custom_nodes`), which is not whitelisted, so no
+  // action-level scope is needed to keep them out.
+  ["install_custom_node", new Set(["install", "list"])],
+  // The `get_image` entry above replaces TWO standalone entries (0.50.0 slice
+  // 15): the fetch-an-output-by-filename tool and the output listing. Those are
+  // exactly action:"get" and action:"list_outputs", and they are all this scope
+  // admits. The other five actions the fold brought onto this name were never
+  // whitelisted, and each is refused for a concrete reason rather than by
+  // default:
+  //
+  //   action:"convert"       WRITES. With `out_path` it encodes a new file under
+  //                          the ComfyUI output directory. A canvas-less client
+  //                          could not create a file there before and must not
+  //                          start now.
+  //   action:"view"          Read-only, but it reads the ASSET REGISTRY, a
+  //                          surface no whitelisted entry ever exposed.
+  //   action:"asset_metadata" Same registry, and it additionally returns the full
+  //                          WORKFLOW SNAPSHOT (prompts and all) of a past render.
+  //   action:"list_assets"   Read-only, and it also triggers a /history reconcile.
+  //   action:"analyze_color" Read-only, but it decodes an arbitrary
+  //                          `reference_path` through sharp.
+  //
+  // Admitting a read-only action merely because it is read-only is how a
+  // whitelist stops meaning anything: the strict rule this file already applies
+  // to `queue` (its read-only actions were never whitelisted either) applies here
+  // unchanged. Broadening a canvas-less client's reach to the asset registry is a
+  // product decision with its own UI, not a side effect of a surface
+  // consolidation. Add actions here deliberately, with a reason, if that decision
+  // is ever made.
+  ["get_image", new Set(["get", "list_outputs"])],
+  // The `enqueue_workflow` entry above absorbed four MORE entry points in
+  // 0.50.0 slice 16, and NOT ONE of their standalone names appeared on this
+  // whitelist. Only the bare submit-this-graph capability was ever admitted, so
+  // that is all this scope permits.
+  //
+  // action:"run_url" is the reason this is not a formality. It fetches a
+  // workflow from a URL THE CALLER CHOOSES and, with run:true, executes it —
+  // arbitrary graph execution on the user's GPU, from a channel that requires
+  // no agent turn and shows no confirmation. Admitting it because the name it
+  // now shares happened to be whitelisted would be the single widest
+  // broadening in the consolidation. (The fetch's own SSRF guard bounds WHERE
+  // it can reach; it says nothing about WHO may ask.)
+  //
+  // The other three are refused for the ordinary reason: their standalone names
+  // were never on this list, so nothing regresses by keeping them off it.
+  ["enqueue_workflow", new Set(["enqueue"])],
+  // The `get_history` entry above is NEW in 0.50.0 slice 16, added to replace
+  // the retired standalone diagnosis entry rather than to grant anything: scoped
+  // to action:"diagnose" it admits exactly what that entry admitted, and no more.
+  // list/stats/suggest stay refused — they were not reachable from this channel
+  // before the fold, and a canvas-less client that needs them can ask an agent.
+  ["get_history", new Set(["diagnose"])],
 ]);
 
 /**
@@ -258,6 +405,42 @@ export function callToolAdmission(
   tool: string,
   args: Record<string, unknown>,
 ): string | null {
+  // A name the consolidation RETIRED reports as RETIRED — ahead of the whitelist,
+  // for ANY retired name, whether or not it was ever whitelisted.
+  //
+  // Without this, a client calling a folded-away name gets `tool "X" is not
+  // permitted`, which is not merely a worse answer than the ledger's — it is a
+  // WRONG one. "Not permitted" says *you lack permission*, and sends a developer
+  // to check tokens, whitelists and trust boundaries. The truth is *that tool no
+  // longer exists under that name*, and the ledger already knows what to call
+  // instead. Both the compact `call_tool` facade and the direct MCP `tools/call`
+  // path (#895) answer a retired name from the ledger; this channel was the one
+  // that overwrote it, and it is exactly the channel the panel's RunPod control
+  // panel and the mobile app reach for the eleven runpod_* names 0.50.0 slice 8
+  // folded away.
+  //
+  // Ahead of the whitelist, and not merely for names the whitelist once carried,
+  // because a name that no longer exists cannot meaningfully be "permitted": the
+  // retirement is the prior fact. A caller who migrates to the surviving name then
+  // receives the action-scoped or permission answer below, which is the accurate
+  // answer AT THAT POINT. Two truthful steps beat one misleading dead end — and
+  // "was it previously whitelisted?" is not even derivable, because a slice SWAPS
+  // the retired entry for its survivor, so answering it would need a second
+  // append-only artifact whose omissions nothing gates.
+  //
+  // SAFETY — why this cannot weaken the money guard below (#269/#278). This branch
+  // has exactly two outcomes: return a non-empty refusal string, or fall through to
+  // the untouched original code. There is no input for which it returns null, so it
+  // cannot turn a refusal into an admission — the "false refusal becomes false
+  // acceptance" failure the #839 gate was about. Beyond that it is never even
+  // REACHED for an action-scoped tool: every key of CALL_TOOL_ACTION_WHITELIST is a
+  // live name, so retiredToolMessage() is undefined for it and control reaches the
+  // action check unchanged. Both properties are pinned in the tests, the second
+  // structurally, so a future slice that retires an action-scoped name (folding
+  // `runpod` onward, say) fails loudly here rather than quietly returning early.
+  const retired = retiredToolMessage(tool);
+  if (retired !== undefined) return retired;
+
   if (!CALL_TOOL_WHITELIST.has(tool)) return `tool "${tool}" is not permitted`;
   const actions = CALL_TOOL_ACTION_WHITELIST.get(tool);
   if (actions !== undefined) {

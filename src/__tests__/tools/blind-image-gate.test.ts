@@ -21,10 +21,14 @@ describe("blind image gate (COMFYUI_MCP_BLIND)", () => {
     // Exercise the boundary directly: register a synthetic tool through
     // registerAllTools' gate by reaching the same wrapper via collectToolCatalog
     // is awkward — the catalog only captures known groups. So assert semantics
-    // on a real captured handler: view_image with a stubbed registry.
+    // on a real captured handler: get_image action:"view" with a stubbed
+    // registry. (0.50.0 slice 15 folded the standalone asset viewer into that
+    // action; the gate
+    // itself reads neither tool name nor action, which is the point — it wraps
+    // the RESULT, so a fold cannot open a hole in it.)
     const { AssetRegistry } = await import("../../services/asset-registry.js");
     const catalog = await collectToolCatalog();
-    const entry = catalog.get("view_image");
+    const entry = catalog.get("get_image");
     expect(entry).toBeTruthy();
     // Stub fetch so viewAssetImage returns real-looking pixels.
     const realFetch = globalThis.fetch;
@@ -40,7 +44,7 @@ describe("blind image gate (COMFYUI_MCP_BLIND)", () => {
         outputs: [{ node_id: "9", images: [{ filename: "blindtest.png", subfolder: "", type: "output" }] }],
       });
       const id = rec.assetId;
-      const result = (await entry!.handler({ asset_id: id })) as {
+      const result = (await entry!.handler({ action: "view", asset_id: id })) as {
         content: Array<{ type: string; text?: string; data?: string }>;
       };
       expect(result.content.some((b) => b.type === "image")).toBe(false);
@@ -57,7 +61,7 @@ describe("blind image gate (COMFYUI_MCP_BLIND)", () => {
     delete process.env.COMFYUI_MCP_BLIND;
     const { AssetRegistry } = await import("../../services/asset-registry.js");
     const catalog = await collectToolCatalog();
-    const entry = catalog.get("view_image");
+    const entry = catalog.get("get_image");
     const realFetch = globalThis.fetch;
     globalThis.fetch = (async () =>
       new Response(Buffer.from("fake-png-bytes-here"), {
@@ -71,7 +75,7 @@ describe("blind image gate (COMFYUI_MCP_BLIND)", () => {
         outputs: [{ node_id: "9", images: [{ filename: "cleartest.png", subfolder: "", type: "output" }] }],
       });
       const id = rec.assetId;
-      const result = (await entry!.handler({ asset_id: id })) as {
+      const result = (await entry!.handler({ action: "view", asset_id: id })) as {
         content: Array<{ type: string; data?: string }>;
       };
       expect(result.content.some((b) => b.type === "image")).toBe(true);

@@ -13,7 +13,7 @@ import { buildArenaReport, mergeRunAxes } from "./arena-report.mjs";
 
 const [baseDir, ...runDirs] = process.argv.slice(2);
 if (!baseDir) {
-  console.error("usage: arena-bestof.mjs <base-results-dir> [extra-run-dir...]  (no dirs = re-sort + regenerate only)");
+  console.error("usage: arena-bestof.mjs <base-results-dir> [extra-run-dir...]  (no dirs = re-sort + rebuild only)");
   process.exit(1);
 }
 
@@ -108,7 +108,7 @@ base.leaderboard.sort(
 );
 writeFileSync(basePath, JSON.stringify(base, null, 2));
 
-// regenerate the share-ready markdown from the SHARED builder (#792) — the
+// rebuild the share-ready markdown from the SHARED builder (#792) — the
 // report shape (Quant/VRAM columns, version note, suspect scenarios) lives in
 // arena-report.mjs so this file and llm-arena.mjs can never drift apart again.
 writeFileSync(join(baseDir, "arena-report.md"), buildArenaReport(base));

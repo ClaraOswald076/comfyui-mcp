@@ -34,90 +34,40 @@ import { readFileSync } from "node:fs";
 export const TOOL_NAMES = [
   "comfy_cli",
   "enqueue_workflow",
-  "rerun_generation",
   "get_system_stats",
   "visualize_workflow",
   "create_workflow",
   "queue",
   "search_custom_nodes",
-  "get_node_pack_details",
   "download_model",
   "list_local_models",
-  "get_logs",
   "get_history",
-  "diagnose_run",
   "runpod",
   "runpod_watch",
   "get_workflow",
   "save_workflow",
-  "run_workflow_url",
   "restart_comfyui",
   "get_image",
   "upload_image",
-  "upload_video",
-  "upload_audio",
-  "stage_output_as_input",
-  "list_output_images",
   "clear_vram",
-  "suggest_settings",
-  "generation_stats",
-  "view_image",
-  "list_assets",
-  "get_asset_metadata",
-  "regenerate",
   "get_defaults",
   "generate_image",
-  "generate_audio",
-  "generate_3d",
-  "generate_video",
-  "remove_background",
-  "upscale_image",
-  "generate_with_controlnet",
-  "generate_with_ip_adapter",
   "node_snapshot",
   "bisect",
   "install_custom_node",
-  "update_custom_node",
-  "reinstall_custom_node",
-  "fix_custom_node",
-  "disable_custom_node",
-  "enable_custom_node",
-  "uninstall_custom_node",
-  "list_installed_nodes",
-  "sync_node_dependencies",
   "report_issue",
   "install_comfyui",
-  "update_comfyui",
-  "update_all",
   "model_metadata",
   "workspace",
-  "get_environment",
   "list_api_nodes",
-  "configure_manager",
-  "scaffold_custom_node",
-  "publish_custom_node",
-  "verify_custom_node",
+  "node_pack",
   "apply_manifest",
-  "convert_image",
-  "analyze_color",
-  "upload_output",
-  "health_check",
   "list_packs",
-  "install_panel",
-  "self_update",
   "calculate",
-  "list_node_pack_files",
-  "read_node_file",
-  "search_node_packs",
-  "write_node_file",
-  "apply_node_patch",
-  "node_pack_git",
   "train_prepare_dataset",
   "train_start",
   "train_doctor",
   "apps",
-  "get_template_schema",
-  "run_template",
   "batch",
 ] as const;
 
@@ -170,7 +120,7 @@ const BASELINE_URL = new URL("../../docs/design/tool-surface.txt", import.meta.u
  * 200-line rename. APPENDING is legitimate — new tools join the baseline when they
  * ship — so the workflow is: append, update this hash, say why in the message.
  */
-export const BASELINE_SHA256 = "c4854a510bf323a9ce6315dcac98faa91d0b87487d152a3221cfa0bf480d37c6";
+export const BASELINE_SHA256 = "984b006e468063be6fb8a5ad5432b21a2246f1510829d30775cfafd06693bc75";
 
 /**
  * LAZY on purpose, and this is not a micro-optimisation.
@@ -244,7 +194,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 87;
+export const MAX_TOOLS = 37;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;
@@ -1559,6 +1509,551 @@ export const DEAD_NAMES: readonly DeadName[] = [
     name: "verify_workflow_lock",
     since: "0.50.0",
     replacement: 'save_workflow (action:"verify_lock")',
+  },
+  // ─────────────────────────────────────────────────────────────────────────
+  // 0.50.0 slice 12: the twenty custom-node tools folded into THREE
+  // action-parameterized tools — the pack LIFECYCLE into the surviving
+  // `install_custom_node` (9 actions), the public-registry DISCOVERY pair into
+  // the surviving `search_custom_nodes` (2 actions), and the AUTHOR loop into
+  // the new name `node_pack` (9 actions). Same node-management / registry-client
+  // / node-authoring / node-verify / node-dev services, same panel-pin redirects,
+  // same return shapes — only the surface changed, so every mention of a RETIRED
+  // name is now rot pointing at a 404. (`search_custom_nodes` is NOT retired: it
+  // survives as the discovery tool and absorbs get_node_pack_details.)
+  //
+  // Three tools rather than one grab-bag because the thirds have different blast
+  // radii, and the NAME is the unit that the call_tool whitelist and the ollama
+  // loop-breaker both reason about:
+  //   • install_custom_node runs third-party pack code and mutates what is
+  //     installed. See CALL_TOOL_ACTION_WHITELIST in
+  //     src/orchestrator/call-tool-admission.ts, which keeps it reachable from a
+  //     canvas-less client for exactly the two actions its retired standalone
+  //     entries covered (install + list) and leaves uninstall/update/reinstall/
+  //     fix unreachable.
+  //   • search_custom_nodes is read-only and network-only — no ComfyUI, no
+  //     COMFYUI_PATH. Never whitelisted before, so it is not whitelisted now.
+  //   • node_pack reads and WRITES your own source on disk and runs git in it.
+  //     Not whitelisted at all.
+  {
+    name: "update_custom_node",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"update")',
+  },
+  {
+    name: "reinstall_custom_node",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"reinstall")',
+  },
+  {
+    name: "fix_custom_node",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"fix")',
+  },
+  {
+    name: "uninstall_custom_node",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"uninstall")',
+  },
+  {
+    name: "enable_custom_node",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"enable")',
+  },
+  {
+    name: "disable_custom_node",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"disable")',
+  },
+  {
+    name: "list_installed_nodes",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"list")',
+  },
+  {
+    name: "sync_node_dependencies",
+    since: "0.50.0",
+    replacement: 'install_custom_node (action:"sync_deps")',
+  },
+  {
+    name: "get_node_pack_details",
+    since: "0.50.0",
+    replacement: 'search_custom_nodes (action:"details")',
+  },
+  {
+    name: "scaffold_custom_node",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"scaffold")',
+  },
+  {
+    name: "verify_custom_node",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"verify")',
+  },
+  {
+    name: "publish_custom_node",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"publish")',
+  },
+  {
+    name: "list_node_pack_files",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"list_files")',
+  },
+  {
+    name: "read_node_file",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"read")',
+  },
+  {
+    name: "search_node_packs",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"search")',
+  },
+  {
+    name: "write_node_file",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"write")',
+  },
+  {
+    name: "apply_node_patch",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"patch")',
+  },
+  // node_pack_git's own `action` parameter is the one argument this whole
+  // consolidation could not preserve — it collided with the tool's dispatch
+  // field — so the replacement names BOTH levels, or a caller rewriting
+  // `node_pack_git(pack, action:"commit")` would silently produce
+  // `node_pack(action:"commit")`, which is not an action at all.
+  //
+  // The comment sits ABOVE the entry rather than inside it on purpose: a
+  // leading comment between `{` and `name:` hides the entry from every
+  // name-extracting scanner that anchors on `^  \{\n    name:` — including the
+  // ratchet verifier — so an entry that IS in the ledger reads as missing.
+  {
+    name: "node_pack_git",
+    since: "0.50.0",
+    replacement: 'node_pack (action:"git", git_action:"status"|"diff"|"log"|"commit"|"push")',
+  },
+  // 0.50.0 slice 15: the twelve image/asset tools folded into TWO
+  // action-parameterized tools, both of them SURVIVORS keeping their
+  // registration slots — the READ/INSPECT half onto `get_image` (7 actions)
+  // and the WRITE half onto `upload_image` (5 actions). Same
+  // image-management / view-image / image-convert / color-analysis /
+  // asset-registry / storage-upload services, same arguments, same return
+  // shapes (inline image blocks, the markdown/json listings, the upload
+  // prose) — only the surface changed, so every mention of the old names is
+  // now rot pointing at a 404.
+  //
+  // Split by DIRECTION OF TRAVEL rather than into one twelve-action tool:
+  // everything on `get_image` reads (its one write is saving bytes it just
+  // fetched to the caller's own save_dir), while every action on
+  // `upload_image` puts a file somewhere — ComfyUI's input/ directory or a
+  // cloud bucket. The orchestrator's call_tool whitelist depends on that
+  // split: `get_image` was whitelisted (as was `list_output_images`) and is
+  // now ACTION-scoped to exactly those two actions — see
+  // CALL_TOOL_ACTION_WHITELIST in src/orchestrator/call-tool-admission.ts —
+  // while `upload_image` was never whitelisted and still is not.
+  {
+    name: "view_image",
+    since: "0.50.0",
+    replacement: 'get_image (action:"view")',
+    allowedIn: [
+      {
+        path: "docs/blog/blind-mode-privacy.mdx",
+        context: "but get_image and view_image fetched them straight from ComfyUI's /view anyway",
+        why: "A DATED post about the v0.42.0 Blind-mode fix, narrating the two tools that leaked pixels AT THAT TIME. Rewriting it to the folded form would make the sentence read 'get_image and get_image (action:\"view\")' — a false account of what the bug was, in a frontmatter description that is also a double-quoted YAML string the replacement's quotes would break.",
+      },
+      {
+        path: "docs/blog/blind-mode-privacy.mdx",
+        context: "(`get_image`, `view_image`) fetch bytes straight from ComfyUI's HTTP `/view`",
+        why: "Same post, body: the pair of tools the reporter proved were leaking. Same collapse into 'get_image, get_image' if rewritten.",
+      },
+      {
+        path: "docs/blog/blind-mode-privacy.mdx",
+        context: "`get_image`, then to `view_image`, then remember `convert_image` returns",
+        why: "Same post, listing the tools a whack-a-mole per-tool fix would have had to chase — the point being that the list is open-ended. It is an argument about the past, not an instruction to call anything.",
+      },
+    ],
+  },
+  {
+    name: "list_output_images",
+    since: "0.50.0",
+    replacement: 'get_image (action:"list_outputs")',
+  },
+  {
+    name: "convert_image",
+    since: "0.50.0",
+    replacement: 'get_image (action:"convert")',
+    allowedIn: [
+      {
+        path: "docs/blog/blind-mode-privacy.mdx",
+        context: "then remember `convert_image` returns",
+        why: "Same dated Blind-mode post as view_image above — the third name in the open-ended list of image-returning tools a per-tool fix would have had to chase, written in the past tense about v0.42.0.",
+      },
+    ],
+  },
+  {
+    name: "analyze_color",
+    since: "0.50.0",
+    replacement: 'get_image (action:"analyze_color")',
+    // The fold reused the retired TOOL name as its ACTION name, so the tool
+    // that implements it necessarily spells the bare token twice: as a member
+    // of get_image's action enum, and as the `case` label that dispatches it.
+    // Rule (c) licenses exactly that one structural form — a complete quoted
+    // literal whose whole content is the name — in these two files, and
+    // nothing else: a live `call analyze_color` sentence in either of them is
+    // still reported, which is why this is not a SELF entry.
+    implementedIn: ["src/tools/image-management.ts"],
+  },
+  {
+    name: "list_assets",
+    since: "0.50.0",
+    replacement: 'get_image (action:"list_assets")',
+    // Same collision as analyze_color above, same two structural forms, same
+    // two files. See that entry for why this is implementedIn and not SELF.
+    implementedIn: ["src/tools/image-management.ts"],
+  },
+  {
+    name: "get_asset_metadata",
+    since: "0.50.0",
+    replacement: 'get_image (action:"asset_metadata")',
+  },
+  {
+    name: "upload_video",
+    since: "0.50.0",
+    replacement: 'upload_image (action:"video")',
+  },
+  {
+    name: "upload_audio",
+    since: "0.50.0",
+    replacement: 'upload_image (action:"audio")',
+  },
+  {
+    name: "upload_output",
+    since: "0.50.0",
+    replacement: 'upload_image (action:"output")',
+  },
+  {
+    name: "stage_output_as_input",
+    since: "0.50.0",
+    replacement: 'upload_image (action:"stage")',
+  },
+  // ─────────────────────────────────────────────────────────────────────────
+  // 0.50.0 slice 16 (the FINAL slice): eighteen execution / generation /
+  // observability names folded into the THREE survivors models reach for first
+  // — `enqueue_workflow` (5 actions), `generate_image` (9) and `get_history`
+  // (4). Same workflow-executor / generate-* / tracker / history services, same
+  // arguments, same return shapes — only the surface changed, so every mention
+  // of the old names is now rot pointing at a 404.
+  //
+  // `enqueue_workflow` REMAINS A NAMED ENTRY POINT: its four satellite entry
+  // points fold INTO it and it is never itself subsumed. Its call_tool
+  // admission is ACTION-scoped to exactly ["enqueue"] — see
+  // CALL_TOOL_ACTION_WHITELIST in src/orchestrator/call-tool-admission.ts,
+  // where action:"run_url" (fetch a workflow from an ARBITRARY URL and execute
+  // it) must stay unreachable from a canvas-less client. `get_history` is ADDED
+  // to that whitelist, action-scoped to ["diagnose"], because the retired
+  // `diagnose_run` was whitelisted and the panel's "why did my render fail?"
+  // would otherwise break with a false refusal.
+  {
+    name: "rerun_generation",
+    since: "0.50.0",
+    replacement: 'enqueue_workflow (action:"rerun")',
+  },
+  {
+    name: "run_workflow_url",
+    since: "0.50.0",
+    replacement: 'enqueue_workflow (action:"run_url")',
+  },
+  {
+    name: "get_template_schema",
+    since: "0.50.0",
+    replacement: 'enqueue_workflow (action:"template_schema")',
+  },
+  {
+    name: "run_template",
+    since: "0.50.0",
+    replacement: 'enqueue_workflow (action:"run_template")',
+    implementedIn: [
+      "src/tools/workflow-execute.ts",
+      "src/__tests__/tools/workflow-execute.test.ts",
+    ],
+  },
+  {
+    name: "generate_audio",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"audio")',
+  },
+  {
+    name: "generate_video",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"video")',
+  },
+  {
+    name: "generate_3d",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"3d")',
+  },
+  {
+    name: "generate_with_controlnet",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"controlnet")',
+  },
+  {
+    name: "generate_with_ip_adapter",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"ip_adapter")',
+  },
+  // The highest-traffic retirement in the consolidation (19 live mentions), and
+  // the one whose name is ALSO an ordinary English verb. Most of the exemptions
+  // below are therefore NOT "history" in the usual sense — they are prose where
+  // "regenerate" is a verb about rebuilding a file or re-synthesising image
+  // detail, and has nothing to do with any tool. Rewriting correct prose to
+  // dodge a name collision is the failure mode the per-occurrence mechanism
+  // exists to prevent, so each one is listed, read, and reasoned about here.
+  {
+    name: "regenerate",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"regenerate")',
+    // The tool that answers for this name, and the two files that drive it under
+    // test — the only places a bare "regenerate" literal is the action vocabulary
+    // rather than a tool name.
+    implementedIn: [
+      "src/tools/generate-image.ts",
+      "src/__tests__/tools/generate-image.test.ts",
+    ],
+    allowedIn: [
+      {
+        path: "docs/blog/flatten-workflows.mdx",
+        context: "then regenerate a UI graph from it and",
+        why: "The ENGLISH VERB, in a dated post narrating an algorithm: rebuild a UI-format graph from an API-format one. Nothing to do with any tool. Rewriting published prose to dodge a name collision is exactly the 'fix' the per-occurrence mechanism exists to prevent.",
+      },
+      {
+        path: "docs/blog/flatten-workflows.mdx",
+        context: "regenerate positions wholesale, every group on the canvas becomes an empty box",
+        why: "Same post, same English verb — recomputing node POSITIONS, in the sentence that explains why litegraph groups break when you do.",
+      },
+      {
+        path: "docs/blog/video-upscale-comfyui.mdx",
+        context: "FlashVSR *regenerate* detail.",
+        why: "The English verb, and load-bearing technical vocabulary: a restorer model literally re-generates image detail rather than magnifying it. No synonym says this as precisely, and the post is dated.",
+      },
+      {
+        path: "docs/blog/video-upscale-comfyui.mdx",
+        context: "**Why downscale before upscaling?** Restorers regenerate detail.",
+        why: "Same post, same claim in the body copy.",
+      },
+      {
+        path: "plugin/skills/video-upscale/SKILL.md",
+        context: "(and FlashVSR) regenerate detail. Feeding them a small frame forces the model",
+        why: "The same technical claim in the bundled skill the post documents. Model-facing, but it is describing what an UPSCALER MODEL does to pixels — it is not an instruction to call a tool.",
+      },
+      {
+        path: "packs/z-image-base-inpaint/pack.yaml",
+        context: "an input image and regenerate only the masked area from a text prompt",
+        why: "The English verb in a pack DESCRIPTION of inpainting — regenerating the masked region is literally what the pack does. packs/*/workflow.json is path-exempt as data, but pack.yaml is prose, so this occurrence is exempted on its own.",
+      },
+    ],
+  },
+  {
+    name: "upscale_image",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"upscale")',
+    allowedIn: [
+      {
+        path: "src/__tests__/tools/generate-image.test.ts",
+        context: 'expect(schema.action.safeParse("upscale_image").success).toBe(false)',
+        why: "A deliberate NEGATIVE fixture: the action is `upscale`, so the RETIRED tool name must be rejected by the enum. `implementedIn` cannot license it — that rule only covers a name the fold reused AS an action, and this one it did not. The assertion is that nothing serves this name.",
+      },
+      {
+        path: "src/__tests__/tools/generate-image.test.ts",
+        context: 'const res = await handler({ action: "upscale_image" });',
+        why: "The same fixture one layer down: the unknown-action branch must reject it at runtime too, not merely at the schema. A call argument under test.",
+      },
+    ],
+  },
+  {
+    name: "remove_background",
+    since: "0.50.0",
+    replacement: 'generate_image (action:"remove_background")',
+    implementedIn: [
+      "src/tools/generate-image.ts",
+      "src/__tests__/tools/generate-image.test.ts",
+    ],
+    allowedIn: [
+      {
+        path: "src/services/workflow-composer.ts",
+        context: "remove_background: (p) => buildRemoveBackground(",
+        why: "A create_workflow TEMPLATE KEY in the builder registry, not a tool name. It happens to be spelled the same because both name the same operation. Renaming it would change a service (the key is part of create_workflow's public template enum), which a pure surface consolidation must not do.",
+      },
+      {
+        path: "src/services/remove-background.ts",
+        context: 'const workflow = createWorkflow("remove_background", {',
+        why: "The call site of that same template key — the service asking the composer for the cutout graph.",
+      },
+      {
+        path: "docs/tools/workflow-authoring.mdx",
+        context: "ace_step_15, stable_audio_3, remove_background, ltx_video). Pure local generation",
+        why: "GENERATED from create_workflow's description, which lists the template keys above. Fixing it at the source would mean renaming the template.",
+      },
+      {
+        path: "docs/tools/workflow-authoring.mdx",
+        context: "`stable_audio_3`, `remove_background`, `ltx_video`.",
+        why: "Generated from the same template enum, rendered as the parameter's option list.",
+      },
+    ],
+  },
+  {
+    name: "generation_stats",
+    since: "0.50.0",
+    replacement: 'get_history (action:"stats")',
+  },
+  {
+    name: "suggest_settings",
+    since: "0.50.0",
+    replacement: 'get_history (action:"suggest")',
+  },
+  {
+    name: "diagnose_run",
+    since: "0.50.0",
+    replacement: 'get_history (action:"diagnose")',
+  },
+  // ─────────────────────────────────────────────────────────────────────────
+  // 0.50.0 slice 13: the install/environment and stats/diagnostics families
+  // folded into TWO action-parameterized tools — the mutating install surface
+  // (ComfyUI core, every custom node pack, the sidebar panel, this npm package,
+  // Manager settings) plus the environment read into the surviving
+  // `install_comfyui` (7 actions), and the connected server's READS into the
+  // surviving `get_system_stats` (3 actions). Same services, same arguments,
+  // same return shapes — only the surface changed, so every mention of the old
+  // names is now rot pointing at a 404.
+  //
+  // FOUR names the slice originally folded are NOT here, because review took
+  // the RFC's documented fallback and left them STANDALONE: `apply_manifest`
+  // (the most-referenced name on the surface, and nearly all of those mentions
+  // are one-line install instructions), `clear_vram` (the OOM panic button,
+  // which belongs at one call's reach), `report_issue` (it FILES A PUBLIC
+  // GITHUB ISSUE and had no business on a tool named "get system stats") and
+  // `calculate` (a pure offline utility with nothing to do with server state).
+  // They are unchanged on the live surface and retire nothing.
+  //
+  // THREE of the folded tools had an `action` parameter of their own, which a
+  // flat schema cannot host twice: install_panel's became `panel_action`,
+  // self_update's `self_update_action`, and configure_manager's
+  // `manager_setting`. The enum VALUES and their defaults are unchanged, so a
+  // caller translating `install_panel(action='sync')` writes
+  // `install_comfyui(action:"panel", panel_action:"sync")`.
+  {
+    name: "update_comfyui",
+    since: "0.50.0",
+    replacement: 'install_comfyui (action:"update")',
+    allowedIn: [
+      {
+        path: "src/services/manager-config.ts",
+        context: "compared server-side (manager_server.py update_comfyui)",
+        why: "Names ComfyUI-Manager's OWN Python handler (manager_server.py's update_comfyui route), which is upstream code this repo does not own and cannot rename. It is not, and never was, a reference to our tool.",
+      },
+    ],
+  },
+  {
+    name: "update_all",
+    since: "0.50.0",
+    replacement: 'install_comfyui (action:"update_all")',
+    // Rule (c): this name is spelled exactly like its own ACTION, so the module
+    // that DEFINES the enum necessarily contains it as a quoted literal — an enum
+    // member and a case label. Licensed there and nowhere else.
+    implementedIn: ["src/tools/install-comfyui.ts"],
+    // NOTE for reviewers: `update_all` is ALSO the name of ComfyUI-Manager's own
+    // bulk-update operation and the tail of its HTTP route
+    // (/manager/queue/update_all). About 120 of the ~134 in-repo occurrences
+    // were that UPSTREAM operation, not our tool. Exempting them one by one
+    // would have meant ~120 ledger entries; exempting them by file would have
+    // been the whole-file exemption this ledger exists to avoid. They were
+    // instead respelled in prose as "update-all" — a hyphen, so not a tool-name
+    // token, and already the spelling the pending-op ledger uses for the op
+    // kind — leaving the literal `update_all` only where it IS the upstream
+    // route string.
+    allowedIn: [
+      // ONE context per file, and it is the upstream ROUTE PATH — which is what
+      // keeps these narrow rather than whole-file: only a line containing
+      // "/manager/queue/update_all" is exempt, and the v4 route
+      // "/v2/manager/queue/update_all" contains it as a substring, so one entry
+      // covers both dialects. A live instruction to call the retired TOOL,
+      // added to any of these files later, still fails the gate.
+      {
+        path: "src/services/node-management.ts",
+        context: "/manager/queue/update_all",
+        why: "ComfyUI-Manager's own HTTP route, which this code POSTs to and its comments enumerate by path. Upstream API surface we cannot rename — rewriting it would break the request.",
+      },
+      {
+        path: "src/services/node-management.ts",
+        context: "endpoint: `${prefix}/update_all`",
+        why: "Builds that same upstream route path to report back as `endpoint`. A URL segment, not a tool name.",
+      },
+      {
+        path: "src/services/update-comfyui.ts",
+        context: "/manager/queue/update_all",
+        why: "A comment naming the two upstream Manager routes (legacy 3.x and v4) by their exact paths, which is the whole point of the line.",
+      },
+      {
+        path: "src/__tests__/services/update-comfyui.test.ts",
+        context: "/manager/queue/update_all",
+        why: "The tests pin WHICH upstream route the enqueue uses per Manager dialect (#656). The literal path is the assertion.",
+      },
+      {
+        path: "src/__tests__/services/manager-dialect-cache.test.ts",
+        context: "/manager/queue/update_all",
+        why: "Same: the dialect-cache tests stub and count calls to the upstream route by path.",
+      },
+      {
+        path: "src/__tests__/services/node-management.test.ts",
+        context: "/manager/queue/update_all",
+        why: "Same: asserts the 'all' id routes to the upstream v4 route with query params rather than a body.",
+      },
+      {
+        path: "src/__tests__/services/panel-pin-cancel.test.ts",
+        context: "/manager/queue/update_all",
+        why: "Same: the Manager persona stubs match on the upstream route path.",
+      },
+    ],
+  },
+  {
+    name: "install_panel",
+    since: "0.50.0",
+    replacement: 'install_comfyui (action:"panel")',
+  },
+  {
+    name: "self_update",
+    since: "0.50.0",
+    replacement: 'install_comfyui (action:"self_update")',
+    // Rule (c): this name is spelled exactly like its own ACTION, so the module
+    // that DEFINES the enum necessarily contains it as a quoted literal — an enum
+    // member and a case label. Licensed there and nowhere else.
+    implementedIn: ["src/tools/install-comfyui.ts"],
+  },
+  {
+    name: "get_environment",
+    since: "0.50.0",
+    replacement: 'install_comfyui (action:"environment")',
+  },
+  {
+    name: "configure_manager",
+    since: "0.50.0",
+    replacement: 'install_comfyui (action:"configure_manager")',
+    // Rule (c): this name is spelled exactly like its own ACTION, so the module
+    // that DEFINES the enum necessarily contains it as a quoted literal — an enum
+    // member and a case label. Licensed there and nowhere else.
+    implementedIn: ["src/tools/install-comfyui.ts"],
+  },
+  {
+    name: "get_logs",
+    since: "0.50.0",
+    replacement: 'get_system_stats (action:"logs")',
+  },
+  {
+    name: "health_check",
+    since: "0.50.0",
+    replacement: 'get_system_stats (action:"health")',
   },
 ];
 

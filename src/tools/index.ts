@@ -1,5 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerWorkflowExecuteTools } from "./workflow-execute.js";
+import { registerSystemStatsTools } from "./system-stats.js";
 import { registerWorkflowVisualizeTools } from "./workflow-visualize.js";
 import { registerWorkflowComposeTools } from "./workflow-compose.js";
 import { registerQueueManagementTools } from "./queue-management.js";
@@ -9,48 +10,31 @@ import { registerModelManagementTools } from "./model-management.js";
 import { registerDiagnosticsTools } from "./diagnostics.js";
 import { registerRunpodTools } from "./runpod.js";
 import { registerWorkflowLibraryTools } from "./workflow-library.js";
-import { registerWorkflowUrlTools } from "./workflow-url.js";
 import { registerProcessControlTools } from "./process-control.js";
 import { registerImageManagementTools } from "./image-management.js";
 import { registerMemoryManagementTools } from "./memory-management.js";
-import { registerGenerationTrackerTools } from "./generation-tracker.js";
-import { registerAssetTools } from "./assets.js";
 import { registerAutoloadedWorkflows } from "./workflow-autoload.js";
 import { registerDefaultsTools } from "./defaults.js";
 import { registerGenerateImageTool } from "./generate-image.js";
-import { registerGenerateAudioTool } from "./generate-audio.js";
-import { registerGenerate3dTools } from "./generate-3d.js";
-import { registerGenerateVideoTool } from "./generate-video.js";
-import { registerRemoveBackgroundTool } from "./remove-background.js";
-import { registerUpscaleImageTool } from "./upscale-image.js";
-import { registerConditionedGenerationTools } from "./generate-conditioned.js";
 import { registerNodeSnapshotsTools } from "./node-snapshots.js";
 import { registerNodeBisectTools } from "./node-bisect.js";
 import { registerNodeManagementTools } from "./node-management.js";
 import { registerReportIssueTools } from "./report-issue.js";
-import { registerNodeAuthoringTools } from "./node-authoring.js";
-import { registerNodeVerifyTools } from "./node-verify.js";
+import { registerNodePackTools } from "./node-pack.js";
 import { registerInstallComfyUITools } from "./install-comfyui.js";
-import { registerUpdateComfyUITools } from "./update-comfyui.js";
 import { registerWorkspaceEnvTools } from "./workspace-env.js";
 import { registerApiNodesTools } from "./api-nodes.js";
-import { registerManagerConfigTools } from "./manager-config.js";
 import { registerManifestTools } from "./manifest.js";
 import { registerModelExplorerTools } from "./model-explorer.js";
-import { registerImageConvertTools } from "./image-convert.js";
-import { registerColorAnalysisTools } from "./color-analysis.js";
-import { registerStorageUploadTools } from "./storage-upload.js";
-import { registerHealthCheckTools } from "./health-check.js";
+// 0.50.0 slice 15: the image-convert / color-analysis / storage-upload
+// registrars are gone — their three tools became actions on `get_image` and
+// `upload_image` (registerImageManagementTools). The SERVICES they called are
+// untouched and now imported there.
 import { registerSkillsAccessTools } from "./skills-access.js";
-import { registerInstallPanelTools } from "./install-panel.js";
-import { registerSelfUpdateTools } from "./self-update.js";
 import { registerCalculateTools } from "./calculate.js";
-import { registerNodeDevTools } from "./node-dev.js";
 import { registerComfyCliTools } from "./comfy-cli.js";
 import { registerTrainTools } from "./train.js";
 import { registerAppsTools } from "./apps.js";
-import { registerTemplateSchemaTools } from "./template-schema.js";
-import { registerRunTemplateTools } from "./run-template.js";
 import { DefaultsManager } from "../services/defaults-manager.js";
 import { ToolCatalog } from "./catalog.js";
 import { registerCompactTools } from "./compact.js";
@@ -64,6 +48,7 @@ import { logger } from "../utils/logger.js";
 const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: McpServer) => void]> = [
   ["comfy-cli", registerComfyCliTools],
   ["workflows", registerWorkflowExecuteTools],
+  ["workflows", registerSystemStatsTools],
   ["workflow-authoring", registerWorkflowVisualizeTools],
   ["workflow-authoring", registerWorkflowComposeTools],
   ["workflows", registerQueueManagementTools],
@@ -75,20 +60,15 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["diagnostics", registerDiagnosticsTools],
   ["runpod", registerRunpodTools],
   ["workflow-authoring", registerWorkflowLibraryTools],
-  ["workflows", registerWorkflowUrlTools],
   ["server", registerProcessControlTools],
   ["images-assets", registerImageManagementTools],
   ["server", registerMemoryManagementTools],
-  ["generation", registerGenerationTrackerTools],
-  ["images-assets", registerAssetTools],
   ["skills-config", registerDefaultsTools],
+  // 0.50.0 slice 16 folded eight sibling generation tools into `generate_image`
+  // and four observability tools into `get_history`, so the groups that used to
+  // register them are gone from this list (their handlers live on as action
+  // functions imported by the survivors). `generate_image` keeps this slot.
   ["generation", registerGenerateImageTool],
-  ["generation", registerGenerateAudioTool],
-  ["generation", registerGenerate3dTools],
-  ["generation", registerGenerateVideoTool],
-  ["generation", registerRemoveBackgroundTool],
-  ["generation", registerUpscaleImageTool],
-  ["generation", registerConditionedGenerationTools],
   ["custom-nodes", registerNodeSnapshotsTools],
   ["custom-nodes", registerNodeBisectTools],
   ["custom-nodes", registerNodeManagementTools],
@@ -96,31 +76,23 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   // (0.50.0 slice 9: the workflow-deps group's two tools folded into `list_packs`
   // actions "extract_deps"/"install_deps" — same note as skill-generator above.)
   ["server", registerInstallComfyUITools],
-  ["server", registerUpdateComfyUITools],
   ["models", registerModelExplorerTools],
   ["server", registerWorkspaceEnvTools],
   ["generation", registerApiNodesTools],
-  ["server", registerManagerConfigTools],
-  ["custom-nodes", registerNodeAuthoringTools],
-  ["custom-nodes", registerNodeVerifyTools],
+  ["custom-nodes", registerNodePackTools],
   ["models", registerManifestTools],
-  ["images-assets", registerImageConvertTools],
-  ["images-assets", registerColorAnalysisTools],
-  ["images-assets", registerStorageUploadTools],
-  ["diagnostics", registerHealthCheckTools],
   ["skills-config", registerSkillsAccessTools],
-  ["server", registerInstallPanelTools],
-  ["server", registerSelfUpdateTools],
   ["diagnostics", registerCalculateTools],
   // registerComfyUISettingsTools used to sit here. 0.50.0 slice 7 folded its two
   // tools into `get_defaults` as action:"get_ui"/"set_ui", so the group is gone
   // rather than empty — every surviving name keeps its position, which is what
   // registry-surface.test.ts pins.
-  ["custom-nodes", registerNodeDevTools],
+  //
+  // registerNodeDevTools sat here too, until 0.50.0 slice 12 folded its six
+  // tools into `node_pack` — registered at the slot its family’s first member
+  // (the scaffold tool) held, further up.
   ["training", registerTrainTools],
   ["apps", registerAppsTools],
-  ["workflows", registerTemplateSchemaTools],
-  ["workflows", registerRunTemplateTools],
   // Appended (not inserted next to queue-management) because tools/list order
   // is observable and must not shift for existing tools.
   ["workflows", registerBatchTools],
@@ -132,8 +104,11 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
 // to the model. Enforced MECHANICALLY at the single registration boundary both
 // tool paths share — the live McpServer and the compact-mode ToolCatalog both
 // receive handlers wrapped here — so the guarantee holds for every current and
-// future image-returning tool (get_image, view_image, convert_image, color
-// analysis previews, ...) without per-tool opt-ins.
+// future image-returning tool (get_image's fetch/view/convert/colour-measure
+// actions, generate_image, get_image, ...) without per-tool opt-ins. It
+// wraps the RESULT, so folding several image-returning tools into one name
+// (0.50.0 slice 15) changes nothing here: the wrapper never reads a tool name
+// or an action.
 const blindMode = (): boolean => process.env.COMFYUI_MCP_BLIND === "1";
 
 function scrubImageBlocks(result: unknown): unknown {
@@ -200,7 +175,7 @@ export async function registerAllTools(server: McpServer): Promise<void> {
  * After the user restarts ComfyUI and the panel session resumes, that snapshot
  * can go stale — a previously-bound direct tool is briefly absent from the
  * refreshed surface, and calling the cached binding throws
- * `TypeError: tools.mcp__comfyui__get_environment is not a function` BEFORE
+ * `TypeError: tools.install_comfyui (action:"environment") is not a function` BEFORE
  * dispatch. Layering the facade (`list_tools` / `describe_tool` / `call_tool`)
  * onto the full direct surface guarantees EVERY advertised surface — compact or
  * full — carries a STABLE `call_tool` escape hatch, so such a client can always
