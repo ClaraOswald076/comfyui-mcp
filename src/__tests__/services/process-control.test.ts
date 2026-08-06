@@ -61,6 +61,18 @@ vi.mock("../../utils/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
+// #871: no real WebSocket in tests — the witness stays open (the instance never
+// goes away). The dropped/unavailable-witness cases have their own suite
+// (restart-instance-identity.test.ts).
+vi.mock("../../services/instance-witness.js", () => ({
+  acquireInstanceWitness: vi.fn(async () => ({
+    url: "ws://127.0.0.1:8188/ws",
+    alive: () => true,
+    closedAt: () => undefined,
+    close: () => {},
+  })),
+}));
+
 const mockFindComfyuiPython = vi.hoisted(() => vi.fn());
 vi.mock("../../services/env-capabilities.js", () => ({
   findComfyuiPython: mockFindComfyuiPython,
