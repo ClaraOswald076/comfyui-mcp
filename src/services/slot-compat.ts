@@ -1,5 +1,5 @@
 // Slot type-compatibility rules — the ONE shared rule set that both the
-// `dsl_to_workflow` advisory wiring warnings (server-side) and the panel's
+// `visualize_workflow (action:"from_dsl")` advisory wiring warnings (server-side) and the panel's
 // `panel_connect` auto-match resolver reason about, so the two never disagree.
 //
 // The panel (comfyui-mcp-panel) is served as live JS and cannot import this TS

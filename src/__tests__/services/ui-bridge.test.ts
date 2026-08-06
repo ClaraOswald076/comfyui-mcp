@@ -1485,7 +1485,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     });
     // A tool_result for the desktop tab must NOT leak to the mirror viewer.
     bridge.push(
-      { type: "tool_result", cid: "x", tool: "list_workflows", ok: true, result: [] },
+      { type: "tool_result", cid: "x", tool: "get_workflow", ok: true, result: [] },
       "desktop-4",
     );
     await settle();

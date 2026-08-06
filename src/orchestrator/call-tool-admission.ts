@@ -10,11 +10,14 @@
  *  bridge is already token-gated; this whitelist keeps call_tool to non-destructive
  *  tools (no restart/remove/clear/install). */
 const CALL_TOOL_WHITELIST = new Set<string>([
-  "list_workflows",
+  // The canvas-less client's whole read side of the saved-workflow library.
+  // FIVE separate entries lived here — the library listing, the file read, the
+  // summary, the graph query and the PNG-metadata extractor — until 0.50.0
+  // slice 14 folded EIGHT names into this one. The three it also folded that
+  // were NOT whitelisted (strip, slice, prompt_director) would have been
+  // admitted for free by the swap, so admission is ACTION-scoped below to
+  // exactly the five that were already reachable — see CALL_TOOL_ACTION_WHITELIST.
   "get_workflow",
-  "analyze_workflow",
-  "query_workflow",
-  "workflow_from_image",
   "list_output_images",
   "get_image",
   // Inventory listing only. 0.50.0 slice 11 folded six model tools into this
@@ -34,6 +37,10 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   // CivitAI example" → save_workflow). Writes a workflow file (auto-converts
   // API-format graphs to canvas-openable UI format); overwrites same-filename,
   // so the client generates a unique name. No model/system mutation.
+  //
+  // 0.50.0 slice 14 folded the two provenance-lock tools onto this name,
+  // NEITHER of which was whitelisted, so it is ACTION-scoped below to
+  // exactly "save" — see CALL_TOOL_ACTION_WHITELIST.
   "save_workflow",
   // One-tap cancel of the RUNNING render (the mobile queue monitor's stop
   // button). User-initiated and narrowly scoped: the client passes the
@@ -202,6 +209,41 @@ const CALL_TOOL_ACTION_WHITELIST: ReadonlyMap<string, ReadonlySet<string>> = new
     "download_model",
     new Set(["download", "download_civitai", "search_civitai", "search_creators", "resolve_missing"]),
   ],
+  // The `get_workflow` entry above replaces FIVE standalone entries (0.50.0
+  // slice 14) — the ones that became actions get, list, analyze, query and
+  // from_image — out of the EIGHT names the tool now folds. The three that were
+  // never whitelisted stay out:
+  //
+  //   strip / slice        — authoring TRANSFORMS, not library reads. Nothing on
+  //                          a canvas-less client asks for them, and the standing
+  //                          rule for this list is that a fold admits exactly what
+  //                          the retired entries covered, not everything that
+  //                          merely looks equally safe.
+  //   prompt_director      — reaches a THIRD-PARTY custom node's HTTP endpoint
+  //                          (ComfyUI-PromptDirector's /prompt_director/inspection),
+  //                          which is a different server surface from the userdata
+  //                          API the admitted actions read. Its posture was never
+  //                          judged for this channel; it is not being judged here.
+  //
+  // All eight are read-only, so this scope is not a data-loss guard — it is the
+  // same "admit what was admitted" discipline the queue and runpod entries set,
+  // and it keeps the channel's surface a reviewed list rather than a side effect
+  // of which tools happened to be folded together.
+  ["get_workflow", new Set(["get", "list", "analyze", "query", "from_image"])],
+  // The `save_workflow` entry above is the one WRITE on this channel's workflow
+  // surface, and 0.50.0 slice 14 gave that name two more actions. Only "save"
+  // was ever admitted:
+  //
+  //   lock         — WRITES a second file (`<filename>.lock.json`) into the user
+  //                  library, and to build it SHA-256s every model the workflow
+  //                  references, which on a real install is minutes of disk I/O a
+  //                  confirmation-less tap must not be able to start.
+  //   verify_lock  — read-only, but a local-install diagnostic that was never
+  //                  whitelisted; admitting it now would be a new decision, not
+  //                  the preservation of an old one.
+  //
+  // Without this scope the swap would have handed a mirrored/foreign tab both.
+  ["save_workflow", new Set(["save"])],
 ]);
 
 /**

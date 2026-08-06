@@ -32,7 +32,7 @@ const FIXTURE = {
   },
 };
 
-describe("dsl_to_workflow advisory wiring warnings", () => {
+describe('visualize_workflow (action:"from_dsl") advisory wiring warnings', () => {
   beforeEach(() => {
     getNodeDefs.mockReset();
     resetObjectInfoCache();

@@ -16,7 +16,7 @@ Works on **macOS**, **Linux**, and **Windows**. Auto-detects your ComfyUI instal
 
 **Stuck or have a question? [Join the Discord](https://discord.gg/cW9arBhzCu)** — help, model tips, and release announcements.
 
-**103 MCP tools** | **37 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
+**87 MCP tools** | **37 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
 
 The plugin ships **expert skills that grow with every release** — model-specific generation guides with curated download URLs, workflow recipes, troubleshooting, and custom-node authoring — so Claude knows the right sampler, CFG, resolution, and model files for each architecture without trial and error.
 
@@ -249,7 +249,7 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 ## MCP Tools
 
-103 tools across workflow execution, generation, iteration, composition, models, and more:
+87 tools across workflow execution, generation, iteration, composition, models, and more:
 
 ### Image Generation (high-level)
 
@@ -295,39 +295,26 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 | Tool | Description |
 |------|-------------|
-| `visualize_workflow` | Convert a workflow to a Mermaid flowchart with nodes grouped by category |
-| `mermaid_to_workflow` | Convert a Mermaid diagram back to executable workflow JSON |
+| `visualize_workflow` | One action-parameterized tool for rendering and converting a workflow you pass in: `render` (Mermaid flowchart, nodes grouped by category), `render_hierarchical` (the same graph sectioned — overview, one section in detail, a listing, or an AI-oriented summary), `mermaid` (a Mermaid diagram back to executable workflow JSON), `to_dsl`/`from_dsl` (the compact, losslessly round-tripping authoring DSL) |
 
 ### Workflow Composition
 
 | Tool | Description |
 |------|-------------|
-| `create_workflow` | Generate a workflow from templates: `txt2img`, `img2img`, `upscale`, `inpaint`, `controlnet`, `ip_adapter`, `ace_step_15`, `stable_audio_3` |
-| `modify_workflow` | Apply operations: `set_input`, `add_node`, `remove_node`, `connect`, `insert_between` |
-| `get_node_info` | Query available node types from ComfyUI's `/object_info` endpoint |
-
-### Workflow Validation
-
-| Tool | Description |
-|------|-------------|
-| `validate_workflow` | Dry-run validation — checks missing nodes, broken connections, invalid output indices, missing model files |
+| `create_workflow` | One action-parameterized tool for authoring: `create` (from templates: `txt2img`, `img2img`, `upscale`, `inpaint`, `controlnet`, `ip_adapter`, `ace_step_15`, `stable_audio_3`), `modify` (operations: `set_input`, `add_node`, `remove_node`, `connect`, `insert_between`), `validate` (dry-run — missing nodes, broken connections, invalid output indices, missing model files), `node_info` (query available node types from ComfyUI's `/object_info` endpoint) |
 
 ### Workflow Library
 
 | Tool | Description |
 |------|-------------|
-| `list_workflows` | List saved workflows from ComfyUI's user library |
-| `get_workflow` | Load a specific saved workflow by filename |
-| `strip_workflow` | **De-virtualize** any workflow (absolute path, library filename, or inline graph) — resolve GetNode/SetNode buses, Reroutes, subgraph defs, and bypassed nodes into real connections and return the flat graph. Reads ANY path server-side, so it loads ad-hoc/expert workflows the cached library can't. |
-| `slice_workflow` | **Un-chunk** a toggle-template monolith — slice ONE rgthree Fast-Groups-Bypass-toggled pipeline out into a standalone activated graph (seed from the named groups' output nodes, backward-closure, un-bypass). Pair with `strip_workflow` to then flatten the buses. |
-| `save_workflow` | Save a workflow to the ComfyUI user library |
+| `get_workflow` | One action-parameterized tool for READING a saved workflow file: `list` (the user library, subfolders included), `get` (one workflow's JSON by filename), `analyze` (a structured summary instead of raw JSON), `query` (filter/traverse/aggregate a big graph without dumping it), `strip` (**de-virtualize** any workflow from an absolute path, library filename, or inline graph — resolve GetNode/SetNode buses, Reroutes, subgraph defs, and bypassed nodes into real connections and return the flat graph; reads ANY path server-side, so it loads ad-hoc/expert workflows the cached library can't), `slice` (**un-chunk** a toggle-template monolith — one rgthree Fast-Groups-Bypass-toggled pipeline out into a standalone activated graph; pair with `strip` to then flatten the buses), `from_image` (the workflow ComfyUI embedded in a PNG), `prompt_director` (Prompt Director's sanitized runtime state) |
+| `save_workflow` | One action-parameterized tool for WRITING to the library: `save` (store a workflow — overwrites a same-filename file), `lock` (record a provenance lock: SHA-256 per model, git commit per node pack), `verify_lock` (report drift against that lock) |
 
 ### Image Management
 
 | Tool | Description |
 |------|-------------|
 | `upload_image` | Copy a local image into ComfyUI's `input/` directory for img2img, inpaint, or ControlNet |
-| `workflow_from_image` | Extract embedded workflow metadata from a ComfyUI-generated PNG (reads `prompt` and `workflow` tEXt chunks) |
 | `list_output_images` | Browse recently generated images **and videos** from the output directory, sorted newest-first — recurses into subfolders (e.g. SaveVideo's `output/video/…`) and returns each result's `subfolder` |
 
 ### Model Management
@@ -799,8 +786,8 @@ src/
     workflow-validator.ts  # Dry-run validation (missing nodes, models, connections)
     image-management.ts    # Upload images, extract PNG metadata, list outputs
     mermaid-converter.ts   # Workflow → Mermaid diagram
-    workflow-converter.ts  # UI → API: de-virtualize Get/Set buses + Reroutes, expand subgraphs, resolve bypass (powers strip_workflow)
-    workflow-slicer.ts     # sliceWorkflow() — rgthree Fast-Groups-Bypass pipeline un-chunker (shared by the CLI + slice_workflow)
+    workflow-converter.ts  # UI → API: de-virtualize Get/Set buses + Reroutes, expand subgraphs, resolve bypass (powers get_workflow's strip action)
+    workflow-slicer.ts     # sliceWorkflow() — rgthree Fast-Groups-Bypass pipeline un-chunker (shared by the CLI + get_workflow's slice action)
     mermaid-parser.ts      # Mermaid diagram → Workflow
     model-resolver.ts      # HuggingFace search, local models, downloads
     generation-tracker.ts  # SQLite generation log, settings dedup, stats
@@ -812,11 +799,11 @@ src/
     skill-generator.ts     # Generate node pack skill docs
   tools/                   # MCP tool registration (one file per group)
     workflow-execute.ts    # enqueue_workflow, get_system_stats
-    workflow-visualize.ts  # visualize_workflow, mermaid_to_workflow
-    workflow-compose.ts    # create_workflow, modify_workflow, get_node_info
-    workflow-validate.ts   # validate_workflow
-    workflow-library.ts    # list_workflows, get_workflow, strip_workflow, slice_workflow, save_workflow
-    image-management.ts    # upload_image, workflow_from_image, list_output_images
+    workflow-visualize.ts  # visualize_workflow (render/render_hierarchical/mermaid/to_dsl/from_dsl)
+    workflow-compose.ts    # create_workflow (create/modify/validate/node_info)
+    workflow-validate.ts   # the validate action's body
+    workflow-library.ts    # get_workflow (8 read actions), save_workflow (save/lock/verify_lock)
+    image-management.ts    # upload_image, list_output_images
     model-management.ts    # download_model, list_local_models (the two consolidated model tools)
     memory-management.ts   # clear_vram
     registry-search.ts     # search_custom_nodes, get_node_pack_details

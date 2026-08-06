@@ -27,7 +27,7 @@ import {
  * #809 — a truncation marker is an INSTRUCTION TO A MACHINE.
  *
  * The defect this file exists to prevent is not "the hint is missing", it is "the hint
- * names the WRONG lever". `query_workflow`'s truncation tail told callers to raise
+ * names the WRONG lever". The saved-file query's truncation tail told callers to raise
  * `limit` even when the CHAR BUDGET had cut the result — where raising `limit` does
  * nothing and makes the overflow worse. The agent tries it, it fails, and the failure
  * confirms the wrong conclusion: "this tool cannot read this graph."
@@ -176,7 +176,7 @@ describe("#809 truncation remedies name a lever that actually exists", () => {
     }
   }
 
-  // ---- query_workflow (src/services/graph-query.ts) --------------------------------
+  // ---- get_workflow action:"query" (src/services/graph-query.ts) -------------------
   //
   // Scenarios are real engine runs, not fixtures: the string under test is the one the
   // tool would actually emit.
@@ -281,13 +281,13 @@ describe("#809 truncation remedies name a lever that actually exists", () => {
   ];
 
   for (const s of scenarios) {
-    it(`query_workflow — ${s.name}`, () => {
+    it(`get_workflow action:"query" — ${s.name}`, () => {
       const text = s.text();
       // Every scenario must actually have dropped something, or it is asserting nothing.
       expect(text, `scenario "${s.name}" produced no truncation marker`).toMatch(
         /…|truncated|cut|omitted/,
       );
-      assertRemedyIsActionable("query_workflow", `query_workflow (${s.name})`, text);
+      assertRemedyIsActionable("get_workflow", `get_workflow action:"query" (${s.name})`, text);
     });
   }
 
@@ -496,12 +496,12 @@ describe("#809 truncation remedies name a lever that actually exists", () => {
     const r = queryApiGraph(g, { ids: ["1"], fields: "detail", max_chars: MAX_CHARS_CEILING });
     expect(r.text).not.toMatch(/list all/);
     expect(r.text).toContain(`list the first ${LIMIT_CEILING}`);
-    // query_workflow has NO cursor/offset, so "page through them" would be a second
+    // The query action has NO cursor/offset, so "page through them" would be a second
     // false promise inside the remedy for the first one.
     expect(r.text).toMatch(/there is no cursor\/offset/);
     // And it still never quotes a limit above the ceiling.
     expect(r.text).not.toMatch(/`limit`:2[0-9][1-9]/);
-    assertRemedyIsActionable("query_workflow", "query_workflow 250-ref follow-up", r.text);
+    assertRemedyIsActionable("get_workflow", "get_workflow query 250-ref follow-up", r.text);
   });
 
   it("points the fixed compact-value clip at fields:'detail', not at a dead lever", () => {

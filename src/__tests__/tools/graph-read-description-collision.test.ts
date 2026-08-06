@@ -71,10 +71,10 @@ const FAMILY = [
   "panel_find_nodes",
   "panel_view_nodes_in_viewport",
   "panel_screenshot",
+  // 0.50.0 slice 14: the hierarchical renderer, the saved-file query and the
+  // saved-file summary are now actions on these two, so the family is the two
+  // TOOL names a model chooses between — which is the level #557 is about.
   "visualize_workflow",
-  "visualize_workflow_hierarchical",
-  "query_workflow",
-  "analyze_workflow",
   "get_workflow",
 ] as const;
 
@@ -150,7 +150,7 @@ describe("graph-reading tool descriptions are distinguishable (#557)", () => {
   });
 
   describe("the file-based readers say FILE, the panel ones say canvas", () => {
-    for (const name of ["visualize_workflow", "query_workflow", "analyze_workflow", "get_workflow"]) {
+    for (const name of ["visualize_workflow", "get_workflow"]) {
       it(`${name} states up front that its input is passed in / on disk`, () => {
         const lead = leadingPhrase(describeTool(name), 90);
         expect(lead).toMatch(/pass in|saved|file|json/);
@@ -200,8 +200,12 @@ describe("graph-reading tool descriptions are distinguishable (#557)", () => {
    * scan that quietly stops scanning.
    */
   const EXPECTED_CLAIMANTS = [
-    "analyze_workflow",
     "diagnose_run",
+    // 0.50.0 slice 14: get_workflow's opening now covers the whole saved-file
+    // read surface, so it names the canvas to rule it OUT — and it hands the
+    // model back to panel_graph_outline in the same clause, which is what the
+    // last test in this file requires of a claimant.
+    "get_workflow",
     "panel_canvas",
     "panel_enter_subgraph",
     "panel_find_nodes",
@@ -216,9 +220,7 @@ describe("graph-reading tool descriptions are distinguishable (#557)", () => {
     "panel_screenshot",
     "panel_strip_workflow",
     "panel_view_nodes_in_viewport",
-    "query_workflow",
     "visualize_workflow",
-    "visualize_workflow_hierarchical",
   ];
 
   it("reaches exactly the tools it is documented to reach (the ratchet is not vacuous)", () => {

@@ -285,7 +285,7 @@ export function analyzeGraphHealth(
   // --- 5. Muted / bypassed nodes (info) ------------------------------------
   // Surfaced via _meta.mode where the raw API JSON carries it. convertUiToApi
   // *drops* mode-2/4 nodes, so for library workflows this is usually absent and
-  // silently skipped; raw API JSON handed to validate_workflow is checked here.
+  // silently skipped; raw API JSON handed to create_workflow (action:"validate") is checked here.
   for (const id of nodeIds) {
     const mode = workflow[id]._meta?.mode;
     if (mode === "muted" || mode === "bypassed") {

@@ -43,7 +43,7 @@ From the execution history, extract:
 
 ### Step 3: Cross-Reference Node Schema
 
-Use `get_node_info(node_type="FailingNodeType")` to retrieve the node's expected input/output schema:
+Use `create_workflow(action="node_info", node_type="FailingNodeType")` to retrieve the node's expected input/output schema:
 
 - Compare the workflow's inputs to the schema's required inputs
 - Check for missing required inputs
@@ -92,7 +92,7 @@ Based on the diagnosis, propose a specific fix. Always include:
 
 1. **Root cause**: What went wrong and why
 2. **Specific action**: Exactly what to change (not vague advice)
-3. **Workflow modification**: If applicable, the exact `modify_workflow` operation to apply
+3. **Workflow modification**: If applicable, the exact `create_workflow (action:"modify")` operation to apply
 4. **Model download**: If a model is missing, the exact `download_model` call
 5. **Verification**: How to confirm the fix works
 
@@ -100,7 +100,7 @@ Based on the diagnosis, propose a specific fix. Always include:
 
 If the user requests it, apply the fix directly:
 
-1. **Modify the workflow**: Use `modify_workflow` to change inputs, add/remove nodes, or rewire connections
+1. **Modify the workflow**: Use `create_workflow (action:"modify")` to change inputs, add/remove nodes, or rewire connections
 2. **Download missing models**: Use `download_model` to install required files
 3. **Re-run the workflow**: Use `enqueue_workflow` with the fixed workflow, then start a background monitor (`node "${CLAUDE_PLUGIN_ROOT}/scripts/monitor-progress.mjs" <prompt_id>` with `run_in_background: true`) to track completion
 4. **Verify success**: Check `get_history` for the new execution

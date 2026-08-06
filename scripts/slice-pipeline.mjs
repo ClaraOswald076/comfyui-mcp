@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Slice ONE pipeline out of a toggle-template pack workflow into a standalone,
 // activated graph. Thin CLI wrapper around the shared sliceWorkflow() service
-// (src/services/workflow-slicer.ts) — the same implementation the slice_workflow
-// / panel_slice_workflow tools use.
+// (src/services/workflow-slicer.ts) — the same implementation that
+// get_workflow (action:"slice") and panel_slice_workflow use.
 //
 //   node scripts/slice-pipeline.mjs <src/workflow.json> <out.json> "<grpA>,<grpB>,..."
 //

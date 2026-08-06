@@ -65,4 +65,4 @@ Steps:
 - Some packs have complex dependencies (e.g., GroundingDINO, SAM) — if pip install fails, show the error and suggest manual intervention
 - If `git clone` fails due to the directory already existing, offer `git pull` to update instead
 - Some packs require additional model downloads after installation — check the pack README for post-install steps
-- After installation and restart, verify the nodes loaded by calling `get_node_info` with one of the pack's node names
+- After installation and restart, verify the nodes loaded by calling `create_workflow (action:"node_info")` with one of the pack's node names

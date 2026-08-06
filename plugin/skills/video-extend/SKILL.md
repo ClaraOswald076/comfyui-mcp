@@ -35,7 +35,7 @@ that workflow plus the live node schemas.
 > and against kijai's example workflow JSON + HF repo (June 2026). Where a value
 > is a starting recommendation rather than a hard requirement it's flagged. Don't
 > substitute a node you can't confirm with `list_installed_nodes` /
-> `get_node_info`.
+> `create_workflow (action:"node_info")`.
 
 ---
 
@@ -192,7 +192,7 @@ The example also contains a `CLIPLoader → CLIPTextEncode → WanVideoTextEmbed
 branch (the "red panda" prompt). **It is NOT wired to the samplers** — both
 `WanVideoSampler.text_embeds` come from `WanVideoTextEncodeCached`
 (`umt5-xxl-enc-bf16`). Edit the prompt THERE; the CLIPTextEncode pair is a decoy
-that strip_workflow will show dangling.
+that get_workflow (action:"strip") will show dangling.
 
 ### ⚠️ TRAP 4 — match the conditioning fps to WAN-native (16)
 
@@ -435,7 +435,7 @@ of LoRA. Use the wrapper's offload tooling.
 - **Loading the example silently resets model/VAE/distill-LoRA dropdowns** to the
   wrong first entry (subfolder paths don't resolve on a flat layout) — the #1
   cause of a Pusa run that errors or generates wrong content. See "In practice:
-  load → strip → re-point" and re-point ALL of them. Use `strip_workflow` to spot
+  load → strip → re-point" and re-point ALL of them. Use `get_workflow (action:"strip")` to spot
   it.
 - **The prompt lives on `WanVideoTextEncodeCached`**, not the CLIPTextEncode
   "decoy" branch (which isn't wired to the samplers).

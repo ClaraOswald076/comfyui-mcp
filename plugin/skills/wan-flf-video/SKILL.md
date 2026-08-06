@@ -529,11 +529,11 @@ Proven timing on RTX 4090: Z-Image (35s) → Qwen Edit (78s) → WAN FLF 81 fram
 
 ## Working with Saved Workflows
 
-Use `analyze_workflow` to understand any saved WAN FLF workflow before modifying or executing it. It returns a structured summary with sections, node IDs, key settings, and virtual wire connections — no raw JSON needed.
+Use `get_workflow (action:"analyze")` to understand any saved WAN FLF workflow before modifying or executing it. It returns a structured summary with sections, node IDs, key settings, and virtual wire connections — no raw JSON needed.
 
 ```
-analyze_workflow("Wan FirstLastFrame Advanced.json")           # summary view (default)
-analyze_workflow("Wan FirstLastFrame Advanced.json", view="flat")  # mermaid diagram
+get_workflow(action="analyze", filename="Wan FirstLastFrame Advanced.json")                # summary view (default)
+get_workflow(action="analyze", filename="Wan FirstLastFrame Advanced.json", view="flat")   # mermaid diagram
 ```
 
-Only use `get_workflow` when you need the raw JSON for `enqueue_workflow` or `modify_workflow`.
+Only use `get_workflow` when you need the raw JSON for `enqueue_workflow` or `create_workflow (action:"modify")`.

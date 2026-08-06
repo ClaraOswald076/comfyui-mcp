@@ -87,8 +87,9 @@ function drawSeed(min: number, max: number): number {
  * since `_enqueue_prompt()` is the raw HTTP POST without seed randomization.
  *
  * Each draw respects the target node's DECLARED `[min, max]` for that input
- * (from the memoized /object_info snapshot — the same one get_node_info
- * serves), so nodes with a sub-2^32 seed max no longer fail validation with a
+ * (from the memoized /object_info snapshot — the same one
+ * create_workflow (action:"node_info") serves), so nodes with a sub-2^32 seed
+ * max no longer fail validation with a
  * 400. Inputs named in `preserveInputs` are left exactly as supplied.
  */
 async function randomizeSeeds(

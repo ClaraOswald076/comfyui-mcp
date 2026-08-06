@@ -231,7 +231,7 @@ Insert a `Power Lora Loader (rgthree)` between the UNet loader and `ModelSamplin
 
 1. Lead with the **literal text** you want rendered, in quotes — that's ERNIE's headline strength.
 2. Use the **prompt enhancer** for short/lazy prompts; turn it off (`ComfySwitchNode` false) when you've written a detailed prompt yourself.
-3. Use **`analyze_workflow`** before executing the shipped graph — it has dozens of group-boxed variants gated by `Fast Groups Bypasser (rgthree)`; the analyzer summary is far easier than reading raw JSON.
+3. Use **`get_workflow (action:"analyze")`** before executing the shipped graph — it has dozens of group-boxed variants gated by `Fast Groups Bypasser (rgthree)`; the analyzer summary is far easier than reading raw JSON.
 4. Most groups are **bypassed (mode 4)** by default in the source file — enable only the pipeline you want via the group bypasser, or build the clean API workflow above.
 5. To choose a model: **ERNIE = text/layout T2I**, **Z-Image Turbo = fast general T2I**, **Qwen-Image-Edit / Flux Kontext = actual editing**.
 ```

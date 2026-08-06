@@ -21,7 +21,7 @@ When a workflow fails, follow this systematic approach:
 1. **Get the error**: Use `get_history` to retrieve the execution result with full traceback
 2. **Check logs**: Use `get_logs` with keyword filters like `"error"`, `"warning"`, `"traceback"`
 3. **Identify the failing node**: The history response includes the `node_id` and `node_type` that failed
-4. **Cross-reference inputs**: Use `get_node_info` to verify the failing node's expected input schema
+4. **Cross-reference inputs**: Use `create_workflow (action:"node_info")` to verify the failing node's expected input schema
 5. **Check models**: Use `list_local_models` to verify all referenced model files exist
 
 ## Out of Memory (OOM)
@@ -330,7 +330,7 @@ Connecting the wrong output slot of a node to an incompatible input. Often cause
 
 ### Fixes
 
-1. **Check output indices**: Use `get_node_info` to verify the exact output order
+1. **Check output indices**: Use `create_workflow (action:"node_info")` to verify the exact output order
    - `CheckpointLoaderSimple` outputs: 0=MODEL, 1=CLIP, 2=VAE
    - Getting index wrong: `["1", 0]` gives MODEL, `["1", 1]` gives CLIP
 2. **Verify connection format**: `["nodeId", outputIndex]` — node ID is a string, index is an integer
@@ -463,8 +463,8 @@ get_logs(max_lines=50, keyword="error")  # Recent error logs
 ### Verify Node Availability
 
 ```
-get_node_info(node_type="KSampler")              # Check specific node
-get_node_info(node_type="ControlNetApply")        # Verify custom nodes loaded
+create_workflow(action="node_info", node_type="KSampler")        # Check specific node
+create_workflow(action="node_info", node_type="ControlNetApply")  # Verify custom nodes loaded
 ```
 
 ### Verify Models
@@ -490,4 +490,4 @@ list_local_models({ action: "list", model_type: "controlnet" })    # Installed C
 | Black images, no error | Check denoise > 0, cfg > 0, steps > 0, prompt not empty |
 | Image looks garbled/noisy | Wrong model+VAE combo, wrong sampler settings |
 | `Connection refused` on port 8188 | ComfyUI not running, or using Desktop (port 8000) |
-| `Prompt outputs failed validation` | Node inputs don't match schema — check `get_node_info` |
+| `Prompt outputs failed validation` | Node inputs don't match schema — check `create_workflow (action:"node_info")` |
