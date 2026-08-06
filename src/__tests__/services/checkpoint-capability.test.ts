@@ -81,8 +81,7 @@ describe("headerKeysHaveTextEncoder", () => {
 
   it("rejects an empty header", () => {
     expect(headerKeysHaveTextEncoder([])).toBe(false);
-  });
-});
+  });});
 
 describe("selectTxt2ImgCheckpoint (#892)", () => {
   it("skips a video checkpoint and picks the txt2img-capable one", async () => {
@@ -165,6 +164,19 @@ describe("selectTxt2ImgCheckpoint (#892)", () => {
     const choice = await selectTxt2ImgCheckpoint([
       model("corrupt.safetensors", filePath),
     ]);
+    expect(choice?.capability).toBe("unknown");
+  });
+
+  it("treats a readable header with an UNRECOGNIZED layout as unknown, not incapable", async () => {
+    // No text-encoder prefix, but also no recognized diffusion/VAE layout:
+    // absence of evidence is not evidence of absence.
+    const exotic = model(
+      "exotic.safetensors",
+      await writeFakeSafetensors("exotic.safetensors", [
+        "some_future_arch.encoder.weight",
+      ]),
+    );
+    const choice = await selectTxt2ImgCheckpoint([exotic]);
     expect(choice?.capability).toBe("unknown");
   });
 });

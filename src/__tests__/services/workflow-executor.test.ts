@@ -124,6 +124,15 @@ describe("seedInputRange", () => {
     expect(seedInputRange(huge, "Huge", "seed")).toBeNull();
   });
 
+  it("rounds fractional declared bounds inward to integers inside the range", () => {
+    const frac = {
+      Frac: {
+        input: { required: { seed: ["INT", { min: 0.5, max: 10.9 }] } },
+      },
+    } as unknown as ObjectInfo;
+    expect(seedInputRange(frac, "Frac", "seed")).toEqual([1, 10]);
+  });
+
   it("honors a declared max wider than int32 (KSampler 2^64-1)", () => {
     const [min, max] = seedInputRange(OBJECT_INFO, "KSampler", "seed");
     expect(min).toBe(0);

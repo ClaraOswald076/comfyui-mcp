@@ -9,13 +9,14 @@
  *
  * ComfyUI exposes no "does this checkpoint contain a CLIP" endpoint, so the
  * probe reads the safetensors header (first bytes only, never the multi-GB
- * tensor payload) and looks for known text-encoder tensor prefixes. The probe
- * is three-valued on purpose: "unknown" is NOT folded into "incapable" —
- * remote servers, non-safetensors formats and unreadable files all mean we
- * could not determine capability, and treating that as a definite negative
- * would refuse checkpoints that actually work. Selection prefers known-capable,
- * falls back to unknown, and refuses only when EVERY candidate is known
- * incapable (where enqueueing would be a guaranteed CLIPTextEncode failure).
+ * tensor payload). A header WITH known text-encoder tensor prefixes is
+ * "capable"; a header with a recognized diffusion/VAE layout but no text
+ * encoder is "incapable" (an observed absence, e.g. the video models this
+ * fix targets); anything else — remote servers, non-safetensors formats,
+ * unreadable files, unrecognized layouts — is "unknown", never folded into
+ * "incapable". Selection prefers known-capable, falls back to unknown, and
+ * refuses only when EVERY candidate is known incapable (where enqueueing
+ * would be a guaranteed CLIPTextEncode failure).
  */
 import { open, stat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
@@ -47,9 +48,35 @@ const TEXT_ENCODER_KEY_PREFIXES = [
   "text_encoder.",
 ] as const;
 
+/**
+ * Tensor-key prefixes that positively identify a recognized diffusion/VAE
+ * checkpoint layout. "incapable" is only reported when the header shows one
+ * of these layouts AND no text encoder — an observed absence inside a
+ * recognized layout, not an unrecognized layout. A header matching NEITHER
+ * list is "unknown" (could not determine), never "incapable".
+ */
+const DIFFUSION_LAYOUT_KEY_PREFIXES = [
+  "model.diffusion_model.",
+  "diffusion_model.",
+  "double_blocks.",
+  "single_blocks.",
+  "first_stage_model.",
+  "vae.",
+] as const;
+
 export function headerKeysHaveTextEncoder(keys: Iterable<string>): boolean {
   for (const key of keys) {
     for (const prefix of TEXT_ENCODER_KEY_PREFIXES) {
+      if (key.startsWith(prefix)) return true;
+    }
+  }
+  return false;
+}
+
+/** True when the header keys show a recognized diffusion/VAE checkpoint layout. */
+export function headerKeysHaveDiffusionLayout(keys: Iterable<string>): boolean {
+  for (const key of keys) {
+    for (const prefix of DIFFUSION_LAYOUT_KEY_PREFIXES) {
       if (key.startsWith(prefix)) return true;
     }
   }
@@ -157,7 +184,11 @@ async function probeCheckpoint(model: LocalModel): Promise<Txt2ImgCapability> {
       ? "unknown"
       : headerKeysHaveTextEncoder(keys)
         ? "capable"
-        : "incapable";
+        : // No text encoder — but only a RECOGNIZED diffusion/VAE layout makes
+          // that an observed absence; an unrecognized layout is "unknown".
+          headerKeysHaveDiffusionLayout(keys)
+          ? "incapable"
+          : "unknown";
   probeCache.set(filePath, { mtimeMs, size, capability });
   return capability;
 }

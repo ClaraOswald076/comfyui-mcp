@@ -69,8 +69,12 @@ export function seedInputRange(
   // (KSampler declares 2^64-1) are inexact doubles, and a top-of-range draw
   // could round UP past the true maximum and fail validation.
   const max = Math.min(declaredMax ?? FALLBACK_SEED_MAX, Number.MAX_SAFE_INTEGER);
-  if (min > max) return null;
-  return [min, max];
+  // ceil/floor fractional declared bounds inward so the draw is always an
+  // integer INSIDE the declared range (the input type is INT).
+  const safeMin = Math.ceil(min);
+  const safeMax = Math.floor(max);
+  if (safeMin > safeMax) return null;
+  return [safeMin, safeMax];
 }
 
 function drawSeed(min: number, max: number): number {
