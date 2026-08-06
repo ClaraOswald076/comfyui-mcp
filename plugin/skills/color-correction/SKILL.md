@@ -1,6 +1,6 @@
 ---
 name: color-correction
-description: Diagnose and fix video/image color OBJECTIVELY with the analyze_color tool (scopes/stats — black/white points, contrast, saturation, clipping, cast) instead of eyeballing a contact sheet. Covers the "washed out" signature, why reference color-match (mkl/ColorMatch/ColorMatchAdobe) CAN'T add contrast a flat source lacks, the levels/contrast-stretch fix (core AdjustContrast / CurveEditor), the measure→fix→re-measure loop, the side-by-side sandbox pattern, and where to place the fix in a render graph (after decode, before save). Use when a render looks washed out / flat / dull / over-saturated / color-cast, or when deciding between a color-match and a contrast/levels fix.
+description: Diagnose and fix video/image color OBJECTIVELY with the get_image (action:"analyze_color") tool (scopes/stats — black/white points, contrast, saturation, clipping, cast) instead of eyeballing a contact sheet. Covers the "washed out" signature, why reference color-match (mkl/ColorMatch/ColorMatchAdobe) CAN'T add contrast a flat source lacks, the levels/contrast-stretch fix (core AdjustContrast / CurveEditor), the measure→fix→re-measure loop, the side-by-side sandbox pattern, and where to place the fix in a render graph (after decode, before save). Use when a render looks washed out / flat / dull / over-saturated / color-cast, or when deciding between a color-match and a contrast/levels fix.
 globs:
   - "**/*.json"
   - "**/packs/**"
@@ -12,11 +12,11 @@ globs:
 
 **You cannot reliably judge color from a storyboard / contact sheet.** "Is it washed
 out?" flip-flops by eye, especially on AI-gen video. Make color **measurable** with the
-`analyze_color` MCP tool, read the numbers like a colorist reads scopes, then pick the
+`get_image (action:"analyze_color")` MCP tool, read the numbers like a colorist reads scopes, then pick the
 fix the data points to — and re-measure to confirm. The whole skill is this loop:
 
 ```
-extract a frame ─► analyze_color ─► read black/white points + contrast + saturation
+extract a frame ─► get_image (action:"analyze_color") ─► read black/white points + contrast + saturation
        ▲                                          │
        │                                          ▼
    re-measure  ◄──── apply fix (levels / contrast / match) ◄── diagnose from the numbers
@@ -28,19 +28,19 @@ extract a frame ─► analyze_color ─► read black/white points + contrast +
 
 ---
 
-## The `analyze_color` tool
+## The `get_image (action:"analyze_color")` tool
 
 Read-only. Source = `asset_id`, a ComfyUI output ref (`filename`/`subfolder`/`type`), or
 an image `path` (absolute, or under the output dir). It returns per-image stats + heuristic
 flags + a one-line verdict, and (optional) an overlaid R/G/B/luma **histogram PNG**.
 
 ```
-analyze_color({ filename: "render_00007_.png" })                 # absolute numbers
-analyze_color({ path: "frame.png", reference_path: "src.jpg" })  # + shot-match deltas
-analyze_color({ filename: "x.png", histogram: true })            # + histogram image
+get_image({ action: "analyze_color", filename: "render_00007_.png" })       # absolute numbers
+get_image({ action: "analyze_color", path: "frame.png", reference_path: "src.jpg" })  # + shot-match deltas
+get_image({ action: "analyze_color", filename: "x.png", histogram: true })  # + histogram image
 ```
 
-**Videos:** `analyze_color` is image-only (no ffmpeg dep). Extract a frame first with the
+**Videos:** `get_image (action:"analyze_color")` is image-only (no ffmpeg dep). Extract a frame first with the
 ComfyUI venv's cv2:
 
 ```bash
@@ -140,7 +140,7 @@ LoadImage (the reference, if shot-matching)
         └─► ImageColorMatchAdobe+(LAB)─► SaveImage "balance_adobe"
 ```
 
-Run once, then `analyze_color` **every** output (+ the reference + the untouched frame) and
+Run once, then `get_image (action:"analyze_color")` **every** output (+ the reference + the untouched frame) and
 compare blackPoint / whitePoint / contrast / saturation / clippedHigh. Whichever lands the
 numbers in range wins; interpolate the factor (1.3 vs 1.6 → 1.4) and confirm with one more
 pass. Stage the frame into the ComfyUI **input** dir first (cp the extracted PNG there) so
@@ -154,7 +154,7 @@ Place the chosen correction **after decode, before the save** — for a WAN/vide
 right after `WanVideoDecode` (or the per-chunk color-match) and feeding the
 `VHS_VideoCombine`/save node. One `AdjustContrast` node is usually the whole fix; keep it as a
 single inline node (or a small bypassable group) so it's easy to toggle and re-tune. Re-render
-a clip, extract a frame, `analyze_color` it, and nudge the factor to hit whitePoint ~250.
+a clip, extract a frame, `get_image (action:"analyze_color")` it, and nudge the factor to hit whitePoint ~250.
 
 ---
 
@@ -176,7 +176,7 @@ a clip, extract a frame, `analyze_color` it, and nudge the factor to hit whitePo
 ## Quick reference — the decision tree
 
 ```
-analyze_color the frame
+get_image (action:"analyze_color") on the frame
   ├─ washedOut / lowContrast / dimHighlights ........ contrast/levels stretch (AdjustContrast ~1.4 → measure)
   ├─ lowSaturation only ............................. saturation boost (small)
   ├─ colorCast (and reference is neutral) ........... white-balance / neutralization, or reference-match
@@ -184,5 +184,5 @@ analyze_color the frame
   └─ blackPoint/whitePoint already 0/255, sat ok .... color is healthy — stop touching it
 ```
 
-Always **re-measure after the fix.** If `analyze_color` still flags it, the fix was wrong —
+Always **re-measure after the fix.** If `get_image (action:"analyze_color")` still flags it, the fix was wrong —
 adjust and measure again. Numbers over vibes.

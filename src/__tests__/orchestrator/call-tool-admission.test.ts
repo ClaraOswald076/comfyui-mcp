@@ -469,9 +469,122 @@ describe("call_tool admission", () => {
     });
   });
 
+  /**
+   * The same trap again (0.50.0 slice 15), and the one most likely to be felt:
+   * `get_image` and `list_output_images` are the image browsing surface a phone
+   * actually uses, and they were the ONLY two of the twelve folded image/asset
+   * names on this whitelist. The fold puts five more actions behind the one
+   * admitted name — including `convert`, which WRITES a file under the ComfyUI
+   * output directory when given `out_path`. Without an action scope, swapping
+   * two names for one would hand a canvas-less client file creation and the
+   * whole asset registry (workflow snapshots included) for free.
+   */
+  describe("get_image: the folded actions the old entries never covered stay out", () => {
+    it("admits exactly the two actions whose standalone names were whitelisted", () => {
+      expect(callToolAdmission("get_image", { action: "get" })).toBeNull();
+      expect(callToolAdmission("get_image", { action: "list_outputs" })).toBeNull();
+      // …with the arguments those entries forwarded.
+      expect(
+        callToolAdmission("get_image", {
+          action: "get",
+          filename: "portrait_00042_.png",
+          type: "output",
+        }),
+      ).toBeNull();
+      expect(
+        callToolAdmission("get_image", { action: "list_outputs", limit: 20, format: "json" }),
+      ).toBeNull();
+    });
+
+    it("refuses convert — the one folded action that WRITES a file", () => {
+      expect(callToolAdmission("get_image", { action: "convert" })).toBe(
+        'tool "get_image" is not permitted for action "convert"',
+      );
+      // Including the shape that would actually create the file, so the refusal
+      // cannot be argued away as "only the bare action is blocked".
+      expect(
+        callToolAdmission("get_image", {
+          action: "convert",
+          path: "a.png",
+          format: "webp",
+          out_path: "a.webp",
+        }),
+      ).toBe('tool "get_image" is not permitted for action "convert"');
+    });
+
+    it("refuses the asset-registry and colour actions — read-only, but never whitelisted", () => {
+      for (const action of ["view", "list_assets", "asset_metadata", "analyze_color"]) {
+        expect(callToolAdmission("get_image", { action }), `action:"${action}"`).toBe(
+          `tool "get_image" is not permitted for action "${action}"`,
+        );
+      }
+    });
+
+    it("refuses get_image with a missing or non-string action", () => {
+      expect(callToolAdmission("get_image", {})).toBe(
+        'tool "get_image" is not permitted for action "(missing)"',
+      );
+      expect(callToolAdmission("get_image", { action: 42 })).toBe(
+        'tool "get_image" is not permitted for action "(missing)"',
+      );
+    });
+
+    it("upload_image stays refused at the NAME level — every one of its actions writes", () => {
+      // It was never on the whitelist and the fold must not put it there: the
+      // media actions write into ComfyUI's input/ directory, stage copies a
+      // server-side output into that directory, and output ships bytes off the
+      // machine to a caller-named cloud destination.
+      for (const action of ["image", "video", "audio", "stage", "output"]) {
+        expect(callToolAdmission("upload_image", { action }), `action:"${action}"`).toBe(
+          'tool "upload_image" is not permitted',
+        );
+      }
+      expect(callToolAdmission("upload_image", {})).toBe(
+        'tool "upload_image" is not permitted',
+      );
+    });
+
+    it("every retired image/asset name is answered from the LEDGER, not as unpermitted", () => {
+      // The fold removed the output listing from the name whitelist, so a client
+      // still sending an old name must not be silently admitted by a stale entry.
+      // What it gets back is the RETIREMENT, not a permission refusal (#911): the
+      // name no longer exists, and "not permitted" would send a developer hunting
+      // for a token or a trust boundary. This matters most for the two names the
+      // whitelist DID carry — a mobile client browsing outputs hits them first.
+      for (const name of [
+        "list_output_images",
+        "view_image",
+        "convert_image",
+        "analyze_color",
+        "list_assets",
+        "get_asset_metadata",
+        "stage_output_as_input",
+        "upload_video",
+        "upload_audio",
+        "upload_output",
+      ]) {
+        const answer = callToolAdmission(name, { action: "x" });
+        expect(answer, name).toBe(retiredToolMessage(name));
+        // Asserted against the wording too, not only against the ledger helper:
+        // an equality with retiredToolMessage() alone would still pass if both
+        // sides degraded together.
+        expect(answer, name).toContain(`Unknown tool '${name}'`);
+        expect(answer, name).toContain("removed in 0.50.0");
+        expect(answer, name).not.toContain("is not permitted");
+      }
+      // …and the two SURVIVORS are not answered as retired — a fold that
+      // accidentally declared its own survivor dead would take the whole name out.
+      expect(retiredToolMessage("get_image")).toBeUndefined();
+      expect(retiredToolMessage("upload_image")).toBeUndefined();
+    });
+  });
+
   it("name-level behavior is unchanged for everything else", () => {
     // A whitelisted tool with no action scope is admitted regardless of args…
-    expect(callToolAdmission("list_output_images", {})).toBeNull();
+    // (this used to name the standalone output listing; 0.50.0 slice 15 folded
+    // that into get_image, which IS action-scoped, so the example moved to a
+    // whitelist entry that still carries no scope.)
+    expect(callToolAdmission("enqueue_workflow", {})).toBeNull();
     // …including a consolidated tool whose whole-tool posture was judged at
     // whitelist time (apps, 0.49.0 slice 2) — deliberately NOT rescoped here.
     expect(callToolAdmission("apps", { action: "run" })).toBeNull();

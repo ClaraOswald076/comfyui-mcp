@@ -117,7 +117,7 @@ models, custom nodes, etc. If the user wants a quick smoke test, ask:
 > Generate a 1024×1024 image of a red apple on a wooden table.
 
 That exercises the `generate_image` tool end-to-end (auto-selects a local
-checkpoint or uses defaults; returns an `asset_id` you can `view_image` to
+checkpoint or uses defaults; returns an `asset_id` you can `get_image (action:"view")` to
 see).
 
 ## Common issues

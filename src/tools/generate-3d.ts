@@ -17,7 +17,7 @@ export function registerGenerate3dTools(server: McpServer): void {
       "server; these are paid API nodes needing a comfy.org API key/login on the server or COMFY_API_KEY here). " +
       "Builds and enqueues a minimal workflow and returns immediately with the prompt_id — poll " +
       "queue (action:\"status\") / get_history for the resulting model file (saved to ComfyUI's output directory). " +
-      "For image mode, upload the image first with upload_image and pass its filename. " +
+      "For image mode, upload the image first with upload_image (action:\"image\") and pass its filename. " +
       "If the server has no 3D-capable API nodes, returns an actionable error naming local-pack alternatives.",
     {
       mode: z
@@ -33,7 +33,7 @@ export function registerGenerate3dTools(server: McpServer): void {
         .string()
         .optional()
         .describe(
-          "REQUIRED when mode is 'image': ComfyUI input-image filename. Upload local files first with upload_image. (Cross-field requirement enforced at runtime.)",
+          "REQUIRED when mode is 'image': ComfyUI input-image filename. Upload local files first with upload_image (action:\"image\"). (Cross-field requirement enforced at runtime.)",
         ),
       node: z
         .string()

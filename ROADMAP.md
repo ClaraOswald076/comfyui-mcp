@@ -15,7 +15,7 @@ Comfy Registry.
 - **Released:** `0.7.0` on npm — Theme E stability/hardening (E1–E4, E7, E2-auth), custom-node
   authoring tools, experimental agent-panel backend, hosted docs.
 - **Complete (on main, unreleased → queued for `0.8.0`):** Theme E additive (E5 `apply_manifest`,
-  E6/E2b cloud storage, E8 `convert_image`), Theme C (C3 `node_pack` (`action: "verify"`), C5 scaffold CI),
+  E6/E2b cloud storage, E8 `get_image (action:"convert")`), Theme C (C3 `node_pack` (`action: "verify"`), C5 scaffold CI),
   Theme D (D1 `comfy-researcher` + skill cache). **Epics A, C, D, E are closed.**
 - **Pending release:** cut **`0.8.0`** for the unreleased surface above — `comfyui-mcp-yrp` (see beads).
 - **Blocked:** **Theme B** (embedded agent panel UI, B3–B6) is gated on the upstream
@@ -28,7 +28,7 @@ Comfy Registry.
 ## ✅ Shipped (0.6.x)
 - comfy-cli capability port (custom-node mgmt, snapshots, bisect, workflow deps, install/update,
   models, workspace/env, API nodes, manager config) — tools surface ~70+.
-- `upload_video` / `upload_audio`.
+- `upload_image (action:"video")` / `upload_image (action:"audio")`.
 - Mintlify docs site (schema-generated tool reference) at comfyui-mcp.artokun.io/docs.
 - Glama listing + TDQS A-grade pass; blog post (TDQS case study).
 

@@ -17,7 +17,7 @@ import { logger } from "../utils/logger.js";
 // ComfyUI can be launched with --output-directory (or --base-directory) which
 // redirects generated images away from the default <COMFYUI_PATH>/output (e.g.
 // to a shared drive like ComfyUI-Shared\output). Tools that scan the output
-// directory on the local filesystem (convert_image, list_output_images) must
+// directory on the local filesystem (get_image (action:"convert"), get_image (action:"list_outputs")) must
 // therefore NOT assume <COMFYUI_PATH>/output, or they find nothing after a
 // successful render.
 //
@@ -898,7 +898,7 @@ export function localOutputDirFallback(): string {
 // that write or check files in the input directory must therefore NOT assume
 // <COMFYUI_PATH>/input, or a server with a custom --input-directory rejects the
 // file ("Invalid image file") while the tool reports success. Prefer the server
-// API (/upload/image, see stage_output_as_input) when possible; use this only
+// API (/upload/image, see upload_image (action:"stage")) when possible; use this only
 // for genuine local filesystem operations.
 // ---------------------------------------------------------------------------
 

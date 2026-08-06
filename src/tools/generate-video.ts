@@ -32,7 +32,7 @@ export function registerGenerateVideoTool(server: McpServer): void {
       "checkpoint is missing. seconds is converted to an 8n+1 frame count. For i2v, higher `strength` means " +
       "MORE adherence to the start frame but LESS motion (1.0 can freeze the clip) — keep ~0.6. This minimal " +
       "path omits the synchronized audio + stage-2 spatial upscale that the full ltx-2.3 packs ship. Returns " +
-      "prompt_id immediately; the video is written under output/video/ — find it with list_output_images " +
+      "prompt_id immediately; the video is written under output/video/ — find it with get_image (action:\"list_outputs\") " +
       "(VHS/SaveVideo outputs may not appear in /history).",
     {
       prompt: z.string().describe("Text description of the video (actions over time, visual details)"),
@@ -81,7 +81,7 @@ export function registerGenerateVideoTool(server: McpServer): void {
                   height: result.height,
                   length_frames: result.length,
                   fps: result.fps,
-                  note: "Video is written under output/video/. VHS/SaveVideo outputs may not show in /history — use list_output_images to find it.",
+                  note: "Video is written under output/video/. VHS/SaveVideo outputs may not show in /history — use get_image (action:\"list_outputs\") to find it.",
                 },
                 null,
                 2,

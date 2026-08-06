@@ -36,9 +36,10 @@ import { registerApiNodesTools } from "./api-nodes.js";
 import { registerManagerConfigTools } from "./manager-config.js";
 import { registerManifestTools } from "./manifest.js";
 import { registerModelExplorerTools } from "./model-explorer.js";
-import { registerImageConvertTools } from "./image-convert.js";
-import { registerColorAnalysisTools } from "./color-analysis.js";
-import { registerStorageUploadTools } from "./storage-upload.js";
+// 0.50.0 slice 15: the image-convert / color-analysis / storage-upload
+// registrars are gone — their three tools became actions on `get_image` and
+// `upload_image` (registerImageManagementTools). The SERVICES they called are
+// untouched and now imported there.
 import { registerHealthCheckTools } from "./health-check.js";
 import { registerSkillsAccessTools } from "./skills-access.js";
 import { registerInstallPanelTools } from "./install-panel.js";
@@ -101,9 +102,6 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["server", registerManagerConfigTools],
   ["custom-nodes", registerNodePackTools],
   ["models", registerManifestTools],
-  ["images-assets", registerImageConvertTools],
-  ["images-assets", registerColorAnalysisTools],
-  ["images-assets", registerStorageUploadTools],
   ["diagnostics", registerHealthCheckTools],
   ["skills-config", registerSkillsAccessTools],
   ["server", registerInstallPanelTools],
@@ -132,8 +130,11 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
 // to the model. Enforced MECHANICALLY at the single registration boundary both
 // tool paths share — the live McpServer and the compact-mode ToolCatalog both
 // receive handlers wrapped here — so the guarantee holds for every current and
-// future image-returning tool (get_image, view_image, convert_image, color
-// analysis previews, ...) without per-tool opt-ins.
+// future image-returning tool (get_image's fetch/view/convert/colour-measure
+// actions, generate_image, upscale_image, ...) without per-tool opt-ins. It
+// wraps the RESULT, so folding several image-returning tools into one name
+// (0.50.0 slice 15) changes nothing here: the wrapper never reads a tool name
+// or an action.
 const blindMode = (): boolean => process.env.COMFYUI_MCP_BLIND === "1";
 
 function scrubImageBlocks(result: unknown): unknown {

@@ -18,7 +18,7 @@ the *full* experience is a model with **tool calling + thinking + vision**:
 | --- | --- |
 | **Tool calling** (native function calling) | **Will not work.** Every comfyui-mcp action is a tool call. Prompt-emulated tool calling in some harnesses technically runs, but reliability collapses — treat it as unsupported. |
 | **Thinking / reasoning** | Works, degraded. Multi-step chains (pick tool → fetch schema → build args → recover from errors) get noticeably worse; expect the agent to need re-prompting/nudging. |
-| **Vision** | Works, degraded. The agent can generate but can't *see* — `view_image` critique loops, `get_workflow (action:"from_image")`, and visual comparisons are unavailable, so it flies blind on its own outputs. |
+| **Vision** | Works, degraded. The agent can generate but can't *see* — `get_image (action:"view")` critique loops, `get_workflow (action:"from_image")`, and visual comparisons are unavailable, so it flies blind on its own outputs. |
 
 Hosted models that fit the full spec change monthly — check your provider's
 model card for the three capabilities rather than trusting a list. As of
@@ -29,7 +29,7 @@ models (below) generally keep tool calling and drop the rest.
 
 ## Compact tool mode
 
-The full surface is 70 tools with rich JSON schemas (~200 KB, roughly 50k
+The full surface is 60 tools with rich JSON schemas (~200 KB, roughly 50k
 tokens, per `tools/list`). Most non-Claude harnesses inject every registered
 schema straight into the model's context — fine for frontier models, fatal
 for a 4B local one. **Compact tool mode** registers exactly **three

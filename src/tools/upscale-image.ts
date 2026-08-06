@@ -25,14 +25,14 @@ export function registerUpscaleImageTool(server: McpServer): void {
     "Upscale an image with an ESRGAN super-resolution model — the high-level entry point. " +
       "Builds an UpscaleModelLoader → ImageUpscaleWithModel workflow (scale=2 supersamples the 4x " +
       "result back down for sharper output) and enqueues it on your LOCAL GPU. Upload the source first " +
-      "with upload_image (or stage a prior output with stage_output_as_input), then pass its filename. " +
+      "with upload_image (action:\"image\") (or stage a prior output with upload_image (action:\"stage\")), then pass its filename. " +
       "Needs an upscale model in models/upscale_models/ (e.g. 4x-ClearRealityV1 / 4x_foolhardy_Remacri, " +
       "provided by the anima/ernie packs or download_model); returns an actionable error if none is found. " +
       "Returns prompt_id immediately; the upscaled asset_id arrives in the completion notification.",
     {
       image: z
         .string()
-        .describe("Filename of the source image in ComfyUI's input dir (upload it first with upload_image)"),
+        .describe("Filename of the source image in ComfyUI's input dir (upload it first with upload_image (action:\"image\"))"),
       scale: z
         .union([z.literal(2), z.literal(4)])
         .optional()
@@ -57,7 +57,7 @@ export function registerUpscaleImageTool(server: McpServer): void {
                   queue_remaining: result.queue_remaining,
                   model: result.model,
                   scale: result.scale,
-                  note: "Upscaled asset_id arrives in the completion notification; use view_image with it.",
+                  note: "Upscaled asset_id arrives in the completion notification; use get_image (action:\"view\") with it.",
                 },
                 null,
                 2,

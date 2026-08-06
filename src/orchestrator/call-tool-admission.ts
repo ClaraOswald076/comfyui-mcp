@@ -27,7 +27,19 @@ export const CALL_TOOL_WHITELIST = new Set<string>([
   // admitted for free by the swap, so admission is ACTION-scoped below to
   // exactly the five that were already reachable — see CALL_TOOL_ACTION_WHITELIST.
   "get_workflow",
-  "list_output_images",
+  // The image browsing surface a canvas-less/mobile client actually uses: the
+  // output listing and the fetch-by-filename. Both names were whitelisted
+  // individually until 0.50.0 slice 15 folded twelve image/asset tools into
+  // `get_image` (7 actions) + `upload_image` (5). One entry now stands where
+  // two did, so admission is ACTION-scoped below to exactly the two actions the
+  // two retired entries covered — see CALL_TOOL_ACTION_WHITELIST.
+  //
+  // NOTE: `upload_image` was NOT whitelisted before the fold and is deliberately
+  // still absent. Every one of its actions WRITES — a local file into ComfyUI's
+  // input/ directory, a server-side output back into that directory, or a
+  // generated output off the machine into an S3/Azure/HTTP/HuggingFace
+  // destination the caller names. None of that was reachable from a canvas-less
+  // client and none of it becomes reachable here.
   "get_image",
   // Inventory listing only. 0.50.0 slice 11 folded six model tools into this
   // name — including `remove`, which UNLINKS a model file — so admission is
@@ -299,6 +311,33 @@ export const CALL_TOOL_ACTION_WHITELIST: ReadonlyMap<string, ReadonlySet<string>
   // tool entirely (`search_custom_nodes`), which is not whitelisted, so no
   // action-level scope is needed to keep them out.
   ["install_custom_node", new Set(["install", "list"])],
+  // The `get_image` entry above replaces TWO standalone entries (0.50.0 slice
+  // 15): the fetch-an-output-by-filename tool and the output listing. Those are
+  // exactly action:"get" and action:"list_outputs", and they are all this scope
+  // admits. The other five actions the fold brought onto this name were never
+  // whitelisted, and each is refused for a concrete reason rather than by
+  // default:
+  //
+  //   action:"convert"       WRITES. With `out_path` it encodes a new file under
+  //                          the ComfyUI output directory. A canvas-less client
+  //                          could not create a file there before and must not
+  //                          start now.
+  //   action:"view"          Read-only, but it reads the ASSET REGISTRY, a
+  //                          surface no whitelisted entry ever exposed.
+  //   action:"asset_metadata" Same registry, and it additionally returns the full
+  //                          WORKFLOW SNAPSHOT (prompts and all) of a past render.
+  //   action:"list_assets"   Read-only, and it also triggers a /history reconcile.
+  //   action:"analyze_color" Read-only, but it decodes an arbitrary
+  //                          `reference_path` through sharp.
+  //
+  // Admitting a read-only action merely because it is read-only is how a
+  // whitelist stops meaning anything: the strict rule this file already applies
+  // to `queue` (its read-only actions were never whitelisted either) applies here
+  // unchanged. Broadening a canvas-less client's reach to the asset registry is a
+  // product decision with its own UI, not a side effect of a surface
+  // consolidation. Add actions here deliberately, with a reason, if that decision
+  // is ever made.
+  ["get_image", new Set(["get", "list_outputs"])],
 ]);
 
 /**

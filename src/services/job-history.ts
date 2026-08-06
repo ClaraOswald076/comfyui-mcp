@@ -37,7 +37,7 @@ export type HistoryStatusMessage = readonly [string, Record<string, unknown>];
 
 /**
  * Affirmative-success test for a history entry — the ONE eligibility gate both
- * asset-registration paths (JobWatcher.handleCompletion and the list_assets
+ * asset-registration paths (JobWatcher.handleCompletion and the get_image (action:"list_assets")
  * history reconcile) share, so a run can never become an asset without real
  * success evidence (#751 codex gate r3).
  *

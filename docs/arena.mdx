@@ -24,7 +24,7 @@ PARTIAL = 1 (right tool family, incomplete outcome), FAIL = 0 — max **20**:
 | --- | --- | --- |
 | Basics | `health` · `models` · `registry` · `queue` | tool discovery + single-call tasks |
 | Gauntlet | `generate` (async render + polling) · `precision` (exact steps/size land in the executed graph) · `breakfix` (deliberate failure → diagnose → recover) · `provenance` (find the asset registry, `regenerate` with an override) | multi-hop chains, parameter fidelity, error recovery |
-| Crucible | `multiout` (ONE graph saving 512px + 1024px outputs — verified by reading the PNG headers) · `pipeline` (two-stage img2img chained through `stage_output_as_input`) | raw graph composition — no template covers these |
+| Crucible | `multiout` (ONE graph saving 512px + 1024px outputs — verified by reading the PNG headers) · `pipeline` (two-stage img2img chained through `upload_image (action:"stage")`) | raw graph composition — no template covers these |
 
 Ties break on **nudges → tool rounds → wall time**, so a model that nails a
 task first-try outranks one that flailed to the same score.

@@ -25,7 +25,7 @@ Return, list, summarize or query a SAVED workflow FILE — files on disk, named 
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which read to perform. "list" and "prompt_director" take no required parameters; "get" and "analyze" require `filename`; "strip", "slice" and "query" require exactly one of `path`/`filename`/`graph` (and "slice" also requires `groups`); "from_image" requires `image_path`. Options: `get`, `list`, `strip`, `slice`, `from_image`, `analyze`, `query`, `prompt_director`.
+  Which read to perform. "list" and "prompt_director" take no required parameters; "get" and "analyze" require `filename`; "strip", "slice" and "query" require exactly one of `path`/`filename`/`graph` (and "slice" also requires `groups`); "from_image" requires `image_path`. Options: `action:"get"`, `action:"list"`, `action:"strip"`, `action:"slice"`, `action:"from_image"`, `action:"analyze"`, `action:"query"`, `action:"prompt_director"`.
 </ParamField>
 <ParamField path="filename" type="string">
   Workflow library name, exactly as action:"list" reports it. A workflow filed in a folder keeps its folder in the name ('VIDEO/MiniMaxH3/clip.json') and that whole string goes here. REQUIRED for action:"get" and action:"analyze"; one of the three sources for "strip", "slice" and "query".
@@ -223,7 +223,7 @@ WRITE to the ComfyUI user library: persist a workflow, or capture/verify its pro
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which write/provenance operation to perform. All three require `filename`; "save" also requires `workflow`. Options: `save`, `lock`, `verify_lock`.
+  Which write/provenance operation to perform. All three require `filename`; "save" also requires `workflow`. Options: `action:"save"`, `action:"lock"`, `action:"verify_lock"`.
 </ParamField>
 <ParamField path="filename" type="string">
   Workflow filename in the ComfyUI user library (e.g. 'my_workflow.json'). REQUIRED for every action. For action:"save" this OVERWRITES an existing file of the same name; for "lock"/"verify_lock" the lock is read/written as '&lt;filename&gt;.lock.json' alongside it.

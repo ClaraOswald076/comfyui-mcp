@@ -102,7 +102,7 @@ whom, from what angle — which text prompting has never done reliably.
 | **Kling 2.6 Motion Control** | Simplest API path: character image + motion video (3–30s) → identity-locked transfer, 4-node graph | **Paid** API node — third restyle leg alongside Seedance/Wan |
 | **Self-filmed video** | A phone clip of the user performing IS a previz for single-character shots (community default); filming rules: full body, locked tripod, no cuts, even light | Free — the skill should accept it as a first-class motion source |
 | **Seedance 2.0 R2V** | ≤3 reference videos (≤15.1s total) + ≤9 reference images + ≤3 audio, `@Video1`/`@Image1` role-tagged prompts; follows choreography + camera; 4–15s out (sweet spot 6–8s) | **Paid** API node (`ByteDance2ReferenceNode`, ~$0.66 / 5s @ 720p; Mini ~$0.32); Seedance 2.5 exists (30s native) but has no Comfy nodes yet |
-| **Already in this repo** | `director` skill (story→scenes→clips), packs system, `upload_video`/`stage_output_as_input` I/O, `list_api_nodes` (actions `list`/`schema`/`generate`), `list_packs` action:"check_runtime" ask-before-spend | Shipped |
+| **Already in this repo** | `director` skill (story→scenes→clips), packs system, `upload_image (action:"video")`/`upload_image (action:"stage")` I/O, `list_api_nodes` (actions `list`/`schema`/`generate`), `list_packs` action:"check_runtime" ask-before-spend | Shipped |
 
 ## Architecture — who talks to whom
 
@@ -117,7 +117,7 @@ Handoff points (all already representable):
    the agent imports it via Blender MCP `execute_python`
    (`bpy.ops.import_scene.gltf`) — **directly from the output folder**, the
    same file awareness the panel already has on the drive
-   (`list_output_images`, workspace paths). No copy step, no asking the user
+   (`get_image (action:"list_outputs")`, workspace paths). No copy step, no asking the user
    where the file went.
 2. **ComfyUI → Mixamo (auto-rig)**: a ComfyUI-authored character mesh from
    `output/` goes to mixamo.com for auto-rigging (or a Mixamo-family Blender
@@ -126,7 +126,7 @@ Handoff points (all already representable):
    import + retarget onto the character rig via add-on or bpy.
 4. **Blender → ComfyUI**: viewport/OpenGL render (solid shading, no lights, no
    materials — it's a motion reference) to mp4 or frame sequence →
-   `upload_video` → reference input of the Wan Animate graph or Seedance node.
+   `upload_image (action:"video")` → reference input of the Wan Animate graph or Seedance node.
 5. **Reference stills**: character/environment look-images from any local
    image pack (Z-Image, Krea2, …) or provided by the user.
 
@@ -217,7 +217,7 @@ recipes reliably. Prior art either way:
   (Trellis/Hunyuan3D for assets, Wan Animate for video) are always named
   first.
 - **3D-asset file awareness** — extend the existing output-folder awareness
-  (`list_output_images` already tags `kind: "video"`) to **3D assets**
+  (`get_image (action:"list_outputs")` already tags `kind: "video"`) to **3D assets**
   (`kind: "model"` for GLB/FBX/OBJ in `output/`), so "import the character I
   just generated into Blender" and "stage this mesh for Mixamo auto-rigging"
   resolve to exact paths without the user hunting for files. Small, and it's

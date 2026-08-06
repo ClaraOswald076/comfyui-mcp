@@ -205,7 +205,7 @@ export interface Generate3dArgs {
   mode: Generate3dMode;
   /** Text description of the model (required in text mode; optional extra guidance in image mode if the node accepts it). */
   prompt?: string;
-  /** ComfyUI input-image filename (image mode). Upload first with upload_image. */
+  /** ComfyUI input-image filename (image mode). Upload first with upload_image (action:"image"). */
   image?: string;
   /** Explicit 3D API node class_type to use (overrides auto-selection). */
   node?: string;
@@ -238,7 +238,7 @@ export async function generate3d(
   }
   if (args.mode === "image" && !args.image?.trim()) {
     throw new ValidationError(
-      'mode "image" requires an input image filename (upload one first with upload_image).',
+      'mode "image" requires an input image filename (upload one first with upload_image (action:"image")).',
     );
   }
 

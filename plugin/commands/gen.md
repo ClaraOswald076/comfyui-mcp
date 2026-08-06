@@ -59,7 +59,7 @@ The user wants to generate an image using ComfyUI. Their prompt is provided as t
 
    **Fallback**: If the background script is unavailable, use `queue` (action:"status") to poll until `done` is true.
 
-7. **Show the result.** Once the background monitor reports completion, use `list_output_images` (limit 1) to find the newest image. Read it with the Read tool to display it to the user.
+7. **Show the result.** Once the background monitor reports completion, use `get_image (action:"list_outputs")` (limit 1) to find the newest image. Read it with the Read tool to display it to the user.
 
 8. **Open the image.** Open the image so the user can see it immediately without navigating to the output folder. Use the Bash tool with the appropriate command for the OS:
    - **macOS**: `open /path/to/image.png`

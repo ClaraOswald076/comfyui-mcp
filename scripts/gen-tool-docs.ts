@@ -127,11 +127,12 @@ const CATEGORIES: Array<{
     icon: "images",
     description: "View, convert, and upload generated images; analyze colors; stage outputs as inputs; upload media inputs; browse outputs.",
     tools: [
-      "view_image", "get_image", "convert_image", "analyze_color",
+      // 0.50.0 slice 15 folded twelve names into these two: `get_image` is the
+      // read/inspect half (get, view, list_outputs, convert, plus the colour
+      // measure and the asset-registry reads) and `upload_image` the write half
+      // (image, video, audio, stage, output).
+      "get_image", "upload_image",
       "remove_background", "upscale_image",
-      "stage_output_as_input", "upload_output",
-      "upload_image", "upload_video", "upload_audio",
-      "list_output_images", "list_assets", "get_asset_metadata",
     ],
   },
   {
@@ -293,7 +294,19 @@ function renderParam(name: string, schema: JsonSchema, required: boolean): strin
   }
   const body: string[] = [];
   if (schema.description) body.push(esc(schema.description));
-  if (schema.enum) body.push(`Options: ${schema.enum.map((e) => `\`${String(e)}\``).join(", ")}.`);
+  if (schema.enum) {
+    // The `action` field gets its options rendered as the CALL FORM rather than
+    // bare values. Two reasons, and the first is the reader's: on the 0.50.0
+    // surface `action` is the only required field on most tools, so `action:"get"`
+    // is the thing to copy, where a bare `get` still has to be assembled. The
+    // second is mechanical — several folds reused a retired TOOL name as an
+    // action name, and a bare option value in generated prose is then
+    // indistinguishable from an instruction to call a tool that 404s. The call
+    // form says which it is, in the one syntax the dead-name gate recognises
+    // repo-wide. Any other enum field keeps the plain value list.
+    const opt = (e: unknown) => (name === "action" ? `\`action:"${String(e)}"\`` : `\`${String(e)}\``);
+    body.push(`Options: ${schema.enum.map(opt).join(", ")}.`);
+  }
   return `<ParamField ${attrs.join(" ")}>\n  ${body.join(" ") || "—"}\n</ParamField>`;
 }
 
