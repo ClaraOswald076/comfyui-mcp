@@ -2746,8 +2746,12 @@ export class PanelAgentManager {
   /** Forget a tab's agent so the next message starts a brand-new session. The
    *  map mutation is synchronous and the old agent is stopped fire-and-forget,
    *  so the caller (e.g. resume_session) can set a new pendingResume right after
-   *  without a concurrent send() spawning a non-resumed agent in an await gap. */
-  reset(tabId: string): void {
+   *  without a concurrent send() spawning a non-resumed agent in an await gap.
+   *  Returns whether the durable session clear actually reached disk — false
+   *  means this process starts fresh but an orchestrator restart could resume
+   *  the cleared conversation, which the caller must disclose rather than
+   *  report a clean New chat (codex confirming-gate P1: false-success). */
+  reset(tabId: string): { durableCleared: boolean } {
     // Unbind through the SHARED teardown seam (#468) — it is what guarantees a
     // run completion parked in held mail is handed back rather than discarded.
     const agent = this.unbindAgent(tabId, { dropHeldMail: true, reason: "reset" });
@@ -2756,7 +2760,7 @@ export class PanelAgentManager {
     // fallback in send() can't resurrect the conversation the user just cleared.
     // (resume_session calls reset() then setResume() with the chosen id, so the
     // historical session is re-armed right after and re-persisted on next onSession.)
-    this.opts.sessionStore?.clear(tabId);
+    const durableCleared = this.opts.sessionStore ? this.opts.sessionStore.clear(tabId) : true;
     this.pendingEffortRestart.delete(tabId); // a reset supersedes any deferred restart
     this.pendingMcpRestart.delete(tabId);
     // Drop this key's picker override so a provider switch (which reset()s the old
@@ -2767,6 +2771,7 @@ export class PanelAgentManager {
       logger.info(`[panel-orchestrator] tab ${tabId.slice(0, 8)} reset — new session next message`);
       void agent.stop();
     }
+    return { durableCleared };
   }
 
   /** Stop and UNBIND a tab's live agent WITHOUT touching its durable session — used

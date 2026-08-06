@@ -17,7 +17,7 @@
 //    v2 file's stable entries are dropped on load.
 
 import { describe, expect, it, afterEach } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionStore, workflowIdentityParts } from "../../orchestrator/session-store.js";
@@ -148,6 +148,70 @@ describe("SessionStore", () => {
     expect(store.get("orchestrator::claude")).toBe("sess-live");
     const onDisk = JSON.parse(readFileSync(fileFor(dir), "utf8"));
     expect(onDisk.sessions["tmp:dead::claude"]).toBeUndefined();
+  });
+
+  describe("#884 durability — persistence failures never destroy the store (confirming-gate P0/P1)", () => {
+    // Force every flush to fail portably: occupy the `.tmp` path with a
+    // DIRECTORY, so writeFileSync(tmp) errors before anything touches the
+    // main file.
+    const blockTmp = (dir: string) => mkdirSync(`${fileFor(dir)}.tmp`, { recursive: true });
+
+    it("a failed persist leaves the previous on-disk store INTACT (no truncate-in-place)", () => {
+      const dir = scratchDir();
+      const key = sharedAgentKey("claude");
+      expect(new SessionStore(PORT, { dir }).set(key, "sess-good")).toBe(true);
+      blockTmp(dir);
+      const store = new SessionStore(PORT, { dir });
+      expect(store.set(key, "sess-newer")).toBe(false); // persist FAILED, reported
+      // The old on-disk state survived — a crash now loses the newer id (a
+      // lost update) but never the whole store (which corrupt-refuses legacy
+      // recovery and would have lost every resume id).
+      rmSync(`${fileFor(dir)}.tmp`, { recursive: true, force: true });
+      expect(new SessionStore(PORT, { dir }).get(key)).toBe("sess-good");
+    });
+
+    it("clear() reports a failed durable clear — the caller can disclose the resume risk", () => {
+      const dir = scratchDir();
+      const key = sharedAgentKey("claude");
+      const store = new SessionStore(PORT, { dir });
+      expect(store.set(key, "sess-1")).toBe(true);
+      blockTmp(dir);
+      expect(store.clear(key)).toBe(false); // disk still holds it…
+      expect(store.get(key)).toBeUndefined(); // …but THIS process starts fresh
+      rmSync(`${fileFor(dir)}.tmp`, { recursive: true, force: true });
+      // A restart resumes the cleared conversation — exactly the hazard the
+      // false return lets new_session disclose instead of claiming success.
+      expect(new SessionStore(PORT, { dir }).get(key)).toBe("sess-1");
+    });
+
+    it("a leftover .tmp (crashed/failed rename) is the NEWEST state and is recovered on load", () => {
+      const dir = scratchDir();
+      const key = sharedAgentKey("claude");
+      writeFileSync(
+        fileFor(dir),
+        JSON.stringify({ v: 2, sessions: { [key]: { s: "sess-old", t: Date.now() } } }),
+      );
+      writeFileSync(
+        `${fileFor(dir)}.tmp`,
+        JSON.stringify({ v: 2, sessions: { [key]: { s: "sess-newest", t: Date.now() } } }),
+      );
+      const store = new SessionStore(PORT, { dir });
+      expect(store.get(key)).toBe("sess-newest");
+      // …and the recovery re-persisted properly (tmp renamed away).
+      expect(existsSync(`${fileFor(dir)}.tmp`)).toBe(false);
+      expect(new SessionStore(PORT, { dir }).get(key)).toBe("sess-newest");
+    });
+
+    it("a CORRUPT leftover .tmp (crash mid-write) falls back to the main file", () => {
+      const dir = scratchDir();
+      const key = sharedAgentKey("claude");
+      writeFileSync(
+        fileFor(dir),
+        JSON.stringify({ v: 2, sessions: { [key]: { s: "sess-main", t: Date.now() } } }),
+      );
+      writeFileSync(`${fileFor(dir)}.tmp`, "{truncated-mid-wr");
+      expect(new SessionStore(PORT, { dir }).get(key)).toBe("sess-main");
+    });
   });
 
   describe("#884 LOCATION migration — tmpdir → ~/.comfyui-mcp/sessions", () => {

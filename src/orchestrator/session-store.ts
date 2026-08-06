@@ -188,11 +188,27 @@ export class SessionStore {
   }
 
   private read(): { sessions: Record<string, Entry>; dirty: boolean } {
-    // The legacy tmpdir file is consulted ONLY when the new-location file does
-    // not EXIST (the one-shot location migration). An existing-but-corrupt home
-    // file must start EMPTY, never fall back to the stale pre-migration store —
-    // that would silently resurrect sessions the user has since replaced or
-    // cleared (a wrong resume; codex round 1, P1). Missing ≠ corrupt.
+    // RECOVERY ORDER. A leftover `.tmp` is always the NEWEST state when it
+    // parses: a successful flush renames it away, so its presence means the
+    // last rename failed or crashed mid-flush — prefer it over the main file
+    // and re-persist (dirty). The legacy tmpdir file is consulted ONLY when
+    // the new-location file does not EXIST (the one-shot location migration).
+    // An existing-but-corrupt home file with no usable `.tmp` starts EMPTY,
+    // never falls back to the stale pre-migration store — that would silently
+    // resurrect sessions the user has since replaced or cleared (a wrong
+    // resume; codex round 1, P1). Missing ≠ corrupt.
+    const tmpPath = `${this.path}.tmp`;
+    try {
+      if (existsSync(tmpPath)) {
+        const recovered = this.parse(readFileSync(tmpPath, "utf8"));
+        logger.warn(
+          `[session-store] recovered the newest state from ${tmpPath} (a previous persist did not complete)`,
+        );
+        return { sessions: recovered.sessions, dirty: true }; // re-persist properly
+      }
+    } catch {
+      // tmp unreadable/corrupt (a crash mid-tmp-write) — fall through to main.
+    }
     if (existsSync(this.path)) {
       try {
         return this.parse(readFileSync(this.path, "utf8"));
@@ -219,24 +235,35 @@ export class SessionStore {
     return { sessions: {}, dirty: false };
   }
 
-  private flush(): void {
-    // Atomic-ish write (temp + rename): this file is the session store of
-    // record now, and a truncated in-place write surviving a crash would read
-    // as corrupt on the next boot (an empty start — a lost resume). rename
-    // replaces the destination on POSIX and on Windows via Node's MoveFileEx
-    // semantics; on any rename failure fall back to the in-place write rather
-    // than not persisting at all.
+  /** Persist the store. Atomic (temp + rename); returns whether the state is
+   *  durably on disk. On ANY failure the previous on-disk store is left
+   *  INTACT — there is deliberately NO truncate-in-place fallback (codex
+   *  confirming-gate P0: a truncated write surviving a crash reads as corrupt
+   *  next boot, and corrupt refuses legacy recovery, so every resume id would
+   *  be lost; failing to persist is strictly better than destroying what's
+   *  there). When the temp write itself succeeded, the newest state survives
+   *  in `.tmp` and read() recovers it on the next load. */
+  private flush(): boolean {
     const payload = JSON.stringify({ v: 2, sessions: this.sessions } satisfies StoreFileV2);
     const tmp = `${this.path}.tmp`;
     try {
       writeFileSync(tmp, payload);
       renameSync(tmp, this.path);
-    } catch {
-      try {
-        writeFileSync(this.path, payload);
-      } catch (err) {
-        logger.debug(`[session-store] write failed: ${String(err)}`);
-      }
+      return true;
+    } catch (err) {
+      const tmpHoldsState = ((): boolean => {
+        try {
+          return existsSync(tmp) && readFileSync(tmp, "utf8") === payload;
+        } catch {
+          return false;
+        }
+      })();
+      logger.warn(
+        `[session-store] persist FAILED — the previous on-disk store was left intact; the latest state ${
+          tmpHoldsState ? `survives in ${tmp} and will be recovered on the next load` : "was NOT captured on disk"
+        }: ${String(err)}`,
+      );
+      return false;
     }
   }
 
@@ -288,9 +315,11 @@ export class SessionStore {
     const adopted: Entry = { s: best.s, t: this.now() };
     for (const k of legacyKeys) delete this.sessions[k]; // consumed — see docstring
     this.sessions[sharedKey] = adopted;
-    this.flush();
+    const persisted = this.flush();
     logger.info(
-      `[session-store] adopted legacy per-workflow session ${bestKey.slice(0, 24)}… as the shared ${backend} conversation (${legacyKeys.length} legacy ${backend} entr${legacyKeys.length === 1 ? "y" : "ies"} consumed, #884)`,
+      `[session-store] adopted legacy per-workflow session ${bestKey.slice(0, 24)}… as the shared ${backend} conversation (${legacyKeys.length} legacy ${backend} entr${legacyKeys.length === 1 ? "y" : "ies"} consumed, #884)${
+        persisted ? "" : " — WARNING: the adoption could NOT be persisted and will re-run from disk on the next boot"
+      }`,
     );
     return adopted;
   }
@@ -316,26 +345,33 @@ export class SessionStore {
 
   /** Record (and persist) a key's current session id. `identityUuid` is the
    *  legacy per-workflow binding — accepted for API compatibility, unused for
-   *  shared-scope keys. No-op if both the id and binding are unchanged. */
-  set(key: string, sessionId: string, identityUuid?: string): void {
+   *  shared-scope keys. No-op if both the id and binding are unchanged.
+   *  Returns whether the state is DURABLY persisted (a swallowed write failure
+   *  here is the false-success class — codex confirming-gate P1). */
+  set(key: string, sessionId: string, identityUuid?: string): boolean {
     const u = typeof identityUuid === "string" && identityUuid ? identityUuid : undefined;
     const existing = this.sessions[key];
     if (existing?.s === sessionId && existing.u === u) {
       // Same id — refresh the timestamp so an active session never GCs out, but
       // skip the disk write when the timestamp is already recent.
-      if (this.now() - existing.t < 60 * 60 * 1000) return;
+      if (this.now() - existing.t < 60 * 60 * 1000) return true;
     }
     const entry: Entry = { s: sessionId, t: this.now() };
     if (u) entry.u = u;
     this.sessions[key] = entry;
-    this.flush();
+    return this.flush();
   }
 
   /** Forget a key's session — called on a deliberate NEW chat, so the disk
-   *  fallback never resurrects a conversation the user reset. */
-  clear(key: string): void {
-    if (!(key in this.sessions)) return;
+   *  fallback never resurrects a conversation the user reset. Returns whether
+   *  the clear is DURABLE: false means the in-memory entry is gone (this
+   *  process starts fresh) but the on-disk copy could not be updated, so an
+   *  orchestrator restart could resume the cleared conversation — callers must
+   *  disclose that instead of reporting a clean New chat (codex
+   *  confirming-gate P1). */
+  clear(key: string): boolean {
+    if (!(key in this.sessions)) return true;
     delete this.sessions[key];
-    this.flush();
+    return this.flush();
   }
 }

@@ -1536,16 +1536,26 @@ export async function runPanelOrchestrator(): Promise<void> {
   // queued messages (codex r3: evicting a LIVE mapping discards fail-closed
   // state — and even then, an unknown mid at dequeue fails the batch closed
   // below rather than inheriting a stale stamp).
-  const turnUuidByMid = new Map<string, string | undefined>();
+  const turnUuidByMid = new Map<string, { uuid: string | undefined; tab: string }>();
   const TURN_UUID_BY_MID_CAP = 5000;
-  const recordTurnUuidForMid = (mid: string, uuid: string | undefined): void => {
-    turnUuidByMid.set(mid, uuid);
+  const recordTurnUuidForMid = (mid: string, uuid: string | undefined, tab: string): void => {
+    turnUuidByMid.set(mid, { uuid, tab });
     while (turnUuidByMid.size > TURN_UUID_BY_MID_CAP) {
       const oldest = turnUuidByMid.keys().next().value as string | undefined;
       if (oldest === undefined) break;
       turnUuidByMid.delete(oldest);
     }
   };
+  // #884 P0 (confirming gate) — each conversation's IN-FLIGHT turn is PINNED to
+  // the tab it was issued from, set alongside the stamp at batch close and
+  // cleared at turn end. The bridge's scope resolution consults this FIRST, so
+  // a queued message from another tab (which moves lastActiveTabId
+  // immediately) can never re-aim a running turn's tool calls at a workflow
+  // the turn was never about — and a pinned tab that disconnects makes the
+  // resolution THROW loudly instead of silently falling back to another tab.
+  // Value string = pinned tab; null = ambiguous origin (refuse); absent = no
+  // turn in flight (active-tab resolution).
+  const turnTargetTabByKey = new Map<string, string | null>();
   // Mids whose stamp was ALREADY applied at a previous dequeue — a re-queued
   // item (interrupt + send-now) fires onSeen again, and it must contribute
   // NOTHING to the new batch (its stamp is in force or superseded), while a
@@ -1568,7 +1578,10 @@ export async function runPanelOrchestrator(): Promise<void> {
   // loudly until the agent explicitly opens/pins a workflow (#716) or the
   // next single-origin message (codex r3, P1: last-message-wins let a merged
   // batch mutate the wrong workflow).
-  const pendingBatchStamp = new Map<string, { known: Array<string | undefined>; unknown: boolean }>();
+  const pendingBatchStamp = new Map<
+    string,
+    { known: Array<string | undefined>; tabs: Set<string>; unknown: boolean }
+  >();
   // #884 — each shared conversation's last message origin (tab + workflow uuid),
   // so a message sent from a DIFFERENT workflow than the previous one carries a
   // one-line context note: session-bound agents keep knowledge of which canvas
@@ -2285,6 +2298,9 @@ export async function runPanelOrchestrator(): Promise<void> {
     // Turn lifecycle → the panel's "working" indicator (stays up through silent
     // tool work; clears on done).
     onTurn: (key, state) => {
+      // #884 P0 — the turn ended: release its routing pin so idle-time scope
+      // resolution follows the active tab again (the next turn re-pins).
+      if (state === "done") turnTargetTabByKey.delete(key);
       pushToConversation(key, { type: "turn", state });
     },
     // Live extended-thinking token count → "thinking… (N)" indicator.
@@ -2308,11 +2324,13 @@ export async function runPanelOrchestrator(): Promise<void> {
       let batch = pendingBatchStamp.get(key);
       const opensBatch = !batch;
       if (!batch) {
-        batch = { known: [], unknown: false };
+        batch = { known: [], tabs: new Set<string>(), unknown: false };
         pendingBatchStamp.set(key, batch);
       }
-      if (turnUuidByMid.has(mid)) {
-        batch.known.push(turnUuidByMid.get(mid));
+      const rec = turnUuidByMid.get(mid);
+      if (rec) {
+        batch.known.push(rec.uuid);
+        batch.tabs.add(rec.tab);
         turnUuidByMid.delete(mid);
         noteConsumedTurnMid(mid);
       } else if (!consumedTurnMids.has(mid)) {
@@ -2336,6 +2354,16 @@ export async function runPanelOrchestrator(): Promise<void> {
             lastTurnUuidByKey.set(key, distinct.values().next().value);
           }
           // size 0 (all re-queued): the stamp already in force stands.
+          //
+          // TURN-TARGET PIN (confirming-gate P0): this turn's tool calls route
+          // to the tab the turn was ISSUED from — never re-resolved mid-turn.
+          // One origin tab pins it; mixed/unknown origins pin `null` (the
+          // bridge refuses loudly); all-requeued leaves the pin as-is.
+          if (closed.unknown || closed.tabs.size > 1) {
+            turnTargetTabByKey.set(key, null);
+          } else if (closed.tabs.size === 1) {
+            turnTargetTabByKey.set(key, closed.tabs.values().next().value as string);
+          }
         });
       }
       pushToConversation(key, { type: "ack", ok: true, kind: "seen", mid });
@@ -2730,7 +2758,15 @@ export async function runPanelOrchestrator(): Promise<void> {
   // on workflow A silently land on workflow B after a mid-turn switch (codex
   // round 1, P0). A real-tab caller keeps the per-tab stamp.
   const scopeToRealTab = (tabId: string): string | undefined =>
-    isScopeAddress(tabId) ? bridge.resolveSharedTabId() : panelTabOf(tabId);
+    isScopeAddress(tabId) ? bridge.resolveSharedTabId(tabId) : panelTabOf(tabId);
+  // #884 P0 (confirming gate) — while a conversation's turn is in flight, its
+  // scope-addressed tool calls are PINNED to the tab the turn was issued from;
+  // `null` (ambiguous origin) makes the bridge refuse loudly; no entry lets
+  // the bridge fall back to active-tab resolution (idle-time probes).
+  bridge.setScopeTargetResolver((scopeId) => {
+    const key = scopeAgentKeyOf(scopeId);
+    return turnTargetTabByKey.has(key) ? turnTargetTabByKey.get(key)! : undefined;
+  });
   bridge.setTabWorkflowUuidResolver(
     (tabId) => {
       if (isScopeAddress(tabId)) return lastTurnUuidByKey.get(scopeAgentKeyOf(tabId));
@@ -4428,9 +4464,10 @@ export async function runPanelOrchestrator(): Promise<void> {
       const key = agentKeyFor(tabId);
       // reset() is synchronous (map cleared now), so no concurrent send() can
       // spawn an agent before we report the cleared session.
-      manager.reset(key);
-      // The replaced conversation's issue-time stamp dies with it (codex r2).
+      const { durableCleared } = manager.reset(key);
+      // The replaced conversation's issue-time stamp and turn pin die with it.
       lastTurnUuidByKey.delete(key);
+      turnTargetTabByKey.delete(key);
       // #468 — the conversation that queued the outstanding renders is gone.
       // Close its run tickets so a render finishing after the New chat is
       // reported to the replacement agent as UNDETERMINED rather than as "the
@@ -4443,7 +4480,28 @@ export async function runPanelOrchestrator(): Promise<void> {
         AskAnswers.closeAsks(t);
       }
       pushToConversation(key, { type: "session", session_id: null });
-      bridge.push({ type: "ack", ok: true, kind: "new_session" }, tabId);
+      // The write outcome is OBSERVABLE (codex confirming-gate P1: a swallowed
+      // disk failure made New chat report false success): the ack carries it,
+      // and a failed durable clear is disclosed in chat — within THIS process
+      // the reset held (in-memory), but a restart could resume the cleared
+      // conversation.
+      bridge.push(
+        { type: "ack", ok: true, kind: "new_session", durable_cleared: durableCleared },
+        tabId,
+      );
+      if (!durableCleared) {
+        bridge.push(
+          {
+            type: "say",
+            text:
+              "⚠️ New chat started, but the previous conversation's stored session could not be " +
+              "removed from disk (the write failed — a full or locked filesystem?). If the " +
+              "orchestrator restarts before this conversation's first exchange completes, the " +
+              "OLD conversation may resume; start a New chat again if that happens.",
+          },
+          tabId,
+        );
+      }
       bridge.broadcastTabList(); // session cleared → mirror pickers' green dot off
       return;
     }
@@ -4494,9 +4552,13 @@ export async function runPanelOrchestrator(): Promise<void> {
       const tabId = event.tab_id;
       const sid = typeof event.session_id === "string" ? event.session_id : undefined;
       const key = agentKeyFor(tabId);
+      // A failed durable clear is benign HERE: within this process the
+      // in-memory store is cleared and setResume below arms the chosen id; the
+      // resumed conversation re-persists on its first onSession.
       manager.reset(key);
-      // The replaced conversation's issue-time stamp dies with it (codex r2).
+      // The replaced conversation's issue-time stamp and turn pin die with it.
       lastTurnUuidByKey.delete(key);
+      turnTargetTabByKey.delete(key);
       // #468 — same as New chat: the conversation being replaced owns the open
       // runs, so a completion landing after the switch is UNDETERMINED, not the
       // historical session's own render. #884: the boundary is conversation-wide.
@@ -4685,14 +4747,16 @@ export async function runPanelOrchestrator(): Promise<void> {
     {
       const issueUuid = tabCommandWorkflowUuid.get(event.tab_id);
       if (userMid) {
-        recordTurnUuidForMid(userMid, issueUuid);
+        recordTurnUuidForMid(userMid, issueUuid, event.tab_id);
       } else if (!manager.isTurnActive(agentKeyFor(event.tab_id))) {
         // Mid-less (non-panel/legacy) message with NO dequeue signal to ride:
         // apply immediately, but only while no turn is in flight — a busy
         // conversation's live fence must never be flipped at receipt (codex
         // r3). While busy, the previous stamp stands; if the canvas moved, the
-        // late mutation fails the panel fence closed.
+        // late mutation fails the panel fence closed. The turn this message is
+        // about to start pins to its origin tab too (confirming-gate P0).
         lastTurnUuidByKey.set(agentKeyFor(event.tab_id), issueUuid);
+        turnTargetTabByKey.set(agentKeyFor(event.tab_id), event.tab_id);
       }
     }
     {

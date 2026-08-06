@@ -144,15 +144,21 @@ describe("sessions are orchestrator-scoped, never workflow-scoped (#884)", () =>
 
   it("SOURCE: scope mutations are stamped with the TURN's issue-time workflow, never re-resolved (codex r1 P0 / r2)", () => {
     const src = indexSrc();
-    // The issue-time uuid RIDES the message (recorded per mid at receipt)…
-    expect(src).toContain("recordTurnUuidForMid(userMid, issueUuid);");
+    // The issue-time uuid AND origin tab RIDE the message (recorded per mid)…
+    expect(src).toContain("recordTurnUuidForMid(userMid, issueUuid, event.tab_id);");
     // …a mid-less message may only stamp while NO turn is in flight (codex r3)…
     expect(src).toContain("} else if (!manager.isTurnActive(agentKeyFor(event.tab_id))) {");
     // …and the stamp lands when the turn DEQUEUES its batch (onSeen), with a
     // MIXED/unknown-origin batch failing closed instead of last-message-wins
     // re-aiming the whole turn's mutations (codex r2/r3).
-    expect(src).toContain("batch.known.push(turnUuidByMid.get(mid));");
+    expect(src).toContain("batch.known.push(rec.uuid);");
     expect(src).toContain("if (closed.unknown || distinct.size > 1) {");
+    // The TURN-TARGET PIN lands in the same batch close and is released at turn
+    // end: an in-flight turn's tool calls route to the tab the turn was issued
+    // from, never re-resolved mid-turn (confirming-gate P0).
+    expect(src).toContain("turnTargetTabByKey.set(key, closed.tabs.values().next().value as string);");
+    expect(src).toContain('if (state === "done") turnTargetTabByKey.delete(key);');
+    expect(src).toContain("bridge.setScopeTargetResolver((scopeId) => {");
     // …answered to scope-addressed callers by the stamp resolver…
     expect(src).toContain(
       "if (isScopeAddress(tabId)) return lastTurnUuidByKey.get(scopeAgentKeyOf(tabId));",
@@ -242,6 +248,41 @@ describe("sessions are orchestrator-scoped, never workflow-scoped (#884)", () =>
     // owns it; the browser holds at most a hint).
     expect(store.get(key)).toBe("sess-shared");
     expect(new SessionStore(PORT, { dir: DIR }).get(key)).toBe("sess-shared");
+
+    await manager.stopAll();
+  });
+
+  it("TWO backends ⇒ TWO agents with SEPARATE histories — cross-backend never merges, neither churns", async () => {
+    const backends = new Map<string, RecordingBackend>();
+    const store = new SessionStore(PORT, { dir: DIR });
+    const manager = new PanelAgentManager({
+      mcpServers: {},
+      systemAppend: "",
+      model: "claude-test",
+      onSay: () => {},
+      onTurn: () => {},
+      onSession: () => {},
+      sessionStore: store,
+      makeBackend: (key: string) => {
+        const b = backends.get(key) ?? new RecordingBackend();
+        backends.set(key, b);
+        return b;
+      },
+    } as never);
+
+    manager.send(sharedAgentKey("claude"), "claude turn");
+    manager.send(sharedAgentKey("codex"), "codex turn");
+    await waitFor(
+      () =>
+        (backends.get(sharedAgentKey("claude"))?.turnTexts.length ?? 0) === 1 &&
+        (backends.get(sharedAgentKey("codex"))?.turnTexts.length ?? 0) === 1,
+    );
+    expect(backends.get(sharedAgentKey("claude"))!.turnTexts).toEqual(["claude turn"]);
+    expect(backends.get(sharedAgentKey("codex"))!.turnTexts).toEqual(["codex turn"]);
+    // Each conversation stood up exactly once; neither's session/MCP children
+    // were churned by the other's activity.
+    expect(backends.get(sharedAgentKey("claude"))!.closes).toBe(0);
+    expect(backends.get(sharedAgentKey("codex"))!.closes).toBe(0);
 
     await manager.stopAll();
   });

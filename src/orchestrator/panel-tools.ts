@@ -54,8 +54,10 @@ import { isScopeAddress } from "../services/session-scope.js";
  *  returned unchanged. */
 function journalTabFor(ctx: PanelToolCtx): string {
   if (!isScopeAddress(ctx.tabId)) return ctx.tabId;
-  const b = ctx.bridge as { resolveSharedTabId?: () => string | undefined };
-  return b.resolveSharedTabId?.() ?? ctx.tabId;
+  // Pass the ctx's own (backend-qualified) scope address so the RIGHT
+  // conversation's in-flight-turn pin is consulted (#884 P0).
+  const b = ctx.bridge as { resolveSharedTabId?: (scopeId?: string) => string | undefined };
+  return b.resolveSharedTabId?.(ctx.tabId) ?? ctx.tabId;
 }
 import {
   dispatchOutcomeOf,
@@ -5094,7 +5096,7 @@ function desktopCanvasRedirect(
     isHeadless?: (id: string) => boolean;
     tabs?: () => Array<{ tab_id: string }>;
     resolveActiveTabId?: () => string;
-    resolveSharedTabId?: () => string | undefined;
+    resolveSharedTabId?: (scopeId?: string) => string | undefined;
   };
   // Older / lightweight bridges can't classify tabs — leave routing exactly as-is.
   if (typeof b.isHeadless !== "function" || typeof b.tabs !== "function") return null;
@@ -5105,7 +5107,7 @@ function desktopCanvasRedirect(
   // now; when that is a canvas-less client (only a phone is connected), the same
   // redirect / honest canvas-less error applies instead of blasting the command
   // at the phone.
-  const boundTab = isScopeAddress(ctx.tabId) ? b.resolveSharedTabId?.() : ctx.tabId;
+  const boundTab = isScopeAddress(ctx.tabId) ? b.resolveSharedTabId?.(ctx.tabId) : ctx.tabId;
   if (!boundTab || !b.isHeadless(boundTab)) return null;
   // Bound to a headless client: find the interactive (canvas-owning) DESKTOP tabs, the
   // SAME filter rebindToActiveTab/ensureReachable use for graph/workflow bindings.

@@ -1096,6 +1096,99 @@ describe("UiBridge (multi-tab)", () => {
       phone.close();
     });
 
+    it("an IN-FLIGHT turn's pin outranks the active tab — a queued message from B cannot re-aim A's turn (confirming-gate P0)", async () => {
+      const a = await connectPanel("wf:workflows/a.json", "a");
+      const b = await connectPanel("wf:workflows/b.json", "b");
+      autoReply(a, "tab-a");
+      autoReply(b, "tab-b");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      // The orchestrator pins the running turn to its origin tab A…
+      let pin: string | null | undefined = "wf:workflows/a.json";
+      bridge.setScopeTargetResolver(() => pin);
+      // …then tab B sends a message, which moves lastActiveTabId to B immediately.
+      b.send(JSON.stringify({ type: "user_message", text: "queued from b" }));
+      await vi.waitFor(async () => {
+        // Un-pinned scope resolution now follows B…
+        pin = undefined;
+        const idle = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
+        expect(idle).toMatchObject({ from: "tab-b" });
+      });
+      // …but the PINNED turn keeps routing to A, not to the newly-active B.
+      pin = "wf:workflows/a.json";
+      const pinned = await bridge.send({ cmd: "workflow_open", path: "c.json" }, { tabId: SHARED_SESSION_SCOPE });
+      expect(pinned).toMatchObject({ from: "tab-a" });
+      a.close();
+      b.close();
+    });
+
+    it("a pinned turn FOLLOWS its own tab's same-socket migration, and REFUSES when the tab is gone or ambiguous", async () => {
+      const a = await connectPanel("wf:workflows/a.json", "a");
+      const b = await connectPanel("wf:workflows/b.json", "b");
+      autoReply(a, "tab-a");
+      autoReply(b, "tab-b");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      let pin: string | null | undefined = "wf:workflows/a.json";
+      bridge.setScopeTargetResolver(() => pin);
+
+      // The turn's own tab switches workflow (same socket re-hellos) — the pin
+      // follows through the migration alias: same browser surface, same turn.
+      a.send(JSON.stringify({ type: "hello", tab_id: "wf:workflows/c.json", title: "c" }));
+      await vi.waitFor(() => {
+        expect(bridge.tabs().map((t) => t.tab_id)).toContain("wf:workflows/c.json");
+      });
+      const followed = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
+      expect(followed).toMatchObject({ from: "tab-a" });
+
+      // The pinned tab disconnects entirely: the scope REFUSES with the standard
+      // no-connected-tab error — it must NOT silently fall back to tab B.
+      a.close();
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      pin = "wf:workflows/c.json";
+      const gone = await bridge
+        .send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE, timeoutMs: 300 })
+        .catch((e) => e as Error);
+      expect(gone).toBeInstanceOf(Error);
+      expect(dispatchOutcomeOf(gone)).toBe(false);
+      expect((gone as Error).message).toMatch(/no connected tab/);
+
+      // An ambiguous-origin turn (mixed batch → pin null) refuses loudly too.
+      pin = null;
+      const ambiguous = await bridge
+        .send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE, timeoutMs: 300 })
+        .catch((e) => e as Error);
+      expect(ambiguous).toBeInstanceOf(Error);
+      expect((ambiguous as Error).message).toMatch(/ambiguous/);
+      b.close();
+    });
+
+    it("a BACKEND-QUALIFIED scope buffer only drains to a hello on that backend (confirming-gate P1)", async () => {
+      // Claude's conversation buffers a frame while nobody is connected…
+      expect(
+        bridge.push({ type: "say", text: "claude while away" }, `${SHARED_SESSION_SCOPE}::claude`),
+      ).toBe(0);
+      // …a CODEX tab hellos first: it must NOT receive Claude's output.
+      const codexSock = await connectPanel();
+      const codexGot: Array<Record<string, unknown>> = [];
+      codexSock.on("message", (buf) => codexGot.push(JSON.parse(buf.toString())));
+      codexSock.send(
+        JSON.stringify({ type: "hello", tab_id: "wf:codex.json", title: "cx", backend: "codex" }),
+      );
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      // A CLAUDE tab hellos next: the buffer drains to it.
+      const claudeSock = await connectPanel();
+      const claudeGot: Array<Record<string, unknown>> = [];
+      claudeSock.on("message", (buf) => claudeGot.push(JSON.parse(buf.toString())));
+      claudeSock.send(
+        JSON.stringify({ type: "hello", tab_id: "wf:claude.json", title: "cl", backend: "claude" }),
+      );
+      await vi.waitFor(() => {
+        expect(claudeGot.some((f) => f.type === "say" && f.text === "claude while away")).toBe(true);
+      });
+      expect(codexGot.some((f) => f.type === "say" && f.text === "claude while away")).toBe(false);
+      codexSock.close();
+      claudeSock.close();
+    });
+
     it("scope-addressed frames buffered while NO tab is connected replay to the first hello", async () => {
       // Nobody connected: a background agent's turn output is buffered under the scope…
       expect(bridge.push({ type: "say", text: "finished while you were away" }, SHARED_SESSION_SCOPE)).toBe(0);

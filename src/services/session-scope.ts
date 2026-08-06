@@ -45,7 +45,7 @@ export function isSharedScopeId(id: string | undefined | null): boolean {
  * not share one issue-time stamp); the bridge routes both forms to the active
  * tab. A real panel tab id (`wf:…`/`tmp:…`) never matches.
  */
-export function isScopeAddress(id: string | undefined | null): boolean {
+export function isScopeAddress(id: string | undefined | null): id is string {
   return (
     typeof id === "string" &&
     (id === SHARED_SESSION_SCOPE || id.startsWith(SHARED_SESSION_SCOPE + "::"))
