@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 import {
+  buildDeferredUpdateScript,
   checkAndSelfUpdate,
   compareSemver,
   detectInstallMode,
@@ -20,6 +24,12 @@ import {
 interface Harness {
   deps: SelfUpdateDeps;
   npmCalls: Array<{ args: string[]; cwd?: string }>;
+  scheduleCalls: Array<{
+    mode: "global" | "local";
+    projectRoot?: string;
+    packageDir: string;
+    to: string;
+  }>;
 }
 
 function pkgJson(version: string): string {
@@ -36,6 +46,10 @@ function makeDeps(opts: {
   env?: NodeJS.ProcessEnv;
   existing?: string[]; // extra paths that exist (e.g. project package.json)
   npmOk?: boolean; // result of runNpm
+  npmStderr?: string; // npm failure output (diagnostics must survive, #912)
+  npmStdout?: string;
+  platform?: string; // injected platform (the deferred path is Windows-only)
+  scheduleOk?: boolean; // whether scheduleDeferredUpdate reports a launch
   registryThrows?: boolean;
 }): Harness {
   const realDir = opts.realpath ?? opts.packageDir;
@@ -46,6 +60,7 @@ function makeDeps(opts: {
   }
   const existing = new Set(opts.existing ?? []);
   const npmCalls: Harness["npmCalls"] = [];
+  const scheduleCalls: Harness["scheduleCalls"] = [];
 
   const deps: SelfUpdateDeps = {
     packageDir: () => opts.packageDir,
@@ -63,10 +78,18 @@ function makeDeps(opts: {
     },
     runNpm: async (args, cwd) => {
       npmCalls.push({ args, cwd });
-      return { ok: opts.npmOk ?? true };
+      const ok = opts.npmOk ?? true;
+      return ok
+        ? { ok }
+        : { ok, stderr: opts.npmStderr ?? "", stdout: opts.npmStdout ?? "" };
+    },
+    platform: opts.platform ? () => opts.platform! : undefined,
+    scheduleDeferredUpdate: async (o) => {
+      scheduleCalls.push({ ...o });
+      return opts.scheduleOk ?? true;
     },
   };
-  return { deps, npmCalls };
+  return { deps, npmCalls, scheduleCalls };
 }
 
 // Common install-dir fixtures (POSIX-style; detection normalizes separators).
@@ -372,6 +395,314 @@ describe("checkAndSelfUpdate policy", () => {
     };
     const res = await checkAndSelfUpdate({ deps: h.deps });
     expect(res.action).toBe("unavailable");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #912 / #916-a — npm failure diagnostics + the Windows deferred updater
+// ---------------------------------------------------------------------------
+
+const EBUSY_STDERR = [
+  "npm error code EBUSY",
+  "npm error syscall copyfile",
+  "npm error path C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\comfyui-mcp\\node_modules\\@img\\sharp-win32-x64\\lib\\libvips-42.dll",
+  "npm error EBUSY: resource busy or locked, copyfile",
+].join("\n");
+
+describe("#912 — a failed npm update must carry WHY (never the bare 'failed' note)", () => {
+  it("npm's stderr tail lands in the failure note (global)", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: "npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/comfyui-mcp",
+      platform: "linux",
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("unavailable");
+    expect(res.reason).toBe("npm-failed");
+    expect(res.note).toContain("staying on 0.19.1");
+    expect(res.note).toContain("npm error code E404");
+    expect(res.note).toContain("404 Not Found");
+  });
+
+  it("the tail comes from stdout when stderr is empty", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStdout: "npm ERR! network timeout at fetch",
+      platform: "linux",
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("unavailable");
+    expect(res.note).toContain("network timeout at fetch");
+  });
+
+  it("only the LAST 8 lines survive", async () => {
+    const lines = Array.from({ length: 30 }, (_, i) => `npm error line-${i + 1} ${"x".repeat(80)}`);
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: lines.join("\n"),
+      platform: "linux",
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.note).toContain("line-30");
+    expect(res.note).toContain("line-23");
+    expect(res.note).not.toContain("line-22"); // dropped: outside the last 8
+  });
+
+  it("a single very long npm line is length-capped", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: `npm error ${"y".repeat(5000)} END-OF-LOG`,
+      platform: "linux",
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.note!.length).toBeLessThan(1500);
+    expect(res.note).toContain("END-OF-LOG"); // the tail is what survives
+  });
+
+  it("the on-load check surfaces the same diagnostics", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: "npm error code EACCES\nnpm error permission denied",
+      platform: "linux",
+    });
+    const res = await checkAndSelfUpdate({ deps: h.deps });
+    expect(res.action).toBe("unavailable");
+    expect(res.note).toContain("EACCES");
+  });
+});
+
+describe("#912 — Windows global/local: EBUSY on the orchestrator's OWN sharp DLL", () => {
+  it("a locked-files npm failure on win32 schedules the deferred helper and reports 'scheduled'", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: EBUSY_STDERR,
+      platform: "win32",
+      scheduleOk: true,
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("scheduled");
+    expect(res.reason).toBe("locked-by-running-process");
+    // The in-process npm was attempted first, then the helper was scheduled…
+    expect(h.npmCalls).toHaveLength(1);
+    expect(h.scheduleCalls).toHaveLength(1);
+    expect(h.scheduleCalls[0].mode).toBe("global");
+    expect(h.scheduleCalls[0].packageDir).toBe(GLOBAL_DIR);
+    expect(h.scheduleCalls[0].to).toBe("0.20.0");
+    // …and the note says what actually happens — never "updated".
+    expect(res.note).toMatch(/detached helper was scheduled/);
+    expect(res.note).toMatch(/fully STOPPED/);
+    expect(res.note).toMatch(/[sS]taying on 0\.19\.1/);
+    expect(res.note).toContain("npm i -g comfyui-mcp@latest");
+    expect(res.note).not.toMatch(/Updated comfyui-mcp/);
+    expect(res.note).toMatch(/self-update\.log/);
+  });
+
+  it("a win32 LOCAL install passes the project root to the helper", async () => {
+    const h = makeDeps({
+      packageDir: LOCAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      existing: [join(LOCAL_PROJECT, "package.json")],
+      npmOk: false,
+      npmStderr: EBUSY_STDERR,
+      platform: "win32",
+      scheduleOk: true,
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("scheduled");
+    expect(h.scheduleCalls).toHaveLength(1);
+    expect(h.scheduleCalls[0].mode).toBe("local");
+    expect(h.scheduleCalls[0].projectRoot).toBe(LOCAL_PROJECT.replace(/\\/g, "/"));
+    expect(res.note).toContain("npm i comfyui-mcp@latest");
+    expect(res.note).toContain(LOCAL_PROJECT.replace(/\\/g, "/"));
+  });
+
+  it("the on-load check takes the same deferred path on win32", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: EBUSY_STDERR,
+      platform: "win32",
+      scheduleOk: true,
+    });
+    const res = await checkAndSelfUpdate({ deps: h.deps });
+    expect(res.action).toBe("scheduled");
+    expect(h.scheduleCalls).toHaveLength(1);
+  });
+
+  it("when the helper cannot be launched, the note falls back to the manual remedy + npm's own error", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: EBUSY_STDERR,
+      platform: "win32",
+      scheduleOk: false, // spawn failed — never claim "scheduled"
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("unavailable");
+    expect(res.reason).toBe("locked-by-running-process");
+    expect(res.note).not.toMatch(/scheduled/);
+    expect(res.note).toMatch(/could not be started/);
+    expect(res.note).toContain("npm i -g comfyui-mcp@latest");
+    expect(res.note).toContain("EBUSY: resource busy or locked");
+    expect(res.note).toMatch(/[sS]taying on 0\.19\.1/);
+  });
+
+  it("a lock failure on POSIX is reported, never scheduled (the deferred path is Windows-only)", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: EBUSY_STDERR,
+      platform: "linux",
+      scheduleOk: true,
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("unavailable");
+    expect(res.reason).toBe("locked-by-running-process");
+    expect(h.scheduleCalls).toEqual([]);
+    expect(res.note).toContain("EBUSY: resource busy or locked");
+  });
+
+  it("a NON-lock npm failure on win32 is NOT scheduled (a 404 won't heal by waiting)", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      npmOk: false,
+      npmStderr: "npm error code E404\nnpm error 404 Not Found",
+      platform: "win32",
+      scheduleOk: true,
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("unavailable");
+    expect(res.reason).toBe("npm-failed");
+    expect(h.scheduleCalls).toEqual([]);
+    expect(res.note).toContain("404 Not Found");
+  });
+
+  it("a successful win32 update never touches the helper", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      platform: "win32",
+    });
+    const res = await runSelfUpdate(h.deps);
+    expect(res.action).toBe("updated");
+    expect(h.scheduleCalls).toEqual([]);
+  });
+});
+
+describe("#912 — status says up front that Windows applies via the deferred helper", () => {
+  it("win32 global: the update-available note names the deferred post-stop application", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      platform: "win32",
+    });
+    const s = await selfUpdateStatus(h.deps);
+    expect(s.updateAvailable).toBe(true);
+    expect(s.note).toMatch(/deferred helper/);
+    expect(s.note).toMatch(/fully stopped/i);
+  });
+
+  it("non-Windows: no such caveat", async () => {
+    const h = makeDeps({
+      packageDir: GLOBAL_DIR,
+      currentVersion: "0.19.1",
+      latest: "0.20.0",
+      platform: "linux",
+    });
+    const s = await selfUpdateStatus(h.deps);
+    expect(s.note).not.toMatch(/deferred helper/);
+  });
+});
+
+describe("#912 — the deferred helper script itself", () => {
+  const LOG = "C:\\Temp\\comfyui-mcp-self-update.log";
+
+  it("global: probes the sharp DLL lock, runs npm -g, self-deletes", () => {
+    const s = buildDeferredUpdateScript(
+      { mode: "global", packageDir: GLOBAL_DIR, to: "0.20.0" },
+      LOG,
+    );
+    expect(s).toContain("libvips-42.dll");
+    expect(s).toContain("[System.IO.File]::Open($dll, 'Open', 'ReadWrite', 'None')");
+    expect(s).toContain(`& npm.cmd i -g ${PACKAGE_NAME}@latest --no-audit --no-fund *>> $log`);
+    expect(s).toContain("Remove-Item -LiteralPath $MyInvocation.MyCommand.Path");
+    expect(s).toContain(`$log = '${LOG}'`);
+    expect(s).not.toContain("Set-Location");
+  });
+
+  it("local: runs npm in the project root, no -g", () => {
+    const s = buildDeferredUpdateScript(
+      { mode: "local", projectRoot: "C:\\proj", packageDir: LOCAL_DIR, to: "0.20.0" },
+      LOG,
+    );
+    expect(s).toContain("Set-Location -LiteralPath 'C:\\proj'");
+    expect(s).toContain(`& npm.cmd i ${PACKAGE_NAME}@latest --no-audit --no-fund *>> $log`);
+    expect(s).not.toContain("i -g");
+  });
+
+  it("single quotes in paths are escaped (PowerShell literal doubling)", () => {
+    const s = buildDeferredUpdateScript(
+      { mode: "local", projectRoot: "C:\\it's here", packageDir: LOCAL_DIR, to: "0.20.0" },
+      LOG,
+    );
+    expect(s).toContain("Set-Location -LiteralPath 'C:\\it''s here'");
+  });
+
+  it("the generated script parses as valid PowerShell (validated on Windows hosts only)", () => {
+    if (process.platform !== "win32") return; // no powershell on POSIX CI
+    const dir = mkdtempSync(join(tmpdir(), "cmcp-helper-script-"));
+    try {
+      const file = join(dir, "helper.ps1");
+      writeFileSync(
+        file,
+        buildDeferredUpdateScript(
+          { mode: "local", projectRoot: dir, packageDir: LOCAL_DIR, to: "0.20.0" },
+          join(dir, "log.txt"),
+        ),
+      );
+      // Parse-only: a syntax error makes [scriptblock]::Create throw (exit ≠ 0).
+      execFileSync(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `$null = [scriptblock]::Create((Get-Content -LiteralPath '${file.replace(/'/g, "''")}' -Raw))`,
+        ],
+        { stdio: "pipe" },
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

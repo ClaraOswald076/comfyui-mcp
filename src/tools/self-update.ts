@@ -12,7 +12,12 @@ export function registerSelfUpdateTools(server: McpServer): void {
       "link / source checkout) is NEVER updated; global/local installs are updated " +
       "via npm; npx fetches latest on next run. The running process cannot hot-swap " +
       "its own code — after an update you must RECONNECT (/mcp) or restart the " +
-      "orchestrator to load the new version. This tool does not auto-restart.",
+      "orchestrator to load the new version. This tool does not auto-restart. On " +
+      "Windows the running orchestrator holds its own sharp DLL locked, so an " +
+      "in-place npm replace fails (EBUSY); the update is then handed to a deferred " +
+      "helper (action 'scheduled') that finishes it once the orchestrator has fully " +
+      "stopped, and the new version loads at the next start. A failed update " +
+      "reports npm's own error output.",
     {
       action: z
         .enum(["status", "update"])
