@@ -36,7 +36,7 @@ It validates against `manifestSchema` in `src/services/manifest.ts`:
 ## Generating the one-click scripts
 
 ```
-npm run packs:gen            # regenerate install-*.{bat,sh} for every pack
+npm run packs:gen            # rebuild install-*.{bat,sh} for every pack
 node scripts/gen-pack-installers.mjs packs/anima   # just one pack
 ```
 

@@ -202,7 +202,7 @@ async function resolveSource(opts: ConvertImageOptions): Promise<SourceImage> {
   }
 
   if (!opts.path) {
-    throw new ValidationError("convert_image requires either asset_id or path.");
+    throw new ValidationError("get_image (action:\"convert\") requires either asset_id or path.");
   }
 
   const source = await resolveSourcePath(opts.path);

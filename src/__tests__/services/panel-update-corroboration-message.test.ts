@@ -1,4 +1,4 @@
-// #916 (part b) — install_panel(action:"update") on a local install whose
+// #916 (part b) — install_comfyui(action:"panel", panel_action:"update") on a local install whose
 // running ComfyUI is REACHABLE but whose launch arguments yield no install
 // root (the common `python main.py` / portable-launcher shape: a relative
 // argv and no reported cwd) hit the corroboration refusal whose only remedy

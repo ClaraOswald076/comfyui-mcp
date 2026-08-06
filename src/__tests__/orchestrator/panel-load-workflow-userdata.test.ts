@@ -4,7 +4,7 @@
 // Root cause: comfyWorkflowsDirs() RECONSTRUCTS COMFYUI_PATH/user/default/workflows
 // (and user/workflows), so a ComfyUI launched with a CUSTOM --user-directory keeps
 // its workflows somewhere the orchestrator cannot guess. A relative name either
-// failed outright — even though list_workflows/panel_open_workflow could see it —
+// failed outright — even though get_workflow (action:"list")/panel_open_workflow could see it —
 // or, worse, matched a same-named file under the reconstructed path and loaded a
 // DIFFERENT graph for the agent to edit.
 //
@@ -48,7 +48,7 @@ vi.mock("../../comfyui/client.js", async (importOriginal) => {
 });
 
 const { buildPanelToolDefs } = await import("../../orchestrator/panel-tools.js");
-// #810: the listing route is now shared with list_workflows, so pinning the literal
+// #810: the listing route is now shared with get_workflow (action:"list"), so pinning the literal
 // here would let the two drift apart again — which is how one recursed and one did not.
 const { WORKFLOW_LIBRARY_LISTING_ROUTE } = await import("../../services/userdata-library.js");
 import type { PanelToolCtx } from "../../orchestrator/panel-tools.js";
@@ -120,7 +120,7 @@ describe("panel_load_workflow: userdata fallback for a custom --user-directory (
     expect(calls).toHaveLength(0);
     const text = JSON.stringify(res);
     expect(text).toMatch(/workflow library/i);
-    expect(text).toMatch(/list_workflows/);
+    expect(text).toMatch(/a name exactly as shown by get_workflow/);
   });
 
   it("surfaces an honest error (no graph_load) when the userdata file is not a UI workflow", async () => {
@@ -275,7 +275,7 @@ describe("panel_load_workflow: userdata fallback for a custom --user-directory (
       expect(calls).toHaveLength(0);
       const text = JSON.stringify(res);
       expect(text).toMatch(/staged\.json/); // names what it tried
-      expect(text).toMatch(/list_workflows/);
+      expect(text).toMatch(/a name exactly as shown by get_workflow/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -993,7 +993,7 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     // The listing WAS consulted (and its 500 swallowed) — otherwise this test would
     // pass even if the near-miss lookup had been dropped entirely.
     expect(fetchApi).toHaveBeenCalledWith(WORKFLOW_LIBRARY_LISTING_ROUTE);
-    expect(JSON.stringify(res)).toMatch(/list_workflows/);
+    expect(JSON.stringify(res)).toMatch(/a name exactly as shown by get_workflow/);
     // And the refusal admits the listing was unreadable rather than implying the
     // library was fully checked.
     expect(JSON.stringify(res)).toMatch(/listing could not be read/i);

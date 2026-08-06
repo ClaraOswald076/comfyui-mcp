@@ -13,13 +13,13 @@
 //  - #766 (Comfy Desktop dual-path). Desktop launches ComfyUI out of its own
 //    program directory but passes `--base-directory <Documents\ComfyUI>`, and
 //    ComfyUI derives custom_nodes/ from THAT. The configured workspace pointed
-//    at the program directory, so install_panel reported `installed: false`
+//    at the program directory, so install_comfyui(action:'panel') reported `installed: false`
 //    while a perfectly good 0.11.x panel sat in the Documents tree — and any
 //    install would have landed in a custom_nodes the server never reads.
 //
-//  - #769 (no configured workspace at all). `get_environment` already resolves
+//  - #769 (no configured workspace at all). `install_comfyui (action:"environment")` already resolves
 //    the live root from the serving process and reports it as the local
-//    workspace, but install_panel asked the sync resolver, got nothing, and
+//    workspace, but install_comfyui(action:'panel') asked the sync resolver, got nothing, and
 //    refused with "no local ComfyUI (COMFYUI_PATH) is configured" about an
 //    install it had just been told the path to.
 //
@@ -257,6 +257,12 @@ export async function primePanelBase(
   // to a wrong-tree mutation reported as success.
   const atTarget = targetKey();
   const atGeneration = targetGeneration();
+  // The cache entry as the probe STARTS. A probe that lands after another
+  // writer refreshed (or deliberately seeded) the cache must not overwrite
+  // that newer entry with its older answer — the in-flight `void
+  // primePanelBase()` a refusal fires in the background did exactly that to a
+  // base seeded after it started (#879 test isolation surfaced it).
+  const cacheAtStart = cached;
 
   let resolution: PanelBaseResolution;
   try {
@@ -280,6 +286,25 @@ export async function primePanelBase(
   if (targetKey() !== atTarget || targetGeneration() !== atGeneration) {
     cached = undefined;
     return { source: "none" };
+  }
+
+  // A NEWER cache write landed while we were asking (a later prime settled, a
+  // test seed, a cache reset). Same rule as the retarget guard above: a probe
+  // that STARTED earlier holds older information, so it must not clobber the
+  // newer write — the fire-and-forget prime a capability refusal kicks off (see
+  // resolveStaleBundleSkew) can settle seconds later, mid-way through someone
+  // else's operation.
+  //
+  // MERGE NOTE (#884 branch × main): both sides fixed this independently and
+  // agreed the newer write must win in the CACHE. They differed on what the
+  // caller gets back — main returned this probe's older answer, this branch
+  // serves the newer cached one. Kept the branch's shape because the other
+  // leaves the caller holding a value the cache has already superseded, which
+  // is the same "two sources of truth" split the guard exists to close. The
+  // expiry fallback preserves main's behavior exactly when the newer entry has
+  // already aged out.
+  if (cached !== cacheAtStart) {
+    return cachedResolution() ?? resolution;
   }
 
   cached = { at: Date.now(), target: atTarget, generation: atGeneration, resolution };
@@ -339,7 +364,7 @@ export function __setPanelBaseForTests(
 // session-rebind.js) which also builds the `hello` payload. So a browser tab
 // holding that file from before 0.11.35 sends an OLD capability set — and an
 // old or absent version — while the pack ON DISK is perfectly current. The
-// write gate then correctly refuses, the user runs install_panel(action:
+// write gate then correctly refuses, the user runs install_comfyui(action:'panel')(action:
 // 'update'), and it correctly finds nothing to do, because nothing is wrong
 // with the install. That is the loop that feels unfixable.
 //

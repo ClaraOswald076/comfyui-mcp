@@ -1,4 +1,4 @@
-// Issue #361: panel_strip_workflow / strip_workflow returned WRONG dynamic
+// Issue #361: panel_strip_workflow / get_workflow (action:"strip") returned WRONG dynamic
 // widget values and DROPPED Set/Get (and other node-pack "virtual") links —
 // silently, so the caller got a graph that looks fine and renders differently.
 //

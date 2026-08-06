@@ -6,6 +6,11 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     include: ["src/**/*.{test,spec}.ts"],
+    // Redirect the home directory to a throwaway temp dir in EVERY worker
+    // before any module under test is imported (#879, #866). Without this the
+    // full suite intermittently rewrites the developer's real
+    // ~/.comfyui-mcp/.env and other live state — see the setup file's header.
+    setupFiles: ["src/__tests__/helpers/isolated-test-home.ts"],
     exclude: [
       "**/node_modules/**",
       "**/dist/**",

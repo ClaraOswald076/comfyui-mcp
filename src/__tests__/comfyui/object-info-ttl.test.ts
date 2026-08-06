@@ -4,8 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // /object_info snapshot after an OUT-OF-BAND ComfyUI restart or custom-node
 // install (Desktop Manager reboot, a manual restart — anything that does NOT go
 // through an mcp tool and so never calls resetObjectInfoCache()). The old cache
-// was memoized for the whole process lifetime, so get_node_info /
-// list_packs (action:"check_runtime") / validate_workflow reported the new nodes
+// was memoized for the whole process lifetime, so create_workflow (action:"node_info") /
+// list_packs (action:"check_runtime") / create_workflow (action:"validate") reported the newly-installed nodes
 // as unknown forever. A bounded freshness window (TTL) must let the NEXT call
 // after the window pick up the live server's changed node set on its own.
 

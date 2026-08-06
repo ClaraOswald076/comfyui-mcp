@@ -178,7 +178,9 @@ export function resolveToolModeForModel(opts: ResolveToolModeOptions = {}): Tool
       mode: "compact",
       source: "no-model-fallback",
       explain:
-        "Tool mode: compact — no model is known at this point, so the documented fallback applies. Set COMFYUI_MCP_TOOL_MODE=full to opt into the full surface.",
+        "Tool mode: compact — no model is known at this point, so this lane falls back to the small-model-safe choice. " +
+        "(The server's own default is full since 0.50.0; auto-selection is deliberately more conservative, because it " +
+        "cannot rule out a model that would drown in the full surface.) Set COMFYUI_MCP_TOOL_MODE=full to override.",
     };
   }
 
@@ -189,8 +191,9 @@ export function resolveToolModeForModel(opts: ResolveToolModeOptions = {}): Tool
       source: "unknown-model-fallback",
       model,
       explain:
-        `Tool mode: compact — "${model}" carries no parameter count I can read, so the documented fallback ` +
-        `applies. Set COMFYUI_MCP_TOOL_MODE=full if this model can hold the full tool surface.`,
+        `Tool mode: compact — "${model}" carries no parameter count I can read, so this lane falls back to the ` +
+        `small-model-safe choice rather than the server's full default. ` +
+        `Set COMFYUI_MCP_TOOL_MODE=full if this model can hold the full tool surface.`,
     };
   }
 

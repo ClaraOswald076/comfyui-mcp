@@ -669,8 +669,8 @@ async function applyNpmUpdate(
           `fully STOPPED — quit the MCP client or end the process; a /mcp reconnect ` +
           `or auto-restart keeps an orchestrator holding the lock and the helper keeps ` +
           `waiting — and takes effect at the next start. Staying on ` +
-          `${info.currentVersion} until then; verify with self_update(action='status') ` +
-          `after the next start.`,
+          `${info.currentVersion} until then; verify with ` +
+          `install_comfyui (action:"self_update") using self_update_action:'status' after the next start.`,
       };
     }
     return {
@@ -842,7 +842,7 @@ export async function selfUpdateStatus(
   } else {
     note =
       `${latest} available (current ${info.currentVersion}). ` +
-      `Run self_update(action='update')${autoUpdateDisabled ? "" : " (or it auto-updates on start)"}. ${RECONNECT_NOTE}`;
+      `Run install_comfyui (action:"self_update") with self_update_action:'update'${autoUpdateDisabled ? "" : " (or it auto-updates on start)"}. ${RECONNECT_NOTE}`;
     // #912: on Windows the running orchestrator holds its own sharp DLL open, so
     // an in-place npm replace fails (EBUSY) — the update is applied by the
     // deferred helper AFTER this process stops, not on a mere reconnect. Say so

@@ -67,10 +67,11 @@ vi.mock("../../services/output-dir.js", () => ({
     s === "argv-flag" || s === "live-root" || s === "observed-root",
 }));
 
-// The symlink-escape guard consults registered extra_model_paths roots (#633).
-// Stub to none (and non-authoritative live roots) so these path-safety tests stay
-// hermetic and an escaping symlink is still refused (nothing authorizes an escape).
-// The #633 allowance + fail-closed authorization are covered in a dedicated file.
+// The symlink-escape guard consults registered extra_model_paths roots (#633) for
+// its code-root VETO. Stub to none (and non-authoritative live roots) so these
+// path-safety tests stay hermetic. Since #870 an in-tree symlink's redirect is
+// authorized by its location, not by any registered root — the veto and the
+// dangling-link refusal are what these tests exercise.
 vi.mock("../../services/extra-paths.js", () => ({
   getExtraModelRoots: vi.fn(async () => []),
   getLiveExtraModelRoots: vi.fn(async () => ({ authoritative: false, roots: [] })),
@@ -208,10 +209,14 @@ describe("downloadModel — filename path safety", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("rejects a destination whose ancestor is a symlink escaping the models dir, and never fetches (#490)", async () => {
-    // The write-target resolver must guard the ACTUAL destination: a symlinked
-    // subfolder that realpaths OUTSIDE models/ can't be used as a write root even
-    // though the path string stays within models/.
+  it("ALLOWS a destination whose ancestor is an in-tree symlink redirecting outside the models dir (#870)", async () => {
+    // The write-target resolver guards the ACTUAL destination: the segment IS
+    // inspected (a dangling link is still refused), but a resolvable redirect no
+    // longer needs a registered root to vouch for the target. #490's blanket
+    // refusal of any escape could not tell `models/vae -> E:\StabilityMatrix\...`
+    // (a mainstream layout ComfyUI's own scanner follows) from a genuinely broken
+    // path, so #870 superseded it: authorization comes from the symlink's
+    // location inside the user's models tree; the code-root veto still applies.
     const escapeDir = resolve("/comfy/models/checkpoints");
     lstatMock.mockImplementation((p: string) =>
       Promise.resolve({ isSymbolicLink: () => p === escapeDir }),
@@ -220,10 +225,12 @@ describe("downloadModel — filename path safety", () => {
       Promise.resolve(p === escapeDir ? resolve("/tmp/outside") : p),
     );
 
-    await expect(
-      downloadModel("https://example.com/x.safetensors", "checkpoints", "x.safetensors"),
-    ).rejects.toThrow(/symlink in the path escapes it|outside the models/i);
-    expect(fetchMock).not.toHaveBeenCalled();
+    const target = await resolveDownloadTarget(
+      "https://example.com/x.safetensors",
+      "checkpoints",
+      "x.safetensors",
+    );
+    expect(target.targetDir).toBe(escapeDir);
   });
 
   it("allows a models ROOT that is itself a symlink/junction to another location", async () => {

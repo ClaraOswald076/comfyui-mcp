@@ -29,14 +29,388 @@ import {
 } from "../services/hierarchical-mermaid.js";
 import { convertToMermaid } from "../services/mermaid-converter.js";
 import { analyzeGraphHealth } from "../services/workflow-health.js";
+import { extractWorkflowFromImage } from "../services/image-management.js";
+import { promptDirectorInspectAction } from "./prompt-director.js";
+import { lockWorkflowAction, verifyWorkflowLockAction } from "./workflow-lock.js";
 
+/** One text content block, the shape every action in this file returns. */
+type TextResult = { content: Array<{ type: "text"; text: string }> };
+
+/**
+ * The exactly-one-of `path` / `filename` / `graph` source resolution shared,
+ * byte for byte, by the three retired tools that became get_workflow's strip,
+ * slice and query actions — including both of their error strings. Factored out
+ * when they folded into `get_workflow` (0.50.0 slice 14) so the three copies
+ * cannot drift; the messages are unchanged from all three.
+ */
+async function loadRawFromSource(
+  path: string | undefined,
+  filename: string | undefined,
+  graph: Record<string, unknown> | undefined,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+): Promise<any> {
+  const provided = [path, filename, graph].filter((v) => v != null).length;
+  if (provided !== 1) {
+    throw new ValidationError("Provide exactly one of: path, filename, or graph.");
+  }
+  if (graph) return graph;
+  if (path) return JSON.parse(await readFile(path, "utf8"));
+  const client = getClient();
+  const encoded = encodeURIComponent(`workflows/${filename}`);
+  const res = await client.fetchApi(`/api/userdata/${encoded}`);
+  if (!res.ok) {
+    throw new ValidationError(`Workflow not found in library: ${filename} (${res.status})`);
+  }
+  return await res.json();
+}
+
+/**
+ * The eight workflow-LIBRARY read tools and the three WRITE/PROVENANCE tools
+ * collapsed into two action-parameterized tools (0.50.0 surface consolidation,
+ * slice 14): `get_workflow` with eight read actions (get, list, strip, slice,
+ * from_image, analyze, query, prompt_director) and `save_workflow` with three
+ * write/provenance actions (save, lock, verify_lock). Both are survivors and
+ * keep their registration slots; the retired names and their replacements are
+ * the ledger's business (DEAD_NAMES in src/tools/vocabulary.ts).
+ *
+ * TWO tools rather than one eleven-action grab-bag because the halves have
+ * different blast radii, and the call_tool whitelist depends on that split:
+ * every `get_workflow` action is READ-ONLY, while `save_workflow` WRITES into
+ * the user's saved-workflow library — hand-authored graphs that are expensive
+ * to recreate, and `action:"save"` overwrites a same-filename workflow without
+ * confirmation. No read action can reach a write path, which the dispatch tests
+ * pin explicitly.
+ *
+ * `get_workflow` is at EIGHT actions, the RFC's cap, with ZERO headroom
+ * (controversy #7). A ninth workflow-reading verb does not go here — it forces
+ * the split this comment is the warning for.
+ *
+ * SHAPE: a FLAT object with an `action` enum — deliberately NOT a
+ * z.discriminatedUnion, which the MCP SDK renders as a schema with ZERO visible
+ * parameters, hiding every input from the model.
+ *
+ * REQUIREDNESS: only `action` can be schema-required, so per-action presence is
+ * enforced in the handler, which NAMES the missing field. The guards test
+ * ABSENCE, not falsiness: `filename: ""` passed z.string() before this
+ * consolidation and reached the userdata fetch, which answers with its own
+ * not-found error, and still does.
+ *
+ * ONE ENUM WIDENED, with the halves kept apart: `format` meant ui|api on the
+ * file read and api|raw on the strip tool. A single field carries the union
+ * ui|api|raw and each branch REFUSES the member its own tool never accepted,
+ * naming the valid ones — rather than silently aliasing "raw" onto "ui", which
+ * would answer a question the caller did not ask.
+ */
 export function registerWorkflowLibraryTools(server: McpServer): void {
   server.tool(
-    "list_workflows",
-    "List the workflows saved in the connected ComfyUI server's user library (the same workflows visible in the ComfyUI web UI), INCLUDING the ones filed in subfolders. Requires a running ComfyUI server. Takes no parameters. Returns a numbered list of library names, each relative to the library root — a workflow in a folder appears as 'VIDEO/MiniMaxH3/clip.json', and that whole string is what get_workflow / analyze_workflow / query_workflow take as `filename`. It never reports an absence it did not establish: a listing it could not read says so, and an EMPTY listing says the library could not be CONFIRMED empty (an answer with no names in it cannot show whether it covered subfolders) and tells you to check the ComfyUI sidebar rather than recreate anything.",
-    {},
-    async () => {
+    "get_workflow",
+    "Return, list, summarize or query a SAVED workflow FILE — files on disk, named from the library or given as a path/JSON — NOT the graph open on the user's canvas (that is panel_graph_outline). Every action here is READ-ONLY; saving and locking are save_workflow. Driven by the `action` parameter:\n" +
+      '- action:"get" — the full JSON of one saved workflow FILE named from the library. Defaults to converted API format; pass format:\'ui\' for the raw on-disk UI JSON. Use action:"analyze" instead if you just need to UNDERSTAND the workflow — it returns a structured summary without flooding context with JSON. Use action:"get" only when you need the actual JSON for enqueue_workflow, create_workflow (action:"modify"), or save_workflow.\n' +
+      '- action:"list" — the workflows saved in the connected ComfyUI server\'s user library (the same ones visible in the ComfyUI web UI), INCLUDING the ones filed in subfolders. Requires a running ComfyUI server. Takes no other parameters. Returns a numbered list of library names, each relative to the library root — a workflow in a folder appears as \'VIDEO/MiniMaxH3/clip.json\', and that whole string is what `filename` takes. It never reports an absence it did not establish: a listing it could not read says so, and an EMPTY listing says the library could not be CONFIRMED empty (an answer with no names in it cannot show whether it covered subfolders) and tells you to check the ComfyUI sidebar rather than recreate anything.\n' +
+      '- action:"strip" — strip a workflow to a clean, flat API graph, resolving Get/Set buses, Reroutes, subgraph definitions, and bypassed/muted nodes into real connections (the \'de-getter-setter\' pass). Unlike action:"get" this reads from ANY server-side file path on disk (not just the workflow library), so it loads ad-hoc / expert workflow files that action:"list" and panel_open_workflow can\'t resolve. Provide exactly one of: path, filename, or graph. Returns conversion warnings, a node-type summary, and the stripped graph (much smaller than the raw UI JSON).\n' +
+      '- action:"slice" — slice ONE pipeline out of a toggle-template workflow, the kind built with rgthree \'Fast Groups Bypasser/Muter\' where one graph holds many pipelines and only one is active at a time. Seeds from the output/SaveImage nodes in the named `groups`, takes their backward dependency closure (through real links AND virtual Set/Get buses), un-bypasses the kept nodes (and the internals of any subgraph defs they use), and returns a STANDALONE, activated UI graph carrying only the subgraph defs it uses. Pair with action:"strip" afterward to flatten the Set/Get buses into real connections.\n' +
+      '- action:"from_image" — extract embedded ComfyUI workflow metadata from a PNG file. ComfyUI stores the full workflow (API format) and prompt data in PNG tEXt chunks. Use this to reverse-engineer how any ComfyUI image was generated.\n' +
+      '- action:"analyze" — SUMMARIZE a saved workflow file named from the library: sections, node settings, connections, and data flow. Returns a concise text summary (not raw JSON) optimized for AI reasoning. Prefer this over action:"get" unless you need the raw JSON for enqueue_workflow or create_workflow (action:"modify").\n' +
+      "- action:\"query\" — filter, traverse, project, and aggregate over a saved workflow's nodes WITHOUT dumping the whole JSON (the missing middle between action:\"analyze\"'s fixed summary and action:\"get\"'s full dump; on 100+-node graphs this is the ONLY context-safe way to answer questions like 'which KSamplers run cfg>7', 'what feeds node 42', 'count nodes by type'). Provide exactly one of path/filename/graph, then combine: `types`, `title`, `where` widget predicates ANDed ('cfg>7', 'steps<=20', 'sampler_name=euler', 'text~sunset' — ops = != >= <= > < ~contains), `ids`, `upstream_of`/`downstream_of` + `depth`, `fields`, `group_by`, `limit`, `max_chars`. Output is TOKEN-BOUNDED and, when it truncates, the tail names WHICH of the two caps fired and the exact parameter to raise — read it and retry rather than concluding the graph can't be read. For the LIVE canvas this is panel_query_graph instead.\n" +
+      '- action:"prompt_director" — read Prompt Director\'s latest sanitized RUNTIME state after its nodes execute: each node id, node kind, resolved Model Explorer model/LoRA context, structured edit plan, source analysis, exact final prompt, warnings, or Result Critic verdict. Secrets and image tensors are redacted. Pair it with a live panel graph audit: graph inspection explains wiring and widget state, while this explains what the nodes actually resolved and compiled. Pass `node_id` to inspect one executed Prompt Director node.',
+    {
+      action: z
+        .enum(["get", "list", "strip", "slice", "from_image", "analyze", "query", "prompt_director"])
+        .describe(
+          'Which read to perform. "list" and "prompt_director" take no required parameters; ' +
+            '"get" and "analyze" require `filename`; "strip", "slice" and "query" require exactly one of ' +
+            '`path`/`filename`/`graph` (and "slice" also requires `groups`); "from_image" requires `image_path`.',
+        ),
+      filename: z
+        .string()
+        .optional()
+        .describe(
+          'Workflow library name, exactly as action:"list" reports it. A workflow filed in a folder ' +
+            "keeps its folder in the name ('VIDEO/MiniMaxH3/clip.json') and that whole string goes here. " +
+            'REQUIRED for action:"get" and action:"analyze"; one of the three sources for "strip", "slice" and "query".',
+        ),
+      format: z
+        .enum(["ui", "api", "raw"])
+        .optional()
+        .default("api")
+        .describe(
+          'action:"get" — \'api\' (default, recommended) converts to compact API format with named inputs, ' +
+            "connection references, and _meta.mode flags for muted/bypassed nodes; 'ui' returns the raw UI " +
+            "format with layout positions and links arrays. " +
+            'action:"strip" — \'api\' (default) strips to the flat resolved graph; \'raw\' returns the file/graph ' +
+            "unchanged. Each action accepts only its own two values (this field is the union of what the two " +
+            "tools it replaces accepted) and refuses the third rather than guessing at an alias.",
+        ),
+      path: z
+        .string()
+        .optional()
+        .describe(
+          'action:"strip" / "slice" / "query" — Absolute server-side path to a workflow .json on disk (e.g. ' +
+            "C:\\\\Users\\\\you\\\\ComfyUI\\\\user\\\\default\\\\workflows\\\\pusa_extend.json). Read directly from disk — no library lookup.",
+        ),
+      graph: z
+        .record(z.string(), z.any())
+        .optional()
+        .describe(
+          'action:"strip" / "slice" / "query" — Inline workflow JSON (UI format for "strip"/"slice"; UI or API for "query"), as an alternative to path/filename.',
+        ),
+      groups: z
+        .union([z.string(), z.array(z.string())])
+        .optional()
+        .describe(
+          'action:"slice" (REQUIRED) — Group-title substrings (case-insensitive) whose output nodes seed the slice — CSV string or ' +
+            "array, e.g. 'TEXT TO IMAGE,TXT' or ['extend','sampler']. Shared post-proc is pulled in via the closure.",
+        ),
+      image_path: z
+        .string()
+        .optional()
+        .describe('action:"from_image" (REQUIRED) — Absolute path to a ComfyUI-generated PNG file'),
+      view: z
+        .enum(["summary", "overview", "detail", "list", "flat", "health"])
+        .optional()
+        .default("summary")
+        .describe(
+          'action:"analyze" — summary (default): structured text with sections, node IDs, key settings, virtual wires, ' +
+            "and full connection graph — best for AI understanding. " +
+            "overview: mermaid diagram showing sections as summary nodes with cross-section data flow. " +
+            "detail: mermaid diagram for one section (requires section parameter). " +
+            "list: text listing of all sections with data flow summary. " +
+            "flat: single mermaid flowchart of the entire workflow (best for small workflows). " +
+            "health: graph-health heuristics (disconnected nodes, duplicate model loads, orphaned branches, muted/bypassed).",
+        ),
+      section: z
+        .string()
+        .optional()
+        .describe(
+          'action:"analyze" — Section name for detail view. Use view=\'list\' first to see available section names.',
+        ),
+      node_id: z
+        .string()
+        .optional()
+        .describe(
+          'action:"prompt_director" — Optional ComfyUI node id; omit to list all recent Prompt Director runtime states.',
+        ),
+      types: z
+        .array(z.string())
+        .optional()
+        .describe('action:"query" — Keep nodes whose class_type contains ANY of these (case-insensitive).'),
+      title: z.string().optional().describe('action:"query" — Keep nodes whose title contains this.'),
+      where: z
+        .array(z.string())
+        .optional()
+        .describe('action:"query" — Widget predicates, ANDed: \'cfg>7\', \'sampler_name=euler\', \'text~sunset\'.'),
+      ids: z
+        .array(z.union([z.string(), z.number()]))
+        .optional()
+        .describe('action:"query" — Keep exactly these node ids.'),
+      upstream_of: z
+        .union([z.string(), z.number()])
+        .optional()
+        .describe('action:"query" — Scope to the dependency closure FEEDING this node id.'),
+      downstream_of: z
+        .union([z.string(), z.number()])
+        .optional()
+        .describe('action:"query" — Scope to the nodes CONSUMING this node id\'s outputs.'),
+      depth: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe('action:"query" — Max hops from the traversal seed (seed=0). Absent = full closure.'),
+      fields: z
+        .enum(["ids", "compact", "detail"])
+        .optional()
+        .describe('action:"query" — Projection: compact one-liners (default), bare ids, or detail JSON rows.'),
+      group_by: z
+        .enum(["type"])
+        .optional()
+        .describe('action:"query" — Aggregate: counts per class_type instead of listing.'),
+      // #809: the ceilings come from the engine's own clamps, so a hint that quotes a
+      // ceiling can never disagree with what the schema accepts or the runtime enforces.
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(LIMIT_CEILING)
+        .optional()
+        .describe(`action:"query" — Max nodes listed (default 40, max ${LIMIT_CEILING}).`),
+      max_chars: z
+        .number()
+        .int()
+        .min(MAX_CHARS_FLOOR)
+        .max(MAX_CHARS_CEILING)
+        .optional()
+        .describe(
+          `action:"query" — Output character bound (default 12000, max ${MAX_CHARS_CEILING}). Raise this — not \`limit\` — when the truncation tail says the char budget cut the result.`,
+        ),
+    },
+    async (args) => {
       try {
+        const requireFilename = (action: string, what: string): string => {
+          if (args.filename === undefined) {
+            throw new Error(`get_workflow action:"${action}" requires \`filename\` — ${what}.`);
+          }
+          return args.filename;
+        };
+
+        switch (args.action) {
+          case "get":
+            return await getWorkflowAction(
+              requireFilename("get", "the workflow library name to read"),
+              requireFormat(args.format, "get", ["ui", "api"]),
+            );
+          case "list":
+            return await listWorkflowsAction();
+          case "strip":
+            return await stripWorkflowAction(
+              args.path,
+              args.filename,
+              args.graph,
+              requireFormat(args.format, "strip", ["api", "raw"]),
+            );
+          case "slice": {
+            if (args.groups === undefined) {
+              throw new Error(
+                'get_workflow action:"slice" requires `groups` — the group-title substring(s) whose output nodes seed the slice.',
+              );
+            }
+            return await sliceWorkflowAction(args.path, args.filename, args.graph, args.groups);
+          }
+          case "from_image": {
+            if (args.image_path === undefined) {
+              throw new Error(
+                'get_workflow action:"from_image" requires `image_path` — the absolute path to a ComfyUI-generated PNG.',
+              );
+            }
+            return await workflowFromImageAction(args.image_path);
+          }
+          case "analyze":
+            return await analyzeWorkflowAction(
+              requireFilename("analyze", "the workflow library name to summarize"),
+              args.view,
+              args.section,
+            );
+          case "query": {
+            const { action, filename, path, graph, format, image_path, view, section, node_id, ...query } =
+              args;
+            void action;
+            void format;
+            void image_path;
+            void view;
+            void section;
+            void node_id;
+            return await queryWorkflowAction(path, filename, graph, query);
+          }
+          case "prompt_director":
+            return await promptDirectorInspectAction(args.node_id);
+          default: {
+            // Unreachable given the zod enum, but a clear runtime guard beats a
+            // silent undefined if the schema and switch ever drift apart.
+            const exhaustive: never = args.action;
+            throw new Error(
+              `Unknown get_workflow action "${String(exhaustive)}". Expected one of: get, list, strip, slice, from_image, analyze, query, prompt_director.`,
+            );
+          }
+        }
+      } catch (err) {
+        return errorToToolResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "save_workflow",
+    "WRITE to the ComfyUI user library: persist a workflow, or capture/verify its provenance lock. This is the only tool here that writes — reading is get_workflow. Driven by the `action` parameter:\n" +
+      "- action:\"save\" — Save a workflow JSON to the connected ComfyUI server's user library so it appears in the ComfyUI web UI. Requires a running ComfyUI server; this writes to that server's userdata and OVERWRITES any existing file with the same filename without confirmation. Web-UI-format JSON ({ nodes: [], links: [] }) is saved as-is and is the preferred input — when re-saving an existing workflow, load it with get_workflow (action:\"get\", format='ui') and modify THAT. API-format graphs ({ '1': { class_type, inputs } }) are AUTO-CONVERTED to Web UI format with a generated layout so the saved file always opens in the ComfyUI canvas (the canvas cannot open raw API format). Returns a confirmation message (noting the conversion and any warnings), or the HTTP status and error text on failure.\n" +
+      '- action:"lock" — Capture a provenance lock for a saved workflow so it can be exactly reproduced later. Walks the workflow\'s model loaders (CheckpointLoaderSimple, UNETLoader, VAELoader, LoraLoader, ControlNetLoader, etc.), SHA-256s every referenced model file, records the git commit currently checked out for every custom node pack the workflow\'s class_types come from, and captures ComfyUI\'s reported version. WRITES `<filename>.lock.json` next to the workflow in ComfyUI\'s user library. Requires a local install (COMFYUI_PATH) — SHA-256 needs raw file bytes and pack commits come from `custom_nodes/*/.git/HEAD`. Pair with action:"verify_lock" later to detect drift.\n' +
+      '- action:"verify_lock" — Compare a saved workflow\'s lock file against the current state of the local install and report drift. Loads `<filename>.lock.json`, re-computes a current lock from the same workflow, and diffs: which models have a different SHA-256, which custom node packs are on a different commit, whether ComfyUI\'s version changed. Use before re-running an important workflow days or weeks later to confirm it\'ll behave the same. Requires a local install (COMFYUI_PATH). Read-only; returns a structured drift report (empty arrays everywhere mean perfect parity).',
+    {
+      action: z
+        .enum(["save", "lock", "verify_lock"])
+        .describe(
+          'Which write/provenance operation to perform. All three require `filename`; "save" also requires `workflow`.',
+        ),
+      filename: z
+        .string()
+        .optional()
+        .describe(
+          "Workflow filename in the ComfyUI user library (e.g. 'my_workflow.json'). REQUIRED for every action. " +
+            'For action:"save" this OVERWRITES an existing file of the same name; for "lock"/"verify_lock" the lock ' +
+            "is read/written as '<filename>.lock.json' alongside it.",
+        ),
+      workflow: z
+        .record(z.string(), z.any())
+        .optional()
+        .describe(
+          'action:"save" (REQUIRED) — Workflow JSON to save. Web UI format ({ nodes: [], links: [] }) is stored verbatim; API format ({ \'1\': { class_type, inputs } }) is auto-converted to Web UI format (generated layout) so it stays openable in ComfyUI\'s canvas. Not validated against the server before saving.',
+        ),
+    },
+    async (args) => {
+      try {
+        // `filename` is required by all three actions but cannot be schema-required
+        // in a flat shape. ABSENCE only: `filename: ""` passed z.string() before and
+        // reached the userdata POST/GET, which answers for itself.
+        if (args.filename === undefined) {
+          throw new Error(
+            `save_workflow action:"${args.action}" requires \`filename\` — the workflow library name to write.`,
+          );
+        }
+        switch (args.action) {
+          case "save": {
+            if (args.workflow === undefined) {
+              throw new Error(
+                'save_workflow action:"save" requires `workflow` — the workflow JSON to write.',
+              );
+            }
+            return await saveWorkflowAction(args.filename, args.workflow);
+          }
+          case "lock":
+            return await lockWorkflowAction(args.filename);
+          case "verify_lock":
+            return await verifyWorkflowLockAction(args.filename);
+          default: {
+            const exhaustive: never = args.action;
+            throw new Error(
+              `Unknown save_workflow action "${String(exhaustive)}". Expected one of: save, lock, verify_lock.`,
+            );
+          }
+        }
+      } catch (err) {
+        return errorToToolResult(err);
+      }
+    },
+  );
+}
+
+/**
+ * `format` carried two DIFFERENT enums before the fold — ui|api on the file read
+ * that became action:"get", api|raw on the tool that became action:"strip" — so
+ * the shared field is their union and each action rejects the member its own
+ * tool never took. The refusal names the valid values; aliasing 'raw' onto 'ui'
+ * (they are close, not equal) would answer a question the caller did not ask.
+ */
+function requireFormat<T extends string>(
+  format: string | undefined,
+  action: string,
+  allowed: readonly T[],
+): T {
+  // `undefined` is the schema default "api", which both halves accept. The zod
+  // layer normally supplies it, so this only matters for a caller that reaches
+  // the handler without it — where refusing "undefined" would break every
+  // default-format read rather than answering it.
+  if (format === undefined) format = "api";
+  if (!(allowed as readonly string[]).includes(format)) {
+    throw new Error(
+      `get_workflow action:"${action}" does not accept format:"${format}" — use ${allowed
+        .map((f) => `"${f}"`)
+        .join(" or ")}.`,
+    );
+  }
+  return format as T;
+}
+
+/** `get_workflow (action:"list")` — the body of the retired library-listing tool. */
+async function listWorkflowsAction(): Promise<TextResult> {
         // #810: the listing is RECURSIVE. Users organize the library into folders in
         // the web UI, and a shallow read reported six visible workflows as none.
         const listing = await listWorkflowLibraryKeys();
@@ -152,42 +526,15 @@ export function registerWorkflowLibraryTools(server: McpServer): void {
             {
               type: "text",
               text:
-                `Found ${files.length} workflow(s) — each name below is what get_workflow / ` +
-                `analyze_workflow / query_workflow take as \`filename\`.${coverage}${unreadable}\n\n${text}`,
+                `Found ${files.length} workflow(s) — each name below is what get_workflow ` +
+                `(action:"get" / "analyze" / "query") takes as \`filename\`.${coverage}${unreadable}\n\n${text}`,
             },
           ],
         };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
+}
 
-  server.tool(
-    "get_workflow",
-    "Return the full JSON of a SAVED workflow FILE, named from the library — a file on disk, NOT the graph open on the user's canvas (that is panel_graph_outline). " +
-      "Defaults to converted API format; pass format:'ui' for the raw on-disk UI JSON. " +
-      "Use analyze_workflow instead if you just need to understand the workflow — it returns a structured summary without flooding context with JSON. " +
-      "Use get_workflow only when you need the actual JSON for enqueue_workflow, modify_workflow, or save_workflow.",
-    {
-      filename: z
-        .string()
-        .describe(
-          "Workflow library name, exactly as list_workflows reports it. A workflow filed in a folder " +
-            "keeps its folder in the name ('VIDEO/MiniMaxH3/clip.json') and that whole string goes here.",
-        ),
-      format: z
-        .enum(["ui", "api"])
-        .optional()
-        .default("api")
-        .describe(
-          "Output format: 'api' (default, recommended) converts to compact API format with " +
-            "named inputs, connection references, and _meta.mode flags for muted/bypassed nodes. " +
-            "'ui' returns the raw UI format with layout positions and links arrays.",
-        ),
-    },
-    async ({ filename, format }) => {
-      try {
+/** `get_workflow (action:"get")` — the body of the surviving get_workflow tool. */
+async function getWorkflowAction(filename: string, format: "ui" | "api"): Promise<TextResult> {
         const client = getClient();
         const encoded = encodeURIComponent(`workflows/${filename}`);
         const res = await client.fetchApi(
@@ -242,67 +589,16 @@ export function registerWorkflowLibraryTools(server: McpServer): void {
             },
           ],
         };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
+}
 
-  server.tool(
-    "strip_workflow",
-    "Strip a workflow to a clean, flat API graph — resolving Get/Set buses, Reroutes, " +
-      "subgraph definitions, and bypassed/muted nodes into real connections (the 'de-getter-setter' pass). " +
-      "Unlike get_workflow, this reads from ANY server-side file path on disk (not just the cached " +
-      "workflow library), so it loads ad-hoc / expert workflow files that workflow_list and " +
-      "panel_open_workflow can't resolve. Provide exactly one of: path, filename, or graph. Returns " +
-      "conversion warnings, a node-type summary, and the stripped graph (much smaller than the raw UI JSON).",
-    {
-      path: z
-        .string()
-        .optional()
-        .describe(
-          "Absolute server-side path to a workflow .json on disk (e.g. " +
-            "C:\\\\Users\\\\you\\\\ComfyUI\\\\user\\\\default\\\\workflows\\\\pusa_extend.json). Read directly from disk — no library lookup.",
-        ),
-      filename: z
-        .string()
-        .optional()
-        .describe(
-          "Workflow library name as list_workflows reports it (subfolders included, e.g. " +
-            "'IMAGE/portrait.json'), as an alternative to path.",
-        ),
-      graph: z
-        .record(z.string(), z.any())
-        .optional()
-        .describe("Inline UI-format workflow JSON, as an alternative to path/filename."),
-      format: z
-        .enum(["api", "raw"])
-        .optional()
-        .default("api")
-        .describe("'api' (default) strips to the flat resolved graph; 'raw' returns the file/graph unchanged."),
-    },
-    async ({ path, filename, graph, format }) => {
-      try {
-        const provided = [path, filename, graph].filter((v) => v != null).length;
-        if (provided !== 1) {
-          throw new ValidationError("Provide exactly one of: path, filename, or graph.");
-        }
-
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        let raw: any;
-        if (graph) {
-          raw = graph;
-        } else if (path) {
-          raw = JSON.parse(await readFile(path, "utf8"));
-        } else {
-          const client = getClient();
-          const encoded = encodeURIComponent(`workflows/${filename}`);
-          const res = await client.fetchApi(`/api/userdata/${encoded}`);
-          if (!res.ok) {
-            throw new ValidationError(`Workflow not found in library: ${filename} (${res.status})`);
-          }
-          raw = await res.json();
-        }
+/** `get_workflow (action:"strip")` — the body of the retired de-getter-setter tool. */
+async function stripWorkflowAction(
+  path: string | undefined,
+  filename: string | undefined,
+  graph: Record<string, unknown> | undefined,
+  format: "api" | "raw",
+): Promise<TextResult> {
+        const raw = await loadRawFromSource(path, filename, graph);
 
         if (format === "raw" || !isUiFormat(raw)) {
           return { content: [{ type: "text", text: JSON.stringify(raw, null, 2) }] };
@@ -342,113 +638,16 @@ export function registerWorkflowLibraryTools(server: McpServer): void {
             { type: "text", text: JSON.stringify(workflow, null, 2) },
           ],
         };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
+}
 
-  server.tool(
-    "query_workflow",
-    "QUERY a SAVED workflow FILE (or JSON you pass in) — NOT the live canvas, which is " +
-      "panel_query_graph / panel_graph_outline. Filter, traverse, project, and aggregate over its nodes WITHOUT " +
-      "dumping the whole JSON (the missing middle between analyze_workflow's fixed summary and " +
-      "get_workflow's full dump; on 100+-node graphs this is the ONLY context-safe way to answer " +
-      "questions like 'which KSamplers run cfg>7', 'what feeds node 42', 'count nodes by type'). " +
-      "Provide exactly one of path/filename/graph, then combine: `types` (class_type contains any), " +
-      "`title` (contains), `where` widget predicates ANDed ('cfg>7', 'steps<=20', 'sampler_name=euler', " +
-      "'text~sunset' — ops = != >= <= > < ~contains), `ids` (exact nodes — the way to read ONE node's " +
-      "detail), `upstream_of`/`downstream_of` + `depth` (dependency traversal: upstream = what FEEDS " +
-      "that node, downstream = what CONSUMES it; seed included at depth 0), `fields` ('compact' one " +
-      "line per node [default], 'ids', or 'detail' JSON rows with widgets + wiring), `group_by:'type'` " +
-      `(counts only), \`limit\` (default 40, max ${LIMIT_CEILING}), \`max_chars\` (default 12000, max ${MAX_CHARS_CEILING}). ` +
-      "Output is TOKEN-BOUNDED and, when it truncates, the tail names WHICH of the two caps fired and the exact " +
-      "parameter to raise — read it and retry rather than concluding the graph can't be read. Read-only.",
-    {
-      path: z.string().optional().describe("Absolute server-side path to a workflow .json on disk."),
-      filename: z
-        .string()
-        .optional()
-        .describe(
-          "Workflow library name as list_workflows reports it (subfolders included, e.g. " +
-            "'IMAGE/portrait.json'), as an alternative to path.",
-        ),
-      graph: z
-        .record(z.string(), z.any())
-        .optional()
-        .describe("Inline workflow JSON (UI or API format), as an alternative to path/filename."),
-      types: z
-        .array(z.string())
-        .optional()
-        .describe("Keep nodes whose class_type contains ANY of these (case-insensitive)."),
-      title: z.string().optional().describe("Keep nodes whose title contains this."),
-      where: z
-        .array(z.string())
-        .optional()
-        .describe("Widget predicates, ANDed: 'cfg>7', 'sampler_name=euler', 'text~sunset'."),
-      ids: z
-        .array(z.union([z.string(), z.number()]))
-        .optional()
-        .describe("Keep exactly these node ids."),
-      upstream_of: z
-        .union([z.string(), z.number()])
-        .optional()
-        .describe("Scope to the dependency closure FEEDING this node id."),
-      downstream_of: z
-        .union([z.string(), z.number()])
-        .optional()
-        .describe("Scope to the nodes CONSUMING this node id's outputs."),
-      depth: z
-        .number()
-        .int()
-        .min(0)
-        .optional()
-        .describe("Max hops from the traversal seed (seed=0). Absent = full closure."),
-      fields: z
-        .enum(["ids", "compact", "detail"])
-        .optional()
-        .describe("Projection: compact one-liners (default), bare ids, or detail JSON rows."),
-      group_by: z.enum(["type"]).optional().describe("Aggregate: counts per class_type instead of listing."),
-      // #809: the ceilings come from the engine's own clamps, so a hint that quotes a
-      // ceiling can never disagree with what the schema accepts or the runtime enforces.
-      limit: z
-        .number()
-        .int()
-        .min(1)
-        .max(LIMIT_CEILING)
-        .optional()
-        .describe(`Max nodes listed (default 40, max ${LIMIT_CEILING}).`),
-      max_chars: z
-        .number()
-        .int()
-        .min(MAX_CHARS_FLOOR)
-        .max(MAX_CHARS_CEILING)
-        .optional()
-        .describe(
-          `Output character bound (default 12000, max ${MAX_CHARS_CEILING}). Raise this — not \`limit\` — when the truncation tail says the char budget cut the result.`,
-        ),
-    },
-    async ({ path, filename, graph, ...query }) => {
-      try {
-        const provided = [path, filename, graph].filter((v) => v != null).length;
-        if (provided !== 1) {
-          throw new ValidationError("Provide exactly one of: path, filename, or graph.");
-        }
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        let raw: any;
-        if (graph) {
-          raw = graph;
-        } else if (path) {
-          raw = JSON.parse(await readFile(path, "utf8"));
-        } else {
-          const client = getClient();
-          const encoded = encodeURIComponent(`workflows/${filename}`);
-          const res = await client.fetchApi(`/api/userdata/${encoded}`);
-          if (!res.ok) {
-            throw new ValidationError(`Workflow not found in library: ${filename} (${res.status})`);
-          }
-          raw = await res.json();
-        }
+/** `get_workflow (action:"query")` — the body of the retired graph-query tool. */
+async function queryWorkflowAction(
+  path: string | undefined,
+  filename: string | undefined,
+  graph: Record<string, unknown> | undefined,
+  query: Parameters<typeof queryApiGraph>[1],
+): Promise<TextResult> {
+        const raw = await loadRawFromSource(path, filename, graph);
         let api = raw;
         const notes: string[] = [];
         if (isUiFormat(raw)) {
@@ -457,7 +656,9 @@ export function registerWorkflowLibraryTools(server: McpServer): void {
           const converted = convertUiToApi(raw, objectInfo);
           api = converted.workflow;
           if (converted.warnings.length)
-            notes.push(`${converted.warnings.length} conversion warning(s) — see strip_workflow for details`);
+            notes.push(
+              `${converted.warnings.length} conversion warning(s) — see get_workflow (action:"strip") for details`,
+            );
         } else if (!isApiFormat(raw)) {
           throw new ValidationError("Not a recognizable workflow (neither UI nor API format).");
         }
@@ -467,56 +668,16 @@ export function registerWorkflowLibraryTools(server: McpServer): void {
             { type: "text", text: result.text + (notes.length ? `\n(${notes.join("; ")})` : "") },
           ],
         };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
+}
 
-  server.tool(
-    "slice_workflow",
-    "Slice ONE pipeline out of a toggle-template workflow — the kind built with rgthree " +
-      "'Fast Groups Bypasser/Muter' where one graph holds many pipelines and only one is active at a time. " +
-      "Seeds from the output/SaveImage nodes in the named groups, takes their backward dependency closure " +
-      "(through real links AND virtual Set/Get buses), un-bypasses the kept nodes (and the internals of any " +
-      "subgraph defs they use), and returns a STANDALONE, activated UI graph carrying only the subgraph " +
-      "defs it uses. Reads from any server-side path, userdata filename, or inline graph. Pair with " +
-      "strip_workflow afterward to flatten the Set/Get buses into real connections.",
-    {
-      path: z.string().optional().describe("Absolute server-side path to the workflow .json on disk."),
-      filename: z.string().optional().describe(
-        "Workflow library name as list_workflows reports it, subfolders included (e.g. 'IMAGE/portrait.json').",
-      ),
-      graph: z.record(z.string(), z.any()).optional().describe("Inline UI-format workflow JSON."),
-      groups: z
-        .union([z.string(), z.array(z.string())])
-        .describe(
-          "Group-title substrings (case-insensitive) whose output nodes seed the slice — CSV string or " +
-            "array, e.g. 'TEXT TO IMAGE,TXT' or ['extend','sampler']. Shared post-proc is pulled in via the closure.",
-        ),
-    },
-    async ({ path, filename, graph, groups }) => {
-      try {
-        const provided = [path, filename, graph].filter((v) => v != null).length;
-        if (provided !== 1) {
-          throw new ValidationError("Provide exactly one of: path, filename, or graph.");
-        }
-
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        let raw: any;
-        if (graph) {
-          raw = graph;
-        } else if (path) {
-          raw = JSON.parse(await readFile(path, "utf8"));
-        } else {
-          const client = getClient();
-          const encoded = encodeURIComponent(`workflows/${filename}`);
-          const res = await client.fetchApi(`/api/userdata/${encoded}`);
-          if (!res.ok) {
-            throw new ValidationError(`Workflow not found in library: ${filename} (${res.status})`);
-          }
-          raw = await res.json();
-        }
+/** `get_workflow (action:"slice")` — the body of the retired pipeline-slicing tool. */
+async function sliceWorkflowAction(
+  path: string | undefined,
+  filename: string | undefined,
+  graph: Record<string, unknown> | undefined,
+  groups: string | string[],
+): Promise<TextResult> {
+        const raw = await loadRawFromSource(path, filename, graph);
 
         const groupList = Array.isArray(groups) ? groups : String(groups).split(",");
         const { workflow, stats } = sliceWorkflow(raw, groupList);
@@ -536,27 +697,18 @@ export function registerWorkflowLibraryTools(server: McpServer): void {
             { type: "text", text: JSON.stringify(workflow, null, 2) },
           ],
         };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
+}
 
-  server.tool(
-    "save_workflow",
-    "Save a workflow JSON to the connected ComfyUI server's user library so it appears in the ComfyUI web UI. Requires a running ComfyUI server; this writes to that server's userdata and overwrites any existing file with the same filename without confirmation. Web-UI-format JSON ({ nodes: [], links: [] }) is saved as-is and is the preferred input — when re-saving an existing workflow, load it with get_workflow format='ui' and modify THAT. API-format graphs ({ '1': { class_type, inputs } }) are AUTO-CONVERTED to Web UI format with a generated layout so the saved file always opens in the ComfyUI canvas (the canvas cannot open raw API format). Returns a confirmation message (noting the conversion and any warnings), or the HTTP status and error text on failure.",
-    {
-      filename: z
-        .string()
-        .describe(
-          "Filename to save as (e.g. 'my_workflow.json'). Will overwrite if it already exists.",
-        ),
-      workflow: z
-        .record(z.string(), z.any())
-        .describe("Workflow JSON to save. Web UI format ({ nodes: [], links: [] }) is stored verbatim; API format ({ '1': { class_type, inputs } }) is auto-converted to Web UI format (generated layout) so it stays openable in ComfyUI's canvas. Not validated against the server before saving."),
-    },
-    async (args) => {
-      try {
+/**
+ * `save_workflow (action:"save")` — the body of the surviving save_workflow
+ * tool. The one WRITE on this surface that a canvas-less client can reach; see
+ * the action scope in src/orchestrator/call-tool-admission.ts.
+ */
+async function saveWorkflowAction(
+  filename: string,
+  workflowArg: Record<string, unknown>,
+): Promise<TextResult> {
+        const args = { filename, workflow: workflowArg };
         const client = getClient();
         const encoded = encodeURIComponent(`workflows/${args.filename}`);
 
@@ -589,7 +741,7 @@ export function registerWorkflowLibraryTools(server: McpServer): void {
               `(${convErr instanceof Error ? convErr.message : String(convErr)}) — saved verbatim. ` +
               `The ComfyUI canvas CANNOT open or edit this file. If it is meant to be reopened in ` +
               `the UI, rebuild it in Web UI format ({ nodes: [], links: [] }) — e.g. load the ` +
-              `on-canvas graph or an existing file via get_workflow format="ui", apply your ` +
+              `on-canvas graph or an existing file via get_workflow (action:"get", format="ui"), apply your ` +
               `changes to that, and save again.`;
           }
         } else if (!isUiFormat(args.workflow)) {
@@ -627,69 +779,35 @@ export function registerWorkflowLibraryTools(server: McpServer): void {
             },
           ],
         };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
+}
 
-  // Helper: load and convert a workflow from the library
-  async function loadWorkflowApi(filename: string): Promise<{ workflow: WorkflowJSON; warnings: string[] }> {
-    const client = getClient();
-    const encoded = encodeURIComponent(`workflows/${filename}`);
-    const res = await client.fetchApi(`/api/userdata/${encoded}`);
+/** Load and convert a workflow from the library (shared by action:"analyze"). */
+async function loadWorkflowApi(filename: string): Promise<{ workflow: WorkflowJSON; warnings: string[] }> {
+  const client = getClient();
+  const encoded = encodeURIComponent(`workflows/${filename}`);
+  const res = await client.fetchApi(`/api/userdata/${encoded}`);
 
-    if (!res.ok) {
-      throw new ValidationError(`Workflow not found: ${filename} (${res.status})`);
-    }
-
-    const raw = await res.json();
-    const objectInfo = await getObjectInfo();
-
-    if (isUiFormat(raw)) {
-      return convertUiToApi(raw, objectInfo);
-    }
-
-    // Already API format
-    return { workflow: raw as WorkflowJSON, warnings: [] };
+  if (!res.ok) {
+    throw new ValidationError(`Workflow not found: ${filename} (${res.status})`);
   }
 
-  server.tool(
-    "analyze_workflow",
-    "SUMMARIZE a SAVED workflow FILE named from the library — sections, node settings, connections, " +
-      "and data flow. It reads a file from the library, NOT the graph open on the user's canvas " +
-      "(that is panel_graph_outline). Use this to understand a saved workflow before modifying or executing it. " +
-      "Returns a concise text summary (not raw JSON) optimized for AI reasoning. " +
-      "Prefer this over get_workflow unless you need the raw JSON for enqueue_workflow or modify_workflow.",
-    {
-      filename: z
-        .string()
-        .describe(
-          "Workflow library name, exactly as list_workflows reports it (e.g. 'Scene Builder v3.json', or " +
-            "'VIDEO/MiniMaxH3/clip.json' for one filed in a folder — the folder is part of the name).",
-        ),
-      view: z
-        .enum(["summary", "overview", "detail", "list", "flat", "health"])
-        .optional()
-        .default("summary")
-        .describe(
-          "summary (default): structured text with sections, node IDs, key settings, virtual wires, " +
-            "and full connection graph — best for AI understanding. " +
-            "overview: mermaid diagram showing sections as summary nodes with cross-section data flow. " +
-            "detail: mermaid diagram for one section (requires section parameter). " +
-            "list: text listing of all sections with data flow summary. " +
-            "flat: single mermaid flowchart of the entire workflow (best for small workflows). " +
-            "health: graph-health heuristics (disconnected nodes, duplicate model loads, orphaned branches, muted/bypassed).",
-        ),
-      section: z
-        .string()
-        .optional()
-        .describe(
-          "Section name for detail view. Use view='list' first to see available section names.",
-        ),
-    },
-    async ({ filename, view, section }) => {
-      try {
+  const raw = await res.json();
+  const objectInfo = await getObjectInfo();
+
+  if (isUiFormat(raw)) {
+    return convertUiToApi(raw, objectInfo);
+  }
+
+  // Already API format
+  return { workflow: raw as WorkflowJSON, warnings: [] };
+}
+
+/** `get_workflow (action:"analyze")` — the body of the retired workflow-summary tool. */
+async function analyzeWorkflowAction(
+  filename: string,
+  view: "summary" | "overview" | "detail" | "list" | "flat" | "health",
+  section: string | undefined,
+): Promise<TextResult> {
         logger.info(`Analyzing workflow: ${filename} (view=${view})`);
         const { workflow, warnings } = await loadWorkflowApi(filename);
         const objectInfo = await getObjectInfo();
@@ -768,9 +886,37 @@ export function registerWorkflowLibraryTools(server: McpServer): void {
         const mermaid = generateOverview(workflow, sections, { direction: "TB" });
         content.push({ type: "text", text: `\`\`\`mermaid\n${mermaid}\n\`\`\`` });
         return { content };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
+}
+
+/**
+ * `get_workflow (action:"from_image")` — the body of the retired PNG-metadata
+ * extraction tool, verbatim. It moved out of image-management.ts
+ * because the ANSWER is a workflow, not an image: the caller is reverse-
+ * engineering a graph, and every other way to reach one is an action here.
+ */
+async function workflowFromImageAction(imagePath: string): Promise<TextResult> {
+  const result = await extractWorkflowFromImage(imagePath);
+  const sections: string[] = [];
+  if (result.prompt) {
+    sections.push(
+      "## API Format (prompt)\n\nThis is the executable workflow format:\n```json\n" +
+        JSON.stringify(result.prompt, null, 2) +
+        "\n```",
+    );
+  }
+  if (result.workflow) {
+    sections.push(
+      "## UI Format (workflow)\n\nThis is the ComfyUI web UI format with layout data:\n```json\n" +
+        JSON.stringify(result.workflow, null, 2) +
+        "\n```",
+    );
+  }
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: `# Workflow extracted from ${imagePath}\n\n${sections.join("\n\n")}`,
+      },
+    ],
+  };
 }

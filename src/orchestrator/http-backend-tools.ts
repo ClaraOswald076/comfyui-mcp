@@ -21,6 +21,20 @@ import type { ToolMode } from "../transport/cli.js";
  *
  * An explicit `COMFYUI_MCP_TOOL_MODE=full` in the orchestrator env opts back into
  * the full surface (accepting the panel_* crowd-out) for a user who wants it.
+ *
+ * SINCE 0.50.0 THIS DELIBERATELY DIVERGES FROM THE TOP-LEVEL DEFAULT. The flip
+ * made `full` the default for the MCP server itself, because consolidation took
+ * the core surface from 154 names to 37. This lane keeps COMPACT anyway: the
+ * argument here was never only about the core count, it is that this connection
+ * also carries ~91 `panel_*` tools, and the budget they share is what gets
+ * crowded. 37 + 91 is a much better position than 154 + 91, but it is still the
+ * fullest surface any single connection in this system advertises, and the
+ * backends on this path are the non-Claude ones with the least room.
+ *
+ * The divergence is safe because cli.ts exports COMFYUI_MCP_TOOL_MODE only when
+ * the user chose a mode EXPLICITLY — a defaulted `full` upstream leaves the env
+ * unset, so this function still sees "nothing chosen" and answers compact.
+ * Revisit if the panel surface shrinks (phase 6 `canvas_*`).
  */
 export function resolveHttpLaneComfyToolMode(
   env: NodeJS.ProcessEnv = process.env,

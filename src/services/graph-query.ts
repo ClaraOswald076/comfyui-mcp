@@ -1,7 +1,7 @@
 // Pure query engine over an API-format graph — the flat {id: {class_type,
 // inputs, _meta}} shape every mutation tool consumes (issue #169).
 //
-// Fills the "missing middle" between analyze_workflow's fixed summary and
+// Fills the "missing middle" between get_workflow (action:"analyze")'s fixed summary and
 // get_workflow's full JSON dump: on big graphs (100+ nodes) an agent needs
 // "the KSamplers with cfg>7", "what feeds node 42", "count nodes by type" —
 // not a context-flooding dump and not an unfilterable outline. Output is
@@ -14,7 +14,7 @@
 const PREDICATE_RE = /^\s*([A-Za-z0-9_.]+)\s*(>=|<=|!=|=|>|<|~)\s*(.*?)\s*$/;
 
 // #809: the REAL clamps, exported so the remedy strings below and the zod schema on
-// query_workflow (src/tools/workflow-library.ts) are derived from ONE number. A hint
+// get_workflow's query action (src/tools/workflow-library.ts) are derived from ONE number. A hint
 // that names a ceiling the runtime does not actually enforce is the same class of
 // defect as a hint that names the wrong parameter — it sends the caller at a value
 // that gets silently clamped, which reads to the caller as "the tool can't do this".
@@ -494,7 +494,7 @@ export function queryApiGraph(graph: ApiGraph, opts: GraphQueryOptions = {}): Gr
       const followUpText = (param: string, count: number) => {
         const need = count + 1; // the traversal returns the seed PLUS its neighbours
         const call = `\`${param}\`:${id}, \`depth\`:1, \`limit\`:${Math.min(LIMIT_CEILING, need)}, \`fields\`:"ids"`;
-        // Above the ceiling a single call CANNOT return them all, and query_workflow has
+        // Above the ceiling a single call CANNOT return them all, and the query action has
         // no cursor/offset — so "page through them" would be a second false promise
         // inside the remedy for the first one (codex gate). Say what is actually true.
         return need <= LIMIT_CEILING

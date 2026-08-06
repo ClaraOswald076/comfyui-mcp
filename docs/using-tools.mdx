@@ -22,11 +22,11 @@ A **tool** is a specific, named action we hand the model so it can actually reac
 
 | You say | It quietly runs |
 | --- | --- |
-| "What have I got saved?" | `list_workflows` |
-| "Open the portrait one and tell me what it does" | `list_workflows`, then `analyze_workflow` |
-| "Make me a red fox in the snow" | `generate_image` |
+| "What have I got saved?" | `get_workflow` with `action: "list"` |
+| "Open the portrait one and tell me what it does" | `get_workflow` with `action: "list"`, then `action: "analyze"` |
+| "Make me a red fox in the snow" | `generate_image` (the `image` job) |
 | "Is it done yet?" | `queue` (the `list` job) |
-| "That failed and I don't understand why" | `diagnose_run` |
+| "That failed and I don't understand why" | `get_history` (the `diagnose` job) |
 | "Half the nodes are red" | `list_packs` (the `install_deps` job) |
 | "I'm out of disk space, what's big?" | `list_local_models` |
 
@@ -34,7 +34,7 @@ Notice the second row: one sentence, two tools, in an order you did not have to 
 
 <Tip>
   You can be as vague as you like. "Something's broken" is a perfectly good
-  opening — the agent will start with `health_check` and narrow down. Being
+  opening — the agent will start with `get_system_stats (action:"health")` and narrow down. Being
   specific gets you there faster, but it is never required.
 </Tip>
 
@@ -125,6 +125,9 @@ What actually happened is that related tools were **merged**, not deleted:
 | `get_queue` | `queue` with `action: "list"` |
 | `apps_run_status` | `apps` with `action: "run_status"` |
 | `install_workflow_dependencies` | `list_packs` with `action: "install_deps"` |
+| `list_workflows` | `get_workflow` with `action: "list"` |
+| `analyze_workflow` | `get_workflow` with `action: "analyze"` |
+| `validate_workflow` | `create_workflow` with `action: "validate"` |
 
 Same code underneath, same behaviour, same answers. Only the label on the front changed.
 
@@ -185,7 +188,7 @@ The agent is meant to read its own note and retry by itself. When it doesn't, yo
 
 ### Where the walls are
 
-These are the numbers for the two tools that read a graph on a budget — `panel_query_graph` (the live canvas) and `query_workflow` (a saved file):
+These are the numbers for the two tools that read a graph on a budget — `panel_query_graph` (the live canvas) and `get_workflow` with `action: "query"` (a saved file):
 
 | Argument | Default | Most you can ask for |
 | --- | --- | --- |
@@ -235,7 +238,7 @@ The fix is three steps, and **the third is the one people skip**:
 
 <Steps>
   <Step title="Update the panel">
-    Ask the agent to update it (`install_panel` with `action: "update"`), or do it
+    Ask the agent to update it (`install_comfyui(action:'panel')` with `action: "update"`), or do it
     from ComfyUI-Manager, where it is listed as `comfyui-agent-panel`.
   </Step>
   <Step title="Restart ComfyUI">
@@ -292,11 +295,15 @@ Ask the agent, in plain words:
   <Step title="Ask what it can see">
     > What tools do you have from comfyui-mcp? Just list the names.
 
-    **Three names** — `list_tools`, `describe_tool`, `call_tool` — is normal and
-    healthy. That is [compact mode](#if-you-run-a-small-local-model), the default:
-    the rest of the catalogue is one `list_tools` call away, so ask it to run that
-    and you will see the real list. A long list is equally fine; that is the same
-    surface with nothing held back.
+    A list of a few dozen names is normal and healthy — that is the direct
+    surface, which has been the default since 0.50.0.
+
+    **Three names** — `list_tools`, `describe_tool`, `call_tool` — is *also*
+    normal and healthy. That is [compact mode](#if-you-run-a-small-local-model),
+    which you get by passing `--compact`, and which small local models still
+    select automatically. The rest of the catalogue is one `list_tools` call
+    away, so ask it to run that and you will see the real list. Neither answer
+    means anything is held back.
 
     **No names at all**, or "I don't have any tools for ComfyUI", rules out the
     third case and nothing else. It does **not** mean absent. A permission policy
