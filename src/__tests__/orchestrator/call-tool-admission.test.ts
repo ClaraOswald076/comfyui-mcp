@@ -544,11 +544,13 @@ describe("call_tool admission", () => {
       );
     });
 
-    it("the retired standalone names are gone from the whitelist too", () => {
-      // Belt and braces: the fold removed list_output_images from the name
-      // whitelist, so a client still sending the old name is refused by NAME
-      // (and the #659 retired-name message tells it what to call instead)
-      // rather than silently admitted by a stale entry.
+    it("every retired image/asset name is answered from the LEDGER, not as unpermitted", () => {
+      // The fold removed the output listing from the name whitelist, so a client
+      // still sending an old name must not be silently admitted by a stale entry.
+      // What it gets back is the RETIREMENT, not a permission refusal (#911): the
+      // name no longer exists, and "not permitted" would send a developer hunting
+      // for a token or a trust boundary. This matters most for the two names the
+      // whitelist DID carry — a mobile client browsing outputs hits them first.
       for (const name of [
         "list_output_images",
         "view_image",
@@ -561,10 +563,19 @@ describe("call_tool admission", () => {
         "upload_audio",
         "upload_output",
       ]) {
-        expect(callToolAdmission(name, { action: "x" }), name).toBe(
-          `tool "${name}" is not permitted`,
-        );
+        const answer = callToolAdmission(name, { action: "x" });
+        expect(answer, name).toBe(retiredToolMessage(name));
+        // Asserted against the wording too, not only against the ledger helper:
+        // an equality with retiredToolMessage() alone would still pass if both
+        // sides degraded together.
+        expect(answer, name).toContain(`Unknown tool '${name}'`);
+        expect(answer, name).toContain("removed in 0.50.0");
+        expect(answer, name).not.toContain("is not permitted");
       }
+      // …and the two SURVIVORS are not answered as retired — a fold that
+      // accidentally declared its own survivor dead would take the whole name out.
+      expect(retiredToolMessage("get_image")).toBeUndefined();
+      expect(retiredToolMessage("upload_image")).toBeUndefined();
     });
   });
 
