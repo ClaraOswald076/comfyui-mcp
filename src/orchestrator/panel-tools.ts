@@ -4316,6 +4316,12 @@ export function makePanelToolCtx(
   };
 
   const ensureReachable = (): void => {
+    // #884 P0 — a SCOPE-bound ctx is never rebound onto a real tab id: its
+    // routing is the turn-target pin (or active-tab fallback), and when the
+    // pinned tab is gone the resolution THROWS loudly by design. Silently
+    // picking another tab here would be exactly the mid-turn re-target the pin
+    // forbids — and it would PERMANENTLY unbind this shared ctx.
+    if (isScopeAddress(ctx.tabId)) return;
     if (typeof bridge.canReach !== "function") return; // lightweight test ctx
     if (bridge.canReach(ctx.tabId)) return; // healthy binding — leave untouched
     if (workflowTargets?.get(ctx.tabId)?.mode === "pinned") return; // stay strict
@@ -4644,6 +4650,11 @@ export function makePanelToolCtx(
   // active tab can't be picked.
   const rebindToActiveTab = (): { previous: string; current: string; rebound: boolean } => {
     const previous = ctx.tabId;
+    // #884 P0 — a SCOPE-bound ctx needs no rebind and must never be pinned to a
+    // real tab id (that would permanently narrow the shared conversation's
+    // routing to one tab). Routing recovers by itself: the dead-pin state ends
+    // with the turn, and the next message re-pins fresh.
+    if (isScopeAddress(previous)) return { previous, current: previous, rebound: false };
     // A healthy binding is left untouched (never disturb a live session). Recovery only
     // fires for an orphaned/stale tab id.
     if (bridge.canReach(previous)) return { previous, current: previous, rebound: false };
