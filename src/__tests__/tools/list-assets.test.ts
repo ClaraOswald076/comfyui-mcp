@@ -151,7 +151,7 @@ describe('get_image action:"list_assets" (#751)', () => {
     expect(asset.asset_id).toMatch(/^a_[0-9a-f]{8}$/);
     expect(asset.url).toContain("type=output");
     // The reconciled asset is genuinely registered — get_image (action:"view")
-    // / regenerate can resolve it by id afterwards.
+    // and generate_image (action:"regenerate") can resolve it by id afterwards.
     expect(AssetRegistry.get(asset.asset_id)).toBeDefined();
   });
 

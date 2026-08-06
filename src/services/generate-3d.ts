@@ -10,7 +10,8 @@ import {
 import { ValidationError } from "../utils/errors.js";
 
 /**
- * generate_3d — produce a 3D model (glb/obj/fbx/ply) from a text prompt or an
+ * generate_image (action:"3d") — produce a 3D model (glb/obj/fbx/ply) from a
+ * text prompt or an
  * input image.
  *
  * PATH CHOSEN (investigated 2026-07-24): current ComfyUI ships hosted partner
@@ -191,7 +192,7 @@ function pickCandidate(
 function noBackendError(mode: Generate3dMode): ValidationError {
   return new ValidationError(
     `No 3D-capable API/partner nodes for ${mode}-to-3D were found on the connected ComfyUI, ` +
-      `so generate_3d has no backend to run on. Recent ComfyUI builds ship hosted 3D partner nodes ` +
+      `so 3D generation has no backend to run on. Recent ComfyUI builds ship hosted 3D partner nodes ` +
       `in core (Tripo, Meshy, Rodin, Hunyuan3D — categories like "partner/3d/..."); they may be ` +
       `missing because the ComfyUI build is old or API nodes are disabled (--disable-api-nodes). ` +
       `Fixes: (1) update ComfyUI (update_comfyui) and remove --disable-api-nodes, then retry; or ` +

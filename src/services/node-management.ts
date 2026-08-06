@@ -2071,7 +2071,7 @@ export interface InstallOptions {
  * Installing/updating/reinstalling/repairing a pack changes which node classes
  * this ComfyUI can register, so the orchestrator's memoized /object_info snapshot
  * (getObjectInfo) is now stale — create_workflow's validate and node_info
- * actions, and diagnose_run,
+ * actions, and get_history (action:"diagnose"),
  * would keep reporting the just-installed types as `missing_node_type` in their
  * top-level summaries until some later reboot bumped the epoch (#444, the residual
  * of the #235/#247/#352/#364 staleness cluster). Drop the cache the moment a

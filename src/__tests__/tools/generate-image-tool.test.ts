@@ -68,7 +68,7 @@ describe("generate_image checkpoint auto-select (#892)", () => {
       capability: "capable",
       skippedIncapable: ["ltx_video.safetensors"],
     });
-    const res = await getHandler()({ prompt: "a red apple" });
+    const res = await getHandler()({ action: "image", prompt: "a red apple" });
     expect(res.isError).toBeFalsy();
     expect(selectMock).toHaveBeenCalledOnce();
     expect(ckptName(enqueuedWorkflow())).toBe("good.safetensors");
@@ -82,7 +82,7 @@ describe("generate_image checkpoint auto-select (#892)", () => {
       { name: "b_wan.safetensors" },
     ]);
     selectMock.mockResolvedValue(null);
-    const res = await getHandler()({ prompt: "a red apple" });
+    const res = await getHandler()({ action: "image", prompt: "a red apple" });
     expect(res.isError).toBe(true);
     const text = res.content[0].text;
     expect(text).toMatch(/none appears txt2img-capable/i);
@@ -97,7 +97,7 @@ describe("generate_image checkpoint auto-select (#892)", () => {
 
   it("keeps the generic 'no checkpoint' error when the listing fails", async () => {
     listLocalModelsMock.mockRejectedValue(new Error("connection refused"));
-    const res = await getHandler()({ prompt: "a red apple" });
+    const res = await getHandler()({ action: "image", prompt: "a red apple" });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/No checkpoint/i);
     expect(enqueueWorkflowMock).not.toHaveBeenCalled();
@@ -105,6 +105,7 @@ describe("generate_image checkpoint auto-select (#892)", () => {
 
   it("does not consult the listing when a checkpoint is passed explicitly", async () => {
     const res = await getHandler()({
+      action: "image",
       prompt: "a red apple",
       checkpoint: "explicit.safetensors",
     });
@@ -116,7 +117,7 @@ describe("generate_image checkpoint auto-select (#892)", () => {
 
 describe("generate_image seed handling (#865)", () => {
   it("passes the caller's seed through and shields it from re-randomization", async () => {
-    const res = await getHandler()({ prompt: "p", checkpoint: "x.safetensors", seed: 12345 });
+    const res = await getHandler()({ action: "image", prompt: "p", checkpoint: "x.safetensors", seed: 12345 });
     expect(res.isError).toBeFalsy();
     const wf = enqueuedWorkflow();
     const sampler = Object.values(wf).find((n) => n.class_type === "KSampler");
@@ -132,7 +133,7 @@ describe("generate_image seed handling (#865)", () => {
     // assertion were only "is a number".
     const spy = vi.spyOn(Math, "random").mockReturnValue(0.5);
     try {
-      const res = await getHandler()({ prompt: "p", checkpoint: "x.safetensors" });
+      const res = await getHandler()({ action: "image", prompt: "p", checkpoint: "x.safetensors" });
       expect(res.isError).toBeFalsy();
       const sampler = Object.values(enqueuedWorkflow()).find(
         (n) => n.class_type === "KSampler",

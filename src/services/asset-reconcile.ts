@@ -15,7 +15,8 @@ import { logger } from "../utils/logger.js";
  * so its outputs never registered and get_image (action:"list_assets") read as empty even though
  * get_history showed them. Reconciling on demand closes that gap: outputs that
  * really exist in history are registered with source "history-reconcile",
- * with the prompt's recorded graph as the workflow snapshot (so regenerate /
+ * with the prompt's recorded graph as the workflow snapshot (so
+ * generate_image (action:"regenerate") /
  * get_image (action:"asset_metadata") keep working) and the run's real completion time as
  * createdAt (so ordering, `since` filters, and TTL expiry stay truthful).
  *
@@ -74,7 +75,8 @@ export async function reconcileAssetsFromHistory(opts: {
     // URL building.
     const notification = buildCompletionNotification(promptId, entry, now());
     if (notification.outputs.length === 0) continue;
-    // The recorded graph is the provenance regenerate / get_image (action:"asset_metadata")
+    // The recorded graph is the provenance generate_image (action:"regenerate") /
+    // get_image (action:"asset_metadata")
     // rely on; without it there is nothing truthful to register.
     const workflow = extractWorkflowGraph(entry);
     if (!workflow) continue;

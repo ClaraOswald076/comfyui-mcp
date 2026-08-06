@@ -130,7 +130,7 @@ SetLatentNoiseMask (samples, mask) → LATENT → KSampler.latent_image
 ### Quick Generation
 
 1. `create_workflow` with template `"txt2img"` and your params
-2. `enqueue_workflow` with the returned JSON — returns `prompt_id` immediately
+2. `enqueue_workflow(action="enqueue")` with the returned JSON — returns `prompt_id` immediately
 3. Poll `queue` (action:"status") with the `prompt_id` until `done` is true
 4. Use `get_image (action:"list_outputs")` (limit 1) to find the generated image, then `Read` to display it
 
@@ -194,7 +194,7 @@ The script connects to ComfyUI's WebSocket and reports:
 - Errors with node details and messages
 
 **Standard generation pattern:**
-1. `create_workflow` or build workflow JSON + `enqueue_workflow` (repeat for batch)
+1. `create_workflow` or build workflow JSON + `enqueue_workflow(action="enqueue")` (repeat for batch)
 2. Start background monitor with all prompt_ids
 3. Continue conversation — results appear when jobs finish
 4. Use `get_image (action:"list_outputs")` or `Read` to display the generated images

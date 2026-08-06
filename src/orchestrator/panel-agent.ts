@@ -63,12 +63,12 @@ function runIdentityPreamble(ev: { prompt_id?: string; run_correlation?: string 
     case "foreign":
       return (
         `This run (prompt ${pid}) does NOT match any run you queued with panel_run — its origin is UNDETERMINED. ` +
-        `Do NOT treat it as the render you are waiting on; if you are still waiting on your own run, verify it with get_history before acting. `
+        `Do NOT treat it as the render you are waiting on; if you are still waiting on your own run, verify it with get_history (action:"list") before acting. `
       );
     case "unidentified":
       return (
         `The panel reported NO prompt id for this run, so it CANNOT be correlated to the render you queued — its origin is UNDETERMINED. ` +
-        `Do NOT assume it is your run; verify yours with get_history before acting on it. `
+        `Do NOT assume it is your run; verify yours with get_history (action:"list") before acting on it. `
       );
     default:
       return pid ? `(prompt ${pid}) ` : ``;
@@ -663,13 +663,13 @@ export class PanelAgent {
         // An eviction dropped older completions for this tab — say so rather than
         // let them disappear (#468). The agent must treat those runs as unknown.
         (typeof ev.dropped_completions === "number" && ev.dropped_completions > 0
-          ? `⚠️ ${ev.dropped_completions} EARLIER completion(s) for this tab could not be delivered and were dropped — treat the outcome of those runs as UNDETERMINED and check get_history if you were waiting on one. `
+          ? `⚠️ ${ev.dropped_completions} EARLIER completion(s) for this tab could not be delivered and were dropped — treat the outcome of those runs as UNDETERMINED and check get_history (action:"list") if you were waiting on one. `
           : ``) +
         // An id-less completion whose content matches one already reported. We
         // will NOT swallow it (identical content is not proof of identity, and a
         // swallowed render is a silent loss), so hand the judgement to the agent.
         (ev.possible_repeat
-          ? `⚠️ POSSIBLE REPEAT: a completion with identical outputs was already reported to you recently, and this one carries no prompt id to tell them apart. It may be the same event re-sent, or a second render that produced identical filenames — do NOT count it twice without checking (get_history). `
+          ? `⚠️ POSSIBLE REPEAT: a completion with identical outputs was already reported to you recently, and this one carries no prompt id to tell them apart. It may be the same event re-sent, or a second render that produced identical filenames — do NOT count it twice without checking with get_history (action:"list"). `
           : ``) +
         runIdentityPreamble(ev) +
         (note

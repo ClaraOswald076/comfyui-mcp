@@ -6555,7 +6555,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // promise we can't keep. Say so and point at the verification path instead.
         const note = correlatable
           ? "\n\n[IMPORTANT] You will be notified automatically with the output image(s)/video when the render finishes — do NOT poll queue (action:\"list\"), get_history, or get_image (action:\"list_outputs\"). Just end your turn now and wait for the result to be delivered to you."
-          : "\n\n[IMPORTANT] The run was queued, but the panel reported NO prompt id for it, so a completion event CANNOT be correlated back to this run — its outcome will be reported to you as UNDETERMINED. Do NOT simply idle and wait indefinitely: end your turn, and if nothing arrives, confirm the outcome with get_history before acting on it.";
+          : "\n\n[IMPORTANT] The run was queued, but the panel reported NO prompt id for it, so a completion event CANNOT be correlated back to this run — its outcome will be reported to you as UNDETERMINED. Do NOT simply idle and wait indefinitely: end your turn, and if nothing arrives, confirm the outcome with get_history (action:\"list\") before acting on it.";
         // Backpressure note. A backlog is only alarming when it's a job we did NOT
         // queue (possibly foreign/stuck). Deliberately batching renders — a sweep,
         // a multi-variant comparison — is a NORMAL workflow, so a queue made of our

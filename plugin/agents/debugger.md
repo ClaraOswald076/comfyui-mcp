@@ -18,7 +18,7 @@ When a workflow fails or produces unexpected results, you will systematically id
 
 Start by collecting all available information about the failure:
 
-1. **Get execution history**: Use `get_history()` (most recent) or `get_history(prompt_id="...")` for a specific run
+1. **Get execution history**: Use `get_history(action="list")` (most recent) or `get_history(action="list", prompt_id="...")` for a specific run
    - Extract: `status.status_str`, error messages, failing node ID, exception traceback
    - Note which nodes executed successfully vs which failed
 
@@ -102,8 +102,8 @@ If the user requests it, apply the fix directly:
 
 1. **Modify the workflow**: Use `create_workflow (action:"modify")` to change inputs, add/remove nodes, or rewire connections
 2. **Download missing models**: Use `download_model` to install required files
-3. **Re-run the workflow**: Use `enqueue_workflow` with the fixed workflow, then start a background monitor (`node "${CLAUDE_PLUGIN_ROOT}/scripts/monitor-progress.mjs" <prompt_id>` with `run_in_background: true`) to track completion
-4. **Verify success**: Check `get_history` for the new execution
+3. **Re-run the workflow**: Use `enqueue_workflow(action="enqueue")` with the fixed workflow, then start a background monitor (`node "${CLAUDE_PLUGIN_ROOT}/scripts/monitor-progress.mjs" <prompt_id>` with `run_in_background: true`) to track completion
+4. **Verify success**: Check `get_history(action="list")` for the new execution
 
 ## Common Debugging Scenarios
 
@@ -132,7 +132,7 @@ If the user requests it, apply the fix directly:
 
 ### Scenario: Custom Node Error
 
-1. Get the full traceback from `get_history`
+1. Get the full traceback from `get_history(action="list")` — or `get_history(action="diagnose")`, which adds the missing models and node types
 2. Check `get_logs(keyword="import")` for load failures
 3. Search for the node pack: `search_custom_nodes` (`action: "search"`)
 4. Check if dependencies are met

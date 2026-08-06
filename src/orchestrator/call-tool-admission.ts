@@ -53,6 +53,17 @@ export const CALL_TOOL_WHITELIST = new Set<string>([
   // CivitAI download, the URL download, and the app-panel's missing-model
   // resolver) and nothing else.
   "download_model",
+  // Queue a render the user explicitly tapped. 0.50.0 slice 16 folded FOUR more
+  // enqueue entry points into this name — re-run from history, run-from-URL,
+  // template-schema and template-run — and NOT ONE of their standalone names
+  // was whitelisted here.
+  // The dispatcher authorizes by tool NAME and then forwards arbitrary action
+  // arguments, so leaving this entry unscoped would silently admit all four, and
+  // action:"run_url" in particular FETCHES A WORKFLOW FROM AN ARBITRARY URL AND
+  // EXECUTES IT. A confirmation-less mirrored/foreign tab must not be able to do
+  // that, so this name is ACTION-scoped below to exactly ["enqueue"] — the
+  // ground its pre-fold entry actually covered. See
+  // CALL_TOOL_ACTION_WHITELIST.
   "enqueue_workflow",
   // Persist a workflow to the ComfyUI library (mobile "pull workflow from a
   // CivitAI example" → save_workflow). Writes a workflow file (auto-converts
@@ -77,7 +88,18 @@ export const CALL_TOOL_WHITELIST = new Set<string>([
   // live canvas state (panel_get_errors); a phone has no canvas, so it reads
   // the same story server-side from history + re-validating the graph that ran.
   // Read-only.
-  "diagnose_run",
+  //
+  // 0.50.0 slice 16 retired that standalone diagnosis name into `get_history`
+  // (action:"diagnose"), and `get_history` was NOT on this whitelist — so the
+  // fold cuts the OTHER way from enqueue_workflow above. Doing nothing would
+  // have left the panel calling a name that no longer exists, admission
+  // refusing the name that replaced it, and the feature breaking with a FALSE
+  // REFUSAL — a regression no vocabulary gate can see, because it hunts prose,
+  // not allowlist entries. The name is therefore ADDED here and ACTION-scoped
+  // below to exactly ["diagnose"], which is precisely the capability the
+  // retired entry admitted: list/stats/suggest were never reachable from this
+  // channel and still are not.
+  "get_history",
   // The training surface for the panel/mobile Training tab: flow/model
   // discovery, progress polling, dataset curation, job introspection and
   // cleanup, plus the user-initiated ops (stage a dataset, launch a run, cancel
@@ -338,6 +360,28 @@ export const CALL_TOOL_ACTION_WHITELIST: ReadonlyMap<string, ReadonlySet<string>
   // consolidation. Add actions here deliberately, with a reason, if that decision
   // is ever made.
   ["get_image", new Set(["get", "list_outputs"])],
+  // The `enqueue_workflow` entry above absorbed four MORE entry points in
+  // 0.50.0 slice 16, and NOT ONE of their standalone names appeared on this
+  // whitelist. Only the bare submit-this-graph capability was ever admitted, so
+  // that is all this scope permits.
+  //
+  // action:"run_url" is the reason this is not a formality. It fetches a
+  // workflow from a URL THE CALLER CHOOSES and, with run:true, executes it —
+  // arbitrary graph execution on the user's GPU, from a channel that requires
+  // no agent turn and shows no confirmation. Admitting it because the name it
+  // now shares happened to be whitelisted would be the single widest
+  // broadening in the consolidation. (The fetch's own SSRF guard bounds WHERE
+  // it can reach; it says nothing about WHO may ask.)
+  //
+  // The other three are refused for the ordinary reason: their standalone names
+  // were never on this list, so nothing regresses by keeping them off it.
+  ["enqueue_workflow", new Set(["enqueue"])],
+  // The `get_history` entry above is NEW in 0.50.0 slice 16, added to replace
+  // the retired standalone diagnosis entry rather than to grant anything: scoped
+  // to action:"diagnose" it admits exactly what that entry admitted, and no more.
+  // list/stats/suggest stay refused — they were not reachable from this channel
+  // before the fold, and a canvas-less client that needs them can ask an agent.
+  ["get_history", new Set(["diagnose"])],
 ]);
 
 /**

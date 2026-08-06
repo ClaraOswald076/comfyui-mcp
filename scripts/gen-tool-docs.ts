@@ -77,15 +77,9 @@ const CATEGORIES: Array<{
     group: "Image & Audio Generation",
     slug: "image-generation",
     icon: "image",
-    description: "High-level text-to-image and text-to-audio generation, plus conditioned image variants.",
+    description: "High-level text-to-image, audio, video and 3D generation, conditioned image variants, and the two post-processing passes — all nine actions of one tool since 0.50.0 slice 16.",
     tools: [
       "generate_image",
-      "generate_with_controlnet",
-      "generate_with_ip_adapter",
-      "regenerate",
-      "generate_audio",
-      "generate_video",
-      "generate_3d",
     ],
   },
   {
@@ -94,11 +88,11 @@ const CATEGORIES: Array<{
     icon: "play",
     description: "Enqueue workflows — one at a time, from a named template, or as a batch — and inspect the queue, jobs, history, and system stats.",
     tools: [
-      "enqueue_workflow", "rerun_generation", "get_system_stats", "queue", "get_history", "get_logs",
-      "health_check", "calculate", "diagnose_run",
-      // Template execution: run_template is an enqueue entrypoint, and
-      // get_template_schema is the lookup you make first to fill its overrides.
-      "get_template_schema", "run_template",
+      // 0.50.0 slice 16 folded the re-run, run-from-URL and template
+      // entrypoints into `enqueue_workflow`, and the diagnosis + local
+      // settings-history views into `get_history`.
+      "enqueue_workflow", "get_system_stats", "queue", "get_history", "get_logs",
+      "health_check", "calculate",
       // Batch execution: submit many prompts under one batch_id, then poll/await it.
       "batch",
     ],
@@ -119,7 +113,7 @@ const CATEGORIES: Array<{
     slug: "workflow-library",
     icon: "folder-open",
     description: "Save, load, strip/slice, analyze, and extract workflows.",
-    tools: ["get_workflow", "save_workflow", "run_workflow_url"],
+    tools: ["get_workflow", "save_workflow"],
   },
   {
     group: "Assets & Images",
@@ -132,7 +126,6 @@ const CATEGORIES: Array<{
       // measure and the asset-registry reads) and `upload_image` the write half
       // (image, video, audio, stage, output).
       "get_image", "upload_image",
-      "remove_background", "upscale_image",
     ],
   },
   {
@@ -191,10 +184,9 @@ const CATEGORIES: Array<{
     group: "Defaults, Stats & Skills",
     slug: "defaults-stats-skills",
     icon: "sliders",
-    description: "Generation defaults, ComfyUI frontend UI settings, history-based suggestions, and skill generation.",
+    description: "Generation defaults, ComfyUI frontend UI settings, and skill generation. (History-based suggestions and stats moved onto get_history in 0.50.0 slice 16.)",
     tools: [
       "get_defaults",
-      "suggest_settings", "generation_stats",
     ],
   },
   {
