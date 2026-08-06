@@ -8,7 +8,7 @@
 // the write, including the empty-redirect fold that made #866's NUL sentinel
 // silently harmless.
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
@@ -141,5 +141,23 @@ describe("empty redirect is not 'use the default' (#866)", () => {
   it("panelLockPath fails loudly on an explicitly-empty override", () => {
     process.env.COMFYUI_MCP_PANEL_LOCK = "";
     expect(() => panelLockPath()).toThrow(/COMFYUI_MCP_PANEL_LOCK is set but EMPTY/);
+  });
+});
+
+// This one is LAST in the file on purpose: replaying the setup module moves
+// HOME to yet another temp dir, and nothing after it should depend on which
+// throwaway home is current.
+describe("worker reuse (codex gate round 1)", () => {
+  it("a second setup pass in the same worker does NOT re-record the redirected home as real", async () => {
+    const recorded = realHomeRecordedForTestIsolation();
+    expect(recorded).toBeDefined();
+    // setupFiles re-run for EVERY test file a reused worker executes, and by
+    // the second run HOME already points at the throwaway home created for
+    // the first. Re-importing the setup module replays that exact situation:
+    // if the recording moved to the temp home, every write-guard in this
+    // worker would from then on compare against the wrong directory.
+    vi.resetModules();
+    await import("../helpers/isolated-test-home.js");
+    expect(realHomeRecordedForTestIsolation()).toBe(recorded);
   });
 });

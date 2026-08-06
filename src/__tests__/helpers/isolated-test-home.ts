@@ -27,9 +27,20 @@
 import { mkdtempSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { recordRealHomeForTestIsolation } from "../../services/test-isolation-guard.js";
+import {
+  realHomeRecordedForTestIsolation,
+  recordRealHomeForTestIsolation,
+} from "../../services/test-isolation-guard.js";
 
-const realHome = homedir();
+// Record the real home ONCE per worker process. setupFiles re-run for EVERY
+// test file a reused worker executes, and by the second run HOME already
+// points at the throwaway home created for the first file — an unconditional
+// record would overwrite the real home with a temp one, and the write-guards
+// would then compare against the wrong directory (codex gate, round 1).
+if (realHomeRecordedForTestIsolation() === undefined) {
+  recordRealHomeForTestIsolation(homedir());
+}
+
 const isolatedHome = mkdtempSync(join(tmpdir(), "comfyui-mcp-test-home-"));
 
 // Node's os.homedir() consults HOME on POSIX and USERPROFILE on Windows, at
@@ -38,5 +49,3 @@ const isolatedHome = mkdtempSync(join(tmpdir(), "comfyui-mcp-test-home-"));
 // `setupFiles` ordering guarantees.
 process.env.HOME = isolatedHome;
 process.env.USERPROFILE = isolatedHome;
-
-recordRealHomeForTestIsolation(realHome);
