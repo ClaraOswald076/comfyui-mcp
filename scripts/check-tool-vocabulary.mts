@@ -48,8 +48,10 @@ import {
   retirementBaseline,
   TOOL_NAMES,
   baselineIntegrity,
+  actionLiteralSpans,
   deadNameRe,
   panelBaselineIntegrity,
+  rotMentions,
   type DeadName,
 } from "../src/tools/vocabulary.js";
 import { buildPanelToolDefs } from "../src/orchestrator/panel-tools.js";
@@ -260,6 +262,8 @@ const hits: Hit[] = [];
 const splitHits: Array<{ path: string; line: number; text: string }> = [];
 /** `${name}\u0000${path}` → the lines it was seen on, to expire stale exceptions. */
 const seenIn = new Map<string, string[]>();
+/** Same key, for `implementedIn` paths that actually licensed an action literal. */
+const implementedUsed = new Set<string>();
 const seenKey = (name: string, path: string) => `${name}\u0000${path}`;
 
 for (const path of files) {
@@ -292,6 +296,25 @@ for (const path of files) {
     const re = deadNameRe(dead.name);
     for (const [i, text] of lines.entries()) {
       if (!re.test(text)) continue;
+      // A mention sitting inside a verbatim copy of this name's OWN declared
+      // replacement is the migration target, not rot — see rotMentions() in
+      // src/tools/vocabulary.ts for why that is principled rather than a loophole.
+      //
+      // Checked BEFORE `seenIn` on purpose: a replacement form is not a mention of
+      // the dead name for ANY purpose, staleness included. Recording it would let a
+      // file whose only remaining occurrences are legitimate replacement forms keep
+      // an obsolete `allowedIn` entry looking fresh — and a stale exception is a
+      // hole that opens later, which is the whole reason the expiry check exists.
+      //
+      // Also BEFORE `allowedIn`, and independent of it: this is the one new decision
+      // point, it needs no ledger entry (it is self-derived), and a line carrying
+      // BOTH an allowedIn-covered mention and a replacement form still fails the
+      // occurrence count below — fail-closed on the ambiguous case.
+      // `path` enables the `implementedIn` rule for this file — see rotMentions.
+      if (dead.implementedIn?.includes(path) && actionLiteralSpans(dead.name, text).length > 0) {
+        implementedUsed.add(seenKey(dead.name, path));
+      }
+      if (rotMentions(dead, text, path).length === 0) continue;
       const key = seenKey(dead.name, path);
       if (!seenIn.has(key)) seenIn.set(key, []);
       seenIn.get(key)!.push(text);
@@ -406,6 +429,29 @@ if (stale.length > 0) {
       "",
       "Delete the exception. Leaving it means a future reference to that file is",
       "pre-approved by an entry nobody re-reviewed.",
+    ].join("\n"),
+  );
+}
+
+// Same expiry rule for `implementedIn`, and for the same reason: a path that no
+// longer spells the name as a quoted action literal has stopped meaning anything,
+// and leaving it there pre-approves whatever lands in that file next. This is the
+// half of the exemption that is scoped by PATH rather than by syntax, so it is the
+// half that can rot.
+const staleImplemented = DEAD_NAMES.flatMap((d) =>
+  (d.implementedIn ?? [])
+    .filter((p) => !implementedUsed.has(seenKey(d.name, p)))
+    .map((p) => `  ${d.name} → ${p}`),
+);
+if (staleImplemented.length > 0) {
+  errors.push(
+    [
+      `${staleImplemented.length} stale implementedIn path(s) — no quoted action literal remains:`,
+      "",
+      ...staleImplemented,
+      "",
+      "Either the file no longer implements that action, or the path is wrong. Delete",
+      "it: an implementedIn path is an exception, and exceptions expire.",
     ].join("\n"),
   );
 }
