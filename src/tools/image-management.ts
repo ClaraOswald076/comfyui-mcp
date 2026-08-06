@@ -417,48 +417,10 @@ export function registerImageManagementTools(server: McpServer): void {
     },
   );
 
-  // ── workflow_from_image ───────────────────────────────────────────────────
-  server.tool(
-    "workflow_from_image",
-    "Extract embedded ComfyUI workflow metadata from a PNG file. " +
-      "ComfyUI stores the full workflow (API format) and prompt data in PNG tEXt chunks. " +
-      "Use this to reverse-engineer how any ComfyUI image was generated.",
-    {
-      image_path: z
-        .string()
-        .describe("Absolute path to a ComfyUI-generated PNG file"),
-    },
-    async (args) => {
-      try {
-        const result = await extractWorkflowFromImage(args.image_path);
-        const sections: string[] = [];
-        if (result.prompt) {
-          sections.push(
-            "## API Format (prompt)\n\nThis is the executable workflow format:\n```json\n" +
-              JSON.stringify(result.prompt, null, 2) +
-              "\n```",
-          );
-        }
-        if (result.workflow) {
-          sections.push(
-            "## UI Format (workflow)\n\nThis is the ComfyUI web UI format with layout data:\n```json\n" +
-              JSON.stringify(result.workflow, null, 2) +
-              "\n```",
-          );
-        }
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `# Workflow extracted from ${args.image_path}\n\n${sections.join("\n\n")}`,
-            },
-          ],
-        };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
+  // The retired PNG-workflow-metadata tool registered here; 0.50.0 slice 14
+  // folded it into get_workflow (action:"from_image"), where the other workflow
+  // reads live. The extractor itself is untouched in
+  // src/services/image-management.ts.
 
   // ── list_output_images ────────────────────────────────────────────────────
   server.tool(

@@ -6,6 +6,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ToolCatalog } from "../../tools/catalog.js";
 import { buildManifest, registerCompactTools, summarize } from "../../tools/compact.js";
 import { collectToolCatalog, registerFullTools } from "../../tools/index.js";
+import { TOOL_NAMES } from "../../tools/vocabulary.js";
 
 function textOf(result: { content?: Array<{ type: string; text?: string }> }): string {
   return (result.content ?? [])
@@ -551,7 +552,17 @@ describe("facade collision guard (#616 / codex P1)", () => {
 describe("collectToolCatalog (real tool surface)", () => {
   it("captures the full registered tool surface with schemas intact", async () => {
     const catalog = await collectToolCatalog();
-    expect(catalog.tools.size).toBeGreaterThanOrEqual(100);
+    // Bound to the ledger, not to a hardcoded floor. The literal 100 here was
+    // written when the surface was ~150 and it means "the catalog captured the
+    // REAL surface, not an empty or partial one" — but the 0.50.0 consolidation
+    // ratchets the surface DOWN past 100 on its way to the RFC's target of 32,
+    // so a fixed floor turns a correct retirement red. No single slice crosses
+    // it; the cumulative merge train does. TOOL_NAMES.length is the same
+    // assertion, stated as the invariant instead of as a number that rots — and
+    // it is strictly STRONGER, since a catalog that dropped a registered tool
+    // now fails where 100 would still have passed. `>=` rather than `===`
+    // because autoloaded workflow tools can add names on a dev box.
+    expect(catalog.tools.size).toBeGreaterThanOrEqual(TOOL_NAMES.length);
     for (const expected of ["generate_image", "health_check", "enqueue_workflow", "list_local_models"]) {
       expect(catalog.get(expected), `missing ${expected}`).toBeDefined();
       expect(catalog.get(expected)?.description.length).toBeGreaterThan(20);
