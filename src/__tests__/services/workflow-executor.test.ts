@@ -100,13 +100,28 @@ describe("seedInputRange", () => {
     ]);
   });
 
-  it("falls back when the declared bounds are incoherent (min > max)", () => {
+  it("returns null when the declared bounds are incoherent (min > max)", () => {
     const broken = {
       Weird: {
         input: { required: { seed: ["INT", { min: 100, max: 5 }] } },
       },
     } as unknown as ObjectInfo;
-    expect(seedInputRange(broken, "Weird", "seed")).toEqual([0, INT32_MAX]);
+    // No safely-drawable value exists inside the declared range; the int32
+    // fallback would be OUTSIDE it, so the range is refused, not substituted.
+    expect(seedInputRange(broken, "Weird", "seed")).toBeNull();
+  });
+
+  it("returns null when the declared minimum is above the safe draw ceiling", () => {
+    const huge = {
+      Huge: {
+        input: {
+          required: {
+            seed: ["INT", { min: 2 ** 60, max: 2 ** 64 - 1 }],
+          },
+        },
+      },
+    } as unknown as ObjectInfo;
+    expect(seedInputRange(huge, "Huge", "seed")).toBeNull();
   });
 
   it("honors a declared max wider than int32 (KSampler 2^64-1)", () => {
@@ -149,8 +164,26 @@ describe("enqueueWorkflow seed randomization (#865)", () => {
       "1": { class_type: "ClaudeNode", inputs: { seed: 1 } },
     });
     expect(result.prompt_id).toBe("pid-1");
+    // Exact fallback draw — proves the seed WAS re-randomized within the
+    // int32 range (seed 1 passing `<= INT32_MAX` alone would also pass if
+    // the failure path silently stopped randomizing).
     const seed = enqueuedWorkflow()["1"].inputs.seed as number;
-    expect(seed).toBeLessThanOrEqual(INT32_MAX);
+    expect(seed).toBe(Math.floor(0.9999999 * (INT32_MAX + 1)));
+  });
+
+  it("leaves the seed untouched when the declared range has no safe draw", async () => {
+    getObjectInfoMock.mockResolvedValue({
+      HugeMin: {
+        input: {
+          required: { seed: ["INT", { min: 2 ** 60, max: 2 ** 64 - 1 }] },
+        },
+      },
+    });
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    await enqueueWorkflow({
+      "1": { class_type: "HugeMin", inputs: { seed: 2 ** 60 } },
+    });
+    expect(enqueuedWorkflow()["1"].inputs.seed).toBe(2 ** 60);
   });
 
   it("draws within a wider declared range when the node allows it", async () => {
@@ -159,8 +192,10 @@ describe("enqueueWorkflow seed randomization (#865)", () => {
       "3": { class_type: "KSampler", inputs: { seed: 1 } },
     });
     const seed = enqueuedWorkflow()["3"].inputs.seed as number;
-    // 0 + floor(0.5 * 2**64) — above the int32 range the old code capped at.
-    expect(seed).toBeGreaterThan(INT32_MAX);
+    // Exact draw distinguishes the declared range (clamped to
+    // MAX_SAFE_INTEGER) from the old fixed 2**32 range: 0.5 * 2**32 would
+    // give 2**31, not 2**52.
+    expect(seed).toBe(0.5 * (Number.MAX_SAFE_INTEGER + 1));
   });
 
   it("leaves inputs named in preserve_seed_inputs exactly as supplied", async () => {

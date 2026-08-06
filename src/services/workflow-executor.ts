@@ -40,14 +40,18 @@ const FALLBACK_SEED_MAX = 2147483647; // 2^31 - 1
 /**
  * Declared `[min, max]` for one node's seed input, from the /object_info
  * snapshot. Falls back to the int32 range when the node or the input's bounds
- * are unknown, or when the declared bounds are incoherent (min > max, NaN) —
- * an unreadable observation is never treated as a definite range.
+ * are unknown — an unreadable observation is never treated as a definite
+ * range. Returns null when bounds ARE declared but no safely-drawable value
+ * exists inside them (incoherent min > max, or a minimum above
+ * MAX_SAFE_INTEGER): drawing the int32 fallback there would land OUTSIDE the
+ * declared range and fail validation — the very bug this fixes — so the
+ * caller's value must be left untouched instead.
  */
 export function seedInputRange(
   objectInfo: ObjectInfo | undefined,
   classType: string,
   inputName: string,
-): [number, number] {
+): [number, number] | null {
   const def = objectInfo?.[classType];
   const spec =
     def?.input?.required?.[inputName] ?? def?.input?.optional?.[inputName];
@@ -65,7 +69,7 @@ export function seedInputRange(
   // (KSampler declares 2^64-1) are inexact doubles, and a top-of-range draw
   // could round UP past the true maximum and fail validation.
   const max = Math.min(declaredMax ?? FALLBACK_SEED_MAX, Number.MAX_SAFE_INTEGER);
-  if (min > max) return [FALLBACK_SEED_MIN, FALLBACK_SEED_MAX];
+  if (min > max) return null;
   return [min, max];
 }
 
@@ -107,8 +111,11 @@ async function randomizeSeeds(
           key in node.inputs &&
           typeof node.inputs[key] === "number"
         ) {
-          const [min, max] = seedInputRange(objectInfo, node.class_type, key);
-          node.inputs[key] = drawSeed(min, max);
+          const range = seedInputRange(objectInfo, node.class_type, key);
+          // null: bounds are declared but hold no safely-drawable value —
+          // keep the caller's seed rather than draw out of range.
+          if (!range) continue;
+          node.inputs[key] = drawSeed(range[0], range[1]);
         }
       }
     }

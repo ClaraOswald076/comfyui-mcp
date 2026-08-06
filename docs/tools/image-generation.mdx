@@ -10,7 +10,7 @@ icon: "image"
 
 ## generate_image
 
-Generate an image from a text prompt — the high-level entry point. Builds a txt2img workflow, filling any unspecified parameter from your configured defaults (get_defaults (action:"set") / COMFYUI_DEFAULT_* / config file), auto-selecting a txt2img-capable local checkpoint when none is given (checkpoints without a text encoder, e.g. video models, are skipped). Returns the prompt_id immediately; the resulting asset_id arrives in the completion notification and can be passed to view_image or regenerate. For full control over the node graph, use create_workflow + enqueue_workflow instead.
+Generate an image from a text prompt — the high-level entry point. Builds a txt2img workflow, filling any unspecified parameter from your configured defaults (get_defaults (action:"set") / COMFYUI_DEFAULT_* / config file), auto-selecting a local checkpoint when none is given — checkpoints known to lack a text encoder (e.g. video models) are skipped. Returns the prompt_id immediately; the resulting asset_id arrives in the completion notification and can be passed to view_image or regenerate. For full control over the node graph, use create_workflow + enqueue_workflow instead.
 
 <Tip>**In plain terms:** The one-line way to get a picture. You do not need a workflow open, or any workflow at all — describe the image and this builds and runs a sensible graph for you. Everything except the prompt is optional and falls back to your saved defaults.</Tip>
 

@@ -35,9 +35,10 @@ async function resolveCheckpoint(): Promise<string | undefined> {
     `Found ${models.length} local checkpoint(s), but none appears txt2img-capable: ` +
       `every one lacks text-encoder weights in its safetensors header (a video or ` +
       `UNet-only model) or is a GGUF file CheckpointLoaderSimple cannot load ` +
-      `(${listed}${more}). Pass \`checkpoint\` explicitly to use one anyway, set a ` +
-      `default with get_defaults (action:"set"), or download an image checkpoint ` +
-      `with download_model.`,
+      `(${listed}${more}). Download an image checkpoint with download_model ` +
+      `(search_civitai_models can find one), then pass it as \`checkpoint\` or save ` +
+      `it with get_defaults (action:"set"). If you believe one was misdetected, ` +
+      `pass \`checkpoint\` explicitly to bypass this check.`,
   );
 }
 
@@ -46,8 +47,8 @@ export function registerGenerateImageTool(server: McpServer): void {
     "generate_image",
     "Generate an image from a text prompt — the high-level entry point. Builds a txt2img workflow, " +
       "filling any unspecified parameter from your configured defaults (get_defaults (action:\"set\") / COMFYUI_DEFAULT_* / config file), " +
-      "auto-selecting a txt2img-capable local checkpoint when none is given (checkpoints without a text " +
-      "encoder, e.g. video models, are skipped). Returns the prompt_id immediately; the resulting " +
+      "auto-selecting a local checkpoint when none is given — checkpoints known to lack a text encoder " +
+      "(e.g. video models) are skipped. Returns the prompt_id immediately; the resulting " +
       "asset_id arrives in the completion notification and can be passed to view_image or regenerate. " +
       "For full control over the node graph, use create_workflow + enqueue_workflow instead.",
     {
