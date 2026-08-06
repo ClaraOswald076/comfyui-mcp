@@ -48,6 +48,7 @@ import {
   MANAGED_SECRET_KEYS_ENV,
 } from "../env-file.js";
 import { logger } from "../utils/logger.js";
+import { runningUnderTestRunner } from "./test-isolation-guard.js";
 import { OPENAI_KEY_PROVIDERS, providerModelHint } from "./openai-provider-registry.js";
 
 interface PanelSecrets {
@@ -788,39 +789,11 @@ function assertPanelSecretsRedirectedInTests(): void {
   );
 }
 
-/**
- * Are we running INSIDE the test runner?
- *
- * The first version of this guard asked `NODE_ENV === "test" || VITEST ||
- * VITEST_WORKER_ID` — ordinary environment variables that any user can have set,
- * for reasons of their own, in the shell this app was launched from. A user with
- * a leftover `VITEST` export, or `NODE_ENV=test` from an adjacent project, was
- * then REFUSED when saving their own API key (codex gate). Refusing a real user
- * their credential is a worse outcome than the accidental store overwrite this
- * guard replaced, so the guard must key off something only the runner itself
- * produces.
- *
- * Vitest injects these into the global scope of every worker it runs. They are
- * not environment variables and there is no plausible way for a user's shell to
- * put them there. When none is present we do NOT know we are under a runner —
- * and in that uncertainty the write is ALLOWED, deliberately: the failure mode
- * we accept is "a rogue test slips past the runtime guard and is caught by the
- * static sweep instead", never "a real user cannot save a token".
- *
- * `scope` is a parameter so this can be tested for what it must NOT do. Some of
- * the runner's own globals are non-configurable, so a test cannot remove them to
- * check that the answer does not fall back to `VITEST` / `NODE_ENV`; passing a
- * bare object asks the question directly.
- */
-export function runningUnderTestRunner(
-  scope: Record<string, unknown> = globalThis as unknown as Record<string, unknown>,
-): boolean {
-  return (
-    "__vitest_worker__" in scope ||
-    "__vitest_index__" in scope ||
-    "__vitest_environment__" in scope
-  );
-}
+// `runningUnderTestRunner` lives in test-isolation-guard.ts, which is a leaf:
+// the other real-home writers (panel-pin-guard, panel-settings,
+// prompt-overrides) need the same predicate and must not pull this module in
+// to get it. Re-exported so existing importers keep working.
+export { runningUnderTestRunner } from "./test-isolation-guard.js";
 
 /** Keys this write is ALLOWED to change. Anything else that the store carried
  *  before and does not carry after is DATA LOSS, and the caller must not report

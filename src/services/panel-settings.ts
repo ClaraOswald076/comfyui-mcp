@@ -14,6 +14,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { writeFileDurable } from "../utils/durable-write.js";
 import { logger } from "../utils/logger.js";
+import { assertNotWritingRealHomeInTests } from "./test-isolation-guard.js";
 
 export interface NsfwConsent {
   /** True only after a verified-adult opt-in through the consent gate. */
@@ -150,6 +151,9 @@ function read(): PanelSettings {
 
 function write(settings: PanelSettings): void {
   const p = panelSettingsPath();
+  // This file carries the panel version pin — a test run writing the real one
+  // changes what updates a live install will accept. Refuse at the write.
+  assertNotWritingRealHomeInTests(p, "the panel settings");
   mkdirSync(dirname(p), { recursive: true });
   // Durable AND atomic (#798): this file carries the panel version PIN — a
   // protection record the user is told is in force the moment this returns. A
