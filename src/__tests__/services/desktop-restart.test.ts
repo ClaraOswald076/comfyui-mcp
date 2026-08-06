@@ -51,6 +51,20 @@ vi.mock("node:child_process", () => ({
   execFile: vi.fn(),
 }));
 
+// #871: the argv comparison is fenced by the instance witness — without a
+// continuous one it declines, and these tests assert the comparison's OUTPUT.
+// They model an instance that stays put across the reboot, so the witness stays
+// open. The dropped/unavailable-witness cases have their own suite
+// (restart-instance-identity.test.ts).
+vi.mock("../../services/instance-witness.js", () => ({
+  acquireInstanceWitness: vi.fn(async () => ({
+    url: "ws://127.0.0.1:8188/ws",
+    alive: () => true,
+    closedAt: () => undefined,
+    close: () => {},
+  })),
+}));
+
 import {
   restartComfyUI,
   __processControlTestHooks,

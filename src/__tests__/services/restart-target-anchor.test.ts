@@ -67,6 +67,18 @@ vi.mock("node:child_process", () => ({
   execFile: vi.fn(),
 }));
 
+// #871: no real WebSocket in tests — the witness stays open (the instance never
+// goes away), matching what these retarget tests model. The dropped/unavailable
+// cases have their own suite (restart-instance-identity.test.ts).
+vi.mock("../../services/instance-witness.js", () => ({
+  acquireInstanceWitness: vi.fn(async () => ({
+    url: "ws://alpha.example:8188/ws",
+    alive: () => true,
+    closedAt: () => undefined,
+    close: () => {},
+  })),
+}));
+
 import {
   restartComfyUI,
   startComfyUI,
