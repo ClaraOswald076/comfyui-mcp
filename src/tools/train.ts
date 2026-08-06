@@ -190,7 +190,7 @@ export function registerTrainTools(server: McpServer): void {
                   type: z.enum(["output", "input"]).optional().default("output").describe("Which ComfyUI dir to resolve against (default output)."),
                 })
                 .optional()
-                .describe("ComfyUI file ref (e.g. from list_output_images format:json) — resolved server-side with containment checks. Give path OR ref."),
+                .describe("ComfyUI file ref (e.g. from get_image (action:\"list_outputs\") format:json) — resolved server-side with containment checks. Give path OR ref."),
               caption: z.string().optional().describe("Caption for this image."),
             })
             .refine((it) => !!it.path || !!it.ref, { message: "each item needs path or ref" }),

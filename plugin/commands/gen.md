@@ -42,7 +42,7 @@ The user wants to generate an image using ComfyUI. Their prompt is provided as t
    - `template`: `"txt2img"`
    - `params`: Include `positive_prompt` from the user's input. Set `checkpoint` to the model filename. Use sensible defaults (1024x1024 for SDXL, 20 steps, cfg 8).
 
-5. **Enqueue the workflow.** Pass the workflow JSON from step 3 to `enqueue_workflow`. This returns immediately with a `prompt_id`.
+5. **Enqueue the workflow.** Pass the workflow JSON from step 3 to `enqueue_workflow(action="enqueue")`. This returns immediately with a `prompt_id`.
 
 6. **Monitor progress in background.** Start a background task to track the job:
 
@@ -55,11 +55,11 @@ The user wants to generate an image using ComfyUI. Their prompt is provided as t
 
    Continue the conversation while waiting. Check the background task output when notified it completed.
 
-   If the job fails, the monitor prints error details (node, message). Use `get_history` for the full traceback if needed.
+   If the job fails, the monitor prints error details (node, message). Use `get_history(action="diagnose")` for the full traceback plus anything missing.
 
    **Fallback**: If the background script is unavailable, use `queue` (action:"status") to poll until `done` is true.
 
-7. **Show the result.** Once the background monitor reports completion, use `list_output_images` (limit 1) to find the newest image. Read it with the Read tool to display it to the user.
+7. **Show the result.** Once the background monitor reports completion, use `get_image (action:"list_outputs")` (limit 1) to find the newest image. Read it with the Read tool to display it to the user.
 
 8. **Open the image.** Open the image so the user can see it immediately without navigating to the output folder. Use the Bash tool with the appropriate command for the OS:
    - **macOS**: `open /path/to/image.png`

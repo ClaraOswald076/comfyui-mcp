@@ -6,6 +6,91 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.0] - 2026-08-06
+
+The tool surface consolidates. Roughly 143 individually-registered tools fold into
+an action-parameterized core (37 tools), cutting what a client sees on `tools/list`
+by well over half — and with the surface small enough to carry, the default flips
+back to FULL, so `--compact` becomes the opt-in rather than the way most clients
+have to run.
+
+Every folded name is redirected rather than removed: calling a retired name reports
+what it became and which action replaces it, instead of failing as an unknown tool.
+That is enforced mechanically — every name that has ever existed and no longer does
+must be declared dead — so a tool cannot quietly vanish and leave rot behind.
+
+The per-slice entries are under **Changed** below.
+
+### MCP
+
+#### Added
+- flip the default to full; --compact becomes the opt-in (#942)
+- arena records VRAM/quant/version axes and flags suspect scenarios
+- audio attachments on the agent turn, and per-model tool mode
+
+#### Fixed
+- sessions are orchestrator-scoped — one agent across all tabs and workflows (#884) (#897)
+- report a retired tool name as retired, not as unpermitted (#911)
+- main is red — a retired name came back in generate_image (#936)
+- gate round 3 — a stale-but-alive sibling also suppresses the tray-row clear (#858)
+- gate round 2 — disclose when the dead record file can't be deleted (#858)
+- stop refusing correct destinations — diffusers contract-empty listing (#844) + in-tree junction escapes (#870)
+- codex gate r2 — positive identification for 'incapable', integer-safe seed bounds
+- gate round 1 — don't claim the tray row was removed; count both live row ids (#858)
+- codex gate r1 — refuse unsafe declared ranges, honest capability claims, sharper tests
+- cancel a stale download once its writer is proven gone + deterministic interference test (#858, #869)
+- seed draws honor declared max, explicit seeds survive, auto-select skips non-txt2img checkpoints
+- teach the dead-name gate the difference between a dead TOOL and a live ACTION (#905)
+- never write our database inside someone else's git tree (#891)
+- serve the retirement ledger on direct tools/call, not only through the facade (#895)
+- the first independent gate on the #842 branch (#880)
+- rename before you inspect — a path read is not an ownership proof
+- once a lock can be taken away, every path must prove it owns it
+- explicit reclaim for a proven-abandoned op lock, durable marker/pin writes, honest panel_reload scope (#760, #798, #765)
+- mixed-version best-of ranges are not one known version
+- suspect analysis pools only one comfyui-mcp version
+- the suspect signal counts distinct models, not leaderboard entries
+- legacy okTools are not selection evidence in the suspect analysis
+- a pending triage may have no job_id — say so (codex gate r2)
+- a live model switch must not be silently ignored on the OpenAI dialect
+- bracket EVERY entry, and stop the guard claiming more than it observed (codex gate r1)
+- a snapshot of the queue is not an exclusion — bracket the merge (codex gate)
+- a live switch rewrites the prompt; the audio table covers real containers
+- codex gate r2 — a malformed historical counter is not 'missing'
+- codex gate r1 — name partial vs incoherent truthfully; drop the false ~5-minute ceiling
+- git-verify a provably-idle incoherent Manager queue; report_issue sets blocking-wait expectation
+- five findings from the seventh gate pass
+- audio survives re-delivery, and the delivery proof is per TURN
+- acceptance proof is per media KIND, and the refusal's remedy is honest
+- the attachment-acceptance proof must not survive a model switch
+- honest delivery boundaries, and drop the ACP path we cannot exercise
+- five more findings from the second gate pass
+- the auto-install gate must name the tree it installs into; sweep "could not determine" folds (#820, #796)
+- five findings from the adversarial gate
+
+#### Changed
+- 0.50.0 slice 13: consolidate install/environment and stats/diagnostics (10 to 2) (#909)
+- 0.50.0 slice 16: consolidate execution, generation and observability (18→3) (#907)
+- 0.50.0 slice 15: consolidate images and assets (12 to 2) (#903)
+- 0.50.0 slice 12: consolidate custom nodes and node authoring (20 to 3) (#904)
+- 0.50.0 slice 14: consolidate workflow authoring and library (20→4) (#906)
+- 0.50.0 slice 11: consolidate models (14→2) (#901)
+- a late probe must not overwrite a newer cache entry (#879)
+- 0.50.0 slice 10: consolidate training (18→3) (#898)
+- 0.50.0 slice 9: consolidate knowledge (9→1) (#896)
+- list_output_images returns [] on a local install whose path comes from the saved workspace (#877) (#883)
+- 0.50.0 slice 7: consolidate process control, API nodes and defaults (10→3) (#894)
+- 0.50.0 slice 8: consolidate runpod (11→2) (#893)
+- remote ComfyUI and secrets: HTML where JSON was promised, and a secret that reports success without reaching the child (#837)
+- path + environment probing: 'could not determine' is not 'determined it is not' (#835)
+- follow-up to #839: fix the three gate findings that merged unaddressed (#882)
+- install_panel git fallback: four claims the concurrency bracket could not establish (follow-up to #840) (#878)
+- node search + install: registry packs that exist on disk read as absent, results that cannot be installed as returned (#834)
+- graph binding after reconnect/retarget: a documented recovery that could not recover (#803, #770, #772) (#833)
+- restart + session reporting: stale launch arguments, a premature failure verdict, and a stale version line (#850)
+- the 20 MB refusal is a dead end for local video (orchestrator half of #648) (#854)
+
+
 ## [0.49.8] - 2026-08-05
 
 ### MCP

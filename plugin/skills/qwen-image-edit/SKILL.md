@@ -274,7 +274,7 @@ This produces a grid image showing all combinations — useful for finding optim
 
 ## Tips
 
-1. **Upload source images first** with `upload_image` before building the workflow
+1. **Upload source images first** with `upload_image (action:"image")` before building the workflow
 2. **Match output resolution** to the next pipeline step (e.g., 832x480 for WAN FLF)
 3. **Lightning LoRA + denoise 1.0** works well — the model handles structure preservation through conditioning
 4. For **img2img editing** (denoise < 1.0), use `VAEEncode` on the source image instead of `EmptyLatentImage`

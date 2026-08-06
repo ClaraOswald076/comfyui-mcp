@@ -60,7 +60,7 @@ blindly re-queuing behind a stuck render:
   still won't die; `clear_pending` drops all pending jobs in the same call.
 
 It's all fail-safe: if the watchdog WebSocket never opens, nothing changes. The agent can
-also reason about an image's colors without a vision round-trip via `analyze_color`
+also reason about an image's colors without a vision round-trip via `get_image (action:"analyze_color")`
 (dominant palette, average + luminance stats, contrast checks).
 
 ## Tool categories

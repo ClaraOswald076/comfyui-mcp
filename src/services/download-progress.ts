@@ -515,6 +515,18 @@ export interface PersistedDownloadJob {
    *  running the same logical download share an `id` but differ here, so a sibling
    *  check can distinguish them. Absent on pre-fix records. */
   owner?: string;
+  /** The writing process's pid (#858). A stale heartbeat only says PERSISTENCE
+   *  stopped — the transfer may still be streaming (#761). What proves the writer
+   *  dead is that no process answers to this pid (the HTTP stream lives in the
+   *  process that wrote the record), which is what lets a later session reclaim a
+   *  stale in-flight record instead of refusing forever. Absent on pre-fix
+   *  records: those stay UNPROVABLE and are never reclaimed. */
+  pid?: number;
+  /** Set on a terminal record written by a LATER session that reclaimed a stale
+   *  in-flight record whose writer was proven dead (#858). The "cancelled" state
+   *  is then administrative — no live transfer was aborted — so renderers must
+   *  not claim a resumable partial was deliberately left by a cancel. */
+  reclaimed_dead?: boolean;
   resume?: unknown;
   /** Post-landing live-server verification (#369): whether the CONNECTED ComfyUI
    *  actually lists the landed file, so a reconnecting session still sees the
@@ -577,6 +589,7 @@ export function persistDownloadJob(job: Omit<PersistedDownloadJob, "updated">): 
     const safe: PersistedDownloadJob = {
       ...job,
       owner: PERSIST_OWNER,
+      pid: process.pid,
       url: job.url ? redactUrl(job.url) : job.url,
       updated: Date.now(),
     };
@@ -624,6 +637,31 @@ export function removePersistedDownloadJob(id: string): void {
   } catch {
     // ignore
   }
+}
+
+/** Remove a SPECIFIC session's persisted record, named by its owner nonce — the
+ *  reclaim half of #858. This is the ONE destructive operation on another
+ *  session's state: call it only for a record whose writer is PROVEN dead (see
+ *  cancelDownloadJob), and only after the replacement terminal record is durable,
+ *  so a failure here never leaves the download with no record at all.
+ *
+ *  Returns TRUE only when the file is gone. A transient Windows sharing violation
+ *  (a reader briefly holding the file) is retried, mirroring the persist rename;
+ *  a persistent failure is reported to the caller so it can DISCLOSE the leftover
+ *  instead of claiming a clean close it did not observe (codex gate, round 2). */
+export function removePersistedDownloadJobFor(id: string, owner: string): boolean {
+  const dir = channelDir();
+  if (!dir || !owner) return false;
+  const path = join(dir, `${JOB_PREFIX}${sanitizeIdPart(id)}-${sanitizeIdPart(owner)}.json`);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      rmSync(path, { force: true });
+      return true;
+    } catch {
+      /* transient — retry */
+    }
+  }
+  return false;
 }
 
 // A missed heartbeat is only a liveness hint, not proof the transfer stopped:

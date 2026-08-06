@@ -49,7 +49,7 @@ describe("get_history media type (#554)", () => {
       },
     });
 
-    const out = await getHandler("get_history")({ prompt_id: "p-temp" });
+    const out = await getHandler("get_history")({ action: "list", prompt_id: "p-temp" });
     const text = out.content.map((c) => c.text).join("\n");
     expect(text).toContain("pixaroma_compare_00001_.png");
     // The actionable bit: the type must be present so the caller does NOT default
@@ -72,7 +72,7 @@ describe("get_history media type (#554)", () => {
       },
     });
 
-    const out = await getHandler("get_history")({ prompt_id: "p-out" });
+    const out = await getHandler("get_history")({ action: "list", prompt_id: "p-out" });
     const text = out.content.map((c) => c.text).join("\n");
     expect(text).toContain("renders/ComfyUI_00007_.png (type=output)");
     expect(text).toContain("clip.mp4 (type=output)");

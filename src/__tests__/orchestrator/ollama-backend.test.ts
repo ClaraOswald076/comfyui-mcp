@@ -405,6 +405,79 @@ describe("OllamaBackend", () => {
     }
   });
 
+  /**
+   * 0.50.0 slice 12 folded the pack-DETAILS lookup into `search_custom_nodes` as
+   * action:"details". The discovery counter keys per DISCOVERY TOOL, and that
+   * retired name was never one — so keying on the NAME after the fold
+   * would start counting a call that never counted before, on the workflow that
+   * is CORRECT: search once, then read details for three or four candidate
+   * packs. The fourth would be answered with "STOP searching — it is very likely
+   * NOT in this catalog" while the model is doing exactly the right thing, and
+   * at eight the turn breaks outright. An invented refusal manufactured by a
+   * pure surface change is the same defect class as a lost one.
+   *
+   * Both directions have to hold: the corrective must still fire on repeated
+   * keyword SEARCHES, and must never fire on detail lookups.
+   */
+  describe("the discovery loop-breaker counts the search ACTION, not the folded tool name", () => {
+    const call = (args: Record<string, unknown>) => [
+      {
+        message: {
+          content: "",
+          tool_calls: [{ function: { name: "search_custom_nodes", arguments: args } }],
+        },
+        done: true,
+      },
+    ];
+    const nudges = () =>
+      chatRequests
+        .flatMap((r) => r.messages)
+        .filter((m) => m.role === "tool" && String(m.content).startsWith("SEARCH LIMIT"));
+
+    it("does NOT break a loop of distinct DETAIL lookups", async () => {
+      const { client, callTool } = fakeMcpClient(COMFY_META);
+      const backend = new OllamaBackend({
+        model: "gemma4:e4b",
+        connectToolClients: async () => ({ comfyui: client }),
+      });
+      // EIGHT distinct detail lookups — past the discovery threshold that
+      // breaks the turn — with different args each time, so the exact-repeat
+      // breaker cannot see them either. Every one must dispatch, because
+      // get_node_pack_details never counted before the fold.
+      for (const id of ["a", "b", "c", "d", "e", "f", "g", "h"]) {
+        chatScript.push(call({ action: "details", id: `${id}-pack` }));
+      }
+      chatScript.push([{ message: { content: "done" }, done: true }]);
+      await collect(backend, turnsOf({ text: "compare these eight packs for me" }));
+      expect(callTool).toHaveBeenCalledTimes(8);
+      expect(nudges()).toHaveLength(0);
+    });
+
+    it("STILL breaks a loop of distinct registry searches", async () => {
+      const { client, callTool } = fakeMcpClient(COMFY_META);
+      const backend = new OllamaBackend({
+        model: "gemma4:e4b",
+        connectToolClients: async () => ({ comfyui: client }),
+      });
+      for (const query of [
+        "lora", "flux", "civitai", "detailer", "upscale", "sampler", "controlnet", "vae",
+      ]) {
+        chatScript.push(call({ action: "search", query }));
+      }
+      const events = await collect(backend, turnsOf({ text: "find me a pack" }));
+      // First 3 dispatch; the 4th+ get the corrective instead of another search.
+      expect(callTool).toHaveBeenCalledTimes(3);
+      expect(nudges().length).toBeGreaterThanOrEqual(1);
+      // The corrective names the CALL, not just the tool — telling a model to
+      // stop calling `search_custom_nodes` outright would also stop it reading
+      // the details of a pack it has already found.
+      expect(String(nudges()[0].content)).toContain('search_custom_nodes action:"search"');
+      expect(events.filter((e) => e.type === "result")).toEqual([
+        { type: "result", ok: false, subtype: "tool_loop", turn: 1 },
+      ]);
+    });
+  });
+
   it("dispatches comfyui meta-tool calls and feeds results back to the next request", async () => {
     const { client, callTool } = fakeMcpClient(COMFY_META);
     const backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: client }) });

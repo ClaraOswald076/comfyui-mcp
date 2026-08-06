@@ -10,7 +10,8 @@ import {
 import { ValidationError } from "../utils/errors.js";
 
 /**
- * generate_3d — produce a 3D model (glb/obj/fbx/ply) from a text prompt or an
+ * generate_image (action:"3d") — produce a 3D model (glb/obj/fbx/ply) from a
+ * text prompt or an
  * input image.
  *
  * PATH CHOSEN (investigated 2026-07-24): current ComfyUI ships hosted partner
@@ -191,10 +192,10 @@ function pickCandidate(
 function noBackendError(mode: Generate3dMode): ValidationError {
   return new ValidationError(
     `No 3D-capable API/partner nodes for ${mode}-to-3D were found on the connected ComfyUI, ` +
-      `so generate_3d has no backend to run on. Recent ComfyUI builds ship hosted 3D partner nodes ` +
+      `so 3D generation has no backend to run on. Recent ComfyUI builds ship hosted 3D partner nodes ` +
       `in core (Tripo, Meshy, Rodin, Hunyuan3D — categories like "partner/3d/..."); they may be ` +
       `missing because the ComfyUI build is old or API nodes are disabled (--disable-api-nodes). ` +
-      `Fixes: (1) update ComfyUI (update_comfyui) and remove --disable-api-nodes, then retry; or ` +
+      `Fixes: (1) update ComfyUI (install_comfyui (action:"update")) and remove --disable-api-nodes, then retry; or ` +
       `(2) install a LOCAL 3D pack and build a workflow with it — e.g. install_custom_node with ` +
       `"ComfyUI-Hunyuan3DWrapper" (image-to-3D) or "ComfyUI-Flowty-TripoSR" (image-to-3D). ` +
       `Nothing was installed automatically.`,
@@ -205,7 +206,7 @@ export interface Generate3dArgs {
   mode: Generate3dMode;
   /** Text description of the model (required in text mode; optional extra guidance in image mode if the node accepts it). */
   prompt?: string;
-  /** ComfyUI input-image filename (image mode). Upload first with upload_image. */
+  /** ComfyUI input-image filename (image mode). Upload first with upload_image (action:"image"). */
   image?: string;
   /** Explicit 3D API node class_type to use (overrides auto-selection). */
   node?: string;
@@ -238,7 +239,7 @@ export async function generate3d(
   }
   if (args.mode === "image" && !args.image?.trim()) {
     throw new ValidationError(
-      'mode "image" requires an input image filename (upload one first with upload_image).',
+      'mode "image" requires an input image filename (upload one first with upload_image (action:"image")).',
     );
   }
 

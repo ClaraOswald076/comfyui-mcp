@@ -49,7 +49,7 @@ describe("enqueue_workflow seed handling (#865)", () => {
     const workflow = {
       "1": { class_type: "ClaudeNode", inputs: { prompt: "hi", seed: 1 } },
     };
-    const res = await getHandler("enqueue_workflow")({ workflow });
+    const res = await getHandler("enqueue_workflow")({ action: "enqueue", workflow });
     expect(res.isError).toBeFalsy();
     // Every seed in a caller-built workflow is caller-fixed: the executor is
     // told to leave all values exactly as supplied.

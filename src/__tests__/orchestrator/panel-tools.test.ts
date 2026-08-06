@@ -1493,6 +1493,84 @@ describe("panel-tools: post-reconnect retry-once (#278/#310/#332/#481)", () => {
     expect((res.content[0] as { text: string }).text).toMatch(/multiple|last active|pass tab_id/i);
   });
 
+  // #884 confirming gate 3, P0 — the scope-repin double gate. A SCOPE-bound ctx
+  // (shared conversation) is repinned ONLY by the explicit
+  // panel_set_workflow_target({mode:"current"}) consent AND only when the pin is
+  // provably dead; panel_reload is NOT a consent path. (The full path — real
+  // UiBridge, real tracker, real repin handler — is driven in ui-bridge.test.ts;
+  // these pin the panel-tools gate itself on a stub bridge.)
+  describe("scope-bound ctx: repin consent gate (#884 gate 3)", () => {
+    function scopeBridge(opts: { reachable: boolean }) {
+      const sent: Array<{ cmd: Record<string, unknown>; tabId?: string }> = [];
+      const repinCalls: string[] = [];
+      const bridge = {
+        send: async (cmd: Record<string, unknown>, sendOpts?: { tabId?: string }) => {
+          if (!opts.reachable) {
+            throw new Error(`no connected tab with id "${sendOpts?.tabId}". Connected: none`);
+          }
+          sent.push({ cmd, tabId: sendOpts?.tabId });
+          return { ok: true };
+        },
+        push: () => 1,
+        canReach: () => opts.reachable,
+        tabs: () => [{ tab_id: "live-tab", title: "wf", connected_at: 0 }],
+        isHeadless: () => false,
+        resolveActiveTabId: () => "live-tab",
+        repinScopeToActive: (scopeId: string) => {
+          repinCalls.push(scopeId);
+          return "live-tab";
+        },
+      } as unknown as PanelToolCtx["bridge"];
+      return { bridge, sent, repinCalls };
+    }
+
+    it("panel_reload NEVER repins a scope ctx — healthy binding forwards to the scope untouched", async () => {
+      const { bridge, sent, repinCalls } = scopeBridge({ reachable: true });
+      const ctx = makePanelToolCtx(bridge, "orchestrator::claude", new WorkflowTargetStore());
+      const res = await defByName("panel_reload").handler({ scope: "frontend" }, ctx);
+      expect(res.isError).toBeFalsy();
+      expect(repinCalls).toHaveLength(0); // the healthy turn was not re-aimed
+      expect(ctx.tabId).toBe("orchestrator::claude"); // never narrowed to a real tab
+      expect(sent.at(-1)).toMatchObject({
+        cmd: { cmd: "soft_reload", scope: "frontend" },
+        tabId: "orchestrator::claude",
+      });
+    });
+
+    it("panel_reload on a DEAD scope pin FAILS naming the explicit recovery — no silent repin", async () => {
+      const { bridge, repinCalls } = scopeBridge({ reachable: false });
+      const ctx = makePanelToolCtx(bridge, "orchestrator::claude", new WorkflowTargetStore());
+      const res = await defByName("panel_reload").handler({}, ctx);
+      expect(res.isError).toBe(true);
+      expect((res.content[0] as { text: string }).text).toMatch(
+        /panel_set_workflow_target\(\{mode:"current"\}\)/,
+      );
+      expect(repinCalls).toHaveLength(0);
+    });
+
+    it("rebindToActiveTab repins a scope ctx ONLY with consent AND a provably dead pin", () => {
+      // Healthy + consent → no repin (recovery only, never a re-target).
+      const healthy = scopeBridge({ reachable: true });
+      const healthyCtx = makePanelToolCtx(healthy.bridge, "orchestrator::claude", new WorkflowTargetStore());
+      expect(healthyCtx.rebindToActiveTab!({ scopeRecoveryConsent: true })).toMatchObject({
+        rebound: false,
+      });
+      expect(healthy.repinCalls).toHaveLength(0);
+      // Dead + NO consent → no repin (implicit callers can never re-aim a turn).
+      const dead = scopeBridge({ reachable: false });
+      const deadCtx = makePanelToolCtx(dead.bridge, "orchestrator::claude", new WorkflowTargetStore());
+      expect(deadCtx.rebindToActiveTab!()).toMatchObject({ rebound: false });
+      expect(dead.repinCalls).toHaveLength(0);
+      // Dead + consent → the one recovery path, and the ctx STAYS scope-bound.
+      expect(deadCtx.rebindToActiveTab!({ scopeRecoveryConsent: true })).toMatchObject({
+        rebound: true,
+        current: "orchestrator::claude",
+      });
+      expect(dead.repinCalls).toEqual(["orchestrator::claude"]);
+      expect(deadCtx.tabId).toBe("orchestrator::claude");
+    });
+  });
+
   it("a genuinely-gone tab (no reconnect) still fails clearly after the single retry", async () => {
     const store = new WorkflowTargetStore();
     // Nothing ever becomes live — retry can't rebind, so it must surface an error.

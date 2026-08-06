@@ -58,8 +58,12 @@ export function defaultCompact(agent: AgentName): boolean {
 }
 
 function serverArgs(compact: boolean): string[] {
-  // Explicit on BOTH sides: bare `npx comfyui-mcp` means compact since #667,
-  // so a full-mode entry must pin --full to survive the default flip.
+  // Explicit on BOTH sides, which is what made this survive the 0.50.0 flip
+  // untouched. Bare `npx comfyui-mcp` meant compact from #667 and means FULL
+  // from 0.50.0; because every generated entry pins its mode, no config written
+  // before the flip changed meaning after it. `defaultCompact` below is a
+  // PER-AGENT judgement (hermes/openclaw run small local models, copilot does
+  // not) and is deliberately independent of whatever the server default is.
   return compact ? ["-y", "comfyui-mcp", "--compact"] : ["-y", "comfyui-mcp", "--full"];
 }
 

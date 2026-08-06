@@ -7,7 +7,7 @@ import { resolveOutputDir } from "./output-dir.js";
 import { ValidationError } from "../utils/errors.js";
 
 // ---------------------------------------------------------------------------
-// analyze_color — objective color scopes/stats for a rendered image.
+// get_image (action:"analyze_color") — objective color scopes/stats for a rendered image.
 //
 // Motivation: judging "washed out" by eye off a contact sheet is unreliable.
 // This computes the numbers a colorist reads off scopes — black/white points,
@@ -114,7 +114,7 @@ async function resolveBytes(opts: AnalyzeColorOptions): Promise<Buffer> {
   }
 
   throw new ValidationError(
-    "analyze_color requires one of: asset_id, filename (+optional subfolder/type), or path.",
+    'get_image (action:"analyze_color") requires one of: asset_id, filename (+optional subfolder/type), or path.',
   );
 }
 
@@ -355,7 +355,13 @@ export async function analyzeColor(opts: AnalyzeColorOptions): Promise<AnalyzeCo
   const stats = computeStats(raw);
 
   const content: AnalyzeColorResult["content"] = [];
-  let summary = `analyze_color — ${stats.width}x${stats.height}\n${stats.verdict}\n\n` +
+  // This header used to be the TOOL's name, which 0.50.0 slice 15 retired. It is
+  // a label on a SUCCESS response, not remedy guidance, so it does not want to be
+  // a call form (`get_image (action:"analyze_color") — 1024x1024` reads as an
+  // instruction where none is wanted). It says what the block is instead — the
+  // same information the tool name carried, minus a name that would 404. Every
+  // other field of the response is unchanged.
+  let summary = `Color analysis — ${stats.width}x${stats.height}\n${stats.verdict}\n\n` +
     JSON.stringify(stats, null, 2);
 
   if (opts.reference_path) {

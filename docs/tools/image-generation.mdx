@@ -1,53 +1,185 @@
 ---
 title: "Image & Audio Generation"
-description: "High-level text-to-image and text-to-audio generation, plus conditioned image variants."
+description: "High-level text-to-image, audio, video and 3D generation, conditioned image variants, and the two post-processing passes — all nine actions of one tool since 0.50.0 slice 16."
 icon: "image"
 ---
 
-<Info>7 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
+<Info>1 tool. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
 <Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
 
 ## generate_image
 
-Generate an image from a text prompt — the high-level entry point. Builds a txt2img workflow, filling any unspecified parameter from your configured defaults (get_defaults (action:"set") / COMFYUI_DEFAULT_* / config file), auto-selecting a local checkpoint when none is given — checkpoints known to lack a text encoder (e.g. video models) are skipped. Returns the prompt_id immediately; the resulting asset_id arrives in the completion notification and can be passed to view_image or regenerate. For full control over the node graph, use create_workflow + enqueue_workflow instead.
+Generate media from a prompt or an existing image — the high-level entry points that build the graph for you. Every action enqueues on the connected ComfyUI and returns the prompt_id immediately; the resulting asset_id arrives in the completion notification. Driven by the `action` parameter:
+- action:"image" — Text-to-image. Builds a txt2img workflow, filling any unspecified parameter from your configured defaults (get_defaults (action:"set") / COMFYUI_DEFAULT_* / config file), auto-selecting a local checkpoint when none is given — checkpoints known to lack a text encoder (e.g. video models) are skipped. `prompt` is required. For full control over the node graph, use create_workflow + enqueue_workflow instead.
+- action:"audio" — Text-to-audio, supporting the ACE Step 1.5 and Stable Audio 3 model families. Builds the appropriate workflow graph, filling unspecified parameters from your defaults and auto-selecting local models. `model_family`, `prompt` and `duration` are required. Requires a running ComfyUI with the corresponding model files installed.
+- action:"video" — Text-to-video, or image-to-video when `image` is given (animate a start frame). Composes an LTX-2.3 distilled workflow on your LOCAL GPU using the render-verified Comfy-Org node stack (gemma text encoder + abliterated/distilled LoRAs). Needs the LTX-2.3 models (~24-46GB): install with apply_manifest --path packs/ltx-2.3-txt2vid/manifest.yaml (or ltx-2.3-img2vid for i2v); returns an actionable error if the checkpoint is missing. `seconds` is converted to an 8n+1 frame count. For i2v, higher `strength` means MORE adherence to the start frame but LESS motion (1.0 can freeze the clip) — keep ~0.6. This minimal path omits the synchronized audio + stage-2 spatial upscale that the full ltx-2.3 packs ship. `prompt` is required. The video is written under output/video/ — find it with get_image (action:"list_outputs") (VHS/SaveVideo outputs may not appear in /history).
+- action:"3d" — Generate a 3D model (glb/obj/fbx) from a text prompt or an input image, using the connected ComfyUI's hosted partner 3D nodes (Tripo, Meshy, Rodin, Hunyuan3D — auto-detected from the server; these are paid API nodes needing a comfy.org API key/login on the server or COMFY_API_KEY here). `mode` is required ("text" needs `prompt`, "image" needs `image`). Poll queue (action:"status") / get_history (action:"list") for the resulting model file (saved to ComfyUI's output directory). If the server has no 3D-capable API nodes, returns an actionable error naming local-pack alternatives.
+- action:"controlnet" — Image conditioned by a ControlNet preprocessed image (pose skeleton, depth, canny, normal, etc.) plus a text prompt. Upload the control image first with upload_image (action:"image"), then pass its filename as `control_image`. `prompt` and `control_image` are required; `checkpoint` and `controlnet_model` auto-resolve from local models. control_image must ALREADY be a preprocessed map (this action does not run the preprocessor); requires a running ComfyUI with a matching controlnet model in models/controlnet/.
+- action:"ip_adapter" — Image guided by a reference image's style/subject via IP-Adapter, plus a text prompt. Requires the ComfyUI_IPAdapter_plus custom nodes. Upload the reference first with upload_image (action:"image"), then pass its filename as `reference_image`. `prompt` and `reference_image` are required; `checkpoint` auto-resolves. Requires a running ComfyUI with ComfyUI_IPAdapter_plus and a matching IP-Adapter model installed, or the workflow will fail at execution time.
+- action:"regenerate" — Re-enqueue the workflow that produced an EXISTING ASSET, optionally applying `overrides`. Overrides are applied to any node input matching the key name (e.g. cfg, steps, sampler_name, scheduler, seed, denoise, text). Seeds are re-randomized by default so each call yields a fresh image unless seed is explicitly passed in overrides. `asset_id` is required. To re-run from execution HISTORY rather than a registered asset, use enqueue_workflow (action:"rerun").
+- action:"upscale" — Upscale an image with an ESRGAN super-resolution model. Builds an UpscaleModelLoader → ImageUpscaleWithModel workflow (scale=2 supersamples the 4x result back down for sharper output) and enqueues it on your LOCAL GPU. Upload the source first with upload_image (action:"image") (or stage a prior output with upload_image (action:"stage")), then pass its filename as `image`. Needs an upscale model in models/upscale_models/ (e.g. 4x-ClearRealityV1 / 4x_foolhardy_Remacri, provided by the anima/ernie packs or download_model); returns an actionable error if none is found. `image` is required.
+- action:"remove_background" — Remove an image's background, returning a transparent (RGBA) cutout. Builds a LoadImage → BiRefNetRMBG → SaveImage workflow using the ComfyUI-RMBG (BiRefNet) matting node and enqueues it on your LOCAL GPU. Upload the source first with upload_image (action:"image") (or stage a prior output with upload_image (action:"stage")), then pass its filename as `image`. Requires the ComfyUI-RMBG custom node (pack: wan-transparent, or install_custom_node 'comfyui-rmbg'); the BiRefNet model auto-downloads on first run. If the node isn't installed, returns an actionable error telling you how to install it. `image` is required.
 
-<Tip>**In plain terms:** The one-line way to get a picture. You do not need a workflow open, or any workflow at all — describe the image and this builds and runs a sensible graph for you. Everything except the prompt is optional and falls back to your saved defaults.</Tip>
+<Tip>**In plain terms:** The one-line way to get a picture — and, through `action`, the same one-line way to get audio, a video clip, a 3D model, a re-run of an earlier image, an upscale, or a background removed. You do not need a workflow open, or any workflow at all: describe what you want and this builds and runs a sensible graph for you. Everything except `action` and the one or two fields that action needs is optional and falls back to your saved defaults.</Tip>
 
 ### Parameters
 
-<ParamField path="prompt" type="string" required>
-  Positive text prompt
+<ParamField path="action" type="enum" required>
+  What to generate. action:"image"/action:"video" require `prompt`; action:"audio" requires `model_family`+`prompt`+`duration`; action:"3d" requires `mode` (+ `prompt` or `image`); action:"controlnet" requires `prompt`+`control_image`; action:"ip_adapter" requires `prompt`+`reference_image`; action:"regenerate" requires `asset_id`; action:"upscale" and action:"remove_background" require `image`. Options: `action:"image"`, `action:"audio"`, `action:"video"`, `action:"3d"`, `action:"controlnet"`, `action:"ip_adapter"`, `action:"regenerate"`, `action:"upscale"`, `action:"remove_background"`.
+</ParamField>
+<ParamField path="prompt" type="string">
+  Positive text prompt. REQUIRED for actions "image", "audio", "video", "controlnet" and "ip_adapter"; for action:"3d" it is required in mode "text" and optional (passed through only if the chosen node accepts it) in mode "image". Unused by action:"regenerate", action:"upscale" and action:"remove_background".
 </ParamField>
 <ParamField path="negative_prompt" type="string">
-  Negative prompt (default: empty / from defaults)
+  Negative prompt (default: empty / from defaults). Used by actions "image", "video", "controlnet", "ip_adapter" and — for the Stable Audio 3 family only — "audio".
 </ParamField>
 <ParamField path="width" type="integer">
-  Image width
+  Image width in pixels. Actions "image", "controlnet", "ip_adapter".
 </ParamField>
 <ParamField path="height" type="integer">
-  Image height
+  Image height in pixels. Actions "image", "controlnet", "ip_adapter".
 </ParamField>
 <ParamField path="steps" type="integer">
-  Sampling steps
+  Sampling steps. Actions "image", "audio", "video", "controlnet", "ip_adapter" (video defaults to 8 for the distilled model).
 </ParamField>
 <ParamField path="cfg" type="number">
-  CFG scale
+  CFG scale. Actions "image", "audio", "video", "controlnet", "ip_adapter" (video defaults to 1.0 for the distilled model).
 </ParamField>
 <ParamField path="sampler" type="string">
-  Sampler name (e.g. euler, dpmpp_2m)
+  Sampler name (e.g. euler, dpmpp_2m). Actions "image", "audio", "controlnet", "ip_adapter".
 </ParamField>
 <ParamField path="scheduler" type="string">
-  Scheduler (e.g. normal, karras)
+  Scheduler (e.g. normal, karras). Actions "image", "audio", "controlnet", "ip_adapter".
 </ParamField>
 <ParamField path="seed" type="integer">
-  Seed (omit to randomize)
+  Seed (omit to randomize). Actions "image", "audio", "video", "controlnet", "ip_adapter".
 </ParamField>
 <ParamField path="checkpoint" type="string">
-  Checkpoint filename; auto-selected from local models if omitted
+  Checkpoint filename; auto-selected from local models if omitted. The relevant checkpoint differs per action: a diffusion checkpoint for "image"/"controlnet"/"ip_adapter", the LTX checkpoint for "video", the Stable Audio 3 checkpoint for "audio".
 </ParamField>
 <ParamField path="batch_size" type="integer">
-  Number of images to generate
+  action:"image" — number of images to generate.
+</ParamField>
+<ParamField path="filename_prefix" type="string">
+  Output filename prefix. action:"audio" (default audio/ace_step or audio/stable_audio_3), action:"video" (default 'video/ltx-2.3') and action:"remove_background" (default 'ComfyUI_cutout').
+</ParamField>
+<ParamField path="image" type="string">
+  Filename of an image in ComfyUI's input dir (upload it first with upload_image (action:"image"), or stage a prior output with upload_image (action:"stage")). REQUIRED for action:"upscale" and action:"remove_background"; the start frame for action:"video" image-to-video; the input image for action:"3d" in mode "image".
+</ParamField>
+<ParamField path="model" type="string">
+  Model file for the post-processing actions: action:"upscale" — an upscale model in models/upscale_models/ (auto-selected from local models if omitted); action:"remove_background" — the BiRefNet matting model (default 'BiRefNet_toonout'; auto-downloaded by ComfyUI-RMBG).
+</ParamField>
+<ParamField path="scale" type="number">
+  action:"upscale" — net upscale factor: 2 or 4 (default 4).
+</ParamField>
+<ParamField path="control_image" type="string">
+  action:"controlnet" — filename of the (already-uploaded, already-preprocessed) control image in ComfyUI's input dir. REQUIRED for that action.
+</ParamField>
+<ParamField path="controlnet_model" type="string">
+  action:"controlnet" — ControlNet model file (in models/controlnet/); auto-selected if omitted.
+</ParamField>
+<ParamField path="reference_image" type="string">
+  action:"ip_adapter" — filename of the (already-uploaded) reference image in ComfyUI's input dir. REQUIRED for that action.
+</ParamField>
+<ParamField path="weight" type="number">
+  action:"ip_adapter" — IP-Adapter influence on the output, typically 0.0-1.0 (default 0.8); higher = closer to the reference.
+</ParamField>
+<ParamField path="preset" type="string">
+  action:"ip_adapter" — IPAdapterUnifiedLoader preset (default 'PLUS (high strength)').
+</ParamField>
+<ParamField path="weight_type" type="enum">
+  action:"ip_adapter" — IPAdapter weight mode (default 'standard' — required by current IPAdapter_plus builds). Options: `standard`, `prompt is more important`, `style transfer`.
+</ParamField>
+<ParamField path="strength" type="number">
+  Two DIFFERENT knobs sharing one field, each with its own range, checked when the action runs: action:"video" (i2v only) — adherence to the start frame, 0-1 inclusive (default 0.6; higher = LESS motion); action:"controlnet" — conditioning strength, must be &gt; 0, typically 0.0-2.0 (default 1.0; higher = stronger adherence to the control image).
+</ParamField>
+<ParamField path="seconds" type="number">
+  action:"video" — clip length in seconds (default 4; ~10s max).
+</ParamField>
+<ParamField path="resolution" type="string">
+  action:"video" — 'WIDTHxHEIGHT' e.g. '768x512' (rounded to multiples of 32; default 768x512).
+</ParamField>
+<ParamField path="fps" type="number">
+  action:"video" — frames per second (default 25).
+</ParamField>
+<ParamField path="mode" type="enum">
+  action:"3d" — "text" = text-to-3D from `prompt`; "image" = image-to-3D from an uploaded input `image`. REQUIRED for that action. Options: `text`, `image`.
+</ParamField>
+<ParamField path="node" type="string">
+  action:"3d" — explicit 3D API node class_type to use (e.g. "MeshyTextToModelNode"); auto-selected if omitted. Use list_api_nodes with filter "3d" to see options.
+</ParamField>
+<ParamField path="inputs" type="object">
+  action:"3d" — provider-specific extra inputs passed through to the node (e.g. style, texture, quality). Use list_api_nodes (action:"schema") on the chosen node for valid keys.
+</ParamField>
+<ParamField path="model_family" type="enum">
+  action:"audio" — audio model family; determines which workflow template and model loaders to use. REQUIRED for that action. Options: `ace_step_1.5`, `stable_audio_3`.
+</ParamField>
+<ParamField path="duration" type="number">
+  action:"audio" — audio duration in seconds. REQUIRED for that action.
+</ParamField>
+<ParamField path="unet" type="string">
+  action:"audio" — ACE UNet model filename (in models/diffusion_models/); auto-selected if omitted.
+</ParamField>
+<ParamField path="vae" type="string">
+  action:"audio" — ACE VAE model filename (in models/vae/); auto-selected if omitted.
+</ParamField>
+<ParamField path="clip_a" type="string">
+  action:"audio" — primary text encoder filename (in models/text_encoders/); auto-selected if omitted.
+</ParamField>
+<ParamField path="clip_b" type="string">
+  action:"audio" — secondary text encoder filename (in models/text_encoders/); auto-selected if omitted.
+</ParamField>
+<ParamField path="clip" type="string">
+  action:"audio" — Stable Audio CLIP encoder filename (in models/text_encoders/); auto-selected if omitted.
+</ParamField>
+<ParamField path="lyrics" type="string">
+  action:"audio" — lyrics or song structure description (ACE only — section-by-section breakdown).
+</ParamField>
+<ParamField path="language" type="string">
+  action:"audio" — language code for prompt (ACE only, default: 'en').
+</ParamField>
+<ParamField path="musical_key" type="string">
+  action:"audio" — target musical key (ACE only, e.g. 'C major', 'E minor'; default: 'C major').
+</ParamField>
+<ParamField path="shift" type="number">
+  action:"audio" — ModelSamplingAuraFlow shift parameter (ACE only, default: 3).
+</ParamField>
+<ParamField path="guidance_scale" type="number">
+  action:"audio" — TextEncodeAceStepAudio1.5 cfg_scale, the text encoder guidance scale (ACE only, default: 2).
+</ParamField>
+<ParamField path="bpm" type="integer">
+  action:"audio" — TextEncodeAceStepAudio1.5 tempo in beats per minute (ACE only, 10-300, default: 120).
+</ParamField>
+<ParamField path="timesignature" type="enum">
+  action:"audio" — TextEncodeAceStepAudio1.5 time signature (ACE only, one of '2'/'3'/'4'/'6', default: '4'). Options: `2`, `3`, `4`, `6`.
+</ParamField>
+<ParamField path="temperature" type="number">
+  action:"audio" — TextEncodeAceStepAudio1.5 LLM sampling temperature (ACE only, 0-2, default: 0.85).
+</ParamField>
+<ParamField path="top_p" type="number">
+  action:"audio" — TextEncodeAceStepAudio1.5 LLM top-p nucleus sampling (ACE only, 0-2000, default: 0.9).
+</ParamField>
+<ParamField path="top_k" type="integer">
+  action:"audio" — TextEncodeAceStepAudio1.5 LLM top-k sampling (ACE only, 0-100, default: 0 = disabled).
+</ParamField>
+<ParamField path="min_p" type="number">
+  action:"audio" — TextEncodeAceStepAudio1.5 LLM min-p sampling (ACE only, 0-1, default: 0).
+</ParamField>
+<ParamField path="generate_audio_codes" type="boolean">
+  action:"audio" — generate audio codes via the TextEncodeAceStepAudio1.5 LLM (ACE only, default: true).
+</ParamField>
+<ParamField path="audio_quality" type="enum">
+  action:"audio" — SaveAudioMP3 bitrate/quality (ACE only, one of 'V0'/'128k'/'320k', default: '320k'). Options: `V0`, `128k`, `320k`.
+</ParamField>
+<ParamField path="asset_id" type="string">
+  action:"regenerate" — asset id of the source generation. REQUIRED for that action.
+</ParamField>
+<ParamField path="overrides" type="object">
+  action:"regenerate" — map of input-name → new value applied to every node that already has that input. Common keys: cfg, steps, sampler_name, scheduler, seed, denoise, text.
+</ParamField>
+<ParamField path="disable_random_seed" type="boolean">
+  action:"regenerate" and action:"3d" — if true, do not randomize seed fields. For action:"regenerate", combine with `overrides.seed` to reproduce the exact original image.
 </ParamField>
 
 ### Examples
@@ -58,6 +190,7 @@ Generate an image from a text prompt — the high-level entry point. Builds a tx
 {
   "tool": "generate_image",
   "arguments": {
+    "action": "image",
     "prompt": "a red fox in deep snow, golden hour, sharp focus"
   }
 }
@@ -71,6 +204,7 @@ Generate an image from a text prompt — the high-level entry point. Builds a tx
 {
   "tool": "generate_image",
   "arguments": {
+    "action": "image",
     "prompt": "a red fox in deep snow, golden hour, sharp focus",
     "negative_prompt": "blurry, watermark, text",
     "width": 1344,
@@ -84,328 +218,13 @@ Generate an image from a text prompt — the high-level entry point. Builds a tx
 
 **You get back:** The same fields plus the image. Because `seed` was pinned, running this again with the same settings gives the same picture — that is how you iterate on one image instead of rolling a new one each time.
 
----
-
-## generate_with_controlnet
-
-Generate an image conditioned by a ControlNet preprocessed image (pose skeleton, depth, canny, normal, etc.) plus a text prompt. Upload the control image first with upload_image, then pass its filename as control_image. Unspecified params fall back to your defaults; checkpoint and controlnet_model auto-resolve from local models. Returns prompt_id immediately; asset_id arrives in the completion notification. control_image must already be a preprocessed map (this tool does not run the preprocessor); requires a running ComfyUI with a matching controlnet model in models/controlnet/.
-
-### Parameters
-
-<ParamField path="prompt" type="string" required>
-  Positive text prompt
-</ParamField>
-<ParamField path="control_image" type="string" required>
-  Filename of the (already-uploaded) control image in ComfyUI's input dir
-</ParamField>
-<ParamField path="controlnet_model" type="string">
-  ControlNet model file (in models/controlnet/); auto-selected if omitted
-</ParamField>
-<ParamField path="strength" type="number">
-  ControlNet conditioning strength, typically 0.0-2.0 (default 1.0); higher = stronger adherence to the control image
-</ParamField>
-<ParamField path="negative_prompt" type="string">
-  Negative prompt (default: empty / from defaults)
-</ParamField>
-<ParamField path="width" type="integer">
-  Image width in pixels
-</ParamField>
-<ParamField path="height" type="integer">
-  Image height in pixels
-</ParamField>
-<ParamField path="steps" type="integer">
-  Sampling steps
-</ParamField>
-<ParamField path="cfg" type="number">
-  CFG scale
-</ParamField>
-<ParamField path="sampler" type="string">
-  Sampler name (e.g. euler, dpmpp_2m)
-</ParamField>
-<ParamField path="scheduler" type="string">
-  Scheduler (e.g. normal, karras)
-</ParamField>
-<ParamField path="seed" type="integer">
-  Seed (omit to randomize)
-</ParamField>
-<ParamField path="checkpoint" type="string">
-  Checkpoint filename; auto-selected if omitted
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "generate_with_controlnet",
-  "arguments": {
-    "prompt": "<prompt>",
-    "control_image": "<control_image>"
-  }
-}
-```
-
----
-
-## generate_with_ip_adapter
-
-Generate an image guided by a reference image's style/subject via IP-Adapter, plus a text prompt. Requires the ComfyUI_IPAdapter_plus custom nodes. Upload the reference first with upload_image, then pass its filename as reference_image. Unspecified params fall back to your defaults; checkpoint auto-resolves. Returns prompt_id immediately; asset_id arrives in the completion notification. Requires a running ComfyUI with ComfyUI_IPAdapter_plus and a matching IP-Adapter model installed, or the workflow will fail at execution time.
-
-### Parameters
-
-<ParamField path="prompt" type="string" required>
-  Positive text prompt
-</ParamField>
-<ParamField path="reference_image" type="string" required>
-  Filename of the (already-uploaded) reference image in ComfyUI's input dir
-</ParamField>
-<ParamField path="weight" type="number">
-  IP-Adapter influence on the output, typically 0.0-1.0 (default 0.8); higher = closer to the reference
-</ParamField>
-<ParamField path="preset" type="string">
-  IPAdapterUnifiedLoader preset (default 'PLUS (high strength)')
-</ParamField>
-<ParamField path="weight_type" type="enum">
-  IPAdapter weight mode (default 'standard' — required by current IPAdapter_plus builds) Options: `standard`, `prompt is more important`, `style transfer`.
-</ParamField>
-<ParamField path="negative_prompt" type="string">
-  Negative prompt (default: empty / from defaults)
-</ParamField>
-<ParamField path="width" type="integer">
-  Image width in pixels
-</ParamField>
-<ParamField path="height" type="integer">
-  Image height in pixels
-</ParamField>
-<ParamField path="steps" type="integer">
-  Sampling steps
-</ParamField>
-<ParamField path="cfg" type="number">
-  CFG scale
-</ParamField>
-<ParamField path="sampler" type="string">
-  Sampler name (e.g. euler, dpmpp_2m)
-</ParamField>
-<ParamField path="scheduler" type="string">
-  Scheduler (e.g. normal, karras)
-</ParamField>
-<ParamField path="seed" type="integer">
-  Seed (omit to randomize)
-</ParamField>
-<ParamField path="checkpoint" type="string">
-  Checkpoint filename; auto-selected if omitted
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "generate_with_ip_adapter",
-  "arguments": {
-    "prompt": "<prompt>",
-    "reference_image": "<reference_image>"
-  }
-}
-```
-
----
-
-## regenerate
-
-Re-enqueue the workflow that produced an existing asset, optionally applying parameter overrides. Overrides are applied to any node input matching the key name (e.g. cfg, steps, sampler_name, scheduler, seed, denoise, text). Seeds are re-randomized by default so each regenerate yields a fresh image unless seed is explicitly passed in overrides.
-
-### Parameters
-
-<ParamField path="asset_id" type="string" required>
-  Asset id of the source generation
-</ParamField>
-<ParamField path="overrides" type="object">
-  Map of input-name → new value applied to every node that already has that input. Common keys: cfg, steps, sampler_name, scheduler, seed, denoise, text.
-</ParamField>
-<ParamField path="disable_random_seed" type="boolean">
-  If true, do not randomize seed fields. Combine with `overrides.seed` to reproduce the exact original image.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "regenerate",
-  "arguments": {
-    "asset_id": "<asset_id>"
-  }
-}
-```
-
----
-
-## generate_audio
-
-Generate audio from a text prompt — supports ACE Step 1.5 and Stable Audio 3 model families. Builds the appropriate workflow graph, filling unspecified parameters from your configured defaults (get_defaults (action:"set") / COMFYUI_DEFAULT_* / config file), auto-selecting local models when needed. Returns the prompt_id immediately; the resulting audio asset_id arrives in the completion notification. Requires a running ComfyUI with the corresponding model files installed.
-
-### Parameters
-
-<ParamField path="model_family" type="enum" required>
-  Audio model family — determines which workflow template and model loaders to use Options: `ace_step_1.5`, `stable_audio_3`.
-</ParamField>
-<ParamField path="prompt" type="string" required>
-  Text description of the audio to generate (genre, mood, instruments, etc.)
-</ParamField>
-<ParamField path="duration" type="number" required>
-  Audio duration in seconds
-</ParamField>
-<ParamField path="seed" type="integer">
-  Seed (omit to randomize)
-</ParamField>
-<ParamField path="steps" type="integer">
-  Sampling steps
-</ParamField>
-<ParamField path="cfg" type="number">
-  CFG scale
-</ParamField>
-<ParamField path="sampler" type="string">
-  Sampler name (e.g. euler, lcm, dpmpp_2m)
-</ParamField>
-<ParamField path="scheduler" type="string">
-  Scheduler (e.g. normal, simple, karras)
-</ParamField>
-<ParamField path="filename_prefix" type="string">
-  Output filename prefix (default: audio/ace_step or audio/stable_audio_3)
-</ParamField>
-<ParamField path="unet" type="string">
-  ACE UNet model filename (in models/diffusion_models/); auto-selected if omitted
-</ParamField>
-<ParamField path="vae" type="string">
-  ACE VAE model filename (in models/vae/); auto-selected if omitted
-</ParamField>
-<ParamField path="clip_a" type="string">
-  Primary text encoder filename (in models/text_encoders/); auto-selected if omitted
-</ParamField>
-<ParamField path="clip_b" type="string">
-  Secondary text encoder filename (in models/text_encoders/); auto-selected if omitted
-</ParamField>
-<ParamField path="lyrics" type="string">
-  Lyrics or song structure description (ACE only — section-by-section breakdown)
-</ParamField>
-<ParamField path="language" type="string">
-  Language code for prompt (ACE only, default: 'en')
-</ParamField>
-<ParamField path="musical_key" type="string">
-  Target musical key (ACE only, e.g. 'C major', 'E minor'; default: 'C major')
-</ParamField>
-<ParamField path="shift" type="number">
-  ModelSamplingAuraFlow shift parameter (ACE only, default: 3)
-</ParamField>
-<ParamField path="guidance_scale" type="number">
-  TextEncodeAceStepAudio1.5 cfg_scale — text encoder guidance scale (ACE only, default: 2)
-</ParamField>
-<ParamField path="bpm" type="integer">
-  TextEncodeAceStepAudio1.5 tempo in beats per minute (ACE only, 10-300, default: 120)
-</ParamField>
-<ParamField path="timesignature" type="enum">
-  TextEncodeAceStepAudio1.5 time signature (ACE only, one of '2'/'3'/'4'/'6', default: '4') Options: `2`, `3`, `4`, `6`.
-</ParamField>
-<ParamField path="temperature" type="number">
-  TextEncodeAceStepAudio1.5 LLM sampling temperature (ACE only, 0-2, default: 0.85)
-</ParamField>
-<ParamField path="top_p" type="number">
-  TextEncodeAceStepAudio1.5 LLM top-p nucleus sampling (ACE only, 0-2000, default: 0.9)
-</ParamField>
-<ParamField path="top_k" type="integer">
-  TextEncodeAceStepAudio1.5 LLM top-k sampling (ACE only, 0-100, default: 0 = disabled)
-</ParamField>
-<ParamField path="min_p" type="number">
-  TextEncodeAceStepAudio1.5 LLM min-p sampling (ACE only, 0-1, default: 0)
-</ParamField>
-<ParamField path="generate_audio_codes" type="boolean">
-  TextEncodeAceStepAudio1.5 — generate audio codes via the LLM (ACE only, default: true)
-</ParamField>
-<ParamField path="audio_quality" type="enum">
-  SaveAudioMP3 bitrate/quality (ACE only, one of 'V0'/'128k'/'320k', default: '320k') Options: `V0`, `128k`, `320k`.
-</ParamField>
-<ParamField path="checkpoint" type="string">
-  Stable Audio 3 checkpoint filename (in models/checkpoints/); auto-selected if omitted
-</ParamField>
-<ParamField path="clip" type="string">
-  Stable Audio CLIP encoder filename (in models/text_encoders/); auto-selected if omitted
-</ParamField>
-<ParamField path="negative_prompt" type="string">
-  Negative prompt (Stable Audio 3 only; default: empty)
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "generate_audio",
-  "arguments": {
-    "model_family": "ace_step_1.5",
-    "prompt": "<prompt>",
-    "duration": 0
-  }
-}
-```
-
----
-
-## generate_video
-
-Generate a short video from a text prompt (text-to-video), or animate a start image (image-to-video when `image` is given) — the high-level entry point. Composes an LTX-2.3 distilled workflow on your LOCAL GPU using the render-verified Comfy-Org node stack (gemma text encoder + abliterated/distilled LoRAs). Needs the LTX-2.3 models (~24-46GB): install with apply_manifest --path packs/ltx-2.3-txt2vid/manifest.yaml (or ltx-2.3-img2vid for i2v); returns an actionable error if the checkpoint is missing. seconds is converted to an 8n+1 frame count. For i2v, higher `strength` means MORE adherence to the start frame but LESS motion (1.0 can freeze the clip) — keep ~0.6. This minimal path omits the synchronized audio + stage-2 spatial upscale that the full ltx-2.3 packs ship. Returns prompt_id immediately; the video is written under output/video/ — find it with list_output_images (VHS/SaveVideo outputs may not appear in /history).
-
-### Parameters
-
-<ParamField path="prompt" type="string" required>
-  Text description of the video (actions over time, visual details)
-</ParamField>
-<ParamField path="image" type="string">
-  For image-to-video: filename of the start image in ComfyUI's input dir (upload it first)
-</ParamField>
-<ParamField path="negative_prompt" type="string">
-  Negative prompt (default: empty / from defaults)
-</ParamField>
-<ParamField path="seconds" type="number">
-  Clip length in seconds (default 4; ~10s max)
-</ParamField>
-<ParamField path="resolution" type="string">
-  'WIDTHxHEIGHT' e.g. '768x512' (rounded to multiples of 32; default 768x512)
-</ParamField>
-<ParamField path="fps" type="number">
-  Frames per second (default 25)
-</ParamField>
-<ParamField path="strength" type="number">
-  i2v only: adherence to the start frame, 0-1 (default 0.6; higher = less motion)
-</ParamField>
-<ParamField path="steps" type="integer">
-  Sampling steps (default 8 for the distilled model)
-</ParamField>
-<ParamField path="cfg" type="number">
-  CFG scale (default 1.0 for the distilled model)
-</ParamField>
-<ParamField path="seed" type="integer">
-  Seed (omit to randomize)
-</ParamField>
-<ParamField path="checkpoint" type="string">
-  LTX checkpoint filename in models/checkpoints/; auto-selected if omitted
-</ParamField>
-<ParamField path="filename_prefix" type="string">
-  Output filename prefix (default 'video/ltx-2.3')
-</ParamField>
-
-### Example
-
 **You say:** Turn that fox picture into a short clip of it walking.
 
 ```json
 {
-  "tool": "generate_video",
+  "tool": "generate_image",
   "arguments": {
+    "action": "video",
     "prompt": "a red fox walking through deep snow, camera slowly pushing in",
     "seconds": 5,
     "resolution": "832x480",
@@ -416,44 +235,21 @@ Generate a short video from a text prompt (text-to-video), or animate a start im
 
 **You get back:** A path to the rendered video file plus the settings used. Video takes far longer than a still — minutes, not seconds — so the agent will usually tell you it has started and then report back.
 
----
-
-## generate_3d
-
-Generate a 3D model (glb/obj/fbx) from a text prompt or an input image, using the connected ComfyUI's hosted partner 3D nodes (Tripo, Meshy, Rodin, Hunyuan3D — auto-detected from the server; these are paid API nodes needing a comfy.org API key/login on the server or COMFY_API_KEY here). Builds and enqueues a minimal workflow and returns immediately with the prompt_id — poll queue (action:"status") / get_history for the resulting model file (saved to ComfyUI's output directory). For image mode, upload the image first with upload_image and pass its filename. If the server has no 3D-capable API nodes, returns an actionable error naming local-pack alternatives.
-
-### Parameters
-
-<ParamField path="mode" type="enum" required>
-  "text" = text-to-3D from prompt; "image" = image-to-3D from an uploaded input image. Options: `text`, `image`.
-</ParamField>
-<ParamField path="prompt" type="string">
-  REQUIRED when mode is 'text': text description of the 3D model. In mode 'image' it is optional and passed along only if the chosen node accepts a prompt. (Cross-field requirement enforced at runtime — the call fails with a clear error if omitted in text mode.)
-</ParamField>
-<ParamField path="image" type="string">
-  REQUIRED when mode is 'image': ComfyUI input-image filename. Upload local files first with upload_image. (Cross-field requirement enforced at runtime.)
-</ParamField>
-<ParamField path="node" type="string">
-  Explicit 3D API node class_type to use (e.g. "MeshyTextToModelNode"); auto-selected if omitted. Use list_api_nodes with filter "3d" to see options.
-</ParamField>
-<ParamField path="inputs" type="object">
-  Provider-specific extra inputs passed through to the node (e.g. style, texture, quality). Use list_api_nodes (action:"schema") on the chosen node for valid keys.
-</ParamField>
-<ParamField path="disable_random_seed" type="boolean">
-  If true, do not randomize seed inputs.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** That one was nearly right — run it again with more steps.
 
 ```json
 {
-  "tool": "generate_3d",
+  "tool": "generate_image",
   "arguments": {
-    "mode": "text"
+    "action": "regenerate",
+    "asset_id": "a3f9c1",
+    "overrides": {
+      "steps": 40
+    }
   }
 }
 ```
+
+**You get back:** A new render from the EXACT graph that produced that asset, with only the fields you named changed. The seed is re-rolled unless you pass one, so this gives you a fresh take rather than the same image.
 
 ---

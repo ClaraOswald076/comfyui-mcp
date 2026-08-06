@@ -770,7 +770,7 @@ export async function fetchImage(
         (res.status === 404
           ? `No such file in the ComfyUI ${type} directory` +
             (subfolder ? ` under subfolder "${subfolder}"` : "") +
-            `. Check the filename/subfolder (e.g. via list_output_images or get_history).`
+            `. Check the filename/subfolder (e.g. via get_image (action:"list_outputs") or get_history).`
           : `The ComfyUI server rejected the request.`),
       res.status === 404 ? "IMAGE_NOT_FOUND" : "VIEW_ERROR",
       { status: res.status, filename, type, subfolder },

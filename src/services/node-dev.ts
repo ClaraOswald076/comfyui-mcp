@@ -45,7 +45,7 @@ export class NodeDevError extends ComfyUIError {
 export class GitWritesDisabledError extends ComfyUIError {
   constructor(action: string) {
     super(
-      `node_pack_git "${action}" is disabled by configuration. Set the ` +
+      `node_pack action:"git" with git_action:"${action}" is disabled by configuration. Set the ` +
         `environment variable COMFYUI_MCP_ALLOW_GIT_WRITES=1 (or "true") to ` +
         `allow git commit/push from this server, then retry. Read-only actions ` +
         `(status/diff/log) are always available.`,
@@ -306,7 +306,7 @@ export function customNodesRoot(): string {
   // Resolve the effective LOCAL ComfyUI base the same way every other
   // filesystem-backed tool does: COMFYUI_PATH first, then the saved default
   // workspace (set via workspace action:"set_default") when COMFYUI_PATH is unset. This
-  // is what get_environment / workspace action:"get" already report, so custom-node
+  // is what install_comfyui (action:"environment") / workspace action:"get" already report, so custom-node
   // source tools no longer reject a loopback session that has a saved default
   // workspace as if it were remote (#506). Returns undefined only in remote
   // mode or when no local install is known — then we refuse with a clear error.
@@ -432,7 +432,7 @@ export function boundText(
   maxChars: number,
   /**
    * REQUIRED (codex gate): there is no safe default. `boundText` is shared by tools with
-   * DIFFERENT levers — read_node_file has `max_chars`, apply_node_patch has none — so a
+   * DIFFERENT levers — action:"read" has `max_chars`, action:"patch" has none — so a
    * default naming `max_chars` would ship a dead remedy to whichever caller lacks it.
    * Every call site states its own.
    */
@@ -483,7 +483,7 @@ function globToRegExp(glob: string): RegExp {
 }
 
 // ---------------------------------------------------------------------------
-// list_node_pack_files
+// node_pack action:"list_files"
 // ---------------------------------------------------------------------------
 
 export interface ListFilesOptions {
@@ -584,7 +584,7 @@ export function listNodePackFiles(
 }
 
 // ---------------------------------------------------------------------------
-// read_node_file
+// node_pack action:"read"
 // ---------------------------------------------------------------------------
 
 export interface ReadFileOptions {
@@ -595,9 +595,9 @@ export interface ReadFileOptions {
 }
 
 /**
- * #809: read_node_file's truncation notice. Exported (with the other notice builders
+ * #809: the read action's truncation notice. Exported (with the other notice builders
  * below) so the schema-driven remedy test can check the parameters they name against
- * read_node_file's REAL zod shape without standing up a filesystem — an untested hint
+ * the read action's REAL zod shape without standing up a filesystem — an untested hint
  * string is precisely how this issue's defect 1 happened.
  *
  * Two DIFFERENT levers, both named: the char budget and the line window. A caller cut by
@@ -617,8 +617,8 @@ export const readBoundNotice =
     const rest = onePhysicalLine
       ? `this slice is a SINGLE physical line, so \`start_line\`/\`line_count\` cannot reach the rest — ` +
         (maxChars >= READ_MAX_CHARS
-          ? `at the ${READ_MAX_CHARS} ceiling this tool cannot return more of it; search within it with search_node_packs instead`
-          : `${raiseOrCeiling("max_chars", maxChars, READ_MAX_CHARS)}, and past that use search_node_packs to locate what you need inside it`)
+          ? `at the ${READ_MAX_CHARS} ceiling this tool cannot return more of it; search within it with node_pack (action:"search") instead`
+          : `${raiseOrCeiling("max_chars", maxChars, READ_MAX_CHARS)}, and past that use node_pack (action:"search") to locate what you need inside it`)
       : `${raiseOrCeiling("max_chars", maxChars, READ_MAX_CHARS)}, or page with \`start_line\`/\`line_count\` (max ${READ_MAX_LINES} lines)`;
     return `\n\n[... ${dropped} more char(s) in lines ${startLine}-${endLine} cut by \`max_chars\`=${maxChars}; ${rest} ...]`;
   };
@@ -703,7 +703,7 @@ export function readNodeFile(
 }
 
 // ---------------------------------------------------------------------------
-// search_node_packs
+// node_pack action:"search"
 // ---------------------------------------------------------------------------
 
 export interface SearchOptions {
@@ -739,9 +739,9 @@ export function clipMatchLine(text: string): string {
   // The marker is spent from the SAME cap it describes (codex gate), so reserve its
   // worst-case size — the emitted field still honours SEARCH_LINE_MAX.
   const marker = (dropped: number) =>
-    // "read the FULL line" would over-promise (codex gate): read_node_file has its own
+    // "read the FULL line" would over-promise (codex gate): action:"read" has its own
     // 24000-char budget, so it returns MORE of the line, not necessarily all of it.
-    `…(+${dropped} chars; fixed ${SEARCH_LINE_MAX}-char per-line cap — read more of it with read_node_file, itself bounded by its own max_chars, max ${READ_MAX_CHARS})`;
+    `…(+${dropped} chars; fixed ${SEARCH_LINE_MAX}-char per-line cap — read more of it with node_pack (action:"read"), itself bounded by its own max_chars, max ${READ_MAX_CHARS})`;
   const keep = Math.max(0, SEARCH_LINE_MAX - marker(text.length).length);
   return text.slice(0, keep) + marker(text.length - keep);
 }
@@ -947,7 +947,7 @@ function searchBuiltin(
 }
 
 // ---------------------------------------------------------------------------
-// write_node_file
+// node_pack action:"write"
 // ---------------------------------------------------------------------------
 
 export interface WriteFileOptions {
@@ -992,7 +992,7 @@ export function writeNodeFile(
 
   const content = options.content ?? "";
   deps.writeFileText(abs, content);
-  logger.info("write_node_file", { path: rel, bytes: Buffer.byteLength(content) });
+  logger.info("node_pack:write", { path: rel, bytes: Buffer.byteLength(content) });
 
   return {
     path: rel.split(/[\\/]/).join("/"),
@@ -1002,7 +1002,7 @@ export function writeNodeFile(
 }
 
 // ---------------------------------------------------------------------------
-// apply_node_patch
+// node_pack action:"patch"
 // ---------------------------------------------------------------------------
 
 export interface PatchResult {
@@ -1031,13 +1031,13 @@ export function parsePatchPaths(patch: string): string[] {
 }
 
 /**
- * #809 (codex gate): apply_node_patch's ONLY parameter is `patch` — it has no
+ * #809 (codex gate): the patch action's ONLY parameter is `patch` — it has no
  * `max_chars`. Its git output cap is therefore fixed, and a remedy naming a lever this
  * tool does not have would be the very defect this issue is about, pointing the other
  * way. Say the cap is fixed, and name the tool that CAN page the same text.
  */
 export const patchBoundNotice = (dropped: number) =>
-  `\n\n[... ${dropped} more char(s) cut at the fixed ${CMD_OUTPUT_MAX}-char git-output cap — apply_node_patch has no parameter to raise it. Split the patch into smaller per-file hunks and re-apply: the output shrinks with the patch ...]`;
+  `\n\n[... ${dropped} more char(s) cut at the fixed ${CMD_OUTPUT_MAX}-char git-output cap — node_pack (action:"patch") has no parameter to raise it. Split the patch into smaller per-file hunks and re-apply: the output shrinks with the patch ...]`;
 
 export function applyNodePatch(
   patch: string,
@@ -1096,7 +1096,7 @@ export function applyNodePatch(
 }
 
 // ---------------------------------------------------------------------------
-// node_pack_git
+// node_pack action:"git"
 // ---------------------------------------------------------------------------
 
 export type GitAction = "status" | "diff" | "log" | "commit" | "push";
@@ -1135,7 +1135,7 @@ function packRelativePath(packDir: string, p: string, deps: NodeDevDeps): string
   return rel.split(/[\\/]/).join("/") || ".";
 }
 
-/** #809: node_pack_git's real ceiling is READ_MAX_CHARS (24000) — a CODE clamp the
+/** #809: the git action's real ceiling is READ_MAX_CHARS (24000) — a CODE clamp the
  *  parameter description never mentioned. State it here so a caller who raises
  *  `max_chars` past it learns why the extra was silently dropped, and narrow-the-scope
  *  is offered because a whole-pack `diff` is often better answered by `paths`. */
@@ -1152,7 +1152,7 @@ export function nodePackGit(
   }
   const action = options.action;
   const maxChars = Math.min(
-    // #809: same floor as read_node_file — a budget too small to explain itself is not a
+    // #809: same floor as action:"read" — a budget too small to explain itself is not a
     // usable budget. Ceiling untouched.
     Math.max(MIN_OUTPUT_CHARS, options.maxChars ?? CMD_OUTPUT_MAX),
     READ_MAX_CHARS,

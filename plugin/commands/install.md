@@ -19,10 +19,10 @@ The user wants to install a ComfyUI custom node pack from the registry or a GitH
    - **Descriptive name**: like "Impact Pack" or "ControlNet" — search for it
 
 2. **Find the pack.** If not a direct GitHub URL:
-   - Call `search_custom_nodes` with the argument as the query
+   - Call `search_custom_nodes` (`action: "search"`) with the argument as `query`
    - Present the top results: name, description, author, star count
    - If multiple matches, ask the user to confirm which one they want
-   - Call `get_node_pack_details` with the selected pack ID for full info including the repository URL
+   - Call `search_custom_nodes` (`action: "details"`) with the selected pack ID for full info including the repository URL
 
 3. **Confirm with the user.** Before installing, show:
    - Pack name and description

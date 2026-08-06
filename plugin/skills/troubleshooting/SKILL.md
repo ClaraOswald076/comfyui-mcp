@@ -18,8 +18,8 @@ globs:
 
 When a workflow fails, follow this systematic approach:
 
-1. **Get the error**: Use `get_history` to retrieve the execution result with full traceback
-2. **Check logs**: Use `get_logs` with keyword filters like `"error"`, `"warning"`, `"traceback"`
+1. **Get the error**: Use `get_history(action="diagnose")` to retrieve the execution result with the full traceback, plus any missing models/nodes
+2. **Check logs**: Use `get_system_stats (action:"logs")` with keyword filters like `"error"`, `"warning"`, `"traceback"`
 3. **Identify the failing node**: The history response includes the `node_id` and `node_type` that failed
 4. **Cross-reference inputs**: Use `create_workflow (action:"node_info")` to verify the failing node's expected input schema
 5. **Check models**: Use `list_local_models` to verify all referenced model files exist
@@ -181,13 +181,13 @@ The workflow references a node type that is not installed. This happens when:
 
 1. **Search for the node pack**:
    ```
-   search_custom_nodes("NodeClassName")
+   search_custom_nodes(action="search", query="NodeClassName")
    ```
 2. **Install via ComfyUI Manager** or the registry
 3. **Check logs for import errors**:
    ```
-   get_logs(keyword="import")
-   get_logs(keyword="error")
+   get_system_stats (action:"logs")(keyword="import")
+   get_system_stats (action:"logs")(keyword="error")
    ```
    Import errors often reveal missing Python dependencies
 4. **Install missing Python dependencies**: If the custom node requires a pip package:
@@ -442,8 +442,9 @@ PyTorch and CUDA version incompatibility, usually after:
 ### Workflow Failed — Get Details
 
 ```
-get_history()                           # Most recent execution
-get_history(prompt_id="abc-123")        # Specific execution
+get_history(action="list")                       # Most recent execution
+get_history(action="list", prompt_id="abc-123")  # Specific execution
+get_history(action="diagnose")                   # Why the last run failed
 ```
 
 The response includes:
@@ -457,7 +458,7 @@ The response includes:
 ```
 get_system_stats()    # GPU info, VRAM, Python/PyTorch versions
 queue(action="list")  # Running and pending jobs
-get_logs(max_lines=50, keyword="error")  # Recent error logs
+get_system_stats (action:"logs")(max_lines=50, keyword="error")  # Recent error logs
 ```
 
 ### Verify Node Availability

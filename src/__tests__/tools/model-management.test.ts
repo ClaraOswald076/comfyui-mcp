@@ -39,6 +39,8 @@ vi.mock("../../services/model-resolver.js", async () => {
 
 import { registerModelManagementTools } from "../../tools/model-management.js";
 import { setProgressDir } from "../../services/download-progress.js";
+import * as progressModule from "../../services/download-progress.js";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -68,6 +70,7 @@ function makeServer() {
   return {
     downloadModel: (args: Record<string, unknown>) => download({ ...args, action: "download" }),
     downloadStatus: (args: Record<string, unknown>) => download({ ...args, action: "status" }),
+    cancelDownload: (args: Record<string, unknown>) => download({ ...args, action: "cancel" }),
     listLocalModels: (args: Record<string, unknown>) => inventory({ ...args, action: "list" }),
   };
 }
@@ -268,7 +271,11 @@ describe('download_model action:"status"', () => {
       expect(text).toContain(id);
       expect(text).toContain("heartbeat stale for");
       expect(text).toContain('Do NOT re-issue download_model action:"download" while this warning remains');
-      expect(text).toContain("only after confirming the .partial has stopped growing");
+      // #858: the note now names the recovery path — a cancel that closes the
+      // record once the writer is PROVEN gone, and refuses while it cannot be.
+      expect(text).toContain('action:"cancel"');
+      expect(text).toContain("PROVEN gone");
+      expect(text).toContain("refuses while that cannot be proven");
       expect(text).toContain("Do not report this download as failed or missing.");
     } finally {
       setProgressDir("");
@@ -391,6 +398,162 @@ describe('download_model action:"status"', () => {
         expect(text).not.toContain("livetray00000001");
         expect(text).not.toContain("Krea-2");
       } finally {
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // ── #858: a stale download whose writer is PROVEN gone can be cancelled ──────
+  describe("#858 stale-download recovery", () => {
+    /** A pid that is guaranteed dead: a child that already exited. */
+    function deadPid(): number {
+      // spawnSync returns after the child has fully exited.
+      const res = spawnSync(process.execPath, ["-e", ""]);
+      return res.pid;
+    }
+
+    async function seedStaleRecord(
+      dir: string,
+      id: string,
+      extra: Record<string, unknown> = {},
+    ): Promise<void> {
+      await writeFile(
+        join(dir, `control-job-${id}-dead-session.json`),
+        JSON.stringify({
+          id,
+          trayId: "staletray8580000",
+          progressId: "stale-prog-858",
+          url: "https://example.com/large.safetensors",
+          target_subfolder: "checkpoints",
+          status: "downloading",
+          started_at: Date.now() - 10 * 60 * 1000,
+          owner: "dead-session",
+          updated: Date.now() - 5 * 60 * 1000, // heartbeat long stale
+          ...extra,
+        }),
+      );
+    }
+
+    it("cancel CLOSES a stale record whose writer process is proven gone — and status then reports the administrative cancel honestly", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-858-"));
+      setProgressDir(dir);
+      try {
+        const id = "stale-dead-job-858";
+        await seedStaleRecord(dir, id, { pid: deadPid() });
+
+        const { cancelDownload, downloadStatus } = makeServer();
+        const res = await cancelDownload({ id, tray_id: "staletray8580000" });
+        const text = res.content[0].text;
+        expect(text).toContain("confirmed GONE");
+        expect(text).toContain("closed as **cancelled**");
+        // The remedy is actionable from here: re-issue.
+        expect(text).toContain('re-issue the same download_model `action:"download"` request');
+        // And it must NOT claim a live transfer was aborted.
+        expect(text).not.toMatch(/being aborted/);
+
+        // The record now reads as an administrative cancel — not "the partial was
+        // left on disk", which nobody verified.
+        const status = (await downloadStatus({ id })).content[0].text;
+        expect(status).toContain("cancelled");
+        expect(status).toContain("confirmed GONE");
+        expect(status).not.toContain("the partial was left on disk");
+      } finally {
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("cancel REFUSES a stale record whose writer process is still alive", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-858-"));
+      setProgressDir(dir);
+      try {
+        const id = "stale-live-job-858";
+        // A live pid (this very process) under a FOREIGN owner nonce stands in for
+        // another live session: stale heartbeat, but the process provably exists.
+        await seedStaleRecord(dir, id, { pid: process.pid });
+
+        const { cancelDownload } = makeServer();
+        const text = (await cancelDownload({ id, tray_id: "staletray8580000" })).content[0].text;
+        expect(text).toContain("STILL RUNNING");
+        expect(text).toContain("refused");
+        expect(text).toContain("panel download tray");
+        // Nothing was closed: the record still reads downloading.
+        expect(text).toContain("status: downloading");
+      } finally {
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("cancel REFUSES a stale record with no writer identity — unprovable is not dead", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-858-"));
+      setProgressDir(dir);
+      try {
+        const id = "stale-unknown-job-858";
+        await seedStaleRecord(dir, id); // no pid — a pre-#858 record
+
+        const { cancelDownload } = makeServer();
+        const text = (await cancelDownload({ id, tray_id: "staletray8580000" })).content[0].text;
+        expect(text).toContain("cannot be proven");
+        expect(text).toContain("panel download tray");
+      } finally {
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("cancel on a foreign SETTLED record reports the settled state instead of 'cannot be aborted'", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-858-"));
+      setProgressDir(dir);
+      try {
+        const id = "foreign-done-job-858";
+        await writeFile(
+          join(dir, `control-job-${id}-other-session.json`),
+          JSON.stringify({
+            id,
+            trayId: "donetray85800000",
+            progressId: "done-prog-858",
+            url: "https://example.com/large.safetensors",
+            target_subfolder: "checkpoints",
+            status: "done",
+            path: "/m/checkpoints/large.safetensors",
+            started_at: Date.now() - 10 * 60 * 1000,
+            finished_at: Date.now() - 9 * 60 * 1000,
+            owner: "other-session",
+            updated: Date.now() - 9 * 60 * 1000,
+          }),
+        );
+
+        const { cancelDownload } = makeServer();
+        const text = (await cancelDownload({ id })).content[0].text;
+        expect(text).toContain("already **done** — nothing to cancel");
+        expect(text).not.toContain("can't be aborted");
+      } finally {
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("cancel DISCLOSES when the dead session's record file could not be deleted", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-858-"));
+      setProgressDir(dir);
+      const removeSpy = vi
+        .spyOn(progressModule, "removePersistedDownloadJobFor")
+        .mockReturnValue(false);
+      try {
+        const id = "stale-undeletable-858";
+        await seedStaleRecord(dir, id, { pid: deadPid() });
+
+        const { cancelDownload } = makeServer();
+        const text = (await cancelDownload({ id, tray_id: "staletray8580000" })).content[0].text;
+        // The reclaim happened (the terminal record is durable)…
+        expect(text).toContain("closed as **cancelled**");
+        // …but the leftover is disclosed, not hidden behind a clean-close claim.
+        expect(text).toContain("could not be deleted");
+        expect(text).toContain("no longer blocks cancelling or re-issuing");
+      } finally {
+        removeSpy.mockRestore();
         setProgressDir("");
         await rm(dir, { recursive: true, force: true });
       }

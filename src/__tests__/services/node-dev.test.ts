@@ -177,7 +177,7 @@ describe("resolveInJail", () => {
 
   it("resolves against the saved default workspace when COMFYUI_PATH is unset (#506)", () => {
     // No COMFYUI_PATH, but a saved default workspace is set — a loopback session
-    // must be treated as local, mirroring get_environment/workspace action:"get", instead
+    // must be treated as local, mirroring install_comfyui (action:"environment")/workspace action:"get", instead
     // of being rejected as remote.
     config.comfyuiPath = undefined;
     wsMock.saved = workspace;
@@ -421,7 +421,7 @@ describe("listNodePackFiles truncation honesty (#809)", () => {
 // #809 (codex gate): the clamps must be exercised, not asserted about. A remedy that
 // quotes a ceiling the runtime does not enforce is the same defect as a wrong param.
 describe("max_chars clamps are real (#809)", () => {
-  it("read_node_file honours the ceiling AND the floor it advertises", () => {
+  it('node_pack action:"read" honours the ceiling AND the floor it advertises', () => {
     const pack = join(customNodes, "Pack");
     mkdirSync(pack, { recursive: true });
     // MANY lines, so paging by start_line/line_count is a live remedy here.
@@ -459,10 +459,10 @@ describe("max_chars clamps are real (#809)", () => {
     expect(r.content).toMatch(/`start_line`\/`line_count` cannot reach the rest/);
     // At the ceiling it must not pretend another parameter would help either.
     expect(r.content).toContain(`at the ${READ_MAX_CHARS} ceiling this tool cannot return more of it`);
-    expect(r.content).toContain("search_node_packs");
+    expect(r.content).toContain('node_pack (action:"search")');
   });
 
-  it("node_pack_git honours the same ceiling and floor", () => {
+  it('node_pack action:"git" honours the same ceiling and floor', () => {
     mkdirSync(join(customNodes, "Pack"), { recursive: true });
     const { deps } = makeDeps({
       runGit: () => ({ status: 0, stdout: "d".repeat(200_000), stderr: "" }),

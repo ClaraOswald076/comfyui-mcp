@@ -40,7 +40,7 @@ export async function upscaleImage(
   if (!args.image || !args.image.trim()) {
     throw new ValidationError(
       "image is required — the filename of an image already in ComfyUI's input dir " +
-        "(upload it first with upload_image, or stage an output with stage_output_as_input).",
+        "(upload it first with upload_image (action:\"image\"), or stage an output with upload_image (action:\"stage\")).",
     );
   }
   assertSafeInputFilename(args.image, "image");
