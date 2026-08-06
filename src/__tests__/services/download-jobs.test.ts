@@ -119,6 +119,7 @@ import { setProgressDir, PERSIST_OWNER } from "../../services/download-progress.
 import * as progressModule from "../../services/download-progress.js";
 import { downloadModel, resolveDownloadTarget } from "../../services/model-resolver.js";
 import { mkdtemp, mkdir, symlink, writeFile, readFile, rm as fsRm } from "node:fs/promises";
+import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 
@@ -142,6 +143,9 @@ async function writeForeignJobRecord(
     status?: "downloading" | "done" | "error" | "cancelled";
     /** Landed path for a "done" record. */
     path?: string;
+    /** The writing process's pid (#858) — present on records written after the
+     *  liveness stamp was added; absent simulates a pre-fix (unprovable) record. */
+    pid?: number;
   },
 ): Promise<void> {
   const status = rec.status ?? "downloading";
@@ -158,6 +162,7 @@ async function writeForeignJobRecord(
     started_at: Date.now(),
     finished_at: status === "downloading" ? undefined : Date.now(),
     owner: rec.owner,
+    pid: rec.pid,
     updated: Date.now() - (rec.ageMs ?? 0),
   };
   await writeFile(pathJoin(dir, `control-job-${rec.id}-${rec.owner}.json`), JSON.stringify(body));
@@ -1303,6 +1308,240 @@ describe("download job registry", () => {
         setProgressDir("");
         await fsRm(dir, { recursive: true, force: true });
       }
+    });
+
+    // ── #858: a stale in-flight record whose writer is PROVEN gone can be
+    // reclaimed by a later session; an unprovable one stays refused (#761). ──
+    describe("#858 stale-download reclaim", () => {
+      /** A pid guaranteed to be dead: a child process that already exited. */
+      const deadPid = (): number => spawnSync(process.execPath, ["-e", ""]).pid;
+
+      it("cancel RECLAIMS a stale in-flight record whose writer process is proven gone", async () => {
+        const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
+        setProgressDir(dir);
+        const clearSpy = vi.spyOn(progressModule, "clearDownloadProgress");
+        try {
+          const id = "deadjog858xxxxxx1";
+          const owner = "dead-session";
+          await writeForeignJobRecord(dir, {
+            id,
+            trayId: "deadtray85800001",
+            progressId: "dead-prog-858",
+            url: URL_A,
+            owner,
+            ageMs: 10 * 60 * 1000,
+            pid: deadPid(),
+          });
+          clearSpy.mockClear();
+
+          const res = cancelDownloadJob(id);
+          expect(res.found).toBe(true);
+          expect(res.reclaimed).toBe(true);
+          expect(res.aborted).toBe(false); // nothing live was aborted
+          expect(res.status).toBe("cancelled");
+
+          // The dead owner's record file is gone…
+          await expect(
+            readFile(pathJoin(dir, `control-job-${id}-${owner}.json`), "utf8"),
+          ).rejects.toMatchObject({ code: "ENOENT" });
+          // …and THIS session's terminal record has replaced it, marked as an
+          // administrative (reclaimed) cancel rather than an abort.
+          const ours = JSON.parse(
+            await readFile(pathJoin(dir, `control-job-${id}-${PERSIST_OWNER}.json`), "utf8"),
+          );
+          expect(ours.status).toBe("cancelled");
+          expect(ours.reclaimed_dead).toBe(true);
+          // Resolution now reports the settled truth instead of a forever-downloading.
+          const got = getDownloadJob(id);
+          expect(got?.status).toBe("cancelled");
+          expect(got?.reclaimedDead).toBe(true);
+          // The dead writer's tray row was cleared (nothing live shares it).
+          expect(clearSpy).toHaveBeenCalledWith("dead-prog-858");
+        } finally {
+          clearSpy.mockRestore();
+          setProgressDir("");
+          await fsRm(dir, { recursive: true, force: true });
+        }
+      });
+
+      it("cancel REFUSES a stale record whose writer process is still ALIVE", async () => {
+        const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
+        setProgressDir(dir);
+        try {
+          const id = "livejog858xxxxxx1";
+          const owner = "other-live-session";
+          // A live pid (this very process) under a FOREIGN owner nonce stands in
+          // for another live session: stale heartbeat, provably-live process.
+          await writeForeignJobRecord(dir, {
+            id,
+            trayId: "livetray85800001",
+            progressId: "live-prog-858",
+            url: URL_A,
+            owner,
+            ageMs: 10 * 60 * 1000,
+            pid: process.pid,
+          });
+
+          const res = cancelDownloadJob(id);
+          expect(res.found).toBe(true);
+          expect(res.owned).toBe(false);
+          expect(res.reclaimed).toBeUndefined();
+          expect(res.reclaimDenied).toBe("owner-alive");
+          // Nothing was destroyed: the record survives, still in-flight.
+          await expect(
+            readFile(pathJoin(dir, `control-job-${id}-${owner}.json`), "utf8"),
+          ).resolves.toContain(id);
+          expect(getDownloadJob(id)?.status).toBe("downloading");
+        } finally {
+          setProgressDir("");
+          await fsRm(dir, { recursive: true, force: true });
+        }
+      });
+
+      it("cancel REFUSES a stale record owned by a DIFFERENT live process (the probe itself must answer)", async () => {
+        // Same shape as the own-pid test above, but the pid belongs to a genuinely
+        // separate LIVE process — this exercises the process.kill(pid, 0) existence
+        // probe rather than the own-pid shortcut.
+        const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)"]);
+        const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
+        setProgressDir(dir);
+        try {
+          const id = "foreignlive858xxx1";
+          const owner = "foreign-live-session";
+          await writeForeignJobRecord(dir, {
+            id,
+            trayId: "foreignlivetray01",
+            progressId: "foreign-live-prog",
+            url: URL_A,
+            owner,
+            ageMs: 10 * 60 * 1000,
+            pid: child.pid,
+          });
+
+          const res = cancelDownloadJob(id);
+          expect(res.reclaimed).toBeUndefined();
+          expect(res.reclaimDenied).toBe("owner-alive");
+          await expect(
+            readFile(pathJoin(dir, `control-job-${id}-${owner}.json`), "utf8"),
+          ).resolves.toContain(id);
+        } finally {
+          child.kill();
+          setProgressDir("");
+          await fsRm(dir, { recursive: true, force: true });
+        }
+      });
+
+      it("cancel REFUSES a stale record with NO writer pid — unprovable is not dead", async () => {
+        const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
+        setProgressDir(dir);
+        try {
+          const id = "unknownjog858xxxx1";
+          const owner = "pre-fix-session";
+          await writeForeignJobRecord(dir, {
+            id,
+            trayId: "unknowntray858001",
+            progressId: "unknown-prog-858",
+            url: URL_A,
+            owner,
+            ageMs: 10 * 60 * 1000,
+            // no pid: a pre-#858 record — the writer cannot be proven gone
+          });
+
+          const res = cancelDownloadJob(id);
+          expect(res.reclaimed).toBeUndefined();
+          expect(res.reclaimDenied).toBe("owner-unknown");
+          await expect(
+            readFile(pathJoin(dir, `control-job-${id}-${owner}.json`), "utf8"),
+          ).resolves.toContain(id);
+        } finally {
+          setProgressDir("");
+          await fsRm(dir, { recursive: true, force: true });
+        }
+      });
+
+      it("reclaim by tray_id works when the bare id is ambiguous across two stale records", async () => {
+        const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
+        setProgressDir(dir);
+        try {
+          const id = "ambigdead858xxxx1";
+          const pid = deadPid();
+          await writeForeignJobRecord(dir, {
+            id,
+            trayId: "deada85800000001",
+            progressId: "dead-prog-a",
+            url: URL_A,
+            owner: "dead-a",
+            ageMs: 10 * 60 * 1000,
+            pid,
+          });
+          await writeForeignJobRecord(dir, {
+            id,
+            trayId: "deadb85800000002",
+            progressId: "dead-prog-b",
+            url: URL_B,
+            owner: "dead-b",
+            ageMs: 10 * 60 * 1000,
+            pid,
+          });
+
+          // Two in-flight candidates — the bare id still refuses to guess (#822)…
+          const amb = cancelDownloadJob(id);
+          expect(amb.ambiguous).toBe(true);
+          expect(amb.reclaimed).toBeUndefined();
+          // …but naming the exact row by tray id reclaims exactly that one.
+          const res = cancelDownloadJob(id, "deadb85800000002");
+          expect(res.reclaimed).toBe(true);
+          expect(res.status).toBe("cancelled");
+          await expect(
+            readFile(pathJoin(dir, `control-job-${id}-dead-b.json`), "utf8"),
+          ).rejects.toMatchObject({ code: "ENOENT" });
+          // The OTHER dead record was not the target and is untouched.
+          await expect(
+            readFile(pathJoin(dir, `control-job-${id}-dead-a.json`), "utf8"),
+          ).resolves.toContain(id);
+        } finally {
+          setProgressDir("");
+          await fsRm(dir, { recursive: true, force: true });
+        }
+      });
+
+      it("reclaim does NOT clear a tray row a LIVE foreign download still shares", async () => {
+        const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
+        setProgressDir(dir);
+        const clearSpy = vi.spyOn(progressModule, "clearDownloadProgress");
+        try {
+          const id = "deadshared858xxx1";
+          await writeForeignJobRecord(dir, {
+            id,
+            trayId: "deadsharedtray001",
+            progressId: "shared-prog-858",
+            url: URL_A,
+            owner: "dead-session",
+            ageMs: 10 * 60 * 1000,
+            pid: deadPid(),
+          });
+          // A DIFFERENT, still-live foreign download (fresh heartbeat) writing rows
+          // under the SAME progress id — its tray display must survive the reclaim.
+          await writeForeignJobRecord(dir, {
+            id: "liveforeign858xxx1",
+            trayId: "liveforeigntray01",
+            progressId: "shared-prog-858",
+            url: URL_A,
+            owner: "live-session",
+          });
+          clearSpy.mockClear();
+
+          const res = cancelDownloadJob(id);
+          expect(res.reclaimed).toBe(true);
+          expect(clearSpy).not.toHaveBeenCalledWith("shared-prog-858");
+          // The dead record's URL-keyed row id was not shared — that one is cleared.
+          expect(clearSpy).toHaveBeenCalledWith("deadsharedtray001");
+        } finally {
+          clearSpy.mockRestore();
+          setProgressDir("");
+          await fsRm(dir, { recursive: true, force: true });
+        }
+      });
     });
 
     it("keeps a heartbeat-stale in-flight record visible without deleting its persisted state (#761)", async () => {

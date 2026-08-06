@@ -233,7 +233,8 @@ export function registerModelManagementTools(server: McpServer): void {
     "download_status",
     "Check on model downloads started by download_model. Reports each download's state (downloading / done / error / cancelled), its destination path once it lands, and byte progress when the panel progress channel is enabled. " +
       "Use this after download_model reports a download is still running — that means the transfer is in flight, NOT that it failed. " +
-      "Survives a sidebar/tool-session reconnect: an in-flight download started in a previous session is still resolvable by its id (or by `url`), so you can confirm it's still running instead of starting a duplicate. Read-only.",
+      "Survives a sidebar/tool-session reconnect: an in-flight download started in a previous session is still resolvable by its id (or by `url`), so you can confirm it's still running instead of starting a duplicate. " +
+      "A previous session's download whose heartbeat has gone stale is reported with a stale-heartbeat NOTE: cancel_download can close it once the writer is proven gone, and re-issuing download_model then resumes or restarts it. Read-only.",
     {
       id: z
         .string()
@@ -338,9 +339,16 @@ export function registerModelManagementTools(server: McpServer): void {
               : j.status === "error"
                 ? `\n    failed: ${j.error}`
                 : j.status === "cancelled"
-                  ? (j.viaManager
-                      ? `\n    cancelled — this was a remote ComfyUI-Manager dispatch, so there is NO local partial to resume, and the host MAY still be fetching server-side (there's no Manager recall API). Re-issuing starts a NEW server-side dispatch (a duplicate, not a resume). Check list_local_models to see whether the file landed before deciding.`
-                      : `\n    cancelled — the partial was left on disk and can be resumed by re-issuing the download (it picks up where it left off)`) +
+                  ? (j.reclaimedDead
+                      ? // #858: NO live transfer was aborted — the writer was already
+                        // dead — so this must not claim a partial was deliberately
+                        // left by a cancel (none may exist).
+                        (j.viaManager
+                          ? `\n    cancelled — the previous session's writer was confirmed GONE (its process no longer exists), so a later session closed its stale record; no live transfer was aborted. This was a remote ComfyUI-Manager dispatch: the host MAY still be fetching server-side (no Manager recall API) and there is NO local partial to resume — check list_local_models to see whether the file landed; re-issuing starts a NEW dispatch.`
+                          : `\n    cancelled — the previous session's writer was confirmed GONE (its process no longer exists), so a later session closed its stale record; no live transfer was aborted. Any .partial the dead writer left was untouched — re-issue the download to resume from it, or to restart cleanly if there is none.`)
+                      : j.viaManager
+                        ? `\n    cancelled — this was a remote ComfyUI-Manager dispatch, so there is NO local partial to resume, and the host MAY still be fetching server-side (there's no Manager recall API). Re-issuing starts a NEW server-side dispatch (a duplicate, not a resume). Check list_local_models to see whether the file landed before deciding.`
+                        : `\n    cancelled — the partial was left on disk and can be resumed by re-issuing the download (it picks up where it left off)`) +
                     // A recovery-critical note from cancellation cleanup (e.g. a previous
                     // destination file preserved under a .bak path because it couldn't be
                     // restored) — surface it so the user can recover, not mask it.
@@ -348,7 +356,7 @@ export function registerModelManagementTools(server: McpServer): void {
                   : `\n    still streaming — started ${Math.round((Date.now() - j.started_at) / 1000)}s ago`;
           const staleNote =
             j.status === "downloading" && j.staleInflight
-              ? `\n    NOTE: heartbeat stale for ${Math.round((j.staleForMs ?? 0) / 1000)}s. The owning session may have reconnected, and the transfer may still be running. Do NOT re-issue download_model while this warning remains: the original owner may still be writing the same .partial. Wait and check download_status again; only after confirming the .partial has stopped growing should you decide on recovery. Do not report this download as failed or missing.`
+              ? `\n    NOTE: heartbeat stale for ${Math.round((j.staleForMs ?? 0) / 1000)}s. The owning session may have reconnected, and the transfer may still be running. Do NOT re-issue download_model while this warning remains: the original owner may still be writing the same .partial. To recover, call cancel_download with this id and tray_id — it closes the stale record once the writer is PROVEN gone (its process no longer exists) and refuses while that cannot be proven. After a successful cancel, re-issuing download_model resumes any .partial the dead writer left, or restarts cleanly. Do not report this download as failed or missing.`
               : "";
           // Surface a declined resume so the agent/user knows a pre-existing
           // .partial was discarded and why — instead of it being silent (#467).
@@ -396,7 +404,7 @@ export function registerModelManagementTools(server: McpServer): void {
 
   server.tool(
     "cancel_download",
-    "Cancel ONE in-flight model download started by download_model / download_civitai_model, by its id (from download_status or the tool that started it). Aborts only that download's transfer — other downloads keep running. The partially-downloaded bytes are left on disk as a resumable .partial and are NEVER reported as a completed file, so nothing corrupt lands in your models directory; re-issuing the same download later resumes where it left off. Idempotent: cancelling an already-finished, failed, or already-cancelled download just reports its current state. Only downloads owned by the current server session can be aborted — a download started before a reconnect is reported but must be stopped from the panel download tray. NOTE: for a download dispatched to a REMOTE ComfyUI via ComfyUI-Manager (server-side fetch), the local job is marked cancelled but the host may keep fetching — there is no Manager API to stop it.",
+    "Cancel ONE in-flight model download started by download_model / download_civitai_model, by its id (from download_status or the tool that started it). Aborts only that download's transfer — other downloads keep running. The partially-downloaded bytes are left on disk as a resumable .partial and are NEVER reported as a completed file, so nothing corrupt lands in your models directory; re-issuing the same download later resumes where it left off. Idempotent: cancelling an already-finished, failed, or already-cancelled download just reports its current state. A download whose AbortController lives in ANOTHER live session cannot be aborted from here (stop it from the panel download tray) — but a download left 'downloading' by a session that is PROVEN gone (heartbeat stale AND its process no longer exists) CAN be cancelled from here: the stale record is closed as cancelled, after which re-issuing download_model resumes the leftover .partial or restarts cleanly. While the writer cannot be proven gone, the cancel refuses rather than risk two writers on one file. NOTE: for a download dispatched to a REMOTE ComfyUI via ComfyUI-Manager (server-side fetch), the local job is marked cancelled but the host may keep fetching — there is no Manager API to stop it.",
     {
       id: z
         .string()
@@ -439,7 +447,7 @@ export function registerModelManagementTools(server: McpServer): void {
                   `writing the SAME destination file, so cancelling by id could stop the wrong one.\n` +
                   (rows ? `${rows}\n\n` : "\n") +
                   `Re-run cancel_download with \`tray_id\` set to the one you want stopped. ` +
-                  `(A download owned by a PREVIOUS session still cannot be aborted from here — that one must be stopped from the panel download tray — but it is now selectable, so you can at least confirm which it is with download_status.)`,
+                  `(A download left over from a PREVIOUS session is selectable this way too: with its tray_id, cancel_download closes it once the writer is proven gone, and refuses — pointing at the panel download tray — while the writer may still be alive.)`,
               },
             ],
           };
@@ -459,14 +467,60 @@ export function registerModelManagementTools(server: McpServer): void {
             ],
           };
         }
-        if (!res.owned) {
+        if (res.reclaimed) {
+          // #858: the record said "downloading" but its writer is PROVEN gone — no
+          // live transfer existed to abort, so say exactly what happened and give
+          // the one remedy that now works: re-issue.
           return {
             content: [
               {
                 type: "text",
                 text:
-                  `Download \`${args.id}\` is tracked (status: ${res.status}) but was started by a different/previous server session, so it can't be aborted from here. ` +
-                  `Stop it from the panel download tray instead.`,
+                  `Download \`${args.id}\` was still listed as downloading from a previous session, but that session is confirmed GONE — its process no longer exists and its heartbeat had stopped — so there was no live transfer left to abort. ` +
+                  `The stale record has been closed as **cancelled** and its panel tray row removed.\n\n` +
+                  (res.job?.viaManager
+                    ? `It was a remote ComfyUI-Manager dispatch, so the host MAY still be fetching server-side (there is no Manager recall API) — check list_local_models to see whether the file landed. Re-issuing starts a NEW dispatch, not a resume.`
+                    : `To get the file, re-issue the same download_model request: it resumes from any .partial the dead session left on disk, or restarts cleanly if there is none.`),
+              },
+            ],
+          };
+        }
+        if (!res.owned) {
+          // A SETTLED record from another session is an idempotent no-op, not a
+          // refusal — "can't be aborted" about a download that already finished
+          // would report failure for work that succeeded.
+          if (res.status && res.status !== "downloading") {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Download \`${args.id}\` is already **${res.status}** — nothing to cancel.`,
+                },
+              ],
+            };
+          }
+          // Still (possibly) in flight under another session. WHY we cannot act
+          // differs, and the difference carries the remedy (#858 refuse-vs-disclose):
+          const staleSecs = Math.round((res.job?.staleForMs ?? 0) / 1000);
+          const detail =
+            res.reclaimDenied === "owner-alive"
+              ? `its heartbeat has been stale for ${staleSecs}s, but the session that started it is STILL RUNNING (its process is alive), so the transfer may still be writing the .partial and aborting it from here is refused`
+              : res.reclaimDenied === "owner-unknown"
+                ? `its heartbeat has been stale for ${staleSecs}s, but whether the writing session is gone cannot be proven from here (its record carries no writer identity to check), so aborting it from here is refused — it may still be writing`
+                : res.reclaimDenied === "persist-failed"
+                  ? `the session that started it is confirmed gone, but closing its stale record failed transiently`
+                  : `it is owned by another session with a live heartbeat, so the transfer is actively writing`;
+          const remedy =
+            res.reclaimDenied === "persist-failed"
+              ? `Retry cancel_download.`
+              : `Stop it from the panel download tray instead.`;
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `Download \`${args.id}\` is tracked (status: ${res.status}) but was started by a different/previous server session: ${detail}. ` +
+                  remedy,
               },
             ],
           };
