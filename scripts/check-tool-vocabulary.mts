@@ -51,6 +51,7 @@ import {
   actionLiteralSpans,
   deadNameRe,
   panelBaselineIntegrity,
+  deadNameMentions,
   rotMentions,
   type DeadName,
 } from "../src/tools/vocabulary.js";
@@ -395,7 +396,13 @@ for (const path of files) {
       // instruction, not the history. Binding the name to the context string means the
       // exempted text must itself contain the name, so an instruction added beside it is
       // a second occurrence and fails.
-      const occurrences = text.split(dead.name).length - 1;
+      // COUNTED THE WAY MENTIONS ARE DETECTED. `deadNameRe` is token-bounded, so
+      // `self_update_action` is NOT a mention of `self_update` — but a naive
+      // `split()` counted it as one, making any line that names an action and its
+      // own `<action>_action` parameter permanently unexemptable. The rule this
+      // count enforces (two real mentions cannot be told apart, so split the line)
+      // is unaffected: two genuine mentions still block.
+      const occurrences = deadNameMentions(dead.name, text).length;
       if (
         occurrences === 1 &&
         dead.allowedIn?.some(

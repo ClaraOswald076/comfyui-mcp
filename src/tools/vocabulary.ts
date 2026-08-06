@@ -1677,6 +1677,11 @@ export const DEAD_NAMES: readonly DeadName[] = [
     since: "0.50.0",
     replacement: 'get_system_stats (action:"calculate")',
     allowedIn: [
+      {
+        path: "docs/tools/workflow-execution.mdx",
+        context: "`clear_vram`, `report_issue`, `calculate`.",
+        why: "The generated reference page for the SURVIVING tool. This slice reused the retired tool's name as its ACTION name, so the page necessarily spells it — it is the action, not a call to the retired tool. Regenerated from the live schema, so it cannot drift.",
+      },
       // `calculate` is the only retired name in this slice that is also a bare
       // English word AND a source FILENAME. deadNameRe treats `.` and `-` as
       // boundaries, so `src/tools/calculate.ts` and `docs/design/calculate-tool.md`
@@ -1719,6 +1724,11 @@ export const DEAD_NAMES: readonly DeadName[] = [
     since: "0.50.0",
     replacement: 'get_system_stats (action:"clear_vram")',
     allowedIn: [
+      {
+        path: "docs/tools/workflow-execution.mdx",
+        context: "`clear_vram`, `report_issue`, `calculate`.",
+        why: "The generated reference page for the SURVIVING tool. This slice reused the retired tool's name as its ACTION name, so the page necessarily spells it — it is the action, not a call to the retired tool. Regenerated from the live schema, so it cannot drift.",
+      },
       {
         path: "docs/tools/workflow-execution.mdx",
         context: "\"clear_vram\" takes `unload_models`",
@@ -1770,6 +1780,11 @@ export const DEAD_NAMES: readonly DeadName[] = [
     allowedIn: [
       {
         path: "docs/tools/workflow-execution.mdx",
+        context: "`clear_vram`, `report_issue`, `calculate`.",
+        why: "The generated reference page for the SURVIVING tool. This slice reused the retired tool's name as its ACTION name, so the page necessarily spells it — it is the action, not a call to the retired tool. Regenerated from the live schema, so it cannot drift.",
+      },
+      {
+        path: "docs/tools/workflow-execution.mdx",
         context: "\"report_issue\" requires `title`",
         why: "The generated reference page for the SURVIVING tool, where this token is that tool's own ACTION name — the fold kept the verb deliberately. Not a call to the retired tool; the page is regenerated from the live schema.",
       },
@@ -1797,6 +1812,16 @@ export const DEAD_NAMES: readonly DeadName[] = [
     since: "0.50.0",
     replacement: 'install_comfyui (action:"update_all")',
     allowedIn: [
+      {
+        path: "docs/tools/install-environment.mdx",
+        context: "\"update\", \"update_all\" and \"environment\" take no other parameters",
+        why: "The generated reference page for the SURVIVING tool. This slice reused the retired tool's name as its ACTION name, so the page necessarily spells it — it is the action, not a call to the retired tool. Regenerated from the live schema, so it cannot drift.",
+      },
+      {
+        path: "docs/tools/install-environment.mdx",
+        context: "and not custom nodes (action:\"update_all\")",
+        why: "The generated reference page for the SURVIVING tool. This slice reused the retired tool's name as its ACTION name, so the page necessarily spells it — it is the action, not a call to the retired tool. Regenerated from the live schema, so it cannot drift.",
+      },
       {
         path: "docs/tools/install-environment.mdx",
         context: "Options: `install`, `update`, `update_all`, `panel`, `self_update`, `environment`, `configure_manager`, `apply_manifest`.",

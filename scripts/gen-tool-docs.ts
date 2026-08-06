@@ -294,8 +294,8 @@ function renderParam(name: string, schema: JsonSchema, required: boolean): strin
   // Description and the enum Options list go on SEPARATE lines, not joined by a
   // space. The vocabulary gate exempts at most ONE occurrence of a name per line
   // (more than one and it cannot tell which is history), and 0.50.0 slice 13 chose
-  // action names identical to the tools they replace — so `apply_manifest` appears
-  // in both the prose and the Options list of the same ParamField. Joined, that
+  // action names identical to the tools they replace, so such a name can appear
+  // in both the prose and the Options list of one ParamField. Joined, that
   // line is permanently unexemptable; split, each occurrence can be declared.
   return `<ParamField ${attrs.join(" ")}>\n  ${body.join("\n  ") || "—"}\n</ParamField>`;
 }

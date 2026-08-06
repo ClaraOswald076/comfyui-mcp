@@ -54,6 +54,7 @@ import { logger } from "../utils/logger.js";
 const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: McpServer) => void]> = [
   ["comfy-cli", registerComfyCliTools],
   ["workflows", registerWorkflowExecuteTools],
+  ["workflows", registerSystemStatsTools],
   ["workflow-authoring", registerWorkflowVisualizeTools],
   ["workflow-authoring", registerWorkflowComposeTools],
   ["workflows", registerQueueManagementTools],
@@ -83,7 +84,6 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["custom-nodes", registerNodeManagementTools],
   // (0.50.0 slice 9: the workflow-deps group's two tools folded into `list_packs`
   // actions "extract_deps"/"install_deps" — same note as skill-generator above.)
-  ["workflows", registerSystemStatsTools],
   ["server", registerInstallComfyUITools],
   ["models", registerModelExplorerTools],
   ["server", registerWorkspaceEnvTools],

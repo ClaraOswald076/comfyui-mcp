@@ -564,7 +564,7 @@ describe("collectToolCatalog (real tool surface)", () => {
     // now fails where 100 would still have passed. `>=` rather than `===`
     // because autoloaded workflow tools can add names on a dev box.
     expect(catalog.tools.size).toBeGreaterThanOrEqual(TOOL_NAMES.length);
-    for (const expected of ["generate_image", "health_check", "enqueue_workflow", "list_local_models"]) {
+    for (const expected of ["generate_image", "get_system_stats", "enqueue_workflow", "list_local_models"]) {
       expect(catalog.get(expected), `missing ${expected}`).toBeDefined();
       expect(catalog.get(expected)?.description.length).toBeGreaterThan(20);
     }
