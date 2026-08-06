@@ -46,6 +46,22 @@ JavaScript).
    git clone https://github.com/artokun/comfyui-mcp-panel
    ```
 
+   <Warning>
+   **Pick `Latest`, not `Nightly`, in Manager's version dropdown.** Despite the
+   name, Manager's **Nightly** is not built nightly: it clones the repo **once**
+   at install time and then never tracks the branch again. It freezes you on
+   whatever commit happened to be `main` that day, while `Latest` keeps pace with
+   every release — so Nightly is routinely *older* than Latest, and silently drifts
+   further behind the longer you leave it. It reports no update available, because
+   from its point of view there isn't one.
+
+   To check where you actually are, compare the SHA under **Node Pack Info →
+   Version** against [the repo's commit
+   history](https://github.com/artokun/comfyui-mcp-panel/commits/main). To escape,
+   either select `Latest (x.y.z)` in that same dropdown, or — if you want to stay on
+   git — `git pull` in `custom_nodes/comfyui-mcp-panel`, which fast-forwards cleanly.
+   </Warning>
+
 2. **Sign in to the provider you want** once, so the background agent can use your
    subscription:
 
@@ -97,8 +113,7 @@ the panel chat.
 It can also **load a whole workflow or installer pack in one shot**
 (`panel_load_workflow pack:<name>`) and is **cost-aware**: bundled packs are
 local-GPU / free, and for an ad-hoc graph the agent checks the runtime
-(`list_packs` with `action: "check_runtime"`) and **asks before spending paid API
-credits**. See
+(`check_workflow_runtime`) and **asks before spending paid API credits**. See
 [Skills, Packs & Runtime Cost](./tools/skills-knowledge).
 
 ## Driving the live graph
@@ -184,10 +199,10 @@ credits (same tools on both backends — see
 
 | Tool | Effect |
 |---|---|
-| `list_packs` (`action: "skill_list"` / `"skill_read"`) | Discover and read bundled model-family + workflow skills |
-| `list_packs` (`action: "list"` / `"read_workflow"`) | List one-command installer packs (local-GPU / free) and read a pack's graph |
-| `list_packs` (`action: "list_templates"`) | List the connected server's custom-node-contributed workflow templates |
-| `list_packs` (`action: "check_runtime"`) | Classify a graph as **local** (free) or **api/mixed/unknown** (paid) — the agent asks before spending paid API credits |
+| `list_skills` / `read_skill` | Discover and read bundled model-family + workflow skills |
+| `list_packs` / `read_pack_workflow` | List one-command installer packs (local-GPU / free) and read a pack's graph |
+| `list_workflow_templates` | List the connected server's official ComfyUI workflow templates |
+| `check_workflow_runtime` | Classify a graph as **local** (free) or **api/mixed/unknown** (paid) — the agent asks before spending paid API credits |
 
 ### Run & view
 
@@ -211,7 +226,7 @@ credits (same tools on both backends — see
 |---|---|
 | `panel_add_mcp` / `panel_remove_mcp` | Connect / remove an MCP server in the user's agent MCP config (Claude or Codex) |
 | `panel_request_secret` | Securely collect an API token — the agent never sees the value |
-| `panel_reload` | Soft-reload the agent + its comfyui tool server (new code/tools) or the panel UI, then resume. Does NOT restart the long-lived orchestrator process behind the `panel_*` tools — that takes a user-run process restart |
+| `panel_reload` | Soft-reload the orchestrator (new code/tools) or the panel UI, then resume |
 
 ### Working with the user
 
