@@ -17,12 +17,17 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   "workflow_from_image",
   "list_output_images",
   "get_image",
+  // Inventory listing only. 0.50.0 slice 11 folded six model tools into this
+  // name — including `remove`, which UNLINKS a model file — so admission is
+  // ACTION-scoped below to exactly what the retired read-only entry covered.
   "list_local_models",
-  // Read-only CivitAI lookups (creator-search feature): let a client browse
-  // models/creators through the rig without an agent turn.
-  "search_civitai_models",
-  "search_civitai_creators",
-  "download_civitai_model",
+  // Read-only CivitAI lookups (creator-search feature) + the two download
+  // starters: let a client browse models/creators through the rig, and fetch
+  // one, without an agent turn. 0.50.0 slice 11 folded eight model tools into
+  // `download_model`, so this entry is ACTION-scoped below to the union of the
+  // FIVE retired per-tool entries it replaces (the two CivitAI searches, the
+  // CivitAI download, the URL download, and the app-panel's missing-model
+  // resolver) and nothing else.
   "download_model",
   "enqueue_workflow",
   // Persist a workflow to the ComfyUI library (mobile "pull workflow from a
@@ -97,12 +102,13 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   // App dependency side-panel (Explore/detail): the ✓/download panel reads what
   // an app needs vs what's installed and offers per-item fetches. Reads are safe
   // (missing-model detection + candidate resolution, node-pack presence); model
-  // downloads reuse the already-whitelisted download_civitai_model/download_model.
+  // downloads reuse the already-whitelisted download_model download/download_civitai
+  // actions, and the missing-model detection is that same tool's
+  // action:"resolve_missing".
   // install_custom_node is a MUTATION that runs the pack's code on install —
   // reachable for the panel's "install missing node" button, gated behind an
   // explicit themed confirm client-side. (Revisit if a canvas-less/foreign tab
   // must not be able to trigger a node install.)
-  "resolve_missing_models",
   // 0.50.0 slice 9 folded the nine knowledge tools into this one name, and the
   // entry it replaces was the READ-ONLY dependency EXTRACTOR (see DEAD_NAMES).
   // The fold brings install_deps — which installs custom node packs through
@@ -173,6 +179,29 @@ const CALL_TOOL_ACTION_WHITELIST: ReadonlyMap<string, ReadonlySet<string>> = new
   // prevent (#839). Both stay reachable through an agent turn / explicit UI
   // action, as before.
   ["train_doctor", new Set(["doctor"])],
+  // 0.50.0 slice 11 folded the six inventory tools into `list_local_models`.
+  // The old entry admitted ONE read-only listing and nothing else, so that is
+  // all this admits. Every other action is refused because none was reachable
+  // before — and one of them, `remove`, DELETES a model file off the user's
+  // disk with no undo. Admitting the folded name unscoped would have handed a
+  // confirmation-less mobile/mirrored client a delete button it never had; that
+  // is the #839 shape exactly, a fold turning a refusal into an acceptance.
+  // (`embeddings` and `list_paths` are read-only and still refused: they were
+  // never whitelisted either, and this map restores the old surface, not a
+  // judgement about what would be safe.)
+  ["list_local_models", new Set(["list"])],
+  // Same treatment for `download_model`, admitting exactly the five actions
+  // whose retired single-purpose tools were whitelisted: the URL download, the
+  // CivitAI download, the CivitAI model search, the CivitAI creator search, and
+  // the missing-model resolver. The three remaining actions were never
+  // whitelisted and stay refused: "search" (HuggingFace) and "status" are
+  // read-only but were not reachable, and "cancel" ABORTS a transfer — a wrong
+  // id from a canvas-less client would stop a download the user is watching,
+  // which no retired entry ever permitted.
+  [
+    "download_model",
+    new Set(["download", "download_civitai", "search_civitai", "search_creators", "resolve_missing"]),
+  ],
 ]);
 
 /**

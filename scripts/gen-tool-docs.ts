@@ -141,11 +141,11 @@ const CATEGORIES: Array<{
     icon: "box",
     description: "Search (HuggingFace + CivitAI), download, list, and remove models; resolve a workflow's missing models with VRAM-aware candidates; manage embeddings and VRAM.",
     tools: [
-      "search_models", "search_civitai_models", "search_civitai_creators",
-      "download_model", "download_civitai_model", "resolve_missing_models", "list_local_models",
-      "download_status", "cancel_download",
-      "remove_model", "list_extra_paths", "add_extra_path", "remove_extra_path",
-      "get_embeddings", "clear_vram",
+      // 0.50.0 slice 11 folded fourteen model tools into two: download_model
+      // (8 actions) and list_local_models (6). Both survivors keep their names,
+      // so this list simply shrinks.
+      "download_model", "list_local_models",
+      "clear_vram",
       "model_metadata",
     ],
   },

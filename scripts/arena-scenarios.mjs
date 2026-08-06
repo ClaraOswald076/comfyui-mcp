@@ -22,7 +22,10 @@ export const SCENARIOS = [
     task: "Find out which checkpoint models are installed on the ComfyUI server and tell me the name of one of them.",
     primary: ["list_local_models"],
     verify: async (call, t) => {
-      const res = await call("list_local_models", { model_type: "checkpoints" });
+      // 0.50.0 slice 11: `action` is now required — a bare {model_type} call
+      // would be refused by the schema, so this harness-side ground truth would
+      // report every model as absent.
+      const res = await call("list_local_models", { action: "list", model_type: "checkpoints" });
       const names = [...res.matchAll(/([\w.-]+)\.(safetensors|ckpt|sft|gguf)/gi)].map((m) =>
         m[1].toLowerCase(),
       );
@@ -34,7 +37,7 @@ export const SCENARIOS = [
     id: "registry",
     title: "Custom-node registry search",
     task: "Find a tool that can search for ComfyUI custom node packs, then use it to search for 'controlnet' and tell me the name of one node pack from its results.",
-    primary: ["search_custom_nodes", "search_models"],
+    primary: ["search_custom_nodes", "download_model"],
     verify: async (_call, t) => t.finalAnswer.trim().length > 0,
   },
   {

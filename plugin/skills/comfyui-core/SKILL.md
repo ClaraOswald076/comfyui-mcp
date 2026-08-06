@@ -148,13 +148,13 @@ SetLatentNoiseMask (samples, mask) → LATENT → KSampler.latent_image
 ### Model Management
 
 - `list_local_models` — see what's installed
-- `search_models` — find models on HuggingFace
+- `download_model` `action:"search"` — find models on HuggingFace
 - `download_model` — download to ComfyUI's models directory
 
 **Important**: Never ask the user to manually download models. If a required model is missing, proactively search for it and download it yourself:
 
 1. Check `list_local_models` first
-2. If missing, search HuggingFace via `search_models` or CivitAI via their REST API
+2. If missing, search HuggingFace via `download_model` `action:"search"` or CivitAI via their REST API
 3. Use `download_model` to install it directly to the correct subfolder
 
 **CivitAI API** (when `CIVITAI_API_TOKEN` env var is available):

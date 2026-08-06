@@ -43,7 +43,7 @@ import { logger } from "../utils/logger.js";
 export interface DownloadJob {
   /** DISTINCT public id, derived from URL AND destination, so the same URL
    *  fetched to two different targets is two separately-pollable jobs
-   *  (download_status(id) resolves each independently). Also the registry key. */
+   *  (download_model action:"status"(id) resolves each independently). Also the registry key. */
   id: string;
   /** The panel tray / progress-file id — a hash of the ORIGINAL source URL only.
    *  STABLE for the life of the job and used to ADOPT this download by URL after a
@@ -53,12 +53,12 @@ export interface DownloadJob {
   /** The id the PHYSICAL progress rows are actually written under — a hash of the
    *  POST-auth/post-HF-rewrite request URL, reported by the writer (#515). Differs
    *  from `trayId` only for query-auth or HF_ENDPOINT-rewritten URLs; equals it for
-   *  the common case. download_status byte display and cancel cleanup key on THIS id
+   *  the common case. download_model action:"status" byte display and cancel cleanup key on THIS id
    *  (falling back to trayId when unset). Never used for URL adoption (that needs the
    *  stable original-URL trayId). */
   progressId?: string;
   /** This job's OWN resume decision (#467), reported by its physical download via
-   *  a callback and stored here — so download_status surfaces exactly this job's
+   *  a callback and stored here — so download_model action:"status" surfaces exactly this job's
    *  outcome and never a stale/other job's. Absent when no resumable download ran
    *  (Manager dispatch, cache hit, a job that coalesced onto another's stream, or
    *  a failure before streaming). */
@@ -88,7 +88,7 @@ export interface DownloadJob {
    *  fetch) rather than streamed to local disk. A "done" viaManager job means the
    *  dispatch was ACCEPTED — NOT that the file has verifiably landed (Manager reports
    *  its queue task done even on failure), and a cancel can't recall the server task.
-   *  download_status renders it as "dispatched (not verified here)" so it isn't
+   *  download_model action:"status" renders it as "dispatched (not verified here)" so it isn't
    *  mistaken for a validated local completion. */
   viaManager?: boolean;
   /** Lines produced by post-download work (trigger words, sidecar paths,
@@ -139,7 +139,7 @@ interface Entry {
    *  unregister ALL of a stale entry's keys — no orphaned index rows. */
   keys: string[];
   /** Per-download abort handle (#515). Its `signal` is threaded through
-   *  downloadModel → the fetch + stream pipeline, so `cancel_download` can abort
+   *  downloadModel → the fetch + stream pipeline, so `download_model action:"cancel"` can abort
    *  exactly THIS job's transfer without touching any other in-flight download. */
   controller: AbortController;
   /** While in flight, periodically re-persists the record so its `updated` stamp
@@ -283,7 +283,7 @@ export function downloadIdFor(url: string): string {
  * that resolve to the SAME file with the SAME auth are one job/one writer (even
  * from different URLs), but the SAME file with DIFFERENT auth are DIFFERENT
  * downloads (a different representation) and must not dedup. Requests to different
- * destinations are separately pollable via download_status.
+ * destinations are separately pollable via download_model action:"status".
  */
 export function downloadJobIdFor(identity: string): string {
   return createHash("sha256").update(identity).digest("hex").slice(0, 16);
@@ -410,7 +410,7 @@ export async function startDownloadJob(
   } else {
     serializeKey = remoteSerializeKey(url, targetSubfolder, filename);
   }
-  // The PUBLIC id (download_status handle): the destination key when we have one
+  // The PUBLIC id (download_model action:"status" handle): the destination key when we have one
   // (so distinct destinations are separately pollable), else the request key.
   const id = destKey ?? reqKey;
   // This call's keys: the route-independent request key, plus the destination key
@@ -455,7 +455,7 @@ export async function startDownloadJob(
   // process's own live jobs were already checked above. The adopted view is READ-ONLY (we
   // hold no handle on the other session's writer): it is NOT registered in this registry,
   // runs no writer/heartbeat/AbortController, and its `settled` resolves immediately — the
-  // tool then reports it as in-flight and the caller polls download_status (which reads
+  // tool then reports it as in-flight and the caller polls download_model action:"status" (which reads
   // the live persisted record) for the resolved state.
   //
   // SCOPE: this dedup is BEST-EFFORT and covers the reported case — a SEQUENTIAL reconnect
@@ -526,7 +526,7 @@ export async function startDownloadJob(
   };
 
   // Per-download abort handle (#515). The signal is threaded through downloadModel
-  // into the fetch + stream pipeline, so cancel_download aborts exactly THIS job.
+  // into the fetch + stream pipeline, so download_model action:"cancel" aborts exactly THIS job.
   const controller = new AbortController();
 
   // The liveness heartbeat timer (assigned below, after the settled closure). Hoisted
@@ -585,7 +585,7 @@ export async function startDownloadJob(
           // Record the id the tray rows are ACTUALLY written under (post-auth/HF
           // rewrite) as job.progressId — WITHOUT touching job.trayId, which must stay
           // the stable original-URL hash so URL reconnect adoption (#529) still
-          // resolves. download_status byte display and cancel cleanup key on
+          // resolves. download_model action:"status" byte display and cancel cleanup key on
           // progressId (falling back to trayId); it only differs for query-auth /
           // mirror-rewritten URLs. Persist so a reconnecting session reads live bytes.
           if (progressId && progressId !== job.progressId) {
@@ -654,7 +654,7 @@ export async function startDownloadJob(
         // …but if the cancellation cleanup threw a recovery-critical ModelError (e.g. the
         // Windows backup of the PREVIOUS destination file could not be restored, so it's
         // preserved under a random .bak path), surface that message on the job so
-        // download_status shows the recoverable path instead of masking it behind a plain
+        // download_model action:"status" shows the recoverable path instead of masking it behind a plain
         // "cancelled, resumable partial". (Ordinary cancellation throws an AbortError,
         // which is NOT a ModelError, so it never sets this.)
         if (err instanceof ModelError) job.error = err.message;
@@ -804,7 +804,7 @@ function persistJobRecord(job: DownloadJob): boolean {
 /** Rebuild an in-memory DownloadJob view from a persisted record (#529 adoption
  *  after a reconnect). It is a read-only snapshot — there is no live AbortController
  *  in THIS process for a job another/previous session started, so it can be polled
- *  by download_status but not cancelled from here. */
+ *  by download_model action:"status" but not cancelled from here. */
 function jobFromPersisted(rec: PersistedDownloadJob): DownloadJob {
   return {
     id: rec.id,
@@ -853,7 +853,7 @@ function hasAmbiguousForeignSibling(id: string, localTrayId: string): boolean {
  * What we ACTUALLY know about where a completed download landed (#369).
  *
  * This is THE single placement policy — every tool that renders a finished job
- * (`download_model`, `download_status`, `download_civitai_model`, `apply_manifest`)
+ * (`download_model`, `download_model action:"status"`, `download_model action:"download_civitai"`, `apply_manifest`)
  * must go through it, or the wording drifts and one of them starts claiming a
  * success nobody verified. That is precisely how a 4.88 GB model in a stale install
  * came back as "downloaded successfully".
@@ -926,7 +926,7 @@ export function describePlacement(
       warning: !ctx?.liveModelsDir
         ? "this download was confirmed earlier, but the connected ComfyUI could not be asked " +
           "just now which models directory it reads, so that confirmation cannot be re-established " +
-          "for the server you are connected to. Re-check with download_status, or confirm with " +
+          "for the server you are connected to. Re-check with download_model action:\"status\", or confirm with " +
           "list_local_models."
         : job.verified_root
         ? `this download was verified against a ComfyUI reading "${job.verified_root}", but the ` +
@@ -987,7 +987,7 @@ export function describePlacement(
         pathQualifier: "",
         warning:
           "the file was materialized locally, but placement has NOT been confirmed yet — the " +
-          "check against the connected ComfyUI has not completed. Re-check with download_status, " +
+          "check against the connected ComfyUI has not completed. Re-check with download_model action:\"status\", " +
           "or confirm with list_local_models.",
       };
   }
@@ -1156,7 +1156,7 @@ export function listDownloadJobs(): DownloadJob[] {
   // One Entry is indexed under multiple keys — dedup by identity so a job appears once
   // regardless of how many keys point at it. Identity is (id, trayId), NOT id alone:
   // two distinct URLs to one dest+auth share an id but are distinct physical downloads
-  // (different trayId), and both must be listed — download_status with no selector
+  // (different trayId), and both must be listed — download_model action:"status" with no selector
   // promises EVERY tracked download.
   const seen = new Set<Entry>();
   const keyOf = (j: DownloadJob): string => `${j.id}\n${j.trayId}`;
@@ -1169,7 +1169,7 @@ export function listDownloadJobs(): DownloadJob[] {
     if (!cur || (e.job.status === "done" && cur.status !== "done")) byKey.set(keyOf(e.job), e.job);
   }
   // #529: fold in persisted records for jobs THIS session's registry doesn't hold
-  // (started before a reconnect), so download_status still lists in-flight downloads.
+  // (started before a reconnect), so download_model action:"status" still lists in-flight downloads.
   // INTEGRITY TRUTH: a validated DONE (file landed) WINS over a cancelled/error record for
   // the SAME (id, trayId) — whether that other record is a persisted counterpart OR this
   // session's own in-memory cancelled/error. So a persisted DONE overrides any current
@@ -1287,7 +1287,7 @@ export function cancelDownloadJob(
     // physically completed but its promise continuation (→ onLanded) hasn't run yet:
     // commitDone only advances a still-"downloading" job, so a synchronous "cancelled"
     // would strand a landed file as cancelled (#515 codex). The tool reports this as a
-    // best-effort request and points the caller at download_status for the resolved state.
+    // best-effort request and points the caller at download_model action:"status" for the resolved state.
     if (!controller.signal.aborted) controller.abort();
     return { found: true, owned: true, aborted: true, status: "downloading", job };
   }

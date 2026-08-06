@@ -179,7 +179,12 @@ export function registerAssetTools(server: McpServer): void {
           );
         }
         const next = applyOverrides(record.workflow, overrides);
-        const result = await enqueueWorkflow(next, { disable_random_seed });
+        // An override like overrides.seed is a caller-fixed value; keep it
+        // while the other seeds re-randomize (issue #865).
+        const result = await enqueueWorkflow(next, {
+          disable_random_seed,
+          preserve_seed_inputs: Object.keys(overrides ?? {}),
+        });
         return {
           content: [
             {

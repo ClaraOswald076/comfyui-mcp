@@ -52,7 +52,7 @@ The GPU does not have enough VRAM to hold the model weights, intermediate tensor
 
 1. **Reduce resolution**: Drop to the model's native resolution (512 for SD 1.5, 1024 for SDXL/Flux)
 2. **Use FP8/FP16 quantized models**: FP8 Flux models use ~8GB vs ~24GB for FP16
-   - Search for FP8 variants: `search_models("flux fp8")` or `search_models("sdxl fp8")`
+   - Search for FP8 variants: `download_model({ action: "search", query: "flux fp8" })` or the same with `"sdxl fp8"`
 3. **Launch flags (the VRAM ladder)**: offload aggressively via ComfyUI CLI flags —
    - `--lowvram` — offload text encoders / model parts to CPU
    - `--novram` — extreme offload; the go-to for long video (LTX 2 / WAN) OOM
@@ -370,11 +370,11 @@ RuntimeError: PytorchStreamReader failed reading zip archive
 
 ### Fixes
 
-1. **Verify the model exists**: `list_local_models(model_type="checkpoints")`
+1. **Verify the model exists**: `list_local_models({ action: "list", model_type: "checkpoints" })`
 2. **Check the exact filename**: Model names in workflows must match the filename exactly (case-sensitive)
 3. **Re-download**: If hash mismatch or corruption:
    ```
-   download_model(url="...", target_subfolder="checkpoints")
+   download_model({ action: "download", url: "...", target_subfolder: "checkpoints" })
    ```
 4. **Check file size**: A 1KB safetensors file is clearly corrupted — re-download
 5. **Verify subfolder**: Models must be in the correct subfolder (`checkpoints/`, `loras/`, `vae/`, etc.)
@@ -470,9 +470,9 @@ get_node_info(node_type="ControlNetApply")        # Verify custom nodes loaded
 ### Verify Models
 
 ```
-list_local_models(model_type="checkpoints")       # Installed checkpoints
-list_local_models(model_type="loras")             # Installed LoRAs
-list_local_models(model_type="controlnet")        # Installed ControlNets
+list_local_models({ action: "list", model_type: "checkpoints" })   # Installed checkpoints
+list_local_models({ action: "list", model_type: "loras" })         # Installed LoRAs
+list_local_models({ action: "list", model_type: "controlnet" })    # Installed ControlNets
 ```
 
 ## Quick Reference: Error to Fix
