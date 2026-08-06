@@ -145,6 +145,11 @@ import {
   warmLmstudio,
 } from "../services/lmstudio-lifecycle.js";
 import { llamacppProps, llamacppToolsReady } from "../services/llamacpp-probe.js";
+import {
+  backendSharesRenderGpu,
+  isLocalLlamacpp,
+  pauseLocalOnGenEnabled,
+} from "../services/local-vram.js";
 import { getAgentSettings, setAgentSettings, normalizePreferredModels } from "../services/panel-settings.js";
 import {
   gatherEnvCapabilities,
@@ -2552,14 +2557,16 @@ export async function runPanelOrchestrator(): Promise<void> {
   );
 
   // ── Local-agent VRAM pause during generation ────────────────────────────
-  // On a single-GPU box the local Ollama chat model and ComfyUI fight for VRAM:
+  // On a single-GPU box the local chat model and ComfyUI fight for VRAM:
   // a resident model can OOM a render, and a chat sent mid-render reloads the
   // model on top of the running generation. So while a render is in flight we
   // (a) unload the local model to free its VRAM, and (b) HOLD any chat the user
   // sends and answer it once the render finishes (warming the model back). Only
-  // for the LOCAL ollama dialect (hosted openai endpoints don't touch local
-  // VRAM); default on, opt out with COMFYUI_MCP_OLLAMA_PAUSE_ON_GEN=0.
-  const pauseLocalDuringGen = process.env.COMFYUI_MCP_OLLAMA_PAUSE_ON_GEN !== "0";
+  // LOCAL backends join (native ollama dialect; loopback LM Studio / llama.cpp —
+  // hosted or remote endpoints don't touch local VRAM); default on, opt out
+  // with COMFYUI_MCP_PAUSE_LOCAL_ON_GEN=0 (the
+  // legacy COMFYUI_MCP_OLLAMA_PAUSE_ON_GEN=0 is still honored).
+  const pauseLocalDuringGen = pauseLocalOnGenEnabled();
   const anyLocalOllama = (): boolean =>
     ollamaApi === "ollama" &&
     (defaultBackend === "ollama" || [...tabBackends.values()].includes("ollama"));
@@ -2568,6 +2575,14 @@ export async function runPanelOrchestrator(): Promise<void> {
   const anyLocalLmstudio = (): boolean =>
     isLocalLmstudio(LMSTUDIO_BASE_URL) &&
     (defaultBackend === "lmstudio" || [...tabBackends.values()].includes("lmstudio"));
+  // llama.cpp too (issue #874), HOLD-ONLY: llama-server has no unload surface
+  // and llama-swap swaps models upstream on demand, so there is nothing to
+  // free or warm — holding mid-render chats is what stops the contention.
+  // Local server only — a remote COMFYUI_MCP_LLAMACPP_HOST is someone else's
+  // VRAM and is never gated.
+  const anyLocalLlamacpp = (): boolean =>
+    isLocalLlamacpp(LLAMACPP_BASE_URL) &&
+    (defaultBackend === "llamacpp" || [...tabBackends.values()].includes("llamacpp"));
   // agentKey -> messages held while a render runs (flushed on render end).
   const heldDuringGen = new Map<string, Array<{ text: string; opts: Record<string, unknown> }>>();
   let genPauseActive = false;
@@ -2576,7 +2591,8 @@ export async function runPanelOrchestrator(): Promise<void> {
       onRunStart: () => {
         const ol = anyLocalOllama();
         const ls = anyLocalLmstudio();
-        if (!ol && !ls) return;
+        const lc = anyLocalLlamacpp();
+        if (!ol && !ls && !lc) return;
         genPauseActive = true;
         // Free the local model's VRAM for the render (best-effort, fire-and-forget).
         if (ol) void unloadAllOllama(resolveOllamaHost());
@@ -4919,13 +4935,16 @@ export async function runPanelOrchestrator(): Promise<void> {
       audio: attachedAudio.length ? attachedAudio : undefined,
       mid: userMid,
     };
-    // Local-agent VRAM pause: if this tab runs the local Ollama model AND a
-    // render is in flight, DON'T run the turn now — that would reload the model
-    // on top of the generation (VRAM contention / OOM). Hold it and answer when
-    // the render finishes (onRunEnd flushes the queue + warms the model).
-    const tabIsLocalVram =
-      (ollamaApi === "ollama" && backendForTab(event.tab_id) === "ollama") ||
-      (backendForTab(event.tab_id) === "lmstudio" && isLocalLmstudio(LMSTUDIO_BASE_URL));
+    // Local-agent VRAM pause: if this tab runs a LOCAL Ollama / LM Studio /
+    // llama.cpp model AND a render is in flight, DON'T run the turn now — that
+    // would reload (or keep hammering) the model on top of the generation
+    // (VRAM contention / OOM). Hold it and answer when the render finishes
+    // (onRunEnd flushes the queue + warms the model where it was unloaded).
+    const tabIsLocalVram = backendSharesRenderGpu(backendForTab(event.tab_id), {
+      ollama: ollamaApi === "ollama",
+      lmstudio: isLocalLmstudio(LMSTUDIO_BASE_URL),
+      llamacpp: isLocalLlamacpp(LLAMACPP_BASE_URL),
+    });
     if (pauseLocalDuringGen && tabIsLocalVram && QueueMonitor.isBusy()) {
       const key = agentKeyFor(event.tab_id);
       const arr = heldDuringGen.get(key) ?? [];
@@ -4935,7 +4954,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       bridge.push(
         {
           type: "say",
-          text: "⏸ A render is running, so I've kept the GPU free for it and queued your message. I'll answer the moment it finishes.",
+          text: "⏸ A render is running, so I've queued your message to keep the GPU free for it. I'll answer the moment it finishes.",
         },
         event.tab_id,
       );
