@@ -87,6 +87,25 @@ export function shouldRetireSharedAgent(opts: {
   );
 }
 
+/**
+ * Map a hello frame's raw `backend` field to the conversation it JOINS: a
+ * known backend name (case-insensitive), else the default. This one function
+ * is used BOTH by the orchestrator's hello handler (deciding which
+ * conversation the tab joins) and by the bridge's backend-qualified mailbox
+ * drain (deciding whose buffers it receives) — confirming gate 2, P1: when
+ * those two mappings disagreed, a tab joined one conversation and stranded
+ * another's mailbox, so they now share this single implementation (and the
+ * ui-bridge tests drive it, not a test-local approximation — gate 3, P2).
+ */
+export function normalizeHelloBackend(
+  raw: unknown,
+  knownBackends: ReadonlySet<string>,
+  defaultBackend: string,
+): string {
+  const named = typeof raw === "string" ? raw.toLowerCase() : undefined;
+  return named && knownBackends.has(named) ? named : defaultBackend;
+}
+
 /** A message's workflow origin, for detecting that the conversation's focus
  *  moved to a different workflow/tab between two user messages. */
 export function messageOrigin(tabId: string, workflowUuid?: string): string {

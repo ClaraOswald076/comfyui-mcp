@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { logger } from "../utils/logger.js";
@@ -99,6 +99,17 @@ export class SessionStore {
    *  would otherwise take an in-memory shortcut and answer `true` consults this
    *  first, so a durability claim always describes the DISK, never just RAM. */
   private undurable = false;
+  /** #884 P1 (confirming gate 3) — the (size, mtime) of the store file as last
+   *  READ or WRITTEN by this instance. `undurable === false` alone proved only
+   *  that the LAST write succeeded, not that the file is still there: deleted
+   *  or replaced externally, a later in-memory shortcut still answered "durable"
+   *  while a restart would lose the session. The shortcut now re-stats the file
+   *  and compares against this fingerprint — a cheap, honest "the state I put
+   *  on disk is observably still in place" check (a same-size, same-mtime
+   *  external replacement is not detectable without a full read and is accepted
+   *  as the documented limit of the claim). Undefined = nothing verifiable on
+   *  disk; the shortcut then re-writes instead of asserting. */
+  private diskFingerprint: { size: number; mtimeMs: number } | undefined;
 
   constructor(port: number, opts: { dir?: string } = {}) {
     // #866 — guard at the WRITE, not per-test: this store lives in the user's
@@ -216,7 +227,11 @@ export class SessionStore {
     }
     if (existsSync(this.path)) {
       try {
-        return this.parse(readFileSync(this.path, "utf8"));
+        const parsed = this.parse(readFileSync(this.path, "utf8"));
+        // The in-memory state now equals this on-disk file — fingerprint it so
+        // a later durability shortcut can verify the file is still in place.
+        this.captureDiskFingerprint();
+        return parsed;
       } catch (err) {
         logger.warn(
           `[session-store] ${this.path} is unreadable/corrupt — starting empty (NOT falling back to the pre-migration tmpdir store): ${String(err)}`,
@@ -255,9 +270,11 @@ export class SessionStore {
       writeFileSync(tmp, payload);
       renameSync(tmp, this.path);
       this.undurable = false;
+      this.captureDiskFingerprint();
       return true;
     } catch (err) {
       this.undurable = true;
+      this.diskFingerprint = undefined; // nothing of ours verifiably on disk
       const tmpHoldsState = ((): boolean => {
         try {
           return existsSync(tmp) && readFileSync(tmp, "utf8") === payload;
@@ -390,11 +407,39 @@ export class SessionStore {
     return this.flush();
   }
 
+  /** Record the store file's current (size, mtime) after a successful read or
+   *  write, for the drift check in {@link settled}. A failed stat clears the
+   *  fingerprint: what cannot be fingerprinted cannot later be verified, so the
+   *  shortcut re-writes instead of asserting. */
+  private captureDiskFingerprint(): void {
+    try {
+      const st = statSync(this.path);
+      this.diskFingerprint = { size: st.size, mtimeMs: st.mtimeMs };
+    } catch {
+      this.diskFingerprint = undefined;
+    }
+  }
+
   /** Durability of the CURRENT in-memory state when a caller took an in-memory
-   *  shortcut (nothing to change). Clean → already on disk. Otherwise a prior
-   *  write failed, so retry it now: that both repairs the store the moment the
-   *  filesystem recovers and keeps the answer honest while it hasn't. */
+   *  shortcut (nothing to change). `true` is claimed only on EVIDENCE: no prior
+   *  write failure AND the store file is observably still the one this instance
+   *  last read/wrote (same size+mtime — confirming gate 3, P1: after external
+   *  deletion/replacement the old shortcut kept answering "durable" while a
+   *  restart would lose the session). Anything less re-runs the write, which
+   *  both repairs the store the moment the filesystem recovers and keeps the
+   *  answer honest while it hasn't. */
   private settled(): boolean {
-    return this.undurable ? this.flush() : true;
+    if (this.undurable) return this.flush();
+    if (this.diskFingerprint) {
+      try {
+        const st = statSync(this.path);
+        if (st.size === this.diskFingerprint.size && st.mtimeMs === this.diskFingerprint.mtimeMs) {
+          return true;
+        }
+      } catch {
+        // missing/unreadable — fall through to the repair write
+      }
+    }
+    return this.flush();
   }
 }

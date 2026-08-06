@@ -21,7 +21,14 @@ import {
   unclassifiedGraphCommandsSeen,
   __resetUnclassifiedGraphCommands,
 } from "../../services/ui-bridge.js";
-import { SHARED_SESSION_SCOPE } from "../../services/session-scope.js";
+import { SHARED_SESSION_SCOPE, normalizeHelloBackend } from "../../services/session-scope.js";
+import {
+  TurnOriginTracker,
+  makeScopeRepinHandler,
+  makeScopeTargetResolver,
+} from "../../orchestrator/turn-origins.js";
+import { buildPanelToolDefs, makePanelToolCtx } from "../../orchestrator/panel-tools.js";
+import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 import {
   __resetPanelBaseCache,
   __setPanelBaseForTests,
@@ -1040,6 +1047,36 @@ describe("UiBridge (multi-tab)", () => {
   // agent serves every tab/workflow, and a command addressed to the scope must
   // reach the workflow the user is actually on. These drive the REAL WS bridge.
   describe("shared-session-scope routing (#884)", () => {
+    const SCOPE_KEY = `${SHARED_SESSION_SCOPE}::claude`;
+    /** Install the PRODUCTION scope wiring on the live test bridge — the same
+     *  TurnOriginTracker + resolver/repin factories index.ts constructs
+     *  (confirming gate 3, P2: these tests must drive the real handlers, not
+     *  hand-written stand-ins that cannot catch a defect in them). */
+    function wireRealScopeRouting() {
+      const backendOfKey = (key: string): string =>
+        key.includes("::") ? key.slice(key.lastIndexOf("::") + 2) : "claude";
+      const backendForTab = (): string => "claude"; // single-provider deployment
+      const tracker = new TurnOriginTracker({
+        backendForTab,
+        backendOfKey,
+        uuidOfTab: () => undefined,
+        warn: () => {},
+      });
+      const scopeAgentKeyOf = (scopeId: string): string =>
+        scopeId === SHARED_SESSION_SCOPE ? SCOPE_KEY : scopeId;
+      bridge.setScopeTargetResolver(makeScopeTargetResolver({ tracker, scopeAgentKeyOf }));
+      bridge.setScopeRepinHandler(
+        makeScopeRepinHandler({
+          bridge,
+          tracker,
+          scopeAgentKeyOf,
+          backendForTab,
+          backendOfKey,
+          info: () => {},
+        }),
+      );
+      return { tracker };
+    }
     it("a scope-addressed tool call reaches the tab the user LAST TALKED FROM", async () => {
       const a = await connectPanel("wf:workflows/a.json", "a");
       const b = await connectPanel("wf:workflows/b.json", "b");
@@ -1128,29 +1165,138 @@ describe("UiBridge (multi-tab)", () => {
       autoReply(b, "tab-b");
       await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
 
+      // The REAL production wiring (confirming gate 3, P2: this test used to
+      // install a hand-written handler, which could not catch a defect in the
+      // real one): the same tracker + resolver/repin factories index.ts wires.
+      const { tracker } = wireRealScopeRouting();
+
       // A turn pinned to a tab that is now GONE: every scope-addressed call
       // refuses, and the refusal names panel_set_workflow_target as the way out.
-      let pin: string | null | undefined = "wf:workflows/gone.json";
-      bridge.setScopeTargetResolver(() => pin);
+      tracker.recordForMid("m-dead", undefined, "wf:workflows/gone.json");
+      tracker.onSeen(SCOPE_KEY, "m-dead");
+      await vi.waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/gone.json"));
       await expect(
         bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE }),
       ).rejects.toThrow(/no connected tab/);
 
-      // That tool's handler calls repinScopeToActive. Before this fix the scope
-      // branch no-op'd, so the pin never moved and the advertised recovery was
-      // a dead end for the rest of the turn.
-      bridge.setScopeRepinHandler(() => {
-        const tab = bridge.resolveActiveScopeTab();
-        if (tab) pin = tab; // the orchestrator's handler rewrites the pin
-        return tab;
-      });
+      // The explicit recovery (panel_set_workflow_target mode:"current" calls
+      // through this bridge method) escapes the dead pin onto the active tab.
       const repinned = bridge.repinScopeToActive(SHARED_SESSION_SCOPE);
       expect(repinned).toBeDefined();
+      expect(tracker.pinOf(SCOPE_KEY)).toBe(repinned);
 
       // …and the SAME turn can now reach the panel again.
       const after = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
       expect(after).toMatchObject({ from: expect.stringMatching(/^tab-/) });
       a.close();
+      b.close();
+    });
+
+    it("the repin REFUSES to move a HEALTHY pin (confirming-gate 3, P0 — recovery, never a re-target)", async () => {
+      const a = await connectPanel("wf:workflows/a.json", "a");
+      const b = await connectPanel("wf:workflows/b.json", "b");
+      autoReply(a, "tab-a");
+      autoReply(b, "tab-b");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      const { tracker } = wireRealScopeRouting();
+
+      // A turn pinned to LIVE tab A…
+      tracker.recordForMid("m-a", undefined, "wf:workflows/a.json");
+      tracker.onSeen(SCOPE_KEY, "m-a");
+      await vi.waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json"));
+      // …while tab B becomes last-active (a queued message moves it instantly).
+      b.send(JSON.stringify({ type: "user_message", text: "queued from b" }));
+      await vi.waitFor(() => {
+        expect(bridge.resolveActiveScopeTab()).toBe("wf:workflows/b.json");
+      });
+
+      // Even a DIRECT repin call must refuse: the pin reaches a live tab, so
+      // there is nothing to recover from — moving it would re-aim the running
+      // turn's tool calls at a workflow it was never about.
+      expect(bridge.repinScopeToActive(SHARED_SESSION_SCOPE)).toBeUndefined();
+      expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json");
+      const still = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
+      expect(still).toMatchObject({ from: "tab-a" });
+      a.close();
+      b.close();
+    });
+
+    it("panel_reload (the REAL tool) leaves a HEALTHY scope-bound turn on its own tab (confirming-gate 3, P0)", async () => {
+      // The exact reported sequence, driven end-to-end through the production
+      // seams: turn pinned to A; a queued message makes B last-active; A's
+      // agent calls panel_reload. Before this fix the tool's unconditional
+      // rebindToActiveTab() repinned the healthy turn onto B — soft_reload
+      // (and every later mutation, carrying B's freshly re-derived stamp)
+      // went to B with no mode:"current" consent anywhere.
+      const a = await connectPanel("wf:workflows/a.json", "a");
+      const b = await connectPanel("wf:workflows/b.json", "b");
+      autoReply(a, "tab-a");
+      autoReply(b, "tab-b");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      const { tracker } = wireRealScopeRouting();
+
+      tracker.recordForMid("m-a", undefined, "wf:workflows/a.json");
+      tracker.onSeen(SCOPE_KEY, "m-a");
+      await vi.waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json"));
+      b.send(JSON.stringify({ type: "user_message", text: "queued from b" }));
+      await vi.waitFor(() => expect(bridge.resolveActiveScopeTab()).toBe("wf:workflows/b.json"));
+
+      const ctx = makePanelToolCtx(bridge, SCOPE_KEY, new WorkflowTargetStore());
+      const reload = buildPanelToolDefs().find((d) => d.name === "panel_reload")!;
+      const res = (await reload.handler({ scope: "frontend" }, ctx)) as {
+        isError?: boolean;
+        content: Array<{ type: string; text?: string }>;
+      };
+      expect(res.isError).toBeFalsy();
+      // The healthy pin stood, and the soft_reload frame reached A — not B.
+      expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json");
+      expect(JSON.parse(res.content[0].text!)).toMatchObject({ from: "tab-a", cmd: "soft_reload" });
+      // The ctx stays scope-bound (never narrowed to a real tab id).
+      expect(ctx.tabId).toBe(SCOPE_KEY);
+      a.close();
+      b.close();
+    });
+
+    it("panel_reload FAILS on a DEAD scope pin naming the recovery, and panel_set_workflow_target({mode:'current'}) then re-pins (confirming-gate 3)", async () => {
+      const a = await connectPanel("wf:workflows/a.json", "a");
+      const b = await connectPanel("wf:workflows/b.json", "b");
+      autoReply(a, "tab-a");
+      autoReply(b, "tab-b");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      const { tracker } = wireRealScopeRouting();
+
+      // A turn pinned to A… whose tab then disconnects: the pin is DEAD.
+      tracker.recordForMid("m-a", undefined, "wf:workflows/a.json");
+      tracker.onSeen(SCOPE_KEY, "m-a");
+      await vi.waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json"));
+      a.close();
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+
+      // panel_reload is NOT a consent path: it fails, names the recovery, and
+      // the pin is NOT silently moved.
+      const ctx = makePanelToolCtx(bridge, SCOPE_KEY, new WorkflowTargetStore());
+      const defs = buildPanelToolDefs();
+      const reload = defs.find((d) => d.name === "panel_reload")!;
+      const res = (await reload.handler({ scope: "frontend" }, ctx)) as {
+        isError?: boolean;
+        content: Array<{ type: string; text?: string }>;
+      };
+      expect(res.isError).toBe(true);
+      expect(res.content[0].text).toMatch(/panel_set_workflow_target\(\{mode:"current"\}\)/);
+      expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json");
+
+      // The advertised recovery — the REAL tool, carrying the explicit
+      // consent — escapes the dead pin onto the live tab. (The tool's own
+      // result additionally reports the fence outcome, which for this
+      // synthetic panel's minimal workflow_list reply is honestly
+      // "not recovered"; the fence-adoption path has its own coverage in
+      // panel-tools.test.ts. What THIS asserts is the pin recovery itself.)
+      const target = defs.find((d) => d.name === "panel_set_workflow_target")!;
+      await target.handler({ mode: "current" }, ctx);
+      expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/b.json");
+      // …and the same turn's scope calls reach the panel again.
+      const after = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
+      expect(after).toMatchObject({ from: "tab-b" });
       b.close();
     });
 
@@ -1166,9 +1312,12 @@ describe("UiBridge (multi-tab)", () => {
       // The tab hellos WITHOUT a backend field. The orchestrator maps absent →
       // default ("claude"), so it JOINS that conversation — and must therefore
       // drain its mailbox. Matching the raw string alone stranded it here, and
-      // the media silently never arrived.
+      // the media silently never arrived. This installs the REAL shared
+      // normalizeHelloBackend (the same function the hello handler uses to
+      // decide which conversation the tab joins), not a test-local
+      // approximation (confirming gate 3, P2).
       bridge.setHelloBackendNormalizer((raw) =>
-        typeof raw === "string" && raw ? raw.toLowerCase() : "claude",
+        normalizeHelloBackend(raw, new Set(["claude", "codex"]), "claude"),
       );
       // Open the socket and start listening BEFORE the hello — the drain happens
       // during hello processing, so a listener attached afterwards misses it.

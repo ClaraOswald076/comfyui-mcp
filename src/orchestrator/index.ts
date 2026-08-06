@@ -48,8 +48,14 @@ import {
   conversationTabs,
   shouldRetireSharedAgent,
   messageOrigin,
+  normalizeHelloBackend,
   workflowOriginNote,
 } from "../services/session-scope.js";
+import {
+  TurnOriginTracker,
+  makeScopeRepinHandler,
+  makeScopeTargetResolver,
+} from "./turn-origins.js";
 import { listSessions, loadTranscript } from "./history.js";
 import { uploadImageHttp, resetClient } from "../comfyui/client.js";
 import { logger } from "../utils/logger.js";
@@ -1512,94 +1518,8 @@ export async function runPanelOrchestrator(): Promise<void> {
   // Set from each hello's trusted identity; #716 lets a successful explicit
   // open/re-pin refresh it between hellos.
   const tabCommandWorkflowUuid = new Map<string, string>();
-  // #884 — PER CONVERSATION, the trusted workflow uuid of the workflow its
-  // CURRENT TURN was issued for, captured at user-message dispatch (and
-  // refreshed by #716's explicit-open path). This is what a scope-addressed
-  // command is STAMPED with: #570's issue-time rule at conversation level. If
-  // the user switches to a different workflow mid-turn, a late scope mutation
-  // still carries THIS uuid and the panel (now showing another workflow)
-  // declines it — the fence must never be re-resolved from whatever tab
-  // happens to be active at dispatch, which would silently re-aim the mutation
-  // (codex round 1, P0). Keyed by agent key so two backends' concurrently
-  // in-flight turns never share one stamp; the panel MCP servers bind the
-  // backend-QUALIFIED scope address to make the key recoverable here.
-  const lastTurnUuidByKey = new Map<string, string | undefined>();
   const scopeAgentKeyOf = (scopeId: string): string =>
     scopeId === SHARED_SESSION_SCOPE ? sharedKeyFor(defaultBackend) : scopeId;
-  // The issue-time uuid RIDES the message and is applied when the agent
-  // DEQUEUES it (onSeen — the true start of its turn), not at receipt: a
-  // message queued behind a busy turn, or held during a render, must not flip
-  // the IN-FLIGHT turn's stamp the moment it arrives (codex round 2, P0 —
-  // receipt-time overwrite re-created the race for queued/held messages).
-  // Bounded: entries are consumed at dequeue and dropped on cancel; the cap is
-  // a last-resort ceiling sized so it is effectively unreachable by live
-  // queued messages (codex r3: evicting a LIVE mapping discards fail-closed
-  // state — and even then, an unknown mid at dequeue fails the batch closed
-  // below rather than inheriting a stale stamp).
-  const turnUuidByMid = new Map<string, { uuid: string | undefined; tab: string }>();
-  const TURN_UUID_BY_MID_CAP = 5000;
-  const recordTurnUuidForMid = (mid: string, uuid: string | undefined, tab: string): void => {
-    turnUuidByMid.set(mid, { uuid, tab });
-    while (turnUuidByMid.size > TURN_UUID_BY_MID_CAP) {
-      const oldest = turnUuidByMid.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
-      turnUuidByMid.delete(oldest);
-    }
-  };
-  // #884 P0 (confirming gate) — each conversation's IN-FLIGHT turn is PINNED to
-  // the tab it was issued from, set alongside the stamp at batch close and
-  // cleared at turn end. The bridge's scope resolution consults this FIRST, so
-  // a queued message from another tab (which moves lastActiveTabId
-  // immediately) can never re-aim a running turn's tool calls at a workflow
-  // the turn was never about — and a pinned tab that disconnects makes the
-  // resolution THROW loudly instead of silently falling back to another tab.
-  // Value string = pinned tab; null = ambiguous origin (refuse); absent = no
-  // turn in flight (active-tab resolution).
-  const turnTargetTabByKey = new Map<string, string | null>();
-  // #884 P0 (confirming gate 2) — each conversation's LAST ESTABLISHED origin
-  // (the tab+uuid its most recent origin-bearing turn agreed on). Turns that
-  // dequeue with NO origin contribution of their own — a restart nudge, a
-  // coalesced download event, a pure re-queue — pin and stamp from THIS, never
-  // from "whatever tab is active": every entry point that can start a turn now
-  // acquires an origin. A conversation with no established origin at all pins
-  // `null` (loud refusal until an explicit target or the next origin-bearing
-  // message).
-  const lastOriginByKey = new Map<string, { tab: string; uuid: string | undefined }>();
-  // Origin for an orchestrator-side INJECTED turn (run errors, completions,
-  // ask answers, panel events): a synthetic mid rides the queue item so the
-  // dequeue fires onSeen and the injected turn pins/stamps like any user turn
-  // (a run error on tab A must pin A — confirming-gate 2, P0).
-  const mintInjectionOrigin = (originTab: string): string => {
-    const mid = `evt-${randomUUID()}`;
-    recordTurnUuidForMid(mid, tabCommandWorkflowUuid.get(originTab), originTab);
-    return mid;
-  };
-  // Mids whose stamp was ALREADY applied at a previous dequeue — a re-queued
-  // item (interrupt + send-now) fires onSeen again, and it must contribute
-  // NOTHING to the new batch (its stamp is in force or superseded), while a
-  // genuinely unknown mid (evicted, foreign) must fail the batch closed.
-  const consumedTurnMids = new Set<string>();
-  const CONSUMED_TURN_MIDS_CAP = 500;
-  const noteConsumedTurnMid = (mid: string): void => {
-    consumedTurnMids.add(mid);
-    while (consumedTurnMids.size > CONSUMED_TURN_MIDS_CAP) {
-      const oldest = consumedTurnMids.values().next().value as string | undefined;
-      if (oldest === undefined) break;
-      consumedTurnMids.delete(oldest);
-    }
-  };
-  // Per-key aggregation of ONE dispatch batch's issue-time uuids (the manager
-  // fires onSeen synchronously per item; the microtask closes the batch before
-  // any backend I/O can run a tool call). A batch whose messages came from ONE
-  // workflow stamps it; a MIXED or unknown-origin batch stamps `undefined` —
-  // no single stamp is honest for it, so mutations fail the panel fence
-  // loudly until the agent explicitly opens/pins a workflow (#716) or the
-  // next single-origin message (codex r3, P1: last-message-wins let a merged
-  // batch mutate the wrong workflow).
-  const pendingBatchStamp = new Map<
-    string,
-    { known: Array<string | undefined>; tabs: Set<string>; unknown: boolean }
-  >();
   // #884 — each shared conversation's last message origin (tab + workflow uuid),
   // so a message sent from a DIFFERENT workflow than the previous one carries a
   // one-line context note: session-bound agents keep knowledge of which canvas
@@ -1631,6 +1551,22 @@ export async function runPanelOrchestrator(): Promise<void> {
     const i = key.lastIndexOf(AGENT_KEY_SEP);
     return i >= 0 ? key.slice(i + AGENT_KEY_SEP.length) : defaultBackend;
   };
+  // #884 — PER-CONVERSATION TURN ORIGINS: the issue-time workflow stamp
+  // (#570's rule at conversation level — a scope mutation carries the uuid its
+  // turn was ISSUED for, never re-resolved at dispatch; codex round 1, P0),
+  // the in-flight turn's routing pin (confirming gate P0), the last
+  // established origin that origin-less turns inherit (confirming gate 2,
+  // P0), and the backend binding every origin is re-verified against at
+  // dequeue (confirming gate 3, P0). The machinery lives in turn-origins.ts —
+  // one seam, driven directly by its own tests — and this file only wires it:
+  // record at receipt, apply at dequeue (onSeen), release at turn end, forget
+  // at conversation boundaries.
+  const turnOrigins = new TurnOriginTracker({
+    backendForTab,
+    backendOfKey: backendOf,
+    uuidOfTab: (tab) => tabCommandWorkflowUuid.get(tab),
+    warn: (msg) => logger.warn(msg),
+  });
   // #884 — ROUTING for agent output: every connected tab participating in this
   // key's backend conversation. Fanout goes through bridge.push PER TAB so the
   // mirror allowlist (MIRROR_SAFE_FRAME_TYPES) and canonical-id fanout keep
@@ -2318,7 +2254,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     onTurn: (key, state) => {
       // #884 P0 — the turn ended: release its routing pin so idle-time scope
       // resolution follows the active tab again (the next turn re-pins).
-      if (state === "done") turnTargetTabByKey.delete(key);
+      if (state === "done") turnOrigins.turnEnded(key);
       pushToConversation(key, { type: "turn", state });
     },
     // Live extended-thinking token count → "thinking… (N)" indicator.
@@ -2333,80 +2269,12 @@ export async function runPanelOrchestrator(): Promise<void> {
     // The agent dequeued a message (the true "read" moment) → flip that bubble
     // from queued/muted to read. Fanned out: tabs that don't know the mid ignore it.
     // #884 — this is also the moment the message's TURN begins, so its recorded
-    // issue-time workflow uuid becomes the conversation's stamp (not at receipt
-    // — codex round 2). One dispatch may batch SEVERAL messages: the batch's
-    // uuids aggregate over a microtask and stamp only when they AGREE — a mixed
-    // or unknown-origin batch fails closed (undefined stamp) instead of letting
-    // the last message re-aim the whole turn's mutations (codex round 3).
+    // issue-time origin becomes the conversation's pin + stamp (not at receipt
+    // — codex round 2). The whole aggregation — batching, agree-or-fail-closed,
+    // origin inheritance, and the backend re-verification (confirming gate 3,
+    // P0) — lives in TurnOriginTracker.onSeen so it is testable at its seam.
     onSeen: (key, mid) => {
-      let batch = pendingBatchStamp.get(key);
-      const opensBatch = !batch;
-      if (!batch) {
-        batch = { known: [], tabs: new Set<string>(), unknown: false };
-        pendingBatchStamp.set(key, batch);
-      }
-      const rec = turnUuidByMid.get(mid);
-      if (rec) {
-        batch.known.push(rec.uuid);
-        batch.tabs.add(rec.tab);
-        turnUuidByMid.delete(mid);
-        noteConsumedTurnMid(mid);
-      } else if (!consumedTurnMids.has(mid)) {
-        // Unknown mid (evicted / non-user item): its origin workflow cannot be
-        // known — the batch must fail closed, never inherit a stale stamp.
-        batch.unknown = true;
-      }
-      // A consumed mid (a re-queued item) contributes nothing: its stamp was
-      // applied at its first dequeue and any newer message supersedes it.
-      if (opensBatch) {
-        const closed = batch;
-        queueMicrotask(() => {
-          pendingBatchStamp.delete(key);
-          const distinct = new Set(closed.known);
-          if (closed.unknown || closed.tabs.size > 1) {
-            // Mixed/unknown-TAB batch: no single stamp or target is honest for
-            // it — fail BOTH closed (the bridge refuses routing; the panel
-            // fence refuses mutations) until an explicit target
-            // (panel_set_workflow_target/open, the #716 refresh) or the next
-            // single-origin message. (A single tab whose uuid changed between
-            // messages keeps its ROUTING pin below — same surface — with the
-            // stamp failing closed on its own.)
-            lastTurnUuidByKey.set(key, undefined);
-            turnTargetTabByKey.set(key, null);
-            logger.warn(
-              `[panel-orchestrator] ${key} dispatched a mixed/unknown-origin batch — no single workflow stamp/target is honest for it, so scope routing and graph mutations FAIL CLOSED until the agent opens/pins a workflow or the next single-origin message (#884)`,
-            );
-          } else if (closed.tabs.size === 1) {
-            // TURN-TARGET PIN (confirming-gate P0): this turn's tool calls
-            // route to the tab the turn was ISSUED from — never re-resolved
-            // mid-turn — and its mutations are fenced to that tab's issue-time
-            // workflow. This agreed origin becomes the conversation's LAST
-            // ESTABLISHED origin for origin-less turns that follow.
-            const tab = closed.tabs.values().next().value as string;
-            const uuid = distinct.size === 1 ? distinct.values().next().value : undefined;
-            lastTurnUuidByKey.set(key, uuid);
-            turnTargetTabByKey.set(key, tab);
-            lastOriginByKey.set(key, { tab, uuid });
-          } else {
-            // NO origin contribution (a pure re-queue, a restart nudge, a
-            // coalesced event with no per-tab origin): the turn inherits the
-            // conversation's LAST ESTABLISHED origin — NEVER "whatever tab is
-            // active", which is how a non-user turn mutated the wrong workflow
-            // (confirming-gate 2, P0). No established origin at all → refuse.
-            const last = lastOriginByKey.get(key);
-            if (last) {
-              lastTurnUuidByKey.set(key, last.uuid);
-              turnTargetTabByKey.set(key, last.tab);
-            } else {
-              lastTurnUuidByKey.set(key, undefined);
-              turnTargetTabByKey.set(key, null);
-              logger.warn(
-                `[panel-orchestrator] ${key} dispatched a turn with no origin and no established prior origin — scope routing FAILS CLOSED until an explicit target or an origin-bearing message (#884)`,
-              );
-            }
-          }
-        });
-      }
+      turnOrigins.onSeen(key, mid);
       pushToConversation(key, { type: "ack", ok: true, kind: "seen", mid });
     },
     // PER-BACKEND start failure (issue #250): a backend that rejects at
@@ -2710,7 +2578,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       // #884 P0 — the injected turn carries the completion's ORIGIN tab, so it
       // pins/stamps there (show the render on the tab that ran it), never on
       // whatever tab is active (confirming-gate 2).
-      manager.injectEvent(key, payload, { eventToken: token, mid: mintInjectionOrigin(panelTabId) }),
+      manager.injectEvent(key, payload, { eventToken: token, mid: turnOrigins.mintInjectionOrigin(panelTabId) }),
     );
     if (blockedOn) {
       logger.warn(
@@ -2737,7 +2605,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     const key = agentKeyFor(panelTabId);
     const { blockedOn } = AskAnswers.deliverPending(panelTabId, (payload, token) =>
       // #884 P0 — same origin ride as run completions (confirming-gate 2).
-      manager.injectEvent(key, payload, { eventToken: token, mid: mintInjectionOrigin(panelTabId) }),
+      manager.injectEvent(key, payload, { eventToken: token, mid: turnOrigins.mintInjectionOrigin(panelTabId) }),
     );
     if (blockedOn) {
       logger.warn(
@@ -2797,7 +2665,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   // race the retiring tab still maps to its own uuid, so a late command stamps the ORIGIN
   // workflow's uuid and the panel (now showing the new one) fails it closed.
   // #884 — a scope-addressed caller's stamp is the workflow its conversation's
-  // CURRENT TURN was issued for (lastTurnUuidByKey — captured at user-message
+  // CURRENT TURN was issued for (turnOrigins.stampOf — captured at user-message
   // dispatch, refreshed by #716's explicit open/re-pin), NOT the active tab's
   // current workflow: re-resolving at dispatch would let a mutation conceived
   // on workflow A silently land on workflow B after a mid-turn switch (codex
@@ -2808,48 +2676,38 @@ export async function runPanelOrchestrator(): Promise<void> {
   // scope-addressed tool calls are PINNED to the tab the turn was issued from;
   // `null` (ambiguous origin) makes the bridge refuse loudly; no entry lets
   // the bridge fall back to active-tab resolution (idle-time probes).
-  bridge.setScopeTargetResolver((scopeId) => {
-    const key = scopeAgentKeyOf(scopeId);
-    return turnTargetTabByKey.has(key) ? turnTargetTabByKey.get(key)! : undefined;
-  });
-  // #884 P1 (confirming gate 2) — EXPLICIT recovery from a dead or ambiguous
-  // pin. The bridge's refusal names panel_set_workflow_target/panel_open_workflow
-  // as the way out; without this the pin was unchangeable for the rest of the
-  // turn and BOTH escape hatches no-op'd for a scope ctx, so the advertised
-  // recovery could not work. This is the ONLY path that rewrites an in-flight
-  // pin, and it requires the agent's explicit consent (mode:"current") — never
-  // a silent re-target, which is the P0 this whole change exists to prevent.
-  bridge.setScopeRepinHandler((scopeId) => {
-    const key = scopeAgentKeyOf(scopeId);
-    const tab = bridge.resolveActiveScopeTab();
-    if (!tab) return undefined;
-    turnTargetTabByKey.set(key, tab);
-    // Re-derive the fence from the tab we just adopted: a repin that left the
-    // OLD workflow's stamp in force would hand back a session whose very next
-    // mutation fails closed (or, worse, is fenced to a workflow the agent is no
-    // longer pointed at). Both move together or neither does.
-    const uuid = tabCommandWorkflowUuid.get(tab);
-    lastTurnUuidByKey.set(key, uuid);
-    lastOriginByKey.set(key, { tab, uuid });
-    logger.info(
-      `[panel-orchestrator] ${key} re-pinned onto ${tab.slice(0, 8)} by explicit target request (#884 recovery)`,
-    );
-    return tab;
-  });
+  bridge.setScopeTargetResolver(makeScopeTargetResolver({ tracker: turnOrigins, scopeAgentKeyOf }));
+  // #884 P1 (confirming gate 2) — EXPLICIT recovery from a DEAD or AMBIGUOUS
+  // pin, and from those only. The bridge's refusal names
+  // panel_set_workflow_target as the way out; this is the ONLY path that
+  // rewrites an in-flight pin, it is reached solely through the agent's
+  // explicit mode:"current" consent, and it refuses to displace a pin that
+  // still reaches a live tab (confirming gate 3, P0: the recovery path was
+  // silently repinning HEALTHY turns via panel_reload — the exact silent
+  // re-target this whole change exists to prevent). The handler is the real
+  // production seam (turn-origins.ts) so tests drive it directly.
+  bridge.setScopeRepinHandler(
+    makeScopeRepinHandler({
+      bridge,
+      tracker: turnOrigins,
+      scopeAgentKeyOf,
+      backendForTab,
+      backendOfKey: backendOf,
+      info: (msg) => logger.info(msg),
+    }),
+  );
   // #884 P1 (confirming gate 2) — a hello whose `backend` is absent or unknown
   // JOINS the default conversation, so its backend-qualified buffers must drain
   // to it too. Matching on the raw string alone stranded that tab's mailbox
-  // (offline show_media never arriving), which is silent output loss.
-  // Mirrors the hello handler's own mapping EXACTLY (lowercase, then unknown or
-  // absent → defaultBackend); if these two ever disagree, a tab joins one
-  // conversation and drains another's buffers.
-  bridge.setHelloBackendNormalizer((raw) => {
-    const named = typeof raw === "string" ? raw.toLowerCase() : undefined;
-    return named && KNOWN_BACKENDS.has(named) ? named : defaultBackend;
-  });
+  // (offline show_media never arriving), which is silent output loss. The ONE
+  // shared normalizeHelloBackend implementation is also what the hello handler
+  // itself uses to decide which conversation the tab joins, so the two mappings
+  // can no longer disagree (a disagreement made a tab join one conversation and
+  // drain another's buffers).
+  bridge.setHelloBackendNormalizer((raw) => normalizeHelloBackend(raw, KNOWN_BACKENDS, defaultBackend));
   bridge.setTabWorkflowUuidResolver(
     (tabId) => {
-      if (isScopeAddress(tabId)) return lastTurnUuidByKey.get(scopeAgentKeyOf(tabId));
+      if (isScopeAddress(tabId)) return turnOrigins.stampOf(scopeAgentKeyOf(tabId));
       const t = panelTabOf(tabId);
       return t ? tabCommandWorkflowUuid.get(t) : undefined;
     },
@@ -2876,7 +2734,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       // that CONVERSATION's issue-time stamp too, so its subsequent edits
       // target the workflow it just opened instead of being declined until the
       // next user message.
-      if (isScopeAddress(tabId)) lastTurnUuidByKey.set(scopeAgentKeyOf(tabId), identity.uuid);
+      if (isScopeAddress(tabId)) turnOrigins.setStamp(scopeAgentKeyOf(tabId), identity.uuid);
       return true;
     },
   );
@@ -3442,12 +3300,15 @@ export async function runPanelOrchestrator(): Promise<void> {
       if (secureBridge && isRemoteHttpsUrl(comfyuiUrl)) void secureBridge.advertise(comfyuiUrl);
       // Per-tab backend selection (single-port multi-provider). The panel names
       // its chosen provider on connect (and on a switch it re-sends hello / a
-      // set_backend); absent or unknown → the default.
-      const reqBackend =
-        typeof (event as { backend?: unknown }).backend === "string"
-          ? ((event as { backend?: string }).backend as string).toLowerCase()
-          : undefined;
-      const backend = reqBackend && KNOWN_BACKENDS.has(reqBackend) ? reqBackend : defaultBackend;
+      // set_backend); absent or unknown → the default. The SAME shared
+      // normalizeHelloBackend the bridge's mailbox drain uses — one
+      // implementation, so "which conversation does this tab join" and "whose
+      // buffers does it drain" can never disagree (confirming gate 2, P1).
+      const backend = normalizeHelloBackend(
+        (event as { backend?: unknown }).backend,
+        KNOWN_BACKENDS,
+        defaultBackend,
+      );
       // Same-socket re-hello under a NEW tab id (issue #210): the BRIDGE stamps
       // `migrated_from` when the SAME socket re-helloed under a new tab id — a
       // workflow SWITCH, a save/rename (tmp:→wf:), or a panel id-scheme change.
@@ -4454,7 +4315,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         // that failed, never whichever tab was last active. This was the P0's
         // exact sequence — a render error on A silently editing B.
         void manager.injectRunError(agentKeyFor(event.tab_id), ev.error ?? "unknown error", {
-          mid: mintInjectionOrigin(event.tab_id),
+          mid: turnOrigins.mintInjectionOrigin(event.tab_id),
         });
         logger.info(`[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} run_error → agent (interrupt)`);
         return;
@@ -4484,7 +4345,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       }
       const delivered = manager.injectEvent(agentKeyFor(event.tab_id), evForTab, {
         // #884 P0 — panel events pin their originating tab (confirming-gate 2).
-        mid: mintInjectionOrigin(event.tab_id),
+        mid: turnOrigins.mintInjectionOrigin(event.tab_id),
       });
       if (delivered) {
         logger.info(`[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} event → agent: ${event.kind}`);
@@ -4538,7 +4399,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       // outside the manager queue (heldDuringGen) reports removed:false and can
       // still dispatch later — deleting its mapping would make that dequeue an
       // unknown mid and spuriously fail the turn's fence closed.
-      if (mid && removed) turnUuidByMid.delete(mid);
+      if (mid && removed) turnOrigins.cancelMid(mid);
       bridge.push({ type: "ack", ok: true, kind: "cancel_message", mid, removed }, tabId);
       return;
     }
@@ -4555,8 +4416,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       // spawn an agent before we report the cleared session.
       const { durableCleared } = manager.reset(key);
       // The replaced conversation's issue-time stamp and turn pin die with it.
-      lastTurnUuidByKey.delete(key);
-      turnTargetTabByKey.delete(key);
+      turnOrigins.forgetConversation(key);
       // #468 — the conversation that queued the outstanding renders is gone.
       // Close its run tickets so a render finishing after the New chat is
       // reported to the replacement agent as UNDETERMINED rather than as "the
@@ -4603,9 +4463,12 @@ export async function runPanelOrchestrator(): Promise<void> {
       const tabId = event.tab_id;
       const anchor = typeof event.anchor === "string" ? event.anchor : null;
       const ok = manager.rewind(agentKeyFor(tabId), anchor);
-      // The dropped branch's issue-time stamp must not outlive it; the edited
-      // message that follows re-stamps at its own dequeue (codex r2).
-      if (ok) lastTurnUuidByKey.delete(agentKeyFor(tabId));
+      // The dropped branch's issue-time stamp AND last established origin must
+      // not outlive it; the edited message that follows re-establishes both at
+      // its own dequeue (codex r2; gate-3 confirm P1: the agent stays live
+      // across a rewind, so an origin-less injected turn landing before the
+      // edited message must refuse, never inherit the dropped branch).
+      if (ok) turnOrigins.dropBranch(agentKeyFor(tabId));
       // #486 — a REWIND is a conversation boundary too, not just New chat and
       // resume: everything after the anchor is discarded, so a question card the
       // dropped branch put up was never asked by the conversation that now
@@ -4651,8 +4514,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       // immediately, so disk agrees with intent from this instant on.
       const { durableCleared: clearedDurably } = manager.reset(key);
       // The replaced conversation's issue-time stamp and turn pin die with it.
-      lastTurnUuidByKey.delete(key);
-      turnTargetTabByKey.delete(key);
+      turnOrigins.forgetConversation(key);
       // #468 — same as New chat: the conversation being replaced owns the open
       // runs, so a completion landing after the switch is UNDETERMINED, not the
       // historical session's own render. #884: the boundary is conversation-wide.
@@ -4846,22 +4708,17 @@ export async function runPanelOrchestrator(): Promise<void> {
     // turn STARTED with (applied at dequeue via onSeen, never re-resolved at
     // dispatch), so a mid-turn switch to another workflow makes late edits fail
     // the panel's fence loudly instead of silently re-aiming (codex rounds
-    // 1–2). A mid-less message (rare: non-panel callers) applies immediately —
-    // there is no dequeue signal to ride.
-    {
-      const issueUuid = tabCommandWorkflowUuid.get(event.tab_id);
-      if (userMid) {
-        recordTurnUuidForMid(userMid, issueUuid, event.tab_id);
-      } else if (!manager.isTurnActive(agentKeyFor(event.tab_id))) {
-        // Mid-less (non-panel/legacy) message with NO dequeue signal to ride:
-        // apply immediately, but only while no turn is in flight — a busy
-        // conversation's live fence must never be flipped at receipt (codex
-        // r3). While busy, the previous stamp stands; if the canvas moved, the
-        // late mutation fails the panel fence closed. The turn this message is
-        // about to start pins to its origin tab too (confirming-gate P0).
-        lastTurnUuidByKey.set(agentKeyFor(event.tab_id), issueUuid);
-        turnTargetTabByKey.set(agentKeyFor(event.tab_id), event.tab_id);
-      }
+    // 1–2). A mid-less message (rare: non-panel callers) gets a SYNTHETIC
+    // origin mid so its turn pins/stamps through the same dequeue path as
+    // every other message (confirming gate 3, P1 sibling: the old
+    // apply-at-receipt-while-idle shortcut left a mid-less message that queued
+    // BEHIND a busy turn with no origin at all, so its own turn later routed
+    // to whatever tab was active). Panels ignore seen-acks for unknown mids,
+    // exactly as with the evt- mids injected events already ride.
+    const dispatchMid =
+      userMid ?? turnOrigins.mintInjectionOrigin(event.tab_id);
+    if (userMid) {
+      turnOrigins.recordForMid(userMid, tabCommandWorkflowUuid.get(event.tab_id), event.tab_id);
     }
     {
       const originKey = agentKeyFor(event.tab_id);
@@ -4926,7 +4783,9 @@ export async function runPanelOrchestrator(): Promise<void> {
       // withhold pixels". Audio is a different sense and is deliberately NOT
       // withheld by that toggle; documented in docs/backends.mdx.
       audio: attachedAudio.length ? attachedAudio : undefined,
-      mid: userMid,
+      // The panel's own mid, or the synthetic origin mid a mid-less message
+      // was given so its turn still pins/stamps at dequeue (#884 gate 3).
+      mid: dispatchMid,
     };
     // Local-agent VRAM pause: if this tab runs the local Ollama model AND a
     // render is in flight, DON'T run the turn now — that would reload the model
@@ -5226,11 +5085,18 @@ export async function runPanelOrchestrator(): Promise<void> {
       // a queued terminal cancelled by a newer live attempt. Don't fire an empty
       // "download_done" turn in that case.
       if (settled.length === 0) continue;
-      // #884 — deliberately NO origin mid here: a download has no originating
-      // TAB (its row names the owning conversation), so the turn inherits the
-      // conversation's LAST ESTABLISHED origin at batch close — never the
-      // active tab (confirming-gate 2, P0 rule: every turn has an origin).
-      manager.injectEvent(key, { kind: "download_done", downloads: settled });
+      // #884 — a download has no originating TAB (its row names the owning
+      // conversation), so its turn INHERITS the conversation's LAST
+      // ESTABLISHED origin — never the active tab (confirming gate 2, P0 rule:
+      // every turn has an origin). The inherited-origin mid is what makes that
+      // actually happen: onSeen only fires for items carrying a mid, so a
+      // mid-less injection opened no batch at all and the inherit branch never
+      // ran — the turn routed to whatever tab was active (confirming gate 3,
+      // P1). The minted mid contributes nothing and the batch close inherits
+      // (or refuses, when no origin was ever established).
+      manager.injectEvent(key, { kind: "download_done", downloads: settled }, {
+        mid: turnOrigins.mintInheritedOrigin(),
+      });
     }
     // MCP-child control channel (#269): runpod_* tools that ran in spawned
     // agent children ask the orchestrator to retarget / watch / unwatch /

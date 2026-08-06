@@ -4196,7 +4196,16 @@ export interface PanelToolCtx {
    * into resolveTarget. Throws (clear message) when a single active tab can't be
    * determined. Optional so lightweight test contexts can omit it.
    */
-  rebindToActiveTab?: () => { previous: string; current: string; rebound: boolean };
+  rebindToActiveTab?: (opts?: {
+    /** EXPLICIT scope-recovery consent — passed ONLY by
+     *  panel_set_workflow_target({mode:"current"}), the documented recovery
+     *  signal. Without it a SCOPE-bound ctx is never repinned at all, and even
+     *  with it the repin fires only when the current pin does NOT reach a live
+     *  tab (a healthy shared turn is never displaced — confirming gate 3, P0:
+     *  panel_reload's unconditional call was silently repinning healthy turns
+     *  onto whichever tab was last active). Real-tab ctxs ignore this flag. */
+    scopeRecoveryConsent?: boolean;
+  }) => { previous: string; current: string; rebound: boolean };
   /**
    * Best-effort in-place self-heal for the handful of tools that call the bridge
    * DIRECTLY (not via `ctx.call`) — e.g. panel_request_adult_consent's ask_user
@@ -4648,18 +4657,35 @@ export function makePanelToolCtx(
   // session is left untouched so this never hijacks routing on a multi-tab
   // deployment. Throws (clear message, via resolveActiveTabId) when a single
   // active tab can't be picked.
-  const rebindToActiveTab = (): { previous: string; current: string; rebound: boolean } => {
+  const rebindToActiveTab = (opts?: {
+    scopeRecoveryConsent?: boolean;
+  }): { previous: string; current: string; rebound: boolean } => {
     const previous = ctx.tabId;
     // #884 P0 — a SCOPE-bound ctx must never be REPLACED by a real tab id (that
     // would permanently narrow the shared conversation's routing to one tab).
-    // The ctx therefore stays scope-bound. But it is NOT a no-op: this is the
-    // explicit "use what's live now" consent, and a turn whose pin is dead or
-    // ambiguous has no other way out — the bridge's own refusal names this tool
-    // as the recovery, and before this it could not deliver one (confirming
-    // gate 2, P1: both escape hatches no-op'd, so awaitReachable stayed false
-    // and panel_open_workflow refused before dispatch for the rest of the turn).
-    // Re-pin the in-flight turn onto the live tab instead, keeping the address.
+    // The ctx therefore stays scope-bound. Its ONE recovery is the explicit
+    // repin — and it is DOUBLE-gated (confirming gate 3, P0):
+    //  1. CONSENT: only panel_set_workflow_target({mode:"current"}) passes
+    //     scopeRecoveryConsent. panel_reload and every implicit self-heal call
+    //     this without it, and for them the scope branch is a strict no-op —
+    //     the previous round's unconditional repin let panel_reload silently
+    //     re-aim a HEALTHY turn at whichever tab a queued message had just
+    //     made last-active, the exact P0 this PR exists to prevent.
+    //  2. RECOVERY-ONLY: even with consent, a pin that still reaches a live
+    //     tab is healthy and stays. Only a dead or ambiguous pin (canReach
+    //     false — the state whose refusal names this tool as the way out,
+    //     confirming gate 2, P1) is escaped, via the bridge repin handler
+    //     (which re-checks both conditions itself, so no future caller can
+    //     bypass this gate).
     if (isScopeAddress(previous)) {
+      // Provably dead/ambiguous ONLY: a bridge that cannot answer canReach
+      // cannot prove the pin is dead, so it must not be moved (conservative;
+      // every real bridge answers).
+      const pinProvenDead =
+        typeof bridge.canReach === "function" && !bridge.canReach(previous);
+      if (!opts?.scopeRecoveryConsent || !pinProvenDead) {
+        return { previous, current: previous, rebound: false };
+      }
       const repinned = bridge.repinScopeToActive?.(previous);
       return { previous, current: previous, rebound: Boolean(repinned) };
     }
@@ -6712,13 +6738,27 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .describe("'orchestrator' (default): respawn the agent and its comfyui tool server (agent config, MCP servers, system prompt, comfyui tool code). Does NOT restart the long-lived orchestrator process behind the panel_* tools. 'frontend': reload the panel UI for new web code."),
       },
       async (args: A, ctx) => {
-        // panel_reload is an explicit "recover me now" signal — if THIS session's
-        // tab id was orphaned by a reconnect/reload/workflow-switch, self-heal it
-        // onto the active tab first so a stuck session can recover by calling this
-        // (and so the soft_reload frame actually reaches a live tab). A healthy
-        // session is left untouched; an ambiguous multi-tab case surfaces a clear
-        // error rather than guessing.
-        if (ctx.rebindToActiveTab) {
+        // panel_reload self-heals an orphaned REAL-tab binding onto the active
+        // tab (so the soft_reload frame reaches a live tab), but it is NOT a
+        // scope-repin consent path (confirming gate 3, P0): a SCOPE-bound
+        // session's in-flight turn pin is only ever moved by the explicit
+        // panel_set_workflow_target({mode:"current"}) recovery. A scope ctx
+        // whose pin is dead therefore FAILS here, naming that recovery —
+        // instead of silently re-aiming the turn (and every mutation that
+        // follows it) at whichever tab happens to be last-active.
+        if (isScopeAddress(ctx.tabId)) {
+          const reachable =
+            typeof ctx.bridge.canReach === "function" ? ctx.bridge.canReach(ctx.tabId) : true;
+          if (!reachable) {
+            return fail(
+              "This conversation's current turn is pinned to a tab that is no longer " +
+                "reachable (it disconnected or its origin is ambiguous), so the reload " +
+                "frame has nowhere safe to go. Switch to the ComfyUI tab you want, call " +
+                'panel_set_workflow_target({mode:"current"}) to re-bind this session onto ' +
+                "it, then retry panel_reload.",
+            );
+          }
+        } else if (ctx.rebindToActiveTab) {
           // Strict-single: if this session's tab is orphaned AND 2+ tabs are live,
           // do NOT guess (the bridge would fall back to last-active, possibly an
           // unrelated tab) — surface a clear error so the user picks, honoring the
@@ -7533,7 +7573,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // rebinds via ensureReachable when a tab is (re)connected.
           if (ctx.awaitReachable) await ctx.awaitReachable();
           try {
-            ctx.rebindToActiveTab(); // completes the rebind if awaitReachable didn't
+            // completes the rebind if awaitReachable didn't. mode:"current" is
+            // THE explicit scope-recovery consent (#884 gate 3) — the only
+            // caller that may escape a DEAD scope pin (a healthy pin still
+            // stays put; see rebindToActiveTab's double gate).
+            ctx.rebindToActiveTab({ scopeRecoveryConsent: true });
           } catch (err) {
             // #474: with 2+ live tabs the rebind is AMBIGUOUS — fail so the user picks.
             // But with ZERO tabs connected (the "Connected: none" window right after a

@@ -25,6 +25,7 @@ import type {
 import { CLAUDE_CAPABILITIES } from "../../orchestrator/agent-backend.js";
 import { SessionStore } from "../../orchestrator/session-store.js";
 import { sharedAgentKey } from "../../services/session-scope.js";
+import { TurnOriginTracker } from "../../orchestrator/turn-origins.js";
 
 let PanelAgentManager: typeof import("../../orchestrator/panel-agent.js").PanelAgentManager;
 beforeAll(async () => {
@@ -143,52 +144,53 @@ describe("sessions are orchestrator-scoped, never workflow-scoped (#884)", () =>
   });
 
   it("SOURCE: scope mutations are stamped with the TURN's issue-time workflow, never re-resolved (codex r1 P0 / r2)", () => {
+    // The stamp/pin/inheritance MACHINERY lives in turn-origins.ts and is
+    // driven behaviorally by turn-origins.test.ts (confirming gate 3, P2: the
+    // old source-string coverage here asserted behavior the code could not
+    // reach). What THIS test pins is the index.ts WIRING into that seam —
+    // every entry point that can start, end, or re-target a turn goes through
+    // the tracker, and nothing bypasses it.
     const src = indexSrc();
-    // The issue-time uuid AND origin tab RIDE the message (recorded per mid)…
-    expect(src).toContain("recordTurnUuidForMid(userMid, issueUuid, event.tab_id);");
-    // …a mid-less message may only stamp while NO turn is in flight (codex r3)…
-    expect(src).toContain("} else if (!manager.isTurnActive(agentKeyFor(event.tab_id))) {");
-    // …and the stamp lands when the turn DEQUEUES its batch (onSeen), with a
-    // MIXED/unknown-origin batch failing closed instead of last-message-wins
-    // re-aiming the whole turn's mutations (codex r2/r3).
-    expect(src).toContain("batch.known.push(rec.uuid);");
-    // Confirming gate 2 split this into its two honest halves, so BOTH are
-    // pinned — the old single condition can't come back by satisfying one.
-    // A mixed/unknown TAB batch fails closed on routing AND stamp (no single
-    // target is honest for it)…
-    expect(src).toContain("if (closed.unknown || closed.tabs.size > 1) {");
-    // …while one tab whose workflow changed between messages keeps its routing
-    // pin (same browser surface) and fails closed on the STAMP alone.
+    // EVERY user message rides an origin mid — a panel mid records its origin,
+    // and a mid-less (non-panel/legacy) message gets a SYNTHETIC one, so both
+    // pin/stamp through the same dequeue path (gate 3: the old
+    // apply-at-receipt-while-idle shortcut left a mid-less message queued
+    // behind a busy turn with no origin at all).
+    expect(src).toContain("userMid ?? turnOrigins.mintInjectionOrigin(event.tab_id);");
     expect(src).toContain(
-      "const uuid = distinct.size === 1 ? distinct.values().next().value : undefined;",
+      "turnOrigins.recordForMid(userMid, tabCommandWorkflowUuid.get(event.tab_id), event.tab_id);",
     );
-    // The TURN-TARGET PIN lands in the same batch close and is released at turn
-    // end: an in-flight turn's tool calls route to the tab the turn was issued
-    // from, never re-resolved mid-turn (confirming-gate P0).
-    expect(src).toContain("turnTargetTabByKey.set(key, tab);");
-    expect(src).toContain('if (state === "done") turnTargetTabByKey.delete(key);');
-    // Confirming gate 2, P0 — EVERY turn has an origin, not just user-message
-    // turns. A turn that contributes none (an injected run error whose queue
-    // item carried no mid, a pure re-queue, a restart nudge) inherits the
-    // conversation's LAST ESTABLISHED origin; with none it refuses. It must
-    // never fall through to "whatever tab is active" — that is how a render
-    // error on tab A silently edited tab B.
-    expect(src).toContain("const last = lastOriginByKey.get(key);");
-    expect(src).toContain("turnTargetTabByKey.set(key, last.tab);");
-    expect(src).toContain("lastOriginByKey.set(key, { tab, uuid });");
-    // …and the injection paths mint that origin rather than going in bare.
-    expect(src).toContain("mid: mintInjectionOrigin(event.tab_id),");
-    expect(src).toContain("bridge.setScopeTargetResolver((scopeId) => {");
-    // …answered to scope-addressed callers by the stamp resolver…
+    expect(src).toContain("mid: dispatchMid,");
+    // The stamp lands when the turn DEQUEUES its batch (onSeen)…
+    expect(src).toContain("turnOrigins.onSeen(key, mid);");
+    // …the pin is released at turn end (idle-time scope resolution follows the
+    // active tab again)…
+    expect(src).toContain('if (state === "done") turnOrigins.turnEnded(key);');
+    // …the injection paths mint a REAL origin (a run error on tab A pins A)…
+    expect(src).toContain("mid: turnOrigins.mintInjectionOrigin(event.tab_id),");
+    // …and the tab-less download completion rides an INHERITED origin so its
+    // turn inherits the conversation's last established origin at dequeue
+    // instead of opening no batch at all (gate 3, P1).
+    expect(src).toContain("mid: turnOrigins.mintInheritedOrigin(),");
+    // The bridge consults the REAL resolver/repin factories (the same seams
+    // the tests drive), never an inline reimplementation.
     expect(src).toContain(
-      "if (isScopeAddress(tabId)) return lastTurnUuidByKey.get(scopeAgentKeyOf(tabId));",
+      "bridge.setScopeTargetResolver(makeScopeTargetResolver({ tracker: turnOrigins, scopeAgentKeyOf }));",
+    );
+    expect(src).toContain("makeScopeRepinHandler({");
+    // Scope-addressed callers are stamped from the tracker…
+    expect(src).toContain(
+      "if (isScopeAddress(tabId)) return turnOrigins.stampOf(scopeAgentKeyOf(tabId));",
     );
     // …refreshed only by #716's validated explicit-open path…
     expect(src).toContain(
-      "if (isScopeAddress(tabId)) lastTurnUuidByKey.set(scopeAgentKeyOf(tabId), identity.uuid);",
+      "if (isScopeAddress(tabId)) turnOrigins.setStamp(scopeAgentKeyOf(tabId), identity.uuid);",
     );
     // …and cleared at every conversation boundary (new chat / resume / rewind).
-    expect((src.match(/lastTurnUuidByKey\.delete\(/g) ?? []).length).toBeGreaterThanOrEqual(3);
+    expect((src.match(/turnOrigins\.forgetConversation\(/g) ?? []).length).toBeGreaterThanOrEqual(2);
+    expect(src).toContain("turnOrigins.dropBranch(agentKeyFor(tabId));");
+    // A cancelled queued message's origin dies with it.
+    expect(src).toContain("turnOrigins.cancelMid(mid);");
     // The panel MCP servers bind the backend-QUALIFIED scope address so the
     // per-conversation stamp is recoverable from the caller id.
     expect(src).toContain("createPanelMcpServer(bridge, key, workflowTargets)");
@@ -303,6 +305,87 @@ describe("sessions are orchestrator-scoped, never workflow-scoped (#884)", () =>
     // were churned by the other's activity.
     expect(backends.get(sharedAgentKey("claude"))!.closes).toBe(0);
     expect(backends.get(sharedAgentKey("codex"))!.closes).toBe(0);
+
+    await manager.stopAll();
+  });
+
+  it("a download_done injection rides an inherited-origin mid through the REAL queue and pins the last established origin (gate 3, P1)", async () => {
+    // Confirming gate 3, P2: the old coverage asserted source strings while a
+    // mid-LESS download injection never fired onSeen at all — no batch, no pin,
+    // and the turn routed to whatever tab was active. This drives the real
+    // PanelAgentManager dequeue: the injected item's minted mid MUST reach
+    // onSeen (the seam panel-agent.ts only fires for items carrying a mid), and
+    // the tracker must then inherit the conversation's last established origin.
+    //
+    // The backend HOLDS each turn open until released: the pin exists only
+    // while its turn is in flight (turn end releases it), so the assertion has
+    // to observe it MID-turn — exactly when the turn's tool calls would route.
+    class HoldingBackend extends RecordingBackend {
+      release: (() => void) | null = null;
+      async *run(opts: BackendStartOptions): AsyncGenerator<AgentEvent> {
+        for await (const turn of opts.channel) {
+          yield { type: "session", sessionId: this.sessionId };
+          this.turnTexts.push(turn.text);
+          await new Promise<void>((r) => {
+            this.release = r;
+          });
+          yield { type: "result", ok: true, subtype: "success" } as AgentEvent;
+        }
+      }
+    }
+    const backend = new HoldingBackend();
+    const store = new SessionStore(PORT, { dir: DIR });
+    const tracker = new TurnOriginTracker({
+      backendForTab: () => "claude",
+      backendOfKey: (k) => k.slice(k.lastIndexOf("::") + 2),
+      uuidOfTab: () => "issue-uuid-a",
+      warn: () => {},
+    });
+    const key = sharedAgentKey("claude");
+    const manager = new PanelAgentManager({
+      mcpServers: {},
+      systemAppend: "",
+      model: "claude-test",
+      onSay: () => {},
+      // Mirror the index.ts wiring exactly: dequeue applies origins, turn end
+      // releases the pin.
+      onSeen: (k: string, mid: string) => tracker.onSeen(k, mid),
+      onTurn: (k: string, state: string) => {
+        if (state === "done") tracker.turnEnded(k);
+      },
+      onSession: () => {},
+      sessionStore: store,
+      makeBackend: () => backend,
+    } as never);
+
+    // A user turn from tab wf:a.json establishes the conversation's origin —
+    // observable mid-turn as the routing pin, and durably as the stamp.
+    tracker.recordForMid("m-user", "issue-uuid-a", "wf:a.json");
+    manager.send(key, "render this", { mid: "m-user" });
+    await waitFor(() => backend.turnTexts.length === 1);
+    await waitFor(() => tracker.pinOf(key) === "wf:a.json");
+    expect(tracker.stampOf(key)).toBe("issue-uuid-a");
+    backend.release!();
+    // The turn ends → the pin is released (idle scope routing follows the
+    // active tab between turns).
+    await waitFor(() => tracker.pinOf(key) === undefined);
+
+    // A coalesced download completion is injected — with NO originating tab of
+    // its own, only the minted inherited-origin mid.
+    expect(manager.hasLiveAgent(key)).toBe(true);
+    const delivered = manager.injectEvent(
+      key,
+      { kind: "download_done", downloads: [{ name: "model.safetensors", status: "done" }] },
+      { mid: tracker.mintInheritedOrigin() },
+    );
+    expect(delivered).toBe(true);
+    await waitFor(() => backend.turnTexts.length === 2);
+    // Its IN-FLIGHT turn INHERITED the last established origin — never the
+    // active tab. (Without the mid, onSeen never fires, no batch opens, and
+    // this pin simply never exists — the pre-fix behavior.)
+    await waitFor(() => tracker.pinOf(key) === "wf:a.json");
+    expect(tracker.stampOf(key)).toBe("issue-uuid-a");
+    backend.release!();
 
     await manager.stopAll();
   });

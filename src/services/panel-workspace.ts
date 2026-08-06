@@ -243,6 +243,7 @@ export async function primePanelBase(
   // to a wrong-tree mutation reported as success.
   const atTarget = targetKey();
   const atGeneration = targetGeneration();
+  const cacheAtStart = cached;
 
   let resolution: PanelBaseResolution;
   try {
@@ -266,6 +267,17 @@ export async function primePanelBase(
   if (targetKey() !== atTarget || targetGeneration() !== atGeneration) {
     cached = undefined;
     return { source: "none" };
+  }
+
+  // A NEWER cache write landed while we were asking (a later prime settled, or
+  // a deliberate seed). Same rule as the retarget guard above: a probe that
+  // STARTED earlier holds older information, so it must not clobber the newer
+  // write — the fire-and-forget prime a capability refusal kicks off (see
+  // resolveStaleBundleSkew) can settle seconds later, mid-way through someone
+  // else's operation. Serve the newer cache when it is still fresh; fall back
+  // to this probe's answer (without caching it) when it has already expired.
+  if (cached !== cacheAtStart) {
+    return cachedResolution() ?? resolution;
   }
 
   cached = { at: Date.now(), target: atTarget, generation: atGeneration, resolution };

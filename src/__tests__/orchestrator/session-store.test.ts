@@ -249,6 +249,50 @@ describe("SessionStore", () => {
       writeFileSync(`${fileFor(dir)}.tmp`, "{truncated-mid-wr");
       expect(new SessionStore(PORT, { dir }).get(key)).toBe("sess-main");
     });
+
+    // Confirming gate 3, P1: `undurable === false` proved only that the LAST
+    // write succeeded. If the file is deleted or replaced EXTERNALLY after
+    // that, the in-memory shortcut kept answering "durable" while a restart
+    // would lose the session. The claim must not exceed the evidence: the
+    // shortcut now verifies the file it last wrote is observably still there
+    // (size+mtime fingerprint) and REPAIRS it otherwise.
+    it("set() after the store file was DELETED externally repairs the file instead of asserting durability", () => {
+      const dir = scratchDir();
+      const key = sharedAgentKey("claude");
+      const store = new SessionStore(PORT, { dir });
+      expect(store.set(key, "sess-drift")).toBe(true);
+      rmSync(fileFor(dir)); // external deletion after a clean write
+      // Same id, well inside the 1h timestamp-skip window: the old shortcut
+      // returned true here without touching disk — and a restart lost the id.
+      expect(store.set(key, "sess-drift")).toBe(true);
+      expect(existsSync(fileFor(dir))).toBe(true); // repaired, not merely claimed
+      expect(new SessionStore(PORT, { dir }).get(key)).toBe("sess-drift");
+    });
+
+    it("set() after the store file was REPLACED externally repairs it too", () => {
+      const dir = scratchDir();
+      const key = sharedAgentKey("claude");
+      const store = new SessionStore(PORT, { dir });
+      expect(store.set(key, "sess-drift")).toBe(true);
+      // An external writer replaced the file (different content ⇒ different
+      // size, which the fingerprint catches without a full read).
+      writeFileSync(fileFor(dir), JSON.stringify({ v: 2, sessions: {} }));
+      expect(store.set(key, "sess-drift")).toBe(true);
+      expect(new SessionStore(PORT, { dir }).get(key)).toBe("sess-drift");
+    });
+
+    it("drift repair still reports false while the filesystem refuses the rewrite", () => {
+      const dir = scratchDir();
+      const key = sharedAgentKey("claude");
+      const store = new SessionStore(PORT, { dir });
+      expect(store.set(key, "sess-drift")).toBe(true);
+      rmSync(fileFor(dir));
+      blockTmp(dir); // the repair write itself cannot land
+      expect(store.set(key, "sess-drift")).toBe(false); // honest: nothing on disk
+      rmSync(`${fileFor(dir)}.tmp`, { recursive: true, force: true });
+      expect(store.set(key, "sess-drift")).toBe(true);
+      expect(new SessionStore(PORT, { dir }).get(key)).toBe("sess-drift");
+    });
   });
 
   describe("#884 LOCATION migration — tmpdir → ~/.comfyui-mcp/sessions", () => {
