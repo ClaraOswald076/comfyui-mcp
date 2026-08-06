@@ -1542,6 +1542,45 @@ describe("download job registry", () => {
           await fsRm(dir, { recursive: true, force: true });
         }
       });
+
+      it("reclaim does NOT clear a row id a live download shares via TRAY id when its progress id differs", async () => {
+        // The inverse shape of the test above: the live download's rows are keyed
+        // by a DIFFERENT progress id (query-auth/rewrite), but it shares the dead
+        // record's tray id. Clearing by tray id would wipe a live row.
+        const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
+        setProgressDir(dir);
+        const clearSpy = vi.spyOn(progressModule, "clearDownloadProgress");
+        try {
+          const id = "deadtrayshare858x1";
+          await writeForeignJobRecord(dir, {
+            id,
+            trayId: "sharedtray8580001",
+            progressId: "dead-only-prog",
+            url: URL_A,
+            owner: "dead-session",
+            ageMs: 10 * 60 * 1000,
+            pid: deadPid(),
+          });
+          await writeForeignJobRecord(dir, {
+            id: "livetrayotherid001",
+            trayId: "sharedtray8580001",
+            progressId: "live-other-prog",
+            url: URL_A,
+            owner: "live-session",
+          });
+          clearSpy.mockClear();
+
+          const res = cancelDownloadJob(id);
+          expect(res.reclaimed).toBe(true);
+          expect(clearSpy).not.toHaveBeenCalledWith("sharedtray8580001");
+          // The dead-only row id is not shared by anything live — it is cleared.
+          expect(clearSpy).toHaveBeenCalledWith("dead-only-prog");
+        } finally {
+          clearSpy.mockRestore();
+          setProgressDir("");
+          await fsRm(dir, { recursive: true, force: true });
+        }
+      });
     });
 
     it("keeps a heartbeat-stale in-flight record visible without deleting its persisted state (#761)", async () => {

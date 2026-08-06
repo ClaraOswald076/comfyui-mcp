@@ -1260,10 +1260,12 @@ function reclaimDeadPersistedDownload(
   });
   if (!durable) return { reclaimed: false, denied: "persist-failed" };
   removePersistedDownloadJobFor(rec.id, rec.owner ?? "");
-  // The dead writer's tray row would linger in the panel forever otherwise.
-  // Clear it ONLY when no LIVE job — this process's in-flight entries or a FRESH
-  // foreign record — still shares that physical row (same sharing discipline as
-  // finalizeCancelled).
+  // The dead writer's tray row would linger in the panel otherwise. Clear it
+  // ONLY when no LIVE job — this process's in-flight entries or a FRESH foreign
+  // record — could share it. Rows are keyed by the writer-reported progressId,
+  // but a job whose writer has not reported yet is identifiable only by trayId,
+  // so count BOTH ids of every live job: over-counting a live id only ever
+  // skips a clear (safe), never wipes a live row (the #515 invariant).
   const rowIds = new Set(
     [rec.progressId, rec.trayId].filter((x): x is string => typeof x === "string" && x.length > 0),
   );
@@ -1272,13 +1274,14 @@ function reclaimDeadPersistedDownload(
     const liveRowIds = new Set<string>();
     for (const e of new Set(jobs.values())) {
       if (e.job.status !== "downloading") continue;
-      liveRowIds.add(e.job.progressId ?? e.job.trayId);
+      if (e.job.progressId) liveRowIds.add(e.job.progressId);
+      liveRowIds.add(e.job.trayId);
     }
     for (const r of listPersistedDownloadJobs()) {
       if (r.status !== "downloading") continue;
       if (now - (r.updated ?? 0) >= PERSISTED_INFLIGHT_STALE_MS) continue;
-      const rowId = r.progressId ?? r.trayId;
-      if (rowId) liveRowIds.add(rowId);
+      if (r.progressId) liveRowIds.add(r.progressId);
+      if (r.trayId) liveRowIds.add(r.trayId);
     }
     for (const rowId of rowIds) {
       if (!liveRowIds.has(rowId)) clearDownloadProgress(rowId);
