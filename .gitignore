@@ -78,3 +78,9 @@ orch.err.log
 
 # Local Discord watchdog/notifier toolkit (token read from ~/.claude.json at runtime; not committed)
 /.discord/
+
+# Tool-reach benchmark (scripts/tool-reach.mjs). The per-episode run-*.json are
+# regenerated evidence and can run to megabytes; the report and the summary are
+# committed alongside the PR that produced them.
+bench-results/*/run-*.json
+bench-results/run-*.json

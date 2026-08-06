@@ -74,8 +74,7 @@ export const REQUESTS = [
     tier: "neutral",
     task: "That last render came out too dark. Do it again, but give it more steps.",
     target: "regenerate",
-    accept: ["generate_image"],
-    why: "Re-running a previous job with an override; composing it afresh is defensible if you still know the prompt.",
+    why: "Re-running a previous job with an override. generate_image is deliberately NOT accepted: the request never states the prompt, so a fresh render cannot reproduce it — and post-fold both are generate_image, so accepting it would make this row unfailable exactly where the action distinction matters most.",
   },
   {
     id: "gen-04",
@@ -135,16 +134,15 @@ export const REQUESTS = [
     tier: "neutral",
     task: "Draw a cat, but make it hold the exact pose in this reference photo.",
     target: "generate_with_controlnet",
-    accept: ["generate_image"],
-    why: "Pose conditioning; a plain render with a good prompt is a weaker but real answer.",
+    why: "Pose conditioning. A plain render cannot honour 'the exact pose in this reference photo', so it is not accepted — post-fold it is the same tool with a different action, which is precisely the confusion under test.",
   },
   {
     id: "gen-12",
     tier: "neutral",
     task: "There's a stock Flux recipe that ships with ComfyUI — use that one to make me a picture of a paper lantern.",
     target: "run_template",
-    accept: ["enqueue_workflow", "generate_image"],
-    why: "Running a shipped recipe; enqueueing it by hand reaches the same place.",
+    accept: ["enqueue_workflow"],
+    why: "Running a shipped recipe; enqueueing it by hand reaches the same place. generate_image is NOT accepted — it would ignore the recipe the user named.",
   },
 
   // ───────────────────────────── neutral: images & assets (7)
@@ -171,6 +169,7 @@ export const REQUESTS = [
     target: "list_output_images",
     accept: ["list_assets"],
     why: "Output listing vs asset registry.",
+    leakOk: "'outputs' is what the folder is called on disk and what a user says; it overlaps the consolidated action list_outputs, but the tool name is not present and there is no other word for the folder.",
   },
   {
     id: "img-04",
@@ -239,6 +238,7 @@ export const REQUESTS = [
     target: "search_civitai_models",
     accept: ["search_models"],
     why: "Named source, but the generic search is a fair first move.",
+    leakOk: "'Civitai' is the site the user is naming; it overlaps the consolidated action search_civitai. Naming the source IS the request — removing it would make the row meaningless.",
   },
   {
     id: "mdl-06",
@@ -586,10 +586,9 @@ export const REQUESTS = [
     id: "h3-02",
     tier: "hypothesis",
     hypothesis: "H3",
-    task: "I want a short animated video — a neon sign flickering in the rain, about three seconds.",
+    task: "I want a short animated piece — a neon sign flickering in the rain, about three seconds.",
     target: "generate_video",
-    why: "H3/video — the plain phrasing.",
-    leakOk: "'video' is the user's own noun; the tool name 'generate_video' is not present.",
+    why: "H3/video — second phrasing. Deliberately avoids the word 'video': that is the consolidated ACTION token, and spelling it would hand the model half the answer on the arm under test (and hand the BASELINE arm, where the tool is literally generate_video, rather more than half).",
   },
   {
     id: "h3-03",
@@ -597,8 +596,7 @@ export const REQUESTS = [
     hypothesis: "H3",
     task: "Take this still photo and give it a few seconds of motion.",
     target: "generate_video",
-    accept: ["generate_image"],
-    why: "H3/video — image-to-motion; a still-image tool is a wrong but understandable reach.",
+    why: "H3/video — image-to-motion. A still-image reach is understandable but WRONG, and accepting it would make H3 unfalsifiable on the arm where both are generate_image.",
   },
   {
     id: "h3-04",
@@ -667,8 +665,7 @@ export const REQUESTS = [
     hypothesis: "H4",
     task: "Show me the reference material that ships with this thing.",
     target: "list_skills",
-    accept: ["list_packs"],
-    why: "H4 — genuinely close to the packs listing, so packs is accepted.",
+    why: "H4 — packs is the confusion under test, so accepting it would make the hypothesis unfalsifiable by construction. Reaching for packs here is the predicted failure, and it is scored as one.",
   },
 
   // ═════════════════════════════ H5: node introspection (4)
@@ -721,10 +718,9 @@ export const REQUESTS = [
     id: "h6-02",
     tier: "hypothesis",
     hypothesis: "H6",
-    task: "I sketched the pipeline out in mermaid — build me the real thing from it.",
+    task: "I sketched the pipeline out as a text flowchart — build me the real thing from it.",
     target: "mermaid_to_workflow",
-    why: "H6 — no diagram body, just the reference.",
-    leakOk: "'mermaid' is the format the user names.",
+    why: "H6 — names no format. Two of the four H6 rows avoid the word entirely, because it is the consolidated ACTION token and rows that spell it measure the word, not the surface.",
   },
   {
     id: "h6-03",
@@ -732,18 +728,16 @@ export const REQUESTS = [
     hypothesis: "H6",
     task: "Here's a flowchart in mermaid syntax. Make it into something I can actually run.",
     target: "mermaid_to_workflow",
-    accept: ["create_workflow"],
-    why: "H6 — authoring from scratch is a wrong-but-reasonable reach, so it is accepted.",
+    why: "H6 — authoring from scratch ignores the diagram the user supplied, so it is a miss, not an accept.",
     leakOk: "'mermaid' is the format the user names.",
   },
   {
     id: "h6-04",
     tier: "hypothesis",
     hypothesis: "H6",
-    task: "Convert my mermaid sketch into something ComfyUI can execute.",
+    task: "Convert my arrows-and-boxes sketch into something ComfyUI can execute.",
     target: "mermaid_to_workflow",
-    why: "H6 — fourth phrasing.",
-    leakOk: "'mermaid' is the format the user names.",
+    why: "H6 — fourth phrasing, also avoiding the format name.",
   },
 
   // ═════════════════════════════ H7: freeing VRAM mid-OOM (3)
@@ -813,9 +807,10 @@ export const REQUESTS = [
   {
     id: "amb-06",
     tier: "ambiguity",
-    task: "Right, go ahead and put that one on my machine.",
+    task: "Go ahead and install ComfyUI-Impact-Pack on my machine.",
     target: "install_custom_node",
-    why: "Triple C — install.",
+    why: "Triple C — install. Names the pack outright: every episode is a SINGLE turn, so 'that one' had no referent and the correct answer would have been to ask, not to install.",
+    leakOk: "'install' is the plain English verb for this and also the consolidated action name. It is a give-away for the ACTION but not for the TOOL, which is what this triple tests — install vs search vs edit.",
   },
   {
     id: "amb-07",
@@ -951,6 +946,23 @@ export function checkRequestSet(resolve, rows = REQUESTS) {
         const { tool, action } = resolve(name);
         if (action && hay.includes(`${tool} ${action}`.replace(/_/g, " ").toLowerCase())) {
           errors.push(`${r.id}: task leaks the folded form "${tool} ${action}"`);
+        }
+        // The bare ACTION token is the half of the answer this gate originally
+        // missed. On the consolidated surface `mermaid`, `video` and `upscale`
+        // ARE the answers, and a request containing one hands the model the
+        // action outright — worse, it hands the BASELINE arm even more, because
+        // there the token is a chunk of the flat tool name. Not an error when
+        // the request genuinely cannot be phrased without it (a user does say
+        // "VRAM"), but it must be a DOCUMENTED exception, never a silent one.
+        // Function words carry no signal: `from_dsl` split on `_` yields
+        // "from", which matches almost any English sentence and would train the
+        // reader to ignore this check — the way a gate stops being a gate.
+        const STOPWORDS = new Set(["from", "with", "into", "this", "that", "them", "over", "then"]);
+        for (const token of (action ?? "").split("_")) {
+          if (token.length < 4 || STOPWORDS.has(token)) continue;
+          if (!new RegExp(`\\b${token}\\b`, "i").test(hay)) continue;
+          if (r.leakOk) notes.push(`${r.id}: contains the action token "${token}" — ${r.leakOk}`);
+          else errors.push(`${r.id}: task contains the bare action token "${token}" with no leakOk rationale`);
         }
       }
     }

@@ -35,6 +35,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFi
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { REQUESTS, checkRequestSet, referencedCapabilities } from "./tool-reach-requests.mjs";
+import { missingCoverage } from "./tool-reach-merge.mjs";
 import { FINAL_SURFACE, FOLD_MAP, resolveExpectation } from "./tool-reach-foldmap.mjs";
 import {
   REACH_WINDOW,
@@ -314,6 +315,28 @@ function report() {
     md.push("**Models that did NOT run** (a silently-skipped field is a misleading table):");
     md.push("");
     for (const s of skips) md.push(`- \`${s.model}\` on \`${s.arm}\` — ${s.reason}`);
+  }
+
+  // A partial arm is not wrong; publishing it as though it were complete is. A
+  // `--only` or `--limit` re-run leaves a model covering a handful of requests,
+  // and its percentage then sits in the same table as a 100-request one with
+  // nothing to say so.
+  const gaps = [];
+  for (const run of runs) {
+    for (const [model, missing] of missingCoverage(run.episodes, REQUESTS.map((r) => r.id))) {
+      gaps.push({ arm: run.arm, model, missing });
+    }
+  }
+  if (gaps.length) {
+    md.push("");
+    md.push("**INCOMPLETE COVERAGE** — these rows did not run the full request set:");
+    md.push("");
+    for (const g of gaps) {
+      md.push(
+        `- \`${g.model}\` on \`${g.arm}\`: ${REQUESTS.length - g.missing.length}/${REQUESTS.length} requests` +
+          ` (missing ${g.missing.slice(0, 6).join(", ")}${g.missing.length > 6 ? `, +${g.missing.length - 6} more` : ""})`,
+      );
+    }
   }
 
   md.push("");

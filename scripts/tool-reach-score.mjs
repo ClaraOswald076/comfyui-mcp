@@ -138,12 +138,19 @@ const pct = (n, d) => (d === 0 ? null : (100 * n) / d);
  * that never calls anything score 4% "accuracy" for free.
  */
 export function summarize(scored) {
-  const positive = scored.filter((s) => s.expected !== null);
-  const negative = scored.filter((s) => s.expected === null);
+  // An errored episode measured the PROVIDER, not the model. A timeout or an
+  // HTTP 500 before any response would otherwise land in the positive
+  // denominator as a "no reach", so a flaky provider reads as a model that
+  // failed to reach — and a flaky provider on one arm only would move the A/B.
+  // Counted and reported, never averaged in.
   const errored = scored.filter((s) => s.error);
+  const evaluated = scored.filter((s) => !s.error);
+  const positive = evaluated.filter((s) => s.expected !== null);
+  const negative = evaluated.filter((s) => s.expected === null);
 
   return {
     n: scored.length,
+    nEvaluated: evaluated.length,
     nPositive: positive.length,
     nNegative: negative.length,
     errors: errored.length,
@@ -153,10 +160,10 @@ export function summarize(scored) {
     noReachPct: pct(positive.filter((s) => s.substantiveCount === 0).length, positive.length),
     abstainPct: pct(negative.filter((s) => s.abstained).length, negative.length),
     navPerRequest:
-      scored.length === 0
+      evaluated.length === 0
         ? null
-        : scored.reduce((a, s) => a + (s.navBeforeFirst ?? 0), 0) / scored.length,
-    navTotal: scored.reduce((a, s) => a + (s.navigation ?? 0), 0),
+        : evaluated.reduce((a, s) => a + (s.navBeforeFirst ?? 0), 0) / evaluated.length,
+    navTotal: evaluated.reduce((a, s) => a + (s.navigation ?? 0), 0),
     byTier: Object.fromEntries(
       [...new Set(positive.map((s) => s.tier))].map((tier) => {
         const rows = positive.filter((s) => s.tier === tier);

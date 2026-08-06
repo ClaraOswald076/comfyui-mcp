@@ -173,6 +173,11 @@ const SELF = new Set([
   "scripts/tool-reach-requests.mjs",
   "scripts/tool-reach-score.mjs",
   "src/__tests__/tool-reach-score.test.ts",
+  // Fires every destructive name on the surface through the benchmark's
+  // interception choke point and asserts the injected escape hatch is never
+  // reached. The names ARE the fixture — a "do not execute" test that cannot
+  // spell what it must not execute is not testing anything.
+  "src/__tests__/tool-reach-dispatch.test.ts",
 ]);
 
 /** Extensions that are never worth scanning as text. */

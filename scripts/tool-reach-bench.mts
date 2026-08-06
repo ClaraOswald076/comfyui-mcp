@@ -44,6 +44,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { REQUESTS } from "./tool-reach-requests.mjs";
 import { REACH_WINDOW } from "./tool-reach-score.mjs";
+import { createDispatcher } from "./tool-reach-dispatch.mjs";
+import { mergeEpisodes } from "./tool-reach-merge.mjs";
 
 // ───────────────────────────────────────────────────────── argv
 const argv = process.argv.slice(2);
@@ -164,91 +166,42 @@ interface Episode {
   error: string | null;
   /** Claude-only: built-ins it tried to use despite CLAUDE_BUILTINS. */
   deniedBuiltins?: string[];
-}
-
-const STUB_CONTINUE =
-  "[harness] Your tool selection has been recorded. This environment does not execute tools, " +
-  "so there is no result to report back. If a different tool would serve the request better, " +
-  "call it; otherwise give your final answer now.";
-const STUB_STOP =
-  "[harness] Your tool selection has been recorded. This environment does not execute tools. " +
-  "Do not call any more tools — give your final answer now.";
-
-/** Robustly read an `action` argument without inventing one. */
-function actionOf(args: unknown): string | null {
-  if (!args || typeof args !== "object" || Array.isArray(args)) return null;
-  const a = (args as Record<string, unknown>).action;
-  return typeof a === "string" ? a : null;
-}
-
-function parseMaybeJson(v: unknown): Record<string, unknown> {
-  if (typeof v === "string") {
-    if (!v.trim()) return {};
-    try {
-      const p: unknown = JSON.parse(v);
-      return p && typeof p === "object" && !Array.isArray(p) ? (p as Record<string, unknown>) : {};
-    } catch {
-      return {};
-    }
-  }
-  if (v && typeof v === "object" && !Array.isArray(v)) return v as Record<string, unknown>;
-  return {};
+  /** Tool results that hit TOOL_RESULT_CAP — a catalog the model could not
+   *  finish reading is a measurement artefact, so it must be visible. */
+  truncatedResults?: number;
 }
 
 /**
- * THE choke point. Returns the text the model sees back.
+ * The interception policy lives in scripts/tool-reach-dispatch.mjs so it can be
+ * tested without booting a tool registration, and so the chat-completions loop
+ * and the MCP stub server that Claude Code talks to share ONE policy. Two
+ * transports with two policies would eventually score two different things.
  *
- * Allowlist: `list_tools` / `describe_tool` (compact only) are forwarded to the
- * in-memory catalog server, because navigating the catalog is the cost being
- * MEASURED on that arm and a stub would make the arm untestable. Every other
- * name — including anything routed through `call_tool` — is recorded and
- * answered with a stub. There is no branch that forwards an application tool.
+ * `navigate` is the only escape hatch out of that module and is bound HERE to
+ * the in-memory compact catalog. Flat arms pass none — there is nothing to
+ * navigate — so on those arms the module has no route to any code at all.
+ * Bound after buildSurface(), which is what supplies both the catalog names and
+ * the client.
  */
-async function dispatch(ep: Episode, name: string, rawArgs: unknown): Promise<string> {
-  const args = parseMaybeJson(rawArgs);
+let dispatch: (ep: Episode, name: string, rawArgs: unknown) => Promise<string>;
 
-  const navigate = async (toolName: string, toolArgs: Record<string, unknown>): Promise<string> => {
-    ep.navigation++;
-    if (ep.substantive.length === 0) ep.navBeforeFirst++;
-    if (!compactClient) return `Unknown tool: ${toolName}`;
-    const res = await compactClient.callTool({ name: toolName, arguments: toolArgs });
-    return ((res.content ?? []) as { type: string; text?: string }[])
-      .filter((c) => c.type === "text")
-      .map((c) => c.text ?? "")
-      .join("\n");
-  };
-
-  const record = (tool: string, action: string | null): string => {
-    ep.substantive.push({ tool, action });
-    return ep.substantive.length >= REACH_WINDOW ? STUB_STOP : STUB_CONTINUE;
-  };
-
-  if (MODE === "compact") {
-    if (name === "list_tools" || name === "describe_tool") return navigate(name, args);
-    if (name === "call_tool") {
-      const inner = args.name ?? args.tool_name;
-      const innerName = typeof inner === "string" ? inner : "";
-      const innerArgs = parseMaybeJson(args.args ?? args.arguments);
-      // compact.ts routes list_tools/describe_tool through call_tool too (#693)
-      // when the catalog has no tool of that name. Same control-plane call, same
-      // navigation cost — counting it as a reach would fabricate misses.
-      if (
-        (innerName === "list_tools" || innerName === "describe_tool") &&
-        !catalogNames.includes(innerName)
-      ) {
-        return navigate(innerName, innerArgs);
-      }
-      if (!innerName) {
-        return 'Missing tool name. Call as: call_tool {"name": "<tool>", "args": {...}}';
-      }
-      return record(innerName, actionOf(innerArgs));
-    }
-    return `Unknown tool: ${name}. This server exposes list_tools, describe_tool and call_tool.`;
-  }
-
-  // Flat arm: there is no catalog to navigate, so every call is a reach. That
-  // structural zero for navigation cost is a RESULT, not a gap.
-  return record(name, actionOf(args));
+function bindDispatcher(): void {
+  dispatch = createDispatcher({
+    mode: MODE,
+    catalogNames,
+    reachWindow: REACH_WINDOW,
+    navigate:
+      MODE === "compact"
+        ? async (toolName: string, toolArgs: Record<string, unknown>) => {
+            if (!compactClient) return `Unknown tool: ${toolName}`;
+            const res = await compactClient.callTool({ name: toolName, arguments: toolArgs });
+            return ((res.content ?? []) as { type: string; text?: string }[])
+              .filter((c) => c.type === "text")
+              .map((c) => c.text ?? "")
+              .join("\n");
+          }
+        : undefined,
+  }) as typeof dispatch;
 }
 
 // ───────────────────────────────────────────────────────── model adapters
@@ -264,13 +217,40 @@ const SYSTEM =
   "When the user asks for something, use the tools to do it. " +
   "If nothing fits, or the request is too vague to act on, answer in words instead of calling a tool.";
 
-/** Context window for local models: the flat surface is ~58k tokens of schema,
- *  so a default 16k window would truncate the catalog and measure truncation
- *  rather than reach. Sized to the actual payload, and RECORDED in the results
- *  so a small-model result is never read without it. */
+/**
+ * How much of a tool RESULT the chat adapters feed back.
+ *
+ * This started at 12,000 characters, copied from llm-arena.mjs where results are
+ * unbounded ComfyUI payloads. Here the only results are catalog reads — and the
+ * unfiltered compact manifest is ~18,000 characters, so that cap silently
+ * amputated a THIRD of the catalog for every Ollama and OpenAI model while the
+ * Claude/MCP transport received it whole. The compact arm would have been scored
+ * on a catalog two of its three transports could not finish reading, and the
+ * shortfall would have looked like small models being bad at navigation.
+ *
+ * Now large enough that nothing the harness can return is cut, and any cut that
+ * does happen is recorded on the episode rather than passing unnoticed.
+ */
+const TOOL_RESULT_CAP = 200_000;
+
+/**
+ * Context window for local models.
+ *
+ * Two different payloads matter and only one of them is the tool schemas:
+ *  - flat arms  — ~58k tokens of SCHEMA up front, so a default 16k window
+ *    truncates the catalog and measures truncation rather than reach.
+ *  - compact arm — only ~600 tokens of schema, but the catalog arrives as tool
+ *    RESULTS: an 18k-character manifest plus a describe_tool per candidate.
+ *    Sizing from the schemas alone would leave a model with room to ask for the
+ *    catalog and no room to read it.
+ * Sized for the worst case of both, and RECORDED in the results so a small-model
+ * number is never read without knowing what window produced it.
+ */
 function ollamaNumCtx(): number {
-  const bytes = JSON.stringify(chatTools()).length;
-  const approxTokens = Math.ceil(bytes / 3.5) + 2048;
+  const schemaBytes = JSON.stringify(chatTools()).length;
+  // Manifest + a handful of describes, measured rather than guessed.
+  const navBytes = MODE === "compact" ? 18_000 + 4 * 4_000 : 0;
+  const approxTokens = Math.ceil((schemaBytes + navBytes) / 3.5) + 4096;
   const target = Math.max(16384, Math.min(65536, 1 << Math.ceil(Math.log2(approxTokens))));
   return Number(process.env.REACH_NUM_CTX ?? target);
 }
@@ -292,13 +272,33 @@ async function chatOllama(model: string, messages: unknown[]): Promise<any> {
   return (await res.json()).message;
 }
 
+/**
+ * Strip a known key value out of anything about to be logged or persisted.
+ *
+ * An error BODY is a provider response to a request that carried the
+ * Authorization header, and episode errors are written to the results file that
+ * ships with the report. The body is worth keeping — "model not found" and
+ * "quota exceeded" are exactly what a failed run needs to say — so it is
+ * redacted rather than dropped, against the actual value we hold, which is exact
+ * and cannot miss the way a pattern match can.
+ */
+function redact(text: string, ...secrets: string[]): string {
+  let out = text;
+  for (const s of secrets) if (s && s.length >= 8) out = out.split(s).join("<redacted>");
+  return out;
+}
+
 async function chatOpenAI(model: string, messages: unknown[], baseUrl: string, key: string): Promise<any> {
   const res = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
     headers: { "content-type": "application/json", ...(key ? { authorization: `Bearer ${key}` } : {}) },
     body: JSON.stringify({ model, messages, tools: chatTools(), tool_choice: "auto", temperature: 0 }),
   });
-  if (!res.ok) throw new Error(`openai-compatible http ${res.status}: ${(await res.text()).slice(0, 300)}`);
+  if (!res.ok) {
+    throw new Error(
+      `openai-compatible http ${res.status}: ${redact((await res.text()).slice(0, 300), key)}`,
+    );
+  }
   const msg = (await res.json()).choices?.[0]?.message;
   if (!msg) throw new Error("response had no choices[0].message");
   return msg;
@@ -357,10 +357,12 @@ async function runChatEpisode(
     for (const tc of msg.tool_calls) {
       const name = tc.function?.name ?? "";
       const text = await dispatch(ep, name, tc.function?.arguments);
+      if (text.length > TOOL_RESULT_CAP) ep.truncatedResults = (ep.truncatedResults ?? 0) + 1;
+      const content = text.slice(0, TOOL_RESULT_CAP);
       messages.push(
         spec.kind === "openai"
-          ? { role: "tool", tool_call_id: tc.id ?? "call_0", content: text.slice(0, 12000) }
-          : { role: "tool", tool_name: name, content: text.slice(0, 12000) },
+          ? { role: "tool", tool_call_id: tc.id ?? "call_0", content }
+          : { role: "tool", tool_name: name, content },
       );
     }
     if (ep.substantive.length >= REACH_WINDOW) break;
@@ -408,7 +410,12 @@ const CLAUDE_BUILTINS = [
   "ScheduleWakeup", "PushNotification", "RemoteTrigger", "SendMessage",
   "DesignSync", "EnterWorktree", "ExitWorktree",
   "CronCreate", "CronDelete", "CronList",
-  "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskStop",
+  "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskStop", "TaskOutput",
+  // AskUserQuestion is the subtle one: on a positive row it absorbs the request
+  // as a clarifying question and scores as a no-reach, and on a NEGATIVE row it
+  // would score as a correct abstention for the wrong reason. Both directions
+  // are wrong, so it goes too.
+  "AskUserQuestion", "SendUserMessage",
 ];
 
 let claudeBin: string | null = null;
@@ -465,12 +472,54 @@ async function startOracle(): Promise<{ url: string; close: () => void }> {
   return oracle;
 }
 
+/**
+ * Ask Claude, once per run, to name every tool it can see, and RECORD it.
+ *
+ * CLAUDE_BUILTINS is a list somebody wrote down, and the failure it guards
+ * against is the tool nobody thought to write down: a surviving built-in
+ * absorbs a request and the episode is scored as "did not reach for a ComfyUI
+ * tool", which is a different and untrue claim. Recording the observed surface
+ * turns that from an assumption into evidence a reader can check — and if
+ * something non-MCP shows up here, the run says so instead of quietly
+ * discounting a model.
+ */
+let claudeSurfaceProbe: string | null = null;
+async function probeClaudeSurface(model: string): Promise<void> {
+  if (claudeSurfaceProbe !== null) return;
+  const ep: Episode = {
+    requestId: "(surface-probe)",
+    model,
+    substantive: [],
+    navigation: 0,
+    navBeforeFirst: 0,
+    rounds: 0,
+    seconds: 0,
+    finalText: "",
+    error: null,
+  };
+  const probed = await runClaudeEpisode(
+    model,
+    {
+      id: "(surface-probe)",
+      tier: "probe",
+      task: "Reply with ONLY a comma-separated list of the exact names of every tool you can call. Call nothing.",
+      target: null,
+      why: "harness self-check",
+    } as never,
+    model,
+    ep,
+  );
+  claudeSurfaceProbe = probed.error ? `probe failed: ${probed.error}` : probed.finalText;
+  console.error(`[reach] claude visible tools: ${claudeSurfaceProbe.replace(/\s+/g, " ").slice(0, 300)}`);
+}
+
 async function runClaudeEpisode(
   model: string,
   request: (typeof REQUESTS)[number],
   label: string,
+  reuse?: Episode,
 ): Promise<Episode> {
-  const ep: Episode = {
+  const ep: Episode = reuse ?? {
     requestId: request.id,
     model: label,
     substantive: [],
@@ -666,6 +715,7 @@ async function preflight(specs: string[]): Promise<{ ready: ModelSpec[]; skipped
 
 // ───────────────────────────────────────────────────────── main
 await buildSurface();
+bindDispatcher();
 
 let requests = REQUESTS.filter((r) => (ONLY.length ? ONLY.some((p) => r.id.startsWith(p)) : true));
 if (LIMIT > 0) requests = requests.slice(0, LIMIT);
@@ -680,17 +730,88 @@ if (!ready.length) {
   console.error("[reach] no runnable models — nothing to do");
 }
 
+mkdirSync(dirname(OUT), { recursive: true });
+
+/**
+ * Write the results, merging with any prior run of the SAME arm.
+ *
+ * Merging lets the field be run one model at a time — the local models are
+ * GPU-serialised and Claude is network-bound, so they want separate
+ * invocations, and plain overwriting would silently discard whichever finished
+ * first. It also makes this safe to call as a per-episode CHECKPOINT: the merge
+ * drops the models being re-run before appending, so re-writing mid-run
+ * replaces this run's partial rows rather than duplicating them.
+ *
+ * Merged ONLY when arm/ref/mode all match. Episodes recorded against a
+ * different surface are not comparable, and quietly blending them would produce
+ * a table whose rows were measured against different tool sets.
+ */
+function writeResults(done: Episode[]): void {
+  void 0;
+  let prior: { modelsRun?: string[]; modelsSkipped?: { model: string }[]; episodes?: Episode[] } = {};
+  if (existsSync(OUT)) {
+    try {
+      const p = JSON.parse(readFileSync(OUT, "utf8"));
+      if (p.arm === ARM && p.ref === REF && p.mode === MODE) prior = p;
+      else console.error(`[reach] ignoring ${OUT}: different arm/ref/mode, not comparable`);
+    } catch {
+      console.error(`[reach] ignoring unreadable ${OUT}`);
+    }
+  }
+  const merged = mergeEpisodes(prior.episodes ?? [], done);
+  const mergedModels = [...new Set([...(prior.modelsRun ?? []), ...ready.map((r) => r.label)])];
+  const ranAnything = new Set(ready.map((r) => r.label));
+  writeFileSync(
+    OUT,
+    JSON.stringify(
+      {
+        arm: ARM,
+        ref: REF,
+        mode: MODE,
+        generatedAt: new Date().toISOString(),
+        advertisedCount: advertised.length,
+        advertisedNames: advertised.map((t) => t.name),
+        catalogNames,
+        surfaceBytes: JSON.stringify(chatTools()).length,
+        ollamaNumCtx: ready.some((r) => r.kind === "ollama") ? ollamaNumCtx() : null,
+        reachWindow: REACH_WINDOW,
+        systemPrompt: SYSTEM,
+        toolResultCap: TOOL_RESULT_CAP,
+        claudeVisibleTools: claudeSurfaceProbe,
+        requestIds: requests.map((r) => r.id),
+        modelsRun: mergedModels,
+        // A model that RAN somewhere must never also appear as skipped.
+        modelsSkipped: [
+          ...(prior.modelsSkipped ?? []).filter(
+            (s) => !ranAnything.has(s.model) && !skipped.some((k) => k.model === s.model),
+          ),
+          ...skipped,
+        ].filter((s) => !mergedModels.includes(s.model)),
+        episodes: merged,
+      },
+      null,
+      2,
+    ),
+  );
+}
+
 const episodes: Episode[] = [];
 for (const spec of ready) {
   console.error(`[reach] ── ${spec.label}`);
   let i = 0;
   for (const request of requests) {
     i++;
+    if (spec.kind === "claude") await probeClaudeSurface(spec.model);
     const ep =
       spec.kind === "claude"
         ? await runClaudeEpisode(spec.model, request, spec.label)
         : await runChatEpisode(spec as never, request, spec.label);
     episodes.push(ep);
+    // Checkpoint. A 100-episode arm is 30-60 minutes of real model time; losing
+    // all of it to a hang on episode 97 is a bad trade for one write per
+    // episode. `writeResults` merges with any prior run of the same arm, so a
+    // resumed or partial run composes with what is already on disk.
+    writeResults(episodes);
     const reach = ep.substantive[0];
     console.error(
       `[reach]   ${String(i).padStart(3)}/${requests.length} ${request.id.padEnd(8)} ` +
@@ -700,65 +821,7 @@ for (const spec of ready) {
   }
 }
 oracle?.close();
-
-mkdirSync(dirname(OUT), { recursive: true });
-
-/**
- * Merge with a prior run of the SAME arm so the field can be run one model at a
- * time — the local models are GPU-serialised and Claude is network-bound, so
- * they want separate invocations, and plain overwriting would silently discard
- * whichever finished first.
- *
- * Merged only when arm/ref/mode all match: episodes recorded against a
- * different surface are not comparable, and quietly blending them would produce
- * a table whose rows were measured against different tool sets.
- */
-let prior: { modelsRun?: string[]; modelsSkipped?: unknown[]; episodes?: Episode[] } = {};
-if (existsSync(OUT)) {
-  try {
-    const p = JSON.parse(readFileSync(OUT, "utf8"));
-    if (p.arm === ARM && p.ref === REF && p.mode === MODE) prior = p;
-    else console.error(`[reach] ignoring ${OUT}: different arm/ref/mode, not comparable`);
-  } catch {
-    console.error(`[reach] ignoring unreadable ${OUT}`);
-  }
-}
-const justRan = new Set(ready.map((r) => r.label));
-const mergedEpisodes = [
-  ...(prior.episodes ?? []).filter((e) => !justRan.has(e.model)),
-  ...episodes,
-];
-const mergedModels = [...new Set([...(prior.modelsRun ?? []), ...ready.map((r) => r.label)])];
-const priorSkips = (prior.modelsSkipped ?? []) as { model: string }[];
-const mergedSkips = [
-  ...priorSkips.filter((s) => !justRan.has(s.model) && !skipped.some((k) => k.model === s.model)),
-  ...skipped,
-].filter((s) => !mergedModels.includes((s as { model: string }).model));
-
-writeFileSync(
-  OUT,
-  JSON.stringify(
-    {
-      arm: ARM,
-      ref: REF,
-      mode: MODE,
-      generatedAt: new Date().toISOString(),
-      advertisedCount: advertised.length,
-      advertisedNames: advertised.map((t) => t.name),
-      catalogNames,
-      surfaceBytes: JSON.stringify(chatTools()).length,
-      ollamaNumCtx: ready.some((r) => r.kind === "ollama") ? ollamaNumCtx() : null,
-      reachWindow: REACH_WINDOW,
-      systemPrompt: SYSTEM,
-      requestIds: requests.map((r) => r.id),
-      modelsRun: mergedModels,
-      modelsSkipped: mergedSkips,
-      episodes: mergedEpisodes,
-    },
-    null,
-    2,
-  ),
-);
+writeResults(episodes);
 console.error(`[reach] wrote ${OUT} (${episodes.length} episodes)`);
 
 // Close what we opened and let the loop drain, rather than calling
