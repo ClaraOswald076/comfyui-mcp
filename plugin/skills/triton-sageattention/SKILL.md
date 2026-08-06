@@ -91,7 +91,7 @@ dot-product attention — always available, no extra deps) and removing the
 **Generic ComfyUI:** don't launch with `--use-sage-attention`; bypass any
 `TorchCompileModel` / inductor node.
 
-This costs you speed, not quality. Use `modify_workflow` / the panel's
+This costs you speed, not quality. Use `create_workflow (action:"modify")` / the panel's
 strip-and-re-point flow to flip the widget and drop the link, then enqueue. Once
 it renders, offer the install.
 

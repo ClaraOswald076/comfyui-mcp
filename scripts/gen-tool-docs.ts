@@ -108,19 +108,18 @@ const CATEGORIES: Array<{
     slug: "workflow-authoring",
     icon: "pen-ruler",
     description: "Build, modify, validate, and visualize ComfyUI workflows.",
-    tools: [
-      "create_workflow", "modify_workflow", "validate_workflow", "get_node_info",
-      "workflow_to_dsl", "dsl_to_workflow", "visualize_workflow",
-      "visualize_workflow_hierarchical", "mermaid_to_workflow",
-      "prompt_director_inspect", "query_workflow",
-    ],
+    // 0.50.0 slice 14: create_workflow absorbed modify/validate/node_info and
+    // visualize_workflow absorbed the hierarchical, mermaid and DSL conversions,
+    // so this group is two entries rather than nine. query/prompt_director moved
+    // to Workflow Library with the rest of get_workflow's read actions.
+    tools: ["create_workflow", "visualize_workflow"],
   },
   {
     group: "Workflow Library",
     slug: "workflow-library",
     icon: "folder-open",
     description: "Save, load, strip/slice, analyze, and extract workflows.",
-    tools: ["list_workflows", "get_workflow", "run_workflow_url", "strip_workflow", "slice_workflow", "save_workflow", "analyze_workflow", "workflow_from_image", "lock_workflow", "verify_workflow_lock"],
+    tools: ["get_workflow", "save_workflow", "run_workflow_url"],
   },
   {
     group: "Assets & Images",
@@ -141,11 +140,11 @@ const CATEGORIES: Array<{
     icon: "box",
     description: "Search (HuggingFace + CivitAI), download, list, and remove models; resolve a workflow's missing models with VRAM-aware candidates; manage embeddings and VRAM.",
     tools: [
-      "search_models", "search_civitai_models", "search_civitai_creators",
-      "download_model", "download_civitai_model", "resolve_missing_models", "list_local_models",
-      "download_status", "cancel_download",
-      "remove_model", "list_extra_paths", "add_extra_path", "remove_extra_path",
-      "get_embeddings", "clear_vram",
+      // 0.50.0 slice 11 folded fourteen model tools into two: download_model
+      // (8 actions) and list_local_models (6). Both survivors keep their names,
+      // so this list simply shrinks.
+      "download_model", "list_local_models",
+      "clear_vram",
       "model_metadata",
     ],
   },

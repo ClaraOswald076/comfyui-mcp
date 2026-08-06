@@ -1,8 +1,8 @@
-# `panel_connect` auto_match + slot-diagnostic errors; `dsl_to_workflow` wiring warnings
+# `panel_connect` auto_match + slot-diagnostic errors; `visualize_workflow (action:"from_dsl")` wiring warnings
 
 **Status:** implemented (this PR) · **Implementation branch:** `spec/panel-connect-auto-match` · **Pairs with:** comfyui-mcp-panel [PR #76](https://github.com/artokun/comfyui-mcp-panel/pull/76) (`docs/design/connect-auto-match.md` — the resolver + diagnostics)
 
-> Prior art: [filliptm/ComfyUI_FL-MCP](https://github.com/filliptm/ComfyUI_FL-MCP) `fl_api.js` connect resolver. Matching rules, ambiguity guard, and diagnostic format are specified in the paired panel RFC; this doc covers the orchestrator tool surface and an optional server-side sibling: advisory wiring warnings in `dsl_to_workflow`.
+> Prior art: [filliptm/ComfyUI_FL-MCP](https://github.com/filliptm/ComfyUI_FL-MCP) `fl_api.js` connect resolver. Matching rules, ambiguity guard, and diagnostic format are specified in the paired panel RFC; this doc covers the orchestrator tool surface and an optional server-side sibling: advisory wiring warnings in `visualize_workflow (action:"from_dsl")`.
 
 ## Part 1: `panel_connect` schema update (backward compatible)
 
@@ -21,7 +21,7 @@
 
 No result-shape change agent-side (the panel's result JSON — now possibly carrying `auto_matched` / `replaced_link` — passes through as text). `docs/panel.mdx` row updated.
 
-## Part 2 (optional commit): advisory wiring warnings in `dsl_to_workflow`
+## Part 2 (optional commit): advisory wiring warnings in `visualize_workflow (action:"from_dsl")`
 
 `dslToWorkflow` (`src/services/workflow-dsl.ts:59`) is a pure parser and stays pure. Instead, in the tool handler (`src/tools/workflow-dsl.ts:25`), after parsing and only when ComfyUI is reachable:
 

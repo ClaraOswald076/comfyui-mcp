@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-// get_node_info structural-summary behavior (default) vs verbose=true full dump.
+// create_workflow (action:"node_info") structural-summary behavior (default) vs
+// verbose=true full dump.
 // Summary-by-default originally contributed by @joaolvivas in
 // joaolvivas/comfyui-mcp-byjlucas@de82ecd — the motivating case is Loader nodes
 // whose enum dropdowns embed the entire local model list (100s of KB per node).
@@ -62,10 +63,10 @@ beforeEach(() => {
   getObjectInfoMock.mockResolvedValue({ CheckpointLoaderSimple: loaderDef });
 });
 
-describe("get_node_info default (structural summary)", () => {
+describe('create_workflow action:"node_info" default (structural summary)', () => {
   it("collapses enum dropdowns to a value count and omits the values", async () => {
-    const handler = getHandler("get_node_info");
-    const res = await handler({ node_type: "CheckpointLoader" });
+    const handler = getHandler("create_workflow");
+    const res = await handler({ action: "node_info", node_type: "CheckpointLoader" });
     const text = res.content[0].text;
 
     expect(text).toContain('"enum(300 values)"');
@@ -85,32 +86,32 @@ describe("get_node_info default (structural summary)", () => {
   });
 
   it("is dramatically smaller than the raw definition for Loader nodes", async () => {
-    const handler = getHandler("get_node_info");
-    const res = await handler({ node_type: "CheckpointLoader" });
+    const handler = getHandler("create_workflow");
+    const res = await handler({ action: "node_info", node_type: "CheckpointLoader" });
     const rawSize = JSON.stringify({ CheckpointLoaderSimple: loaderDef }).length;
     expect(res.content[0].text.length).toBeLessThan(rawSize / 5);
   });
 });
 
-describe("get_node_info verbose=true (full dump)", () => {
+describe('create_workflow action:"node_info" verbose=true (full dump)', () => {
   it("returns the complete raw definition including dropdown values", async () => {
-    const handler = getHandler("get_node_info");
-    const res = await handler({ node_type: "CheckpointLoader", verbose: true });
+    const handler = getHandler("create_workflow");
+    const res = await handler({ action: "node_info", node_type: "CheckpointLoader", verbose: true });
     const parsed = JSON.parse(res.content[0].text);
     // Pre-summary behavior restored: keyed-by-name raw defs, enum values intact.
     expect(parsed.CheckpointLoaderSimple.input.required.ckpt_name[0]).toEqual(modelList);
   });
 });
 
-describe("get_node_info >20 matches (unchanged name-list behavior)", () => {
+describe('create_workflow action:"node_info" >20 matches (unchanged name-list behavior)', () => {
   it("returns the summarized name list and narrowing hint", async () => {
     const many: Record<string, ComfyUINodeDef> = {};
     for (let i = 0; i < 25; i++) {
       many[`Node${i}`] = { ...loaderDef, name: `Node${i}` };
     }
     getObjectInfoMock.mockResolvedValue(many);
-    const handler = getHandler("get_node_info");
-    const res = await handler({});
+    const handler = getHandler("create_workflow");
+    const res = await handler({ action: "node_info" });
     const parsed = JSON.parse(res.content[0].text);
     expect(parsed.count).toBe(25);
     expect(parsed.nodes[0]).not.toHaveProperty("input_required");
@@ -118,7 +119,7 @@ describe("get_node_info >20 matches (unchanged name-list behavior)", () => {
   });
 });
 
-describe("get_node_info refresh after external restart (issue #499)", () => {
+describe('create_workflow action:"node_info" refresh after external restart (issue #499)', () => {
   // A loader whose model dropdown is served from a STALE cache after the ComfyUI
   // server was restarted externally (systemd) and a new model file was added.
   // The stale snapshot omits the freshly-installed file; refresh:true must drop
@@ -134,8 +135,8 @@ describe("get_node_info refresh after external restart (issue #499)", () => {
 
   it("does NOT reset the cache when refresh is omitted (serves memoized snapshot)", async () => {
     getObjectInfoMock.mockResolvedValue({ CLIPLoaderGGUF: staleDef });
-    const handler = getHandler("get_node_info");
-    const res = await handler({ node_type: "CLIPLoaderGGUF", verbose: true });
+    const handler = getHandler("create_workflow");
+    const res = await handler({ action: "node_info", node_type: "CLIPLoaderGGUF", verbose: true });
     expect(resetObjectInfoCacheMock).not.toHaveBeenCalled();
     const parsed = JSON.parse(res.content[0].text);
     expect(parsed.CLIPLoaderGGUF.input.required.clip_name[0]).toEqual(["old-clip.gguf"]);
@@ -152,8 +153,8 @@ describe("get_node_info refresh after external restart (issue #499)", () => {
     getObjectInfoMock.mockImplementation(async () =>
       resetBeforeFetch ? { CLIPLoaderGGUF: freshDef } : { CLIPLoaderGGUF: staleDef },
     );
-    const handler = getHandler("get_node_info");
-    const res = await handler({ node_type: "CLIPLoaderGGUF", verbose: true, refresh: true });
+    const handler = getHandler("create_workflow");
+    const res = await handler({ action: "node_info", node_type: "CLIPLoaderGGUF", verbose: true, refresh: true });
     expect(resetObjectInfoCacheMock).toHaveBeenCalledTimes(1);
     const parsed = JSON.parse(res.content[0].text);
     expect(parsed.CLIPLoaderGGUF.input.required.clip_name[0]).toContain(

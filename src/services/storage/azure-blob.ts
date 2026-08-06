@@ -144,7 +144,7 @@ export async function downloadAzureBlobToFile(
 ): Promise<void> {
   try {
     // Thread the abort signal into BOTH the SDK download and the write pipeline so a
-    // cancel_download (#515) aborts the Azure transfer; the streamUrlToFile cloud
+    // download_model action:"cancel" (#515) aborts the Azure transfer; the streamUrlToFile cloud
     // branch also guards before/after so a cancelled transfer is never finalized.
     const response = await (await blobClientForDownload(url)).download(undefined, undefined, {
       abortSignal: signal,

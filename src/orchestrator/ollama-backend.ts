@@ -395,6 +395,30 @@ function msgOf(err: unknown): string {
   return errorText(err);
 }
 
+/**
+ * The `action` of a consolidated tool call, so a per-tool heuristic can be
+ * scoped to ONE action of a tool whose other actions are unrelated (and, for
+ * download_model, expensive). Returns undefined for a flat tool, a non-string
+ * action, or arguments that do not parse — every caller must treat that as "not
+ * this action" rather than guessing.
+ *
+ * Tolerates the string-encoded arguments some Ollama builds send, which is the
+ * same reason the repeat-call key stringifies rather than reads them.
+ */
+function toolCallAction(args: unknown): string | undefined {
+  let obj: unknown = args;
+  if (typeof args === "string") {
+    try {
+      obj = JSON.parse(args);
+    } catch {
+      return undefined;
+    }
+  }
+  if (!obj || typeof obj !== "object") return undefined;
+  const action = (obj as { action?: unknown }).action;
+  return typeof action === "string" ? action : undefined;
+}
+
 function textOf(result: McpCallResult): string {
   return (result.content ?? [])
     .filter((c) => c.type === "text")
@@ -1358,7 +1382,21 @@ export class OllamaBackend implements AgentBackend {
     // (ignoring args); past a threshold, stop searching and tell it the truth
     // (some capabilities live in OPTIONAL companion servers). describe_tool is
     // NOT here — describing many distinct tools is legitimate exploration.
-    const DISCOVERY_TOOLS = new Set(["list_tools", "panel_list_tools", "search_models", "search_custom_nodes"]);
+    //
+    // Keyed on `tool` + `action` for consolidated tools, and that is not
+    // cosmetic: 0.50.0 slice 11 folded the HuggingFace search into
+    // download_model action:"search", and the SAME tool name now also STARTS
+    // MULTI-GB DOWNLOADS. Counting the bare name would answer a fourth
+    // download_model {action:"download"} in one turn with a "SEARCH LIMIT"
+    // refusal instead of downloading, and end the turn at eight — a fold
+    // turning legitimate calls into refusals because the thing reading the
+    // name was not updated with it (#839).
+    const DISCOVERY_TOOLS = new Set([
+      "list_tools",
+      "panel_list_tools",
+      'download_model action:"search"',
+      "search_custom_nodes",
+    ]);
     const discoveryCounts = new Map<string, number>();
     let emptyFinalRetried = false;
     let attachmentsStripped = false;
@@ -1515,8 +1553,18 @@ export class OllamaBackend implements AgentBackend {
           const repeats = (seenCalls.get(callKey) ?? 0) + 1;
           seenCalls.set(callKey, repeats);
           maxRepeats = Math.max(maxRepeats, repeats);
-          const discoveryHits = DISCOVERY_TOOLS.has(name)
-            ? (discoveryCounts.set(name, (discoveryCounts.get(name) ?? 0) + 1), discoveryCounts.get(name)!)
+          // The consolidated form first, then the bare name — so a tool whose
+          // whole surface is discovery still counts, while a consolidated tool
+          // counts only for the action that actually searches.
+          const action = toolCallAction(args);
+          const discoveryKey = action !== undefined && DISCOVERY_TOOLS.has(`${name} action:"${action}"`)
+            ? `${name} action:"${action}"`
+            : DISCOVERY_TOOLS.has(name)
+              ? name
+              : undefined;
+          const discoveryHits = discoveryKey
+            ? (discoveryCounts.set(discoveryKey, (discoveryCounts.get(discoveryKey) ?? 0) + 1),
+              discoveryCounts.get(discoveryKey)!)
             : 0;
           yield { type: "tool_call", name, phase: "start", detail: tc.function?.arguments };
           const { text, isError } =
@@ -1538,11 +1586,11 @@ export class OllamaBackend implements AgentBackend {
                     // isn't here. Stop, and name the most common trap (Civitai
                     // search lives in the OPTIONAL companion server, not here).
                     text:
-                      `SEARCH LIMIT: you have called ${name} ${discoveryHits} times without finding a matching tool — it is very likely NOT in this catalog. STOP searching. ` +
+                      `SEARCH LIMIT: you have called ${discoveryKey} ${discoveryHits} times without finding a matching tool — it is very likely NOT in this catalog. STOP searching. ` +
                       `Common misses: GRAPH/CANVAS actions (add a node, connect slots, set a widget, run the workflow) are PANEL tools — panel_call_tool {"name":"panel_add_node"} / panel_connect / panel_set_widget / panel_run, listed by panel_list_tools, NOT here. ` +
-                      `Civitai keyword search is the search_civitai_models tool (filter by types + base_models, then download_civitai_model); ` +
+                      `Civitai keyword search is download_model action:"search_civitai" (filter by types + base_models, then action:"download_civitai"); ` +
                       `model families like krea2 / qwen-image-edit / wan / ltxv are installer PACKS — call_tool {"name":"list_packs"}. ` +
-                      `Otherwise, tell the user plainly what IS available and ask how they want to proceed. Do not call ${name} again.`,
+                      `Otherwise, tell the user plainly what IS available and ask how they want to proceed. Do not call ${discoveryKey} again.`,
                     isError: true,
                   }
                 : await this.dispatch(name, args);

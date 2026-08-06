@@ -6,27 +6,27 @@
 
 ## Relationship to graph query (#169)
 
-`query_workflow` / `panel_query_graph` (comfyui-mcp #179 + panel #77) is the *generic* surface — arbitrary filter/traverse/aggregate over a graph, agent-composed per question. Graph health is the *curated* counterpart: a fixed set of opinionated findings (disconnected, missing-required, duplicate loads, orphaned branches, muted/bypassed) with severities and remediation hints, computed server-side against `/object_info`. Health does not duplicate query capability; anything beyond these findings should be answered with the query tools rather than by growing this list.
+`get_workflow (action:"query")` / `panel_query_graph` (comfyui-mcp #179 + panel #77) is the *generic* surface — arbitrary filter/traverse/aggregate over a graph, agent-composed per question. Graph health is the *curated* counterpart: a fixed set of opinionated findings (disconnected, missing-required, duplicate loads, orphaned branches, muted/bypassed) with severities and remediation hints, computed server-side against `/object_info`. Health does not duplicate query capability; anything beyond these findings should be answered with the query tools rather than by growing this list.
 
 ## Motivation
 
-`validate_workflow` (`src/tools/workflow-validate.ts` → `src/services/workflow-validator.ts`) catches hard errors: unknown node types, missing required inputs, broken/self-referencing links, invalid output indices, out-of-list combo values. `analyze_workflow` (`src/tools/workflow-library.ts:409-509`) explains *structure*. Neither answers "is this graph *healthy*": dead subgraphs, duplicate model loads wasting VRAM, sampler branches whose outputs never reach a save node, or muted/bypassed nodes silently dropping connections.
+`create_workflow (action:"validate")` (`src/tools/workflow-validate.ts` → `src/services/workflow-validator.ts`) catches hard errors: unknown node types, missing required inputs, broken/self-referencing links, invalid output indices, out-of-list combo values. `get_workflow (action:"analyze")` (`src/tools/workflow-library.ts:409-509`) explains *structure*. Neither answers "is this graph *healthy*": dead subgraphs, duplicate model loads wasting VRAM, sampler branches whose outputs never reach a save node, or muted/bypassed nodes silently dropping connections.
 
-## Placement: `validate_workflow` (primary), `analyze_workflow view:"health"` (secondary)
+## Placement: `create_workflow (action:"validate")` (primary), `get_workflow (action:"analyze") view:"health"` (secondary)
 
-- `validate_workflow` takes raw workflow JSON — the shape agents hold while authoring; health findings are a validation concern (severity-tagged issues) and compose with `ValidationResult.issues`.
-- `analyze_workflow` takes a library filename; extending its `view` enum with `"health"` reuses `loadWorkflowApi()` (which already converts UI→API via `convertUiToApi`) for near-zero extra code.
+- `create_workflow (action:"validate")` takes raw workflow JSON — the shape agents hold while authoring; health findings are a validation concern (severity-tagged issues) and compose with `ValidationResult.issues`.
+- `get_workflow (action:"analyze")` takes a library filename; extending its `view` enum with `"health"` reuses `loadWorkflowApi()` (which already converts UI→API via `convertUiToApi`) for near-zero extra code.
 
 ## Tool API
 
-`validate_workflow` — unchanged params plus:
+`create_workflow (action:"validate")` — unchanged params plus:
 
 ```ts
 health: z.boolean().optional().default(true)
   .describe("Include graph-health heuristics (disconnected nodes, duplicate model loads, orphaned branches, muted/bypassed nodes) as info/warning issues plus a structured health section.")
 ```
 
-`analyze_workflow` — `view` enum gains `"health"`.
+`get_workflow (action:"analyze")` — `view` enum gains `"health"`.
 
 ## New service: `src/services/workflow-health.ts`
 
@@ -59,11 +59,11 @@ Pure and synchronous — the caller (validator or analyze handler) already holds
 2. **Missing required inputs** (warning): primary source `objectInfo[class_type].input.required`. **Fallback heuristic only** when the class is absent from object_info (uninstalled custom node): FL-MCP's `isInputSlotRequired` rules — known-optional slot-name list; Loader/Load families require `*name*/*path*/*ckpt*`; Sampler families require `model/positive/negative/latent_image`; VAE families require `samples/images/vae`; default required. Tagged `heuristic: true`.
 3. **Duplicate model loads** (warning): group nodes by `(class_type, model-file widget value)` where class_type matches `/Loader|Load/` and the value matches the model-file regex already in `workflow-validator.ts:213` (`/\.(safetensors|gguf|ckpt|pt|pth|bin|sft)$/i`). ≥2 nodes on the same file → one finding listing all node ids.
 4. **Orphaned branches / no output reachable** (warning): reverse-BFS from every output node (`objectInfo[ct].output_node === true` plus the hardcoded SaveImage/PreviewImage/SaveAnimated* list at `workflow-validator.ts:137-146`). Unreached non-output nodes are "computed but never saved" — reported as **one finding per connected component** (avoids 40 line items on big graphs). The existing zero-output validator check stays as-is.
-5. **Muted/bypassed** (info): via `_meta.mode` where present. Known limitation, documented: `convertUiToApi` *drops* mode-2/4 nodes (comment at `workflow-converter.ts:731`; the `_meta.mode: "muted"|"bypassed"` mapping lives at `932-942`), so for `analyze_workflow` we surface the converter's existing warnings instead; raw API JSON handed to `validate_workflow` is checked directly, and silently skipped when `_meta` is absent.
+5. **Muted/bypassed** (info): via `_meta.mode` where present. Known limitation, documented: `convertUiToApi` *drops* mode-2/4 nodes (comment at `workflow-converter.ts:731`; the `_meta.mode: "muted"|"bypassed"` mapping lives at `932-942`), so for `get_workflow (action:"analyze")` we surface the converter's existing warnings instead; raw API JSON handed to `create_workflow (action:"validate")` is checked directly, and silently skipped when `_meta` is absent.
 
 ## Output composition
 
-`validate_workflow` text output gains, after Errors/Warnings:
+`create_workflow (action:"validate")` text output gains, after Errors/Warnings:
 
 ```
 ### Graph health
@@ -80,7 +80,7 @@ Programmatically: findings are appended into `result.issues` (severity `warning`
 1. `src/services/workflow-health.ts` — `analyzeGraphHealth` (~180 lines, pure). Types imported from `src/comfyui/types.ts`.
 2. `src/services/workflow-validator.ts` — widen `ValidationIssue.severity`; call `analyzeGraphHealth` after existing step 4 (objectInfo already in hand); merge findings; return `health`.
 3. `src/tools/workflow-validate.ts` — `health` param; render the section incl. the `info` bucket.
-4. `src/tools/workflow-library.ts` — add `"health"` to `analyze_workflow`'s `view` enum; handler calls `analyzeGraphHealth(workflow, objectInfo)` (both in scope at lines 443-444) and renders.
+4. `src/tools/workflow-library.ts` — add `"health"` to `get_workflow (action:"analyze")`'s `view` enum; handler calls `analyzeGraphHealth(workflow, objectInfo)` (both in scope at lines 443-444) and renders.
 
 ## Test plan (vitest)
 

@@ -93,7 +93,7 @@ stateless-server / Salad-specific bits (replicas, deletion-cost, k8s proxy).
 **Harden existing tools**
 - **E1 — Download cache + dedup.** Content-address downloads (SHA-256 of URL → cache dir + sidecar
   `.meta`, symlink to target), reuse on hit, coalesce concurrent same-URL fetches, optional LRU
-  eviction. Hardens `download_model`/`download_civitai_model`. (`remote-storage-manager.ts`, `utils.hashUrlBase64`)
+  eviction. Hardens `download_model` (`action:"download"` / `action:"download_civitai"`). (`remote-storage-manager.ts`, `utils.hashUrlBase64`)
 - **E2 — Download auth + storage backends.** Per-URL credential resolution (bearer/basic/header/
   query/s3) and `s3://` / huggingface / azure-blob / http(s) sources for gated/private models.
   (`credential-resolver.ts`, `storage-providers/*`)

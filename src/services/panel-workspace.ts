@@ -243,6 +243,12 @@ export async function primePanelBase(
   // to a wrong-tree mutation reported as success.
   const atTarget = targetKey();
   const atGeneration = targetGeneration();
+  // The cache entry as the probe STARTS. A probe that lands after another
+  // writer refreshed (or deliberately seeded) the cache must not overwrite
+  // that newer entry with its older answer — the in-flight `void
+  // primePanelBase()` a refusal fires in the background did exactly that to a
+  // base seeded after it started (#879 test isolation surfaced it).
+  const cacheAtStart = cached;
 
   let resolution: PanelBaseResolution;
   try {
@@ -267,6 +273,11 @@ export async function primePanelBase(
     cached = undefined;
     return { source: "none" };
   }
+
+  // A newer writer (a concurrent prime that already landed, a test seed, a
+  // cache reset) holds the cache now. This probe's answer is no fresher than
+  // theirs for the same target and generation, so keep theirs.
+  if (cached !== cacheAtStart) return resolution;
 
   cached = { at: Date.now(), target: atTarget, generation: atGeneration, resolution };
   return resolution;

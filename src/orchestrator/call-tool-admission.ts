@@ -10,25 +10,37 @@
  *  bridge is already token-gated; this whitelist keeps call_tool to non-destructive
  *  tools (no restart/remove/clear/install). */
 const CALL_TOOL_WHITELIST = new Set<string>([
-  "list_workflows",
+  // The canvas-less client's whole read side of the saved-workflow library.
+  // FIVE separate entries lived here — the library listing, the file read, the
+  // summary, the graph query and the PNG-metadata extractor — until 0.50.0
+  // slice 14 folded EIGHT names into this one. The three it also folded that
+  // were NOT whitelisted (strip, slice, prompt_director) would have been
+  // admitted for free by the swap, so admission is ACTION-scoped below to
+  // exactly the five that were already reachable — see CALL_TOOL_ACTION_WHITELIST.
   "get_workflow",
-  "analyze_workflow",
-  "query_workflow",
-  "workflow_from_image",
   "list_output_images",
   "get_image",
+  // Inventory listing only. 0.50.0 slice 11 folded six model tools into this
+  // name — including `remove`, which UNLINKS a model file — so admission is
+  // ACTION-scoped below to exactly what the retired read-only entry covered.
   "list_local_models",
-  // Read-only CivitAI lookups (creator-search feature): let a client browse
-  // models/creators through the rig without an agent turn.
-  "search_civitai_models",
-  "search_civitai_creators",
-  "download_civitai_model",
+  // Read-only CivitAI lookups (creator-search feature) + the two download
+  // starters: let a client browse models/creators through the rig, and fetch
+  // one, without an agent turn. 0.50.0 slice 11 folded eight model tools into
+  // `download_model`, so this entry is ACTION-scoped below to the union of the
+  // FIVE retired per-tool entries it replaces (the two CivitAI searches, the
+  // CivitAI download, the URL download, and the app-panel's missing-model
+  // resolver) and nothing else.
   "download_model",
   "enqueue_workflow",
   // Persist a workflow to the ComfyUI library (mobile "pull workflow from a
   // CivitAI example" → save_workflow). Writes a workflow file (auto-converts
   // API-format graphs to canvas-openable UI format); overwrites same-filename,
   // so the client generates a unique name. No model/system mutation.
+  //
+  // 0.50.0 slice 14 folded the two provenance-lock tools onto this name,
+  // NEITHER of which was whitelisted, so it is ACTION-scoped below to
+  // exactly "save" — see CALL_TOOL_ACTION_WHITELIST.
   "save_workflow",
   // One-tap cancel of the RUNNING render (the mobile queue monitor's stop
   // button). User-initiated and narrowly scoped: the client passes the
@@ -97,12 +109,13 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   // App dependency side-panel (Explore/detail): the ✓/download panel reads what
   // an app needs vs what's installed and offers per-item fetches. Reads are safe
   // (missing-model detection + candidate resolution, node-pack presence); model
-  // downloads reuse the already-whitelisted download_civitai_model/download_model.
+  // downloads reuse the already-whitelisted download_model download/download_civitai
+  // actions, and the missing-model detection is that same tool's
+  // action:"resolve_missing".
   // install_custom_node is a MUTATION that runs the pack's code on install —
   // reachable for the panel's "install missing node" button, gated behind an
   // explicit themed confirm client-side. (Revisit if a canvas-less/foreign tab
   // must not be able to trigger a node install.)
-  "resolve_missing_models",
   // 0.50.0 slice 9 folded the nine knowledge tools into this one name, and the
   // entry it replaces was the READ-ONLY dependency EXTRACTOR (see DEAD_NAMES).
   // The fold brings install_deps — which installs custom node packs through
@@ -173,6 +186,64 @@ const CALL_TOOL_ACTION_WHITELIST: ReadonlyMap<string, ReadonlySet<string>> = new
   // prevent (#839). Both stay reachable through an agent turn / explicit UI
   // action, as before.
   ["train_doctor", new Set(["doctor"])],
+  // 0.50.0 slice 11 folded the six inventory tools into `list_local_models`.
+  // The old entry admitted ONE read-only listing and nothing else, so that is
+  // all this admits. Every other action is refused because none was reachable
+  // before — and one of them, `remove`, DELETES a model file off the user's
+  // disk with no undo. Admitting the folded name unscoped would have handed a
+  // confirmation-less mobile/mirrored client a delete button it never had; that
+  // is the #839 shape exactly, a fold turning a refusal into an acceptance.
+  // (`embeddings` and `list_paths` are read-only and still refused: they were
+  // never whitelisted either, and this map restores the old surface, not a
+  // judgement about what would be safe.)
+  ["list_local_models", new Set(["list"])],
+  // Same treatment for `download_model`, admitting exactly the five actions
+  // whose retired single-purpose tools were whitelisted: the URL download, the
+  // CivitAI download, the CivitAI model search, the CivitAI creator search, and
+  // the missing-model resolver. The three remaining actions were never
+  // whitelisted and stay refused: "search" (HuggingFace) and "status" are
+  // read-only but were not reachable, and "cancel" ABORTS a transfer — a wrong
+  // id from a canvas-less client would stop a download the user is watching,
+  // which no retired entry ever permitted.
+  [
+    "download_model",
+    new Set(["download", "download_civitai", "search_civitai", "search_creators", "resolve_missing"]),
+  ],
+  // The `get_workflow` entry above replaces FIVE standalone entries (0.50.0
+  // slice 14) — the ones that became actions get, list, analyze, query and
+  // from_image — out of the EIGHT names the tool now folds. The three that were
+  // never whitelisted stay out:
+  //
+  //   strip / slice        — authoring TRANSFORMS, not library reads. Nothing on
+  //                          a canvas-less client asks for them, and the standing
+  //                          rule for this list is that a fold admits exactly what
+  //                          the retired entries covered, not everything that
+  //                          merely looks equally safe.
+  //   prompt_director      — reaches a THIRD-PARTY custom node's HTTP endpoint
+  //                          (ComfyUI-PromptDirector's /prompt_director/inspection),
+  //                          which is a different server surface from the userdata
+  //                          API the admitted actions read. Its posture was never
+  //                          judged for this channel; it is not being judged here.
+  //
+  // All eight are read-only, so this scope is not a data-loss guard — it is the
+  // same "admit what was admitted" discipline the queue and runpod entries set,
+  // and it keeps the channel's surface a reviewed list rather than a side effect
+  // of which tools happened to be folded together.
+  ["get_workflow", new Set(["get", "list", "analyze", "query", "from_image"])],
+  // The `save_workflow` entry above is the one WRITE on this channel's workflow
+  // surface, and 0.50.0 slice 14 gave that name two more actions. Only "save"
+  // was ever admitted:
+  //
+  //   lock         — WRITES a second file (`<filename>.lock.json`) into the user
+  //                  library, and to build it SHA-256s every model the workflow
+  //                  references, which on a real install is minutes of disk I/O a
+  //                  confirmation-less tap must not be able to start.
+  //   verify_lock  — read-only, but a local-install diagnostic that was never
+  //                  whitelisted; admitting it now would be a new decision, not
+  //                  the preservation of an old one.
+  //
+  // Without this scope the swap would have handed a mirrored/foreign tab both.
+  ["save_workflow", new Set(["save"])],
 ]);
 
 /**

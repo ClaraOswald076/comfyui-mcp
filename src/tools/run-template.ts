@@ -85,7 +85,7 @@ function overridesToOps(
     }
     if (isLinkRef(node.inputs[widget], nodeKeys)) {
       throw new ValidationError(
-        `Override "${key}": input "${widget}" on node ${nodeId} (${node.class_type}) is a graph CONNECTION, not a widget — overriding it would break the graph. Overridable widgets: ${widgetInputs.join(", ") || "(none)"}. Use modify_workflow to rewire connections.`,
+        `Override "${key}": input "${widget}" on node ${nodeId} (${node.class_type}) is a graph CONNECTION, not a widget — overriding it would break the graph. Overridable widgets: ${widgetInputs.join(", ") || "(none)"}. Use create_workflow (action:"modify") to rewire connections.`,
       );
     }
     ops.push({ op: "set_input", node_id: nodeId, input_name: widget, value });
@@ -120,7 +120,7 @@ async function loadTemplateApiGraph(wfFile: string): Promise<WorkflowJSON> {
 export function registerRunTemplateTools(server: McpServer): void {
   server.tool(
     "run_template",
-    "ONE-SHOT: run a named workflow template (a bundled pack from list_packs) with optional overrides. Resolves the template's expert graph, applies overrides, and enqueues it — replacing the manual list_packs (action:\"read_workflow\") → modify_workflow → enqueue_workflow chain. Override keys are '<nodeId>.<widget_name>' (e.g. {'6.text': 'a cat', '3.seed': 42}) — the SAME keys the companion get_template_schema tool reports (when available), so schema→run round-trips; only widget values can be overridden, never graph connections. By default returns {prompt_id} immediately; pass wait:true to block until the job completes and return its outputs (images etc.). Unresolvable template names return a clear error with near-matches.",
+    "ONE-SHOT: run a named workflow template (a bundled pack from list_packs) with optional overrides. Resolves the template's expert graph, applies overrides, and enqueues it — replacing the manual list_packs (action:\"read_workflow\") → create_workflow (action:\"modify\") → enqueue_workflow chain. Override keys are '<nodeId>.<widget_name>' (e.g. {'6.text': 'a cat', '3.seed': 42}) — the SAME keys the companion get_template_schema tool reports (when available), so schema→run round-trips; only widget values can be overridden, never graph connections. By default returns {prompt_id} immediately; pass wait:true to block until the job completes and return its outputs (images etc.). Unresolvable template names return a clear error with near-matches.",
     {
       template: z
         .string()

@@ -18,7 +18,7 @@ All configuration is via environment variables (set in the server's `env` block 
 | **Remote** | `--comfyui-url` / `COMFYUI_URL` points at a non-loopback host | no | no | yes |
 | **Cloud** | `COMFYUI_API_KEY` is set (targets Comfy Cloud) | no | no | no (HTTP polling) |
 
-Tools that require a local install (`restart_comfyui` with `action: "start"` / `apply_manifest` / `remove_model` / `list_output_images` / etc.)
+Tools that require a local install (`restart_comfyui` with `action: "start"` / `apply_manifest` / `list_local_models` (`action:"remove"`) / `list_output_images` / etc.)
 return a clear error when running in remote or cloud mode. In remote and cloud modes the server skips
 local `COMFYUI_PATH` auto-detection so a stale local install can't silently absorb uploads or model
 downloads the agent intends for the actual target — set `COMFYUI_PATH` explicitly if you want to

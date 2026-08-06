@@ -3558,7 +3558,7 @@ function comfyWorkflowsDirs(): string[] {
 
 // The raw-Response userdata GET (why it bypasses `fetchApi`, and what a thrown error
 // vs a returned Response each prove) now lives in services/userdata-library.ts, shared
-// with list_workflows — see #810: the two callers had drifted, one recursing into
+// with get_workflow (action:"list") — see #810: the two callers had drifted, one recursing into
 // subfolders and one not.
 
 /**
@@ -3616,7 +3616,7 @@ const looseName = (name: string): string =>
   name.replace(/\\/g, "/").normalize("NFC").toLowerCase();
 /**
  * The connected ComfyUI's OWN list of saved workflow store keys, or null when the
- * listing could not be read. This is the same source list_workflows reports (the
+ * listing could not be read. This is the same source get_workflow (action:"list") reports (the
  * SAVED library, not the open tabs), so it reflects the server's runtime
  * `--user-directory` — it is asked, never reconstructed. Used only to turn an
  * authoritative "no such name" into either the server's EXACT key or an explicit
@@ -3662,7 +3662,7 @@ function assertUiWorkflow(parsed: unknown, sourceLabel: string): Record<string, 
  * An ABSOLUTE path is read off the orchestrator's own disk, unchanged.
  *
  * A RELATIVE name is resolved AUTHORITATIVELY by the CONNECTED ComfyUI's userdata
- * API — the same source list_workflows / panel_open_workflow read. That
+ * API — the same source get_workflow (action:"list") / panel_open_workflow read. That
  * server resolves the name under its RUNTIME `--user-directory`, so a custom user
  * directory just works and a same-named file under a reconstructed default-layout
  * path can never shadow it (#202).
@@ -3717,7 +3717,7 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
   }
 
   // RELATIVE name → the AUTHORITATIVE source is the connected ComfyUI's userdata
-  // API (the SAME source list_workflows / panel_open_workflow read): it resolves
+  // API (the SAME source get_workflow (action:"list") / panel_open_workflow read): it resolves
   // under the runtime `--user-directory`, so a CUSTOM user-dir loads the correct
   // file and a stale same-named file under the orchestrator's guessed default
   // dir can't shadow it (#202). Try it FIRST; fall back to local disk ONLY when
@@ -3871,7 +3871,7 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
   // The server ANSWERED "no such name". Before giving up, ask it for its OWN listing
   // and look for the same name in a different Unicode normal form — a name pasted
   // from a listing (or produced on another OS) can be byte-different yet denote the
-  // same file, which is how a workflow that list_workflows plainly shows still 404s
+  // same file, which is how a workflow that get_workflow (action:"list") plainly shows still 404s
   // here. Only the SERVER's own entry is retried, so this resolves the name the
   // connected ComfyUI itself reports; it never reconstructs a path. More than one
   // match is AMBIGUOUS and is refused rather than guessed at.
@@ -3913,7 +3913,7 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
         throw new Error(
           `"${p}" is ambiguous in the connected ComfyUI's workflow library — it matches ` +
             `${matches.length} saved workflows (${matches.map((k) => `"${k}"`).join(", ")}). ` +
-            `Refusing to guess which one you meant: pass the exact name from list_workflows, ` +
+            `Refusing to guess which one you meant: pass the exact name from get_workflow (action:"list"), ` +
             `or an absolute path.`,
         );
       }
@@ -3958,7 +3958,7 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
     // possibly-different local file; report the status honestly.
     throw new Error(
       `Could not read "${p}" from the connected ComfyUI: ${outcome.detail}. ` +
-        `Pass an absolute path, or a name shown by list_workflows.`,
+        `Pass an absolute path, or a name shown by get_workflow (action:"list").`,
     );
   }
   if (outcome.kind === "absent") {
@@ -3988,7 +3988,7 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
           : "") +
         ` The connected ComfyUI is the authority on its own user directory (it may have been started` +
         ` with --user-directory), so the orchestrator will NOT guess at a local path that could be a` +
-        ` different file. Use a name exactly as shown by list_workflows (which reads the same library),` +
+        ` different file. Use a name exactly as shown by get_workflow action:"list", which reads the same library,` +
         ` or pass an absolute path.`,
     );
   }
@@ -4111,7 +4111,7 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
           ` normalization), and with ComfyUI unreachable there is no authority to confirm they are` +
           ` the same file — so it was NOT loaded. Retype the name exactly, or pass an absolute path.`
         : "") +
-      ` Pass an absolute path, or a name shown by list_workflows.`,
+      ` Pass an absolute path, or a name shown by get_workflow (action:"list").`,
   );
 }
 
@@ -5687,7 +5687,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
   const defs: PanelToolDef[] = [
     def(
       "panel_query_graph",
-      "FILTER or TRAVERSE a SUBSET of the live canvas, for when you ALREADY KNOW what you're looking for. NOT for 'show me the canvas' or any whole-graph overview — call panel_graph_outline FIRST for that. NOT query_workflow (that queries a saved file or JSON you provide, not the live canvas). Filters, traverses, projects and aggregates over the workflow the user is CURRENTLY VIEWING without dumping the whole graph (replaces the old panel_get_graph full-JSON dump; output is TOKEN-BOUNDED with an explicit truncation marker, so a big graph can never flood your context). Combine: `types` (node type contains any), `title` (contains), `where` widget predicates ANDed ('cfg>7', 'steps<=20', 'sampler_name=euler', 'text~sunset' — ops = != >= <= > < ~contains), `ids` (exact nodes — THE way to read ONE node's exact slot/widget detail: {ids:[42], fields:'detail'}), `upstream_of`/`downstream_of` + `depth` (dependency traversal: upstream = what FEEDS that node, downstream = what CONSUMES it; seed at depth 0), `fields` ('compact' one line per node [default], 'ids', 'detail' = the full node summary with slots + connections + mode), `group_by:'type'` (counts only), `limit` (default 40). detail rows include each node's MODE — a 'bypass' node is skipped and a 'mute' node kills everything downstream, so check modes on the path you care about before running (fix with panel_set_node_mode). Every result also carries `groups` (id, title, member node_ids — groups are geometric, trust this list) and, when viewing a SUBGRAPH (after panel_enter_subgraph), `rails` (boundary rail ids/slots). `max_chars` bounds the WHOLE result, those riders included, and the rows you asked for are spent first: on a big graph the riders lose their member ids, then drop out entirely, rather than starving your query — and each says in-band that it did, with the true counts. Typical flow: panel_graph_outline to orient → panel_query_graph to pinpoint/inspect → edit. Read-only.",
+      "FILTER or TRAVERSE a SUBSET of the live canvas, for when you ALREADY KNOW what you're looking for. NOT for 'show me the canvas' or any whole-graph overview — call panel_graph_outline FIRST for that. NOT get_workflow's query action (that queries a saved file or JSON you provide, not the live canvas). Filters, traverses, projects and aggregates over the workflow the user is CURRENTLY VIEWING without dumping the whole graph (replaces the old panel_get_graph full-JSON dump; output is TOKEN-BOUNDED with an explicit truncation marker, so a big graph can never flood your context). Combine: `types` (node type contains any), `title` (contains), `where` widget predicates ANDed ('cfg>7', 'steps<=20', 'sampler_name=euler', 'text~sunset' — ops = != >= <= > < ~contains), `ids` (exact nodes — THE way to read ONE node's exact slot/widget detail: {ids:[42], fields:'detail'}), `upstream_of`/`downstream_of` + `depth` (dependency traversal: upstream = what FEEDS that node, downstream = what CONSUMES it; seed at depth 0), `fields` ('compact' one line per node [default], 'ids', 'detail' = the full node summary with slots + connections + mode), `group_by:'type'` (counts only), `limit` (default 40). detail rows include each node's MODE — a 'bypass' node is skipped and a 'mute' node kills everything downstream, so check modes on the path you care about before running (fix with panel_set_node_mode). Every result also carries `groups` (id, title, member node_ids — groups are geometric, trust this list) and, when viewing a SUBGRAPH (after panel_enter_subgraph), `rails` (boundary rail ids/slots). `max_chars` bounds the WHOLE result, those riders included, and the rows you asked for are spent first: on a big graph the riders lose their member ids, then drop out entirely, rather than starving your query — and each says in-band that it did, with the true counts. Typical flow: panel_graph_outline to orient → panel_query_graph to pinpoint/inspect → edit. Read-only.",
       {
         types: z.array(z.string()).optional().describe("Node type contains ANY of these (case-insensitive)."),
         title: z.string().optional().describe("Node title contains this."),
@@ -5755,7 +5755,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_graph_outline",
-      "READ THE LIVE CANVAS the user is looking at, as text. 'Show me what's on the canvas' / 'what's on the graph right now' / 'read the current workflow' / 'describe the open graph' -> THIS TOOL, with no arguments. NOT visualize_workflow or visualize_workflow_hierarchical (those DRAW A DIAGRAM of a workflow you PASS IN — a saved file or JSON — and never see the live canvas). NOT panel_query_graph (that FILTERS a SUBSET, for when you already know what you're looking for). Returns one `outline` string covering the WHOLE open graph, topologically sorted (sources first, sinks last): each node as `id Type \"title\" [bypass/mute] [OUTPUT] · group:X  widget=value …` with `← inputs` (source_node.output_name) and `→ outputs` (target_node.input_name), after a GROUPS index (title → member node ids). It gives you the WIRING you would otherwise reconstruct by hand — read it FIRST to get oriented, then panel_query_graph to inspect one node ({ids:[42], fields:'detail'}) or panel_find_nodes for free-text search. Over `max_chars` it never cuts the graph short: it sheds per-node detail, or refuses with a reason — never a partial outline. Read-only.",
+      "READ THE LIVE CANVAS the user is looking at, as text. 'Show me what's on the canvas' / 'what's on the graph right now' / 'read the current workflow' / 'describe the open graph' -> THIS TOOL, with no arguments. NOT visualize_workflow (it DRAWS A DIAGRAM of a workflow you PASS IN — a saved file or JSON — and never sees the live canvas). NOT panel_query_graph (that FILTERS a SUBSET, for when you already know what you're looking for). Returns one `outline` string covering the WHOLE open graph, topologically sorted (sources first, sinks last): each node as `id Type \"title\" [bypass/mute] [OUTPUT] · group:X  widget=value …` with `← inputs` (source_node.output_name) and `→ outputs` (target_node.input_name), after a GROUPS index (title → member node ids). It gives you the WIRING you would otherwise reconstruct by hand — read it FIRST to get oriented, then panel_query_graph to inspect one node ({ids:[42], fields:'detail'}) or panel_find_nodes for free-text search. Over `max_chars` it never cuts the graph short: it sheds per-node detail, or refuses with a reason — never a partial outline. Read-only.",
       {
         max_chars: z
           .number()
@@ -6220,7 +6220,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         path: z
           .string()
           .optional()
-          .describe("Path to a workflow .json — an ABSOLUTE path on the ComfyUI machine's disk, or a name from list_workflows, which is looked up in the connected ComfyUI's own saved-workflow library (so a custom --user-directory resolves correctly). Read + parsed server-side and loaded onto the canvas (keeps a large JSON out of chat). A name the library does not have is REFUSED rather than guessed at from a local path."),
+          .describe("Path to a workflow .json — an ABSOLUTE path on the ComfyUI machine's disk, or a name from get_workflow (action:\"list\"), which is looked up in the connected ComfyUI's own saved-workflow library (so a custom --user-directory resolves correctly). Read + parsed server-side and loaded onto the canvas (keeps a large JSON out of chat). A name the library does not have is REFUSED rather than guessed at from a local path."),
         graph: z
           .union([z.string(), z.record(z.string(), z.unknown())])
           .optional()
@@ -6804,11 +6804,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_request_secret",
-      "Securely collect an API token / secret from the user and write it straight to config — you NEVER see the value and it is never saved to chat history. The panel shows a masked input; the pasted value goes directly to the orchestrator, which stores it on the target MCP server, then applies it. Returns only a redacted confirmation.\n\nTWO targets:\n• The BUILT-IN comfyui server (mcp_server 'comfyui', target_kind 'env') — for tokens YOUR OWN comfyui tools need. The env key MUST be one of a fixed allowlist: CIVITAI_API_TOKEN (download_civitai_model), HUGGINGFACE_TOKEN or HF_TOKEN (HuggingFace downloads). Any other key is rejected. The secret is written to the canonical credential file, which the comfyui tools re-read each time they use a credential — so the running tools pick it up with NO panel_reload. The tool result states what was actually verified (that the file now carries the key) and what the live tool sessions did; if it reports the save could NOT be confirmed, treat it as unconfigured rather than retrying blindly. THIS is what fixes a download that returned HTTP 401.\n• A user-added MCP server (e.g. the 'civitai' http server you added with panel_add_mcp) — use target_kind 'header' (e.g. Authorization, value_prefix 'Bearer ') for http/sse, or 'env' for stdio; then call panel_reload to load it.\n\nFor a CivitAI DOWNLOAD 401, target 'comfyui' env CIVITAI_API_TOKEN — NOT the 'civitai' MCP server (that's only the search MCP).",
+      "Securely collect an API token / secret from the user and write it straight to config — you NEVER see the value and it is never saved to chat history. The panel shows a masked input; the pasted value goes directly to the orchestrator, which stores it on the target MCP server, then applies it. Returns only a redacted confirmation.\n\nTWO targets:\n• The BUILT-IN comfyui server (mcp_server 'comfyui', target_kind 'env') — for tokens YOUR OWN comfyui tools need. The env key MUST be one of a fixed allowlist: CIVITAI_API_TOKEN (download_model action:\"download_civitai\"), HUGGINGFACE_TOKEN or HF_TOKEN (HuggingFace downloads). Any other key is rejected. The secret is written to the canonical credential file, which the comfyui tools re-read each time they use a credential — so the running tools pick it up with NO panel_reload. The tool result states what was actually verified (that the file now carries the key) and what the live tool sessions did; if it reports the save could NOT be confirmed, treat it as unconfigured rather than retrying blindly. THIS is what fixes a download that returned HTTP 401.\n• A user-added MCP server (e.g. the 'civitai' http server you added with panel_add_mcp) — use target_kind 'header' (e.g. Authorization, value_prefix 'Bearer ') for http/sse, or 'env' for stdio; then call panel_reload to load it.\n\nFor a CivitAI DOWNLOAD 401, target 'comfyui' env CIVITAI_API_TOKEN — NOT the 'civitai' MCP server (that's only the search MCP).",
       {
         label: z.string().describe("Prompt shown above the masked input, e.g. 'Paste your CivitAI API token'."),
         target_kind: z.enum(["header", "env"]).describe("'header' for http/sse servers (e.g. Authorization); 'env' for stdio servers and the built-in comfyui server."),
-        mcp_server: z.string().describe("MCP server to attach the secret to: 'comfyui' for the built-in tools (download_civitai_model etc.), 'orchestrator' for orchestrator-level provider keys (OPENROUTER_API_KEY), or a user-added server name like 'civitai'."),
+        mcp_server: z.string().describe("MCP server to attach the secret to: 'comfyui' for the built-in tools (download_model action:\"download_civitai\" etc.), 'orchestrator' for orchestrator-level provider keys (OPENROUTER_API_KEY), or a user-added server name like 'civitai'."),
         key: z.string().describe("For 'comfyui': one of CIVITAI_API_TOKEN, HUGGINGFACE_TOKEN, HF_TOKEN (others rejected). For a user-added server: env var name or header name (e.g. 'Authorization')."),
         value_prefix: z.string().optional().describe("Optional string prepended to the token, e.g. 'Bearer '. Usually empty for env vars."),
         hint: z.string().optional().describe("Optional reassurance/help text shown under the input."),
@@ -7298,7 +7298,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                   `evidence that this creator has no content. Likely causes: the creator publishes only ` +
                   `images/videos (no models, so username lookup on model tabs can miss them), the username ` +
                   `is misspelled, or the CivitAI session is unauthenticated (a signed-out session can't see ` +
-                  `account-gated content). Verify the exact username with search_civitai_creators, or drive ` +
+                  `account-gated content). Verify the exact username with download_model action:"search_creators", or drive ` +
                   `the logged-in browser session directly.`,
               });
             }
