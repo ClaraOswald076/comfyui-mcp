@@ -5493,7 +5493,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   // training records blindly (hasActiveTrainingJob is a probe-free file scan),
   // and owner-death reconciliation otherwise only runs via getJob/listJobs —
   // so if the harness that launched a pod training run dies and nobody ever
-  // calls train_status again, the stale "running" record would suppress the
+  // polls the status action again, the stale "running" record would suppress the
   // pod auto-stop FOREVER. Periodically reconcile dead-owner records (probes
   // fire only for dead/stale owners, so a healthy run costs nothing here).
   const trainingReconcileTimer = setInterval(() => {

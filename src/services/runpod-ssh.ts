@@ -15,7 +15,7 @@ import { dirname, join } from "node:path";
 import { logger } from "../utils/logger.js";
 import type { RunpodPod } from "./runpod-client.js";
 import type { TrainerEnvelope, TrainingHandle, TrainingProgress } from "./ai-toolkit.js";
-import { parseTrainingProgress } from "./ai-toolkit.js";
+import { parseTrainingProgress, TRAINER_COMMAND } from "./ai-toolkit.js";
 
 export interface PodSshEndpoint {
   /** user@host, e.g. "root@203.0.113.10". */
@@ -548,13 +548,13 @@ export function startSshTraining(opts: {
  *  The pattern is bracketed so the invoking shell can't self-match. */
 export async function stopSshTraining(containerName: string, remoteConfigPath?: string): Promise<TrainerEnvelope<{ stopped: string }>> {
   const ep = decodePodContainerName(containerName);
-  if (!ep) return fail("train_cancel", "not_pod", `not a pod container name: ${containerName}`);
+  if (!ep) return fail(TRAINER_COMMAND.cancel, "not_pod", `not a pod container name: ${containerName}`);
   const pattern = remoteConfigPath ? `${RUNPY_PATTERN} ${remoteConfigPath}` : RUNPY_PATTERN;
   const r = await sshExec(ep, `pkill -f '${pattern.replace(/'/g, "'\\''")}' || true`, 30_000);
   if (r.code !== 0) {
-    return fail("train_cancel", "stop_failed", `remote pkill on ${ep.userHost} failed: ${r.stderr.trim() || `exit ${r.code}`}`, r.stderr);
+    return fail(TRAINER_COMMAND.cancel, "stop_failed", `remote pkill on ${ep.userHost} failed: ${r.stderr.trim() || `exit ${r.code}`}`, r.stderr);
   }
-  return ok("train_cancel", { stopped: containerName });
+  return ok(TRAINER_COMMAND.cancel, { stopped: containerName });
 }
 
 /** Is a pod job's run.py still alive? false = definitively not running,

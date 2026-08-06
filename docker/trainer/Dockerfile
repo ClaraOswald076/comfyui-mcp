@@ -47,7 +47,7 @@ RUN pip install --break-system-packages --no-cache-dir \
     && pip install --break-system-packages --no-cache-dir hf_transfer
 
 # 3) ai-toolkit source (pinned to the E2E-proven commit for reproducible
-#    builds — train_build_image passes no ref by default, so the default MUST
+#    builds — the image-build action passes no ref by default, so the default MUST
 #    be the commit we validated; independent review finding #3) + its
 #    requirements. Requirements are installed from the cloned file so they layer
 #    after torch.

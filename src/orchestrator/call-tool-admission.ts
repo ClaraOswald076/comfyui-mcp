@@ -45,29 +45,21 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   // the same story server-side from history + re-validating the graph that ran.
   // Read-only.
   "diagnose_run",
-  // Read-only training surface: flow/model discovery + progress polling +
-  // docker/GPU/image preflight for the panel/mobile Training tab, and the
-  // dataset/job-config/file readers behind its Jobs/Datasets views.
-  "train_list_flows",
-  "train_status",
-  "train_doctor",
-  "train_list_datasets",
-  "train_dataset_detail",
-  "train_job_config",
-  "train_file",
-  "train_preview_config",
-  "train_dataset_update",
-  "train_dataset_delete",
-  "train_caption_image",
-  "train_caption_dataset",
-  "train_delete_job",
-  // User-initiated training ops (panel/mobile Training wizard): stage a dataset,
-  // launch a GPU-container training run, cancel one. All validation lives in the
-  // tools themselves (dataset checks, docker/image preflight, liveness-verified
-  // cancel); the whitelist only gates reachability.
+  // The training surface for the panel/mobile Training tab: flow/model
+  // discovery, progress polling, dataset curation, job introspection and
+  // cleanup, plus the user-initiated ops (stage a dataset, launch a run, cancel
+  // one). All validation lives in the tools themselves (dataset checks,
+  // docker/image preflight, liveness-verified cancel); the whitelist only gates
+  // reachability.
+  //
+  // 0.50.0 slice 10 folded eighteen train_* tools into these three names. Every
+  // action `train_prepare_dataset` and `train_start` now carry already had its
+  // own whitelist entry before the fold, so those two are admitted whole. The
+  // third is NOT: `train_doctor` also swallowed the two SETUP tools, which were
+  // deliberately absent from this list — hence the action scoping below.
   "train_prepare_dataset",
   "train_start",
-  "train_cancel",
+  "train_doctor",
   // RunPod control panel (desktop + mobile): the one-tap pod lifecycle + the
   // local⇄pod host switch. Read-only status/list/troubleshoot, the COST-SAVING
   // actions (stop/use_local), connect (retarget only — a pod must already be
@@ -170,6 +162,17 @@ const CALL_TOOL_ACTION_WHITELIST: ReadonlyMap<string, ReadonlySet<string>> = new
   // though read-only, were never whitelisted either, and generate_skill writes a
   // file when `install_in` is set.
   ["list_packs", new Set(["extract_deps"])],
+  // `train_doctor` above kept the retired standalone train_doctor entry's
+  // admission — a READ-ONLY preflight (docker daemon reachable? GPU passthrough?
+  // image built?). 0.50.0 slice 10 folded the two SETUP tools into the same
+  // name, and NEITHER was ever whitelisted: action:"bootstrap" runs a ~10 minute
+  // git clone + torch/pip install on this machine or on a billed pod, and
+  // action:"build_image" runs a multi-GB CUDA docker build. Admitting them by name alone
+  // would let a canvas-less client start either without an agent turn — a false
+  // ACCEPTANCE created by the fold, which is exactly what this map exists to
+  // prevent (#839). Both stay reachable through an agent turn / explicit UI
+  // action, as before.
+  ["train_doctor", new Set(["doctor"])],
 ]);
 
 /**

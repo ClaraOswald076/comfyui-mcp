@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { callToolAdmission } from "../../orchestrator/call-tool-admission.js";
+import { DEAD_NAMES } from "../../tools/vocabulary.js";
 
 /**
  * The call_tool dispatcher authorizes by tool NAME and forwards arbitrary
@@ -136,6 +137,74 @@ describe("call_tool admission", () => {
     ]) {
       expect(callToolAdmission("list_packs", { action }), `action:"${action}"`).toBe(
         `tool "list_packs" is not permitted for action "${action}"`,
+      );
+    }
+  });
+
+  /**
+   * The same trap, with a machine's disk and ~10 minutes attached (0.50.0 slice
+   * 10). Eighteen train_* tools folded into three. Two of the three are safe to
+   * admit at NAME level because every action they absorbed already had its own
+   * whitelist entry — 8/8 for train_prepare_dataset, 7/7 for train_start.
+   * train_doctor is 1/3: it also absorbed the two SETUP tools, and NEITHER was
+   * ever whitelisted. Admitting them by name would turn a read-only preflight
+   * entry into "a canvas-less client can kick off a ~10 minute git clone +
+   * torch/pip install (locally or on a BILLED pod) or a multi-GB CUDA docker
+   * build" — a fold turning a false refusal into a false acceptance (#839).
+   */
+  describe("training: the folded SETUP actions stay unreachable", () => {
+    it('admits train_doctor for action:"doctor" — the read-only preflight the old entry covered', () => {
+      expect(callToolAdmission("train_doctor", { action: "doctor" })).toBeNull();
+    });
+
+    it("refuses the two SETUP actions train_doctor absorbed — neither was ever whitelisted", () => {
+      for (const action of ["bootstrap", "build_image"]) {
+        expect(callToolAdmission("train_doctor", { action }), `action:"${action}"`).toBe(
+          `tool "train_doctor" is not permitted for action "${action}"`,
+        );
+      }
+      // Including the shapes a client would actually send, so the refusal cannot
+      // be argued away as "only the bare action is blocked".
+      expect(callToolAdmission("train_doctor", { action: "bootstrap", target: "pod", pod_id: "pod123" })).toBe(
+        'tool "train_doctor" is not permitted for action "bootstrap"',
+      );
+      expect(callToolAdmission("train_doctor", { action: "build_image", aiToolkitRef: "deadbeef" })).toBe(
+        'tool "train_doctor" is not permitted for action "build_image"',
+      );
+    });
+
+    it("refuses train_doctor with a missing or non-string action", () => {
+      expect(callToolAdmission("train_doctor", {})).toBe(
+        'tool "train_doctor" is not permitted for action "(missing)"',
+      );
+      expect(callToolAdmission("train_doctor", { action: 42 })).toBe(
+        'tool "train_doctor" is not permitted for action "(missing)"',
+      );
+    });
+
+    it("admits every action train_prepare_dataset and train_start absorbed — each had its own entry", () => {
+      // The other direction, and just as important: whole-tool admission must
+      // not have DROPPED a capability the panel's Training tab still needs. All
+      // fifteen of these had their own pre-fold entry. If a future action is
+      // ADDED to either tool it does not inherit that judgement — rescope it,
+      // the way train_doctor is rescoped above.
+      for (const action of ["prepare", "list", "detail", "update", "delete", "file", "caption_image", "caption_dataset"]) {
+        expect(callToolAdmission("train_prepare_dataset", { action }), `dataset action:"${action}"`).toBeNull();
+      }
+      for (const action of ["start", "status", "cancel", "delete", "list_flows", "job_config", "preview_config"]) {
+        expect(callToolAdmission("train_start", { action }), `job action:"${action}"`).toBeNull();
+      }
+    });
+  });
+
+  // Read from the ledger rather than spelled: a consolidation that removes a
+  // name from TOOL_NAMES but forgets to remove it from the whitelist would leave
+  // a phantom entry admitting a tool that no longer exists, and every slice adds
+  // more candidates. Slice-agnostic, so it keeps holding as 0.50.0 lands.
+  it("no name the ledger declares dead is admitted by the whitelist", () => {
+    for (const dead of DEAD_NAMES) {
+      expect(callToolAdmission(dead.name, {}), dead.name).toBe(
+        `tool "${dead.name}" is not permitted`,
       );
     }
   });

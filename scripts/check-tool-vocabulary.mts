@@ -135,6 +135,10 @@ const SELF = new Set([
   // no ACTION is spelled the same as one of them, which is the invariant that
   // keeps this gate's own replacement text writable.
   "src/__tests__/tools/skills-access.test.ts",
+  // Same, for 0.50.0 slice 10: asserts as FIXTURES that the fifteen retired
+  // train_* names are in DEAD_NAMES, and — the load-bearing one — that the two
+  // retired DELETE names resolve to different tools keyed by different fields.
+  "src/__tests__/tools/train-consolidation.test.ts",
   // Same, for the #659 retired-name error: these pass dead names to call_tool /
   // the ollama dispatch as FIXTURES and assert the error quotes the ledger's
   // replacement — the names are call arguments under test, not live guidance.

@@ -4,111 +4,53 @@ description: "Train character LoRAs (FLUX.1-dev) via ostris ai-toolkit — local
 icon: "graduation-cap"
 ---
 
-<Info>18 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
+<Info>3 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
 <Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
 
-## train_list_flows
-
-List the LoRA training flows and base models the local trainer supports (phase 1: character LoRA on FLUX.1-dev), with the default training params. Read-only — call this first to see what train_start accepts.
-
-<Note>This tool takes no parameters.</Note>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "train_list_flows",
-  "arguments": {}
-}
-```
-
----
-
-## train_doctor
-
-Preflight the local trainer: docker daemon reachable, `--gpus all` GPU passthrough working (NVIDIA Container Toolkit), trainer image built. Returns per-check booleans + setup hints. Also reports the training data root and whether HF_TOKEN is set (needed to download FLUX.1-dev on first run).
-
-<Note>This tool takes no parameters.</Note>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "train_doctor",
-  "arguments": {}
-}
-```
-
----
-
-## train_build_image
-
-Build the headless GPU trainer image (comfyui-mcp-trainer:latest) from docker/trainer/Dockerfile — one-time, several minutes (CUDA + torch + ai-toolkit). Requires a reachable docker daemon. aiToolkitRef pins the ai-toolkit commit/tag for reproducibility.
-
-### Parameters
-
-<ParamField path="aiToolkitRef" type="string">
-  ai-toolkit git ref (commit/tag) to build against. Default: the Dockerfile's pinned ref.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "train_build_image",
-  "arguments": {}
-}
-```
-
----
-
-## train_bootstrap
-
-Set up the NATIVE (dockerless) trainer on this machine or a pod: clone ai-toolkit at the pinned commit, create its venv, install torch + requirements. One-time per machine/pod (~10 min fresh, idempotent; a pod's /workspace persists it across restarts). Needed before target 'pod' train_start on a fresh pod (no docker there).
-
-### Parameters
-
-<ParamField path="target" type="enum" default="local">
-  Options: `local`, `pod`.
-</ParamField>
-<ParamField path="pod_id" type="string">
-  Pod to bootstrap (target 'pod'). Default: the connected pod.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "train_bootstrap",
-  "arguments": {}
-}
-```
-
----
-
 ## train_prepare_dataset
 
-Stage training images + captions into a dataset dir the trainer consumes. Each item is an image (absolute `path`, OR a ComfyUI `ref` &#123;filename,subfolder?,type?&#125; resolved against the connected ComfyUI's output/input dirs — how phone/panel pickers hand over selections) with an optional caption (a missing caption falls back to defaultCaption — typically the trigger word). Returns the datasetPath to pass to train_start. Character LoRA guidance: 10-30 varied images; caption what changes between images, keep the trigger word constant.
+Stage and curate the training DATASETS a LoRA run consumes — the images and their captions. Datasets are keyed by `name`; the jobs that train on them live in the separate `train_start` tool and are keyed by `id`. Driven by the `action` parameter:
+- action:"prepare" — Stage training images + captions into a dataset dir the trainer consumes. Each item is an image (absolute `path`, OR a ComfyUI `ref` &#123;filename,subfolder?,type?&#125; resolved against the connected ComfyUI's output/input dirs — how phone/panel pickers hand over selections) with an optional caption (a missing caption falls back to defaultCaption — typically the trigger word). Requires `name` + `items`. Returns the datasetPath to pass to train_start (action:"start"). Character LoRA guidance: 10-30 varied images; caption what changes between images, keep the trigger word constant.
+- action:"list" — List staged datasets, newest-first, with image/caption counts. Read-only, takes no other parameters. Pair with action:"detail" to see one dataset's images + captions.
+- action:"detail" — Show ONE staged dataset by `name`: its dir (datasetPath — reusable as train_start's datasetPath) and every image with its caption (null when uncaptioned). Images render via action:"file". Read-only.
+- action:"update" — Edit a staged dataset by `name`: set/replace per-image captions (`setCaptions`) and/or delete individual images with their caption files (`deleteImages`). Refuses while a running/queued job trains from it. Returns per-file warnings for unknown files. This is the SURGICAL edit — it removes only the filenames you list, leaving the dataset itself in place.
+- action:"delete" — DESTROY a whole staged DATASET by `name`: every image and every caption under it. Irreversible, and the images are typically hand-curated and unrecoverable — confirm with the user first. Refuses while a running/queued job trains from it. THIS DELETES A DATASET, NOT A TRAINING JOB: to delete a finished job's record and checkpoints use the separate `train_start` tool with action:"delete", which is keyed by `id` rather than `name`. To remove only SOME images, use action:"update" with `deleteImages`.
+- action:"file" — Fetch an image under the training root (dataset image, job sample) by absolute `path` as an inline image — the tunnel-safe way for a phone/panel to render training files it can't reach over /view. Bounded: image files only, ≤ 2MB.
+- action:"caption_image" — Caption ONE image by absolute `path` with the user's own Claude subscription (one vision turn through the Agent SDK — not a paid API). Returns the bare caption and does NOT write it — review, then save with action:"update", or use action:"caption_dataset" to write directly. Optional `guide` steers the style; optional `trigger` is prepended by the model.
+- action:"caption_dataset" — Caption a whole staged dataset by `name` (or the `only` subset) with the user's own Claude subscription and WRITE the captions into its .txt files (one vision turn per image, sequential). Captioning ALWAYS runs through Claude (Agent SDK) regardless of the panel's active backend, so it needs a logged-in Claude Code session (or ANTHROPIC_API_KEY). Use after gathering images, before train_start (action:"start"). Per-file transient failures are reported without stopping the batch, but a persistent auth/credential failure stops immediately with an actionable error rather than failing every image. Optional `guide` steers all captions; optional `trigger` is prepended to each.
 
 ### Parameters
 
-<ParamField path="name" type="string" required>
-  Dataset name (becomes the staging dir name).
+<ParamField path="action" type="enum" required>
+  Which dataset operation to perform. "list" takes no other parameters; "prepare" requires `name` + `items`; "detail", "update", "delete" and "caption_dataset" require `name`; "file" and "caption_image" require `path`. NOTE "delete" here destroys a DATASET (images + captions) — deleting a training JOB is train_start action:"delete". Options: `prepare`, `list`, `detail`, `update`, `delete`, `file`, `caption_image`, `caption_dataset`.
 </ParamField>
-<ParamField path="items" type="object[]" required>
-  —
+<ParamField path="name" type="string">
+  Dataset name — the staging dir name. REQUIRED for actions "prepare" (it is created), "detail", "update", "delete" and "caption_dataset" (from action:"list"). This is a DATASET name, never a training job id.
+</ParamField>
+<ParamField path="items" type="object[]">
+  action:"prepare" — the images to stage. REQUIRED for that action.
 </ParamField>
 <ParamField path="defaultCaption" type="string">
-  Fallback caption for items without one — usually the trigger word.
+  action:"prepare" — fallback caption for items without one; usually the trigger word.
+</ParamField>
+<ParamField path="setCaptions" type="object">
+  action:"update" — &#123;filename: caption&#125; pairs to write (replaces existing captions).
+</ParamField>
+<ParamField path="deleteImages" type="string[]">
+  action:"update" — image filenames to delete from the dataset (caption files go too). Removes only these files; action:"delete" removes the whole dataset.
+</ParamField>
+<ParamField path="path" type="string">
+  Absolute path of a file under the training root. REQUIRED for action:"file" (a dataset image or job sample, from action:"detail"'s datasetPath or train_start action:"status"'s samples) and for action:"caption_image" (the image to caption).
+</ParamField>
+<ParamField path="guide" type="string">
+  actions "caption_image"/"caption_dataset" — extra style guidance for the captioner (e.g. 'focus on outfits and backgrounds').
+</ParamField>
+<ParamField path="trigger" type="string">
+  actions "caption_image"/"caption_dataset" — trigger word to prepend to the caption(s).
+</ParamField>
+<ParamField path="only" type="string[]">
+  action:"caption_dataset" — subset of filenames to caption (default: all images).
 </ParamField>
 
 ### Example
@@ -119,8 +61,15 @@ Stage training images + captions into a dataset dir the trainer consumes. Each i
 {
   "tool": "train_prepare_dataset",
   "arguments": {
-    "name": "<name>",
-    "items": []
+    "action": "prepare",
+    "name": "aria_character",
+    "items": [
+      {
+        "path": "/photos/aria_01.png",
+        "caption": "ohwx person, side profile, window light"
+      }
+    ],
+    "defaultCaption": "ohwx person"
   }
 }
 ```
@@ -129,42 +78,58 @@ Stage training images + captions into a dataset dir the trainer consumes. Each i
 
 ## train_start
 
-Start a LoRA training job: target 'local' builds the config and launches the GPU trainer container (docker run --gpus all); target 'pod' ssh-drives pod-native training on a connected RunPod pod (pod_id, or the connector's currently connected pod). Returns a job id for train_status/train_cancel. Long-running — returns immediately; poll train_status. On completion the LoRA is delivered per deliverTo (pod/local/both) and cataloged when local. Run train_doctor first if unsure the image/docker/GPU (local) or bootstrap (pod) are ready.
+Run and inspect LoRA training JOBS — launch a run, poll it, stop it, delete it, and read back the settings behind it. Jobs are keyed by `id`; the datasets they train on live in the separate `train_prepare_dataset` tool and are keyed by `name`. Driven by the `action` parameter:
+- action:"start" — Start a LoRA training job: target 'local' builds the config and launches the GPU trainer container (docker run --gpus all); target 'pod' ssh-drives pod-native training on a connected RunPod pod (pod_id, or the connector's currently connected pod). Requires `name` + `datasetPath`. Returns a job id for action:"status"/action:"cancel". Long-running — returns immediately; poll action:"status". On completion the LoRA is delivered per deliverTo (pod/local/both) and cataloged when local. Run train_doctor first if unsure the image/docker/GPU (local) or bootstrap (pod) are ready.
+- action:"status" — Check training progress: pass an `id` for one job (step/total, loss, recent samples, log tail, result paths when done) or OMIT `id` for all jobs newest-first. Read-only.
+- action:"cancel" — STOP a RUNNING job (docker stop) by `id` and mark it cancelled. Nothing is erased: checkpoints already saved stay in the job's output dir; no LoRA is handed off to models/loras, so the run can be inspected afterwards. Returns ok:false when the container could not be confirmed stopped (the job reverts to running). This is the RECOVERABLE stop — use action:"delete" only when you also want the artifacts gone.
+- action:"delete" — DESTROY a finished job by `id`: its record AND its output dir with checkpoints/samples, unless keep_outputs is true. Irreversible — confirm with the user first. The delivered LoRA in models/loras is NOT removed. Running/queued jobs must be cancelled first (action:"cancel"). THIS DELETES A JOB, NOT A DATASET: to delete the staged images and captions a run consumed use the separate `train_prepare_dataset` tool with action:"delete", which is keyed by `name` rather than `id`.
+- action:"list_flows" — List the LoRA training flows and base models the local trainer supports (phase 1: character LoRA on FLUX.1-dev), with the default training params. Read-only, takes no other parameters — call this first to see what action:"start" accepts.
+- action:"job_config" — Show the effective settings a job ran with by `id` (steps/lr/rank/resolution/batch/saveEvery/sampleEvery/quantize), read back from the ai-toolkit config.yml it consumed, plus flow/model/trigger/datasetPath — everything needed to run the job again with tweaks. Read-only.
+- action:"preview_config" — Show the RAW ai-toolkit config.yml action:"start" WOULD write for these settings (the ostris-UI 'raw config' view) — no side effects, nothing is written or started. Requires `name` + `datasetPath`. Use it to review a run before launching; pass the same params to action:"start" to execute.
 
 ### Parameters
 
-<ParamField path="name" type="string" required>
-  Job name — becomes the output .safetensors basename (e.g. 'aria_character').
+<ParamField path="action" type="enum" required>
+  Which training-job operation to perform. "list_flows" takes no other parameters; "status" takes an OPTIONAL `id` (omit for all jobs); "cancel", "delete" and "job_config" require `id`; "start" and "preview_config" require `name` + `datasetPath`. NOTE "delete" here destroys a training JOB — deleting a staged DATASET is train_prepare_dataset action:"delete". Options: `start`, `status`, `cancel`, `delete`, `list_flows`, `job_config`, `preview_config`.
+</ParamField>
+<ParamField path="id" type="string">
+  Training job id, as returned by action:"start" (e.g. "t8f3k2ab") — NEVER a dataset name. REQUIRED and must be non-empty for actions "cancel", "delete" and "job_config". OPTIONAL for action:"status": omit it (or pass an empty string) to list every job newest-first. Unused by "start", "list_flows" and "preview_config".
+</ParamField>
+<ParamField path="name" type="string">
+  Job name — becomes the output .safetensors basename (e.g. 'aria_character'). REQUIRED for actions "start" and "preview_config". This names the RUN, not the dataset it reads.
 </ParamField>
 <ParamField path="flow" type="enum" default="character">
-  Options: `character`.
+  action:"start" — training flow (see action:"list_flows"). Options: `character`.
 </ParamField>
 <ParamField path="model" type="enum" default="flux1-dev">
-  Options: `flux1-dev`.
+  action:"start" — base model (see action:"list_flows"). Options: `flux1-dev`.
 </ParamField>
-<ParamField path="datasetPath" type="string" required>
-  Dataset dir from train_prepare_dataset (images + same-basename .txt captions).
+<ParamField path="datasetPath" type="string">
+  Dataset dir from train_prepare_dataset (images + same-basename .txt captions). REQUIRED for actions "start" and "preview_config".
 </ParamField>
 <ParamField path="trigger" type="string">
   Unique trigger word (e.g. 'ohwx person') — injected as trigger_word and usable in prompts.
 </ParamField>
 <ParamField path="params" type="object">
-  —
+  Training param overrides for actions "start" and "preview_config" (steps/lr/rank/resolution/batchSize/saveEvery/sampleEvery/quantize). Omitted keys fall back to the defaults from action:"list_flows". action:"preview_config" enforces the SAME bounds action:"start" does, so a preview always reflects a run that could actually launch.
 </ParamField>
 <ParamField path="device" type="string">
-  GPU selector, default cuda:0.
+  action:"start" — GPU selector, default cuda:0.
 </ParamField>
 <ParamField path="target" type="enum" default="local">
-  'local' = docker on this rig; 'pod' = pod-native over ssh on a RunPod pod. Options: `local`, `pod`.
+  action:"start" — 'local' = docker on this rig; 'pod' = pod-native over ssh on a RunPod pod. Options: `local`, `pod`.
 </ParamField>
 <ParamField path="pod_id" type="string">
-  RunPod pod to train on (target 'pod'). Default: the connector's currently connected/watched pod.
+  action:"start" — RunPod pod to train on (target 'pod'). Default: the connector's currently connected/watched pod.
 </ParamField>
 <ParamField path="deliverTo" type="enum" default="both">
-  Pod jobs only: where the finished LoRA lands. Options: `pod`, `local`, `both`.
+  action:"start", pod jobs only: where the finished LoRA lands. Options: `pod`, `local`, `both`.
 </ParamField>
 <ParamField path="model_path" type="string">
-  Override the base model path AS THE TRAINER SEES IT (pod path for target 'pod', container path for 'local') — e.g. a pre-uploaded local HF snapshot dir when the default HF repo id is gated/unreachable.
+  action:"start" — override the base model path AS THE TRAINER SEES IT (pod path for target 'pod', container path for 'local') — e.g. a pre-uploaded local HF snapshot dir when the default HF repo id is gated/unreachable.
+</ParamField>
+<ParamField path="keep_outputs" type="boolean">
+  action:"delete" — keep the job's output dir (checkpoints/samples) and delete only the record.
 </ParamField>
 
 ### Example
@@ -175,22 +140,36 @@ Start a LoRA training job: target 'local' builds the config and launches the GPU
 {
   "tool": "train_start",
   "arguments": {
-    "name": "<name>",
-    "datasetPath": "<datasetPath>"
+    "action": "start",
+    "name": "aria_character",
+    "datasetPath": "/home/me/.comfyui-mcp/training/datasets/aria_character",
+    "trigger": "ohwx person"
   }
 }
 ```
 
 ---
 
-## train_status
+## train_doctor
 
-Check training progress: pass an id for one job (step/total, loss, recent samples, log tail, result paths when done) or omit for all jobs newest-first.
+Preflight and set up the TRAINER ITSELF — the docker/GPU/venv machinery every training job needs. Touches no dataset and no job. Driven by the `action` parameter:
+- action:"doctor" — Preflight the local trainer: docker daemon reachable, `--gpus all` GPU passthrough working (NVIDIA Container Toolkit), trainer image built. Read-only, takes no other parameters. Returns per-check booleans + setup hints. Also reports the training data root and whether HF_TOKEN is set (needed to download FLUX.1-dev on first run), the native (dockerless) bootstrap status, and the connected pod. Run this first when a training start fails.
+- action:"bootstrap" — Set up the NATIVE (dockerless) trainer on this machine (`target` 'local', the default) or on a pod (`target` 'pod', optional `pod_id`): clone ai-toolkit at the pinned commit, create its venv, install torch + requirements. One-time per machine/pod (~10 min fresh, idempotent; a pod's /workspace persists it across restarts). Needed before a target 'pod' train_start on a fresh pod (no docker there). Long-running.
+- action:"build_image" — Build the headless GPU trainer image (comfyui-mcp-trainer:latest) from docker/trainer/Dockerfile — one-time, several minutes (CUDA + torch + ai-toolkit). Requires a reachable docker daemon. `aiToolkitRef` pins the ai-toolkit commit/tag for reproducibility. The docker alternative to action:"bootstrap".
 
 ### Parameters
 
-<ParamField path="id" type="string">
-  Job id from train_start. Omit to list all jobs.
+<ParamField path="action" type="enum" required>
+  Which trainer-setup operation to perform. "doctor" is read-only and takes no other parameters; "bootstrap" takes `target` (+ `pod_id` for target 'pod'); "build_image" takes an optional `aiToolkitRef`. None of them touches a dataset or a job. Options: `doctor`, `bootstrap`, `build_image`.
+</ParamField>
+<ParamField path="target" type="enum" default="local">
+  action:"bootstrap" — where to install the native trainer. Default local. Options: `local`, `pod`.
+</ParamField>
+<ParamField path="pod_id" type="string">
+  action:"bootstrap" — pod to bootstrap (target 'pod'). Default: the connected pod.
+</ParamField>
+<ParamField path="aiToolkitRef" type="string">
+  action:"build_image" — ai-toolkit git ref (commit/tag) to build against. Default: the Dockerfile's pinned ref.
 </ParamField>
 
 ### Example
@@ -199,310 +178,9 @@ Check training progress: pass an id for one job (step/total, loss, recent sample
 
 ```json
 {
-  "tool": "train_status",
-  "arguments": {}
-}
-```
-
----
-
-## train_cancel
-
-Stop a running training job (docker stop) and mark it cancelled. Checkpoints already saved stay in the job's output dir; no LoRA is handed off to models/loras. Returns ok:false when the container could not be confirmed stopped (the job reverts to running).
-
-### Parameters
-
-<ParamField path="id" type="string" required>
-  Job id from train_start.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "train_cancel",
+  "tool": "train_doctor",
   "arguments": {
-    "id": "<id>"
-  }
-}
-```
-
----
-
-## train_list_datasets
-
-List staged training datasets (the dirs from train_prepare_dataset), newest-first, with image/caption counts. Read-only — pair with train_dataset_detail to see one dataset's images + captions.
-
-<Note>This tool takes no parameters.</Note>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "train_list_datasets",
-  "arguments": {}
-}
-```
-
----
-
-## train_dataset_detail
-
-Show one staged dataset: its dir (datasetPath — reusable as train_start's datasetPath) and every image with its caption (null when uncaptioned). Images render via train_file. Read-only.
-
-### Parameters
-
-<ParamField path="name" type="string" required>
-  Dataset name (from train_list_datasets).
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "train_dataset_detail",
-  "arguments": {
-    "name": "<name>"
-  }
-}
-```
-
----
-
-## train_dataset_update
-
-Edit a staged dataset: set/replace per-image captions and/or delete images (with their caption files). Refuses while a running/queued job trains from it. Returns per-file warnings for unknown files.
-
-### Parameters
-
-<ParamField path="name" type="string" required>
-  Dataset name (from train_list_datasets).
-</ParamField>
-<ParamField path="setCaptions" type="object">
-  &#123;filename: caption&#125; pairs to write (replaces existing captions).
-</ParamField>
-<ParamField path="deleteImages" type="string[]">
-  Image filenames to delete from the dataset (caption files go too).
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "train_dataset_update",
-  "arguments": {
-    "name": "<name>"
-  }
-}
-```
-
----
-
-## train_dataset_delete
-
-Delete a whole staged dataset (images + captions). Refuses while a running/queued job trains from it. Irreversible — confirm with the user first.
-
-### Parameters
-
-<ParamField path="name" type="string" required>
-  Dataset name (from train_list_datasets).
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "train_dataset_delete",
-  "arguments": {
-    "name": "<name>"
-  }
-}
-```
-
----
-
-## train_caption_image
-
-Caption ONE dataset/training image with the user's own Claude subscription (one vision turn through the Agent SDK — not a paid API). Returns the bare caption (does NOT write it — review then save with train_dataset_update, or use train_caption_dataset to write directly). Optional guide text steers the style; optional trigger is prepended by the model.
-
-### Parameters
-
-<ParamField path="path" type="string" required>
-  Absolute path of an image under the training root (train_dataset_detail's datasetPath + filename).
-</ParamField>
-<ParamField path="guide" type="string">
-  Extra style guidance for the captioner (e.g. 'focus on outfits and backgrounds').
-</ParamField>
-<ParamField path="trigger" type="string">
-  Trigger word to prepend in the caption.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "train_caption_image",
-  "arguments": {
-    "path": "<path>"
-  }
-}
-```
-
----
-
-## train_caption_dataset
-
-Caption a whole staged dataset (or a subset) with the user's own Claude subscription and WRITE the captions into its .txt files (one vision turn per image, sequential). Captioning ALWAYS runs through Claude (Agent SDK) regardless of the panel's active backend, so it needs a logged-in Claude Code session (or ANTHROPIC_API_KEY). Use after gathering images, before train_start. Per-file transient failures are reported without stopping the batch, but a persistent auth/credential failure stops immediately with an actionable error rather than failing every image. Optional guide text steers all captions; optional trigger is prepended to each.
-
-### Parameters
-
-<ParamField path="name" type="string" required>
-  Dataset name (from train_list_datasets).
-</ParamField>
-<ParamField path="guide" type="string">
-  Extra style guidance applied to every caption.
-</ParamField>
-<ParamField path="trigger" type="string">
-  Trigger word prepended to every caption.
-</ParamField>
-<ParamField path="only" type="string[]">
-  Subset of filenames to caption (default: all images).
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "train_caption_dataset",
-  "arguments": {
-    "name": "<name>"
-  }
-}
-```
-
----
-
-## train_file
-
-Fetch an image under the training root (dataset image, job sample) as an inline image — the tunnel-safe way for a phone/panel to render training files it can't reach over /view. Bounded: image files only, ≤ 2MB.
-
-### Parameters
-
-<ParamField path="path" type="string" required>
-  Absolute path under the training root (from train_dataset_detail's datasetPath or train_status's samples).
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "train_file",
-  "arguments": {
-    "path": "<path>"
-  }
-}
-```
-
----
-
-## train_job_config
-
-Show the effective settings a training job ran with (steps/lr/rank/resolution/batch/saveEvery/sampleEvery/quantize) read back from the ai-toolkit config.yml it consumed, plus flow/model/trigger/datasetPath — everything needed to run the job again with tweaks. Read-only.
-
-### Parameters
-
-<ParamField path="id" type="string" required>
-  Job id from train_start.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "train_job_config",
-  "arguments": {
-    "id": "<id>"
-  }
-}
-```
-
----
-
-## train_preview_config
-
-Show the RAW ai-toolkit config.yml train_start would write for these settings (the ostris-UI 'raw config' view) — no side effects. Use it to review/edit a run before launching; pass the same params to train_start to execute.
-
-### Parameters
-
-<ParamField path="name" type="string" required>
-  Job name (becomes the output folder + .safetensors basename).
-</ParamField>
-<ParamField path="datasetPath" type="string" required>
-  Staged dataset dir (from train_prepare_dataset or train_dataset_detail).
-</ParamField>
-<ParamField path="trigger" type="string">
-  Trigger word.
-</ParamField>
-<ParamField path="params" type="object">
-  Param overrides (steps/lr/rank/resolution/batchSize/saveEvery/sampleEvery/quantize).
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "train_preview_config",
-  "arguments": {
-    "name": "<name>",
-    "datasetPath": "<datasetPath>"
-  }
-}
-```
-
----
-
-## train_delete_job
-
-Delete an old training job's record (+ its output dir with checkpoints/samples unless keep_outputs is true) — cleanup for the Jobs view. The delivered LoRA in models/loras is NOT removed. Running/queued jobs must be cancelled first (train_cancel). Confirm with the user before deleting.
-
-### Parameters
-
-<ParamField path="id" type="string" required>
-  Job id from train_start.
-</ParamField>
-<ParamField path="keep_outputs" type="boolean">
-  Keep the job's output dir (checkpoints/samples) — delete only the record.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "train_delete_job",
-  "arguments": {
-    "id": "<id>"
+    "action": "doctor"
   }
 }
 ```
