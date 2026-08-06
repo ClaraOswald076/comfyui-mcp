@@ -128,11 +128,18 @@ describe("generate_image seed handling (#865)", () => {
   });
 
   it("still randomizes when no seed is given (composer-side draw)", async () => {
-    const res = await getHandler()({ prompt: "p", checkpoint: "x.safetensors" });
-    expect(res.isError).toBeFalsy();
-    const sampler = Object.values(enqueuedWorkflow()).find(
-      (n) => n.class_type === "KSampler",
-    );
-    expect(typeof sampler?.inputs.seed).toBe("number");
+    // Pin the draw: a hardcoded/default seed would leave this green if the
+    // assertion were only "is a number".
+    const spy = vi.spyOn(Math, "random").mockReturnValue(0.5);
+    try {
+      const res = await getHandler()({ prompt: "p", checkpoint: "x.safetensors" });
+      expect(res.isError).toBeFalsy();
+      const sampler = Object.values(enqueuedWorkflow()).find(
+        (n) => n.class_type === "KSampler",
+      );
+      expect(sampler?.inputs.seed).toBe(Math.floor(0.5 * 2 ** 48));
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
