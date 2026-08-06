@@ -45,7 +45,7 @@ vi.mock("node:dns/promises", () => ({
   lookup: (...a: unknown[]) => lookupMock(...a),
 }));
 
-import { registerWorkflowUrlTools } from "../../tools/workflow-url.js";
+import { registerWorkflowExecuteTools } from "../../tools/workflow-execute.js";
 
 type ToolHandler = (args: Record<string, unknown>) => Promise<{
   isError?: boolean;
@@ -59,7 +59,7 @@ function getHandler(name: string): ToolHandler {
       if (n === name) handler = h;
     },
   };
-  registerWorkflowUrlTools(server as never);
+  registerWorkflowExecuteTools(server as never);
   if (!handler) throw new Error(`tool ${name} not registered`);
   return handler;
 }
@@ -93,12 +93,13 @@ const API_WF = {
   "2": { class_type: "SaveImage", inputs: { images: ["1", 0] } },
 };
 
-describe("run_workflow_url", () => {
+describe('enqueue_workflow (action:"run_url")', () => {
   it("loads a raw API-format JSON URL (run=false, read-only)", async () => {
     fetchMock.mockResolvedValue(jsonResponse(API_WF));
-    const handler = getHandler("run_workflow_url");
+    const handler = getHandler("enqueue_workflow");
 
     const res = await handler({
+      action: "run_url",
       url: "https://example.com/wf.json",
       run: false,
     });
@@ -113,9 +114,9 @@ describe("run_workflow_url", () => {
 
   it("converts a UI-format export via the converter", async () => {
     fetchMock.mockResolvedValue(jsonResponse({ nodes: [{ id: 1, type: "KSampler" }], links: [] }));
-    const handler = getHandler("run_workflow_url");
+    const handler = getHandler("enqueue_workflow");
 
-    const res = await handler({ url: "https://example.com/ui.json" });
+    const res = await handler({ action: "run_url", url: "https://example.com/ui.json" });
 
     expect(res.isError).toBeFalsy();
     expect(getObjectInfoMock).toHaveBeenCalled();
@@ -125,9 +126,10 @@ describe("run_workflow_url", () => {
 
   it("normalizes a GitHub blob URL to raw.githubusercontent.com", async () => {
     fetchMock.mockResolvedValue(jsonResponse(API_WF));
-    const handler = getHandler("run_workflow_url");
+    const handler = getHandler("enqueue_workflow");
 
     await handler({
+      action: "run_url",
       url: "https://github.com/owner/repo/blob/main/wf.json",
     });
 
@@ -136,9 +138,9 @@ describe("run_workflow_url", () => {
   });
 
   it("rejects an SSRF attempt (loopback/metadata host) without fetching", async () => {
-    const handler = getHandler("run_workflow_url");
+    const handler = getHandler("enqueue_workflow");
 
-    const res = await handler({ url: "http://169.254.169.254/latest/meta-data/" });
+    const res = await handler({ action: "run_url", url: "http://169.254.169.254/latest/meta-data/" });
 
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/SSRF|internal\/loopback/i);
@@ -146,8 +148,8 @@ describe("run_workflow_url", () => {
   });
 
   it("rejects non-http(s) schemes (file://)", async () => {
-    const handler = getHandler("run_workflow_url");
-    const res = await handler({ url: "file:///etc/passwd" });
+    const handler = getHandler("enqueue_workflow");
+    const res = await handler({ action: "run_url", url: "file:///etc/passwd" });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/http\/https/i);
     expect(fetchMock).not.toHaveBeenCalled();
@@ -157,9 +159,9 @@ describe("run_workflow_url", () => {
     // Host passes the literal check, but resolves to an internal address.
     lookupMock.mockResolvedValue([{ address: "10.0.0.5", family: 4 }]);
     fetchMock.mockResolvedValue(jsonResponse(API_WF));
-    const handler = getHandler("run_workflow_url");
+    const handler = getHandler("enqueue_workflow");
 
-    const res = await handler({ url: "https://evil.example.com/wf.json" });
+    const res = await handler({ action: "run_url", url: "https://evil.example.com/wf.json" });
 
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/resolves to internal\/private|DNS-rebinding/i);
@@ -168,8 +170,8 @@ describe("run_workflow_url", () => {
 
   it("blocks an IPv6 ULA resolution too", async () => {
     lookupMock.mockResolvedValue([{ address: "fd00::1", family: 6 }]);
-    const handler = getHandler("run_workflow_url");
-    const res = await handler({ url: "https://evil6.example.com/wf.json" });
+    const handler = getHandler("enqueue_workflow");
+    const res = await handler({ action: "run_url", url: "https://evil6.example.com/wf.json" });
     expect(res.isError).toBe(true);
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -181,9 +183,9 @@ describe("run_workflow_url", () => {
         headers: { location: "http://169.254.169.254/latest/meta-data/" },
       }),
     );
-    const handler = getHandler("run_workflow_url");
+    const handler = getHandler("enqueue_workflow");
 
-    const res = await handler({ url: "https://example.com/redirector" });
+    const res = await handler({ action: "run_url", url: "https://example.com/redirector" });
 
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/redirect/i);
@@ -191,8 +193,8 @@ describe("run_workflow_url", () => {
   });
 
   it("returns a clear error for an unsupported share host", async () => {
-    const handler = getHandler("run_workflow_url");
-    const res = await handler({ url: "https://comfyworkflows.com/workflows/abc123" });
+    const handler = getHandler("enqueue_workflow");
+    const res = await handler({ action: "run_url", url: "https://comfyworkflows.com/workflows/abc123" });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/Unsupported share host/i);
     expect(fetchMock).not.toHaveBeenCalled();
@@ -205,25 +207,26 @@ describe("run_workflow_url", () => {
         headers: { "content-type": "text/html" },
       }),
     );
-    const handler = getHandler("run_workflow_url");
-    const res = await handler({ url: "https://example.com/page.html" });
+    const handler = getHandler("enqueue_workflow");
+    const res = await handler({ action: "run_url", url: "https://example.com/page.html" });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/did not return valid JSON/i);
   });
 
   it("rejects JSON that is not a recognized workflow", async () => {
     fetchMock.mockResolvedValue(jsonResponse({ hello: "world" }));
-    const handler = getHandler("run_workflow_url");
-    const res = await handler({ url: "https://example.com/other.json" });
+    const handler = getHandler("enqueue_workflow");
+    const res = await handler({ action: "run_url", url: "https://example.com/other.json" });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/not a recognized ComfyUI workflow/i);
   });
 
   it("enqueues and applies overrides when run=true", async () => {
     fetchMock.mockResolvedValue(jsonResponse(API_WF));
-    const handler = getHandler("run_workflow_url");
+    const handler = getHandler("enqueue_workflow");
 
     const res = await handler({
+      action: "run_url",
       url: "https://example.com/wf.json",
       run: true,
       inputs: { cfg: 9.5 },

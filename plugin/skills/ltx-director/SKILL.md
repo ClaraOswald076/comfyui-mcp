@@ -32,8 +32,10 @@ It is listed in the pack's `HIDDEN_WIDGET_NAMES`, so it does **not** appear in t
 node's visible widget list — but it is an ordinary input and is settable:
 
 ```
-modify_workflow  → { op: "set_input", node_id: "42",
-                     input_name: "timeline_data", value: "<json string>" }
+create_workflow(action="modify", workflow=<the graph>, operations=[
+  { op: "set_input", node_id: "42",
+    input_name: "timeline_data", value: "<json string>" },
+])
 ```
 
 The value is a JSON **string**, not an object. Empty state is `"{}"`.
@@ -97,7 +99,7 @@ Sibling hidden widgets: `local_prompts`, `segment_lengths`, `guide_strength`,
 image segment just points at a file already in ComfyUI's **input** dir. Full
 agent-drivable recipe:
 
-1. `upload_image` → puts the file in the input dir (note its `subfolder`/name)
+1. `upload_image (action:"image")` → puts the file in the input dir (note its `subfolder`/name)
 2. `imageFile` = `"<subfolder>/<name>.png"`
 3. `imageB64` = `"/api/view?filename=<name>.png&type=input&subfolder=<subfolder>"`
 
@@ -156,13 +158,13 @@ PrimitiveStringMultiline ─ global_prompt ─┘
 
 ## Procedure
 
-1. Find the node: `query_workflow` with `types: ["LTXDirector"]`, `fields: "detail"`
+1. Find the node: `get_workflow (action:"query")` with `types: ["LTXDirector"]`, `fields: "detail"`
    (or `panel_query_graph` on the live canvas).
 2. Read the current `timeline_data`, `JSON.parse` it — **never** hand-splice the string.
 3. Mutate the parsed object (append a segment, flip a track gate, retime).
 4. Keep `normalStartFrame` / `normalDurationFrames` in sync with the widgets (edge 2).
 5. Write it back as a string via `set_input`.
-6. Re-read to confirm it round-trips, then `validate_workflow`.
+6. Re-read to confirm it round-trips, then `create_workflow (action:"validate")`.
 
 ## Related
 

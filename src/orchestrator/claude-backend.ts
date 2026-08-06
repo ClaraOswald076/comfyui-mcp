@@ -386,7 +386,7 @@ export class ClaudeBackend implements AgentBackend {
 
   /** Shape one provider-neutral turn into a Claude `SDKUserMessage`, resolving
    *  image refs to inline base64 blocks so the agent SEES them in this turn (no
-   *  view_image/get_image round-trip). */
+   *  get_image view/fetch round-trip). */
   private async shapeTurn(turn: NeutralTurn): Promise<SDKUserMessage> {
     let text = turn.text;
     // #885 — deliver the held stall correction AHEAD of the user's words, so

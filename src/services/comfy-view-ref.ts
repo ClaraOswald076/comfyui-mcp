@@ -353,7 +353,7 @@ export function oversizedInlineRefusal(opts: {
   const seeItYourself =
     kind === "video"
       ? "The panel then builds a SAMPLED contact sheet of the video for you; you are still not sent the video itself."
-      : "The panel then displays it to the USER at full size. To look at it YOURSELF, call get_image with its filename/subfolder/type — that returns the image inline.";
+      : "The panel then displays it to the USER at full size. To look at it YOURSELF, call get_image (action:\"get\") with its filename/subfolder/type — that returns the image inline.";
 
   const head =
     `file too large to send inline (${mb(sizeBytes)} > ${mb(capBytes)} cap): ${path}\n` +
@@ -433,10 +433,10 @@ export function forwardedByReferenceNote(
   const anyImage = items.some((it) => it.kind === "image");
   const howToSee = [
     anyImage
-      ? `To look at an IMAGE yourself, call get_image with the filename/type/subfolder above — it comes back inline.`
+      ? `To look at an IMAGE yourself, call get_image (action:"get") with the filename/type/subfolder above — it comes back inline.`
       : null,
     anyVideo
-      ? `A VIDEO is never sent to you inline; the panel's reply above carries a sampled contact sheet and says what it does and does not show. get_image on a video saves it to disk and returns the path.`
+      ? `A VIDEO is never sent to you inline; the panel's reply above carries a sampled contact sheet and says what it does and does not show. get_image (action:"get") on a video saves it to disk and returns the path.`
       : null,
   ]
     .filter(Boolean)

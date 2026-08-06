@@ -10,8 +10,8 @@ The user wants to find out why a ComfyUI workflow execution failed and get a sug
 ## Instructions
 
 1. **Get the execution history.** The argument is: $ARGUMENTS
-   - If a prompt_id is provided, call `get_history` with that prompt_id
-   - If "last" is provided or no argument given, call `get_history` with no prompt_id to get the most recent execution
+   - If a prompt_id is provided, call `get_history(action="list")` with that prompt_id
+   - If "last" is provided or no argument given, call `get_history(action="list")` with no prompt_id to get the most recent execution
 
 2. **Extract the error.** From the history response, identify:
    - `node_id`: the node where execution failed
@@ -21,9 +21,9 @@ The user wants to find out why a ComfyUI workflow execution failed and get a sug
 
    If the execution succeeded (no error), tell the user it completed normally and show the output summary.
 
-3. **Get relevant logs.** Call `get_logs` with a `keyword` filter matching the error — use the exception class name (e.g., "RuntimeError", "ValueError") or a distinctive phrase from the error message. Request up to 200 lines.
+3. **Get relevant logs.** Call `get_system_stats (action:"logs")` with a `keyword` filter matching the error — use the exception class name (e.g., "RuntimeError", "ValueError") or a distinctive phrase from the error message. Request up to 200 lines.
 
-4. **Inspect the failing node.** Call `get_node_info` with the `node_type` of the failing node. Check:
+4. **Inspect the failing node.** Call `create_workflow (action:"node_info")` with the `node_type` of the failing node. Check:
    - What inputs does the node expect?
    - Are there required inputs that might be missing or mistyped?
    - What data types are expected for each input?
@@ -31,11 +31,11 @@ The user wants to find out why a ComfyUI workflow execution failed and get a sug
 5. **Check for missing models.** If the error mentions a missing file, model, or checkpoint:
    - Call `list_local_models` to see what's installed
    - Compare against what the workflow references
-   - If a model is missing, suggest using `download_model` or provide a search query for `search_models`
+   - If a model is missing, suggest using `download_model` `action:"download"` or provide a search query for `action:"search"`
 
 6. **Check for missing nodes.** If the error is a `KeyError` or mentions an unknown node type:
    - The node pack may not be installed
-   - Call `search_custom_nodes` with the node class name to find which pack provides it
+   - Call `search_custom_nodes` (`action: "search"`) with the node class name as `query` to find which pack provides it
    - Suggest installing the pack
 
 7. **Present the diagnosis.** Provide a clear summary:
@@ -58,10 +58,10 @@ The user wants to find out why a ComfyUI workflow execution failed and get a sug
 User: `/comfy-debug last`
 
 Steps:
-- Call `get_history` with no prompt_id
+- Call `get_history(action="list")` with no prompt_id
 - Find error: node 12 (KSampler) threw RuntimeError "Expected all tensors to be on the same device"
-- Call `get_logs` with keyword "RuntimeError"
-- Call `get_node_info` for "KSampler"
+- Call `get_system_stats (action:"logs")` with keyword "RuntimeError"
+- Call `create_workflow (action:"node_info")` for "KSampler"
 - Diagnose: model and conditioning are on different devices, likely a VRAM issue
 - Suggest: restart ComfyUI or use `clear_vram` before retrying
 

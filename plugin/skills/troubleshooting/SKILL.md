@@ -18,10 +18,10 @@ globs:
 
 When a workflow fails, follow this systematic approach:
 
-1. **Get the error**: Use `get_history` to retrieve the execution result with full traceback
-2. **Check logs**: Use `get_logs` with keyword filters like `"error"`, `"warning"`, `"traceback"`
+1. **Get the error**: Use `get_history(action="diagnose")` to retrieve the execution result with the full traceback, plus any missing models/nodes
+2. **Check logs**: Use `get_system_stats (action:"logs")` with keyword filters like `"error"`, `"warning"`, `"traceback"`
 3. **Identify the failing node**: The history response includes the `node_id` and `node_type` that failed
-4. **Cross-reference inputs**: Use `get_node_info` to verify the failing node's expected input schema
+4. **Cross-reference inputs**: Use `create_workflow (action:"node_info")` to verify the failing node's expected input schema
 5. **Check models**: Use `list_local_models` to verify all referenced model files exist
 
 ## Out of Memory (OOM)
@@ -52,7 +52,7 @@ The GPU does not have enough VRAM to hold the model weights, intermediate tensor
 
 1. **Reduce resolution**: Drop to the model's native resolution (512 for SD 1.5, 1024 for SDXL/Flux)
 2. **Use FP8/FP16 quantized models**: FP8 Flux models use ~8GB vs ~24GB for FP16
-   - Search for FP8 variants: `search_models("flux fp8")` or `search_models("sdxl fp8")`
+   - Search for FP8 variants: `download_model({ action: "search", query: "flux fp8" })` or the same with `"sdxl fp8"`
 3. **Launch flags (the VRAM ladder)**: offload aggressively via ComfyUI CLI flags —
    - `--lowvram` — offload text encoders / model parts to CPU
    - `--novram` — extreme offload; the go-to for long video (LTX 2 / WAN) OOM
@@ -181,13 +181,13 @@ The workflow references a node type that is not installed. This happens when:
 
 1. **Search for the node pack**:
    ```
-   search_custom_nodes("NodeClassName")
+   search_custom_nodes(action="search", query="NodeClassName")
    ```
 2. **Install via ComfyUI Manager** or the registry
 3. **Check logs for import errors**:
    ```
-   get_logs(keyword="import")
-   get_logs(keyword="error")
+   get_system_stats (action:"logs")(keyword="import")
+   get_system_stats (action:"logs")(keyword="error")
    ```
    Import errors often reveal missing Python dependencies
 4. **Install missing Python dependencies**: If the custom node requires a pip package:
@@ -330,7 +330,7 @@ Connecting the wrong output slot of a node to an incompatible input. Often cause
 
 ### Fixes
 
-1. **Check output indices**: Use `get_node_info` to verify the exact output order
+1. **Check output indices**: Use `create_workflow (action:"node_info")` to verify the exact output order
    - `CheckpointLoaderSimple` outputs: 0=MODEL, 1=CLIP, 2=VAE
    - Getting index wrong: `["1", 0]` gives MODEL, `["1", 1]` gives CLIP
 2. **Verify connection format**: `["nodeId", outputIndex]` — node ID is a string, index is an integer
@@ -370,11 +370,11 @@ RuntimeError: PytorchStreamReader failed reading zip archive
 
 ### Fixes
 
-1. **Verify the model exists**: `list_local_models(model_type="checkpoints")`
+1. **Verify the model exists**: `list_local_models({ action: "list", model_type: "checkpoints" })`
 2. **Check the exact filename**: Model names in workflows must match the filename exactly (case-sensitive)
 3. **Re-download**: If hash mismatch or corruption:
    ```
-   download_model(url="...", target_subfolder="checkpoints")
+   download_model({ action: "download", url: "...", target_subfolder: "checkpoints" })
    ```
 4. **Check file size**: A 1KB safetensors file is clearly corrupted — re-download
 5. **Verify subfolder**: Models must be in the correct subfolder (`checkpoints/`, `loras/`, `vae/`, etc.)
@@ -442,8 +442,9 @@ PyTorch and CUDA version incompatibility, usually after:
 ### Workflow Failed — Get Details
 
 ```
-get_history()                           # Most recent execution
-get_history(prompt_id="abc-123")        # Specific execution
+get_history(action="list")                       # Most recent execution
+get_history(action="list", prompt_id="abc-123")  # Specific execution
+get_history(action="diagnose")                   # Why the last run failed
 ```
 
 The response includes:
@@ -457,22 +458,22 @@ The response includes:
 ```
 get_system_stats()    # GPU info, VRAM, Python/PyTorch versions
 queue(action="list")  # Running and pending jobs
-get_logs(max_lines=50, keyword="error")  # Recent error logs
+get_system_stats (action:"logs")(max_lines=50, keyword="error")  # Recent error logs
 ```
 
 ### Verify Node Availability
 
 ```
-get_node_info(node_type="KSampler")              # Check specific node
-get_node_info(node_type="ControlNetApply")        # Verify custom nodes loaded
+create_workflow(action="node_info", node_type="KSampler")        # Check specific node
+create_workflow(action="node_info", node_type="ControlNetApply")  # Verify custom nodes loaded
 ```
 
 ### Verify Models
 
 ```
-list_local_models(model_type="checkpoints")       # Installed checkpoints
-list_local_models(model_type="loras")             # Installed LoRAs
-list_local_models(model_type="controlnet")        # Installed ControlNets
+list_local_models({ action: "list", model_type: "checkpoints" })   # Installed checkpoints
+list_local_models({ action: "list", model_type: "loras" })         # Installed LoRAs
+list_local_models({ action: "list", model_type: "controlnet" })    # Installed ControlNets
 ```
 
 ## Quick Reference: Error to Fix
@@ -490,4 +491,4 @@ list_local_models(model_type="controlnet")        # Installed ControlNets
 | Black images, no error | Check denoise > 0, cfg > 0, steps > 0, prompt not empty |
 | Image looks garbled/noisy | Wrong model+VAE combo, wrong sampler settings |
 | `Connection refused` on port 8188 | ComfyUI not running, or using Desktop (port 8000) |
-| `Prompt outputs failed validation` | Node inputs don't match schema — check `get_node_info` |
+| `Prompt outputs failed validation` | Node inputs don't match schema — check `create_workflow (action:"node_info")` |

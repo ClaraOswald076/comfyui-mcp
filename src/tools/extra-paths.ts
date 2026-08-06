@@ -1,74 +1,47 @@
-import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
   addExtraPath,
-  EXTRA_PATH_TARGETS,
   listExtraPaths,
   removeExtraPath,
+  type ExtraPathTarget,
 } from "../services/extra-paths.js";
 import { errorToToolResult } from "../utils/errors.js";
 
-const targetSchema = z.enum(EXTRA_PATH_TARGETS);
+/**
+ * The three extra-search-path handlers, no longer registered as tools of their own.
+ *
+ * 0.50.0 slice 11 folded them into `list_local_models` (action:"list_paths" /
+ * "add_path" / "remove_path"); see ./model-management.ts for the dispatcher and
+ * the merged schema.
+ *
+ * THE POINT OF KEEPING THEM HERE, UNCHANGED: list/add/remove are a
+ * read/write/write set over ONE file — extra_model_paths.yaml (or the Desktop
+ * extra_models_config.yaml) — and a corrupted copy of that file makes ComfyUI
+ * unable to find ANY model. So the fold must not change WHEN the file is written
+ * or HOW it is serialized. It does not: each function is the old handler body
+ * verbatim, mapping the same snake_case arguments onto the same service options
+ * and JSON-stringifying the same result. The services in
+ * ../services/extra-paths.ts are untouched, and the only writers remain
+ * addExtraPath / removeExtraPath — reached from exactly two of the six actions,
+ * the same two that used to be their own tools.
+ */
 
-const targetArgs = {
-  target: targetSchema
-    .optional()
-    .describe(
-      "Config target. auto (default) is LIVE-FIRST: the running ComfyUI's own " +
-        "--extra-model-paths-config, else the extra_model_paths.yaml next to its main.py. " +
-        "When no server is reachable, auto shows the Desktop config if one exists, otherwise " +
-        "standalone. When a reachable LOCAL server does not expose main.py, listing degrades to " +
-        "the server-named config (if it exists here) or the local auto-selected one, explicitly " +
-        "marked as an unconfirmed display fallback; mutations refuse instead. " +
-        "standalone forces <ComfyUI root>/extra_model_paths.yaml, " +
-        "where the root is COMFYUI_PATH (or an auto-detected install) and falls back to the " +
-        "saved default workspace; desktop forces the OS app-data extra_models_config.yaml. " +
-        "Use standalone/desktop (or config_path) to deliberately target a file the running " +
-        "server does not read.",
-    ),
-  config_path: z
-    .string()
-    .optional()
-    .describe("Explicit YAML config path override, mainly for advanced/manual installs."),
-};
+/** Arguments shared by all three, mapped 1:1 onto the service's options. */
+interface ExtraPathTargetArgs {
+  target?: ExtraPathTarget;
+  config_path?: string;
+}
 
-const mutationArgs = {
-  ...targetArgs,
-  group: z
-    .string()
-    .optional()
-    .describe("Top-level YAML group to edit. Defaults to comfyui_mcp."),
-  category: z
-    .string()
-    .min(1)
-    .describe(
-      "ComfyUI search-path category, e.g. checkpoints, loras, vae, diffusion_models, unet_gguf, or custom_nodes.",
-    ),
-  path: z
-    .string()
-    .min(1)
-    .describe(
-      "Directory path to add/remove for that category. Absolute paths are safest; relative paths are resolved by ComfyUI.",
-    ),
-};
+/** The two mutations additionally require a category + a path. */
+interface ExtraPathMutationArgs extends ExtraPathTargetArgs {
+  group?: string;
+  category: string;
+  path: string;
+}
 
-export function registerExtraPathsTools(server: McpServer): void {
-  server.tool(
-    "list_extra_paths",
-    "View ComfyUI extra search-path config for standalone/manual installs and ComfyUI Desktop. " +
-      "Resolves LIVE-FIRST: the file the running ComfyUI actually reads (its " +
-      "--extra-model-paths-config, else the extra_model_paths.yaml beside its main.py), falling " +
-      "back to the local heuristic only when no server is reachable — <ComfyUI root>/" +
-      "extra_model_paths.yaml (COMFYUI_PATH, else the saved default workspace from " +
-      "workspace action:\"set_default\") or the Desktop app-data extra_models_config.yaml. Reports generic " +
-      "categories, so model categories and custom_nodes entries are both visible when present. " +
-      "Read-only. Because it is read-only it never refuses a reachable LOCAL server just " +
-      "because its argv does not prove which file it reads: it shows the server-named config " +
-      "when that file exists here, else the local auto-selected one, always labelled as " +
-      "unconfirmed rather than presented as the live server's. add_extra_path/remove_extra_path " +
-      "still refuse in that state — a write to an unproven file would be a silent no-op.",
-    targetArgs,
-    async (args) => {
+export async function listExtraPathsAction(
+  args: ExtraPathTargetArgs,
+): Promise<CallToolResult> {
       try {
         const result = await listExtraPaths({
           target: args.target,
@@ -78,22 +51,11 @@ export function registerExtraPathsTools(server: McpServer): void {
       } catch (err) {
         return errorToToolResult(err);
       }
-    },
-  );
+}
 
-  server.tool(
-    "add_extra_path",
-    "Add a directory to a ComfyUI extra search-path YAML config. Use this for " +
-      "model categories such as checkpoints/loras/vae and, on ComfyUI builds that " +
-      "support it, custom_nodes. Writes the config file and returns the updated view; restart ComfyUI to apply.",
-    {
-      ...mutationArgs,
-      is_default: z
-        .boolean()
-        .optional()
-        .describe("Set is_default on a newly-created group. Existing groups are not overwritten."),
-    },
-    async (args) => {
+export async function addExtraPathAction(
+  args: ExtraPathMutationArgs & { is_default?: boolean },
+): Promise<CallToolResult> {
       try {
         const result = await addExtraPath({
           target: args.target,
@@ -107,15 +69,11 @@ export function registerExtraPathsTools(server: McpServer): void {
       } catch (err) {
         return errorToToolResult(err);
       }
-    },
-  );
+}
 
-  server.tool(
-    "remove_extra_path",
-    "Remove a directory from a ComfyUI extra search-path YAML config. Matches the stored path exactly. " +
-      "Restart ComfyUI after removing an active path.",
-    mutationArgs,
-    async (args) => {
+export async function removeExtraPathAction(
+  args: ExtraPathMutationArgs,
+): Promise<CallToolResult> {
       try {
         const result = await removeExtraPath({
           target: args.target,
@@ -128,6 +86,4 @@ export function registerExtraPathsTools(server: McpServer): void {
       } catch (err) {
         return errorToToolResult(err);
       }
-    },
-  );
 }

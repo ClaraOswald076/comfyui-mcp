@@ -8,30 +8,19 @@ vi.mock("../../services/workflow-validator.js", () => ({
   validateWorkflow: (...a: unknown[]) => validateWorkflowMock(...a),
 }));
 
-import { registerWorkflowValidateTools } from "../../tools/workflow-validate.js";
+// 0.50.0 slice 14: this rendering no longer registers a tool of its own — it is
+// create_workflow (action:"validate"). The render is exercised through the
+// exported action body rather than through a registrar, so these cases stay
+// about the RENDER; the dispatch that reaches it is covered by
+// src/__tests__/tools/workflow-compose.test.ts.
+import { validateWorkflowAction } from "../../tools/workflow-validate.js";
 import type { ValidationResult } from "../../services/workflow-validator.js";
-
-type ToolHandler = (args: Record<string, unknown>) => Promise<{
-  isError?: boolean;
-  content: Array<{ type: string; text: string }>;
-}>;
-
-function getHandler(name: string): ToolHandler {
-  let handler: ToolHandler | undefined;
-  const server = {
-    tool: (n: string, _d: string, _s: unknown, h: ToolHandler) => {
-      if (n === name) handler = h;
-    },
-  };
-  registerWorkflowValidateTools(server as never);
-  if (!handler) throw new Error(`tool ${name} not registered`);
-  return handler;
-}
 
 const run = async (result: ValidationResult): Promise<string> => {
   validateWorkflowMock.mockResolvedValue(result);
-  const handler = getHandler("validate_workflow");
-  const out = await handler({ workflow: { "1": { class_type: "SaveImage", inputs: {} } } });
+  const out = await validateWorkflowAction({
+    workflow: { "1": { class_type: "SaveImage", inputs: {} } },
+  });
   return out.content.map((c) => c.text).join("\n");
 };
 
@@ -39,7 +28,7 @@ beforeEach(() => {
   validateWorkflowMock.mockReset();
 });
 
-describe("validate_workflow render — verdict is derived from errors (#342)", () => {
+describe("create_workflow action:\"validate\" render — verdict is derived from errors (#342)", () => {
   it("never says 'ready to execute' when the result is invalid with a real error", async () => {
     const text = await run({
       valid: false,
@@ -71,7 +60,7 @@ describe("validate_workflow render — verdict is derived from errors (#342)", (
   });
 });
 
-describe("validate_workflow render — authoritative combo errors are surfaced (#505)", () => {
+describe("create_workflow action:\"validate\" render — authoritative combo errors are surfaced (#505)", () => {
   it("surfaces a value_not_in_list combo error (which carries `kind`) in the Errors section", async () => {
     const text = await run({
       valid: false,

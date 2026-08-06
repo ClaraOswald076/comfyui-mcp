@@ -4,88 +4,118 @@ description: "Build, modify, validate, and visualize ComfyUI workflows."
 icon: "pen-ruler"
 ---
 
-<Info>11 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
+<Info>2 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
 <Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
 
 ## create_workflow
 
-Create a ready-to-run ComfyUI API-format workflow from a built-in template (txt2img, img2img, upscale, inpaint, controlnet, ip_adapter, ace_step_15, stable_audio_3, remove_background, ltx_video). Pure local generation — does not contact ComfyUI and has no side effects. Returns the complete workflow JSON; pass it to validate_workflow or enqueue_workflow. Unsupplied params fall back to template defaults, so the result may reference checkpoints/models that must exist on your ComfyUI server before it will execute.
+Author and check ComfyUI workflow JSON. Driven by the `action` parameter:
+- action:"create" — Create a ready-to-run API-format workflow from a built-in template (txt2img, img2img, upscale, inpaint, controlnet, ip_adapter, ace_step_15, stable_audio_3, remove_background, ltx_video). Pure local generation — does not contact ComfyUI and has no side effects. Returns the complete workflow JSON; pass it to action:"validate" or enqueue_workflow. Unsupplied `params` fall back to template defaults, so the result may reference checkpoints/models that must exist on your ComfyUI server before it will execute.
+- action:"modify" — Apply modification `operations` to an existing workflow. Supports: set_input, add_node, remove_node, connect, insert_between. Returns the modified workflow JSON and IDs of any newly added nodes.
+- action:"validate" — Validate a workflow WITHOUT executing it. Checks for missing node types, broken connections, invalid output indices, missing models, and other issues. Returns a list of errors and warnings.
+- action:"node_info" — Query a running ComfyUI server's /object_info endpoint for installed node type definitions. Requires a reachable ComfyUI instance; results reflect that server's installed custom nodes. Use the `node_type` filter to inspect a specific node before composing or modifying a workflow. Default response is a STRUCTURAL summary: input/output names and type tags, with enum (dropdown) inputs collapsed to a value count — safe for context even on Loader nodes whose model dropdowns embed the entire local model list (hundreds of KB raw). Pass verbose=true (20 or fewer matches) for the complete raw definitions including every dropdown value. When more than 20 node types match, returns only a name/category list and asks you to narrow the filter.
+
+<Tip>**In plain terms:** Building a graph, and the schema lookup you make while building it — start one from a template, patch an existing one, check it before you queue it, or ask what a node's inputs are. Chosen with `action`.</Tip>
 
 ### Parameters
 
-<ParamField path="template" type="enum" required>
-  Template name: txt2img, img2img, upscale, or inpaint Options: `txt2img`, `img2img`, `upscale`, `inpaint`, `controlnet`, `ip_adapter`, `ace_step_15`, `stable_audio_3`, `remove_background`, `ltx_video`.
+<ParamField path="action" type="enum" required>
+  Which authoring operation to perform. "create" requires `template` (optional `params`); "modify" requires `workflow` + `operations`; "validate" requires `workflow` (optional `health`); "node_info" takes no required parameters (optional `node_type`, `verbose`, `refresh`). Options: `action:"create"`, `action:"modify"`, `action:"validate"`, `action:"node_info"`.
+</ParamField>
+<ParamField path="template" type="enum">
+  action:"create" (REQUIRED) — Template name: txt2img, img2img, upscale, or inpaint Options: `txt2img`, `img2img`, `upscale`, `inpaint`, `controlnet`, `ip_adapter`, `ace_step_15`, `stable_audio_3`, `remove_background`, `ltx_video`.
 </ParamField>
 <ParamField path="params" type="object" default="[object Object]">
-  Template parameters; recognized keys depend on the template. txt2img: checkpoint, positive_prompt, negative_prompt, width, height, steps, cfg, seed, sampler_name, scheduler. img2img/inpaint add image_path (and mask_path for inpaint) and denoise. upscale adds upscale_model. Unknown keys are ignored; omitted keys use template defaults.
+  action:"create" — Template parameters; recognized keys depend on the template. txt2img: checkpoint, positive_prompt, negative_prompt, width, height, steps, cfg, seed, sampler_name, scheduler. img2img/inpaint add image_path (and mask_path for inpaint) and denoise. upscale adds upscale_model. Unknown keys are ignored; omitted keys use template defaults.
+</ParamField>
+<ParamField path="workflow" type="string | object">
+  ComfyUI workflow JSON (as a JSON string or object). REQUIRED for action:"modify" and action:"validate" — API format for "validate".
+</ParamField>
+<ParamField path="operations" type="object[]">
+  action:"modify" (REQUIRED) — Array of operations to apply in order. Each has an 'op' field: set_input, add_node, remove_node, connect, or insert_between
+</ParamField>
+<ParamField path="health" type="boolean" default="true">
+  action:"validate" — Include graph-health heuristics (disconnected nodes, duplicate model loads, orphaned branches, muted/bypassed nodes) as info/warning issues plus a structured health section. Never affects `valid`.
+</ParamField>
+<ParamField path="node_type" type="string">
+  action:"node_info" — Filter by node class_type name (case-insensitive substring match). Omit to list all available nodes.
+</ParamField>
+<ParamField path="verbose" type="boolean" default="false">
+  action:"node_info" — If true, return the full raw /object_info definitions including enum dropdown values (model lists etc.) — can be hundreds of KB per Loader node, so only use it when you need the actual enum values (e.g. exact model filenames) and the filter matches few nodes. Default false: structural summary with enum value counts.
+</ParamField>
+<ParamField path="refresh" type="boolean" default="false">
+  action:"node_info" — If true, discard the memoized /object_info snapshot and refetch live from the connected server before answering. Use after the ComfyUI server was restarted EXTERNALLY (systemd/service manager) or new model files were added out-of-band — the cache is otherwise only invalidated by MCP-managed restarts, so loader dropdowns (model lists) would remain stale for the rest of the session (#499).
 </ParamField>
 
-### Example
+### Examples
 
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** Give me a basic text-to-image workflow to start from.
 
 ```json
 {
   "tool": "create_workflow",
   "arguments": {
-    "template": "txt2img"
+    "action": "create",
+    "template": "txt2img",
+    "params": {
+      "positive_prompt": "a snow leopard on a rooftop at dusk",
+      "steps": 25
+    }
   }
 }
 ```
 
----
+**You get back:** A complete, runnable API-format workflow. Anything you left out uses the template default, so check the checkpoint it picked actually exists on your server before running it.
 
-## modify_workflow
-
-Apply modification operations to an existing ComfyUI workflow. Supports: set_input, add_node, remove_node, connect, insert_between. Returns the modified workflow JSON and IDs of any newly added nodes.
-
-### Parameters
-
-<ParamField path="workflow" type="string | object" required>
-  ComfyUI workflow JSON (as a JSON string or object)
-</ParamField>
-<ParamField path="operations" type="object[]" required>
-  Array of operations to apply in order. Each has an 'op' field: set_input, add_node, remove_node, connect, or insert_between
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** Turn the steps up to 40 on node 3.
 
 ```json
 {
-  "tool": "modify_workflow",
+  "tool": "create_workflow",
   "arguments": {
-    "workflow": "<workflow>",
-    "operations": []
+    "action": "modify",
+    "workflow": {
+      "4": {
+        "class_type": "CheckpointLoaderSimple",
+        "inputs": {
+          "ckpt_name": "sd_xl_base_1.0.safetensors"
+        }
+      },
+      "9": {
+        "class_type": "SaveImage",
+        "inputs": {
+          "filename_prefix": "portrait",
+          "images": [
+            "8",
+            0
+          ]
+        }
+      }
+    },
+    "operations": [
+      {
+        "op": "set_input",
+        "node_id": "3",
+        "input_name": "steps",
+        "value": 40
+      }
+    ]
   }
 }
 ```
 
----
+<Note>Shortened for readability — two nodes of a real API-format graph are shown. In practice the agent passes the whole thing: the graph it just loaded with get_workflow, or the one it built for you.</Note>
 
-## validate_workflow
-
-Validate a ComfyUI workflow without executing it. Checks for missing node types, broken connections, invalid output indices, missing models, and other issues. Returns a list of errors and warnings.
-
-### Parameters
-
-<ParamField path="workflow" type="string | object" required>
-  ComfyUI workflow in API format (JSON string or object)
-</ParamField>
-<ParamField path="health" type="boolean" default="true">
-  Include graph-health heuristics (disconnected nodes, duplicate model loads, orphaned branches, muted/bypassed nodes) as info/warning issues plus a structured health section. Never affects `valid`.
-</ParamField>
-
-### Example
+**You get back:** The modified workflow plus the ids of any nodes the operations added. Nothing is written to disk and nothing is queued.
 
 **You say:** Will this run?
 
 ```json
 {
-  "tool": "validate_workflow",
+  "tool": "create_workflow",
   "arguments": {
+    "action": "validate",
     "workflow": {
       "4": {
         "class_type": "CheckpointLoaderSimple",
@@ -112,32 +142,13 @@ Validate a ComfyUI workflow without executing it. Checks for missing node types,
 
 **You get back:** Either a clean bill of health or the specific problems, without queuing anything.
 
----
-
-## get_node_info
-
-Query a running ComfyUI server's /object_info endpoint for installed node type definitions. Requires a reachable ComfyUI instance; results reflect that server's installed custom nodes. Use the node_type filter to inspect a specific node before composing or modifying a workflow. Default response is a STRUCTURAL summary: input/output names and type tags, with enum (dropdown) inputs collapsed to a value count — safe for context even on Loader nodes whose model dropdowns embed the entire local model list (hundreds of KB raw). Pass verbose=true (20 or fewer matches) for the complete raw definitions including every dropdown value. When more than 20 node types match, returns only a name/category list and asks you to narrow the filter.
-
-### Parameters
-
-<ParamField path="node_type" type="string">
-  Filter by node class_type name (case-insensitive substring match). Omit to list all available nodes.
-</ParamField>
-<ParamField path="verbose" type="boolean" default="false">
-  If true, return the full raw /object_info definitions including enum dropdown values (model lists etc.) — can be hundreds of KB per Loader node, so only use it when you need the actual enum values (e.g. exact model filenames) and the filter matches few nodes. Default false: structural summary with enum value counts.
-</ParamField>
-<ParamField path="refresh" type="boolean" default="false">
-  If true, discard the memoized /object_info snapshot and refetch live from the connected server before answering. Use after the ComfyUI server was restarted EXTERNALLY (systemd/service manager) or new model files were added out-of-band — the cache is otherwise only invalidated by MCP-managed restarts, so loader dropdowns (model lists) would remain stale for the rest of the session (#499).
-</ParamField>
-
-### Example
-
 **You say:** What settings does the KSampler node have?
 
 ```json
 {
-  "tool": "get_node_info",
+  "tool": "create_workflow",
   "arguments": {
+    "action": "node_info",
     "node_type": "KSampler"
   }
 }
@@ -147,230 +158,144 @@ Query a running ComfyUI server's /object_info endpoint for installed node type d
 
 ---
 
-## workflow_to_dsl
-
-Convert a ComfyUI API-format workflow into a compact, human/LLM-readable DSL — easier to read and edit than raw JSON, and round-trips losslessly back via dsl_to_workflow. Connections render as `key &lt;- nodeId.outputIndex`, literals as `key = &lt;JSON&gt;`. (Experimental.)
-
-### Parameters
-
-<ParamField path="workflow" type="object" required>
-  ComfyUI workflow in API format (node ID -&gt; &#123;class_type, inputs&#125;)
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "workflow_to_dsl",
-  "arguments": {
-    "workflow": "<workflow>"
-  }
-}
-```
-
----
-
-## dsl_to_workflow
-
-Convert the compact workflow DSL (see workflow_to_dsl) back into executable ComfyUI API-format JSON. Useful for authoring/editing workflows in the legible DSL, then converting to run with enqueue_workflow. When ComfyUI is reachable, the result also carries advisory `warnings` (unknown class_type, output index out of range, type mismatches) — the conversion still succeeds regardless. (Experimental.)
-
-### Parameters
-
-<ParamField path="dsl" type="string" required>
-  Workflow DSL text
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "dsl_to_workflow",
-  "arguments": {
-    "dsl": "<dsl>"
-  }
-}
-```
-
----
-
 ## visualize_workflow
 
-DRAW a Mermaid flowchart DIAGRAM from workflow JSON you PASS IN (a JSON string or object). It requires that JSON as an argument and does NOT read the user's live canvas — for 'show me what's on the canvas' / the CURRENTLY-OPEN graph use panel_graph_outline instead. Returns mermaid diagram syntax: nodes grouped by category (loading, conditioning, sampling, image, output), connections labeled by data type.
+DRAW a diagram of, or convert, workflow JSON you PASS IN (a JSON string or object) — it does NOT read the user's live canvas, so for 'show me what's on the canvas' / the CURRENTLY-OPEN graph use panel_graph_outline instead. Driven by the `action` parameter:
+- action:"render" — Mermaid flowchart of the whole graph: nodes grouped by category, connections labeled by data type.
+- action:"render_hierarchical" — the same graph SECTIONED rather than flat, which is what you want past ~20 nodes. `view` picks a compact overview, one section in detail, a text listing, or an AI-oriented structured summary.
+- action:"mermaid" — the INVERSE of render: a Mermaid flowchart back into executable API-format workflow JSON, wired from /object_info schemas.
+- action:"to_dsl" — API-format JSON into the compact, human/LLM-readable authoring DSL: `key &lt;- nodeId.outputIndex` for connections, `key = &lt;JSON&gt;` for literals. Round-trips losslessly. (Experimental.)
+- action:"from_dsl" — that DSL back into executable JSON, plus advisory wiring warnings when ComfyUI is reachable (the conversion succeeds either way). (Experimental.)
+
+<Tip>**In plain terms:** Turn a workflow you PASS IN into something readable — a Mermaid diagram or the compact DSL — and back again. It never looks at the graph open on your canvas.</Tip>
 
 ### Parameters
 
-<ParamField path="workflow" type="string | object" required>
-  ComfyUI workflow JSON (as a JSON string or object)
+<ParamField path="action" type="enum" required>
+  Which rendering/conversion to perform. "render", "render_hierarchical" and "to_dsl" require `workflow`; "mermaid" requires `mermaid`; "from_dsl" requires `dsl`. Options: `action:"render"`, `action:"render_hierarchical"`, `action:"mermaid"`, `action:"to_dsl"`, `action:"from_dsl"`.
+</ParamField>
+<ParamField path="workflow" type="string | object">
+  ComfyUI workflow JSON (as a JSON string or object; API or UI format is auto-detected). REQUIRED for action:"render", action:"render_hierarchical" and action:"to_dsl" — "to_dsl" expects API format (node ID -&gt; &#123;class_type, inputs&#125;).
 </ParamField>
 <ParamField path="show_values" type="boolean" default="true">
-  Include widget values (seed, steps, cfg, etc.) in node labels
+  action:"render" / action:"render_hierarchical" — Include widget values (seed, steps, cfg, etc.) in node labels (detail view only, for the hierarchical action).
 </ParamField>
-<ParamField path="direction" type="enum" default="LR">
-  Flowchart direction: LR (left-to-right) or TB (top-to-bottom) Options: `LR`, `TB`.
+<ParamField path="direction" type="enum">
+  action:"render" / action:"render_hierarchical" — Flowchart direction: LR (left-to-right) or TB (top-to-bottom). Default LR for "render" and for the hierarchical detail view, TB for the hierarchical overview. Options: `LR`, `TB`.
+</ParamField>
+<ParamField path="view" type="enum" default="overview">
+  action:"render_hierarchical" — overview: compact diagram with sections as summary nodes; detail: full diagram for one section; list: text summary of all sections; summary: structured text optimized for AI ingestion with node IDs, key settings, virtual wires, and full connection graph Options: `overview`, `detail`, `list`, `summary`.
+</ParamField>
+<ParamField path="section" type="string">
+  action:"render_hierarchical" — Section name to show in detail view (required when view=detail). Use view=list to see available section names.
+</ParamField>
+<ParamField path="mermaid" type="string">
+  action:"mermaid" (REQUIRED) — Mermaid flowchart text (with or without ```mermaid code fence). Nodes should use ComfyUI class_type names as labels. Connections should be labeled with data types (e.g., --&gt;|MODEL|).
+</ParamField>
+<ParamField path="dsl" type="string">
+  action:"from_dsl" (REQUIRED) — Workflow DSL text
 </ParamField>
 
-### Example
+### Examples
 
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** Draw me a diagram of this workflow.
 
 ```json
 {
   "tool": "visualize_workflow",
   "arguments": {
-    "workflow": "<workflow>"
+    "action": "render",
+    "workflow": {
+      "4": {
+        "class_type": "CheckpointLoaderSimple",
+        "inputs": {
+          "ckpt_name": "sd_xl_base_1.0.safetensors"
+        }
+      },
+      "9": {
+        "class_type": "SaveImage",
+        "inputs": {
+          "filename_prefix": "portrait",
+          "images": [
+            "8",
+            0
+          ]
+        }
+      }
+    }
   }
 }
 ```
 
----
+<Note>Shortened for readability — two nodes of a real API-format graph are shown. In practice the agent passes the whole thing: the graph it just loaded with get_workflow, or the one it built for you.</Note>
 
-## visualize_workflow_hierarchical
+**You get back:** Mermaid flowchart syntax, nodes grouped by role and every connection labelled with the data type flowing along it.
 
-SECTION a workflow JSON you PASS IN into a hierarchical Mermaid diagram — same required `workflow` argument as visualize_workflow, grouped into sections instead of one flat chart, which is what you want once a graph reaches ~20+ nodes. It does NOT read the user's live canvas: for 'show me what's on the canvas' use panel_graph_outline. Detects logical sections using node categories from /object_info, resolves Get/Set virtual wires, and produces either a compact overview (sections as summary nodes), a detailed view of one section, or a text listing of all sections.
-
-### Parameters
-
-<ParamField path="view" type="enum" default="overview">
-  overview: compact diagram with sections as summary nodes; detail: full diagram for one section; list: text summary of all sections; summary: structured text optimized for AI ingestion with node IDs, key settings, virtual wires, and full connection graph Options: `overview`, `detail`, `list`, `summary`.
-</ParamField>
-<ParamField path="section" type="string">
-  Section name to show in detail view (required when view=detail). Use view=list to see available section names.
-</ParamField>
-<ParamField path="workflow" type="string | object" required>
-  ComfyUI workflow in API format or UI format (auto-detected)
-</ParamField>
-<ParamField path="show_values" type="boolean" default="true">
-  Include widget values in node labels (detail view only)
-</ParamField>
-<ParamField path="direction" type="enum">
-  Flowchart direction (default: TB for overview, LR for detail) Options: `LR`, `TB`.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** That chart is unreadable, it's a 60-node graph.
 
 ```json
 {
-  "tool": "visualize_workflow_hierarchical",
+  "tool": "visualize_workflow",
   "arguments": {
-    "workflow": "<workflow>"
+    "action": "render_hierarchical",
+    "workflow": {
+      "4": {
+        "class_type": "CheckpointLoaderSimple",
+        "inputs": {
+          "ckpt_name": "sd_xl_base_1.0.safetensors"
+        }
+      },
+      "9": {
+        "class_type": "SaveImage",
+        "inputs": {
+          "filename_prefix": "portrait",
+          "images": [
+            "8",
+            0
+          ]
+        }
+      }
+    },
+    "view": "overview"
   }
 }
 ```
 
----
+<Note>Shortened for readability — two nodes of a real API-format graph are shown. In practice the agent passes the whole thing: the graph it just loaded with get_workflow, or the one it built for you.</Note>
 
-## mermaid_to_workflow
+**You get back:** The same graph collapsed to one box per section with the data flow between them. `view: "list"` names the sections; `view: "detail"` with a `section` opens one of them up.
 
-Convert a Mermaid flowchart diagram back into a ComfyUI workflow JSON. Parses node definitions, connections (with data type labels), and widget values from the mermaid syntax. Resolves node types and wires connections using ComfyUI's /object_info schemas. Fills missing inputs with defaults. Returns a valid, executable ComfyUI API workflow.
-
-### Parameters
-
-<ParamField path="mermaid" type="string" required>
-  Mermaid flowchart text (with or without ```mermaid code fence). Nodes should use ComfyUI class_type names as labels. Connections should be labeled with data types (e.g., --&gt;|MODEL|).
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** Show me this workflow in a form I can actually edit by hand.
 
 ```json
 {
-  "tool": "mermaid_to_workflow",
+  "tool": "visualize_workflow",
   "arguments": {
-    "mermaid": "<mermaid>"
+    "action": "to_dsl",
+    "workflow": {
+      "4": {
+        "class_type": "CheckpointLoaderSimple",
+        "inputs": {
+          "ckpt_name": "sd_xl_base_1.0.safetensors"
+        }
+      },
+      "9": {
+        "class_type": "SaveImage",
+        "inputs": {
+          "filename_prefix": "portrait",
+          "images": [
+            "8",
+            0
+          ]
+        }
+      }
+    }
   }
 }
 ```
 
----
+<Note>Shortened for readability — two nodes of a real API-format graph are shown. In practice the agent passes the whole thing: the graph it just loaded with get_workflow, or the one it built for you.</Note>
 
-## prompt_director_inspect
-
-Read Prompt Director's latest sanitized RUNTIME state after its nodes execute. Returns each node id, node kind, resolved Model Explorer model/LoRA context, structured edit plan, source analysis, exact final prompt, warnings, or Result Critic verdict. Secrets and image tensors are redacted. Use this with the live panel graph audit: graph inspection explains wiring and widget state, while this tool explains what the nodes actually resolved and compiled. Read-only: never changes the workflow. Pass node_id to inspect one executed Prompt Director node.
-
-### Parameters
-
-<ParamField path="node_id" type="string">
-  Optional ComfyUI node id; omit to list all recent Prompt Director runtime states.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "prompt_director_inspect",
-  "arguments": {}
-}
-```
-
----
-
-## query_workflow
-
-QUERY a SAVED workflow FILE (or JSON you pass in) — NOT the live canvas, which is panel_query_graph / panel_graph_outline. Filter, traverse, project, and aggregate over its nodes WITHOUT dumping the whole JSON (the missing middle between analyze_workflow's fixed summary and get_workflow's full dump; on 100+-node graphs this is the ONLY context-safe way to answer questions like 'which KSamplers run cfg&gt;7', 'what feeds node 42', 'count nodes by type'). Provide exactly one of path/filename/graph, then combine: `types` (class_type contains any), `title` (contains), `where` widget predicates ANDed ('cfg&gt;7', 'steps&lt;=20', 'sampler_name=euler', 'text~sunset' — ops = != &gt;= &lt;= &gt; &lt; ~contains), `ids` (exact nodes — the way to read ONE node's detail), `upstream_of`/`downstream_of` + `depth` (dependency traversal: upstream = what FEEDS that node, downstream = what CONSUMES it; seed included at depth 0), `fields` ('compact' one line per node [default], 'ids', or 'detail' JSON rows with widgets + wiring), `group_by:'type'` (counts only), `limit` (default 40, max 200), `max_chars` (default 12000, max 60000). Output is TOKEN-BOUNDED and, when it truncates, the tail names WHICH of the two caps fired and the exact parameter to raise — read it and retry rather than concluding the graph can't be read. Read-only.
-
-### Parameters
-
-<ParamField path="path" type="string">
-  Absolute server-side path to a workflow .json on disk.
-</ParamField>
-<ParamField path="filename" type="string">
-  Workflow library name as list_workflows reports it (subfolders included, e.g. 'IMAGE/portrait.json'), as an alternative to path.
-</ParamField>
-<ParamField path="graph" type="object">
-  Inline workflow JSON (UI or API format), as an alternative to path/filename.
-</ParamField>
-<ParamField path="types" type="string[]">
-  Keep nodes whose class_type contains ANY of these (case-insensitive).
-</ParamField>
-<ParamField path="title" type="string">
-  Keep nodes whose title contains this.
-</ParamField>
-<ParamField path="where" type="string[]">
-  Widget predicates, ANDed: 'cfg&gt;7', 'sampler_name=euler', 'text~sunset'.
-</ParamField>
-<ParamField path="ids" type="string | number[]">
-  Keep exactly these node ids.
-</ParamField>
-<ParamField path="upstream_of" type="string | number">
-  Scope to the dependency closure FEEDING this node id.
-</ParamField>
-<ParamField path="downstream_of" type="string | number">
-  Scope to the nodes CONSUMING this node id's outputs.
-</ParamField>
-<ParamField path="depth" type="integer">
-  Max hops from the traversal seed (seed=0). Absent = full closure.
-</ParamField>
-<ParamField path="fields" type="enum">
-  Projection: compact one-liners (default), bare ids, or detail JSON rows. Options: `ids`, `compact`, `detail`.
-</ParamField>
-<ParamField path="group_by" type="enum">
-  Aggregate: counts per class_type instead of listing. Options: `type`.
-</ParamField>
-<ParamField path="limit" type="integer">
-  Max nodes listed (default 40, max 200).
-</ParamField>
-<ParamField path="max_chars" type="integer">
-  Output character bound (default 12000, max 60000). Raise this — not `limit` — when the truncation tail says the char budget cut the result.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "query_workflow",
-  "arguments": {}
-}
-```
+**You get back:** The compact DSL: one block per node, connections as `key &lt;- nodeId.outputIndex`. `action: "from_dsl"` converts it back to runnable JSON when you are done editing.
 
 ---

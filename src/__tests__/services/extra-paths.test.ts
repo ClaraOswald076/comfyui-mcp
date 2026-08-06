@@ -587,7 +587,7 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
     expect(result.notes.some((n) => n.includes(workspaceA) && /silent no-op/i.test(n))).toBe(true);
   });
 
-  it("add_extra_path WRITES into the live root, not the saved workspace", async () => {
+  it('list_local_models action:"add_path" WRITES into the live root, not the saved workspace', async () => {
     const workspaceA = await trackTmp();
     const liveB = await trackTmp();
     await saveDefaultWorkspace(workspaceA);

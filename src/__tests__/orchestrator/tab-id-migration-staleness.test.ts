@@ -7,8 +7,8 @@
 // tab", and the session persists under an orphaned key. These pin that the field
 // (and the panel-server binding) move with the tab.
 
-import { describe, expect, it, beforeAll, afterEach } from "vitest";
-import { rmSync } from "node:fs";
+import { describe, expect, it, beforeAll, afterAll, afterEach } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -28,12 +28,25 @@ beforeAll(async () => {
 });
 
 const PORT = 59231;
-const FILE = join(tmpdir(), `comfyui-mcp-panel-sessions-${PORT}.json`);
+// #884 — SessionStore lives in ~/.comfyui-mcp/sessions by default; tests pin it
+// to a scratch dir so they never touch the real home. The pre-#884 tmpdir file
+// is removed too — a stale one would be silently migrated into the next store.
+const DIR = mkdtempSync(join(tmpdir(), "cmcp-sessions-"));
+const FILE = join(DIR, `panel-sessions-${PORT}.json`);
 afterEach(() => {
+  for (const f of [FILE, join(tmpdir(), `comfyui-mcp-panel-sessions-${PORT}.json`)]) {
+    try {
+      rmSync(f);
+    } catch {
+      /* already gone */
+    }
+  }
+});
+afterAll(() => {
   try {
-    rmSync(FILE);
+    rmSync(DIR, { recursive: true, force: true });
   } catch {
-    /* already gone */
+    /* best-effort */
   }
 });
 
@@ -71,7 +84,7 @@ async function waitFor(cond: () => boolean, timeoutMs = 3000): Promise<void> {
 describe("tab-id migration moves the agent's own identity (#568 Defect 1)", () => {
   it("after rebind, callbacks fire under the NEW key and the session persists under it", async () => {
     const backend = new SessioningBackend();
-    const store = new SessionStore(PORT);
+    const store = new SessionStore(PORT, { dir: DIR });
     const seen: Array<{ tab: string; mid: string }> = [];
     const sessions: Array<{ tab: string; sid: string }> = [];
     const manager = new PanelAgentManager({

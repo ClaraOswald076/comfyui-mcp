@@ -1,8 +1,6 @@
-import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { WorkflowJSON } from "../comfyui/types.js";
 import { validateWorkflow } from "../services/workflow-validator.js";
-import { errorToToolResult, ValidationError } from "../utils/errors.js";
+import { ValidationError } from "../utils/errors.js";
 
 function parseWorkflow(input: unknown): WorkflowJSON {
   if (typeof input === "string") {
@@ -23,92 +21,87 @@ function parseWorkflow(input: unknown): WorkflowJSON {
   throw new ValidationError("Workflow must be a JSON string or object");
 }
 
-export function registerWorkflowValidateTools(server: McpServer): void {
-  server.tool(
-    "validate_workflow",
-    "Validate a ComfyUI workflow without executing it. Checks for missing node types, broken connections, invalid output indices, missing models, and other issues. Returns a list of errors and warnings.",
-    {
-      workflow: z
-        .union([z.string(), z.record(z.string(), z.any())])
-        .describe("ComfyUI workflow in API format (JSON string or object)"),
-      health: z
-        .boolean()
-        .optional()
-        .default(true)
-        .describe(
-          "Include graph-health heuristics (disconnected nodes, duplicate model loads, orphaned branches, muted/bypassed nodes) as info/warning issues plus a structured health section. Never affects `valid`.",
-        ),
-    },
-    async (args) => {
-      try {
-        const workflow = parseWorkflow(args.workflow);
-        const result = await validateWorkflow(workflow, { health: args.health });
+/**
+ * `create_workflow (action:"validate")` — the body of the retired standalone
+ * workflow-validation tool, verbatim (0.50.0 slice 14).
+ *
+ * It no longer registers a tool of its own: the surface consolidation folded it
+ * into `create_workflow`, which owns the schema and the single try/catch. The
+ * WORK stayed here, unchanged — same `validateWorkflow` call, same arguments,
+ * same rendered content block — so this file remains the one place the
+ * "verdict is derived from the surfaced errors" rendering of #342/#505 lives.
+ *
+ * Throws instead of returning `errorToToolResult`: the caller wraps every action
+ * in the identical `errorToToolResult` catch, so a failure produces the same
+ * result object it always did.
+ */
+export async function validateWorkflowAction(args: {
+  workflow: unknown;
+  health?: boolean;
+}): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+  const workflow = parseWorkflow(args.workflow);
+  const result = await validateWorkflow(workflow, { health: args.health });
 
-        const lines: string[] = [];
-        lines.push(`## ${result.summary}`);
-        lines.push("");
+  const lines: string[] = [];
+  lines.push(`## ${result.summary}`);
+  lines.push("");
 
-        // Health findings are rendered in their own "### Graph health" section —
-        // exclude them from the Errors/Warnings buckets to avoid double-listing.
-        // NOTE: partition on `.health`, NOT `.kind`. Authoritative validator issues
-        // (missing_node_type / missing_model / value_not_in_list) also carry `kind`,
-        // so filtering by `!i.kind` (the old logic) masked real errors behind
-        // "No issues found" while the header still counted them (#342, #505).
-        const nonHealth = result.issues.filter((i) => !i.health);
-        const errors = nonHealth.filter((i) => i.severity === "error");
-        const warnings = nonHealth.filter((i) => i.severity === "warning");
+  // Health findings are rendered in their own "### Graph health" section —
+  // exclude them from the Errors/Warnings buckets to avoid double-listing.
+  // NOTE: partition on `.health`, NOT `.kind`. Authoritative validator issues
+  // (missing_node_type / missing_model / value_not_in_list) also carry `kind`,
+  // so filtering by `!i.kind` (the old logic) masked real errors behind
+  // "No issues found" while the header still counted them (#342, #505).
+  const nonHealth = result.issues.filter((i) => !i.health);
+  const errors = nonHealth.filter((i) => i.severity === "error");
+  const warnings = nonHealth.filter((i) => i.severity === "warning");
 
-        if (errors.length === 0 && warnings.length === 0) {
-          // Verdict is DERIVED from the surfaced errors, never asserted independently.
-          lines.push(
-            result.valid
-              ? "No issues found. The workflow is ready to execute."
-              : "No errors were surfaced, but the workflow is NOT valid — see the header and graph-health section below.",
-          );
-        } else {
-          if (errors.length > 0) {
-            lines.push("### Errors");
-            for (const issue of errors) {
-              const loc = issue.node_id
-                ? `Node ${issue.node_id} (${issue.node_type})`
-                : "Workflow";
-              lines.push(`- **${loc}**: ${issue.message}`);
-            }
-            lines.push("");
-          }
-
-          if (warnings.length > 0) {
-            lines.push("### Warnings");
-            for (const issue of warnings) {
-              const loc = issue.node_id
-                ? `Node ${issue.node_id} (${issue.node_type})`
-                : "Workflow";
-              lines.push(`- **${loc}**: ${issue.message}`);
-            }
-          }
-        }
-
-        if (result.health) {
-          lines.push("");
-          lines.push("### Graph health");
-          lines.push(`- ${result.health.summary}`);
-          for (const f of result.health.findings) {
-            const tag = f.heuristic ? `${f.severity}, heuristic` : f.severity;
-            lines.push(`- [${tag}] ${f.detail}`);
-          }
-        }
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: lines.join("\n"),
-            },
-          ],
-        };
-      } catch (err) {
-        return errorToToolResult(err);
+  if (errors.length === 0 && warnings.length === 0) {
+    // Verdict is DERIVED from the surfaced errors, never asserted independently.
+    lines.push(
+      result.valid
+        ? "No issues found. The workflow is ready to execute."
+        : "No errors were surfaced, but the workflow is NOT valid — see the header and graph-health section below.",
+    );
+  } else {
+    if (errors.length > 0) {
+      lines.push("### Errors");
+      for (const issue of errors) {
+        const loc = issue.node_id
+          ? `Node ${issue.node_id} (${issue.node_type})`
+          : "Workflow";
+        lines.push(`- **${loc}**: ${issue.message}`);
       }
-    },
-  );
+      lines.push("");
+    }
+
+    if (warnings.length > 0) {
+      lines.push("### Warnings");
+      for (const issue of warnings) {
+        const loc = issue.node_id
+          ? `Node ${issue.node_id} (${issue.node_type})`
+          : "Workflow";
+        lines.push(`- **${loc}**: ${issue.message}`);
+      }
+    }
+  }
+
+  if (result.health) {
+    lines.push("");
+    lines.push("### Graph health");
+    lines.push(`- ${result.health.summary}`);
+    for (const f of result.health.findings) {
+      const tag = f.heuristic ? `${f.severity}, heuristic` : f.severity;
+      lines.push(`- [${tag}] ${f.detail}`);
+    }
+  }
+
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: lines.join("\n"),
+      },
+    ],
+  };
 }

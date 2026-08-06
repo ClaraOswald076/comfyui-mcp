@@ -6,10 +6,12 @@
 // panel IS an ordinary custom node pack, so the generic node tools are a second,
 // wider door into exactly the same ComfyUI-Manager mutation:
 //
-//     update_custom_node(id="comfyui-agent-panel")   → updateCustomNode(...)
-//     update_custom_node(id="all")                   → updateCustomNode(...)
-//     reinstall_custom_node(id="comfyui-mcp-panel")  → reinstallCustomNode(...)
-//     update_all                                     → updateAllCustomNodes()
+//     install_custom_node(action:"update", id="comfyui-agent-panel")
+//                                                     → updateCustomNode(...)
+//     install_custom_node(action:"update", id="all")  → updateCustomNode(...)
+//     install_custom_node(action:"reinstall", id="comfyui-mcp-panel")
+//                                                     → reinstallCustomNode(...)
+//     update-all                                      → updateAllCustomNodes()
 //
 // None of those go through `runPanelAction`, so none of them saw the pin. A
 // pinned user was one `id="all"` away from being moved. The guard therefore
@@ -52,6 +54,7 @@ import {
   PANEL_PIN_ENV_VAR,
   type PanelPinState,
 } from "./panel-settings.js";
+import { assertNotWritingRealHomeInTests } from "./test-isolation-guard.js";
 
 /** Thrown when a pin forbids a mutation. Distinct so callers can recognise it. */
 export class PanelPinnedError extends Error {
@@ -167,21 +170,21 @@ export function assertPanelPinAllows(action: string, id: string): void {
       : ``;
 
   // #774/#784 — the way out of this refusal must be a way the caller can
-  // actually take. `install_panel(action='unpin')` is the right instruction in a
-  // local session and a dead end in a remote/cloud one, where install_panel
+  // actually take. `install_comfyui(action:'panel', panel_action:'unpin')` is the right instruction in a
+  // local session and a dead end in a remote/cloud one, where install_comfyui(action:'panel')
   // cannot act at all. So the LEAD instruction switches with the session rather
   // than being appended to. An env pin already carries its own instruction (unset
   // the variable), which is host-side either way and needs no substitution.
   const usable = panelRecoveryContext().installPanelUsable;
   const clearIt = usable
-    ? `clear the pin with install_panel(action='unpin')${envNote}`
+    ? `clear the pin with install_comfyui(action:'panel', panel_action:'unpin')${envNote}`
     : pin.source === "env"
       ? // An env pin is not cleared by any tool anywhere, so naming one would be
         // noise on top of a dead end — say plainly where the variable lives.
         `clear the pin ON THE COMFYUI HOST: unset ${PANEL_PIN_ENV_VAR} in that ` +
         `machine's environment (or ~/.comfyui-mcp/.env) and restart the ` +
         `orchestrator running there`
-      : `clear the pin ON THE COMFYUI HOST — install_panel cannot act in this ` +
+      : `clear the pin ON THE COMFYUI HOST — install_comfyui(action:'panel') cannot act in this ` +
         `session, so remove it from that machine's ` +
         `~/.comfyui-mcp/panel-settings.json and restart the orchestrator ` +
         `running there`;
@@ -202,7 +205,7 @@ export function assertPanelPinAllows(action: string, id: string): void {
  * Refuse a panel-pack mutation on a path that has NO on-disk verification —
  * currently the sidebar `panel_install_node` / `panel_update_node` tools (which
  * drive the user's built-in ComfyUI Manager through the browser) and
- * `fix_custom_node`.
+ * `install_custom_node` action:"fix".
  *
  * These cannot be redirected into the verified path: `panel_*` acts on the
  * panel's own host through the browser Manager (which may not even be the
@@ -214,7 +217,7 @@ export function assertPanelPinAllows(action: string, id: string): void {
  * The pin is reported FIRST when set, because that is the more specific reason.
  *
  * #774/#784 — the REDIRECT is resolved from the session context rather than
- * hardcoded to "use install_panel". Pairing this refusal with a pointer at a
+ * hardcoded to "use install_comfyui(action:'panel')". Pairing this refusal with a pointer at a
  * tool that is a no-op here (remote/cloud) or absent here (the embedded
  * `panel_*` surface) is what closed the loop into a deadlock: every door the
  * user tried named another door that was also shut. Refusing remains correct —
@@ -253,11 +256,31 @@ export function assertPanelNotTargetedUnverifiable(
 // function while already holding it.
 // ---------------------------------------------------------------------------
 
+/**
+ * An explicitly-set-but-EMPTY redirect is a mistake, not an intent to use the
+ * default — and treating it as unset hid exactly that mistake once already:
+ * node-snapshots.test.ts assigned `"\0"` intending an fs-rejected path, Node
+ * truncated the assignment to `""`, and the write silently fell through to the
+ * developer's real home (#866). Fail loudly at resolution time instead.
+ */
+function redirectedStatePath(envVar: string, fallback: string): string {
+  const value = process.env[envVar];
+  if (value !== undefined && value.trim() === "") {
+    throw new Error(
+      `${envVar} is set but EMPTY. An empty override does not mean "use the default" — ` +
+        `it falls through to the default (${fallback}) with no sign anything was wrong, ` +
+        `which is how a test run came to write the developer's real home directory (#866). ` +
+        `Set ${envVar} to a real path or unset it entirely.`,
+    );
+  }
+  return value ?? fallback;
+}
+
 /** Lock file path. Overridable so tests never touch the real home directory. */
 export function panelLockPath(): string {
-  return (
-    process.env.COMFYUI_MCP_PANEL_LOCK ||
-    join(homedir(), ".comfyui-mcp", "panel-op.lock")
+  return redirectedStatePath(
+    "COMFYUI_MCP_PANEL_LOCK",
+    join(homedir(), ".comfyui-mcp", "panel-op.lock"),
   );
 }
 
@@ -498,6 +521,9 @@ export interface PanelLockReclaimResult {
  */
 export function reclaimAbandonedPanelLock(): PanelLockReclaimResult {
   const path = panelLockPath();
+  // A test pointed at the real home must never move or delete a lock a live
+  // orchestrator is holding — reclaim is exactly the operation that does.
+  assertNotWritingRealHomeInTests(path, "the panel operation lock");
   const obs = observePanelLock(path);
   if (!obs) {
     return {
@@ -655,6 +681,7 @@ export function reclaimAbandonedPanelLock(): PanelLockReclaimResult {
 
 async function acquireFileLock(timeoutMs: number): Promise<() => void> {
   const path = panelLockPath();
+  assertNotWritingRealHomeInTests(path, "the panel operation lock");
   mkdirSync(dirname(path), { recursive: true });
   const deadline = Date.now() + timeoutMs;
 
@@ -849,7 +876,7 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
             `${describeObservedLock(path, obs)} The lock is never auto-reclaimed: a ` +
             `concurrent pre-upgrade orchestrator could replace an observed stale path ` +
             `with a fresh lock. To recover a proven abandoned lock, run ` +
-            `install_panel(action='unlock') — it re-verifies that the recorded owner is ` +
+            `install_comfyui(action:'panel', panel_action:'unlock') — it re-verifies that the recorded owner is ` +
             `dead and the lock is old before deleting anything, and refuses otherwise. ` +
             `Or do it by hand: stop or restart every comfyui-mcp orchestrator, verify ` +
             `none remain, delete this exact lock file, then retry.`,
@@ -905,7 +932,7 @@ export function withPanelMutationLock<T>(
  * Run a panel-moving mutation atomically with its pin check.
  *
  * assertPanelPinAllows alone is a TOCTOU race: the check passes, and THEN a pin
- * can be written before/while the ComfyUI-Manager operation runs (an update_all
+ * can be written before/while the ComfyUI-Manager operation runs (an update-all
  * drain takes seconds), so the update lands on a by-then-pinned panel. The pin
  * WRITE path takes this same lock, so checking inside it and holding it across
  * the whole mutation means a pin either lands before the op starts (and blocks
@@ -934,7 +961,7 @@ export function withPanelPinGuard<T>(
 // Pending panel-affecting operations
 //
 // Some panel-moving operations are handed to ComfyUI-Manager and then applied
-// OUT OF BAND: update_all drains on the Manager's own worker after we return,
+// OUT OF BAND: update-all drains on the Manager's own worker after we return,
 // and a snapshot restore is deferred to the next ComfyUI restart. The mutation
 // lock cannot be held across that window (it would wedge pinning for minutes
 // to days), and no completion/apply path exists IN THIS PROCESS to re-check a
@@ -947,8 +974,8 @@ export function withPanelPinGuard<T>(
 // delete the deferred-restore file), clears the marker only for what was
 // PROVABLY cancelled or proven no longer pending, and keeps the warning for
 // the residue — in-flight work, remote hosts, anything unverifiable. The
-// lock-held variants — update_custom_node(id="all"), which waits for the
-// drain inside the lock, and every install_panel mutation — need no marker:
+// lock-held variants — install_custom_node(action:"update", id="all"), which waits
+// for the drain inside the lock, and every install_comfyui(action:'panel') mutation — need no marker:
 // no pin can be written inside their window at all.
 // ---------------------------------------------------------------------------
 
@@ -979,7 +1006,7 @@ export interface PanelPendingOp {
   uiId?: string;
 }
 
-/** update_all drains in minutes on the Manager's worker; an hour is far beyond
+/** update-all drains in minutes on the Manager's worker; an hour is far beyond
  *  a legitimate drain, so reclaiming then cannot cut a live op short. */
 export const UPDATE_ALL_PENDING_MS = 60 * 60_000;
 
@@ -990,9 +1017,9 @@ export const SNAPSHOT_RESTORE_PENDING_MS = 7 * 24 * 60 * 60_000;
 
 /** Marker file path. Overridable so tests never touch the real home directory. */
 export function panelPendingOpsPath(): string {
-  return (
-    process.env.COMFYUI_MCP_PANEL_PENDING ||
-    join(homedir(), ".comfyui-mcp", "panel-pending-ops.json")
+  return redirectedStatePath(
+    "COMFYUI_MCP_PANEL_PENDING",
+    join(homedir(), ".comfyui-mcp", "panel-pending-ops.json"),
   );
 }
 
@@ -1010,7 +1037,7 @@ function isPanelPendingOp(value: unknown): value is PanelPendingOp {
 }
 
 /** Why a read produced no usable ops. The distinction that matters is `empty`
- *  vs `unparseable`, and it exists because collapsing them wedged `update_all`
+ *  vs `unparseable`, and it exists because collapsing them wedged `update-all`
  *  permanently (#847).
  *
  *  A ZERO-BYTE file is not "a record we cannot read" — it is a file with no
@@ -1044,6 +1071,12 @@ interface PendingOpsRead {
  * `.tmp` would let concurrent writers clobber each other's staging file.
  */
 function writePanelPendingOpsAtomic(path: string, body: string): void {
+  // The third time the suite wrote the developer's real state it was THIS
+  // file (#866): the orchestrator reads these markers, so leftovers make every
+  // pin write warn about operations that never happened. Refuse at the write —
+  // per-test scoping of COMFYUI_MCP_PANEL_PENDING kept eroding exactly the way
+  // the issue predicted.
+  assertNotWritingRealHomeInTests(path, "the pending panel-operation record");
   // Rebase reconciliation (#847 + #798). Both branches grew a temp+fsync+rename
   // writer for this file. `writeFileDurable` is the stronger one: it does
   // everything this function used to, and then fsyncs the CONTAINING DIRECTORY so
@@ -1081,7 +1114,7 @@ function readPanelPendingOpsFile(): PendingOpsRead {
   }
   // A zero-byte file is the signature of a torn pre-#798 write (crash between
   // truncate and write). It provably contains NO record — reading it as
-  // "unreadable" would refuse every later update_all / warn on every pin
+  // "unreadable" would refuse every later update-all / warn on every pin
   // forever, with no recovery path, over a file we can read perfectly well.
   // (Non-empty unparseable content stays unreadable: it COULD have held a
   // record, and failing closed there is the whole point.)
@@ -1132,7 +1165,7 @@ function readPanelPendingOpsFile(): PendingOpsRead {
  * exactly what this call wrote, so a concurrent recorder's work is never
  * erased, and it is skipped entirely when the caller passes
  * `keepRecordOnFailure: true` — a call that merely RE-RECORDS an operation
- * already handed to the Manager (the update_all base/uiId enrichment), where
+ * already handed to the Manager (the update-all base/uiId enrichment), where
  * the operation IS pending and the marker must survive a failed enrichment.
  */
 export function recordPanelPendingOp(
@@ -1163,7 +1196,7 @@ export function recordPanelPendingOp(
     // loses nothing — and refusing on it was self-perpetuating (#847): this write
     // is gated behind the check, so the only thing that could replace the bad file
     // was the thing the bad file blocked. Because `recordPanelPendingOp` runs
-    // BEFORE the Manager handoff, that wedged `update_all` permanently, until a
+    // BEFORE the Manager handoff, that wedged `update-all` permanently, until a
     // human deleted the file by hand.
     //
     // The path is named either way. A refusal a user cannot act on from where they

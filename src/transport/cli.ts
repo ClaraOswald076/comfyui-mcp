@@ -10,12 +10,22 @@ export interface CliOptions {
    *  users with no local way to discover the flag that controls it (#860). */
   help: boolean;
   transport: TransportMode;
-  /** --compact / --tool-mode compact / COMFYUI_MCP_TOOL_MODE=compact (DEFAULT,
-   *  #667): register only the list_tools/describe_tool/call_tool meta-tools
-   *  instead of the full ~200-schema surface — the full surface costs a client
-   *  ~200KB (~50k tokens) per tools/list, which harnesses that inject schemas
-   *  into context pay on every read. --full / COMFYUI_MCP_TOOL_MODE=full opts
-   *  back into the classic surface (frontier-model harnesses). */
+  /** --full / --tool-mode full / COMFYUI_MCP_TOOL_MODE=full (DEFAULT since
+   *  0.50.0): register the direct tool surface.
+   *
+   *  Compact was the default from #667 only because the surface was too big to
+   *  ship: ~200 schemas cost a client ~200KB (~50k tokens) on every tools/list,
+   *  which harnesses that inject schemas into context pay on every read. The
+   *  0.50.0 consolidation folded 154 names into 37 action-parameterized tools,
+   *  so the same read is now roughly a fifth of that — a reasonable default for
+   *  a frontier harness, and the owner's stated goal ("get the tool count down,
+   *  then make --compact the optional one").
+   *
+   *  --compact / COMFYUI_MCP_TOOL_MODE=compact opts INTO the three
+   *  list_tools/describe_tool/call_tool meta-tools, which is still the right
+   *  choice for small local models (#97) — and remains the DEFAULT on the two
+   *  lanes that serve them, deliberately diverging from this one. See
+   *  resolveHttpLaneComfyToolMode and comfyuiSpawnEnv. */
   toolMode: ToolMode;
   host: string;
   port: number;
@@ -75,7 +85,10 @@ export function parseCliArgs(
 
   let help = false;
   let transport: TransportMode = env.MCP_TRANSPORT === "http" ? "http" : "stdio";
-  let toolMode: ToolMode = env.COMFYUI_MCP_TOOL_MODE === "full" ? "full" : "compact";
+  // 0.50.0 flip: full is the default, compact is the opt-in. Only the exact
+  // string "compact" selects it, so a typo'd value falls back to the default
+  // exactly as a typo'd value used to fall back to compact.
+  let toolMode: ToolMode = env.COMFYUI_MCP_TOOL_MODE === "compact" ? "compact" : "full";
   let host = env.MCP_HOST ?? DEFAULT_HOST;
   let port = env.MCP_PORT ? Number(env.MCP_PORT) : DEFAULT_PORT;
   let panelOrchestrator =
@@ -150,7 +163,10 @@ export function parseCliArgs(
       toolModeExplicit = true;
     } else if (a === "--tool-mode" || a.startsWith("--tool-mode=")) {
       const [v, ni] = valueOf(a, "--tool-mode", i);
-      toolMode = v === "full" ? "full" : "compact";
+      // Inverted with the 0.50.0 default: only the exact string "compact"
+      // selects compact, so `--tool-mode bogus` falls back to the default, which
+      // is what it always did — the default just changed under it.
+      toolMode = v === "compact" ? "compact" : "full";
       toolModeExplicit = true;
       i = ni;
     } else if (a === "setup") {
@@ -204,8 +220,18 @@ export function parseCliArgs(
  * comfyuiSpawnEnv for the Ollama family) — a bare --full/--compact flag
  * otherwise never reaches them, so `--full --panel-orchestrator` silently ran
  * compact downstream. A DEFAULTED mode is deliberately NOT exported: unset env
- * is how children tell "user chose nothing" from "user chose compact", and
- * unset resolves to the documented compact default on its own.
+ * is how children tell "user chose nothing" from "user chose compact".
+ *
+ * The 0.50.0 flip changed what unset MEANS, and the distinction now carries
+ * real weight rather than being a tidiness argument. Before, unset resolved to
+ * compact everywhere, so exporting or not exporting a defaulted mode was
+ * unobservable. Now the top-level default is FULL while both child lanes still
+ * default to COMPACT on purpose — the HTTP lane shares its tool budget with ~91
+ * `panel_*` tools, and the Ollama lane feeds a small local model's 16k context
+ * (#97). Not exporting a defaulted mode is what lets those lanes keep their own
+ * default; exporting it would silently push the full surface into exactly the
+ * two places compact exists to protect. An EXPLICIT --full still reaches them,
+ * which is the documented way to opt a child lane in.
  */
 export function exportExplicitToolMode(
   cli: Pick<CliOptions, "toolMode" | "toolModeExplicit">,

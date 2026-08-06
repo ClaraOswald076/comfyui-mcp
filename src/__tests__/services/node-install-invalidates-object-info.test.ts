@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Regression for #444: after a custom-node install completes, the orchestrator's
 // memoized /object_info snapshot must be invalidated so the NEXT validation
-// (validate_workflow / diagnose_run) recomputes `missing_node_types` against the
+// (create_workflow (action:"validate") / get_history (action:"diagnose"))
+// recomputes `missing_node_types` against the
 // live registry instead of serving the pre-install snapshot that still lists the
 // just-installed type as missing. This drives the REAL installCustomNode +
 // validateWorkflow code paths (only the network boundaries are stubbed).

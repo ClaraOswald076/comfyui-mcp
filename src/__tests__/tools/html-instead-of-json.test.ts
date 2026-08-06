@@ -34,7 +34,7 @@ vi.mock("../../services/api-nodes.js", async (importOriginal) => {
 });
 
 import { registerSkillsAccessTools } from "../../tools/skills-access.js";
-import { registerTemplateSchemaTools } from "../../tools/template-schema.js";
+import { registerWorkflowExecuteTools } from "../../tools/workflow-execute.js";
 import { NonJsonResponseError, classifyNonJson } from "../../comfyui/json-guard.js";
 
 type ToolResult = { content: Array<{ type: string; text: string }>; isError?: boolean };
@@ -219,12 +219,13 @@ describe('list_packs action:"check_runtime" must not call an answering server un
   });
 });
 
-describe("get_template_schema must not call an answering server unreachable (#828)", () => {
+describe('enqueue_workflow (action:"template_schema") must not call an answering server unreachable (#828)', () => {
   it("names the HTML page instead of reporting the ComfyUI server unreachable", async () => {
     // `.json()` on an HTML body threw into a catch that reported the server
     // UNREACHABLE — for a server that plainly answered.
     global.fetch = vi.fn(async () => htmlResponse(200)) as unknown as typeof fetch;
-    const out = await getHandler("get_template_schema", registerTemplateSchemaTools)({
+    const out = await getHandler("enqueue_workflow", registerWorkflowExecuteTools)({
+      action: "template_schema",
       template: "some-template",
     });
     const text = out.content[0].text;
@@ -239,7 +240,8 @@ describe("get_template_schema must not call an answering server unreachable (#82
     // read as "there is no template by that name" — a confident wrong verdict
     // about the template, from a response that said nothing about templates.
     global.fetch = vi.fn(async () => htmlResponse(502)) as unknown as typeof fetch;
-    const out = await getHandler("get_template_schema", registerTemplateSchemaTools)({
+    const out = await getHandler("enqueue_workflow", registerWorkflowExecuteTools)({
+      action: "template_schema",
       template: "some-template",
     });
     const text = out.content[0].text;
@@ -256,7 +258,8 @@ describe("get_template_schema must not call an answering server unreachable (#82
           headers: { "content-type": "application/json" },
         }),
     ) as unknown as typeof fetch;
-    const out = await getHandler("get_template_schema", registerTemplateSchemaTools)({
+    const out = await getHandler("enqueue_workflow", registerWorkflowExecuteTools)({
+      action: "template_schema",
       template: "some-template",
     });
     const error = String(JSON.parse(out.content[0].text).error);
@@ -274,7 +277,8 @@ describe("get_template_schema must not call an answering server unreachable (#82
           headers: { "content-type": "application/json" },
         }),
     ) as unknown as typeof fetch;
-    const out = await getHandler("get_template_schema", registerTemplateSchemaTools)({
+    const out = await getHandler("enqueue_workflow", registerWorkflowExecuteTools)({
+      action: "template_schema",
       template: "some-template",
     });
     expect(out.content[0].text).toMatch(/No custom-node-contributed workflow template named/);
@@ -284,7 +288,8 @@ describe("get_template_schema must not call an answering server unreachable (#82
     global.fetch = vi.fn(async () => {
       throw new Error("fetch failed");
     }) as unknown as typeof fetch;
-    const out = await getHandler("get_template_schema", registerTemplateSchemaTools)({
+    const out = await getHandler("enqueue_workflow", registerWorkflowExecuteTools)({
+      action: "template_schema",
       template: "some-template",
     });
     expect(out.content[0].text).toMatch(/server is unreachable/i);

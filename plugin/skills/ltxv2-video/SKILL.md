@@ -222,13 +222,13 @@ Connect the optional `latent` input for latent-aware shift scaling.
 > **Feeding a prior stage's output into I2V (e.g. Krea2 image → LTX video).** The
 > `LoadImage` that feeds `LTXVImgToVideo.image` needs the source frame registered
 > as a ComfyUI INPUT. When that frame is an OUTPUT from an earlier stage, call
-> **`stage_output_as_input`** with its `{ filename, subfolder?, type? }` and drop
+> **`upload_image (action:"stage")`** with its `{ filename, subfolder?, type? }` and drop
 > the returned input filename into `LoadImage`. (For a file already on local
-> disk, `upload_image`.) **NEVER copy the output file into, or guess, a
+> disk, `upload_image (action:"image")`.) **NEVER copy the output file into, or guess, a
 > filesystem `input/` path** — ComfyUI's input/output dirs may be CUSTOM
 > (`--input-directory` / `--output-directory`), so a guessed path makes
 > `LoadImage` reject the file (`Invalid image file`) and wastes the render.
-> `stage_output_as_input` goes through the server API (`/view` → `/upload/image`)
+> `upload_image (action:"stage")` goes through the server API (`/view` → `/upload/image`)
 > and resolves the real dirs correctly.
 
 > **VERIFY A VIDEO RENDER VIA THE FILESYSTEM, NOT /history.** `VHS_VideoCombine`
@@ -236,9 +236,9 @@ Connect the optional `latent` input for latent-aware shift scaling.
 > output in ComfyUI's `/history` — the prompt shows done with an empty outputs map
 > and no error. Do **NOT** conclude the render "silently dropped" from
 > `get_history` / `queue` (action:"status") alone. Confirm the file with
-> **`list_output_images`** (it now lists videos too, with `kind: "video"`) — match
+> **`get_image (action:"list_outputs")`** (it now lists videos too, with `kind: "video"`) — match
 > the `filename_prefix` (e.g. `ltxv2_…​.mp4`) and check the mtime is fresh — then
-> chain it into the next stage with `stage_output_as_input`.
+> chain it into the next stage with `upload_image (action:"stage")`.
 
 ### LTXVImgToVideo (For I2V)
 
