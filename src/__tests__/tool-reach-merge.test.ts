@@ -17,7 +17,7 @@
  */
 import { describe, expect, it } from "vitest";
 // @ts-expect-error — plain-JS benchmark module, deliberately untyped
-import { mergeEpisodes, missingCoverage } from "../../scripts/tool-reach-merge.mjs";
+import { episodeFingerprint, mergeEpisodes, missingCoverage } from "../../scripts/tool-reach-merge.mjs";
 
 const ep = (model: string, requestId: string, tag = "") => ({ model, requestId, tag });
 
@@ -52,6 +52,103 @@ describe("mergeEpisodes", () => {
   it("is a no-op on an empty fresh set", () => {
     const prior = [ep("a", "gen-01")];
     expect(mergeEpisodes(prior, [])).toEqual(prior);
+  });
+});
+
+describe("comparability fingerprints", () => {
+  const cfg = {
+    systemPrompt: "S",
+    reachWindow: 3,
+    toolResultCap: 200_000,
+    maxRounds: 8,
+    mode: "compact",
+    adapter: "ollama",
+    numCtx: 16384,
+    think: false,
+  };
+  const req = { id: "h6-02", task: "build me the real thing", target: "mermaid_to_workflow" };
+
+  it("changes when the request text changes", () => {
+    const a = episodeFingerprint(req, cfg);
+    const b = episodeFingerprint({ ...req, task: "build it from my sketch" }, cfg);
+    expect(a).not.toBe(b);
+  });
+
+  it("changes when a run condition the model can perceive changes", () => {
+    const a = episodeFingerprint(req, cfg);
+    // The exact change that broke comparability in practice: results were
+    // truncated at 12,000 characters, and the compact manifest is ~18,000.
+    expect(episodeFingerprint(req, { ...cfg, toolResultCap: 12_000 })).not.toBe(a);
+    expect(episodeFingerprint(req, { ...cfg, systemPrompt: "S2" })).not.toBe(a);
+    expect(episodeFingerprint(req, { ...cfg, think: true })).not.toBe(a);
+    expect(episodeFingerprint(req, { ...cfg, numCtx: 65536 })).not.toBe(a);
+  });
+
+  it("changes when the SCORING of the request changes, not just its wording", () => {
+    // Tightening an accept set changes what the row means even though the model
+    // saw the identical prompt.
+    const a = episodeFingerprint({ ...req, accept: ["create_workflow"] }, cfg);
+    expect(episodeFingerprint({ ...req, accept: [] }, cfg)).not.toBe(a);
+  });
+
+  it("is stable across runs with identical conditions", () => {
+    expect(episodeFingerprint(req, cfg)).toBe(episodeFingerprint({ ...req }, { ...cfg }));
+  });
+
+  it("does NOT change for a hosted adapter when a local-only setting changes", () => {
+    // Otherwise a tweak to the Ollama context window would invalidate — and
+    // force a costly re-run of — Claude episodes that cannot see it.
+    const hosted = { ...cfg, adapter: "claude", numCtx: null, think: null };
+    expect(episodeFingerprint(req, hosted)).toBe(
+      episodeFingerprint(req, { ...hosted, numCtx: null, think: null }),
+    );
+  });
+});
+
+describe("mergeEpisodes comparability", () => {
+  const fp = (s: string) => s;
+  const row = (model: string, requestId: string, fingerprint: string, tag = "") => ({
+    model,
+    requestId,
+    fingerprint,
+    tag,
+  });
+  const expected = new Map([
+    ["a|gen-01", fp("F1")],
+    ["a|h6-02", fp("F2")],
+  ]);
+
+  it("drops a saved row measured under conditions that no longer hold", () => {
+    // h6-02's wording changed, so its saved row is stale — it must vanish and
+    // reappear as missing coverage, never be averaged in as if comparable.
+    const out = mergeEpisodes(
+      [row("a", "gen-01", "F1", "keep"), row("a", "h6-02", "OLD", "stale")],
+      [],
+      expected,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0].requestId).toBe("gen-01");
+  });
+
+  it("drops a saved row with NO fingerprint — 'cannot tell' must mean re-run", () => {
+    const out = mergeEpisodes([{ model: "a", requestId: "gen-01" }], [], expected);
+    expect(out).toEqual([]);
+  });
+
+  it("keeps rows for a model or request the current run knows nothing about", () => {
+    // Another model's data, and a request id since removed, are out of scope —
+    // not stale. Deleting them would be destroying somebody else's results.
+    const out = mergeEpisodes(
+      [row("z", "gen-01", "whatever"), row("a", "since-removed", "whatever")],
+      [],
+      expected,
+    );
+    expect(out).toHaveLength(2);
+  });
+
+  it("skips the check entirely when no expectation is supplied", () => {
+    const out = mergeEpisodes([{ model: "a", requestId: "gen-01" }], []);
+    expect(out).toHaveLength(1);
   });
 });
 

@@ -45,7 +45,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { REQUESTS } from "./tool-reach-requests.mjs";
 import { REACH_WINDOW } from "./tool-reach-score.mjs";
 import { createDispatcher } from "./tool-reach-dispatch.mjs";
-import { mergeEpisodes } from "./tool-reach-merge.mjs";
+import { episodeFingerprint, mergeEpisodes } from "./tool-reach-merge.mjs";
 
 // ───────────────────────────────────────────────────────── argv
 const argv = process.argv.slice(2);
@@ -166,6 +166,10 @@ interface Episode {
   error: string | null;
   /** Claude-only: built-ins it tried to use despite CLAUDE_BUILTINS. */
   deniedBuiltins?: string[];
+  /** Digest of the request text and run conditions this episode was measured
+   *  under. A saved row whose fingerprint no longer matches is not comparable
+   *  and is dropped by the merge rather than averaged in. */
+  fingerprint?: string;
   /** Tool results that hit TOOL_RESULT_CAP — a catalog the model could not
    *  finish reading is a measurement artefact, so it must be visible. */
   truncatedResults?: number;
@@ -255,6 +259,24 @@ function ollamaNumCtx(): number {
   return Number(process.env.REACH_NUM_CTX ?? target);
 }
 
+/**
+ * Extended reasoning, off by default for local models.
+ *
+ * qwen3 emits a long `<think>` block before every tool call, which costs ~40s an
+ * episode and makes the local field infeasible: four model×arm cells become one.
+ * What is being measured is the FIRST substantive call — which tool a model
+ * reaches for when it reads a surface — and a reasoning trace before that call
+ * is not the thing the flat/compact/consolidated distinction is about. Turning
+ * it off also makes the local field internally comparable: llama3.1 and gemma
+ * have no thinking mode at all, so leaving it on for qwen3 alone would compare
+ * two different configurations and call it a model difference.
+ *
+ * REACH_THINK=1 restores it. Either way the choice is RECORDED in the results,
+ * because a small-model number read without knowing which mode produced it is a
+ * number that means something else.
+ */
+const OLLAMA_THINK = process.env.REACH_THINK === "1";
+
 async function chatOllama(model: string, messages: unknown[]): Promise<any> {
   const host = process.env.OLLAMA_HOST ?? "http://127.0.0.1:11434";
   const res = await fetch(`${host}/api/chat`, {
@@ -265,6 +287,7 @@ async function chatOllama(model: string, messages: unknown[]): Promise<any> {
       messages,
       tools: chatTools(),
       stream: false,
+      think: OLLAMA_THINK,
       options: { num_ctx: ollamaNumCtx(), temperature: 0 },
     }),
   });
@@ -284,7 +307,11 @@ async function chatOllama(model: string, messages: unknown[]): Promise<any> {
  */
 function redact(text: string, ...secrets: string[]): string {
   let out = text;
-  for (const s of secrets) if (s && s.length >= 8) out = out.split(s).join("<redacted>");
+  // No length floor. A floor is an invitation to reason about which keys are
+  // "long enough to matter", and a short bearer token from a local
+  // OpenAI-compatible provider is still a secret. If a pathologically short key
+  // mangles the diagnostic text, that is the safe direction to fail.
+  for (const s of secrets) if (s) out = out.split(s).join("<redacted>");
   return out;
 }
 
@@ -733,6 +760,44 @@ if (!ready.length) {
 mkdirSync(dirname(OUT), { recursive: true });
 
 /**
+ * The conditions an episode was measured under, as seen by one adapter kind.
+ *
+ * Kept adapter-aware so that changing the Ollama context window does not
+ * invalidate the (far more expensive) Claude episodes, which cannot see it.
+ */
+function runConfig(adapter: "ollama" | "openai" | "claude") {
+  return {
+    systemPrompt: SYSTEM,
+    reachWindow: REACH_WINDOW,
+    toolResultCap: TOOL_RESULT_CAP,
+    maxRounds: MAX_ROUNDS,
+    mode: MODE,
+    adapter,
+    numCtx: adapter === "ollama" ? ollamaNumCtx() : null,
+    think: adapter === "ollama" ? OLLAMA_THINK : null,
+  };
+}
+
+/**
+ * requestId → the fingerprint the CURRENT setup would produce, for every
+ * adapter in the field. A saved episode whose fingerprint is not the one its
+ * adapter would produce today was measured under conditions that no longer hold
+ * and must be re-run rather than averaged in.
+ *
+ * Keyed by request id only, so it is computed per adapter and unioned: an id
+ * maps to the fingerprint for the adapter of the episode being judged.
+ */
+function expectedFingerprints(): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const spec of ready) {
+    for (const r of REQUESTS) {
+      out.set(`${spec.label}|${r.id}`, episodeFingerprint(r, runConfig(spec.kind)));
+    }
+  }
+  return out;
+}
+
+/**
  * Write the results, merging with any prior run of the SAME arm.
  *
  * Merging lets the field be run one model at a time — the local models are
@@ -758,7 +823,7 @@ function writeResults(done: Episode[]): void {
       console.error(`[reach] ignoring unreadable ${OUT}`);
     }
   }
-  const merged = mergeEpisodes(prior.episodes ?? [], done);
+  const merged = mergeEpisodes(prior.episodes ?? [], done, expectedFingerprints());
   const mergedModels = [...new Set([...(prior.modelsRun ?? []), ...ready.map((r) => r.label)])];
   const ranAnything = new Set(ready.map((r) => r.label));
   writeFileSync(
@@ -777,6 +842,7 @@ function writeResults(done: Episode[]): void {
         reachWindow: REACH_WINDOW,
         systemPrompt: SYSTEM,
         toolResultCap: TOOL_RESULT_CAP,
+        ollamaThink: ready.some((r) => r.kind === "ollama") ? OLLAMA_THINK : null,
         claudeVisibleTools: claudeSurfaceProbe,
         requestIds: requests.map((r) => r.id),
         modelsRun: mergedModels,
@@ -806,6 +872,9 @@ for (const spec of ready) {
       spec.kind === "claude"
         ? await runClaudeEpisode(spec.model, request, spec.label)
         : await runChatEpisode(spec as never, request, spec.label);
+    // Stamp the conditions this episode was measured under, so a later partial
+    // re-run can tell a reusable row from a stale one.
+    ep.fingerprint = episodeFingerprint(request, runConfig(spec.kind));
     episodes.push(ep);
     // Checkpoint. A 100-episode arm is 30-60 minutes of real model time; losing
     // all of it to a hang on episode 97 is a bad trade for one write per

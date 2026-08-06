@@ -31,11 +31,20 @@ const CATALOG = Object.keys(FOLD_MAP as Record<string, unknown>);
 
 const newEpisode = () => ({ substantive: [], navigation: 0, navBeforeFirst: 0 });
 
-/** A `navigate` that fails the test the moment it is asked to run anything that
- *  is not one of the two permitted catalog reads. */
+/**
+ * A `navigate` that fails the test the moment it is asked to run anything that
+ * is not a catalog read.
+ *
+ * The permitted names are spelled LITERALLY here, not imported from the module
+ * under test. Importing `NAVIGATION_TOOLS` made the guard expand in lockstep
+ * with the allowlist: adding `restart_comfyui` to it would have widened what
+ * this suite considers acceptable and left the whole file green. A guard that
+ * agrees with the thing it guards is not a guard.
+ */
+const ALLOWED_LITERAL = ["list_tools", "describe_tool"];
 function guardedNavigate() {
   return vi.fn(async (tool: string) => {
-    if (!NAVIGATION_TOOLS.includes(tool)) {
+    if (!ALLOWED_LITERAL.includes(tool)) {
       throw new Error(`EXECUTION ESCAPED THE STUB: navigate("${tool}")`);
     }
     return `catalog text for ${tool}`;
@@ -89,6 +98,15 @@ describe("flat arm — no wire to anything", () => {
     await dispatch(ep, "list_tools", {});
     expect(ep.substantive).toEqual([{ tool: "list_tools", action: null }]);
     expect(ep.navigation).toBe(0);
+  });
+});
+
+describe("the allowlist itself", () => {
+  it("is exactly the two catalog reads, and nothing has been added to it", () => {
+    // Pinned against the literal set the tests guard on. If a future change
+    // widens NAVIGATION_TOOLS, this fails HERE with a clear reason rather than
+    // silently widening every other assertion in the file.
+    expect([...NAVIGATION_TOOLS]).toEqual(ALLOWED_LITERAL);
   });
 });
 
@@ -164,6 +182,25 @@ describe("compact arm — the allowlist is exactly two names", () => {
     await dispatch(ep, "call_tool", { name: "list_tools", args: {} });
     expect(navigate).not.toHaveBeenCalled();
     expect(ep.substantive).toEqual([{ tool: "list_tools", action: null }]);
+  });
+
+  it("executes NONE of the destructive names when routed through call_tool", async () => {
+    // The raw-call test above covered four spellings; this covers the whole
+    // destructive list on the compact path, because the interesting case is
+    // always the name nobody thought to enumerate.
+    const navigate = guardedNavigate();
+    const dispatch = createDispatcher({
+      mode: "compact",
+      catalogNames: CATALOG,
+      reachWindow: 9999,
+      navigate,
+    });
+    const ep = newEpisode();
+    for (const name of DESTRUCTIVE) {
+      await dispatch(ep, "call_tool", { name, args: { confirm: true, force: true } });
+    }
+    expect(navigate).not.toHaveBeenCalled();
+    expect(ep.substantive.map((r: { tool: string }) => r.tool)).toEqual(DESTRUCTIVE);
   });
 
   it("rejects an unknown meta-tool without executing it", async () => {
