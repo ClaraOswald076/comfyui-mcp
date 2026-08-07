@@ -8,14 +8,22 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { open, readFile } from "node:fs/promises";
 import { errorToToolResult } from "../utils/errors.js";
-import { isRemoteMode } from "../config.js";
+import { getComfyUIBaseUrl, isRemoteMode } from "../config.js";
+import { comfyuiFetch } from "../comfyui/fetch.js";
 import { resolveExistingModelFile } from "../services/model-resolver.js";
 
+/**
+ * The connected ComfyUI's base URL.
+ *
+ * This used to re-derive the address from raw env (`COMFYUI_URL` / `COMFYUI_PORT`,
+ * else loopback:8188), which silently disagreed with the resolver every other
+ * caller uses on three counts: it ignored the configured PROTOCOL (an https
+ * ComfyUI got http), the config-resolved HOST, and the BASE PATH that a
+ * reverse-proxied install needs (`/comfyapi`). So model_metadata pointed at the
+ * wrong address on exactly the deployments #952 and #954 were about.
+ */
 function comfyBase(): string {
-  return (
-    process.env.COMFYUI_URL ||
-    (process.env.COMFYUI_PORT ? `http://127.0.0.1:${process.env.COMFYUI_PORT}` : "http://127.0.0.1:8188")
-  ).replace(/\/$/, "");
+  return getComfyUIBaseUrl().replace(/\/$/, "");
 }
 
 const okText = (value: unknown) => ({
@@ -54,7 +62,11 @@ export async function fetchCivitaiVersionDirect(
   versionId: number,
 ): Promise<Record<string, unknown> | null> {
   try {
-    const res = await fetch(`https://civitai.com/api/v1/model-versions/${versionId}`);
+    const res = await fetch(`https://civitai.com/api/v1/model-versions/${versionId}`, {
+      // CivitAI is a third party: bound the wait so a stalled response cannot
+      // wedge the turn (same class as #1026).
+      signal: AbortSignal.timeout(15_000),
+    });
     if (!res || !res.ok) return null;
     const v = (await res.json()) as any;
     const modelId = v?.modelId ?? null;
@@ -342,7 +354,7 @@ export function registerModelExplorerTools(server: McpServer): void {
             const { category, name } = requireCategoryName("read");
             const COMFY = comfyBase();
             const q = `category=${encodeURIComponent(category)}&name=${encodeURIComponent(name)}`;
-            const dr = await fetch(`${COMFY}/model_explorer/detail?${q}`);
+            const dr = await comfyuiFetch(`${COMFY}/model_explorer/detail?${q}`);
             if (!dr.ok) {
               const body = await readBodyText(dr);
               // #363: make an absent optional route a structured unavailable
@@ -368,7 +380,7 @@ export function registerModelExplorerTools(server: McpServer): void {
             const detail = (await dr.json()) as any;
             let tags = null;
             try {
-              const tr = await fetch(`${COMFY}/model_explorer/suggest_triggers?${q}`);
+              const tr = await comfyuiFetch(`${COMFY}/model_explorer/suggest_triggers?${q}`);
               if (tr.ok) tags = ((await tr.json()) as any).candidates;
             } catch { /* optional */ }
             return okText({
@@ -390,7 +402,7 @@ export function registerModelExplorerTools(server: McpServer): void {
               );
             }
             const COMFY = comfyBase();
-            const r = await fetch(`${COMFY}/model_explorer/proposal`, {
+            const r = await comfyuiFetch(`${COMFY}/model_explorer/proposal`, {
               method: "POST",
               headers: { "content-type": "application/json" },
               body: JSON.stringify({ category, name, fields: args.fields, note: args.note }),
@@ -413,7 +425,7 @@ export function registerModelExplorerTools(server: McpServer): void {
             const q =
               `category=${encodeURIComponent(category)}&name=${encodeURIComponent(name)}` +
               (hasVersionId ? `&version_id=${args.version_id}` : "");
-            const r = await fetch(`${COMFY}/model_explorer/civitai?${q}`);
+            const r = await comfyuiFetch(`${COMFY}/model_explorer/civitai?${q}`);
             if (r.ok) return okText(await r.json());
             const body = await readBodyText(r);
             // #541: the node route is unavailable. Degrade instead of hard-failing.

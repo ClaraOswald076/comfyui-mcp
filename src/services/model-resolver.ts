@@ -221,7 +221,10 @@ export async function searchHuggingFaceModels(
   const url = applyHfEndpoint(`https://huggingface.co/api/models?${params}`);
   logger.debug("HuggingFace API request", { url });
 
-  const res = await fetch(url, { headers });
+  // Third-party API: bound the wait so a stalled response cannot wedge the
+  // turn. Same class as #1026 — an unbounded metadata call has no limit at
+  // all and hangs until the caller gives up.
+  const res = await fetch(url, { headers, signal: AbortSignal.timeout(20_000) });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new ModelError(

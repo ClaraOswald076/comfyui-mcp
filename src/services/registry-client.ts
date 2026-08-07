@@ -49,7 +49,10 @@ async function registryFetch<T>(path: string): Promise<T> {
   const url = `${REGISTRY_BASE}${path}`;
   logger.debug("Registry API request", { url });
 
-  const res = await fetch(url);
+  // Third-party API: bound the wait so a stalled response cannot wedge the
+  // turn. Same class as #1026 — an unbounded metadata call has no limit at
+  // all and hangs until the caller gives up.
+  const res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new RegistryError(
