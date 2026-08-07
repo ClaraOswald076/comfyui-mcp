@@ -6518,7 +6518,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_run",
-      "Queue the workflow the user has OPEN — exactly like them pressing Queue Prompt (current widget values, the live graph they can see). On success it confirms the run was queued; if ComfyUI REFUSES the prompt (validation failure on either channel — per-node node_errors OR a top-level error like a missing node type) it returns a FAILURE with that rejection detail, never a false 'queued'. Pass to_node_id to RUN ONLY ONE BRANCH ('run to node'): ComfyUI renders just that output node plus everything upstream of it and SKIPS every other output branch — handy for previewing or debugging part of a big graph without rendering the whole thing. to_node_id MUST be an OUTPUT node (SaveImage, PreviewImage, SaveVideo, …) — pick the one at the END of the branch you want; nodes are tagged is_output:true in panel_query_graph's detail rows. The output node may be NESTED inside a subgraph — just pass its id (resolved in the scope you're currently viewing, then anywhere in the workflow); the tool builds the nested execution path for you. Omit it to run the whole graph. Use this so the render runs on THEIR canvas and they see the result.",
+      "Queue the workflow the user has OPEN — exactly like them pressing Queue Prompt (current widget values, the live graph they can see). On success it confirms the run was queued; if ComfyUI REFUSES the prompt (validation failure on either channel — per-node node_errors OR a top-level error like a missing node type) it returns a FAILURE with that rejection detail, never a false 'queued'. Pass to_node_id to RUN ONLY ONE BRANCH ('run to node'): ComfyUI renders just that output node plus everything upstream of it and SKIPS every other output branch — handy for previewing or debugging part of a big graph without rendering the whole thing. to_node_id MUST be an OUTPUT node (SaveImage, PreviewImage, SaveVideo, …) — pick the one at the END of the branch you want; nodes are tagged is_output:true in panel_query_graph's detail rows. The output node may be NESTED inside a subgraph — just pass its id (resolved in the scope you're currently viewing, then anywhere in the workflow); the tool builds the nested execution path for you. Omit it to run the whole graph. DUPLICATE FENCE (#862): if a render this session cannot account for is already in flight (after a reconnect this is usually YOUR earlier render still running — the queue record does not survive a restart), the run is REFUSED before anything is queued and the in-flight prompt is named; inspect queue (action:'list') first, or pass allow_duplicate:true only to deliberately stack behind it. Use this so the render runs on THEIR canvas and they see the result.",
       {
         batch_count: z
           .number()
@@ -6534,12 +6534,67 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .describe(
             "Output node id to render UP TO (partial execution). Omit to run the whole graph. Must be an OUTPUT node — one with is_output:true in panel_query_graph's detail rows. May be nested inside a subgraph (pass the node's own id).",
           ),
+        allow_duplicate: z
+          .boolean()
+          .optional()
+          .describe(
+            "Queue even when a render this session cannot account for is already in flight (default false). When work is in flight that this session has no record of queueing — e.g. YOUR OWN earlier render still running after a reconnect, whose record does not survive the restart — panel_run REFUSES to stack a duplicate and names the in-flight prompt instead. Pass true only to deliberately queue behind it (a sweep/batch).",
+          ),
       },
       async (args: A, ctx) => {
         // BACKPRESSURE: the agent can't see ComfyUI's queue, so re-queuing while a
         // render is already running silently stacks behind it (this is how a stuck
         // job once let three more pile up). Snapshot the watchdog BEFORE we queue.
         const pre = QueueMonitor.snapshot();
+        // #862 — the fence fires BEFORE the queue call, not after. After a
+        // reconnect the resumed agent has no running-state signal, and the old
+        // order queued first and only THEN appended the "[QUEUE] already running"
+        // note — a duplicate the agent then had to find and cancel. When in-flight
+        // work is not PROVABLY this session's own, refuse to enqueue: name what
+        // is in flight and require an explicit allow_duplicate to stack behind
+        // it. "Not provably ours" is the honest phrasing, not "foreign": the
+        // self-queue ledger is in-memory and prompt-id-based, so after an
+        // orchestrator restart — or whenever the panel's queue reply carried no
+        // prompt id — the agent's OWN earlier render reads as unproven, which is
+        // exactly the duplicate this fence exists to stop. The fence therefore
+        // keys on selfAttributedProven, the strict id-matched form; the coarse
+        // recent-self-queue fallback that softens the #559 backlog warning would
+        // also wave an unrelated render through (codex gate). The deliberate cost:
+        // a fast self-queued burst whose ids the 1 Hz poll has not captured yet
+        // is refused too, with the override named — a false refusal with an
+        // actionable remedy, never a silent duplicate. A provably self-attributed
+        // in-flight batch (a sweep whose ids are recorded and accounted for)
+        // still queues, exactly as before; an unconnected watchdog proves nothing
+        // either way, so the call proceeds and the post-queue note remains the
+        // disclosure of last resort (and the TOCTOU net: work can start between
+        // this snapshot and the dispatch). This composes with #694's retry_of
+        // rather than duplicating it: that token dedupes an EXPLICIT retry of an
+        // outcome-unknown dispatch at the panel; this fence stops a BLIND
+        // re-issue before any dispatch.
+        if (
+          args.allow_duplicate !== true &&
+          pre.connected &&
+          (pre.running || pre.queueDepth > 0) &&
+          !pre.selfAttributedProven
+        ) {
+          const pending = Math.max(0, pre.queueDepth - (pre.running ? 1 : 0));
+          const pendingTxt = pending > 0 ? ` + ${pending} pending` : "";
+          return fail(
+            `panel_run refused to queue: a render is already in flight on ComfyUI` +
+              (pre.runningPromptId
+                ? ` (running prompt ${pre.runningPromptId}${pre.currentNode ? `, currently at node ${pre.currentNode}` : ""}${pendingTxt})`
+                : ` (${pre.queueDepth} job(s) in the queue)`) +
+              `, and this session cannot confirm it as its own — the queue record is in-memory and ` +
+              `prompt-id-based, so after a reconnect/restart (or when an earlier queue reply carried ` +
+              `no prompt id) even YOUR OWN earlier render reads as unconfirmable, and queueing now ` +
+              `would stack a DUPLICATE behind it (#862). Nothing was queued. Inspect with queue ` +
+              `(action:"list"): if the in-flight job is the render you already started, wait for it ` +
+              `and confirm the outcome with get_history instead of re-running it. If you genuinely ` +
+              `intend to stack another render behind it (a deliberate sweep/batch), re-call panel_run ` +
+              `with allow_duplicate:true. If the in-flight job is actually wedged, queue ` +
+              `(action:"cancel") with clear_pending:true interrupts it AND drops everything pending.`,
+          );
+        }
         const runCmd = { cmd: "graph_run", batch_count: args.batch_count, to_node_id: args.to_node_id };
         // #884 — capture the journal tab BEFORE dispatch: this is the tab the
         // bridge is about to route the run to (both read the same active-tab

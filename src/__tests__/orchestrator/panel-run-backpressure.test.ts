@@ -1,9 +1,16 @@
-// panel_run backpressure note (#559) + panel_screenshot DOM-overlay note (#567).
+// panel_run duplicate fence (#862) + backpressure note (#559) + panel_screenshot
+// DOM-overlay note (#567).
 //
+// #862: after a reconnect the resumed agent has no running-state signal, and the
+//       self-queue ledger is in-memory — its own still-running render reads as
+//       unaccounted-for. panel_run must REFUSE to stack a duplicate BEFORE the
+//       queue call (naming the in-flight prompt), not queue first and warn after;
+//       allow_duplicate:true is the explicit override.
 // #559: queuing a batch is normal. A queue made of the agent's OWN recent jobs must
 //       be reported NEUTRALLY, never as a "[QUEUE WARNING] … cancel with
-//       clear_pending:true" that would wipe the whole batch. A job we did NOT queue
-//       still drives a (softened) warning.
+//       clear_pending:true" that would wipe the whole batch. Unaccounted-for work
+//       in flight is now fenced pre-dispatch (#862); the softened post-queue warning
+//       remains as the TOCTOU / explicit-override disclosure.
 // #567: a canvas screenshot cannot show DOM-overlay widget content (MarkdownNote
 //       renders as an empty body). panel_screenshot must FLAG such nodes so the
 //       agent doesn't read the blank body as missing content.
@@ -103,18 +110,141 @@ describe("panel_run backpressure note (#559)", () => {
     expect(qm.selfQueuedIds.has("p-batch-2")).toBe(true);
   });
 
-  it("a job we did NOT queue running ahead → softened warning that leads with inspection", async () => {
+  it("an unaccounted-for job running ahead → REFUSED before dispatch, running prompt named (#862)", async () => {
+    // The reconnect-duplicate case: the self-queue ledger is in-memory, so after
+    // an orchestrator restart the agent's OWN still-running render reads as
+    // unaccounted-for. The fence must fire BEFORE any graph_run goes out.
     qm.state.runningPromptId = "p-foreign";
-    qm.state.queueRemaining = 1; // just the foreign running job
+    qm.state.queueRemaining = 1; // just the unaccounted running job
 
-    const ctx = makeCtx({ queued: true, prompt_id: "p-mine" });
+    let dispatched = 0;
+    const bridge = {
+      send: async () => {
+        dispatched++;
+        return {};
+      },
+      push: () => 1,
+      canReach: () => true,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "test-tab");
+    (ctx as { call: PanelToolCtx["call"] }).call = async () => {
+      dispatched++;
+      return { content: [{ type: "text", text: JSON.stringify({ queued: true, prompt_id: "p-mine" }) }] };
+    };
+
     const res = await defByName("panel_run").handler({}, ctx);
     const text = firstText(res);
 
+    // Nothing was dispatched — the fence fired before the queue call.
+    expect(dispatched).toBe(0);
+    expect(res.isError).toBe(true);
+    expect(text).toContain("refused to queue");
+    expect(text).toContain("p-foreign"); // the running prompt id is returned
+    expect(text).toContain("Nothing was queued");
+    // The reason is stated honestly: CANNOT CONFIRM it as this session's own —
+    // not "you didn't queue it" (the ledger does not survive a restart).
+    expect(text).toContain("cannot confirm it as its own");
+    // Actionable remedies: inspect, deliberate override, wedge escape.
+    expect(text).toContain('queue (action:"list")');
+    expect(text).toContain("allow_duplicate:true");
+    expect(text).toContain("clear_pending:true");
+  });
+
+  it("a RECENT self-queue with no recorded ids does NOT wave a foreign render through (strict attribution, #862 codex gate)", async () => {
+    // The coarse #559 fallback ("we queued SOMETHING in the last 10 minutes")
+    // would call this self-attributed — but the in-flight job's id is visible
+    // and is NOT ours. A fence that refuses dispatches needs the strict warrant.
+    QueueMonitor.markSelfQueued(null); // a queue whose reply carried no prompt_id
+    qm.state.runningPromptId = "p-foreign";
+    qm.state.queueRemaining = 1;
+
+    let dispatched = 0;
+    const ctx = makeCtx({ queued: true, prompt_id: "p-mine" });
+    (ctx as { call: PanelToolCtx["call"] }).call = async () => {
+      dispatched++;
+      return { content: [{ type: "text", text: "{}" }] };
+    };
+
+    const res = await defByName("panel_run").handler({}, ctx);
+    expect(dispatched).toBe(0);
+    expect(res.isError).toBe(true);
+    expect(firstText(res)).toContain("refused to queue");
+  });
+
+  it("an own batch whose depth the poll has NOT fully accounted for is refused — the documented burst tradeoff (#862)", async () => {
+    // We queued two jobs, but the 1 Hz poll has only captured one of them
+    // (queueRemaining is live; pendingPromptIds lags). Not PROVABLY ours → the
+    // fence refuses and names the override, rather than risk a blind duplicate.
+    QueueMonitor.markSelfQueued("p-own-1");
+    QueueMonitor.markSelfQueued("p-own-2");
+    qm.state.runningPromptId = "p-own-1";
+    qm.state.pendingPromptIds = []; // poll hasn't captured p-own-2 yet
+    qm.state.queueRemaining = 2;
+
+    let dispatched = 0;
+    const ctx = makeCtx({ queued: true, prompt_id: "p-own-3" });
+    (ctx as { call: PanelToolCtx["call"] }).call = async () => {
+      dispatched++;
+      return { content: [{ type: "text", text: "{}" }] };
+    };
+
+    const res = await defByName("panel_run").handler({}, ctx);
+    expect(dispatched).toBe(0);
+    expect(res.isError).toBe(true);
+    expect(firstText(res)).toContain("allow_duplicate:true");
+  });
+
+  it("unaccounted-for PENDING-only work (nothing running yet) → also refused (#862)", async () => {
+    qm.state.runningPromptId = null;
+    qm.state.pendingPromptIds = ["p-pending-1", "p-pending-2"];
+    qm.state.queueRemaining = 2;
+
+    let dispatched = 0;
+    const ctx = makeCtx({ queued: true, prompt_id: "p-mine" });
+    (ctx as { call: PanelToolCtx["call"] }).call = async () => {
+      dispatched++;
+      return { content: [{ type: "text", text: "{}" }] };
+    };
+
+    const res = await defByName("panel_run").handler({}, ctx);
+    const text = firstText(res);
+
+    expect(dispatched).toBe(0);
+    expect(res.isError).toBe(true);
+    expect(text).toContain("refused to queue");
+    expect(text).toContain("2 job(s)");
+  });
+
+  it("allow_duplicate:true stacks behind the unaccounted-for job — with the inspection warning after", async () => {
+    qm.state.runningPromptId = "p-foreign";
+    qm.state.queueRemaining = 1;
+
+    const ctx = makeCtx({ queued: true, prompt_id: "p-mine" });
+    const res = await defByName("panel_run").handler({ allow_duplicate: true }, ctx);
+    const text = firstText(res);
+
+    // The explicit override queued — and the post-queue disclosure still names
+    // the work this session didn't queue (now the TOCTOU/override net).
+    expect(res.isError).not.toBe(true);
+    expect(qm.selfQueuedIds.has("p-mine")).toBe(true);
     expect(text).toContain("[QUEUE]");
     expect(text).toContain("didn't queue");
-    expect(text).toContain('queue (action:"list")'); // lead with inspection
+    expect(text).toContain('queue (action:"list")'); // leads with inspection
     expect(text).not.toContain("your own");
+  });
+
+  it("a disconnected watchdog proves nothing → the run proceeds (no fence on unknown state)", async () => {
+    qm.state.connected = false;
+    qm.state.runningPromptId = "p-stale"; // stale last-known state, unverifiable
+    qm.state.queueRemaining = 1;
+
+    const ctx = makeCtx({ queued: true, prompt_id: "p-solo" });
+    const res = await defByName("panel_run").handler({}, ctx);
+    const text = firstText(res);
+
+    expect(res.isError).not.toBe(true);
+    expect(qm.selfQueuedIds.has("p-solo")).toBe(true);
+    expect(text).toContain("notified automatically");
   });
 
   it("nothing running → no backpressure note at all", async () => {
