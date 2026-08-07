@@ -118,8 +118,18 @@ export function sliceWorkflow(
 
   const seeds = allNodes.filter((n) => SINK_TYPES.has(n.type) && wantNode(n)).map((n) => n.id);
   if (!seeds.length) {
+    // #690(4) — the old message named only what was searched FOR, never what was
+    // there, so six different substrings produced six identical dead ends and the
+    // caller had no way to converge except guessing. Everything needed to explain
+    // the miss is already in hand here.
     throw new Error(
-      `No output node (SaveImage / VHS_VideoCombine / …) found in groups matching: ${groupSubstrings.join(", ")}`,
+      describeSliceMiss({
+        groupSubstrings,
+        groupTitles: groups.map((gr) => gr.title ?? ""),
+        sinks: allNodes
+          .filter((n) => SINK_TYPES.has(n.type))
+          .map((n) => ({ id: n.id, type: n.type, group: groupOf(n) })),
+      }),
     );
   }
   const keep = closure(seeds);
@@ -163,4 +173,75 @@ export function sliceWorkflow(
     workflow: newWf,
     stats: { nodes: newNodes.length, unbypassed, links: newLinks.length, subgraphs: keptDefs.length, seeds: seeds.length, badLinks, orphanGets },
   };
+}
+
+/** Cap the enumerations so a 200-group workflow cannot turn one refusal into a wall
+ *  of text. The counts are always exact, so a truncated list still says how much it
+ *  is hiding rather than quietly implying that is all there is. */
+const SLICE_MISS_LIST_CAP = 25;
+
+function capped(items: string[], cap = SLICE_MISS_LIST_CAP): string {
+  if (!items.length) return "(none)";
+  if (items.length <= cap) return items.join(", ");
+  return `${items.slice(0, cap).join(", ")} … and ${items.length - cap} more`;
+}
+
+/**
+ * #690(4) — explain a slice that matched no output node.
+ *
+ * The reporter tried six different `groups` substrings against one workflow and got
+ * the same message every time: it named the substrings they had just supplied and
+ * nothing about the workflow, so there was no way to converge except blind trial and
+ * error. Their workflow DID have an output node (a `SaveVideo`, node 92) — and
+ * `SaveVideo` is in SINK_TYPES, so the sink type was never the problem. What failed
+ * was group matching: a node belongs to a group only by falling inside its bounding
+ * box, so an output node sitting outside every group, or inside one whose title none
+ * of the substrings match, yields no seeds.
+ *
+ * Both facts are known at the throw site, so the refusal now carries them:
+ *   • the group titles that actually exist — no more guessing at names;
+ *   • every output node found ANYWHERE in the workflow and the group it falls in,
+ *     which distinguishes "your substring is wrong" from "this output node is not
+ *     inside any group at all" — two different fixes that produced one message.
+ *
+ * Deliberately still a REFUSAL. Falling back to "slice from any output node" would
+ * silently produce a different workflow than the caller asked for, which is worse
+ * than a clear stop.
+ */
+export function describeSliceMiss(info: {
+  groupSubstrings: string[];
+  groupTitles: string[];
+  sinks: Array<{ id: number; type: string; group: string }>;
+}): string {
+  const { groupSubstrings, groupTitles, sinks } = info;
+  const titles = groupTitles.map((t) => String(t ?? "").trim()).filter(Boolean);
+  const lines = [
+    `No output node (SaveImage / VHS_VideoCombine / SaveVideo / SaveAudio / PreviewImage) ` +
+      `found in groups matching: ${groupSubstrings.join(", ")}`,
+    `Groups in this workflow (${titles.length}): ${capped(titles)}`,
+  ];
+  if (!sinks.length) {
+    lines.push(
+      "This workflow contains NO output node of any recognized type, so no substring can " +
+        "match — slicing needs one to seed from.",
+    );
+  } else {
+    lines.push(
+      `Output nodes present (${sinks.length}): ` +
+        capped(sinks.map((s) => `#${s.id} ${s.type} in ${s.group ? `"${s.group}"` : "NO group"}`)),
+    );
+    // The distinction that decides what to do next. A node belongs to a group purely
+    // by geometry, so an output node outside every box can never be matched by any
+    // substring, and telling the caller to try another one would send them in circles.
+    if (sinks.every((s) => !s.group)) {
+      lines.push(
+        "None of them is inside ANY group, so no `groups` value can match. Move the output " +
+          "node into the group's bounds on the canvas, or slice a workflow whose pipelines " +
+          "are grouped.",
+      );
+    } else {
+      lines.push("Pass a substring of one of the group titles listed above.");
+    }
+  }
+  return lines.join("\n");
 }
