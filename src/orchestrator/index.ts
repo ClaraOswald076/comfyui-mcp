@@ -551,11 +551,32 @@ function portKillHint(port: number): string {
     : `To free the port manually:\n  bash/zsh:    ${sh}\n  PowerShell:  ${ps}`;
 }
 
+
+/**
+ * PROBE TIMEOUT. These four inspections run SYNCHRONOUSLY, so a command that
+ * hangs blocks the whole event loop — no bridge traffic, no agent turns,
+ * nothing — and they run on the startup/takeover path where being stuck is
+ * indistinguishable from being broken. `lsof` is the known offender (it stalls
+ * on unreachable network mounts), and `netstat` is slow on a busy host.
+ *
+ * 5s matches what the rest of the codebase already uses for these EXACT
+ * commands — port-owner.ts times out its `lsof`/`netstat` and process-control.ts
+ * its `tasklist`. These copies simply never got it.
+ *
+ * Timing out costs nothing in correctness: both callers already fail closed on
+ * a throw (null / "unknown"), and both READ that as "could not determine" —
+ * pidListeningOnPort's null makes the caller decline to claim a takeover rather
+ * than assert the port is free.
+ */
+const PORT_PROBE_TIMEOUT_MS = 5000;
 /** Resolve which pid is LISTENING on a local TCP port (null if none/unknown). */
 function pidListeningOnPort(port: number): number | null {
   try {
     if (process.platform === "win32") {
-      const out = execFileSync("netstat", ["-ano", "-p", "tcp"], { encoding: "utf8" });
+      const out = execFileSync("netstat", ["-ano", "-p", "tcp"], {
+        encoding: "utf8",
+        timeout: PORT_PROBE_TIMEOUT_MS,
+      });
       for (const line of out.split(/\r?\n/)) {
         const m = line.match(/TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$/i);
         if (m && Number(m[1]) === port) return Number(m[2]);
@@ -564,6 +585,7 @@ function pidListeningOnPort(port: number): number | null {
     }
     const out = execFileSync("lsof", ["-ti", `tcp:${port}`, "-s", "tcp:LISTEN"], {
       encoding: "utf8",
+      timeout: PORT_PROBE_TIMEOUT_MS,
     });
     const pid = Number(out.trim().split(/\s+/)[0]);
     return Number.isInteger(pid) && pid > 0 ? pid : null;
@@ -578,11 +600,15 @@ function processNameOf(pid: number): string {
     if (process.platform === "win32") {
       const out = execFileSync("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
         encoding: "utf8",
+        timeout: PORT_PROBE_TIMEOUT_MS,
       });
       return /^"([^"]+)"/m.exec(out)?.[1] ?? "unknown";
     }
     return (
-      execFileSync("ps", ["-p", String(pid), "-o", "comm="], { encoding: "utf8" }).trim() ||
+      execFileSync("ps", ["-p", String(pid), "-o", "comm="], {
+        encoding: "utf8",
+        timeout: PORT_PROBE_TIMEOUT_MS,
+      }).trim() ||
       "unknown"
     );
   } catch {
