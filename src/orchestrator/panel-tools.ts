@@ -8098,9 +8098,23 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_list_subgraphs",
-      "List the saved subgraph BLUEPRINTS in the user's library (from panel_save_subgraph, plus any global/bundled ones). Each entry has {name, type, display_name, description, is_global} — use name/type with panel_add_subgraph to drop it onto the canvas. Read-only.",
-      {},
-      async (_args, ctx) => ctx.call({ cmd: "graph_list_subgraphs" }, 15000),
+      "List the saved subgraph BLUEPRINTS in the user's library (from panel_save_subgraph, plus any global/bundled ones). Each entry has {name, type, display_name, description, is_global} — use name/type with panel_add_subgraph to drop it onto the canvas. Read-only.\n\nTOKEN-BOUNDED like the other reads (panel#690). The reply's count field is always the LIBRARY TOTAL, so compare it against the returned array. When entries are withheld the reply carries truncated:true, a returned field, and a note — an absent entry in a TRUNCATED list is NOT evidence the blueprint does not exist, so narrow with `filter` (or raise `limit`, up to 500) before concluding anything. When a filter is applied the reply's matched field reports how many the filter selected, distinct from the count field, so matched:0 against a non-zero count means the filter missed, not that the library is empty.",
+      {
+        filter: z
+          .string()
+          .optional()
+          .describe(
+            "Case-insensitive substring matched against the blueprint's name, display name AND description. Use this rather than a bigger limit when you know roughly what you want.",
+          ),
+        limit: z
+          .number()
+          .optional()
+          .describe(
+            "Maximum entries to return (default 40, max 500). A value <= 0 or non-numeric falls back to the default rather than returning nothing.",
+          ),
+      },
+      async (args: A, ctx) =>
+        ctx.call({ cmd: "graph_list_subgraphs", filter: args.filter, limit: args.limit }, 15000),
     ),
     def(
       "panel_add_subgraph",
