@@ -29,6 +29,10 @@ const stageOutputAsInputMock = vi.fn();
 vi.mock("../../services/image-management.js", () => ({
   extractWorkflowFromImage: vi.fn(),
   listOutputImages: (...a: unknown[]) => listOutputImagesMock(...a),
+  listOutputMedia: async (...a: unknown[]) => ({
+    images: await listOutputImagesMock(...a),
+    source: { directory: "C:\Comfy\output", basis: "local-scan" },
+  }),
   getOutputImage: (...a: unknown[]) => getOutputImageMock(...a),
   uploadImageAuto: (...a: unknown[]) => uploadImageAutoMock(...a),
   uploadVideoAuto: (...a: unknown[]) => uploadVideoAutoMock(...a),
@@ -655,7 +659,7 @@ describe('action:"list_outputs" keeps the mobile dataset picker\'s contract', ()
   it("format:json with no matches returns an empty array (not a prose message)", async () => {
     listOutputImagesMock.mockResolvedValue([]);
     const t = text(await getImage()({ action: "list_outputs", format: "json" }));
-    expect(JSON.parse(t)).toEqual({ images: [] });
+    expect(JSON.parse(t)).toEqual({ images: [], source: "local-scan", directory: "C:\Comfy\output" });
   });
 
   it("format:json omits size/modified when the scan can't provide them (remote/history path)", async () => {
@@ -667,10 +671,26 @@ describe('action:"list_outputs" keeps the mobile dataset picker\'s contract', ()
     expect(parsed.images[0]).toEqual({ filename: "r.png", subfolder: "", kind: "image" });
   });
 
+  it("names the directory in the MARKDOWN listing, so a caller never has to guess it (#899)", async () => {
+    // The live failure this fixes: the tool returned bare filenames, an agent
+    // reconstructed the path from get_environment's workspace, and that guess is
+    // wrong on any install launched with --output-directory — silently, because
+    // the filenames look plausible against it.
+    listOutputImagesMock.mockResolvedValue([
+      { filename: "a.png", path: "", size: 1024, modified: "", subfolder: "", kind: "image" },
+    ]);
+    const t = text(await getImage()({ action: "list_outputs" }));
+    expect(t).toContain("C:\Comfy\output");
+    expect(t).toContain("scanned on disk");
+  });
+
   it("the empty-markdown message still names the pattern that matched nothing", async () => {
     listOutputImagesMock.mockResolvedValue([]);
     const t = text(await getImage()({ action: "list_outputs", pattern: "fox" }));
-    expect(t).toBe('No output media (images or videos) found matching "fox".');
+    expect(t).toContain('No output media (images or videos) found matching "fox".');
+    // …and says WHERE it looked: "nothing found" invites the reader to conclude
+    // the file does not exist, which only holds if the directory was right.
+    expect(t).toMatch(/scanned on disk/);
   });
 });
 

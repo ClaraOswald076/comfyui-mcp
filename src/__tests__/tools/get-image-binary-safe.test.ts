@@ -14,6 +14,10 @@ const getOutputImageMock = vi.fn();
 vi.mock("../../services/image-management.js", () => ({
   extractWorkflowFromImage: vi.fn(),
   listOutputImages: vi.fn(),
+  listOutputMedia: vi.fn(async () => ({
+    images: [],
+    source: { directory: "C:\Comfy\output", basis: "local-scan" },
+  })),
   getOutputImage: (...a: unknown[]) => getOutputImageMock(...a),
   uploadImageAuto: vi.fn(),
   uploadVideoAuto: vi.fn(),

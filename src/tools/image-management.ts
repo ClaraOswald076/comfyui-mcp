@@ -5,6 +5,7 @@ import { tmpdir, homedir } from "node:os";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   listOutputImages,
+  listOutputMedia,
   getOutputImage,
   uploadImageAuto,
   uploadVideoAuto,
@@ -501,10 +502,22 @@ export function registerImageManagementTools(server: McpServer): void {
                   '"png"/"jpeg"/"webp" are encoder formats for action:"convert".',
               );
             }
-            const images = await listOutputImages({
+            const { images, source } = await listOutputMedia({
               limit: args.limit,
               pattern: args.pattern,
             });
+            // Say WHERE these came from (#899). The tool resolved it a moment
+            // ago; withholding it forces callers to reconstruct the path, and the
+            // natural reconstruction — the workspace path from install_comfyui (action:"environment") —
+            // is wrong on any install launched with --output-directory. Naming the
+            // basis matters as much as the path: "scanned this directory" and
+            // "read the server's history" are different claims, and only one is
+            // about disk.
+            const whereFrom =
+              source.basis === "local-scan"
+                ? `Read from \`${source.directory}\` (scanned on disk).`
+                : "Read from ComfyUI's generation history over HTTP — not from disk, so this " +
+                  "reflects what the server remembers this session, not what the output folder holds.";
             if (args.format === "json") {
               // Machine-readable form for app clients (the mobile dataset picker):
               // same entries, no prose. Thumbs render client-side via /view URLs.
@@ -513,6 +526,11 @@ export function registerImageManagementTools(server: McpServer): void {
                   {
                     type: "text" as const,
                     text: JSON.stringify({
+                      // Machine-readable counterpart of the prose: the entries are
+                      // meaningless to a client that cannot say which directory
+                      // they are relative to (#899).
+                      source: source.basis,
+                      ...(source.directory ? { directory: source.directory } : {}),
                       images: images.map((img) => ({
                         filename: img.filename,
                         subfolder: img.subfolder,
@@ -530,9 +548,13 @@ export function registerImageManagementTools(server: McpServer): void {
                 content: [
                   {
                     type: "text" as const,
-                    text: args.pattern
-                      ? `No output media (images or videos) found matching "${args.pattern}".`
-                      : "No output media (images or videos) found.",
+                    // NAMING THE SOURCE MATTERS MOST HERE. "Nothing found"
+                    // invites the reader to conclude their file does not exist,
+                    // and whether that holds depends entirely on where we looked.
+                    text:
+                      (args.pattern
+                        ? `No output media (images or videos) found matching "${args.pattern}".`
+                        : "No output media (images or videos) found.") + ` ${whereFrom}`,
                   },
                 ],
               };
@@ -557,7 +579,7 @@ export function registerImageManagementTools(server: McpServer): void {
               content: [
                 {
                   type: "text" as const,
-                  text: `${summary}\n\n${lines.join("\n")}`,
+                  text: `${summary} ${whereFrom}\n\n${lines.join("\n")}`,
                 },
               ],
             };
