@@ -6,6 +6,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.4] - 2026-08-07
+
+### MCP
+
+#### Added
+- summary_only, so the report costs a report (panel#690(5)) (#992)
+- expose the filter/limit the panel now honours (panel#690(5)) (#990)
+
+#### Fixed
+- list what the server REGISTERS, not 15 hardcoded folder names (#995)
+- a batch queues N runs, so ticket N runs (#994)
+- extend the unapplied-filter guard past `creator` (#993)
+- a run-error notice must not assert who queued the run (#991)
+- a remedy has to work from where the user is reading it (#989)
+- a slice that matches no output node explains why (panel#690(4)) (#986)
+
+
 ## [0.50.3] - 2026-08-07
 
 ### MCP
