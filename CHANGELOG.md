@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.6] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- ask PowerShell for UTF-8 before reading a process command line (#1012)
+- the ACTION-level admission refusal owes the same explanation the name-level one got (#1008)
+- scan untracked files too, and say what was skipped (#1009)
+- dedupe the changelog against what it already says (#1007)
+
+
 ## [0.50.5] - 2026-08-07
 
 ### MCP
