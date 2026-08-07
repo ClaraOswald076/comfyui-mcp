@@ -8045,9 +8045,48 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         if (ctx.awaitReachable && !(await ctx.awaitReachable())) {
           return noReachableTabFail(args.name ? "workflow_save_as" : "workflow_save");
         }
-        return args.name
-          ? ctx.call({ cmd: "workflow_save_as", name: args.name }, 15000)
-          : ctx.call({ cmd: "workflow_save" }, 15000);
+        const res = args.name
+          ? await ctx.call({ cmd: "workflow_save_as", name: args.name }, 15000)
+          : await ctx.call({ cmd: "workflow_save" }, 15000);
+        if (res.isError) return res;
+        // #1045 — a SAVE-AS replaces the active workflow instance: the canvas is
+        // now the NEW file, with its own identity, while this session's command
+        // fence still names the pre-save one. Every graph call afterwards fails
+        // with "workflow instance mismatch" — a reporter lost the session right
+        // after a successful save of ~40 nodes' work.
+        //
+        // Same shape as #932 (panel_new_workflow), and the same fix: re-derive
+        // the fence from the panel's live active record. I closed that path and
+        // missed this one; workflow_new and workflow_save_as both re-point the
+        // active workflow, so both have to re-anchor.
+        //
+        // A plain in-place save is included deliberately. Its identity normally
+        // FOLLOWS the workflow across the save (tmp: -> wf:), so the refresh
+        // re-derives the same value and changes nothing — but "normally" is the
+        // whole problem here, and re-reading costs one round trip against a
+        // session that is otherwise silently unusable.
+        //
+        // NEVER fails the call: the file WAS written. Retracting a completed save
+        // would be the worse lie, so a fence that could not be re-established is
+        // DISCLOSED instead.
+        const fenceRebind = await rebindWorkflowFence(ctx);
+        let canMutateNow: boolean | undefined;
+        let refusalCause: "unroutable" | "disconnected" | "no_identity" | "capability" | undefined;
+        try {
+          if (ctx.tabGraphMutationCapability) {
+            const cap = ctx.tabGraphMutationCapability();
+            canMutateNow = cap.known ? cap.canMutate : undefined;
+            if (cap.known && !cap.canMutate) refusalCause = cap.because;
+          } else {
+            canMutateNow = ctx.tabCanMutateGraph?.();
+          }
+        } catch {
+          canMutateNow = undefined;
+          refusalCause = undefined;
+        }
+        const fence = describeFenceRebind(fenceRebind, canMutateNow, refusalCause);
+        if (!fence || fence.binding === "bound") return res;
+        return appendNote(res, `The workflow WAS saved.${fence.note}`);
       },
     ),
     def(
