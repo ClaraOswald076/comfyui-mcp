@@ -103,3 +103,72 @@ export function runCompletionDirective(tabId: string | undefined): string {
     ? `Acknowledge the result in ONE short sentence, then CONTINUE your plan — you have unfinished items on your todo list, so do NOT stop here or wait for the user. Carry straight on with the next step (queue it now if that is what the plan says). Don't repeat an earlier comment.`
     : `Reply with ONE short sentence acknowledging the result and suggesting a sensible next step — you do NOT need to call any tools. Don't repeat an earlier comment.`;
 }
+
+// ---------------------------------------------------------------------------
+// #1018 — the status vocabulary the caller brings.
+//
+// The schema accepted exactly `pending` | `active` | `done`, and an agent's FIRST
+// panel_set_todo submitted `in_progress` and `completed`. Those are not a typo:
+// they are the near-universal todo vocabulary in agent tooling, so an agent that
+// has never read this particular tool's enum reaches for them by default. The
+// call was rejected at the protocol layer with a bare
+//
+//     MCP error -32602: Input validation error; expected one of `pending`|`active`|`done`
+//
+// which costs a full round trip at exactly the worst moment — plan setup, the
+// first thing the user sees. Nothing about the request was ambiguous: the intent
+// of `in_progress` is not in question.
+//
+// So the schema accepts the aliases and normalizes them here, at the boundary.
+// Everything downstream — the panel UI, recordTodo's snapshot (#977), the
+// completion-directive logic that reads it — continues to see ONLY the canonical
+// three. This adds no new state and changes no behaviour for a caller that
+// already used the canonical values.
+//
+// The tool DESCRIPTION still teaches `pending → active → done`, deliberately.
+// The aliases are a compatibility shim, not a second vocabulary to document: an
+// agent should be told one set of names, and simply not be punished for the
+// obvious synonyms.
+
+/** Canonical checklist states, in progress order. */
+export const TODO_STATUSES = ["pending", "active", "done"] as const;
+export type TodoStatus = (typeof TODO_STATUSES)[number];
+
+/**
+ * Accepted synonyms → canonical. Kept deliberately small: these are the spellings
+ * agents actually produce, not an open thesaurus. An unknown value is NOT mapped
+ * — it still fails validation, because guessing at a status nobody recognises
+ * would put a wrong state in front of the user.
+ */
+const TODO_STATUS_ALIASES: Record<string, TodoStatus> = {
+  in_progress: "active",
+  "in-progress": "active",
+  inprogress: "active",
+  running: "active",
+  current: "active",
+  completed: "done",
+  complete: "done",
+  finished: "done",
+  todo: "pending",
+  not_started: "pending",
+  "not-started": "pending",
+  queued: "pending",
+};
+
+/** Every spelling the schema admits (canonical first, for the error message). */
+export const TODO_STATUS_INPUTS: string[] = [...TODO_STATUSES, ...Object.keys(TODO_STATUS_ALIASES)];
+
+/** Map an accepted spelling to its canonical form. Unknown input is returned
+ *  unchanged — validation, not this function, is what rejects it. */
+export function normalizeTodoStatus(status: string): string {
+  if ((TODO_STATUSES as readonly string[]).includes(status)) return status;
+  return TODO_STATUS_ALIASES[status.trim().toLowerCase()] ?? status;
+}
+
+/** Normalize a checklist's statuses in place-safe fashion (returns a new array).
+ *  Items without a status are left alone — the default is applied downstream. */
+export function normalizeTodoItems<T extends { status?: unknown }>(items: T[]): T[] {
+  return items.map((item) =>
+    typeof item?.status === "string" ? { ...item, status: normalizeTodoStatus(item.status) } : item,
+  );
+}

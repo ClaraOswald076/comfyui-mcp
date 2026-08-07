@@ -102,7 +102,7 @@ import {
 } from "../services/panel-secrets.js";
 import { flattenUiWorkflow } from "../services/flatten-workflow.js";
 import { describeUnappliedFilters } from "./civitai-filter-guard.js";
-import { recordTodo } from "./todo-state.js";
+import { recordTodo, normalizeTodoItems, TODO_STATUS_INPUTS } from "./todo-state.js";
 import { applyCapturedWidgetValues } from "../services/live-widget-overlay.js";
 import { listWorkflowLibraryKeys, userdataFetch } from "../services/userdata-library.js";
 import { getNsfwConsent, setNsfwConsent } from "../services/panel-settings.js";
@@ -7503,8 +7503,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .array(
             z.object({
               text: z.string().describe("Short step description (a few words)."),
+              // #1018 — accept the synonyms agents actually produce (in_progress,
+              // completed, …) and normalize them in the handler. The DESCRIPTION
+              // still teaches only the canonical trio: one vocabulary to learn,
+              // and no round trip lost to a rejected first call over a spelling
+              // whose intent was never in doubt.
               status: z
-                .enum(["pending", "active", "done"])
+                .enum(TODO_STATUS_INPUTS as [string, ...string[]])
                 .optional()
                 .describe("Step state (default 'pending'). Mark the one you're on 'active'."),
             }),
@@ -7520,17 +7525,21 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // bound tab is a headless (mobile/remote) client, resolve the live desktop
         // canvas tab instead of dispatching at the headless client — which would
         // reject with the misleading "mobile client has no open canvas".
+        // #1018 — canonicalize ONCE, here, before anything reads the list. The
+        // panel, recordTodo's snapshot (#977) and the completion-directive logic
+        // all keep seeing only pending/active/done.
+        const items = normalizeTodoItems(args.items as Array<{ text?: unknown; status?: unknown }>);
         const redirect = desktopCanvasRedirect(ctx, "panel_set_todo");
         if (redirect?.error) return fail(redirect.error);
         if (redirect?.tabId) {
           // #977 — the desktop redirect writes the checklist to ANOTHER tab, so
           // record it against that one. Keying it on ctx.tabId would leave the
           // tab that actually holds the plan looking planless.
-          recordTodo(redirect.tabId, args.items);
+          recordTodo(redirect.tabId, items);
           return dispatchToTab(
             ctx,
             redirect.tabId,
-            { cmd: "set_todo", items: args.items },
+            { cmd: "set_todo", items },
             15000,
             () => reResolveDesktopTab(ctx, "panel_set_todo"),
           );
@@ -7538,8 +7547,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // #977 — retain what the agent DECLARED, so a later render completion can
         // tell "you are mid-sweep" from "that was the last thing you were doing".
         // The panel keeps the UI copy; this is the orchestrator's own record.
-        recordTodo(ctx.tabId, args.items);
-        return ctx.call({ cmd: "set_todo", items: args.items }, 15000);
+        recordTodo(ctx.tabId, items);
+        return ctx.call({ cmd: "set_todo", items }, 15000);
       },
     ),
     def(
