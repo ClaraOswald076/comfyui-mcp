@@ -937,6 +937,29 @@ describe("run completion journal correlation (#468)", () => {
     expect(resend.possibleRepeat).toBe(true); // flagged, never suppressed
   });
 
+  it("#704: a New chat on ANOTHER backend does not close this conversation's ticket", () => {
+    // Boundaries are per conversation, and a tab can change which conversation it
+    // belongs to. Closing by tab as well looked like the safe direction — closing
+    // too much only weakens a verdict — but it is the #704 failure in miniature:
+    // claude queues on tab T, T switches to codex, a codex New chat runs, and
+    // claude's own render comes back UNDETERMINED (adversarial gate, round 2).
+    journal.openRun(PROMPT_A, { tabId: "wf:one", conversation: "orchestrator::claude" });
+    journal.closeRuns("wf:one", "orchestrator::codex"); // codex's boundary, same tab
+    expect(journal.ticketFor(PROMPT_A)).toBeDefined();
+    expect(
+      journal.correlate("wf:one", { prompt_id: PROMPT_A }, "orchestrator::claude").status,
+    ).toBe("matched");
+    // …and codex still cannot claim it.
+    expect(
+      journal.correlate("wf:one", { prompt_id: PROMPT_A }, "orchestrator::codex").status,
+    ).toBe("foreign");
+    // A ticket with no conversation to name is still closed by its tab, so the
+    // legacy path keeps a boundary rather than leaking one.
+    journal.openRun(PROMPT_B, { tabId: "wf:one" });
+    journal.closeRuns("wf:one", "orchestrator::codex");
+    expect(journal.ticketFor(PROMPT_B)).toBeUndefined();
+  });
+
   it("#704 NEGATIVE: a REUSED prompt id is still detected when the delivery was acked under a different tab id", () => {
     // Ownership and the already-delivered MEMO have to agree about who a run
     // belongs to. When the memo was still filed under the tab, a delivery acked

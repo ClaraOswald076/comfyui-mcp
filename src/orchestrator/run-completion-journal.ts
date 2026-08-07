@@ -1033,20 +1033,27 @@ export class RunCompletionJournalImpl {
    * conversation was owed is still reported to it correctly if it is still
    * deliverable.
    *
-   * `conversation` is the boundary that matters once tickets are owned by a
-   * conversation rather than a tab (#704), and it is what makes this closure
-   * COMPLETE: a ticket whose tab has since been re-registered under a new id is
-   * no longer reachable by ANY member tab, and left open it would go on matching
-   * — the replacement conversation reuses the same key string
-   * (`orchestrator::<backend>`), so only DELETING the ticket ends the old
-   * conversation's ownership. Closing by tab as well is kept: closing too much
-   * only ever weakens a verdict (matched → foreign), which is the safe direction.
+   * A TICKET is closed when the ending party OWNS it — the same predicate that
+   * decides a match (ownsRun), which is the whole rule: whatever this party could
+   * be told is "the run YOU queued" it can also end, and nothing else.
+   *  • It reaches a ticket whose tab was re-registered under a new id on a
+   *    reconnect (#704) and is therefore in NO member-tab sweep. That matters
+   *    because the replacement conversation reuses the same key string
+   *    (`orchestrator::<backend>`), so only DELETING the ticket ends ownership.
+   *  • It does NOT delete another conversation's ticket that merely shares this
+   *    tab. Closing by tab as well looked like the safe direction, but it is the
+   *    #704 failure in miniature: claude queues on tab T, T switches to codex, a
+   *    codex New chat runs — and claude's own render would come back UNDETERMINED
+   *    (adversarial gate, round 2).
+   *
+   * ENTRIES are different and keep the tab arm: an entry is ADDRESSED to a tab
+   * and will be handed to whichever conversation serves that tab at flush time,
+   * so one addressed to a swept tab must lose its "YOUR run" claim regardless of
+   * who queued it.
    */
   closeRuns(key: string, conversation?: string): void {
-    const closed = (t: RunTicket): boolean =>
-      t.tabId === key || (conversation !== undefined && t.conversation === conversation);
     for (const [pid, ticket] of [...this.tickets]) {
-      if (closed(ticket)) this.tickets.delete(pid);
+      if (ownsRun(ticket, key, conversation)) this.tickets.delete(pid);
     }
     // Entries still undelivered were addressed to the conversation that just
     // went away, so their `matched` verdict no longer holds for whoever receives
