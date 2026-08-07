@@ -177,6 +177,22 @@ export interface UiNode {
    * drop them or land them on the wrong widget (issue #361).
    */
   resolvedWidgetValues?: Record<string, unknown>;
+  /**
+   * INTERNAL, never serialized: the panel's AUTHORITATIVE name→value map for this
+   * node's widgets, captured from the live canvas alongside the serialized graph
+   * (see applyCapturedWidgetValues). When present it REPLACES `widgets_values` as
+   * the converter's widget source, which is the whole point: `widgets_values` is a
+   * bare positional array whose order is the FRONTEND's, while the converter can
+   * only reconstruct an order from object_info's — and for custom nodes that add or
+   * reorder widgets in JS the two disagree, silently landing each value on the wrong
+   * widget (#961/#955/#361). A name-keyed map has no order to disagree about.
+   *
+   * It is deliberately a SEPARATE field rather than an object written into
+   * `widgets_values`: several call sites legitimately read that array BY INDEX
+   * (a subgraph node's proxyWidgets, a PrimitiveNode's literal at [0], a Set/Get
+   * node's bus name), and handing them an object would silently drop those values.
+   */
+  capturedWidgetValues?: Record<string, unknown>;
 }
 
 // link: [link_id, source_node_id, source_slot, target_node_id, target_slot, type_name]

@@ -86,6 +86,7 @@ import {
   type SecretSaveReceipt,
 } from "../services/panel-secrets.js";
 import { flattenUiWorkflow } from "../services/flatten-workflow.js";
+import { applyCapturedWidgetValues } from "../services/live-widget-overlay.js";
 import { listWorkflowLibraryKeys, userdataFetch } from "../services/userdata-library.js";
 import { getNsfwConsent, setNsfwConsent } from "../services/panel-settings.js";
 import { QueueMonitor } from "../services/queue-monitor.js";
@@ -4904,6 +4905,11 @@ async function resolveWorkflowInput(
   // they must NOT take this fallback — they keep the actionable "update your
   // panel" error instead. Only strip opts in.
   allowStateFallback = false,
+  // Collects disclosure lines about the live widget capture (#959). Only the
+  // live-canvas path writes here, and only when something was left mapped by
+  // POSITION — the caller surfaces these alongside the converter's warnings so an
+  // unverified widget mapping is never presented as a verified one.
+  notes?: string[],
 ): Promise<Record<string, unknown>> {
   if (args.pack) return readPackWorkflow(args.pack as string);
   if (args.path) return await readWorkflowFromPath(args.path as string);
@@ -4972,6 +4978,39 @@ async function resolveWorkflowInput(
   const wf = (reply as { workflow?: unknown } | null)?.workflow;
   if (!wf || typeof wf !== "object") {
     throw new Error("The live canvas returned no graph — pass pack, path, or graph explicitly.");
+  }
+
+  // #959: the serialized graph's widget values are POSITIONAL, and their order is
+  // the frontend's — which object_info's input order does not reproduce for custom
+  // nodes that add or reorder widgets in JS. Take a second, name-keyed read of the
+  // same canvas so the converter can map by NAME instead of by index. Structure
+  // still comes from graph_serialize (this adds values only, never nodes or links),
+  // so a panel too old to answer, a slow read, or a mismatched scope costs nothing
+  // but the disclosure that the mapping stayed positional and is UNVERIFIED.
+  if (allowStateFallback && notes) {
+    let stateReply: unknown;
+    try {
+      const target = ctx.workflowTarget?.get(ctx.tabId);
+      const stateCmd = target
+        ? withWorkflowTarget({ cmd: "graph_get_state" }, target)
+        : { cmd: "graph_get_state" };
+      stateReply = await ctx.bridge.send(stateCmd as { cmd: string }, {
+        tabId: ctx.tabId,
+        timeoutMs: 30000,
+      });
+    } catch (err) {
+      // Never fatal: strip already HAS a usable graph. Losing the cross-check
+      // degrades fidelity, and that degradation is what gets reported.
+      stateReply = null;
+      notes.push(
+        `note: the live widget cross-check could not be read (${err instanceof Error ? err.message : String(err)}); ` +
+          `an older panel may not support it. Widget values were mapped by position and MAY be attributed to the ` +
+          `wrong widget on custom nodes — verify with panel_query_graph {fields:'detail'} if one looks off.`,
+      );
+    }
+    if (stateReply) {
+      notes.push(...applyCapturedWidgetValues(wf, stateReply).notes);
+    }
   }
   return wf as Record<string, unknown>;
 }
@@ -6146,11 +6185,17 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       async (args: A, ctx) => {
         // strip opts into the lossy live-canvas fallback (#384) — its API/prompt
         // output is for inspection/execution, never reloaded onto the canvas.
-        const raw = await resolveWorkflowInput(args, ctx, true);
+        // `captureNotes` collects the #959 widget-capture disclosures: they say
+        // which nodes' widget values are UNVERIFIED, so they belong with the
+        // conversion notes rather than being dropped.
+        const captureNotes: string[] = [];
+        const raw = await resolveWorkflowInput(args, ctx, true, captureNotes);
         const ui = raw as unknown as UiWorkflow;
         const bulk = await getObjectInfo();
         const objectInfo = await backfillObjectInfo(bulk, collectNodeTypes(ui));
-        const { workflow, warnings } = convertUiToApi(ui, objectInfo);
+        const converted = convertUiToApi(ui, objectInfo);
+        const workflow = converted.workflow;
+        const warnings = [...captureNotes, ...converted.warnings];
 
         const hist: Record<string, number> = {};
         for (const node of Object.values(workflow)) {
