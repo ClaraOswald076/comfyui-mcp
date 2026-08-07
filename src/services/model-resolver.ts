@@ -334,7 +334,36 @@ function makeModelDeduper(): { add: (category: string, name: string) => boolean 
   };
 }
 
-async function discoverGgufCategories(
+/**
+ * Weight-file extensions. The gate that makes discovering the WHOLE registry
+ * safe (#962).
+ *
+ * #526 deliberately scoped discovery to `*_gguf` because `/models` also lists
+ * extension-BLIND registries — `custom_nodes`, `datasets` and friends register
+ * an EMPTY extension set, so `/models/<that>` returns every file in the folder
+ * and folding one in would flood the listing with arbitrary files. That reason
+ * is sound, and a denylist of category NAMES cannot answer it: the set is open,
+ * since any custom node can register its own.
+ *
+ * Filtering the FILES instead closes it for good. A discovered category
+ * contributes only recognisable weights, so an extension-blind registry full of
+ * .txt/.json/.py contributes nothing — while a `.safetensors` under a key
+ * MODEL_SUBDIRS never heard of finally becomes visible, which is the whole of
+ * #962.
+ */
+const WEIGHT_EXTS = new Set([
+  ".safetensors",
+  ".ckpt",
+  ".pt",
+  ".pth",
+  ".bin",
+  ".gguf",
+  ".sft",
+  ".onnx",
+  ".engine", // TensorRT
+]);
+
+async function discoverExtraCategories(
   client: ReturnType<typeof getClient>,
 ): Promise<string[]> {
   try {
@@ -343,13 +372,22 @@ async function discoverGgufCategories(
     const json = (await res.json()) as unknown;
     if (!Array.isArray(json)) return [];
     const core = new Set<string>(MODEL_SUBDIRS);
-    // Keep `*_gguf` categories only, deduped, minus any the core scan already covers.
+    // EVERY registered category we don't already scan, not just `*_gguf` (#962).
+    //
+    // MODEL_SUBDIRS is a hardcoded list of 15 folder names. Anything ComfyUI
+    // registers outside it — a custom node's own folder, an extra_model_paths
+    // entry, a fork's renamed weights dir — was invisible to this tool BY
+    // CONSTRUCTION. A reporter had a remote server whose UNETLoader listed and
+    // loaded `krastBf16_v3.safetensors` while `list_local_models` answered "no
+    // diffusion_models models found" AND "no unet models found": the weights
+    // were registered under a key neither name covers, and a hardcoded list can
+    // never find them.
+    //
+    // `/models` is ComfyUI's own answer to "what folders do I serve?", so
+    // discovery replaces the guess rather than supplementing it.
     return [
       ...new Set(
-        json.filter(
-          (c): c is string =>
-            typeof c === "string" && /_gguf$/i.test(c) && !core.has(c),
-        ),
+        json.filter((c): c is string => typeof c === "string" && c.trim() !== "" && !core.has(c)),
       ),
     ];
   } catch (err) {
@@ -420,15 +458,21 @@ async function collectLocalModels(
   // those, and they fail entirely in remote/cloud mode where comfyuiPath is
   // undefined. Originally contributed by João Lucas (github.com/joaolvivas) in
   // joaolvivas/comfyui-mcp-byjlucas@e2ae39c8 (2026-05-12).
+  const coreDirs = new Set<string>(MODEL_SUBDIRS);
   let httpReturnedAny = false;
   try {
     const client = getClient(); // throws CLOUD_UNSUPPORTED in cloud mode
-    // For an unfiltered listing, also scan ComfyUI-GGUF's registered `*_gguf`
-    // categories (`unet_gguf`/`clip_gguf`, …) holding the `.gguf` weights that core
-    // `/models/<dir>` omits. A filtered call already targets its exact category via
-    // dirsToScan, so it needs no discovery. See #526.
+    // For an unfiltered listing, scan every category the server REGISTERS that
+    // MODEL_SUBDIRS doesn't already cover. That began as ComfyUI-GGUF's `*_gguf`
+    // views (#526, the `.gguf` weights core `/models/<dir>` omits) and is now the
+    // whole registry (#962): a hardcoded list of 15 folder names cannot find
+    // weights a custom node, a fork, or an extra_model_paths entry registered
+    // under some other key — and a reporter's UNETLoader was loading exactly such
+    // a file while this tool reported none.
+    //
+    // A FILTERED call already names its exact category, so it needs no discovery.
     if (!modelType) {
-      for (const cat of await discoverGgufCategories(client)) dirsToScan.push(cat);
+      for (const cat of await discoverExtraCategories(client)) dirsToScan.push(cat);
     }
     // A `*_gguf` view aliases real folders, so the same file can be reported both
     // via the view and via a core category (e.g. a custom node that re-registers
@@ -479,6 +523,14 @@ async function collectLocalModels(
           // lists every file) over a shared dir — without this guard that would flood
           // the output. Core categories never contain `.gguf`, so this stays additive.
           if (isGgufCategory(dir) && !name.toLowerCase().endsWith(".gguf")) continue;
+          // #962 — the same hardening, generalised to every DISCOVERED category.
+          // Discovery now folds in the whole registry, which includes
+          // extension-blind entries (custom_nodes, datasets, a custom node's own)
+          // whose `/models/<dir>` returns every file in the folder. Requiring a
+          // weight extension is what keeps that from flooding the listing, and it
+          // is the reason discovery can be widened at all. CORE categories are
+          // untouched — their behaviour is unchanged.
+          if (!coreDirs.has(dir) && !WEIGHT_EXTS.has(extname(name).toLowerCase())) continue;
           if (!dedup.add(dir, name)) continue; // same file already surfaced elsewhere
           httpReturnedAny = true;
           results.push({

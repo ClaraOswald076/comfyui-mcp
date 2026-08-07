@@ -132,12 +132,23 @@ describe("listLocalModels — HTTP-first with FS fallback", () => {
     expect(readdir).not.toHaveBeenCalled();
   });
 
-  it("#526: discovery is scoped to *_gguf categories, ignoring non-gguf / non-model keys", async () => {
-    // `/models` lists the whole registry: core categories, other loaders' non-gguf
-    // categories (tensorrt/.engine), and extension-BLIND non-model registries
-    // (custom_nodes/datasets — empty extension sets that would list arbitrary files).
-    // Only the `*_gguf` categories are safe to fold in; everything else must be
-    // neither queried nor listed. Core categories are not re-queried.
+  it("#526/#962: a discovered category contributes only WEIGHTS, never arbitrary files", async () => {
+    // `/models` lists the whole registry: core categories, other loaders'
+    // non-gguf categories (tensorrt/.engine), and extension-BLIND non-model
+    // registries (custom_nodes/datasets — empty extension sets, so
+    // `/models/<that>` returns every file in the folder).
+    //
+    // #526 answered that by folding in ONLY `*_gguf` and querying nothing else.
+    // Sound at the time, but it left #962: MODEL_SUBDIRS is 15 hardcoded names,
+    // and a reporter's UNETLoader was loading a .safetensors registered under a
+    // key none of them covered, while this tool reported no models at all. A
+    // denylist of category NAMES cannot fix that — the set is open, since any
+    // custom node can register its own.
+    //
+    // So discovery now folds in the whole registry and the FILES are filtered by
+    // weight extension instead. The anti-flood guarantee #526 was protecting is
+    // unchanged and asserted below; what changed is that it is now enforced per
+    // FILE rather than by refusing to look.
     getClient.mockReturnValue({ fetchApi });
     const queried: string[] = [];
     fetchApi.mockImplementation(async (path: string) => {
@@ -154,20 +165,37 @@ describe("listLocalModels — HTTP-first with FS fallback", () => {
           { status: 200 },
         );
       }
-      return path === "/models/unet_gguf"
-        ? new Response(JSON.stringify(["flux-Q4.gguf"]), { status: 200 })
-        : new Response("[]", { status: 200 });
+      if (path === "/models/unet_gguf") {
+        return new Response(JSON.stringify(["flux-Q4.gguf"]), { status: 200 });
+      }
+      // An extension-BLIND registry: it answers with whatever is in the folder.
+      if (path === "/models/custom_nodes") {
+        return new Response(
+          JSON.stringify(["__init__.py", "requirements.txt", "README.md"]),
+          { status: 200 },
+        );
+      }
+      if (path === "/models/datasets") {
+        return new Response(JSON.stringify(["captions.json", "img_001.png"]), { status: 200 });
+      }
+      // A real non-gguf weight category, invisible to the old name-scoped rule.
+      if (path === "/models/tensorrt") {
+        return new Response(JSON.stringify(["unet_fp8.engine", "build.log"]), { status: 200 });
+      }
+      return new Response("[]", { status: 200 });
     });
 
     const result = await listLocalModels();
-    // Only the gguf model is surfaced by discovery.
-    expect(result.map((m) => ({ name: m.name, type: m.type }))).toEqual([
-      { name: "flux-Q4.gguf", type: "unet_gguf" },
-    ]);
-    // Non-gguf / non-model categories are never even queried.
-    expect(queried).not.toContain("/models/tensorrt");
-    expect(queried).not.toContain("/models/custom_nodes");
-    expect(queried).not.toContain("/models/datasets");
+    const got = result.map((m) => ({ name: m.name, type: m.type }));
+
+    // THE FLOOD GUARANTEE, unchanged: not one .py / .txt / .md / .json / .png
+    // reaches the listing, even though those categories WERE queried.
+    expect(got.some((m) => /\.(py|txt|md|json|png|log)$/i.test(m.name))).toBe(false);
+
+    // …and the weights under keys MODEL_SUBDIRS never heard of now appear (#962).
+    expect(got).toContainEqual({ name: "flux-Q4.gguf", type: "unet_gguf" });
+    expect(got).toContainEqual({ name: "unet_fp8.engine", type: "tensorrt" });
+
     // `checkpoints` is core → queried exactly once by the core scan, not by discovery.
     expect(queried.filter((p) => p === "/models/checkpoints")).toHaveLength(1);
   });
@@ -539,5 +567,55 @@ describe("listLocalModels — HTTP-first with FS fallback", () => {
     fetchApi.mockResolvedValue(new Response("Not Found", { status: 404 }));
     const result = await listLocalModels("checkpoints");
     expect(result).toEqual([]);
+  });
+});
+
+// #962 — the reported shape, end to end. A remote server whose UNETLoader listed
+// and loaded `krastBf16_v3.safetensors` answered "No diffusion_models models
+// found" AND "No unet models found": the weights were registered under a key
+// MODEL_SUBDIRS does not contain, and a hardcoded list of 15 folder names can
+// never find them. /models is ComfyUI's own answer to "what do I serve?".
+describe("#962: weights under an UNKNOWN registered category are found", () => {
+  it("surfaces a .safetensors from a category MODEL_SUBDIRS does not list", async () => {
+    getClient.mockReturnValue({ fetchApi });
+    fetchApi.mockImplementation(async (path: string) => {
+      if (path === "/models") {
+        // The core names answer empty; the real weights live elsewhere.
+        return new Response(
+          JSON.stringify(["diffusion_models", "unet", "krast_weights"]),
+          { status: 200 },
+        );
+      }
+      if (path === "/models/krast_weights") {
+        return new Response(JSON.stringify(["krastBf16_v3.safetensors"]), { status: 200 });
+      }
+      return new Response("[]", { status: 200 });
+    });
+
+    const result = await listLocalModels();
+    expect(result).toContainEqual({
+      name: "krastBf16_v3.safetensors",
+      path: "krast_weights/krastBf16_v3.safetensors",
+      size: 0,
+      modified: "",
+      type: "krast_weights",
+    });
+  });
+
+  // A FILTERED call names its category outright, so it must not pay for
+  // discovery — and must still answer for a category it was handed directly.
+  it("a filtered call does not run discovery", async () => {
+    getClient.mockReturnValue({ fetchApi });
+    const queried: string[] = [];
+    fetchApi.mockImplementation(async (path: string) => {
+      queried.push(path);
+      return path === "/models/checkpoints"
+        ? new Response(JSON.stringify(["sd_xl.safetensors"]), { status: 200 })
+        : new Response("[]", { status: 200 });
+    });
+
+    const result = await listLocalModels("checkpoints");
+    expect(result).toHaveLength(1);
+    expect(queried).not.toContain("/models");
   });
 });
