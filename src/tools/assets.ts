@@ -50,6 +50,11 @@ export async function regenerateAction(args: {
             status: "enqueued",
             prompt_id: result.prompt_id,
             queue_remaining: result.queue_remaining,
+            // #1037 — a 200 from /prompt does not mean every output was accepted;
+            // ComfyUI queues the branches that validate and reports the rest.
+            ...(result.rejectedOutputs
+              ? { rejected_outputs: result.rejectedOutputs }
+              : {}),
             source_asset_id: asset_id,
             overrides_applied: overrides ?? {},
           },
