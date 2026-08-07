@@ -8270,7 +8270,51 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "panel_new_workflow",
       "Open a brand-new BLANK workflow in a NEW TAB. Use this whenever the user wants a 'new workflow' / 'fresh canvas' / 'start over for a new project'. This does NOT touch their current workflow — it opens a separate tab. NEVER use panel_clear for a new workflow (panel_clear wipes the CURRENT graph and is only for 'clear/reset this canvas').",
       {},
-      async (_args, ctx) => ctx.call({ cmd: "workflow_new" }, 15000),
+      async (_args, ctx) => {
+        const res = await ctx.call({ cmd: "workflow_new" }, 15000);
+        if (res.isError) return res;
+        // #932 (recurrence on 0.50.6) — a NEW canvas needs a NEW fence.
+        //
+        // workflow_new authoritatively re-points the active workflow, exactly as
+        // workflow_open does — but only the open path re-derived the command
+        // fence afterwards (openWorkflowWithVerify). So this session kept the
+        // PREVIOUS workflow's instance stamp while the user was now looking at a
+        // brand-new blank canvas, and every stamped command after it failed with
+        // "workflow instance mismatch". The reporter created a workflow and could
+        // not add a single node to it.
+        //
+        // Refresh from the panel's own live active record, the same way the open
+        // path does. The panel mints the new canvas's identity EAGERLY at
+        // creation ("so the key exists BEFORE the first edit"), so it is readable
+        // by the time this runs — it is simply not carried on the workflow_new
+        // reply, which returns key/routing_key but no workflow_uuid.
+        //
+        // NEVER fails the call on a rebind miss: the workflow WAS created, and
+        // retracting that would be the worse lie. Disclose instead, so the agent
+        // learns the graph tools are not yet usable here rather than discovering
+        // it one confusing mismatch at a time.
+        const fenceRebind = await rebindWorkflowFence(ctx);
+        let canMutateNow: boolean | undefined;
+        let refusalCause: "unroutable" | "disconnected" | "no_identity" | "capability" | undefined;
+        try {
+          if (ctx.tabGraphMutationCapability) {
+            const cap = ctx.tabGraphMutationCapability();
+            canMutateNow = cap.known ? cap.canMutate : undefined;
+            if (cap.known && !cap.canMutate) refusalCause = cap.because;
+          } else {
+            canMutateNow = ctx.tabCanMutateGraph?.();
+          }
+        } catch {
+          canMutateNow = undefined; // a guard that can throw is not a guard
+          refusalCause = undefined;
+        }
+        const fence = describeFenceRebind(fenceRebind, canMutateNow, refusalCause);
+        if (!fence || fence.binding === "bound") return res;
+        return appendNote(
+          res,
+          `The blank workflow WAS created.${fence.note}`,
+        );
+      },
     ),
     def(
       "panel_open_workflow",
