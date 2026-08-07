@@ -22,6 +22,8 @@ import type {
 import { logger } from "../utils/logger.js";
 import { errorText } from "./error-text.js";
 import { buildAgentSpawnEnv } from "../services/panel-secrets.js";
+import { loadTurnRegistry, saveTurnRegistry, tombstoneTurn } from "./turn-registry.js";
+import { randomUUID } from "node:crypto";
 import {
   type AgentBackend,
   type AgentEvent,
@@ -233,6 +235,12 @@ export interface ClaudeBackendDeps {
  *  traceless result) fails closed as unverifiable, never ok:true (#745 r3). */
 const MAX_UNRESOLVED_TURNS = 16;
 
+/** Bound on REMEMBERED dead-session turn ids (#886). The set exists to
+ *  recognize a late result from a restarted session — it is not a
+ *  classification input, so a cap here only bounds how far back recognition
+ *  reaches; beyond it a stray falls back to the plain traceless report. */
+const MAX_REMEMBERED_DEAD_TURNS = 64;
+
 /**
  * The Claude Agent SDK adapter. One instance per PanelAgent; it holds the live
  * `Query` for the current session and re-creates it on each `run()`.
@@ -295,6 +303,53 @@ export class ClaudeBackend implements AgentBackend {
     interrupted: boolean;
   }> = [];
 
+  // #886 — "submitted" must survive the session: when a run() restart drops the
+  // live traces above, their ids move here (and a RESUMED session rehydrates
+  // them from the durable registry written by the previous process). A
+  // traceless result while this set is non-empty is then RECOGNIZED for what
+  // it most likely is — a turn that was in flight when its session died,
+  // completing late — and reported as "completed but unverified": never a
+  // fabricated success (fail-closed #745 stands), but also no longer the false
+  // "could not be matched to any submitted turn", which claimed the turn never
+  // existed when only its record was lost. Insertion-ordered; recognition
+  // consumes the oldest entry (results land in submission order).
+  //
+  // Entries are owner-TAGGED (`<instanceId>:<turnId>`): turnSeq restarts per
+  // process, so two instances can each leave their own turn "1" outstanding —
+  // untagged ids would collapse those into one record and the second late
+  // result would be falsely reported as matching no submission (codex gate).
+  private readonly instanceId = randomUUID();
+  private rememberedDeadTurns = new Set<string>();
+  /** The remembered set's bound dropped a record at some point — persisted
+   *  into the registry file (`incomplete`) so a RESPAWN also knows the record
+   *  is not provably complete, not just this process (codex gate r2). */
+  private rememberedIncomplete = false;
+  /** Session id the durable registry file belongs to (learned at init). Null
+   *  until then — a submission pulled before init is processed can't be filed
+   *  under a session nobody can resume yet. */
+  private registrySessionId: string | null = null;
+  /** A registry read/write failed — the record of outstanding turns is not
+   *  provably complete, so log it and never lean on the registry's ABSENCE as
+   *  evidence in that state. */
+  private registryDegraded = false;
+
+  // #885 — a stall is not a user rejection. The Agent SDK has no mid-turn steer
+  // (Codex's turn/steer equivalent): a user message pushed into the stream is
+  // queued by the CLI until the current turn ENDS — exactly what a frozen turn
+  // cannot do — so the notice cannot ride the stalled turn itself. What must
+  // not happen is the transcript keeping ONLY the interrupt's generic
+  // user-rejection payload: on the next turn the model reads it and tells the
+  // user "you cancelled" — a lie about the user's own actions. So the notice
+  // is held here and prepended (clearly delimited as harness text, not the
+  // user's words) to the NEXT user turn, where it lands in the transcript
+  // right beside that payload. recoverStalledTurn therefore returns false:
+  // PanelAgent keeps its proven bounded interrupt/restart recovery for the
+  // frozen turn, and the correction rides the turn after.
+  private pendingStallNotice: string | null = null;
+  /** turnSeq when the notice was stored — a genuine `success` landing for that
+   *  turn means the "stall" recovered by itself and the notice is stale. */
+  private pendingStallNoticeTurn = 0;
+
   constructor(deps: ClaudeBackendDeps) {
     this.deps = deps;
   }
@@ -333,7 +388,20 @@ export class ClaudeBackend implements AgentBackend {
    *  image refs to inline base64 blocks so the agent SEES them in this turn (no
    *  get_image view/fetch round-trip). */
   private async shapeTurn(turn: NeutralTurn): Promise<SDKUserMessage> {
-    const text = turn.text;
+    let text = turn.text;
+    // #885 — deliver the held stall correction AHEAD of the user's words, so
+    // the model reads the true origin of the interrupt right next to the
+    // generic rejection payload it would otherwise take at face value. The
+    // notice names the PREVIOUS turn explicitly: on this new turn, a bare
+    // "this turn stalled" would mispoint.
+    if (this.pendingStallNotice) {
+      text =
+        `${this.pendingStallNotice}\n\n` +
+        `[harness note: the notice above is about the PREVIOUS turn — the one the harness cleared. ` +
+        `It is not part of the user's message and the user did not write it. The user's message follows.]\n\n` +
+        text;
+      this.pendingStallNotice = null;
+    }
     const images = turn.images ?? [];
     let content: unknown = text;
     if (images.length) {
@@ -415,23 +483,51 @@ export class ClaudeBackend implements AgentBackend {
     const query = await loadQuery();
     const self = this;
     // A (re)started session can never produce results for turns submitted to a
-    // PREVIOUS session — drop any dead traces and advance the result sequence
-    // past EVERY turn stamped so far (turnSeq), whether or not traces remain:
-    // in a FULLY DRAINED (e.g. poisoned) session the FIFO is already empty, but
-    // the sequence must still move past the old ids or the new session's first
-    // result re-crosses the old gap and falsely re-poisons (#745 r5). Stray
-    // late results from the dead session then arrive TRACELESS and fail closed
-    // instead. This genuine restart boundary is also the ONLY reset of the
+    // PREVIOUS session through the live FIFO — clear it and advance the result
+    // sequence past EVERY turn stamped so far (turnSeq), whether or not traces
+    // remain: in a FULLY DRAINED (e.g. poisoned) session the FIFO is already
+    // empty, but the sequence must still move past the old ids or the new
+    // session's first result re-crosses the old gap and falsely re-poisons
+    // (#745 r5). This genuine restart boundary is also the ONLY reset of the
     // sticky classification poison (#745 r4). Done here, at run() entry (BEFORE
     // the new query exists), rather than on system/init: the SDK's prompt drain
     // legitimately pulls the first batch before init is processed, and an
     // init-time clear would unmark that genuinely in-flight turn (#745).
+    //
+    // But "the trace is gone" must not become "no turn was ever submitted"
+    // (#886): the dead session's unresolved ids are REMEMBERED (and, when this
+    // run RESUMES a session, rehydrated from the durable registry a previous
+    // process wrote), so a stray late result is recognized as a submitted
+    // turn's late landing and reported "completed but unverified" instead of
+    // "matched to no submitted turn". Recognition never upgrades a result to
+    // ok:true — fail-closed stands.
+    for (const dead of this.turns) this.rememberDeadTurn(`${this.instanceId}:${dead.id}`);
     this.turns.length = 0;
     this.lastResultTurnId = this.turnSeq;
     this.classificationPoisoned = false;
     this.parkedInterrupted.clear(); // dead session's parks die with it
     this.consumedInterrupted.clear(); // …and its landing history
     this.markerBase = this.lastResultTurnId; // turn markers are run-relative (#728)
+    const resumeTarget = opts.resume ?? opts.sessionId ?? null;
+    // Registry writes before init (the prompt drain can submit ahead of it)
+    // file under the resume target — the session they will actually run in.
+    // A fresh start files nothing until init names the new session.
+    this.registrySessionId = resumeTarget;
+    if (resumeTarget) {
+      const loaded = loadTurnRegistry(resumeTarget);
+      // Hydrate whatever the session's files prove is outstanding — including
+      // this instance's OWN file (tags dedupe against the in-memory carry, and
+      // tombstones keep already-reported strays from resurrecting). A degraded
+      // or self-declared-incomplete record must not later ground the confident
+      // "matched to no submitted turn".
+      for (const tag of loaded.tags) this.rememberDeadTurn(tag);
+      if (loaded.kind === "degraded" || loaded.incomplete) {
+        this.registryDegraded = true;
+        logger.warn(
+          `[claude-backend] turn registry for the resumed session is ${loaded.kind === "degraded" ? `unreadable (${loaded.reason})` : "incomplete"} — outstanding-turn recognition is degraded (#886)`,
+        );
+      }
+    }
     // Wrap the neutral channel: shape each turn into the SDK's native form right
     // before it's read, so PanelAgent never deals in SDKUserMessage.
     async function* prompt(): AsyncGenerator<SDKUserMessage> {
@@ -451,6 +547,7 @@ export class ClaudeBackend implements AgentBackend {
             `[claude-backend] over ${MAX_UNRESOLVED_TURNS} unresolved turns — evicted turn ${evicted?.id}'s trace; its result will fail closed as unverifiable (#740)`,
           );
         }
+        self.saveRegistry(); // the submission record must survive a restart (#886)
         yield msg;
       }
     }
@@ -506,6 +603,23 @@ export class ClaudeBackend implements AgentBackend {
     await this.q?.interrupt();
   }
 
+  /**
+   * #885 — record the harness-stall notice so the NEXT user turn carries it
+   * into the transcript beside the interrupt's generic user-rejection payload
+   * (see the pendingStallNotice field comment for why the notice cannot ride
+   * the stalled turn itself on this provider). Returns false: no mid-turn
+   * steer exists here, so PanelAgent keeps its bounded interrupt/restart
+   * recovery for the frozen turn — the notice's job is only to stop the agent
+   * from telling the user THEY cancelled, and to tell it a retry is safe.
+   */
+  async recoverStalledTurn(notice: string): Promise<boolean> {
+    if (notice.trim()) {
+      this.pendingStallNotice = notice;
+      this.pendingStallNoticeTurn = this.turnSeq;
+    }
+    return false;
+  }
+
   /** Permanently dispose of the live SDK query. The Agent SDK has no explicit
    *  "dispose" beyond interrupt(), which both stops the in-flight turn and lets
    *  the underlying transport wind down once the prompt generator is no longer
@@ -528,6 +642,78 @@ export class ClaudeBackend implements AgentBackend {
     return [];
   }
 
+  /** Remember a submitted turn whose result can no longer arrive through the
+   *  live FIFO (its session restarted). Recognition-only (#886): membership
+   *  changes what an unmatched result can honestly be CALLED, never how it is
+   *  classified. Bounded — oldest drops first, but a drop means the record is
+   *  no longer provably complete, so it degrades recognition (the hedged
+   *  wording) rather than silently reverting to the confident negative. */
+  private rememberDeadTurn(tag: string): void {
+    if (this.rememberedDeadTurns.has(tag)) return;
+    this.rememberedDeadTurns.add(tag);
+    if (this.rememberedDeadTurns.size > MAX_REMEMBERED_DEAD_TURNS) {
+      const oldest = this.rememberedDeadTurns.keys().next().value;
+      if (oldest !== undefined) this.rememberedDeadTurns.delete(oldest);
+      this.registryDegraded = true;
+      this.rememberedIncomplete = true; // persisted — a respawn must hedge too
+      logger.warn(
+        `[claude-backend] over ${MAX_REMEMBERED_DEAD_TURNS} remembered dead turns — dropped the oldest record; outstanding-turn recognition is degraded (#886)`,
+      );
+    }
+  }
+
+  /** Consume the oldest remembered dead-turn tag, if any — a recognized late
+   *  landing spends the record (in memory, in this instance's file, and in the
+   *  session's tombstones) so a second stray can never re-claim it. */
+  private takeOldestRememberedDeadTurn(): string | null {
+    const oldest = this.rememberedDeadTurns.keys().next().value;
+    if (oldest === undefined) return null;
+    this.rememberedDeadTurns.delete(oldest);
+    const sid = this.registrySessionId;
+    if (sid) {
+      try {
+        tombstoneTurn(sid, oldest);
+      } catch (err) {
+        // A lost tombstone can only REVIVE an already-reported record (a
+        // repeated hedged disclosure) — never a fabricated success. Log, move on.
+        logger.warn(`[claude-backend] turn tombstone write failed: ${msgOf(err)} (#886)`);
+      }
+    }
+    this.saveRegistry();
+    return oldest;
+  }
+
+  /** Persist which submitted turns are still outstanding (#886). A failure
+   *  degrades recognition (flagged + logged) but must never break the turn
+   *  itself — the registry is a recognition aid, not load-bearing for the
+   *  turn in flight.
+   *
+   *  Ordering: saves happen AFTER the trace push/pop they record. A crash in
+   *  the pop→save window leaves a STALE record (a turn whose result was seen
+   *  still listed outstanding) — over-recognition, which produces the hedged
+   *  "completed but unverified" disclosure. The reverse order could LOSE a
+   *  record, and a lost record produces the confident "matched to no
+   *  submitted turn" — a false assertion — so over-recognition is the
+   *  deliberate failure side. */
+  private saveRegistry(): void {
+    const sid = this.registrySessionId;
+    if (!sid) return;
+    try {
+      saveTurnRegistry(
+        sid,
+        this.instanceId,
+        this.turns.map((t) => t.id),
+        [...this.rememberedDeadTurns],
+        this.rememberedIncomplete,
+      );
+    } catch (err) {
+      this.registryDegraded = true;
+      logger.warn(
+        `[claude-backend] turn registry write failed: ${msgOf(err)} — outstanding-turn recognition is degraded (#886)`,
+      );
+    }
+  }
+
   /** Normalize one SDK message into zero or more canonical AgentEvents. */
   private *route(message: SDKMessage): Generator<AgentEvent> {
     switch (message.type) {
@@ -535,9 +721,15 @@ export class ClaudeBackend implements AgentBackend {
         if (message.subtype === "init") {
           // New session (or a restarted one). No turn state is reset here: all
           // of it is per-turn (the `turns` FIFO), and dead traces from a
-          // previous session are dropped at run() entry — an init-time clear
-          // could unmark a turn the prompt drain already handed to the SDK
-          // before this init was processed (#745 review).
+          // previous session were already carried into `rememberedDeadTurns`
+          // at run() entry — an init-time clear could unmark a turn the prompt
+          // drain already handed to the SDK before this init was processed
+          // (#745 review).
+          // The durable turn registry is keyed by THIS session id from now on
+          // (#886) — including a pre-init submission the prompt drain already
+          // pulled, which couldn't be filed before the session id was known.
+          this.registrySessionId = message.session_id;
+          this.saveRegistry();
           yield {
             type: "session",
             sessionId: message.session_id,
@@ -731,12 +923,61 @@ export class ClaudeBackend implements AgentBackend {
           );
         }
         const trace = idx >= 0 ? (this.turns.splice(idx, 1)[0] ?? null) : null;
+        if (trace) {
+          // The pop retires the turn's outstanding record (#886) — in this
+          // instance's own file AND in the session's tombstones: a concurrent
+          // resumer may have copied this turn's id into its own file as a dead
+          // record while it was still live, and only a tombstone invalidates
+          // that replica (rewriting this instance's file does not). A lost
+          // tombstone can only revive the copy as a hedged over-recognition —
+          // never a fabricated success — so a failure logs and moves on.
+          const sid = this.registrySessionId;
+          if (sid) {
+            try {
+              tombstoneTurn(sid, `${this.instanceId}:${trace.id}`);
+            } catch (err) {
+              logger.warn(`[claude-backend] turn tombstone write failed: ${msgOf(err)} (#886)`);
+            }
+          }
+          this.saveRegistry();
+        }
         let unverifiable: string | null = null;
+        // #886: an unmatched result with a REMEMBERED outstanding submission is
+        // a different report than one with none. Both fail closed — only the
+        // honesty of the message differs.
+        let unverifiedCompletion = false;
         if (this.classificationPoisoned) {
           unverifiable = "Turn bookkeeping was poisoned by an earlier overflow — no result in this session can be verified";
         } else if (!trace) {
-          unverifiable = "The result could not be matched to any submitted turn";
-          logger.warn(`[claude-backend] ${unverifiable} — unverifiable, failing closed (#740)`);
+          const deadId = this.takeOldestRememberedDeadTurn();
+          if (deadId !== null) {
+            // A turn WAS submitted (before a session restart dropped its trace)
+            // and never reported an outcome — this result is most plausibly its
+            // late landing. Say exactly that: not a success (unverifiable — the
+            // match is inference, not proof), and not a failure either — the
+            // turn may have finished real work, and "turn failed, try again"
+            // would invite a destructive duplicate retry.
+            unverifiedCompletion = true;
+            unverifiable =
+              `A result (reported as "${resultSubtype}") arrived that matches no live turn, but a turn ` +
+              `submitted before the session restarted never reported an outcome — this is most likely that ` +
+              `turn completing late. It may have finished real work (files written, changes made), yet I ` +
+              `cannot verify which turn it was, so I am NOT counting it as a success. Check what that turn ` +
+              `was doing before asking for it again, so the work is not done twice.`;
+            logger.warn(
+              `[claude-backend] traceless result (${resultSubtype}) recognized as a likely late landing for a pre-restart submitted turn — completed but unverified, failing closed (#886)`,
+            );
+          } else if (this.registryDegraded) {
+            // The recognition record itself is not provably complete — do not
+            // assert the negative as confidently as a healthy registry allows.
+            unverifiable =
+              "The result could not be matched to any submitted turn, and the durable turn record " +
+              "could not be fully read or written, so an outstanding earlier submission can't be ruled out";
+            logger.warn(`[claude-backend] ${unverifiable} — unverifiable, failing closed (#740/#886)`);
+          } else {
+            unverifiable = "The result could not be matched to any submitted turn";
+            logger.warn(`[claude-backend] ${unverifiable} — unverifiable, failing closed (#740)`);
+          }
         } else {
           let crossesGap = false;
           if (trace.id > this.lastResultTurnId + 1) {
@@ -786,7 +1027,13 @@ export class ClaudeBackend implements AgentBackend {
           ok = false;
           yield {
             type: "error",
-            message: `${unverifiable} — reporting the turn as unverifiable rather than a success.`,
+            // The recognized late landing's message is self-contained (it says
+            // "not counted as a success" itself) and flagged so the panel
+            // doesn't frame it as a failure (#886).
+            message: unverifiedCompletion
+              ? unverifiable
+              : `${unverifiable} — reporting the turn as unverifiable rather than a success.`,
+            ...(unverifiedCompletion ? { unverifiedCompletion: true } : {}),
             ...stamp,
           };
         } else if (ok && trace !== null && trace.blockReason !== null) {
@@ -800,6 +1047,19 @@ export class ClaudeBackend implements AgentBackend {
             message: "The model ended the turn without producing a reply.",
             ...stamp,
           };
+        }
+        // #885: a SELF landing for the stalled turn (success OR a genuine
+        // error — i.e. not the interrupt's doing) means the turn ended on its
+        // own and no rejection payload ever landed in the transcript, so the
+        // held correction would be stale; drop it. An INTERRUPT landing
+        // (trace.interrupted) is exactly the case the notice exists for.
+        if (
+          this.pendingStallNotice !== null &&
+          trace !== null &&
+          !trace.interrupted &&
+          trace.id >= this.pendingStallNoticeTurn
+        ) {
+          this.pendingStallNotice = null;
         }
         yield {
           type: "result",

@@ -1673,9 +1673,16 @@ export class PanelAgent {
         const detail = typeof ev.message === "string" && ev.message.trim() ? ev.message.trim() : "unknown error";
         if (!this.errorSurfaced) {
           this.errorSurfaced = true;
+          // #886: a "completed but unverified" disclosure is NOT a turn failure
+          // — the turn may have finished real work — and its message is
+          // self-contained. Framing it as "turn failed … nothing was lost, try
+          // again" would be two lies (it didn't fail; something may have been
+          // DONE) and would invite a destructive duplicate retry.
           this.deps.onSay(
             this.tabId,
-            `⚠️ The ${this.model} turn failed: ${detail}\n\nNothing was lost — try again, switch models from the composer picker, or check the terminal running the orchestrator for more detail.`,
+            ev.unverifiedCompletion
+              ? `⚠️ ${detail}`
+              : `⚠️ The ${this.model} turn failed: ${detail}\n\nNothing was lost — try again, switch models from the composer picker, or check the terminal running the orchestrator for more detail.`,
           );
         }
         logger.warn(`[panel-agent ${this.short()}] backend error: ${detail}`);

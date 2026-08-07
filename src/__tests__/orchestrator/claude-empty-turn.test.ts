@@ -9,7 +9,15 @@
 // collected and asserted on.
 
 import { describe, expect, it, beforeEach, vi } from "vitest";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentEvent } from "../../orchestrator/agent-backend.js";
+
+// Keep the durable turn registry (#886) hermetic per test file — the backend
+// writes it on every submission, and the fixed INIT session id would otherwise
+// share one real-tmpdir file across files.
+process.env.COMFYUI_MCP_TURN_REGISTRY_DIR = mkdtempSync(join(tmpdir(), "claude-empty-turn-registry-"));
 
 const hoisted = vi.hoisted(() => ({
   /** A push-based async message source — stands in for the live SDK query stream. */
@@ -406,9 +414,11 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
     await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
     expect(resultsOf(events)[0]).toMatchObject({ ok: false });
     expect(errorsOf(events)).toHaveLength(1);
-    // A STRAY late result from the dead session (no matching submitted turn)
-    // must FAIL CLOSED — unverifiable, ok:false — never forwarded as a success
-    // that completes the current turn (#745 r3 review).
+    // A STRAY late result from the dead session must still FAIL CLOSED —
+    // ok:false, never a forwarded success (#745 r3). But turn A WAS submitted
+    // before session 1 died, so the report must not claim the opposite: the
+    // stray is RECOGNIZED as a submitted turn's late landing and disclosed as
+    // "completed but unverified", not "matched to no submitted turn" (#886).
     hoisted.queue.push(RESULT_SUCCESS);
     hoisted.queue.end();
     await done2;
@@ -416,8 +426,11 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
     expect(results).toHaveLength(2);
     expect(results[1]).toMatchObject({ ok: false });
     const errors = errorsOf(events);
-    expect(errors).toHaveLength(2); // turn B's synthetic error + the stray's unverifiable one
-    expect(errors[1].message).toMatch(/unverifiable/i);
+    expect(errors).toHaveLength(2); // turn B's synthetic error + the stray's recognized one
+    expect(errors[1].message).toMatch(/completing late/i);
+    expect(errors[1].message).toMatch(/NOT counting it as a success/i);
+    expect(errors[1].message).not.toMatch(/could not be matched/i);
+    expect(errors[1].unverifiedCompletion).toBe(true);
   });
 
   it("a result/success with NO matching turn fails closed (unverifiable) instead of forwarding ok:true", async () => {

@@ -7,6 +7,13 @@
 // REPLACES the env, so it must be a complete copy).
 
 import { describe, expect, it, beforeEach, vi } from "vitest";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// Keep the durable turn registry (#886) hermetic — the run() turn test drives
+// a submission, which persists the registry.
+process.env.COMFYUI_MCP_TURN_REGISTRY_DIR = mkdtempSync(join(tmpdir(), "claude-spawn-env-registry-"));
 
 const hoisted = vi.hoisted(() => ({
   optionsSeen: [] as Array<Record<string, unknown>>,
