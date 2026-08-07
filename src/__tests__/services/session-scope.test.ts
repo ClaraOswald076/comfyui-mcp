@@ -12,6 +12,7 @@ import {
   shouldRetireSharedAgent,
   messageOrigin,
   workflowOriginNote,
+  shortTabId,
 } from "../../services/session-scope.js";
 
 describe("shared session scope (#884)", () => {
@@ -112,5 +113,57 @@ describe("shared session scope (#884)", () => {
       });
       expect(note).not.toBeNull();
     });
+  });
+});
+
+// #934 — two DIFFERENT tabs rendered identically, in the middle of a wedge whose
+// entire question was whether anything had changed.
+//
+// Tab ids come in two shapes. A browser tab is a uuid, where slice(0, 8) is a
+// fine abbreviation. A workflow-keyed tab is `wf:workflows/<name>.json`, and
+// there slice(0, 8) yields the literal "wf:workf" for EVERY workflow — so
+// panel_set_workflow_target reported "Rebound this session from tab wf:workf
+// onto the active tab wf:workf" for a rebind between two different workflows,
+// which reads as a no-op and told the reporter nothing.
+describe("shortTabId (#934)", () => {
+  const UUID = "3f7a1c2e-9b4d-4e5f-8a01-7c6d5e4f3a2b";
+
+  it("keeps the uuid behaviour — 8 hex chars separate any two live tabs", () => {
+    expect(shortTabId(UUID)).toBe("3f7a1c2e");
+  });
+
+  // THE bug: the old rendering collapsed the entire workflows/ namespace.
+  it("distinguishes two workflow tabs that used to render identically", () => {
+    const a = "wf:workflows/Untitled 2026-08-06 03-58-41.json";
+    const b = "wf:workflows/portrait-v3.json";
+    expect(a.slice(0, 8)).toBe(b.slice(0, 8)); // the defect, stated
+    expect(shortTabId(a)).not.toBe(shortTabId(b));
+    expect(shortTabId(b)).toBe("wf:portrait-v3.json");
+  });
+
+  it("keeps the part that varies — the filename, not the shared directory", () => {
+    expect(shortTabId("wf:workflows/deep/nested/clip.json")).toBe("wf:clip.json");
+    // Windows separators too: a tab id can carry either. (The backslashes are
+    // escaped — "\d" and "\c" are not escape sequences, so an unescaped fixture
+    // silently becomes "workflowsdeepclip.json" and tests nothing.)
+    expect(shortTabId("wf:workflows\\deep\\clip.json")).toBe("wf:clip.json");
+  });
+
+  it("stays bounded for an absurdly long name, keeping the END", () => {
+    const long = `wf:workflows/${"x".repeat(120)}-final.json`;
+    const out = shortTabId(long);
+    expect(out.length).toBeLessThanOrEqual(44);
+    // The tail is what disambiguates a set of same-prefixed names.
+    expect(out.endsWith("-final.json")).toBe(true);
+    expect(out).toContain("…");
+  });
+
+  it("does not throw on the empty / missing cases", () => {
+    // A missing id renders as empty rather than the string "undefined" — this
+    // goes into agent-facing prose, where the word "undefined" reads as a value.
+    expect(shortTabId("")).toBe("");
+    expect(shortTabId(undefined)).toBe("");
+    expect(shortTabId(null)).toBe("");
+    expect(shortTabId("wf:")).toBe("wf:");
   });
 });
