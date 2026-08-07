@@ -6011,6 +6011,72 @@ describe("panel-tools: panel_run scoped-run stamp-race retry (#772)", () => {
     expect(runText(res)).toMatch(/queued once, not twice/);
   });
 
+  // #1050 — the re-issue used to fire in the SAME tick as the refusal, so it
+  // landed in the very window the panel had just refused for. A reporter's
+  // retry raced identically and instantly: the one re-issue was spent for
+  // nothing and the run was refused twice with nothing queued.
+  //
+  // The pause is a SETTLE, not the mutation-quiescence barrier the report asked
+  // for — the panel exposes no such signal, and inventing a graph-is-quiet
+  // reading from out here would be guessing at the frontend's state. What it
+  // buys is a moment for pending edits to land, exactly as the reconnect retry
+  // already does for a dropped socket.
+  describe("#1050: the re-issue settles first", () => {
+    it("waits before re-dispatching instead of racing in the same tick", async () => {
+      __panelToolsTestHooks.setRetrySettleMs(40);
+      try {
+        const { ctx, runs } = runCtx([{ error: RACE }, { queued: true, prompt_id: "p1" }]);
+        const started = Date.now();
+        const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+        const elapsed = Date.now() - started;
+
+        expect(res.isError).toBeFalsy();
+        expect(runs).toHaveLength(2);
+        // The gap is the whole fix: without it the second dispatch is issued
+        // synchronously into the window that just refused the first.
+        expect(elapsed).toBeGreaterThanOrEqual(35);
+      } finally {
+        __panelToolsTestHooks.setRetrySettleMs(0);
+      }
+    });
+
+    it("still re-issues EXACTLY once when the pause does not save it", async () => {
+      const { ctx, runs } = runCtx([{ error: RACE }, { error: RACE }]);
+      const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+
+      expect(res.isError).toBe(true);
+      expect(runs).toHaveLength(2); // never a third — a second race is surfaced
+    });
+
+    // A graph still moving after the pause means the canvas is being edited, and
+    // that is the one thing the caller can act on.
+    it("says a second race means the graph is still changing", async () => {
+      const { ctx } = runCtx([{ error: RACE }, { error: RACE }]);
+      const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+      const text = runText(res);
+      expect(text).toMatch(/after a short pause to let pending graph edits land/);
+      expect(text).toMatch(/still changing under the run/);
+      // …and the certified fact is unchanged.
+      expect(text).toMatch(/first dispatch definitely queued nothing/);
+    });
+
+    // The pause must not apply to rejections that are NOT the certified race —
+    // those are terminal and must stay instant.
+    it("does not pause a rejection it will not retry", async () => {
+      __panelToolsTestHooks.setRetrySettleMs(300);
+      try {
+        const { ctx, runs } = runCtx([{ error: "ComfyUI refused: node 3 has no input 'x'" }]);
+        const started = Date.now();
+        const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+        expect(res.isError).toBe(true);
+        expect(runs).toHaveLength(1);
+        expect(Date.now() - started).toBeLessThan(250);
+      } finally {
+        __panelToolsTestHooks.setRetrySettleMs(0);
+      }
+    });
+  });
+
   it("does NOT retry a rejection that is not the certified race (validation failure)", async () => {
     const { ctx, runs } = runCtx([
       { node_errors: { 5: { class_type: "KSampler", errors: [{ message: "bad seed" }] } } },

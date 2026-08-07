@@ -7066,6 +7066,20 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         ) {
           scopeRebuilt = true;
           try {
+            // #1050 — SETTLE before re-issuing. The panel refuses this race when the
+            // graph changed between dispatch and apply, and re-dispatching in the
+            // same tick lands in the SAME window: a reporter's retry raced
+            // identically and instantly, so the one re-issue was spent for nothing
+            // and the run was refused twice with nothing queued.
+            //
+            // This is a SETTLE PAUSE, not the mutation-quiescence barrier the report
+            // asked for. The panel exposes no such signal, and inventing a
+            // graph-is-quiet reading from out here would be guessing at the
+            // frontend's state. It buys pending edits a moment to land — exactly
+            // what the reconnect retry already does for a dropped socket — and
+            // nothing more. A graph still moving after it (a user actively editing)
+            // races again and is SURFACED, never re-raced.
+            await sleep(retrySettleMs());
             res = await ctx.call(runCmd, 20000);
             rejection = detectRunRejection(res);
           } catch (err) {
@@ -7095,9 +7109,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             rejection,
             `\n\n(Dispatch history: the first graph_run was refused by the panel's run-to-node ` +
               `graph-stamp race, which CERTIFIED that nothing was queued, so the scoped run was ` +
-              `re-issued exactly once. The failure above is that SECOND dispatch; it was not ` +
-              `retried again. Judge whether anything was queued from that message alone — the ` +
-              `first dispatch definitely queued nothing.)`,
+              `re-issued exactly once — after a short pause to let pending graph edits land ` +
+              `(#1050). The failure above is that SECOND dispatch; it was not retried again. ` +
+              `Judge whether anything was queued from that message alone — the first dispatch ` +
+              `definitely queued nothing. Racing AGAIN after the pause means the graph is still ` +
+              `changing under the run: let the canvas settle, then re-run.)`,
           );
         }
         // Attribute this genuine queue to ourselves so a later panel_run in the
