@@ -329,6 +329,16 @@ default in current builds; **older builds need `--jinja`** (the panel detects a
 tools-incapable server at connect and says exactly that). The single loaded
 model is adopted automatically — no picking needed.
 
+On a single-GPU box a **local** llama-server (or llama-swap in front of it)
+joins the same VRAM handoff as Ollama and LM Studio: while a ComfyUI render
+runs, your chat is held and answered the moment the render finishes. Since
+llama-server has no unload API (and llama-swap swaps models upstream on
+demand), the handoff is hold-only — nothing is explicitly unloaded or warmed.
+A **remote** `COMFYUI_MCP_LLAMACPP_HOST` is someone else's GPU and is never
+gated. The handoff is on by default for all three local backends; opt out with
+`COMFYUI_MCP_PAUSE_LOCAL_ON_GEN=0` (the legacy
+`COMFYUI_MCP_OLLAMA_PAUSE_ON_GEN=0` is still honored).
+
 ## Custom endpoint (any OpenAI-compatible server)
 
 Anything that speaks `/v1/chat/completions` — vLLM, DeepSeek, Together, Azure
