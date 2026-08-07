@@ -809,6 +809,30 @@ describe("panel-tools: panel_run verdict is derived from the ComfyUI reply", () 
     expect(RunCompletions.ticketFor("p-ok")).toBeDefined();
   });
 
+  it("#704: the ticket records the CONVERSATION that queued the run, not just the routed tab", async () => {
+    // The tool session is bound to the shared conversation (#884), and the run is
+    // routed to whichever tab is active. The journal needs BOTH: the tab is where
+    // the completion will arrive from, the conversation is who gets to call it its
+    // own — and only the second survives the panel re-registering under a new tab
+    // id, which is what made an agent's own render come back "origin UNDETERMINED".
+    const reply: ToolResult = {
+      content: [
+        { type: "text", text: JSON.stringify({ queued: true, batch_count: 1, prompt_id: "p-conv" }) },
+      ],
+    };
+    const { ctx } = makeRunCtx(reply);
+    ctx.tabId = "orchestrator::claude"; // the agent key this MCP session binds
+    (ctx as { bridge: unknown }).bridge = {
+      resolveSharedTabId: (scopeId?: string) =>
+        scopeId === "orchestrator::claude" ? "tmp:active" : undefined,
+    };
+    const res = await defByName("panel_run").handler({}, ctx);
+    expect(res.isError).toBeFalsy();
+    const ticket = RunCompletions.ticketFor("p-conv");
+    expect(ticket?.tabId).toBe("tmp:active");
+    expect(ticket?.conversation).toBe("orchestrator::claude");
+  });
+
   it("#468: a queue with NO prompt id does NOT promise automatic delivery — it says UNDETERMINED", async () => {
     // The panel forwards ComfyUI's /prompt reply; without a prompt_id there is
     // nothing to correlate a later completion to, so telling the agent to idle

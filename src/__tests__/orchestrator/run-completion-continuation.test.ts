@@ -809,6 +809,185 @@ describe("run completion journal correlation (#468)", () => {
     expect(journal.correlate("wf:two", { prompt_id: PROMPT_A }).status).toBe("foreign");
   });
 
+  // ── #704 — WHOSE run is it: the conversation, not the tab ──────────────────
+  //
+  // The reported failure: `panel_run` returned prompt bc023bc3…, that exact run
+  // came back RE-DELIVERED, and it was annotated "does NOT match any run you
+  // queued with panel_run — its origin is UNDETERMINED. Do NOT treat it as the
+  // render you are waiting on." That does not merely mislabel a correct result —
+  // it instructs the agent to discard it and go re-verify.
+  //
+  // Why it happened: the ticket was owned by the panel TAB ID, which is a routing
+  // address, not an identity. A panel that reconnects re-registers under a new id
+  // (an unsaved workflow mints a fresh `tmp:<uuid>` on every page load) and only a
+  // SAME-SOCKET re-hello carries the `migrated_from` that moveKey follows — so the
+  // ticket was stranded under a dead id while the completion arrived under the
+  // live one. The conversation (#884: one orchestrator-scoped session across every
+  // tab and workflow) is the thing that actually queued the run and does not churn.
+  //
+  // Both directions are locked below: an own run stays attributable across the
+  // gap, and a run this conversation did NOT queue stays unattributable.
+
+  it("#704: a run this CONVERSATION queued still matches after the panel reconnects under a NEW tab id", () => {
+    const CLAUDE = "orchestrator::claude";
+    journal.openRun(PROMPT_A, { tabId: "tmp:before-reload", conversation: CLAUDE });
+    // The browser reloaded mid-render: same panel, same conversation, new socket,
+    // and the unsaved workflow minted a fresh tmp: id — no migration alias exists
+    // for moveKey to follow, so the ticket's tab is simply gone.
+    expect(journal.correlate("tmp:after-reload", { prompt_id: PROMPT_A }, CLAUDE)).toEqual({
+      status: "matched",
+      promptId: PROMPT_A,
+    });
+  });
+
+  it("#704: the RE-DELIVERED completion carries the matched verdict, not the UNDETERMINED warning", () => {
+    // End to end through the journal, in the shape the issue reported: the
+    // completion lands when no agent can take it (so it is replayed later), and
+    // the tab it lands on is not the one the run was queued from.
+    const CLAUDE = "orchestrator::claude";
+    journal.openRun(PROMPT_A, { tabId: "tmp:before-reload", conversation: CLAUDE });
+    const entry = journal.record(
+      "tmp:after-reload",
+      { kind: "executed", prompt_id: PROMPT_A },
+      { conversation: CLAUDE },
+    );
+    expect(entry.correlation.status).toBe("matched");
+    journal.deliverPending("tmp:after-reload", () => false); // no agent — journaled
+    const seen: CompletionPayload[] = [];
+    journal.deliverPending("tmp:after-reload", (p) => {
+      seen.push(p);
+      return true;
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0].replayed).toBe(true); // …the "RE-DELIVERED" prefix
+    expect(seen[0].run_correlation).toBe("matched"); // …but NOT "its origin is UNDETERMINED"
+  });
+
+  it("#704 NEGATIVE: a run this conversation never queued is STILL unattributable", () => {
+    // The user pressing Queue Prompt themselves, or any render nothing ticketed:
+    // there is no ticket, so nothing to own, and the warning must still fire.
+    const CLAUDE = "orchestrator::claude";
+    journal.openRun(PROMPT_A, { tabId: "wf:one", conversation: CLAUDE });
+    expect(journal.correlate("wf:one", { prompt_id: PROMPT_B }, CLAUDE)).toEqual({
+      status: "foreign",
+      promptId: PROMPT_B,
+    });
+    // …including on the very tab that queued A, and for a near-miss id.
+    expect(journal.correlate("wf:one", { prompt_id: `${PROMPT_A}x` }, CLAUDE).status).toBe(
+      "foreign",
+    );
+  });
+
+  it("#704 NEGATIVE: ANOTHER conversation's run never matches, even on the same tab", () => {
+    // Two backends are two conversations. A render codex queued must never be
+    // handed to claude as "the run YOU queued" — and this is STRICTER than the old
+    // by-tab rule, which matched on the tab alone and would have.
+    journal.openRun(PROMPT_A, { tabId: "wf:one", conversation: "orchestrator::codex" });
+    expect(
+      journal.correlate("wf:one", { prompt_id: PROMPT_A }, "orchestrator::claude").status,
+    ).toBe("foreign");
+    expect(
+      journal.correlate("wf:one", { prompt_id: PROMPT_A }, "orchestrator::codex").status,
+    ).toBe("matched");
+  });
+
+  it("#704 NEGATIVE: New chat still ends ownership, even for a ticket whose tab id has churned", () => {
+    // The replacement conversation reuses the SAME key string
+    // (`orchestrator::<backend>`), so the boundary cannot rest on the key — the
+    // ticket has to be deleted. Closing by conversation is what reaches a ticket
+    // whose tab was re-registered and is therefore in no member-tab sweep.
+    const CLAUDE = "orchestrator::claude";
+    journal.openRun(PROMPT_A, { tabId: "tmp:gone", conversation: CLAUDE });
+    const arrived = journal.record(
+      "tmp:live",
+      { kind: "executed", prompt_id: PROMPT_A },
+      { conversation: CLAUDE },
+    );
+    expect(arrived.correlation.status).toBe("matched");
+    journal.closeRuns("tmp:live", CLAUDE); // New chat, swept over the LIVE tab only
+    expect(journal.ticketFor(PROMPT_A)).toBeUndefined();
+    expect(journal.correlate("tmp:live", { prompt_id: PROMPT_A }, CLAUDE).status).toBe("foreign");
+    // …and the already-arrived one is downgraded, never swallowed.
+    expect(journal.pending("tmp:live")).toHaveLength(1);
+    expect(journal.pending("tmp:live")[0].correlation.status).toBe("foreign");
+  });
+
+  it("#704: an own run keeps its dedupe identity across the tab change (no phantom duplicate)", () => {
+    // Ownership drives the GENERATION too. If it did not, a completion that
+    // correlates as ours would still be stamped generation 0 — "no identity" — and
+    // lose both its ack memo and its already-delivered flag, so a panel re-sending
+    // the frame would look like a brand-new render.
+    const CLAUDE = "orchestrator::claude";
+    journal.openRun(PROMPT_A, { tabId: "tmp:before", conversation: CLAUDE });
+    const entry = journal.record(
+      "tmp:after",
+      { kind: "executed", prompt_id: PROMPT_A },
+      { conversation: CLAUDE },
+    );
+    expect(entry.ticketSeq).toBeGreaterThan(0);
+    expect(entry.ambiguousId).toBeUndefined();
+    journal.deliverPending("tmp:after", () => true);
+    journal.ack(entry.token);
+    expect(journal.ticketFor(PROMPT_A)?.settled).toBe(true);
+    const resend = journal.record(
+      "tmp:after",
+      { kind: "executed", prompt_id: PROMPT_A },
+      { conversation: CLAUDE },
+    );
+    expect(resend.possibleRepeat).toBe(true); // flagged, never suppressed
+  });
+
+  it("#704: a New chat on ANOTHER backend does not close this conversation's ticket", () => {
+    // Boundaries are per conversation, and a tab can change which conversation it
+    // belongs to. Closing by tab as well looked like the safe direction — closing
+    // too much only weakens a verdict — but it is the #704 failure in miniature:
+    // claude queues on tab T, T switches to codex, a codex New chat runs, and
+    // claude's own render comes back UNDETERMINED (adversarial gate, round 2).
+    journal.openRun(PROMPT_A, { tabId: "wf:one", conversation: "orchestrator::claude" });
+    journal.closeRuns("wf:one", "orchestrator::codex"); // codex's boundary, same tab
+    expect(journal.ticketFor(PROMPT_A)).toBeDefined();
+    expect(
+      journal.correlate("wf:one", { prompt_id: PROMPT_A }, "orchestrator::claude").status,
+    ).toBe("matched");
+    // …and codex still cannot claim it.
+    expect(
+      journal.correlate("wf:one", { prompt_id: PROMPT_A }, "orchestrator::codex").status,
+    ).toBe("foreign");
+    // A ticket with no conversation to name is still closed by its tab, so the
+    // legacy path keeps a boundary rather than leaking one.
+    journal.openRun(PROMPT_B, { tabId: "wf:one" });
+    journal.closeRuns("wf:one", "orchestrator::codex");
+    expect(journal.ticketFor(PROMPT_B)).toBeUndefined();
+  });
+
+  it("#704 NEGATIVE: a REUSED prompt id is still detected when the delivery was acked under a different tab id", () => {
+    // Ownership and the already-delivered MEMO have to agree about who a run
+    // belongs to. When the memo was still filed under the tab, a delivery acked
+    // after a reconnect became invisible to the reuse check: the id looked like a
+    // clean identity when ComfyUI handed it out again, and the EARLIER
+    // generation's late completion could then be presented as the new run's
+    // result (found by the adversarial gate).
+    const CLAUDE = "orchestrator::claude";
+    journal.openRun(PROMPT_A, { tabId: "tmp:before", conversation: CLAUDE });
+    const first = journal.record(
+      "tmp:after",
+      { kind: "executed", prompt_id: PROMPT_A },
+      { conversation: CLAUDE },
+    );
+    journal.deliverPending("tmp:after", () => true);
+    journal.ack(first.token); // delivered + memoized, entry gone
+    // A busy session evicts the settled ticket…
+    for (let i = 0; i < 80; i++) {
+      journal.openRun(`later-${i}`, { tabId: "tmp:after", conversation: CLAUDE });
+    }
+    expect(journal.ticketFor(PROMPT_A)).toBeUndefined();
+    // …and ComfyUI hands the same id out again, queued from a third tab id.
+    journal.openRun(PROMPT_A, { tabId: "tmp:third", conversation: CLAUDE });
+    expect(journal.ticketFor(PROMPT_A)?.reused).toBe(true);
+    // So neither generation's completion may claim to be the run now outstanding.
+    expect(journal.correlate("tmp:third", { prompt_id: PROMPT_A }, CLAUDE).status).toBe("foreign");
+  });
+
   it("forget drops the tab's RUN TICKETS too, so a late completion reads as undetermined", () => {
     journal.openRun(PROMPT_A, { tabId: "wf:one" });
     journal.forget("wf:one");

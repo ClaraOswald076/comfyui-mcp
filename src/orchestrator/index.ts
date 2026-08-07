@@ -4411,7 +4411,14 @@ export async function runPanelOrchestrator(): Promise<void> {
         // Journal the BLIND-STRIPPED copy: a replay must not resurrect pixels
         // the blind gate removed on arrival. `null` = the panel re-sent a
         // completion this tab was already given; suppressed, never duplicated.
-        const entry = RunCompletions.record(event.tab_id, evForTab as CompletionPayload);
+        // #704 — WHO this completion is being reported to. The tab it arrived on
+        // is an address that churns across a panel reconnect (a new `tmp:` id, no
+        // same-socket migration to follow); the conversation is what actually
+        // queued the run, so it is what decides "this is the run YOU queued"
+        // versus the origin-UNDETERMINED warning.
+        const entry = RunCompletions.record(event.tab_id, evForTab as CompletionPayload, {
+          conversation: agentKeyFor(event.tab_id),
+        });
         logger.info(
           `[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} run completion for ${describeCorrelation(entry.correlation)}${entry.possibleRepeat ? " (flagged as a possible repeat)" : ""}`,
         );
@@ -4499,8 +4506,12 @@ export async function runPanelOrchestrator(): Promise<void> {
       // their arrival and are still delivered.
       // #486 — and the questions it asked: answers stay journaled and are still
       // reported, but lose the fingerprint that let them satisfy a re-ask.
+      // #704 — close by CONVERSATION as well as by member tab: a ticket whose tab
+      // was re-registered under a new id on a reconnect is reachable from no member
+      // tab at all, and the replacement conversation reuses the same key string, so
+      // only deleting it ends the old conversation's ownership.
       for (const t of conversationMemberTabs(tabId)) {
-        RunCompletions.closeRuns(t);
+        RunCompletions.closeRuns(t, key);
         AskAnswers.closeAsks(t);
       }
       pushToConversation(key, { type: "session", session_id: null });
@@ -4595,8 +4606,12 @@ export async function runPanelOrchestrator(): Promise<void> {
       // historical session's own render. #884: the boundary is conversation-wide.
       // #486 — likewise its questions: answers stay journaled and are still
       // reported, but lose the fingerprint that let them satisfy a re-ask.
+      // #704 — close by CONVERSATION as well as by member tab: a ticket whose tab
+      // was re-registered under a new id on a reconnect is reachable from no member
+      // tab at all, and the replacement conversation reuses the same key string, so
+      // only deleting it ends the old conversation's ownership.
       for (const t of conversationMemberTabs(tabId)) {
-        RunCompletions.closeRuns(t);
+        RunCompletions.closeRuns(t, key);
         AskAnswers.closeAsks(t);
       }
       if (sid) manager.setResume(key, sid);
