@@ -57,7 +57,13 @@ interface MidOrigin {
 
 interface PendingBatch {
   known: Array<string | undefined>;
+  /** Origin tab ids AS RECORDED — the pin keeps this identity, and the bridge
+   *  resolves it onward through any migration alias. */
   tabs: Set<string>;
+  /** The same origins resolved to the tab they ROUTE TO today. Ambiguity is
+   *  judged on THIS set, so a save's tmp:→wf: rename does not read as two
+   *  workflows (see onSeen). */
+  routes: Set<string>;
   unknown: boolean;
 }
 
@@ -190,7 +196,7 @@ export class TurnOriginTracker {
     let batch = this.pendingBatchStamp.get(key);
     const opensBatch = !batch;
     if (!batch) {
-      batch = { known: [], tabs: new Set<string>(), unknown: false };
+      batch = { known: [], tabs: new Set<string>(), routes: new Set<string>(), unknown: false };
       this.pendingBatchStamp.set(key, batch);
     }
     // A mid's origin comes from the LIVE record (first dequeue) or the APPLIED
@@ -236,7 +242,29 @@ export class TurnOriginTracker {
         );
       } else {
         batch.known.push(rec.uuid);
+        // TWO sets, because the pin and the ambiguity test want different things.
+        //
+        // The PIN keeps the id as RECORDED — the bridge resolves it onward through
+        // any migration alias, which is the existing contract (gate 4, P1).
+        //
+        // AMBIGUITY is judged on where the origins ROUTE, via the same `liveOrigin`
+        // the ownership check above already uses, and for the same reason. A
+        // same-socket migration (a workflow switch, a save, tmp:→wf:) rewrites the
+        // tab's id, so two messages issued from ONE tab either side of a save
+        // arrive carrying DIFFERENT ids. Counting those made the set size 2 and
+        // declared a single-tab turn a mixed-origin batch — routing and mutations
+        // then failed closed with "issued from multiple workflows at once", naming
+        // two entries that are the same workflow (observed live on mcp 0.50.14 /
+        // panel 0.11.44: one tmp: and one wf: banner, both titled "Untitled
+        // 2026-08-07 14-21-08").
+        //
+        // That is the FALSE REFUSAL the block above fixed for backend ownership and
+        // left in place for the tab count, a few lines apart. liveTabIdFor path-
+        // compresses every historical alias onto the newest live id, so genuinely
+        // distinct tabs still resolve distinctly and a real mixed batch still fails
+        // closed — only the aliases of ONE tab collapse.
         batch.tabs.add(rec.tab);
+        batch.routes.add(liveOrigin);
         this.turnUuidByMid.delete(mid);
         this.noteAppliedTurnMid(mid, rec); // keeps its origin for a re-queue
       }
@@ -252,7 +280,7 @@ export class TurnOriginTracker {
       queueMicrotask(() => {
         this.pendingBatchStamp.delete(key);
         const distinct = new Set(closed.known);
-        if (closed.unknown || closed.tabs.size > 1) {
+        if (closed.unknown || closed.routes.size > 1) {
           // Mixed/unknown-TAB batch: no single stamp or target is honest for
           // it — fail BOTH closed (the bridge refuses routing; the panel fence
           // refuses mutations) until an explicit target or the next
@@ -262,7 +290,7 @@ export class TurnOriginTracker {
           this.deps.warn(
             `[panel-orchestrator] ${key} dispatched a mixed/unknown-origin batch — no single workflow stamp/target is honest for it, so scope routing and graph mutations FAIL CLOSED until the agent opens/pins a workflow or the next single-origin message (#884)`,
           );
-        } else if (closed.tabs.size === 1) {
+        } else if (closed.routes.size === 1) {
           // TURN-TARGET PIN (confirming gate P0): this turn's tool calls route
           // to the tab the turn was ISSUED from — never re-resolved mid-turn —
           // and its mutations are fenced to that tab's issue-time workflow.
