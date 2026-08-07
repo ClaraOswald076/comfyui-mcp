@@ -22,6 +22,7 @@ import {
   type PanelToolCtx,
 } from "../../orchestrator/panel-tools.js";
 import { QueueMonitor } from "../../services/queue-monitor.js";
+import { runErrorNotice } from "../../orchestrator/cli-remedy.js";
 
 type QMPriv = {
   url: string | null;
@@ -334,5 +335,83 @@ describe("domOverlayScreenshotNote (pure)", () => {
     expect(note).toContain("MarkdownNote #1");
     expect(note).toContain("MarkdownNote #5");
     expect(note).toContain("ids:[1, 5]");
+  });
+});
+
+// #889 — the run-error notification asserted "the workflow run you just queued"
+// unconditionally, and reached a session whose agent had never called panel_run.
+// Attribution is the fact the wording depends on, so it is pinned here against
+// the same private state the rest of this file drives.
+describe("#889: attributeRun answers three ways, and refuses to guess", () => {
+  beforeEach(() => {
+    qm.selfQueuedIds.clear();
+    qm.lastSelfQueueTs = null;
+  });
+
+  // THE reported case: nothing queued this session, so no run can be ours.
+  it("a session that has queued NOTHING owns nothing", () => {
+    expect(QueueMonitor.attributeRun("9d70fd9d-1c2b-4e3f-8a01-7c6d5e4f3a2b")).toBe("not-mine");
+    // …and with no id either — still provable, because the proof is about US.
+    expect(QueueMonitor.attributeRun(undefined)).toBe("not-mine");
+    expect(QueueMonitor.attributeRun(null)).toBe("not-mine");
+  });
+
+  it("a recorded id is ours", () => {
+    QueueMonitor.markSelfQueued("p-mine");
+    expect(QueueMonitor.attributeRun("p-mine")).toBe("mine");
+    // Whitespace from prose extraction must not defeat the match.
+    expect(QueueMonitor.attributeRun("  p-mine  ")).toBe("mine");
+  });
+
+  // The honest middle. We queued SOMETHING, so this run might be ours; our id
+  // record is bounded (200) and a panel reply may carry no id at all, so an
+  // unrecognised id is genuinely undecidable — not evidence of a foreign run.
+  it("an unrecognised id is UNKNOWN once this session has queued anything", () => {
+    QueueMonitor.markSelfQueued("p-mine");
+    expect(QueueMonitor.attributeRun("p-someone-elses")).toBe("unknown");
+    expect(QueueMonitor.attributeRun(undefined)).toBe("unknown");
+  });
+
+  // A queue whose reply carried no prompt_id still marks the timestamp — so the
+  // session HAS queued, and must not then claim a run is not its own.
+  it("an id-less self-queue still blocks the 'not-mine' claim", () => {
+    QueueMonitor.markSelfQueued(null);
+    expect(qm.selfQueuedIds.size).toBe(0);
+    expect(QueueMonitor.attributeRun("9d70fd9d-1c2b-4e3f-8a01-7c6d5e4f3a2b")).toBe("unknown");
+  });
+});
+
+// #889 — the COMPOSITION, which is what PanelAgent.injectRunError actually calls.
+// Left inline in the agent it was reachable only through a full agent harness,
+// and a mutation hardcoding the attribution back to "mine" (the exact regression)
+// broke no test at all.
+describe("#889: runErrorNotice picks its wording from real attribution", () => {
+  const ERR = "Render status for prompt 9d70fd9d-1c2b-4e3f-8a01-7c6d5e4f3a2b could not be confirmed";
+
+  beforeEach(() => {
+    qm.selfQueuedIds.clear();
+    qm.lastSelfQueueTs = null;
+  });
+
+  // The reported session: reads and graph edits only, never a panel_run.
+  it("a session that never queued gets the non-attributing wording", () => {
+    const t = runErrorNotice(ERR);
+    expect(t).toMatch(/You did NOT queue this run/);
+    expect(t).not.toMatch(/you just queued/);
+    expect(t).not.toMatch(/STOP —/);
+  });
+
+  it("the agent's OWN failed render still gets the urgent wording", () => {
+    QueueMonitor.markSelfQueued("9d70fd9d-1c2b-4e3f-8a01-7c6d5e4f3a2b");
+    const t = runErrorNotice(ERR);
+    expect(t).toMatch(/run you queued ERRORED/);
+    expect(t).toMatch(/STOP/);
+  });
+
+  it("an unrecognised run, after this session HAS queued, is reported as undetermined", () => {
+    QueueMonitor.markSelfQueued("p-something-else");
+    const t = runErrorNotice(ERR);
+    expect(t).toMatch(/could NOT be determined/);
+    expect(t).not.toMatch(/You did NOT queue this run/);
   });
 });

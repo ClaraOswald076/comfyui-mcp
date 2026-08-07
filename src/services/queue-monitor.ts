@@ -276,6 +276,38 @@ class QueueMonitorImpl {
     }
   }
 
+  /**
+   * Can a run be attributed to THIS session? (#889)
+   *
+   * Three answers, and the third is the one that was missing. A run-errored
+   * notification used to open "The workflow run **you just queued** ERRORED" as
+   * a fixed template — for a session whose agent had never called panel_run at
+   * all. It then spent a round trip diagnosing a failure it did not cause, which
+   * the wording ("STOP — do not carry on as if it succeeded") made expensive
+   * rather than merely cosmetic: it invites inventing a connection.
+   *
+   *   "mine"     — the id is one we recorded queuing. Proven.
+   *   "not-mine" — this session has queued NOTHING, so it cannot be ours,
+   *                whether or not an id was parsed. Also proven, and it is the
+   *                reported case exactly.
+   *   "unknown"  — we have queued something, but this run carries no id (or an
+   *                unrecognised one). Genuinely undecidable: our own record is
+   *                bounded to the last 200 ids and a panel reply may carry none.
+   *
+   * `unknown` must not collapse into either certainty. Claiming the run is the
+   * agent's repeats this bug; claiming it is not risks telling an agent to
+   * ignore its own failed render.
+   */
+  attributeRun(promptId?: string | null): "mine" | "not-mine" | "unknown" {
+    const id = typeof promptId === "string" ? promptId.trim() : "";
+    if (id && this.selfQueuedIds.has(id)) return "mine";
+    // Nothing queued by this session, ever — including the coarse timestamp,
+    // which is set even when the panel reply carried no id. There is nothing
+    // this session could be the author of.
+    if (this.selfQueuedIds.size === 0 && this.lastSelfQueueTs === null) return "not-mine";
+    return "unknown";
+  }
+
   /** True when the ENTIRE in-flight queue is attributable to this session — i.e.
    *  every visible prompt (the running one plus every pending one) is an id we
    *  queued. That is the only safe basis for suppressing the backlog warning: a
