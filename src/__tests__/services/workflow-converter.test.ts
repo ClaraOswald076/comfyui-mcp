@@ -1696,22 +1696,25 @@ describe("convertUiToApi — linked PrimitiveNode combo validation (P1-A, #504)"
       ],
       links: [[10, 2, 0, 1, 0, "FLOAT"]],
     } as never;
-    const { workflow, warnings } = convertUiToApi(ui, info);
-    // The retained placeholder must NEVER become the seed.
+    const { workflow } = convertUiToApi(ui, info);
+    // THE P0, unchanged and non-negotiable: the retained placeholder must NEVER
+    // become the seed.
     expect(workflow["1"].inputs.seed).not.toBe(4);
-    // seed falls to its schema default, not a shifted placeholder value.
-    expect(workflow["1"].inputs.seed).toBe(0);
+    // #1037 — this row is now RESOLVED rather than refused, and the seed the user
+    // actually saved survives. Counting settles it: 3 slots remain after the
+    // parent; "placeholders retained" consumes 1 and leaves 2 for seed + its
+    // control_after_generate phantom, while "omitted" would leave 3. Only one
+    // adds up, so the placeholder is stepped over and 424242 lands on seed.
+    //
+    // This assertion used to read `toBe(0)`. That was the refusal's outcome and
+    // the best answer available while the ambiguity was unresolvable — but it
+    // meant the user's seed was silently REPLACED BY ZERO, which is its own
+    // quiet data loss. Recovering 424242 is strictly better, and the guard that
+    // matters (never 4) is untouched.
+    expect(workflow["1"].inputs.seed).toBe(424242);
     // The linked nested leaf is supplied by its (PrimitiveNode) source, not the
     // retained placeholder 4.
     expect(workflow["1"].inputs["mode.multiplier"]).toBe(8);
-    expect(
-      warnings.some(
-        (w) =>
-          w.includes("1") &&
-          w.includes("mode.multiplier") &&
-          /default/.test(w),
-      ),
-    ).toBe(true);
   });
 
   it("re-anchors nested leaves when a PrimitiveNode overrides the dynamic PARENT (A -> B)", () => {
