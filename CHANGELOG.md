@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.8] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a new canvas gets a new fence (#1024)
+- accept the node ids we print, and say which canvas args were ignored (#1023)
+- accept the todo status spellings agents actually produce (#1022)
+
+
 ## [0.50.7] - 2026-08-07
 
 ### MCP
