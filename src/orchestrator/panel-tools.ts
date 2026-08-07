@@ -780,6 +780,34 @@ function isTransientReconnectError(err: unknown): boolean {
   );
 }
 
+/**
+ * #1027 — the panel's WORKFLOW-SWITCH critical section, which is retryable by
+ * construction and was not being retried.
+ *
+ * While a workflow switch/reload is in flight the panel refuses every graph and
+ * workflow executor rather than queueing it, because refusing cannot reorder or
+ * double-apply. Its own words:
+ *
+ *   the panel is switching/refreshing "<key>" right now, so "<cmd>" was NOT
+ *   applied — nothing changed. Retry in a moment.
+ *
+ * Two facts make this the safest retry in the file: the panel STATES nothing was
+ * applied, and the section lasts a fraction of a second. Yet none of that text
+ * matched the transient classifier, so a read issued right after
+ * panel_open_workflow surfaced the refusal to the agent instead of waiting the
+ * ~400ms the panel asked for. A reporter driving several tabs read-only hit it
+ * repeatedly, and read the resulting instance-mismatch errors as a wedge.
+ *
+ * TEXT-matched, deliberately, unlike #1001's typed marker: this error is minted
+ * in the browser and arrives over the wire, so there is no object identity to
+ * carry a symbol across. The phrasing is distinctive enough to key on, and the
+ * retry it enables is bounded to RETRY-SAFE commands either way.
+ */
+function isWorkflowSwitchGuardRefusal(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? "");
+  return /panel is switching\/refreshing|panel is switching or reloading/i.test(msg);
+}
+
 let retrySettleMsOverride: number | null = null;
 /** Short pause before the single post-drop retry, letting the replacement tab
  *  finish its reconnect hello so ensureReachable can resolve it. Test-overridable. */
@@ -4641,12 +4669,32 @@ export function makePanelToolCtx(
       // For idempotent commands, settle briefly, rebind onto the now-live tab, and
       // retry ONE time before surfacing an error (#278/#310/#332/#481). Mutating
       // edits are excluded from RETRY_SAFE_CMDS, so they never double-apply.
-      if (isRetrySafeCmd(cmd) && isTransientReconnectError(err)) {
+      // #1027 — the workflow-switch critical section is retried on the same path.
+      // The panel refuses during it, states that nothing was applied, and asks
+      // for a retry in a moment; the section lasts a fraction of a second, which
+      // is what retrySettleMs already waits. Still gated on RETRY-SAFE commands,
+      // so a mutation is never re-issued on our own initiative.
+      if (isRetrySafeCmd(cmd) && (isTransientReconnectError(err) || isWorkflowSwitchGuardRefusal(err))) {
         try {
           await sleep(retrySettleMs());
           ensureReachable(); // rebinds a current-mode session onto the reconnected tab
           return ok(await sendRouted(cmd, timeoutMs, observeRid));
         } catch (err2) {
+          // #1027 — a switch STILL in progress is not a reconnect, and saying so
+          // would be the #1001 mistake again: the tab is connected and healthy,
+          // it is simply mid-switch. Name the actual state and the actual wait.
+          if (isWorkflowSwitchGuardRefusal(err2)) {
+            const name = typeof cmd.cmd === "string" ? cmd.cmd : "panel command";
+            return fail(
+              `${name} was NOT applied — nothing changed. The panel is still switching or ` +
+                `reloading the workflow on the canvas, which it refuses commands during so a ` +
+                `command cannot land on the wrong graph. The tab is connected and this is not a ` +
+                `reconnect: it normally clears in well under a second, so simply retry. If a ` +
+                `switch appears stuck, check the canvas — a load dialog or an unsaved-changes ` +
+                `prompt can hold it open awaiting the user. ` +
+                `(${err2 instanceof Error ? err2.message : String(err2)})`,
+            );
+          }
           // The retry also failed — surface an actionable reconnecting status rather
           // than a bare transport error (#332), while still failing honestly.
           if (isTransientReconnectError(err2)) {
