@@ -61,6 +61,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { logger } from "../utils/logger.js";
 import { errorText, promptText } from "./error-text.js";
+import { looksLikeAuthFailure, providerAuthRemedy, qualifySlashCommands } from "./cli-remedy.js";
 import { buildAgentSpawnEnv } from "../services/panel-secrets.js";
 import {
   type AgentBackend,
@@ -584,16 +585,18 @@ export class PiBackend implements AgentBackend {
         push({ type: "result", ok: false, subtype: "timeout" });
       } else if (spawnErr || code !== 0) {
         const stderrTail = stripAnsi(errOut).trim().split(/\r?\n/).slice(-3).join(" ").trim();
-        const authish = /sign.?in|log.?in|auth|credential|unauthoriz|api.?key|no provider/i.test(
-          stderrTail + finalText,
-        );
+        const authish = looksLikeAuthFailure(stderrTail + finalText);
+        // #948 — pi's own text says "please run /login", which in a chat panel
+        // reads as "type this here" and sends the user somewhere it cannot work.
+        // Every path that passes the child's words through is qualified, not just
+        // the auth one: a non-auth failure can name a slash command too.
         const message = spawnErr
           ? /ENOENT/i.test(spawnErr.message)
             ? "pi CLI (`pi`) could not be launched — it may have been uninstalled. Reinstall from https://pi.dev and reconnect."
             : `pi failed to start: ${spawnErr.message}`
           : authish
-            ? `pi has no usable provider credentials. Configure one — set a provider API key (e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY) or run \`pi\` once and \`/login\` — then send your message again.${stderrTail ? ` (pi: ${stderrTail})` : ""}`
-            : `pi exited with code ${code}.${stderrTail ? ` ${stderrTail}` : ""}`;
+            ? providerAuthRemedy("pi", stderrTail)
+            : `pi exited with code ${code}.${stderrTail ? ` ${qualifySlashCommands(stderrTail, "pi")}` : ""}`;
         push({ type: "error", message });
         push({ type: "result", ok: false, subtype: "error" });
       } else {
