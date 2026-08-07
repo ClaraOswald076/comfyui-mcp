@@ -10,6 +10,7 @@ import {
 } from "../services/model-resolver.js";
 import type { ModelListingCoverage } from "../services/model-resolver.js";
 import { EXTRA_PATH_TARGETS } from "../services/extra-paths.js";
+import { isRemoteMode } from "../config.js";
 import {
   startDownloadJob,
   getDownloadJob,
@@ -848,7 +849,11 @@ async function statusAction(args: {
           const detail =
             j.status === "done" && placement
               ? j.viaManager
-                ? `\n    dispatched to the remote ComfyUI via ComfyUI-Manager (server-side fetch): ${j.path}\n    NOTE: ${placement.warning}`
+                ? // #947 — say what the ROUTE was, not that the server is remote.
+                  // The Manager route is taken whenever no local models directory
+                  // could be resolved, which a loopback server hits routinely; a
+                  // reporter on 127.0.0.1 read "remote" as a misclassification.
+                  `\n    dispatched to the ${isRemoteMode() ? "remote" : "connected"} ComfyUI via ComfyUI-Manager (server-side fetch)${isRemoteMode() ? "" : " — no local models directory was resolvable, so this MCP could not stream it itself; that is a routing fallback, not a remote server"}: ${j.path}\n    NOTE: ${placement.warning}`
                 : placement.confirmed
                   ? `\n    ${placement.pathLabel}${placement.pathQualifier}: ${j.path}`
                   : `\n    ${placement.pathLabel}${placement.pathQualifier}: ${j.path}\n    ${placement.wrongPlace ? "WARNING" : "NOTE"}: ${placement.warning}`

@@ -8,10 +8,20 @@ vi.mock("../../config.js", () => {
     huggingfaceToken: undefined as string | undefined,
     civitaiApiToken: undefined as string | undefined,
   };
-  // downloadModel routes to the Manager install-model path in remote mode
-  // (comfyuiPath unset). Most tests set comfyuiPath, so this is false for them.
-  return { config, isRemoteMode: () => !config.comfyuiPath };
+  // #947 — this stub USED to be exactly `() => !config.comfyuiPath`, which is the
+  // very conflation the issue is about: the real isRemoteMode() classifies by
+  // HOST (a loopback target is local whether or not COMFYUI_PATH is set), and
+  // "no local path" is a different fact entirely. The default is kept so every
+  // existing test behaves as before; `remoteOverride` lets a test state the
+  // reporter's actual configuration — a LOCAL server with no resolvable models
+  // directory — which the old stub could not express at all.
+  return {
+    config,
+    isRemoteMode: () => remoteOverride.value ?? !config.comfyuiPath,
+  };
 });
+/** Per-test override for isRemoteMode; null = derive from comfyuiPath (legacy). */
+const remoteOverride = vi.hoisted(() => ({ value: null as boolean | null }));
 
 // Stub the Manager install-model dispatch so remote-mode downloadModel can be
 // asserted without a live ComfyUI-Manager.
@@ -125,6 +135,7 @@ function flipFetch(pageResp: () => Response): void {
 }
 
 beforeEach(() => {
+  remoteOverride.value = null; // back to the legacy comfyuiPath-derived default
   vi.stubGlobal("fetch", fetchMock);
   fetchMock.mockReset();
   mkdirMock.mockReset().mockResolvedValue(undefined);
@@ -815,6 +826,34 @@ describe("downloadModel — threaded routing decision (#420 split-brain guard)",
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(mkdirMock).not.toHaveBeenCalled();
     expect(out).toContain("ComfyUI-Manager");
+  });
+
+  // #947 — a reporter on http://127.0.0.1:8188 was told their download went "to
+  // the REMOTE ComfyUI", concluded the orchestrator had misclassified a local
+  // server, and filed against the classification. isRemoteMode() was right the
+  // whole time: the Manager route is taken whenever no local models directory
+  // can be resolved, which a loopback server hits routinely (no COMFYUI_PATH, no
+  // saved workspace, a `python main.py` argv with no derivable root). The
+  // SENTENCE was wrong, and it named a cause the code had not established.
+  it("#947: a LOCAL server is not described as remote when the Manager route is taken", async () => {
+    config.comfyuiPath = undefined; // no local models dir to stream into…
+    remoteOverride.value = false; // …but the target is 127.0.0.1, i.e. LOCAL
+    fetchMock.mockResolvedValue(binaryProbeResponse());
+    const out = await downloadModel(
+      "https://example.com/model.safetensors",
+      "checkpoints",
+      "model.safetensors",
+      undefined,
+      true,
+    );
+    // Still names the route — that part was never wrong.
+    expect(out).toContain("ComfyUI-Manager");
+    // …but no longer asserts a remote server.
+    expect(out).not.toMatch(/remote ComfyUI/);
+    // It says what was ACTUALLY decided, and what would change it.
+    expect(out).toMatch(/could not resolve a local models directory/);
+    expect(out).toMatch(/NOT a claim that the server is remote/);
+    expect(out).toMatch(/COMFYUI_PATH/);
   });
 
   it("forces local streaming when dispatchToManager=false, even in remote-like config", async () => {

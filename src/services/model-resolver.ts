@@ -2119,7 +2119,24 @@ async function downloadModelViaManagerRemote(
   // "cancelled" (the tool message notes the server may still be fetching).
   if (signal?.aborted) throw new DOMException("The download was cancelled.", "AbortError");
 
-  return `${normalizedSubfolder}/${resolvedFilename} (dispatched to the remote ComfyUI via ComfyUI-Manager — download continues server-side; the file lists under /models when complete)${authGateWarning}${authWarning}`;
+  // #947 — "the REMOTE ComfyUI" is not what this decision established. The route
+  // is chosen by shouldDispatchDownloadToManager(), which sends work to the
+  // Manager whenever it cannot resolve a local models directory to stream into —
+  // and a LOOPBACK server does that routinely: no COMFYUI_PATH, no saved
+  // workspace, and a `python main.py` argv whose root cannot be derived.
+  //
+  // A reporter on http://127.0.0.1:8188 was told their download went "to the
+  // remote ComfyUI", concluded the orchestrator had misclassified a local server,
+  // and filed against the classification. isRemoteMode() was right the whole
+  // time; the SENTENCE was wrong. Say what was actually decided, and name the
+  // setting that would have kept the download local.
+  const routeNote = isRemoteMode()
+    ? "dispatched to the remote ComfyUI via ComfyUI-Manager"
+    : "dispatched to the connected ComfyUI via ComfyUI-Manager — this MCP could not resolve a " +
+      "local models directory to stream into (no COMFYUI_PATH, no saved workspace, and the " +
+      "running server's launch arguments did not identify one). That is a routing fallback, NOT " +
+      "a claim that the server is remote; set COMFYUI_PATH to stream directly instead";
+  return `${normalizedSubfolder}/${resolvedFilename} (${routeNote} — download continues server-side; the file lists under /models when complete)${authGateWarning}${authWarning}`;
 }
 
 /**
