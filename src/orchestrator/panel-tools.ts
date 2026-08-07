@@ -6784,8 +6784,28 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // rather than duplicating it: that token dedupes an EXPLICIT retry of an
         // outcome-unknown dispatch at the panel; this fence stops a BLIND
         // re-issue before any dispatch.
+        // #1011 — an EXPLICIT retry is not a blind re-issue, and this fence was
+        // stopping the one mechanism that can settle it.
+        //
+        // The comment above says this "composes with #694's retry_of". It does
+        // not, in the order they actually run: the fence refuses BEFORE dispatch,
+        // so a caller who was handed a retry_of rid by an outcome-unknown timeout
+        // can never get that token to the panel, where the dedupe lives. After a
+        // reconnect the in-flight render is exactly the one they are unsure
+        // about, `selfAttributedProven` is false (the ledger is in-memory and did
+        // not survive), and the fence fires every time — leaving them unable to
+        // discover whether their timed-out dispatch created the pending job, with
+        // the token that exists for that purpose inert in their hand.
+        //
+        // A supplied retry_of is a caller ASSERTION of the same weight as
+        // allow_duplicate: "this is a retry of that dispatch, dedupe it." It is
+        // only ever obtained FROM an outcome-unknown failure of this identical
+        // call, so it is not a blanket bypass. Honour it, and let the panel do
+        // the reconciliation it is designed for.
+        const explicitRetry = typeof args.retry_of === "string" && args.retry_of !== "";
         if (
           args.allow_duplicate !== true &&
+          !explicitRetry &&
           pre.connected &&
           (pre.running || pre.queueDepth > 0) &&
           !pre.selfAttributedProven
@@ -6889,6 +6909,22 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // (a minted prompt id outranks the rejection signals). Say which outputs
         // were dropped, or the caller waits for files that will never be written.
         const droppedNote = describeDroppedOutputs(runReply);
+        // #1011 — a retry that rode PAST the duplicate fence must say so. The
+        // fence exists to stop a second render stacking behind an unaccountable
+        // one; skipping it on the caller's assertion is right, but silently
+        // skipping it would hide the one risk the caller took. The panel dedupes
+        // on the token, so the expected outcome is reconciliation rather than a
+        // new render — expected, not guaranteed, which is exactly why it is said.
+        const retryBypassNote =
+          explicitRetry && pre.connected && (pre.running || pre.queueDepth > 0) && !pre.selfAttributedProven
+            ? `\n\n[RETRY] You passed retry_of, so the duplicate fence was SKIPPED — a render this session ` +
+              `could not account for was already in flight` +
+              (pre.runningPromptId ? ` (running prompt ${pre.runningPromptId})` : "") +
+              `. The panel dedupes on that token, so a matching earlier dispatch should have been ` +
+              `reconciled rather than re-queued. VERIFY that before assuming: check queue (action:"list") ` +
+              `and get_history — if you now see one MORE job than you intended, the token did not match ` +
+              `and this dispatch stacked a duplicate.`
+            : "";
         // markSelfQueued with NO id still stamps the recent-self-queue timestamp,
         // so the id-less case must still call it exactly once (#559).
         if (queuedIds.length === 0) QueueMonitor.markSelfQueued(null);
@@ -6972,7 +7008,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               // droppedNote sits FIRST among the appendices: "some outputs were
               // dropped" changes what the caller should expect from this run, so
               // it must not trail behind the anti-poll boilerplate (#944).
-              { type: "text", text: res.content[0].text + droppedNote + retryNote + warn + note },
+              { type: "text", text: res.content[0].text + droppedNote + retryBypassNote + retryNote + warn + note },
               ...res.content.slice(1),
             ],
           };
