@@ -2377,7 +2377,16 @@ export function convertUiToApi(
     // Some INT inputs with "control_after_generate": true (like seed, noise_seed) have
     // a phantom widget value in widgets_values ("fixed"/"randomize"/"increment"/"decrement")
     // that doesn't correspond to any named input — we must skip those.
-    const widgetValues = node.widgets_values ?? [];
+    //
+    // A live-canvas capture may carry the panel's AUTHORITATIVE name→value widget
+    // map (capturedWidgetValues). Prefer it: the positional array below is ordered
+    // by the FRONTEND, while the only order we can reconstruct is object_info's, and
+    // custom nodes that add or reorder widgets in JS make the two disagree — which
+    // silently shifts every value onto the wrong widget (#961/#955/#361: a wildcard
+    // string landing on `seed`, a LoRA name landing on a VAE). A name-keyed map has
+    // no order to disagree about, so it routes into the object branch below, which
+    // already fails CLOSED when a name is ambiguous.
+    const widgetValues = node.capturedWidgetValues ?? node.widgets_values ?? [];
 
     // Some nodes (e.g. VHS_VideoCombine) store widgets_values as a name->value
     // object instead of a positional array — as does the #384 live-canvas
