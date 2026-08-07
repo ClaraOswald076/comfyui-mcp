@@ -40,7 +40,8 @@ import { performPanelSync, reassessPanelAfterSyncFailure } from "../services/pan
 import { clearPanelDiskObservation } from "../services/panel-workspace.js";
 import { panelRecoveryContext } from "../services/panel-recovery.js";
 import { isPanelAutoInstallDisabled } from "../services/panel-installer.js";
-import { SelfRestarter } from "../services/self-restart.js";
+import { SelfRestarter, canSelfRestart } from "../services/self-restart.js";
+import { pairUrlDurability } from "./pair-durability.js";
 import { SessionStore, workflowIdentityParts } from "./session-store.js";
 import {
   SHARED_SESSION_SCOPE,
@@ -58,6 +59,7 @@ import {
 } from "./turn-origins.js";
 import { listSessions, loadTranscript } from "./history.js";
 import { uploadImageHttp, resetClient } from "../comfyui/client.js";
+import { setConnectedPanelOrigins } from "../comfyui/fetch.js";
 import { logger } from "../utils/logger.js";
 import {
   PanelAgentManager,
@@ -2695,6 +2697,12 @@ export async function runPanelOrchestrator(): Promise<void> {
   // `null` (ambiguous origin) makes the bridge refuse loudly; no entry lets
   // the bridge fall back to active-tab resolution (idle-time probes).
   bridge.setScopeTargetResolver(makeScopeTargetResolver({ tracker: turnOrigins, scopeAgentKeyOf }));
+  // #952 — let a headless `fetch failed` say whether the connected panel is on a
+  // DIFFERENT ComfyUI than COMFYUI_URL. The reporter's readonly tools failed
+  // while every panel tool worked, and nothing in the error connected the two.
+  // SERVER-OBSERVED origins only (tabServerOrigin): the browser sets the
+  // handshake Origin and page JS cannot forge it, unlike hello.comfyui_url.
+  setConnectedPanelOrigins(() => bridge.connectedServerOrigins());
   // #884 P1 (confirming gate 2) — EXPLICIT recovery from a DEAD or AMBIGUOUS
   // pin, and from those only. The bridge's refusal names
   // panel_set_workflow_target as the way out; this is the ONLY path that
@@ -4186,8 +4194,24 @@ export async function runPanelOrchestrator(): Promise<void> {
           }
           url = `ws://${ip}:${pairPort}/?token=${token}`;
         }
-        logger.info(`[panel-orchestrator] pairing URL minted (${mode})`);
-        bridge.push({ type: "pair_url", mode, url }, tabId);
+        // #875 — say at pair time whether this URL survives a restart. The
+        // self-restarter is on by default and rotates the token (always, unless
+        // pinned) and the tunnel hostname (always, quick tunnels cannot be
+        // pinned). A user hit exactly this and reported it as "updating the npm
+        // version bricks my communication with the agent" — the restart was the
+        // cause, and nothing here had told them.
+        const durability = pairUrlDurability({
+          mode,
+          pinnedToken: envPairToken !== null,
+          autoRestart: canSelfRestart(),
+        });
+        logger.info(
+          `[panel-orchestrator] pairing URL minted (${mode}) — ` +
+            (durability.survivesRestart
+              ? "survives restart"
+              : `rotates on restart: ${durability.rotates.join(", ")}`),
+        );
+        bridge.push({ type: "pair_url", mode, url, durability }, tabId);
       })().catch((err) => {
         bridge.push(
           { type: "pair_error", mode, error: err instanceof Error ? err.message : String(err) },

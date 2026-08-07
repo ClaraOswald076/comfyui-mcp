@@ -40,7 +40,9 @@ vi.mock("node:fs/promises", () => ({
 }));
 
 const { config } = await import("../../config.js");
-const { listLocalModelsWithCoverage } = await import("../../services/model-resolver.js");
+const { listLocalModelsWithCoverage, describeUnparsableBody } = await import(
+  "../../services/model-resolver.js"
+);
 const { describeEmptyModelListing } = await import("../../tools/model-management.js");
 
 beforeEach(() => {
@@ -203,5 +205,77 @@ describe("#918: what an empty listing is allowed to say", () => {
       unanswered: Array.from({ length: 15 }, (_, i) => ({ dir: `d${i}`, reason: "fetch failed" })),
     });
     expect(text).toMatch(/…and 7 more/);
+  });
+});
+
+// #1015 — the follow-on. Coverage correctly refused to call these categories
+// empty, but described WHY in the vaguest available terms: an EMPTY body was
+// reported as "a non-JSON body (a proxy, login page, or a server still starting
+// answers this way)". None of those three produces zero bytes, and the status
+// — which the reporter explicitly asked for, to tell an empty category apart
+// from a transport failure — was dropped on every parse-failure branch.
+//
+// What must NOT change: an unparsable answer still leaves the category
+// UNANSWERED. This is about the accuracy of the reason, not the verdict.
+describe("#1015: an unparsable category body is described from what was observed", () => {
+  it("names an EMPTY body as empty, and does not offer proxy/login/starting guesses", () => {
+    const reason = describeUnparsableBody(200, "");
+    expect(reason).toMatch(/EMPTY body/);
+    expect(reason).toMatch(/0 bytes/);
+    expect(reason).toMatch(/HTTP 200/);
+    // The three causes that cannot produce an empty body.
+    expect(reason).not.toMatch(/proxy/);
+    expect(reason).not.toMatch(/login/);
+    expect(reason).not.toMatch(/still starting/);
+    // And never the raw parser message the reporter saw on 0.50.2.
+    expect(reason).not.toMatch(/Unexpected end of JSON input/);
+  });
+
+  it("treats a whitespace-only body as empty too", () => {
+    expect(describeUnparsableBody(200, "\r\n  \n")).toMatch(/EMPTY body/);
+  });
+
+  it("keeps the HTML reading, and now carries the status with it", () => {
+    const reason = describeUnparsableBody(200, "<!doctype html><html><body>Sign in</body></html>");
+    expect(reason).toMatch(/returned HTML instead of JSON/);
+    expect(reason).toMatch(/still starting/);
+    expect(reason).toMatch(/HTTP 200/);
+  });
+
+  it("quotes a bounded excerpt for a body that is neither empty nor markup", () => {
+    const reason = describeUnparsableBody(200, "not json at all");
+    expect(reason).toMatch(/not JSON/);
+    expect(reason).toMatch(/15 bytes/);
+    expect(reason).toMatch(/not json at all/);
+  });
+
+  it("bounds the excerpt so a large body cannot flood the tool result", () => {
+    const reason = describeUnparsableBody(500, "x".repeat(50_000));
+    expect(reason.length).toBeLessThan(200);
+    expect(reason).toMatch(/50000 bytes/);
+    expect(reason).toMatch(/HTTP 500/);
+  });
+
+  it("collapses a multi-line body onto one line", () => {
+    expect(describeUnparsableBody(200, "line one\nline two")).not.toMatch(/\n/);
+  });
+
+  // The end-to-end shape the reporter hit: two categories answer 200 with an
+  // empty body while the rest answer normally.
+  it("leaves an empty-bodied category UNANSWERED, never empty", async () => {
+    getClient.mockReturnValue({ fetchApi });
+    fetchApi.mockImplementation(async (url: string) =>
+      url.endsWith("/models/clip")
+        ? new Response("", { status: 200 })
+        : new Response(JSON.stringify(["m.safetensors"]), { status: 200 }),
+    );
+    readdir.mockRejectedValue(new Error("ENOENT"));
+
+    const { coverage } = await listLocalModelsWithCoverage("clip");
+    expect(coverage.answered).toEqual([]);
+    expect(coverage.unanswered).toHaveLength(1);
+    expect(coverage.unanswered[0].dir).toBe("clip");
+    expect(coverage.unanswered[0].reason).toMatch(/EMPTY body/);
+    expect(coverage.unanswered[0].reason).not.toMatch(/Unexpected end of JSON input/);
   });
 });

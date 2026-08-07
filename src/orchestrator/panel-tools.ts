@@ -78,6 +78,7 @@ import {
   isCapabilityRefusal,
   isPanelCmdUnsupportedError,
   isReplyTimeoutTagged,
+  isRoutingAmbiguity,
   requiresWorkflowStampEnforcement,
 } from "../services/ui-bridge.js";
 import {
@@ -101,6 +102,7 @@ import {
 } from "../services/panel-secrets.js";
 import { flattenUiWorkflow } from "../services/flatten-workflow.js";
 import { describeUnappliedFilters } from "./civitai-filter-guard.js";
+import { recordTodo, normalizeTodoItems, TODO_STATUS_INPUTS } from "./todo-state.js";
 import { applyCapturedWidgetValues } from "../services/live-widget-overlay.js";
 import { listWorkflowLibraryKeys, userdataFetch } from "../services/userdata-library.js";
 import { getNsfwConsent, setNsfwConsent } from "../services/panel-settings.js";
@@ -763,10 +765,47 @@ function isMutatingGraphCmd(cmd: Record<string, unknown>): boolean {
  *  frozen tab — retrying just double-waits, #334) and "OUTCOME UNKNOWN" (a
  *  mutating command that may already have applied). */
 function isTransientReconnectError(err: unknown): boolean {
+  // #1001 — the TYPED marker wins over the text. A routing-ambiguity refusal
+  // (the turn was issued from several workflows at once) opens with the literal
+  // words "no connected tab", so the regex below matched it and called a fully
+  // connected panel "transient". Nothing about it is: the pin is settled for the
+  // whole batch, so the retry is guaranteed to fail identically, and the caller
+  // then reported "still reconnecting after a restart/reload" about a panel that
+  // never disconnected. Waiting cannot clear this; only an explicit target or the
+  // next single-origin message can.
+  if (isRoutingAmbiguity(err)) return false;
   const msg = err instanceof Error ? err.message : String(err ?? "");
   return /no connected tab|genuinely gone|is not open|Failed to fetch|Panel not reachable|ECONNRESET|socket hang up|premature close|other side closed|ECONNABORTED|EPIPE/i.test(
     msg,
   );
+}
+
+/**
+ * #1027 — the panel's WORKFLOW-SWITCH critical section, which is retryable by
+ * construction and was not being retried.
+ *
+ * While a workflow switch/reload is in flight the panel refuses every graph and
+ * workflow executor rather than queueing it, because refusing cannot reorder or
+ * double-apply. Its own words:
+ *
+ *   the panel is switching/refreshing "<key>" right now, so "<cmd>" was NOT
+ *   applied — nothing changed. Retry in a moment.
+ *
+ * Two facts make this the safest retry in the file: the panel STATES nothing was
+ * applied, and the section lasts a fraction of a second. Yet none of that text
+ * matched the transient classifier, so a read issued right after
+ * panel_open_workflow surfaced the refusal to the agent instead of waiting the
+ * ~400ms the panel asked for. A reporter driving several tabs read-only hit it
+ * repeatedly, and read the resulting instance-mismatch errors as a wedge.
+ *
+ * TEXT-matched, deliberately, unlike #1001's typed marker: this error is minted
+ * in the browser and arrives over the wire, so there is no object identity to
+ * carry a symbol across. The phrasing is distinctive enough to key on, and the
+ * retry it enables is bounded to RETRY-SAFE commands either way.
+ */
+function isWorkflowSwitchGuardRefusal(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? "");
+  return /panel is switching\/refreshing|panel is switching or reloading/i.test(msg);
 }
 
 let retrySettleMsOverride: number | null = null;
@@ -4630,12 +4669,32 @@ export function makePanelToolCtx(
       // For idempotent commands, settle briefly, rebind onto the now-live tab, and
       // retry ONE time before surfacing an error (#278/#310/#332/#481). Mutating
       // edits are excluded from RETRY_SAFE_CMDS, so they never double-apply.
-      if (isRetrySafeCmd(cmd) && isTransientReconnectError(err)) {
+      // #1027 — the workflow-switch critical section is retried on the same path.
+      // The panel refuses during it, states that nothing was applied, and asks
+      // for a retry in a moment; the section lasts a fraction of a second, which
+      // is what retrySettleMs already waits. Still gated on RETRY-SAFE commands,
+      // so a mutation is never re-issued on our own initiative.
+      if (isRetrySafeCmd(cmd) && (isTransientReconnectError(err) || isWorkflowSwitchGuardRefusal(err))) {
         try {
           await sleep(retrySettleMs());
           ensureReachable(); // rebinds a current-mode session onto the reconnected tab
           return ok(await sendRouted(cmd, timeoutMs, observeRid));
         } catch (err2) {
+          // #1027 — a switch STILL in progress is not a reconnect, and saying so
+          // would be the #1001 mistake again: the tab is connected and healthy,
+          // it is simply mid-switch. Name the actual state and the actual wait.
+          if (isWorkflowSwitchGuardRefusal(err2)) {
+            const name = typeof cmd.cmd === "string" ? cmd.cmd : "panel command";
+            return fail(
+              `${name} was NOT applied — nothing changed. The panel is still switching or ` +
+                `reloading the workflow on the canvas, which it refuses commands during so a ` +
+                `command cannot land on the wrong graph. The tab is connected and this is not a ` +
+                `reconnect: it normally clears in well under a second, so simply retry. If a ` +
+                `switch appears stuck, check the canvas — a load dialog or an unsaved-changes ` +
+                `prompt can hold it open awaiting the user. ` +
+                `(${err2 instanceof Error ? err2.message : String(err2)})`,
+            );
+          }
           // The retry also failed — surface an actionable reconnecting status rather
           // than a bare transport error (#332), while still failing honestly.
           if (isTransientReconnectError(err2)) {
@@ -4672,6 +4731,22 @@ export function makePanelToolCtx(
       // already names the real recovery (update + restart + browser hard-refresh).
       if (isCapabilityRefusal(err)) {
         return fail(err instanceof Error ? err.message : String(err));
+      }
+      // #1001 — same shape, opposite cause: a ROUTING-AMBIGUITY refusal already
+      // knows exactly why it refused AND names both recoveries in its own text
+      // (target a workflow explicitly, or wait for the next single-origin
+      // message). The generic wrapper below would bury that under a differential
+      // — "disconnected, still reconnecting, or the binding is stale" — of which
+      // all three are FALSE here, plus a "retry in a moment" that can never
+      // work. That speculation reads as observation: the reporter of #1001 filed
+      // "reconnect readiness is reported before the route is usable" as a second
+      // root cause, citing this wrapper's guess as their evidence. Surface the
+      // cause verbatim; add only the fact the flag actually proves.
+      if (isRoutingAmbiguity(err)) {
+        return fail(
+          `${typeof cmd.cmd === "string" ? cmd.cmd : "panel command"} was not dispatched — ` +
+            `nothing was applied. ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
       if (dispatchOutcomeOf(err) === false) {
         const name = typeof cmd.cmd === "string" ? cmd.cmd : "panel command";
@@ -5781,6 +5856,74 @@ function validatePanelEditNodeArgs(args: Record<string, unknown>): string | null
  * forwarded to the wire UNTOUCHED (contrast workflow_uuid, which is bridge-owned
  * and always overwritten). Optional everywhere; never required.
  */
+/**
+ * #845 — a node id the tools THEMSELVES printed must be accepted back.
+ *
+ * Every panel tool took `z.number().int()` for a node id, while the graph
+ * readers return ids as STRINGS (`"id": "42"`). So the obvious move — copy an id
+ * out of panel_query_graph, paste it into panel_select_nodes — failed on the
+ * first attempt, every time, with a raw zod `expected number, received string`.
+ * The reporter hit it doing exactly that.
+ *
+ * Nothing about `"42"` is ambiguous. Accept both spellings and normalize to the
+ * number the wire has always carried, so the round trip closes.
+ *
+ * DELIBERATELY STRICT about what counts as a node id: only an integer, or a
+ * string that is exactly an integer. `"42px"`, `"4.5"`, `""` and `"5:12"` are
+ * still rejected. The last one matters — a subgraph-qualified id is a real
+ * shape in newer ComfyUI, and silently truncating it to `5` would target the
+ * WRONG node rather than fail. If those need supporting, that is a separate,
+ * deliberate change to the wire contract, not something to fall out of a coerce.
+ */
+const nodeId = () =>
+  z.union([z.number().int(), z.string().regex(/^-?\d+$/, "a node id must be an integer")]).transform(
+    (v) => (typeof v === "number" ? v : Number.parseInt(v, 10)),
+  );
+
+/**
+ * #845 — which `panel_canvas` arguments the chosen action actually consumes.
+ *
+ * The tool accepted node_id/dx/dy/scale for every action and forwarded them all,
+ * so an argument the action ignores vanished without a word. The reporter passed
+ * `zoom: 0.55` alongside `center_on_node` and got `scale: 0.067` back — which
+ * reads as "your zoom was applied and then overridden", when in truth it was
+ * never applied at all. The panel's center_on_node case sets the offset and
+ * touches the scale not at all.
+ *
+ * Naming what an action ignores is the whole fix. It is NOT an error — passing a
+ * harmless extra argument should not fail a viewport move — but it must not be
+ * silent either.
+ */
+const CANVAS_ACTION_ARGS: Record<string, string[]> = {
+  fit: [], // computes its own framing from the graph bounds
+  center_on_node: ["node_id"],
+  pan: ["dx", "dy"],
+  zoom: ["scale"],
+};
+
+/** Supplied-but-unused argument names for `action`, in a caller-facing spelling. */
+export function ignoredCanvasArgs(
+  action: string,
+  supplied: { node_id?: unknown; dx?: unknown; dy?: unknown; scale?: unknown },
+): string[] {
+  const used = CANVAS_ACTION_ARGS[action];
+  if (!used) return []; // unknown action — the enum rejects it; never guess here
+  const label: Record<string, string> = { scale: "scale/zoom" };
+  return (["node_id", "dx", "dy", "scale"] as const)
+    .filter((k) => supplied[k] !== undefined && !used.includes(k))
+    .map((k) => label[k] ?? k);
+}
+
+/** Append a disclosure line to a successful text result, leaving errors alone. */
+function appendNote(res: ToolResult, note: string): ToolResult {
+  const first = res.content[0];
+  if (!first || first.type !== "text") return res;
+  return {
+    ...res,
+    content: [{ ...first, text: `${first.text}\n\n${note}` }, ...res.content.slice(1)],
+  };
+}
+
 const RETRY_OF_ARG = {
   retry_of: z
     .string()
@@ -6130,7 +6273,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     def(
       "panel_get_subgraph",
       "Read INSIDE a subgraph node on the user's open graph: ids, types, widget values, and connections of its inner nodes. Use after panel_graph_outline / panel_query_graph shows a node with is_subgraph=true. Read-only.",
-      { node_id: z.number().int().describe("Subgraph node id (is_subgraph=true).") },
+      { node_id: nodeId().describe("Subgraph node id (is_subgraph=true).") },
       async (args: A, ctx) =>
         withTruncationHints(await ctx.call({ cmd: "graph_get_subgraph", node_id: args.node_id }), [
           {
@@ -6267,7 +6410,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     def(
       "panel_remove_node",
       "Remove a node (and its connections) from the user's open graph by id. Undoable with Ctrl+Z.",
-      { node_id: z.number().int().describe("Node id from panel_graph_outline / panel_query_graph.") },
+      { node_id: nodeId().describe("Node id from panel_graph_outline / panel_query_graph.") },
       async (args: A, ctx) => ctx.call({ cmd: "graph_remove_node", node_id: args.node_id }),
     ),
     def(
@@ -6534,11 +6677,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "panel_connect",
       "Connect an output slot of one node to an input slot of another in the user's open graph. Slots accept a name ('MODEL', 'samples') or numeric index. If both slot args are omitted the panel picks the first type-compatible pairing. On failure the error lists every slot with its type and [connected] flag — re-check with panel_query_graph ({ids:[node_id], fields:'detail'}). Undoable.",
       {
-        from_node_id: z.number().int().describe("Source node id."),
+        from_node_id: nodeId().describe("Source node id."),
         from_output: slotRef
           .optional()
           .describe("Source output slot name or index; omit to auto-match by type (prefers an unconnected, exact-type input; `*` wildcards match last)."),
-        to_node_id: z.number().int().describe("Target node id."),
+        to_node_id: nodeId().describe("Target node id."),
         to_input: slotRef
           .optional()
           .describe("Target input slot name or index; omit to auto-match by type (prefers an unconnected, exact-type input; `*` wildcards match last)."),
@@ -6571,7 +6714,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "panel_disconnect",
       "Disconnect an input slot of a node in the user's open graph. Undoable with Ctrl+Z.",
       {
-        node_id: z.number().int().describe("Node id whose input to disconnect."),
+        node_id: nodeId().describe("Node id whose input to disconnect."),
         input: slotRef.optional().describe("Input slot name or index (default 0)."),
       },
       async (args: A, ctx) => ctx.call({ cmd: "graph_disconnect", node_id: args.node_id, input: args.input }),
@@ -6580,7 +6723,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "panel_set_widget",
       "Set a widget value on a node in the user's open graph (steps, cfg, seed, ckpt_name, text prompts, …). Returns the previous and new value. Undoable with Ctrl+Z. To CLEAR a text widget to an empty string, pass `clear: true` (some MCP clients drop an empty-string `value` from the serialized payload, so `value: \"\"` may not arrive — `clear: true` always works). For the LTXDirector timeline node (WhatDreamsCost CSGlide), set `timeline_data` with the FULL timeline JSON (segments + global_prompt) to drive its custom timeline UI — this re-syncs the editor and regenerates its derived `local_prompts`/`segment_lengths`/`guide_strength` widgets; setting those derived widgets directly is refused (they are silently reverted).",
       {
-        node_id: z.number().int().describe("Node id from panel_graph_outline / panel_query_graph."),
+        node_id: nodeId().describe("Node id from panel_graph_outline / panel_query_graph."),
         widget: z.string().describe("Widget name (e.g. 'steps', 'cfg', 'text')."),
         value: z
           .union([z.string(), z.number(), z.boolean()])
@@ -6616,7 +6759,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "panel_set_property",
       "Set a node's LiteGraph PROPERTY (the right-click → Properties panel), NOT a widget — the counterpart to panel_set_widget, which only reaches `widgets`. Many custom nodes are configured entirely through node properties: e.g. the rgthree Fast Groups Bypasser's filters `matchTitle`, `matchColors`, `sort`, and `toggleRestriction` are node properties, and without `matchTitle` the node enumerates EVERY group in the workflow (a footgun). Sets node.properties[name] and, when the node defines an onPropertyChanged callback (rgthree and many LiteGraph nodes do), invokes it so the change takes effect LIVE (e.g. rgthree re-filters its group list). Returns the previous and new value. Undoable with Ctrl+Z.",
       {
-        node_id: z.number().int().describe("Node id from panel_graph_outline / panel_query_graph."),
+        node_id: nodeId().describe("Node id from panel_graph_outline / panel_query_graph."),
         name: z
           .string()
           .describe("Property name from the node's right-click → Properties panel (e.g. 'matchTitle', 'matchColors', 'sort', 'toggleRestriction')."),
@@ -6631,8 +6774,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "panel_edit_node",
       "Atomically edit one node, or apply the same edit to several nodes. Pass exactly one of node_id or node_ids, plus at least one field. In one Ctrl+Z step you can move (pos), resize (size — including Note/MarkdownNote), retitle, recolor, change shape, collapse, pin, or set execution mode. Widget values, LiteGraph properties, links, and slot order stay on their dedicated tools. For a multi-node call, position/size/title/mode apply the same value to every target. Color fields accept #RGB, #RGBA, #RRGGBB, or #RRGGBBAA; null clears a color. Bypassing a subgraph retains panel_set_node_mode's unsafe-boundary guard; force:true is required to override it. Undoable with Ctrl+Z.",
       {
-        node_id: z.number().int().optional().describe("One node id from panel_graph_outline / panel_query_graph. Provide this OR node_ids, not both."),
-        node_ids: z.array(z.number().int()).min(1).optional().describe("Several node ids that receive the same presentation edit. Provide this OR node_id, not both."),
+        node_id: nodeId().optional().describe("One node id from panel_graph_outline / panel_query_graph. Provide this OR node_ids, not both."),
+        node_ids: z.array(nodeId()).min(1).optional().describe("Several node ids that receive the same presentation edit. Provide this OR node_id, not both."),
         pos: xy().optional().describe("New canvas [x, y]."),
         size: nodeSize().optional().describe("New [width, height] in canvas px. Uses the node's setSize so DOM-widget nodes reflow and minimum sizes are honored."),
         title: z.string().optional().describe("New header title."),
@@ -6669,8 +6812,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     // Keep legacy bridge commands behind compatibility tool names. graph_edit_node
     // is newer than several installed panels, while current panels adapt these
     // commands into the same atomic implementation.
-    def("panel_move_node", "Compatibility wrapper for panel_edit_node(pos).", { node_id: z.number().int(), pos: xy() }, async (args: A, ctx) => ctx.call({ cmd: "graph_move_node", node_id: args.node_id, pos: args.pos })),
-    def("panel_resize_node", "Compatibility wrapper for panel_edit_node(size).", { node_id: z.number().int(), size: nodeSize() }, async (args: A, ctx) => ctx.call({ cmd: "graph_resize_node", node_id: args.node_id, size: args.size })),
+    def("panel_move_node", "Compatibility wrapper for panel_edit_node(pos).", { node_id: nodeId(), pos: xy() }, async (args: A, ctx) => ctx.call({ cmd: "graph_move_node", node_id: args.node_id, pos: args.pos })),
+    def("panel_resize_node", "Compatibility wrapper for panel_edit_node(size).", { node_id: nodeId(), size: nodeSize() }, async (args: A, ctx) => ctx.call({ cmd: "graph_resize_node", node_id: args.node_id, size: args.size })),
     def(
       "panel_auto_layout",
       "Automatically arrange the user's open graph (or a subset of nodes) into a clean left-to-right / top-to-bottom / grid layout based on the real link topology. Group boxes move with their members and are re-fit. Use dry_run:true to preview proposed positions without touching the canvas. Undoable (one Ctrl+Z).",
@@ -6713,20 +6856,48 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "MOVE the user's viewport: 'fit' frames the whole graph, 'center_on_node' jumps to a node (give node_id), 'pan' shifts by dx/dy, 'zoom' sets an absolute scale. It changes what they are looking AT and returns nothing about the graph — to find out what is ON the canvas, use panel_graph_outline. View-only.",
       {
         action: z.enum(["fit", "center_on_node", "pan", "zoom"]),
-        node_id: z.number().int().optional().describe("Required for center_on_node."),
+        node_id: nodeId().optional().describe("Required for center_on_node."),
         dx: z.number().optional().describe("Pan delta x."),
         dy: z.number().optional().describe("Pan delta y."),
         scale: z.number().optional().describe("Absolute zoom for 'zoom' (0.05–4, 1 = 100%)."),
+        // #845 — the tool used two names for one concept: `action:"zoom"` requires
+        // `scale`, and a `zoom` argument was simply not in the schema, so passing
+        // it was dropped without a word. Accept it as the alias it obviously is.
+        zoom: z.number().optional().describe("Alias for `scale`."),
       },
-      async (args: A, ctx) =>
-        ctx.call({
+      async (args: A, ctx) => {
+        const scale = args.scale ?? args.zoom;
+        const res = await ctx.call({
           cmd: "graph_canvas",
           action: args.action,
           node_id: args.node_id,
           dx: args.dx,
           dy: args.dy,
-          scale: args.scale,
-        }),
+          scale,
+        });
+        // #845 — an argument this action does not consume was SILENTLY dropped.
+        // The reporter passed zoom:0.55 to center_on_node, got scale 0.067 back,
+        // and had no way to tell the zoom had been ignored rather than applied
+        // and overridden. Only `zoom` applies a scale — the panel's
+        // center_on_node sets the offset alone — so say which arguments this
+        // action actually used.
+        const ignored = ignoredCanvasArgs(String(args.action), {
+          node_id: args.node_id,
+          dx: args.dx,
+          dy: args.dy,
+          scale,
+        });
+        if (!ignored.length || res.isError) return res;
+        return appendNote(
+          res,
+          `Note: action:"${args.action}" does not use ${ignored.join(", ")} — ` +
+            `${ignored.length === 1 ? "it was" : "they were"} ignored, not applied. ` +
+            (ignored.includes("scale/zoom")
+              ? `To change the zoom, call panel_canvas again with action:"zoom" and scale. `
+              : "") +
+            `Any values in this result are the canvas's actual state.`,
+        );
+      },
     ),
     def(
       "panel_run",
@@ -6783,8 +6954,28 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // rather than duplicating it: that token dedupes an EXPLICIT retry of an
         // outcome-unknown dispatch at the panel; this fence stops a BLIND
         // re-issue before any dispatch.
+        // #1011 — an EXPLICIT retry is not a blind re-issue, and this fence was
+        // stopping the one mechanism that can settle it.
+        //
+        // The comment above says this "composes with #694's retry_of". It does
+        // not, in the order they actually run: the fence refuses BEFORE dispatch,
+        // so a caller who was handed a retry_of rid by an outcome-unknown timeout
+        // can never get that token to the panel, where the dedupe lives. After a
+        // reconnect the in-flight render is exactly the one they are unsure
+        // about, `selfAttributedProven` is false (the ledger is in-memory and did
+        // not survive), and the fence fires every time — leaving them unable to
+        // discover whether their timed-out dispatch created the pending job, with
+        // the token that exists for that purpose inert in their hand.
+        //
+        // A supplied retry_of is a caller ASSERTION of the same weight as
+        // allow_duplicate: "this is a retry of that dispatch, dedupe it." It is
+        // only ever obtained FROM an outcome-unknown failure of this identical
+        // call, so it is not a blanket bypass. Honour it, and let the panel do
+        // the reconciliation it is designed for.
+        const explicitRetry = typeof args.retry_of === "string" && args.retry_of !== "";
         if (
           args.allow_duplicate !== true &&
+          !explicitRetry &&
           pre.connected &&
           (pre.running || pre.queueDepth > 0) &&
           !pre.selfAttributedProven
@@ -6888,6 +7079,22 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // (a minted prompt id outranks the rejection signals). Say which outputs
         // were dropped, or the caller waits for files that will never be written.
         const droppedNote = describeDroppedOutputs(runReply);
+        // #1011 — a retry that rode PAST the duplicate fence must say so. The
+        // fence exists to stop a second render stacking behind an unaccountable
+        // one; skipping it on the caller's assertion is right, but silently
+        // skipping it would hide the one risk the caller took. The panel dedupes
+        // on the token, so the expected outcome is reconciliation rather than a
+        // new render — expected, not guaranteed, which is exactly why it is said.
+        const retryBypassNote =
+          explicitRetry && pre.connected && (pre.running || pre.queueDepth > 0) && !pre.selfAttributedProven
+            ? `\n\n[RETRY] You passed retry_of, so the duplicate fence was SKIPPED — a render this session ` +
+              `could not account for was already in flight` +
+              (pre.runningPromptId ? ` (running prompt ${pre.runningPromptId})` : "") +
+              `. The panel dedupes on that token, so a matching earlier dispatch should have been ` +
+              `reconciled rather than re-queued. VERIFY that before assuming: check queue (action:"list") ` +
+              `and get_history — if you now see one MORE job than you intended, the token did not match ` +
+              `and this dispatch stacked a duplicate.`
+            : "";
         // markSelfQueued with NO id still stamps the recent-self-queue timestamp,
         // so the id-less case must still call it exactly once (#559).
         if (queuedIds.length === 0) QueueMonitor.markSelfQueued(null);
@@ -6971,7 +7178,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               // droppedNote sits FIRST among the appendices: "some outputs were
               // dropped" changes what the caller should expect from this run, so
               // it must not trail behind the anti-poll boilerplate (#944).
-              { type: "text", text: res.content[0].text + droppedNote + retryNote + warn + note },
+              { type: "text", text: res.content[0].text + droppedNote + retryBypassNote + retryNote + warn + note },
               ...res.content.slice(1),
             ],
           };
@@ -7440,8 +7647,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .array(
             z.object({
               text: z.string().describe("Short step description (a few words)."),
+              // #1018 — accept the synonyms agents actually produce (in_progress,
+              // completed, …) and normalize them in the handler. The DESCRIPTION
+              // still teaches only the canonical trio: one vocabulary to learn,
+              // and no round trip lost to a rejected first call over a spelling
+              // whose intent was never in doubt.
               status: z
-                .enum(["pending", "active", "done"])
+                .enum(TODO_STATUS_INPUTS as [string, ...string[]])
                 .optional()
                 .describe("Step state (default 'pending'). Mark the one you're on 'active'."),
             }),
@@ -7457,18 +7669,30 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // bound tab is a headless (mobile/remote) client, resolve the live desktop
         // canvas tab instead of dispatching at the headless client — which would
         // reject with the misleading "mobile client has no open canvas".
+        // #1018 — canonicalize ONCE, here, before anything reads the list. The
+        // panel, recordTodo's snapshot (#977) and the completion-directive logic
+        // all keep seeing only pending/active/done.
+        const items = normalizeTodoItems(args.items as Array<{ text?: unknown; status?: unknown }>);
         const redirect = desktopCanvasRedirect(ctx, "panel_set_todo");
         if (redirect?.error) return fail(redirect.error);
         if (redirect?.tabId) {
+          // #977 — the desktop redirect writes the checklist to ANOTHER tab, so
+          // record it against that one. Keying it on ctx.tabId would leave the
+          // tab that actually holds the plan looking planless.
+          recordTodo(redirect.tabId, items);
           return dispatchToTab(
             ctx,
             redirect.tabId,
-            { cmd: "set_todo", items: args.items },
+            { cmd: "set_todo", items },
             15000,
             () => reResolveDesktopTab(ctx, "panel_set_todo"),
           );
         }
-        return ctx.call({ cmd: "set_todo", items: args.items }, 15000);
+        // #977 — retain what the agent DECLARED, so a later render completion can
+        // tell "you are mid-sweep" from "that was the last thing you were doing".
+        // The panel keeps the UI copy; this is the orchestrator's own record.
+        recordTodo(ctx.tabId, items);
+        return ctx.call({ cmd: "set_todo", items }, 15000);
       },
     ),
     def(
@@ -8094,7 +8318,51 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "panel_new_workflow",
       "Open a brand-new BLANK workflow in a NEW TAB. Use this whenever the user wants a 'new workflow' / 'fresh canvas' / 'start over for a new project'. This does NOT touch their current workflow — it opens a separate tab. NEVER use panel_clear for a new workflow (panel_clear wipes the CURRENT graph and is only for 'clear/reset this canvas').",
       {},
-      async (_args, ctx) => ctx.call({ cmd: "workflow_new" }, 15000),
+      async (_args, ctx) => {
+        const res = await ctx.call({ cmd: "workflow_new" }, 15000);
+        if (res.isError) return res;
+        // #932 (recurrence on 0.50.6) — a NEW canvas needs a NEW fence.
+        //
+        // workflow_new authoritatively re-points the active workflow, exactly as
+        // workflow_open does — but only the open path re-derived the command
+        // fence afterwards (openWorkflowWithVerify). So this session kept the
+        // PREVIOUS workflow's instance stamp while the user was now looking at a
+        // brand-new blank canvas, and every stamped command after it failed with
+        // "workflow instance mismatch". The reporter created a workflow and could
+        // not add a single node to it.
+        //
+        // Refresh from the panel's own live active record, the same way the open
+        // path does. The panel mints the new canvas's identity EAGERLY at
+        // creation ("so the key exists BEFORE the first edit"), so it is readable
+        // by the time this runs — it is simply not carried on the workflow_new
+        // reply, which returns key/routing_key but no workflow_uuid.
+        //
+        // NEVER fails the call on a rebind miss: the workflow WAS created, and
+        // retracting that would be the worse lie. Disclose instead, so the agent
+        // learns the graph tools are not yet usable here rather than discovering
+        // it one confusing mismatch at a time.
+        const fenceRebind = await rebindWorkflowFence(ctx);
+        let canMutateNow: boolean | undefined;
+        let refusalCause: "unroutable" | "disconnected" | "no_identity" | "capability" | undefined;
+        try {
+          if (ctx.tabGraphMutationCapability) {
+            const cap = ctx.tabGraphMutationCapability();
+            canMutateNow = cap.known ? cap.canMutate : undefined;
+            if (cap.known && !cap.canMutate) refusalCause = cap.because;
+          } else {
+            canMutateNow = ctx.tabCanMutateGraph?.();
+          }
+        } catch {
+          canMutateNow = undefined; // a guard that can throw is not a guard
+          refusalCause = undefined;
+        }
+        const fence = describeFenceRebind(fenceRebind, canMutateNow, refusalCause);
+        if (!fence || fence.binding === "bound") return res;
+        return appendNote(
+          res,
+          `The blank workflow WAS created.${fence.note}`,
+        );
+      },
     ),
     def(
       "panel_open_workflow",
@@ -8127,13 +8395,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     def(
       "panel_select_nodes",
       "Select nodes on the user's canvas by id (highlights them, sets the multi-selection). Useful before panel_create_subgraph.",
-      { node_ids: z.array(z.number().int()).describe("Node ids to select.") },
+      { node_ids: z.array(nodeId()).describe("Node ids to select.") },
       async (args: A, ctx) => ctx.call({ cmd: "graph_select_nodes", node_ids: args.node_ids }),
     ),
     def(
       "panel_create_subgraph",
       "Group the given nodes into a SUBGRAPH (ComfyUI 'Convert to Subgraph') on the user's canvas — collapses them into one subgraph node. Returns the new subgraph node id. Undoable with Ctrl+Z. To wrap an existing GROUP, prefer panel_subgraph_group (you don't have to list the node_ids yourself).",
-      { node_ids: z.array(z.number().int()).describe("Node ids to group into a subgraph.") },
+      { node_ids: z.array(nodeId()).describe("Node ids to group into a subgraph.") },
       async (args: A, ctx) => ctx.call({ cmd: "graph_create_subgraph", node_ids: args.node_ids }, 15000),
     ),
     def(
@@ -8176,7 +8444,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "panel_save_subgraph",
       "Save a SUBGRAPH node to the user's reusable blueprint LIBRARY (publish), so it can be dropped into any workflow later. Pass node_id to pick the subgraph node (else a single selected subgraph node is used) and name to title the blueprint (defaults to the node's title). Runs programmatically — NO save dialog pops. The blueprint becomes the addable type 'SubgraphBlueprint.<name>' (use panel_add_subgraph or panel_list_subgraphs). Returns {saved: {name, type}}.",
       {
-        node_id: z.number().int().optional().describe("Subgraph node id to publish (is_subgraph=true). Omit to use the selected subgraph node."),
+        node_id: nodeId().optional().describe("Subgraph node id to publish (is_subgraph=true). Omit to use the selected subgraph node."),
         name: z.string().optional().describe("Blueprint name. Defaults to the subgraph node's title."),
       },
       async (args: A, ctx) =>
@@ -8284,13 +8552,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     def(
       "panel_set_node_title",
       "Compatibility wrapper for panel_edit_node(title).",
-      { node_id: z.number().int(), title: z.string() },
+      { node_id: nodeId(), title: z.string() },
       async (args: A, ctx) => ctx.call({ cmd: "graph_set_title", node_id: args.node_id, title: args.title }, 15000),
     ),
     def(
       "panel_set_node_collapsed",
       "Compatibility wrapper for panel_edit_node(collapsed).",
-      { node_id: z.number().int(), collapsed: z.boolean().optional() },
+      { node_id: nodeId(), collapsed: z.boolean().optional() },
       async (args: A, ctx) => ctx.call({ cmd: "graph_set_node_collapsed", node_id: args.node_id, collapsed: args.collapsed ?? true }),
     ),
     def(
@@ -8301,7 +8569,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         "• 'mute' — the node AND everything DOWNSTREAM of it do NOT execute (no pass-through). Use to fully switch off a branch/output.\n" +
         "CRITICAL — modes silently change what a render produces, so they are a top cause of 'wrong output'. A BYPASSED node contributes nothing of its own and a MUTED node kills its branch. Use this tool to ENABLE the path you actually want and DISABLE the one you don't — e.g. to drive a workflow from its Ideogram/JSON prompt builder you must set the manual-prompt node to 'bypass' and the JSON-builder path to 'active' (or vice-versa); likewise to pick one branch of an rgthree 'Fast Groups Bypasser'/Muter or a prompt-source switch. ALWAYS read modes first (panel_graph_outline marks [bypass]/[mute]; panel_query_graph detail rows carry mode): if the intended path is bypassed/muted, fix it HERE before running, and never assume a switch/route is already active. UNSAFE-BYPASS GUARD: bypassing a SUBGRAPH node whose boundary inputs are ordered differently from its outputs is REJECTED — ComfyUI forwards each output from the input at the SAME index, so e.g. an IMAGE output backed by a BBOX_DETECTOR input would silently feed the wrong type downstream. Re-order the boundary inputs or add an explicit ImpactSwitch to choose the passthrough; pass force:true only if you truly intend the positional forward. Undoable with Ctrl+Z.",
       {
-        node_id: z.number().int().describe("Node id from panel_graph_outline / panel_query_graph."),
+        node_id: nodeId().describe("Node id from panel_graph_outline / panel_query_graph."),
         mode: z
           .enum(["active", "bypass", "mute"])
           .describe(
@@ -8321,7 +8589,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "panel_set_node_color",
       "Legacy color compatibility wrapper. Unlike panel_edit_node, color and bgcolor accept any CSS color string; when preset is supplied it wins over explicit colors, preserving the historical bridge behavior.",
       {
-        node_id: z.number().int(),
+        node_id: nodeId(),
         preset: z.enum(["red", "brown", "green", "blue", "pale_blue", "cyan", "purple", "yellow", "black"]).nullable().optional(),
         color: z.string().nullable().optional(),
         bgcolor: z.string().nullable().optional(),
@@ -8373,7 +8641,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     def(
       "panel_enter_subgraph",
       "Navigate INTO a subgraph node so you can read and EDIT its inner nodes — after this, panel_query_graph / panel_graph_outline and all panel_* edit tools target the subgraph's inner graph (the user sees the canvas drill in). This is how you edit inside a subgraph (e.g. tweak a widget on an inner node). Call panel_exit_subgraph when done. Returns the new viewing scope.",
-      { node_id: z.number().int().describe("Subgraph node id (is_subgraph=true).") },
+      { node_id: nodeId().describe("Subgraph node id (is_subgraph=true).") },
       async (args: A, ctx) => ctx.call({ cmd: "graph_enter_subgraph", node_id: args.node_id }, 15000),
     ),
     def(
@@ -8395,7 +8663,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "panel_promote_widget",
       "Expose (promote) an INNER subgraph widget on the PARENT subgraph node, so it can be set from outside without opening the subgraph — e.g. surface an inner KSampler's `seed`/`steps` on the subgraph node. You MUST be inside the subgraph first (call panel_enter_subgraph): `node_id` is an inner node (from panel_query_graph while inside) and `widget` is one of its widget names. Pass demote:true to un-promote. Undoable with Ctrl+Z.",
       {
-        node_id: z.number().int().describe("Inner node id (from panel_query_graph while inside the subgraph)."),
+        node_id: nodeId().describe("Inner node id (from panel_query_graph while inside the subgraph)."),
         widget: z.string().describe("Name of the widget on that node to promote (e.g. 'seed', 'steps', 'text')."),
         demote: z.boolean().optional().describe("Set true to UN-promote (remove the widget from the parent node)."),
       },
@@ -8406,7 +8674,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "panel_expose_subgraph_output",
       "Wire an interior node's OUTPUT to the subgraph's OUTPUT RAIL — i.e. expose it as a SUBGRAPH OUTPUT on the boundary so the PARENT graph can connect to the subgraph node's new output slot. You MUST be INSIDE the subgraph first (panel_enter_subgraph). This is the correct way to \"wire an internal output to the subgraph's output rail\": do NOT panel_connect to a guessed rail node id — call this with the interior node + the output you want exposed. Read panel_query_graph's `rails` to see the resulting boundary slots. `from_output` is an output slot NAME ('IMAGE', 'LATENT') or numeric index. Optional `name` titles the new boundary output (defaults from the source slot). Undoable with Ctrl+Z.",
       {
-        from_node_id: z.number().int().describe("Interior (inner) node id whose output to expose (from panel_query_graph while inside the subgraph)."),
+        from_node_id: nodeId().describe("Interior (inner) node id whose output to expose (from panel_query_graph while inside the subgraph)."),
         from_output: slotRef.describe("Output slot name (e.g. 'IMAGE', 'LATENT') or numeric index on that node."),
         name: z.string().optional().describe("Optional name for the new subgraph output (boundary slot). Defaults from the source slot."),
       },
@@ -8425,7 +8693,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "panel_expose_subgraph_input",
       "Wire an interior node's INPUT to the subgraph's INPUT RAIL — i.e. expose it as a SUBGRAPH INPUT on the boundary so the PARENT graph can feed the subgraph node's new input slot. You MUST be INSIDE the subgraph first (panel_enter_subgraph). This is the correct way to wire an internal input to the subgraph's input rail: do NOT panel_connect to a guessed rail node id — call this with the interior node + the input you want exposed. Read panel_query_graph's `rails` to see the resulting boundary slots. `to_input` is an input slot NAME ('model', 'pixels') or numeric index. Optional `name` titles the new boundary input (defaults from the target slot). Undoable with Ctrl+Z.",
       {
-        to_node_id: z.number().int().describe("Interior (inner) node id whose input to expose (from panel_query_graph while inside the subgraph)."),
+        to_node_id: nodeId().describe("Interior (inner) node id whose input to expose (from panel_query_graph while inside the subgraph)."),
         to_input: slotRef.describe("Input slot name (e.g. 'model', 'pixels') or numeric index on that node."),
         name: z.string().optional().describe("Optional name for the new subgraph input (boundary slot). Defaults from the target slot."),
       },
@@ -8443,7 +8711,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     def(
       "panel_unpack_subgraph",
       "EXPAND / DISSOLVE a subgraph node on the user's open graph — inline its interior nodes back into the PARENT graph, rewire all external links to those now-inlined nodes, and remove the subgraph wrapper. This is the frontend's \"Unpack Subgraph\" (litegraph LGraph.unpackSubgraph) and the exact INVERSE of panel_create_subgraph. Use it to flatten a stage that was over-nested, or to edit interior nodes directly at the parent level. The interior nodes reappear on the parent canvas with their connections preserved. Undoable with Ctrl+Z.",
-      { node_id: z.number().int().describe("Subgraph node id to unpack/dissolve (is_subgraph=true, from panel_graph_outline / panel_query_graph).") },
+      { node_id: nodeId().describe("Subgraph node id to unpack/dissolve (is_subgraph=true, from panel_graph_outline / panel_query_graph).") },
       async (args: A, ctx) => ctx.call({ cmd: "graph_unpack_subgraph", node_id: args.node_id }, 15000),
     ),
     def(

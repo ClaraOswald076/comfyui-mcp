@@ -205,10 +205,45 @@ const SELF = new Set([
 /** Extensions that are never worth scanning as text. */
 const BINARY = /\.(png|jpg|jpeg|gif|webp|ico|pdf|safetensors|ckpt|pt|bin|woff2?|mp4|webm|wav|mp3)$/i;
 
-function tracked(): string[] {
-  return execFileSync("git", ["ls-files", "-z"], { encoding: "utf8" })
+function gitList(args: string[]): string[] {
+  return execFileSync("git", ["ls-files", ...args, "-z"], { encoding: "utf8" })
     .split("\0")
     .filter((p) => p && !BINARY.test(p) && !SELF.has(p));
+}
+
+/**
+ * Files to scan: tracked AND untracked-but-not-ignored (#970).
+ *
+ * `git ls-files` alone cannot see an untracked file, so a brand-new file was
+ * invisible to this gate until its first commit — and it reported
+ * `OK — N tracked files` while saying nothing about what it had skipped. That
+ * green reads as "checked everything".
+ *
+ * This exact trap is recorded TWICE in the comments above ("green while
+ * untracked, red once committed") because it caught the gate out on its own
+ * source and then again on the generated vocabulary artefact. It caught a third
+ * change out since — a new test file whose comments named two names retired in
+ * 0.50.0 passed locally and took CI red on three platforms.
+ *
+ * Three times is enough. The class of change most likely to introduce a dead
+ * name is a NEW file — written fresh, often narrating an issue report that
+ * predates a rename — which is precisely the class the old list could not see.
+ *
+ * `--exclude-standard` honours .gitignore, so build output and local scratch stay
+ * out. A dirty working tree therefore scans slightly more than CI does, which is
+ * the right direction: locally it is a superset, and in CI (always clean) the two
+ * lists are identical.
+ */
+function scannable(): { files: string[]; trackedCount: number; untrackedCount: number } {
+  const trackedFiles = gitList([]);
+  const untrackedFiles = gitList(["--others", "--exclude-standard"]);
+  const seen = new Set(trackedFiles);
+  const extra = untrackedFiles.filter((p) => !seen.has(p));
+  return {
+    files: [...trackedFiles, ...extra],
+    trackedCount: trackedFiles.length,
+    untrackedCount: extra.length,
+  };
 }
 
 /**
@@ -303,7 +338,7 @@ interface Hit {
   dead: DeadName;
 }
 
-const files = tracked();
+const { files, trackedCount, untrackedCount } = scannable();
 const hits: Hit[] = [];
 const splitHits: Array<{ path: string; line: number; text: string }> = [];
 /** `${name}\u0000${path}` → the lines it was seen on, to expire stale exceptions. */
@@ -658,6 +693,11 @@ if (errors.length > 0) {
 }
 
 console.error(
-  `[check-tool-vocabulary] OK — ${files.length} tracked files, ` +
+  // #970 — the count says what was SCANNED, and names the untracked share
+  // explicitly. "OK — N tracked files" read as "checked everything" while a
+  // brand-new file was invisible; a reader who can see the split can tell a
+  // clean CI run (untracked 0) from a local run over a dirty tree.
+  `[check-tool-vocabulary] OK — ${files.length} files scanned ` +
+    `(${trackedCount} tracked, ${untrackedCount} untracked-not-ignored), ` +
     `${DEAD_NAMES.length} dead name(s) in the ledger, no live references.`,
 );

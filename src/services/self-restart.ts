@@ -143,6 +143,19 @@ function isRestartDisabled(env: NodeJS.ProcessEnv): boolean {
   return v === "0" || v === "false" || v === "no" || v === "off";
 }
 
+/**
+ * Can this process restart itself to apply an update? Both switches, in one
+ * place (#875): the master off (COMFYUI_MCP_AUTO_UPDATE_DISABLE) and the
+ * restart-only opt-out (COMFYUI_MCP_AUTORESTART=0).
+ *
+ * Exported so the phone-pairing disclosure can say whether a rotating pair URL
+ * is likely to be invalidated on its own, without re-deriving the rule from the
+ * env vars and drifting from what the restarter actually does.
+ */
+export function canSelfRestart(env: NodeJS.ProcessEnv = process.env): boolean {
+  return !isAutoUpdateDisabled(env) && !isRestartDisabled(env);
+}
+
 export class SelfRestarter {
   private deps: SelfRestartDeps;
   private info: InstallInfo;

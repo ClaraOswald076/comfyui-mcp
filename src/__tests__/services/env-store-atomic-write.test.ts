@@ -17,7 +17,15 @@
 // verification that REPORTS a loss instead of confirming a save over it.
 
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -432,7 +440,7 @@ describe("the credential store is written ATOMICALLY", () => {
     expect(r.uncertainty).toMatch(/two adjacent operations/);
   });
 
-  it("REPORTS the key of a writer that lands AFTER the compare-and-swap re-read", () => {
+  it("PRESERVES the key of a writer that lands AFTER the compare-and-swap re-read", () => {
     // THE window the compare-and-swap cannot close, and the case the receipt used
     // to narrate as a clean save: writer B lands between our `current !== raw`
     // check (read 2) and our rename, so our rename replaces B's file. Computing
@@ -450,14 +458,20 @@ describe("the credential store is written ATOMICALLY", () => {
       },
     };
     const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
-    // Our key landed, and B's really is gone — that is the damage.
+    // #881 — this window is now CLOSED, so there is no damage left to report.
+    // The store is re-read at the last possible moment before the rename, so B's
+    // arrival is SEEN and the save retries against their content instead of
+    // replacing it. Both keys survive, which is strictly better than the
+    // accurate loss report this test used to assert.
     expect(parseEnvFile()!.CIVITAI_API_TOKEN).toBe("civ-new");
-    expect(parseEnvFile()!.RUNPOD_API_KEY).toBeUndefined();
-    // ...and it is REPORTED, not narrated away.
-    expect(r.lostKeys).toContain("RUNPOD_API_KEY");
-    // The verdict itself is what stops any caller rendering this as a save:
-    // every success test in the codebase is `persisted === "yes"`.
-    expect(r.persisted).toBe("damaged");
+    expect(parseEnvFile()!.RUNPOD_API_KEY).toBe("rp-from-other-process");
+    expect(r.lostKeys ?? []).toEqual([]);
+    // NOT "yes", and that is deliberate. The collision was real, and the guard
+    // NARROWS the window rather than closing it — a writer landing between that
+    // last read and the rename is still unobservable, and no portable API can
+    // see it. The verdict has to keep saying so.
+    expect(r.persisted).toBe("unknown");
+    expect(r.uncertainty).toMatch(/another process was writing/);
   });
 
   it("preserves comments and unrelated keys through a normal save", () => {
@@ -530,7 +544,7 @@ describe("a save is never CONFIRMED over lost credentials", () => {
     expect(fsState.links).toContain(envPath);
   });
 
-  it("REPORTS a writer that CREATES the store before the snapshot is taken", () => {
+  it("PRESERVES a writer that CREATES the store before the snapshot is taken", () => {
     rmSync(envPath, { force: true }); // start with NO store at all
     // existsSync #1 is the writer's own "does it exist?"; #2 is the
     // compare-and-swap's. The other process creates the file right after #2 —
@@ -542,10 +556,16 @@ describe("a save is never CONFIRMED over lost credentials", () => {
       },
     };
     const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+    // #881 — also closed. The store did not exist when we read it, so `raw` is
+    // "", and the last-moment re-read before the rename finds their file there
+    // instead. That difference is the collision, and the retry recomputes from
+    // what they wrote rather than replacing it.
     expect(parseEnvFile()!.CIVITAI_API_TOKEN).toBe("civ-new");
-    expect(parseEnvFile()!.RUNPOD_API_KEY).toBeUndefined(); // theirs really is gone
-    expect(r.lostKeys).toContain("RUNPOD_API_KEY"); // ...and it is REPORTED
-    expect(r.persisted).toBe("damaged");
+    expect(parseEnvFile()!.RUNPOD_API_KEY).toBe("rp-from-other-process");
+    expect(r.lostKeys ?? []).toEqual([]);
+    // Still not a confirmed save, for the same reason as the sibling test above:
+    // the residual read→rename window cannot be observed from in-process.
+    expect(r.persisted).toBe("unknown");
   });
 
   it("still reports a clean save on a genuinely FIRST write (no prior store)", () => {
@@ -1107,17 +1127,20 @@ function readdirSyncSafe(d: string): string[] {
 // sentinel, saw only our own intended changes and reported the save clean.
 
 describe("a save that would clobber a writer who landed in the swap window", () => {
-  // KNOWN DEFECT, REPRODUCED — see issue #881. `it.fails` because the assertion below
-  // genuinely does not hold today: the other writer's credential is silently
-  // overwritten and the save still reports itself clean. Kept executing rather
-  // than skipped so the reproduction cannot rot, and marked `.fails` so that
-  // whoever fixes it is told immediately (this test starts FAILING once the bug
-  // is gone, which is the prompt to flip it back to `it`).
+  // FIXED — see issue #881. This ran as `it.fails` for a while, and the reason it
+  // could not be fixed is worth keeping: the harness was broken, not the store.
   //
-  // I tried two guards before the rename and neither ever executed — the
-  // sentinel is not taken on this path, and I did not establish why. That is the
-  // next thing to find out, not another guess.
-  it.fails("REFUSES rather than overwriting, and the other writer's value survives", () => {
+  // The hook below calls `renameSync`, which this file did not import. So it threw
+  // ReferenceError on every run, the concurrent write NEVER happened, and the
+  // throw propagated out of the mocked linkSync — which production caught as a
+  // link failure and answered with the copyFile fallback. Every guard tried
+  // against it "never executed" because there was no collision to see, and the
+  // earlier note here concluded the sentinel was not taken on this path. It was;
+  // the ReferenceError just looked exactly like a link that failed.
+  //
+  // The lesson: when a reproduction proves nothing, instrument the REPRODUCTION
+  // before instrumenting the code under test.
+  it("REFUSES rather than overwriting, and the other writer's value survives", () => {
     // Ours is already on disk and readable, so the CAS passes cleanly.
     setComfyuiSecret("CIVITAI_API_TOKEN", "mine-first");
 

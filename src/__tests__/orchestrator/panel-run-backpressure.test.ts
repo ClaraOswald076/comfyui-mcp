@@ -415,3 +415,67 @@ describe("#889: runErrorNotice picks its wording from real attribution", () => {
     expect(t).not.toMatch(/You did NOT queue this run/);
   });
 });
+
+// #1011 — the duplicate fence made the retry token inert.
+//
+// After a reconnect, panel_run timed out waiting for graph_run and returned a
+// retry_of rid. Re-issuing with that token hit the fence FIRST, so the panel's
+// dedupe — the only thing that can settle whether the timed-out dispatch created
+// the pending job — was never reached. The caller was left holding a token for
+// exactly this situation with no way to spend it.
+//
+// The fence's own comment claims it "composes with #694's retry_of". In the order
+// they actually ran, it did not: refusing before dispatch means the token cannot
+// travel.
+describe("#1011: an explicit retry is not a blind re-issue", () => {
+  beforeEach(() => {
+    qm.selfQueuedIds.clear();
+    qm.lastSelfQueueTs = null;
+    qm.state.connected = true;
+    qm.state.runningPromptId = "p-unaccountable";
+    qm.state.pendingPromptIds = [];
+    qm.state.queueRemaining = 1;
+  });
+
+  it("still REFUSES a blind re-issue — the fence is unchanged without the token", async () => {
+    const ctx = makeCtx({ queued: true, prompt_id: "p-new" });
+    const res = await defByName("panel_run").handler({}, ctx);
+    expect(res.isError).toBe(true);
+    expect(firstText(res)).toMatch(/refused to queue: a render is already in flight/);
+  });
+
+  it("lets a retry_of THROUGH so the panel can reconcile it", async () => {
+    const ctx = makeCtx({ queued: true, prompt_id: "p-reconciled" });
+    const res = await defByName("panel_run").handler({ retry_of: "rid-abc" }, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(firstText(res)).not.toMatch(/refused to queue/);
+  });
+
+  // Riding past a duplicate guard silently would hide the one risk the caller
+  // took. The note says what was skipped and how to check it actually deduped.
+  it("DISCLOSES that the fence was skipped, and how to verify", async () => {
+    const ctx = makeCtx({ queued: true, prompt_id: "p-reconciled" });
+    const t = firstText(await defByName("panel_run").handler({ retry_of: "rid-abc" }, ctx));
+    expect(t).toMatch(/\[RETRY\]/);
+    expect(t).toMatch(/duplicate fence was SKIPPED/);
+    expect(t).toContain("p-unaccountable");
+    // Expected, not guaranteed — the token might not match.
+    expect(t).toMatch(/VERIFY that before assuming/);
+    expect(t).toMatch(/one MORE job than you intended/);
+  });
+
+  it("says nothing when there was no fence to skip", async () => {
+    qm.state.runningPromptId = null;
+    qm.state.queueRemaining = 0;
+    const ctx = makeCtx({ queued: true, prompt_id: "p-quiet" });
+    const t = firstText(await defByName("panel_run").handler({ retry_of: "rid-abc" }, ctx));
+    expect(t).not.toMatch(/\[RETRY\]/);
+  });
+
+  it("an empty retry_of is not an assertion and does not bypass", async () => {
+    const ctx = makeCtx({ queued: true, prompt_id: "p-new" });
+    const res = await defByName("panel_run").handler({ retry_of: "" }, ctx);
+    expect(res.isError).toBe(true);
+    expect(firstText(res)).toMatch(/refused to queue/);
+  });
+});

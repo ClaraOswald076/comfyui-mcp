@@ -6,6 +6,70 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.10] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- close the swap window — and fix the reproduction that hid it (#1031)
+
+
+## [0.50.9] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- retry a mid-workflow-switch refusal instead of surfacing it (#1029)
+- bound the skill-generator's network calls (#1028)
+
+
+## [0.50.8] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a new canvas gets a new fence (#1024)
+- accept the node ids we print, and say which canvas args were ignored (#1023)
+- accept the todo status spellings agents actually produce (#1022)
+
+
+## [0.50.7] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- say at pair time whether the phone URL survives a restart (#1020)
+- name the panel's ComfyUI origin instead of asking the reader to check (#1019)
+- describe an unparsable category body from what was observed (#1017)
+- an ambiguous routing pin is not a reconnecting panel (#1016)
+- an explicit retry is not a blind re-issue (#1014)
+
+
+## [0.50.6] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- ask PowerShell for UTF-8 before reading a process command line (#1012)
+- the ACTION-level admission refusal owes the same explanation the name-level one got (#1008)
+- scan untracked files too, and say what was skipped (#1009)
+- dedupe the changelog against what it already says (#1007)
+
+
+## [0.50.5] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a render completion is a STEP when a plan is still running (#1002)
+- name our own User-Agent, and stop pushing Windows onto Python (#1000)
+- the Manager route is a routing fallback, not a remote server (#999)
+- say WHY the caller is holding a tool that does not exist (#998)
+
+#### Changed
+- reach the injection call sites three fixes could not (#1004)
+
+
 ## [0.50.4] - 2026-08-07
 
 ### MCP
