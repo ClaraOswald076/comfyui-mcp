@@ -278,6 +278,21 @@ export function readProcessIdentity(pid: number): ProcessIdentity | undefined {
         [
           "-NoProfile",
           "-Command",
+          // #1005 — PowerShell encodes REDIRECTED stdout with the console's
+          // legacy OEM codepage, not UTF-8, and this output is decoded as UTF-8.
+          // Any character the codepage cannot represent arrives as `?` or U+FFFD,
+          // so a ComfyUI under a non-ASCII path (a Cyrillic Windows profile, an
+          // accented folder, CJK) reports a MANGLED command line.
+          //
+          // That is not cosmetic here: commandLineMatchesArgv compares this
+          // against /system_stats argv to corroborate ownership before a restart.
+          // A mangled path never matches, so restart_comfyui refuses to control
+          // the very process it just identified — reporting "is not running the
+          // ComfyUI that answered /system_stats" about the one that is.
+          //
+          // Verified on Windows 11: without this line `Пример-café-日本` comes back
+          // as `??????-caf?-??`; with it, intact.
+          `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ` +
           `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"; ` +
             `if ($p) { "START=" + $p.CreationDate.ToFileTimeUtc(); "PPID=" + $p.ParentProcessId; "EXE=" + $p.ExecutablePath; "CMD=" + $p.CommandLine }`,
         ],
