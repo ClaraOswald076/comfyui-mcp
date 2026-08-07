@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.19] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- make the character budget reachable (#1055)
+
+
 ## [0.50.18] - 2026-08-07
 
 ### MCP
