@@ -28,6 +28,7 @@ import type { SessionStore } from "./session-store.js";
 import type { AgentBackend, AgentEvent, NeutralTurn } from "./agent-backend.js";
 import { type AudioRef, dedupeAudioRefs, noAudioPartText } from "./audio-attachment.js";
 import { runErrorNotice } from "./cli-remedy.js";
+import { runCompletionDirective } from "./todo-state.js";
 import {
   ClaudeBackend,
   fetchSupportedModels,
@@ -692,7 +693,20 @@ export class PanelAgent {
             ? `The image(s) are attached below and already shown to the user in the panel. `
             : `You cannot view images on this provider, but they are already shown to the user in the panel. `
           : ``) +
-        `Reply with ONE short sentence acknowledging the result and suggesting a sensible next step — you do NOT need to call any tools. Don't repeat an earlier comment.`;
+        // #977 — this used to be a FIXED "you do NOT need to call any tools",
+        // i.e. "stop now", sent after every render. Paired with panel_run's own
+        // "just end your turn now and wait", the emergent default was:
+        // queue → end turn → render → one sentence → end turn. A user running a
+        // five-variant sweep had to send a message to advance every step, while
+        // the system prompt was telling the agent to treat a todo list as a loop
+        // and not stop between steps. The per-event text won because it is the
+        // most recent and most specific thing in context.
+        //
+        // The agent's own checklist is the signal: if it declared a plan and
+        // entries remain, this render is a STEP, not an ending. Positive
+        // evidence only — no checklist, or one that is finished, keeps the
+        // acknowledge-and-stop wording, so nothing changes for a single render.
+        runCompletionDirective(this.tabId);
       // Attach the outputs inline so the agent SEES the render (no fetch needed).
       if (this.backend.capabilities.vision) {
         images = imgs.filter((i) => i.filename).map((i) => ({ ...i, type: i.type ?? "output" }));

@@ -101,6 +101,7 @@ import {
 } from "../services/panel-secrets.js";
 import { flattenUiWorkflow } from "../services/flatten-workflow.js";
 import { describeUnappliedFilters } from "./civitai-filter-guard.js";
+import { recordTodo } from "./todo-state.js";
 import { applyCapturedWidgetValues } from "../services/live-widget-overlay.js";
 import { listWorkflowLibraryKeys, userdataFetch } from "../services/userdata-library.js";
 import { getNsfwConsent, setNsfwConsent } from "../services/panel-settings.js";
@@ -7460,6 +7461,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         const redirect = desktopCanvasRedirect(ctx, "panel_set_todo");
         if (redirect?.error) return fail(redirect.error);
         if (redirect?.tabId) {
+          // #977 — the desktop redirect writes the checklist to ANOTHER tab, so
+          // record it against that one. Keying it on ctx.tabId would leave the
+          // tab that actually holds the plan looking planless.
+          recordTodo(redirect.tabId, args.items);
           return dispatchToTab(
             ctx,
             redirect.tabId,
@@ -7468,6 +7473,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             () => reResolveDesktopTab(ctx, "panel_set_todo"),
           );
         }
+        // #977 — retain what the agent DECLARED, so a later render completion can
+        // tell "you are mid-sweep" from "that was the last thing you were doing".
+        // The panel keeps the UI copy; this is the orchestrator's own record.
+        recordTodo(ctx.tabId, args.items);
         return ctx.call({ cmd: "set_todo", items: args.items }, 15000);
       },
     ),
