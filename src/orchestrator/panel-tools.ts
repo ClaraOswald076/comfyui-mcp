@@ -6361,6 +6361,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .boolean()
           .optional()
           .describe("Load the flattened graph onto the canvas (default true). false = return the graph JSON only."),
+        summary_only: z
+          .boolean()
+          .optional()
+          .describe(
+            "With apply:false, return ONLY the flatten report (what was removed/rewired, plus the size of the result) and omit the graph JSON. Use this when you want to know WHAT flattening did rather than to consume the graph — a flattened workflow's JSON is often tens of thousands of tokens. Ignored when the graph is being applied to the canvas.",
+          ),
       },
       async (args: A, ctx) => {
         const raw = await resolveWorkflowInput(args, ctx);
@@ -6376,7 +6382,32 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             ? `\nWarnings:\n${report.warnings.map((w) => `- ${w}`).join("\n")}`
             : "");
         if (args.apply === false) {
-          return ok(`${summary}\n\n${JSON.stringify(graph)}`);
+          // panel#690(5) — `apply:false` returned the entire flattened graph JSON with
+          // no way to ask for less, so a caller who only wanted to know WHAT flattening
+          // did paid tens of thousands of tokens to find out.
+          //
+          // The graph is NOT clipped when it is returned. A truncated JSON document is
+          // not a smaller answer, it is an invalid one — it cannot be parsed, loaded or
+          // diffed, so clipping would turn a large correct result into a small useless
+          // one. The choice is therefore whole-or-not-at-all, and `summary_only` is how
+          // the caller makes it.
+          const json = JSON.stringify(graph);
+          if (args.summary_only) {
+            const nodes = Array.isArray((graph as { nodes?: unknown[] }).nodes)
+              ? (graph as { nodes: unknown[] }).nodes.length
+              : 0;
+            const links = Array.isArray((graph as { links?: unknown[] }).links)
+              ? (graph as { links: unknown[] }).links.length
+              : 0;
+            // State the size that was withheld, so "summary only" never reads as "that
+            // is all there was" — the same rule the bounded reads follow.
+            return ok(
+              `${summary}\n\nGraph JSON omitted (summary_only): ${nodes} node(s), ${links} link(s), ` +
+                `~${Math.round(json.length / 1024)} KB. Re-run without summary_only to get it, ` +
+                `or with apply:true to load it onto the canvas.`,
+            );
+          }
+          return ok(`${summary}\n\n${json}`);
         }
         const loaded = await ctx.call({ cmd: "graph_load", graph: graph as never }, 30000);
         // ctx.call returns an error ToolResult for an outcome-unknown graph_load
