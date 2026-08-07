@@ -17,12 +17,18 @@ export interface UpscaleImageArgs {
 export interface UpscaleImageDeps {
   /** Resolve a local upscale model filename when none is given/defaulted. */
   resolveUpscaleModel: () => Promise<string | undefined>;
-  enqueue: (workflow: WorkflowJSON) => Promise<{ prompt_id: string; queue_remaining?: number }>;
+  enqueue: (
+    workflow: WorkflowJSON,
+  ) => Promise<{ prompt_id: string; queue_remaining?: number; rejectedOutputs?: string }>;
 }
 
 export interface UpscaleImageResult {
   prompt_id: string;
   queue_remaining?: number;
+  /** #1037 — output branches ComfyUI REFUSED while accepting the prompt. Present
+   *  only when some were: the run WAS queued, and the accepted branches still
+   *  produce output, so this is a disclosure attached to a success. */
+  rejectedOutputs?: string;
   model: string;
   scale: 2 | 4;
 }
@@ -74,6 +80,6 @@ export async function upscaleImage(
     scale,
   });
 
-  const { prompt_id, queue_remaining } = await deps.enqueue(workflow);
-  return { prompt_id, queue_remaining, model, scale };
+  const { prompt_id, queue_remaining, rejectedOutputs } = await deps.enqueue(workflow);
+  return { prompt_id, queue_remaining, rejectedOutputs, model, scale };
 }

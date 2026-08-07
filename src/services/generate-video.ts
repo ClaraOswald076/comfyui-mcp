@@ -31,12 +31,18 @@ export interface GenerateVideoDeps {
   /** List local model filenames for a category (may be empty; throws when the
    *  listing can't be obtained, e.g. no running server). */
   listModels: (type: string) => Promise<string[]>;
-  enqueue: (workflow: WorkflowJSON) => Promise<{ prompt_id: string; queue_remaining?: number }>;
+  enqueue: (
+    workflow: WorkflowJSON,
+  ) => Promise<{ prompt_id: string; queue_remaining?: number; rejectedOutputs?: string }>;
 }
 
 export interface GenerateVideoResult {
   prompt_id: string;
   queue_remaining?: number;
+  /** #1037 — output branches ComfyUI REFUSED while accepting the prompt. Present
+   *  only when some were: the run WAS queued, and the accepted branches still
+   *  produce output, so this is a disclosure attached to a success. */
+  rejectedOutputs?: string;
   mode: "t2v" | "i2v";
   checkpoint: string;
   width: number;
@@ -244,10 +250,11 @@ export async function generateVideo(
     filename_prefix: filenamePrefix,
   });
 
-  const { prompt_id, queue_remaining } = await deps.enqueue(workflow);
+  const { prompt_id, queue_remaining, rejectedOutputs } = await deps.enqueue(workflow);
   return {
     prompt_id,
     queue_remaining,
+    rejectedOutputs,
     mode,
     checkpoint,
     width: res.width,

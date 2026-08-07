@@ -24,7 +24,16 @@ const deps: ConditionedDeps = {
 };
 
 
-function enqueuedResult(result: { prompt_id: string; queue_remaining?: number; checkpoint: string }, tool: string) {
+function enqueuedResult(
+  result: {
+    prompt_id: string;
+    queue_remaining?: number;
+    checkpoint: string;
+    /** #1037 — output branches ComfyUI refused while accepting the prompt. */
+    rejectedOutputs?: string;
+  },
+  tool: string,
+) {
   return {
     content: [
       {
@@ -35,6 +44,11 @@ function enqueuedResult(result: { prompt_id: string; queue_remaining?: number; c
             tool,
             prompt_id: result.prompt_id,
             queue_remaining: result.queue_remaining,
+            // #1037 — a 200 from /prompt does not mean every output was accepted;
+            // ComfyUI queues the branches that validate and reports the rest.
+            ...(result.rejectedOutputs
+              ? { rejected_outputs: result.rejectedOutputs }
+              : {}),
             checkpoint: result.checkpoint,
             note: 'asset_id will be available in the completion notification; use get_image (action:"view") or generate_image (action:"regenerate") with it.',
           },

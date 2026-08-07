@@ -43,12 +43,18 @@ export interface GenerateAudioArgs {
 
 export interface GenerateAudioDeps {
   resolveFirstModel: (type: string) => Promise<string | undefined>;
-  enqueue: (workflow: WorkflowJSON) => Promise<{ prompt_id: string; queue_remaining?: number }>;
+  enqueue: (
+    workflow: WorkflowJSON,
+  ) => Promise<{ prompt_id: string; queue_remaining?: number; rejectedOutputs?: string }>;
 }
 
 export interface GenerateAudioResult {
   prompt_id: string;
   queue_remaining?: number;
+  /** #1037 — output branches ComfyUI REFUSED while accepting the prompt. Present
+   *  only when some were: the run WAS queued, and the accepted branches still
+   *  produce output, so this is a disclosure attached to a success. */
+  rejectedOutputs?: string;
   model_family: string;
 }
 
@@ -147,8 +153,8 @@ export async function generateAudio(
       filename_prefix: resolved.filename_prefix as string | undefined,
     });
 
-    const { prompt_id, queue_remaining } = await deps.enqueue(workflow);
-    return { prompt_id, queue_remaining, model_family: "ace_step_1.5" };
+    const { prompt_id, queue_remaining, rejectedOutputs } = await deps.enqueue(workflow);
+    return { prompt_id, queue_remaining, rejectedOutputs, model_family: "ace_step_1.5" };
   }
 
   // Stable Audio 3
@@ -178,6 +184,6 @@ export async function generateAudio(
     filename_prefix: resolved.filename_prefix as string | undefined,
   });
 
-  const { prompt_id, queue_remaining } = await deps.enqueue(workflow);
-  return { prompt_id, queue_remaining, model_family: "stable_audio_3" };
+  const { prompt_id, queue_remaining, rejectedOutputs } = await deps.enqueue(workflow);
+  return { prompt_id, queue_remaining, rejectedOutputs, model_family: "stable_audio_3" };
 }

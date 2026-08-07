@@ -21,12 +21,18 @@ export interface GenerateImageDeps {
   /** Resolve a checkpoint filename when none is given or defaulted. */
   resolveCheckpoint: () => Promise<string | undefined>;
   /** Submit the constructed workflow; returns the prompt id. */
-  enqueue: (workflow: WorkflowJSON) => Promise<{ prompt_id: string; queue_remaining?: number }>;
+  enqueue: (
+    workflow: WorkflowJSON,
+  ) => Promise<{ prompt_id: string; queue_remaining?: number; rejectedOutputs?: string }>;
 }
 
 export interface GenerateImageResult {
   prompt_id: string;
   queue_remaining?: number;
+  /** #1037 — output branches ComfyUI REFUSED while accepting the prompt. Present
+   *  only when some were: the run WAS queued, and the accepted branches still
+   *  produce output, so this is a disclosure attached to a success. */
+  rejectedOutputs?: string;
   checkpoint: string;
 }
 
@@ -95,6 +101,6 @@ export async function generateImage(
     }
   }
 
-  const { prompt_id, queue_remaining } = await deps.enqueue(workflow);
-  return { prompt_id, queue_remaining, checkpoint };
+  const { prompt_id, queue_remaining, rejectedOutputs } = await deps.enqueue(workflow);
+  return { prompt_id, queue_remaining, rejectedOutputs, checkpoint };
 }

@@ -82,3 +82,40 @@ describe("upscaleImage", () => {
     await expect(upscaleImage({ image: "" }, deps)).rejects.toThrow(/image is required/i);
   });
 });
+
+// #1037 — a 200 from /prompt does not mean every output was accepted. ComfyUI
+// validates each branch independently, queues the ones that pass, and reports
+// `node_errors` for the ones it refused; those never run while the prompt still
+// completes, so the run reads as a clean success that produced nothing.
+//
+// 0.50.15 surfaced that on the workflow-execution tools, but the generate_*
+// family routes through its own result types and only LOGGED it. This pins that
+// the disclosure now reaches the caller here too.
+describe("#1037: a rejected output branch reaches the caller", () => {
+  const REJECTED =
+    'The prompt was QUEUED, but ComfyUI REJECTED 1 output branch at validation and will not run it ' +
+    '— node 9 (SaveImage): Required input is missing (images).';
+
+  it("carries rejectedOutputs through to the result", async () => {
+    const { deps } = makeDeps({
+      enqueue: async () => ({
+        prompt_id: "pid-upscale",
+        queue_remaining: 0,
+        rejectedOutputs: REJECTED,
+      }),
+    });
+    const res = await upscaleImage({ image: "in.png" }, deps);
+    expect(res.rejectedOutputs).toBe(REJECTED);
+    // …and the run is still reported as queued, because it was.
+    expect(res.prompt_id).toBe("pid-upscale");
+  });
+
+  // Absent when nothing was rejected — the field must never appear as an empty
+  // reassurance, which would read as "we checked and it was fine".
+  it("is absent when every output was accepted", async () => {
+    const { deps } = makeDeps();
+    const res = await upscaleImage({ image: "in.png" }, deps);
+    expect(res.rejectedOutputs).toBeUndefined();
+    expect("rejectedOutputs" in res && res.rejectedOutputs !== undefined).toBe(false);
+  });
+});
