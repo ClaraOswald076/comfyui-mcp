@@ -2095,3 +2095,111 @@ export function retiredToolMessage(name: string): string | undefined {
   const removed = dead.since.startsWith("removed") ? dead.since : `removed in ${dead.since}`;
   return `Unknown tool '${name}' — ${removed}. Call ${dead.replacement} instead.`;
 }
+
+/**
+ * The identity of the TOOL VOCABULARY, as a hash — the primitive the panel
+ * handshake compares (#683 follow-up).
+ *
+ * ## Why this exists
+ *
+ * The panel calls these names as bare string literals from browser JS and vendors
+ * a generated copy of this vocabulary to validate them against. Nothing checks
+ * that its copy still matches the server it is talking to. `vocab:export --check`
+ * proves the artefact matches THIS repo's ledger; the panel's own gate verifies
+ * its vendored file against its own contents. Both are self-consistency checks,
+ * and neither can see across the repo boundary.
+ *
+ * That gap has now cost twice, in both directions. Panel #683: the panel sat at
+ * 145 tools while core had finished at 37, and the whole Training tab called
+ * names that no longer existed. The mirror case is just as real — a rig running
+ * an updated panel against a not-yet-updated server, where the panel calls the
+ * consolidated names and the server only answers the old ones. Either way the
+ * failure surfaces at CALL time as "unknown tool", which reads to a user as "the
+ * panel is broken" and gives an agent nothing to act on.
+ *
+ * A version string cannot close this: two builds of the same version can carry
+ * different vocabularies, and two different versions can carry identical ones.
+ * Hashing the vocabulary itself is stable across releases and changes exactly
+ * when the thing it identifies changes.
+ *
+ * ## What it deliberately does NOT cover
+ *
+ * Names only. Schemas, descriptions, annotations and handlers can all change
+ * while every name stays identical, and this will read as a match — the same
+ * scope `vocab:export` documents for the artefact. It answers "do we agree on
+ * what exists", not "do we agree on what it does".
+ *
+ * MUST stay byte-identical to the artefact's `vocabularyHash`, so
+ * scripts/export-vocabulary.mts calls THIS function rather than repeating the
+ * expression. Two copies of a hash rule drift, and a handshake that compares a
+ * drifted hash reports a mismatch that is not real — worse than no check.
+ */
+export function computeVocabularyHash(input: {
+  core: readonly string[];
+  panel: readonly string[];
+  dead: readonly string[];
+}): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        core: [...input.core],
+        panel: [...input.panel],
+        dead: [...input.dead],
+      }),
+    )
+    .digest("hex");
+}
+
+/** What a vocabulary comparison concluded. `unknown` is a first-class outcome. */
+export type VocabularySkew =
+  | { status: "match" }
+  /** The panel did not advertise a hash at all — an older build. NOT a mismatch. */
+  | { status: "unknown"; reason: string }
+  | { status: "mismatch"; message: string };
+
+/**
+ * Compare the server's vocabulary against the one the panel vendored.
+ *
+ * ## The one rule that matters here
+ *
+ * A panel that sends NO hash is `unknown`, never `mismatch`. Older panels do not
+ * advertise one, and "it did not tell us" is not "it disagrees" — folding those
+ * together would fire a scary, actionable-sounding warning at every user on an
+ * older panel whose vocabulary is very likely fine. That is the same
+ * could-not-determine-reported-as-determined defect this function exists to catch
+ * in the tool surface, and it would be embarrassing to commit it here.
+ *
+ * ## Why the message does not name which side is stale
+ *
+ * It cannot, and guessing would be worse than not saying. Both sides are opaque
+ * digests; there is no ordering between two hashes and no history to rank them
+ * against. The server knows only that they differ. So the message states exactly
+ * that, and gives the one remedy that is correct in both directions — bring both
+ * to the same release — rather than a 50/50 guess that sends half of users to
+ * update the component that was already current.
+ */
+export function describeVocabularySkew(
+  serverHash: string,
+  panelHash: string | undefined,
+  panelVersion?: string,
+): VocabularySkew {
+  if (!panelHash) {
+    return {
+      status: "unknown",
+      reason:
+        "the panel did not advertise a vocabulary hash (builds before this handshake do not) — " +
+        "its vocabulary is UNVERIFIED, which is not the same as wrong",
+    };
+  }
+  if (panelHash === serverHash) return { status: "match" };
+  const who = panelVersion ? `panel ${panelVersion}` : "the panel";
+  return {
+    status: "mismatch",
+    message:
+      `The tool vocabulary ${who} vendored does not match this server's ` +
+      `(panel ${panelHash.slice(0, 8)} vs server ${serverHash.slice(0, 8)}). One of the two is ` +
+      `behind the other — a hash cannot say which, so update BOTH to the same release rather ` +
+      `than guessing. Until then, tool calls can fail as "unknown tool" for names one side has ` +
+      `and the other does not: that is this skew surfacing at call time, not a broken panel.`,
+  };
+}
