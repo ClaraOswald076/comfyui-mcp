@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { DEAD_NAMES, MAX_TOOLS, TOOL_NAMES } from "../../tools/vocabulary.js";
 
@@ -26,12 +26,19 @@ const uploadImageAutoMock = vi.fn();
 const uploadVideoAutoMock = vi.fn();
 const uploadAudioAutoMock = vi.fn();
 const stageOutputAsInputMock = vi.fn();
+/** Where the listing came from. Mutable so a test can pick local vs remote. */
+let listSourceMock: { directory?: string; basis: "local-scan" | "server-history" } = {
+  directory: "C:\\Comfy\\output",
+  basis: "local-scan",
+};
 vi.mock("../../services/image-management.js", () => ({
   extractWorkflowFromImage: vi.fn(),
   listOutputImages: (...a: unknown[]) => listOutputImagesMock(...a),
   listOutputMedia: async (...a: unknown[]) => ({
     images: await listOutputImagesMock(...a),
-    source: { directory: "C:\Comfy\output", basis: "local-scan" },
+    // #953: the BASIS is per-test now — a remote target answers from /history,
+    // and that listing is incomplete in a way a local scan is not.
+    source: listSourceMock,
   }),
   getOutputImage: (...a: unknown[]) => getOutputImageMock(...a),
   uploadImageAuto: (...a: unknown[]) => uploadImageAutoMock(...a),
@@ -641,6 +648,64 @@ describe('action:"list_outputs" keeps the mobile dataset picker\'s contract', ()
     expect(t).toContain("**video/b.mp4** [video]");
   });
 
+  // #953 — the listing was already labelled with its source (#899), but the
+  // history wording described STALENESS ("what the server remembers this
+  // session"). The reporter's files were never in /history at all: VHS-style
+  // video nodes write the file without registering an output entry, so those
+  // videos are absent by construction. They saw a confident 12-file listing that
+  // omitted 30+ ProRes masters, concluded the directory was empty, and wrote
+  // that into a handover document. The files were fetchable by name throughout.
+  describe("#953: a history-derived listing says it is incomplete BY CONSTRUCTION", () => {
+    const remote = () => {
+      listSourceMock = { basis: "server-history" };
+    };
+    const local = () => {
+      listSourceMock = { directory: "C:\\Comfy\\output", basis: "local-scan" };
+    };
+    afterEach(local);
+
+    it("warns on a POPULATED remote listing — the shape that misled the reporter", async () => {
+      remote();
+      listOutputImagesMock.mockResolvedValue(sample);
+      const t = text(await getImage()({ action: "list_outputs", limit: 5 }));
+      // The results are still returned…
+      expect(t).toContain("Found 2 media file(s)");
+      // …and the caveat rides with them.
+      expect(t).toMatch(/INCOMPLETE BY CONSTRUCTION/);
+      expect(t).toMatch(/VHS_VideoCombine/);
+      expect(t).toMatch(/never appear here even though they are on disk/);
+    });
+
+    it("says absence is not evidence, and names a check that works remotely", async () => {
+      remote();
+      listOutputImagesMock.mockResolvedValue([]);
+      const t = text(await getImage()({ action: "list_outputs" }));
+      expect(t).toMatch(/NOT evidence the file is missing/);
+      // /view serves from the output dir, so a by-name fetch sees what /history cannot.
+      expect(t).toMatch(/action:"get"/);
+      expect(t).toMatch(/stage_output_as_input|upload_image/);
+      expect(t).toMatch(/\/view/);
+    });
+
+    // The local scan really does read the directory, so it must NOT inherit this
+    // hedge — that would make a trustworthy answer look doubtful.
+    it("says none of it on a local scan", async () => {
+      local();
+      listOutputImagesMock.mockResolvedValue(sample);
+      const t = text(await getImage()({ action: "list_outputs", limit: 5 }));
+      expect(t).toContain("scanned on disk");
+      expect(t).not.toMatch(/INCOMPLETE BY CONSTRUCTION/);
+      expect(t).not.toMatch(/NOT evidence/);
+    });
+
+    it("the json shape still reports the basis for app clients", async () => {
+      remote();
+      listOutputImagesMock.mockResolvedValue(sample);
+      const t = text(await getImage()({ action: "list_outputs", format: "json" }));
+      expect(JSON.parse(t).source).toBe("server-history");
+    });
+  });
+
   it("format:json returns a machine-readable array (no prose)", async () => {
     listOutputImagesMock.mockResolvedValue(sample);
     const t = text(await getImage()({ action: "list_outputs", limit: 5, format: "json" }));
@@ -659,7 +724,10 @@ describe('action:"list_outputs" keeps the mobile dataset picker\'s contract', ()
   it("format:json with no matches returns an empty array (not a prose message)", async () => {
     listOutputImagesMock.mockResolvedValue([]);
     const t = text(await getImage()({ action: "list_outputs", format: "json" }));
-    expect(JSON.parse(t)).toEqual({ images: [], source: "local-scan", directory: "C:\Comfy\output" });
+    // The fixture path is properly escaped now: "C:\Comfy\output" in a JS string
+    // is `C:Comfyoutput` (\C and \o are not escapes), so the old fixture asserted
+    // a Windows path that contained no separators at all.
+    expect(JSON.parse(t)).toEqual({ images: [], source: "local-scan", directory: "C:\\Comfy\\output" });
   });
 
   it("format:json omits size/modified when the scan can't provide them (remote/history path)", async () => {
@@ -680,7 +748,7 @@ describe('action:"list_outputs" keeps the mobile dataset picker\'s contract', ()
       { filename: "a.png", path: "", size: 1024, modified: "", subfolder: "", kind: "image" },
     ]);
     const t = text(await getImage()({ action: "list_outputs" }));
-    expect(t).toContain("C:\Comfy\output");
+    expect(t).toContain("C:\\Comfy\\output");
     expect(t).toContain("scanned on disk");
   });
 
