@@ -46,7 +46,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DEAD_NAMES, MAX_TOOLS, TOOL_NAMES } from "../src/tools/vocabulary.js";
+import { computeVocabularyHash, DEAD_NAMES, MAX_TOOLS, TOOL_NAMES } from "../src/tools/vocabulary.js";
 import { buildPanelToolDefs } from "../src/orchestrator/panel-tools.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -77,10 +77,17 @@ const core = [...TOOL_NAMES];
 const panelSorted = [...panel].sort();
 const dead = DEAD_NAMES.map((d) => ({ name: d.name, since: d.since, replacement: d.replacement }));
 
-/** Identifies the VOCABULARY, not the build that produced it. */
-const vocabularyHash = createHash("sha256")
-  .update(JSON.stringify({ core, panel: panelSorted, dead: dead.map((d) => d.name) }))
-  .digest("hex");
+/** Identifies the VOCABULARY, not the build that produced it.
+ *
+ *  Computed by computeVocabularyHash() in src/tools/vocabulary.ts rather than
+ *  inline here, because the RUNTIME handshake compares against this value. Two
+ *  copies of the rule would drift, and a drifted hash reports a mismatch that is
+ *  not real — which is worse than having no check at all. */
+const vocabularyHash = computeVocabularyHash({
+  core,
+  panel: panelSorted,
+  dead: dead.map((d) => d.name),
+});
 
 const artefact = {
   $comment:

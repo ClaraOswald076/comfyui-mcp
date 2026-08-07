@@ -136,6 +136,11 @@ interface Conn {
    *  (see makeUnknownCommandError) — the panel gained these bridge commands in
    *  0.11.4, so older builds reject graph_* / ui_* with a raw dispatch error. */
   panelVersion?: string;
+  /** The `vocabularyHash` of the tool vocabulary this panel build VENDORED, as sent
+   *  in its `hello`. Undefined when the panel did not advertise one — an older
+   *  build, which means UNVERIFIED, not disagreeing. Never inherited across a
+   *  hello: a reconnect may be a freshly updated build with a different copy. */
+  panelVocabularyHash?: string;
   /** True only when THIS hello actually CARRIED a `panel_version` (not inherited from
    *  a prior connection under the same tab id). `panelVersion` is deliberately
    *  inherited across a reconnect that omits the field (line ~849) so the reactive
@@ -1910,6 +1915,15 @@ export class UiBridge {
           panelVersionAdvertised:
             typeof (msg as { panel_version?: unknown }).panel_version === "string" &&
             !!(msg as { panel_version?: string }).panel_version,
+          // The vocabulary the panel VENDORED, so the skew that #683 exposed can be
+          // detected at the handshake instead of at call time as "unknown tool".
+          // Re-read from THIS hello and never inherited: a reconnect may be a freshly
+          // updated build carrying a different vendored copy, and inheriting would
+          // report the OLD build's agreement as if it were this one's.
+          panelVocabularyHash:
+            typeof (msg as { vocabulary_hash?: unknown }).vocabulary_hash === "string"
+              ? ((msg as { vocabulary_hash?: string }).vocabulary_hash || undefined)
+              : undefined,
           // #570 P0c — re-read from THIS hello, never inherited (a reconnect may be a newly
           // updated build). Strict === true so any non-true / absent value is non-enforcing.
           enforcesWorkflowStamp:
