@@ -58,6 +58,8 @@ async function hfRepoFiles(repoId: string): Promise<Array<{ filename: string; si
     // reading process.env.HF_TOKEN directly made a token saved after this
     // process started invisible here, while the save reported live pickup.
     headers: hfToken ? { authorization: `Bearer ${hfToken}` } : undefined,
+    // Third-party API: bound the wait (same class as #1026).
+    signal: AbortSignal.timeout(20_000),
   });
   if (!res.ok) return [];
   const body = (await res.json()) as Array<{ type?: string; path?: string; size?: number }>;
