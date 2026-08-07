@@ -3422,12 +3422,38 @@ export async function runPanelOrchestrator(): Promise<void> {
 
       // Record this tab's trusted per-workflow COMMAND STAMP (#570 P0c — a
       // ROUTING fence kept under #884: a late command issued for another
-      // workflow must not mutate this one). Absent/untrusted → cleared: the
-      // graph-mutation fence then fails closed for this tab.
+      // workflow must not mutate this one).
+      //
+      // #689/#688/#607/#702 — an untrusted identity RETAINS the previous stamp
+      // instead of deleting it. Deleting looks like the conservative choice and
+      // is in fact the strictly worse one, because the two outcomes are not
+      // symmetric:
+      //
+      //   • The panel authorizes a fenced command IFF stamp === the LIVE active
+      //     workflow uuid. So a RETAINED stamp can only ever authorize a command
+      //     that names the canvas actually mounted right now — if the workflow
+      //     changed, it mismatches and is refused exactly as before. Retaining
+      //     therefore permits no write that a correct stamp would not permit.
+      //   • A DELETED stamp makes UiBridge send frames with no `workflow_uuid`
+      //     at all (`else delete frame.workflow_uuid`), and the panel counts an
+      //     unstamped command as a mismatch too (#718, deliberately fail-closed).
+      //     So deleting does not relax the fence — it refuses HARDER, and it
+      //     refuses everything the fence covers, including `workflow_list`.
+      //
+      // The asymmetry is that a stale stamp is RECOVERABLE (the next hello that
+      // does resolve an identity replaces it) while an absent one is not: the
+      // panel's re-advertise repair is capped at MISMATCH_REHELLO_MAX_PER_IDENTITY
+      // (3) per identity, so once those attempts are spent against an orchestrator
+      // that still cannot derive an identity, nothing retries and every command is
+      // refused permanently. A reconnect hello that lands before the canvas
+      // identity is readable carries no uuid, which is enough to erase the stamp
+      // and wedge the tab for the rest of the session.
+      //
+      // Untrusted identity therefore means "no NEW evidence", not "the previous
+      // evidence is now false". Keep what we last proved and let the fence judge
+      // it on equality, which is the only test that decides authorization.
       if (newIdentity) {
         tabCommandWorkflowUuid.set(panelTab, newIdentity.uuid);
-      } else {
-        tabCommandWorkflowUuid.delete(panelTab);
       }
       // Blind content mode rides the hello (issue #90) so the FIRST agent spawn
       // already carries the right tool-server env. A CHANGE against a live
