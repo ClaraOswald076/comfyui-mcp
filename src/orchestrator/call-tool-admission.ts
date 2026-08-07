@@ -5,7 +5,7 @@
  * call site.
  */
 
-import { retiredToolMessage } from "../tools/vocabulary.js";
+import { retiredToolMessage, TOOL_NAMES } from "../tools/vocabulary.js";
 
 /** The direct tool channel: a mobile client can invoke these READ/DOWNLOAD backend
  *  tools without an agent turn (structured nav data + rig downloads). The
@@ -441,7 +441,23 @@ export function callToolAdmission(
   const retired = retiredToolMessage(tool);
   if (retired !== undefined) return retired;
 
-  if (!CALL_TOOL_WHITELIST.has(tool)) return `tool "${tool}" is not permitted`;
+  if (!CALL_TOOL_WHITELIST.has(tool)) {
+    // Distinguish "does not exist" from "exists, but not on THIS channel" (#908).
+    // The bare "is not permitted" was a dead end: the panel's RunPod Deploy/Start
+    // buttons returned it verbatim for ~2 weeks after #278 correctly removed those
+    // two tools from this whitelist (both start BILLING, and a confirmation-less
+    // mirrored tab must not spend money). The exclusion was right; the message
+    // told nobody what had happened or what to do instead, so it read as "the
+    // panel is broken" rather than "this channel deliberately does not carry it".
+    const exists = (TOOL_NAMES as readonly string[]).includes(tool);
+    return exists
+      ? `tool "${tool}" exists but is not available on the direct call_tool channel ` +
+        `(the canvas-less path used by mobile, mirrored tabs and panel buttons). This is a ` +
+        `deliberate exclusion, not a missing tool — some tools are withheld here because they ` +
+        `spend money or mutate state that this channel cannot confirm with the user. Ask the ` +
+        `agent to run it instead: the agent session carries the full tool surface and can confirm.`
+      : `tool "${tool}" is not permitted`;
+  }
   const actions = CALL_TOOL_ACTION_WHITELIST.get(tool);
   if (actions !== undefined) {
     const action = typeof args.action === "string" ? args.action : undefined;

@@ -940,5 +940,23 @@
       "since": "0.50.0",
       "replacement": "get_system_stats (action:\"health\")"
     }
+  ],
+  "directCallable": [
+    "apps",
+    "download_model",
+    "enqueue_workflow",
+    "get_history",
+    "get_image",
+    "get_workflow",
+    "install_custom_node",
+    "list_local_models",
+    "list_packs",
+    "queue",
+    "runpod",
+    "runpod_watch",
+    "save_workflow",
+    "train_doctor",
+    "train_prepare_dataset",
+    "train_start"
   ]
 }
