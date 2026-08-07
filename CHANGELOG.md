@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.11] - 2026-08-07
+
+### MCP
+
+#### Added
+- tool-reach corpus for the consolidated 37-tool surface (#1003)
+
+#### Fixed
+- a ComfyUI call with no budget of its own had no time limit (#1033)
+
+
 ## [0.50.10] - 2026-08-07
 
 ### MCP
