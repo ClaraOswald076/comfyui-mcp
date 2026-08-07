@@ -23,7 +23,14 @@ import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+// The repo this operates on. Derived from the script's own location so it works
+// from any cwd — with an explicit override so the generator can be exercised
+// against a scratch repo. Without one it can only be tested by running it on the
+// real CHANGELOG, which is how a range bug survived three releases: the only way
+// to check its output was to generate a release and read it.
+const ROOT = process.env.COMFYUI_MCP_CHANGELOG_ROOT
+  ? process.env.COMFYUI_MCP_CHANGELOG_ROOT
+  : join(dirname(fileURLToPath(import.meta.url)), "..");
 const CHANGELOG = join(ROOT, "CHANGELOG.md");
 
 // ── Repo config ─────────────────────────────────────────────────────────────
@@ -210,10 +217,48 @@ const rawMd = readFileSync(CHANGELOG, "utf-8");
 const EOL = rawMd.includes("\r\n") ? "\r\n" : "\n";
 const writeChangelog = (s) => writeFileSync(CHANGELOG, EOL === "\r\n" ? s.replace(/\n/g, "\r\n") : s);
 
+/**
+ * Every PR number the CHANGELOG already documents (#988).
+ *
+ * Read from the file rather than from git, because the file is the record of
+ * what has actually been ANNOUNCED — which is the question being asked. Tags
+ * cannot answer it here: the release flow leaves them off the branch entirely.
+ *
+ * Deliberately scans the WHOLE file, not just the newest section. An
+ * over-reaching range can reach back several releases (v0.50.5's reached to
+ * v0.50.1, four sections back), and each of those releases already said its
+ * piece.
+ */
+function alreadyDocumentedPRs() {
+  return [...rawMd.matchAll(/\(#(\d+)\)/g)].map((m) => m[1]);
+}
+
 /** Build a dated entry string for `ver` from commits in `range`, folding in any
  *  hand-written highlights (deduped by PR). */
 function buildEntry(ver, range, highlights = "") {
-  const covered = new Set([...highlights.matchAll(/\(#(\d+)\)/g)].map((m) => m[1]));
+  // #988 — dedupe against EVERY PR the changelog already documents, not just the
+  // hand-written highlights for this release.
+  //
+  // The range this is given routinely reaches too far back. `describe --tags`
+  // returns the newest tag REACHABLE from HEAD, and the release flow pushes the
+  // tag from a local commit and then squash-merges the version bump onto
+  // protected main — which writes a different sha, so a version tag is never an
+  // ancestor of main. `describe` walks straight past it to the release before.
+  // 0.50.3, 0.50.4 and 0.50.5 each generated a section listing every commit back
+  // to v0.50.1, and each had to be trimmed by hand before the tag was pushed.
+  //
+  // A narrower RANGE was tried and rejected: bounding by the newest release
+  // COMMIT on the branch under-includes instead, silently dropping anything
+  // merged between the tag being cut and the reconcile PR landing (#976 fell in
+  // exactly that window). Dropping an entry is worse than repeating one — a
+  // duplicate is visible, a gap is not.
+  //
+  // Filtering by what is already WRITTEN has neither failure mode: an entry the
+  // changelog already carries is a duplicate by definition, and one it does not
+  // carry survives however wide the range was. The mechanism already existed
+  // for the highlights; it was simply never pointed at the rest of the file.
+  const documented = [...alreadyDocumentedPRs(), ...[...highlights.matchAll(/\(#(\d+)\)/g)].map((m) => m[1])];
+  const covered = new Set(documented);
   const commits = parseCommits(range);
   const auto = autoBody(commits, covered);
   const parts = [`## [${ver}] - ${today()}`, ""];
