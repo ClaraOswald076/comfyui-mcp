@@ -184,11 +184,23 @@ describe("downloadModel cache", () => {
   it("#515: aborting mid-stream rejects and never finalizes the target (integrity preserved)", async () => {
     // A body that emits one chunk then STALLS forever, so we can abort it mid-transfer.
     let cancelled = false;
+    // #980 — the abort used to fire on a 25 ms timer, which is a BET that the
+    // pipeline has attached to the body and entered pull() first. On a loaded
+    // macOS runner that bet loses: the abort lands before anything reads the
+    // stream, the transfer rejects without ever cancelling the body, and
+    // `cancelled` stays false. The download behaviour was fine every time — only
+    // the corroborating observation raced — but it took main red intermittently,
+    // which costs more than the assertion is worth. Wait for the EVENT instead.
+    let sawFirstPull!: () => void;
+    const firstPull = new Promise<void>((resolve) => {
+      sawFirstPull = resolve;
+    });
     const body = new ReadableStream<Uint8Array>({
       start(c) {
         c.enqueue(new TextEncoder().encode("partial-bytes-on-disk"));
       },
       pull() {
+        sawFirstPull(); // the pipeline IS reading — safe to abort now
         return new Promise<void>(() => {}); // never resolves — the stream stalls
       },
       cancel() {
@@ -213,8 +225,9 @@ describe("downloadModel cache", () => {
       undefined,
       controller.signal,
     );
-    // Let the stream begin, then abort it.
-    await new Promise((r) => setTimeout(r, 25));
+    // Deterministic: block until the pipeline has actually pulled from the body,
+    // then abort. No wall-clock bet, so runner load cannot change the outcome.
+    await firstPull;
     controller.abort();
 
     // The transfer rejects (aborted) — it is NOT reported as a successful download.
