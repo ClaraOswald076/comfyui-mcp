@@ -19,6 +19,17 @@
 // live litegraph node objects — the frontend's own truth, with no order to
 // disagree about. So capture both and hand the converter the named map.
 //
+// Why the named map can't be LESS complete than the array (the load-bearing
+// point — if it could, this fix would trade a wrong value for a missing one):
+// both are derived from the SAME list, `node.widgets`. litegraph builds
+// `widgets_values` by walking that list and taking each `w.value`; the capture
+// walks the same list and takes each `w.name`/`w.value` pair. The array is that
+// list with the names thrown away, which is precisely why naming its positions
+// requires a guess. Anything absent from the capture was absent from
+// `node.widgets`, so it had no serialized value either. (The asymmetry runs the
+// other way in some frontend versions, which skip `serialize:false` widgets when
+// building the array — one more reason position is not a reliable key.)
+//
 // This module decides ONLY whether the two captures describe the same nodes. It
 // refuses rather than guesses, and every refusal is disclosed to the caller: a
 // positional mapping that could not be verified is reported as UNVERIFIED, never
