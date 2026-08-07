@@ -62,13 +62,66 @@ function githubHeaders(): Record<string, string> {
   return headers;
 }
 
+/**
+ * #1026 — an unbounded network wait can wedge a whole agent turn.
+ *
+ * `list_packs action:"generate_skill"` reaches GitHub and api.comfy.org, and
+ * every one of those calls was a bare `fetch` with no AbortSignal. A host that
+ * accepts the connection and then never answers — a captive portal, a stalled
+ * proxy, a black-holed route — leaves the request pending forever: no error, no
+ * result, nothing for the caller to act on. A reporter's `list_packs` call sat
+ * in flight past 180s and had to be killed client-side, which is exactly this
+ * shape: not a failure that was mis-described, but no answer at all.
+ *
+ * Every other network path on that tool is already bounded (the live-server
+ * template listing carries AbortSignal.timeout(8000); comfyuiFetch callers pass
+ * their own). These three were the gap.
+ *
+ * Generous by default — a cold GitHub API call over a slow link is legitimately
+ * slow, and a timeout that fires on a working connection would be its own bug.
+ * The point is a CEILING, not a tight bound.
+ */
+const DEFAULT_SKILL_FETCH_TIMEOUT_S = 30;
+
+function skillFetchTimeoutSeconds(): number {
+  const raw = Number(process.env.COMFYUI_MCP_SKILL_FETCH_TIMEOUT_S);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_SKILL_FETCH_TIMEOUT_S;
+}
+
+function skillFetchSignal(): AbortSignal {
+  return AbortSignal.timeout(Math.round(skillFetchTimeoutSeconds() * 1000));
+}
+
+/**
+ * Turn an abort into a statement of what we DID and did NOT learn. A timeout is
+ * not a 404 and not a refusal: the request may well have been received, so this
+ * says the wait ended, never that the resource is absent.
+ */
+function describeSkillFetchTimeout(err: unknown, what: string, url: string): Error {
+  const aborted =
+    err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+  if (!aborted) return err instanceof Error ? err : new Error(String(err));
+  return new ComfyUIError(
+    `Timed out after ${skillFetchTimeoutSeconds()}s ${what} (${url}). The host accepted the ` +
+      `request but did not answer in time, so whether it exists could NOT be determined — this ` +
+      `is not a "not found". Check network/proxy reachability to that host, or raise ` +
+      `COMFYUI_MCP_SKILL_FETCH_TIMEOUT_S if the link is simply slow.`,
+    "NETWORK_TIMEOUT",
+  );
+}
+
 export async function fetchGitHubFile(
   owner: string,
   repo: string,
   path: string,
 ): Promise<string> {
   const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
-  const res = await fetch(url, { headers: githubHeaders() });
+  const res = await fetch(url, {
+    headers: githubHeaders(),
+    signal: skillFetchSignal(),
+  }).catch((err) => {
+    throw describeSkillFetchTimeout(err, `fetching ${path} from GitHub`, url);
+  });
   if (!res.ok) {
     throw new ComfyUIError(
       `GitHub API error ${res.status} fetching ${path}`,
@@ -88,7 +141,12 @@ async function listGitHubDir(
   path = "",
 ): Promise<GitHubContentEntry[]> {
   const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
-  const res = await fetch(url, { headers: githubHeaders() });
+  const res = await fetch(url, {
+    headers: githubHeaders(),
+    signal: skillFetchSignal(),
+  }).catch((err) => {
+    throw describeSkillFetchTimeout(err, `listing ${path || "/"} on GitHub`, url);
+  });
   if (!res.ok) {
     throw new ComfyUIError(
       `GitHub API error ${res.status} listing ${path || "/"}`,
@@ -108,6 +166,9 @@ async function resolveRegistryRepo(registryId: string): Promise<string> {
   const url = `https://api.comfy.org/nodes/${encodeURIComponent(registryId)}`;
   const res = await fetch(url, {
     headers: { Accept: "application/json" },
+    signal: skillFetchSignal(),
+  }).catch((err) => {
+    throw describeSkillFetchTimeout(err, `resolving "${registryId}" on the ComfyUI Registry`, url);
   });
   if (!res.ok) {
     throw new ComfyUIError(
