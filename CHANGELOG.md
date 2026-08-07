@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.14] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- settle the linked-nested placeholder ambiguity by counting the row (#1040)
+
+
 ## [0.50.13] - 2026-08-07
 
 ### MCP
