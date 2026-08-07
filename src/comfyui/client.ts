@@ -8,11 +8,17 @@ import {
   isRemoteMode,
 } from "../config.js";
 import { logger } from "../utils/logger.js";
-import { ComfyUIError, ConnectionError, WorkflowExecutionError } from "../utils/errors.js";
+import {
+  ComfyUIError,
+  ConnectionError,
+  ValidationError,
+  WorkflowExecutionError,
+} from "../utils/errors.js";
 import { comfyuiFetch } from "./fetch.js";
 import {
   fetchComfyJson,
   looksLikeHtmlParsedAsJson,
+  readComfyJson,
   redactErrorMessage,
   rethrowWithJsonDiagnosis,
 } from "./json-guard.js";
@@ -794,11 +800,20 @@ export async function uploadImageHttp(
 ): Promise<{ name: string; subfolder: string; type: string }> {
   if (isCloudMode()) return cloudClient.uploadImageHttp(filename, data, mimeType);
   const client = getClient();
+  // #946 — a `filename` carrying a path ("assets/clip.mp4") is a SUBFOLDER
+  // request, and ComfyUI's /upload/image takes that as its own form field, not
+  // as a slash inside the multipart filename. Sending the whole path as the
+  // filename put it somewhere between the transport and ComfyUI's handler and
+  // came back as a bare `Unexpected non-whitespace character after JSON at
+  // position 4` — no upload, no usable error. Split it and use the field the
+  // API actually has, which is also what the caller was asking for.
+  const { subfolder, name } = splitUploadTarget(filename);
   const formData = new FormData();
   const blob = new Blob([data], { type: mimeType });
-  formData.append("image", blob, filename);
+  formData.append("image", blob, name);
   formData.append("type", "input");
   formData.append("overwrite", "true");
+  if (subfolder) formData.append("subfolder", subfolder);
   const res = await client.fetchApi("/upload/image", {
     method: "POST",
     body: formData,
@@ -807,5 +822,48 @@ export async function uploadImageHttp(
     const text = await res.text().catch(() => "");
     throw new Error(`ComfyUI /upload/image returned ${res.status}: ${text}`);
   }
-  return res.json() as Promise<{ name: string; subfolder: string; type: string }>;
+  // Never let a parser message stand in for a diagnosis: a proxy or a
+  // still-starting server answering 200 with HTML used to surface as a raw
+  // SyntaxError with no mention of what was requested (#946, and the same class
+  // as #918/#952).
+  return readComfyJson<{ name: string; subfolder: string; type: string }>(res, {
+    url: "/upload/image",
+    expectShape: (v: unknown) => !!v && typeof v === "object" && typeof (v as { name?: unknown }).name === "string",
+    shapeHint: 'the upload result ({ name, subfolder, type })',
+  });
+}
+
+/**
+ * Split an upload target into ComfyUI's two fields (#946).
+ *
+ * `filename` is the caller's whole intent — "clip.mp4" or "assets/clip.mp4" —
+ * while ComfyUI's /upload/image wants a bare filename plus a separate
+ * `subfolder`. Backslashes count as separators too: a caller on Windows
+ * naturally writes "assets\clip.mp4".
+ *
+ * Traversal is REFUSED rather than sanitised. Silently rewriting "../../x.png"
+ * into something safe would upload to a place the caller did not name and then
+ * report the name they asked for — a wrong answer dressed as a right one. The
+ * caller gets told instead.
+ */
+export function splitUploadTarget(filename: string): { subfolder: string; name: string } {
+  // A TRAILING separator has to be caught before the empty segments are filtered
+  // out: "assets/" would otherwise leave ["assets"], and the directory would be
+  // adopted as the filename — an upload to a name the caller never wrote.
+  const endsInSeparator = /[/\\]\s*$/.test(filename);
+  const parts = filename.split(/[/\\]+/).filter((p) => p !== "" && p !== ".");
+  const name = endsInSeparator ? "" : (parts.pop() ?? "");
+  if (name === "" || name === "..") {
+    throw new ValidationError(
+      `"${filename}" does not name a file to upload — it ends in a path separator or a "..". ` +
+        `Pass a filename, optionally prefixed with a subfolder (e.g. "assets/clip.mp4").`,
+    );
+  }
+  if (parts.some((p) => p === "..")) {
+    throw new ValidationError(
+      `"${filename}" walks outside ComfyUI's input directory with "..". ` +
+        `A subfolder prefix may only go downwards (e.g. "assets/clip.mp4").`,
+    );
+  }
+  return { subfolder: parts.join("/"), name };
 }
