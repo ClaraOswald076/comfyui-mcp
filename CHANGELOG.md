@@ -6,6 +6,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.5] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a render completion is a STEP when a plan is still running (#1002)
+- name our own User-Agent, and stop pushing Windows onto Python (#1000)
+- the Manager route is a routing fallback, not a remote server (#999)
+- say WHY the caller is holding a tool that does not exist (#998)
+
+#### Changed
+- reach the injection call sites three fixes could not (#1004)
+
+
 ## [0.50.4] - 2026-08-07
 
 ### MCP
