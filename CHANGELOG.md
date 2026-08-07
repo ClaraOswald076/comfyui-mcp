@@ -6,6 +6,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.3] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a path in `filename` is a subfolder request, not a broken upload (#985)
+- two different tabs must not render identically (#984)
+- a painted card is not a loaded image (#982)
+- an untrusted hello must not ERASE the tab's command stamp (#976)
+
+#### Changed
+- stop betting on 25ms to decide when the abort lands (#981)
+
+
 ## [0.50.2] - 2026-08-07
 
 ### MCP
