@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.9] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- retry a mid-workflow-switch refusal instead of surfacing it (#1029)
+- bound the skill-generator's network calls (#1028)
+
+
 ## [0.50.8] - 2026-08-07
 
 ### MCP
