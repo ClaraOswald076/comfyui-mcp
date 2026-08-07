@@ -1133,6 +1133,35 @@ export function isCapabilityRefusal(err: unknown): boolean {
   return (err as Record<symbol, unknown>)[CAPABILITY_REFUSAL] === true;
 }
 
+/** Marks an error as a ROUTING-AMBIGUITY refusal: every tab is healthy and reachable,
+ *  but the turn was issued from SEVERAL of them at once, so no single one is honestly
+ *  "the" target (#884). Like a capability refusal this is pre-dispatch and settled —
+ *  the pin is decided once per batch and does not heal on its own clock — but it is
+ *  the OPPOSITE of a connectivity problem, and callers had no way to tell the two
+ *  apart: the refusal opens with the literal phrase "no connected tab", which is also
+ *  the machine-readable marker of the genuine post-restart "Connected: none" window.
+ *  A substring classifier therefore read this as a transient reconnect, retried it
+ *  pointlessly, and then reported "the panel is still reconnecting after a
+ *  restart/reload" — a fabricated diagnosis of a panel that was never disconnected
+ *  (#1001). Key on THIS marker, never on the text. */
+const ROUTING_AMBIGUITY = Symbol.for("comfyui-mcp.bridge.routing-ambiguity");
+
+/** Tag an error as a routing-ambiguity refusal and return it (for throw/reject). */
+export function markRoutingAmbiguity<E extends Error>(err: E): E {
+  Object.defineProperty(err, ROUTING_AMBIGUITY, {
+    value: true,
+    enumerable: false,
+    configurable: true,
+  });
+  return err;
+}
+
+/** True when `err` carries the typed routing-ambiguity marker set by the bridge. */
+export function isRoutingAmbiguity(err: unknown): boolean {
+  if (err == null || (typeof err !== "object" && typeof err !== "function")) return false;
+  return (err as Record<symbol, unknown>)[ROUTING_AMBIGUITY] === true;
+}
+
 /** Tag an error as a reply-timeout and return it (for throw/reject). */
 /**
  * Key for a pending "is this tab gone?" clock (#486).
@@ -2920,11 +2949,16 @@ export class UiBridge {
     if (isScopeAddress(tabId)) {
       const pin = this.scopeTargetResolver?.(tabId);
       if (pin === null) {
-        throw new Error(
-          `no connected tab can be chosen for "${tabId}": the current turn was issued from ` +
-            `multiple workflows at once, so its target is ambiguous. Target a workflow ` +
-            `explicitly (panel_set_workflow_target / panel_open_workflow) or wait for the ` +
-            `next single-origin message.`,
+        // TYPED, not text-matched (#1001): this refusal's own opening words are
+        // "no connected tab", which is exactly what the transient-reconnect
+        // classifier keys on — yet the tabs here are all connected and fine.
+        throw markRoutingAmbiguity(
+          new Error(
+            `no connected tab can be chosen for "${tabId}": the current turn was issued from ` +
+              `multiple workflows at once, so its target is ambiguous. Target a workflow ` +
+              `explicitly (panel_set_workflow_target / panel_open_workflow) or wait for the ` +
+              `next single-origin message.`,
+          ),
         );
       }
       if (typeof pin === "string" && pin.length > 0) {

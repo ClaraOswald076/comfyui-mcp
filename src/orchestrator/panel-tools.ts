@@ -78,6 +78,7 @@ import {
   isCapabilityRefusal,
   isPanelCmdUnsupportedError,
   isReplyTimeoutTagged,
+  isRoutingAmbiguity,
   requiresWorkflowStampEnforcement,
 } from "../services/ui-bridge.js";
 import {
@@ -764,6 +765,15 @@ function isMutatingGraphCmd(cmd: Record<string, unknown>): boolean {
  *  frozen tab — retrying just double-waits, #334) and "OUTCOME UNKNOWN" (a
  *  mutating command that may already have applied). */
 function isTransientReconnectError(err: unknown): boolean {
+  // #1001 — the TYPED marker wins over the text. A routing-ambiguity refusal
+  // (the turn was issued from several workflows at once) opens with the literal
+  // words "no connected tab", so the regex below matched it and called a fully
+  // connected panel "transient". Nothing about it is: the pin is settled for the
+  // whole batch, so the retry is guaranteed to fail identically, and the caller
+  // then reported "still reconnecting after a restart/reload" about a panel that
+  // never disconnected. Waiting cannot clear this; only an explicit target or the
+  // next single-origin message can.
+  if (isRoutingAmbiguity(err)) return false;
   const msg = err instanceof Error ? err.message : String(err ?? "");
   return /no connected tab|genuinely gone|is not open|Failed to fetch|Panel not reachable|ECONNRESET|socket hang up|premature close|other side closed|ECONNABORTED|EPIPE/i.test(
     msg,
@@ -4673,6 +4683,22 @@ export function makePanelToolCtx(
       // already names the real recovery (update + restart + browser hard-refresh).
       if (isCapabilityRefusal(err)) {
         return fail(err instanceof Error ? err.message : String(err));
+      }
+      // #1001 — same shape, opposite cause: a ROUTING-AMBIGUITY refusal already
+      // knows exactly why it refused AND names both recoveries in its own text
+      // (target a workflow explicitly, or wait for the next single-origin
+      // message). The generic wrapper below would bury that under a differential
+      // — "disconnected, still reconnecting, or the binding is stale" — of which
+      // all three are FALSE here, plus a "retry in a moment" that can never
+      // work. That speculation reads as observation: the reporter of #1001 filed
+      // "reconnect readiness is reported before the route is usable" as a second
+      // root cause, citing this wrapper's guess as their evidence. Surface the
+      // cause verbatim; add only the fact the flag actually proves.
+      if (isRoutingAmbiguity(err)) {
+        return fail(
+          `${typeof cmd.cmd === "string" ? cmd.cmd : "panel command"} was not dispatched — ` +
+            `nothing was applied. ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
       if (dispatchOutcomeOf(err) === false) {
         const name = typeof cmd.cmd === "string" ? cmd.cmd : "panel command";
