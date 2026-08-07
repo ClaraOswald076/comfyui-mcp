@@ -293,6 +293,21 @@ const COMPACT_ROUTER_FALLBACK = (action: string): string =>
 export function describePanelUpdateRecovery(
   ctx: PanelRecoveryContext = panelRecoveryContext(),
   skew?: PanelBundleSkew,
+  /**
+   * #973 — set when the stale-bundle check could not read the pack's ON-DISK
+   * version at all, so it proved nothing either way.
+   *
+   * The skew check returns a skew only on positive proof, and an unreadable disk
+   * version resolves to "no skew" — which then falls through to "Run
+   * install_comfyui(action:'panel', panel_action:'update')". That fall-through is right when the install is
+   * genuinely behind and WRONG when it is already current, and this branch
+   * cannot tell which. A reporter followed it, found their pack was already at
+   * origin/main HEAD, and had spent a round trip on an update that could not
+   * have helped. Leading with an unproven remedy is the thing to fix; the check
+   * itself already re-reads the base in the background, so the cheap move is to
+   * say so and let one retry answer properly.
+   */
+  diskVersionUnconfirmed = false,
 ): string {
   // STALE BUNDLE FIRST. When the caller has PROVEN the pack on disk already
   // satisfies the requirement, no update of any kind is the answer — not
@@ -355,9 +370,24 @@ export function describePanelUpdateRecovery(
     );
   }
 
+  // #973 — the on-disk version could not be read, so "your install is behind" is
+  // NOT established and must not lead. Two remedies are live and one of them is
+  // free, so name the free one first and keep the update as the fallback it is.
+  // (The check re-primes the panel base in the background precisely so a retry
+  // can answer this properly, which is why retrying is the first suggestion.)
+  const unconfirmedPrefix = diskVersionUnconfirmed
+    ? `NOTE: the panel version ON DISK could not be read just now, so whether the install is ` +
+      `actually behind is UNCONFIRMED — an already-current pack behind a stale cached browser ` +
+      `tab looks identical from here. Two cheap checks before updating anything: (1) RETRY this ` +
+      `command once — the disk version is being re-read in the background and a retry usually ` +
+      `answers definitively; (2) HARD-REFRESH the ComfyUI tab (Ctrl+Shift+R, Cmd+Shift+R on ` +
+      `macOS), which costs nothing and fixes it outright if the tab is the stale part. ` +
+      `If it is genuinely behind: `
+    : "";
+
   if (ctx.installPanelUsable) {
     return (
-      `Run install_comfyui(action:'panel', panel_action:'update'). ${COMPACT_ROUTER_FALLBACK("update")} ` +
+      `${unconfirmedPrefix}Run install_comfyui(action:'panel', panel_action:'update'). ${COMPACT_ROUTER_FALLBACK("update")} ` +
       `If neither route exists on this surface, update the pack on the ComfyUI host: ` +
       // No trailing period: every caller of this function appends its own
       // sentence break, and adding one here rendered ".." to the user.
@@ -365,7 +395,7 @@ export function describePanelUpdateRecovery(
     );
   }
   return (
-    `Update the panel ON THE COMFYUI HOST — ${blockerPhrase(ctx.blocker)}. On the host ` +
+    `${unconfirmedPrefix}Update the panel ON THE COMFYUI HOST — ${blockerPhrase(ctx.blocker)}. On the host ` +
     `run: ${manualPanelUpdateCommands(ctx.comfyuiPath)}. Then ${RESTART_AND_REFRESH}`
   );
 }

@@ -2482,6 +2482,49 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     }
   });
 
+  // #973 — the third state, and the one the reporter landed in. The skew check
+  // proves a stale bundle only when it can READ the pack's on-disk version; when
+  // it cannot, it proved nothing — and the fall-through led with
+  // "Run install_comfyui(action:'panel', panel_action:'update')" anyway. The reporter followed that, found their
+  // pack was already at origin/main HEAD running 0.11.41, and had spent a round
+  // trip on an update that could not have helped.
+  it("an UNREADABLE disk version leads with the two free checks, not with an update", async () => {
+    // No pack on disk at all → verifiedPanelDiskVersion() answers nothing, which
+    // is exactly the state that used to be indistinguishable from "behind".
+    clearPanelDiskObservation();
+    const unknown = new WebSocket(`ws://127.0.0.1:${port}`);
+    await new Promise<void>((res, rej) => {
+      unknown.on("open", () => {
+        unknown.send(JSON.stringify({ type: "hello", tab_id: "disk-unknown", title: "wf" }));
+        res();
+      });
+      unknown.on("error", rej);
+    });
+    await vi.waitFor(() =>
+      expect(bridge.tabs().some((t) => t.tab_id === "disk-unknown")).toBe(true),
+    );
+    const err = await bridge
+      .send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "disk-unknown" })
+      .catch((e: Error) => e);
+    const msg = (err as Error).message;
+
+    // It must SAY it could not check, rather than implying an answer.
+    expect(msg).toMatch(/UNCONFIRMED/);
+    expect(msg).toMatch(/could not be read just now/);
+    // …and the two costless checks must come before the remedy that has a cost.
+    expect(msg.search(/RETRY this command/)).toBeLessThan(
+      msg.search(/panel_action:'update'/),
+    );
+    expect(msg.search(/HARD-REFRESH/)).toBeLessThan(msg.search(/panel_action:'update'/));
+    // The update is DEMOTED, not deleted — it is still right when the install
+    // really is behind, and this branch cannot rule that out either.
+    expect(msg).toMatch(/If it is genuinely behind/);
+    expect(msg).toMatch(/panel_action:'update'/);
+    // The gate itself is unchanged: the write is still refused.
+    expect(isCapabilityRefusal(err as Error)).toBe(true);
+    unknown.close();
+  });
+
   it("an install that is genuinely BEHIND still gets the update remedy, never a refresh", async () => {
     // The guard on the branch above: a stale-install user must not be told their
     // install is fine. Only a disk version at or above the floor earns the

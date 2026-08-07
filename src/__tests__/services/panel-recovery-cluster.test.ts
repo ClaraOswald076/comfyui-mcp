@@ -2920,3 +2920,74 @@ describe("the panel's ComfyUI root is the RUNNING server's (#766, #769)", () => 
     expect(defaultDeps.comfyuiPath()).toBe(liveRoot);
   });
 });
+
+// #973 — the remedy that leads must be one the message can justify.
+//
+// The stale-bundle check returns a skew only on POSITIVE proof, and an
+// unreadable on-disk version resolves to "no skew". That then fell through to
+// "Run install_comfyui(action:'panel', panel_action:'update')" — correct when the install really is behind, wrong
+// when it is already current, and this branch cannot tell which. A reporter
+// followed it, found their pack was already at origin/main HEAD running 0.11.41,
+// and had spent a round trip on an update that could not have helped (#950/#973).
+//
+// The check already re-primes the panel base in the background so a retry can
+// answer definitively — so the fix is to SAY the disk version is unconfirmed and
+// put the two free checks first, not to guess a cause.
+describe("#973: an unconfirmed disk version does not get an update-first remedy", () => {
+  const ctx = {
+    installPanelUsable: true,
+    comfyuiPath: "/comfy",
+    blocker: undefined,
+  } as unknown as Parameters<typeof describePanelUpdateRecovery>[0];
+
+  it("discloses that the on-disk version was not read", () => {
+    const text = describePanelUpdateRecovery(ctx, undefined, true);
+    expect(text).toMatch(/could not be read just now/);
+    expect(text).toMatch(/UNCONFIRMED/);
+  });
+
+  it("puts the two free checks BEFORE the update", () => {
+    const text = describePanelUpdateRecovery(ctx, undefined, true);
+    const retryAt = text.search(/RETRY this command/);
+    const refreshAt = text.search(/HARD-REFRESH/);
+    const updateAt = text.search(/panel_action:'update'/);
+    expect(retryAt).toBeGreaterThan(-1);
+    expect(refreshAt).toBeGreaterThan(-1);
+    expect(updateAt).toBeGreaterThan(-1);
+    expect(retryAt).toBeLessThan(updateAt);
+    expect(refreshAt).toBeLessThan(updateAt);
+  });
+
+  // The update is still the right answer when the install genuinely IS behind,
+  // so it must remain present — demoted, not deleted.
+  it("still names the update as the remedy when the install really is behind", () => {
+    const text = describePanelUpdateRecovery(ctx, undefined, true);
+    expect(text).toMatch(/If it is genuinely behind/);
+    expect(text).toMatch(/panel_action:'update'/);
+  });
+
+  // The default path is untouched: a CONFIRMED-behind install still leads with
+  // the update, with no hedging that would make a real problem look optional.
+  it("says none of this when the disk version WAS read", () => {
+    const text = describePanelUpdateRecovery(ctx, undefined, false);
+    expect(text).not.toMatch(/UNCONFIRMED/);
+    expect(text).not.toMatch(/RETRY this command/);
+    expect(text.trimStart().startsWith("Run install_comfyui")).toBe(true);
+  });
+
+  // A PROVEN skew still outranks everything — that branch already leads with
+  // "do not update" and must not be diluted by the unconfirmed wording.
+  it("a proven skew still wins over the unconfirmed prefix", () => {
+    const text = describePanelUpdateRecovery(
+      ctx,
+      {
+        diskVersion: "0.11.41",
+        requiredVersion: "0.11.35",
+        handshakeVersion: "0.11.20",
+      } as never,
+      true,
+    );
+    expect(text).toMatch(/Do NOT update the panel/);
+    expect(text).not.toMatch(/UNCONFIRMED/);
+  });
+});

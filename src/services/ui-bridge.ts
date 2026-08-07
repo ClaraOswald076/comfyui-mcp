@@ -491,7 +491,9 @@ export function requiredPanelVersionForWorkflowFence(): string | undefined {
  *  never `conn.panelVersion` raw, which is inherited across an omitted-version
  *  reconnect. Reasoning about an inherited value here would let a previous
  *  connection's reading decide whether the CURRENT tab is the stale part. */
-function resolveStaleBundleSkew(panelVersion?: string): PanelBundleSkew | undefined {
+function resolveStaleBundleSkew(
+  panelVersion?: string,
+): PanelBundleSkew | { diskVersionUnconfirmed: true } | undefined {
   const disk = verifiedPanelDiskVersion()?.trim();
   if (!disk) {
     // Could not confirm — most often because the live-base resolution has gone
@@ -499,7 +501,11 @@ function resolveStaleBundleSkew(panelVersion?: string): PanelBundleSkew | undefi
     // the background (never awaited; building an error message must not block on
     // I/O) so a retry, which agents reliably make, can answer properly.
     void primePanelBase().catch(() => {});
-    return undefined;
+    // #973 — but say so. Returning a bare `undefined` here is indistinguishable
+    // from "checked, and the install really is behind", and the recovery text
+    // then leads with an update this branch never established was needed. The
+    // reporter followed exactly that and found their pack already current.
+    return { diskVersionUnconfirmed: true };
   }
   // THE FENCE's floor, not the aggregate requiredPanelVersion() (codex gate).
   // This function answers one question — "is the install sufficient for the
@@ -3302,9 +3308,13 @@ export class UiBridge {
         const reading = connPanelVersionReading(conn);
         const rawAdvertised = reading.raw;
         const advertised = reading.version;
+        const skewReading = resolveStaleBundleSkew(advertised);
+        const unconfirmed =
+          skewReading != null && "diskVersionUnconfirmed" in skewReading;
         const recovery = describePanelUpdateRecovery(
           undefined,
-          resolveStaleBundleSkew(advertised),
+          unconfirmed ? undefined : (skewReading as PanelBundleSkew | undefined),
+          unconfirmed,
         );
         // #819/#823 — do not fold an ABSENT reading into a definite verdict.
         // "detected panel version unknown; this MCP requires panel 0.11.35+"
