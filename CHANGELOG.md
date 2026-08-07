@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.12] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- talk to the SAME ComfyUI as every other tool (#1035)
+
+
 ## [0.50.11] - 2026-08-07
 
 ### MCP
