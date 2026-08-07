@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.10] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- close the swap window — and fix the reproduction that hid it (#1031)
+
+
 ## [0.50.9] - 2026-08-07
 
 ### MCP
