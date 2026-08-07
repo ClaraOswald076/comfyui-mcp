@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.18] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- I/O dirs follow the CONNECTED ComfyUI, not a second install (#1053)
+
+#### Changed
+- pin that nested "<node>.<combo>.<leaf>" override keys work (#1051)
+
+
 ## [0.50.17] - 2026-08-07
 
 ### MCP
