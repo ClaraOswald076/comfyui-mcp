@@ -234,6 +234,28 @@ describe("sessions are orchestrator-scoped, never workflow-scoped (#884)", () =>
     expect(tools).toContain("const tabId = journalTabFor(ctx);");
   });
 
+  it("SOURCE: a run ticket also records the CONVERSATION that queued it (#704)", () => {
+    // The routed tab is the run's ADDRESS and it churns — a reconnecting panel
+    // re-registers under a new id, and only a same-socket re-hello leaves a
+    // migration alias to follow — so a by-tab-only ticket made the agent's own
+    // render come back "does NOT match any run you queued … its origin is
+    // UNDETERMINED". The conversation is orchestrator-scoped and does not churn,
+    // so both ends of the journal must speak it: the queue side stamps it, the
+    // arrival side asks with it, and the conversation boundary closes by it.
+    const tools = readFileSync(
+      new URL("../../orchestrator/panel-tools.ts", import.meta.url),
+      "utf8",
+    );
+    expect(tools).toContain("const runTicketConversation = journalConversationFor(ctx);");
+    expect(tools).toContain("conversation: runTicketConversation");
+    const src = indexSrc();
+    expect(src).toContain("conversation: agentKeyFor(event.tab_id),");
+    // Both conversation boundaries (New chat, resume switch) close by conversation
+    // as well as by member tab — a ticket whose tab id churned is in no tab sweep.
+    expect([...src.matchAll(/RunCompletions\.closeRuns\(t, key\)/g)]).toHaveLength(2);
+    expect(src).not.toMatch(/RunCompletions\.closeRuns\(t\)/);
+  });
+
   it("SOURCE: hello.resume is a last-resort hint — the orchestrator's disk store wins", () => {
     const src = indexSrc();
     const at = src.indexOf("manager.setResume(key, resumeHint)");

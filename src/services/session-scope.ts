@@ -53,6 +53,24 @@ export function isScopeAddress(id: string | undefined | null): id is string {
 }
 
 /**
+ * The CONVERSATION a scope address names: the backend-qualified agent key
+ * (`orchestrator::<backend>`), or undefined for the bare scope and for a real
+ * panel tab id.
+ *
+ * This is the identity a journal ticket is OWNED by (#704). A panel tab id is a
+ * routing address and it churns — a reconnecting panel re-registers under a new
+ * id, and only a same-socket re-hello leaves a migration trail to follow — so a
+ * run ticketed by tab alone stopped being recognizable as the agent's own after
+ * a reconnect. The conversation spans every tab and workflow (#884) and outlives
+ * the address. Deliberately NOT the bare scope: the conversation is per BACKEND
+ * (two providers are two conversations), so an unqualified address names no one
+ * and yields undefined rather than a value that could match the wrong one.
+ */
+export function conversationOfScopeAddress(id: string | undefined | null): string | undefined {
+  return typeof id === "string" && id.startsWith(SHARED_SESSION_SCOPE + "::") ? id : undefined;
+}
+
+/**
  * The connected panel tabs participating in a backend's shared conversation —
  * every tab whose selected backend matches. Agent output (say/stream/turn/…)
  * fans out to ALL of them: the same conversation is visible from every tab.

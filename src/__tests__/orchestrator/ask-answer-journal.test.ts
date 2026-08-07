@@ -1054,7 +1054,11 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     // being added to one and forgotten in the other — which is exactly how a late
     // answer reached a conversation that never asked the question, twice.
     const pairs: Array<[RegExp, string, boolean]> = [
-      [/RunCompletions\.closeRuns\((\w+)\)/g, "AskAnswers.closeAsks($1)", true],
+      // The run journal also closes by CONVERSATION (#704 — a ticket whose tab id
+      // churned on a reconnect is in no member-tab sweep), so the site carries an
+      // optional second argument. The PAIRING is still on the tab: that is the
+      // argument both journals share.
+      [/RunCompletions\.closeRuns\((\w+)(?:, \w+)?\)/g, "AskAnswers.closeAsks($1)", true],
       // #884 removed every forget() site: an unproven workflow transition no
       // longer purges the journals, because the conversation is orchestrator-
       // scoped and deliberately CONTINUES across a workflow switch (pending

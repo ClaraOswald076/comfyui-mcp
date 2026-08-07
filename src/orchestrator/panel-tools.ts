@@ -43,7 +43,7 @@ import { parse as parseYaml } from "yaml";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { UiBridge } from "../services/ui-bridge.js";
-import { isScopeAddress } from "../services/session-scope.js";
+import { conversationOfScopeAddress, isScopeAddress } from "../services/session-scope.js";
 
 /** #884 — journal TICKETS (run completions #468, ask answers #486) must be
  *  keyed by the REAL tab a run/card was routed to: the panel reports back under
@@ -58,6 +58,17 @@ function journalTabFor(ctx: PanelToolCtx): string {
   // conversation's in-flight-turn pin is consulted (#884 P0).
   const b = ctx.bridge as { resolveSharedTabId?: (scopeId?: string) => string | undefined };
   return b.resolveSharedTabId?.(ctx.tabId) ?? ctx.tabId;
+}
+
+/** #704 — the CONVERSATION a ticket belongs to: the backend-qualified agent key
+ *  (`orchestrator::<backend>`) this tool session is bound to. The tab a run was
+ *  routed to is only its address and it churns across a panel reconnect (a new
+ *  `tmp:` id, no same-socket migration to follow), which is what made an agent's
+ *  own render come back as "origin UNDETERMINED"; the conversation does not.
+ *  Undefined for the bare scope / a real-tab binding, which leaves the journal on
+ *  its by-tab ownership rule. */
+function journalConversationFor(ctx: PanelToolCtx): string | undefined {
+  return conversationOfScopeAddress(ctx.tabId);
 }
 import {
   dispatchOutcomeOf,
@@ -6647,6 +6658,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // the completion. Resolving AFTER the (seconds-long) queue round-trip
         // could key a tab the user has since moved to (codex r3/r4 timing).
         const runTicketTab = journalTabFor(ctx);
+        // #704 — the OWNER of the run. Unlike the tab, this cannot drift between
+        // the queue and the completion: it is this tool session's own binding.
+        const runTicketConversation = journalConversationFor(ctx);
         let res = await ctx.call(runCmd, 20000);
         // Derive the verdict from the AUTHORITATIVE reply, not a bare `queued`
         // flag. A rejection — a no-connected-tab / thrown-queuePrompt error
@@ -6720,6 +6734,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // #884 — the REAL routed tab, captured at dispatch (see runTicketTab):
           // the panel's `executed` event arrives under that id.
           tabId: runTicketTab,
+          // #704 — …and WHOSE run it is. The tab is where the completion is
+          // expected FROM; this is the conversation that gets to call it its own,
+          // which is what still holds after the panel reconnects under a new id.
+          ...(runTicketConversation !== undefined ? { conversation: runTicketConversation } : {}),
           ...(typeof args.to_node_id === "number" ? { toNodeId: args.to_node_id } : {}),
         });
         // Append anti-poll guidance: the agent should go idle after queuing so the

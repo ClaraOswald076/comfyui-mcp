@@ -30,6 +30,17 @@
 // self-restart loop — each of which tears the listener down (windows 2 and 3)
 // underneath the very render whose completion is in flight.
 //
+// WHOSE RUN IS IT (#704). A ticket is owned by the CONVERSATION that queued it
+// (the orchestrator-scoped agent key, #884), not by the panel tab it was queued
+// from. The tab is an ADDRESS and it churns: a panel that reconnects re-registers
+// under a new id (an unsaved workflow mints a fresh `tmp:<uuid>` every page load)
+// and only a SAME-SOCKET re-hello carries the `migrated_from` that moveKey
+// follows — so a reconnect used to strand the ticket under a dead id and the
+// agent's OWN render came back "does NOT match any run you queued with panel_run
+// — its origin is UNDETERMINED", which does not merely mislabel it: it TELLS THE
+// AGENT TO DISBELIEVE A CORRECT RESULT. The conversation spans every tab and
+// workflow and outlives the address, so it is the fact worth keying on.
+//
 // THE CONTRACT HERE.
 //  • Runs are ticketed by ComfyUI's `prompt_id`, opened by `panel_run`.
 //  • Every completion is CORRELATED ONCE, AT ARRIVAL, by EXACT prompt-id
@@ -75,12 +86,29 @@ export interface CompletionPayload {
 /** A run `panel_run` queued and is waiting on. */
 export interface RunTicket {
   promptId: string;
-  /** Panel tab the run was queued from. Part of the MATCH: a completion is only
-   *  "the run YOU queued" for the tab that queued it, so a workflow switch or a
-   *  cross-tab completion reads as foreign instead of being misattributed. A
-   *  proven tab-id migration moves it (moveKey) so the tab's own runs still
-   *  match. */
+  /** Panel tab the run was queued from — the run's ORIGIN ADDRESS: where its
+   *  completion is expected from, which tab the injected turn pins to, and (for
+   *  a caller that names no conversation) the ownership test. A proven tab-id
+   *  migration moves it (moveKey) so the tab's own runs still line up. */
   tabId: string;
+  /**
+   * The CONVERSATION that queued this run — the agent key `orchestrator::<backend>`
+   * (#884). THE ownership fact, and the one that survives (#704).
+   *
+   * The tab id is an ADDRESS, not an identity: a panel that reconnects re-registers
+   * under a new id (an unsaved workflow mints a fresh `tmp:<uuid>` on every page
+   * load), and only a SAME-SOCKET re-hello carries `migrated_from` for moveKey to
+   * follow. So a reconnect stranded the ticket under a dead id and the agent's OWN
+   * render came back "does NOT match any run you queued — its origin is
+   * UNDETERMINED", telling it to distrust a correct result. The conversation does
+   * not churn: it is the orchestrator-scoped session (one agent across every tab
+   * and workflow), so "did I queue this?" is answerable across the whole gap.
+   *
+   * Optional only for callers that have no conversation to name (tests, a legacy
+   * binding); ownership then falls back to the tab, i.e. exactly the pre-#704
+   * rule. See ownsRun().
+   */
+  conversation?: string;
   queuedAt: number;
   toNodeId?: number;
   /**
@@ -110,6 +138,31 @@ export interface RunTicket {
   reused?: boolean;
 }
 
+/**
+ * Does `ticket` belong to the party a completion is being reported to — the
+ * conversation `conversation`, receiving it on panel tab `key`?
+ *
+ * ONE rule, in priority order:
+ *  • BOTH sides name a conversation → the CONVERSATION decides, and the tab is
+ *    irrelevant. That is what makes a run survive its tab being re-registered
+ *    under a new id (#704), and it is strictly narrower than the tab rule where
+ *    the two disagree: a completion landing on a tab whose backend has since
+ *    changed reaches a DIFFERENT conversation, which never queued the run and is
+ *    now told so instead of being handed "the run YOU queued".
+ *  • EITHER side names none (tests, a legacy binding) → the pre-#704 tab rule,
+ *    unchanged.
+ *
+ * It is never "the newest run" and never a cross-conversation match: ownership
+ * still requires a ticket THIS party opened, so a render the panel queued on its
+ * own (the user pressing Queue Prompt) has no ticket and stays unattributable.
+ */
+function ownsRun(ticket: RunTicket, key: string, conversation?: string): boolean {
+  if (ticket.conversation !== undefined && conversation !== undefined) {
+    return ticket.conversation === conversation;
+  }
+  return ticket.tabId === key;
+}
+
 export type EntryState =
   /** Waiting for a delivery attempt. */
   | "pending"
@@ -124,6 +177,11 @@ export interface JournalEntry {
   key: string;
   payload: CompletionPayload;
   correlation: RunCorrelation;
+  /** The conversation this completion was correlated FOR, frozen at arrival with
+   *  the verdict. `ack()` re-checks ownership long after the fact and must use the
+   *  same party the correlation was computed against, not whatever the tab means
+   *  by then. Undefined when the caller named none (see ownsRun). */
+  conversation?: string;
   arrivedAt: number;
   attempts: number;
   state: EntryState;
@@ -246,13 +304,15 @@ export class RunCompletionJournalImpl {
   /** Monotonic ticket-generation counter — see RunTicket.seq. */
   private ticketSeq = 0;
 
-  /** The generation this tab's ticket for `promptId` is currently on, or 0 when
+  /** The generation this party's ticket for `promptId` is currently on, or 0 when
    *  it has none. THE run identity: every proof and every merge is keyed on it,
    *  so an id reused (or a ticket evicted and recreated) can never let one run's
-   *  bookkeeping answer for another's. */
-  private generationOf(key: string, promptId: string): number {
+   *  bookkeeping answer for another's. Ownership is judged exactly as `correlate`
+   *  judges it (ownsRun), or a run that correlates as ours would still be given
+   *  generation 0 — "no identity" — and lose its dedupe and its ack memo. */
+  private generationOf(key: string, promptId: string, conversation?: string): number {
     const ticket = this.tickets.get(promptId);
-    return ticket && ticket.tabId === key ? ticket.seq : 0;
+    return ticket && ownsRun(ticket, key, conversation) ? ticket.seq : 0;
   }
   /** Pull a still-queued completion back off its agent (see setRevoker). */
   private revoke: ((key: string, token: string) => boolean) | null = null;
@@ -321,18 +381,24 @@ export class RunCompletionJournalImpl {
     }
   }
 
-  /** Has this tab ALREADY seen a completion for this prompt id — delivered (a
+  /** Has this party ALREADY seen a completion for this prompt id — delivered (a
    *  memo from any generation) or still journaled? If so the id is not a fresh
    *  identity, however long ago that was and whether or not its ticket survives.
-   *  Both stores are bounded, so this is a small scan. */
-  private hasHistoryFor(key: string, promptId: string): boolean {
+   *  Both stores are bounded, so this is a small scan.
+   *
+   *  Scanned by tab AND by conversation: a journaled entry whose tab id has since
+   *  been re-registered (the #704 gap) is still this conversation's own history,
+   *  and missing it would let the re-queued id be treated as a clean identity —
+   *  the exact misattribution-plus-loss the `reused` flag exists to prevent. */
+  private hasHistoryFor(key: string, promptId: string, conversation?: string): boolean {
     const prefix = `${key}|${promptId}|`;
     for (const memo of this.delivered) {
       if (memo.startsWith(prefix)) return true;
     }
     for (const entry of this.entries.values()) {
       if (
-        entry.key === key &&
+        (entry.key === key ||
+          (conversation !== undefined && entry.conversation === conversation)) &&
         entry.correlation.status !== "unidentified" &&
         entry.correlation.promptId === promptId
       ) {
@@ -346,7 +412,10 @@ export class RunCompletionJournalImpl {
    *  no prompt id — the caller MUST then tell the agent its completion cannot be
    *  correlated rather than promising a notification it may not be able to
    *  attribute. */
-  openRun(promptId: string | null | undefined, meta: { tabId: string; toNodeId?: number }): boolean {
+  openRun(
+    promptId: string | null | undefined,
+    meta: { tabId: string; conversation?: string; toNodeId?: number },
+  ): boolean {
     if (typeof promptId !== "string" || !promptId) return false;
     // NOTE: no memo clearing is needed here. The delivered memo is keyed by
     // ticket GENERATION, and every path below either bumps the generation (a
@@ -360,6 +429,12 @@ export class RunCompletionJournalImpl {
       // prompt id always means one run.
       existing.settled = false;
       existing.tabId = meta.tabId;
+      // The REOPENING caller owns this generation of the id — including when a
+      // different conversation re-queued it. (It is `reused` from here on, so
+      // every completion for it reads UNDETERMINED for everyone regardless; this
+      // just keeps the record honest about who queued it last.)
+      if (meta.conversation !== undefined) existing.conversation = meta.conversation;
+      else delete existing.conversation;
       existing.queuedAt = Date.now();
       existing.seq = ++this.ticketSeq; // a NEW generation of this id
       // The id no longer identifies ONE run. Every completion for it from here
@@ -377,10 +452,11 @@ export class RunCompletionJournalImpl {
     // ambiguous: had it been treated as a clean identity, A's resend would
     // correlate as B, its ack would settle B, and B's real completion would then
     // be suppressed by B's own settled flag — misattribution AND loss.
-    const hasHistory = this.hasHistoryFor(meta.tabId, promptId);
+    const hasHistory = this.hasHistoryFor(meta.tabId, promptId, meta.conversation);
     this.tickets.set(promptId, {
       promptId,
       tabId: meta.tabId,
+      ...(meta.conversation !== undefined ? { conversation: meta.conversation } : {}),
       seq: ++this.ticketSeq,
       queuedAt: Date.now(),
       ...(typeof meta.toNodeId === "number" ? { toNodeId: meta.toNodeId } : {}),
@@ -402,23 +478,25 @@ export class RunCompletionJournalImpl {
   }
 
   /**
-   * Classify a completion that arrived for panel tab `key` against the open runs.
+   * Classify a completion that arrived on panel tab `key`, for conversation
+   * `conversation`, against the open runs.
    *
    * TWO conditions, both required: EXACT prompt-id equality AND the ticket must
-   * belong to THIS panel tab. There is deliberately no "the newest outstanding
-   * run" fallback and no cross-tab match, because attributing a completion to
-   * the wrong run — or to a different workflow's agent — is worse than not
-   * attributing it at all. A run whose ticket belongs to another tab reads as
-   * `foreign`, i.e. UNDETERMINED, which is the honest answer.
+   * be OWNED by the party being reported to (ownsRun — the conversation that
+   * queued it, else the tab). There is deliberately no "the newest outstanding
+   * run" fallback and no cross-CONVERSATION match, because attributing a
+   * completion to the wrong run — or to a conversation that never queued it — is
+   * worse than not attributing it at all. Anything unowned reads as `foreign`,
+   * i.e. UNDETERMINED, which is the honest answer.
    */
-  correlate(key: string, payload: CompletionPayload): RunCorrelation {
+  correlate(key: string, payload: CompletionPayload, conversation?: string): RunCorrelation {
     const pid = typeof payload.prompt_id === "string" ? payload.prompt_id.trim() : "";
     if (!pid) return { status: "unidentified" };
     const ticket = this.tickets.get(pid);
     // A REUSED id proves nothing: the panel sends only the id, so a completion
     // for it could belong to either generation. Report it as foreign — real, but
     // UNDETERMINED — rather than claiming it is the run now outstanding.
-    return ticket && ticket.tabId === key && !ticket.reused
+    return ticket && ownsRun(ticket, key, conversation) && !ticket.reused
       ? { status: "matched", promptId: pid }
       : { status: "foreign", promptId: pid };
   }
@@ -442,8 +520,13 @@ export class RunCompletionJournalImpl {
    * kept re-growing, because each proof it rested on is bounded and any expiry at
    * the wrong moment turned a new run's result into a discarded "duplicate".
    */
-  record(key: string, payload: CompletionPayload): JournalEntry {
-    const correlation = this.correlate(key, payload);
+  record(
+    key: string,
+    payload: CompletionPayload,
+    opts: { conversation?: string } = {},
+  ): JournalEntry {
+    const conversation = opts.conversation;
+    const correlation = this.correlate(key, payload, conversation);
     let idlessRepeat = false;
     /** This id already stands for more than one run (see RunTicket.reused). */
     let idReused = false;
@@ -468,12 +551,12 @@ export class RunCompletionJournalImpl {
       // generation a completion belongs to, so suppressing on them could swallow
       // the newer run's real result. A duplicate delivery (labelled UNDETERMINED)
       // is the correct trade here.
-      idReused = settledTicket?.reused === true && settledTicket.tabId === key;
+      idReused = settledTicket?.reused === true && ownsRun(settledTicket, key, conversation);
       // The memo is keyed by GENERATION, so an older run's delivery can never
       // suppress a newer one that merely reuses the id (or that got a fresh
       // ticket after the old one was evicted): different generation, different
       // key, no match.
-      gen = this.generationOf(key, correlation.promptId);
+      gen = this.generationOf(key, correlation.promptId, conversation);
       // UNPROVABLE identity — no dedupe of any kind is safe:
       //  • `reused`: the id stands for more than one run (see RunTicket.reused).
       //  • gen 0: this tab never ticketed the id, so there is NO generation to
@@ -503,7 +586,7 @@ export class RunCompletionJournalImpl {
       if (
         !idUnprovable &&
         (this.delivered.has(deliveredKey(key, correlation.promptId, gen)) ||
-          (settledTicket?.settled === true && settledTicket.tabId === key))
+          (settledTicket?.settled === true && ownsRun(settledTicket, key, conversation)))
       ) {
         logger.info(
           `[run-completions] a completion for ${describe(correlation)} was already delivered to tab ${key.slice(0, 8)} — forwarding this one FLAGGED as a possible repeat (never suppressed)`,
@@ -588,6 +671,9 @@ export class RunCompletionJournalImpl {
       key,
       payload,
       correlation,
+      // Frozen WITH the verdict: ack() re-checks ownership later and must ask
+      // about the same party this was correlated for.
+      ...(conversation !== undefined ? { conversation } : {}),
       arrivedAt: Date.now(),
       attempts: 0,
       state: "pending",
@@ -772,7 +858,7 @@ export class RunCompletionJournalImpl {
       // completion for it — memoizing there would let one external render's
       // delivery suppress a different one that happens to reuse the id.
       const provable = (entry.ticketSeq ?? 0) > 0;
-      if (provable && !(ticket?.reused === true && ticket.tabId === entry.key)) {
+      if (provable && !(ticket?.reused === true && ownsRun(ticket, entry.key, entry.conversation))) {
         // Memoize against THIS entry's own generation, never the id's current
         // meaning: an older run's ack must not write a proof that then suppresses
         // the newer run which reused the id (or got a fresh ticket after the old
@@ -925,10 +1011,21 @@ export class RunCompletionJournalImpl {
    * arrived keep the verdict frozen at THEIR arrival, so a completion the old
    * conversation was owed is still reported to it correctly if it is still
    * deliverable.
+   *
+   * `conversation` is the boundary that matters once tickets are owned by a
+   * conversation rather than a tab (#704), and it is what makes this closure
+   * COMPLETE: a ticket whose tab has since been re-registered under a new id is
+   * no longer reachable by ANY member tab, and left open it would go on matching
+   * — the replacement conversation reuses the same key string
+   * (`orchestrator::<backend>`), so only DELETING the ticket ends the old
+   * conversation's ownership. Closing by tab as well is kept: closing too much
+   * only ever weakens a verdict (matched → foreign), which is the safe direction.
    */
-  closeRuns(key: string): void {
+  closeRuns(key: string, conversation?: string): void {
+    const closed = (t: RunTicket): boolean =>
+      t.tabId === key || (conversation !== undefined && t.conversation === conversation);
     for (const [pid, ticket] of [...this.tickets]) {
-      if (ticket.tabId === key) this.tickets.delete(pid);
+      if (closed(ticket)) this.tickets.delete(pid);
     }
     // Entries still undelivered were addressed to the conversation that just
     // went away, so their `matched` verdict no longer holds for whoever receives
@@ -938,7 +1035,10 @@ export class RunCompletionJournalImpl {
     // gone" event. Without it a completion journaled before New chat would be
     // replayed to the replacement agent as "the run YOU queued".
     for (const entry of this.entries.values()) {
-      if (entry.key === key && entry.correlation.status === "matched") {
+      const mine =
+        entry.key === key ||
+        (conversation !== undefined && entry.conversation === conversation);
+      if (mine && entry.correlation.status === "matched") {
         entry.correlation = { status: "foreign", promptId: entry.correlation.promptId };
         // Same as the reused-id downgrade: the queued copy still claims to be the
         // run this (now-replaced) conversation queued. Recall it if we still can.
