@@ -4653,3 +4653,64 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     expect(bridge.takeLateAskReply("tab-plain")).toBeUndefined();
   });
 });
+
+// #952 — the headless tools failed with `fetch failed` while every panel tool
+// worked, and nothing in the error connected the two. They are separate targets
+// by design (the panel talks to whichever ComfyUI its browser tab is on; the
+// headless calls go to COMFYUI_URL), so the failure has to be able to say
+// whether the two actually differ. comfyui/fetch.ts asks the bridge, via a
+// callback the orchestrator installs, and this is what it asks for.
+describe("UiBridge.connectedServerOrigins (#952)", () => {
+  /** A panel socket carrying a SERVER-OBSERVED handshake Origin, like a browser. */
+  function connectWithOrigin(tabId: string, origin?: string): Promise<WebSocket> {
+    return new Promise((resolve, reject) => {
+      const sock = new WebSocket(`ws://127.0.0.1:${port}`, origin ? { origin } : {});
+      sock.on("open", () => {
+        sock.send(JSON.stringify({ type: "hello", tab_id: tabId, title: tabId }));
+        resolve(sock);
+      });
+      sock.on("error", reject);
+    });
+  }
+
+  it("reports the origins connected tabs actually front", async () => {
+    const a = await connectWithOrigin("o-1", "http://192.168.1.50:8188");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "o-1")).toBe(true));
+    expect(bridge.connectedServerOrigins()).toEqual(["http://192.168.1.50:8188"]);
+    a.close();
+  });
+
+  it("de-duplicates two tabs on the SAME ComfyUI", async () => {
+    const a = await connectWithOrigin("o-1", "http://192.168.1.50:8188");
+    const b = await connectWithOrigin("o-2", "http://192.168.1.50:8188");
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+    expect(bridge.connectedServerOrigins()).toEqual(["http://192.168.1.50:8188"]);
+    a.close();
+    b.close();
+  });
+
+  it("reports BOTH when tabs front different ComfyUIs", async () => {
+    const a = await connectWithOrigin("o-1", "http://192.168.1.50:8188");
+    const b = await connectWithOrigin("o-2", "http://10.0.0.9:8188");
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+    expect(bridge.connectedServerOrigins().sort()).toEqual(
+      ["http://10.0.0.9:8188", "http://192.168.1.50:8188"].sort(),
+    );
+    a.close();
+    b.close();
+  });
+
+  // A relay/non-browser client sends no Origin. Omitting it is required: an
+  // invented origin would be compared against COMFYUI_URL and could report drift
+  // that does not exist, or rule out drift that does.
+  it("omits a tab that supplied no handshake Origin rather than guessing", async () => {
+    const a = await connectWithOrigin("o-1"); // no Origin header
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "o-1")).toBe(true));
+    expect(bridge.connectedServerOrigins()).toEqual([]);
+    a.close();
+  });
+
+  it("is empty with nothing connected, and never throws", () => {
+    expect(bridge.connectedServerOrigins()).toEqual([]);
+  });
+});

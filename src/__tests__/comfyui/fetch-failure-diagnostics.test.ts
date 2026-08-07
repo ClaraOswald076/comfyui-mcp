@@ -24,7 +24,7 @@ vi.mock("../../config.js", () => ({
   getComfyUIAuthHeaders: () => ({}),
 }));
 
-const { comfyuiFetch } = await import("../../comfyui/fetch.js");
+const { comfyuiFetch, setConnectedPanelOrigins } = await import("../../comfyui/fetch.js");
 const { describeFetchFailure, isBareFetchFailure, errorToToolResult, ComfyUIError } =
   await import("../../utils/errors.js");
 
@@ -146,5 +146,97 @@ describe("comfyuiFetch names the target it could not reach", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("<html>", { status: 502 })));
     const res = await comfyuiFetch("http://127.0.0.1:8188/x");
     expect(res.status).toBe(502);
+  });
+});
+
+// #952 follow-on — naming the drift instead of asking the reader to check for it.
+//
+// The shipped message said a connected panel "does not imply this address is
+// reachable" and pointed at install_comfyui(action:"environment") to compare the
+// two by hand. The bridge already knows what each connected tab fronts, so the
+// comparison can just be done — and which of the three cases holds is worth much
+// more than the instruction to go and find out.
+describe("#952: a headless failure names the connected panel's origin", () => {
+  afterEach(() => setConnectedPanelOrigins(null));
+
+  /** Drive a real comfyuiFetch failure and return the wrapped message. */
+  async function failureText(target: string): Promise<string> {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(
+      undiciFailure("ECONNREFUSED", "connect ECONNREFUSED 127.0.0.1:8188"),
+    );
+    try {
+      await comfyuiFetch(target);
+      throw new Error("expected comfyuiFetch to throw");
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  it("says DIFFERENT when the panel is on another origin — the likely answer", async () => {
+    setConnectedPanelOrigins(() => ["http://192.168.1.50:8188"]);
+    const text = await failureText("http://127.0.0.1:8188/object_info");
+    expect(text).toContain("http://192.168.1.50:8188");
+    expect(text).toContain("a DIFFERENT address");
+    expect(text).toContain("COMFYUI_URL");
+  });
+
+  // The valuable inverse: stating that drift is RULED OUT stops the reader
+  // chasing the explanation the surrounding text volunteers.
+  it("RULES OUT drift when the panel is on the same origin", async () => {
+    setConnectedPanelOrigins(() => ["http://127.0.0.1:8188"]);
+    const text = await failureText("http://127.0.0.1:8188/object_info");
+    expect(text).toContain("NOT a wrong-address problem");
+    expect(text).toContain("firewall");
+    expect(text).not.toContain("a DIFFERENT address");
+  });
+
+  it("ignores the path and compares ORIGINS only", async () => {
+    setConnectedPanelOrigins(() => ["http://127.0.0.1:8188"]);
+    expect(await failureText("http://127.0.0.1:8188/api/v2/deep/path?x=1")).toContain(
+      "NOT a wrong-address problem",
+    );
+  });
+
+  it("says nothing about drift when no panel is connected", async () => {
+    setConnectedPanelOrigins(() => []);
+    const text = await failureText("http://127.0.0.1:8188/object_info");
+    expect(text).not.toContain("a DIFFERENT address");
+    expect(text).not.toContain("NOT a wrong-address problem");
+  });
+
+  // An absent comparison is not a negative result. With no source installed at
+  // all (the plain MCP server), the message must read exactly as it did before.
+  it("says nothing about drift when no origin source is installed", async () => {
+    const text = await failureText("http://127.0.0.1:8188/object_info");
+    expect(text).not.toContain("a DIFFERENT address");
+    expect(text).not.toContain("NOT a wrong-address problem");
+    expect(text).toContain("does not imply this address is reachable");
+  });
+
+  it("lists every distinct origin, without repeating one", async () => {
+    setConnectedPanelOrigins(() => [
+      "http://192.168.1.50:8188",
+      "http://192.168.1.50:8188",
+      "http://10.0.0.9:8188",
+    ]);
+    const text = await failureText("http://127.0.0.1:8188/object_info");
+    expect(text).toContain("http://192.168.1.50:8188, http://10.0.0.9:8188");
+    expect(text.match(/192\.168\.1\.50/g)).toHaveLength(1);
+  });
+
+  // The comparison is a nicety; the network error is the point. A throwing
+  // source must never cost the caller the real diagnosis.
+  it("still reports the real failure when the origin source throws", async () => {
+    setConnectedPanelOrigins(() => {
+      throw new Error("bridge exploded");
+    });
+    const text = await failureText("http://127.0.0.1:8188/object_info");
+    expect(text).toContain("ECONNREFUSED");
+    expect(text).not.toContain("bridge exploded");
+  });
+
+  it("does not crash on an unparsable target", async () => {
+    setConnectedPanelOrigins(() => ["http://192.168.1.50:8188"]);
+    expect(await failureText("not-a-url")).toContain("ECONNREFUSED");
   });
 });

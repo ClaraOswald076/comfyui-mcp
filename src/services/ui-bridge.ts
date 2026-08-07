@@ -2565,6 +2565,20 @@ export class UiBridge {
     }
   }
 
+  /** #952 — the DISTINCT ComfyUI origins the connected tabs actually front, for
+   *  the headless-fetch drift comparison (see comfyui/fetch.ts). Trusted
+   *  handshake Origins only, so a tab that supplied none is simply absent rather
+   *  than guessed at: an incomplete list must never be read as "no drift". Order
+   *  follows connection order; never throws. */
+  connectedServerOrigins(): string[] {
+    const out: string[] = [];
+    for (const conn of this.conns.values()) {
+      const origin = conn.serverOrigin;
+      if (typeof origin === "string" && origin !== "" && !out.includes(origin)) out.push(origin);
+    }
+    return out;
+  }
+
   /** Fence a same-socket migration alias (#570 P0a): drop the `fromId → to` route and
    *  every other entry that points at the SAME target (fromId's path-compressed chain),
    *  so a RETIRED workflow's stale / in-flight panel_* calls addressed to fromId can no

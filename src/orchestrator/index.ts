@@ -58,6 +58,7 @@ import {
 } from "./turn-origins.js";
 import { listSessions, loadTranscript } from "./history.js";
 import { uploadImageHttp, resetClient } from "../comfyui/client.js";
+import { setConnectedPanelOrigins } from "../comfyui/fetch.js";
 import { logger } from "../utils/logger.js";
 import {
   PanelAgentManager,
@@ -2695,6 +2696,12 @@ export async function runPanelOrchestrator(): Promise<void> {
   // `null` (ambiguous origin) makes the bridge refuse loudly; no entry lets
   // the bridge fall back to active-tab resolution (idle-time probes).
   bridge.setScopeTargetResolver(makeScopeTargetResolver({ tracker: turnOrigins, scopeAgentKeyOf }));
+  // #952 — let a headless `fetch failed` say whether the connected panel is on a
+  // DIFFERENT ComfyUI than COMFYUI_URL. The reporter's readonly tools failed
+  // while every panel tool worked, and nothing in the error connected the two.
+  // SERVER-OBSERVED origins only (tabServerOrigin): the browser sets the
+  // handshake Origin and page JS cannot forge it, unlike hello.comfyui_url.
+  setConnectedPanelOrigins(() => bridge.connectedServerOrigins());
   // #884 P1 (confirming gate 2) — EXPLICIT recovery from a DEAD or AMBIGUOUS
   // pin, and from those only. The bridge's refusal names
   // panel_set_workflow_target as the way out; this is the ONLY path that
