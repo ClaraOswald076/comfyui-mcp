@@ -6,6 +6,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.7] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- say at pair time whether the phone URL survives a restart (#1020)
+- name the panel's ComfyUI origin instead of asking the reader to check (#1019)
+- describe an unparsable category body from what was observed (#1017)
+- an ambiguous routing pin is not a reconnecting panel (#1016)
+- an explicit retry is not a blind re-issue (#1014)
+
+
 ## [0.50.6] - 2026-08-07
 
 ### MCP
