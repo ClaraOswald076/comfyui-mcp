@@ -6,6 +6,44 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.1] - 2026-08-06
+
+Ten fixes on top of the 0.50.0 consolidation, and most of them are one defect class:
+a tool reporting something it had not actually established.
+
+A restart fenced the endpoint rather than the instance, so a same-URL reaffirmation
+bumped a generation without moving anything. A backend stall reached the agent as a
+USER rejection. `panel_run` could stack a duplicate after a reconnect, because the
+self-queue ledger is prompt-id based and in-memory — so the agent's OWN earlier render
+read as unattributed; the fence now demands PROVEN self-attribution and refuses with the
+override named rather than silently duplicating. A "panel install did NOT land" warning
+fired against a tree the retarget had already corrected. And `self_update` on Windows
+could never succeed at all: the running orchestrator holds its own sharp DLL open, the
+in-place npm replace failed EBUSY, and the error was swallowed.
+
+Also here: the test suite could rewrite the developer's real `~/.comfyui-mcp` state. That
+had been fixed four separate times per-test and kept coming back, so the whole run is now
+redirected before workers fork. And the vocabulary gate was counting mentions by raw
+substring while every other check is token-bounded — where a live name contains a dead one
+(`self_update_action` vs `self_update`) it overcounted and silently denied valid exemptions.
+
+### MCP
+
+#### Fixed
+- a failed clone must not leave something ComfyUI will try to load (#917)
+- redirect every persistent store for the whole run (#930)
+- say where the listing came from, instead of making callers guess (#915)
+- count mentions the way the gate detects them; stop welding doc lines together (#951)
+
+#### Changed
+- warn that Manager's "Nightly" is not nightly, and is routinely older than Latest (#931)
+- self_update on Windows: EBUSY on own sharp dll, npm error swallowed; updater failure + cancelled restart disconnects bridge (#924)
+- VRAM handoff during renders skips the llama.cpp backend (#927)
+- panel run/sync truthfulness: duplicate run after reconnect + false 'panel install did NOT land' warning (#926)
+- turn lifecycle: Claude backend stall still reported as user rejection + turn registry does not survive reconnect (#923)
+- restart fences the endpoint, not the instance + cannot identify local process without start times (#925)
+
+
 ## [0.50.0] - 2026-08-06
 
 The tool surface consolidates. Roughly 143 individually-registered tools fold into
