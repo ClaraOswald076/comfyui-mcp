@@ -105,9 +105,52 @@ export class NodeBisectError extends ComfyUIError {
   }
 }
 
+/**
+ * Unwrap the `cause` chain of an error thrown by `fetch()` itself — a
+ * network-layer failure, not an HTTP status.
+ *
+ * undici surfaces every one of these as `TypeError: fetch failed`, a message
+ * that says nothing: not the host, not the port, not whether it was DNS, a
+ * refused connection, a timeout, or a bad certificate. The actionable detail is
+ * one level down on `.cause`, as an Error carrying a `code` (ENOTFOUND,
+ * ECONNREFUSED, ECONNRESET, UND_ERR_CONNECT_TIMEOUT, ERR_TLS_CERT_ALTNAME_INVALID…).
+ *
+ * The returned message always BEGINS with the original text, so existing
+ * transient-error matchers that look for /fetch failed/ keep matching.
+ */
+export function describeFetchFailure(err: unknown): { message: string; code?: string } {
+  const parts: string[] = [];
+  let code: string | undefined;
+  let cur: unknown = err;
+  const seen = new Set<unknown>();
+  while (cur instanceof Error && !seen.has(cur)) {
+    seen.add(cur);
+    const c = (cur as { code?: unknown }).code;
+    if (typeof c === "string" && !code) code = c;
+    const label = typeof c === "string" ? `${cur.message} (${c})` : cur.message;
+    if (label && !parts.includes(label)) parts.push(label);
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  if (parts.length === 0) parts.push(String(err));
+  return { message: parts.join(": "), code };
+}
+
+/** True for the opaque undici network failure whose detail lives on `.cause`. */
+export function isBareFetchFailure(err: unknown): boolean {
+  return err instanceof Error && /^fetch failed$/i.test(err.message.trim());
+}
+
 export function errorToToolResult(err: unknown): CallToolResult {
   if (err instanceof ComfyUIError) return err.toToolResult();
-  const message = err instanceof Error ? err.message : String(err);
+  // A bare "fetch failed" reaching a tool result tells the reader nothing and
+  // has repeatedly been read as "ComfyUI is broken" when it was a wrong port or
+  // a stale target (#952, #954, #411). Expand the cause chain; the original
+  // message stays at the front so nothing matching on it changes.
+  const message = isBareFetchFailure(err)
+    ? describeFetchFailure(err).message
+    : err instanceof Error
+      ? err.message
+      : String(err);
   return {
     isError: true,
     content: [{ type: "text", text: message }],

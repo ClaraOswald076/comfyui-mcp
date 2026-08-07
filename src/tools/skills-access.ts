@@ -6,7 +6,8 @@ import { fileURLToPath } from "node:url";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { parse as parseYaml } from "yaml";
 import { errorToToolResult, ValidationError } from "../utils/errors.js";
-import { getComfyUIBaseUrl, getComfyUIAuthHeaders } from "../config.js";
+import { getComfyUIBaseUrl } from "../config.js";
+import { comfyuiFetch } from "../comfyui/fetch.js";
 import { checkWorkflowRuntime, extractWorkflowClassTypes } from "../services/api-nodes.js";
 import {
   extractWorkflowDependencies,
@@ -527,8 +528,12 @@ async function listWorkflowTemplatesAction(): Promise<ToolText> {
   // consistently between listing and schema lookup.
   const base = getComfyUIBaseUrl();
   const url = `${base}/api/workflow_templates`;
-  const res = await fetch(url, {
-    headers: getComfyUIAuthHeaders(),
+  // #954: a bare `fetch` here rejected with the opaque `TypeError: fetch failed`
+  // and the reader had no way to see WHICH target was tried — the reported
+  // symptom, from a session where the panel bridge was connected and this
+  // headless address was not. comfyuiFetch names the target on a network throw,
+  // and it is the same auth path every other ComfyUI call uses.
+  const res = await comfyuiFetch(url, {
     signal: AbortSignal.timeout(8000),
   });
   if (!res.ok) {
