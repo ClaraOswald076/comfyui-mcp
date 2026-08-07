@@ -6247,10 +6247,44 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_view_nodes_in_viewport",
-      "ONLY the nodes inside the current VIEWPORT (pan+zoom) — a screen-region subset, NOT the whole open graph (that is panel_graph_outline, which is what 'show me what's on the canvas' means). Use this to SCOPE your work to what's on their screen: when they say \"these nodes\", \"the ones here\", \"what am I looking at right now\", or when a graph is large and you only need the region in front of them. Returns the viewport rect in graph coordinates (x, y, width, height, zoom), `node_count` (whole graph) vs `in_view_count`, and the detail summary of each visible node. A node counts as visible if any part of it overlaps the viewport. On a big canvas this is dramatically cheaper than reading everything. Read-only.",
-      {},
-      async (_args, ctx) =>
-        withTruncationHints(await ctx.call({ cmd: "graph_view_nodes_in_viewport" }), [
+      "ONLY the nodes inside the current VIEWPORT (pan+zoom) — a screen-region subset, NOT the whole open graph (that is panel_graph_outline, which is what 'show me what's on the canvas' means). Use this to SCOPE your work to what's on their screen: when they say \"these nodes\", \"the ones here\", \"what am I looking at right now\", or when a graph is large and you only need the region in front of them. Returns the viewport rect in graph coordinates (x, y, width, height, zoom), `node_count` (whole graph) vs `in_view_count`, and the detail summary of each visible node. A node counts as visible if any part of it overlaps the viewport. On a big canvas this is dramatically cheaper than reading everything. This tool does NOT filter to specific nodes — to read one node's exact slot/widget detail use panel_query_graph {ids:[…], fields:'detail'}. Read-only.",
+      {
+        // #845/#754 — the panel has enforced a CHARACTER budget here since the
+        // 135k-character reply that motivated it, but the budget was unreachable:
+        // this schema was `{}` and the call below passed no arguments, so the
+        // default applied and no caller could raise or lower it. Its sibling
+        // panel_query_graph has always exposed the lever. An enforced-but-hidden
+        // knob is the worst of both — callers hit a cap they cannot see or move.
+        //
+        // The range described here is the PANEL's own clamp (viewport-char-bound.js),
+        // not panel_graph_outline's 500–60000. Two different clamps already exist;
+        // describing the one that is not enforced would make this text false, and a
+        // schema that lies about its bounds is worse than one that omits them.
+        max_chars: z
+          .number()
+          .int()
+          .positive()
+          // Declared so the #809 gate can check the ceiling this tool STATES
+          // against the one it enforces. Only the ceiling: the floor stays
+          // undeclared so a small value clamps up panel-side rather than being
+          // refused — a caller asking for 1000 wants less, not an error.
+          .max(200000)
+          .optional()
+          .describe(
+            "Character budget for the whole reply (default 24000, clamped 2000–200000). Nodes are taken in view order until it is spent, never partially serialized. `in_view_count` keeps describing the SCREEN, so compare it to nodes.length to see what was withheld.",
+          ),
+      },
+      async (args: A, ctx) =>
+        withTruncationHints(
+          await ctx.call({
+            cmd: "graph_view_nodes_in_viewport",
+            // Forwarded only when supplied: an explicit `undefined` on the wire
+            // would reach the panel's normalizer as a nonsense value, and it
+            // deliberately falls back to the default rather than to zero — but
+            // sending it at all would misreport this caller as having asked.
+            ...(args.max_chars === undefined ? {} : { max_chars: args.max_chars }),
+          }),
+          [
           {
             flag: "truncated",
             key: "truncation_hint",
@@ -6259,7 +6293,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 "visible node(s)",
                 replyCount(p, "nodes"),
                 p.in_view_count,
-                "Ask the user to zoom in so fewer nodes are on screen, or read the region with panel_query_graph (which DOES take limit and max_chars) / panel_graph_outline for the whole graph.",
+                // #754 — this remedy used to send the caller to panel_query_graph
+                // "which DOES take limit and max_chars", because this tool did not.
+                // It does now, so the first move is the lever in your own hand.
+                "Raise `max_chars` up to 200000 to see more of the same screen, or ask the user to zoom in so fewer nodes are on it. To read SPECIFIC nodes instead, panel_query_graph {ids:[…], fields:'detail'}; for the whole graph, panel_graph_outline.",
               ),
           },
         ]),

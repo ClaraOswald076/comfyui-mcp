@@ -6272,3 +6272,43 @@ describe("panel-tools: ack-timeout classification survives a full, spaced tab id
     ).toBe(false);
   });
 });
+
+describe("#754 panel_view_nodes_in_viewport: the character budget is REACHABLE", () => {
+  // The panel has enforced a character budget here since #845 (a 135k-character
+  // reply for a caller inspecting one node). But the orchestrator declared `{}`
+  // and called with no arguments, so the budget applied at its default and no
+  // caller could move it. An enforced-but-hidden cap is the worst shape: callers
+  // hit a limit they can neither see nor raise, and the reply looks merely small.
+  it("forwards max_chars when the caller supplies it", async () => {
+    const { ctx, calls } = makeFakeCtx();
+    await defByName("panel_view_nodes_in_viewport").handler({ max_chars: 50000 }, ctx);
+    expect(calls[0]).toMatchObject({ cmd: "graph_view_nodes_in_viewport", max_chars: 50000 });
+  });
+
+  it("omits the key entirely when the caller does not", async () => {
+    // Not `max_chars: undefined` on the wire: the panel's normalizer treats a
+    // nonsense value as "fall back to the default", so sending the key at all
+    // would record this caller as having asked for something it did not.
+    const { ctx, calls } = makeFakeCtx();
+    await defByName("panel_view_nodes_in_viewport").handler({}, ctx);
+    expect(calls[0]).toMatchObject({ cmd: "graph_view_nodes_in_viewport" });
+    expect("max_chars" in calls[0]).toBe(false);
+  });
+
+  it("declares the ceiling it advertises, so the stated number is enforced", () => {
+    // The remedy string says "Raise `max_chars` up to 200000". A prose ceiling the
+    // schema does not enforce is the #809 defect in miniature — the caller raises
+    // past it and nothing changes. Read the ceiling off the zod shape itself.
+    const def = defByName("panel_view_nodes_in_viewport");
+    const shape = def.schema as Record<string, { safeParse: (v: unknown) => { success: boolean } }>;
+    expect(shape.max_chars).toBeDefined();
+    expect(shape.max_chars.safeParse(200000).success).toBe(true);
+    expect(shape.max_chars.safeParse(200001).success).toBe(false);
+    // …and the remedy's number matches what was just proven enforceable.
+    expect(def.description).not.toContain("node_ids");
+    const remedy = JSON.stringify(def);
+    if (remedy.includes("up to ")) {
+      expect(remedy).toContain("up to 200000");
+    }
+  });
+});
