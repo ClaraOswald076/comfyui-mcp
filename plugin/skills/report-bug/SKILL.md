@@ -165,8 +165,15 @@ touched and nothing is done as the user. That is the default and needs no ask.
   # body has newlines/quotes). --max-time bounds the request so a hung
   # connection can't wedge us.
   # body: { "repo": "comfyui-mcp" | "comfyui-mcp-panel", "title", "body", "labels": ["via-panel"] }
+  # The User-Agent is EXPLICIT and load-bearing (#937). Cloudflare bans some
+  # default client signatures outright — a Python `urllib.request` POST to this
+  # endpoint returns 403 with `error code: 1010` (the browser-signature ban),
+  # while the byte-identical request with any ordinary UA succeeds seconds later.
+  # Sending a named UA keeps every client path on a known-good signature instead
+  # of whatever its stdlib happens to advertise.
   RESP=$(curl -fsS --max-time 15 -X POST "$WORKER_URL" \
     -H "Content-Type: application/json" -H "X-Client-Key: $CLIENT_KEY" \
+    -H "User-Agent: comfyui-mcp-report-bug/1.0" -H "Accept: application/json" \
     --data @"$BODY_JSON_FILE" || true)
 
   # 2) VALIDATE THE WHOLE BODY FIRST with `jq -e .` — it rejects anything that
@@ -188,6 +195,37 @@ touched and nothing is done as the user. That is the default and needs no ask.
     fi
   fi
   ```
+  **On Windows, use this instead — it needs no `jq` and no Python** (#937). The
+  `jq` requirement above is what pushed Windows agents onto Python's
+  `urllib.request` in the first place, and that client's default User-Agent is
+  exactly the signature Cloudflare rejects. PowerShell parses JSON natively, so
+  this path has neither problem:
+
+  ```powershell
+  $WorkerUrl = if ($env:COMFYUI_MCP_ISSUE_WORKER_URL) { $env:COMFYUI_MCP_ISSUE_WORKER_URL }
+               else { "https://comfyui-mcp-issue-worker.artokun.workers.dev" }
+  $ClientKey = if ($env:COMFYUI_MCP_ISSUE_CLIENT_KEY) { $env:COMFYUI_MCP_ISSUE_CLIENT_KEY }
+               else { "9b6f2abf09b64006dc6e033f59d2dc8112e34d8347a923c2" }
+
+  # Invoke-RestMethod parses the JSON body itself and THROWS on a non-2xx, so
+  # both failure shapes land in the same catch — no partial-output window.
+  try {
+    $resp = Invoke-RestMethod -Method Post -Uri $WorkerUrl -TimeoutSec 15 `
+      -ContentType "application/json" `
+      -Headers @{ "X-Client-Key" = $ClientKey; "User-Agent" = "comfyui-mcp-report-bug/1.0"; "Accept" = "application/json" } `
+      -InFile $BodyJsonFile
+  } catch { $resp = $null }
+
+  # Same single "filed" condition as the bash path: ok==true, status not "error",
+  # and a url matching the exact GitHub issue shape. Anything else falls back.
+  if ($resp -and $resp.ok -eq $true -and $resp.status -ne "error" -and
+      $resp.url -match '^https://github\.com/[^/]+/[^/]+/issues/\d+$') {
+    "filed: $($resp.url)"
+  } else {
+    "worker did not return an issue link — fall back to the report_issue tool for a prefilled GitHub link"
+  }
+  ```
+
   A real `url` from the POST is the only "filed" outcome. Any submit failure
   (`401`/non-2xx/timeout/unreachable), `ok` not `true`, a `status:"error"` body,
   a missing/invalid url, or invalid JSON → fall back to `report_issue` for a

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { normalizeRepo, buildIssueUrl, isOurRepo, submitAndPoll, registerReportIssueTools } from "./report-issue.js";
+import { normalizeRepo, buildIssueUrl, isOurRepo, submitAndPoll, registerReportIssueTools, REPORT_UA } from "./report-issue.js";
 
 const noSleep = async () => {};
 
@@ -439,5 +439,70 @@ describe("report_issue tool (registered handler)", () => {
   it("invalid repo → isError", async () => {
     const { isError } = await callTool({ title: "t", body: "b", repo: "not-a-repo" });
     expect(isError).toBe(true);
+  });
+});
+
+// #937 — Cloudflare fronts the intake endpoint and bans some default client
+// signatures outright. A Python `urllib.request` POST returns 403 with
+// `error code: 1010` (the browser-signature ban) while the byte-identical
+// request with an ordinary UA succeeds 13 seconds later, same IP, same key,
+// same body.
+//
+// Node fetch happens to be allowed today — a WAF disposition we neither control
+// nor chose. Sending a named UA makes the path deterministic rather than
+// incidentally lucky, and it is the one header a future WAF rule would key on.
+describe("#937: every intake request carries a named User-Agent", () => {
+  it("sends it on the SUBMIT", async () => {
+    const seen: Array<Record<string, string>> = [];
+    const fetchImpl = (async (_url: string, init?: RequestInit) => {
+      seen.push((init?.headers ?? {}) as Record<string, string>);
+      return new Response(JSON.stringify({ ok: true, job_id: "j1" }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await submitAndPoll({
+      workerUrl: "https://w.example",
+      clientKey: "k",
+      repoName: "comfyui-mcp",
+      title: "t",
+      body: "b",
+      fetchImpl,
+      maxPolls: 0,
+      sleep: async () => {},
+    });
+
+    expect(seen[0]["User-Agent"]).toBe(REPORT_UA);
+    expect(seen[0]["Accept"]).toBe("application/json");
+    // The signature is NAMED, not a browser impersonation — we are a tool, and
+    // claiming to be Chrome to get past a bot check would be the wrong fix.
+    expect(REPORT_UA).toMatch(/^comfyui-mcp-report-bug\//);
+    expect(REPORT_UA).not.toMatch(/Mozilla|Chrome|Safari/);
+  });
+
+  it("sends it on the STATUS poll too", async () => {
+    const seen: Array<Record<string, string>> = [];
+    let call = 0;
+    const fetchImpl = (async (_url: string, init?: RequestInit) => {
+      seen.push((init?.headers ?? {}) as Record<string, string>);
+      call += 1;
+      return call === 1
+        ? new Response(JSON.stringify({ ok: true, job_id: "j1" }), { status: 200 })
+        : new Response(JSON.stringify({ state: "CLOSED", payload: { url: "u" } }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await submitAndPoll({
+      workerUrl: "https://w.example",
+      clientKey: "k",
+      repoName: "comfyui-mcp",
+      title: "t",
+      body: "b",
+      fetchImpl,
+      maxPolls: 1,
+      pollDelayMs: 0,
+      sleep: async () => {},
+    });
+
+    // The poll is a separate request and would be judged by the WAF separately.
+    expect(seen.length).toBeGreaterThan(1);
+    expect(seen[1]["User-Agent"]).toBe(REPORT_UA);
   });
 });

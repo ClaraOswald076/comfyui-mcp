@@ -22,6 +22,10 @@ const OUR_REPO_NAMES = new Set(["comfyui-mcp", "comfyui-mcp-panel"]);
 const DEFAULT_WORKER_URL = "https://comfyui-mcp-issue-worker.artokun.workers.dev";
 const DEFAULT_CLIENT_KEY = "9b6f2abf09b64006dc6e033f59d2dc8112e34d8347a923c2";
 
+/** The User-Agent every report-bug request sends (#937). Named on purpose: a
+ *  default runtime signature is a WAF disposition we do not control. */
+export const REPORT_UA = "comfyui-mcp-report-bug/1.0";
+
 export function normalizeRepo(input: string | undefined): string {
   const repo = (input || DEFAULT_REPO)
     .trim()
@@ -169,6 +173,15 @@ export async function submitAndPoll(opts: {
         headers: {
           "Content-Type": "application/json",
           "X-Client-Key": opts.clientKey,
+          // #937 — an EXPLICIT, named signature rather than whatever the runtime
+          // advertises. Cloudflare fronts this endpoint and bans some default
+          // client UAs outright: a Python urllib POST gets 403 / `error code:
+          // 1010` while the byte-identical request with an ordinary UA succeeds
+          // seconds later. Node fetch happens to be allowed today — a WAF
+          // disposition we neither control nor chose. Naming ourselves makes the
+          // path deterministic instead of incidentally lucky.
+          "User-Agent": REPORT_UA,
+          Accept: "application/json",
           // Opt into the async AI-triage contract. Absent this header the worker
           // runs its legacy synchronous dumb-file path (old clients stay working).
           "X-Triage-Async": "1",
@@ -220,7 +233,7 @@ export async function submitAndPoll(opts: {
       parsed = await withTimeout(async (signal): Promise<StatusFrame> => {
         const r = await doFetch(`${base}/status/${jobId}`, {
           signal,
-          headers: { "X-Client-Key": opts.clientKey },
+          headers: { "X-Client-Key": opts.clientKey, "User-Agent": REPORT_UA, Accept: "application/json" },
         });
         if (!r.ok) throw new Error(`poll failed: HTTP ${r.status}`);
         return (await r.json()) as StatusFrame;
