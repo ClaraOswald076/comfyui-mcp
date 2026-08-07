@@ -47,6 +47,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { computeVocabularyHash, DEAD_NAMES, MAX_TOOLS, TOOL_NAMES } from "../src/tools/vocabulary.js";
+import { CALL_TOOL_WHITELIST } from "../src/orchestrator/call-tool-admission.js";
 import { buildPanelToolDefs } from "../src/orchestrator/panel-tools.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -102,6 +103,26 @@ const artefact = {
   panel: panelSorted,
   /** Removed names, with what to use instead. `allowedIn` is repo-local and omitted. */
   dead,
+  /**
+   * Core tools the DIRECT `call_tool` channel will admit — the canvas-less path
+   * mobile, mirrored tabs and the panel's own buttons use.
+   *
+   * Exists because #908: PR #278 correctly removed pod create/start (now
+   * `runpod` actions) from that channel (both start BILLING, and a
+   * confirmation-less mirrored tab must not spend money), but the panel's
+   * cmcp-runpod-ui.js kept calling them over exactly that channel. Both buttons
+   * were inert for about two weeks, returning a bare "not permitted". Each repo
+   * was correct alone; nothing could see across the seam.
+   *
+   * Publishing the admitted set lets the panel gate its OWN call sites the same
+   * way it already gates retired names — at build time, instead of a user
+   * discovering it by clicking a dead button.
+   *
+   * NOT part of `vocabularyHash`, deliberately. The hash identifies which tools
+   * EXIST; admission is a separate question about one channel, and folding it in
+   * would invalidate every vendored copy on a policy change that renamed nothing.
+   */
+  directCallable: [...CALL_TOOL_WHITELIST].sort(),
 };
 
 const serialized = `${JSON.stringify(artefact, null, 2)}\n`;

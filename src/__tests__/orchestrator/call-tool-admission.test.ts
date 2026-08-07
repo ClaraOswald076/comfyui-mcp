@@ -435,16 +435,16 @@ describe("call_tool admission", () => {
      */
     it("search_custom_nodes is not whitelisted at all — it was never reachable here", () => {
       for (const action of ["search", "details"]) {
-        expect(callToolAdmission("search_custom_nodes", { action }), `action:"${action}"`).toBe(
-          'tool "search_custom_nodes" is not permitted',
+        expect(callToolAdmission("search_custom_nodes", { action }), `action:"${action}"`).toEqual(
+          expect.stringContaining('tool "search_custom_nodes" exists but is not available'),
         );
       }
       // …including the shapes a client would actually send.
       expect(
         callToolAdmission("search_custom_nodes", { action: "search", query: "impact", limit: 5 }),
-      ).toBe('tool "search_custom_nodes" is not permitted');
-      expect(callToolAdmission("search_custom_nodes", {})).toBe(
-        'tool "search_custom_nodes" is not permitted',
+      ).toEqual(expect.stringContaining('tool "search_custom_nodes" exists but is not available'));
+      expect(callToolAdmission("search_custom_nodes", {})).toEqual(
+        expect.stringContaining('tool "search_custom_nodes" exists but is not available'),
       );
     });
 
@@ -462,8 +462,8 @@ describe("call_tool admission", () => {
 
     it("node_pack is not whitelisted at all — it writes files and runs git", () => {
       for (const action of ["scaffold", "verify", "publish", "list_files", "read", "search", "write", "patch", "git"]) {
-        expect(callToolAdmission("node_pack", { action }), `action:"${action}"`).toBe(
-          'tool "node_pack" is not permitted',
+        expect(callToolAdmission("node_pack", { action }), `action:"${action}"`).toEqual(
+          expect.stringContaining('tool "node_pack" exists but is not available'),
         );
       }
     });
@@ -535,12 +535,12 @@ describe("call_tool admission", () => {
       // server-side output into that directory, and output ships bytes off the
       // machine to a caller-named cloud destination.
       for (const action of ["image", "video", "audio", "stage", "output"]) {
-        expect(callToolAdmission("upload_image", { action }), `action:"${action}"`).toBe(
-          'tool "upload_image" is not permitted',
+        expect(callToolAdmission("upload_image", { action }), `action:"${action}"`).toEqual(
+          expect.stringContaining('tool "upload_image" exists but is not available'),
         );
       }
-      expect(callToolAdmission("upload_image", {})).toBe(
-        'tool "upload_image" is not permitted',
+      expect(callToolAdmission("upload_image", {})).toEqual(
+        expect.stringContaining('tool "upload_image" exists but is not available'),
       );
     });
 
@@ -671,11 +671,11 @@ describe("call_tool admission", () => {
     // to this channel. Asserted rather than assumed: `apps` action:"run" IS
     // admitted and queues a render, so "generation is reachable from here" is a
     // plausible-sounding mistake to make.
-    expect(callToolAdmission("generate_image", { action: "image" })).toBe(
-      'tool "generate_image" is not permitted',
+    expect(callToolAdmission("generate_image", { action: "image" })).toEqual(
+      expect.stringContaining('tool "generate_image" exists but is not available'),
     );
-    expect(callToolAdmission("generate_image", { action: "regenerate", asset_id: "a" })).toBe(
-      'tool "generate_image" is not permitted',
+    expect(callToolAdmission("generate_image", { action: "regenerate", asset_id: "a" })).toEqual(
+      expect.stringContaining('tool "generate_image" exists but is not available'),
     );
   });
 
@@ -738,11 +738,19 @@ describe("call_tool admission", () => {
    * to do with what it is testing. Derived from TOOL_NAMES it cannot rot, and it
    * covers the whole surface instead of a sample.
    */
-  it("refuses every live non-whitelisted tool with the byte-identical legacy string", () => {
+  it("refuses every live non-whitelisted tool with ONE consistent excluded-not-missing string", () => {
     const notWhitelisted = TOOL_NAMES.filter((n) => !CALL_TOOL_WHITELIST.has(n));
     expect(notWhitelisted.length).toBeGreaterThan(0);
     for (const name of notWhitelisted) {
-      expect(callToolAdmission(name, {}), name).toBe(`tool "${name}" is not permitted`);
+      // #908 changed this string: a LIVE tool withheld from this channel now says
+      // it exists and names the remedy, instead of the bare "is not permitted"
+      // that read identically to "no such tool". The property this test was
+      // written to hold is unchanged and is what still matters — every live
+      // non-whitelisted name gets the SAME refusal, derived from TOOL_NAMES so it
+      // covers the whole surface and cannot rot when a slice folds a name away.
+      const msg = String(callToolAdmission(name, {}));
+      expect(msg, name).toContain(`tool "${name}" exists but is not available`);
+      expect(msg, name).toContain("deliberate exclusion, not a missing tool");
     }
   });
 
@@ -950,12 +958,14 @@ describe("0.50.0 slice 13 — install/environment and stats/diagnostics", () => 
       expect(CALL_TOOL_WHITELIST.has(tool), `${tool} must stay off the whitelist`).toBe(false);
       expect(CALL_TOOL_ACTION_WHITELIST.has(tool), `${tool} needs no action scope`).toBe(false);
       for (const action of actions) {
-        expect(callToolAdmission(tool, { action }), `${tool}/${action}`).toBe(
-          `tool "${tool}" is not permitted`,
+        expect(callToolAdmission(tool, { action }), `${tool}/${action}`).toEqual(
+          expect.stringContaining(`tool "${tool}" exists but is not available`),
         );
       }
       // ...including with no action at all, the shape a stale client would send.
-      expect(callToolAdmission(tool, {})).toBe(`tool "${tool}" is not permitted`);
+      expect(callToolAdmission(tool, {})).toEqual(
+        expect.stringContaining(`tool "${tool}" exists but is not available`),
+      );
     }
   });
 
