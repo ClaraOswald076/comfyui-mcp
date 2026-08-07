@@ -13,7 +13,7 @@ describe("parseCliArgs", () => {
     expect(parseCliArgs(base, {})).toEqual({
       help: false,
       transport: "stdio",
-      toolMode: "compact",
+      toolMode: "full",
       toolModeExplicit: false,
       host: "127.0.0.1",
       port: 9100,
@@ -37,38 +37,49 @@ describe("parseCliArgs", () => {
 
   it("supports --port value and --host value", () => {
     const o = parseCliArgs([...base, "--http", "--host", "0.0.0.0", "--port", "8080"], {});
-    expect(o).toEqual({ help: false, transport: "http", toolMode: "compact", toolModeExplicit: false, host: "0.0.0.0", port: 8080, panelOrchestrator: false, token: undefined, tunnel: false, allowUnauthenticated: false, insecureBridge: false, setupAgent: undefined, setupDryRun: false });
+    expect(o).toEqual({ help: false, transport: "http", toolMode: "full", toolModeExplicit: false, host: "0.0.0.0", port: 8080, panelOrchestrator: false, token: undefined, tunnel: false, allowUnauthenticated: false, insecureBridge: false, setupAgent: undefined, setupDryRun: false });
   });
 
   it("supports --flag=value form", () => {
     const o = parseCliArgs([...base, "--transport=http", "--port=3000", "--host=0.0.0.0"], {});
-    expect(o).toEqual({ help: false, transport: "http", toolMode: "compact", toolModeExplicit: false, host: "0.0.0.0", port: 3000, panelOrchestrator: false, token: undefined, tunnel: false, allowUnauthenticated: false, insecureBridge: false, setupAgent: undefined, setupDryRun: false });
+    expect(o).toEqual({ help: false, transport: "http", toolMode: "full", toolModeExplicit: false, host: "0.0.0.0", port: 3000, panelOrchestrator: false, token: undefined, tunnel: false, allowUnauthenticated: false, insecureBridge: false, setupAgent: undefined, setupDryRun: false });
   });
 
   it("reads env defaults", () => {
     const o = parseCliArgs(base, { MCP_TRANSPORT: "http", MCP_HOST: "0.0.0.0", MCP_PORT: "5000" });
-    expect(o).toEqual({ help: false, transport: "http", toolMode: "compact", toolModeExplicit: false, host: "0.0.0.0", port: 5000, panelOrchestrator: false, token: undefined, tunnel: false, allowUnauthenticated: false, insecureBridge: false, setupAgent: undefined, setupDryRun: false });
+    expect(o).toEqual({ help: false, transport: "http", toolMode: "full", toolModeExplicit: false, host: "0.0.0.0", port: 5000, panelOrchestrator: false, token: undefined, tunnel: false, allowUnauthenticated: false, insecureBridge: false, setupAgent: undefined, setupDryRun: false });
   });
 
-  it("compact is the DEFAULT tool mode; --full / COMFYUI_MCP_TOOL_MODE=full opts out (#667)", () => {
-    expect(parseCliArgs(base, {}).toolMode).toBe("compact");
+  it("FULL is the default tool mode since 0.50.0; --compact / COMFYUI_MCP_TOOL_MODE=compact opts in (#726)", () => {
+    // The flip. Compact was the default from #667 only because the surface was
+    // too big to ship — 154 names, ~50k tokens per tools/list. Consolidation
+    // took it to 37, so the classic surface is affordable again and compact
+    // becomes the opt-in for small local models (#97).
+    expect(parseCliArgs(base, {}).toolMode).toBe("full");
+    expect(parseCliArgs([...base, "--full"], {}).toolMode).toBe("full");
+    expect(parseCliArgs([...base, "--tool-mode", "full"], {}).toolMode).toBe("full");
+    expect(parseCliArgs([...base, "--tool-mode=full"], {}).toolMode).toBe("full");
+    expect(parseCliArgs(base, { COMFYUI_MCP_TOOL_MODE: "full" }).toolMode).toBe("full");
+    // compact is still fully available — it is the opt-in now, not gone
     expect(parseCliArgs([...base, "--compact"], {}).toolMode).toBe("compact");
     expect(parseCliArgs([...base, "--tool-mode", "compact"], {}).toolMode).toBe("compact");
     expect(parseCliArgs([...base, "--tool-mode=compact"], {}).toolMode).toBe("compact");
     expect(parseCliArgs(base, { COMFYUI_MCP_TOOL_MODE: "compact" }).toolMode).toBe("compact");
-    // the full surface is still available, explicitly
-    expect(parseCliArgs([...base, "--full"], {}).toolMode).toBe("full");
-    expect(parseCliArgs([...base, "--tool-mode", "full"], {}).toolMode).toBe("full");
-    expect(parseCliArgs(base, { COMFYUI_MCP_TOOL_MODE: "full" }).toolMode).toBe("full");
+    // `--full` stays an ACCEPTED no-op so existing scripts and docs snippets
+    // that pass it keep working rather than erroring on an unknown flag.
+    expect(parseCliArgs([...base, "--full"], {}).toolModeExplicit).toBe(true);
     // explicit CLI wins over env, in both directions
     expect(
       parseCliArgs([...base, "--tool-mode", "full"], { COMFYUI_MCP_TOOL_MODE: "compact" }).toolMode,
     ).toBe("full");
     expect(parseCliArgs([...base, "--full"], { COMFYUI_MCP_TOOL_MODE: "compact" }).toolMode).toBe("full");
     expect(parseCliArgs([...base, "--compact"], { COMFYUI_MCP_TOOL_MODE: "full" }).toolMode).toBe("compact");
-    // unknown values fall back to the compact default
-    expect(parseCliArgs([...base, "--tool-mode", "bogus"], {}).toolMode).toBe("compact");
-    expect(parseCliArgs(base, { COMFYUI_MCP_TOOL_MODE: "bogus" }).toolMode).toBe("compact");
+    // Unknown values fall back to THE DEFAULT — which is now full. The rule is
+    // unchanged ("only the exact opt-in string counts"); the default moved under
+    // it. Note this is the one caller-visible behaviour change beyond the
+    // default itself: `--tool-mode bogus` used to yield compact.
+    expect(parseCliArgs([...base, "--tool-mode", "bogus"], {}).toolMode).toBe("full");
+    expect(parseCliArgs(base, { COMFYUI_MCP_TOOL_MODE: "bogus" }).toolMode).toBe("full");
     // either explicit env mode counts as an explicit choice (for `setup`)
     expect(parseCliArgs(base, { COMFYUI_MCP_TOOL_MODE: "compact" }).toolModeExplicit).toBe(true);
     expect(parseCliArgs(base, { COMFYUI_MCP_TOOL_MODE: "full" }).toolModeExplicit).toBe(true);

@@ -90,12 +90,23 @@ vi.mock("node:child_process", () => ({
 const fsCtl = vi.hoisted(() => ({
   readdirSync: undefined as ((path: string) => unknown[]) | undefined,
   readFileSync: undefined as ((path: string) => string) | undefined,
+  /** Paths passed to rmSync this test (#900 cleanup observation). */
+  removed: [] as string[],
+  /** Make removal fail, so the leftover has to be disclosed rather than swallowed. */
+  rmThrows: false,
 }));
 vi.mock("node:fs", async (importOriginal) => {
   const real = await importOriginal<typeof import("node:fs")>();
   return {
     ...real,
     existsSync: vi.fn(() => true),
+    // Tracked so a test can observe that a failed clone REMOVED what it created
+    // — and, just as importantly, that it left an existing pack alone (#900).
+    rmSync: vi.fn((path: unknown, options?: unknown) => {
+      fsCtl.removed.push(String(path));
+      if (fsCtl.rmThrows) throw new Error("EPERM: removal refused");
+      return (real.rmSync as (p: unknown, o?: unknown) => unknown)(path, options);
+    }),
     readdirSync: vi.fn((path: unknown, options?: unknown) =>
       fsCtl.readdirSync
         ? fsCtl.readdirSync(String(path))
@@ -250,6 +261,8 @@ describe("node-management service", () => {
     // Default: no custom_nodes fixture — the #797 disk scan delegates to the
     // real fs (which throws on the fake root) unless a test installs one.
     fsCtl.readdirSync = undefined;
+    fsCtl.removed = [];
+    fsCtl.rmThrows = false;
     fsCtl.readFileSync = undefined;
     savedDefault.value = undefined;
     config.comfyuiPath = "/fake/comfy";
@@ -721,6 +734,116 @@ describe("node-management service", () => {
           (c) => c[0] === "git" && (c[1] as string[]).includes("checkout"),
         ),
       ).toBe(true);
+    });
+
+    it("removes the directory a FAILED clone created, instead of leaving a husk", async () => {
+      // #900, observed on a real machine: a clone that did not produce a pack left
+      // a directory holding only `.git` in custom_nodes. ComfyUI loads
+      // DIRECTORIES, so it tried to import it on every start and logged an error
+      // — for over a month, long after anyone remembered running the install.
+      stubFetch({ installedBody: {} });
+      let cloned = false;
+      mockedExists.mockImplementation((p: unknown) => {
+        const str = String(p);
+        if (str.includes("requirements.txt") || str.includes("install.py")) return false;
+        if (str.includes(".venv") || str.includes("cm-cli.py")) return false;
+        if (str.includes(NODE_DIR_UTILS)) return cloned; // git created it, then failed
+        return false;
+      });
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") {
+          cloned = true; // the directory now exists…
+          throw new Error("fatal: could not read from remote repository");
+        }
+        return "";
+      }) as never);
+
+      await expect(
+        installCustomNode({ id: "https://github.com/teskor-hub/comfyui-teskors-utils" }),
+      ).rejects.toThrow(/Failed to clone/);
+
+      expect(fsCtl.removed).toContain(NODE_DIR_UTILS);
+    });
+
+    it("does NOT remove a PRE-EXISTING pack when a clone/update fails", async () => {
+      // The inverse, and the one that would do real damage: an existing pack is
+      // the user's, and a failed operation must never take it away.
+      //
+      // Note what this test does and does not prove. It passes STRUCTURALLY —
+      // with the pack already present the clone block is skipped entirely, so the
+      // cleanup is never reached — which means removing the ownership check
+      // inside `discardFailedClone` does not fail it. That check is a documented
+      // precondition rather than live logic. What this DOES pin is the property
+      // that matters to a user: run an install against a pack that is already
+      // there, have it fail, and still have your pack.
+      stubFetch({ installedBody: {} });
+      mockedExists.mockImplementation((p: unknown) => {
+        const str = String(p);
+        if (str.includes("requirements.txt") || str.includes("install.py")) return false;
+        if (str.includes(".venv") || str.includes("cm-cli.py")) return false;
+        if (str.includes(NODE_DIR_UTILS)) return true; // already there, before we ran
+        return false;
+      });
+      fsCtl.readdirSync = () => ["__init__.py", ".git"]; // a real pack
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") throw new Error("should not clone");
+        return "";
+      }) as never);
+
+      await installCustomNode({
+        id: "https://github.com/teskor-hub/comfyui-teskors-utils",
+      }).catch(() => undefined);
+
+      expect(fsCtl.removed).not.toContain(NODE_DIR_UTILS);
+    });
+
+    it("REJECTS a clone that produced only git metadata — an existing directory is not a pack", async () => {
+      // `existsSync(nodeDir)` was the whole post-clone check, and it passes for a
+      // husk. "The directory exists" was never the question ComfyUI asks.
+      stubFetch({ installedBody: {} });
+      let cloned = false;
+      mockedExists.mockImplementation((p: unknown) => {
+        const str = String(p);
+        if (str.includes("requirements.txt") || str.includes("install.py")) return false;
+        if (str.includes(".venv") || str.includes("cm-cli.py")) return false;
+        if (str.includes(NODE_DIR_UTILS)) return cloned;
+        return false;
+      });
+      fsCtl.readdirSync = () => [".git"]; // git and nothing else
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") cloned = true;
+        return "";
+      }) as never);
+
+      await expect(
+        installCustomNode({ id: "https://github.com/teskor-hub/comfyui-teskors-utils" }),
+      ).rejects.toThrow(/no loadable pack/i);
+      expect(fsCtl.removed).toContain(NODE_DIR_UTILS);
+    });
+
+    it("DISCLOSES a leftover it could not remove, rather than swallowing it", async () => {
+      // A husk nobody was told about is how the one in #900 survived a month.
+      stubFetch({ installedBody: {} });
+      let cloned = false;
+      mockedExists.mockImplementation((p: unknown) => {
+        const str = String(p);
+        if (str.includes("requirements.txt") || str.includes("install.py")) return false;
+        if (str.includes(".venv") || str.includes("cm-cli.py")) return false;
+        if (str.includes(NODE_DIR_UTILS)) return cloned;
+        return false;
+      });
+      fsCtl.rmThrows = true;
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") {
+          cloned = true;
+          throw new Error("fatal: repository not found");
+        }
+        return "";
+      }) as never);
+
+      await expect(
+        installCustomNode({ id: "https://github.com/teskor-hub/comfyui-teskors-utils" }),
+      ).rejects.toThrow(/could NOT be removed/i);
     });
 
     it("throws ProcessControlError on clone fallback when comfyuiPath is unset", async () => {

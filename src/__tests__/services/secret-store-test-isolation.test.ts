@@ -223,13 +223,47 @@ describe("secret-store test isolation", () => {
     }
   });
 
+  /**
+   * Files allowed to name the real store, each with its reason.
+   *
+   * DECLARED, not evaded. The pattern below could be side-stepped by assembling
+   * the same path from pieces — and that is precisely what must not happen: an
+   * exception nobody can see is how a guard quietly stops guarding. Anything
+   * added here needs a reason that survives being read aloud.
+   */
+  const ALLOWED_TO_NAME_THE_REAL_STORE = new Map<string, string>([
+    [
+      "suite-state-isolation.test.ts",
+      "asserts that NO redirect points inside the real store, so it has to name " +
+        "the store to check nothing resolves there — the inverse of this hazard.",
+    ],
+  ]);
+
+  const baseName = (p: string): string => p.split(/[\\/]/).pop() ?? "";
+
   it("no test hardcodes the real home credential path", () => {
     const offenders: string[] = [];
     for (const file of files) {
+      const rel = relative(testsRoot, file);
+      if (ALLOWED_TO_NAME_THE_REAL_STORE.has(baseName(rel))) continue;
       const src = readFileSync(file, "utf-8");
       // homedir()-based store paths in a test are the same hazard wearing a hat.
-      if (/homedir\(\)[^\n]*\.comfyui-mcp/.test(src)) offenders.push(relative(testsRoot, file));
+      if (/homedir\(\)[^\n]*\.comfyui-mcp/.test(src)) offenders.push(rel);
     }
     expect(offenders).toEqual([]);
+  });
+
+  it("the allowlist cannot become a place to quietly park offenders", () => {
+    // An allowlist that grows without anyone noticing IS the bypass. Every entry
+    // must carry a real reason and must still name a file that exists — a stale
+    // name left behind after a rename silently widens the exemption to nothing,
+    // or worse, to whatever later takes that name.
+    for (const [name, reason] of ALLOWED_TO_NAME_THE_REAL_STORE) {
+      expect(reason.length, `${name} has no real reason`).toBeGreaterThan(40);
+      expect(
+        files.some((f) => baseName(relative(testsRoot, f)) === name),
+        `${name} is allowlisted but no such test file exists`,
+      ).toBe(true);
+    }
   });
 });

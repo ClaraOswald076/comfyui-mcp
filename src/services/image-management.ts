@@ -200,7 +200,7 @@ export interface OutputImage {
   /** Subfolder relative to the output dir ("" for top level), forward-slash
    *  normalized. ComfyUI writes to subfolders when a node's filename_prefix
    *  contains a path (e.g. SaveVideo "video/clip" → output/video/clip_00001.mp4).
-   *  Pass { filename, subfolder } to get_image / stage_output_as_input. */
+   *  Pass { filename, subfolder } to get_image (action:"get") / upload_image (action:"stage"). */
   subfolder: string;
   /** Media kind derived from the file extension. */
   kind: "image" | "video";
@@ -227,10 +227,34 @@ function mediaKind(ext: string): "image" | "video" {
  * video outputs — so a filesystem scan is the reliable way to confirm a finished
  * video render.
  */
-export async function listOutputImages(options?: {
+/** Where a listing came from, and what established it. */
+export interface OutputListingSource {
+  /** The directory that was actually scanned. Absent on the /history path,
+   *  which has no directory to name — it is a listing from the server's
+   *  in-memory history, not from disk. */
+  directory?: string;
+  /** How the answer was produced, so a caller never has to guess which. */
+  basis: "local-scan" | "server-history";
+}
+
+/**
+ * The listing PLUS where it came from.
+ *
+ * `listOutputImages` returns bare filenames, which forces any caller that needs
+ * the path to reconstruct it — and the obvious reconstruction (the workspace
+ * path from `install_comfyui (action:"environment")`) is WRONG on every install launched with
+ * `--output-directory`, in the silent way: the filenames look plausible against
+ * it, so a caller that does not stat them reports a directory holding nothing
+ * (#899, observed live).
+ *
+ * The directory is resolved exactly ONCE, here, and travels with the entries it
+ * describes. Resolving it a second time in the caller would be the same class of
+ * bug this fixes: two answers to one question, free to disagree.
+ */
+export async function listOutputMedia(options?: {
   limit?: number;
   pattern?: string;
-}): Promise<OutputImage[]> {
+}): Promise<{ images: OutputImage[]; source: OutputListingSource }> {
   const limit = options?.limit ?? 20;
   const pattern = options?.pattern?.toLowerCase();
 
@@ -242,13 +266,16 @@ export async function listOutputImages(options?: {
   // wrong machine's outputs — but the converse test, `!config.comfyuiPath`, was
   // never a test for "no local path". It reads one ENV VAR, while a local
   // portable install is perfectly well located by the SAVED DEFAULT WORKSPACE,
-  // which `resolveOutputDir` consults and `get_environment` reports. So a local
+  // which `resolveOutputDir` consults and `install_comfyui (action:"environment")` reports. So a local
   // install with `COMFYUI_PATH` unset silently took the remote branch, asked
   // /history — which had been emptied by a restart — and returned `[]` over an
   // output directory holding the files the caller was asking about. A silent
   // wrong answer, not an error: the agent concludes the file does not exist.
   if (isRemoteMode()) {
-    return listOutputImagesFromHistory(limit, pattern);
+    return {
+      images: await listOutputImagesFromHistory(limit, pattern),
+      source: { basis: "server-history" },
+    };
   }
 
   // Local. `resolveOutputDir` already knows every way this path can be
@@ -262,7 +289,9 @@ export async function listOutputImages(options?: {
     // that there are no outputs. Falling back is right; reporting its emptiness
     // as an answer is not.
     const fromHistory = await listOutputImagesFromHistory(limit, pattern);
-    if (fromHistory.length > 0) return fromHistory;
+    if (fromHistory.length > 0) {
+      return { images: fromHistory, source: { basis: "server-history" } };
+    }
     throw new ComfyUIError(
       `Could not determine this ComfyUI's output directory (${err instanceof Error ? err.message : String(err)}), ` +
         `so the local output folder was never scanned. ComfyUI's /history was asked instead and ` +
@@ -347,7 +376,22 @@ export async function listOutputImages(options?: {
   // Sort newest first
   images.sort((a, b) => b.modified.localeCompare(a.modified));
 
-  return images.slice(0, limit);
+  return {
+    images: images.slice(0, limit),
+    source: { directory: outputDir, basis: "local-scan" },
+  };
+}
+
+/**
+ * Just the entries. Kept because most callers only want the list; anything that
+ * needs to SAY where the files are must use `listOutputMedia`, so the path it
+ * reports is the path that was scanned.
+ */
+export async function listOutputImages(options?: {
+  limit?: number;
+  pattern?: string;
+}): Promise<OutputImage[]> {
+  return (await listOutputMedia(options)).images;
 }
 
 /**
@@ -450,8 +494,8 @@ import { readFile as nodeReadFile } from "node:fs/promises";
  * onto the configured base directory; the server has historically been
  * permissive about ".." segments and absolute paths in those parameters
  * (see e.g. comfyanonymous/ComfyUI#785), so an attacker who can reach the
- * MCP tool surface could otherwise pivot through get_image / view_image /
- * stage_output_as_input to read arbitrary files from the ComfyUI host.
+ * MCP tool surface could otherwise pivot through get_image (action:"get"/"view") /
+ * upload_image (action:"stage") to read arbitrary files from the ComfyUI host.
  *
  * Legitimate ComfyUI values are a single filename (no separators) and a
  * relative subfolder produced by listOutputImages (forward-slash joined,
@@ -742,7 +786,7 @@ export async function getOutputImage(
       `ComfyUI /view did not return an image for "${filename}" (${where}); ` +
         `got ${result.base64.length === 0 ? "an empty response" : `content-type "${result.mimeType}"`}. ` +
         `The file may not exist in the ComfyUI ${type} directory — ` +
-        `check the filename/subfolder (e.g. via list_output_images or get_history).`,
+        `check the filename/subfolder (e.g. via get_image (action:"list_outputs") or get_history).`,
       "IMAGE_NOT_FOUND",
       { filename, type, subfolder, mimeType: result.mimeType },
     );
@@ -870,7 +914,7 @@ export const uploadAudioLocal = (sourcePath: string, filename?: string) =>
   uploadMediaLocal(sourcePath, filename, AUDIO_MIME, "audio");
 
 // ---------------------------------------------------------------------------
-// stage_output_as_input — pipe one pipeline stage's OUTPUT into the next stage's
+// upload_image (action:"stage") — pipe one pipeline stage's OUTPUT into the next stage's
 // loader (LoadImage / VHS_LoadVideo / LoadAudio) the CORRECT way: fetch the bytes
 // from the ComfyUI server (/view) and re-register them as an INPUT via the same
 // /upload/image endpoint the upload_* tools use. Because both legs go through the
@@ -913,7 +957,7 @@ function mimeForKind(filename: string, kind: MediaKind): string {
 }
 
 export interface StageOutputAsInputArgs {
-  /** Filename of the existing output/temp asset (from get_history / list_output_images). */
+  /** Filename of the existing output/temp asset (from get_history / get_image (action:"list_outputs")). */
   filename: string;
   /** Subfolder the asset lives in, if any. */
   subfolder?: string;
@@ -942,7 +986,7 @@ export interface StagedInput {
  *
  * Fetches the bytes from the server via /view (the same path get_image uses) and
  * re-registers them as an input via /upload/image (the same path upload_image /
- * upload_video / upload_audio use). Goes entirely through the server API, so it
+ * upload_image (action:"video") / upload_image (action:"audio") use). Goes entirely through the server API, so it
  * is correct even when ComfyUI runs with a custom input/output directory.
  */
 export async function stageOutputAsInput(

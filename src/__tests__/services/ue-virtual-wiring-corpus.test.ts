@@ -1,7 +1,7 @@
 // SHARED ADVERSARIAL CORPUS — one table of virtual-wiring graph shapes, run
 // against BOTH tools that resolve them:
 //
-//   • strip_workflow / panel_strip_workflow  → convertUiToApi
+//   • get_workflow (action:"strip") / panel_strip_workflow  → convertUiToApi
 //   • panel_flatten_workflow                 → flattenUiWorkflow
 //
 // The two keep SEPARATE implementations of the same policy on purpose: they walk
@@ -986,7 +986,7 @@ function check(outcome: Outcome, expected: Expect) {
   }
 }
 
-describe("virtual-wiring corpus — strip_workflow (convertUiToApi)", () => {
+describe('virtual-wiring corpus — get_workflow action:"strip" (convertUiToApi)', () => {
   for (const c of CORPUS) {
     it(c.name, () => check(apiOutcome(c.graph()), c.api));
   }

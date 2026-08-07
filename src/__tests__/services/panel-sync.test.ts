@@ -27,6 +27,7 @@ import {
   classifyPinWrite,
   evaluatePanelSync,
   performPanelSync,
+  reassessPanelAfterSyncFailure,
   requiredPanelVersion,
   type PanelSyncDecision,
 } from "../../services/panel-sync.js";
@@ -67,7 +68,7 @@ function decide(over: Partial<PanelStatus>): PanelSyncDecision {
 describe("requiredPanelVersion", () => {
   it("includes handshake capabilities as well as bridge-command minimums", () => {
     // A capability gate is just as much a version requirement as a command
-    // gate: otherwise install_panel can call the panel current while the bridge
+    // gate: otherwise install_comfyui(action:'panel') can call the panel current while the bridge
     // refuses every active-workflow write (#708).
     expect(BRIDGE_CAPABILITY_MIN_PANEL_VERSION.enforces_workflow_stamp).toBe("0.11.30");
     expect(BRIDGE_CAPABILITY_MIN_PANEL_VERSION.enforces_workflow_stamp_at_write).toBe(REQUIRED);
@@ -218,7 +219,7 @@ describe("evaluatePanelSync — a pin is honoured in every shape", () => {
   });
 
   // #806, pinned variant. The honesty is owed here too — but the step that moves
-  // a PINNED user is clearing the pin, not install_panel(action='update'), which
+  // a PINNED user is clearing the pin, not install_comfyui(action:'panel', panel_action:'update'), which
   // this state would refuse. Naming the wrong one is the dead-end shape again.
   it("a pinned floor-clearing panel is told the floor is not the latest, and to unpin first", () => {
     const pin: PanelPinState = { pinned: true, version: REQUIRED, source: "settings" };
@@ -229,7 +230,7 @@ describe("evaluatePanelSync — a pin is honoured in every shape", () => {
     expect(a.summary).toMatch(/FLOOR check, not a latest-version check/);
     expect(a.summary).toContain("pyproject.toml");
     expect(a.summary).toMatch(/clear the pin/i);
-    expect(a.summary).not.toContain("install_panel(action='update')");
+    expect(a.summary).not.toContain("install_comfyui(action:'panel', panel_action:'update')");
   });
 
   it("a pin blocks even a FRESH install of a missing panel", () => {
@@ -636,5 +637,67 @@ describe("performPanelSync", () => {
     expect(r.synced).toBe(false);
     expect(r.decision).toBe("dev-install");
     expect(h.updates).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reassessPanelAfterSyncFailure (#888) — the authoritative re-check behind the
+// hello auto-sync failure path. Only a PROVEN meets-floor verdict may suppress
+// the warning; every "can't tell" keeps it.
+// ---------------------------------------------------------------------------
+
+describe("reassessPanelAfterSyncFailure (#888)", () => {
+  it("panel installed AT the floor → meets-floor (the stale 'did NOT land' warning is suppressible)", async () => {
+    // The #888 report: the sync's pre-scan read the wrong tree during the
+    // retarget window and threw "the pack is not present in custom_nodes",
+    // while the panel was in fact installed and compatible.
+    const h = makeDeps({ installedVersion: REQUIRED });
+    const r = await reassessPanelAfterSyncFailure({ deps: h.deps, ...RUN });
+    expect(r).not.toBeNull();
+    expect(r!.decision).toBe("meets-floor");
+    expect(r!.installedVersion).toBe(REQUIRED);
+    expect(r!.behind).toBe(false);
+    // No mutation was queued by the re-check — it is a pure read.
+    expect(h.updates).toBe(0);
+    expect(h.installs).toBe(0);
+  });
+
+  it("panel installed ABOVE the floor → meets-floor", async () => {
+    const h = makeDeps({ installedVersion: "99.0.0" });
+    const r = await reassessPanelAfterSyncFailure({ deps: h.deps, ...RUN });
+    expect(r!.decision).toBe("meets-floor");
+  });
+
+  it("panel genuinely BEHIND the floor → sync decision (the failure was real; keep the warning)", async () => {
+    const h = makeDeps({ installedVersion: "0.11.3" });
+    const r = await reassessPanelAfterSyncFailure({ deps: h.deps, ...RUN });
+    expect(r!.decision).toBe("sync");
+    expect(r!.behind).toBe(true);
+  });
+
+  it("panel genuinely ABSENT → sync decision with behind:true (keep the warning)", async () => {
+    const h = makeDeps({});
+    const r = await reassessPanelAfterSyncFailure({ deps: h.deps, ...RUN });
+    expect(r!.decision).toBe("sync");
+    expect(r!.behind).toBe(true);
+  });
+
+  it("installed version NOT comparable → unknown, never meets-floor (can't-tell keeps the warning)", async () => {
+    const h = makeDeps({ installedVersion: "nightly" });
+    const r = await reassessPanelAfterSyncFailure({ deps: h.deps, ...RUN });
+    expect(r!.decision).toBe("unknown");
+    expect(r!.decision).not.toBe("meets-floor");
+  });
+
+  it("the re-scan itself failing → null (a failed guard certifies nothing; the original warning stands)", async () => {
+    const h = makeDeps({ installedVersion: REQUIRED });
+    const deps: PanelInstallerDeps = {
+      ...h.deps,
+      comfyuiPath: () => {
+        throw new Error("base unresolvable");
+      },
+    };
+    const r = await reassessPanelAfterSyncFailure({ deps, ...RUN });
+    expect(r).toBeNull();
   });
 });

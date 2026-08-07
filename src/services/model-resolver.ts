@@ -153,7 +153,7 @@ export interface LocalModel {
  * COMFYUI_PATH / auto-detection (config.comfyuiPath); when that's unset and we're
  * NOT targeting a remote ComfyUI, falls back to the saved default workspace (set
  * via workspace action:"set_default") so local downloads and model lookups work without
- * COMFYUI_PATH — matching what get_environment / workspace action:"get" already report.
+ * COMFYUI_PATH — matching what install_comfyui (action:"environment") / workspace action:"get" already report.
  * Never falls back to a local workspace in remote mode (that dir isn't the remote
  * target). Returns undefined when no usable local path exists.
  */
@@ -464,7 +464,7 @@ export async function listLocalModels(
 
 /**
  * Best-effort: attach `triggerWords` + `baseModel` from each model's CivitAI
- * sidecar (`<file>.civitai.json`, written by download_civitai_model) so the
+ * sidecar (`<file>.civitai.json`, written by download_model action:"download_civitai") so the
  * agent applies the trigger words automatically when generating. Silent when a
  * sidecar is missing or there's no local filesystem (remote/cloud).
  */
@@ -610,6 +610,28 @@ const CORE_MODEL_EXTENSIONS = new Set([
   ".sft",
 ]);
 
+/**
+ * Model categories whose `/models/<category>` endpoint can NEVER enumerate FILES,
+ * so "the server does not list this file" is not evidence about the server at all.
+ * ComfyUI core registers `diffusers` with the extension contract `["folder"]`
+ * (folder_paths.py) — an extension no real file ever matches — so the listing is
+ * empty BY DESIGN: ComfyUI loads a diffusers model as a whole directory and never
+ * lists the component files inside one (`hunyuan3d-paint-v2-0-turbo/vae/diffusion_pytorch_model.bin`,
+ * `.../text_encoder/pytorch_model.bin`). Sampling those component files and
+ * finding them "missing" from the listing was the #844 false "a DIFFERENT install"
+ * refusal — the omission is CONTRACTUAL, not evidential.
+ * For these categories the listing is inconclusive about files in BOTH directions:
+ * absence proves nothing (the pre-write refusal) and a landed file's presence
+ * cannot be confirmed from it either (the post-write check) — both must report
+ * "unknown", never a determined negative.
+ */
+const CATEGORIES_WITHOUT_FILE_ENUMERATION = new Set(["diffusers"]);
+
+/** Is this category's live listing contractually incapable of naming FILES? */
+function categoryCannotEnumerateFiles(category: string): boolean {
+  return CATEGORIES_WITHOUT_FILE_ENUMERATION.has(category.trim().toLowerCase());
+}
+
 /** The models/ CATEGORY a target subfolder belongs to — its first path segment
  *  (`"loras/sdxl"` → `"loras"`), which is the folder name ComfyUI's `/models/<cat>`
  *  endpoint is keyed by. */
@@ -632,13 +654,17 @@ function subfolderRemainder(targetSubfolder: string): string {
  * COMFYUI_PATH, and the two disagreed silently.
  *
  * Returns `undefined` (INCONCLUSIVE — never an empty array) when the server is
- * unreachable, the endpoint is absent/errors, or the body is not a string array.
- * Callers must treat inconclusive as "no evidence", never as "no files".
+ * unreachable, the endpoint is absent/errors, the body is not a string array, OR
+ * the category's enumeration contract cannot name files at all
+ * (CATEGORIES_WITHOUT_FILE_ENUMERATION — there an answered-but-empty listing is
+ * the contract speaking, not the server's contents). Callers must treat
+ * inconclusive as "no evidence", never as "no files".
  */
 export async function liveCategoryListing(
   category: string,
 ): Promise<string[] | undefined> {
   if (!category) return undefined;
+  if (categoryCannotEnumerateFiles(category)) return undefined;
   try {
     const client = getClient();
     const res = await client.fetchApi(`/models/${encodeURIComponent(category)}`);
@@ -725,8 +751,10 @@ async function categoriesUnder(modelsRoot: string): Promise<string[]> {
  * the end of the body.
  *
  * Fails OPEN on anything inconclusive — server unreachable, endpoint missing, an
- * empty candidate directory, or full containment. It must never block a legitimate
- * download into a fresh or shared models tree.
+ * empty candidate directory, a category whose listing contractually cannot name
+ * files (`diffusers`, #844: its component files are absent from the listing by
+ * DESIGN, so their "absence" is not disagreement), or full containment. It must
+ * never block a legitimate download into a fresh or shared models tree.
  */
 async function assertDestinationVisibleToLiveServer(
   modelsRoot: string,
@@ -1016,7 +1044,7 @@ const LIVE_VISIBILITY_RETRY_MS = 1000;
  * Confirm, AFTER a download lands, that the bytes are (a) really on disk and
  * (b) somewhere the LIVE server reads from — then report the path we actually
  * confirmed. Reporting the INTENDED path is what made #369 a fabricated success:
- * `download_status` said "done … landed at <stale install>" while the running
+ * `download_model action:"status"` said "done … landed at <stale install>" while the running
  * ComfyUI could not see the file at all.
  *
  * Never throws: a completed transfer must not be turned into a failure by a
@@ -1086,7 +1114,19 @@ export async function verifyLandedModel(
   // codex gate, round 4); `undefined` means only local configuration could answer,
   // so a pre-existing listing entry proves nothing about OUR bytes.
   const landed = verifiedPath ?? resolve(targetPath);
-  const membership = await isUnderLiveModelRoots(landed, category);
+  // Membership is checked on the LEXICAL write path, not the realpath'd landed
+  // path: the server scans `<modelsRoot>/<category>` RECURSIVELY FOLLOWING LINKS
+  // (folder_paths.recursive_search walks with followlinks=True), so "this file
+  // sits at a path the server walks" is answered by the path as written. Checking
+  // the realpath instead called a file landed through an in-tree junction —
+  // `models/vae -> E:\StabilityMatrix\models\VAE` (#870), or a nested link like
+  // `models/vae/vendor -> ...` — "outside every directory the server reads", a
+  // false not-visible for a file the server demonstrably lists. The canonical
+  // forms inside still cover a junctioned ROOT (compared by where it really
+  // lives), and a host path that merely aliases a container-side root was already
+  // vouched lexically whenever no link was involved — this extends that existing,
+  // accepted exposure to linked paths rather than adding a new one.
+  const membership = await isUnderLiveModelRoots(resolve(targetPath), category);
   const destinationIsLiveAuthoritative = membership.inRoots === true;
   if (membership.inRoots === false) {
     const liveRoot = membership.liveRoot;
@@ -1117,6 +1157,26 @@ export async function verifyLandedModel(
   // live root cannot be pinned; it never refuses, never fails, and never lies.
   const ambiguous = !destinationIsLiveAuthoritative;
 
+  // A category whose listing contractually contains NO files (`diffusers`, #844)
+  // can neither confirm nor deny a landed FILE — its absence from the listing is
+  // the contract speaking, not the server. Without this branch the loop below
+  // would read that contractual absence as "the server does NOT list it" — the
+  // same could-not-determine → determined-not fold as the pre-write refusal,
+  // pointed at the user whose download just succeeded.
+  if (categoryCannotEnumerateFiles(category)) {
+    return {
+      verifiedPath,
+      liveVisible: "unknown",
+      note:
+        `The file IS on disk at ${verifiedPath}, but the connected ComfyUI ` +
+        `(${getComfyUIBaseUrl()}) cannot confirm it from its model listing: ComfyUI ` +
+        `never lists individual files under "${category}" (it loads a "${category}" ` +
+        "model as a whole directory, and the endpoint's listing is empty by design), " +
+        "so absence there is contractual, not a mismatch. Confirm the model's " +
+        "directory is complete on disk.",
+    };
+  }
+
   let sawListing = false;
   for (let i = 0; i < attempts; i++) {
     const listing = await liveCategoryListing(category);
@@ -1127,7 +1187,7 @@ export async function verifyLandedModel(
         // two separate observations; a ComfyUI restart onto a DIFFERENT install
         // between them would otherwise let the NEW server's own same-named model
         // confirm OUR file, which that server cannot read (codex gate, round 11).
-        const still = await isUnderLiveModelRoots(landed, category);
+        const still = await isUnderLiveModelRoots(resolve(targetPath), category);
         if (still.inRoots === false) {
           return {
             verifiedPath,
@@ -1288,12 +1348,11 @@ export async function resolveModelSubfolderWithLiveRoot(
 
 /**
  * Enforce that a local model download can ONLY land where the running ComfyUI
- * actually reads model WEIGHTS — never in a directory it imports Python from, and
- * never in an arbitrary location a symlink redirects to. Applied to the resolved
- * write target BEFORE any mkdir/write.
+ * actually reads model WEIGHTS — never in a directory it imports Python from.
+ * Applied to the resolved write target BEFORE any mkdir/write.
  *
- * Two canonical (realpath-collapsed) root sets are built from the running server's
- * OWN configuration so they match by real on-disk location regardless of mounts:
+ * The veto set is built from the running server's OWN configuration and canonical
+ * (realpath-collapsed) so it matches by real on-disk location regardless of mounts:
  *   • codeRoots (VETO, inclusive/over-veto) — the dirs ComfyUI IMPORTS PYTHON from
  *     (`custom_nodes`): each base-install dir's `custom_nodes` (from the base dirs
  *     the caller derived from the SAME /system_stats call), the models-root sibling,
@@ -1301,13 +1360,21 @@ export async function resolveModelSubfolderWithLiveRoot(
  *     must NEVER land inside one — that is arbitrary CODE execution, not a model
  *     install — so this is checked by RESOLVED REAL PATH, not category label, and
  *     it wins even when a model category also claims the same physical dir.
- *   • modelRoots (ALLOW, fail-closed) — the extra MODEL dirs the LIVE server
- *     authoritatively registers (getLiveExtraModelRoots). A symlink escaping the
- *     primary models root is permitted ONLY into one of these (the #633 case:
- *     `models/external_unet_download -> /Volumes/Render/00_AI/models/unet`). A
- *     STALE/STATIC config never authorizes an escape, and an unreachable server
- *     authorizes nothing (codex P0d) — so authorization is always anchored to what
- *     the running server really loads.
+ *
+ * A symlink/junction INSIDE the models tree may redirect the write anywhere that
+ * veto does not cover (#870 — this SUPERSEDES the #633-era "only a live-registered
+ * extra root authorizes an escape" rule, codex P0d). The redirect is a physical
+ * fixture of the user's own models directory — placed there by the user or their
+ * launcher — and ComfyUI's own scanner FOLLOWS directory symlinks
+ * (`folder_paths.recursive_search` walks with `followlinks=True`), so a write
+ * through one lands where the server actually reads. The earlier rule could never
+ * authorize the mainstream StabilityMatrix layout: it junctions each shared model
+ * folder (`models/vae` → `E:\comfy\StabilityMatrix\models\VAE`) and registers
+ * NOTHING — the junction IS the registration, so no live-root lookup can vouch
+ * for the target, and requiring one refused a correct install (a
+ * could-not-determine → determined-not fold, pointed at refusal). An exotic
+ * redirect that lands somewhere the server does not list is not hidden: the
+ * post-write check (verifyLandedModel) reports it honestly.
  *
  * Hardening invariants (codex P0a/P0b):
  *   - The PRIMARY models root itself is code-root-vetoed: if it canonicalizes into
@@ -1319,21 +1386,24 @@ export async function resolveModelSubfolderWithLiveRoot(
  *     as an absent segment (which would let a later recursive mkdir FOLLOW the link
  *     out of every root). Only a genuinely-absent segment (ENOENT/ENOTDIR from
  *     lstat) is safe to skip; any other lstat error fails closed.
+ *   - An escaping symlink whose REAL target falls under a code root is REJECTED —
+ *     the in-tree authorization above never extends to a directory ComfyUI imports
+ *     Python from.
  *
  * ACCEPTED RESIDUAL (P0c — TOCTOU): this is a pathname-time check. The Node runtime
  * has no `openat`/per-segment `O_NOFOLLOW` traversal, so a LOCAL process that can
  * replace an accepted directory/symlink AFTER this check but BEFORE the writer's
  * mkdir/rename could still redirect the write. This race is inherent to pathname
- * validation and pre-exists the #633 allowance (it affects any accepted path,
- * symlinked or not). It is ACCEPTED as a non-blocker: this runs on the user's OWN
- * single-user machine, so a concurrently-racing local process is out of scope
- * (maintainer ruling — "downloads should go where the user wants; it's their
- * computer"). We deliberately do NOT reject symlinked/external destinations to
- * defend against it — that would break the legitimate #633 external-drive use case.
+ * validation (it affects any accepted path, symlinked or not). It is ACCEPTED as a
+ * non-blocker: this runs on the user's OWN single-user machine, so a
+ * concurrently-racing local process is out of scope (maintainer ruling —
+ * "downloads should go where the user wants; it's their computer"). We deliberately
+ * do NOT reject symlinked/external destinations to defend against it — that would
+ * break the legitimate #633 external-drive and #870 StabilityMatrix use cases.
  * The refusals this guard DOES make are the ACCIDENTAL-corruption ones only: a
- * dangling/unresolvable escape (P0a), a write into a code dir / custom_nodes (P0b),
- * and an unauthorized/unresolvable root (P0d). Fully eliminating the race would
- * require trusted directory-handle traversal (native support) and is out of scope.
+ * dangling/unresolvable escape (P0a) and a write into a code dir / custom_nodes
+ * (P0b). Fully eliminating the race would require trusted directory-handle
+ * traversal (native support) and is out of scope.
  */
 async function assertNoEscapingSymlinkAncestor(
   root: string,
@@ -1345,10 +1415,11 @@ async function assertNoEscapingSymlinkAncestor(
    *  rather than re-fetched here so it can never disagree with the models dir a
    *  divergent --models-directory produced (fail-open race; #633 codex round 4). */
   baseInstallDirs: string[] = [],
-  /** The SAME /system_stats snapshot the models/base dirs came from — used to
-   *  AUTHORIZE an escaping symlink (getLiveExtraModelRoots), so authorization and
-   *  the code-root veto reflect ONE consistent server state (codex inter-snapshot
-   *  race). Default = unreachable → nothing is authorized (fail closed). */
+  /** The SAME /system_stats snapshot the models/base dirs came from — its live
+   *  extra roots feed the code-root VETO (a live-registered custom_nodes dir is
+   *  refused as a destination), so the veto reflects ONE consistent server state
+   *  (codex inter-snapshot race). Since #870 it no longer AUTHORIZES anything:
+   *  an in-tree symlink's redirect is authorized by its location, not by config. */
   liveSnapshot: LiveServerSnapshot = { reachable: false },
 ): Promise<void> {
   // Canonical root: if the models dir is itself a symlink/junction, resolve it so
@@ -1395,8 +1466,8 @@ async function assertNoEscapingSymlinkAncestor(
   const underAny = (real: string, roots: string[]): boolean =>
     roots.some((r) => real === r || real.startsWith(r + sep));
 
-  // Build the CODE roots (veto) and MODEL roots (allow) EAGERLY — the code veto must
-  // also cover the primary root (P0b), so it can't be deferred to an escape.
+  // Build the CODE roots (veto) EAGERLY — the code veto must also cover the
+  // primary root (P0b), so it can't be deferred to an escape.
   const baseDirSet = new Set<string>([
     dirname(realRoot),
     ...baseInstallDirs.map((b) => resolve(b)),
@@ -1416,11 +1487,13 @@ async function assertNoEscapingSymlinkAncestor(
   for (const er of staticExtra) {
     if (isCodeCategory(er.category)) codeRoots.push(await canon(er.dir));
   }
-  // LIVE, server-authoritative roots: the ONLY source that may AUTHORIZE an escape
-  // (fail-closed, P0d). Self-derived from the live /system_stats snapshot (the
-  // launched --extra-model-paths-config files + the live install's own
-  // extra_model_paths.yaml) — NEVER a stale local workspace config. Their
-  // custom_nodes also feed the veto.
+  // LIVE, server-authoritative roots contribute their custom_nodes to the VETO.
+  // Self-derived from the live /system_stats snapshot (the launched
+  // --extra-model-paths-config files + the live install's own extra_model_paths.yaml)
+  // — NEVER a stale local workspace config. They no longer form an ALLOW list
+  // (#870): an in-tree symlink redirect is authorized by sitting inside the user's
+  // own models tree, not by appearing in a server-declared root set (a
+  // StabilityMatrix junction target is declared nowhere).
   let live: Awaited<ReturnType<typeof getLiveExtraModelRoots>> = {
     authoritative: false,
     roots: [],
@@ -1433,17 +1506,8 @@ async function assertNoEscapingSymlinkAncestor(
   for (const er of live.roots) {
     if (isCodeCategory(er.category)) codeRoots.push(await canon(er.dir));
   }
-  const modelRoots: string[] = [];
-  if (live.authoritative) {
-    for (const er of live.roots) {
-      if (!isCodeCategory(er.category)) modelRoots.push(await canon(er.dir));
-    }
-  }
 
   const isUnderCode = (real: string): boolean => underAny(real, codeRoots);
-  const isAllowedReal = (real: string): boolean =>
-    (real === realRoot || real.startsWith(realRoot + sep) || underAny(real, modelRoots)) &&
-    !isUnderCode(real);
 
   // P0b: the PRIMARY models root must not itself resolve into a code directory
   // (e.g. `--models-directory <base>/custom_nodes`, or a models junction into
@@ -1488,9 +1552,17 @@ async function assertNoEscapingSymlinkAncestor(
           `Refusing to write through a symlink that cannot be resolved (dangling or circular): ${label}`,
         );
       }
-      if (!isAllowedReal(real)) {
+      // The segment is a symlink/junction INSIDE the models tree (every cursor in
+      // this walk is under the root by construction). Wherever it points, the
+      // redirect is a fixture of the user's own models directory and ComfyUI's
+      // scanner follows it (recursive_search walks with followlinks=True) — so the
+      // write stays where the server reads. This is the StabilityMatrix layout
+      // (#870): junctioned category folders whose targets no config declares. The
+      // ONLY remaining refusal is a landing inside a CODE root — a model download
+      // must never become a Python import.
+      if (isUnderCode(real)) {
         throw new ModelError(
-          `Refusing to write outside the models directory (a symlink in the path escapes every registered model root): ${label}`,
+          `Refusing to write through a symlink that resolves into a ComfyUI code directory (custom_nodes): ${label}`,
         );
       }
     }
@@ -1992,14 +2064,14 @@ export async function downloadModel(
    *  on that job (#467). Omitted by direct callers (no job to report to). */
   onResume?: ResumeReporter,
   /** Per-download abort signal, threaded from the job's AbortController into the
-   *  fetch + stream pipeline so cancel_download aborts exactly this transfer (#515).
+   *  fetch + stream pipeline so download_model action:"cancel" aborts exactly this transfer (#515).
    *  Omitted by direct callers (no cancellation handle). */
   signal?: AbortSignal,
   /** Reports the ACTUAL progress-tray id (a hash of the post-auth/post-HF-rewrite
    *  request URL) back to the job, so the job's trayId matches the id the streaming
    *  and done rows are written under. Without it a query-auth or HF_ENDPOINT-rewritten
    *  download's tray row is keyed differently from the job's original-URL trayId — so
-   *  download_status byte display AND cancel cleanup would target the wrong id. Called
+   *  download_model action:"status" byte display AND cancel cleanup would target the wrong id. Called
    *  only on the LOCAL streaming path (the Manager path writes no streaming rows). */
   onTrayId?: (trayId: string) => void,
   /** Fired the instant the completed, validated file is renamed into its destination

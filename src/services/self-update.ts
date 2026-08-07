@@ -18,9 +18,18 @@
 //     blocking or crashing the server.
 //   - we NEVER kill/restart the running MCP process; we only surface a
 //     "reconnect to load vX" note.
+//
+// WINDOWS (#912): an in-place npm replace of the running install fails every
+// time — this process holds its own sharp libvips DLL mapped, and Windows
+// refuses to move a mapped file (EBUSY). A failed npm on win32 is therefore
+// handed to a DETACHED helper (buildDeferredUpdateScript) that waits for the
+// lock to clear and finishes the install after this process has fully
+// stopped; the result is honestly reported as "scheduled", never "updated",
+// and npm's own error output travels in the note either way (#912/#916-a).
 
-import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
-import { execFile } from "node:child_process";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { execFile, spawn } from "node:child_process";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { logger } from "../utils/logger.js";
@@ -52,6 +61,7 @@ export type SelfUpdateAction =
   | "skipped-dev"
   | "skipped-disabled"
   | "notify"
+  | "scheduled"
   | "unavailable";
 
 export interface SelfUpdateResult {
@@ -59,6 +69,13 @@ export interface SelfUpdateResult {
   mode: InstallMode;
   from?: string;
   to?: string;
+  /**
+   * Machine-readable cause for a non-update, when one is known:
+   *   - "locked-by-running-process" — npm failed because THIS process holds its
+   *     own files open (Windows keeps sharp's libvips DLL mapped, #912).
+   *   - "npm-failed" — npm failed for some other reason (see `note` for the tail).
+   */
+  reason?: "locked-by-running-process" | "npm-failed";
   /** Human-facing note (reconnect instruction, reason, etc.). */
   note?: string;
 }
@@ -87,9 +104,24 @@ export interface SelfUpdateDeps {
   getLatestVersion: () => Promise<string | undefined>;
   /**
    * Run an `npm` command (args are fixed constants — no user input).
-   * Resolves { ok } and NEVER throws.
+   * Resolves and NEVER throws. stdout/stderr are captured so a failure can be
+   * DIAGNOSED (#912: an EBUSY from our own locked files is indistinguishable
+   * from a registry 404 when only `ok` survives).
    */
-  runNpm: (args: string[], cwd?: string) => Promise<{ ok: boolean }>;
+  runNpm: (
+    args: string[],
+    cwd?: string,
+  ) => Promise<{ ok: boolean; stdout?: string; stderr?: string }>;
+  /** Process platform — injectable so the Windows-only deferred path is testable. */
+  platform?: () => string;
+  /**
+   * #912: schedule the DETACHED helper that applies an npm update after this
+   * process has released its own files (Windows holds sharp's libvips DLL open
+   * while the orchestrator runs, so an in-place `npm i` of this package fails
+   * with EBUSY every time). Resolves true only when the helper was actually
+   * launched — callers must NOT claim "scheduled" on false. Never throws.
+   */
+  scheduleDeferredUpdate?: (opts: DeferredUpdateOpts) => Promise<boolean>;
 }
 
 function defaultPackageDir(): string {
@@ -112,7 +144,196 @@ async function defaultGetLatestVersion(): Promise<string | undefined> {
   }
 }
 
-function defaultRunNpm(args: string[], cwd?: string): Promise<{ ok: boolean }> {
+// ---------------------------------------------------------------------------
+// #912 — the deferred (post-exit) updater for Windows
+// ---------------------------------------------------------------------------
+
+/** What the detached helper needs to finish an update this process cannot. */
+export interface DeferredUpdateOpts {
+  mode: "global" | "local";
+  /** Local installs: the project root `npm i` must run in. */
+  projectRoot?: string;
+  /** Resolved package root — the helper probes THIS tree's sharp DLL lock. */
+  packageDir: string;
+  /** Version the helper should land (for the log line; it installs @latest). */
+  to: string;
+}
+
+/** Where the helper writes its log (named in user-facing notes). */
+const HELPER_LOG_NAME = "comfyui-mcp-self-update.log";
+/**
+ * Helper scripts are named UNIQUELY per launch (`…-<pid>-<ms>.ps1`): a shared
+ * fixed name let two orchestrators stat-miss the same path and each spawn a
+ * helper running the OTHER caller's freshly-overwritten script — for a local
+ * install that is `npm i` in the wrong project (codex gate r1).
+ */
+const HELPER_SCRIPT_RE = /^comfyui-mcp-self-update-.+\.ps1$/;
+
+/** Once per process: the auto-update tick must not pile up helpers. */
+let helperScheduledThisProcess = false;
+
+/**
+ * Per-wait budget inside the helper, and the staleness window for the dedupe
+ * below (a script younger than this is a helper still waiting/working — or one
+ * that died mid-wait, whose log says so — so a second helper is not stacked).
+ */
+const HELPER_WAIT_CAP_MINUTES = 120;
+const HELPER_ATTEMPTS = 3;
+const HELPER_STALE_MS = (HELPER_WAIT_CAP_MINUTES * HELPER_ATTEMPTS + 60) * 60_000;
+
+/** PowerShell single-quoted literal. */
+function psLiteral(s: string): string {
+  return `'${s.replace(/'/g, "''")}'`;
+}
+
+/**
+ * The helper script text (exported for tests — its PowerShell syntax is
+ * validated against a real powershell.exe in the test suite on Windows).
+ *
+ * The helper must outlive THIS process and only run npm once the files npm
+ * replaces are no longer locked — on Windows that is sharp's libvips-42.dll,
+ * mapped by every running orchestrator. So each attempt first waits (bounded)
+ * for the DLL to open with NO sharing; a quick respawn that re-locks it
+ * mid-install just sends the next attempt back to the wait. Every outcome is
+ * logged, and the script deletes itself on the way out (a helper killed by a
+ * shutdown leaves the script behind; the staleness window above is what lets a
+ * later run schedule a fresh one).
+ *
+ * All interpolated values are psLiteral-quoted constants of ours (paths, the
+ * package name) — nothing user-controlled reaches the script.
+ */
+export function buildDeferredUpdateScript(opts: DeferredUpdateOpts, logPath: string): string {
+  const dll = join(
+    opts.packageDir,
+    "node_modules",
+    "@img",
+    "sharp-win32-x64",
+    "lib",
+    "libvips-42.dll",
+  );
+  const npmArgs =
+    opts.mode === "global"
+      ? `i -g ${PACKAGE_NAME}@latest --no-audit --no-fund`
+      : `i ${PACKAGE_NAME}@latest --no-audit --no-fund`;
+  // Local installs run npm IN the project root — re-validated immediately before
+  // EVERY attempt: the helper can wait hours, and a project moved meanwhile must
+  // abort the helper, never let npm run in whatever directory it inherited
+  // (codex gate r1). Empty for global installs (npm -g has no cwd dependence).
+  const cwd = opts.mode === "local" && opts.projectRoot ? opts.projectRoot : "";
+  return [
+    `# comfyui-mcp deferred self-update helper (#912). Log: ${logPath}`,
+    `$ErrorActionPreference = 'Continue'`,
+    `$log = ${psLiteral(logPath)}`,
+    `$dll = ${psLiteral(dll)}`,
+    `$cwd = ${psLiteral(cwd)}`,
+    `function Wait-LockFree {`,
+    `  $deadline = (Get-Date).AddMinutes(${HELPER_WAIT_CAP_MINUTES})`,
+    `  while ((Get-Date) -lt $deadline) {`,
+    `    if (-not (Test-Path -LiteralPath $dll)) { return $true } # unexpected layout — let npm's own error say so`,
+    `    try {`,
+    `      $fs = [System.IO.File]::Open($dll, 'Open', 'ReadWrite', 'None')`,
+    `      $fs.Close()`,
+    `      return $true`,
+    `    } catch { Start-Sleep -Seconds 5 }`,
+    `  }`,
+    `  return $false`,
+    `}`,
+    `"$(Get-Date -Format o) helper started (mode=${opts.mode}, target=${opts.to})" | Out-File -Append -LiteralPath $log`,
+    `$ok = $false`,
+    `$aborted = ''`,
+    `for ($i = 0; $i -lt ${HELPER_ATTEMPTS} -and -not $ok -and -not $aborted; $i++) {`,
+    `  if (-not (Wait-LockFree)) {`,
+    `    $aborted = 'the sharp DLL stayed locked'`,
+    `  } elseif ($cwd -and -not (Test-Path -LiteralPath $cwd -PathType Container)) {`,
+    `    $aborted = "the project root $cwd no longer exists"`,
+    `  } elseif ($cwd) {`,
+    `    try { Set-Location -LiteralPath $cwd -ErrorAction Stop } catch {`,
+    `      $aborted = "could not enter the project root $cwd ($($_.Exception.Message))"`,
+    `    }`,
+    `  }`,
+    `  if ($aborted) { break }`,
+    `  & npm.cmd ${npmArgs} *>> $log`,
+    `  if ($LASTEXITCODE -eq 0) { $ok = $true } else { Start-Sleep -Seconds 10 }`,
+    `}`,
+    `if ($aborted) {`,
+    `  "$(Get-Date -Format o) ABORTED without running npm: $aborted" | Out-File -Append -LiteralPath $log`,
+    `} else {`,
+    `  "$(Get-Date -Format o) npm update $(if ($ok) { 'SUCCEEDED' } else { 'FAILED' })" | Out-File -Append -LiteralPath $log`,
+    `}`,
+    `Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue`,
+    ``,
+  ]
+    .filter((l) => l !== "")
+    .join("\r\n");
+}
+
+/**
+ * Launch the detached helper. Resolves true only when the script was written
+ * AND powershell actually spawned — a false here must surface as "not
+ * scheduled", never as a claimed scheduled update. Never throws.
+ *
+ * Dedupe: once per process (the auto-update tick), and cross-process by
+ * helper-script freshness — a script younger than the staleness window is a
+ * helper still waiting/working (or one that died mid-wait; its log says
+ * which), so a second is not stacked. Stale leftovers from killed helpers are
+ * our own artifacts and are cleaned up as they are found.
+ */
+async function defaultScheduleDeferredUpdate(opts: DeferredUpdateOpts): Promise<boolean> {
+  if (process.platform !== "win32") return false;
+  try {
+    const dir = tmpdir();
+    const logPath = join(dir, HELPER_LOG_NAME);
+    if (helperScheduledThisProcess) return true;
+    for (const name of readdirSync(dir)) {
+      if (!HELPER_SCRIPT_RE.test(name)) continue;
+      try {
+        const st = statSync(join(dir, name));
+        if (Date.now() - st.mtimeMs < HELPER_STALE_MS) return true; // already scheduled
+        unlinkSync(join(dir, name)); // stale leftover from a killed helper
+      } catch {
+        /* vanished between listing and stat — fine */
+      }
+    }
+    const scriptPath = join(dir, `comfyui-mcp-self-update-${process.pid}-${Date.now()}.ps1`);
+    writeFileSync(scriptPath, buildDeferredUpdateScript(opts, logPath), "utf-8");
+    const spawned = await new Promise<boolean>((resolveP) => {
+      const child = spawn(
+        "powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
+        { detached: true, stdio: "ignore", windowsHide: true },
+      );
+      child.once("error", () => resolveP(false));
+      child.once("spawn", () => {
+        child.unref();
+        resolveP(true);
+      });
+    });
+    // A spawn failure leaves the script behind; remove it so the dedupe scan
+    // does not read it as a pending helper.
+    if (!spawned) {
+      try {
+        unlinkSync(scriptPath);
+      } catch {
+        /* best effort */
+      }
+      return false;
+    }
+    helperScheduledThisProcess = true;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The log path the helper writes to — named in user-facing notes. */
+export function deferredUpdateLogPath(): string {
+  return join(tmpdir(), HELPER_LOG_NAME);
+}
+
+function defaultRunNpm(
+  args: string[],
+  cwd?: string,
+): Promise<{ ok: boolean; stdout?: string; stderr?: string }> {
   return new Promise((resolveP) => {
     // `npm` is a .cmd shim on Windows; execFile needs shell:true to run it.
     // SAFE: every arg is a hard-coded constant (no interpolation of user input),
@@ -124,7 +345,8 @@ function defaultRunNpm(args: string[], cwd?: string): Promise<{ ok: boolean }> {
         cmd,
         args,
         { cwd, timeout: NPM_TIMEOUT_MS, windowsHide: true, shell: isWin },
-        (err) => resolveP({ ok: !err }),
+        (err, stdout, stderr) =>
+          resolveP({ ok: !err, stdout: String(stdout ?? ""), stderr: String(stderr ?? "") }),
       );
       child.on("error", () => resolveP({ ok: false }));
     } catch {
@@ -154,6 +376,8 @@ export const defaultDeps: SelfUpdateDeps = {
   readFile: (p) => readFileSync(p, "utf-8"),
   getLatestVersion: defaultGetLatestVersion,
   runNpm: defaultRunNpm,
+  platform: () => process.platform,
+  scheduleDeferredUpdate: defaultScheduleDeferredUpdate,
 };
 
 // ---------------------------------------------------------------------------
@@ -359,6 +583,124 @@ function npmInstallArgs(mode: "global" | "local"): string[] {
   return [...base, "--no-audit", "--no-fund"];
 }
 
+/**
+ * The last few lines of npm's output, trimmed and capped so a tool result stays
+ * readable. stderr is preferred (npm writes its `npm error code …` block there);
+ * stdout is the fallback for a failure that logged nothing to stderr.
+ * DISPLAY ONLY — classification reads the FULL output (a lock error older than
+ * the last 8 lines must still classify, codex gate).
+ */
+function npmOutputTail(res: { stdout?: string; stderr?: string }): string {
+  const raw = String(res.stderr ?? "").trim() || String(res.stdout ?? "").trim();
+  if (!raw) return "";
+  const tail = raw.split(/\r?\n/).slice(-8).join("\n");
+  return tail.length > 1200 ? `…${tail.slice(-1200)}` : tail;
+}
+
+/** The manual-update command a remedy can name for this install mode. */
+function manualUpdateCommand(info: InstallInfo): string {
+  return info.mode === "local" ? `npm i ${PACKAGE_NAME}@latest` : `npm i -g ${PACKAGE_NAME}@latest`;
+}
+
+/** Where the command runs — only meaningful for a local project install. */
+function manualUpdateLocation(info: InstallInfo): string {
+  return info.mode === "local" && info.projectRoot ? ` in ${info.projectRoot}` : "";
+}
+
+/** npm's signature for "a file it must replace is held open by a process". */
+const NPM_LOCK_RE = /EBUSY|EPERM|resource busy or locked/i;
+
+/**
+ * Apply the npm update for a global/local install and classify the result
+ * (#912 / #916-a). A failure MUST carry why: npm's output tail goes into the
+ * note, and on Windows the deterministic EBUSY — this process holds its own
+ * sharp libvips DLL mapped, so npm cannot replace the package it is running
+ * from — is named as such and routed to the deferred post-exit helper. The
+ * helper is only offered as "scheduled" when it actually launched.
+ */
+async function applyNpmUpdate(
+  deps: SelfUpdateDeps,
+  info: InstallInfo & { mode: "global" | "local" },
+  latest: string,
+): Promise<SelfUpdateResult> {
+  const args = npmInstallArgs(info.mode);
+  const res = await deps.runNpm(args, info.mode === "local" ? info.projectRoot : undefined);
+  if (res.ok) {
+    return {
+      action: "updated",
+      mode: info.mode,
+      from: info.currentVersion,
+      to: latest,
+      note: `Updated ${PACKAGE_NAME} ${info.currentVersion} → ${latest}. ${RECONNECT_NOTE}`,
+    };
+  }
+
+  const tail = npmOutputTail(res);
+  // Classify on the FULL capture, not the display tail: the lock error can sit
+  // anywhere in npm's output (the tail is only the last few lines of stderr).
+  const locked = NPM_LOCK_RE.test(`${res.stderr ?? ""}\n${res.stdout ?? ""}`);
+  const isWin = (deps.platform?.() ?? process.platform) === "win32";
+  if (locked && isWin) {
+    // The lock is held by THIS process, so no in-process retry can succeed.
+    // The helper applies the update once the orchestrator has fully stopped;
+    // claim "scheduled" only when it genuinely launched.
+    const scheduled = deps.scheduleDeferredUpdate
+      ? await deps.scheduleDeferredUpdate({
+          mode: info.mode,
+          projectRoot: info.projectRoot,
+          packageDir: info.packageDir,
+          to: latest,
+        })
+      : false;
+    if (scheduled) {
+      return {
+        action: "scheduled",
+        mode: info.mode,
+        from: info.currentVersion,
+        to: latest,
+        reason: "locked-by-running-process",
+        note:
+          `npm could not install ${latest} in place: Windows keeps this running ` +
+          `orchestrator's own sharp libvips DLL locked, so the package cannot be ` +
+          `replaced while it runs. A detached helper was scheduled — it waits for ` +
+          `the lock to clear, then runs \`${manualUpdateCommand(info)}\`` +
+          `${manualUpdateLocation(info)} (log: ` +
+          `${deferredUpdateLogPath()}). The update lands once this orchestrator has ` +
+          `fully STOPPED — quit the MCP client or end the process; a /mcp reconnect ` +
+          `or auto-restart keeps an orchestrator holding the lock and the helper keeps ` +
+          `waiting — and takes effect at the next start. Staying on ` +
+          `${info.currentVersion} until then; verify with ` +
+          `install_comfyui (action:"self_update") using self_update_action:'status' after the next start.`,
+      };
+    }
+    return {
+      action: "unavailable",
+      mode: info.mode,
+      from: info.currentVersion,
+      to: latest,
+      reason: "locked-by-running-process",
+      note:
+        `npm update to ${latest} failed: files of the RUNNING orchestrator are locked ` +
+        `(Windows holds this process's own sharp libvips DLL open), and the deferred ` +
+        `update helper could not be started. Staying on ${info.currentVersion}. Quit ` +
+        `the orchestrator fully (a /mcp reconnect or auto-restart keeps a process ` +
+        `holding the lock), then run: ${manualUpdateCommand(info)}${manualUpdateLocation(info)}` +
+        (tail ? `\nnpm said:\n${tail}` : ""),
+    };
+  }
+
+  return {
+    action: "unavailable",
+    mode: info.mode,
+    from: info.currentVersion,
+    to: latest,
+    reason: locked ? "locked-by-running-process" : "npm-failed",
+    note:
+      `npm update to ${latest} failed; staying on ${info.currentVersion}.` +
+      (tail ? `\nnpm said:\n${tail}` : ""),
+  };
+}
+
 export interface SelfUpdateOptions {
   deps?: SelfUpdateDeps;
 }
@@ -410,24 +752,7 @@ async function checkInner(deps: SelfUpdateDeps): Promise<SelfUpdateResult> {
 
   // 5) Newer available. Only global/local can be safely self-replaced on disk.
   if (info.mode === "global" || info.mode === "local") {
-    const args = npmInstallArgs(info.mode);
-    const { ok } = await deps.runNpm(args, info.mode === "local" ? info.projectRoot : undefined);
-    if (!ok) {
-      return {
-        action: "unavailable",
-        mode: info.mode,
-        from: info.currentVersion,
-        to: latest,
-        note: `npm update to ${latest} failed; staying on ${info.currentVersion}.`,
-      };
-    }
-    return {
-      action: "updated",
-      mode: info.mode,
-      from: info.currentVersion,
-      to: latest,
-      note: `Updated ${PACKAGE_NAME} ${info.currentVersion} → ${latest}. ${RECONNECT_NOTE}`,
-    };
+    return applyNpmUpdate(deps, { ...info, mode: info.mode }, latest);
   }
 
   // 6) npx / unknown — can't safely self-replace; notify only.
@@ -517,7 +842,17 @@ export async function selfUpdateStatus(
   } else {
     note =
       `${latest} available (current ${info.currentVersion}). ` +
-      `Run self_update(action='update')${autoUpdateDisabled ? "" : " (or it auto-updates on start)"}. ${RECONNECT_NOTE}`;
+      `Run install_comfyui (action:"self_update") with self_update_action:'update'${autoUpdateDisabled ? "" : " (or it auto-updates on start)"}. ${RECONNECT_NOTE}`;
+    // #912: on Windows the running orchestrator holds its own sharp DLL open, so
+    // an in-place npm replace fails (EBUSY) — the update is applied by the
+    // deferred helper AFTER this process stops, not on a mere reconnect. Say so
+    // up front so nobody promises an in-place update this platform can't do.
+    if ((deps.platform?.() ?? process.platform) === "win32") {
+      note +=
+        " On Windows the running orchestrator keeps its own files locked, so the " +
+        "update is applied by a deferred helper once this orchestrator has fully " +
+        "stopped, and loads at the next start.";
+    }
   }
 
   return {
@@ -568,23 +903,7 @@ export async function runSelfUpdate(
     return { action: "up-to-date", mode: info.mode, from: info.currentVersion, to: latest };
   }
   if (info.mode === "global" || info.mode === "local") {
-    const args = npmInstallArgs(info.mode);
-    const { ok } = await deps.runNpm(args, info.mode === "local" ? info.projectRoot : undefined);
-    return ok
-      ? {
-          action: "updated",
-          mode: info.mode,
-          from: info.currentVersion,
-          to: latest,
-          note: `Updated ${PACKAGE_NAME} ${info.currentVersion} → ${latest}. ${RECONNECT_NOTE}`,
-        }
-      : {
-          action: "unavailable",
-          mode: info.mode,
-          from: info.currentVersion,
-          to: latest,
-          note: `npm update to ${latest} failed; staying on ${info.currentVersion}.`,
-        };
+    return applyNpmUpdate(deps, { ...info, mode: info.mode }, latest);
   }
   // npx / unknown
   return {

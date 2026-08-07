@@ -25,7 +25,8 @@ Deploy, start, stop, inspect and connect to RunPod cloud GPU pods, and switch re
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which RunPod operation to perform. "start", "stop", "status" and "connect" require `pod_id`; "create" takes the optional deploy parameters (name/gpu_type/cloud_type/connect/deadman); "list", "use_local" and "deploy_link" take no other parameters. "create" and "start" BILL; "stop" ends billing. Options: `create`, `start`, `stop`, `status`, `list`, `connect`, `use_local`, `deploy_link`.
+  Which RunPod operation to perform. "start", "stop", "status" and "connect" require `pod_id`; "create" takes the optional deploy parameters (name/gpu_type/cloud_type/connect/deadman); "list", "use_local" and "deploy_link" take no other parameters. "create" and "start" BILL; "stop" ends billing.
+  Options: `action:"create"`, `action:"start"`, `action:"stop"`, `action:"status"`, `action:"list"`, `action:"connect"`, `action:"use_local"`, `action:"deploy_link"`.
 </ParamField>
 <ParamField path="pod_id" type="string">
   The RunPod pod ID (from console.runpod.io, or action:"list"). REQUIRED for actions "start", "stop", "status" and "connect". Ignored by "create", "list", "use_local" and "deploy_link".
@@ -40,7 +41,8 @@ Deploy, start, stop, inspect and connect to RunPod cloud GPU pods, and switch re
   action:"create" — GPU type to prefer, e.g. "NVIDIA GeForce RTX 4090". Default tries: NVIDIA GeForce RTX 4090, NVIDIA RTX A6000, NVIDIA RTX PRO 4500 Blackwell, NVIDIA A40, NVIDIA RTX A5000.
 </ParamField>
 <ParamField path="cloud_type" type="enum">
-  action:"create" — COMMUNITY (cheaper, default) or SECURE. Options: `COMMUNITY`, `SECURE`.
+  action:"create" — COMMUNITY (cheaper, default) or SECURE.
+  Options: `COMMUNITY`, `SECURE`.
 </ParamField>
 <ParamField path="connect" type="boolean">
   action:"create" — auto-connect when booted: the ORCHESTRATOR waits for ComfyUI to answer (1-3min), then retargets + watches — this call returns immediately (default false: deploy only; connect later with action:"connect"). This is the create-time flag, NOT the action of the same name.
@@ -139,7 +141,8 @@ Watch a RunPod pod's live status in the control panel, stop watching it, or diag
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which watch operation to perform. "watch" and "troubleshoot" require `pod_id`; "unwatch" takes no other parameters (it clears whichever pod is currently watched). Options: `watch`, `unwatch`, `troubleshoot`.
+  Which watch operation to perform. "watch" and "troubleshoot" require `pod_id`; "unwatch" takes no other parameters (it clears whichever pod is currently watched).
+  Options: `action:"watch"`, `action:"unwatch"`, `action:"troubleshoot"`.
 </ParamField>
 <ParamField path="pod_id" type="string">
   The RunPod pod ID. REQUIRED for actions "watch" and "troubleshoot". Ignored by "unwatch", which clears the single currently watched pod.

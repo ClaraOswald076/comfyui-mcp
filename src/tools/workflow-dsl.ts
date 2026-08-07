@@ -1,10 +1,7 @@
-import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { workflowToDsl, dslToWorkflow } from "../services/workflow-dsl.js";
 import { isTypeCompatible, type SlotType } from "../services/slot-compat.js";
 import { getObjectInfo } from "../comfyui/client.js";
 import type { ObjectInfo, WorkflowJSON } from "../comfyui/types.js";
-import { errorToToolResult } from "../utils/errors.js";
 
 /** A connection input value: [sourceNodeId, outputIndex], where the source id exists in the graph. */
 function isConnection(value: unknown, workflow: WorkflowJSON): value is [string, number] {
@@ -87,44 +84,36 @@ export async function dslToWorkflowWithWarnings(
   return { workflow, warnings };
 }
 
-export function registerWorkflowDslTools(server: McpServer): void {
-  server.tool(
-    "workflow_to_dsl",
-    "Convert a ComfyUI API-format workflow into a compact, human/LLM-readable DSL — easier to read and edit than raw JSON, and round-trips losslessly back via dsl_to_workflow. Connections render as `key <- nodeId.outputIndex`, literals as `key = <JSON>`. (Experimental.)",
-    {
-      workflow: z
-        .record(z.string(), z.any())
-        .describe("ComfyUI workflow in API format (node ID -> {class_type, inputs})"),
-    },
-    async ({ workflow }) => {
-      try {
-        return { content: [{ type: "text" as const, text: workflowToDsl(workflow) }] };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
+/**
+ * `visualize_workflow (action:"to_dsl")` — the body of the retired JSON-to-DSL
+ * tool (0.50.0 slice 14). Same `workflowToDsl` call, same single-text content
+ * block.
+ */
+export function workflowToDslAction(workflow: WorkflowJSON): {
+  content: Array<{ type: "text"; text: string }>;
+} {
+  return { content: [{ type: "text" as const, text: workflowToDsl(workflow) }] };
+}
 
-  server.tool(
-    "dsl_to_workflow",
-    "Convert the compact workflow DSL (see workflow_to_dsl) back into executable ComfyUI API-format JSON. Useful for authoring/editing workflows in the legible DSL, then converting to run with enqueue_workflow. When ComfyUI is reachable, the result also carries advisory `warnings` (unknown class_type, output index out of range, type mismatches) — the conversion still succeeds regardless. (Experimental.)",
-    {
-      dsl: z.string().describe("Workflow DSL text"),
-    },
-    async ({ dsl }) => {
-      try {
-        const { workflow, warnings } = await dslToWorkflowWithWarnings(dsl);
-        const content = [{ type: "text" as const, text: JSON.stringify(workflow, null, 2) }];
-        if (warnings.length > 0) {
-          content.push({
-            type: "text" as const,
-            text: `Advisory wiring warnings (conversion still succeeded):\n${warnings.map((w) => `- ${w}`).join("\n")}`,
-          });
-        }
-        return { content };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
+/**
+ * `visualize_workflow (action:"from_dsl")` — the body of the retired
+ * DSL-to-JSON tool (0.50.0 slice 14). Same `dslToWorkflowWithWarnings` call,
+ * same JSON-first content block with the advisory-warnings block appended only
+ * when there are warnings.
+ *
+ * Both throw rather than returning `errorToToolResult`; the caller wraps every
+ * action in the identical catch, so failures render exactly as before.
+ */
+export async function dslToWorkflowAction(
+  dsl: string,
+): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+  const { workflow, warnings } = await dslToWorkflowWithWarnings(dsl);
+  const content = [{ type: "text" as const, text: JSON.stringify(workflow, null, 2) }];
+  if (warnings.length > 0) {
+    content.push({
+      type: "text" as const,
+      text: `Advisory wiring warnings (conversion still succeeded):\n${warnings.map((w) => `- ${w}`).join("\n")}`,
+    });
+  }
+  return { content };
 }

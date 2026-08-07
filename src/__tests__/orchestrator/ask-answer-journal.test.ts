@@ -1002,7 +1002,11 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     // and pushes it to whoever holds the tab, so a retired conversation's pick
     // must be counted there, not quoted. The durable LOG still gets everything —
     // two audiences, two buckets.
-    const exitAt2 = src.indexOf("AskAnswers.allOutstanding()");
+    // Anchor inside the EXIT-DISCLOSURE function: #884's boundary sweep and
+    // journal-flush helpers also call allOutstanding() earlier in the file.
+    const exitFnAt = src.indexOf("function reportLostCompletionsOnExit");
+    expect(exitFnAt, "exit-disclosure function not found").toBeGreaterThan(-1);
+    const exitAt2 = src.indexOf("AskAnswers.allOutstanding()", exitFnAt);
     expect(exitAt2, "exit disclosure not found").toBeGreaterThan(-1);
     const exitBlock = src.slice(exitAt2, exitAt2 + 900);
     expect(exitBlock, "the notice must gate content on the boundary").toContain(
@@ -1049,19 +1053,37 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     // Pairing the two journals structurally is what stops the next boundary from
     // being added to one and forgotten in the other — which is exactly how a late
     // answer reached a conversation that never asked the question, twice.
-    const pairs: Array<[RegExp, string]> = [
-      [/RunCompletions\.closeRuns\((\w+)\)/g, "AskAnswers.closeAsks($1)"],
-      [/RunCompletions\.forget\((\w+)\)/g, "AskAnswers.forget($1)"],
+    const pairs: Array<[RegExp, string, boolean]> = [
+      [/RunCompletions\.closeRuns\((\w+)\)/g, "AskAnswers.closeAsks($1)", true],
+      // #884 removed every forget() site: an unproven workflow transition no
+      // longer purges the journals, because the conversation is orchestrator-
+      // scoped and deliberately CONTINUES across a workflow switch (pending
+      // deliveries follow the socket via moveKey instead). The pairing rule
+      // still stands for any future forget() site — it just may be absent.
+      [/RunCompletions\.forget\((\w+)\)/g, "AskAnswers.forget($1)", false],
     ];
-    for (const [re, template] of pairs) {
+    for (const [re, template, required] of pairs) {
       const found = [...src.matchAll(re)];
-      expect(found.length, `no ${re.source} call sites found`).toBeGreaterThan(0);
+      if (required) {
+        expect(found.length, `no ${re.source} call sites found`).toBeGreaterThan(0);
+      }
       for (const m of found) {
         const arg = m[1];
         const want = template.replace("$1", arg);
         const near = src.slice(m.index!, m.index! + 900);
         expect(near, `${m[0]} is not paired with ${want}`).toContain(want);
       }
+    }
+    // …and the #884 boundary-follows-the-socket rule has the same two-journal
+    // pairing obligation: a moveKey in one journal must move the other too.
+    const moved = [...src.matchAll(/RunCompletions\.moveKey\((\w+), (\w+)\)/g)];
+    expect(moved.length, "no RunCompletions.moveKey call sites found").toBeGreaterThan(0);
+    for (const m of moved) {
+      const want = `AskAnswers.moveKey(${m[1]}, ${m[2]})`;
+      expect(
+        src.slice(m.index!, m.index! + 900),
+        `${m[0]} is not paired with ${want}`,
+      ).toContain(want);
     }
   });
 

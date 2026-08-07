@@ -164,7 +164,7 @@ export async function getJobStatus(promptId: string): Promise<CloudJobStatus> {
 
 export async function getObjectInfo(): Promise<ObjectInfo> {
   throw new ComfyUIError(
-    "get_node_info (object_info) is not available in Comfy Cloud mode.",
+    "create_workflow (action:\"node_info\"), which reads /object_info, is not available in Comfy Cloud mode.",
     "CLOUD_UNSUPPORTED",
   );
 }

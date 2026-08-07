@@ -70,7 +70,8 @@ reads the PNG header.
 
 The ladder climbs three bands — basics (tool discovery, single-call tasks),
 a gauntlet (async render with polling, exact parameters landing in the
-executed graph, a deliberate break-and-recover, provenance via `regenerate`),
+executed graph, a deliberate break-and-recover, provenance via a re-render
+with an override),
 and a crucible of raw graph composition no template covers. PASS is 2,
 PARTIAL is 1, FAIL is 0, max **20**; ties break on nudges, then tool rounds,
 then wall time — a model that nails a task first-try outranks one that flailed

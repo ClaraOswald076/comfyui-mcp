@@ -18,6 +18,7 @@
 import { execFile } from "node:child_process";
 import { logger } from "../utils/logger.js";
 import { lmstudioCliPath } from "../orchestrator/backend-readiness.js";
+import { isLoopbackServerUrl } from "./local-vram.js";
 
 export const DEFAULT_LMSTUDIO_HOST = "http://127.0.0.1:1234/v1";
 
@@ -29,7 +30,7 @@ function serverRoot(host: string): string {
 /** True when the host is this machine — we only manage LOCAL VRAM/lifecycle
  *  (never unload models on someone's remote LM Studio box). */
 export function isLocalLmstudio(host: string): boolean {
-  return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/i.test(host);
+  return isLoopbackServerUrl(host);
 }
 
 function lms(args: string[], timeoutMs = 20000): Promise<{ ok: boolean; out: string }> {

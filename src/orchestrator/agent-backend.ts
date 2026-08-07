@@ -140,7 +140,16 @@ export type AgentEvent = (
       costUsd?: number;
     }
   | { type: "rate_limit"; resetsAt?: number; kind?: string }
-  | { type: "error"; message: string }
+  | {
+      type: "error";
+      message: string;
+      /** The error is a "completed but UNVERIFIED" disclosure (#886): a result
+       *  arrived for a turn whose record was lost at a session restart. The
+       *  turn may have completed real work — it is NOT a failure and NOT a
+       *  verified success, so renderers must not frame it as either (no "turn
+       *  failed", no "nothing was lost — try again"). */
+      unverifiedCompletion?: boolean;
+    }
 ) & {
   /** Backend-minted TURN MARKER (#728): a monotonically increasing id (1 = the
    *  first turn read from the channel in this run) the backend stamps on every

@@ -24,6 +24,7 @@ const idle = (): QueueSnapshot => ({
   progressMax: null,
   lastCompleted: null,
   selfAttributed: false,
+  selfAttributedProven: false,
 });
 
 const running = (progress: number): QueueSnapshot => ({
@@ -36,6 +37,7 @@ const running = (progress: number): QueueSnapshot => ({
   progressMax: 20,
   lastCompleted: null,
   selfAttributed: false,
+  selfAttributedProven: false,
 });
 
 describe("buildQueueStatusFrame", () => {

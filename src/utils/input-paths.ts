@@ -20,7 +20,7 @@ export function assertSafeInputFilename(value: string, label = "image"): void {
   if (value.includes("/") || value.includes("\\")) {
     throw new ValidationError(
       `Invalid ${label} "${value}": must be a single filename in ComfyUI's input dir, ` +
-        "without path separators (upload it first with upload_image).",
+        "without path separators (upload it first with upload_image (action:\"image\")).",
     );
   }
   if (value === "." || value === ".." || value.includes("..")) {

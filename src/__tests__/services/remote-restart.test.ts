@@ -42,6 +42,19 @@ vi.mock("node:child_process", () => ({
   execFile: vi.fn(),
 }));
 
+// #871: no real WebSocket in tests — the witness stays open (the instance never
+// goes away), which keeps the pre-#871 behaviour these tests assert. The
+// dropped/unavailable-witness cases have their own suite
+// (restart-instance-identity.test.ts).
+vi.mock("../../services/instance-witness.js", () => ({
+  acquireInstanceWitness: vi.fn(async () => ({
+    url: "ws://remote.example:8188/ws",
+    alive: () => true,
+    closedAt: () => undefined,
+    close: () => {},
+  })),
+}));
+
 import {
   restartComfyUI,
   __processControlTestHooks,
@@ -181,7 +194,7 @@ describe("restartComfyUI — remote (Manager reboot)", () => {
     expect(res.message).toMatch(/reboot request was acknowledged/i);
     expect(res.message).toMatch(/NOT CONFIRMED YET/);
     expect(res.message).toMatch(/does NOT mean it failed/i);
-    expect(res.message).toMatch(/health_check/);
+    expect(res.message).toMatch(/get_system_stats \(action:"health"\)/);
     expect(res.message).toMatch(/COMFYUI_REMOTE_REBOOT_BUDGET_S/);
     expect(hoisted.resetClient).not.toHaveBeenCalled();
   });

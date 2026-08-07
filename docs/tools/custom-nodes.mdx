@@ -4,27 +4,38 @@ description: "Discover, install, update, snapshot, bisect, scaffold, and publish
 icon: "puzzle"
 ---
 
-<Info>22 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
+<Info>5 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
 <Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
 
 ## search_custom_nodes
 
-Search the public ComfyUI Registry (registry.comfy.org) for custom node packs by keyword. Read-only and network-only: queries the hosted registry over HTTP and does NOT require a running ComfyUI or COMFYUI_PATH. Returns a ranked list of packs with id, name, author, install count, and latest version. The keyword search ranks a fixed window of packs client-side, so when it matches nothing the query is also tried as an exact registry id automatically (e.g. 'comfyui kjnodes' → 'comfyui-kjnodes'). Use to discover packs to install; pass a returned id to get_node_pack_details for full info. This searches node PACKS, not models (use search_models) and not local installs (use list_local_models).
+Discover ComfyUI custom node PACKS in the public ComfyUI Registry (registry.comfy.org). Read-only and network-only: queries the hosted registry over HTTP and does NOT require a running ComfyUI or COMFYUI_PATH. This searches node PACKS, not models (use download_model action:"search") and not local installs (use list_local_models action:"list"). To actually install what you find, or to manage packs already installed, use install_custom_node. Driven by the `action` parameter:
+- action:"search" — Search by keyword; `query` required. Returns a ranked list of packs with id, name, author, install count, and latest version. The keyword search ranks a fixed window of packs client-side, so when it matches nothing the query is also tried as an exact registry id automatically (e.g. 'comfyui kjnodes' → 'comfyui-kjnodes'). Pass a returned id to action:"details" for full info, or to install_custom_node (action:"install").
+- action:"details" — Full details for ONE pack by its exact registry id: description, author, license, repository, install count, latest version, the node types it provides, and recent version changelogs. Look up the id via action:"search" first.
+
+<Tip>**In plain terms:** Finding a node pack in the public registry, before you install anything. Read-only and network-only — it does not need a running ComfyUI. Installing what you find is a different tool: `install_custom_node`.</Tip>
 
 ### Parameters
 
-<ParamField path="query" type="string" required>
-  Keyword(s) to match against pack name/description, e.g. 'impact', 'controlnet aux'
+<ParamField path="action" type="enum" required>
+  Which registry lookup to perform. "search" requires `query` (and takes optional `limit`/`page`); "details" requires `id`.
+  Options: `action:"search"`, `action:"details"`.
+</ParamField>
+<ParamField path="query" type="string">
+  action:"search" — REQUIRED. Keyword(s) to match against pack name/description, e.g. 'impact', 'controlnet aux'.
 </ParamField>
 <ParamField path="limit" type="integer">
-  Max results to return (default 10)
+  action:"search" — max results to return (default 10).
 </ParamField>
 <ParamField path="page" type="integer">
-  Page number for pagination (default 1)
+  action:"search" — page number for pagination (default 1).
+</ParamField>
+<ParamField path="id" type="string">
+  action:"details" — REQUIRED. Exact registry pack id (the 'id' field from action:"search"), e.g. 'comfyui-impact-pack'.
 </ParamField>
 
-### Example
+### Examples
 
 **You say:** Is there a node pack for face detailing?
 
@@ -32,6 +43,7 @@ Search the public ComfyUI Registry (registry.comfy.org) for custom node packs by
 {
   "tool": "search_custom_nodes",
   "arguments": {
+    "action": "search",
     "query": "face detailer",
     "limit": 5
   }
@@ -40,62 +52,68 @@ Search the public ComfyUI Registry (registry.comfy.org) for custom node packs by
 
 **You get back:** Matching packs from the registry with their ids, authors and descriptions. The id is what install_custom_node wants.
 
----
-
-## get_node_pack_details
-
-Get full details for one ComfyUI custom node pack from the public ComfyUI Registry: description, author, license, repository, install count, latest version, the node types it provides, and recent version changelogs. Read-only and network-only (hosted registry over HTTP); does not require a running ComfyUI. Look up the pack id via search_custom_nodes first.
-
-### Parameters
-
-<ParamField path="id" type="string" required>
-  Exact registry pack id (the 'id' field from search_custom_nodes), e.g. 'comfyui-impact-pack'
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** Tell me more about that Impact Pack before I install it.
 
 ```json
 {
-  "tool": "get_node_pack_details",
+  "tool": "search_custom_nodes",
   "arguments": {
-    "id": "<id>"
+    "action": "details",
+    "id": "comfyui-impact-pack"
   }
 }
 ```
+
+**You get back:** The pack's description, author, license, repository, install count, the node types it provides, and its recent version changelogs.
 
 ---
 
 ## install_custom_node
 
-Install a ComfyUI custom node pack by registry id, git URL, or name. Local installs prefer official comfy-cli when available; remote or CLI-unavailable installs use the ComfyUI-Manager HTTP API. A ComfyUI restart may be required. Targeting the comfyui-mcp sidebar panel pack ('comfyui-agent-panel' / 'comfyui-mcp-panel') is routed through the verified install_panel path (the version is re-read from disk afterwards) and is REFUSED while the panel is version-pinned.
+Install, repair, enable/disable and remove ComfyUI custom node packs on this ComfyUI. To FIND a pack in the public registry first, use search_custom_nodes. Driven by the `action` parameter:
+- action:"install" — Install a pack by registry id, git URL, or name. Local installs prefer official comfy-cli when available; remote or CLI-unavailable installs use the ComfyUI-Manager HTTP API. A ComfyUI restart may be required. Targeting the comfyui-mcp sidebar panel pack ('comfyui-agent-panel' / 'comfyui-mcp-panel') is routed through the verified install_comfyui(action:'panel') path (the version is re-read from disk afterwards) and is REFUSED while the panel is version-pinned.
+- action:"update" — Update an installed pack, or pass id:'all' to update every installed pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP. Targeting the sidebar panel pack is routed through the verified install_comfyui(action:'panel') path. While the panel is version-pinned, BOTH a direct panel target and 'all' are REFUSED — 'all' would move the pinned panel too; clear the pin with install_comfyui(action:'panel')(action='unpin') or update other packs individually.
+- action:"reinstall" — Reinstall a pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP. A ComfyUI restart may be required. A panel target is routed through the verified install_comfyui(action:'panel') path and is REFUSED while the panel is version-pinned.
+- action:"fix" — Repair a pack's install and Python dependencies, or pass id:'all' to repair every pack. Local operations prefer official comfy-cli; remote single-pack repairs use Manager HTTP. REFUSES the sidebar panel pack — 'fix' has no verified on-disk check, so use install_comfyui(action:'panel') for the panel — and refuses 'all' while the panel is version-pinned.
+- action:"uninstall" — Uninstall a pack (removes it). IRREVERSIBLE through this tool — for a cleanup audit prefer action:"disable", which is reversible. The pack must be one ComfyUI-Manager tracks: an id that resolves nowhere is REFUSED before anything is queued (a drained queue would otherwise read exactly like a success), and a pack that is on disk but unmanaged is named so you can remove its directory yourself. After the queue drains the installed-pack list is re-read and the pack must be GONE before anything claims 'uninstalled'. A ComfyUI restart is required to unload it fully. REFUSES the sidebar panel pack.
+- action:"disable" — Disable an installed pack WITHOUT removing it — the reversible first step of a cleanup (re-enable with action:"enable"; action:"uninstall" removes a pack outright). Uses the ComfyUI-Manager HTTP API (works against remote instances) or official comfy-cli locally, and re-reads the installed-pack list afterwards so a Manager no-op is reported as NOT disabled rather than as success. A ComfyUI restart is required for the change to take effect. REFUSES the sidebar panel pack.
+- action:"enable" — Re-enable a pack previously disabled with action:"disable". Same Manager/comfy-cli mechanics and the same post-op re-read, so a Manager no-op is reported as NOT enabled rather than as success. A ComfyUI restart is required for the change to take effect. REFUSES the sidebar panel pack.
+- action:"list" — List installed packs with their version and enabled/disabled state. Uses the ComfyUI-Manager HTTP API (works against remote instances); the cm-cli fallback returns names only. Read-only.
+- action:"sync_deps" — Reconcile the Python dependencies of ALL installed packs through official `comfy node restore-dependencies`. Requires a local ComfyUI install and comfy-cli; takes no other parameters.
+
+<Tip>**In plain terms:** Everything you do to someone ELSE'S node pack once you have found it: install it, keep it working, turn it off, remove it. One tool for the whole pack lifecycle, chosen with `action`. FINDING a pack is `search_custom_nodes`; writing your own is `node_pack`.</Tip>
 
 ### Parameters
 
-<ParamField path="id" type="string" required>
-  Registry id, git URL, or node-pack name to install.
+<ParamField path="action" type="enum" required>
+  Which custom-node operation to perform. "install", "update", "reinstall", "fix", "uninstall", "enable" and "disable" require `id`; "list" and "sync_deps" take no required parameters.
+  Options: `action:"install"`, `action:"update"`, `action:"reinstall"`, `action:"fix"`, `action:"uninstall"`, `action:"enable"`, `action:"disable"`, `action:"list"`, `action:"sync_deps"`.
+</ParamField>
+<ParamField path="id" type="string">
+  The pack to act on. REQUIRED for actions "install", "update", "reinstall", "fix", "uninstall", "enable" and "disable". For "install" this is a registry id, git URL, or node-pack name (find one with search_custom_nodes); for "update"/"fix" it may also be 'all' (every installed pack); for "update"/"reinstall"/"fix"/"uninstall"/"enable"/"disable" it is a registry id / module name of an INSTALLED pack.
 </ParamField>
 <ParamField path="source" type="enum">
-  How to interpret `id` (default 'auto', which detects git URLs vs registry ids). Options: `registry`, `git`, `auto`.
+  action:"install" — how to interpret `id` (default 'auto', which detects git URLs vs registry ids).
+  Options: `registry`, `git`, `auto`.
 </ParamField>
 <ParamField path="version" type="string">
-  Version to install (e.g. 'latest', 'nightly', or a semver). For git installs, this is treated as a git ref unless `ref` is also provided. Registry installs default to 'latest'.
+  Version to install. action:"install" — e.g. 'latest', 'nightly', or a semver; for git installs this is treated as a git ref unless `ref` is also provided, and registry installs default to 'latest'. action:"reinstall" — version to reinstall (default 'latest').
 </ParamField>
 <ParamField path="ref" type="string">
-  Git ref (commit SHA, branch, or tag) to pin when installing a git URL. Overrides any ref parsed from the URL and any `version` value. Ignored for registry-id installs.
+  action:"install" — git ref (commit SHA, branch, or tag) to pin when installing a git URL. Overrides any ref parsed from the URL and any `version` value. Ignored for registry-id installs.
 </ParamField>
 <ParamField path="mode" type="enum">
-  ComfyUI-Manager data source mode (default 'remote'): 'remote' fetches the live node list, 'local'/'cache' use bundled/cached data. Options: `remote`, `local`, `cache`.
+  Two distinct meanings, one per action group. For actions "install"/"update"/"reinstall"/"fix": the ComfyUI-Manager data source (default 'remote'); 'remote' fetches the live node list, 'local'/'cache' use bundled/cached data. For action:"list": 'default' lists all installed packs, 'imported' lists only those successfully imported this session. Passing a value from the wrong group is refused, naming the ones the action accepts.
+  Options: `remote`, `local`, `cache`, `default`, `imported`.
 </ParamField>
 <ParamField path="channel" type="string">
   ComfyUI-Manager channel name (default 'default').
 </ParamField>
 <ParamField path="useCmCli" type="boolean">
-  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
+  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for actions "install"/"disable"/"enable"/"uninstall", an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); "update"/"reinstall"/"fix"/"list" do not fall back.
 </ParamField>
 
-### Example
+### Examples
 
 **You say:** Install the Impact Pack.
 
@@ -103,6 +121,7 @@ Install a ComfyUI custom node pack by registry id, git URL, or name. Local insta
 {
   "tool": "install_custom_node",
   "arguments": {
+    "action": "install",
     "id": "comfyui-impact-pack"
   }
 }
@@ -112,239 +131,282 @@ Install a ComfyUI custom node pack by registry id, git URL, or name. Local insta
 
 <Warning>A custom node pack is third-party code that runs inside your ComfyUI. Install packs you have reason to trust, the same as any other plugin.</Warning>
 
----
-
-## update_custom_node
-
-Update an installed ComfyUI custom node pack, or pass 'all' to update every installed pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP. Targeting the comfyui-mcp sidebar panel pack ('comfyui-agent-panel' / 'comfyui-mcp-panel') is routed through the verified install_panel path (the version is re-read from disk afterwards). While the panel is version-pinned, BOTH a direct panel target and 'all' are REFUSED — 'all' would move the pinned panel too; clear the pin with install_panel(action='unpin') or update other packs individually.
-
-### Parameters
-
-<ParamField path="id" type="string" required>
-  Registry id / module name to update, or 'all' for every pack.
-</ParamField>
-<ParamField path="mode" type="enum">
-  ComfyUI-Manager data source mode (default 'remote'): 'remote' fetches the live node list, 'local'/'cache' use bundled/cached data. Options: `remote`, `local`, `cache`.
-</ParamField>
-<ParamField path="channel" type="string">
-  ComfyUI-Manager channel name (default 'default').
-</ParamField>
-<ParamField path="useCmCli" type="boolean">
-  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** What node packs have I got installed?
 
 ```json
 {
-  "tool": "update_custom_node",
+  "tool": "install_custom_node",
   "arguments": {
-    "id": "<id>"
+    "action": "list"
   }
 }
 ```
 
----
+**You get back:** Every installed pack with its version and whether it is enabled or disabled. Read-only.
 
-## reinstall_custom_node
-
-Reinstall a ComfyUI custom node pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP. A ComfyUI restart may be required. Targeting the comfyui-mcp sidebar panel pack ('comfyui-agent-panel' / 'comfyui-mcp-panel') is routed through the verified install_panel path (the version is re-read from disk afterwards) and is REFUSED while the panel is version-pinned.
-
-### Parameters
-
-<ParamField path="id" type="string" required>
-  Registry id / module name to reinstall.
-</ParamField>
-<ParamField path="version" type="string">
-  Version to reinstall (default 'latest').
-</ParamField>
-<ParamField path="mode" type="enum">
-  ComfyUI-Manager data source mode (default 'remote'): 'remote' fetches the live node list, 'local'/'cache' use bundled/cached data. Options: `remote`, `local`, `cache`.
-</ParamField>
-<ParamField path="channel" type="string">
-  ComfyUI-Manager channel name (default 'default').
-</ParamField>
-<ParamField path="useCmCli" type="boolean">
-  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** That pack has been broken since the last update — repair it.
 
 ```json
 {
-  "tool": "reinstall_custom_node",
+  "tool": "install_custom_node",
   "arguments": {
-    "id": "<id>"
+    "action": "fix",
+    "id": "comfyui-impact-pack"
   }
 }
 ```
 
----
+**You get back:** What the repair did to the pack's install and Python dependencies. A restart is usually needed before the result is visible.
 
-## fix_custom_node
+<Warning>Repairing re-runs the pack's own install step, which is third-party code. Pass id "all" only if you mean every installed pack.</Warning>
 
-Repair a ComfyUI custom node pack's install and Python dependencies, or pass 'all' to repair every pack. Local operations prefer official comfy-cli; remote single-pack repairs use Manager HTTP. REFUSES the comfyui-mcp sidebar panel pack — 'fix' has no verified on-disk check, so use install_panel for the panel — and refuses 'all' while the panel is version-pinned.
-
-### Parameters
-
-<ParamField path="id" type="string" required>
-  Registry id / module name to repair, or 'all' for every pack.
-</ParamField>
-<ParamField path="mode" type="enum">
-  ComfyUI-Manager data source mode (default 'remote'): 'remote' fetches the live node list, 'local'/'cache' use bundled/cached data. Options: `remote`, `local`, `cache`.
-</ParamField>
-<ParamField path="channel" type="string">
-  ComfyUI-Manager channel name (default 'default').
-</ParamField>
-<ParamField path="useCmCli" type="boolean">
-  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** Turn that pack off but don't delete it — I want to see if it's the culprit.
 
 ```json
 {
-  "tool": "fix_custom_node",
+  "tool": "install_custom_node",
   "arguments": {
-    "id": "<id>"
+    "action": "disable",
+    "id": "comfyui-impact-pack"
   }
 }
 ```
 
----
+**You get back:** Confirmation, re-read from the installed-pack list so a Manager no-op is reported as NOT disabled rather than as success. Restart ComfyUI for it to take effect; action "enable" puts it back.
 
-## disable_custom_node
-
-Disable an installed ComfyUI custom node pack WITHOUT removing it — the reversible first step of a cleanup (re-enable with enable_custom_node; uninstall_custom_node removes a pack outright). Uses the ComfyUI-Manager HTTP API (works against remote instances) or official comfy-cli locally, and re-reads the installed-pack list afterwards so a Manager no-op is reported as NOT disabled rather than as success. A ComfyUI restart is required for the change to take effect. REFUSES the comfyui-mcp sidebar panel pack.
-
-### Parameters
-
-<ParamField path="id" type="string" required>
-  Registry id / module name of the installed pack to disable.
-</ParamField>
-<ParamField path="useCmCli" type="boolean">
-  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** Get rid of that pack for good.
 
 ```json
 {
-  "tool": "disable_custom_node",
+  "tool": "install_custom_node",
   "arguments": {
-    "id": "<id>"
+    "action": "uninstall",
+    "id": "comfyui-impact-pack"
   }
 }
 ```
 
+**You get back:** Confirmation, but only after the installed-pack list is re-read and the pack is provably GONE. An id that resolves nowhere is refused before anything is queued.
+
+<Warning>This REMOVES the pack and is irreversible through this tool — any workflow using its nodes will go red. For a cleanup audit use action "disable" first, which is reversible.</Warning>
+
 ---
 
-## enable_custom_node
+## node_pack
 
-Re-enable a ComfyUI custom node pack previously disabled with disable_custom_node. Uses the ComfyUI-Manager HTTP API (works against remote instances) or official comfy-cli locally, and re-reads the installed-pack list afterwards so a Manager no-op is reported as NOT enabled rather than as success. A ComfyUI restart is required for the change to take effect. REFUSES the comfyui-mcp sidebar panel pack.
+Author, edit, test and publish YOUR OWN ComfyUI custom-node pack under &lt;COMFYUI_PATH&gt;/custom_nodes/. LOCAL-ONLY: it acts on the local filesystem and is meaningless for a remote --comfyui-url target. Every file-touching action (list_files, read, search, write, patch, git) is jailed to custom_nodes/ and needs COMFYUI_PATH; the one exception is action:"publish", which also accepts an explicit `path` to a pack directory ANYWHERE on this machine and therefore works without COMFYUI_PATH. To INSTALL or update someone else's pack use install_custom_node instead. Driven by the `action` parameter:
+- action:"scaffold" — Generate a new pack from a template into &lt;COMFYUI_PATH&gt;/custom_nodes/&lt;name&gt;/. Writes pyproject.toml (with the [tool.comfy] PublisherId/DisplayName/Icon table the Comfy Registry requires), __init__.py exporting NODE_CLASS_MAPPINGS / NODE_DISPLAY_NAME_MAPPINGS, and src/nodes.py containing a runnable sample node (INPUT_TYPES/RETURN_TYPES/FUNCTION/CATEGORY), plus .comfyignore and .gitignore. Optionally emits a web/js frontend stub (wiring WEB_DIRECTORY) and a GitHub Actions publish workflow (with_ci). This is the FIRST step of the author loop: scaffold here, then restart_comfyui to load it, test it, and finally action:"publish". Names must be a safe lowercase slug and cannot escape custom_nodes/; an existing non-empty directory is left untouched unless overwrite is true. Requires `name` and `display_name`.
+- action:"verify" — Test that a pack actually LOADS in ComfyUI — the middle step of the author loop. Restarts the local ComfyUI and waits for it to become ready, then checks that the pack's node class_types appear in /object_info. A node that fails to import (a missing dependency or a syntax error) simply never registers, so any missing class_types pinpoint a broken pack. Provide `class_types` explicitly, or a pack `name` whose __init__.py declares NODE_CLASS_MAPPINGS (the keys are inferred). Needs a managed local ComfyUI. Set restart:false to check the already-running server without restarting it.
+- action:"publish" — Publish a local pack to the public Comfy Registry (registry.comfy.org) by running `comfy node publish` inside the pack directory. First validates the pack's pyproject.toml has the required [project].name, [project].version and [tool.comfy].PublisherId (refusing the scaffold placeholder), then publishes using the API key from the REGISTRY_ACCESS_TOKEN environment variable (passed to comfy-cli via the environment, never via logged arguments). This is the LAST step of the author loop and an IRREVERSIBLE, EXTERNAL action: it creates/updates a PUBLIC registry version that this tool cannot undo. Requires comfy-cli installed and REGISTRY_ACCESS_TOKEN set. Give `name` (a folder under custom_nodes/) or `path` (an explicit pack directory).
+- action:"list_files" — List the files in one installed pack under custom_nodes/&lt;pack&gt;/ (read-only). Skips .git/, __pycache__/ and node_modules/. Use this to orient before action:"read" / action:"search" when diagnosing or editing a pack you found via bisect or install_custom_node (action:"fix"). Requires `pack`.
+- action:"read" — Read a slice of ONE file inside a pack (read-only), with bounded output so a huge file can't flood the context. Returns the requested line range with a truncation notice when clipped; long lines are chunked. Pair with action:"search" to locate the line, then action:"patch" or action:"write" to change it. Requires `path`.
+- action:"search" — Regex-search custom-node source under custom_nodes/ (read-only). Uses ripgrep when it's on PATH, otherwise a bounded built-in scanner (skips dot-dirs, __pycache__/node_modules, binary and &gt;1 MiB files). Returns file/line/text matches with per-line and result caps. Use this to find where a node class, import, or error string lives before reading or patching. Requires `query`.
+- action:"write" — Create or overwrite ONE file inside a pack. Refuses to clobber an existing file unless overwrite is true, and creates parent directories by default. Use for whole-file edits or new files; for surgical edits prefer action:"patch". After writing, run action:"verify" and restart_comfyui to load the change. Requires `path` and `content`.
+- action:"patch" — Apply a unified diff to custom-node source under custom_nodes/. Every touched path is jail-checked BEFORE any git call, then the patch is validated with `git apply --check` and only applied if the check passes (two-phase; never uses --unsafe-paths). Paths are relative to custom_nodes/ and may carry a/ b/ prefixes; works on non-repo packs too. Ideal for surgical edits located via action:"search". Requires `patch`.
+- action:"git" — Run a git operation inside one pack, selected by `git_action` (status/diff/log/commit/push). Reads (status/diff/log) are always allowed. Writes (commit/push) require the environment flag COMFYUI_MCP_ALLOW_GIT_WRITES=1 (default OFF) and otherwise return a structured DISABLED_BY_CONFIG refusal so you can self-correct. commit requires a `message` and stages either the given `paths` or all pack changes. This is the final step of the author loop after scaffold → write/patch → verify → restart_comfyui, before action:"publish". Requires `pack` and `git_action`.
+
+<Tip>**In plain terms:** The loop for authoring YOUR OWN node pack: scaffold it, read and edit its source, check it actually loads, commit it, publish it. Everything is local and jailed to `custom_nodes/`. Installing someone else's pack is `install_custom_node`.</Tip>
 
 ### Parameters
 
-<ParamField path="id" type="string" required>
-  Registry id / module name of the installed pack to enable.
+<ParamField path="action" type="enum" required>
+  Which node-pack operation to perform. "scaffold" requires `name` + `display_name`; "list_files" requires `pack`; "read" requires `path`; "search" requires `query`; "write" requires `path` + `content`; "patch" requires `patch`; "git" requires `pack` + `git_action`. "verify" and "publish" have no required parameters — "verify" resolves the pack from `name` (or checks `class_types` directly), "publish" from `name` or `path`.
+  Options: `action:"scaffold"`, `action:"verify"`, `action:"publish"`, `action:"list_files"`, `action:"read"`, `action:"search"`, `action:"write"`, `action:"patch"`, `action:"git"`.
 </ParamField>
-<ParamField path="useCmCli" type="boolean">
-  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
+<ParamField path="name" type="string">
+  Pack folder name under &lt;COMFYUI_PATH&gt;/custom_nodes/. REQUIRED for action:"scaffold" — a safe lowercase slug (letters, digits, hyphens, underscores), e.g. 'my-cool-nodes', which becomes the directory under custom_nodes/ and the pyproject [project].name. For action:"verify", the pack whose __init__.py NODE_CLASS_MAPPINGS keys are inferred and checked when `class_types` is omitted. For action:"publish", the pack folder to publish (give this or `path`).
+</ParamField>
+<ParamField path="display_name" type="string">
+  action:"scaffold" — REQUIRED. Human-readable name shown in the ComfyUI node menu and the registry listing.
+</ParamField>
+<ParamField path="category" type="string">
+  action:"scaffold" — node menu category for the sample node (default 'custom').
+</ParamField>
+<ParamField path="description" type="string">
+  action:"scaffold" — short description written to pyproject [project].description.
+</ParamField>
+<ParamField path="publisher_id" type="string">
+  action:"scaffold" — your Comfy Registry publisher id, stamped into [tool.comfy].PublisherId. If omitted a placeholder is written that you must replace before publishing.
+</ParamField>
+<ParamField path="with_frontend" type="boolean">
+  action:"scaffold" — if true, also generate a web/js/&lt;name&gt;.js extension stub and set WEB_DIRECTORY (default false).
+</ParamField>
+<ParamField path="with_ci" type="boolean">
+  action:"scaffold" — if true, also generate .github/workflows/publish_action.yml (Comfy-Org/publish-node-action; needs the REGISTRY_ACCESS_TOKEN repo secret) so pushing a pyproject.toml version bump auto-publishes (default false).
+</ParamField>
+<ParamField path="overwrite" type="boolean">
+  action:"scaffold" — overwrite template files in an existing pack directory instead of refusing (default false). action:"write" — overwrite an existing file instead of refusing (default false).
+</ParamField>
+<ParamField path="class_types" type="string[]">
+  action:"verify" — explicit NODE_CLASS_MAPPINGS keys to confirm are registered in /object_info. Takes precedence over inferring from `name`.
+</ParamField>
+<ParamField path="restart" type="boolean">
+  action:"verify" — restart ComfyUI before checking so newly-added packs load (default true). Set false to check the live server as-is.
+</ParamField>
+<ParamField path="pack" type="string">
+  Pack folder name under custom_nodes/ (e.g. 'ComfyUI-Manager'). REQUIRED for action:"list_files" and action:"git".
+</ParamField>
+<ParamField path="path" type="string">
+  REQUIRED for action:"read" and action:"write": a pack-relative path under custom_nodes/, e.g. 'MyPack/nodes.py'. For action:"search", the pack-relative directory to search, or '.' for all packs (default '.'). For action:"publish" ONLY, this is instead an explicit absolute path to the pack directory to publish, and it overrides `name` when both are given.
+</ParamField>
+<ParamField path="content" type="string">
+  action:"write" — REQUIRED. Full file contents to write.
+</ParamField>
+<ParamField path="create_dirs" type="boolean">
+  action:"write" — create missing parent directories (default true).
+</ParamField>
+<ParamField path="patch" type="string">
+  action:"patch" — REQUIRED. A unified diff. File headers (---/+++) are read to determine touched paths, which must resolve inside custom_nodes/ (e.g. 'a/MyPack/nodes.py').
+</ParamField>
+<ParamField path="query" type="string">
+  action:"search" — REQUIRED. Regular expression to search for.
+</ParamField>
+<ParamField path="glob" type="string">
+  action:"list_files" — optional glob to filter entries (supports *, **, ?), matched against pack-relative paths. action:"search" — optional glob to restrict which files are searched (e.g. '**/*.py').
+</ParamField>
+<ParamField path="max_entries" type="integer">
+  action:"list_files" — maximum entries to return (default 500, max 2000 — a hard clamp). The walk STOPS at this many, so a capped result is not the pack's full file list.
+</ParamField>
+<ParamField path="start_line" type="integer">
+  action:"read" — 1-based line to start at (default 1).
+</ParamField>
+<ParamField path="line_count" type="integer">
+  action:"read" — number of lines to return (default 240, max 800).
+</ParamField>
+<ParamField path="max_chars" type="integer">
+  action:"read" — maximum characters to return (default 12000, min 500, max 24000 — hard clamps; values outside are silently pulled into range). action:"git" — maximum characters of git output to return (default 12000, min 500, max 24000 — hard clamps the runtime applies; values outside are silently pulled into range).
+</ParamField>
+<ParamField path="max_results" type="integer">
+  action:"search" — maximum matches to return (default 50, max 100). The scan STOPS at this many, so a capped result is not a complete match set.
+</ParamField>
+<ParamField path="case_sensitive" type="boolean">
+  action:"search" — match case-sensitively (default false).
+</ParamField>
+<ParamField path="git_action" type="enum">
+  action:"git" — REQUIRED. Which git operation to run: status/diff/log are read-only; commit/push require COMFYUI_MCP_ALLOW_GIT_WRITES=1. Named `git_action` rather than `action` only because `action` is this tool's dispatch field; the git operation itself is unchanged.
+  Options: `status`, `diff`, `log`, `commit`, `push`.
+</ParamField>
+<ParamField path="message" type="string">
+  action:"git" — commit message (required for git_action 'commit').
+</ParamField>
+<ParamField path="paths" type="string[]">
+  action:"git" — pack-relative paths to stage/scope (jail-checked). Defaults to all pack changes.
 </ParamField>
 
-### Example
+### Examples
 
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** Start me a new node pack called my-cool-nodes.
 
 ```json
 {
-  "tool": "enable_custom_node",
+  "tool": "node_pack",
   "arguments": {
-    "id": "<id>"
+    "action": "scaffold",
+    "name": "my-cool-nodes",
+    "display_name": "My Cool Nodes"
   }
 }
 ```
 
----
+**You get back:** The files it wrote under custom_nodes/my-cool-nodes/ — pyproject.toml, __init__.py and a runnable sample node. Restart ComfyUI to load it.
 
-## uninstall_custom_node
-
-Uninstall a ComfyUI custom node pack (removes it). IRREVERSIBLE through this tool — for a cleanup audit prefer disable_custom_node, which is reversible. The pack must be one ComfyUI-Manager tracks: an id that resolves nowhere is REFUSED before anything is queued (a drained queue would otherwise read exactly like a success), and a pack that is on disk but unmanaged is named so you can remove its directory yourself. After the queue drains the installed-pack list is re-read and the pack must be GONE before anything claims 'uninstalled'. A ComfyUI restart is required to unload it fully. REFUSES the comfyui-mcp sidebar panel pack.
-
-### Parameters
-
-<ParamField path="id" type="string" required>
-  Registry id / module name of the installed pack to uninstall.
-</ParamField>
-<ParamField path="useCmCli" type="boolean">
-  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** Where is that pack's sampler class defined?
 
 ```json
 {
-  "tool": "uninstall_custom_node",
+  "tool": "node_pack",
   "arguments": {
-    "id": "<id>"
+    "action": "search",
+    "query": "class .*Sampler",
+    "glob": "**/*.py"
   }
 }
 ```
 
----
+**You get back:** File/line/text matches under custom_nodes/, capped so a broad regex cannot flood the reply. Read-only.
 
-## list_installed_nodes
-
-List installed ComfyUI custom node packs with their version and enabled/disabled state. Uses the ComfyUI-Manager HTTP API (works against remote instances); the cm-cli fallback returns names only.
-
-### Parameters
-
-<ParamField path="mode" type="enum">
-  'default' lists all installed packs; 'imported' lists only those successfully imported this session. Options: `default`, `imported`.
-</ParamField>
-<ParamField path="useCmCli" type="boolean">
-  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** Show me the top of that file.
 
 ```json
 {
-  "tool": "list_installed_nodes",
-  "arguments": {}
+  "tool": "node_pack",
+  "arguments": {
+    "action": "read",
+    "path": "my-cool-nodes/src/nodes.py",
+    "line_count": 60
+  }
 }
 ```
 
----
+**You get back:** The requested line range, with a truncation notice if it was clipped.
 
-## sync_node_dependencies
-
-Reconcile the Python dependencies of all installed custom node packs through official `comfy node restore-dependencies`. Requires a local ComfyUI install and comfy-cli.
-
-<Note>This tool takes no parameters.</Note>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** Replace that file with the fixed version.
 
 ```json
 {
-  "tool": "sync_node_dependencies",
-  "arguments": {}
+  "tool": "node_pack",
+  "arguments": {
+    "action": "write",
+    "path": "my-cool-nodes/src/nodes.py",
+    "content": "# ...the full new contents of the file...",
+    "overwrite": true
+  }
 }
 ```
+
+<Note>`content` is the COMPLETE new file, shortened to one line here. For a small edit prefer action "patch", which applies a unified diff.</Note>
+
+**You get back:** The path written and its byte count.
+
+<Warning>With overwrite true this replaces the whole file. There is no undo here — commit first with action "git" if the pack is a repo.</Warning>
+
+**You say:** Does my pack actually load?
+
+```json
+{
+  "tool": "node_pack",
+  "arguments": {
+    "action": "verify",
+    "name": "my-cool-nodes"
+  }
+}
+```
+
+**You get back:** Whether each of the pack's node classes appeared in /object_info. A class that is missing failed to import — that is your bug.
+
+<Warning>By default this RESTARTS your local ComfyUI, which aborts anything rendering. Pass restart false to check the live server as-is.</Warning>
+
+**You say:** Commit what I changed in that pack.
+
+```json
+{
+  "tool": "node_pack",
+  "arguments": {
+    "action": "git",
+    "pack": "my-cool-nodes",
+    "git_action": "commit",
+    "message": "fix: sampler returns the right latent"
+  }
+}
+```
+
+**You get back:** The git output, capped. status/diff/log always work; commit and push need COMFYUI_MCP_ALLOW_GIT_WRITES=1 and otherwise return a structured refusal naming that flag.
+
+**You say:** Publish it to the registry.
+
+```json
+{
+  "tool": "node_pack",
+  "arguments": {
+    "action": "publish",
+    "name": "my-cool-nodes"
+  }
+}
+```
+
+**You get back:** What comfy-cli published, after pyproject.toml is validated for a real name, version and PublisherId.
+
+<Warning>IRREVERSIBLE and PUBLIC: this creates or updates a version on registry.comfy.org that this tool cannot take back. Needs comfy-cli and REGISTRY_ACCESS_TOKEN.</Warning>
 
 ---
 
@@ -360,7 +422,8 @@ Custom-node snapshots via ComfyUI-Manager (mirrors `comfy node save-snapshot` / 
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which snapshot operation to perform. "list" takes no other parameters; "save" takes an optional `name`; "restore" requires `name`. Options: `list`, `save`, `restore`.
+  Which snapshot operation to perform. "list" takes no other parameters; "save" takes an optional `name`; "restore" requires `name`.
+  Options: `action:"list"`, `action:"save"`, `action:"restore"`.
 </ParamField>
 <ParamField path="name" type="string">
   Snapshot name (no extension, no path separators). REQUIRED for action:"restore" (as shown by action:"list"). OPTIONAL for action:"save" — omit to let ComfyUI-Manager assign a timestamped name. Ignored by action:"list".
@@ -413,7 +476,8 @@ All actions are argument-free; `action` is the only parameter. `good`/`bad` requ
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which bisect operation to perform. "start" begins a session; "good"/"bad" narrow it (require a running session); "reset" clears it and re-enables everything; "status" reports state. No other arguments are needed for any action. Options: `start`, `good`, `bad`, `reset`, `status`.
+  Which bisect operation to perform. "start" begins a session; "good"/"bad" narrow it (require a running session); "reset" clears it and re-enables everything; "status" reports state. No other arguments are needed for any action.
+  Options: `action:"start"`, `action:"good"`, `action:"bad"`, `action:"reset"`, `action:"status"`.
 </ParamField>
 
 ### Example
@@ -425,308 +489,6 @@ All actions are argument-free; `action` is the only parameter. `good`/`bad` requ
   "tool": "bisect",
   "arguments": {
     "action": "start"
-  }
-}
-```
-
----
-
-## scaffold_custom_node
-
-Generate a new ComfyUI custom-node pack from a template into &lt;COMFYUI_PATH&gt;/custom_nodes/&lt;name&gt;/. Writes pyproject.toml (with the [tool.comfy] PublisherId/DisplayName/Icon table the Comfy Registry requires), __init__.py exporting NODE_CLASS_MAPPINGS / NODE_DISPLAY_NAME_MAPPINGS, and src/nodes.py containing a runnable sample node (INPUT_TYPES/RETURN_TYPES/FUNCTION/CATEGORY), plus .comfyignore and .gitignore. Optionally emits a web/js frontend stub (wiring WEB_DIRECTORY) and a GitHub Actions publish workflow (with_ci). This is the FIRST step of the author loop: scaffold here, then restart_comfyui to load it, test it, and finally publish_custom_node. LOCAL-ONLY: it writes to your local ComfyUI install and requires COMFYUI_PATH (it does nothing for a remote --comfyui-url target). Names must be a safe lowercase slug and cannot escape custom_nodes/; an existing non-empty directory is left untouched unless overwrite is true. Use this to CREATE a pack you author — to install someone else's pack use install_custom_node instead.
-
-### Parameters
-
-<ParamField path="name" type="string" required>
-  Pack folder name — a safe lowercase slug (letters, digits, hyphens, underscores), e.g. 'my-cool-nodes'. Becomes the directory under custom_nodes/ and the pyproject [project].name.
-</ParamField>
-<ParamField path="display_name" type="string" required>
-  Human-readable name shown in the ComfyUI node menu and the registry listing.
-</ParamField>
-<ParamField path="category" type="string">
-  Node menu category for the sample node (default 'custom').
-</ParamField>
-<ParamField path="description" type="string">
-  Short description written to pyproject [project].description.
-</ParamField>
-<ParamField path="publisher_id" type="string">
-  Your Comfy Registry publisher id, stamped into [tool.comfy].PublisherId. If omitted a placeholder is written that you must replace before publishing.
-</ParamField>
-<ParamField path="with_frontend" type="boolean">
-  If true, also generate a web/js/&lt;name&gt;.js extension stub and set WEB_DIRECTORY (default false).
-</ParamField>
-<ParamField path="with_ci" type="boolean">
-  If true, also generate .github/workflows/publish_action.yml (Comfy-Org/publish-node-action; needs the REGISTRY_ACCESS_TOKEN repo secret) so pushing a pyproject.toml version bump auto-publishes (default false).
-</ParamField>
-<ParamField path="overwrite" type="boolean">
-  If true, overwrite template files in an existing pack directory instead of refusing (default false).
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "scaffold_custom_node",
-  "arguments": {
-    "name": "<name>",
-    "display_name": "<display_name>"
-  }
-}
-```
-
----
-
-## verify_custom_node
-
-Test that a custom-node pack actually loads in ComfyUI — the middle step of the author loop (scaffold_custom_node → verify_custom_node → publish_custom_node). Restarts the local ComfyUI and waits for it to become ready, then checks that the pack's node class_types appear in /object_info. A node that fails to import (a missing dependency or a syntax error) simply never registers, so any missing class_types pinpoint a broken pack. Provide class_types explicitly, or a pack `name` whose __init__.py declares NODE_CLASS_MAPPINGS (the keys are inferred). LOCAL-ONLY: needs COMFYUI_PATH and a managed local ComfyUI. Set restart:false to check the already-running server without restarting it.
-
-### Parameters
-
-<ParamField path="name" type="string">
-  Pack folder under custom_nodes/. If class_types is omitted, its __init__.py NODE_CLASS_MAPPINGS keys are inferred and checked.
-</ParamField>
-<ParamField path="class_types" type="string[]">
-  Explicit NODE_CLASS_MAPPINGS keys to confirm are registered in /object_info. Takes precedence over inferring from `name`.
-</ParamField>
-<ParamField path="restart" type="boolean">
-  Restart ComfyUI before checking so newly-added packs load (default true). Set false to check the live server as-is.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "verify_custom_node",
-  "arguments": {}
-}
-```
-
----
-
-## publish_custom_node
-
-Publish a local custom-node pack to the public Comfy Registry (registry.comfy.org) by running `comfy node publish` inside the pack directory. First validates the pack's pyproject.toml has the required [project].name, [project].version and [tool.comfy].PublisherId (refusing the scaffold placeholder), then publishes using the API key from the REGISTRY_ACCESS_TOKEN environment variable (passed to comfy-cli via the environment, never via logged arguments). This is the LAST step of the author loop and an IRREVERSIBLE, EXTERNAL action: it creates/updates a PUBLIC registry version that this tool cannot undo. Requires comfy-cli installed and REGISTRY_ACCESS_TOKEN set. LOCAL-ONLY: it reads and runs against a pack on the local filesystem and is meaningless for a remote --comfyui-url target. To create a pack first, use scaffold_custom_node.
-
-### Parameters
-
-<ParamField path="name" type="string">
-  Pack folder name under &lt;COMFYUI_PATH&gt;/custom_nodes/ to publish. Provide this or `path`.
-</ParamField>
-<ParamField path="path" type="string">
-  Explicit absolute path to the pack directory to publish. Overrides `name` when both are given.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "publish_custom_node",
-  "arguments": {}
-}
-```
-
----
-
-## list_node_pack_files
-
-List the files in one installed custom-node pack under &lt;COMFYUI_PATH&gt;/custom_nodes/&lt;pack&gt;/ (read-only). Skips .git/, __pycache__/ and node_modules/. Use this to orient before read_node_file / search_node_packs when diagnosing or editing a pack you found via bisect or fix_custom_node. LOCAL-ONLY (requires COMFYUI_PATH); the pack name and every returned path are jailed to custom_nodes/.
-
-### Parameters
-
-<ParamField path="pack" type="string" required>
-  Pack folder name under custom_nodes/ (e.g. 'ComfyUI-Manager').
-</ParamField>
-<ParamField path="glob" type="string">
-  Optional glob to filter entries (supports *, **, ?), matched against pack-relative paths.
-</ParamField>
-<ParamField path="max_entries" type="integer">
-  Maximum entries to return (default 500, max 2000 — a hard clamp). The walk STOPS at this many, so a capped result is not the pack's full file list.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "list_node_pack_files",
-  "arguments": {
-    "pack": "<pack>"
-  }
-}
-```
-
----
-
-## read_node_file
-
-Read a slice of one file inside a custom-node pack (read-only), with bounded output so a huge file can't flood the context. Returns the requested line range with a truncation notice when clipped; long lines are chunked. Pair with search_node_packs to locate the line, then apply_node_patch or write_node_file to change it. LOCAL-ONLY (requires COMFYUI_PATH); the path is jailed to custom_nodes/.
-
-### Parameters
-
-<ParamField path="path" type="string" required>
-  Pack-relative path under custom_nodes/, e.g. 'MyPack/nodes.py'.
-</ParamField>
-<ParamField path="start_line" type="integer">
-  1-based line to start at (default 1).
-</ParamField>
-<ParamField path="line_count" type="integer">
-  Number of lines to return (default 240, max 800).
-</ParamField>
-<ParamField path="max_chars" type="integer">
-  Maximum characters to return (default 12000, min 500, max 24000 — hard clamps; values outside are silently pulled into range).
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "read_node_file",
-  "arguments": {
-    "path": "<path>"
-  }
-}
-```
-
----
-
-## search_node_packs
-
-Regex-search custom-node source under custom_nodes/ (read-only). Uses ripgrep when it's on PATH, otherwise a bounded built-in scanner (skips dot-dirs, __pycache__/node_modules, binary and &gt;1 MiB files). Returns file/line/text matches with per-line and result caps. Use this to find where a node class, import, or error string lives before reading or patching. LOCAL-ONLY (requires COMFYUI_PATH); the search path is jailed to custom_nodes/.
-
-### Parameters
-
-<ParamField path="query" type="string" required>
-  Regular expression to search for.
-</ParamField>
-<ParamField path="path" type="string">
-  Pack-relative directory to search, or '.' for all packs (default '.').
-</ParamField>
-<ParamField path="glob" type="string">
-  Optional glob to restrict which files are searched (e.g. '**/*.py').
-</ParamField>
-<ParamField path="max_results" type="integer">
-  Maximum matches to return (default 50, max 100). The scan STOPS at this many, so a capped result is not a complete match set.
-</ParamField>
-<ParamField path="case_sensitive" type="boolean">
-  Match case-sensitively (default false).
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "search_node_packs",
-  "arguments": {
-    "query": "<query>"
-  }
-}
-```
-
----
-
-## write_node_file
-
-Create or overwrite one file inside a custom-node pack under custom_nodes/. Refuses to clobber an existing file unless overwrite is true, and creates parent directories by default. Use for whole-file edits or new files; for surgical edits prefer apply_node_patch. After writing, run verify_custom_node and restart_comfyui to load the change. LOCAL-ONLY (requires COMFYUI_PATH); the path is jailed to custom_nodes/.
-
-### Parameters
-
-<ParamField path="path" type="string" required>
-  Pack-relative path under custom_nodes/, e.g. 'MyPack/nodes.py'.
-</ParamField>
-<ParamField path="content" type="string" required>
-  Full file contents to write.
-</ParamField>
-<ParamField path="overwrite" type="boolean">
-  Overwrite an existing file instead of refusing (default false).
-</ParamField>
-<ParamField path="create_dirs" type="boolean">
-  Create missing parent directories (default true).
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "write_node_file",
-  "arguments": {
-    "path": "<path>",
-    "content": "<content>"
-  }
-}
-```
-
----
-
-## apply_node_patch
-
-Apply a unified diff to custom-node source under custom_nodes/. Every touched path is jail-checked BEFORE any git call, then the patch is validated with `git apply --check` and only applied if the check passes (two-phase; never uses --unsafe-paths). Paths are relative to custom_nodes/ and may carry a/ b/ prefixes; works on non-repo packs too. Ideal for surgical edits located via search_node_packs. LOCAL-ONLY (requires COMFYUI_PATH).
-
-### Parameters
-
-<ParamField path="patch" type="string" required>
-  A unified diff. File headers (---/+++) are read to determine touched paths, which must resolve inside custom_nodes/ (e.g. 'a/MyPack/nodes.py').
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "apply_node_patch",
-  "arguments": {
-    "patch": "<patch>"
-  }
-}
-```
-
----
-
-## node_pack_git
-
-Run a git operation inside one custom-node pack (status/diff/log/commit/push). Reads (status/diff/log) are always allowed. Writes (commit/push) require the environment flag COMFYUI_MCP_ALLOW_GIT_WRITES=1 (default OFF) and otherwise return a structured DISABLED_BY_CONFIG refusal so you can self-correct. commit requires a message and stages either the given paths or all pack changes. This is the final step of the author loop after scaffold_custom_node → write_node_file/apply_node_patch → verify_custom_node → restart_comfyui, before publish_custom_node. LOCAL-ONLY (requires COMFYUI_PATH); the pack and any paths are jailed to custom_nodes/.
-
-### Parameters
-
-<ParamField path="pack" type="string" required>
-  Pack folder name under custom_nodes/.
-</ParamField>
-<ParamField path="action" type="enum" required>
-  Git action. status/diff/log are read-only; commit/push require COMFYUI_MCP_ALLOW_GIT_WRITES=1. Options: `status`, `diff`, `log`, `commit`, `push`.
-</ParamField>
-<ParamField path="message" type="string">
-  Commit message (required for action 'commit').
-</ParamField>
-<ParamField path="paths" type="string[]">
-  Pack-relative paths to stage/scope (jail-checked). Defaults to all pack changes.
-</ParamField>
-<ParamField path="max_chars" type="integer">
-  Maximum characters of git output to return (default 12000, min 500, max 24000 — hard clamps the runtime applies; values outside are silently pulled into range).
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "node_pack_git",
-  "arguments": {
-    "pack": "<pack>",
-    "action": "status"
   }
 }
 ```

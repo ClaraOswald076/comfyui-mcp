@@ -21,7 +21,14 @@ import {
   unclassifiedGraphCommandsSeen,
   __resetUnclassifiedGraphCommands,
 } from "../../services/ui-bridge.js";
-import { carryWorkflowCommandStamp } from "../../orchestrator/session-store.js";
+import { SHARED_SESSION_SCOPE, normalizeHelloBackend } from "../../services/session-scope.js";
+import {
+  TurnOriginTracker,
+  makeScopeRepinHandler,
+  makeScopeTargetResolver,
+} from "../../orchestrator/turn-origins.js";
+import { buildPanelToolDefs, makePanelToolCtx } from "../../orchestrator/panel-tools.js";
+import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 import {
   __resetPanelBaseCache,
   __setPanelBaseForTests,
@@ -815,7 +822,7 @@ describe("UiBridge (multi-tab)", () => {
       // panel can dial, and it carries no token.
       expect(msg).toMatch(/Settings → Advanced → Bridge URL/);
       expect(msg).not.toMatch(/COMFYUI_MCP_BRIDGE_PORT/);
-      // install_panel is named with BOTH its conditions: holding the tool is not
+      // install_comfyui(action:'panel') is named with BOTH its conditions: holding the tool is not
       // enough, since it is local-only and refuses in remote/cloud mode.
       expect(msg).toMatch(/local-only and refuses in remote\/cloud mode/);
     });
@@ -941,15 +948,14 @@ describe("UiBridge (multi-tab)", () => {
 
   // The trusted workflow-uuid stamp registry (orchestrator's tabCommandWorkflowUuid)
   // is keyed by the CALLER's tab id, while command ROUTING resolves through the
-  // bridge's same-socket migration alias. A proven same-workflow migration (a save /
-  // rename, or a reconnect that re-registers the tab under a new id) used to retire
-  // the old id's stamp: a session still bound to the pre-migration id (a Codex HTTP
-  // MCP session is never re-pointed) kept reading through the alias while EVERY write
-  // was refused "no trusted identity" — and panel_set_workflow_target({mode:"current"})
-  // reported success without repairing anything (canReach is true through the alias).
-  // Only a browser refresh restored writes (#436 priority 3).
-  describe("the trusted stamp survives a proven same-workflow migration (#436.3)", () => {
-    it("a session bound to the pre-migration id keeps mutating once the stamp is carried", async () => {
+  // bridge's same-socket migration alias. #884 re-bound agent sessions to the
+  // SHARED SCOPE (no session is bound to a per-workflow tab id anymore), so the
+  // #436 stamp-carry is gone: a SHARED-SCOPE caller mutates via the stamp of the
+  // RESOLVED (active) conn, while a caller still naming a retired per-workflow id
+  // keeps FAILING CLOSED — a straggler command issued for the old workflow must
+  // never mutate the newly-shown one.
+  describe("workflow stamps after a same-socket migration (#436.3 → #884)", () => {
+    it("a shared-scope caller keeps mutating across the migration; the retired id fails closed", async () => {
       // Wire the stamp registry exactly as the orchestrator does (caller-keyed map).
       const stamps = new Map<string, string>();
       bridge.setTabWorkflowUuidResolver((tabId) => stamps.get(tabId));
@@ -1001,25 +1007,476 @@ describe("UiBridge (multi-tab)", () => {
         expect(bridge.tabs()[0].tab_id).toBe("wf:saved.json");
       });
       stamps.set("wf:saved.json", UUID); // the hello handler records the new id's stamp
+      stamps.delete("tmp:unsaved"); // …and retires the old id's stamp (#884)
 
-      // …but when the migration RETIRES the old id's stamp (the pre-fix behavior),
-      // the still-bound session reads fine while EVERY write is refused — the flap.
-      // Pinned here so the gate keeps failing closed whenever no stamp resolves.
-      stamps.delete("tmp:unsaved");
+      // The retired per-workflow id: reads still ride the migration alias, but a
+      // straggler WRITE issued for the old workflow keeps failing closed.
       const read = await bridge.send({ cmd: "graph_outline" }, { tabId: "tmp:unsaved" });
       expect(read).toMatchObject({ ok: true }); // reads ride the alias
       await expect(
         bridge.send({ cmd: "graph_add_node" }, { tabId: "tmp:unsaved" }),
       ).rejects.toThrow(/no trusted identity/);
 
-      // 3) The fix: the proven migration CARRIES the stamp (the exact call the
-      //    hello handler now makes) — the session writes again without a browser
-      //    refresh, stamped with the SAME trusted uuid the panel fences on.
-      carryWorkflowCommandStamp(stamps, "tmp:unsaved", { uuid: UUID });
-      const after = await bridge.send({ cmd: "graph_add_node" }, { tabId: "tmp:unsaved" });
+      // 3) #884: the agent's session is bound to the SHARED SCOPE, not a tab id.
+      //    A scope-addressed write resolves to the live (migrated) conn for
+      //    ROUTING, but its STAMP comes from the SCOPE's registry entry — the
+      //    orchestrator answers a scope caller with the workflow the CURRENT
+      //    TURN was issued for. No carry, no browser refresh, and the panel
+      //    still fences on the trusted uuid.
+      stamps.set(SHARED_SESSION_SCOPE, UUID); // the orchestrator's turn capture
+      const after = await bridge.send({ cmd: "graph_add_node" }, { tabId: SHARED_SESSION_SCOPE });
       expect(after).toMatchObject({ ok: true });
       expect(frames.pop()?.workflow_uuid).toBe(UUID);
 
+      // 4) ISSUE-TIME WINS (codex round 1, P0): if the turn was issued for a
+      //    DIFFERENT workflow than the one the active tab now shows, the frame
+      //    must carry the ISSUE-TIME uuid — the panel (comparing against its
+      //    active workflow) then DECLINES, instead of the stamp silently
+      //    re-aiming the mutation at whatever is on screen.
+      const TURN_UUID = "33333333-3333-4333-8333-333333333333";
+      stamps.set(SHARED_SESSION_SCOPE, TURN_UUID);
+      const reaimed = await bridge.send({ cmd: "graph_add_node" }, { tabId: SHARED_SESSION_SCOPE });
+      expect(reaimed).toMatchObject({ ok: true }); // this mock panel accepts; a real one fences
+      expect(frames.pop()?.workflow_uuid).toBe(TURN_UUID); // NOT the conn's own UUID
+
+      sock.close();
+    });
+  });
+
+  // #884 — the SHARED SESSION SCOPE separates session identity from routing: one
+  // agent serves every tab/workflow, and a command addressed to the scope must
+  // reach the workflow the user is actually on. These drive the REAL WS bridge.
+  describe("shared-session-scope routing (#884)", () => {
+    const SCOPE_KEY = `${SHARED_SESSION_SCOPE}::claude`;
+    /** Install the PRODUCTION scope wiring on the live test bridge — the same
+     *  TurnOriginTracker + resolver/repin factories index.ts constructs
+     *  (confirming gate 3, P2: these tests must drive the real handlers, not
+     *  hand-written stand-ins that cannot catch a defect in them). */
+    function wireRealScopeRouting() {
+      const backendOfKey = (key: string): string =>
+        key.includes("::") ? key.slice(key.lastIndexOf("::") + 2) : "claude";
+      // Mirrors the orchestrator's live tabBackends map: tabs default to
+      // claude; a test flips an entry to simulate a provider switch/revival.
+      const tabBackends = new Map<string, string>();
+      const backendForTab = (tab: string): string => tabBackends.get(tab) ?? "claude";
+      const tracker = new TurnOriginTracker({
+        backendForTab,
+        backendOfKey,
+        uuidOfTab: () => undefined,
+        liveTabOf: (tab) => bridge.liveTabIdFor(tab), // the production wiring
+        warn: () => {},
+      });
+      const scopeAgentKeyOf = (scopeId: string): string =>
+        scopeId === SHARED_SESSION_SCOPE ? SCOPE_KEY : scopeId;
+      bridge.setScopeTargetResolver(makeScopeTargetResolver({ tracker, scopeAgentKeyOf }));
+      bridge.setScopeRepinHandler(
+        makeScopeRepinHandler({
+          bridge,
+          tracker,
+          scopeAgentKeyOf,
+          backendForTab,
+          backendOfKey,
+          info: () => {},
+        }),
+      );
+      return { tracker, tabBackends };
+    }
+    it("a scope-addressed tool call reaches the tab the user LAST TALKED FROM", async () => {
+      const a = await connectPanel("wf:workflows/a.json", "a");
+      const b = await connectPanel("wf:workflows/b.json", "b");
+      autoReply(a, "tab-a");
+      autoReply(b, "tab-b");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+
+      // The user speaks from B → the scope routes there.
+      b.send(JSON.stringify({ type: "user_message", text: "hi from b" }));
+      await vi.waitFor(async () => {
+        const r = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
+        expect(r).toMatchObject({ from: "tab-b" });
+      });
+
+      // …then from A → the SAME scope now routes to A (several workflows open,
+      // one session; each call still reaches the right canvas).
+      a.send(JSON.stringify({ type: "user_message", text: "hi from a" }));
+      await vi.waitFor(async () => {
+        const r = await bridge.send({ cmd: "graph_get_state" }, { tabId: SHARED_SESSION_SCOPE });
+        expect(r).toMatchObject({ from: "tab-a" });
+      });
+
+      a.close();
+      b.close();
+    });
+
+    it("a backend-QUALIFIED scope address routes exactly like the bare scope", async () => {
+      // The panel MCP servers bind `orchestrator::<backend>` (so the workflow
+      // stamp resolves per conversation); routing must treat it as the scope.
+      const a = await connectPanel("wf:workflows/a.json", "a");
+      autoReply(a, "tab-a");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      const r = await bridge.send({ cmd: "graph_outline" }, { tabId: `${SHARED_SESSION_SCOPE}::claude` });
+      expect(r).toMatchObject({ from: "tab-a" });
+      a.close();
+    });
+
+    it("with no last-active tab, the scope prefers the most recent INTERACTIVE conn over a headless viewer", async () => {
+      const a = await connectPanel("wf:workflows/a.json", "a");
+      autoReply(a, "tab-a");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      // A headless (canvas-less) client connects LAST — it must not steal routing.
+      const phone = await connectPanel();
+      phone.send(
+        JSON.stringify({ type: "hello", tab_id: "mobile-1", title: "phone", headless: true }),
+      );
+      autoReply(phone, "phone");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+
+      const r = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
+      expect(r).toMatchObject({ from: "tab-a" });
+
+      a.close();
+      phone.close();
+    });
+
+    it("an IN-FLIGHT turn's pin outranks the active tab — a queued message from B cannot re-aim A's turn (confirming-gate P0)", async () => {
+      const a = await connectPanel("wf:workflows/a.json", "a");
+      const b = await connectPanel("wf:workflows/b.json", "b");
+      autoReply(a, "tab-a");
+      autoReply(b, "tab-b");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      // The orchestrator pins the running turn to its origin tab A…
+      let pin: string | null | undefined = "wf:workflows/a.json";
+      bridge.setScopeTargetResolver(() => pin);
+      // …then tab B sends a message, which moves lastActiveTabId to B immediately.
+      b.send(JSON.stringify({ type: "user_message", text: "queued from b" }));
+      await vi.waitFor(async () => {
+        // Un-pinned scope resolution now follows B…
+        pin = undefined;
+        const idle = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
+        expect(idle).toMatchObject({ from: "tab-b" });
+      });
+      // …but the PINNED turn keeps routing to A, not to the newly-active B.
+      pin = "wf:workflows/a.json";
+      const pinned = await bridge.send({ cmd: "workflow_open", path: "c.json" }, { tabId: SHARED_SESSION_SCOPE });
+      expect(pinned).toMatchObject({ from: "tab-a" });
+      a.close();
+      b.close();
+    });
+
+    it("the EXPLICIT repin escapes a dead pin — the recovery the refusal advertises actually works (confirming-gate 2, P1)", async () => {
+      const a = await connectPanel("wf:workflows/a.json", "a");
+      const b = await connectPanel("wf:workflows/b.json", "b");
+      autoReply(a, "tab-a");
+      autoReply(b, "tab-b");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+
+      // The REAL production wiring (confirming gate 3, P2: this test used to
+      // install a hand-written handler, which could not catch a defect in the
+      // real one): the same tracker + resolver/repin factories index.ts wires.
+      const { tracker } = wireRealScopeRouting();
+
+      // A turn pinned to a tab that is now GONE: every scope-addressed call
+      // refuses, and the refusal names panel_set_workflow_target as the way out.
+      tracker.recordForMid("m-dead", undefined, "wf:workflows/gone.json");
+      tracker.onSeen(SCOPE_KEY, "m-dead");
+      await vi.waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/gone.json"));
+      await expect(
+        bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE }),
+      ).rejects.toThrow(/no connected tab/);
+
+      // The explicit recovery (panel_set_workflow_target mode:"current" calls
+      // through this bridge method) escapes the dead pin onto the active tab.
+      const repinned = bridge.repinScopeToActive(SHARED_SESSION_SCOPE);
+      expect(repinned).toBeDefined();
+      expect(tracker.pinOf(SCOPE_KEY)).toBe(repinned);
+
+      // …and the SAME turn can now reach the panel again.
+      const after = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
+      expect(after).toMatchObject({ from: expect.stringMatching(/^tab-/) });
+      a.close();
+      b.close();
+    });
+
+    it("the repin REFUSES to move a HEALTHY pin (confirming-gate 3, P0 — recovery, never a re-target)", async () => {
+      const a = await connectPanel("wf:workflows/a.json", "a");
+      const b = await connectPanel("wf:workflows/b.json", "b");
+      autoReply(a, "tab-a");
+      autoReply(b, "tab-b");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      const { tracker } = wireRealScopeRouting();
+
+      // A turn pinned to LIVE tab A…
+      tracker.recordForMid("m-a", undefined, "wf:workflows/a.json");
+      tracker.onSeen(SCOPE_KEY, "m-a");
+      await vi.waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json"));
+      // …while tab B becomes last-active (a queued message moves it instantly).
+      b.send(JSON.stringify({ type: "user_message", text: "queued from b" }));
+      await vi.waitFor(() => {
+        expect(bridge.resolveActiveScopeTab()).toBe("wf:workflows/b.json");
+      });
+
+      // Even a DIRECT repin call must refuse: the pin reaches a live tab, so
+      // there is nothing to recover from — moving it would re-aim the running
+      // turn's tool calls at a workflow it was never about.
+      expect(bridge.repinScopeToActive(SHARED_SESSION_SCOPE)).toBeUndefined();
+      expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json");
+      const still = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
+      expect(still).toMatchObject({ from: "tab-a" });
+      a.close();
+      b.close();
+    });
+
+    it("panel_reload (the REAL tool) leaves a HEALTHY scope-bound turn on its own tab (confirming-gate 3, P0)", async () => {
+      // The exact reported sequence, driven end-to-end through the production
+      // seams: turn pinned to A; a queued message makes B last-active; A's
+      // agent calls panel_reload. Before this fix the tool's unconditional
+      // rebindToActiveTab() repinned the healthy turn onto B — soft_reload
+      // (and every later mutation, carrying B's freshly re-derived stamp)
+      // went to B with no mode:"current" consent anywhere.
+      const a = await connectPanel("wf:workflows/a.json", "a");
+      const b = await connectPanel("wf:workflows/b.json", "b");
+      autoReply(a, "tab-a");
+      autoReply(b, "tab-b");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      const { tracker } = wireRealScopeRouting();
+
+      tracker.recordForMid("m-a", undefined, "wf:workflows/a.json");
+      tracker.onSeen(SCOPE_KEY, "m-a");
+      await vi.waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json"));
+      b.send(JSON.stringify({ type: "user_message", text: "queued from b" }));
+      await vi.waitFor(() => expect(bridge.resolveActiveScopeTab()).toBe("wf:workflows/b.json"));
+
+      const ctx = makePanelToolCtx(bridge, SCOPE_KEY, new WorkflowTargetStore());
+      const reload = buildPanelToolDefs().find((d) => d.name === "panel_reload")!;
+      const res = (await reload.handler({ scope: "frontend" }, ctx)) as {
+        isError?: boolean;
+        content: Array<{ type: string; text?: string }>;
+      };
+      expect(res.isError).toBeFalsy();
+      // The healthy pin stood, and the soft_reload frame reached A — not B.
+      expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json");
+      expect(JSON.parse(res.content[0].text!)).toMatchObject({ from: "tab-a", cmd: "soft_reload" });
+      // The ctx stays scope-bound (never narrowed to a real tab id).
+      expect(ctx.tabId).toBe(SCOPE_KEY);
+      a.close();
+      b.close();
+    });
+
+    it("panel_reload FAILS on a DEAD scope pin naming the recovery, and panel_set_workflow_target({mode:'current'}) then re-pins (confirming-gate 3)", async () => {
+      const a = await connectPanel("wf:workflows/a.json", "a");
+      const b = await connectPanel("wf:workflows/b.json", "b");
+      autoReply(a, "tab-a");
+      autoReply(b, "tab-b");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      const { tracker } = wireRealScopeRouting();
+
+      // A turn pinned to A… whose tab then disconnects: the pin is DEAD.
+      tracker.recordForMid("m-a", undefined, "wf:workflows/a.json");
+      tracker.onSeen(SCOPE_KEY, "m-a");
+      await vi.waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json"));
+      a.close();
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+
+      // panel_reload is NOT a consent path: it fails, names the recovery, and
+      // the pin is NOT silently moved.
+      const ctx = makePanelToolCtx(bridge, SCOPE_KEY, new WorkflowTargetStore());
+      const defs = buildPanelToolDefs();
+      const reload = defs.find((d) => d.name === "panel_reload")!;
+      const res = (await reload.handler({ scope: "frontend" }, ctx)) as {
+        isError?: boolean;
+        content: Array<{ type: string; text?: string }>;
+      };
+      expect(res.isError).toBe(true);
+      expect(res.content[0].text).toMatch(/panel_set_workflow_target\(\{mode:"current"\}\)/);
+      expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json");
+
+      // The advertised recovery — the REAL tool, carrying the explicit
+      // consent — escapes the dead pin onto the live tab. (The tool's own
+      // result additionally reports the fence outcome, which for this
+      // synthetic panel's minimal workflow_list reply is honestly
+      // "not recovered"; the fence-adoption path has its own coverage in
+      // panel-tools.test.ts. What THIS asserts is the pin recovery itself.)
+      const target = defs.find((d) => d.name === "panel_set_workflow_target")!;
+      await target.handler({ mode: "current" }, ctx);
+      expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/b.json");
+      // …and the same turn's scope calls reach the panel again.
+      const after = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
+      expect(after).toMatchObject({ from: "tab-b" });
+      b.close();
+    });
+
+    it("a hello that OMITS backend still drains the default conversation's mailbox (confirming-gate 2, P1)", async () => {
+      // Offline show_media buffers under the BACKEND-QUALIFIED scope address.
+      const qualified = `${SHARED_SESSION_SCOPE}::claude`;
+      const res = await bridge.send(
+        { cmd: "show_media", items: [{ url: "/view?x=1" }] },
+        { tabId: qualified },
+      );
+      expect(res).toMatchObject({ mailboxed: true });
+
+      // The tab hellos WITHOUT a backend field. The orchestrator maps absent →
+      // default ("claude"), so it JOINS that conversation — and must therefore
+      // drain its mailbox. Matching the raw string alone stranded it here, and
+      // the media silently never arrived. This installs the REAL shared
+      // normalizeHelloBackend (the same function the hello handler uses to
+      // decide which conversation the tab joins), not a test-local
+      // approximation (confirming gate 3, P2).
+      bridge.setHelloBackendNormalizer((raw) =>
+        normalizeHelloBackend(raw, new Set(["claude", "codex"]), "claude"),
+      );
+      // Open the socket and start listening BEFORE the hello — the drain happens
+      // during hello processing, so a listener attached afterwards misses it.
+      const tab = await connectPanel();
+      const got: Array<Record<string, unknown>> = [];
+      tab.on("message", (buf) => got.push(JSON.parse(buf.toString())));
+      tab.send(JSON.stringify({ type: "hello", tab_id: "wf:workflows/a.json", title: "a" }));
+      await vi.waitFor(() => {
+        expect(got.find((m) => m.cmd === "show_media")).toMatchObject({ mailbox: true });
+      });
+      tab.close();
+    });
+
+    it("liveTabIdFor follows a PATH-COMPRESSED multi-hop migration chain to the live tab (codex gate 4)", async () => {
+      // A→B then B→C on the SAME socket: the bridge rewrites every historical
+      // alias to the newest id in one step, so a pin naming A must be judged
+      // as routing to C — no single hello ever reports A as migrated_from for
+      // the second hop. This is the resolution the provider-switch pin
+      // invalidation (TurnOriginTracker.tabChangedBackend) consults.
+      const sock = await connectPanel("tmp:hop-a", "a");
+      autoReply(sock, "surface");
+      await vi.waitFor(() => expect(bridge.tabs().map((t) => t.tab_id)).toContain("tmp:hop-a"));
+      sock.send(JSON.stringify({ type: "hello", tab_id: "wf:hop-b", title: "b" }));
+      await vi.waitFor(() => expect(bridge.tabs().map((t) => t.tab_id)).toContain("wf:hop-b"));
+      sock.send(JSON.stringify({ type: "hello", tab_id: "wf:hop-c", title: "c" }));
+      await vi.waitFor(() => expect(bridge.tabs().map((t) => t.tab_id)).toContain("wf:hop-c"));
+
+      expect(bridge.liveTabIdFor("tmp:hop-a")).toBe("wf:hop-c"); // two hops, compressed
+      expect(bridge.liveTabIdFor("wf:hop-b")).toBe("wf:hop-c");
+      expect(bridge.liveTabIdFor("wf:hop-c")).toBe("wf:hop-c");
+      expect(bridge.liveTabIdFor("wf:never-seen")).toBeUndefined();
+      sock.close();
+    });
+
+    it("a pin whose id is REVIVED by another backend's tab is refused at resolution (codex gate-4 delta P0)", async () => {
+      // wf:<hash> ids are deterministic and recur. A Claude turn pins tab A;
+      // A disconnects (no switch event will ever fire for it); a NEW socket
+      // hellos under the SAME id on Codex. The pin now resolves exact-match
+      // onto the revived tab, and a provider switch does not change the
+      // workflow uuid — so only a USE-time ownership check refuses it.
+      const a = await connectPanel("wf:revive.json", "a");
+      autoReply(a, "old-claude-tab");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      const { tracker, tabBackends } = wireRealScopeRouting();
+
+      tracker.recordForMid("m-a", undefined, "wf:revive.json");
+      tracker.onSeen(SCOPE_KEY, "m-a");
+      await vi.waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:revive.json"));
+
+      a.close();
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(0));
+      // The revival: a different browser tab, same deterministic id, Codex.
+      const revived = await connectPanel("wf:revive.json", "a-again");
+      autoReply(revived, "new-codex-tab");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      tabBackends.set("wf:revive.json", "codex");
+
+      // The scope command must be REFUSED — never delivered to the revived
+      // Codex tab under the old Claude pin.
+      await expect(
+        bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE, timeoutMs: 300 }),
+      ).rejects.toThrow(/ambiguous/);
+      expect(tracker.pinOf(SCOPE_KEY)).toBeNull(); // invalidated at first use
+      revived.close();
+    });
+
+    it("a pinned turn FOLLOWS its own tab's same-socket migration, and REFUSES when the tab is gone or ambiguous", async () => {
+      const a = await connectPanel("wf:workflows/a.json", "a");
+      const b = await connectPanel("wf:workflows/b.json", "b");
+      autoReply(a, "tab-a");
+      autoReply(b, "tab-b");
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      let pin: string | null | undefined = "wf:workflows/a.json";
+      bridge.setScopeTargetResolver(() => pin);
+
+      // The turn's own tab switches workflow (same socket re-hellos) — the pin
+      // follows through the migration alias: same browser surface, same turn.
+      a.send(JSON.stringify({ type: "hello", tab_id: "wf:workflows/c.json", title: "c" }));
+      await vi.waitFor(() => {
+        expect(bridge.tabs().map((t) => t.tab_id)).toContain("wf:workflows/c.json");
+      });
+      const followed = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
+      expect(followed).toMatchObject({ from: "tab-a" });
+
+      // The pinned tab disconnects entirely: the scope REFUSES with the standard
+      // no-connected-tab error — it must NOT silently fall back to tab B.
+      a.close();
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      pin = "wf:workflows/c.json";
+      const gone = await bridge
+        .send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE, timeoutMs: 300 })
+        .catch((e) => e as Error);
+      expect(gone).toBeInstanceOf(Error);
+      expect(dispatchOutcomeOf(gone)).toBe(false);
+      expect((gone as Error).message).toMatch(/no connected tab/);
+
+      // An ambiguous-origin turn (mixed batch → pin null) refuses loudly too.
+      pin = null;
+      const ambiguous = await bridge
+        .send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE, timeoutMs: 300 })
+        .catch((e) => e as Error);
+      expect(ambiguous).toBeInstanceOf(Error);
+      expect((ambiguous as Error).message).toMatch(/ambiguous/);
+      b.close();
+    });
+
+    it("a BACKEND-QUALIFIED scope buffer only drains to a hello on that backend (confirming-gate P1)", async () => {
+      // Claude's conversation buffers a frame while nobody is connected…
+      expect(
+        bridge.push({ type: "say", text: "claude while away" }, `${SHARED_SESSION_SCOPE}::claude`),
+      ).toBe(0);
+      // …a CODEX tab hellos first: it must NOT receive Claude's output.
+      const codexSock = await connectPanel();
+      const codexGot: Array<Record<string, unknown>> = [];
+      codexSock.on("message", (buf) => codexGot.push(JSON.parse(buf.toString())));
+      codexSock.send(
+        JSON.stringify({ type: "hello", tab_id: "wf:codex.json", title: "cx", backend: "codex" }),
+      );
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      // A CLAUDE tab hellos next: the buffer drains to it.
+      const claudeSock = await connectPanel();
+      const claudeGot: Array<Record<string, unknown>> = [];
+      claudeSock.on("message", (buf) => claudeGot.push(JSON.parse(buf.toString())));
+      claudeSock.send(
+        JSON.stringify({ type: "hello", tab_id: "wf:claude.json", title: "cl", backend: "claude" }),
+      );
+      await vi.waitFor(() => {
+        expect(claudeGot.some((f) => f.type === "say" && f.text === "claude while away")).toBe(true);
+      });
+      expect(codexGot.some((f) => f.type === "say" && f.text === "claude while away")).toBe(false);
+      codexSock.close();
+      claudeSock.close();
+    });
+
+    it("scope-addressed frames buffered while NO tab is connected replay to the first hello", async () => {
+      // Nobody connected: a background agent's turn output is buffered under the scope…
+      expect(bridge.push({ type: "say", text: "finished while you were away" }, SHARED_SESSION_SCOPE)).toBe(0);
+      // …and a scope-addressed command refuses with the authoritative dispatched:false.
+      const err = await bridge
+        .send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE, timeoutMs: 300 })
+        .catch((e) => e as Error);
+      expect(err).toBeInstanceOf(Error);
+      expect(dispatchOutcomeOf(err)).toBe(false);
+      expect((err as Error).message).toMatch(/no connected tab/);
+
+      // The first tab to hello picks the buffered conversation up.
+      const sock = await connectPanel();
+      const got: Array<Record<string, unknown>> = [];
+      sock.on("message", (buf) => got.push(JSON.parse(buf.toString())));
+      sock.send(JSON.stringify({ type: "hello", tab_id: "wf:back.json", title: "back" }));
+      await vi.waitFor(() => {
+        expect(got.some((f) => f.type === "say" && f.text === "finished while you were away")).toBe(
+          true,
+        );
+      });
       sock.close();
     });
   });
@@ -1485,7 +1942,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     });
     // A tool_result for the desktop tab must NOT leak to the mirror viewer.
     bridge.push(
-      { type: "tool_result", cid: "x", tool: "list_workflows", ok: true, result: [] },
+      { type: "tool_result", cid: "x", tool: "get_workflow", ok: true, result: [] },
       "desktop-4",
     );
     await settle();
@@ -1915,7 +2372,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     // A mutating graph command is refused BEFORE dispatch (never written to the socket).
     await expect(
       bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "tmp:old" }),
-    ).rejects.toThrow(/enforce.*workflow targeting|install_panel\(action:'update'\)/i);
+    ).rejects.toThrow(/enforce.*workflow targeting|install_comfyui\(action:'panel', panel_action:'update'\)/i);
 
     // …but a READ-ONLY graph command still works (read-only graph access retained).
     await expect(
@@ -1926,7 +2383,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     // refused — the class the graph_-only gate previously missed (#570 P0c, codex cycle 8).
     await expect(
       bridge.send({ cmd: "workflow_close", force: true } as never, { tabId: "tmp:old" }),
-    ).rejects.toThrow(/enforce.*workflow targeting|install_panel\(action:'update'\)/i);
+    ).rejects.toThrow(/enforce.*workflow targeting|install_comfyui\(action:'panel', panel_action:'update'\)/i);
 
     // ALL FOUR workflow mutators are refused on a non-enforcing panel — regardless of path,
     // including an EXPLICIT non-empty path. The server can't resolve the selector or prove it
@@ -1940,13 +2397,23 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       { cmd: "workflow_close", path: "workflows/other.json", force: true }, // explicit path — still gated
     ]) {
       await expect(bridge.send(cmd as never, { tabId: "tmp:old" })).rejects.toThrow(
-        /enforce.*workflow targeting|install_panel\(action:'update'\)/i,
+        /enforce.*workflow targeting|install_comfyui\(action:'panel', panel_action:'update'\)/i,
       );
     }
     old.close();
   });
 
   it("names the versioned panel-sync remedy when stamp enforcement is absent (#706)", async () => {
+    // The remedy names install_comfyui(action:'panel') ONLY when a local ComfyUI install is
+    // resolvable from here. That used to come from the developer's REAL
+    // machine state (COMFYUI_PATH in the real ~/.comfyui-mcp/.env), so the
+    // test failed on any machine without one — and under the suite-wide home
+    // redirect (#879/#866), which hides that ambient config on purpose.
+    // Prime the resolution the assertion actually depends on: a resolved
+    // local base, no disk observation (cleared by this file's afterEach).
+    const base = mkdtempSync(join(tmpdir(), "cmcp-bridge-base-"));
+    tempRoots.push(base);
+    __setPanelBaseForTests(base);
     const old = new WebSocket(`ws://127.0.0.1:${port}`);
     await new Promise<void>((res, rej) => {
       old.on("open", () => {
@@ -1958,7 +2425,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "old-skew")).toBe(true));
     await expect(
       bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "old-skew" }),
-    ).rejects.toThrow(/reports panel 0\.11\.0.*needs panel 0\.11\.35\+.*install_panel\(action:'update'\).*restart ComfyUI.*rebinding cannot/i);
+    ).rejects.toThrow(/reports panel 0\.11\.0.*needs panel 0\.11\.35\+.*install_comfyui\(action:'panel', panel_action:'update'\).*restart ComfyUI.*rebinding cannot/i);
     old.close();
   });
 
@@ -1967,7 +2434,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     // key and the capability is advertised from the single file that also builds
     // `hello`, so a tab holding the pre-0.11.35 copy announces the old
     // capability set while the pack ON DISK is current. Telling that user to run
-    // install_panel is what closed the loop: it correctly reports nothing to do.
+    // install_comfyui(action:'panel') is what closed the loop: it correctly reports nothing to do.
     // The orchestrator runs the panel sync on this same hello, so the on-disk
     // version is observed alongside the handshake — enough to name it.
     // A REAL pack on disk: the skew resolver re-reads the pyproject at the
@@ -1995,7 +2462,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       expect((err as Error).message).toMatch(/HARD-REFRESH/);
       expect((err as Error).message).toMatch(/0\.11\.38/);
       // It must NOT send them back to the tool that will report nothing to do.
-      expect((err as Error).message).not.toMatch(/Run install_panel\(action:'update'\)/);
+      expect((err as Error).message).not.toMatch(/Run install_comfyui\(action:'panel', panel_action:'update'\)/);
       // …and it must not claim the update would report nothing to do: since #806
       // an update CAN pull a newer panel. What it cannot do is replace the JS an
       // open tab is running, which is what this branch is actually about.
@@ -2038,7 +2505,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
         .send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "really-old" })
         .catch((e: Error) => e);
       expect((err as Error).message).not.toMatch(/Do NOT update the panel/);
-      expect((err as Error).message).toMatch(/install_panel\(action:'update'\)|ON THE COMFYUI HOST/);
+      expect((err as Error).message).toMatch(/install_comfyui\(action:'panel', panel_action:'update'\)|ON THE COMFYUI HOST/);
       behind.close();
     } finally {
       clearPanelDiskObservation();
@@ -2106,7 +2573,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       // The PROVEN part is still stated plainly, and still spares them the update.
       expect(msg).toMatch(/Updating the panel will not fix this/);
       expect(msg).toMatch(/already 0\.11\.38/);
-      expect(msg).not.toMatch(/Run install_panel\(action:'update'\)/);
+      expect(msg).not.toMatch(/Run install_comfyui\(action:'panel', panel_action:'update'\)/);
       // The UNPROVEN part is not asserted...
       expect(msg).not.toMatch(/This BROWSER TAB is running an older cached copy/);
       // ...it is ranked, actionable case first, the other named rather than hidden.
@@ -2429,7 +2896,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     old.close();
   });
 
-  it("#812/#823: the remedy names how to reach install_panel when it is not in the tool list", async () => {
+  it("#812/#823: the remedy names how to reach install_comfyui(action:'panel') when it is not in the tool list", async () => {
     const old = new WebSocket(`ws://127.0.0.1:${port}`);
     await new Promise<void>((res, rej) => {
       old.on("open", () => {
@@ -2451,11 +2918,11 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       .then(() => null)
       .catch((e: Error) => e);
     const msg = (err as Error).message;
-    // #812's reporter searched their tool list for install_panel, found nothing,
+    // #812's reporter searched their tool list for install_comfyui(action:'panel'), found nothing,
     // and concluded the documented recovery was impossible. It was there — behind
     // the compact router, which is the DEFAULT tool mode. Naming the actual call
     // is the difference between a remedy and a dead end.
-    expect(msg).toContain(`call_tool {"name": "install_panel", "args": {"action": "update"}}`);
+    expect(msg).toContain(`call_tool {"name": "install_comfyui", "args": {"action": "panel", "panel_action": "update"}}`);
     // The specific version found and the version required, both named.
     expect(msg).toContain("0.11.32");
     expect(msg).toMatch(/needs panel 0\.11\.35\+/);
@@ -2593,7 +3060,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       const msg = (err as Error).message;
       expect(msg).toMatch(/Updating the panel will not fix this/);
       expect(msg).toMatch(/already 0\.11\.38/);
-      expect(msg).not.toMatch(/Run install_panel\(action:'update'\)/);
+      expect(msg).not.toMatch(/Run install_comfyui\(action:'panel', panel_action:'update'\)/);
       // Still no fabricated cause — the causes are ranked, as for no version.
       expect(msg).not.toMatch(/This BROWSER TAB is running an older cached copy/);
       expect(msg).toMatch(/\(1\) It is a ComfyUI browser tab/);

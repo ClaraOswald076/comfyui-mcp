@@ -4,49 +4,109 @@ description: "Save, load, strip/slice, analyze, and extract workflows."
 icon: "folder-open"
 ---
 
-<Info>10 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
+<Info>2 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
 <Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
 
-## list_workflows
+## get_workflow
 
-List the workflows saved in the connected ComfyUI server's user library (the same workflows visible in the ComfyUI web UI), INCLUDING the ones filed in subfolders. Requires a running ComfyUI server. Takes no parameters. Returns a numbered list of library names, each relative to the library root — a workflow in a folder appears as 'VIDEO/MiniMaxH3/clip.json', and that whole string is what get_workflow / analyze_workflow / query_workflow take as `filename`. It never reports an absence it did not establish: a listing it could not read says so, and an EMPTY listing says the library could not be CONFIRMED empty (an answer with no names in it cannot show whether it covered subfolders) and tells you to check the ComfyUI sidebar rather than recreate anything.
+Return, list, summarize or query a SAVED workflow FILE — files on disk, named from the library or given as a path/JSON — NOT the graph open on the user's canvas (that is panel_graph_outline). Every action here is READ-ONLY; saving and locking are save_workflow. Driven by the `action` parameter:
+- action:"get" — the full JSON of one saved workflow FILE named from the library. Defaults to converted API format; pass format:'ui' for the raw on-disk UI JSON. Use action:"analyze" instead if you just need to UNDERSTAND the workflow — it returns a structured summary without flooding context with JSON. Use action:"get" only when you need the actual JSON for enqueue_workflow, create_workflow (action:"modify"), or save_workflow.
+- action:"list" — the workflows saved in the connected ComfyUI server's user library (the same ones visible in the ComfyUI web UI), INCLUDING the ones filed in subfolders. Requires a running ComfyUI server. Takes no other parameters. Returns a numbered list of library names, each relative to the library root — a workflow in a folder appears as 'VIDEO/MiniMaxH3/clip.json', and that whole string is what `filename` takes. It never reports an absence it did not establish: a listing it could not read says so, and an EMPTY listing says the library could not be CONFIRMED empty (an answer with no names in it cannot show whether it covered subfolders) and tells you to check the ComfyUI sidebar rather than recreate anything.
+- action:"strip" — strip a workflow to a clean, flat API graph, resolving Get/Set buses, Reroutes, subgraph definitions, and bypassed/muted nodes into real connections (the 'de-getter-setter' pass). Unlike action:"get" this reads from ANY server-side file path on disk (not just the workflow library), so it loads ad-hoc / expert workflow files that action:"list" and panel_open_workflow can't resolve. Provide exactly one of: path, filename, or graph. Returns conversion warnings, a node-type summary, and the stripped graph (much smaller than the raw UI JSON).
+- action:"slice" — slice ONE pipeline out of a toggle-template workflow, the kind built with rgthree 'Fast Groups Bypasser/Muter' where one graph holds many pipelines and only one is active at a time. Seeds from the output/SaveImage nodes in the named `groups`, takes their backward dependency closure (through real links AND virtual Set/Get buses), un-bypasses the kept nodes (and the internals of any subgraph defs they use), and returns a STANDALONE, activated UI graph carrying only the subgraph defs it uses. Pair with action:"strip" afterward to flatten the Set/Get buses into real connections.
+- action:"from_image" — extract embedded ComfyUI workflow metadata from a PNG file. ComfyUI stores the full workflow (API format) and prompt data in PNG tEXt chunks. Use this to reverse-engineer how any ComfyUI image was generated.
+- action:"analyze" — SUMMARIZE a saved workflow file named from the library: sections, node settings, connections, and data flow. Returns a concise text summary (not raw JSON) optimized for AI reasoning. Prefer this over action:"get" unless you need the raw JSON for enqueue_workflow or create_workflow (action:"modify").
+- action:"query" — filter, traverse, project, and aggregate over a saved workflow's nodes WITHOUT dumping the whole JSON (the missing middle between action:"analyze"'s fixed summary and action:"get"'s full dump; on 100+-node graphs this is the ONLY context-safe way to answer questions like 'which KSamplers run cfg&gt;7', 'what feeds node 42', 'count nodes by type'). Provide exactly one of path/filename/graph, then combine: `types`, `title`, `where` widget predicates ANDed ('cfg&gt;7', 'steps&lt;=20', 'sampler_name=euler', 'text~sunset' — ops = != &gt;= &lt;= &gt; &lt; ~contains), `ids`, `upstream_of`/`downstream_of` + `depth`, `fields`, `group_by`, `limit`, `max_chars`. Output is TOKEN-BOUNDED and, when it truncates, the tail names WHICH of the two caps fired and the exact parameter to raise — read it and retry rather than concluding the graph can't be read. For the LIVE canvas this is panel_query_graph instead.
+- action:"prompt_director" — read Prompt Director's latest sanitized RUNTIME state after its nodes execute: each node id, node kind, resolved Model Explorer model/LoRA context, structured edit plan, source analysis, exact final prompt, warnings, or Result Critic verdict. Secrets and image tensors are redacted. Pair it with a live panel graph audit: graph inspection explains wiring and widget state, while this explains what the nodes actually resolved and compiled. Pass `node_id` to inspect one executed Prompt Director node.
 
-<Tip>**In plain terms:** The saved workflow FILES in your ComfyUI — the same list you see in the ComfyUI sidebar, folders and all. Usually the first call in any "open my…" request.</Tip>
+<Tip>**In plain terms:** Everything you can READ about a saved workflow FILE, chosen with `action` — the library listing, the raw JSON, a plain-English summary, a targeted query. Never the graph currently open on your canvas. If you only want to know what a workflow does, `action: "analyze"` is a far shorter answer than the full JSON.</Tip>
 
-<Note>This tool takes no parameters.</Note>
+### Parameters
 
-### Example
+<ParamField path="action" type="enum" required>
+  Which read to perform. "list" and "prompt_director" take no required parameters; "get" and "analyze" require `filename`; "strip", "slice" and "query" require exactly one of `path`/`filename`/`graph` (and "slice" also requires `groups`); "from_image" requires `image_path`.
+  Options: `action:"get"`, `action:"list"`, `action:"strip"`, `action:"slice"`, `action:"from_image"`, `action:"analyze"`, `action:"query"`, `action:"prompt_director"`.
+</ParamField>
+<ParamField path="filename" type="string">
+  Workflow library name, exactly as action:"list" reports it. A workflow filed in a folder keeps its folder in the name ('VIDEO/MiniMaxH3/clip.json') and that whole string goes here. REQUIRED for action:"get" and action:"analyze"; one of the three sources for "strip", "slice" and "query".
+</ParamField>
+<ParamField path="format" type="enum" default="api">
+  action:"get" — 'api' (default, recommended) converts to compact API format with named inputs, connection references, and _meta.mode flags for muted/bypassed nodes; 'ui' returns the raw UI format with layout positions and links arrays. action:"strip" — 'api' (default) strips to the flat resolved graph; 'raw' returns the file/graph unchanged. Each action accepts only its own two values (this field is the union of what the two tools it replaces accepted) and refuses the third rather than guessing at an alias.
+  Options: `ui`, `api`, `raw`.
+</ParamField>
+<ParamField path="path" type="string">
+  action:"strip" / "slice" / "query" — Absolute server-side path to a workflow .json on disk (e.g. C:\\Users\\you\\ComfyUI\\user\\default\\workflows\\pusa_extend.json). Read directly from disk — no library lookup.
+</ParamField>
+<ParamField path="graph" type="object">
+  action:"strip" / "slice" / "query" — Inline workflow JSON (UI format for "strip"/"slice"; UI or API for "query"), as an alternative to path/filename.
+</ParamField>
+<ParamField path="groups" type="string | string[]">
+  action:"slice" (REQUIRED) — Group-title substrings (case-insensitive) whose output nodes seed the slice — CSV string or array, e.g. 'TEXT TO IMAGE,TXT' or ['extend','sampler']. Shared post-proc is pulled in via the closure.
+</ParamField>
+<ParamField path="image_path" type="string">
+  action:"from_image" (REQUIRED) — Absolute path to a ComfyUI-generated PNG file
+</ParamField>
+<ParamField path="view" type="enum" default="summary">
+  action:"analyze" — summary (default): structured text with sections, node IDs, key settings, virtual wires, and full connection graph — best for AI understanding. overview: mermaid diagram showing sections as summary nodes with cross-section data flow. detail: mermaid diagram for one section (requires section parameter). list: text listing of all sections with data flow summary. flat: single mermaid flowchart of the entire workflow (best for small workflows). health: graph-health heuristics (disconnected nodes, duplicate model loads, orphaned branches, muted/bypassed).
+  Options: `summary`, `overview`, `detail`, `list`, `flat`, `health`.
+</ParamField>
+<ParamField path="section" type="string">
+  action:"analyze" — Section name for detail view. Use view='list' first to see available section names.
+</ParamField>
+<ParamField path="node_id" type="string">
+  action:"prompt_director" — Optional ComfyUI node id; omit to list all recent Prompt Director runtime states.
+</ParamField>
+<ParamField path="types" type="string[]">
+  action:"query" — Keep nodes whose class_type contains ANY of these (case-insensitive).
+</ParamField>
+<ParamField path="title" type="string">
+  action:"query" — Keep nodes whose title contains this.
+</ParamField>
+<ParamField path="where" type="string[]">
+  action:"query" — Widget predicates, ANDed: 'cfg&gt;7', 'sampler_name=euler', 'text~sunset'.
+</ParamField>
+<ParamField path="ids" type="string | number[]">
+  action:"query" — Keep exactly these node ids.
+</ParamField>
+<ParamField path="upstream_of" type="string | number">
+  action:"query" — Scope to the dependency closure FEEDING this node id.
+</ParamField>
+<ParamField path="downstream_of" type="string | number">
+  action:"query" — Scope to the nodes CONSUMING this node id's outputs.
+</ParamField>
+<ParamField path="depth" type="integer">
+  action:"query" — Max hops from the traversal seed (seed=0). Absent = full closure.
+</ParamField>
+<ParamField path="fields" type="enum">
+  action:"query" — Projection: compact one-liners (default), bare ids, or detail JSON rows.
+  Options: `ids`, `compact`, `detail`.
+</ParamField>
+<ParamField path="group_by" type="enum">
+  action:"query" — Aggregate: counts per class_type instead of listing.
+  Options: `type`.
+</ParamField>
+<ParamField path="limit" type="integer">
+  action:"query" — Max nodes listed (default 40, max 200).
+</ParamField>
+<ParamField path="max_chars" type="integer">
+  action:"query" — Output character bound (default 12000, max 60000). Raise this — not `limit` — when the truncation tail says the char budget cut the result.
+</ParamField>
+
+### Examples
 
 **You say:** What workflows have I got saved?
 
 ```json
 {
-  "tool": "list_workflows",
-  "arguments": {}
+  "tool": "get_workflow",
+  "arguments": {
+    "action": "list"
+  }
 }
 ```
 
-**You get back:** A numbered list of names, each relative to the library root — one filed in a folder shows as VIDEO/MiniMaxH3/clip.json. Pick one and hand the whole name to analyze_workflow or get_workflow.
-
----
-
-## get_workflow
-
-Return the full JSON of a SAVED workflow FILE, named from the library — a file on disk, NOT the graph open on the user's canvas (that is panel_graph_outline). Defaults to converted API format; pass format:'ui' for the raw on-disk UI JSON. Use analyze_workflow instead if you just need to understand the workflow — it returns a structured summary without flooding context with JSON. Use get_workflow only when you need the actual JSON for enqueue_workflow, modify_workflow, or save_workflow.
-
-<Tip>**In plain terms:** Reads a saved FILE, not the graph currently open on your canvas. Ask for this when the agent needs the actual JSON to change or run; if you only want to know what a workflow does, analyze_workflow is the shorter answer.</Tip>
-
-### Parameters
-
-<ParamField path="filename" type="string" required>
-  Workflow library name, exactly as list_workflows reports it. A workflow filed in a folder keeps its folder in the name ('VIDEO/MiniMaxH3/clip.json') and that whole string goes here.
-</ParamField>
-<ParamField path="format" type="enum" default="api">
-  Output format: 'api' (default, recommended) converts to compact API format with named inputs, connection references, and _meta.mode flags for muted/bypassed nodes. 'ui' returns the raw UI format with layout positions and links arrays. Options: `ui`, `api`.
-</ParamField>
-
-### Examples
+**You get back:** A numbered list of names, each relative to the library root — one filed in a folder shows as VIDEO/MiniMaxH3/clip.json. Pick one and hand the whole name back as `filename`.
 
 **You say:** Open my portrait workflow so we can change the prompt.
 
@@ -54,6 +114,7 @@ Return the full JSON of a SAVED workflow FILE, named from the library — a file
 {
   "tool": "get_workflow",
   "arguments": {
+    "action": "get",
     "filename": "portrait-flux.json"
   }
 }
@@ -67,6 +128,7 @@ Return the full JSON of a SAVED workflow FILE, named from the library — a file
 {
   "tool": "get_workflow",
   "arguments": {
+    "action": "get",
     "filename": "portrait-flux.json",
     "format": "ui"
   }
@@ -75,119 +137,108 @@ Return the full JSON of a SAVED workflow FILE, named from the library — a file
 
 **You get back:** The on-disk UI format, including node positions and colours — what you want if the file is going to be loaded back into the canvas rather than executed.
 
----
-
-## run_workflow_url
-
-Read (and optionally execute) a shared ComfyUI workflow from a URL. Fetches the workflow JSON, accepts API-format prompt graphs or UI-format exports (UI is auto-converted via the same converter as get_workflow), validates it, and summarizes it. Supports raw .json links and GitHub blob/raw URLs (blob is normalized to raw); other share hosts that need a site API return a clear 'paste the raw JSON URL' error. The fetch is bounded (http/https only, timeout + size cap, loopback/private/metadata IPs rejected to prevent SSRF). READ-ONLY unless run=true; when run=true it enqueues the workflow (applying optional `inputs` overrides) and returns the prompt_id.
-
-### Parameters
-
-<ParamField path="url" type="string" required>
-  URL of the workflow JSON. Raw .json links and GitHub blob/raw URLs work directly.
-</ParamField>
-<ParamField path="run" type="boolean" default="false">
-  If true, enqueue the workflow for execution and return the prompt_id. Default false: only fetch, validate, and summarize (read-only).
-</ParamField>
-<ParamField path="inputs" type="object">
-  Optional parameter overrides applied (only when run=true) to every node that already has a matching input name. Common keys: cfg, steps, sampler_name, seed, text.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** What does my portrait workflow actually do?
 
 ```json
 {
-  "tool": "run_workflow_url",
+  "tool": "get_workflow",
   "arguments": {
-    "url": "<url>"
+    "action": "analyze",
+    "filename": "portrait-flux.json"
   }
 }
 ```
 
----
+**You get back:** A short summary: the model it loads, the prompts, the sampler settings, and what it saves.
 
-## strip_workflow
-
-Strip a workflow to a clean, flat API graph — resolving Get/Set buses, Reroutes, subgraph definitions, and bypassed/muted nodes into real connections (the 'de-getter-setter' pass). Unlike get_workflow, this reads from ANY server-side file path on disk (not just the cached workflow library), so it loads ad-hoc / expert workflow files that workflow_list and panel_open_workflow can't resolve. Provide exactly one of: path, filename, or graph. Returns conversion warnings, a node-type summary, and the stripped graph (much smaller than the raw UI JSON).
-
-### Parameters
-
-<ParamField path="path" type="string">
-  Absolute server-side path to a workflow .json on disk (e.g. C:\\Users\\you\\ComfyUI\\user\\default\\workflows\\pusa_extend.json). Read directly from disk — no library lookup.
-</ParamField>
-<ParamField path="filename" type="string">
-  Workflow library name as list_workflows reports it (subfolders included, e.g. 'IMAGE/portrait.json'), as an alternative to path.
-</ParamField>
-<ParamField path="graph" type="object">
-  Inline UI-format workflow JSON, as an alternative to path/filename.
-</ParamField>
-<ParamField path="format" type="enum" default="api">
-  'api' (default) strips to the flat resolved graph; 'raw' returns the file/graph unchanged. Options: `api`, `raw`.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
+**You say:** Is that workflow going to run, or is something missing?
 
 ```json
 {
-  "tool": "strip_workflow",
-  "arguments": {}
-}
-```
-
----
-
-## slice_workflow
-
-Slice ONE pipeline out of a toggle-template workflow — the kind built with rgthree 'Fast Groups Bypasser/Muter' where one graph holds many pipelines and only one is active at a time. Seeds from the output/SaveImage nodes in the named groups, takes their backward dependency closure (through real links AND virtual Set/Get buses), un-bypasses the kept nodes (and the internals of any subgraph defs they use), and returns a STANDALONE, activated UI graph carrying only the subgraph defs it uses. Reads from any server-side path, userdata filename, or inline graph. Pair with strip_workflow afterward to flatten the Set/Get buses into real connections.
-
-### Parameters
-
-<ParamField path="path" type="string">
-  Absolute server-side path to the workflow .json on disk.
-</ParamField>
-<ParamField path="filename" type="string">
-  Workflow library name as list_workflows reports it, subfolders included (e.g. 'IMAGE/portrait.json').
-</ParamField>
-<ParamField path="graph" type="object">
-  Inline UI-format workflow JSON.
-</ParamField>
-<ParamField path="groups" type="string | string[]" required>
-  Group-title substrings (case-insensitive) whose output nodes seed the slice — CSV string or array, e.g. 'TEXT TO IMAGE,TXT' or ['extend','sampler']. Shared post-proc is pulled in via the closure.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "slice_workflow",
+  "tool": "get_workflow",
   "arguments": {
-    "groups": "<groups>"
+    "action": "analyze",
+    "filename": "portrait-flux.json",
+    "view": "health"
   }
 }
 ```
+
+**You get back:** Problems only — missing models, unconnected inputs, nodes whose packs are not installed.
+
+**You say:** Which samplers in that graph are running above cfg 7?
+
+```json
+{
+  "tool": "get_workflow",
+  "arguments": {
+    "action": "query",
+    "filename": "portrait-flux.json",
+    "types": [
+      "KSampler"
+    ],
+    "where": [
+      "cfg>7"
+    ]
+  }
+}
+```
+
+**You get back:** One line per matching node instead of the whole file — the only context-safe way to ask a question of a 100-node graph.
+
+**You say:** How was this picture made?
+
+```json
+{
+  "tool": "get_workflow",
+  "arguments": {
+    "action": "from_image",
+    "image_path": "C:/ComfyUI/output/ComfyUI_00042_.png"
+  }
+}
+```
+
+**You get back:** The workflow ComfyUI embedded in the PNG when it saved it, in both API and UI form — the way to reverse-engineer someone else's image.
+
+**You say:** This graph is a mess of Get/Set nodes. What is actually wired to what?
+
+```json
+{
+  "tool": "get_workflow",
+  "arguments": {
+    "action": "strip",
+    "path": "C:/ComfyUI/user/default/workflows/expert.json"
+  }
+}
+```
+
+**You get back:** The same graph with the virtual wiring resolved into real connections, plus a note wherever the stripped form DIFFERS from the source. Read those notes before running it.
 
 ---
 
 ## save_workflow
 
-Save a workflow JSON to the connected ComfyUI server's user library so it appears in the ComfyUI web UI. Requires a running ComfyUI server; this writes to that server's userdata and overwrites any existing file with the same filename without confirmation. Web-UI-format JSON (&#123; nodes: [], links: [] &#125;) is saved as-is and is the preferred input — when re-saving an existing workflow, load it with get_workflow format='ui' and modify THAT. API-format graphs (&#123; '1': &#123; class_type, inputs &#125; &#125;) are AUTO-CONVERTED to Web UI format with a generated layout so the saved file always opens in the ComfyUI canvas (the canvas cannot open raw API format). Returns a confirmation message (noting the conversion and any warnings), or the HTTP status and error text on failure.
+WRITE to the ComfyUI user library: persist a workflow, or capture/verify its provenance lock. This is the only tool here that writes — reading is get_workflow. Driven by the `action` parameter:
+- action:"save" — Save a workflow JSON to the connected ComfyUI server's user library so it appears in the ComfyUI web UI. Requires a running ComfyUI server; this writes to that server's userdata and OVERWRITES any existing file with the same filename without confirmation. Web-UI-format JSON (&#123; nodes: [], links: [] &#125;) is saved as-is and is the preferred input — when re-saving an existing workflow, load it with get_workflow (action:"get", format='ui') and modify THAT. API-format graphs (&#123; '1': &#123; class_type, inputs &#125; &#125;) are AUTO-CONVERTED to Web UI format with a generated layout so the saved file always opens in the ComfyUI canvas (the canvas cannot open raw API format). Returns a confirmation message (noting the conversion and any warnings), or the HTTP status and error text on failure.
+- action:"lock" — Capture a provenance lock for a saved workflow so it can be exactly reproduced later. Walks the workflow's model loaders (CheckpointLoaderSimple, UNETLoader, VAELoader, LoraLoader, ControlNetLoader, etc.), SHA-256s every referenced model file, records the git commit currently checked out for every custom node pack the workflow's class_types come from, and captures ComfyUI's reported version. WRITES `&lt;filename&gt;.lock.json` next to the workflow in ComfyUI's user library. Requires a local install (COMFYUI_PATH) — SHA-256 needs raw file bytes and pack commits come from `custom_nodes/*/.git/HEAD`. Pair with action:"verify_lock" later to detect drift.
+- action:"verify_lock" — Compare a saved workflow's lock file against the current state of the local install and report drift. Loads `&lt;filename&gt;.lock.json`, re-computes a current lock from the same workflow, and diffs: which models have a different SHA-256, which custom node packs are on a different commit, whether ComfyUI's version changed. Use before re-running an important workflow days or weeks later to confirm it'll behave the same. Requires a local install (COMFYUI_PATH). Read-only; returns a structured drift report (empty arrays everywhere mean perfect parity).
+
+<Tip>**In plain terms:** The WRITE half of the library: store a workflow, or record/check the exact models and node-pack commits it ran against so it can be reproduced later.</Tip>
 
 ### Parameters
 
-<ParamField path="filename" type="string" required>
-  Filename to save as (e.g. 'my_workflow.json'). Will overwrite if it already exists.
+<ParamField path="action" type="enum" required>
+  Which write/provenance operation to perform. All three require `filename`; "save" also requires `workflow`.
+  Options: `action:"save"`, `action:"lock"`, `action:"verify_lock"`.
 </ParamField>
-<ParamField path="workflow" type="object" required>
-  Workflow JSON to save. Web UI format (&#123; nodes: [], links: [] &#125;) is stored verbatim; API format (&#123; '1': &#123; class_type, inputs &#125; &#125;) is auto-converted to Web UI format (generated layout) so it stays openable in ComfyUI's canvas. Not validated against the server before saving.
+<ParamField path="filename" type="string">
+  Workflow filename in the ComfyUI user library (e.g. 'my_workflow.json'). REQUIRED for every action. For action:"save" this OVERWRITES an existing file of the same name; for "lock"/"verify_lock" the lock is read/written as '&lt;filename&gt;.lock.json' alongside it.
+</ParamField>
+<ParamField path="workflow" type="object">
+  action:"save" (REQUIRED) — Workflow JSON to save. Web UI format (&#123; nodes: [], links: [] &#125;) is stored verbatim; API format (&#123; '1': &#123; class_type, inputs &#125; &#125;) is auto-converted to Web UI format (generated layout) so it stays openable in ComfyUI's canvas. Not validated against the server before saving.
 </ParamField>
 
-### Example
+### Examples
 
 **You say:** Save that as a new file so I don't lose the original.
 
@@ -195,6 +246,7 @@ Save a workflow JSON to the connected ComfyUI server's user library so it appear
 {
   "tool": "save_workflow",
   "arguments": {
+    "action": "save",
     "filename": "portrait-flux-v2.json",
     "workflow": {
       "4": {
@@ -224,128 +276,34 @@ Save a workflow JSON to the connected ComfyUI server's user library so it appear
 
 <Warning>Writing to a filename that already exists replaces that file. Ask for a new name — as above — when you want to keep the original.</Warning>
 
----
-
-## analyze_workflow
-
-SUMMARIZE a SAVED workflow FILE named from the library — sections, node settings, connections, and data flow. It reads a file from the library, NOT the graph open on the user's canvas (that is panel_graph_outline). Use this to understand a saved workflow before modifying or executing it. Returns a concise text summary (not raw JSON) optimized for AI reasoning. Prefer this over get_workflow unless you need the raw JSON for enqueue_workflow or modify_workflow.
-
-<Tip>**In plain terms:** "Explain this workflow to me." Cheaper and far more readable than get_workflow when you just want to understand what a file does.</Tip>
-
-### Parameters
-
-<ParamField path="filename" type="string" required>
-  Workflow library name, exactly as list_workflows reports it (e.g. 'Scene Builder v3.json', or 'VIDEO/MiniMaxH3/clip.json' for one filed in a folder — the folder is part of the name).
-</ParamField>
-<ParamField path="view" type="enum" default="summary">
-  summary (default): structured text with sections, node IDs, key settings, virtual wires, and full connection graph — best for AI understanding. overview: mermaid diagram showing sections as summary nodes with cross-section data flow. detail: mermaid diagram for one section (requires section parameter). list: text listing of all sections with data flow summary. flat: single mermaid flowchart of the entire workflow (best for small workflows). health: graph-health heuristics (disconnected nodes, duplicate model loads, orphaned branches, muted/bypassed). Options: `summary`, `overview`, `detail`, `list`, `flat`, `health`.
-</ParamField>
-<ParamField path="section" type="string">
-  Section name for detail view. Use view='list' first to see available section names.
-</ParamField>
-
-### Examples
-
-**You say:** What does my portrait workflow actually do?
+**You say:** Pin this one down so it renders the same in six months.
 
 ```json
 {
-  "tool": "analyze_workflow",
+  "tool": "save_workflow",
   "arguments": {
-    "filename": "portrait-flux.json"
+    "action": "lock",
+    "filename": "portrait-flux-v2.json"
   }
 }
 ```
 
-**You get back:** A short summary: the model it loads, the prompts, the sampler settings, and what it saves.
+**You get back:** A lock file written alongside the workflow, recording a SHA-256 for every model it loads and the git commit of every custom node pack it uses. Needs a local install — hashing reads the model files.
 
-**You say:** Is that workflow going to run, or is something missing?
+<Warning>This writes a second file (&lt;filename&gt;.lock.json) and hashes every referenced model, which on a large install is minutes of disk work.</Warning>
+
+**You say:** Has anything changed since I locked that workflow?
 
 ```json
 {
-  "tool": "analyze_workflow",
+  "tool": "save_workflow",
   "arguments": {
-    "filename": "portrait-flux.json",
-    "view": "health"
+    "action": "verify_lock",
+    "filename": "portrait-flux-v2.json"
   }
 }
 ```
 
-**You get back:** Problems only — missing models, unconnected inputs, nodes whose packs are not installed.
-
----
-
-## workflow_from_image
-
-Extract embedded ComfyUI workflow metadata from a PNG file. ComfyUI stores the full workflow (API format) and prompt data in PNG tEXt chunks. Use this to reverse-engineer how any ComfyUI image was generated.
-
-### Parameters
-
-<ParamField path="image_path" type="string" required>
-  Absolute path to a ComfyUI-generated PNG file
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "workflow_from_image",
-  "arguments": {
-    "image_path": "<image_path>"
-  }
-}
-```
-
----
-
-## lock_workflow
-
-Capture a provenance lock for a saved workflow so it can be exactly reproduced later. Walks the workflow's model loaders (CheckpointLoaderSimple, UNETLoader, VAELoader, LoraLoader, ControlNetLoader, etc.), SHA-256s every referenced model file, records the git commit currently checked out for every custom node pack the workflow's class_types come from, and captures ComfyUI's reported version. Writes `&lt;filename&gt;.lock.json` next to the workflow in ComfyUI's user library. Requires a local install (COMFYUI_PATH) — SHA-256 needs raw file bytes and pack commits come from `custom_nodes/*/.git/HEAD`. Pair with verify_workflow_lock later to detect drift.
-
-### Parameters
-
-<ParamField path="filename" type="string" required>
-  Workflow filename in the ComfyUI user library (e.g. 'my_workflow.json'). The lock is written as '&lt;filename&gt;.lock.json' alongside.
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "lock_workflow",
-  "arguments": {
-    "filename": "<filename>"
-  }
-}
-```
-
----
-
-## verify_workflow_lock
-
-Compare a saved workflow's lock file against the current state of the local install and report drift. Loads `&lt;filename&gt;.lock.json` from ComfyUI's user library, re-computes a current lock from the same workflow, and diffs: which models have a different SHA-256, which custom node packs are on a different commit, whether ComfyUI's version changed. Use before re-running an important workflow days or weeks later to confirm it'll behave the same. Requires a local install (COMFYUI_PATH). Returns a structured drift report (empty arrays everywhere mean perfect parity).
-
-### Parameters
-
-<ParamField path="filename" type="string" required>
-  Workflow filename whose lock to verify (e.g. 'my_workflow.json').
-</ParamField>
-
-### Example
-
-<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
-
-```json
-{
-  "tool": "verify_workflow_lock",
-  "arguments": {
-    "filename": "<filename>"
-  }
-}
-```
+**You get back:** A drift report: which models now hash differently, which node packs moved to a new commit, whether ComfyUI itself was updated. Empty everywhere means it will behave exactly as it did. Read-only.
 
 ---

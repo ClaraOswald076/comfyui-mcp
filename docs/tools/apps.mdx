@@ -22,7 +22,8 @@ Micro-apps on this ComfyUI (panel Apps feature): named workflows packaged for on
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Which apps operation to perform. "list" takes no other parameters; "get"/"run" require `app_id`; "run_status" requires `app_id` + `prompt_id`; "import" requires `registry_url` + `app_id`. Options: `list`, `get`, `run`, `run_status`, `import`.
+  Which apps operation to perform. "list" takes no other parameters; "get"/"run" require `app_id`; "run_status" requires `app_id` + `prompt_id`; "import" requires `registry_url` + `app_id`.
+  Options: `action:"list"`, `action:"get"`, `action:"run"`, `action:"run_status"`, `action:"import"`.
 </ParamField>
 <ParamField path="app_id" type="string">
   The app's uuid. REQUIRED for actions "get", "run", "run_status" (from action:"list") and "import" (the REGISTRY app's uuid, from the explore list).

@@ -43,6 +43,22 @@ import { parse as parseYaml } from "yaml";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { UiBridge } from "../services/ui-bridge.js";
+import { isScopeAddress } from "../services/session-scope.js";
+
+/** #884 — journal TICKETS (run completions #468, ask answers #486) must be
+ *  keyed by the REAL tab a run/card was routed to: the panel reports back under
+ *  that tab id, and a ticket keyed by the shared scope address a tool ctx is
+ *  bound to can never correlate — the agent's own render would come back
+ *  labeled "foreign" and boundary sweeps could never close the ticket (codex
+ *  round 3, P1). Resolves the scope to the active tab; a real-tab ctx is
+ *  returned unchanged. */
+function journalTabFor(ctx: PanelToolCtx): string {
+  if (!isScopeAddress(ctx.tabId)) return ctx.tabId;
+  // Pass the ctx's own (backend-qualified) scope address so the RIGHT
+  // conversation's in-flight-turn pin is consulted (#884 P0).
+  const b = ctx.bridge as { resolveSharedTabId?: (scopeId?: string) => string | undefined };
+  return b.resolveSharedTabId?.(ctx.tabId) ?? ctx.tabId;
+}
 import {
   dispatchOutcomeOf,
   isCapabilityRefusal,
@@ -786,8 +802,8 @@ interface PanelReadyResult {
 }
 
 /** True when a decoded /system_stats body has the recognizable ComfyUI shape (a
- *  `system` object and/or a `devices` array) — the same fields health_check /
- *  get_environment read. A bare 2xx from a reverse-proxy login page, an SPA
+ *  `system` object and/or a `devices` array) — the same fields get_system_stats (action:"health") /
+ *  install_comfyui (action:"environment") read. A bare 2xx from a reverse-proxy login page, an SPA
  *  catch-all, or a proxy error page is NOT ComfyUI and must NOT certify recovery
  *  (codex #509 P1). */
 function looksLikeSystemStats(body: unknown): boolean {
@@ -1897,7 +1913,7 @@ function fitQueryGraphReply(res: ToolResult, requested: unknown): ToolResult {
 // (/comfyui_mcp_panel/civitai/media?… served by the ComfyUI server the
 // orchestrator is connected to), so we fetch the top-N NON-GATED thumbnails here
 // and hand them back as MCP image content blocks — the same {type:"image"} bytes
-// mechanism panel_show_media / view_image use.
+// mechanism panel_show_media / get_image (action:"view") use.
 //
 // NSFW/consent gate preservation is the load-bearing invariant: a result the
 // panel would render as a BLURRED/gated placeholder (rating outside the user's
@@ -3558,7 +3574,7 @@ function comfyWorkflowsDirs(): string[] {
 
 // The raw-Response userdata GET (why it bypasses `fetchApi`, and what a thrown error
 // vs a returned Response each prove) now lives in services/userdata-library.ts, shared
-// with list_workflows — see #810: the two callers had drifted, one recursing into
+// with get_workflow (action:"list") — see #810: the two callers had drifted, one recursing into
 // subfolders and one not.
 
 /**
@@ -3616,7 +3632,7 @@ const looseName = (name: string): string =>
   name.replace(/\\/g, "/").normalize("NFC").toLowerCase();
 /**
  * The connected ComfyUI's OWN list of saved workflow store keys, or null when the
- * listing could not be read. This is the same source list_workflows reports (the
+ * listing could not be read. This is the same source get_workflow (action:"list") reports (the
  * SAVED library, not the open tabs), so it reflects the server's runtime
  * `--user-directory` — it is asked, never reconstructed. Used only to turn an
  * authoritative "no such name" into either the server's EXACT key or an explicit
@@ -3662,7 +3678,7 @@ function assertUiWorkflow(parsed: unknown, sourceLabel: string): Record<string, 
  * An ABSOLUTE path is read off the orchestrator's own disk, unchanged.
  *
  * A RELATIVE name is resolved AUTHORITATIVELY by the CONNECTED ComfyUI's userdata
- * API — the same source list_workflows / panel_open_workflow read. That
+ * API — the same source get_workflow (action:"list") / panel_open_workflow read. That
  * server resolves the name under its RUNTIME `--user-directory`, so a custom user
  * directory just works and a same-named file under a reconstructed default-layout
  * path can never shadow it (#202).
@@ -3717,7 +3733,7 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
   }
 
   // RELATIVE name → the AUTHORITATIVE source is the connected ComfyUI's userdata
-  // API (the SAME source list_workflows / panel_open_workflow read): it resolves
+  // API (the SAME source get_workflow (action:"list") / panel_open_workflow read): it resolves
   // under the runtime `--user-directory`, so a CUSTOM user-dir loads the correct
   // file and a stale same-named file under the orchestrator's guessed default
   // dir can't shadow it (#202). Try it FIRST; fall back to local disk ONLY when
@@ -3871,7 +3887,7 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
   // The server ANSWERED "no such name". Before giving up, ask it for its OWN listing
   // and look for the same name in a different Unicode normal form — a name pasted
   // from a listing (or produced on another OS) can be byte-different yet denote the
-  // same file, which is how a workflow that list_workflows plainly shows still 404s
+  // same file, which is how a workflow that get_workflow (action:"list") plainly shows still 404s
   // here. Only the SERVER's own entry is retried, so this resolves the name the
   // connected ComfyUI itself reports; it never reconstructs a path. More than one
   // match is AMBIGUOUS and is refused rather than guessed at.
@@ -3913,7 +3929,7 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
         throw new Error(
           `"${p}" is ambiguous in the connected ComfyUI's workflow library — it matches ` +
             `${matches.length} saved workflows (${matches.map((k) => `"${k}"`).join(", ")}). ` +
-            `Refusing to guess which one you meant: pass the exact name from list_workflows, ` +
+            `Refusing to guess which one you meant: pass the exact name from get_workflow (action:"list"), ` +
             `or an absolute path.`,
         );
       }
@@ -3958,7 +3974,7 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
     // possibly-different local file; report the status honestly.
     throw new Error(
       `Could not read "${p}" from the connected ComfyUI: ${outcome.detail}. ` +
-        `Pass an absolute path, or a name shown by list_workflows.`,
+        `Pass an absolute path, or a name shown by get_workflow (action:"list").`,
     );
   }
   if (outcome.kind === "absent") {
@@ -3988,7 +4004,7 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
           : "") +
         ` The connected ComfyUI is the authority on its own user directory (it may have been started` +
         ` with --user-directory), so the orchestrator will NOT guess at a local path that could be a` +
-        ` different file. Use a name exactly as shown by list_workflows (which reads the same library),` +
+        ` different file. Use a name exactly as shown by get_workflow action:"list", which reads the same library,` +
         ` or pass an absolute path.`,
     );
   }
@@ -4111,7 +4127,7 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
           ` normalization), and with ComfyUI unreachable there is no authority to confirm they are` +
           ` the same file — so it was NOT loaded. Retype the name exactly, or pass an absolute path.`
         : "") +
-      ` Pass an absolute path, or a name shown by list_workflows.`,
+      ` Pass an absolute path, or a name shown by get_workflow (action:"list").`,
   );
 }
 
@@ -4180,7 +4196,16 @@ export interface PanelToolCtx {
    * into resolveTarget. Throws (clear message) when a single active tab can't be
    * determined. Optional so lightweight test contexts can omit it.
    */
-  rebindToActiveTab?: () => { previous: string; current: string; rebound: boolean };
+  rebindToActiveTab?: (opts?: {
+    /** EXPLICIT scope-recovery consent — passed ONLY by
+     *  panel_set_workflow_target({mode:"current"}), the documented recovery
+     *  signal. Without it a SCOPE-bound ctx is never repinned at all, and even
+     *  with it the repin fires only when the current pin does NOT reach a live
+     *  tab (a healthy shared turn is never displaced — confirming gate 3, P0:
+     *  panel_reload's unconditional call was silently repinning healthy turns
+     *  onto whichever tab was last active). Real-tab ctxs ignore this flag. */
+    scopeRecoveryConsent?: boolean;
+  }) => { previous: string; current: string; rebound: boolean };
   /**
    * Best-effort in-place self-heal for the handful of tools that call the bridge
    * DIRECTLY (not via `ctx.call`) — e.g. panel_request_adult_consent's ask_user
@@ -4300,6 +4325,12 @@ export function makePanelToolCtx(
   };
 
   const ensureReachable = (): void => {
+    // #884 P0 — a SCOPE-bound ctx is never rebound onto a real tab id: its
+    // routing is the turn-target pin (or active-tab fallback), and when the
+    // pinned tab is gone the resolution THROWS loudly by design. Silently
+    // picking another tab here would be exactly the mid-turn re-target the pin
+    // forbids — and it would PERMANENTLY unbind this shared ctx.
+    if (isScopeAddress(ctx.tabId)) return;
     if (typeof bridge.canReach !== "function") return; // lightweight test ctx
     if (bridge.canReach(ctx.tabId)) return; // healthy binding — leave untouched
     if (workflowTargets?.get(ctx.tabId)?.mode === "pinned") return; // stay strict
@@ -4626,8 +4657,38 @@ export function makePanelToolCtx(
   // session is left untouched so this never hijacks routing on a multi-tab
   // deployment. Throws (clear message, via resolveActiveTabId) when a single
   // active tab can't be picked.
-  const rebindToActiveTab = (): { previous: string; current: string; rebound: boolean } => {
+  const rebindToActiveTab = (opts?: {
+    scopeRecoveryConsent?: boolean;
+  }): { previous: string; current: string; rebound: boolean } => {
     const previous = ctx.tabId;
+    // #884 P0 — a SCOPE-bound ctx must never be REPLACED by a real tab id (that
+    // would permanently narrow the shared conversation's routing to one tab).
+    // The ctx therefore stays scope-bound. Its ONE recovery is the explicit
+    // repin — and it is DOUBLE-gated (confirming gate 3, P0):
+    //  1. CONSENT: only panel_set_workflow_target({mode:"current"}) passes
+    //     scopeRecoveryConsent. panel_reload and every implicit self-heal call
+    //     this without it, and for them the scope branch is a strict no-op —
+    //     the previous round's unconditional repin let panel_reload silently
+    //     re-aim a HEALTHY turn at whichever tab a queued message had just
+    //     made last-active, the exact P0 this PR exists to prevent.
+    //  2. RECOVERY-ONLY: even with consent, a pin that still reaches a live
+    //     tab is healthy and stays. Only a dead or ambiguous pin (canReach
+    //     false — the state whose refusal names this tool as the way out,
+    //     confirming gate 2, P1) is escaped, via the bridge repin handler
+    //     (which re-checks both conditions itself, so no future caller can
+    //     bypass this gate).
+    if (isScopeAddress(previous)) {
+      // Provably dead/ambiguous ONLY: a bridge that cannot answer canReach
+      // cannot prove the pin is dead, so it must not be moved (conservative;
+      // every real bridge answers).
+      const pinProvenDead =
+        typeof bridge.canReach === "function" && !bridge.canReach(previous);
+      if (!opts?.scopeRecoveryConsent || !pinProvenDead) {
+        return { previous, current: previous, rebound: false };
+      }
+      const repinned = bridge.repinScopeToActive?.(previous);
+      return { previous, current: previous, rebound: Boolean(repinned) };
+    }
     // A healthy binding is left untouched (never disturb a live session). Recovery only
     // fires for an orphaned/stale tab id.
     if (bridge.canReach(previous)) return { previous, current: previous, rebound: false };
@@ -5080,13 +5141,19 @@ function desktopCanvasRedirect(
     isHeadless?: (id: string) => boolean;
     tabs?: () => Array<{ tab_id: string }>;
     resolveActiveTabId?: () => string;
+    resolveSharedTabId?: (scopeId?: string) => string | undefined;
   };
   // Older / lightweight bridges can't classify tabs — leave routing exactly as-is.
   if (typeof b.isHeadless !== "function" || typeof b.tabs !== "function") return null;
   // Only intervene when THIS session is bound to a canvas-less (mobile/remote) client.
   // A desktop-bound session — healthy, or merely orphaned by a reconnect — is left to
   // the normal ctx.call path and its reconnect/rebind machinery untouched.
-  if (!b.isHeadless(ctx.tabId)) return null;
+  // #884 — a SHARED-SCOPE session is bound to whatever the scope resolves to right
+  // now; when that is a canvas-less client (only a phone is connected), the same
+  // redirect / honest canvas-less error applies instead of blasting the command
+  // at the phone.
+  const boundTab = isScopeAddress(ctx.tabId) ? b.resolveSharedTabId?.(ctx.tabId) : ctx.tabId;
+  if (!boundTab || !b.isHeadless(boundTab)) return null;
   // Bound to a headless client: find the interactive (canvas-owning) DESKTOP tabs, the
   // SAME filter rebindToActiveTab/ensureReachable use for graph/workflow bindings.
   const live = b.tabs();
@@ -5351,7 +5418,9 @@ async function askUserWithGrace(
   } catch (err) {
     return fail(err);
   }
-  const tabId = ctx.tabId;
+  // #884 — the journal key is the REAL tab the card renders on (the bridge's
+  // late-answer sink records answers under it), never the scope address.
+  const tabId = journalTabFor(ctx);
   const fingerprint = askFingerprint(ask);
   // Open the ticket BEFORE dispatching: the answer can validate the instant the
   // card renders, and an answer that arrives with no ticket is unattributable.
@@ -5687,7 +5756,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
   const defs: PanelToolDef[] = [
     def(
       "panel_query_graph",
-      "FILTER or TRAVERSE a SUBSET of the live canvas, for when you ALREADY KNOW what you're looking for. NOT for 'show me the canvas' or any whole-graph overview — call panel_graph_outline FIRST for that. NOT query_workflow (that queries a saved file or JSON you provide, not the live canvas). Filters, traverses, projects and aggregates over the workflow the user is CURRENTLY VIEWING without dumping the whole graph (replaces the old panel_get_graph full-JSON dump; output is TOKEN-BOUNDED with an explicit truncation marker, so a big graph can never flood your context). Combine: `types` (node type contains any), `title` (contains), `where` widget predicates ANDed ('cfg>7', 'steps<=20', 'sampler_name=euler', 'text~sunset' — ops = != >= <= > < ~contains), `ids` (exact nodes — THE way to read ONE node's exact slot/widget detail: {ids:[42], fields:'detail'}), `upstream_of`/`downstream_of` + `depth` (dependency traversal: upstream = what FEEDS that node, downstream = what CONSUMES it; seed at depth 0), `fields` ('compact' one line per node [default], 'ids', 'detail' = the full node summary with slots + connections + mode), `group_by:'type'` (counts only), `limit` (default 40). detail rows include each node's MODE — a 'bypass' node is skipped and a 'mute' node kills everything downstream, so check modes on the path you care about before running (fix with panel_set_node_mode). Every result also carries `groups` (id, title, member node_ids — groups are geometric, trust this list) and, when viewing a SUBGRAPH (after panel_enter_subgraph), `rails` (boundary rail ids/slots). `max_chars` bounds the WHOLE result, those riders included, and the rows you asked for are spent first: on a big graph the riders lose their member ids, then drop out entirely, rather than starving your query — and each says in-band that it did, with the true counts. Typical flow: panel_graph_outline to orient → panel_query_graph to pinpoint/inspect → edit. Read-only.",
+      "FILTER or TRAVERSE a SUBSET of the live canvas, for when you ALREADY KNOW what you're looking for. NOT for 'show me the canvas' or any whole-graph overview — call panel_graph_outline FIRST for that. NOT get_workflow's query action (that queries a saved file or JSON you provide, not the live canvas). Filters, traverses, projects and aggregates over the workflow the user is CURRENTLY VIEWING without dumping the whole graph (replaces the old panel_get_graph full-JSON dump; output is TOKEN-BOUNDED with an explicit truncation marker, so a big graph can never flood your context). Combine: `types` (node type contains any), `title` (contains), `where` widget predicates ANDed ('cfg>7', 'steps<=20', 'sampler_name=euler', 'text~sunset' — ops = != >= <= > < ~contains), `ids` (exact nodes — THE way to read ONE node's exact slot/widget detail: {ids:[42], fields:'detail'}), `upstream_of`/`downstream_of` + `depth` (dependency traversal: upstream = what FEEDS that node, downstream = what CONSUMES it; seed at depth 0), `fields` ('compact' one line per node [default], 'ids', 'detail' = the full node summary with slots + connections + mode), `group_by:'type'` (counts only), `limit` (default 40). detail rows include each node's MODE — a 'bypass' node is skipped and a 'mute' node kills everything downstream, so check modes on the path you care about before running (fix with panel_set_node_mode). Every result also carries `groups` (id, title, member node_ids — groups are geometric, trust this list) and, when viewing a SUBGRAPH (after panel_enter_subgraph), `rails` (boundary rail ids/slots). `max_chars` bounds the WHOLE result, those riders included, and the rows you asked for are spent first: on a big graph the riders lose their member ids, then drop out entirely, rather than starving your query — and each says in-band that it did, with the true counts. Typical flow: panel_graph_outline to orient → panel_query_graph to pinpoint/inspect → edit. Read-only.",
       {
         types: z.array(z.string()).optional().describe("Node type contains ANY of these (case-insensitive)."),
         title: z.string().optional().describe("Node title contains this."),
@@ -5755,7 +5824,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_graph_outline",
-      "READ THE LIVE CANVAS the user is looking at, as text. 'Show me what's on the canvas' / 'what's on the graph right now' / 'read the current workflow' / 'describe the open graph' -> THIS TOOL, with no arguments. NOT visualize_workflow or visualize_workflow_hierarchical (those DRAW A DIAGRAM of a workflow you PASS IN — a saved file or JSON — and never see the live canvas). NOT panel_query_graph (that FILTERS a SUBSET, for when you already know what you're looking for). Returns one `outline` string covering the WHOLE open graph, topologically sorted (sources first, sinks last): each node as `id Type \"title\" [bypass/mute] [OUTPUT] · group:X  widget=value …` with `← inputs` (source_node.output_name) and `→ outputs` (target_node.input_name), after a GROUPS index (title → member node ids). It gives you the WIRING you would otherwise reconstruct by hand — read it FIRST to get oriented, then panel_query_graph to inspect one node ({ids:[42], fields:'detail'}) or panel_find_nodes for free-text search. Over `max_chars` it never cuts the graph short: it sheds per-node detail, or refuses with a reason — never a partial outline. Read-only.",
+      "READ THE LIVE CANVAS the user is looking at, as text. 'Show me what's on the canvas' / 'what's on the graph right now' / 'read the current workflow' / 'describe the open graph' -> THIS TOOL, with no arguments. NOT visualize_workflow (it DRAWS A DIAGRAM of a workflow you PASS IN — a saved file or JSON — and never sees the live canvas). NOT panel_query_graph (that FILTERS a SUBSET, for when you already know what you're looking for). Returns one `outline` string covering the WHOLE open graph, topologically sorted (sources first, sinks last): each node as `id Type \"title\" [bypass/mute] [OUTPUT] · group:X  widget=value …` with `← inputs` (source_node.output_name) and `→ outputs` (target_node.input_name), after a GROUPS index (title → member node ids). It gives you the WIRING you would otherwise reconstruct by hand — read it FIRST to get oriented, then panel_query_graph to inspect one node ({ids:[42], fields:'detail'}) or panel_find_nodes for free-text search. Over `max_chars` it never cuts the graph short: it sheds per-node detail, or refuses with a reason — never a partial outline. Read-only.",
       {
         max_chars: z
           .number()
@@ -6220,7 +6289,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         path: z
           .string()
           .optional()
-          .describe("Path to a workflow .json — an ABSOLUTE path on the ComfyUI machine's disk, or a name from list_workflows, which is looked up in the connected ComfyUI's own saved-workflow library (so a custom --user-directory resolves correctly). Read + parsed server-side and loaded onto the canvas (keeps a large JSON out of chat). A name the library does not have is REFUSED rather than guessed at from a local path."),
+          .describe("Path to a workflow .json — an ABSOLUTE path on the ComfyUI machine's disk, or a name from get_workflow (action:\"list\"), which is looked up in the connected ComfyUI's own saved-workflow library (so a custom --user-directory resolves correctly). Read + parsed server-side and loaded onto the canvas (keeps a large JSON out of chat). A name the library does not have is REFUSED rather than guessed at from a local path."),
         graph: z
           .union([z.string(), z.record(z.string(), z.unknown())])
           .optional()
@@ -6449,7 +6518,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_run",
-      "Queue the workflow the user has OPEN — exactly like them pressing Queue Prompt (current widget values, the live graph they can see). On success it confirms the run was queued; if ComfyUI REFUSES the prompt (validation failure on either channel — per-node node_errors OR a top-level error like a missing node type) it returns a FAILURE with that rejection detail, never a false 'queued'. Pass to_node_id to RUN ONLY ONE BRANCH ('run to node'): ComfyUI renders just that output node plus everything upstream of it and SKIPS every other output branch — handy for previewing or debugging part of a big graph without rendering the whole thing. to_node_id MUST be an OUTPUT node (SaveImage, PreviewImage, SaveVideo, …) — pick the one at the END of the branch you want; nodes are tagged is_output:true in panel_query_graph's detail rows. The output node may be NESTED inside a subgraph — just pass its id (resolved in the scope you're currently viewing, then anywhere in the workflow); the tool builds the nested execution path for you. Omit it to run the whole graph. Use this so the render runs on THEIR canvas and they see the result.",
+      "Queue the workflow the user has OPEN — exactly like them pressing Queue Prompt (current widget values, the live graph they can see). On success it confirms the run was queued; if ComfyUI REFUSES the prompt (validation failure on either channel — per-node node_errors OR a top-level error like a missing node type) it returns a FAILURE with that rejection detail, never a false 'queued'. Pass to_node_id to RUN ONLY ONE BRANCH ('run to node'): ComfyUI renders just that output node plus everything upstream of it and SKIPS every other output branch — handy for previewing or debugging part of a big graph without rendering the whole thing. to_node_id MUST be an OUTPUT node (SaveImage, PreviewImage, SaveVideo, …) — pick the one at the END of the branch you want; nodes are tagged is_output:true in panel_query_graph's detail rows. The output node may be NESTED inside a subgraph — just pass its id (resolved in the scope you're currently viewing, then anywhere in the workflow); the tool builds the nested execution path for you. Omit it to run the whole graph. DUPLICATE FENCE (#862): if a render this session cannot account for is already in flight (after a reconnect this is usually YOUR earlier render still running — the queue record does not survive a restart), the run is REFUSED before anything is queued and the in-flight prompt is named; inspect queue (action:'list') first, or pass allow_duplicate:true only to deliberately stack behind it. Use this so the render runs on THEIR canvas and they see the result.",
       {
         batch_count: z
           .number()
@@ -6465,13 +6534,74 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .describe(
             "Output node id to render UP TO (partial execution). Omit to run the whole graph. Must be an OUTPUT node — one with is_output:true in panel_query_graph's detail rows. May be nested inside a subgraph (pass the node's own id).",
           ),
+        allow_duplicate: z
+          .boolean()
+          .optional()
+          .describe(
+            "Queue even when a render this session cannot account for is already in flight (default false). When work is in flight that this session has no record of queueing — e.g. YOUR OWN earlier render still running after a reconnect, whose record does not survive the restart — panel_run REFUSES to stack a duplicate and names the in-flight prompt instead. Pass true only to deliberately queue behind it (a sweep/batch).",
+          ),
       },
       async (args: A, ctx) => {
         // BACKPRESSURE: the agent can't see ComfyUI's queue, so re-queuing while a
         // render is already running silently stacks behind it (this is how a stuck
         // job once let three more pile up). Snapshot the watchdog BEFORE we queue.
         const pre = QueueMonitor.snapshot();
+        // #862 — the fence fires BEFORE the queue call, not after. After a
+        // reconnect the resumed agent has no running-state signal, and the old
+        // order queued first and only THEN appended the "[QUEUE] already running"
+        // note — a duplicate the agent then had to find and cancel. When in-flight
+        // work is not PROVABLY this session's own, refuse to enqueue: name what
+        // is in flight and require an explicit allow_duplicate to stack behind
+        // it. "Not provably ours" is the honest phrasing, not "foreign": the
+        // self-queue ledger is in-memory and prompt-id-based, so after an
+        // orchestrator restart — or whenever the panel's queue reply carried no
+        // prompt id — the agent's OWN earlier render reads as unproven, which is
+        // exactly the duplicate this fence exists to stop. The fence therefore
+        // keys on selfAttributedProven, the strict id-matched form; the coarse
+        // recent-self-queue fallback that softens the #559 backlog warning would
+        // also wave an unrelated render through (codex gate). The deliberate cost:
+        // a fast self-queued burst whose ids the 1 Hz poll has not captured yet
+        // is refused too, with the override named — a false refusal with an
+        // actionable remedy, never a silent duplicate. A provably self-attributed
+        // in-flight batch (a sweep whose ids are recorded and accounted for)
+        // still queues, exactly as before; an unconnected watchdog proves nothing
+        // either way, so the call proceeds and the post-queue note remains the
+        // disclosure of last resort (and the TOCTOU net: work can start between
+        // this snapshot and the dispatch). This composes with #694's retry_of
+        // rather than duplicating it: that token dedupes an EXPLICIT retry of an
+        // outcome-unknown dispatch at the panel; this fence stops a BLIND
+        // re-issue before any dispatch.
+        if (
+          args.allow_duplicate !== true &&
+          pre.connected &&
+          (pre.running || pre.queueDepth > 0) &&
+          !pre.selfAttributedProven
+        ) {
+          const pending = Math.max(0, pre.queueDepth - (pre.running ? 1 : 0));
+          const pendingTxt = pending > 0 ? ` + ${pending} pending` : "";
+          return fail(
+            `panel_run refused to queue: a render is already in flight on ComfyUI` +
+              (pre.runningPromptId
+                ? ` (running prompt ${pre.runningPromptId}${pre.currentNode ? `, currently at node ${pre.currentNode}` : ""}${pendingTxt})`
+                : ` (${pre.queueDepth} job(s) in the queue)`) +
+              `, and this session cannot confirm it as its own — the queue record is in-memory and ` +
+              `prompt-id-based, so after a reconnect/restart (or when an earlier queue reply carried ` +
+              `no prompt id) even YOUR OWN earlier render reads as unconfirmable, and queueing now ` +
+              `would stack a DUPLICATE behind it (#862). Nothing was queued. Inspect with queue ` +
+              `(action:"list"): if the in-flight job is the render you already started, wait for it ` +
+              `and confirm the outcome with get_history instead of re-running it. If you genuinely ` +
+              `intend to stack another render behind it (a deliberate sweep/batch), re-call panel_run ` +
+              `with allow_duplicate:true. If the in-flight job is actually wedged, queue ` +
+              `(action:"cancel") with clear_pending:true interrupts it AND drops everything pending.`,
+          );
+        }
         const runCmd = { cmd: "graph_run", batch_count: args.batch_count, to_node_id: args.to_node_id };
+        // #884 — capture the journal tab BEFORE dispatch: this is the tab the
+        // bridge is about to route the run to (both read the same active-tab
+        // resolution), so the #468 ticket keys the tab whose panel will report
+        // the completion. Resolving AFTER the (seconds-long) queue round-trip
+        // could key a tab the user has since moved to (codex r3/r4 timing).
+        const runTicketTab = journalTabFor(ctx);
         let res = await ctx.call(runCmd, 20000);
         // Derive the verdict from the AUTHORITATIVE reply, not a bare `queued`
         // flag. A rejection — a no-connected-tab / thrown-queuePrompt error
@@ -6542,7 +6672,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // journal an undelivered completion and replay it into the right run
         // instead of losing it while the agent works through a goal.
         const correlatable = RunCompletions.openRun(queuedId, {
-          tabId: ctx.tabId,
+          // #884 — the REAL routed tab, captured at dispatch (see runTicketTab):
+          // the panel's `executed` event arrives under that id.
+          tabId: runTicketTab,
           ...(typeof args.to_node_id === "number" ? { toNodeId: args.to_node_id } : {}),
         });
         // Append anti-poll guidance: the agent should go idle after queuing so the
@@ -6554,8 +6686,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // UNDETERMINED, so telling the agent to idle and wait would park it on a
         // promise we can't keep. Say so and point at the verification path instead.
         const note = correlatable
-          ? "\n\n[IMPORTANT] You will be notified automatically with the output image(s)/video when the render finishes — do NOT poll queue (action:\"list\"), get_history, or list_output_images. Just end your turn now and wait for the result to be delivered to you."
-          : "\n\n[IMPORTANT] The run was queued, but the panel reported NO prompt id for it, so a completion event CANNOT be correlated back to this run — its outcome will be reported to you as UNDETERMINED. Do NOT simply idle and wait indefinitely: end your turn, and if nothing arrives, confirm the outcome with get_history before acting on it.";
+          ? "\n\n[IMPORTANT] You will be notified automatically with the output image(s)/video when the render finishes — do NOT poll queue (action:\"list\"), get_history, or get_image (action:\"list_outputs\"). Just end your turn now and wait for the result to be delivered to you."
+          : "\n\n[IMPORTANT] The run was queued, but the panel reported NO prompt id for it, so a completion event CANNOT be correlated back to this run — its outcome will be reported to you as UNDETERMINED. Do NOT simply idle and wait indefinitely: end your turn, and if nothing arrives, confirm the outcome with get_history (action:\"list\") before acting on it.";
         // Backpressure note. A backlog is only alarming when it's a job we did NOT
         // queue (possibly foreign/stuck). Deliberately batching renders — a sweep,
         // a multi-variant comparison — is a NORMAL workflow, so a queue made of our
@@ -6643,7 +6775,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_refresh_nodes",
-      "Re-pull the live ComfyUI server's /object_info and rebuild every combo/loader option list in the user's open tab, so an asset that appeared server-side AFTER the tab loaded becomes SELECTABLE without a manual reload (the 'press R' step) or a restart. Use this right after stage_output_as_input (chaining a stage's output into a LoadImage / VHS_LoadVideo / LoadAudio loader — the returned filename won't be in the loader's dropdown until you refresh), after downloading a model / LoRA / VAE (a freshly downloaded file is otherwise 'not a valid option' in its loader), or after installing a node pack. Then panel_set_widget / panel_add_node will accept the new value. Non-destructive: it only re-registers node defs and refreshes combo option lists — it does NOT change your graph and is undo-neutral. Idempotent (safe to call repeatedly). Returns whether the refresh authoritatively fetched fresh defs.",
+      "Re-pull the live ComfyUI server's /object_info and rebuild every combo/loader option list in the user's open tab, so an asset that appeared server-side AFTER the tab loaded becomes SELECTABLE without a manual reload (the 'press R' step) or a restart. Use this right after upload_image (action:\"stage\") (chaining a stage's output into a LoadImage / VHS_LoadVideo / LoadAudio loader — the returned filename won't be in the loader's dropdown until you refresh), after downloading a model / LoRA / VAE (a freshly downloaded file is otherwise 'not a valid option' in its loader), or after installing a node pack. Then panel_set_widget / panel_add_node will accept the new value. Non-destructive: it only re-registers node defs and refreshes combo option lists — it does NOT change your graph and is undo-neutral. Idempotent (safe to call repeatedly). Returns whether the refresh authoritatively fetched fresh defs.",
       {},
       async (_args, ctx) =>
         // Same bounded ack budget as the refresh-before-validate writes (#599): a
@@ -6661,13 +6793,27 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .describe("'orchestrator' (default): respawn the agent and its comfyui tool server (agent config, MCP servers, system prompt, comfyui tool code). Does NOT restart the long-lived orchestrator process behind the panel_* tools. 'frontend': reload the panel UI for new web code."),
       },
       async (args: A, ctx) => {
-        // panel_reload is an explicit "recover me now" signal — if THIS session's
-        // tab id was orphaned by a reconnect/reload/workflow-switch, self-heal it
-        // onto the active tab first so a stuck session can recover by calling this
-        // (and so the soft_reload frame actually reaches a live tab). A healthy
-        // session is left untouched; an ambiguous multi-tab case surfaces a clear
-        // error rather than guessing.
-        if (ctx.rebindToActiveTab) {
+        // panel_reload self-heals an orphaned REAL-tab binding onto the active
+        // tab (so the soft_reload frame reaches a live tab), but it is NOT a
+        // scope-repin consent path (confirming gate 3, P0): a SCOPE-bound
+        // session's in-flight turn pin is only ever moved by the explicit
+        // panel_set_workflow_target({mode:"current"}) recovery. A scope ctx
+        // whose pin is dead therefore FAILS here, naming that recovery —
+        // instead of silently re-aiming the turn (and every mutation that
+        // follows it) at whichever tab happens to be last-active.
+        if (isScopeAddress(ctx.tabId)) {
+          const reachable =
+            typeof ctx.bridge.canReach === "function" ? ctx.bridge.canReach(ctx.tabId) : true;
+          if (!reachable) {
+            return fail(
+              "This conversation's current turn is pinned to a tab that is no longer " +
+                "reachable (it disconnected or its origin is ambiguous), so the reload " +
+                "frame has nowhere safe to go. Switch to the ComfyUI tab you want, call " +
+                'panel_set_workflow_target({mode:"current"}) to re-bind this session onto ' +
+                "it, then retry panel_reload.",
+            );
+          }
+        } else if (ctx.rebindToActiveTab) {
           // Strict-single: if this session's tab is orphaned AND 2+ tabs are live,
           // do NOT guess (the bridge would fall back to last-active, possibly an
           // unrelated tab) — surface a clear error so the user picks, honoring the
@@ -6804,11 +6950,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_request_secret",
-      "Securely collect an API token / secret from the user and write it straight to config — you NEVER see the value and it is never saved to chat history. The panel shows a masked input; the pasted value goes directly to the orchestrator, which stores it on the target MCP server, then applies it. Returns only a redacted confirmation.\n\nTWO targets:\n• The BUILT-IN comfyui server (mcp_server 'comfyui', target_kind 'env') — for tokens YOUR OWN comfyui tools need. The env key MUST be one of a fixed allowlist: CIVITAI_API_TOKEN (download_civitai_model), HUGGINGFACE_TOKEN or HF_TOKEN (HuggingFace downloads). Any other key is rejected. The secret is written to the canonical credential file, which the comfyui tools re-read each time they use a credential — so the running tools pick it up with NO panel_reload. The tool result states what was actually verified (that the file now carries the key) and what the live tool sessions did; if it reports the save could NOT be confirmed, treat it as unconfigured rather than retrying blindly. THIS is what fixes a download that returned HTTP 401.\n• A user-added MCP server (e.g. the 'civitai' http server you added with panel_add_mcp) — use target_kind 'header' (e.g. Authorization, value_prefix 'Bearer ') for http/sse, or 'env' for stdio; then call panel_reload to load it.\n\nFor a CivitAI DOWNLOAD 401, target 'comfyui' env CIVITAI_API_TOKEN — NOT the 'civitai' MCP server (that's only the search MCP).",
+      "Securely collect an API token / secret from the user and write it straight to config — you NEVER see the value and it is never saved to chat history. The panel shows a masked input; the pasted value goes directly to the orchestrator, which stores it on the target MCP server, then applies it. Returns only a redacted confirmation.\n\nTWO targets:\n• The BUILT-IN comfyui server (mcp_server 'comfyui', target_kind 'env') — for tokens YOUR OWN comfyui tools need. The env key MUST be one of a fixed allowlist: CIVITAI_API_TOKEN (download_model action:\"download_civitai\"), HUGGINGFACE_TOKEN or HF_TOKEN (HuggingFace downloads). Any other key is rejected. The secret is written to the canonical credential file, which the comfyui tools re-read each time they use a credential — so the running tools pick it up with NO panel_reload. The tool result states what was actually verified (that the file now carries the key) and what the live tool sessions did; if it reports the save could NOT be confirmed, treat it as unconfigured rather than retrying blindly. THIS is what fixes a download that returned HTTP 401.\n• A user-added MCP server (e.g. the 'civitai' http server you added with panel_add_mcp) — use target_kind 'header' (e.g. Authorization, value_prefix 'Bearer ') for http/sse, or 'env' for stdio; then call panel_reload to load it.\n\nFor a CivitAI DOWNLOAD 401, target 'comfyui' env CIVITAI_API_TOKEN — NOT the 'civitai' MCP server (that's only the search MCP).",
       {
         label: z.string().describe("Prompt shown above the masked input, e.g. 'Paste your CivitAI API token'."),
         target_kind: z.enum(["header", "env"]).describe("'header' for http/sse servers (e.g. Authorization); 'env' for stdio servers and the built-in comfyui server."),
-        mcp_server: z.string().describe("MCP server to attach the secret to: 'comfyui' for the built-in tools (download_civitai_model etc.), 'orchestrator' for orchestrator-level provider keys (OPENROUTER_API_KEY), or a user-added server name like 'civitai'."),
+        mcp_server: z.string().describe("MCP server to attach the secret to: 'comfyui' for the built-in tools (download_model action:\"download_civitai\" etc.), 'orchestrator' for orchestrator-level provider keys (OPENROUTER_API_KEY), or a user-added server name like 'civitai'."),
         key: z.string().describe("For 'comfyui': one of CIVITAI_API_TOKEN, HUGGINGFACE_TOKEN, HF_TOKEN (others rejected). For a user-added server: env var name or header name (e.g. 'Authorization')."),
         value_prefix: z.string().optional().describe("Optional string prepended to the token, e.g. 'Bearer '. Usually empty for env vars."),
         hint: z.string().optional().describe("Optional reassurance/help text shown under the input."),
@@ -7298,7 +7444,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                   `evidence that this creator has no content. Likely causes: the creator publishes only ` +
                   `images/videos (no models, so username lookup on model tabs can miss them), the username ` +
                   `is misspelled, or the CivitAI session is unauthenticated (a signed-out session can't see ` +
-                  `account-gated content). Verify the exact username with search_civitai_creators, or drive ` +
+                  `account-gated content). Verify the exact username with download_model action:"search_creators", or drive ` +
                   `the logged-in browser session directly.`,
               });
             }
@@ -7482,7 +7628,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // rebinds via ensureReachable when a tab is (re)connected.
           if (ctx.awaitReachable) await ctx.awaitReachable();
           try {
-            ctx.rebindToActiveTab(); // completes the rebind if awaitReachable didn't
+            // completes the rebind if awaitReachable didn't. mode:"current" is
+            // THE explicit scope-recovery consent (#884 gate 3) — the only
+            // caller that may escape a DEAD scope pin (a healthy pin still
+            // stays put; see rebindToActiveTab's double gate).
+            ctx.rebindToActiveTab({ scopeRecoveryConsent: true });
           } catch (err) {
             // #474: with 2+ live tabs the rebind is AMBIGUOUS — fail so the user picks.
             // But with ZERO tabs connected (the "Connected: none" window right after a
@@ -8783,7 +8933,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 (recovery.ready
                   ? `and it came back healthy in ${(recovery.waited_ms / 1000).toFixed(1)}s` +
                     (observed ? " (observed it go down then come back)." : " (cycle not directly observed).")
-                  : `but it did NOT become healthy within ${Math.round(recovery.waited_ms / 1000)}s — verify with health_check / panel_node_queue_status before assuming it restarted.`),
+                  : `but it did NOT become healthy within ${Math.round(recovery.waited_ms / 1000)}s — verify with get_system_stats (action:"health") / panel_node_queue_status before assuming it restarted.`),
             });
           }
           // Genuine refusal (busy guard / security / no eligible fallback) — return
@@ -8840,7 +8990,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               "ComfyUI restart was dispatched and accepted; it is restarting out-of-band. " +
               "There is no local boot endpoint I can safely probe from here, so I can't " +
               "confirm it finished coming back — a panel reconnect wouldn't prove this " +
-              "instance actually cycled. Check health_check / panel_node_queue_status in a " +
+              'instance actually cycled. Check get_system_stats (action:"health") / panel_node_queue_status in a ' +
               "few seconds to confirm it's back.",
           });
         }
@@ -8868,8 +9018,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             probes: recovery.attempts,
             saw_down: recovery.sawDown,
             note: recovery.sawDown
-              ? `Reboot was dispatched and ComfyUI went down, but it has not become healthy within ${waited}s — it may still be starting or the restart failed. Verify with health_check / panel_node_queue_status before retrying; do NOT assume it is back.`
-              : `The reboot command was sent but I could NOT confirm ComfyUI actually cycled within ${waited}s (it never went down — the panel may have merely disconnected/inferred a reboot without one). Verify with health_check / panel_node_queue_status; do NOT assume it restarted.`,
+              ? `Reboot was dispatched and ComfyUI went down, but it has not become healthy within ${waited}s — it may still be starting or the restart failed. Verify with get_system_stats (action:"health") / panel_node_queue_status before retrying; do NOT assume it is back.`
+              : `The reboot command was sent but I could NOT confirm ComfyUI actually cycled within ${waited}s (it never went down — the panel may have merely disconnected/inferred a reboot without one). Verify with get_system_stats (action:"health") / panel_node_queue_status; do NOT assume it restarted.`,
           });
         }
         // #400/#709: ComfyUI is healthy, but the panel's browser tab re-registers its own

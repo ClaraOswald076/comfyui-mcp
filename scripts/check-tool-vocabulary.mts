@@ -49,6 +49,7 @@ import {
   TOOL_NAMES,
   baselineIntegrity,
   actionLiteralSpans,
+  deadNameMentions,
   deadNameRe,
   panelBaselineIntegrity,
   rotMentions,
@@ -139,6 +140,47 @@ const SELF = new Set([
   // train_* names are in DEAD_NAMES, and — the load-bearing one — that the two
   // retired DELETE names resolve to different tools keyed by different fields.
   "src/__tests__/tools/train-consolidation.test.ts",
+  // Same, for 0.50.0 slice 11: asserts as FIXTURES that the twelve retired model
+  // names are in DEAD_NAMES with their exact `download_model` /
+  // `list_local_models` action replacements.
+  "src/__tests__/tools/models-consolidated.test.ts",
+  // Same, for 0.50.0 slice 14: each asserts as FIXTURES that the names its tool
+  // replaced are in DEAD_NAMES (create_workflow ← 3, visualize_workflow ← 4,
+  // get_workflow ← 7 and save_workflow ← 2).
+  "src/__tests__/tools/workflow-compose.test.ts",
+  "src/__tests__/tools/workflow-visualize.test.ts",
+  "src/__tests__/tools/workflow-library.test.ts",
+  // Same slice, one layer out: this passes three retired names to
+  // callToolAdmission as FIXTURES and asserts the direct channel REFUSES them by
+  // name. They are call arguments under test — the assertion is that nothing
+  // serves them — not guidance to call anything.
+  "src/__tests__/orchestrator/call-tool-admission.test.ts",
+  // Same, for 0.50.0 slice 12: the three parts of the custom-node fold each
+  // assert as FIXTURES that the names their tool replaced are in DEAD_NAMES
+  // (install_custom_node ← 8, search_custom_nodes ← 1, node_pack ← 9). The
+  // registry-search file also asserts the INVERSE — that `search_custom_nodes`
+  // is NOT in DEAD_NAMES, because the owner's split kept it alive — which it
+  // can only do by naming both it and the name it absorbed.
+  "src/__tests__/tools/node-management.test.ts",
+  "src/__tests__/tools/registry-search.test.ts",
+  "src/__tests__/tools/node-pack.test.ts",
+  // Same, for 0.50.0 slice 15: asserts as FIXTURES that the ten retired
+  // image/asset names are in DEAD_NAMES with their exact `get_image` /
+  // `upload_image` action replacements. Eight of the ten had their action
+  // RENAMED (view_image -> action:"view"), so the action-literal rule cannot
+  // reach them — they are a migration TABLE under assertion, not guidance.
+  "src/__tests__/tools/image-assets.test.ts",
+  // Same, for 0.50.0 slice 13: both spell the retired names as FIXTURES —
+  // install-environment.test.ts asserts the six install/env retirements resolve
+  // to the right `install_comfyui` action (including that the three tools which
+  // already had an `action` of their own map onto `panel_action` /
+  // `self_update_action` / `manager_setting` rather than colliding), and
+  // system-stats.test.ts asserts `get_logs`/`health_check` redirect AND that
+  // apply_manifest / clear_vram / report_issue / calculate stayed LIVE and out
+  // of DEAD_NAMES — the owner's ruling, which cannot be pinned without naming
+  // them.
+  "src/__tests__/tools/install-environment.test.ts",
+  "src/__tests__/tools/system-stats.test.ts",
   // Same, for the #659 retired-name error: these pass dead names to call_tool /
   // the ollama dispatch as FIXTURES and assert the error quotes the ledger's
   // replacement — the names are call arguments under test, not live guidance.
@@ -336,7 +378,19 @@ for (const path of files) {
       // instruction, not the history. Binding the name to the context string means the
       // exempted text must itself contain the name, so an instruction added beside it is
       // a second occurrence and fails.
-      const occurrences = text.split(dead.name).length - 1;
+      // COUNT THE WAY EVERY OTHER CHECK HERE DETECTS. `split(dead.name)` is a raw
+      // SUBSTRING split, while `deadNameRe`/`rotMentions`/`actionLiteralSpans` are all
+      // token-bounded — so the two disagreed exactly where a live name CONTAINS a dead
+      // one. With `self_update` retired, a line naming `self_update_action` (the real
+      // parameter on the consolidated tool) counted as an occurrence here while matching
+      // nowhere else, pushing a legitimately exempted line to `occurrences === 2` and
+      // failing it. That is a FALSE REFUSAL: the gate rejecting a valid `allowedIn`
+      // entry over a name that is not a mention at all.
+      //
+      // The fail-closed intent above is unchanged — a line carrying two REAL mentions
+      // still fails, because the ambiguity it guards against is real. This only stops
+      // counting things that were never mentions.
+      const occurrences = deadNameMentions(dead.name, text).length;
       if (
         occurrences === 1 &&
         dead.allowedIn?.some(

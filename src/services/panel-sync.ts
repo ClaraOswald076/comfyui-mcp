@@ -1,7 +1,7 @@
 // Node-pack auto-sync: decide whether the installed sidebar panel pack
 // (comfyui-agent-panel) is behind what THIS orchestrator build needs, and — when
 // it is, and only when the user has not pinned it — run the sync through the
-// hardened, verified install_panel path.
+// hardened, verified install_comfyui(action:'panel') path.
 //
 // WHY THIS EXISTS. The orchestrator ships on npm; the panel ships on the Comfy
 // Registry. Updating one does not update the other, so users end up running a
@@ -70,7 +70,7 @@ function isComparableVersion(v: string | undefined): v is string {
 /**
  * How to clear a pin, phrased for THIS session. These summaries are pushed
  * straight into the embedded panel chat on every hello, and that surface does
- * not carry install_panel (#784) — naming it there is the same dead end the
+ * not carry install_comfyui(action:'panel') (#784) — naming it there is the same dead end the
  * bridge refusal had.
  */
 const UNPIN_INSTRUCTION = (): string =>
@@ -130,7 +130,7 @@ const PANEL_PYPROJECT_URL =
  * (the update action, and the file where the real latest is published).
  *
  * A function, not a constant: the update instruction depends on whether
- * install_panel can act in THIS session.
+ * install_comfyui(action:'panel') can act in THIS session.
  */
 const FLOOR_IS_NOT_LATEST = (): string =>
   ` NOTE — that is a FLOOR check, not a latest-version check. It compares your panel ` +
@@ -383,7 +383,7 @@ export function evaluatePanelSync(
           `--base-directory, #766) the panel lives in a different tree and installing ` +
           `here would land in a custom_nodes that is never loaded. Make sure ComfyUI is ` +
           `running and reachable so its own install root can be read, or check ` +
-          `get_environment's local.workspace_path, then re-check.` +
+          `install_comfyui (action:"environment")'s local.workspace_path, then re-check.` +
           driftNote,
       };
     }
@@ -455,7 +455,7 @@ export function evaluatePanelSync(
           `(${required}+). You are ${describePanelPin(pin)}; nothing will be changed.` +
           // The pinned reader gets the same honesty, with the step that actually
           // applies to them: an update is gated behind clearing the pin, so
-          // sending them straight at install_panel(action='update') would be the
+          // sending them straight at install_comfyui(action:'panel', panel_action:'update') would be the
           // dead-end shape this cluster exists to remove.
           ` NOTE — that is a FLOOR check, not a latest-version check: a newer panel with ` +
           `fixes you are missing can exist while this still reads "meets the minimum", ` +
@@ -542,6 +542,58 @@ export interface PerformSyncOptions {
   deps?: PanelInstallerDeps;
   orchestratorVersion?: string;
   requiredVersion?: string;
+}
+
+/**
+ * #888 — the authoritative re-check behind the hello auto-sync FAILURE path.
+ *
+ * The sync's own pre-scan runs inside the reconnect/retarget window, where the
+ * base it freezes can describe the tree ComfyUI is ABOUT to be retargeted away
+ * from (or a tree read before a just-restarted server named its real root). A
+ * failure minted from that scan — "the pack is not present in custom_nodes" —
+ * can therefore be stale the moment it is thrown, while an immediate
+ * install_comfyui(action:'panel', panel_action:'status') shows the panel
+ * installed and compatible.
+ * Pushing that detail to the user as-is warns about a state that does not exist.
+ *
+ * So before the failure is surfaced, the caller re-asks the ONE question the
+ * whole sync exists to answer, against a FRESHLY resolved base: does the panel
+ * on disk meet this orchestrator's floor? A proven `meets-floor` verdict means
+ * the sync's goal is already met and the failure's warning would be false.
+ *
+ * Returns the fresh assessment, or null when the re-scan itself could not run
+ * (base unresolvable, disk unreadable, …). A "can't tell" NEVER counts as
+ * proof the warning was false — the caller keeps the original warning then.
+ *
+ * Note on the narrow opposite case: if the failed sync DID move the pack and
+ * only its verification threw, a meets-floor re-scan means the update landed
+ * and the floor is met — the warning's "no update was claimed" is equally
+ * false, so suppressing is still the truthful outcome. The stale-RUNNING-panel
+ * restart guidance that case loses is carried by the write gate's own refusal
+ * (it reads what the tab advertises and names the skew), so the user is not
+ * left without a path.
+ */
+export async function reassessPanelAfterSyncFailure(
+  opts: PerformSyncOptions = {},
+): Promise<PanelSyncAssessment | null> {
+  const deps = opts.deps ?? defaultDeps;
+  try {
+    // Same fresh, frozen base resolution the sync itself used — forced, because
+    // a hello can mean ComfyUI just restarted onto a different tree, and a cached
+    // base is precisely how the stale reading this re-check exists to catch was
+    // minted. panelStatus is a pure read and holds no lock, so this can run right
+    // behind the failed sync without contending with the op lock it released.
+    const pinnedDeps = await pinPanelBase(deps, { force: true });
+    const status = await panelStatus(pinnedDeps);
+    return evaluatePanelSync(status, {
+      orchestratorVersion: opts.orchestratorVersion,
+      requiredVersion: opts.requiredVersion,
+    });
+  } catch {
+    // Every guard is itself an operation that can fail. A failed re-check is
+    // "could not determine", never "determined fine" — report nothing.
+    return null;
+  }
 }
 
 /**

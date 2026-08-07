@@ -17,6 +17,10 @@ import {
 } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { errorText } from "../orchestrator/error-text.js";
+import {
+  acquireInstanceWitness,
+  type InstanceWitness,
+} from "./instance-witness.js";
 import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { findComfyuiPython } from "./env-capabilities.js";
@@ -2049,12 +2053,19 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
   // an end whose stamp cannot be read is "did not observe", never "observed the
   // same" (codex gate).
   //
+  // When the host cannot stamp the creation time at all (#914 — reported on
+  // macOS), the stamp comparison has nothing to work with, but the window still
+  // needs a continuity proof: an instance WITNESS — a WebSocket held open across
+  // the fetch (see instance-witness.ts). The witness's peer is the process holding
+  // the listening socket, so a live witness at the closing end means one continuous
+  // instance served both port lookups, and no pid reuse can leave it open. A
+  // witness that could not be acquired or that dropped mid-fetch is NOT evidence
+  // of substitution — only the absence of the fallback proof.
+  //
   // `missing` records WHICH capability was unavailable, so a refusal can name it
-  // rather than leaving the user to guess. This is a real, if narrow, platform
-  // limitation: a host that cannot report process creation times cannot have its
-  // restart verified, and we would rather say so than kill on an unverified pairing.
+  // rather than leaving the user to guess.
   let missingCapability: string | undefined;
-  const observeOwner = (): { pid: number; startedAt: string } | null => {
+  const observeOwner = (): { pid: number; startedAt?: string } | null => {
     let owner: number | null = null;
     try {
       owner = findPidByPort(port);
@@ -2067,14 +2078,9 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
         `port-owner lookup — on Linux this needs \`lsof\`, on Windows \`netstat\`/PowerShell)`;
       return null;
     }
-    const startedAt = resolveProcessIdentity(owner)?.startedAt;
-    if (!startedAt) {
-      missingCapability =
-        `the creation time of PID ${owner} could not be read, so that number cannot be ` +
-        `tied to a specific process (this host does not expose process start times to us)`;
-      return null;
-    }
-    return { pid: owner, startedAt };
+    // A missing stamp does NOT null the observation (#914): the pid is real
+    // evidence, and the continuity witness below stands in for the stamp.
+    return { pid: owner, startedAt: resolveProcessIdentity(owner)?.startedAt };
   };
 
   let argv: string[] = [];
@@ -2082,49 +2088,90 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
   let bracketed = false;
   for (let attempt = 0; attempt < 2; attempt++) {
     const before = observeOwner();
+    // #914: acquire the witness BEFORE the fetch, so the window it fences contains
+    // the fetch — acquiring it afterwards would prove nothing about who answered.
+    // Only needed when the opening observation has no stamp to compare; best-effort,
+    // since a failed acquisition just leaves this attempt with the stamp evidence.
+    let witness: InstanceWitness | undefined;
+    if (before && !before.startedAt) {
+      witness = await acquireInstanceWitness(getComfyUIBaseUrl());
+    }
+    // The finally is the ONLY cleanup: the bracket logic below exits by break,
+    // continue AND throw, and a close that depends on each path remembering it
+    // leaks a live socket the first time one doesn't (codex gate).
     try {
-      const stats = await getSystemStats();
-      argv = stats.system.argv ?? [];
-    } catch {
-      argv = [];
-      logger.warn("Could not fetch system_stats — will rely on PID detection");
-    }
-    const after = observeOwner();
-    pid = after?.pid ?? before?.pid ?? null;
-    if (pid == null) {
       try {
-        pid = findPidByPort(port);
+        const stats = await getSystemStats();
+        argv = stats.system.argv ?? [];
       } catch {
-        pid = null;
+        argv = [];
+        logger.warn("Could not fetch system_stats — will rely on PID detection");
       }
-    }
-    // No answer to bind means there is nothing to mis-bind: the pid-only paths
-    // below (including #449's reachable-but-unmapped) own that case.
-    if (argv.length === 0) break;
-    if (before && after) {
-      if (before.pid !== after.pid || before.startedAt !== after.startedAt) {
-        const err = new ProcessControlError(
-          `The process listening on port ${port} changed while ComfyUI was being identified ` +
-            `(PID ${before.pid} answered; PID ${after.pid} holds the port now${
-              before.pid === after.pid ? ", and it is a different process reusing that number" : ""
-            }). Nothing was stopped: the launch arguments we hold describe the instance that has ` +
-            `gone, not the one running now. Re-run once the server has settled.`,
-        );
-        err.identityAmbiguous = true;
-        throw err;
+      const after = observeOwner();
+      pid = after?.pid ?? before?.pid ?? null;
+      if (pid == null) {
+        try {
+          pid = findPidByPort(port);
+        } catch {
+          pid = null;
+        }
       }
-      bracketed = true;
-      break;
+      // No answer to bind means there is nothing to mis-bind: the pid-only paths
+      // below (including #449's reachable-but-unmapped) own that case.
+      if (argv.length === 0) break;
+      if (before && after) {
+        if (before.pid !== after.pid) {
+          const err = new ProcessControlError(
+            `The process listening on port ${port} changed while ComfyUI was being identified ` +
+              `(PID ${before.pid} answered; PID ${after.pid} holds the port now). Nothing was ` +
+              `stopped: the launch arguments we hold describe the instance that has gone, not ` +
+              `the one running now. Re-run once the server has settled.`,
+          );
+          err.identityAmbiguous = true;
+          throw err;
+        }
+        if (before.startedAt && after.startedAt) {
+          if (before.startedAt !== after.startedAt) {
+            const err = new ProcessControlError(
+              `The process listening on port ${port} changed while ComfyUI was being identified ` +
+                `(PID ${before.pid} answered and still holds the port, but it is a different ` +
+                `process reusing that number). Nothing was stopped: the launch arguments we ` +
+                `hold describe the instance that has gone, not the one running now. Re-run ` +
+                `once the server has settled.`,
+            );
+            err.identityAmbiguous = true;
+            throw err;
+          }
+          bracketed = true;
+          break;
+        }
+        // At least one end could not stamp the process. A stable pid NUMBER across
+        // the fetch is not identity — pid reuse defeats it — so the window closes on
+        // the witness instead (#914): still open here means one continuous instance
+        // held the port for the whole fetch.
+        if (witness?.alive()) {
+          bracketed = true;
+          break;
+        }
+        missingCapability =
+          `the creation time of PID ${before.pid} could not be read at both ends of the ` +
+          `request (this host does not reliably expose process start times to us), and ` +
+          `the fallback continuity check — a WebSocket held open to the server for the ` +
+          `duration of the request — could not be established or did not stay open`;
+        // One identity source may be flapping — retry once before giving up.
+        continue;
+      }
+      // One side of the bracket was unobservable — retry once before giving up.
+    } finally {
+      witness?.close();
     }
-    // One side of the bracket was unobservable — retry once before giving up.
   }
   if (argv.length > 0 && pid != null && !bracketed) {
     const err = new ProcessControlError(
       `ComfyUI answered on port ${port}, but its answer could not be tied to PID ${pid}: ` +
         `${missingCapability ?? "the port owner's identity could not be observed on both sides of the request"}. ` +
         `Nothing was stopped — killing a process we cannot identify risks taking down the wrong ` +
-        `one. Restart ComfyUI from the launcher that owns it, or install the missing tool ` +
-        `(\`lsof\` on Linux) and try again.`,
+        `one. Restart ComfyUI from the launcher that owns it, then try again.`,
     );
     err.identityAmbiguous = true;
     throw err;
@@ -2775,7 +2822,7 @@ export async function startComfyUI(anchor?: {
               (launchedChildExit
                 ? describeLaunchedChildExit(launchedChildExit)
                 : " The process this call launched is no longer running, so THIS RELAUNCH FAILED — it was not a slow start.")) +
-          " Check the ComfyUI logs, and re-check with health_check before assuming nothing is serving the port — an external launcher or supervisor may have brought one back since." +
+          ' Check the ComfyUI logs, and re-check with get_system_stats (action:"health") before assuming nothing is serving the port — an external launcher or supervisor may have brought one back since.' +
           (env ? ` Launch environment: ${env.note}.` : "") +
           launchEnvWarning(info),
         auto_restart: supervisorResult(info),
@@ -2808,7 +2855,7 @@ export async function startComfyUI(anchor?: {
         "the startup is NOT CONFIRMED YET — it does NOT mean it failed: ComfyUI with a normal " +
         "set of custom nodes routinely answers well after this window. " +
         "Do NOT kill it and do NOT launch a second copy onto this port. " +
-        `Re-check with health_check in another ${RECHECK_HINT_S}s; if it is still silent then, ` +
+        `Re-check with get_system_stats (action:"health") in another ${RECHECK_HINT_S}s; if it is still silent then, ` +
         "the ComfyUI logs will say why. To wait longer next time, raise " +
         `COMFYUI_STARTUP_CHECK_MAX_TRIES (currently ${readiness.max_tries} ` +
         `${readiness.max_tries === 1 ? "probe" : "probes"}, one every ` +
@@ -3187,6 +3234,42 @@ async function restartViaManagerReboot(context: {
 }): Promise<RestartResult> {
   logger.info(`Restarting ${context.label} ComfyUI via ComfyUI-Manager reboot...`);
 
+  // #871: pin the base and open the instance WITNESS before anything below reads
+  // the server, so the fenced window CONTAINS the argv read. The witness is the
+  // per-instance identity the endpoint fence cannot provide: a WebSocket held open
+  // across the whole call dies with the instance that accepted it, so a same-URL
+  // replacement mid-call is visible here even though it moves neither the base nor
+  // the generation (see instance-witness.ts for why a dropped witness is
+  // inconclusive, never positive evidence of substitution).
+  //
+  // The base and the witness are captured together: a retarget landing during the
+  // handshake leaves the witness watching the OLD base while the config names the
+  // new one — which the endpoint fence below then refuses on, exactly as it would
+  // for a retarget during the argv read.
+  //
+  // RESIDUAL GAP, stated honestly: when `prior` arrives from the caller, that
+  // reading predates the witness, so a replacement in the narrow window between
+  // the caller's read and this handshake is not seen. The caller's own identify
+  // fences bound its reading to a live instance at the time it was taken; this
+  // fences everything from here on.
+  const anchoredBase = getComfyUIBaseUrl();
+  const witness = await acquireInstanceWitness(anchoredBase);
+  try {
+    return await restartViaManagerRebootDispatch(context, anchoredBase, witness);
+  } finally {
+    witness?.close();
+  }
+}
+
+async function restartViaManagerRebootDispatch(
+  context: {
+    label: string;
+    prior?: { argv: string[]; generation: number };
+    isDesktop?: boolean;
+  },
+  anchoredBase: string,
+  witness: InstanceWitness | undefined,
+): Promise<RestartResult> {
   // #848: capture what it is running BEFORE the reboot, so the report afterwards can
   // say whether that changed. Total and bounded (see readServingArgv) — it is only
   // ever detail in a message, and must not be able to cost anyone their restart.
@@ -3205,12 +3288,11 @@ async function restartViaManagerReboot(context: {
   // otherwise be stamped with the NEW generation and sail through the check below
   // while the reading itself came from the old instance.
   const selfReadGeneration = getComfyuiTargetGeneration();
-  // Pinned HERE, with the generation, and used for every step below: the
-  // dispatch, the dispatch record, and the readiness probe. Each of those used
-  // to call `getComfyUIBaseUrl()` afresh, so a retarget landing in any of the
-  // gaps between them sent the reboot to one server, recorded a second, and
+  // anchoredBase was pinned by the caller, with the witness, and is used for every
+  // step below: the dispatch, the dispatch record, and the readiness probe. Each of
+  // those used to call `getComfyUIBaseUrl()` afresh, so a retarget landing in any
+  // of the gaps between them sent the reboot to one server, recorded a second, and
   // reported the health of a third (codex gate P0/P1).
-  const anchoredBase = getComfyUIBaseUrl();
   const priorArgv = context.prior?.argv.length
     ? context.prior.argv
     : await readServingArgv();
@@ -3233,11 +3315,11 @@ async function restartViaManagerReboot(context: {
   // the question that actually matters.
   //
   // What this fences is the ENDPOINT: the reboot will go to the URL whose argv
-  // we read. It does NOT establish that the same INSTANCE is still serving that
-  // URL — a same-URL replacement moves neither the base nor the generation and
-  // is invisible to both. Closing that needs a per-instance identity this
-  // codebase does not have yet; tracked in #871. Do not read this fence as more
-  // than it is.
+  // we read. Same-URL instance REPLACEMENT is fenced separately, by the witness
+  // (#871) — and it governs the argv COMPARISON, not this dispatch: rebooting
+  // whatever serves the configured endpoint is what the caller asked for, so a
+  // dropped or unreadable witness does not stop the reboot; it stops the report
+  // afterwards from narrating two different instances as one server.
   //
   // The generation still governs the ARGV COMPARISON further down, where it is
   // the right test for a different question: an A→B→A round trip leaves the base
@@ -3258,6 +3340,11 @@ async function restartViaManagerReboot(context: {
     };
   }
 
+  // The witness fences the dispatch window by WHEN it died: a close stamped before
+  // this moment means the reboot may reach a SUCCESSOR, not the instance whose
+  // argv we read (#871). Captured before the dispatch so the comparison below can
+  // tell the two apart.
+  const dispatchedAt = Date.now();
   const reboot = await rebootViaManager(anchoredBase);
   if (!reboot.rebooting) {
     return {
@@ -3339,7 +3426,7 @@ async function restartViaManagerReboot(context: {
         `(${readiness.attempts}/${readiness.max_tries} probes over a ` +
         `COMFYUI_REMOTE_REBOOT_BUDGET_S=${seconds(timing.budgetMs)}s budget). That budget ` +
         "expiring means the restart is NOT CONFIRMED YET — it does NOT mean it failed; a " +
-        "supervised cold start can take longer than this. Re-check with health_check in " +
+        'supervised cold start can take longer than this. Re-check with get_system_stats (action:"health") in ' +
         `another ${RECHECK_HINT_S}s before intervening. If it is still down then, start ` +
         "ComfyUI from whatever supervises it (" +
         (context.label === "Desktop" ? "the ComfyUI Desktop app" : "its host") +
@@ -3370,9 +3457,51 @@ async function restartViaManagerReboot(context: {
   // reading — including during this one — because the two readings would then
   // describe two different servers. The generation is re-checked AFTER the read, so
   // a retarget that lands mid-read is caught too.
+  //
+  // #871: the generation fences RETARGETS; the witness fences same-URL REPLACEMENT.
+  // The comparison runs only when the witness ties the two readings to one
+  // instance lineage:
+  //   - witness unavailable (could not be acquired) → the identity token could
+  //     not be read — an inconclusive, so the comparison DECLINES (the dispatch
+  //     above still went ahead, which is what the caller asked for);
+  //   - witness STILL OPEN after the reboot → the instance never went away at all
+  //     (a no-op reboot, e.g. Manager accepted and did nothing) — both readings
+  //     are provably one instance's, so comparing them is exactly right;
+  //   - witness closed AFTER the dispatch → consistent with our own reboot
+  //     killing it, so the pre-reboot reading describes the instance the reboot
+  //     reached. The boundary is STRICT: the stamp is the close EVENT's delivery,
+  //     so a death recorded in the same millisecond as the dispatch may actually
+  //     have happened before it (event-delivery slack) — an ambiguous boundary
+  //     declines, which only ever costs a message detail.
+  //   - witness closed BEFORE the dispatch → the instance whose argv we read was
+  //     gone before the reboot went out; the reboot reached a successor and the
+  //     two readings may describe different lineages — decline.
   const afterArgv = await readServingArgv();
+  const targetStable = getComfyuiTargetGeneration() === argvGeneration;
+  const witnessClosedAt = witness?.closedAt();
+  const identityContinuous =
+    witness !== undefined &&
+    (witnessClosedAt === undefined || witnessClosedAt > dispatchedAt);
+  if (targetStable && !identityContinuous) {
+    logger.info(
+      "Withholding the launch-argument comparison: the instance serving the " +
+        "configured target was not observed continuous across the reboot (#871)",
+      {
+        witness:
+          witness === undefined
+            ? "unavailable"
+            : witnessClosedAt === undefined
+              ? "open"
+              : // NOT "closed-before-dispatch": the boundary is strict precisely
+                // because a same-millisecond stamp is ambiguous (event-delivery
+                // slack), so the log must not assert the ordering the fence
+                // itself declined to trust (codex gate).
+                "closed-at-or-before-dispatch",
+      },
+    );
+  }
   const argvNote =
-    getComfyuiTargetGeneration() === argvGeneration
+    targetStable && identityContinuous
       ? describeArgvDrift(priorArgv, afterArgv, context.isDesktop === true)
       : "";
 
@@ -3427,7 +3556,7 @@ async function restartViaManagerReboot(context: {
           `A ComfyUI-Manager reboot was dispatched but not acknowledged (${reboot.note ?? "no reply"}).`) +
       ` ComfyUI is healthy now (${readiness.waited_ms}ms) — ${context.label}/supervised ` +
       "restart. The cycle itself was not directly observed from here, so verify with " +
-      "health_check if you need certainty that it actually restarted." +
+      'get_system_stats (action:"health") if you need certainty that it actually restarted.' +
       argvNote,
     // We launched nothing on this path — a supervisor is what would have cycled the
     // process — so the listener is never ours to claim. (Nor is it established that

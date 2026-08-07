@@ -69,7 +69,7 @@ export async function downloadS3ToFile(
   const client = await makeS3Client(auth);
   try {
     // Thread the abort signal into BOTH the SDK request and the write pipeline so a
-    // cancel_download (#515) aborts the S3 transfer promptly instead of running to
+    // download_model action:"cancel" (#515) aborts the S3 transfer promptly instead of running to
     // completion. The streamUrlToFile cloud branch also guards before/after as a
     // backstop, so a cancelled transfer is never finalized even if the SDK ignores it.
     const response = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }), {

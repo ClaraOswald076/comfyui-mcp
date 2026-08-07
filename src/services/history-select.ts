@@ -11,7 +11,7 @@ import type { WorkflowJSON } from "../comfyui/types.js";
  * callers return the PRIOR run (off-by-one). `prompt` is the tuple
  * `[queueNumber, promptId, graph, extra, outputs]`; `prompt[0]` is the order key.
  *
- * Shared by get_history and rerun_generation so both agree on "the latest run".
+ * Shared by get_history and the rerun action so both agree on "the latest run".
  */
 export function selectNewestHistoryEntry(
   history: Record<string, HistoryEntry>,

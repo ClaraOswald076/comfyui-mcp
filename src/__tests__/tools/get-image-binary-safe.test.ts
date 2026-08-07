@@ -14,6 +14,10 @@ const getOutputImageMock = vi.fn();
 vi.mock("../../services/image-management.js", () => ({
   extractWorkflowFromImage: vi.fn(),
   listOutputImages: vi.fn(),
+  listOutputMedia: vi.fn(async () => ({
+    images: [],
+    source: { directory: "C:\Comfy\output", basis: "local-scan" },
+  })),
   getOutputImage: (...a: unknown[]) => getOutputImageMock(...a),
   uploadImageAuto: vi.fn(),
   uploadVideoAuto: vi.fn(),
@@ -51,6 +55,7 @@ describe("get_image — binary-safe (#483)", () => {
     getOutputImageMock.mockResolvedValue({ base64, mimeType: "image/png", filename: "src.png" });
 
     const out = await getHandler("get_image")({
+      action: "get",
       filename: "RogueTD_Ara_Locomotion_Source.png",
       type: "input",
       save_dir: "/tmp/x",
@@ -70,7 +75,7 @@ describe("get_image — binary-safe (#483)", () => {
       ),
     );
 
-    const out = await getHandler("get_image")({ filename: "x.png", type: "input" });
+    const out = await getHandler("get_image")({ action: "get", filename: "x.png", type: "input" });
     expect(out.isError).toBe(true);
     const text = out.content.map((c) => c.text ?? "").join("");
     expect(text).toContain("IMAGE_NOT_FOUND");
@@ -100,6 +105,7 @@ describe("get_image — video/audio save-to-disk (#663)", () => {
     });
 
     const out = await getHandler("get_image")({
+      action: "get",
       filename: "I2V_HD_FaceLock_00036-audio.mp4",
       type: "output",
       subfolder: "Eros",
@@ -141,6 +147,7 @@ describe("get_image — video/audio save-to-disk (#663)", () => {
     );
 
     const out = await getHandler("get_image")({
+      action: "get",
       filename: "clip_00001_.mp4",
       type: "output",
       subfolder: "video",

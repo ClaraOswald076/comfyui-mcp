@@ -20,6 +20,10 @@ const getOutputImageMock = vi.fn();
 vi.mock("../../services/image-management.js", () => ({
   extractWorkflowFromImage: vi.fn(),
   listOutputImages: vi.fn(),
+  listOutputMedia: vi.fn(async () => ({
+    images: [],
+    source: { directory: "C:\Comfy\output", basis: "local-scan" },
+  })),
   getOutputImage: (...a: unknown[]) => getOutputImageMock(...a),
   uploadImageAuto: vi.fn(),
   uploadVideoAuto: vi.fn(),
@@ -92,7 +96,7 @@ describe("get_image save_dir resolution (#768)", () => {
   it("writes to the platform temp dir, NOT the process cwd, when save_dir is omitted", async () => {
     const hostile = pretendUnwritableCwd();
 
-    const out = await getHandler("get_image")({ filename: "Krea2-220227_00001_.png" });
+    const out = await getHandler("get_image")({ action: "get", filename: "Krea2-220227_00001_.png" });
 
     expect(out.isError).toBeUndefined();
     const expected = join(tmpdir(), "comfyui-images");
@@ -108,7 +112,7 @@ describe("get_image save_dir resolution (#768)", () => {
   });
 
   it("creates the default directory recursively before writing into it", async () => {
-    await getHandler("get_image")({ filename: "a.png" });
+    await getHandler("get_image")({ action: "get", filename: "a.png" });
     const mkdirOrder = vi.mocked(mkdir).mock.invocationCallOrder[0];
     const writeOrder = vi.mocked(writeFile).mock.invocationCallOrder[0];
     expect(mkdirOrder).toBeLessThan(writeOrder);
@@ -118,7 +122,7 @@ describe("get_image save_dir resolution (#768)", () => {
     pretendUnwritableCwd();
     const dir = process.platform === "win32" ? "D:\\out\\imgs" : "/var/out/imgs";
 
-    await getHandler("get_image")({ filename: "b.png", save_dir: dir });
+    await getHandler("get_image")({ action: "get", filename: "b.png", save_dir: dir });
 
     expect(vi.mocked(writeFile)).toHaveBeenCalledWith(
       join(dir, "b.png"),
@@ -133,7 +137,7 @@ describe("get_image save_dir resolution (#768)", () => {
       process.platform === "win32" ? "C:\\work\\proj" : "/work/proj",
     );
 
-    const out = await getHandler("get_image")({ filename: "c.png", save_dir: "out" });
+    const out = await getHandler("get_image")({ action: "get", filename: "c.png", save_dir: "out" });
 
     const text = out.content.map((c) => c.text ?? "").join("");
     const reported = text.replace(/^Saved to:\s*/, "").trim();
@@ -149,7 +153,7 @@ describe("get_image save_dir resolution (#768)", () => {
       Object.assign(new Error("EPERM: operation not permitted, mkdir"), { code: "EPERM" }),
     );
 
-    const out = await getHandler("get_image")({ filename: "Krea2-220227_00001_.png" });
+    const out = await getHandler("get_image")({ action: "get", filename: "Krea2-220227_00001_.png" });
 
     // The image survives.
     const image = out.content.find((c) => c.type === "image");
@@ -173,6 +177,7 @@ describe("get_image save_dir resolution (#768)", () => {
     );
 
     const out = await getHandler("get_image")({
+      action: "get",
       filename: "clip.mp4",
       save_dir: process.platform === "win32" ? "D:\\ro" : "/ro",
     });
@@ -211,7 +216,7 @@ describe("get_image save_dir resolution (#768)", () => {
       // which is the same bug with an extra path segment.
       expect(isAbsolute(defaultImageSaveDir())).toBe(true);
       expect(defaultImageSaveDir()).toBe(join(homedir(), "comfyui-images"));
-      await getHandler("get_image")({ filename: "d.png" });
+      await getHandler("get_image")({ action: "get", filename: "d.png" });
       const [target] = vi.mocked(writeFile).mock.calls[0] as [string, Buffer];
       expect(isAbsolute(target)).toBe(true);
       expect(target.startsWith(hostile)).toBe(false);
@@ -254,7 +259,7 @@ describe("get_image save_dir resolution (#768)", () => {
       });
     });
 
-    const out = await getHandler("get_image")({ filename: "e.png", save_dir: "out" });
+    const out = await getHandler("get_image")({ action: "get", filename: "e.png", save_dir: "out" });
 
     expect(out.content.find((c) => c.type === "image")?.data).toBe(PNG);
     const text = out.content.map((c) => c.text ?? "").join("");
@@ -274,7 +279,7 @@ describe("get_image save_dir resolution (#768)", () => {
       Object.assign(new Error("EPERM: operation not permitted, mkdir"), { code: "EPERM" }),
     );
 
-    const out = await getHandler("get_image")({ filename: "f.png", save_dir: "   " });
+    const out = await getHandler("get_image")({ action: "get", filename: "f.png", save_dir: "   " });
 
     const text = out.content.map((c) => c.text ?? "").join("");
     expect(text).toContain("NOT SAVED");
@@ -294,7 +299,7 @@ describe("get_image save_dir resolution (#768)", () => {
       Object.assign(new Error("EPERM: operation not permitted, mkdir"), { code: "EPERM" }),
     );
 
-    const out = await getHandler("get_image")({ filename: "g.png", save_dir: "\\out" });
+    const out = await getHandler("get_image")({ action: "get", filename: "g.png", save_dir: "\\out" });
 
     const text = out.content.map((c) => c.text ?? "").join("");
     expect(text).toMatch(/DRIVE-RELATIVE save_dir/);
@@ -317,7 +322,7 @@ describe("get_image save_dir resolution (#768)", () => {
       Object.assign(new Error("EPERM: operation not permitted, mkdir"), { code: "EPERM" }),
     );
 
-    const out = await getHandler("get_image")({ filename: "h.png", save_dir: "C:out" });
+    const out = await getHandler("get_image")({ action: "get", filename: "h.png", save_dir: "C:out" });
 
     const text = out.content.map((c) => c.text ?? "").join("");
     expect(text).toMatch(/DRIVE-RELATIVE save_dir/);

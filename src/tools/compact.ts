@@ -284,8 +284,8 @@ const PANEL_NAMESPACE_RE = /^(?:mcp__[A-Za-z0-9_]+__)?panel_/;
  * reinstall something that is already fine.
  *
  * This path is reachable through our own prose, not just through a model's
- * imagination: `visualize_workflow` and `visualize_workflow_hierarchical` both
- * tell the reader to "use panel_graph_outline instead" for the live canvas, and
+ * imagination: `visualize_workflow`'s render and render_hierarchical actions
+ * both tell the reader to "use panel_graph_outline instead" for the live canvas, and
  * the bundled plugin's debug-render / director skills name panel_* tools too —
  * all of which an outside MCP client reads while holding none of them (#784, same
  * family: recovery guidance naming a tool the caller cannot invoke).
@@ -343,7 +343,7 @@ function panelNamespaceMessage(catalog: ToolCatalog, name: string): string {
     `If it offers ${name}, or a panel router such as panel_call_tool, go that way — call_tool ` +
     "dispatches only within this server's own catalog and can never reach the panel surface. " +
     "If it offers nothing under `panel_`, there is no live-canvas route from here: read the " +
-    "workflow from disk instead (list_workflows, get_workflow, analyze_workflow, query_workflow), " +
+    "workflow from disk instead (get_workflow, whose list/get/analyze/query actions read saved files), " +
     "or ask the user to make the request from the Agent tab in the ComfyUI sidebar, on a backend " +
     "that has ComfyUI tools (the pi backend has no MCP client and so has none)."
   );

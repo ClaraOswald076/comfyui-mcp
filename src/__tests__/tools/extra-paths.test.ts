@@ -16,23 +16,11 @@ vi.mock("../../services/extra-paths.js", async () => {
   };
 });
 
-import { registerExtraPathsTools } from "../../tools/extra-paths.js";
-
-type ToolHandler = (args: Record<string, unknown>) => Promise<{
-  isError?: boolean;
-  content: Array<{ type: string; text: string }>;
-}>;
-
-function makeServer() {
-  const handlers = new Map<string, ToolHandler>();
-  const server = {
-    tool: (name: string, _desc: string, _schema: unknown, handler: ToolHandler) => {
-      handlers.set(name, handler);
-    },
-  };
-  registerExtraPathsTools(server as never);
-  return handlers;
-}
+import {
+  addExtraPathAction,
+  listExtraPathsAction,
+  removeExtraPathAction,
+} from "../../tools/extra-paths.js";
 
 beforeEach(() => {
   listExtraPathsMock.mockReset();
@@ -40,28 +28,27 @@ beforeEach(() => {
   removeExtraPathMock.mockReset();
 });
 
-describe("extra paths tools", () => {
-  it("registers list/add/remove and maps snake_case args to service options", async () => {
-    const handlers = makeServer();
-    expect([...handlers.keys()]).toEqual([
-      "list_extra_paths",
-      "add_extra_path",
-      "remove_extra_path",
-    ]);
-
+/**
+ * 0.50.0 slice 11 retired the three extra-path TOOLS into actions of
+ * `list_local_models`. What this file still owns is the argument mapping —
+ * snake_case tool arguments onto the service's camelCase options — because that
+ * mapping is what decides WHICH FILE gets written and with what. Dispatch (which
+ * action reaches which of these) is covered in models-consolidated.test.ts.
+ */
+describe("extra-path actions map snake_case args onto service options", () => {
+  it('list_paths passes target + config_path through and returns the JSON view', async () => {
     listExtraPathsMock.mockResolvedValueOnce({ target: "standalone", path: "x", groups: [] });
-    const list = await handlers.get("list_extra_paths")!({
-      target: "standalone",
-      config_path: "x",
-    });
+    const list = await listExtraPathsAction({ target: "standalone", config_path: "x" });
     expect(listExtraPathsMock).toHaveBeenCalledWith({
       target: "standalone",
       configPath: "x",
     });
-    expect(JSON.parse(list.content[0].text)).toMatchObject({ target: "standalone" });
+    expect(JSON.parse(list.content![0].text as string)).toMatchObject({ target: "standalone" });
+  });
 
+  it("add_path passes every option, including is_default → isDefault", async () => {
     addExtraPathMock.mockResolvedValueOnce({ changed: true });
-    await handlers.get("add_extra_path")!({
+    await addExtraPathAction({
       target: "desktop",
       config_path: "y",
       group: "shared",
@@ -77,9 +64,11 @@ describe("extra paths tools", () => {
       path: "D:/Comfy/custom_nodes",
       isDefault: true,
     });
+  });
 
+  it("remove_path leaves the untouched options undefined rather than defaulting them", async () => {
     removeExtraPathMock.mockResolvedValueOnce({ changed: true });
-    await handlers.get("remove_extra_path")!({
+    await removeExtraPathAction({
       category: "loras",
       path: "D:/Models/loras",
     });

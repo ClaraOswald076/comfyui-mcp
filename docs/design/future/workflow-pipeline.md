@@ -44,7 +44,7 @@ stages:
 | `inputs` | Flat overrides (`applyOverrides`) across all nodes |
 | `node_inputs` | Per-node input patches (`{ "6": { text: "..." } }`) |
 | `assets` | Map manifest `assets` keys → reference role (`primary`, `reference`, …) |
-| `chain_from` | Prior stage id — stages output via `stage_output_as_input`, wires into next workflow |
+| `chain_from` | Prior stage id — stages output via `upload_image (action:"stage")`, wires into next workflow |
 | `chain_role` / `chain_node_id` / `chain_input_name` | Control reference patching |
 | `wait` | Wait for completion (default `true`) |
 | `timeout_seconds` | Per-stage wait cap (default 1800) |
@@ -53,7 +53,7 @@ stages:
 
 ## Chaining
 
-When `chain_from` is set, the prior stage's primary output is fetched from `/history`, re-staged with `stage_output_as_input`, and applied to the next workflow with `apply_reference_to_workflow`. This matches the director / multi-stage panel guidance (never guess filesystem `input/` paths).
+When `chain_from` is set, the prior stage's primary output is fetched from `/history`, re-staged with `upload_image (action:"stage")`, and applied to the next workflow with `apply_reference_to_workflow`. This matches the director / multi-stage panel guidance (never guess filesystem `input/` paths).
 
 ## Related
 

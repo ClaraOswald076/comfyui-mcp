@@ -36,7 +36,7 @@ export async function viewAssetImage(assetId: string): Promise<ViewImageResult> 
 
   if (!mimeType.startsWith(SUPPORTED_IMAGE_MIME_PREFIX)) {
     throw new Error(
-      `Asset "${assetId}" is not an image (mime: ${mimeType}). view_image only supports PNG/JPEG/WebP.`,
+      `Asset "${assetId}" is not an image (mime: ${mimeType}). get_image (action:"view") only supports PNG/JPEG/WebP.`,
     );
   }
 
