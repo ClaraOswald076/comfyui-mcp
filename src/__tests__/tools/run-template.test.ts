@@ -68,6 +68,20 @@ const TEMPLATE_GRAPH = {
     // it must be overridable (not misclassified as a graph connection).
     inputs: { text: "default prompt", size: [1024, 1024], clip: ["4", 1] },
   },
+  // #1037 — a V3 DYNAMICCOMBO's nested leaves are keyed "<combo>.<leaf>" in the
+  // API prompt, so an override key naming one contains TWO dots. Modelled on the
+  // reported ResizeImageMaskNode, with one leaf LINKED and one a plain widget.
+  "343": {
+    class_type: "ResizeImageMaskNode",
+    inputs: {
+      resize_type: "scale dimensions",
+      // Points at node "3", which EXISTS here — isLinkRef only treats an array
+      // as a connection when its first element is a real node id.
+      "resize_type.width": ["3", 0],
+      "resize_type.crop": "center",
+      scale_method: "lanczos",
+    },
+  },
 };
 
 const dir = mkdtempSync(join(tmpdir(), "run-template-"));
@@ -107,6 +121,64 @@ describe('enqueue_workflow (action:"run_template")', () => {
     expect(out.prompt_id).toBe("rt-prompt-1");
     expect(out.status).toBe("enqueued");
     expect(out.overrides_applied).toEqual(["6.text", "3.steps", "3.cfg"]);
+  });
+
+  // #1037 — the reporter's blocked workaround, and why it was never the parser.
+  //
+  // `overrides={"343.resize_type.crop":"center"}` came back as "node 343 has no
+  // input resize_type.crop. Overridable widgets: resize_type, scale_method". The
+  // key splits on the FIRST dot, so `widget` was already "resize_type.crop" —
+  // correct. The key was missing from the GRAPH, because the converter was
+  // dropping it (fixed in 0.50.14). So the blocked escape hatch was a SYMPTOM of
+  // the same bug, not a second one. These pin that it now works, and that the
+  // guards either side of it did not loosen.
+  it("accepts a NESTED '<nodeId>.<combo>.<leaf>' override key", async () => {
+    const handler = getHandler();
+    const res = await handler({
+      action: "run_template",
+      template: "anima-txt2img",
+      overrides: { "343.resize_type.crop": "disabled" },
+    });
+    expect(res.isError).toBeFalsy();
+    const enqueued = enqueueWorkflowMock.mock.calls[0][0] as Record<
+      string,
+      { inputs: Record<string, unknown> }
+    >;
+    expect(enqueued["343"].inputs["resize_type.crop"]).toBe("disabled");
+    // Siblings untouched.
+    expect(enqueued["343"].inputs.scale_method).toBe("lanczos");
+    expect(enqueued["343"].inputs.resize_type).toBe("scale dimensions");
+  });
+
+  // A LINKED nested leaf is still a graph connection — overriding it would break
+  // the wiring, and the nested key must not smuggle past that guard.
+  it("still refuses to override a LINKED nested leaf", async () => {
+    const handler = getHandler();
+    const res = await handler({
+      action: "run_template",
+      template: "anima-txt2img",
+      overrides: { "343.resize_type.width": 512 },
+    });
+    expect(res.isError).toBe(true);
+    expect(String((res.content[0] as { text: string }).text)).toContain(
+      "graph CONNECTION, not a widget",
+    );
+  });
+
+  it("still rejects a nested key the node does not have", async () => {
+    const handler = getHandler();
+    const res = await handler({
+      action: "run_template",
+      template: "anima-txt2img",
+      overrides: { "343.resize_type.nope": 1 },
+    });
+    expect(res.isError).toBe(true);
+    // The text is a JSON envelope, so quotes arrive escaped — match on the key
+    // names rather than the punctuation around them.
+    const text = String((res.content[0] as { text: string }).text);
+    expect(text).toContain("has no input");
+    expect(text).toContain("resize_type.nope");
+    expect(text).toContain("resize_type.crop"); // the real keys are listed
   });
 
   it("enqueues the template unmodified when no overrides given", async () => {
