@@ -2464,6 +2464,46 @@ describe("panel-tools: agent-driven CivitAI + training modals", () => {
     });
   });
 
+  // #935 — the #374 guard below covers `creator` and nothing else, so
+  // modelSort/baseModels/period could be supplied, ignored, and answered with a
+  // full plausible list. A reporter saw download counts in no order at all
+  // (48, 53, 53, 64, 1468) for a "Most Downloaded" sort. The guard's own rules
+  // are pinned in civitai-filter-guard.test.ts; these cover the WIRING.
+  it("panel_civitai_search WARNS when a supplied filter was not applied (#935)", async () => {
+    const { ctx } = makeFakeCtx({
+      creator: null,
+      applied_filters: { modelSort: "Newest" },
+    });
+    const res = await defByName("panel_civitai_search").handler(
+      { query: "flux lora", filters: { modelSort: "Most Downloaded" } },
+      ctx,
+    );
+    const text = (res.content[0] as { text: string }).text;
+    expect(text).toMatch(/were NOT applied/);
+    expect(text).toContain("Most Downloaded");
+    expect(text).toContain("Newest");
+    expect(text).toMatch(/do not describe them as sorted or narrowed/);
+  });
+
+  it("panel_civitai_search stays SILENT when the panel applied what was asked (#935)", async () => {
+    const filters = { modelSort: "Most Downloaded" };
+    const { ctx } = makeFakeCtx({ creator: null, applied_filters: filters });
+    const res = await defByName("panel_civitai_search").handler({ query: "x", filters }, ctx);
+    expect((res.content[0] as { text: string }).text).not.toMatch(/NOT applied|UNVERIFIED/);
+  });
+
+  it("panel_civitai_search reports an un-echoed filter as UNVERIFIED, not failed (#935)", async () => {
+    // An older panel echoes no applied_filters. Absence is not evidence.
+    const { ctx } = makeFakeCtx({ creator: null });
+    const res = await defByName("panel_civitai_search").handler(
+      { query: "x", filters: { baseModels: ["Flux.1 D"] } },
+      ctx,
+    );
+    const text = (res.content[0] as { text: string }).text;
+    expect(text).toMatch(/UNVERIFIED/);
+    expect(text).not.toMatch(/were NOT applied/);
+  });
+
   it("panel_civitai_search folds a creator into the query as an @creator token (#374)", async () => {
     const { ctx, calls } = makeFakeCtx({ creator: "tenstrip" });
     await defByName("panel_civitai_search").handler(

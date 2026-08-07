@@ -100,6 +100,7 @@ import {
   type SecretSaveReceipt,
 } from "../services/panel-secrets.js";
 import { flattenUiWorkflow } from "../services/flatten-workflow.js";
+import { describeUnappliedFilters } from "./civitai-filter-guard.js";
 import { applyCapturedWidgetValues } from "../services/live-widget-overlay.js";
 import { listWorkflowLibraryKeys, userdataFetch } from "../services/userdata-library.js";
 import { getNsfwConsent, setNsfwConsent } from "../services/panel-settings.js";
@@ -7645,6 +7646,19 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                   `the logged-in browser session directly.`,
               });
             }
+          }
+          // #935 — the #374 guard above covers `creator` and NOTHING else, so
+          // modelSort / baseModels / period could be supplied, silently ignored,
+          // and answered with a full, plausible result set. An agent asked for
+          // "most-downloaded Flux LoRAs" then presents whatever came back, and
+          // neither it nor the user can tell the sort never applied. Same failure
+          // as #374, one parameter over.
+          const filterWarning = describeUnappliedFilters(args.filters, reply);
+          if (filterWarning) {
+            return ok({
+              ...(reply as Record<string, unknown>),
+              warning: filterWarning,
+            });
           }
           return ok(reply);
         } catch (err) {
