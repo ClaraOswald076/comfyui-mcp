@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.16] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a Save-As re-anchors the session fence too (#1046)
+
+
 ## [0.50.15] - 2026-08-07
 
 ### MCP
