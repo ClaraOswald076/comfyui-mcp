@@ -767,8 +767,35 @@ describe("findDeadName", () => {
 
 describe("retiredToolMessage", () => {
   it("quotes the removing version and the replacement", () => {
-    expect(retiredToolMessage("apps_run")).toBe(
-      `Unknown tool 'apps_run' — removed in 0.49.0. Call apps (action:"run") instead.`,
+    // Leads with exactly this — the redirect is the first thing a caller reads.
+    // Asserted as a PREFIX rather than the whole string so the message can carry
+    // further diagnosis (see the #996 case below) without this test having to
+    // restate it; the claim here is about the version and the replacement.
+    expect(retiredToolMessage("apps_run")).toMatch(
+      /^Unknown tool 'apps_run' — removed in 0\.49\.0\. Call apps \(action:"run"\) instead\./,
+    );
+  });
+
+  // #996 — a reporter saw list_tools advertise `read_skill`, describe_tool
+  // succeed on it, then got this error, and filed a catalog/dispatcher mismatch.
+  // The catalog is built by re-running the SAME registration pass, so it cannot
+  // contain a retired name: what they were reading was a tool list captured
+  // BEFORE the upgrade and cached by their client. Without saying so, the only
+  // available reading is "the server is inconsistent" — wrong and unactionable.
+  it("#996: explains why the caller was holding a name that does not exist", () => {
+    const m = retiredToolMessage("read_skill") ?? "";
+    expect(m).toMatch(/captured before this server was upgraded/);
+    expect(m).toMatch(/reconnect the MCP client/);
+    // …and states the fact that rules out the mismatch they suspected.
+    expect(m).toMatch(/cannot contain a retired name/);
+  });
+
+  it("#996: the stale-catalog note never displaces the redirect", () => {
+    const m = retiredToolMessage("read_skill") ?? "";
+    // The replacement still comes first; diagnosis is an addendum, not a
+    // replacement for the answer.
+    expect(m.indexOf('list_packs (action:"skill_read")')).toBeLessThan(
+      m.indexOf("reconnect the MCP client"),
     );
   });
 
@@ -784,5 +811,35 @@ describe("retiredToolMessage", () => {
 
   it("returns undefined for a genuinely unknown name", () => {
     expect(retiredToolMessage("definitely_not_a_tool")).toBeUndefined();
+  });
+});
+
+// #996 — the message now asserts something structural: "The catalog this server
+// serves cannot contain a retired name." That is only honest if it is enforced.
+//
+// It holds by construction — collectToolCatalog re-runs the SAME registration
+// pass the live server uses, so a name nobody registers cannot appear — but
+// "holds by construction" is exactly the kind of claim that quietly stops
+// holding. Pin it against the real catalog.
+describe("#996: the catalog and the dead-name ledger cannot disagree", () => {
+  it("advertises no name the ledger has retired", async () => {
+    const { collectToolCatalog } = await import("../../tools/index.js");
+    const catalog = await collectToolCatalog();
+    const advertised = new Set(catalog.tools.keys());
+    const retired = DEAD_NAMES.map((d) => d.name).filter((n) => advertised.has(n));
+    expect(retired, `catalog advertises retired name(s): ${retired.join(", ")}`).toEqual([]);
+  });
+
+  it("advertises exactly the live tool surface", async () => {
+    const { collectToolCatalog } = await import("../../tools/index.js");
+    const catalog = await collectToolCatalog();
+    // Every catalogued tool is a live name (saved-workflow tools are registered
+    // dynamically and are not part of the fixed vocabulary, so allow those).
+    const live = new Set<string>(TOOL_NAMES);
+    const unknown = [...catalog.tools.values()]
+      .filter((t) => t.category !== "saved-workflows")
+      .map((t) => t.name)
+      .filter((n) => !live.has(n));
+    expect(unknown, `catalogued but not in TOOL_NAMES: ${unknown.join(", ")}`).toEqual([]);
   });
 });
