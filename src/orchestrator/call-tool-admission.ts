@@ -462,7 +462,25 @@ export function callToolAdmission(
   if (actions !== undefined) {
     const action = typeof args.action === "string" ? args.action : undefined;
     if (action === undefined || !actions.has(action)) {
-      return `tool "${tool}" is not permitted for action "${action ?? "(missing)"}"`;
+      // #908, second half. The explanation above was written for the NAME-level
+      // refusal, when `runpod_pod_create`/`runpod_pod_start` were whole tools kept
+      // off this channel. The 0.50.0 fold made `runpod` a single admitted NAME with
+      // an action allowlist, so the panel's Deploy/Start buttons now land HERE — and
+      // this branch still returned the bare dead-end the other branch was fixed to
+      // stop returning. Same refusal, same reason, so it owes the same explanation:
+      // the exclusion is deliberate (these actions spend money and this channel
+      // cannot confirm with the user), the tool is not missing, and there IS a way
+      // to do it.
+      const permitted = [...actions].sort();
+      return (
+        `tool "${tool}" does not carry action "${action ?? "(missing)"}" on the direct ` +
+        `call_tool channel (the canvas-less path used by mobile, mirrored tabs and panel ` +
+        `buttons). This is a deliberate per-action exclusion, not a missing tool or a typo — ` +
+        `an action is withheld here when it spends money or mutates state this channel cannot ` +
+        `confirm with the user. Permitted here: ${permitted.join(", ")}. Ask the agent to run ` +
+        `"${action ?? ""}" instead: the agent session carries the full tool surface and can ` +
+        `confirm with you first.`
+      );
     }
   }
   return null;
