@@ -40,7 +40,8 @@ import { performPanelSync, reassessPanelAfterSyncFailure } from "../services/pan
 import { clearPanelDiskObservation } from "../services/panel-workspace.js";
 import { panelRecoveryContext } from "../services/panel-recovery.js";
 import { isPanelAutoInstallDisabled } from "../services/panel-installer.js";
-import { SelfRestarter } from "../services/self-restart.js";
+import { SelfRestarter, canSelfRestart } from "../services/self-restart.js";
+import { pairUrlDurability } from "./pair-durability.js";
 import { SessionStore, workflowIdentityParts } from "./session-store.js";
 import {
   SHARED_SESSION_SCOPE,
@@ -4186,8 +4187,24 @@ export async function runPanelOrchestrator(): Promise<void> {
           }
           url = `ws://${ip}:${pairPort}/?token=${token}`;
         }
-        logger.info(`[panel-orchestrator] pairing URL minted (${mode})`);
-        bridge.push({ type: "pair_url", mode, url }, tabId);
+        // #875 — say at pair time whether this URL survives a restart. The
+        // self-restarter is on by default and rotates the token (always, unless
+        // pinned) and the tunnel hostname (always, quick tunnels cannot be
+        // pinned). A user hit exactly this and reported it as "updating the npm
+        // version bricks my communication with the agent" — the restart was the
+        // cause, and nothing here had told them.
+        const durability = pairUrlDurability({
+          mode,
+          pinnedToken: envPairToken !== null,
+          autoRestart: canSelfRestart(),
+        });
+        logger.info(
+          `[panel-orchestrator] pairing URL minted (${mode}) — ` +
+            (durability.survivesRestart
+              ? "survives restart"
+              : `rotates on restart: ${durability.rotates.join(", ")}`),
+        );
+        bridge.push({ type: "pair_url", mode, url, durability }, tabId);
       })().catch((err) => {
         bridge.push(
           { type: "pair_error", mode, error: err instanceof Error ? err.message : String(err) },
