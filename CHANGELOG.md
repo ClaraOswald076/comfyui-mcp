@@ -6,6 +6,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.2] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a remote listing is incomplete BY CONSTRUCTION — say so, on every result (#975)
+- don't lead with an update when the disk version was never read (#974)
+- a `git pull` that exits 0 is not proof the checkout moved (#972)
+- a minted prompt_id is a receipt, not a flag (#971)
+- a run is owned by the conversation that queued it, not by the tab id (#969)
+- stop letting "fetch failed" stand in for a diagnosis (#968)
+- stop reporting an unread model list as an empty install (#967)
+- map live-canvas widgets by NAME, and disclose when we can't (#966)
+- publish the admission surface, and stop conflating "excluded" with "unknown" (#965)
+- detect panel/server vocabulary skew at the handshake, not at call time (#964)
+
+
 ## [0.50.1] - 2026-08-06
 
 Ten fixes on top of the 0.50.0 consolidation, and most of them are one defect class:
