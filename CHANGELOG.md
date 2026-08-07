@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.13] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- bound the four process probes that can wedge startup (#1038)
+
+
 ## [0.50.12] - 2026-08-07
 
 ### MCP
