@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.15] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a queued prompt can still have had output branches rejected (#1042)
+
+
 ## [0.50.14] - 2026-08-07
 
 ### MCP
