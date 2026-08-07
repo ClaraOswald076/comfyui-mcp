@@ -27,6 +27,7 @@ import { errorText, promptText } from "./error-text.js";
 import type { SessionStore } from "./session-store.js";
 import type { AgentBackend, AgentEvent, NeutralTurn } from "./agent-backend.js";
 import { type AudioRef, dedupeAudioRefs, noAudioPartText } from "./audio-attachment.js";
+import { runErrorNotice } from "./cli-remedy.js";
 import {
   ClaudeBackend,
   fetchSupportedModels,
@@ -800,10 +801,12 @@ export class PanelAgent {
    *  it before anything else. */
   async injectRunError(error: string, opts?: { mid?: string }): Promise<void> {
     if (this.closed) return;
-    const text =
-      `[panel event] ⚠️ The workflow run you just queued ERRORED on the user's canvas: ${error}. ` +
-      `STOP — do not carry on as if it succeeded. If it relates to what you were doing, diagnose it ` +
-      `(panel_get_errors has the full node-level details) and fix it; otherwise tell the user briefly.`;
+    // #889 — "the workflow run YOU JUST QUEUED" was a fixed template, sent to a
+    // session whose agent had never called panel_run at all. It then burned a
+    // panel_get_errors round trip on a failure it did not cause, and the
+    // imperative made that costly rather than cosmetic: told to STOP and to
+    // relate the error to its work, an agent will find a relation.
+    const text = runErrorNotice(error);
     if (this.inFlight) {
       // Stop the live turn and re-queue it so the agent handles the error FIRST,
       // then resumes whatever it was doing.

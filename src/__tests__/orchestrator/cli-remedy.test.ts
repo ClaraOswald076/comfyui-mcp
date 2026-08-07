@@ -12,7 +12,9 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  describeRunError,
   looksLikeAuthFailure,
+  promptIdOf,
   providerAuthRemedy,
   qualifySlashCommands,
 } from "../../orchestrator/cli-remedy.js";
@@ -109,6 +111,63 @@ describe("#948: recognising the condition", () => {
   it("does not claim an unrelated failure is about credentials", () => {
     for (const s of ["ENOENT: no such file", "exited with code 137", "connection reset"]) {
       expect(looksLikeAuthFailure(s), s).toBe(false);
+    }
+  });
+});
+
+// #889 — the run-error notification opened "The workflow run YOU JUST QUEUED
+// ERRORED" as a fixed template, and was delivered to a session whose agent had
+// never called panel_run at all. It burned a panel_get_errors round trip on a
+// failure it did not cause and got back errored_count: 0.
+//
+// The wording is what made that expensive rather than cosmetic: told to STOP and
+// to relate the error to its work, an agent will find a relation.
+describe("#889: a run error does not assert who queued it", () => {
+  const ERR = "Render status for prompt 9d70fd9d-1c2b-4e3f-8a01-7c6d5e4f3a2b could not be confirmed";
+
+  it("finds the prompt id inside the prose", () => {
+    expect(promptIdOf(ERR)).toBe("9d70fd9d-1c2b-4e3f-8a01-7c6d5e4f3a2b");
+  });
+
+  it("returns nothing rather than a wrong id when there is none", () => {
+    expect(promptIdOf("the canvas errored")).toBeUndefined();
+    expect(promptIdOf("")).toBeUndefined();
+    // A short hex blob is not a uuid and must not be mistaken for one.
+    expect(promptIdOf("prompt 9d70fd9d")).toBeUndefined();
+  });
+
+  it("keeps the urgent wording for a run the agent PROVABLY queued", () => {
+    const t = describeRunError(ERR, "mine");
+    expect(t).toMatch(/run you queued ERRORED/);
+    expect(t).toMatch(/STOP/);
+    expect(t).toMatch(/panel_get_errors/);
+  });
+
+  // THE reported case.
+  it("states plainly that the agent did not queue it, and says not to hunt for a link", () => {
+    const t = describeRunError(ERR, "not-mine");
+    expect(t).not.toMatch(/you (just )?queued/);
+    expect(t).toMatch(/You did NOT queue this run/);
+    expect(t).toMatch(/do not look for a connection/);
+    // The imperative that made the misattribution costly is gone.
+    expect(t).not.toMatch(/STOP —/);
+  });
+
+  // "Could not determine" must not collapse into either certainty: claiming it
+  // is the agent's repeats the bug, claiming it is not risks telling an agent to
+  // ignore its own failed render.
+  it("declines to decide when it cannot, and covers both readings", () => {
+    const t = describeRunError(ERR, "unknown");
+    expect(t).toMatch(/could NOT be determined/);
+    expect(t).toMatch(/do not assume either way/);
+    expect(t).toMatch(/If you were waiting on a render/);
+    expect(t).toMatch(/if you were not/i);
+    expect(t).not.toMatch(/You did NOT queue this run/);
+  });
+
+  it("always carries the underlying error text, whatever the attribution", () => {
+    for (const a of ["mine", "not-mine", "unknown"] as const) {
+      expect(describeRunError(ERR, a)).toContain(ERR);
     }
   });
 });

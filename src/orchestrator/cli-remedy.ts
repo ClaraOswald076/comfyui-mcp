@@ -1,3 +1,4 @@
+import { QueueMonitor } from "../services/queue-monitor.js";
 // #948 — a correct instruction delivered to the wrong place is a wrong instruction.
 //
 // A user saw `Not logged in, please run /login` in the PANEL CHAT and reported
@@ -101,4 +102,71 @@ export function providerAuthRemedy(backend: string, detail?: string): string {
         `its CLI sign-in in a TERMINAL, then Disconnect → Connect.${tail}`
       );
   }
+}
+
+
+// ---------------------------------------------------------------------------
+// #889 — a run-error notification must not assert who queued the run.
+// ---------------------------------------------------------------------------
+
+/**
+ * The ComfyUI prompt id named in a run-error string, when there is one.
+ *
+ * Best-effort by design: the id travels inside prose ("Render status for prompt
+ * 9d70fd9d-… could not be confirmed"), so a miss is normal and simply yields the
+ * `unknown` attribution rather than a wrong one. Matches a bare uuid, which is
+ * what ComfyUI mints.
+ */
+export function promptIdOf(text: string): string | undefined {
+  const m = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i.exec(text ?? "");
+  return m?.[0];
+}
+
+/**
+ * The run-error notification, phrased by what we can actually establish.
+ *
+ * The three wordings differ in the ONE thing that was wrong before — the claim
+ * about authorship — and in how hard they push. An agent told to STOP and to
+ * relate a failure to its own work will relate it, so the imperative only
+ * belongs on a run we can show is the agent's.
+ */
+export function describeRunError(
+  error: string,
+  attribution: "mine" | "not-mine" | "unknown",
+): string {
+  const details = `(panel_get_errors has the full node-level details)`;
+  switch (attribution) {
+    case "mine":
+      return (
+        `[panel event] ⚠️ The workflow run you queued ERRORED on the user's canvas: ${error}. ` +
+        `STOP — do not carry on as if it succeeded. Diagnose it ${details} and fix it.`
+      );
+    case "not-mine":
+      return (
+        `[panel event] A workflow run ERRORED on the user's canvas: ${error}. ` +
+        `You did NOT queue this run — this session has queued none — so do not treat it as your own ` +
+        `failure and do not look for a connection to what you were doing. Tell the user briefly. ` +
+        `Only investigate ${details} if they ask, or if it is obviously about a graph you just edited.`
+      );
+    default:
+      return (
+        `[panel event] ⚠️ A workflow run ERRORED on the user's canvas: ${error}. ` +
+        `Whether it is one you queued could NOT be determined, so do not assume either way. ` +
+        `If you were waiting on a render, treat this as it and diagnose it ${details}; if you were not, ` +
+        `it is the user's own run — tell them briefly and carry on.`
+      );
+  }
+}
+
+/**
+ * The run-error notice for a raw error string: extract the prompt id, ask the
+ * QueueMonitor whose run it was, and phrase it accordingly.
+ *
+ * Kept as one named step so the composition is testable. Left inline in
+ * PanelAgent it was reachable only through a full agent harness, and a mutation
+ * that hardcoded the attribution back to "mine" — the exact #889 regression —
+ * broke no test at all.
+ */
+export function runErrorNotice(error: string): string {
+  return describeRunError(error, QueueMonitor.attributeRun(promptIdOf(error)));
 }
