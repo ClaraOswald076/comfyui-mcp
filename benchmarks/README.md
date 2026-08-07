@@ -23,6 +23,28 @@ instead — its presence is the interesting signal, not a scoring detail.
 
 ## How to run an arm
 
+```
+node benchmarks/run-arm.mjs --base http://127.0.0.1:11434/v1 --model qwen3:4b
+node benchmarks/run-arm.mjs --base https://api.moonshot.ai/v1 --model kimi-k2 --key $KIMI_KEY
+```
+
+Any OpenAI-compatible `/chat/completions` endpoint. The model sees the 37 tool names and
+the request — never `expect`, `alt` or `why`.
+
+**It is not run automatically, and that is deliberate.** A hosted arm is 100 billable
+calls; a local arm puts a model resident on the GPU, which on a single-GPU box competes
+with ComfyUI for VRAM (the orchestrator already pauses Ollama during renders for exactly
+that reason). Both are decisions for whoever owns the machine and the budget.
+
+Scoring is three-way rather than pass/fail: `hit`, `alt` (the SURFACE is ambiguous
+there, not the model — counting these as misses blames the model for the benchmark's own
+design), and `miss`. An unparseable answer is counted separately from a wrong tool,
+because "could not follow the format" and "picked the wrong tool" need different fixes.
+Read the printed misses, not the rate.
+
+### Method notes
+
+
 Give a model ONLY the 37 tool names + descriptions and each `request`, ask which single
 tool it would call first, and compare to `expect`. Treat a hit on `alt` as a partial,
 not a miss — those rows are ambiguous **by construction** and are there to measure the
