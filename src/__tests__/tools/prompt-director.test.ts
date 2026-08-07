@@ -24,12 +24,13 @@ describe('get_workflow (action:"prompt_director") inspection', () => {
 
     const result = await promptDirectorInspectAction("42");
 
-    // Routed through comfyuiFetch now (so CF Access / COMFYUI_AUTH_* headers reach
-    // this endpoint too); with no auth configured it calls fetch(url, {}).
-    expect(fetchMock).toHaveBeenCalledWith(
-      "http://127.0.0.1:8188/prompt_director/inspection?node_id=42",
-      {},
-    );
+    // Routed through comfyuiFetch (so CF Access / COMFYUI_AUTH_* headers reach
+    // this endpoint too). With no auth configured the only thing added is the
+    // timeout ceiling: this call passes no signal of its own, and before that
+    // ceiling existed it could wait forever on a host that never answers.
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://127.0.0.1:8188/prompt_director/inspection?node_id=42");
+    expect(init.signal).toBeInstanceOf(AbortSignal);
     expect(result.content[0].text).toContain('"node_id": "42"');
     expect(result.content[0].text).toContain("prompt_director_auto");
   });

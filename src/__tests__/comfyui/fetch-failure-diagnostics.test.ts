@@ -18,7 +18,7 @@
 // original message survives at the FRONT of the expansion: transient-error
 // matchers elsewhere test for /fetch failed/.
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../config.js", () => ({
   getComfyUIAuthHeaders: () => ({}),
@@ -238,5 +238,100 @@ describe("#952: a headless failure names the connected panel's origin", () => {
   it("does not crash on an unparsable target", async () => {
     setConnectedPanelOrigins(() => ["http://192.168.1.50:8188"]);
     expect(await failureText("not-a-url")).toContain("ECONNREFUSED");
+  });
+});
+
+// A ComfyUI call that brought no budget of its own had NO time limit at all:
+// comfyuiFetch passed `init` straight to fetch, so a host that accepts the
+// connection and never answers left the request pending forever. Thirteen of
+// twenty-five call sites were in that state, including /prompt, /queue,
+// /object_info and the Manager API — the same defect #1026 hit in the skill
+// generator, which bounded three calls and left these.
+describe("comfyuiFetch bounds a call that brought no budget", () => {
+  afterEach(() => {
+    delete process.env.COMFYUI_MCP_HTTP_TIMEOUT_S;
+  });
+
+  it("supplies a signal when the caller passed none", async () => {
+    const spy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 200 }));
+    await comfyuiFetch("http://127.0.0.1:8188/queue");
+    expect((spy.mock.calls.at(-1)![1] as RequestInit).signal).toBeInstanceOf(AbortSignal);
+  });
+
+  // The caller's own budget is the informed one — 8s for the template listing,
+  // and so on. Ours must never shorten or replace it.
+  it("NEVER overrides a caller's own signal", async () => {
+    const mine = AbortSignal.timeout(5_000);
+    const spy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 200 }));
+    await comfyuiFetch("http://127.0.0.1:8188/queue", { signal: mine });
+    expect((spy.mock.calls.at(-1)![1] as RequestInit).signal).toBe(mine);
+  });
+
+  it("keeps auth headers while adding the signal", async () => {
+    const spy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 200 }));
+    await comfyuiFetch("http://127.0.0.1:8188/queue", { headers: { "X-Mine": "1" } });
+    const init = spy.mock.calls.at(-1)![1] as RequestInit;
+    expect(new Headers(init.headers).get("X-Mine")).toBe("1");
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("a nonsense env value does not disable the ceiling", async () => {
+    for (const bad of ["0", "-1", "abc", ""]) {
+      process.env.COMFYUI_MCP_HTTP_TIMEOUT_S = bad;
+      const spy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 200 }));
+      await comfyuiFetch("http://127.0.0.1:8188/queue");
+      expect((spy.mock.calls.at(-1)![1] as RequestInit).signal, bad).toBeInstanceOf(AbortSignal);
+      vi.restoreAllMocks();
+    }
+  });
+});
+
+describe("a ComfyUI timeout says what it did NOT establish", () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  function timeoutError(): Error {
+    const err = new Error("The operation was aborted due to timeout");
+    err.name = "TimeoutError";
+    return err;
+  }
+
+  it("does not read a GET timeout as a refusal or a missing resource", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(timeoutError());
+    const err = await comfyuiFetch("http://127.0.0.1:8188/queue").catch((e) => e);
+    const text = String((err as Error).message);
+    expect(text).toContain("Nothing was learned about the server");
+    expect(text).toContain("not a refusal");
+    expect((err as { code?: string }).code).toBe("COMFYUI_HTTP_TIMEOUT");
+  });
+
+  // THE case that matters. /prompt may have queued the render before the reply
+  // was lost, so calling this a failure would invite a retry that queues twice.
+  it("calls a MUTATING timeout OUTCOME UNKNOWN, not a failure", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(timeoutError());
+    const err = await comfyuiFetch("http://127.0.0.1:8188/prompt", { method: "POST" }).catch(
+      (e) => e,
+    );
+    const text = String((err as Error).message);
+    expect(text).toContain("OUTCOME UNKNOWN");
+    expect(text).toContain("do NOT");
+    expect(text).toContain("queue (action:\"list\")");
+    expect(text).not.toContain("Nothing was learned");
+  });
+
+  it("names the target and the method", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(timeoutError());
+    const err = await comfyuiFetch("http://gpu.local:8188/object_info").catch((e) => e);
+    expect(String((err as Error).message)).toContain("http://gpu.local:8188/object_info");
+    expect(String((err as Error).message)).toContain("(GET)");
+  });
+
+  // A caller who set their OWN deadline gets their own abort back untouched —
+  // rewriting it as our ceiling would misattribute whose budget expired.
+  it("leaves a CALLER's abort exactly as it was", async () => {
+    const original = timeoutError();
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(original);
+    const err = await comfyuiFetch("http://127.0.0.1:8188/queue", {
+      signal: AbortSignal.timeout(5_000),
+    }).catch((e) => e);
+    expect(err).toBe(original);
   });
 });

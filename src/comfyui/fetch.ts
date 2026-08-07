@@ -115,6 +115,78 @@ function describeComfyFetchFailure(err: unknown, target: string): Error {
 }
 
 /**
+ * A last-resort ceiling on a ComfyUI HTTP call that brought no budget of its own.
+ *
+ * `comfyuiFetch` passed `init` straight to `fetch`, so a call with no signal had
+ * NO time limit at all: a host that accepts the connection and then never
+ * answers — a stalled reverse proxy, a black-holed route, a ComfyUI wedged
+ * mid-request — left it pending forever. Thirteen of the twenty-five call sites
+ * were in that state, including `/prompt`, `/queue`, `/object_info` and the
+ * Manager API. This is the same defect #1026 hit in the skill generator; that
+ * fix bounded three calls, and this bounds the rest.
+ *
+ * DELIBERATELY GENEROUS. Every caller that knows its own budget already passes a
+ * signal (8s for the template listing, and so on) and keeps it — `init.signal`
+ * always wins. This value only has to be shorter than "forever" and longer than
+ * any healthy request: `/object_info` on a large custom-node install is
+ * legitimately slow, and a ceiling that fires on a working server would be a
+ * worse bug than the one being fixed.
+ *
+ * SAFE TO APPLY BROADLY because of what does NOT come through here: uploads and
+ * `/view` go through the client library's own `fetchApi`, and model downloads
+ * have their own streaming path. Every comfyuiFetch site is a small JSON API
+ * request.
+ */
+const DEFAULT_COMFY_HTTP_TIMEOUT_S = 120;
+
+function comfyHttpTimeoutSeconds(): number {
+  const raw = Number(process.env.COMFYUI_MCP_HTTP_TIMEOUT_S);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_COMFY_HTTP_TIMEOUT_S;
+}
+
+function defaultComfyTimeoutSignal(): AbortSignal {
+  return AbortSignal.timeout(Math.round(comfyHttpTimeoutSeconds() * 1000));
+}
+
+/** True for an abort raised by AbortSignal.timeout (not a caller's own abort). */
+function isTimeoutAbort(err: unknown): boolean {
+  return err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+}
+
+/**
+ * Say what the ceiling did and did NOT establish.
+ *
+ * The critical distinction is the METHOD. A GET that times out learned nothing
+ * about the server's state. A POST that times out is OUTCOME UNKNOWN — `/prompt`
+ * may well have queued the render before the reply was lost — and reporting that
+ * as a failure would invite a retry that queues it twice. Neither may be
+ * described as "the server is down".
+ */
+function describeComfyTimeout(input: string | URL | Request, init: RequestInit): Error {
+  const target = targetOf(input);
+  const method = String(
+    init.method ?? (input instanceof Request ? input.method : "GET"),
+  ).toUpperCase();
+  const seconds = comfyHttpTimeoutSeconds();
+  const mutating = method !== "GET" && method !== "HEAD";
+  const err = new Error(
+    `No reply from ComfyUI within ${seconds}s — while requesting ${target} (${method}). ` +
+      (mutating
+        ? `OUTCOME UNKNOWN: this request may already have been received and acted on, so do NOT ` +
+          `blindly re-issue it — check the server's state first (for a queued prompt, queue ` +
+          `(action:"list") and get_history (action:"list")). `
+        : `Nothing was learned about the server from this — a timeout is not a refusal and not a ` +
+          `"not found". `) +
+      `The connection was accepted but no answer arrived in time, which points at the server or ` +
+      `something between it and here rather than at the request. Confirm it is up with ` +
+      `get_system_stats (action:"health"), and raise COMFYUI_MCP_HTTP_TIMEOUT_S if this server is ` +
+      `simply slow.`,
+  );
+  (err as { code?: string }).code = "COMFYUI_HTTP_TIMEOUT";
+  return err;
+}
+
+/**
  * `fetch` wrapper for ComfyUI HTTP requests that injects the configured generic
  * auth header(s) (COMFYUI_AUTH_* — for self-hosted ComfyUI behind a reverse
  * proxy / API gateway). A no-op when no auth is configured. Explicit headers on
@@ -129,19 +201,28 @@ export async function comfyuiFetch(
   init: RequestInit = {},
 ): Promise<Response> {
   const auth = getComfyUIAuthHeaders();
+  // A CEILING, not a policy. Callers that know their own budget pass a signal
+  // and it always wins — this only covers the ones that passed none, which
+  // otherwise wait forever.
+  const signal = init.signal ?? defaultComfyTimeoutSignal();
   let request: Promise<Response>;
   if (Object.keys(auth).length === 0) {
-    request = fetch(input, init);
+    request = fetch(input, { ...init, signal });
   } else {
     const headers = new Headers(init.headers);
     for (const [name, value] of Object.entries(auth)) {
       if (!headers.has(name)) headers.set(name, value);
     }
-    request = fetch(input, { ...init, headers });
+    request = fetch(input, { ...init, headers, signal });
   }
   try {
     return await request;
   } catch (err) {
+    // Our own ceiling firing is not the same event as a caller's abort, and it
+    // must not be reported as one. Only rewrite when WE supplied the signal.
+    if (init.signal === undefined && isTimeoutAbort(err)) {
+      throw describeComfyTimeout(input, init);
+    }
     // ONLY the opaque undici failure is rewritten. An AbortError, a timeout with
     // its own message, or anything else already says what happened, and
     // replacing that text would be a downgrade.

@@ -21,10 +21,17 @@ describe("comfyuiFetch", () => {
     vi.unstubAllGlobals();
   });
 
-  it("is a passthrough when no auth is configured", async () => {
+  // Passthrough for everything the caller supplied — plus a timeout ceiling the
+  // caller did not. A call with no signal previously had NO limit at all and
+  // could hang forever against a host that accepts the connection and never
+  // answers; `init.signal` still always wins (see fetch-failure-diagnostics).
+  it("passes the caller's init through when no auth is configured", async () => {
     authHeaders.mockReturnValue({});
     await comfyuiFetch("http://comfy/prompt", { method: "POST" });
-    expect(fetchMock).toHaveBeenCalledWith("http://comfy/prompt", { method: "POST" });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://comfy/prompt");
+    expect((init as RequestInit).method).toBe("POST");
+    expect((init as RequestInit).signal).toBeInstanceOf(AbortSignal);
   });
 
   it("injects the configured auth header", async () => {
