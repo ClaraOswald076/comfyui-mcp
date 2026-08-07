@@ -92,6 +92,70 @@ function isWidgetInput(
  * (a string type carrying an `options` list), and the standard scalar widget
  * types all qualify; link/list types (IMAGE, COMFY_AUTOGROW_V3, …) do not.
  */
+/**
+ * #1037 — can the linked-nested placeholder ambiguity be settled by COUNTING?
+ *
+ * When a dynamic combo's nested leaf is converted-to-input, the saved array may
+ * or may not still carry a placeholder slot for it — frontend versions differ,
+ * and the two readings are indistinguishable from the leaf alone. The converter
+ * therefore refuses the tail rather than risk shifting a later widget (a seed
+ * silently becoming a stray `4`). That refusal is right in general.
+ *
+ * But it is often over-broad, because the WHOLE row usually settles it. Given
+ * the slots still unread and the widgets still to map, exactly one reading
+ * normally adds up:
+ *
+ *   widgets_values: ["scale dimensions", 1920, 1088, "center", "lanczos"]
+ *   nested(width, height, crop) with width+height linked, then scale_method
+ *     retained  -> consumes 3, leaves 1 for scale_method   ✓
+ *     omitted   -> consumes 1, leaves 3 for scale_method   ✗
+ *
+ * So the placeholders ARE present, and `crop` can be read from its slot instead
+ * of being dropped — which is what left ltx-2.3-txt2vid queueing a prompt with
+ * no `resize_type.crop`, getting its output node ignored by ComfyUI, and still
+ * reporting success.
+ *
+ * Returns the number of nested slots to consume, or undefined when the count
+ * does NOT settle it — in which case the caller refuses exactly as before.
+ * Deliberately conservative: it answers only when the remaining top-level
+ * widgets have a KNOWABLE width, and bails out entirely if any of them is
+ * itself a dynamic combo (whose own nested arity is unknown from here) or is a
+ * non-positional input. Ambiguity must stay a refusal, never a guess.
+ */
+function resolveLinkedNestedArity(opts: {
+  /** Slots not yet read, i.e. widgetValues.length - widgetIdx. */
+  remainingSlots: number;
+  /** Positional nested leaves of the selected option, in order. */
+  nestedPositional: string[];
+  /** Which of those are converted-to-input. */
+  isLinked: (leaf: string) => boolean;
+  /** Top-level widget names still to map AFTER this combo. */
+  laterWidgets: string[];
+  /** Slots a later top-level widget consumes, or undefined if unknowable. */
+  slotsForLaterWidget: (name: string) => number | undefined;
+}): number | undefined {
+  const total = opts.nestedPositional.length;
+  const linked = opts.nestedPositional.filter(opts.isLinked).length;
+  if (linked === 0) return undefined; // not the ambiguous case
+
+  let tail = 0;
+  for (const w of opts.laterWidgets) {
+    const n = opts.slotsForLaterWidget(w);
+    if (n === undefined) return undefined; // unknowable width — refuse, as before
+    tail += n;
+  }
+
+  const retained = total; // every nested leaf kept a slot
+  const omitted = total - linked; // linked leaves serialized nothing
+  const fitsRetained = opts.remainingSlots - retained === tail;
+  const fitsOmitted = opts.remainingSlots - omitted === tail;
+  // Exactly one reading may account for the row. Both (possible when linked
+  // leaves and later widgets happen to cancel out) or neither is still
+  // ambiguous, and stays a refusal.
+  if (fitsRetained === fitsOmitted) return undefined;
+  return fitsRetained ? retained : omitted;
+}
+
 function isPositionalWidgetSpec(spec: unknown): boolean {
   if (!Array.isArray(spec)) return false;
   const type = spec[0];
@@ -2716,6 +2780,35 @@ export function convertUiToApi(
         // non-widget nested inputs (AUTOGROW lists like Nano Banana 2's
         // "images", or IMAGE/link types) have no saved widget value, so skipping
         // them keeps the positional mapping aligned.
+        // #1037 — settle the placeholder ambiguity by COUNTING the row before
+        // falling back to a refusal. Computed once for the whole nested block so
+        // every leaf reads the same way; undefined means it did NOT settle, and
+        // the per-leaf refusal below then behaves exactly as it always did.
+        const nestedPositional = Object.entries(nested)
+          .filter(([, nSpec]) => isPositionalWidgetSpec(nSpec))
+          .map(([nName]) => nName);
+        const slotsForLaterWidget = (wName: string): number | undefined => {
+          const wSpec =
+            (def.input?.required as Record<string, unknown>)?.[wName] ??
+            (def.input?.optional as Record<string, unknown>)?.[wName];
+          // A later DYNAMIC COMBO carries its own unknown nested arity, so the
+          // row cannot be counted past it. Same for a non-positional input.
+          const wType = Array.isArray(wSpec) ? wSpec[0] : undefined;
+          if (wType === "COMFY_DYNAMICCOMBO_V3") return undefined;
+          if (!isPositionalWidgetSpec(wSpec)) return undefined;
+          return 1 + (hasControlAfterGenerate(wName, def) ? 1 : 0);
+        };
+        const settledArity = resolveLinkedNestedArity({
+          remainingSlots: widgetValues.length - widgetIdx,
+          nestedPositional,
+          isLinked: (leaf) => linkedInputNames.has(`${name}.${leaf}`),
+          laterWidgets: widgetNames.slice(nameIdx + 1),
+          slotsForLaterWidget,
+        });
+        // "retained" is the only reading under which a linked leaf still occupies
+        // a slot that must be stepped over.
+        const linkedLeavesHoldSlots =
+          settledArity !== undefined && settledArity === nestedPositional.length;
         let refuseTail = false;
         for (const [nName, nSpec] of Object.entries(nested)) {
           if (!isPositionalWidgetSpec(nSpec)) continue;
@@ -2734,11 +2827,25 @@ export function convertUiToApi(
           // (If NO trailing values remain there is nothing to misassign, so the
           // link simply supplies the leaf and the loop ends.)
           if (linkedInputNames.has(`${name}.${nName}`)) {
+            // #1037 — the row settled the ambiguity: step over the placeholder
+            // (or don't) and keep mapping, instead of dropping the rest. The
+            // leaf's own value still arrives via the link loop either way.
+            if (settledArity !== undefined) {
+              if (linkedLeavesHoldSlots && widgetIdx < widgetValues.length) widgetIdx++;
+              continue;
+            }
             if (widgetIdx < widgetValues.length) {
               warnings.push(
-                `Node ${nodeId} (${classType}): widget "${name}" has a converted-to-input (linked) nested widget "${name}.${nName}" whose widgets_values slot can't be positionally resolved (frontend versions differ on whether a converted widget keeps a placeholder slot), so the remaining ${
+                // #1037 — "left to their defaults" was only half true, and the
+                // harmless half. A TOP-LEVEL widget does fall back to its schema
+                // default. A NESTED "<combo>.<leaf>" key has NO such fallback: it
+                // is omitted from the prompt entirely, and if it is required
+                // ComfyUI rejects the node ("Required input is missing: crop") and
+                // IGNORES that output — which reads downstream as a successful run
+                // that produced nothing. Say which of the two this is.
+                `Node ${nodeId} (${classType}): widget "${name}" has a converted-to-input (linked) nested widget "${name}.${nName}" whose widgets_values slot can't be positionally resolved (frontend versions differ on whether a converted widget keeps a placeholder slot, and the saved row's length settles neither reading), so the remaining ${
                   widgetValues.length - widgetIdx
-                } saved widget value(s) are left to their defaults rather than risk silently assigning a stale value to a later widget (such as a seed).`,
+                } saved widget value(s) are not read — rather than risk silently assigning a stale value to a later widget (such as a seed). Top-level widgets fall back to their defaults; any NESTED "${name}.<leaf>" key is OMITTED from the prompt instead, so if one of them is required ComfyUI will reject this node and ignore its output branch (the run can then report success with nothing produced). Set the missing nested value explicitly, or reconnect the linked nested input as a widget.`,
               );
               refuseTail = true;
               break;
