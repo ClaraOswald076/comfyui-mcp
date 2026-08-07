@@ -70,6 +70,75 @@ describe("TurnOriginTracker — pins and stamps land at dequeue (#884)", () => {
     expect(warnings.join("\n")).toMatch(/mixed\/unknown-origin/);
   });
 
+  // A SAVE renames the tab (tmp:<uuid> → wf:<path>), so two messages issued from
+  // ONE tab either side of it carry different ids. Counting the minted ids made
+  // tabs.size === 2 and refused a single-tab turn as "issued from multiple
+  // workflows at once" — naming two entries that are the same workflow.
+  // Observed live on mcp 0.50.14 / panel 0.11.44: two origin banners, both
+  // titled "Untitled 2026-08-07 14-21-08", one tmp: and one wf:.
+  it("a tmp:→wf: SAVE migration is ONE origin, not a mixed batch", async () => {
+    const { tracker, tabAliases } = makeTracker();
+    // The save rewrote tmp:a onto wf:a; the instance uuid is carried across the
+    // swap (the tab is the same instance, only its id changed).
+    tabAliases.set("tmp:a", "wf:a");
+    tracker.recordForMid("m1", "uuid-a", "tmp:a"); // issued before the save
+    tracker.recordForMid("m2", "uuid-a", "wf:a"); //  issued after it
+    tracker.onSeen(KEY, "m1");
+    tracker.onSeen(KEY, "m2");
+    await flushMicrotasks();
+    // Not null — that is the whole point: routing resolves instead of refusing.
+    // The pin keeps the RECORDED identity (the bridge resolves it onward through
+    // the alias), so this asserts the contract gate 4 established, not the live id.
+    expect(tracker.pinOf(KEY)).toBe("tmp:a");
+    // …and the stamp survives, so graph mutations are not fenced out either.
+    expect(tracker.stampOf(KEY)).toBe("uuid-a");
+  });
+
+  it("the migration collapse holds whichever ORDER the two halves dequeue in", async () => {
+    // The post-save message can dequeue first (a re-queue, or simply the order
+    // the manager drains). Ambiguity must not depend on arrival order.
+    const { tracker, tabAliases } = makeTracker();
+    tabAliases.set("tmp:a", "wf:a");
+    tracker.recordForMid("m2", "uuid-a", "wf:a");
+    tracker.recordForMid("m1", "uuid-a", "tmp:a");
+    tracker.onSeen(KEY, "m2"); // post-save half dequeues first
+    tracker.onSeen(KEY, "m1");
+    await flushMicrotasks();
+    expect(tracker.pinOf(KEY)).toBe("wf:a"); // whichever was recorded into the set first
+    expect(tracker.stampOf(KEY)).toBe("uuid-a");
+  });
+
+  it("the collapse is by ROUTING, so two genuinely distinct tabs still fail closed", async () => {
+    // Guards the obvious over-fix: if aliasing collapsed anything it touched,
+    // a real mixed batch would be laundered onto one tab — the P0 this whole
+    // gate exists to prevent. Neither id is aliased, so each routes to itself.
+    const { tracker, warnings } = makeTracker();
+    tracker.recordForMid("m1", "uuid-a", "tab-a");
+    tracker.recordForMid("m2", "uuid-b", "tab-b");
+    tracker.onSeen(KEY, "m1");
+    tracker.onSeen(KEY, "m2");
+    await flushMicrotasks();
+    expect(tracker.pinOf(KEY)).toBeNull();
+    expect(tracker.stampOf(KEY)).toBeUndefined();
+    expect(warnings.join("\n")).toMatch(/mixed\/unknown-origin/);
+  });
+
+  it("a migration whose halves carry DIFFERENT uuids pins the tab but withholds the stamp", async () => {
+    // One tab, so routing is honest and resolves. But the two halves disagree
+    // about which workflow instance they were issued for, and no single stamp is
+    // honest for that — mutations stay fenced while reads/routing recover.
+    // Pinning the tab must NOT be read as vouching for a workflow.
+    const { tracker, tabAliases } = makeTracker();
+    tabAliases.set("tmp:a", "wf:a");
+    tracker.recordForMid("m1", "uuid-before", "tmp:a");
+    tracker.recordForMid("m2", "uuid-after", "wf:a");
+    tracker.onSeen(KEY, "m1");
+    tracker.onSeen(KEY, "m2");
+    await flushMicrotasks();
+    expect(tracker.pinOf(KEY)).toBe("tmp:a"); // recorded identity, resolved onward
+    expect(tracker.stampOf(KEY)).toBeUndefined();
+  });
+
   it("an unknown (evicted/foreign) mid fails the batch closed rather than inheriting", async () => {
     const { tracker } = makeTracker();
     tracker.recordForMid("known", "uuid-a", "tab-a");
