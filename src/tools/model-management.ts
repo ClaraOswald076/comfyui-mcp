@@ -4,9 +4,11 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
   searchHuggingFaceModels,
   listLocalModels,
+  listLocalModelsWithCoverage,
   currentLiveModelsRoot,
   MODEL_SUBDIRS,
 } from "../services/model-resolver.js";
+import type { ModelListingCoverage } from "../services/model-resolver.js";
 import { EXTRA_PATH_TARGETS } from "../services/extra-paths.js";
 import {
   startDownloadJob,
@@ -1044,19 +1046,83 @@ async function cancelAction(args: { id: string; tray_id?: string }): Promise<Cal
       }
 }
 
+/**
+ * What an EMPTY model listing is entitled to claim (#918).
+ *
+ * Three different situations used to print the same sentence:
+ *   1. ComfyUI answered for every category and every one was empty — a genuinely
+ *      empty install. "No models found" is true, and only here.
+ *   2. Some categories answered, others didn't — we know less than we're asked.
+ *   3. Nothing answered and there is no local path to scan (the remote/warming-up
+ *      case) — we know NOTHING, and the old text asserted an empty install.
+ *
+ * Exported for tests: the distinction is the fix, so it is pinned directly.
+ */
+export function describeEmptyModelListing(
+  modelType: string | undefined,
+  coverage: ModelListingCoverage,
+): string {
+  const scope = modelType ? `${modelType} models` : "local models";
+  if (coverage.unanswered.length === 0) {
+    // Verified: the server was asked and said zero.
+    return modelType ? `No ${modelType} models found.` : "No local models found.";
+  }
+
+  const detail = coverage.unanswered
+    .slice(0, 8)
+    .map((u) => `- ${u.dir}: ${u.reason}`)
+    .join("\n");
+  const more =
+    coverage.unanswered.length > 8 ? `\n- …and ${coverage.unanswered.length - 8} more` : "";
+
+  if (coverage.answered.length === 0) {
+    // We learned nothing at all. Say that, and do NOT say "none".
+    return (
+      `Could not determine which ${scope} are installed — ComfyUI did not answer the model listing. ` +
+      `This is NOT the same as having none: the models may be present and simply unlistable right now.\n\n` +
+      `Categories that could not be read:\n${detail}${more}\n\n` +
+      (coverage.noSourceAvailable
+        ? `There is also no local ComfyUI path to scan as a fallback (this is a remote/cloud setup), so there is no second source to check.\n\n`
+        : "") +
+      `Most often the server is still starting, or a proxy is returning HTML instead of JSON. ` +
+      `Retry in a few seconds; if it persists, check the ComfyUI URL with get_system_stats (action:"health") before concluding anything about the install.`
+    );
+  }
+
+  return (
+    `No ${scope} were found in the categories ComfyUI answered for (${coverage.answered.join(", ")}), ` +
+    `but ${coverage.unanswered.length} categor${coverage.unanswered.length === 1 ? "y" : "ies"} could not be read, ` +
+    `so this is a PARTIAL answer — models may exist in the categories below.\n\n${detail}${more}\n\n` +
+    `Retry before concluding they are absent.`
+  );
+}
+
 /** ← list_local_models (the pre-fold single-purpose tool) */
 async function listAction(args: {
   model_type?: z.infer<typeof modelTypeEnum>;
 }): Promise<CallToolResult> {
       try {
-        const models = await listLocalModels(args.model_type);
+        const { models, coverage } = await listLocalModelsWithCoverage(args.model_type);
 
         if (models.length === 0) {
-          const scope = args.model_type
-            ? `No ${args.model_type} models found.`
-            : "No local models found.";
-          return { content: [{ type: "text", text: scope }] };
+          // #918: "found none" is a CLAIM, and it may not be one we're entitled
+          // to make. When a category never answered — server warming up, a proxy
+          // returning HTML, no route to it at all — its emptiness is unknown, and
+          // saying "No models found" reads as a verified empty install. A reporter
+          // acted on exactly that and told a user their URL was misconfigured; the
+          // same call succeeded minutes later.
+          return {
+            content: [{ type: "text", text: describeEmptyModelListing(args.model_type, coverage) }],
+          };
         }
+        // Some categories answered and some didn't: the list below is real but
+        // PARTIAL, and a missing model may simply be in the part we couldn't read.
+        const partial =
+          coverage.unanswered.length > 0 && !coverage.usedFilesystem
+            ? `\n\n⚠ Partial listing — ${coverage.unanswered.length} categor${coverage.unanswered.length === 1 ? "y" : "ies"} could not be read ` +
+              `(${coverage.unanswered.map((u) => `${u.dir}: ${u.reason}`).join("; ")}). ` +
+              `Models in those categories are NOT absent, they are unlisted — retry if something you expect is missing.`
+            : "";
 
         // Group by type
         const grouped = new Map<string, typeof models>();
@@ -1099,7 +1165,7 @@ async function listAction(args: {
           lines.push("");
         }
 
-        return { content: [{ type: "text", text: lines.join("\n") }] };
+        return { content: [{ type: "text", text: lines.join("\n") + partial }] };
       } catch (err) {
         return errorToToolResult(err);
       }

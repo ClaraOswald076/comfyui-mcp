@@ -358,8 +358,58 @@ async function discoverGgufCategories(
   }
 }
 
+/**
+ * Where a model listing's emptiness came from (#918).
+ *
+ * An empty `LocalModel[]` used to be indistinguishable from "ComfyUI never
+ * answered": every per-category read swallowed its error, `httpReturnedAny`
+ * stayed false, the filesystem fallback returned [] because a remote setup has
+ * no `comfyuiPath`, and the tool printed "No local models found." A reporter
+ * read that as a misconfigured URL and told the user so — the listing was
+ * correct minutes later, once the server finished warming up.
+ *
+ * So the listing now carries HOW it knows. "The server said zero" and "the
+ * server said nothing" are different facts and must not render the same way.
+ */
+export type ModelListingCoverage = {
+  /** Categories ComfyUI answered for — an OK response with an array body.
+   *  Their emptiness is a verified fact. */
+  answered: string[];
+  /** Categories whose read failed or returned an unusable body, with why. Their
+   *  emptiness is UNKNOWN, not zero. */
+  unanswered: { dir: string; reason: string }[];
+  /** Set when HTTP listing was unavailable as a whole (no client, cloud mode,
+   *  category discovery threw) — every category is then unanswered. */
+  httpUnavailable?: string;
+  /** True when results came from the filesystem scan rather than HTTP. */
+  usedFilesystem: boolean;
+  /** Set when neither path could run: no HTTP answer AND no local install path
+   *  to scan, which is the exact shape that produced the false "no models". */
+  noSourceAvailable?: boolean;
+};
+
+/** Model listing plus the provenance needed to describe it honestly. */
+export async function listLocalModelsWithCoverage(
+  modelType?: string,
+): Promise<{ models: LocalModel[]; coverage: ModelListingCoverage }> {
+  const coverage: ModelListingCoverage = {
+    answered: [],
+    unanswered: [],
+    usedFilesystem: false,
+  };
+  const models = await collectLocalModels(modelType, coverage);
+  return { models, coverage };
+}
+
 export async function listLocalModels(
   modelType?: string,
+): Promise<LocalModel[]> {
+  return (await listLocalModelsWithCoverage(modelType)).models;
+}
+
+async function collectLocalModels(
+  modelType: string | undefined,
+  coverage: ModelListingCoverage,
 ): Promise<LocalModel[]> {
   const dirsToScan: string[] = modelType ? [modelType] : [...MODEL_SUBDIRS];
   const results: LocalModel[] = [];
@@ -388,9 +438,39 @@ export async function listLocalModels(
     for (const dir of dirsToScan) {
       try {
         const res = await client.fetchApi(`/models/${dir}`);
-        if (!res.ok) continue;
-        const files = (await res.json()) as unknown;
-        if (!Array.isArray(files)) continue;
+        // A non-OK status or a non-array body means we did NOT learn what this
+        // category holds. Recording the reason is the whole point: continuing
+        // silently is what let a warming-up server look like an empty install.
+        if (!res.ok) {
+          coverage.unanswered.push({ dir, reason: `HTTP ${res.status}` });
+          continue;
+        }
+        // Parse from TEXT rather than res.json(): a proxy, login page, or a
+        // still-starting server answers 200 with HTML, and res.json() then throws
+        // `Unexpected token '<', "<!doctype "...` — a raw parser message that says
+        // nothing about what actually happened. #918 called that out on the sibling
+        // tool; classify it here instead of leaking it.
+        const body = await res.text();
+        let files: unknown;
+        try {
+          files = JSON.parse(body);
+        } catch {
+          coverage.unanswered.push({
+            dir,
+            reason:
+              `ComfyUI returned ${/^\s*</.test(body) ? "HTML" : "a non-JSON body"} instead of JSON ` +
+              `(a proxy, login page, or a server still starting answers this way)`,
+          });
+          continue;
+        }
+        if (!Array.isArray(files)) {
+          coverage.unanswered.push({
+            dir,
+            reason: `the response was JSON but not an array (got ${files === null ? "null" : typeof files})`,
+          });
+          continue;
+        }
+        coverage.answered.push(dir);
         for (const name of files) {
           if (typeof name !== "string") continue;
           // Hardening for any `*_gguf` category (discovered OR explicitly requested):
@@ -411,6 +491,10 @@ export async function listLocalModels(
         }
       } catch (err) {
         logger.debug(`HTTP /models/${dir} failed, continuing`, { err });
+        coverage.unanswered.push({
+          dir,
+          reason: err instanceof Error ? err.message : String(err),
+        });
       }
     }
     if (httpReturnedAny) {
@@ -419,13 +503,25 @@ export async function listLocalModels(
     }
   } catch (err) {
     logger.debug("HTTP model listing unavailable, trying filesystem", { err });
+    coverage.httpUnavailable = err instanceof Error ? err.message : String(err);
+    // The outer throw (no client / cloud mode / GGUF discovery) aborts before any
+    // per-category read, so nothing below it was answered either.
+    for (const dir of dirsToScan) {
+      if (!coverage.answered.includes(dir) && !coverage.unanswered.some((u) => u.dir === dir)) {
+        coverage.unanswered.push({ dir, reason: coverage.httpUnavailable });
+      }
+    }
   }
 
   // Path 2 — filesystem fallback. Only useful in pure local mode without
-  // extra_model_paths.yaml. Return empty (don't throw) when there's no local
-  // path: that's the correct answer for remote/cloud setups where ComfyUI
-  // simply didn't return anything over HTTP.
-  if (!config.comfyuiPath) return results;
+  // extra_model_paths.yaml. Returning empty here is only the RIGHT answer when
+  // HTTP actually answered; when it didn't, this is the false-empty path from
+  // #918 and the caller has to be told the difference (coverage.noSourceAvailable).
+  if (!config.comfyuiPath) {
+    coverage.noSourceAvailable = coverage.unanswered.length > 0;
+    return results;
+  }
+  coverage.usedFilesystem = true;
   const modelsRoot = join(config.comfyuiPath, "models");
   const dedup = makeModelDeduper();
   for (const dir of dirsToScan) {

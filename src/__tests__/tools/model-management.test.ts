@@ -19,6 +19,13 @@ vi.mock("../../services/model-resolver.js", async () => {
     ...actual,
     downloadModel: (...a: unknown[]) => downloadModelMock(...a),
     listLocalModels: (...a: unknown[]) => listLocalModelsMock(...a),
+    // #918: the rendering path reads the coverage-carrying entry point. Wrap the
+    // existing mock so a test only has to say what the listing CONTAINS; the
+    // default coverage is the verified-answered case (nothing to caveat).
+    listLocalModelsWithCoverage: async (...a: unknown[]) => ({
+      models: (await listLocalModelsMock(...a)) ?? [],
+      coverage: { answered: ["checkpoints"], unanswered: [], usedFilesystem: false },
+    }),
     // Deterministic local routing (no live server probe) so startDownloadJob keys
     // the job locally and threads dispatchToManager=false into downloadModel.
     shouldDispatchDownloadToManager: async () => false,

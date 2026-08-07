@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   // model-resolver
   searchHuggingFaceModels: vi.fn(),
   listLocalModels: vi.fn(),
+  listLocalModelsWithCoverage: vi.fn(),
   resolveExistingModelFile: vi.fn(),
   // download-jobs
   startDownloadJob: vi.fn(),
@@ -57,6 +58,7 @@ vi.mock("../../services/model-resolver.js", async () => {
     ...actual,
     searchHuggingFaceModels: (...a: unknown[]) => mocks.searchHuggingFaceModels(...a),
     listLocalModels: (...a: unknown[]) => mocks.listLocalModels(...a),
+    listLocalModelsWithCoverage: (...a: unknown[]) => mocks.listLocalModelsWithCoverage(...a),
     resolveExistingModelFile: (...a: unknown[]) => mocks.resolveExistingModelFile(...a),
     currentLiveModelsRoot: async () => undefined,
   };
@@ -196,6 +198,12 @@ beforeEach(() => {
   mocks.cancelDownloadJob.mockReturnValue({ found: false, owned: false, aborted: false });
   mocks.searchHuggingFaceModels.mockResolvedValue([]);
   mocks.listLocalModels.mockResolvedValue([]);
+  // #918: the listing now carries HOW it knows. An empty list with every category
+  // ANSWERED is the verified-empty case these tests mean by "no models".
+  mocks.listLocalModelsWithCoverage.mockResolvedValue({
+    models: [],
+    coverage: { answered: ["checkpoints"], unanswered: [], usedFilesystem: false },
+  });
   mocks.searchCivitaiModels.mockResolvedValue({ hits: [] });
   mocks.searchCivitaiCreators.mockResolvedValue({ hits: [] });
   mocks.fetchCivitaiTopCreators.mockResolvedValue([]);
@@ -425,9 +433,11 @@ describe("download_model dispatch", () => {
 });
 
 describe("list_local_models dispatch", () => {
-  it('action:"list" reaches listLocalModels with the model_type filter', async () => {
+  it('action:"list" reaches the model listing with the model_type filter', async () => {
     await inventory()({ action: "list", model_type: "loras" });
-    expect(mocks.listLocalModels).toHaveBeenCalledWith("loras");
+    // #918 moved the call to the coverage-carrying entry point. The filter still
+    // has to reach the resolver, which is what this has always been pinning.
+    expect(mocks.listLocalModelsWithCoverage).toHaveBeenCalledWith("loras");
   });
 
   it('action:"embeddings" reads the connected server\'s /api/embeddings', async () => {
