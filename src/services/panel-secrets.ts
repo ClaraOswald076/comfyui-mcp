@@ -1141,6 +1141,47 @@ function rewriteEnvFile(
           }
         }
       }
+      // #881 — THE SWAP WINDOW. The compare-and-swap above closes the gap
+      // between our first read and our decision. It cannot close the gap between
+      // that check and this rename, and a writer landing in THAT window was
+      // overwritten silently: the loss account compares the store against the
+      // sentinel, which was captured before their write, so it saw only our own
+      // intended changes and reported the save clean. Losing another process's
+      // credential is bad; reporting it as a clean save is what made it
+      // undiagnosable.
+      //
+      // Re-read at the LAST possible moment and retry if the file moved under
+      // us. Retrying (rather than refusing) is what preserves their key: the
+      // next pass recomputes `next` from their content, so both writes survive.
+      //
+      // Compared by CONTENT, not by inode. st_ino is the more precise signal —
+      // the sentinel is a hard link, so a replacement gives `p` a new inode
+      // while the sentinel keeps the old one — but Node reports an unstable or
+      // zero `ino` on Windows, which is the platform this store is most used on.
+      // A content comparison is exact everywhere and costs one small read.
+      //
+      // HONEST LIMIT: this NARROWS the window, it does not close it. A writer
+      // landing between this read and the rename below is still unobservable
+      // without an OS-level atomic compare-and-swap, which no portable API
+      // offers. What it removes is the SILENT part — after this, a collision we
+      // can see is retried instead of clobbered.
+      if (sentinelTaken) {
+        // readFileSync + catch, NOT existsSync-then-read: this is a
+        // check-then-act pair otherwise, and the read is the observation anyway.
+        let atSwap = "";
+        try {
+          atSwap = readFileSync(p, "utf-8");
+        } catch {
+          atSwap = ""; // gone entirely — also a change
+        }
+        if (atSwap !== raw) {
+          rmSync(tmp, { force: true });
+          rmSync(sentinel, { force: true });
+          sentinelTaken = false;
+          sawConcurrentWriter = true;
+          continue;
+        }
+      }
       renameSync(tmp, p);
     } catch (err) {
       if (fd !== undefined) {
@@ -1276,8 +1317,9 @@ function rewriteEnvFile(
             `or between it and the rename, is not covered by the account above`
           : sawConcurrentWriter
           ? `another process was writing ${p} during this save (a compare-and-swap conflict was hit and retried). ` +
-            `The snapshot of the replaced state and the rename are two adjacent operations, so a write landing exactly between them ` +
-            `is replaced by this one without appearing in any read — this save cannot rule that out`
+            `The store is re-read immediately before the rename, so a write that landed up to that point was seen and retried ` +
+            `against rather than replaced (#881); but that read and the rename are still two adjacent operations, and a write ` +
+            `landing in the gap between them is replaced by this one without appearing in any read — this save cannot rule that out`
           : null;
     return {
       changed: afterRaw !== raw,
