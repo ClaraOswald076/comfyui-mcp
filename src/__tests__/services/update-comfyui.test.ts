@@ -205,8 +205,13 @@ describe("updateComfyUICore", () => {
       expect(r.updated).toBe(true);
       expect(r.comfyui_path).toBe("/fake/ComfyUI");
 
-      // First call is git pull in the comfyui path.
-      const gitCall = mockedExec.mock.calls.find((c) => c[0] === "git");
+      // `git pull` runs in the comfyui path. It is no longer the FIRST git call:
+      // #945 brackets the pull with read-only `rev-parse`/`symbolic-ref` probes,
+      // because a pull exiting 0 is not evidence that the checkout moved. Find
+      // the pull rather than assuming its position.
+      const gitCall = mockedExec.mock.calls.find(
+        (c) => c[0] === "git" && Array.isArray(c[1]) && c[1][0] === "pull",
+      );
       expect(gitCall).toBeDefined();
       expect(gitCall![1]).toEqual(["pull"]);
       expect(gitCall![2].cwd).toBe("/fake/ComfyUI");
@@ -219,6 +224,108 @@ describe("updateComfyUICore", () => {
       expect(pipCall![1]).toContain("install");
       expect(pipCall![1]).toContain("requirements.txt");
       expect(pipCall![0]).toMatch(/python/);
+    });
+  });
+
+  // #945 — the false success, end to end. The pure classifier is covered in
+  // update-core-verification.test.ts; these cover the WIRING, which is what
+  // actually reached the user: `updated: true` plus a requirements reinstall
+  // for a checkout that never moved.
+  describe("#945: a pull that moved nothing is not an update", () => {
+    /** Scripts the git probes; everything else answers "ok". */
+    const scriptGit = (probe: (args: string[]) => string | undefined) => {
+      mockedExists.mockImplementation((p: string) => {
+        if (p === "/fake/ComfyUI") return true;
+        if (p.endsWith("requirements.txt")) return true;
+        return false;
+      });
+      mockedExec.mockImplementation((file: string, args: string[]) => {
+        if (file === "uv" || file === "uv.exe") throw new Error("uv not found"); // force pip
+        if (file === "git") {
+          const out = probe(args);
+          if (out === undefined) throw new Error(`git ${args.join(" ")} failed`);
+          return out;
+        }
+        return "ok";
+      });
+    };
+    const pipCallsIn = (m: Mock) =>
+      m.mock.calls.filter((c) => Array.isArray(c[1]) && c[1].includes("-r"));
+
+    it("a DETACHED HEAD reports updated:false and skips the requirements reinstall", async () => {
+      scriptGit((args) => {
+        if (args[0] === "pull") return "Already up to date.";
+        if (args[0] === "rev-parse" && args[1] === "HEAD") return "dec5d945";
+        if (args[0] === "symbolic-ref") return undefined; // detached
+        return undefined; // no upstream either
+      });
+
+      const r = await updateComfyUICore();
+      expect(r.updated).toBe(false);
+      expect(r.message).toMatch(/was NOT updated/);
+      expect(r.message).toMatch(/DETACHED/);
+      expect(r.revision).toMatchObject({ before: "dec5d945", after: "dec5d945", branch: null });
+      // The part that made the lie convincing: it looked like work.
+      expect(pipCallsIn(mockedExec)).toHaveLength(0);
+      expect(r.message).toMatch(/requirements were NOT reinstalled/);
+    });
+
+    it("an upstream that is AHEAD reports updated:false and names both shas", async () => {
+      scriptGit((args) => {
+        if (args[0] === "pull") return "Already up to date.";
+        if (args[0] === "rev-parse" && args[1] === "HEAD") return "dec5d945aaaa";
+        if (args[0] === "symbolic-ref") return "master";
+        if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return "origin/master";
+        if (args[0] === "rev-parse" && args[1] === "origin/master") return "2eb60796bbbb";
+        return undefined;
+      });
+
+      const r = await updateComfyUICore();
+      expect(r.updated).toBe(false);
+      expect(r.message).toContain("dec5d945");
+      expect(r.message).toContain("2eb60796");
+      expect(r.revision?.matches_upstream).toBe(false);
+      expect(pipCallsIn(mockedExec)).toHaveLength(0);
+    });
+
+    it("a HEAD that MOVED reports updated:true and does reinstall requirements", async () => {
+      let pulled = false;
+      scriptGit((args) => {
+        if (args[0] === "pull") {
+          pulled = true;
+          return "Updating dec5d94..2eb6079";
+        }
+        if (args[0] === "rev-parse" && args[1] === "HEAD") {
+          return pulled ? "2eb60796bbbb" : "dec5d945aaaa";
+        }
+        if (args[0] === "symbolic-ref") return "master";
+        if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return "origin/master";
+        if (args[0] === "rev-parse" && args[1] === "origin/master") return "2eb60796bbbb";
+        return undefined;
+      });
+
+      const r = await updateComfyUICore();
+      expect(r.updated).toBe(true);
+      expect(r.message).toMatch(/dec5d945 → 2eb60796/);
+      expect(pipCallsIn(mockedExec).length).toBeGreaterThan(0);
+    });
+
+    it("HEAD already AT the upstream tip is a success, and says nothing was pulled", async () => {
+      scriptGit((args) => {
+        if (args[0] === "pull") return "Already up to date.";
+        if (args[0] === "rev-parse" && args[1] === "HEAD") return "2eb60796bbbb";
+        if (args[0] === "symbolic-ref") return "master";
+        if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return "origin/master";
+        if (args[0] === "rev-parse" && args[1] === "origin/master") return "2eb60796bbbb";
+        return undefined;
+      });
+
+      const r = await updateComfyUICore();
+      expect(r.updated).toBe(true);
+      expect(r.message).toMatch(/nothing to pull/);
+      expect(r.revision?.matches_upstream).toBe(true);
+      // This IS a legitimate update call, so the dependency sync still runs.
+      expect(pipCallsIn(mockedExec).length).toBeGreaterThan(0);
     });
   });
 
