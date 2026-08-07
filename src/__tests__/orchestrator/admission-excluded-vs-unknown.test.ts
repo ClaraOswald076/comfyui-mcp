@@ -1,6 +1,6 @@
 // #908 — "not permitted" was a dead end.
 //
-// PR #278 correctly removed runpod_pod_create / runpod_pod_start from the direct
+// PR #278 correctly removed pod create/start (now `runpod` actions) from the direct
 // call_tool whitelist: both put a pod into a BILLING state, and a
 // confirmation-less mirrored tab must not be able to spend money. The exclusion
 // is right and stays. What was wrong is that the panel's RunPod Deploy/Start

@@ -107,8 +107,8 @@ const artefact = {
    * Core tools the DIRECT `call_tool` channel will admit — the canvas-less path
    * mobile, mirrored tabs and the panel's own buttons use.
    *
-   * Exists because #908: PR #278 correctly removed `runpod_pod_create` and
-   * `runpod_pod_start` from that channel (both start BILLING, and a
+   * Exists because #908: PR #278 correctly removed pod create/start (now
+   * `runpod` actions) from that channel (both start BILLING, and a
    * confirmation-less mirrored tab must not spend money), but the panel's
    * cmcp-runpod-ui.js kept calling them over exactly that channel. Both buttons
    * were inert for about two weeks, returning a bare "not permitted". Each repo
