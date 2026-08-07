@@ -84,6 +84,15 @@ export interface PanelBaseResolution {
    * destructive write: see the corroboration gate in panel-installer.
    */
   liveProbeFailed?: boolean;
+  /**
+   * True when the server WAS reached but no live root could be derived from
+   * what it reported: no `--base-directory`, and its argv yielded no absolute
+   * install root holding custom_nodes (argv absent, no positional main.py, or
+   * a RELATIVE main.py with no reported cwd — the common `python main.py` /
+   * portable-launcher shape). Distinct from liveProbeFailed: "start ComfyUI"
+   * is a dead remedy here because ComfyUI is already running (#890/#916).
+   */
+  liveRootUnderivable?: boolean;
 }
 
 /**
@@ -150,8 +159,13 @@ export async function resolvePanelBase(): Promise<PanelBaseResolution> {
   }
 
   const liveProbeFailed = !snapshot.reachable;
-  if (configured) return { base: configured, source: "configured", liveProbeFailed };
-  return { source: "none", liveProbeFailed };
+  // Reached but nothing derivable: tell callers apart from "could not ask" —
+  // the remedy for each is different (#916).
+  const liveRootUnderivable = snapshot.reachable;
+  if (configured) {
+    return { base: configured, source: "configured", liveProbeFailed, liveRootUnderivable };
+  }
+  return { source: "none", liveProbeFailed, liveRootUnderivable };
 }
 
 /*

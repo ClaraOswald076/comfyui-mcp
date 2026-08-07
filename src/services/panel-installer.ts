@@ -1926,9 +1926,16 @@ export async function panelStatus(
         `CONFIGURED path, and the running ComfyUI did not confirm it is the tree it ` +
         `serves from, so "not installed" is UNCORROBORATED. On a split install ` +
         `(Comfy Desktop's --base-directory, #766) the panel lives elsewhere and ` +
-        `installing here would land in a custom_nodes nothing loads. Start/reach ` +
-        `ComfyUI so its own install root can be read, or check install_comfyui (action:"environment")'s ` +
-        `local.workspace_path, before installing.`
+        `installing here would land in a custom_nodes nothing loads. ` +
+        (baseResolution?.liveRootUnderivable
+          ? `ComfyUI IS running, but its reported launch arguments did not identify ` +
+            `an install root holding custom_nodes (a relative main.py with no ` +
+            `reported working directory), so reaching it again will not change this — ` +
+            `check install_comfyui (action:"environment")'s local.workspace_path, or ` +
+            `relaunch ComfyUI with an ABSOLUTE path to main.py, before installing.`
+          : `Start/reach ` +
+            `ComfyUI so its own install root can be read, or check install_comfyui ` +
+            `(action:"environment")'s local.workspace_path, before installing.`)
       : `Not installed. Run install_comfyui(action:'panel', panel_action:'install') to add the panel (${PANEL_VERSION}). Restart ComfyUI afterwards.`;
   } else {
     note = `Installed${
@@ -2464,12 +2471,32 @@ function assertSwapTreeCorroborated(
   }
   throw new PanelInstallError(
     `Panel update did NOT apply (${managerReason}), and ${what} is REFUSED: the ` +
-      `running ComfyUI did not confirm that ${comfyuiPath} is the tree it serves from, ` +
-      `so this is the CONFIGURED path rather than a corroborated one. On a split ` +
-      `install (Comfy Desktop's --base-directory, #766) those differ, and updating the ` +
-      `panel here could move a copy nobody serves while the browser keeps loading the ` +
-      `real one — reported as a verified success. Start ComfyUI so its install root can ` +
-      `be read, then retry. ${describePanelUpdateRecovery()}`,
+      (resolution?.liveRootUnderivable
+        ? // The server ANSWERED but its launch arguments yielded no install
+          // root holding custom_nodes (#890/#916 — the common `python main.py`
+          // / portable-launcher shape reports a relative argv and no cwd). The
+          // "start ComfyUI" remedy is dead here: it is already running. What
+          // works is updating the pack by hand where it lies, or relaunching
+          // in a way that reports an absolute main.py.
+          `running ComfyUI answered but its reported launch arguments did not identify ` +
+          `an install root holding custom_nodes (a relative main.py and no reported ` +
+          `working directory cannot be resolved), so it could not confirm that ` +
+          `${comfyuiPath} is the tree it serves from — this is the CONFIGURED path ` +
+          `rather than a corroborated one. On a split install (Comfy Desktop's ` +
+          `--base-directory, #766) those differ, and updating the panel here could ` +
+          `move a copy nobody serves while the browser keeps loading the real one — ` +
+          `reported as a verified success. Two ways forward: update the pack by hand ` +
+          `where it is installed (if ${comfyuiPath}/custom_nodes/${PANEL_REGISTRY_ID} ` +
+          `is a git checkout: git -C "${comfyuiPath}/custom_nodes/${PANEL_REGISTRY_ID}" ` +
+          `pull --ff-only, then restart ComfyUI and hard-refresh the tab), or relaunch ` +
+          `ComfyUI with an ABSOLUTE path to main.py so its root can be corroborated, ` +
+          `then retry. ${describePanelUpdateRecovery()}`
+        : `running ComfyUI did not confirm that ${comfyuiPath} is the tree it serves from, ` +
+          `so this is the CONFIGURED path rather than a corroborated one. On a split ` +
+          `install (Comfy Desktop's --base-directory, #766) those differ, and updating the ` +
+          `panel here could move a copy nobody serves while the browser keeps loading the ` +
+          `real one — reported as a verified success. Start ComfyUI so its install root can ` +
+          `be read, then retry. ${describePanelUpdateRecovery()}`),
   );
 }
 

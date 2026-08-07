@@ -774,6 +774,54 @@ describe("panel_restart_comfyui — Pinokio-style refuse-safe preflight (#742)",
   });
 });
 
+describe("panel_restart_comfyui — a declined restart leaves the panel bridge untouched (#916)", () => {
+  // #916: a restart CANCELLED at its confirmation card left the panel bridge
+  // disconnected ("Panel not reachable: no panel connected" on the very next
+  // call). The decline path must be a pure report: it dispatches nothing to
+  // the bridge, drops no caches, and leaves the session bound to the same tab.
+  it("a clean decline dispatches NOTHING over the bridge and the session stays bound to the same live tab", async () => {
+    __panelToolsTestHooks.setHealthProbe(async () => "healthy");
+    const { ctx, sends } = makeCtx({ confirm: "no" });
+    const identityBefore = ctx.panelConnectionIdentity();
+
+    const res = await restartTool().handler({}, ctx);
+
+    expect(text(res)).toBe("Cancelled — ComfyUI was not restarted.");
+    // Not one frame to the panel: no reboot, no reload, no rebind command.
+    expect(sends).toEqual([]);
+    // No client caches dropped (those belong to an ACCEPTED restart).
+    expect(resetClient).not.toHaveBeenCalled();
+    expect(resetObjectInfoCache).not.toHaveBeenCalled();
+    // The binding is exactly what it was before the card was answered.
+    expect(ctx.tabId).toBe("bound-tab");
+    expect(ctx.bridge.canReach(ctx.tabId)).toBe(true);
+    expect(ctx.panelConnectionIdentity()).toEqual(identityBefore);
+    // …so the next panel command routes exactly as before the declined restart.
+    await ctx.bridge.send({ cmd: "graph_get_state" } as { cmd: string }, {
+      tabId: ctx.tabId,
+    } as never);
+    expect(sends).toEqual([{ cmd: "graph_get_state" }]);
+  });
+
+  it("a decline over a DOWN server reports the loss but STILL dispatches nothing and keeps the binding", async () => {
+    __panelToolsTestHooks.setHealthProbe(async () => "down");
+    const { ctx, sends } = makeCtx({ confirm: "no" });
+    const identityBefore = ctx.panelConnectionIdentity();
+
+    const res = await restartTool().handler({}, ctx);
+
+    expect(text(res)).toMatch(/ComfyUI is DOWN/i);
+    // Even the alarmed report path is observation-only: nothing went out over
+    // the bridge, and the session/tab identity is undisturbed.
+    expect(sends).toEqual([]);
+    expect(resetClient).not.toHaveBeenCalled();
+    expect(resetObjectInfoCache).not.toHaveBeenCalled();
+    expect(ctx.tabId).toBe("bound-tab");
+    expect(ctx.bridge.canReach(ctx.tabId)).toBe(true);
+    expect(ctx.panelConnectionIdentity()).toEqual(identityBefore);
+  });
+});
+
 describe("panel_restart_comfyui — restart dispatch record (r4/r5)", () => {
   it("an ACCEPTED reboot stamps the dispatch record HELD BY its session (target base + time)", async () => {
     // The reboot is accepted but never observed back — the record must stay
