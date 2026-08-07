@@ -94,6 +94,16 @@ vi.mock("../../services/workspace-env.js", async () => {
   >("../../services/workspace-env.js");
   return {
     resolveEffectiveComfyUIBase: () => config.comfyuiPath ?? savedDefaultWorkspace,
+    // #1052 — backed by the REAL argv parsing, like the resolvers above, so the
+    // live-root rung is exercised end to end rather than stubbed away.
+    resolveLiveComfyUIBase: async () => {
+      try {
+        const stats = await getSystemStats();
+        return actual.liveRootFromArgv(stats?.system?.argv, stats?.system?.cwd);
+      } catch {
+        return undefined;
+      }
+    },
     liveRootFromArgv: actual.liveRootFromArgv,
     hasComfyUIEntrypoint: (dir: string) =>
       hasEntrypointFor ? hasEntrypointFor(dir) : baseHasEntrypoint,
@@ -1094,5 +1104,76 @@ describe("models dir — corroborating a data-dir base by the server's own inven
     const res = await resolveModelsDirWithBases({ targetCategory: "diffusion_models" });
     expect(res.source).toBe("live-root");
     expect(fetchApi).not.toHaveBeenCalled();
+  });
+});
+
+// #1052 — with TWO ComfyUI installs on one machine, refs resolved against the
+// wrong one.
+//
+// A reporter had ComfyUI Desktop installed alongside the git checkout they were
+// actually connected to. `train_prepare_dataset` refs
+// ({filename, subfolder, type:"output"}) pointing at images that server had just
+// produced failed "image not found" against the DESKTOP path, while the files
+// sat in the connected server's output dir the whole time.
+//
+// The argv rung only answers when ComfyUI was launched with an explicit
+// --output-directory. Without one, resolution fell straight through to the
+// configured/auto-detected install — a different tree from the running one. The
+// running server's own argv (main.py + cwd) identifies its root perfectly well,
+// which is the live-first move #463 already made for models.
+//
+// The tool's description promises refs resolve "against the connected ComfyUI's
+// output/input dirs", so the contract was right and the resolution was not.
+describe("#1052: I/O dirs follow the CONNECTED server, not a second install", () => {
+  const CONNECTED = resolve("/home/u/Documents/comfy/ComfyUI");
+  const DESKTOP = resolve("/home/u/AppData/Local/Programs/ComfyUI/resources/ComfyUI");
+
+  beforeEach(() => {
+    (config as { comfyuiPath?: string }).comfyuiPath = DESKTOP;
+    liveRootExists = true;
+  });
+
+  /** The connected server, launched WITHOUT an explicit --output/--input-directory. */
+  function connectedServerNoExplicitDirs(): void {
+    getSystemStats.mockResolvedValue({
+      system: { argv: ["python", join(CONNECTED, "main.py")], cwd: CONNECTED },
+    });
+  }
+
+  it("resolves the OUTPUT dir under the connected install, not the configured one", async () => {
+    connectedServerNoExplicitDirs();
+    const got = await resolveOutputDir();
+    expect(got).toBe(join(CONNECTED, "output"));
+    expect(got).not.toBe(resolve(DESKTOP, "output")); // the reported failure
+  });
+
+  it("resolves the INPUT dir the same way", async () => {
+    connectedServerNoExplicitDirs();
+    expect(await resolveInputDir()).toBe(join(CONNECTED, "input"));
+  });
+
+  // An EXPLICIT --output-directory is the server telling us outright; it must
+  // keep winning over an install root inferred from main.py.
+  it("still lets an explicit --output-directory win", async () => {
+    const redirected = resolve("/mnt/big/outputs");
+    getSystemStats.mockResolvedValue({
+      system: {
+        argv: ["python", join(CONNECTED, "main.py"), "--output-directory", redirected],
+        cwd: CONNECTED,
+      },
+    });
+    expect(await resolveOutputDir()).toBe(redirected);
+  });
+
+  // And when nothing about the live server can be read, the configured install
+  // is still the right answer — this rung adds a source, it does not remove one.
+  it("falls back to the configured install when the server cannot be read", async () => {
+    getSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+    expect(await resolveOutputDir()).toBe(resolve(DESKTOP, "output"));
+  });
+
+  it("falls back when the live argv identifies no root", async () => {
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    expect(await resolveOutputDir()).toBe(resolve(DESKTOP, "output"));
   });
 });

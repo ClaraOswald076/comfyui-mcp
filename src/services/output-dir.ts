@@ -4,6 +4,7 @@ import { config, isRemoteMode } from "../config.js";
 import { getClient, getSystemStats } from "../comfyui/client.js";
 import {
   resolveEffectiveComfyUIBase,
+  resolveLiveComfyUIBase,
   liveRootFromArgv,
   resolveLiveServerRoot,
   hasComfyUIEntrypoint,
@@ -943,6 +944,36 @@ export function localInputDirFallback(): string {
  * Resolve the directory ComfyUI actually reads inputs from. Asks the running
  * ComfyUI (/system_stats argv) first; falls back to <COMFYUI_PATH>/input.
  */
+/**
+ * `<live install root>/<kind>` when the CONNECTED server's own argv identifies
+ * it, else undefined (#1052).
+ *
+ * The argv parse above only answers when ComfyUI was launched with an EXPLICIT
+ * --input-directory / --output-directory. Without one, resolution fell straight
+ * through to the configured/auto-detected install — and on a machine with more
+ * than one ComfyUI that is a different tree from the one actually running.
+ *
+ * A reporter with ComfyUI Desktop installed alongside the git checkout they were
+ * connected to had `train_prepare_dataset` refs resolve against Desktop and fail
+ * "image not found", while the files sat in the connected server's output dir
+ * the whole time. The tool's own description promises refs resolve "against the
+ * connected ComfyUI's output/input dirs", so the contract was right and the
+ * resolution was not.
+ *
+ * `resolveLiveComfyUIBase` derives the root from the running server's argv
+ * main.py + cwd, which is the same live-first move #463 made for models. It is
+ * only a middle rung: an explicit --output-directory still wins above, and the
+ * configured install still catches everything below.
+ */
+async function liveIoDirFallback(kind: "input" | "output"): Promise<string | undefined> {
+  try {
+    const base = await resolveLiveComfyUIBase();
+    return base ? join(base, kind) : undefined;
+  } catch {
+    return undefined; // never let a probe failure outrank the configured install
+  }
+}
+
 export async function resolveInputDir(): Promise<string> {
   try {
     const stats = await getSystemStats();
@@ -958,6 +989,16 @@ export async function resolveInputDir(): Promise<string> {
       "Could not resolve input dir from /system_stats; using COMFYUI_PATH/input",
       { error: err instanceof Error ? err.message : String(err) },
     );
+  }
+  // #1052 — before the CONFIGURED install, try the one that is actually
+  // running. With two ComfyUIs on a machine these differ, and the connected
+  // server is the one whose files the caller means.
+  const live = await liveIoDirFallback("input");
+  if (live) {
+    logger.debug("Resolved ComfyUI input directory from the LIVE server's install root", {
+      dir: live,
+    });
+    return live;
   }
   return localInputDirFallback();
 }
@@ -981,6 +1022,16 @@ export async function resolveOutputDir(): Promise<string> {
       "Could not resolve output dir from /system_stats; using COMFYUI_PATH/output",
       { error: err instanceof Error ? err.message : String(err) },
     );
+  }
+  // #1052 — before the CONFIGURED install, try the one that is actually
+  // running. With two ComfyUIs on a machine these differ, and the connected
+  // server is the one whose files the caller means.
+  const live = await liveIoDirFallback("output");
+  if (live) {
+    logger.debug("Resolved ComfyUI output directory from the LIVE server's install root", {
+      dir: live,
+    });
+    return live;
   }
   return localOutputDirFallback();
 }
