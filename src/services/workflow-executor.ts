@@ -136,7 +136,7 @@ async function randomizeSeeds(
 export async function enqueueWorkflow(
   workflowJson: WorkflowJSON,
   options?: EnqueueWorkflowOptions,
-): Promise<{ prompt_id: string; queue_remaining?: number }> {
+): Promise<{ prompt_id: string; queue_remaining?: number; rejectedOutputs?: string }> {
   const workflow = options?.disable_random_seed
     ? workflowJson
     : await randomizeSeeds(
@@ -153,6 +153,13 @@ export async function enqueueWorkflow(
     prompt_id: result.prompt_id,
     queue_remaining: result.queue_remaining,
   });
+  // A 200 from /prompt does not mean every output was accepted: ComfyUI queues
+  // the branches that validate and reports the rejected ones in node_errors. Log
+  // it unconditionally so the fact survives even if a caller renders only
+  // prompt_id — a rejected branch produces nothing while the run still completes.
+  if (result.rejectedOutputs) {
+    logger.warn(`[enqueue] ${result.rejectedOutputs}`, { prompt_id: result.prompt_id });
+  }
 
   // Start background watcher for completion detection. Capture the workflow
   // that was actually sent (post-seed-randomization) so the AssetRegistry can

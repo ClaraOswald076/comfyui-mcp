@@ -385,11 +385,56 @@ export async function freeMemory(opts: { unload_models?: boolean; free_memory?: 
  * Fire-and-forget: enqueue a prompt via HTTP POST (no WebSocket needed).
  * Returns prompt_id and queue position immediately.
  */
+/**
+ * Human-readable account of output branches ComfyUI REFUSED while accepting the
+ * prompt, or undefined when it accepted everything.
+ *
+ * Shape from ComfyUI: { "<nodeId>": { class_type, errors: [{ type, message,
+ * details, extra_info: { input_name } }] } }. Only what is actually present is
+ * stated — a node that carries no readable error still gets named, because "this
+ * branch will not run" is the load-bearing fact and it does not depend on our
+ * being able to parse the reason.
+ */
+function describeRejectedOutputs(nodeErrors: unknown): string | undefined {
+  if (!nodeErrors || typeof nodeErrors !== "object") return undefined;
+  const entries = Object.entries(nodeErrors as Record<string, unknown>);
+  if (entries.length === 0) return undefined;
+  const parts = entries.map(([nodeId, raw]) => {
+    const rec = (raw ?? {}) as { class_type?: unknown; errors?: unknown };
+    const cls = typeof rec.class_type === "string" ? ` (${rec.class_type})` : "";
+    const errs = Array.isArray(rec.errors) ? rec.errors : [];
+    const reasons = errs
+      .map((e) => {
+        const er = (e ?? {}) as { message?: unknown; extra_info?: { input_name?: unknown } };
+        const msg = typeof er.message === "string" ? er.message : null;
+        const input =
+          er.extra_info && typeof er.extra_info.input_name === "string"
+            ? er.extra_info.input_name
+            : null;
+        if (msg && input) return `${msg} (${input})`;
+        return msg ?? (input ? `problem with input "${input}"` : null);
+      })
+      .filter((r): r is string => !!r);
+    return `node ${nodeId}${cls}${reasons.length ? `: ${reasons.join("; ")}` : ""}`;
+  });
+  return (
+    `The prompt was QUEUED, but ComfyUI REJECTED ${parts.length} output branch` +
+    `${parts.length === 1 ? "" : "es"} at validation and will not run ${
+      parts.length === 1 ? "it" : "them"
+    } — ${parts.join(" | ")}. Everything upstream of the ACCEPTED outputs still ` +
+    `runs, so this prompt can complete and report success while producing nothing ` +
+    `from the rejected branch${parts.length === 1 ? "" : "es"}. Fix the named ` +
+    `input(s) and re-queue if you expected output from ${
+      parts.length === 1 ? "it" : "them"
+    }.`
+  );
+}
+
 export async function enqueuePrompt(
   workflow: Record<string, unknown>,
   extraData?: Record<string, unknown>,
   opts?: { front?: boolean },
-): Promise<{ prompt_id: string; queue_remaining?: number }> {
+): Promise<{ prompt_id: string; queue_remaining?: number; rejectedOutputs?: string }> {
   if (isCloudMode()) return cloudClient.enqueuePrompt(workflow, extraData);
 
   // POST /prompt directly (rather than the SDK's _enqueue_prompt) for two
@@ -414,13 +459,38 @@ export async function enqueuePrompt(
   if (!res.ok) {
     throw await buildEnqueueError(res);
   }
-  const data = (await res.json()) as { prompt_id: string; number?: number };
+  const data = (await res.json()) as {
+    prompt_id: string;
+    number?: number;
+    node_errors?: Record<string, unknown>;
+  };
   // NB: `data.number` is ComfyUI's monotonic priority counter (and is NEGATIVE
   // for front-inserted jobs) — NOT the remaining queue depth. The old SDK path
   // returned exec_info.queue_remaining; to preserve an accurate count now that
   // we POST directly, read /queue for the authoritative running+pending total.
   // Fall back to undefined (never the misleading counter) if that read fails.
-  return { prompt_id: data.prompt_id, queue_remaining: await queueRemainingCount() };
+  // A 200 does NOT mean every output was accepted. ComfyUI validates each output
+  // branch independently: if SOME validate it queues those and returns 200 with a
+  // prompt_id, carrying `node_errors` for the ones it REJECTED (execution.py
+  // returns (True, None, good_outputs, node_errors); it only 400s when NO output
+  // is good). Those branches then never run — ComfyUI logs "Output will be
+  // ignored" — and the prompt still completes, so the run reports success while
+  // producing nothing from them.
+  //
+  // That is exactly how #1037 reached a user: a required nested input was missing
+  // on one node, its output branch was dropped, and queue(action:"status") said
+  // success with no video. This function already goes direct to /prompt SO THAT
+  // node_errors can be read (#485) — but only the 400 path read them.
+  //
+  // Reported, never swallowed and never fatal: the run WAS queued and the
+  // accepted branches will produce output, so this is a disclosure attached to a
+  // success, not a failure.
+  const rejectedOutputs = describeRejectedOutputs(data.node_errors);
+  return {
+    prompt_id: data.prompt_id,
+    queue_remaining: await queueRemainingCount(),
+    ...(rejectedOutputs ? { rejectedOutputs } : {}),
+  };
 }
 
 /**
