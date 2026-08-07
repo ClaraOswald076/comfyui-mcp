@@ -426,6 +426,51 @@ export type ModelListingCoverage = {
   noSourceAvailable?: boolean;
 };
 
+/**
+ * Why a category's body would not parse — stated from what was OBSERVED (#1015).
+ *
+ * The previous wording covered every parse failure with one sentence: "returned
+ * a non-JSON body instead of JSON (a proxy, login page, or a server still
+ * starting answers this way)". For an HTML body that is a fair reading. For an
+ * EMPTY body it is three guesses stacked on a fact we already hold exactly — the
+ * server answered, the status was fine, and it sent zero bytes. None of the
+ * three offered causes produces an empty body, so the one case where the
+ * evidence is unambiguous got the vaguest description.
+ *
+ * The reporter's ask was precisely this: "return the raw endpoint/status so
+ * callers can distinguish an empty category from a transport/parse failure."
+ * The status is now carried in every branch, because a parse failure at 200 and
+ * a parse failure at 502 are different problems.
+ *
+ * Note what this does NOT claim. An empty body is not read as "the category is
+ * empty" — that is the #918 conflation this whole coverage type exists to
+ * prevent. An unparsable answer leaves the category UNANSWERED regardless of
+ * why; this only makes the why accurate.
+ */
+export function describeUnparsableBody(status: number, body: string): string {
+  const at = `HTTP ${status}`;
+  if (body.trim() === "") {
+    return (
+      `ComfyUI answered ${at} with an EMPTY body (${body.length} byte${body.length === 1 ? "" : "s"}) — ` +
+      `it reported nothing about this category either way`
+    );
+  }
+  if (/^\s*</.test(body)) {
+    return (
+      `ComfyUI returned HTML instead of JSON ` +
+      `(${at} — a proxy, a login page, or a server still starting answers this way)`
+    );
+  }
+  // Neither empty nor markup: quote a bounded excerpt so the cause is
+  // diagnosable without dumping a large body into the tool result. Collapse
+  // whitespace so a multi-line payload stays on one line.
+  const excerpt = body.trim().replace(/\s+/g, " ").slice(0, 80);
+  return (
+    `ComfyUI answered ${at} with a body that is not JSON ` +
+    `(${body.length} bytes, starts: ${JSON.stringify(excerpt)})`
+  );
+}
+
 /** Model listing plus the provenance needed to describe it honestly. */
 export async function listLocalModelsWithCoverage(
   modelType?: string,
@@ -499,12 +544,7 @@ async function collectLocalModels(
         try {
           files = JSON.parse(body);
         } catch {
-          coverage.unanswered.push({
-            dir,
-            reason:
-              `ComfyUI returned ${/^\s*</.test(body) ? "HTML" : "a non-JSON body"} instead of JSON ` +
-              `(a proxy, login page, or a server still starting answers this way)`,
-          });
+          coverage.unanswered.push({ dir, reason: describeUnparsableBody(res.status, body) });
           continue;
         }
         if (!Array.isArray(files)) {
