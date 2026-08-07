@@ -75,6 +75,7 @@ const {
   resolveServableViewRef,
   oversizedInlineRefusal,
   forwardedByReferenceNote,
+  unverifiedViewRefNote,
 } = await import("../../services/comfy-view-ref.js");
 
 let root: string;
@@ -451,5 +452,71 @@ describe("forwardedByReferenceNote", () => {
       20 * 1024 * 1024,
     );
     expect(vid).toContain("never sent to you inline");
+  });
+});
+
+// #941 — panel_show_media handed a browser panel eight ComfyUI /view references
+// and replied {"ok":true,"count":8,"painted":8,"unconfirmed":0} over eight
+// BROKEN image cards. The count was honest about what the PANEL did — it made
+// eight cards — and silent about the thing the caller cares about: the browser
+// fetches /view itself, AFTER that reply, and a proxied remote ComfyUI answering
+// HTML breaks every card with no error anywhere in the chain.
+describe("unverifiedViewRefNote (#941)", () => {
+  const refs = [
+    { filename: "a.png", subfolder: "final", type: "output" },
+    { filename: "b.png", type: "output" },
+  ];
+
+  it("says nothing when nothing was forwarded by reference", () => {
+    expect(unverifiedViewRefNote([])).toBe("");
+  });
+
+  it("separates what the panel established from what it did not", () => {
+    const note = unverifiedViewRefNote(refs);
+    expect(note).toMatch(/NOT that the media loaded/);
+    expect(note).toMatch(/browser fetches \/view itself/);
+    expect(note).toMatch(/renders BROKEN and nothing reports an error/);
+    expect(note).toContain("a.png");
+    expect(note).toContain('subfolder "final"');
+  });
+
+  it("names the remedy, and says not to re-send the same reference", () => {
+    const note = unverifiedViewRefNote(refs);
+    expect(note).toMatch(/do not re-send the same reference/i);
+    expect(note).toMatch(/absolute LOCAL path/);
+  });
+
+  // A probe from the orchestrator is EVIDENCE, not proof: this process asks its
+  // own COMFYUI_URL while the browser asks the origin its tab is on, and those
+  // are allowed to differ (#952). Overstating it here would be the same defect
+  // the note exists to fix, one layer up.
+  it("reports a failed probe as strong evidence, never as proof", () => {
+    const note = unverifiedViewRefNote(refs, {
+      checked: 2,
+      nonMedia: [{ filename: "a.png", detail: 'content-type "text/html"' }],
+    });
+    expect(note).toMatch(/1 of the 2 probed did NOT return media/);
+    expect(note).toContain('a.png → content-type "text/html"');
+    expect(note).toMatch(/strong evidence rather than proof/);
+    expect(note).toMatch(/not necessarily the origin the browser tab is on/);
+  });
+
+  it("a clean probe does not become a guarantee either", () => {
+    const note = unverifiedViewRefNote(refs, { checked: 2, nonMedia: [] });
+    expect(note).toMatch(/all 2 probed returned media/);
+    // …and still refuses to certify the browser's side.
+    expect(note).toMatch(/does not rule out the browser tab reaching a DIFFERENT ComfyUI/);
+  });
+
+  it("omits probe wording entirely when nothing could be probed", () => {
+    const note = unverifiedViewRefNote(refs, { checked: 0, nonMedia: [] });
+    expect(note).not.toMatch(/Checked from HERE/);
+  });
+
+  it("caps the listing so a large batch cannot flood the reply", () => {
+    const many = Array.from({ length: 12 }, (_, i) => ({ filename: `f${i}.png`, type: "output" }));
+    const note = unverifiedViewRefNote(many);
+    expect(note).toMatch(/…and 4 more/);
+    expect(note).not.toContain("f11.png");
   });
 });

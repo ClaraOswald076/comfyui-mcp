@@ -450,3 +450,68 @@ export function forwardedByReferenceNote(
     howToSee
   );
 }
+
+/** A ComfyUI /view reference handed to a BROWSER panel without being verified. */
+export type UnverifiedViewRef = { filename: string; subfolder?: string; type?: string };
+
+/** What an orchestrator-side probe of /view found, when one was run. */
+export type ViewRefProbe = {
+  /** How many refs were probed (bounded — this is a diagnostic, not a sweep). */
+  checked: number;
+  /** Refs whose /view answered with something that is not media. */
+  nonMedia: { filename: string; detail: string }[];
+};
+
+/**
+ * The caveat a forwarded /view reference has to carry (#941).
+ *
+ * `panel_show_media` hands a browser panel a reference and the panel replies
+ * `painted: N, unconfirmed: 0`. That count is honest about what the PANEL did —
+ * it created N cards — and silent about the thing the caller cares about: the
+ * browser fetches `/view` itself, AFTER the reply, and if that fetch returns
+ * HTML the card renders broken with no error anywhere in the chain. A reporter
+ * saw `{"ok":true,"count":8,"painted":8,"unconfirmed":0}` over eight broken
+ * images on a proxied remote ComfyUI.
+ *
+ * Note what this deliberately does NOT do: inline bytes from a local workspace
+ * "mirror" when the target is REMOTE. Same-named files on a different machine
+ * are not the same files, and painting a stale local image while reporting
+ * success would replace a visibly broken card with an invisibly wrong one —
+ * strictly worse (the #877/#899 hazard).
+ */
+export function unverifiedViewRefNote(
+  refs: UnverifiedViewRef[],
+  probe?: ViewRefProbe,
+): string {
+  if (refs.length === 0) return "";
+  const one = refs.length === 1;
+  const lines = refs
+    .slice(0, 8)
+    .map((r) => `  - ${r.filename}${r.subfolder ? ` (subfolder "${r.subfolder}")` : ""}`)
+    .join("\n");
+  const more = refs.length > 8 ? `\n  - …and ${refs.length - 8} more` : "";
+
+  // A probe result is EVIDENCE, not proof: this process asks its own
+  // COMFYUI_URL, while the browser asks the origin its tab is on, and those two
+  // are allowed to differ (#952). Say which one was tested.
+  const evidence =
+    probe && probe.nonMedia.length > 0
+      ? `\nChecked from HERE: ${probe.nonMedia.length} of the ${probe.checked} probed did NOT return media ` +
+        `(${probe.nonMedia.map((n) => `${n.filename} → ${n.detail}`).join("; ")}). ` +
+        `That is this orchestrator's ComfyUI target, not necessarily the origin the browser tab is on, ` +
+        `so treat it as strong evidence rather than proof.`
+      : probe && probe.checked > 0
+        ? `\nChecked from HERE: all ${probe.checked} probed returned media, so the reference itself looks fine — ` +
+          `which does not rule out the browser tab reaching a DIFFERENT ComfyUI than this orchestrator does.`
+        : "";
+
+  return (
+    `NOTE — ${one ? "1 item was" : `${refs.length} items were`} sent to the panel as a ComfyUI /view REFERENCE, ` +
+    `not as inline bytes:\n${lines}${more}\n` +
+    `A "painted" count above means the panel created ${one ? "that card" : "those cards"} — NOT that the media loaded. ` +
+    `The browser fetches /view itself, after that reply, and when it gets HTML instead of an image (a proxied or ` +
+    `remote ComfyUI, an auth wall, an expired session) the card renders BROKEN and nothing reports an error.${evidence}\n` +
+    `If the user says the image is broken, do not re-send the same reference — pass an absolute LOCAL path instead, ` +
+    `which is verified and inlined as bytes.`
+  );
+}
