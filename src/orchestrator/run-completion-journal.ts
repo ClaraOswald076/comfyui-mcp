@@ -257,16 +257,30 @@ const MAX_CARRIED_RELEASES = 3;
 const IDLESS_REPEAT_HINT_MS = 10 * 60_000;
 
 /**
- * Memo key for an already-delivered run: (tab, prompt id, TICKET GENERATION).
+ * Memo key for an already-delivered run: (OWNER, prompt id, TICKET GENERATION).
  *
  * The generation is what makes this an identity rather than a guess. A prompt id
  * alone is not one — ComfyUI reuses ids, and a ticket can be evicted and
  * recreated — so a memo keyed on the id would let run A's delivery suppress run
- * B's real completion. `gen` is `RunTicket.seq`, or 0 when this tab has no
+ * B's real completion. `gen` is `RunTicket.seq`, or 0 when the owner has no
  * ticket for the id at all (an unqueued, foreign run).
+ *
+ * The OWNER is the same party ownership is judged against (ownsRun): the
+ * CONVERSATION when one is known, else the tab. It has to be, or the memo stops
+ * agreeing with the ownership rule the moment a tab id churns — a delivery
+ * recorded under the old tab id would be invisible to `hasHistoryFor`, the
+ * re-queued id would look like a clean identity instead of a REUSED one, and the
+ * earlier generation's late completion could then be presented as the new run's
+ * result (codex gate, P1).
  */
-function deliveredKey(key: string, promptId: string, gen: number): string {
-  return `${key}|${promptId}|${gen}`;
+function deliveredKey(owner: string, promptId: string, gen: number): string {
+  return `${owner}|${promptId}|${gen}`;
+}
+
+/** The party a run's bookkeeping is filed under — the conversation when there is
+ *  one, else the panel tab. Mirrors ownsRun(): the two must never disagree. */
+function ownerOf(key: string, conversation?: string): string {
+  return conversation ?? key;
 }
 
 /**
@@ -391,9 +405,12 @@ export class RunCompletionJournalImpl {
    *  and missing it would let the re-queued id be treated as a clean identity —
    *  the exact misattribution-plus-loss the `reused` flag exists to prevent. */
   private hasHistoryFor(key: string, promptId: string, conversation?: string): boolean {
-    const prefix = `${key}|${promptId}|`;
+    // BOTH owners: the memo may have been written under the tab (no conversation
+    // known at the time, or an older entry) or under the conversation.
+    const prefixes = [`${key}|${promptId}|`];
+    if (conversation !== undefined) prefixes.push(`${conversation}|${promptId}|`);
     for (const memo of this.delivered) {
-      if (memo.startsWith(prefix)) return true;
+      if (prefixes.some((p) => memo.startsWith(p))) return true;
     }
     for (const entry of this.entries.values()) {
       if (
@@ -585,7 +602,7 @@ export class RunCompletionJournalImpl {
       // saying "this may be the same render", not silence.
       if (
         !idUnprovable &&
-        (this.delivered.has(deliveredKey(key, correlation.promptId, gen)) ||
+        (this.delivered.has(deliveredKey(ownerOf(key, conversation), correlation.promptId, gen)) ||
           (settledTicket?.settled === true && ownsRun(settledTicket, key, conversation)))
       ) {
         logger.info(
@@ -863,7 +880,11 @@ export class RunCompletionJournalImpl {
         // meaning: an older run's ack must not write a proof that then suppresses
         // the newer run which reused the id (or got a fresh ticket after the old
         // one was evicted).
-        this.memoDelivered(entry.key, entry.correlation.promptId, entry.ticketSeq ?? 0);
+        this.memoDelivered(
+          ownerOf(entry.key, entry.conversation),
+          entry.correlation.promptId,
+          entry.ticketSeq ?? 0,
+        );
       }
     } else if (entry.fingerprint) {
       // ID-LESS: memoize the CONTENT so a re-sent identical frame after the ack

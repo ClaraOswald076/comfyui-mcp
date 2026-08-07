@@ -937,6 +937,34 @@ describe("run completion journal correlation (#468)", () => {
     expect(resend.possibleRepeat).toBe(true); // flagged, never suppressed
   });
 
+  it("#704 NEGATIVE: a REUSED prompt id is still detected when the delivery was acked under a different tab id", () => {
+    // Ownership and the already-delivered MEMO have to agree about who a run
+    // belongs to. When the memo was still filed under the tab, a delivery acked
+    // after a reconnect became invisible to the reuse check: the id looked like a
+    // clean identity when ComfyUI handed it out again, and the EARLIER
+    // generation's late completion could then be presented as the new run's
+    // result (found by the adversarial gate).
+    const CLAUDE = "orchestrator::claude";
+    journal.openRun(PROMPT_A, { tabId: "tmp:before", conversation: CLAUDE });
+    const first = journal.record(
+      "tmp:after",
+      { kind: "executed", prompt_id: PROMPT_A },
+      { conversation: CLAUDE },
+    );
+    journal.deliverPending("tmp:after", () => true);
+    journal.ack(first.token); // delivered + memoized, entry gone
+    // A busy session evicts the settled ticket…
+    for (let i = 0; i < 80; i++) {
+      journal.openRun(`later-${i}`, { tabId: "tmp:after", conversation: CLAUDE });
+    }
+    expect(journal.ticketFor(PROMPT_A)).toBeUndefined();
+    // …and ComfyUI hands the same id out again, queued from a third tab id.
+    journal.openRun(PROMPT_A, { tabId: "tmp:third", conversation: CLAUDE });
+    expect(journal.ticketFor(PROMPT_A)?.reused).toBe(true);
+    // So neither generation's completion may claim to be the run now outstanding.
+    expect(journal.correlate("tmp:third", { prompt_id: PROMPT_A }, CLAUDE).status).toBe("foreign");
+  });
+
   it("forget drops the tab's RUN TICKETS too, so a late completion reads as undetermined", () => {
     journal.openRun(PROMPT_A, { tabId: "wf:one" });
     journal.forget("wf:one");
