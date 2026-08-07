@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.17] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a save's tmp:→wf: rename is one origin, not a mixed batch (#1047)
+
+
 ## [0.50.16] - 2026-08-07
 
 ### MCP
