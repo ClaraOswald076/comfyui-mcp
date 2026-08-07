@@ -2145,6 +2145,30 @@ function formatRunRejection(payload: { error?: unknown; node_errors?: unknown })
  *  - Anything else (a plain `queued:true`, or an unparseable reply we must not
  *    regress) returns null and is treated as a genuine queue.
  */
+/**
+ * #944 — a `prompt_id` is not a flag, it is a RECEIPT.
+ *
+ * ComfyUI has a PARTIAL-validation path: when some output nodes fail validation
+ * but at least one valid output remains, it drops the bad ones ("Output will be
+ * ignored"), returns a prompt_id, and executes the rest. That reply carries
+ * `node_errors` AND a prompt id at the same time.
+ *
+ * The #213 rule — node_errors means rejection, even alongside queued:true — read
+ * that as a total refusal and reported "ComfyUI refused to queue the workflow"
+ * for a render that was already running. The agent then diagnosed a live graph,
+ * asked the user to mute a node mid-render, and twice tried to "retry"; only the
+ * #556 graph-changed guard stopped it double-queueing a 20-minute video.
+ *
+ * `queued:true` is a flag the panel sets. A prompt_id is an identifier ComfyUI
+ * MINTED, and it only mints one when it accepted the prompt — which is why this
+ * overrides the flag-based rule and #213 does not regress: that reply had no
+ * prompt id. The same asymmetry the retry guard already relies on.
+ */
+function acceptedPromptId(parsed: Record<string, unknown> | null): string | null {
+  const pid = parsed?.prompt_id;
+  return typeof pid === "string" && pid.trim() !== "" ? pid.trim() : null;
+}
+
 function detectRunRejection(res: ToolResult): ToolResult | null {
   // Bridge/transport/executor error: never a queue. Preserve it verbatim (#248),
   // no success note (#331). fail() already carries err.message (incl. any stack).
@@ -2159,7 +2183,78 @@ function detectRunRejection(res: ToolResult): ToolResult | null {
     hasTopLevelError(topError) || hasNodeErrors(nodeErrors) || parsed.queued === false;
   if (!rejected) return null; // genuine queue (queued:true / no rejection signal)
 
+  const promptId = acceptedPromptId(parsed);
+  if (promptId) {
+    // THE #944 SHAPE, and only this shape: node_errors WITHOUT a top-level error
+    // and without queued:false. That is literally what ComfyUI returns from its
+    // partial-validation path (validate_prompt keeps the good outputs, so the
+    // server answers 200 with prompt_id + node_errors and no `error` key). The
+    // prompt is in the queue; the failing outputs were dropped, not refused.
+    if (!hasTopLevelError(topError) && parsed.queued !== false) return null;
+
+    // Anything else pairing a prompt id with a rejection is a CONTRADICTION, and
+    // the two claims come from different places — the panel's own refusals (the
+    // #556/#772 run-to-node race) are prose it wrote, while a prompt id may be a
+    // field echoed from an earlier run. We cannot tell which is true, so we must
+    // not assert either. Saying "refused" here would be the #944 lie in miniature;
+    // saying "queued" would invite the caller to wait on a render that may not
+    // exist. Report the conflict and send them to the queue to settle it.
+    return fail(
+      `${formatRunRejection({ error: topError, node_errors: nodeErrors })}\n\n` +
+        `[UNCERTAIN] That rejection arrived in the SAME reply as a prompt id (${promptId}), and the two ` +
+        `contradict each other — a prompt id normally means ComfyUI accepted the work. This tool cannot ` +
+        `tell which is true, so it is not claiming either. Do NOT re-run: check queue (action:"list") and ` +
+        `get_history first, because a render may already be in flight.`,
+    );
+  }
+
   return fail(formatRunRejection({ error: topError, node_errors: nodeErrors }));
+}
+
+/**
+ * The disclosure for a run ComfyUI accepted while dropping some outputs (#944).
+ * Returns null when nothing was dropped — a clean run says nothing extra.
+ *
+ * This has to be loud. The failure it replaces was loud and WRONG; a partial run
+ * that stays silent would be the opposite error, letting the agent believe every
+ * output is coming and wait for a file that will never be written.
+ */
+function describeDroppedOutputs(parsed: Record<string, unknown> | null): string {
+  if (!parsed || !acceptedPromptId(parsed)) return "";
+  // Mirrors detectRunRejection's acceptance test exactly: only the partial-
+  // validation shape reaches the success path, so only it gets this note. A
+  // reply that ALSO carried a top-level error was reported as UNCERTAIN and
+  // never got here — describing it as an accepted-but-partial run would
+  // contradict that.
+  if (hasTopLevelError(parsed.error) || parsed.queued === false) return "";
+  const ne = parsed.node_errors;
+  if (!hasNodeErrors(ne)) return "";
+
+  const lines: string[] = [];
+  if (ne && typeof ne === "object") {
+    for (const [nodeId, info] of Object.entries(ne as Record<string, unknown>)) {
+      const i = (info ?? {}) as { class_type?: unknown; errors?: unknown };
+      const cls = typeof i.class_type === "string" ? i.class_type : "node";
+      const errs = Array.isArray(i.errors) ? i.errors : [];
+      if (errs.length === 0) {
+        lines.push(`- ${cls} (node ${nodeId}): validation failed`);
+        continue;
+      }
+      for (const e of errs as Array<{ message?: unknown; details?: unknown }>) {
+        const detail = typeof e?.details === "string" && e.details ? ` (${e.details})` : "";
+        const m = typeof e?.message === "string" ? e.message : "validation failed";
+        lines.push(`- ${cls} (node ${nodeId}): ${m}${detail}`);
+      }
+    }
+  }
+  return (
+    `\n\n[PARTIAL] ComfyUI ACCEPTED this prompt and is running it, but it dropped ` +
+    `${lines.length || "one or more"} output(s) that failed validation — its "Output will be ignored" path. ` +
+    `The remaining outputs ARE executing.\n${lines.join("\n")}\n` +
+    `Do NOT re-run and do NOT edit the graph to "fix" this right now: a render is IN FLIGHT, ` +
+    `and ComfyUI has already excluded the failing output(s) itself. Expect no file from them. ` +
+    `Repair them after this run finishes, or interrupt it deliberately with queue (action:"cancel").`
+  );
 }
 
 /**
@@ -2211,6 +2306,7 @@ export const __panelRunTestHooks = {
   detectRunRejection,
   formatRunRejection,
   isRetryableRunToNodeStampRace,
+  describeDroppedOutputs,
 };
 
 /** Drop a trailing .json (case-insensitive) so filename/path forms compare equal. */
@@ -6720,11 +6816,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // same batch recognizes the in-flight job as our own and doesn't false-warn
         // (#559). The panel forwards ComfyUI's /prompt reply, which carries the
         // prompt_id; when it doesn't, the timestamp still marks a recent self-queue.
-        const queuedId = ((): string | null => {
-          const parsed = parseToolResultJson(res);
-          const pid = parsed?.prompt_id;
-          return typeof pid === "string" && pid ? pid : null;
-        })();
+        const runReply = parseToolResultJson(res);
+        const queuedId = acceptedPromptId(runReply);
+        // #944: a run ComfyUI accepted while dropping some outputs reaches here
+        // (a minted prompt id outranks the rejection signals). Say which outputs
+        // were dropped, or the caller waits for files that will never be written.
+        const droppedNote = describeDroppedOutputs(runReply);
         QueueMonitor.markSelfQueued(queuedId);
         // #468 — open a run ticket so the render's completion can be CORRELATED
         // to this exact call by prompt id. This is what lets the orchestrator
@@ -6795,7 +6892,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           return {
             ...res,
             content: [
-              { type: "text", text: res.content[0].text + retryNote + warn + note },
+              // droppedNote sits FIRST among the appendices: "some outputs were
+              // dropped" changes what the caller should expect from this run, so
+              // it must not trail behind the anti-poll boilerplate (#944).
+              { type: "text", text: res.content[0].text + droppedNote + retryNote + warn + note },
               ...res.content.slice(1),
             ],
           };

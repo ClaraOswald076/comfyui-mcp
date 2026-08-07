@@ -875,6 +875,130 @@ describe("panel-tools: detectRunRejection helper", () => {
     const err: ToolResult = { content: [{ type: "text", text: "Error: boom" }], isError: true };
     expect(detectRunRejection(err)).toBe(err);
   });
+
+  // #944 — ComfyUI's PARTIAL-validation path: some outputs fail, at least one
+  // valid output remains, so it drops the bad ones ("Output will be ignored"),
+  // MINTS A PROMPT ID, and runs the rest. The reply carries node_errors and a
+  // prompt id together, and the #213 rule read that as a total refusal.
+  //
+  // What it cost: the agent was told nothing was queued while a render was
+  // already running. It diagnosed a live graph, asked the user to mute a node
+  // mid-render, and twice tried to "retry" — only the #556 graph-changed guard
+  // stopped it double-queueing a 20-minute video.
+  describe("#944: a minted prompt_id outranks the rejection signals", () => {
+    const partial = {
+      queued: true,
+      prompt_id: "abc-123",
+      node_errors: {
+        "92": {
+          class_type: "SaveVideo",
+          errors: [{ message: "Exception when validating node", details: "'43069'" }],
+        },
+      },
+    };
+
+    it("does NOT report a refusal for a prompt ComfyUI accepted", () => {
+      expect(detectRunRejection(jsonReply(partial))).toBeNull();
+    });
+
+    // A prompt id paired with a TOP-LEVEL error is a contradiction, not a
+    // partial acceptance: the panel's own refusals (the #556/#772 run-to-node
+    // race) arrive that way, and a prompt id there may be echoed from an earlier
+    // run. Asserting either reading would be guessing, so it reports the conflict.
+    it("a prompt id ALONGSIDE a top-level error is reported as uncertain, not as either", () => {
+      const rej = detectRunRejection(
+        jsonReply({ ...partial, error: { type: "prompt_outputs_failed_validation" } }),
+      );
+      expect(rej?.isError).toBe(true);
+      const text = String(rej?.content?.[0]?.text ?? "");
+      expect(text).toContain("[UNCERTAIN]");
+      expect(text).toContain("abc-123");
+      expect(text).toMatch(/Do NOT re-run/);
+      // It must not resolve the conflict in either direction.
+      expect(text).not.toMatch(/was queued successfully|nothing was queued$/i);
+    });
+
+    it("queued:false with a prompt id is uncertain too, never a clean queue", () => {
+      const rej = detectRunRejection(jsonReply({ ...partial, queued: false }));
+      expect(rej?.isError).toBe(true);
+      expect(String(rej?.content?.[0]?.text ?? "")).toContain("[UNCERTAIN]");
+    });
+
+    // The #213 reply had NO prompt id, which is exactly why it still fails.
+    it("still rejects when there is no prompt id (does not regress #213)", () => {
+      expect(
+        detectRunRejection(jsonReply({ queued: true, error: { type: "missing_node_type" } }))?.isError,
+      ).toBe(true);
+      expect(detectRunRejection(jsonReply({ queued: true, prompt_id: "" , error: { type: "x" } }))?.isError).toBe(true);
+      expect(
+        detectRunRejection(jsonReply({ queued: true, prompt_id: "   ", error: { type: "x" } }))?.isError,
+      ).toBe(true);
+    });
+
+    it("an isError transport reply is still never a queue, prompt id or not", () => {
+      const err: ToolResult = {
+        content: [{ type: "text", text: JSON.stringify({ prompt_id: "abc" }) }],
+        isError: true,
+      };
+      expect(detectRunRejection(err)).toBe(err);
+    });
+  });
+
+  // Silence would be the opposite error: the caller would wait for a file that
+  // is never written. The disclosure has to name the dropped outputs AND stop
+  // the two harmful reflexes the report recorded (re-run, edit mid-render).
+  describe("#944: the dropped outputs are disclosed on the success path", () => {
+    const { describeDroppedOutputs } = __panelRunTestHooks;
+
+    it("names the dropped output and what it means", () => {
+      const note = describeDroppedOutputs({
+        prompt_id: "abc-123",
+        node_errors: {
+          "92": { class_type: "SaveVideo", errors: [{ message: "Exception when validating node", details: "'43069'" }] },
+        },
+      });
+      expect(note).toContain("ACCEPTED");
+      expect(note).toContain("SaveVideo (node 92)");
+      expect(note).toContain("'43069'");
+      expect(note).toMatch(/Output will be ignored/);
+      expect(note).toMatch(/Do NOT re-run/);
+      expect(note).toMatch(/render is IN FLIGHT/);
+    });
+
+    it("says nothing for a clean run", () => {
+      expect(describeDroppedOutputs({ prompt_id: "abc", queued: true })).toBe("");
+      expect(describeDroppedOutputs({ prompt_id: "abc", node_errors: {} })).toBe("");
+    });
+
+    // Without a prompt id this is a real refusal, and detectRunRejection already
+    // reports it. Emitting a "partial" note there would claim a queue that
+    // does not exist — the #213 failure, re-created.
+    it("says nothing when there is no prompt id", () => {
+      expect(
+        describeDroppedOutputs({ node_errors: { "92": { class_type: "SaveVideo", errors: [] } } }),
+      ).toBe("");
+      expect(describeDroppedOutputs(null)).toBe("");
+    });
+
+    // The contradiction case was reported as UNCERTAIN and never reaches the
+    // success path; calling it an accepted-but-partial run would contradict that.
+    it("says nothing for the uncertain (prompt id + top-level error) reply", () => {
+      expect(
+        describeDroppedOutputs({
+          prompt_id: "abc",
+          error: { type: "x" },
+          node_errors: { "92": { class_type: "SaveVideo", errors: [] } },
+        }),
+      ).toBe("");
+      expect(
+        describeDroppedOutputs({
+          prompt_id: "abc",
+          queued: false,
+          node_errors: { "92": { class_type: "SaveVideo", errors: [] } },
+        }),
+      ).toBe("");
+    });
+  });
 });
 
 describe("panel-tools: panel_auto_layout (one-shot canvas arrange)", () => {
@@ -5821,6 +5945,41 @@ describe("panel-tools: panel_run scoped-run stamp-race retry (#772)", () => {
 
     expect(res.isError).toBe(true);
     expect(runs).toHaveLength(1);
+    // #944: the reply claims both a refusal and a prompt id. It is reported as a
+    // failure (unchanged), but the text no longer settles the contradiction it
+    // has no way to settle.
+    expect(runText(res)).toContain("[UNCERTAIN]");
+  });
+
+  // #944 END-TO-END. The unit tests above cover the decision; this covers the
+  // WIRING — that the disclosure actually reaches the caller's text. Without it,
+  // deleting the append at the call site breaks nothing visible.
+  it("a partially-validated run comes back as a QUEUE, with the dropped output named", async () => {
+    const { ctx, runs } = runCtx([
+      {
+        queued: true,
+        prompt_id: "p-partial",
+        node_errors: {
+          "92": {
+            class_type: "SaveVideo",
+            errors: [{ message: "Exception when validating node", details: "'43069'" }],
+          },
+        },
+      },
+    ]);
+    const res = await defByName("panel_run").handler({}, ctx);
+
+    // The reported bug: this was `isError` with "ComfyUI refused to queue".
+    expect(res.isError).toBeFalsy();
+    expect(runs).toHaveLength(1);
+    const text = runText(res);
+    expect(text).not.toMatch(/refused to queue/i);
+    expect(text).toContain("[PARTIAL]");
+    expect(text).toContain("SaveVideo (node 92)");
+    expect(text).toMatch(/Do NOT re-run/);
+    // The partial notice must lead the appendices — it changes what to expect
+    // from this run, so it cannot trail behind the anti-poll boilerplate.
+    expect(text.indexOf("[PARTIAL]")).toBeLessThan(text.indexOf("[IMPORTANT]"));
   });
 
   it("does NOT retry an unparseable reply — unreadable is an unknown, not a clean queue", async () => {
