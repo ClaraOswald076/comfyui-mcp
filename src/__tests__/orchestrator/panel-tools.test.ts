@@ -16,6 +16,7 @@ import { getNsfwConsent, setNsfwConsent } from "../../services/panel-settings.js
 import { getBootLocalComfyUIBaseUrl } from "../../config.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
+  acceptedPromptIds,
   buildPanelToolDefs,
   makePanelToolCtx,
   registerPanelTools,
@@ -29,6 +30,7 @@ import {
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 import { markReplyTimeout } from "../../services/ui-bridge.js";
 import { RunCompletions } from "../../orchestrator/run-completion-journal.js";
+import { QueueMonitor } from "../../services/queue-monitor.js";
 import { AskAnswers } from "../../orchestrator/ask-answer-journal.js";
 
 type Forwarded = Record<string, unknown>;
@@ -807,6 +809,75 @@ describe("panel-tools: panel_run verdict is derived from the ComfyUI reply", () 
     // #468 — the anti-poll instruction is only safe because the completion can be
     // correlated back to this exact run; the ticket is what makes that possible.
     expect(RunCompletions.ticketFor("p-ok")).toBeDefined();
+  });
+
+  // #949 — batch_count > 1 makes the panel report `prompt_ids` for EVERY queued
+  // render alongside `prompt_id` for the first. Only the first was ticketed, so
+  // completions 2..N came back as "does NOT match any run you queued … its
+  // origin is UNDETERMINED" — for runs the agent had just queued itself.
+  it("#949: a BATCH tickets every prompt id, not just the first", async () => {
+    const reply: ToolResult = {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            queued: true,
+            batch_count: 3,
+            prompt_id: "p-batch-1",
+            prompt_ids: ["p-batch-1", "p-batch-2", "p-batch-3"],
+          }),
+        },
+      ],
+    };
+    const { ctx } = makeRunCtx(reply);
+    const res = await defByName("panel_run").handler({ batch_count: 3 }, ctx);
+    expect(res.isError).toBeFalsy();
+    for (const id of ["p-batch-1", "p-batch-2", "p-batch-3"]) {
+      expect(RunCompletions.ticketFor(id), id).toBeDefined();
+    }
+    // Every one of them is also OURS, so a later backlog warning does not call
+    // the agent's own batch a foreign job (#559).
+    for (const id of ["p-batch-2", "p-batch-3"]) {
+      expect(QueueMonitor.attributeRun(id), id).toBe("mine");
+    }
+    // The batch is correlatable, so the anti-poll promise still stands.
+    expect(textOf(res)).toContain(QUEUED_NOTE);
+  });
+
+  it("#949: prompt_id repeated inside prompt_ids opens ONE ticket, not two", async () => {
+    const reply: ToolResult = {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            queued: true,
+            batch_count: 2,
+            prompt_id: "p-dup-1",
+            prompt_ids: ["p-dup-1", "p-dup-2"],
+          }),
+        },
+      ],
+    };
+    const { ctx } = makeRunCtx(reply);
+    await defByName("panel_run").handler({ batch_count: 2 }, ctx);
+    // One prompt id always means one run — a duplicate must not stack a second
+    // ticket, which openRun would otherwise treat as a re-queue.
+    expect(RunCompletions.ticketFor("p-dup-1")).toBeDefined();
+    expect(RunCompletions.ticketFor("p-dup-2")).toBeDefined();
+    expect(acceptedPromptIds({ prompt_id: "p-dup-1", prompt_ids: ["p-dup-1", "p-dup-2"] })).toEqual([
+      "p-dup-1",
+      "p-dup-2",
+    ]);
+  });
+
+  it("#949: a malformed prompt_ids does not break the single-id path", async () => {
+    // Junk entries are skipped, not ticketed, and prompt_id still works.
+    expect(acceptedPromptIds({ prompt_id: "p-a", prompt_ids: [null, 7, "", "  ", "p-b"] })).toEqual([
+      "p-a",
+      "p-b",
+    ]);
+    expect(acceptedPromptIds({ prompt_ids: "not-an-array" })).toEqual([]);
+    expect(acceptedPromptIds(null)).toEqual([]);
   });
 
   it("#704: the ticket records the CONVERSATION that queued the run, not just the routed tab", async () => {

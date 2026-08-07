@@ -2173,6 +2173,31 @@ function acceptedPromptId(parsed: Record<string, unknown> | null): string | null
   return typeof pid === "string" && pid.trim() !== "" ? pid.trim() : null;
 }
 
+/**
+ * EVERY prompt id a graph_run reply minted, first one first (#949).
+ *
+ * `batch_count > 1` makes the panel report `prompt_ids` for all N renders
+ * alongside `prompt_id` for the first. Reading only `prompt_id` ticketed one run
+ * and left 2..N uncorrelated, so their completions came back as "does NOT match
+ * any run you queued … its origin is UNDETERMINED" — for runs the agent had just
+ * queued itself.
+ *
+ * Deduped and order-preserving: `prompt_id` normally repeats the first entry of
+ * `prompt_ids`, and a duplicate would open two tickets for one render.
+ */
+export function acceptedPromptIds(parsed: Record<string, unknown> | null): string[] {
+  const out: string[] = [];
+  const add = (v: unknown) => {
+    if (typeof v !== "string") return;
+    const id = v.trim();
+    if (id !== "" && !out.includes(id)) out.push(id);
+  };
+  add(parsed?.prompt_id);
+  const many = parsed?.prompt_ids;
+  if (Array.isArray(many)) for (const v of many) add(v);
+  return out;
+}
+
 function detectRunRejection(res: ToolResult): ToolResult | null {
   // Bridge/transport/executor error: never a queue. Preserve it verbatim (#248),
   // no success note (#331). fail() already carries err.message (incl. any stack).
@@ -6852,17 +6877,26 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // (#559). The panel forwards ComfyUI's /prompt reply, which carries the
         // prompt_id; when it doesn't, the timestamp still marks a recent self-queue.
         const runReply = parseToolResultJson(res);
-        const queuedId = acceptedPromptId(runReply);
+        // #949 — batch_count > 1 makes the panel report `prompt_ids` for EVERY
+        // queued render alongside `prompt_id` for the first. Only the first was
+        // ever ticketed, so completions 2..N came back as
+        // "does NOT match any run you queued … its origin is UNDETERMINED" — for
+        // runs the agent had just queued itself. Ticket all of them.
+        const queuedIds = acceptedPromptIds(runReply);
+        const queuedId = queuedIds[0];
         // #944: a run ComfyUI accepted while dropping some outputs reaches here
         // (a minted prompt id outranks the rejection signals). Say which outputs
         // were dropped, or the caller waits for files that will never be written.
         const droppedNote = describeDroppedOutputs(runReply);
-        QueueMonitor.markSelfQueued(queuedId);
+        // markSelfQueued with NO id still stamps the recent-self-queue timestamp,
+        // so the id-less case must still call it exactly once (#559).
+        if (queuedIds.length === 0) QueueMonitor.markSelfQueued(null);
+        for (const id of queuedIds) QueueMonitor.markSelfQueued(id);
         // #468 — open a run ticket so the render's completion can be CORRELATED
         // to this exact call by prompt id. This is what lets the orchestrator
         // journal an undelivered completion and replay it into the right run
         // instead of losing it while the agent works through a goal.
-        const correlatable = RunCompletions.openRun(queuedId, {
+        const ticketOpts = {
           // #884 — the REAL routed tab, captured at dispatch (see runTicketTab):
           // the panel's `executed` event arrives under that id.
           tabId: runTicketTab,
@@ -6871,7 +6905,14 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // which is what still holds after the panel reconnects under a new id.
           ...(runTicketConversation !== undefined ? { conversation: runTicketConversation } : {}),
           ...(typeof args.to_node_id === "number" ? { toNodeId: args.to_node_id } : {}),
-        });
+        };
+        // Every id gets its own ticket. `correlatable` stays the promise the
+        // anti-poll note is allowed to make — true only if at least one run can
+        // actually be correlated back.
+        const correlatable =
+          queuedIds.length === 0
+            ? RunCompletions.openRun(undefined, ticketOpts)
+            : queuedIds.map((id) => RunCompletions.openRun(id, ticketOpts)).some(Boolean);
         // Append anti-poll guidance: the agent should go idle after queuing so the
         // executed event auto-injects the output image, rather than busy-polling.
         //
