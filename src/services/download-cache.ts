@@ -17,7 +17,7 @@ import { homedir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { ModelError } from "../utils/errors.js";
+import { ModelError, describeFetchFailure } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { redactUrlForLogs } from "./download-auth.js";
 import { reportDownloadProgress, type DownloadProgress } from "./download-progress.js";
@@ -1003,23 +1003,12 @@ async function partialConfirmedDiscarded(path: string): Promise<boolean> {
  * a TLS `ERR_TLS_CERT_ALTNAME_INVALID`). The top-level message is the useless
  * generic "fetch failed" (issue #411) — the actionable detail is one level
  * down, so unwrap the cause chain into a single readable string.
+ *
+ * Lives in utils/errors.ts now: the identical "fetch failed says nothing"
+ * defect was reported again against ComfyUI's OWN endpoints (#952, #954), so
+ * there is one implementation and one place to fix it.
  */
-function describeFetchError(err: unknown): { message: string; code?: string } {
-  const parts: string[] = [];
-  let code: string | undefined;
-  let cur: unknown = err;
-  const seen = new Set<unknown>();
-  while (cur instanceof Error && !seen.has(cur)) {
-    seen.add(cur);
-    const c = (cur as { code?: unknown }).code;
-    if (typeof c === "string" && !code) code = c;
-    const label = typeof c === "string" ? `${cur.message} (${c})` : cur.message;
-    if (label && !parts.includes(label)) parts.push(label);
-    cur = (cur as { cause?: unknown }).cause;
-  }
-  if (parts.length === 0) parts.push(String(err));
-  return { message: parts.join(": "), code };
-}
+const describeFetchError = describeFetchFailure;
 
 /**
  * Fetch that converts a network-layer failure into a ModelError carrying the
