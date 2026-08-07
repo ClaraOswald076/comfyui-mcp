@@ -499,6 +499,40 @@ describe("PiBackend turns", () => {
     expect(err.message).toMatch(/provider credentials|API key|login/i);
   });
 
+  // #948 — a user saw pi's own "Not logged in, please run /login" in the PANEL
+  // CHAT and reported that /login "doesn't exist as a command". They were right:
+  // it is typed at pi's prompt, and in a chat box a leading `/` reads as "type
+  // this here". The remedy was accurate and unusable at the same time.
+  //
+  // The helper's rules are pinned in cli-remedy.test.ts; this covers the WIRING,
+  // because the bare string reached chat through THIS passthrough.
+  it("#948: pi's own '/login' never reaches chat as a bare command", async () => {
+    hoisted.script.push({ stdout: [], stderr: "Not logged in, please run /login", exit: 1 });
+    const backend = new PiBackend({ cwd: workDir });
+    const events = await collect(backend.run({ channel: channelOf([{ text: "hi" }]) }));
+    const err = events.find((e) => e.type === "error") as { message: string };
+
+    // The exact string the user was told to type into the panel.
+    expect(err.message).not.toMatch(/please run \/login/);
+    // Replaced by one that says where its prompt is…
+    expect(err.message).toMatch(/at its prompt|at the `pi` prompt/);
+    expect(err.message).toMatch(/TERMINAL/);
+    // …and pi's own detail is kept, since it carries the real reason.
+    expect(err.message).toMatch(/Not logged in/);
+  });
+
+  // A NON-auth failure can name a slash command too, so the qualification is not
+  // limited to the credentials branch.
+  it("#948: qualifies a slash command on a plain non-zero exit as well", async () => {
+    hoisted.script.push({ stdout: [], stderr: "unknown flag; try /help", exit: 2 });
+    const backend = new PiBackend({ cwd: workDir });
+    const events = await collect(backend.run({ channel: channelOf([{ text: "hi" }]) }));
+    const err = events.find((e) => e.type === "error") as { message: string };
+    expect(err.message).toMatch(/exited with code 2/);
+    expect(err.message).not.toMatch(/try \/help/);
+    expect(err.message).toMatch(/`\/help`/);
+  });
+
   it("interrupt kills the in-flight child tree and yields a cancelled result", async () => {
     hoisted.script.push({ hang: true });
     const backend = new PiBackend({ cwd: workDir });
