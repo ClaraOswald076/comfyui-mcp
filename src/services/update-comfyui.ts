@@ -29,6 +29,25 @@ export interface UpdateCoreResult {
   package_manager: "uv" | "pip";
   steps: CommandResult[];
   message: string;
+  /** The checkout's git state before and after the pull (#945). Present
+   *  whenever it could be read; absent for a non-git install. */
+  revision?: {
+    before: string | null;
+    after: string | null;
+    /** Branch name, or null when HEAD is DETACHED (a release tag checkout). */
+    branch: string | null;
+    /** The configured upstream (e.g. "origin/master"), when there is one. */
+    upstream: string | null;
+    /** Whether `after` was proven equal to the upstream's tip. `null` = could
+     *  not be checked, which is NOT the same as false. */
+    matches_upstream: boolean | null;
+  };
+}
+
+/** Why a `git pull` that exited 0 nevertheless moved nothing (#945). */
+export interface CoreUpdateBlocker {
+  reason: "detached" | "no-upstream" | "behind-upstream" | "unverifiable";
+  message: string;
 }
 
 export interface UpdateNodesResult {
@@ -75,6 +94,146 @@ function runCommand(
       `Command failed: ${command}\n${out || e.message || "unknown error"}`,
     );
   }
+}
+
+/**
+ * Read-only git probe. Returns trimmed stdout, or null when the command fails
+ * for ANY reason — not a git repo, no upstream, an unknown ref. Never throws:
+ * these calls exist to describe the checkout, and a failed description must not
+ * take down the update itself.
+ */
+function gitProbe(args: string[], cwd: string): string | null {
+  try {
+    const out = execFileSync("git", args, {
+      cwd,
+      encoding: "utf-8",
+      timeout: 30_000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const t = (out ?? "").trim();
+    return t === "" ? null : t;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Decide whether `git pull` actually updated the checkout (#945).
+ *
+ * A `git pull` on a DETACHED HEAD — which is how Comfy Desktop's release-tag
+ * installs sit — prints "Already up to date." and exits 0 while moving nothing.
+ * The same happens when `remote.origin.fetch` carries only a tag refspec, so
+ * `origin/master` is never fetched and stays stale (or absent). Both were
+ * reported as `updated: true`, and the requirements were then reinstalled for a
+ * checkout that had not moved. The reporter's install stayed pinned at v0.30.2
+ * while master had advanced.
+ *
+ * The rule: a sha that CHANGED proves an update. A sha that did not change
+ * proves nothing on its own — it is only "already current" if it can be shown
+ * equal to the upstream tip. Everything else is reported as NOT updated, with
+ * the reason, because the alternative is the false success above.
+ */
+export function classifyCoreUpdate(state: {
+  before: string | null;
+  after: string | null;
+  branch: string | null;
+  upstream: string | null;
+  upstreamSha: string | null;
+}): { updated: boolean; matchesUpstream: boolean | null; blocker?: CoreUpdateBlocker } {
+  // The sha moved: the pull did something. Nothing else needs proving.
+  if (state.before && state.after && state.before !== state.after) {
+    return { updated: true, matchesUpstream: null };
+  }
+  // Not a git checkout at all (both probes failed) — say so rather than guess.
+  if (!state.after) {
+    return {
+      updated: false,
+      matchesUpstream: null,
+      blocker: {
+        reason: "unverifiable",
+        message:
+          "the ComfyUI directory's git revision could not be read, so whether the pull changed anything is UNKNOWN. " +
+          "If this is not a git checkout, `git pull` cannot update it at all — update through the installer you used.",
+      },
+    };
+  }
+
+  if (!state.branch) {
+    return {
+      updated: false,
+      matchesUpstream: null,
+      blocker: {
+        reason: "detached",
+        message:
+          "HEAD is DETACHED (a tag or bare commit, which is how release-tag and Comfy Desktop installs are set up), so " +
+          "`git pull` has no branch to fast-forward and reports \"Already up to date.\" without moving anything. " +
+          "Switch to a branch first, e.g. `git checkout master && git pull --ff-only`. " +
+          "Check for local edits before switching (`git status`) — this tool will not move your HEAD for you.",
+      },
+    };
+  }
+
+  if (!state.upstream) {
+    return {
+      updated: false,
+      matchesUpstream: null,
+      blocker: {
+        reason: "no-upstream",
+        message:
+          `branch "${state.branch}" has no upstream configured, so \`git pull\` has nothing to pull from and exits ` +
+          `without changing the checkout. Set one with \`git branch --set-upstream-to=origin/${state.branch} ${state.branch}\`.`,
+      },
+    };
+  }
+
+  // Upstream is configured but its tip is unreadable — classically a
+  // `remote.origin.fetch` that only carries `+refs/tags/*`, so the remote branch
+  // ref was never created locally. This is the reported install's exact shape.
+  if (!state.upstreamSha) {
+    return {
+      updated: false,
+      matchesUpstream: null,
+      blocker: {
+        reason: "unverifiable",
+        message:
+          `the upstream "${state.upstream}" could not be resolved locally, so there is no way to tell whether this ` +
+          `checkout is current. That usually means \`remote.origin.fetch\` carries only a tag refspec, so the remote ` +
+          `branch is never fetched. Check it with \`git config --get-all remote.origin.fetch\`, and add the branch ` +
+          `refspec if it is missing: \`git config --add remote.origin.fetch +refs/heads/${state.branch}:refs/remotes/origin/${state.branch}\`.`,
+      },
+    };
+  }
+
+  if (state.after === state.upstreamSha) {
+    // The one honest "nothing to do": proven equal to the upstream tip.
+    return { updated: true, matchesUpstream: true };
+  }
+
+  return {
+    updated: false,
+    matchesUpstream: false,
+    blocker: {
+      reason: "behind-upstream",
+      message:
+        `the pull exited cleanly but the checkout is still at ${state.after.slice(0, 8)} while ${state.upstream} is at ` +
+        `${state.upstreamSha.slice(0, 8)} — so it did NOT update. Fetch and fast-forward explicitly ` +
+        `(\`git fetch origin && git merge --ff-only ${state.upstream}\`) and check \`git status\` for local changes that block it.`,
+    },
+  };
+}
+
+/** Read the checkout's git state. Every field is best-effort and may be null. */
+function readGitState(cwd: string): {
+  head: string | null;
+  branch: string | null;
+  upstream: string | null;
+} {
+  return {
+    head: gitProbe(["rev-parse", "HEAD"], cwd),
+    // --quiet + --short: prints the branch name, fails (→ null) when detached.
+    branch: gitProbe(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd),
+    upstream: gitProbe(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd),
+  };
 }
 
 /**
@@ -157,8 +316,43 @@ export async function updateComfyUICore(): Promise<UpdateCoreResult> {
     pythonReason = ` ${resolved.reason}`;
   }
 
-  // 1. git pull the core repo.
+  // 1. git pull the core repo — bracketed by a revision read, because a pull
+  //    that exits 0 is NOT evidence that anything moved (#945).
+  const before = readGitState(comfyuiPath);
   steps.push(runCommand("git", ["pull"], comfyuiPath));
+  const after = readGitState(comfyuiPath);
+  const verdict = classifyCoreUpdate({
+    before: before.head,
+    after: after.head,
+    branch: after.branch,
+    upstream: after.upstream,
+    upstreamSha: after.upstream ? gitProbe(["rev-parse", after.upstream], comfyuiPath) : null,
+  });
+  const revision = {
+    before: before.head,
+    after: after.head,
+    branch: after.branch,
+    upstream: after.upstream,
+    matches_upstream: verdict.matchesUpstream,
+  };
+
+  // The checkout did not move and could not be shown to be current. Reinstalling
+  // requirements here is what made the old false success convincing — it looked
+  // like work. Stop before it and report the reason, so nothing is done in the
+  // name of an update that did not happen.
+  if (!verdict.updated) {
+    return {
+      updated: false,
+      comfyui_path: comfyuiPath,
+      package_manager: pm,
+      steps,
+      revision,
+      message:
+        `ComfyUI core was NOT updated in ${comfyuiPath}: ${verdict.blocker?.message ?? "the checkout did not change."} ` +
+        `\`git pull\` exited cleanly, which is why this used to be reported as a successful update — it is not one. ` +
+        `Python requirements were NOT reinstalled, because nothing changed that would need them.`,
+    };
+  }
 
   // 2. Reinstall requirements into the resolved interpreter's env (never this
   //    server's Python). requirements.txt lives in the repo root.
@@ -185,12 +379,19 @@ export async function updateComfyUICore(): Promise<UpdateCoreResult> {
     logger.warn(`No requirements.txt found at ${requirements}; skipping dependency install`);
   }
 
+  // Distinguish "moved" from "already at the upstream tip" — both are honest
+  // successes, but they are different facts and the caller may care which.
+  const moved = revision.before !== revision.after;
+  const what = moved
+    ? `updated ${String(revision.before).slice(0, 8)} → ${String(revision.after).slice(0, 8)}`
+    : `already at ${after.upstream} (${String(revision.after).slice(0, 8)}) — nothing to pull`;
   return {
     updated: true,
     comfyui_path: comfyuiPath,
     package_manager: pm,
     steps,
-    message: `ComfyUI core updated in ${comfyuiPath} using ${pm}.${pythonReason}`,
+    revision,
+    message: `ComfyUI core ${what} in ${comfyuiPath} using ${pm}.${pythonReason}`,
   };
 }
 
