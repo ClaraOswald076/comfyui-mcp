@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.20] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- settle before re-issuing a scoped run that lost the stamp race (#1057)
+
+
 ## [0.50.19] - 2026-08-07
 
 ### MCP
