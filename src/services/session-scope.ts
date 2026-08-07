@@ -152,3 +152,33 @@ export function workflowOriginNote(opts: {
     `the conversation itself continues (one session spans all open workflows).]`
   );
 }
+
+/**
+ * A SHORT, still-DISTINGUISHING rendering of a tab id (#934).
+ *
+ * Tab ids come in two shapes. A browser tab is a uuid, where `.slice(0, 8)` is a
+ * fine abbreviation — eight hex chars separate any two tabs you are likely to
+ * hold at once. A workflow-keyed tab is `wf:<path>`, and there `.slice(0, 8)`
+ * yields the literal string `wf:workf` for EVERY workflow under `workflows/`.
+ *
+ * That is how panel_set_workflow_target came to report
+ *
+ *     Rebound this session from tab wf:workf onto the active tab wf:workf
+ *
+ * for a rebind between two different workflows: the note read as a no-op, in the
+ * middle of a wedge whose whole question was whether the retarget had done
+ * anything. Two different tabs must not render identically.
+ *
+ * So: keep the uuid behaviour, and for a `wf:` id keep the part that actually
+ * varies — the tail of the path, which carries the filename.
+ */
+export function shortTabId(id: string | undefined | null): string {
+  if (!id) return String(id ?? "");
+  if (!id.startsWith("wf:")) return id.slice(0, 8);
+  const path = id.slice(3);
+  // The basename is what distinguishes two workflow tabs; the directory prefix
+  // is shared by all of them and is exactly what the old slice kept.
+  const base = path.split(/[/\\]/).pop() || path;
+  const MAX = 40;
+  return `wf:${base.length > MAX ? `…${base.slice(-MAX)}` : base}`;
+}

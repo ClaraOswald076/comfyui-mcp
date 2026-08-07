@@ -46,7 +46,7 @@ import { parse as parseYaml } from "yaml";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { UiBridge } from "../services/ui-bridge.js";
-import { conversationOfScopeAddress, isScopeAddress } from "../services/session-scope.js";
+import { conversationOfScopeAddress, isScopeAddress, shortTabId } from "../services/session-scope.js";
 
 /** #884 — journal TICKETS (run completions #468, ask answers #486) must be
  *  keyed by the REAL tab a run/card was routed to: the panel reports back under
@@ -7838,7 +7838,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // Detect the rebind regardless of whether awaitReachable or rebindToActiveTab
           // performed it (either mutates ctx.tabId), so the note is never swallowed.
           if (!deferredBind && ctx.tabId !== before) {
-            rebindNote = ` Rebound this session from tab ${before.slice(0, 8)} onto the active tab ${ctx.tabId.slice(0, 8)}.`;
+            // #934 — `.slice(0, 8)` renders EVERY `wf:workflows/…` tab as the
+            // literal "wf:workf", so this note read "Rebound this session from
+            // tab wf:workf onto the active tab wf:workf" for a rebind between two
+            // DIFFERENT workflows. In the middle of a wedge whose entire question
+            // was whether the retarget did anything, it read as a no-op.
+            rebindNote = ` Rebound this session from tab ${shortTabId(before)} onto the active tab ${shortTabId(ctx.tabId)}.`;
           }
         }
         // PIN: bind to the EXACT open-workflow identity from the authoritative

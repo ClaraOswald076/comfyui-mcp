@@ -1957,6 +1957,31 @@ describe("panel-tools: session tabId self-heal (#322 reload / #331 workflow-swit
     expect(sent.at(-1)?.tabId).toBe("new-live-tab");
   });
 
+  // #934 — the note above used `.slice(0, 8)`, which renders EVERY
+  // `wf:workflows/…` tab as the literal "wf:workf". The reporter read
+  // "Rebound this session from tab wf:workf onto the active tab wf:workf"
+  // during a wedge whose entire question was whether the retarget had done
+  // anything — a real rebind between two different workflows, described as a
+  // no-op. Two different tabs must not render identically.
+  it("names workflow-keyed tabs distinguishably in the rebind note", async () => {
+    const store = new WorkflowTargetStore();
+    const from = "wf:workflows/Untitled 2026-08-06 03-58-41.json";
+    const onto = "wf:workflows/portrait-v3.json";
+    // The defect, stated: these are indistinguishable under the old rendering.
+    expect(from.slice(0, 8)).toBe(onto.slice(0, 8));
+
+    const { bridge } = fakeBridge(new Set([onto]));
+    const ctx = makePanelToolCtx(bridge, from, store);
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+
+    const text = (res.content[0] as { text: string }).text;
+    expect(text).toContain("Rebound this session");
+    expect(text).toContain("portrait-v3.json");
+    expect(text).toContain("Untitled 2026-08-06 03-58-41.json");
+    // …and the collapsed rendering is gone.
+    expect(text).not.toContain("from tab wf:workf onto the active tab wf:workf");
+  });
+
   // ---- Auto-heal: an orphaned current-mode session self-recovers on the next
   // panel_* call, WITHOUT an explicit panel_set_workflow_target (#372/#178/#170/
   // #165/#166/#195). Conservative: only when the current tab is unreachable AND a
