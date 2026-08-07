@@ -2093,7 +2093,24 @@ export function retiredToolMessage(name: string): string | undefined {
   const dead = findDeadName(name);
   if (!dead) return undefined;
   const removed = dead.since.startsWith("removed") ? dead.since : `removed in ${dead.since}`;
-  return `Unknown tool '${name}' — ${removed}. Call ${dead.replacement} instead.`;
+  return (
+    `Unknown tool '${name}' — ${removed}. Call ${dead.replacement} instead.` +
+    // #996 — the redirect answered WHAT to call and never WHY the caller was
+    // holding a name that does not exist. A reporter saw list_tools advertise
+    // read_skill and describe_tool succeed on it, then got this error, and
+    // filed a catalog/dispatcher mismatch. The catalog is built by re-running
+    // the SAME registration pass, so it cannot contain a retired name — what
+    // they were reading was a tool list captured BEFORE the upgrade and cached
+    // by the client (MCP clients hold tools/list until told otherwise).
+    //
+    // Without this sentence the only reading available is "the server is
+    // inconsistent", which is both wrong and unactionable. One line converts it
+    // into a stale-cache diagnosis with a remedy — the same job the rest of this
+    // message already does for the name itself.
+    ` If your tool list still shows '${name}', it was captured before this server` +
+    ` was upgraded: reconnect the MCP client (/mcp) to pick up the current` +
+    ` surface. The catalog this server serves cannot contain a retired name.`
+  );
 }
 
 /**
