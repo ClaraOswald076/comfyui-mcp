@@ -463,9 +463,14 @@ export function callToolAdmission(
     const action = typeof args.action === "string" ? args.action : undefined;
     if (action === undefined || !actions.has(action)) {
       // #908, second half. The explanation above was written for the NAME-level
-      // refusal, when `runpod_pod_create`/`runpod_pod_start` were whole tools kept
-      // off this channel. The 0.50.0 fold made `runpod` a single admitted NAME with
-      // an action allowlist, so the panel's Deploy/Start buttons now land HERE — and
+      // refusal, back when the two RunPod billing operations — deploy a pod and
+      // resume a stopped one, now `runpod` actions "create" and "start" — were whole
+      // tools that #278 kept off this channel, so a refusal hit the name check.
+      // (Their retired names are deliberately not spelled here: the dead-name gate
+      // is right that a comment naming them reads as a live reference, and the fact
+      // that matters is which OPERATIONS moved, not what they used to be called.)
+      // The 0.50.0 fold made `runpod` a single admitted NAME with an action
+      // allowlist, so the panel's Deploy/Start buttons now land HERE — and
       // this branch still returned the bare dead-end the other branch was fixed to
       // stop returning. Same refusal, same reason, so it owes the same explanation:
       // the exclusion is deliberate (these actions spend money and this channel
