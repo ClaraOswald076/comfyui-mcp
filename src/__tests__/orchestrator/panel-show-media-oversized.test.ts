@@ -9,7 +9,7 @@
 // MAX_BYTES is NOT raised, and these tests would not notice if it were; the
 // oversized fixtures are real files above the cap.
 
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -328,5 +328,55 @@ describe("panel_show_media: the other outcomes stay distinct", () => {
     const { res } = await showMedia([{ source: { path: "relative/clip.mp4" } }]);
     expect(res.isError).toBe(true);
     expect(textOf(res)).toContain("must be absolute");
+  });
+});
+
+// #941 — a /view reference forwarded to a BROWSER panel comes back described as
+// painted, and the reporter's eight painted cards were eight broken images on a
+// proxied remote ComfyUI. The panel's count is honest about the card; nothing
+// in the chain knows whether the browser's own /view fetch succeeded.
+//
+// These cover the WIRING: the note has to reach the reply. The note's own
+// wording is pinned in comfy-view-ref.test.ts.
+describe("#941: a forwarded /view reference says what 'painted' does not cover", () => {
+  const ref = { source: { filename: "a.png", subfolder: "final", type: "output" } };
+
+  beforeEach(() => {
+    // No probe response — fetch is not stubbed here, so every probe throws and
+    // is (correctly) not counted. The caveat must stand on its own regardless.
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("no network in test")));
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("appends the caveat when an item goes as a reference", async () => {
+    const { res } = await showMedia([ref]);
+    const t = textOf(res);
+    expect(t).toMatch(/NOT that the media loaded/);
+    expect(t).toMatch(/browser fetches \/view itself/);
+    expect(t).toContain("a.png");
+  });
+
+  it("still forwards the reference — the caveat replaces nothing", async () => {
+    const { calls } = await showMedia([ref]);
+    const items = calls[0]?.items as Array<Record<string, unknown>>;
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ kind: "viewRef" });
+  });
+
+  // An inlined local path is verified bytes; hedging it would make a
+  // trustworthy result look doubtful.
+  it("says nothing for an item that was inlined from a local path", async () => {
+    const small = join(outDir, "small.png");
+    writeFileSync(small, Buffer.alloc(64));
+    const { res } = await showMedia([{ source: { path: small } }]);
+    expect(textOf(res)).not.toMatch(/NOT that the media loaded/);
+  });
+
+  it("an unreachable probe is not counted as a check", async () => {
+    const { res } = await showMedia([ref]);
+    // Every probe threw, so there is no evidence sentence to print…
+    expect(textOf(res)).not.toMatch(/Checked from HERE/);
+    // …but the caveat itself is unconditional.
+    expect(textOf(res)).toMatch(/renders BROKEN/);
   });
 });

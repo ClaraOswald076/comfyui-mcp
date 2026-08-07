@@ -31,7 +31,10 @@ import {
   forwardedByReferenceNote,
   oversizedInlineRefusal,
   resolveServableViewRef,
+  unverifiedViewRefNote,
   type ForwardedByReference,
+  type UnverifiedViewRef,
+  type ViewRefProbe,
 } from "../services/comfy-view-ref.js";
 import { extname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9312,6 +9315,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         const resolved: Array<Record<string, unknown>> = [];
         /** Oversized items that took the /view reference route instead (#648). */
         const forwarded: ForwardedByReference[] = [];
+        // #941 — /view references handed to a BROWSER panel, whose rendering this
+        // process never observes. Collected so the reply can say what "painted"
+        // does and does not establish.
+        const unverifiedRefs: UnverifiedViewRef[] = [];
         for (const item of items) {
           const src = item.source;
           if ("path" in src) {
@@ -9462,6 +9469,15 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 filename: src.filename,
                 caption: item.caption,
               });
+              // #941 — the panel will report this as painted, meaning it made a
+              // card. Whether the IMAGE loads is decided later, by the browser's
+              // own /view fetch, and a proxied ComfyUI answering HTML breaks it
+              // with no error anywhere. Remember the ref so the reply can say so.
+              unverifiedRefs.push({
+                filename: src.filename,
+                subfolder: src.subfolder,
+                type: src.type,
+              });
             }
           }
         }
@@ -9475,6 +9491,40 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           res.content.push({
             type: "text",
             text: forwardedByReferenceNote(forwarded, MAX_BYTES),
+          });
+        }
+        // #941 — a forwarded /view reference is DISPATCHED, not displayed. Probe a
+        // bounded sample from here so the note can carry evidence instead of only
+        // a caveat; the probe is best-effort and never affects the result.
+        if (unverifiedRefs.length > 0 && !res.isError) {
+          const probe: ViewRefProbe = { checked: 0, nonMedia: [] };
+          const base = (process.env.COMFYUI_URL ?? "http://127.0.0.1:8188").replace(/\/+$/, "");
+          for (const ref of unverifiedRefs.slice(0, 3)) {
+            try {
+              const qs = new URLSearchParams({ filename: ref.filename, type: ref.type ?? "output" });
+              if (ref.subfolder) qs.set("subfolder", ref.subfolder);
+              const resp = await comfyuiFetch(`${base}/view?${qs.toString()}`, {
+                method: "HEAD",
+                signal: AbortSignal.timeout(4000),
+              });
+              probe.checked++;
+              const mime = resp.headers.get("content-type") ?? "";
+              if (!resp.ok) {
+                probe.nonMedia.push({ filename: ref.filename, detail: `HTTP ${resp.status}` });
+              } else if (!mime.startsWith("image/") && !mime.startsWith("video/")) {
+                probe.nonMedia.push({
+                  filename: ref.filename,
+                  detail: `content-type "${mime || "unset"}"`,
+                });
+              }
+            } catch {
+              // An unreachable /view from HERE says nothing reliable about the
+              // browser's origin, so it is simply not counted as checked.
+            }
+          }
+          res.content.push({
+            type: "text",
+            text: unverifiedViewRefNote(unverifiedRefs, probe),
           });
         }
         return res;
