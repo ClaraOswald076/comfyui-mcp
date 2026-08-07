@@ -255,9 +255,19 @@ describe("#694 retry_of threading through the tool defs", () => {
   it("panel_save_workflow attaches the token on BOTH the save and save_as branches", async () => {
     const { ctx, calls } = makeRecordingCtx();
     await defByName("panel_save_workflow").handler({ retry_of: "tok-a" }, ctx);
-    expect(calls[0]).toMatchObject({ cmd: "workflow_save", retry_of: "tok-a" });
     await defByName("panel_save_workflow").handler({ name: "copy", retry_of: "tok-b" }, ctx);
-    expect(calls[1]).toMatchObject({ cmd: "workflow_save_as", retry_of: "tok-b" });
+    // Find the save frames by NAME, not by index: #1045 added a `workflow_list`
+    // fence probe after each save (a Save-As re-points the active workflow, so
+    // the session has to re-anchor), which sits between them. The token contract
+    // is about which frame CARRIES it, not where it lands in the sequence.
+    const save = calls.find((c) => c.cmd === "workflow_save");
+    const saveAs = calls.find((c) => c.cmd === "workflow_save_as");
+    expect(save).toMatchObject({ cmd: "workflow_save", retry_of: "tok-a" });
+    expect(saveAs).toMatchObject({ cmd: "workflow_save_as", retry_of: "tok-b" });
+    // …and the probe itself must never carry a caller's retry token.
+    for (const probe of calls.filter((c) => c.cmd === "workflow_list")) {
+      expect("retry_of" in probe).toBe(false);
+    }
   });
 
   it("a READ tool never forwards retry_of even when args smuggle one (belt-and-braces gate)", async () => {

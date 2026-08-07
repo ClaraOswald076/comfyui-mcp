@@ -188,8 +188,12 @@ describe("#402 panel_save_workflow awaits a stable binding before dispatch", () 
     setTimeout(() => live.add("reconnected-tab"), 40);
     const res = await defByName("panel_save_workflow").handler({}, ctx);
     expect(res.isError).toBeFalsy();
-    expect(sent.at(-1)?.cmd).toMatchObject({ cmd: "workflow_save" });
-    expect(sent.at(-1)?.tabId).toBe("reconnected-tab"); // never fired into the dead binding
+    // Locate the SAVE frame by name rather than by position: #1045 added a
+    // `workflow_list` fence probe after each save, so the save is no longer last.
+    // What this test is about is which TAB the save reached.
+    const save = sent.find((s) => (s.cmd as { cmd?: string })?.cmd === "workflow_save");
+    expect(save?.cmd).toMatchObject({ cmd: "workflow_save" });
+    expect(save?.tabId).toBe("reconnected-tab"); // never fired into the dead binding
   });
 
   it("REFUSES (zero sends) when no tab reconnects within budget — never dispatches into a dead binding", async () => {
