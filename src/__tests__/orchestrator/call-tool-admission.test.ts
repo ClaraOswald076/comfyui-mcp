@@ -6,6 +6,26 @@ import {
 } from "../../orchestrator/call-tool-admission.js";
 import { DEAD_NAMES, TOOL_NAMES, retiredToolMessage } from "../../tools/vocabulary.js";
 
+/** The action-level refusal, built from the SAME allowlist the code reads.
+ *  Centralised so the 50-odd exact-match assertions below stay exact — the point of
+ *  those is that a specific action is refused, not the prose — while the wording
+ *  lives in one place. #908: this refusal used to be a bare dead end; it now has to
+ *  explain that the exclusion is deliberate and say what to do instead, because the
+ *  0.50.0 fold routed the panel's RunPod Deploy/Start buttons through THIS branch
+ *  rather than the name-level one that had already been fixed. */
+function actionRefusal(tool: string, action: string | undefined): string {
+  const permitted = [...(CALL_TOOL_ACTION_WHITELIST.get(tool) ?? [])].sort();
+  return (
+    `tool "${tool}" does not carry action "${action ?? "(missing)"}" on the direct ` +
+    `call_tool channel (the canvas-less path used by mobile, mirrored tabs and panel ` +
+    `buttons). This is a deliberate per-action exclusion, not a missing tool or a typo — ` +
+    `an action is withheld here when it spends money or mutates state this channel cannot ` +
+    `confirm with the user. Permitted here: ${permitted.join(", ")}. Ask the agent to run ` +
+    `"${action ?? ""}" instead: the agent session carries the full tool surface and can ` +
+    `confirm with you first.`
+  );
+}
+
 /**
  * The call_tool dispatcher authorizes by tool NAME and forwards arbitrary
  * action arguments, so whitelisting the consolidated `queue` name (0.49.0
@@ -28,7 +48,7 @@ describe("call_tool admission", () => {
   it("refuses the queue actions the old whitelist entry never covered", () => {
     for (const action of ["move", "edit", "cancel_queued", "clear"]) {
       expect(callToolAdmission("queue", { action }), `action:"${action}"`).toBe(
-        `tool "queue" is not permitted for action "${action}"`,
+        actionRefusal("queue", action),
       );
     }
   });
@@ -36,17 +56,17 @@ describe("call_tool admission", () => {
   it("also refuses the read-only queue actions — never whitelisted before either", () => {
     for (const action of ["list", "status", "get_workflow"]) {
       expect(callToolAdmission("queue", { action }), `action:"${action}"`).toBe(
-        `tool "queue" is not permitted for action "${action}"`,
+        actionRefusal("queue", action),
       );
     }
   });
 
   it("refuses queue with a missing or non-string action", () => {
     expect(callToolAdmission("queue", {})).toBe(
-      'tool "queue" is not permitted for action "(missing)"',
+      actionRefusal("queue", undefined),
     );
     expect(callToolAdmission("queue", { action: 42 })).toBe(
-      'tool "queue" is not permitted for action "(missing)"',
+      actionRefusal("queue", undefined),
     );
   });
 
@@ -70,25 +90,25 @@ describe("call_tool admission", () => {
     it("refuses the two actions that BILL — deploying and resuming a pod", () => {
       for (const action of ["create", "start"]) {
         expect(callToolAdmission("runpod", { action }), `action:"${action}"`).toBe(
-          `tool "runpod" is not permitted for action "${action}"`,
+          actionRefusal("runpod", action),
         );
       }
       // Including the create shape a client would actually send, so the refusal
       // cannot be argued away as "only the bare action is blocked".
       expect(
         callToolAdmission("runpod", { action: "create", gpu_type: "NVIDIA A40", connect: true }),
-      ).toBe('tool "runpod" is not permitted for action "create"');
+      ).toBe(actionRefusal("runpod", "create"));
       expect(callToolAdmission("runpod", { action: "start", pod_id: "pod123", gpu_count: 8 })).toBe(
-        'tool "runpod" is not permitted for action "start"',
+        actionRefusal("runpod", "start"),
       );
     });
 
     it("refuses runpod with a missing or non-string action", () => {
       expect(callToolAdmission("runpod", {})).toBe(
-        'tool "runpod" is not permitted for action "(missing)"',
+        actionRefusal("runpod", undefined),
       );
       expect(callToolAdmission("runpod", { action: 42 })).toBe(
-        'tool "runpod" is not permitted for action "(missing)"',
+        actionRefusal("runpod", undefined),
       );
     });
 
@@ -118,14 +138,14 @@ describe("call_tool admission", () => {
 
   it("REFUSES list_packs action:\"install_deps\" — a read entry must never become an install", () => {
     expect(callToolAdmission("list_packs", { action: "install_deps" })).toBe(
-      'tool "list_packs" is not permitted for action "install_deps"',
+      actionRefusal("list_packs", "install_deps"),
     );
     // Not reachable by omitting or fuzzing the action, either.
     expect(callToolAdmission("list_packs", {})).toBe(
-      'tool "list_packs" is not permitted for action "(missing)"',
+      actionRefusal("list_packs", undefined),
     );
     expect(callToolAdmission("list_packs", { action: 42 })).toBe(
-      'tool "list_packs" is not permitted for action "(missing)"',
+      actionRefusal("list_packs", undefined),
     );
   });
 
@@ -140,7 +160,7 @@ describe("call_tool admission", () => {
       "generate_skill",
     ]) {
       expect(callToolAdmission("list_packs", { action }), `action:"${action}"`).toBe(
-        `tool "list_packs" is not permitted for action "${action}"`,
+        actionRefusal("list_packs", action),
       );
     }
   });
@@ -164,25 +184,25 @@ describe("call_tool admission", () => {
     it("refuses the two SETUP actions train_doctor absorbed — neither was ever whitelisted", () => {
       for (const action of ["bootstrap", "build_image"]) {
         expect(callToolAdmission("train_doctor", { action }), `action:"${action}"`).toBe(
-          `tool "train_doctor" is not permitted for action "${action}"`,
+          actionRefusal("train_doctor", action),
         );
       }
       // Including the shapes a client would actually send, so the refusal cannot
       // be argued away as "only the bare action is blocked".
       expect(callToolAdmission("train_doctor", { action: "bootstrap", target: "pod", pod_id: "pod123" })).toBe(
-        'tool "train_doctor" is not permitted for action "bootstrap"',
+        actionRefusal("train_doctor", "bootstrap"),
       );
       expect(callToolAdmission("train_doctor", { action: "build_image", aiToolkitRef: "deadbeef" })).toBe(
-        'tool "train_doctor" is not permitted for action "build_image"',
+        actionRefusal("train_doctor", "build_image"),
       );
     });
 
     it("refuses train_doctor with a missing or non-string action", () => {
       expect(callToolAdmission("train_doctor", {})).toBe(
-        'tool "train_doctor" is not permitted for action "(missing)"',
+        actionRefusal("train_doctor", undefined),
       );
       expect(callToolAdmission("train_doctor", { action: 42 })).toBe(
-        'tool "train_doctor" is not permitted for action "(missing)"',
+        actionRefusal("train_doctor", undefined),
       );
     });
 
@@ -218,11 +238,11 @@ describe("call_tool admission", () => {
       expect(
         callToolAdmission("list_local_models", { action, path: "loras/x.safetensors" }),
         `action:"${action}"`,
-      ).toBe(`tool "list_local_models" is not permitted for action "${action}"`);
+      ).toBe(actionRefusal("list_local_models", action));
     }
     // An omitted action cannot fall through to the delete either.
     expect(callToolAdmission("list_local_models", { path: "loras/x.safetensors" })).toBe(
-      'tool "list_local_models" is not permitted for action "(missing)"',
+      actionRefusal("list_local_models", undefined),
     );
   });
 
@@ -247,11 +267,11 @@ describe("call_tool admission", () => {
     // abort a transfer the user is watching.
     for (const action of ["search", "status", "cancel"]) {
       expect(callToolAdmission("download_model", { action }), `action:"${action}"`).toBe(
-        `tool "download_model" is not permitted for action "${action}"`,
+        actionRefusal("download_model", action),
       );
     }
     expect(callToolAdmission("download_model", {})).toBe(
-      'tool "download_model" is not permitted for action "(missing)"',
+      actionRefusal("download_model", undefined),
     );
   });
 
@@ -277,17 +297,17 @@ describe("call_tool admission", () => {
     it("get_workflow refuses the three actions no standalone entry ever covered", () => {
       for (const action of ["strip", "slice", "prompt_director"]) {
         expect(callToolAdmission("get_workflow", { action }), `action:"${action}"`).toBe(
-          `tool "get_workflow" is not permitted for action "${action}"`,
+          actionRefusal("get_workflow", action),
         );
       }
       // Including the shapes a client would actually send, so the refusal cannot be
       // argued away as "only the bare action is blocked".
       expect(
         callToolAdmission("get_workflow", { action: "strip", path: "C:/wf/expert.json" }),
-      ).toBe('tool "get_workflow" is not permitted for action "strip"');
+      ).toBe(actionRefusal("get_workflow", "strip"));
       expect(
         callToolAdmission("get_workflow", { action: "slice", graph: {}, groups: "TXT" }),
-      ).toBe('tool "get_workflow" is not permitted for action "slice"');
+      ).toBe(actionRefusal("get_workflow", "slice"));
     });
 
     it("save_workflow admits SAVE only — lock writes, and verify_lock was never admitted", () => {
@@ -296,21 +316,21 @@ describe("call_tool admission", () => {
       ).toBeNull();
       for (const action of ["lock", "verify_lock"]) {
         expect(callToolAdmission("save_workflow", { action }), `action:"${action}"`).toBe(
-          `tool "save_workflow" is not permitted for action "${action}"`,
+          actionRefusal("save_workflow", action),
         );
       }
       expect(callToolAdmission("save_workflow", { action: "lock", filename: "a.json" })).toBe(
-        'tool "save_workflow" is not permitted for action "lock"',
+        actionRefusal("save_workflow", "lock"),
       );
     });
 
     it("refuses either tool with a missing or non-string action", () => {
       for (const tool of ["get_workflow", "save_workflow"]) {
         expect(callToolAdmission(tool, {})).toBe(
-          `tool "${tool}" is not permitted for action "(missing)"`,
+          actionRefusal(tool, undefined),
         );
         expect(callToolAdmission(tool, { action: 42 })).toBe(
-          `tool "${tool}" is not permitted for action "(missing)"`,
+          actionRefusal(tool, undefined),
         );
       }
     });
@@ -390,7 +410,7 @@ describe("call_tool admission", () => {
 
     it("refuses uninstall — a pack removal that was never reachable this way", () => {
       expect(callToolAdmission("install_custom_node", { action: "uninstall" })).toBe(
-        'tool "install_custom_node" is not permitted for action "uninstall"',
+        actionRefusal("install_custom_node", "uninstall"),
       );
       // Including the shape a client would actually send, so the refusal cannot
       // be argued away as "only the bare action is blocked".
@@ -399,7 +419,7 @@ describe("call_tool admission", () => {
           action: "uninstall",
           id: "comfyui-impact-pack",
         }),
-      ).toBe('tool "install_custom_node" is not permitted for action "uninstall"');
+      ).toBe(actionRefusal("install_custom_node", "uninstall"));
     });
 
     it("refuses the actions that RUN third-party pack code", () => {
@@ -407,11 +427,11 @@ describe("call_tool admission", () => {
         expect(
           callToolAdmission("install_custom_node", { action, id: "comfyui-impact-pack" }),
           `action:"${action}"`,
-        ).toBe(`tool "install_custom_node" is not permitted for action "${action}"`);
+        ).toBe(actionRefusal("install_custom_node", action));
       }
       // "all" is the shape that would have hit EVERY installed pack at once.
       expect(callToolAdmission("install_custom_node", { action: "update", id: "all" })).toBe(
-        'tool "install_custom_node" is not permitted for action "update"',
+        actionRefusal("install_custom_node", "update"),
       );
     });
 
@@ -420,7 +440,7 @@ describe("call_tool admission", () => {
         expect(
           callToolAdmission("install_custom_node", { action }),
           `action:"${action}"`,
-        ).toBe(`tool "install_custom_node" is not permitted for action "${action}"`);
+        ).toBe(actionRefusal("install_custom_node", action));
       }
     });
 
@@ -453,10 +473,10 @@ describe("call_tool admission", () => {
       // so a client that merely swapped the NAME must be refused rather than
       // silently defaulting into one of the eleven actions.
       expect(callToolAdmission("install_custom_node", {})).toBe(
-        'tool "install_custom_node" is not permitted for action "(missing)"',
+        actionRefusal("install_custom_node", undefined),
       );
       expect(callToolAdmission("install_custom_node", { action: 42 })).toBe(
-        'tool "install_custom_node" is not permitted for action "(missing)"',
+        actionRefusal("install_custom_node", undefined),
       );
     });
 
@@ -498,7 +518,7 @@ describe("call_tool admission", () => {
 
     it("refuses convert — the one folded action that WRITES a file", () => {
       expect(callToolAdmission("get_image", { action: "convert" })).toBe(
-        'tool "get_image" is not permitted for action "convert"',
+        actionRefusal("get_image", "convert"),
       );
       // Including the shape that would actually create the file, so the refusal
       // cannot be argued away as "only the bare action is blocked".
@@ -509,23 +529,23 @@ describe("call_tool admission", () => {
           format: "webp",
           out_path: "a.webp",
         }),
-      ).toBe('tool "get_image" is not permitted for action "convert"');
+      ).toBe(actionRefusal("get_image", "convert"));
     });
 
     it("refuses the asset-registry and colour actions — read-only, but never whitelisted", () => {
       for (const action of ["view", "list_assets", "asset_metadata", "analyze_color"]) {
         expect(callToolAdmission("get_image", { action }), `action:"${action}"`).toBe(
-          `tool "get_image" is not permitted for action "${action}"`,
+          actionRefusal("get_image", action),
         );
       }
     });
 
     it("refuses get_image with a missing or non-string action", () => {
       expect(callToolAdmission("get_image", {})).toBe(
-        'tool "get_image" is not permitted for action "(missing)"',
+        actionRefusal("get_image", undefined),
       );
       expect(callToolAdmission("get_image", { action: 42 })).toBe(
-        'tool "get_image" is not permitted for action "(missing)"',
+        actionRefusal("get_image", undefined),
       );
     });
 
@@ -600,7 +620,7 @@ describe("call_tool admission", () => {
       // The one that matters. run:true executes a graph nobody on this machine
       // wrote, on the user's GPU, with no agent turn and no confirmation.
       expect(callToolAdmission("enqueue_workflow", { action: "run_url" })).toBe(
-        'tool "enqueue_workflow" is not permitted for action "run_url"',
+        actionRefusal("enqueue_workflow", "run_url"),
       );
       expect(
         callToolAdmission("enqueue_workflow", {
@@ -608,7 +628,7 @@ describe("call_tool admission", () => {
           url: "https://example.com/wf.json",
           run: true,
         }),
-      ).toBe('tool "enqueue_workflow" is not permitted for action "run_url"');
+      ).toBe(actionRefusal("enqueue_workflow", "run_url"));
       // …and read-only is refused too: the entry never covered this tool at all.
       expect(
         callToolAdmission("enqueue_workflow", {
@@ -616,26 +636,26 @@ describe("call_tool admission", () => {
           url: "https://example.com/wf.json",
           run: false,
         }),
-      ).toBe('tool "enqueue_workflow" is not permitted for action "run_url"');
+      ).toBe(actionRefusal("enqueue_workflow", "run_url"));
     });
 
     it("refuses the other three folded actions, whose names were never whitelisted", () => {
       for (const action of ["rerun", "template_schema", "run_template"]) {
         expect(callToolAdmission("enqueue_workflow", { action }), `action:"${action}"`).toBe(
-          `tool "enqueue_workflow" is not permitted for action "${action}"`,
+          actionRefusal("enqueue_workflow", action),
         );
       }
       expect(
         callToolAdmission("enqueue_workflow", { action: "run_template", template: "anima-txt2img" }),
-      ).toBe('tool "enqueue_workflow" is not permitted for action "run_template"');
+      ).toBe(actionRefusal("enqueue_workflow", "run_template"));
     });
 
     it("refuses enqueue_workflow with a missing or non-string action", () => {
       expect(callToolAdmission("enqueue_workflow", {})).toBe(
-        'tool "enqueue_workflow" is not permitted for action "(missing)"',
+        actionRefusal("enqueue_workflow", undefined),
       );
       expect(callToolAdmission("enqueue_workflow", { action: 42 })).toBe(
-        'tool "enqueue_workflow" is not permitted for action "(missing)"',
+        actionRefusal("enqueue_workflow", undefined),
       );
     });
   });
@@ -656,11 +676,11 @@ describe("call_tool admission", () => {
     it("admits NOTHING ELSE — the scope grants exactly what the retired entry did", () => {
       for (const action of ["list", "stats", "suggest"]) {
         expect(callToolAdmission("get_history", { action }), `action:"${action}"`).toBe(
-          `tool "get_history" is not permitted for action "${action}"`,
+          actionRefusal("get_history", action),
         );
       }
       expect(callToolAdmission("get_history", {})).toBe(
-        'tool "get_history" is not permitted for action "(missing)"',
+        actionRefusal("get_history", undefined),
       );
     });
   });
@@ -894,7 +914,7 @@ describe("call_tool admission", () => {
         for (const action of probes) {
           if (allowed.has(action)) continue;
           expect(callToolAdmission(tool, { action }), `${tool} / ${action}`).toBe(
-            `tool "${tool}" is not permitted for action "${action}"`,
+            actionRefusal(tool, action),
           );
         }
       }
@@ -915,7 +935,7 @@ describe("call_tool admission", () => {
       for (const action of ["create", "start"]) {
         expect(runpod?.has(action), `${action} must stay out of the scope set`).toBe(false);
         expect(callToolAdmission("runpod", { action }), action).toBe(
-          `tool "runpod" is not permitted for action "${action}"`,
+          actionRefusal("runpod", action),
         );
       }
     });
