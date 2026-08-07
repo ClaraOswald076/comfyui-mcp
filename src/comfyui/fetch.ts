@@ -13,6 +13,79 @@ function targetOf(input: string | URL | Request): string {
 }
 
 /**
+ * What the CONNECTED panels front, for the drift comparison below (#952).
+ *
+ * Injected by the orchestrator at startup rather than imported: this module is
+ * the bottom of the stack and must not depend on the bridge. Unset (the plain
+ * MCP server, tests, any process with no bridge) simply means the comparison is
+ * skipped — never that there is no drift.
+ *
+ * Origins here must be the SERVER-OBSERVED handshake Origin (UiBridge's
+ * `tabServerOrigin`), not the client-supplied `hello.comfyui_url`: the browser
+ * sets the former and blocks page JS from forging it, so it is the trustworthy
+ * answer to "which ComfyUI is this tab actually on".
+ */
+let connectedPanelOrigins: (() => string[]) | null = null;
+
+/** Install the panel-origin source. Pass null to clear (tests, shutdown). */
+export function setConnectedPanelOrigins(fn: (() => string[]) | null): void {
+  connectedPanelOrigins = fn;
+}
+
+/** Origin (scheme://host:port) of a request target, or undefined if unparsable. */
+function originOf(target: string): string | undefined {
+  try {
+    return new URL(target).origin;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Name the drift instead of asking the reader to go and check for it (#952).
+ *
+ * The shipped message told the user a connected panel "does not imply this
+ * address is reachable" and pointed them at install_comfyui(action:"environment")
+ * to compare the two by hand. We can usually just do the comparison — the bridge
+ * knows what each connected tab fronts — and saying which of the three cases
+ * holds is worth far more than the instruction to go and find out:
+ *
+ *   - DIFFERENT   → that is very likely the whole answer.
+ *   - THE SAME    → drift is RULED OUT. Worth stating plainly, because it stops
+ *                   the reader chasing the explanation the old text volunteered.
+ *                   The panel reaches it from the browser; this process does not
+ *                   (a firewall, a container boundary, a bound interface).
+ *   - UNKNOWN     → no panel connected, no origin source installed, or the
+ *                   handshake carried no usable Origin. Say nothing about drift;
+ *                   an absent comparison is not a negative result.
+ */
+function describeTargetDrift(target: string): string {
+  const origins = (() => {
+    try {
+      return connectedPanelOrigins?.() ?? [];
+    } catch {
+      return []; // a broken source must never replace the real network error
+    }
+  })();
+  if (origins.length === 0) return "";
+  const want = originOf(target);
+  if (!want) return "";
+  const distinct = [...new Set(origins)];
+  if (distinct.includes(want)) {
+    return (
+      ` A connected panel is on this same origin, so this is NOT a wrong-address problem: ` +
+      `the browser can reach ${want} and this process cannot (a firewall, a container ` +
+      `boundary, or a server bound to one interface).`
+    );
+  }
+  return (
+    ` A connected panel is on ${distinct.join(", ")} — a DIFFERENT address, which is why ` +
+    `the panel works while this call does not. Point COMFYUI_URL at that origin if it is the ` +
+    `server you meant.`
+  );
+}
+
+/**
  * Turn a network-layer throw into a diagnostic that says WHAT was attempted.
  *
  * `TypeError: fetch failed` was reaching tool results verbatim: #954 saw it from
@@ -24,15 +97,17 @@ function targetOf(input: string | URL | Request): string {
  *
  * The two ARE separate targets by design: the panel talks to whichever ComfyUI
  * the browser is on, while these calls go to the configured COMFYUI_URL. That is
- * not a bug, but it is invisible unless the failure names the address.
+ * not a bug, but it is invisible unless the failure names the address — and,
+ * where the bridge can tell us, says whether the two actually differ.
  */
 function describeComfyFetchFailure(err: unknown, target: string): Error {
   const { message, code } = describeFetchFailure(err);
   const wrapped = new Error(
     `${message} — while requesting ${target}. ` +
       `That is the headless ComfyUI target (COMFYUI_URL); a CONNECTED sidebar panel does not imply this address is reachable, ` +
-      `because the panel talks to whichever ComfyUI its browser tab is on. ` +
-      `Check the target with install_comfyui (action:"environment"), and confirm the server is up with get_system_stats (action:"health").`,
+      `because the panel talks to whichever ComfyUI its browser tab is on.` +
+      describeTargetDrift(target) +
+      ` Check the target with install_comfyui (action:"environment"), and confirm the server is up with get_system_stats (action:"health").`,
     { cause: err },
   );
   if (code) (wrapped as { code?: string }).code = code;
