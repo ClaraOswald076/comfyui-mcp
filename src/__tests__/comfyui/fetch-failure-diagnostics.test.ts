@@ -5,7 +5,8 @@
 // or a certificate. The real reason sits one level down on `.cause`, and
 // `errorToToolResult` kept only `err.message`.
 //
-// #954 saw it from list_workflow_templates and could not tell which target was
+// #954 saw it from the workflow-templates listing (now `list_packs`
+// action:"list_templates") and could not tell which target was
 // tried. #952 saw it from the readonly tools while the panel bridge was working
 // fine — and read it, reasonably, as "these tools are broken". They weren't: the
 // panel talks to whichever ComfyUI its browser tab is on, while these calls go to
@@ -108,9 +109,9 @@ describe("comfyuiFetch names the target it could not reach", () => {
     await expect(comfyuiFetch("http://127.0.0.1:8188/api/x")).rejects.toThrow(
       /CONNECTED sidebar panel does not imply/,
     );
-    // Remedies must be NAMED, or the reader is still guessing. (The vocabulary
-    // gate keeps these two names live — it caught an earlier draft pointing at
-    // get_environment, retired in 0.50.0.)
+    // Remedies must be NAMED, or the reader is still guessing. The vocabulary
+    // gate keeps these two names live — it caught an earlier draft of this very
+    // change pointing at the environment tool's pre-0.50.0 name.
     await expect(comfyuiFetch("http://127.0.0.1:8188/api/x")).rejects.toThrow(
       /install_comfyui \(action:"environment"\)/,
     );
