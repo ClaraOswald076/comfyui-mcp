@@ -14,6 +14,7 @@ import { execSync, spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 /**
  * Ask the installed server for its tool list over MCP stdio. Resolves to the
@@ -144,5 +145,34 @@ if (missingMeta.length) {
   process.exit(1);
 }
 console.log(`✅ installed surface registers ${core.length} core tools + ${META.length} compact-mode tools`);
+
+// 6. The PANEL surface too. Those 91 tools are the whole reason the panel can
+//    drive a live canvas, they ship in the same tarball, and until now nothing
+//    checked that the published build still builds them. buildPanelToolDefs is
+//    pure — no server, no socket — so this is a direct call into the INSTALLED
+//    dist rather than another stdio round trip.
+const PANEL_LEDGER = readFileSync(join(process.cwd(), "docs/design/panel-surface.txt"), "utf-8")
+  .split(/\r?\n/)
+  .map((l) => l.trim())
+  .filter((l) => l.startsWith("panel_"));
+let panelCount = null;
+try {
+  const mod = await import(pathToFileURL(join(pkg, "dist/orchestrator/panel-tools.js")).href);
+  panelCount = mod.buildPanelToolDefs?.().length ?? null;
+} catch (err) {
+  console.error(`❌ could not load the installed panel tools: ${err?.message ?? err}`);
+  process.exit(1);
+}
+if (panelCount === null) {
+  console.error("❌ the installed build exports no buildPanelToolDefs");
+  process.exit(1);
+}
+if (PANEL_LEDGER.length > 0 && panelCount !== PANEL_LEDGER.length) {
+  console.error(
+    `❌ installed build makes ${panelCount} panel tools, ledger declares ${PANEL_LEDGER.length}`,
+  );
+  process.exit(1);
+}
+console.log(`✅ installed build makes ${panelCount} panel tools (ledger: ${PANEL_LEDGER.length})`);
 
 console.log("✅ pack/install smoke passed — tarball installs cleanly, boots, and registers its tools");
