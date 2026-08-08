@@ -6,6 +6,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.32] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- an AMBIGUOUS turn is not a dead tab, and not a missing Origin (#1077) (#1107)
+- refuse API/prompt format instead of crashing or lying (#1103)
+
+#### Changed
+- pin that every pack ships a UI workflow, not API/prompt (#1105)
+
+
 ## [0.50.31] - 2026-08-07
 
 ### MCP
