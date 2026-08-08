@@ -6,6 +6,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.25] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a refused adoption now says WHICH gate refused it (#1077) (#1084)
+- an unreadable settings answer is not an empty one (#796) (#1082)
+- say that `name` is dropped when the slot is reused (#1081)
+
+#### Changed
+- record the first measured arm, and what is still unmeasured (#1083)
+
+
 ## [0.50.24] - 2026-08-07
 
 ### MCP
