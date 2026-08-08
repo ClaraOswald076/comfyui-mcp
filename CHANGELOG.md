@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.33] - 2026-08-08
+
+### MCP
+
+#### Added
+- declare destructive/openWorld hints on the money-spending tools (#1108)
+
+#### Fixed
+- a fence the panel repaired mid-call is no longer reported as failure (#1043) (#1111)
+
+
 ## [0.50.32] - 2026-08-08
 
 ### MCP
