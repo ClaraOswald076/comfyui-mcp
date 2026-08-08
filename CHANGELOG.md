@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.21] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- the generate_* family reports rejected output branches too (#1060)
+
+#### Changed
+- a remedy never names an action the tool does not have (#1059)
+
+
 ## [0.50.20] - 2026-08-07
 
 ### MCP
