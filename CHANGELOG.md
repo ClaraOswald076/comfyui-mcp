@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.38] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- the GitHub Release body is THIS version's changelog, not every PR since forever (#1138)
+- stop telling users to move a model into the folder it is already in (#1137)
+
+
 ## [0.50.37] - 2026-08-08
 
 ### RunPod image
