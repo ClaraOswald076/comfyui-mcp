@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.31] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a 403 already says WHY — stop dropping it (#1099)
+
+
 ## [0.50.30] - 2026-08-07
 
 ### MCP
