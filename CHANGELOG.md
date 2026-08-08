@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.23] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- the fence repair was gated behind the one call the wedge blocks (#1075)
+
+
 ## [0.50.22] - 2026-08-07
 
 ### MCP
