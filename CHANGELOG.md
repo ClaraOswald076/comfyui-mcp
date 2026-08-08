@@ -6,6 +6,25 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.22] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- the advertise retry loop could not retry (#1073)
+- getSystemStats must be able to fail, and fetchImage must be able to time out (#1072)
+- give the cloud client the timeout ceiling and delivery doubt its twin already had (#1069)
+- a transport failure on a POST no longer implies the POST never arrived (#1068)
+- a reply-timeout on a mutating command no longer reads as "nothing happened" (#1067)
+- two release gates anchored to a frozen retirement baseline instead of the live surface (#1066)
+
+#### Changed
+- verify the published PANEL surface builds too (#1065)
+- verify the published surface REGISTERS, not just that it boots (#1064)
+- the startup probe budget is 60, not 20 — and gate the drift (#1063)
+- COMFYUI_MCP_NO_AUTOSPAWN does not exist — name the control that does (#1062)
+
+
 ## [0.50.21] - 2026-08-07
 
 ### MCP
