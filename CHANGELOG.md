@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.29] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- ask the server whether a Manager dispatch landed (#1086) (#1096)
+
+#### Changed
+- tell callers to add sequentially, and why (#1095)
+
+
 ## [0.50.28] - 2026-08-07
 
 ### MCP
