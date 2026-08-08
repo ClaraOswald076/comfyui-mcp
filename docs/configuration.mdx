@@ -169,8 +169,14 @@ Applies to `restart_comfyui` (actions `start` and `restart`) when comfyui-mcp ma
 <ParamField path="COMFYUI_STARTUP_CHECK_INTERVAL_S" type="number" default="1">
   Seconds between readiness probes after launching ComfyUI.
 </ParamField>
-<ParamField path="COMFYUI_STARTUP_CHECK_MAX_TRIES" type="number" default="20">
-  Maximum readiness probes before reporting a startup timeout.
+<ParamField path="COMFYUI_STARTUP_CHECK_MAX_TRIES" type="number" default="60">
+  Maximum readiness probes before reporting that startup is not confirmed. With the
+  default 1s interval this is a ~60s budget. It was raised from 20 because ComfyUI
+  with a normal set of custom nodes routinely takes longer than 20s to answer
+  `/system_stats` on a cold start, and the shorter budget reported a startup as
+  unconfirmed moments before a healthy instance became ready.
+
+  Exhausting the budget means startup is **not confirmed yet** — not that it failed.
 </ParamField>
 <ParamField path="COMFYUI_ALWAYS_RESTART" type="boolean" default="false">
   When enabled, a ComfyUI process that exits unexpectedly is automatically restarted. A deliberate `restart_comfyui` with `action: "stop"` is never restarted.
