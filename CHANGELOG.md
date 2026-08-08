@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.28] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- an unreadable overrides file is preserved, not erased (#796) (#1093)
+
+
 ## [0.50.27] - 2026-08-07
 
 ### MCP
