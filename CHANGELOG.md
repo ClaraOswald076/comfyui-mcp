@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.40] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- a REFUSED Manager enqueue falls through to the direct git clone (#1143)
+
+
 ## [0.50.39] - 2026-08-08
 
 ### MCP
