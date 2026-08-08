@@ -47,6 +47,11 @@ export async function generateAudioAction(
             model_family: result.model_family,
             prompt_id: result.prompt_id,
             queue_remaining: result.queue_remaining,
+            // #1037 — a 200 from /prompt does not mean every output was accepted;
+            // ComfyUI queues the branches that validate and reports the rest.
+            ...(result.rejectedOutputs
+              ? { rejected_outputs: result.rejectedOutputs }
+              : {}),
             note: "asset_id will be available in the completion notification; the SaveAudioMP3 node writes the output file to ComfyUI's output directory.",
           },
           null,

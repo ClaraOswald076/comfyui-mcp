@@ -469,6 +469,11 @@ export function registerGenerateImageTool(server: McpServer): void {
                       status: "enqueued",
                       prompt_id: result.prompt_id,
                       queue_remaining: result.queue_remaining,
+                      // #1037 — a 200 from /prompt does not mean every output was accepted;
+                      // ComfyUI queues the branches that validate and reports the rest.
+                      ...(result.rejectedOutputs
+                        ? { rejected_outputs: result.rejectedOutputs }
+                        : {}),
                       checkpoint: result.checkpoint,
                       note: 'asset_id will be available in the completion notification; use get_image (action:"view") or generate_image (action:"regenerate") with it.',
                     },

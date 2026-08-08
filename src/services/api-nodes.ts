@@ -44,7 +44,7 @@ export interface ApiNodesDeps {
       disable_random_seed?: boolean;
       extra_data?: Record<string, unknown>;
     },
-  ) => Promise<{ prompt_id: string; queue_remaining?: number }>;
+  ) => Promise<{ prompt_id: string; queue_remaining?: number; rejectedOutputs?: string }>;
 }
 
 const defaultDeps: ApiNodesDeps = {
@@ -518,6 +518,10 @@ export interface GenerateWithApiNodeArgs {
 export interface GenerateWithApiNodeResult {
   prompt_id: string;
   queue_remaining?: number;
+  /** #1037 — output branches ComfyUI REFUSED while accepting the prompt. Present
+   *  only when some were: the run WAS queued, and the accepted branches still
+   *  produce output, so this is a disclosure attached to a success. */
+  rejectedOutputs?: string;
   /** The minimal single-node workflow that was enqueued. */
   workflow: WorkflowJSON;
   /** Non-fatal guidance (e.g. unknown inputs, auth reminder). */
@@ -656,6 +660,7 @@ export async function generateWithApiNode(
   return {
     prompt_id: result.prompt_id,
     queue_remaining: result.queue_remaining,
+    rejectedOutputs: result.rejectedOutputs,
     workflow,
     notes,
   };

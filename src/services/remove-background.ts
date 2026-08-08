@@ -21,12 +21,18 @@ export interface RemoveBackgroundDeps {
    *  it can't be determined (no running server) — in which case we proceed and
    *  let execution surface any problem. */
   isNodeInstalled?: (classType: string) => Promise<boolean | undefined>;
-  enqueue: (workflow: WorkflowJSON) => Promise<{ prompt_id: string; queue_remaining?: number }>;
+  enqueue: (
+    workflow: WorkflowJSON,
+  ) => Promise<{ prompt_id: string; queue_remaining?: number; rejectedOutputs?: string }>;
 }
 
 export interface RemoveBackgroundResult {
   prompt_id: string;
   queue_remaining?: number;
+  /** #1037 — output branches ComfyUI REFUSED while accepting the prompt. Present
+   *  only when some were: the run WAS queued, and the accepted branches still
+   *  produce output, so this is a disclosure attached to a success. */
+  rejectedOutputs?: string;
   model: string;
 }
 
@@ -88,6 +94,6 @@ export async function removeBackground(
   const model =
     (workflow["2"]?.inputs.model as string | undefined) ?? "BiRefNet_toonout";
 
-  const { prompt_id, queue_remaining } = await deps.enqueue(workflow);
-  return { prompt_id, queue_remaining, model };
+  const { prompt_id, queue_remaining, rejectedOutputs } = await deps.enqueue(workflow);
+  return { prompt_id, queue_remaining, rejectedOutputs, model };
 }
