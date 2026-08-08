@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.41] - 2026-08-08
+
+### MCP
+
+#### Added
+- attach UI workflow metadata to API-enqueued prompts (#1124)
+
+
 ## [0.50.40] - 2026-08-08
 
 ### MCP
