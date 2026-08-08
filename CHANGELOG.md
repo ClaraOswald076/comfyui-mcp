@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.39] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- a RESERVED Manager update is staged, not failed (#1141)
+
+
 ## [0.50.38] - 2026-08-08
 
 ### MCP
