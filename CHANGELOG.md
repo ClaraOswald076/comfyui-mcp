@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.34] - 2026-08-08
+
+### MCP
+
+#### Added
+- gate the "could not determine" → "determined not" collapse (#1110)
+
+#### Fixed
+- persist the phone pair token so a restart stops killing the link (#875) (#1113)
+
+
 ## [0.50.33] - 2026-08-08
 
 ### MCP
