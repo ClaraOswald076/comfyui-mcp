@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.24] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a store that could not be READ is never overwritten (#796) (#1079)
+- a log that could not be read is not a clean restart (#796) (#1078)
+
+
 ## [0.50.23] - 2026-08-07
 
 ### MCP
