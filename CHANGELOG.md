@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.26] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a config that could not be loaded is neither empty nor disposable (#796) (#1087)
+
+
 ## [0.50.25] - 2026-08-07
 
 ### MCP
