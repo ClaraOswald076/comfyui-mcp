@@ -8,7 +8,7 @@ import { getClient, getSystemStats } from "../comfyui/client.js";
 import { getExtraModelRoots, getLiveExtraModelRoots } from "./extra-paths.js";
 import { resolveEffectiveComfyUIBase, resolveLiveServerRoot } from "./workspace-env.js";
 import { installModelViaManager } from "./node-management.js";
-import { ModelError, ValidationError } from "../utils/errors.js";
+import { ModelError, ValidationError, unreachableHostMessage } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { downloadWithCache, probeRemoteModelPayload } from "./download-cache.js";
 import { reportDownloadProgress } from "./download-progress.js";
@@ -224,7 +224,21 @@ export async function searchHuggingFaceModels(
   // Third-party API: bound the wait so a stalled response cannot wedge the
   // turn. Same class as #1026 — an unbounded metadata call has no limit at
   // all and hangs until the caller gives up.
-  const res = await fetch(url, { headers, signal: AbortSignal.timeout(20_000) });
+  //
+  // #1136: an unreachable HuggingFace is the failure most easily mistaken for
+  // "no such model" — this call backs model SEARCH, and its caller renders a
+  // zero-length array as "nothing found". Only errors thrown by fetch() itself
+  // take this path; an HTTP status is a real answer and keeps its own wording.
+  const res = await fetch(url, { headers, signal: AbortSignal.timeout(20_000) }).catch(
+    (err: unknown) => {
+      const { message, code } = unreachableHostMessage(err, url, "the HuggingFace model search", {
+        remedy:
+          "If huggingface.co is blocked in your region, set HF_ENDPOINT to a reachable mirror " +
+          "(e.g. https://hf-mirror.com) and retry.",
+      });
+      throw new ModelError(message, { url, code });
+    },
+  );
   if (!res.ok) {
     // unknown-ok: "" is interpolated into an ERROR MESSAGE and nothing else — the
     // HTTP status is reported either way, so an unreadable body costs detail in the
