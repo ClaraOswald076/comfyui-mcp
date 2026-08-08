@@ -6,6 +6,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.36] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- a Manager listing is PLACEMENT, never validity — my 0.50.29 regression (#473) (#1120)
+
+#### Changed
+- the shipped build's data-loss guards must actually guard (#1119)
+- pin the env var our errors tell people to set (#1118)
+- the tunnel-deferral comment named a function that does not exist (#1117)
+
+
 ## [0.50.35] - 2026-08-08
 
 ### MCP
