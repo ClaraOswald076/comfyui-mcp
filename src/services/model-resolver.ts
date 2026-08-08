@@ -1551,14 +1551,83 @@ export async function verifyLandedModel(
   }
   return {
     verifiedPath,
-    liveVisible: "not-visible",
-    note:
-      `The file IS on disk at ${verifiedPath}, but the connected ComfyUI ` +
-      `(${getComfyUIBaseUrl()}) does NOT list "${wanted}" under "${category}" — it will not be ` +
-      `usable in a workflow from there.` +
-      (liveModelsDir ? ` The models directory that server reads is ${liveModelsDir}.` : "") +
-      " Move the file into the running server's models tree (or point COMFYUI_PATH at that install and re-download).",
+    ...notVisibleVerdict({
+      verifiedPath,
+      liveModelsDir,
+      wanted,
+      category,
+      baseUrl: getComfyUIBaseUrl(),
+    }),
   };
+}
+
+/**
+ * The verdict for a file that is on disk but absent from the live listing (#1131).
+ *
+ * "Not listed" has TWO causes and they take OPPOSITE remedies. If the file sits
+ * UNDER the very models root the server reads, it is not misplaced: the server
+ * simply has not re-read that folder yet. ComfyUI caches its loader option lists
+ * and invalidates them on the directory's mtime, so a check this soon after the
+ * write routinely races it. Telling that user to "move the file into the running
+ * server's models tree" names a directory the file is ALREADY in — a remedy that
+ * cannot be followed, which is what the reporter received. Only a file OUTSIDE
+ * that root is genuinely in the wrong place.
+ *
+ * The DECISION lives here rather than at the call site so it is covered by the
+ * same tests as the wording; a branch chosen upstream and passed in as a boolean
+ * would be exactly the untested wiring this repo keeps getting caught by.
+ */
+export function notVisibleVerdict(args: {
+  verifiedPath: string;
+  liveModelsDir: string | undefined;
+  wanted: string;
+  category: string;
+  baseUrl: string;
+}): { liveVisible: "not-visible"; note: string } {
+  const { verifiedPath, liveModelsDir, wanted, category, baseUrl } = args;
+  const insideLiveRoot = liveModelsDir !== undefined && isUnderRoot(verifiedPath, liveModelsDir);
+  return {
+    // Still not VISIBLE — we did not observe it in the listing, and #369 exists
+    // because an unobserved placement must not render as confirmed. The verdict
+    // is unchanged; what changes is the explanation and the remedy.
+    liveVisible: "not-visible",
+    note: insideLiveRoot
+      ? `The file IS on disk at ${verifiedPath}, which is INSIDE the models directory the ` +
+        `connected ComfyUI reads (${liveModelsDir}) — so it is in the right place. That server ` +
+        `does not list "${wanted}" under "${category}" YET, which almost always means its ` +
+        `cached loader options have not been re-read since the write (ComfyUI invalidates them ` +
+        `on the directory's mtime). Do NOT move the file. Refresh the node/model definitions ` +
+        `— install_comfyui (action:"refresh_nodes"), or the panel's refresh — or restart ` +
+        `ComfyUI, then check list_local_models again.`
+      : `The file IS on disk at ${verifiedPath}, but the connected ComfyUI ` +
+        `(${baseUrl}) does NOT list "${wanted}" under "${category}" — it will not be ` +
+        `usable in a workflow from there.` +
+        (liveModelsDir ? ` The models directory that server reads is ${liveModelsDir}.` : "") +
+        " Move the file into the running server's models tree (or point COMFYUI_PATH at that install and re-download).",
+  };
+}
+
+/**
+ * Is `file` inside `root`? Compared on NORMALIZED paths (#1131).
+ *
+ * Windows mixes separators and is case-insensitive, so `C:\ComfyUI\models` and
+ * `c:/comfyui/models` name the same directory — comparing raw strings would call
+ * a correctly-placed file misplaced and print the "move it there" remedy for a
+ * file already there. The boundary check requires a separator so `…/models2`
+ * never counts as inside `…/models`.
+ */
+export function isUnderRoot(
+  file: string,
+  root: string,
+  platform: string = process.platform,
+): boolean {
+  const norm = (s: string): string => {
+    const slashed = s.replace(/\\/g, "/").replace(/\/+$/, "");
+    return platform === "win32" ? slashed.toLowerCase() : slashed;
+  };
+  const f = norm(file);
+  const r = norm(root);
+  return f === r || f.startsWith(`${r}/`);
 }
 
 /**
