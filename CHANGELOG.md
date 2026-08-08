@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.30] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- a REMOTE no-reboot-endpoint failure now names what will work (#425) (#1100)
+- name the tunnelled-remote case in the panel-restart refusal (#1098)
+
+
 ## [0.50.29] - 2026-08-07
 
 ### MCP
