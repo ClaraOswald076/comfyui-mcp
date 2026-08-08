@@ -79,9 +79,11 @@ JavaScript).
 No `claude mcp add`, no API key. The orchestrator is started **only when you click
 Connect** — never silently on load — and the panel auto-connects if a bridge is
 already running. Prerequisites are Node.js/`npx` on your PATH and the provider login
-above. To run an orchestrator yourself, set `COMFYUI_MCP_NO_AUTOSPAWN=1` and launch
-`npx -y comfyui-mcp@latest connect`, then click Connect; change the bridge
-port with `COMFYUI_MCP_BRIDGE_PORT`.
+above. To run an orchestrator yourself, turn on **Settings → General → "Use
+external/local orchestrator (advanced)"**, launch `npx -y comfyui-mcp@latest
+connect`, then click Connect — the panel links to the bridge that is already
+running instead of starting its own. Change the bridge port with
+`COMFYUI_MCP_BRIDGE_PORT`.
 
 <Note>
 **Driving a remote ComfyUI** (a cloud GPU pod, another box on your LAN)? The setup
