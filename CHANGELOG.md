@@ -6,6 +6,26 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.37] - 2026-08-08
+
+### RunPod image
+
+#### Fixed
+- a hash that could not be COMPUTED is not a hash that DIFFERED (#1123)
+
+### MCP
+
+#### Added
+- report the ComfyUI FRONTEND version — the field #779 turned on (#1126)
+
+#### Fixed
+- REFUSE an auth-gated Manager dispatch instead of writing a corrupt model (#473) (#1134)
+- finish the #796 review — baseline reaches zero, and a comment could switch the gate off (#1125)
+
+#### Changed
+- ask for the ComfyUI FRONTEND version, and say why (#1127)
+
+
 ## [0.50.36] - 2026-08-08
 
 ### MCP
