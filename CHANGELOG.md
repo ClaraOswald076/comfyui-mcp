@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.35] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- defer the update-restart while a phone is connected over a tunnel (#875) (#1115)
+
+
 ## [0.50.34] - 2026-08-08
 
 ### MCP
