@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.27] - 2026-08-07
+
+### MCP
+
+#### Fixed
+- never overwrite a ~/.claude.json we could not read (#796) (#1091)
+- a Manager dispatch must not promise where the file lands (#1090)
+
+
 ## [0.50.26] - 2026-08-07
 
 ### MCP
