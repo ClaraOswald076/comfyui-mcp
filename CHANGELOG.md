@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.48] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- the refusal names the origin the connected panel is actually on (#1181)
+
+
 ## [0.50.47] - 2026-08-08
 
 ### MCP
