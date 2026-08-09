@@ -21,6 +21,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.77] - 2026-08-09
+
+### MCP
+
+#### Changed
+- a failure message must not name a cause nobody observed (#1271)
+- 0.50.76 (#1270)
+
+
 ## [0.50.76] - 2026-08-09
 
 ### MCP
