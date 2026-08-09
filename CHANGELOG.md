@@ -6,6 +6,22 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.50] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a BACKGROUNDED phone is not a departed phone (#1185)
+
+
+## [0.50.49] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- stop the client library's error path eating non-JSON responses (#1178)
+
+
 ## [0.50.48] - 2026-08-09
 
 ### MCP
