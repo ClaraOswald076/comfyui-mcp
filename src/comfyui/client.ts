@@ -862,7 +862,22 @@ export async function getHistory(
   const client = getClient();
   const path = promptId ? `/history/${promptId}` : "/history";
   const res = await client.fetchApi(path);
-  return res.json() as Promise<Record<string, HistoryEntry>>;
+  // #1149 — this was a bare res.json(), the last unguarded parse on the media
+  // read paths. A reporter on a remote H100 got `Unexpected end of JSON input`
+  // from get_history and get_image after a completed video render, which
+  // get_image then wrapped as HISTORY_UNREADABLE: a raw parser message standing
+  // in for a diagnosis, naming no endpoint and no status, for a render that had
+  // demonstrably succeeded.
+  //
+  // readComfyJson is what every sibling read already uses (#918/#946/#952): it
+  // names the URL, the status, the content type and a body prefix, so an empty
+  // body, an auth gate's login page and a proxy's HTML are each said out loud
+  // rather than collapsing into one parser error.
+  //
+  // No expectShape: /history's value is an object keyed by prompt id, and `{}`
+  // is a perfectly valid EMPTY history. Asserting a shape here would turn a
+  // legitimately empty answer into a fabricated failure — the opposite defect.
+  return readComfyJson<Record<string, HistoryEntry>>(res, { url: path });
 }
 
 /**
