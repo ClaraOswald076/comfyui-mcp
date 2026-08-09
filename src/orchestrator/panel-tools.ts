@@ -5998,6 +5998,34 @@ export interface PanelToolDef {
   handler: (args: Record<string, unknown>, ctx: PanelToolCtx) => Promise<ToolResult>;
 }
 
+/**
+ * #754 — an unrecognized argument key was silently DROPPED, not rejected. Measured:
+ * a real call and one with an extra `utterly_bogus_param` key returned byte-identical
+ * replies. Zod's default `z.object()` is "strip" mode: unknown keys vanish before the
+ * handler ever sees them, so a caller with a misspelled or hallucinated field name gets
+ * no signal that anything was wrong — the call just quietly does less than asked.
+ *
+ * `.strict()` turns that into a validation error the caller can see and correct,
+ * which is the whole value for an LLM caller: a loud, specific failure ("Unrecognized
+ * key: X") is something a model can read and fix on the next attempt; a silent no-op
+ * is not distinguishable from "it worked but had no effect".
+ *
+ * BOTH transports' registration functions accept this directly in place of the raw
+ * shape (verified against each SDK's actual runtime behavior, not assumed from the
+ * TypeScript types — see the cast note at the Anthropic SDK call site):
+ *   - `@modelcontextprotocol/sdk`'s `registerTool({ inputSchema })` types `inputSchema`
+ *     as `AnySchema | ZodRawShapeCompat`, so a full ZodObject is accepted as-is by the
+ *     TYPE, and at runtime `normalizeObjectSchema` detects an already-built schema
+ *     (it carries `_def`/`_zod`) and passes it through unwrapped rather than
+ *     re-wrapping it — so the `.strict()` marker survives into validation.
+ *   - The Anthropic Agent SDK's `tool()` stores whatever is passed as `inputSchema`
+ *     verbatim; a `.safeParse()` probe against the returned tool definition confirmed
+ *     an unrecognized key is rejected with `Unrecognized key: "..."`.
+ */
+function strictPanelSchema(shape: z.ZodRawShape) {
+  return z.object(shape).strict();
+}
+
 const PANEL_EDIT_NODE_FIELDS = ["pos", "size", "title", "preset", "color", "bgcolor", "shape", "collapsed", "pinned", "mode"] as const;
 const NODE_COLOR_HEX = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
 
@@ -10268,7 +10296,21 @@ export function createPanelMcpServer(
   // to the SDK's tool-list element type so the heterogeneous array type-checks.
   type SdkTool = ReturnType<typeof tool>;
   const tools = defs.map((d) =>
-    tool(d.name, d.description, d.schema, (args: Record<string, unknown>) => d.handler(args, ctx)),
+    tool(
+      d.name,
+      d.description,
+      // #754 — strict() so an unrecognized arg key is a loud validation error,
+      // not a silent drop. tool()'s TS signature requires a bare ZodRawShape
+      // (`Schema extends AnyZodRawShape`), which a strict ZodObject instance does
+      // NOT structurally satisfy (it has methods like `.parse`, not just field
+      // schemas) — but at RUNTIME the SDK stores whatever is passed as
+      // `inputSchema` verbatim (confirmed by constructing a tool this way and
+      // calling `.safeParse` on the returned definition: unknown keys are
+      // rejected). The cast documents that the type is being widened past what
+      // TS can express here, not past what the SDK actually accepts.
+      strictPanelSchema(d.schema) as unknown as typeof d.schema,
+      (args: Record<string, unknown>) => d.handler(args, ctx),
+    ),
   ) as unknown as SdkTool[];
   const server = createSdkMcpServer({
     name: "comfyui-panel",
@@ -10296,9 +10338,12 @@ export function registerPanelTools(server: McpServer, ctx: PanelToolCtx): void {
       d.name,
       {
         description: d.description,
-        // The MCP SDK accepts a zod raw shape as inputSchema (same shape the
-        // Anthropic SDK tool() takes), so the shared schema drops straight in.
-        inputSchema: d.schema,
+        // #754 — strict() so an unrecognized arg key is a loud validation error,
+        // not silently stripped. The MCP SDK types `inputSchema` as a full zod
+        // schema OR a raw shape (`AnySchema | ZodRawShapeCompat`), so passing the
+        // already-built ZodObject needs no cast here — unlike the Anthropic SDK
+        // call site, which types inputSchema as a bare raw shape only.
+        inputSchema: strictPanelSchema(d.schema),
       },
       (async (args: Record<string, unknown>) => {
         const res = await d.handler(args ?? {}, ctx);
