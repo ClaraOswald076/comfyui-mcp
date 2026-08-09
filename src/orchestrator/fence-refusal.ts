@@ -74,8 +74,21 @@ export function identityReason(
       `this session, setting it to the URL the panel is served from is what supplies it.`
     );
   }
+  // #1255 — this used to end "a malformed uuid, or one bound to a different
+  // origin", which describes a comparison the code does not perform.
+  // workflowIdentityParts uses the origin as a PRESENCE gate: it requires one to
+  // exist, and never compares it against a previously bound value (nothing in
+  // the repo has ever read `identity.origin` -- both call sites take `.uuid`).
+  // Reaching here with an origin present therefore means the UUID failed its
+  // shape check, full stop.
+  //
+  // The old wording sent a reader hunting for an origin mismatch that cannot
+  // happen -- it cost a whole investigation and a closed-unmerged PR before the
+  // mechanism was checked rather than believed. A refusal must describe the
+  // check it actually ran.
   return (
-    `the workflow identity did not validate (uuid ${String(workflowUuid)} against origin ` +
-    `${origin}) — a malformed uuid, or one bound to a different origin.`
+    `the workflow identity did not validate: the uuid ${String(workflowUuid)} is not a ` +
+    `well-formed workflow uuid. (The origin ${origin} was present and accepted -- this gate ` +
+    `requires an origin to exist, it does not compare it against a previously bound one.)`
   );
 }

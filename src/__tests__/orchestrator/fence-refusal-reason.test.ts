@@ -25,6 +25,7 @@
 import { describe, expect, it } from "vitest";
 import { UiBridge } from "../../services/ui-bridge.js";
 import { unreachableReason, identityReason } from "../../orchestrator/fence-refusal.js";
+import { workflowIdentityParts } from "../../orchestrator/session-store.js";
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 import {
   buildPanelToolDefs,
@@ -268,5 +269,59 @@ describe("the refusal reasons distinguish an AMBIGUOUS turn", () => {
     expect(r).toMatch(/did not validate/);
     expect(r).toMatch(/not-a-uuid/);
     expect(r).not.toMatch(/no server-observed Origin/);
+  });
+});
+
+// #1255 — a refusal must describe the check it actually ran.
+//
+// identityReason's last branch used to end "a malformed uuid, or one bound to a
+// different origin". workflowIdentityParts never compares origins: it requires
+// one to be PRESENT, and nothing in the repo has ever read `identity.origin`
+// (both call sites take `.uuid`). So the second half named a mechanism that does
+// not exist.
+//
+// That is not a cosmetic complaint. Reasoning from that sentence produced a
+// filed issue, a written fix and 7 tests before anyone checked whether the
+// comparison existed; the PR closed unmerged. Prose in the codebase gets read as
+// evidence about the codebase, so a message that overstates is a defect.
+describe("identityReason describes the check it actually performs (#1255)", () => {
+  const reason = () =>
+    identityReason("wf:x", "http://127.0.0.1:8188", "not-a-uuid", undefined);
+
+  it("does not claim the identity may be bound to a DIFFERENT origin", () => {
+    expect(reason()).not.toMatch(/bound to a different origin/i);
+  });
+
+  it("names the uuid as the thing that failed", () => {
+    const text = reason();
+    expect(text).toContain("not-a-uuid");
+    expect(text).toMatch(/not a well-formed workflow uuid/i);
+  });
+
+  it("says the origin was ACCEPTED, so a reader does not go hunting there", () => {
+    const text = reason();
+    expect(text).toContain("http://127.0.0.1:8188");
+    expect(text).toMatch(/present and accepted/i);
+    expect(text).toMatch(/does not compare it against a previously bound one/i);
+  });
+
+  it("owns its own premise: a present origin IS accepted by the gate", () => {
+    // The message asserts the origin was accepted and is not compared. Nothing
+    // in this file held that claim to the CODE -- a reviewer showed that adding
+    // a real origin comparison to workflowIdentityParts leaves all of these
+    // green, so the sentence could silently become false again. This pins it:
+    // a well-formed uuid with a present origin must produce an identity.
+    expect(
+      workflowIdentityParts({
+        workflowUuid: "11111111-2222-4333-8444-555555555555",
+        origin: "http://127.0.0.1:8188",
+      }),
+    ).toBeDefined();
+  });
+
+  it("still routes an AMBIGUOUS turn to its own branch, unchanged", () => {
+    // The no-origin branches are correct and must not be disturbed by this.
+    expect(identityReason("wf:x", undefined, "u", "ambiguous")).toMatch(/no single tab/i);
+    expect(identityReason("wf:x", undefined, "u", undefined)).toMatch(/no server-observed Origin/i);
   });
 });
