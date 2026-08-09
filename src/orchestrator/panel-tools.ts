@@ -2476,6 +2476,48 @@ function refreshWorkflowUuid(ctx: PanelToolCtx, value: unknown): boolean {
 }
 
 /**
+ * #814 — workflow_new and workflow_save/workflow_save_as all re-point the active
+ * workflow, and each of their handlers repairs the session's command fence by
+ * calling `rebindWorkflowFence(ctx)` unconditionally — a GENERIC re-derivation
+ * that makes its OWN independent `workflow_list` round trip and has no access to
+ * the command's own reply. That read is refused by the exact fence this whole
+ * flow exists to repair (#1071), and the only remaining recovery
+ * (`unreadableOrHealed`'s check for the panel's async hello re-advertise) is
+ * timing-dependent — a reporter hit exactly this: the save reply already proved
+ * the new uuid, and the very next command still failed with
+ * root-workflow-uuid-mismatch.
+ *
+ * Each of these replies ALREADY carries `workflow_uuid` directly (#762 for
+ * workflow_new, #800 for workflow_save/save_as), published only after the
+ * panel's own FINAL SYNCHRONOUS check that this target is still the active
+ * workflow — the identical proof `workflow_open`'s reply carries, which
+ * `refreshOpenWorkflowUuid` already trusts as a fallback. Trust it FIRST here
+ * too, before ever attempting the round trip that can be refused.
+ *
+ * No corroboration gate is needed (unlike workflow_open, which must verify the
+ * reply's identity against a caller-supplied path): there is no caller target to
+ * corroborate against — this session's own tab just performed the operation that
+ * produced this exact reply.
+ *
+ * Returns null when the reply carries no adoptable uuid (an older panel build,
+ * or the panel's own check could not prove it — #716's fail-closed omission), so
+ * the caller falls back to the EXISTING rebindWorkflowFence(ctx) round trip
+ * completely unchanged.
+ */
+function refreshFenceFromOwnReply(ctx: PanelToolCtx, reply: ToolResult): WorkflowFenceRebind | null {
+  const before = currentWorkflowFence(ctx);
+  const parsed = parseToolResultJson(reply);
+  if (!parsed) return null;
+  const uuid = responseWorkflowUuid(parsed);
+  if (!uuid) return null;
+  try {
+    return refreshWorkflowUuid(ctx, parsed) ? { status: "refreshed", uuid, before } : null;
+  } catch {
+    return null; // never surface a throw here as worse than the existing fallback
+  }
+}
+
+/**
  * The stamp currently fencing this session's tab — TRI-STATE, because reading it
  * is itself an operation that can fail (codex gate).
  *
@@ -8320,7 +8362,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // NEVER fails the call: the file WAS written. Retracting a completed save
         // would be the worse lie, so a fence that could not be re-established is
         // DISCLOSED instead.
-        const fenceRebind = await rebindWorkflowFence(ctx);
+        //
+        // #814 — trust THIS reply's own proven uuid first (#800), before ever
+        // attempting rebindWorkflowFence's independent workflow_list round trip,
+        // which can be refused by the exact fence this repairs.
+        const fenceRebind = refreshFenceFromOwnReply(ctx, res) ?? (await rebindWorkflowFence(ctx));
         let canMutateNow: boolean | undefined;
         let refusalCause: "unroutable" | "disconnected" | "no_identity" | "capability" | undefined;
         try {
@@ -8623,15 +8669,20 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         //
         // Refresh from the panel's own live active record, the same way the open
         // path does. The panel mints the new canvas's identity EAGERLY at
-        // creation ("so the key exists BEFORE the first edit"), so it is readable
-        // by the time this runs — it is simply not carried on the workflow_new
-        // reply, which returns key/routing_key but no workflow_uuid.
+        // creation ("so the key exists BEFORE the first edit").
+        //
+        // #814/#812 — this reply DOES carry workflow_uuid directly (#762), and the
+        // stale comment that used to stand here said otherwise. Trust it first,
+        // before ever attempting rebindWorkflowFence's independent workflow_list
+        // round trip, which can be refused by the exact fence being repaired
+        // (#1071) — the same trap a reporter hit via panel_new_workflow's own
+        // recovery attempt.
         //
         // NEVER fails the call on a rebind miss: the workflow WAS created, and
         // retracting that would be the worse lie. Disclose instead, so the agent
         // learns the graph tools are not yet usable here rather than discovering
         // it one confusing mismatch at a time.
-        const fenceRebind = await rebindWorkflowFence(ctx);
+        const fenceRebind = refreshFenceFromOwnReply(ctx, res) ?? (await rebindWorkflowFence(ctx));
         let canMutateNow: boolean | undefined;
         let refusalCause: "unroutable" | "disconnected" | "no_identity" | "capability" | undefined;
         try {
