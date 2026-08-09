@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.57] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- download status must not promise survival across an orchestrator restart (#1194)
+
+
 ## [0.50.56] - 2026-08-09
 
 ### MCP
