@@ -444,6 +444,28 @@ export type ModelListingCoverage = {
   /** Set when neither path could run: no HTTP answer AND no local install path
    *  to scan, which is the exact shape that produced the false "no models". */
   noSourceAvailable?: boolean;
+  /**
+   * Other categories THIS server registers, collected only when a FILTERED call
+   * came back empty (#962).
+   *
+   * The unfiltered path already discovers every registered category, and its own
+   * comment says why a filtered one skips discovery: "a FILTERED call already
+   * names its exact category". True for the lookup — and it is exactly what makes
+   * the answer misleading. The reporter called
+   * `list_local_models({model_type:"diffusion_models"})` and `{"unet"}` on a
+   * server whose UNETLoader was loading `krastBf16_v3.safetensors` at that
+   * moment. Both names answered 200 with `[]`, honestly, because the weights are
+   * registered under neither of them.
+   *
+   * So a filtered empty is a true statement about the wrong folder, and it is
+   * dressed as a fact about the install. Only when we would otherwise report
+   * "none" do we spend one `/models` call to say where else to look.
+   *
+   * Undefined means the question was never asked (a non-empty result, or the
+   * category list could not be read) — never "there are no other categories",
+   * which is what an empty array means.
+   */
+  otherRegisteredCategories?: string[];
 };
 
 /**
@@ -501,7 +523,40 @@ export async function listLocalModelsWithCoverage(
     usedFilesystem: false,
   };
   const models = await collectLocalModels(modelType, coverage);
+  // #962 — a filtered call that found nothing is about to say "none". Before it
+  // does, ask the server what it actually registers. Bounded to this one case,
+  // so the common paths pay nothing.
+  if (models.length === 0 && modelType !== undefined && coverage.answered.includes(modelType)) {
+    coverage.otherRegisteredCategories = await otherRegisteredCategories(modelType);
+  }
   return { models, coverage };
+}
+
+/**
+ * Categories this ComfyUI registers, minus the one already asked about (#962).
+ *
+ * Undefined on any failure: "we could not ask" must not render as "there is
+ * nowhere else to look", which is the same fold the coverage type exists for.
+ */
+async function otherRegisteredCategories(asked: string): Promise<string[] | undefined> {
+  try {
+    const res = await getClient().fetchApi("/models");
+    if (!res.ok) return undefined;
+    const json = (await res.json()) as unknown;
+    if (!Array.isArray(json)) return undefined;
+    return [
+      ...new Set(
+        json.filter(
+          (c): c is string => typeof c === "string" && c.trim() !== "" && c !== asked,
+        ),
+      ),
+    ];
+  } catch (err) {
+    logger.debug("could not read the registered category list for an empty filtered listing", {
+      err,
+    });
+    return undefined;
+  }
 }
 
 export async function listLocalModels(

@@ -1110,7 +1110,29 @@ export function describeEmptyModelListing(
 ): string {
   const scope = modelType ? `${modelType} models` : "local models";
   if (coverage.unanswered.length === 0) {
-    // Verified: the server was asked and said zero.
+    // Verified: the server was asked and said zero. For a FILTERED call that is
+    // a true statement about ONE folder, and #962 is what it costs when it is
+    // read as a fact about the install: a reporter's UNETLoader was loading
+    // krastBf16_v3.safetensors while "diffusion_models" and "unet" both
+    // answered 200 with []. The weights were registered under neither name.
+    //
+    // The unfiltered path discovers every registered category; a filtered one
+    // skips discovery precisely because it "already names its exact category".
+    // So say which other folders this server actually has.
+    const others = coverage.otherRegisteredCategories;
+    if (modelType && others !== undefined && others.length > 0) {
+      const shown = others.slice(0, 20).join(", ");
+      const more = others.length > 20 ? `, …and ${others.length - 20} more` : "";
+      return (
+        `No models in "${modelType}" — ComfyUI answered for that category and it is empty.\n\n` +
+        `That is a fact about ONE folder, not about this install. This server also registers: ` +
+        `${shown}${more}.\n\n` +
+        `Weights a custom node, a fork, or an extra_model_paths entry registered under another ` +
+        `key are loadable in a workflow while being absent from "${modelType}" — so if a loader ` +
+        `on the canvas is offering a file, it is coming from one of those. Run list_local_models ` +
+        `with NO model_type to list every registered category, or name one of the above.`
+      );
+    }
     return modelType ? `No ${modelType} models found.` : "No local models found.";
   }
 

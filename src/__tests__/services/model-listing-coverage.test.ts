@@ -279,3 +279,105 @@ describe("#1015: an unparsable category body is described from what was observed
     expect(coverage.unanswered[0].reason).not.toMatch(/Unexpected end of JSON input/);
   });
 });
+
+// #962 — a filtered empty is a true statement about the WRONG folder.
+//
+// A reporter called list_local_models({model_type:"diffusion_models"}) and
+// {"unet"} against a remote server whose UNETLoader was loading
+// krastBf16_v3.safetensors at that moment. Both answered 200 with [], honestly:
+// the weights are registered under neither name. The unfiltered path discovers
+// every registered category; a filtered one skips discovery precisely because it
+// "already names its exact category" — which is what makes the answer misleading.
+describe("#962: a filtered empty says where else to look", () => {
+  /** `/models` lists categories; `/models/<dir>` lists that category's files. */
+  function serverWith(categories: string[], filesByCat: Record<string, string[]> = {}) {
+    getClient.mockReturnValue({ fetchApi });
+    fetchApi.mockImplementation(async (path: string) => {
+      if (path === "/models") return new Response(JSON.stringify(categories), { status: 200 });
+      const cat = path.replace(/^\/models\//, "");
+      return new Response(JSON.stringify(filesByCat[cat] ?? []), { status: 200 });
+    });
+    readdir.mockRejectedValue(new Error("ENOENT"));
+  }
+
+  it("collects the OTHER registered categories when the asked-for one is empty", async () => {
+    serverWith(["diffusion_models", "unet_gguf", "checkpoints"]);
+    const { models, coverage } = await listLocalModelsWithCoverage("diffusion_models");
+    expect(models).toEqual([]);
+    // The asked-for category is excluded — repeating it back is not a lead.
+    expect(coverage.otherRegisteredCategories).toEqual(["unet_gguf", "checkpoints"]);
+  });
+
+  it("does NOT pay for the extra call when the listing found something", async () => {
+    serverWith(["diffusion_models", "checkpoints"], { diffusion_models: ["a.safetensors"] });
+    const { models, coverage } = await listLocalModelsWithCoverage("diffusion_models");
+    expect(models.length).toBe(1);
+    expect(coverage.otherRegisteredCategories).toBeUndefined();
+    expect(fetchApi.mock.calls.filter((c) => c[0] === "/models")).toHaveLength(0);
+  });
+
+  it("leaves it UNDEFINED when the category list cannot be read", async () => {
+    // "Could not ask" must not render as "there is nowhere else to look" — the
+    // same fold this coverage type exists to prevent.
+    getClient.mockReturnValue({ fetchApi });
+    fetchApi.mockImplementation(async (path: string) =>
+      path === "/models"
+        ? new Response("nope", { status: 503 })
+        : new Response("[]", { status: 200 }),
+    );
+    readdir.mockRejectedValue(new Error("ENOENT"));
+    const { coverage } = await listLocalModelsWithCoverage("diffusion_models");
+    expect(coverage.otherRegisteredCategories).toBeUndefined();
+  });
+
+  it("does not ask at all for an UNFILTERED call — it already discovers them", async () => {
+    serverWith(["diffusion_models", "unet_gguf"]);
+    const { coverage } = await listLocalModelsWithCoverage();
+    expect(coverage.otherRegisteredCategories).toBeUndefined();
+  });
+});
+
+describe("#962: the message names the other categories instead of claiming none", () => {
+  const base = { answered: ["diffusion_models"], unanswered: [], usedFilesystem: false };
+
+  it("stops asserting an empty install, and points at the real folders", () => {
+    const text = describeEmptyModelListing("diffusion_models", {
+      ...base,
+      otherRegisteredCategories: ["unet_gguf", "checkpoints"],
+    });
+    // The sentence the reporter acted on.
+    expect(text).not.toMatch(/^No diffusion_models models found\.$/);
+    expect(text).toMatch(/fact about ONE folder, not about this install/);
+    expect(text).toMatch(/unet_gguf/);
+    expect(text).toMatch(/checkpoints/);
+    // And the two ways out.
+    expect(text).toMatch(/NO model_type/);
+  });
+
+  it("keeps the plain sentence when the server registers nothing else", () => {
+    // Genuinely the only category: "none" is then the whole truth and extra
+    // hedging would be noise.
+    const text = describeEmptyModelListing("diffusion_models", {
+      ...base,
+      otherRegisteredCategories: [],
+    });
+    expect(text).toBe("No diffusion_models models found.");
+  });
+
+  it("keeps the plain sentence when the category list could not be read", () => {
+    expect(describeEmptyModelListing("diffusion_models", base)).toBe(
+      "No diffusion_models models found.",
+    );
+  });
+
+  it("an UNANSWERED category still wins — that path says 'could not determine'", () => {
+    const text = describeEmptyModelListing("diffusion_models", {
+      answered: [],
+      unanswered: [{ dir: "diffusion_models", reason: "HTTP 503" }],
+      usedFilesystem: false,
+      otherRegisteredCategories: ["checkpoints"],
+    });
+    expect(text).toMatch(/Could not determine/);
+    expect(text).not.toMatch(/fact about ONE folder/);
+  });
+});
