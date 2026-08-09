@@ -25,6 +25,7 @@
 import { describe, expect, it } from "vitest";
 import { UiBridge } from "../../services/ui-bridge.js";
 import { unreachableReason, identityReason } from "../../orchestrator/fence-refusal.js";
+import { workflowIdentityParts } from "../../orchestrator/session-store.js";
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 import {
   buildPanelToolDefs,
@@ -302,6 +303,20 @@ describe("identityReason describes the check it actually performs (#1255)", () =
     expect(text).toContain("http://127.0.0.1:8188");
     expect(text).toMatch(/present and accepted/i);
     expect(text).toMatch(/does not compare it against a previously bound one/i);
+  });
+
+  it("owns its own premise: a present origin IS accepted by the gate", () => {
+    // The message asserts the origin was accepted and is not compared. Nothing
+    // in this file held that claim to the CODE -- a reviewer showed that adding
+    // a real origin comparison to workflowIdentityParts leaves all of these
+    // green, so the sentence could silently become false again. This pins it:
+    // a well-formed uuid with a present origin must produce an identity.
+    expect(
+      workflowIdentityParts({
+        workflowUuid: "11111111-2222-4333-8444-555555555555",
+        origin: "http://127.0.0.1:8188",
+      }),
+    ).toBeDefined();
   });
 
   it("still routes an AMBIGUOUS turn to its own branch, unchanged", () => {
