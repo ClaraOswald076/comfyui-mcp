@@ -1064,6 +1064,28 @@ export function requiresWorkflowStampEnforcement(cmd: { cmd?: unknown }): boolea
  * Never below the read bound: see the invariant test.
  */
 export const BRIDGE_DEFAULT_TIMEOUT_MS = 20_000;
+
+/**
+ * How long after a headless client's socket closes it still counts as present
+ * for the #875 restart-deferral gate (#1176).
+ *
+ * Chosen from what the window has to cover and what it costs if it is wrong.
+ *
+ * It must cover: a phone whose screen went off, which the mobile OS suspends
+ * within seconds and which reconnects when the user next picks it up. That is a
+ * pocket interval — minutes to hours, unbounded in principle.
+ *
+ * It costs: a deferred auto-update, for this long, after a phone genuinely
+ * leaves. Nothing is lost — the update applies at the next check — so the price
+ * of being generous is a delay, while the price of being stingy is the reported
+ * bug: a rotated tunnel hostname and a phone that cannot get back in.
+ *
+ * Asymmetric, so lean generous. Thirty minutes covers a meeting or a commute and
+ * still lets an install that has truly lost its phone update within the hour,
+ * with no unpairing step and no user action — which is the property that made the
+ * sticky `isHeadless()` unacceptable for this gate.
+ */
+export const HEADLESS_RECENCY_MS = 30 * 60_000;
 /** More tolerant default for a READ (idempotent) command with no explicit timeout.
  *  A legitimately busy-but-alive panel main thread — e.g. Preview3D parsing a large
  *  FBX — can take many seconds to service a graph_query; failing it at the tight
@@ -2345,6 +2367,12 @@ export class UiBridge {
       let wasPrimary = false;
       if (tabId && this.conns.get(tabId)?.sock === sock) {
         wasPrimary = true;
+        // #1176 — start the recency clock BEFORE the conn is dropped, while its
+        // `headless` flag is still readable. This is the only place that knows a
+        // headless socket just closed; after the delete the information is gone.
+        if (this.conns.get(tabId)?.headless === true) {
+          this.lastHeadlessDisconnectAt = performance.now();
+        }
         this.conns.delete(tabId);
         if (this.lastActiveTabId === tabId) this.setLastActiveTab(null);
         // The mirrored desktop tab is gone — detach its viewers so their input
@@ -2756,7 +2784,63 @@ export class UiBridge {
    */
   hasLiveHeadlessClient(): boolean {
     for (const c of this.conns.values()) if (c.headless === true) return true;
-    return false;
+    // #1176 — A BACKGROUNDED PHONE IS NOT A DEPARTED PHONE.
+    //
+    // `conns` holds currently-OPEN sockets. A phone at work with its screen off
+    // has had its WebSocket suspended or closed by the mobile OS, so the loop
+    // above answers false and the restart gate opens — and the restart mints a
+    // NEW cloudflared hostname. A reporter picked their phone up to:
+    //
+    //   Failed host lookup: 'cameron-timing-face-spies.trycloudflare.com'
+    //   (No address associated with hostname, errno = 7)
+    //
+    // Not a timeout and not a refusal: the hostname no longer existed.
+    //
+    // The sticky `isHeadless()` was rejected for this gate, correctly — a phone
+    // that paired once and left would defer updates forever. But "socket open
+    // right now" and "ever paired" are not the only options, and the state
+    // between them is not an edge case: a phone in a pocket is the EXPECTED
+    // condition for someone who paired it to use at work.
+    //
+    // So: a bounded recency window. It keeps the property that killed the sticky
+    // option — a phone that genuinely left stops deferring, on its own, without
+    // anyone unpairing anything — while covering the normal mobile case.
+    return this.recentHeadlessWithin(HEADLESS_RECENCY_MS);
+  }
+
+  /** Was a headless client connected within `ms`? (#1176) Reads the disconnect
+   *  clock, so it answers true for a phone whose socket the OS suspended and
+   *  false for one that has genuinely been gone longer than the window. */
+  private recentHeadlessWithin(ms: number): boolean {
+    if (this.lastHeadlessDisconnectAt === undefined) return false;
+    return performance.now() - this.lastHeadlessDisconnectAt < ms;
+  }
+
+  /**
+   * When a headless client last held an open socket (#1176), on the MONOTONIC
+   * clock — `performance.now()`, not `Date.now()`.
+   *
+   * This measures ELAPSED TIME, and the wall clock is not a measure of elapsed
+   * time: an NTP correction can move it. On Windows a step of more than the
+   * window would make a phone that disconnected seconds ago look long gone, and
+   * the restart would rotate the tunnel hostname — the exact bug this window
+   * exists to prevent, reintroduced by the clock rather than by the logic. A
+   * backward step would defer far longer than intended. (codex review, PR #1185)
+   *
+   * `performance.now()` is monotonic from process start, which is the right
+   * lifetime here: the value is only ever compared against another reading from
+   * the same process, and a restart clears it — after which there is no phone
+   * this process has seen, which is the correct answer anyway.
+   *
+   * Undefined until a headless client actually disconnects, so an install that
+   * has never seen a phone can never defer.
+   */
+  private lastHeadlessDisconnectAt: number | undefined;
+
+  /** Test seam: place the recency clock in the past without sleeping. Takes a
+   *  `performance.now()`-based reading, matching the field. */
+  markHeadlessDisconnectForTests(at: number): void {
+    this.lastHeadlessDisconnectAt = at;
   }
 
   isHeadless(tabId: string): boolean {
