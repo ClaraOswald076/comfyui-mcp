@@ -1218,7 +1218,14 @@ describe("UiBridge (multi-tab)", () => {
       // Even a DIRECT repin call must refuse: the pin reaches a live tab, so
       // there is nothing to recover from — moving it would re-aim the running
       // turn's tool calls at a workflow it was never about.
-      expect(bridge.repinScopeToActive(SHARED_SESSION_SCOPE)).toBeUndefined();
+      // #1077 Finding 2 — the refusal now carries WHY. What matters here is
+      // unchanged (no tab id came back, the pin did not move); it now also says
+      // the pin is healthy, which is the whole point of distinguishing this
+      // correct refusal from the ones a user can act on.
+      const declined = bridge.repinScopeToActive(SHARED_SESSION_SCOPE);
+      expect(typeof declined).not.toBe("string");
+      expect(declined).toMatchObject({ repinned: false });
+      expect((declined as { reason: string }).reason).toMatch(/still reaches a live tab/);
       expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json");
       const still = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
       expect(still).toMatchObject({ from: "tab-a" });

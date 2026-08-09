@@ -4946,7 +4946,7 @@ export interface PanelToolCtx {
      *  panel_reload's unconditional call was silently repinning healthy turns
      *  onto whichever tab was last active). Real-tab ctxs ignore this flag. */
     scopeRecoveryConsent?: boolean;
-  }) => { previous: string; current: string; rebound: boolean };
+  }) => { previous: string; current: string; rebound: boolean; repinRefusal?: string };
   /**
    * Best-effort in-place self-heal for the handful of tools that call the bridge
    * DIRECTLY (not via `ctx.call`) — e.g. panel_request_adult_consent's ask_user
@@ -5436,7 +5436,7 @@ export function makePanelToolCtx(
   // active tab can't be picked.
   const rebindToActiveTab = (opts?: {
     scopeRecoveryConsent?: boolean;
-  }): { previous: string; current: string; rebound: boolean } => {
+  }): { previous: string; current: string; rebound: boolean; repinRefusal?: string } => {
     const previous = ctx.tabId;
     // #884 P0 — a SCOPE-bound ctx must never be REPLACED by a real tab id (that
     // would permanently narrow the shared conversation's routing to one tab).
@@ -5463,8 +5463,22 @@ export function makePanelToolCtx(
       if (!opts?.scopeRecoveryConsent || !pinProvenDead) {
         return { previous, current: previous, rebound: false };
       }
-      const repinned = bridge.repinScopeToActive?.(previous);
-      return { previous, current: previous, rebound: Boolean(repinned) };
+      // #1077 Finding 2 — carry the REASON out when nothing was repinned. This
+      // collapsed to `Boolean(repinned)`, so four different refusals arrived at
+      // the caller as one bare `false` and the user was told only that the
+      // adoption was refused. One of those refusals repeats forever (an active
+      // tab on another backend's conversation while this one has several), and
+      // nothing in the reply hinted that naming a workflow is the way out.
+      const outcome = bridge.repinScopeToActive?.(previous);
+      const repinned = typeof outcome === "string" ? outcome : undefined;
+      const repinRefusal =
+        outcome && typeof outcome === "object" ? outcome.reason : undefined;
+      return {
+        previous,
+        current: previous,
+        rebound: Boolean(repinned),
+        ...(repinRefusal ? { repinRefusal } : {}),
+      };
     }
     // A healthy binding is left untouched (never disturb a live session). Recovery only
     // fires for an orphaned/stale tab id.
@@ -8946,7 +8960,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // THE explicit scope-recovery consent (#884 gate 3) — the only
             // caller that may escape a DEAD scope pin (a healthy pin still
             // stays put; see rebindToActiveTab's double gate).
-            ctx.rebindToActiveTab({ scopeRecoveryConsent: true });
+            const rebind = ctx.rebindToActiveTab({ scopeRecoveryConsent: true });
+            // #1077 Finding 2 — a scope repin that declined now says WHY, and
+            // this is where the user reads it. The refusal used to be a bare
+            // boolean, so a session stuck in the one state that repeats forever
+            // (the active tab belongs to another backend's conversation while
+            // this one has several eligible tabs) saw no difference from a
+            // healthy pin being correctly left alone.
+            if (rebind?.repinRefusal) {
+              rebindNote += ` The session pin was NOT moved: ${rebind.repinRefusal}.`;
+            }
           } catch (err) {
             // #474: with 2+ live tabs the rebind is AMBIGUOUS — fail so the user picks.
             // But with ZERO tabs connected (the "Connected: none" window right after a

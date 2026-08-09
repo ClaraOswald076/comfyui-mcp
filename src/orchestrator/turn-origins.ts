@@ -516,6 +516,17 @@ export interface ScopeRepinBridge {
  *    otherwise the backend's SOLE interactive tab; 2+ candidates without a
  *    clear active one refuse rather than guess.
  */
+/**
+ * What an explicit `mode:"current"` repin did — or, when it did nothing, WHY
+ * (#1077 Finding 2).
+ *
+ * A bare `undefined` was indistinguishable across four different refusals, and
+ * the caller collapsed it to `rebound: false`. A session wedged on any of them
+ * saw only "the adoption was REFUSED" and had no way to tell a healthy pin it
+ * should leave alone from an ambiguity it could resolve by naming a workflow.
+ */
+export type ScopeRepinOutcome = string | { repinned: false; reason: string } | undefined;
+
 export function makeScopeRepinHandler(opts: {
   bridge: ScopeRepinBridge;
   tracker: TurnOriginTracker;
@@ -523,7 +534,7 @@ export function makeScopeRepinHandler(opts: {
   backendForTab: (tabId: string) => string;
   backendOfKey: (key: string) => string;
   info: (msg: string) => void;
-}): (scopeId: string) => string | undefined {
+}): (scopeId: string) => ScopeRepinOutcome {
   return (scopeId) => {
     const key = opts.scopeAgentKeyOf(scopeId);
     // RECOVERY ONLY: a pin that still reaches a live tab OF THIS conversation
@@ -534,7 +545,13 @@ export function makeScopeRepinHandler(opts: {
     // against the resolution-time refusal (codex gate-4 delta).
     const existing = opts.tracker.resolvedPinOf(key);
     if (typeof existing === "string" && opts.bridge.canReach(existing)) {
-      return undefined;
+      return {
+        repinned: false,
+        reason:
+          `the existing pin (${existing.slice(0, 8)}) still reaches a live tab of this ` +
+          `conversation, so it is healthy and was left alone — this recovery only displaces a ` +
+          `pin that is dead or ambiguous`,
+      };
     }
     const backend = opts.backendOfKey(key);
     const eligible = opts.bridge
@@ -548,7 +565,35 @@ export function makeScopeRepinHandler(opts: {
         : eligible.length === 1
           ? eligible[0]
           : undefined;
-    if (!tab) return undefined;
+    // #1077 Finding 2 — SAY WHY. Every refusal above and below returned a bare
+    // `undefined`, which the caller collapsed to `rebound: false`, so a session
+    // stuck here was told only that the adoption was refused. The reporter could
+    // not tell which branch fired and had no orchestrator log to read; they
+    // refreshed, closed and reopened the tab, and finally traced it to source.
+    //
+    // The state worth naming is the last one: `active` exists but belongs to a
+    // DIFFERENT backend's conversation while this one has two or more tabs. That
+    // is reachable in ordinary multi-tab use, it repeats on every retry, and
+    // nothing in the old reply hinted that targeting a workflow explicitly is the
+    // way out.
+    if (!tab) {
+      if (eligible.length === 0) {
+        return {
+          repinned: false,
+          reason:
+            `no connected tab belongs to this conversation's backend (${backend}) — ` +
+            `every eligible tab is either headless or bound to another backend`,
+        };
+      }
+      return {
+        repinned: false,
+        reason:
+          `this conversation has ${eligible.length} eligible tabs and the active one ` +
+          `(${active ? active.slice(0, 8) : "none"}) is not among them, so "current" does not ` +
+          `identify which to bind. Name the workflow instead — panel_set_workflow_target with a ` +
+          `path, or panel_open_workflow — and the pin follows it`,
+      };
+    }
     opts.tracker.repinTo(key, tab);
     opts.info(
       `[panel-orchestrator] ${key} re-pinned onto ${tab.slice(0, 8)} by explicit target request (#884 recovery)`,
