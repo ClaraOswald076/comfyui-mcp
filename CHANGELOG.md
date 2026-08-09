@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.47] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- a non-JSON /prompt reply states the delivery doubt instead of a parser message (#1179)
+- hold a turn's temp images past the turn, so a deferred read still finds them (#1177)
+
+
 ## [0.50.46] - 2026-08-08
 
 ### MCP

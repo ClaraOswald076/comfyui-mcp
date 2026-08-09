@@ -476,11 +476,41 @@ export async function enqueuePrompt(
   if (!res.ok) {
     throw await buildEnqueueError(res);
   }
-  const data = (await res.json()) as {
-    prompt_id: string;
-    number?: number;
-    node_errors?: Record<string, unknown>;
-  };
+  // A bare res.json() here is the worst place in the codebase for one, and the
+  // same family as #1149/#1160/#828. This is a MUTATING POST that already
+  // succeeded at the HTTP layer: if the body will not parse, the prompt may well
+  // be queued and running, and `Unexpected end of JSON input` says nothing about
+  // that — a caller reads it as "the run failed" and re-submits, queueing the
+  // render twice.
+  //
+  // So: classify what actually answered (readComfyJson names the URL, status,
+  // content type and body prefix), and state the delivery doubt explicitly. The
+  // expectShape check is what catches the shape that matters — a gateway's own
+  // JSON error envelope is valid JSON with no prompt_id, and reading
+  // `data.prompt_id` off it would hand back `undefined` as a prompt id and let
+  // every downstream poll chase a job that was never queued.
+  let data: { prompt_id: string; number?: number; node_errors?: Record<string, unknown> };
+  try {
+    data = await readComfyJson<{
+      prompt_id: string;
+      number?: number;
+      node_errors?: Record<string, unknown>;
+    }>(res, {
+      url: "/prompt",
+      expectShape: (v: unknown) =>
+        !!v && typeof v === "object" && typeof (v as { prompt_id?: unknown }).prompt_id === "string",
+      shapeHint: "the enqueue result ({ prompt_id, … })",
+    });
+  } catch (err) {
+    throw new ComfyUIError(
+      `${err instanceof Error ? err.message : String(err)} ` +
+        `OUTCOME UNDETERMINED: the POST to /prompt was accepted (HTTP ${res.status}) and the ` +
+        `workflow MAY ALREADY BE QUEUED — this is not proof it failed. Check queue ` +
+        `(action:"status") or get_history BEFORE re-submitting; a blind retry can run the ` +
+        `same workflow twice.`,
+      "ENQUEUE_UNVERIFIED",
+    );
+  }
   // NB: `data.number` is ComfyUI's monotonic priority counter (and is NEGATIVE
   // for front-inserted jobs) — NOT the remaining queue depth. The old SDK path
   // returned exec_info.queue_remaining; to preserve an accurate count now that
