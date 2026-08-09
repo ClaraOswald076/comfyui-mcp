@@ -1187,6 +1187,47 @@ async function probeDeclineRecovery(
  *     Origin carries NO path, a boot target mounted under a basePath fails path-aware
  *     identity and is (soundly) fail-closed to dispatched-unconfirmed.
  */
+/**
+ * #851 — what to tell the caller about `restart_comfyui` when the panel's confirmation
+ * card timed out.
+ *
+ * The old text recommended it unconditionally. It targets COMFYUI_URL, not the ComfyUI
+ * the panel runs inside, so a reporter who followed that advice aimed a restart at a
+ * different server than the one they had been working on — and got "No ComfyUI process
+ * found on port 8188" while the panel was working fine on the live canvas.
+ *
+ * `panelBase` comes from captureRebootHealthBase(), which is a PROOF rather than a
+ * comparison: null in remote/cloud mode, and whenever the tab's origin cannot be shown
+ * to front the local boot instance. "Unproven" is deliberately NOT folded into
+ * "different" — that would fire the warning on ordinary remote installs where the two
+ * ARE the same server, trading a wrong recommendation for a wrong alarm.
+ *
+ * Pure, so the three-way decision is testable without a live panel.
+ */
+export function restartTimeoutFallbackAdvice({
+  headlessBase,
+  panelBase,
+}: {
+  headlessBase: string;
+  panelBase: string | null;
+}): string {
+  if (panelBase != null && sameHttpBase(headlessBase, panelBase)) {
+    return "or use restart_comfyui to restart the server directly without a panel card.";
+  }
+  if (panelBase != null) {
+    return (
+      `Do NOT reach for restart_comfyui here without checking: it targets ${headlessBase}, ` +
+      `while this panel is running inside ${panelBase}. Restarting the first would hit a ` +
+      "different server than the one you have been working on — and may find nothing there at all."
+    );
+  }
+  return (
+    `or use restart_comfyui, which restarts ${headlessBase} directly without a panel ` +
+    "card — check that this is the same ComfyUI you have been working on, since I " +
+    "could not confirm which one this panel is running inside."
+  );
+}
+
 function captureRebootHealthBase(ctx: PanelToolCtx): string | null {
   if (isCloudMode() || isRemoteMode()) return null;
   const bootBase = getBootLocalComfyUIBaseUrl(); // server-authorized, hello-immutable
@@ -9573,12 +9614,27 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           confirmBudget,
         );
         if (decision === "timeout") {
+          // #851 — the fallback used to be recommended unconditionally, and
+          // `restart_comfyui` targets COMFYUI_URL, NOT the ComfyUI the panel is
+          // running inside. A reporter followed this advice against a panel driving a
+          // different server and got `No ComfyUI process found on port 8188` while the
+          // panel was working fine on the live canvas — a restart aimed at the wrong
+          // machine, recommended by a call that never checked which machine that was.
+          //
+          // The information was already here and simply not consulted on this branch:
+          // captureRebootHealthBase() is the origin the PANEL answers on, and the
+          // adjacent decline branch already reads it. Only recommend the headless tool
+          // when it provably points at the same server; otherwise name both and say
+          // plainly that this call did not verify the other one.
+          const fallback = restartTimeoutFallbackAdvice({
+            headlessBase: getComfyUIBaseUrl(),
+            panelBase: captureRebootHealthBase(ctx),
+          });
           return ok(
             `No confirmation received within ${Math.round(confirmBudget / 1000)}s, so I did NOT ` +
               "restart ComfyUI. The panel tab may be backgrounded or still reconnecting after a " +
               "previous restart, so the confirmation card wasn't answered. Tell me to restart it " +
-              "and I'll re-ask, or use restart_comfyui to restart the server directly without a " +
-              "panel card.",
+              `and I'll re-ask. ${fallback}`,
           );
         }
         if (decision !== "yes") {
