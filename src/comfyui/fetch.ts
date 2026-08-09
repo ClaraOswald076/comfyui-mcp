@@ -2,7 +2,7 @@ import { getComfyUIAuthHeaders } from "../config.js";
 import { describeFetchFailure, isBareFetchFailure } from "../utils/errors.js";
 
 /** The request target, for the diagnostic. Never throws on an odd input. */
-function targetOf(input: string | URL | Request): string {
+export function targetOf(input: string | URL | Request): string {
   try {
     if (typeof input === "string") return input;
     if (input instanceof URL) return input.href;

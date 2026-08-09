@@ -18,8 +18,11 @@ import { comfyuiFetch } from "./fetch.js";
 import {
   classifyNonJson,
   fetchComfyJson,
+  guardClientFetch,
+  isNonJsonResponseError,
   looksLikeHtmlParsedAsJson,
   NonJsonResponseError,
+  provesNonJsonAnswer,
   readComfyJson,
   redactErrorMessage,
   rethrowWithJsonDiagnosis,
@@ -81,7 +84,12 @@ export function getClient(): Client {
       clientId: "comfyui-mcp",
       // Inject generic auth headers (COMFYUI_AUTH_*) on the library's own HTTP
       // calls; a no-op when unset. Node 22+ provides global WebSocket.
-      fetch: comfyuiFetch,
+      //
+      // Wrapped so the library's non-2xx path — which calls `res.json()` on the
+      // ERROR body and lets a bare SyntaxError replace its own error, losing the
+      // status and the URL with it — reports what actually answered instead
+      // (#828, #1160). See guardClientFetch.
+      fetch: guardClientFetch(comfyuiFetch),
     });
     logger.info("ComfyUI client created", {
       host: getComfyUIApiHost(),
@@ -266,7 +274,14 @@ export async function getObjectInfo(): Promise<ObjectInfo> {
         // only the retry would downgrade a known #828 diagnosis to "server
         // unavailable" and send the user to check whether ComfyUI is running
         // (codex gate, round 8, finding 2).
-        const toReport = looksLikeHtmlParsedAsJson(retryErr) ? retryErr : looksLikeHtmlParsedAsJson(err) ? err : retryErr;
+        //
+        // `provesNonJsonAnswer`, not `looksLikeHtmlParsedAsJson`: since
+        // guardClientFetch the library's parse failure arrives as a
+        // NonJsonResponseError carrying no parser text, so the old predicate
+        // answered "no" for the strongest evidence available and this picker
+        // fell through to `retryErr` every time — reintroducing the very
+        // downgrade round 8 fixed.
+        const toReport = provesNonJsonAnswer(retryErr) ? retryErr : provesNonJsonAnswer(err) ? err : retryErr;
         return await rethrowWithJsonDiagnosis(toReport, `${getComfyUIBaseUrl()}/object_info`);
       }
     }
@@ -730,6 +745,12 @@ export async function getLogs(): Promise<string[]> {
     try {
       text = await getClient().fetchApi("/internal/logs").then((r) => r.text());
     } catch (err2) {
+      // A DIAGNOSED non-JSON answer is not a connection failure — the server (or
+      // whatever is in front of it) replied, and the diagnosis already names the
+      // endpoint, the status and what answered. Wrapping it in a ConnectionError
+      // titled "Failed to fetch" contradicted its own contents and sent readers
+      // to check whether ComfyUI was up when it demonstrably was (#828).
+      if (isNonJsonResponseError(err2)) throw err2;
       const detail = err2 instanceof Error ? err2.message : String(err2);
       throw new ConnectionError(
         `Failed to fetch ComfyUI logs after reconnect retry: ${detail}`,
@@ -841,6 +862,7 @@ export async function getSetting(id: string): Promise<unknown> {
       classifyNonJson({
         url,
         status: res.status,
+        statusText: res.statusText,
         contentType: res.headers.get("content-type") ?? "",
         body: text,
       }),
