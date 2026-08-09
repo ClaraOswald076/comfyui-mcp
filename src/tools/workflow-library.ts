@@ -556,18 +556,24 @@ async function getWorkflowAction(filename: string, format: "ui" | "api"): Promis
           // An agent told its workflow does not exist is one step from recreating
           // or overwriting it, and before #385 made this reachable the user got a
           // neutral transport error instead. Only 404 may claim absence.
+          //
+          // The non-404 case THROWS rather than returning text (round-2 review
+          // residual 1). A plain TextResult leaves `isError` unset, so the
+          // orchestrator reports `ok: true` and the Ollama/Grok/ChatGPT backends
+          // mark the call succeeded — the machine-readable flag contradicting the
+          // prose. Pre-PR a 502 threw and surfaced as `ok: false`; throwing keeps
+          // that, and the handler's own `catch` renders it identically to this
+          // block's three siblings. The 404 wording stays a return, byte for byte,
+          // because a test pins it.
+          if (res.status !== 404) {
+            throw new ValidationError(
+              `Could NOT read "${filename}": the server answered ${describeStatus(res.status, res.statusText)}. ` +
+                `That is NOT a report that the workflow is missing — nothing was read. Do not recreate it on ` +
+                `the strength of this; check the server with get_system_stats (action:"health") first.`,
+            );
+          }
           return {
-            content: [
-              {
-                type: "text",
-                text:
-                  res.status === 404
-                    ? `Workflow not found: ${filename} (404)`
-                    : `Could NOT read "${filename}": the server answered ${describeStatus(res.status, res.statusText)}. ` +
-                      `That is NOT a report that the workflow is missing — nothing was read. Do not recreate it on ` +
-                      `the strength of this; check the server with get_system_stats (action:"health") first.`,
-              },
-            ],
+            content: [{ type: "text", text: `Workflow not found: ${filename} (404)` }],
           };
         }
 
