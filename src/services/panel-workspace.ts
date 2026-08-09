@@ -203,6 +203,29 @@ let cached:
  */
 let clearEpoch = 0;
 
+/**
+ * Forget the resolved base, countably (#1222).
+ *
+ * The one way to clear it deliberately. A bare `cached = undefined` at a fourth
+ * call site would reintroduce the whole bug silently — the clear would happen and
+ * an in-flight probe would put its pre-clear answer straight back — so the count
+ * lives with the assignment rather than next to it.
+ *
+ * NOT used by the retarget bail inside `primePanelBase`. That one is discarding
+ * its OWN answer because the target moved, and the target/generation checks
+ * already stop anyone acting on it. Bumping there would additionally stop a
+ * CONCURRENT probe against the new target from caching a result that is
+ * perfectly good — which costs a re-probe rather than correctness, so it is a
+ * deliberate scope line and not a safety one. Stated that way because it is not
+ * pinned by a test: mutating it to bump changes no observable answer, only how
+ * often the next caller re-resolves, and a test asserting that would be pinning
+ * a performance detail as though it were a contract.
+ */
+function forgetResolvedBase(): void {
+  cached = undefined;
+  clearEpoch += 1;
+}
+
 /** Cache key: which ComfyUI this resolution describes. Never throws. */
 function targetKey(): string {
   try {
@@ -375,9 +398,8 @@ export function lastPanelBaseResolution(): PanelBaseResolution | undefined {
  * exactly like a real regression.
  */
 export function __resetPanelBaseCache(): void {
-  cached = undefined;
   diskObservation = undefined;
-  clearEpoch += 1;
+  forgetResolvedBase();
 }
 
 /**
@@ -477,7 +499,12 @@ export function clearPanelDiskObservation(): void {
   // restarted with different launch flags — and therefore a different
   // custom_nodes — so keeping the previous root cached would let the very next
   // operation freeze the wrong tree.
-  cached = undefined;
+  //
+  // #1222 — through `forgetResolvedBase`, because an in-flight probe that
+  // started BEFORE this hello would otherwise write the pre-restart root back in
+  // a moment later, which is precisely the freezing this exists to prevent. That
+  // is a PRODUCTION path, not only a test one: the clear runs on every hello.
+  forgetResolvedBase();
 }
 
 /**

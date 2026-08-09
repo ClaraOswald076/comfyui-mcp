@@ -39,6 +39,7 @@ const {
   lastPanelBaseResolution,
   __resetPanelBaseCache,
   __setPanelBaseForTests,
+  clearPanelDiskObservation,
 } = await import("../../services/panel-workspace.js");
 
 beforeEach(() => {
@@ -125,6 +126,39 @@ describe("a clear beats a probe that started before it (#1222)", () => {
     const inFlight = primePanelBase({ force: true });
     __resetPanelBaseCache();
     __resetPanelBaseCache();
+    await inFlight;
+
+    expect(lastPanelBaseResolution()).toBeUndefined();
+  });
+});
+
+// CODEX REVIEW asked which OTHER paths clear the cache, and found a production
+// one: `clearPanelDiskObservation()` also drops the resolved base, and it runs on
+// every panel hello — the moment ComfyUI may have restarted with different launch
+// flags and therefore a different custom_nodes tree. Its own comment says keeping
+// the previous root would "let the very next operation freeze the wrong tree",
+// which is exactly what an in-flight probe does when it writes its pre-hello
+// answer back in a moment later. Tests were covered by __resetPanelBaseCache;
+// production was not.
+describe("a hello's clear also beats an in-flight probe (#1222)", () => {
+  it("clearPanelDiskObservation is not undone by a probe that predates it", async () => {
+    __setPanelBaseForTests("/pre-restart/base");
+    const inFlight = primePanelBase({ force: true });
+
+    clearPanelDiskObservation();
+    expect(lastPanelBaseResolution(), "the hello cleared it").toBeUndefined();
+
+    await inFlight;
+
+    expect(
+      lastPanelBaseResolution(),
+      "the pre-restart root must not be frozen back in",
+    ).toBeUndefined();
+  });
+
+  it("holds for the empty-cache start, the case reference comparison cannot see", async () => {
+    const inFlight = primePanelBase();
+    clearPanelDiskObservation();
     await inFlight;
 
     expect(lastPanelBaseResolution()).toBeUndefined();
