@@ -105,7 +105,12 @@ function selectRunToDiagnose(
   return selectNewestHistoryEntry(history);
 }
 
-function formatHistoryEntry(
+/** #1229 — per-value cap for a non-media history output. Generous enough for a
+ *  diagnostic string, small enough that a runaway value cannot dominate the
+ *  reply; anything longer is clipped WITH a note saying so. */
+const PER_OUTPUT_VALUE_CHARS = 800;
+
+export function formatHistoryEntry(
   promptId: string,
   entry: HistoryEntry,
 ): string {
@@ -207,8 +212,32 @@ function formatHistoryEntry(
       if (expanded.length > 0) {
         lines.push(`- Node ${nodeId}: ${expanded.join("; ")}`);
       } else {
-        const outputTypes = Object.keys(output);
-        lines.push(`- Node ${nodeId}: ${outputTypes.join(", ")}`);
+        // #1229 — show the VALUE, not just the key.
+        //
+        // This branch used to emit `Object.keys(output)`, so a PreviewAny result
+        // shaped `{ text: ["diagnostic details"] }` rendered as "Node 102: text".
+        // PreviewAny is a DIAGNOSTIC node: the value IS the answer, and dropping
+        // it silently left the caller unable to tell that anything was there.
+        //
+        // Rendered as a CLASS, not a `text` special case -- every custom node that
+        // names its output something else had the identical defect.
+        const parts = Object.entries(output).map(([key, value]) => {
+          const flat = Array.isArray(value)
+            ? value.map((v) => (typeof v === "string" ? v : JSON.stringify(v))).join(", ")
+            : typeof value === "string"
+              ? value
+              : JSON.stringify(value);
+          if (flat === undefined || flat === "") return key;
+          // Bounded, and it SAYS so. History can carry large values and this is
+          // read by an agent with a token budget -- eliding silently would
+          // recreate this very bug at a different threshold.
+          const clipped =
+            flat.length > PER_OUTPUT_VALUE_CHARS
+              ? `${flat.slice(0, PER_OUTPUT_VALUE_CHARS)}… [truncated, ${flat.length} chars total]`
+              : flat;
+          return `${key}: ${clipped}`;
+        });
+        lines.push(`- Node ${nodeId}: ${parts.join("; ")}`);
       }
     }
   }
