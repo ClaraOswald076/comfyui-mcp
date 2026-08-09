@@ -187,6 +187,22 @@ let cached:
   | { at: number; target: string; generation: number; resolution: PanelBaseResolution }
   | undefined;
 
+/**
+ * How many times the cache has been deliberately CLEARED (#1222).
+ *
+ * The in-flight guard below compares `cached` by reference to catch "a newer
+ * write landed while we were probing". That comparison has one blind spot, and
+ * it is the one that bites: a probe which STARTS with an empty cache records
+ * `undefined`, a clear leaves it `undefined`, and the two compare equal — so the
+ * clear is invisible and the stale probe writes its pre-clear answer in
+ * afterwards.
+ *
+ * A clear is an EVENT, not a value, so counting it is what makes it observable.
+ * `undefined → undefined` is indistinguishable by reference and unmistakable by
+ * count.
+ */
+let clearEpoch = 0;
+
 /** Cache key: which ComfyUI this resolution describes. Never throws. */
 function targetKey(): string {
   try {
@@ -263,6 +279,9 @@ export async function primePanelBase(
   // primePanelBase()` a refusal fires in the background did exactly that to a
   // base seeded after it started (#879 test isolation surfaced it).
   const cacheAtStart = cached;
+  // #1222 — and the CLEAR COUNT, because the reference comparison above cannot
+  // see a clear that leaves the cache as empty as it found it.
+  const clearEpochAtStart = clearEpoch;
 
   let resolution: PanelBaseResolution;
   try {
@@ -307,6 +326,20 @@ export async function primePanelBase(
     return cachedResolution() ?? resolution;
   }
 
+  // #1222 — the cache was deliberately CLEARED while this probe was in flight.
+  // Same rule as above and the same reason: this answer predates the clear, so
+  // writing it would silently undo an explicit "forget what you knew". The
+  // reference check misses it whenever the cache was already empty when the
+  // probe started, which is the common case — a refusal fires the background
+  // prime precisely because nothing was primed yet.
+  //
+  // The ANSWER is still returned: this caller asked and this is what the probe
+  // found. Only the shared cache is left alone, so the next caller re-resolves
+  // rather than inheriting a resolution someone asked to be forgotten.
+  if (clearEpoch !== clearEpochAtStart) {
+    return resolution;
+  }
+
   cached = { at: Date.now(), target: atTarget, generation: atGeneration, resolution };
   return resolution;
 }
@@ -331,10 +364,20 @@ export function lastPanelBaseResolution(): PanelBaseResolution | undefined {
   return cachedResolution();
 }
 
-/** Test hook — drop the cache so the next prime re-resolves. */
+/**
+ * Test hook — drop the cache so the next prime re-resolves.
+ *
+ * Bumps the clear epoch (#1222) so a probe already in flight cannot land its
+ * pre-clear answer afterwards. Without that, this hook cleared the cache and an
+ * unawaited background prime — the one a capability refusal fires — repopulated
+ * it seconds later, inside whichever test happened to be running. That produced
+ * three flakes whose only symptom was the wrong remedy WORDING, which reads
+ * exactly like a real regression.
+ */
 export function __resetPanelBaseCache(): void {
   cached = undefined;
   diskObservation = undefined;
+  clearEpoch += 1;
 }
 
 /**
