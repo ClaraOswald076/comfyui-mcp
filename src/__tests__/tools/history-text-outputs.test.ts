@@ -52,6 +52,94 @@ describe("get_history surfaces non-media output values (#1229)", () => {
     expect(out).toContain("type=output");
   });
 
+  it("KEEPS the value alongside media - the same bug survived one branch over", () => {
+    // Review HIGH 1, found on STOCK ComfyUI: SaveAnimatedWEBP emits
+    // {images, animated}; a captioner emits {images, text}. `expanded.length > 0`
+    // short-circuited, so a node carrying media AND a payload lost the payload
+    // exactly as #1229 described. Fixing only the no-media branch fixed only the
+    // case I happened to test.
+    const out = formatHistoryEntry(
+      "p1",
+      entryWith({
+        "2": {
+          images: [{ filename: "a.webp", subfolder: "", type: "output" }],
+          animated: [true],
+          text: ["caption here"],
+        },
+      }),
+    );
+    expect(out).toContain("a.webp");
+    expect(out).toContain("animated");
+    expect(out).toContain("caption here");
+  });
+
+  it("does not re-print a media key as a leftover", () => {
+    const out = formatHistoryEntry(
+      "p1",
+      entryWith({ "2": { images: [{ filename: "a.png", subfolder: "", type: "output" }] } }),
+    );
+    expect(out.split("a.png").length - 1).toBe(1);
+  });
+
+  it("RETAINS the leading content when it truncates", () => {
+    // Review HIGH 2: slice(0, 0) survived every test. The only truncation test
+    // asserted a length bound and the word "truncated", so the fix could keep
+    // ZERO characters, staple on a note, and stay green - #1229's exact failure
+    // mode with a label. The real PreviewAny payload measured in review was
+    // 7,695 chars for a blank 64x64 image, so the clip is the COMMON path for
+    // the very node this issue is about.
+    const body = "HEAD_MARKER" + "x".repeat(5000);
+    const out = formatHistoryEntry("p1", entryWith({ "3": { text: [body] } }));
+    expect(out).toContain("HEAD_MARKER");
+    expect(out).toContain("x".repeat(700));
+  });
+
+  it("pins the cap so it cannot be silently retuned", () => {
+    // 800 was unpinned across ~18..3900; a "tune" to 3800 was invisible.
+    const under = formatHistoryEntry("p1", entryWith({ "4": { text: ["y".repeat(800)] } }));
+    expect(under).not.toMatch(/truncated/i);
+    const over = formatHistoryEntry("p1", entryWith({ "4": { text: ["y".repeat(801)] } }));
+    expect(over).toContain("truncated, 801 chars total");
+  });
+
+  it("keeps array separators visible so entries cannot merge", () => {
+    const out = formatHistoryEntry("p1", entryWith({ "7": { tags: ["alpha", "beta"] } }));
+    expect(out).toContain("alpha, beta");
+  });
+
+  it("labels an empty value instead of rendering a bare key", () => {
+    // A bare key is character-identical to the #1229 symptom.
+    const out = formatHistoryEntry("p1", entryWith({ "8": { text: [], other: "" } }));
+    expect(out).toContain("(empty)");
+  });
+
+  it("does not split a surrogate pair at the cap", () => {
+    const emoji = String.fromCodePoint(0x1f600);
+    const out = formatHistoryEntry(
+      "p1",
+      entryWith({ "9": { text: ["z".repeat(799) + emoji + "tail"] } }),
+    );
+    expect((out as unknown as { isWellFormed?: () => boolean }).isWellFormed?.() ?? true).toBe(true);
+  });
+
+  it("serialises an OBJECT value, never [object Object]", () => {
+    // Surviving mutation from review: String(v) in place of JSON.stringify.
+    // This repo has a documented recurring [object Object] family, so a
+    // rendering path that can produce it must be pinned, not left to style.
+    const out = formatHistoryEntry("p1", entryWith({ "5": { meta: [{ seed: 42 }] } }));
+    expect(out).not.toContain("[object Object]");
+    expect(out).toContain("42");
+  });
+
+  it("keeps a multi-line value from shattering the bullet list", () => {
+    // The motivating use case is reading validation errors through a scratch
+    // PreviewAny, which are multi-line by nature; unindented spill put ~40 bare
+    // lines between two node bullets.
+    const out = formatHistoryEntry("p1", entryWith({ "6": { text: ["line1\nline2"] } }));
+    expect(out).toContain("    line1");
+    expect(out).toContain("    line2");
+  });
+
   it("SAYS when it truncated, rather than silently eliding", () => {
     // History can carry large values and this is read by an agent with a token
     // budget. Silently cutting a long value recreates #1229 at a different

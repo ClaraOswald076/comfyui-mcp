@@ -110,6 +110,43 @@ function selectRunToDiagnose(
  *  reply; anything longer is clipped WITH a note saying so. */
 const PER_OUTPUT_VALUE_CHARS = 800;
 
+/**
+ * Render one non-media history output value (#1229).
+ *
+ * Separator is " | " between keys and ", " inside an array. Multi-line values
+ * are indented as continuations so one value cannot shatter the bullet list --
+ * the motivating use case is reading validation errors through a scratch
+ * PreviewAny, which are multi-line by nature.
+ */
+function renderOutputValue(value: unknown): string {
+  let flat: string;
+  try {
+    flat = Array.isArray(value)
+      ? value.map((v) => (typeof v === "string" ? v : JSON.stringify(v))).join(", ")
+      : typeof value === "string"
+        ? value
+        : JSON.stringify(value);
+  } catch {
+    // Unreachable today (the entry always comes from JSON.parse, which cannot
+    // produce a cycle or a BigInt) -- but losing the WHOLE entry, including the
+    // status and timing already computed, to an opaque TypeError would be worse
+    // than the bug this fixes.
+    return "(unserializable)";
+  }
+  if (flat === undefined || flat === "") return "(empty)";
+  // Slice by CODE POINT: a UTF-16 slice can split a surrogate pair and emit a
+  // lone half, which is not well-formed text.
+  const chars = Array.from(flat);
+  const clipped =
+    chars.length > PER_OUTPUT_VALUE_CHARS
+      ? chars.slice(0, PER_OUTPUT_VALUE_CHARS).join("") +
+        `... [truncated, ${chars.length} chars total]`
+      : flat;
+  return clipped.includes("\n")
+    ? "\n" + clipped.split("\n").map((l) => `    ${l}`).join("\n")
+    : clipped;
+}
+
 export function formatHistoryEntry(
   promptId: string,
   entry: HistoryEntry,
@@ -190,6 +227,7 @@ export function formatHistoryEntry(
       // (jcd315/comfyui-mcp-muse, commit e13342ec).
       const mediaKeys = ["images", "videos", "video", "gifs"] as const;
       const expanded: string[] = [];
+      const consumed = new Set<string>();
       for (const key of mediaKeys) {
         const items = output[key];
         if (!Array.isArray(items)) continue;
@@ -207,38 +245,28 @@ export function formatHistoryEntry(
             return `${path} (type=${type})`;
           })
           .join(", ");
-        if (fileList) expanded.push(`${key} → **${fileList}**`);
+        if (fileList) {
+          expanded.push(`${key} → **${fileList}**`);
+          consumed.add(key);
+        }
       }
-      if (expanded.length > 0) {
-        lines.push(`- Node ${nodeId}: ${expanded.join("; ")}`);
-      } else {
-        // #1229 — show the VALUE, not just the key.
-        //
-        // This branch used to emit `Object.keys(output)`, so a PreviewAny result
-        // shaped `{ text: ["diagnostic details"] }` rendered as "Node 102: text".
-        // PreviewAny is a DIAGNOSTIC node: the value IS the answer, and dropping
-        // it silently left the caller unable to tell that anything was there.
-        //
-        // Rendered as a CLASS, not a `text` special case -- every custom node that
-        // names its output something else had the identical defect.
-        const parts = Object.entries(output).map(([key, value]) => {
-          const flat = Array.isArray(value)
-            ? value.map((v) => (typeof v === "string" ? v : JSON.stringify(v))).join(", ")
-            : typeof value === "string"
-              ? value
-              : JSON.stringify(value);
-          if (flat === undefined || flat === "") return key;
-          // Bounded, and it SAYS so. History can carry large values and this is
-          // read by an agent with a token budget -- eliding silently would
-          // recreate this very bug at a different threshold.
-          const clipped =
-            flat.length > PER_OUTPUT_VALUE_CHARS
-              ? `${flat.slice(0, PER_OUTPUT_VALUE_CHARS)}… [truncated, ${flat.length} chars total]`
-              : flat;
-          return `${key}: ${clipped}`;
-        });
-        lines.push(`- Node ${nodeId}: ${parts.join("; ")}`);
-      }
+      // #1229 - render every key the media expansion did NOT consume, in BOTH
+      // branches.
+      //
+      // Scoping this to the no-media `else` left the reported defect live one
+      // branch over, on STOCK nodes: SaveAnimatedWEBP emits {images, animated}
+      // and a captioner emits {images, text}, so `expanded.length > 0` won a
+      // short-circuit and the payload was dropped exactly as before. Fixing the
+      // fallback alone fixed only the case I happened to test.
+      const leftovers = Object.entries(output)
+        .filter(([key]) => !consumed.has(key))
+        .map(([key, value]) => `${key}: ${renderOutputValue(value)}`);
+      const rendered = [...expanded, ...leftovers];
+      lines.push(
+        rendered.length > 0
+          ? `- Node ${nodeId}: ${rendered.join(" | ")}`
+          : `- Node ${nodeId}: (no output data)`,
+      );
     }
   }
 
