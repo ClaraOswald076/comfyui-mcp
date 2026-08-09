@@ -6,6 +6,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.65] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- enforce panel_graph_outline's max_chars when the live panel ignores it (#1228)
+- make an unreachable host say unreachable, not 'nothing found' (#1136)
+
+#### Changed
+- 0.50.63 (#1227)
+
+
 ## [0.50.64] - 2026-08-09
 
 _No user-facing changes._
