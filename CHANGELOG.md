@@ -21,6 +21,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.69] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- 127.0.0.1 and localhost are the same host, not a target drift (#1246)
+
+#### Changed
+- 0.50.68 (#1245)
+
+
 ## [0.50.68] - 2026-08-09
 
 ### MCP
