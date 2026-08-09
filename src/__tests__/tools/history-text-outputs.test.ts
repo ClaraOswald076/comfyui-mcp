@@ -168,7 +168,7 @@ describe("get_history surfaces non-media output values (#1229)", () => {
       "p1",
       entryWith({ "1": { text: ["| col a | col b |"], seed: [42] } }),
     );
-    const seedLine = out.split("\n").find((l) => l.trim().startsWith("- seed:"));
+    const seedLine = out.split("\n").find((l) => l.startsWith("  - seed:"));
     expect(seedLine, "seed must be its own line, not inline after a pipe").toBeTruthy();
     expect(out).toContain("| col a | col b |");
   });
@@ -186,6 +186,56 @@ describe("get_history surfaces non-media output values (#1229)", () => {
     const emoji = String.fromCodePoint(0x1f600);
     const out = formatHistoryEntry("p1", entryWith({ "1": { text: [emoji.repeat(900)] } }));
     expect(out).toContain("truncated, 900 chars total");
+  });
+
+  it("renders EVERY feature at once, on one node (the fixture that would have caught rounds 1 and 2)", () => {
+    // Both earlier defects were invisible to per-feature tests: round 1 scoped
+    // the fix to the branch its test exercised, and round 2 had two fixes that
+    // were each correct alone and composed wrong. Nothing drove both at once.
+    // This is that fixture: media + multi-line text + a scalar flag + a long
+    // value + an empty key, on a single node.
+    const out = formatHistoryEntry(
+      "p1",
+      entryWith({
+        "2": {
+          images: [{ filename: "a.webp", subfolder: "sub", type: "temp" }],
+          text: ["ERROR: node 5 failed\n  missing model foo.safetensors"],
+          animated: [true],
+          blob: ["q".repeat(1200)],
+          nothing: [],
+        },
+      }),
+    );
+    const lines = out.split("\n");
+    // the node header owns its own line; every key is a NESTED bullet
+    expect(lines).toContain("- Node 2:");
+    expect(lines.some((l) => l.startsWith("  - images → "))).toBe(true);
+    expect(lines.some((l) => l.startsWith("  - animated: true"))).toBe(true);
+    expect(lines.some((l) => l.startsWith("  - nothing: (empty)"))).toBe(true);
+    expect(lines.some((l) => l.startsWith("  - blob: "))).toBe(true);
+    // media detail survives
+    expect(out).toContain("sub/a.webp (type=temp)");
+    // the multi-line value stays indented under ITS key and captures nothing else
+    const animIdx = lines.findIndex((l) => l.startsWith("  - animated:"));
+    const errIdx = lines.findIndex((l) => l.includes("foo.safetensors"));
+    expect(errIdx).toBeGreaterThan(-1);
+    expect(animIdx).toBeGreaterThan(errIdx);
+    expect(lines[errIdx]).not.toContain("animated");
+    // the long value is clipped and says so
+    expect(out).toContain("truncated, 1200 chars total");
+  });
+
+  it("gives a LONE multi-line value its own nested bullet, not an inline block", () => {
+    // N12: dropping `!rendered[0].includes(newline)` from the single-part
+    // condition survived every test, because the multi-line test only checked
+    // that the indented lines EXIST - satisfied by the inline form too. Inline,
+    // the block hangs off `- Node 6: text:` and the node bullet no longer owns
+    // its own line, which is the structure this commit exists to create.
+    const out = formatHistoryEntry("p1", entryWith({ "6": { text: ["line1\nline2"] } }));
+    const lines = out.split("\n");
+    expect(lines).toContain("- Node 6:");
+    expect(lines.some((l) => l.startsWith("  - text:"))).toBe(true);
+    expect(lines.some((l) => l.startsWith("- Node 6: text:"))).toBe(false);
   });
 
   it("SAYS when it truncated, rather than silently eliding", () => {

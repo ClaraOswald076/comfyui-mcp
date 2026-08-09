@@ -260,7 +260,12 @@ export function formatHistoryEntry(
       // fallback alone fixed only the case I happened to test.
       const leftovers = Object.entries(output)
         .filter(([key]) => !consumed.has(key))
-        .map(([key, value]) => `${key}: ${renderOutputValue(value)}`);
+        .map(([key, value]) => {
+          const v = renderOutputValue(value);
+          // No space before a multi-line block: `key: ` meeting the value's
+          // leading newline leaves a trailing space on the key line.
+          return v.startsWith("\n") ? `${key}:${v}` : `${key}: ${v}`;
+        });
       const rendered = [...expanded, ...leftovers];
       // One key per LINE once there is more than one, or any value is
       // multi-line. Round 2 caught the two round-1 fixes colliding: rendering
