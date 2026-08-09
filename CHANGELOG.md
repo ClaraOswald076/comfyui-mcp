@@ -21,6 +21,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.75] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- download-manager-routing depends on state a neighbour primes (#1266)
+- the identity refusal must describe the check it actually ran (#1255)
+
+#### Changed
+- a probe that FAILED must not answer 'no' (#1267)
+- 0.50.74 (#1265)
+
+
 ## [0.50.74] - 2026-08-09
 
 ### MCP
