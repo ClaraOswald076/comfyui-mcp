@@ -21,6 +21,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.67] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a relay session can adopt a workflow fence — it knows its own origin (#1240)
+
+
 ## [0.50.66] - 2026-08-09
 
 ### MCP
