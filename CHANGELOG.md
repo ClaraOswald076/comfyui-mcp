@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.43] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- stop reporting a live download as FAILED, and stop claiming bytes moved for a 404 (#1163)
+- Save-As and new-workflow trust their OWN reply's proven uuid (#1161)
+- recent_errors:0 returns none, and says the log was not checked (#1162)
+- reopening a tab's OWN tmp: routing_key refreshes the fence (#1157)
+
+
 ## [0.50.42] - 2026-08-08
 
 ### MCP
