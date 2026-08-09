@@ -246,6 +246,40 @@ export function downloadAttemptKey(row: AttemptRowLike): string | null {
   return `${id}\n${target}`;
 }
 
+/**
+ * Flag each settled FAILURE whose FILENAME is being downloaded right now (#1150).
+ *
+ * The supersession key above is (id, target), and it is right to be: it answers
+ * "is this the same transfer?", where a filename cannot. But a 404 retried with a
+ * CORRECTED URL is a different id writing the same filename, so the eviction
+ * cannot see it — and a reporter was woken with "Model download FAILED" for two
+ * files that `download_model action:"status"` showed streaming at 20% and 13%
+ * seconds later.
+ *
+ * This asks a different, narrower question: "is the thing I am about to call
+ * failed currently arriving?" For the human or agent reading that sentence, the
+ * NAME is the identity, so the name is the right key here even though it is the
+ * wrong key there. A false positive costs a hedge on a genuinely dead download; a
+ * false negative is the reported bug.
+ *
+ * Mutates and returns `settled` — the caller passes rows it just built.
+ */
+export function markSupersededByLive<T extends { name: string; status: string; supersededByLive?: boolean }>(
+  settled: T[],
+  liveRows: ReadonlyArray<{ name?: unknown; status?: unknown }>,
+): T[] {
+  const liveNames = new Set(
+    liveRows
+      .filter((r) => r?.status === "downloading")
+      .map((r) => (typeof r?.name === "string" ? r.name : ""))
+      .filter((n) => n !== ""),
+  );
+  for (const s of settled) {
+    if (s.status !== "done" && liveNames.has(s.name)) s.supersededByLive = true;
+  }
+  return settled;
+}
+
 /** Newest attempt epoch per (id, target) across the given rows (ANY status — a
  *  superseding newer attempt may itself be downloading OR already terminal). Rows
  *  missing an `attempt` epoch (pre-fix writer / non-model reporter) are ignored —
