@@ -1032,11 +1032,26 @@ export async function uploadImageHttp(
     body: formData,
   });
   if (!res.ok) {
-    // unknown-ok: "" is interpolated into an ERROR MESSAGE and nothing else — the
-    // HTTP status is reported either way, so an unreadable body costs detail in the
-    // text, never a wrong conclusion. Verified there is no branch on this value.
+    // This branch only became REACHABLE with #385, and reaching it must not cost
+    // the #1160 diagnosis. An auth gate answering 401 with a sign-in page is the
+    // reported case, and "returned 401: <!DOCTYPE html>…" is strictly worse than
+    // naming the gate and saying which layer wants the credential.
+    //
+    // It must also not dump a RAW body: a gateway that reflects the request can
+    // put our own credential in it, which is exactly what bodyPrefixOf exists to
+    // prevent. Both problems are solved by classifying rather than interpolating.
+    // unknown-ok: "" only means an unreadable body, which classifyNonJson reports
+    // as an empty one — a loss of detail, never a wrong conclusion.
     const text = await res.text().catch(() => "");
-    throw new Error(`ComfyUI /upload/image returned ${res.status}: ${text}`);
+    throw new NonJsonResponseError(
+      classifyNonJson({
+        url: "/upload/image",
+        status: res.status,
+        statusText: res.statusText,
+        contentType: res.headers.get("content-type") ?? "",
+        body: text,
+      }),
+    );
   }
   // Never let a parser message stand in for a diagnosis: a proxy or a
   // still-starting server answering 200 with HTML used to surface as a raw

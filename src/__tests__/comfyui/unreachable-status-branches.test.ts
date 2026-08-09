@@ -99,11 +99,35 @@ describe("status branches after a ComfyUI API call are reachable (#385)", () => 
     );
   });
 
-  it("uploadImageHttp reports the status and body it was given", async () => {
+  it("uploadImageHttp CLASSIFIES a rejected upload rather than dumping the body", async () => {
+    // Making this branch reachable must not cost the #1160 diagnosis, and must
+    // not print a raw body — a gateway that reflects the request can put our own
+    // credential in it. So it classifies instead of interpolating.
     answer(413, "too large", "text/plain");
-    await expect(uploadImageHttp("big.png", Buffer.from("x"))).rejects.toThrow(
-      /\/upload\/image returned 413: too large/,
+    const err = await uploadImageHttp("big.png", Buffer.from("x")).then(
+      () => null,
+      (e: unknown) => e,
     );
+    expect((err as { code?: string }).code).toBe("NON_JSON_RESPONSE");
+    expect((err as Error).message).toContain("/upload/image");
+    expect((err as Error).message).toContain("413");
+  });
+
+  it("uploadImageHttp still names a sign-in gate on a 401 (#1160 must not regress)", async () => {
+    // The regression this conversion nearly caused: with `!res.ok` reachable, a
+    // hand-rolled "returned 401: <!DOCTYPE html>…" would have replaced the
+    // diagnosis that says WHICH layer wants the credential.
+    answer(
+      401,
+      '<!DOCTYPE html><html><head><title>Sign in</title></head><body><form action="/login"><input type="password" name="p"></form></body></html>',
+      "text/html",
+    );
+    const err = await uploadImageHttp("cat.png", Buffer.from("x")).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect((err as Error).message).toMatch(/SIGN-IN PAGE/);
+    expect((err as Error).message).toMatch(/credential belongs to that GATEWAY/);
   });
 
   it("a 2xx still flows through untouched", async () => {

@@ -760,6 +760,7 @@ async function saveWorkflowAction(
           // unknown-ok: "" is interpolated into an ERROR MESSAGE and nothing else — the
           // HTTP status is reported either way, so an unreadable body costs detail in the
           // text, never a wrong conclusion. Verified there is no branch on this value.
+          // #385 made this branch reachable; scrub before printing (see #828).
           const errText = await res.text().catch(() => "");
           return {
             content: [

@@ -1,4 +1,5 @@
 import { comfyApiFetch } from "../comfyui/client.js";
+import { bodyPrefixOf } from "../comfyui/json-guard.js";
 import type { WorkflowJSON } from "../comfyui/types.js";
 import {
   diffLocks,
@@ -50,9 +51,13 @@ async function saveLockToLibrary(filename: string, lock: WorkflowLock): Promise<
     // unknown-ok: "" is interpolated into an ERROR MESSAGE and nothing else — the
     // HTTP status is reported either way, so an unreadable body costs detail in the
     // text, never a wrong conclusion. Verified there is no branch on this value.
+    //
+    // #385 made this branch REACHABLE, so a body that was never printed before now
+    // can be. A gateway that reflects the request can put our own credential in it,
+    // so it goes through the same scrubber every other printed body goes through.
     const text = await res.text().catch(() => "");
     throw new ValidationError(
-      `Failed to save lock file for ${filename}: ${res.status} ${res.statusText}${text ? `\n${text}` : ""}`,
+      `Failed to save lock file for ${filename}: ${res.status} ${res.statusText}${text ? `\n${bodyPrefixOf(text)}` : ""}`,
     );
   }
 }
