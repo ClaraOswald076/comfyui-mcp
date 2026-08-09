@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.51] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- make the endpoint-specific !res.ok branches reachable (#1187)
+
+
 ## [0.50.50] - 2026-08-09
 
 ### MCP
