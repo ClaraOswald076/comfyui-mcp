@@ -3158,7 +3158,25 @@ async function refreshOpenWorkflowUuid(
   const openedIdentity = openedPath
     ? canonicalSavedRecordIdentity({ path: openedPath, routing_key: parsedOpen?.routing_key })
     : null;
-  if (!requestedIdentity || requestedIdentity !== openedIdentity) return;
+  if (!requestedIdentity || requestedIdentity !== openedIdentity) {
+    // #812 — the SAVED corroboration above can never succeed for an unsaved
+    // target (there is no path), so try the parallel UNSAVED identity: the
+    // caller's literal token against the panel's own proven routing_key for
+    // the tab it just opened. Exact equality only — see
+    // canonicalUnsavedWorkflowIdentity for why that carries no alias risk.
+    //
+    // Trust level matches the EXISTING "could not ask" fallback below exactly:
+    // adopt the reply's own workflow_uuid directly, which the panel published
+    // only after its own final synchronous check that this target was still
+    // the active workflow (#716). No extra workflow_list round trip — that
+    // read is itself refused by the exact wedge this exists to repair
+    // (#1071), which is the same trap `panel_new_workflow`'s recovery hit.
+    const requestedUnsaved = canonicalUnsavedWorkflowIdentity(requestedPath);
+    if (requestedUnsaved && requestedUnsaved === parsedOpen?.routing_key) {
+      refreshWorkflowUuid(ctx, parsedOpen);
+    }
+    return;
+  }
 
   // THREE outcomes for this corroborating read, not two — and conflating the last
   // two is #1071 (also #932/#1043).
@@ -3648,6 +3666,28 @@ function canonicalSavedWorkflowRoutingIdentity(value: unknown): string | null {
   if (typeof value !== "string" || !value.startsWith("wf:")) return null;
   const path = canonicalSavedWorkflowPath(value.slice(3));
   return path ? `wf:${path}` : null;
+}
+
+/**
+ * #812 — an UNSAVED workflow has no saved path, so `canonicalRequestedSavedIdentity`
+ * always returns null for it, and `refreshOpenWorkflowUuid` bails out before ever
+ * consulting the reply. `panel_open_workflow(tmp:<uuid>)` on the panel's OWN
+ * routing_key succeeded (`opened:true`) but never refreshed the fence — the ONLY
+ * documented recovery for a just-created blank tab, reported as leaving the tool
+ * "effectively unusable whenever this fires."
+ *
+ * A `tmp:<uuid>` token is not an alias needing corroboration the way a saved path's
+ * basename is (#716 P1's concern) — it is the per-tab routing id itself, unique by
+ * construction. So the identity check here is a single exact-string equality, not a
+ * lookup: does the caller's literal request match the panel's own proven routing_key
+ * for the tab it just opened? No resolution happens on either side.
+ *
+ * Strict RFC-uuid suffix (same `WORKFLOW_UUID_RE` the command-fence stamp itself is
+ * validated against) so a malformed or truncated token is never treated as a match.
+ */
+function canonicalUnsavedWorkflowIdentity(value: unknown): string | null {
+  if (typeof value !== "string" || !value.startsWith("tmp:")) return null;
+  return WORKFLOW_UUID_RE.test(value.slice(4)) ? value : null;
 }
 
 /** Stable-identity match (positive only) — used to prefer the active record among matches. */
