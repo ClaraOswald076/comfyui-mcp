@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { WorkflowJSON } from "../comfyui/types.js";
 import { getObjectInfo, backfillObjectInfo, comfyApiFetch } from "../comfyui/client.js";
+import { bodyPrefixOf, describeStatus } from "../comfyui/json-guard.js";
 import { errorToToolResult, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import {
@@ -58,7 +59,17 @@ async function loadRawFromSource(
   const encoded = encodeURIComponent(`workflows/${filename}`);
   const res = await comfyApiFetch(`/api/userdata/${encoded}`);
   if (!res.ok) {
-    throw new ValidationError(`Workflow not found in library: ${filename} (${res.status})`);
+    // Gate the ABSENCE wording on 404, the way fetchImage does (#385 review
+    // finding 4). This branch was dead until #385 made it reachable, so it had
+    // never had to distinguish "the server says it is not there" from "an auth
+    // gate, a 502, or a proxy that does not forward /api/userdata answered".
+    // Reporting the second as the first is the #796 fold, and an agent told its
+    // workflow does not exist is one step from recreating or overwriting it.
+    throw new ValidationError(
+      res.status === 404
+        ? `Workflow not found in library: ${filename} (404)`
+        : `Could NOT read "${filename}" from the library: the server answered ${describeStatus(res.status, res.statusText)}. That is not a report that it is missing — nothing was read.`,
+    );
   }
   return await res.json();
 }
@@ -540,11 +551,21 @@ async function getWorkflowAction(filename: string, format: "ui" | "api"): Promis
         );
 
         if (!res.ok) {
+          // The worst of the four not-found sites (#385 review finding 4): it
+          // returns a NORMAL text block, so nothing marks it as a failure at all.
+          // An agent told its workflow does not exist is one step from recreating
+          // or overwriting it, and before #385 made this reachable the user got a
+          // neutral transport error instead. Only 404 may claim absence.
           return {
             content: [
               {
                 type: "text",
-                text: `Workflow not found: ${filename} (${res.status})`,
+                text:
+                  res.status === 404
+                    ? `Workflow not found: ${filename} (404)`
+                    : `Could NOT read "${filename}": the server answered ${describeStatus(res.status, res.statusText)}. ` +
+                      `That is NOT a report that the workflow is missing — nothing was read. Do not recreate it on ` +
+                      `the strength of this; check the server with get_system_stats (action:"health") first.`,
               },
             ],
           };
@@ -760,13 +781,16 @@ async function saveWorkflowAction(
           // unknown-ok: "" is interpolated into an ERROR MESSAGE and nothing else — the
           // HTTP status is reported either way, so an unreadable body costs detail in the
           // text, never a wrong conclusion. Verified there is no branch on this value.
-          // #385 made this branch reachable; scrub before printing (see #828).
+          //
+          // #385 made this branch REACHABLE. A reflecting gateway can echo our own
+          // credential in the body it answers with, and the reason phrase is
+          // attacker-influenceable too, so both go through the scrubbers (#828).
           const errText = await res.text().catch(() => "");
           return {
             content: [
               {
                 type: "text",
-                text: `Failed to save workflow: ${res.status} ${res.statusText}${errText ? `\n${errText}` : ""}`,
+                text: `Failed to save workflow: ${describeStatus(res.status, res.statusText)}${errText ? `\n${bodyPrefixOf(errText)}` : ""}`,
               },
             ],
           };
@@ -788,7 +812,17 @@ async function loadWorkflowApi(filename: string): Promise<{ workflow: WorkflowJS
   const res = await comfyApiFetch(`/api/userdata/${encoded}`);
 
   if (!res.ok) {
-    throw new ValidationError(`Workflow not found: ${filename} (${res.status})`);
+    // Gate the ABSENCE wording on 404, the way fetchImage does (#385 review
+    // finding 4). This branch was dead until #385 made it reachable, so it had
+    // never had to distinguish "the server says it is not there" from "an auth
+    // gate, a 502, or a proxy that does not forward /api/userdata answered".
+    // Reporting the second as the first is the #796 fold, and an agent told its
+    // workflow does not exist is one step from recreating or overwriting it.
+    throw new ValidationError(
+      res.status === 404
+        ? `Workflow not found: ${filename} (404)`
+        : `Could NOT read "${filename}": the server answered ${describeStatus(res.status, res.statusText)}. That is not a report that it is missing — nothing was read.`,
+    );
   }
 
   const raw = await res.json();

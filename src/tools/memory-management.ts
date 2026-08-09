@@ -3,7 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { getSystemStats, comfyApiFetch } from "../comfyui/client.js";
 import { ComfyUIError, errorToToolResult } from "../utils/errors.js";
-import { bodyPrefixOf } from "../comfyui/json-guard.js";
+import { bodyPrefixOf, describeStatus } from "../comfyui/json-guard.js";
 import { logger } from "../utils/logger.js";
 
 export function registerMemoryManagementTools(server: McpServer): void {
@@ -48,7 +48,7 @@ export function registerMemoryManagementTools(server: McpServer): void {
             content: [
               {
                 type: "text" as const,
-                text: `Failed to free VRAM: ${res.status} ${res.statusText}${text ? `\n${bodyPrefixOf(text)}` : ""}`,
+                text: `Failed to free VRAM: ${describeStatus(res.status, res.statusText)}${text ? `\n${bodyPrefixOf(text)}` : ""}`,
               },
             ],
           };
@@ -110,7 +110,7 @@ export async function getEmbeddingsAction(): Promise<CallToolResult> {
         // they have none. Say what actually happened instead.
         if (!res.ok) {
           throw new ComfyUIError(
-            `ComfyUI /api/embeddings answered ${res.status} ${res.statusText}, so the installed ` +
+            `ComfyUI /api/embeddings answered ${describeStatus(res.status, res.statusText)}, so the installed ` +
               `embeddings could NOT be listed. This is not a report that none are installed — ` +
               `nothing was read. Confirm the server is up and exposes this route with ` +
               `get_system_stats (action:"health").`,

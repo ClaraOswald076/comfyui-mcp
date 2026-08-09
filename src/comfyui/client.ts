@@ -16,7 +16,9 @@ import {
 } from "../utils/errors.js";
 import { comfyuiFetch } from "./fetch.js";
 import {
+  bodyPrefixOf,
   classifyNonJson,
+  describeStatus,
   fetchComfyJson,
   guardClientFetch,
   isNonJsonResponseError,
@@ -885,6 +887,23 @@ export async function getSetting(id: string): Promise<unknown> {
   const url = `/settings/${encodeURIComponent(id)}`;
   const res = await comfyApiFetch(url);
   if (res.status === 404) return undefined;
+  // ONLY 404 means "unset". Every other error status must throw (review finding 1).
+  //
+  // This branch could not run before #385 made it reachable, and without it the
+  // function reopens the exact hole its own docstring says was closed: a 403 or
+  // 500 carrying a gateway's JSON error envelope parses fine and is RETURNED AS
+  // THE STORED VALUE, and a 502 with an empty body reports "unset (frontend
+  // default applies)" for a setting nobody read. `set_ui` echoes this call as
+  // `previous:`, so a user who then writes a value is told the old one was unset
+  // and cannot restore it.
+  if (!res.ok) {
+    throw new ComfyUIError(
+      `ComfyUI ${url} answered ${describeStatus(res.status, res.statusText)}, so this setting could ` +
+        `NOT be read. That is not a report that it is unset — nothing was read. Only a 404 means ` +
+        `"unset (frontend default applies)" on builds that 404 the per-id route.`,
+      "HTTP_ERROR",
+    );
+  }
   const text = await res.text();
   if (text.trim() === "") return undefined;
   try {
@@ -926,9 +945,14 @@ export async function setSetting(id: string, value: unknown): Promise<void> {
     // unknown-ok: "" is interpolated into an ERROR MESSAGE and nothing else — the
     // HTTP status is reported either way, so an unreadable body costs detail in the
     // text, never a wrong conclusion. Verified there is no branch on this value.
+    //
+    // #385 made this branch REACHABLE, and it was printing 500 raw bytes. A
+    // reflecting gateway answers `invalid token: Bearer <ours>` and that went
+    // straight into a tool result (review finding 2). Body and reason phrase both
+    // go through the scrubbers now, as everywhere else.
     const body = await res.text().catch(() => "");
     throw new ConnectionError(
-      `ComfyUI /settings/${id} returned ${res.status} ${res.statusText}: ${body.slice(0, 500)}`,
+      `ComfyUI /settings/${id} returned ${describeStatus(res.status, res.statusText)}: ${bodyPrefixOf(body)}`,
     );
   }
 }

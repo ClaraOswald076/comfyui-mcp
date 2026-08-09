@@ -38,6 +38,7 @@ import {
   getSetting,
   getSettings,
   resetClient,
+  setSetting,
   uploadImageHttp,
 } from "../../comfyui/client.js";
 
@@ -90,6 +91,39 @@ describe("status branches after a ComfyUI API call are reachable (#385)", () => 
     // route, so empty / null / 404 are treated uniformly as unset".
     answer(404, null);
     await expect(getSetting("Comfy.ColorPalette")).resolves.toBeUndefined();
+  });
+
+  // Review finding 1 + the coverage hole it came through: the suite exercised
+  // exactly ONE status on getSetting — 404 — so a non-404 falling through to
+  // JSON.parse and being RETURNED AS THE VALUE sailed past a green run.
+  it.each([
+    ["403 with a gateway's JSON envelope", 403, '{"error":"forbidden","code":403}'],
+    ["500 with an empty body", 500, ""],
+    ["502 with a null body", 502, "null"],
+  ])("getSetting THROWS on %s rather than reporting a value or 'unset'", async (_l, status, body) => {
+    answer(status, body, "application/json");
+    const err = await getSetting("Comfy.ColorPalette").then(
+      (v) => ({ resolved: v }),
+      (e: unknown) => e,
+    );
+    // Neither of the two wrong outputs: the envelope as the stored value, nor
+    // `undefined`, which this function documents as "unset (frontend default
+    // applies)" and which set_ui echoes back as `previous:`.
+    expect(err).not.toHaveProperty("resolved");
+    expect((err as { code?: string }).code).toBe("HTTP_ERROR");
+    expect((err as Error).message).toMatch(/not a report that it is unset/);
+  });
+
+  it("setSetting does not print a reflected credential", async () => {
+    // Review finding 2, reproduced: a gateway that echoes the request put our
+    // own Authorization value into a tool result.
+    answer(403, "invalid token: Bearer s3cr3t-token-value-abcdef for /settings", "text/plain");
+    const err = await setSetting("Comfy.ColorPalette", "dark").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect((err as Error).message).not.toContain("s3cr3t-token-value-abcdef");
+    expect((err as Error).message).toContain("403");
   });
 
   it("getSettings reports the curated version-drift error on a 404", async () => {
