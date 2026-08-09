@@ -6,6 +6,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.64] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- the confirmation timeout must not recommend a server it never checked (#851)
+- make an unreachable host say unreachable, not 'nothing found' (#1136)
+- stop redacting file paths and module names, and filter the log BEFORE scrubbing (#1225)
+
+#### Changed
+- 0.50.62 (#1224)
+
+
 ## [0.50.62] - 2026-08-09
 
 ### MCP
