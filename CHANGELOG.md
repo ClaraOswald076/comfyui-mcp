@@ -21,6 +21,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.76] - 2026-08-09
+
+### MCP
+
+#### Changed
+- 'no saved sessions' must not also mean 'could not read them' (#1269)
+- 0.50.75 (#1268)
+
+
 ## [0.50.75] - 2026-08-09
 
 ### MCP
