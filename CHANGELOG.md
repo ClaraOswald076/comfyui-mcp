@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.42] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- a filtered empty listing says where else to look (#1158)
+- name the tool that CAN install an unregistered pack (#1156)
+- reject unrecognized argument keys instead of silently dropping them (#1153)
+- stop abandoning a WRITE sooner than a read (#1154)
+
+
 ## [0.50.41] - 2026-08-08
 
 ### MCP
