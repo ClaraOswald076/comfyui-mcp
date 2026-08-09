@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.44] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- an EMPTY live listing is not evidence of a different install (#1168)
+- a bare JSON parse error names the tool, the likely cause, and the delivery doubt (#1166)
+- accept the video containers this codebase already recognizes (#1165)
+
+
 ## [0.50.43] - 2026-08-08
 
 ### MCP
