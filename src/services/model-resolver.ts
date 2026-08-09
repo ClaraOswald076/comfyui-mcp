@@ -1050,6 +1050,26 @@ async function assertDestinationVisibleToLiveServer(
     if (onDisk.length === 0) continue; // nothing here to contradict anything
     const listing = await liveCategoryListing(category);
     if (listing === undefined) continue; // the server can't speak for it — no evidence
+    // #1147 — AN EMPTY LISTING IS NOT DISAGREEMENT.
+    //
+    // The #369 signature this guard exists for is a POPULATED listing that
+    // describes a different tree: 3 files on disk, 24 unrelated files live. That
+    // is positive evidence — the server demonstrably scans SOMETHING ELSE for
+    // this category.
+    //
+    // An empty listing says only that the server named nothing here, and that is
+    // equally explained by a server that reads this very directory but does not
+    // enumerate it the way a filesystem walk does. A reporter's portable install
+    // held models/birefnet/BiRefNet_lite/model.safetensors — a HuggingFace repo
+    // dump — while /models/birefnet answered empty, and the download was refused
+    // into the correct, running install, with their loras/ agreeing perfectly.
+    //
+    // So "0 live entries" cannot distinguish "wrong install" from "a category
+    // this server does not scan like we do", and this guard refuses only on
+    // positive evidence. The same reasoning the surrounding code already applies
+    // to `diffusers` (#844), whose listing contractually names no files —
+    // generalized from one hardcoded category to the condition underneath it.
+    if (listing.length === 0) continue;
     probed += 1;
     // CONTAINMENT, not overlap. If this directory really is one the server reads, it
     // SCANS it — so EVERY core-extension file in it must appear in the listing. A

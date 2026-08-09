@@ -190,6 +190,34 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     expect(msg).toMatch(/127\.0\.0\.1:8188/);
   });
 
+  // #1147 — an EMPTY live listing is not disagreement.
+  //
+  // A reporter's portable install held models/birefnet/BiRefNet_lite/model.safetensors
+  // (a HuggingFace repo dump) while the running server's /models/birefnet answered
+  // empty. Their loras/ agreed with the live server perfectly and argv pointed at
+  // that very tree — and the download was refused into the correct install.
+  //
+  // The #369 signature this guard exists for is a POPULATED listing describing a
+  // DIFFERENT tree (3 on disk, 24 unrelated live). "0 live entries" cannot tell
+  // "wrong install" from "a category this server does not enumerate the way a
+  // filesystem walk does", so it is not positive evidence and must not refuse.
+  it("#1147: PROCEEDS when the live listing for a populated category is EMPTY", async () => {
+    h.onDisk = { birefnet: ["BiRefNet_lite/model.safetensors"] };
+    h.liveListings["birefnet"] = []; // registered, answers, names nothing
+    h.liveListings["loras"] = ["agreed.safetensors"];
+
+    await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBeTruthy();
+  });
+
+  it("#1147: still REFUSES when that same category lists OTHER files", async () => {
+    // The guard must not be blunted: a populated listing that omits the on-disk
+    // files is the real #369 signature and still fails closed.
+    h.onDisk = { birefnet: ["BiRefNet_lite/model.safetensors"] };
+    h.liveListings["birefnet"] = ["someone-elses.safetensors"];
+
+    await expect(resolveModelSubfolderPreferServer("birefnet")).rejects.toThrow(ModelError);
+  });
+
   it("REFUSES on a POPULATED SIBLING when the target category is empty (codex gate)", async () => {
     // The stale install has never held a diffusion model, so the target folder is
     // empty and says nothing — but its checkpoints/ betrays the wrong install.
