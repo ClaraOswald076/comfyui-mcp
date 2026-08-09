@@ -64,6 +64,17 @@ export function isNonJsonResponseError(err: unknown): err is NonJsonResponseErro
 const REDACTED = "«redacted»";
 
 /**
+ * The same marker, spelled for a URL component.
+ *
+ * `«redacted»` is non-ASCII, so putting it in a query value, a path segment or
+ * userinfo gets it percent-encoded to `%C2%ABredacted%C2%BB` on the way out.
+ * That leaves one message carrying two spellings of the same word, and — the
+ * part that actually costs something — a triage grep for `«redacted»` silently
+ * misses every URL occurrence. ASCII here keeps one greppable spelling.
+ */
+const URL_REDACTED = "REDACTED";
+
+/**
  * Collapse a body to a short single-line prefix for the message.
  *
  * The prefix is diagnostic — it is what lets a user recognise the page that
@@ -343,9 +354,35 @@ const SHOWABLE_PARAMS: ReadonlySet<string> = new Set([
   "input",
   "response_type",
   "scope",
-  "redirect_uri",
   "code_challenge_method",
 ]);
+
+/**
+ * The subset of SHOWABLE_PARAMS whose values are legitimately LONG free text —
+ * user-supplied paths and titles — and so must not be length-checked.
+ *
+ * Everything else on the allowlist keeps the opaque-run check on its value. The
+ * names there are generic enough (`id`, `ref`, `type`, `mode`, `input`, `raw`,
+ * `channel`) that a third-party gateway is as likely to pick one as ComfyUI is,
+ * and a JWT under `?id=` or an access key under `?ref=` should not print merely
+ * because ComfyUI also happens to use that word. Dropping the check for ALL 31
+ * names — which is what the long-filename fix did — was wider than the evidence
+ * justified (review finding 2).
+ *
+ * `redirect_uri` was removed from the allowlist entirely rather than added here:
+ * its value is an arbitrary URL, so a nested `?session=…` prints whole and no
+ * length rule can see it, `:` and `?` being outside the opaque alphabet.
+ */
+const LONG_TEXT_PARAMS: ReadonlySet<string> = new Set([
+  "filename",
+  "subfolder",
+  "dir",
+  "template",
+]);
+// `name` is deliberately NOT here, though it was in the review's suggested set:
+// probing found `?name=AKIAIOSFODNN7EXAMPLEwJalrXUtnFEMI` printing in full. A
+// pack or model name long enough to trip the length check is rare and costs
+// only a redacted word in a diagnostic; an access key printing costs more.
 
 /** A single opaque run long enough to be a credential and nothing else. Reused
  *  from the body scrubber's pass 3, but applied PER COMPONENT so an ordinary
@@ -353,24 +390,23 @@ const SHOWABLE_PARAMS: ReadonlySet<string> = new Set([
 const OPAQUE_RUN = /^[A-Za-z0-9\-._~+/=%]{24,}$/;
 
 /**
- * A parameter value may be printed only if we recognise the NAME.
+ * A parameter value may be printed only if we recognise the NAME, and — unless
+ * the name is one that legitimately carries long free text — only if the value
+ * is not itself credential-shaped.
  *
- * The value is deliberately NOT length-checked. An earlier version also required
- * it not to match the opaque-run pattern, on the reasoning that a known-good name
- * carrying a 40-character blob is still not worth printing — but the pattern's
- * alphabet includes letters, digits, `-`, `.` and `_`, so an ordinary filename of
- * 24 characters or more matches it. Live-testing a missing `/view` produced:
+ * The long-text exemption exists because live-testing a missing `/view` produced
  *
  *     /view?filename=«redacted»&type=input&subfolder=
  *
- * which redacts the single most useful fact in the message. These names are on
- * the list precisely because we know what they carry — user-supplied paths and
- * identifiers, never credentials — so the length of the value says nothing. Any
- * name NOT on the list is still redacted whatever its value looks like, which is
- * where the fail-closed protection actually lives.
+ * — the opaque-run alphabet is letters, digits, `-`, `.` and `_`, so any
+ * filename of 24 characters or more matched it, and the message threw away the
+ * single most useful fact it had. The exemption is scoped to LONG_TEXT_PARAMS
+ * rather than applied to the whole allowlist: a JWT under `?id=` is still a JWT.
  */
-function isShowableParam(name: string): boolean {
-  return SHOWABLE_PARAMS.has(name.toLowerCase());
+function isShowableParam(name: string, value: string): boolean {
+  const n = name.toLowerCase();
+  if (!SHOWABLE_PARAMS.has(n)) return false;
+  return LONG_TEXT_PARAMS.has(n) || !OPAQUE_RUN.test(value);
 }
 
 /**
@@ -383,12 +419,12 @@ function isShowableParam(name: string): boolean {
  * way, because that is the route and the route is the diagnosis.
  */
 function scrubPathSegment(segment: string): string {
-  if (OPAQUE_RUN.test(segment)) return REDACTED;
+  if (OPAQUE_RUN.test(segment)) return URL_REDACTED;
   if (!segment.includes(";") && !segment.includes("=")) return segment;
   const [head, ...matrix] = segment.split(";");
   const eq = head.indexOf("=");
-  const safeHead = eq === -1 ? head : `${head.slice(0, eq)}=${REDACTED}`;
-  return matrix.length > 0 ? `${safeHead};${REDACTED}` : safeHead;
+  const safeHead = eq === -1 ? head : `${head.slice(0, eq)}=${URL_REDACTED}`;
+  return matrix.length > 0 ? `${safeHead};${URL_REDACTED}` : safeHead;
 }
 
 /**
@@ -411,10 +447,13 @@ function scrubPathSegment(segment: string): string {
  *
  *   - userinfo                → always redacted
  *   - query/fragment values   → redacted unless the NAME is one this codebase
- *                               sends (see SHOWABLE_PARAMS) and the value is not
- *                               itself credential-shaped
+ *                               sends (SHOWABLE_PARAMS); for those, the value is
+ *                               additionally length-checked unless the name is
+ *                               one that carries long free text (LONG_TEXT_PARAMS)
  *   - path segments           → redacted when opaque, or when carrying a matrix
- *                               parameter (`;jsessionid=…`)
+ *                               parameter (`;jsessionid=…`); applied to a
+ *                               RELATIVE target too, not only an absolute one
+ *   - non-http(s) schemes     → refused outright rather than parsed
  *   - origin, route, param NAMES → always kept; they are the diagnosis
  *
  * Residual, stated rather than papered over: a SHORT secret sitting in a bare
@@ -426,21 +465,34 @@ function scrubPathSegment(segment: string): string {
  * never reformatted by a round-trip through the URL parser.
  */
 export function redactUrlForDiagnosis(raw: string): string {
-  let u: URL;
+  let u: URL | null = null;
   try {
-    u = new URL(raw);
+    const parsed = new URL(raw);
+    // `data:`, `blob:` and `about:` DO parse, but they are "cannot-be-a-base"
+    // URLs whose `pathname` setter is a spec'd silent no-op — so the path scrub
+    // below would report success and change nothing, the sole fail-OPEN path in
+    // a function documented as fail-closed (review finding 5). A ComfyUI target
+    // is always http(s); anything else is refused rather than trusted.
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") u = parsed;
   } catch {
-    // Not absolute (a relative path from a test double, or a malformed target).
-    // There is no structure to reason about, so keep everything up to the first
-    // query/fragment and say plainly that the rest was dropped rather than
-    // printing an unexamined credential.
+    u = null;
+  }
+  if (!u) {
+    // Relative (`/settings/<id>`, a test double's target), malformed, or an
+    // opaque scheme. There is no origin to reason about, but a relative path can
+    // still carry an opaque segment or a matrix parameter, so it gets the SAME
+    // per-segment scrub as an absolute one (review finding 4) — an asymmetry
+    // here is a trap for the next caller. The query/fragment cannot be parsed
+    // safely, so it is withheld rather than printed unexamined.
     const cut = raw.search(/[?#]/);
-    return cut === -1 ? raw : `${raw.slice(0, cut)} (query withheld: unparsable URL)`;
+    const path = cut === -1 ? raw : raw.slice(0, cut);
+    const scrubbedPath = path.split("/").map(scrubPathSegment).join("/");
+    return cut === -1 ? scrubbedPath : `${scrubbedPath} (query withheld: unparsable URL)`;
   }
 
   let changed = false;
   if (u.username || u.password) {
-    u.username = REDACTED;
+    u.username = URL_REDACTED;
     u.password = "";
     changed = true;
   }
@@ -450,8 +502,8 @@ export function redactUrlForDiagnosis(raw: string): string {
   const rebuilt = new URLSearchParams();
   let paramsChanged = false;
   for (const [name, value] of u.searchParams) {
-    if (value && !isShowableParam(name)) {
-      rebuilt.append(name, REDACTED);
+    if (value && !isShowableParam(name, value)) {
+      rebuilt.append(name, URL_REDACTED);
       paramsChanged = true;
     } else {
       rebuilt.append(name, value);
@@ -464,7 +516,7 @@ export function redactUrlForDiagnosis(raw: string): string {
   // The FRAGMENT is where an OAuth implicit flow puts its access token, and it
   // is never needed to identify a route. Any fragment carrying `=` goes.
   if (u.hash.includes("=")) {
-    u.hash = REDACTED;
+    u.hash = URL_REDACTED;
     changed = true;
   }
   // A token can also ride in the path (`/api/v1/<opaque>/logs`, or a
@@ -722,7 +774,7 @@ export function classifyNonJson(args: {
     `${url} answered ${reason} with ${what} where JSON was expected. This means ${cause}. ` +
     `Content-Type: ${contentType || "(none)"}. Body starts: ${bodyPrefix || "(empty)"}. ` +
     `Confirm the configured ComfyUI base URL really is a ComfyUI API root — a URL that loads the ComfyUI UI in a browser is not proof, because the UI is served by the same catch-all that produced this page. ` +
-    `The check is that ${getComfyUIBaseUrl()}/system_stats returns JSON with a "system"/"devices" shape; if it returns HTML too, the base URL, its path prefix, or the proxy's route map is wrong` +
+    `The check is that ${redactUrlForDiagnosis(getComfyUIBaseUrl())}/system_stats returns JSON with a "system"/"devices" shape; if it returns HTML too, the base URL, its path prefix, or the proxy's route map is wrong` +
     // The credential instruction must follow the same evidence rule as the
     // diagnosis above. Only a body-confirmed sign-in page justifies "give it to
     // the gateway"; a bare 401/403 could equally be ComfyUI's own auth layer, and
@@ -829,6 +881,13 @@ export async function readComfyJson<T = unknown>(
  * original `json()` would have, so `text()`, `body` and `bodyUsed` are unchanged
  * for every caller that does not call `json()` — including `readComfyJson`,
  * which reads `text()` and keeps its own richer shape checking.
+ *
+ * KNOWN GAP, written down because the override is otherwise invisible: it is an
+ * OWN property of this Response, so it does NOT survive `res.clone()` or
+ * `new Response(res.body)` — a clone's `json()` is the prototype's again and
+ * throws a bare SyntaxError. Nothing in src/ clones a guarded response today
+ * (checked), so this is latent rather than live; anything that starts to should
+ * read `text()` and classify it directly instead.
  *
  * Applied to ALL statuses, not just the ones the library throws on: a 200 that
  * carries an HTML catch-all is the same defect one layer over, and the override
@@ -981,7 +1040,13 @@ export async function diagnoseComfyEndpoint(url: string): Promise<NonJsonDiagnos
       JSON.parse(body);
       return null; // it parses now — we cannot claim the earlier body was HTML
     } catch {
-      return classifyNonJson({ url, status: res.status, contentType, body });
+      return classifyNonJson({
+        url,
+        status: res.status,
+        statusText: res.statusText,
+        contentType,
+        body,
+      });
     }
   } catch {
     return null; // probe failed; we learned nothing and must not invent a cause

@@ -862,6 +862,7 @@ export async function getSetting(id: string): Promise<unknown> {
       classifyNonJson({
         url,
         status: res.status,
+        statusText: res.statusText,
         contentType: res.headers.get("content-type") ?? "",
         body: text,
       }),

@@ -299,7 +299,52 @@ describe("the diagnosis URL is redacted (codex gate, finding 6)", () => {
     // The route and the parameter NAME still print — that is what identifies
     // the responder, and redacting them would defeat the diagnosis.
     expect(out).toContain("gw.example.com/internal/logs");
-    expect(out).toContain(param);
+    // Anchored: a bare toContain("t") is satisfied by "internal" and asserts
+    // nothing (review finding, test integrity).
+    expect(out).toContain(`?${param}=`);
+  });
+
+  // Review finding 2: dropping the value length-check for the WHOLE allowlist
+  // was wider than the long-filename evidence justified. Generic single words
+  // like `id`/`ref`/`name` are as likely to be a gateway's choice as ComfyUI's.
+  it.each([
+    ["id", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIn0.sig"],
+    ["ref", "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MA"],
+    ["name", "AKIAIOSFODNN7EXAMPLEwJalrXUtnFEMI"],
+  ])("still length-checks the generic allowlisted name %s", (param, secret) => {
+    expect(redactUrlForDiagnosis(`https://gw.example.com/l?${param}=${secret}`)).not.toContain(
+      secret,
+    );
+  });
+
+  it("redacts a secret nested inside a redirect_uri", () => {
+    // An arbitrary URL as a value: `:` and `?` are outside the opaque alphabet,
+    // so no length rule can see the nested credential. The name was dropped
+    // from the allowlist entirely instead.
+    const nested = encodeURIComponent("https://app.example/cb?session=s3cr3t-live");
+    expect(redactUrlForDiagnosis(`https://gw.example.com/l?redirect_uri=${nested}`)).not.toContain(
+      "s3cr3t-live",
+    );
+  });
+
+  // Review finding 4: a RELATIVE target reaches this too — client.ts passes
+  // "/settings", `/settings/${id}` and "/history" straight into readComfyJson.
+  it("gives a relative target the same path scrub as an absolute one", () => {
+    expect(redactUrlForDiagnosis("/t/AbCdEf0123456789AbCdEf0123456789/logs")).not.toContain(
+      "AbCdEf0123456789AbCdEf0123456789",
+    );
+    expect(redactUrlForDiagnosis("/logs;jsessionid=s3cr3t-live")).not.toContain("s3cr3t-live");
+    // …without disturbing the ordinary case.
+    expect(redactUrlForDiagnosis("/internal/logs")).toBe("/internal/logs");
+  });
+
+  // Review finding 5: `data:`/`blob:` PARSE, but their pathname setter is a
+  // spec'd no-op, so the path scrub silently did nothing while reporting that
+  // it had — the one fail-OPEN path in a fail-closed helper.
+  it("does not fail open on a non-http scheme", () => {
+    expect(
+      redactUrlForDiagnosis("data:text/plain;base64,QUJDREVGR0hJSktMTU5PUFFSU1RVVldY"),
+    ).not.toContain("QUJDREVGR0hJSktMTU5PUFFSU1RVVldY");
   });
 
   it("redacts userinfo and a fragment token", () => {
