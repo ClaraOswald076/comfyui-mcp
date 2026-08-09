@@ -899,7 +899,13 @@ async function statusAction(args: {
                   ? `\n    ${placement.pathLabel}${placement.pathQualifier}: ${j.path}`
                   : `\n    ${placement.pathLabel}${placement.pathQualifier}: ${j.path}\n    ${placement.wrongPlace ? "WARNING" : "NOTE"}: ${placement.warning}`
               : j.status === "error"
-                ? `\n    failed: ${j.error}`
+                ? j.interruptedByRestart
+                  ? // #1148 — NOT a transfer failure. The process it streamed
+                    // inside exited, which the previous behaviour rendered as
+                    // "No download matching id": the job silently ceased to exist
+                    // while the contract told the caller to keep waiting.
+                    `\n    INTERRUPTED — ${j.error}`
+                  : `\n    failed: ${j.error}`
                 : j.status === "cancelled"
                   ? (j.reclaimedDead
                       ? // #858: NO live transfer was aborted — the writer was already
