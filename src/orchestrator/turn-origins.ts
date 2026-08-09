@@ -28,6 +28,7 @@
 // is unchanged, so the stamp would pass).
 
 import { randomUUID } from "node:crypto";
+import { shortTabId } from "../services/session-scope.js";
 
 export interface TurnOriginDeps {
   /** The backend a panel tab is CURRENTLY on (live tabBackends lookup). */
@@ -548,7 +549,7 @@ export function makeScopeRepinHandler(opts: {
       return {
         repinned: false,
         reason:
-          `the existing pin (${existing.slice(0, 8)}) still reaches a live tab of this ` +
+          `the existing pin (${shortTabId(existing)}) still reaches a live tab of this ` +
           `conversation, so it is healthy and was left alone — this recovery only displaces a ` +
           `pin that is dead or ambiguous`,
       };
@@ -572,10 +573,14 @@ export function makeScopeRepinHandler(opts: {
     // refreshed, closed and reopened the tab, and finally traced it to source.
     //
     // The state worth naming is the last one: `active` exists but belongs to a
-    // DIFFERENT backend's conversation while this one has two or more tabs. That
-    // is reachable in ordinary multi-tab use, it repeats on every retry, and
-    // nothing in the old reply hinted that targeting a workflow explicitly is the
-    // way out.
+    // DIFFERENT backend's conversation while this one has two or more tabs.
+    //
+    // NOT permanent, and saying so would overstate it — the active tab moves on
+    // the next user_message, so a message sent from one of this conversation's
+    // own tabs clears it. What IS true is that RETRYING THE TOOL never clears
+    // it: the inputs are identical every time, which is what the reporter
+    // experienced before refreshing and reopening the tab. Nothing in the old
+    // reply hinted at either way out.
     if (!tab) {
       if (eligible.length === 0) {
         return {
@@ -589,7 +594,7 @@ export function makeScopeRepinHandler(opts: {
         repinned: false,
         reason:
           `this conversation has ${eligible.length} eligible tabs and the active one ` +
-          `(${active ? active.slice(0, 8) : "none"}) is not among them, so "current" does not ` +
+          `(${active ? shortTabId(active) : "none"}) is not among them, so "current" does not ` +
           `identify which to bind. Name the workflow instead — panel_set_workflow_target with a ` +
           `path, or panel_open_workflow — and the pin follows it`,
       };

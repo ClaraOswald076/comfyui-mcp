@@ -12,12 +12,17 @@
 // `rebound: false`. A healthy pin correctly left alone and a permanent ambiguity
 // were the same value.
 //
-// And one of those four repeats forever. `mode:"current"` picks the active tab
-// when it is eligible, or the sole eligible tab — otherwise nothing. So when the
-// ACTIVE tab belongs to another backend's conversation and this one has two or
-// more tabs, every retry refuses identically, and nothing in the reply hinted
-// that naming a workflow is the way out. That is reachable in ordinary multi-tab
-// use, which is the shape the report describes.
+// And one of those four cannot be escaped BY RETRYING. `mode:"current"` picks the
+// active tab when it is eligible, or the sole eligible tab — otherwise nothing.
+// So when the ACTIVE tab belongs to another backend's conversation and this one
+// has two or more tabs, every retry refuses on identical inputs, and nothing in
+// the reply hinted that naming a workflow is the way out.
+//
+// Deliberately NOT called permanent, which the first draft of this claimed: the
+// active tab moves on the next `user_message`, so a message sent from one of this
+// conversation's own tabs also clears it. Both ways out were invisible; the retry
+// loop is the one a stuck caller actually sits in, which is what the report
+// describes.
 
 import { describe, expect, it } from "vitest";
 
@@ -63,15 +68,20 @@ function handlerFor(opts: {
 }
 
 describe("a declined repin says which branch declined it (#1077)", () => {
-  it("THE PERMANENT ONE: active tab on another backend, several eligible here", () => {
+  it("THE STUCK ONE: active tab on another backend, several eligible here", () => {
     // Two tabs for this conversation, and the active tab belongs to codex's.
     // `mode:"current"` cannot name one, so this refuses identically every retry.
     const repin = handlerFor({
       bridge: bridgeWith({
-        tabs: [{ tab_id: "wf:a" }, { tab_id: "wf:b" }, { tab_id: "wf:other" }],
-        active: "wf:other",
+        tabs: [
+          { tab_id: "wf:workflows/alpha.json" },
+          { tab_id: "wf:workflows/beta.json" },
+          { tab_id: "wf:workflows/other.json" },
+        ],
+        active: "wf:workflows/other.json",
       }),
-      backendForTab: (t) => (t === "wf:other" ? "codex" : "claude"),
+      backendForTab: (t) =>
+        t === "wf:workflows/other.json" ? "codex" : "claude",
     });
 
     const out = repin(SCOPE);
@@ -81,15 +91,27 @@ describe("a declined repin says which branch declined it (#1077)", () => {
     const reason = (out as { reason: string }).reason;
     expect(reason, "says how many tabs are eligible").toMatch(/2 eligible tabs/);
     expect(reason, "says the active tab is not one of them").toMatch(/is not among them/);
+    // #934's lesson, which this reason repeated: `slice(0, 8)` renders EVERY
+    // `wf:workflows/…` id as the literal "wf:workf", so a message naming two
+    // different workflow tabs read as naming the same one twice.
+    expect(reason, "the tab must be identifiable").toContain("other.json");
+    expect(reason).not.toContain("wf:workf ");
     // The way out, which the old reply never mentioned.
     expect(reason).toMatch(/panel_set_workflow_target with a path|panel_open_workflow/);
   });
 
-  it("it repeats identically — the retry cannot change the answer", () => {
-    // What made the reporter refresh, close and reopen the tab.
+  it("RETRYING alone cannot change the answer", () => {
+    // What made the reporter refresh, close and reopen the tab. Deliberately not
+    // called "permanent": the active tab moves on the next user_message, so a
+    // message from one of this conversation's own tabs clears it. It is the
+    // RETRY that is futile, and that is the loop a stuck caller is in.
     const repin = handlerFor({
       bridge: bridgeWith({
-        tabs: [{ tab_id: "wf:a" }, { tab_id: "wf:b" }, { tab_id: "wf:other" }],
+        tabs: [
+          { tab_id: "wf:workflows/alpha.json" },
+          { tab_id: "wf:workflows/beta.json" },
+          { tab_id: "wf:workflows/other.json" },
+        ],
         active: "wf:other",
       }),
       backendForTab: (t) => (t === "wf:other" ? "codex" : "claude"),
