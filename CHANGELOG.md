@@ -21,6 +21,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.79] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- persist job records without a panel, so a restart can be survived (#1278)
+- do not adopt an in-flight record whose writer is PROVEN gone (#1275)
+
+#### Changed
+- 0.50.78 — an open that lands on another workflow stops reporting success (panel#887) (#1276)
+
+
 ## [0.50.78] - 2026-08-09
 
 ### MCP
