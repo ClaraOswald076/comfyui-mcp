@@ -20,7 +20,7 @@
 
 import { ComfyUIError } from "../utils/errors.js";
 import { getComfyUIAuthHeaders, getComfyUIBaseUrl } from "../config.js";
-import { comfyuiFetch } from "./fetch.js";
+import { comfyuiFetch, targetOf } from "./fetch.js";
 
 /** What answered instead of the ComfyUI JSON API. */
 export type NonJsonKind =
@@ -401,6 +401,12 @@ export function classifyNonJson(args: {
   const loginPage = html && looksLikeLoginPage(body);
   const gatewayStatus = status === 502 || status === 503 || status === 504;
   const authStatus = status === 401 || status === 403;
+  // An EMPTY body is its own observation and deserves its own sentence. It is
+  // what a parser reports as "Unexpected end of JSON input" — the message #828
+  // and #1160 were reported as — and the generic "did not parse as JSON and is
+  // not markup either" reads as though there WAS a body to inspect, sending the
+  // reader to look at a body prefix that says "(empty)".
+  const empty = body.trim() === "";
 
   let kind: NonJsonKind;
   let cause: string;
@@ -428,6 +434,20 @@ export function classifyNonJson(args: {
     cause = looksLikeComfyFrontend(body)
       ? "the ComfyUI web FRONTEND answered this path (its markers are in the body) instead of the ComfyUI HTTP API — typically a reverse proxy that forwards the UI but not the API routes, or a base URL pointing at the frontend's catch-all"
       : "some HTTP responder other than the ComfyUI JSON API answered this path; this body alone does not identify which. The usual candidates are the ComfyUI frontend's SPA catch-all, a reverse proxy that forwards the UI but not the API routes, a maintenance/WAF page, or an unrelated web app on this host";
+  } else if (empty) {
+    // A 404 with nothing in it is still "that route is not served here", and
+    // saying so is more use than a generic parse complaint.
+    kind = status === 404 ? "not-found" : "not-json";
+    cause =
+      `NOTHING was sent back — the response carried no body at all, so the ${status} status is the entire message ` +
+      `and this response does not identify what produced it. That is what a JSON parser reports as ` +
+      `"Unexpected end of JSON input", and it is equally consistent with ComfyUI itself answering the status ` +
+      `without an error document, with a proxy or gateway ending the exchange after the headers, and with a route ` +
+      `that is not served here at all. Nothing in this response distinguishes them` +
+      (status >= 200 && status < 300
+        ? `, and note the status is a SUCCESS one — an empty 2xx where a JSON document was promised points at ` +
+          `something answering on ComfyUI's behalf rather than at ComfyUI`
+        : ``);
   } else if (malformedJson) {
     kind = "not-json";
     // OBSERVED: the body starts with `{` or `[` and JSON.parse rejects it. That
@@ -453,11 +473,13 @@ export function classifyNonJson(args: {
 
   const what = html
     ? "an HTML page"
-    : malformedJson
-      ? "a body that begins like JSON but does not parse"
-      : contentType
-        ? `a ${contentType} body that did not parse as JSON`
-        : "a body that did not parse as JSON";
+    : empty
+      ? "an EMPTY body"
+      : malformedJson
+        ? "a body that begins like JSON but does not parse"
+        : contentType
+          ? `a ${contentType} body that did not parse as JSON`
+          : "a body that did not parse as JSON";
   const message =
     `${url} answered ${status} with ${what} where JSON was expected. This means ${cause}. ` +
     `Content-Type: ${contentType || "(none)"}. Body starts: ${bodyPrefix || "(empty)"}. ` +
@@ -527,6 +549,78 @@ export async function readComfyJson<T = unknown>(
     });
   }
   return parsed as T;
+}
+
+/**
+ * Wrap the `fetch` handed to the ComfyUI client library so the library's own
+ * error path cannot EAT the response (#828, #1160).
+ *
+ * `Client.fetchApi` does this on every status outside [200, 400):
+ *
+ *     if (status < 200 || status >= 400)
+ *       return res.json().then(body => { throw new Error(`Endpoint Bad Request (${status} ${statusText}): ${url}`) })
+ *
+ * — it reads the ERROR body as JSON in order to attach it to the error it is
+ * about to throw. When that body is not JSON, `res.json()` rejects FIRST, and
+ * its bare SyntaxError propagates in place of the library's error, so the
+ * status, the statusText and the URL are all lost. The failure is upstream of
+ * every `client.fetchApi` call site, which is why guarding them one at a time
+ * kept missing it:
+ *
+ *   - #828: a remote `/internal/logs` answered non-2xx with an empty body after
+ *     a reconnect, and surfaced as
+ *     `Failed to fetch ComfyUI logs after reconnect retry: Unexpected end of JSON input`.
+ *   - #1160: `upload_image` on an authenticated remote surfaced as a bare
+ *     `Unexpected end of JSON input` even though `uploadImageHttp`'s SUCCESS
+ *     path already runs `readComfyJson` — the auth gate's 401/403 made the
+ *     library throw before that code ever saw the response, so its own
+ *     `if (!res.ok)` branch was unreachable.
+ *
+ * The wrapper overrides `json()` on the returned Response so a parse failure
+ * throws the diagnosis instead of a SyntaxError. It deliberately does NOT read
+ * the body up front: the override consumes the stream at exactly the moment the
+ * original `json()` would have, so `text()`, `body` and `bodyUsed` are unchanged
+ * for every caller that does not call `json()` — including `readComfyJson`,
+ * which reads `text()` and keeps its own richer shape checking.
+ *
+ * Applied to ALL statuses, not just the ones the library throws on: a 200 that
+ * carries an HTML catch-all is the same defect one layer over, and the override
+ * costs nothing on a response nobody parses.
+ */
+export function guardClientFetch(
+  base: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
+): (input: string | URL | Request, init?: RequestInit) => Promise<Response> {
+  return async (input, init) => {
+    const res = await base(input, init);
+    // Bind before overriding: the override must reach the REAL reader, and
+    // `res.text` would otherwise still resolve through the prototype anyway —
+    // binding makes that independent of anything else patching the instance.
+    const readText = res.text.bind(res);
+    // `url` on a real fetch Response is the FINAL url after redirects, which is
+    // the more useful one to name. Falling back to the request target keeps the
+    // message honest for a synthesised response (a test double, a mock).
+    const url = res.url || targetOf(input);
+    Object.defineProperty(res, "json", {
+      configurable: true,
+      writable: true,
+      value: async (): Promise<unknown> => {
+        const body = await readText();
+        try {
+          return JSON.parse(body);
+        } catch {
+          throw new NonJsonResponseError(
+            classifyNonJson({
+              url,
+              status: res.status,
+              contentType: res.headers.get("content-type") ?? "",
+              body,
+            }),
+          );
+        }
+      },
+    });
+    return res;
+  };
 }
 
 /** Fetch a ComfyUI endpoint and parse it as JSON with the guard above. */

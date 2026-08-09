@@ -18,6 +18,8 @@ import { comfyuiFetch } from "./fetch.js";
 import {
   classifyNonJson,
   fetchComfyJson,
+  guardClientFetch,
+  isNonJsonResponseError,
   looksLikeHtmlParsedAsJson,
   NonJsonResponseError,
   readComfyJson,
@@ -81,7 +83,12 @@ export function getClient(): Client {
       clientId: "comfyui-mcp",
       // Inject generic auth headers (COMFYUI_AUTH_*) on the library's own HTTP
       // calls; a no-op when unset. Node 22+ provides global WebSocket.
-      fetch: comfyuiFetch,
+      //
+      // Wrapped so the library's non-2xx path — which calls `res.json()` on the
+      // ERROR body and lets a bare SyntaxError replace its own error, losing the
+      // status and the URL with it — reports what actually answered instead
+      // (#828, #1160). See guardClientFetch.
+      fetch: guardClientFetch(comfyuiFetch),
     });
     logger.info("ComfyUI client created", {
       host: getComfyUIApiHost(),
@@ -700,6 +707,12 @@ export async function getLogs(): Promise<string[]> {
     try {
       text = await getClient().fetchApi("/internal/logs").then((r) => r.text());
     } catch (err2) {
+      // A DIAGNOSED non-JSON answer is not a connection failure — the server (or
+      // whatever is in front of it) replied, and the diagnosis already names the
+      // endpoint, the status and what answered. Wrapping it in a ConnectionError
+      // titled "Failed to fetch" contradicted its own contents and sent readers
+      // to check whether ComfyUI was up when it demonstrably was (#828).
+      if (isNonJsonResponseError(err2)) throw err2;
       const detail = err2 instanceof Error ? err2.message : String(err2);
       throw new ConnectionError(
         `Failed to fetch ComfyUI logs after reconnect retry: ${detail}`,
