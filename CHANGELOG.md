@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.62] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a 0-node outline right after a restore is not an observation (#1221)
+
+
 ## [0.50.61] - 2026-08-09
 
 ### MCP
