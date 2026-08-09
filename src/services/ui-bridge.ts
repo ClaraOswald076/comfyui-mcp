@@ -1035,9 +1035,35 @@ export function requiresWorkflowStampEnforcement(cmd: { cmd?: unknown }): boolea
   return ACTIVE_WORKFLOW_MUTATORS.has(name);
 }
 
-/** Tight default reply timeout for a MUTATING command with no explicit timeout —
- *  fail fast so the agent isn't blocked on a stuck write. */
-export const BRIDGE_DEFAULT_TIMEOUT_MS = 6000;
+/**
+ * Default reply timeout for a MUTATING command with no explicit timeout.
+ *
+ * This was 6000 ms — the flat pre-#574 default, kept when reads were raised to
+ * 20 s, on the rationale "fail fast so the agent isn't blocked on a stuck write".
+ * That rationale had the asymmetry backwards, and #694's recurrence is what it
+ * costs: `panel_set_node_mode` timed out at 6 s on a live tab, and an immediate
+ * `panel_query_graph` showed the mode HAD been set.
+ *
+ * The reason reads got 20 s applies to writes with more force, not less. It is the
+ * same busy-but-alive main thread — a write does strictly more of that work, since
+ * it mutates, re-renders, and answers the workflow-stamp check — and the two
+ * failures are not equally expensive:
+ *
+ *   - A read abandoned too early costs a retry. Nothing is ambiguous.
+ *   - A write abandoned too early is UNRECOVERABLE ambiguity. The command was
+ *     already delivered, so it may have applied; the bridge deliberately refuses
+ *     to auto-retry it (#334), and the caller is left to verify by hand before it
+ *     can safely do anything. Which is exactly the manual step the reporter
+ *     performed.
+ *
+ * So the cheap failure got the patience and the expensive one got the hair
+ * trigger. Writes now wait as long as reads. This lowers how OFTEN a live tab is
+ * declared unknown; it does not make an unknown recoverable — that needs the
+ * caller-supplied retry identity #694 is actually about.
+ *
+ * Never below the read bound: see the invariant test.
+ */
+export const BRIDGE_DEFAULT_TIMEOUT_MS = 20_000;
 /** More tolerant default for a READ (idempotent) command with no explicit timeout.
  *  A legitimately busy-but-alive panel main thread — e.g. Preview3D parsing a large
  *  FBX — can take many seconds to service a graph_query; failing it at the tight

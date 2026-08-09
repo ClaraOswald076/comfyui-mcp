@@ -3326,7 +3326,28 @@ describe("defaultBridgeTimeoutMs — tolerant read timeout (#357)", () => {
     // Preview3D loaded a large FBX on a busy-but-alive main thread.
     expect(defaultBridgeTimeoutMs("graph_query")).toBe(20_000);
     expect(defaultBridgeTimeoutMs("graph_query")).toBeGreaterThan(6000);
-    expect(defaultBridgeTimeoutMs("graph_query")).toBeGreaterThan(defaultBridgeTimeoutMs("graph_run"));
+  });
+
+  it("a WRITE is never abandoned sooner than a read (#694)", () => {
+    // This inverts what #574 left in place, and the inversion is the point.
+    //
+    // A read abandoned too early costs a retry. A write abandoned too early is
+    // unrecoverable ambiguity: it was already delivered so it may have applied,
+    // the bridge refuses to auto-retry it (#334), and the caller must go verify by
+    // hand. The cheap failure had the patience and the expensive one had the hair
+    // trigger — a reporter's panel_set_node_mode timed out at 6s on a live tab
+    // that had already applied it.
+    //
+    // Asserted as an INVARIANT rather than a number so re-tightening writes fails
+    // here no matter which constant someone edits.
+    for (const write of ["graph_run", "graph_add_node", "graph_set_node_mode", "workflow_save"]) {
+      expect(BRIDGE_READONLY_CMDS.has(write)).toBe(false);
+      expect(defaultBridgeTimeoutMs(write)).toBeGreaterThanOrEqual(
+        defaultBridgeTimeoutMs("graph_query"),
+      );
+      // And still past the old flat cutoff that produced the false unknowns.
+      expect(defaultBridgeTimeoutMs(write)).toBeGreaterThan(6000);
+    }
   });
 
   it("a no-timeout READ stays alive PAST the old 6s cutoff (end-to-end) (#357)", async () => {
