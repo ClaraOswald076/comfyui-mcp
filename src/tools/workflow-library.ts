@@ -2,7 +2,7 @@ import { z } from "zod";
 import { readFile } from "node:fs/promises";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { WorkflowJSON } from "../comfyui/types.js";
-import { getClient, getObjectInfo, backfillObjectInfo } from "../comfyui/client.js";
+import { getObjectInfo, backfillObjectInfo, comfyApiFetch } from "../comfyui/client.js";
 import { errorToToolResult, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import {
@@ -55,9 +55,8 @@ async function loadRawFromSource(
   }
   if (graph) return graph;
   if (path) return JSON.parse(await readFile(path, "utf8"));
-  const client = getClient();
   const encoded = encodeURIComponent(`workflows/${filename}`);
-  const res = await client.fetchApi(`/api/userdata/${encoded}`);
+  const res = await comfyApiFetch(`/api/userdata/${encoded}`);
   if (!res.ok) {
     throw new ValidationError(`Workflow not found in library: ${filename} (${res.status})`);
   }
@@ -535,9 +534,8 @@ async function listWorkflowsAction(): Promise<TextResult> {
 
 /** `get_workflow (action:"get")` — the body of the surviving get_workflow tool. */
 async function getWorkflowAction(filename: string, format: "ui" | "api"): Promise<TextResult> {
-        const client = getClient();
         const encoded = encodeURIComponent(`workflows/${filename}`);
-        const res = await client.fetchApi(
+        const res = await comfyApiFetch(
           `/api/userdata/${encoded}`,
         );
 
@@ -709,7 +707,6 @@ async function saveWorkflowAction(
   workflowArg: Record<string, unknown>,
 ): Promise<TextResult> {
         const args = { filename, workflow: workflowArg };
-        const client = getClient();
         const encoded = encodeURIComponent(`workflows/${args.filename}`);
 
         // API-format graphs can't be opened by the canvas — the #1 way agents
@@ -751,7 +748,7 @@ async function saveWorkflowAction(
             `cannot open it.`;
         }
 
-        const res = await client.fetchApi(
+        const res = await comfyApiFetch(
           `/api/userdata/${encoded}`,
           {
             method: "POST",
@@ -786,9 +783,8 @@ async function saveWorkflowAction(
 
 /** Load and convert a workflow from the library (shared by action:"analyze"). */
 async function loadWorkflowApi(filename: string): Promise<{ workflow: WorkflowJSON; warnings: string[] }> {
-  const client = getClient();
   const encoded = encodeURIComponent(`workflows/${filename}`);
-  const res = await client.fetchApi(`/api/userdata/${encoded}`);
+  const res = await comfyApiFetch(`/api/userdata/${encoded}`);
 
   if (!res.ok) {
     throw new ValidationError(`Workflow not found: ${filename} (${res.status})`);

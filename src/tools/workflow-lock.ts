@@ -1,4 +1,4 @@
-import { getClient } from "../comfyui/client.js";
+import { comfyApiFetch } from "../comfyui/client.js";
 import type { WorkflowJSON } from "../comfyui/types.js";
 import {
   diffLocks,
@@ -9,9 +9,8 @@ import {
 import { ValidationError } from "../utils/errors.js";
 
 async function loadWorkflowFromLibrary(filename: string): Promise<WorkflowJSON> {
-  const client = getClient();
   const encoded = encodeURIComponent(`workflows/${filename}`);
-  const res = await client.fetchApi(`/api/userdata/${encoded}`);
+  const res = await comfyApiFetch(`/api/userdata/${encoded}`);
   if (!res.ok) {
     throw new ValidationError(`Workflow not found in user library: ${filename} (${res.status})`);
   }
@@ -25,9 +24,8 @@ async function loadWorkflowFromLibrary(filename: string): Promise<WorkflowJSON> 
  */
 async function loadLockFromLibrary(filename: string): Promise<WorkflowLock | null> {
   const lockName = `${filename}.lock.json`;
-  const client = getClient();
   const encoded = encodeURIComponent(`workflows/${lockName}`);
-  const res = await client.fetchApi(`/api/userdata/${encoded}`);
+  const res = await comfyApiFetch(`/api/userdata/${encoded}`);
   if (res.status === 404) return null;
   if (!res.ok) {
     throw new ValidationError(
@@ -43,9 +41,8 @@ async function loadLockFromLibrary(filename: string): Promise<WorkflowLock | nul
 
 async function saveLockToLibrary(filename: string, lock: WorkflowLock): Promise<void> {
   const lockName = `${filename}.lock.json`;
-  const client = getClient();
   const encoded = encodeURIComponent(`workflows/${lockName}`);
-  const res = await client.fetchApi(`/api/userdata/${encoded}`, {
+  const res = await comfyApiFetch(`/api/userdata/${encoded}`, {
     method: "POST",
     body: JSON.stringify(lock, null, 2),
   });

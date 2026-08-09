@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { getClient, getSystemStats } from "../comfyui/client.js";
+import { getSystemStats, comfyApiFetch } from "../comfyui/client.js";
 import { errorToToolResult } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
@@ -23,10 +23,9 @@ export function registerMemoryManagementTools(server: McpServer): void {
     },
     async (args) => {
       try {
-        const client = getClient();
 
         // ComfyUI's /free endpoint accepts POST with JSON body
-        const res = await client.fetchApi("/free", {
+        const res = await comfyApiFetch("/free", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -96,8 +95,7 @@ export function registerMemoryManagementTools(server: McpServer): void {
  */
 export async function getEmbeddingsAction(): Promise<CallToolResult> {
       try {
-        const client = getClient();
-        const res = await client.fetchApi("/api/embeddings");
+        const res = await comfyApiFetch("/api/embeddings");
         const embeddings = (await res.json()) as string[];
 
         if (!Array.isArray(embeddings) || embeddings.length === 0) {

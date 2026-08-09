@@ -98,6 +98,43 @@ export function getClient(): Client {
   return clientInstance;
 }
 
+/**
+ * `client.fetchApi`, minus the part that makes a status branch unreachable (#385).
+ *
+ * `Client.fetchApi` THROWS for every status outside [200, 400) — it never returns
+ * a 4xx response. So every `if (!res.ok)` / `if (res.status === 404)` written
+ * after a `fetchApi` call is dead code, and the endpoint-specific answers behind
+ * those checks have never once run. That is not a theoretical concern:
+ *
+ *   - `fetchImage`'s IMAGE_NOT_FOUND — added by #435 for issue #385 itself, naming
+ *     the filename and pointing at the listing tool — never fired for a missing
+ *     output file.
+ *   - `getSetting` treats a 404 as "unset (frontend default applies)", because
+ *     some ComfyUI builds 404 the per-id settings route. Those builds threw.
+ *   - `loadLockFromLibrary` treats a 404 as "no lock present", which is the
+ *     ORDINARY case for an unlocked workflow. It threw.
+ *
+ * This keeps the library's URL and header construction verbatim — `apiURL` adds
+ * the api_base prefix and the clientId, `apiHeaders` adds comfy-user and merges
+ * the caller's — so a proxied, prefixed or multi-user target resolves exactly as
+ * before. The ONLY difference is that the Response comes back instead of being
+ * turned into an exception, which is what lets the caller classify it.
+ *
+ * `userdataFetch` in services/userdata-library.ts arrived at this same shape
+ * independently for one route (panel #202); this is that fix generalised.
+ *
+ * Not a replacement for `comfyuiFetch`: use that when you are composing the URL
+ * yourself (as `getSystemStats` and `enqueuePrompt` do). Use this when you want
+ * the library's routing and a Response you can read.
+ */
+export async function comfyApiFetch(route: string, init: RequestInit = {}): Promise<Response> {
+  const client = getClient();
+  return await client.fetch(client.apiURL(route), {
+    ...init,
+    headers: client.apiHeaders(init),
+  });
+}
+
 export async function connectClient(): Promise<Client> {
   requireLocalMode("connectClient");
   const client = getClient();
@@ -817,7 +854,7 @@ function settingsVersionDriftError(): ComfyUIError {
 export async function getSettings(): Promise<Record<string, unknown>> {
   requireLocalMode("settings");
   const client = getClient();
-  const res = await client.fetchApi("/settings");
+  const res = await comfyApiFetch("/settings");
   if (res.status === 404) throw settingsVersionDriftError();
   return await readComfyJson<Record<string, unknown>>(res, {
     url: "/settings",
@@ -846,7 +883,7 @@ export async function getSetting(id: string): Promise<unknown> {
   requireLocalMode("settings");
   const client = getClient();
   const url = `/settings/${encodeURIComponent(id)}`;
-  const res = await client.fetchApi(url);
+  const res = await comfyApiFetch(url);
   if (res.status === 404) return undefined;
   const text = await res.text();
   if (text.trim() === "") return undefined;
@@ -879,7 +916,7 @@ export async function getSetting(id: string): Promise<unknown> {
 export async function setSetting(id: string, value: unknown): Promise<void> {
   requireLocalMode("settings");
   const client = getClient();
-  const res = await client.fetchApi(`/settings/${encodeURIComponent(id)}`, {
+  const res = await comfyApiFetch(`/settings/${encodeURIComponent(id)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(value),
@@ -913,7 +950,7 @@ export async function getHistory(
   if (isCloudMode()) return cloudClient.getHistory(promptId);
   const client = getClient();
   const path = promptId ? `/history/${promptId}` : "/history";
-  const res = await client.fetchApi(path);
+  const res = await comfyApiFetch(path);
   // #1149 — this was a bare res.json(), the last unguarded parse on the media
   // read paths. A reporter on a remote H100 got `Unexpected end of JSON input`
   // from get_history and get_image after a completed video render, which
@@ -944,7 +981,7 @@ export async function fetchImage(
   if (isCloudMode()) return cloudClient.fetchImage(filename, type, subfolder);
   const client = getClient();
   const params = new URLSearchParams({ filename, type, subfolder });
-  const res = await client.fetchApi(`/view?${params.toString()}`);
+  const res = await comfyApiFetch(`/view?${params.toString()}`);
   if (!res.ok) {
     const where = subfolder ? `${type}/${subfolder}` : type;
     throw new ComfyUIError(
@@ -990,7 +1027,7 @@ export async function uploadImageHttp(
   formData.append("type", "input");
   formData.append("overwrite", "true");
   if (subfolder) formData.append("subfolder", subfolder);
-  const res = await client.fetchApi("/upload/image", {
+  const res = await comfyApiFetch("/upload/image", {
     method: "POST",
     body: formData,
   });
