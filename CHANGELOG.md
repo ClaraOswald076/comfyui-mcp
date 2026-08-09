@@ -21,6 +21,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.68] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- the stale-heartbeat note must not tell a Manager dispatch to re-issue (#1242)
+
+#### Changed
+- 0.50.67 (#1241)
+
+
 ## [0.50.67] - 2026-08-09
 
 ### MCP
