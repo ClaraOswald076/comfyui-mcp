@@ -24,7 +24,9 @@ function bridgeWithHeadlessGoneFor(ms: number | null): UiBridge {
   const b = new UiBridge() as UiBridge & {
     markHeadlessDisconnectForTests(at: number): void;
   };
-  if (ms !== null) b.markHeadlessDisconnectForTests(Date.now() - ms);
+  // Monotonic, matching the field — the recency window measures ELAPSED time,
+  // which the wall clock does not (codex review: an NTP step could skip it).
+  if (ms !== null) b.markHeadlessDisconnectForTests(performance.now() - ms);
   return b;
 }
 

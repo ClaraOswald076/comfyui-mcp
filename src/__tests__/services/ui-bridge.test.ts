@@ -4777,7 +4777,7 @@ describe("#875: hasLiveHeadlessClient reports the LIVE set, not the sticky one",
     // The property that killed the sticky isHeadless() is still intact: a phone
     // that has genuinely been gone longer than the window stops deferring, on
     // its own, with no unpairing step and no user action.
-    bridge.markHeadlessDisconnectForTests(Date.now() - HEADLESS_RECENCY_MS - 1);
+    bridge.markHeadlessDisconnectForTests(performance.now() - HEADLESS_RECENCY_MS - 1);
     expect(bridge.hasLiveHeadlessClient()).toBe(false);
   });
 

@@ -2371,7 +2371,7 @@ export class UiBridge {
         // `headless` flag is still readable. This is the only place that knows a
         // headless socket just closed; after the delete the information is gone.
         if (this.conns.get(tabId)?.headless === true) {
-          this.lastHeadlessDisconnectAt = Date.now();
+          this.lastHeadlessDisconnectAt = performance.now();
         }
         this.conns.delete(tabId);
         if (this.lastActiveTabId === tabId) this.setLastActiveTab(null);
@@ -2813,16 +2813,32 @@ export class UiBridge {
    *  false for one that has genuinely been gone longer than the window. */
   private recentHeadlessWithin(ms: number): boolean {
     if (this.lastHeadlessDisconnectAt === undefined) return false;
-    return Date.now() - this.lastHeadlessDisconnectAt < ms;
+    return performance.now() - this.lastHeadlessDisconnectAt < ms;
   }
 
-  /** When a headless client last held an open socket (#1176). Undefined until one
-   *  disconnects — never set on a client that has not paired, so an install that
-   *  has never seen a phone can never defer. */
+  /**
+   * When a headless client last held an open socket (#1176), on the MONOTONIC
+   * clock — `performance.now()`, not `Date.now()`.
+   *
+   * This measures ELAPSED TIME, and the wall clock is not a measure of elapsed
+   * time: an NTP correction can move it. On Windows a step of more than the
+   * window would make a phone that disconnected seconds ago look long gone, and
+   * the restart would rotate the tunnel hostname — the exact bug this window
+   * exists to prevent, reintroduced by the clock rather than by the logic. A
+   * backward step would defer far longer than intended. (codex review, PR #1185)
+   *
+   * `performance.now()` is monotonic from process start, which is the right
+   * lifetime here: the value is only ever compared against another reading from
+   * the same process, and a restart clears it — after which there is no phone
+   * this process has seen, which is the correct answer anyway.
+   *
+   * Undefined until a headless client actually disconnects, so an install that
+   * has never seen a phone can never defer.
+   */
   private lastHeadlessDisconnectAt: number | undefined;
 
-  /** Test seam: the recency clock, so a test can place a disconnect in the past
-   *  without sleeping. */
+  /** Test seam: place the recency clock in the past without sleeping. Takes a
+   *  `performance.now()`-based reading, matching the field. */
   markHeadlessDisconnectForTests(at: number): void {
     this.lastHeadlessDisconnectAt = at;
   }
