@@ -3824,6 +3824,41 @@ export interface NormalizedGitUrlInstallArgs extends GitUrlInstallArgs {
  * `id` AND `repository` together name TWO targets (the schema presents them as
  * alternatives); that is a conflict to refuse, not a precedence to pick.
  */
+/**
+ * The route that still works when the Manager has no route at all (#789, recurrence).
+ *
+ * Rerouting a git URL to a from-source "nightly" install fixed the ORIGINAL report,
+ * where the pack was registered and only the version spec was wrong. It cannot fix
+ * the recurrence, because that pack is not in the registry:
+ *
+ *   Node 'ComfyUI-MiniMaxH3-FirstBlockCache@nightly' not found
+ *     — ManagerChannel.dev, ManagerDatabaseSource.remote
+ *
+ * Manager v4's do_install resolves a pack by its registry ID, never by URL (the
+ * 3.x `files:[url]` clone path does not exist there), so on a v4 host an
+ * unregistered repository has NO Manager route by any spelling. The panel cannot
+ * clone either — it is browser JS.
+ *
+ * `install_custom_node` can: it tries the Manager first and then clones the URL
+ * directly into custom_nodes, verifying the result is a real pack. That is the
+ * one tool that finishes this job, and the reporter had to find it by hand after
+ * being left at "not found". Naming it here costs a sentence.
+ *
+ * Stated up front rather than on the failure: the failure text comes back from
+ * the panel and matching on it would be brittle, and an agent that reads this
+ * when the install is queued needs one fewer round trip than one that reads it
+ * after the queue drains.
+ */
+function unregisteredPackEscapeHatch(): string {
+  return (
+    `If this comes back "not found" / "not available node", the pack is not in the ` +
+    `Manager's registry at all — on Manager v4 that leaves NO Manager route for a ` +
+    `repository URL, by any spelling. Use install_custom_node (source:"git") instead: ` +
+    `it clones the URL directly into custom_nodes and verifies a real pack landed. ` +
+    `Requires a LOCAL ComfyUI, since the clone writes to its filesystem.`
+  );
+}
+
 export function normalizeGitUrlInstallArgs(
   args: GitUrlInstallArgs,
 ): NormalizedGitUrlInstallArgs {
@@ -3854,7 +3889,8 @@ export function normalizeGitUrlInstallArgs(
       `"${gitTarget}" is a git repository URL, so this was queued as a from-source ` +
       `install with version "nightly" (git HEAD): ComfyUI-Manager cannot resolve a ` +
       `registry "latest" for a repository-style entry and rejects it ("not available ` +
-      `node: <repo>@<version>"). Pass an explicit version/ref to override.`;
+      `node: <repo>@<version>"). Pass an explicit version/ref to override. ` +
+      unregisteredPackEscapeHatch();
   } else {
     out.version = args.version;
   }

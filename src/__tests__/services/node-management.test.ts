@@ -2179,6 +2179,31 @@ describe("node-management service", () => {
       expect(out.id).toBeUndefined();
     });
 
+    // #789 RECURRENCE — the reroute cannot fix an UNREGISTERED pack.
+    //
+    // The original report was a registered pack with the wrong version spec, which
+    // "nightly" fixes. The recurrence was ComfyUI-MiniMaxH3-FirstBlockCache, which
+    // is in no registry: Manager v4's do_install resolves by pack ID and never by
+    // URL (3.x's files:[url] clone path does not exist there), so a v4 host has NO
+    // Manager route for it by any spelling, and the panel cannot clone — it is
+    // browser JS. The reporter was left at "not found" and had to find the working
+    // tool themselves.
+    it("names install_custom_node, the tool that CAN finish an unregistered pack", () => {
+      const out = normalizeGitUrlInstallArgs({ id: URL });
+      expect(out.note).toMatch(/install_custom_node/);
+      expect(out.note).toMatch(/source:"git"/);
+      // The trigger the caller will actually see from the Manager.
+      expect(out.note).toMatch(/not found.*not available node|not available node/);
+      // And its precondition — the clone writes to the server's filesystem.
+      expect(out.note).toMatch(/LOCAL ComfyUI/);
+    });
+
+    it("does not offer the escape hatch when the caller pinned a version", () => {
+      // No reroute happened, so there is no note at all — a pinned version is the
+      // caller's own choice and gets no advice it did not ask for.
+      expect(normalizeGitUrlInstallArgs({ id: URL, version: "8.28.3" }).note).toBeUndefined();
+    });
+
     it("translates an explicit 'latest' on a git URL to 'nightly' (the #789 failure shape)", () => {
       const out = normalizeGitUrlInstallArgs({ id: URL, version: "latest" });
       expect(out.version).toBe("nightly");
