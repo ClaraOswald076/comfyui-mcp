@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.45] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- an interrupted download leaves a findable record instead of vanishing (#1170)
+
+
 ## [0.50.44] - 2026-08-08
 
 ### MCP
