@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.58] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- scrub /internal/logs before it reaches a tool result (#1209)
+
+
 ## [0.50.57] - 2026-08-09
 
 ### MCP
