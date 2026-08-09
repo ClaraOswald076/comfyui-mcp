@@ -146,7 +146,7 @@ import {
 import { AskAnswers, preview as previewQuestion } from "./ask-answer-journal.js";
 import { initRunpodWatcher, getRunpodWatcher, type RunpodStatusFrame, type RunpodAlertFrame } from "../services/runpod-watch.js";
 import { getPod } from "../services/runpod-client.js";
-import { listTargetChangeRequests, consumeTargetChange, ackTargetChange, setProgressDir, CONTROL_PREFIX, newestAttemptEpochs, isSupersededAttempt, downloadAttemptKey, markSupersededByLive } from "../services/download-progress.js";
+import { listTargetChangeRequests, consumeTargetChange, ackTargetChange, setProgressDir, CONTROL_PREFIX, newestAttemptEpochs, isSupersededAttempt, downloadAttemptKey, markSupersededByLive, migrateInFlightJobs } from "../services/download-progress.js";
 import { hasActiveTrainingJob, reconcileStaleTrainingJobs } from "../services/training-jobs.js";
 import {
   buildQueueStatusFrame,
@@ -1327,6 +1327,28 @@ export async function runPanelOrchestrator(): Promise<void> {
   try {
     for (const d of readdirSync(tmpdir())) {
       if (d.startsWith(`comfyui-mcp-progress-${bridgePort}-`) && join(tmpdir(), d) !== progressDir) {
+        // #1148 — carry any IN-FLIGHT download records forward before deleting.
+        //
+        // The persisted store exists so a reconnecting session can still resolve
+        // an in-flight download by id (#529), and download_model's status text
+        // promises exactly that. This reap deleted the store that promise rests
+        // on: a reporter's 12GB transfer answered "No download matching id" and
+        // "No downloads are being tracked", with no file, no partial, and no
+        // error event — 40 minutes lost invisibly while the documented contract
+        // told their agent to wait rather than re-issue.
+        //
+        // The transfer IS dead (it streamed inside the exited process), so this
+        // resurrects nothing. It replaces the silence with a terminal record
+        // saying the download was interrupted, which status can find by the id
+        // the caller already holds. Runs BEFORE the delete, and its failure is
+        // never allowed to skip the delete.
+        try {
+          mkdirSync(progressDir, { recursive: true, mode: 0o700 });
+          const n = migrateInFlightJobs(join(tmpdir(), d), progressDir);
+          if (n > 0) logger.info(`Carried ${n} interrupted download record(s) forward`);
+        } catch {
+          /* best-effort */
+        }
         rmSync(join(tmpdir(), d), { recursive: true, force: true });
       }
     }
