@@ -21,6 +21,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.74] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a relaunch that exits 1 must say what the child printed (#1262)
+
+#### Changed
+- 0.50.73 (#1260)
+
+
 ## [0.50.73] - 2026-08-09
 
 ### MCP
