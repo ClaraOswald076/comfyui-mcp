@@ -13,6 +13,7 @@ import {
   isCapabilityRefusal,
   defaultBridgeTimeoutMs,
   BRIDGE_DEFAULT_TIMEOUT_MS,
+  HEADLESS_RECENCY_MS,
   BRIDGE_READ_DEFAULT_TIMEOUT_MS,
   BRIDGE_READONLY_CMDS,
   isMutatingGraphCommand,
@@ -4766,8 +4767,17 @@ describe("#875: hasLiveHeadlessClient reports the LIVE set, not the sticky one",
 
     sock.close();
     await new Promise((r) => setTimeout(r, 150));
-    // The whole point of not using the sticky isHeadless(): once the phone is
-    // gone the restarter must be free to restart again.
+    // #1176 — 150ms after the socket closed is NOT "the phone is gone". It is
+    // exactly the backgrounded case: the mobile OS suspends the socket within
+    // seconds of the screen going off. This assertion used to demand `false`
+    // here, and that is the bug — a reporter's restart rotated the cloudflared
+    // hostname during a pocket interval and their phone came back to a dead URL.
+    expect(bridge.hasLiveHeadlessClient()).toBe(true);
+
+    // The property that killed the sticky isHeadless() is still intact: a phone
+    // that has genuinely been gone longer than the window stops deferring, on
+    // its own, with no unpairing step and no user action.
+    bridge.markHeadlessDisconnectForTests(Date.now() - HEADLESS_RECENCY_MS - 1);
     expect(bridge.hasLiveHeadlessClient()).toBe(false);
   });
 
