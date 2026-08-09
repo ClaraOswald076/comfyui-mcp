@@ -21,6 +21,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.80] - 2026-08-09
+
+### MCP
+
+#### Changed
+- 'unreachable' is a specific claim, not a synonym for 'it failed' (#1281)
+- 0.50.79 (#1280)
+
+
 ## [0.50.79] - 2026-08-09
 
 ### MCP
