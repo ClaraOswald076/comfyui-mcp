@@ -140,6 +140,54 @@ describe("get_history surfaces non-media output values (#1229)", () => {
     expect(out).toContain("    line2");
   });
 
+  it("never lets one key run into another key's continuation", () => {
+    // Round 2: my two round-1 fixes collided. Rendering leftovers alongside
+    // media, plus indented multi-line blocks, meant join(" | ") appended the
+    // next key to the last indented line - "animated: true" read as the tail of
+    // a PreviewAny error. No data lost, but MIS-ATTRIBUTED, which is the
+    // adjacent defect by this issue's own standard.
+    const out = formatHistoryEntry(
+      "p1",
+      entryWith({
+        "2": {
+          images: [{ filename: "a.webp", subfolder: "", type: "output" }],
+          text: ["ERROR: node 5 failed\n  missing model foo.safetensors"],
+          animated: [true],
+        },
+      }),
+    );
+    const animLine = out.split("\n").find((l) => l.includes("animated"));
+    expect(animLine, "animated must be on its own line").toBeTruthy();
+    expect(animLine).not.toContain("foo.safetensors");
+  });
+
+  it("separates multiple keys without an inline separator that content can forge", () => {
+    // MA: the separator was pinned by nothing, and " | " only MOVED the
+    // collision - a markdown table row is a plausible PreviewAny payload.
+    const out = formatHistoryEntry(
+      "p1",
+      entryWith({ "1": { text: ["| col a | col b |"], seed: [42] } }),
+    );
+    const seedLine = out.split("\n").find((l) => l.trim().startsWith("- seed:"));
+    expect(seedLine, "seed must be its own line, not inline after a pipe").toBeTruthy();
+    expect(out).toContain("| col a | col b |");
+  });
+
+  it("distinguishes an EMPTY output object from a missing one", () => {
+    // Three states shared one string; distinct causes, and folding them is the
+    // defect class this issue belongs to.
+    expect(formatHistoryEntry("p1", entryWith({ "1": {} }))).toContain("(empty output object)");
+    expect(formatHistoryEntry("p1", entryWith({ "1": null }))).toContain("(no output data)");
+  });
+
+  it("counts truncation in CODE POINTS, matching how it slices", () => {
+    // MD: reporting flat.length while slicing by code point survived. An emoji
+    // payload would report a number that does not match what was cut.
+    const emoji = String.fromCodePoint(0x1f600);
+    const out = formatHistoryEntry("p1", entryWith({ "1": { text: [emoji.repeat(900)] } }));
+    expect(out).toContain("truncated, 900 chars total");
+  });
+
   it("SAYS when it truncated, rather than silently eliding", () => {
     // History can carry large values and this is read by an agent with a token
     // budget. Silently cutting a long value recreates #1229 at a different

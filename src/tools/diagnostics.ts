@@ -262,11 +262,29 @@ export function formatHistoryEntry(
         .filter(([key]) => !consumed.has(key))
         .map(([key, value]) => `${key}: ${renderOutputValue(value)}`);
       const rendered = [...expanded, ...leftovers];
-      lines.push(
-        rendered.length > 0
-          ? `- Node ${nodeId}: ${rendered.join(" | ")}`
-          : `- Node ${nodeId}: (no output data)`,
-      );
+      // One key per LINE once there is more than one, or any value is
+      // multi-line. Round 2 caught the two round-1 fixes colliding: rendering
+      // leftovers alongside media (HIGH 1) plus indented continuations for
+      // multi-line values meant `join(" | ")` appended the next key to the last
+      // indented line, so `animated: true` read as the tail of a PreviewAny
+      // error. No data lost, but mis-attributed -- and it fires on exactly the
+      // {images, text, animated} shape HIGH 1 made renderable.
+      //
+      // This also retires the inline separator rather than relocating its
+      // collision: `" | "` merely moved the clash from semicolon-bearing text
+      // onto pipe-bearing text, and a markdown table row is a very plausible
+      // PreviewAny payload.
+      if (rendered.length === 0) {
+        // Three states used to share "(no output data)": a missing output, a
+        // non-object output, and an object with no keys. Distinct causes, and
+        // folding them is the defect class this issue belongs to.
+        lines.push(`- Node ${nodeId}: (empty output object)`);
+      } else if (rendered.length === 1 && !rendered[0].includes("\n")) {
+        lines.push(`- Node ${nodeId}: ${rendered[0]}`);
+      } else {
+        lines.push(`- Node ${nodeId}:`);
+        for (const part of rendered) lines.push(`  - ${part}`);
+      }
     }
   }
 
