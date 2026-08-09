@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.46] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- getHistory names the endpoint instead of leaking a parser message (#1172)
+
+
 ## [0.50.45] - 2026-08-08
 
 ### MCP
