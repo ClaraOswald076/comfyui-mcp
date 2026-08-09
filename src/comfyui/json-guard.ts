@@ -296,40 +296,85 @@ export function scrubSecretShapedText(text: string): string | null {
 }
 
 /**
- * Parameter names whose VALUE is a credential often enough that printing it is
- * not worth the diagnosis. Matched as a SUBSTRING of the name, because gateways
- * prefix and suffix freely — `x-amz-signature`, `access_token`,
- * `cf_authorization`, `id_token` are all the same idea wearing different names,
- * and an exact-match list would have to anticipate every one of them.
+ * Query parameters worth PRINTING, which is the only list that can be complete.
+ *
+ * The first version of this went the other way — a list of credential-ish NAMES
+ * (`token`, `secret`, `signature`, …) to redact. Probing it with sixteen
+ * credential-carrying URLs leaked nine of them: `?t=`, `?jwt=`, `?ticket=`,
+ * `?nonce=`, `?otp=`, `?hmac=`, `?bearer=`, `?SAMLResponse=` and a
+ * `;jsessionid=` matrix parameter all sailed through, because the set of names
+ * a gateway might use for a credential is open and the set I can think of is
+ * not. That is the same failure the credential-encoding list in
+ * `reflectionVariants` documents above: enumerate a family by hand and you miss
+ * a member.
+ *
+ * So this is inverted and FAILS CLOSED. Only parameters this codebase itself
+ * sends to ComfyUI are shown; every other value is redacted whatever it is
+ * called. The cost is bounded and small — the origin, the path and every
+ * parameter NAME still print, which is what identifies the responder — while
+ * the benefit is that an unfamiliar parameter cannot leak by default.
  */
-const CREDENTIAL_PARAM_WORDS = [
-  "token",
-  "secret",
-  "password",
-  "passwd",
-  "pwd",
-  "signature",
-  "sig",
-  "credential",
-  "auth",
-  "session",
-  "apikey",
-  "api_key",
-  "key",
-  "code",
-  "state",
-  "assertion",
-  "refresh",
-];
+const SHOWABLE_PARAMS: ReadonlySet<string> = new Set([
+  "clientid",
+  "client_id",
+  "filename",
+  "subfolder",
+  "type",
+  "types",
+  "dir",
+  "recurse",
+  "split",
+  "node_id",
+  "ref",
+  "name",
+  "mode",
+  "raw",
+  "template",
+  "max_items",
+  "version_id",
+  "id",
+  "ui_id",
+  "format",
+  "channel",
+  "preview",
+  "overwrite",
+  "skip_update",
+  "blobs",
+  "input",
+  "response_type",
+  "scope",
+  "redirect_uri",
+  "code_challenge_method",
+]);
 
 /** A single opaque run long enough to be a credential and nothing else. Reused
  *  from the body scrubber's pass 3, but applied PER COMPONENT so an ordinary
  *  host+path — which is one long run of exactly this alphabet — survives. */
 const OPAQUE_RUN = /^[A-Za-z0-9\-._~+/=%]{24,}$/;
 
-function isCredentialish(name: string, value: string): boolean {
-  const n = name.toLowerCase();
-  return CREDENTIAL_PARAM_WORDS.some((w) => n.includes(w)) || OPAQUE_RUN.test(value);
+/** A parameter value may be printed only if we recognise the name AND the value
+ *  is not itself credential-shaped — a known-good name carrying a 40-char opaque
+ *  blob is still not something to put in an error message. */
+function isShowableParam(name: string, value: string): boolean {
+  return SHOWABLE_PARAMS.has(name.toLowerCase()) && !OPAQUE_RUN.test(value);
+}
+
+/**
+ * One path segment, with the parts that can carry a credential removed.
+ *
+ * Two shapes hide in a path. A whole segment can BE a token (`/t/<40 chars>/x`),
+ * and a MATRIX PARAMETER can append one to an ordinary segment
+ * (`/logs;jsessionid=…`) — the latter is under the opaque-run threshold and was
+ * missed entirely by the first version. The head of the segment is kept either
+ * way, because that is the route and the route is the diagnosis.
+ */
+function scrubPathSegment(segment: string): string {
+  if (OPAQUE_RUN.test(segment)) return REDACTED;
+  if (!segment.includes(";") && !segment.includes("=")) return segment;
+  const [head, ...matrix] = segment.split(";");
+  const eq = head.indexOf("=");
+  const safeHead = eq === -1 ? head : `${head.slice(0, eq)}=${REDACTED}`;
+  return matrix.length > 0 ? `${safeHead};${REDACTED}` : safeHead;
 }
 
 /**
@@ -347,9 +392,21 @@ function isCredentialish(name: string, value: string): boolean {
  * `scrubSecretShapedText` cannot be used for this: its opaque-run pass matches
  * 24+ characters of an alphabet that includes `/`, `.` and `-`, so an ordinary
  * `https://comfy.example.com/api/v1/internal/logs` collapses to `https:«redacted»`
- * and the diagnosis loses the one fact it exists to report. This redacts by
- * URL STRUCTURE instead — userinfo, credential-shaped query/fragment values,
- * and credential-shaped path segments — and leaves origin and route intact.
+ * and the diagnosis loses the one fact it exists to report. This redacts by URL
+ * STRUCTURE instead, and FAILS CLOSED on the parts that can carry a secret:
+ *
+ *   - userinfo                → always redacted
+ *   - query/fragment values   → redacted unless the NAME is one this codebase
+ *                               sends (see SHOWABLE_PARAMS) and the value is not
+ *                               itself credential-shaped
+ *   - path segments           → redacted when opaque, or when carrying a matrix
+ *                               parameter (`;jsessionid=…`)
+ *   - origin, route, param NAMES → always kept; they are the diagnosis
+ *
+ * Residual, stated rather than papered over: a SHORT secret sitting in a bare
+ * path segment (`/t/abc123/logs`) is indistinguishable from a route and is not
+ * redacted. Redacting it would mean redacting every path, which would leave the
+ * message unable to say what was requested.
  *
  * Returns the ORIGINAL string when nothing needed redacting, so a clean URL is
  * never reformatted by a round-trip through the URL parser.
@@ -373,11 +430,22 @@ export function redactUrlForDiagnosis(raw: string): string {
     u.password = "";
     changed = true;
   }
-  for (const [name, value] of [...u.searchParams]) {
-    if (value && isCredentialish(name, value)) {
-      u.searchParams.set(name, REDACTED);
-      changed = true;
+  // Rebuilt rather than mutated in place: `searchParams.set` COLLAPSES repeated
+  // keys onto the first occurrence, so `?a=1&code=…&a=2` would silently lose a
+  // value while claiming only to redact one.
+  const rebuilt = new URLSearchParams();
+  let paramsChanged = false;
+  for (const [name, value] of u.searchParams) {
+    if (value && !isShowableParam(name, value)) {
+      rebuilt.append(name, REDACTED);
+      paramsChanged = true;
+    } else {
+      rebuilt.append(name, value);
     }
+  }
+  if (paramsChanged) {
+    u.search = rebuilt.toString();
+    changed = true;
   }
   // The FRAGMENT is where an OAuth implicit flow puts its access token, and it
   // is never needed to identify a route. Any fragment carrying `=` goes.
@@ -385,10 +453,11 @@ export function redactUrlForDiagnosis(raw: string): string {
     u.hash = REDACTED;
     changed = true;
   }
-  // A token can also ride in the path (`/api/v1/<opaque>/logs`). Judge each
-  // segment on its own so a long ROUTE is not mistaken for a long secret.
+  // A token can also ride in the path (`/api/v1/<opaque>/logs`, or a
+  // `;jsessionid=` matrix parameter). Judge each segment on its own so a long
+  // ROUTE is not mistaken for a long secret.
   const segments = u.pathname.split("/");
-  const scrubbed = segments.map((s) => (OPAQUE_RUN.test(s) ? REDACTED : s));
+  const scrubbed = segments.map(scrubPathSegment);
   if (scrubbed.some((s, i) => s !== segments[i])) {
     u.pathname = scrubbed.join("/");
     changed = true;

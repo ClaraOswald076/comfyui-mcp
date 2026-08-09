@@ -275,30 +275,40 @@ describe("a first-hand diagnosis still wins over a retry blip", () => {
 });
 
 describe("the diagnosis URL is redacted (codex gate, finding 6)", () => {
-  it("redacts an OAuth redirect target without mangling the route", () => {
-    // Response.url is the url AFTER redirects, so an identity proxy that bounces
-    // the request to its SSO endpoint puts a live authorization code in it.
-    const out = redactUrlForDiagnosis(
-      "https://sso.example.com/callback?code=4/0AY0e-g7xQ&state=abc123&redirect_uri=/api",
-    );
-    expect(out).not.toContain("4/0AY0e-g7xQ");
-    expect(out).not.toContain("abc123");
-    // The part that identifies the route must survive — that is the whole point
-    // of the message.
-    expect(out).toContain("sso.example.com/callback");
-    expect(out).toContain("redirect_uri");
+  // The first version of the redactor used a list of credential-ish parameter
+  // NAMES. Probing it with credential-carrying URLs leaked NINE of sixteen,
+  // because the set of names a gateway can pick is open. Each name below is one
+  // that actually leaked; they are kept as the regression set for the inversion
+  // to a fail-closed allowlist.
+  it.each([
+    ["oauth code", "code"],
+    ["a one-letter name", "t"],
+    ["jwt", "jwt"],
+    ["ticket", "ticket"],
+    ["nonce", "nonce"],
+    ["otp", "otp"],
+    ["hmac", "hmac"],
+    ["bearer", "bearer"],
+    ["SAMLResponse", "SAMLResponse"],
+    ["X-Amz-Credential", "X-Amz-Credential"],
+    ["a capitalised Signature", "Signature"],
+    ["an unfamiliar name entirely", "wibble"],
+  ])("redacts a credential in %s", (_label, param) => {
+    const out = redactUrlForDiagnosis(`https://gw.example.com/internal/logs?${param}=s3cr3t-live`);
+    expect(out).not.toContain("s3cr3t-live");
+    // The route and the parameter NAME still print — that is what identifies
+    // the responder, and redacting them would defeat the diagnosis.
+    expect(out).toContain("gw.example.com/internal/logs");
+    expect(out).toContain(param);
   });
 
-  it("redacts a presigned-URL signature and userinfo", () => {
-    const signed = redactUrlForDiagnosis(
-      "https://s3.example.com/bucket/model.safetensors?X-Amz-Signature=deadbeefcafe&X-Amz-Expires=60",
-    );
-    expect(signed).not.toContain("deadbeefcafe");
-    expect(signed).toContain("X-Amz-Expires=60");
-
+  it("redacts userinfo and a fragment token", () => {
     expect(redactUrlForDiagnosis("http://bob:hunter2@comfy.example.com/prompt")).not.toContain(
       "hunter2",
     );
+    expect(
+      redactUrlForDiagnosis("https://gw.example.com/cb#access_token=s3cr3t-live"),
+    ).not.toContain("s3cr3t-live");
   });
 
   it("redacts a token that rides in the PATH, per segment", () => {
@@ -307,6 +317,33 @@ describe("the diagnosis URL is redacted (codex gate, finding 6)", () => {
     );
     expect(out).not.toContain("AbCdEf0123456789AbCdEf0123456789");
     expect(out).toContain("/internal/logs");
+  });
+
+  it("redacts a matrix parameter, which is under the opaque-run threshold", () => {
+    // `;jsessionid=…` is part of the PATH, not the query, and short enough to
+    // slip past a length rule. It was one of the nine leaks.
+    const out = redactUrlForDiagnosis("https://gw.example.com/logs;jsessionid=s3cr3t-live/x");
+    expect(out).not.toContain("s3cr3t-live");
+    expect(out).toContain("/logs;");
+  });
+
+  it("does not lose a repeated query key while redacting", () => {
+    // `searchParams.set` collapses repeats onto the first occurrence, which
+    // would silently drop a value while claiming only to redact one.
+    const out = redactUrlForDiagnosis("https://gw.example.com/l?a=1&code=s3cr3t-live&a=2");
+    expect(out).not.toContain("s3cr3t-live");
+    expect(out.match(/(^|[?&])a=/g)).toHaveLength(2);
+  });
+
+  it("keeps the parameters this codebase actually sends", () => {
+    // Fail-closed must not cost the diagnosis its usefulness on OUR OWN urls —
+    // these are the ones that appear in real messages.
+    for (const clean of [
+      "http://127.0.0.1:8188/view?filename=cat.png&type=output&subfolder=&clientId=comfyui-mcp",
+      "http://127.0.0.1:8188/api/userdata?dir=workflows&recurse=true&split=false",
+    ]) {
+      expect(redactUrlForDiagnosis(clean)).toBe(clean);
+    }
   });
 
   it("leaves an ordinary URL byte-identical", () => {
