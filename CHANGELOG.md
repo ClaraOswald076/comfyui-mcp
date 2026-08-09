@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.59] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- status must not report a LIVE download as missing (#1213)
+- type three test-only violations so `src/__tests__` can rejoin typechecking (#1204)
+
+
 ## [0.50.58] - 2026-08-09
 
 ### MCP
