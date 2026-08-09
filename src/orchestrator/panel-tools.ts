@@ -1586,6 +1586,101 @@ function withTruncationHints(res: ToolResult, rules: TruncationRule[]): ToolResu
  * the bound this tool advertises did not apply. The flag is stripped again before the
  * result is returned — it exists only to drive the rider.
  */
+/**
+ * A 0-node outline is a CLAIM, and one made mid-restore is not established (#1184).
+ *
+ * Right after a ComfyUI restart and a tab switch, graph_outline returned
+ * `node_count: 0` for a tab holding a 7-node starter graph — the frontend was
+ * still restoring, and the canvas transiently had nothing on it. The agent
+ * trusted the empty read, reported the canvas empty, and BUILT A NEW 9-NODE
+ * PIPELINE alongside the invisible one. A later panel_query_graph showed 16
+ * nodes: ids 1–7 had been there the whole time, which the frontend knew, because
+ * the new adds started at id 8.
+ *
+ * That is the worst shape of this defect class, because the action taken on the
+ * false read DESTROYS WORK: a duplicate pipeline cannot be un-built, and the user
+ * is left with two overlapping graphs and no way to tell which nodes are theirs.
+ *
+ * It is also unusually cheap to get right. Unlike most "could not determine"
+ * cases, an empty outline is trivially RE-VERIFIABLE: read it again, and the
+ * restore has either finished or it has not.
+ *
+ * So an empty first read is re-read once after a short settle:
+ *   - second read non-empty  → the first was a race; report the real graph.
+ *   - second read still empty → "empty" is now OBSERVED TWICE, not assumed, and
+ *     is reported plainly with no hedge (a blank canvas is a normal state and
+ *     must not be narrated as suspicious).
+ *
+ * The whole cost lands on the genuinely-empty case — one extra cheap read — which
+ * is the right place for it: a blank canvas is common but harmless to re-check,
+ * while a false empty is rare and expensive.
+ *
+ * Never throws: a failed re-read leaves the original reply exactly as it was.
+ */
+async function confirmEmptyOutline(
+  ctx: PanelToolCtx,
+  res: ToolResult,
+  reread: () => Promise<ToolResult>,
+): Promise<ToolResult> {
+  try {
+    if (res.isError) return res;
+    const first = parseToolResultJson(res);
+    if (!first || first.node_count !== 0) return res;
+
+    // Which workflow this empty answer is ABOUT (codex review). The re-read is a
+    // second round trip, and the user can switch tabs during it — so a non-empty
+    // second outline might describe a DIFFERENT workflow entirely. Substituting
+    // it would report workflow B's graph as though it confirmed a read of A,
+    // which is a worse failure than the empty read this exists to fix.
+    const identityBefore = currentWorkflowFence(ctx);
+
+    // A BOUNDED POLL, not a single retry (codex review). A restore after a
+    // ComfyUI restart has no guaranteed duration, and one 400ms attempt is an
+    // arbitrary cliff: if the restore is still going at that instant, the fix
+    // silently fails to cover the very report it is for. Poll briefly instead,
+    // stopping the moment nodes appear.
+    for (const waitMs of EMPTY_OUTLINE_RECHECK_STEPS_MS) {
+      await sleep(waitMs);
+      const second = await reread();
+      // Redundant with the parsed-null guard below TODAY — an error result carries
+      // no parseable JSON — and kept anyway: it states the intent directly, and
+      // would still hold if an error result ever carried a structured body.
+      if (second.isError) continue;
+      const parsed = parseToolResultJson(second);
+      if (!parsed || parsed.node_count === 0) continue;
+
+      // Nodes appeared — but only adopt them if the canvas is still the SAME
+      // workflow. A changed identity means the second read answers a different
+      // question, so the original (honest, empty) answer stands.
+      const identityAfter = currentWorkflowFence(ctx);
+      if (
+        identityBefore.known &&
+        identityAfter.known &&
+        identityBefore.uuid !== identityAfter.uuid
+      ) {
+        return res;
+      }
+      return second;
+    }
+    return res;
+  } catch {
+    return res;
+  }
+}
+
+/**
+ * The back-off schedule for re-reading an empty outline (#1184).
+ *
+ * A bounded poll rather than one attempt: a restore after a ComfyUI restart has
+ * no guaranteed duration, so a single fixed wait is an arbitrary cliff that would
+ * silently miss a slower restore (codex review). Stops the moment nodes appear.
+ *
+ * Bounded deliberately at ~1.2s total. A genuinely blank canvas is a COMMON
+ * state and pays this whole cost, so it has to stay small enough not to be felt;
+ * a longer poll would buy rarer restores at the expense of every empty read.
+ */
+const EMPTY_OUTLINE_RECHECK_STEPS_MS = [250, 400, 550] as const;
+
 function markBudgetIgnored(res: ToolResult, requested: unknown): ToolResult {
   if (typeof requested !== "number") return res;
   const payload = parseToolResultJson(res);
@@ -6547,7 +6642,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // The synthetic `__budget_ignored` flag below is derived from the reply, not
           // sent by the panel: a build that supports the budget echoes `max_chars` back.
           markBudgetIgnored(
-            await ctx.call({ cmd: "graph_outline", max_chars: args.max_chars }),
+            // #1184 — an empty outline is re-verified before it is believed.
+            await confirmEmptyOutline(
+              ctx,
+              await ctx.call({ cmd: "graph_outline", max_chars: args.max_chars }),
+              () => ctx.call({ cmd: "graph_outline", max_chars: args.max_chars }),
+            ),
             args.max_chars,
           ),
           [
