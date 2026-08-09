@@ -276,3 +276,61 @@ describe("attempt-supersession (panel#489)", () => {
     expect(emitted.some((r) => r.status === "error")).toBe(false);
   });
 });
+
+// #1150 — the (id, target) supersession key cannot see a corrected retry.
+//
+// Two 404s were re-issued with corrected URLs and the same target filenames.
+// A new URL is a new id, so the eviction never fired and both filenames flushed
+// as failures — while download_model action:"status" showed them streaming at
+// 20% and 13%. This asks the narrower question the event text actually needs:
+// is the thing I am about to call failed currently arriving?
+describe("markSupersededByLive (#1150)", () => {
+  const live = (name: string) => ({ name, status: "downloading" });
+
+  it("flags a failure whose filename is downloading RIGHT NOW", () => {
+    const settled = [{ name: "big.safetensors", status: "error" }];
+    mod.markSupersededByLive(settled, [live("big.safetensors")]);
+    expect(settled[0]).toMatchObject({ supersededByLive: true });
+  });
+
+  it("leaves a genuinely dead failure alone", () => {
+    const settled = [{ name: "gone.safetensors", status: "error" }];
+    mod.markSupersededByLive(settled, [live("other.safetensors")]);
+    expect(settled[0].supersededByLive).toBeUndefined();
+  });
+
+  it("never flags a SUCCESS — 'done' is settled regardless of what else is live", () => {
+    // A second copy of the same name streaming elsewhere does not un-complete a
+    // transfer that finished.
+    const settled = [{ name: "big.safetensors", status: "done" }];
+    mod.markSupersededByLive(settled, [live("big.safetensors")]);
+    expect(settled[0].supersededByLive).toBeUndefined();
+  });
+
+  it("ignores live rows that are not actually downloading", () => {
+    const settled = [{ name: "big.safetensors", status: "error" }];
+    mod.markSupersededByLive(settled, [
+      { name: "big.safetensors", status: "done" },
+      { name: "big.safetensors", status: "error" },
+    ]);
+    expect(settled[0].supersededByLive).toBeUndefined();
+  });
+
+  it("ignores nameless rows rather than matching them to each other", () => {
+    const settled = [{ name: "", status: "error" }];
+    mod.markSupersededByLive(settled, [{ name: undefined, status: "downloading" }]);
+    expect(settled[0].supersededByLive).toBeUndefined();
+  });
+
+  it("handles the reporter's shape: two failures, both retried", () => {
+    const settled = [
+      { name: "MiniMax-H3_FL2VA-NVFP4-HQ.safetensors", status: "error" },
+      { name: "MiniMax-H3_FL2VA-NVFP4-LQ.safetensors", status: "error" },
+    ];
+    mod.markSupersededByLive(settled, [
+      live("MiniMax-H3_FL2VA-NVFP4-HQ.safetensors"),
+      live("MiniMax-H3_FL2VA-NVFP4-LQ.safetensors"),
+    ]);
+    expect(settled.every((s) => s.supersededByLive === true)).toBe(true);
+  });
+});

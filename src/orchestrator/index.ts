@@ -146,7 +146,7 @@ import {
 import { AskAnswers, preview as previewQuestion } from "./ask-answer-journal.js";
 import { initRunpodWatcher, getRunpodWatcher, type RunpodStatusFrame, type RunpodAlertFrame } from "../services/runpod-watch.js";
 import { getPod } from "../services/runpod-client.js";
-import { listTargetChangeRequests, consumeTargetChange, ackTargetChange, setProgressDir, CONTROL_PREFIX, newestAttemptEpochs, isSupersededAttempt, downloadAttemptKey } from "../services/download-progress.js";
+import { listTargetChangeRequests, consumeTargetChange, ackTargetChange, setProgressDir, CONTROL_PREFIX, newestAttemptEpochs, isSupersededAttempt, downloadAttemptKey, markSupersededByLive } from "../services/download-progress.js";
 import { hasActiveTrainingJob, reconcileStaleTrainingJobs } from "../services/training-jobs.js";
 import {
   buildQueueStatusFrame,
@@ -5297,6 +5297,10 @@ export async function runPanelOrchestrator(): Promise<void> {
       // a queued terminal cancelled by a newer live attempt. Don't fire an empty
       // "download_done" turn in that case.
       if (settled.length === 0) continue;
+      // #1150 — a corrected retry of a 404 is a DIFFERENT id writing the SAME
+      // filename, so the (id, target) eviction above cannot see it. The live rows
+      // are already in hand this tick; markSupersededByLive asks them by name.
+      markSupersededByLive(settled, downloads);
       // #884 — a download has no originating TAB (its row names the owning
       // conversation), so its turn INHERITS the conversation's LAST
       // ESTABLISHED origin — never the active tab (confirming gate 2, P0 rule:
