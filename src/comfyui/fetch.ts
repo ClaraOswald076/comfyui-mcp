@@ -65,7 +65,7 @@ function originOf(target: string): string | undefined {
  *                   handshake carried no usable Origin. Say nothing about drift;
  *                   an absent comparison is not a negative result.
  */
-function describeTargetDrift(target: string): string {
+export function describeTargetDrift(target: string): string {
   const origins = (() => {
     try {
       return connectedPanelOrigins?.() ?? [];
