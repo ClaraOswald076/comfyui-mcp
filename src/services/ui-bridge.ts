@@ -25,6 +25,7 @@ import {
 import { primePanelBase, verifiedPanelDiskVersion } from "./panel-workspace.js";
 import { compareSemver, detectInstallMode } from "./self-update.js";
 import { SHARED_SESSION_SCOPE, isScopeAddress } from "./session-scope.js";
+import type { ScopeRepinOutcome } from "../orchestrator/turn-origins.js";
 
 export const DEFAULT_BRIDGE_PORT = 9101;
 
@@ -1389,7 +1390,7 @@ export class UiBridge {
    *  in-flight turn onto the tab that is active now (the documented
    *  panel_set_workflow_target({mode:"current"}) consent). Returns the tab it
    *  repinned to, or undefined when nothing is resolvable. */
-  private scopeRepinHandler: ((scopeId: string) => string | undefined) | null = null;
+  private scopeRepinHandler: ((scopeId: string) => ScopeRepinOutcome) | null = null;
   /** #884 — orchestrator-injected: normalize a hello's raw `backend` value the
    *  same way the orchestrator does (unknown/absent → the default backend), so
    *  the backend-qualified scope-buffer replay matches the conversation the
@@ -2716,15 +2717,18 @@ export class UiBridge {
   }
 
   /** #884 — inject the explicit-repin recovery handler (see the field doc). */
-  setScopeRepinHandler(fn: (scopeId: string) => string | undefined): void {
+  setScopeRepinHandler(fn: (scopeId: string) => ScopeRepinOutcome): void {
     this.scopeRepinHandler = fn;
   }
 
   /** #884 — EXPLICIT recovery consent (panel_set_workflow_target
    *  mode:"current" on a scope-bound session): re-pin the conversation's
    *  in-flight turn onto the tab that is active now, escaping a dead or
-   *  ambiguous pin. Returns the repinned tab id, or undefined. */
-  repinScopeToActive(scopeId: string): string | undefined {
+   *  ambiguous pin. Returns the repinned tab id, or — when nothing was
+   *  repinned — WHY (#1077 Finding 2). A bare undefined was indistinguishable
+   *  across four different refusals, and a session wedged on any of them was
+   *  told only that the adoption was refused. */
+  repinScopeToActive(scopeId: string): ScopeRepinOutcome {
     return this.scopeRepinHandler?.(scopeId);
   }
 
