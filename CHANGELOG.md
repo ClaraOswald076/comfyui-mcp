@@ -21,6 +21,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.73] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- 'latest' is not a git ref — do not check it out (#1258)
+
+#### Changed
+- 0.50.72 (#1256)
+
+
 ## [0.50.72] - 2026-08-09
 
 ### MCP
