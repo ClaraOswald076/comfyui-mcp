@@ -1111,6 +1111,94 @@ export function getDownloadJob(id: string, trayId?: string): DownloadJob | undef
   return terminal ? jobFromPersisted(terminal) : undefined;
 }
 
+/**
+ * Why a by-id lookup came back empty — when the answer is NOT "it is gone" (#1183).
+ *
+ * A reporter polled a live 26.5GB local download for ~30 minutes (20% → 95%) and
+ * then got, for ONE poll:
+ *
+ *   No download matching id `cb43b8c206bec9b1`. It has either finished long ago
+ *   … or never started
+ *
+ * The file existed nowhere on disk and nothing had been cancelled. Re-issuing the
+ * same URL immediately re-adopted the SAME id at 97% — the job was alive in
+ * process the entire time.
+ *
+ * getDownloadJob DECLINES in several places rather than guessing, and those
+ * declines are correct: two concurrent physical transfers sharing an id must not
+ * be resolved by picking one. What is not correct is rendering a decline as an
+ * ABSENCE. "I will not choose between two" and "there is nothing here" are
+ * different facts, and only the second justifies telling a user their download
+ * vanished — which is what invites a redundant multi-gigabyte re-download.
+ *
+ * So: when the lookup misses, ask the cheaper question it never asked — is there
+ * a LIVE record for this id at all? Returns undefined when there genuinely is
+ * not, so a real "not found" keeps its existing wording.
+ */
+export function describeUnresolvedDownload(id: string): string | undefined {
+  const now = Date.now();
+  const liveInMemory = jobs.get(id)?.job;
+  const inFlight = listPersistedDownloadJobs().filter(
+    (r) => r.id === id && r.status === "downloading",
+  );
+  const livePersisted = inFlight.filter(
+    (r) => now - (r.updated ?? 0) < PERSISTED_INFLIGHT_STALE_MS,
+  );
+  // A STALE in-flight record counts here, hedged — and getting that wrong is
+  // what would have left the REPORTED case uncovered.
+  //
+  // This function first used the same freshness window the lookup uses, which
+  // means it went silent in exactly the situation most likely to have produced a
+  // one-poll miss during a 26GB transfer: a heartbeat delayed past 60s while the
+  // writer was busy. The codebase already states the right rule one file over
+  // (#761): "a missed heartbeat is only a liveness hint, not proof the transfer
+  // stopped" — which is why an in-flight record is retained for 6h rather than
+  // reaped at 60s. Declining to mention such a record would repeat the very fold
+  // this fix exists to remove, one level down.
+  const stalePersisted = inFlight.filter(
+    (r) => now - (r.updated ?? 0) >= PERSISTED_INFLIGHT_STALE_MS,
+  );
+  const inMemoryLive = liveInMemory?.status === "downloading";
+  if (!inMemoryLive && livePersisted.length === 0 && stalePersisted.length === 0) {
+    return undefined;
+  }
+
+  // Only a stale record to go on: say what is known and what is not, rather than
+  // asserting either "running" or "gone".
+  if (!inMemoryLive && livePersisted.length === 0) {
+    const newest = stalePersisted.sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0))[0];
+    const ageS = Math.round((now - (newest?.updated ?? now)) / 1000);
+    return (
+      `A download with id \`${id}\` has an IN-FLIGHT record that stopped reporting ` +
+      `${ageS}s ago — this lookup declined to answer for it, which is NOT the same as it ` +
+      `being gone. A missed heartbeat is a liveness HINT, not proof the transfer stopped: ` +
+      `the bytes may still be streaming while persistence was interrupted (a reconnect, or ` +
+      `a busy writer). Check the panel download tray, or re-run with no selector to list ` +
+      `every tracked download, BEFORE re-downloading — a second transfer would duplicate ` +
+      `a multi-gigabyte file.`
+    );
+  }
+
+  const trays = [
+    ...new Set([
+      ...(inMemoryLive && liveInMemory ? [liveInMemory.trayId] : []),
+      ...livePersisted.map((r) => r.trayId).filter((t): t is string => typeof t === "string"),
+    ]),
+  ];
+  const several = trays.length > 1;
+  return (
+    `A download with id \`${id}\` IS still running — this lookup declined to answer for it, ` +
+    `which is NOT the same as it being gone. ` +
+    (several
+      ? `TWO OR MORE live transfers share that id (tray ids: ${trays.join(", ")}), so answering ` +
+        `by id alone would have picked one arbitrarily. Re-run with \`tray_id\` to select the one ` +
+        `you mean, or omit the selector to list them all.`
+      : `Its record could not be matched by id alone in this session. Re-run with no selector to ` +
+        `list every tracked download, or pass \`tray_id\`${trays[0] ? ` (\`${trays[0]}\`)` : ""}.`) +
+    ` Do NOT re-download: the transfer is in flight and a second one would duplicate it.`
+  );
+}
+
 /** Adopt an in-flight download by URL or destination after a reconnect (#529) —
  *  so a caller can confirm a download is still running (and not start a duplicate)
  *  even without the id. Prefers a LIVE in-memory job, then the persisted store.
