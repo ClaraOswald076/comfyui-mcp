@@ -150,23 +150,39 @@ export async function runHealthCheck(
 
   // Recent custom-node errors from /internal/logs (best-effort; older
   // ComfyUI versions and remote-only deployments may not expose it).
-  try {
-    const res = await client.fetchApi("/internal/logs");
-    if (res.ok) {
-      const text = await res.text();
-      const errLines = text
-        .split("\n")
-        .filter((l) => /traceback|error|exception/i.test(l))
-        .slice(-recentErrors);
-      if (errLines.length > 0) {
-        lines.push(`\n**Recent errors** (last ${errLines.length}):`);
-        for (const e of errLines) lines.push(`  ${e.trim()}`);
-      } else {
-        lines.push(`\n**Recent errors**: none in /internal/logs`);
+  // #1146 — recent_errors:0 means "show me none", and it returned EVERYTHING.
+  //
+  // `slice(-0)` is `slice(0)`: -0 === 0 in JS, so the negative-index reading
+  // never happens and the whole array comes back. A reporter asking for zero got
+  // the full historical ComfyUI log and a response truncated at ~12k tokens —
+  // the opposite of the request, from the one argument value meant to suppress
+  // it. Any non-positive limit takes the explicit branch instead.
+  //
+  // And it is reported as NOT REQUESTED, not as "none in /internal/logs". The
+  // log was never read for content, so claiming it is clean would assert an
+  // absence nobody observed — a caller trying to shrink a response would be told
+  // their server is healthy as a side effect of asking for a shorter answer.
+  if (recentErrors <= 0) {
+    lines.push(`\n**Recent errors**: not requested (recent_errors=${recentErrors}) — the log was NOT checked, which is not the same as it being clean.`);
+  } else {
+    try {
+      const res = await client.fetchApi("/internal/logs");
+      if (res.ok) {
+        const text = await res.text();
+        const errLines = text
+          .split("\n")
+          .filter((l) => /traceback|error|exception/i.test(l))
+          .slice(-recentErrors);
+        if (errLines.length > 0) {
+          lines.push(`\n**Recent errors** (last ${errLines.length}):`);
+          for (const e of errLines) lines.push(`  ${e.trim()}`);
+        } else {
+          lines.push(`\n**Recent errors**: none in /internal/logs`);
+        }
       }
+    } catch {
+      // Logs endpoint unavailable — silent.
     }
-  } catch {
-    // Logs endpoint unavailable — silent.
   }
 
   return lines.join("\n");
