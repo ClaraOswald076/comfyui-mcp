@@ -352,11 +352,25 @@ const SHOWABLE_PARAMS: ReadonlySet<string> = new Set([
  *  host+path — which is one long run of exactly this alphabet — survives. */
 const OPAQUE_RUN = /^[A-Za-z0-9\-._~+/=%]{24,}$/;
 
-/** A parameter value may be printed only if we recognise the name AND the value
- *  is not itself credential-shaped — a known-good name carrying a 40-char opaque
- *  blob is still not something to put in an error message. */
-function isShowableParam(name: string, value: string): boolean {
-  return SHOWABLE_PARAMS.has(name.toLowerCase()) && !OPAQUE_RUN.test(value);
+/**
+ * A parameter value may be printed only if we recognise the NAME.
+ *
+ * The value is deliberately NOT length-checked. An earlier version also required
+ * it not to match the opaque-run pattern, on the reasoning that a known-good name
+ * carrying a 40-character blob is still not worth printing — but the pattern's
+ * alphabet includes letters, digits, `-`, `.` and `_`, so an ordinary filename of
+ * 24 characters or more matches it. Live-testing a missing `/view` produced:
+ *
+ *     /view?filename=«redacted»&type=input&subfolder=
+ *
+ * which redacts the single most useful fact in the message. These names are on
+ * the list precisely because we know what they carry — user-supplied paths and
+ * identifiers, never credentials — so the length of the value says nothing. Any
+ * name NOT on the list is still redacted whatever its value looks like, which is
+ * where the fail-closed protection actually lives.
+ */
+function isShowableParam(name: string): boolean {
+  return SHOWABLE_PARAMS.has(name.toLowerCase());
 }
 
 /**
@@ -436,7 +450,7 @@ export function redactUrlForDiagnosis(raw: string): string {
   const rebuilt = new URLSearchParams();
   let paramsChanged = false;
   for (const [name, value] of u.searchParams) {
-    if (value && !isShowableParam(name, value)) {
+    if (value && !isShowableParam(name)) {
       rebuilt.append(name, REDACTED);
       paramsChanged = true;
     } else {

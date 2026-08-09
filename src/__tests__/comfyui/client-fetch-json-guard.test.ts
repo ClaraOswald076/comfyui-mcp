@@ -346,6 +346,17 @@ describe("the diagnosis URL is redacted (codex gate, finding 6)", () => {
     }
   });
 
+  it("keeps a LONG filename, which a length rule would have eaten", () => {
+    // Caught by live-testing a missing /view: `definitely-not-here-828.png` is
+    // 27 characters of the credential alphabet, so an opaque-run check on the
+    // VALUE redacted the one fact the message exists to report. The name is on
+    // the allowlist because we know it carries a path, so its length says
+    // nothing.
+    const url =
+      "http://127.0.0.1:8188/view?filename=a-really-quite-long-output-filename-00042.png&type=input&subfolder=";
+    expect(redactUrlForDiagnosis(url)).toBe(url);
+  });
+
   it("leaves an ordinary URL byte-identical", () => {
     // The body scrubber's opaque-run pass would collapse this whole URL to
     // "https:«redacted»" — a host+path IS a long run of the credential
