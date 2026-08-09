@@ -21,6 +21,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.71] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- the timeout must not offer a cause it already ruled out (#1247)
+- get_history shows output VALUES, not just their keys (#1229)
+
+#### Changed
+- stop panelRecoveryContext wording depending on which test ran first (#1250)
+- 0.50.70 (#1249)
+- 0.50.69 (#1248)
+
+
 ## [0.50.70] - 2026-08-09
 
 _No user-facing changes._
