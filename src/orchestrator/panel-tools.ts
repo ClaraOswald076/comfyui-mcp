@@ -10112,7 +10112,39 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         }>;
 
         const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
-        const VIDEO_EXTS = new Set([".mp4", ".webm"]);
+        // #811 — this used to be just {.mp4, .webm}, narrower than what this
+        // codebase ALREADY treats as video elsewhere: get_image's
+        // action:"list_outputs" documents ".mp4/.webm/.mov/.mkv/.m4v/.avi", and
+        // upload_image's action:"video" accepts the identical set. A ProRes
+        // .mov produced by VHS/standard ComfyUI video nodes was refused here
+        // even though every other tool in this codebase already calls it a
+        // valid video output. Aligned to the same set both of those already use.
+        //
+        // This widens the CONTAINER-extension gate only — it does not and
+        // cannot guarantee browser-side codec decode (a ProRes stream inside
+        // that .mov may still not play natively outside Safari). That is a
+        // downstream browser limitation, not a reason to refuse the file
+        // upfront: the panel's video path already degrades gracefully when a
+        // codec can't be decoded (falls back to a native <video> element,
+        // which surfaces the browser's own playback error, rather than
+        // silently failing) — an honest browser failure is a strictly better
+        // outcome than a blanket refusal at this gate for every .mov file,
+        // most of which (H.264/H.265-encoded) play back completely fine.
+        const VIDEO_EXTS = new Set([".mp4", ".webm", ".mov", ".mkv", ".m4v", ".avi"]);
+        // Real IANA subtypes. The old code built video MIME by naive
+        // `"video/" + ext.slice(1)`, which only ever worked for .mp4/.webm by
+        // COINCIDENCE (their extension equals their MIME subtype) — extended to
+        // .mov/.mkv/.avi it would have produced invalid types (`video/mov`
+        // instead of `video/quicktime`), and a wrong MIME can make a browser
+        // refuse to even ATTEMPT playback before the codec is ever considered.
+        const VIDEO_MIME: Record<string, string> = {
+          ".mp4": "video/mp4",
+          ".webm": "video/webm",
+          ".mov": "video/quicktime",
+          ".mkv": "video/x-matroska",
+          ".m4v": "video/x-m4v",
+          ".avi": "video/x-msvideo",
+        };
         const MAX_BYTES = 20 * 1024 * 1024; // 20 MB
 
         const resolved: Array<Record<string, unknown>> = [];
@@ -10167,7 +10199,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               mime = ext === ".jpg" ? "image/jpeg" : "image/" + ext.slice(1);
               kind = "image";
             } else if (VIDEO_EXTS.has(ext)) {
-              mime = "video/" + ext.slice(1);
+              mime = VIDEO_MIME[ext];
               kind = "video";
             } else {
               return fail(
