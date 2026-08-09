@@ -21,6 +21,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.78] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- do not adopt an in-flight record whose writer is PROVEN gone (#1275)
+- tell the caller when the post-open read contradicts the open (panel#887) (#1272)
+
+#### Changed
+- 0.50.77 (#1273)
+
+
 ## [0.50.77] - 2026-08-09
 
 ### MCP
