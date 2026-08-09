@@ -21,6 +21,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.72] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- investigate #1077 Finding 2 — permanent refusal without a relay backend (#1252)
+
+#### Changed
+- reset the panel-base cache in the five files that never did (#1253)
+- 0.50.71 (#1251)
+
+
 ## [0.50.71] - 2026-08-09
 
 ### MCP
