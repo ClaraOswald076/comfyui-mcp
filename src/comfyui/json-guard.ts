@@ -295,6 +295,108 @@ export function scrubSecretShapedText(text: string): string | null {
   return out;
 }
 
+/**
+ * Parameter names whose VALUE is a credential often enough that printing it is
+ * not worth the diagnosis. Matched as a SUBSTRING of the name, because gateways
+ * prefix and suffix freely — `x-amz-signature`, `access_token`,
+ * `cf_authorization`, `id_token` are all the same idea wearing different names,
+ * and an exact-match list would have to anticipate every one of them.
+ */
+const CREDENTIAL_PARAM_WORDS = [
+  "token",
+  "secret",
+  "password",
+  "passwd",
+  "pwd",
+  "signature",
+  "sig",
+  "credential",
+  "auth",
+  "session",
+  "apikey",
+  "api_key",
+  "key",
+  "code",
+  "state",
+  "assertion",
+  "refresh",
+];
+
+/** A single opaque run long enough to be a credential and nothing else. Reused
+ *  from the body scrubber's pass 3, but applied PER COMPONENT so an ordinary
+ *  host+path — which is one long run of exactly this alphabet — survives. */
+const OPAQUE_RUN = /^[A-Za-z0-9\-._~+/=%]{24,}$/;
+
+function isCredentialish(name: string, value: string): boolean {
+  const n = name.toLowerCase();
+  return CREDENTIAL_PARAM_WORDS.some((w) => n.includes(w)) || OPAQUE_RUN.test(value);
+}
+
+/**
+ * A URL that is safe to put in an error message (codex gate, finding 6).
+ *
+ * `bodyPrefixOf` scrubs the BODY, and until now nothing scrubbed the URL —
+ * which was fine while every diagnosis was built from a base URL we composed
+ * ourselves, and stopped being fine once `guardClientFetch` started reporting
+ * `Response.url`. That is the url AFTER redirects, so an identity proxy that
+ * bounces the request to an SSO endpoint (`?code=…&state=…`), or a gateway that
+ * hands back a presigned object URL (`?X-Amz-Signature=…`), puts a live
+ * credential in it. The diagnosis is shown to the agent and routinely pasted
+ * into bug reports.
+ *
+ * `scrubSecretShapedText` cannot be used for this: its opaque-run pass matches
+ * 24+ characters of an alphabet that includes `/`, `.` and `-`, so an ordinary
+ * `https://comfy.example.com/api/v1/internal/logs` collapses to `https:«redacted»`
+ * and the diagnosis loses the one fact it exists to report. This redacts by
+ * URL STRUCTURE instead — userinfo, credential-shaped query/fragment values,
+ * and credential-shaped path segments — and leaves origin and route intact.
+ *
+ * Returns the ORIGINAL string when nothing needed redacting, so a clean URL is
+ * never reformatted by a round-trip through the URL parser.
+ */
+export function redactUrlForDiagnosis(raw: string): string {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    // Not absolute (a relative path from a test double, or a malformed target).
+    // There is no structure to reason about, so keep everything up to the first
+    // query/fragment and say plainly that the rest was dropped rather than
+    // printing an unexamined credential.
+    const cut = raw.search(/[?#]/);
+    return cut === -1 ? raw : `${raw.slice(0, cut)} (query withheld: unparsable URL)`;
+  }
+
+  let changed = false;
+  if (u.username || u.password) {
+    u.username = REDACTED;
+    u.password = "";
+    changed = true;
+  }
+  for (const [name, value] of [...u.searchParams]) {
+    if (value && isCredentialish(name, value)) {
+      u.searchParams.set(name, REDACTED);
+      changed = true;
+    }
+  }
+  // The FRAGMENT is where an OAuth implicit flow puts its access token, and it
+  // is never needed to identify a route. Any fragment carrying `=` goes.
+  if (u.hash.includes("=")) {
+    u.hash = REDACTED;
+    changed = true;
+  }
+  // A token can also ride in the path (`/api/v1/<opaque>/logs`). Judge each
+  // segment on its own so a long ROUTE is not mistaken for a long secret.
+  const segments = u.pathname.split("/");
+  const scrubbed = segments.map((s) => (OPAQUE_RUN.test(s) ? REDACTED : s));
+  if (scrubbed.some((s, i) => s !== segments[i])) {
+    u.pathname = scrubbed.join("/");
+    changed = true;
+  }
+
+  return changed ? u.href : raw;
+}
+
 /** Back-compat alias: the known-value redaction is now one pass of the
  *  shape-based scrubber. Callers that only want "is this safe to print" should
  *  use `scrubSecretShapedText`/`bodyPrefixOf`. */
@@ -370,16 +472,69 @@ function looksLikeProxyErrorPage(body: string): boolean {
 }
 
 /**
+ * `503` or `503 Origin warming up` — the code, plus the reason phrase when the
+ * responder wrote one worth reading.
+ *
+ * A CUSTOM phrase is often the single most useful token in the whole response:
+ * a CDN's "Origin warming up", a gateway's "Backend read timeout". The standard
+ * phrase for a code is noise beside the code itself, so it is dropped.
+ */
+function describeStatus(status: number, statusText?: string): string {
+  const text = (statusText ?? "").trim();
+  if (!text) return String(status);
+  if (STANDARD_REASON_PHRASES.has(text.toLowerCase())) return String(status);
+  // A phrase is a short label, not a document. Anything longer is a body that
+  // escaped into the status line and is not worth the room.
+  const clipped = text.length > 80 ? `${text.slice(0, 80)}…` : text;
+  // Reason phrases are attacker-influenceable on a hostile proxy, and this one
+  // is interpolated into a message the agent reads. Same scrub the body gets.
+  const safe = scrubSecretShapedText(clipped);
+  return safe === null ? String(status) : `${status} ${safe}`;
+}
+
+/** Reason phrases that merely restate their code. Lowercased for comparison. */
+const STANDARD_REASON_PHRASES: ReadonlySet<string> = new Set([
+  "ok",
+  "no content",
+  "moved permanently",
+  "found",
+  "not modified",
+  "bad request",
+  "unauthorized",
+  "forbidden",
+  "not found",
+  "method not allowed",
+  "request timeout",
+  "conflict",
+  "payload too large",
+  "unprocessable entity",
+  "too many requests",
+  "internal server error",
+  "not implemented",
+  "bad gateway",
+  "service unavailable",
+  "gateway timeout",
+]);
+
+/**
  * Classify a non-JSON response body. Pure (no I/O) so the classification rules
  * are unit-testable without a server.
  */
 export function classifyNonJson(args: {
   url: string;
   status: number;
+  /** The reason phrase, when the responder sent a meaningful one. `503 Origin
+   *  warming up` says more than `503`, and it was being dropped. Standard
+   *  phrases add nothing next to the code and are omitted. */
+  statusText?: string;
   contentType: string;
   body: string;
 }): NonJsonDiagnosis {
-  const { url, status, contentType, body } = args;
+  const { status, contentType, body } = args;
+  // Redacted HERE rather than at the call sites, so no future caller can
+  // reintroduce the leak by composing a url that carries a credential.
+  const url = redactUrlForDiagnosis(args.url);
+  const reason = describeStatus(status, args.statusText);
   const bodyPrefix = bodyPrefixOf(body);
   // EVIDENCE, not the header's claim. `claimsHtml` is reported as a claim; only
   // `html` (the body really is markup) may drive a diagnosis.
@@ -481,7 +636,7 @@ export function classifyNonJson(args: {
           ? `a ${contentType} body that did not parse as JSON`
           : "a body that did not parse as JSON";
   const message =
-    `${url} answered ${status} with ${what} where JSON was expected. This means ${cause}. ` +
+    `${url} answered ${reason} with ${what} where JSON was expected. This means ${cause}. ` +
     `Content-Type: ${contentType || "(none)"}. Body starts: ${bodyPrefix || "(empty)"}. ` +
     `Confirm the configured ComfyUI base URL really is a ComfyUI API root — a URL that loads the ComfyUI UI in a browser is not proof, because the UI is served by the same catch-all that produced this page. ` +
     `The check is that ${getComfyUIBaseUrl()}/system_stats returns JSON with a "system"/"devices" shape; if it returns HTML too, the base URL, its path prefix, or the proxy's route map is wrong` +
@@ -523,26 +678,35 @@ export async function readComfyJson<T = unknown>(
     parsed = JSON.parse(body);
   } catch {
     throw new NonJsonResponseError(
-      classifyNonJson({ url: opts.url, status: res.status, contentType, body }),
+      classifyNonJson({
+        url: opts.url,
+        status: res.status,
+        statusText: res.statusText,
+        contentType,
+        body,
+      }),
     );
   }
+  // Every url that reaches a MESSAGE goes through the same redaction as the one
+  // in classifyNonJson — these two paths build their text by hand.
+  const safeUrl = redactUrlForDiagnosis(opts.url);
   if (!res.ok) {
     // Valid JSON, but an error status — surface it verbatim rather than as a
     // shape failure; the server told us something specific.
     throw new ComfyUIError(
-      `${opts.url} returned ${res.status}: ${bodyPrefixOf(body)}`,
+      `${safeUrl} returned ${describeStatus(res.status, res.statusText)}: ${bodyPrefixOf(body)}`,
       "HTTP_ERROR",
     );
   }
   if (opts.expectShape && !opts.expectShape(parsed)) {
     throw new NonJsonResponseError({
       kind: "not-json",
-      url: opts.url,
+      url: safeUrl,
       status: res.status,
       contentType,
       bodyPrefix: bodyPrefixOf(body),
       message:
-        `${opts.url} answered ${res.status} with valid JSON that is not ${opts.shapeHint ?? "the expected document"}. ` +
+        `${safeUrl} answered ${res.status} with valid JSON that is not ${opts.shapeHint ?? "the expected document"}. ` +
         `Something other than ComfyUI is very likely answering this route (an API gateway's own JSON error envelope, or a different service on this host). ` +
         `Body starts: ${bodyPrefixOf(body)}.` +
         (jsonish ? "" : ` (Content-Type was ${contentType || "(none)"}.)`),
@@ -612,6 +776,7 @@ export function guardClientFetch(
             classifyNonJson({
               url,
               status: res.status,
+              statusText: res.statusText,
               contentType: res.headers.get("content-type") ?? "",
               body,
             }),
@@ -688,6 +853,20 @@ export function redactedError(err: unknown): unknown {
  * signature of a client library that called `res.json()` itself and so gave us
  * no URL, status, or content type to report.
  */
+/**
+ * Did this error PROVE the response was not JSON?
+ *
+ * Two shapes prove it now, and code that picks between competing errors has to
+ * accept both. `looksLikeHtmlParsedAsJson` recognises a raw parser message, which
+ * was the only shape available while the client library did the parsing. Since
+ * `guardClientFetch`, that same failure arrives as a NonJsonResponseError whose
+ * message contains no parser text at all — so a predicate written against the
+ * old shape silently answers "no" for the strongest evidence we have.
+ */
+export function provesNonJsonAnswer(err: unknown): boolean {
+  return isNonJsonResponseError(err) || looksLikeHtmlParsedAsJson(err);
+}
+
 export function looksLikeHtmlParsedAsJson(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   // Require a MARKUP indicator, not merely "is not valid JSON" (codex gate,
@@ -735,6 +914,12 @@ export async function diagnoseComfyEndpoint(url: string): Promise<NonJsonDiagnos
  * happened to be conclusive).
  */
 export async function rethrowWithJsonDiagnosis(err: unknown, url: string): Promise<never> {
+  // Already a FIRST-HAND diagnosis of the response that actually failed — since
+  // guardClientFetch, the library's own parse throws one of these. Re-probing
+  // would replace evidence from the failing response with a guess from a
+  // different, later one, which is the exact trade this function's own comment
+  // warns against.
+  if (isNonJsonResponseError(err)) throw err;
   if (looksLikeHtmlParsedAsJson(err)) {
     const diagnosis = await diagnoseComfyEndpoint(url);
     if (diagnosis) {
@@ -752,7 +937,7 @@ export async function rethrowWithJsonDiagnosis(err: unknown, url: string): Promi
         ...diagnosis,
         message:
           `The request failed while parsing the response as JSON: ${original} ` +
-          `A follow-up probe of ${url} — a separate request, so not necessarily the same response — found: ${diagnosis.message}`,
+          `A follow-up probe of ${redactUrlForDiagnosis(url)} — a separate request, so not necessarily the same response — found: ${diagnosis.message}`,
       });
     }
   }

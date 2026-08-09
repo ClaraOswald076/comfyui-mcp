@@ -29,11 +29,18 @@ vi.mock("../../config.js", () => ({
   isRemoteMode: () => true,
 }));
 
-import { getLogs, resetClient, uploadImageHttp } from "../../comfyui/client.js";
+import {
+  getLogs,
+  getObjectInfo,
+  resetClient,
+  resetObjectInfoCache,
+  uploadImageHttp,
+} from "../../comfyui/client.js";
 import {
   classifyNonJson,
   guardClientFetch,
   isNonJsonResponseError,
+  redactUrlForDiagnosis,
 } from "../../comfyui/json-guard.js";
 
 /** Every response the fake server will give, in order. */
@@ -51,6 +58,7 @@ beforeEach(() => {
   // getClient() memoises, and these tests each want a client built from the
   // wiring under test rather than one another's leftovers.
   resetClient();
+  resetObjectInfoCache();
 });
 
 describe("the library's non-2xx path can no longer eat the response (#828)", () => {
@@ -214,5 +222,157 @@ describe("classifyNonJson on an empty body", () => {
       body: "",
     });
     expect(d.kind).toBe("proxy-error");
+  });
+
+  // Pins the empty branch's POSITION, not just its existence. Moving it above
+  // the auth branch would turn "an auth gate rejected this" into a generic
+  // "nothing came back", which sends the reader to the wrong layer entirely —
+  // and the 404/200/502 cases above would all still pass (codex gate, finding 7).
+  it.each([401, 403])("still prefers the auth diagnosis for an empty %i", (status) => {
+    const d = classifyNonJson({
+      url: "http://remote.example:8188/upload/image",
+      status,
+      contentType: "",
+      body: "",
+    });
+    expect(d.kind).toBe("login");
+    expect(d.message).toMatch(/needs the credential/);
+  });
+});
+
+// The guard changes the SHAPE of the error the library throws, from a raw
+// SyntaxError to a NonJsonResponseError. Any predicate written against the old
+// shape silently answers "no" for the strongest evidence available — and
+// getObjectInfo has one, picking which of two failed attempts to report.
+describe("a first-hand diagnosis still wins over a retry blip", () => {
+  it("reports attempt 1's HTML diagnosis, not the retry's transport failure", async () => {
+    // Round 8 of the original #828 gate established this rule: when the first
+    // request PROVED a non-JSON answer and the retry merely hit a blip,
+    // surfacing the retry downgrades a known diagnosis to "server unavailable"
+    // and sends the user to check whether ComfyUI is running. The guard broke
+    // the predicate that enforced it.
+    let call = 0;
+    global.fetch = vi.fn(async () => {
+      call += 1;
+      if (call === 1) {
+        return new Response("<!DOCTYPE html><html><body>gateway</body></html>", {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        });
+      }
+      throw Object.assign(new TypeError("fetch failed"), { code: "ECONNREFUSED" });
+    }) as unknown as typeof fetch;
+
+    const err = await getObjectInfo().then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    expect(isNonJsonResponseError(err)).toBe(true);
+    expect((err as Error).message).toContain("HTML page");
+    expect((err as Error).message).not.toContain("fetch failed");
+  });
+});
+
+describe("the diagnosis URL is redacted (codex gate, finding 6)", () => {
+  it("redacts an OAuth redirect target without mangling the route", () => {
+    // Response.url is the url AFTER redirects, so an identity proxy that bounces
+    // the request to its SSO endpoint puts a live authorization code in it.
+    const out = redactUrlForDiagnosis(
+      "https://sso.example.com/callback?code=4/0AY0e-g7xQ&state=abc123&redirect_uri=/api",
+    );
+    expect(out).not.toContain("4/0AY0e-g7xQ");
+    expect(out).not.toContain("abc123");
+    // The part that identifies the route must survive — that is the whole point
+    // of the message.
+    expect(out).toContain("sso.example.com/callback");
+    expect(out).toContain("redirect_uri");
+  });
+
+  it("redacts a presigned-URL signature and userinfo", () => {
+    const signed = redactUrlForDiagnosis(
+      "https://s3.example.com/bucket/model.safetensors?X-Amz-Signature=deadbeefcafe&X-Amz-Expires=60",
+    );
+    expect(signed).not.toContain("deadbeefcafe");
+    expect(signed).toContain("X-Amz-Expires=60");
+
+    expect(redactUrlForDiagnosis("http://bob:hunter2@comfy.example.com/prompt")).not.toContain(
+      "hunter2",
+    );
+  });
+
+  it("redacts a token that rides in the PATH, per segment", () => {
+    const out = redactUrlForDiagnosis(
+      "https://gw.example.com/t/AbCdEf0123456789AbCdEf0123456789/internal/logs",
+    );
+    expect(out).not.toContain("AbCdEf0123456789AbCdEf0123456789");
+    expect(out).toContain("/internal/logs");
+  });
+
+  it("leaves an ordinary URL byte-identical", () => {
+    // The body scrubber's opaque-run pass would collapse this whole URL to
+    // "https:«redacted»" — a host+path IS a long run of the credential
+    // alphabet. Structural redaction is what makes the diagnosis survivable.
+    for (const clean of [
+      "https://comfy.example.com/api/v1/internal/logs",
+      "http://127.0.0.1:8188/internal/logs?clientId=comfyui-mcp",
+      "http://remote.example:8188/system_stats",
+    ]) {
+      expect(redactUrlForDiagnosis(clean)).toBe(clean);
+    }
+  });
+
+  it("withholds the query of an unparsable target rather than printing it", () => {
+    expect(redactUrlForDiagnosis("/internal/logs?token=secretvalue")).not.toContain("secretvalue");
+  });
+
+  it("reaches the message built by the live guard", () => {
+    // Wiring: the redaction must be applied where the diagnosis is BUILT, not
+    // only when a caller remembers to ask for it.
+    const d = classifyNonJson({
+      url: "https://gw.example.com/internal/logs?access_token=sk-live-abcdef123456",
+      status: 500,
+      contentType: "text/plain",
+      body: "boom",
+    });
+    expect(d.message).not.toContain("sk-live-abcdef123456");
+    expect(d.url).not.toContain("sk-live-abcdef123456");
+    expect(d.message).toContain("gw.example.com/internal/logs");
+  });
+});
+
+describe("the status reason phrase is carried (codex gate, finding 1)", () => {
+  it("keeps a CUSTOM phrase, which is often the most useful token present", () => {
+    const d = classifyNonJson({
+      url: "http://remote.example:8188/system_stats",
+      status: 503,
+      statusText: "Origin warming up",
+      contentType: "text/html",
+      body: "<html><body>please wait</body></html>",
+    });
+    expect(d.message).toContain("503 Origin warming up");
+  });
+
+  it("drops a STANDARD phrase, which only restates the code", () => {
+    const d = classifyNonJson({
+      url: "http://remote.example:8188/internal/logs",
+      status: 404,
+      statusText: "Not Found",
+      contentType: "",
+      body: "",
+    });
+    expect(d.message).toContain("answered 404 with");
+    expect(d.message).not.toContain("404 Not Found");
+  });
+
+  it("scrubs a credential a hostile proxy put in the reason phrase", () => {
+    const d = classifyNonJson({
+      url: "http://remote.example:8188/prompt",
+      status: 400,
+      statusText: "rejected token=sk-live-abcdef123456",
+      contentType: "",
+      body: "x",
+    });
+    expect(d.message).not.toContain("sk-live-abcdef123456");
   });
 });

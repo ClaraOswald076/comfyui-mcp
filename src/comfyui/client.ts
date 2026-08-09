@@ -22,6 +22,7 @@ import {
   isNonJsonResponseError,
   looksLikeHtmlParsedAsJson,
   NonJsonResponseError,
+  provesNonJsonAnswer,
   readComfyJson,
   redactErrorMessage,
   rethrowWithJsonDiagnosis,
@@ -273,7 +274,14 @@ export async function getObjectInfo(): Promise<ObjectInfo> {
         // only the retry would downgrade a known #828 diagnosis to "server
         // unavailable" and send the user to check whether ComfyUI is running
         // (codex gate, round 8, finding 2).
-        const toReport = looksLikeHtmlParsedAsJson(retryErr) ? retryErr : looksLikeHtmlParsedAsJson(err) ? err : retryErr;
+        //
+        // `provesNonJsonAnswer`, not `looksLikeHtmlParsedAsJson`: since
+        // guardClientFetch the library's parse failure arrives as a
+        // NonJsonResponseError carrying no parser text, so the old predicate
+        // answered "no" for the strongest evidence available and this picker
+        // fell through to `retryErr` every time — reintroducing the very
+        // downgrade round 8 fixed.
+        const toReport = provesNonJsonAnswer(retryErr) ? retryErr : provesNonJsonAnswer(err) ? err : retryErr;
         return await rethrowWithJsonDiagnosis(toReport, `${getComfyUIBaseUrl()}/object_info`);
       }
     }
