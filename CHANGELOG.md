@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.63] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- stop redacting file paths and module names, and filter the log BEFORE scrubbing (#1225)
+
+#### Changed
+- 0.50.62 (#1224)
+
+
 ## [0.50.62] - 2026-08-09
 
 ### MCP
