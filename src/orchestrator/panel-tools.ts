@@ -897,7 +897,10 @@ function isLoopbackHostName(host: string): boolean {
 
 /** The scheme://host:port origin of a URL (default ports made explicit), or null if
  *  unparseable. Loopback hosts canonicalize to their FAMILY loopback (v4 → 127.0.0.1,
- *  v6 → ::1) — so localhost/127.0.0.1/0.0.0.0 compare equal, and ::1/:: compare equal,
+ *  v6 → ::1) — so 127.0.0.1/0.0.0.0 compare equal, and ::1/:: compare equal. NOTE:
+ *  `localhost` is deliberately NOT folded (loopbackFamily returns null for it), so it
+ *  compares UNEQUAL to a concrete literal — callers that would harm a user by treating
+ *  that as proof of difference must degrade it to "unknown" themselves (#1233),
  *  but a v4 host and a v6 host DIFFER (they may be different instances). Ports differ. */
 function httpOriginOf(rawUrl: string): string | null {
   try {
@@ -1207,18 +1210,66 @@ async function probeDeclineRecovery(
 export function restartTimeoutFallbackAdvice({
   headlessBase,
   panelBase,
+  observedOrigin = null,
 }: {
   headlessBase: string;
   panelBase: string | null;
+  /**
+   * #1233 — the tab's SERVER-OBSERVED handshake Origin, read directly rather than
+   * through captureRebootHealthBase's proof.
+   *
+   * That proof answers "is this provably the boot instance", so it collapses a
+   * CONFIRMED MISMATCH into the same `null` as an absent or unprovable origin — and the
+   * confirmed mismatch is exactly the case panel#851 was filed about (a tab fronting a
+   * second local ComfyUI on another port). The evidence was computed and then discarded.
+   * Passing it separately lets a confirmed mismatch reach the strong warning without
+   * loosening the proof, which is correctly strict for its own purpose.
+   */
+  observedOrigin?: string | null;
 }): string {
   if (panelBase != null && sameHttpBase(headlessBase, panelBase)) {
     return "or use restart_comfyui to restart the server directly without a panel card.";
   }
-  if (panelBase != null) {
+  // Proven different: either the proof resolved a base that differs, or the observed
+  // origin — which the browser sets and page JS cannot forge — differs outright.
+  // ORIGIN-only compare for the raw Origin, deliberately. `tabServerOrigin` is pathless
+  // (scheme+host+port — the browser sends no path on a WS upgrade), while `headlessBase`
+  // may carry a basePath mount such as :8188/comfy. A path-AWARE compare therefore reads
+  // a correctly-mounted install as a mismatch and fires the strong warning at a server
+  // that IS the right one — the cry-wolf failure this branch exists to avoid, which is
+  // how it was found. A pathless Origin can prove a different host:port; it cannot prove
+  // a different path, so it is only ever used for the claim it can actually support.
+  // (captureRebootHealthBase fails closed on the same ambiguity for the same reason.)
+  // #1233 (codex) — a DNS-ambiguous `localhost` on EITHER side is NOT proof of a
+  // different server. loopbackFamily() deliberately excludes it (a coordinator P0: it
+  // can resolve to either family, or to something else entirely), so `localhost:8188`
+  // vs `127.0.0.1:8188` canonicalizes unequal and would fire the strong warning at what
+  // is very likely the same instance. Absence of proof is not proof of difference, so
+  // an ambiguous host degrades to UNPROVEN — the same direction captureRebootHealthBase
+  // takes for the same input.
+  const dnsAmbiguous = (u: string | null) => {
+    if (!u) return false;
+    try {
+      return new URL(u).hostname.toLowerCase().replace(/^\[|\]$/g, "") === "localhost";
+    } catch {
+      return false;
+    }
+  };
+  const originMismatch =
+    observedOrigin != null &&
+    !dnsAmbiguous(observedOrigin) &&
+    !dnsAmbiguous(headlessBase) &&
+    !sameHttpOrigin(headlessBase, observedOrigin)
+      ? observedOrigin
+      : null;
+  const proven = panelBase ?? originMismatch;
+  if (proven != null) {
     return (
       `Do NOT reach for restart_comfyui here without checking: it targets ${headlessBase}, ` +
-      `while this panel is running inside ${panelBase}. Restarting the first would hit a ` +
-      "different server than the one you have been working on — and may find nothing there at all."
+      `while this panel is running inside ${proven}. Restarting the first would hit a ` +
+      "different server than the one you have been working on. That may find nothing there " +
+      "at all — or it may SUCCEED and take down a ComfyUI you did not mean to touch, which " +
+      "on a shared instance is the worse outcome."
     );
   }
   return (
@@ -9629,6 +9680,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           const fallback = restartTimeoutFallbackAdvice({
             headlessBase: getComfyUIBaseUrl(),
             panelBase: captureRebootHealthBase(ctx),
+            // #1233 — the raw observed origin, so a CONFIRMED mismatch is not lost inside
+            // the proof's null. Server-observed on the WS upgrade; page JS cannot forge it.
+            observedOrigin: ctx.bridge?.tabServerOrigin?.(ctx.tabId) ?? null,
           });
           return ok(
             `No confirmation received within ${Math.round(confirmBudget / 1000)}s, so I did NOT ` +

@@ -73,3 +73,83 @@ describe("#851 restart-timeout fallback advice", () => {
     expect(advice("http://a:1", "http://b:2")).toContain("http://b:2");
   });
 });
+
+// ---------------------------------------------------------------------------
+// #1233 — a CONFIRMED mismatch must not be lost inside the proof's null.
+// ---------------------------------------------------------------------------
+
+describe("#1233 confirmed mismatch reaches the strong warning", () => {
+  const advise = (headlessBase: string, panelBase: string | null, observedOrigin: string | null) =>
+    restartTimeoutFallbackAdvice({ headlessBase, panelBase, observedOrigin });
+
+  it("a SECOND local instance on another port is proven different, not merely unproven", () => {
+    // panel#851's own motivating case. captureRebootHealthBase returns null here — it
+    // proves sameness with the BOOT base and a :8189 tab is not that — but the observed
+    // origin is positive evidence of a mismatch, and it used to be discarded.
+    const a = advise("http://127.0.0.1:8188", null, "http://127.0.0.1:8189");
+    expect(a).toContain("Do NOT reach for restart_comfyui");
+    expect(a).toContain("http://127.0.0.1:8189");
+  });
+
+  it("an observed origin that MATCHES does not manufacture a warning", () => {
+    // Unproven-but-consistent stays the mild, target-naming advice.
+    const a = advise("http://127.0.0.1:8188", null, "http://127.0.0.1:8188");
+    expect(a).not.toContain("Do NOT");
+    expect(a).toContain("or use restart_comfyui, which restarts http://127.0.0.1:8188");
+  });
+
+  it("no observed origin at all is still unproven — absence is not evidence", () => {
+    const a = advise("http://127.0.0.1:8188", null, null);
+    expect(a).not.toContain("Do NOT");
+    expect(a).toContain("could not confirm which one this panel is running inside");
+  });
+
+  it("the proof still wins when it is available", () => {
+    expect(advise("http://a:1", "http://a:1", "http://zzz:9")).toContain(
+      "or use restart_comfyui to restart the server directly",
+    );
+  });
+
+  it("the warning names the SUCCEED-on-the-wrong-server risk, not only the no-op", () => {
+    // The old text said only "may find nothing there at all". In this branch the other
+    // target is a LIVE server by construction, so succeeding is the worse outcome.
+    const a = advise("http://127.0.0.1:8188", "http://127.0.0.1:8189", null);
+    expect(a).toContain("may find nothing there");
+    expect(a).toContain("SUCCEED and take down a ComfyUI you did not mean to touch");
+  });
+
+  it("#1233 a basePath mount is NOT a mismatch — the Origin is pathless and cannot say", () => {
+    // Found by probing this fix, not by review: tabServerOrigin carries scheme+host+port
+    // only, so a path-aware compare against a :8188/comfy base read a correctly-mounted
+    // install as a different server and fired the strong warning at the right one.
+    const a = advise("http://127.0.0.1:8188/comfy", null, "http://127.0.0.1:8188");
+    expect(a).not.toContain("Do NOT");
+    expect(a).toContain("could not confirm which one this panel is running inside");
+  });
+
+  it("#1233 a genuinely different PORT is still caught despite the origin-only compare", () => {
+    expect(advise("http://127.0.0.1:8188/comfy", null, "http://127.0.0.1:8189")).toContain("Do NOT");
+  });
+
+  it("#1233 loopback family folding does not manufacture a mismatch", () => {
+    // 127.0.0.1 vs a 0.0.0.0 bind is the same instance; sameHttpOrigin folds the family.
+    expect(advise("http://0.0.0.0:8188", null, "http://127.0.0.1:8188")).not.toContain("Do NOT");
+  });
+
+  it("#1233 (codex) `localhost` vs a loopback literal is UNPROVEN, not a mismatch", () => {
+    // loopbackFamily() deliberately excludes localhost (coordinator P0: it can resolve to
+    // either family, or elsewhere), so it canonicalizes unequal to 127.0.0.1 — and firing
+    // the strong warning on that would accuse what is very likely the same instance.
+    expect(advise("http://localhost:8188", null, "http://127.0.0.1:8188")).not.toContain("Do NOT");
+    expect(advise("http://127.0.0.1:8188", null, "http://localhost:8188")).not.toContain("Do NOT");
+    expect(advise("http://localhost:8188", null, "http://[::1]:8188")).not.toContain("Do NOT");
+  });
+
+  it("#1233 (codex) an ambiguous host does not mask a genuinely different PORT", () => {
+    // Degrading to unproven must not become a blanket amnesty: the port still differs.
+    const a = advise("http://localhost:8188", null, "http://localhost:8189");
+    expect(a).not.toContain("Do NOT"); // ambiguous on both sides -> unknown, by design
+    // …but a concrete literal on both sides still proves it.
+    expect(advise("http://127.0.0.1:8188", null, "http://127.0.0.1:8189")).toContain("Do NOT");
+  });
+});
