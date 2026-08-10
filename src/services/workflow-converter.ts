@@ -509,10 +509,10 @@ const CONTROL_AFTER_GENERATE_MODES = new Set(["fixed", "randomize", "increment",
  * for the frontend's auto-augmented top-level seeds, and wrong for a V3 dynamic-combo
  * nested `seed` that has no such widget. #1334: `TongzeArkReferenceToVideo` on frontend
  * 1.48.7 has a nested `seed` with no phantom, the converter skipped the real next value
- * anyway, and every following widget shifted by one — `watermark=false` became
- * `generate_audio`, `service_tier="default"` became `generate_audio`, and a
- * 172800-second expiry landed in `priority`. Silently wrong output, from a graph that
- * was correct on disk and correct in the live panel.
+ * anyway, and every following widget shifted by one: the watermark flag took the audio
+ * flag's value, the audio flag took `service_tier`'s, and a 172800-second expiry landed
+ * in `priority`. Silently wrong output, from a graph that was correct on disk and
+ * correct in the live panel.
  *
  * Checking the value closes that gap without giving up the inference: when a phantom is
  * really there the slot holds one of four known strings, and when it is not the slot

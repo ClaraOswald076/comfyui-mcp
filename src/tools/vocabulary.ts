@@ -1783,6 +1783,23 @@ export const DEAD_NAMES: readonly DeadName[] = [
     name: "generate_audio",
     since: "0.50.0",
     replacement: 'generate_image (action:"audio")',
+    allowedIn: [
+      {
+        path: "src/__tests__/services/nested-seed-without-phantom.test.ts",
+        context: "//   generate_audio    true       \"default\"",
+        why: "NOT our retired tool — a homonym in a different namespace. This is a WIDGET name on a third-party ComfyUI node (TongzeArkReferenceToVideo), quoted from #1334's measured wrong output to record which value landed in which slot. The gate cannot know the namespace, so the collision is declared here rather than worked around: renaming the widget would make the fixture stop reproducing the reporter's row, which is the only thing that makes the regression provable. Pinned to the measured-output line because that is the part that must not be paraphrased.",
+      },
+      {
+        path: "src/__tests__/services/nested-seed-without-phantom.test.ts",
+        context: "generate_audio: [\"BOOLEAN\", { default: true }],",
+        why: "The same third-party node's object_info spec, reproduced verbatim so the nested widget ORDER matches the reporter's. Order is the entire subject of #1334 — a shifted slot is the defect — so the fixture must carry their names in their positions, not stand-ins.",
+      },
+      {
+        path: "src/__tests__/services/nested-seed-without-phantom.test.ts",
+        context: "expect(inputs[\"model.generate_audio\"]).toBe(true);",
+        why: "The assertion on that same widget's converted value. It reads `model.generate_audio` because that is the dotted key the converter emits for the nested leaf; asserting on a renamed key would assert on something the reporter's workflow does not contain.",
+      },
+    ],
   },
   {
     name: "generate_video",

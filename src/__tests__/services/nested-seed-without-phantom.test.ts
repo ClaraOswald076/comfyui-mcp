@@ -10,10 +10,10 @@
 // phantom, the converter consumed the real next value anyway, and everything after it
 // slid by one:
 //
-//   intended                       produced
-//   watermark        = false       watermark        = true
-//   generate_audio   = true        generate_audio   = "default"
-//   priority         = 0           priority         = 172800
+//   widget            intended   produced
+//   watermark         false      true
+//   generate_audio    true       "default"
+//   priority          0          172800
 //
 // The saved UI graph was correct and the live panel widget map was correct; only
 // UI→API conversion was wrong — so nothing on screen contradicted it.
