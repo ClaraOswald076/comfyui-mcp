@@ -48,6 +48,35 @@ describe("the CivitAI hint fires on the status the reporter actually got (#1300)
     expect(hint).not.toMatch(/Set it in panel Settings/);
   });
 
+  it("BUT a 401/403 WITH a token means the token is bad — not 'probably not auth'", () => {
+    // Ignoring the status here would repeat the original bug one layer along:
+    // an invalid, expired or unentitled token produces exactly this status, and
+    // steering that caller away from auth is the same wrong answer (codex).
+    for (const status of [401, 403]) {
+      const hint = downloadFailureHint({ status, url: METADATA_URL, hasCivitaiToken: true });
+      expect(hint, `status ${status}`).toMatch(/INVALID, expired, or lacks access/);
+      expect(hint).not.toMatch(/probably not an auth failure/);
+    }
+  });
+
+  it("the fileId remedy is for a 404 only, not for 429 or 5xx", () => {
+    for (const status of [429, 500, 503]) {
+      const hint = downloadFailureHint({ status, url: METADATA_URL, hasCivitaiToken: true });
+      expect(hint, `status ${status}`).not.toMatch(/selects a file by METADATA/);
+    }
+  });
+
+  it("a trailing-dot FQDN is the same host", () => {
+    // `civitai.com.` is a legitimate spelling; WHATWG URL keeps the dot (codex).
+    expect(
+      downloadFailureHint({
+        status: 404,
+        url: "https://civitai.com./api/download/models/1",
+        hasCivitaiToken: false,
+      }),
+    ).toMatch(/no CIVITAI_API_TOKEN/);
+  });
+
   it("with a token, a METADATA-query url gets the fileId remedy they found", () => {
     // Established by their curl, not inferred: `?type=…&format=…&fp=…` 404s even
     // with a valid token when a version publishes several files.
@@ -140,6 +169,60 @@ describe("the server's own explanation is carried back (#1300)", () => {
   it("does not invent a body when there is none", async () => {
     expect(await readErrorBody({ text: async () => "" })).toBe("");
   });
+
+  it("REDACTS a credential the host echoed back from our own query string", async () => {
+    // A signed download URL carries its credential in the query, and a host that
+    // reflects the request would otherwise republish it (codex). These values are
+    // ours, so they are redacted by identity, not by shape.
+    const token = "sk-live-abcdefghijklmnop";
+    const url = `https://civitai.com/api/download/models/1?token=${token}`;
+    const b = await readErrorBody({ text: async () => `{"error":"bad token ${token}"}` }, url);
+    expect(b).not.toContain(token);
+  });
+
+  it("…and in percent-encoded form", async () => {
+    const value = "abc/def+ghi=jkl mno";
+    const url = `https://civitai.com/api/download/models/1?sig=${encodeURIComponent(value)}`;
+    const b = await readErrorBody(
+      { text: async () => `{"echo":"${encodeURIComponent(value)}"}` },
+      url,
+    );
+    expect(b).not.toContain(encodeURIComponent(value));
+  });
+
+  it("does NOT redact short query values — type=UNet is the diagnosis, not a secret", async () => {
+    const url = "https://civitai.com/api/download/models/1?type=UNet&format=SafeTensor";
+    const b = await readErrorBody({ text: async () => '{"error":"no file for type UNet"}' }, url);
+    expect(b).toContain("UNet");
+  });
+
+  it("STOPS READING at the byte cap — the output bound is not a read bound", async () => {
+    // res.text() drains the whole response first, so a huge or never-ending error
+    // body could hang the download while we improved its message (codex).
+    let delivered = 0;
+    const reader = {
+      read: async () => {
+        delivered += 1024;
+        return { done: false, value: new Uint8Array(1024).fill(65) };
+      },
+      cancel: async () => undefined,
+    };
+    const b = await readErrorBody({ body: { getReader: () => reader } });
+    expect(delivered, "must stop near the cap, not read forever").toBeLessThanOrEqual(16 * 1024);
+    expect(b.length).toBeLessThanOrEqual(401);
+  });
+
+  it("cancels the stream it stopped reading", async () => {
+    let cancelled = false;
+    const reader = {
+      read: async () => ({ done: false, value: new Uint8Array(4096).fill(66) }),
+      cancel: async () => {
+        cancelled = true;
+      },
+    };
+    await readErrorBody({ body: { getReader: () => reader } });
+    expect(cancelled, "a body nobody will read must not be left draining").toBe(true);
+  });
 });
 
 // The wiring: the failure path must actually call both, or none of the above
@@ -154,7 +237,8 @@ describe("WIRING: the download failure path uses them (#1300)", () => {
     const at = src.indexOf("if (!res.ok) {");
     expect(at, "the failure branch moved").toBeGreaterThan(-1);
     const branch = src.slice(at, at + 1200);
-    expect(branch).toContain("await readErrorBody(res)");
+    // The request URL is passed so a reflected query credential is redacted.
+    expect(branch).toContain("await readErrorBody(res, currentUrl)");
     expect(branch).toContain("downloadFailureHint({");
     expect(branch).toContain("hasCivitaiToken: Boolean(config.civitaiApiToken)");
     // The status is still reported — the body and hint are additions, not a

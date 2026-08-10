@@ -1717,7 +1717,7 @@ async function streamUrlToFile(
     // with a body explaining itself and we threw it away, so a missing-token
     // failure and a wrong-URL failure were the same sentence. Read a bounded,
     // scrubbed slice of it: it is the only thing that distinguishes them.
-    const body = await readErrorBody(res);
+    const body = await readErrorBody(res, currentUrl);
     const hint = downloadFailureHint({
       status: res.status,
       url: currentUrl,
