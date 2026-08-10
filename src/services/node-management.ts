@@ -636,35 +636,73 @@ function whitelistVerdict(details: unknown): "proven" | "excluded" | "unknown" {
   const d = details as { status?: unknown; body?: unknown } | undefined;
   const status = typeof d?.status === "number" ? d.status : undefined;
   const body = typeof d?.body === "string" ? d.body : "";
-  // 403 is Manager refusing on its own security level; explainManagerForbidden already
-  // says so in detail, and the whitelist is NOT the reason. Claiming it there would
-  // send the reader to migrate Manager when the fix is a config setting.
-  if (status === 403) return "excluded";
+  // A security_level refusal is a DIFFERENT fault with a different fix (a Manager
+  // config setting, not a migration), and explainManagerForbidden already spells it
+  // out. Offering the whitelist beside it would give two causes for one failure.
+  //
+  // Keyed on the marker, not on the bare 403: a proxy or auth gate in front of ComfyUI
+  // also answers 403, and that is not Manager speaking at all.
+  if (status === 403 && /"error"\s*:\s*"security_level"/.test(body)) return "excluded";
   // Manager 3.x names the model-list check when it rejects one. Only these positively
   // establish it — anything else stays "unknown" rather than defaulting to the guess.
+  //
+  // Not applied to an HTML page: a proxy error or a framework traceback can contain the
+  // words "model list" without being Manager's rejection, and "proven" is the one branch
+  // that speaks with certainty. Manager answers JSON/plain text here.
+  if (/^\s*<|<html/i.test(body)) return "unknown";
   if (/model[- _]?list|whitelist|not (?:in|found in) the model list|invalid model/i.test(body))
     return "proven";
   return "unknown";
 }
 
-/** Manager's own response body, bounded and stripped of any credential echoed from
- *  the request URL. This is the evidence #1326 lost. */
+/**
+ * Strip credentials out of text that is about to be shown to a user.
+ *
+ * Redacting only the values from `details.url` is NOT enough here, and getting that
+ * wrong would have leaked a token. `details.url` is the Manager ENDPOINT
+ * (`…/manager/queue/install_model`) — the MODEL url, which is the one carrying a
+ * Hugging Face / CivitAI token, travels in the POST BODY. Manager echoes that url back
+ * when the download fails ("failed fetching <url>"), so the secret arrives through a
+ * path an endpoint-only redaction never sees.
+ *
+ * So every url found in the text has its query VALUES redacted, whatever its origin,
+ * plus a few token shapes that travel outside a query string. Keys are kept: the reader
+ * still needs to see that a token was present.
+ */
+function redactCredentialsForDisplay(text: string, endpointUrl?: string): string {
+  let out = text;
+  const redactUrlValues = (raw: string): void => {
+    let url: URL;
+    try {
+      url = new URL(raw);
+    } catch {
+      return; // not a parseable url — nothing known to redact
+    }
+    for (const value of url.searchParams.values()) {
+      // Short values are structural (page=2, type=vae), not secrets.
+      if (!value || value.length < 12) continue;
+      for (const form of new Set([value, encodeURIComponent(value)])) {
+        out = out.split(form).join("«redacted»");
+      }
+    }
+  };
+  if (endpointUrl) redactUrlValues(endpointUrl);
+  for (const found of text.match(/https?:\/\/[^\s"'<>)\\]+/gi) ?? []) redactUrlValues(found);
+  // Token shapes that are not query values (an Authorization header echoed into a
+  // traceback, a bare token in a message).
+  out = out
+    .replace(/\b(hf_|sk-|ghp_|gho_|github_pat_)[A-Za-z0-9_-]{8,}/g, "«redacted»")
+    .replace(/\b([Bb]earer\s+)[A-Za-z0-9._~+/-]{12,}=*/g, "$1«redacted»");
+  return out;
+}
+
+/** Manager's own response body, bounded and stripped of credentials. This is the
+ *  evidence #1326 lost. */
 function managerBodyExcerpt(details: unknown): string {
   const d = details as { body?: unknown; url?: unknown } | undefined;
-  let body = typeof d?.body === "string" ? d.body.trim() : "";
-  if (!body) return "";
-  if (typeof d?.url === "string") {
-    try {
-      for (const value of new URL(d.url).searchParams.values()) {
-        if (!value || value.length < 12) continue;
-        for (const form of new Set([value, encodeURIComponent(value)])) {
-          body = body.split(form).join("«redacted»");
-        }
-      }
-    } catch {
-      /* an unparseable url contributes no known values */
-    }
-  }
+  const raw = typeof d?.body === "string" ? d.body.trim() : "";
+  if (!raw) return "";
+  const body = redactCredentialsForDisplay(raw, typeof d?.url === "string" ? d.url : undefined);
   const MAX = 600;
   const clipped = body.length > MAX ? `${body.slice(0, MAX)}… (truncated)` : body;
   return ` ComfyUI-Manager said: ${clipped}`;

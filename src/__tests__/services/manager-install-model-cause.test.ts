@@ -96,18 +96,71 @@ describe("an install-model failure only claims a cause it can support (#1326)", 
     expect(msg).toContain("No space left on device");
   });
 
-  it("never echoes a credential from the request URL into the message", () => {
-    // A model URL routinely carries a token in its query. The body can echo the URL
-    // back, and an error message is the one place a secret must never surface.
-    const secret = "hf_SUPERSECRETTOKENVALUE123";
-    const url = `http://pod:8188/manager/queue/install_model?token=${secret}`;
+  it("never echoes the MODEL url's token — the path an endpoint-only redaction misses", () => {
+    // THE ONE THAT NEARLY SHIPPED A LEAK. My first version redacted only the query
+    // values of `details.url`, and my first test fed the secret in through exactly
+    // that — so it passed while proving nothing.
+    //
+    // `details.url` is the Manager ENDPOINT (…/manager/queue/install_model). The model
+    // url, which is the one carrying a Hugging Face / CivitAI token, is sent in the
+    // POST BODY (installModelViaManager -> taskParams.url). Manager echoes it back on a
+    // failed download, so the secret arrives by a route the endpoint url never covers.
+    // The secret is deliberately OPAQUE — no `hf_`/`sk-` prefix. An earlier version of
+    // this test used `hf_…`, which the token-SHAPE fallback catches, so it passed with
+    // the url redaction mutated away: it proved the fallback, not the thing it names.
+    // Verified by deleting the body-url redaction — this must fail.
+    const secret = "9f3a71c05b2e4d8899ab13ff5027cc41";
     const msg = annotateLegacyError(
-      managerHttpError(500, `failed fetching https://host/x.safetensors?token=${secret}`, url),
+      managerHttpError(
+        500,
+        `failed fetching https://civitai.com/api/download/models/123?token=${secret}&x=1`,
+        "http://pod:8188/manager/queue/install_model", // NO credential here
+      ),
       "install-model",
     ).message;
 
     expect(msg).not.toContain(secret);
     expect(msg).toContain("«redacted»");
+    // The shape survives so the reader can still see a token was involved.
+    expect(msg).toContain("token=");
+  });
+
+  it("redacts a token that is not a query value at all", () => {
+    const secret = "hf_ANOTHERSECRETTOKEN9876";
+    const msg = annotateLegacyError(
+      managerHttpError(500, `Traceback: Authorization: Bearer abcdefghijklmnop123456 / ${secret}`),
+      "install-model",
+    ).message;
+    expect(msg).not.toContain(secret);
+    expect(msg).not.toContain("abcdefghijklmnop123456");
+  });
+
+  it("keeps short structural query values readable", () => {
+    // Over-redaction would destroy the evidence this change exists to surface.
+    const msg = annotateLegacyError(
+      managerHttpError(500, "failed fetching https://host/m.safetensors?type=vae&page=2"),
+      "install-model",
+    ).message;
+    expect(msg).toContain("type=vae");
+    expect(msg).toContain("page=2");
+  });
+
+  it("an HTML error page is never 'proven' — certainty needs Manager, not a proxy", () => {
+    // "proven" is the only branch that speaks with certainty, so it must not be
+    // reachable from a page that merely contains the words.
+    const msg = annotateLegacyError(
+      managerHttpError(502, "<html><body>Bad Gateway: upstream model list unavailable</body></html>"),
+      "install-model",
+    ).message;
+    expect(msg).toMatch(/did NOT say so explicitly/);
+  });
+
+  it("a 403 that is NOT security_level stays undetermined, not excluded", () => {
+    // A proxy or auth gate in front of ComfyUI also answers 403, and that is not
+    // Manager speaking — treating it as a security_level refusal would suppress the
+    // only guidance the caller gets.
+    const msg = annotateLegacyError(managerHttpError(403, "Forbidden by corporate proxy"), "install-model").message;
+    expect(msg).toMatch(/did NOT say so explicitly/);
   });
 
   it("bounds the excerpt so a huge HTML error page cannot flood the reply", () => {
