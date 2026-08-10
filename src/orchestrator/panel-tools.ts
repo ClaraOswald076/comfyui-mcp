@@ -4059,7 +4059,55 @@ async function waitForOpenReceipt(
  *  gave up (no tab reconnected within budget / an ambiguous multi-tab session). We
  *  must NOT dispatch — firing into a dead binding is exactly the OUTCOME-UNKNOWN /
  *  double-apply risk the pre-send wait exists to prevent (codex). */
-function noReachableTabFail(cmd: string): ToolResult {
+function noReachableTabFail(cmd: string, ctx?: PanelToolCtx): ToolResult {
+  // #971 — TWO CAUSES, OPPOSITE REMEDIES, and they were folded into one sentence
+  // that sent the reporter in a circle:
+  //
+  //   panel_open_workflow  -> "no reachable tab … or rebind with
+  //                            panel_set_workflow_target({mode:'current'})"
+  //   mode:"current"       -> its only probe is a workflow_list call TO A TAB
+  //
+  // So the advice needed exactly the thing whose absence caused the failure. The
+  // reporter had already run the rebind — it reported `bound` — and was sent back
+  // to it.
+  //
+  // The two causes want different answers, and the bridge can tell them apart:
+  //  • nothing connected  → there is nothing to rebind ONTO. Say so, and name the
+  //    thing that does help (the tab reconnecting, or the user opening/refreshing
+  //    one).
+  //  • tabs connected, none is ours → `mode:"current"` is exactly right: it
+  //    re-points the session at the active tab.
+  let connected: number | null = null;
+  try {
+    const tabs = ctx?.bridge?.tabs?.();
+    if (Array.isArray(tabs)) {
+      connected = tabs.filter(
+        (t) => !(typeof ctx?.bridge?.isHeadless === "function" && ctx.bridge.isHeadless(t.tab_id)),
+      ).length;
+    }
+  } catch {
+    connected = null; // an unreadable bridge earns the neutral wording below
+  }
+
+  if (connected === 0) {
+    return fail(
+      `${cmd} — this session has no reachable panel tab, and NO panel tab is connected at all ` +
+        `(still reconnecting after a restart/reload, or the ComfyUI browser tab is closed). ` +
+        `Nothing was sent. Rebinding CANNOT help while nothing is connected — ` +
+        `panel_set_workflow_target({mode:"current"}) has to reach a tab to do anything. Wait for ` +
+        `the tab to reconnect and retry, or ask the user to open/refresh the ComfyUI tab.`,
+    );
+  }
+  if (connected !== null && connected > 0) {
+    return fail(
+      `${cmd} — this session has no reachable panel tab, though ${connected} panel tab(s) are ` +
+        `connected — none of them is bound to this session (its tab was replaced, or several are ` +
+        `open and the session's is gone). Nothing was sent. Rebind onto the live one with ` +
+        `panel_set_workflow_target({mode:"current"}), then retry.`,
+    );
+  }
+  // Bridge could not enumerate tabs: keep the old, cause-neutral wording rather
+  // than guessing which of the two it is.
   return fail(
     `${cmd} — this session has no reachable panel tab yet (still reconnecting after a ` +
       `restart/reload, or multiple tabs are open and none is this session's). Nothing was ` +
@@ -4075,7 +4123,7 @@ async function openWorkflowWithVerify(path: string, ctx: PanelToolCtx): Promise<
   // OUTCOME UNKNOWN. A healthy session returns from this instantly; if no tab
   // reconnects within budget we REFUSE rather than dispatch into a dead binding.
   if (ctx.awaitReachable && !(await ctx.awaitReachable())) {
-    return noReachableTabFail("workflow_open");
+    return noReachableTabFail("workflow_open", ctx);
   }
   let dispatchedRid: string | undefined;
   const res = await ctx.call(
@@ -9255,7 +9303,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // if no tab reconnects within budget we REFUSE rather than fire into a dead
         // binding.
         if (ctx.awaitReachable && !(await ctx.awaitReachable())) {
-          return noReachableTabFail(args.name ? "workflow_save_as" : "workflow_save");
+          return noReachableTabFail(args.name ? "workflow_save_as" : "workflow_save", ctx);
         }
         const res = args.name
           ? await ctx.call({ cmd: "workflow_save_as", name: args.name }, 15000)
