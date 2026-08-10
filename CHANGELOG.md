@@ -21,6 +21,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.96] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- refuse an arbitrary-URL download once, before three requests fail (#1338)
+
+
 ## [0.50.95] - 2026-08-10
 
 ### MCP
