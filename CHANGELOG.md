@@ -21,6 +21,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.94] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- tell the user the install is damaged, instead of printing a resolver path (#1333)
+
+#### Changed
+- delete a header claim about a caller that does not exist (#1324)
+
+
 ## [0.50.93] - 2026-08-10
 
 ### MCP
