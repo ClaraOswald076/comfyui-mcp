@@ -524,15 +524,28 @@ function isDesktopSupervisorProcess(identity: ProcessIdentity): boolean {
     const base = norm.split("/").pop() ?? "";
     // Current and legacy Windows branding, including the electron-era install dir.
     if (base === "comfy desktop.exe" || base === "comfyui.exe") return true;
-    // macOS: the bundle's MAIN binary, which by convention is named after the bundle
-    // (`Comfy Desktop.app/Contents/MacOS/Comfy Desktop`). Accepting ANY binary under
-    // `Contents/MacOS/` was too loose: a venv shim or launcher script living inside
-    // the bundle would pass, and a shim re-execs nothing (coordinator gate). The
-    // backreference ties the two halves together so the binary must belong to the
-    // bundle naming it. Electron HELPERS are excluded structurally — they live in
-    // `Contents/Frameworks/<Helper>.app/Contents/MacOS/…`, so the first bundle in the
-    // path is not followed by `Contents/MacOS/`.
-    return /\/(comfy desktop|comfyui)\.app\/contents\/macos\/\1$/.test(norm);
+    // macOS: the bundle's MAIN binary. Accepting ANY binary under `Contents/MacOS/`
+    // would be too loose — a venv shim or launcher script living inside the bundle
+    // would pass, and a shim re-execs nothing (coordinator gate) — so BOTH halves are
+    // pinned to the trusted product names. Electron HELPERS are excluded structurally:
+    // they live in `Contents/Frameworks/<Helper>.app/Contents/MacOS/…`, so the first
+    // bundle in the path is not followed by `Contents/MacOS/`.
+    //
+    // #1341 — the two names are matched INDEPENDENTLY, not tied by a backreference.
+    // The convention that a bundle's binary is named after the bundle does not hold
+    // for current Desktop packaging: ComfyUI Desktop 1.0.38 ships bundle `ComfyUI.app`
+    // with main executable `Comfy Desktop`. The backreference rejected that real
+    // supervisor, the ancestry walk ran to PID 1, and a reporter with a healthy
+    // Desktop parent was told "no Desktop app is still supervising it — its parent
+    // process is gone" and refused a safe restart.
+    //
+    // This does NOT loosen the asymmetry documented above. Both halves are still
+    // drawn from the same two-name set, so nothing new becomes a supervisor; only the
+    // requirement that they be the SAME name is dropped, and that requirement was
+    // about Apple's naming convention rather than about trust.
+    return /\/(?:comfy desktop|comfyui)\.app\/contents\/macos\/(?:comfy desktop|comfyui)$/.test(
+      norm,
+    );
   };
 
   // THE KERNEL'S ANSWER FIRST, and ALONE when it exists (codex gate round 3).
@@ -564,11 +577,16 @@ function isDesktopSupervisorProcess(identity: ProcessIdentity): boolean {
   //
   // The BINARY NAME is required here too, for the same reason as above: a launcher
   // script or venv shim inside the bundle would otherwise be read as the shell
-  // (coordinator gate). `\2` ties it to the bundle that names it, and the match must
-  // end at whitespace or end-of-line so the binary is the whole argv[0] rather than a
-  // prefix of some longer name.
+  // (coordinator gate). The match must end at whitespace or end-of-line so the binary
+  // is the whole argv[0] rather than a prefix of some longer name.
+  //
+  // #1341 — and the two names are independent here as well. This fallback carried the
+  // identical backreference, so fixing only the executable-path matcher above would
+  // have left macOS installs failing on exactly the path macOS actually takes: `ps`
+  // has no authenticated-executable column, so this IS the branch a Desktop-managed
+  // mac reaches.
   const line = (identity.commandLine ?? "").trim().replace(/\\/g, "/").toLowerCase();
-  return /^"?(\/[^\s"]*\/)?(comfy desktop|comfyui)\.app\/contents\/macos\/\2(\s|"|$)/.test(
+  return /^"?(\/[^\s"]*\/)?(?:comfy desktop|comfyui)\.app\/contents\/macos\/(?:comfy desktop|comfyui)(\s|"|$)/.test(
     line,
   );
 }
