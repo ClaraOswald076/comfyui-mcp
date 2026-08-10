@@ -112,3 +112,19 @@ it("#971 with NO last-active tab, the prescribed recovery is a dead end", async 
   const recovered = ctx.tabId !== "stale-tab" || /switch to|focus/i.test(textOf(rec2));
   expect(recovered).toBe(true);
 });
+
+it("#971 a NON-ambiguity failure keeps its own words", async () => {
+  // The guard's false-positive direction is invisible in the tests above: if
+  // ambiguousRebindGuidance rewrote everything, they would still pass while every
+  // unrelated rebind failure was replaced by advice about switching tabs.
+  const { bridge } = reconnectingBridge(["tab-a", "tab-b"]);
+  (bridge as unknown as { resolveActiveTabId: () => string }).resolveActiveTabId = () => {
+    throw new Error("bridge exploded while resolving");
+  };
+  const ctx = makePanelToolCtx(bridge, "stale-tab", new WorkflowTargetStore());
+  const target = buildPanelToolDefs().find((d) => d.name === "panel_set_workflow_target")!;
+  const res = (await target.handler({ mode: "current" }, ctx)) as ToolResult;
+  expect(res.isError).toBe(true);
+  expect(textOf(res)).toMatch(/bridge exploded while resolving/);
+  expect(textOf(res)).not.toMatch(/Switch to \(click\)/);
+});

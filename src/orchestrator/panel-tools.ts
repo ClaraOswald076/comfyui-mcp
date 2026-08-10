@@ -227,6 +227,51 @@ function fail(err: unknown): ToolResult {
   const msg = err instanceof Error ? err.message : String(err);
   return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
 }
+/**
+ * #971 — the AMBIGUOUS-rebind refusal, worded so it can be acted on.
+ *
+ * Refusing here is right (#474: with 2+ live tabs the rebind is ambiguous, so the
+ * user picks rather than us guessing). What was wrong is what it refused WITH:
+ * rebindToActiveTab propagates the bridge's raw resolve error, which ends
+ * "— pass tab_id". This tool has no tab_id parameter (schema: mode/path/filename)
+ * and #754 made these schemas strict, so an unknown key is a hard validation error
+ * rather than a no-op. Since panel_open_workflow's own refusal names THIS tool as
+ * the way out, an instruction that cannot be followed closes the loop and the
+ * session stays wedged with no exit — the reporter's wedge.
+ *
+ * Focusing a tab is what MAKES it last-active, so the action that actually works is
+ * the one panel_reload already prescribes. Name the connected tabs too, so the user
+ * knows what they are choosing among.
+ */
+function ambiguousRebindGuidance(ctx: PanelToolCtx, err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err ?? "");
+  // Only reword the ambiguity refusal — every other failure keeps its own words.
+  if (!/multiple|last active|pass tab_id/i.test(raw)) return raw;
+  let listed = "";
+  try {
+    const live = typeof ctx.bridge.tabs === "function" ? ctx.bridge.tabs() : undefined;
+    if (Array.isArray(live)) {
+      // isHeadless THROUGH the bridge — a detached reference loses `this` and throws
+      // on `this.conns` (#478). A headless viewer is not a pickable canvas tab.
+      const isHeadlessTab = (id: string): boolean =>
+        typeof ctx.bridge.isHeadless === "function" && ctx.bridge.isHeadless(id);
+      const names = live
+        .filter((t) => !isHeadlessTab(t.tab_id))
+        .map((t) => (t.title ? `${shortTabId(t.tab_id)} ("${t.title}")` : shortTabId(t.tab_id)));
+      if (names.length) listed = ` Connected ComfyUI tabs: ${names.join(", ")}.`;
+    }
+  } catch {
+    // Enumeration is best-effort; the instruction below stands without the list.
+  }
+  return (
+    "Several ComfyUI tabs are connected and none is marked active, so this session cannot " +
+    "tell which one to follow — and this tool takes no tab_id to disambiguate with." +
+    `${listed} Switch to (click) the ComfyUI tab you want the agent to work in, which makes ` +
+    'it the active tab, then call panel_set_workflow_target({mode:"current"}) again. ' +
+    "Nothing was rebound."
+  );
+}
+
 
 // ── Honest secret-save reporting (#826) ─────────────────────────────────────
 // `panel_request_secret` used to answer "the comfyui tools respawn with it as
@@ -9457,7 +9502,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 /no panel connected|not reachable|connected:\s*none|no connected tab/i.test(msg) &&
                 !/multiple|last active|pass tab_id/i.test(msg);
             }
-            if (!noTabsConnected) return fail(err);
+            if (!noTabsConnected) return fail(ambiguousRebindGuidance(ctx, err));
             deferredBind = true;
             rebindNote =
               " No panel tab is connected yet — cleared the stale binding; this session will " +
