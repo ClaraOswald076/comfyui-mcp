@@ -21,6 +21,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.99] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- name the remedy that restores a trusted identity, not the one that cannot (#1346)
+
+
 ## [0.50.98] - 2026-08-10
 
 ### MCP
