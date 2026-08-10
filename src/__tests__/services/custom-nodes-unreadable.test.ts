@@ -33,6 +33,15 @@ const hoisted = vi.hoisted(() => ({
   statError: undefined as NodeJS.ErrnoException | undefined,
 }));
 
+// #1290 — this file reaches `resolveLiveServerRoot`, whose second tier shells
+// out (netstat/WMI) to find the python actually serving the port ON THIS
+// MACHINE. Unstubbed, the assertions below would depend on whether the
+// developer happens to have ComfyUI running (#1263). Stub it at the boundary.
+vi.mock("../../services/live-interpreter.js", async () => ({
+  ...(await vi.importActual("../../services/live-interpreter.js")),
+  resolveLiveInterpreter: () => undefined,
+}));
+
 vi.mock("../../config.js", async () => {
   const actual = await vi.importActual<typeof import("../../config.js")>("../../config.js");
   return { ...actual, isLocalMode: () => true };
@@ -51,6 +60,13 @@ vi.mock("../../services/workspace-env.js", async () => {
       cwd: undefined,
     }),
     liveRootFromArgv: (argv: string[] | undefined) => (argv ? argv[0] : undefined),
+    // #1133 — `resolvePanelBase` derives the install root through the CANONICAL
+    // resolver now, not by re-parsing argv, so that is the seam this file has to
+    // stub. Left on `liveRootFromArgv` alone it would silently stop producing a
+    // live candidate at all, and every assertion below would pass vacuously
+    // against a resolution that never had one to disqualify.
+    resolveLiveServerRoot: (argv: string[] | undefined) =>
+      argv ? { root: argv[0], source: "argv" as const } : { source: "unresolved" as const },
   };
 });
 
