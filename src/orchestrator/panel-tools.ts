@@ -4090,12 +4090,20 @@ function noReachableTabFail(cmd: string, ctx?: PanelToolCtx): ToolResult {
   }
 
   if (connected === 0) {
+    // MEASURED, not assumed. An earlier draft of this said "rebinding CANNOT
+    // help while nothing is connected". That is false: with zero tabs
+    // `mode:"current"` returns `deferred: true`, CLEARS the stale binding, and
+    // arms a bind onto the first tab that reconnects. It is worth doing — it
+    // just does not make the command retryable NOW, which is what the caller is
+    // actually asking. Saying which of those it does is the difference between
+    // a useful instruction and the loop the reporter hit.
     return fail(
       `${cmd} — this session has no reachable panel tab, and NO panel tab is connected at all ` +
         `(still reconnecting after a restart/reload, or the ComfyUI browser tab is closed). ` +
-        `Nothing was sent. Rebinding CANNOT help while nothing is connected — ` +
-        `panel_set_workflow_target({mode:"current"}) has to reach a tab to do anything. Wait for ` +
-        `the tab to reconnect and retry, or ask the user to open/refresh the ComfyUI tab.`,
+        `Nothing was sent. A rebind will NOT make this retryable yet: with nothing connected, ` +
+        `panel_set_workflow_target({mode:"current"}) clears the stale binding and DEFERS, taking ` +
+        `effect on the first tab that reconnects — useful, but it does not bring a tab back. ` +
+        `Wait for the reconnect and retry, or ask the user to open/refresh the ComfyUI browser tab.`,
     );
   }
   if (connected !== null && connected > 0) {

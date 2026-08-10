@@ -11,12 +11,17 @@
 //   4. which is step 1 — and whose only probe is a `workflow_list` call TO A TAB,
 //      so it needs exactly what step 3 just said is missing.
 //
-// The message folded two causes that want opposite advice:
+// The message folded two causes into one remedy, and they want different advice:
 //
-//   nothing connected      -> nothing to rebind ONTO; the rebind cannot help
-//   connected, none is ours -> the rebind is precisely right
+//   nothing connected       -> a rebind DEFERS (it clears the stale binding and
+//                              takes effect on the first tab that reconnects), so
+//                              it does not make this retryable now
+//   connected, none is ours -> a rebind is precisely right: it re-points the
+//                              session at the live tab
 //
-// The bridge can tell them apart, so the remedy now matches the cause.
+// The bridge can tell them apart, so the remedy now matches the cause. What the
+// zero-tab branch says was MEASURED against the real handler, not reasoned — see
+// the first test.
 
 import { describe, expect, it } from "vitest";
 
@@ -58,16 +63,22 @@ async function openWorkflow(bridge: PanelToolCtx["bridge"]): Promise<string> {
 }
 
 describe("the no-reachable-tab remedy matches its cause (#971)", () => {
-  it("NOTHING connected: does not send the caller to a rebind that cannot work", async () => {
-    // The reporter's loop. `mode:"current"` re-derives the fence from a
-    // `workflow_list` call to a tab — with none connected there is nothing to
-    // ask, so offering it is advice that cannot come true.
+  it("NOTHING connected: says the rebind DEFERS rather than repairs", async () => {
+    // MEASURED, and it corrected me. My first version of this asserted the
+    // rebind "cannot help" with zero tabs. Probed against the real handler: it
+    // returns `deferred: true`, CLEARS the stale binding, and arms a bind onto
+    // the first tab that reconnects. So it is worth doing — it simply does not
+    // make the command retryable now, which is what the caller is asking. The
+    // loop the reporter hit comes from not saying which of those it does.
     const text = await openWorkflow(bridgeWith([]));
 
     expect(text).toMatch(/NO panel tab is connected at all/);
-    expect(text).toMatch(/Rebinding CANNOT help while nothing is connected/);
-    // …and it names what does help instead.
-    expect(text).toMatch(/Wait for the tab to reconnect|open\/refresh the ComfyUI tab/);
+    expect(text).toMatch(/will NOT make this retryable yet/);
+    expect(text).toMatch(/clears the stale binding and DEFERS/);
+    // …and it names what actually brings a tab back.
+    expect(text).toMatch(/Wait for the reconnect|open\/refresh the ComfyUI browser tab/);
+    // The false claim must not come back.
+    expect(text).not.toMatch(/CANNOT help/);
   });
 
   it("CONNECTED but not ours: the rebind IS the right move, and is offered", async () => {
@@ -77,7 +88,7 @@ describe("the no-reachable-tab remedy matches its cause (#971)", () => {
 
     expect(text).toMatch(/1 panel tab\(s\) are connected/);
     expect(text).toMatch(/panel_set_workflow_target\(\{mode:"current"\}\)/);
-    expect(text).not.toMatch(/CANNOT help/);
+    expect(text).not.toMatch(/will NOT make this retryable yet/);
   });
 
   it("headless tabs do not count as something to rebind onto", async () => {
