@@ -1417,6 +1417,67 @@ export function restartTimeoutFallbackAdvice({
   );
 }
 
+/**
+ * #1359 — an /object_info failure that names WHICH host it asked, and why that host.
+ *
+ * `panel_strip_workflow` reads the graph from the connected panel and then fetches node
+ * definitions through the global headless client, which resolves COMFYUI_URL. For a
+ * local session those are one machine. For a connected REMOTE panel they are two, and
+ * the tool fails with a bare
+ *
+ *   fetch failed: connect ECONNREFUSED 127.0.0.1:8188 — while requesting
+ *   http://127.0.0.1:8188/object_info
+ *
+ * which says nothing about the canvas being on a different host. The reporter of #1359
+ * had to read the compiled orchestrator to find that out.
+ *
+ * This does NOT fix the split authority — that needs the panel to serve its own
+ * /object_info, a protocol change tracked separately. It makes the existing failure
+ * diagnosable, and names the workaround that works today.
+ *
+ * The panel's origin is the SERVER-OBSERVED handshake Origin where available: the
+ * browser sets it on the WS upgrade and page JS cannot forge it. It is only being
+ * PRINTED here, never fetched from, so an unreadable one costs a detail rather than a
+ * wrong conclusion.
+ */
+function objectInfoHostMismatchMessage(
+  ctx: PanelToolCtx,
+  err: unknown,
+  liveCanvasSource: boolean,
+): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  let panelOrigin: string | null = null;
+  try {
+    panelOrigin = ctx.bridge?.tabServerOrigin?.(ctx.tabId) ?? null;
+  } catch {
+    /* best effort — the message stands without it */
+  }
+  const configured = getComfyUIBaseUrl();
+  if (!liveCanvasSource) {
+    // pack / path / inline: COMFYUI_URL is the right authority, so the bare failure is
+    // already about the host the caller asked for. Say only what is true.
+    return `${raw}\n\nNode definitions are read from COMFYUI_URL (${configured}) for a pack/path/inline source. That host did not answer /object_info.`;
+  }
+  const differs =
+    panelOrigin != null && configured != null && !sameHttpBase(panelOrigin, configured);
+  return (
+    `${raw}\n\nTHE GRAPH AND ITS NODE DEFINITIONS CAME FROM DIFFERENT PLACES. The workflow was ` +
+    `captured from the connected panel` +
+    (panelOrigin ? ` (ComfyUI at ${panelOrigin})` : "") +
+    `, but node definitions are fetched over COMFYUI_URL (${configured}) — and that is the ` +
+    `request that failed` +
+    (differs
+      ? `. Those are two different hosts, which is why this could not work: the orchestrator ` +
+        `has no route to the panel's ComfyUI for /object_info.`
+      : `.`) +
+    `\n\nWORKAROUND: point COMFYUI_URL at the same ComfyUI the panel is connected to` +
+    (panelOrigin ? ` (${panelOrigin})` : "") +
+    ` and retry, or pass an explicit \`graph\`/\`pack\`/\`path\` source instead of the live ` +
+    `canvas. This is a known split of authority (#1359): stripping the LIVE canvas needs ` +
+    `the definitions to come from the panel's own ComfyUI, which needs a panel-side change.`
+  );
+}
+
 function captureRebootHealthBase(ctx: PanelToolCtx): string | null {
   if (isCloudMode() || isRemoteMode()) return null;
   const bootBase = getBootLocalComfyUIBaseUrl(); // server-authorized, hello-immutable
@@ -8078,7 +8139,25 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         const captureNotes: string[] = [];
         const raw = await resolveWorkflowInput(args, ctx, true, captureNotes);
         const ui = raw as unknown as UiWorkflow;
-        const bulk = await getObjectInfo();
+        // #1359 — the graph came from the PANEL; the node definitions come from
+        // COMFYUI_URL. Those are the same machine for a local session and different
+        // ones for a connected REMOTE panel, and when they differ this fails with a
+        // bare `ECONNREFUSED 127.0.0.1:8188` that never mentions the canvas host. The
+        // reporter had to read dist/ to discover that the two halves have different
+        // authorities.
+        //
+        // Only the live-canvas source is affected: a pack/path/inline graph is
+        // deliberately tied to COMFYUI_URL, so its definitions belong there.
+        const liveCanvasSource = args.pack == null && args.path == null && args.graph == null;
+        let bulk: Awaited<ReturnType<typeof getObjectInfo>>;
+        try {
+          bulk = await getObjectInfo();
+        } catch (err) {
+          // Returned as a tool ERROR rather than thrown: a throw here escapes the
+          // handler and reaches the caller as a transport-shaped failure, which is how
+          // the bare ECONNREFUSED got to the reporter in the first place.
+          return fail(objectInfoHostMismatchMessage(ctx, err, liveCanvasSource));
+        }
         const objectInfo = await backfillObjectInfo(bulk, collectNodeTypes(ui));
         const converted = convertUiToApi(ui, objectInfo);
         const workflow = converted.workflow;
