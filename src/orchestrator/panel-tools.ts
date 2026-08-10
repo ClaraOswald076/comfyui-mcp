@@ -859,6 +859,21 @@ function isWorkflowSwitchGuardRefusal(err: unknown): boolean {
   return /panel is switching\/refreshing|panel is switching or reloading/i.test(msg);
 }
 
+/**
+ * #1331 — the bridge refused a mutation because the active workflow has no identity to
+ * fence against (ui-bridge's `no trusted identity` branch).
+ *
+ * Kept separate from the capability refusal beside it because the two need opposite
+ * advice: a capability gap needs a panel UPDATE, this needs the workflow re-opened. What
+ * they share is that the generic "retry / rebind with mode:current" wrapper can clear
+ * NEITHER, and appending it sent the reporter of #1331 through four calls to reach a
+ * state the panel already believed it was in.
+ */
+function isNoTrustedIdentityRefusal(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? "");
+  return /no trusted identity/i.test(msg);
+}
+
 let retrySettleMsOverride: number | null = null;
 /** Short pause before the single post-drop retry, letting the replacement tab
  *  finish its reconnect hello so ensureReachable can resolve it. Test-overridable. */
@@ -5803,6 +5818,62 @@ export function makePanelToolCtx(
       // sent agents into a futile retry/rebind loop that contradicted the embedded
       // guidance. Key on the TYPED marker and surface the cause verbatim instead; it
       // already names the real recovery (update + restart + browser hard-refresh).
+      // #1331 — DECIDE WHICH "no trusted identity" THIS IS, instead of asserting one.
+      //
+      // The reporter was told to "retry in a moment, or rebind with
+      // panel_set_workflow_target({mode:"current"})", followed it, and it did not work:
+      // recovery took panel_open_workflow on the workflow that was ALREADY active —
+      // four calls to reach a state the panel already believed it was in.
+      //
+      // But that advice is NOT always wrong, and my first attempt at this deleted it
+      // outright — which #709's test caught. Two different states produce the identical
+      // bridge message, and they need opposite remedies:
+      //
+      //   session bound to a STALE tab, live canvas HAS an identity
+      //        → rebinding genuinely re-resolves it (#709). The advice is correct.
+      //   the LIVE canvas itself has no identity
+      //        → the rebind READS an identity to adopt and finds none, so it reports
+      //          success while every mutation keeps failing (#1331).
+      //
+      // The bridge cannot tell them apart — from its side both are "no identity". The
+      // orchestrator can, with the same read-only re-derivation the documented recovery
+      // performs. So it is measured, once, and the answer names the remedy that fits.
+      if (isNoTrustedIdentityRefusal(err) && isMutatingGraphCmd(cmd)) {
+        const raw = err instanceof Error ? err.message : String(err);
+        try {
+          const rebind = await rebindWorkflowFence(ctx);
+          if (rebind.status === "no_identity") {
+            return fail(
+              `${raw}\n\nCHECKED, so this is not a guess: the live canvas was re-read and it ` +
+                `carries no workflow identity either (${rebind.why}). ` +
+                `panel_set_workflow_target({mode:"current"}) will NOT clear this — it chooses ` +
+                `WHICH workflow to fence against and cannot mint an identity for one that has ` +
+                `none, so it reports success while every mutation keeps failing. RECOVERY: ` +
+                `panel_open_workflow(<path>) on this same workflow; re-opening it is what gives ` +
+                `it an identity. If it has never been saved there is no path to re-open — save ` +
+                `it first with panel_save_workflow, which also gives it a stable identity.`,
+            );
+          }
+          if (rebind.status === "refreshed" || rebind.status === "already_current") {
+            return fail(
+              `${raw}\n\nCHECKED: the live canvas DOES carry an identity (${rebind.uuid}) and ` +
+                `this session's fence has been re-derived onto it. RETRY THIS EXACT CALL ONCE — ` +
+                `nothing was applied, so a retry cannot double-apply.`,
+            );
+          }
+          // unreadable / uncorroborated — say so rather than picking a remedy.
+          return fail(
+            `${raw}\n\nCHECKED, and the answer is UNKNOWN: the live canvas could not be re-read ` +
+              `well enough to say whether it has an identity. Try ` +
+              `panel_open_workflow(<path>) on the workflow you mean — it is the only recovery ` +
+              `that works in BOTH states, because it gives the workflow an identity rather than ` +
+              `adopting one that may not exist.`,
+          );
+        } catch {
+          // The diagnosis must never change how the call failed.
+          return fail(raw);
+        }
+      }
       if (isCapabilityRefusal(err)) {
         return fail(err instanceof Error ? err.message : String(err));
       }
