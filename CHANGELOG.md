@@ -21,6 +21,22 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.98] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- corroborate a fence mismatch before failing 14 calls closed (#1344)
+
+
+## [0.50.97] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- a re-delivered completion must not disown a run we queued (#1342)
+
+
 ## [0.50.96] - 2026-08-10
 
 ### MCP

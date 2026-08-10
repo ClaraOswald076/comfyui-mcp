@@ -860,10 +860,31 @@ function isWorkflowSwitchGuardRefusal(err: unknown): boolean {
 }
 
 /**
+ * #1330 — the panel's workflow-instance fence refused this command.
+ *
+ * Distinct from every other refusal here in one way that matters: the panel checks the
+ * fence BEFORE the handler runs, so "Nothing was applied" is structural, not a claim.
+ * That is what makes it safe to tell a caller to retry — and it is why this is worth
+ * separating from the transport failures around it, where the outcome is unknown.
+ *
+ * Matched on the leading token the panel preserves deliberately for exactly this
+ * purpose (see workflowInstanceMismatchMessage: "the leading `workflow instance
+ * mismatch:` token is preserved deliberately").
+ */
+function isWorkflowInstanceMismatch(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? "");
+  return /workflow instance mismatch/i.test(msg);
+}
+
+/**
  * #1331 — the bridge refused a mutation because the active workflow has no identity to
  * fence against (ui-bridge's `no trusted identity` branch).
  *
- * Kept separate from the capability refusal beside it because the two need opposite
+ * A DIFFERENT refusal from the one above, and the pair is easy to conflate: that one is
+ * two identities disagreeing, this one is there being no identity at all. They also need
+ * different handling — a mismatch may clear by itself, this never does.
+ *
+ * Kept separate from the capability refusal beside it because those need opposite
  * advice: a capability gap needs a panel UPDATE, this needs the workflow re-opened. What
  * they share is that the generic "retry / rebind with mode:current" wrapper can clear
  * NEITHER, and appending it sent the reporter of #1331 through four calls to reach a
@@ -5873,6 +5894,65 @@ export function makePanelToolCtx(
           // The diagnosis must never change how the call failed.
           return fail(raw);
         }
+      }
+      // #1330 — CORROBORATE A FENCE MISMATCH INSTEAD OF LETTING IT REPEAT.
+      //
+      // The reporter built 12 nodes successfully, then EVERY panel_connect was refused
+      // on an instance mismatch. Calling panel_set_workflow_target({mode:"current"})
+      // straight afterwards reported `already_current` naming the SAME uuid the command
+      // had been issued for, and the retried connects all succeeded. So the mismatch was
+      // transient and self-correcting, and the caller paid 14 refusals to find that out —
+      // because nothing in the refusal distinguishes "the canvas really is a different
+      // workflow" from "the identity flipped for a moment while you were building".
+      //
+      // The fence is NOT weakened and nothing is auto-applied. This performs the same
+      // read-only re-derivation the documented recovery performs, then says which of the
+      // two states was found. One informed retry replaces fourteen blind ones.
+      //
+      // Safe to recommend a retry because a fence refusal is checked BEFORE the handler
+      // runs — "Nothing was applied" is structural here, not an echoed claim.
+      if (isWorkflowInstanceMismatch(err) && isMutatingGraphCmd(cmd)) {
+        const name = typeof cmd.cmd === "string" ? cmd.cmd : "panel command";
+        const raw = err instanceof Error ? err.message : String(err);
+        // The uuid the command CARRIED, read from the panel's own refusal rather than
+        // from `cmd`: the stamp is applied downstream of here, so `cmd.workflow_uuid`
+        // is undefined at this point and keying on it silently disabled the transient
+        // branch — the one case this whole block exists for. The panel states both
+        // sides of the comparison it performed, which is the authoritative record of
+        // what was compared.
+        const stamped = /issued for workflow instance ([0-9a-f-]{36})/i.exec(
+          err instanceof Error ? err.message : String(err),
+        )?.[1] ?? null;
+        let verdict: string;
+        try {
+          const rebind = await rebindWorkflowFence(ctx);
+          verdict =
+            rebind.status === "already_current" && stamped && rebind.uuid === stamped
+              ? `\n\nAUTO-REBIND: ATTEMPTED, and the live canvas now reports the SAME workflow ` +
+                `instance this command carried (${stamped}) — nothing needed repairing. The ` +
+                `mismatch was TRANSIENT: the identity flipped and settled back, which happens ` +
+                `while a new unsaved workflow is still materialising. RETRY THIS EXACT CALL ONCE. ` +
+                `Nothing was applied, so a retry cannot double-apply, and re-issuing the whole ` +
+                `build would duplicate the work that already succeeded.`
+              : rebind.status === "already_current"
+                ? `\n\nAUTO-REBIND: ATTEMPTED; the fence already named the live canvas ` +
+                  `(${rebind.uuid}), so it was not the stale side. Retry once — if it refuses ` +
+                  `again with the same pair, the two identities are genuinely disagreeing and ` +
+                  `panel_open_workflow is the way to settle which one you mean.`
+                : rebind.status === "refreshed"
+                  ? `\n\nAUTO-REBIND: ATTEMPTED and the fence was RE-DERIVED onto the live canvas ` +
+                    `(now ${rebind.uuid}). Retry once. If you meant the EARLIER workflow, re-select ` +
+                    `it with panel_open_workflow first — this session now points at the live one.`
+                  : `\n\nAUTO-REBIND: ATTEMPTED and did NOT succeed (${rebind.status}), so the fence ` +
+                    `is unchanged and a bare retry will fail the same way. Re-select the workflow ` +
+                    `you mean with panel_open_workflow, then retry.`;
+        } catch (rebindErr) {
+          // Never let the diagnosis fail the call differently than it already failed.
+          verdict =
+            `\n\nAUTO-REBIND: ATTEMPTED and threw, so the fence state is UNKNOWN — this refusal ` +
+            `stands on its own terms. (${rebindErr instanceof Error ? rebindErr.message : String(rebindErr)})`;
+        }
+        return fail(`${name} was NOT applied — nothing changed. ${raw}${verdict}`);
       }
       if (isCapabilityRefusal(err)) {
         return fail(err instanceof Error ? err.message : String(err));
