@@ -705,6 +705,88 @@ describe("restart_comfyui — live-first script resolution (#476, #426)", () => 
     },
   );
 
+  it("WINDOWS: a SECOND value of a multi-value path flag is checked too (#535 codex round 3)", async () => {
+    // ComfyUI declares `--extra-model-paths-config` as nargs='+', so it carries
+    // one-or-more paths. Checking only the first let `two.yaml` — relative, and
+    // separator-free so the positional check waves it through — reach the anchor.
+    const LIVE_CWD = resolve("bundle-multi");
+    mockResolveBase.mockReturnValue(undefined);
+    mockLiveRootFromArgv.mockReturnValue(undefined);
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: [
+          join("ComfyUI", "main.py"),
+          "--extra-model-paths-config",
+          resolve("cfg", "one.yaml"), // absolute — fine on its own
+          "two.yaml", // RELATIVE, and the one that used to slip
+        ],
+      },
+    });
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return s === ABS_PYTHON || s === join(LIVE_CWD, "ComfyUI", "main.py");
+    });
+    __processControlTestHooks.setLiveCwdResolver(() => undefined);
+    mockResolveLiveServerRoot.mockReturnValue({
+      source: "observed-process",
+      anchorDir: LIVE_CWD,
+      observedPid: 4321,
+    });
+    mockLivePortThenFree();
+    mockSpawn.mockImplementation(() => new FakeChild());
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(mockSpawn).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it.each([
+    ["a device index on --directml", ["--directml", "0"]],
+    ["a URL value carrying slashes", ["--comfy-api-base", "https://api.comfy.org"]],
+  ])(
+    "WINDOWS: %s does NOT block the anchor (#535 codex round 3)",
+    async (_label, extra) => {
+      // Two more over-broad cases. `--directml` takes a DEVICE INDEX, not a path —
+      // I had wrongly enumerated it. And a URL carries slashes without being
+      // something a working directory can move.
+      const LIVE_CWD = resolve("bundle-ok");
+      const LIVE_MAIN = join(LIVE_CWD, "ComfyUI", "main.py");
+      mockResolveBase.mockReturnValue(undefined);
+      mockLiveRootFromArgv.mockReturnValue(undefined);
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: [join("ComfyUI", "main.py"), ...extra] },
+      });
+      mockExistsSync.mockImplementation((p: string) => {
+        const s = String(p);
+        return s === ABS_PYTHON || s === LIVE_MAIN;
+      });
+      __processControlTestHooks.setLiveCwdResolver(() => undefined);
+      mockResolveLiveServerRoot.mockReturnValue({
+        source: "observed-process",
+        anchorDir: LIVE_CWD,
+        observedPid: 4321,
+      });
+      mockLivePortThenFree();
+      mockSpawn.mockImplementation(() => new FakeChild());
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => ({ ok: true }) as Response),
+      );
+      const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+      const result = await restartComfyUI();
+
+      expect(result.message).not.toMatch(/refusing to restart/i);
+      expect(mockSpawn.mock.calls[0][1][0]).toBe(LIVE_MAIN);
+
+      killSpy.mockRestore();
+    },
+  );
+
   it("an UNRESOLVED observation changes nothing — the pre-#535 refusal stands (#535)", async () => {
     // The tri-state discipline: "could not observe" is not "observed something
     // usable". This is the branch that must never become a success.

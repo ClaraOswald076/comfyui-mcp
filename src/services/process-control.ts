@@ -1620,10 +1620,14 @@ function argvHasRelativePathArg(argv: string[]): boolean {
     // A token starting with `--` is the exception: no ComfyUI path flag takes a
     // `--`-prefixed value, so that is the NEXT FLAG and the previous one was a
     // boolean we misread.
+    // KEEP consuming while the flag can still take values. ComfyUI declares
+    // `--extra-model-paths-config` as `nargs='+'`, so `--extra-model-paths-config
+    // C:\one.yaml two.yaml` carries TWO paths and only the first was being checked
+    // (codex round 3) — `two.yaml` then fell to the positional check, which lets a
+    // separator-free name through. argparse ends the list at the next option.
     if (pendingPathFlag && !raw.startsWith("--")) {
-      pendingPathFlag = false;
       if (!isAbsolutePath(raw)) return true;
-      continue;
+      continue; // stay pending: there may be more values
     }
     pendingPathFlag = false;
     if (raw.startsWith("-")) {
@@ -1641,8 +1645,10 @@ function argvHasRelativePathArg(argv: string[]): boolean {
     }
     // Any other token: only a path-SHAPED one is a concern. A stray value that is
     // not a path (`8188` after `--port`, `10` after `--cache-lru`) cannot be
-    // re-resolved into something else by a different cwd.
-    if (raw === "." || raw === ".." || /[\\/]/.test(raw)) {
+    // re-resolved into something else by a different cwd. A URL carries slashes
+    // without being a path — `--comfy-api-base https://api.comfy.org` is not
+    // something a working directory can move (codex round 3).
+    if (raw === "." || raw === ".." || (/[\\/]/.test(raw) && !isUrlLike(raw))) {
       if (!isAbsolutePath(raw)) return true;
     }
   }
@@ -1674,11 +1680,16 @@ function argvHasRelativePathArg(argv: string[]): boolean {
  * blanket refusal it replaces, and is stated rather than hidden.
  */
 const KNOWN_PATH_FLAG =
-  /^--(base|input|output|temp|user|models|custom-nodes|front-end-root)-director(y|ies)$|^--(models-dir|extra-model-paths-config|tls-keyfile|tls-certfile|log-file|directml)$/i;
+  /^--(base|input|output|temp|user|models|custom-nodes|front-end-root)-director(y|ies)$|^--(models-dir|extra-model-paths-config|tls-keyfile|tls-certfile|log-file)$/i;
 
 /** Absolute on either host convention — POSIX, Windows drive, or UNC. */
 function isAbsolutePath(p: string): boolean {
   return isAbsolute(p) || /^[a-zA-Z]:[\\/]/.test(p) || /^\\\\/.test(p);
+}
+
+/** A URL, not a filesystem path — it carries slashes but no cwd can move it. */
+function isUrlLike(p: string): boolean {
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(p);
 }
 
 /**
