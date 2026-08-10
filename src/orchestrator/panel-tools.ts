@@ -227,6 +227,56 @@ function fail(err: unknown): ToolResult {
   const msg = err instanceof Error ? err.message : String(err);
   return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
 }
+/**
+ * #971 — the AMBIGUOUS-rebind refusal, worded so it can be acted on.
+ *
+ * Refusing here is right (#474: with 2+ live tabs the rebind is ambiguous, so the
+ * user picks rather than us guessing). What was wrong is what it refused WITH:
+ * rebindToActiveTab propagates the bridge's raw resolve error, which ends
+ * "— pass tab_id". This tool has no tab_id parameter (schema: mode/path/filename)
+ * and #754 made these schemas strict, so an unknown key is a hard validation error
+ * rather than a no-op. Since panel_open_workflow's own refusal names THIS tool as
+ * the way out, an instruction that cannot be followed closes the loop and the
+ * session stays wedged with no exit — the reporter's wedge.
+ *
+ * The action named here is the one that actually works, which is NOT the obvious one.
+ * UiBridge.setLastActiveTab is documented as the ONLY writer of lastActiveTabId and
+ * fires on `msg.type === "user_message"` (ui-bridge.ts) — a tab becomes last-active
+ * when a MESSAGE IS SENT from its Agent panel, not when the browser tab is focused or
+ * clicked. "Switch to the tab you want" (which panel_reload's sibling message says)
+ * would leave the state unchanged and send the user round the loop again.
+ * Name the connected tabs too, so the user knows what they are choosing among.
+ */
+function ambiguousRebindGuidance(ctx: PanelToolCtx, err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err ?? "");
+  // Only reword the ambiguity refusal — every other failure keeps its own words.
+  if (!/multiple|last active|pass tab_id/i.test(raw)) return raw;
+  let listed = "";
+  try {
+    const live = typeof ctx.bridge.tabs === "function" ? ctx.bridge.tabs() : undefined;
+    if (Array.isArray(live)) {
+      // isHeadless THROUGH the bridge — a detached reference loses `this` and throws
+      // on `this.conns` (#478). A headless viewer is not a pickable canvas tab.
+      const isHeadlessTab = (id: string): boolean =>
+        typeof ctx.bridge.isHeadless === "function" && ctx.bridge.isHeadless(id);
+      const names = live
+        .filter((t) => !isHeadlessTab(t.tab_id))
+        .map((t) => (t.title ? `${shortTabId(t.tab_id)} ("${t.title}")` : shortTabId(t.tab_id)));
+      if (names.length) listed = ` Connected ComfyUI tabs: ${names.join(", ")}.`;
+    }
+  } catch {
+    // Enumeration is best-effort; the instruction below stands without the list.
+  }
+  return (
+    "Several ComfyUI tabs are connected and none is marked active, so this session cannot " +
+    "tell which one to follow — and this tool takes no tab_id to disambiguate with." +
+    `${listed} A tab becomes the active one when a message is SENT from its Agent panel ` +
+    "(focusing or clicking the browser tab does not do it), so ask the user to send any " +
+    "message from the Agent panel in the ComfyUI tab they want you working in, then call " +
+    'panel_set_workflow_target({mode:"current"}) again. Nothing was rebound.'
+  );
+}
+
 
 // ── Honest secret-save reporting (#826) ─────────────────────────────────────
 // `panel_request_secret` used to answer "the comfyui tools respawn with it as
@@ -6500,8 +6550,9 @@ function desktopCanvasRedirect(
     error:
       `${label} needs an open ComfyUI desktop panel canvas, but this session is bound to ` +
       `a canvas-less (mobile/remote) client and multiple desktop tabs are open — it can't ` +
-      `pick one automatically. Switch to the ComfyUI tab you want, rebind with ` +
-      `panel_set_workflow_target({mode:"current"}), then retry.`,
+      `pick one automatically. Ask the user to send a message from the Agent panel in the ` +
+      `ComfyUI tab they want (that — not focusing the tab — is what marks it active), ` +
+      `rebind with panel_set_workflow_target({mode:"current"}), then retry.`,
   };
 }
 
@@ -8522,9 +8573,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             return fail(
               "This conversation's current turn is pinned to a tab that is no longer " +
                 "reachable (it disconnected or its origin is ambiguous), so the reload " +
-                "frame has nowhere safe to go. Switch to the ComfyUI tab you want, call " +
-                'panel_set_workflow_target({mode:"current"}) to re-bind this session onto ' +
-                "it, then retry panel_reload.",
+                "frame has nowhere safe to go. Ask the user to send a message from the Agent " +
+                "panel in the ComfyUI tab they want (that — not focusing the tab — is what " +
+                'marks it active), call panel_set_workflow_target({mode:"current"}) to ' +
+                "re-bind this session onto it, then retry panel_reload.",
             );
           }
         } else if (ctx.rebindToActiveTab) {
@@ -8551,8 +8603,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           if (orphaned && Array.isArray(interactive) && interactive.length > 1) {
             return fail(
               "This session's ComfyUI tab was replaced and multiple tabs are now open — " +
-                "can't safely pick one. Switch to the tab you want, then call " +
-                'panel_set_workflow_target({mode:"current"}) before panel_reload.',
+                "can't safely pick one. Ask the user to send a message from the Agent panel " +
+                "in the tab they want (that — not focusing the tab — is what marks it " +
+                'active), then call panel_set_workflow_target({mode:"current"}) before ' +
+                "panel_reload.",
             );
           }
           try {
@@ -9457,7 +9511,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 /no panel connected|not reachable|connected:\s*none|no connected tab/i.test(msg) &&
                 !/multiple|last active|pass tab_id/i.test(msg);
             }
-            if (!noTabsConnected) return fail(err);
+            if (!noTabsConnected) return fail(ambiguousRebindGuidance(ctx, err));
             deferredBind = true;
             rebindNote =
               " No panel tab is connected yet — cleared the stale binding; this session will " +

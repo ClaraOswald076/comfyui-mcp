@@ -331,7 +331,13 @@ describe("#474 panel_set_workflow_target({mode:'current'}) recovery", () => {
     const ctx = makePanelToolCtx(bridge, "dead-tab", new WorkflowTargetStore());
     const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
     expect(res.isError).toBe(true);
-    expect(textOf(res)).toMatch(/Multiple panel tabs/);
+    // #971 — this used to match the BRIDGE's raw /Multiple panel tabs/, which ended
+    // "— pass tab_id". This tool has no tab_id parameter and #754 strict schemas make
+    // an unknown key a hard error, so that instruction could not be followed and the
+    // session had no exit. The refusal is unchanged (still fails, still does not
+    // defer, still does not guess); only its wording is now actionable.
+    expect(textOf(res)).toMatch(/Several ComfyUI tabs are connected/i);
+    expect(textOf(res)).not.toMatch(/pass tab_id/i);
     expect(ctx.tabId).toBe("dead-tab");
   });
 
