@@ -21,6 +21,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.84] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- absorb the post-restart reconciliation window in mode:"current" (#1292) (#1295)
+
+
 ## [0.50.83] - 2026-08-09
 
 ### MCP
