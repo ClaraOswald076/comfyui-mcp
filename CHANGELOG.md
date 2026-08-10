@@ -21,6 +21,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.95] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- ui-bridge.test.ts is load-sensitive — find the real rejection, don't loosen the assertion (#1336)
+- the prescribed recovery from a lost tab binding is a dead end (#1322)
+
+
 ## [0.50.94] - 2026-08-10
 
 ### MCP
