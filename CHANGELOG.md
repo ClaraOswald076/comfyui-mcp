@@ -21,6 +21,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.103] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- accept a Desktop bundle whose binary is branded differently (#1358)
+
+
 ## [0.50.102] - 2026-08-10
 
 ### MCP
