@@ -21,6 +21,10 @@ const hoisted = vi.hoisted(() => ({
   /** #1263 — the interpreter the live-process probe "finds", instead of whatever
    *  is really running on the developer's machine. undefined = nothing found. */
   livePython: undefined as string | undefined,
+  /** The stub itself, created here so the spec can assert BY IDENTITY that this
+   *  is the function in force, and count the calls the code under test makes to
+   *  it (codex). Its behaviour is installed in `beforeEach`. */
+  liveInterpreter: vi.fn() as ReturnType<typeof vi.fn>,
 }));
 
 // The live-root routing branch only streams local when the root exists locally.
@@ -60,11 +64,10 @@ vi.mock("../../services/live-interpreter.js", async () => {
   const actual = await vi.importActual<typeof import("../../services/live-interpreter.js")>(
     "../../services/live-interpreter.js",
   );
-  return {
-    ...actual,
-    resolveLiveInterpreter: () =>
-      hoisted.livePython ? { python: hoisted.livePython, pid: 4242 } : undefined,
-  };
+  // The stub is created in `vi.hoisted` and handed over here, so the spec can
+  // assert BY IDENTITY that this is the function in force, and count the calls
+  // the code under test makes to it (codex).
+  return { ...actual, resolveLiveInterpreter: hoisted.liveInterpreter };
 });
 
 // getSystemStats stands in for the connected server's /system_stats. getClient is
@@ -91,6 +94,12 @@ beforeEach(() => {
   hoisted.statsThrows = false;
   hoisted.liveRootExists = true;
   hoisted.livePython = undefined;
+  // The stub is a spy now (so its calls can be counted), so its behaviour has to
+  // be (re)installed here rather than living in the mock factory.
+  hoisted.liveInterpreter.mockReset();
+  hoisted.liveInterpreter.mockImplementation(() =>
+    hoisted.livePython ? { python: hoisted.livePython, pid: 4242 } : undefined,
+  );
 });
 
 // #1263 — THE STUB MUST BE PROVEN, NOT ASSUMED.
@@ -108,23 +117,49 @@ beforeEach(() => {
 // see whether the mock takes effect. This can, and it fails with its own name on
 // it rather than as a confusing routing assertion.
 describe("the live-process stub is actually in force (#1263)", () => {
-  it("the imported resolveLiveInterpreter IS this file's stub", () => {
-    // Default state: the stub reports "found nothing".
+  it("the imported resolveLiveInterpreter IS this file's stub, by identity", () => {
+    // Identity, not behaviour (codex): a different implementation returning the
+    // same two values would satisfy an output check.
     expect(
-      resolveLiveInterpreter(),
-      "vi.mock is not intercepting ../../services/live-interpreter.js — every case in this " +
-        "file is reading the REAL process table, so it now depends on whether this machine " +
-        "happens to have ComfyUI running (#1263).",
-    ).toBeUndefined();
+      resolveLiveInterpreter,
+      "vi.mock is not intercepting ../../services/live-interpreter.js — this file is " +
+        "reading the REAL process table, so its assertions now depend on whether this " +
+        "machine happens to have ComfyUI running (#1263).",
+    ).toBe(hoisted.liveInterpreter);
+  });
 
-    // …and it is genuinely driven by the fixture, not merely undefined by luck:
-    // a real probe on a machine with no ComfyUI would also return undefined.
-    hoisted.livePython = "C:/probe/python.exe";
+  it("and the CODE UNDER TEST reaches that same stub — not another copy", async () => {
+    // The check that matters (codex): proving THIS file's import is mocked says
+    // nothing about which module `shouldDispatchDownloadToManager` resolves. If
+    // the SUT reached an unmocked copy — a different specifier, a duplicated
+    // module instance — the identity check above would still pass while every
+    // routing assertion silently consulted the real process table.
+    //
+    // The #420 shape is the one that must consult it: no local base, and a
+    // RELATIVE main.py that can only be anchored via the live interpreter.
+    hoisted.base = undefined;
+    hoisted.stats = { system: { argv: ["main.py", "--listen"] } };
+    await shouldDispatchDownloadToManager();
+
     expect(
-      resolveLiveInterpreter(),
-      "the stub does not follow its own fixture — it is not the function under mock",
-    ).toEqual({ python: "C:/probe/python.exe", pid: 4242 });
-    hoisted.livePython = undefined;
+      hoisted.liveInterpreter.mock.calls.length,
+      "the routing code never called the stubbed probe, so it is resolving a DIFFERENT " +
+        "copy of live-interpreter than this file mocked — the stub is inert for the " +
+        "assertions that depend on it (#1263).",
+    ).toBeGreaterThan(0);
+  });
+
+  it("the stub follows its fixture, so it is not merely returning undefined by luck", () => {
+    // A real probe on a machine with no ComfyUI also returns undefined, so the
+    // default proves nothing on its own.
+    try {
+      hoisted.livePython = "C:/probe/python.exe";
+      expect(resolveLiveInterpreter()).toEqual({ python: "C:/probe/python.exe", pid: 4242 });
+    } finally {
+      // Restored here rather than left to beforeEach, so a failure above cannot
+      // leave the fixture mutated for anything that runs before it (codex).
+      hoisted.livePython = undefined;
+    }
   });
 });
 
