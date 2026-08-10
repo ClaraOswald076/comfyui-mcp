@@ -81,6 +81,7 @@ vi.mock("../../comfyui/client.js", () => ({
   }),
 }));
 
+import { resolveLiveInterpreter } from "../../services/live-interpreter.js";
 import { shouldDispatchDownloadToManager } from "../../services/model-resolver.js";
 
 beforeEach(() => {
@@ -90,6 +91,41 @@ beforeEach(() => {
   hoisted.statsThrows = false;
   hoisted.liveRootExists = true;
   hoisted.livePython = undefined;
+});
+
+// #1263 — THE STUB MUST BE PROVEN, NOT ASSUMED.
+//
+// Every case below depends on `resolveLiveInterpreter` returning what this file
+// says it returns. If the mock ever stops intercepting — a vitest change, a path
+// resolution difference, an import that reaches the module by another specifier —
+// the stub goes INERT and these tests silently read the real process table again.
+// The symptom is not an error: it is the #420 case receiving `false` on a machine
+// with ComfyUI running, and passing on CI where nothing is listening. That is the
+// original bug, and it recurred on 0.50.87 for a reporter whose vitest, OS and
+// checkout all match a rig where it passes.
+//
+// The #1290 source gate asserts that a spec MENTIONS live-interpreter. It cannot
+// see whether the mock takes effect. This can, and it fails with its own name on
+// it rather than as a confusing routing assertion.
+describe("the live-process stub is actually in force (#1263)", () => {
+  it("the imported resolveLiveInterpreter IS this file's stub", () => {
+    // Default state: the stub reports "found nothing".
+    expect(
+      resolveLiveInterpreter(),
+      "vi.mock is not intercepting ../../services/live-interpreter.js — every case in this " +
+        "file is reading the REAL process table, so it now depends on whether this machine " +
+        "happens to have ComfyUI running (#1263).",
+    ).toBeUndefined();
+
+    // …and it is genuinely driven by the fixture, not merely undefined by luck:
+    // a real probe on a machine with no ComfyUI would also return undefined.
+    hoisted.livePython = "C:/probe/python.exe";
+    expect(
+      resolveLiveInterpreter(),
+      "the stub does not follow its own fixture — it is not the function under mock",
+    ).toEqual({ python: "C:/probe/python.exe", pid: 4242 });
+    hoisted.livePython = undefined;
+  });
 });
 
 describe("shouldDispatchDownloadToManager (#420 reconnect routing)", () => {
