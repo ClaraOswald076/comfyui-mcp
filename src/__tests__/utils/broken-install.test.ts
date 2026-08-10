@@ -185,6 +185,30 @@ describe("WIRING: the launcher can survive the failure it reports (#1318)", () =
     expect(src).toContain("if (!isModuleResolutionFailure(err)) throw err;");
   });
 
+  it("boot.ts must not AWAIT main() — the launcher's scope depends on it", async () => {
+    // The one finding of the review pass, and it is invisible from the launcher.
+    //
+    // `await import("./boot.js")` resolves when boot's MODULE BODY finishes, not
+    // when the server stops. boot.ts ends in `main().catch(...)`, so everything
+    // that happens during a run — including the lazy `await import()` probes for
+    // OPTIONAL dependencies (@aws-sdk/client-s3, @azure/storage-blob, @ai-sdk/*,
+    // @anthropic-ai/claude-agent-sdk), which throw ERR_MODULE_NOT_FOUND when
+    // legitimately absent — is handled by boot's own catch and never reaches us.
+    //
+    // Change that line to `await main()` and every one of those optional probes
+    // starts printing "this install is INCOMPLETE, reinstall it" over a working
+    // install. MEASURED both ways against the built launcher, not reasoned:
+    //
+    //   main().catch(...)  -> boot's handler ran, code = ERR_MODULE_NOT_FOUND
+    //   await main()       -> comfyui-mcp could not start: its dependency
+    //                         "@azure/storage-blob" is not installed
+    const { readFile } = await import("node:fs/promises");
+    const src = await readFile(new URL("../../boot.ts", import.meta.url), "utf-8");
+
+    expect(src).toMatch(/^main\(\)\s*\n?\s*\.?catch\(/m);
+    expect(src).not.toMatch(/^await\s+main\(\)/m);
+  });
+
   it("broken-install.ts itself imports nothing at all", async () => {
     // It is loaded by the launcher, so anything it pulls in is another thing
     // that can be missing at exactly the moment we need to print the message.
