@@ -21,6 +21,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.91] - 2026-08-10
+
+### MCP
+
+#### Changed
+- prove the live-process stub is in force, instead of assuming it (#1314)
+
+
 ## [0.50.90] - 2026-08-09
 
 ### MCP
