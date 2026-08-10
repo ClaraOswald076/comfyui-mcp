@@ -2935,6 +2935,70 @@ export function readOpenActiveAgainstTarget(
  * all. Requiring corroboration there is what kept the reporter's own case
  * unexamined.
  */
+/**
+ * #1337 — CLEAR THE FENCE ON THE VERDICT THAT PROVED IDENTITY.
+ *
+ * A reporter's session lost the canvas permanently: every graph call refused with
+ * `workflow instance mismatch`, and the one fence-EXEMPT recovery could not clear it.
+ *
+ * `workflow_open` re-derives the fence only on its success branch. The verdict
+ *
+ *   "workflow_open RAN and the canvas IS bound to X — that much was proven — but the
+ *    graph on it does not match the state that was loaded … You are NOT on the wrong
+ *    workflow: X IS the active one."
+ *
+ * is delivered as an ERROR, so control never reaches the re-derivation. That mismatches
+ * two different levels: the verdict asserts IDENTITY was proven, and what it withholds
+ * is CONTENT (frontend normalisation vs a partial load). Applying content-level
+ * uncertainty to an identity-level fence is what leaves the session with no in-band
+ * recovery — the only remaining move is a browser reload, which destroys unsaved work.
+ *
+ * MEASURED, because the comment that justified the old behaviour asserts otherwise:
+ *   • the panel really does publish NO workflow_uuid on this reply (its own
+ *     FENCE_NOT_REFRESHED text), so there is nothing to adopt FROM THE REPLY — true;
+ *   • but `workflow_list` IS fence-exempt (commandIsCanvasTargetless in the panel's
+ *     workflow-chat-identity.js), and the panel's own recovery text names
+ *     panel_list_workflows as "exempt from the fence" and says it "republishes the
+ *     active identity". So the fence CAN be re-derived here; nothing tried.
+ *
+ * This runs that exempt re-derivation and reports what it achieved. The open still
+ * FAILS — the content warning is preserved verbatim, because "re-read before editing"
+ * is still the right instruction — and nothing is adopted on the UNPROVEN verdict,
+ * where identity itself is in doubt.
+ */
+async function clearFenceOnIdentityProvenOpen(
+  ctx: PanelToolCtx,
+  res: ToolResult,
+): Promise<ToolResult> {
+  const text = toolResultText(res);
+  // ONLY the class that states identity was proven. The UNPROVEN verdict ("could not
+  // prove that the active canvas was rebound") must keep failing closed: re-deriving a
+  // fence onto a canvas we cannot identify is how an edit lands on the wrong graph.
+  if (!/the canvas IS bound to/i.test(text)) return res;
+
+  let note: string;
+  try {
+    const rebind = await rebindWorkflowFence(ctx);
+    note =
+      rebind.status === "refreshed" || rebind.status === "already_current"
+        ? `\n\nFENCE: CLEARED. This reply published no workflow_uuid, so the fence was re-derived ` +
+          `from the panel's own fence-EXEMPT workflow_list read instead — the active identity is ` +
+          `${rebind.uuid}, and graph commands from this session are stamped with it again. You do ` +
+          `NOT need to reload the browser tab, and no unsaved canvas work is at risk. The content ` +
+          `warning above still stands: re-read the graph before editing.`
+        : `\n\nFENCE: NOT cleared (${rebind.status}). The re-derivation was attempted — the panel ` +
+          `publishes no workflow_uuid on this verdict, so the fence-exempt workflow_list read is ` +
+          `the only way to refresh it — and it did not establish an identity. Graph commands stay ` +
+          `refused. Try panel_list_workflows directly; if that also fails, the panel tab is the ` +
+          `thing to fix.`;
+  } catch (err) {
+    note =
+      `\n\nFENCE: NOT cleared — the re-derivation threw, so the fence state is UNKNOWN and graph ` +
+      `commands may still be refused. (${err instanceof Error ? err.message : String(err)})`;
+  }
+  return appendToolResultText(res, note);
+}
+
 async function observeActiveAfterOpen(
   ctx: PanelToolCtx,
   requestedPath: string,
@@ -4258,7 +4322,7 @@ async function openWorkflowWithVerify(path: string, ctx: PanelToolCtx): Promise<
       // which is exactly the class that can assert a false active workflow.
       if (!/workflow_open RAN/i.test(toolResultText(res))) return res;
       const drift = await observeActiveAfterOpen(ctx, path);
-      if (!drift) return res;
+      if (!drift) return await clearFenceOnIdentityProvenOpen(ctx, res);
       return fail(
         `${toolResultText(res)}\n\nAND — checked after that failure — ${drift.activeLabel} is the ` +
           `ACTIVE workflow now, not ${path}. Whatever that message says about ${path} being active, ` +
