@@ -974,6 +974,46 @@ describe("applyManifest", () => {
     }
   });
 
+  // Round 2: three of the six note-renderings were unpinned — including
+  // wrongPlace, which my own commit called the worst case ("two same-named
+  // copies on disk and neither message mentions the other"). Deleting any of
+  // those three appends left a green suite, so each could regress silently to
+  // exactly the state round 1 shipped.
+  describe.each([
+    {
+      name: "a FAILED download",
+      file: "failcase.safetensors",
+      arm: () => downloadModelMock.mockRejectedValueOnce(new Error("boom")),
+    },
+    {
+      name: "a landed-but-NOT-VISIBLE placement (wrongPlace)",
+      file: "wrongplace.safetensors",
+      arm: () => verifyLandedModelMock.mockResolvedValueOnce({ liveVisible: "not-visible", note: "" }),
+    },
+    {
+      name: "an UNCONFIRMED placement",
+      file: "unconfirmed.safetensors",
+      arm: () => verifyLandedModelMock.mockResolvedValueOnce({ liveVisible: "unknown", note: "" }),
+    },
+  ])("names the stale copy on $name (#1298)", ({ file, arm }) => {
+    it("carries the note", async () => {
+      resolveExistingModelFileMock.mockResolvedValueOnce({
+        path: `C:/stale/models/checkpoints/${file}`,
+        root: "C:/stale/models",
+        info: { isFile: () => true },
+      });
+      isUnderLiveModelRootsMock.mockResolvedValueOnce({ inRoots: false });
+      arm();
+
+      const result = await applyManifest({
+        manifest: {
+          models: [{ url: `https://example.com/${file}`, model_type: "checkpoints", filename: file }],
+        },
+      });
+      expect(result.results[0].message ?? "").toMatch(/same-named file also exists/);
+    });
+  });
+
   it("does not block on MANY slow downloads — enqueues all, one bounded grace (#362)", async () => {
     const prevGrace = process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
     process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = "50";

@@ -986,6 +986,10 @@ async function applyManifestSections(
           target.targetSubfolder,
           target.filename,
         );
+        // NOTE: `servedByLive` above is deliberately computed and unused on the
+        // stale path. Keeping the call costs one cheap listing GET per stale item
+        // and avoids churn on this branch; it is NOT load-bearing here, and it
+        // reads as though it feeds the guard below, which it does not.
         if (!staleOutsideLiveRoots) {
           results.push(
             servedByLive === true
@@ -1055,9 +1059,9 @@ async function applyManifestSections(
       // Worst was `wrongPlace`: two same-named copies on disk and neither
       // message naming the other.
       const staleNote = staleOutsideLiveRoots
-        ? ` (Note: a same-named file also exists at ${staleOutsideLiveRoots}, which is NOT in ` +
-          "any directory the connected ComfyUI reads — it belongs to a different install and " +
-          "was ignored.)"
+        ? ` (Note: a same-named file also exists at ${staleOutsideLiveRoots}, which was NOT in ` +
+          "any directory the connected ComfyUI reported reading when this item was checked — it " +
+          "belongs to a different install and was ignored.)"
         : "";
       if (job.status === "error") {
         results.push(
