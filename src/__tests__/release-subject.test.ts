@@ -32,7 +32,9 @@ describe("a release commit is recognised as one (#1309)", () => {
     expect(isReleaseSubject("chore(release): 1.0.0")).toBe(true);
     // A breaking marker is still a release.
     expect(isReleaseSubject("chore(release)!: 2.0.0 (#102)")).toBe(true);
-    // Another type with the release scope is still a release.
+    // Another type with the release scope, carrying only a version, is still a
+    // release — the type is not pinned to `chore` because the flow could
+    // reasonably change it, but the VERSION requirement is what keeps it safe.
     expect(isReleaseSubject("build(release): 0.1.0 (#3)")).toBe(true);
   });
 
@@ -51,18 +53,21 @@ describe("a release commit is recognised as one (#1309)", () => {
     expect(isReleaseSubject("chore(release-notes): fix a typo (#203)")).toBe(false);
   });
 
-  it("does not match a real change that merely mentions a release", () => {
-    expect(isReleaseSubject("fix(release): the tag was pushed before the build (#204)")).toBe(
-      // `fix(release)` IS the release scope, and a fix scoped to the release
-      // process is indistinguishable from a release commit by subject alone.
-      // Accepted deliberately: the cost is one dropped entry for a rare shape,
-      // against a wrong entry on EVERY release. Recorded so it is a decision
-      // rather than a surprise.
-      true,
-    );
-    // …but a description mentioning a release is not one.
-    expect(isReleaseSubject("docs: explain the release process (#205)")).toBe(false);
-    expect(isReleaseSubject("fix: do not release the lock too early (#206)")).toBe(false);
+  it("a real FIX to the release process is NOT a release (codex)", () => {
+    // Scope alone was the first version of this, and it would have silently
+    // dropped genuine user-facing work — the exact failure this generator warns
+    // about, introduced while fixing a different one. A release-scoped subject
+    // must also carry nothing but a version.
+    expect(
+      isReleaseSubject("fix(release): prevent failed releases from corrupting user installs (#204)"),
+    ).toBe(false);
+    expect(isReleaseSubject("feat(release): add release-channel selection (#205)")).toBe(false);
+    expect(isReleaseSubject("chore(release): repair the release workflow (#206)")).toBe(false);
+  });
+
+  it("does not match a change that merely mentions a release", () => {
+    expect(isReleaseSubject("docs: explain the release process (#207)")).toBe(false);
+    expect(isReleaseSubject("fix: do not release the lock too early (#208)")).toBe(false);
   });
 
   it("is not fooled by leading whitespace or an empty subject", () => {

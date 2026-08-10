@@ -18,9 +18,17 @@
  * commit range safe is "filter out PRs the changelog already documents", and a
  * release-reconcile PR is never documented — it is not a change.
  *
- * Deliberately NOT a blanket `chore:` skip. An ordinary chore can be a real
- * user-facing change, and dropping those silently is the failure this generator
- * already warns about at length. Only the `release` SCOPE is a release.
+ * TWO CONSTRAINTS, and the second was a codex finding. Scope alone is not
+ * enough: `fix(release): prevent failed releases from corrupting user installs`
+ * is scoped `release` and is a REAL user-facing change. Matching on scope alone
+ * would have silently dropped it — the exact failure this generator warns about
+ * at length, introduced while fixing a different one. So a release-scoped
+ * subject must ALSO carry nothing but a version (plus the PR number GitHub
+ * appends), which is what the release flow produces and what a fix to the
+ * release process never does.
+ *
+ * And deliberately NOT a blanket `chore:` skip, for the same reason in the other
+ * direction: an ordinary chore can be user-facing.
  *
  * Lives in its own module so it can be tested directly. An earlier attempt tested
  * it through the generator against a scratch repo and the test passed with the fix
@@ -30,4 +38,4 @@
 export const isReleaseSubject = (s) =>
   /^release:/i.test(s) ||
   /^v?\d+\.\d+\.\d+\s*(\(#\d+\))?$/.test(s) ||
-  /^\w+\(release\)!?:/i.test(s);
+  /^\w+\(release\)!?:\s*v?\d+\.\d+\.\d+\s*(\(#\d+\))?$/i.test(s);
