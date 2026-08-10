@@ -64,7 +64,7 @@ export function midCommandVerifyClause(cmd: string): string {
           `conversation, where you would see it and it would be recorded.`
         : `Re-issue the question on the current connection, or simply ask it in conversation.`;
     return (
-      `The panel may already be SHOWING this card. Nothing in the tool surface can check that — ` +
+      `Nothing in the tool surface can check that — ` +
       `there is no pending-card query — and the answer to it will NOT reach you: the panel ` +
       `deliberately does not replay a reply of this kind across a reconnect (nothing was applied ` +
       `and nothing was stored). ${reissue} Expect the stale card to remain on screen: retry ` +

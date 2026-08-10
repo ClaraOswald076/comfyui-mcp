@@ -89,6 +89,10 @@ describe("the disconnect remedy fits what was interrupted (#952)", () => {
     expect(midCommandDisconnectMessage({ short: "wf:1", cmd: "request_secret" })).toMatch(
       /card may already be on screen/,
     );
+    // …and says it ONCE. The lead sentence and the clause both used to open with
+    // it, which read as though two separate facts were being reported.
+    const msg = midCommandDisconnectMessage({ short: "wf:1", cmd: "request_secret" });
+    expect(msg.match(/may already be (on screen|SHOWING)/g)?.length).toBe(1);
   });
 
   it("the two interactive commands differ ONLY in the route they are given", () => {
