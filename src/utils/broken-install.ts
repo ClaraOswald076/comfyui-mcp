@@ -47,6 +47,23 @@ export function missingSpecifier(err: unknown): string | null {
   return null;
 }
 
+/**
+ * Which of the two failures Node reported — an absent PACKAGE or an absent FILE
+ * inside one.
+ *
+ * Worth distinguishing because the repair reads differently and, more to the
+ * point, because "a file is missing: zod" is nonsense. Node says "Cannot find
+ * package" when nothing resolved the bare specifier at all, and "Cannot find
+ * module" when it resolved to a path that is not on disk — which is the
+ * half-extracted case in #1318.
+ */
+export function missingKind(err: unknown): "package" | "module" | null {
+  const msg = typeof (err as ResolutionError)?.message === "string" ? String((err as ResolutionError).message) : "";
+  if (/Cannot find package '/.test(msg)) return "package";
+  if (/Cannot find module '/.test(msg)) return "module";
+  return null;
+}
+
 /** The package a path inside node_modules belongs to, for naming the culprit. */
 export function owningPackage(specifier: string | null): string | null {
   if (!specifier) return null;
@@ -82,11 +99,16 @@ export function owningPackage(specifier: string | null): string | null {
 export function describeBrokenInstall(err: unknown): string {
   const specifier = missingSpecifier(err);
   const pkg = owningPackage(specifier);
-  const what = specifier
-    ? pkg && pkg !== "comfyui-mcp"
-      ? `a file from its dependency "${pkg}" is missing:\n    ${specifier}`
-      : `a file it needs is missing:\n    ${specifier}`
-    : `a module it needs could not be loaded`;
+  const isDependency = Boolean(pkg) && pkg !== "comfyui-mcp";
+  const what = !specifier
+    ? `a module it needs could not be loaded`
+    : // Nothing resolved the name at all: the package is absent, not damaged.
+      // Printing the bare name on the "path" line would read as `is missing: zod`.
+      missingKind(err) === "package" && isDependency
+      ? `its dependency "${pkg}" is not installed`
+      : isDependency
+        ? `a file from its dependency "${pkg}" is missing:\n    ${specifier}`
+        : `a file it needs is missing:\n    ${specifier}`;
   return (
     `comfyui-mcp could not start: ${what}\n\n` +
     `This install is INCOMPLETE, not misconfigured. Directories present with files missing is what an\n` +
