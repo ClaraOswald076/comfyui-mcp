@@ -21,6 +21,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.106] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- say what a timed-out secret card actually means (#1364)
+
+
 ## [0.50.105] - 2026-08-10
 
 ### MCP
