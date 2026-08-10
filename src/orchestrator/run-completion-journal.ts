@@ -67,7 +67,19 @@ export type RunCorrelation =
   | { status: "matched"; promptId: string }
   /** Carries a prompt id, but no run this session queued has that id. Real, but
    *  NOT ours — it must never satisfy an outstanding `panel_run`. */
-  | { status: "foreign"; promptId: string }
+  /** `priorHistory` separates the two very different facts this used to fold
+   *  (#925). Both are UNDETERMINED and both are refused identically; they are
+   *  not the same claim:
+   *
+   *    false — no run this session queued has ever carried this id. "Not yours"
+   *            is a true statement.
+   *    true  — this id HAS been ours: its ticket was evicted (the map is capped),
+   *            or the completion was already delivered and acked, or the id was
+   *            re-queued and now stands for more than one run. We have forgotten
+   *            WHICH run it was, not WHETHER it was ours — and telling the agent
+   *            it "does NOT match any run you queued" is then a false claim,
+   *            about its own correct result. */
+  | { status: "foreign"; promptId: string; priorHistory?: boolean }
   /** No prompt id at all. Unattributable in principle; reported as such. */
   | { status: "unidentified" };
 
@@ -513,8 +525,18 @@ export class RunCompletionJournalImpl {
     // A REUSED id proves nothing: the panel sends only the id, so a completion
     // for it could belong to either generation. Report it as foreign — real, but
     // UNDETERMINED — rather than claiming it is the run now outstanding.
-    return ticket && ownsRun(ticket, key, conversation) && !ticket.reused
-      ? { status: "matched", promptId: pid }
+    if (ticket && ownsRun(ticket, key, conversation) && !ticket.reused) {
+      return { status: "matched", promptId: pid };
+    }
+    // #925 — SAY WHICH KIND OF UNDETERMINED THIS IS. The refusal is unchanged;
+    // only the claim attached to it. `hasHistoryFor` answers "has this party ever
+    // seen this id" from stores that deliberately outlive the ticket map (the
+    // delivered-memo holds MAX_DELIVERED_MEMO pairs against MAX_TICKETS tickets),
+    // which is exactly the evidence separating "never yours" from "yours, and we
+    // no longer hold the ticket".
+    const priorHistory = this.hasHistoryFor(key, pid, conversation) || Boolean(ticket?.reused);
+    return priorHistory
+      ? { status: "foreign", promptId: pid, priorHistory: true }
       : { status: "foreign", promptId: pid };
   }
 
@@ -792,6 +814,12 @@ export class RunCompletionJournalImpl {
       const payload: CompletionPayload = {
         ...entry.payload,
         run_correlation: entry.correlation.status,
+        // #925 — carried ALONGSIDE the status rather than as a fourth status, so
+        // every existing consumer of `run_correlation` keeps working and only the
+        // wording gains a case.
+        ...(entry.correlation.status === "foreign" && entry.correlation.priorHistory
+          ? { run_correlation_prior: true }
+          : {}),
         ...(entry.correlation.status === "unidentified"
           ? {}
           : { prompt_id: entry.correlation.promptId }),

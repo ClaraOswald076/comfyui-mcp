@@ -57,12 +57,35 @@ function msgOf(err: unknown): string {
  * An event with no correlation field (a legacy/simulated frame) gets the old
  * neutral wording — unchanged behavior.
  */
-function runIdentityPreamble(ev: { prompt_id?: string; run_correlation?: string }): string {
+function runIdentityPreamble(ev: {
+  prompt_id?: string;
+  run_correlation?: string;
+  /** #925 — the id has been ours before; see run-completion-journal. */
+  run_correlation_prior?: boolean;
+}): string {
   const pid = typeof ev.prompt_id === "string" && ev.prompt_id.trim() ? ev.prompt_id.trim() : null;
   switch (ev.run_correlation) {
     case "matched":
       return `This is the run YOU queued with panel_run (prompt ${pid}). `;
     case "foreign":
+      // #925 — TWO DIFFERENT FACTS, and only one of them is "not yours". A
+      // completion with no open ticket may be a run this session never queued,
+      // or a run it DID queue whose ticket has since been evicted (the map is
+      // capped), or a re-delivery after the first was acked. The reporter hit the
+      // second: their own prompt id, confirmed successful in ComfyUI's history,
+      // and the orchestrator told the agent it was not theirs — which does not
+      // merely mislabel it, it instructs the agent to disbelieve a correct
+      // result. Both stay UNDETERMINED and both are refused identically; what
+      // changes is that we stop asserting the one thing we do not know.
+      if (ev.run_correlation_prior) {
+        return (
+          `This run (prompt ${pid}) WAS queued from this session, but its ticket is no longer held — ` +
+          `tickets are bounded, an acked completion clears one, and a re-queued id can stand for more ` +
+          `than one run. So it CANNOT be proven to be the render you are waiting on: its origin is ` +
+          `UNDETERMINED even though the id is one of yours. Do NOT treat it as that render; confirm ` +
+          `with get_history (action:"list") which of your runs this id belongs to before acting. `
+        );
+      }
       return (
         `This run (prompt ${pid}) does NOT match any run you queued with panel_run — its origin is UNDETERMINED. ` +
         `Do NOT treat it as the render you are waiting on; if you are still waiting on your own run, verify it with get_history (action:"list") before acting. `
@@ -627,6 +650,7 @@ export class PanelAgent {
       /** #468 — run identity + how it correlates to a run this session queued. */
       prompt_id?: string;
       run_correlation?: "matched" | "foreign" | "unidentified";
+      run_correlation_prior?: boolean;
       replayed?: boolean;
       dropped_completions?: number;
       possible_repeat?: boolean;
@@ -2311,6 +2335,7 @@ export class PanelAgentManager {
       downloads?: Array<{ name: string; status: string; supersededByLive?: boolean }>;
       prompt_id?: string;
       run_correlation?: "matched" | "foreign" | "unidentified";
+      run_correlation_prior?: boolean;
       replayed?: boolean;
       dropped_completions?: number;
       possible_repeat?: boolean;
