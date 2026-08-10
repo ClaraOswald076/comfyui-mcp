@@ -21,6 +21,22 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.93] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- anchor a relative launch script on Windows, where /proc has no equivalent (#1315)
+
+
+## [0.50.92] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- stop prescribing a rebind that needs the tab we just said is missing (#1317)
+
+
 ## [0.50.91] - 2026-08-10
 
 ### MCP
