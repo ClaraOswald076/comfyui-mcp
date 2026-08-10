@@ -21,6 +21,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.85] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- stop reporting a forgotten run as one you never queued (#1301)
+
+#### Changed
+- 0.50.84 (#1297)
+
+
 ## [0.50.84] - 2026-08-09
 
 ### MCP
