@@ -8311,6 +8311,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // #704 — the OWNER of the run. Unlike the tab, this cannot drift between
         // the queue and the completion: it is this tool session's own binding.
         const runTicketConversation = journalConversationFor(ctx);
+        // #1327 — stamped BEFORE the dispatch, because the ticket cannot be opened
+        // until ComfyUI mints the prompt id and a cached render can finish before that
+        // reply gets back here. Any completion for that id which arrived after this
+        // instant belongs to this run: the id did not exist before this call created
+        // it. Without the timestamp the journal has no way to tell the agent's own
+        // 0.1s render from a stranger's, and reported it as UNDETERMINED.
+        const runDispatchedAt = Date.now();
         let res = await ctx.call(runCmd, 20000);
         // Derive the verdict from the AUTHORITATIVE reply, not a bare `queued`
         // flag. A rejection — a no-connected-tab / thrown-queuePrompt error
@@ -8431,6 +8438,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // which is what still holds after the panel reconnects under a new id.
           ...(runTicketConversation !== undefined ? { conversation: runTicketConversation } : {}),
           ...(typeof args.to_node_id === "number" ? { toNodeId: args.to_node_id } : {}),
+          // #1327 — lets the journal claim a completion that beat its own ticket.
+          dispatchedAt: runDispatchedAt,
         };
         // Every id gets its own ticket. `correlatable` stays the promise the
         // anti-poll note is allowed to make — true only if at least one run can
