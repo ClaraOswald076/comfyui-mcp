@@ -1598,29 +1598,77 @@ function observedLiveCwd(
  * directory where its own arguments point somewhere else.
  */
 function argvHasRelativePathArg(argv: string[]): boolean {
+  let sawSeparator = false;
+  let pendingPathFlag = false;
   for (let i = 1; i < argv.length; i++) {
     const raw = argv[i];
-    if (!raw) continue; // an empty token is not a path
-    // `--flag=value` carries its value INSIDE the flag token, so skipping every
-    // token that starts with "-" would walk straight past a relative path
-    // (`--output-directory=out`). Unwrap the payload and judge that instead.
-    const eq = raw.startsWith("-") ? raw.indexOf("=") : -1;
-    const token = eq >= 0 ? raw.slice(eq + 1) : raw;
-    if (eq < 0 && raw.startsWith("-")) continue; // a bare flag, no value attached
-    if (!token) continue; // `--flag=` carries nothing
-    if (isAbsolute(token) || /^[a-zA-Z]:[\\/]/.test(token) || /^\\\\/.test(token)) {
-      continue; // absolute — cwd cannot change it
+    if (raw === undefined) continue;
+    // Everything after a bare `--` is positional, so nothing there is a flag and
+    // a leading dash no longer means what it did.
+    if (!sawSeparator && raw === "--") {
+      sawSeparator = true;
+      pendingPathFlag = false;
+      continue;
     }
-    if (/^-?\d+(\.\d+)?$/.test(token)) continue; // numeric value (--port 8188)
-    // Plain enum-ish values ComfyUI really passes (`--preview-method auto`,
-    // `--force-fp16 true`). A directory named exactly one of these, handed over as
-    // a RELATIVE path while every other argument is absolute, is the one shape this
-    // allowlist could miss — accepted deliberately, because without it the fix
-    // would refuse most real launches.
-    if (/^(true|false|none|auto)$/i.test(token)) continue;
-    return true; // could be a relative path
+    if (sawSeparator) {
+      if (!isAbsolutePath(raw)) return true; // a positional we cannot vouch for
+      continue;
+    }
+    // The token immediately after a path-valued flag is ITS VALUE, whatever it
+    // looks like — `--output-directory -` names a directory called `-`, and
+    // treating it as the next flag is how that slips through (codex round 2).
+    if (pendingPathFlag) {
+      pendingPathFlag = false;
+      if (!isAbsolutePath(raw)) return true;
+      continue;
+    }
+    if (raw.startsWith("-")) {
+      // `--flag=value` carries its value INSIDE the token.
+      const eq = raw.indexOf("=");
+      const name = eq >= 0 ? raw.slice(0, eq) : raw;
+      const attached = eq >= 0 ? raw.slice(eq + 1) : undefined;
+      if (!PATH_VALUED_FLAG.test(name)) continue; // --port, --enable-manager, …
+      if (attached === undefined) {
+        pendingPathFlag = true; // its value is the next token
+        continue;
+      }
+      if (attached && !isAbsolutePath(attached)) return true;
+      continue;
+    }
+    // A bare positional. Only a path-SHAPED one is a concern; a stray value that
+    // is not a path cannot be re-resolved into something else.
+    if (raw === "." || raw === ".." || /[\\/]/.test(raw)) {
+      if (!isAbsolutePath(raw)) return true;
+    }
   }
+  // A trailing path flag with no value left to take is malformed argv, not a
+  // relative path — there is nothing for a different cwd to re-resolve.
   return false;
+}
+
+/**
+ * Flags whose value is a PATH, matched on the flag NAME rather than on what the
+ * value looks like (codex round 2).
+ *
+ * Judging the value was the wrong instinct and bypassable three ways: `auto`,
+ * `8188` and `-` are all perfectly legal directory names, so an allowlist of
+ * "values that cannot be paths" cannot exist. The flag name is the part whose
+ * vocabulary is knowable — ComfyUI's own `--input-directory`, `--output-directory`,
+ * `--base-directory`, `--models-directory`, `--extra-model-paths-config`,
+ * `--temp-directory`, `--user-directory`, `--log-file` — and the pattern is
+ * deliberately broad so an unfamiliar path flag is treated as one rather than
+ * waved through.
+ *
+ * Erring broad costs a refusal (the manual restart the user already has today);
+ * erring narrow relaunches a server into a directory where its own arguments
+ * point somewhere else.
+ */
+const PATH_VALUED_FLAG =
+  /(dir|directory|path|paths|file|config|folder|cache|log|output|input|models?|workspace|checkpoint)/i;
+
+/** Absolute on either host convention — POSIX, Windows drive, or UNC. */
+function isAbsolutePath(p: string): boolean {
+  return isAbsolute(p) || /^[a-zA-Z]:[\\/]/.test(p) || /^\\\\/.test(p);
 }
 
 /**

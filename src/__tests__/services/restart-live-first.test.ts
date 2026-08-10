@@ -622,6 +622,44 @@ describe("restart_comfyui — live-first script resolution (#476, #426)", () => 
     killSpy.mockRestore();
   });
 
+  // Codex round 2: judging the VALUE was bypassable three ways, because `auto`,
+  // `8188` and `-` are all legal directory names. The guard now keys on the FLAG
+  // name, whose vocabulary is knowable. Each of these was a live bypass.
+  it.each([
+    ["a value that looks numeric", ["--output-directory", "8188"]],
+    ["a value that looks enum-ish", ["--output-directory", "auto"]],
+    ["a value that is a bare dash", ["--output-directory", "-"]],
+    ["a positional after `--`", ["--", "relative/thing"]],
+  ])("WINDOWS: %s still blocks the inferred anchor (#535 codex round 2)", async (_label, extra) => {
+    const LIVE_CWD = resolve("bundle-bypass");
+    mockResolveBase.mockReturnValue(undefined);
+    mockLiveRootFromArgv.mockReturnValue(undefined);
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: [join("ComfyUI", "main.py"), ...extra] },
+    });
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return s === ABS_PYTHON || s === join(LIVE_CWD, "ComfyUI", "main.py");
+    });
+    __processControlTestHooks.setLiveCwdResolver(() => undefined);
+    mockResolveLiveServerRoot.mockReturnValue({
+      source: "observed-process",
+      anchorDir: LIVE_CWD,
+      observedPid: 4321,
+    });
+    mockLivePortThenFree();
+    mockSpawn.mockImplementation(() => new FakeChild());
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
   it("an UNRESOLVED observation changes nothing — the pre-#535 refusal stands (#535)", async () => {
     // The tri-state discipline: "could not observe" is not "observed something
     // usable". This is the branch that must never become a success.
