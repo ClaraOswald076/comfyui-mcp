@@ -58,29 +58,18 @@ async function runWithConfirm(tool: string, outcome: ConfirmOutcome, args: objec
 }
 
 describe("an unaskable question is not a decline (#1332)", () => {
-  it("RESTART: stops claiming ComfyUI was not restarted when it cannot know", async () => {
-    const text = await runWithConfirm("panel_restart_comfyui", "unreachable");
-
-    // The exact false sentence from the report must not appear.
-    expect(text).not.toContain("Cancelled — ComfyUI was not restarted.");
-    // What IS true: this call dispatched nothing.
-    expect(text).toMatch(/did NOT dispatch a restart/);
-    // …and why the question of whether one happened is open.
-    expect(text).toMatch(/could not be reached to ask/);
-    expect(text).toMatch(/no decision was made either way/);
-    // The reporter's own recovery, named so the next person does not need the log hunt
-    // to disbelieve us.
-    expect(text).toMatch(/fresh startup line/);
-  });
-
-  it("RESTART: an EXPLICIT decline still says so, plainly", async () => {
-    // The fix must not blur a real user decision into hedging. When the user says no,
-    // "cancelled" is the truth and stays.
-    const text = await runWithConfirm("panel_restart_comfyui", "no");
-
-    expect(text).toContain("Cancelled — ComfyUI was not restarted.");
-    expect(text).not.toMatch(/could not be reached to ask/);
-  });
+  // THE TWO RESTART DECLINE CASES LIVE IN panel-restart-cancel-truth.test.ts, not here.
+  //
+  // They were here first and they passed locally and failed on macOS and Windows CI.
+  // The decline branch probes ComfyUI's health for ~6s; my workstation has a live
+  // ComfyUI on 8188 that answered, and CI has none, so the probe ran its full window
+  // and reported the server DOWN instead of reaching the wording under test. The
+  // assertion's outcome depended on the machine rather than the code — #1263's exact
+  // shape, in a test written to fix a truthfulness bug.
+  //
+  // That file already owns this path and has the harness for it: a stubbed health
+  // probe (setHealthProbe), a shrunk recheck window (setDeclineProbeTiming), and mocked
+  // config/process-control. Re-deriving that here would have been a second, weaker copy.
 
   it("RESTART: a TIMEOUT keeps its own distinct wording", async () => {
     // Three refusals, three meanings: declined, unanswered, unaskable.
