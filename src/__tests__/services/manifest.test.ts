@@ -476,6 +476,17 @@ describe("applyManifest", () => {
     expect(result.summary).toMatchObject({ skipped: 0, failed: 1 });
     expect(result.results[0].message).toMatch(/NOT in any directory/);
     expect(downloadModelMock).not.toHaveBeenCalled();
+
+    // #1298 — the VERDICT is #369's and unchanged; the REMEDY was wrong.
+    // It said only "point COMFYUI_PATH at the ComfyUI that is actually
+    // running", which assumes a misconfigured target. The reporting case had
+    // the live models root resolve CORRECTLY, so the user was told to fix
+    // something already right, with no way to act on it. The message now names
+    // the resolved target and both readings, so they can tell which they are in.
+    const msg = result.results[0].message ?? "";
+    expect(msg).toMatch(/was NOT downloaded/);
+    expect(msg).toMatch(/leftover from a DIFFERENT install/);
+    expect(msg).toMatch(/can be ignored or deleted/);
   });
 
   it("FAILS a same-named existing file that is OUTSIDE every live model root (codex gate r5)", async () => {

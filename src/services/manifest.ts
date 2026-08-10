@@ -934,8 +934,19 @@ async function applyManifestSections(
               "failed",
               `A file exists at ${existing}, but it is NOT in any directory the connected ` +
                 "ComfyUI reads models from — it belongs to an install the running server does " +
-                "not use. Point COMFYUI_PATH at the ComfyUI that is actually running, or " +
-                "launch it with an absolute --base-directory.",
+                "not use, so this item was NOT downloaded. " +
+                // #1298 — the old remedy said only "point COMFYUI_PATH at the ComfyUI that
+                // is actually running", which assumes the target is misconfigured. Often it
+                // is not: the live models root can resolve CORRECTLY and this stale file is
+                // simply irrelevant, leaving the user told to fix something that is already
+                // right. Name both possibilities and the resolved target, so they can tell
+                // which one they are in.
+                `The download target resolved to ${target.targetPath}. If that is the install ` +
+                `you are running, the file ` +
+                "above is a leftover from a DIFFERENT install and can be ignored or deleted — " +
+                "re-run apply_manifest afterwards. If it is not, point COMFYUI_PATH at the " +
+                "ComfyUI that is actually running, or launch it with an absolute " +
+                "--base-directory.",
             ),
           );
           continue;
