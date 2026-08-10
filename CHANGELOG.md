@@ -21,6 +21,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.104] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- stop telling a code-mode agent its panel tools are absent (#1360)
+
+
 ## [0.50.103] - 2026-08-10
 
 ### MCP
