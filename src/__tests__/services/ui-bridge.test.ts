@@ -1886,10 +1886,26 @@ function nextFrame(
  * 60ms, more only when the loop is already behind. It therefore cannot change the
  * outcome of a test that passes today; it can only stop a loaded machine from deciding
  * one. (A shorter wait could have masked a real regression; this direction cannot.)
+ *
+ * WHAT IT DOES AND DOES NOT COVER, measured rather than assumed:
+ *
+ *   idle                       old 63ms   new 63ms   (no cost added)
+ *   in-process loop congestion old 121ms  new 367ms  (adapts — a busy worker)
+ *   other PROCESSES burning CPU old 62ms  new 63ms   (does NOT adapt)
+ *
+ * The last row is the honest limit. Cross-process starvation does not congest THIS
+ * loop, so there is nothing local to measure; a wall-clock sleep and the work it waits
+ * for are descheduled together. So this is not a proven cure for the reported
+ * condition — it removes one real load-sensitivity vector (a busy worker's own queue)
+ * without claiming to remove them all.
  */
 const settle = async (): Promise<void> => {
+  // Lag is measured with setImmediate, NOT setTimeout(0): Windows' timer resolution is
+  // ~15.6ms, so a setTimeout(0) probe reports that floor as if it were contention and
+  // inflates every one of the 31 waits on an idle machine (measured: 63ms -> 140ms).
+  // setImmediate has no such floor — 0ms idle, and it still grows when the loop is busy.
   const t0 = Date.now();
-  await new Promise((r) => setTimeout(r, 0));
+  await new Promise((r) => setImmediate(r));
   const lag = Date.now() - t0; // ~0 idle, tens of ms under a loaded suite
   await new Promise((r) => setTimeout(r, 60 + lag * 4));
   // Drain work those timers queued behind them, which a single sleep never sees.
