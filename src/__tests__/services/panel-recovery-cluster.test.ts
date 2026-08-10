@@ -48,6 +48,15 @@ process.env.COMFYUI_MCP_PANEL_LOCK = join(
 
 const mode = vi.hoisted(() => ({ local: true, remote: false }));
 const generation = vi.hoisted(() => ({ value: 0 }));
+// #1290 — this file reaches `resolveLiveServerRoot`, whose second tier shells
+// out (netstat/WMI) to find the python actually serving the port ON THIS
+// MACHINE. Unstubbed, the assertions below would depend on whether the
+// developer happens to have ComfyUI running (#1263). Stub it at the boundary.
+vi.mock("../../services/live-interpreter.js", async () => ({
+  ...(await vi.importActual("../../services/live-interpreter.js")),
+  resolveLiveInterpreter: () => undefined,
+}));
+
 vi.mock("../../config.js", () => ({
   config: { comfyuiPath: undefined as string | undefined },
   isLocalMode: () => mode.local,

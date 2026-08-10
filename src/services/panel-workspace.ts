@@ -120,6 +120,19 @@ export interface PanelBaseResolution {
    * remedy here would be the #916 defect pointed at a new branch.
    */
   baseDirUnresolvable?: boolean;
+  /**
+   * The live root that was skipped because its `custom_nodes` could NOT BE READ
+   * — a permission error, an IO error, a share that went away — as distinct from
+   * one that provably has none (#796).
+   *
+   * Both used to end here identically, and the difference decides what the
+   * fallback means: falling back to the CONFIGURED tree after disproving the
+   * live one is a conclusion, while doing it after failing to read the live one
+   * is a guess wearing the same clothes. On a Desktop split install the
+   * configured tree is exactly the one the server does not read, so a caller
+   * about to write needs to know which of the two it is standing on.
+   */
+  liveRootUnreadable?: string;
 }
 
 /**
@@ -149,12 +162,32 @@ export function isLiveDerivedBase(
   );
 }
 
-/** Does this candidate root actually hold a custom_nodes directory? */
-function hasCustomNodes(base: string): boolean {
+/**
+ * Does this candidate root hold a `custom_nodes` directory — THREE answers (#796).
+ *
+ * `statSync` throws for two entirely different reasons and this returned `false`
+ * for both. ENOENT/ENOTDIR is a real answer: nothing is there. EACCES, EPERM,
+ * EIO, EBUSY and a dead UNC share are NOT — they mean the question could not be
+ * asked. This file already knows that hazard; `safeExists` a few hundred lines
+ * down avoids UNC paths precisely because "a dead network share can block
+ * existsSync for seconds".
+ *
+ * Folding them mattered here because of what the caller does next: an unreadable
+ * LIVE root is skipped, the resolution falls back to the CONFIGURED path, and
+ * the panel installer then operates on a different tree — while the caller's own
+ * comment says the point is to accept only a base we can PROVE holds
+ * custom_nodes. A base we could not read is not disproof.
+ */
+type CustomNodesState = "present" | "absent" | "unknown";
+
+function customNodesState(base: string): CustomNodesState {
   try {
-    return statSync(join(base, "custom_nodes")).isDirectory();
-  } catch {
-    return false;
+    return statSync(join(base, "custom_nodes")).isDirectory() ? "present" : "absent";
+  } catch (err) {
+    // Only these two prove absence. Everything else — permissions, IO, a share
+    // that went away — is an unanswered question, not a negative answer.
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return code === "ENOENT" || code === "ENOTDIR" ? "absent" : "unknown";
   }
 }
 
@@ -182,6 +215,9 @@ export async function resolvePanelBase(): Promise<PanelBaseResolution> {
   // where an ABSOLUTE main.py alongside an unresolvable relative
   // `--base-directory` already resolved to the install root.
   const baseDirPoisoned = hasUnresolvableRelativeBaseDirFlag(snapshot.argv, snapshot.cwd);
+  /** #796 — a live candidate whose custom_nodes could not be READ (permissions,
+   *  IO, a dead share), as opposed to one that provably lacks it. */
+  let liveRootUnreadable: string | undefined;
   if (snapshot.reachable && !baseDirPoisoned) {
     // Only accept a live base we can PROVE holds custom_nodes. A root without
     // one is not the tree the panel lives in, and pointing the installer at it
@@ -189,15 +225,27 @@ export async function resolvePanelBase(): Promise<PanelBaseResolution> {
     const accept = (
       candidate: string | undefined,
       source: PanelBaseSource,
-    ): PanelBaseResolution | undefined =>
-      candidate && hasCustomNodes(candidate)
-        ? {
-            base: candidate,
-            source,
-            overriddenConfiguredBase:
-              configured && configured !== candidate ? configured : undefined,
-          }
-        : undefined;
+    ): PanelBaseResolution | undefined => {
+      if (!candidate) return undefined;
+      const state = customNodesState(candidate);
+      if (state === "unknown") {
+        // #796 — STILL SKIPPED: "we could not read it" is not the proof this
+        // branch requires, and loosening a guard on an unread directory is the
+        // wrong direction. But it is not disproof either, so it is recorded
+        // instead of vanishing — the fallback below otherwise hands the caller a
+        // CONFIGURED tree while silently implying the live one was disqualified
+        // on the evidence.
+        liveRootUnreadable ??= candidate;
+        return undefined;
+      }
+      if (state === "absent") return undefined;
+      return {
+        base: candidate,
+        source,
+        overriddenConfiguredBase:
+          configured && configured !== candidate ? configured : undefined,
+      };
+    };
 
     // `--base-directory` FIRST: when ComfyUI is launched with it, that flag —
     // not the main.py location — is the root it derives custom_nodes/ from.
@@ -248,9 +296,16 @@ export async function resolvePanelBase(): Promise<PanelBaseResolution> {
       liveProbeFailed,
       liveRootUnderivable,
       baseDirUnresolvable,
+      liveRootUnreadable,
     };
   }
-  return { source: "none", liveProbeFailed, liveRootUnderivable, baseDirUnresolvable };
+  return {
+    source: "none",
+    liveProbeFailed,
+    liveRootUnderivable,
+    baseDirUnresolvable,
+    liveRootUnreadable,
+  };
 }
 
 /*
@@ -271,6 +326,45 @@ const PANEL_BASE_TTL_MS = 60_000;
 let cached:
   | { at: number; target: string; generation: number; resolution: PanelBaseResolution }
   | undefined;
+
+/**
+ * How many times the cache has been deliberately CLEARED (#1222).
+ *
+ * The in-flight guard below compares `cached` by reference to catch "a newer
+ * write landed while we were probing". That comparison has one blind spot, and
+ * it is the one that bites: a probe which STARTS with an empty cache records
+ * `undefined`, a clear leaves it `undefined`, and the two compare equal — so the
+ * clear is invisible and the stale probe writes its pre-clear answer in
+ * afterwards.
+ *
+ * A clear is an EVENT, not a value, so counting it is what makes it observable.
+ * `undefined → undefined` is indistinguishable by reference and unmistakable by
+ * count.
+ */
+let clearEpoch = 0;
+
+/**
+ * Forget the resolved base, countably (#1222).
+ *
+ * The one way to clear it deliberately. A bare `cached = undefined` at a fourth
+ * call site would reintroduce the whole bug silently — the clear would happen and
+ * an in-flight probe would put its pre-clear answer straight back — so the count
+ * lives with the assignment rather than next to it.
+ *
+ * NOT used by the retarget bail inside `primePanelBase`. That one is discarding
+ * its OWN answer because the target moved, and the target/generation checks
+ * already stop anyone acting on it. Bumping there would additionally stop a
+ * CONCURRENT probe against the new target from caching a result that is
+ * perfectly good — which costs a re-probe rather than correctness, so it is a
+ * deliberate scope line and not a safety one. Stated that way because it is not
+ * pinned by a test: mutating it to bump changes no observable answer, only how
+ * often the next caller re-resolves, and a test asserting that would be pinning
+ * a performance detail as though it were a contract.
+ */
+function forgetResolvedBase(): void {
+  cached = undefined;
+  clearEpoch += 1;
+}
 
 /** Cache key: which ComfyUI this resolution describes. Never throws. */
 function targetKey(): string {
@@ -348,6 +442,9 @@ export async function primePanelBase(
   // primePanelBase()` a refusal fires in the background did exactly that to a
   // base seeded after it started (#879 test isolation surfaced it).
   const cacheAtStart = cached;
+  // #1222 — and the CLEAR COUNT, because the reference comparison above cannot
+  // see a clear that leaves the cache as empty as it found it.
+  const clearEpochAtStart = clearEpoch;
 
   let resolution: PanelBaseResolution;
   try {
@@ -392,6 +489,20 @@ export async function primePanelBase(
     return cachedResolution() ?? resolution;
   }
 
+  // #1222 — the cache was deliberately CLEARED while this probe was in flight.
+  // Same rule as above and the same reason: this answer predates the clear, so
+  // writing it would silently undo an explicit "forget what you knew". The
+  // reference check misses it whenever the cache was already empty when the
+  // probe started, which is the common case — a refusal fires the background
+  // prime precisely because nothing was primed yet.
+  //
+  // The ANSWER is still returned: this caller asked and this is what the probe
+  // found. Only the shared cache is left alone, so the next caller re-resolves
+  // rather than inheriting a resolution someone asked to be forgotten.
+  if (clearEpoch !== clearEpochAtStart) {
+    return resolution;
+  }
+
   cached = { at: Date.now(), target: atTarget, generation: atGeneration, resolution };
   return resolution;
 }
@@ -416,10 +527,19 @@ export function lastPanelBaseResolution(): PanelBaseResolution | undefined {
   return cachedResolution();
 }
 
-/** Test hook — drop the cache so the next prime re-resolves. */
+/**
+ * Test hook — drop the cache so the next prime re-resolves.
+ *
+ * Bumps the clear epoch (#1222) so a probe already in flight cannot land its
+ * pre-clear answer afterwards. Without that, this hook cleared the cache and an
+ * unawaited background prime — the one a capability refusal fires — repopulated
+ * it seconds later, inside whichever test happened to be running. That produced
+ * three flakes whose only symptom was the wrong remedy WORDING, which reads
+ * exactly like a real regression.
+ */
 export function __resetPanelBaseCache(): void {
-  cached = undefined;
   diskObservation = undefined;
+  forgetResolvedBase();
 }
 
 /**
@@ -519,7 +639,12 @@ export function clearPanelDiskObservation(): void {
   // restarted with different launch flags — and therefore a different
   // custom_nodes — so keeping the previous root cached would let the very next
   // operation freeze the wrong tree.
-  cached = undefined;
+  //
+  // #1222 — through `forgetResolvedBase`, because an in-flight probe that
+  // started BEFORE this hello would otherwise write the pre-restart root back in
+  // a moment later, which is precisely the freezing this exists to prevent. That
+  // is a PRODUCTION path, not only a test one: the clear runs on every hello.
+  forgetResolvedBase();
 }
 
 /**
