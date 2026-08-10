@@ -21,6 +21,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.88] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- say it once — the interactive remedy repeated its own lead (#1307)
+- give an interactive card a disconnect remedy that applies to it (#1305)
+
+
 ## [0.50.87] - 2026-08-09
 
 ### MCP
