@@ -1599,13 +1599,25 @@ function observedLiveCwd(
  */
 function argvHasRelativePathArg(argv: string[]): boolean {
   for (let i = 1; i < argv.length; i++) {
-    const token = argv[i];
-    if (!token || token.startsWith("-")) continue; // a flag, not a value
+    const raw = argv[i];
+    if (!raw) continue; // an empty token is not a path
+    // `--flag=value` carries its value INSIDE the flag token, so skipping every
+    // token that starts with "-" would walk straight past a relative path
+    // (`--output-directory=out`). Unwrap the payload and judge that instead.
+    const eq = raw.startsWith("-") ? raw.indexOf("=") : -1;
+    const token = eq >= 0 ? raw.slice(eq + 1) : raw;
+    if (eq < 0 && raw.startsWith("-")) continue; // a bare flag, no value attached
+    if (!token) continue; // `--flag=` carries nothing
     if (isAbsolute(token) || /^[a-zA-Z]:[\\/]/.test(token) || /^\\\\/.test(token)) {
       continue; // absolute — cwd cannot change it
     }
     if (/^-?\d+(\.\d+)?$/.test(token)) continue; // numeric value (--port 8188)
-    if (/^(true|false|none|auto)$/i.test(token)) continue; // plain enum-ish value
+    // Plain enum-ish values ComfyUI really passes (`--preview-method auto`,
+    // `--force-fp16 true`). A directory named exactly one of these, handed over as
+    // a RELATIVE path while every other argument is absolute, is the one shape this
+    // allowlist could miss — accepted deliberately, because without it the fix
+    // would refuse most real launches.
+    if (/^(true|false|none|auto)$/i.test(token)) continue;
     return true; // could be a relative path
   }
   return false;

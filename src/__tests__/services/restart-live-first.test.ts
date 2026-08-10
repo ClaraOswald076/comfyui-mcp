@@ -477,6 +477,76 @@ describe("restart_comfyui — live-first script resolution (#476, #426)", () => 
     killSpy.mockRestore();
   });
 
+  it("WINDOWS: an EQUALS-FORM relative path blocks the anchor too (#535)", async () => {
+    // `--output-directory=out` hides its value inside the flag token, so a guard
+    // that skips everything starting with "-" walks straight past it.
+    const LIVE_CWD = resolve("bundle-eq");
+    mockResolveBase.mockReturnValue(undefined);
+    mockLiveRootFromArgv.mockReturnValue(undefined);
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: [join("ComfyUI", "main.py"), "--output-directory=out"] },
+    });
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return s === ABS_PYTHON || s === join(LIVE_CWD, "ComfyUI", "main.py");
+    });
+    __processControlTestHooks.setLiveCwdResolver(() => undefined);
+    mockResolveLiveServerRoot.mockReturnValue({
+      source: "observed-process",
+      anchorDir: LIVE_CWD,
+      observedPid: 4321,
+    });
+    mockLivePortThenFree();
+    mockSpawn.mockImplementation(() => new FakeChild());
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("WINDOWS: an equals-form ABSOLUTE path does NOT block the anchor (#535)", async () => {
+    // The mirror: unwrapping the payload must not turn every `--flag=…` into a
+    // refusal. An absolute value is still cwd-independent.
+    const LIVE_CWD = resolve("bundle-eq2");
+    const LIVE_MAIN = join(LIVE_CWD, "ComfyUI", "main.py");
+    mockResolveBase.mockReturnValue(undefined);
+    mockLiveRootFromArgv.mockReturnValue(undefined);
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: [join("ComfyUI", "main.py"), `--output-directory=${resolve("outdir")}`],
+      },
+    });
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return s === ABS_PYTHON || s === LIVE_MAIN;
+    });
+    __processControlTestHooks.setLiveCwdResolver(() => undefined);
+    mockResolveLiveServerRoot.mockReturnValue({
+      source: "observed-process",
+      anchorDir: LIVE_CWD,
+      observedPid: 4321,
+    });
+    mockLivePortThenFree();
+    mockSpawn.mockImplementation(() => new FakeChild());
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).not.toMatch(/refusing to restart/i);
+    expect(mockSpawn.mock.calls[0][1][0]).toBe(LIVE_MAIN);
+
+    killSpy.mockRestore();
+  });
+
   it("WINDOWS: a plain non-path value (`--port 8188`) does NOT block the anchor (#535)", async () => {
     // The guard above must not be so broad it refuses the very case this issue is
     // about. The reporter's argv carries `--port 8188`; a number cannot be a path.
