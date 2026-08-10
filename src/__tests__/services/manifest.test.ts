@@ -453,7 +453,15 @@ describe("applyManifest", () => {
   });
 
   // #369 — "already exists" is a claim about a path the RUNNING server may not read.
-  it("FAILS an existing file that is not in any tree the connected ComfyUI reads", async () => {
+  // #1298 — and when that claim is DISPROVEN, the file is irrelevant, not fatal.
+  //
+  // #369 changed a false SKIP into a FAIL, which was right about skipping: a
+  // stale same-named file must never satisfy the manifest. But failing vetoes a
+  // download that has nothing wrong with it — the live root resolved correctly,
+  // and the old remedy told the user to repoint COMFYUI_PATH when nothing was
+  // misconfigured. #369's real requirement survives: the item is satisfied only
+  // if the DOWNLOAD succeeds, never by a file existing somewhere.
+  it("DOWNLOADS past an existing file that is not in any tree the connected ComfyUI reads", async () => {
     resolveExistingModelFileMock.mockResolvedValueOnce({
       path: "C:/stale/models/checkpoints/big.safetensors",
       root: "C:/stale/models",
@@ -473,23 +481,23 @@ describe("applyManifest", () => {
       },
     });
 
-    expect(result.summary).toMatchObject({ skipped: 0, failed: 1 });
-    expect(result.results[0].message).toMatch(/NOT in any directory/);
-    expect(downloadModelMock).not.toHaveBeenCalled();
-
-    // #1298 — the VERDICT is #369's and unchanged; the REMEDY was wrong.
-    // It said only "point COMFYUI_PATH at the ComfyUI that is actually
-    // running", which assumes a misconfigured target. The reporting case had
-    // the live models root resolve CORRECTLY, so the user was told to fix
-    // something already right, with no way to act on it. The message now names
-    // the resolved target and both readings, so they can tell which they are in.
+    // The stale copy must NOT block the download...
+    expect(result.summary.failed).toBe(0);
+    expect(downloadModelMock).toHaveBeenCalled();
+    // ...and must still be NAMED, because a same-named file in another install
+    // is genuinely confusing later. #369 was right that the user should hear
+    // about it; it is a note on a success, not a veto.
     const msg = result.results[0].message ?? "";
-    expect(msg).toMatch(/was NOT downloaded/);
-    expect(msg).toMatch(/leftover from a DIFFERENT install/);
-    expect(msg).toMatch(/can be ignored or deleted/);
+    expect(msg).toMatch(/same-named file also exists/);
+    expect(msg).toMatch(/C:\/stale\/models/);
+    expect(msg).toMatch(/was ignored/);
   });
 
-  it("FAILS a same-named existing file that is OUTSIDE every live model root (codex gate r5)", async () => {
+  // #1298 — was "FAILS"; containment proving the file irrelevant now lets the
+  // download proceed. The containment CHECK is unchanged and still load-bearing:
+  // it is what distinguishes this from a live copy (which still skips) and from
+  // an unverifiable one (which is still pending).
+  it("DOWNLOADS past a same-named existing file OUTSIDE every live model root (codex gate r5)", async () => {
     // C:\Stale\...\big.safetensors exists locally AND the live server has its own
     // D:\Live\...\big.safetensors, so a name-only listing check would call it a skip.
     // The containment test is decisive and overrides it.
@@ -514,8 +522,8 @@ describe("applyManifest", () => {
       },
     });
 
-    expect(result.summary).toMatchObject({ skipped: 0, failed: 1 });
-    expect(result.results[0].message).toMatch(/NOT in any directory/);
+    expect(result.summary.failed).toBe(0);
+    expect(result.results[0].message).toMatch(/same-named file also exists/);
   });
 
   it("FAILS a contained file the live server does not serve at all (container/host collision; codex gate r15)", async () => {
