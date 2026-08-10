@@ -68,6 +68,7 @@ import {
 import {
   liveRootFromArgv,
   resolveEffectiveComfyUIBase,
+  resolveLiveServerRoot,
   markLocalComfyUILaunched,
   resetLocalComfyUILaunchState,
 } from "./workspace-env.js";
@@ -1522,6 +1523,176 @@ function resolveLiveProcessCwd(pid: number): string | undefined {
 }
 
 /**
+ * The live process's working directory, reconstructed from the OS process
+ * observation rather than from procfs (#535) — the Windows path, where
+ * `/proc/<pid>/cwd` does not exist.
+ *
+ * `resolveLiveServerRoot`'s observed-process tier walks up from the interpreter the
+ * OS reports for the server on our port and accepts the first ancestor under which
+ * `<ancestor>/<relDir>/main.py` exists AND the interpreter belongs to that install.
+ * That accepted ancestor IS the working directory the server must have had for its
+ * relative `main.py` to name this install — the same fact `/proc/<pid>/cwd` states
+ * directly.
+ *
+ * THE PID MUST MATCH. This value is used to decide a relaunch of a process we are
+ * about to KILL, and the observation is anchored on "whatever is listening on our
+ * port". If that is a different process than `pid` — a second ComfyUI, a proxy, a
+ * pid we resolved from a stale record — then its install is not the one being
+ * stopped, and anchoring the relaunch on it would restart the wrong tree after
+ * killing the right one. An unconfirmed observation is discarded, leaving the
+ * pre-existing refusal exactly as it was.
+ *
+ * Never throws: a failure here must degrade to the old refusal, never break a stop.
+ */
+function observedLiveCwd(
+  pid: number,
+  argv: string[],
+  expectedStartedAt: string | undefined,
+): string | undefined {
+  if (!pid) return undefined;
+  // The anchor is INFERRED, never observed: it is a directory from which this
+  // relative script WOULD name this install, which is not the same claim as
+  // "the directory the process was started in". A launcher that keeps
+  // `C:\launcher\main.py` symlinked to `C:\bundle\main.py` is started from
+  // `C:\launcher`, yet `C:\bundle` satisfies the inference (codex gate).
+  //
+  // For the panel base (#1133) that gap is harmless — both spellings name the same
+  // install root. Here it is not: this value becomes the relaunch's WORKING
+  // DIRECTORY, so any relative argument would resolve somewhere else after the
+  // restart. So only adopt it when the choice of cwd CANNOT change what an
+  // argument means: every token after the script must be a flag, an absolute path,
+  // or a plain non-path value. Anything that could be a relative path leaves the
+  // pre-existing refusal in place.
+  if (argvHasRelativePathArg(argv)) return undefined;
+  try {
+    const live = resolveLiveServerRoot(argv, undefined, { remote: false });
+    if (live.source !== "observed-process" || !live.anchorDir) return undefined;
+    if (live.observedPid !== pid) return undefined;
+    // …and bind it to the process INSTANCE, not to the pid NUMBER. This resolver
+    // re-queries the port owner at its own moment, after the identity bracket
+    // above has already closed; a pid recycled in that window would satisfy a
+    // numeric comparison while describing a different server. The codebase's rule
+    // is pid + creation time, and an unreadable stamp is "did not observe", never
+    // "observed the same" — so it fails closed to the old refusal (#535 codex gate).
+    const nowStartedAt = resolveProcessIdentity(pid)?.startedAt;
+    if (!expectedStartedAt || !nowStartedAt || nowStartedAt !== expectedStartedAt) {
+      return undefined;
+    }
+    return isAbsolute(live.anchorDir) ? live.anchorDir : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Does any argument AFTER the launch script depend on the working directory?
+ *
+ * Conservative on purpose (#535): a token counts as a possible relative path
+ * unless it is a flag, an absolute path, or a plain value that cannot be one (a
+ * number, a `key=value` flag payload, a bare `true`/`false`). `--port 8188` is
+ * safe; `--output-directory out` is not, and neither is anything carrying a path
+ * separator without a root.
+ *
+ * The asymmetry is deliberate. A false positive costs a Windows user the same
+ * manual restart they have today; a false negative relaunches a server into a
+ * directory where its own arguments point somewhere else.
+ */
+function argvHasRelativePathArg(argv: string[]): boolean {
+  let sawSeparator = false;
+  let pendingPathFlag = false;
+  for (let i = 1; i < argv.length; i++) {
+    const raw = argv[i];
+    if (raw === undefined) continue;
+    // Everything after a bare `--` is positional, so nothing there is a flag and
+    // a leading dash no longer means what it did.
+    if (!sawSeparator && raw === "--") {
+      sawSeparator = true;
+      pendingPathFlag = false;
+      continue;
+    }
+    if (sawSeparator) {
+      if (!isAbsolutePath(raw)) return true; // a positional we cannot vouch for
+      continue;
+    }
+    // The token immediately after a path-valued flag is ITS VALUE, whatever it
+    // looks like — `--output-directory -` names a directory called `-`, and
+    // treating it as the next flag is how that slipped through (codex round 2).
+    // A token starting with `--` is the exception: no ComfyUI path flag takes a
+    // `--`-prefixed value, so that is the NEXT FLAG and the previous one was a
+    // boolean we misread.
+    // KEEP consuming while the flag can still take values. ComfyUI declares
+    // `--extra-model-paths-config` as `nargs='+'`, so `--extra-model-paths-config
+    // C:\one.yaml two.yaml` carries TWO paths and only the first was being checked
+    // (codex round 3) — `two.yaml` then fell to the positional check, which lets a
+    // separator-free name through. argparse ends the list at the next option.
+    if (pendingPathFlag && !raw.startsWith("--")) {
+      if (!isAbsolutePath(raw)) return true;
+      continue; // stay pending: there may be more values
+    }
+    pendingPathFlag = false;
+    if (raw.startsWith("-")) {
+      // `--flag=value` carries its value INSIDE the token.
+      const eq = raw.indexOf("=");
+      const name = eq >= 0 ? raw.slice(0, eq) : raw;
+      const attached = eq >= 0 ? raw.slice(eq + 1) : undefined;
+      if (!KNOWN_PATH_FLAG.test(name)) continue; // --port, --cache-none, …
+      if (attached === undefined) {
+        pendingPathFlag = true; // its value is the next token
+        continue;
+      }
+      if (attached && !isAbsolutePath(attached)) return true;
+      continue;
+    }
+    // Any other token: only a path-SHAPED one is a concern. A stray value that is
+    // not a path (`8188` after `--port`, `10` after `--cache-lru`) cannot be
+    // re-resolved into something else by a different cwd. A URL carries slashes
+    // without being a path — `--comfy-api-base https://api.comfy.org` is not
+    // something a working directory can move (codex round 3).
+    if (raw === "." || raw === ".." || (/[\\/]/.test(raw) && !isUrlLike(raw))) {
+      if (!isAbsolutePath(raw)) return true;
+    }
+  }
+  // A trailing path flag with no value left to take is malformed argv, not a
+  // relative path — there is nothing for a different cwd to re-resolve.
+  return false;
+}
+
+/**
+ * ComfyUI's flags whose value is a PATH, matched on the flag NAME rather than on
+ * what the value looks like (codex round 2).
+ *
+ * Judging the value was the wrong instinct and bypassable three ways: `auto`,
+ * `8188` and `-` are all perfectly legal directory names, so an allowlist of
+ * "values that cannot be paths" cannot exist. The flag name is the part whose
+ * vocabulary is knowable.
+ *
+ * ENUMERATED, not pattern-matched. A broad `/dir|path|cache|log|…/` substring
+ * test is over-broad in the direction that BREAKS the fix: `--cache-none` and
+ * `--log-stdout` are BOOLEAN flags that match it, so the next token gets eaten as
+ * their "value" and a perfectly ordinary launch is refused. `--cache-none` is in
+ * this issue's own original report, so the heuristic would have refused the very
+ * argv it exists to support.
+ *
+ * A path flag missing from this list degrades to the positional check below —
+ * blocked when the value is path-SHAPED, allowed when it is not. That residual
+ * (an unknown path flag carrying a relative value that looks like nothing,
+ * e.g. `--future-dir auto`, on a symlinked launcher) is narrower than the
+ * blanket refusal it replaces, and is stated rather than hidden.
+ */
+const KNOWN_PATH_FLAG =
+  /^--(base|input|output|temp|user|models|custom-nodes|front-end-root)-director(y|ies)$|^--(models-dir|extra-model-paths-config|tls-keyfile|tls-certfile|log-file)$/i;
+
+/** Absolute on either host convention — POSIX, Windows drive, or UNC. */
+function isAbsolutePath(p: string): boolean {
+  return isAbsolute(p) || /^[a-zA-Z]:[\\/]/.test(p) || /^\\\\/.test(p);
+}
+
+/** A URL, not a filesystem path — it carries slashes but no cwd can move it. */
+function isUrlLike(p: string): boolean {
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(p);
+}
+
+/**
  * The argv a relaunch is built from: the SERVER's own `sys.argv` when it could tell
  * us, otherwise the OS's view of the same process (#767).
  *
@@ -2225,6 +2396,7 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
 
   let argv: string[] = [];
   let pid: number | null = null;
+  let ownerStartedAt: string | undefined;
   let bracketed = false;
   for (let attempt = 0; attempt < 2; attempt++) {
     const before = observeOwner();
@@ -2249,6 +2421,9 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
       }
       const after = observeOwner();
       pid = after?.pid ?? before?.pid ?? null;
+      // Keep the bracketed instance stamp: the observed-cwd fallback (#535) must
+      // bind to this PROCESS INSTANCE, not to a pid number it can re-observe later.
+      ownerStartedAt = after?.startedAt ?? before?.startedAt;
       if (pid == null) {
         try {
           pid = findPidByPort(port);
@@ -2360,7 +2535,17 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
   const desktopExe = desktop ? findDesktopExePath(identifyingArgv) : undefined;
   // Capture the live process cwd NOW, while the pid is guaranteed alive — the
   // `/proc/<pid>/cwd` symlink is gone the instant a later stop kills it (#535).
-  const liveCwd = desktop ? undefined : resolveLiveProcessCwd(pid);
+  //
+  // On Windows there is no `/proc`, so this returned undefined and the relative-script
+  // anchor downstream could never fire — a `ComfyUI\main.py` launch was refused
+  // outright with "could not locate the ComfyUI install", which is the #535 recurrence
+  // that kept coming back. `observedLiveCwd` reconstructs the SAME fact from the OS
+  // process observation instead of from procfs: the directory the server's relative
+  // `main.py` must have been resolved against for it to name the install its own
+  // interpreter lives in.
+  const liveCwd = desktop
+    ? undefined
+    : (resolveLiveProcessCwd(pid) ?? observedLiveCwd(pid, argv, ownerStartedAt));
   // Same live-only window for the ENVIRONMENT (#776): read it now, while the pid
   // is guaranteed alive, so a relaunch can reproduce the launcher environment the
   // server was actually started with instead of substituting the orchestrator's.
