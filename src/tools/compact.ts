@@ -392,7 +392,24 @@ function panelNamespaceMessage(catalog: ToolCatalog, name: string): string {
     "see what else your client holds, so check the tool list your client gave you. " +
     `If it offers ${name}, or a panel router such as panel_call_tool, go that way — call_tool ` +
     "dispatches only within this server's own catalog and can never reach the panel surface. " +
-    "If it offers nothing under `panel_`, there is no live-canvas route from here: read the " +
+    // #1353 — SEARCHING ONLY THE DIRECT DECLARATIONS PRODUCES A FALSE NEGATIVE.
+    //
+    // On a code-mode client (the Codex backend) the panel tools are DEFERRED: they
+    // live in the `ALL_TOOLS` catalog under an `mcp__panel__` prefix, so a scan for a
+    // bare `panel_` prefix among direct declarations finds nothing while the panel MCP
+    // endpoint is answering tools/list with 91 tools. A reporter followed the sentence
+    // below literally and declared the live-canvas tools missing, repeatedly, with no
+    // transport error anywhere — the failure was entirely this instruction.
+    //
+    // So the absence test has to name both the prefix and the deferred catalog before
+    // it is allowed to conclude anything.
+    "BEFORE concluding they are absent: a code-mode/deferred-tool client (e.g. the Codex " +
+    "backend) does NOT declare these directly — it lists them in its deferred catalog " +
+    "(`ALL_TOOLS`) under an MCP prefix, so the name to look for is " +
+    "`mcp__panel__panel_graph_outline`, not `panel_graph_outline`. Search that catalog too, " +
+    "and if it is there, call it through the nested tools namespace. Only when BOTH the " +
+    "direct declarations and the deferred catalog have nothing matching `panel_` is there " +
+    "no live-canvas route from here: read the " +
     "workflow from disk instead (get_workflow, whose list/get/analyze/query actions read saved files), " +
     "or ask the user to make the request from the Agent tab in the ComfyUI sidebar, on a backend " +
     "that has ComfyUI tools (the pi backend has no MCP client and so has none)."
