@@ -21,6 +21,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.107] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- gate the instance-witness channel too, not just the process probe (#1367)
+
+
 ## [0.50.106] - 2026-08-10
 
 ### MCP
