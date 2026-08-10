@@ -491,6 +491,35 @@ describe("applyManifest", () => {
     expect(msg).toMatch(/same-named file also exists/);
     expect(msg).toMatch(/C:\/stale\/models/);
     expect(msg).toMatch(/was ignored/);
+    // Re-pinned from the #369 tests this replaced: that clause IS the diagnostic
+    // half #369 wanted kept, and after the rewrite nothing held it — stripping it
+    // killed zero tests.
+    expect(msg).toMatch(/NOT in any directory/);
+  });
+
+  it("does not accuse LATER items of a stale copy found for an earlier one", async () => {
+    // Surviving mutation: hoisting `let staleOutsideLiveRoots` above the per-item
+    // loop passes every other test, because both stale tests use a single-model
+    // manifest. Manifests are multi-model by definition, so the mutant ships a
+    // false accusation on every subsequent asset.
+    resolveExistingModelFileMock.mockResolvedValueOnce({
+      path: "C:/stale/models/checkpoints/big.safetensors",
+      root: "C:/stale/models",
+      info: { isFile: () => true },
+    });
+    isUnderLiveModelRootsMock.mockResolvedValueOnce({ inRoots: false });
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          { url: "https://example.com/big.safetensors", model_type: "checkpoints", filename: "big.safetensors" },
+          { url: "https://example.com/clean.safetensors", model_type: "loras", filename: "clean.safetensors" },
+        ],
+      },
+    });
+
+    const second = result.results.find((r) => String(r.item).includes("clean")) ?? result.results[1];
+    expect(second?.message ?? "").not.toMatch(/same-named file also exists/);
   });
 
   // #1298 — was "FAILS"; containment proving the file irrelevant now lets the
@@ -523,7 +552,11 @@ describe("applyManifest", () => {
     });
 
     expect(result.summary.failed).toBe(0);
+    // Re-pinned: the old test asserted downloadModel was NOT called, so the new
+    // contract needs the mirror assertion or "downloads past it" is unheld.
+    expect(downloadModelMock).toHaveBeenCalled();
     expect(result.results[0].message).toMatch(/same-named file also exists/);
+    expect(result.results[0].message).toMatch(/NOT in any directory/);
   });
 
   it("FAILS a contained file the live server does not serve at all (container/host collision; codex gate r15)", async () => {
@@ -902,6 +935,39 @@ describe("applyManifest", () => {
       // The apply is not settled, so it is not a success — but nothing FAILED.
       expect(result.summary.failed).toBe(0);
       expect(result.success).toBe(false);
+    } finally {
+      if (prevGrace === undefined) delete process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
+      else process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = prevGrace;
+    }
+  });
+
+  it("names the stale copy on a STILL-RUNNING download — the reporter's own case", async () => {
+    // The note used to render on 1 of 6 outcomes. A download slower than the 15s
+    // grace reports `pending` and the stale path was lost PERMANENTLY: it lives
+    // only in applyManifest's local array, so the `download_model status` poll
+    // the user is told to run cannot see it. That is the case that filed #1298,
+    // so the fix is hollow without it.
+    const prevGrace = process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
+    process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = "0";
+    downloadModelMock.mockReturnValue(new Promise<string>(() => {}));
+    resolveExistingModelFileMock.mockResolvedValueOnce({
+      path: "C:/stale/models/checkpoints/slow.safetensors",
+      root: "C:/stale/models",
+      info: { isFile: () => true },
+    });
+    isUnderLiveModelRootsMock.mockResolvedValueOnce({ inRoots: false });
+
+    try {
+      const result = await applyManifest({
+        manifest: {
+          models: [
+            { url: "https://example.com/slow.safetensors", model_type: "checkpoints", filename: "slow.safetensors" },
+          ],
+        },
+      });
+      expect(result.results[0].status).toBe("pending");
+      expect(result.results[0].message).toMatch(/same-named file also exists/);
+      expect(result.results[0].message).toMatch(/C:\/stale\/models/);
     } finally {
       if (prevGrace === undefined) delete process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
       else process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = prevGrace;

@@ -952,7 +952,7 @@ async function applyManifestSections(
         // DOWNLOAD succeeds, never by the mere existence of a file somewhere.
         if (visible === false) {
           staleOutsideLiveRoots = existing;
-        } else         if (visible === undefined) {
+        } else if (visible === undefined) {
           // We could not establish that the running server reads from this path, so
           // "already exists" is an UNVERIFIED claim. Report it as pending, never as
           // a satisfied item (codex gate, rounds 4 and 8).
@@ -1047,8 +1047,22 @@ async function applyManifestSections(
     // the one connected now must not be re-asserted as an apply (#369).
     const liveRootNow = await currentLiveModelsRoot();
     for (const { item, job, staleOutsideLiveRoots } of enqueued) {
+      // #1298 — the stale-copy note belongs on EVERY outcome, not just the happy
+      // one. Review measured it rendering on 1 of 6: a download slower than the
+      // 15s grace reports `pending` and the path was lost permanently, because
+      // it lives only in this local array and the `download_model status` poll
+      // the user is told to run cannot see it. That is the reporter's own case.
+      // Worst was `wrongPlace`: two same-named copies on disk and neither
+      // message naming the other.
+      const staleNote = staleOutsideLiveRoots
+        ? ` (Note: a same-named file also exists at ${staleOutsideLiveRoots}, which is NOT in ` +
+          "any directory the connected ComfyUI reads — it belongs to a different install and " +
+          "was ignored.)"
+        : "";
       if (job.status === "error") {
-        results.push(report("model", item, "failed", job.error ?? "Model download failed."));
+        results.push(
+          report("model", item, "failed", (job.error ?? "Model download failed.") + staleNote),
+        );
       } else if (job.status === "done") {
         // "applied" must mean the running ComfyUI can actually load it (#369). Same
         // shared placement policy as download_model: an unconfirmed or demonstrably
@@ -1064,29 +1078,21 @@ async function applyManifestSections(
                 "model",
                 item,
                 "applied",
-                `Model downloaded to ${job.path}${placement.pathQualifier}.` +
-                  // #1298 — the stale copy that used to VETO this download is
-                  // still worth naming: a same-named file in another install is
-                  // genuinely confusing later, and #369 was right that the user
-                  // should hear about it. It is a note on a success, not a veto.
-                  (staleOutsideLiveRoots
-                    ? ` (Note: a same-named file also exists at ${staleOutsideLiveRoots}, ` +
-                      "which is NOT in any directory the connected ComfyUI reads — it belongs " +
-                      "to a different install and was ignored.)"
-                    : ""),
+                `Model downloaded to ${job.path}${placement.pathQualifier}.` + staleNote,
               )
             : placement.wrongPlace
               ? report(
                   "model",
                   item,
                   "failed",
-                  `Model ${placement.pathLabel} ${job.path}, but it is NOT usable by the connected ComfyUI: ${placement.warning}`,
+                  `Model ${placement.pathLabel} ${job.path}, but it is NOT usable by the connected ComfyUI: ${placement.warning}` +
+                    staleNote,
                 )
               : report(
                   "model",
                   item,
                   "pending",
-                  `Model ${placement.pathLabel} ${job.path}. ${placement.warning}`,
+                  `Model ${placement.pathLabel} ${job.path}. ${placement.warning}` + staleNote,
                 ),
         );
       } else {
@@ -1097,7 +1103,7 @@ async function applyManifestSections(
             "pending",
             `Model download is RUNNING in the background (job ${job.id}) — NOT yet complete, ` +
               `and NOT a failure. Poll download_model action:"status" with this id; the file lands on its own. ` +
-              `Do not re-issue the download.`,
+              `Do not re-issue the download.` + staleNote,
           ),
         );
       }
