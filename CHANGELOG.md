@@ -21,6 +21,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.101] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- refresh the node schema and retry the add, once (#1354)
+- consume a control_after_generate slot only when it holds a control mode (#1350)
+
+
 ## [0.50.100] - 2026-08-10
 
 ### MCP
