@@ -9156,6 +9156,36 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             `🔒 Token saved to MCP server "${server}" (${args.target_kind} "${args.key}"). Call panel_reload to load it.`,
           );
         } catch (err) {
+          // #1352 — A TIMED-OUT SECRET CARD IS NOT A FROZEN TAB.
+          //
+          // The bridge's generic no-reply message ("the ComfyUI tab may be backgrounded
+          // or frozen") is right for every other command and wrong here. This card
+          // blocks up to 300s on a MASKED INPUT, and the overwhelmingly likely reason it
+          // went unanswered is that a human is still typing — off finding the key in a
+          // password manager or a billing console. Nothing is wrong with the tab, and
+          // sending someone to fix one is the #1332 defect in a new place.
+          //
+          // It also has to say what happens to a value entered LATE, because that is the
+          // question the caller will actually have. MEASURED: this card is sent as a raw
+          // `request_secret` command with NO ask_id, and the late-reply buffer
+          // (takeLateAskReply) is keyed BY ask id — so a value typed after the timeout
+          // has no path back to this call. It is discarded, and the tool must be called
+          // again. "It may still arrive" would be a guess, and an expensive one: the
+          // user would wait for a save that cannot happen.
+          if (isReplyTimeoutError(err)) {
+            return fail(
+              `The secret card was not answered within 300s, so NOTHING was saved and no ` +
+                `credential was read. That is very likely just time — the card asks for a ` +
+                `token, and finding one in a password manager or a billing console can take ` +
+                `longer than that. It does NOT mean the tab is frozen, and it does NOT mean ` +
+                `the user declined.\n\n` +
+                `A value typed into that card NOW cannot reach this call: it carries no id ` +
+                `this reply could be matched to, so a late answer is discarded rather than ` +
+                `saved. Ask whether they still want to set it and call panel_request_secret ` +
+                `again when they are ready to paste — the value goes straight from the masked ` +
+                `field into storage, and must never be typed into the conversation.`,
+            );
+          }
           return fail(err);
         }
       },
