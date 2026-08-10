@@ -21,6 +21,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.102] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- clear the fence on the verdict that PROVED identity (#1355)
+
+
 ## [0.50.101] - 2026-08-10
 
 ### MCP
