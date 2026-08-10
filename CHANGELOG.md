@@ -21,6 +21,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.105] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- say WHICH host the node definitions came from when a remote strip fails (#1362)
+
+
 ## [0.50.104] - 2026-08-10
 
 ### MCP
