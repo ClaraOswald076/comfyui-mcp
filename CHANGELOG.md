@@ -21,6 +21,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.89] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- this repo's own release subject is a release subject (#1310)
+
+
 ## [0.50.88] - 2026-08-09
 
 ### MCP
