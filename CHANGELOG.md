@@ -21,6 +21,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.86] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- say why a CivitAI download failed, instead of a bare status (#1303)
+
+#### Changed
+- 0.50.85 (#1302)
+
+
 ## [0.50.85] - 2026-08-09
 
 ### MCP
