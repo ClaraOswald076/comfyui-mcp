@@ -1873,7 +1873,44 @@ function nextFrame(
   });
 }
 
-const settle = () => new Promise((r) => setTimeout(r, 60));
+/**
+ * Let queued bridge work flush before asserting on its effect.
+ *
+ * #1325 — this was `setTimeout(60)`: a wall-clock guess that 60ms is "enough". It is,
+ * on an idle machine. Under a fully parallel suite the event loop is contended and
+ * 60ms can elapse with the queued work never scheduled — which is exactly the shape
+ * reported, a file that fails under `vitest run` and passes 206/206 in isolation.
+ *
+ * The wait now SCALES with measured event-loop lag. Note the property that makes this
+ * safe to apply to all 31 call sites at once: it is MONOTONE — always at least the old
+ * 60ms, more only when the loop is already behind. It therefore cannot change the
+ * outcome of a test that passes today; it can only stop a loaded machine from deciding
+ * one. (A shorter wait could have masked a real regression; this direction cannot.)
+ *
+ * WHAT IT DOES AND DOES NOT COVER, measured rather than assumed:
+ *
+ *   idle                       old 63ms   new 63ms   (no cost added)
+ *   in-process loop congestion old 121ms  new 367ms  (adapts — a busy worker)
+ *   other PROCESSES burning CPU old 62ms  new 63ms   (does NOT adapt)
+ *
+ * The last row is the honest limit. Cross-process starvation does not congest THIS
+ * loop, so there is nothing local to measure; a wall-clock sleep and the work it waits
+ * for are descheduled together. So this is not a proven cure for the reported
+ * condition — it removes one real load-sensitivity vector (a busy worker's own queue)
+ * without claiming to remove them all.
+ */
+const settle = async (): Promise<void> => {
+  // Lag is measured with setImmediate, NOT setTimeout(0): Windows' timer resolution is
+  // ~15.6ms, so a setTimeout(0) probe reports that floor as if it were contention and
+  // inflates every one of the 31 waits on an idle machine (measured: 63ms -> 140ms).
+  // setImmediate has no such floor — 0ms idle, and it still grows when the loop is busy.
+  const t0 = Date.now();
+  await new Promise((r) => setImmediate(r));
+  const lag = Date.now() - t0; // ~0 idle, tens of ms under a loaded suite
+  await new Promise((r) => setTimeout(r, 60 + lag * 4));
+  // Drain work those timers queued behind them, which a single sleep never sees.
+  for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+};
 
 describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
   it("lists desktop tabs (excluding headless viewers), attaches, and fans push out to primary + viewer", async () => {
@@ -3374,18 +3411,46 @@ describe("defaultBridgeTimeoutMs — tolerant read timeout (#357)", () => {
   it("a no-timeout READ stays alive PAST the old 6s cutoff (end-to-end) (#357)", async () => {
     const a = await connectPanel("tab-aaaa-1111"); // never auto-replies
     await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
-    let settled = false;
+    // #1325 — this test used to record only a BOOLEAN and discard the reason, so a
+    // failure read `expected true to be false` and named nothing. It was reported as
+    // load-sensitive, and the arithmetic says a slow machine alone cannot be the whole
+    // story: the read default is 20s and this test's budget is 12s, so the deadline
+    // UNDER TEST cannot be reached inside it. If this read settles, something else
+    // rejected it, and that reason is the only thing worth having.
+    let outcome: "resolved" | "rejected" | null = null;
+    let reason: unknown;
     // No explicit timeout → send() applies the tolerant read default (20s). Swallow
     // the eventual late rejection so it never surfaces as an unhandled rejection
     // (the bridge is torn down in afterEach; the pending read settles then).
     void bridge.send({ cmd: "graph_query" }).then(
-      () => { settled = true; },
-      () => { settled = true; },
+      () => { outcome = "resolved"; },
+      (err) => { outcome = "rejected"; reason = err; },
     );
     // Wait comfortably past the OLD 6000ms default: before the fix this would have
-    // already rejected (settled === true); after it, the read is still in-flight.
-    await new Promise((r) => setTimeout(r, 6500));
-    expect(settled).toBe(false);
+    // already rejected; after it, the read is still in-flight.
+    const SLEEP_MS = 6500;
+    const startedAt = Date.now();
+    await new Promise((r) => setTimeout(r, SLEEP_MS));
+    const elapsed = Date.now() - startedAt;
+
+    // Report the two confounds instead of asserting through them. A stall past the
+    // real deadline means this run measured the MACHINE, not the code — and that is
+    // the one thing a bare `toBe(false)` could never say.
+    //
+    // `deadline >= SLEEP_MS` is what separates the two. If the deadline is BELOW this
+    // sleep, reaching it is the regression this test exists to catch, not a stall —
+    // without that clause a genuine regression would be reported as a slow machine,
+    // which is precisely the misdiagnosis #1325 is about. (Verified by lowering the
+    // constant to 6s: it must read as a regression, not as scheduling.)
+    const deadline = BRIDGE_READ_DEFAULT_TIMEOUT_MS;
+    const stalled = elapsed >= deadline && deadline >= SLEEP_MS;
+    const detail =
+      outcome === null
+        ? "still in flight"
+        : `${outcome} after ${elapsed}ms` +
+          (stalled ? ` — THE MACHINE STALLED past the ${deadline}ms read deadline, so this run cannot tell a regression from scheduling` : "") +
+          (outcome === "rejected" ? `: ${reason instanceof Error ? reason.message : String(reason)}` : "");
+    expect(detail).toBe("still in flight");
     a.close();
   }, 12000);
 
