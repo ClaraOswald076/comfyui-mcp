@@ -21,6 +21,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.100] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- stop reporting a lost transport as "the user cancelled" (#1348)
+
+
 ## [0.50.99] - 2026-08-10
 
 ### MCP
