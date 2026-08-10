@@ -21,6 +21,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.82] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a tab id is a bridge ROUTE, not a workflow path (#1287)
+
+
 ## [0.50.81] - 2026-08-09
 
 ### MCP
