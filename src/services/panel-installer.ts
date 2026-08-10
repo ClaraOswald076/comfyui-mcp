@@ -1931,6 +1931,18 @@ export async function panelStatus(
           : ` — no COMFYUI_PATH or saved workspace was needed (#769).`)
       );
     }
+    if (baseResolution.source === "live-observed-root") {
+      return (
+        ` Resolved from the RUNNING ComfyUI process itself (${baseResolution.base}): it ` +
+        `reported a relative main.py with no working directory (the Comfy Desktop / ` +
+        `Windows portable shape), so its install root was re-anchored on the ` +
+        `interpreter the OS reports for the process serving this port (#1133).` +
+        (baseResolution.overriddenConfiguredBase
+          ? ` This is NOT the configured workspace ` +
+            `(${baseResolution.overriddenConfiguredBase}).`
+          : ``)
+      );
+    }
     return "";
   })();
 

@@ -50,7 +50,7 @@ import { parsePyproject } from "./node-authoring.js";
 import { parseBaseDirFromArgv } from "./output-dir.js";
 import {
   getLiveServerSnapshot,
-  liveRootFromArgv,
+  resolveLiveServerRoot,
   resolveEffectiveComfyUIBase,
   resolveLocalWorkspaceBase,
 } from "./workspace-env.js";
@@ -61,6 +61,14 @@ export type PanelBaseSource =
   | "live-base-directory"
   /** The running server's own install root, from its launch argv (#769). */
   | "live-argv-root"
+  /**
+   * The running server's install root re-anchored on the interpreter the OS
+   * reports for the process on our port (#1133). This is the ComfyUI **Desktop**
+   * / Windows **portable** shape: argv is a RELATIVE `ComfyUI\main.py` with no
+   * reported cwd, so `live-argv-root` cannot resolve — but the process listening
+   * on our port can be observed directly. See `resolveLiveServerRoot`.
+   */
+  | "live-observed-root"
   /** COMFYUI_PATH or the saved default workspace. */
   | "configured"
   /** Remote/cloud, or nothing resolvable. */
@@ -87,10 +95,16 @@ export interface PanelBaseResolution {
   /**
    * True when the server WAS reached but no live root could be derived from
    * what it reported: no `--base-directory`, and its argv yielded no absolute
-   * install root holding custom_nodes (argv absent, no positional main.py, or
-   * a RELATIVE main.py with no reported cwd — the common `python main.py` /
-   * portable-launcher shape). Distinct from liveProbeFailed: "start ComfyUI"
-   * is a dead remedy here because ComfyUI is already running (#890/#916).
+   * install root holding custom_nodes (argv absent, or no positional main.py).
+   *
+   * A RELATIVE main.py with no reported cwd — the ComfyUI Desktop / Windows
+   * portable shape — no longer lands here on its own (#1133): the process on our
+   * port is observed and the relative dir re-anchored on its interpreter. It
+   * reaches this flag only when that observation ALSO fails (the process could
+   * not be identified, or the anchored dir held no `main.py`).
+   *
+   * Distinct from liveProbeFailed: "start ComfyUI" is a dead remedy here because
+   * ComfyUI is already running (#890/#916).
    */
   liveRootUnderivable?: boolean;
 }
@@ -105,14 +119,20 @@ export interface PanelBaseResolution {
  * configured base is a plausible READ but never authority for a destructive
  * write, nor for certifying which panel the browser is loading.
  *
- * Only the two live-derived sources qualify.
+ * Only the three live-derived sources qualify. `live-observed-root` belongs here
+ * for the same reason the other two do — it is anchored on the process the OS
+ * reports for our port, correlated against that server's OWN argv, and accepted
+ * only when the anchored directory really holds `main.py` and an interpreter
+ * belonging to that install. It is an OBSERVATION of the running server, not a
+ * guess about a configured path (#1133).
  */
 export function isLiveDerivedBase(
   resolution: PanelBaseResolution | undefined,
 ): boolean {
   return (
     resolution?.source === "live-base-directory" ||
-    resolution?.source === "live-argv-root"
+    resolution?.source === "live-argv-root" ||
+    resolution?.source === "live-observed-root"
   );
 }
 
@@ -140,9 +160,27 @@ export async function resolvePanelBase(): Promise<PanelBaseResolution> {
   if (snapshot.reachable) {
     // `--base-directory` FIRST: when ComfyUI is launched with it, that flag —
     // not the main.py location — is the root it derives custom_nodes/ from.
+    // The install root goes through the ONE canonical resolver (#1133). Parsing
+    // argv here directly — as this did — silently drops ComfyUI Desktop and the
+    // Windows portable bundle, which report a RELATIVE `ComfyUI\main.py` with no
+    // cwd: `liveRootFromArgv` returns undefined for that shape, so a Desktop
+    // install had NO live-derived candidate at all and every destructive panel
+    // operation refused on an uncorroborated configured path. `resolveLiveServerRoot`
+    // adds the tier that exists precisely for it — re-anchoring the relative
+    // main.py on the interpreter the OS reports for the process on our port.
+    //
+    // This does NOT widen what counts as corroboration: the anchor is accepted
+    // only when the resulting directory holds `main.py` AND the observed
+    // interpreter belongs to that install, and `--base-directory` still wins
+    // ahead of it, so a genuinely split install resolves exactly as before.
+    // Unresolved still yields no candidate, and the gate still refuses.
+    const live = resolveLiveServerRoot(snapshot.argv, snapshot.cwd, { remote: false });
     const candidates: Array<[string | undefined, PanelBaseSource]> = [
       [parseBaseDirFromArgv(snapshot.argv, snapshot.cwd), "live-base-directory"],
-      [liveRootFromArgv(snapshot.argv, snapshot.cwd), "live-argv-root"],
+      [
+        live.root,
+        live.source === "observed-process" ? "live-observed-root" : "live-argv-root",
+      ],
     ];
     for (const [candidate, source] of candidates) {
       // Only accept a live base we can PROVE holds custom_nodes. An argv root

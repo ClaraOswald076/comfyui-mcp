@@ -61,16 +61,31 @@ const workspace = vi.hoisted(() => ({
   liveArgv: undefined as string[] | undefined,
   liveCwd: undefined as string | undefined,
   reachable: false,
+  /** What the OS-observed process tier resolves to (#1133). undefined ⇒ the
+   *  observation fails, which is the pre-#1133 behaviour every other test here
+   *  was written against. */
+  observedRoot: undefined as string | undefined,
 }));
+const argvRoot = vi.hoisted(() => (argv: string[] | undefined) => {
+  // Minimal stand-in for the real argv→root derivation: the dir holding main.py.
+  const main = argv?.find((a) => a.endsWith("main.py"));
+  return main ? main.slice(0, main.length - "/main.py".length) : undefined;
+});
 vi.mock("../../services/workspace-env.js", () => ({
   resolveEffectiveComfyUIBase: () => workspace.base,
   // The LOCAL-MACHINE question #490 split out. Panel code gates on isLocalMode itself,
   // so in a local session the two answers agree.
   resolveLocalWorkspaceBase: () => workspace.base,
-  liveRootFromArgv: (argv: string[] | undefined) => {
-    // Minimal stand-in for the real argv→root derivation: the dir holding main.py.
-    const main = argv?.find((a) => a.endsWith("main.py"));
-    return main ? main.slice(0, main.length - "/main.py".length) : undefined;
+  liveRootFromArgv: (argv: string[] | undefined) => argvRoot(argv),
+  // Faithful to the real two-tier contract (#1133): argv when it resolves, else
+  // the OS-observed process anchor, else unresolved.
+  resolveLiveServerRoot: (argv: string[] | undefined) => {
+    const fromArgv = argvRoot(argv);
+    if (fromArgv) return { root: fromArgv, source: "argv" };
+    if (workspace.observedRoot) {
+      return { root: workspace.observedRoot, source: "observed-process" };
+    }
+    return { source: "unresolved" };
   },
   getLiveServerSnapshot: async () => ({
     reachable: workspace.reachable,
