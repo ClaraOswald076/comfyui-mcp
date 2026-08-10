@@ -79,11 +79,12 @@ function runIdentityPreamble(ev: {
       // changes is that we stop asserting the one thing we do not know.
       if (ev.run_correlation_prior) {
         return (
-          `This run (prompt ${pid}) WAS queued from this session, but its ticket is no longer held — ` +
-          `tickets are bounded, an acked completion clears one, and a re-queued id can stand for more ` +
-          `than one run. So it CANNOT be proven to be the render you are waiting on: its origin is ` +
-          `UNDETERMINED even though the id is one of yours. Do NOT treat it as that render; confirm ` +
-          `with get_history (action:"list") which of your runs this id belongs to before acting. `
+          `This run (prompt ${pid}) WAS queued from this session, but it can no longer be tied to a ` +
+          `specific run of yours — the orchestrator tracks a bounded number of runs and this one has ` +
+          `aged out, or the id was queued again and now stands for more than one. So its origin is ` +
+          `UNDETERMINED even though the id is one of yours, and it CANNOT be treated as proof that ` +
+          `the render you are waiting on finished. Do NOT treat it as that render; confirm with ` +
+          `get_history (action:"list") which of your runs this id belongs to before acting. `
         );
       }
       return (

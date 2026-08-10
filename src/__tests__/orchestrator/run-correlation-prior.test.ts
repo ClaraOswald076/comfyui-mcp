@@ -137,6 +137,91 @@ describe("a forgotten run is not reported as one you never queued (#925)", () =>
     ).toBeFalsy();
   });
 
+  // ── THE CLAIM MUST BE ABOUT OWNERSHIP, NOT ACQUAINTANCE (codex) ──────────
+  // The sentence says "WAS queued from this session". Evidence that only shows
+  // the id has been SEEN here would make that false in two reachable ways.
+
+  it("a FOREIGN completion seen here once does not become 'yours' on re-delivery", () => {
+    // Never queued: no ticket was ever opened for this id. It is delivered and
+    // acked like any other completion.
+    //
+    // HONEST LIMIT: this case passes under BOTH the old "has this party seen the
+    // id" evidence and the ownership evidence that replaced it, so it does not by
+    // itself prove the narrowing was necessary — the memo apparently is not
+    // written for a completion with no ticket. It is kept because the property it
+    // states is the one that matters (acquaintance is not ownership), and because
+    // a future change to when the memo is written would land here first. The case
+    // that DOES discriminate is the cross-conversation reused ticket below.
+    const j = journal();
+    const foreignPid = "ffffffff-0000-4000-8000-000000000001";
+    j.record(TAB, { prompt_id: foreignPid, kind: "executed" }, { conversation: CONVO });
+    const tokens: string[] = [];
+    j.deliverPending(TAB, (_p: unknown, token: string) => {
+      tokens.push(token);
+      return true;
+    });
+    for (const t of tokens) j.ack(t);
+
+    const again = j.correlate(TAB, { prompt_id: foreignPid }, CONVO);
+    expect(again.status).toBe("foreign");
+    expect(
+      (again as { priorHistory?: boolean }).priorHistory,
+      "seen here before, but never queued here — the wording must not claim otherwise",
+    ).toBeFalsy();
+  });
+
+  it("ANOTHER conversation's reused ticket is not our history", () => {
+    // A live ticket for this id exists, is flagged `reused`, and belongs to a
+    // different conversation. Reading `reused` without an ownership test would
+    // tell this session it had queued the run.
+    const j = journal();
+    j.openRun(PID, { tabId: TAB, conversation: "orchestrator::codex" });
+    j.openRun(PID, { tabId: TAB, conversation: "orchestrator::codex" }); // re-queue -> reused
+
+    const ours = j.correlate("wf:workflows/b.json", { prompt_id: PID }, CONVO);
+    expect(ours.status).toBe("foreign");
+    expect(
+      (ours as { priorHistory?: boolean }).priorHistory,
+      "another conversation's run, however it is flagged, is not ours",
+    ).toBeFalsy();
+  });
+
+  it("OUR OWN reused id does report prior history", () => {
+    // The neighbouring positive: same shape, our conversation. The id now stands
+    // for more than one of our runs, which is a real "we cannot tell which".
+    const j = journal();
+    j.openRun(PID, { tabId: TAB, conversation: CONVO });
+    j.openRun(PID, { tabId: TAB, conversation: CONVO });
+
+    const ours = j.correlate(TAB, { prompt_id: PID }, CONVO);
+    expect(ours.status).toBe("foreign");
+    expect((ours as { priorHistory?: boolean }).priorHistory).toBe(true);
+  });
+
+  it("BEHAVIOURAL: the flag survives to the delivered payload", () => {
+    // Not a source check (codex): the property could be correct in the journal
+    // and dropped at the wire boundary, and then nothing changes for the agent.
+    const j = journal();
+    queueDeliverAck(j, TAB, CONVO, PID);
+    for (let i = 0; i < 80; i++) {
+      j.openRun(`later-${i}-0000-4000-8000-00000000${String(i).padStart(4, "0")}`, {
+        tabId: TAB,
+        conversation: CONVO,
+      });
+    }
+    j.record(TAB, { prompt_id: PID, kind: "executed" }, { conversation: CONVO });
+
+    const payloads: Array<Record<string, unknown>> = [];
+    j.deliverPending(TAB, (payload: Record<string, unknown>) => {
+      payloads.push(payload);
+      return true;
+    });
+    const delivered = payloads.find((p) => p.prompt_id === PID);
+    expect(delivered, "the completion must still be delivered").toBeTruthy();
+    expect(delivered?.run_correlation).toBe("foreign");
+    expect(delivered?.run_correlation_prior).toBe(true);
+  });
+
   it("an id with no prompt id at all is unchanged — still unidentified", () => {
     const j = journal();
     expect(j.correlate(TAB, {}, CONVO).status).toBe("unidentified");
