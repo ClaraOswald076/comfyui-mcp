@@ -615,6 +615,99 @@ const MANAGER_LEGACY_UI_HINT =
   "yanwk/comfyui-boot images that flag is hardcoded in the entrypoint). " +
   "See https://comfyui-mcp.artokun.io/docs/troubleshooting";
 
+/**
+ * #1326 — what an install-model failure on legacy Manager is allowed to CLAIM.
+ *
+ * The sentence below used to be appended to every `install-model` failure on 3.x,
+ * unconditionally: "Arbitrary-URL model installs REQUIRE Manager v4+". For the URL
+ * whitelist that is right, and it is the common case. For a security_level refusal, a
+ * 404 URL, a full disk or a Manager bug it is a confident answer to a question nobody
+ * asked — and it sends the reader through a Manager migration that will not fix it.
+ *
+ * The reporter of #1326 saw exactly the ambiguous form: a bare
+ * `ComfyUI-Manager API 500 Internal Server Error for /manager/queue/install_model`,
+ * with our v4 sentence attached. Manager's own response body — the one thing that
+ * would have said which it was — was captured in `details.body` and never shown.
+ *
+ * So: three states, not two (#796). Say WHICH when the evidence decides it, offer the
+ * candidates when it does not, and show Manager's own words either way.
+ */
+function whitelistVerdict(details: unknown): "proven" | "excluded" | "unknown" {
+  const d = details as { status?: unknown; body?: unknown } | undefined;
+  const status = typeof d?.status === "number" ? d.status : undefined;
+  const body = typeof d?.body === "string" ? d.body : "";
+  // A security_level refusal is a DIFFERENT fault with a different fix (a Manager
+  // config setting, not a migration), and explainManagerForbidden already spells it
+  // out. Offering the whitelist beside it would give two causes for one failure.
+  //
+  // Keyed on the marker, not on the bare 403: a proxy or auth gate in front of ComfyUI
+  // also answers 403, and that is not Manager speaking at all.
+  if (status === 403 && /"error"\s*:\s*"security_level"/.test(body)) return "excluded";
+  // Manager 3.x names the model-list check when it rejects one. Only these positively
+  // establish it — anything else stays "unknown" rather than defaulting to the guess.
+  //
+  // Not applied to an HTML page: a proxy error or a framework traceback can contain the
+  // words "model list" without being Manager's rejection, and "proven" is the one branch
+  // that speaks with certainty. Manager answers JSON/plain text here.
+  if (/^\s*<|<html/i.test(body)) return "unknown";
+  if (/model[- _]?list|whitelist|not (?:in|found in) the model list|invalid model/i.test(body))
+    return "proven";
+  return "unknown";
+}
+
+/**
+ * Strip credentials out of text that is about to be shown to a user.
+ *
+ * Redacting only the values from `details.url` is NOT enough here, and getting that
+ * wrong would have leaked a token. `details.url` is the Manager ENDPOINT
+ * (`…/manager/queue/install_model`) — the MODEL url, which is the one carrying a
+ * Hugging Face / CivitAI token, travels in the POST BODY. Manager echoes that url back
+ * when the download fails ("failed fetching <url>"), so the secret arrives through a
+ * path an endpoint-only redaction never sees.
+ *
+ * So every url found in the text has its query VALUES redacted, whatever its origin,
+ * plus a few token shapes that travel outside a query string. Keys are kept: the reader
+ * still needs to see that a token was present.
+ */
+function redactCredentialsForDisplay(text: string, endpointUrl?: string): string {
+  let out = text;
+  const redactUrlValues = (raw: string): void => {
+    let url: URL;
+    try {
+      url = new URL(raw);
+    } catch {
+      return; // not a parseable url — nothing known to redact
+    }
+    for (const value of url.searchParams.values()) {
+      // Short values are structural (page=2, type=vae), not secrets.
+      if (!value || value.length < 12) continue;
+      for (const form of new Set([value, encodeURIComponent(value)])) {
+        out = out.split(form).join("«redacted»");
+      }
+    }
+  };
+  if (endpointUrl) redactUrlValues(endpointUrl);
+  for (const found of text.match(/https?:\/\/[^\s"'<>)\\]+/gi) ?? []) redactUrlValues(found);
+  // Token shapes that are not query values (an Authorization header echoed into a
+  // traceback, a bare token in a message).
+  out = out
+    .replace(/\b(hf_|sk-|ghp_|gho_|github_pat_)[A-Za-z0-9_-]{8,}/g, "«redacted»")
+    .replace(/\b([Bb]earer\s+)[A-Za-z0-9._~+/-]{12,}=*/g, "$1«redacted»");
+  return out;
+}
+
+/** Manager's own response body, bounded and stripped of credentials. This is the
+ *  evidence #1326 lost. */
+function managerBodyExcerpt(details: unknown): string {
+  const d = details as { body?: unknown; url?: unknown } | undefined;
+  const raw = typeof d?.body === "string" ? d.body.trim() : "";
+  if (!raw) return "";
+  const body = redactCredentialsForDisplay(raw, typeof d?.url === "string" ? d.url : undefined);
+  const MAX = 600;
+  const clipped = body.length > MAX ? `${body.slice(0, MAX)}… (truncated)` : body;
+  return ` ComfyUI-Manager said: ${clipped}`;
+}
+
 /** Wrap a legacy-Manager failure with the upgrade guidance (keeps details). */
 function annotateLegacyError(
   err: unknown,
@@ -622,15 +715,47 @@ function annotateLegacyError(
   hint: string = MANAGER_UPGRADE_HINT,
 ): NodeManagementError {
   const base = err instanceof Error ? err.message : String(err);
-  const extra =
-    kind === "install-model"
-      ? " Arbitrary-URL model installs REQUIRE Manager v4+ (3.x only accepts whitelisted catalog models)."
-      : "";
-  return new NodeManagementError(
-    `${base}${extra}\n${hint}`,
-    err instanceof NodeManagementError ? err.details : undefined,
-  );
+  const details = err instanceof NodeManagementError ? err.details : undefined;
+  let extra = "";
+  if (kind === "install-model") {
+    switch (whitelistVerdict(details)) {
+      case "proven":
+        extra =
+          " Arbitrary-URL model installs REQUIRE Manager v4+ (3.x only accepts whitelisted catalog models).";
+        break;
+      case "excluded":
+        // Deliberately silent: the 403 explanation is the answer, and adding the
+        // whitelist sentence beside it would offer a second, wrong cause.
+        break;
+      case "unknown":
+        // Still LEADS with the whitelist and keeps the upgrade path: on 3.x that is the
+        // usual cause and the migration below is the fix, which is real value (#553) and
+        // must not be hedged away. What changes is only the certainty — Manager did not
+        // say so here, and three other faults fail identically. Naming them costs a
+        // sentence; omitting them cost the reporter of #1326 a diagnosis.
+        extra =
+          " On Manager 3.x the usual cause is its model-list whitelist: arbitrary-URL model" +
+          " installs REQUIRE Manager v4+ (3.x only accepts whitelisted catalog models), and" +
+          " the recovery below is that upgrade. Manager did NOT say so explicitly here," +
+          " though — a security_level refusal, an unreachable URL, or no space on the host" +
+          " fail the same way. If the upgrade does not resolve it, the ComfyUI server log" +
+          " names which.";
+        break;
+    }
+    extra += managerBodyExcerpt(details);
+  }
+  return new NodeManagementError(`${base}${extra}\n${hint}`, details);
 }
+
+/** #1326 — the cause-attribution above is the whole user-visible product of a failed
+ *  install-model, and it is reached only through a live Manager. Exposed so it can be
+ *  asserted against real error shapes rather than through a mocked HTTP stack. */
+export const __managerCauseTestHooks = {
+  annotateLegacyError,
+  whitelistVerdict,
+  managerBodyExcerpt,
+  NodeManagementError,
+};
 
 /**
  * Translate one unified-task call into the legacy per-operation route + body.
