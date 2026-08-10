@@ -47,7 +47,10 @@ import {
   isLocalMode,
 } from "../config.js";
 import { parsePyproject } from "./node-authoring.js";
-import { parseBaseDirFromArgv } from "./output-dir.js";
+import {
+  hasUnresolvableRelativeBaseDirFlag,
+  parseBaseDirFromArgv,
+} from "./output-dir.js";
 import {
   getLiveServerSnapshot,
   resolveLiveServerRoot,
@@ -107,6 +110,16 @@ export interface PanelBaseResolution {
    * ComfyUI is already running (#890/#916).
    */
   liveRootUnderivable?: boolean;
+  /**
+   * True when the server reported a `--base-directory` that is PRESENT but
+   * UNRESOLVABLE (relative, with no absolute cwd), so NO candidate was tried.
+   *
+   * Carried separately because the remedy differs from every other underivable
+   * case: relaunching with an absolute `main.py` would NOT fix this one — the
+   * flag, not the script path, is what cannot be resolved. Reporting the generic
+   * remedy here would be the #916 defect pointed at a new branch.
+   */
+  baseDirUnresolvable?: boolean;
 }
 
 /**
@@ -157,53 +170,87 @@ export async function resolvePanelBase(): Promise<PanelBaseResolution> {
 
   const configured = resolveEffectiveComfyUIBase();
   const snapshot = await getLiveServerSnapshot();
-  if (snapshot.reachable) {
+  // A `--base-directory` that is PRESENT but UNRESOLVABLE (relative, and the
+  // server reported no absolute cwd) poisons EVERY derivation, so no candidate
+  // may be tried at all (codex gate, #1133). ComfyUI derives custom_nodes from
+  // `<server cwd>/<flag>`; without the cwd that path cannot be computed — but
+  // the install root and the OS-observed process root both still resolve, and
+  // both name a tree the flag has already overridden. Adopting either would
+  // hand a DESTRUCTIVE swap a confidently-wrong directory. Fail closed.
+  //
+  // This also closes the same hole on the pre-existing `live-argv-root` tier,
+  // where an ABSOLUTE main.py alongside an unresolvable relative
+  // `--base-directory` already resolved to the install root.
+  const baseDirPoisoned = hasUnresolvableRelativeBaseDirFlag(snapshot.argv, snapshot.cwd);
+  if (snapshot.reachable && !baseDirPoisoned) {
+    // Only accept a live base we can PROVE holds custom_nodes. A root without
+    // one is not the tree the panel lives in, and pointing the installer at it
+    // would manufacture a false "not installed".
+    const accept = (
+      candidate: string | undefined,
+      source: PanelBaseSource,
+    ): PanelBaseResolution | undefined =>
+      candidate && hasCustomNodes(candidate)
+        ? {
+            base: candidate,
+            source,
+            overriddenConfiguredBase:
+              configured && configured !== candidate ? configured : undefined,
+          }
+        : undefined;
+
     // `--base-directory` FIRST: when ComfyUI is launched with it, that flag —
     // not the main.py location — is the root it derives custom_nodes/ from.
-    // The install root goes through the ONE canonical resolver (#1133). Parsing
-    // argv here directly — as this did — silently drops ComfyUI Desktop and the
-    // Windows portable bundle, which report a RELATIVE `ComfyUI\main.py` with no
-    // cwd: `liveRootFromArgv` returns undefined for that shape, so a Desktop
-    // install had NO live-derived candidate at all and every destructive panel
-    // operation refused on an uncorroborated configured path. `resolveLiveServerRoot`
-    // adds the tier that exists precisely for it — re-anchoring the relative
-    // main.py on the interpreter the OS reports for the process on our port.
+    const fromFlag = accept(
+      parseBaseDirFromArgv(snapshot.argv, snapshot.cwd),
+      "live-base-directory",
+    );
+    if (fromFlag) return fromFlag;
+
+    // Only NOW pay for the install-root derivation. `resolveLiveServerRoot` is
+    // SYNCHRONOUS and its second tier shells out to the process table
+    // (netstat + WMI on Windows), which blocks the event loop for ~1.3s on a
+    // healthy machine and far longer on its timeout path — so it must never run
+    // when `--base-directory` was going to win anyway (codex gate, #1133).
     //
-    // This does NOT widen what counts as corroboration: the anchor is accepted
+    // It goes through the ONE canonical resolver rather than re-parsing argv
+    // here, which is what silently dropped ComfyUI Desktop and the Windows
+    // portable bundle: they report a RELATIVE `ComfyUI\main.py` with no cwd, so
+    // `liveRootFromArgv` yields nothing and a Desktop install had NO
+    // live-derived candidate at all — every destructive panel operation refused
+    // on an uncorroborated configured path. The canonical resolver adds the tier
+    // that exists precisely for that shape, re-anchoring the relative main.py on
+    // the interpreter the OS reports for the process on our port.
+    //
+    // That does not widen what counts as corroboration: the anchor is accepted
     // only when the resulting directory holds `main.py` AND the observed
-    // interpreter belongs to that install, and `--base-directory` still wins
-    // ahead of it, so a genuinely split install resolves exactly as before.
-    // Unresolved still yields no candidate, and the gate still refuses.
+    // interpreter belongs to that install. Unresolved still yields no candidate,
+    // and the gate still refuses.
     const live = resolveLiveServerRoot(snapshot.argv, snapshot.cwd, { remote: false });
-    const candidates: Array<[string | undefined, PanelBaseSource]> = [
-      [parseBaseDirFromArgv(snapshot.argv, snapshot.cwd), "live-base-directory"],
-      [
-        live.root,
-        live.source === "observed-process" ? "live-observed-root" : "live-argv-root",
-      ],
-    ];
-    for (const [candidate, source] of candidates) {
-      // Only accept a live base we can PROVE holds custom_nodes. An argv root
-      // without one is not the tree the panel lives in, and pointing the
-      // installer at it would manufacture a false "not installed".
-      if (!candidate || !hasCustomNodes(candidate)) continue;
-      return {
-        base: candidate,
-        source,
-        overriddenConfiguredBase:
-          configured && configured !== candidate ? configured : undefined,
-      };
-    }
+    const fromLive = accept(
+      live.root,
+      live.source === "observed-process" ? "live-observed-root" : "live-argv-root",
+    );
+    if (fromLive) return fromLive;
   }
 
   const liveProbeFailed = !snapshot.reachable;
   // Reached but nothing derivable: tell callers apart from "could not ask" —
   // the remedy for each is different (#916).
   const liveRootUnderivable = snapshot.reachable;
+  // …and apart again from "reached, but a flag we cannot resolve overrides
+  // everything we could derive", whose remedy is different a third time.
+  const baseDirUnresolvable = snapshot.reachable && baseDirPoisoned;
   if (configured) {
-    return { base: configured, source: "configured", liveProbeFailed, liveRootUnderivable };
+    return {
+      base: configured,
+      source: "configured",
+      liveProbeFailed,
+      liveRootUnderivable,
+      baseDirUnresolvable,
+    };
   }
-  return { source: "none", liveProbeFailed, liveRootUnderivable };
+  return { source: "none", liveProbeFailed, liveRootUnderivable, baseDirUnresolvable };
 }
 
 /*

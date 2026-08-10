@@ -39,7 +39,7 @@
 // instead of being refused.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -65,8 +65,8 @@ const workspace = vi.hoisted(() => ({
   /** What the OS-observed process tier resolves to. undefined ⇒ the process
    *  could not be identified, or the anchored dir held no main.py. */
   observedRoot: undefined as string | undefined,
-  /** A `--base-directory` the mocked argv parser should report. */
-  baseDirFlag: undefined as string | undefined,
+  /** Raw `--base-directory` value appended to the reported argv (may be relative). */
+  baseDirRaw: undefined as string | undefined,
 }));
 
 // Stand-in faithful to the real derivation's contract: an ABSOLUTE main.py
@@ -84,26 +84,32 @@ vi.mock("../../services/workspace-env.js", () => ({
   resolveLocalWorkspaceBase: () => workspace.base,
   liveRootFromArgv: (argv: string[] | undefined) => argvRoot(argv),
   // The real two-tier contract: argv first, then the OS-observed process anchor.
+  //
+  // The observed tier reproduces production's on-disk precondition rather than
+  // trusting the injected value: `anchorRelDirOnInterpreter` returns a root ONLY
+  // when it actually holds `main.py`. Without that, a fixture could "anchor" a
+  // directory production would have rejected, and the suite would be asserting
+  // about a state the code can never reach.
   resolveLiveServerRoot: (argv: string[] | undefined) => {
     const fromArgv = argvRoot(argv);
     if (fromArgv) return { root: fromArgv, source: "argv" };
-    if (workspace.observedRoot) {
+    if (workspace.observedRoot && existsSync(join(workspace.observedRoot, "main.py"))) {
       return { root: workspace.observedRoot, source: "observed-process" };
     }
     return { source: "unresolved" };
   },
   getLiveServerSnapshot: async () => ({
     reachable: workspace.reachable,
-    argv: workspace.liveArgv,
+    // `--base-directory` is appended to the REAL argv rather than stubbing
+    // output-dir, so production's own `parseBaseDirFromArgv` and
+    // `hasUnresolvableRelativeBaseDirFlag` do the parsing — a stub there could
+    // silently disagree with the code under test about what "unresolvable" means.
+    argv: workspace.liveArgv && [
+      ...workspace.liveArgv,
+      ...(workspace.baseDirRaw ? ["--base-directory", workspace.baseDirRaw] : []),
+    ],
     cwd: undefined, // Desktop reports none — the whole point
   }),
-}));
-
-// `--base-directory` parsing lives in output-dir; stub only that one export so
-// the split-install precedence can be exercised without a real argv parser.
-vi.mock("../../services/output-dir.js", async (importOriginal) => ({
-  ...(await importOriginal<object>()),
-  parseBaseDirFromArgv: () => workspace.baseDirFlag,
 }));
 
 import {
@@ -149,11 +155,13 @@ beforeEach(() => {
   configured = mkdtempSync(join(tmpdir(), "cmcp-desktop-configured-"));
   mkdirSync(join(root, "custom_nodes"), { recursive: true });
   mkdirSync(join(configured, "custom_nodes"), { recursive: true });
+  // The observed tier only ever anchors a dir that really holds the entrypoint.
+  writeFileSync(join(root, "main.py"), "# ComfyUI\n");
   workspace.base = configured;
   workspace.liveArgv = undefined;
   workspace.reachable = false;
   workspace.observedRoot = undefined;
-  workspace.baseDirFlag = undefined;
+  workspace.baseDirRaw = undefined;
   generation.value = 0;
   __resetPanelBaseCache();
   savedPin = process.env.COMFYUI_MCP_PANEL_PIN;
@@ -231,7 +239,7 @@ describe("the guard is not relaxed (#1133)", () => {
       workspace.reachable = true;
       workspace.liveArgv = DESKTOP_ARGV;
       workspace.observedRoot = root;
-      workspace.baseDirFlag = splitBase;
+      workspace.baseDirRaw = splitBase;
 
       const resolution = await primePanelBase({ force: true });
 
@@ -247,10 +255,11 @@ describe("the guard is not relaxed (#1133)", () => {
     // The candidate is still required to prove it holds the tree the panel lives
     // in. A bare interpreter anchor that happens to resolve is not enough.
     const bare = mkdtempSync(join(tmpdir(), "cmcp-desktop-bare-"));
+    writeFileSync(join(bare, "main.py"), "# ComfyUI\n"); // anchors, but…
     try {
       workspace.reachable = true;
       workspace.liveArgv = DESKTOP_ARGV;
-      workspace.observedRoot = bare; // no custom_nodes inside
+      workspace.observedRoot = bare; // …no custom_nodes inside
 
       const resolution = await primePanelBase({ force: true });
 
@@ -259,6 +268,66 @@ describe("the guard is not relaxed (#1133)", () => {
       expect(isLiveDerivedBase(resolution)).toBe(false);
     } finally {
       rmSync(bare, { recursive: true, force: true });
+    }
+  });
+
+  it("a PRESENT but unresolvable --base-directory poisons EVERY candidate", async () => {
+    // The hole codex found. `parseBaseDirFromArgv` returns undefined for a
+    // RELATIVE --base-directory with no cwd — it cannot be resolved — which used
+    // to mean the flag simply "wasn't there", letting the next candidate win.
+    // But ComfyUI derives custom_nodes from `<cwd>/<flag>`, so the observed root
+    // is a tree that flag has already overridden. Adopting it would hand a
+    // destructive swap a confidently-WRONG directory.
+    workspace.reachable = true;
+    workspace.liveArgv = DESKTOP_ARGV;
+    workspace.observedRoot = root; // would otherwise anchor and win
+    workspace.baseDirRaw = "ComfyUI-Data"; // relative, and no cwd is reported
+
+    const resolution = await primePanelBase({ force: true });
+
+    expect(resolution.source).toBe("configured");
+    expect(resolution.base).not.toBe(root);
+    expect(isLiveDerivedBase(resolution)).toBe(false);
+    expect(resolution.baseDirUnresolvable).toBe(true);
+  });
+
+  it("the poisoned case names the flag, not the dead absolute-main.py remedy", async () => {
+    // Reporting "relaunch with an ABSOLUTE path to main.py" here would be the
+    // #916 defect pointed at a new branch: the script path is not what failed
+    // to resolve. The flag is.
+    writePanelPack(configured, "0.11.38");
+    workspace.reachable = true;
+    workspace.liveArgv = DESKTOP_ARGV;
+    workspace.observedRoot = root;
+    workspace.baseDirRaw = "ComfyUI-Data";
+
+    const err = await runPanelActionInner("update", defaultDeps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    const msg = String(err?.message);
+
+    expect(msg).toMatch(/--base-directory we cannot resolve/);
+    expect(msg).toMatch(/ABSOLUTE --base-directory/);
+    expect(msg).not.toMatch(/ABSOLUTE path to main\.py/);
+  });
+
+  it("an ABSOLUTE --base-directory is not poisoned — it still resolves and wins", async () => {
+    // The guard must fire on UNRESOLVABLE, not on "present". An absolute flag
+    // is exactly the split install the gate is built to protect.
+    const splitBase = mkdtempSync(join(tmpdir(), "cmcp-desktop-abs-"));
+    mkdirSync(join(splitBase, "custom_nodes"), { recursive: true });
+    try {
+      workspace.reachable = true;
+      workspace.liveArgv = DESKTOP_ARGV;
+      workspace.observedRoot = root;
+      workspace.baseDirRaw = splitBase; // absolute
+
+      const resolution = await primePanelBase({ force: true });
+
+      expect(resolution.source).toBe("live-base-directory");
+      expect(resolution.base).toBe(splitBase);
+      expect(resolution.baseDirUnresolvable).toBeFalsy();
+    } finally {
+      rmSync(splitBase, { recursive: true, force: true });
     }
   });
 
