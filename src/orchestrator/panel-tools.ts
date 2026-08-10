@@ -5420,7 +5420,22 @@ const nodeSize = () =>
  * confirmation"), never silently treated as a decline. Any non-timeout failure
  * (no panel, transport error) maps to "no" so the destructive op is SKIPPED.
  */
-export type ConfirmOutcome = "yes" | "no" | "timeout";
+/**
+ * #1332 — FOUR outcomes, because there are four facts.
+ *
+ * `no` used to carry two of them: the user said no, AND the question could not be put
+ * to them at all (no panel, dropped transport). Skipping the destructive operation is
+ * correct for both — that part does not change — but the SENTENCE built on it is not:
+ * `panel_restart_comfyui` answered "Cancelled — ComfyUI was not restarted" to a
+ * reporter whose ComfyUI had demonstrably restarted, because the restart itself dropped
+ * the socket the answer had to come back on.
+ *
+ * `unreachable` is that second fact, separated. It is deliberately NOT a failure state:
+ * every caller already branches `!== "yes"`, so the safe path is preserved by
+ * construction, and only what we CLAIM about it changes (#796's defect class — "could
+ * not determine X" reported as "determined X is not the case").
+ */
+export type ConfirmOutcome = "yes" | "no" | "timeout" | "unreachable";
 
 /**
  * The execution context every tool handler receives. Both transports (Anthropic
@@ -6003,14 +6018,16 @@ export function makePanelToolCtx(
     } catch (err) {
       // Only a card-reply TIMEOUT is recoverable/honest-as-timeout: poll the late
       // buffer, then report "timeout" if still unanswered. Any other error (no
-      // panel, transport failure) → "no" so the destructive op is SKIPPED, exactly
-      // as the previous catch-all did.
+      // panel, transport failure) still SKIPS the destructive op — but it is reported
+      // as `unreachable`, not `no` (#1332). The user did not decline; we never got to
+      // ask them, and a caller that says "cancelled" on this is describing a decision
+      // nobody made.
       if (isReplyTimeoutError(err)) {
         const late = await pollLateAskReply(bridge, askId, timing, budgetEnd);
         if (late !== undefined) return isAffirmative(late) ? "yes" : "no";
         return "timeout";
       }
-      return "no";
+      return "unreachable";
     }
   };
 
@@ -7805,6 +7822,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           return ok(
             "Timed out waiting for your confirmation, so I left the canvas as-is. " +
               "Tell me to clear it again when you're ready.",
+          );
+        }
+        if (decision === "unreachable") {
+          // #1332 — the canvas is still untouched, which is the part that matters, but
+          // the user never saw the question. Saying "cancelled" would credit them with
+          // a decision they were never offered.
+          return ok(
+            "The canvas was left as-is — but NOT because it was declined: the panel could " +
+              "not be reached to ask, so the question never appeared. Nothing was cleared. " +
+              "Check the panel tab is connected, then ask again.",
           );
         }
         if (decision !== "yes") {
@@ -10519,7 +10546,28 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                     "unreachable but is healthy again.",
             );
           }
-          return ok("Cancelled — ComfyUI was not restarted.");
+          // #1332 — the reporter's exact string, and it was FALSE. They accepted the
+          // restart, ComfyUI restarted (a fresh startup in the server log), and this
+          // said it had not — because the restart dropped the socket the answer had to
+          // travel back on, and a transport failure used to arrive here as "no".
+          //
+          // The probes above already refuse to claim "not restarted" while the server
+          // is DOWN. This is the remaining case: the server is HEALTHY, which is
+          // equally true of "nothing happened" and of "it restarted and came back".
+          // With an explicit decline we know which; without one we do not, and the
+          // sentence must stop asserting it.
+          return ok(
+            decision === "unreachable"
+              ? "This call did NOT dispatch a restart. Whether ComfyUI restarted for some " +
+                  "other reason cannot be told from here: the panel could not be reached to " +
+                  "ask for confirmation — the question never appeared — so no decision was " +
+                  "made either way, and the server is reachable now, which looks the same " +
+                  "whether it never went down or went down and came back. If you asked for a " +
+                  "restart and one has already happened, this is that transport loss, not a " +
+                  "cancellation. Check the ComfyUI log for a fresh startup line before " +
+                  "restarting again."
+              : "Cancelled — ComfyUI was not restarted.",
+          );
         }
         // Heal an orphaned session onto the live tab FIRST, then bind the reboot dispatch
         // to that ONE tab id (no await between capture and dispatch, so JS run-to-
