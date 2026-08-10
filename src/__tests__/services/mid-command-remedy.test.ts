@@ -35,17 +35,44 @@ describe("the disconnect remedy fits what was interrupted (#952)", () => {
   it("…and says the thing that is actually true of it", () => {
     const msg = midCommandDisconnectMessage(ASK);
     expect(msg).toMatch(/card may already be on screen/);
-    // The fact from the panel trace: a retry is not merely unverifiable, it is
-    // known to duplicate after a reconnect.
-    expect(msg).toMatch(/paints a SECOND card/);
-    expect(msg).toMatch(/cannot be withdrawn/);
+    // The fact from the panel trace: a retry is not merely unverifiable, it
+    // duplicates after a reconnect because suppression is keyed to the dead
+    // socket. Stated as the consequence the user sees.
+    expect(msg).toMatch(/retry\s+suppression is keyed to the socket that dropped/);
+    expect(msg).toMatch(/user may see two/);
   });
 
-  it("names what the caller CAN do, since it forbids the obvious move", () => {
+  it("does NOT promise the answer will arrive — it will not (codex)", () => {
+    // An earlier draft said "if the user answers the card already up, the answer
+    // still arrives". Checked against the panel: `redactSensitiveReply` replaces
+    // an ask_user/request_secret reply that cannot cross the dropped connection
+    // with a payload-free failure, deliberately, and tells the caller to ask
+    // again on the current connection. Waiting is not a recovery, and advising it
+    // would have parked the agent forever.
+    const msg = midCommandDisconnectMessage(ASK);
+    expect(msg).toMatch(/will NOT reach you/);
+    expect(msg).not.toMatch(/Prefer to wait/);
+    expect(msg).not.toMatch(/still arrives/);
+  });
+
+  it("names a route that works, since it forbids the obvious move", () => {
     // A refusal with no alternative is how an agent ends up retrying anyway.
     const msg = midCommandDisconnectMessage(ASK);
-    expect(msg).toMatch(/Prefer to wait/);
-    expect(msg).toMatch(/ask the question directly in conversation/);
+    expect(msg).toMatch(/Re-issue the question on the current connection/);
+    expect(msg).toMatch(/ask it in conversation/);
+    // …and warns about the consequence the panel trace established.
+    expect(msg).toMatch(/user may see two/);
+  });
+
+  it("a SECRET is never routed through the conversation (codex)", () => {
+    // The card exists so the value reaches the panel through a masked input,
+    // unseen by the agent and unrecorded in chat. "Just ask them for it" would
+    // defeat exactly that, and this message is read by an agent that will act
+    // on it.
+    const msg = midCommandDisconnectMessage({ short: "wf:1", cmd: "request_secret" });
+    expect(msg).toMatch(/Re-issue panel_request_secret on the current connection/);
+    expect(msg).toMatch(/never ask the user to paste a secret into the conversation/);
+    expect(msg).not.toMatch(/ask it in conversation/);
   });
 
   it("does NOT invent a recovery that does not exist", () => {
@@ -62,6 +89,18 @@ describe("the disconnect remedy fits what was interrupted (#952)", () => {
     expect(midCommandDisconnectMessage({ short: "wf:1", cmd: "request_secret" })).toMatch(
       /card may already be on screen/,
     );
+  });
+
+  it("the two interactive commands differ ONLY in the route they are given", () => {
+    // Same facts, different safe action. If these ever collapse to one string,
+    // one of them is being given the other's advice.
+    const ask = midCommandDisconnectMessage(ASK);
+    const secret = midCommandDisconnectMessage({ short: ASK.short, cmd: "request_secret" });
+    expect(ask).not.toBe(secret);
+    for (const m of [ask, secret]) {
+      expect(m).toMatch(/will NOT reach you/);
+      expect(m).toMatch(/user may see two/);
+    }
   });
 
   it("every OTHER command keeps the queue/output check — it is real evidence there", () => {

@@ -38,22 +38,38 @@ export function isInteractiveCommand(cmd: string): boolean {
  * Two kinds, because they have different evidence and different costs:
  *
  *  • an INTERACTIVE card — nothing in the tool surface can observe it, and a
- *    retry is known to duplicate it after a reconnect. Say both, and say what
- *    the caller can do instead: wait for the answer to arrive, or ask the user
- *    directly in conversation.
+ *    the answer to it will NEVER arrive (the panel refuses to replay a reply of
+ *    this kind across a reconnect), and a retry duplicates the card. Say all
+ *    three, and give the route that works — which differs for a secret.
  *  • anything else — the existing queue/output check, which is real evidence for
  *    a run or a write.
  */
 export function midCommandVerifyClause(cmd: string): string {
   if (isInteractiveCommand(cmd)) {
+    // WAITING IS NOT A RECOVERY, and an earlier draft of this said it was
+    // (codex). Checked against the panel: `redactSensitiveReply` replaces an
+    // `ask_user`/`request_secret` reply that cannot cross the dropped connection
+    // with a payload-free failure — deliberately, because the content is the
+    // user's own input and a replay could land on a different orchestrator. Its
+    // own words are "ask again on the current connection". So the answer to the
+    // card already on screen will NOT reach you, however long you wait.
+    const reissue =
+      cmd === "request_secret"
+        ? // NEVER route a secret through the conversation (codex). The whole
+          // point of this card is a masked input the agent never sees and that
+          // is never written to chat history; "just ask them for it" would
+          // defeat the guarantee the tool makes.
+          `Re-issue panel_request_secret on the current connection — that is what the panel itself ` +
+          `advises, and it is the ONLY safe route: never ask the user to paste a secret into the ` +
+          `conversation, where you would see it and it would be recorded.`
+        : `Re-issue the question on the current connection, or simply ask it in conversation.`;
     return (
-      `The panel may already be SHOWING this card to the user. Nothing in the tool surface can ` +
-      `check that — there is no pending-card query — and re-issuing it is NOT safe here: the ` +
-      `panel's duplicate-suppression is keyed to the socket that dropped, so a retry after a ` +
-      `reconnect is treated as a new command and paints a SECOND card, which cannot be withdrawn. ` +
-      `Prefer to wait: if the user answers the card that is already up, the answer still arrives. ` +
-      `If you cannot wait, ask the question directly in conversation rather than re-issuing this ` +
-      `tool, and do not assume the card was never shown.`
+      `The panel may already be SHOWING this card. Nothing in the tool surface can check that — ` +
+      `there is no pending-card query — and the answer to it will NOT reach you: the panel ` +
+      `deliberately does not replay a reply of this kind across a reconnect (nothing was applied ` +
+      `and nothing was stored). ${reissue} Expect the stale card to remain on screen: retry ` +
+      `suppression is keyed to the socket that dropped, so this counts as a new command and the ` +
+      `user may see two. Tell them which one to answer.`
     );
   }
   return (
