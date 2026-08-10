@@ -18,6 +18,7 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { logger } from "../utils/logger.js";
+import { midCommandDisconnectMessage } from "./mid-command-remedy.js";
 import {
   describePanelUpdateRecovery,
   type PanelBundleSkew,
@@ -4077,7 +4078,10 @@ export class UiBridge {
       ctx.reject(
         markDispatched(
           new Error(
-            `panel tab ${short} disconnected mid-command ("${cmd}") — OUTCOME UNKNOWN: the command was already sent, so the panel may have applied it (for a run, ComfyUI may already be rendering). Verify before retrying (e.g. check queue action:"list" / get_image (action:"list_outputs")) instead of re-issuing it blindly.`,
+            // #952 — the remedy depends on WHAT was interrupted. An interactive
+            // card cannot be checked with queue/get_image, and a retry after a
+            // reconnect duplicates it in front of a human.
+            midCommandDisconnectMessage({ short, cmd }),
           ),
           true,
         ),
