@@ -1616,18 +1616,22 @@ function argvHasRelativePathArg(argv: string[]): boolean {
     }
     // The token immediately after a path-valued flag is ITS VALUE, whatever it
     // looks like — `--output-directory -` names a directory called `-`, and
-    // treating it as the next flag is how that slips through (codex round 2).
-    if (pendingPathFlag) {
+    // treating it as the next flag is how that slipped through (codex round 2).
+    // A token starting with `--` is the exception: no ComfyUI path flag takes a
+    // `--`-prefixed value, so that is the NEXT FLAG and the previous one was a
+    // boolean we misread.
+    if (pendingPathFlag && !raw.startsWith("--")) {
       pendingPathFlag = false;
       if (!isAbsolutePath(raw)) return true;
       continue;
     }
+    pendingPathFlag = false;
     if (raw.startsWith("-")) {
       // `--flag=value` carries its value INSIDE the token.
       const eq = raw.indexOf("=");
       const name = eq >= 0 ? raw.slice(0, eq) : raw;
       const attached = eq >= 0 ? raw.slice(eq + 1) : undefined;
-      if (!PATH_VALUED_FLAG.test(name)) continue; // --port, --enable-manager, …
+      if (!KNOWN_PATH_FLAG.test(name)) continue; // --port, --cache-none, …
       if (attached === undefined) {
         pendingPathFlag = true; // its value is the next token
         continue;
@@ -1635,8 +1639,9 @@ function argvHasRelativePathArg(argv: string[]): boolean {
       if (attached && !isAbsolutePath(attached)) return true;
       continue;
     }
-    // A bare positional. Only a path-SHAPED one is a concern; a stray value that
-    // is not a path cannot be re-resolved into something else.
+    // Any other token: only a path-SHAPED one is a concern. A stray value that is
+    // not a path (`8188` after `--port`, `10` after `--cache-lru`) cannot be
+    // re-resolved into something else by a different cwd.
     if (raw === "." || raw === ".." || /[\\/]/.test(raw)) {
       if (!isAbsolutePath(raw)) return true;
     }
@@ -1647,24 +1652,29 @@ function argvHasRelativePathArg(argv: string[]): boolean {
 }
 
 /**
- * Flags whose value is a PATH, matched on the flag NAME rather than on what the
- * value looks like (codex round 2).
+ * ComfyUI's flags whose value is a PATH, matched on the flag NAME rather than on
+ * what the value looks like (codex round 2).
  *
  * Judging the value was the wrong instinct and bypassable three ways: `auto`,
  * `8188` and `-` are all perfectly legal directory names, so an allowlist of
  * "values that cannot be paths" cannot exist. The flag name is the part whose
- * vocabulary is knowable — ComfyUI's own `--input-directory`, `--output-directory`,
- * `--base-directory`, `--models-directory`, `--extra-model-paths-config`,
- * `--temp-directory`, `--user-directory`, `--log-file` — and the pattern is
- * deliberately broad so an unfamiliar path flag is treated as one rather than
- * waved through.
+ * vocabulary is knowable.
  *
- * Erring broad costs a refusal (the manual restart the user already has today);
- * erring narrow relaunches a server into a directory where its own arguments
- * point somewhere else.
+ * ENUMERATED, not pattern-matched. A broad `/dir|path|cache|log|…/` substring
+ * test is over-broad in the direction that BREAKS the fix: `--cache-none` and
+ * `--log-stdout` are BOOLEAN flags that match it, so the next token gets eaten as
+ * their "value" and a perfectly ordinary launch is refused. `--cache-none` is in
+ * this issue's own original report, so the heuristic would have refused the very
+ * argv it exists to support.
+ *
+ * A path flag missing from this list degrades to the positional check below —
+ * blocked when the value is path-SHAPED, allowed when it is not. That residual
+ * (an unknown path flag carrying a relative value that looks like nothing,
+ * e.g. `--future-dir auto`, on a symlinked launcher) is narrower than the
+ * blanket refusal it replaces, and is stated rather than hidden.
  */
-const PATH_VALUED_FLAG =
-  /(dir|directory|path|paths|file|config|folder|cache|log|output|input|models?|workspace|checkpoint)/i;
+const KNOWN_PATH_FLAG =
+  /^--(base|input|output|temp|user|models|custom-nodes|front-end-root)-director(y|ies)$|^--(models-dir|extra-model-paths-config|tls-keyfile|tls-certfile|log-file|directml)$/i;
 
 /** Absolute on either host convention — POSIX, Windows drive, or UNC. */
 function isAbsolutePath(p: string): boolean {

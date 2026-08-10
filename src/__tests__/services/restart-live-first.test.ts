@@ -660,6 +660,51 @@ describe("restart_comfyui — live-first script resolution (#476, #426)", () => 
     killSpy.mockRestore();
   });
 
+  it.each([
+    ["a BOOLEAN flag that merely reads path-ish", ["--cache-none", "--port", "8188"]],
+    ["a counted flag whose value is not a path", ["--cache-lru", "10"]],
+    ["a boolean flag before a path flag", ["--log-stdout", "--port", "8188"]],
+  ])(
+    "WINDOWS: %s does NOT block the anchor — the guard must not refuse ordinary launches (#535)",
+    async (_label, extra) => {
+      // The over-broad direction, and the one that would quietly un-fix this issue.
+      // `--cache-none` and `--log-stdout` are BOOLEAN; a substring test on
+      // dir|cache|log treats them as path-valued, eats the next token as their
+      // "value", and refuses. `--cache-none` is in this issue's ORIGINAL report.
+      const LIVE_CWD = resolve("bundle-bool");
+      const LIVE_MAIN = join(LIVE_CWD, "ComfyUI", "main.py");
+      mockResolveBase.mockReturnValue(undefined);
+      mockLiveRootFromArgv.mockReturnValue(undefined);
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: [join("ComfyUI", "main.py"), ...extra] },
+      });
+      mockExistsSync.mockImplementation((p: string) => {
+        const s = String(p);
+        return s === ABS_PYTHON || s === LIVE_MAIN;
+      });
+      __processControlTestHooks.setLiveCwdResolver(() => undefined);
+      mockResolveLiveServerRoot.mockReturnValue({
+        source: "observed-process",
+        anchorDir: LIVE_CWD,
+        observedPid: 4321,
+      });
+      mockLivePortThenFree();
+      mockSpawn.mockImplementation(() => new FakeChild());
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => ({ ok: true }) as Response),
+      );
+      const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+      const result = await restartComfyUI();
+
+      expect(result.message).not.toMatch(/refusing to restart/i);
+      expect(mockSpawn.mock.calls[0][1][0]).toBe(LIVE_MAIN);
+
+      killSpy.mockRestore();
+    },
+  );
+
   it("an UNRESOLVED observation changes nothing — the pre-#535 refusal stands (#535)", async () => {
     // The tri-state discipline: "could not observe" is not "observed something
     // usable". This is the branch that must never become a success.
