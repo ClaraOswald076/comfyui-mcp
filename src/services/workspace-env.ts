@@ -643,6 +643,24 @@ export interface LiveServerRootResolution {
   relDir?: string;
   /** The interpreter the OS reports for the process on our port, when observed. */
   observedPython?: string;
+  /**
+   * The directory `relDir` was resolved AGAINST to produce `root` — i.e. the
+   * working directory the running server must have had for its relative
+   * `main.py` to name that install (`observed-process` only).
+   *
+   * This is the WINDOWS equivalent of `/proc/<pid>/cwd` (#535). `resolveLiveProcessCwd`
+   * returns undefined on Windows, so the restart path's live-cwd anchor could never
+   * fire there and a relative launch script was refused outright. Recovering the
+   * anchor directory here reconstructs the same fact from the OS process
+   * observation instead of from procfs.
+   *
+   * Only meaningful with `observedPid`: it describes THAT process, and a caller
+   * about to stop a server must confirm it is the same one before trusting it.
+   */
+  anchorDir?: string;
+  /** The PID the observation was made against, so a caller can confirm the
+   *  anchor describes the very process it is acting on (#535). */
+  observedPid?: number;
 }
 
 /** How far up from the observed interpreter we look for the live install root.
@@ -715,14 +733,23 @@ function interpreterBelongsToInstall(python: string, base: string, root: string)
  * interpreter is positioned inside that install (interpreterBelongsToInstall), so
  * an unrelated `main.py` further up the filesystem can never be adopted. Returns
  * undefined when nothing on the bounded path qualifies.
+ *
+ * Returns the accepted install root together with the ancestor it was resolved
+ * AGAINST. That ancestor is the working directory the server must have had for its
+ * relative `main.py` to name this install — the fact `/proc/<pid>/cwd` supplies on
+ * Linux and nothing supplied on Windows (#535). It falls out of the walk for free;
+ * discarding it was why the restart path had no Windows anchor to use.
  */
-function anchorRelDirOnInterpreter(python: string, relDir: string): string | undefined {
+function anchorRelDirOnInterpreter(
+  python: string,
+  relDir: string,
+): { root: string; anchorDir: string } | undefined {
   if (!isAbsolute(python)) return undefined;
   let dir = dirname(pathResolve(python));
   for (let i = 0; i < OBSERVED_ROOT_MAX_ASCENT; i++) {
     const candidate = pathResolve(dir, relDir);
     if (hasMainPy(candidate) && interpreterBelongsToInstall(python, dir, candidate)) {
-      return candidate;
+      return { root: candidate, anchorDir: dir };
     }
     const parent = dirname(dir);
     if (parent === dir) break;
@@ -743,7 +770,9 @@ function anchorRelDirOnInterpreter(python: string, relDir: string): string | und
  * #369 is about (codex gate, round 1). Each resolution re-observes the process
  * that is live right now; correctness here outranks a few hundred milliseconds.
  */
-function observeLivePython(argv: string[] | undefined): string | undefined {
+function observeLivePython(
+  argv: string[] | undefined,
+): { python: string; pid: number } | undefined {
   let statsHost: string | undefined;
   try {
     statsHost = new URL(getComfyUIBaseUrl()).hostname;
@@ -751,12 +780,16 @@ function observeLivePython(argv: string[] | undefined): string | undefined {
     /* unparseable target → no host filter */
   }
   try {
-    return resolveLiveInterpreter({
+    const live = resolveLiveInterpreter({
       port: config.resolvedPort,
       host: statsHost,
       remote: false,
       serverArgv: argv,
-    })?.python;
+    });
+    // The PID travels with the interpreter (#535). A caller that is about to STOP
+    // a process must be able to confirm the anchor describes that very process
+    // and not some other ComfyUI — an interpreter path alone cannot prove it.
+    return live ? { python: live.python, pid: live.pid } : undefined;
   } catch {
     return undefined;
   }
@@ -797,6 +830,8 @@ export function resolveLiveServerRoot(
   opts?: {
     /** Test seam / caller-supplied observation, bypassing the process-table probe. */
     observedPython?: string;
+    /** PID the caller-supplied observation belongs to (test seam companion). */
+    observedPid?: number;
     /** Skip the process-table probe entirely (remote server). Defaults to isRemoteMode(). */
     remote?: boolean;
   },
@@ -808,14 +843,26 @@ export function resolveLiveServerRoot(
   if (remote || relDir === undefined) return { source: "unresolved", relDir };
 
   let observedPython = opts?.observedPython;
-  if (!observedPython) observedPython = observeLivePython(argv);
+  let observedPid = opts?.observedPid;
+  if (!observedPython) {
+    const observed = observeLivePython(argv);
+    observedPython = observed?.python;
+    observedPid = observed?.pid;
+  }
   if (!observedPython) return { source: "unresolved", relDir };
 
   const anchored = anchorRelDirOnInterpreter(observedPython, relDir);
   if (anchored) {
-    return { root: anchored, source: "observed-process", relDir, observedPython };
+    return {
+      root: anchored.root,
+      source: "observed-process",
+      relDir,
+      observedPython,
+      observedPid,
+      anchorDir: anchored.anchorDir,
+    };
   }
-  return { source: "unresolved", relDir, observedPython };
+  return { source: "unresolved", relDir, observedPython, observedPid };
 }
 
 /**

@@ -68,6 +68,7 @@ import {
 import {
   liveRootFromArgv,
   resolveEffectiveComfyUIBase,
+  resolveLiveServerRoot,
   markLocalComfyUILaunched,
   resetLocalComfyUILaunchState,
 } from "./workspace-env.js";
@@ -1522,6 +1523,40 @@ function resolveLiveProcessCwd(pid: number): string | undefined {
 }
 
 /**
+ * The live process's working directory, reconstructed from the OS process
+ * observation rather than from procfs (#535) — the Windows path, where
+ * `/proc/<pid>/cwd` does not exist.
+ *
+ * `resolveLiveServerRoot`'s observed-process tier walks up from the interpreter the
+ * OS reports for the server on our port and accepts the first ancestor under which
+ * `<ancestor>/<relDir>/main.py` exists AND the interpreter belongs to that install.
+ * That accepted ancestor IS the working directory the server must have had for its
+ * relative `main.py` to name this install — the same fact `/proc/<pid>/cwd` states
+ * directly.
+ *
+ * THE PID MUST MATCH. This value is used to decide a relaunch of a process we are
+ * about to KILL, and the observation is anchored on "whatever is listening on our
+ * port". If that is a different process than `pid` — a second ComfyUI, a proxy, a
+ * pid we resolved from a stale record — then its install is not the one being
+ * stopped, and anchoring the relaunch on it would restart the wrong tree after
+ * killing the right one. An unconfirmed observation is discarded, leaving the
+ * pre-existing refusal exactly as it was.
+ *
+ * Never throws: a failure here must degrade to the old refusal, never break a stop.
+ */
+function observedLiveCwd(pid: number, argv: string[]): string | undefined {
+  if (!pid) return undefined;
+  try {
+    const live = resolveLiveServerRoot(argv, undefined, { remote: false });
+    if (live.source !== "observed-process" || !live.anchorDir) return undefined;
+    if (live.observedPid !== pid) return undefined;
+    return isAbsolute(live.anchorDir) ? live.anchorDir : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * The argv a relaunch is built from: the SERVER's own `sys.argv` when it could tell
  * us, otherwise the OS's view of the same process (#767).
  *
@@ -2360,7 +2395,16 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
   const desktopExe = desktop ? findDesktopExePath(identifyingArgv) : undefined;
   // Capture the live process cwd NOW, while the pid is guaranteed alive — the
   // `/proc/<pid>/cwd` symlink is gone the instant a later stop kills it (#535).
-  const liveCwd = desktop ? undefined : resolveLiveProcessCwd(pid);
+  //
+  // On Windows there is no `/proc`, so this returned undefined and the relative-script
+  // anchor downstream could never fire — a `ComfyUI\main.py` launch was refused
+  // outright with "could not locate the ComfyUI install", which is the #535 recurrence
+  // that kept coming back. `observedLiveCwd` reconstructs the SAME fact from the OS
+  // process observation instead of from procfs: the directory the server's relative
+  // `main.py` must have been resolved against for it to name the install its own
+  // interpreter lives in.
+  const liveCwd =
+    desktop ? undefined : (resolveLiveProcessCwd(pid) ?? observedLiveCwd(pid, argv));
   // Same live-only window for the ENVIRONMENT (#776): read it now, while the pid
   // is guaranteed alive, so a relaunch can reproduce the launcher environment the
   // server was actually started with instead of substituting the orchestrator's.
