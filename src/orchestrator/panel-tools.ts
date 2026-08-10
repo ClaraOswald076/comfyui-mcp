@@ -239,9 +239,13 @@ function fail(err: unknown): ToolResult {
  * the way out, an instruction that cannot be followed closes the loop and the
  * session stays wedged with no exit — the reporter's wedge.
  *
- * Focusing a tab is what MAKES it last-active, so the action that actually works is
- * the one panel_reload already prescribes. Name the connected tabs too, so the user
- * knows what they are choosing among.
+ * The action named here is the one that actually works, which is NOT the obvious one.
+ * UiBridge.setLastActiveTab is documented as the ONLY writer of lastActiveTabId and
+ * fires on `msg.type === "user_message"` (ui-bridge.ts) — a tab becomes last-active
+ * when a MESSAGE IS SENT from its Agent panel, not when the browser tab is focused or
+ * clicked. "Switch to the tab you want" (which panel_reload's sibling message says)
+ * would leave the state unchanged and send the user round the loop again.
+ * Name the connected tabs too, so the user knows what they are choosing among.
  */
 function ambiguousRebindGuidance(ctx: PanelToolCtx, err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err ?? "");
@@ -266,9 +270,10 @@ function ambiguousRebindGuidance(ctx: PanelToolCtx, err: unknown): string {
   return (
     "Several ComfyUI tabs are connected and none is marked active, so this session cannot " +
     "tell which one to follow — and this tool takes no tab_id to disambiguate with." +
-    `${listed} Switch to (click) the ComfyUI tab you want the agent to work in, which makes ` +
-    'it the active tab, then call panel_set_workflow_target({mode:"current"}) again. ' +
-    "Nothing was rebound."
+    `${listed} A tab becomes the active one when a message is SENT from its Agent panel ` +
+    "(focusing or clicking the browser tab does not do it), so ask the user to send any " +
+    "message from the Agent panel in the ComfyUI tab they want you working in, then call " +
+    'panel_set_workflow_target({mode:"current"}) again. Nothing was rebound.'
   );
 }
 
@@ -6545,8 +6550,9 @@ function desktopCanvasRedirect(
     error:
       `${label} needs an open ComfyUI desktop panel canvas, but this session is bound to ` +
       `a canvas-less (mobile/remote) client and multiple desktop tabs are open — it can't ` +
-      `pick one automatically. Switch to the ComfyUI tab you want, rebind with ` +
-      `panel_set_workflow_target({mode:"current"}), then retry.`,
+      `pick one automatically. Ask the user to send a message from the Agent panel in the ` +
+      `ComfyUI tab they want (that — not focusing the tab — is what marks it active), ` +
+      `rebind with panel_set_workflow_target({mode:"current"}), then retry.`,
   };
 }
 
@@ -8567,9 +8573,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             return fail(
               "This conversation's current turn is pinned to a tab that is no longer " +
                 "reachable (it disconnected or its origin is ambiguous), so the reload " +
-                "frame has nowhere safe to go. Switch to the ComfyUI tab you want, call " +
-                'panel_set_workflow_target({mode:"current"}) to re-bind this session onto ' +
-                "it, then retry panel_reload.",
+                "frame has nowhere safe to go. Ask the user to send a message from the Agent " +
+                "panel in the ComfyUI tab they want (that — not focusing the tab — is what " +
+                'marks it active), call panel_set_workflow_target({mode:"current"}) to ' +
+                "re-bind this session onto it, then retry panel_reload.",
             );
           }
         } else if (ctx.rebindToActiveTab) {
@@ -8596,8 +8603,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           if (orphaned && Array.isArray(interactive) && interactive.length > 1) {
             return fail(
               "This session's ComfyUI tab was replaced and multiple tabs are now open — " +
-                "can't safely pick one. Switch to the tab you want, then call " +
-                'panel_set_workflow_target({mode:"current"}) before panel_reload.',
+                "can't safely pick one. Ask the user to send a message from the Agent panel " +
+                "in the tab they want (that — not focusing the tab — is what marks it " +
+                'active), then call panel_set_workflow_target({mode:"current"}) before ' +
+                "panel_reload.",
             );
           }
           try {

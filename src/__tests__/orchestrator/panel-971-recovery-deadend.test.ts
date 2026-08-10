@@ -109,7 +109,7 @@ it("#971 with NO last-active tab, the prescribed recovery is a dead end", async 
   // And whatever it says, it must leave the caller somewhere other than where it
   // started: either rebound, or told an action that does not require a parameter
   // this tool does not have.
-  const recovered = ctx.tabId !== "stale-tab" || /switch to|focus/i.test(textOf(rec2));
+  const recovered = ctx.tabId !== "stale-tab" || /sent from its Agent panel/i.test(textOf(rec2));
   expect(recovered).toBe(true);
 });
 
@@ -126,5 +126,40 @@ it("#971 a NON-ambiguity failure keeps its own words", async () => {
   const res = (await target.handler({ mode: "current" }, ctx)) as ToolResult;
   expect(res.isError).toBe(true);
   expect(textOf(res)).toMatch(/bridge exploded while resolving/);
-  expect(textOf(res)).not.toMatch(/Switch to \(click\)/);
+  expect(textOf(res)).not.toMatch(/Agent panel/);
+});
+
+it("#971 no recovery message tells the user to do something that does not work", async () => {
+  // The mechanism, from ui-bridge.ts: setLastActiveTab is documented as the ONLY
+  // writer of lastActiveTabId and is called on `msg.type === "user_message"`. A tab
+  // becomes last-active when a MESSAGE IS SENT from its Agent panel. Focusing or
+  // clicking the browser tab never touches it.
+  //
+  // Four messages in panel-tools.ts prescribe this recovery, and three of them said
+  // "Switch to the tab you want" — an instruction that leaves the state exactly as it
+  // was and sends the user around the loop again. This asserts on the SOURCE because
+  // three of the four are on paths (mobile-client, panel_reload) this file cannot
+  // reach, and a message that is wrong is wrong whether or not a test can drive it.
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("../../orchestrator/panel-tools.ts", import.meta.url), "utf8");
+
+  const prescribes = src.split(/\r?\n/).filter((l) => /panel_set_workflow_target\(\{mode:"current"\}\)/.test(l));
+  expect(prescribes.length).toBeGreaterThan(0);
+
+  // No user-facing recovery TEXT may claim that switching/focusing a tab does it.
+  // Comment lines are excluded deliberately: the doc comment on
+  // ambiguousRebindGuidance quotes the wrong advice in order to explain why it is
+  // wrong, and a gate that cannot tell an explanation from an instruction would
+  // force that explanation to be deleted. Checked against a known site below.
+  const codeLines = src
+    .split(String.fromCharCode(10))
+    .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+    .join(String.fromCharCode(10));
+  expect(codeLines).not.toMatch(/Switch to (the|\(click\) the) (ComfyUI )?tab you want/i);
+  // The filter must not be so aggressive that it would miss a real one: prove it
+  // still sees ordinary string content on these same lines.
+  expect(codeLines).toMatch(/panel_set_workflow_target/);
+  // And the real mechanism must be stated wherever the recovery is prescribed.
+  expect((src.match(/not focusing the tab/g) ?? []).length).toBeGreaterThanOrEqual(3);
+  expect(src).toMatch(/sent from its Agent panel|send a message from the Agent panel/i);
 });
