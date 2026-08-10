@@ -1720,6 +1720,29 @@ function toolResultText(res: ToolResult): string {
  *  else about it — including `isError` and any non-text content. Used where the
  *  original message must reach the caller VERBATIM and we are only adding what we
  *  additionally know, never restating (or re-classifying) what it already said. */
+/** All text in a tool result, joined — for quoting one result inside another. */
+function textOfToolResult(res: ToolResult): string {
+  return res.content.map((c) => (c as { text?: string }).text ?? "").join(" ").trim();
+}
+
+/**
+ * #1329 — the panel's STALE NODE SCHEMA refusal, which is worth acting on rather than
+ * relaying.
+ *
+ * It is the one refusal here whose prescribed remedy has no decision in it: the class
+ * this page registered has drifted from the server's, and `refresh_nodes` re-fetches
+ * /object_info and re-registers it in place. The reporter ran that by hand twice and it
+ * worked twice.
+ *
+ * Matched on the drift sentence rather than on "panel_refresh_nodes", which appears in
+ * several unrelated remedies — keying on the recommendation would make any of them
+ * trigger an add-retry.
+ */
+function isStaleNodeSchemaRefusal(res: ToolResult): boolean {
+  if (!res.isError) return false;
+  return /added or retyped since this page loaded its node schema/i.test(textOfToolResult(res));
+}
+
 function appendToolResultText(res: ToolResult, extra: string): ToolResult {
   const idx = res?.content?.findIndex((c) => c.type === "text") ?? -1;
   const block = idx >= 0 ? res.content[idx] : undefined;
@@ -7868,15 +7891,55 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .describe("Canvas [x, y] (two numbers). Auto-placed beside existing nodes when omitted."),
         title: z.string().optional().describe("Optional custom node title."),
       },
-      async (args: A, ctx) =>
+      async (args: A, ctx) => {
         // #599: the frontend gates the add on a FRESH /object_info (assertAddNode-
         // ResolvableRefreshing) so an uninstalled class can't be added as a
         // placeholder — that fetch can outlast the 6000 ms default on a large
         // install. Give it the bounded refresh ack budget.
-        ctx.call(
-          { cmd: "graph_add_node", class_type: args.class_type, pos: args.pos, title: args.title },
-          OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
-        ),
+        const add = (): Promise<ToolResult> =>
+          ctx.call(
+            { cmd: "graph_add_node", class_type: args.class_type, pos: args.pos, title: args.title },
+            OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+          );
+        const first = await add();
+        if (!isStaleNodeSchemaRefusal(first)) return first;
+
+        // #1329 — DO THE REFRESH THE REFUSAL ASKS FOR, instead of billing the caller.
+        //
+        // The reporter uploaded two images, and both LoadImage adds were refused with
+        // "call panel_refresh_nodes and retry". Doing exactly that worked, both times.
+        // That is a round trip and an agent-visible error for something with one
+        // correct response and no decision in it.
+        //
+        // Safe to automate for a checkable reason, not a hopeful one: the panel's guard
+        // throws BEFORE it creates anything ("Refuse before creating anything"), so the
+        // retry cannot leave two nodes behind. Mutations are otherwise never re-issued
+        // on our own initiative, and that rule is intact — this is not a transport
+        // failure with an unknown outcome, it is a refusal that states its own.
+        const refreshed = await ctx.call({ cmd: "refresh_nodes" }, OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS);
+        if (refreshed.isError) {
+          // The refusal is the better error: it names what is wrong with the SCHEMA and
+          // what clears it. Carry the refresh failure alongside so the caller knows the
+          // automatic attempt happened and why it did not help.
+          return appendToolResultText(
+            first,
+            `\n\n(Tried to clear this automatically: panel_refresh_nodes was dispatched and FAILED, ` +
+              `so the schema is unchanged and retrying the add will refuse again. ` +
+              `${textOfToolResult(refreshed)})`,
+          );
+        }
+        const second = await add();
+        if (!isStaleNodeSchemaRefusal(second)) return second;
+        // Still stale after a successful refresh: report THAT, because it means the
+        // remedy the refusal prescribes does not fix this instance and a caller
+        // following it by hand would loop.
+        return appendToolResultText(
+          second,
+          `\n\n(This was already retried ONCE automatically: panel_refresh_nodes reported success ` +
+            `and the add still refuses, so repeating panel_refresh_nodes will not clear it. ` +
+            `Reload the ComfyUI browser tab, which rebuilds the page's node registry from scratch.)`,
+        );
+      },
     ),
     def(
       "panel_remove_node",
