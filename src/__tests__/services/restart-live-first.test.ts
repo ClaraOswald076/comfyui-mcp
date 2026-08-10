@@ -585,13 +585,24 @@ describe("restart_comfyui — live-first script resolution (#476, #426)", () => 
     killSpy.mockRestore();
   });
 
-  it("WINDOWS: an UNREADABLE creation stamp fails closed, it does not pass on the pid number (#535 codex gate)", async () => {
+  it("a CHANGED creation stamp discards the observed anchor — pid equality is not identity (#535 codex gate)", async () => {
     // pid + creation time is this file's standard for process identity, because
     // pid equality across a window is exactly what pid REUSE defeats. The observed
     // resolver re-queries the port owner AFTER the identity bracket has closed, so
-    // it needs its own continuity proof. "Could not read the stamp" is not
-    // "the stamp matched".
+    // it needs its own continuity proof.
+    //
+    // The bracket is left INTACT on purpose. Simply removing the stamp makes
+    // `gatherProcessInfo` refuse earlier, with a different (also correct) message —
+    // which passed on Windows and failed on Linux, and proved nothing about this
+    // guard on either. So the bracket gets a consistent stamp and only the LATER
+    // read differs, which is exactly the pid-reuse shape.
     const LIVE_CWD = resolve("bundle3");
+    let reads = 0;
+    __processControlTestHooks.setProcessIdentityResolver(() => ({
+      // The bracket reads it twice (before/after the request) and must agree;
+      // everything after that is the post-bracket world.
+      startedAt: ++reads <= 2 ? "stable-stamp" : "recycled-pid-different-process",
+    }));
     mockResolveBase.mockReturnValue(undefined);
     mockLiveRootFromArgv.mockReturnValue(undefined);
     mockGetSystemStats.mockResolvedValue({
@@ -602,8 +613,6 @@ describe("restart_comfyui — live-first script resolution (#476, #426)", () => 
       return s === ABS_PYTHON || s === join(LIVE_CWD, "ComfyUI", "main.py");
     });
     __processControlTestHooks.setLiveCwdResolver(() => undefined);
-    // No stamp available on this host.
-    __processControlTestHooks.setProcessIdentityResolver(() => undefined);
     mockResolveLiveServerRoot.mockReturnValue({
       source: "observed-process",
       anchorDir: LIVE_CWD,
@@ -615,7 +624,12 @@ describe("restart_comfyui — live-first script resolution (#476, #426)", () => 
 
     const result = await restartComfyUI();
 
-    expect(result.message).toMatch(/refusing to restart/i);
+    // The refuse-safe INVARIANT, not a particular sentence: nothing was stopped,
+    // nothing was spawned, the server is left running. The wording of the refusal
+    // differs by which guard fires first, and asserting it is what made this test
+    // platform-dependent.
+    expect(result.started).toBe(false);
+    expect(result.stopped).toBe(false);
     expect(mockSpawn).not.toHaveBeenCalled();
     expect(killSpy).not.toHaveBeenCalled();
 
