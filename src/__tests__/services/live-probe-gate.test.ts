@@ -76,8 +76,18 @@ function enclosingExports(file: string, callee: string): string[] {
  * and a gate hardcoded to the first could not see it.
  *
  * Adding one here is now a three-line change rather than a rewrite, which matters
- * because the next channel will not be the last: a health probe over `fetch` cost me a
- * CI failure on #1332 the same day, for the same reason.
+ * because the next channel will not be the last: a health probe over `fetch` cost a CI
+ * failure on #1332 the same day, for the same reason.
+ *
+ * THAT THIRD CHANNEL IS DELIBERATELY ABSENT, and the reason is worth recording so the
+ * next person does not re-derive it. Its probe (`probeComfyEndpoint`, reached through
+ * the private `probeComfyHealth` / `probeDeclineRecovery` / `observeRecovery`) has
+ * exactly ONE exported caller: `buildPanelToolDefs()`. Every panel tool is registered
+ * inside it, so every panel test names it — gating on it would flag essentially the
+ * whole suite, and a gate that cries wolf is a list people learn to edit rather than
+ * read. It is stubbable (`__panelToolsTestHooks.setHealthProbe`), so the remedy exists;
+ * what is missing is a way to attribute reachability to a TOOL rather than to the one
+ * export that registers all 91 of them. That is what would have to change first.
  */
 interface Probe {
   /** Short name used in failure output. */
