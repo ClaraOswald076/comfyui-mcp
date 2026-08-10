@@ -1544,16 +1544,71 @@ function resolveLiveProcessCwd(pid: number): string | undefined {
  *
  * Never throws: a failure here must degrade to the old refusal, never break a stop.
  */
-function observedLiveCwd(pid: number, argv: string[]): string | undefined {
+function observedLiveCwd(
+  pid: number,
+  argv: string[],
+  expectedStartedAt: string | undefined,
+): string | undefined {
   if (!pid) return undefined;
+  // The anchor is INFERRED, never observed: it is a directory from which this
+  // relative script WOULD name this install, which is not the same claim as
+  // "the directory the process was started in". A launcher that keeps
+  // `C:\launcher\main.py` symlinked to `C:\bundle\main.py` is started from
+  // `C:\launcher`, yet `C:\bundle` satisfies the inference (codex gate).
+  //
+  // For the panel base (#1133) that gap is harmless — both spellings name the same
+  // install root. Here it is not: this value becomes the relaunch's WORKING
+  // DIRECTORY, so any relative argument would resolve somewhere else after the
+  // restart. So only adopt it when the choice of cwd CANNOT change what an
+  // argument means: every token after the script must be a flag, an absolute path,
+  // or a plain non-path value. Anything that could be a relative path leaves the
+  // pre-existing refusal in place.
+  if (argvHasRelativePathArg(argv)) return undefined;
   try {
     const live = resolveLiveServerRoot(argv, undefined, { remote: false });
     if (live.source !== "observed-process" || !live.anchorDir) return undefined;
     if (live.observedPid !== pid) return undefined;
+    // …and bind it to the process INSTANCE, not to the pid NUMBER. This resolver
+    // re-queries the port owner at its own moment, after the identity bracket
+    // above has already closed; a pid recycled in that window would satisfy a
+    // numeric comparison while describing a different server. The codebase's rule
+    // is pid + creation time, and an unreadable stamp is "did not observe", never
+    // "observed the same" — so it fails closed to the old refusal (#535 codex gate).
+    const nowStartedAt = resolveProcessIdentity(pid)?.startedAt;
+    if (!expectedStartedAt || !nowStartedAt || nowStartedAt !== expectedStartedAt) {
+      return undefined;
+    }
     return isAbsolute(live.anchorDir) ? live.anchorDir : undefined;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Does any argument AFTER the launch script depend on the working directory?
+ *
+ * Conservative on purpose (#535): a token counts as a possible relative path
+ * unless it is a flag, an absolute path, or a plain value that cannot be one (a
+ * number, a `key=value` flag payload, a bare `true`/`false`). `--port 8188` is
+ * safe; `--output-directory out` is not, and neither is anything carrying a path
+ * separator without a root.
+ *
+ * The asymmetry is deliberate. A false positive costs a Windows user the same
+ * manual restart they have today; a false negative relaunches a server into a
+ * directory where its own arguments point somewhere else.
+ */
+function argvHasRelativePathArg(argv: string[]): boolean {
+  for (let i = 1; i < argv.length; i++) {
+    const token = argv[i];
+    if (!token || token.startsWith("-")) continue; // a flag, not a value
+    if (isAbsolute(token) || /^[a-zA-Z]:[\\/]/.test(token) || /^\\\\/.test(token)) {
+      continue; // absolute — cwd cannot change it
+    }
+    if (/^-?\d+(\.\d+)?$/.test(token)) continue; // numeric value (--port 8188)
+    if (/^(true|false|none|auto)$/i.test(token)) continue; // plain enum-ish value
+    return true; // could be a relative path
+  }
+  return false;
 }
 
 /**
@@ -2260,6 +2315,7 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
 
   let argv: string[] = [];
   let pid: number | null = null;
+  let ownerStartedAt: string | undefined;
   let bracketed = false;
   for (let attempt = 0; attempt < 2; attempt++) {
     const before = observeOwner();
@@ -2284,6 +2340,9 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
       }
       const after = observeOwner();
       pid = after?.pid ?? before?.pid ?? null;
+      // Keep the bracketed instance stamp: the observed-cwd fallback (#535) must
+      // bind to this PROCESS INSTANCE, not to a pid number it can re-observe later.
+      ownerStartedAt = after?.startedAt ?? before?.startedAt;
       if (pid == null) {
         try {
           pid = findPidByPort(port);
@@ -2403,8 +2462,9 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
   // process observation instead of from procfs: the directory the server's relative
   // `main.py` must have been resolved against for it to name the install its own
   // interpreter lives in.
-  const liveCwd =
-    desktop ? undefined : (resolveLiveProcessCwd(pid) ?? observedLiveCwd(pid, argv));
+  const liveCwd = desktop
+    ? undefined
+    : (resolveLiveProcessCwd(pid) ?? observedLiveCwd(pid, argv, ownerStartedAt));
   // Same live-only window for the ENVIRONMENT (#776): read it now, while the pid
   // is guaranteed alive, so a relaunch can reproduce the launcher environment the
   // server was actually started with instead of substituting the orchestrator's.

@@ -436,6 +436,122 @@ describe("restart_comfyui — live-first script resolution (#476, #426)", () => 
     killSpy.mockRestore();
   });
 
+  it("WINDOWS: a RELATIVE path argument blocks the inferred anchor (#535 codex gate)", async () => {
+    // The anchor is INFERRED, not observed — a directory from which this relative
+    // script WOULD name this install, which is not "the directory it was started
+    // in". A symlinked launcher satisfies the inference from the wrong place. That
+    // gap is harmless for the panel base (#1133) and NOT harmless here, because the
+    // value becomes the relaunch's working directory. So when any argument could
+    // itself be cwd-relative, the anchor is not adopted.
+    const LIVE_CWD = resolve("bundle");
+    mockResolveBase.mockReturnValue(undefined);
+    mockLiveRootFromArgv.mockReturnValue(undefined);
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        // `out` is cwd-relative: after a restart from a different cwd it would
+        // point somewhere else entirely.
+        argv: [join("ComfyUI", "main.py"), "--output-directory", "out"],
+      },
+    });
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return s === ABS_PYTHON || s === join(LIVE_CWD, "ComfyUI", "main.py");
+    });
+    __processControlTestHooks.setLiveCwdResolver(() => undefined);
+    mockResolveLiveServerRoot.mockReturnValue({
+      source: "observed-process",
+      anchorDir: LIVE_CWD,
+      observedPid: 4321,
+    });
+    mockLivePortThenFree();
+    mockSpawn.mockImplementation(() => new FakeChild());
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(result.stopped).toBe(false);
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("WINDOWS: a plain non-path value (`--port 8188`) does NOT block the anchor (#535)", async () => {
+    // The guard above must not be so broad it refuses the very case this issue is
+    // about. The reporter's argv carries `--port 8188`; a number cannot be a path.
+    const LIVE_CWD = resolve("bundle2");
+    const LIVE_MAIN = join(LIVE_CWD, "ComfyUI", "main.py");
+    mockResolveBase.mockReturnValue(undefined);
+    mockLiveRootFromArgv.mockReturnValue(undefined);
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: [join("ComfyUI", "main.py"), "--port", "8188", "--enable-manager"],
+      },
+    });
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return s === ABS_PYTHON || s === LIVE_MAIN;
+    });
+    __processControlTestHooks.setLiveCwdResolver(() => undefined);
+    mockResolveLiveServerRoot.mockReturnValue({
+      source: "observed-process",
+      anchorDir: LIVE_CWD,
+      observedPid: 4321,
+    });
+    mockLivePortThenFree();
+    mockSpawn.mockImplementation(() => new FakeChild());
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).not.toMatch(/refusing to restart/i);
+    expect(mockSpawn.mock.calls[0][1][0]).toBe(LIVE_MAIN);
+
+    killSpy.mockRestore();
+  });
+
+  it("WINDOWS: an UNREADABLE creation stamp fails closed, it does not pass on the pid number (#535 codex gate)", async () => {
+    // pid + creation time is this file's standard for process identity, because
+    // pid equality across a window is exactly what pid REUSE defeats. The observed
+    // resolver re-queries the port owner AFTER the identity bracket has closed, so
+    // it needs its own continuity proof. "Could not read the stamp" is not
+    // "the stamp matched".
+    const LIVE_CWD = resolve("bundle3");
+    mockResolveBase.mockReturnValue(undefined);
+    mockLiveRootFromArgv.mockReturnValue(undefined);
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: [join("ComfyUI", "main.py"), "--port", "8188"] },
+    });
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return s === ABS_PYTHON || s === join(LIVE_CWD, "ComfyUI", "main.py");
+    });
+    __processControlTestHooks.setLiveCwdResolver(() => undefined);
+    // No stamp available on this host.
+    __processControlTestHooks.setProcessIdentityResolver(() => undefined);
+    mockResolveLiveServerRoot.mockReturnValue({
+      source: "observed-process",
+      anchorDir: LIVE_CWD,
+      observedPid: 4321,
+    });
+    mockLivePortThenFree();
+    mockSpawn.mockImplementation(() => new FakeChild());
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
   it("an UNRESOLVED observation changes nothing — the pre-#535 refusal stands (#535)", async () => {
     // The tri-state discipline: "could not observe" is not "observed something
     // usable". This is the branch that must never become a success.
