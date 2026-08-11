@@ -29,6 +29,20 @@ import {
   withToolSurfaceFilter,
 } from "../../tools/tool-surface-filter.js";
 
+/**
+ * Source with comments removed.
+ *
+ * Every source-grepping test below needs this, and finding out why was worth more than the
+ * tests. Two of them asserted `src.includes("COMFYUI_MCP_TOOL_PRESET")` and
+ * `src.indexOf("resolveToolSurfacePolicy();")` — and I had written a PARAGRAPH of comment
+ * above each fix explaining what it does, naming those exact strings. Deleting the code
+ * outright left both tests green, because the comment satisfied them. A wiring test that a
+ * comment can satisfy is not a wiring test; it is a spell-check on my own prose.
+ */
+function codeOnly(src: string): string {
+  return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*/g, "");
+}
+
 /** A minimal stand-in for the SDK registrar: records what actually got registered. */
 function recordingRegistrar() {
   const registered: string[] = [];
@@ -121,6 +135,42 @@ describe("allow wins, and is absolute (#873)", () => {
     expect(toolAllowed("panel_graph_outline", p)).toBe(true);
     expect(toolAllowed("panel_run", p)).toBe(false);
     expect(toolAllowed("restart_comfyui", p)).toBe(false);
+  });
+
+  it("a GLOB in allow narrows, but cannot re-open what a preset closed", () => {
+    // Measured on the first version, which let any allow match override the preset:
+    // ALLOW=list_* re-admitted list_packs — the install-and-execute tool that was the
+    // headline finding of the round which added these presets — and ALLOW=* made every
+    // preset inert while still reporting itself active.
+    //
+    // Naming `panel_graph_outline` is a decision about one tool. Writing `list_*` is a
+    // decision about a shape, and it sweeps in whatever the next release names that way.
+    const glob = resolveToolSurfacePolicy({
+      COMFYUI_MCP_TOOL_PRESET: "safe",
+      COMFYUI_MCP_TOOL_ALLOW: "list_*",
+    });
+    expect(toolAllowed("list_packs", glob)).toBe(false);
+    expect(toolAllowed("list_api_nodes", glob)).toBe(true); // allowed by safe anyway
+    expect(toolAllowed("restart_comfyui", glob)).toBe(false); // outside the allow bound
+
+    const star = resolveToolSurfacePolicy({
+      COMFYUI_MCP_TOOL_PRESET: "safe",
+      COMFYUI_MCP_TOOL_ALLOW: "*",
+    });
+    expect(toolAllowed("restart_comfyui", star), "ALLOW=* must not void a preset").toBe(false);
+
+    const readonlyGlob = resolveToolSurfacePolicy({
+      COMFYUI_MCP_TOOL_PRESET: "readonly",
+      COMFYUI_MCP_TOOL_ALLOW: "panel_*",
+    });
+    expect(toolAllowed("panel_run", readonlyGlob)).toBe(false);
+
+    // …while the EXACT name still refines, which is the documented opt-in.
+    const exact = resolveToolSurfacePolicy({
+      COMFYUI_MCP_TOOL_PRESET: "readonly",
+      COMFYUI_MCP_TOOL_ALLOW: "panel_run",
+    });
+    expect(toolAllowed("panel_run", exact)).toBe(true);
   });
 
   it("a variable SET BUT EMPTY refuses to start — the fail-open by another route", () => {
@@ -379,7 +429,7 @@ describe("WIRING: the filter covers the call_tool route, not just registration (
     // That path uses `registerTool` on a separate server, so the headless decorator —
     // which proxies `.tool` — could never have caught it.
     const { readFile } = await import("node:fs/promises");
-    const src = await readFile(new URL("../../orchestrator/panel-tools.ts", import.meta.url), "utf-8");
+    const src = codeOnly(await readFile(new URL("../../orchestrator/panel-tools.ts", import.meta.url), "utf-8"));
     const at = src.indexOf("export function registerPanelTools");
     expect(at).toBeGreaterThan(-1);
     const body = src.slice(at, at + 1400);
@@ -397,7 +447,7 @@ describe("WIRING: the filter covers the call_tool route, not just registration (
     // that was true, which is why this one names the second function explicitly rather
     // than searching the file as a whole.
     const { readFile } = await import("node:fs/promises");
-    const src = await readFile(new URL("../../orchestrator/panel-tools.ts", import.meta.url), "utf-8");
+    const src = codeOnly(await readFile(new URL("../../orchestrator/panel-tools.ts", import.meta.url), "utf-8"));
     const at = src.indexOf("export function createPanelMcpServer");
     expect(at).toBeGreaterThan(-1);
     const body = src.slice(at, at + 1800);
@@ -405,20 +455,33 @@ describe("WIRING: the filter covers the call_tool route, not just registration (
     expect(body).toContain("toolAllowed(d.name, policy)");
   });
 
-  it("the policy reaches the SPAWNED comfyui child, which builds its env explicitly", async () => {
-    // comfyuiBaseEnv() constructs the child's environment rather than inheriting it (on
-    // purpose — a spread cannot REMOVE a revoked credential), and the MCP SDK spawns
-    // stdio children with a PATH/HOME-class default env. So an unforwarded variable does
-    // not exist over there: panel tools withheld and logged as withheld, while the
-    // agent's own comfyui child still offers download_model and restart_comfyui.
+  it("the policy reaches the SPAWNED comfyui child through the env builder BOTH lanes share", async () => {
+    // There are two comfyui spawn lanes. I put this forwarding in comfyuiBaseEnv(), which
+    // only the Codex/Gemini lane spreads; the DEFAULT Claude lane builds its own literal
+    // and calls buildComfyuiMcpEnv directly, so it kept spawning a child with all 37
+    // tools while the panel surface was withheld and logged as withheld.
+    //
+    // That is the same defect as the two panel registration paths — fix one, test the one
+    // you fixed — committed again in the same change, one file over. So this asserts on
+    // the CHOKE POINT both lanes pass through, not on either call site.
     const { readFile } = await import("node:fs/promises");
-    const src = await readFile(new URL("../../orchestrator/index.ts", import.meta.url), "utf-8");
-    const at = src.indexOf("const comfyuiBaseEnv");
+    const src = codeOnly(await readFile(new URL("../../services/panel-secrets.ts", import.meta.url), "utf-8"));
+    const at = src.indexOf("export function buildComfyuiMcpEnv");
     expect(at).toBeGreaterThan(-1);
-    const body = src.slice(at, at + 2600);
+    const body = src.slice(at, at + 3200);
     for (const v of ["COMFYUI_MCP_TOOL_PRESET", "COMFYUI_MCP_TOOL_ALLOW", "COMFYUI_MCP_TOOL_DENY"]) {
-      expect(body, `${v} must be forwarded to the child`).toContain(v);
+      // Assert the ASSIGNMENT, not that the name appears somewhere. Checking only for the
+      // name passed with the forwarding deleted, because the `process.env.X ?` guard on
+      // the line above still mentions X — the test matched the condition and called it
+      // the effect.
+      expect(body, `${v} must be ASSIGNED into the child env, not merely mentioned`).toContain(
+        `${v}: process.env.${v}`,
+      );
     }
+
+    // …and both lanes really do route through it, or the choke point is not one.
+    const orch = codeOnly(await readFile(new URL("../../orchestrator/index.ts", import.meta.url), "utf-8"));
+    expect(orch.match(/buildComfyuiMcpEnv\(/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
   });
 
   it("the policy is validated at BOOT, so 'Refusing to start' is true on http too", async () => {
@@ -428,10 +491,14 @@ describe("WIRING: the filter covers the call_tool route, not just registration (
     // back 500 with the real reason buried in a log line. Fail-closed, so not a hole —
     // but the message promised something that transport did not do.
     const { readFile } = await import("node:fs/promises");
-    const src = await readFile(new URL("../../boot.ts", import.meta.url), "utf-8");
+    const src = codeOnly(await readFile(new URL("../../boot.ts", import.meta.url), "utf-8"));
     const call = src.indexOf("resolveToolSurfacePolicy();");
     expect(call).toBeGreaterThan(-1);
-    // …and BEFORE the http branch, or it has not bought anything.
+    // Above EVERY branch that starts something. Asserting only against the http branch
+    // missed --panel-orchestrator, which returns above it and never comes back: a typo'd
+    // preset there bound the bridge, the loopback MCP and the console, printed the ready
+    // banner, and only threw later at first use, inside a request handler.
+    expect(call).toBeLessThan(src.indexOf("if (cli.panelOrchestrator)"));
     expect(call).toBeLessThan(src.indexOf('if (cli.transport === "http")'));
   });
 
@@ -440,7 +507,7 @@ describe("WIRING: the filter covers the call_tool route, not just registration (
     // catalog is built once per process and the policy is read from the environment at
     // that moment; a runtime assertion here would test my mock, not the wiring.
     const { readFile } = await import("node:fs/promises");
-    const src = await readFile(new URL("../../tools/index.ts", import.meta.url), "utf-8");
+    const src = codeOnly(await readFile(new URL("../../tools/index.ts", import.meta.url), "utf-8"));
 
     const at = src.indexOf("export async function collectToolCatalog");
     expect(at).toBeGreaterThan(-1);

@@ -283,7 +283,10 @@ the model never learns it exists.
 
 <ParamField path="COMFYUI_MCP_TOOL_PRESET" type="string">
   `safe` — everything except tools that change the machine or the model library.
-  Rendering still works; installing, deleting and restarting do not.
+  Installing, deleting and restarting are withheld. **Rendering still works, and so do
+  the things that come with it**: queueing generations, `list_api_nodes` (hosted partner
+  nodes that spend PAID credits), and `report_issue` (files a public GitHub issue). Use
+  `readonly` if a shared frontend's users must not be able to spend or publish.
   `readonly` — inspection only: no renders queued, nothing written, nothing spent.
   Both also withhold the whole `panel_*` surface, which drives a live shared canvas.
 </ParamField>
@@ -297,6 +300,11 @@ the model never learns it exists.
   not named is withheld even if no deny rule mentions it. Use it to opt individual tools
   back in past a preset: `COMFYUI_MCP_TOOL_PRESET=safe` plus
   `COMFYUI_MCP_TOOL_ALLOW=panel_graph_outline,panel_query_graph`.
+
+  Only an **exact name** opts a tool back in past a preset. A glob (`list_*`) narrows the
+  surface like any other entry but cannot re-open what a preset closed — otherwise
+  `ALLOW=list_*` would re-admit `list_packs`, whose `install_deps` action installs and
+  runs third-party code, and `ALLOW=*` would make every preset inert.
 </ParamField>
 
 ```bash A hosted deployment that cannot install or restart anything

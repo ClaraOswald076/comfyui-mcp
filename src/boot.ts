@@ -344,6 +344,25 @@ async function main() {
     }
   }
 
+  // #873 — VALIDATE THE OPERATOR'S TOOL POLICY BEFORE ANY SERVER STARTS, of any kind.
+  //
+  // resolveToolSurfacePolicy() throws on a misconfiguration (an unknown preset, a variable
+  // set but empty) with a message that says "Refusing to start". Making that true took two
+  // corrections, both the same mistake:
+  //
+  //   - On --transport http the server is built LAZILY inside the request handler, so the
+  //     socket bound, "running on http://…" printed, and every initialize came back 500
+  //     with the reason buried in a log line.
+  //   - Moving the call above the http branch left --panel-orchestrator, which returns
+  //     BELOW me and never came back. A typo'd preset there started the bridge, the
+  //     loopback panel MCP and the console, printed the ready banner, and only threw later
+  //     at first use — inside a request handler, per session.
+  //
+  // Both times the fix was placed at the first spot that satisfied the case in front of me
+  // rather than at the point every path passes through. This is that point: above every
+  // branch that starts anything.
+  resolveToolSurfacePolicy();
+
   // Standalone background orchestrator: owns the UI bridge and drives the panel
   // with autonomous Agent SDK sessions. Not an MCP server — it never returns.
   if (cli.panelOrchestrator) {
@@ -409,21 +428,6 @@ async function main() {
     await runPanelOrchestrator();
     return;
   }
-
-  // #873 — VALIDATE THE OPERATOR'S TOOL POLICY BEFORE ANY TRANSPORT STARTS.
-  //
-  // resolveToolSurfacePolicy() throws on a misconfiguration (an unknown preset, a variable
-  // set but empty) with a message that says "Refusing to start". On stdio that was true,
-  // because the first call happens while building the server. On HTTP it was NOT: that
-  // transport calls createServer() lazily inside the request handler, so the socket bound,
-  // the "server running on http://…" line printed, and every `initialize` came back as a
-  // bare 500 with the real reason buried in a request-error log. Fail-closed, so no hole —
-  // but the message promised something the HTTP path did not do, and a message that lies
-  // about its own behaviour is how an operator ends up debugging the wrong thing.
-  //
-  // Calling it here makes the promise true on every transport. The result is discarded;
-  // each registration site resolves its own (the env cannot change under us mid-process).
-  resolveToolSurfacePolicy();
 
   await JobWatcher.cleanupOldFiles();
 

@@ -94,9 +94,16 @@ export const EXECUTION_TOOLS = [
   "get_image",
   // Runs hosted partner nodes that spend PAID credits.
   "list_api_nodes",
-  // Files a PUBLIC GitHub issue under the operator's token. Nothing on the machine
-  // changes, so `safe` permits it; `readonly` promises "nothing written" and a public
-  // issue written by whoever is prompting a shared frontend is squarely a write.
+  // Files a PUBLIC GitHub issue. Nothing on the machine changes, so `safe` permits it;
+  // `readonly` promises "nothing written", and a public issue written by whoever is
+  // prompting a shared frontend is squarely a write.
+  //
+  // My first note here said "under the operator's token", which is wrong: the GitHub
+  // token is server-side in the intake Worker and the client key is a soft anti-spam gate
+  // (report-issue.ts:18-23). The classification is unaffected — the issue is still public
+  // and still attributable to this deployment — but a wrong premise in this ledger is
+  // exactly what produced the `search_custom_nodes` inversion one round ago, so it gets
+  // corrected rather than left as harmless-sounding filler.
   "report_issue",
 ];
 
@@ -164,7 +171,13 @@ export const EXECUTION_ACTION_NAMES = /^(enqueue|start|submit|run)$/i;
  */
 export function declaredActions(
   description: string,
-  opts: { selfName?: string; knownTools?: ReadonlySet<string> } = {},
+  // REQUIRED, and both fields with it. They read like optional refinements and are the
+  // only thing standing between this function and the over-stripping its own comment
+  // calls the dangerous direction: with the guards defaulted off, every `name action:"x"`
+  // is deleted, so `install_comfyui` loses its own pin/unpin/unlock and
+  // `list_local_models` loses `download`. A caller that forgets them gets a silently
+  // blinded result and a check that reports no holes. Make it impossible to forget.
+  opts: { selfName: string; knownTools: ReadonlySet<string> },
 ): string[] {
   const { selfName, knownTools } = opts;
   // Both spellings occur in the real descriptions: `get_defaults (action:"set")` and
@@ -348,10 +361,22 @@ export function toolAllowed(name: string, policy: ToolSurfacePolicy): boolean {
   // An EXPLICIT deny beats an allow list — both are the operator speaking, and the
   // smaller surface wins the tie.
   if (policy.deny.some((p) => toolMatches(name, p))) return false;
-  // A PRESET is a broad default, so naming a tool in the allow list is how you refine it
+  // A PRESET is a broad default, so NAMING a tool in the allow list is how you refine it
   // (`PRESET=safe` + `ALLOW=panel_graph_outline,panel_query_graph`). Without this, the
   // documented opt-back-in would silently do nothing.
-  if (policy.allow.length > 0) return true;
+  //
+  // AN EXACT NAME REFINES A PRESET; A GLOB DOES NOT. Measured on the first version, which
+  // let any allow match override: `PRESET=safe` + `ALLOW=list_*` re-admitted `list_packs`
+  // — the tool whose action:"install_deps" downloads and runs third-party code, and the
+  // headline finding of the round that added the preset. `ALLOW=*` made every preset
+  // entirely inert while reporting itself active.
+  //
+  // The difference is what the operator actually asserted. Writing `panel_graph_outline`
+  // is a decision about one tool, made with it in mind. Writing `list_*` is a decision
+  // about a shape, and it sweeps in whatever the next release happens to name that way —
+  // which is precisely what a preset exists to protect against. So a glob narrows the
+  // surface like any allow entry, and cannot re-open what the preset closed.
+  if (policy.allow.includes(name)) return true;
   return !policy.presetDeny.some((p) => toolMatches(name, p));
 }
 
