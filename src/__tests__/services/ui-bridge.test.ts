@@ -40,6 +40,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { waitFor } from "../helpers/wait-for.js";
+import { logger } from "../../utils/logger.js";
 
 /**
  * A real on-disk panel pack under a resolved base. The skew resolver re-reads
@@ -4405,6 +4406,16 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     });
     const journaled: unknown[] = [];
     bridge.setLateAskReplySink((askId, result) => journaled.push({ askId, result }));
+    // Capture every log level for the duration — verified against the real bridge with a
+    // canary token, which is how this assertion earned its place.
+    const logged: unknown[] = [];
+    const levels = ["debug", "info", "warn", "error"] as const;
+    const originals = levels.map((l) => [l, logger[l]] as const);
+    for (const l of levels) {
+      (logger as unknown as Record<string, unknown>)[l] = (...args: unknown[]) => {
+        logged.push(args);
+      };
+    }
     sock.on("message", (buf) => {
       const msg = JSON.parse(buf.toString());
       if (msg.rid && msg.cmd === "request_secret") {
@@ -4431,6 +4442,10 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     // the id — a sink that recorded the value under a different key would still be a leak.
     expect(journaled).toEqual([]);
     expect(JSON.stringify(journaled)).not.toContain("sk-live-TOKEN");
+    // …and it reached no LOG LINE either, at any level. A journal is the obvious place a
+    // credential must not land; a debug line is the easy one to add later without noticing.
+    expect(JSON.stringify(logged)).not.toContain("sk-live-TOKEN");
+    for (const [l, fn] of originals) (logger as unknown as Record<string, unknown>)[l] = fn;
     bridge.setLateAskReplySink(() => {});
   });
 
