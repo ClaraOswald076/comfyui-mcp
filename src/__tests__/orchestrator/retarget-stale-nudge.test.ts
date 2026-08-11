@@ -234,6 +234,54 @@ describe("#1429 retarget nudge reaches exactly the tabs that were stale", () => 
     expect(backend.turnTexts.some((x) => x.includes("target changed"))).toBe(false);
   });
 
+  it("a BROADCAST per-request nudge is not stolen by the next retarget either", async () => {
+    // Round-2 self-review: restartForMcpEnv cleared the marker but its all-tabs
+    // sibling did not, so the same theft was still reachable one call over.
+    const backend = new RecordingBackend();
+    backend.autoComplete = false;
+    const manager = makeManager(backend);
+
+    manager.send("tab-broadcast", "download that model");
+    await waitFor(() => backend.turnTexts.length >= 1);
+
+    manager.retargetAllForMcpEnv(OLD, NEW); // retarget nudge queued
+    manager.restartAllForMcpEnv("RETRY the download"); // broadcast nudge replaces it
+    manager.retargetAllForMcpEnv(NEW, "https://pod-z.proxy.runpod.net"); // must not steal it
+
+    backend.autoComplete = true;
+    backend.release();
+
+    await waitFor(() => backend.turnTexts.length >= 2);
+    expect(backend.turnTexts.filter((x) => x === "RETRY the download")).toHaveLength(1);
+  });
+
+  it("a tab renamed mid-turn keeps its retarget classification", async () => {
+    // Round-2 self-review: rebindAgent migrated the queued nudge but not the
+    // marker that says what KIND it is, so after a rename the next retarget read
+    // it as a per-request nudge and preserved an obsolete target.
+    const backend = new RecordingBackend();
+    backend.autoComplete = false;
+    const manager = makeManager(backend);
+    const A = "http://127.0.0.1:8188";
+    const B = "https://pod-b.proxy.runpod.net";
+    const C = "https://pod-c.proxy.runpod.net";
+
+    manager.send("tab-before", "render");
+    await waitFor(() => backend.turnTexts.length >= 1);
+
+    manager.retargetAllForMcpEnv(A, B); // stranded on A, queued under the old key
+    expect(manager.rebindAgent("tab-before", "tab-after")).toBe(true);
+    manager.retargetAllForMcpEnv(B, C); // must still recompose to A->C
+
+    backend.autoComplete = true;
+    backend.release();
+
+    await waitFor(() => backend.turnTexts.length >= 2);
+    const delivered = backend.turnTexts[backend.turnTexts.length - 1];
+    expect(delivered).toBe(staleTargetNudge(A, C));
+    expect(backend.turnTexts).not.toContain(staleTargetNudge(A, B));
+  });
+
   it("the plain (non-retarget) nudge still reaches an IDLE tab — #164 semantics unchanged", async () => {
     const backend = new RecordingBackend();
     backend.autoComplete = true;

@@ -2200,6 +2200,9 @@ export class PanelAgentManager {
         continue;
       }
       this.pendingMcpRestart.set(tabId, nudge ?? null);
+      // Whatever is queued now is not a retarget nudge any more (#1429) — leaving
+      // the marker set lets the NEXT retarget claim this one as its own.
+      this.pendingRetargetFrom.delete(tabId);
       // Apply immediately when the tab is already idle; otherwise it fires on the
       // next turn-done via applyPendingRestarts().
       tallyRestart(tally, this.applyPendingRestarts(tabId));
@@ -2679,6 +2682,13 @@ export class PanelAgentManager {
       this.pendingMcpRestart.set(newKey, this.pendingMcpRestart.get(oldKey)!);
       this.pendingMcpRestart.delete(oldKey);
     }
+    // The marker classifies that value (#1429), so it has to travel with it: left
+    // behind, the renamed tab's queued retarget nudge reads as a per-request one
+    // and the next retarget preserves an obsolete target instead of recomposing.
+    if (this.pendingRetargetFrom.has(oldKey)) {
+      this.pendingRetargetFrom.set(newKey, this.pendingRetargetFrom.get(oldKey)!);
+      this.pendingRetargetFrom.delete(oldKey);
+    }
     if (this.modelByKey.has(oldKey)) {
       this.modelByKey.set(newKey, this.modelByKey.get(oldKey)!);
       this.modelByKey.delete(oldKey);
@@ -2936,6 +2946,7 @@ export class PanelAgentManager {
     const durableCleared = this.opts.sessionStore ? this.opts.sessionStore.clear(tabId) : true;
     this.pendingEffortRestart.delete(tabId); // a reset supersedes any deferred restart
     this.pendingMcpRestart.delete(tabId);
+    this.pendingRetargetFrom.delete(tabId); // #1429 — nothing queued, nothing to classify
     // Drop this key's picker override so a provider switch (which reset()s the old
     // key) can't carry the old provider's model/effort into the new backend's spawn.
     this.modelByKey.delete(tabId);
