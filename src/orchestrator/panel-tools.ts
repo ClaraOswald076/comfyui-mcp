@@ -127,7 +127,6 @@ import {
   resetObjectInfoCache,
 } from "../comfyui/client.js";
 import { convertUiToApi, collectNodeTypes } from "../services/workflow-converter.js";
-import { downloadsAtRiskOfRespawn } from "../services/download-jobs.js";
 import type { ObjectInfo } from "../comfyui/types.js";
 import {
   restartComfyUI,
@@ -441,37 +440,35 @@ export function describeComfyuiSecretSave(receipt: SecretSaveReceipt): string {
         : `No live tool session needed rebuilding (${live} live).`,
     );
   }
-  // #1378 — SAY IT BEFORE THE RESPAWN, while waiting is still an option.
+  // #1378 — WHAT THIS SAVE COST, OR WILL COST, depending on when the respawn lands.
   //
   // A respawn changes the auth header the tool session attaches, which changes each
   // in-flight download's CACHE IDENTITY — so a `.partial` at 96% becomes unreachable and
-  // the re-issued download restarts from zero. A reporter lost ~29 GB across two files
-  // that way. The bytes were never deleted; nothing could find them again.
+  // re-issuing restarts from zero. A reporter lost ~29 GB across two files that way. The
+  // bytes were never deleted; nothing could find them again.
   //
-  // Rescuing the transfer is deliberately NOT attempted: reusing the old entry under the
-  // new identity would serve bytes fetched under one auth identity to a request made under
-  // another, which is precisely what folding headers into the key prevents. So the caller
-  // gets the choice instead — finish the downloads, then save the credential.
-  //
-  // Best-effort: a store this process cannot read must not break a credential save.
-  if (receipt.respawn && (receipt.respawn.applied || receipt.respawn.scheduled)) {
-    let atRisk: { filename: string; bytes: number }[] = [];
-    try {
-      atRisk = downloadsAtRiskOfRespawn();
-    } catch {
-      /* the warning is a courtesy; the save is the job */
-    }
-    if (atRisk.length) {
-      const gb = atRisk.reduce((n, d) => n + d.bytes, 0) / 1024 ** 3;
-      const names = atRisk.map((d) => d.filename).slice(0, 3).join(", ");
-      parts.push(
-        `WARNING — ${atRisk.length} download(s) are in flight (${names}${atRisk.length > 3 ? ", …" : ""}), ` +
-          `about ${gb.toFixed(2)} GB fetched so far. The respawn changes the credentials this ` +
-          `session sends, which changes each download's cache identity, so those transfers will ` +
-          `NOT resume — re-issuing them starts from 0% even though the partial files remain on ` +
-          `disk (#1378). If that matters, let them finish and save the credential afterwards.`,
-      );
-    }
+  // The list is snapshotted in the SETTER, before the synchronous respawn emit. My first
+  // version enumerated it here and told the user to "let them finish and save afterwards"
+  // about transfers an already-applied respawn had killed a tick earlier — advice that was
+  // not just useless but wrong about what had happened. Applied and scheduled get
+  // different sentences because they are different facts.
+  const atRisk = receipt.atRiskDownloads ?? [];
+  if (atRisk.length && receipt.respawn && (receipt.respawn.applied || receipt.respawn.scheduled)) {
+    const gb = atRisk.reduce((n, d) => n + d.bytes, 0) / 1024 ** 3;
+    const names = atRisk.map((d) => d.filename).slice(0, 3).join(", ");
+    const listed = `${atRisk.length} download(s) (${names}${atRisk.length > 3 ? ", …" : ""}), about ${gb.toFixed(2)} GB fetched`;
+    parts.push(
+      receipt.respawn.applied
+        ? `WARNING — the tool session was replaced immediately, and ${listed} were in flight. ` +
+          `The new credentials change each download's cache identity, so those transfers will ` +
+          `NOT resume: re-issuing them starts from 0% even though the partial files remain on ` +
+          `disk (#1378). Nothing can recover them under the new identity — that is the cost ` +
+          `already paid, not a warning you can act on.`
+        : `WARNING — ${listed} are in flight and the tool session is queued to be rebuilt at ` +
+          `the end of this turn. The new credentials change each download's cache identity, so ` +
+          `those transfers will NOT resume — re-issuing starts from 0% even though the partial ` +
+          `files remain on disk (#1378). If that matters, let them finish before the rebuild.`,
+    );
   }
   parts.push(
     !confirmed

@@ -16,7 +16,7 @@
 
 import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { extname, basename, dirname, join } from "node:path";
 import {
   downloadModel,
   liveListingHasEntry,
@@ -1682,6 +1682,31 @@ export function resetDownloadJobs(): void {
  * NEVER REPORTS THE URL. A download URL can carry query-string auth, and this string ends
  * up in a chat transcript — the filename and the byte count are what the decision needs.
  */
+/**
+ * A filename safe to print in a chat transcript (#1378).
+ *
+ * The URL is never reported, and a filename DERIVED from a url takes only the pathname —
+ * so the ordinary case cannot carry a query token. But an explicitly supplied `filename` is
+ * copied through unchanged, and its validation rejects separators and dot-names, not
+ * secret-looking content. A caller can legally pass `model-sk-live-abc123.safetensors`.
+ *
+ * So a name carrying a credential-shaped token is reported by its EXTENSION only. Losing
+ * the name costs the reader a little context; printing a live token into a transcript is
+ * not recoverable.
+ */
+function redactSecretishFilename(name: string | undefined): string {
+  if (!name) return "(unnamed)";
+  const looksSecretish =
+    // Hyphens and underscores INSIDE the token count: a real key is `sk-live-abc…`, and
+    // requiring 12 contiguous alphanumerics after the prefix missed exactly that shape.
+    /(sk|pk|hf|ghp|gho|xox[baprs])[-_][A-Za-z0-9_-]{12,}/.test(name) ||
+    /(api[-_]?key|secret|token|password|bearer)/i.test(name) ||
+    /[A-Za-z0-9_-]{32,}/.test(name);
+  if (!looksSecretish) return name;
+  const ext = extname(name);
+  return ext ? `(redacted)${ext}` : "(redacted)";
+}
+
 export function downloadsAtRiskOfRespawn(
   /**
    * Injectable for tests. Mocking `listDownloadJobs` does NOT work here: it is called from
@@ -1696,7 +1721,7 @@ export function downloadsAtRiskOfRespawn(
     if (job.status !== "downloading") continue;
     const progress = readDownloadProgress(job.progressId ?? job.trayId);
     at.push({
-      filename: job.filename ?? "(unnamed)",
+      filename: redactSecretishFilename(job.filename),
       bytes: progress?.downloaded ?? 0,
     });
   }

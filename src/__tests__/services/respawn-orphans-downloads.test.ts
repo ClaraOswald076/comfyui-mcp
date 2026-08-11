@@ -64,6 +64,25 @@ describe("downloadsAtRiskOfRespawn (#1378)", () => {
     ).toEqual([]);
   });
 
+  it("REDACTS a credential-shaped filename, not just the URL (codex)", () => {
+    // The URL is never reported and a url-DERIVED filename takes only the pathname — but an
+    // explicitly supplied `filename` is copied through unchanged, and its validation
+    // rejects separators and dot-names, not secret-looking content. A caller can legally
+    // pass `model-sk-live-abc123.safetensors`, and this string lands in a transcript.
+    hoisted.progress = { a: { downloaded: 1 }, b: { downloaded: 2 }, c: { downloaded: 3 } };
+    const at = downloadsAtRiskOfRespawn(
+      jobs(
+        { filename: "model-sk-live-abcdefghijkl.safetensors", status: "downloading", trayId: "a" },
+        { filename: "my_api_key_dump.safetensors", status: "downloading", trayId: "b" },
+        { filename: "flux2_dev.safetensors", status: "downloading", trayId: "c" },
+      ),
+    );
+    expect(at[0].filename).toBe("(redacted).safetensors");
+    expect(at[1].filename).toBe("(redacted).safetensors");
+    // …and an ordinary name is kept, or the warning stops being useful.
+    expect(at[2].filename).toBe("flux2_dev.safetensors");
+  });
+
   it("NEVER reports the URL — a download URL can carry query-string auth", () => {
     // This string lands in a chat transcript. The filename and the byte count are what the
     // decision needs; the URL is the one field that can carry a credential.
@@ -92,14 +111,33 @@ describe("downloadsAtRiskOfRespawn (#1378)", () => {
     ).toEqual([{ filename: "unknown-progress.safetensors", bytes: 0 }]);
   });
 
-  it("WIRING: the credential receipt warns only when a respawn is actually happening", async () => {
-    // The warning is worth nothing after the fact — by then the transfers are already
-    // orphaned. It has to ride the receipt that announces the respawn.
+  it("WIRING: the snapshot is taken in the SETTER, before the synchronous respawn", async () => {
+    // The whole premise. `emitComfyuiChange` is synchronous and a listener may replace its
+    // tool session inside it, so enumerating downloads afterwards describes a world where
+    // they are already orphaned — my first version did exactly that and then told the user
+    // to "let them finish". The snapshot has to be taken before the emit and ride the
+    // receipt.
     const { readFileSync } = await import("node:fs");
-    const src = readFileSync(new URL("../../orchestrator/panel-tools.ts", import.meta.url), "utf8")
-      .replace(/\/\*[\s\S]*?\*\//g, "")
-      .replace(/\/\/.*/g, "");
-    expect(src).toMatch(/downloadsAtRiskOfRespawn\(\)/);
-    expect(src).toMatch(/receipt\.respawn && \(receipt\.respawn\.applied \|\| receipt\.respawn\.scheduled\)/);
+    const code = (rel: string): string =>
+      readFileSync(new URL(rel, import.meta.url), "utf8")
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/.*/g, "");
+
+    const setter = code("../../services/panel-secrets.ts");
+    // The CALL SITE, not the helper's definition. Measuring `snapshotAtRiskDownloads()`
+    // alone found the function declaration — which sits near the top of the file and is
+    // therefore always "before the emit", so the assertion passed no matter where the call
+    // actually was. Mutation testing caught it: moving the call after the emit left this
+    // green.
+    const snapshotAt = setter.indexOf("? snapshotAtRiskDownloads()");
+    const emitAt = setter.indexOf("emitComfyuiChange({");
+    expect(snapshotAt, "the setter must snapshot in-flight downloads").toBeGreaterThan(-1);
+    expect(emitAt).toBeGreaterThan(-1);
+    expect(snapshotAt, "the snapshot must precede the respawn emit").toBeLessThan(emitAt);
+
+    // …and the receipt renderer must read that snapshot rather than re-enumerating.
+    const receipt = code("../../orchestrator/panel-tools.ts");
+    expect(receipt).toMatch(/receipt\.atRiskDownloads/);
+    expect(receipt).not.toMatch(/downloadsAtRiskOfRespawn\(\)/);
   });
 });

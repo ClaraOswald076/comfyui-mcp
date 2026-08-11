@@ -48,6 +48,7 @@ import {
   MANAGED_SECRET_KEYS_ENV,
 } from "../env-file.js";
 import { logger } from "../utils/logger.js";
+import { downloadsAtRiskOfRespawn } from "./download-jobs.js";
 import { runningUnderTestRunner } from "./test-isolation-guard.js";
 import { OPENAI_KEY_PROVIDERS, providerModelHint } from "./openai-provider-registry.js";
 
@@ -189,6 +190,20 @@ function emitGuarded(event: "change" | "agentChange", payload?: Partial<ComfyuiS
   }
 }
 
+/** Downloads in flight at the moment a credential save is about to respawn the tool
+ *  session (#1378). Best-effort: a records store this process cannot read must never break
+ *  a credential save, and an unreadable store is reported as "none" rather than throwing. */
+function snapshotAtRiskDownloads(): { filename: string; bytes: number }[] {
+  try {
+    return downloadsAtRiskOfRespawn();
+  } catch (err) {
+    logger.debug("[secrets] could not enumerate in-flight downloads for the respawn warning", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+}
+
 function emitComfyuiChange(payload: Partial<ComfyuiSecretChange>): void {
   if (emitSuspendDepth > 0) {
     suspendedComfyuiChange = true;
@@ -312,6 +327,13 @@ export function onComfyuiSecretsChanged(cb: (change: ComfyuiSecretChange) => voi
  * from this instead of asserting a respawn that may never fire (#826).
  */
 export interface SecretSaveReceipt {
+  /**
+   * Downloads that were in flight when this save was about to respawn the tool session
+   * (#1378). Captured BEFORE the (synchronous) respawn emit, so an already-applied
+   * replacement can still report what it cost — afterwards the list is empty and the
+   * warning would describe nothing.
+   */
+  atRiskDownloads?: { filename: string; bytes: number }[];
   /** The env var written. Never the value. */
   key: string;
   /** The canonical file it was written to (contains no secret). */
@@ -1605,6 +1627,18 @@ export function setEnvSecret(
   // has landed by the time this returns — the receipt describes observed work,
   // not an intention. No listener → `respawn: null`, never a fabricated zero.
   const reports: SecretRespawnReport[] = [];
+  // #1378 — SNAPSHOT BEFORE THE EMIT, because the emit is where the damage happens.
+  //
+  // `emitComfyuiChange` is synchronous and a listener may replace its tool session inside
+  // it, so by the time the receipt is rendered those downloads are already orphaned. My
+  // first version enumerated them afterwards and told the user "let them finish and save
+  // the credential afterwards" about transfers that had been dead for a tick — advice that
+  // was not merely useless but wrong about what had happened.
+  //
+  // Taken before, the list is what WAS in flight, which is the right thing to report in
+  // both cases: still running for a queued respawn, already lost for an applied one. The
+  // receipt words those differently.
+  const atRiskDownloads = isAllowedComfyuiSecretKey(trimmed) ? snapshotAtRiskDownloads() : [];
   if (isAllowedComfyuiSecretKey(trimmed))
     emitComfyuiChange({
       requested: opts.requested === true,
@@ -1616,6 +1650,7 @@ export function setEnvSecret(
     });
   if (isAllowedAgentSecretKey(trimmed)) emitAgentChange(); // flip provider readiness live
   return {
+    atRiskDownloads,
     key: trimmed,
     path: envFilePath(),
     persisted,
