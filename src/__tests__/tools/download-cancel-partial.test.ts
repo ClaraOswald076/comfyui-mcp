@@ -17,7 +17,7 @@
 
 import { describe, expect, it, afterEach } from "vitest";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
-import { dirname } from "node:path";
+import { basename, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -55,14 +55,40 @@ describe("findResumablePartial reports what is ACTUALLY staged (#1370)", () => {
     expect(found?.path).toBe(staged);
   });
 
-  it("the staged name is HASHED, not the destination filename", async () => {
-    // Pins the fact the first implementation got wrong. If this ever becomes
-    // `.flux2_dev_fp8mixed.safetensors.partial`, the lookup and the writer have diverged
-    // and one of them is silently wrong.
+  it("the staged name is HASHED and HIDDEN — both details cost a round", async () => {
+    // Two separate mistakes, one per review round:
+    //   1. searched `.<destination filename>.partial` — wrong KEY (the writer stages by
+    //      cache identity, not destination);
+    //   2. derived the cache path correctly and dropped the LEADING DOT, so it looked for
+    //      `hash.ext.partial` while the writer wrote `.hash.ext.partial`.
+    // Each time the lookup found nothing and would have told a user holding 30 GB of
+    // resumable bytes to start over. The dot is asserted separately because the previous
+    // version of this test used `/[0-9a-f]{32}\.safetensors\.partial$/`, which matches
+    // happily with OR without it.
     await useTempCache();
     const p = stagedPartialPathForUrl(URL_A);
-    expect(p).not.toMatch(/flux2_dev_fp8mixed/);
-    expect(p).toMatch(/[0-9a-f]{32}\.safetensors\.partial$/);
+    const name = basename(p);
+    expect(p, "must not be keyed on the destination filename").not.toMatch(/flux2_dev_fp8mixed/);
+    expect(name.startsWith("."), `staged file must be hidden, got ${name}`).toBe(true);
+    expect(name).toMatch(/^\.[0-9a-f]{32}\.safetensors\.partial$/);
+  });
+
+  it("WIRING: the WRITER stages through the same function the lookup reads", async () => {
+    // The root cause of both rounds was two parallel derivations of one path, each
+    // confident and one wrong. A test that only compares the helper against itself cannot
+    // see that — my fixtures were built by calling the helper under test, so they agreed
+    // with every wrong version of it.
+    //
+    // This asserts the writer does not hand-roll the path any more. It is the only check
+    // here that could have failed while all the others passed.
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(new URL("../../services/download-cache.ts", import.meta.url), "utf8")
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\/\/.*/g, "");
+    expect(src).toMatch(/const partial = stagedPartialPathForTarget\(target\);/);
+    // …and the hand-rolled expression exists in exactly ONE place: the shared helper.
+    const handRolled = src.match(/join\(cacheDir\(\), `\.\$\{basename\([a-z]+\)\}\.partial`\)/g) ?? [];
+    expect(handRolled.length, "the staged path must be built in exactly one place").toBe(1);
   });
 
   it("returns NULL when nothing is staged — the reporter's case", async () => {
