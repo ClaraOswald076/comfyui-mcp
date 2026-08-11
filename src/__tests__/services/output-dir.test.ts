@@ -24,7 +24,12 @@ let modelsDirStat: "dir" | "file" | "enoent" | "eacces" = "dir";
 let statFor: ((p: string) => { isDirectory: () => boolean; isFile: () => boolean }) | undefined;
 /** Canonicalization, for the #851 physical-containment check. Identity by default. */
 let realpathFor: ((p: string) => string) | undefined;
+/** What the BASE's own category dir contains (#1371). A contradiction requires this base
+ *  to hold files of its own — an EMPTY category dir is an extra_model_paths root that
+ *  simply has nothing here yet, which is a working setup and must not be refused. */
+let baseCategoryEntries: string[] = [];
 vi.mock("node:fs", () => ({
+  readdirSync: () => baseCategoryEntries,
   realpathSync: (p: string) => (realpathFor ? realpathFor(String(p)) : String(p)),
   existsSync: (p: string) => (existsFor ? existsFor(String(p)) : liveRootExists),
   statSync: (p: string) => {
@@ -156,6 +161,7 @@ beforeEach(() => {
   hasEntrypointFor = undefined;
   existsFor = undefined;
   modelsDirStat = "dir";
+  baseCategoryEntries = [];
   statFor = undefined;
   realpathFor = undefined;
   serverInventory = undefined;
@@ -1201,10 +1207,30 @@ describe("#1371 — a configured base the server demonstrably does not read is r
     serverInventory = { vae: ["h3-only.safetensors"] };
     modelsDirStat = "dir";
     existsFor = (p) => p.endsWith("models");
+    // The stale base holds its OWN models for this category — a second full install. That
+    // is what makes "none of the server's files are here" diagnostic rather than merely
+    // uninformative.
+    baseCategoryEntries = ["something-else.safetensors"];
 
     await expect(resolveModelsDirWithBases({ targetCategory: "vae" })).rejects.toThrow(
       /Refusing to download into/,
     );
+  });
+
+  it("does NOT refuse a multi-root base that is simply EMPTY for this category", async () => {
+    // THE P0 DIRECTION. An extra_model_paths layout can legitimately have this base as one
+    // of the server's roots with nothing in this category yet — indistinguishable from a
+    // stale base by filename listing alone. Refusing it would block a working install,
+    // which is worse than the wrong-directory write this gate exists to stop.
+    config.comfyuiPath = "/second-root";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { vae: ["lives-in-the-other-root.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = [];
+
+    const { modelsDir } = await resolveModelsDirWithBases({ targetCategory: "vae" });
+    expect(modelsDir).toBe(resolve("/second-root", "models"));
   });
 
   it("still writes when the server lists NOTHING — absence of evidence is not evidence", async () => {

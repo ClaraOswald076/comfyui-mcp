@@ -1,4 +1,4 @@
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { config, isRemoteMode } from "../config.js";
 import { getSystemStats, comfyApiFetch } from "../comfyui/client.js";
@@ -653,7 +653,26 @@ async function corroborateBaseByModelInventory(
           : "");
     } else if (missing.length > 0) {
       const present = files.length - missing.length;
-      if (present === 0) contradictedBase = true;
+      // CONTRADICTION REQUIRES THIS BASE TO HAVE SOMETHING OF ITS OWN.
+      //
+      // present === 0 means none of the server's files for this category are here. That is
+      // a stale base — or an extra_model_paths layout where this IS one of the server's
+      // roots and simply has nothing in this category yet. A filename listing cannot tell
+      // those apart, and refusing the second would block a working install, which is worse
+      // than the wrong-directory write this gate exists to stop.
+      //
+      // An EMPTY (or absent) category dir here is therefore no evidence, not evidence
+      // against. A base holding a different set of files for the same category is the case
+      // that is actually diagnostic, and it is the reporter's: a second full install.
+      if (present === 0) {
+        let baseHasOwnFilesHere = false;
+        try {
+          baseHasOwnFilesHere = readdirSync(categoryDir).length > 0;
+        } catch {
+          // Absent or unreadable — nothing established either way.
+        }
+        contradictedBase = baseHasOwnFilesHere;
+      }
       lastReason =
         present === 0
           ? `the server lists ${files.length} file(s) under "${category}" and NONE of them are under ` +
