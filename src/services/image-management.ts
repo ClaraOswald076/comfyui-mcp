@@ -805,18 +805,7 @@ export async function getOutputImage(
   // untouched: an HTML error page, a login redirect or a truncated body does not parse and
   // is still refused. ComfyUI answers 200 with an error body often enough that this check
   // is the only thing standing between the caller and a corrupt "image".
-  const isJson =
-    allowJson &&
-    ext === ".json" &&
-    result.base64.length > 0 &&
-    (() => {
-      try {
-        JSON.parse(Buffer.from(result.base64, "base64").toString("utf8"));
-        return true;
-      } catch {
-        return false;
-      }
-    })();
+  const isJson = allowJson && ext === ".json" && looksLikeSavableJson(result.base64);
   if ((!isImage && !isMedia && !isJson) || result.base64.length === 0) {
     const where = subfolder ? `${type}/${subfolder}` : type;
     throw new ComfyUIError(
@@ -830,6 +819,52 @@ export async function getOutputImage(
   }
 
   return { ...result, filename };
+}
+
+/**
+ * Byte ceiling for the JSON validation (#1373).
+ *
+ * A workflow is tens to hundreds of kilobytes; ComfyUI's own saves are well under a
+ * megabyte. Parsing is the acceptance test, and parsing means decoding the whole payload
+ * into a string and building an object graph from it — so an enormous body would be paid
+ * for twice in memory before anything could reject it. 32 MB is far above any real
+ * workflow and far below a problem.
+ *
+ * Above the ceiling the answer is REFUSE, not accept-unchecked: a `.json` that large is
+ * not the workflow attachment this path exists to save, and accepting it unverified would
+ * hand back exactly the unvalidated payload the surrounding guard is for.
+ */
+const MAX_JSON_ATTACHMENT_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Is this payload a JSON document worth saving as the requested attachment? (#1373)
+ *
+ * Parsing is the test, because the declared content-type is a claim and parsing is a fact
+ * — the reporter's server labelled a valid workflow `video/json`.
+ *
+ * BUT VALID JSON IS NOT THE SAME AS THE FILE THEY ASKED FOR (codex). ComfyUI answers 200
+ * with a JSON error envelope in several cases, and `{"error":"not found"}` parses
+ * perfectly. Saving that as `my_workflow.json` is the original bug in a new costume: a
+ * failure written to disk under the name of the thing that failed. So a top-level `error`
+ * key on an object body is refused — narrow on purpose, because every OTHER shape of valid
+ * JSON is legitimately savable and guessing further would start rejecting real files.
+ */
+function looksLikeSavableJson(base64: string): boolean {
+  if (base64.length === 0) return false;
+  // base64 is 4 chars per 3 bytes; compare before decoding so the ceiling is not paid to
+  // be enforced.
+  if (Math.floor((base64.length * 3) / 4) > MAX_JSON_ATTACHMENT_BYTES) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(base64, "base64").toString("utf8"));
+  } catch {
+    return false;
+  }
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const rec = parsed as Record<string, unknown>;
+    if ("error" in rec) return false;
+  }
+  return true;
 }
 
 /**

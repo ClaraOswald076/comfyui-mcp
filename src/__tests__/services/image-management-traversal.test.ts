@@ -708,6 +708,45 @@ describe("#1373 — a .json attachment is accepted by PARSING it, not by its con
     ).resolves.toBeDefined();
   });
 
+  it("REFUSES a 200 JSON ERROR ENVELOPE — valid JSON is not the file they asked for", async () => {
+    // ComfyUI answers 200 with a JSON error body in several cases, and {"error":"..."}
+    // parses perfectly. Saving it as my_workflow.json is this issue's own bug in a new
+    // costume: a failure written to disk under the name of the thing that failed.
+    fetchImageMock.mockResolvedValue(jsonBody('{"error":"not found"}'));
+    await expect(
+      getOutputImage("wf.json", "input", "", { allowMedia: true, allowJson: true }),
+    ).rejects.toThrow(/did not return an image/);
+  });
+
+  it("…but a workflow that merely CONTAINS the word error is still saved", async () => {
+    // The refusal is a top-level `error` KEY on an object, not a substring search. A node
+    // titled "error handler" or a widget value mentioning errors is an ordinary workflow.
+    fetchImageMock.mockResolvedValue(
+      jsonBody('{"nodes":[{"title":"error handler","widgets_values":["error"]}]}'),
+    );
+    await expect(
+      getOutputImage("wf.json", "input", "", { allowMedia: true, allowJson: true }),
+    ).resolves.toBeDefined();
+  });
+
+  it("REFUSES an implausibly large .json rather than parsing it unchecked", async () => {
+    // Parsing is the acceptance test, and parsing means decoding the whole body and
+    // building an object graph — paid twice in memory before anything could reject it. A
+    // workflow is kilobytes; 32 MB is far above any real one. Above the ceiling the answer
+    // is REFUSE, because accepting unverified is exactly what this guard exists to prevent.
+    // VALID JSON, deliberately — an invalid blob would be refused by the parse regardless,
+    // so the test would pass with the ceiling removed and prove nothing. Mutation testing
+    // caught exactly that: my first version used 45 MB of "A".
+    const huge = JSON.stringify({ pad: "A".repeat(40 * 1024 * 1024) });
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from(huge, "utf8").toString("base64"),
+      mimeType: "application/json",
+    });
+    await expect(
+      getOutputImage("huge.json", "input", "", { allowMedia: true, allowJson: true }),
+    ).rejects.toThrow(/did not return an image/);
+  });
+
   it("REFUSES an HTML error page served as .json — the rejection this check exists for", async () => {
     // ComfyUI answers 200 with an error body often enough that this is the whole point.
     // A permissive "it was requested as .json, save it" would hand back a login page as a
