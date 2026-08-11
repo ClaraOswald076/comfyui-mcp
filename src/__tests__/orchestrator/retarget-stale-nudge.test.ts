@@ -7,9 +7,14 @@
 //     would be a false alarm — and a nudge is a real agent TURN, not a log line,
 //     so a spurious one costs the user a response about nothing).
 //
-// The second is the direction that fails silently. `onlyWhenDeferred` could be
-// ignored entirely and every "does the busy tab get told?" assertion would still
-// pass, because the old code delivered the nudge to everyone.
+// The second is the direction that fails silently: a retargetAllForMcpEnv that
+// nudged unconditionally would still pass every "does the busy tab get told?"
+// assertion.
+//
+// The rest come from adversarial review of the first cut, and each one produced
+// something worse than silence: an A-to-B message delivered while the child is on
+// C, a per-request retry nudge erased one step removed, and a nudge fired for a
+// target that never actually moved.
 
 import { describe, expect, it, beforeAll } from "vitest";
 import type {
@@ -19,11 +24,7 @@ import type {
   ModelChoice,
 } from "../../orchestrator/agent-backend.js";
 import { CLAUDE_CAPABILITIES } from "../../orchestrator/agent-backend.js";
-import {
-  retargetIsWorthNudging,
-  retargetRestartArgs,
-  staleTargetNudge,
-} from "../../orchestrator/retarget-nudge.js";
+import { retargetIsWorthNudging, staleTargetNudge } from "../../orchestrator/retarget-nudge.js";
 
 let PanelAgentManager: typeof import("../../orchestrator/panel-agent.js").PanelAgentManager;
 
@@ -90,7 +91,9 @@ async function waitFor(cond: () => boolean, timeoutMs = 5000): Promise<void> {
   }
 }
 
-const NUDGE = staleTargetNudge("http://127.0.0.1:8188", "https://pod-8188.proxy.runpod.net");
+const OLD = "http://127.0.0.1:8188";
+const NEW = "https://pod-8188.proxy.runpod.net";
+const NUDGE = staleTargetNudge(OLD, NEW);
 
 describe("#1429 retarget nudge reaches exactly the tabs that were stale", () => {
   it("a MID-TURN tab is told, when its deferred respawn finally lands", async () => {
@@ -102,7 +105,7 @@ describe("#1429 retarget nudge reaches exactly the tabs that were stale", () => 
     await waitFor(() => backend.turnTexts.length >= 1);
 
     // The retarget arrives mid-turn: it can only be scheduled.
-    const tally = manager.restartAllForMcpEnv(NUDGE, { onlyWhenDeferred: true });
+    const tally = manager.retargetAllForMcpEnv(OLD, NEW);
     expect(tally).toEqual({ live: 1, applied: 0, scheduled: 1 });
     // Nothing delivered YET — the turn is still running, and interrupting it to
     // deliver news is not the trade this makes.
@@ -126,7 +129,7 @@ describe("#1429 retarget nudge reaches exactly the tabs that were stale", () => 
     await new Promise((r) => setTimeout(r, 50));
 
     const before = backend.turnTexts.length;
-    const tally = manager.restartAllForMcpEnv(NUDGE, { onlyWhenDeferred: true });
+    const tally = manager.retargetAllForMcpEnv(OLD, NEW);
     // Applied on the spot — so there was never a stale window to report.
     expect(tally.scheduled).toBe(0);
     expect(tally.applied).toBe(1);
@@ -148,7 +151,7 @@ describe("#1429 retarget nudge reaches exactly the tabs that were stale", () => 
     // A per-request retry nudge is queued first (credentials arrived, #164) …
     expect(manager.restartForMcpEnv("tab-both", "RETRY the download")).toBe("scheduled");
     // … then a retarget lands on the same still-busy tab.
-    manager.restartAllForMcpEnv(NUDGE, { onlyWhenDeferred: true });
+    manager.retargetAllForMcpEnv(OLD, NEW);
 
     backend.autoComplete = true;
     backend.release();
@@ -158,6 +161,77 @@ describe("#1429 retarget nudge reaches exactly the tabs that were stale", () => 
     // the tab is not restarted twice to deliver both.
     expect(backend.turnTexts.filter((t) => t === "RETRY the download")).toHaveLength(1);
     expect(backend.turnTexts).not.toContain(NUDGE);
+  });
+
+  it("two retargets in one turn report A-to-C — never the obsolete A-to-B", async () => {
+    // codex finding: keeping the FIRST retarget's message tells the agent it is
+    // on B while its respawned child is on C. Wrong information is worse than
+    // none — it invites the agent to reason about infrastructure that moved on.
+    const backend = new RecordingBackend();
+    backend.autoComplete = false;
+    const manager = makeManager(backend);
+    const A = "http://127.0.0.1:8188";
+    const B = "https://pod-b.proxy.runpod.net";
+    const C = "https://pod-c.proxy.runpod.net";
+
+    manager.send("tab-abc", "render");
+    await waitFor(() => backend.turnTexts.length >= 1);
+
+    manager.retargetAllForMcpEnv(A, B); // stranded on A
+    manager.retargetAllForMcpEnv(B, C); // still stranded on A — now heading to C
+
+    backend.autoComplete = true;
+    backend.release();
+
+    await waitFor(() => backend.turnTexts.length >= 2);
+    const delivered = backend.turnTexts[backend.turnTexts.length - 1];
+    // The ORIGIN is what the turn actually used, and C is where it is now.
+    expect(delivered).toBe(staleTargetNudge(A, C));
+    expect(backend.turnTexts).not.toContain(staleTargetNudge(A, B));
+    expect(delivered).not.toContain(B);
+  });
+
+  it("a per-request nudge queued AFTER a retarget survives the NEXT retarget", async () => {
+    // codex finding, one step removed from #164: the retarget marker has to be
+    // cleared when a per-request nudge overwrites the queued value, or the next
+    // retarget classifies that nudge as its own and takes it.
+    const backend = new RecordingBackend();
+    backend.autoComplete = false;
+    const manager = makeManager(backend);
+
+    manager.send("tab-order", "download that model");
+    await waitFor(() => backend.turnTexts.length >= 1);
+
+    manager.retargetAllForMcpEnv(OLD, NEW); // retarget nudge queued
+    expect(manager.restartForMcpEnv("tab-order", "RETRY the download")).toBe("scheduled");
+    manager.retargetAllForMcpEnv(NEW, "https://pod-z.proxy.runpod.net"); // must not steal it
+
+    backend.autoComplete = true;
+    backend.release();
+
+    await waitFor(() => backend.turnTexts.length >= 2);
+    expect(backend.turnTexts.filter((x) => x === "RETRY the download")).toHaveLength(1);
+  });
+
+  it("a same-target reaffirmation that only differs textually nudges NOBODY", async () => {
+    // codex finding: the previous target is the raw COMFYUI_URL, the event carries
+    // the canonical base URL, so a trailing slash reads as a move. A busy tab must
+    // not be charged a whole turn to hear about a target that did not change.
+    const backend = new RecordingBackend();
+    backend.autoComplete = false;
+    const manager = makeManager(backend);
+
+    manager.send("tab-canon", "render");
+    await waitFor(() => backend.turnTexts.length >= 1);
+
+    const tally = manager.retargetAllForMcpEnv("http://127.0.0.1:8188/", "http://127.0.0.1:8188");
+    expect(tally.scheduled).toBe(1); // the respawn still happens…
+
+    backend.autoComplete = true;
+    backend.release();
+    await new Promise((r) => setTimeout(r, 150));
+    // …but nothing is said about a target that did not move.
+    expect(backend.turnTexts.some((x) => x.includes("target changed"))).toBe(false);
   });
 
   it("the plain (non-retarget) nudge still reaches an IDLE tab — #164 semantics unchanged", async () => {
@@ -203,33 +277,29 @@ describe("#1429 nudge wording", () => {
   });
 });
 
-// The call site is `manager.restartAllForMcpEnv(...retargetRestartArgs(prev, url))`,
-// so these ARE the wiring: a change that dropped the flag would have to change
-// this function, and these assertions, to get through.
-describe("#1429 the arguments the retarget actually passes", () => {
-  it("a real switch passes the nudge AND onlyWhenDeferred", () => {
-    const args = retargetRestartArgs("http://127.0.0.1:8188", "https://pod.proxy.net");
-    expect(args).toHaveLength(2);
-    expect(args[0]).toBe(staleTargetNudge("http://127.0.0.1:8188", "https://pod.proxy.net"));
-    // Without this flag every idle tab is nudged too — the exact false alarm the
-    // deferred-only path exists to prevent.
-    expect(args[1]).toEqual({ onlyWhenDeferred: true });
+describe("#1429 same-target detection (the expensive direction is a FALSE move)", () => {
+  const moved = (a: string, b: string) => retargetIsWorthNudging(a, b);
+
+  it("trailing slash, case and default ports are not moves", () => {
+    expect(moved("http://127.0.0.1:8188/", "http://127.0.0.1:8188")).toBe(false);
+    expect(moved("http://LOCALHOST:8188", "http://localhost:8188")).toBe(false);
+    expect(moved("http://example.com:80", "http://example.com")).toBe(false);
+    expect(moved("https://example.com:443/", "https://example.com")).toBe(false);
   });
 
-  it("a startup seed passes NOTHING — the plain silent respawn", () => {
-    expect(retargetRestartArgs(null, "http://127.0.0.1:8188")).toEqual([]);
+  it("a real move is still a move", () => {
+    expect(moved("http://127.0.0.1:8188", "http://127.0.0.1:8189")).toBe(true);
+    expect(moved("http://127.0.0.1:8188", "https://127.0.0.1:8188")).toBe(true);
+    expect(moved("http://127.0.0.1:8188", "https://pod.proxy.net")).toBe(true);
   });
 
-  it("a same-address reaffirmation passes nothing either", () => {
-    expect(retargetRestartArgs("http://x:8188", "http://x:8188")).toEqual([]);
+  it("a base path is part of the target", () => {
+    expect(moved("http://h:8188/comfyapi", "http://h:8188")).toBe(true);
+    expect(moved("http://h:8188/comfyapi/", "http://h:8188/comfyapi")).toBe(false);
   });
 
-  it("spreading the empty result is the no-nudge call — not an undefined nudge", () => {
-    // `restartAllForMcpEnv(...[])` must be indistinguishable from `…()`, or the
-    // #164 nudge-preserving branch (which keys on `nudge === undefined`) changes
-    // meaning for every retarget.
-    const [nudge, opts] = retargetRestartArgs(null, "http://127.0.0.1:8188");
-    expect(nudge).toBeUndefined();
-    expect(opts).toBeUndefined();
+  it("unparseable input falls back to exact equality rather than guessing", () => {
+    expect(moved("not a url", "not a url")).toBe(false);
+    expect(moved("not a url", "http://127.0.0.1:8188")).toBe(true);
   });
 });

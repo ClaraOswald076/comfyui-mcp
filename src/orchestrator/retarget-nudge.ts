@@ -38,21 +38,36 @@ export function staleTargetNudge(from: string, to: string): string {
  *  so a nudge would be a false alarm. Same-address is likewise not a move; the
  *  caller already skips those, and this keeps the helper honest on its own. */
 export function retargetIsWorthNudging(from: string | null | undefined, to: string): boolean {
-  return typeof from === "string" && from.length > 0 && from !== to;
+  if (typeof from !== "string" || from.length === 0) return false;
+  return sameTarget(from, to) === false;
 }
 
 /**
- * The exact argument list the retarget hands `restartAllForMcpEnv`, so the whole
- * decision — nudge or not, deferred-only or not — lives HERE and is unit-testable,
- * and the call site is a spread that cannot quietly lose the flag. A call site
- * that passed the nudge WITHOUT `onlyWhenDeferred` would still type-check and
- * still pass every manager-level test; it would just also nudge idle tabs, which
- * is the failure this whole module exists to avoid.
+ * Whether two target strings name the same ComfyUI, textual differences aside.
+ *
+ * The comparison CANNOT be `from !== to` (codex finding). The previous target is
+ * seeded from the raw `COMFYUI_URL` the user set, while every retarget event
+ * carries the canonical `getComfyUIBaseUrl()` — so booting with a trailing slash,
+ * an uppercase host, or an explicit `:80`/`:443` and then reaffirming that very
+ * same target reads as a MOVE, and a mid-turn tab gets told its ComfyUI changed
+ * when nothing changed. A false nudge costs a real agent turn, so the false
+ * direction here is the expensive one.
+ *
+ * Unparseable input falls back to exact string equality rather than guessing.
  */
-export function retargetRestartArgs(
-  from: string | null | undefined,
-  to: string,
-): [nudge?: string, opts?: { onlyWhenDeferred?: boolean }] {
-  if (!retargetIsWorthNudging(from, to)) return [];
-  return [staleTargetNudge(from as string, to), { onlyWhenDeferred: true }];
+function sameTarget(a: string, b: string): boolean {
+  if (a === b) return true;
+  let ua: URL, ub: URL;
+  try {
+    ua = new URL(a);
+    ub = new URL(b);
+  } catch {
+    return false;
+  }
+  const norm = (u: URL) => {
+    // URL already lowercases host+protocol and folds a default port to "".
+    const path = u.pathname.replace(/\/+$/, "");
+    return `${u.protocol}//${u.hostname}:${u.port}${path}`;
+  };
+  return norm(ua) === norm(ub);
 }

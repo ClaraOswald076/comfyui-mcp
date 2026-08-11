@@ -29,6 +29,7 @@ import type { AgentBackend, AgentEvent, NeutralTurn } from "./agent-backend.js";
 import { type AudioRef, dedupeAudioRefs, noAudioPartText } from "./audio-attachment.js";
 import { runErrorNotice } from "./cli-remedy.js";
 import { runCompletionDirective } from "./todo-state.js";
+import { retargetIsWorthNudging, staleTargetNudge } from "./retarget-nudge.js";
 import {
   ClaudeBackend,
   fetchSupportedModels,
@@ -2033,6 +2034,12 @@ export class PanelAgentManager {
    *  an optional nudge to enqueue after the resumed agent comes back (e.g. "retry
    *  the download"). Applied at the next idle so the saving turn finishes first. */
   private pendingMcpRestart = new Map<string, string | null>();
+  /** #1429 — tabs whose queued MCP-restart nudge is a RETARGET nudge, mapped to
+   *  the EARLIEST address they were stranded on. Two jobs: it tells a retarget
+   *  nudge apart from a per-request retry nudge (#164, which must never be
+   *  overwritten), and it makes A→B→C inside one turn report A→C rather than the
+   *  obsolete A→B. Cleared wherever pendingMcpRestart is. */
+  private pendingRetargetFrom = new Map<string, string>();
   /** Default model/effort for newly-spawned agents (the env/config defaults). */
   private model: string;
   private effort?: Effort;
@@ -2177,51 +2184,84 @@ export class PanelAgentManager {
    *  next idle so the turn that SAVED the secret finishes first (we never
    *  interrupt a live reply). `nudge`, if given, is enqueued to each resumed
    *  agent so it auto-continues (e.g. retries the download the secret unblocked). */
-  restartAllForMcpEnv(
-    nudge?: string,
-    opts?: {
-      /** #1429 — deliver `nudge` ONLY to tabs whose restart had to be DEFERRED.
-       *  A retarget nudge says "your tools spent that turn on the old address";
-       *  that is true exactly when the tab was mid-turn. An idle tab respawns
-       *  before it can run anything, so nudging it would be a false alarm — and
-       *  a nudge is a real agent turn (restartAgentResume delivers it as one),
-       *  not a log line, so a false one costs the user a spurious response.
-       *  The per-request retry nudge (#164) means something different — "the
-       *  thing you just tried can be retried now" — and is right to fire on an
-       *  idle tab, so it keeps the default. */
-      onlyWhenDeferred?: boolean;
-    },
-  ): McpEnvRestartTally {
+  restartAllForMcpEnv(nudge?: string): McpEnvRestartTally {
     // Snapshot the key set: applyPendingRestarts REPLACES entries in this.agents
     // (spawn + retire) while we iterate, and mutating a Map during its own
     // iteration is how a tab silently gets skipped.
     const keys = [...this.agents.keys()];
     const tally: McpEnvRestartTally = { live: 0, applied: 0, scheduled: 0 };
-    const deferredOnly = opts?.onlyWhenDeferred === true;
     for (const tabId of keys) {
       // A SILENT env respawn (no nudge) must NOT downgrade a tab that already has
       // a retry nudge queued (#164): a concurrent env change on another tab, or a
       // retarget, would otherwise erase a still-pending per-request nudge before
       // its busy agent could apply it. Keep the existing nudge; still coalesce.
-      //
-      // A deferred-only nudge is silent AT THIS POINT — whether it applies is not
-      // known until the outcome below — so it takes the same branch, and for the
-      // same reason: the queued per-request nudge is the more specific one.
-      if ((nudge === undefined || deferredOnly) && this.pendingMcpRestart.get(tabId)) {
+      if (nudge === undefined && this.pendingMcpRestart.get(tabId)) {
         tallyRestart(tally, this.applyPendingRestarts(tabId));
         continue;
       }
-      this.pendingMcpRestart.set(tabId, deferredOnly ? null : (nudge ?? null));
+      this.pendingMcpRestart.set(tabId, nudge ?? null);
       // Apply immediately when the tab is already idle; otherwise it fires on the
       // next turn-done via applyPendingRestarts().
+      tallyRestart(tally, this.applyPendingRestarts(tabId));
+    }
+    return tally;
+  }
+
+  /**
+   * #1429 — the ComfyUI target moved, so every tab's comfyui MCP child must be
+   * respawned to learn the new address. Identical to restartAllForMcpEnv() except
+   * for what a MID-TURN tab is told afterwards.
+   *
+   * A tab that is busy cannot have its child replaced now, so it goes on serving
+   * `from` for the rest of that turn. It gets a nudge naming both addresses. A
+   * tab that is IDLE respawns before it can run anything and gets NOTHING: a
+   * nudge is a real agent turn (restartAgentResume delivers it as one), not a log
+   * line, so a false one costs the user a response about nothing.
+   *
+   * Two orderings this has to get right, both found in adversarial review:
+   *
+   *   * A per-request retry nudge (#164, "the download you just tried can be
+   *     retried now") is MORE SPECIFIC than a retarget nudge and must never be
+   *     overwritten by one — hence pendingRetargetFrom, which is what tells the
+   *     two apart when a nudge is already queued.
+   *   * Two retargets inside one turn (A→B then B→C) must tell the agent A→C.
+   *     Keeping the first message would state a target the respawned child is
+   *     NOT on, which is worse than saying nothing — so the ORIGIN is what
+   *     persists, and the message is recomposed against the current target.
+   */
+  retargetAllForMcpEnv(from: string | null | undefined, to: string): McpEnvRestartTally {
+    // A startup seed (no previous target) or a same-address reaffirmation is not
+    // a move: nothing ever ran against a different address, so there is nothing
+    // to report and this degrades to the ordinary silent respawn.
+    if (!retargetIsWorthNudging(from, to)) return this.restartAllForMcpEnv();
+
+    const keys = [...this.agents.keys()];
+    const tally: McpEnvRestartTally = { live: 0, applied: 0, scheduled: 0 };
+    for (const tabId of keys) {
+      const queued = this.pendingMcpRestart.get(tabId);
+      const queuedIsRetarget = this.pendingRetargetFrom.has(tabId);
+      // #164: a queued PER-REQUEST nudge wins outright. (A queued `null` is a
+      // silent pending respawn — no payload to protect — so it falls through.)
+      if (queued && !queuedIsRetarget) {
+        tallyRestart(tally, this.applyPendingRestarts(tabId));
+        continue;
+      }
+      // The EARLIEST address this tab was stranded on is the true `from`.
+      const origin = this.pendingRetargetFrom.get(tabId) ?? (from as string);
+      // Recompose BEFORE applying, not after: if the tab went idle in between,
+      // applyPendingRestarts delivers whatever is queued right now, and a stale
+      // A→B message would go out while the child is being respawned onto C.
+      this.pendingMcpRestart.set(tabId, queuedIsRetarget ? staleTargetNudge(origin, to) : null);
       const outcome = this.applyPendingRestarts(tabId);
-      // "scheduled" means the tab is mid-turn and its comfyui child goes on
-      // serving the OLD target until this restart lands (#1429). That is the one
-      // case the retarget nudge is about, and the entry is still pending here
-      // (applyPendingRestarts only clears it when it APPLIES), so upgrading the
-      // queued value now is what makes it ride along with the deferred respawn.
-      if (deferredOnly && nudge !== undefined && outcome === "scheduled") {
-        this.pendingMcpRestart.set(tabId, nudge);
+      if (outcome === "scheduled") {
+        // Mid-turn: the tab is stranded on `origin` until the turn ends. Record
+        // the origin so a further retarget in the same turn keeps it, and queue
+        // the message the deferred respawn will carry.
+        this.pendingRetargetFrom.set(tabId, origin);
+        this.pendingMcpRestart.set(tabId, staleTargetNudge(origin, to));
+      } else {
+        // Applied (or no agent): nothing is stranded any more.
+        this.pendingRetargetFrom.delete(tabId);
       }
       tallyRestart(tally, outcome);
     }
@@ -2240,6 +2280,10 @@ export class PanelAgentManager {
       return this.applyPendingRestarts(key);
     }
     this.pendingMcpRestart.set(key, nudge ?? null);
+    // Whatever is queued now, it is no longer a retarget nudge (#1429). Leaving
+    // the marker set would make the NEXT retarget classify this per-request nudge
+    // as its own and overwrite it — the exact #164 erasure, one step removed.
+    this.pendingRetargetFrom.delete(key);
     return this.applyPendingRestarts(key);
   }
 
@@ -2275,6 +2319,7 @@ export class PanelAgentManager {
     if (!agent || agent.isStopped) {
       this.pendingEffortRestart.delete(tabId);
       this.pendingMcpRestart.delete(tabId);
+      this.pendingRetargetFrom.delete(tabId);
       return "no-agent";
     }
     // Still mid-work (a queued message will start the next turn) — wait for the
@@ -2284,6 +2329,7 @@ export class PanelAgentManager {
     const nudge = wantMcp ? (this.pendingMcpRestart.get(tabId) ?? undefined) : undefined;
     this.pendingEffortRestart.delete(tabId);
     this.pendingMcpRestart.delete(tabId);
+    this.pendingRetargetFrom.delete(tabId);
     const carried = this.restartAgentResume(tabId, agent, nudge);
     const reasons = [wantEffort ? "effort" : null, wantMcp ? "comfyui-mcp-env" : null]
       .filter(Boolean)

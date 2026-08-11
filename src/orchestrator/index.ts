@@ -76,7 +76,6 @@ import {
 } from "./panel-agent.js";
 import { promptText } from "./error-text.js";
 import { callToolAdmission } from "./call-tool-admission.js";
-import { retargetRestartArgs } from "./retarget-nudge.js";
 import {
   createPanelMcpServer,
   makePanelToolCtx,
@@ -5864,7 +5863,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       // A tab that is mid-turn cannot have its comfyui MCP child replaced now, so
       // it keeps serving `previousUrl` until the turn ends (#1429). Tell those
       // tabs — and ONLY those; an idle tab respawns before it can run anything.
-      const tally = manager.restartAllForMcpEnv(...retargetRestartArgs(previousUrl, url));
+      const tally = manager.retargetAllForMcpEnv(previousUrl, url);
       if (tally.scheduled > 0) {
         logger.warn(
           `[panel-orchestrator] ${tally.scheduled} tab(s) mid-turn during the retarget — ` +
