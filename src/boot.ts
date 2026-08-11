@@ -14,6 +14,7 @@ import { logger } from "./utils/logger.js";
 import { JobWatcher } from "./services/job-watcher.js";
 import { parseCliArgs, validateConnectUrl, exportExplicitToolMode, type ToolMode } from "./transport/cli.js";
 import { startHttpServer } from "./transport/http.js";
+import { resolveToolSurfacePolicy } from "./tools/tool-surface-filter.js";
 import { isLocalMode } from "./config.js";
 import { ensurePanelInstalled } from "./services/panel-installer.js";
 import { checkAndSelfUpdate } from "./services/self-update.js";
@@ -366,6 +367,25 @@ async function main() {
       process.exit(1);
     }
   }
+
+  // #873 — VALIDATE THE OPERATOR'S TOOL POLICY BEFORE ANY SERVER STARTS, of any kind.
+  //
+  // resolveToolSurfacePolicy() throws on a misconfiguration (an unknown preset, a variable
+  // set but empty) with a message that says "Refusing to start". Making that true took two
+  // corrections, both the same mistake:
+  //
+  //   - On --transport http the server is built LAZILY inside the request handler, so the
+  //     socket bound, "running on http://…" printed, and every initialize came back 500
+  //     with the reason buried in a log line.
+  //   - Moving the call above the http branch left --panel-orchestrator, which returns
+  //     BELOW me and never came back. A typo'd preset there started the bridge, the
+  //     loopback panel MCP and the console, printed the ready banner, and only threw later
+  //     at first use — inside a request handler, per session.
+  //
+  // Both times the fix was placed at the first spot that satisfied the case in front of me
+  // rather than at the point every path passes through. This is that point: above every
+  // branch that starts anything.
+  resolveToolSurfacePolicy();
 
   // Standalone background orchestrator: owns the UI bridge and drives the panel
   // with autonomous Agent SDK sessions. Not an MCP server — it never returns.

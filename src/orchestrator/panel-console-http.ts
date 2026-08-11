@@ -17,6 +17,7 @@ import {
   envFilePath as envStorePath,
   listPanelSecretsMasked,
   receiptDisclosures,
+  atRiskNote,
   removeDisclosures,
   revokeIsClean,
   slotRevokeState,
@@ -818,6 +819,12 @@ export function startPanelConsoleHttpServer(opts: {
           // Built from the one shared list, so a new obligation on the receipt
           // reaches this endpoint without anyone remembering to wire it up here.
           const warnings = [
+            // The slot fan-out suspends per-alias emits and makes ONE at the end, so the
+            // respawn cost belongs to the OUTCOME, not to any single receipt — every
+            // receipt here carries an empty list by construction. Rendering only the
+            // receipts is why this endpoint warned about nothing while orphaning the same
+            // transfers the agent-facing path warns about (codex).
+            ...(atRiskNote(outcome.atRiskDownloads, undefined) ? [atRiskNote(outcome.atRiskDownloads, undefined)!] : []),
             ...outcome.receipts.flatMap((r) => receiptDisclosures(r)),
             // A confirmed slot save performs no rollback, so this is normally
             // empty — but it is included from the same place either way, so the
