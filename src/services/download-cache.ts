@@ -3304,43 +3304,55 @@ export async function downloadWithCache(
 }
 
 /**
- * The resumable `.partial` for a download, if one is actually on disk (#1370).
+ * Where a download's resumable `.partial` is staged, derived the way the writer derives it
+ * (#1370).
  *
- * `download_model action:"cancel"` told users "the partial was left on disk and can be
- * resumed by re-issuing the download". Nothing ever checked. The reporter paused a 33 GB
- * download BECAUSE of that sentence, then found no partial anywhere and restarted from
- * zero — the message was load-bearing for a decision and it was asserted, not observed.
+ * MY FIRST VERSION OF THIS GUESSED THE NAME AND GUESSED WRONG. It looked for
+ * `.<destination filename>.partial`, because that is what "the partial for this download"
+ * sounds like. The writer stages under `.<sha256(cacheIdentity)[0:32]><ext>.partial` —
+ * keyed by the CACHE identity, not the destination — so the lookup would have missed every
+ * time and reported "no partial was found" for downloads that had one. That is the same
+ * false claim this issue is about, pointing the other way, and it would have been worse:
+ * the original at least erred toward "your bytes are safe".
  *
- * The neighbouring branches were already careful: a ComfyUI-Manager dispatch says there is
- * no local partial, and a reclaimed-dead writer says one MAY exist. Only the ordinary
- * cancel stated a fact about the filesystem without consulting it.
+ * The tests missed it because the fixtures created files under the name I was searching
+ * for. They encoded my belief about the naming rather than the naming, which is the third
+ * time that shape has cost me today. Building the path from `cachePathForUrl` — the same
+ * function the writer uses — is what makes the two definitions impossible to disagree.
  *
- * Candidate names rather than one: the staged file is `.<basename>.partial` in the cache
- * dir, and a cancelled job knows its destination by several routes of differing
- * reliability (`filename`, the destination key, the URL's last segment). Checking each is
- * cheap — a few `stat`s — and guessing one wrong would reintroduce the same false claim in
- * the opposite direction: reporting "nothing to resume" while a 30 GB partial sits there.
+ * SCOPE, stated because the caller has to phrase its answer around it: `cacheIdentity`
+ * folds in representation-affecting request headers and cloud credentials, which a job
+ * record deliberately does not keep. So this reproduces the staged path exactly for an
+ * unauthenticated public download (the reporter's case, and the common one) and cannot for
+ * an authenticated variant. A miss therefore means "none found under this URL's staged
+ * name", never "none exists" — and the caller must not upgrade it to the latter.
+ */
+export function stagedPartialPathForUrl(url: string): string {
+  return `${cachePathForUrl(url)}.partial`;
+}
+
+/**
+ * Stat the staged `.partial` for a URL. Returns null when there is nothing usable there.
  *
- * Returns null when nothing is found, which the caller must report as "no partial" rather
- * than as a failure — a cancel that leaves nothing is not an error, it is a fact the user
- * needs before deciding to re-issue.
+ * A zero-byte partial reports as absent: resuming from it saves nothing, and calling it
+ * resumable would restate this issue's bug in miniature — a claim of retained bytes where
+ * there are none.
  */
 export async function findResumablePartial(
-  candidateNames: readonly (string | undefined)[],
+  url: string | undefined,
 ): Promise<{ path: string; bytes: number } | null> {
-  const seen = new Set<string>();
-  for (const raw of candidateNames) {
-    if (typeof raw !== "string" || !raw.trim()) continue;
-    const name = basename(raw.trim());
-    if (!name || seen.has(name)) continue;
-    seen.add(name);
-    const candidate = join(cacheDir(), `.${name}.partial`);
-    try {
-      const st = await stat(candidate);
-      if (st.isFile() && st.size > 0) return { path: candidate, bytes: st.size };
-    } catch {
-      // ENOENT is the common, expected answer — keep looking.
-    }
+  if (typeof url !== "string" || !url.trim()) return null;
+  let candidate: string;
+  try {
+    candidate = stagedPartialPathForUrl(url.trim());
+  } catch {
+    return null;
+  }
+  try {
+    const st = await stat(candidate);
+    if (st.isFile() && st.size > 0) return { path: candidate, bytes: st.size };
+  } catch {
+    // ENOENT is the common, expected answer.
   }
   return null;
 }

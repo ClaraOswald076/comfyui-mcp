@@ -1,20 +1,30 @@
-// #1370 — `download_model action:"cancel"` told users "the partial was left on disk and
-// can be resumed by re-issuing the download (it picks up where it left off)". Nothing ever
-// stat'd the file. The reporter paused a 33 GB download BECAUSE of that sentence, found no
-// partial anywhere in the install tree, and restarted from zero.
+// #1370 — `download_model action:"status"` told users "the partial was left on disk and
+// can be resumed by re-issuing the download". Nothing ever stat'd the file. The reporter
+// paused a 33 GB download BECAUSE of that sentence, found no partial anywhere, and
+// restarted from zero.
 //
-// The sentence was not stale — it was never checked. It was selected from
-// `status === "cancelled"` plus two flags. And the neighbouring branches were already
-// careful: a ComfyUI-Manager dispatch says there is NO local partial, and a reclaimed-dead
-// writer says one MAY exist. Only the ordinary cancel asserted a filesystem fact without
-// consulting the filesystem.
+// THE FIXTURES HERE ARE BUILT FROM THE PRODUCTION PATH FUNCTION, NOT FROM A NAME I TYPED.
+// My first version of this file created `.<destination filename>.partial` and searched for
+// the same string, so it passed while production stages under
+// `.<sha256(cacheIdentity)[0:32]><ext>.partial` — keyed by the CACHE identity, not the
+// destination. The lookup would have missed every real partial and reported "no partial
+// found" for downloads that had one: this issue's own bug inverted, and worse, because the
+// original at least erred toward "your bytes are safe".
+//
+// A test whose fixture encodes the belief under test cannot fail for the reason it exists.
+// Deriving the path from `stagedPartialPathForUrl` is what makes the two impossible to
+// disagree.
 
 import { describe, expect, it, afterEach } from "vitest";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { findResumablePartial } from "../../services/download-cache.js";
+import { findResumablePartial, stagedPartialPathForUrl } from "../../services/download-cache.js";
+
+const URL_A = "https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/flux2_dev_fp8mixed.safetensors";
+const URL_B = "https://huggingface.co/Comfy-Org/other/resolve/main/mistral_3_small.safetensors";
 
 const dirs: string[] = [];
 afterEach(async () => {
@@ -22,54 +32,74 @@ afterEach(async () => {
   delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
 });
 
-async function cacheWith(files: Record<string, number>): Promise<string> {
+async function useTempCache(): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "dl-partial-"));
   dirs.push(dir);
-  await mkdir(dir, { recursive: true });
-  for (const [name, size] of Object.entries(files)) {
-    await writeFile(join(dir, name), Buffer.alloc(size, 1));
-  }
   process.env.COMFYUI_DOWNLOAD_CACHE_DIR = dir;
-  return dir;
 }
 
-describe("findResumablePartial reports what is ACTUALLY there (#1370)", () => {
-  it("finds the staged partial by the destination filename", async () => {
-    await cacheWith({ ".flux2_dev_fp8mixed.safetensors.partial": 4096 });
-    const found = await findResumablePartial(["flux2_dev_fp8mixed.safetensors"]);
+/** Stage a partial exactly where the writer would put it for this URL. */
+async function stagePartialFor(url: string, bytes: number): Promise<string> {
+  const p = stagedPartialPathForUrl(url);
+  await mkdir(dirname(p), { recursive: true });
+  await writeFile(p, Buffer.alloc(bytes, 1));
+  return p;
+}
+
+describe("findResumablePartial reports what is ACTUALLY staged (#1370)", () => {
+  it("finds the partial the writer would have staged for this URL", async () => {
+    await useTempCache();
+    const staged = await stagePartialFor(URL_A, 4096);
+    const found = await findResumablePartial(URL_A);
     expect(found?.bytes).toBe(4096);
-    expect(found?.path).toMatch(/\.flux2_dev_fp8mixed\.safetensors\.partial$/);
+    expect(found?.path).toBe(staged);
+  });
+
+  it("the staged name is HASHED, not the destination filename", async () => {
+    // Pins the fact the first implementation got wrong. If this ever becomes
+    // `.flux2_dev_fp8mixed.safetensors.partial`, the lookup and the writer have diverged
+    // and one of them is silently wrong.
+    await useTempCache();
+    const p = stagedPartialPathForUrl(URL_A);
+    expect(p).not.toMatch(/flux2_dev_fp8mixed/);
+    expect(p).toMatch(/[0-9a-f]{32}\.safetensors\.partial$/);
   });
 
   it("returns NULL when nothing is staged — the reporter's case", async () => {
-    // Their scan found no partial of any kind. With no file present the tool must say so
-    // rather than repeat a sentence about resuming.
-    await cacheWith({});
-    expect(await findResumablePartial(["flux2_dev_fp8mixed.safetensors"])).toBeNull();
+    await useTempCache();
+    expect(await findResumablePartial(URL_A)).toBeNull();
   });
 
-  it("tries SEVERAL candidate names, because one wrong guess inverts the same bug", async () => {
-    // A cancelled job knows its destination by routes of differing reliability (filename,
-    // destination key, landed path, the URL's last segment). Reporting "nothing to resume"
-    // over a 30 GB partial that is sitting there would be the identical false claim in the
-    // other direction.
-    await cacheWith({ ".model.safetensors.partial": 2048 });
-    expect(await findResumablePartial([undefined, "", "model.safetensors"])).not.toBeNull();
-    // A full path contributes its basename, which is how the staged file is named.
-    expect(await findResumablePartial(["/models/checkpoints/model.safetensors"])).not.toBeNull();
-    // …and an unrelated name still finds nothing, so the search is not indiscriminate.
-    expect(await findResumablePartial(["something_else.safetensors"])).toBeNull();
+  it("does not report ANOTHER download's partial as this one's", async () => {
+    // The staged name is keyed on the URL, so two downloads never share one. Reporting a
+    // neighbour's bytes as resumable would be a new false claim, not a fix for the old one.
+    await useTempCache();
+    await stagePartialFor(URL_B, 8192);
+    expect(await findResumablePartial(URL_A)).toBeNull();
+    expect((await findResumablePartial(URL_B))?.bytes).toBe(8192);
   });
 
-  it("a ZERO-BYTE partial is not resumable and is reported as absent", async () => {
-    // Resuming from it saves nothing, and calling it resumable would restate the bug in
+  it("a ZERO-BYTE partial is reported as absent", async () => {
+    // Resuming from it saves nothing, and calling it resumable restates this bug in
     // miniature: a claim of retained bytes where there are none.
-    await cacheWith({ ".empty.safetensors.partial": 0 });
-    expect(await findResumablePartial(["empty.safetensors"])).toBeNull();
+    await useTempCache();
+    await stagePartialFor(URL_A, 0);
+    expect(await findResumablePartial(URL_A)).toBeNull();
   });
 
-  it("ignores the FINAL file — only the staged .partial counts as resumable", async () => {
-    await cacheWith({ "model.safetensors": 8192 });
-    expect(await findResumablePartial(["model.safetensors"])).toBeNull();
+  it("ignores the COMPLETED cache entry — only the staged .partial is resumable", async () => {
+    await useTempCache();
+    const partial = stagedPartialPathForUrl(URL_A);
+    const completed = partial.replace(/\.partial$/, "");
+    await mkdir(dirname(completed), { recursive: true });
+    await writeFile(completed, Buffer.alloc(8192, 1));
+    expect(await findResumablePartial(URL_A)).toBeNull();
+  });
+
+  it("a missing or unparseable URL yields null rather than throwing", async () => {
+    await useTempCache();
+    expect(await findResumablePartial(undefined)).toBeNull();
+    expect(await findResumablePartial("")).toBeNull();
+    expect(await findResumablePartial("not a url")).toBeNull();
   });
 });

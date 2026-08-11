@@ -240,10 +240,12 @@ function stillWritingClause(route: DownloadRoute): string {
 function describePartial(partial: { path: string; bytes: number } | null): string {
   if (!partial) {
     return (
-      `NO partial was found on disk, so re-issuing this download starts from the ` +
-      `beginning. (Checked the download cache for a staged .partial under this file's ` +
-      `name.) That is not an error — but it is worth knowing before you re-issue a large ` +
-      `file.`
+      `no resumable partial was found for this URL, so re-issuing very likely starts from ` +
+      `the beginning. That is not an error — but it is worth knowing before you re-spend ` +
+      `the bandwidth on a large file. (The staged file is keyed by the download's cache ` +
+      `identity, which folds in auth headers this record deliberately does not keep, so ` +
+      `for an AUTHENTICATED download this means "none found under the unauthenticated ` +
+      `key", not "none exists".)`
     );
   }
   const gb = partial.bytes / 1024 ** 3;
@@ -1007,25 +1009,20 @@ async function statusAction(args: {
         //
         // Stat'd up front because the row builder below is synchronous, and only for rows
         // that could have one: a Manager dispatch never writes a local partial and already
-        // says so. Several candidate names are tried — a cancelled job knows its
-        // destination by routes of differing reliability — because guessing one wrong would
-        // reintroduce the same false claim inverted, reporting "nothing to resume" over a
-        // 30 GB partial sitting right there.
+        // says so.
+        //
+        // Keyed by the job's URL, because that is what the WRITER keys the staged file on
+        // (cachePathForUrl). My first version searched for `.<destination filename>.partial`
+        // — what "the partial for this download" sounds like, and not what is on disk. It
+        // would have reported "no partial" for every download that had one: the same false
+        // claim inverted, and pointing the more damaging way, since the original at least
+        // erred toward "your bytes are safe".
         const partials = new Map<string, { path: string; bytes: number } | null>();
         await Promise.all(
           list
             .filter((j) => j.status === "cancelled" && !j.viaManager)
             .map(async (j) => {
-              let fromUrl: string | undefined;
-              try {
-                fromUrl = new URL(j.url).pathname.split("/").filter(Boolean).pop();
-              } catch {
-                /* a non-URL source simply contributes no candidate */
-              }
-              partials.set(
-                `${j.id}\n${j.trayId}`,
-                await findResumablePartial([j.filename, j.path, j.destKey, fromUrl]),
-              );
+              partials.set(`${j.id}\n${j.trayId}`, await findResumablePartial(j.url));
             }),
         );
         const partialFor = (j: DownloadJob): { path: string; bytes: number } | null =>
