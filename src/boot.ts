@@ -17,6 +17,8 @@ import { startHttpServer } from "./transport/http.js";
 import { isLocalMode } from "./config.js";
 import { ensurePanelInstalled } from "./services/panel-installer.js";
 import { checkAndSelfUpdate } from "./services/self-update.js";
+import { tr } from "./i18n/index.js";
+import { banner, labelRows, numberedSteps } from "./i18n/terminal-layout.js";
 
 /**
  * Fire-and-forget: ensure the ComfyUI sidebar panel is installed (install-if-
@@ -246,26 +248,35 @@ async function openTunnelAndAnnounce(
   // Single multi-line block to stderr so it survives MCP stdio framing and is
   // easy to copy from the terminal.
   process.stderr.write(
-    [
+    banner(`ComfyUI MCP — ${tr("cli.tunnel_title", "Remote / Hosted Connector is LIVE")}`, [
+      ...labelRows(" ", [
+        [tr("cli.tunnel_label_public_url", "Public MCP URL"), mcpUrl],
+        [tr("cli.tunnel_label_token", "Auth token"), token],
+      ]),
       "",
-      "════════════════════════════════════════════════════════════════════",
-      " ComfyUI MCP — Remote / Hosted Connector is LIVE",
-      "════════════════════════════════════════════════════════════════════",
-      ` Public MCP URL : ${mcpUrl}`,
-      ` Auth token     : ${token}`,
+      // Names CLAUDE DESKTOP's own menu path, which is localised by Claude Desktop's
+      // language setting and not by ours. The English fallback must keep matching that app's
+      // English UI exactly; a catalog should only translate it to the wording Claude Desktop
+      // itself uses in that language, never to a literal translation of these words.
+      ` ${tr("cli.tunnel_desktop_connector_path", "Claude Desktop → Settings → Connectors → Add custom connector:")}`,
+      // The header NAMES are wire protocol, not prose — only the row labels translate.
+      ...labelRows("   • ", [
+        [tr("cli.tunnel_field_name", "Name"), "ComfyUI"],
+        [tr("cli.tunnel_field_url", "URL"), mcpUrl],
+        [
+          tr("cli.tunnel_field_header", "Header"),
+          // The alternative is one phrase, not the word "or" plus a header name: a lone
+          // conjunction is untranslatable without the sentence it sits in, and both header
+          // spellings have to survive into every language byte-for-byte anyway.
+          `X-API-Key: ${token}   ${tr("cli.tunnel_header_alt", "(or Authorization: Bearer {token})", { token })}`,
+        ],
+      ]),
       "",
-      " Claude Desktop → Settings → Connectors → Add custom connector:",
-      `   • Name : ComfyUI`,
-      `   • URL  : ${mcpUrl}`,
-      `   • Header: X-API-Key: ${token}   (or Authorization: Bearer ${token})`,
-      "",
-      " Headless / programmatic config snippet:",
+      ` ${tr("cli.tunnel_headless_snippet", "Headless / programmatic config snippet:")}`,
       snippet,
       "",
-      " Keep this terminal open — the tunnel closes when the process exits.",
-      "════════════════════════════════════════════════════════════════════",
-      "",
-    ].join("\n"),
+      ` ${tr("cli.tunnel_keep_open", "Keep this terminal open — the tunnel closes when the process exits.")}`,
+    ]),
   );
 }
 
@@ -308,10 +319,17 @@ async function main() {
     const { setupAgent, AGENT_NAMES } = await import("./services/agent-setup.js");
     const agent = cli.setupAgent as (typeof AGENT_NAMES)[number];
     if (!AGENT_NAMES.includes(agent)) {
+      // Only the prose translates. The command itself is passed in as a variable rather than
+      // spliced around a translated "Usage" label, so what the user has to type back stays
+      // verbatim in every language — including the agent names, which are the literal values
+      // the parser matches on.
+      const usage = `comfyui-mcp setup <${AGENT_NAMES.join("|")}> [--compact|--full] [--comfyui-url <url>] [--dry-run]`;
       process.stderr.write(
-        `\nUsage: comfyui-mcp setup <${AGENT_NAMES.join("|")}> [--compact|--full] [--comfyui-url <url>] [--dry-run]\n` +
-          (cli.setupAgent ? `\nUnknown agent "${cli.setupAgent}".\n` : "") +
-          `\nWrites the comfyui MCP server entry into the agent's own config file.\n`,
+        `\n${tr("cli.setup_usage", "Usage: {command}", { command: usage })}\n` +
+          (cli.setupAgent
+            ? `\n${tr("cli.setup_unknown_agent", 'Unknown agent "{agent}".', { agent: cli.setupAgent })}\n`
+            : "") +
+          `\n${tr("cli.setup_what_it_does", "Writes the comfyui MCP server entry into the agent's own config file.")}\n`,
       );
       process.exit(1);
     }
@@ -325,11 +343,15 @@ async function main() {
       const lines = [
         "",
         result.wrote
-          ? `✓ Added the "comfyui" MCP server to ${result.configPath}`
-          : `— dry run: would write ${result.configPath} as —`,
+          ? tr("cli.setup_wrote", '✓ Added the "comfyui" MCP server to {path}', {
+              path: result.configPath,
+            })
+          : tr("cli.setup_dry_run", "— dry run: would write {path} as —", {
+              path: result.configPath,
+            }),
         ...(result.wrote ? [] : ["", result.content.trimEnd()]),
         "",
-        "Next steps:",
+        tr("cli.setup_next_steps", "Next steps:"),
         ...result.nextSteps.map((s) => `  • ${s}`),
         "",
       ];
@@ -337,7 +359,9 @@ async function main() {
       process.exit(0);
     } catch (err) {
       process.stderr.write(
-        `\ncomfyui-mcp setup failed: ${err instanceof Error ? err.message : err}\n`,
+        `\n${tr("cli.setup_failed", "comfyui-mcp setup failed: {error}", {
+          error: err instanceof Error ? err.message : String(err),
+        })}\n`,
       );
       process.exit(1);
     }
@@ -363,7 +387,9 @@ async function main() {
       // local ComfyUI (which would make the banner below lie about what it drives).
       const urlError = validateConnectUrl(cli.comfyuiUrl);
       if (urlError) {
-        process.stderr.write(`\nComfyUI MCP — cannot start: ${urlError}\n\n`);
+        process.stderr.write(
+          `\n${tr("cli.cannot_start", "ComfyUI MCP — cannot start: {error}", { error: urlError })}\n\n`,
+        );
         process.exit(1);
       }
       process.env.COMFYUI_URL = cli.comfyuiUrl;
@@ -373,35 +399,58 @@ async function main() {
       // Remote https pod → secure wss:// tunnel (auto); local/http or
       // --insecure-bridge → plain loopback ws://. Informational only here.
       const secureBridge = !cli.insecureBridge && isRemoteHttpsPod(cli.comfyuiUrl);
-      const bridgeLine = secureBridge
-        ? " Agent bridge : wss:// secure Cloudflare tunnel (auto — nothing to copy)"
-        : ` Agent bridge : ws://127.0.0.1:${bridgePort}`;
+      const bridgeValue = secureBridge
+        ? tr("cli.connect_bridge_secure", "wss:// secure Cloudflare tunnel (auto — nothing to copy)")
+        : `ws://127.0.0.1:${bridgePort}`;
+      // Every string below that NAMES A PANEL CONTROL keeps its English fallback exactly as
+      // the panel renders it in English today, and says so in its key. The panel's own labels
+      // are being translated separately; until a catalog carries both, an English fallback is
+      // the only wording that still matches the button the user has to find. A catalog entry
+      // for one of these keys is only correct if it uses the panel's translation of that
+      // control, not a fresh translation of the sentence.
+      const steps = [
+        tr("cli.connect_step_open_comfyui", "Open that ComfyUI in your browser: {url}", {
+          url: cli.comfyuiUrl,
+        }),
+        tr(
+          "cli.connect_step_enable_external_orchestrator",
+          "In the Agent panel's Settings → General, turn ON\n'Use external/local orchestrator (advanced)'.",
+        ),
+        tr(
+          "cli.connect_step_click_connect",
+          "Click Connect in the panel (the Agent panel's Connect dropdown).",
+        ),
+      ];
       process.stderr.write(
-        [
+        banner(`ComfyUI MCP — ${tr("cli.connect_title", "local agent bridge is starting")}`, [
+          ...labelRows(" ", [
+            [tr("cli.connect_label_bridge", "Agent bridge"), bridgeValue],
+            [tr("cli.connect_label_driving", "Driving"), cli.comfyuiUrl],
+            ...(secureBridge
+              ? ([
+                  [
+                    tr("cli.connect_label_secure", "Secure"),
+                    tr(
+                      "cli.connect_secure_note",
+                      "the pod's HTTPS panel connects automatically over an\nencrypted tunnel — no URL to paste, works in any browser.",
+                    ),
+                  ],
+                ] as const)
+              : []),
+          ]),
           "",
-          "════════════════════════════════════════════════════════════════════",
-          " ComfyUI MCP — local agent bridge is starting",
-          "════════════════════════════════════════════════════════════════════",
-          bridgeLine,
-          ` Driving      : ${cli.comfyuiUrl}`,
-          secureBridge
-            ? " Secure       : the pod's HTTPS panel connects automatically over an\n                encrypted tunnel — no URL to paste, works in any browser."
-            : null,
+          ` ${tr("cli.connect_next_steps", "Next steps:")}`,
+          ...numberedSteps(steps),
           "",
-          " Next steps:",
-          `   1. Open that ComfyUI in your browser: ${cli.comfyuiUrl}`,
-          "   2. In the Agent panel's Settings → General, turn ON",
-          "      'Use external/local orchestrator (advanced)'.",
-          "   3. Click Connect in the panel (the Agent panel's Connect dropdown).",
-          "",
-          " Until you click Connect this window stays quiet — that's expected, not",
-          " a hang. The agent runs HERE on your Claude/Codex login; nothing is",
-          " installed on the ComfyUI box. Keep this terminal open.",
-          "════════════════════════════════════════════════════════════════════",
-          "",
-        ]
-          .filter((l): l is string => l !== null)
-          .join("\n"),
+          ...tr(
+            "cli.connect_quiet_note",
+            "Until you click Connect this window stays quiet — that's expected, not\n" +
+              "a hang. The agent runs HERE on your Claude/Codex login; nothing is\n" +
+              "installed on the ComfyUI box. Keep this terminal open.",
+          )
+            .split("\n")
+            .map((l) => ` ${l}`),
+        ]),
       );
     }
     const { runPanelOrchestrator } = await import("./orchestrator/index.js");
