@@ -1448,6 +1448,24 @@ async function panelObjectInfo(
 ): Promise<{ ok: true; objectInfo: ObjectInfo } | { ok: false; message: string }> {
   let reply: unknown;
   try {
+    // NO `if_none_match`, DELIBERATELY, EVEN THOUGH THE PAYLOAD IS LARGE.
+    //
+    // The panel offers a fingerprint cache and this caller declines it. Its fingerprint is
+    // computed over the SORTED TYPE NAMES and nothing else (object-info-fingerprint.js), so
+    // `unchanged: true` establishes only that the same node types exist. `convertUiToApi`
+    // maps `widgets_values` POSITIONALLY onto each def's declared input order — so a
+    // renamed widget, a reordered input, or an edited combo list changes the conversion
+    // while leaving the type set, and therefore the fingerprint, identical.
+    //
+    // Reusing a cached map on `unchanged` would convert this canvas against a schema that
+    // has since moved and return a confidently wrong workflow — the same failure this whole
+    // change exists to prevent, bought back for a saved download. The panel's own reply
+    // says as much: "That does not establish that individual definitions are identical …
+    // Re-read without if_none_match if you need those."
+    //
+    // So the cost is accepted: a strip is user-initiated and infrequent, and correctness
+    // here is worth more than the transfer.
+    //
     // The panel fetches a full /object_info here — megabytes on a large install — so it
     // needs the bounded refresh budget, not the default ack. A false timeout would read as
     // "the panel cannot serve definitions" for a panel that served them.
@@ -1503,6 +1521,30 @@ The conversion is refused rather than retried against ` +
         (r.served_by ? ` (it reported serving from ${r.served_by})` : "") +
         `. Nothing was converted — a partial or absent schema produces a wrong workflow, ` +
         `so this refuses instead of guessing.`,
+    };
+  }
+  // AN EMPTY MAP IS NOT A SCHEMA, and accepting one was the hole in the first version of
+  // this "fail closed" path. `{ok: true, object_info: {}}` passed every check above, and
+  // convertUiToApi SKIPS every node whose type it cannot find — so the caller got a
+  // successful reply containing an empty or gutted workflow, with no error anywhere. A
+  // silent wrong answer, which is the outcome this whole change exists to prevent, reached
+  // through the success branch instead of the failure one.
+  //
+  // A running ComfyUI always defines core nodes, so zero entries cannot be a true schema;
+  // it is a regressed panel, a proxy rewriting the body, or an error page. Nothing weaker
+  // is asserted here — a map that is merely MISSING some of this graph's types is a real
+  // and legitimate case (an uninstalled custom node), and convertUiToApi already reports
+  // those as warnings rather than pretending they converted.
+  if (Object.keys(r.object_info).length === 0) {
+    return {
+      ok: false,
+      message:
+        `The panel returned an EMPTY node-definition map` +
+        (r.served_by ? ` from ${r.served_by}` : "") +
+        `. A running ComfyUI always defines its core nodes, so this is a regressed panel, a ` +
+        `proxy rewriting the response, or an error page — not a real schema. Converting ` +
+        `against it would silently drop every node and hand back an empty workflow that ` +
+        `looks like a success, so nothing was converted.`,
     };
   }
   return { ok: true, objectInfo: r.object_info };

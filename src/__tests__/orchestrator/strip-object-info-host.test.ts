@@ -46,8 +46,17 @@ import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 const TAB = "wf:workflows/a.json";
 const REMOTE = "https://abc123-8188.proxy.runpod.net:443";
 
+/** The canvas the panel reports. Non-empty on purpose — see the harness note. */
+const liveNodes = [
+  { id: 1, type: "KSampler", widgets_values: [0, "fixed", 20, 8, "euler", "normal", 1], inputs: [], outputs: [] },
+];
+
 /** What the panel answers `graph_get_object_info` with, per test. */
-let objectInfoReply: unknown = { ok: true, served_by: REMOTE, object_info: {} };
+let objectInfoReply: unknown = {
+  ok: true,
+  served_by: REMOTE,
+  object_info: { KSampler: { input: { required: { seed: ["INT"] } }, output: [], name: "KSampler" } },
+};
 
 async function stripWithPanelObjectInfo(reply: unknown): Promise<string> {
   const prev = objectInfoReply;
@@ -64,7 +73,10 @@ function bridge(serverOrigin: string | null) {
   return {
     send: async (cmd: Record<string, unknown>) => {
       if (cmd.cmd === "graph_serialize" || cmd.cmd === "graph_get_state") {
-        return { workflow: { nodes: [], links: [] }, nodes: [], links: [] };
+        // A NON-EMPTY graph. It was empty, which made `object_info: {}` look like a
+        // perfectly good conversion — the fixture blessed the exact shape the fail-closed
+        // path was supposed to reject, so no test could see the hole.
+        return { workflow: { nodes: liveNodes, links: [] }, nodes: liveNodes, links: [] };
       }
       if (cmd.cmd === "graph_get_object_info") return objectInfoReply;
       return { ok: true, workflow: { nodes: [], links: [] } };
@@ -108,6 +120,33 @@ describe("an /object_info failure names which host it asked (#1359)", () => {
     expect(text).toContain(REMOTE);
     expect(text).toMatch(/refused rather than retried against COMFYUI_URL/i);
     expect(text).not.toMatch(/ECONNREFUSED/);
+  });
+
+  it("LIVE CANVAS: an EMPTY definition map is refused, not converted into an empty workflow", async () => {
+    // The P1 the first version shipped. `{ok:true, object_info:{}}` satisfied every check
+    // — truthy, an object — and convertUiToApi then SKIPS every node whose type it cannot
+    // find, so the caller got a successful reply containing a gutted workflow and no error
+    // anywhere. A silent wrong answer reached through the success branch.
+    //
+    // A running ComfyUI always defines its core nodes, so zero entries is a regressed
+    // panel, a proxy rewriting the body, or an error page.
+    const text = await stripWithPanelObjectInfo({ ok: true, served_by: REMOTE, object_info: {} });
+    expect(text).toMatch(/EMPTY node-definition map/i);
+    expect(text).toMatch(/nothing was converted/i);
+    expect(text).not.toMatch(/ECONNREFUSED/);
+  });
+
+  it("…but a map merely MISSING one of this graph's types still converts, with a warning", async () => {
+    // The over-broad direction. An uninstalled custom node is a real and legitimate case;
+    // refusing it would make the guard worse than the bug, and convertUiToApi already
+    // reports unknown types rather than pretending they converted.
+    const text = await stripWithPanelObjectInfo({
+      ok: true,
+      served_by: REMOTE,
+      object_info: { SomeOtherNode: { input: { required: {} }, output: [], name: "SomeOtherNode" } },
+    });
+    expect(text).not.toMatch(/EMPTY node-definition map/i);
+    expect(text).not.toMatch(/nothing was converted/i);
   });
 
   it("LIVE CANVAS: a payload-free success is refused, not read as an empty schema", async () => {
