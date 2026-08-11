@@ -100,7 +100,6 @@ import {
   setAgentSecret,
   isAllowedAgentSecretKey,
   receiptDisclosures,
-  atRiskDownloadSummary,
   shadowedNote,
   storeDamageNote,
   type SecretSaveReceipt,
@@ -441,36 +440,11 @@ export function describeComfyuiSecretSave(receipt: SecretSaveReceipt): string {
         : `No live tool session needed rebuilding (${live} live).`,
     );
   }
-  // #1378 — WHAT THIS SAVE COST, OR WILL COST, depending on when the respawn lands.
-  //
-  // A respawn changes the auth header the tool session attaches, which changes each
-  // in-flight download's CACHE IDENTITY — so a `.partial` at 96% becomes unreachable and
-  // re-issuing restarts from zero. A reporter lost ~29 GB across two files that way. The
-  // bytes were never deleted; nothing could find them again.
-  //
-  // The list is snapshotted in the SETTER, before the synchronous respawn emit. My first
-  // version enumerated it here and told the user to "let them finish and save afterwards"
-  // about transfers an already-applied respawn had killed a tick earlier — advice that was
-  // not just useless but wrong about what had happened. Applied and scheduled get
-  // different sentences because they are different facts.
-  const atRisk = receipt.atRiskDownloads ?? [];
-  if (atRisk.length && receipt.respawn && (receipt.respawn.applied || receipt.respawn.scheduled)) {
-    // Shared with the revoke path's disclosure, which loses the same transfers the same
-    // way — two hand-rolled summaries of one fact drift.
-    const listed = atRiskDownloadSummary(atRisk);
-    parts.push(
-      receipt.respawn.applied
-        ? `WARNING — the tool session was replaced immediately, and ${listed} were in flight. ` +
-          `The new credentials change each download's cache identity, so those transfers will ` +
-          `NOT resume: re-issuing them starts from 0% even though the partial files remain on ` +
-          `disk (#1378). Nothing can recover them under the new identity — that is the cost ` +
-          `already paid, not a warning you can act on.`
-        : `WARNING — ${listed} are in flight and the tool session is queued to be rebuilt at ` +
-          `the end of this turn. The new credentials change each download's cache identity, so ` +
-          `those transfers will NOT resume — re-issuing starts from 0% even though the partial ` +
-          `files remain on disk (#1378). If that matters, let them finish before the rebuild.`,
-    );
-  }
+  // #1378's warning is NOT rendered here any more. It moved into `receiptDisclosures`
+  // (pushed above), because this renderer is the agent-facing one and the Settings
+  // endpoint saves through the same path, orphans the same transfers, and said nothing at
+  // all. One description, every consumer — the alternative is what already happened once.
+
   parts.push(
     !confirmed
       ? `Before relying on it, re-check ${receipt.path} carries "${receipt.key}"; if the action fails again the same way, treat the credential as unset and set it again.`

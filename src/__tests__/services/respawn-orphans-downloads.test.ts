@@ -48,8 +48,8 @@ describe("downloadsAtRiskOfRespawn (#1378)", () => {
     );
     expect(at).toHaveLength(2);
     // The reporter's actual numbers: 77% of 19.53 GB and 96% of 14.61 GB.
-    expect(at[0]).toEqual({ filename: "flux2_dev.safetensors", bytes: 16_291_583_966 });
-    expect(at[1]).toEqual({ filename: "text_encoder.safetensors", bytes: 15_207_387_077 });
+    expect(at[0]).toEqual({ id: "a", filename: "flux2_dev.safetensors", bytes: 16_291_583_966 });
+    expect(at[1]).toEqual({ id: "b", filename: "text_encoder.safetensors", bytes: 15_207_387_077 });
   });
 
   it("ignores downloads that are NOT in flight — a finished one loses nothing", () => {
@@ -97,22 +97,37 @@ describe("downloadsAtRiskOfRespawn (#1378)", () => {
     expect(at[1].filename).toBe("(redacted).safetensors");
   });
 
-  it("KEEPS a hash-named model — over-redaction costs the warning its point (codex P3)", () => {
-    // A receipt that says two downloads are at risk without saying WHICH has given up most
-    // of its value. A sha1/md5/sha256 in a filename is ordinary; it is hex-only AND an
-    // exact hash length, which a credential is not (they are base64-ish and any length).
+  it("redacts the opaque PART and keeps the name (codex P1/P3)", () => {
+    // Both directions at once, and the reason the thresholds below are affordable.
+    // Deciding whether a whole filename is a secret loses either way: an exact-length hex
+    // credential was waved through as "a hash", while a legitimate CivitAI-style name was
+    // redacted entirely — leaving a receipt that says two downloads are at risk without
+    // saying which, which is most of the warning's value.
     hoisted.progress = { a: { downloaded: 1 }, b: { downloaded: 2 }, c: { downloaded: 3 } };
     const at = downloadsAtRiskOfRespawn(
       jobs(
         { filename: `flux1-dev-${"a1b2c3d4".repeat(5)}.safetensors`, status: "downloading", trayId: "a" },
-        { filename: `sd35-${"0f".repeat(32)}.safetensors`, status: "downloading", trayId: "b" },
-        // One unbroken 40-character mixed run: no part explains itself, still a blob.
-        { filename: `blob-${"Zx9Qw7Er".repeat(5)}.safetensors`, status: "downloading", trayId: "c" },
+        // A 32-hex credential. The old rule called this a hash and printed it in full.
+        { filename: "twilio-0123456789abcdef0123456789abcdef.safetensors", status: "downloading", trayId: "b" },
+        // A real model name with two mixed parts. The old rule redacted it whole.
+        { filename: "realisticVisionV60B1_v51HyperVAE-inpainting.safetensors", status: "downloading", trayId: "c" },
       ),
     );
-    expect(at[0].filename).toBe(`flux1-dev-${"a1b2c3d4".repeat(5)}.safetensors`);
-    expect(at[1].filename).toBe(`sd35-${"0f".repeat(32)}.safetensors`);
-    expect(at[2].filename).toBe("(redacted).safetensors");
+    expect(at[0].filename).toBe("flux1-dev-(redacted).safetensors");
+    expect(at[1].filename).toBe("twilio-(redacted).safetensors");
+    expect(at[2].filename).toBe("realisticVisionV60B1_v51HyperVAE-inpainting.safetensors");
+  });
+
+  it("drops an extension that is not one — the redaction must not publish the secret", () => {
+    // `extname` returns everything after the last dot, and filename validation rejects
+    // separators and dot-names but not `?`. So the redacted form carried the credential it
+    // had just removed (codex).
+    hoisted.progress = { a: { downloaded: 1 } };
+    const at = downloadsAtRiskOfRespawn(
+      jobs({ filename: "model-token.safetensors?token=TopSecret", status: "downloading", trayId: "a" }),
+    );
+    expect(at[0].filename).toBe("(redacted)");
+    expect(at[0].filename).not.toMatch(/TopSecret/);
   });
 
   it("a long name of ORDINARY parts is kept, but several blob parts are not", () => {
@@ -130,6 +145,8 @@ describe("downloadsAtRiskOfRespawn (#1378)", () => {
       ),
     );
     expect(at[0].filename).toBe(ordinary);
+    // Three interleaved parts in one run is a token spelled to look like a name; each part
+    // alone reads as ordinary, so it can only be judged across the run.
     expect(at[1].filename).toBe("(redacted).safetensors");
   });
 
@@ -158,7 +175,7 @@ describe("downloadsAtRiskOfRespawn (#1378)", () => {
       downloadsAtRiskOfRespawn(
         jobs({ filename: "unknown-progress.safetensors", status: "downloading", trayId: "z" }),
       ),
-    ).toEqual([{ filename: "unknown-progress.safetensors", bytes: 0 }]);
+    ).toEqual([{ id: "z", filename: "unknown-progress.safetensors", bytes: 0 }]);
   });
 
   it("the revoke disclosure NAMES the transfers, and stays silent when there are none", async () => {
@@ -187,11 +204,53 @@ describe("downloadsAtRiskOfRespawn (#1378)", () => {
     expect(removeDisclosures({ ...base, atRiskDownloads: [] }, "/store/.env")).toEqual([]);
   });
 
-  it("WIRING: REVOKE snapshots before its emit too, and discloses it (#1409)", async () => {
-    // The fix landed on the save path only. Revoke reaches the same synchronous emit two
-    // functions later, and removing the credential a gated transfer authenticates with is
-    // at least as likely to cost one as replacing it — codex scored the hole against this
-    // PR rather than accepting the follow-up issue, correctly.
+  it("two credential-shaped names are TWO downloads, not one (codex P2)", async () => {
+    // Both redact to the same display string, so a consumer keying on the filename
+    // collapsed them and reported the larger byte count — under-reporting the loss exactly
+    // when the names are least informative. The record carries a job id for this reason.
+    hoisted.progress = { a: { downloaded: 3 }, b: { downloaded: 5 } };
+    const at = downloadsAtRiskOfRespawn(
+      jobs(
+        { filename: "model-token-alpha.safetensors", status: "downloading", trayId: "a" },
+        { filename: "model-secret-beta.safetensors", status: "downloading", trayId: "b" },
+      ),
+    );
+    expect(at.map((d) => d.filename)).toEqual(["(redacted).safetensors", "(redacted).safetensors"]);
+    // The distinguishing field, which is what a deduplicating consumer must key on.
+    expect(new Set(at.map((d) => d.id)).size).toBe(2);
+    // …and the shared summary counts both and totals their bytes.
+    const { atRiskDownloadSummary } = await import("../../services/panel-secrets.js");
+    expect(atRiskDownloadSummary(at)).toMatch(/^2 download\(s\)/);
+  });
+
+  it("the note distinguishes applied, scheduled, and NOT REPORTED", async () => {
+    // Three states (#796). A path that collects no respawn report has not established that
+    // no respawn happened: "already lost" claims an event nobody observed, and "will be
+    // lost" invites the user to act on a transfer that may be dead already.
+    const { atRiskNote } = await import("../../services/panel-secrets.js");
+    const at = [{ id: "a", filename: "flux1-dev.safetensors", bytes: 1024 ** 3 }];
+
+    expect(atRiskNote(at, { applied: true, scheduled: false, live: 1 } as never)).toMatch(
+      /replaced immediately/,
+    );
+    expect(atRiskNote(at, { applied: false, scheduled: true, live: 1 } as never)).toMatch(
+      /queued to be rebuilt/,
+    );
+    const unreported = atRiskNote(at, undefined);
+    expect(unreported).toMatch(/was not reported here/);
+    expect(unreported).not.toMatch(/already paid|let them finish/);
+
+    // Empty stays silent on every path, or an ordinary save grows a warning about nothing.
+    expect(atRiskNote([], undefined)).toBeNull();
+    expect(atRiskNote([], { applied: true, scheduled: false, live: 1 } as never)).toBeNull();
+  });
+
+  it("WIRING: the snapshot lives INSIDE the emit, so neither half can be forgotten", async () => {
+    // This started as two call sites each remembering to snapshot before emitting. Three
+    // defects came out of that arrangement — an emit with no snapshot (revoke, for a whole
+    // release), a snapshot with no emit (a rollback under suspended emissions, warning
+    // about a loss that never happened), and an ordering restated at every site and
+    // therefore mistakable at any of them. It is one function now.
     const { readFileSync } = await import("node:fs");
     const code = (rel: string): string =>
       readFileSync(new URL(rel, import.meta.url), "utf8")
@@ -199,45 +258,32 @@ describe("downloadsAtRiskOfRespawn (#1378)", () => {
         .replace(/\/\/.*/g, "");
     const src = code("../../services/panel-secrets.ts");
 
-    // Scoped to the REMOVER, or the setter's own (correct) ordering satisfies this.
-    const remover = src.slice(src.indexOf("export function removeEnvSecret"));
-    const snapshotAt = remover.indexOf("snapshotAtRiskDownloads()");
-    const emitAt = remover.indexOf("emitComfyuiChange({})");
-    expect(snapshotAt, "the remover must snapshot in-flight downloads").toBeGreaterThan(-1);
-    expect(emitAt, "the remover must still emit").toBeGreaterThan(-1);
-    expect(snapshotAt, "the snapshot must precede the respawn emit").toBeLessThan(emitAt);
+    const emitter = src.slice(src.indexOf("function emitComfyuiChange"));
+    const body = emitter.slice(0, emitter.indexOf("\n}"));
+    const snapshotAt = body.indexOf("snapshotAtRiskDownloads()");
+    const emitAt = body.indexOf("emitGuarded(");
+    expect(snapshotAt, "the emitter must snapshot").toBeGreaterThan(-1);
+    expect(emitAt, "the emitter must emit").toBeGreaterThan(-1);
+    // The whole premise: the emit is synchronous and a listener replaces its tool session
+    // inside it, so a list gathered afterwards describes a world where they are already
+    // orphaned.
+    expect(snapshotAt, "the snapshot must precede the emit").toBeLessThan(emitAt);
+    // ...and the suspended path must return BEFORE the snapshot: nothing emitted, nothing
+    // lost, nothing to warn about.
+    expect(body.indexOf("emitSuspendDepth > 0")).toBeLessThan(snapshotAt);
 
-    // …and it must reach the user. A field nobody renders is not a warning.
-    expect(src).toMatch(/outcome\.atRiskDownloads\.length/);
-  });
+    // No call site may take its own snapshot any more — that is the arrangement this
+    // replaced, and a second one would drift from this one.
+    // The DECLARATION is not a call site — `function snapshotAtRiskDownloads()` matches the
+    // same text, and an assertion its own definition satisfies is not an assertion.
+    const others = (src.split("function emitComfyuiChange")[0] + emitter.slice(emitter.indexOf("\n}")))
+      .replace(/function snapshotAtRiskDownloads\(\)[^\n]*/g, "");
+    expect(others).not.toMatch(/snapshotAtRiskDownloads\(\)/);
 
-  it("WIRING: the snapshot is taken in the SETTER, before the synchronous respawn", async () => {
-    // The whole premise. `emitComfyuiChange` is synchronous and a listener may replace its
-    // tool session inside it, so enumerating downloads afterwards describes a world where
-    // they are already orphaned — my first version did exactly that and then told the user
-    // to "let them finish". The snapshot has to be taken before the emit and ride the
-    // receipt.
-    const { readFileSync } = await import("node:fs");
-    const code = (rel: string): string =>
-      readFileSync(new URL(rel, import.meta.url), "utf8")
-        .replace(/\/\*[\s\S]*?\*\//g, "")
-        .replace(/\/\/.*/g, "");
-
-    const setter = code("../../services/panel-secrets.ts");
-    // The CALL SITE, not the helper's definition. Measuring `snapshotAtRiskDownloads()`
-    // alone found the function declaration — which sits near the top of the file and is
-    // therefore always "before the emit", so the assertion passed no matter where the call
-    // actually was. Mutation testing caught it: moving the call after the emit left this
-    // green.
-    const snapshotAt = setter.indexOf("? snapshotAtRiskDownloads()");
-    const emitAt = setter.indexOf("emitComfyuiChange({");
-    expect(snapshotAt, "the setter must snapshot in-flight downloads").toBeGreaterThan(-1);
-    expect(emitAt).toBeGreaterThan(-1);
-    expect(snapshotAt, "the snapshot must precede the respawn emit").toBeLessThan(emitAt);
-
-    // …and the receipt renderer must read that snapshot rather than re-enumerating.
-    const receipt = code("../../orchestrator/panel-tools.ts");
-    expect(receipt).toMatch(/receipt\.atRiskDownloads/);
-    expect(receipt).not.toMatch(/downloadsAtRiskOfRespawn\(\)/);
+    // …and it must reach the user through the shared disclosure list, not one caller's
+    // renderer: the Settings endpoint saves through the same path and said nothing.
+    expect(src).toMatch(/atRiskNote\(receipt\.atRiskDownloads/);
+    const receiptRenderer = code("../../orchestrator/panel-tools.ts");
+    expect(receiptRenderer).not.toMatch(/downloadsAtRiskOfRespawn\(\)/);
   });
 });

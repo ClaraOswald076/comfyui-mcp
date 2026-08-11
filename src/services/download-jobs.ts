@@ -1695,78 +1695,100 @@ export function resetDownloadJobs(): void {
  * not recoverable.
  */
 /**
- * Lengths at which a pure-hex run is a HASH rather than a credential (codex P3).
+ * Named credential shapes. A filename matching one of these is redacted WHOLE — no part of
+ * a known key is worth keeping for identification.
  *
- * `flux1-dev-<40 hex>.safetensors` is a perfectly ordinary name — a git sha, an md5, a
- * civitai version hash — and redacting it wholesale leaves the user a receipt saying two
- * downloads are at risk without saying WHICH, which is most of the value of the warning.
- * Hex-only is a weak signal on its own, so it is paired with an exact hash length: md5,
- * sha1, sha256, sha512. A credential that happens to be pure hex at exactly one of those
- * four lengths still prints — stated rather than hidden, because a redaction rule that
- * overstates its coverage is worse than one that admits its gap.
+ * These exist because length alone cannot catch them: an AWS access key ID is exactly 20
+ * characters with no separator, which is also the length of an ordinary model filename, so
+ * the generic run rule below cannot be lowered far enough to see it.
  */
-const HASH_RUN_LENGTHS: ReadonlySet<number> = new Set([32, 40, 64, 128]);
+const NAMED_CREDENTIAL_SHAPES: readonly RegExp[] = [
+  // Hyphens and underscores INSIDE the token count: a real key is `sk-live-abc…`, and
+  // requiring 12 contiguous alphanumerics after the prefix missed exactly that shape.
+  /(sk|pk|hf|ghp|gho|xox[baprs])[-_][A-Za-z0-9_-]{12,}/,
+  /(api[-_]?key|secret|token|password|bearer)/i,
+  /(AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ABIA)[A-Z0-9]{16}/,
+  /AIza[A-Za-z0-9_-]{35}/,
+  /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/,
+];
 
 /**
- * Is this long run ACCOUNTED FOR by ordinary name parts, or is it a blob?
+ * Part-level thresholds for the generic rule.
  *
- * Checking hex-ness on the whole run does not work, because `-` and `_` are inside the
- * run: `flux1-dev-<40 hex>` is one 50-character run that is not pure hex, so the naive
- * version redacted the very name the P3 finding was about. The run is therefore split on
- * its separators and each part must explain itself.
+ * PARTIAL redaction is what makes these numbers affordable. The previous version had to
+ * decide whether a whole filename was a secret, so every threshold traded a leak against
+ * destroying the user's ability to tell which download the warning was about — and it lost
+ * both ways: an exact-length hex credential was waved through as "a hash", while
+ * `realisticVisionV60B1_v51HyperVAE-inpainting` was redacted entirely. Replacing only the
+ * suspicious PART keeps the identifying prefix, so the rule can be strict without costing
+ * the warning its point, and there is no longer any need to guess hash-versus-secret: a
+ * long opaque part is replaced whatever it is.
+ */
+const MAX_KEPT_PART = 24;
+/** Interleaved letters-and-digits is the strongest blob signal, so several in one run is a
+ *  blob even when each is short. Real names reach two (`juggernautXL_v9Rundiffusion`);
+ *  three is where a name stops being plausible. */
+const MAX_MIXED_PARTS = 2;
+const MIN_MIXED_PART = 5;
+
+/** Is this part long enough and opaque enough that it should not be printed? */
+function partIsOpaque(part: string): boolean {
+  return part.length > MAX_KEPT_PART;
+}
+
+function partIsMixed(part: string): boolean {
+  return (
+    part.length >= MIN_MIXED_PART && /[A-Za-z]/.test(part) && /[0-9]/.test(part)
+  );
+}
+
+/** Replace the opaque parts of one long run, or the whole run when it is a blob. */
+function redactRun(run: string): string {
+  const parts = run.split(/([-_])/);
+  const words = parts.filter((x) => x !== "-" && x !== "_" && x !== "");
+  // Several interleaved parts in one run is a token spelled to look like a name —
+  // `auth-A1b2C3d4-E5f6G7h8-I9j0K1l2`. Each part alone reads as ordinary, so this can only
+  // be judged across the run.
+  if (words.filter(partIsMixed).length > MAX_MIXED_PARTS) return REDACTED;
+  return parts.map((x) => (partIsOpaque(x) ? REDACTED : x)).join("");
+}
+
+const REDACTED = "(redacted)";
+
+/**
+ * A filename with credential-shaped material removed, keeping what identifies the download.
+ *
+ * The warning this feeds exists so a user can decide whether to let a 29 GB transfer
+ * finish. A receipt that says "2 downloads are at risk" without saying WHICH has given up
+ * most of that value — so the goal is not to redact the most, it is to redact the
+ * credential and keep the name.
  *
  * ACCEPTED RESIDUAL, stated rather than hidden: a credential spelled as separator-
- * delimited chunks of eight characters or fewer — `AbcD3fGh-IjKl9mNo-PqRs7tUv` — reads as
- * a name here and survives. Eight characters is where json-guard draws the same line for
- * the same reason: below it a chunk carries too little entropy to be worth protecting, and
- * a rule that redacts `Q8_0`, `a14b` and `e4m3fn` redacts most real model filenames. The
- * shapes that actually appear in a leaked filename — a bare key, a prefixed key, a JWT —
- * are matched by name above and do not depend on this.
+ * delimited chunks that are each short, each of one character class, and no more than two
+ * of them interleaved, reads as a model name and survives. No shape rule closes that — a
+ * token spelled like a name IS spelled like a name, and the rule that catches it also
+ * catches `flux1-kontext-dev-Q8_0-fp8-e4m3fn`.
  */
-const MAX_NAME_PART = 20;
-const MIN_PROTECTED_PART = 8;
-
-function runIsOrdinaryName(run: string): boolean {
-  let mixedBudget = 1;
-  for (const part of run.split(/[-_]/)) {
-    if (part === "") continue;
-    // A hash: hex-only AND an exact digest length.
-    if (/^[0-9a-f]+$/i.test(part) && HASH_RUN_LENGTHS.has(part.length)) continue;
-    if (part.length <= MIN_PROTECTED_PART) continue;
-    if (part.length > MAX_NAME_PART) return false;
-    if (/^[A-Za-z]+$/.test(part) || /^[0-9]+$/.test(part)) continue;
-    // Letters and digits interleaved is the strongest blob signal, so it is BUDGETED
-    // across the run rather than allowed per part — several in a row is not a name.
-    if (mixedBudget-- > 0) continue;
-    return false;
-  }
-  return true;
-}
-
-/** A run long enough to be a credential, discounting the ones that are plainly names. */
-function hasOpaqueRun(name: string): boolean {
-  return (name.match(/[A-Za-z0-9_-]{32,}/g) ?? []).some((run) => !runIsOrdinaryName(run));
-}
-
 function redactSecretishFilename(name: string | undefined): string {
   if (!name) return "(unnamed)";
-  const looksSecretish =
-    // Hyphens and underscores INSIDE the token count: a real key is `sk-live-abc…`, and
-    // requiring 12 contiguous alphanumerics after the prefix missed exactly that shape.
-    /(sk|pk|hf|ghp|gho|xox[baprs])[-_][A-Za-z0-9_-]{12,}/.test(name) ||
-    /(api[-_]?key|secret|token|password|bearer)/i.test(name) ||
-    // SHAPES SHORTER THAN THE GENERIC RUN (codex). An AWS access key ID is exactly 20
-    // characters with no separator, so it cleared none of the rules above and fell under
-    // the 32-character floor below: `AKIAABCDEFGHIJKLMNOP.safetensors` printed in full.
-    // The generic length rule cannot be lowered to catch it — 20 characters is an ordinary
-    // model filename — so the known short shapes are named individually.
-    /(AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ABIA)[A-Z0-9]{16}/.test(name) ||
-    /AIza[A-Za-z0-9_-]{35}/.test(name) ||
-    /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/.test(name) ||
-    hasOpaqueRun(name);
-  if (!looksSecretish) return name;
+  if (NAMED_CREDENTIAL_SHAPES.some((re) => re.test(name))) {
+    return `${REDACTED}${safeExtension(name)}`;
+  }
+  // Runs are examined and rewritten in place, so the parts that are ordinary survive.
+  return name.replace(/[A-Za-z0-9_-]{32,}/g, redactRun);
+}
+
+/**
+ * The extension, but only when it IS one.
+ *
+ * `extname` returns everything after the last dot, and filename validation rejects path
+ * separators and dot-names — not `?`. So `model-token.safetensors?token=SECRET` yielded
+ * `(redacted).safetensors?token=SECRET`, a redaction that published the credential it was
+ * removing (codex). An extension is letters and digits or it is not kept.
+ */
+function safeExtension(name: string): string {
   const ext = extname(name);
-  return ext ? `(redacted)${ext}` : "(redacted)";
+  return /^\.[A-Za-z0-9]{1,12}$/.test(ext) ? ext : "";
 }
 
 export function downloadsAtRiskOfRespawn(
@@ -1777,12 +1799,18 @@ export function downloadsAtRiskOfRespawn(
    * same "the double agreed with me" failure this session keeps producing, one layer down.
    */
   jobs: readonly DownloadJob[] = listDownloadJobs(),
-): { filename: string; bytes: number }[] {
-  const at: { filename: string; bytes: number }[] = [];
+): { id: string; filename: string; bytes: number }[] {
+  const at: { id: string; filename: string; bytes: number }[] = [];
   for (const job of jobs) {
     if (job.status !== "downloading") continue;
     const progress = readDownloadProgress(job.progressId ?? job.trayId);
     at.push({
+      // AN IDENTITY THAT IS NOT THE DISPLAY NAME (codex P2). Two different downloads
+      // whose names are both credential-shaped redact to the SAME string, so a consumer
+      // deduplicating on the filename collapsed them into one entry and reported the
+      // larger byte count instead of both files and their total — under-reporting the
+      // loss precisely when the names are least informative.
+      id: job.progressId ?? job.trayId ?? job.filename ?? "",
       filename: redactSecretishFilename(job.filename),
       bytes: progress?.downloaded ?? 0,
     });
