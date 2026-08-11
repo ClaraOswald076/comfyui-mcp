@@ -440,6 +440,11 @@ export function describeComfyuiSecretSave(receipt: SecretSaveReceipt): string {
         : `No live tool session needed rebuilding (${live} live).`,
     );
   }
+  // #1378's warning is NOT rendered here any more. It moved into `receiptDisclosures`
+  // (pushed above), because this renderer is the agent-facing one and the Settings
+  // endpoint saves through the same path, orphans the same transfers, and said nothing at
+  // all. One description, every consumer — the alternative is what already happened once.
+
   parts.push(
     !confirmed
       ? `Before relying on it, re-check ${receipt.path} carries "${receipt.key}"; if the action fails again the same way, treat the credential as unset and set it again.`
