@@ -821,8 +821,20 @@ export async function getOutputImage(
           `got ${result.base64.length === 0 ? "an empty response" : `content-type "${result.mimeType}"`}. ` +
           `The file may not exist in the ComfyUI ${type} directory — ` +
           `check the filename/subfolder (e.g. via get_image (action:"list_outputs") or get_history).`,
-      "IMAGE_NOT_FOUND",
-      { filename, type, subfolder, mimeType: result.mimeType },
+      // THE CODE HAS TO AGREE WITH THE MESSAGE (codex P2). The message names the real
+      // reason, but a caller that branches on the code — which is the whole point of
+      // having one — still read IMAGE_NOT_FOUND and went off to re-check a filename that
+      // was never wrong. That is the same wrong-cause failure as the prose, one layer
+      // down, and it is the layer that automation reads.
+      jsonRefusal ? "ATTACHMENT_CONTENT_REJECTED" : "IMAGE_NOT_FOUND",
+      {
+        filename,
+        type,
+        subfolder,
+        mimeType: result.mimeType,
+        // The reason, structured, so a caller does not have to parse the sentence.
+        ...(jsonRefusal ? { rejectedBecause: jsonRefusal } : {}),
+      },
     );
   }
 

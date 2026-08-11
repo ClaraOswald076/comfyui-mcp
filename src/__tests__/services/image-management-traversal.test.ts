@@ -787,6 +787,37 @@ describe("#1373 — a .json attachment is accepted by PARSING it, not by its con
     }
   });
 
+  it("a content refusal carries its OWN error code, not IMAGE_NOT_FOUND (codex P2)", async () => {
+    // The prose named the real reason; the CODE still said the file was missing — and the
+    // code is the part automation reads. A caller branching on it retried, re-listed the
+    // directory, and asked the user to check a filename that was never wrong.
+    fetchImageMock.mockResolvedValue(jsonBody('{"error":"not found"}'));
+    const err = await getOutputImage("wf.json", "input", "", {
+      allowMedia: true,
+      allowJson: true,
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(ComfyUIError);
+    expect(err.code).toBe("ATTACHMENT_CONTENT_REJECTED");
+    // The reason, structured, so a caller need not parse the sentence to act on it.
+    expect(err.details?.rejectedBecause).toMatch(/JSON ERROR body/);
+  });
+
+  it("…and a genuinely absent file still says IMAGE_NOT_FOUND", async () => {
+    // The over-broad direction of the same change, which the test above cannot see:
+    // relabelling every rejection would erase the missing-file signal that #385 added,
+    // and #385's own tests use .png paths that never reach the JSON branch at all.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from("<html>404</html>", "utf8").toString("base64"),
+      mimeType: "text/html",
+    });
+    const err = await getOutputImage("gone.png", "output", "", {
+      allowMedia: true,
+      allowJson: true,
+    }).catch((e) => e);
+    expect(err.code).toBe("IMAGE_NOT_FOUND");
+    expect(err.details?.rejectedBecause).toBeUndefined();
+  });
+
   it("…and KEEPS a real workflow that carries its own top-level `error` field (codex)", async () => {
     // The other direction of the same miscalibration: rejecting a legitimate attachment
     // because a key name collided. A body with workflow markers is a workflow.
