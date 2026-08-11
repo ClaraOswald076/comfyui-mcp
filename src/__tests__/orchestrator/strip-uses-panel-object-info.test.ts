@@ -54,6 +54,22 @@ describe("the live canvas is converted with ITS OWN ComfyUI's definitions (#1359
     expect(body).toContain("OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS");
   });
 
+  it("NO FALLBACK: the BACKFILL is skipped too, or the guarantee leaks one line later", () => {
+    // `backfillObjectInfo` fetches each type it lacks from
+    // `${getComfyUIBaseUrl()}/object_info/<Type>` — COMFYUI_URL, the host the live path
+    // just refused. Refusing the bulk fetch and then backfilling from that server merges a
+    // DIFFERENT ComfyUI's definitions into the panel's map, which is exactly the silent
+    // wrong-schema outcome the refusal exists to prevent. It fails soft, so it degrades to
+    // "type absent" when that host is unreachable and to a quietly wrong schema when it is
+    // not.
+    const src = panelToolsCode();
+    const at = src.indexOf("const objectInfo =");
+    expect(at).toBeGreaterThan(-1);
+    const line = src.slice(at, at + 200);
+    expect(line).toMatch(/liveCanvasSource\s*\?\s*bulk/);
+    expect(line).toMatch(/backfillObjectInfo\(bulk, collectNodeTypes\(ui\)\)/);
+  });
+
   it("NO FALLBACK: the live-canvas path never reaches getObjectInfo() on a panel failure", () => {
     // THE TEST THIS FILE EXISTS FOR. A fallback is the tempting shape and the dangerous
     // one, and it would pass every other assertion here.

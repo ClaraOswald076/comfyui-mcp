@@ -8227,7 +8227,24 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             return fail(objectInfoHostMismatchMessage(err));
           }
         }
-        const objectInfo = await backfillObjectInfo(bulk, collectNodeTypes(ui));
+        // THE FAIL-CLOSED GUARANTEE LEAKED ONE LINE LATER, so this branches too.
+        //
+        // `backfillObjectInfo` fetches each type it is missing from
+        // `${getComfyUIBaseUrl()}/object_info/<Type>` — COMFYUI_URL, the exact authority
+        // the live-canvas path just refused to consult. Refusing the bulk fetch and then
+        // backfilling from that host would merge a DIFFERENT ComfyUI's definitions into
+        // the panel's map, silently, which is the outcome the branch above exists to
+        // prevent. It fails soft (each miss is swallowed), so on an unreachable
+        // COMFYUI_URL it degrades to "type absent" — but when that host IS reachable and
+        // is a different server, the schema is quietly wrong.
+        //
+        // For a panel-sourced map a miss is not something to repair from elsewhere: the
+        // panel returned that ComfyUI's WHOLE /object_info, so a type absent from it is
+        // absent from the server that will run the workflow. convertUiToApi already
+        // reports unknown types as warnings, which is the honest outcome.
+        const objectInfo = liveCanvasSource
+          ? bulk
+          : await backfillObjectInfo(bulk, collectNodeTypes(ui));
         const converted = convertUiToApi(ui, objectInfo);
         const workflow = converted.workflow;
         const warnings = [...captureNotes, ...converted.warnings];
