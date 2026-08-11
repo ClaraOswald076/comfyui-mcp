@@ -34,6 +34,10 @@ import {
 } from "./instance-witness.js";
 import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import {
+  desktopSavedLaunchArgs,
+  describeSavedLaunchArgDrift,
+} from "./desktop-launch-args.js";
 import { findComfyuiPython } from "./env-capabilities.js";
 import {
   readLiveProcessEnv,
@@ -3850,7 +3854,18 @@ async function restartViaManagerRebootDispatch(
   }
   const argvNote =
     targetStable && identityContinuous
-      ? describeArgvDrift(priorArgv, afterArgv, context.isDesktop === true)
+      ? describeArgvDrift(priorArgv, afterArgv, context.isDesktop === true) +
+        // #848: and where the SAVED settings can be read, replace the conditional
+        // remedy with the observation. "If you were expecting different arguments" is
+        // a hint the user has to evaluate; naming the flag they added and confirming
+        // it is not in force is the answer they came for. Silent whenever the settings
+        // could not be established — a missing file is not evidence of agreement.
+        (context.isDesktop === true
+          ? describeSavedLaunchArgDrift(
+              desktopSavedLaunchArgs(config.comfyuiPath ?? undefined),
+              afterArgv,
+            )
+          : "")
       : "";
 
   return {
