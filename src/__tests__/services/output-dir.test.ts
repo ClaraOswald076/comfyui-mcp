@@ -1217,6 +1217,22 @@ describe("#1371 — a configured base the server demonstrably does not read is r
     );
   });
 
+  it("does NOT refuse a multi-root base holding only METADATA (codex P0)", async () => {
+    // "Has files of its own" has to mean MODEL files. Counting any directory entry treats
+    // a .gitkeep or a desktop.ini as proof the base is a populated root, so an
+    // extra_model_paths root with nothing but housekeeping in this category would be
+    // refused — the working install this refinement exists to protect.
+    config.comfyuiPath = "/second-root";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { vae: ["lives-in-the-other-root.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = [".gitkeep", "desktop.ini", "Thumbs.db"];
+
+    const { modelsDir } = await resolveModelsDirWithBases({ targetCategory: "vae" });
+    expect(modelsDir).toBe(resolve("/second-root", "models"));
+  });
+
   it("does NOT refuse a multi-root base that is simply EMPTY for this category", async () => {
     // THE P0 DIRECTION. An extra_model_paths layout can legitimately have this base as one
     // of the server's roots with nothing in this category yet — indistinguishable from a

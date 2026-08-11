@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { config, isRemoteMode } from "../config.js";
 import { getSystemStats, comfyApiFetch } from "../comfyui/client.js";
 import {
@@ -441,6 +441,25 @@ function probeEntry(p: string): { kind: "file" | "absent" | "not-a-file" | "inde
   }
 }
 
+/**
+ * Extensions that make a directory entry a MODEL rather than housekeeping (#1371).
+ *
+ * Used only to answer "does this base hold models of its own for this category?" — the
+ * question that separates a stale second install from an extra_model_paths root that is
+ * simply empty here. A `.gitkeep` or a `desktop.ini` answers neither.
+ */
+const BASE_OWN_MODEL_EXTENSIONS = new Set([
+  ".safetensors",
+  ".sft",
+  ".ckpt",
+  ".pt",
+  ".pt2",
+  ".pth",
+  ".bin",
+  ".gguf",
+  ".onnx",
+]);
+
 async function corroborateBaseByModelInventory(
   base: string,
   targetCategory: string,
@@ -665,13 +684,21 @@ async function corroborateBaseByModelInventory(
       // against. A base holding a different set of files for the same category is the case
       // that is actually diagnostic, and it is the reporter's: a second full install.
       if (present === 0) {
-        let baseHasOwnFilesHere = false;
+        // …and "has files of its own" must mean MODEL files (codex P0). Counting any
+        // directory entry treats a `.gitkeep`, a `desktop.ini` or a `Thumbs.db` as proof
+        // the base is a populated root — so a legitimate extra_model_paths root holding
+        // nothing but metadata for this category would be refused, which is the working
+        // install this whole refinement exists to protect. Only a real model file is
+        // evidence that this base is a place models live.
+        let baseHasOwnModelsHere = false;
         try {
-          baseHasOwnFilesHere = readdirSync(categoryDir).length > 0;
+          baseHasOwnModelsHere = readdirSync(categoryDir).some((entry) =>
+            BASE_OWN_MODEL_EXTENSIONS.has(extname(String(entry)).toLowerCase()),
+          );
         } catch {
           // Absent or unreadable — nothing established either way.
         }
-        contradictedBase = baseHasOwnFilesHere;
+        contradictedBase = baseHasOwnModelsHere;
       }
       lastReason =
         present === 0
