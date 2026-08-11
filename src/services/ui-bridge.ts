@@ -17,6 +17,7 @@
 
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
+import { resolveLocale, trFor, type Locale } from "../i18n/index.js";
 import { logger } from "../utils/logger.js";
 import { midCommandDisconnectMessage } from "./mid-command-remedy.js";
 import {
@@ -232,6 +233,16 @@ interface Conn {
    *  connections, whose advertised loopback origin is NOT the orchestrator's host
    *  and must not be directly health-probed (#509). */
   local: boolean;
+  /** The panel language THIS tab resolved for itself (`locale` in its `hello`), already
+   *  narrowed to a locale we ship. Undefined when the panel sent none (an older build) or
+   *  sent one we do not ship — both mean UNKNOWN, and unknown renders English.
+   *
+   *  Why per TAB and not per process: a `say` frame is a chat bubble inside one specific
+   *  panel tab, and those strings NAME PANEL CONTROLS ("Settings → OpenRouter → 'Set API
+   *  key…'"). Rendered in the process locale — the language of whoever launched the server —
+   *  the instruction would point at a label that user cannot find on their own screen. So the
+   *  language must come from the destination tab. See {@link tabLocale}. */
+  locale?: Locale;
 }
 
 /** Panel build that first implements the full graph_* / ui_* bridge command set.
@@ -1921,6 +1932,12 @@ export class UiBridge {
     // deleted during migration below; without carrying this, a graph-edit-triggered
     // migration + undercutting-version hello would reintroduce the false "too old" gate.
     let migratedProvenSupported: Set<string> | undefined;
+    // Same idea for the panel language: a WORKFLOW SWITCH re-hellos on this socket under a
+    // NEW tab id, so the retiring conn is not `existing` and same-socket inheritance cannot
+    // see it. Without this carry-over a panel that omitted `locale` on the switch hello would
+    // drop back to English mid-session — which is exactly the case the field's doc claims is
+    // preserved. Consumed once, with migratedProvenSupported.
+    let migratedLocale: Locale | undefined;
 
     sock.on("message", (buf: unknown) => {
       const raw = String(buf);
@@ -1963,6 +1980,9 @@ export class UiBridge {
           // Carry the retiring conn's proven-supported veto to the migrated id (#422)
           // — same socket/panel, so demonstrated capability must not be lost.
           migratedProvenSupported = this.conns.get(tabId)?.provenSupportedCmds;
+          // …and the panel language, for the same reason: same socket, same browser tab, same
+          // person reading the bubbles.
+          migratedLocale = this.conns.get(tabId)?.locale;
           this.conns.delete(tabId);
           // Move mirror subscribers to the migrated tab id so viewers keep this
           // tab's live feed across a same-socket re-hello. #570 P0a — this is OPTIMISTIC
@@ -2160,6 +2180,27 @@ export class UiBridge {
           serverOrigin: existing?.sock === sock ? (serverOrigin ?? existing?.serverOrigin) : serverOrigin,
           // Server-trusted provenance of THIS socket (not client-controlled).
           local,
+          // The panel's own resolved UI language, so `say` bubbles land in the language of
+          // the controls they name. Narrowed here rather than at the read sites: an unshipped
+          // or garbage value becomes undefined once, at the boundary, instead of every caller
+          // having to defend against it.
+          //
+          // PRESENCE decides inheritance, not resolvability. A hello that CARRIES the field is
+          // authoritative even when we cannot ship what it asked for: a user who just switched
+          // the panel to German must get English, not the Japanese they had a moment ago —
+          // otherwise every bubble names controls in a language no longer on their screen.
+          //
+          // Only an ABSENT field inherits, and only from this same socket (the `originUrl`
+          // rule above, same reason: wf: ids recur, so a DIFFERENT socket reusing this id is a
+          // different browser tab whose language we have not been told) — or from the conn
+          // this socket is migrating away from, since a workflow switch re-hellos under a NEW
+          // tab id. Cosmetic either way; nothing gates on it.
+          locale:
+            "locale" in msg
+              ? typeof msg.locale === "string"
+                ? (resolveLocale(msg.locale) ?? undefined)
+                : undefined
+              : ((existing?.sock === sock ? existing?.locale : undefined) ?? migratedLocale),
         });
         // CONSUME the migration carry-over exactly once: it belongs to THIS hello's
         // conn only. Leaving it set would let a LATER same-socket re-hello rebuild the
@@ -2167,6 +2208,7 @@ export class UiBridge {
         // Unknown-command reply cleared it — re-bypassing the undercut-version gate
         // (codex round-8 P1).
         migratedProvenSupported = undefined;
+        migratedLocale = undefined;
         if (incomingHeadless) {
           this.headlessSeen.add(tabId);
         } else {
@@ -2825,6 +2867,28 @@ export class UiBridge {
     }
   }
 
+  /**
+   * The panel language to render a HUMAN-facing frame in for `tabId` — English when the
+   * tab never advertised one, advertised one we do not ship, or is not connected.
+   *
+   * Resolved through the SAME path as `push` (exact id → prefix → same-socket migration
+   * alias → scope address), so the language is the language of the tab that will actually
+   * RECEIVE the frame, not of whatever id the caller happened to hold. A `say` naming
+   * "Settings → OpenRouter" is useless in a language the panel around it is not in.
+   *
+   * NEVER THROWS, and that is the load-bearing part: these strings are emitted while
+   * reporting OTHER failures — a start failure, a lost render completion, a panel sync that
+   * did not happen — so a locale lookup that could throw would turn a report of one failure
+   * into two. English is always an acceptable answer; an exception never is.
+   */
+  tabLocale(tabId: string): Locale {
+    try {
+      return this.resolveTarget(tabId).locale ?? "en";
+    } catch {
+      return "en";
+    }
+  }
+
   /** #952 — the DISTINCT ComfyUI origins the connected tabs actually front, for
    *  the headless-fetch drift comparison (see comfyui/fetch.ts). Trusted
    *  handshake Origins only, so a tab that supplied none is simply absent rather
@@ -3099,10 +3163,16 @@ export class UiBridge {
           this.push(
             {
               type: "say",
-              text:
-                `⚠️ Too many question cards are open at once in this tab, so the oldest ones can no ` +
-                `longer accept an answer — clicking them will do nothing. Answer the most recent card, ` +
-                `or just type your choice in the chat and the agent will pick it up.`,
+              // The ⚠️ stays outside the translated span: it is the status marker the panel's
+              // own bubble styling and a skimming eye both key on, and it means the same thing
+              // in every language.
+              text: `⚠️ ${trFor(
+                this.tabLocale(tabId),
+                "say.too_many_question_cards",
+                "Too many question cards are open at once in this tab, so the oldest ones can no " +
+                  "longer accept an answer — clicking them will do nothing. Answer the most recent card, " +
+                  "or just type your choice in the chat and the agent will pick it up.",
+              )}`,
             },
             tabId,
           );
