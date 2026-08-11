@@ -79,6 +79,49 @@ describe("operational status reaches the agent without reaching the user", () =>
     expect(sent[0]?.type).toBe("say");
   });
 
+  it("a MIGRATED tab is judged by the connection that will RECEIVE it (codex P1)", () => {
+    // The capability was read with conns.get() while push() routes with
+    // resolveTarget(), which follows alias/migration mappings. A tab that re-helloed
+    // under a new id was therefore judged incapable and then delivered to a perfectly
+    // capable panel — the wall of text reappearing on exactly the build that can hide
+    // it. Both now go through resolveTarget.
+    const bridge = new UiBridge(0);
+    const sent: Frame[] = [];
+    (bridge as unknown as { push: (f: Frame, t?: string) => number }).push = (f) => {
+      sent.push(f);
+      return 1;
+    };
+    // The capable connection lives under its NEW id; the caller still holds the old one.
+    (bridge as unknown as { conns: Map<string, unknown> }).conns.set("tab-new", {
+      acceptsAgentNotes: true,
+    });
+    (bridge as unknown as { resolveTarget: (t: string) => unknown }).resolveTarget = (t) => {
+      if (t === "tab-old" || t === "tab-new") return { acceptsAgentNotes: true };
+      throw new Error("no such tab");
+    };
+
+    expect(bridge.pushAgentNote(NOTE, "tab-old")).toBe("agent_note");
+    expect(sent[0]?.type).toBe("agent_note");
+  });
+
+  it("an UNROUTABLE tab still falls back — the buffered frame must be the safe one", () => {
+    // push() buffers for replay on the next hello when the tab is not routable. We
+    // cannot know what will pick that frame up, so the one we hand it must be the
+    // visible `say`.
+    const bridge = new UiBridge(0);
+    const sent: Frame[] = [];
+    (bridge as unknown as { push: (f: Frame, t?: string) => number }).push = (f) => {
+      sent.push(f);
+      return 1;
+    };
+    (bridge as unknown as { resolveTarget: (t: string) => unknown }).resolveTarget = () => {
+      throw new Error("tab not connected");
+    };
+
+    expect(bridge.pushAgentNote(NOTE, "gone")).toBe("say");
+    expect(sent[0]?.type).toBe("say");
+  });
+
   it("a MISSING capability field is treated as absent, not as truthy", () => {
     const bridge = new UiBridge(0);
     const sent: Frame[] = [];

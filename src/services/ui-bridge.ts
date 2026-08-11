@@ -2589,7 +2589,23 @@ export class UiBridge {
    * assume.
    */
   pushAgentNote(text: string, tabId?: string): "agent_note" | "say" {
-    const conn = tabId ? this.conns.get(tabId) : undefined;
+    // Resolve through resolveTarget — the SAME lookup push() will use (codex, P1).
+    // A direct conns.get() misses alias/migration mappings that resolveTarget follows,
+    // so a tab that re-helloed under a new id mid-operation would be judged incapable
+    // here and then delivered to perfectly capable panel: the wall of text reappears on
+    // exactly the build that can hide it. Reading it the same way removes the
+    // disagreement, and there is no await between this and the push, so run-to-
+    // completion guarantees the two see the same connection.
+    let conn: Conn | undefined;
+    if (tabId) {
+      try {
+        conn = this.resolveTarget(tabId);
+      } catch {
+        // Not routable. push() will buffer for replay on the next hello; the frame it
+        // buffers must be the SAFE one, because we cannot know what will pick it up.
+        conn = undefined;
+      }
+    }
     const hidden = conn?.acceptsAgentNotes === true;
     this.push({ type: hidden ? "agent_note" : "say", text }, tabId);
     return hidden ? "agent_note" : "say";
