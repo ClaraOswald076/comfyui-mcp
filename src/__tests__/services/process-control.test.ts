@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
+import { waitFor } from "../helpers/wait-for.js";
 
 const mockConfig = vi.hoisted(() => ({
   resolvedPort: 8188,
@@ -1039,7 +1040,7 @@ describe("restart truthfulness + Pinokio-shaped refusal (#742)", () => {
     vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => undefined)));
 
     const pending = restartComfyUI();
-    await vi.waitFor(() => expect(children.length).toBe(1), {
+    await waitFor(() => expect(children.length).toBe(1), {
       timeout: 10000,
       interval: 20,
     });
