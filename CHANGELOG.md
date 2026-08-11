@@ -197,6 +197,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.3] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- reserve time to actually SAVE a recovered token (#1426)
+- a human fetching a credential is not a stalled operation (#1424)
+
+
 ## [0.51.2] - 2026-08-11
 
 ### MCP
