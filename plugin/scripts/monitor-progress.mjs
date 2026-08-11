@@ -67,6 +67,9 @@ const POST_PROCESSING_GRACE_MS = 15_000;
 let doneCount = 0;
 let successCount = 0;
 let errorCount = 0;
+/** Interrupted runs. Its own tally, because folding them into either of the other two says
+ *  something untrue: a cancelled job did not succeed, and nothing failed. */
+let cancelledCount = 0;
 
 console.log(
   `[MONITOR] Tracking ${jobs.size} job(s): ${[...promptIds].map(short).join(", ")}`,
@@ -190,6 +193,15 @@ async function markDone(promptId, status) {
     } else {
       console.log(`[ERROR] ${short(promptId)} | Failed after ${elapsed}s`);
     }
+  } else if (status === "cancelled") {
+    // A NEW TERMINAL STATUS NEEDS A HOME EVERYWHERE IT LANDS (codex round 3). Teaching the
+    // classifier to say "cancelled" while `markDone` still had two branches meant the new
+    // value fell into the `else` — so an interrupted run printed `| success |` and counted
+    // toward successCount, which is the very claim the classifier was added to stop making.
+    // Fixing the vocabulary in one place and not the other is worse than not fixing it: the
+    // code now looks like it handles interruption.
+    cancelledCount++;
+    console.log(`[CANCELLED] ${short(promptId)} | interrupted after ${elapsed}s | no outputs`);
   } else {
     successCount++;
     await new Promise((r) => setTimeout(r, HISTORY_DELAY_MS));
@@ -214,8 +226,12 @@ function checkAllDone() {
       1000
     ).toFixed(1);
     console.log(
-      `[COMPLETE] All ${jobs.size} jobs finished: ${successCount} success, ${errorCount} error (total: ${totalElapsed}s)`,
+      `[COMPLETE] All ${jobs.size} jobs finished: ${successCount} success, ${errorCount} error` +
+        `${cancelledCount > 0 ? `, ${cancelledCount} cancelled` : ""} (total: ${totalElapsed}s)`,
     );
+    // The exit code is unchanged for cancellations. A user who interrupts a job did not
+    // hit a failure, and the summary above names what happened; turning their own action
+    // into a non-zero exit would make every deliberate cancel look like a broken run.
     process.exit(0);
   }
 }

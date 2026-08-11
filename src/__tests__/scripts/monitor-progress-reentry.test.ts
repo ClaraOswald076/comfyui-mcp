@@ -99,6 +99,28 @@ describe("monitor-progress re-entry guard (#1385)", () => {
     expect(classifyHistoryMessages(undefined)).toBe("success");
   });
 
+  it("a cancelled run is not counted or printed as a success", () => {
+    // Codex round 3, and it is the half I left undone: teaching the classifier to say
+    // "cancelled" while markDone still had exactly two branches meant the new value fell
+    // into the `else` — printing `| success |` and incrementing successCount, which is the
+    // claim the classifier was added to stop making. A vocabulary fixed in one place and
+    // not the other is worse than none: the code then LOOKS like it handles interruption.
+    const s = code();
+    const body = s.slice(s.indexOf("async function markDone"), s.indexOf("function checkAllDone"));
+    expect(body).toMatch(/status === "cancelled"/);
+    // The branch must come BEFORE the catch-all, or it never runs.
+    expect(body.indexOf('status === "cancelled"')).toBeLessThan(body.indexOf("successCount++"));
+    // …and it must not reach the success tally.
+    const cancelledBranch = body.slice(
+      body.indexOf('status === "cancelled"'),
+      body.indexOf("} else {", body.indexOf('status === "cancelled"')),
+    );
+    expect(cancelledBranch).not.toMatch(/successCount/);
+    expect(cancelledBranch).toMatch(/cancelledCount\+\+/);
+    // The summary has to say it happened, or the count is invisible.
+    expect(s).toMatch(/cancelledCount > 0/);
+  });
+
   it("both classification sites use the shared rule", () => {
     // There were two copies, indented differently, and fixing the one I happened to read
     // would have left a cancelled job reported as a success on the other path.
