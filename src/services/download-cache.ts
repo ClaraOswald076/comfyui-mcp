@@ -3302,3 +3302,45 @@ export async function downloadWithCache(
     return { targetPath: options.targetPath, usedCache: false };
   }
 }
+
+/**
+ * The resumable `.partial` for a download, if one is actually on disk (#1370).
+ *
+ * `download_model action:"cancel"` told users "the partial was left on disk and can be
+ * resumed by re-issuing the download". Nothing ever checked. The reporter paused a 33 GB
+ * download BECAUSE of that sentence, then found no partial anywhere and restarted from
+ * zero — the message was load-bearing for a decision and it was asserted, not observed.
+ *
+ * The neighbouring branches were already careful: a ComfyUI-Manager dispatch says there is
+ * no local partial, and a reclaimed-dead writer says one MAY exist. Only the ordinary
+ * cancel stated a fact about the filesystem without consulting it.
+ *
+ * Candidate names rather than one: the staged file is `.<basename>.partial` in the cache
+ * dir, and a cancelled job knows its destination by several routes of differing
+ * reliability (`filename`, the destination key, the URL's last segment). Checking each is
+ * cheap — a few `stat`s — and guessing one wrong would reintroduce the same false claim in
+ * the opposite direction: reporting "nothing to resume" while a 30 GB partial sits there.
+ *
+ * Returns null when nothing is found, which the caller must report as "no partial" rather
+ * than as a failure — a cancel that leaves nothing is not an error, it is a fact the user
+ * needs before deciding to re-issue.
+ */
+export async function findResumablePartial(
+  candidateNames: readonly (string | undefined)[],
+): Promise<{ path: string; bytes: number } | null> {
+  const seen = new Set<string>();
+  for (const raw of candidateNames) {
+    if (typeof raw !== "string" || !raw.trim()) continue;
+    const name = basename(raw.trim());
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    const candidate = join(cacheDir(), `.${name}.partial`);
+    try {
+      const st = await stat(candidate);
+      if (st.isFile() && st.size > 0) return { path: candidate, bytes: st.size };
+    } catch {
+      // ENOENT is the common, expected answer — keep looking.
+    }
+  }
+  return null;
+}

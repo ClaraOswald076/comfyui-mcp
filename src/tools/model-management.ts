@@ -26,6 +26,7 @@ import {
   type DownloadJob,
 } from "../services/download-jobs.js";
 import { readDownloadProgress } from "../services/download-progress.js";
+import { findResumablePartial } from "../services/download-cache.js";
 import { errorToToolResult, ModelError } from "../utils/errors.js";
 import {
   downloadCivitaiModelAction,
@@ -222,6 +223,37 @@ function stillWritingClause(route: DownloadRoute): string {
  * re-issue, while the stale note said doing that corrupts the file (codex
  * review). One function, so they cannot drift again.
  */
+/**
+ * What is ACTUALLY on disk for a cancelled download (#1370).
+ *
+ * The row this replaces said "the partial was left on disk and can be resumed by
+ * re-issuing the download (it picks up where it left off)" on the strength of
+ * `status === "cancelled"` alone. A reporter paused a 33 GB download because of that
+ * sentence, found nothing on disk, and restarted from zero. The sentence was not stale —
+ * it was never checked.
+ *
+ * Both answers are useful and neither is a failure: a partial means "re-issue and you keep
+ * these bytes", and no partial means "re-issue and you start over" — which is exactly the
+ * fact someone needs BEFORE spending the bandwidth, not after. The size is included
+ * because "resumable" without a number is not something you can weigh against restarting.
+ */
+function describePartial(partial: { path: string; bytes: number } | null): string {
+  if (!partial) {
+    return (
+      `NO partial was found on disk, so re-issuing this download starts from the ` +
+      `beginning. (Checked the download cache for a staged .partial under this file's ` +
+      `name.) That is not an error — but it is worth knowing before you re-issue a large ` +
+      `file.`
+    );
+  }
+  const gb = partial.bytes / 1024 ** 3;
+  const size = gb >= 1 ? `${gb.toFixed(2)} GB` : `${(partial.bytes / 1024 ** 2).toFixed(1)} MB`;
+  return (
+    `a partial of ${size} is on disk (${partial.path}) and re-issuing the same download ` +
+    `resumes from it.`
+  );
+}
+
 function afterCancelAdvice(route: DownloadRoute): string {
   switch (route) {
     case "manager":
@@ -968,6 +1000,36 @@ async function statusAction(args: {
         // listing actually contains a collision (two writers, one file).
         const idCounts = new Map<string, number>();
         for (const j of list) idCounts.set(j.id, (idCounts.get(j.id) ?? 0) + 1);
+        // #1370 — LOOK, then say. The cancelled row claimed "the partial was left on disk
+        // and can be resumed by re-issuing the download" purely from `status === "cancelled"`;
+        // nothing stat'd the file. A reporter paused a 33 GB download BECAUSE of that
+        // sentence, found no partial anywhere, and restarted from zero.
+        //
+        // Stat'd up front because the row builder below is synchronous, and only for rows
+        // that could have one: a Manager dispatch never writes a local partial and already
+        // says so. Several candidate names are tried — a cancelled job knows its
+        // destination by routes of differing reliability — because guessing one wrong would
+        // reintroduce the same false claim inverted, reporting "nothing to resume" over a
+        // 30 GB partial sitting right there.
+        const partials = new Map<string, { path: string; bytes: number } | null>();
+        await Promise.all(
+          list
+            .filter((j) => j.status === "cancelled" && !j.viaManager)
+            .map(async (j) => {
+              let fromUrl: string | undefined;
+              try {
+                fromUrl = new URL(j.url).pathname.split("/").filter(Boolean).pop();
+              } catch {
+                /* a non-URL source simply contributes no candidate */
+              }
+              partials.set(
+                `${j.id}\n${j.trayId}`,
+                await findResumablePartial([j.filename, j.path, j.destKey, fromUrl]),
+              );
+            }),
+        );
+        const partialFor = (j: DownloadJob): { path: string; bytes: number } | null =>
+          partials.get(`${j.id}\n${j.trayId}`) ?? null;
         const collidingIds = [...idCounts.entries()].filter(([, n]) => n > 1).map(([k]) => k);
         const lines = list.map((j) => {
           const p = readDownloadProgress(j.progressId ?? j.trayId);
@@ -1027,10 +1089,10 @@ async function statusAction(args: {
                         // left by a cancel (none may exist).
                         (j.viaManager
                           ? `\n    cancelled — the previous session's writer was confirmed GONE (its process no longer exists), so a later session closed its stale record; no live transfer was aborted. This was a remote ComfyUI-Manager dispatch: the host MAY still be fetching server-side (no Manager recall API) and there is NO local partial to resume — check list_local_models to see whether the file landed; re-issuing starts a NEW dispatch.`
-                          : `\n    cancelled — the previous session's writer was confirmed GONE (its process no longer exists), so a later session closed its stale record; no live transfer was aborted. Any .partial the dead writer left was untouched — re-issue the download to resume from it, or to restart cleanly if there is none.`)
+                          : `\n    cancelled — the previous session's writer was confirmed GONE (its process no longer exists), so a later session closed its stale record; no live transfer was aborted. ${describePartial(partialFor(j))}`)
                       : j.viaManager
                         ? `\n    cancelled — this was a remote ComfyUI-Manager dispatch, so there is NO local partial to resume, and the host MAY still be fetching server-side (there's no Manager recall API). Re-issuing starts a NEW server-side dispatch (a duplicate, not a resume). Check list_local_models to see whether the file landed before deciding.`
-                        : `\n    cancelled — the partial was left on disk and can be resumed by re-issuing the download (it picks up where it left off)`) +
+                        : `\n    cancelled — ${describePartial(partialFor(j))}`) +
                     // A recovery-critical note from cancellation cleanup (e.g. a previous
                     // destination file preserved under a .bak path because it couldn't be
                     // restored) — surface it so the user can recover, not mask it.
