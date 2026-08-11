@@ -1233,6 +1233,24 @@ describe("#1371 — a configured base the server demonstrably does not read is r
     expect(modelsDir).toBe(resolve("/second-root", "models"));
   });
 
+  it("a diffusers-style base (models in SUBFOLDERS) is not contradicted — the safe direction", async () => {
+    // A category whose models live in subdirectories reads as metadata-only to this check,
+    // so a stale base of that shape is NOT refused and the download proceeds with the
+    // existing unconfirmed-visibility note. Deliberate: that is the behaviour these users
+    // had before the gate existed. Treating any subdirectory as evidence would re-open the
+    // metadata hole with an empty folder, and a false contradiction costs every download on
+    // a working install while a missed one costs a single misplaced file plus a warning.
+    config.comfyuiPath = "/diffusers-style";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { clip_vision: ["elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = ["some-model-dir"]; // a folder, no model file at this level
+
+    const { modelsDir } = await resolveModelsDirWithBases({ targetCategory: "clip_vision" });
+    expect(modelsDir).toBe(resolve("/diffusers-style", "models"));
+  });
+
   it("does NOT refuse a multi-root base that is simply EMPTY for this category", async () => {
     // THE P0 DIRECTION. An extra_model_paths layout can legitimately have this base as one
     // of the server's roots with nothing in this category yet — indistinguishable from a

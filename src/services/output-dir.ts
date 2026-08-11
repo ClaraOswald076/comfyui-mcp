@@ -690,6 +690,16 @@ async function corroborateBaseByModelInventory(
         // nothing but metadata for this category would be refused, which is the working
         // install this whole refinement exists to protect. Only a real model file is
         // evidence that this base is a place models live.
+        //
+        // KNOWN AND DELIBERATE GAP: a category whose models live in SUBFOLDERS
+        // (diffusers-style directories, `clip_vision/<dir>/model.bin`) reads as
+        // metadata-only here, so a stale base of that shape is NOT contradicted and the
+        // download proceeds with the existing unconfirmed-visibility note. That is the
+        // safe direction — it returns the behaviour to what it was before this gate rather
+        // than blocking anyone — and the alternative, treating any subdirectory as
+        // evidence, re-opens the metadata hole with an empty folder. A missed contradiction
+        // costs one misplaced file and a warning; a false one costs every download on a
+        // working install.
         let baseHasOwnModelsHere = false;
         try {
           baseHasOwnModelsHere = readdirSync(categoryDir).some((entry) =>
