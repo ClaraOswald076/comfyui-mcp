@@ -4,6 +4,30 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.50.112
+
+### Fixed
+
+- **A remote panel can convert its own live canvas (#1359).** `panel_strip_workflow` read the
+  graph from the connected panel but fetched node definitions over `COMFYUI_URL` — the same
+  machine locally, two different ones whenever the panel is remote. A canvas on a proxy URL
+  could not be stripped at all: the definitions request went to `127.0.0.1:8188`.
+
+  The live canvas now takes its definitions from the ComfyUI the PANEL is connected to,
+  which the panel has been able to serve since 0.13.0. In a tunnel or loopback-only
+  topology the browser is the only thing that can reach that server, so this is not a
+  workaround for the remote case — it is the correct source for every case.
+
+  There is deliberately **no fallback** to `COMFYUI_URL`. Both hosts can answer, and when
+  they disagree a fallback returns a workflow converted against the wrong server's schema —
+  wrong widget order, wrong input names — with no error at all. That is worse than the
+  connection failure this issue was filed about, which at least announced itself. A panel
+  that cannot serve definitions, an empty map, an error body, and a map that describes some
+  other install are each refused with the reason.
+
+  Requires panel 0.13.0+; an older panel is refused by the version gate with the version it
+  needs, rather than an "unknown command" error that reads like a broken ComfyUI.
+
 ## 0.50.111
 
 ### Fixed
@@ -119,6 +143,14 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.50.112] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- the live canvas gets its node definitions from its own ComfyUI (#1390)
+
 
 ## [0.50.111] - 2026-08-11
 
