@@ -244,10 +244,23 @@ function hasJsonRecord(stdout: string): boolean {
  * much is recoverable; being wrong the other way hides the only evidence they had.
  */
 const PROGRESS_ONLY_LINE_PATTERNS: readonly RegExp[] = [
-  // comfy-cli's own pre-download announcement — the exact line from the report.
-  /^start downloading url\b.*\binto\b/i,
-  // tqdm: " 45%|█████     | 1.2G/2.7G [00:30<00:40, 40.0MB/s]"
-  /^\s*\d{1,3}%\|[^|]*\|\s*[\d.]+\s*\S*\/[\d.]+\s*\S*/i,
+  // comfy-cli's own pre-download announcement — the line from the report. The real
+  // emitter is `print(f"Start downloading URL: {url} into {local_filepath}")`
+  // (comfy_cli/command/models/models.py) — WITH a colon, which my first fixtures omitted.
+  /^start downloading url:?\s.*\binto\b/i,
+  // huggingface_hub's tqdm, which ALWAYS carries a desc:
+  //   "y.safetensors: 45%|████▌     | 1.20G/2.70G [00:30<00:40, 40.0MB/s]"
+  // Every earlier pattern was anchored `^\s*\d`, so a desc-prefixed bar — the only tqdm
+  // this tool actually produces — matched none of them. #417 was therefore still live on
+  // the gated-Hugging-Face path, which is the path the new hint tells the user to suspect.
+  // The desc is bounded and may not contain a `%`, so it cannot swallow a sentence that
+  // merely happens to precede a percentage.
+  /^[^%]{0,120}:\s*\d{1,3}%\|/,
+  // Bare tqdm: " 45%|█████| 1.2G/2.7G [00:30<00:40, 40.0MB/s]". The size quantifiers are
+  // BOUNDED: `[\d.]+\s*\S*\/` is ambiguous, and on a pathological single line it
+  // backtracks quadratically — measured 13.3s at 200 KB, which on a 16 MB capture
+  // (execFile's maxBuffer) would block the event loop for hours.
+  /^\s*\d{1,3}%\|[^|]{0,200}\|\s*[\d.]{1,20}\s*\S{0,10}\/[\d.]{1,20}\s*\S{0,10}/i,
   // tqdm with no bar drawn (non-tty): " 45%| | 1.2G/2.7G"
   /^\s*\d{1,3}%\|/,
   // A bare percentage or a "Downloading: 45%" heartbeat.
@@ -318,6 +331,9 @@ export function normalizeComfyCliResult<T = unknown>(
     // less satisfying and far more useful, because it redirects the search instead of
     // misdirecting it. The raw output stays in `details` either way; nothing is dropped.
     const reason = failureReasonFrom(details.stderr) ?? failureReasonFrom(details.stdout);
+    // Only a DOWNLOAD may be described as having produced download progress. Read from the
+    // argv this call actually ran, not from the tool that happened to call us.
+    const isDownload = args.includes("download") || args.includes("--url");
     return {
       schema: "envelope/1",
       type: "envelope",
@@ -330,17 +346,31 @@ export function normalizeComfyCliResult<T = unknown>(
         code: "legacy_command_failed",
         message:
           reason ??
-          `comfy-cli exited with code ${result.exitCode} and printed no error — its output was download progress only, so the cause is not visible from here.`,
+          `comfy-cli exited with code ${result.exitCode} and printed no error, so the cause is ` +
+            `not visible from here${isDownload ? " — the output was download progress only" : ""}.`,
         ...(reason
           ? {}
           : {
-              hint:
-                "Nothing in the command's output says why it stopped. Check, in this order: " +
-                "free disk space on the destination drive; whether the source needs auth (a gated " +
-                "Hugging Face repo returns 401/403 and some downloaders exit without printing it); " +
-                "and whether an antivirus or the OS killed the process. Re-running with the same " +
-                "arguments will show the same message — the missing information is on comfy-cli's " +
-                "side, not this tool's.",
+              // THE DIAGNOSIS IS SCOPED TO THE COMMAND THAT EARNED IT. This function
+              // normalizes the ENTIRE comfy-cli surface — stop, launch, run, node
+              // install/update, models list/search/remove, skills_*, env — and the first
+              // version asserted "its output was download progress only" and offered
+              // disk-space-and-gated-HF-auth advice for every one of them. A failing
+              // `comfy node install` would have been handed a fabricated download story.
+              //
+              // Which is this issue's own defect, inverted: #417 is about stating a cause
+              // that was never established. Replacing a progress line with a confident
+              // guess about a different command is the same error with better prose.
+              hint: isDownload
+                ? "Nothing in the command's output says why it stopped. Check, in this order: " +
+                  "free disk space on the destination drive; whether the source needs auth (a " +
+                  "gated Hugging Face repo returns 401/403 and some downloaders exit without " +
+                  "printing it); and whether an antivirus or the OS killed the process. " +
+                  "Re-running with the same arguments will show the same message — the missing " +
+                  "information is on comfy-cli's side, not this tool's."
+                : "Nothing in the command's output says why it stopped, and this tool cannot " +
+                  "infer it. Re-run the same command directly in a terminal, where comfy-cli " +
+                  "may print more than it does when its output is captured.",
             }),
         details: { ...details, exit_code: result.exitCode },
       },
