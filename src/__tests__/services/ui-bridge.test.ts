@@ -763,7 +763,11 @@ describe("UiBridge (multi-tab)", () => {
 
   it("an idempotent read whose tab never returns fails as genuinely gone (#450)", async () => {
     const a = await connectPanel("tab-aaaa-1111");
-    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    // BOUNDED UNDER THIS TEST'S OWN BUDGET (#1325). The helper's 15s default is larger
+    // than the 10s below, so a stuck connect would be killed by the runner and reported as
+    // vitest's generic "test timed out" instead of naming the wait. This connect is local
+    // and takes milliseconds; 3s is slack, not a deadline under test.
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1), { timeout: 3000 });
     const promise = bridge.send({ cmd: "graph_get_errors" }, { timeoutMs: 5000 });
     await new Promise((r) => setTimeout(r, 50));
     a.close();
@@ -3411,7 +3415,8 @@ describe("defaultBridgeTimeoutMs — tolerant read timeout (#357)", () => {
 
   it("a no-timeout READ stays alive PAST the old 6s cutoff (end-to-end) (#357)", async () => {
     const a = await connectPanel("tab-aaaa-1111"); // never auto-replies
-    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    // Bounded under this test's 12s budget, for the reason given at the #450 test above.
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1), { timeout: 3000 });
     // #1325 — this test used to record only a BOOLEAN and discard the reason, so a
     // failure read `expected true to be false` and named nothing. It was reported as
     // load-sensitive, and the arithmetic says a slow machine alone cannot be the whole
