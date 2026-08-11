@@ -270,6 +270,32 @@ describe("compact mode over a real MCP client/server pair", () => {
   // bundled debug-render / director skills name panel_* tools), and an outside MCP
   // client reading it holds none of them.
   describe("a panel_* name is answered as a wrong-surface fact, not as non-existence (#804)", () => {
+    it("#1353: a DEFERRED/code-mode client is told where to look before concluding absence", async () => {
+      // The reporter's Codex code-mode session declared the live-canvas tools missing,
+      // repeatedly, while the panel MCP endpoint was answering tools/list with 91 tools
+      // and HTTP 200. No transport error anywhere — the failure was this message.
+      //
+      // It said "if it offers nothing under `panel_`, there is no live-canvas route
+      // from here". On code-mode the panel tools are DEFERRED: they sit in the
+      // ALL_TOOLS catalog as `mcp__panel__panel_graph_outline`, so a scan of the direct
+      // declarations for a bare `panel_` prefix finds nothing and the sentence licenses
+      // exactly the wrong conclusion.
+      const client = await compactPair(fakeCatalog());
+      const res = (await client.callTool({
+        name: "call_tool",
+        arguments: { name: "panel_graph_outline" },
+      })) as { isError?: boolean };
+      const text = textOf(res as never);
+
+      // The prefixed name it must actually look for…
+      expect(text).toContain("mcp__panel__panel_graph_outline");
+      // …the catalog it lives in…
+      expect(text).toMatch(/ALL_TOOLS/);
+      expect(text).toMatch(/deferred/i);
+      // …and the absence test now requires BOTH to be empty before concluding.
+      expect(text).toMatch(/Only when BOTH the direct declarations and the deferred catalog/);
+    });
+
     it("names the panel surface, and gives a remedy for BOTH surfaces the caller might hold", async () => {
       const client = await compactPair(fakeCatalog());
       const res = (await client.callTool({

@@ -34,6 +34,10 @@ import {
 } from "./instance-witness.js";
 import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import {
+  desktopSavedLaunchArgs,
+  describeSavedLaunchArgDrift,
+} from "./desktop-launch-args.js";
 import { findComfyuiPython } from "./env-capabilities.js";
 import {
   readLiveProcessEnv,
@@ -524,15 +528,28 @@ function isDesktopSupervisorProcess(identity: ProcessIdentity): boolean {
     const base = norm.split("/").pop() ?? "";
     // Current and legacy Windows branding, including the electron-era install dir.
     if (base === "comfy desktop.exe" || base === "comfyui.exe") return true;
-    // macOS: the bundle's MAIN binary, which by convention is named after the bundle
-    // (`Comfy Desktop.app/Contents/MacOS/Comfy Desktop`). Accepting ANY binary under
-    // `Contents/MacOS/` was too loose: a venv shim or launcher script living inside
-    // the bundle would pass, and a shim re-execs nothing (coordinator gate). The
-    // backreference ties the two halves together so the binary must belong to the
-    // bundle naming it. Electron HELPERS are excluded structurally — they live in
-    // `Contents/Frameworks/<Helper>.app/Contents/MacOS/…`, so the first bundle in the
-    // path is not followed by `Contents/MacOS/`.
-    return /\/(comfy desktop|comfyui)\.app\/contents\/macos\/\1$/.test(norm);
+    // macOS: the bundle's MAIN binary. Accepting ANY binary under `Contents/MacOS/`
+    // would be too loose — a venv shim or launcher script living inside the bundle
+    // would pass, and a shim re-execs nothing (coordinator gate) — so BOTH halves are
+    // pinned to the trusted product names. Electron HELPERS are excluded structurally:
+    // they live in `Contents/Frameworks/<Helper>.app/Contents/MacOS/…`, so the first
+    // bundle in the path is not followed by `Contents/MacOS/`.
+    //
+    // #1341 — the two names are matched INDEPENDENTLY, not tied by a backreference.
+    // The convention that a bundle's binary is named after the bundle does not hold
+    // for current Desktop packaging: ComfyUI Desktop 1.0.38 ships bundle `ComfyUI.app`
+    // with main executable `Comfy Desktop`. The backreference rejected that real
+    // supervisor, the ancestry walk ran to PID 1, and a reporter with a healthy
+    // Desktop parent was told "no Desktop app is still supervising it — its parent
+    // process is gone" and refused a safe restart.
+    //
+    // This does NOT loosen the asymmetry documented above. Both halves are still
+    // drawn from the same two-name set, so nothing new becomes a supervisor; only the
+    // requirement that they be the SAME name is dropped, and that requirement was
+    // about Apple's naming convention rather than about trust.
+    return /\/(?:comfy desktop|comfyui)\.app\/contents\/macos\/(?:comfy desktop|comfyui)$/.test(
+      norm,
+    );
   };
 
   // THE KERNEL'S ANSWER FIRST, and ALONE when it exists (codex gate round 3).
@@ -564,11 +581,16 @@ function isDesktopSupervisorProcess(identity: ProcessIdentity): boolean {
   //
   // The BINARY NAME is required here too, for the same reason as above: a launcher
   // script or venv shim inside the bundle would otherwise be read as the shell
-  // (coordinator gate). `\2` ties it to the bundle that names it, and the match must
-  // end at whitespace or end-of-line so the binary is the whole argv[0] rather than a
-  // prefix of some longer name.
+  // (coordinator gate). The match must end at whitespace or end-of-line so the binary
+  // is the whole argv[0] rather than a prefix of some longer name.
+  //
+  // #1341 — and the two names are independent here as well. This fallback carried the
+  // identical backreference, so fixing only the executable-path matcher above would
+  // have left macOS installs failing on exactly the path macOS actually takes: `ps`
+  // has no authenticated-executable column, so this IS the branch a Desktop-managed
+  // mac reaches.
   const line = (identity.commandLine ?? "").trim().replace(/\\/g, "/").toLowerCase();
-  return /^"?(\/[^\s"]*\/)?(comfy desktop|comfyui)\.app\/contents\/macos\/\2(\s|"|$)/.test(
+  return /^"?(\/[^\s"]*\/)?(?:comfy desktop|comfyui)\.app\/contents\/macos\/(?:comfy desktop|comfyui)(\s|"|$)/.test(
     line,
   );
 }
@@ -1074,6 +1096,14 @@ export function describeArgvDrift(
   before: string[] | undefined,
   after: string[] | undefined,
   isDesktop: boolean,
+  /**
+   * The saved-settings finding (#848), when one could be established. It ANSWERS the
+   * question the conditional remedy below can only ask, so it REPLACES that remedy rather
+   * than following it: printed together, the user reads "if you were expecting different
+   * arguments…" immediately before "your --disable-dynamic-vram is not in force", which
+   * hedges a fact we just established and then repeats the same remedy twice.
+   */
+  savedNote = "",
 ): string {
   if (!before?.length || !after?.length) return "";
   const unchanged =
@@ -1086,7 +1116,7 @@ export function describeArgvDrift(
     return (
       ` Its launch arguments CHANGED between the reading taken before this restart request and the one taken now: before ${before
         .map(quoteToken)
-        .join(" ")} / now ${after.map(quoteToken).join(" ")}.`
+        .join(" ")} / now ${after.map(quoteToken).join(" ")}.` + savedNote
     );
   }
   // WHAT EQUAL ARGV ESTABLISHES (codex gate, twice). Two readings matched. That is
@@ -1101,9 +1131,12 @@ export function describeArgvDrift(
   // What IS supportable is the present state — the arguments in force NOW are the
   // old ones — so the remedy hangs off that, conditioned on the user's own
   // expectation, which only they can check.
+  const observed = ` Its launch arguments are UNCHANGED (${after.map(quoteToken).join(" ")}) — the same arguments were observed before this restart request and again now.`;
+  // A read of the user's actual settings beats a guess about their expectations.
+  if (savedNote) return observed + savedNote;
   return (
-    ` Its launch arguments are UNCHANGED (${after.map(quoteToken).join(" ")}) — the same arguments were observed before this restart request and again now. ` +
-    "If you were expecting different arguments" +
+    observed +
+    " If you were expecting different arguments" +
     (isDesktop
       ? " (after editing ComfyUI Desktop's saved launch settings, say), they are not in effect here: fully quit the ComfyUI Desktop app and relaunch it so it spawns the server from those settings."
       : " (after editing the launch command on the host, say), they are not in effect here: stop ComfyUI and start it again from its own launcher so the new arguments are used.")
@@ -3832,7 +3865,22 @@ async function restartViaManagerRebootDispatch(
   }
   const argvNote =
     targetStable && identityContinuous
-      ? describeArgvDrift(priorArgv, afterArgv, context.isDesktop === true)
+      ? describeArgvDrift(
+          priorArgv,
+          afterArgv,
+          context.isDesktop === true,
+          // #848: where the SAVED settings can be read, the finding REPLACES the
+          // conditional remedy inside that function — "if you were expecting different
+          // arguments" is a question, and this is the answer. Silent whenever the
+          // settings could not be established: a missing file is not evidence of
+          // agreement.
+          context.isDesktop === true
+            ? describeSavedLaunchArgDrift(
+                desktopSavedLaunchArgs(config.comfyuiPath ?? undefined),
+                afterArgv,
+              )
+            : "",
+        )
       : "";
 
   return {

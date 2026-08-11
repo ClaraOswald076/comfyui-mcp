@@ -92,6 +92,95 @@ describe("panel-console-http", () => {
     }
   });
 
+  // ── i18n of the two served pages ───────────────────────────────────────────
+  //
+  // No catalogs are installed in this repo, so every page here renders English no
+  // matter what the browser asks for. That is exactly the case these guard: the
+  // document must not CLAIM a language it did not render. Negotiation and RTL, which
+  // need a catalog to be observable at all, are covered in panel-console-i18n.test.ts.
+  describe("page language, with no catalogs installed", () => {
+    const serve = async () =>
+      startPanelConsoleHttpServer({
+        port: 0,
+        bridgePort: 9180,
+        comfyuiUrl: "http://127.0.0.1:9500",
+        token: "tok-123",
+      });
+
+    // Stamping lang="fa" dir="rtl" onto untranslated English is worse than saying
+    // nothing: it mirrors the whole layout and tells a screen reader to pronounce
+    // English as Persian. Before the pages were translatable, an Arabic-speaking
+    // reader got a correct LTR English page — that must not regress on the way in.
+    it("declares English, not the requested language, while the prose is English", async () => {
+      const srv = await serve();
+      try {
+        for (const lang of ["fa-IR,fa;q=0.9", "ar", "ja-JP", "ru"]) {
+          const html = await (await fetch(srv.url, { headers: { "accept-language": lang } })).text();
+          expect(html).toContain(`<html lang="en">`);
+          expect(html).not.toContain(`dir="rtl"`);
+          expect(html).toContain("Control plane for the panel orchestrator");
+        }
+        const creds = await (
+          await fetch(`${srv.url}/credentials?token=tok-123`, { headers: { "accept-language": "ar" } })
+        ).text();
+        expect(creds).toContain(`<html lang="en">`);
+        expect(creds).not.toContain(`dir="rtl"`);
+      } finally {
+        await srv.stop();
+      }
+    });
+
+    // The 401 is a bare fragment with no <html> to carry the language, so the <p> has to.
+    it("carries the language on the unauthorized fragment itself", async () => {
+      const srv = await serve();
+      try {
+        const res = await fetch(`${srv.url}/credentials?token=wrong`, {
+          headers: { "accept-language": "fa" },
+        });
+        expect(res.status).toBe(401);
+        expect(await res.text()).toBe(`<p lang="en">Unauthorized — reconnect the panel.</p>`);
+      } finally {
+        await srv.stop();
+      }
+    });
+
+    // Translated strings are now serialized INTO the inline scripts. A stray quote
+    // or a `</script>` would break the page silently — the server would still answer
+    // 200 and the page would still contain its prose. Compiling the script body is
+    // the only assertion that sees it. (The hostile-translation case, which is what
+    // makes this bite, lives in panel-console-i18n.test.ts.)
+    it("keeps both inline scripts parseable", async () => {
+      const srv = await serve();
+      try {
+        for (const path of ["/console", "/credentials?token=tok-123"]) {
+          const html = await (await fetch(`${srv.url}${path}`)).text();
+          const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+          expect(scripts.length).toBeGreaterThan(0);
+          // `new Function` COMPILES without running: a syntax error throws here, and
+          // nothing touches document/fetch.
+          for (const body of scripts) expect(() => new Function(body)).not.toThrow();
+        }
+      } finally {
+        await srv.stop();
+      }
+    });
+
+    it("escapes markup from the served ComfyUI URL rather than emitting it", async () => {
+      const srv = await startPanelConsoleHttpServer({
+        port: 0,
+        bridgePort: 9180,
+        comfyuiUrl: "http://127.0.0.1:9500/<script>alert(1)</script>",
+      });
+      try {
+        const html = await (await fetch(srv.url)).text();
+        expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+        expect(html).not.toContain("<script>alert(1)</script>");
+      } finally {
+        await srv.stop();
+      }
+    });
+  });
+
   it("sends CORS headers for the ComfyUI origin (and its localhost twin) only", async () => {
     const srv = await startPanelConsoleHttpServer({
       port: 0,

@@ -353,7 +353,8 @@ export function registerImageManagementTools(server: McpServer): void {
               filename,
               args.type ?? "output",
               args.subfolder ?? "",
-              { allowMedia: true },
+              // #1373 — the input dir legitimately holds workflow .json files.
+              { allowMedia: true, allowJson: true },
             );
 
             // The bytes are already in hand at this point. Saving them is a SEPARATE

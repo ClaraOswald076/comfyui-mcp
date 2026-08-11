@@ -1710,7 +1710,11 @@ describe("panel-tools: post-reconnect retry-once (#278/#310/#332/#481)", () => {
     const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
     expect(res.isError).toBe(true);
     expect((res.content[0] as { text: string }).text).not.toMatch(/conns/i);
-    expect((res.content[0] as { text: string }).text).toMatch(/multiple|last active|pass tab_id/i);
+    // #971 — the ambiguity error is still produced and still does not guess; it is
+    // now worded so it can be acted on (the old text ended "— pass tab_id", which
+    // this tool has no parameter for). What this test is really about is that the
+    // BOUND isHeadless call worked, so keep pinning "not /conns/" above.
+    expect((res.content[0] as { text: string }).text).toMatch(/Several ComfyUI tabs are connected/i);
   });
 
   // #884 confirming gate 3, P0 — the scope-repin double gate. A SCOPE-bound ctx
@@ -2150,7 +2154,10 @@ describe("panel-tools: session tabId self-heal (#322 reload / #331 workflow-swit
 
     const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
     expect(res.isError).toBe(true);
-    expect((res.content[0] as { text: string }).text).toMatch(/Multiple panel tabs/);
+    // #971 — same refusal, actionable wording. The behavioural assertions (isError,
+    // and tabId untouched below) are what "no guess" actually means here.
+    expect((res.content[0] as { text: string }).text).toMatch(/Several ComfyUI tabs are connected/i);
+    expect((res.content[0] as { text: string }).text).not.toMatch(/pass tab_id/i);
     // tabId is NOT silently changed to some arbitrary tab.
     expect(ctx.tabId).toBe("dead-tab");
   });

@@ -4,6 +4,182 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.50.114
+
+### Fixed
+
+- **A failed local download now says what made ComfyUI-Manager necessary (#1374).** A LOCAL
+  Windows-portable install could not download anything: every attempt died on "ComfyUI-
+  Manager's queue API is not reachable", for a capability that needs no Manager at all. The
+  reporter downloaded ~45 GB with `curl` instead.
+
+  That error is raised in generic Manager code which cannot know it is serving a download,
+  so it named the thing that BROKE and not the decision that made Manager necessary — this
+  MCP could not resolve where the connected server keeps its models. Only the second has a
+  remedy you can apply, and nothing distinguished it from "your ComfyUI is remote, this is
+  normal".
+
+  The failure now explains the route, per case, with the `argv[0]` and `cwd` that identify
+  which one you hit. It is appended ONLY when the Manager API call itself failed — a bad
+  source URL or an auth refusal keeps its own error untouched.
+
+  **The routing is deliberately unchanged.** The reporter's decision could not be
+  reproduced here: a live ComfyUI on this machine reports a relative `main.py` and no `cwd`
+  — the shape that looked like the culprit — and still resolves, because the process-table
+  probe anchors it. Guessing at which of six conditions fires for them, and "fixing" that,
+  is how a routing change breaks installs that work today. What ships is the answer being
+  visible in the next report.
+
+## 0.50.113
+
+### Fixed
+
+- **A frontend-only node no longer makes a workflow's runtime "unknown" (#1372).**
+  `list_packs(action:"check_runtime")` counted `MarkdownNote` as an unclassifiable node and
+  refused to say the workflow was free, stopping the paid-API safety flow to ask a question
+  that already had an answer.
+
+  `MarkdownNote`, `Note`, `Reroute` and `PrimitiveNode` are LiteGraph-native: the frontend
+  registers them, `/object_info` never lists them, and they are stripped before a prompt is
+  queued. A node that does not execute cannot be a paid partner node, so it earns none of
+  the doubt the "unknown" verdict exists to express. They are also removed from the
+  classifiable denominator — one API node beside three Notes used to read as "mixed".
+
+  The caution itself is unchanged: a genuinely unrecognised node still collapses the
+  verdict, and a node the server DOES register under one of those names is classified
+  normally rather than skipped — a safety check that a name collision can bypass would be
+  worse than the false "unknown" it replaced.
+
+  The type list is imported from the workflow converter, which has always known which types
+  never reach the backend. The two disagreeing was the bug.
+
+  Not covered: third-party virtual nodes (KJNodes `GetNode`/`SetNode`, rgthree's
+  canvas-only nodes) still report "unknown". They have the same property but a hardcoded
+  list of third-party names goes stale silently — tracked in #1400.
+
+## 0.50.112
+
+### Fixed
+
+- **A remote panel can convert its own live canvas (#1359).** `panel_strip_workflow` read the
+  graph from the connected panel but fetched node definitions over `COMFYUI_URL` — the same
+  machine locally, two different ones whenever the panel is remote. A canvas on a proxy URL
+  could not be stripped at all: the definitions request went to `127.0.0.1:8188`.
+
+  The live canvas now takes its definitions from the ComfyUI the PANEL is connected to,
+  which the panel has been able to serve since 0.13.0. In a tunnel or loopback-only
+  topology the browser is the only thing that can reach that server, so this is not a
+  workaround for the remote case — it is the correct source for every case.
+
+  There is deliberately **no fallback** to `COMFYUI_URL`. Both hosts can answer, and when
+  they disagree a fallback returns a workflow converted against the wrong server's schema —
+  wrong widget order, wrong input names — with no error at all. That is worse than the
+  connection failure this issue was filed about, which at least announced itself. A panel
+  that cannot serve definitions, an empty map, an error body, and a map that describes some
+  other install are each refused with the reason.
+
+  Requires panel 0.13.0+; an older panel is refused by the version gate with the version it
+  needs, rather than an "unknown command" error that reads like a broken ComfyUI.
+
+## 0.50.111
+
+### Fixed
+
+- **`download_model` no longer promises a resumable partial it never looked for (#1370).**
+  Cancelling a download reported "the partial was left on disk and can be resumed by
+  re-issuing" purely from the job's status — nothing stat'd the file. A reporter paused a
+  33 GB download because of that sentence, found no partial anywhere, and restarted from
+  zero.
+
+  Both cancelled branches now report what is actually staged: the partial's SIZE when there
+  is one, so "resumable" is something you can weigh against restarting, or its absence, so
+  you learn it before re-spending the bandwidth rather than after. A cancel that leaves
+  nothing is not an error; telling you it left something is.
+
+  The lookup derives the staged path from the same function the writer uses, so the two
+  cannot drift. Getting there took two corrections — the file is keyed by the download's
+  CACHE identity rather than its destination filename, and it is HIDDEN (a leading dot) —
+  and each wrong version would have reported "no partial found" to someone holding tens of
+  gigabytes of resumable bytes.
+
+## 0.50.110
+
+### Fixed
+
+- **A progress line is no longer handed to you as a failure reason (#417).** When a
+  comfy-cli download died, its stderr often held only progress, so the error you were shown
+  was comfy-cli's own `Start downloading URL: … into …` — a sentence that reads like a
+  diagnosis and names no cause. Output that carries no failure information now says exactly
+  that, and names what to check; the raw output is still kept. A real error is passed
+  through unchanged.
+
+  The progress patterns match the emitter that actually exists: comfy-cli's own downloader
+  is `rich.progress` (which writes nothing to a pipe), so the bars that reach us come from
+  `huggingface_hub` with a `desc` prefix. The diagnosis is also scoped to downloads — a
+  failing `comfy node install` was being handed disk-space and gated-Hugging-Face advice
+  about a transfer it never performed.
+
+- **A reconnect no longer wedges every mutating `panel_*` call (#1331).** After a workflow
+  switch, a save/rename, or an id-scheme change the tab gets a new id, and the trusted
+  workflow stamp was deleted and only restored if that same hello resolved an identity. A
+  reconnect hello that lands before the canvas identity is readable carries none, so the
+  stamp was gone for the rest of the session and every mutation was refused with "this
+  workflow has no trusted identity" while reads kept working.
+
+  The stamp now moves with the rest of the routing state. It cannot widen authorization —
+  the panel authorizes only when the stamp equals the live workflow uuid — while an absent
+  stamp was unrecoverable. This restores `carryWorkflowCommandStamp`, which #436 added for
+  exactly this and the #884 refactor dropped.
+
+### Added
+
+- **`panel_remove_widget` removes ONE dynamic widget row (#938)** — rgthree Power Lora
+  Loader `lora_N`, Impact/Inspire list rows. Their add/remove affordance is a canvas-drawn
+  button an agent cannot click, so those rows were previously un-removable from an agent
+  session. Requires panel 0.13.7.
+
+  The rows are deliberately NOT renumbered (`lora_N` is a monotonic id, not a position), and
+  removal is refused with the specific reason for a backend-declared input, a
+  frontend-generated control widget, a linked widget, or a subgraph container. Node
+  definitions that cannot be READ are reported as unknown rather than treated as "declares
+  nothing".
+
+## 0.50.109
+
+### Added
+
+- **Operator-level restriction of the tool surface (#873).** For a hosted deployment — a
+  shared Open WebUI, a team frontend — where the operator is not the person prompting,
+  three environment variables now withhold tools from the model entirely:
+  `COMFYUI_MCP_TOOL_PRESET` (`safe` | `readonly`), `COMFYUI_MCP_TOOL_DENY`, and
+  `COMFYUI_MCP_TOOL_ALLOW`. A withheld tool is never registered, so it is absent from
+  `tools/list`, absent from `call_tool`, and the model never learns it exists.
+
+  Measured on a built server: 40 tools unrestricted, 16 under `safe`, 10 under `readonly`.
+  Under `readonly`, `call_tool {"name": "restart_comfyui"}` answers `Unknown tool` —
+  absent from dispatch, not merely hidden from the listing, which was the reporter's
+  specific concern about compact mode.
+
+  A misconfiguration **refuses to start** rather than starting unrestricted: an unknown
+  preset, or a variable set but empty (an unexpanded `${VAR}` in a compose file), aborts
+  with the reason on every transport — stdio, `--http`, and `--panel-orchestrator`.
+  Coming up with a full surface while the operator believes it is restricted is worse than
+  having no filter.
+
+  This is a boundary against the model and the people prompting it — not against whoever
+  sets the environment, and not a substitute for keeping an untrusted party off the
+  ComfyUI host. `docs/configuration.mdx` says so.
+
+### Fixed
+
+- `list_packs` is withheld by both presets. Its `action:"install_deps"` installs custom
+  node packs through ComfyUI-Manager — downloading and RUNNING third-party code on the
+  host — behind a name that reads like inspection. Same for `apps` (`action:"import"`
+  installs from the public registry), `get_defaults` (writes config), `list_local_models`
+  (`action:"remove"` deletes a model file) and `queue` (destroys work).
+- `search_custom_nodes` is NOT withheld. It only searches; the installing tool is
+  `install_custom_node`, which is withheld.
+
 ## 0.50.66
 
 ### Fixed
@@ -20,6 +196,205 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.51.1] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- name the Desktop launch arguments that did not take effect (#1414)
+- the smoke mock implements what it advertises (#1412)
+
+
+## [0.50.115] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- warn before a credential save orphans in-flight downloads (#1406)
+- the smoke mock advertises a panel version, and a ratchet keeps it current (#1410)
+- a completed job no longer matches its own re-entry guard (#1407)
+- verify a .json attachment by parsing it, not by its content-type (#1405)
+- prove the configured base before writing a model into it (#1403)
+
+
+## [0.50.114] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- a local download should not need ComfyUI-Manager (#1393)
+
+
+## [0.50.113] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- a frontend-only node is not an unknown runtime (#1396)
+
+
+## [0.50.112] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- the live canvas gets its node definitions from its own ComfyUI (#1390)
+
+
+## [0.50.111] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- stat the partial instead of asserting it (#1392)
+
+
+## [0.50.110] - 2026-08-11
+
+### MCP
+
+#### Added
+- panel_remove_widget — remove one dynamic widget row (#1387)
+
+#### Fixed
+- the workflow stamp survives a tab-id migration (#1389)
+- a progress line is not a failure reason (#1386)
+
+
+## [0.50.109] - 2026-08-11
+
+### MCP
+
+#### Added
+- restrict the tool surface — deny/allow lists and presets (#1383)
+- krea2-identity-edit — local outfit swap, on demand (#1376)
+
+
+## [0.50.108] - 2026-08-10
+
+### MCP
+
+#### Added
+- send operational status to the agent, not to the user (#1375)
+
+
+## [0.50.107] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- gate the instance-witness channel too, not just the process probe (#1367)
+
+
+## [0.50.106] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- say what a timed-out secret card actually means (#1364)
+
+
+## [0.50.105] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- say WHICH host the node definitions came from when a remote strip fails (#1362)
+
+
+## [0.50.104] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- stop telling a code-mode agent its panel tools are absent (#1360)
+
+
+## [0.50.103] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- accept a Desktop bundle whose binary is branded differently (#1358)
+
+
+## [0.50.102] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- clear the fence on the verdict that PROVED identity (#1355)
+
+
+## [0.50.101] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- refresh the node schema and retry the add, once (#1354)
+- consume a control_after_generate slot only when it holds a control mode (#1350)
+
+
+## [0.50.100] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- stop reporting a lost transport as "the user cancelled" (#1348)
+
+
+## [0.50.99] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- name the remedy that restores a trusted identity, not the one that cannot (#1346)
+
+
+## [0.50.98] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- corroborate a fence mismatch before failing 14 calls closed (#1344)
+
+
+## [0.50.97] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- a re-delivered completion must not disown a run we queued (#1342)
+
+
+## [0.50.96] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- refuse an arbitrary-URL download once, before three requests fail (#1338)
+
+
+## [0.50.95] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- ui-bridge.test.ts is load-sensitive — find the real rejection, don't loosen the assertion (#1336)
+- the prescribed recovery from a lost tab binding is a dead end (#1322)
+
+
+## [0.50.94] - 2026-08-10
+
+### MCP
+
+#### Fixed
+- tell the user the install is damaged, instead of printing a resolver path (#1333)
+
+#### Changed
+- delete a header claim about a caller that does not exist (#1324)
+
 
 ## [0.50.93] - 2026-08-10
 

@@ -59,7 +59,9 @@ const text = (res: ToolResult): string =>
 const parse = (res: ToolResult): Record<string, unknown> => JSON.parse(text(res));
 
 function makeCtx(opts: {
-  confirm: "yes" | "no";
+  /** #1332 — "unreachable" is the fourth outcome: the card could not be put to the
+   *  user, or its answer could not be retrieved. It reaches the same decline branch. */
+  confirm: "yes" | "no" | "unreachable";
   /** Whether the bound tab provably fronts our local boot instance (the gate
    *  for both the boot-endpoint probe and the #742 preflight). */
   frontsBoot?: boolean;
@@ -298,6 +300,42 @@ describe("panel_restart_comfyui — decline truthfulness (#742)", () => {
     expect(t3).toMatch(/no restart was dispatched/i);
     expect(t3).not.toMatch(/restart initiated earlier/i);
     expect(t3).not.toMatch(/STOPPED and did not come back/i);
+  });
+
+  it("#1332: an UNREACHABLE card does not claim ComfyUI was not restarted", async () => {
+    // The reporter accepted the restart, ComfyUI restarted (a fresh startup line in
+    // their server log), and this tool answered "Cancelled — ComfyUI was not
+    // restarted." The restart is what dropped the socket its own confirmation had to
+    // travel back on, and that transport failure used to arrive here as a decline.
+    //
+    // The server is HEALTHY throughout, which is the case the probes above cannot
+    // distinguish: "nothing happened" and "it restarted and came back" look identical
+    // from here. With an explicit decline we know which. Without one we do not.
+    __panelToolsTestHooks.setHealthProbe(async () => "healthy");
+    const { ctx, sends } = makeCtx({ confirm: "unreachable" });
+
+    const t = text(await restartTool().handler({}, ctx));
+
+    expect(t).not.toContain("Cancelled — ComfyUI was not restarted.");
+    expect(t).toMatch(/did NOT dispatch a restart/);
+    expect(t).toMatch(/could not be reached to ask/);
+    expect(t).toMatch(/no decision was made either way/);
+    expect(t).toMatch(/fresh startup line/);
+    // Still nothing dispatched — the safe behaviour is untouched.
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
+  });
+
+  it("#1332: an EXPLICIT decline still says Cancelled — the truth is kept", async () => {
+    // The fix must not blur a real decision into hedging: when the user says no,
+    // "ComfyUI was not restarted" is an observation, not a guess.
+    __panelToolsTestHooks.setHealthProbe(async () => "healthy");
+    const { ctx, sends } = makeCtx({ confirm: "no" });
+
+    const t = text(await restartTool().handler({}, ctx));
+
+    expect(t).toContain("Cancelled — ComfyUI was not restarted.");
+    expect(t).not.toMatch(/could not be reached to ask/);
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
   });
 
   it("a decline with the server down-then-HEALTHY inside the window does NOT declare a loss", async () => {
