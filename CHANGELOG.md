@@ -197,6 +197,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.1] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- name the Desktop launch arguments that did not take effect (#1414)
+- the smoke mock implements what it advertises (#1412)
+
+
 ## [0.50.115] - 2026-08-11
 
 ### MCP
