@@ -197,6 +197,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.115] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- warn before a credential save orphans in-flight downloads (#1406)
+- the smoke mock advertises a panel version, and a ratchet keeps it current (#1410)
+- a completed job no longer matches its own re-entry guard (#1407)
+- verify a .json attachment by parsing it, not by its content-type (#1405)
+- prove the configured base before writing a model into it (#1403)
+
+
 ## [0.50.114] - 2026-08-11
 
 ### MCP
