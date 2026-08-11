@@ -3380,10 +3380,13 @@ export async function runPanelOrchestrator(): Promise<void> {
                   );
                   return;
                 }
-                bridge.push(
-                  {
-                    type: "say",
-                    text:
+                // AGENT-ONLY. This is operational status with a lock-recovery procedure
+                // attached — necessary, and addressed to the wrong reader. Printed in the
+                // chat it lands mid-conversation as a wall of text about a subsystem the
+                // user did not ask about. pushAgentNote falls back to a visible `say` on
+                // a panel too old to understand the hidden frame, so nothing is lost.
+                bridge.pushAgentNote(
+                  (
                       `⚠️ Could not automatically sync the ComfyUI-MCP panel; no update was claimed. ` +
                       // #784 — this is pushed to the embedded panel chat, whose
                       // tool set does not include install_comfyui(action:'panel'). Name it only where
@@ -3392,8 +3395,8 @@ export async function runPanelOrchestrator(): Promise<void> {
                         panelRecoveryContext().installPanelUsable
                           ? "Run install_comfyui(action:'panel', panel_action:'status') to inspect it, then retry install_comfyui(action:'panel', panel_action:'sync') if appropriate."
                           : "Inspect and update the panel pack on the ComfyUI host itself — no tool in this session can do it."
-                      } (${detail})`,
-                  },
+                      } (${detail})`
+                  ),
                   panelTab,
                 );
               })
