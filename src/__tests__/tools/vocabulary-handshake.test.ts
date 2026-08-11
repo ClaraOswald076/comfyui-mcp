@@ -15,7 +15,7 @@ import {
   TOOL_NAMES,
 } from "../../tools/vocabulary.js";
 
-const HASH = "0d805152a369dc0bfcc8bd2b96cdcbbe2f139d5b46e71857701e2ea132f5f05e";
+const HASH = "6db51618f0bbe344e7ef3dad330da7971f19299db1a390cfd08672a04dda05fa";
 
 describe("computeVocabularyHash", () => {
   it("is stable for the same names regardless of the array identity", () => {
@@ -81,7 +81,10 @@ describe("describeVocabularySkew", () => {
     expect(r.status).toBe("mismatch");
     const msg = r.status === "mismatch" ? r.message : "";
     // It must name BOTH digests and prescribe updating both...
-    expect(msg).toContain("0d805152");
+    // Derived from HASH rather than written as a literal: a literal is a second place the
+    // digest has to be updated whenever the surface changes, and the one that gets missed
+    // — this test failed on a new panel tool for no reason connected to what it checks.
+    expect(msg).toContain(HASH.slice(0, 8));
     expect(msg).toContain("ffffffff");
     expect(msg).toMatch(/update BOTH/i);
     // ...and must not assert a direction it has no basis for.
