@@ -25,6 +25,13 @@ import fs from "node:fs";
 import net from "node:net";
 import { WebSocket } from "ws";
 
+/** Panel version the mock advertises (#1384). Kept in step with the product's own derived
+ *  fence minimum by src/__tests__/scripts/knowledge-parity-mock-version.test.ts — a raised
+ *  floor fails that test instead of silently refusing every graph write in the smoke. */
+const MOCK_PANEL_VERSION = "0.13.0";
+/** A well-formed workflow uuid, so the per-command stamp fence has something to fence on. */
+const MOCK_WORKFLOW_UUID = "11111111-1111-4111-8111-111111111111";
+
 const PORT = Number(process.env.TEST_PORT || 9151);
 const MCP_ENTRY = fileURLToPath(new URL("../dist/index.js", import.meta.url));
 const COMFY_PATH = fileURLToPath(new URL("..", import.meta.url)); // a real dir w/ packs/ + plugin/
@@ -52,6 +59,24 @@ function makeGraph() {
     graph_add_node: ({ class_type, title }) => { if (!class_type) throw new Error("class_type required"); return { added: brief(add(class_type, title)) }; },
     graph_remove_node: ({ node_id }) => { const n = need(node_id); nodes.delete(Number(node_id)); return { removed: brief(n) }; },
     graph_clear: () => { const c = nodes.size; nodes.clear(); return { cleared: c }; },
+    // #1384 — without this the preferred one-shot panel_load_workflow(pack:…) path cannot
+    // complete, so the smoke could only reach the capability by the long route.
+    graph_load: ({ workflow }) => {
+      const incoming = Array.isArray(workflow?.nodes) ? workflow.nodes : [];
+      nodes.clear();
+      for (const n of incoming) {
+        const id = Number(n.id ?? nodes.size + 1);
+        nodes.set(id, {
+          id,
+          type: n.type ?? "Unknown",
+          title: n.title ?? n.type ?? "Unknown",
+          widgets: {},
+          inputs: [],
+          outputs: [],
+        });
+      }
+      return { loaded: { node_count: nodes.size } };
+    },
     graph_connect: ({ from_node_id, to_node_id }) => ({ connected: { from: { node_id: from_node_id }, to: { node_id: to_node_id } } }),
     graph_disconnect: ({ node_id }) => ({ disconnected: { node_id } }),
     graph_set_widget: ({ node_id, widget, value }) => { const n = need(node_id); const p = n.widgets[widget]; n.widgets[widget] = value; return { set: { node_id, widget, previous: p, value } }; },
@@ -101,7 +126,30 @@ function runScenario(task) {
       resolve({ counts, says, finalNodes: nodes.size });
     }
     ws.on("open", () => {
-      ws.send(JSON.stringify({ type: "hello", tab_id: `codex-kp-smoke`, title: "smoke" }));
+      // #1384 — ADVERTISE A PANEL VERSION AND THE FENCE CAPABILITIES.
+      //
+      // The hello carried only tab_id and title, so the graph-write fence refused
+      // `graph_clear` before the mock executor ever saw it: "this tab advertised NO panel
+      // version". The smoke exercises graph writes, so a mock that cannot pass the write
+      // fence tests nothing it claims to.
+      //
+      // MOCK_PANEL_VERSION is asserted against the product's own derived minimum by
+      // src/__tests__/scripts/knowledge-parity-mock-version.test.ts. A literal here is a
+      // second copy of a number the code already computes — it went stale once (the fence
+      // floor moved to 0.11.35) and would have again, since #1359 raised
+      // requiredPanelVersion() to 0.13.0. The ratchet makes a raised floor fail a test
+      // that names this file, instead of surfacing months later as a fence bug.
+      ws.send(
+        JSON.stringify({
+          type: "hello",
+          tab_id: `codex-kp-smoke`,
+          title: "smoke",
+          panel_version: MOCK_PANEL_VERSION,
+          enforces_workflow_stamp: true,
+          enforces_workflow_stamp_at_write: true,
+          workflow_uuid: MOCK_WORKFLOW_UUID,
+        }),
+      );
       setTimeout(() => { console.log(`   -> TASK: ${task}`); ws.send(JSON.stringify({ type: "user_message", text: task })); }, 1500);
     });
     ws.on("message", (buf) => {
