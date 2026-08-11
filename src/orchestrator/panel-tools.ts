@@ -51,6 +51,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { UiBridge } from "../services/ui-bridge.js";
 import { conversationOfScopeAddress, isScopeAddress, shortTabId } from "../services/session-scope.js";
 import type { ScopeRepinOutcome } from "./turn-origins.js";
+import { NODE_ID_MESSAGE, isNodeIdString, normalizeNodeId } from "./node-id.js";
 
 /** #884 — journal TICKETS (run completions #468, ask answers #486) must be
  *  keyed by the REAL tab a run/card was routed to: the panel reports back under
@@ -7539,17 +7540,23 @@ function validatePanelEditNodeArgs(args: Record<string, unknown>): string | null
  * Nothing about `"42"` is ambiguous. Accept both spellings and normalize to the
  * number the wire has always carried, so the round trip closes.
  *
- * DELIBERATELY STRICT about what counts as a node id: only an integer, or a
- * string that is exactly an integer. `"42px"`, `"4.5"`, `""` and `"5:12"` are
- * still rejected. The last one matters — a subgraph-qualified id is a real
- * shape in newer ComfyUI, and silently truncating it to `5` would target the
- * WRONG node rather than fail. If those need supporting, that is a separate,
- * deliberate change to the wire contract, not something to fall out of a coerce.
+ * STRICT about what counts as a node id: an integer, a string that is exactly an
+ * integer, or a subgraph-qualified id (`"120:104"`). `"42px"`, `"4.5"` and `""`
+ * are still rejected.
+ *
+ * #1425 added the qualified shape — the "separate, deliberate change to the wire
+ * contract" this comment used to defer. Unpacking a subgraph leaves genuine ROOT
+ * nodes carrying those ids, the readers hand them out, and every write tool
+ * refused them. Crucially the qualified form is NOT parsed to a number: see
+ * node-id.ts, where truncating `"263:78"` to `263` would edit the wrong node.
  */
 const nodeId = () =>
-  z.union([z.number().int(), z.string().regex(/^-?\d+$/, "a node id must be an integer")]).transform(
-    (v) => (typeof v === "number" ? v : Number.parseInt(v, 10)),
-  );
+  z
+    .union([
+      z.number().int(),
+      z.string().refine(isNodeIdString, NODE_ID_MESSAGE),
+    ])
+    .transform(normalizeNodeId);
 
 /**
  * #845 — which `panel_canvas` arguments the chosen action actually consumes.
