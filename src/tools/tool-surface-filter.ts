@@ -21,7 +21,28 @@
  * by remembering to cover them.
  */
 
-/** Tools that change the machine, the model library, or the running server. */
+/**
+ * Tools that change the machine, the model library, or the running server.
+ *
+ * A NAME NO LONGER TELLS YOU WHAT A TOOL CAN DO (codex, P1). The 0.50.0 consolidation
+ * folded destructive actions into tools that read as inspection:
+ *
+ *   list_local_models   action:"remove" deletes a model file; add_path/remove_path
+ *                       rewrite extra_model_paths.yaml
+ *   search_custom_nodes action:"install" installs a node pack
+ *   get_defaults        action:"set" writes persistent config
+ *   queue               action:"clear"/"cancel" destroys work — someone else's, in the
+ *                       shared deployment this feature exists for
+ *
+ * My first list was written from the names and missed every one of those. Since the
+ * filter is per-TOOL and cannot see actions, the rule is: deny the whole tool when ANY of
+ * its actions violates the preset. That costs `safe` some genuinely useful reads, and
+ * that is the correct trade — an operator who thinks deletion is impossible and is wrong
+ * is worse off than one who has to allow a tool back explicitly.
+ *
+ * Per-action policy is the real answer and is deliberately not attempted here; it needs a
+ * vocabulary these tools do not yet expose uniformly.
+ */
 const MUTATING_TOOLS = [
   "install_comfyui",
   "install_custom_node",
@@ -42,6 +63,11 @@ const MUTATING_TOOLS = [
   "create_workflow",
   "upload_image",
   "bisect",
+  // …the consolidated ones a name-based list misses:
+  "list_local_models",
+  "search_custom_nodes",
+  "get_defaults",
+  "queue",
 ];
 
 /** …plus everything that queues work or spends money. */
@@ -49,10 +75,43 @@ const EXECUTION_TOOLS = [
   "generate_image",
   "enqueue_workflow",
   "batch",
-  "queue",
   "apps",
   "list_api_nodes",
 ];
+
+/**
+ * Action names that mean a tool can change something. Used ONLY by the completeness test,
+ * which scans the live catalog and fails when a tool advertising one of these is missing
+ * from the `safe` deny list.
+ *
+ * The hand-written list above stays hand-written — it is auditable, and an operator can
+ * read it. What this adds is that it cannot silently ROT: the next consolidation that
+ * hides `action:"delete"` behind an inspection-sounding name fails a test instead of
+ * quietly widening every deployment's surface.
+ */
+export const MUTATING_ACTION_NAMES =
+  /^(remove|delete|clear|cancel|uninstall|install|reset|kill|stop|restart|purge|prune|apply|create|upload|train|add_path|remove_path|set|save|write|switch|update|fix|disable|enable)$/i;
+
+/**
+ * Verbs that mean "queue work / spend", which `safe` deliberately ALLOWS — rendering is
+ * the point of the product — and only `readonly` withholds. Kept separate so the
+ * completeness check does not flag `enqueue_workflow` as a hole in `safe`.
+ */
+export const EXECUTION_ACTION_NAMES = /^(enqueue|start|submit|run)$/i;
+
+/**
+ * Extract the actions a tool declares for ITSELF, from its description.
+ *
+ * Cross-references are excluded, and that is not a detail: `generate_image`'s description
+ * mentions `get_defaults (action:"set")` while explaining where defaults come from. A
+ * naive scan reads that as generate_image having a `set` action and reports a hole that
+ * does not exist. A completeness check that cries wolf gets muted, and then it is not a
+ * check.
+ */
+export function declaredActions(description: string): string[] {
+  const withoutCrossRefs = description.replace(/\b[a-z_0-9]+\s*\(action:"[a-z_0-9]+"\)/gi, "");
+  return [...new Set([...withoutCrossRefs.matchAll(/action:"([a-z_0-9]+)"/g)].map((m) => m[1]))];
+}
 
 /**
  * Named presets, so an operator is not hand-maintaining a list against a surface that
@@ -62,9 +121,29 @@ const EXECUTION_TOOLS = [
  *              Rendering still works; installing, deleting and restarting do not.
  * `readonly` — inspection only. No renders queued, nothing written, nothing spent.
  */
+/**
+ * THE PANEL SURFACE IS DENIED WHOLESALE BY BOTH PRESETS (codex, P0).
+ *
+ * `registerPanelTools` registers 91 `panel_*` tools through a different method
+ * (`registerTool`) on a separate server, so they bypassed the filter entirely: under
+ * `readonly`, `panel_run` still queued renders. That is the "a filter with a hole is
+ * worse than none" case — the operator is told the surface is restricted and it is not.
+ *
+ * Denied as a FAMILY rather than tool-by-tool, deliberately. I classified those 91 by
+ * name first and got several wrong in both directions (`panel_set_property`,
+ * `panel_move_node`, `panel_add_subgraph` and `panel_update_node` all mutate and none
+ * match an obvious write-ish pattern). A hand list over a surface that grows every
+ * release is the rot this feature already tripped over once. `panel_*` is also exactly
+ * what a hosted operator would withhold: it drives a live canvas their users share.
+ *
+ * Opt back in explicitly — `COMFYUI_MCP_TOOL_ALLOW=panel_graph_outline,panel_query_graph`
+ * — which is the direction that fails safe when someone forgets one.
+ */
+const PANEL_SURFACE = ["panel_*"];
+
 export const TOOL_PRESETS: Record<string, string[]> = {
-  safe: MUTATING_TOOLS,
-  readonly: [...MUTATING_TOOLS, ...EXECUTION_TOOLS],
+  safe: [...MUTATING_TOOLS, ...PANEL_SURFACE],
+  readonly: [...MUTATING_TOOLS, ...EXECUTION_TOOLS, ...PANEL_SURFACE],
 };
 
 export interface ToolSurfacePolicy {
@@ -100,11 +179,34 @@ export function toolMatches(name: string, pattern: string): boolean {
   return false;
 }
 
-/** Read the policy from the environment. */
+/**
+ * Read the policy from the environment.
+ *
+ * AN UNKNOWN PRESET THROWS (codex, P0). The first version resolved a typo — `saef` for
+ * `safe` — to no rules at all, which made `active` false, which meant the decorator
+ * returned the registrar unwrapped AND the "surface restricted" log never fired. The
+ * server came up with its complete tool surface and said nothing, while the operator
+ * believed they had locked it down. Worse, I had written a test asserting exactly that
+ * and called it correct, on the reasoning that "the log will tell them" — the log is
+ * gated on the same flag.
+ *
+ * For a control whose whole purpose is a guarantee, silence on a misconfiguration is the
+ * one unacceptable outcome. Refusing to start is loud, immediate, and cannot be mistaken
+ * for success.
+ */
 export function resolveToolSurfacePolicy(env: NodeJS.ProcessEnv = process.env): ToolSurfacePolicy {
   const allow = splitList(env.COMFYUI_MCP_TOOL_ALLOW);
   const denyRaw = splitList(env.COMFYUI_MCP_TOOL_DENY);
   const presetName = (env.COMFYUI_MCP_TOOL_PRESET ?? "").trim();
+  if (presetName && !Object.prototype.hasOwnProperty.call(TOOL_PRESETS, presetName)) {
+    throw new Error(
+      `COMFYUI_MCP_TOOL_PRESET="${presetName}" is not a known preset. ` +
+        `Valid presets: ${Object.keys(TOOL_PRESETS).join(", ")}. ` +
+        `Refusing to start: continuing would expose the FULL tool surface while you believe ` +
+        `it is restricted, which is worse than no filter at all. Fix the value, or drop the ` +
+        `variable and use COMFYUI_MCP_TOOL_DENY / COMFYUI_MCP_TOOL_ALLOW directly.`,
+    );
+  }
   const preset = presetName ? TOOL_PRESETS[presetName] : undefined;
   const deny = [...(preset ?? []), ...denyRaw];
   return {

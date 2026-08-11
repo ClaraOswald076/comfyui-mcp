@@ -20,6 +20,8 @@ import {
   toolAllowed,
   toolMatches,
   TOOL_PRESETS,
+  MUTATING_ACTION_NAMES,
+  declaredActions,
   withToolSurfaceFilter,
 } from "../../tools/tool-surface-filter.js";
 
@@ -51,14 +53,22 @@ describe("the operator's policy is read from the environment (#873)", () => {
     expect(preset.deny).toContain("restart_comfyui");
   });
 
-  it("an UNKNOWN preset name does not silently become 'no policy'", () => {
-    // Failing open on a typo is the dangerous direction: the operator believes the
-    // surface is restricted and it is not. A bare unknown preset yields no deny rules,
-    // so `active` must stay false and the LOG must be the thing that tells them —
-    // rather than a half-applied policy that looks like it worked.
-    const p = resolveToolSurfacePolicy({ COMFYUI_MCP_TOOL_PRESET: "saef" });
-    expect(p.deny).toEqual([]);
-    expect(p.active).toBe(false);
+  it("an UNKNOWN preset REFUSES TO START rather than failing open (codex P0)", () => {
+    // I got this wrong first time and wrote a test asserting the broken behaviour.
+    // `saef` resolved to no rules → `active` false → the decorator returned the
+    // registrar unwrapped AND the "surface restricted" log, gated on the same flag,
+    // never fired. The server came up with its FULL surface, silently, while the
+    // operator believed it was locked down. My justification at the time — "the log
+    // tells them" — was false about my own code.
+    //
+    // For a control whose entire purpose is a guarantee, silence on misconfiguration is
+    // the one unacceptable outcome.
+    expect(() => resolveToolSurfacePolicy({ COMFYUI_MCP_TOOL_PRESET: "saef" })).toThrow(
+      /is not a known preset/,
+    );
+    expect(() => resolveToolSurfacePolicy({ COMFYUI_MCP_TOOL_PRESET: "saef" })).toThrow(
+      /Refusing to start/,
+    );
   });
 });
 
@@ -122,8 +132,12 @@ describe("a denied tool is ABSENT, not refusing (#873)", () => {
     expect(toolAllowed("enqueue_workflow", p)).toBe(false);
     expect(toolAllowed("restart_comfyui", p)).toBe(false);
     // …but inspection still works, or the preset would be useless.
+    //
+    // This used to assert `list_local_models` was allowed — a tool whose action:"remove"
+    // DELETES a model file. The assertion was wrong before the preset was, and it read
+    // as reassurance. Use tools that genuinely only read.
     expect(toolAllowed("get_history", p)).toBe(true);
-    expect(toolAllowed("list_local_models", p)).toBe(true);
+    expect(toolAllowed("get_system_stats", p)).toBe(true);
   });
 
   it("safe keeps rendering while withholding machine changes", () => {
@@ -140,12 +154,79 @@ describe("a denied tool is ABSENT, not refusing (#873)", () => {
     const { collectToolCatalog } = await import("../../tools/index.js");
     const catalog = await collectToolCatalog();
     const live = new Set([...catalog.tools.keys()]);
-    const unknown = [...new Set(Object.values(TOOL_PRESETS).flat())].filter((n) => !live.has(n));
+    // Globs are patterns, not names — `panel_*` deliberately matches a surface that is
+    // registered on a different server and is not in this catalog at all.
+    const unknown = [...new Set(Object.values(TOOL_PRESETS).flat())]
+      .filter((n) => !n.endsWith("*"))
+      .filter((n) => !live.has(n));
     expect(unknown, `preset entries that match no live tool: ${unknown.join(", ")}`).toEqual([]);
   });
 });
 
+describe("the presets cover what a NAME no longer reveals (codex P1)", () => {
+  it("withholds tools whose destructive action hides behind an inspection-sounding name", () => {
+    // The 0.50.0 consolidation folded deletion into `list_local_models` (action:"remove"
+    // deletes a model file), installation into `search_custom_nodes`, config writes into
+    // `get_defaults`, and queue destruction into `queue`. My first preset list was
+    // written from the names and missed every one.
+    const p = resolveToolSurfacePolicy({ COMFYUI_MCP_TOOL_PRESET: "safe" });
+    for (const name of ["list_local_models", "search_custom_nodes", "get_defaults", "queue"]) {
+      expect(toolAllowed(name, p), `${name} can mutate and must be withheld by "safe"`).toBe(false);
+    }
+  });
+
+  it("STAYS complete: every live tool advertising a mutating action is denied by safe", async () => {
+    // The hand list is auditable, which is why it stays hand-written — but it must not
+    // silently ROT. This scans the REAL catalog and fails when a tool advertising a
+    // destructive action is missing, so the next consolidation that hides
+    // action:"delete" behind a read-sounding name breaks a test instead of quietly
+    // widening every deployment's surface.
+    const { collectToolCatalog } = await import("../../tools/index.js");
+    const catalog = await collectToolCatalog();
+    const p = resolveToolSurfacePolicy({ COMFYUI_MCP_TOOL_PRESET: "safe" });
+
+    const leaked: string[] = [];
+    for (const [name, tool] of catalog.tools) {
+      const actions = declaredActions(tool.description ?? "");
+      const mutating = actions.filter((a) => MUTATING_ACTION_NAMES.test(a));
+      if (mutating.length && toolAllowed(name, p)) leaked.push(`${name} (${mutating.join(",")})`);
+    }
+    expect(leaked, `tools with a mutating action that "safe" still allows: ${leaked.join("; ")}`).toEqual([]);
+  });
+
+  it("the PANEL surface is withheld wholesale by both presets (codex P0)", () => {
+    // 91 panel_* tools register through a different method on a separate server and
+    // bypassed the filter entirely — `panel_run` still queued renders under `readonly`.
+    // Denied as a family because classifying 91 by name got several wrong in both
+    // directions, and the list grows every release.
+    for (const preset of ["safe", "readonly"]) {
+      const p = resolveToolSurfacePolicy({ COMFYUI_MCP_TOOL_PRESET: preset });
+      for (const name of ["panel_run", "panel_add_node", "panel_graph_outline", "panel_set_property"]) {
+        expect(toolAllowed(name, p), `${name} under ${preset}`).toBe(false);
+      }
+    }
+  });
+
+  it("…and can be opted back in explicitly", () => {
+    const p = resolveToolSurfacePolicy({ COMFYUI_MCP_TOOL_ALLOW: "panel_graph_outline,panel_query_graph" });
+    expect(toolAllowed("panel_graph_outline", p)).toBe(true);
+    expect(toolAllowed("panel_run", p)).toBe(false);
+  });
+});
+
 describe("WIRING: the filter covers the call_tool route, not just registration (#873)", () => {
+  it("is applied to the PANEL registration path too (codex P0)", async () => {
+    // That path uses `registerTool` on a separate server, so the headless decorator —
+    // which proxies `.tool` — could never have caught it.
+    const { readFile } = await import("node:fs/promises");
+    const src = await readFile(new URL("../../orchestrator/panel-tools.ts", import.meta.url), "utf-8");
+    const at = src.indexOf("export function registerPanelTools");
+    expect(at).toBeGreaterThan(-1);
+    const body = src.slice(at, at + 1400);
+    expect(body).toContain("resolveToolSurfacePolicy()");
+    expect(body).toContain("toolAllowed(d.name, policy)");
+  });
+
   it("is applied inside collectToolCatalog, which call_tool dispatches through", async () => {
     // The bypass this feature exists to close. Asserted on the source because the
     // catalog is built once per process and the policy is read from the environment at

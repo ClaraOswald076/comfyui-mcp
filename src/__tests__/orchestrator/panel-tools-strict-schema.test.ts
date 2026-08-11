@@ -124,7 +124,11 @@ describe("panel-tools #754: strict schemas reject unknown argument keys", () => 
     // registerPanelTools (MCP SDK / Codex HTTP transport).
     const registerIdx = src.indexOf("export function registerPanelTools(");
     expect(registerIdx).toBeGreaterThan(0);
-    const registerBlock = src.slice(registerIdx, registerIdx + 1200);
+    // Widened from 1200: #873 added the tool-surface policy check at the top of this
+    // function, pushing the schema line past the old window. The assertion is about
+    // WHICH schema builder the call site uses, not about how near the top it appears —
+    // a fixed byte window turns any insertion above it into a false failure.
+    const registerBlock = src.slice(registerIdx, registerIdx + 2200);
     expect(registerBlock).toMatch(/inputSchema:\s*strictPanelSchema\(d\.schema\)/);
     expect(registerBlock).not.toMatch(/inputSchema:\s*d\.schema[,\s]/);
 
