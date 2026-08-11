@@ -458,7 +458,36 @@ const BASE_OWN_MODEL_EXTENSIONS = new Set([
   ".bin",
   ".gguf",
   ".onnx",
+  // Formats a first pass missed (codex P1). Omitting one is not neutral: a stale base
+  // holding only `.engine` files reads as EMPTY, the contradiction never fires, and the
+  // download goes into the wrong install — the exact write this gate exists to stop.
+  ".pte",
+  ".engine",
+  ".trt",
+  ".plan",
+  ".npz",
+  ".msgpack",
+  ".pkl",
+  ".model",
 ]);
+
+/**
+ * Does this directory hold a model file, one level down? (#1371)
+ *
+ * Diffusers-style categories keep their weights in per-model folders, so "no model file at
+ * the top level" is not the same as "this base is empty". One level is deliberate: it
+ * covers the real layout without turning a corroboration check into a recursive walk of a
+ * models tree that can hold tens of thousands of files.
+ */
+function directoryHoldsAModel(dir: string): boolean {
+  try {
+    return readdirSync(dir, { withFileTypes: true }).some(
+      (e) => e.isFile() && BASE_OWN_MODEL_EXTENSIONS.has(extname(e.name).toLowerCase()),
+    );
+  } catch {
+    return false;
+  }
+}
 
 async function corroborateBaseByModelInventory(
   base: string,
@@ -702,8 +731,18 @@ async function corroborateBaseByModelInventory(
         // working install.
         let baseHasOwnModelsHere = false;
         try {
-          baseHasOwnModelsHere = readdirSync(categoryDir).some((entry) =>
-            BASE_OWN_MODEL_EXTENSIONS.has(extname(String(entry)).toLowerCase()),
+          // withFileTypes, because a DIRECTORY named `foo.safetensors` is not a model
+          // (codex): counting it would refuse a base on the strength of a folder name.
+          // A nested model directory (diffusers-style) still counts — see below.
+          baseHasOwnModelsHere = readdirSync(categoryDir, { withFileTypes: true }).some(
+            (entry) =>
+              entry.isFile()
+                ? BASE_OWN_MODEL_EXTENSIONS.has(extname(entry.name).toLowerCase())
+                : // A SUBDIRECTORY counts too, but only when it actually holds a model
+                  // file. An empty folder is not evidence the base is populated, which is
+                  // the metadata hole in another costume; a diffusers-style directory of
+                  // shards is exactly the stale base the first version let through.
+                  entry.isDirectory() && directoryHoldsAModel(join(categoryDir, entry.name)),
           );
         } catch {
           // Absent or unreadable — nothing established either way.

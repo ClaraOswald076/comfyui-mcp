@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 
 let remoteMode = false;
 vi.mock("../../config.js", () => ({
@@ -28,8 +28,22 @@ let realpathFor: ((p: string) => string) | undefined;
  *  to hold files of its own — an EMPTY category dir is an extra_model_paths root that
  *  simply has nothing here yet, which is a working setup and must not be refused. */
 let baseCategoryEntries: string[] = [];
+/** Names inside a SUBDIRECTORY of the category, for the diffusers-style layout (#1371). */
+let baseNestedEntries: string[] = [];
+/** Entries the readdir mock reports as directories rather than files. */
+let baseDirEntries = new Set<string>();
+const direntOf = (name: string) => ({
+  name,
+  isFile: () => !baseDirEntries.has(name),
+  isDirectory: () => baseDirEntries.has(name),
+});
 vi.mock("node:fs", () => ({
-  readdirSync: () => baseCategoryEntries,
+  readdirSync: (p: string) => {
+    // Explicit two-level dispatch: the LAST path segment decides. A path ending in a name
+    // we declared to be a directory is the nested read; anything else is the category dir.
+    const last = basename(String(p));
+    return (baseDirEntries.has(last) ? baseNestedEntries : baseCategoryEntries).map(direntOf);
+  },
   realpathSync: (p: string) => (realpathFor ? realpathFor(String(p)) : String(p)),
   existsSync: (p: string) => (existsFor ? existsFor(String(p)) : liveRootExists),
   statSync: (p: string) => {
@@ -162,6 +176,8 @@ beforeEach(() => {
   existsFor = undefined;
   modelsDirStat = "dir";
   baseCategoryEntries = [];
+  baseNestedEntries = [];
+  baseDirEntries = new Set();
   statFor = undefined;
   realpathFor = undefined;
   serverInventory = undefined;
@@ -1233,23 +1249,55 @@ describe("#1371 — a configured base the server demonstrably does not read is r
     expect(modelsDir).toBe(resolve("/second-root", "models"));
   });
 
-  it("a diffusers-style base (models in SUBFOLDERS) is not contradicted — the safe direction", async () => {
-    // A category whose models live in subdirectories reads as metadata-only to this check,
-    // so a stale base of that shape is NOT refused and the download proceeds with the
-    // existing unconfirmed-visibility note. Deliberate: that is the behaviour these users
-    // had before the gate existed. Treating any subdirectory as evidence would re-open the
-    // metadata hole with an empty folder, and a false contradiction costs every download on
-    // a working install while a missed one costs a single misplaced file plus a warning.
-    config.comfyuiPath = "/diffusers-style";
+  it("a diffusers-style base IS contradicted — a nested model counts (codex P1)", async () => {
+    // The first version treated "no model file at the top level" as "not populated", so a
+    // stale base whose weights live in per-model folders sailed through and the download
+    // went into the wrong install. One level down is enough for the real layout and stops
+    // short of walking a models tree that can hold tens of thousands of files.
+    config.comfyuiPath = "/stale-diffusers";
     getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
-    serverInventory = { clip_vision: ["elsewhere.safetensors"] };
+    serverInventory = { clip_vision: ["lives-elsewhere.safetensors"] };
     modelsDirStat = "dir";
     existsFor = (p) => p.endsWith("models");
-    baseCategoryEntries = ["some-model-dir"]; // a folder, no model file at this level
+    baseCategoryEntries = ["some-model-dir"];
+    baseDirEntries = new Set(["some-model-dir"]);
+    baseNestedEntries = ["model.safetensors"];
+
+    await expect(
+      resolveModelsDirWithBases({ targetCategory: "clip_vision" }),
+    ).rejects.toThrow(/Refusing to download into/);
+  });
+
+  it("…but an EMPTY subfolder is still not evidence", async () => {
+    // The metadata hole in another costume: a folder that holds nothing says nothing.
+    config.comfyuiPath = "/empty-subfolder";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { clip_vision: ["lives-elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = ["empty-dir"];
+    baseDirEntries = new Set(["empty-dir"]);
+    baseNestedEntries = [];
 
     const { modelsDir } = await resolveModelsDirWithBases({ targetCategory: "clip_vision" });
-    expect(modelsDir).toBe(resolve("/diffusers-style", "models"));
+    expect(modelsDir).toBe(resolve("/empty-subfolder", "models"));
   });
+
+  it("a DIRECTORY named *.safetensors is not a model (codex)", async () => {
+    // Counting it would refuse a working base on the strength of a folder name.
+    config.comfyuiPath = "/folder-named-like-a-model";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { vae: ["elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = ["looks_like.safetensors"];
+    baseDirEntries = new Set(["looks_like.safetensors"]);
+    baseNestedEntries = [];
+
+    const { modelsDir } = await resolveModelsDirWithBases({ targetCategory: "vae" });
+    expect(modelsDir).toBe(resolve("/folder-named-like-a-model", "models"));
+  });
+
 
   it("does NOT refuse a multi-root base that is simply EMPTY for this category", async () => {
     // THE P0 DIRECTION. An extra_model_paths layout can legitimately have this base as one
