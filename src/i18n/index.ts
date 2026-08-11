@@ -170,8 +170,13 @@ export function trFor(locale: string, key: string, fallback: Fallback, vars?: Va
   }
   out = out ?? "";
 
+  // ONE pass. A loop of `split(...).join(...)` per variable expands placeholders that appear
+  // INSIDE an already-substituted value — a pod named `{id}` would be rewritten by the next
+  // variable's turn, destroying the user's own data. A single pass never revisits its output.
   if (vars) {
-    for (const [k, v] of Object.entries(vars)) out = out.split(`{${k}}`).join(String(v));
+    out = out.replace(/\{(\w+)\}/g, (whole, name) =>
+      Object.prototype.hasOwnProperty.call(vars, name) ? String(vars[name as keyof typeof vars]) : whole,
+    );
   }
   return out;
 }
