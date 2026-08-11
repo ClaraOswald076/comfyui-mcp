@@ -77,6 +77,10 @@ import {
 import { promptText } from "./error-text.js";
 import { callToolAdmission } from "./call-tool-admission.js";
 import {
+  DEFERRED_PANEL_TOOLS_STEERING,
+  withDeferredPanelToolsNote,
+} from "../deferred-panel-tools.js";
+import {
   createPanelMcpServer,
   makePanelToolCtx,
   resolvePinTarget,
@@ -201,9 +205,14 @@ const MCP_VERSION_RUNNING = ((): string | undefined => {
   }
 })();
 
-const PANEL_SYSTEM_APPEND = `You are the autonomous assistant embedded directly in a ComfyUI sidebar panel. The person is working in ComfyUI and talks to you through that panel: their messages arrive as your prompts, and everything you write is shown to them in the panel chat. Write for that reader — lead with the result, keep replies short and concrete, and don't narrate routine internal steps.
+/** Exported for tests (#1398): the RENDERED persona is the only thing that proves
+ *  the deferred-catalog guidance actually reaches an agent — a template literal that
+ *  silently failed to interpolate would type-check, build, and ship the placeholder. */
+export const PANEL_SYSTEM_APPEND = `You are the autonomous assistant embedded directly in a ComfyUI sidebar panel. The person is working in ComfyUI and talks to you through that panel: their messages arrive as your prompts, and everything you write is shown to them in the panel chat. Write for that reader — lead with the result, keep replies short and concrete, and don't narrate routine internal steps.
 
 You can SEE and EDIT the workflow the user currently has open, via the panel_* tools (panel_graph_outline, panel_query_graph, panel_add_node, panel_connect, panel_set_widget, panel_run, panel_get_errors, panel_save_workflow, …). STRONGLY PREFER building on their live canvas: read it first (panel_graph_outline, then panel_query_graph for specifics), add/wire/configure nodes with the panel_* tools, then panel_run to queue it — so the user watches the work happen and the result loads in their own workflow with full Ctrl+Z undo. Only fall back to the headless generate_image/enqueue_workflow tools when the user explicitly wants a one-off they don't need on their canvas, or when no panel tab is connected (a panel_* call will error if so). On a LARGE graph (a loaded pack/template with dozens of nodes), do NOT dump the whole thing and scan it — and NEVER shell out to grep/jq/python over a saved workflow file. To UNDERSTAND the graph, call panel_graph_outline FIRST: a compact, dependency-ordered TEXT map (nodes topologically sorted source→sink, each with its key widgets and ← inputs / → outputs wiring, plus a groups index) made for you to read top-to-bottom. To PINPOINT and INSPECT specific nodes, use panel_query_graph: filter by types/title/widget predicates ('cfg>7'), traverse upstream_of/downstream_of a node, aggregate with group_by:'type', and read ONE node's exact slot/widget detail with {ids:[id], fields:'detail'} — output is token-bounded so it can never flood your context. panel_find_nodes remains for free-text search across all fields.
+
+${DEFERRED_PANEL_TOOLS_STEERING}
 
 PROMPT DIRECTOR AWARENESS. When the graph contains PromptDirector, PromptDirectorAuto, PromptDirectorContext, PromptProducer, or PromptDirectorResultCritic nodes, call panel_audit_prompt_director before declaring that the prompt/model/LoRA setup is correct or diagnosing a failed edit. The audit correlates live wiring and loader widgets with the nodes' resolved Model Explorer metadata, edit plan, LoRA compatibility/strengths, exact final prompt, warnings, and critic verdict. Surface concise, useful observations proactively (including when the configuration is coherent). Its recommendations are READ-ONLY proposals: ask before applying panel_set_widget/panel_connect changes unless the user already explicitly asked you to fix the workflow.
 
@@ -336,6 +345,20 @@ The panel tools cannot come back during this session — the tool set was fixed 
  * lies when the bind fails" is precisely the kind of thing that stays broken when
  * only the happy path is exercised.
  */
+/**
+ * The panel persona as an agent actually receives it (#1398).
+ *
+ * The deferred-catalog guidance is re-applied AFTER `resolvePrompt`, because a
+ * locale translation or a user persona override replaces the WHOLE string and would
+ * otherwise take it with them — reproducing #1398 in exactly the deployments least
+ * equipped to diagnose it (codex review, P1). Exported so that re-application is a
+ * TESTABLE unit: inlining it at the call site made dropping it invisible to every
+ * test, which a mutation run confirmed.
+ */
+export function resolvePanelPersona(): string {
+  return withDeferredPanelToolsNote(resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND));
+}
+
 export function panelToolsRetraction(backend: string, panelToolsAvailable: boolean): string {
   if (panelToolsAvailable) return "";
   // pi has no MCP client at all; PI_CAPABILITY_OVERRIDE already retracts strictly
@@ -1791,7 +1814,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   // mirror-image lie: claiming to be a build we are not running.
   const mcpVersionRunning = MCP_VERSION_RUNNING;
   let latestPanelVersion: string | undefined;
-  let panelSystemAppend = resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND);
+  let panelSystemAppend = resolvePanelPersona();
   // Set once the manager exists so a later refresh (after a ComfyUI restart) feeds
   // the freshly-gathered env into newly-spawned agents too — Claude reads
   // manager.opts.systemAppend at each spawn; Codex reads the closed-over
@@ -1813,7 +1836,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       const caps = await gatherEnvCapabilities({ comfyuiUrl, comfyuiPath, backendId, mcpVersion: mcpVersionRunning, panelVersion: latestPanelVersion });
       if (gen !== envRefreshGen) return; // a newer refresh superseded us — drop this stale result
       envCaps = caps;
-      panelSystemAppend = buildPanelSystemAppend(resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND), envCaps);
+      panelSystemAppend = buildPanelSystemAppend(resolvePanelPersona(), envCaps);
       if (liveManager) liveManager.setSystemAppend(panelSystemAppend);
     } catch (err) {
       if (gen !== envRefreshGen) return; // superseded — let the newer refresh own the prompt
@@ -1824,7 +1847,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       // non-default backend would rebuild a stale env block off the old caps,
       // disagreeing with the reset panelSystemAppend (#358 wiring).
       envCaps = undefined;
-      panelSystemAppend = resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND);
+      panelSystemAppend = resolvePanelPersona();
       logger.debug(
         `[panel-orchestrator] env-capabilities probe failed (using static prompt): ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -1844,7 +1867,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       return panelSystemAppend;
     }
     return buildPanelSystemAppend(
-      resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND),
+      resolvePanelPersona(),
       { ...envCaps, backend, otherBackendAvailable },
     );
   };

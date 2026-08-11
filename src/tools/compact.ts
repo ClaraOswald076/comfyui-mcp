@@ -1,3 +1,4 @@
+import { DEFERRED_PANEL_TOOLS_NOTE } from "../deferred-panel-tools.js";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -403,11 +404,9 @@ function panelNamespaceMessage(catalog: ToolCatalog, name: string): string {
     //
     // So the absence test has to name both the prefix and the deferred catalog before
     // it is allowed to conclude anything.
-    "BEFORE concluding they are absent: a code-mode/deferred-tool client (e.g. the Codex " +
-    "backend) does NOT declare these directly — it lists them in its deferred catalog " +
-    "(`ALL_TOOLS`) under an MCP prefix, so the name to look for is " +
-    "`mcp__panel__panel_graph_outline`, not `panel_graph_outline`. Search that catalog too, " +
-    "and if it is there, call it through the nested tools namespace. Only when BOTH the " +
+    // Shared with the INJECTED steering (#1398): two surfaces phrasing this in their
+    // own words is how one ends up a version behind the other.
+    `BEFORE concluding they are absent: ${DEFERRED_PANEL_TOOLS_NOTE} Only when BOTH the ` +
     "direct declarations and the deferred catalog have nothing matching `panel_` is there " +
     "no live-canvas route from here: read the " +
     "workflow from disk instead (get_workflow, whose list/get/analyze/query actions read saved files), " +
