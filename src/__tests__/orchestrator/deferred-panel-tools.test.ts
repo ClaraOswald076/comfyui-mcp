@@ -177,7 +177,11 @@ describe("#1398 the install line itself", () => {
     // expression is — so `resolvePrompt(PANEL_PERSONA_ID, PANEL_SYSTEM_APPEND)` is
     // caught too. (Comments and registerPrompt legitimately name the constant, so
     // counting bare mentions would be brittle in the way codex warned about.)
-    const resolvers = src.match(/resolvePrompt\([^)]*PANEL_SYSTEM_APPEND/g) ?? [];
+    // `[^)]*` could not cross a nested `)` (codex round 3), so an equivalent
+    // refactor like `resolvePrompt(promptIdFor("panel.persona"), PANEL_SYSTEM_APPEND)`
+    // matched nothing and failed this guard for no reason. Bounded-span instead: it
+    // spans a nested call while still not running away across the file.
+    const resolvers = src.match(/resolvePrompt\([\s\S]{0,200}?PANEL_SYSTEM_APPEND/g) ?? [];
     expect(resolvers).toHaveLength(1); // only resolvePanelPersona resolves the persona
   });
 });
