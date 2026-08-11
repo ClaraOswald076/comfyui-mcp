@@ -12,10 +12,15 @@
 // Nothing there mentions that the workflow itself came from a ComfyUI on a different
 // host. They had to read dist/orchestrator/panel-tools.js to work it out.
 //
-// THIS DOES NOT FIX THE SPLIT AUTHORITY. Stripping the live canvas correctly needs the
-// definitions to come from the panel's own ComfyUI, which is a panel protocol change
-// and is tracked separately. What it fixes is that the failure was undiagnosable —
-// the same class of defect as #1300 (a status where a reason belonged).
+// THE SPLIT IS NOW FIXED, so most of this file changed meaning. The live canvas takes its
+// definitions from the panel that supplied the graph (`graph_get_object_info`, panel
+// 0.13.0 / #1006), so the message these tests were written for — "THE GRAPH AND ITS NODE
+// DEFINITIONS CAME FROM DIFFERENT PLACES", with a WORKAROUND to repoint COMFYUI_URL — is
+// unreachable and has been deleted rather than left as a confident explanation of a
+// situation the code can no longer produce.
+//
+// What remains here is the pack/path/inline case, where COMFYUI_URL genuinely IS the right
+// authority, plus a test that the live canvas no longer touches it at all.
 
 import { describe, expect, it, vi } from "vitest";
 
@@ -41,6 +46,19 @@ import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 const TAB = "wf:workflows/a.json";
 const REMOTE = "https://abc123-8188.proxy.runpod.net:443";
 
+/** What the panel answers `graph_get_object_info` with, per test. */
+let objectInfoReply: unknown = { ok: true, served_by: REMOTE, object_info: {} };
+
+async function stripWithPanelObjectInfo(reply: unknown): Promise<string> {
+  const prev = objectInfoReply;
+  objectInfoReply = reply;
+  try {
+    return await strip({});
+  } finally {
+    objectInfoReply = prev;
+  }
+}
+
 /** A panel that serves the live graph and reports a REMOTE ComfyUI origin. */
 function bridge(serverOrigin: string | null) {
   return {
@@ -48,6 +66,7 @@ function bridge(serverOrigin: string | null) {
       if (cmd.cmd === "graph_serialize" || cmd.cmd === "graph_get_state") {
         return { workflow: { nodes: [], links: [] }, nodes: [], links: [] };
       }
+      if (cmd.cmd === "graph_get_object_info") return objectInfoReply;
       return { ok: true, workflow: { nodes: [], links: [] } };
     },
     push: () => 1,
@@ -70,38 +89,33 @@ async function strip(args: object, serverOrigin: string | null = REMOTE): Promis
 }
 
 describe("an /object_info failure names which host it asked (#1359)", () => {
-  it("LIVE CANVAS: says the graph and the definitions came from different places", async () => {
+  it("LIVE CANVAS: never asks COMFYUI_URL at all, so its failure cannot reach the user", async () => {
+    // The mocked global client throws ECONNREFUSED for every call. If the live-canvas path
+    // still consulted it, that string would appear here — which is exactly what the
+    // reporter saw. It must not, because the definitions now come from the panel.
     const text = await strip({});
-
-    // The raw cause is preserved — it is still the evidence.
-    expect(text).toMatch(/ECONNREFUSED 127\.0\.0\.1:8188/);
-    // …and now it says what the reporter had to read dist/ to learn.
-    expect(text).toMatch(/DIFFERENT PLACES/);
-    expect(text).toContain(REMOTE); // where the graph came from
-    expect(text).toMatch(/node definitions are fetched over COMFYUI_URL/i);
-    // The workaround that works today, and honesty that this is a known split.
-    expect(text).toMatch(/WORKAROUND: point COMFYUI_URL at the same ComfyUI/);
-    expect(text).toMatch(/#1359/);
+    expect(text).not.toMatch(/ECONNREFUSED 127\.0\.0\.1:8188/);
+    // …and the superseded explanation must be gone, not merely unused.
+    expect(text).not.toMatch(/DIFFERENT PLACES/);
+    expect(text).not.toMatch(/WORKAROUND: point COMFYUI_URL/);
   });
 
-  it("names the two hosts as DIFFERENT only when they are", async () => {
-    // The over-claiming direction. If the panel is on the same host, "two different
-    // hosts, which is why this could not work" would be a false explanation for a
-    // failure with some other cause — a plain unreachable ComfyUI, say.
-    const text = await strip({}, "http://127.0.0.1:8188");
-
-    expect(text).toMatch(/DIFFERENT PLACES/); // the authorities are still split…
-    expect(text).not.toMatch(/two different hosts/); // …but they resolve to one machine
+  it("LIVE CANVAS: a panel that cannot serve definitions is REFUSED, never retried on COMFYUI_URL", async () => {
+    // The direction that matters. A fallback would convert this canvas against a different
+    // ComfyUI's schema and return a confidently wrong workflow.
+    const text = await stripWithPanelObjectInfo({ ok: false, served_by: REMOTE, detail: "no /object_info here." });
+    expect(text).toMatch(/could not obtain node definitions/i);
+    expect(text).toContain(REMOTE);
+    expect(text).toMatch(/refused rather than retried against COMFYUI_URL/i);
+    expect(text).not.toMatch(/ECONNREFUSED/);
   });
 
-  it("an unreadable panel origin costs a detail, not a wrong claim", async () => {
-    const text = await strip({}, null);
-
-    expect(text).toMatch(/ECONNREFUSED/);
-    expect(text).not.toMatch(/two different hosts/);
-    // Still names the workaround it can support.
-    expect(text).toMatch(/WORKAROUND/);
+  it("LIVE CANVAS: a payload-free success is refused, not read as an empty schema", async () => {
+    const text = await stripWithPanelObjectInfo({ ok: true, served_by: REMOTE });
+    expect(text).toMatch(/replied without node definitions/i);
+    expect(text).not.toMatch(/ECONNREFUSED/);
   });
+
 
   it("a PACK/PATH/INLINE source is not told about the panel at all", async () => {
     // Those sources are deliberately tied to COMFYUI_URL, so the bare failure is
