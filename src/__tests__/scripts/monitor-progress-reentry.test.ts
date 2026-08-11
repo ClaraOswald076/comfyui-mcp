@@ -52,38 +52,87 @@ describe("monitor-progress re-entry guard (#1385)", () => {
     }
   });
 
-  it("the TIMEOUT decides on the flag, and only reports when something is unfinished", () => {
-    // Two faults lived here. The filter used the stale vocabulary, and the ENTRY condition
-    // used `doneCount < jobs.size` — which lags, because `doneCount++` lands only after the
-    // awaited history fetch. A job finishing just before the timeout is correctly absent
-    // from the list while doneCount has not caught up, so the script printed
-    // "[TIMEOUT] 0 job(s) still incomplete" and exited 1: a clean run reported as failure,
-    // with an empty list as its own evidence.
-    //
-    // Asserted on BEHAVIOUR rather than source text (codex P3): the previous version
-    // matched an exact `.filter(([, j]) => !j.finished)` string, which a rename of `j` or a
-    // reformat would break while preserving semantics.
-    const decide = (jobsList: { finished: boolean }[]): { exits: boolean; count: number } => {
-      const remaining = jobsList.filter((j) => !j.finished);
-      return { exits: remaining.length > 0, count: remaining.length };
-    };
-    // The regression: finished, but doneCount has not caught up.
-    expect(decide([{ finished: true }, { finished: true }])).toEqual({ exits: false, count: 0 });
-    // A genuine timeout still fails, which is the point of the timeout.
-    expect(decide([{ finished: true }, { finished: false }])).toEqual({ exits: true, count: 1 });
+  it("the TIMEOUT decides on the flag, and only reports when something is unfinished", async () => {
+    // Calls the REAL decision. The previous version reimplemented it inline and asserted
+    // against its own copy — a test of the test, which a production regression that
+    // inverted the condition would have left green (codex P3). That is why the decision
+    // now lives in its own module: monitor-progress.mjs connects to ComfyUI at import, so
+    // nothing importable could reach it before.
+    const { timeoutVerdict } = await import("../../../plugin/scripts/monitor-timeout.mjs");
+    const jobs = (...list: { finished: boolean; status?: string }[]) =>
+      new Map(list.map((j, i) => [`p${i}`, { startTime: 0, status: "running", ...j }]));
+
+    // The regression this fixes: every job finished, but `doneCount++` lands only after an
+    // awaited history fetch, so the counter lags. The old gate exited 1 and printed
+    // "0 job(s) still incomplete" — a clean run reported as a failure, with an empty list
+    // as its own evidence.
+    expect(
+      timeoutVerdict(jobs({ finished: true }, { finished: true }), { postProcessingDone: true }).kind,
+    ).toBe("clean");
+
+    // A genuine timeout still fails, which is the point of having one.
+    const late = timeoutVerdict(jobs({ finished: true }, { finished: false }), {
+      postProcessingDone: false,
+    });
+    expect(late.kind).toBe("incomplete");
+    expect(late.remaining).toHaveLength(1);
+
+    // …and the third state, which the two-way version could not express: everything
+    // reported terminal, but the run has not exited, so post-processing is wedged. Exiting
+    // 1 here would be wrong-cause; returning would hang forever.
+    expect(
+      timeoutVerdict(jobs({ finished: true }), { postProcessingDone: false }).kind,
+    ).toBe("stalled");
+  });
+
+  it("a cancelled run is not reported as a success", async () => {
+    // Pre-existing, found by codex while reviewing the timeout. ComfyUI marks an
+    // interrupted prompt `completed` and emits `execution_interrupted`; both places that
+    // classified history messages tested only for `execution_error`, so a job the user
+    // cancelled was counted and printed as a success.
+    const { classifyHistoryMessages } = await import("../../../plugin/scripts/monitor-timeout.mjs");
+    expect(classifyHistoryMessages([["execution_start"], ["execution_success"]])).toBe("success");
+    expect(classifyHistoryMessages([["execution_error"]])).toBe("error");
+    expect(classifyHistoryMessages([["execution_interrupted"]])).toBe("cancelled");
+    // An error alongside an interrupt is still an error — the more specific failure wins.
+    expect(classifyHistoryMessages([["execution_interrupted"], ["execution_error"]])).toBe("error");
+    expect(classifyHistoryMessages(undefined)).toBe("success");
+  });
+
+  it("both classification sites use the shared rule", () => {
+    // There were two copies, indented differently, and fixing the one I happened to read
+    // would have left a cancelled job reported as a success on the other path.
+    const s = code();
+    expect(s).not.toMatch(/hasError/);
+    expect((s.match(/classifyHistoryMessages\(messages\)/g) ?? []).length).toBe(2);
   });
 
   it("the timeout no longer gates entry on the lagging counter", () => {
-    // The one source fact worth pinning: `doneCount` must not be the entry condition,
-    // because it is updated after an await while `finished` is not.
+    // The one source fact worth pinning: `doneCount` must not decide whether jobs are
+    // outstanding, because it is updated after an await while `finished` is not.
+    //
     // Scoped to the TIMEOUT block alone. Slicing to end-of-file swept in a later,
     // legitimate `doneCount` gate — an assertion that reads the whole rest of the script
     // is not about the thing it names.
     const s = code();
     const start = s.indexOf("setTimeout(() => {");
-    const block = s.slice(start, s.indexOf("}, TIMEOUT_MS);", start));
+    const end = s.indexOf("}, TIMEOUT_MS);", start);
     expect(start, "the timeout block must still exist").toBeGreaterThan(-1);
-    expect(block).not.toMatch(/doneCount/);
+    // Asserted, because a missing end marker would silently widen the slice to the rest of
+    // the file and the assertion below could then pass on unrelated code (codex).
+    expect(end, "the timeout block must still close with }, TIMEOUT_MS);").toBeGreaterThan(start);
+    const block = s.slice(start, end);
+    // `postProcessingDone: doneCount >= jobs.size` is allowed — that is the counter
+    // reporting on POST-PROCESSING, not on whether jobs are outstanding.
+    expect(block).not.toMatch(/doneCount < jobs\.size/);
+
+    // AND THE VERDICT MUST BE ACTED ON. The behavioural test above proves the decision is
+    // right; nothing there reaches the line that obeys it, and mutation testing found that
+    // gap — turning the exit into a `return` left every test green while a genuine timeout
+    // silently hung. Reaching this any other way means spawning the script and waiting out
+    // its ten-minute timer, so this is a source assertion on purpose, scoped to the block.
+    expect(block).toMatch(/kind === "incomplete"\) process\.exit\(1\)/);
+    expect(block).toMatch(/kind === "clean"\) return/);
   });
 
   it("the flag is set BEFORE the first await in markDone", () => {

@@ -13,6 +13,8 @@
  *      COMFYUI_SSL (default false — set "true" to use https:// + wss://)
  */
 
+import { timeoutVerdict, describeTimeout, classifyHistoryMessages } from "./monitor-timeout.mjs";
+
 const HOST = process.env.COMFYUI_HOST || process.env.COMFY_HOST || "127.0.0.1";
 const PORT = Number(process.env.COMFYUI_PORT || process.env.COMFY_PORT) || 8000;
 const SSL = process.env.COMFYUI_SSL === "true";
@@ -57,6 +59,11 @@ for (const id of promptIds) {
 }
 
 const short = (id) => id.slice(0, 8);
+/** How long the timeout waits for post-processing once every job has reported. Short: the
+ *  case it exists for is a fetch that already has its headers and needs a moment, not a
+ *  second monitoring window. */
+const POST_PROCESSING_GRACE_MS = 15_000;
+
 let doneCount = 0;
 let successCount = 0;
 let errorCount = 0;
@@ -222,8 +229,13 @@ async function checkAlreadyDone() {
       const entry = history[promptId];
       if (entry?.status?.completed) {
         const messages = entry.status.messages || [];
-        const hasError = messages.some((m) => m[0] === "execution_error");
-        await markDone(promptId, hasError ? "error" : "success");
+        // A CANCELLED RUN IS NOT A SUCCESSFUL ONE (codex, pre-existing). ComfyUI marks
+        // an interrupted prompt `completed` and reports `execution_interrupted`;
+        // testing only for `execution_error` counted it as a success and printed it
+        // as one. This repo's own history reader already treats that message as a
+        // non-success terminal state (src/services/job-history.ts) — this script was
+        // the odd one out, in two places with two copies of the same test.
+        await markDone(promptId, classifyHistoryMessages(messages));
       }
     } catch {
       // Not in history yet — still pending/running
@@ -388,8 +400,13 @@ function startPolling() {
         const entry = history[promptId];
         if (entry?.status?.completed) {
           const messages = entry.status.messages || [];
-          const hasError = messages.some((m) => m[0] === "execution_error");
-          await markDone(promptId, hasError ? "error" : "success");
+          // A CANCELLED RUN IS NOT A SUCCESSFUL ONE (codex, pre-existing). ComfyUI marks
+          // an interrupted prompt `completed` and reports `execution_interrupted`;
+          // testing only for `execution_error` counted it as a success and printed it
+          // as one. This repo's own history reader already treats that message as a
+          // non-success terminal state (src/services/job-history.ts) — this script was
+          // the odd one out, in two places with two copies of the same test.
+          await markDone(promptId, classifyHistoryMessages(messages));
         }
       } catch {
         consecutiveFailures++;
@@ -421,32 +438,32 @@ function startStallChecker() {
 // ── Timeout ─────────────────────────────────────────────────────────────
 
 setTimeout(() => {
-  // GATE ON THE SAME FACT THE LIST REPORTS (#1385, codex round 2). This used to enter on
-  // `doneCount < jobs.size`, and `doneCount++` lands only AFTER the awaited history fetch —
-  // so a job that finished a moment before the timeout has `finished` true and is correctly
-  // absent from `remaining`, while `doneCount` has not caught up. The result was
-  // "[TIMEOUT] 0 job(s) still incomplete" followed by exit 1: a clean run reported as a
-  // failure, with an empty list as the evidence.
-  //
-  // One fact, read once. If nothing is unfinished there is nothing to time out.
-  const remaining = [...jobs.entries()]
-      // The SAME stale vocabulary, in its inequality form (#1385, codex). A successful job
-      // carries status "success", so `!== "done" && !== "error"` calls it incomplete — and
-      // the window is real: `finished` is set before the history fetch but `doneCount++`
-      // comes after it, so a timeout landing in between reports a job that succeeded as
-      // still running, and exits 1. My first pass fixed only the equality comparisons.
-    .filter(([, j]) => !j.finished)
-    .map(([id, j]) => {
-      const elapsed = ((Date.now() - j.startTime) / 1000).toFixed(0);
-      // `j.status` here is DISPLAY only — the decision above is the flag.
-      return `${short(id)} (${j.status}, ${elapsed}s)`;
-    });
-  if (remaining.length > 0) {
+  // The decision lives in monitor-timeout.mjs so the tests can call the real one — see the
+  // comment there for why all three outcomes exist and which two used to be conflated.
+  const verdict = timeoutVerdict(jobs, { postProcessingDone: doneCount >= jobs.size });
+  const line = describeTimeout(verdict, {
+    jobCount: jobs.size,
+    graceSeconds: POST_PROCESSING_GRACE_MS / 1000,
+  });
+  if (line) console.log(line);
+  if (verdict.kind === "incomplete") process.exit(1);
+  if (verdict.kind === "clean") return; // the normal exit path is a moment away
+
+  // STALLED. Every job reported a terminal state, so the run is not waiting on ComfyUI; it
+  // is waiting on its own post-processing, and nothing bounds that — `fetchJSON` clears its
+  // abort timer once response HEADERS arrive, so a body that never finishes streaming keeps
+  // an open socket and the process alive forever (codex P1). Returning here is the hang the
+  // old unconditional exit(1) was accidentally preventing. A short grace first, because a
+  // job finishing a moment before the timeout is exactly the near-miss this whole fix is
+  // about, and it resolves in well under a second.
+  setTimeout(() => {
+    if (doneCount >= jobs.size) return; // it landed during the grace; let the normal exit run
     console.log(
-      `[TIMEOUT] ${remaining.length} job(s) still incomplete after 10 minutes: ${remaining.join(", ")}`,
+      `[TIMEOUT] giving up: ${jobs.size} job(s) finished but their history/outputs never ` +
+        `finished being read. The jobs themselves completed — check ComfyUI directly for results.`,
     );
     process.exit(1);
-  }
+  }, POST_PROCESSING_GRACE_MS);
 }, TIMEOUT_MS);
 
 // ── Main ────────────────────────────────────────────────────────────────
