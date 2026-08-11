@@ -165,6 +165,38 @@ describe("a timed-out secret card is described honestly (#1352)", () => {
     expect(text).toMatch(/No token entered/);
   });
 
+  it("stops polling early enough to still SAVE what it accepts (codex P1)", async () => {
+    // The card wait plus the grace fill the whole ask budget, and the enclosing tools/call
+    // is killed shortly after it — so a token accepted at the very END of the grace had
+    // only the leftover framework margin in which to be written and read back. A slow
+    // store would then lose a credential the user DID supply in time.
+    //
+    // The rule this encodes: an answer arriving too late to be persisted SAFELY is not
+    // accepted at all. Better to tell someone their token did not land than to take it and
+    // lose it — they believe they supplied it either way.
+    //
+    // Driven at millisecond scale, where the 10s reserve consumes the whole grace, so the
+    // poll gets a single attempt. An answer that only shows up after that is therefore NOT
+    // taken — and with the reserve removed it would be, which is what makes this a test of
+    // the reserve rather than of the recovery.
+    let calls = 0;
+    const slowBuffer = {
+      get value() {
+        // Absent for the first few polls, then present — a user still typing.
+        return ++calls > 3 ? "sk-late" : undefined;
+      },
+      set value(_v: unknown) {
+        /* claimed-once semantics are irrelevant here */
+      },
+    };
+    __panelAskTestHooks.setAskTiming({ deadlineMs: 5, graceMs: 200, pollMs: 2 });
+    const text = await requestSecret(REPLY_TIMEOUT(), slowBuffer as { value: unknown });
+
+    // Not recovered: the reserve ended the poll before that answer appeared.
+    expect(text).toMatch(/no path back to this call/);
+    expect(text).not.toMatch(/arrived AFTER the/);
+  });
+
   it("keeps the masked-input rule — never route a secret through the conversation", async () => {
     // #952's finding: suggesting the conversational route defeats the entire purpose of
     // this tool. A recovery path is exactly where that would slip back in.

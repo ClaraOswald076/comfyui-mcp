@@ -6874,6 +6874,18 @@ let askTimingOverride: AskTiming | null = null;
 const ASK_TOTAL_BUDGET_CAP_MS = 285_000;
 
 /**
+ * Headroom kept back from a SECRET card's grace so a recovered token can still be written,
+ * read back and reported before the enclosing tools/call is killed (#1352, codex P1).
+ *
+ * The write is a small local file plus a read-back — milliseconds when nothing is in the
+ * way. This is sized for when something IS: a locked store, antivirus inspecting the
+ * write, a slow rewrite. Accepting a credential and then losing it to the framework
+ * deadline is worse than declining it a few seconds earlier, because the user believes
+ * they supplied it.
+ */
+const SECRET_PERSIST_RESERVE_MS = 10_000;
+
+/**
  * The per-request timeout an INTERNAL MCP client must use when calling panel_*
  * tools (#325). Several panel tools are DESIGNED to block on a human well past
  * the MCP SDK's 60s default request timeout: panel_ask / the confirm / consent
@@ -9371,8 +9383,20 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // So it gets the STRUCTURE the ask path has: a deadline clamped under the budget,
         // then a bounded grace poll of the late-answer buffer. Someone who finishes typing
         // a second after the deadline now has their token APPLIED rather than discarded.
+        // RESERVE TIME TO ACTUALLY SAVE IT (codex P1). The card wait plus the grace fill
+        // the whole 285s ask budget, and the enclosing tools/call is killed at ~300s — so
+        // a token recovered at the very end of the grace had only the leftover framework
+        // margin in which to be written, read back, and reported. A slow store (a locked
+        // file, antivirus on the write, a config rewrite) could then lose a credential the
+        // user DID supply in time: precisely the loss this whole change exists to prevent,
+        // moved one step later.
+        //
+        // So the grace stops early enough that anything accepted has room to persist. The
+        // cost is a slightly shorter window to type in; the alternative is accepting a
+        // token and then dropping it, which is worse than never having taken it.
         const timing = getAskTiming();
         const budgetEnd = Date.now() + timing.deadlineMs + timing.graceMs;
+        const pollUntil = budgetEnd - SECRET_PERSIST_RESERVE_MS;
         // The ask_id is what makes a late answer recoverable at all (#486) — the bridge
         // only buffers a reply whose command carried one, and this card never sent one.
         //
@@ -9409,7 +9433,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // ONLY a reply timeout is recoverable. Any other failure — no panel, transport
             // down — is not "they are still typing" and must not be waited out.
             if (!isReplyTimeoutError(err)) throw err;
-            const late = await pollLateAskReply(ctx.bridge, askId, timing, budgetEnd);
+            const late = await pollLateAskReply(ctx.bridge, askId, timing, pollUntil);
             if (late === undefined) throw err;
             secret = late;
             arrivedLate = true;
