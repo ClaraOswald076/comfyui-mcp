@@ -22,7 +22,7 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 
-import { workflowIdentityParts } from "../../orchestrator/session-store.js";
+import { carryWorkflowCommandStamp, workflowIdentityParts } from "../../orchestrator/session-store.js";
 
 /** Source with comments stripped.
  *
@@ -48,36 +48,23 @@ function migrationBlock(src: string): string {
 }
 
 describe("a tab-id migration CARRIES the workflow stamp (#1331)", () => {
-  it("SOURCE: the stamp is read from the old id before the old id is retired", () => {
+  it("WIRING: the hello handler CALLS the carry, it does not reimplement it", () => {
+    // The previous version of this file asserted the shape of inlined statements —
+    // `get(migratedFrom)`, `set(panelTab, carriedStamp)`, `delete(migratedFrom)` in that
+    // order. Codex's objection was right: a DEAD `set` before the delete satisfies every
+    // one of those string checks, and the behavioural half was a re-implementation of what
+    // the handler ought to do rather than the thing it does. Two independent copies of a
+    // rule agreeing with each other proves nothing about the third copy in production.
+    //
+    // So the logic is extracted (restoring the name #436 gave it) and the handler calls it.
+    // The tests below then exercise the FUNCTION PRODUCTION RUNS, and this one only has to
+    // check that the call site exists inside the migration branch.
     const block = migrationBlock(orchestratorCode());
-    expect(
-      block,
-      "the migration must carry the stamp onto the new id — deleting it without carrying is the #1331 wedge",
-    ).toMatch(/tabCommandWorkflowUuid\.get\(migratedFrom\)/);
-    expect(block).toMatch(/tabCommandWorkflowUuid\.set\(panelTab,\s*carriedStamp\)/);
-  });
-
-  it("SOURCE: the old id's stamp is still retired — the carry is a MOVE, not a copy", () => {
-    // The old id going away is a separate, correct decision that predates this fix and
-    // must survive it: a straggler command addressed to the retired id must not resolve.
-    expect(migrationBlock(orchestratorCode())).toContain(
-      "tabCommandWorkflowUuid.delete(migratedFrom);",
+    expect(block).toMatch(
+      /carryWorkflowCommandStamp\(tabCommandWorkflowUuid,\s*migratedFrom,\s*panelTab\)/,
     );
-  });
-
-  it("SOURCE: the carry runs BEFORE the delete, or it carries nothing", () => {
-    const block = migrationBlock(orchestratorCode());
-    const read = block.indexOf("tabCommandWorkflowUuid.get(migratedFrom)");
-    const del = block.indexOf("tabCommandWorkflowUuid.delete(migratedFrom)");
-    expect(read).toBeGreaterThan(-1);
-    expect(del).toBeGreaterThan(-1);
-    expect(read, "reading after the delete would always yield undefined").toBeLessThan(del);
-  });
-
-  it("SOURCE: a stamp already set for the new id is NOT clobbered by the carried one", () => {
-    // Ordering inside one hello is not guaranteed to be the only writer; a value already
-    // recorded for the new id is newer evidence than anything held under the old.
-    expect(migrationBlock(orchestratorCode())).toMatch(/!tabCommandWorkflowUuid\.has\(panelTab\)/);
+    // …and nothing hand-rolls the same operations alongside it.
+    expect(block).not.toMatch(/tabCommandWorkflowUuid\.delete\(migratedFrom\)/);
   });
 
   it("SOURCE: a hello that DOES resolve an identity still overwrites the carried stamp", () => {
@@ -112,15 +99,15 @@ describe("the carry's semantics, exercised (#1331)", () => {
   // The hello handler is a few hundred lines inside a much larger closure, so the
   // assertions above read its source. This exercises the SEMANTICS the source implements,
   // so a future refactor that keeps the identifiers but inverts the meaning still fails.
+  // The REAL function the handler calls — not a local restatement of it. The `newIdentity`
+  // overwrite stays here because it lives in the handler, one branch later.
   function migrate(
     stamps: Map<string, string>,
     migratedFrom: string,
     panelTab: string,
     newIdentityUuid?: string,
   ): void {
-    const carried = stamps.get(migratedFrom);
-    if (carried !== undefined && !stamps.has(panelTab)) stamps.set(panelTab, carried);
-    stamps.delete(migratedFrom);
+    carryWorkflowCommandStamp(stamps, migratedFrom, panelTab);
     if (newIdentityUuid) stamps.set(panelTab, newIdentityUuid);
   }
 
