@@ -1703,12 +1703,21 @@ export function resetDownloadJobs(): void {
  * the generic run rule below cannot be lowered far enough to see it.
  */
 const NAMED_CREDENTIAL_SHAPES: readonly RegExp[] = [
+  // Vendor prefixes, ENUMERATED on purpose. The obvious generalisation — "a short
+  // alphabetic prefix followed by a long opaque body" — cannot be made to work: it is the
+  // shape of `juggernautXL_v9Rundiffusionphoto2` as exactly as it is the shape of
+  // `glpat-8GMtG8Mf4EnMJzmAWDU`, and the rule that catches one redacts the other. Public
+  // token prefixes are a small, published, slow-moving set, which is why every real secret
+  // scanner enumerates them too.
+  //
   // Hyphens and underscores INSIDE the token count: a real key is `sk-live-abc…`, and
   // requiring 12 contiguous alphanumerics after the prefix missed exactly that shape.
-  /(sk|pk|hf|ghp|gho|xox[baprs])[-_][A-Za-z0-9_-]{12,}/,
+  /(sk|pk|rk|hf|ghp|gho|ghu|ghs|ghr|glpat|gldt|dop_v1|doo_v1|dor_v1|shpat|shpss|shpca|shppa|npm|pypi|sq0atp|sq0csp|xkeysib|SG|xox[baprs])[-_][A-Za-z0-9_-]{12,}/,
+  /github_pat_[A-Za-z0-9_]{20,}/,
   /(api[-_]?key|secret|token|password|bearer)/i,
   /(AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ABIA)[A-Z0-9]{16}/,
   /AIza[A-Za-z0-9_-]{35}/,
+  /ya29\.[A-Za-z0-9_-]{20,}/,
   /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/,
 ];
 

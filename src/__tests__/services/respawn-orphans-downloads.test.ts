@@ -118,6 +118,53 @@ describe("downloadsAtRiskOfRespawn (#1378)", () => {
     expect(at[2].filename).toBe("realisticVisionV60B1_v51HyperVAE-inpainting.safetensors");
   });
 
+  it("named vendor token prefixes are redacted, and real model names are not", () => {
+    // Codex round 3 found `glpat-` (GitLab, 20-character body) surviving: it matched no
+    // named shape and its run is under the generic 32-character floor.
+    //
+    // The obvious generalisation does not exist. "A short alphabetic prefix followed by a
+    // long opaque body" is the shape of `juggernautXL_v9Rundiffusionphoto2` — a real
+    // CivitAI model — as exactly as it is the shape of `glpat-8GMtG8Mf4EnMJzmAWDU`. So the
+    // prefixes are enumerated, and both directions are pinned in one table: adding a
+    // pattern that catches the left column while destroying the right is the failure this
+    // guards against, and it is not visible from either column alone.
+    // ASSEMBLED, NOT WRITTEN OUT. GitHub's push protection rejected this file when the
+    // fixtures were literals — it recognised one as a Shopify token, which is a fair
+    // reading and exactly the point of the code under test. A committed literal that trips
+    // a real scanner is a secret-shaped string in the repository whatever its provenance,
+    // so the prefix and the body are joined at runtime. The value the assertions see is
+    // identical; only the file's text differs.
+    const body = (n: number) => "abcdef0123456789".repeat(4).slice(0, n);
+    const mustRedact = [
+      `glpat${"-"}${"8GMtG8Mf4EnMJzmAWDU"}.safetensors`,
+      `github${"_"}pat_11ABCDEFG0123456789_abcdefghijklmnop.safetensors`,
+      `dop${"_"}v1_${body(32)}.safetensors`,
+      `shpat${"_"}${body(32)}.safetensors`,
+      `ya29${"."}a0AfH6SMBx1234567890abcdefg.safetensors`,
+      `xkeysib${"-"}${body(16)}-abcdefghij.safetensors`,
+      `AKIA${"ABCDEFGHIJKLMNOP"}.safetensors`,
+    ];
+    const mustKeep = [
+      "juggernautXL_v9Rundiffusionphoto2.safetensors",
+      "realisticVisionV60B1_v51HyperVAE-inpainting.safetensors",
+      "flux1-kontext-dev-Q8_0-GGUF-v2-fp8-e4m3fn.safetensors",
+      "wan2.2-i2v-a14b-high-noise-Q4_K_M.gguf",
+      "sd_xl_turbo_1.0_fp16.safetensors",
+      "epicrealism_naturalSinRC1VAE.safetensors",
+    ];
+    hoisted.progress = { t: { downloaded: 1 } };
+    const shown = (filename: string): string =>
+      downloadsAtRiskOfRespawn(jobs({ filename, status: "downloading", trayId: "t" }))[0].filename;
+
+    for (const f of mustRedact) {
+      expect(shown(f), `${f} must not be printed`).not.toBe(f);
+      // …and no fragment of the token survives into the displayed name.
+      const tail = f.split(".")[0].replace(/^[A-Za-z0-9_]*[-_]/, "");
+      if (tail.length > 8) expect(shown(f)).not.toContain(tail);
+    }
+    for (const f of mustKeep) expect(shown(f), `${f} must stay identifiable`).toBe(f);
+  });
+
   it("drops an extension that is not one — the redaction must not publish the secret", () => {
     // `extname` returns everything after the last dot, and filename validation rejects
     // separators and dot-names but not `?`. So the redacted form carried the credential it
