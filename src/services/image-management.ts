@@ -805,14 +805,22 @@ export async function getOutputImage(
   // untouched: an HTML error page, a login redirect or a truncated body does not parse and
   // is still refused. ComfyUI answers 200 with an error body often enough that this check
   // is the only thing standing between the caller and a corrupt "image".
-  const isJson = allowJson && ext === ".json" && looksLikeSavableJson(result.base64);
+  const jsonRefusal = allowJson && ext === ".json" ? jsonAttachmentRefusal(result.base64) : null;
+  const isJson = allowJson && ext === ".json" && jsonRefusal === null;
   if ((!isImage && !isMedia && !isJson) || result.base64.length === 0) {
     const where = subfolder ? `${type}/${subfolder}` : type;
     throw new ComfyUIError(
-      `ComfyUI /view did not return an image for "${filename}" (${where}); ` +
-        `got ${result.base64.length === 0 ? "an empty response" : `content-type "${result.mimeType}"`}. ` +
-        `The file may not exist in the ComfyUI ${type} directory — ` +
-        `check the filename/subfolder (e.g. via get_image (action:"list_outputs") or get_history).`,
+      jsonRefusal
+        ? // NAME THE ACTUAL REASON (#1373). "The file may not exist" for a body that
+          // arrived and was rejected on its CONTENT sends the caller to re-check a
+          // filename that is perfectly correct — the wrong-cause failure this issue is
+          // about, reproduced by its own fix.
+          `ComfyUI /view returned ${jsonRefusal}, for "${filename}" (${where}). ` +
+          `Nothing was saved.`
+        : `ComfyUI /view did not return an image for "${filename}" (${where}); ` +
+          `got ${result.base64.length === 0 ? "an empty response" : `content-type "${result.mimeType}"`}. ` +
+          `The file may not exist in the ComfyUI ${type} directory — ` +
+          `check the filename/subfolder (e.g. via get_image (action:"list_outputs") or get_history).`,
       "IMAGE_NOT_FOUND",
       { filename, type, subfolder, mimeType: result.mimeType },
     );
@@ -837,34 +845,53 @@ export async function getOutputImage(
 const MAX_JSON_ATTACHMENT_BYTES = 32 * 1024 * 1024;
 
 /**
- * Is this payload a JSON document worth saving as the requested attachment? (#1373)
+ * Why a `.json` payload is not savable, or null when it is (#1373).
  *
- * Parsing is the test, because the declared content-type is a claim and parsing is a fact
- * — the reporter's server labelled a valid workflow `video/json`.
+ * Returns a REASON rather than a boolean so the refusal can say what was actually wrong.
+ * Collapsing "40 MB" and "this is an error envelope" into the generic "the file may not
+ * exist in the ComfyUI input directory" sends the caller to check a filename that is
+ * perfectly correct — which is the same wrong-cause failure this whole issue is about.
  *
- * BUT VALID JSON IS NOT THE SAME AS THE FILE THEY ASKED FOR (codex). ComfyUI answers 200
- * with a JSON error envelope in several cases, and `{"error":"not found"}` parses
- * perfectly. Saving that as `my_workflow.json` is the original bug in a new costume: a
- * failure written to disk under the name of the thing that failed. So a top-level `error`
- * key on an object body is refused — narrow on purpose, because every OTHER shape of valid
- * JSON is legitimately savable and guessing further would start rejecting real files.
+ * WHAT COUNTS AS AN ERROR ENVELOPE (codex). A top-level `error` key alone was calibrated
+ * wrong in both directions: it missed ComfyUI's other shapes (`node_errors`, `detail`) and
+ * it rejected a legitimate workflow that happens to carry a top-level `error` field. The
+ * test is now "carries an error-ish key AND carries none of the markers a workflow always
+ * has" — so an error body is caught whatever it is called, and a real workflow is kept even
+ * if it has an `error` extension of its own.
  */
-function looksLikeSavableJson(base64: string): boolean {
-  if (base64.length === 0) return false;
-  // base64 is 4 chars per 3 bytes; compare before decoding so the ceiling is not paid to
-  // be enforced.
-  if (Math.floor((base64.length * 3) / 4) > MAX_JSON_ATTACHMENT_BYTES) return false;
+function jsonAttachmentRefusal(base64: string): string | null {
+  if (base64.length === 0) return "an empty response";
+  // Decoded size from the base64 LENGTH, minus padding, so the ceiling costs nothing to
+  // enforce and does not overestimate a padded payload by a byte or two at the boundary.
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+  const approxBytes = Math.floor((base64.length * 3) / 4) - padding;
+  if (approxBytes > MAX_JSON_ATTACHMENT_BYTES) {
+    return (
+      `a ${(approxBytes / 1024 ** 2).toFixed(1)} MB JSON body, over the ` +
+      `${MAX_JSON_ATTACHMENT_BYTES / 1024 ** 2} MB ceiling for a workflow attachment — ` +
+      `parsing it to check it would cost that much again in memory, so it was refused unread`
+    );
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(Buffer.from(base64, "base64").toString("utf8"));
   } catch {
-    return false;
+    return "a body that is not valid JSON";
   }
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
     const rec = parsed as Record<string, unknown>;
-    if ("error" in rec) return false;
+    const errorish = ["error", "node_errors", "detail"].filter((k) => k in rec);
+    const workflowMarkers = ["nodes", "links", "last_node_id", "extra", "prompt", "workflow"];
+    const looksLikeAWorkflow = workflowMarkers.some((k) => k in rec);
+    if (errorish.length > 0 && !looksLikeAWorkflow) {
+      return (
+        `a JSON ERROR body (it carries "${errorish[0]}" and none of the keys a workflow has), ` +
+        `not the attachment you asked for — saving it would write a failure to disk under ` +
+        `the name of the thing that failed`
+      );
+    }
   }
-  return true;
+  return null;
 }
 
 /**

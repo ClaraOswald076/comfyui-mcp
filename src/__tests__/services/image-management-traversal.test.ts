@@ -715,7 +715,7 @@ describe("#1373 — a .json attachment is accepted by PARSING it, not by its con
     fetchImageMock.mockResolvedValue(jsonBody('{"error":"not found"}'));
     await expect(
       getOutputImage("wf.json", "input", "", { allowMedia: true, allowJson: true }),
-    ).rejects.toThrow(/did not return an image/);
+    ).rejects.toThrow(/JSON ERROR body/);
   });
 
   it("…but a workflow that merely CONTAINS the word error is still saved", async () => {
@@ -742,9 +742,11 @@ describe("#1373 — a .json attachment is accepted by PARSING it, not by its con
       base64: Buffer.from(huge, "utf8").toString("base64"),
       mimeType: "application/json",
     });
+    // …and the message names the SIZE, not "the file may not exist" — the caller's
+    // filename is perfectly correct and sending them to re-check it wastes the trip.
     await expect(
       getOutputImage("huge.json", "input", "", { allowMedia: true, allowJson: true }),
-    ).rejects.toThrow(/did not return an image/);
+    ).rejects.toThrow(/over the 32 MB ceiling/);
   });
 
   it("REFUSES an HTML error page served as .json — the rejection this check exists for", async () => {
@@ -757,21 +759,43 @@ describe("#1373 — a .json attachment is accepted by PARSING it, not by its con
     });
     await expect(
       getOutputImage("missing.json", "input", "", { allowMedia: true, allowJson: true }),
-    ).rejects.toThrow(/did not return an image/);
+    ).rejects.toThrow(/not valid JSON/);
   });
 
   it("REFUSES truncated JSON", async () => {
     fetchImageMock.mockResolvedValue(jsonBody('{"nodes":[],"li'));
     await expect(
       getOutputImage("truncated.json", "input", "", { allowMedia: true, allowJson: true }),
-    ).rejects.toThrow(/did not return an image/);
+    ).rejects.toThrow(/not valid JSON/);
   });
 
   it("REFUSES an empty body even though '' is a .json request", async () => {
     fetchImageMock.mockResolvedValue({ base64: "", mimeType: "application/json" });
     await expect(
       getOutputImage("empty.json", "input", "", { allowMedia: true, allowJson: true }),
-    ).rejects.toThrow(/did not return an image/);
+    ).rejects.toThrow(/an empty response/);
+  });
+
+  it("catches the OTHER ComfyUI error shapes, not just a top-level `error` (codex)", async () => {
+    // A single-key heuristic was calibrated wrong in both directions. These are error
+    // bodies whatever they are called.
+    for (const body of ['{"node_errors":{}}', '{"detail":"Not Found"}']) {
+      fetchImageMock.mockResolvedValue(jsonBody(body));
+      await expect(
+        getOutputImage("wf.json", "input", "", { allowMedia: true, allowJson: true }),
+      ).rejects.toThrow(/JSON ERROR body/);
+    }
+  });
+
+  it("…and KEEPS a real workflow that carries its own top-level `error` field (codex)", async () => {
+    // The other direction of the same miscalibration: rejecting a legitimate attachment
+    // because a key name collided. A body with workflow markers is a workflow.
+    fetchImageMock.mockResolvedValue(
+      jsonBody('{"nodes":[],"links":[],"last_node_id":3,"error":"captured during the run"}'),
+    );
+    await expect(
+      getOutputImage("wf.json", "input", "", { allowMedia: true, allowJson: true }),
+    ).resolves.toBeDefined();
   });
 
   it("does NOT widen anything when allowJson is off", async () => {
