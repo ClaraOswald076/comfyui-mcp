@@ -4,6 +4,27 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.50.111
+
+### Fixed
+
+- **`download_model` no longer promises a resumable partial it never looked for (#1370).**
+  Cancelling a download reported "the partial was left on disk and can be resumed by
+  re-issuing" purely from the job's status — nothing stat'd the file. A reporter paused a
+  33 GB download because of that sentence, found no partial anywhere, and restarted from
+  zero.
+
+  Both cancelled branches now report what is actually staged: the partial's SIZE when there
+  is one, so "resumable" is something you can weigh against restarting, or its absence, so
+  you learn it before re-spending the bandwidth rather than after. A cancel that leaves
+  nothing is not an error; telling you it left something is.
+
+  The lookup derives the staged path from the same function the writer uses, so the two
+  cannot drift. Getting there took two corrections — the file is keyed by the download's
+  CACHE identity rather than its destination filename, and it is HIDDEN (a leading dot) —
+  and each wrong version would have reported "no partial found" to someone holding tens of
+  gigabytes of resumable bytes.
+
 ## 0.50.110
 
 ### Fixed
@@ -98,6 +119,14 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.50.111] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- stat the partial instead of asserting it (#1392)
+
 
 ## [0.50.110] - 2026-08-11
 
