@@ -769,11 +769,21 @@ describe("#1373 — a .json attachment is accepted by PARSING it, not by its con
     ).rejects.toThrow(/not valid JSON/);
   });
 
-  it("REFUSES an empty body even though '' is a .json request", async () => {
+  it("REFUSES an empty body — and it is still a MISSING FILE, not a content refusal", async () => {
+    // codex P2. An empty 200 is what an unresolved `input` reference looks like; that is
+    // why #385 made it a structured not-found. Giving it the content-refusal code takes
+    // the missing-file branch away from callers for `.json` alone — the same wrong-cause
+    // failure this issue is about, pointed the other way.
     fetchImageMock.mockResolvedValue({ base64: "", mimeType: "application/json" });
-    await expect(
-      getOutputImage("empty.json", "input", "", { allowMedia: true, allowJson: true }),
-    ).rejects.toThrow(/an empty response/);
+    const err = await getOutputImage("empty.json", "input", "", {
+      allowMedia: true,
+      allowJson: true,
+    }).catch((e) => e);
+    expect(err.message).toMatch(/an empty response/);
+    expect(err.code).toBe("IMAGE_NOT_FOUND");
+    // ...and it must say the file may not exist, which is the actionable part.
+    expect(err.message).toMatch(/may not exist/);
+    expect(err.details?.rejectedBecause).toBeUndefined();
   });
 
   it("catches the OTHER ComfyUI error shapes, not just a top-level `error` (codex)", async () => {
@@ -804,8 +814,21 @@ describe("#1373 — a .json attachment is accepted by PARSING it, not by its con
 
   it("…and a genuinely absent file still says IMAGE_NOT_FOUND", async () => {
     // The over-broad direction of the same change, which the test above cannot see:
-    // relabelling every rejection would erase the missing-file signal that #385 added,
-    // and #385's own tests use .png paths that never reach the JSON branch at all.
+    // relabelling every rejection would erase the missing-file signal that #385 added.
+    //
+    // The FIRST version of this test used `gone.png`, which never reaches the JSON gate at
+    // all — so it asserted a branch the change could not affect and would have shipped the
+    // P2 above unnoticed (codex). A `.json` request whose body never arrived is the case
+    // that actually distinguishes the two codes.
+    fetchImageMock.mockResolvedValue({ base64: "", mimeType: "application/json" });
+    const missingJson = await getOutputImage("gone.json", "output", "", {
+      allowMedia: true,
+      allowJson: true,
+    }).catch((e) => e);
+    expect(missingJson.code).toBe("IMAGE_NOT_FOUND");
+    expect(missingJson.details?.rejectedBecause).toBeUndefined();
+
+    // …and the non-JSON path, unchanged.
     fetchImageMock.mockResolvedValue({
       base64: Buffer.from("<html>404</html>", "utf8").toString("base64"),
       mimeType: "text/html",

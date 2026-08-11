@@ -807,10 +807,20 @@ export async function getOutputImage(
   // is the only thing standing between the caller and a corrupt "image".
   const jsonRefusal = allowJson && ext === ".json" ? jsonAttachmentRefusal(result.base64) : null;
   const isJson = allowJson && ext === ".json" && jsonRefusal === null;
+  // AN EMPTY BODY IS A MISSING FILE, NOT A CONTENT REFUSAL (codex P2).
+  //
+  // `jsonAttachmentRefusal` answers "not savable" for an empty payload too, but this file
+  // already establishes what a 200-with-empty-body means: it is what an unresolved `input`
+  // reference looks like, which is why #385 made it a structured not-found in the first
+  // place. Routing it through the new code would take the missing-file branch away from
+  // callers for `.json` alone — the same wrong-cause failure this issue is about, just
+  // pointed the other way. Bytes arrived and were judged: content refusal. No bytes
+  // arrived: nothing was judged.
+  const contentRejected = jsonRefusal !== null && result.base64.length > 0;
   if ((!isImage && !isMedia && !isJson) || result.base64.length === 0) {
     const where = subfolder ? `${type}/${subfolder}` : type;
     throw new ComfyUIError(
-      jsonRefusal
+      contentRejected
         ? // NAME THE ACTUAL REASON (#1373). "The file may not exist" for a body that
           // arrived and was rejected on its CONTENT sends the caller to re-check a
           // filename that is perfectly correct — the wrong-cause failure this issue is
@@ -826,14 +836,14 @@ export async function getOutputImage(
       // having one — still read IMAGE_NOT_FOUND and went off to re-check a filename that
       // was never wrong. That is the same wrong-cause failure as the prose, one layer
       // down, and it is the layer that automation reads.
-      jsonRefusal ? "ATTACHMENT_CONTENT_REJECTED" : "IMAGE_NOT_FOUND",
+      contentRejected ? "ATTACHMENT_CONTENT_REJECTED" : "IMAGE_NOT_FOUND",
       {
         filename,
         type,
         subfolder,
         mimeType: result.mimeType,
         // The reason, structured, so a caller does not have to parse the sentence.
-        ...(jsonRefusal ? { rejectedBecause: jsonRefusal } : {}),
+        ...(contentRejected ? { rejectedBecause: jsonRefusal } : {}),
       },
     );
   }
