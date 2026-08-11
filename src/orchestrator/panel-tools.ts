@@ -100,6 +100,7 @@ import {
   setAgentSecret,
   isAllowedAgentSecretKey,
   receiptDisclosures,
+  atRiskDownloadSummary,
   shadowedNote,
   storeDamageNote,
   type SecretSaveReceipt,
@@ -454,9 +455,9 @@ export function describeComfyuiSecretSave(receipt: SecretSaveReceipt): string {
   // different sentences because they are different facts.
   const atRisk = receipt.atRiskDownloads ?? [];
   if (atRisk.length && receipt.respawn && (receipt.respawn.applied || receipt.respawn.scheduled)) {
-    const gb = atRisk.reduce((n, d) => n + d.bytes, 0) / 1024 ** 3;
-    const names = atRisk.map((d) => d.filename).slice(0, 3).join(", ");
-    const listed = `${atRisk.length} download(s) (${names}${atRisk.length > 3 ? ", …" : ""}), about ${gb.toFixed(2)} GB fetched`;
+    // Shared with the revoke path's disclosure, which loses the same transfers the same
+    // way — two hand-rolled summaries of one fact drift.
+    const listed = atRiskDownloadSummary(atRisk);
     parts.push(
       receipt.respawn.applied
         ? `WARNING — the tool session was replaced immediately, and ${listed} were in flight. ` +

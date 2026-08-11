@@ -83,6 +83,56 @@ describe("downloadsAtRiskOfRespawn (#1378)", () => {
     expect(at[2].filename).toBe("flux2_dev.safetensors");
   });
 
+  it("REDACTS shapes SHORTER than the generic run — an AWS key ID is 20 chars (codex)", () => {
+    // The generic rule is a 32-character floor, and 20 characters is an ordinary model
+    // filename, so the floor cannot be lowered to catch this. `AKIA…` printed in full.
+    hoisted.progress = { a: { downloaded: 1 }, b: { downloaded: 2 } };
+    const at = downloadsAtRiskOfRespawn(
+      jobs(
+        { filename: "AKIAABCDEFGHIJKLMNOP.safetensors", status: "downloading", trayId: "a" },
+        { filename: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.safetensors", status: "downloading", trayId: "b" },
+      ),
+    );
+    expect(at[0].filename).toBe("(redacted).safetensors");
+    expect(at[1].filename).toBe("(redacted).safetensors");
+  });
+
+  it("KEEPS a hash-named model — over-redaction costs the warning its point (codex P3)", () => {
+    // A receipt that says two downloads are at risk without saying WHICH has given up most
+    // of its value. A sha1/md5/sha256 in a filename is ordinary; it is hex-only AND an
+    // exact hash length, which a credential is not (they are base64-ish and any length).
+    hoisted.progress = { a: { downloaded: 1 }, b: { downloaded: 2 }, c: { downloaded: 3 } };
+    const at = downloadsAtRiskOfRespawn(
+      jobs(
+        { filename: `flux1-dev-${"a1b2c3d4".repeat(5)}.safetensors`, status: "downloading", trayId: "a" },
+        { filename: `sd35-${"0f".repeat(32)}.safetensors`, status: "downloading", trayId: "b" },
+        // One unbroken 40-character mixed run: no part explains itself, still a blob.
+        { filename: `blob-${"Zx9Qw7Er".repeat(5)}.safetensors`, status: "downloading", trayId: "c" },
+      ),
+    );
+    expect(at[0].filename).toBe(`flux1-dev-${"a1b2c3d4".repeat(5)}.safetensors`);
+    expect(at[1].filename).toBe(`sd35-${"0f".repeat(32)}.safetensors`);
+    expect(at[2].filename).toBe("(redacted).safetensors");
+  });
+
+  it("a long name of ORDINARY parts is kept, but several blob parts are not", () => {
+    // The line between the two directions, asserted where it actually sits: real model
+    // filenames are long and full of `Q8_0`/`a14b`/`e4m3fn`, and a rule that redacts those
+    // redacts nearly everything. Parts that are long AND interleaved are budgeted, so one
+    // is a name and several is a blob.
+    hoisted.progress = { a: { downloaded: 1 }, b: { downloaded: 2 } };
+    const ordinary = "flux1-kontext-dev-Q8_0-GGUF-v2-fp8-e4m3fn.safetensors";
+    const blobby = "AbcD3fGhIjK-LmNo9pQrStU-VwXy7zAbCdE.safetensors";
+    const at = downloadsAtRiskOfRespawn(
+      jobs(
+        { filename: ordinary, status: "downloading", trayId: "a" },
+        { filename: blobby, status: "downloading", trayId: "b" },
+      ),
+    );
+    expect(at[0].filename).toBe(ordinary);
+    expect(at[1].filename).toBe("(redacted).safetensors");
+  });
+
   it("NEVER reports the URL — a download URL can carry query-string auth", () => {
     // This string lands in a chat transcript. The filename and the byte count are what the
     // decision needs; the URL is the one field that can carry a credential.
@@ -109,6 +159,56 @@ describe("downloadsAtRiskOfRespawn (#1378)", () => {
         jobs({ filename: "unknown-progress.safetensors", status: "downloading", trayId: "z" }),
       ),
     ).toEqual([{ filename: "unknown-progress.safetensors", bytes: 0 }]);
+  });
+
+  it("the revoke disclosure NAMES the transfers, and stays silent when there are none", async () => {
+    // The behaviour behind the wiring test above: a field nobody renders is not a warning,
+    // and a warning that fires on an empty list is noise on every ordinary revoke.
+    const { removeDisclosures } = await import("../../services/panel-secrets.js");
+    const base = { changed: true, lostKeys: [], lostCommentLines: 0 };
+
+    const loud = removeDisclosures(
+      {
+        ...base,
+        atRiskDownloads: [
+          { filename: "flux1-dev.safetensors", bytes: 12 * 1024 ** 3 },
+          { filename: "wan22.safetensors", bytes: 4 * 1024 ** 3 },
+        ],
+      },
+      "/store/.env",
+    );
+    const text = loud.join(" ");
+    expect(text).toMatch(/flux1-dev\.safetensors/);
+    expect(text).toMatch(/16\.00 GB/);
+    // It must NOT claim which side of the respawn we are on — this path collects no
+    // respawn reports, so "already lost" and "will be lost" are both unchecked claims.
+    expect(text).toMatch(/not reported on this path/);
+
+    expect(removeDisclosures({ ...base, atRiskDownloads: [] }, "/store/.env")).toEqual([]);
+  });
+
+  it("WIRING: REVOKE snapshots before its emit too, and discloses it (#1409)", async () => {
+    // The fix landed on the save path only. Revoke reaches the same synchronous emit two
+    // functions later, and removing the credential a gated transfer authenticates with is
+    // at least as likely to cost one as replacing it — codex scored the hole against this
+    // PR rather than accepting the follow-up issue, correctly.
+    const { readFileSync } = await import("node:fs");
+    const code = (rel: string): string =>
+      readFileSync(new URL(rel, import.meta.url), "utf8")
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/.*/g, "");
+    const src = code("../../services/panel-secrets.ts");
+
+    // Scoped to the REMOVER, or the setter's own (correct) ordering satisfies this.
+    const remover = src.slice(src.indexOf("export function removeEnvSecret"));
+    const snapshotAt = remover.indexOf("snapshotAtRiskDownloads()");
+    const emitAt = remover.indexOf("emitComfyuiChange({})");
+    expect(snapshotAt, "the remover must snapshot in-flight downloads").toBeGreaterThan(-1);
+    expect(emitAt, "the remover must still emit").toBeGreaterThan(-1);
+    expect(snapshotAt, "the snapshot must precede the respawn emit").toBeLessThan(emitAt);
+
+    // …and it must reach the user. A field nobody renders is not a warning.
+    expect(src).toMatch(/outcome\.atRiskDownloads\.length/);
   });
 
   it("WIRING: the snapshot is taken in the SETTER, before the synchronous respawn", async () => {

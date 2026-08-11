@@ -1694,6 +1694,60 @@ export function resetDownloadJobs(): void {
  * the name costs the reader a little context; printing a live token into a transcript is
  * not recoverable.
  */
+/**
+ * Lengths at which a pure-hex run is a HASH rather than a credential (codex P3).
+ *
+ * `flux1-dev-<40 hex>.safetensors` is a perfectly ordinary name — a git sha, an md5, a
+ * civitai version hash — and redacting it wholesale leaves the user a receipt saying two
+ * downloads are at risk without saying WHICH, which is most of the value of the warning.
+ * Hex-only is a weak signal on its own, so it is paired with an exact hash length: md5,
+ * sha1, sha256, sha512. A credential that happens to be pure hex at exactly one of those
+ * four lengths still prints — stated rather than hidden, because a redaction rule that
+ * overstates its coverage is worse than one that admits its gap.
+ */
+const HASH_RUN_LENGTHS: ReadonlySet<number> = new Set([32, 40, 64, 128]);
+
+/**
+ * Is this long run ACCOUNTED FOR by ordinary name parts, or is it a blob?
+ *
+ * Checking hex-ness on the whole run does not work, because `-` and `_` are inside the
+ * run: `flux1-dev-<40 hex>` is one 50-character run that is not pure hex, so the naive
+ * version redacted the very name the P3 finding was about. The run is therefore split on
+ * its separators and each part must explain itself.
+ *
+ * ACCEPTED RESIDUAL, stated rather than hidden: a credential spelled as separator-
+ * delimited chunks of eight characters or fewer — `AbcD3fGh-IjKl9mNo-PqRs7tUv` — reads as
+ * a name here and survives. Eight characters is where json-guard draws the same line for
+ * the same reason: below it a chunk carries too little entropy to be worth protecting, and
+ * a rule that redacts `Q8_0`, `a14b` and `e4m3fn` redacts most real model filenames. The
+ * shapes that actually appear in a leaked filename — a bare key, a prefixed key, a JWT —
+ * are matched by name above and do not depend on this.
+ */
+const MAX_NAME_PART = 20;
+const MIN_PROTECTED_PART = 8;
+
+function runIsOrdinaryName(run: string): boolean {
+  let mixedBudget = 1;
+  for (const part of run.split(/[-_]/)) {
+    if (part === "") continue;
+    // A hash: hex-only AND an exact digest length.
+    if (/^[0-9a-f]+$/i.test(part) && HASH_RUN_LENGTHS.has(part.length)) continue;
+    if (part.length <= MIN_PROTECTED_PART) continue;
+    if (part.length > MAX_NAME_PART) return false;
+    if (/^[A-Za-z]+$/.test(part) || /^[0-9]+$/.test(part)) continue;
+    // Letters and digits interleaved is the strongest blob signal, so it is BUDGETED
+    // across the run rather than allowed per part — several in a row is not a name.
+    if (mixedBudget-- > 0) continue;
+    return false;
+  }
+  return true;
+}
+
+/** A run long enough to be a credential, discounting the ones that are plainly names. */
+function hasOpaqueRun(name: string): boolean {
+  return (name.match(/[A-Za-z0-9_-]{32,}/g) ?? []).some((run) => !runIsOrdinaryName(run));
+}
+
 function redactSecretishFilename(name: string | undefined): string {
   if (!name) return "(unnamed)";
   const looksSecretish =
@@ -1701,7 +1755,15 @@ function redactSecretishFilename(name: string | undefined): string {
     // requiring 12 contiguous alphanumerics after the prefix missed exactly that shape.
     /(sk|pk|hf|ghp|gho|xox[baprs])[-_][A-Za-z0-9_-]{12,}/.test(name) ||
     /(api[-_]?key|secret|token|password|bearer)/i.test(name) ||
-    /[A-Za-z0-9_-]{32,}/.test(name);
+    // SHAPES SHORTER THAN THE GENERIC RUN (codex). An AWS access key ID is exactly 20
+    // characters with no separator, so it cleared none of the rules above and fell under
+    // the 32-character floor below: `AKIAABCDEFGHIJKLMNOP.safetensors` printed in full.
+    // The generic length rule cannot be lowered to catch it — 20 characters is an ordinary
+    // model filename — so the known short shapes are named individually.
+    /(AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ABIA)[A-Z0-9]{16}/.test(name) ||
+    /AIza[A-Za-z0-9_-]{35}/.test(name) ||
+    /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/.test(name) ||
+    hasOpaqueRun(name);
   if (!looksSecretish) return name;
   const ext = extname(name);
   return ext ? `(redacted)${ext}` : "(redacted)";

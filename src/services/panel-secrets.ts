@@ -508,8 +508,41 @@ export function strayCopyNote(receipt: SecretSaveReceipt): string | null {
  * beside the save's, so the two cannot drift into disagreeing about what a store
  * write owes its caller.
  */
+/**
+ * The one description of what a respawn is about to cost, shared by both paths (#1378).
+ *
+ * Save and revoke reach the same emit and lose the same transfers, so they say it the same
+ * way — two hand-rolled summaries would drift, and the revoke half was missing entirely
+ * until codex pointed at it.
+ */
+export function atRiskDownloadSummary(atRisk: readonly { filename: string; bytes: number }[]): string {
+  const gb = atRisk.reduce((n, d) => n + d.bytes, 0) / 1024 ** 3;
+  const names = atRisk
+    .map((d) => d.filename)
+    .slice(0, 3)
+    .join(", ");
+  return `${atRisk.length} download(s) (${names}${atRisk.length > 3 ? ", …" : ""}), about ${gb.toFixed(2)} GB fetched`;
+}
+
 export function removeDisclosures(outcome: SecretRemoveOutcome, path: string): string[] {
   const out: string[] = [];
+  if (outcome.atRiskDownloads.length) {
+    // WHAT THE REVOKE COST (#1378, #1409). Removing the credential a gated transfer is
+    // authenticated with respawns the tool session, which changes each download's cache
+    // identity — the `.partial` at 96% becomes unreachable and re-issuing starts from zero.
+    //
+    // Unlike the save path, this one collects no respawn reports, so whether the rebuild
+    // has ALREADY happened is not established here. The sentence says so rather than
+    // picking one: "already lost" would be a claim we did not check, and "will be lost"
+    // invites the user to act on a transfer that may be dead already.
+    out.push(
+      `⚠️ ${atRiskDownloadSummary(outcome.atRiskDownloads)} — these were in flight when the ` +
+        `credential was removed. Whether the tool session has been rebuilt yet is not reported ` +
+        `on this path, but a rebuild changes each download's cache identity, so those transfers ` +
+        `do NOT resume: re-issuing starts from 0% even though the partial files remain on disk ` +
+        `(#1378).`,
+    );
+  }
   if (outcome.lostKeys.length) {
     out.push(
       `🛑 The store no longer carries ${outcome.lostKeys.join(", ")} — ` +
@@ -1688,6 +1721,17 @@ export interface SecretRemoveOutcome {
   /** Something changed: a store line removed, the in-process copy dropped, or a
    *  legacy JSON entry purged. */
   changed: boolean;
+  /**
+   * Downloads that were in flight when this revoke was about to respawn the tool session
+   * (#1378, #1409). Same field and same capture point as `SecretSaveReceipt` — a revoke
+   * reaches the same synchronous emit, and removing the credential a gated transfer is
+   * authenticated with is at least as likely to cost one as replacing it.
+   *
+   * Empty when nothing changed (no emit, so nothing was at risk) and when the key is not
+   * a ComfyUI one — never absent, so a caller need not distinguish "none" from "not
+   * reported".
+   */
+  atRiskDownloads: { filename: string; bytes: number }[];
   /** OTHER credential keys the store held before and no longer holds. Names
    *  only. Non-empty means the revoke happened AND cost something else. */
   lostKeys: string[];
@@ -1799,12 +1843,23 @@ export function removeEnvSecret(key: string): SecretRemoveOutcome {
     logger.warn(`[panel-secrets] ${resurrectionRisk}`);
   }
   const changed = removed || purgedJson || envDeleted;
+  // #1378 — REVOKE ORPHANS DOWNLOADS TOO (codex P1, filed separately as #1409).
+  //
+  // The fix landed on the SET path only, and revoke reaches the same emit two functions
+  // later. A listener replacing its tool session inside that synchronous emit kills an
+  // in-flight transfer whether the credential was written or removed — and removing the
+  // credential a gated download is authenticated with is, if anything, the likelier way to
+  // lose one. Snapshot before the emit for the same reason as above: afterwards the
+  // transfers are already gone and the list is empty, which reads as "nothing was at risk".
+  const atRiskDownloads =
+    changed && isAllowedComfyuiSecretKey(key) ? snapshotAtRiskDownloads() : [];
   if (changed) {
     if (isAllowedComfyuiSecretKey(key)) emitComfyuiChange({}); // comfyui-only restart (#269)
     if (isAllowedAgentSecretKey(key)) emitAgentChange();
   }
   return {
     changed,
+    atRiskDownloads,
     lostKeys: outcome.lostKeys,
     lostCommentLines: outcome.lostCommentLines,
     ...(outcome.lossCheck === "unknown"
@@ -2538,6 +2593,7 @@ export function clearPanelSecret(slotId: string): SecretRemoveOutcome {
   const resurrectionRisks: string[] = [];
   let durabilityGap: string | undefined;
   const failures: string[] = [];
+  const atRisk = new Map<string, { filename: string; bytes: number }>();
   let firstError: unknown = null;
   for (const key of slot.envKeys) {
     let out: SecretRemoveOutcome;
@@ -2561,6 +2617,14 @@ export function clearPanelSecret(slotId: string): SecretRemoveOutcome {
     lostCommentLines += out.lostCommentLines;
     if (out.uncertainty) uncertainties.push(out.uncertainty);
     if (out.durabilityGap && !durabilityGap) durabilityGap = out.durabilityGap;
+    // Aggregated, and deduped by filename (#1378). The fan-out is SERIAL, so the FIRST
+    // alias whose removal emits is the one that catches the transfers still running; by
+    // the second the session is already replaced and its snapshot is empty. Keeping the
+    // largest byte count means the report never understates what was in flight.
+    for (const d of out.atRiskDownloads) {
+      const seen = atRisk.get(d.filename);
+      if (!seen || d.bytes > seen.bytes) atRisk.set(d.filename, d);
+    }
   }
   // Nothing was removed and something failed: nothing happened, so REFUSING is
   // correct and the caller's "it is still there" is true. Anything else is a
@@ -2568,6 +2632,7 @@ export function clearPanelSecret(slotId: string): SecretRemoveOutcome {
   if (!changed && firstError !== null) throw firstError;
   return {
     changed,
+    atRiskDownloads: [...atRisk.values()],
     ...(failures.length
       ? {
           incomplete:
