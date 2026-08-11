@@ -76,7 +76,10 @@ import {
 } from "./panel-agent.js";
 import { promptText } from "./error-text.js";
 import { callToolAdmission } from "./call-tool-admission.js";
-import { DEFERRED_PANEL_TOOLS_STEERING } from "../deferred-panel-tools.js";
+import {
+  DEFERRED_PANEL_TOOLS_STEERING,
+  withDeferredPanelToolsNote,
+} from "../deferred-panel-tools.js";
 import {
   createPanelMcpServer,
   makePanelToolCtx,
@@ -342,6 +345,20 @@ The panel tools cannot come back during this session — the tool set was fixed 
  * lies when the bind fails" is precisely the kind of thing that stays broken when
  * only the happy path is exercised.
  */
+/**
+ * The panel persona as an agent actually receives it (#1398).
+ *
+ * The deferred-catalog guidance is re-applied AFTER `resolvePrompt`, because a
+ * locale translation or a user persona override replaces the WHOLE string and would
+ * otherwise take it with them — reproducing #1398 in exactly the deployments least
+ * equipped to diagnose it (codex review, P1). Exported so that re-application is a
+ * TESTABLE unit: inlining it at the call site made dropping it invisible to every
+ * test, which a mutation run confirmed.
+ */
+export function resolvePanelPersona(): string {
+  return withDeferredPanelToolsNote(resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND));
+}
+
 export function panelToolsRetraction(backend: string, panelToolsAvailable: boolean): string {
   if (panelToolsAvailable) return "";
   // pi has no MCP client at all; PI_CAPABILITY_OVERRIDE already retracts strictly
@@ -1797,7 +1814,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   // mirror-image lie: claiming to be a build we are not running.
   const mcpVersionRunning = MCP_VERSION_RUNNING;
   let latestPanelVersion: string | undefined;
-  let panelSystemAppend = resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND);
+  let panelSystemAppend = resolvePanelPersona();
   // Set once the manager exists so a later refresh (after a ComfyUI restart) feeds
   // the freshly-gathered env into newly-spawned agents too — Claude reads
   // manager.opts.systemAppend at each spawn; Codex reads the closed-over
@@ -1819,7 +1836,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       const caps = await gatherEnvCapabilities({ comfyuiUrl, comfyuiPath, backendId, mcpVersion: mcpVersionRunning, panelVersion: latestPanelVersion });
       if (gen !== envRefreshGen) return; // a newer refresh superseded us — drop this stale result
       envCaps = caps;
-      panelSystemAppend = buildPanelSystemAppend(resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND), envCaps);
+      panelSystemAppend = buildPanelSystemAppend(resolvePanelPersona(), envCaps);
       if (liveManager) liveManager.setSystemAppend(panelSystemAppend);
     } catch (err) {
       if (gen !== envRefreshGen) return; // superseded — let the newer refresh own the prompt
@@ -1830,7 +1847,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       // non-default backend would rebuild a stale env block off the old caps,
       // disagreeing with the reset panelSystemAppend (#358 wiring).
       envCaps = undefined;
-      panelSystemAppend = resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND);
+      panelSystemAppend = resolvePanelPersona();
       logger.debug(
         `[panel-orchestrator] env-capabilities probe failed (using static prompt): ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -1850,7 +1867,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       return panelSystemAppend;
     }
     return buildPanelSystemAppend(
-      resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND),
+      resolvePanelPersona(),
       { ...envCaps, backend, otherBackendAvailable },
     );
   };

@@ -57,3 +57,23 @@ export const DEFERRED_PANEL_TOOLS_STEERING =
   `deferred catalog hold nothing matching \`panel_\` may you say the live-canvas tools are ` +
   `unavailable — and never treat their apparent absence as a product fault to diagnose, ` +
   `downgrade, or roll back.`;
+
+/**
+ * Guarantee the guidance survives a persona OVERRIDE (codex review, #1398 P1).
+ *
+ * The default persona interpolates the steering, but the persona is resolved through
+ * `resolvePrompt("panel.persona", …)`: a locale translation or a user override
+ * replaces the WHOLE string, silently taking this with it — and a non-English or
+ * customized deployment then reproduces #1398 exactly, with the fix apparently
+ * shipped. The guidance is about the SPELLING of a tool name, which is the same in
+ * every language, so it belongs outside anything translatable.
+ *
+ * Idempotent: keyed on the qualified name, so the default persona (which already
+ * contains it) is returned untouched rather than carrying the paragraph twice.
+ */
+export function withDeferredPanelToolsNote(persona: string): string {
+  if (persona.includes(DEFERRED_PANEL_QUALIFIED_NAME)) return persona;
+  return `${persona}
+
+${DEFERRED_PANEL_TOOLS_STEERING}`;
+}
