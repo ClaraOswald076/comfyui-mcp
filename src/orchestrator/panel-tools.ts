@@ -25,6 +25,9 @@
 
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
+// #873 — the operator's tool-surface policy also governs the panel surface.
+import { resolveToolSurfacePolicy, toolAllowed } from "../tools/tool-surface-filter.js";
+import { logger as toolPolicyLogger } from "../utils/logger.js";
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import type { Stats } from "node:fs";
 import {
@@ -11973,7 +11976,29 @@ export function createPanelMcpServer(
   workflowTargets?: WorkflowTargetStore,
 ): McpSdkServerConfigWithInstance {
   const ctx = makePanelToolCtx(bridge, tabId, workflowTargets);
-  const defs = buildPanelToolDefs();
+  // #873 — THE SECOND PANEL REGISTRATION PATH. This one serves the Anthropic Agent SDK
+  // (Claude backend, in-process transport); registerPanelTools serves the MCP SDK. They
+  // build from the SAME buildPanelToolDefs(), so filtering only the other one left
+  // `panel_run` queueing renders under PRESET=readonly for every Claude-backend tab — the
+  // exact hole the previous round closed on the sibling path and, by fixing only one of
+  // two, left open. Filtering at the shared def list would be tidier and is deliberately
+  // not done here: both call sites are then trivially greppable, and the wiring tests
+  // assert on each by name.
+  const policy = resolveToolSurfacePolicy();
+  const withheldSdk: string[] = [];
+  const defs = buildPanelToolDefs().filter((d) => {
+    if (policy.active && !toolAllowed(d.name, policy)) {
+      withheldSdk.push(d.name);
+      return false;
+    }
+    return true;
+  });
+  if (withheldSdk.length) {
+    toolPolicyLogger.info(
+      `[panel-tools] surface restricted by policy${policy.preset ? ` (preset "${policy.preset}")` : ""} — ` +
+        `${withheldSdk.length} panel tool(s) withheld from the in-process server`,
+    );
+  }
   // The Anthropic SDK's tool() accepts (name, description, zodRawShape, cb). The
   // shared handler is transport-agnostic — bind it to this tab's ctx. Each def's
   // schema is a distinct zod shape, so the produced tool generics differ; widen
@@ -12017,7 +12042,18 @@ export function createPanelMcpServer(
  * tools forward to the bridge for THAT tab — same surface as the Claude path.
  */
 export function registerPanelTools(server: McpServer, ctx: PanelToolCtx): void {
+  // #873 — the operator's policy applies HERE too. This path registers through
+  // `registerTool` on a separate MCP server, so it bypassed the headless filter
+  // entirely: with COMFYUI_MCP_TOOL_PRESET=readonly set, `panel_run` still queued
+  // renders. A filter with a hole is worse than no filter, because the operator has been
+  // told the surface is restricted.
+  const policy = resolveToolSurfacePolicy();
+  const withheld: string[] = [];
   for (const d of buildPanelToolDefs()) {
+    if (policy.active && !toolAllowed(d.name, policy)) {
+      withheld.push(d.name);
+      continue;
+    }
     server.registerTool(
       d.name,
       {
@@ -12034,6 +12070,15 @@ export function registerPanelTools(server: McpServer, ctx: PanelToolCtx): void {
         // ToolResult is already the MCP CallToolResult shape (content[] + isError).
         return res as never;
       }) as never,
+    );
+  }
+  if (withheld.length) {
+    // Logged for the OPERATOR, never surfaced to the model — the point is that it does
+    // not learn these exist. Silence here is how a policy that withholds the whole panel
+    // becomes an afternoon of "why can't it see my canvas".
+    toolPolicyLogger.info(
+      `[panel-tools] surface restricted by policy${policy.preset ? ` (preset "${policy.preset}")` : ""} — ` +
+        `${withheld.length} panel tool(s) withheld`,
     );
   }
 }

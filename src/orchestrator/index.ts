@@ -1876,6 +1876,9 @@ export async function runPanelOrchestrator(): Promise<void> {
     // it as a real env override — a revoke that did not revoke.
     // Test-only tool-call trace (knowledge-parity smoke). No-op unless set.
     ...(process.env.COMFYUI_MCP_TOOL_TRACE ? { COMFYUI_MCP_TOOL_TRACE: process.env.COMFYUI_MCP_TOOL_TRACE } : {}),
+    // #873 — the tool-surface policy is forwarded in buildComfyuiMcpEnv(), which BOTH
+    // comfyui spawn lanes share. It was here first, and here is only the Codex/Gemini
+    // lane: the default Claude lane calls buildComfyuiMcpEnv directly and got nothing.
   });
 
   // The orchestrator-hosted loopback HTTP MCP for panel_* tools. Started for the
