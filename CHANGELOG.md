@@ -197,6 +197,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.4] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- a retarget that lands mid-turn tells the agent its tools were stale (#1430)
+
+
 ## [0.51.3] - 2026-08-11
 
 ### MCP
