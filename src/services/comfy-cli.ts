@@ -228,6 +228,52 @@ function hasJsonRecord(stdout: string): boolean {
   });
 }
 
+/**
+ * Output lines that are PROGRESS, not diagnosis (#417).
+ *
+ * ENUMERATED ON PURPOSE, and this is the whole safety argument. The failure this guards
+ * against is a non-zero exit whose captured output says nothing about why — the reporter
+ * was handed `Start downloading URL ... into ...` in the place a reason belongs. But a
+ * filter that is too eager does something strictly worse: it discards a REAL error message
+ * and replaces it with "no reason available", un-shipping the fix while looking like it
+ * worked. A keyword test ("downloading", "%") would do exactly that to
+ * `HTTP 403 while downloading ...`.
+ *
+ * So each entry matches one KNOWN emitter, anchored, and anything unrecognised is treated
+ * as a real message and preserved. Being wrong in the direction of showing the user too
+ * much is recoverable; being wrong the other way hides the only evidence they had.
+ */
+const PROGRESS_ONLY_LINE_PATTERNS: readonly RegExp[] = [
+  // comfy-cli's own pre-download announcement — the exact line from the report.
+  /^start downloading url\b.*\binto\b/i,
+  // tqdm: " 45%|█████     | 1.2G/2.7G [00:30<00:40, 40.0MB/s]"
+  /^\s*\d{1,3}%\|[^|]*\|\s*[\d.]+\s*\S*\/[\d.]+\s*\S*/i,
+  // tqdm with no bar drawn (non-tty): " 45%| | 1.2G/2.7G"
+  /^\s*\d{1,3}%\|/,
+  // A bare percentage or a "Downloading: 45%" heartbeat.
+  /^\s*(downloading:?\s*)?\d{1,3}(\.\d+)?%\s*$/i,
+  // A drawn bar with no other text.
+  /^[\s█▉▊▋▌▍▎▏#=>.\-\[\]|]+$/,
+];
+
+/**
+ * Does this captured output contain anything that could explain a failure?
+ *
+ * Returns the surviving text, or null when every line was recognised progress. Null means
+ * "I could not determine the reason" — a distinct third state from "the reason is X", and
+ * it must never be reported as one (#796).
+ */
+export function failureReasonFrom(text: string): string | null {
+  const meaningful = text
+    // A progress bar redraws with \r; without splitting on it the whole bar is ONE line
+    // ending in a real error, or one line of pure progress, depending on the emitter.
+    .split(/\r\n|\r|\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .filter((line) => !PROGRESS_ONLY_LINE_PATTERNS.some((re) => re.test(line)));
+  return meaningful.length ? meaningful.join("\n") : null;
+}
+
 export function normalizeComfyCliResult<T = unknown>(
   args: readonly string[],
   options: ComfyCliRunOptions,
@@ -259,6 +305,19 @@ export function normalizeComfyCliResult<T = unknown>(
     };
   }
   if (result.exitCode !== 0) {
+    // #417 — A PROGRESS LINE IS NOT A FAILURE REASON.
+    //
+    // This used to report `stderr || stdout` verbatim. When comfy-cli dies mid-download
+    // its stderr often holds nothing but the progress it had printed so far, so the
+    // reporter's error message was `Start downloading URL ... into ...` — a sentence that
+    // reads like a diagnosis, names no cause, and sent them looking at their URL and
+    // destination directory (both fine) instead of at the download.
+    //
+    // The three states are: a reason, no reason, and — the one that caused this — no
+    // reason DRESSED AS one. Saying plainly that the command produced no error output is
+    // less satisfying and far more useful, because it redirects the search instead of
+    // misdirecting it. The raw output stays in `details` either way; nothing is dropped.
+    const reason = failureReasonFrom(details.stderr) ?? failureReasonFrom(details.stdout);
     return {
       schema: "envelope/1",
       type: "envelope",
@@ -269,7 +328,20 @@ export function normalizeComfyCliResult<T = unknown>(
       data: null,
       error: {
         code: "legacy_command_failed",
-        message: details.stderr || details.stdout || `comfy-cli exited with code ${result.exitCode}`,
+        message:
+          reason ??
+          `comfy-cli exited with code ${result.exitCode} and printed no error — its output was download progress only, so the cause is not visible from here.`,
+        ...(reason
+          ? {}
+          : {
+              hint:
+                "Nothing in the command's output says why it stopped. Check, in this order: " +
+                "free disk space on the destination drive; whether the source needs auth (a gated " +
+                "Hugging Face repo returns 401/403 and some downloaders exit without printing it); " +
+                "and whether an antivirus or the OS killed the process. Re-running with the same " +
+                "arguments will show the same message — the missing information is on comfy-cli's " +
+                "side, not this tool's.",
+            }),
         details: { ...details, exit_code: result.exitCode },
       },
     };
