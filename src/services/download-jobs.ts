@@ -28,6 +28,7 @@ import type { DownloadAuth } from "./download-auth.js";
 import type { ResumeDiagnostic } from "./download-resume-diag.js";
 import { ModelError } from "../utils/errors.js";
 import {
+  readDownloadProgress,
   persistDownloadJob,
   readPersistedDownloadJob,
   listPersistedDownloadJobs,
@@ -1661,4 +1662,43 @@ export function resetDownloadJobs(): void {
   }
   jobs.clear();
   destChains.clear();
+}
+
+/**
+ * In-flight downloads that a tool-session respawn would orphan (#1378).
+ *
+ * Saving a credential mid-flight respawns the comfyui tool session, and the new auth
+ * header changes each download's CACHE IDENTITY — so a `.partial` at 96% becomes
+ * unreachable and the re-issued download starts from zero. A reporter lost ~29 GB across
+ * two files that way, with nothing warning them and nothing indicating the bytes were
+ * still on disk.
+ *
+ * The two obvious repairs are both unsafe: reusing the old entry under the new identity
+ * would serve bytes fetched under one auth identity to a request made under another, which
+ * is exactly what folding headers into the key prevents. So this does not try to rescue the
+ * transfer — it exists so the caller can be told BEFORE the respawn, while waiting is still
+ * an option. Afterwards the choice is gone, which is what happened to the reporter.
+ *
+ * NEVER REPORTS THE URL. A download URL can carry query-string auth, and this string ends
+ * up in a chat transcript — the filename and the byte count are what the decision needs.
+ */
+export function downloadsAtRiskOfRespawn(
+  /**
+   * Injectable for tests. Mocking `listDownloadJobs` does NOT work here: it is called from
+   * inside this module, and vi.mock replaces a module's EXPORT, not its internal binding.
+   * My first test did exactly that and reported an empty list against working code — the
+   * same "the double agreed with me" failure this session keeps producing, one layer down.
+   */
+  jobs: readonly DownloadJob[] = listDownloadJobs(),
+): { filename: string; bytes: number }[] {
+  const at: { filename: string; bytes: number }[] = [];
+  for (const job of jobs) {
+    if (job.status !== "downloading") continue;
+    const progress = readDownloadProgress(job.progressId ?? job.trayId);
+    at.push({
+      filename: job.filename ?? "(unnamed)",
+      bytes: progress?.downloaded ?? 0,
+    });
+  }
+  return at;
 }
