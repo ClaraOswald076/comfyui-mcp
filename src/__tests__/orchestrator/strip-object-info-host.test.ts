@@ -49,6 +49,10 @@ const REMOTE = "https://abc123-8188.proxy.runpod.net:443";
 /** The canvas the panel reports. Non-empty on purpose — see the harness note. */
 const liveNodes = [
   { id: 1, type: "KSampler", widgets_values: [0, "fixed", 20, 8, "euler", "normal", 1], inputs: [], outputs: [] },
+  // A SECOND type, so "the map is missing one of this graph's types" is a state the
+  // fixtures can actually express. With a one-node graph, "missing one" and "covers
+  // nothing" are the same case and the partial-coverage path was untestable.
+  { id: 2, type: "SomeCustomNode", widgets_values: [], inputs: [], outputs: [] },
 ];
 
 /** What the panel answers `graph_get_object_info` with, per test. */
@@ -143,15 +147,35 @@ describe("an /object_info failure names which host it asked (#1359)", () => {
     const text = await stripWithPanelObjectInfo({
       ok: true,
       served_by: REMOTE,
-      object_info: { SomeOtherNode: { input: { required: {} }, output: [], name: "SomeOtherNode" } },
+      // Defines KSampler but NOT SomeCustomNode — the uninstalled-custom-node case.
+      object_info: { KSampler: { input: { required: { seed: ["INT"] } }, output: [], name: "KSampler" } },
     });
     expect(text).not.toMatch(/EMPTY node-definition map/i);
+    expect(text).not.toMatch(/do not describe this canvas/i);
     expect(text).not.toMatch(/nothing was converted/i);
     // ASSERT THE POSITIVE, not just the absence of two error phrases (codex P2). The
     // earlier version passed with the guard removed entirely, because "no error appeared"
     // is true of a great many broken outcomes. The conversion must actually happen and the
     // unknown type must actually be reported.
     expect(text).toMatch(/KSampler/);
+  });
+
+  it("a WELL-FORMED map about a DIFFERENT install is refused (codex: the structural decoy)", async () => {
+    // "at least one entry that looks like a definition" is satisfied by a single unrelated
+    // record while none of THIS canvas's types are present — and the converter then skips
+    // every node and returns an empty workflow that reads as success. A structural decoy is
+    // still a decoy, so the test that matters is coverage of the graph being converted.
+    const text = await stripWithPanelObjectInfo({
+      ok: true,
+      served_by: REMOTE,
+      object_info: {
+        TotallyUnrelated: { input: { required: {} }, output: [], name: "TotallyUnrelated" },
+        AlsoUnrelated: { input: { required: {} }, output: [], name: "AlsoUnrelated" },
+      },
+    });
+    expect(text).toMatch(/do not describe this canvas/i);
+    expect(text).toMatch(/KSampler/); // names what it was looking for
+    expect(text).toMatch(/nothing was converted/i);
   });
 
   it("a 200 ERROR BODY is refused — one key is not a schema", async () => {

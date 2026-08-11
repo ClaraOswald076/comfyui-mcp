@@ -1445,6 +1445,9 @@ export function restartTimeoutFallbackAdvice({
  */
 async function panelObjectInfo(
   ctx: PanelToolCtx,
+  /** The node types on the canvas being converted, so the reply can be judged against the
+   *  graph it is supposed to define rather than against its own shape. */
+  neededTypes: readonly string[] = [],
 ): Promise<{ ok: true; objectInfo: ObjectInfo } | { ok: false; message: string }> {
   let reply: unknown;
   try {
@@ -1558,6 +1561,16 @@ The conversion is refused rather than retried against ` +
   // does). Deliberately not "every entry" — a single malformed record among thousands is a
   // pack's problem and the converter reports it per node, whereas requiring perfection here
   // would refuse a working install over one bad custom node.
+  //
+  // AND THE TEST HAS TO BE ABOUT THIS GRAPH (codex, round 3). "at least one entry that
+  // looks like a definition" is satisfied by a single unrelated record — `{meta: {input:
+  // {}}}` passes — while none of the types this canvas actually uses are present, and the
+  // converter then skips every node and returns the same empty workflow. A structural
+  // decoy is still a decoy.
+  //
+  // So the question asked is the one that matters for a conversion: does this map define
+  // ANY of the node types on the canvas? Zero coverage of a non-empty graph is not a
+  // schema for it, whatever else the payload contains.
   const looksLikeNodeDef = (v: unknown): boolean =>
     !!v && typeof v === "object" && ("input" in (v as object) || "output" in (v as object));
   if (!Object.values(r.object_info).some(looksLikeNodeDef)) {
@@ -1571,6 +1584,29 @@ The conversion is refused rather than retried against ` +
         `error body. Converting against it would silently drop every node and hand back an ` +
         `empty workflow that reads as success, so nothing was converted.`,
     };
+  }
+  // ZERO COVERAGE OF THIS GRAPH is the decisive test, and the one a structural check
+  // cannot make on its own. A payload can be well-formed, non-empty, and about something
+  // else entirely — at which point the converter skips every node and returns an empty
+  // workflow that reads as a success.
+  //
+  // Only a total miss refuses. PARTIAL coverage converts and warns, because an uninstalled
+  // custom node is a real and legitimate case, and refusing a whole strip over one missing
+  // type would be the over-broad direction that makes a guard worse than the bug.
+  if (neededTypes.length > 0) {
+    const covered = neededTypes.filter((t) => t in (r.object_info as Record<string, unknown>));
+    if (covered.length === 0) {
+      return {
+        ok: false,
+        message:
+          `The panel returned node definitions that do not describe this canvas` +
+          (r.served_by ? ` (served from ${r.served_by})` : "") +
+          `: none of its ${neededTypes.length} node type(s) — e.g. ${neededTypes.slice(0, 3).join(", ")} — ` +
+          `appear among the ${Object.keys(r.object_info).length} definition(s) returned. ` +
+          `Converting against it would drop every node and hand back an empty workflow that ` +
+          `reads as success, so nothing was converted.`,
+      };
+    }
   }
   return { ok: true, objectInfo: r.object_info };
 }
@@ -8281,7 +8317,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // DIFFERENT ComfyUI's schema and return a confident, wrong workflow — silently,
           // since the two hosts can both answer and disagree. That is strictly worse than
           // the ECONNREFUSED this issue was filed about, which at least failed loudly.
-          const reply = await panelObjectInfo(ctx);
+          const reply = await panelObjectInfo(ctx, collectNodeTypes(ui));
           if (!reply.ok) return fail(reply.message);
           bulk = reply.objectInfo;
         } else {

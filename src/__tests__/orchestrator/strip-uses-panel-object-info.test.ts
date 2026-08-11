@@ -38,7 +38,9 @@ describe("the live canvas is converted with ITS OWN ComfyUI's definitions (#1359
     expect(at, "the live-canvas discriminator must still exist").toBeGreaterThan(-1);
     const block = src.slice(at, at + 1200);
     expect(block).toMatch(/if \(liveCanvasSource\)/);
-    expect(block).toMatch(/panelObjectInfo\(ctx\)/);
+    // Passes the graph's node types now, so the reply can be judged against the canvas it
+    // is meant to describe rather than against its own shape (codex round 3).
+    expect(block).toMatch(/panelObjectInfo\(ctx, collectNodeTypes\(ui\)\)/);
     // …and the global client is still used for the sources that genuinely belong to it.
     expect(block).toMatch(/getObjectInfo\(\)/);
   });
