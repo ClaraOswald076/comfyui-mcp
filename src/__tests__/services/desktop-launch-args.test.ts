@@ -138,6 +138,22 @@ describe("#848 — the saved launch arguments", () => {
     expect(desktopSavedLaunchArgs(root)).toBeUndefined();
   });
 
+  it("splits the saved string the way a shell would, honouring quotes", () => {
+    // A path with a space splits into fragments that appear nowhere in argv, so a naive
+    // whitespace split reports a setting that IS in force as missing.
+    const root = join(home, "ComfyUI-Installs", "ComfyUI");
+    writeInstallations([
+      localEntry(root, {
+        launchArgs: String.raw`--extra-model-paths-config "C:\my path\extra.yaml" --listen`,
+      }),
+    ]);
+    expect(desktopSavedLaunchArgs(root)?.args).toEqual([
+      "--extra-model-paths-config",
+      String.raw`C:\my path\extra.yaml`,
+      "--listen",
+    ]);
+  });
+
   it("accepts an ARRAY too, rather than assuming the format cannot change", () => {
     const root = join(home, "ComfyUI-Installs", "ComfyUI");
     writeInstallations([localEntry(root, { launchArgs: ["--a", "--b"] })]);
@@ -158,6 +174,34 @@ describe("#848 — the sentence", () => {
     expect(said).not.toMatch(/--enable-manager,|include --enable-manager/);
     // The remedy is the one thing that applies them, and it is not this tool.
     expect(said).toMatch(/quit the ComfyUI Desktop app and relaunch/);
+  });
+
+  it("does NOT claim drift when the same instruction is spelled differently", () => {
+    // The mirror of this bug, pointed at the user. The saved settings are ONE STRING and
+    // argv is already split, so `--port 8000` / `--port=8000` and a quoted path against its
+    // unquoted argv form are the same instruction in different words — and token equality
+    // called every one of them "not in force", which is a confident, checkable, wrong
+    // sentence sending someone to restart Desktop for nothing.
+    expect(
+      describeSavedLaunchArgDrift({ name: "X", args: ["--port=8000"] }, ["main.py", "--port", "8000"]),
+    ).toBe("");
+    expect(
+      describeSavedLaunchArgDrift({ name: "X", args: ["--port", "8000"] }, ["main.py", "--port=8000"]),
+    ).toBe("");
+    // A bare value is an argument to a flag; its formatting varies and it says nothing on
+    // its own, so it is never reported.
+    expect(
+      describeSavedLaunchArgDrift({ name: "X", args: ["--listen", "0.0.0.0"] }, ["main.py", "--listen", "127.0.0.1"]),
+    ).toBe("");
+  });
+
+  it("still reports a whole flag that is absent — the reported case", () => {
+    const said = describeSavedLaunchArgDrift({ name: "X", args: ["--disable-dynamic-vram"] }, [
+      "main.py",
+      "--listen",
+      "127.0.0.1",
+    ]);
+    expect(said).toMatch(/--disable-dynamic-vram/);
   });
 
   it("says NOTHING when there is nothing established", () => {

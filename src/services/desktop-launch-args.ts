@@ -53,6 +53,24 @@ function samePath(a: string, b: string): boolean {
 }
 
 /**
+ * Split the saved string into tokens the way a shell would, honouring quotes.
+ *
+ * `--extra-model-paths-config "C:\my path\x.yaml"` splits on whitespace into three
+ * fragments, none of which appears in argv — so a naive split reports a change that IS in
+ * force as missing, which is this issue's own defect pointed at the user.
+ */
+function splitLaunchArgs(raw: string): string[] {
+  const out: string[] = [];
+  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(raw)) !== null) {
+    const tok = m[1] ?? m[2] ?? m[3];
+    if (tok) out.push(tok);
+  }
+  return out;
+}
+
+/**
  * Does this Desktop record describe the install we are running?
  *
  * Desktop's `installPath` is the install ROOT, and for its own installer layout `main.py`
@@ -105,7 +123,7 @@ export function desktopSavedLaunchArgs(installPath: string | undefined): SavedLa
       const raw = rec.launchArgs;
       const args =
         typeof raw === "string"
-          ? raw.split(/\s+/).filter(Boolean)
+          ? splitLaunchArgs(raw)
           : Array.isArray(raw) && raw.every((t) => typeof t === "string")
             ? (raw as string[]).filter(Boolean)
             : undefined;
@@ -120,6 +138,12 @@ export function desktopSavedLaunchArgs(installPath: string | undefined): SavedLa
   // whose settings the user edited, and picking one would put a specific, checkable
   // sentence in front of them that may be about the other.
   return matches.length === 1 ? matches[0] : undefined;
+}
+
+/** The flag NAME of a token: `--port=8000` and `--port` are the same instruction, and a
+ *  value token has no flag name at all. */
+function flagName(token: string): string {
+  return token.startsWith("-") ? token.split("=")[0] : "";
 }
 
 /**
@@ -140,8 +164,19 @@ export function describeSavedLaunchArgDrift(
   runningArgv: string[] | undefined,
 ): string {
   if (!saved || !saved.args.length || !runningArgv?.length) return "";
-  const running = new Set(runningArgv);
-  const missing = saved.args.filter((tok) => !running.has(tok));
+  // COMPARE FLAGS, NOT TOKENS. The saved settings are one string and argv is already
+  // split, so the same instruction is spelled several ways: `--port 8000` against
+  // `--port=8000`, a quoted path against its unquoted argv form. Token equality called all
+  // of those "not in force" — a confident, checkable, WRONG sentence sending the user to
+  // restart Desktop for nothing, which is this issue's defect pointed back at them.
+  //
+  // Only FLAGS are reported, and only by name. A bare value is an argument to a flag: its
+  // formatting varies, and it says nothing on its own. The reported case is a whole flag
+  // that is absent, which is exactly what #848 was about.
+  const runningFlags = new Set(runningArgv.map(flagName).filter(Boolean));
+  const missing = saved.args
+    .filter((tok) => tok.startsWith("-"))
+    .filter((tok) => !runningFlags.has(flagName(tok)));
   if (!missing.length) return "";
   return (
     ` ComfyUI Desktop's saved launch settings for "${saved.name}" include ` +
