@@ -2036,6 +2036,31 @@ export function buildComfyuiMcpEnv(base: Record<string, string>): Record<string,
     ...(process.env.COMFYUI_MCP_ENV_FILE
       ? { COMFYUI_MCP_ENV_FILE: process.env.COMFYUI_MCP_ENV_FILE }
       : {}),
+    // #873 — THE OPERATOR'S TOOL-SURFACE POLICY, forwarded HERE because this is the one
+    // function BOTH comfyui spawn lanes share.
+    //
+    // I first put this in comfyuiBaseEnv(), which only the Codex/Gemini lane spreads. The
+    // Claude lane — the DEFAULT backend — builds its own literal and calls this function
+    // directly, so it kept spawning a child with all 37 tools while the panel surface was
+    // correctly withheld and logged as withheld. An operator setting PRESET=readonly got
+    // a server that reported itself restricted and still offered restart_comfyui,
+    // install_custom_node and download_model.
+    //
+    // That is the same defect I had just written a commit message about — fixing one of
+    // two registration paths and testing only the one I fixed — committed again, in the
+    // same change, one file over. Two call sites is the bug; the choke point is the fix.
+    // The child's env is CONSTRUCTED rather than inherited (a spread cannot remove a
+    // revoked credential, see below), so an unforwarded variable simply does not exist
+    // over there.
+    ...(process.env.COMFYUI_MCP_TOOL_PRESET
+      ? { COMFYUI_MCP_TOOL_PRESET: process.env.COMFYUI_MCP_TOOL_PRESET }
+      : {}),
+    ...(process.env.COMFYUI_MCP_TOOL_ALLOW
+      ? { COMFYUI_MCP_TOOL_ALLOW: process.env.COMFYUI_MCP_TOOL_ALLOW }
+      : {}),
+    ...(process.env.COMFYUI_MCP_TOOL_DENY
+      ? { COMFYUI_MCP_TOOL_DENY: process.env.COMFYUI_MCP_TOOL_DENY }
+      : {}),
     // KEY NAMES only — never values.
     ...(managed.length ? { [MANAGED_SECRET_KEYS_ENV]: managed.join(",") } : {}),
     ...secrets,
