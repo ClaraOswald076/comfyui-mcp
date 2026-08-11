@@ -40,6 +40,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { waitFor } from "../helpers/wait-for.js";
+import { logger } from "../../utils/logger.js";
 
 /**
  * A real on-disk panel pack under a resolved base. The skew resolver re-reads
@@ -4391,6 +4392,61 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     // The late-but-valid answer must be recoverable via the buffer, then drained.
     await waitFor(() => expect(bridge.takeLateAskReply("ask-xyz")).toBe("Late Pick"));
     expect(bridge.takeLateAskReply("ask-xyz")).toBeUndefined(); // drained once
+  });
+
+  // #1352 — the same recovery for a CREDENTIAL, minus the one property that makes it
+  // durable. A secret card's late answer must be claimable in memory, because a user who
+  // finishes typing a moment late should still have their token applied — and it must
+  // NEVER reach the journal, because `panel_request_secret` exists so the value lands
+  // nowhere it can be read back.
+  it("buffers a late request_secret answer but NEVER hands it to the durable sink", async () => {
+    const sock = await connectPanel("tab-secret", "wf");
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-secret")).toBe(true), {
+      timeout: 3000,
+    });
+    const journaled: unknown[] = [];
+    bridge.setLateAskReplySink((askId, result) => journaled.push({ askId, result }));
+    // Capture every log level for the duration — verified against the real bridge with a
+    // canary token, which is how this assertion earned its place.
+    const logged: unknown[] = [];
+    const levels = ["debug", "info", "warn", "error"] as const;
+    const originals = levels.map((l) => [l, logger[l]] as const);
+    for (const l of levels) {
+      (logger as unknown as Record<string, unknown>)[l] = (...args: unknown[]) => {
+        logged.push(args);
+      };
+    }
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd === "request_secret") {
+        setTimeout(() => {
+          sock.send(JSON.stringify({ rid: msg.rid, ok: true, result: "sk-live-TOKEN" }));
+        }, 80);
+      }
+    });
+
+    await expect(
+      bridge.send(
+        { cmd: "request_secret", ask_id: "secret-1", label: "token" },
+        { tabId: "tab-secret", timeoutMs: 30 },
+      ),
+    ).rejects.toThrow(/did not reply/i);
+
+    // Recoverable in memory: this is what lets a late token still be applied.
+    await waitFor(() => expect(bridge.takeLateAskReply("secret-1")).toBe("sk-live-TOKEN"), {
+      timeout: 3000,
+    });
+    // …and drained on claim, so it does not linger.
+    expect(bridge.takeLateAskReply("secret-1")).toBeUndefined();
+    // THE POINT: the durable journal never saw it. Asserted on the whole payload, not just
+    // the id — a sink that recorded the value under a different key would still be a leak.
+    expect(journaled).toEqual([]);
+    expect(JSON.stringify(journaled)).not.toContain("sk-live-TOKEN");
+    // …and it reached no LOG LINE either, at any level. A journal is the obvious place a
+    // credential must not land; a debug line is the easy one to add later without noticing.
+    expect(JSON.stringify(logged)).not.toContain("sk-live-TOKEN");
+    for (const [l, fn] of originals) (logger as unknown as Record<string, unknown>)[l] = fn;
+    bridge.setLateAskReplySink(() => {});
   });
 
   // The buffer only helps a caller that is still alive to poll it, and #486 is

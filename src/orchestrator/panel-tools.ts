@@ -9359,11 +9359,61 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         hint: z.string().optional().describe("Optional reassurance/help text shown under the input."),
       },
       async (args: A, ctx) => {
+        // #1352 — A HUMAN FETCHING A CREDENTIAL IS NOT A STALLED OPERATION, and a flat
+        // 300s treated it as one.
+        //
+        // Waiting longer is NOT available: the enclosing MCP `tools/call` is killed at
+        // ~300s (see ASK_TOTAL_BUDGET_CAP_MS), so this card already sat at the framework
+        // ceiling. A bigger number only moves the kill from our timer to theirs, where the
+        // answer is lost instead of handled — the #360 lesson the confirm cards learned and
+        // this one did not.
+        //
+        // So it gets the STRUCTURE the ask path has: a deadline clamped under the budget,
+        // then a bounded grace poll of the late-answer buffer. Someone who finishes typing
+        // a second after the deadline now has their token APPLIED rather than discarded.
+        const timing = getAskTiming();
+        const budgetEnd = Date.now() + timing.deadlineMs + timing.graceMs;
+        // The ask_id is what makes a late answer recoverable at all (#486) — the bridge
+        // only buffers a reply whose command carried one, and this card never sent one.
+        //
+        // The bridge treats a `request_secret` card as SENSITIVE from the command name: it
+        // buffers the late value in memory but never hands it to the DURABLE late-answer
+        // journal. A credential must not be written down, which is why this tool exists.
+        const askId = randomUUID();
+        let arrivedLate = false;
+        /** A recovered answer must never read as an ordinary one (#486's rule, here). */
+        const lateAware = (r: ToolResult): ToolResult => {
+          if (!arrivedLate) return r;
+          // ARRIVAL ONLY — never "and was applied". This prefixes EVERY outcome, failures
+          // included: a token that lands during the grace and then fails to persist
+          // (`secretNotPersisted`, a damaged store, an unconfirmed write) would otherwise
+          // be announced as applied by the very message explaining that it was not. The
+          // rest of the result already says what happened; this says only WHEN it arrived.
+          const note =
+            `(This token arrived AFTER the ${Math.round(timing.deadlineMs / 1000)}s card ` +
+            `deadline, within the grace period that follows it.) `;
+          const [first, ...rest] = r.content;
+          return first && first.type === "text"
+            ? { ...r, content: [{ ...first, text: note + first.text }, ...rest] }
+            : r;
+        };
+        const run = async (): Promise<ToolResult> => {
         try {
-          const secret = await ctx.bridge.send(
-            { cmd: "request_secret", label: args.label, hint: args.hint },
-            { tabId: ctx.tabId, timeoutMs: 300000 },
-          );
+          let secret: unknown;
+          try {
+            secret = await ctx.bridge.send(
+              { cmd: "request_secret", ask_id: askId, label: args.label, hint: args.hint },
+              { tabId: ctx.tabId, timeoutMs: timing.deadlineMs },
+            );
+          } catch (err) {
+            // ONLY a reply timeout is recoverable. Any other failure — no panel, transport
+            // down — is not "they are still typing" and must not be waited out.
+            if (!isReplyTimeoutError(err)) throw err;
+            const late = await pollLateAskReply(ctx.bridge, askId, timing, budgetEnd);
+            if (late === undefined) throw err;
+            secret = late;
+            arrivedLate = true;
+          }
           // A whitespace-only paste must be treated as "nothing entered": it
           // would write and read back cleanly (so the save would be CONFIRMED)
           // while every reader treats a blank as absent, leaving the credential
@@ -9483,28 +9533,35 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // sending someone to fix one is the #1332 defect in a new place.
           //
           // It also has to say what happens to a value entered LATE, because that is the
-          // question the caller will actually have. MEASURED: this card is sent as a raw
-          // `request_secret` command with NO ask_id, and the late-reply buffer
-          // (takeLateAskReply) is keyed BY ask id — so a value typed after the timeout
-          // has no path back to this call. It is discarded, and the tool must be called
-          // again. "It may still arrive" would be a guess, and an expensive one: the
-          // user would wait for a save that cannot happen.
+          // question the caller will actually have. That answer CHANGED in #1352, and this
+          // comment changes with it: the card now carries an ask_id and this handler polls
+          // the late-answer buffer for a bounded grace, so a value typed shortly after the
+          // deadline IS applied. Reaching this branch means the grace elapsed too, and only
+          // then is it true that nothing more can reach this call.
+          //
+          // The previous text asserted the discard as a MEASURED fact, correctly at the
+          // time. A message that outlives the behaviour it describes is worse than none —
+          // someone stops waiting for a save that now works.
           if (isReplyTimeoutError(err)) {
             return fail(
-              `The secret card was not answered within 300s, so NOTHING was saved and no ` +
-                `credential was read. That is very likely just time — the card asks for a ` +
+              `The secret card went unanswered — through its ` +
+                `${Math.round(timing.deadlineMs / 1000)}s deadline AND the ` +
+                `${Math.round(timing.graceMs / 1000)}s grace after it — so NOTHING was saved and ` +
+                `no credential was read. That is very likely just time: the card asks for a ` +
                 `token, and finding one in a password manager or a billing console can take ` +
                 `longer than that. It does NOT mean the tab is frozen, and it does NOT mean ` +
                 `the user declined.\n\n` +
-                `A value typed into that card NOW cannot reach this call: it carries no id ` +
-                `this reply could be matched to, so a late answer is discarded rather than ` +
-                `saved. Ask whether they still want to set it and call panel_request_secret ` +
+                `A value typed into that card DURING the grace WOULD have been applied — that is ` +
+                `what the grace is for. Past it there is no path back to this call, so ask ` +
+                `whether they still want to set it and call panel_request_secret ` +
                 `again when they are ready to paste — the value goes straight from the masked ` +
                 `field into storage, and must never be typed into the conversation.`,
             );
           }
           return fail(err);
         }
+        };
+        return lateAware(await run());
       },
     ),
     def(
