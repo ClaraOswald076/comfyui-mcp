@@ -88,6 +88,23 @@ describe("#1384 — the knowledge-parity mock keeps up with the fences", () => {
     );
   });
 
+  it("the mock's socket sends an Origin, because a real panel's does", () => {
+    // The THIRD fence this mock had to stop failing. A browser sets Origin on the upgrade
+    // and forbids page JS from overriding it, so the bridge treats it as trusted
+    // provenance and refuses every graph EDIT without one. The `ws` library sends none by
+    // default, so the mock read as a relay connection of unknown provenance and the smoke
+    // reported a knowledge failure that was really its own handshake.
+    //
+    // Asserted here rather than left to the run, because the failure mode is a PASS on the
+    // read-only half with "built nodes on the live canvas: NO" — which looks like a model
+    // that did not try.
+    // NOT comment-stripped, unlike the assertions above: the naive `//.*` strip treats the
+    // `//` in `ws://127.0.0.1` as a line comment and deletes the rest of the line — the
+    // construction being asserted. A comment cannot satisfy this pattern anyway, because
+    // the match must START at `new WebSocket(`.
+    expect(source()).toMatch(/new WebSocket\([\s\S]{0,200}?headers:\s*\{\s*Origin:/);
+  });
+
   it("the mock implements the commands the scenario drives", () => {
     // graph_load was missing, so the preferred one-shot panel_load_workflow(pack:…) path
     // could not complete and the smoke could only reach the capability by the long route —

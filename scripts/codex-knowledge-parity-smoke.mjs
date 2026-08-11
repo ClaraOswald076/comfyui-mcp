@@ -33,6 +33,9 @@ const MOCK_PANEL_VERSION = "0.13.0";
 const MOCK_WORKFLOW_UUID = "11111111-1111-4111-8111-111111111111";
 
 const PORT = Number(process.env.TEST_PORT || 9151);
+/** The MCP console, which the orchestrator binds LAST — the honest readiness signal.
+ *  Bridge is PORT, panel MCP is PORT+1, pairing is PORT+2, console is PORT+3. */
+const CONSOLE_PORT = PORT + 3;
 const MCP_ENTRY = fileURLToPath(new URL("../dist/index.js", import.meta.url));
 const COMFY_PATH = fileURLToPath(new URL("..", import.meta.url)); // a real dir w/ packs/ + plugin/
 const DEAD_COMFY = "http://127.0.0.1:9";
@@ -89,7 +92,29 @@ function makeGraph() {
     workflow_save_as: ({ name }) => ({ saved_as: `workflows/${name}.json` }),
     workflow_new: () => ({ created: true }),
     workflow_open: ({ path }) => ({ opened: { path } }),
-    workflow_list: () => ({ active: { path: "workflows/current.json", filename: "current.json", key: "cur" }, open: [] }),
+    // The ACTIVE record must carry a workflow_uuid (#1384). Without one the tab is
+    // identity-less, so `rebindWorkflowFence` reports `no_uuid` and every graph WRITE stays
+    // refused — the same class of refusal the report opened with, one fence further in.
+    // The refusal is correct product behaviour: the mock was the thing lying, by claiming a
+    // panel version new enough to stamp per-workflow identity while advertising none.
+    workflow_list: () => ({
+      active: {
+        path: "workflows/current.json",
+        filename: "current.json",
+        key: "cur",
+        workflow_uuid: MOCK_WORKFLOW_UUID,
+      },
+      workflows: [
+        {
+          path: "workflows/current.json",
+          filename: "current.json",
+          key: "cur",
+          workflow_uuid: MOCK_WORKFLOW_UUID,
+          active: true,
+        },
+      ],
+      open: [],
+    }),
     graph_select_nodes: ({ node_ids }) => ({ selected: node_ids }),
     set_todo: ({ items }) => ({ ok: true, count: (items || []).length }),
     ask_user: (m) => (m.options && m.options[0] && m.options[0].label) || "yes",
@@ -115,7 +140,16 @@ function runScenario(task) {
     const commands = [];
     const says = [];
     let done = false, idleTimer = null;
-    const ws = new WebSocket(`ws://127.0.0.1:${PORT}`);
+    // SEND AN ORIGIN, because a real panel does (#1384). A browser sets this header on the
+    // upgrade and forbids page JS from overriding it, so the bridge treats it as trusted
+    // provenance of the page the socket runs in — and refuses every graph EDIT without one.
+    // The `ws` library sends no Origin by default, so the mock read as a relay connection
+    // of unknown provenance and the smoke reported a knowledge failure that was really its
+    // own handshake. The refusal is correct product behaviour; the mock was the thing
+    // pretending to be a browser without doing what a browser does.
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}`, {
+      headers: { Origin: DEAD_COMFY },
+    });
     const hard = setTimeout(finish, CAP_MS);
     function finish() {
       if (done) return; done = true;
@@ -200,7 +234,16 @@ async function main() {
   const orch = spawn(process.execPath, [MCP_ENTRY, "--panel-orchestrator"], { env, stdio: ["ignore", logFd, logFd] });
   let exitCode = 1;
   try {
+    // WAIT FOR THE LAST PORT UP, NOT THE FIRST (#1384).
+    //
+    // The bridge binds first and the MCP console binds last, ~4 seconds apart on this
+    // machine. Probing the bridge alone declared the orchestrator "up" while it was still
+    // booting, so the scenario's user_message landed before the per-tab agent existed and
+    // went nowhere: the run reported "Codex consulted bundled skills: NO" with an EMPTY
+    // tool trace — a harness race that, in the output, is indistinguishable from the
+    // knowledge failure this smoke exists to detect.
     await waitForPort(PORT);
+    await waitForPort(CONSOLE_PORT);
     console.log("[kp-smoke] orchestrator up.\n");
 
     console.log("• Scenario: set up a krea2 workflow on my canvas");
