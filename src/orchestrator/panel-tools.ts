@@ -142,6 +142,11 @@ import {
 } from "../services/process-control.js";
 import { resetManagerApiCache } from "../services/manager-api-cache.js";
 import {
+  desktopSavedLaunchArgs,
+  describeSavedLaunchArgDrift,
+} from "../services/desktop-launch-args.js";
+import {
+  config,
   isRemoteMode,
   isCloudMode,
   getBootLocalComfyUIBaseUrl,
@@ -11824,7 +11829,20 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             getComfyuiTargetGeneration() === preflightArgvGeneration &&
             sameHttpBase(getComfyUIBaseUrl(), healthBase)
           ) {
-            argvNote = describeArgvDrift(preflightArgv, afterArgv, preflightIsDesktop);
+            argvNote = describeArgvDrift(
+              preflightArgv,
+              afterArgv,
+              preflightIsDesktop,
+              // #848: BOTH restart paths, or the answer depends on which one the user
+              // happened to take. This is the panel tool's own path; the service's
+              // Manager-reboot path passes the same finding.
+              preflightIsDesktop
+                ? describeSavedLaunchArgDrift(
+                    desktopSavedLaunchArgs(config.comfyuiPath ?? undefined),
+                    afterArgv,
+                  )
+                : "",
+            );
           }
         }
         return ok({
