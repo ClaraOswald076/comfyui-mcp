@@ -14,7 +14,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createServer } from "node:net";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { UiBridge } from "../../services/ui-bridge.js";
@@ -22,7 +23,9 @@ import { trFor, __resetI18nForTest } from "../../i18n/index.js";
 import {
   buildStartFailureNotice,
   startFailureHint,
+  startFailureSay,
 } from "../../orchestrator/start-failure-notice.js";
+import { openAiKeyProvider } from "../../services/openai-provider-registry.js";
 
 let bridge: UiBridge;
 let port: number;
@@ -122,12 +125,30 @@ describe("tabLocale — where a say frame's language comes from", () => {
     sock.close();
   });
 
-  it("answers English for an unknown, ambiguous or disconnected tab instead of throwing", () => {
-    // resolveTarget THROWS for all three. Every caller here is mid-failure-report, so the
-    // lookup absorbs it: a frame in the wrong language is a blemish, an exception is a bug.
+  it("answers English for an unknown tab instead of throwing, even with others connected", async () => {
+    // With NOTHING connected this passes for an uninteresting reason, so a real tab is
+    // connected first: the question is whether an unknown id borrows a stranger's language.
+    // resolveTarget throws for it, and every caller here is mid-failure-report — so the
+    // lookup absorbs it. A frame in the wrong language is a blemish; an exception is a bug.
     expect(() => bridge.tabLocale("never-existed")).not.toThrow();
     expect(bridge.tabLocale("never-existed")).toBe("en");
-    expect(bridge.tabLocale("")).toBe("en");
+    const sock = await open();
+    await hello(sock, "tab-only", { locale: "ko" });
+    expect(() => bridge.tabLocale("never-existed")).not.toThrow();
+    expect(bridge.tabLocale("never-existed")).toBe("en");
+    sock.close();
+  });
+
+  it("answers ambiguous prefixes in English rather than picking one of the matches", async () => {
+    const a = await open();
+    const b = await open();
+    await hello(a, "tab-amb-1", { locale: "ko" });
+    await hello(b, "tab-amb-2", { locale: "fr" });
+    // "tab-amb" prefixes both, which resolveTarget refuses — a push would refuse too.
+    expect(() => bridge.tabLocale("tab-amb")).not.toThrow();
+    expect(bridge.tabLocale("tab-amb")).toBe("en");
+    a.close();
+    b.close();
   });
 
   it("keeps the language across a same-socket re-hello that omits it", async () => {
@@ -216,9 +237,11 @@ describe("say frames degrade to English rather than failing", () => {
   });
 
   it("renders intact text for a locale with no catalog, and never a key or an empty bubble", () => {
+    // Exercises `startFailureSay` — the function the orchestrator ACTUALLY calls per tab —
+    // rather than buildStartFailureNotice, which has no locale of its own precisely so that a
+    // test cannot pin a path production never takes.
     for (const locale of ["ko", "ar", "zh-TW", "kl-GL", "", "not-a-locale"]) {
-      const { frames } = buildStartFailureNotice("tab-1::openrouter", "401", "claude", locale);
-      const text = (frames[0] as { text: string }).text;
+      const text = startFailureSay("openrouter", "401", locale);
       expect(text).toContain("OPENROUTER_API_KEY");
       expect(text).not.toContain("say.");
       expect(text).not.toContain("{");
@@ -228,14 +251,23 @@ describe("say frames degrade to English rather than failing", () => {
   it("keeps the ⚠️ status marker outside the translatable span", () => {
     // The emoji is what the eye and the panel's bubble styling key on; it means the same
     // thing in every language and must survive a catalog that translates the prose.
-    const { frames } = buildStartFailureNotice("t::claude", "boom", "claude", "ja");
-    expect((frames[0] as { text: string }).text.startsWith("⚠️ ")).toBe(true);
+    expect(startFailureSay("claude", "boom", "ja").startsWith("⚠️ ")).toBe(true);
+  });
+
+  it("delivers the SAME sentence the frame builder holds, so the two cannot drift", () => {
+    // The orchestrator re-renders per recipient instead of pushing frames[0]. If those two
+    // ever stopped sharing one function, the tested text and the delivered text would differ
+    // with everything still green.
+    const { frames } = buildStartFailureNotice("t::custom", "ECONNREFUSED", "claude");
+    expect((frames[0] as { text: string }).text).toBe(
+      startFailureSay("custom", "ECONNREFUSED"),
+    );
   });
 
   it("leaves the ack and turn frames alone — they are machine state, not prose", () => {
     // `kind` is string-matched by the panel and these read as machine errors; translating
     // them would break the parse while looking like a courtesy.
-    const { frames } = buildStartFailureNotice("t::claude", "boom", "claude", "ko");
+    const { frames } = buildStartFailureNotice("t::claude", "boom", "claude");
     expect(frames[1]).toEqual({ type: "ack", ok: false, kind: "degraded" });
     expect(frames[2]).toEqual({ type: "turn", state: "done" });
   });
@@ -243,6 +275,18 @@ describe("say frames degrade to English rather than failing", () => {
   it("passes the provider label and env var through untranslated — they are typed, not read", () => {
     const hint = startFailureHint("moonshot", "ru");
     expect(hint).toContain("MOONSHOT_API_KEY");
+  });
+
+  it("keeps every registry degraded message shaped like the ones beside it", () => {
+    // The glm/kimi/moonshot/minimax bubbles live in a data table and carry their own leading
+    // ⚠️; the call site strips it so all 15 say.degraded.* fallbacks have one shape and a
+    // catalog never has to guess which include the marker. If the table stopped leading with
+    // ⚠️, that strip would silently become a no-op and the key would gain a second one.
+    for (const backend of ["glm", "kimi", "moonshot", "minimax"]) {
+      const reg = openAiKeyProvider(backend);
+      expect(reg, `${backend} is no longer a registered key provider`).toBeTruthy();
+      expect(reg!.degradedMessage.startsWith("⚠️ "), `${backend} degradedMessage`).toBe(true);
+    }
   });
 
   it("renders a counted string from a plain-string fallback, so English keeps its '(s)' hedge", () => {
@@ -265,21 +309,100 @@ describe("say frames degrade to English rather than failing", () => {
 });
 
 /**
- * The mechanism above is only worth having if the CALL SITES use it, and nothing else in the
- * suite would notice if one stopped: a deleted `trFor(` wrapper leaves correct English, a
- * passing type-check and a green run — the string is simply never translatable again. The
- * same hole swallows a NEW `say` site added later by someone who has not read this file.
+ * THE ROT GUARD. The mechanism above is only worth having if the CALL SITES use it, and
+ * nothing else in the suite would notice if one stopped: a deleted `trFor(` wrapper leaves
+ * correct English, a passing type-check and a green run — the string is simply never
+ * translatable again. The same hole swallows a NEW `say` site added later by someone who has
+ * not read this file.
  *
- * So this asserts on the SOURCE, with an ENUMERATED exemption list rather than a keyword
- * heuristic: a keyword ("text:", "message") would quietly excuse a genuinely untranslated
- * site, which is exactly the failure it exists to catch. Each exemption must still MATCH
- * something — a stale one that no longer corresponds to real code is itself a failure, or the
- * list would silently grant amnesty to whatever moved into its place.
+ * Two things make this guard honest rather than decorative, and both were added only after a
+ * mutation proved the earlier version wrong:
+ *
+ *   - It reads THE FRAME'S OWN `text:` VALUE, not a character window around the marker. Any
+ *     window wide enough to hold a multi-line frame also holds the NEXT frame's translator
+ *     call, and an untranslated `say` inserted just before a translated one sailed through.
+ *     The value is bounded by indentation: prettier puts every continuation line deeper than
+ *     the `text:` line, and the next thing at that indent or shallower ends the expression.
+ *   - Each exemption is bound to ONE SITE, by position, not to a neighbourhood. The collar
+ *     that let both `pushSayToConversation` fragments count as "used" was equally happy to
+ *     excuse an untranslated frame dropped between them.
+ *
+ * Exemptions are ENUMERATED rather than pattern-matched: a keyword rule ("text:", "message")
+ * would quietly excuse a genuinely untranslated site, which is the exact failure this exists
+ * to catch. Every entry must still MATCH live code, so a stale one is a failure rather than a
+ * standing amnesty for whatever moved into its place.
  */
-const srcOf = (rel: string): string =>
-  readFileSync(fileURLToPath(new URL(`../../${rel}`, import.meta.url)), "utf8");
+const SRC_ROOT = fileURLToPath(new URL("../../", import.meta.url));
+const srcOf = (rel: string): string => readFileSync(join(SRC_ROOT, rel), "utf8");
 
-/** `say` sites whose text is composed elsewhere, each with the reason it is not wrapped here. */
+/** Every non-test source file, so a new module that emits `say` frames cannot slip past an
+ *  allowlist — start-failure-notice.ts already emits one and an earlier allowlist missed it. */
+function sourceFiles(dir = SRC_ROOT, out: string[] = []): string[] {
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, e.name);
+    if (e.isDirectory()) {
+      if (e.name !== "__tests__" && e.name !== "node_modules") sourceFiles(full, out);
+    } else if (e.name.endsWith(".ts") && !e.name.endsWith(".test.ts")) {
+      out.push(relative(SRC_ROOT, full).split("\\").join("/"));
+    }
+  }
+  return out;
+}
+
+const SAY_MARKER = `type: "say"`;
+
+/** Byte offsets of every `say` frame in `src`. */
+function saySites(src: string): number[] {
+  const out: number[] = [];
+  for (
+    let at = src.indexOf(SAY_MARKER);
+    at !== -1;
+    at = src.indexOf(SAY_MARKER, at + SAY_MARKER.length)
+  ) {
+    out.push(at);
+  }
+  return out;
+}
+
+/**
+ * The `text:` value expression of the frame at `at` — nothing before it, and nothing from the
+ * frame after it.
+ *
+ * Bounded by INDENTATION rather than brace matching: braces appear inside these strings
+ * (`{count}`, `${trFor(`), so a depth counter would need a full string/template scanner to be
+ * trustworthy, whereas prettier's layout is already unambiguous. A one-line frame yields the
+ * rest of its line, which is exactly the right answer for `text: degradedText }, panelTab);`.
+ */
+function sayTextExpression(src: string, at: number): string {
+  const lines = src.split("\n");
+  const lineOf = (off: number) => src.slice(0, off).split("\n").length - 1;
+  const indentOf = (l: string) => l.length - l.trimStart().length;
+  const markerLine = lineOf(at);
+  // `text` may be on the marker's own line or a few lines below it (a comment can sit
+  // between). Stop at the first line that dedents out of the frame literal.
+  const frameIndent = indentOf(lines[markerLine]);
+  let textLine = -1;
+  let col = -1;
+  for (let i = markerLine; i < lines.length && i < markerLine + 12; i++) {
+    if (i > markerLine && lines[i].trim() && indentOf(lines[i]) < frameIndent) break;
+    const m = /\btext\b\s*[:,}]/.exec(lines[i]);
+    if (m && (i > markerLine || m.index > at - src.slice(0, at).lastIndexOf("\n") - 1)) {
+      textLine = i;
+      col = m.index;
+      break;
+    }
+  }
+  if (textLine === -1) return "";
+  const baseIndent = indentOf(lines[textLine]);
+  const parts = [lines[textLine].slice(col)];
+  for (let i = textLine + 1; i < lines.length; i++) {
+    if (lines[i].trim() && indentOf(lines[i]) <= baseIndent) break;
+    parts.push(lines[i]);
+  }
+  return parts.join("\n");
+}
+
+/** A `say` site whose text is composed elsewhere, with the reason it carries no `trFor`. */
 const SAY_EXEMPTIONS: Array<{ file: string; fragment: string; why: string }> = [
   {
     file: "orchestrator/index.ts",
@@ -294,79 +417,91 @@ const SAY_EXEMPTIONS: Array<{ file: string; fragment: string; why: string }> = [
   {
     file: "orchestrator/index.ts",
     fragment: `{ type: "say", text, id: meta?.id`,
-    why: "the AGENT's own reply text — a model wrote it, in whatever language it was asked in",
+    why: "the AGENT's own reply — a model wrote it, in whatever language it was asked in",
   },
   {
     file: "orchestrator/index.ts",
     fragment: `{ type: "say", text: corrected }`,
-    why: "bannerCorrection() in ready-banner.ts owns that string",
+    why: "TRANSLATED ELSEWHERE (pending): bannerCorrection() in ready-banner.ts owns it; that file has no i18n yet",
   },
   {
     file: "orchestrator/index.ts",
     fragment: `{ type: "say", text: parts.join(" ") }`,
-    why: "the parts are each trFor'd where they are built, a few lines above",
+    why: "each part is trFor'd a few lines above, where it is built",
   },
   {
     file: "orchestrator/index.ts",
     fragment: "${sync.message}",
-    why: "panel-sync owns that message; only the ⚠️ marker is added here",
+    why: "TRANSLATED ELSEWHERE (pending): panel-sync owns the message; only the ⚠️ marker is added here",
   },
   {
     file: "orchestrator/index.ts",
     fragment: "readyBannerText(backend, bannerLabel, customBaseUrl)",
-    why: "ready-banner.ts owns the greeting",
+    why: "TRANSLATED ELSEWHERE (pending): ready-banner.ts owns the greeting; that file has no i18n yet",
   },
   {
     file: "orchestrator/index.ts",
     fragment: `{ type: "say", text: degradedText }`,
-    why: "degradedText is assembled with trFor in the ternary chain just above",
+    why: "every branch of the ternary above goes through dtr() — including the registry one",
   },
   {
     file: "orchestrator/index.ts",
     fragment: `announce: (text) => void bridge.push({ type: "say", text })`,
-    why: "self-restarter owns the update announcement, and it broadcasts to every tab",
+    why: "TRANSLATED ELSEWHERE (pending): self-restarter owns it, and it broadcasts to every tab at once",
+  },
+  {
+    file: "orchestrator/start-failure-notice.ts",
+    fragment: "text: startFailureSay(backend, message) }",
+    why: "startFailureSay, defined just above in this same file, IS the trFor call",
   },
 ];
 
 describe("every say frame is wired to the per-tab translator", () => {
-  for (const file of ["orchestrator/index.ts", "services/ui-bridge.ts"]) {
+  const filesWithSay = sourceFiles().filter((f) => srcOf(f).includes(SAY_MARKER));
+
+  it("scans every source file that emits a say frame, not an allowlist", () => {
+    // An allowlist of two files missed start-failure-notice.ts, which emits one. A new module
+    // that composes frames would be invisible the same way.
+    expect(filesWithSay.length).toBeGreaterThanOrEqual(3);
+    for (const f of ["orchestrator/index.ts", "services/ui-bridge.ts", "orchestrator/start-failure-notice.ts"]) {
+      expect(filesWithSay, `${f} emits say frames and must be scanned`).toContain(f);
+    }
+  });
+
+  for (const file of filesWithSay) {
     it(`${file}: no untranslated say site`, () => {
       const src = srcOf(file);
+      const sites = saySites(src);
       const exemptions = SAY_EXEMPTIONS.filter((e) => e.file === file);
+
+      // Bind each exemption OCCURRENCE to exactly one site: the last marker at or before the
+      // fragment's end. A fragment that starts before its marker (`announce: (text) => …`) and
+      // one that trails it (`${sync.message}`) both land on their own frame, and neither can
+      // reach the frame next door.
+      const excused = new Map<number, string>();
       const unmatched = new Set(exemptions.map((e) => e.fragment));
-      const marker = `type: "say"`;
-      const sites: number[] = [];
-      for (let at = src.indexOf(marker); at !== -1; at = src.indexOf(marker, at + marker.length)) {
-        sites.push(at);
-      }
-      for (const [n, at] of sites.entries()) {
-        // Bounded by the NEXT say site, not by a fixed character budget. A fixed window let a
-        // neighbouring translated frame vouch for an untranslated one — verified by mutation:
-        // an untranslated say inserted immediately before a translated one passed. Ending the
-        // window where the next frame begins makes each site answer for itself.
-        const next = sites[n + 1] ?? src.length;
-        const body = src.slice(at, Math.min(next, at + 900));
-        // A tight collar for the exemptions: an exempt fragment can start just before the
-        // marker (`announce: (text) => …`) or land just after it (`${sync.message}`), but it
-        // must belong to THIS frame — a wide window would let one exemption excuse the frame
-        // next to it. Every exemption visible here counts as USED, not just the first: two
-        // say sites can sit three lines apart (pushSayToConversation's park and fan-out paths
-        // do), and claiming only one would report the other as stale forever.
-        const collar = src.slice(Math.max(0, at - 80), at + 120);
-        const matched = exemptions.filter((e) => collar.includes(e.fragment));
-        for (const e of matched) unmatched.delete(e.fragment);
-        if (matched.length === 0) {
-          expect(
-            body,
-            `an untranslated say frame at ${file}:${src.slice(0, at).split("\n").length} — ` +
-              "wrap it in trFor(bridge.tabLocale(<tab>), …), or add it to SAY_EXEMPTIONS with a reason",
-          ).toContain("trFor(");
+      for (const e of exemptions) {
+        for (let f = src.indexOf(e.fragment); f !== -1; f = src.indexOf(e.fragment, f + 1)) {
+          const end = f + e.fragment.length;
+          const site = [...sites].reverse().find((at) => at <= end && at >= f - 200);
+          if (site !== undefined) {
+            excused.set(site, e.why);
+            unmatched.delete(e.fragment);
+          }
         }
       }
-      expect(
-        sites.length,
-        `no say frames found in ${file} — the marker must have changed`,
-      ).toBeGreaterThan(0);
+
+      for (const at of sites) {
+        if (excused.has(at)) continue;
+        const line = src.slice(0, at).split("\n").length;
+        expect(
+          sayTextExpression(src, at),
+          `an untranslated say frame at ${file}:${line} — wrap it in ` +
+            "trFor(bridge.tabLocale(<tab>), …), or add it to SAY_EXEMPTIONS with a reason",
+        ).toContain("trFor(");
+      }
+
+      expect(sites.length, `no say frames in ${file} — the marker must have changed`).toBeGreaterThan(0);
       expect(
         [...unmatched],
         "stale SAY_EXEMPTIONS entries: they match no code, so they excuse whatever moved in",
@@ -374,16 +509,33 @@ describe("every say frame is wired to the per-tab translator", () => {
     });
   }
 
+  it("bounds a frame's text at its own expression, not at a character window", () => {
+    // The property this guard depends on, asserted directly rather than trusted: the extracted
+    // value must stop before the NEXT say frame's translator call, or a neighbour vouches for
+    // an untranslated site (which is exactly how the previous version passed a mutation).
+    const src = srcOf("orchestrator/index.ts");
+    const sites = saySites(src);
+    for (const [n, at] of sites.entries()) {
+      const next = sites[n + 1];
+      if (next === undefined) continue;
+      const expr = sayTextExpression(src, at);
+      expect(expr, `no text expression found for the say frame at index ${n}`).not.toBe("");
+      // Where the extracted expression actually ENDS in the file — not `at + length`, which
+      // would understate it, since the expression begins at `text:`, some way past the marker.
+      const end = src.indexOf(expr, at) + expr.length;
+      expect(
+        end,
+        `the text expression at index ${n} (line ${src.slice(0, at).split("\n").length}) ` +
+          "runs into the next say frame, so that frame's translator would vouch for this one",
+      ).toBeLessThanOrEqual(next);
+    }
+  });
+
   it("uses trFor (the destination tab's language), never tr (the terminal's)", () => {
     // `tr()` follows LANG/--lang on the machine running the orchestrator. A say frame naming
     // "Settings → OpenRouter" in the server operator's language points at a control the
     // panel's user cannot find — the whole reason those two calls are separate.
-    for (const file of [
-      "orchestrator/index.ts",
-      "services/ui-bridge.ts",
-      "orchestrator/start-failure-notice.ts",
-    ]) {
-      expect(srcOf(file), `${file} must import trFor`).toMatch(/import \{[^}]*\btrFor\b/);
+    for (const file of filesWithSay) {
       expect(srcOf(file), `${file} must not use the process-locale tr()`).not.toMatch(
         /[^A-Za-z0-9_.$]tr\(/,
       );
@@ -405,7 +557,9 @@ describe("every say frame is wired to the per-tab translator", () => {
       srcOf("orchestrator/index.ts") +
       srcOf("services/ui-bridge.ts") +
       srcOf("orchestrator/start-failure-notice.ts");
-    const keys = [...src.matchAll(/trFor\([\s\S]{0,80}?"([a-z][\w.]*)"/g)].map((m) => m[1]);
+    // Backtick keys count too: `say.degraded.${backend}` builds 15 keys from one call site,
+    // and a quote-only regex would leave all 15 unguarded.
+    const keys = [...src.matchAll(/trFor\([\s\S]{0,80}?["`]([a-z][\w.]*)/g)].map((m) => m[1]);
     expect(keys.length, "no trFor keys found — the say frames lost their wrappers").toBeGreaterThan(20);
     for (const k of keys) {
       expect(k, `${k} is not under the say. prefix this unit owns`).toMatch(/^say\./);

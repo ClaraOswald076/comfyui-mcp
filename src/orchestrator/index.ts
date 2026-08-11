@@ -3467,8 +3467,8 @@ export async function runPanelOrchestrator(): Promise<void> {
                   {
                     type: "say",
                     // `detail` is the underlying failure's own text (untranslated, from
-                    // whatever threw) and is substituted last so nothing inside it is
-                    // mistaken for a placeholder.
+                    // whatever threw). trFor substitutes in ONE pass, so a brace sequence
+                    // inside it is never mistaken for a placeholder.
                     text: `⚠️ ${trFor(
                       syncLocale,
                       "say.panel_sync_failed",
@@ -3963,13 +3963,20 @@ export async function runPanelOrchestrator(): Promise<void> {
             // Studio → Developer → Start Server", "Settings → Custom endpoint"), so it
             // renders in THIS tab's panel language. CLI invocations, env-var names, URLs and
             // model ids are interpolated or quoted literally and never translated — they are
-            // typed, not read. `reg.degradedMessage` comes from the key-provider registry and
-            // is still English (that table is not part of this unit).
+            // typed, not read.
             const dLocale = bridge.tabLocale(panelTab);
             const dtr = (key: string, en: string, vars?: Record<string, string | number>): string =>
               `⚠️ ${trFor(dLocale, `say.degraded.${key}`, en, vars)}`;
             const degradedText = reg
-              ? reg.degradedMessage
+              ? // The key-provider registry (glm / kimi / moonshot / minimax) keeps its sentence
+                // in a data table. Keyed by BACKEND with the table's English as the fallback,
+                // rather than left as the one branch of this chain that can never be
+                // translated: otherwise a Korean panel on GLM gets the start-failure notice in
+                // Korean and the degraded notice for the same class of failure in English.
+                // The table's copy carries its own leading ⚠️ (asserted in the say-frame
+                // tests); stripping it keeps all 15 say.degraded.* fallbacks the same shape, so
+                // a catalog never has to guess which ones include the marker.
+                dtr(backend, reg.degradedMessage.replace(/^⚠️\s*/u, ""))
               : isCx
               ? dtr("codex", "The background agent isn't responding — the Codex app-server couldn't start. Make sure Codex is installed and signed in (run `codex login`), then Disconnect → Connect to retry.")
               : isCg
@@ -4493,8 +4500,8 @@ export async function runPanelOrchestrator(): Promise<void> {
           onAuthChanged: () => pushReadiness(tabId),
           onBackgroundError: (providerId, message) => {
             const label = OAUTH_PROVIDERS[providerId]?.label ?? providerId;
-            // `message` is the provider's own failure text — untranslated, and substituted
-            // after {provider} so nothing inside it is read as a placeholder.
+            // `message` is the provider's own failure text — untranslated, and safe to embed:
+            // trFor interpolates in one pass, so braces inside it stay literal.
             bridge.push(
               {
                 type: "say",

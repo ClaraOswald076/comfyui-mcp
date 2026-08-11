@@ -95,13 +95,13 @@ export interface StartFailureNotice {
  * Exported separately from the notice below because the conversation this is announced to
  * can span several tabs whose panels are in DIFFERENT languages: the orchestrator renders
  * this once per recipient, while the `ack`/`turn` frames beside it are machine state and fan
- * out unchanged. Keeping the sentence in one function is what stops those two paths from
- * drifting into two slightly different messages.
+ * out unchanged. This IS the sentence — `buildStartFailureNotice` calls it too rather than
+ * holding a second copy, so the delivered text and the tested text cannot drift apart.
  */
 export function startFailureSay(backend: string, message: string, locale = "en"): string {
-  // ⚠️ outside the translated span — a status marker, not prose. `message` is the provider's
-  // own error text and is passed through verbatim in every language; it is substituted LAST
-  // so a `{hint}`-looking sequence inside it stays literal.
+  // ⚠️ outside the translated span — a status marker, not prose, and the same in every
+  // language. `message` is the provider's own error text and is passed through verbatim;
+  // trFor interpolates in ONE pass, so a `{hint}`-looking sequence inside it stays literal.
   return `⚠️ ${trFor(
     locale,
     "say.start_failure.notice",
@@ -110,20 +110,26 @@ export function startFailureSay(backend: string, message: string, locale = "en")
   )}`;
 }
 
-/** Build the per-tab degradation frames for a start failure on `key`, with the `say`
- *  rendered in `locale` (the destination tab's panel language; English when unknown). */
+/**
+ * Build the per-tab degradation frames for a start failure on `key`.
+ *
+ * The `say` here is ENGLISH, deliberately and always. The orchestrator does not deliver this
+ * copy of it — it re-renders the sentence per recipient through `startFailureSay`, because one
+ * conversation can span panels in different languages. A `locale` parameter on this function
+ * would therefore be exercised only by its own tests, pinning a path production never takes;
+ * the two could then drift apart with everything still green.
+ */
 export function buildStartFailureNotice(
   key: string,
   message: string,
   defaultBackend: string,
-  locale = "en",
 ): StartFailureNotice {
   const backend = backendOfKey(key, defaultBackend);
   return {
     panelTab: panelTabOfKey(key),
     backend,
     frames: [
-      { type: "say", text: startFailureSay(backend, message, locale) },
+      { type: "say", text: startFailureSay(backend, message) },
       { type: "ack", ok: false, kind: "degraded" },
       { type: "turn", state: "done" },
     ],
