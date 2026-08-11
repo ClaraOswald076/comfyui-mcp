@@ -128,7 +128,12 @@ import { SYSTEM as MODEL_CARD_SYSTEM } from "./ai-proposer.js";
 import { resolvePrompt, registerPrompt, onPromptsChanged } from "../services/prompt-overrides.js";
 import { allBackendReadiness, piCredentialPresent } from "./backend-readiness.js";
 import { handleOAuthBegin, handleOAuthStatus, handleOAuthSignout } from "./oauth-bridge.js";
-import { buildStartFailureNotice } from "./start-failure-notice.js";
+// HUMAN-facing `say` bubbles only — `trFor`, never `tr`: each frame renders inside one
+// specific panel tab, in THAT user's language (bridge.tabLocale), not the language of
+// whoever launched this process. Everything else this file emits — tool text, system
+// prompts, ack `message` fields, log lines — is read by a machine and stays English.
+import { trFor } from "../i18n/index.js";
+import { buildStartFailureNotice, startFailureSay } from "./start-failure-notice.js";
 import { readyBannerText, bannerCorrection } from "./ready-banner.js";
 import { OAUTH_PROVIDERS } from "../services/oauth-flow.js";
 import { startPanelMcpHttpServer, type PanelMcpHttpServer } from "./panel-mcp-http.js";
@@ -1701,6 +1706,25 @@ export async function runPanelOrchestrator(): Promise<void> {
     }
     parkedConversationFrames.set(key, q);
   };
+  /**
+   * A HUMAN-facing `say` fanned out to a conversation's tabs, rendered PER TAB.
+   *
+   * pushToConversation cannot serve this: one conversation can span tabs whose panels are in
+   * DIFFERENT languages, and a single pre-rendered string would then be wrong on all but one
+   * of them. `build` is called once per recipient with that tab's own locale.
+   *
+   * With no tab connected the frame parks like any other (replayed on the next hello),
+   * rendered in English: the tab that will eventually receive it has not told us its language
+   * yet, and English is the honest default rather than a guess.
+   */
+  const pushSayToConversation = (key: string, build: (locale: string) => string): void => {
+    const tabs = conversationDeliveryTabs(key, "say");
+    if (!tabs.length) {
+      pushToConversation(key, { type: "say", text: build("en") });
+      return;
+    }
+    for (const t of tabs) bridge.push({ type: "say", text: build(bridge.tabLocale(t)) }, t);
+  };
   // The REAL tab ids participating in the conversation that `originTab` belongs
   // to — used when a conversation BOUNDARY (New chat / resume switch / rewind)
   // must close every participating tab's journaled tickets, not just the
@@ -2390,7 +2414,20 @@ export async function runPanelOrchestrator(): Promise<void> {
       // start-failure-notice.ts so it is unit-testable (issue #255). #884: the
       // frames fan out to every tab on the failed backend's conversation.
       const { backend, frames } = buildStartFailureNotice(key, message, defaultBackend);
-      for (const frame of frames) pushToConversation(key, frame);
+      for (const frame of frames) {
+        // The say is the only HUMAN-facing frame of the three, and #884's conversation
+        // spans every tab on this backend — which can be several panels in DIFFERENT
+        // languages. So it is rendered per recipient rather than pushing one pre-rendered
+        // copy; deriving a single locale from the key cannot work either, since the key is
+        // usually the SCOPE address `orchestrator::<backend>` and resolves to whichever tab
+        // happens to be pinned or last-active. The ack + turn are machine state and fan out
+        // unchanged. Push order (say → ack → turn) is preserved.
+        if (frame.type === "say") {
+          pushSayToConversation(key, (locale) => startFailureSay(backend, message, locale));
+        } else {
+          pushToConversation(key, frame);
+        }
+      }
       logger.warn(
         `[panel-orchestrator] ${backend} agent failed to start — degraded THIS backend's conversation only, other providers unaffected (${message})`,
       );
@@ -2638,21 +2675,40 @@ export async function runPanelOrchestrator(): Promise<void> {
     }
     try {
       for (const [panelTab, { runs, answers, withheld }] of byTab) {
+        // Per TAB, so each person reads this in their own panel's language. `{ count }` is
+        // passed even though the English fallback hedges with "(s)": it lets a catalog
+        // supply real plural forms (`_one`/`_few`/`_other` via Intl.PluralRules, which
+        // knows Korean has one form and Russian four) without touching the English here.
+        const locale = bridge.tabLocale(panelTab);
         // Two different losses, two different remedies — never merged.
-        const parts: string[] = ["⚠️ The agent backend is being restarted."];
+        const parts: string[] = [
+          `⚠️ ${trFor(locale, "say.restart_lost.header", "The agent backend is being restarted.")}`,
+        ];
         if (runs.length) {
+          // `get_history (action:"list")` is a TOOL CALL the user relays to the agent, so it
+          // stays spelled exactly as typed in every language.
           parts.push(
-            `${runs.length} finished render result(s) could not be delivered (${runs.join("; ")}). ` +
-              `Their outcome is UNDETERMINED from the agent's point of view — ask it to check \`get_history (action:"list")\` ` +
-              `for those runs once it reconnects rather than assuming it saw them.`,
+            trFor(
+              locale,
+              "say.restart_lost.runs",
+              `{count} finished render result(s) could not be delivered ({runs}). ` +
+                `Their outcome is UNDETERMINED from the agent's point of view — ask it to check \`get_history (action:"list")\` ` +
+                `for those runs once it reconnects rather than assuming it saw them.`,
+              { count: runs.length, runs: runs.join("; ") },
+            ),
           );
         }
         if (answers.length) {
           parts.push(
-            `${answers.length} answer(s) you gave on a question card never reached the agent: ${answers.join("; ")}. ` +
-              `An answer is not a render — there is NO history to look it up in, and the agent has no way to ` +
-              `recover it once this restart completes. Please tell it your choice again (or paste the text above) ` +
-              `when it comes back.`,
+            trFor(
+              locale,
+              "say.restart_lost.answers",
+              `{count} answer(s) you gave on a question card never reached the agent: {answers}. ` +
+                `An answer is not a render — there is NO history to look it up in, and the agent has no way to ` +
+                `recover it once this restart completes. Please tell it your choice again (or paste the text above) ` +
+                `when it comes back.`,
+              { count: answers.length, answers: answers.join("; ") },
+            ),
           );
         }
         if (withheld > 0) {
@@ -2660,9 +2716,14 @@ export async function runPanelOrchestrator(): Promise<void> {
           // replaced (a new chat, a rewind, a provider switch, another tab taking
           // this workflow). Their text is in the log, not on this screen.
           parts.push(
-            `${withheld} further answer(s) on this tab belong to an earlier conversation that has ` +
-              `since been replaced; they were never delivered either, but they are not shown here ` +
-              `because they were not given to the conversation you are in now.`,
+            trFor(
+              locale,
+              "say.restart_lost.withheld",
+              `{count} further answer(s) on this tab belong to an earlier conversation that has ` +
+                `since been replaced; they were never delivered either, but they are not shown here ` +
+                `because they were not given to the conversation you are in now.`,
+              { count: withheld },
+            ),
           );
         }
         bridge.push({ type: "say", text: parts.join(" ") }, panelTab);
@@ -2917,10 +2978,16 @@ export async function runPanelOrchestrator(): Promise<void> {
           // #884 — keys are shared (`orchestrator::<backend>`); the notices fan
           // out to that backend's conversation like any other agent output.
           if (msgs.length > 0) {
-            pushToConversation(key, {
-              type: "say",
-              text: "✅ Render finished — the local agent is back. Answering your queued message now.",
-            });
+            // Per tab: this conversation's members may be in different panel languages.
+            pushSayToConversation(
+              key,
+              (locale) =>
+                `✅ ${trFor(
+                  locale,
+                  "say.local_agent_resumed",
+                  "Render finished — the local agent is back. Answering your queued message now.",
+                )}`,
+            );
           }
           for (const m of msgs) {
             pushToConversation(key, { type: "turn", state: "working" });
@@ -3755,10 +3822,17 @@ export async function runPanelOrchestrator(): Promise<void> {
         bridge.push(
           {
             type: "say",
-            text:
-              "⚠️ OpenRouter has no API key — the connection would fail on your first message. " +
-              "Set it in Settings → OpenRouter → “Set API key…” (masked, stored by the orchestrator — takes effect immediately, no reconnect needed), " +
-              "or set the OPENROUTER_API_KEY environment variable and restart the orchestrator. Keys: https://openrouter.ai/keys",
+            // Translated in the TAB's language, not the process's: "Settings → OpenRouter →
+            // 'Set API key…'" names controls the user has to find on their own screen, and
+            // a panel in Korean has no menu item spelled "Settings". Env-var names and URLs
+            // are typed literally and stay as they are.
+            text: `⚠️ ${trFor(
+              bridge.tabLocale(panelTab),
+              "say.openrouter_no_key",
+              "OpenRouter has no API key — the connection would fail on your first message. " +
+                "Set it in Settings → OpenRouter → “Set API key…” (masked, stored by the orchestrator — takes effect immediately, no reconnect needed), " +
+                "or set the OPENROUTER_API_KEY environment variable and restart the orchestrator. Keys: https://openrouter.ai/keys",
+            )}`,
           },
           panelTab,
         );
@@ -3775,12 +3849,15 @@ export async function runPanelOrchestrator(): Promise<void> {
         bridge.push(
           {
             type: "say",
-            text:
-              "⚠️ pi has no usable provider credential — the connection would greet ready and then fail on your first message. " +
-              "Configure a provider: set a provider API key (e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY / CEREBRAS_API_KEY) and restart the orchestrator, " +
-              "or run `pi` once and `/login` (stored in ~/.pi/agent/auth.json), then Disconnect → Connect. " +
-              "If you already did one of those, check the entry is complete — an ~/.pi/agent/auth.json record with no `key`, " +
-              "a models.json provider with no `apiKey`, or GOOGLE_APPLICATION_CREDENTIALS pointing at a missing file cannot authenticate. https://pi.dev",
+            text: `⚠️ ${trFor(
+              bridge.tabLocale(panelTab),
+              "say.pi_no_credential",
+              "pi has no usable provider credential — the connection would greet ready and then fail on your first message. " +
+                "Configure a provider: set a provider API key (e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY / CEREBRAS_API_KEY) and restart the orchestrator, " +
+                "or run `pi` once and `/login` (stored in ~/.pi/agent/auth.json), then Disconnect → Connect. " +
+                "If you already did one of those, check the entry is complete — an ~/.pi/agent/auth.json record with no `key`, " +
+                "a models.json provider with no `apiKey`, or GOOGLE_APPLICATION_CREDENTIALS pointing at a missing file cannot authenticate. https://pi.dev",
+            )}`,
           },
           panelTab,
         );
@@ -3794,9 +3871,12 @@ export async function runPanelOrchestrator(): Promise<void> {
         bridge.push(
           {
             type: "say",
-            text:
-              "⚠️ No endpoint configured — set the base URL in Settings → Custom endpoint (include the /v1, e.g. http://192.168.1.20:8000/v1 for vLLM, or a hosted provider's OpenAI-compatible URL), " +
-              "plus “Set API key…” if the server needs one. Both apply immediately — then Connect again.",
+            text: `⚠️ ${trFor(
+              bridge.tabLocale(panelTab),
+              "say.custom_no_base_url",
+              "No endpoint configured — set the base URL in Settings → Custom endpoint (include the /v1, e.g. http://192.168.1.20:8000/v1 for vLLM, or a hosted provider's OpenAI-compatible URL), " +
+                "plus “Set API key…” if the server needs one. Both apply immediately — then Connect again.",
+            )}`,
           },
           panelTab,
         );
@@ -3853,9 +3933,13 @@ export async function runPanelOrchestrator(): Promise<void> {
                   bridge.push(
                     {
                       type: "say",
-                      text:
-                        "⚠️ Your llama-server is running WITHOUT `--jinja`, so tool calling is disabled — every agent action would fail. " +
-                        "Restart it with tool support: `llama-server -m <model>.gguf --jinja -c 16384` (current builds enable jinja by default; older ones need the flag), then Disconnect → Connect.",
+                      // Shell command lines stay verbatim — they are pasted, not read.
+                      text: `⚠️ ${trFor(
+                        bridge.tabLocale(panelTab),
+                        "say.llamacpp_no_jinja",
+                        "Your llama-server is running WITHOUT `--jinja`, so tool calling is disabled — every agent action would fail. " +
+                          "Restart it with tool support: `llama-server -m <model>.gguf --jinja -c 16384` (current builds enable jinja by default; older ones need the flag), then Disconnect → Connect.",
+                      )}`,
                     },
                     panelTab,
                   );
@@ -3863,7 +3947,12 @@ export async function runPanelOrchestrator(): Promise<void> {
                   bridge.push(
                     {
                       type: "say",
-                      text: `ℹ️ Your llama-server context is ${props.nCtx} tokens (launch flag -c). The agent's tool payload wants ≥16384 — below that, long turns silently truncate. Consider restarting with \`-c 16384\` or higher.`,
+                      text: `ℹ️ ${trFor(
+                        bridge.tabLocale(panelTab),
+                        "say.llamacpp_small_context",
+                        "Your llama-server context is {tokens} tokens (launch flag -c). The agent's tool payload wants ≥16384 — below that, long turns silently truncate. Consider restarting with `-c 16384` or higher.",
+                        { tokens: props.nCtx },
+                      )}`,
                     },
                     panelTab,
                   );
@@ -3889,31 +3978,47 @@ export async function runPanelOrchestrator(): Promise<void> {
             bridge.push({ type: "ack", ok: true, kind: "ready", agent: agentLabel, backend }, panelTab);
             logger.debug(`[panel-orchestrator] tab ${panelTab.slice(0, 8)} connected (${backend}) — agent healthy, ready ack`);
           } else {
+            // Each variant names a per-provider remedy the user performs by hand ("Open LM
+            // Studio → Developer → Start Server", "Settings → Custom endpoint"), so it
+            // renders in THIS tab's panel language. CLI invocations, env-var names, URLs and
+            // model ids are interpolated or quoted literally and never translated — they are
+            // typed, not read.
+            const dLocale = bridge.tabLocale(panelTab);
+            const dtr = (key: string, en: string, vars?: Record<string, string | number>): string =>
+              `⚠️ ${trFor(dLocale, `say.degraded.${key}`, en, vars)}`;
             const degradedText = reg
-              ? reg.degradedMessage
+              ? // The key-provider registry (glm / kimi / moonshot / minimax) keeps its sentence
+                // in a data table. Keyed by BACKEND with the table's English as the fallback,
+                // rather than left as the one branch of this chain that can never be
+                // translated: otherwise a Korean panel on GLM gets the start-failure notice in
+                // Korean and the degraded notice for the same class of failure in English.
+                // The table's copy carries its own leading ⚠️ (asserted in the say-frame
+                // tests); stripping it keeps all 15 say.degraded.* fallbacks the same shape, so
+                // a catalog never has to guess which ones include the marker.
+                dtr(backend, reg.degradedMessage.replace(/^⚠️\s*/u, ""))
               : isCx
-              ? "⚠️ The background agent isn't responding — the Codex app-server couldn't start. Make sure Codex is installed and signed in (run `codex login`), then Disconnect → Connect to retry."
+              ? dtr("codex", "The background agent isn't responding — the Codex app-server couldn't start. Make sure Codex is installed and signed in (run `codex login`), then Disconnect → Connect to retry.")
               : isCg
-                ? "⚠️ The background agent isn't responding — ChatGPT direct OAuth couldn't start. Make sure ~/.codex/auth.json exists (run `codex login`), then Disconnect → Connect to retry."
+                ? dtr("chatgpt", "The background agent isn't responding — ChatGPT direct OAuth couldn't start. Make sure ~/.codex/auth.json exists (run `codex login`), then Disconnect → Connect to retry.")
               : isGm
-                ? "⚠️ The background agent isn't responding — the Gemini CLI couldn't start. Make sure the Gemini CLI is installed and signed in (run `gemini` once and complete the Google sign-in), then Disconnect → Connect to retry."
+                ? dtr("gemini", "The background agent isn't responding — the Gemini CLI couldn't start. Make sure the Gemini CLI is installed and signed in (run `gemini` once and complete the Google sign-in), then Disconnect → Connect to retry.")
                 : isAg
-                  ? "⚠️ The background agent isn't responding — the Antigravity CLI couldn't answer `agy models`. Install it from https://antigravity.google, run `agy` once and complete the Google Sign-In, then Disconnect → Connect to retry."
+                  ? dtr("antigravity", "The background agent isn't responding — the Antigravity CLI couldn't answer `agy models`. Install it from https://antigravity.google, run `agy` once and complete the Google Sign-In, then Disconnect → Connect to retry.")
                 : isPi
-                  ? "⚠️ The background agent isn't responding — the pi CLI couldn't run `pi --list-models`. Install it from https://pi.dev (`curl -fsSL https://pi.dev/install.sh | sh`), configure a provider (set a provider API key or run `pi` once and `/login`), then Disconnect → Connect to retry."
+                  ? dtr("pi", "The background agent isn't responding — the pi CLI couldn't run `pi --list-models`. Install it from https://pi.dev (`curl -fsSL https://pi.dev/install.sh | sh`), configure a provider (set a provider API key or run `pi` once and `/login`), then Disconnect → Connect to retry.")
                 : isGk
-                  ? "⚠️ The background agent isn't responding — the Grok CLI couldn't start. Make sure Grok is installed and signed in (run `grok` once and complete the xAI sign-in), then Disconnect → Connect to retry."
+                  ? dtr("grok", "The background agent isn't responding — the Grok CLI couldn't start. Make sure Grok is installed and signed in (run `grok` once and complete the xAI sign-in), then Disconnect → Connect to retry.")
                 : isOl
-                  ? "⚠️ The background agent isn't responding — Ollama isn't reachable. Start it with `ollama serve` and pull our fine-tuned model (`ollama pull artokun/gemma4-comfyui-mcp:e4b` — gemma4 trained on the comfyui-mcp tool suite — arena-best local model; `:12b` for ~8 GB VRAM), then Disconnect → Connect to retry."
+                  ? dtr("ollama", "The background agent isn't responding — Ollama isn't reachable. Start it with `ollama serve` and pull our fine-tuned model (`ollama pull artokun/gemma4-comfyui-mcp:e4b` — gemma4 trained on the comfyui-mcp tool suite — arena-best local model; `:12b` for ~8 GB VRAM), then Disconnect → Connect to retry.")
                   : isLs
-                    ? `⚠️ The background agent isn't responding — LM Studio isn't reachable at ${LMSTUDIO_BASE_URL}. Open LM Studio → Developer → Start Server and load a tool-calling model (our gemma4-comfyui-mcp GGUFs from Hugging Face work great), or set COMFYUI_MCP_LMSTUDIO_HOST if it serves elsewhere — then Disconnect → Connect to retry.`
+                    ? dtr("lmstudio", "The background agent isn't responding — LM Studio isn't reachable at {url}. Open LM Studio → Developer → Start Server and load a tool-calling model (our gemma4-comfyui-mcp GGUFs from Hugging Face work great), or set COMFYUI_MCP_LMSTUDIO_HOST if it serves elsewhere — then Disconnect → Connect to retry.", { url: LMSTUDIO_BASE_URL })
                     : isLc
-                      ? `⚠️ The background agent isn't responding — llama-server isn't reachable at ${LLAMACPP_BASE_URL}. Start it with \`llama-server -m <model>.gguf -c 16384\` (our gemma4-comfyui-mcp GGUFs work great; add --jinja on older builds — required there for tool calling), or set COMFYUI_MCP_LLAMACPP_HOST — then Disconnect → Connect to retry.`
+                      ? dtr("llamacpp", "The background agent isn't responding — llama-server isn't reachable at {url}. Start it with `llama-server -m <model>.gguf -c 16384` (our gemma4-comfyui-mcp GGUFs work great; add --jinja on older builds — required there for tool calling), or set COMFYUI_MCP_LLAMACPP_HOST — then Disconnect → Connect to retry.", { url: LLAMACPP_BASE_URL })
                       : isCu
-                        ? `⚠️ The background agent isn't responding — your custom endpoint isn't answering at ${customBaseUrl}. Check the base URL in Settings → Custom endpoint (it must be OpenAI-compatible and include the /v1) and the API key if the server requires one — then Connect to retry.`
+                        ? dtr("custom", "The background agent isn't responding — your custom endpoint isn't answering at {url}. Check the base URL in Settings → Custom endpoint (it must be OpenAI-compatible and include the /v1) and the API key if the server requires one — then Connect to retry.", { url: customBaseUrl })
                         : isCp
-                          ? "⚠️ The background agent isn't responding — GitHub Copilot (experimental) couldn't start. Sign in from the panel's experimental row, then Disconnect → Connect to retry."
-                        : "⚠️ The background agent isn't responding — the Claude Agent SDK couldn't start. Make sure you're signed in (run `claude` once), then Disconnect → Connect to retry.";
+                          ? dtr("copilot", "The background agent isn't responding — GitHub Copilot (experimental) couldn't start. Sign in from the panel's experimental row, then Disconnect → Connect to retry.")
+                        : dtr("claude", "The background agent isn't responding — the Claude Agent SDK couldn't start. Make sure you're signed in (run `claude` once), then Disconnect → Connect to retry.");
             bridge.push({ type: "say", text: degradedText }, panelTab);
             bridge.push({ type: "ack", ok: false, kind: "degraded" }, panelTab);
             logger.warn(`[panel-orchestrator] tab ${panelTab.slice(0, 8)} connected (${backend}) but model probe empty — degraded ack`);
@@ -4414,7 +4519,20 @@ export async function runPanelOrchestrator(): Promise<void> {
           onAuthChanged: () => pushReadiness(tabId),
           onBackgroundError: (providerId, message) => {
             const label = OAUTH_PROVIDERS[providerId]?.label ?? providerId;
-            bridge.push({ type: "say", text: `⚠️ ${label} sign-in failed: ${message}` }, tabId);
+            // `message` is the provider's own failure text — untranslated, and safe to embed:
+            // trFor interpolates in one pass, so braces inside it stay literal.
+            bridge.push(
+              {
+                type: "say",
+                text: `⚠️ ${trFor(
+                  bridge.tabLocale(tabId),
+                  "say.oauth_signin_failed",
+                  "{provider} sign-in failed: {message}",
+                  { provider: label, message },
+                )}`,
+              },
+              tabId,
+            );
           },
         },
       )
@@ -4496,9 +4614,19 @@ export async function runPanelOrchestrator(): Promise<void> {
         bridge.push(
           {
             type: "say",
+            // 🕶️/👁️ carry the ON/OFF distinction at a glance and are the same in every
+            // language, so they stay outside the translated span.
             text: nextBlind
-              ? "🕶️ Blind mode ON — the agent's image tools now withhold pixels (applies after the current turn; the session resumes automatically)."
-              : "👁️ Blind mode OFF — the agent's image tools deliver pixels again (applies after the current turn).",
+              ? `🕶️ ${trFor(
+                  bridge.tabLocale(tabId),
+                  "say.blind_on",
+                  "Blind mode ON — the agent's image tools now withhold pixels (applies after the current turn; the session resumes automatically).",
+                )}`
+              : `👁️ ${trFor(
+                  bridge.tabLocale(tabId),
+                  "say.blind_off",
+                  "Blind mode OFF — the agent's image tools deliver pixels again (applies after the current turn).",
+                )}`,
           },
           tabId,
         );
@@ -4542,7 +4670,18 @@ export async function runPanelOrchestrator(): Promise<void> {
         // Legacy contract: old clients only understand the say. A rid-stamped
         // request ALSO gets an ok:false options ack so the correlating client
         // resolves the exact failed attempt instead of waiting out a timeout.
-        bridge.push({ type: "say", text: `⚠️ Could not change model/effort: ${message}` }, tabId);
+        bridge.push(
+          {
+            type: "say",
+            text: `⚠️ ${trFor(
+              bridge.tabLocale(tabId),
+              "say.options_change_failed",
+              "Could not change model/effort: {message}",
+              { message },
+            )}`,
+          },
+          tabId,
+        );
         const errorAck = optionsErrorAckFrame(message, meta);
         if (errorAck) bridge.push(errorAck, tabId);
       });
@@ -4706,11 +4845,14 @@ export async function runPanelOrchestrator(): Promise<void> {
         bridge.push(
           {
             type: "say",
-            text:
-              "⚠️ New chat started, but the previous conversation's stored session could not be " +
-              "removed from disk (the write failed — a full or locked filesystem?). If the " +
-              "orchestrator restarts before this conversation's first exchange completes, the " +
-              "OLD conversation may resume; start a New chat again if that happens.",
+            text: `⚠️ ${trFor(
+              bridge.tabLocale(tabId),
+              "say.new_chat_durable_clear_failed",
+              "New chat started, but the previous conversation's stored session could not be " +
+                "removed from disk (the write failed — a full or locked filesystem?). If the " +
+                "orchestrator restarts before this conversation's first exchange completes, the " +
+                "OLD conversation may resume; start a New chat again if that happens.",
+            )}`,
           },
           tabId,
         );
@@ -5076,7 +5218,11 @@ export async function runPanelOrchestrator(): Promise<void> {
       bridge.push(
         {
           type: "say",
-          text: "⏸ A render is running, so I've queued your message to keep the GPU free for it. I'll answer the moment it finishes.",
+          text: `⏸ ${trFor(
+            bridge.tabLocale(event.tab_id),
+            "say.message_queued_during_render",
+            "A render is running, so I've queued your message to keep the GPU free for it. I'll answer the moment it finishes.",
+          )}`,
         },
         event.tab_id,
       );
