@@ -2386,6 +2386,12 @@ export class UiBridge {
               // the one property a secret must not have. So a secret card's late answer is
               // recoverable within this process and nowhere else — and if nothing claims
               // it, it expires unread rather than being written down.
+              //
+              // The journal ALSO declines it on its own (`AskAnswers.tracks` accepts only
+              // panel_ask-prefixed ids), so this is the second of two barriers rather than
+              // the only one. It is still worth having here: that prefix rule is the
+              // JOURNAL's policy, expressed in another file for its own reasons, and a
+              // guarantee about credentials should not depend on it staying that way.
               try {
                 if (!entry.sensitive) this.lateAskSink?.(entry.askId, msg.result, entry.tabId);
               } catch (err) {
