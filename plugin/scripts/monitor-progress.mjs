@@ -49,6 +49,10 @@ for (const id of promptIds) {
     startTime: Date.now(),
     lastActivity: Date.now(), // last WS event or status change
     stallWarned: false,
+    // #1385 — the terminal re-entry guard. A FLAG, not a status comparison: markDone
+    // assigns "success", which never matched a guard testing for "done", so one
+    // completion was counted twice and the monitor exited while another job ran.
+    finished: false,
   });
 }
 
@@ -145,7 +149,25 @@ async function checkServerHealth() {
 
 async function markDone(promptId, status) {
   const job = jobs.get(promptId);
-  if (!job || job.status === "done" || job.status === "error") return;
+  // RE-ENTRY GUARD, on a flag rather than the status string (#1385).
+  //
+  // This used to test `status === "done" || "error"` and then assign `status`, which the
+  // callers pass as "success" — so a successfully finished job never matched its own
+  // guard. Two callers reach here for one completion (the WS `execution_success` event and
+  // the history poller), and the second went straight through: `[DONE]` printed twice,
+  // `successCount` and `doneCount` incremented twice, and `checkAllDone` then saw two of
+  // two finished while the other job was still executing. The monitor exited 0 on a job
+  // that had not produced its file yet.
+  //
+  // SET BEFORE ANY await, which is the other half. `doneCount++` sits after a
+  // HISTORY_DELAY_MS sleep and a /history fetch, so even a correct status guard leaves a
+  // window where both callers are past the check before either increments. A flag written
+  // in the same tick as the check cannot be raced on a single-threaded event loop.
+  //
+  // It is also independent of the status vocabulary: adding a new terminal status can no
+  // longer silently reopen this.
+  if (!job || job.finished) return;
+  job.finished = true;
 
   job.status = status;
   const elapsed = ((Date.now() - job.startTime) / 1000).toFixed(1);
@@ -213,7 +235,9 @@ async function checkAlreadyDone() {
 
 function printProgress(promptId, step, max, node) {
   const job = jobs.get(promptId);
-  if (!job || job.status === "done" || job.status === "error") return;
+  // Same stale-status pattern as markDone (#1385): a finished job kept printing progress
+  // because its status reads "success", not "done".
+  if (!job || job.finished) return;
 
   job.step = step;
   job.maxSteps = max;
@@ -246,7 +270,7 @@ function printProgress(promptId, step, max, node) {
 function checkStalls() {
   const now = Date.now();
   for (const [promptId, job] of jobs) {
-    if (job.status === "done" || job.status === "error") continue;
+    if (job.finished) continue;
 
     const idleSec = ((now - job.lastActivity) / 1000).toFixed(0);
     const totalSec = ((now - job.startTime) / 1000).toFixed(0);
@@ -356,7 +380,7 @@ function startPolling() {
     }
 
     for (const [promptId, job] of jobs) {
-      if (job.status === "done" || job.status === "error") continue;
+      if (job.finished) continue;
 
       try {
         const history = await fetchJSON(`/history/${promptId}`);
