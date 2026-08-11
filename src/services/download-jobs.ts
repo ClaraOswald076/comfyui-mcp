@@ -16,7 +16,7 @@
 
 import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { extname, basename, dirname, join } from "node:path";
 import {
   downloadModel,
   liveListingHasEntry,
@@ -28,6 +28,7 @@ import type { DownloadAuth } from "./download-auth.js";
 import type { ResumeDiagnostic } from "./download-resume-diag.js";
 import { ModelError } from "../utils/errors.js";
 import {
+  readDownloadProgress,
   persistDownloadJob,
   readPersistedDownloadJob,
   listPersistedDownloadJobs,
@@ -1661,4 +1662,167 @@ export function resetDownloadJobs(): void {
   }
   jobs.clear();
   destChains.clear();
+}
+
+/**
+ * In-flight downloads that a tool-session respawn would orphan (#1378).
+ *
+ * Saving a credential mid-flight respawns the comfyui tool session, and the new auth
+ * header changes each download's CACHE IDENTITY — so a `.partial` at 96% becomes
+ * unreachable and the re-issued download starts from zero. A reporter lost ~29 GB across
+ * two files that way, with nothing warning them and nothing indicating the bytes were
+ * still on disk.
+ *
+ * The two obvious repairs are both unsafe: reusing the old entry under the new identity
+ * would serve bytes fetched under one auth identity to a request made under another, which
+ * is exactly what folding headers into the key prevents. So this does not try to rescue the
+ * transfer — it exists so the caller can be told BEFORE the respawn, while waiting is still
+ * an option. Afterwards the choice is gone, which is what happened to the reporter.
+ *
+ * NEVER REPORTS THE URL. A download URL can carry query-string auth, and this string ends
+ * up in a chat transcript — the filename and the byte count are what the decision needs.
+ */
+/**
+ * A filename safe to print in a chat transcript (#1378).
+ *
+ * The URL is never reported, and a filename DERIVED from a url takes only the pathname —
+ * so the ordinary case cannot carry a query token. But an explicitly supplied `filename` is
+ * copied through unchanged, and its validation rejects separators and dot-names, not
+ * secret-looking content. A caller can legally pass `model-sk-live-abc123.safetensors`.
+ *
+ * So a name carrying a credential-shaped token is reported by its EXTENSION only. Losing
+ * the name costs the reader a little context; printing a live token into a transcript is
+ * not recoverable.
+ */
+/**
+ * Named credential shapes. A filename matching one of these is redacted WHOLE — no part of
+ * a known key is worth keeping for identification.
+ *
+ * These exist because length alone cannot catch them: an AWS access key ID is exactly 20
+ * characters with no separator, which is also the length of an ordinary model filename, so
+ * the generic run rule below cannot be lowered far enough to see it.
+ */
+const NAMED_CREDENTIAL_SHAPES: readonly RegExp[] = [
+  // Vendor prefixes, ENUMERATED on purpose. The obvious generalisation — "a short
+  // alphabetic prefix followed by a long opaque body" — cannot be made to work: it is the
+  // shape of `juggernautXL_v9Rundiffusionphoto2` as exactly as it is the shape of
+  // `glpat-8GMtG8Mf4EnMJzmAWDU`, and the rule that catches one redacts the other. Public
+  // token prefixes are a small, published, slow-moving set, which is why every real secret
+  // scanner enumerates them too.
+  //
+  // Hyphens and underscores INSIDE the token count: a real key is `sk-live-abc…`, and
+  // requiring 12 contiguous alphanumerics after the prefix missed exactly that shape.
+  /(sk|pk|rk|hf|ghp|gho|ghu|ghs|ghr|glpat|gldt|dop_v1|doo_v1|dor_v1|shpat|shpss|shpca|shppa|npm|pypi|sq0atp|sq0csp|xkeysib|SG|xox[baprs])[-_][A-Za-z0-9_-]{12,}/,
+  /github_pat_[A-Za-z0-9_]{20,}/,
+  /(api[-_]?key|secret|token|password|bearer)/i,
+  /(AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ABIA)[A-Z0-9]{16}/,
+  /AIza[A-Za-z0-9_-]{35}/,
+  /ya29\.[A-Za-z0-9_-]{20,}/,
+  /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/,
+];
+
+/**
+ * Part-level thresholds for the generic rule.
+ *
+ * PARTIAL redaction is what makes these numbers affordable. The previous version had to
+ * decide whether a whole filename was a secret, so every threshold traded a leak against
+ * destroying the user's ability to tell which download the warning was about — and it lost
+ * both ways: an exact-length hex credential was waved through as "a hash", while
+ * `realisticVisionV60B1_v51HyperVAE-inpainting` was redacted entirely. Replacing only the
+ * suspicious PART keeps the identifying prefix, so the rule can be strict without costing
+ * the warning its point, and there is no longer any need to guess hash-versus-secret: a
+ * long opaque part is replaced whatever it is.
+ */
+const MAX_KEPT_PART = 24;
+/** Interleaved letters-and-digits is the strongest blob signal, so several in one run is a
+ *  blob even when each is short. Real names reach two (`juggernautXL_v9Rundiffusion`);
+ *  three is where a name stops being plausible. */
+const MAX_MIXED_PARTS = 2;
+const MIN_MIXED_PART = 5;
+
+/** Is this part long enough and opaque enough that it should not be printed? */
+function partIsOpaque(part: string): boolean {
+  return part.length > MAX_KEPT_PART;
+}
+
+function partIsMixed(part: string): boolean {
+  return (
+    part.length >= MIN_MIXED_PART && /[A-Za-z]/.test(part) && /[0-9]/.test(part)
+  );
+}
+
+/** Replace the opaque parts of one long run, or the whole run when it is a blob. */
+function redactRun(run: string): string {
+  const parts = run.split(/([-_])/);
+  const words = parts.filter((x) => x !== "-" && x !== "_" && x !== "");
+  // Several interleaved parts in one run is a token spelled to look like a name —
+  // `auth-A1b2C3d4-E5f6G7h8-I9j0K1l2`. Each part alone reads as ordinary, so this can only
+  // be judged across the run.
+  if (words.filter(partIsMixed).length > MAX_MIXED_PARTS) return REDACTED;
+  return parts.map((x) => (partIsOpaque(x) ? REDACTED : x)).join("");
+}
+
+const REDACTED = "(redacted)";
+
+/**
+ * A filename with credential-shaped material removed, keeping what identifies the download.
+ *
+ * The warning this feeds exists so a user can decide whether to let a 29 GB transfer
+ * finish. A receipt that says "2 downloads are at risk" without saying WHICH has given up
+ * most of that value — so the goal is not to redact the most, it is to redact the
+ * credential and keep the name.
+ *
+ * ACCEPTED RESIDUAL, stated rather than hidden: a credential spelled as separator-
+ * delimited chunks that are each short, each of one character class, and no more than two
+ * of them interleaved, reads as a model name and survives. No shape rule closes that — a
+ * token spelled like a name IS spelled like a name, and the rule that catches it also
+ * catches `flux1-kontext-dev-Q8_0-fp8-e4m3fn`.
+ */
+function redactSecretishFilename(name: string | undefined): string {
+  if (!name) return "(unnamed)";
+  if (NAMED_CREDENTIAL_SHAPES.some((re) => re.test(name))) {
+    return `${REDACTED}${safeExtension(name)}`;
+  }
+  // Runs are examined and rewritten in place, so the parts that are ordinary survive.
+  return name.replace(/[A-Za-z0-9_-]{32,}/g, redactRun);
+}
+
+/**
+ * The extension, but only when it IS one.
+ *
+ * `extname` returns everything after the last dot, and filename validation rejects path
+ * separators and dot-names — not `?`. So `model-token.safetensors?token=SECRET` yielded
+ * `(redacted).safetensors?token=SECRET`, a redaction that published the credential it was
+ * removing (codex). An extension is letters and digits or it is not kept.
+ */
+function safeExtension(name: string): string {
+  const ext = extname(name);
+  return /^\.[A-Za-z0-9]{1,12}$/.test(ext) ? ext : "";
+}
+
+export function downloadsAtRiskOfRespawn(
+  /**
+   * Injectable for tests. Mocking `listDownloadJobs` does NOT work here: it is called from
+   * inside this module, and vi.mock replaces a module's EXPORT, not its internal binding.
+   * My first test did exactly that and reported an empty list against working code — the
+   * same "the double agreed with me" failure this session keeps producing, one layer down.
+   */
+  jobs: readonly DownloadJob[] = listDownloadJobs(),
+): { id: string; filename: string; bytes: number }[] {
+  const at: { id: string; filename: string; bytes: number }[] = [];
+  for (const job of jobs) {
+    if (job.status !== "downloading") continue;
+    const progress = readDownloadProgress(job.progressId ?? job.trayId);
+    at.push({
+      // AN IDENTITY THAT IS NOT THE DISPLAY NAME (codex P2). Two different downloads
+      // whose names are both credential-shaped redact to the SAME string, so a consumer
+      // deduplicating on the filename collapsed them into one entry and reported the
+      // larger byte count instead of both files and their total — under-reporting the
+      // loss precisely when the names are least informative.
+      id: job.progressId ?? job.trayId ?? job.filename ?? "",
+      filename: redactSecretishFilename(job.filename),
+      bytes: progress?.downloaded ?? 0,
+    });
+  }
+  return at;
 }
