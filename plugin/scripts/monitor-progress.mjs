@@ -423,7 +423,12 @@ function startStallChecker() {
 setTimeout(() => {
   if (doneCount < jobs.size) {
     const remaining = [...jobs.entries()]
-      .filter(([, j]) => j.status !== "done" && j.status !== "error")
+      // The SAME stale vocabulary, in its inequality form (#1385, codex). A successful job
+      // carries status "success", so `!== "done" && !== "error"` calls it incomplete — and
+      // the window is real: `finished` is set before the history fetch but `doneCount++`
+      // comes after it, so a timeout landing in between reports a job that succeeded as
+      // still running, and exits 1. My first pass fixed only the equality comparisons.
+      .filter(([, j]) => !j.finished)
       .map(([id, j]) => {
         const elapsed = ((Date.now() - j.startTime) / 1000).toFixed(0);
         return `${short(id)} (${j.status}, ${elapsed}s)`;

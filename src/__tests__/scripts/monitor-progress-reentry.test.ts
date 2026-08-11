@@ -36,11 +36,28 @@ describe("monitor-progress re-entry guard (#1385)", () => {
     expect(s).toMatch(/job\.finished = true;/);
   });
 
-  it("no guard compares against the status vocabulary any more", () => {
-    // All four sites had the same pattern; fixing only markDone would leave printProgress
-    // and the two sweep loops treating a finished job as live.
-    expect(code()).not.toMatch(/job\.status === "done"/);
-    expect(code()).not.toMatch(/job\.status === "error"/);
+  it("NO comparison against the terminal vocabulary survives, in either form", () => {
+    // Five sites had the same pattern. My first pass banned only the EQUALITY form and
+    // missed the timeout path's inequality `j.status !== "done" && j.status !== "error"`,
+    // which reports a just-succeeded job as incomplete and exits 1 — the assertion was
+    // shaped like the bug I had already found rather than like the bug.
+    const s = code();
+    for (const pattern of [
+      /\.status === "done"/,
+      /\.status === "error"/,
+      /\.status !== "done"/,
+      /\.status !== "error"/,
+    ]) {
+      expect(s, `a terminal-status comparison survives: ${pattern}`).not.toMatch(pattern);
+    }
+  });
+
+  it("the TIMEOUT path uses the flag — a finished job is never reported as incomplete", () => {
+    // `finished` is set before the history fetch and `doneCount++` comes after it, so a
+    // timeout landing in that window used to name a job that had already succeeded.
+    const s = code();
+    const block = s.slice(s.indexOf("setTimeout(() => {", s.indexOf("Timeout")));
+    expect(block).toMatch(/\.filter\(\(\[, j\]\) => !j\.finished\)/);
   });
 
   it("the flag is set BEFORE the first await in markDone", () => {
