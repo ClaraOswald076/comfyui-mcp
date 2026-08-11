@@ -4,6 +4,48 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.50.110
+
+### Fixed
+
+- **A progress line is no longer handed to you as a failure reason (#417).** When a
+  comfy-cli download died, its stderr often held only progress, so the error you were shown
+  was comfy-cli's own `Start downloading URL: … into …` — a sentence that reads like a
+  diagnosis and names no cause. Output that carries no failure information now says exactly
+  that, and names what to check; the raw output is still kept. A real error is passed
+  through unchanged.
+
+  The progress patterns match the emitter that actually exists: comfy-cli's own downloader
+  is `rich.progress` (which writes nothing to a pipe), so the bars that reach us come from
+  `huggingface_hub` with a `desc` prefix. The diagnosis is also scoped to downloads — a
+  failing `comfy node install` was being handed disk-space and gated-Hugging-Face advice
+  about a transfer it never performed.
+
+- **A reconnect no longer wedges every mutating `panel_*` call (#1331).** After a workflow
+  switch, a save/rename, or an id-scheme change the tab gets a new id, and the trusted
+  workflow stamp was deleted and only restored if that same hello resolved an identity. A
+  reconnect hello that lands before the canvas identity is readable carries none, so the
+  stamp was gone for the rest of the session and every mutation was refused with "this
+  workflow has no trusted identity" while reads kept working.
+
+  The stamp now moves with the rest of the routing state. It cannot widen authorization —
+  the panel authorizes only when the stamp equals the live workflow uuid — while an absent
+  stamp was unrecoverable. This restores `carryWorkflowCommandStamp`, which #436 added for
+  exactly this and the #884 refactor dropped.
+
+### Added
+
+- **`panel_remove_widget` removes ONE dynamic widget row (#938)** — rgthree Power Lora
+  Loader `lora_N`, Impact/Inspire list rows. Their add/remove affordance is a canvas-drawn
+  button an agent cannot click, so those rows were previously un-removable from an agent
+  session. Requires panel 0.13.7.
+
+  The rows are deliberately NOT renumbered (`lora_N` is a monotonic id, not a position), and
+  removal is refused with the specific reason for a backend-declared input, a
+  frontend-generated control widget, a linked widget, or a subgraph container. Node
+  definitions that cannot be READ are reported as unknown rather than treated as "declares
+  nothing".
+
 ## 0.50.109
 
 ### Added
@@ -56,6 +98,18 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.50.110] - 2026-08-11
+
+### MCP
+
+#### Added
+- panel_remove_widget — remove one dynamic widget row (#1387)
+
+#### Fixed
+- the workflow stamp survives a tab-id migration (#1389)
+- a progress line is not a failure reason (#1386)
+
 
 ## [0.50.109] - 2026-08-11
 
