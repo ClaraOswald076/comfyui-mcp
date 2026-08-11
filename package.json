@@ -11,6 +11,7 @@
   },
   "files": [
     "dist",
+    "locales",
     "plugin",
     "packs",
     "scripts",
@@ -55,7 +56,8 @@
     "release:major": "npm version major && git push --follow-tags",
     "changelog": "node scripts/gen-changelog.mjs",
     "version": "node scripts/gen-changelog.mjs --from-pkg && git add CHANGELOG.md",
-    "prepare": "tsc"
+    "prepare": "tsc",
+    "i18n:check": "node scripts/i18n-check.mjs"
   },
   "dependencies": {
     "@comfyorg/sdk": "^0.1.5",
