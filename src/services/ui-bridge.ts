@@ -923,6 +923,11 @@ export const GRAPH_CMD_EFFECT: Readonly<Record<string, GraphCmdEffect>> = {
   graph_connect: "targeted",
   graph_disconnect: "targeted",
   graph_set_widget: "targeted",
+  // Removes ONE dynamic widget row (artokun/comfyui-mcp#938). "targeted" for the same
+  // reason set_widget is: it changes one node's content, and it awaits a fresh
+  // /object_info before writing — so it needs the fence that covers the await, not only
+  // the one at dispatch.
+  graph_remove_widget: "targeted",
   graph_set_node_property: "targeted",
   graph_move_node: "targeted",
   graph_resize_node: "targeted",

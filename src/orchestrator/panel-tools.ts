@@ -777,6 +777,7 @@ const MUTATING_GRAPH_EDIT_CMDS = new Set<string>([
   "graph_connect",
   "graph_disconnect",
   "graph_set_widget",
+  "graph_remove_widget",
   "graph_set_node_property",
   // Legacy bridge commands remain behind compatibility tool names so panels that
   // predate graph_edit_node continue to receive commands they actually implement.
@@ -7449,6 +7450,7 @@ export const RETRY_TOKEN_CMD_BY_TOOL: Readonly<Record<string, string>> = {
   panel_connect: "graph_connect",
   panel_disconnect: "graph_disconnect",
   panel_set_widget: "graph_set_widget",
+  panel_remove_widget: "graph_remove_widget",
   panel_set_property: "graph_set_node_property",
   panel_move_node: "graph_move_node",
   panel_resize_node: "graph_resize_node",
@@ -8444,6 +8446,27 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
         );
       },
+    ),
+    def(
+      "panel_remove_widget",
+      "Remove ONE dynamic widget row from a node — the rows custom nodes add themselves, like the rgthree Power Lora Loader's `lora_1`, `lora_2`, … or an Impact/Inspire list node's entries. Their add/remove affordance is a canvas-drawn button you cannot click, so this is the only way to delete a row; panel_set_widget can only overwrite a row's value, and panel_remove_node deletes the whole node. REFUSES, with the reason, when the widget is an input the BACKEND declares (removing it would change what is sent at queue time — set it with panel_set_widget instead), when it is a frontend-generated control widget (control_after_generate, which the frontend re-creates), when its input slot currently has a link (disconnect it first), and when the node definitions cannot be read at all — an unreadable definition is reported as unknown, never treated as 'not declared'. The remaining rows are deliberately NOT renumbered: `lora_N` is a monotonic id, not a position, and the backend matches rows by name prefix, so gaps are harmless — the reply lists the remaining widget names, and those are the names to use next. Undoable with Ctrl+Z.",
+      {
+        node_id: nodeId().describe("Node id from panel_graph_outline / panel_query_graph."),
+        widget: z
+          .string()
+          .describe(
+            "Exact widget name to remove, as shown by panel_query_graph {fields:'detail'} (e.g. 'lora_2').",
+          ),
+      },
+      async (args: A, ctx) =>
+        // Same bounded budget panel_set_widget uses: the panel pulls a fresh /object_info
+        // to decide whether this widget is a declared input, and that fetch outlasts the
+        // 6000 ms default ack on a large install (#599) — a false timeout here would read
+        // as "the removal failed" for a removal that succeeded.
+        ctx.call(
+          { cmd: "graph_remove_widget", node_id: args.node_id, widget: args.widget },
+          OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+        ),
     ),
     def(
       "panel_set_property",
