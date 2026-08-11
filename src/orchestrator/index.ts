@@ -43,7 +43,7 @@ import { isPanelAutoInstallDisabled } from "../services/panel-installer.js";
 import { SelfRestarter, canSelfRestart } from "../services/self-restart.js";
 import { pairUrlDurability } from "./pair-durability.js";
 import { loadOrCreatePairToken } from "./pair-token-store.js";
-import { SessionStore, workflowIdentityParts } from "./session-store.js";
+import { SessionStore, workflowIdentityParts, carryWorkflowCommandStamp } from "./session-store.js";
 import { unreachableReason, noPanelTabReason, identityReason } from "./fence-refusal.js";
 import {
   SHARED_SESSION_SCOPE,
@@ -3518,11 +3518,39 @@ export async function runPanelOrchestrator(): Promise<void> {
         AskAnswers.moveKey(migratedFrom, panelTab);
         flushRunCompletions(panelTab);
         flushAskAnswers(panelTab);
-        // The OLD id's command stamp dies with it: a straggler command issued
-        // for the old workflow must keep failing the panel's fence rather than
-        // mutate the newly-shown one. The new id is stamped from THIS hello
-        // just below.
-        tabCommandWorkflowUuid.delete(migratedFrom);
+        // The stamp MOVES to the new id, like every other piece of routing state
+        // above it (#1331). It used to be deleted here, and the justification —
+        // "a straggler command issued for the old workflow must keep failing the
+        // panel's fence" — is satisfied either way, because the OLD id ceases to
+        // resolve at all once the socket re-helloes under the new one.
+        //
+        // A REGRESSION, and one this file already knew about. #436 added
+        // `carryWorkflowCommandStamp` for exactly this, recording that deleting it
+        // "flapped sessions"; the #884 refactor rewrote this block and left a bare
+        // delete in its place. Thirty lines below, the surviving comment still
+        // argues the case and even names the scenario: "A reconnect hello that
+        // lands before the canvas identity is readable carries no uuid, which is
+        // enough to erase the stamp and wedge the tab for the rest of the session."
+        // That is #1331 verbatim — reported after a save/rename, which is one of
+        // the three events that mints a new tab id.
+        //
+        // Carrying cannot widen authorization. The panel authorizes a fenced
+        // command IFF stamp === the LIVE active workflow uuid, so a carried-but-
+        // stale stamp permits nothing a correct one would not; it simply mismatches
+        // and is refused, exactly as before. An ABSENT stamp is the asymmetric
+        // case: UiBridge then sends frames with no `workflow_uuid`, which the panel
+        // also counts as a mismatch, so every fenced command is refused. NOT
+        // `workflow_list`, which the panel deliberately exempts as its recovery probe
+        // (commandIsCanvasTargetless) — I claimed otherwise in the first version of this
+        // comment, an hour after reading the #1337 code that says so. The panel's
+        // re-advertise repair is
+        // capped at MISMATCH_REHELLO_MAX_PER_IDENTITY (3). Once those are spent the
+        // tab is wedged for the session, which is what cost the reporter four calls
+        // to recover a state the panel already believed it was in.
+        //
+        // If THIS hello does resolve an identity, the `set` below overwrites what
+        // we carried — new evidence always wins over old.
+        carryWorkflowCommandStamp(tabCommandWorkflowUuid, migratedFrom, panelTab);
         logger.info(
           `[panel-orchestrator] same-socket re-hello ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} — routing state carried; the shared session continues (#884)`,
         );
