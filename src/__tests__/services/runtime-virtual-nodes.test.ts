@@ -59,6 +59,31 @@ describe("a frontend-only node is not an unknown runtime (#1372)", () => {
     }
   });
 
+  it("a REGISTERED node that collides with a virtual name is still classified (codex P1)", async () => {
+    // THE SAFETY HOLE. The skip used to run before the /object_info lookup, so a
+    // third-party backend node legitimately named "Note" — registered, executable, and
+    // api_node:true — was skipped unexamined and the workflow reported "local /
+    // usesApiNodes:false". That tells the agent the run is confirmed FREE and skips the
+    // credit confirmation, which is the one outcome this classifier exists to prevent.
+    //
+    // Absence from the registry is not a heuristic for "virtual", it is the definition.
+    const r = await checkWorkflowRuntime(
+      graphOf("KSampler", "Note"),
+      depsWith({ KSampler: KSAMPLER, Note: { ...API_NODE, name: "Note" } }),
+    );
+    expect(r.runtime, "a registered api_node must never be skipped as virtual").toBe("mixed");
+    expect(r.usesApiNodes).toBe(true);
+  });
+
+  it("…and a registered LOCAL node of the same name is classified local, not skipped", async () => {
+    const r = await checkWorkflowRuntime(
+      graphOf("Note"),
+      depsWith({ Note: { input: { required: {} }, output: [], name: "Note" } }),
+    );
+    expect(r.runtime).toBe("local");
+    expect(r.usesApiNodes).toBe(false);
+  });
+
   it("a GENUINELY unrecognised node still collapses the verdict — the doubt is preserved", async () => {
     // The over-broad direction. If this stopped refusing, the safety flow would claim
     // "free" for a workflow that might contain a paid partner node.

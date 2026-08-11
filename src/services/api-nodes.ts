@@ -237,8 +237,19 @@ export async function checkWorkflowRuntime(
     // The set is IMPORTED from the converter rather than restated here. It already had to
     // know which types never reach the backend, and a second copy drifting from the first
     // is exactly how this bug happened.
-    if (NON_EXECUTING_NODE_TYPES.has(ct)) continue;
     const def = objectInfo[ct];
+    // …but ONLY when the server does not register it (codex P1). The skip used to run
+    // BEFORE this lookup, which meant a third-party backend node legitimately named `Note`
+    // or `PrimitiveNode` — and registered with api_node:true — was skipped unexamined and
+    // the workflow reported "local / usesApiNodes:false". That tells the agent the run is
+    // confirmed free and skips the credit confirmation, which is the one outcome this
+    // classifier exists to prevent. A safety check that can be bypassed by a name
+    // collision is worse than the false "unknown" it was fixing.
+    //
+    // Absence from /object_info is not a heuristic for "virtual", it is the definition:
+    // the frontend registers these, the backend does not. So a REGISTERED node of the same
+    // name is a real node and is classified as one.
+    if (!def && NON_EXECUTING_NODE_TYPES.has(ct)) continue;
     if (!def) {
       unknownNodes.push(ct);
       continue;
@@ -250,7 +261,9 @@ export async function checkWorkflowRuntime(
   // Virtual nodes are not classifiable EITHER WAY, so they leave the denominator too —
   // otherwise a workflow of one KSampler plus three Notes reads as 1-of-4 API and reports
   // "mixed" when it is entirely local.
-  const virtualCount = classTypes.filter((ct) => NON_EXECUTING_NODE_TYPES.has(ct)).length;
+  const virtualCount = classTypes.filter(
+    (ct) => !objectInfo[ct] && NON_EXECUTING_NODE_TYPES.has(ct),
+  ).length;
   const classifiable = classTypes.length - unknownNodes.length - virtualCount;
   let runtime: "local" | "api" | "mixed" | "unknown";
   let usesApiNodes: boolean | null;
