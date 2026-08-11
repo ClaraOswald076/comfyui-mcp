@@ -18,7 +18,7 @@
 //      a full SKILL.md is slow).
 
 import { spawn } from "node:child_process";
-import { makeGraph, parityVerdict } from "./knowledge-parity-mock-graph.mjs";
+import { makeGraph, parityVerdict, MOCK_WORKFLOW_UUID } from "./knowledge-parity-mock-graph.mjs";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,7 +31,7 @@ import { WebSocket } from "ws";
  *  floor fails that test instead of silently refusing every graph write in the smoke. */
 const MOCK_PANEL_VERSION = "0.13.0";
 /** A well-formed workflow uuid, so the per-command stamp fence has something to fence on. */
-const MOCK_WORKFLOW_UUID = "11111111-1111-4111-8111-111111111111";
+// MOCK_WORKFLOW_UUID is imported above — it belongs with the executors that answer with it.
 
 const PORT = Number(process.env.TEST_PORT || 9151);
 const MCP_ENTRY = fileURLToPath(new URL("../dist/index.js", import.meta.url));
@@ -245,7 +245,11 @@ async function main() {
     const discovery = calledListSkills || calledReadSkill || calledListPacks || calledReadPack;
     // Applied ready expertise = read the pack workflow (the expert graph) and/or
     // built nodes on the canvas from it.
-    const builtOnCanvas = (r.counts.graph_add_node || 0) >= 1;
+    // THE CANVAS, not one command that changes it (codex). The PREFERRED path is a single
+    // `graph_load` of the pack's ready workflow, which populates the canvas without a single
+    // `graph_add_node` — so counting adds alone failed the very route this smoke is meant to
+    // reward.
+    const builtOnCanvas = r.finalNodes > 0 || (r.counts.graph_add_node || 0) >= 1;
     const appliedPack = calledReadPack || discoveredKrea2;
 
     console.log(`\n===== CODEX KNOWLEDGE-PARITY SMOKE =====`);
@@ -263,7 +267,7 @@ async function main() {
     // canvas actually changed. `builtOnCanvas` was printed as a criterion and then left out
     // of the verdict (codex), so a run that read the pack and applied NOTHING — the
     // zero-node load this file also fixes — passed while reporting "built nodes: NO".
-    exitCode = parityVerdict({ discovery, discoveredKrea2, builtOnCanvas }) ? 0 : 1;
+    exitCode = parityVerdict({ discovery, discoveredKrea2, appliedPack, builtOnCanvas }) ? 0 : 1;
     console.log(`\n${exitCode === 0 ? "PASS" : "FAIL"} — knowledge parity ${exitCode === 0 ? "achieved" : "NOT achieved"}.`);
   } catch (e) {
     console.error("[kp-smoke] ERROR:", e.message);

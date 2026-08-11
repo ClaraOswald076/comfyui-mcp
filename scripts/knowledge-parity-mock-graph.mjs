@@ -10,6 +10,26 @@
  * Same move, same reason, as plugin/scripts/monitor-timeout.mjs (#1385).
  */
 
+/** A UI workflow's node list, when this object carries one. */
+function nodeArray(v) {
+  return Array.isArray(v?.nodes) ? v.nodes : undefined;
+}
+
+/**
+ * An API-format prompt: `{ "1": { class_type, inputs }, "2": {…} }`. Recognised only when
+ * EVERY key is numeric and every value looks like a node — a workflow object with two
+ * unrelated keys must not be mistaken for one, or the refusal stops meaning anything.
+ */
+function nodeIdMap(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+  const entries = Object.entries(v);
+  if (!entries.length) return undefined;
+  if (!entries.every(([k, node]) => /^\d+$/.test(k) && node && typeof node === "object")) {
+    return undefined;
+  }
+  return entries.map(([id, node]) => ({ id: Number(id), type: node.class_type ?? node.type, ...node }));
+}
+
 /** A SHAPE, never the payload: a workflow can carry prompts and paths, and this string
  *  goes into a transcript. */
 export function describeShape(value) {
@@ -19,6 +39,18 @@ export function describeShape(value) {
   const keys = Object.keys(value);
   return `an object with keys [${keys.slice(0, 8).join(", ")}${keys.length > 8 ? ", …" : ""}]`;
 }
+
+/**
+ * The workflow identity this mock tab holds.
+ *
+ * It lives HERE, not in the smoke script. When the executors were extracted it stayed
+ * behind in the script's lexical scope, and ES modules do not share that — so
+ * `workflow_list` threw a ReferenceError and answered `ok:false` on every call. Nothing
+ * caught it: the new tests never called `workflow_list`, and the one smoke run afterwards
+ * happened not to reach it. An extraction is a behaviour change until something proves
+ * otherwise (codex).
+ */
+export const MOCK_WORKFLOW_UUID = "11111111-1111-4111-8111-111111111111";
 
 export function makeGraph() {
   let seq = 0;
@@ -50,13 +82,16 @@ export function makeGraph() {
       // defect (comfyui-mcp-panel#1068). The observation was right; the panel it was
       // observing was this file.
       const wf = m.workflow ?? m.graph ?? m.data ?? m;
-      const incoming = Array.isArray(wf?.nodes)
-        ? wf.nodes
-        : Array.isArray(wf?.workflow?.nodes)
-          ? wf.workflow.nodes
-          : Array.isArray(wf?.prompt?.nodes)
-            ? wf.prompt.nodes
-            : undefined;
+      const incoming =
+        nodeArray(wf) ??
+        nodeArray(wf?.workflow) ??
+        nodeArray(wf?.prompt) ??
+        // AN API-FORMAT PROMPT IS A MAP KEYED BY NODE ID, and a real panel accepts one.
+        // Refusing it made the smoke fail where the product passes — a harness false
+        // NEGATIVE, which is the same class of lie as the false success this refusal was
+        // added to stop, just pointed the other way (codex).
+        nodeIdMap(wf?.prompt) ??
+        nodeIdMap(wf);
       // REFUSE, do not report a successful load of nothing (codex). An API-format prompt
       // is an object keyed by node id, not an array, and falling through to `[]` cleared
       // the canvas and answered `node_count: 0` — a successful-looking load that loaded
@@ -172,6 +207,9 @@ export function makeGraph() {
  * printing "built nodes on the live canvas: NO" — including the zero-node load this mock
  * used to produce.
  */
-export function parityVerdict({ discovery, discoveredKrea2, builtOnCanvas }) {
-  return Boolean(discovery && discoveredKrea2 && builtOnCanvas);
+export function parityVerdict({ discovery, discoveredKrea2, appliedPack, builtOnCanvas }) {
+  // `appliedPack` is required as well (codex). Without it an agent could read the Krea2
+  // knowledge, drop one unrelated node on the canvas, and PASS — which demonstrates that
+  // it can add a node, not that it used what it read.
+  return Boolean(discovery && discoveredKrea2 && appliedPack && builtOnCanvas);
 }

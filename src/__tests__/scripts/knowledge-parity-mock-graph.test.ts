@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { makeGraph, parityVerdict, describeShape } from "../../../scripts/knowledge-parity-mock-graph.mjs";
+import {
+  makeGraph,
+  parityVerdict,
+  describeShape,
+  MOCK_WORKFLOW_UUID,
+} from "../../../scripts/knowledge-parity-mock-graph.mjs";
 
 /**
  * The mock canvas's executors, exercised rather than grepped (#1384).
@@ -21,14 +26,27 @@ describe("#1384 — the mock's graph_load", () => {
     }
   });
 
+  it("loads an API-format prompt — a node-id map, which a real panel accepts", () => {
+    // Refusing this made the smoke fail where the PRODUCT passes: a harness false
+    // negative, the same class of lie as the false success the refusal was added to stop
+    // (codex). Recognised only when every key is numeric and every value is an object, so
+    // an ordinary workflow with two unrelated keys is still refused.
+    const { nodes, EXEC } = makeGraph();
+    const out = EXEC.graph_load({
+      workflow: { prompt: { "1": { class_type: "KSampler" }, "2": { class_type: "CLIPTextEncode" } } },
+    });
+    expect(out.loaded.node_count).toBe(2);
+    expect(nodes.size).toBe(2);
+  });
+
   it("REFUSES a shape it cannot read instead of reporting a load of nothing", () => {
     const { nodes, EXEC } = makeGraph();
     EXEC.graph_add_node({ class_type: "KSampler" });
     expect(nodes.size).toBe(1);
 
-    // An API-format prompt: an object keyed by node id, not an array. This used to fall
-    // through to an empty list, CLEAR the canvas, and answer node_count: 0.
-    expect(() => EXEC.graph_load({ workflow: { prompt: { "1": { class_type: "KSampler" } } } })).toThrow(
+    // Neither an array nor a node-id map: nothing here says how to build a canvas. This
+    // used to fall through to an empty list, CLEAR the canvas, and answer node_count: 0.
+    expect(() => EXEC.graph_load({ workflow: { format: "v2", data: "…" } })).toThrow(
       /SMOKE MOCK understands/,
     );
     // …and the canvas it could not load into is untouched, which is what "nothing was
@@ -41,7 +59,7 @@ describe("#1384 — the mock's graph_load", () => {
     const { EXEC } = makeGraph();
     const err = (() => {
       try {
-        EXEC.graph_load({ workflow: { prompt: { "1": { text: "a very private prompt" } } } });
+        EXEC.graph_load({ workflow: { note: "a very private prompt", format: "v2" } });
         return "";
       } catch (e) {
         return String((e as Error).message);
@@ -97,9 +115,63 @@ describe("#1384 — the verdict", () => {
   it("requires the canvas to have actually changed", () => {
     // Printed as one of four criteria and left out of the verdict, so a run that discovered
     // the pack and applied nothing passed while reporting "built nodes: NO".
-    expect(parityVerdict({ discovery: true, discoveredKrea2: true, builtOnCanvas: true })).toBe(true);
-    expect(parityVerdict({ discovery: true, discoveredKrea2: true, builtOnCanvas: false })).toBe(false);
-    expect(parityVerdict({ discovery: true, discoveredKrea2: false, builtOnCanvas: true })).toBe(false);
-    expect(parityVerdict({ discovery: false, discoveredKrea2: true, builtOnCanvas: true })).toBe(false);
+    const all = { discovery: true, discoveredKrea2: true, appliedPack: true, builtOnCanvas: true };
+    expect(parityVerdict(all)).toBe(true);
+    // Every criterion is load-bearing, including `appliedPack` — without it an agent could
+    // read the Krea2 knowledge, drop one unrelated node, and PASS, which demonstrates that
+    // it can add a node rather than that it used what it read (codex).
+    for (const missing of ["discovery", "discoveredKrea2", "appliedPack", "builtOnCanvas"]) {
+      expect(parityVerdict({ ...all, [missing]: false }), `${missing} must matter`).toBe(false);
+    }
+  });
+});
+
+describe("#1384 — workflow_list, which nothing called", () => {
+  it("answers with this tab's workflow identity", () => {
+    // The extraction left MOCK_WORKFLOW_UUID behind in the old script's lexical scope, so
+    // this threw a ReferenceError and answered ok:false on every call — invisible because
+    // no test called it and the one smoke run afterwards happened not to reach it. An
+    // extraction is a behaviour change until something proves otherwise.
+    const { EXEC } = makeGraph();
+    const out = EXEC.workflow_list({});
+    expect(out.active.workflow_uuid).toBe(MOCK_WORKFLOW_UUID);
+    expect(out.workflows[0].workflow_uuid).toBe(MOCK_WORKFLOW_UUID);
+    // …and it is a well-formed uuid, or the per-command stamp fence has nothing to fence on.
+    expect(MOCK_WORKFLOW_UUID).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+  });
+
+  it("EVERY executor answers without throwing", () => {
+    // The general form of the bug above: an extracted executor that references something
+    // left behind fails only when called. Calling each one with a plausible argument is
+    // cheap and would have caught it.
+    // A FRESH GRAPH PER EXECUTOR. Sharing one canvas made this order-dependent: whichever
+    // executor ran first could clear or delete what the next one was handed, so the loop
+    // failed on state rather than on the thing it is checking.
+    const names = Object.keys(makeGraph().EXEC);
+    for (const name of names) {
+      const { EXEC } = makeGraph();
+      const added = EXEC.graph_add_node({ class_type: "KSampler" }).added;
+      const args: Record<string, unknown> = {
+        node_id: added.id,
+        from_node_id: added.id,
+        to_node_id: added.id,
+        class_type: "KSampler",
+        widget: "seed",
+        value: 1,
+        title: "t",
+        node_ids: [added.id],
+        items: [],
+        query: "k",
+        workflow: { nodes: [{ id: 1, type: "KSampler" }] },
+        pos: [0, 0],
+        mode: 0,
+      };
+      expect(
+        () => (EXEC[name] as (m: unknown) => unknown)(args),
+        `${name} must not throw`,
+      ).not.toThrow();
+    }
   });
 });

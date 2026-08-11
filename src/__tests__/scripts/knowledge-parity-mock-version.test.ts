@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
+import { MOCK_WORKFLOW_UUID } from "../../../scripts/knowledge-parity-mock-graph.mjs";
 import {
   BRIDGE_CMD_MIN_PANEL_VERSION,
   BRIDGE_CAPABILITY_MIN_PANEL_VERSION,
@@ -127,9 +128,11 @@ describe("#1384 — the knowledge-parity mock keeps up with the fences", () => {
         new RegExp(`${cap}:\\s*true`),
       );
     }
-    // …and a workflow uuid for the per-command stamp to fence on.
+    // …and a workflow uuid for the per-command stamp to fence on. It is DECLARED in the
+    // mock-graph module now and imported here, so this reads the module rather than the
+    // script — a grep that keeps passing on a file the value has left is not a check.
     expect(s).toMatch(/workflow_uuid: MOCK_WORKFLOW_UUID/);
-    expect(declared("MOCK_WORKFLOW_UUID")).toMatch(
+    expect(MOCK_WORKFLOW_UUID).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
     );
   });
