@@ -807,16 +807,13 @@ export async function getOutputImage(
   // is the only thing standing between the caller and a corrupt "image".
   const jsonRefusal = allowJson && ext === ".json" ? jsonAttachmentRefusal(result.base64) : null;
   const isJson = allowJson && ext === ".json" && jsonRefusal === null;
-  // AN EMPTY BODY IS A MISSING FILE, NOT A CONTENT REFUSAL (codex P2).
-  //
-  // `jsonAttachmentRefusal` answers "not savable" for an empty payload too, but this file
-  // already establishes what a 200-with-empty-body means: it is what an unresolved `input`
-  // reference looks like, which is why #385 made it a structured not-found in the first
-  // place. Routing it through the new code would take the missing-file branch away from
-  // callers for `.json` alone — the same wrong-cause failure this issue is about, just
-  // pointed the other way. Bytes arrived and were judged: content refusal. No bytes
-  // arrived: nothing was judged.
-  const contentRejected = jsonRefusal !== null && result.base64.length > 0;
+  // WHICH REFUSAL THIS IS decides the code, the message and the remedy — see
+  // `jsonAttachmentRefusal`. Byte length was the first attempt at this discriminator and it
+  // got the error-envelope case backwards: a `/view` that answers `{"error":"not found"}`
+  // is the server reporting an ABSENT FILE, and calling that a content refusal sends the
+  // caller to inspect a payload when the filename is the thing to look at.
+  const contentRejected = jsonRefusal?.kind === "content";
+
   if ((!isImage && !isMedia && !isJson) || result.base64.length === 0) {
     const where = subfolder ? `${type}/${subfolder}` : type;
     throw new ComfyUIError(
@@ -825,9 +822,15 @@ export async function getOutputImage(
           // arrived and was rejected on its CONTENT sends the caller to re-check a
           // filename that is perfectly correct — the wrong-cause failure this issue is
           // about, reproduced by its own fix.
-          `ComfyUI /view returned ${jsonRefusal}, for "${filename}" (${where}). ` +
+          `ComfyUI /view returned ${jsonRefusal?.reason}, for "${filename}" (${where}). ` +
           `Nothing was saved.`
-        : `ComfyUI /view did not return an image for "${filename}" (${where}); ` +
+        : jsonRefusal
+          ? // A MISSING-kind JSON refusal: say what came back AND point at the name, which
+            // is the part the caller can act on.
+            `ComfyUI /view returned ${jsonRefusal.reason}, for "${filename}" (${where}). ` +
+            `Nothing was saved. The file may not exist in the ComfyUI ${type} directory — ` +
+            `check the filename/subfolder (e.g. via get_image (action:"list_outputs") or get_history).`
+          : `ComfyUI /view did not return an image for "${filename}" (${where}); ` +
           `got ${result.base64.length === 0 ? "an empty response" : `content-type "${result.mimeType}"`}. ` +
           `The file may not exist in the ComfyUI ${type} directory — ` +
           `check the filename/subfolder (e.g. via get_image (action:"list_outputs") or get_history).`,
@@ -843,7 +846,9 @@ export async function getOutputImage(
         subfolder,
         mimeType: result.mimeType,
         // The reason, structured, so a caller does not have to parse the sentence.
-        ...(contentRejected ? { rejectedBecause: jsonRefusal } : {}),
+        // The reason rides along on BOTH kinds — a caller should not have to parse a
+        // sentence to learn the server sent an error envelope rather than nothing at all.
+        ...(jsonRefusal ? { rejectedBecause: jsonRefusal.reason } : {}),
       },
     );
   }
@@ -866,6 +871,12 @@ export async function getOutputImage(
  */
 const MAX_JSON_ATTACHMENT_BYTES = 32 * 1024 * 1024;
 
+/** Why a `.json` payload is not savable, and which of the two remedies applies. */
+interface JsonRefusal {
+  kind: "missing" | "content";
+  reason: string;
+}
+
 /**
  * Why a `.json` payload is not savable, or null when it is (#1373).
  *
@@ -881,24 +892,40 @@ const MAX_JSON_ATTACHMENT_BYTES = 32 * 1024 * 1024;
  * has" — so an error body is caught whatever it is called, and a real workflow is kept even
  * if it has an `error` extension of its own.
  */
-function jsonAttachmentRefusal(base64: string): string | null {
-  if (base64.length === 0) return "an empty response";
+function jsonAttachmentRefusal(base64: string): JsonRefusal | null {
+  // WHY THE KIND EXISTS (codex round 3). "Nothing was saved" is one outcome with two
+  // different remedies, and the remedy is the whole value of the answer:
+  //
+  //   missing — the server says it has no such file (an error envelope, or nothing at
+  //             all). CHECK THE FILENAME. This is what IMAGE_NOT_FOUND means and what
+  //             #385 added it for.
+  //   content — a body arrived and it is not the attachment: an HTML login page from a
+  //             proxy, a truncated stream, something over the ceiling. Checking the
+  //             filename is useless here; the name was right and the payload was wrong.
+  //
+  // Deciding this on emptiness alone got the error-envelope case backwards: a `/view`
+  // answering `{"error":"not found"}` for a file that is genuinely absent is the server
+  // TELLING us it is absent, and routing that to "the payload was unusable" sends the
+  // caller to inspect content instead of the name.
+  if (base64.length === 0) return { kind: "missing", reason: "an empty response" };
   // Decoded size from the base64 LENGTH, minus padding, so the ceiling costs nothing to
   // enforce and does not overestimate a padded payload by a byte or two at the boundary.
   const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
   const approxBytes = Math.floor((base64.length * 3) / 4) - padding;
   if (approxBytes > MAX_JSON_ATTACHMENT_BYTES) {
-    return (
-      `a ${(approxBytes / 1024 ** 2).toFixed(1)} MB JSON body, over the ` +
-      `${MAX_JSON_ATTACHMENT_BYTES / 1024 ** 2} MB ceiling for a workflow attachment — ` +
-      `parsing it to check it would cost that much again in memory, so it was refused unread`
-    );
+    return {
+      kind: "content",
+      reason:
+        `a ${(approxBytes / 1024 ** 2).toFixed(1)} MB JSON body, over the ` +
+        `${MAX_JSON_ATTACHMENT_BYTES / 1024 ** 2} MB ceiling for a workflow attachment — ` +
+        `parsing it to check it would cost that much again in memory, so it was refused unread`,
+    };
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(Buffer.from(base64, "base64").toString("utf8"));
   } catch {
-    return "a body that is not valid JSON";
+    return { kind: "content", reason: "a body that is not valid JSON" };
   }
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
     const rec = parsed as Record<string, unknown>;
@@ -906,11 +933,15 @@ function jsonAttachmentRefusal(base64: string): string | null {
     const workflowMarkers = ["nodes", "links", "last_node_id", "extra", "prompt", "workflow"];
     const looksLikeAWorkflow = workflowMarkers.some((k) => k in rec);
     if (errorish.length > 0 && !looksLikeAWorkflow) {
-      return (
-        `a JSON ERROR body (it carries "${errorish[0]}" and none of the keys a workflow has), ` +
-        `not the attachment you asked for — saving it would write a failure to disk under ` +
-        `the name of the thing that failed`
-      );
+      return {
+        // MISSING, not content. The server answered the request by saying it could not
+        // serve it; the actionable fact is the name, not the bytes.
+        kind: "missing",
+        reason:
+          `a JSON ERROR body (it carries "${errorish[0]}" and none of the keys a workflow has), ` +
+          `not the attachment you asked for — saving it would write a failure to disk under ` +
+          `the name of the thing that failed`,
+      };
     }
   }
   return null;

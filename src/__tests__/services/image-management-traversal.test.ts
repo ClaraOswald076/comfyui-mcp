@@ -783,7 +783,9 @@ describe("#1373 — a .json attachment is accepted by PARSING it, not by its con
     expect(err.code).toBe("IMAGE_NOT_FOUND");
     // ...and it must say the file may not exist, which is the actionable part.
     expect(err.message).toMatch(/may not exist/);
-    expect(err.details?.rejectedBecause).toBeUndefined();
+    // The reason rides along on both kinds: a caller should not have to parse a sentence
+    // to learn whether the server sent an error envelope or nothing at all.
+    expect(err.details?.rejectedBecause).toBe("an empty response");
   });
 
   it("catches the OTHER ComfyUI error shapes, not just a top-level `error` (codex)", async () => {
@@ -801,7 +803,13 @@ describe("#1373 — a .json attachment is accepted by PARSING it, not by its con
     // The prose named the real reason; the CODE still said the file was missing — and the
     // code is the part automation reads. A caller branching on it retried, re-listed the
     // directory, and asked the user to check a filename that was never wrong.
-    fetchImageMock.mockResolvedValue(jsonBody('{"error":"not found"}'));
+    //
+    // An HTML page from a proxy is the clean example of this kind: the name was right and
+    // the payload was wrong, so checking the filename is useless.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from("<html><body>login required</body></html>", "utf8").toString("base64"),
+      mimeType: "application/json",
+    });
     const err = await getOutputImage("wf.json", "input", "", {
       allowMedia: true,
       allowJson: true,
@@ -809,7 +817,26 @@ describe("#1373 — a .json attachment is accepted by PARSING it, not by its con
     expect(err).toBeInstanceOf(ComfyUIError);
     expect(err.code).toBe("ATTACHMENT_CONTENT_REJECTED");
     // The reason, structured, so a caller need not parse the sentence to act on it.
+    expect(err.details?.rejectedBecause).toMatch(/not valid JSON/);
+    // …and it must NOT send them off to re-check a filename that was never the problem.
+    expect(err.message).not.toMatch(/may not exist/);
+  });
+
+  it("a JSON ERROR ENVELOPE is the server saying the file is ABSENT (codex round 3)", async () => {
+    // Byte length was the first discriminator and it got this backwards. `/view` answering
+    // `{"error":"not found"}` for a file that is genuinely gone is the server REPORTING
+    // that — so the remedy is the filename, and calling it a content refusal sends the
+    // caller to inspect a payload instead.
+    fetchImageMock.mockResolvedValue(jsonBody('{"error":"not found"}'));
+    const err = await getOutputImage("wf.json", "input", "", {
+      allowMedia: true,
+      allowJson: true,
+    }).catch((e) => e);
+    expect(err.code).toBe("IMAGE_NOT_FOUND");
+    // Both halves: what came back, and the part the caller can act on.
     expect(err.details?.rejectedBecause).toMatch(/JSON ERROR body/);
+    expect(err.message).toMatch(/JSON ERROR body/);
+    expect(err.message).toMatch(/check the filename/);
   });
 
   it("…and a genuinely absent file still says IMAGE_NOT_FOUND", async () => {
@@ -826,7 +853,7 @@ describe("#1373 — a .json attachment is accepted by PARSING it, not by its con
       allowJson: true,
     }).catch((e) => e);
     expect(missingJson.code).toBe("IMAGE_NOT_FOUND");
-    expect(missingJson.details?.rejectedBecause).toBeUndefined();
+    expect(missingJson.details?.rejectedBecause).toBe("an empty response");
 
     // …and the non-JSON path, unchanged.
     fetchImageMock.mockResolvedValue({
