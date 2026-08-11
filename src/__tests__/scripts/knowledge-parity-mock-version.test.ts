@@ -129,6 +129,27 @@ describe("#1384 — the knowledge-parity mock keeps up with the fences", () => {
     );
   });
 
+  it("an unimplemented command names the harness, so it is not filed as a panel defect", () => {
+    // The subset will never be complete, so the REFUSAL has to carry its own provenance.
+    // A bare `unknown <cmd>` from a tab advertising a current panel version reads as a
+    // product defect, and an agent with a bug-report tool files it as one — which is
+    // exactly what happened.
+    const s = source();
+    const dispatch = s.slice(s.indexOf("const fn = EXEC[m.cmd]"), s.indexOf("console.log(`   <cmd"));
+    expect(dispatch).toMatch(/SMOKE MOCK/);
+    expect(dispatch).toMatch(/[Dd]o not file this as a panel defect/);
+  });
+
+  it("graph_load reads the shapes a workflow actually arrives in", () => {
+    // Reading only `workflow.nodes` loaded ZERO nodes from a pack workflow that nests them
+    // elsewhere, and the mock then honestly reported node_count: 0 for a 16-node graph —
+    // which reads as the panel silently dropping the workflow.
+    const s = source();
+    const loader = s.slice(s.indexOf("graph_load:"), s.indexOf("graph_connect:"));
+    expect(loader).toMatch(/wf\?\.workflow\?\.nodes/);
+    expect(loader).toMatch(/wf\?\.prompt\?\.nodes/);
+  });
+
   it("the mock's socket sends an Origin, because a real panel's does", () => {
     // The THIRD fence this mock had to stop failing. A browser sets Origin on the upgrade
     // and forbids page JS from overriding it, so the bridge treats it as trusted
@@ -150,8 +171,13 @@ describe("#1384 — the knowledge-parity mock keeps up with the fences", () => {
     // graph_load was missing, so the preferred one-shot panel_load_workflow(pack:…) path
     // could not complete and the smoke could only reach the capability by the long route —
     // measuring a fallback while reporting on the primary.
+    // graph_outline / nodes_list were added after a smoke run FILED A BUG about their
+    // absence (comfyui-mcp-panel#1068). The mock advertises a panel version that implies
+    // the whole bridge set, so an agent that checks the version first is entitled to them;
+    // throwing `unknown graph_outline` at it is the same lie as advertising no version at
+    // all, and this time it cost a false report against the real panel.
     const s = source();
-    for (const cmd of ["graph_clear", "graph_load", "graph_get_state"]) {
+    for (const cmd of ["graph_clear", "graph_load", "graph_get_state", "graph_outline", "nodes_list"]) {
       expect(s, `the mock executor must implement ${cmd}`).toMatch(new RegExp(`${cmd}:\\s*[({]`));
     }
   });

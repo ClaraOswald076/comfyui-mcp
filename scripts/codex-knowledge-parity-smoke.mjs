@@ -61,8 +61,21 @@ function makeGraph() {
     graph_clear: () => { const c = nodes.size; nodes.clear(); return { cleared: c }; },
     // #1384 — without this the preferred one-shot panel_load_workflow(pack:…) path cannot
     // complete, so the smoke could only reach the capability by the long route.
-    graph_load: ({ workflow }) => {
-      const incoming = Array.isArray(workflow?.nodes) ? workflow.nodes : [];
+    graph_load: (m) => {
+      // ACCEPT THE SHAPES A WORKFLOW ACTUALLY ARRIVES IN. Reading only `workflow.nodes`
+      // meant a pack workflow that nests them elsewhere loaded ZERO nodes — and the mock
+      // then honestly reported `node_count: 0` for a 16-node graph, which an agent
+      // correctly read as the panel silently dropping its workflow and filed as a panel
+      // defect (comfyui-mcp-panel#1068). The observation was right; the panel it was
+      // observing was this file.
+      const wf = m.workflow ?? m.graph ?? m.data ?? m;
+      const incoming = Array.isArray(wf?.nodes)
+        ? wf.nodes
+        : Array.isArray(wf?.workflow?.nodes)
+          ? wf.workflow.nodes
+          : Array.isArray(wf?.prompt?.nodes)
+            ? wf.prompt.nodes
+            : [];
       nodes.clear();
       for (const n of incoming) {
         const id = Number(n.id ?? nodes.size + 1);
@@ -112,6 +125,28 @@ function makeGraph() {
       ],
       open: [],
     }),
+    // COMMANDS THE ADVERTISED VERSION IMPLIES (comfyui-mcp-panel#1068). The hello claims a
+    // panel new enough for the whole bridge set; throwing `unknown graph_outline` at an
+    // agent that checked the version first is the mock lying again, and this time the agent
+    // did the right thing with the lie — it treated a missing capability as a defect and
+    // filed a report against the real panel. A harness that provokes false bug reports
+    // costs more than the coverage it buys.
+    graph_outline: () => ({
+      scope: "root",
+      node_count: nodes.size,
+      nodes: [...nodes.values()].map((n) => ({ id: n.id, type: n.type, title: n.title })),
+    }),
+    nodes_list: () => ({
+      count: nodes.size,
+      nodes: [...nodes.values()].map(brief),
+    }),
+    graph_find_nodes: ({ query }) => {
+      const q = String(query ?? "").toLowerCase();
+      const hits = [...nodes.values()].filter(
+        (n) => !q || n.type.toLowerCase().includes(q) || n.title.toLowerCase().includes(q),
+      );
+      return { count: hits.length, nodes: hits.map(brief) };
+    },
     graph_select_nodes: ({ node_ids }) => ({ selected: node_ids }),
     set_todo: ({ items }) => ({ ok: true, count: (items || []).length }),
     ask_user: (m) => (m.options && m.options[0] && m.options[0].label) || "yes",
@@ -225,7 +260,21 @@ function runScenario(task) {
           );
           return;
         }
-        try { const fn = EXEC[m.cmd]; if (!fn) throw new Error(`unknown ${m.cmd}`); reply = { rid: m.rid, ok: true, result: fn(m) }; }
+        try {
+          const fn = EXEC[m.cmd];
+          // SAY WHAT THIS IS. `unknown graph_outline` from a tab advertising a current
+          // panel version reads as a product defect, and an agent with a bug-report tool
+          // will file it as one. Naming the harness in the error costs nothing and stops
+          // the next run from opening an issue about a stub.
+          if (!fn)
+            throw new Error(
+              `unknown ${m.cmd} — this tab is the knowledge-parity SMOKE MOCK ` +
+                `(scripts/codex-knowledge-parity-smoke.mjs), not a real panel. It implements a ` +
+                `subset of the bridge. Do not file this as a panel defect; work with what is ` +
+                `available or say the command is unavailable here.`,
+            );
+          reply = { rid: m.rid, ok: true, result: fn(m) };
+        }
         catch (e) { reply = { rid: m.rid, ok: false, error: e.message }; }
         console.log(`   <cmd ${m.cmd}>`);
         try { ws.send(JSON.stringify(reply)); } catch {}
