@@ -11976,7 +11976,29 @@ export function createPanelMcpServer(
   workflowTargets?: WorkflowTargetStore,
 ): McpSdkServerConfigWithInstance {
   const ctx = makePanelToolCtx(bridge, tabId, workflowTargets);
-  const defs = buildPanelToolDefs();
+  // #873 — THE SECOND PANEL REGISTRATION PATH. This one serves the Anthropic Agent SDK
+  // (Claude backend, in-process transport); registerPanelTools serves the MCP SDK. They
+  // build from the SAME buildPanelToolDefs(), so filtering only the other one left
+  // `panel_run` queueing renders under PRESET=readonly for every Claude-backend tab — the
+  // exact hole the previous round closed on the sibling path and, by fixing only one of
+  // two, left open. Filtering at the shared def list would be tidier and is deliberately
+  // not done here: both call sites are then trivially greppable, and the wiring tests
+  // assert on each by name.
+  const policy = resolveToolSurfacePolicy();
+  const withheldSdk: string[] = [];
+  const defs = buildPanelToolDefs().filter((d) => {
+    if (policy.active && !toolAllowed(d.name, policy)) {
+      withheldSdk.push(d.name);
+      return false;
+    }
+    return true;
+  });
+  if (withheldSdk.length) {
+    toolPolicyLogger.info(
+      `[panel-tools] surface restricted by policy${policy.preset ? ` (preset "${policy.preset}")` : ""} — ` +
+        `${withheldSdk.length} panel tool(s) withheld from the in-process server`,
+    );
+  }
   // The Anthropic SDK's tool() accepts (name, description, zodRawShape, cb). The
   // shared handler is transport-agnostic — bind it to this tab's ctx. Each def's
   // schema is a distinct zod shape, so the produced tool generics differ; widen

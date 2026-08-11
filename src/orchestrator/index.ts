@@ -1876,6 +1876,22 @@ export async function runPanelOrchestrator(): Promise<void> {
     // it as a real env override — a revoke that did not revoke.
     // Test-only tool-call trace (knowledge-parity smoke). No-op unless set.
     ...(process.env.COMFYUI_MCP_TOOL_TRACE ? { COMFYUI_MCP_TOOL_TRACE: process.env.COMFYUI_MCP_TOOL_TRACE } : {}),
+    // #873 — the operator's tool-surface policy MUST reach the spawned child. This env is
+    // CONSTRUCTED, not inherited (deliberately — see the credentials note above), and the
+    // MCP SDK spawns stdio children with a PATH/HOME-class default environment, so an
+    // unforwarded variable simply does not exist over there. Without this the panel tools
+    // are withheld and LOGGED as withheld while the agent's own comfyui child still
+    // offers download_model, install_custom_node, restart_comfyui and comfy_cli — a
+    // filter that reports success and restricts the wrong half of the surface.
+    ...(process.env.COMFYUI_MCP_TOOL_PRESET
+      ? { COMFYUI_MCP_TOOL_PRESET: process.env.COMFYUI_MCP_TOOL_PRESET }
+      : {}),
+    ...(process.env.COMFYUI_MCP_TOOL_ALLOW
+      ? { COMFYUI_MCP_TOOL_ALLOW: process.env.COMFYUI_MCP_TOOL_ALLOW }
+      : {}),
+    ...(process.env.COMFYUI_MCP_TOOL_DENY
+      ? { COMFYUI_MCP_TOOL_DENY: process.env.COMFYUI_MCP_TOOL_DENY }
+      : {}),
   });
 
   // The orchestrator-hosted loopback HTTP MCP for panel_* tools. Started for the

@@ -43,54 +43,108 @@
  * Per-action policy is the real answer and is deliberately not attempted here; it needs a
  * vocabulary these tools do not yet expose uniformly.
  */
-const MUTATING_TOOLS = [
+export const MUTATING_TOOLS = [
+  "apply_manifest",
+  // action:"import" installs an app from the public registry and creates it locally.
+  "apps",
+  "bisect",
+  "clear_vram",
+  "comfy_cli",
+  "create_workflow",
+  "download_model",
+  // action:"set" writes persistent config.
+  "get_defaults",
   "install_comfyui",
   "install_custom_node",
-  "download_model",
+  // action:"remove" deletes a model FILE; add_path/remove_path rewrite
+  // extra_model_paths.yaml.
+  "list_local_models",
+  // action:"install_deps" resolves and INSTALLS custom-node packs through
+  // ComfyUI-Manager — it downloads and RUNS third-party code on the ComfyUI host.
+  // Missed by every earlier version of this list, including the pattern-matching
+  // completeness test, because the verb is `install_deps` and the pattern was `^install$`.
+  "list_packs",
   "node_pack",
   "node_snapshot",
+  // action:"clear"/"cancel" destroys work — someone ELSE's, in the shared deployment
+  // this feature exists for.
+  "queue",
   "restart_comfyui",
-  "clear_vram",
-  "apply_manifest",
-  "comfy_cli",
   "runpod",
   "runpod_watch",
-  "train_start",
-  "train_prepare_dataset",
-  "train_doctor",
-  "workspace",
   "save_workflow",
-  "create_workflow",
+  // Sets up the trainer itself: docker, GPU passthrough, venv.
+  "train_doctor",
+  "train_prepare_dataset",
+  "train_start",
   "upload_image",
-  "bisect",
-  // …the consolidated ones a name-based list misses:
-  "list_local_models",
-  "search_custom_nodes",
-  "get_defaults",
-  "queue",
-];
-
-/** …plus everything that queues work or spends money. */
-const EXECUTION_TOOLS = [
-  "generate_image",
-  "enqueue_workflow",
-  "batch",
-  "apps",
-  "list_api_nodes",
+  "workspace",
 ];
 
 /**
- * Action names that mean a tool can change something. Used ONLY by the completeness test,
- * which scans the live catalog and fails when a tool advertising one of these is missing
- * from the `safe` deny list.
+ * Queues work, spends money, writes a file, or publishes something. `safe` allows these
+ * — rendering is the point of the product — and only `readonly` withholds them.
+ */
+export const EXECUTION_TOOLS = [
+  "batch",
+  "enqueue_workflow",
+  "generate_image",
+  // action:"convert" writes a converted file, and video/audio outputs are SAVED to a
+  // model-chosen directory. Fetching is a read; this tool does not only fetch.
+  "get_image",
+  // Runs hosted partner nodes that spend PAID credits.
+  "list_api_nodes",
+  // Files a PUBLIC GitHub issue under the operator's token. Nothing on the machine
+  // changes, so `safe` permits it; `readonly` promises "nothing written" and a public
+  // issue written by whoever is prompting a shared frontend is squarely a write.
+  "report_issue",
+];
+
+/**
+ * Neither mutates nor spends. Allowed by every preset.
  *
- * The hand-written list above stays hand-written — it is auditable, and an operator can
- * read it. What this adds is that it cannot silently ROT: the next consolidation that
- * hides `action:"delete"` behind an inspection-sounding name fails a test instead of
- * quietly widening every deployment's surface.
+ * `search_custom_nodes` IS ON THIS LIST, AND USED TO BE ON THE MUTATING ONE. I denied it
+ * claiming `action:"install"` installs a node pack. It has exactly two actions, `search`
+ * and `details`, and is read-only and network-only; the installing tool is
+ * `install_custom_node`, already denied. The claim came from its description MENTIONING
+ * `install_custom_node (action:"install")` — the same cross-reference confusion that
+ * `declaredActions()` below exists to strip, made by me while reading rather than by the
+ * scanner. The net effect was an inversion worth stating plainly: `safe` withheld a pure
+ * registry read while allowing `list_packs`, which genuinely installs.
+ */
+export const READONLY_TOOLS = [
+  "calculate",
+  "get_history",
+  "get_system_stats",
+  "get_workflow",
+  // action:"propose" says so itself: "This does NOT write". Read + network only.
+  "model_metadata",
+  "search_custom_nodes",
+  "visualize_workflow",
+];
+
+/**
+ * Action names that mean a tool can change something. A SECONDARY cross-check, and it is
+ * important to be honest about how little it is worth on its own.
+ *
+ * The first version of this feature relied on a scan like this AS the completeness
+ * guarantee, with the pattern anchored to whole verbs — `^install$`. `list_packs` declares
+ * `action:"install_deps"`, so the scan did not match it, and `list_packs` INSTALLS AND RUNS
+ * third-party code on the ComfyUI host. The test passed 17/17 with that hole wide open,
+ * which is the worst possible outcome for a check whose entire job is to notice holes: it
+ * was read as coverage.
+ *
+ * A pattern over tool descriptions can only ever catch the cases someone already thought
+ * of. So the real guarantee is now the LEDGER — every live tool must appear in exactly one
+ * of MUTATING/EXECUTION/READONLY, and a new tool in none of them fails a test. That cannot
+ * silently rot, because the failure mode is "unclassified", not "assumed harmless".
+ *
+ * What this pattern is still good for: catching a tool someone classified READONLY that
+ * advertises a mutating action — a wrong hand-classification rather than a missing one.
+ * The prefix form (`install_deps`, `add_path`, `generate_skill`) is deliberate.
  */
 export const MUTATING_ACTION_NAMES =
-  /^(remove|delete|clear|cancel|uninstall|install|reset|kill|stop|restart|purge|prune|apply|create|upload|train|add_path|remove_path|set|save|write|switch|update|fix|disable|enable)$/i;
+  /^(remove|delete|clear|cancel|uninstall|install|reset|kill|stop|restart|purge|prune|apply|create|upload|train|add|set|save|write|switch|update|fix|disable|enable|import|convert|generate|prepare|download|move|rename)(_|$)/i;
 
 /**
  * Verbs that mean "queue work / spend", which `safe` deliberately ALLOWS — rendering is
@@ -108,8 +162,27 @@ export const EXECUTION_ACTION_NAMES = /^(enqueue|start|submit|run)$/i;
  * does not exist. A completeness check that cries wolf gets muted, and then it is not a
  * check.
  */
-export function declaredActions(description: string): string[] {
-  const withoutCrossRefs = description.replace(/\b[a-z_0-9]+\s*\(action:"[a-z_0-9]+"\)/gi, "");
+export function declaredActions(
+  description: string,
+  opts: { selfName?: string; knownTools?: ReadonlySet<string> } = {},
+): string[] {
+  const { selfName, knownTools } = opts;
+  // Both spellings occur in the real descriptions: `get_defaults (action:"set")` and
+  // `download_model action:"download_civitai"`. Only the first was stripped, so
+  // model_metadata — which is read-only and merely mentions where a sidecar comes from —
+  // was reported as advertising a download.
+  const withoutCrossRefs = description.replace(
+    /\b([a-z_0-9]+)\s*(?:\(\s*)?action:"[a-z_0-9]+"\s*\)?/gi,
+    (match, refName: string) => {
+      // OVER-STRIPPING IS THE DANGEROUS DIRECTION: a tool whose own declaration got eaten
+      // looks action-free, and a check that sees nothing reports no hole. So a reference
+      // is removed ONLY when it names a tool that is not this one — a self-reference
+      // ("model_metadata action:\"read\"") is kept, and so is a name nobody recognises.
+      if (selfName && refName === selfName) return match;
+      if (knownTools && !knownTools.has(refName)) return match;
+      return "";
+    },
+  );
   return [...new Set([...withoutCrossRefs.matchAll(/action:"([a-z_0-9]+)"/g)].map((m) => m[1]))];
 }
 
@@ -149,20 +222,47 @@ export const TOOL_PRESETS: Record<string, string[]> = {
 export interface ToolSurfacePolicy {
   /** Explicit allow list. When non-empty, ONLY these may register. */
   allow: string[];
-  /** Deny list, including any preset expansion. */
+  /**
+   * Explicit COMFYUI_MCP_TOOL_DENY entries. Kept SEPARATE from the preset's, because the
+   * two lose to an allow list differently: a preset is a broad default an allow list is
+   * entitled to refine (that is how you opt two `panel_*` tools back in), while an
+   * explicit deny is the operator naming a tool to withhold — as explicit as the allow
+   * list, and the tie goes to the smaller surface.
+   */
   deny: string[];
+  /** The preset's deny patterns, if a preset was named. */
+  presetDeny: string[];
   /** True when the operator configured anything at all. */
   active: boolean;
   /** The preset name, when one was named — for disclosure in logs. */
   preset?: string;
 }
 
-function splitList(raw: string | undefined): string[] {
-  if (!raw) return [];
-  return raw
+/**
+ * A variable that is SET BUT EMPTY throws, rather than silently meaning "no rules".
+ *
+ * `COMFYUI_MCP_TOOL_ALLOW=${ALLOWED_TOOLS}` in a docker-compose file with `ALLOWED_TOOLS`
+ * unset expands to an empty string. Treating that as "no rules configured" produces the
+ * full tool surface with no log — the identical fail-open the unknown-preset throw was
+ * added to eliminate, reached by a different route. Setting the variable is the operator
+ * stating an intent; an empty value cannot satisfy it either way, so neither answer is
+ * safe to assume.
+ */
+function splitList(raw: string | undefined, varName: string): string[] {
+  if (raw === undefined) return [];
+  const items = raw
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+  if (items.length === 0) {
+    throw new Error(
+      `${varName} is set but empty. Refusing to start: this is usually an unexpanded ` +
+        `shell variable (e.g. \`${varName}=\${ALLOWED_TOOLS}\` with ALLOWED_TOOLS unset), and ` +
+        `treating it as "no rules" would expose the FULL tool surface while you believe it is ` +
+        `restricted. Give it a value, or remove the variable entirely.`,
+    );
+  }
+  return items;
 }
 
 /**
@@ -195,9 +295,17 @@ export function toolMatches(name: string, pattern: string): boolean {
  * for success.
  */
 export function resolveToolSurfacePolicy(env: NodeJS.ProcessEnv = process.env): ToolSurfacePolicy {
-  const allow = splitList(env.COMFYUI_MCP_TOOL_ALLOW);
-  const denyRaw = splitList(env.COMFYUI_MCP_TOOL_DENY);
+  const allow = splitList(env.COMFYUI_MCP_TOOL_ALLOW, "COMFYUI_MCP_TOOL_ALLOW");
+  const denyRaw = splitList(env.COMFYUI_MCP_TOOL_DENY, "COMFYUI_MCP_TOOL_DENY");
   const presetName = (env.COMFYUI_MCP_TOOL_PRESET ?? "").trim();
+  if (env.COMFYUI_MCP_TOOL_PRESET !== undefined && presetName === "") {
+    throw new Error(
+      `COMFYUI_MCP_TOOL_PRESET is set but empty. Refusing to start: this is usually an ` +
+        `unexpanded shell variable, and treating it as "no preset" would expose the FULL tool ` +
+        `surface while you believe it is restricted. Valid presets: ` +
+        `${Object.keys(TOOL_PRESETS).join(", ")}. Give it a value, or remove the variable.`,
+    );
+  }
   if (presetName && !Object.prototype.hasOwnProperty.call(TOOL_PRESETS, presetName)) {
     throw new Error(
       `COMFYUI_MCP_TOOL_PRESET="${presetName}" is not a known preset. ` +
@@ -208,11 +316,11 @@ export function resolveToolSurfacePolicy(env: NodeJS.ProcessEnv = process.env): 
     );
   }
   const preset = presetName ? TOOL_PRESETS[presetName] : undefined;
-  const deny = [...(preset ?? []), ...denyRaw];
   return {
     allow,
-    deny,
-    active: allow.length > 0 || deny.length > 0,
+    deny: denyRaw,
+    presetDeny: preset ?? [],
+    active: allow.length > 0 || denyRaw.length > 0 || preset !== undefined,
     ...(preset ? { preset: presetName } : {}),
   };
 }
@@ -220,15 +328,31 @@ export function resolveToolSurfacePolicy(env: NodeJS.ProcessEnv = process.env): 
 /**
  * Is this tool permitted?
  *
- * ALLOW WINS, and is absolute when present: naming an allow list is a statement that the
- * surface is exactly those tools, so a name absent from it is denied even if no deny rule
- * mentions it. That is the safer reading of an operator's intent — the alternative (allow
- * as a mere exemption from deny) turns an incomplete list into a wide-open surface, which
- * is the failure mode nobody notices until it matters.
+ * ALLOW BOUNDS THE SURFACE, and is absolute when present: naming an allow list is a
+ * statement that the surface is exactly those tools, so a name absent from it is denied
+ * even if no deny rule mentions it. That is the safer reading of an operator's intent —
+ * the alternative (allow as a mere exemption from deny) turns an incomplete list into a
+ * wide-open surface, which is the failure mode nobody notices until it matters.
+ *
+ * DENY THEN APPLIES ON TOP, rather than being switched off by the presence of an allow
+ * list. The first version returned early on the allow match, so
+ * `ALLOW=list_local_models,get_history` plus `DENY=list_local_models` allowed
+ * `list_local_models` — a tool whose `action:"remove"` deletes a model file — because the
+ * allow list won outright. Both variables are the operator saying "not this"; the
+ * intersection is the only reading where neither statement is silently discarded, and it
+ * is the one that errs toward a smaller surface.
  */
 export function toolAllowed(name: string, policy: ToolSurfacePolicy): boolean {
-  if (policy.allow.length > 0) return policy.allow.some((p) => toolMatches(name, p));
-  return !policy.deny.some((p) => toolMatches(name, p));
+  const allowed = policy.allow.length === 0 || policy.allow.some((p) => toolMatches(name, p));
+  if (!allowed) return false;
+  // An EXPLICIT deny beats an allow list — both are the operator speaking, and the
+  // smaller surface wins the tie.
+  if (policy.deny.some((p) => toolMatches(name, p))) return false;
+  // A PRESET is a broad default, so naming a tool in the allow list is how you refine it
+  // (`PRESET=safe` + `ALLOW=panel_graph_outline,panel_query_graph`). Without this, the
+  // documented opt-back-in would silently do nothing.
+  if (policy.allow.length > 0) return true;
+  return !policy.presetDeny.some((p) => toolMatches(name, p));
 }
 
 /**

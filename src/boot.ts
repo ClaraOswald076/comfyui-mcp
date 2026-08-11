@@ -14,6 +14,7 @@ import { logger } from "./utils/logger.js";
 import { JobWatcher } from "./services/job-watcher.js";
 import { parseCliArgs, validateConnectUrl, exportExplicitToolMode, type ToolMode } from "./transport/cli.js";
 import { startHttpServer } from "./transport/http.js";
+import { resolveToolSurfacePolicy } from "./tools/tool-surface-filter.js";
 import { isLocalMode } from "./config.js";
 import { ensurePanelInstalled } from "./services/panel-installer.js";
 import { checkAndSelfUpdate } from "./services/self-update.js";
@@ -408,6 +409,21 @@ async function main() {
     await runPanelOrchestrator();
     return;
   }
+
+  // #873 — VALIDATE THE OPERATOR'S TOOL POLICY BEFORE ANY TRANSPORT STARTS.
+  //
+  // resolveToolSurfacePolicy() throws on a misconfiguration (an unknown preset, a variable
+  // set but empty) with a message that says "Refusing to start". On stdio that was true,
+  // because the first call happens while building the server. On HTTP it was NOT: that
+  // transport calls createServer() lazily inside the request handler, so the socket bound,
+  // the "server running on http://…" line printed, and every `initialize` came back as a
+  // bare 500 with the real reason buried in a request-error log. Fail-closed, so no hole —
+  // but the message promised something the HTTP path did not do, and a message that lies
+  // about its own behaviour is how an operator ends up debugging the wrong thing.
+  //
+  // Calling it here makes the promise true on every transport. The result is discarded;
+  // each registration site resolves its own (the env cannot change under us mid-process).
+  resolveToolSurfacePolicy();
 
   await JobWatcher.cleanupOldFiles();
 

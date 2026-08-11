@@ -21,6 +21,10 @@ import {
   toolMatches,
   TOOL_PRESETS,
   MUTATING_ACTION_NAMES,
+  EXECUTION_ACTION_NAMES,
+  MUTATING_TOOLS,
+  EXECUTION_TOOLS,
+  READONLY_TOOLS,
   declaredActions,
   withToolSurfaceFilter,
 } from "../../tools/tool-surface-filter.js";
@@ -50,7 +54,10 @@ describe("the operator's policy is read from the environment (#873)", () => {
     expect(resolveToolSurfacePolicy({ COMFYUI_MCP_TOOL_ALLOW: "x" }).allow).toEqual(["x"]);
     const preset = resolveToolSurfacePolicy({ COMFYUI_MCP_TOOL_PRESET: "safe" });
     expect(preset.preset).toBe("safe");
-    expect(preset.deny).toContain("restart_comfyui");
+    // The preset's patterns live in presetDeny, kept apart from an explicit DENY because
+    // an allow list is entitled to refine a preset but not to overrule an explicit deny.
+    expect(preset.presetDeny).toContain("restart_comfyui");
+    expect(preset.deny).toEqual([]);
   });
 
   it("an UNKNOWN preset REFUSES TO START rather than failing open (codex P0)", () => {
@@ -88,6 +95,43 @@ describe("allow wins, and is absolute (#873)", () => {
     const p = resolveToolSurfacePolicy({ COMFYUI_MCP_TOOL_DENY: "restart_comfyui" });
     expect(toolAllowed("restart_comfyui", p)).toBe(false);
     expect(toolAllowed("generate_image", p)).toBe(true);
+  });
+
+  it("an EXPLICIT deny still applies on top of an allow list", () => {
+    // The first version returned early on the allow match, so naming a tool in BOTH
+    // allowed it — `ALLOW=list_local_models,get_history` + `DENY=list_local_models` left
+    // a tool whose action:"remove" deletes a model file reachable. Both variables are the
+    // operator saying something; the intersection is the only reading that discards
+    // neither, and it errs toward the smaller surface.
+    const p = resolveToolSurfacePolicy({
+      COMFYUI_MCP_TOOL_ALLOW: "list_local_models,get_history",
+      COMFYUI_MCP_TOOL_DENY: "list_local_models",
+    });
+    expect(toolAllowed("list_local_models", p)).toBe(false);
+    expect(toolAllowed("get_history", p)).toBe(true);
+  });
+
+  it("…but an allow list DOES refine a preset, or the documented opt-in would be a lie", () => {
+    // A preset is a broad default. `PRESET=safe` denies panel_* wholesale, and naming two
+    // of them in ALLOW is exactly how the docs say to get them back.
+    const p = resolveToolSurfacePolicy({
+      COMFYUI_MCP_TOOL_PRESET: "safe",
+      COMFYUI_MCP_TOOL_ALLOW: "panel_graph_outline",
+    });
+    expect(toolAllowed("panel_graph_outline", p)).toBe(true);
+    expect(toolAllowed("panel_run", p)).toBe(false);
+    expect(toolAllowed("restart_comfyui", p)).toBe(false);
+  });
+
+  it("a variable SET BUT EMPTY refuses to start — the fail-open by another route", () => {
+    // `COMFYUI_MCP_TOOL_ALLOW=${ALLOWED_TOOLS}` in a compose file with ALLOWED_TOOLS
+    // unset expands to "". Reading that as "no rules configured" produces the full
+    // surface with no log — the identical failure the unknown-preset throw exists to
+    // prevent, reached from a different direction.
+    for (const v of ["COMFYUI_MCP_TOOL_ALLOW", "COMFYUI_MCP_TOOL_DENY", "COMFYUI_MCP_TOOL_PRESET"]) {
+      expect(() => resolveToolSurfacePolicy({ [v]: "" }), v).toThrow(/set but empty/);
+      expect(() => resolveToolSurfacePolicy({ [v]: "  ,  " }), v).toThrow(/Refusing to start|set but empty/);
+    }
   });
 
   it("a prefix glob groups a family, and does not match more than it reads like", () => {
@@ -166,32 +210,112 @@ describe("a denied tool is ABSENT, not refusing (#873)", () => {
 describe("the presets cover what a NAME no longer reveals (codex P1)", () => {
   it("withholds tools whose destructive action hides behind an inspection-sounding name", () => {
     // The 0.50.0 consolidation folded deletion into `list_local_models` (action:"remove"
-    // deletes a model file), installation into `search_custom_nodes`, config writes into
-    // `get_defaults`, and queue destruction into `queue`. My first preset list was
-    // written from the names and missed every one.
+    // deletes a model file), config writes into `get_defaults`, queue destruction into
+    // `queue`, and pack INSTALLATION into `list_packs` (action:"install_deps" downloads
+    // and RUNS third-party code on the ComfyUI host). My first preset list was written
+    // from the names and missed every one.
     const p = resolveToolSurfacePolicy({ COMFYUI_MCP_TOOL_PRESET: "safe" });
-    for (const name of ["list_local_models", "search_custom_nodes", "get_defaults", "queue"]) {
+    for (const name of ["list_local_models", "list_packs", "get_defaults", "queue", "apps"]) {
       expect(toolAllowed(name, p), `${name} can mutate and must be withheld by "safe"`).toBe(false);
     }
   });
 
-  it("STAYS complete: every live tool advertising a mutating action is denied by safe", async () => {
-    // The hand list is auditable, which is why it stays hand-written — but it must not
-    // silently ROT. This scans the REAL catalog and fails when a tool advertising a
-    // destructive action is missing, so the next consolidation that hides
-    // action:"delete" behind a read-sounding name breaks a test instead of quietly
-    // widening every deployment's surface.
+  it("does NOT withhold search_custom_nodes — it only searches", () => {
+    // It was on the deny list, and the justification was that action:"install" installs a
+    // pack. It has exactly two actions, `search` and `details`, and is read-only; the
+    // installing tool is `install_custom_node`. The false claim came from its description
+    // MENTIONING `install_custom_node (action:"install")` — the same cross-reference
+    // confusion `declaredActions` strips, made by me while reading. The net effect was an
+    // inversion: `safe` withheld a registry search while allowing `list_packs`, which
+    // genuinely installs.
+    const p = resolveToolSurfacePolicy({ COMFYUI_MCP_TOOL_PRESET: "safe" });
+    expect(toolAllowed("search_custom_nodes", p)).toBe(true);
+  });
+
+  it("STAYS complete: EVERY live tool is classified, and the ledger names only live tools", async () => {
+    // THE GUARANTEE, and the reason it is a ledger rather than a pattern.
+    //
+    // The previous version scanned descriptions for a mutating verb and passed 17/17
+    // while `list_packs` — which installs and runs third-party code — was allowed by both
+    // presets, because its verb is `install_deps` and the pattern was anchored `^install$`.
+    // A pattern can only catch what someone already thought of; being read as coverage is
+    // what made it worse than nothing.
+    //
+    // Exhaustive partition instead: a NEW tool belongs to no list, so it fails here as
+    // "unclassified" and someone has to decide. The failure mode is a stopped build, not
+    // an assumption that it is harmless.
     const { collectToolCatalog } = await import("../../tools/index.js");
     const catalog = await collectToolCatalog();
-    const p = resolveToolSurfacePolicy({ COMFYUI_MCP_TOOL_PRESET: "safe" });
+    const live = [...catalog.tools.keys()].sort();
+    const ledger = [...MUTATING_TOOLS, ...EXECUTION_TOOLS, ...READONLY_TOOLS].sort();
 
-    const leaked: string[] = [];
-    for (const [name, tool] of catalog.tools) {
-      const actions = declaredActions(tool.description ?? "");
-      const mutating = actions.filter((a) => MUTATING_ACTION_NAMES.test(a));
-      if (mutating.length && toolAllowed(name, p)) leaked.push(`${name} (${mutating.join(",")})`);
+    const unclassified = live.filter((n) => !ledger.includes(n));
+    expect(
+      unclassified,
+      `live tools in NO list — classify each as mutating / execution / readonly: ${unclassified.join(", ")}`,
+    ).toEqual([]);
+
+    const phantom = ledger.filter((n) => !live.includes(n));
+    expect(phantom, `ledger entries that match no live tool: ${phantom.join(", ")}`).toEqual([]);
+
+    // …and no tool in two lists, or the presets would disagree with themselves.
+    const dupes = ledger.filter((n, i) => ledger.indexOf(n) !== i);
+    expect([...new Set(dupes)], `tools classified twice: ${dupes.join(", ")}`).toEqual([]);
+  });
+
+  it("CROSS-CHECK: nothing classified read-only advertises a mutating action", async () => {
+    // Secondary to the ledger above, and worth exactly what it is: the ledger catches a
+    // MISSING classification, this catches a WRONG one. It is why `list_packs` moved —
+    // once the pattern was widened to match a verb PREFIX (`install_deps`, `add_path`,
+    // `generate_skill`) rather than a whole word, it stopped being blind to the family of
+    // names the consolidation actually produced.
+    const { collectToolCatalog } = await import("../../tools/index.js");
+    const catalog = await collectToolCatalog();
+
+    const misclassified: string[] = [];
+    for (const name of READONLY_TOOLS) {
+      const actions = declaredActions(catalog.tools.get(name)?.description ?? "", {
+        selfName: name,
+        knownTools: new Set(catalog.tools.keys()),
+      });
+      const mutating = actions.filter(
+        (a) => MUTATING_ACTION_NAMES.test(a) && !EXECUTION_ACTION_NAMES.test(a),
+      );
+      if (mutating.length) misclassified.push(`${name} (${mutating.join(",")})`);
     }
-    expect(leaked, `tools with a mutating action that "safe" still allows: ${leaked.join("; ")}`).toEqual([]);
+    expect(
+      misclassified,
+      `tools classified READONLY that advertise a mutating action: ${misclassified.join("; ")}`,
+    ).toEqual([]);
+  });
+
+  it("declaredActions strips a CROSS-reference but never a SELF-declaration", () => {
+    // The over-stripping direction is the one that matters: a tool whose own declaration
+    // got eaten looks action-free, so the cross-check sees nothing and reports no hole —
+    // a silent false negative in a guard, which is worse than no guard.
+    const known = new Set(["get_defaults", "download_model", "model_metadata"]);
+
+    // Both spellings of a cross-reference go, parenthesised or not.
+    expect(
+      declaredActions('- action:"generate" — uses get_defaults (action:"set") and download_model action:"download_civitai".', {
+        selfName: "generate_image",
+        knownTools: known,
+      }),
+    ).toEqual(["generate"]);
+
+    // A tool naming ITSELF keeps the action…
+    expect(
+      declaredActions('model_metadata action:"read" — reads embedded metadata.', {
+        selfName: "model_metadata",
+        knownTools: known,
+      }),
+    ).toEqual(["read"]);
+
+    // …and so does a reference to a name that is not a known tool, because an unrecognised
+    // word is not evidence that the action belongs to someone else.
+    expect(
+      declaredActions('somethingelse action:"delete"', { selfName: "x", knownTools: known }),
+    ).toEqual(["delete"]);
   });
 
   it("the PANEL surface is withheld wholesale by both presets (codex P0)", () => {
@@ -225,6 +349,54 @@ describe("WIRING: the filter covers the call_tool route, not just registration (
     const body = src.slice(at, at + 1400);
     expect(body).toContain("resolveToolSurfacePolicy()");
     expect(body).toContain("toolAllowed(d.name, policy)");
+  });
+
+  it("is applied to the OTHER panel registration path as well — createPanelMcpServer", async () => {
+    // There are TWO. registerPanelTools serves the MCP SDK; createPanelMcpServer serves
+    // the Anthropic Agent SDK (Claude backend, in-process transport). They build from the
+    // same buildPanelToolDefs(), so fixing one left `panel_run` queueing renders under
+    // PRESET=readonly for every Claude-backend tab — the same hole, reported closed.
+    //
+    // The previous version of this test grepped only registerPanelTools and passed while
+    // that was true, which is why this one names the second function explicitly rather
+    // than searching the file as a whole.
+    const { readFile } = await import("node:fs/promises");
+    const src = await readFile(new URL("../../orchestrator/panel-tools.ts", import.meta.url), "utf-8");
+    const at = src.indexOf("export function createPanelMcpServer");
+    expect(at).toBeGreaterThan(-1);
+    const body = src.slice(at, at + 1800);
+    expect(body).toContain("resolveToolSurfacePolicy()");
+    expect(body).toContain("toolAllowed(d.name, policy)");
+  });
+
+  it("the policy reaches the SPAWNED comfyui child, which builds its env explicitly", async () => {
+    // comfyuiBaseEnv() constructs the child's environment rather than inheriting it (on
+    // purpose — a spread cannot REMOVE a revoked credential), and the MCP SDK spawns
+    // stdio children with a PATH/HOME-class default env. So an unforwarded variable does
+    // not exist over there: panel tools withheld and logged as withheld, while the
+    // agent's own comfyui child still offers download_model and restart_comfyui.
+    const { readFile } = await import("node:fs/promises");
+    const src = await readFile(new URL("../../orchestrator/index.ts", import.meta.url), "utf-8");
+    const at = src.indexOf("const comfyuiBaseEnv");
+    expect(at).toBeGreaterThan(-1);
+    const body = src.slice(at, at + 2600);
+    for (const v of ["COMFYUI_MCP_TOOL_PRESET", "COMFYUI_MCP_TOOL_ALLOW", "COMFYUI_MCP_TOOL_DENY"]) {
+      expect(body, `${v} must be forwarded to the child`).toContain(v);
+    }
+  });
+
+  it("the policy is validated at BOOT, so 'Refusing to start' is true on http too", async () => {
+    // The throw is only a refusal-to-start if something calls it before the transport
+    // comes up. --transport http builds the server LAZILY inside the request handler, so
+    // the socket bound, "server running on http://…" printed, and every initialize came
+    // back 500 with the real reason buried in a log line. Fail-closed, so not a hole —
+    // but the message promised something that transport did not do.
+    const { readFile } = await import("node:fs/promises");
+    const src = await readFile(new URL("../../boot.ts", import.meta.url), "utf-8");
+    const call = src.indexOf("resolveToolSurfacePolicy();");
+    expect(call).toBeGreaterThan(-1);
+    // …and BEFORE the http branch, or it has not bought anything.
+    expect(call).toBeLessThan(src.indexOf('if (cli.transport === "http")'));
   });
 
   it("is applied inside collectToolCatalog, which call_tool dispatches through", async () => {
