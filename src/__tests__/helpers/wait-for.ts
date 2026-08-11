@@ -58,9 +58,15 @@ export function waitFor<T>(
   opts: { timeout?: number; interval?: number } = {},
 ): Promise<T> {
   return vi.waitFor(fn, {
-    // A FLOOR, not an override. The three call sites that pass a timeout all wanted to wait
-    // LONGER than the default (one is `IDLE_MS * 20`), so honouring the larger of the two
-    // keeps their intent while still lifting them clear of a starved scheduler.
+    // A FLOOR, not an override. All EIGHT call sites that pass a timeout wanted to wait
+    // LONGER than the default — 3000, 10000, 15000, and `IDLE_MS * 20` (2400ms) — so
+    // honouring the larger of the two keeps their intent while lifting them clear of a
+    // starved scheduler. None of them bounds a budget under test: each waits for something
+    // to APPEAR, and nothing asserts that it appears quickly. One of them was already
+    // 15000, which is someone hitting this and fixing their own call site.
+    //
+    // (I first counted three of these with a single-line regex, which missed the ones whose
+    // options span lines. Corrected by walking the parens.)
     timeout: Math.max(DEADLINE_MS, opts.timeout ?? 0),
     interval: opts.interval ?? INTERVAL_MS,
   });
