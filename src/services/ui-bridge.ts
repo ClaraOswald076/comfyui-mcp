@@ -187,6 +187,14 @@ interface Conn {
    * its required fresh-backend query yields to the browser, allowing a workflow
    * switch before it writes. Re-read per hello and fail closed if absent. */
   enforcesWorkflowStampAtWrite: boolean;
+  /** True when THIS hello advertises that the panel understands `agent_note` — a frame
+   *  delivered to the AGENT ONLY and never rendered as a chat bubble.
+   *
+   *  Capability-gated on purpose. An older panel silently DROPS an unknown frame type, so
+   *  switching unconditionally would make these notices vanish for anyone who has not
+   *  updated — a wall of text traded for nothing at all, which is the worse failure. When
+   *  this is false the caller falls back to a visible `say`. */
+  acceptsAgentNotes: boolean;
   /** Commands THIS connection has already proven it doesn't support, via a real
    *  "Unknown command" reply earlier in the session (#236). Once a cmd lands
    *  here, every later call is gated proactively — rejected before it ever
@@ -2130,6 +2138,9 @@ export class UiBridge {
             (msg as { enforces_workflow_stamp?: unknown }).enforces_workflow_stamp === true,
           enforcesWorkflowStampAtWrite:
             (msg as { enforces_workflow_stamp_at_write?: unknown }).enforces_workflow_stamp_at_write === true,
+          // Re-read per hello like the stamps above: a reconnect can be a different build.
+          acceptsAgentNotes:
+            (msg as { accepts_agent_notes?: unknown }).accepts_agent_notes === true,
           // Fresh per hello — see the field's doc comment (#236).
           unsupportedCmds: new Set<string>(),
           // INHERITED across a reconnect (the panel code did not get older) so a command
@@ -2561,6 +2572,29 @@ export class UiBridge {
    * like the send gate, it intentionally describes the local panel protocol
    * needed to avoid an unfenced wrong-workflow write.
    */
+  /**
+   * Send operational status to the AGENT ONLY — never rendered in the user's chat.
+   *
+   * For the walls of text that are true, necessary and addressed to the wrong reader: a
+   * failed panel auto-sync and its lock-recovery procedure, for instance. The agent has
+   * to know; the person asking for an image does not, and printing one mid-conversation
+   * reads like the assistant lost its place.
+   *
+   * FALLS BACK TO A VISIBLE `say` when the panel does not advertise `accepts_agent_notes`.
+   * An older panel drops an unknown frame silently, so sending unconditionally would turn
+   * "too loud" into "gone" — and a notice nobody sees is worse than an ugly one. The
+   * fallback is the current behaviour exactly, so an un-updated panel is unaffected.
+   *
+   * Returns which channel was used, so a caller can log the difference rather than
+   * assume.
+   */
+  pushAgentNote(text: string, tabId?: string): "agent_note" | "say" {
+    const conn = tabId ? this.conns.get(tabId) : undefined;
+    const hidden = conn?.acceptsAgentNotes === true;
+    this.push({ type: hidden ? "agent_note" : "say", text }, tabId);
+    return hidden ? "agent_note" : "say";
+  }
+
   tabCanMutateGraph(tabId: string): boolean {
     // FAIL-CLOSED convenience for the readiness callers: an unreadable probe is
     // treated as "not ready", which is the right default when the question is
