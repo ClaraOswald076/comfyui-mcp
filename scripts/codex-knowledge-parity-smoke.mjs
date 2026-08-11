@@ -33,9 +33,6 @@ const MOCK_PANEL_VERSION = "0.13.0";
 const MOCK_WORKFLOW_UUID = "11111111-1111-4111-8111-111111111111";
 
 const PORT = Number(process.env.TEST_PORT || 9151);
-/** The MCP console, which the orchestrator binds LAST — the honest readiness signal.
- *  Bridge is PORT, panel MCP is PORT+1, pairing is PORT+2, console is PORT+3. */
-const CONSOLE_PORT = PORT + 3;
 const MCP_ENTRY = fileURLToPath(new URL("../dist/index.js", import.meta.url));
 const COMFY_PATH = fileURLToPath(new URL("..", import.meta.url)); // a real dir w/ packs/ + plugin/
 const DEAD_COMFY = "http://127.0.0.1:9";
@@ -134,6 +131,27 @@ function waitForPort(port, timeoutMs = 30000) {
   });
 }
 
+/** Wait for a line to appear in a log file the child is writing. */
+function waitForLine(path, needle, timeoutMs = 60000) {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      let text = "";
+      try {
+        text = fs.readFileSync(path, "utf8");
+      } catch {
+        // Not created yet.
+      }
+      if (text.includes(needle)) return resolve(true);
+      if (Date.now() - start > timeoutMs) {
+        return reject(new Error(`timed out waiting for "${needle}" in ${path}`));
+      }
+      setTimeout(tick, 250);
+    };
+    tick();
+  });
+}
+
 function runScenario(task) {
   return new Promise((resolve) => {
     const { nodes, EXEC } = makeGraph();
@@ -191,6 +209,22 @@ function runScenario(task) {
       if (typeof m.rid === "string" && typeof m.cmd === "string") {
         commands.push(m.cmd);
         let reply;
+        // ENFORCE THE STAMP WE ADVERTISE (#1384, codex). The hello claims
+        // `enforces_workflow_stamp` and `enforces_workflow_stamp_at_write`; a mock that
+        // claims them and then executes whatever arrives is certifying behaviour it does
+        // not have, so the smoke would pass against a stale-stamp bug that a real panel
+        // refuses. A command carrying no stamp is left alone — reads are not fenced.
+        const stamp = m.workflow_uuid ?? m.expected_workflow_uuid;
+        if (typeof stamp === "string" && stamp !== MOCK_WORKFLOW_UUID) {
+          ws.send(
+            JSON.stringify({
+              rid: m.rid,
+              ok: false,
+              error: `workflow stamp mismatch: command carried ${stamp}, this tab holds ${MOCK_WORKFLOW_UUID}`,
+            }),
+          );
+          return;
+        }
         try { const fn = EXEC[m.cmd]; if (!fn) throw new Error(`unknown ${m.cmd}`); reply = { rid: m.rid, ok: true, result: fn(m) }; }
         catch (e) { reply = { rid: m.rid, ok: false, error: e.message }; }
         console.log(`   <cmd ${m.cmd}>`);
@@ -234,16 +268,22 @@ async function main() {
   const orch = spawn(process.execPath, [MCP_ENTRY, "--panel-orchestrator"], { env, stdio: ["ignore", logFd, logFd] });
   let exitCode = 1;
   try {
-    // WAIT FOR THE LAST PORT UP, NOT THE FIRST (#1384).
+    // WAIT FOR THE ORCHESTRATOR TO SAY IT IS READY (#1384).
     //
-    // The bridge binds first and the MCP console binds last, ~4 seconds apart on this
-    // machine. Probing the bridge alone declared the orchestrator "up" while it was still
-    // booting, so the scenario's user_message landed before the per-tab agent existed and
-    // went nowhere: the run reported "Codex consulted bundled skills: NO" with an EMPTY
-    // tool trace — a harness race that, in the output, is indistinguishable from the
-    // knowledge failure this smoke exists to detect.
+    // The bridge binds FIRST and the per-tab message handler is installed much later —
+    // ~4 seconds apart on this machine. Probing the bridge port declared the orchestrator
+    // "up" while it was still booting, so the scenario's user_message arrived before
+    // `onPanelMessage` existed and was dropped: the run reported "Codex consulted bundled
+    // skills: NO" with an EMPTY tool trace, a harness race indistinguishable in the output
+    // from the knowledge failure this smoke exists to detect.
+    //
+    // Waiting for a LATER PORT is not a fix either (codex): the console binds before the
+    // handler is installed, and COMFYUI_MCP_CONSOLE_PORT can move it, so a hard-coded
+    // PORT+3 can wait for something that never binds. The "ready" line is printed after
+    // the handler is in place, and it is the orchestrator's own statement rather than an
+    // inference from one of its side effects.
     await waitForPort(PORT);
-    await waitForPort(CONSOLE_PORT);
+    await waitForLine(logPath, "[panel-orchestrator] ready —");
     console.log("[kp-smoke] orchestrator up.\n");
 
     console.log("• Scenario: set up a krea2 workflow on my canvas");

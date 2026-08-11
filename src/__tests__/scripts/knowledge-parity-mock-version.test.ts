@@ -30,15 +30,38 @@ const declared = (name: string): string => {
   return m![1];
 };
 
-const parse = (v: string): number[] => v.split(".").map(Number);
+/**
+ * Semver-aware enough for a version FLOOR (codex P2).
+ *
+ * The first version split on "." and called Number on each part, so `0.13.0-rc1` parsed as
+ * [0, 13, NaN] and every comparison against it was false — a ratchet that answers "no" to
+ * everything is not a ratchet. The tables hold plain releases today, but the production
+ * reader accepts prerelease forms, so a floor written as one would have silently failed
+ * this test rather than raising the mock.
+ *
+ * A prerelease sorts BELOW its release (0.13.0-rc1 < 0.13.0), which is the semver rule and
+ * also the safe direction here: satisfying a release floor satisfies its prereleases.
+ */
+const parse = (v: string): { nums: number[]; pre: string | undefined } => {
+  const [core, ...rest] = v.trim().split("-");
+  return {
+    nums: core.split(".").map((n) => Number(n) || 0),
+    pre: rest.length ? rest.join("-") : undefined,
+  };
+};
 const atLeast = (have: string, want: string): boolean => {
   const a = parse(have);
   const b = parse(want);
-  for (let i = 0; i < Math.max(a.length, b.length); i++) {
-    const d = (a[i] ?? 0) - (b[i] ?? 0);
+  for (let i = 0; i < Math.max(a.nums.length, b.nums.length); i++) {
+    const d = (a.nums[i] ?? 0) - (b.nums[i] ?? 0);
     if (d !== 0) return d > 0;
   }
-  return true;
+  // Same numbers: a release satisfies a prerelease floor, a prerelease does not satisfy a
+  // release floor, and two prereleases compare as strings.
+  if (a.pre === b.pre) return true;
+  if (a.pre === undefined) return true;
+  if (b.pre === undefined) return false;
+  return a.pre >= b.pre;
 };
 
 describe("#1384 — the knowledge-parity mock keeps up with the fences", () => {
@@ -68,6 +91,24 @@ describe("#1384 — the knowledge-parity mock keeps up with the fences", () => {
     expect(behind, `the mock (${mock}) is older than: ${behind.map(([k]) => k).join(", ")}`).toEqual(
       [],
     );
+  });
+
+  it("the comparator handles the version forms the product accepts", () => {
+    // The ratchet is only as good as its comparison. The first version parsed "0.13.0-rc1"
+    // as [0, 13, NaN] and answered false to everything (codex P2) — a floor written that
+    // way would have failed this test silently instead of raising the mock.
+    expect(atLeast("0.13.0", "0.13.0")).toBe(true);
+    expect(atLeast("0.13.1", "0.13.0")).toBe(true);
+    expect(atLeast("0.12.99", "0.13.0")).toBe(false);
+    expect(atLeast("0.13", "0.13.0")).toBe(true);
+    expect(atLeast("1.0.0", "0.99.99")).toBe(true);
+    // Multi-digit parts must compare numerically, not lexically: "0.9.0" < "0.10.0".
+    expect(atLeast("0.10.0", "0.9.0")).toBe(true);
+    expect(atLeast("0.9.0", "0.10.0")).toBe(false);
+    // Prereleases sort below their release, which is also the safe direction for a floor.
+    expect(atLeast("0.13.0", "0.13.0-rc1")).toBe(true);
+    expect(atLeast("0.13.0-rc1", "0.13.0")).toBe(false);
+    expect(atLeast("0.13.0-rc2", "0.13.0-rc1")).toBe(true);
   });
 
   it("the mock advertises BOTH write-fence capabilities, not just a version", () => {
