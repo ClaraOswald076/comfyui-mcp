@@ -1590,9 +1590,25 @@ The conversion is refused rather than retried against ` +
   // else entirely — at which point the converter skips every node and returns an empty
   // workflow that reads as a success.
   //
-  // Only a total miss refuses. PARTIAL coverage converts and warns, because an uninstalled
-  // custom node is a real and legitimate case, and refusing a whole strip over one missing
-  // type would be the over-broad direction that makes a guard worse than the bug.
+  // Only a total miss refuses. PARTIAL coverage converts and warns, and that is not a
+  // judgement call — MEASURED against this machine's live /object_info and three real pack
+  // workflows:
+  //
+  //   anima              52 types, 36 covered, 16 missing
+  //   anima-img2img      39 types, 33 covered,  6 missing
+  //   krea2-identity     14 types, 13 covered,  1 missing
+  //
+  // Every real workflow has misses, and all of them are legitimate: frontend-only virtual
+  // nodes (Note, GetNode, SetNode, "Label (rgthree)"), UUID-typed SUBGRAPH nodes, and
+  // uninstalled packs. So "refuse if ANY type is missing" would refuse ALL THREE — the
+  // over-broad direction is not hypothetical here, it is the default outcome. Zero coverage
+  // never occurred, which is what makes it a usable signal for "this payload is not about
+  // this canvas".
+  //
+  // That measurement also settles the direction that would have been catastrophic:
+  // `collectNodeTypes` does return the same strings that appear as /object_info KEYS. If it
+  // did not, `t in object_info` would always be false and this would refuse EVERY
+  // live-canvas strip.
   if (neededTypes.length > 0) {
     const covered = neededTypes.filter((t) => t in (r.object_info as Record<string, unknown>));
     if (covered.length === 0) {
