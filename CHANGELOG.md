@@ -197,6 +197,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.6] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- the injected steering tells a code-mode agent where its panel tools actually are (#1435)
+
+
 ## [0.51.5] - 2026-08-11
 
 ### MCP
