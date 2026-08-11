@@ -318,6 +318,42 @@ describe("the presets cover what a NAME no longer reveals (codex P1)", () => {
     ).toEqual(["delete"]);
   });
 
+  it("declaredActions never strips a tool's OWN action, measured on all 37 live descriptions", async () => {
+    // The hand-written case above proves the rule; this proves it against the real text,
+    // which is where it can actually fail. `queue` and `batch` are tool names AND ordinary
+    // English words, so a sentence ending "...drains the queue." immediately before a
+    // bulleted `action:"clear"` would capture `queue` as a cross-reference and delete a
+    // self-declaration — leaving the tool looking action-free and the cross-check
+    // reporting no hole.
+    //
+    // GROUND TRUTH: a tool's own actions are introduced as a BULLET (`- action:"x" — …`);
+    // a cross-reference never is. My first attempt at this check read the zod action enum
+    // off the catalog entry, resolved it for 0 of 37 tools, and printed a confident pass —
+    // so the count is asserted below to keep this from going quietly vacuous the same way.
+    const { collectToolCatalog } = await import("../../tools/index.js");
+    const catalog = await collectToolCatalog();
+    const known = new Set(catalog.tools.keys());
+
+    const selfStripped: string[] = [];
+    let measured = 0;
+    for (const [name, tool] of catalog.tools) {
+      const description = tool.description ?? "";
+      const own = [
+        ...new Set(
+          [...description.matchAll(/(?:^|\n)\s*[-*]\s*action:"([a-z_0-9]+)"/g)].map((m) => m[1]),
+        ),
+      ];
+      if (!own.length) continue;
+      measured++;
+      const kept = declaredActions(description, { selfName: name, knownTools: known });
+      const lost = own.filter((a) => !kept.includes(a));
+      if (lost.length) selfStripped.push(`${name} lost ${lost.join(",")}`);
+    }
+
+    expect(measured, "no descriptions had bullet-declared actions — this check read nothing").toBeGreaterThan(25);
+    expect(selfStripped, `tools whose OWN action was stripped: ${selfStripped.join("; ")}`).toEqual([]);
+  });
+
   it("the PANEL surface is withheld wholesale by both presets (codex P0)", () => {
     // 91 panel_* tools register through a different method on a separate server and
     // bypassed the filter entirely — `panel_run` still queued renders under `readonly`.
