@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
+import { MOCK_WORKFLOW_UUID } from "../../../scripts/knowledge-parity-mock-graph.mjs";
 import {
   BRIDGE_CMD_MIN_PANEL_VERSION,
   BRIDGE_CAPABILITY_MIN_PANEL_VERSION,
@@ -23,6 +24,11 @@ import {
 const SMOKE = new URL("../../../scripts/codex-knowledge-parity-smoke.mjs", import.meta.url);
 
 const source = (): string => readFileSync(SMOKE, "utf8");
+
+/** Source with comments removed, for assertions that are about CODE. A prose sentence
+ *  satisfying a code assertion is a spell-check on my own comments — which has happened in
+ *  this repo more than once. Block comments only where a naive `//` strip would eat a URL. */
+const codeOnly = (): string => source().replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
 
 const declared = (name: string): string => {
   const m = source().match(new RegExp(`const ${name} = "([^"]+)"`));
@@ -122,11 +128,32 @@ describe("#1384 — the knowledge-parity mock keeps up with the fences", () => {
         new RegExp(`${cap}:\\s*true`),
       );
     }
-    // …and a workflow uuid for the per-command stamp to fence on.
+    // …and a workflow uuid for the per-command stamp to fence on. It is DECLARED in the
+    // mock-graph module now and imported here, so this reads the module rather than the
+    // script — a grep that keeps passing on a file the value has left is not a check.
     expect(s).toMatch(/workflow_uuid: MOCK_WORKFLOW_UUID/);
-    expect(declared("MOCK_WORKFLOW_UUID")).toMatch(
+    expect(MOCK_WORKFLOW_UUID).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
     );
+  });
+
+  it("an unimplemented command names the harness, so it is not filed as a panel defect", () => {
+    // The subset will never be complete, so the REFUSAL has to carry its own provenance.
+    // A bare `unknown <cmd>` from a tab advertising a current panel version reads as a
+    // product defect, and an agent with a bug-report tool files it as one — which is
+    // exactly what happened.
+    // Both markers ASSERTED (codex P3). An unguarded indexOf returns -1 and slice(-1, …)
+    // silently widens to most of the file, so the assertion would keep passing on text it
+    // was never about. Comments stripped for the same reason: a sentence in a comment
+    // satisfying a code assertion is a spell-check.
+    const s = codeOnly();
+    const from = s.indexOf("const fn = EXEC[m.cmd]");
+    const to = s.indexOf("console.log(`   <cmd");
+    expect(from, "the dispatch must still exist").toBeGreaterThan(-1);
+    expect(to, "the dispatch's end marker must still exist").toBeGreaterThan(from);
+    const dispatch = s.slice(from, to);
+    expect(dispatch).toMatch(/SMOKE MOCK/);
+    expect(dispatch).toMatch(/[Dd]o not file this as a panel defect/);
   });
 
   it("the mock's socket sends an Origin, because a real panel's does", () => {
@@ -147,12 +174,22 @@ describe("#1384 — the knowledge-parity mock keeps up with the fences", () => {
   });
 
   it("the mock implements the commands the scenario drives", () => {
-    // graph_load was missing, so the preferred one-shot panel_load_workflow(pack:…) path
-    // could not complete and the smoke could only reach the capability by the long route —
-    // measuring a fallback while reporting on the primary.
-    const s = source();
-    for (const cmd of ["graph_clear", "graph_load", "graph_get_state"]) {
-      expect(s, `the mock executor must implement ${cmd}`).toMatch(new RegExp(`${cmd}:\\s*[({]`));
+    // Reads the MOCK GRAPH module, which is where the executors live now. Pointed at the
+    // smoke script it passed on a file that no longer contains any of them — an assertion
+    // is only about the thing it actually reads.
+    //
+    // The reply SHAPES and the refusal behaviour are asserted by calling the real
+    // executors in knowledge-parity-mock-graph.test.ts; source text cannot see either,
+    // as mutation testing demonstrated twice here.
+    const mock = readFileSync(new URL("../../../scripts/knowledge-parity-mock-graph.mjs", import.meta.url), "utf8");
+    for (const cmd of [
+      "graph_clear",
+      "graph_load",
+      "graph_get_state",
+      "graph_outline",
+      "graph_find_nodes",
+    ]) {
+      expect(mock, `the mock executor must implement ${cmd}`).toMatch(new RegExp(`${cmd}:\\s*[({]`));
     }
   });
 });
