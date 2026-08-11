@@ -742,7 +742,26 @@ export async function getOutputImage(
   filename: string,
   type: "output" | "input" | "temp" = "output",
   subfolder = "",
-  { allowMedia = false }: { allowMedia?: boolean } = {},
+  {
+    allowMedia = false,
+    /**
+     * Accept a `.json` attachment whose bytes actually PARSE as JSON (#1373).
+     *
+     * A ComfyUI input directory legitimately holds workflow `.json` files, and `get_image`
+     * refused to save them: the reporter's server labelled one `video/json`, which is
+     * neither `image/*` nor a sniffable media format.
+     *
+     * NOT AN ADDITION TO THE ACCEPT LIST. I could not reproduce that header — a stock
+     * ComfyUI 0.31.1 here returns `application/json` for the same request, so `video/json`
+     * comes from something in their stack, and the next install will invent a different
+     * one. Accepting the specific string would fix one machine.
+     *
+     * The declared type is a claim about the payload; parsing is a fact about it. So this
+     * follows the rule the media branch above already applies — bytes must be what they
+     * are said to be — and simply asks the question JSON can answer directly.
+     */
+    allowJson = false,
+  }: { allowMedia?: boolean; allowJson?: boolean } = {},
 ): Promise<{ base64: string; mimeType: string; filename: string }> {
   assertSafeViewRef(filename, subfolder);
   const result = await fetchImage(filename, type, subfolder);
@@ -780,7 +799,25 @@ export async function getOutputImage(
     extOk &&
     (mime === "application/octet-stream" ||
       MEDIA_FORMAT_BY_MIME[mime] === sniffedFormat);
-  if ((!isImage && !isMedia) || result.base64.length === 0) {
+  // A `.json` request whose bytes parse as JSON is accepted whatever the server called
+  // them (#1373). Gated on the REQUESTED extension so this can never widen the image or
+  // media paths, and on a successful parse so the rejection this function exists for is
+  // untouched: an HTML error page, a login redirect or a truncated body does not parse and
+  // is still refused. ComfyUI answers 200 with an error body often enough that this check
+  // is the only thing standing between the caller and a corrupt "image".
+  const isJson =
+    allowJson &&
+    ext === ".json" &&
+    result.base64.length > 0 &&
+    (() => {
+      try {
+        JSON.parse(Buffer.from(result.base64, "base64").toString("utf8"));
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+  if ((!isImage && !isMedia && !isJson) || result.base64.length === 0) {
     const where = subfolder ? `${type}/${subfolder}` : type;
     throw new ComfyUIError(
       `ComfyUI /view did not return an image for "${filename}" (${where}); ` +

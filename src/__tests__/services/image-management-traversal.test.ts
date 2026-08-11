@@ -671,3 +671,85 @@ describe("listOutputImages — remote mode keyed off isRemoteMode (issue #2 regr
     expect(results.map((r) => r.filename)).toEqual(["remote.png"]);
   });
 });
+
+describe("#1373 — a .json attachment is accepted by PARSING it, not by its content-type", () => {
+  // get_image refused a valid ComfyUI workflow attachment because the reporter's server
+  // labelled it `video/json` — neither image/* nor a sniffable media format. The input
+  // directory legitimately holds workflow .json files, so they could not be saved at all.
+  //
+  // I could not reproduce that header: a stock ComfyUI 0.31.1 on this machine returns
+  // `application/json` for the same request, and ComfyUI's own source has no `video/<ext>`
+  // branch. So the label is install-specific, which is exactly why the fix cannot key on
+  // it — the next install will invent a different one.
+  //
+  // The rule this follows is already in the file, one branch up: media payloads must SNIFF
+  // as media, because "the declared content-type alone is no proof". JSON can answer that
+  // question directly.
+
+  const jsonBody = (text: string) => ({
+    base64: Buffer.from(text, "utf8").toString("base64"),
+    mimeType: "video/json",
+  });
+
+  it("accepts valid JSON however the server labelled it", async () => {
+    fetchImageMock.mockResolvedValue(jsonBody('{"nodes":[],"links":[]}'));
+    await expect(
+      getOutputImage("08_SAM2_Rotoscope.json", "input", "", { allowMedia: true, allowJson: true }),
+    ).resolves.toMatchObject({ filename: "08_SAM2_Rotoscope.json" });
+  });
+
+  it("…including the application/json a stock server actually sends", async () => {
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from('{"a":1}', "utf8").toString("base64"),
+      mimeType: "application/json",
+    });
+    await expect(
+      getOutputImage("wf.json", "input", "", { allowMedia: true, allowJson: true }),
+    ).resolves.toBeDefined();
+  });
+
+  it("REFUSES an HTML error page served as .json — the rejection this check exists for", async () => {
+    // ComfyUI answers 200 with an error body often enough that this is the whole point.
+    // A permissive "it was requested as .json, save it" would hand back a login page as a
+    // workflow.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from("<html><body>404 Not Found</body></html>", "utf8").toString("base64"),
+      mimeType: "video/json",
+    });
+    await expect(
+      getOutputImage("missing.json", "input", "", { allowMedia: true, allowJson: true }),
+    ).rejects.toThrow(/did not return an image/);
+  });
+
+  it("REFUSES truncated JSON", async () => {
+    fetchImageMock.mockResolvedValue(jsonBody('{"nodes":[],"li'));
+    await expect(
+      getOutputImage("truncated.json", "input", "", { allowMedia: true, allowJson: true }),
+    ).rejects.toThrow(/did not return an image/);
+  });
+
+  it("REFUSES an empty body even though '' is a .json request", async () => {
+    fetchImageMock.mockResolvedValue({ base64: "", mimeType: "application/json" });
+    await expect(
+      getOutputImage("empty.json", "input", "", { allowMedia: true, allowJson: true }),
+    ).rejects.toThrow(/did not return an image/);
+  });
+
+  it("does NOT widen anything when allowJson is off", async () => {
+    // The default path must be unchanged: this is opt-in from get_image(action:"get").
+    fetchImageMock.mockResolvedValue(jsonBody('{"nodes":[]}'));
+    await expect(getOutputImage("wf.json", "input", "")).rejects.toThrow(/did not return an image/);
+  });
+
+  it("does NOT accept JSON bytes requested under an IMAGE extension", async () => {
+    // Gated on the requested extension, so a JSON body cannot arrive as a .png and be
+    // saved as a working image.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from('{"nodes":[]}', "utf8").toString("base64"),
+      mimeType: "application/json",
+    });
+    await expect(
+      getOutputImage("actually.png", "input", "", { allowMedia: true, allowJson: true }),
+    ).rejects.toThrow(/did not return an image/);
+  });
+});
