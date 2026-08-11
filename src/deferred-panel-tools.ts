@@ -68,11 +68,15 @@ export const DEFERRED_PANEL_TOOLS_STEERING =
  * shipped. The guidance is about the SPELLING of a tool name, which is the same in
  * every language, so it belongs outside anything translatable.
  *
- * Idempotent: keyed on the qualified name, so the default persona (which already
- * contains it) is returned untouched rather than carrying the paragraph twice.
+ * Idempotent, keyed on the WHOLE steering rather than on the tool name (codex round
+ * 2, P1). Keying on the name alone meant a persona that merely MENTIONS
+ * `mcp__panel__panel_graph_outline` — a user override naming the tool, a translation
+ * that keeps identifiers verbatim — was returned unchanged and never received the
+ * catalog, the namespace, or the do-not-diagnose-a-rollback part. That persona then
+ * reproduces #1398 while looking, to this function, like it already had the fix.
  */
 export function withDeferredPanelToolsNote(persona: string): string {
-  if (persona.includes(DEFERRED_PANEL_QUALIFIED_NAME)) return persona;
+  if (persona.includes(DEFERRED_PANEL_TOOLS_STEERING)) return persona;
   return `${persona}
 
 ${DEFERRED_PANEL_TOOLS_STEERING}`;

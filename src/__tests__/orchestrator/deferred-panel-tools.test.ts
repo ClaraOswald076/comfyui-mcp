@@ -167,8 +167,37 @@ describe("#1398 the install line itself", () => {
       "utf8",
     );
     expect(src).toContain("let panelSystemAppend = resolvePanelPersona();");
-    // And nothing else may resolve the persona behind its back.
+    // And nothing else may resolve the persona behind its back. Keyed on the
+    // FALLBACK, not the id string (codex round 2, P2): a bypass written as
+    // `resolvePrompt(PANEL_PERSONA_ID, PANEL_SYSTEM_APPEND)` passes an id-literal
+    // check while dropping the remedy. Any such call still has to name the fallback.
     const direct = src.match(/resolvePrompt\("panel\.persona"/g) ?? [];
     expect(direct).toHaveLength(1); // exactly one: inside resolvePanelPersona itself
+    // Matches ANY resolvePrompt whose fallback is the persona, whatever the id
+    // expression is — so `resolvePrompt(PANEL_PERSONA_ID, PANEL_SYSTEM_APPEND)` is
+    // caught too. (Comments and registerPrompt legitimately name the constant, so
+    // counting bare mentions would be brittle in the way codex warned about.)
+    const resolvers = src.match(/resolvePrompt\([^)]*PANEL_SYSTEM_APPEND/g) ?? [];
+    expect(resolvers).toHaveLength(1); // only resolvePanelPersona resolves the persona
+  });
+});
+
+describe("#1398 idempotence is keyed on the GUIDANCE, not the tool name", () => {
+  // codex round 2, P1. A persona that merely mentions the qualified name — a user
+  // override naming the tool, a translation keeping identifiers — used to be treated
+  // as already-fixed and received none of the actual guidance.
+  it("a persona that only MENTIONS the tool name still gets the guidance", () => {
+    const mentionsOnly = `Usa ${DEFERRED_PANEL_QUALIFIED_NAME} para leer el lienzo.`;
+    const out = withDeferredPanelToolsNote(mentionsOnly);
+    expect(out).not.toBe(mentionsOnly);
+    expect(out).toContain("ALL_TOOLS");
+    expect(out).toContain(DEFERRED_PANEL_TOOLS_STEERING);
+  });
+
+  it("a persona carrying the FULL steering is still returned untouched", () => {
+    const already = `preamble
+
+${DEFERRED_PANEL_TOOLS_STEERING}`;
+    expect(withDeferredPanelToolsNote(already)).toBe(already);
   });
 });
