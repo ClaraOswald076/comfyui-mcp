@@ -9384,9 +9384,14 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         /** A recovered answer must never read as an ordinary one (#486's rule, here). */
         const lateAware = (r: ToolResult): ToolResult => {
           if (!arrivedLate) return r;
+          // ARRIVAL ONLY — never "and was applied". This prefixes EVERY outcome, failures
+          // included: a token that lands during the grace and then fails to persist
+          // (`secretNotPersisted`, a damaged store, an unconfirmed write) would otherwise
+          // be announced as applied by the very message explaining that it was not. The
+          // rest of the result already says what happened; this says only WHEN it arrived.
           const note =
             `(This token arrived AFTER the ${Math.round(timing.deadlineMs / 1000)}s card ` +
-            `deadline, within the grace period, and was still applied.) `;
+            `deadline, within the grace period that follows it.) `;
           const [first, ...rest] = r.content;
           return first && first.type === "text"
             ? { ...r, content: [{ ...first, text: note + first.text }, ...rest] }

@@ -152,6 +152,19 @@ describe("a timed-out secret card is described honestly (#1352)", () => {
     expect(String(sentCommands[0].ask_id).length).toBeGreaterThan(8);
   });
 
+  it("a LATE arrival is announced as an arrival, never as a save", async () => {
+    // The note prefixes EVERY outcome, failures included. A token that lands during the
+    // grace and then fails to persist would otherwise be announced as applied by the very
+    // message explaining that it was not — so the note states only WHEN it arrived and
+    // leaves what happened to the rest of the result.
+    const text = await requestSecret(REPLY_TIMEOUT(), { value: "   " });
+    expect(text).toMatch(/arrived AFTER the/);
+    expect(text).toMatch(/grace period/);
+    expect(text).not.toMatch(/was still applied/);
+    // …and this particular late value was NOT saved, which the result still says plainly.
+    expect(text).toMatch(/No token entered/);
+  });
+
   it("keeps the masked-input rule — never route a secret through the conversation", async () => {
     // #952's finding: suggesting the conversational route defeats the entire purpose of
     // this tool. A recovery path is exactly where that would slip back in.
