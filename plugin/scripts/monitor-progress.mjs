@@ -421,18 +421,27 @@ function startStallChecker() {
 // ── Timeout ─────────────────────────────────────────────────────────────
 
 setTimeout(() => {
-  if (doneCount < jobs.size) {
-    const remaining = [...jobs.entries()]
+  // GATE ON THE SAME FACT THE LIST REPORTS (#1385, codex round 2). This used to enter on
+  // `doneCount < jobs.size`, and `doneCount++` lands only AFTER the awaited history fetch —
+  // so a job that finished a moment before the timeout has `finished` true and is correctly
+  // absent from `remaining`, while `doneCount` has not caught up. The result was
+  // "[TIMEOUT] 0 job(s) still incomplete" followed by exit 1: a clean run reported as a
+  // failure, with an empty list as the evidence.
+  //
+  // One fact, read once. If nothing is unfinished there is nothing to time out.
+  const remaining = [...jobs.entries()]
       // The SAME stale vocabulary, in its inequality form (#1385, codex). A successful job
       // carries status "success", so `!== "done" && !== "error"` calls it incomplete — and
       // the window is real: `finished` is set before the history fetch but `doneCount++`
       // comes after it, so a timeout landing in between reports a job that succeeded as
       // still running, and exits 1. My first pass fixed only the equality comparisons.
-      .filter(([, j]) => !j.finished)
-      .map(([id, j]) => {
-        const elapsed = ((Date.now() - j.startTime) / 1000).toFixed(0);
-        return `${short(id)} (${j.status}, ${elapsed}s)`;
-      });
+    .filter(([, j]) => !j.finished)
+    .map(([id, j]) => {
+      const elapsed = ((Date.now() - j.startTime) / 1000).toFixed(0);
+      // `j.status` here is DISPLAY only — the decision above is the flag.
+      return `${short(id)} (${j.status}, ${elapsed}s)`;
+    });
+  if (remaining.length > 0) {
     console.log(
       `[TIMEOUT] ${remaining.length} job(s) still incomplete after 10 minutes: ${remaining.join(", ")}`,
     );
