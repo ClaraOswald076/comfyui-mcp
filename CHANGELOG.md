@@ -21,6 +21,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.108] - 2026-08-10
+
+### MCP
+
+#### Added
+- send operational status to the agent, not to the user (#1375)
+
+
 ## [0.50.107] - 2026-08-10
 
 ### MCP
