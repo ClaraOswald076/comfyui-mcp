@@ -35,39 +35,47 @@ import { vi } from "vitest";
  *
  * ## Why this is not widening a tolerance to hide a race
  *
- * The same reasoning vitest.config.ts sets out for `testTimeout`: these waits guard the
- * RUNNER being starved of CPU, not a race in product code. No wait in this repo asserts
- * that something happens QUICKLY — none of them is a deadline under test, and none asserts
- * a rejection — so raising the ceiling changes no verdict. A test that would pass still
- * passes; a test that would fail still fails, just later and with its real reason.
+ * The same reasoning vitest.config.ts sets out for `testTimeout`: an untimed wait guards
+ * the RUNNER being starved of CPU, not a race in product code. The waits this touches are
+ * the ones that specified NO bound at all — they were never asserting a deadline, they
+ * inherited one. Calls that DO state a bound keep it exactly, including the two that mean
+ * something by it.
  *
- * The cost is bounded and falls only on failures: a genuinely broken wait reports in 15s
- * instead of 1s, inside the existing 30s test budget.
+ * The cost is bounded and falls only on failures: an unbounded wait that never settles
+ * reports in 15s instead of 1s, inside the existing 30s test budget.
  *
  * If a wait ever needs MORE than this, make it deterministic — inject the clock, drive the
  * event — rather than raising the number.
  */
 const DEADLINE_MS = 15_000;
 
-/** Poll briskly: the wait is usually satisfied in one or two ticks, and a short interval
- *  keeps a passing test as fast as it was. */
-const INTERVAL_MS = 10;
-
+/**
+ * `vi.waitFor` with a deadline that is not the thing under test (#1325).
+ *
+ * THE DEFAULT IS THE ONLY THING THIS CHANGES. An explicit timeout is the author's
+ * deliberate bound and is passed through untouched — my first version took the LARGER of
+ * the two, which quietly rewrote two real assertions (codex):
+ *
+ *   - `claude-stall-notice.test.ts` configures `IDLE_MS = 120` and bounds the watchdog
+ *     notice at `IDLE_MS * 20`. That is a bounded-time claim: the notice must arrive within
+ *     ~20 idle windows. Raising it to 15s made a regression that took 3-14 seconds — 25x
+ *     to 125x the configured idle period — pass. My "no wait here asserts that something
+ *     happens quickly" was simply wrong, and I had checked it and talked myself past it.
+ *   - `run-template.test.ts:262` pairs a 10s wait with a 15s TEST timeout. Raising the wait
+ *     to 15s lets the runner's deadline win, so a broken wait reports vitest's generic
+ *     "test timed out" instead of its own reason — the opposite of the point.
+ *
+ * A site whose explicit bound turns out to be too tight under load should be raised
+ * individually, with a note about why that number.
+ */
 export function waitFor<T>(
   fn: () => T | Promise<T>,
   opts: { timeout?: number; interval?: number } = {},
 ): Promise<T> {
   return vi.waitFor(fn, {
-    // A FLOOR, not an override. All EIGHT call sites that pass a timeout wanted to wait
-    // LONGER than the default — 3000, 10000, 15000, and `IDLE_MS * 20` (2400ms) — so
-    // honouring the larger of the two keeps their intent while lifting them clear of a
-    // starved scheduler. None of them bounds a budget under test: each waits for something
-    // to APPEAR, and nothing asserts that it appears quickly. One of them was already
-    // 15000, which is someone hitting this and fixing their own call site.
-    //
-    // (I first counted three of these with a single-line regex, which missed the ones whose
-    // options span lines. Corrected by walking the parens.)
-    timeout: Math.max(DEADLINE_MS, opts.timeout ?? 0),
-    interval: opts.interval ?? INTERVAL_MS,
+    timeout: opts.timeout ?? DEADLINE_MS,
+    // Vitest's default is 50ms, not 10ms. My first version passed 10ms and so made 287
+    // waits poll five times as hard — on a machine this exists to stop starving (codex).
+    interval: opts.interval ?? 50,
   });
 }
