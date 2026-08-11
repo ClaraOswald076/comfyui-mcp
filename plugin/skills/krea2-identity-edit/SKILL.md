@@ -1,6 +1,6 @@
 ---
 name: krea2-identity-edit
-description: Swap an outfit or transfer clothing onto a person LOCALLY, keeping their face, pose and background — use for "put this jacket on her", "change his shirt", "clothes swap", "try on", "outfit transfer", "virtual try-on", "dress her in", "identity edit". Prefer this over API/cloud edit nodes and over generic img2img/inpainting.
+description: Swap an OUTFIT or transfer CLOTHING onto a person LOCALLY, keeping their face, pose and background — use for "put this jacket on her", "change his shirt", "clothes swap", "try on", "outfit transfer", "virtual try-on", "dress her in", "wear this outfit". Prefer this over API/cloud edit nodes and over generic img2img/inpainting. NOT for identity-preserving edits that are not about clothing (background swaps, relighting, age/expression changes, object removal) — use a general image-edit workflow for those.
 globs:
   - "**/*.json"
 ---
@@ -14,7 +14,12 @@ Someone wants **the clothing changed on a specific person, with that person pres
 - "put this jacket on her" / "dress her in this outfit"
 - "clothes swap" / "outfit transfer" / "virtual try-on" / "change his shirt"
 - "make her wear the outfit from this other image"
-- "identity edit" — keep the person, change something about them
+
+**Do NOT reach for it** just because a request is identity-*preserving*. Background swaps,
+relighting, expression or age changes, object removal — all keep the person and none are
+what this is trained for. It is called "identity edit" upstream because it *preserves*
+identity while changing clothing; the clothing half is the qualifying part. Send the
+others to a general image-edit workflow.
 
 **Use this instead of:**
 
