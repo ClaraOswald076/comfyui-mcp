@@ -147,6 +147,42 @@ describe("an /object_info failure names which host it asked (#1359)", () => {
     });
     expect(text).not.toMatch(/EMPTY node-definition map/i);
     expect(text).not.toMatch(/nothing was converted/i);
+    // ASSERT THE POSITIVE, not just the absence of two error phrases (codex P2). The
+    // earlier version passed with the guard removed entirely, because "no error appeared"
+    // is true of a great many broken outcomes. The conversion must actually happen and the
+    // unknown type must actually be reported.
+    expect(text).toMatch(/KSampler/);
+  });
+
+  it("a 200 ERROR BODY is refused — one key is not a schema", async () => {
+    // The zero-key check was not enough (codex, round 2): a proxy or backend answering 200
+    // with `{"error": "..."}` yields a one-key map, which passed and was handed to the
+    // converter — which skips every node it cannot find and returns a successful, empty
+    // workflow. The same silent loss, one key above the case just fixed.
+    const text = await stripWithPanelObjectInfo({
+      ok: true,
+      served_by: REMOTE,
+      object_info: { error: "upstream unavailable" },
+    });
+    expect(text).toMatch(/not a node-definition map/i);
+    expect(text).toMatch(/nothing was converted/i);
+  });
+
+  it("…and one malformed entry among good ones does NOT refuse the whole install", () => {
+    // The over-broad direction. Requiring every entry to be well-formed would refuse a
+    // working ComfyUI because one custom node ships a bad record — and the converter
+    // already reports those per node.
+    return stripWithPanelObjectInfo({
+      ok: true,
+      served_by: REMOTE,
+      object_info: {
+        KSampler: { input: { required: { seed: ["INT"] } }, output: [], name: "KSampler" },
+        BrokenPackNode: "not an object",
+      },
+    }).then((text) => {
+      expect(text).not.toMatch(/not a node-definition map/i);
+      expect(text).toMatch(/KSampler/);
+    });
   });
 
   it("LIVE CANVAS: a payload-free success is refused, not read as an empty schema", async () => {

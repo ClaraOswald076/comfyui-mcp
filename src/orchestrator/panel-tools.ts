@@ -1547,6 +1547,31 @@ The conversion is refused rather than retried against ` +
         `looks like a success, so nothing was converted.`,
     };
   }
+  // …and "non-empty" is not the same as "a schema" (codex, round 2). A proxy or a backend
+  // that answers 200 with `{"error": "..."}` produces a map with ONE key, which sailed
+  // through a zero-length check and was handed to the converter — which then skips every
+  // node it cannot find and returns a successful, empty workflow. The same silent loss,
+  // one key up from the case I had just fixed.
+  //
+  // So the test is STRUCTURAL: at least one entry that actually looks like a node
+  // definition (an object carrying `input` or `output`, which every real /object_info entry
+  // does). Deliberately not "every entry" — a single malformed record among thousands is a
+  // pack's problem and the converter reports it per node, whereas requiring perfection here
+  // would refuse a working install over one bad custom node.
+  const looksLikeNodeDef = (v: unknown): boolean =>
+    !!v && typeof v === "object" && ("input" in (v as object) || "output" in (v as object));
+  if (!Object.values(r.object_info).some(looksLikeNodeDef)) {
+    return {
+      ok: false,
+      message:
+        `The panel returned something that is not a node-definition map` +
+        (r.served_by ? ` from ${r.served_by}` : "") +
+        ` — ${Object.keys(r.object_info).length} key(s), none of which look like a node ` +
+        `definition. That is characteristic of a proxy or backend answering 200 with an ` +
+        `error body. Converting against it would silently drop every node and hand back an ` +
+        `empty workflow that reads as success, so nothing was converted.`,
+    };
+  }
   return { ok: true, objectInfo: r.object_info };
 }
 
