@@ -197,6 +197,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.2] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- ui-bridge.test.ts flakes in isolation, not just under load (#1419)
+
+
 ## [0.51.1] - 2026-08-11
 
 ### MCP
