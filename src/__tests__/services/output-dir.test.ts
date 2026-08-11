@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { logger } from "../../utils/logger.js";
 import { basename, isAbsolute, join, resolve } from "node:path";
 
 let remoteMode = false;
@@ -39,6 +40,8 @@ let baseDirEntries = new Set<string>();
 let baseSymlinkEntries = new Set<string>();
 /** How many readdirs one resolve did — the P2 bound is a number, so assert on the number. */
 let readdirCalls = 0;
+/** How many stats one resolve did — the symlink bound is a number too. */
+let statCalls = 0;
 const direntOf = (name: string) => ({
   name,
   isFile: () => !baseDirEntries.has(name) && !baseSymlinkEntries.has(name),
@@ -62,6 +65,7 @@ vi.mock("node:fs", () => ({
   realpathSync: (p: string) => (realpathFor ? realpathFor(String(p)) : String(p)),
   existsSync: (p: string) => (existsFor ? existsFor(String(p)) : liveRootExists),
   statSync: (p: string) => {
+    statCalls += 1;
     const path = String(p);
     if (/[\\/]models$/.test(path)) {
       if (modelsDirStat === "enoent" || modelsDirStat === "eacces") {
@@ -102,6 +106,10 @@ const statExceptFor = (
   err.code = "ENOENT";
   throw err;
 };
+
+vi.mock("../../utils/logger.js", () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
 
 const getSystemStats = vi.fn();
 /** The server's own model inventory: category → filenames it reports seeing. */
@@ -1393,8 +1401,9 @@ describe("#1371 — a configured base the server demonstrably does not read is r
 
   it("the scan is bounded — a huge category does not become thousands of readdirs (codex P2)", async () => {
     // Depth alone bounds nothing: 10k empty subdirectories is 10k synchronous readdirs on
-    // the download path. Exhausting the budget answers "no model found", which is the safe
-    // direction — no contradiction, so no refusal, just the pre-existing warning.
+    // the download path. The bound is generous (512) because a real diffusers layout
+    // answers from the first directory it reads — it exists for the pathological tree, not
+    // the ordinary one.
     config.comfyuiPath = "/huge";
     getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
     serverInventory = { clip_vision: ["lives-elsewhere.safetensors"] };
@@ -1405,13 +1414,96 @@ describe("#1371 — a configured base the server demonstrably does not read is r
     baseDirEntries = new Set(many);
     baseNestedEntries = [];
     readdirCalls = 0;
+    statCalls = 0;
 
     const { modelsDir } = await resolveModelsDirWithBases({ targetCategory: "clip_vision" });
     expect(modelsDir).toBe(resolve("/huge", "models"));
     // The bound, asserted as a number rather than a vibe. Without it this is 5001.
-    expect(readdirCalls).toBeLessThanOrEqual(80);
+    expect(readdirCalls).toBeLessThanOrEqual(520);
     // ...and it really did have thousands of chances to exceed it.
-    expect(readdirCalls).toBeGreaterThan(1);
+    expect(readdirCalls).toBeGreaterThan(100);
+  });
+
+  it("SYMLINK entries are bounded too — the stat is itself the work (codex P2)", async () => {
+    // Bounding readdirs left this shape exactly as unbounded as before: `.some()` resolves
+    // every link with statSync and only THEN lets the recursion decline for want of
+    // budget. Thousands of symlinks in one category is the tree the symlink fix newly made
+    // reachable, so it is the tree that had to be bounded with it.
+    //
+    // The links point at FILES, deliberately. A link to a DIRECTORY consumes the readdir
+    // budget, so that budget bounds the stats as a side effect and the stat cap could be
+    // deleted with every test still green — mutation testing caught exactly that. A link
+    // to a file consumes nothing, so this shape is bounded by the stat cap alone.
+    config.comfyuiPath = "/huge-links";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { clip_vision: ["lives-elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    // No model extension, so the entries are not counted as models on their names.
+    const many = Array.from({ length: 20000 }, (_, i) => `link-${i}`);
+    baseCategoryEntries = many;
+    baseSymlinkEntries = new Set(many);
+    baseNestedEntries = [];
+    statFor = statExceptFor((p) => /link-\d+$/.test(p), {
+      isDirectory: () => false,
+      isFile: () => true,
+    });
+    readdirCalls = 0;
+    statCalls = 0;
+
+    const { modelsDir } = await resolveModelsDirWithBases({ targetCategory: "clip_vision" });
+    expect(modelsDir).toBe(resolve("/huge-links", "models"));
+    // The cap is 4096; without it this is 20000.
+    expect(statCalls, "every link must not be resolved").toBeLessThanOrEqual(4200);
+    expect(statCalls, "...and it really had 20k chances to exceed it").toBeGreaterThan(1000);
+    // Nothing recursed, so the readdir budget never applied — the stat cap is the only
+    // thing standing between this tree and 20k syscalls.
+    expect(readdirCalls).toBeLessThanOrEqual(3);
+  });
+
+  it("a TRUNCATED scan is reported, not folded into an empty-base finding (codex P1)", async () => {
+    // The dangerous half. A stale base whose only model sits behind the 512th directory
+    // looks exactly like an empty one, so the refusal is skipped and the file lands in an
+    // install the connected server never reads — the silent misplaced write this entire
+    // check exists to stop, reintroduced by its own bound.
+    //
+    // Refusing on an inconclusive scan is worse (it blocks working installs, which was an
+    // earlier P0 here), so the download proceeds — but the user is told the check did not
+    // finish, which is the one thing they cannot otherwise know.
+    const warn = vi.mocked(logger.warn);
+    warn.mockClear();
+    config.comfyuiPath = "/truncated";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { clip_vision: ["lives-elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    const many = Array.from({ length: 5000 }, (_, i) => `dir-${i}`);
+    baseCategoryEntries = many;
+    baseDirEntries = new Set(many);
+    baseNestedEntries = [];
+
+    await resolveModelsDirWithBases({ targetCategory: "clip_vision" });
+    const said = warn.mock.calls.map((c) => String(c[0])).join(" ");
+    expect(said).toMatch(/did not finish/);
+    expect(said).toMatch(/NOT a finding that this/);
+  });
+
+  it("...and a scan that COMPLETES says nothing about truncation", async () => {
+    // The over-broad direction: warning on every ordinary resolve would train the user to
+    // ignore the one that matters.
+    const warn = vi.mocked(logger.warn);
+    warn.mockClear();
+    config.comfyuiPath = "/small";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { clip_vision: ["lives-elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = ["a", "b"];
+    baseDirEntries = new Set(["a", "b"]);
+    baseNestedEntries = [];
+
+    await resolveModelsDirWithBases({ targetCategory: "clip_vision" });
+    expect(warn.mock.calls.map((c) => String(c[0])).join(" ")).not.toMatch(/did not finish/);
   });
 
   it("…but an EMPTY subfolder is still not evidence", async () => {

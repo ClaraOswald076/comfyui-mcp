@@ -502,9 +502,22 @@ function isModelFileEntry(entry: { name: string; isFile(): boolean; isSymbolicLi
  * budget-bounded — a link pointing back up its own tree costs at most a couple of extra
  * readdirs, not a cycle. A broken link throws and is simply not a directory.
  */
-function entryIsDirectoryLike(dir: string, entry: { name: string; isDirectory(): boolean; isSymbolicLink(): boolean }): boolean {
+function entryIsDirectoryLike(
+  dir: string,
+  entry: { name: string; isDirectory(): boolean; isSymbolicLink(): boolean },
+  budget: ModelScanBudget,
+): boolean {
   if (entry.isDirectory()) return true;
   if (!entry.isSymbolicLink()) return false;
+  // THE STAT IS ITSELF THE WORK (codex P2). A category holding thousands of directory
+  // symlinks reached this line once per entry, because the readdir budget is only consumed
+  // one level down — so bounding readdirs left the symlink-heavy tree exactly as
+  // unbounded as before, in the shape the symlink fix newly made reachable.
+  if (budget.stats <= 0) {
+    budget.truncated = true;
+    return false;
+  }
+  budget.stats -= 1;
   try {
     return statSync(join(dir, entry.name)).isDirectory();
   } catch {
@@ -521,10 +534,29 @@ function entryIsDirectoryLike(dir: string, entry: { name: string; isDirectory():
  * the pre-existing unconfirmed-visibility warning. A populated base almost always answers
  * true from a file in the first directory read.
  */
-const MODEL_SCAN_DIR_BUDGET = 64;
+const MODEL_SCAN_DIR_BUDGET = 512;
 
-function newModelScanBudget(): { dirs: number } {
-  return { dirs: MODEL_SCAN_DIR_BUDGET };
+/** Companion cap on link resolutions, for the same reason one level down. */
+const MODEL_SCAN_STAT_BUDGET = 4096;
+
+interface ModelScanBudget {
+  dirs: number;
+  stats: number;
+  /**
+   * The scan GAVE UP; it did not finish and find nothing.
+   *
+   * These are not the same answer and folding them together is the defect this repo has a
+   * gate for (#796). "No model here" contradicts the base and refuses the download; "I
+   * stopped looking" establishes nothing, and reporting it as the former would refuse a
+   * working install, while reporting it as a clean negative — which is what the first
+   * version of this bound did — silently returns the misplaced write the whole check
+   * exists to stop. The caller proceeds either way, but says which one happened.
+   */
+  truncated: boolean;
+}
+
+function newModelScanBudget(): ModelScanBudget {
+  return { dirs: MODEL_SCAN_DIR_BUDGET, stats: MODEL_SCAN_STAT_BUDGET, truncated: false };
 }
 
 /**
@@ -541,7 +573,11 @@ function newModelScanBudget(): { dirs: number } {
  * these users were before the gate existed.
  */
 function directoryHoldsAModel(dir: string, depth = 2, budget = newModelScanBudget()): boolean {
-  if (depth <= 0 || budget.dirs <= 0) return false;
+  if (depth <= 0) return false;
+  if (budget.dirs <= 0) {
+    budget.truncated = true;
+    return false;
+  }
   budget.dirs -= 1;
   let entries: { name: string; isFile(): boolean; isSymbolicLink(): boolean; isDirectory(): boolean }[];
   try {
@@ -554,8 +590,14 @@ function directoryHoldsAModel(dir: string, depth = 2, budget = newModelScanBudge
     if (isModelFileEntry(entry)) return true;
   }
   for (const entry of entries) {
-    if (budget.dirs <= 0) return false;
-    if (entryIsDirectoryLike(dir, entry) && directoryHoldsAModel(join(dir, entry.name), depth - 1, budget))
+    if (budget.dirs <= 0) {
+      budget.truncated = true;
+      return false;
+    }
+    if (
+      entryIsDirectoryLike(dir, entry, budget) &&
+      directoryHoldsAModel(join(dir, entry.name), depth - 1, budget)
+    )
       return true;
   }
   return false;
@@ -585,6 +627,9 @@ async function corroborateBaseByModelInventory(
        * lands in the wrong install.
        */
       contradicted?: boolean;
+      /** The local model scan gave up at its bound, so "not contradicted" is not a finding
+       *  that this base holds nothing of its own. */
+      scanTruncated?: boolean;
     }
 > {
   // The corroboration must be about the category this download is FOR. A complete match
@@ -626,6 +671,8 @@ async function corroborateBaseByModelInventory(
   let lastReason: string | undefined;
   /** Set when the server's own listing shows the base is NOT a root it reads (#1371). */
   let contradictedBase = false;
+  /** The local scan hit its bound before answering. See the assignment for why it matters. */
+  let scanTruncated = false;
   for (const category of [targetCategory]) {
     let files: string[];
     try {
@@ -802,6 +849,29 @@ async function corroborateBaseByModelInventory(
         // costs one misplaced file and a warning; a false one costs every download on a
         // working install.
         let baseHasOwnModelsHere = false;
+        const budget = newModelScanBudget();
+        // The budget is read BEFORE the link resolution, not after: `.some()` would
+        // otherwise stat every one of thousands of entries and only then let the recursion
+        // decline for want of budget (codex P2).
+        //
+        // Named rather than inlined because the guard must MARK the truncation on its way
+        // out. Written inline as `budget.dirs > 0 && …` it short-circuited silently, so the
+        // scan gave up and reported a clean negative — precisely the fold this budget was
+        // being taught to avoid, committed in the line that avoids it.
+        const subdirHoldsAModel = (entry: {
+          name: string;
+          isDirectory(): boolean;
+          isSymbolicLink(): boolean;
+        }): boolean => {
+          if (budget.dirs <= 0) {
+            budget.truncated = true;
+            return false;
+          }
+          return (
+            entryIsDirectoryLike(categoryDir, entry, budget) &&
+            directoryHoldsAModel(join(categoryDir, entry.name), 2, budget)
+          );
+        };
         try {
           // withFileTypes, because a DIRECTORY named `foo.safetensors` is not a model
           // (codex): counting it would refuse a base on the strength of a folder name.
@@ -809,7 +879,6 @@ async function corroborateBaseByModelInventory(
           // ONE budget for the whole scan, not one per subdirectory: the point of the
           // bound is to cap this entire check, and a fresh budget per entry would let a
           // category with 10k subdirectories spend 10k of them.
-          const budget = newModelScanBudget();
           baseHasOwnModelsHere = readdirSync(categoryDir, { withFileTypes: true }).some(
             (entry) =>
               isModelFileEntry(entry) ||
@@ -817,13 +886,22 @@ async function corroborateBaseByModelInventory(
               // actually holds a model file within a bounded depth. An empty folder is not
               // evidence the base is populated: that is the metadata hole wearing a
               // directory.
-              (entryIsDirectoryLike(categoryDir, entry) &&
-                directoryHoldsAModel(join(categoryDir, entry.name), 2, budget)),
+              subdirHoldsAModel(entry),
           );
         } catch {
           // Absent or unreadable — nothing established either way.
         }
         contradictedBase = baseHasOwnModelsHere;
+        // A TRUNCATED SCAN IS NOT A CLEAN NEGATIVE (codex P1, #796 discipline).
+        //
+        // Not finding a model means this base is a place models do not live, which
+        // contradicts nothing and lets the download proceed. Giving up after the bound
+        // means we do not know — and a stale base whose only model sits behind the 512th
+        // directory reads identically to an empty one, which is the silent misplaced write
+        // this whole check exists to stop. The download still proceeds (refusing on an
+        // inconclusive scan would block working installs, which is worse), but the fact
+        // that the check did not finish is stated rather than folded away.
+        scanTruncated = budget.truncated && !baseHasOwnModelsHere;
       }
       lastReason =
         present === 0
@@ -848,7 +926,8 @@ async function corroborateBaseByModelInventory(
         `"${categoryDir}" (e.g. "${escaping[0]}"), so they cannot corroborate this base`;
     }
   }
-  if (lastReason) return { ok: false, reason: lastReason, contradicted: contradictedBase };
+  if (lastReason)
+    return { ok: false, reason: lastReason, contradicted: contradictedBase, scanTruncated };
   // Nothing was COMPARED. Say which of the two reasons that was: the listing could not be
   // read, or it was empty. Reporting the first as the second would be the same fold this
   // whole change is about — and an EMPTY target category genuinely cannot corroborate
@@ -1072,6 +1151,19 @@ export async function resolveModelsDirWithBases(opts?: {
               `and be reported as a success (#1371). Fix by pointing COMFYUI_PATH at the install ` +
               `the connected server actually runs, or by launching that server with an absolute ` +
               `--base-directory so its models directory can be read from it directly.`,
+          );
+        }
+        if (!verdict.ok && verdict.scanTruncated) {
+          // Proceeding, but not silently (codex P1). The refusal above needs the base to
+          // be PROVEN stale, and a scan that stopped early proves nothing — so the
+          // download goes ahead exactly as it did before this gate existed, with the one
+          // thing the user cannot otherwise know: the check did not finish.
+          logger.warn(
+            `The local check of "${resolve(base, "models")}" did not finish — it stopped at its ` +
+              `directory bound before finding a model of its own. That is NOT a finding that this ` +
+              `base is empty, so the download proceeds; but if this install is stale, the file will ` +
+              `land where the connected server never looks (#1371). ${verdict.reason}.`,
+            { modelsDir: resolve(base, "models"), basis: "filename-inventory", truncated: true },
           );
         }
       }
