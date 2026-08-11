@@ -9,8 +9,10 @@
 // with one about identity for that reason.
 
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import {
   NODE_ID_MESSAGE,
+  NODE_ID_PATTERN,
   isNodeIdString,
   isQualifiedNodeId,
   normalizeNodeId,
@@ -75,5 +77,24 @@ describe("#1425 what goes on the wire", () => {
     // A caller holding `263:78` needs to know whether it is unsupported or
     // malformed; the old message ("must be an integer") answered neither.
     expect(NODE_ID_MESSAGE).toContain("120:104");
+  });
+});
+
+describe("#1425 what the tool schema ADVERTISES", () => {
+  it("keeps a pattern on the wire schema — a refine would advertise nothing", () => {
+    // Validating through `.refine()` type-checks and passes every behavioural test
+    // above, while rendering as a bare {"type":"string"}: clients would be told
+    // LESS about a node id than the old integer-only rule told them. Measured, not
+    // assumed — this is the assertion that catches a switch back.
+    const schema = z.toJSONSchema(
+      z.object({ node_id: z.string().regex(NODE_ID_PATTERN, NODE_ID_MESSAGE) }),
+      { io: "input", unrepresentable: "any" },
+    ) as { properties: { node_id: { pattern?: string } } };
+    expect(schema.properties.node_id.pattern).toBeTruthy();
+    // And the advertised pattern must actually admit the shape this issue is about.
+    const advertised = new RegExp(schema.properties.node_id.pattern!);
+    expect(advertised.test("263:78")).toBe(true);
+    expect(advertised.test("42")).toBe(true);
+    expect(advertised.test("1:-2")).toBe(false);
   });
 });

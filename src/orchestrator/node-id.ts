@@ -34,9 +34,19 @@ const PLAIN = /^-?\d+$/;
  */
 const QUALIFIED = /^-?\d+(?::\d+)+$/;
 
+/**
+ * Both spellings in ONE pattern, so it can be handed to `z.string().regex()`.
+ *
+ * That matters beyond tidiness: `.regex()` puts a `pattern` on the advertised MCP
+ * input schema, while `.refine()` renders as a bare `{"type":"string"}` (measured
+ * with zod 4's toJSONSchema). Validating through a refine would therefore have told
+ * every client LESS about a node id than the old integer-only rule did.
+ */
+export const NODE_ID_PATTERN = /^-?\d+(?::\d+)*$/;
+
 /** Does this string name a node at all — either spelling? */
 export function isNodeIdString(v: string): boolean {
-  return PLAIN.test(v) || QUALIFIED.test(v);
+  return NODE_ID_PATTERN.test(v);
 }
 
 /** True for the qualified form specifically (`"5:12"`), false for `"5"`. */

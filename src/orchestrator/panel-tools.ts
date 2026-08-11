@@ -51,7 +51,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { UiBridge } from "../services/ui-bridge.js";
 import { conversationOfScopeAddress, isScopeAddress, shortTabId } from "../services/session-scope.js";
 import type { ScopeRepinOutcome } from "./turn-origins.js";
-import { NODE_ID_MESSAGE, isNodeIdString, normalizeNodeId } from "./node-id.js";
+import { NODE_ID_MESSAGE, NODE_ID_PATTERN, normalizeNodeId } from "./node-id.js";
 
 /** #884 — journal TICKETS (run completions #468, ask answers #486) must be
  *  keyed by the REAL tab a run/card was routed to: the panel reports back under
@@ -7554,7 +7554,7 @@ const nodeId = () =>
   z
     .union([
       z.number().int(),
-      z.string().refine(isNodeIdString, NODE_ID_MESSAGE),
+      z.string().regex(NODE_ID_PATTERN, NODE_ID_MESSAGE),
     ])
     .transform(normalizeNodeId);
 
