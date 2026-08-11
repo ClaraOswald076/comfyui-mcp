@@ -21,11 +21,12 @@
 // card so an internal MCP client does not kill the request first (#325); moving one
 // means moving the other, which is the design decision #1352 is really asking for.
 
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   buildPanelToolDefs,
   makePanelToolCtx,
+  __panelAskTestHooks,
   type PanelToolCtx,
   type ToolResult,
 } from "../../orchestrator/panel-tools.js";
@@ -40,10 +41,24 @@ const REPLY_TIMEOUT = () =>
       `may be backgrounded or frozen`,
   );
 
-function bridge(fail: Error) {
+/** What the tool actually put on the wire, so the ask_id can be asserted rather than
+ *  assumed — a double that ignores the command cannot tell whether one was sent. */
+const sentCommands: Record<string, unknown>[] = [];
+
+function bridge(fail: Error, lateAnswer?: { value: unknown }) {
   return {
-    send: async () => {
+    send: async (cmd: Record<string, unknown>) => {
+      sentCommands.push(cmd);
       throw fail;
+    },
+    // #1352 — the grace poll asks the bridge for a late answer keyed by ask id. Supplying
+    // one here is what distinguishes "nobody typed it" from "they typed it a moment late",
+    // which are the two outcomes this tool now has to tell apart.
+    takeLateAskReply: () => {
+      if (!lateAnswer) return undefined;
+      const v = lateAnswer.value;
+      lateAnswer.value = undefined; // claimed once, like the real buffer
+      return v;
     },
     push: () => 1,
     canReach: () => true,
@@ -55,8 +70,8 @@ function bridge(fail: Error) {
   } as unknown as PanelToolCtx["bridge"];
 }
 
-async function requestSecret(fail: Error): Promise<string> {
-  const ctx = makePanelToolCtx(bridge(fail), TAB, new WorkflowTargetStore());
+async function requestSecret(fail: Error, lateAnswer?: { value: unknown }): Promise<string> {
+  const ctx = makePanelToolCtx(bridge(fail, lateAnswer), TAB, new WorkflowTargetStore());
   const def = buildPanelToolDefs().find((d) => d.name === "panel_request_secret");
   if (!def) throw new Error("panel_request_secret is not registered");
   const res: ToolResult = await def.handler(
@@ -67,6 +82,18 @@ async function requestSecret(fail: Error): Promise<string> {
 }
 
 describe("a timed-out secret card is described honestly (#1352)", () => {
+  // #1352 gave this card the ask path's deadline + GRACE, and the grace is a real wait:
+  // on a genuine no-answer the handler now polls for it before reporting. At the shipped
+  // 240s + 45s that is far past any test budget, so drive it at millisecond scale — the
+  // behaviour under test is the ORDER of events, not the size of the numbers.
+  beforeEach(() => {
+    sentCommands.length = 0;
+    __panelAskTestHooks.setAskTiming({ deadlineMs: 5, graceMs: 20, pollMs: 2 });
+  });
+  afterEach(() => {
+    __panelAskTestHooks.setAskTiming(null);
+  });
+
   it("does not accuse the tab of being frozen, or the user of declining", async () => {
     const text = await requestSecret(REPLY_TIMEOUT());
 
@@ -83,14 +110,46 @@ describe("a timed-out secret card is described honestly (#1352)", () => {
     expect(text).toMatch(/no credential was read/);
   });
 
-  it("says a LATE value is discarded — measured, not hedged", async () => {
-    // The claim rests on this card having no ask_id, so the id-keyed late buffer cannot
-    // match it. Hedging here would leave the user waiting for a save that cannot happen.
+  it("says the DEADLINE AND THE GRACE both elapsed — the claim that is true now", async () => {
+    // This test used to assert that a late value is discarded, which was measured and
+    // correct: the card carried no ask_id, so the id-keyed buffer could not match it.
+    // #1352 gave it one and a grace poll, so reaching this message means BOTH windows
+    // closed. The old sentence would now send someone away from a save that works.
     const text = await requestSecret(REPLY_TIMEOUT());
 
-    expect(text).toMatch(/cannot reach this call/);
-    expect(text).toMatch(/discarded rather than saved/);
+    expect(text).toMatch(/deadline AND the/);
+    expect(text).toMatch(/grace/);
+    expect(text).toMatch(/no path back to this call/);
     expect(text).toMatch(/call panel_request_secret again/);
+    // …and it must not resurrect the retired claim.
+    expect(text).not.toMatch(/discarded rather than saved/);
+  });
+
+  it("APPLIES a value that arrives during the grace, and says it was late", async () => {
+    // The point of the change. The card deadline fires, the human is still typing, and the
+    // answer lands a moment later — it is applied rather than thrown away.
+    //
+    // The value is deliberately one the tool will refuse to persist (whitespace), so this
+    // test exercises the RECOVERY without writing a credential anywhere: what is asserted
+    // is that the late answer reached the handler at all, which "No token entered" proves
+    // and a timeout message would disprove.
+    const text = await requestSecret(REPLY_TIMEOUT(), { value: "   " });
+
+    expect(text).toMatch(/No token entered/);
+    expect(text).not.toMatch(/no path back to this call/);
+  });
+
+  it("SENDS an ask_id, which is the only thing that makes a late answer recoverable", async () => {
+    // The bridge buffers a late reply only for a command that carried an ask_id
+    // (ui-bridge.ts, the askRidToId registration). Without one the grace poll above can
+    // never find anything — and a test double that answers regardless would not notice,
+    // which is exactly what mutation testing caught here.
+    await requestSecret(REPLY_TIMEOUT());
+
+    expect(sentCommands).toHaveLength(1);
+    expect(sentCommands[0].cmd).toBe("request_secret");
+    expect(typeof sentCommands[0].ask_id).toBe("string");
+    expect(String(sentCommands[0].ask_id).length).toBeGreaterThan(8);
   });
 
   it("keeps the masked-input rule — never route a secret through the conversation", async () => {
@@ -107,6 +166,6 @@ describe("a timed-out secret card is described honestly (#1352)", () => {
 
     expect(text).toMatch(/Panel tab is not open/);
     expect(text).not.toMatch(/very likely just time/);
-    expect(text).not.toMatch(/discarded rather than saved/);
+    expect(text).not.toMatch(/no path back to this call/);
   });
 });

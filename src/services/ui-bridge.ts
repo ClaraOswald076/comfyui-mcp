@@ -1522,7 +1522,21 @@ export class UiBridge {
    *  caller, instead of being discarded as a "late reply for a timed-out command"
    *  (#486). Timestamped so an abandoned mapping (timeout/disconnect/send-failure
    *  whose late reply never arrives) is TTL-pruned rather than kept forever. */
-  private askRidToId = new Map<string, { askId: string; ts: number; tabId: string }>();
+  private askRidToId = new Map<
+    string,
+    {
+      askId: string;
+      ts: number;
+      tabId: string;
+      /**
+       * This card's answer is a CREDENTIAL (#1352). It may be buffered in memory so a
+       * late-arriving value can still be applied, but it must never reach the durable
+       * late-answer journal: `panel_request_secret` exists precisely so the value lands
+       * nowhere it can be read back, and a journal is exactly such a place.
+       */
+      sensitive?: boolean;
+    }
+  >();
   /**
    * Notified the instant a LATE (post-reply-timeout) ask answer validates (#486).
    *
@@ -2366,8 +2380,14 @@ export class UiBridge {
               // by a live poller; this is what makes an answer given after the
               // tool call died survive at all. Never let a sink fault break the
               // message loop.
+              //
+              // EXCEPT FOR A CREDENTIAL (#1352). The in-memory buffer above is bounded by
+              // a TTL and cleared when claimed; the journal is durable BY DESIGN, which is
+              // the one property a secret must not have. So a secret card's late answer is
+              // recoverable within this process and nowhere else — and if nothing claims
+              // it, it expires unread rather than being written down.
               try {
-                this.lateAskSink?.(entry.askId, msg.result, entry.tabId);
+                if (!entry.sensitive) this.lateAskSink?.(entry.askId, msg.result, entry.tabId);
               } catch (err) {
                 logger.warn(
                   `[ui-bridge] late ask-answer sink threw (the answer is still buffered): ${err instanceof Error ? err.message : String(err)}`,
@@ -4043,10 +4063,19 @@ export class UiBridge {
     const askId = (cmd as { ask_id?: unknown }).ask_id;
     if (typeof askId === "string" && askId) {
       this.pruneLateAsk();
+      // INFERRED FROM THE COMMAND, never from a caller-supplied flag (#1352). A flag is
+      // one forgotten argument away from journaling a credential, and the set of
+      // secret-collecting commands is closed and known here.
+      const sensitive = cmd.cmd === "request_secret";
       // Carry the ROUTED tab id with the mapping: the late-reply branch runs in a
       // scope that only knows the socket, and the journal needs the tab the card
       // was rendered on to address the answer.
-      this.askRidToId.set(rid, { askId, ts: Date.now(), tabId: ctx.tabId });
+      this.askRidToId.set(rid, {
+        askId,
+        ts: Date.now(),
+        tabId: ctx.tabId,
+        ...(sensitive ? { sensitive: true } : {}),
+      });
     }
     // Rewrite an old-panel "Unknown command" rejection into an actionable
     // update-your-panel message (see makeUnknownCommandError). Applied to the

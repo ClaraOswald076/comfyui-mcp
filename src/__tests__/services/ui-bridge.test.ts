@@ -4393,6 +4393,47 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     expect(bridge.takeLateAskReply("ask-xyz")).toBeUndefined(); // drained once
   });
 
+  // #1352 — the same recovery for a CREDENTIAL, minus the one property that makes it
+  // durable. A secret card's late answer must be claimable in memory, because a user who
+  // finishes typing a moment late should still have their token applied — and it must
+  // NEVER reach the journal, because `panel_request_secret` exists so the value lands
+  // nowhere it can be read back.
+  it("buffers a late request_secret answer but NEVER hands it to the durable sink", async () => {
+    const sock = await connectPanel("tab-secret", "wf");
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-secret")).toBe(true), {
+      timeout: 3000,
+    });
+    const journaled: unknown[] = [];
+    bridge.setLateAskReplySink((askId, result) => journaled.push({ askId, result }));
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd === "request_secret") {
+        setTimeout(() => {
+          sock.send(JSON.stringify({ rid: msg.rid, ok: true, result: "sk-live-TOKEN" }));
+        }, 80);
+      }
+    });
+
+    await expect(
+      bridge.send(
+        { cmd: "request_secret", ask_id: "secret-1", label: "token" },
+        { tabId: "tab-secret", timeoutMs: 30 },
+      ),
+    ).rejects.toThrow(/did not reply/i);
+
+    // Recoverable in memory: this is what lets a late token still be applied.
+    await waitFor(() => expect(bridge.takeLateAskReply("secret-1")).toBe("sk-live-TOKEN"), {
+      timeout: 3000,
+    });
+    // …and drained on claim, so it does not linger.
+    expect(bridge.takeLateAskReply("secret-1")).toBeUndefined();
+    // THE POINT: the durable journal never saw it. Asserted on the whole payload, not just
+    // the id — a sink that recorded the value under a different key would still be a leak.
+    expect(journaled).toEqual([]);
+    expect(JSON.stringify(journaled)).not.toContain("sk-live-TOKEN");
+    bridge.setLateAskReplySink(() => {});
+  });
+
   // The buffer only helps a caller that is still alive to poll it, and #486 is
   // exactly the case where there is none — the tools/call that asked has been
   // abandoned. The SINK is what makes the answer durable: it fires at arrival,
