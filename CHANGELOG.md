@@ -4,6 +4,33 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.50.113
+
+### Fixed
+
+- **A frontend-only node no longer makes a workflow's runtime "unknown" (#1372).**
+  `list_packs(action:"check_runtime")` counted `MarkdownNote` as an unclassifiable node and
+  refused to say the workflow was free, stopping the paid-API safety flow to ask a question
+  that already had an answer.
+
+  `MarkdownNote`, `Note`, `Reroute` and `PrimitiveNode` are LiteGraph-native: the frontend
+  registers them, `/object_info` never lists them, and they are stripped before a prompt is
+  queued. A node that does not execute cannot be a paid partner node, so it earns none of
+  the doubt the "unknown" verdict exists to express. They are also removed from the
+  classifiable denominator — one API node beside three Notes used to read as "mixed".
+
+  The caution itself is unchanged: a genuinely unrecognised node still collapses the
+  verdict, and a node the server DOES register under one of those names is classified
+  normally rather than skipped — a safety check that a name collision can bypass would be
+  worse than the false "unknown" it replaced.
+
+  The type list is imported from the workflow converter, which has always known which types
+  never reach the backend. The two disagreeing was the bug.
+
+  Not covered: third-party virtual nodes (KJNodes `GetNode`/`SetNode`, rgthree's
+  canvas-only nodes) still report "unknown". They have the same property but a hardcoded
+  list of third-party names goes stale silently — tracked in #1400.
+
 ## 0.50.112
 
 ### Fixed
@@ -143,6 +170,14 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.50.113] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- a frontend-only node is not an unknown runtime (#1396)
+
 
 ## [0.50.112] - 2026-08-11
 
