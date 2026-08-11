@@ -197,6 +197,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.5] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- colon-qualified node ids stop being uneditable (and stop resolving to the wrong node) (#1433)
+
+
 ## [0.51.4] - 2026-08-11
 
 ### MCP
