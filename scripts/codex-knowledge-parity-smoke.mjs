@@ -18,6 +18,7 @@
 //      a full SKILL.md is slow).
 
 import { spawn } from "node:child_process";
+import { makeGraph, parityVerdict } from "./knowledge-parity-mock-graph.mjs";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -39,120 +40,6 @@ const DEAD_COMFY = "http://127.0.0.1:9";
 const CAP_MS = Number(process.env.SCENARIO_CAP_MS || 240000);
 const TRACE = join(tmpdir(), `comfyui-mcp-tooltrace-${PORT}-${Date.now()}.jsonl`);
 
-function makeGraph() {
-  let seq = 0;
-  const nodes = new Map();
-  const add = (type, title) => {
-    const id = ++seq;
-    nodes.set(id, {
-      id, type, title: title || type, is_subgraph: false,
-      widgets: { value: 0, text: "" },
-      inputs: [{ name: "in0", type: "*", link: null }, { name: "model", type: "MODEL", link: null }],
-      outputs: [{ name: "out0", type: "*", links: [] }, { name: "MODEL", type: "MODEL", links: [] }],
-    });
-    return nodes.get(id);
-  };
-  const brief = (n) => ({ id: n.id, type: n.type, title: n.title, is_subgraph: !!n.is_subgraph, widgets: n.widgets, inputs: n.inputs, outputs: n.outputs });
-  const need = (id) => { const n = nodes.get(Number(id)); if (!n) throw new Error(`No node ${id}`); return n; };
-  const EXEC = {
-    graph_get_state: () => ({ viewing: { scope: "root" }, node_count: nodes.size, truncated: false, nodes: [...nodes.values()].map(brief) }),
-    graph_add_node: ({ class_type, title }) => { if (!class_type) throw new Error("class_type required"); return { added: brief(add(class_type, title)) }; },
-    graph_remove_node: ({ node_id }) => { const n = need(node_id); nodes.delete(Number(node_id)); return { removed: brief(n) }; },
-    graph_clear: () => { const c = nodes.size; nodes.clear(); return { cleared: c }; },
-    // #1384 — without this the preferred one-shot panel_load_workflow(pack:…) path cannot
-    // complete, so the smoke could only reach the capability by the long route.
-    graph_load: (m) => {
-      // ACCEPT THE SHAPES A WORKFLOW ACTUALLY ARRIVES IN. Reading only `workflow.nodes`
-      // meant a pack workflow that nests them elsewhere loaded ZERO nodes — and the mock
-      // then honestly reported `node_count: 0` for a 16-node graph, which an agent
-      // correctly read as the panel silently dropping its workflow and filed as a panel
-      // defect (comfyui-mcp-panel#1068). The observation was right; the panel it was
-      // observing was this file.
-      const wf = m.workflow ?? m.graph ?? m.data ?? m;
-      const incoming = Array.isArray(wf?.nodes)
-        ? wf.nodes
-        : Array.isArray(wf?.workflow?.nodes)
-          ? wf.workflow.nodes
-          : Array.isArray(wf?.prompt?.nodes)
-            ? wf.prompt.nodes
-            : [];
-      nodes.clear();
-      for (const n of incoming) {
-        const id = Number(n.id ?? nodes.size + 1);
-        nodes.set(id, {
-          id,
-          type: n.type ?? "Unknown",
-          title: n.title ?? n.type ?? "Unknown",
-          widgets: {},
-          inputs: [],
-          outputs: [],
-        });
-      }
-      return { loaded: { node_count: nodes.size } };
-    },
-    graph_connect: ({ from_node_id, to_node_id }) => ({ connected: { from: { node_id: from_node_id }, to: { node_id: to_node_id } } }),
-    graph_disconnect: ({ node_id }) => ({ disconnected: { node_id } }),
-    graph_set_widget: ({ node_id, widget, value }) => { const n = need(node_id); const p = n.widgets[widget]; n.widgets[widget] = value; return { set: { node_id, widget, previous: p, value } }; },
-    graph_set_title: ({ node_id, title }) => { const n = need(node_id); const p = n.title; n.title = title; return { node_id, previous: p, title }; },
-    graph_move_node: ({ node_id, pos }) => ({ moved: { node_id, to: pos } }),
-    graph_canvas: ({ action }) => ({ canvas: { action } }),
-    graph_run: ({ batch_count }) => ({ queued: true, batch_count: batch_count ?? 1 }),
-    graph_get_errors: () => ({ last_execution_error: null, node_errors: null, note: "no errors" }),
-    workflow_save: () => ({ saved: true }),
-    workflow_save_as: ({ name }) => ({ saved_as: `workflows/${name}.json` }),
-    workflow_new: () => ({ created: true }),
-    workflow_open: ({ path }) => ({ opened: { path } }),
-    // The ACTIVE record must carry a workflow_uuid (#1384). Without one the tab is
-    // identity-less, so `rebindWorkflowFence` reports `no_uuid` and every graph WRITE stays
-    // refused — the same class of refusal the report opened with, one fence further in.
-    // The refusal is correct product behaviour: the mock was the thing lying, by claiming a
-    // panel version new enough to stamp per-workflow identity while advertising none.
-    workflow_list: () => ({
-      active: {
-        path: "workflows/current.json",
-        filename: "current.json",
-        key: "cur",
-        workflow_uuid: MOCK_WORKFLOW_UUID,
-      },
-      workflows: [
-        {
-          path: "workflows/current.json",
-          filename: "current.json",
-          key: "cur",
-          workflow_uuid: MOCK_WORKFLOW_UUID,
-          active: true,
-        },
-      ],
-      open: [],
-    }),
-    // COMMANDS THE ADVERTISED VERSION IMPLIES (comfyui-mcp-panel#1068). The hello claims a
-    // panel new enough for the whole bridge set; throwing `unknown graph_outline` at an
-    // agent that checked the version first is the mock lying again, and this time the agent
-    // did the right thing with the lie — it treated a missing capability as a defect and
-    // filed a report against the real panel. A harness that provokes false bug reports
-    // costs more than the coverage it buys.
-    graph_outline: () => ({
-      scope: "root",
-      node_count: nodes.size,
-      nodes: [...nodes.values()].map((n) => ({ id: n.id, type: n.type, title: n.title })),
-    }),
-    nodes_list: () => ({
-      count: nodes.size,
-      nodes: [...nodes.values()].map(brief),
-    }),
-    graph_find_nodes: ({ query }) => {
-      const q = String(query ?? "").toLowerCase();
-      const hits = [...nodes.values()].filter(
-        (n) => !q || n.type.toLowerCase().includes(q) || n.title.toLowerCase().includes(q),
-      );
-      return { count: hits.length, nodes: hits.map(brief) };
-    },
-    graph_select_nodes: ({ node_ids }) => ({ selected: node_ids }),
-    set_todo: ({ items }) => ({ ok: true, count: (items || []).length }),
-    ask_user: (m) => (m.options && m.options[0] && m.options[0].label) || "yes",
-  };
-  return { nodes, EXEC };
-}
 
 function waitForPort(port, timeoutMs = 30000) {
   const start = Date.now();
@@ -372,8 +259,11 @@ async function main() {
     console.log(`Codex applied the pack / read its ready workflow: ${appliedPack ? "YES" : "NO"}`);
     console.log(`Codex built nodes on the live canvas: ${builtOnCanvas ? "YES" : "NO"}`);
 
-    // PASS = it discovered the family knowledge AND used the ready pack expertise.
-    exitCode = discovery && discoveredKrea2 ? 0 : 1;
+    // PASS = it discovered the family knowledge, used the ready pack expertise, AND the
+    // canvas actually changed. `builtOnCanvas` was printed as a criterion and then left out
+    // of the verdict (codex), so a run that read the pack and applied NOTHING — the
+    // zero-node load this file also fixes — passed while reporting "built nodes: NO".
+    exitCode = parityVerdict({ discovery, discoveredKrea2, builtOnCanvas }) ? 0 : 1;
     console.log(`\n${exitCode === 0 ? "PASS" : "FAIL"} — knowledge parity ${exitCode === 0 ? "achieved" : "NOT achieved"}.`);
   } catch (e) {
     console.error("[kp-smoke] ERROR:", e.message);
