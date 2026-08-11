@@ -4,6 +4,42 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.50.109
+
+### Added
+
+- **Operator-level restriction of the tool surface (#873).** For a hosted deployment — a
+  shared Open WebUI, a team frontend — where the operator is not the person prompting,
+  three environment variables now withhold tools from the model entirely:
+  `COMFYUI_MCP_TOOL_PRESET` (`safe` | `readonly`), `COMFYUI_MCP_TOOL_DENY`, and
+  `COMFYUI_MCP_TOOL_ALLOW`. A withheld tool is never registered, so it is absent from
+  `tools/list`, absent from `call_tool`, and the model never learns it exists.
+
+  Measured on a built server: 40 tools unrestricted, 16 under `safe`, 10 under `readonly`.
+  Under `readonly`, `call_tool {"name": "restart_comfyui"}` answers `Unknown tool` —
+  absent from dispatch, not merely hidden from the listing, which was the reporter's
+  specific concern about compact mode.
+
+  A misconfiguration **refuses to start** rather than starting unrestricted: an unknown
+  preset, or a variable set but empty (an unexpanded `${VAR}` in a compose file), aborts
+  with the reason on every transport — stdio, `--http`, and `--panel-orchestrator`.
+  Coming up with a full surface while the operator believes it is restricted is worse than
+  having no filter.
+
+  This is a boundary against the model and the people prompting it — not against whoever
+  sets the environment, and not a substitute for keeping an untrusted party off the
+  ComfyUI host. `docs/configuration.mdx` says so.
+
+### Fixed
+
+- `list_packs` is withheld by both presets. Its `action:"install_deps"` installs custom
+  node packs through ComfyUI-Manager — downloading and RUNNING third-party code on the
+  host — behind a name that reads like inspection. Same for `apps` (`action:"import"`
+  installs from the public registry), `get_defaults` (writes config), `list_local_models`
+  (`action:"remove"` deletes a model file) and `queue` (destroys work).
+- `search_custom_nodes` is NOT withheld. It only searches; the installing tool is
+  `install_custom_node`, which is withheld.
+
 ## 0.50.66
 
 ### Fixed
@@ -20,6 +56,15 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.50.109] - 2026-08-11
+
+### MCP
+
+#### Added
+- restrict the tool surface — deny/allow lists and presets (#1383)
+- krea2-identity-edit — local outfit swap, on demand (#1376)
+
 
 ## [0.50.108] - 2026-08-10
 
