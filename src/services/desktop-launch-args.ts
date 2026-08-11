@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
 
@@ -30,6 +30,9 @@ export interface SavedLaunchArgs {
   args: string[];
 }
 
+/** Desktop's own file is a few kilobytes; anything far larger is not it. */
+const MAX_INSTALLATIONS_BYTES = 4 * 1024 * 1024;
+
 /** The Desktop config directories, in the same order `config.ts` reads them. */
 function desktopConfigDirs(): string[] {
   const home = homedir();
@@ -40,11 +43,24 @@ function desktopConfigDirs(): string[] {
   ];
 }
 
-/** Case- and separator-insensitive path identity, since Desktop and our config can
- *  disagree on trailing slashes and (on Windows) case. */
+/**
+ * Path identity, tolerant of trailing separators — and of CASE only where the filesystem
+ * is (codex).
+ *
+ * Folding case everywhere is wrong on Linux, where `/home/u/ComfyUI` and `/home/u/comfyui`
+ * are two different installs: the drift sentence would be attributed to the wrong one and
+ * name a flag the user never put there. Windows is case-insensitive, and it is the
+ * platform whose config layout this file is mostly about, so the fold is scoped to it.
+ *
+ * macOS is usually — not always — case-insensitive, and guessing is not worth it: a
+ * mismatch there DECLINES, which costs a sentence rather than printing a wrong one.
+ */
 function samePath(a: string, b: string): boolean {
-  const norm = (p: string) =>
-    resolve(p.trim()).replace(new RegExp(`\\${sep}+$`), "").toLowerCase();
+  const fold = process.platform === "win32";
+  const norm = (p: string) => {
+    const resolved = resolve(p.trim()).replace(new RegExp(`\\${sep}+$`), "");
+    return fold ? resolved.toLowerCase() : resolved;
+  };
   try {
     return norm(a) === norm(b);
   } catch {
@@ -103,6 +119,13 @@ export function desktopSavedLaunchArgs(installPath: string | undefined): SavedLa
     try {
       const file = join(dir, "installations.json");
       if (!existsSync(file)) continue;
+      // A SIZE BOUND (codex P3). This runs while composing the restart REPORT, and the
+      // answer is worth one small local JSON read — not an unbounded slurp of whatever
+      // happens to sit at that name. It does not make the read non-blocking, which is the
+      // honest residual: a redirected roaming profile on a slow share can still cost this
+      // report a moment. The restart itself has already happened by then, and this path
+      // already makes synchronous process-table and network probes.
+      if (statSync(file).size > MAX_INSTALLATIONS_BYTES) continue;
       parsed = JSON.parse(readFileSync(file, "utf-8"));
     } catch {
       // Unreadable or malformed: nothing established.

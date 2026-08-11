@@ -127,6 +127,43 @@ describe("#848 — the saved launch arguments", () => {
     ]);
   });
 
+  it("folds CASE only where the filesystem does (codex P2)", () => {
+    // Folding everywhere is wrong on Linux, where `/home/u/ComfyUI` and `/home/u/comfyui`
+    // are two different installs — the sentence would then be attributed to the wrong one
+    // and name a flag the user never put there.
+    //
+    // The assertion is platform-conditional because the CORRECT ANSWER is: Windows
+    // matches, a case-sensitive filesystem declines. Asserting one of those everywhere
+    // would just encode the bug on the other platform.
+    const root = join(home, "ComfyUI-Installs", "ComfyUI");
+    writeInstallations([localEntry(root)]);
+    const differentCase = root.toUpperCase();
+
+    if (process.platform === "win32") {
+      expect(desktopSavedLaunchArgs(differentCase)?.args).toEqual([
+        "--enable-manager",
+        "--enable-cors-header",
+      ]);
+    } else {
+      expect(desktopSavedLaunchArgs(differentCase)).toBeUndefined();
+    }
+    // Exact case matches everywhere, which is the case that actually ships.
+    expect(desktopSavedLaunchArgs(root)?.args).toHaveLength(2);
+  });
+
+  it("ignores a file far too large to be Desktop's own (codex P3)", () => {
+    // This read happens while composing a restart report. A bound keeps a pathological
+    // file at that name from being slurped; the honest residual — that the read is still
+    // synchronous — is stated in the code.
+    const root = join(home, "ComfyUI-Installs", "ComfyUI");
+    const dir = join(home, "AppData", "Roaming", "Comfy Desktop");
+    mkdirSync(dir, { recursive: true });
+    const entries = JSON.stringify([localEntry(root)]);
+    const padding = " ".repeat(5 * 1024 * 1024);
+    writeFileSync(join(dir, "installations.json"), entries + padding, "utf8");
+    expect(desktopSavedLaunchArgs(root)).toBeUndefined();
+  });
+
   it("DECLINES when two entries claim the same install", () => {
     // They cannot both be the install whose settings the user edited, and picking one puts
     // a specific, checkable sentence in front of them that may be about the other.
