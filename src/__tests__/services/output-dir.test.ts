@@ -37,6 +37,8 @@ let baseDirEntries = new Set<string>();
 /** Entries the readdir mock reports as SYMLINKS — `Dirent.isFile()` is false for those,
  *  which is how counting only isFile() stopped seeing a symlinked model tree (#1371). */
 let baseSymlinkEntries = new Set<string>();
+/** How many readdirs one resolve did — the P2 bound is a number, so assert on the number. */
+let readdirCalls = 0;
 const direntOf = (name: string) => ({
   name,
   isFile: () => !baseDirEntries.has(name) && !baseSymlinkEntries.has(name),
@@ -45,12 +47,17 @@ const direntOf = (name: string) => ({
 });
 vi.mock("node:fs", () => ({
   readdirSync: (p: string) => {
+    readdirCalls += 1;
     // Explicit two-level dispatch: the LAST path segment decides. A path ending in a name
     // we declared to be a directory is the nested read; anything else is the category dir.
     const last = basename(String(p));
     // Three levels: category dir → a nested dir → one deeper (the diffusers shape).
     if (last === "transformer") return baseDeepEntries.map(direntOf);
-    return (baseDirEntries.has(last) ? baseNestedEntries : baseCategoryEntries).map(direntOf);
+    // A SYMLINKED directory reads through to the nested listing too — readdir follows the
+    // link. Dispatching on baseDirEntries alone made the link re-serve the category's own
+    // listing, which is not a filesystem that exists.
+    const nested = baseDirEntries.has(last) || baseSymlinkEntries.has(last);
+    return (nested ? baseNestedEntries : baseCategoryEntries).map(direntOf);
   },
   realpathSync: (p: string) => (realpathFor ? realpathFor(String(p)) : String(p)),
   existsSync: (p: string) => (existsFor ? existsFor(String(p)) : liveRootExists),
@@ -74,6 +81,27 @@ vi.mock("node:fs", () => ({
     return { isDirectory: () => false, isFile: () => true };
   },
 }));
+
+/** statSync is consulted on MANY paths during resolution, not just the one a test cares
+ *  about. A blanket stub answers the others wrongly — an `isFile: true` fallback made the
+ *  server's listed file look PRESENT, so nothing was missing and the check returned ok
+ *  before reaching the branch under test. Override one path; defer the rest to the mock's
+ *  own default (present per existsFor, ENOENT otherwise). */
+const statExceptFor = (
+  match: (p: string) => boolean,
+  answer: { isDirectory: () => boolean; isFile: () => boolean } | "enoent",
+) => (path: string) => {
+  if (match(path)) {
+    if (answer !== "enoent") return answer;
+    const err = new Error(`stat ${path}`) as NodeJS.ErrnoException;
+    err.code = "ENOENT";
+    throw err;
+  }
+  if (existsFor ? existsFor(path) : liveRootExists) return { isDirectory: () => false, isFile: () => true };
+  const err = new Error(`stat ${path}`) as NodeJS.ErrnoException;
+  err.code = "ENOENT";
+  throw err;
+};
 
 const getSystemStats = vi.fn();
 /** The server's own model inventory: category → filenames it reports seeing. */
@@ -1313,6 +1341,77 @@ describe("#1371 — a configured base the server demonstrably does not read is r
     await expect(
       resolveModelsDirWithBases({ targetCategory: "clip_vision" }),
     ).rejects.toThrow(/Refusing to download into/);
+  });
+
+  it("a SYMLINKED model DIRECTORY counts — isDirectory() is false for those too (codex P1)", async () => {
+    // The same trap as isFile(), and it caught the same users. `models/checkpoints/SDXL ->
+    // /mnt/shared/SDXL` is what sharing one model tree between installs looks like, so the
+    // population this gate protects read as empty and the misplaced write went ahead —
+    // the symlinked-FILE fix above did nothing for them.
+    config.comfyuiPath = "/stale-linked-dir";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { clip_vision: ["elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = ["linked-dir"];
+    // A link to a directory: isDirectory() FALSE, isSymbolicLink() TRUE — Node's real
+    // Dirent semantics, pinned against the live filesystem in output-dir-symlink-fs.test.ts.
+    baseSymlinkEntries = new Set(["linked-dir"]);
+    baseNestedEntries = ["model.safetensors"];
+    // Scoped to the link. statSync is consulted on other paths during resolution, and a
+    // blanket stub answers those wrongly — the test then fails for an unrelated reason.
+    statFor = statExceptFor((p) => p.endsWith("linked-dir"), {
+      isDirectory: () => true,
+      isFile: () => false,
+    });
+
+    await expect(
+      resolveModelsDirWithBases({ targetCategory: "clip_vision" }),
+    ).rejects.toThrow(/Refusing to download into/);
+  });
+
+  it("a BROKEN link does not abort the scan around it", async () => {
+    // statSync on a dangling link throws. Letting it escape does not crash — an outer
+    // catch swallows it — which is exactly why this needed a test that can fail: the
+    // throw ABORTS the scan, so a base holding a stray broken link AND real models is
+    // never contradicted, and the misplaced write proceeds.
+    //
+    // The link is listed FIRST on purpose. Behind it, a model that must still be found.
+    config.comfyuiPath = "/broken-link";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { clip_vision: ["lives-elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = ["dangling", "real-model.safetensors"];
+    baseSymlinkEntries = new Set(["dangling"]);
+    statFor = statExceptFor((p) => p.endsWith("dangling"), "enoent");
+
+    await expect(
+      resolveModelsDirWithBases({ targetCategory: "clip_vision" }),
+    ).rejects.toThrow(/Refusing to download into/);
+  });
+
+  it("the scan is bounded — a huge category does not become thousands of readdirs (codex P2)", async () => {
+    // Depth alone bounds nothing: 10k empty subdirectories is 10k synchronous readdirs on
+    // the download path. Exhausting the budget answers "no model found", which is the safe
+    // direction — no contradiction, so no refusal, just the pre-existing warning.
+    config.comfyuiPath = "/huge";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { clip_vision: ["lives-elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    const many = Array.from({ length: 5000 }, (_, i) => `dir-${i}`);
+    baseCategoryEntries = many;
+    baseDirEntries = new Set(many);
+    baseNestedEntries = [];
+    readdirCalls = 0;
+
+    const { modelsDir } = await resolveModelsDirWithBases({ targetCategory: "clip_vision" });
+    expect(modelsDir).toBe(resolve("/huge", "models"));
+    // The bound, asserted as a number rather than a vibe. Without it this is 5001.
+    expect(readdirCalls).toBeLessThanOrEqual(80);
+    // ...and it really did have thousands of chances to exceed it.
+    expect(readdirCalls).toBeGreaterThan(1);
   });
 
   it("…but an EMPTY subfolder is still not evidence", async () => {

@@ -490,6 +490,44 @@ function isModelFileEntry(entry: { name: string; isFile(): boolean; isSymbolicLi
 }
 
 /**
+ * Is this entry a directory, INCLUDING a symlink pointing at one? (#1371)
+ *
+ * `Dirent.isDirectory()` is false for a symlink to a directory — the same trap as
+ * `isFile()` above, and it bit the same users twice. `models/checkpoints/SDXL ->
+ * /mnt/shared/SDXL` is the layout of someone sharing one model tree between installs,
+ * which is precisely the population this gate exists to protect: their base read as empty,
+ * so no contradiction was found, so the misplaced write went ahead.
+ *
+ * Following the link is safe here because the recursion below is depth-bounded and
+ * budget-bounded — a link pointing back up its own tree costs at most a couple of extra
+ * readdirs, not a cycle. A broken link throws and is simply not a directory.
+ */
+function entryIsDirectoryLike(dir: string, entry: { name: string; isDirectory(): boolean; isSymbolicLink(): boolean }): boolean {
+  if (entry.isDirectory()) return true;
+  if (!entry.isSymbolicLink()) return false;
+  try {
+    return statSync(join(dir, entry.name)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * How many directories one corroboration check may read before it gives up. (#1371, codex P2)
+ *
+ * Depth alone does not bound the work: a category holding 10k subdirectories is 10k
+ * synchronous readdirs at depth 2, on the download path. Exhausting the budget answers
+ * "no model found", which is the SAFE direction — no contradiction means no refusal, only
+ * the pre-existing unconfirmed-visibility warning. A populated base almost always answers
+ * true from a file in the first directory read.
+ */
+const MODEL_SCAN_DIR_BUDGET = 64;
+
+function newModelScanBudget(): { dirs: number } {
+  return { dirs: MODEL_SCAN_DIR_BUDGET };
+}
+
+/**
  * Does this directory tree hold a model file, within a bounded depth? (#1371)
  *
  * TWO LEVELS, not one. A Diffusers/HF repo checkout is `<category>/<repo>/transformer/
@@ -502,8 +540,9 @@ function isModelFileEntry(entry: { name: string; isFile(): boolean; isSymbolicLi
  * negative — it proceeds with the existing unconfirmed-visibility warning, which is where
  * these users were before the gate existed.
  */
-function directoryHoldsAModel(dir: string, depth = 2): boolean {
-  if (depth <= 0) return false;
+function directoryHoldsAModel(dir: string, depth = 2, budget = newModelScanBudget()): boolean {
+  if (depth <= 0 || budget.dirs <= 0) return false;
+  budget.dirs -= 1;
   let entries: { name: string; isFile(): boolean; isSymbolicLink(): boolean; isDirectory(): boolean }[];
   try {
     entries = readdirSync(dir, { withFileTypes: true });
@@ -515,9 +554,9 @@ function directoryHoldsAModel(dir: string, depth = 2): boolean {
     if (isModelFileEntry(entry)) return true;
   }
   for (const entry of entries) {
-    // Symlinked DIRECTORIES are deliberately not followed: a link can point back up the
-    // tree, and this is a corroboration check, not a crawler.
-    if (entry.isDirectory() && directoryHoldsAModel(join(dir, entry.name), depth - 1)) return true;
+    if (budget.dirs <= 0) return false;
+    if (entryIsDirectoryLike(dir, entry) && directoryHoldsAModel(join(dir, entry.name), depth - 1, budget))
+      return true;
   }
   return false;
 }
@@ -767,13 +806,19 @@ async function corroborateBaseByModelInventory(
           // withFileTypes, because a DIRECTORY named `foo.safetensors` is not a model
           // (codex): counting it would refuse a base on the strength of a folder name.
           // A nested model directory (diffusers-style) still counts — see below.
+          // ONE budget for the whole scan, not one per subdirectory: the point of the
+          // bound is to cap this entire check, and a fresh budget per entry would let a
+          // category with 10k subdirectories spend 10k of them.
+          const budget = newModelScanBudget();
           baseHasOwnModelsHere = readdirSync(categoryDir, { withFileTypes: true }).some(
             (entry) =>
               isModelFileEntry(entry) ||
-              // A SUBDIRECTORY counts too, but only when it actually holds a model file
-              // within a bounded depth. An empty folder is not evidence the base is
-              // populated — that is the metadata hole wearing a directory.
-              (entry.isDirectory() && directoryHoldsAModel(join(categoryDir, entry.name))),
+              // A SUBDIRECTORY counts too — symlinked ones included — but only when it
+              // actually holds a model file within a bounded depth. An empty folder is not
+              // evidence the base is populated: that is the metadata hole wearing a
+              // directory.
+              (entryIsDirectoryLike(categoryDir, entry) &&
+                directoryHoldsAModel(join(categoryDir, entry.name), 2, budget)),
           );
         } catch {
           // Absent or unreadable — nothing established either way.
