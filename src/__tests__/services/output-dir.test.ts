@@ -1181,3 +1181,64 @@ describe("#1052: I/O dirs follow the CONNECTED server, not a second install", ()
     expect(await resolveOutputDir()).toBe(resolve(DESKTOP, "output"));
   });
 });
+
+describe("#1371 — a configured base the server demonstrably does not read is refused", () => {
+  // The reporter ran TWO local ComfyUIs. Connected to the second, COMFYUI_PATH still
+  // pointed at the first, and a model landed in the install the running server never reads
+  // — while the tool said "destination came from local configuration rather than the
+  // running server; visibility to the connected ComfyUI is unconfirmed". It knew, and wrote
+  // anyway.
+  //
+  // The `else if (base)` fallback took COMFYUI_PATH/models with no corroboration, and it is
+  // reached whenever the live root cannot be derived for any reason other than the
+  // relative-main.py shape the branch above it handles.
+
+  it("REFUSES when the server lists models for the category and NONE are under the base", async () => {
+    config.comfyuiPath = "/stale-install";
+    // A live server we cannot pin to a root: argv names no resolvable entrypoint.
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    // …and it will say what it sees. None of it is in the stale base.
+    serverInventory = { vae: ["h3-only.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+
+    await expect(resolveModelsDirWithBases({ targetCategory: "vae" })).rejects.toThrow(
+      /Refusing to download into/,
+    );
+  });
+
+  it("still writes when the server lists NOTHING — absence of evidence is not evidence", async () => {
+    // THE OVER-BROAD DIRECTION, and the reason this gate is contradiction-only. A fresh
+    // install has an empty models dir, corroborates nothing, and must still take its FIRST
+    // download. Refusing here would break every new setup.
+    config.comfyuiPath = "/fresh-install";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { vae: [] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+
+    const { modelsDir, source } = await resolveModelsDirWithBases({ targetCategory: "vae" });
+    expect(modelsDir).toBe(resolve("/fresh-install", "models"));
+    expect(source).toBe("configured-base");
+  });
+
+  it("still writes when the server is UNREACHABLE — nothing was established either way", async () => {
+    config.comfyuiPath = "/offline-install";
+    getSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+    serverInventory = undefined;
+
+    const { modelsDir } = await resolveModelsDirWithBases({ targetCategory: "vae" });
+    expect(modelsDir).toBe(resolve("/offline-install", "models"));
+  });
+
+  it("still writes when NO category was named — the check cannot contradict what it never asked", async () => {
+    config.comfyuiPath = "/unknown-category";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { vae: ["something.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+
+    const { modelsDir } = await resolveModelsDirWithBases();
+    expect(modelsDir).toBe(resolve("/unknown-category", "models"));
+  });
+});

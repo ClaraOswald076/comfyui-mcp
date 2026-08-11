@@ -453,7 +453,19 @@ async function corroborateBaseByModelInventory(
       /** How many the server listed, so a PARTIAL match can be reported as one. */
       listed: number;
     }
-  | { ok: false; reason: string }
+  | {
+      ok: false;
+      reason: string;
+      /**
+       * The server listed files for this category and NONE of them are under the base
+       * (#1371). That is not "no evidence" — it is evidence AGAINST, and the two must not
+       * be answered the same way. A fresh install with an empty models dir corroborates
+       * nothing either, and refusing that would block the first download on every new
+       * setup; a base the server demonstrably does not read is where a model silently
+       * lands in the wrong install.
+       */
+      contradicted?: boolean;
+    }
 > {
   // The corroboration must be about the category this download is FOR. A complete match
   // on some OTHER category proves only that THAT folder is under this base — and a server
@@ -492,6 +504,8 @@ async function corroborateBaseByModelInventory(
   // this used to sweep for any category that happened to match.
   let unreadableCategories = 0;
   let lastReason: string | undefined;
+  /** Set when the server's own listing shows the base is NOT a root it reads (#1371). */
+  let contradictedBase = false;
   for (const category of [targetCategory]) {
     let files: string[];
     try {
@@ -639,6 +653,7 @@ async function corroborateBaseByModelInventory(
           : "");
     } else if (missing.length > 0) {
       const present = files.length - missing.length;
+      if (present === 0) contradictedBase = true;
       lastReason =
         present === 0
           ? `the server lists ${files.length} file(s) under "${category}" and NONE of them are under ` +
@@ -662,7 +677,7 @@ async function corroborateBaseByModelInventory(
         `"${categoryDir}" (e.g. "${escaping[0]}"), so they cannot corroborate this base`;
     }
   }
-  if (lastReason) return { ok: false, reason: lastReason };
+  if (lastReason) return { ok: false, reason: lastReason, contradicted: contradictedBase };
   // Nothing was COMPARED. Say which of the two reasons that was: the listing could not be
   // read, or it was empty. Reporting the first as the second would be the same fold this
   // whole change is about — and an EMPTY target category genuinely cannot corroborate
@@ -853,6 +868,42 @@ export async function resolveModelsDirWithBases(opts?: {
           "Fix by launching ComfyUI with an ABSOLUTE --base-directory, or set COMFYUI_PATH to the directory whose models/ the server actually reads.",
       );
     } else if (base) {
+      // #1371 — DO NOT WRITE INTO A BASE THE SERVER DEMONSTRABLY DOES NOT READ.
+      //
+      // This fallback took COMFYUI_PATH/models with no corroboration at all, and it is
+      // reached whenever the live root could not be derived for any reason OTHER than the
+      // relative-main.py shape the branch above handles. A reporter running two local
+      // ComfyUIs — connected to :8190, COMFYUI_PATH pointing at the other install — had a
+      // model written into the install the server never reads, while the tool told them
+      // "destination came from local configuration rather than the running server;
+      // visibility to the connected ComfyUI is unconfirmed". It knew, and wrote anyway. A
+      // warning beside a write is not a substitute for not writing.
+      //
+      // THE GATE IS EVIDENCE AGAINST, NOT ABSENCE OF EVIDENCE. Refusing whenever the base
+      // cannot be corroborated would break every correct setup whose server reports no
+      // resolvable root — per #1374 that includes the ordinary Windows-portable shape — and
+      // it would block the FIRST download on any fresh install, whose models dir is empty
+      // and therefore corroborates nothing. So this refuses only when the server's own
+      // listing shows the base is not a root it reads: files listed for this category, none
+      // of them here. Silence still writes, with the existing unconfirmed-visibility note.
+      if (snapshot.reachable && !isRemoteMode()) {
+        const verdict = await corroborateBaseByModelInventory(
+          base,
+          (opts?.targetCategory ?? "").trim(),
+        );
+        if (!verdict.ok && verdict.contradicted) {
+          throw new ValidationError(
+            `Refusing to download into "${resolve(base, "models")}": ${verdict.reason}.
+
+` +
+              `The graph you are downloading for is served by a DIFFERENT ComfyUI than this ` +
+              `configured base describes, so the file would land where that server never looks ` +
+              `and be reported as a success (#1371). Fix by pointing COMFYUI_PATH at the install ` +
+              `the connected server actually runs, or by launching that server with an absolute ` +
+              `--base-directory so its models directory can be read from it directly.`,
+          );
+        }
+      }
       modelsDir = resolve(base, "models");
       source = "configured-base";
     } else {
