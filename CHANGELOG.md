@@ -4,6 +4,32 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.50.114
+
+### Fixed
+
+- **A failed local download now says what made ComfyUI-Manager necessary (#1374).** A LOCAL
+  Windows-portable install could not download anything: every attempt died on "ComfyUI-
+  Manager's queue API is not reachable", for a capability that needs no Manager at all. The
+  reporter downloaded ~45 GB with `curl` instead.
+
+  That error is raised in generic Manager code which cannot know it is serving a download,
+  so it named the thing that BROKE and not the decision that made Manager necessary — this
+  MCP could not resolve where the connected server keeps its models. Only the second has a
+  remedy you can apply, and nothing distinguished it from "your ComfyUI is remote, this is
+  normal".
+
+  The failure now explains the route, per case, with the `argv[0]` and `cwd` that identify
+  which one you hit. It is appended ONLY when the Manager API call itself failed — a bad
+  source URL or an auth refusal keeps its own error untouched.
+
+  **The routing is deliberately unchanged.** The reporter's decision could not be
+  reproduced here: a live ComfyUI on this machine reports a relative `main.py` and no `cwd`
+  — the shape that looked like the culprit — and still resolves, because the process-table
+  probe anchors it. Guessing at which of six conditions fires for them, and "fixing" that,
+  is how a routing change breaks installs that work today. What ships is the answer being
+  visible in the next report.
+
 ## 0.50.113
 
 ### Fixed
@@ -170,6 +196,14 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.50.114] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- a local download should not need ComfyUI-Manager (#1393)
+
 
 ## [0.50.113] - 2026-08-11
 
