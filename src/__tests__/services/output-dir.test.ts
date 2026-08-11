@@ -30,18 +30,26 @@ let realpathFor: ((p: string) => string) | undefined;
 let baseCategoryEntries: string[] = [];
 /** Names inside a SUBDIRECTORY of the category, for the diffusers-style layout (#1371). */
 let baseNestedEntries: string[] = [];
+/** Names one level below a nested directory, for the depth-2 diffusers case (#1371). */
+let baseDeepEntries: string[] = [];
 /** Entries the readdir mock reports as directories rather than files. */
 let baseDirEntries = new Set<string>();
+/** Entries the readdir mock reports as SYMLINKS — `Dirent.isFile()` is false for those,
+ *  which is how counting only isFile() stopped seeing a symlinked model tree (#1371). */
+let baseSymlinkEntries = new Set<string>();
 const direntOf = (name: string) => ({
   name,
-  isFile: () => !baseDirEntries.has(name),
+  isFile: () => !baseDirEntries.has(name) && !baseSymlinkEntries.has(name),
   isDirectory: () => baseDirEntries.has(name),
+  isSymbolicLink: () => baseSymlinkEntries.has(name),
 });
 vi.mock("node:fs", () => ({
   readdirSync: (p: string) => {
     // Explicit two-level dispatch: the LAST path segment decides. A path ending in a name
     // we declared to be a directory is the nested read; anything else is the category dir.
     const last = basename(String(p));
+    // Three levels: category dir → a nested dir → one deeper (the diffusers shape).
+    if (last === "transformer") return baseDeepEntries.map(direntOf);
     return (baseDirEntries.has(last) ? baseNestedEntries : baseCategoryEntries).map(direntOf);
   },
   realpathSync: (p: string) => (realpathFor ? realpathFor(String(p)) : String(p)),
@@ -177,7 +185,9 @@ beforeEach(() => {
   modelsDirStat = "dir";
   baseCategoryEntries = [];
   baseNestedEntries = [];
+  baseDeepEntries = [];
   baseDirEntries = new Set();
+  baseSymlinkEntries = new Set();
   statFor = undefined;
   realpathFor = undefined;
   serverInventory = undefined;
@@ -1262,6 +1272,43 @@ describe("#1371 — a configured base the server demonstrably does not read is r
     baseCategoryEntries = ["some-model-dir"];
     baseDirEntries = new Set(["some-model-dir"]);
     baseNestedEntries = ["model.safetensors"];
+
+    await expect(
+      resolveModelsDirWithBases({ targetCategory: "clip_vision" }),
+    ).rejects.toThrow(/Refusing to download into/);
+  });
+
+  it("a SYMLINKED model file counts — Dirent.isFile() is false for links (codex P1)", async () => {
+    // Sharing one model tree between installs by symlinking is ordinary practice, and this
+    // file says so elsewhere. Requiring isFile() alone made a stale base whose models are
+    // links read as EMPTY — reintroducing the misplaced write for exactly the users most
+    // likely to be running two installs.
+    config.comfyuiPath = "/stale-symlinked";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { vae: ["elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = ["linked-model.safetensors"];
+    baseSymlinkEntries = new Set(["linked-model.safetensors"]);
+
+    await expect(resolveModelsDirWithBases({ targetCategory: "vae" })).rejects.toThrow(
+      /Refusing to download into/,
+    );
+  });
+
+  it("a DEEPER diffusers tree counts too — <repo>/transformer/model.safetensors (codex P1)", async () => {
+    // One level down finds nothing in a real HF repo checkout, and "found nothing" was
+    // read as "this base is empty", permitting the misplaced write.
+    config.comfyuiPath = "/stale-deep";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { clip_vision: ["elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = ["repo"];
+    baseDirEntries = new Set(["repo", "transformer"]);
+    baseNestedEntries = ["transformer"];
+    // `transformer` resolves through the same nested list; give it a model at depth 2.
+    baseDeepEntries = ["model.safetensors"];
 
     await expect(
       resolveModelsDirWithBases({ targetCategory: "clip_vision" }),

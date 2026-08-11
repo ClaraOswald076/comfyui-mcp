@@ -479,14 +479,47 @@ const BASE_OWN_MODEL_EXTENSIONS = new Set([
  * covers the real layout without turning a corroboration check into a recursive walk of a
  * models tree that can hold tens of thousands of files.
  */
-function directoryHoldsAModel(dir: string): boolean {
+function isModelFileEntry(entry: { name: string; isFile(): boolean; isSymbolicLink(): boolean }): boolean {
+  // SYMLINKS COUNT (codex). `Dirent.isFile()` is FALSE for a symbolic link, and sharing one
+  // model tree between installs by symlinking is ordinary practice — this file says so
+  // elsewhere. Requiring isFile() alone made a stale base whose models are links read as
+  // empty, reintroducing the misplaced write for exactly the users most likely to have two
+  // installs.
+  if (!entry.isFile() && !entry.isSymbolicLink()) return false;
+  return BASE_OWN_MODEL_EXTENSIONS.has(extname(entry.name).toLowerCase());
+}
+
+/**
+ * Does this directory tree hold a model file, within a bounded depth? (#1371)
+ *
+ * TWO LEVELS, not one. A Diffusers/HF repo checkout is `<category>/<repo>/transformer/
+ * model.safetensors` — one level down finds nothing there, and "found nothing" is read as
+ * "this base is empty", which permits the misplaced write this gate exists to stop.
+ *
+ * Bounded on purpose: a models tree can hold tens of thousands of files, and this runs
+ * synchronously inside a corroboration check on the download path. Depth 2 covers the real
+ * layouts without turning that into a full walk. Deeper nesting than that is a false
+ * negative — it proceeds with the existing unconfirmed-visibility warning, which is where
+ * these users were before the gate existed.
+ */
+function directoryHoldsAModel(dir: string, depth = 2): boolean {
+  if (depth <= 0) return false;
+  let entries: { name: string; isFile(): boolean; isSymbolicLink(): boolean; isDirectory(): boolean }[];
   try {
-    return readdirSync(dir, { withFileTypes: true }).some(
-      (e) => e.isFile() && BASE_OWN_MODEL_EXTENSIONS.has(extname(e.name).toLowerCase()),
-    );
+    entries = readdirSync(dir, { withFileTypes: true });
   } catch {
+    // Permission-denied or absent: nothing established either way.
     return false;
   }
+  for (const entry of entries) {
+    if (isModelFileEntry(entry)) return true;
+  }
+  for (const entry of entries) {
+    // Symlinked DIRECTORIES are deliberately not followed: a link can point back up the
+    // tree, and this is a corroboration check, not a crawler.
+    if (entry.isDirectory() && directoryHoldsAModel(join(dir, entry.name), depth - 1)) return true;
+  }
+  return false;
 }
 
 async function corroborateBaseByModelInventory(
@@ -736,13 +769,11 @@ async function corroborateBaseByModelInventory(
           // A nested model directory (diffusers-style) still counts — see below.
           baseHasOwnModelsHere = readdirSync(categoryDir, { withFileTypes: true }).some(
             (entry) =>
-              entry.isFile()
-                ? BASE_OWN_MODEL_EXTENSIONS.has(extname(entry.name).toLowerCase())
-                : // A SUBDIRECTORY counts too, but only when it actually holds a model
-                  // file. An empty folder is not evidence the base is populated, which is
-                  // the metadata hole in another costume; a diffusers-style directory of
-                  // shards is exactly the stale base the first version let through.
-                  entry.isDirectory() && directoryHoldsAModel(join(categoryDir, entry.name)),
+              isModelFileEntry(entry) ||
+              // A SUBDIRECTORY counts too, but only when it actually holds a model file
+              // within a bounded depth. An empty folder is not evidence the base is
+              // populated — that is the metadata hole wearing a directory.
+              (entry.isDirectory() && directoryHoldsAModel(join(categoryDir, entry.name))),
           );
         } catch {
           // Absent or unreadable — nothing established either way.
