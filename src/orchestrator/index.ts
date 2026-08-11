@@ -5842,6 +5842,9 @@ export async function runPanelOrchestrator(): Promise<void> {
     // siblings' pending promises intact (codex finding).
     if (!machineRetargetInFlight) { pendingPodConnects.clear(); persistPendingConnects(); }
     if (url !== lastRetargetUrl) {
+      // Captured BEFORE the reassignment: the address every mid-turn tab's
+      // comfyui child is still serving, which is what the #1429 nudge names.
+      const previousUrl = lastRetargetUrl;
       lastRetargetUrl = url;
       // Sync the shared target closures FIRST: retargets that did NOT come
       // through applyComfyuiUrl (runpod tools, watcher callbacks) leave them
@@ -5857,7 +5860,16 @@ export async function runPanelOrchestrator(): Promise<void> {
       QueueMonitor.start(url);
       manager.setMcpServers(buildMcpServers());
       manager.setComfyuiUrl(url);
-      manager.restartAllForMcpEnv();
+      // A tab that is mid-turn cannot have its comfyui MCP child replaced now, so
+      // it keeps serving `previousUrl` until the turn ends (#1429). Tell those
+      // tabs — and ONLY those; an idle tab respawns before it can run anything.
+      const tally = manager.retargetAllForMcpEnv(previousUrl, url);
+      if (tally.scheduled > 0) {
+        logger.warn(
+          `[panel-orchestrator] ${tally.scheduled} tab(s) mid-turn during the retarget — ` +
+            `their comfyui tools stay on ${previousUrl} until the turn ends (#1429)`,
+        );
+      }
       void refreshEnvCapabilities();
     }
     // The readvertise timer follows the target too (created only at startup
