@@ -2177,25 +2177,53 @@ export class PanelAgentManager {
    *  next idle so the turn that SAVED the secret finishes first (we never
    *  interrupt a live reply). `nudge`, if given, is enqueued to each resumed
    *  agent so it auto-continues (e.g. retries the download the secret unblocked). */
-  restartAllForMcpEnv(nudge?: string): McpEnvRestartTally {
+  restartAllForMcpEnv(
+    nudge?: string,
+    opts?: {
+      /** #1429 — deliver `nudge` ONLY to tabs whose restart had to be DEFERRED.
+       *  A retarget nudge says "your tools spent that turn on the old address";
+       *  that is true exactly when the tab was mid-turn. An idle tab respawns
+       *  before it can run anything, so nudging it would be a false alarm — and
+       *  a nudge is a real agent turn (restartAgentResume delivers it as one),
+       *  not a log line, so a false one costs the user a spurious response.
+       *  The per-request retry nudge (#164) means something different — "the
+       *  thing you just tried can be retried now" — and is right to fire on an
+       *  idle tab, so it keeps the default. */
+      onlyWhenDeferred?: boolean;
+    },
+  ): McpEnvRestartTally {
     // Snapshot the key set: applyPendingRestarts REPLACES entries in this.agents
     // (spawn + retire) while we iterate, and mutating a Map during its own
     // iteration is how a tab silently gets skipped.
     const keys = [...this.agents.keys()];
     const tally: McpEnvRestartTally = { live: 0, applied: 0, scheduled: 0 };
+    const deferredOnly = opts?.onlyWhenDeferred === true;
     for (const tabId of keys) {
       // A SILENT env respawn (no nudge) must NOT downgrade a tab that already has
       // a retry nudge queued (#164): a concurrent env change on another tab, or a
       // retarget, would otherwise erase a still-pending per-request nudge before
       // its busy agent could apply it. Keep the existing nudge; still coalesce.
-      if (nudge === undefined && this.pendingMcpRestart.get(tabId)) {
+      //
+      // A deferred-only nudge is silent AT THIS POINT — whether it applies is not
+      // known until the outcome below — so it takes the same branch, and for the
+      // same reason: the queued per-request nudge is the more specific one.
+      if ((nudge === undefined || deferredOnly) && this.pendingMcpRestart.get(tabId)) {
         tallyRestart(tally, this.applyPendingRestarts(tabId));
         continue;
       }
-      this.pendingMcpRestart.set(tabId, nudge ?? null);
+      this.pendingMcpRestart.set(tabId, deferredOnly ? null : (nudge ?? null));
       // Apply immediately when the tab is already idle; otherwise it fires on the
       // next turn-done via applyPendingRestarts().
-      tallyRestart(tally, this.applyPendingRestarts(tabId));
+      const outcome = this.applyPendingRestarts(tabId);
+      // "scheduled" means the tab is mid-turn and its comfyui child goes on
+      // serving the OLD target until this restart lands (#1429). That is the one
+      // case the retarget nudge is about, and the entry is still pending here
+      // (applyPendingRestarts only clears it when it APPLIES), so upgrading the
+      // queued value now is what makes it ride along with the deferred respawn.
+      if (deferredOnly && nudge !== undefined && outcome === "scheduled") {
+        this.pendingMcpRestart.set(tabId, nudge);
+      }
+      tallyRestart(tally, outcome);
     }
     return tally;
   }
