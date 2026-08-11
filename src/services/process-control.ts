@@ -1096,6 +1096,14 @@ export function describeArgvDrift(
   before: string[] | undefined,
   after: string[] | undefined,
   isDesktop: boolean,
+  /**
+   * The saved-settings finding (#848), when one could be established. It ANSWERS the
+   * question the conditional remedy below can only ask, so it REPLACES that remedy rather
+   * than following it: printed together, the user reads "if you were expecting different
+   * arguments…" immediately before "your --disable-dynamic-vram is not in force", which
+   * hedges a fact we just established and then repeats the same remedy twice.
+   */
+  savedNote = "",
 ): string {
   if (!before?.length || !after?.length) return "";
   const unchanged =
@@ -1108,7 +1116,7 @@ export function describeArgvDrift(
     return (
       ` Its launch arguments CHANGED between the reading taken before this restart request and the one taken now: before ${before
         .map(quoteToken)
-        .join(" ")} / now ${after.map(quoteToken).join(" ")}.`
+        .join(" ")} / now ${after.map(quoteToken).join(" ")}.` + savedNote
     );
   }
   // WHAT EQUAL ARGV ESTABLISHES (codex gate, twice). Two readings matched. That is
@@ -1123,9 +1131,12 @@ export function describeArgvDrift(
   // What IS supportable is the present state — the arguments in force NOW are the
   // old ones — so the remedy hangs off that, conditioned on the user's own
   // expectation, which only they can check.
+  const observed = ` Its launch arguments are UNCHANGED (${after.map(quoteToken).join(" ")}) — the same arguments were observed before this restart request and again now.`;
+  // A read of the user's actual settings beats a guess about their expectations.
+  if (savedNote) return observed + savedNote;
   return (
-    ` Its launch arguments are UNCHANGED (${after.map(quoteToken).join(" ")}) — the same arguments were observed before this restart request and again now. ` +
-    "If you were expecting different arguments" +
+    observed +
+    " If you were expecting different arguments" +
     (isDesktop
       ? " (after editing ComfyUI Desktop's saved launch settings, say), they are not in effect here: fully quit the ComfyUI Desktop app and relaunch it so it spawns the server from those settings."
       : " (after editing the launch command on the host, say), they are not in effect here: stop ComfyUI and start it again from its own launcher so the new arguments are used.")
@@ -3854,18 +3865,22 @@ async function restartViaManagerRebootDispatch(
   }
   const argvNote =
     targetStable && identityContinuous
-      ? describeArgvDrift(priorArgv, afterArgv, context.isDesktop === true) +
-        // #848: and where the SAVED settings can be read, replace the conditional
-        // remedy with the observation. "If you were expecting different arguments" is
-        // a hint the user has to evaluate; naming the flag they added and confirming
-        // it is not in force is the answer they came for. Silent whenever the settings
-        // could not be established — a missing file is not evidence of agreement.
-        (context.isDesktop === true
-          ? describeSavedLaunchArgDrift(
-              desktopSavedLaunchArgs(config.comfyuiPath ?? undefined),
-              afterArgv,
-            )
-          : "")
+      ? describeArgvDrift(
+          priorArgv,
+          afterArgv,
+          context.isDesktop === true,
+          // #848: where the SAVED settings can be read, the finding REPLACES the
+          // conditional remedy inside that function — "if you were expecting different
+          // arguments" is a question, and this is the answer. Silent whenever the
+          // settings could not be established: a missing file is not evidence of
+          // agreement.
+          context.isDesktop === true
+            ? describeSavedLaunchArgDrift(
+                desktopSavedLaunchArgs(config.comfyuiPath ?? undefined),
+                afterArgv,
+              )
+            : "",
+        )
       : "";
 
   return {

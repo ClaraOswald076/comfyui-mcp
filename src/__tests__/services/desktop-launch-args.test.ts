@@ -262,3 +262,30 @@ describe("#848 — the wiring", () => {
     }
   });
 });
+
+describe("#848 — the two halves compose into ONE remedy", () => {
+  it("the finding REPLACES the conditional, and survives without it", async () => {
+    // Printed together they read: "if you were expecting different arguments … your
+    // --disable-dynamic-vram is not in force", which hedges a fact just established and
+    // then gives the same remedy twice. Caught by rendering the real sentence rather than
+    // by any test — the tests were green on both halves separately.
+    const { describeArgvDrift } = await import("../../services/process-control.js");
+    const same = ["main.py", "--listen", "127.0.0.1"];
+    const finding = describeSavedLaunchArgDrift(
+      { name: "My Desktop Install", args: ["--disable-dynamic-vram"] },
+      same,
+    );
+
+    const answered = describeArgvDrift(same, same, true, finding);
+    expect(answered).toContain("--disable-dynamic-vram");
+    // The hedge is gone: we read the settings, so we are no longer guessing.
+    expect(answered).not.toContain("If you were expecting different arguments");
+    // …and the remedy appears once.
+    expect(answered.match(/fully quit the ComfyUI Desktop app/g)).toHaveLength(1);
+
+    // When the settings could NOT be read, the conditional is still the honest answer.
+    const unanswered = describeArgvDrift(same, same, true, "");
+    expect(unanswered).toContain("If you were expecting different arguments");
+    expect(unanswered).not.toContain("do NOT contain");
+  });
+});
