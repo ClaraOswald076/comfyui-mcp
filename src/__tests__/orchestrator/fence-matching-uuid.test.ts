@@ -89,11 +89,23 @@ describe("#1401 an uncorroborated uuid that MATCHES the fence", () => {
     expect(text).not.toContain("graph tools will keep failing");
   });
 
-  it("says the fence was not re-derived, but names it as the SAME instance", async () => {
+  it("says the fence was not re-derived, and names what that rules OUT", async () => {
     const { text } = await setCurrent();
     expect(text).toContain("NOT re-derived");
     expect(text).toContain(LIVE);
-    expect(text.toLowerCase()).toContain("same one this session is already fenced");
+    expect(text).toContain("matches the fence this session already holds");
+    expect(text).toContain("DIFFERENT workflow instance");
+  });
+
+  it("does NOT promise the graph tools work — that is what could not be confirmed", async () => {
+    // codex review: a matching uuid rules OUT "fenced to another instance"; it does
+    // not rule IN liveness, because a stale or background record can carry the right
+    // uuid and still not be the canvas in front of the user. Claiming health here
+    // would be the mirror image of the bug being fixed — turning "could not confirm"
+    // into "is fine" instead of into "is broken".
+    const { text } = await setCurrent();
+    expect(text).toContain("NOT a claim that graph tools work");
+    expect(text).not.toMatch(/likely to work|should work|will work/i);
   });
 
   it("prescribes a cheap probe FIRST, not a hard refresh", async () => {
@@ -155,6 +167,6 @@ describe("#1401 a reply that names NO identity keeps the hard wording", () => {
 
   it("does not claim the fence still matches", async () => {
     const { text } = await setCurrent();
-    expect(text.toLowerCase()).not.toContain("same one this session is already fenced");
+    expect(text).not.toContain("matches the fence this session already holds");
   });
 });

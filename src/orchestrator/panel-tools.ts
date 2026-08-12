@@ -4252,21 +4252,29 @@ function describeFenceRebind(
       // succeeded, after being told it would keep failing and to hard-refresh.
       //
       // So this splits on evidence rather than reporting the worst case for both:
-      // a MATCHING uuid means "not re-derived, probably still fine, try one"; a
-      // DIFFERENT or absent one keeps the original certain-failure wording.
+      // a MATCHING uuid rules OUT the fenced-to-another-instance case without ruling
+      // IN liveness (codex: a stale/background record can carry the right uuid), so it
+      // reports what is ruled out and sends the caller to the read that settles it; a
+      // DIFFERENT or absent uuid keeps the original certain-failure wording.
       const fenceStillMatches =
         r.status === "no_identity" && r.seenUuid !== undefined && r.seenUuid === r.before.uuid;
       if (fenceStillMatches) {
         return {
           binding: "not_recovered",
           note:
-            `${lead}. This session's fence was NOT re-derived — but the identity the panel ` +
-            `did report for the active canvas is the SAME one this session is already fenced ` +
-            `to (${r.before.uuid}), so it was not repointed at a different workflow and graph ` +
-            `tools are likely to work. TRY ONE (panel_graph_outline) before doing anything ` +
-            `heavier: if it succeeds, the fence was fine all along and this was a ` +
-            `reconciliation race, not a broken binding. Only if it fails with a ` +
-            `workflow-instance mismatch is the fence actually stale — then ${RELOAD_TAB_REMEDY}`,
+            `${lead}. This session's fence was NOT re-derived, and whether that reply describes ` +
+            `the LIVE canvas is exactly what could not be confirmed — a stale or background ` +
+            `record can carry the right uuid and still not be the canvas in front of the user, ` +
+            `so this is NOT a claim that graph tools work. What IS known is narrower and still ` +
+            `useful: the identity it reported matches the fence this session already holds ` +
+            `(${r.before.uuid}), so this is not the case where the session is fenced to a ` +
+            `DIFFERENT workflow instance — which is the one that keeps graph tools failing.` +
+            `
+
+WHAT TO DO: settle it with a graph read — call panel_graph_outline. That ` +
+            `answers the question this could not: if it succeeds, the binding was fine and this ` +
+            `was a reconciliation race. If it fails with a workflow-instance mismatch, the ` +
+            `reply was stale after all — then ${RELOAD_TAB_REMEDY}`,
         };
       }
       return r.before.uuid
