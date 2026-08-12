@@ -197,6 +197,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.7] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- a preserved fence that still matches is not 'graph tools will keep failing' (#1437)
+
+
 ## [0.51.6] - 2026-08-11
 
 ### MCP
