@@ -115,3 +115,57 @@ describe("#1397 WIRING: the non-2xx site actually appends it", () => {
     expect(src.slice(at, at + 700)).toMatch(/\{ url, status: res\.status, body: text \}/);
   });
 });
+
+describe("#1397 a credential never reaches the message", () => {
+  // The excerpt is an ARBITRARY upstream payload on a user-visible path, and a
+  // Manager failure is exactly where a credential shows up: a pack install that
+  // cannot clone echoes the git remote. The rule here is that a secret never appears
+  // in an error, so these are the shapes, not a list of key names — the next
+  // credential will not be on a list.
+
+  it("strips credentials from a git remote in a clone failure", () => {
+    const body =
+      "CalledProcessError: git clone https://octocat:ghp_ABCDEFG1234567890abcdef@github.com/o/r.git failed";
+    const out = managerBodyExcerpt(body);
+    expect(out).not.toMatch(/ghp_ABCDEFG1234567890abcdef/);
+    expect(out).not.toMatch(/octocat:/);
+    expect(out).toMatch(/\*\*\*:\*\*\*@github\.com/);
+    // The DIAGNOSIS survives the redaction — that is the whole point of the excerpt.
+    expect(out).toMatch(/CalledProcessError/);
+    expect(out).toMatch(/github\.com\/o\/r\.git/);
+  });
+
+  it("strips bearer/token headers echoed into a traceback", () => {
+    const out = managerBodyExcerpt('headers={"Authorization": "Bearer sk-live-ABCDEF1234567890"}');
+    expect(out).not.toMatch(/sk-live-ABCDEF1234567890/);
+    expect(out).toMatch(/Bearer \*\*\*/i);
+  });
+
+  it("strips token-ish query params and reprs", () => {
+    for (const body of [
+      "GET /manager/queue/task?api_key=ABCDEF1234567890 failed",
+      "config: {'civitai_token': 'ABCDEF1234567890'}",
+      'url=https://x/y?access_token=ABCDEF1234567890',
+    ]) {
+      const out = managerBodyExcerpt(body);
+      expect(out, body).not.toMatch(/ABCDEF1234567890/);
+      expect(out, body).toMatch(/\*\*\*/);
+    }
+  });
+
+  it("redacts BEFORE the cap, so truncation cannot preserve half a secret", () => {
+    // Order is load-bearing. Redacting after the slice would leave the first half of
+    // a credential that straddles the boundary — a partial secret is a leaked one.
+    const secret = "ghp_" + "Z".repeat(80);
+    const body = `${"filler ".repeat(90)}https://u:${secret}@h/r.git`;
+    const out = managerBodyExcerpt(body, 700);
+    expect(out).not.toMatch(/ghp_ZZZ/);
+  });
+
+  it("does not over-redact an ordinary exception", () => {
+    // Over-redaction makes the excerpt useless, and this exists to make an opaque
+    // failure readable. A normal traceback must come through intact.
+    const body = "ModuleNotFoundError: No module named 'openai_whisper' in /home/u/ComfyUI/custom_nodes/x";
+    expect(managerBodyExcerpt(body)).toBe(body);
+  });
+});

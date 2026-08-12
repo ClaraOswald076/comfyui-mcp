@@ -24,6 +24,33 @@
  * exception ended where the budget did.
  */
 
+/**
+ * Redact credential shapes before ANY of this body is shown.
+ *
+ * The excerpt is an ARBITRARY upstream payload reaching a user-visible error, and a
+ * Manager failure is exactly where a credential can appear: a pack install that
+ * fails to clone echoes the git remote, and a remote can carry
+ * `https://user:token@host/...`. The rule in this project is that a secret never
+ * appears in an error, a disclosure, a fixture or a commit — so this runs before the
+ * cap, not after, and the redaction is on the SHAPE rather than on a list of known
+ * key names, because the next credential will not be on the list.
+ *
+ * Deliberately narrow. Over-redaction makes the excerpt useless and this exists to
+ * make an opaque failure readable; each pattern below is a shape that is a secret
+ * essentially whenever it appears, not merely a word that often sits near one.
+ */
+function redactCredentials(text: string): string {
+  return (
+    text
+      // scheme://user:secret@host — the git-remote case, and the one most likely here.
+      .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1***:***@")
+      // Authorization-style bearer/token headers echoed into a traceback.
+      .replace(/\b(bearer|token|apikey|api_key)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 ***")
+      // token=… / api_key=… / access_token=… in a query string or a repr.
+      .replace(/\b([a-z_]*(?:token|secret|password|passwd|api[_-]?key))(["']?\s*[=:]\s*["']?)[A-Za-z0-9._~+/=-]{6,}/gi, "$1$2***")
+  );
+}
+
 /** Characters of the Manager's body carried into the message. Enough for a Python
  *  exception's type and message line — which is the part that names the cause —
  *  without importing a traceback. */
@@ -59,7 +86,10 @@ export function managerBodyExcerpt(
   // Collapse newlines and runs of whitespace: a traceback pasted verbatim into a
   // single-line error is harder to read than a dense one, and the caller may be
   // rendering this into a log line.
-  const flat = raw.replace(/\s+/g, " ").trim();
+  //
+  // Redaction runs BEFORE the cap. After it, a credential split across the truncation
+  // boundary would keep its first half — a partial secret is still a leaked one.
+  const flat = redactCredentials(raw.replace(/\s+/g, " ").trim());
   // No empty-string guard: an empty `flat` already falls through the ternary and is
   // returned as "". A mutation deleting one proved it changed nothing, and a line
   // that reads as a correctness gate while being dead is worse than its absence.
