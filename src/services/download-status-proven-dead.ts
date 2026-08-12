@@ -30,7 +30,15 @@
  */
 
 /**
- * The status note for an in-flight record whose writer is PROVEN gone.
+ * The status note for an in-flight record whose writer is gone by the LOCAL pid probe.
+ *
+ * The probe is `kill(pid, 0)`: ESRCH means no process with that id exists HERE. That is
+ * conclusive for the ordinary case (the writer was this machine's own orchestrator) and
+ * inconclusive for a writer in another container or on another host, whose pid means
+ * nothing locally. Review raised exactly that, and the record carries no host to check
+ * it against — so the verdict is scoped to what was measured, and the recovery routes
+ * through `cancel`, which re-probes and refuses when it cannot confirm. A wrong verdict
+ * then costs a refused cancel, not a duplicated multi-gigabyte download.
  *
  * Deliberately states the evidence rather than just the verdict: a caller who was told
  * five seconds ago not to touch this download needs to know why the answer changed.
@@ -52,9 +60,10 @@ export function provenDeadStatusNote(opts: {
     ? ` This was a remote ComfyUI-Manager dispatch, so the SERVER-side fetch may still ` +
       `be running — only the local record's owner is proven gone. Check ` +
       `list_local_models to see whether the file landed.`
-    : ` Nothing is writing this file. There is no local transfer to interrupt, so it ` +
-      `is safe to re-issue the download — or call download_model action:"cancel" with ` +
-      `this id and tray_id first to close the stale record.`;
+    : ` No local process is writing this file. Close the record with download_model ` +
+      `action:"cancel" (this id and tray_id) before re-issuing — cancel re-probes and ` +
+      `refuses if it cannot confirm, so it is safe either way, and it is the step that ` +
+      `makes a re-issue safe rather than a possible duplicate.`;
   // The OPENING verdict has to be route-aware too. Saying "this transfer is NOT
   // running" and then admitting the server-side fetch may still be live is the same
   // self-contradiction this issue is about — review caught me writing it into the fix.
@@ -62,8 +71,11 @@ export function provenDeadStatusNote(opts: {
   const head = viaManager
     ? `\n    NOTE: the local owner of this record is gone — the process that started ` +
       `it no longer exists (probed by pid), so it died with its session (#1479).`
-    : `\n    NOTE: this transfer is NOT running. The process that owned it no longer ` +
-      `exists (probed by pid), so it died with its session (#1479).`;
+    : `\n    NOTE: this transfer is NOT running on this machine. No process with its ` +
+      `recorded pid exists here, so it died with its session (#1479). That evidence is ` +
+      `LOCAL: a writer owned by another host or container would look the same from ` +
+      `here, which is why the recovery below goes through cancel rather than straight ` +
+      `to a re-issue.`;
   return `${head}${stale}${tail}`;
 }
 

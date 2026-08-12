@@ -68,13 +68,13 @@ describe("#1479 the proven-dead note", () => {
 
   it("states plainly that the transfer is not running", () => {
     expect(note()).toMatch(/NOT running/);
-    expect(note()).toMatch(/no longer\s+exists/);
+    expect(note().includes("recorded pid exists here")).toBe(true);
   });
 
   it("gives the EVIDENCE, not just the verdict", () => {
     // A caller told moments ago not to touch this download needs to know why the
     // answer changed.
-    expect(note()).toMatch(/probed by pid/);
+    expect(note()).toMatch(/recorded pid exists here/);
     expect(note()).toMatch(/died with its session/);
   });
 
@@ -84,8 +84,16 @@ describe("#1479 the proven-dead note", () => {
   });
 
   it("says a re-issue is safe, because nothing is writing the file", () => {
-    expect(note()).toMatch(/Nothing is writing this file/);
-    expect(note()).toMatch(/safe to re-issue/);
+    expect(note()).toMatch(/No local process is writing this file/);
+    // Round 3 of review: a pid from another host or container ESRCHes here too, and the
+    // record carries no host to check against. So the verdict is scoped to the local
+    // evidence and recovery routes through cancel, which re-probes and refuses when it
+    // cannot confirm. A wrong verdict then costs a refused cancel, not a duplicated
+    // multi-gigabyte download.
+    expect(note()).toMatch(/NOT running on this machine/);
+    expect(note()).toMatch(/would look the same from\s+here/);
+    expect(note()).toMatch(/before re-issuing/);
+    expect(note()).not.toMatch(/is safe to re-issue the download/);
   });
 
   it("reports how long ago the heartbeat stopped when known", () => {
