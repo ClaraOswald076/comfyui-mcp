@@ -510,6 +510,15 @@ export async function installWorkflowDependencies(
       installed: [],
       alreadyInstalled: analysis.requiredPacks,
       unresolved: analysis.unresolved,
+      // panel#890 (codex round 2, P1) — this early return emits `unresolved` too, and
+      // it used to emit it BARE. Nothing is installed on this path, so it reads as the
+      // most settled answer of the three, and "not found in ComfyUI-Manager" with no
+      // qualification is exactly the reading the caveat exists to prevent. Carried over
+      // from the analysis rather than recomputed: the analysis is where the catalogue
+      // was actually consulted.
+      ...(analysis.catalogue_currency_unverified
+        ? { catalogue_currency_unverified: analysis.catalogue_currency_unverified }
+        : {}),
     };
   }
 

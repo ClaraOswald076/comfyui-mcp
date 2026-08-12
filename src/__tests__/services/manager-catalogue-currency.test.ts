@@ -107,10 +107,31 @@ describe("#890 WIRING: it reaches both results and both renderers", () => {
     expect((deps.match(/catalogue_currency_unverified\?: string;/g) ?? []).length).toBe(2);
   });
 
-  it("both results actually SET it", () => {
-    // A field nothing populates is the defect this repo keeps paying for: a
-    // mechanism that is complete, tested, and never reached.
-    expect((deps.match(/catalogue_currency_unverified: MANAGER_CATALOGUE_CURRENCY_CAVEAT/g) ?? []).length).toBe(2);
+  it("EVERY return that emits `unresolved` also carries the caveat", () => {
+    // Counting setters was not enough, and codex round 2 proved it: an EARLY RETURN in
+    // installWorkflowDependencies (taken when nothing is missing) emitted `unresolved`
+    // bare. The caveat existed, was set in two places, and still never reached that
+    // path — and nothing is installed on that branch, which makes it read as the MOST
+    // settled answer of the three.
+    //
+    // Anchored on the FIELD, not on return-block boundaries: the returns sit at
+    // different nesting depths, so an indent/brace terminator matched nothing and an
+    // earlier version of this test passed while checking zero sites. The `const `
+    // exclusion keeps the local `const unresolved: string[] = []` declaration out —
+    // that is not a reply, and demanding the caveat near it fails for no reason.
+    const FIELD = new RegExp(String.raw`\n\s+unresolved: `, "g");
+    const sites = [...deps.matchAll(FIELD)]
+      .map((m) => m.index ?? 0)
+      .filter((i) => !/const\s+$/.test(deps.slice(Math.max(0, i - 24), i + 1)));
+    expect(sites.length).toBeGreaterThanOrEqual(3); // analysis + install + early return
+    for (const i of sites) {
+      // FORWARD-only, and wide enough to clear a long message literal: the install
+      // return carries ~600 characters of `catalogue_unavailable` prose between the
+      // field and the caveat, so a 900-char window reported a defect that was not one.
+      // Forward-only also means a neighbouring return's caveat cannot satisfy this one.
+      const window = deps.slice(i, i + 2600);
+      expect(window, deps.slice(i, i + 60)).toMatch(/catalogue_currency_unverified/);
+    }
   });
 
   it("every site that renders the stronger caveats renders this one too", () => {
