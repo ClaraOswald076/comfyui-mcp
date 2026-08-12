@@ -1712,6 +1712,8 @@ export class UiBridge {
   private draining = false;
   private drainScheduled = false;
   private pendingDrain: ReturnType<typeof setImmediate> | null = null;
+  /** Set by stop(): no further continuation may be scheduled after teardown. */
+  private drainStopped = false;
 
   /**
    * Bounds on the pre-handler queue — COUNT and BYTES (codex review, P1).
@@ -1744,6 +1746,12 @@ export class UiBridge {
   /** Deliver a panel-initiated frame, or hold it until there is somewhere to
    *  deliver it (#1411). Never drops silently. */
   private deliverPanelEvent(event: PanelEvent): void {
+    // A stopped bridge dispatches NOTHING. Past teardown there is nowhere for a
+    // frame to go: delivering it pretends a dead bridge is live, and holding it is
+    // a leak nothing will ever drain. This has to precede the live-delivery path —
+    // sitting after it, a frame arriving post-stop was handed straight to a handler
+    // that was still installed.
+    if (this.drainStopped) return;
     const fn = this.panelMessageHandler;
     // The queue is the ordering authority whenever ANYTHING is still waiting on it
     // (codex rounds 1 and 3, both P1). Three conditions, one rule — deliver
@@ -1828,6 +1836,14 @@ export class UiBridge {
     // Anything still held — produced during this pass, or queued by a handler that
     // swapped itself out and back — is delivered on a later tick. Never dropped,
     // and never spun on: each pass does a bounded amount of synchronous work.
+    // The teardown race codex round 4 raised — a handler calling stop() mid-drain,
+    // leaving pendingDrain null at the moment stop() looks for it — is closed
+    // upstream of here rather than by a fourth condition on this line: stop() drops
+    // whatever is held, and deliverPanelEvent refuses anything after it, so by this
+    // point a stopped bridge has nothing left to schedule. A `!drainStopped` clause
+    // was tried and removed: mutation testing showed it could never change the
+    // outcome, and a guard that cannot fail reads as protection while providing
+    // none.
     if (this.preHandlerFrames.length > 0 && this.panelMessageHandler && !this.drainScheduled) {
       this.drainScheduled = true;
       const pending = setImmediate(() => {
@@ -1835,11 +1851,19 @@ export class UiBridge {
         this.drainScheduled = false;
         this.drainPreHandlerFrames();
       });
-      // UNREF'd (codex round 3, P1): a handler that emits a frame per delivery keeps
+      // UNREF'd (codex round 3, P1; re-examined round 4): a handler that emits a frame per delivery keeps
       // one continuation perpetually pending, and a referenced immediate would stop
       // a short-lived CLI — or a test — from ever exiting. Held so stop() can cancel
       // it: a bridge torn down inside the schedule-to-callback window must not run
       // it afterwards.
+      //
+      // The cost of unref is that a process which would otherwise exit does not wait
+      // for this. That is acceptable HERE and nowhere else in the queue: the budget
+      // is the whole backlog, so everything that arrived before the handler is
+      // delivered in the FIRST, synchronous pass. A continuation therefore only ever
+      // carries frames a handler produced while being drained — work whose consumer
+      // is going away too. The alternative, a referenced immediate, hangs the process
+      // forever on a self-feeding handler, which is strictly worse.
       pending.unref?.();
       this.pendingDrain = pending;
     }
@@ -4674,10 +4698,24 @@ export class UiBridge {
   }
 
   async stop(): Promise<void> {
+    // Fence FIRST, then cancel: a drain in flight must not schedule a successor
+    // behind this call (codex round 4, P1).
+    this.drainStopped = true;
     if (this.pendingDrain) {
       clearImmediate(this.pendingDrain);
       this.pendingDrain = null;
       this.drainScheduled = false;
+    }
+    if (this.preHandlerFrames.length > 0) {
+      // Held frames die with the bridge. That is the honest end state — there is
+      // nowhere left to deliver them — but it is never silent, because "the frame
+      // vanished and nothing said so" is the whole of #1411.
+      logger.warn(
+        `[ui-bridge] stopping with ${this.preHandlerFrames.length} panel frame(s) still held ` +
+          `and undelivered (#1411)`,
+      );
+      this.preHandlerFrames = [];
+      this.preHandlerBytes = 0;
     }
     for (const armed of this.tabGoneTimers.values()) clearTimeout(armed.timer);
     this.tabGoneTimers.clear();

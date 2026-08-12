@@ -215,6 +215,38 @@ describe("#1411 nothing overtakes a frame that is still waiting (codex round 3)"
     expect(seen).toEqual(["A", "B", "C", "D"]);
   });
 
+  it("a handler that calls stop() MID-DRAIN cannot leave a successor behind it", async () => {
+    // codex round 4, P1: cancellation alone is not enough. When the handler calls
+    // stop() while being drained, pendingDrain is still null at that moment, so
+    // nothing is there to cancel — and the pass then scheduled its successor
+    // afterwards, which ran after teardown.
+    const port = await freePort();
+    const live = new UiBridge(port);
+    live.start();
+    expect(await live.whenReady()).toBe(true);
+
+    const raw = live as unknown as { deliverPanelEvent: (e: PanelEvent) => void };
+    raw.deliverPanelEvent(msg("A"));
+
+    const seen: string[] = [];
+    live.onPanelMessage = (e) => {
+      const text = (e as unknown as { text?: string }).text ?? "";
+      seen.push(text);
+      if (text === "A") {
+        raw.deliverPanelEvent(msg("after-teardown")); // queued mid-drain
+        void live.stop(); // …and the bridge goes down in the same breath
+      }
+    };
+
+    // A frame that arrives after teardown has nowhere to go: it must not be held
+    // (a leak) and must not be delivered later (a lie about a dead bridge).
+    raw.deliverPanelEvent(msg("post-teardown"));
+    expect(live.preHandlerBacklog().held).toBe(0);
+
+    for (let i = 0; i < 5; i++) await tick();
+    expect(seen).toEqual(["A"]);
+  });
+
   it("stop() cancels a pending continuation instead of firing after teardown", async () => {
     const port = await freePort();
     const live = new UiBridge(port);
