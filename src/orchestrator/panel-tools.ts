@@ -6166,11 +6166,6 @@ export function makePanelToolCtx(
       dispatchedRid = rid;
       onDispatchedRid?.(rid);
     };
-    // panel#1097 — captured BEFORE any await, and used by BOTH the success and the
-    // refusal paths. `ctx.tabId` is mutable and ensureReachable can rebind this
-    // session onto another tab mid-flight, so reading it after the await can clear
-    // or age the WRONG tab's run (codex review).
-    const holdTab = ctx.tabId;
     try {
       // #436: a MUTATING graph edit must not fire into the "Connected: none"
       // window a ComfyUI restart/reload opens. A read survives that window (it is
@@ -6188,11 +6183,7 @@ export function makePanelToolCtx(
         await awaitReachable();
       }
       ensureReachable();
-      const sent = ok(await sendRouted(cmd, timeoutMs, observeRid));
-      // The switch cleared, so a LATER refusal starts a fresh run rather than
-      // inheriting this one's age — otherwise the figure only ever grows.
-      clearSwitchHold(holdTab);
-      return sent;
+      return ok(await sendRouted(cmd, timeoutMs, observeRid));
     } catch (err) {
       // Post-reconnect retry-once: a reboot/free_vram/reconnect can drop the tab's
       // transport (or replace it under a new tab id) the instant after we dispatch.
@@ -6205,10 +6196,24 @@ export function makePanelToolCtx(
       // is what retrySettleMs already waits. Still gated on RETRY-SAFE commands,
       // so a mutation is never re-issued on our own initiative.
       if (isRetrySafeCmd(cmd) && (isTransientReconnectError(err) || isWorkflowSwitchGuardRefusal(err))) {
+        // panel#1097 — declared out here so the refusal branch below can see it,
+        // and REASSIGNED after ensureReachable so it names the tab the command is
+        // actually dispatched on. Reading it before the rebind attributed a refusal
+        // from B to A; reading it after the await let a later rebind move it again
+        // (codex rounds 1 and 2).
+        let holdTab = ctx.tabId;
         try {
           await sleep(retrySettleMs());
           ensureReachable(); // rebinds a current-mode session onto the reconnected tab
-          return ok(await sendRouted(cmd, timeoutMs, observeRid));
+          holdTab = ctx.tabId;
+          const retried = ok(await sendRouted(cmd, timeoutMs, observeRid));
+          // Cleared HERE and nowhere else: this is the one path that knows a switch
+          // refusal preceded this success. Clearing on every routed success let an
+          // unguarded command (a status read) wipe the evidence while graph commands
+          // stayed refused, and left the retry path not clearing at all — so a later
+          // refusal inherited a stale age (codex round 2).
+          clearSwitchHold(holdTab);
+          return retried;
         } catch (err2) {
           // #1027 — a switch STILL in progress is not a reconnect, and saying so
           // would be the #1001 mistake again: the tab is connected and healthy,

@@ -25,7 +25,11 @@
 interface Hold {
   /** When the FIRST refusal of this run was seen. */
   since: number;
-  /** How many have been seen since — a fast retry loop is worth naming too. */
+  /** How many of those runs have ended in a terminal refusal. One per FAILED
+   *  CALL, not per panel refusal: each call refuses, settles, retries and refuses
+   *  again, so the panel sees roughly twice this (codex review). The message says
+   *  "failed calls" because that is the number this counts and the one a caller
+   *  can compare against what they did. */
   count: number;
 }
 
@@ -107,7 +111,7 @@ export function describeSwitchHold(hold: Hold | undefined, now: number = Date.no
   // user the canvas is "not busy" and that retrying cannot work would be wrong in
   // the one direction that costs them the thing that would have worked.
   return (
-    ` THIS HAS BEEN HELD FOR ${howLong} across ${hold.count} refusals, which is longer than a ` +
+    ` THIS HAS BEEN HELD FOR ${howLong} across ${hold.count} failed calls, which is longer than a ` +
     `switch usually takes. Two things look like this: it may still be loading — a very large ` +
     `graph, a slow disk, a remote canvas — or it may be held open by something on the ComfyUI ` +
     `tab awaiting a person, such as a load dialog or an unsaved-changes prompt. Retrying clears ` +

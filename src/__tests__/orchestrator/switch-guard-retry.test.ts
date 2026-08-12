@@ -28,7 +28,7 @@ import {
   type PanelToolCtx,
   type ToolResult,
 } from "../../orchestrator/panel-tools.js";
-import { resetSwitchHolds } from "../../orchestrator/switch-hold.js";
+import { resetSwitchHolds, switchHoldFor } from "../../orchestrator/switch-hold.js";
 
 const textOf = (res: ToolResult): string => (res.content[0] as { text: string }).text;
 
@@ -166,12 +166,43 @@ describe("panel#1097: a switch that never clears stops reading like one that wil
     await ctx.call({ cmd: "graph_outline" });
     await new Promise((r) => setTimeout(r, 3100));
 
-    // A command that lands clears the hold…
-    const okCtx = makePanelToolCtx(bridgeFailing(0), "tab-1");
+    // A command that was switch-refused and then SUCCEEDED on its retry clears the
+    // hold. (An unrelated success does not — it proves nothing about the switch.)
+    const okCtx = makePanelToolCtx(bridgeFailing(1), "tab-1");
     expect((await okCtx.call({ cmd: "graph_outline" })).isError).toBeFalsy();
 
     // …so the next refusal is a fresh, momentary one again.
     const after = textOf(await makePanelToolCtx(bridgeFailing(99), "tab-1").call({ cmd: "graph_outline" }));
     expect(after).not.toContain("HELD FOR");
   }, 15_000);
+});
+
+describe("panel#1097: the run belongs to the tab the command was DISPATCHED on", () => {
+  // codex rounds 1-2. ctx.tabId is mutable: ensureReachable rebinds a current-mode
+  // session onto whichever tab is live. Snapshotting it BEFORE that rebind filed
+  // tab B's refusal under tab A — so an unrelated A command could later reset a
+  // stuck B, and B's own age was never recorded.
+  it("records under the REBOUND tab, not the one the call started on", async () => {
+    // The tab must move BETWEEN the two attempts — that is the only ordering where
+    // the reassignment matters. If it has already moved before the first send, the
+    // pre-rebind and post-rebind reads are the same value and nothing is proven.
+    let reachable = "tab-1";
+    const bridge = {
+      send: async () => {
+        reachable = "tab-2"; // the session rebinds during the retry's ensureReachable
+        throw switchGuardError();
+      },
+      push: () => 1,
+      canReach: (id: string) => id === reachable,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: reachable, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => reachable,
+    } as unknown as PanelToolCtx["bridge"];
+
+    const ctx = makePanelToolCtx(bridge, "tab-1");
+    await ctx.call({ cmd: "graph_outline" });
+
+    expect(switchHoldFor("tab-2"), "the tab it was actually dispatched on").toBeTruthy();
+    expect(switchHoldFor("tab-1"), "the tab the call merely started on").toBeUndefined();
+  });
 });

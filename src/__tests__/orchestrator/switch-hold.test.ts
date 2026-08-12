@@ -76,7 +76,7 @@ describe("panel#1097 what it says, and when it says nothing", () => {
     const held = recordSwitchHold("tab", T0 + 4000);
     const text = describeSwitchHold(held, T0 + 4000);
     expect(text).toContain("HELD FOR 4s");
-    expect(text).toContain("across 2 refusals");
+    expect(text).toContain("across 2 failed calls");
   });
 
   it("offers BOTH explanations and asserts neither", () => {
@@ -96,12 +96,14 @@ describe("panel#1097 what it says, and when it says nothing", () => {
     expect(text).not.toContain("no number of retries will clear it");
   });
 
-  it("counts REFUSALS, and says so — that is what it measures", () => {
-    // codex review, P2: "attempts" overstated it. The run counts terminal refusals,
-    // not routed sends, and with a ~400ms settle those differ by a factor of two.
+  it("counts FAILED CALLS, and says so — that is what it measures", () => {
+    // codex rounds 1-2: "attempts" overstated it, and "refusals" understated what
+    // the panel saw. Each failed call refuses, settles, retries and refuses again,
+    // so the panel sees roughly twice this. "Failed calls" is the number this
+    // counts and the one a caller can compare against what they actually did.
     recordSwitchHold("tab", T0);
     const held = recordSwitchHold("tab", T0 + 5000);
-    expect(describeSwitchHold(held, T0 + 5000)).toContain("across 2 refusals");
+    expect(describeSwitchHold(held, T0 + 5000)).toContain("across 2 failed calls");
   });
 
   it("evicts runs nobody has touched, so the map cannot grow forever", () => {
