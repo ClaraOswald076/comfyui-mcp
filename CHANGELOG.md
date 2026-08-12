@@ -4,6 +4,26 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.19
+
+### Fixed
+
+- **A download can no longer land in a ComfyUI the connected server does not read (#1371).** A
+  model was written into a DIFFERENT local installation than the one serving the session: connected
+  to ComfyUI on `:8190`, the download streamed into a tree belonging to another install, resolved
+  from a stale `COMFYUI_PATH`, while visibility was checked against the connected server.
+
+  The existing divergence guard shipped in v0.49.4 and the reporter was on 0.50.107, so it was
+  present and did not fire: it proves divergence from CONTENT -- files on disk the running server
+  does not list -- and a sparse or empty destination category proves nothing.
+
+  The destination is now checked against the roots the live server actually reads, including any
+  registered through `extra_model_paths.yaml`, with junctions and symlinks resolved and the check
+  scoped to the destination's category. It refuses only on a demonstrated mismatch, never on an
+  unverifiable one -- an unknown answer proceeds exactly as before, because treating "the server
+  did not vouch for it" as "the server cannot read it" is what produced false refusals every
+  previous time that inference was tightened.
+
 ## 0.51.18
 
 ### Fixed
@@ -251,6 +271,17 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.51.19] - 2026-08-12
+
+### MCP
+
+#### Added
+- ship the twelve locale catalogs the runtime has been waiting for (#1486)
+
+#### Fixed
+- refuse a download whose destination the server PROVABLY does not read (#1487)
+
 
 ## [0.51.18] - 2026-08-12
 
