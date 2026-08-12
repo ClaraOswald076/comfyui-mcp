@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -33,7 +33,7 @@ describe("#1477 freeBytesFor", () => {
   it("walks UP to an existing ancestor - the cache dir may not exist yet", async () => {
     // On a first run ~/.comfyui-mcp/cache does not exist and statfs throws ENOENT.
     // Without the walk, every fresh install would silently skip the space check.
-    const nested = join(homedir(), ".comfyui-mcp-does-not-exist", "cache", "deeper");
+    const nested = join(tmpdir(), "cmcp-not-created-yet", "cache", "deeper");
     const free = await freeBytesFor(nested);
     expect(typeof free).toBe("number");
     expect(free as number).toBeGreaterThan(0);
@@ -48,7 +48,7 @@ describe("#1477 checkCacheVolumeSpace refuses only when it is sure", () => {
   it("refuses a download the staging volume cannot possibly hold", async () => {
     const refusal = await checkCacheVolumeSpace({
       needBytes: 1e15, // a petabyte: larger than any volume on this machine
-      cacheDir: join(homedir(), ".comfyui-mcp", "cache"),
+      cacheDir: join(tmpdir(), "cmcp-space-probe", "cache"),
     });
     expect(refusal).toBeTruthy();
     expect(refusal).toMatch(/NOT downloaded/);
