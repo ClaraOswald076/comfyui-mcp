@@ -4,6 +4,27 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.20
+
+### Fixed
+
+- **`download_model action:"status"` no longer reports a dead download as "still streaming" (#1479).**
+  Three transfers died with their owning process, and status rendered them as *downloading --
+  still streaming* with "the transfer may still be running ... Do not report this download as failed
+  or missing" -- while `action:"cancel"` on the same ids, in the same process, answered "that session
+  is confirmed GONE".
+
+  The evidence was already there: `writerProcessGone()` probes the owner pid, but it was only reached
+  from the cancel path, and the status render branched on heartbeat AGE alone. Status now consults
+  the same probe, and both the status line and the note change together.
+
+  A merely-stale record keeps the cautious wording -- a missed heartbeat still does not prove the
+  transfer stopped (#761) -- and the pid verdict is carried as "proven gone" or absent, never as a
+  tri-state, so "cannot tell" can never render as death. The verdict is scoped to what was measured:
+  no process with that pid exists ON THIS MACHINE. A writer on another host or container looks the
+  same from here, and `cancel` shares that blind spot, so the message says so rather than promising
+  a safe recovery it cannot guarantee.
+
 ## 0.51.19
 
 ### Fixed
@@ -271,6 +292,14 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.51.20] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- status must not call a PROVEN-dead download 'still streaming' (#1490)
+
 
 ## [0.51.19] - 2026-08-12
 
