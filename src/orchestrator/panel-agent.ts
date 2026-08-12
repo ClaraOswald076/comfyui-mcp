@@ -2251,19 +2251,33 @@ export class PanelAgentManager {
       }
       // The EARLIEST address this tab was stranded on is the true `from`.
       const origin = this.pendingRetargetFrom.get(tabId) ?? (from as string);
+      // #1443 — ASK THE QUESTION ABOUT THE PAIR THAT GETS REPORTED.
+      //
+      // Whether this call is a move was decided from the INCOMING from→to, which is
+      // the right question for the caller and the wrong one for this tab: the
+      // message is composed from its PRESERVED origin. A tab held mid-turn across
+      // A→B→A has origin A and to A — it never left A — and was told, in a real
+      // agent turn, that its target changed from A to A. A→B→C, the case preserving
+      // the origin exists for, is correct; this is its degenerate sibling.
+      const stranded = retargetIsWorthNudging(origin, to);
       // Recompose BEFORE applying, not after: if the tab went idle in between,
       // applyPendingRestarts delivers whatever is queued right now, and a stale
       // A→B message would go out while the child is being respawned onto C.
-      this.pendingMcpRestart.set(tabId, queuedIsRetarget ? staleTargetNudge(origin, to) : null);
+      this.pendingMcpRestart.set(
+        tabId,
+        queuedIsRetarget && stranded ? staleTargetNudge(origin, to) : null,
+      );
       const outcome = this.applyPendingRestarts(tabId);
-      if (outcome === "scheduled") {
+      if (outcome === "scheduled" && stranded) {
         // Mid-turn: the tab is stranded on `origin` until the turn ends. Record
         // the origin so a further retarget in the same turn keeps it, and queue
         // the message the deferred respawn will carry.
         this.pendingRetargetFrom.set(tabId, origin);
         this.pendingMcpRestart.set(tabId, staleTargetNudge(origin, to));
       } else {
-        // Applied (or no agent): nothing is stranded any more.
+        // Applied, no agent, or a ROUND TRIP that landed back on `origin`: either
+        // way this tab has nothing to be told. The respawn still happens — it is
+        // the same env, so it is harmless — but it goes out silently.
         this.pendingRetargetFrom.delete(tabId);
       }
       tallyRestart(tally, outcome);

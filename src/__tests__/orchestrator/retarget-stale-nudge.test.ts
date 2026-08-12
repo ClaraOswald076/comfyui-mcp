@@ -191,6 +191,55 @@ describe("#1429 retarget nudge reaches exactly the tabs that were stale", () => 
     expect(delivered).not.toContain(B);
   });
 
+  it("a ROUND TRIP says nothing — the child never left the target it is on (#1443)", async () => {
+    // Found by the independent review of 0.51.4. Whether to nudge was decided from
+    // the INCOMING pair, while the message was composed from the PRESERVED origin,
+    // so A→B→A produced staleTargetNudge(A, A): a real agent turn asserting the
+    // target changed from A to A, for a tab whose child was correct throughout.
+    const backend = new RecordingBackend();
+    backend.autoComplete = false;
+    const manager = makeManager(backend);
+    const A = "http://127.0.0.1:8188";
+    const B = "https://pod-b.proxy.runpod.net";
+
+    manager.send("tab-round-trip", "render");
+    await waitFor(() => backend.turnTexts.length >= 1);
+
+    manager.retargetAllForMcpEnv(A, B); // stranded on A
+    manager.retargetAllForMcpEnv(B, A); // …and back. Nothing moved for this tab.
+
+    backend.autoComplete = true;
+    backend.release();
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(backend.turnTexts.some((x) => x.includes("target changed"))).toBe(false);
+    expect(backend.turnTexts).not.toContain(staleTargetNudge(A, A));
+  });
+
+  it("a round trip does not strand the marker for a LATER real move", async () => {
+    // The round trip clears the marker; a genuine move afterwards must still report
+    // from where that turn actually is, not from a stale origin.
+    const backend = new RecordingBackend();
+    backend.autoComplete = false;
+    const manager = makeManager(backend);
+    const A = "http://127.0.0.1:8188";
+    const B = "https://pod-b.proxy.runpod.net";
+    const C = "https://pod-c.proxy.runpod.net";
+
+    manager.send("tab-after-trip", "render");
+    await waitFor(() => backend.turnTexts.length >= 1);
+
+    manager.retargetAllForMcpEnv(A, B);
+    manager.retargetAllForMcpEnv(B, A); // round trip: marker cleared
+    manager.retargetAllForMcpEnv(A, C); // a real move, from A
+
+    backend.autoComplete = true;
+    backend.release();
+
+    await waitFor(() => backend.turnTexts.length >= 2);
+    expect(backend.turnTexts[backend.turnTexts.length - 1]).toBe(staleTargetNudge(A, C));
+  });
+
   it("a per-request nudge queued AFTER a retarget survives the NEXT retarget", async () => {
     // codex finding, one step removed from #164: the retarget marker has to be
     // cleared when a per-request nudge overwrites the queued value, or the next
