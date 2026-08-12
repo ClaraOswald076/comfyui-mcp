@@ -1710,6 +1710,7 @@ export class UiBridge {
   /** How many were refused once the cap was hit. Reported, never silent. */
   private preHandlerDropped = 0;
   private draining = false;
+  private drainScheduled = false;
 
   /**
    * Bounds on the pre-handler queue — COUNT and BYTES (codex review, P1).
@@ -1787,12 +1788,22 @@ export class UiBridge {
     const held = this.preHandlerFrames.length;
     this.draining = true;
     let delivered = 0;
+    // A BUDGET, because the loop body can extend the queue it is draining (codex
+    // round 2, P1): a handler that feeds one frame back per frame it handles would
+    // otherwise keep this synchronous loop non-empty forever and wedge the event
+    // loop — worse than the bug being fixed. The budget is the number of frames
+    // held when the drain STARTED, which is exactly the pre-handler backlog this
+    // exists to deliver; anything produced while draining is new work and is
+    // rescheduled below rather than dropped.
+    let budget = held;
     try {
       for (;;) {
         const handler = this.panelMessageHandler;
         // Cleared mid-drain: keep the rest HELD rather than dropping them — there
         // is nowhere to deliver them, which is the situation this queue exists for.
         if (!handler || this.preHandlerFrames.length === 0) break;
+        if (budget <= 0) break; // yield the rest to the next tick
+        budget -= 1;
         const event = this.preHandlerFrames.shift() as PanelEvent;
         this.preHandlerBytes = Math.max(0, this.preHandlerBytes - UiBridge.frameBytes(event));
         delivered += 1;
@@ -1808,6 +1819,16 @@ export class UiBridge {
       }
     } finally {
       this.draining = false;
+    }
+    // Anything still held — produced during this pass, or queued by a handler that
+    // swapped itself out and back — is delivered on a later tick. Never dropped,
+    // and never spun on: each pass does a bounded amount of synchronous work.
+    if (this.preHandlerFrames.length > 0 && this.panelMessageHandler && !this.drainScheduled) {
+      this.drainScheduled = true;
+      setImmediate(() => {
+        this.drainScheduled = false;
+        this.drainPreHandlerFrames();
+      });
     }
     if (delivered > 0) {
       logger.info(

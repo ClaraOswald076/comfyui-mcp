@@ -32,6 +32,9 @@ function deliver(ev: PanelEvent): void {
   (bridge as unknown as { deliverPanelEvent: (e: PanelEvent) => void }).deliverPanelEvent(ev);
 }
 
+/** One turn of the event loop — where work produced DURING a drain is delivered. */
+const tick = () => new Promise<void>((r) => setImmediate(() => r()));
+
 const msg = (text: string): PanelEvent =>
   ({ type: "user_message", tab_id: "wf:a.json", text }) as unknown as PanelEvent;
 
@@ -125,6 +128,11 @@ describe("#1411 frames that arrive DURING the drain (codex review, P1)", () => {
       if (text === "A") deliver(msg("C"));
     };
 
+    // A and B were the pre-handler backlog, so they land synchronously. C was
+    // produced BY the drain, so it is delivered on a later tick — bounded work per
+    // pass (codex round 2), with the order preserved either way.
+    expect(seen).toEqual(["A", "B"]);
+    await tick();
     expect(seen).toEqual(["A", "B", "C"]);
     expect(bridge.preHandlerBacklog().held).toBe(0);
   });
@@ -148,7 +156,37 @@ describe("#1411 frames that arrive DURING the drain (codex review, P1)", () => {
       }
     };
 
+    expect(seen).toEqual(["first:A"]);
+    await tick(); // the replacement handler picks up what was queued mid-drain
     expect(seen).toEqual(["first:A", "second:B"]);
+    expect(bridge.preHandlerBacklog().held).toBe(0);
+  });
+});
+
+describe("#1411 a self-feeding handler cannot wedge the event loop", () => {
+  it("does bounded work per pass, and still delivers everything in order", async () => {
+    // codex round 2, P1: the drain loop can extend the queue it is draining, so an
+    // unbounded loop lets a handler that emits one frame per frame it handles spin
+    // forever — the assignment never returns and Node stops. The budget is the
+    // backlog present when the pass started; the rest is rescheduled, never dropped.
+    deliver(msg("seed"));
+
+    const seen: string[] = [];
+    let more = 5;
+    bridge.onPanelMessage = (e) => {
+      const text = (e as unknown as { text: string }).text;
+      seen.push(text);
+      if (more > 0) {
+        more -= 1;
+        deliver(msg(`echo${more}`));
+      }
+    };
+
+    // The synchronous pass delivered only the pre-existing backlog and RETURNED.
+    expect(seen).toEqual(["seed"]);
+    for (let i = 0; i < 10 && bridge.preHandlerBacklog().held > 0; i++) await tick();
+
+    expect(seen).toEqual(["seed", "echo4", "echo3", "echo2", "echo1", "echo0"]);
     expect(bridge.preHandlerBacklog().held).toBe(0);
   });
 });
