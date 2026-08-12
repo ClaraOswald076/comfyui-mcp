@@ -75,7 +75,11 @@ describe("#890 what the caveat says", () => {
     // api.comfy.org directly rather than through Manager, so it is real evidence.
     // The ACTION too: search_custom_nodes is action-parameterised and refuses without
     // one, so naming the tool alone would cost a round trip to an error.
+    // BOTH parameters. The tool is action-parameterised AND `query` is required for
+    // the search action, so a half-named call costs a round trip to an error message
+    // inside a caveat whose whole job is to hand over a check that works.
     expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/search_custom_nodes action:"search"/);
+    expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/query:"<pack name>"/);
     expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/api\.comfy\.org directly/);
     expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/found there means this[\s\S]*behind/i);
     expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/absent from both/i);
