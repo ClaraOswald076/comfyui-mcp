@@ -7,7 +7,7 @@ import {
   validateConnectUrl,
 } from "../../transport/cli.js";
 import { displayWidth } from "../../i18n/terminal-layout.js";
-import { __resetI18nForTest } from "../../i18n/index.js";
+import { __resetI18nForTest, trFor } from "../../i18n/index.js";
 
 const base = ["node", "comfyui-mcp"];
 
@@ -359,21 +359,38 @@ describe("--help is translated, and degrades to English", () => {
   let restore = () => {};
   afterEach(() => restore());
 
-  it("renders English for a locale with no catalog on disk", () => {
-    // The shipping state today: `tr()` carries its English at the call site, so a user with
-    // LANG=ko_KR.UTF-8 gets a complete English screen rather than a screen of raw keys. This
-    // is the behaviour that has to hold for every release BETWEEN this change and the first
-    // catalog, which is most of them.
+  it("renders the shipped catalog, and never a raw key", () => {
+    // This test used to assert the OPPOSITE — that a Korean screen came back byte-identical
+    // to English — because no catalog existed to render. That was the honest assertion then
+    // and is a false one now: locales/ko/main.json ships, so the prose has to move.
+    //
+    // What survives the change is the pair that actually matters. The descriptions are the
+    // reader's half and must be translated; the left column is what the user TYPES and must
+    // not be. And a raw `cli.*` key on screen is the failure mode a missing fallback produces,
+    // which no amount of translation should ever be able to cause.
     restore = pinLocale("en");
     const english = renderCliHelp();
     restore();
     restore = pinLocale("ko");
     const korean = renderCliHelp();
-    // The `--lang` row reports the ACTIVE locale, so it is the one line that is supposed to
-    // move. Everything else is prose, and prose with no catalog behind it stays English.
-    expect(korean).toContain("env: COMFYUI_MCP_LANG   (active: ko)");
-    expect(korean.replace("(active: ko)", "(active: en)")).toBe(english);
+
+    // The parenthetical around the active locale is itself a translated key, so match the
+    // row rather than the English sentence: `env: <VAR>` is typed, `ko` is the answer.
+    expect(korean).toMatch(/env: COMFYUI_MCP_LANG {2,}\(\S+: ko\)/);
+    expect(english).toContain("env: COMFYUI_MCP_LANG   (active: en)");
+    expect(korean).not.toBe(english);
+    expect(korean).toMatch(/[가-힣]/);
     expect(korean).not.toMatch(/\bcli\.[a-z_]+\b/);
+    for (const typed of ["comfyui-mcp connect [<comfyui-url>]", "--tool-mode <compact|full>", "--host <host>", "env: MCP_PORT", "-h, --help"]) {
+      expect(korean).toContain(typed);
+    }
+  });
+
+  it("still falls back to English for a key no catalog carries", () => {
+    // The degradation path, now that it can no longer be observed from the assembled screen.
+    // Every release between a NEW `tr()` call site and its translation lives here, and the
+    // guarantee is a complete English sentence rather than a key.
+    expect(trFor("ko", "cli.help_not_a_real_key", "start the MCP server")).toBe("start the MCP server");
   });
 
   it("lays the two columns out in terminal CELLS, not characters", () => {

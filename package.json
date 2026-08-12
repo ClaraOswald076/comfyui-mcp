@@ -27,7 +27,7 @@
     "dev": "tsx src/index.ts",
     "dev:agent-poc": "tsx src/experimental/run.ts",
     "start": "node dist/index.js",
-    "test": "vitest run --passWithNoTests",
+    "test": "npm run i18n:check && vitest run --passWithNoTests",
     "smoke": "npm run build && node scripts/smoke-install.mjs",
     "test:watch": "vitest",
     "test:integration": "cross-env COMFYUI_INTEGRATION=true vitest run",
@@ -57,6 +57,7 @@
     "changelog": "node scripts/gen-changelog.mjs",
     "version": "node scripts/gen-changelog.mjs --from-pkg && git add CHANGELOG.md",
     "prepare": "tsc",
+    "i18n:build": "node scripts/i18n-build-en.mjs",
     "i18n:check": "node scripts/i18n-check.mjs"
   },
   "dependencies": {
