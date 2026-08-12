@@ -185,3 +185,46 @@ describe("#236 the runtime hash agrees with the artefact the panel vendors", () 
     );
   });
 });
+
+describe("#236 the dedup map is bounded", () => {
+  const ORCH = readFileSync(join(HERE, "../../orchestrator/index.ts"), "utf8");
+
+  it("evicts rather than growing for every tab id ever seen (codex review, P2)", () => {
+    // Tab ids are minted continually — every tmp: connection and every workflow
+    // switch produces a new one — so an uncapped module-level Map keyed by tab id
+    // retains an entry per tab forever, including long-disconnected ones.
+    expect(ORCH).toMatch(/MAX_LOGGED_VOCABULARY_SKEW = \d+/);
+    const start = ORCH.indexOf("loggedVocabularySkew.set(panelTab");
+    expect(start).toBeGreaterThan(-1);
+    const before = ORCH.slice(Math.max(0, start - 600), start);
+    expect(before).toMatch(/loggedVocabularySkew\.size >= MAX_LOGGED_VOCABULARY_SKEW/);
+    expect(before).toMatch(/loggedVocabularySkew\.delete\(oldest\)/);
+  });
+
+  it("eviction can only DUPLICATE a warning, never suppress one", () => {
+    // The safety argument, asserted so it cannot be quietly inverted into an
+    // eviction that drops mismatches instead of dedup entries.
+    const map = new Map<string, string>();
+    const CAP = 3;
+    const warned: string[] = [];
+    const seen = (tab: string, hash: string) => {
+      if (map.get(tab) === hash) return;
+      while (map.size >= CAP) {
+        const oldest = map.keys().next().value;
+        if (oldest === undefined) break;
+        map.delete(oldest);
+      }
+      map.set(tab, hash);
+      warned.push(tab);
+    };
+    seen("a", "h1");
+    seen("a", "h1"); // deduped
+    expect(warned).toEqual(["a"]);
+    seen("b", "h1");
+    seen("c", "h1");
+    seen("d", "h1"); // evicts "a"
+    seen("a", "h1"); // "a" warns AGAIN — a duplicate, which is the safe direction
+    expect(warned).toEqual(["a", "b", "c", "d", "a"]);
+    expect(map.size).toBeLessThanOrEqual(CAP);
+  });
+});

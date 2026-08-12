@@ -72,6 +72,17 @@ import { buildPanelToolDefs } from "./panel-tools.js";
  *  vocabulary is reported again — that is new information, not a repeat. */
 const loggedVocabularySkew = new Map<string, string>();
 
+/** Cap on the map above (codex review, P2). Tab ids are minted continually — every
+ *  `tmp:` connection and every workflow switch produces a new one — and a long-lived
+ *  server would otherwise retain one entry per tab that ever reported a skew, forever,
+ *  including tabs that disconnected hours ago.
+ *
+ *  Evicting the OLDEST is safe in the direction that matters: the only consequence of
+ *  dropping an entry is that a still-connected tab's unchanged mismatch gets logged a
+ *  second time. It can never SUPPRESS a warning, because entries only ever suppress.
+ *  A duplicated log line is the correct thing to risk here; a missed one is not. */
+const MAX_LOGGED_VOCABULARY_SKEW = 200;
+
 /** This server's vocabulary hash, computed once.
  *
  *  Memoised because it cannot change without a restart (the tool surface is fixed at
@@ -3453,6 +3464,13 @@ export async function runPanelOrchestrator(): Promise<void> {
         // a panel that UPDATES to a different (still disagreeing) vocabulary is.
         if (skew.status === "mismatch") {
           if (loggedVocabularySkew.get(panelTab) !== advertised) {
+            // Insertion-ordered, so the first key is the oldest. Evicted BEFORE the
+            // insert so the cap is a real bound rather than a bound-plus-one.
+            while (loggedVocabularySkew.size >= MAX_LOGGED_VOCABULARY_SKEW) {
+              const oldest = loggedVocabularySkew.keys().next().value;
+              if (oldest === undefined) break;
+              loggedVocabularySkew.delete(oldest);
+            }
             loggedVocabularySkew.set(panelTab, advertised!);
             logger.warn(`[panel-orchestrator] ${skew.message}`);
           }
