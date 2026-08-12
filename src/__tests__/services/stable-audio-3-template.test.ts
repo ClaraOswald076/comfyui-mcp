@@ -98,3 +98,34 @@ describe("#1458 WIRING: the audio tool passes audio_quality to THIS family", () 
     expect(call).toMatch(/audio_quality: resolved\.audio_quality/);
   });
 });
+
+describe("#1458 the audio_quality description matches where it now applies", () => {
+  // The fix routed stable_audio_3's SaveAudioMP3 `quality` through the SAME
+  // `audio_quality` parameter the ACE family uses. The parameter's own description
+  // still said "ACE only", which tells a stable_audio_3 caller the knob does not apply
+  // to them - a wrong answer about the tool's own surface, which is the defect class
+  // this issue is an instance of. Caught by the review gate probing the enum chain.
+  const src = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "../../tools/generate-image.ts"),
+    "utf8",
+  );
+  const line = src.split("\n").find((l) => l.includes("SaveAudioMP3 bitrate/quality"));
+
+  it("the description exists and names BOTH families", () => {
+    expect(line).toBeDefined();
+    expect(line).toMatch(/stable_audio_3/);
+    expect(line).toMatch(/ACE/);
+  });
+
+  it('no longer claims "ACE only"', () => {
+    expect(line).not.toMatch(/ACE only/);
+  });
+
+  it("still names the legal values, which the live node reports as V0/128k/320k", () => {
+    // Verified against the running server's /object_info/SaveAudioMP3:
+    //   quality: ["COMBO", {default: "V0", options: ["V0", "128k", "320k"]}]
+    // An enum that drifts from the node definition fails validation exactly the way
+    // the omitted input did.
+    for (const v of ["V0", "128k", "320k"]) expect(line).toContain(v);
+  });
+});
