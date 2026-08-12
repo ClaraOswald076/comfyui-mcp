@@ -3514,6 +3514,11 @@ export type WorkflowFenceRebind =
        *  is wrong (an older build sends no open-workflow list), and telling that
        *  caller to try again in a moment is advice that can never come true. */
       rechecks?: { attempts: number; waitedMs: number; settles: boolean };
+      /** #1401 — the uuid the panel reported but could not corroborate. NOT
+       *  adopted, and never treated as the live identity; used only so the
+       *  message can stop asserting certain failure when it EQUALS the fence
+       *  this session already holds. */
+      seenUuid?: string;
     }
   /** A live identity was read, but the bridge declined to adopt it (the tab stopped
    *  being reachable, or the uuid failed the orchestrator's shape/origin check).
@@ -3563,12 +3568,24 @@ function corroborateActiveForFence(
    *  the panel has finished confirming) settles; a SHAPE fact (this build does
    *  not send a `workflows` array; these records share no comparable identity
    *  field) does not, no matter how long anyone waits. */
-  | { ok: false; why: string; settles: boolean } {
+  /** `seenUuid` — the identity the panel REPORTED for the active canvas, when it
+   *  reported one at all. Deliberately kept on the FAILURE path (#1401): it must
+   *  never be adopted, but it is the only thing that can tell "we could not
+   *  confirm the canvas" apart from "the canvas is a different one". A caller
+   *  whose preserved fence equals this uuid is not broken, and telling them their
+   *  graph tools will keep failing sends them to a hard refresh for nothing. */
+  | { ok: false; why: string; settles: boolean; seenUuid?: string } {
   const active = parsed.active;
+  // Read once, up front, so every failure branch below can report it. Undefined
+  // whenever the record is missing, unreadable, or carries no usable uuid.
+  const seenUuid =
+    active && typeof active === "object"
+      ? responseWorkflowUuid(active as Record<string, unknown>)
+      : undefined;
   if (!active || typeof active !== "object") {
     // SETTLES: mid-restore the frontend genuinely has no active workflow yet —
     // that is #1184's finding in this reply's terms, and it is the window here.
-    return { ok: false, why: "the reply carried no active-workflow record", settles: true };
+    return { ok: false, seenUuid, why: "the reply carried no active-workflow record", settles: true };
   }
   // #514: the panel says so itself when its active record is not confirmed. An
   // explicit `false` is the panel telling us the value is untrustworthy — never
@@ -3579,6 +3596,7 @@ function corroborateActiveForFence(
     // and a moment later it says otherwise (#1292).
     return {
       ok: false,
+      seenUuid,
       why: "the panel reported its active workflow as UNCONFIRMED",
       settles: true,
     };
@@ -3592,6 +3610,7 @@ function corroborateActiveForFence(
   if (!Array.isArray(list)) {
     return {
       ok: false,
+      seenUuid,
       why: "the reply carried no open-workflow list to corroborate the active record against",
       settles: false,
     };
@@ -3599,6 +3618,7 @@ function corroborateActiveForFence(
   if (list.length === 0) {
     return {
       ok: false,
+      seenUuid,
       why: "the reply's open-workflow list was empty, so nothing corroborates the active record",
       settles: true,
     };
@@ -3613,6 +3633,7 @@ function corroborateActiveForFence(
     // SETTLES: a snapshot taken before the panel re-flagged its active tab.
     return {
       ok: false,
+      seenUuid,
       why: "no entry in the open-workflow list is marked active",
       settles: true,
     };
@@ -3622,6 +3643,7 @@ function corroborateActiveForFence(
     // uuid through, so it is refused rather than arbitrated.
     return {
       ok: false,
+      seenUuid,
       why: `${flaggedActive.length} entries in the open-workflow list are marked active (a mixed reply)`,
       // SETTLES: "mixed" IS the half-reconciled state, by definition.
       settles: true,
@@ -3634,6 +3656,7 @@ function corroborateActiveForFence(
   if (verdict === false) {
     return {
       ok: false,
+      seenUuid,
       why: "the active record and the entry marked active in the open-workflow list name DIFFERENT workflows (a stale or mixed reply)",
       // SETTLES: a stale half of the snapshot catches up.
       settles: true,
@@ -3642,6 +3665,7 @@ function corroborateActiveForFence(
   if (verdict !== true) {
     return {
       ok: false,
+      seenUuid,
       why: "the active record and the open-workflow list share no comparable identity field, so nothing corroborates it",
       // DOES NOT SETTLE: a field the records do not carry will not appear by
       // waiting — that is the reply's SHAPE, not its timing.
@@ -3831,6 +3855,7 @@ async function rebindWorkflowFence(ctx: PanelToolCtx): Promise<WorkflowFenceRebi
       kind: "uncorroborated",
       why: corroborated.why,
       rechecks: { attempts, waitedMs, settles: corroborated.settles },
+      ...(corroborated.seenUuid ? { seenUuid: corroborated.seenUuid } : {}),
     };
   }
   const active = corroborated.active;
@@ -4215,6 +4240,41 @@ function describeFenceRebind(
             `its graph binding is healthy could NOT be determined. Routing is set. Treat graph ` +
             `tools as unconfirmed: if the next one fails with a workflow-instance mismatch, ` +
             `that is the answer.${remedy}`,
+        };
+      }
+      // #1401 — the SAME uuid is not the same situation.
+      //
+      // The gate is right to refuse an uncorroborated identity, and nothing here
+      // adopts one. What was wrong was the consequence asserted afterwards: when
+      // the identity the panel reported EQUALS the fence this session already
+      // holds, graph tools are not fenced to a different instance and generally
+      // keep working — the reporter's next call was a panel_graph_outline that
+      // succeeded, after being told it would keep failing and to hard-refresh.
+      //
+      // So this splits on evidence rather than reporting the worst case for both:
+      // a MATCHING uuid rules OUT the fenced-to-another-instance case without ruling
+      // IN liveness (codex: a stale/background record can carry the right uuid), so it
+      // reports what is ruled out and sends the caller to the read that settles it; a
+      // DIFFERENT or absent uuid keeps the original certain-failure wording.
+      const fenceStillMatches =
+        r.status === "no_identity" && r.seenUuid !== undefined && r.seenUuid === r.before.uuid;
+      if (fenceStillMatches) {
+        return {
+          binding: "not_recovered",
+          note:
+            `${lead}. This session's fence was NOT re-derived, and whether that reply describes ` +
+            `the LIVE canvas is exactly what could not be confirmed — a stale or background ` +
+            `record can carry the right uuid and still not be the canvas in front of the user, ` +
+            `so this is NOT a claim that graph tools work. What IS known is narrower and still ` +
+            `useful: the identity it reported matches the fence this session already holds ` +
+            `(${r.before.uuid}), so this is not the case where the session is fenced to a ` +
+            `DIFFERENT workflow instance — which is the one that keeps graph tools failing.` +
+            `
+
+WHAT TO DO: settle it with a graph read — call panel_graph_outline. That ` +
+            `answers the question this could not: if it succeeds, the binding was fine and this ` +
+            `was a reconciliation race. If it fails with a workflow-instance mismatch, the ` +
+            `reply was stale after all — then ${RELOAD_TAB_REMEDY}`,
         };
       }
       return r.before.uuid
