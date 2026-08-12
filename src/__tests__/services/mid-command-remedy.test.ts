@@ -266,3 +266,50 @@ describe("#646 the verify clause names evidence that exists for the command", ()
     }
   });
 });
+
+describe("#646 a graph_ prefix does not mean the effect is on the canvas", () => {
+  it("graph_save_subgraph is verified with panel_list_subgraphs (codex review, P1)", () => {
+    // It writes to the blueprint LIBRARY. The graph is identical afterwards, so both
+    // graph readers show exactly what they showed before and cannot tell a save that
+    // landed from one that did not — the same shape of wrong answer this fix exists
+    // to remove, one branch further in.
+    const text = midCommandVerifyClause("graph_save_subgraph");
+    expect(text).toMatch(/panel_list_subgraphs/);
+    expect(text).not.toMatch(/panel_query_graph/);
+    expect(text).not.toMatch(/queue action:"list"/);
+    // And the reason a blind retry is bad here is specific: a name collision.
+    expect(text).toMatch(/collides on the name/);
+  });
+
+  it("graph_copy_nodes says nothing can check it — and to just re-issue", () => {
+    // The clipboard is not readable and the graph is unchanged, so no reader is
+    // evidence. This is the ONE interrupted write where retrying is correct: a second
+    // copy of the same nodes is the same clipboard.
+    const text = midCommandVerifyClause("graph_copy_nodes");
+    expect(text).toMatch(/clipboard is not readable/);
+    expect(text).toMatch(/Just re-issue it/);
+    expect(text).not.toMatch(/panel_query_graph/);
+    expect(text).not.toMatch(/panel_list_subgraphs/);
+  });
+
+  it("the two carve-outs are checked BEFORE the generic graph_ branch", () => {
+    // Ordering is the whole mechanism — both names start with "graph_", so a branch
+    // placed after the prefix test would never be reached.
+    const src = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../../services/mid-command-remedy.ts"),
+      "utf8",
+    );
+    const lib = src.indexOf("LIBRARY_COMMANDS.has(cmd)");
+    const clip = src.indexOf("CLIPBOARD_COMMANDS.has(cmd)");
+    const generic = src.indexOf('cmd.startsWith("graph_")');
+    expect(lib).toBeGreaterThan(-1);
+    expect(clip).toBeGreaterThan(-1);
+    expect(lib).toBeLessThan(generic);
+    expect(clip).toBeLessThan(generic);
+  });
+
+  it("an ordinary content edit is unaffected by the carve-outs", () => {
+    expect(midCommandVerifyClause("graph_set_widget")).toMatch(/panel_query_graph/);
+    expect(midCommandVerifyClause("graph_add_subgraph")).toMatch(/panel_query_graph/);
+  });
+});

@@ -56,9 +56,17 @@ export function isInteractiveCommand(cmd: string): boolean {
  *  • a RUN — the queue and the output list are exactly right, and stay.
  *  • a GRAPH WRITE — read the graph back. A graph read is idempotent and safe to
  *    run the instant a tab is connected, which makes it a better check than
- *    anything the run path offers.
+ *    anything the run path offers. This branch is LAST among the graph_* kinds:
+ *    the prefix alone does not mean the effect is on the canvas, and the two cases
+ *    above are the ones where it is not.
  *  • a WORKFLOW mutator — the workflow list, not the graph: these change which
  *    workflows exist or are open, which a canvas read does not see.
+ *  • a LIBRARY write (`graph_save_subgraph`) — panel_list_subgraphs. The graph is
+ *    identical after a blueprint save, so both graph readers show what they showed
+ *    before and prove nothing (codex review).
+ *  • a CLIPBOARD write (`graph_copy_nodes`) — nothing can read the clipboard, and
+ *    the graph is unchanged. This is the one interrupted write where re-issuing is
+ *    the right answer: a second copy of the same nodes is the same clipboard.
  *  • anything else — say to verify without naming tools that may not apply.
  *    Naming a plausible-but-wrong check is what this fix exists to remove; doing
  *    it again in the default branch would be the same defect with a different tool.
@@ -70,6 +78,20 @@ export function isInteractiveCommand(cmd: string): boolean {
  */
 /** The one command whose evidence really is the render queue (panel#646). */
 const RUN_COMMAND = "graph_run";
+
+/** Writes to the user's blueprint LIBRARY, not to the canvas (codex review, P1).
+ *  `graph_save_subgraph` publishes a subgraph as a reusable blueprint; the graph is
+ *  unchanged afterwards, so both graph readers show exactly what they showed before
+ *  and cannot tell a save that landed from one that did not. `panel_list_subgraphs`
+ *  is the reader that can. */
+const LIBRARY_COMMANDS = new Set<string>(["graph_save_subgraph"]);
+
+/** Writes the CLIPBOARD, which nothing in the tool surface can read (codex review).
+ *  Copying leaves the graph identical, so a canvas read is no evidence at all —
+ *  but unlike everything else here, re-issuing is harmless: a second copy of the
+ *  same nodes produces the same clipboard. That makes "just do it again" the
+ *  correct advice rather than a dangerous one. */
+const CLIPBOARD_COMMANDS = new Set<string>(["graph_copy_nodes"]);
 
 /** The four active-workflow mutators. A canvas read cannot see these — they change
  *  which workflows exist or are open, not what is on the current graph. Mirrors
@@ -124,6 +146,22 @@ export function midCommandVerifyClause(cmd: string): string {
       `Verify with panel_list_workflows before retrying — these change which workflows ` +
       `exist or are open, which a canvas read does not see. Re-issuing blindly can save ` +
       `or close a second time.`
+    );
+  }
+  if (LIBRARY_COMMANDS.has(cmd)) {
+    return (
+      `Verify with panel_list_subgraphs before retrying — this writes to the blueprint ` +
+      `LIBRARY, not to the canvas, so the graph is identical either way and a graph read ` +
+      `cannot tell a save that landed from one that did not. If the blueprint is already ` +
+      `there, do NOT re-issue it: a second save collides on the name.`
+    );
+  }
+  if (CLIPBOARD_COMMANDS.has(cmd)) {
+    return (
+      `Nothing in the tool surface can check that — the clipboard is not readable, and the ` +
+      `graph is unchanged either way, so neither graph reader is evidence. Just re-issue it: ` +
+      `unlike the other interrupted writes, copying the same nodes twice produces the same ` +
+      `clipboard, so a retry here costs nothing and settles it.`
     );
   }
   if (cmd.startsWith("graph_")) {
