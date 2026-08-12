@@ -13,6 +13,7 @@ import { logger } from "../utils/logger.js";
 import { downloadWithCache, probeRemoteModelPayload } from "./download-cache.js";
 import { reportDownloadProgress } from "./download-progress.js";
 import type { ResumeReporter } from "./download-resume-diag.js";
+import { modelNotFoundMessage } from "./model-root-scope.js";
 import {
   resolveModelsDir,
   resolveModelsDirWithBases,
@@ -2254,9 +2255,12 @@ export async function resolveExistingModelFile(
 
   if (dirHit) return dirHit;
 
+  // #1474 — say WHY only these roots were searched. `list_paths` may display roots
+  // this resolver refused to enumerate (it backs DELETION, so it uses only roots
+  // provable from the running server's launch arguments), and the caller was left
+  // holding two tools that disagreed with nothing to reconcile them.
   throw new ModelError(
-    `Model file not found: ${relativePath}. Searched ${searched.length} root(s): ` +
-      `${searched.join(", ")}`,
+    modelNotFoundMessage({ relativePath, searched }),
     { path: relativePath, searched },
   );
 }
