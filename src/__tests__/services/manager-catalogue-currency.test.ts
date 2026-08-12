@@ -60,7 +60,10 @@ describe("#890 what the caveat says", () => {
   });
 
   it("refuses the 'does not exist' reading outright", () => {
-    expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/NOT proof these do not exist/);
+    // Case-insensitive: a control mutation lowercasing "NOT" killed the strict form,
+    // which punishes rewording rather than protecting the claim. The property is that
+    // the "does not exist" reading is refused, not how it is capitalised.
+    expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/not proof these do not exist/i);
   });
 
   it("names WHY a populated list is not evidence of currency", () => {
