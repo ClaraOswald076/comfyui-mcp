@@ -110,6 +110,49 @@ describe("#1411 frames that arrive before the handler exists", () => {
   });
 });
 
+describe("#1411 frames that arrive DURING the drain (codex review, P1)", () => {
+  it("land BEHIND what is still held, not in front of it", async () => {
+    // Handling A can synchronously cause C to arrive — a hello handler that pushes,
+    // a reply that loops back. Delivering C immediately would reorder A, B, C into
+    // A, C, B, which is the ordering guarantee this queue exists to provide.
+    deliver(msg("A"));
+    deliver(msg("B"));
+
+    const seen: string[] = [];
+    bridge.onPanelMessage = (e) => {
+      const text = (e as unknown as { text: string }).text;
+      seen.push(text);
+      if (text === "A") deliver(msg("C"));
+    };
+
+    expect(seen).toEqual(["A", "B", "C"]);
+    expect(bridge.preHandlerBacklog().held).toBe(0);
+  });
+
+  it("a handler that swaps ITSELF out mid-drain does not strand the next frame", async () => {
+    // The nested assignment's own drain is suppressed by the re-entry guard, so the
+    // outer loop has to be what finishes the job — otherwise the frame sits queued
+    // indefinitely, which is the original bug with extra steps.
+    deliver(msg("A"));
+
+    const seen: string[] = [];
+    const replacement = (e: unknown) =>
+      void seen.push(`second:${(e as { text: string }).text}`);
+    bridge.onPanelMessage = (e) => {
+      const text = (e as unknown as { text: string }).text;
+      seen.push(`first:${text}`);
+      if (text === "A") {
+        bridge.onPanelMessage = null;
+        deliver(msg("B")); // held: there is no handler at this instant
+        bridge.onPanelMessage = replacement as (ev: PanelEvent) => void;
+      }
+    };
+
+    expect(seen).toEqual(["first:A", "second:B"]);
+    expect(bridge.preHandlerBacklog().held).toBe(0);
+  });
+});
+
 describe("#1411 the queue is BOUNDED, and says so", () => {
   it("refuses past the cap rather than growing without limit", async () => {
     // Nothing guarantees a handler is ever installed; an unbounded buffer would be
@@ -134,6 +177,25 @@ describe("#1411 the queue is BOUNDED, and says so", () => {
     expect(seen[0]).toBe("hello");
     expect(seen).toHaveLength(200);
     expect(seen).not.toContain("m199"); // refused, because the cap was already reached
+  });
+
+  it("is bounded by BYTES too — a frame count is not a resource bound", async () => {
+    // codex review, P1: this is an INGRESS path that previously discarded, so
+    // retaining 200 arbitrarily large frames would be new memory exposure.
+    const big = "x".repeat(50_000);
+    for (let i = 0; i < 40; i++) deliver(msg(big)); // ~2 MB offered, well under 200 frames
+
+    const { held, dropped, bytes } = bridge.preHandlerBacklog();
+    expect(held).toBeLessThan(200); // refused on BYTES, before the count cap
+    expect(dropped).toBeGreaterThan(0);
+    expect(bytes).toBeLessThanOrEqual(1_000_000);
+  });
+
+  it("gives the bytes back as frames are delivered", async () => {
+    deliver(msg("x".repeat(1000)));
+    expect(bridge.preHandlerBacklog().bytes).toBeGreaterThan(900);
+    bridge.onPanelMessage = () => {};
+    expect(bridge.preHandlerBacklog().bytes).toBe(0);
   });
 
   it("clears the refusal count once it has been reported", async () => {

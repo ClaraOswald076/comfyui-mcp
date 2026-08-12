@@ -1700,7 +1700,7 @@ export class UiBridge {
 
   set onPanelMessage(fn: ((event: PanelEvent) => void) | null) {
     this.panelMessageHandler = fn;
-    if (fn) this.drainPreHandlerFrames(fn);
+    if (fn) this.drainPreHandlerFrames();
   }
 
   /** Frames that arrived before the handler existed, in ARRIVAL ORDER — so the
@@ -1712,56 +1712,92 @@ export class UiBridge {
   private draining = false;
 
   /**
-   * Bound on the pre-handler queue.
+   * Bounds on the pre-handler queue — COUNT and BYTES (codex review, P1).
    *
-   * The window is bounded by boot, so this is generous for the case it exists for.
-   * It is a cap rather than an unbounded buffer because nothing guarantees a
-   * handler is EVER installed — a bridge constructed without one (tests, a future
-   * embedder) would otherwise accumulate every frame for the life of the process.
+   * The window is bounded by boot, so these are generous for the case they exist
+   * for. They are bounds rather than an unbounded buffer because nothing
+   * guarantees a handler is EVER installed, and because this is an INGRESS path
+   * that previously discarded: retaining 200 arbitrarily large frames would be new
+   * memory exposure, quieter than the bug being fixed. A frame count alone is not
+   * a resource bound.
+   *
    * On overflow the EARLIEST frames are kept: the first of them is the `hello` that
    * identifies the tab, and a message replayed without it is worth less than the
    * message that was refused.
    */
   private static readonly MAX_PRE_HANDLER_FRAMES = 200;
+  private static readonly MAX_PRE_HANDLER_BYTES = 1_000_000;
+  private preHandlerBytes = 0;
+
+  /** Rough wire size of a held frame. Only ever computed inside the pre-handler
+   *  window, which both bounds cap, so this cannot become a hot-path cost. */
+  private static frameBytes(event: PanelEvent): number {
+    try {
+      return JSON.stringify(event)?.length ?? 0;
+    } catch {
+      return 0; // unserialisable: counted as free rather than refused
+    }
+  }
 
   /** Deliver a panel-initiated frame, or hold it until there is somewhere to
    *  deliver it (#1411). Never drops silently. */
   private deliverPanelEvent(event: PanelEvent): void {
     const fn = this.panelMessageHandler;
-    if (fn) {
+    // While a drain is in flight the queue is still the ordering authority: a
+    // frame that arrives BECAUSE an earlier one is being handled must land BEHIND
+    // whatever is still held (codex review, P1). Delivering it now would reorder
+    // A, B, C into A, C, B.
+    if (fn && !this.draining) {
       fn(event);
       return;
     }
-    if (this.preHandlerFrames.length >= UiBridge.MAX_PRE_HANDLER_FRAMES) {
+    const bytes = UiBridge.frameBytes(event);
+    if (
+      this.preHandlerFrames.length >= UiBridge.MAX_PRE_HANDLER_FRAMES ||
+      this.preHandlerBytes + bytes > UiBridge.MAX_PRE_HANDLER_BYTES
+    ) {
       this.preHandlerDropped += 1;
       if (this.preHandlerDropped === 1) {
         logger.warn(
-          `[ui-bridge] the panel-message handler is still not installed and ` +
-            `${UiBridge.MAX_PRE_HANDLER_FRAMES} frames are already held — further frames are ` +
-            `being REFUSED, not queued (#1411). Anything sent from here until the orchestrator ` +
-            `finishes starting is lost.`,
+          `[ui-bridge] the panel-message handler is still not installed and the held-frame ` +
+            `budget is full (${this.preHandlerFrames.length} frames, ${this.preHandlerBytes} B) ` +
+            `— further frames are being REFUSED, not queued (#1411). Anything sent from here ` +
+            `until the orchestrator finishes starting is lost.`,
         );
       }
       return;
     }
+    this.preHandlerBytes += bytes;
     this.preHandlerFrames.push(event);
   }
 
-  /** Hand over everything held, in order, then report anything that was refused. */
-  private drainPreHandlerFrames(fn: (event: PanelEvent) => void): void {
+  /**
+   * Hand over everything held, in order, then report anything that was refused.
+   *
+   * A WORK LOOP, not a snapshot of the queue (codex review, P1). Two things can
+   * happen while a frame is being handled, and both are handled by re-reading the
+   * queue and the handler on every iteration rather than by capturing them once:
+   * a handler can cause another frame to arrive (it must go to the BACK), and a
+   * handler can swap itself out and back (its own drain is suppressed by
+   * `draining`, so this loop has to be the thing that finishes the job).
+   */
+  private drainPreHandlerFrames(): void {
     if (this.draining) return; // a handler assigned FROM a handler must not re-enter
-    const held = this.preHandlerFrames;
-    if (held.length === 0 && this.preHandlerDropped === 0) return;
-    this.preHandlerFrames = [];
+    if (this.preHandlerFrames.length === 0 && this.preHandlerDropped === 0) return;
+    const held = this.preHandlerFrames.length;
     this.draining = true;
+    let delivered = 0;
     try {
-      logger.info(
-        `[ui-bridge] delivering ${held.length} panel frame(s) that arrived before the handler ` +
-          `was installed (#1411)`,
-      );
-      for (const event of held) {
+      for (;;) {
+        const handler = this.panelMessageHandler;
+        // Cleared mid-drain: keep the rest HELD rather than dropping them — there
+        // is nowhere to deliver them, which is the situation this queue exists for.
+        if (!handler || this.preHandlerFrames.length === 0) break;
+        const event = this.preHandlerFrames.shift() as PanelEvent;
+        this.preHandlerBytes = Math.max(0, this.preHandlerBytes - UiBridge.frameBytes(event));
+        delivered += 1;
         try {
-          fn(event);
+          handler(event);
         } catch (err) {
           // One bad frame must not strand the rest — including the user's message.
           logger.warn(
@@ -1773,6 +1809,12 @@ export class UiBridge {
     } finally {
       this.draining = false;
     }
+    if (delivered > 0) {
+      logger.info(
+        `[ui-bridge] delivered ${delivered} of ${held} panel frame(s) that arrived before the ` +
+          `handler was installed (#1411)`,
+      );
+    }
     if (this.preHandlerDropped > 0) {
       logger.warn(
         `[ui-bridge] ${this.preHandlerDropped} panel frame(s) were REFUSED before the handler ` +
@@ -1783,8 +1825,12 @@ export class UiBridge {
   }
 
   /** Test seam: how many frames are held right now, and how many were refused. */
-  preHandlerBacklog(): { held: number; dropped: number } {
-    return { held: this.preHandlerFrames.length, dropped: this.preHandlerDropped };
+  preHandlerBacklog(): { held: number; dropped: number; bytes: number } {
+    return {
+      held: this.preHandlerFrames.length,
+      dropped: this.preHandlerDropped,
+      bytes: this.preHandlerBytes,
+    };
   }
 
   constructor(port = DEFAULT_BRIDGE_PORT, token: string | null = null, host = "127.0.0.1") {
