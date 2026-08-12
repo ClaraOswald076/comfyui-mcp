@@ -52,6 +52,7 @@ import type { UiBridge } from "../services/ui-bridge.js";
 import { conversationOfScopeAddress, isScopeAddress, shortTabId } from "../services/session-scope.js";
 import type { ScopeRepinOutcome } from "./turn-origins.js";
 import { NODE_ID_MESSAGE, NODE_ID_PATTERN, normalizeNodeId } from "./node-id.js";
+import { NO_ORIGIN_REMEDY } from "./fence-refusal.js";
 
 /** #884 — journal TICKETS (run completions #468, ask answers #486) must be
  *  keyed by the REAL tab a run/card was routed to: the panel reports back under
@@ -4090,11 +4091,12 @@ function describeFenceRebind(
             // the tab" — the reporter did that repeatedly, including closing and
             // reopening it, and it could never have worked.
             r.refusalReason && /no server-observed Origin/i.test(r.refusalReason)
-              ? `Refreshing the tab will NOT help — this one is structural. Reconnect over a ` +
-                `direct/loopback or cloudflared link rather than the relay backend (unset ` +
-                `COMFYUI_MCP_TUNNEL_BACKEND=relay), or continue with reads and non-graph tools, ` +
-                `which do not need the fence. Please also report it: the relay protocol has to ` +
-                `forward the browser's handshake Origin for this path to work at all.`
+              ? // panel#1065 — SHARED with fence-refusal.ts, because this copy went stale.
+                // It still described the world before #1240 gave the relay path its
+                // origin: it told the user to abandon the relay backend and to report
+                // a protocol gap that had already been closed. Someone did exactly
+                // that, on a version that had the fix.
+                NO_ORIGIN_REMEDY
               : RELOAD_TAB_REMEDY
           }`,
       };
