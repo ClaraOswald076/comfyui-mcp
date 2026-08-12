@@ -20,8 +20,22 @@ const GB = 1024 ** 3;
 // missing drive letter cannot be measured at all. A mock would only assert my model of
 // those semantics, which is the thing most likely to be wrong.
 //
-// `MISSING_VOLUME` is a drive letter with no volume mounted; verified unmeasurable.
-const MISSING_VOLUME = "M:/models/diffusion_models";
+// An unmeasurable location has to be DISCOVERED, not assumed. The first cut hardcoded
+// "M:/" and CI failed on a Windows runner that actually has an M: drive — it returned
+// 92 GB and the test demanded null. Same class as pinning a platform in a process test:
+// a machine-specific fact baked into an assertion.
+//
+// So probe for a drive letter with nothing mounted, and if the machine has all of them
+// (or we are not on Windows, where a bare letter means nothing), skip rather than
+// assert something untrue. `null` here means "no unmeasurable path available".
+async function findUnmeasurablePath(): Promise<string | null> {
+  if (process.platform !== "win32") return null;
+  for (const letter of ["Z", "Y", "X", "W", "V", "Q"]) {
+    const candidate = `${letter}:/models/diffusion_models`;
+    if ((await freeBytesFor(candidate)) === null) return candidate;
+  }
+  return null;
+}
 
 describe("#1477 freeBytesFor", () => {
   it("reports free bytes for a real volume", async () => {
@@ -40,7 +54,9 @@ describe("#1477 freeBytesFor", () => {
   });
 
   it("returns null for a volume that cannot be measured", async () => {
-    expect(await freeBytesFor(MISSING_VOLUME)).toBeNull();
+    const missing = await findUnmeasurablePath();
+    if (missing === null) return; // every drive letter is mounted, or not Windows
+    expect(await freeBytesFor(missing)).toBeNull();
   });
 });
 
@@ -61,8 +77,10 @@ describe("#1477 checkCacheVolumeSpace refuses only when it is sure", () => {
   it("FAILS SOFT when free space cannot be read", async () => {
     // An unmeasurable volume must not become an unusable one: this exists to stop a
     // known-bad write, never to invent a new way for a good one to be blocked.
+    const missing = await findUnmeasurablePath();
+    if (missing === null) return;
     expect(
-      await checkCacheVolumeSpace({ needBytes: 1e15, cacheDir: MISSING_VOLUME }),
+      await checkCacheVolumeSpace({ needBytes: 1e15, cacheDir: missing }),
     ).toBeNull();
   });
 
