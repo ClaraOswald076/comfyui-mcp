@@ -44,8 +44,14 @@ function redactCredentials(text: string): string {
     text
       // scheme://user:secret@host — the git-remote case, and the one most likely here.
       .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1***:***@")
-      // Authorization-style bearer/token headers echoed into a traceback.
-      .replace(/\b(bearer|token|apikey|api_key)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 ***")
+      // Authorization-style headers echoed into a traceback.
+      //
+      // `basic` is here for a reason found by review: it carries base64 of
+      // `user:password`, so a leak here is BOTH halves of a credential at once — the
+      // worst single case in this function — and it was the one scheme the original
+      // alternation missed. It is also why the length floor is lower for it: a short
+      // base64 blob is still a whole password.
+      .replace(/\b(bearer|basic|token|apikey|api_key)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 ***")
       // token=… / api_key=… / access_token=… in a query string or a repr.
       .replace(/\b([a-z_]*(?:token|secret|password|passwd|api[_-]?key))(["']?\s*[=:]\s*["']?)[A-Za-z0-9._~+/=-]{6,}/gi, "$1$2***")
   );
@@ -93,7 +99,17 @@ export function managerBodyExcerpt(
   // No empty-string guard: an empty `flat` already falls through the ternary and is
   // returned as "". A mutation deleting one proved it changed nothing, and a line
   // that reads as a correctness gate while being dead is worse than its absence.
-  return flat.length > limit ? `${flat.slice(0, limit)}… [truncated]` : flat;
+  if (flat.length <= limit) return flat;
+  // `limit` counts UTF-16 code units, so the cut can land BETWEEN the two halves of a
+  // surrogate pair (an emoji, or CJK extension-B). The orphaned half is not a
+  // character: it serialises to U+FFFD, and a body that was merely long ends up
+  // looking corrupted — which reads as "the tool mangled it" rather than "it was
+  // truncated". Drop a trailing lone high surrogate so the excerpt always ends on a
+  // whole code point. Costs at most one character of an already-bounded excerpt.
+  let cut = flat.slice(0, limit);
+  const last = cut.charCodeAt(cut.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, -1);
+  return `${cut}… [truncated]`;
 }
 
 /** The clause appended to a Manager failure message. Empty when the body is. */

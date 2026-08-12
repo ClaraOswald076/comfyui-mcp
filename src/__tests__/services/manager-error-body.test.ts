@@ -170,6 +170,39 @@ describe("#1397 a credential never reaches the message", () => {
     expect(out).not.toMatch(/ghp_ZZZ/);
   });
 
+  it("redacts an Authorization: Basic header - both halves of a credential at once", () => {
+    // Found by review: `basic` was the one scheme the alternation missed. It matters
+    // MORE than the others, not less - the base64 blob decodes to `user:password`, so
+    // leaking it leaks the account itself, not a token that can be rotated.
+    const secret = "QWxhZGRpbjpvcGVuc2VzYW1l";
+    const out = managerBodyExcerpt(
+      "HTTPError: 401 Client Error for url http://127.0.0.1:8188/api/manager/queue/install " +
+        "(sent Authorization: Basic " + secret + ")",
+    );
+    expect(out).not.toContain(secret);
+    expect(out).toMatch(/Basic \*\*\*/);
+    // The diagnosis still survives - redaction must not cost the reason.
+    expect(out).toMatch(/401/);
+  });
+
+  it("truncation never ends on half a surrogate pair", () => {
+    // `limit` counts UTF-16 code units, so a cut can land BETWEEN the halves of an
+    // emoji. The orphan serialises to U+FFFD, and a body that was merely long then
+    // reads as corrupted - "the tool mangled it" rather than "it was truncated".
+    //
+    // Cut lands exactly mid-pair: (limit - 1) filler chars, then a 2-unit emoji.
+    const body = "a".repeat(MANAGER_BODY_EXCERPT_LIMIT - 1) + "\u{1F600}tail";
+    const out = managerBodyExcerpt(body);
+    expect(out).toMatch(/\[truncated\]$/);
+    expect(out).not.toContain("\uFFFD");
+    // No lone surrogate survives: iterating by code point, any leading surrogate must
+    // come paired (a whole pair iterates as a single 2-unit string).
+    for (const ch of out) {
+      const c = ch.charCodeAt(0);
+      if (c >= 0xd800 && c <= 0xdbff) expect(ch.length).toBe(2);
+    }
+  });
+
   it("does not over-redact an ordinary exception", () => {
     // Over-redaction makes the excerpt useless, and this exists to make an opaque
     // failure readable. A normal traceback must come through intact.
