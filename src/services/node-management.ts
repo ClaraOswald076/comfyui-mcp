@@ -30,6 +30,7 @@ import {
 import { withPanelPinGuard } from "./panel-pin-guard.js";
 import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import { managerBodyClause } from "./manager-error-body.js";
 
 // ---------------------------------------------------------------------------
 // Custom-node management — ports `comfy-cli node install|update|reinstall|fix|
@@ -273,7 +274,13 @@ async function managerFetch<T>(
     const text = await res.text().catch(() => "");
     throw new NodeManagementError(
       `ComfyUI-Manager API ${res.status} ${res.statusText} for ${path}` +
-        explainManagerForbidden(res.status, text),
+        explainManagerForbidden(res.status, text) +
+        // #1397 — SHOW THE BODY. It was already being captured into `details` below
+        // and only surfaced for 403, so a task-queue failure reported a bare status
+        // line while the serialized exception naming the cause sat one layer down.
+        // Bounded and truncation-marked; see manager-error-body.ts for why a
+        // passthrough is not an option here.
+        managerBodyClause(text),
       { url, status: res.status, body: text },
     );
   }
