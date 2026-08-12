@@ -88,4 +88,16 @@ describe("#1420 the SIBLING branch gives the same route advice", () => {
     expect(text).toContain("If this session has the ComfyUI sidebar panel");
     expect(text).toContain("without a panel there is no equivalent read");
   });
+
+  it("the RECONNECT advice is conditional too — the third instance, found one per round", async () => {
+    // Rounds 2, 3 and 4 each found one more unconditional tray instruction. A regex
+    // "no unguarded mention anywhere" property was written to catch the next one and
+    // then REMOVED: the first match it finds is the `tray_id` in an unrelated
+    // sentence, so it passed against a reverted fix. It is asserted per sentence
+    // instead, which is less elegant and actually fails when the guard is dropped.
+    const res = await downloadTool()({ action: "status", id: "0123456789abcdef" });
+    const text = res.content[0].text;
+    expect(text).toContain("across a reconnect, confirm first — via the tray if this session has the panel");
+    expect(text).not.toContain("across a reconnect, confirm via the tray first");
+  });
 });
