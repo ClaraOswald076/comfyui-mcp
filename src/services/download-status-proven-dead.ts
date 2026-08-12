@@ -37,8 +37,11 @@
  * inconclusive for a writer in another container or on another host, whose pid means
  * nothing locally. Review raised exactly that, and the record carries no host to check
  * it against — so the verdict is scoped to what was measured, and the recovery routes
- * through `cancel`, which re-probes and refuses when it cannot confirm. A wrong verdict
- * then costs a refused cancel, not a duplicated multi-gigabyte download.
+ * through `cancel` first, and says plainly that cancel shares the same blind spot: it
+ * re-runs the SAME local probe, so it cannot see a foreign writer either. Review had to
+ * point that out twice before I stopped trying to promise a safe path and simply named
+ * the limit. The one outcome worth avoiding is a duplicate transfer into the same
+ * destination, so that is what the message tells the reader to rule out.
  *
  * Deliberately states the evidence rather than just the verdict: a caller who was told
  * five seconds ago not to touch this download needs to know why the answer changed.
@@ -61,9 +64,11 @@ export function provenDeadStatusNote(opts: {
       `be running — only the local record's owner is proven gone. Check ` +
       `list_local_models to see whether the file landed.`
     : ` No local process is writing this file. Close the record with download_model ` +
-      `action:"cancel" (this id and tray_id) before re-issuing — cancel re-probes and ` +
-      `refuses if it cannot confirm, so it is safe either way, and it is the step that ` +
-      `makes a re-issue safe rather than a possible duplicate.`;
+      `action:"cancel" (this id and tray_id) before re-issuing. Note that cancel uses ` +
+      `this SAME local probe, so it cannot see a writer on another host or container ` +
+      `either — if this download was started somewhere other than here, confirm it is ` +
+      `really stopped at its source before re-issuing, because a duplicate transfer ` +
+      `into the same destination is the one outcome worth avoiding.`;
   // The OPENING verdict has to be route-aware too. Saying "this transfer is NOT
   // running" and then admitting the server-side fetch may still be live is the same
   // self-contradiction this issue is about — review caught me writing it into the fix.
@@ -74,8 +79,7 @@ export function provenDeadStatusNote(opts: {
     : `\n    NOTE: this transfer is NOT running on this machine. No process with its ` +
       `recorded pid exists here, so it died with its session (#1479). That evidence is ` +
       `LOCAL: a writer owned by another host or container would look the same from ` +
-      `here, which is why the recovery below goes through cancel rather than straight ` +
-      `to a re-issue.`;
+      `here, and cancel uses the same probe, so neither can rule that out.`;
   return `${head}${stale}${tail}`;
 }
 

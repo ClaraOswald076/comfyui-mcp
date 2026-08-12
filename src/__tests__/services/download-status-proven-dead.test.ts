@@ -93,6 +93,12 @@ describe("#1479 the proven-dead note", () => {
     expect(note()).toMatch(/NOT running on this machine/);
     expect(note()).toMatch(/would look the same from\s+here/);
     expect(note()).toMatch(/before re-issuing/);
+    // Round 4: cancel runs the SAME local probe, so claiming it is safe either way was
+    // false for a foreign-host writer. The message names the shared blind spot instead
+    // of promising around it.
+    expect(note()).toMatch(/cancel uses/);
+    expect(note()).toMatch(/SAME local probe/);
+    expect(note()).not.toMatch(/safe either way/);
     expect(note()).not.toMatch(/is safe to re-issue the download/);
   });
 
