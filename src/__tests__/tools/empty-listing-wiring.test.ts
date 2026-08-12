@@ -79,4 +79,13 @@ describe("#1420 the SIBLING branch gives the same route advice", () => {
     const res = await downloadTool()({ action: "status", id: "0123456789abcdef" });
     expect(res.content[0].text).toContain("in-flight LOCAL download adopts it");
   });
+
+  it("offers the tray conditionally, as the empty branch does (codex round 3)", async () => {
+    // A headless MCP caller has no tray at all; one branch conditioning it while the
+    // other did not is the same disagreement in a quieter form.
+    const res = await downloadTool()({ action: "status", id: "0123456789abcdef" });
+    const text = res.content[0].text;
+    expect(text).toContain("If this session has the ComfyUI sidebar panel");
+    expect(text).toContain("without a panel there is no equivalent read");
+  });
 });
