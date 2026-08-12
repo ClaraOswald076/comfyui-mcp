@@ -111,27 +111,38 @@ describe("#890 what the caveat says", () => {
     expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/does not report which source/);
   });
 
-  it("names an INDEPENDENT reader that can settle it, and both outcomes", () => {
-    // A caveat with no next step is just doubt. search_custom_nodes queries
-    // api.comfy.org directly rather than through Manager, so it is real evidence.
-    // The ACTION too: search_custom_nodes is action-parameterised and refuses without
-    // one, so naming the tool alone would cost a round trip to an error.
-    // BOTH parameters. The tool is action-parameterised AND `query` is required for
-    // the search action, so a half-named call costs a round trip to an error message
-    // inside a caveat whose whole job is to hand over a check that works.
+  it("names an independent check WITHOUT overclaiming what it proves", () => {
+    // A caveat with no next step is just doubt, so it names one: search_custom_nodes
+    // queries api.comfy.org directly rather than through Manager.
     expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/search_custom_nodes action:"search"/);
-    expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/query:"<pack name>"/);
+    expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/query:"/);
     expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/api\.comfy\.org directly/);
-    expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/found there means this[\s\S]*behind/i);
-    expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/absent from both/i);
-    // And what to DO about the one outcome that is actionable.
-    expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/update ComfyUI-Manager/);
+
+    // codex round 7, P1 — and the subtler version of the trap the reporter named.
+    // `unresolved` holds node CLASS TYPES, not pack ids, and the registry indexes
+    // PACKS. An earlier version told the reader to look the entries up and treat a hit
+    // as proof the catalogue was behind; neither half held. So the caveat says what the
+    // entries ARE, and offers the hit as a reason to update rather than a verdict.
+    expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/CLASS TYPES, not[\s\S]*pack ids/);
+    expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/SUGGESTS the catalogue is behind/);
+    expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/does not prove it/);
+    expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/missing for indexing reasons/);
+    // The other direction is not evidence either, and saying it was would be the same
+    // overclaim pointed backwards.
+    expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/finding nothing settles nothing/);
+    // Still actionable: the one thing worth doing is named.
+    expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/updating\s+ComfyUI-Manager/);
   });
 
   it("stays short enough to be read", () => {
-    // It attaches to every miss, including the many that are ordinary. A paragraph
-    // here becomes noise that gets skipped, and then it protects nobody.
-    expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT.length).toBeLessThan(700);
+    // It attaches to every miss, including the many that are ordinary, so a paragraph
+    // here becomes noise that gets skipped and then it protects nobody.
+    //
+    // Raised from 700 after codex round 7: saying what the entries ARE (class types,
+    // not pack ids) and that a registry hit SUGGESTS rather than proves cost about 150
+    // characters. A shorter caveat that overclaims is worse than a longer one that
+    // does not — brevity is a means here, not the point.
+    expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT.length).toBeLessThan(950);
   });
 });
 

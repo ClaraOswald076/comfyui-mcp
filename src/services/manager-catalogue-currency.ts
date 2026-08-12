@@ -29,13 +29,21 @@
  * only what is true of every Manager-served catalogue — its currency is unverifiable
  * from here — and then hands over a check that can settle it.
  *
- * ## The discriminator
+ * ## The nearest thing to a discriminator
  *
- * `search_custom_nodes` queries `api.comfy.org` DIRECTLY rather than through Manager, so
- * it is an independent source:
+ * `search_custom_nodes` queries `api.comfy.org` DIRECTLY rather than through Manager,
+ * so it is an INDEPENDENT source. It is not a clean two-way test, and an earlier
+ * version of this said it was (codex round 7):
  *
- *   - found there, absent here  → this Manager catalogue is behind
- *   - absent from both          → genuinely unknown to the registry
+ *   - `unresolved` holds node CLASS TYPES, not pack ids, and the registry indexes
+ *     PACKS. So the entries cannot simply be looked up; the caller searches the class
+ *     type or the pack they believe provides it.
+ *   - A registry hit for a pack this catalogue omits SUGGESTS the catalogue is behind.
+ *     It does not prove it — a Manager mapping can be absent for indexing reasons that
+ *     have nothing to do with age — so it is offered as a reason to update, not a
+ *     verdict.
+ *   - Finding nothing settles nothing in either direction, and saying otherwise would
+ *     be the same overclaim pointed the other way.
  *
  * Named rather than performed: this rides on a read that already has its answer, and
  * adding a network call to it would make every dependency scan slower for a case that
@@ -44,10 +52,9 @@
  * Spelled out with BOTH `action` and `query` (codex review). The tool is
  * action-parameterised and `query` is required for the search action, so a half-named
  * call costs a round trip to an error — inside a caveat whose entire job is to hand
- * over a check that works. (The review reported that this tool has no `action`
- * parameter at all; measured against `registerRegistrySearchTools`, it does — a
- * required `z.enum(["search","details"])`. The finding was wrong on that premise and
- * right that the call was under-specified.)
+ * over a check that works. (A review round reported that this tool has no `action`
+ * parameter at all; measured twice against origin/main, it does — a required
+ * `z.enum(["search","details"])`, with exactly one registration of the name.)
  */
 
 /** The one sentence that must accompany an `unresolved` list from a Manager catalogue
@@ -58,11 +65,13 @@ export const MANAGER_CATALOGUE_CURRENCY_CAVEAT =
   `NOT proof these do not exist. This is the ComfyUI-Manager catalogue, and when Manager ` +
   `cannot reach the registry it serves a copy bundled in its own package — populated, ` +
   `HTTP 200, and indistinguishable from a current one; it does not report which source ` +
-  `answered, so nothing here can date it (panel#890). To settle it, look one of these up ` +
-  `with search_custom_nodes action:"search" query:"<pack name>", which queries api.comfy.org ` +
-  `directly: found there means this ` +
-  `Manager catalogue is behind (update ComfyUI-Manager on the ComfyUI host and re-scan), ` +
-  `absent from both means it is genuinely unknown to the registry.`;
+  `answered, so nothing here can date it (panel#890). These are node CLASS TYPES, not ` +
+  `pack ids, and the registry indexes PACKS — so search the class type, or the pack you ` +
+  `believe provides it, with search_custom_nodes action:"search" query:"<name>", which ` +
+  `queries api.comfy.org directly rather than through Manager. A pack found there that ` +
+  `this catalogue does not list SUGGESTS the catalogue is behind and is worth updating ` +
+  `ComfyUI-Manager on the ComfyUI host for — it does not prove it, because a mapping can ` +
+  `also be missing for indexing reasons, and finding nothing settles nothing either way.`;
 
 /**
  * Should the currency caveat be attached?
