@@ -129,6 +129,10 @@ export interface DownloadJob {
   /** A persisted in-flight record missed its owner heartbeat. It stays visible
    *  because this is not proof the physical transfer stopped (#761). */
   staleInflight?: boolean;
+  /** The writer's process is PROVEN gone — its pid answers ESRCH (#1479). Only ever
+   *  `true` or absent: "cannot tell" must never render as death, which is the whole
+   *  reason `staleInflight` alone was the wrong branch for the status note. */
+  writerProvenGone?: boolean;
   /** Age of the missing persisted heartbeat, used only for status diagnostics. */
   staleForMs?: number;
   /** This "cancelled" record was written by a LATER session reclaiming a stale
@@ -854,6 +858,11 @@ function jobFromPersisted(rec: PersistedDownloadJob): DownloadJob {
     verified_root: rec.verified_root,
     staleInflight: rec.staleInflight,
     staleForMs: rec.staleForMs,
+    // #1479 — the cancel path already probed this and status never asked, so the two
+    // actions answered the same question with opposite verdicts. Carried as `true` or
+    // absent: `writerProcessGone` returns undefined when it cannot tell, and that must
+    // keep the cautious note rather than becoming a death claim.
+    writerProvenGone: writerProcessGone(rec) === true ? true : undefined,
     reclaimedDead: rec.reclaimed_dead,
     interruptedByRestart: rec.interrupted_by_restart,
   };

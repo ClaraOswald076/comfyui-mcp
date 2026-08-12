@@ -43,6 +43,10 @@ import {
 } from "./extra-paths.js";
 import { resolveMissingModelsAction } from "./missing-models.js";
 import { getEmbeddingsAction } from "./memory-management.js";
+import {
+  inflightNoteKind,
+  provenDeadStatusNote,
+} from "../services/download-status-proven-dead.js";
 
 /**
  * The fourteen model tools collapsed into two action-parameterized tools
@@ -1101,10 +1105,28 @@ async function statusAction(args: {
                     // destination file preserved under a .bak path because it couldn't be
                     // restored) — surface it so the user can recover, not mask it.
                     (j.error ? `\n    IMPORTANT: ${j.error}` : "")
-                  : `\n    still streaming — started ${Math.round((Date.now() - j.started_at) / 1000)}s ago`;
+                  : // #1479 — do not say "still streaming" about a transfer whose writer is
+                    // PROVEN gone. The note below explains it, but the STATUS LINE is what a
+                    // reader takes at a glance, and leaving it would have this reply
+                    // contradict itself in consecutive sentences.
+                    j.writerProvenGone === true
+                    ? `\n    NOT running — the owning process is gone; started ${Math.round((Date.now() - j.started_at) / 1000)}s ago`
+                    : `\n    still streaming — started ${Math.round((Date.now() - j.started_at) / 1000)}s ago`;
           const route = downloadRoute(j);
+          // #1479 — a PROVEN-dead writer must not be reported as "still streaming".
+          // The pid probe that settles it was already being run on the cancel path;
+          // status branched on heartbeat AGE alone and so told callers not to act on a
+          // transfer that had died with its session. A merely-stale record keeps the
+          // cautious wording, because a missed heartbeat still proves nothing (#761).
+          const noteKind = inflightNoteKind({
+            status: j.status,
+            staleInflight: j.staleInflight,
+            provenGone: j.writerProvenGone,
+          });
           const staleNote =
-            j.status === "downloading" && j.staleInflight
+            noteKind === "proven-dead"
+              ? provenDeadStatusNote({ staleForMs: j.staleForMs, viaManager: j.viaManager })
+              : noteKind === "stale"
               ? `\n    NOTE: heartbeat stale for ${Math.round((j.staleForMs ?? 0) / 1000)}s. The owning session may have reconnected, and the transfer may still be running. Do NOT re-issue download_model action:"download" while this warning remains: ${stillWritingClause(route)}. To recover, call download_model \`action:"cancel"\` with this id and tray_id — it closes the stale record once the writer is PROVEN gone (its process no longer exists) and refuses while that cannot be proven. ONCE THAT CANCEL SUCCEEDS: ${afterCancelAdvice(route)} Do not report this download as failed or missing.`
               : "";
           // Surface a declined resume so the agent/user knows a pre-existing
