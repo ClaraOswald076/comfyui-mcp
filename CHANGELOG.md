@@ -197,6 +197,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.8] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- a panel message that arrives before boot finishes is no longer dropped (#1439)
+
+
 ## [0.51.7] - 2026-08-11
 
 ### MCP
