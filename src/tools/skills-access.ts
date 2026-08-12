@@ -737,6 +737,10 @@ async function extractDepsAction(input: string | Record<string, unknown>): Promi
     // MAPPINGS endpoint, whose failure was previously caught, logged at warn and
     // discarded -- we held the exception and asserted absence anyway.
     if (result.mappings_unavailable) lines.push(result.mappings_unavailable, "");
+    // panel#890 — rendered at every site the stronger caveats are, or `unresolved`
+    // still reads as "does not exist" wherever this one was forgotten.
+    if (result.catalogue_currency_unverified)
+      lines.push(result.catalogue_currency_unverified, "");
     lines.push(
       `### Unresolved node types (${result.unresolved.length})`,
       "These class_types are neither installed nor known to ComfyUI-Manager:",
@@ -791,6 +795,8 @@ async function installDepsAction(input: string | Record<string, unknown>): Promi
     // #1136 — say it BEFORE the list. A reader who has already read
     // "not found in ComfyUI-Manager" has drawn the conclusion.
     if (result.catalogue_unavailable) lines.push(result.catalogue_unavailable, "");
+    if (result.catalogue_currency_unverified)
+      lines.push(result.catalogue_currency_unverified, "");
     lines.push(
       `### Could not resolve (${result.unresolved.length})`,
       "Not found in ComfyUI-Manager — install manually:",

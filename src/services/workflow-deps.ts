@@ -12,6 +12,10 @@ import {
   type ManagerApi,
 } from "./node-management.js";
 import { targetsPanelPackExactly, withPanelPinGuard } from "./panel-pin-guard.js";
+import {
+  MANAGER_CATALOGUE_CURRENCY_CAVEAT,
+  managerCatalogueCurrencyUnverified,
+} from "./manager-catalogue-currency.js";
 
 /**
  * Workflow dependency analysis & installation.
@@ -89,6 +93,15 @@ export interface ExtractDepsResult {
    * here we caught a real exception and logged it, then asserted absence anyway.
    */
   mappings_unavailable?: string;
+  /**
+   * panel#890 — set when `unresolved` came from a Manager catalogue whose CURRENCY
+   * could not be established, which is every populated one: Manager serves a copy
+   * bundled in its own package when the registry is unreachable, and does not report
+   * which source answered. Weaker than the two fields above — they report an OBSERVED
+   * failure; this reports the absence of evidence — so it is set only when neither of
+   * those is.
+   */
+  catalogue_currency_unverified?: string;
 }
 
 export interface InstallDepsResult {
@@ -107,6 +120,8 @@ export interface InstallDepsResult {
    * alongside, "not found in ComfyUI-Manager".
    */
   catalogue_unavailable?: string;
+  /** panel#890 — see the same field on WorkflowDepsAnalysis. */
+  catalogue_currency_unverified?: string;
 }
 
 export interface ManagerQueueStatus {
@@ -464,6 +479,15 @@ export async function extractWorkflowDependencies(
     ...(mappingsUnavailable && unresolved.length > 0
       ? { mappings_unavailable: mappingsUnavailable }
       : {}),
+    // panel#890 — the third state. The two caveats above fire on an OBSERVED failure
+    // (empty list, caught exception); a catalogue served from Manager's bundled copy
+    // presents as success, so neither fires and `unresolved` used to go out bare.
+    ...(managerCatalogueCurrencyUnverified({
+      unresolvedCount: unresolved.length,
+      mappingsUnavailable,
+    })
+      ? { catalogue_currency_unverified: MANAGER_CATALOGUE_CURRENCY_CAVEAT }
+      : {}),
   };
 }
 
@@ -622,6 +646,12 @@ export async function installWorkflowDependenciesForAnalysis(
             `blocked or filtered network there looks exactly like an empty result here. Refresh the ` +
             `Manager list on that host before concluding anything from "not found".`,
         }
+      : {}),
+    ...(managerCatalogueCurrencyUnverified({
+      unresolvedCount: unresolved.length,
+      catalogueUnavailable: catalogueEmpty ? "empty" : undefined,
+    })
+      ? { catalogue_currency_unverified: MANAGER_CATALOGUE_CURRENCY_CAVEAT }
       : {}),
     ...(panelNotes.length ? { panel_notes: panelNotes } : {}),
   };
