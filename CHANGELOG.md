@@ -197,6 +197,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.13] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- compare the panel's tool vocabulary at the handshake, not at call time (#1455)
+
+
 ## [0.51.12] - 2026-08-11
 
 ### MCP
