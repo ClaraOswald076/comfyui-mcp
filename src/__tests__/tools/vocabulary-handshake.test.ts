@@ -154,7 +154,10 @@ describe("#236 the handshake is wired, not just implemented", () => {
     const start = ORCH.indexOf("// #236 — THE VOCABULARY HANDSHAKE");
     expect(start).toBeGreaterThan(-1);
     const block = ORCH.slice(start, start + 2400);
-    expect(block).toMatch(/if \(skew\.status === "mismatch"\)/);
+    // Matched as a PROPERTY: the gate tests for "mismatch" exactly. Pinning the whole
+    // `if (...)` broke when a dedup clause was added to the same condition — a real
+    // refactor, not a behaviour change.
+    expect(block).toMatch(/skew\.status === "mismatch"/);
     expect(block).not.toMatch(/status !== "match"/);
   });
 
@@ -186,45 +189,65 @@ describe("#236 the runtime hash agrees with the artefact the panel vendors", () 
   });
 });
 
-describe("#236 the dedup map is bounded", () => {
+describe("#236 the report is deduped by VOCABULARY, not by tab", () => {
   const ORCH = readFileSync(join(HERE, "../../orchestrator/index.ts"), "utf8");
 
-  it("evicts rather than growing for every tab id ever seen (codex review, P2)", () => {
-    // Tab ids are minted continually — every tmp: connection and every workflow
-    // switch produces a new one — so an uncapped module-level Map keyed by tab id
-    // retains an entry per tab forever, including long-disconnected ones.
-    expect(ORCH).toMatch(/MAX_LOGGED_VOCABULARY_SKEW = \d+/);
-    const start = ORCH.indexOf("loggedVocabularySkew.set(panelTab");
-    expect(start).toBeGreaterThan(-1);
-    const before = ORCH.slice(Math.max(0, start - 600), start);
-    expect(before).toMatch(/loggedVocabularySkew\.size >= MAX_LOGGED_VOCABULARY_SKEW/);
-    expect(before).toMatch(/loggedVocabularySkew\.delete\(oldest\)/);
+  it("keys on the hash so a reused wf: id cannot suppress a real mismatch", () => {
+    // Codex round 2, P2: with a per-tab key, a tab that warned and then closed left an
+    // entry that silenced the NEXT tab opening the same workflow — wf: ids are reused.
+    expect(ORCH).toMatch(/const loggedVocabularySkew = new Set<string>\(\);/);
+    expect(ORCH).toMatch(/loggedVocabularySkew\.has\(advertised!\)/);
+    // No tab id may be involved in the dedup decision at all.
+    expect(ORCH).not.toMatch(/loggedVocabularySkew\.(get|set)\(panelTab/);
+    expect(ORCH).not.toMatch(/loggedVocabularySkew\.delete\(panelTab\)/);
   });
 
-  it("eviction can only DUPLICATE a warning, never suppress one", () => {
-    // The safety argument, asserted so it cannot be quietly inverted into an
-    // eviction that drops mismatches instead of dedup entries.
-    const map = new Map<string, string>();
+  it("is bounded, and eviction can only DUPLICATE a report, never suppress one", () => {
+    expect(ORCH).toMatch(/MAX_LOGGED_VOCABULARY_SKEW = \d+/);
+    const at = ORCH.indexOf("loggedVocabularySkew.add(advertised!)");
+    expect(at).toBeGreaterThan(-1);
+    const before = ORCH.slice(Math.max(0, at - 600), at);
+    expect(before).toMatch(/loggedVocabularySkew\.size >= MAX_LOGGED_VOCABULARY_SKEW/);
+
+    // The safety argument, executed rather than asserted about, so it cannot be
+    // quietly inverted into an eviction that drops mismatches instead of entries.
+    const seen = new Set<string>();
     const CAP = 3;
-    const warned: string[] = [];
-    const seen = (tab: string, hash: string) => {
-      if (map.get(tab) === hash) return;
-      while (map.size >= CAP) {
-        const oldest = map.keys().next().value;
+    const reported: string[] = [];
+    const hello = (hash: string) => {
+      if (seen.has(hash)) return;
+      while (seen.size >= CAP) {
+        const oldest = seen.values().next().value;
         if (oldest === undefined) break;
-        map.delete(oldest);
+        seen.delete(oldest);
       }
-      map.set(tab, hash);
-      warned.push(tab);
+      seen.add(hash);
+      reported.push(hash);
     };
-    seen("a", "h1");
-    seen("a", "h1"); // deduped
-    expect(warned).toEqual(["a"]);
-    seen("b", "h1");
-    seen("c", "h1");
-    seen("d", "h1"); // evicts "a"
-    seen("a", "h1"); // "a" warns AGAIN — a duplicate, which is the safe direction
-    expect(warned).toEqual(["a", "b", "c", "d", "a"]);
-    expect(map.size).toBeLessThanOrEqual(CAP);
+    hello("h1");
+    hello("h1"); // same build, same news
+    expect(reported).toEqual(["h1"]);
+    hello("h2");
+    hello("h3");
+    hello("h4"); // evicts h1
+    hello("h1"); // reported AGAIN — a duplicate, which is the safe direction
+    expect(reported).toEqual(["h1", "h2", "h3", "h4", "h1"]);
+    expect(seen.size).toBeLessThanOrEqual(CAP);
+  });
+
+  it("two tabs sharing a reused workflow id both get the truth", () => {
+    // The concrete round-2 scenario, as behaviour: tab A (wf:123) warns and closes;
+    // tab B opens the same workflow with the same disagreeing build. Under the old
+    // per-tab key B was silenced by A's leftover entry. Keyed by hash, the question
+    // "have we said this yet" no longer depends on which tab is asking.
+    const seen = new Set<string>();
+    const report = (_tab: string, hash: string) => {
+      if (seen.has(hash)) return false;
+      seen.add(hash);
+      return true;
+    };
+    expect(report("wf:123", "H")).toBe(true); // tab A
+    expect(report("wf:123", "H")).toBe(false); // tab B — same build, already said
+    expect(report("wf:123", "H2")).toBe(true); // B updated to a DIFFERENT bad build
   });
 });

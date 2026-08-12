@@ -66,22 +66,29 @@ import { logger } from "../utils/logger.js";
 import { assembleVocabularyHash, describeVocabularySkew } from "../tools/vocabulary.js";
 import { buildPanelToolDefs } from "./panel-tools.js";
 
-/** Tab id → the panel vocabulary hash whose MISMATCH has already been logged (#236),
- *  so a reconnect loop does not repeat the same warning every few seconds. Keyed by
- *  the HASH, not just the tab, so a panel that updates to a DIFFERENT disagreeing
- *  vocabulary is reported again — that is new information, not a repeat. */
-const loggedVocabularySkew = new Map<string, string>();
-
-/** Cap on the map above (codex review, P2). Tab ids are minted continually — every
- *  `tmp:` connection and every workflow switch produces a new one — and a long-lived
- *  server would otherwise retain one entry per tab that ever reported a skew, forever,
- *  including tabs that disconnected hours ago.
+/** The panel vocabulary hashes whose MISMATCH has already been reported (#236).
  *
- *  Evicting the OLDEST is safe in the direction that matters: the only consequence of
- *  dropping an entry is that a still-connected tab's unchanged mismatch gets logged a
- *  second time. It can never SUPPRESS a warning, because entries only ever suppress.
- *  A duplicated log line is the correct thing to risk here; a missed one is not. */
-const MAX_LOGGED_VOCABULARY_SKEW = 200;
+ *  Keyed by the HASH ALONE, not by tab. Codex round 2 found that a per-tab key lets a
+ *  stale entry suppress a real mismatch: `wf:` ids are reused, so a tab that closes
+ *  after warning leaves an entry that silences the NEXT tab opening the same workflow.
+ *
+ *  Keying by hash is not a patch for that, it is the correct granularity. The fact
+ *  being reported — "the vocabulary this panel build vendored disagrees with this
+ *  server's" — is a property of the panel BUILD, not of a tab or a workflow. Saying it
+ *  once per distinct disagreeing vocabulary is exactly the news there is; saying it
+ *  once per tab was always repeating one fact under different labels.
+ *
+ *  It also bounds itself: a process sees one or two panel builds, so the set holds one
+ *  or two entries where the per-tab map grew with every id ever minted. */
+const loggedVocabularySkew = new Set<string>();
+
+/** A cap anyway (codex round 1, P2). Nothing legitimate mints hashes — a panel
+ *  advertises one per build — but this reads a value off the wire, and a broken or
+ *  hand-modified panel that sent a fresh hash every hello would otherwise grow the set
+ *  without limit. Oldest-first eviction, and the direction stays safe: an evicted entry
+ *  can only cause a mismatch to be reported a SECOND time, never suppress one, because
+ *  entries only ever suppress. */
+const MAX_LOGGED_VOCABULARY_SKEW = 64;
 
 /** This server's vocabulary hash, computed once.
  *
@@ -3459,28 +3466,26 @@ export async function runPanelOrchestrator(): Promise<void> {
           advertised,
           typeof helloPanelVer === "string" ? helloPanelVer : undefined,
         );
-        // Logged once per DISTINCT advertised hash per tab. A reconnect ping-pong
-        // repeats the same hello every few seconds and the same skew is not new news;
-        // a panel that UPDATES to a different (still disagreeing) vocabulary is.
-        if (skew.status === "mismatch") {
-          if (loggedVocabularySkew.get(panelTab) !== advertised) {
-            // Insertion-ordered, so the first key is the oldest. Evicted BEFORE the
-            // insert so the cap is a real bound rather than a bound-plus-one.
-            while (loggedVocabularySkew.size >= MAX_LOGGED_VOCABULARY_SKEW) {
-              const oldest = loggedVocabularySkew.keys().next().value;
-              if (oldest === undefined) break;
-              loggedVocabularySkew.delete(oldest);
-            }
-            loggedVocabularySkew.set(panelTab, advertised!);
-            logger.warn(`[panel-orchestrator] ${skew.message}`);
+        // Reported once per DISTINCT disagreeing vocabulary, for the whole process.
+        // A reconnect ping-pong repeats the same hello every few seconds and the same
+        // skew is not new news; a panel that UPDATES to a different (still disagreeing)
+        // vocabulary is, and its new hash reports again.
+        //
+        // There is deliberately NO "clear on match" here. Under the per-tab key a
+        // stale entry had to be cleared so a tab that came back into agreement and
+        // later regressed would report again; keyed by hash there is nothing stale to
+        // clear — a regression re-advertises the same disagreeing hash, and if it was
+        // already reported, that is genuinely the same news the user already has.
+        if (skew.status === "mismatch" && !loggedVocabularySkew.has(advertised!)) {
+          // Insertion-ordered, so the first entry is the oldest. Evicted BEFORE the
+          // add so the cap is a real bound rather than a bound-plus-one.
+          while (loggedVocabularySkew.size >= MAX_LOGGED_VOCABULARY_SKEW) {
+            const oldest = loggedVocabularySkew.values().next().value;
+            if (oldest === undefined) break;
+            loggedVocabularySkew.delete(oldest);
           }
-        } else {
-          // Cleared, so a panel that updates INTO agreement and later regresses is
-          // reported again instead of being suppressed by a stale entry. `unknown`
-          // clears it too: it is the absence of evidence, and holding a prior
-          // mismatch against a build that told us nothing would report a skew that
-          // this connection never proved.
-          loggedVocabularySkew.delete(panelTab);
+          loggedVocabularySkew.add(advertised!);
+          logger.warn(`[panel-orchestrator] ${skew.message}`);
         }
       }
       // #706 — an npm-orchestrator update can require a newer Registry panel.
