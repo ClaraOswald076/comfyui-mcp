@@ -2168,6 +2168,37 @@ export function retiredToolMessage(name: string): string | undefined {
  * expression. Two copies of a hash rule drift, and a handshake that compares a
  * drifted hash reports a mismatch that is not real — worse than no check.
  */
+/**
+ * The hash of THIS server's vocabulary — the value the panel handshake compares
+ * against (#236).
+ *
+ * The panel tool names arrive as an argument rather than being imported, and that
+ * is load-bearing: `buildPanelToolDefs` lives in orchestrator/panel-tools.ts, which
+ * imports ui-bridge, which would make importing it here a cycle. Passing them in
+ * keeps this module free of the orchestrator entirely.
+ *
+ * ## Why the ASSEMBLY lives here and not at each call site
+ *
+ * `computeVocabularyHash` hashes whatever it is handed; deciding WHAT to hand it —
+ * core names, panel names SORTED, dead names — is a second rule, and it was
+ * previously written out only in scripts/export-vocabulary.mts. A runtime check
+ * that assembled its own copy would agree with the artefact right up until one of
+ * the two changed, and then report a mismatch that is not real. The doc on
+ * `computeVocabularyHash` says two copies of the hash rule must not exist; this is
+ * the same argument applied to its input, which is just as capable of drifting.
+ *
+ * So the exporter calls this too, and `vocabulary-handshake.test.ts` asserts the
+ * value it produces from the live panel defs equals the artefact's own
+ * `vocabularyHash` — the only check that can actually catch drift between them.
+ */
+export function assembleVocabularyHash(panelToolNames: readonly string[]): string {
+  return computeVocabularyHash({
+    core: [...TOOL_NAMES],
+    panel: [...panelToolNames].sort(),
+    dead: DEAD_NAMES.map((d) => d.name),
+  });
+}
+
 export function computeVocabularyHash(input: {
   core: readonly string[];
   panel: readonly string[];

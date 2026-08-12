@@ -63,6 +63,27 @@ import { listSessions, loadTranscript } from "./history.js";
 import { uploadImageHttp, resetClient } from "../comfyui/client.js";
 import { setConnectedPanelOrigins } from "../comfyui/fetch.js";
 import { logger } from "../utils/logger.js";
+import { assembleVocabularyHash, describeVocabularySkew } from "../tools/vocabulary.js";
+import { buildPanelToolDefs } from "./panel-tools.js";
+
+/** Tab id → the panel vocabulary hash whose MISMATCH has already been logged (#236),
+ *  so a reconnect loop does not repeat the same warning every few seconds. Keyed by
+ *  the HASH, not just the tab, so a panel that updates to a DIFFERENT disagreeing
+ *  vocabulary is reported again — that is new information, not a repeat. */
+const loggedVocabularySkew = new Map<string, string>();
+
+/** This server's vocabulary hash, computed once.
+ *
+ *  Memoised because it cannot change without a restart (the tool surface is fixed at
+ *  build time) and buildPanelToolDefs() walks every panel tool definition — work that
+ *  has no business running on every hello, which is a hot path during a reconnect loop. */
+let cachedServerVocabularyHash: string | undefined;
+function serverVocabularyHash(): string {
+  cachedServerVocabularyHash ??= assembleVocabularyHash(
+    buildPanelToolDefs().map((d) => d.name),
+  );
+  return cachedServerVocabularyHash;
+}
 import {
   PanelAgentManager,
   fetchSupportedModels,
@@ -3404,6 +3425,45 @@ export async function runPanelOrchestrator(): Promise<void> {
       if (typeof helloPanelVer === "string" && helloPanelVer && helloPanelVer !== latestPanelVersion) {
         latestPanelVersion = helloPanelVer;
         void refreshEnvCapabilities();
+      }
+      // #236 — THE VOCABULARY HANDSHAKE, at the handshake.
+      //
+      // `describeVocabularySkew` and the hash it compares have existed, fully
+      // unit-tested, since the #683 follow-up, and NOTHING called them: the bridge
+      // stored the panel's advertised hash on every hello under a comment promising
+      // this exact check, and no code read the field. A mechanism can be completely
+      // unreachable and still pass every test it has — the tests proved the function
+      // worked, never that it ran — so the call site below is asserted directly, by
+      // source, in vocabulary-handshake.test.ts.
+      //
+      // The comparison is done HERE rather than in the bridge because the server's own
+      // hash needs buildPanelToolDefs(), and panel-tools.ts imports ui-bridge.ts — the
+      // bridge cannot reach it without a cycle. The orchestrator already imports both.
+      const helloVocabHash = (event as { vocabulary_hash?: unknown }).vocabulary_hash;
+      {
+        const advertised =
+          typeof helloVocabHash === "string" && helloVocabHash ? helloVocabHash : undefined;
+        const skew = describeVocabularySkew(
+          serverVocabularyHash(),
+          advertised,
+          typeof helloPanelVer === "string" ? helloPanelVer : undefined,
+        );
+        // Logged once per DISTINCT advertised hash per tab. A reconnect ping-pong
+        // repeats the same hello every few seconds and the same skew is not new news;
+        // a panel that UPDATES to a different (still disagreeing) vocabulary is.
+        if (skew.status === "mismatch") {
+          if (loggedVocabularySkew.get(panelTab) !== advertised) {
+            loggedVocabularySkew.set(panelTab, advertised!);
+            logger.warn(`[panel-orchestrator] ${skew.message}`);
+          }
+        } else {
+          // Cleared, so a panel that updates INTO agreement and later regresses is
+          // reported again instead of being suppressed by a stale entry. `unknown`
+          // clears it too: it is the absence of evidence, and holding a prior
+          // mismatch against a build that told us nothing would report a skew that
+          // this connection never proved.
+          loggedVocabularySkew.delete(panelTab);
+        }
       }
       // #706 — an npm-orchestrator update can require a newer Registry panel.
       // The panel-sync service owns the ENTIRE safety decision: it re-reads the

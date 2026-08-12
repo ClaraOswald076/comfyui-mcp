@@ -8,6 +8,9 @@
 // boundary. The skew then surfaces at CALL time as "unknown tool".
 
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   computeVocabularyHash,
   describeVocabularySkew,
@@ -100,5 +103,85 @@ describe("describeVocabularySkew", () => {
   it("explains that a resulting 'unknown tool' is the skew, not a broken panel", () => {
     const r = describeVocabularySkew(HASH, "ab".repeat(32));
     expect(r.status === "mismatch" && r.message).toMatch(/unknown tool/i);
+  });
+});
+
+
+// ===========================================================================
+// #236 — IS THE HANDSHAKE ACTUALLY PERFORMED?
+//
+// Everything above this line passed for months while the check did not exist.
+// `describeVocabularySkew` was called by nothing but these tests; the bridge
+// stored the panel's advertised hash on every hello under a comment promising
+// the comparison, and no code ever read the field. Green tests proved the
+// function WORKED. They could not, and did not, prove it RAN.
+//
+// So these assert reachability, which is the property that was actually missing.
+// ===========================================================================
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+describe("#236 the handshake is wired, not just implemented", () => {
+  const ORCH = readFileSync(join(HERE, "../../orchestrator/index.ts"), "utf8");
+
+  it("the orchestrator's hello handler CALLS describeVocabularySkew", () => {
+    // A source assertion because the call sits inside the hello handler of a large
+    // side-effectful module — there is no seam to import and no return value to
+    // observe. Deleting the call is the mutation this exists to kill; behavioural
+    // tests of the describer cannot see it, which is exactly how it went missing.
+    expect(ORCH).toMatch(/import \{ assembleVocabularyHash, describeVocabularySkew \}/);
+    // Asserted as a PROPERTY — the call exists and is fed THIS server's hash — not
+    // as an exact expression. A control mutation that only reworded the argument
+    // (`serverVocabularyHash() + ""`) killed the strict form, which is a test that
+    // punishes rewording rather than protecting behaviour.
+    expect(ORCH).toMatch(/describeVocabularySkew\([\s\S]{0,160}serverVocabularyHash\(\)/);
+    // It must read the hash off THIS hello, not from anywhere it could go stale.
+    expect(ORCH).toMatch(/\(event as \{ vocabulary_hash\?: unknown \}\)\.vocabulary_hash/);
+  });
+
+  it("the check runs on the hello path, not lazily at first tool call", () => {
+    // "Detected at connection time" is the entire ask in #236. A comparison that
+    // happened on first USE would be the call-time surfacing the issue reported.
+    const hello = ORCH.slice(ORCH.indexOf("const helloPanelVer"));
+    const idx = hello.indexOf("describeVocabularySkew(");
+    expect(idx).toBeGreaterThan(-1);
+    expect(idx).toBeLessThan(4000); // same handler, not elsewhere in the file
+  });
+
+  it("only a MISMATCH warns — unknown and match stay silent", () => {
+    // The three-state discipline at the CALL SITE, not just in the describer:
+    // warning on `unknown` would fire at every user on a panel predating the
+    // handshake, whose vocabulary is very likely fine.
+    const start = ORCH.indexOf("// #236 — THE VOCABULARY HANDSHAKE");
+    expect(start).toBeGreaterThan(-1);
+    const block = ORCH.slice(start, start + 2400);
+    expect(block).toMatch(/if \(skew\.status === "mismatch"\)/);
+    expect(block).not.toMatch(/status !== "match"/);
+  });
+
+  it("the bridge no longer stores a hash nobody reads", () => {
+    const BRIDGE = readFileSync(join(HERE, "../../services/ui-bridge.ts"), "utf8");
+    // The dead field is gone WITH the comment that claimed it was compared. A false
+    // comment outlives the code it describes and costs the next reader the same
+    // investigation it cost this one.
+    expect(BRIDGE).not.toMatch(/panelVocabularyHash/);
+    expect(BRIDGE).not.toMatch(/detected at the handshake instead of at call time/);
+  });
+});
+
+describe("#236 the runtime hash agrees with the artefact the panel vendors", () => {
+  it("assembleVocabularyHash over the LIVE panel defs equals the exported hash", async () => {
+    // The decisive anti-drift check, and the reason the assembly moved into
+    // vocabulary.ts. If the runtime assembled its own copy of "core + panel sorted
+    // + dead", it would agree with the artefact right until one side changed — and
+    // then report a mismatch that is not real, which the module doc calls worse than
+    // having no check at all. This compares the two for real.
+    const { assembleVocabularyHash } = await import("../../tools/vocabulary.js");
+    const { buildPanelToolDefs } = await import("../../orchestrator/panel-tools.js");
+    const artefact = JSON.parse(
+      readFileSync(join(HERE, "../../../docs/design/tool-vocabulary.json"), "utf8"),
+    ) as { vocabularyHash: string };
+    expect(assembleVocabularyHash(buildPanelToolDefs().map((d) => d.name))).toBe(
+      artefact.vocabularyHash,
+    );
   });
 });
