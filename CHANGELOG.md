@@ -197,6 +197,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.10] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- a retarget round-trip says nothing, instead of saying A changed to A (#1444)
+
+
 ## [0.51.9] - 2026-08-11
 
 ### MCP
