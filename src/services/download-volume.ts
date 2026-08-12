@@ -45,15 +45,26 @@ import { dirname, parse, resolve } from "node:path";
  * which is on the same volume by construction. Give up at the filesystem root rather
  * than looping.
  */
-export async function freeBytesFor(path: string): Promise<number | null> {
+export async function volumeSpaceFor(
+  path: string,
+): Promise<{ free: number; total: number } | null> {
   let dir = resolve(path);
   const { root } = parse(dir);
   for (;;) {
     try {
       const st = await statfs(dir);
       const free = Number(st.bsize) * Number(st.bavail);
-      return Number.isFinite(free) && free >= 0 ? free : null;
-    } catch {
+      const total = Number(st.bsize) * Number(st.blocks);
+      return Number.isFinite(free) && free >= 0 ? { free, total } : null;
+    } catch (err) {
+      // Climb ONLY for "this path does not exist yet", which is the case that makes
+      // the walk necessary at all (a first run has no cache directory). Review
+      // caught the original catch-all: on a junction, mount point or network share
+      // whose statfs fails for PERMISSION or transport reasons, climbing would
+      // silently measure a DIFFERENT volume and answer confidently about the wrong
+      // disk -- which could permit the very overflow this exists to stop.
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") return null;
       const parent = dirname(dir);
       // `dirname` of a root returns the root: that is the stop condition, and without
       // it a missing drive letter would spin forever.
@@ -63,6 +74,10 @@ export async function freeBytesFor(path: string): Promise<number | null> {
   }
 }
 
+export async function freeBytesFor(path: string): Promise<number | null> {
+  return (await volumeSpaceFor(path))?.free ?? null;
+}
+
 /** Bytes left free after a download, below which we refuse to start it.
  *
  *  Not zero: landing a volume on exactly 0 free is its own failure, and on the system
@@ -70,6 +85,21 @@ export async function freeBytesFor(path: string): Promise<number | null> {
  *  block a legitimate tight-but-workable download and large enough to leave the OS
  *  somewhere to breathe. */
 export const VOLUME_HEADROOM_BYTES = 1024 ** 3;
+
+/**
+ * The reserve to keep free on a volume of `total` bytes.
+ *
+ * A flat 1 GiB is right for the case this issue is about -- a 232 GB system drive
+ * whose page file needs somewhere to live -- and wrong for a small or removable
+ * volume, where it would refuse a download that fits comfortably. Review flagged
+ * exactly that. So the reserve is the SMALLER of 1 GiB and 5% of the volume, which
+ * leaves the system-drive protection untouched and stops a 4 GB stick being declared
+ * unusable for a 2 GB file.
+ */
+export function headroomFor(total: number): number {
+  if (!Number.isFinite(total) || total <= 0) return VOLUME_HEADROOM_BYTES;
+  return Math.min(VOLUME_HEADROOM_BYTES, Math.floor(total * 0.05));
+}
 
 const gb = (n: number): string => `${(n / 1024 ** 3).toFixed(2)} GB`;
 
@@ -87,8 +117,10 @@ export function insufficientCacheSpaceMessage(opts: {
   cacheFree: number;
   destDir?: string;
   destFree?: number | null;
+  /** True when this refusal interrupts a RESUME, so a .partial already exists. */
+  resuming?: boolean;
 }): string {
-  const { needBytes, cacheDir, cacheFree, destDir, destFree } = opts;
+  const { needBytes, cacheDir, cacheFree, destDir, destFree, resuming = false } = opts;
   const destHasRoom =
     typeof destFree === "number" && destFree >= needBytes + VOLUME_HEADROOM_BYTES;
 
@@ -107,11 +139,18 @@ export function insufficientCacheSpaceMessage(opts: {
         `${destDir}), so a different cache location alone will not resolve this.`
       : "";
 
+  // Review caught this claiming too much: the check also runs on a RESUME, where a
+  // .partial already exists on disk. Telling that user "nothing was downloaded" is
+  // false and invites them to delete a partial they could have reused.
+  const state = resuming
+    ? ` Your existing partial download is untouched and still resumable — this ` +
+      `refusal happens before any further bytes are written.`
+    : ` Nothing was written and nothing was partially downloaded — this refusal ` +
+      `happens before the first byte, precisely so a full volume is not driven to ` +
+      `zero (#1477).`;
   const fix =
     ` Point the cache at a volume with room by setting COMFYUI_DOWNLOAD_CACHE_DIR ` +
-    `(for example to a directory beside your models), then retry. Nothing was ` +
-    `written and nothing was partially downloaded — this refusal happens before the ` +
-    `first byte, precisely so a full volume is not driven to zero (#1477).`;
+    `(for example to a directory beside your models), then retry.` + state;
 
   return head + split + fix;
 }
@@ -127,18 +166,21 @@ export async function checkCacheVolumeSpace(opts: {
   needBytes: number | undefined;
   cacheDir: string;
   destDir?: string;
+  resuming?: boolean;
 }): Promise<string | null> {
-  const { needBytes, cacheDir, destDir } = opts;
+  const { needBytes, cacheDir, destDir, resuming } = opts;
   if (!needBytes || !Number.isFinite(needBytes) || needBytes <= 0) return null;
-  const cacheFree = await freeBytesFor(cacheDir);
-  if (cacheFree === null) return null;
-  if (cacheFree >= needBytes + VOLUME_HEADROOM_BYTES) return null;
+  const space = await volumeSpaceFor(cacheDir);
+  if (space === null) return null;
+  const headroom = headroomFor(space.total);
+  if (space.free >= needBytes + headroom) return null;
   const destFree = destDir ? await freeBytesFor(destDir) : null;
   return insufficientCacheSpaceMessage({
     needBytes,
     cacheDir,
-    cacheFree,
+    cacheFree: space.free,
     destDir,
     destFree,
+    resuming,
   });
 }

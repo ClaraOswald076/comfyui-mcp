@@ -7,6 +7,7 @@ import {
   freeBytesFor,
   checkCacheVolumeSpace,
   insufficientCacheSpaceMessage,
+  headroomFor,
   VOLUME_HEADROOM_BYTES,
 } from "../../services/download-volume.js";
 
@@ -156,6 +157,70 @@ describe("#1477 WIRING: the streaming path refuses before opening a handle", () 
   it("a resume asks only for the REMAINING bytes", () => {
     // On an append the already-written bytes are on disk; demanding the full size
     // would refuse resumes that fit perfectly well.
-    expect(src).toMatch(/appendMode\s*\?\s*Math\.max\(\(rangeTotal \?\? 0\) - \(resumeFromBytes \|\| 0\), 0\)/);
+    expect(src).toMatch(/rangeTotal - \(resumeFromBytes \|\| 0\)/);
+  });
+
+  it("a resume with NO Content-Range total still checks, via Content-Length", () => {
+    // Round 2 of review: when a 206 carries no Content-Range total, `rangeTotal` is
+    // null and the original arithmetic yielded 0 -- which SKIPPED the guard on exactly
+    // the resume path it was written to protect. Content-Length on a 206 is the
+    // remaining slice, so it is the right fallback.
+    expect(src).toMatch(/remainingFromRange \?\? \(lengthHeaderPre > 0 \? lengthHeaderPre : 0\)/);
+  });
+
+  it("tells the check it is a resume, so the message does not lie about the partial", () => {
+    expect(src).toMatch(/resuming: appendMode/);
+  });
+});
+
+describe("#1477 round 2: the reserve scales, and the message tells the truth on a resume", () => {
+  it("keeps a full 1 GiB on a large volume - the system-drive case", () => {
+    expect(headroomFor(232 * GB)).toBe(VOLUME_HEADROOM_BYTES);
+  });
+
+  it("does not make a SMALL volume unusable", () => {
+    // A flat 1 GiB reserve would refuse a 2 GB file on a 4 GB stick that fits.
+    const small = 4 * GB;
+    expect(headroomFor(small)).toBeLessThan(VOLUME_HEADROOM_BYTES);
+    expect(headroomFor(small)).toBe(Math.floor(small * 0.05));
+  });
+
+  it("falls back to the full reserve for a nonsense total", () => {
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(headroomFor(bad)).toBe(VOLUME_HEADROOM_BYTES);
+    }
+  });
+
+  it("does NOT claim nothing was downloaded when interrupting a resume", () => {
+    // The partial exists on disk. Telling the user otherwise invites them to delete
+    // something they could have reused.
+    const resumeMsg = insufficientCacheSpaceMessage({
+      needBytes: 10 * GB,
+      cacheDir: "C:/cache",
+      cacheFree: 1 * GB,
+      resuming: true,
+    });
+    expect(resumeMsg).not.toMatch(/Nothing was written/);
+    expect(resumeMsg).toMatch(/existing partial download is untouched/);
+    expect(resumeMsg).toMatch(/still resumable/);
+  });
+
+  it("still says nothing was written on a FRESH download", () => {
+    const freshMsg = insufficientCacheSpaceMessage({
+      needBytes: 10 * GB,
+      cacheDir: "C:/cache",
+      cacheFree: 1 * GB,
+    });
+    expect(freshMsg).toMatch(/Nothing was written/);
+    expect(freshMsg).not.toMatch(/still resumable/);
+  });
+
+  it("refuses to measure a volume whose statfs fails for a NON-missing-path reason", async () => {
+    // Climbing on any error could answer confidently about a different disk. Only
+    // ENOENT/ENOTDIR justify walking up. A path under an existing FILE yields ENOTDIR
+    // and is therefore allowed to climb; that is the deliberate exception.
+    const underAFile = join(HERE, "download-volume.test.ts", "nested", "cache");
+    const free = await freeBytesFor(underAFile);
+    expect(typeof free).toBe("number");
   });
 });

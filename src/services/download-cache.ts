@@ -2090,12 +2090,21 @@ async function streamUrlToFile(
     const lengthHeaderPre = Number(res.headers.get("content-length") || 0);
     const fresh200TotalPre = Math.max(lengthHeaderPre > 0 ? lengthHeaderPre : 0, redirectSize ?? 0);
     // On a resume only the REMAINING bytes are written; the rest is already on disk.
+    //
+    // When the 206 carries no Content-Range total, `rangeTotal` is null and the old
+    // arithmetic produced 0 — silently SKIPPING the guard on exactly the resume path
+    // it was written to protect (review found this). Content-Length on a 206 is the
+    // remaining slice, which is precisely the quantity still to be written, so fall
+    // back to it rather than to nothing.
+    const remainingFromRange =
+      rangeTotal != null ? Math.max(rangeTotal - (resumeFromBytes || 0), 0) : undefined;
     const needBytes = appendMode
-      ? Math.max((rangeTotal ?? 0) - (resumeFromBytes || 0), 0)
+      ? (remainingFromRange ?? (lengthHeaderPre > 0 ? lengthHeaderPre : 0))
       : fresh200TotalPre;
     const refusal = await checkCacheVolumeSpace({
       needBytes,
       cacheDir: dirname(targetPath),
+      resuming: appendMode,
     });
     if (refusal) throw new ModelError(refusal, { path: targetPath });
   }
