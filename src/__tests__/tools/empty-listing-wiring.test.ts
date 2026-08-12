@@ -52,12 +52,31 @@ describe("#1420 status with no selector answers honestly", () => {
     // returns rather than on what the helper can produce.
     expect(text).toContain("THIS session's record store");
     expect(text).toContain("DO NOT conclude");
-    expect(text).toContain("check the panel's download tray");
+    expect(text).toContain("If this session has the ComfyUI sidebar panel");
     expect(text).toContain("corrupting move");
   });
 
   it("is not an error — nothing failed, the answer is just not proof", async () => {
     const res = await downloadTool()({ action: "status" });
     expect(res.isError).toBeFalsy();
+  });
+});
+
+describe("#1420 the SIBLING branch gives the same route advice", () => {
+  // codex round 2, P1: with only the empty-listing branch fixed, a same-session
+  // Manager transfer looked up BY ID was still told that re-issuing adopts — two
+  // branches of one tool disagreeing about the move that can corrupt a file.
+  it("an id that matches nothing carries the Manager caveat too", async () => {
+    const res = await downloadTool()({ action: "status", id: "0123456789abcdef" });
+    const text = res.content[0].text;
+    expect(text).toContain("No download matching");
+    expect(text).toContain("Do NOT re-issue a transfer that was dispatched to ComfyUI-Manager");
+    expect(text).toContain("(#1197)");
+    expect(text).toContain("If you cannot tell which route was used, ask before re-issuing");
+  });
+
+  it("scopes its adoption claim to a LOCAL transfer, as the empty branch does", async () => {
+    const res = await downloadTool()({ action: "status", id: "0123456789abcdef" });
+    expect(res.content[0].text).toContain("in-flight LOCAL download adopts it");
   });
 });

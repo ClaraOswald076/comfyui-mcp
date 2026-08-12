@@ -39,9 +39,21 @@ describe("#1420 the empty listing refuses to claim absence", () => {
     expect(note).toContain("staged OUTSIDE models/<subfolder>");
   });
 
-  it("puts the UNIVERSALLY safe check first — the tray", () => {
-    expect(note).toContain("check the panel's download tray");
-    expect(note).toContain("safe in every configuration");
+  it("offers the tray CONDITIONALLY — not every caller has a panel", () => {
+    // codex round 2, P2: "safe in every configuration" was false for headless MCP
+    // use, which has no tray at all — those callers were pointed at a check that
+    // does not exist for them.
+    expect(note).toContain("If this session has the ComfyUI sidebar panel");
+    expect(note).toContain("Without a panel there is no equivalent read");
+  });
+
+  it("does not DIRECT a re-download — it tells the caller to ask first", () => {
+    // codex round 2, P1: this reply is read by an agent, and an empty listing is
+    // exactly the state in which the route cannot be determined. A positive
+    // instruction to re-issue could become the corrupting second Manager dispatch.
+    expect(note).toContain("deliberately not an instruction to re-download");
+    expect(note).toContain("ask the user first");
+    expect(note).toContain("CANNOT tell which route");
   });
 
   it("scopes adoption to the SAME session, matching the sibling message", () => {
@@ -49,16 +61,15 @@ describe("#1420 the empty listing refuses to claim absence", () => {
     // is "the safe check". Adoption is a same-session property; across a reconnect
     // the sibling id/url-miss message says to confirm via the tray first, and two
     // branches of one tool must not give incompatible route advice.
-    expect(note).toContain("Within the SAME session");
-    expect(note).toContain("ACROSS a reconnect");
-    expect(note).toContain("confirm via the tray");
+    expect(note).toContain("ONLY within the ");
+    expect(note).toContain("same session and only for a LOCAL one");
   });
 
   it("warns that a Manager-dispatched transfer must NOT be re-issued", () => {
     // #1197: that one runs server-side, and re-issuing it is the corrupting move.
     // Telling every caller to re-issue would have handed exactly that transfer the
     // one instruction that destroys it.
-    expect(note).toContain("NOT universally safe");
+    expect(note).toContain("SERVER-side");
     expect(note).toContain("corrupting move");
     expect(note).toContain("check whether the file landed");
   });

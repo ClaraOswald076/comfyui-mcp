@@ -79,13 +79,18 @@ export function emptyDownloadListingNote(opts?: {
     `not tell the user so. In-flight bytes are staged OUTSIDE models/<subfolder> and only ` +
     `moved on completion, so the destination folder looks empty too, which makes these two ` +
     `very different states look identical.\n\n` +
-    `TO FIND OUT, IN THIS ORDER: check the panel's download tray — it shows live transfers ` +
-    `regardless of this store, and it is the check that is safe in every configuration. ` +
-    `Within the SAME session, re-issuing an identical in-flight download_model ` +
-    `action:"download" adopts it rather than duplicating it; ACROSS a reconnect — which is ` +
-    `the situation you are most likely in when this listing is empty — confirm via the tray ` +
-    `FIRST. Re-issuing is NOT universally safe: a transfer dispatched to ComfyUI-Manager runs ` +
-    `SERVER-side, and re-issuing that one is a second dispatch to the same destination, which ` +
-    `is the corrupting move (#1197) — for those, check whether the file landed instead.`
+    `WHAT TO DO — and this is deliberately not an instruction to re-download. If this ` +
+    `session has the ComfyUI sidebar panel, its download tray shows live transfers regardless ` +
+    `of this store: that is the authoritative check, and the only one that is safe whatever ` +
+    `route a transfer took. Without a panel there is no equivalent read, so the safe move is ` +
+    `to WAIT and re-check rather than to act.
+
+` +
+    `Re-issuing download_model action:"download" adopts an in-flight transfer ONLY within the ` +
+    `same session and only for a LOCAL one. A transfer dispatched to ComfyUI-Manager runs ` +
+    `SERVER-side, and re-issuing that is a SECOND dispatch to the same destination — the ` +
+    `corrupting move (#1197); for those, check whether the file landed instead. An empty ` +
+    `listing is precisely the state in which you CANNOT tell which route the transfer took, ` +
+    `so do not re-issue on the strength of this reply: ask the user first.`
   );
 }
