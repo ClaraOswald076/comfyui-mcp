@@ -324,7 +324,12 @@ describe("#646 workflow navigation has a reader too", () => {
     // navigation differently, but the EVIDENCE is the same.
     for (const cmd of ["workflow_open", "workflow_new"]) {
       const text = midCommandVerifyClause(cmd);
-      expect(text, cmd).toMatch(/last_open_receipt/);
+      // The REPLY KEY is `last_open`. codex round 2: the first version said
+      // `last_open_receipt`, which is the panel's local VARIABLE name and not a field
+      // any reply carries — a confidently named thing that does not exist, which is
+      // the defect this module was written to remove. Both directions asserted.
+      expect(text, cmd).toMatch(/`last_open`/);
+      expect(text, cmd).not.toMatch(/last_open_receipt/);
       // codex review, P1: the first attempt named panel_list_workflows and stopped
       // there, on the reasoning that an opened workflow appears in it. The panel had
       // already written the rebuttal — after a backend reconnect the frontend restores

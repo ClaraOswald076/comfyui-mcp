@@ -107,9 +107,9 @@ const WORKFLOW_MUTATORS = new Set<string>([
 
 /** Workflow NAVIGATION/creation. Deliberately not in ACTIVE_WORKFLOW_MUTATORS — they
  *  carry their own explicit or new target rather than mutating active content, so the
- *  fence treats them differently. But the QUESTION HERE IS EVIDENCE, not fencing, and
- *  the evidence is identical: an opened or newly created workflow shows up in
- *  panel_list_workflows.
+ *  fence treats them differently. The question HERE is evidence, not fencing — and the
+ *  evidence for these is NOT the workflow list itself, which is where the first attempt
+ *  went wrong.
  *
  *  Found by running the LIVE panel's registered command names through this classifier
  *  after the fix merged — these two fell to the default branch, which names no tool.
@@ -125,7 +125,10 @@ const WORKFLOW_MUTATORS = new Set<string>([
  *  That mechanism is the panel's OPEN RECEIPTS (#402): every workflow_open/workflow_new
  *  that RAN is journaled with the selector it was asked for, the identity it resolved
  *  to, and whether it applied. The latest one rides in the workflow-list reply as
- *  `last_open_receipt`, and it answers ONLY for the command whose id equals its `rid` —
+ *  `last_open` — that is the reply KEY; the panel's local variable is `lastOpenReceipt`,
+ *  and naming THAT is how the first version of this shipped a field no reply carries
+ *  (codex round 2), which is the very defect this module exists to remove. It answers
+ *  ONLY for the command whose id equals its `rid` —
  *  so an EARLIER successful open of the same file is not evidence about a later dropped
  *  one. The message says both halves, because the receipt is over-readable without the
  *  rule that comes with it. */
@@ -169,7 +172,7 @@ export function midCommandVerifyClause(cmd: string): string {
   }
   if (WORKFLOW_NAVIGATION.has(cmd)) {
     return (
-      `Verify with panel_list_workflows and read its \`last_open_receipt\` — the panel's own ` +
+      `Verify with panel_list_workflows and read its \`last_open\` — the panel's own ` +
       `execution record for opens (#402). It answers ONLY for the command whose id equals ` +
       `its \`rid\`: \`applied:true\` means it completed, \`applied:false\` means nothing was ` +
       `applied and it is safe to re-issue, \`applied:"unknown"\` means it may have taken ` +
