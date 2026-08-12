@@ -16,6 +16,7 @@ import {
 } from "../services/workflow-deps.js";
 import { generateSkillCached } from "../services/skill-cache.js";
 import type { WorkflowJSON } from "../comfyui/types.js";
+import { templateIndexScopeNote } from "../services/template-index-scope.js";
 import {
   bodyPrefixOf,
   classifyNonJson,
@@ -588,7 +589,15 @@ async function listWorkflowTemplatesAction(): Promise<ToolText> {
       {
         type: "text" as const,
         text: JSON.stringify(
-          { source_count: groups.length, template_count: total, templates: index },
+          {
+            source_count: groups.length,
+            template_count: total,
+            // #1454 — the counts above describe what the SERVER registers, not what is
+            // installed. Said on every listing, not only an empty one: the reporter's
+            // had 4 sources and 53 templates, and the pack they wanted was still absent.
+            index_scope: templateIndexScopeNote(),
+            templates: index,
+          },
           null,
           2,
         ),
