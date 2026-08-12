@@ -2086,30 +2086,11 @@ export interface ResolvedDownloadTarget {
   liveRootAtResolve?: string;
 }
 
-/**
- * The install root the CONNECTED server reports for ITSELF, derived from its `main.py`
- * argv — available even when it was not launched with `--base-directory`.
- *
- * Returns undefined on any failure. #1371's refusal is conditional on this value, so a
- * throw here must never become a failed download: no root, no refusal.
- */
-async function serverInstallRootOrUndefined(): Promise<string | undefined> {
-  try {
-    const stats = await getSystemStats();
-    const argv = (stats as { system?: { argv?: string[] } })?.system?.argv;
-    const cwd = (stats as { system?: { cwd?: string } })?.system?.cwd;
-    // ARGV ONLY — deliberately not resolveLiveServerRoot, which falls back to probing
-    // the live PROCESS TABLE. The repo has a gate against new code reaching that probe
-    // (#1290/#1263) precisely because it makes a test assert one thing on a machine
-    // where ComfyUI is running and another where it is not. I reached for the shared
-    // resolver first and that gate caught it.
-    //
-    // Argv is also the right evidence here: it is what the connected server itself
-    // reported, so it cannot describe some other process that happens to be running.
-    return liveRootFromArgv(argv, cwd) || undefined;
-  } catch {
-    return undefined;
-  }
+/** The models CATEGORY a target subfolder belongs to — its first segment. Live extra
+ *  roots are category-scoped, so a `checkpoints` root must not vouch for a LoRA. */
+function normalizedSubfolderFor(targetSubfolder: string): string | undefined {
+  const first = (targetSubfolder ?? "").trim().replace(/\\/g, "/").split("/")[0];
+  return first || undefined;
 }
 
 /**
@@ -2167,11 +2148,13 @@ export async function resolveDownloadTarget(
   // own note warns about — and it is skipped entirely when the destination came from
   // the live server (nothing to disagree with) or when no root can be derived.
   if (!liveRootAtResolve) {
+    const membership = await isUnderLiveModelRoots(targetDir, normalizedSubfolderFor(targetSubfolder));
     const refusal = divergentInstallRefusal({
       targetDir,
-      serverRoot: await serverInstallRootOrUndefined(),
-      // Defensive: this is decoration on a refusal, and an existing suite mocks
-      // config.js without this export — a message detail must never fail a download.
+      inRoots: membership.inRoots,
+      liveRoot: membership.liveRoot,
+      // Defensive: decoration on a refusal, and an existing suite mocks config.js
+      // without this export — a message detail must never fail a download.
       serverUrl: (() => {
         try {
           return getComfyUIBaseUrl();
