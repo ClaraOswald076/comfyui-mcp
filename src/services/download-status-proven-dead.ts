@@ -55,10 +55,16 @@ export function provenDeadStatusNote(opts: {
     : ` Nothing is writing this file. There is no local transfer to interrupt, so it ` +
       `is safe to re-issue the download — or call download_model action:"cancel" with ` +
       `this id and tray_id first to close the stale record.`;
-  return (
-    `\n    NOTE: this transfer is NOT running. The process that owned it no longer ` +
-    `exists (probed by pid), so it died with its session (#1479).${stale}${tail}`
-  );
+  // The OPENING verdict has to be route-aware too. Saying "this transfer is NOT
+  // running" and then admitting the server-side fetch may still be live is the same
+  // self-contradiction this issue is about — review caught me writing it into the fix.
+  // For a Manager dispatch the pid proves only that the LOCAL record's owner is gone.
+  const head = viaManager
+    ? `\n    NOTE: the local owner of this record is gone — the process that started ` +
+      `it no longer exists (probed by pid), so it died with its session (#1479).`
+    : `\n    NOTE: this transfer is NOT running. The process that owned it no longer ` +
+      `exists (probed by pid), so it died with its session (#1479).`;
+  return `${head}${stale}${tail}`;
 }
 
 /**

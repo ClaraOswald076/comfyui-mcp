@@ -1110,7 +1110,9 @@ async function statusAction(args: {
                     // reader takes at a glance, and leaving it would have this reply
                     // contradict itself in consecutive sentences.
                     j.writerProvenGone === true
-                    ? `\n    NOT running — the owning process is gone; started ${Math.round((Date.now() - j.started_at) / 1000)}s ago`
+                    ? (j.viaManager
+                        ? `\n    local owner gone — this was a ComfyUI-Manager dispatch, so the server-side fetch may still be running; started ${Math.round((Date.now() - j.started_at) / 1000)}s ago`
+                        : `\n    NOT running — the owning process is gone; started ${Math.round((Date.now() - j.started_at) / 1000)}s ago`)
                     : `\n    still streaming — started ${Math.round((Date.now() - j.started_at) / 1000)}s ago`;
           const route = downloadRoute(j);
           // #1479 — a PROVEN-dead writer must not be reported as "still streaming".

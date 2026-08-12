@@ -141,3 +141,37 @@ describe("#1479 WIRING", () => {
     expect(tool).toMatch(/the transfer may still be running/);
   });
 });
+
+describe("#1479 a Manager dispatch is never declared dead", () => {
+  const m = () => provenDeadStatusNote({ staleForMs: 102_000, viaManager: true });
+
+  it("does not OPEN by calling the transfer dead", () => {
+    // The first cut said "this transfer is NOT running" and then admitted the
+    // server-side fetch may still be live — the same self-contradiction this issue is
+    // about, written into its own fix. My tests asserted only the tail, so they passed
+    // while the opening sentence was wrong; review caught it, and a mutation confirmed
+    // the case was uncovered.
+    expect(m()).not.toMatch(/this transfer is NOT running/);
+    expect(m()).toMatch(/the local owner of this record is gone/);
+  });
+
+  it("scopes the pid evidence to the LOCAL owner", () => {
+    expect(m()).toMatch(/only the local record's owner is proven gone/);
+  });
+
+  it("the non-Manager note still states the plain verdict", () => {
+    expect(provenDeadStatusNote({ staleForMs: 1000 })).toMatch(/this transfer is NOT running/);
+  });
+});
+
+describe("#1479 WIRING: the status line is route-aware too", () => {
+  const tool2 = readFileSync(join(HERE, "../../tools/model-management.ts"), "utf8");
+
+  it("a Manager dispatch does not read 'NOT running' at a glance", () => {
+    // The status line is what a reader takes first; leaving it absolute would have it
+    // contradict the note directly beneath it.
+    expect(tool2).toMatch(/j\.viaManager/);
+    expect(tool2).toContain("local owner gone");
+    expect(tool2).toContain("the server-side fetch may still be running");
+  });
+});
