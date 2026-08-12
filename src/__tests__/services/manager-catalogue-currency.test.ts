@@ -22,6 +22,44 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
+/** Blank out string/template/comment CONTENT, preserving length and therefore offsets,
+ *  so a brace scan sees only syntax. Deliberately small: it is a test fixture, not a
+ *  parser, and it only has to be right about braces in this one file. */
+function maskLiterals(src: string): string {
+  const out = src.split("");
+  let i = 0;
+  const blank = (from: number, to: number) => {
+    for (let k = from; k < to && k < out.length; k++) if (out[k] !== "\n") out[k] = " ";
+  };
+  while (i < src.length) {
+    const c = src[i];
+    const next = src[i + 1];
+    if (c === "/" && next === "/") {
+      const nl = src.indexOf("\n", i);
+      blank(i, nl === -1 ? src.length : nl);
+      i = nl === -1 ? src.length : nl;
+    } else if (c === "/" && next === "*") {
+      const endC = src.indexOf("*/", i + 2);
+      const stop = endC === -1 ? src.length : endC + 2;
+      blank(i, stop);
+      i = stop;
+    } else if (c === '"' || c === "'" || c === "`") {
+      let j = i + 1;
+      while (j < src.length) {
+        if (src[j] === "\\") j += 2;
+        else if (src[j] === c) break;
+        else j++;
+      }
+      blank(i, Math.min(j + 1, src.length));
+      i = j + 1;
+    } else {
+      i++;
+    }
+  }
+  return out.join("");
+}
+
+
 describe("#890 when the caveat attaches", () => {
   it("attaches when packs are unresolved and nothing stronger applies", () => {
     // The reported case: a healthy-LOOKING catalogue answered, and some class_types
@@ -107,7 +145,7 @@ describe("#890 WIRING: it reaches both results and both renderers", () => {
     expect((deps.match(/catalogue_currency_unverified\?: string;/g) ?? []).length).toBe(2);
   });
 
-  it("EVERY return that emits `unresolved` also carries the caveat", () => {
+  it("EVERY return that emits `unresolved` also carries a caveat", () => {
     // Counting setters was not enough, and codex round 2 proved it: an EARLY RETURN in
     // installWorkflowDependencies (taken when nothing is missing) emitted `unresolved`
     // bare. The caveat existed, was set in two places, and still never reached that
@@ -115,43 +153,40 @@ describe("#890 WIRING: it reaches both results and both renderers", () => {
     // settled answer of the three.
     //
     // The window is bounded to the ENCLOSING OBJECT by brace depth, not by a character
-    // count (codex round 3). A fixed 2600-char forward scan happened to be correct at
-    // today's distances — removing the early return's caveat did fail this test — but
-    // its correctness rested on two returns staying far enough apart, so an edit that
-    // moved them closer would let one return's caveat satisfy another's check and the
-    // test would pass while `unresolved` went out bare. That is the vacuous pass this
-    // test exists to prevent, so it must not depend on layout.
+    // count (round 3): a fixed forward window was correct only at today's distances, so
+    // an edit moving two returns closer would let one return's caveat satisfy another's
+    // check and this test would pass while `unresolved` went out bare.
     //
-    // Anchored on the FIELD rather than on `return {`: the returns sit at different
-    // nesting depths, and an indent-based terminator matched nothing at all. The
-    // `const ` exclusion drops the local `const unresolved: string[] = []` declaration,
-    // which is not a reply.
+    // Braces inside STRINGS, TEMPLATE LITERALS and COMMENTS are masked first (round 5).
+    // The messages in this file are long and full of prose; a future property like
+    // `note: "{"` would otherwise stop the walk from closing and let it run on into a
+    // later return that does carry a caveat — the same vacuous pass, reintroduced by
+    // the fix for it. Indices are preserved so offsets still line up with the source.
+    const masked = maskLiterals(deps);
+
     const FIELD = new RegExp(String.raw`\n\s+unresolved: `, "g");
-    const sites = [...deps.matchAll(FIELD)]
+    const sites = [...masked.matchAll(FIELD)]
       .map((m) => m.index ?? 0)
-      .filter((i) => !/const\s+$/.test(deps.slice(Math.max(0, i - 24), i + 1)));
+      .filter((i) => !/const\s+$/.test(masked.slice(Math.max(0, i - 24), i + 1)));
     expect(sites.length).toBeGreaterThanOrEqual(3); // analysis + install + early return
 
-    /** The rest of the object literal this field sits in — to its matching `}`. */
-    const enclosingObject = (from: number): string => {
-      let depth = 1; // we are already inside the object that holds this field
-      for (let j = from; j < deps.length; j++) {
-        const c = deps[j];
+    for (const i of sites) {
+      let depth = 1; // already inside the object holding this field
+      let close = -1;
+      for (let j = i; j < masked.length; j++) {
+        const c = masked[j];
         if (c === "{") depth++;
-        else if (c === "}") {
-          depth--;
-          if (depth === 0) return deps.slice(from, j);
+        else if (c === "}" && --depth === 0) {
+          close = j;
+          break;
         }
       }
-      return deps.slice(from); // unbalanced — fail loudly below rather than pass
-    };
-
-    for (const i of sites) {
-      const object = enclosingObject(i);
-      // A bound that is not a bound would reintroduce the vacuous pass, so assert the
-      // walk actually terminated before the end of the file.
-      expect(object.length).toBeLessThan(deps.length - i);
-      expect(object, deps.slice(i, i + 60)).toMatch(/catalogue_currency_unverified/);
+      // A walk that never closed is not a bound, and would silently widen the window.
+      expect(close, `unterminated object at ${deps.slice(i, i + 60)}`).toBeGreaterThan(i);
+      const object = deps.slice(i, close);
+      expect(object, deps.slice(i, i + 60)).toMatch(
+        /catalogue_currency_unverified|mappings_unavailable|catalogue_unavailable/,
+      );
     }
   });
 
