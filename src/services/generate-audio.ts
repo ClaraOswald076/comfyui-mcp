@@ -182,8 +182,8 @@ export async function generateAudio(
     sampler_name: resolved.sampler as string | undefined,
     scheduler: resolved.scheduler as string | undefined,
     filename_prefix: resolved.filename_prefix as string | undefined,
-    // #1458 — passed through like the ace_step path. generate_audio ACCEPTS
-    // audio_quality; this family dropped it on the floor.
+    // #1458 — passed through like the ace_step path. The audio generation tool
+    // ACCEPTS audio_quality; this family dropped it on the floor.
     audio_quality: resolved.audio_quality as string | undefined,
   });
 

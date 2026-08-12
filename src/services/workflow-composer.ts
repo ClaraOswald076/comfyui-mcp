@@ -644,9 +644,10 @@ interface StableAudio3Txt2AudioParams {
   sampler_name?: string;
   scheduler?: string;
   filename_prefix?: string;
-  /** #1458 — mirrors the ace_step sibling. `audio_quality` is a PUBLIC generate_audio
-   *  parameter, and this family both ignored it and emitted no `quality` at all, so a
-   *  caller who set it had it silently dropped on top of every run failing validation. */
+  /** #1458 — mirrors the ace_step sibling. `audio_quality` is a PUBLIC parameter of
+   *  the audio generation tool, and this family both ignored it and emitted no
+   *  `quality` at all, so a caller who set it had it silently dropped on top of every
+   *  run failing validation. */
   audio_quality?: string;
 }
 
@@ -823,7 +824,7 @@ function buildStableAudio3Txt2Audio(p: StableAudio3Txt2AudioParams): WorkflowJSO
     "8": {
       class_type: "SaveAudioMP3",
       // #1458 — `quality` is REQUIRED on SaveAudioMP3. Omitting it made every
-      // generate_audio for this family fail validation before execution:
+      // audio generation for this family fail validation before execution:
       // "SaveAudioMP3 (node 8): Required input is missing (quality)". The ace_step
       // builder above always set it; only this sibling did not.
       inputs: { audio: conn("7", 0), filename_prefix: prefix, quality: audioQuality },

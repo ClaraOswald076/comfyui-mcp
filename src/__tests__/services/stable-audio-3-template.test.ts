@@ -1,7 +1,7 @@
 // #1458 — the bundled stable_audio_3 template had two independent defects.
 //
-// 1. `SaveAudioMP3` omitted the REQUIRED `quality` input, so every generate_audio
-//    call for this family was rejected before execution:
+// 1. `SaveAudioMP3` omitted the REQUIRED `quality` input, so every audio generation
+//    for this family was rejected before execution:
 //      400 prompt_outputs_failed_validation
 //      - SaveAudioMP3 (node 8): Required input is missing (quality)
 //    The ace_step_15 sibling in the same file always set it. One of two templates.
@@ -31,7 +31,8 @@ describe("#1458 bug 1: SaveAudioMP3 carries the required quality", () => {
   });
 
   it("honours a caller's audio_quality instead of dropping it", () => {
-    // `audio_quality` is a PUBLIC generate_audio parameter. This family ignored it
+    // `audio_quality` is a PUBLIC parameter of the audio generation tool. This
+    // family ignored it
     // AND emitted no quality at all, so a caller who set it was silently overridden
     // on top of every run failing — accepting a parameter and discarding it is its
     // own defect, and fixing only the omission would have left it in place.
@@ -81,7 +82,7 @@ describe("#1458 bug 2: the defaults do not render silence", () => {
   });
 });
 
-describe("#1458 WIRING: generate_audio passes audio_quality to THIS family", () => {
+describe("#1458 WIRING: the audio tool passes audio_quality to THIS family", () => {
   it("the stable_audio_3 dispatch forwards it, like the ace_step path", () => {
     // A mutation deleting this line SURVIVED the tests above, and rightly: they call
     // createWorkflow directly, so no amount of composer testing can see whether the
