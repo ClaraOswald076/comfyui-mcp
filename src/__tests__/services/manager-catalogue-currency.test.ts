@@ -73,7 +73,9 @@ describe("#890 what the caveat says", () => {
   it("names an INDEPENDENT reader that can settle it, and both outcomes", () => {
     // A caveat with no next step is just doubt. search_custom_nodes queries
     // api.comfy.org directly rather than through Manager, so it is real evidence.
-    expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/search_custom_nodes/);
+    // The ACTION too: search_custom_nodes is action-parameterised and refuses without
+    // one, so naming the tool alone would cost a round trip to an error.
+    expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/search_custom_nodes action:"search"/);
     expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/api\.comfy\.org directly/);
     expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/found there means this[\s\S]*behind/i);
     expect(MANAGER_CATALOGUE_CURRENCY_CAVEAT).toMatch(/absent from both/i);

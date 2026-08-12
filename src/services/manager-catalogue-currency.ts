@@ -51,7 +51,8 @@ export const MANAGER_CATALOGUE_CURRENCY_CAVEAT =
   `cannot reach the registry it serves a copy bundled in its own package — populated, ` +
   `HTTP 200, and indistinguishable from a current one; it does not report which source ` +
   `answered, so nothing here can date it (panel#890). To settle it, look one of these up ` +
-  `with search_custom_nodes, which queries api.comfy.org directly: found there means this ` +
+  `with search_custom_nodes action:"search", which queries api.comfy.org directly: found ` +
+  `there means this ` +
   `Manager catalogue is behind (update ComfyUI-Manager on the ComfyUI host and re-scan), ` +
   `absent from both means it is genuinely unknown to the registry.`;
 
