@@ -197,6 +197,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.9] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- an empty download listing stops reading as 'nothing is running' (#1441)
+
+
 ## [0.51.8] - 2026-08-11
 
 ### MCP
