@@ -155,14 +155,56 @@ describe("#890 WIRING: it reaches both results and both renderers", () => {
     }
   });
 
-  it("every site that renders the stronger caveats renders this one too", () => {
-    // If one renderer forgot it, `unresolved` still reads as "does not exist"
-    // wherever that path is taken — and the behavioural tests above cannot see it.
-    const stronger =
-      (skills.match(/result\.mappings_unavailable\)/g) ?? []).length +
-      (skills.match(/result\.catalogue_unavailable\)/g) ?? []).length;
-    const mine = (skills.match(/result\.catalogue_currency_unverified\)/g) ?? []).length;
-    expect(stronger).toBeGreaterThan(0);
-    expect(mine).toBe(stronger);
+  it("BOTH result renderers surface the currency caveat", () => {
+    // This used to assert parity with the stronger caveats — one currency render per
+    // stronger render. That premise died the moment `mappings_unavailable` gained a
+    // second render site (codex round 4), and the assertion started failing for a
+    // reason that was not a defect. The property that actually matters is coverage:
+    // there are two result shapes, each with a renderer, and BOTH must surface it —
+    // a renderer that forgets it leaves `unresolved` reading as "does not exist" on
+    // whichever path it serves.
+    expect((skills.match(/result\.catalogue_currency_unverified\)/g) ?? []).length).toBe(2);
+    // And the stronger caveats must still be rendered wherever they can be set, or
+    // this one silently becomes the only disclosure a reader ever sees.
+    expect(skills).toMatch(/result\.mappings_unavailable\)/);
+    expect(skills).toMatch(/result\.catalogue_unavailable\)/);
+  });
+});
+
+describe("#890 yielding to a caveat that never arrives", () => {
+  const deps = readFileSync(join(HERE, "../../services/workflow-deps.ts"), "utf8");
+  const skills = readFileSync(join(HERE, "../../tools/skills-access.ts"), "utf8");
+
+  it("the install result can CARRY the stronger mappings caveat", () => {
+    // codex round 4, P1. `mappings_unavailable` had nowhere to live on
+    // InstallDepsResult, so an install whose MAPPINGS lookup threw emitted `unresolved`
+    // with NO caveat at all: the strong one could not be represented, and the currency
+    // caveat correctly yields to it. Yielding to something that never arrives is the
+    // worst of both — it suppresses the weaker disclosure and loses the stronger one,
+    // leaving a bare list in the case we know the MOST about.
+    const install = deps.slice(deps.indexOf("export interface InstallDepsResult"));
+    const shape = install.slice(0, install.indexOf("\n}"));
+    expect(shape).toMatch(/mappings_unavailable\?: string;/);
+  });
+
+  it("both install returns propagate it from the analysis", () => {
+    // The analysis is where the mappings lookup actually happened, so it is carried
+    // over rather than recomputed — and BOTH returns need it: the early
+    // no-missing-packs one and the full install one.
+    expect(
+      (deps.match(/mappings_unavailable: analysis\.mappings_unavailable/g) ?? []).length,
+    ).toBe(2);
+  });
+
+  it("the currency caveat yields only when the stronger one will REACH the reader", () => {
+    // The gate is passed `analysis.mappings_unavailable` on the install path now. If it
+    // were not, the currency caveat would fire alongside a stronger caveat that is also
+    // present — two disclosures for one fact.
+    expect(deps).toMatch(/mappingsUnavailable: analysis\.mappings_unavailable/);
+  });
+
+  it("the install renderer surfaces it", () => {
+    // A field that is set and never rendered is the same hole one layer down.
+    expect((skills.match(/result\.mappings_unavailable\)/g) ?? []).length).toBe(2);
   });
 });

@@ -795,6 +795,10 @@ async function installDepsAction(input: string | Record<string, unknown>): Promi
     // #1136 — say it BEFORE the list. A reader who has already read
     // "not found in ComfyUI-Manager" has drawn the conclusion.
     if (result.catalogue_unavailable) lines.push(result.catalogue_unavailable, "");
+    // panel#890 (codex round 4) — the install reply can carry the analysis's mappings
+    // failure now, and a caveat that is set but never rendered is the same hole one
+    // layer down.
+    if (result.mappings_unavailable) lines.push(result.mappings_unavailable, "");
     if (result.catalogue_currency_unverified)
       lines.push(result.catalogue_currency_unverified, "");
     lines.push(

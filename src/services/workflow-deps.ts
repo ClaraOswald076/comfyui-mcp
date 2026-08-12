@@ -122,6 +122,17 @@ export interface InstallDepsResult {
   catalogue_unavailable?: string;
   /** panel#890 — see the same field on WorkflowDepsAnalysis. */
   catalogue_currency_unverified?: string;
+  /**
+   * panel#890 (codex round 4) — the analysis's `mappings_unavailable`, carried through.
+   *
+   * It had nowhere to live on this shape, so an install whose MAPPINGS lookup threw
+   * emitted `unresolved` with no caveat of any kind: the strong one could not be
+   * represented, and the currency caveat deliberately yields to it. Yielding to a
+   * caveat that never arrives is the worst of both — it suppresses the weaker
+   * disclosure AND loses the stronger one, so the reader sees a bare list in the case
+   * we know the most about.
+   */
+  mappings_unavailable?: string;
 }
 
 export interface ManagerQueueStatus {
@@ -519,6 +530,11 @@ export async function installWorkflowDependencies(
       ...(analysis.catalogue_currency_unverified
         ? { catalogue_currency_unverified: analysis.catalogue_currency_unverified }
         : {}),
+      // The STRONGER caveat too (codex round 4). The currency one yields to it, so
+      // dropping it here left this path with neither.
+      ...(analysis.mappings_unavailable
+        ? { mappings_unavailable: analysis.mappings_unavailable }
+        : {}),
     };
   }
 
@@ -659,8 +675,13 @@ export async function installWorkflowDependenciesForAnalysis(
     ...(managerCatalogueCurrencyUnverified({
       unresolvedCount: unresolved.length,
       catalogueUnavailable: catalogueEmpty ? "empty" : undefined,
+      mappingsUnavailable: analysis.mappings_unavailable,
     })
       ? { catalogue_currency_unverified: MANAGER_CATALOGUE_CURRENCY_CAVEAT }
+      : {}),
+    // Same gap on this path: the analysis's mappings failure never reached the reply.
+    ...(analysis.mappings_unavailable
+      ? { mappings_unavailable: analysis.mappings_unavailable }
       : {}),
     ...(panelNotes.length ? { panel_notes: panelNotes } : {}),
   };
