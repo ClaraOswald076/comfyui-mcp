@@ -4,6 +4,37 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.17
+
+### Fixed
+
+- **The stable_audio_3 template could not produce audio at all, and its defaults rendered
+  silence (#1458).** `SaveAudioMP3` was emitted without the required `quality` input, so every
+  generation for this family failed validation before execution with
+  `Required input is missing (quality)`. Separately, the shipped `lcm` + cfg 7 pairing renders
+  DIGITAL SILENCE at mean -91 dB while ComfyUI reports success -- a correctly-sized,
+  correctly-durated file of nothing, with nothing in the logs to grep for. The default sampler
+  is now `dpmpp_2m`; passing `sampler_name` explicitly is unaffected. The reporter measured six
+  combinations to isolate it.
+- **A ComfyUI-Manager failure now shows the Manager's own error body (#1397).** An opaque
+  exception for a deno-compatible pack reported a bare status and discarded everything the
+  Manager said about why. The body is now carried into the message, bounded, with credential
+  shapes redacted first -- git-remote userinfo, bearer/token headers, `Authorization: Basic`,
+  and cookie/session pairs.
+- **`list_local_models` `remove` says WHY it searched fewer roots than `list_paths` shows
+  (#1474).** The two tools disagreed with nothing to reconcile them. The resolver behind
+  deletion enumerates only roots provable from the running server's launch arguments, which is
+  deliberate and unchanged; the refusal now states that, and that "not found" here does NOT
+  mean "not on disk".
+- **`list_templates` says it reflects what the server REGISTERS, not what is on disk (#1454).**
+  Installed `example_workflows` were omitted from a list that looked complete.
+- **The npx update note names the restart that actually applies it (#1471).** "restart to pick
+  it up" sent users to the panel's `/restart`, which does not restart the long-lived
+  orchestrator process -- the one that keeps the build it launched with. The note now names the
+  levers that do NOT work, says an unchanged version cannot distinguish a missed restart from a
+  deliberate pin from a cached copy, and no longer claims `npm cache clean` clears npx's
+  execution cache.
+
 ## 0.50.114
 
 ### Fixed
@@ -196,6 +227,18 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.51.17] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- name the restart that actually applies an npx update (#1475)
+- show the Manager's own error body, bounded, instead of a bare status line (#1465)
+- say that list_templates reflects what the server REGISTERS, not what is on disk (#1469)
+- stable_audio_3 emits SaveAudioMP3 without required quality, and defaults to a silent sampler pair (#1466)
+- say WHY remove searched fewer roots than list_paths shows (#1476)
+
 
 ## [0.51.16] - 2026-08-12
 
