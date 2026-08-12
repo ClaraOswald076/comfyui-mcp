@@ -1676,8 +1676,116 @@ export class UiBridge {
   private readyPromise: Promise<boolean> | null = null;
   private readyResolve: ((ok: boolean) => void) | null = null;
 
-  /** Called for panel-initiated frames (no rid): user messages, hellos. */
-  onPanelMessage: ((event: PanelEvent) => void) | null = null;
+  /**
+   * Called for panel-initiated frames (no rid): user messages, hellos.
+   *
+   * #1411 — ASSIGNING THIS DRAINS WHATEVER ARRIVED BEFORE IT.
+   *
+   * The bridge binds its port and starts accepting frames several seconds before
+   * the orchestrator installs this handler (measured on the reporting machine:
+   * listening at T+0.0s, orchestrator ready at T+3.7s). Every frame in that window
+   * used to hit `this.onPanelMessage?.(…)` and vanish — accepted, stamped, echoed
+   * into the panel transcript, then dropped with no queue, no ack and no error. The
+   * user watches their own message appear and nothing happen, which reads as the
+   * agent ignoring them rather than as a fault.
+   *
+   * A panel reaches this window whenever the orchestrator restarts under an open
+   * sidebar: a self-restart on rebuild, a crash restart, a machine waking up.
+   */
+  private panelMessageHandler: ((event: PanelEvent) => void) | null = null;
+
+  get onPanelMessage(): ((event: PanelEvent) => void) | null {
+    return this.panelMessageHandler;
+  }
+
+  set onPanelMessage(fn: ((event: PanelEvent) => void) | null) {
+    this.panelMessageHandler = fn;
+    if (fn) this.drainPreHandlerFrames(fn);
+  }
+
+  /** Frames that arrived before the handler existed, in ARRIVAL ORDER — so the
+   *  handler sees the sequence the panel actually sent (its `hello` before its
+   *  first message), not a reordering invented by the queue. */
+  private preHandlerFrames: PanelEvent[] = [];
+  /** How many were refused once the cap was hit. Reported, never silent. */
+  private preHandlerDropped = 0;
+  private draining = false;
+
+  /**
+   * Bound on the pre-handler queue.
+   *
+   * The window is bounded by boot, so this is generous for the case it exists for.
+   * It is a cap rather than an unbounded buffer because nothing guarantees a
+   * handler is EVER installed — a bridge constructed without one (tests, a future
+   * embedder) would otherwise accumulate every frame for the life of the process.
+   * On overflow the EARLIEST frames are kept: the first of them is the `hello` that
+   * identifies the tab, and a message replayed without it is worth less than the
+   * message that was refused.
+   */
+  private static readonly MAX_PRE_HANDLER_FRAMES = 200;
+
+  /** Deliver a panel-initiated frame, or hold it until there is somewhere to
+   *  deliver it (#1411). Never drops silently. */
+  private deliverPanelEvent(event: PanelEvent): void {
+    const fn = this.panelMessageHandler;
+    if (fn) {
+      fn(event);
+      return;
+    }
+    if (this.preHandlerFrames.length >= UiBridge.MAX_PRE_HANDLER_FRAMES) {
+      this.preHandlerDropped += 1;
+      if (this.preHandlerDropped === 1) {
+        logger.warn(
+          `[ui-bridge] the panel-message handler is still not installed and ` +
+            `${UiBridge.MAX_PRE_HANDLER_FRAMES} frames are already held — further frames are ` +
+            `being REFUSED, not queued (#1411). Anything sent from here until the orchestrator ` +
+            `finishes starting is lost.`,
+        );
+      }
+      return;
+    }
+    this.preHandlerFrames.push(event);
+  }
+
+  /** Hand over everything held, in order, then report anything that was refused. */
+  private drainPreHandlerFrames(fn: (event: PanelEvent) => void): void {
+    if (this.draining) return; // a handler assigned FROM a handler must not re-enter
+    const held = this.preHandlerFrames;
+    if (held.length === 0 && this.preHandlerDropped === 0) return;
+    this.preHandlerFrames = [];
+    this.draining = true;
+    try {
+      logger.info(
+        `[ui-bridge] delivering ${held.length} panel frame(s) that arrived before the handler ` +
+          `was installed (#1411)`,
+      );
+      for (const event of held) {
+        try {
+          fn(event);
+        } catch (err) {
+          // One bad frame must not strand the rest — including the user's message.
+          logger.warn(
+            `[ui-bridge] a held frame threw while being delivered: ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+    } finally {
+      this.draining = false;
+    }
+    if (this.preHandlerDropped > 0) {
+      logger.warn(
+        `[ui-bridge] ${this.preHandlerDropped} panel frame(s) were REFUSED before the handler ` +
+          `was installed and are gone (#1411)`,
+      );
+      this.preHandlerDropped = 0;
+    }
+  }
+
+  /** Test seam: how many frames are held right now, and how many were refused. */
+  preHandlerBacklog(): { held: number; dropped: number } {
+    return { held: this.preHandlerFrames.length, dropped: this.preHandlerDropped };
+  }
 
   constructor(port = DEFAULT_BRIDGE_PORT, token: string | null = null, host = "127.0.0.1") {
     this.port = port;
@@ -2284,7 +2392,7 @@ export class UiBridge {
         // buffered items below — which belong to the PRIOR workflow — are NOT replayed into
         // the replacement (a wrong-conversation/media delivery). For a PROVEN reconnect it
         // drops nothing, so the replay/flush proceeds exactly as before, just after the ack.
-        this.onPanelMessage?.(msg as PanelEvent);
+        this.deliverPanelEvent(msg as PanelEvent);
         // Replay anything this tab's agent produced while the tab had no live connection
         // (its socket was re-helloed to another workflow). The panel swaps to this
         // workflow's thread synchronously, so they render + record into the RIGHT
@@ -2499,7 +2607,7 @@ export class UiBridge {
           msg.title = this.conns.get(effectiveTab)?.title;
           if (msg.type === "user_message") this.setLastActiveTab(effectiveTab);
         }
-        this.onPanelMessage?.(msg as PanelEvent);
+        this.deliverPanelEvent(msg as PanelEvent);
       }
     });
 
