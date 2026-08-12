@@ -6,7 +6,11 @@ import { dirname, join, basename, normalize, resolve, relative, sep, isAbsolute,
 import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
 import { getClient, getLogs, getSystemStats, comfyApiFetch } from "../comfyui/client.js";
 import { getExtraModelRoots, getLiveExtraModelRoots } from "./extra-paths.js";
-import { resolveEffectiveComfyUIBase, resolveLiveServerRoot } from "./workspace-env.js";
+import {
+  liveRootFromArgv,
+  resolveEffectiveComfyUIBase,
+  resolveLiveServerRoot,
+} from "./workspace-env.js";
 import { installModelViaManager } from "./node-management.js";
 import { ModelError, ValidationError, unreachableHostMessage } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -14,6 +18,7 @@ import { downloadWithCache, probeRemoteModelPayload } from "./download-cache.js"
 import { reportDownloadProgress } from "./download-progress.js";
 import type { ResumeReporter } from "./download-resume-diag.js";
 import { modelNotFoundMessage } from "./model-root-scope.js";
+import { divergentInstallRefusal } from "./download-root-correspondence.js";
 import {
   resolveModelsDir,
   resolveModelsDirWithBases,
@@ -2082,6 +2087,32 @@ export interface ResolvedDownloadTarget {
 }
 
 /**
+ * The install root the CONNECTED server reports for ITSELF, derived from its `main.py`
+ * argv — available even when it was not launched with `--base-directory`.
+ *
+ * Returns undefined on any failure. #1371's refusal is conditional on this value, so a
+ * throw here must never become a failed download: no root, no refusal.
+ */
+async function serverInstallRootOrUndefined(): Promise<string | undefined> {
+  try {
+    const stats = await getSystemStats();
+    const argv = (stats as { system?: { argv?: string[] } })?.system?.argv;
+    const cwd = (stats as { system?: { cwd?: string } })?.system?.cwd;
+    // ARGV ONLY — deliberately not resolveLiveServerRoot, which falls back to probing
+    // the live PROCESS TABLE. The repo has a gate against new code reaching that probe
+    // (#1290/#1263) precisely because it makes a test assert one thing on a machine
+    // where ComfyUI is running and another where it is not. I reached for the shared
+    // resolver first and that gate caught it.
+    //
+    // Argv is also the right evidence here: it is what the connected server itself
+    // reported, so it cannot describe some other process that happens to be running.
+    return liveRootFromArgv(argv, cwd) || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * The SINGLE source of truth for a model download's final on-disk destination,
  * shared by downloadModel (the writer) AND the background job registry (which
  * keys jobs by this canonical `targetPath`, so any two requests that resolve to
@@ -2123,6 +2154,33 @@ export async function resolveDownloadTarget(
       "Refusing to write outside the target model directory.",
       { filename: rawFilename },
     );
+  }
+  // #1371 — a stale COMFYUI_PATH wrote a model into a DIFFERENT local install than the
+  // one serving the session. The destination is rooted at the server's own models dir
+  // when it can be, but falls back to <COMFYUI_PATH>/models when the server was not
+  // launched with --base-directory — and nothing then checked that the fallback belongs
+  // to THAT server.
+  //
+  // A server can still name its install root through its main.py argv. When it does and
+  // the destination is outside it, the installs are PROVABLY different. Positive
+  // evidence, so this does not reintroduce the false-refusal class the content check's
+  // own note warns about — and it is skipped entirely when the destination came from
+  // the live server (nothing to disagree with) or when no root can be derived.
+  if (!liveRootAtResolve) {
+    const refusal = divergentInstallRefusal({
+      targetDir,
+      serverRoot: await serverInstallRootOrUndefined(),
+      // Defensive: this is decoration on a refusal, and an existing suite mocks
+      // config.js without this export — a message detail must never fail a download.
+      serverUrl: (() => {
+        try {
+          return getComfyUIBaseUrl();
+        } catch {
+          return undefined;
+        }
+      })(),
+    });
+    if (refusal) throw new ModelError(refusal, { path: targetDir });
   }
   return { targetDir, filename: resolvedFilename, targetPath, liveRootAtResolve };
 }
