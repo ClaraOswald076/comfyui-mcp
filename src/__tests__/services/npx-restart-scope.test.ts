@@ -24,7 +24,16 @@ describe("#1471 the note names the restart that works", () => {
 
   it("still says what npx does, and when", () => {
     expect(note).toMatch(/0\.51\.16 available/);
-    expect(note).toMatch(/NEXT LAUNCH/);
+    expect(note).toMatch(/next launch/i);
+  });
+
+  it("says npx will TRY to resolve, not that it WILL fetch the latest", () => {
+    // Round 2 of review, and a fair hit: "npx fetches the latest on its next launch"
+    // is false for a pinned package spec or an offline/preferred cache. Promising the
+    // fetch makes the next sentence ("re-check the version") read as a clean pass/fail
+    // when it is not one.
+    expect(note).toMatch(/TRY to resolve/);
+    expect(note).not.toMatch(/npx fetches the latest/);
   });
 
   it("names the restarts that do NOT apply it", () => {
@@ -46,11 +55,22 @@ describe("#1471 the note names the restart that works", () => {
     expect(note).toMatch(/npx -y comfyui-mcp/);
   });
 
-  it("names the check that CONFIRMS it, and what proves nothing", () => {
-    // The reporter's own method: the reported currentVersion is the only evidence.
+  it("names the check, and refuses to over-read its result", () => {
+    // The check is real evidence but NOT a diagnosis: an unchanged version cannot
+    // distinguish "the restart never reached this process" from "npx relaunched and
+    // the cache served the old build". Claiming it proves the update was not applied
+    // is the same over-claim this whole issue is about - a message that reads as
+    // conclusive when it is only suggestive.
     expect(note).toMatch(/self_update_action:"status"/);
-    expect(note).toMatch(/Until the reported currentVersion changes/);
-    expect(note).toMatch(/whatever any restart appeared to do/);
+    expect(note).toMatch(/does not say why/);
+    expect(note).toMatch(/look identical from here/);
+    expect(note).not.toMatch(/whatever any restart appeared to do/);
+  });
+
+  it("names the cache as the other suspect, with a way out", () => {
+    expect(note).toMatch(/cache/i);
+    expect(note).toMatch(/pinned package spec/);
+    expect(note).toMatch(/npm cache clean --force/);
   });
 
   it("no longer promises that a bare restart suffices", () => {

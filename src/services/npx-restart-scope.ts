@@ -29,13 +29,17 @@
  */
 export function npxUpdateNote(latest: string): string {
   return (
-    `${latest} available — npx fetches the latest on its NEXT LAUNCH, so the update ` +
-    `arrives when this server process is started again. The panel's /restart and ` +
-    `panel_reload do NOT do that: they restart ComfyUI and the agent, not the ` +
-    `long-lived orchestrator process serving these tools, which keeps the build it ` +
-    `started with (#1471). Stop that process and start it again — the same command ` +
-    `that launched it (npx -y comfyui-mcp ...) — then re-check with ` +
-    `self_update_action:"status". Until the reported currentVersion changes, the ` +
-    `update has NOT been applied, whatever any restart appeared to do.`
+    `${latest} available — on its next launch npx will TRY to resolve the latest ` +
+    `version, so the update can only arrive when this server process is started ` +
+    `again. The panel's /restart and panel_reload do NOT do that: they restart ` +
+    `ComfyUI and the agent, not the long-lived orchestrator process serving these ` +
+    `tools, which keeps the build it started with (#1471). Stop that process and ` +
+    `start it again — the same command that launched it (npx -y comfyui-mcp ...) — ` +
+    `then re-check with self_update_action:"status". If currentVersion is unchanged ` +
+    `the new build is NOT running, but that alone does not say why: a restart that ` +
+    `never reached this process and a relaunch served an older build from the npx ` +
+    `cache look identical from here. If you did restart this process and the version ` +
+    `still has not moved, suspect the cache — a pinned package spec (comfyui-mcp@X) ` +
+    `pins it by design, and \`npm cache clean --force\` clears a stale entry.`
   );
 }
