@@ -239,3 +239,29 @@ describe("panel#1097: only a SWITCH refusal that then succeeds clears the run", 
     expect(switchHoldFor("tab-1"), "the switch run is not evidence about a reconnect").toBeTruthy();
   });
 });
+
+describe("panel#1097: what a SUCCESS proves depends on the command", () => {
+  // Two rounds pulled opposite ways here. Clearing on every routed success let an
+  // unguarded read wipe the evidence while graph commands stayed refused (r2);
+  // clearing only on a switch-retry left a stale run for the next, unrelated
+  // switch to inherit (r4). The guard's domain is what both agree on.
+  it("an ordinary first-attempt graph success clears the run", async () => {
+    const stuck = makePanelToolCtx(bridgeFailing(99), "tab-1");
+    await stuck.call({ cmd: "graph_outline" });
+    expect(switchHoldFor("tab-1")).toBeTruthy();
+
+    const healthy = makePanelToolCtx(bridgeFailing(0), "tab-1");
+    expect((await healthy.call({ cmd: "graph_outline" })).isError).toBeFalsy();
+    expect(switchHoldFor("tab-1"), "the switch is demonstrably over").toBeUndefined();
+  });
+
+  it("a NON-guard command's success does not — it was never refused", async () => {
+    const stuck = makePanelToolCtx(bridgeFailing(99), "tab-1");
+    await stuck.call({ cmd: "graph_outline" });
+    expect(switchHoldFor("tab-1")).toBeTruthy();
+
+    const healthy = makePanelToolCtx(bridgeFailing(0), "tab-1");
+    expect((await healthy.call({ cmd: "panel_status" })).isError).toBeFalsy();
+    expect(switchHoldFor("tab-1"), "a status read proves nothing about the switch").toBeTruthy();
+  });
+});

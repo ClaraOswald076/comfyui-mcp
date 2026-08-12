@@ -56,6 +56,7 @@ import {
   clearSwitchHold,
   describeSwitchHold,
   recordSwitchHold,
+  successProvesSwitchCleared,
 } from "./switch-hold.js";
 import { NO_ORIGIN_REMEDY } from "./fence-refusal.js";
 
@@ -6183,7 +6184,13 @@ export function makePanelToolCtx(
         await awaitReachable();
       }
       ensureReachable();
-      return ok(await sendRouted(cmd, timeoutMs, observeRid));
+      const firstTry = ok(await sendRouted(cmd, timeoutMs, observeRid));
+      // panel#1097 — a guard-domain command that SUCCEEDS is the evidence that the
+      // switch is over, whichever attempt lands it. Without this an ordinary
+      // first-attempt success left the old run in place, and a later unrelated
+      // switch inherited its age and was announced as stuck at once (codex r4).
+      if (successProvesSwitchCleared(cmd.cmd)) clearSwitchHold(ctx.tabId);
+      return firstTry;
     } catch (err) {
       // Post-reconnect retry-once: a reboot/free_vram/reconnect can drop the tab's
       // transport (or replace it under a new tab id) the instant after we dispatch.
@@ -6213,7 +6220,12 @@ export function makePanelToolCtx(
           // (codex round 2); clearing after a transient-reconnect retry does the
           // same thing one step removed, because reconnecting proves nothing about
           // whether the switch cleared (codex round 3).
-          if (isWorkflowSwitchGuardRefusal(err)) clearSwitchHold(holdTab);
+          // Same rule on the retry path. A transient-RECONNECT retry that succeeds
+          // proves nothing about the switch (codex r3), so the command still has to
+          // be one the guard would have refused.
+          if (isWorkflowSwitchGuardRefusal(err) && successProvesSwitchCleared(cmd.cmd)) {
+            clearSwitchHold(holdTab);
+          }
           return retried;
         } catch (err2) {
           // #1027 — a switch STILL in progress is not a reconnect, and saying so

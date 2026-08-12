@@ -124,3 +124,23 @@ export function describeSwitchHold(hold: Hold | undefined, now: number = Date.no
     `the first and never the second, so if it keeps growing, look at the canvas.`
   );
 }
+
+/**
+ * Is this command one the switch guard would refuse — i.e. does its success prove
+ * the switch has cleared?
+ *
+ * Two review rounds pulled in opposite directions and this is what they agree on.
+ * Clearing on EVERY routed success let an unguarded status read wipe the evidence
+ * while graph commands stayed refused (round 2). Clearing only on the retry of a
+ * switch refusal left a stale run behind after an ordinary first-attempt success,
+ * so a later, unrelated switch inherited its age and was announced as stuck
+ * immediately (round 4).
+ *
+ * The panel refuses "every graph and workflow executor" while switching — that is
+ * the domain, and the success of one of those is exactly the evidence that the
+ * switch is over.
+ */
+export function successProvesSwitchCleared(cmd: unknown): boolean {
+  const name = typeof cmd === "string" ? cmd : undefined;
+  return typeof name === "string" && /^(graph_|workflow_)/.test(name);
+}
