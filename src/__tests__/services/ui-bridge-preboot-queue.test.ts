@@ -191,6 +191,57 @@ describe("#1411 a self-feeding handler cannot wedge the event loop", () => {
   });
 });
 
+describe("#1411 nothing overtakes a frame that is still waiting (codex round 3)", () => {
+  it("a live frame arriving BEFORE the continuation lands behind the queued one", async () => {
+    // A,B are the backlog; handling A queues C, which the budget defers to the next
+    // tick. A socket frame D arriving in that gap must NOT be delivered around C —
+    // the panel sent C first, so A,B,D,C would be a reordering the queue exists to
+    // prevent.
+    deliver(msg("A"));
+    deliver(msg("B"));
+
+    const seen: string[] = [];
+    bridge.onPanelMessage = (e) => {
+      const text = (e as unknown as { text: string }).text;
+      seen.push(text);
+      if (text === "A") deliver(msg("C"));
+    };
+    expect(seen).toEqual(["A", "B"]); // pass over, C still queued
+
+    deliver(msg("D")); // the socket keeps running while the continuation is pending
+    expect(seen).toEqual(["A", "B"]); // …and D did not jump the queue
+
+    for (let i = 0; i < 5 && bridge.preHandlerBacklog().held > 0; i++) await tick();
+    expect(seen).toEqual(["A", "B", "C", "D"]);
+  });
+
+  it("stop() cancels a pending continuation instead of firing after teardown", async () => {
+    const port = await freePort();
+    const live = new UiBridge(port);
+    live.start();
+    expect(await live.whenReady()).toBe(true);
+
+    const raw = live as unknown as { deliverPanelEvent: (e: PanelEvent) => void };
+    // A must be BACKLOG, not a live delivery: only a drain pass can leave work for
+    // a continuation, which is the thing being cancelled here.
+    raw.deliverPanelEvent(msg("A"));
+
+    const seen: string[] = [];
+    live.onPanelMessage = (e) => {
+      const text = (e as unknown as { text?: string }).text ?? "";
+      seen.push(text);
+      if (text === "A") raw.deliverPanelEvent(msg("after-stop")); // queued mid-drain
+    };
+    expect(seen).toEqual(["A"]);
+    expect(live.preHandlerBacklog().held).toBe(1); // waiting on the continuation
+
+    await live.stop();
+    for (let i = 0; i < 5; i++) await tick();
+
+    expect(seen).toEqual(["A"]); // the continuation was cancelled, not run after stop
+  });
+});
+
 describe("#1411 the queue is BOUNDED, and says so", () => {
   it("refuses past the cap rather than growing without limit", async () => {
     // Nothing guarantees a handler is ever installed; an unbounded buffer would be

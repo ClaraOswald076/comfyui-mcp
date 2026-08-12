@@ -1711,6 +1711,7 @@ export class UiBridge {
   private preHandlerDropped = 0;
   private draining = false;
   private drainScheduled = false;
+  private pendingDrain: ReturnType<typeof setImmediate> | null = null;
 
   /**
    * Bounds on the pre-handler queue — COUNT and BYTES (codex review, P1).
@@ -1744,11 +1745,15 @@ export class UiBridge {
    *  deliver it (#1411). Never drops silently. */
   private deliverPanelEvent(event: PanelEvent): void {
     const fn = this.panelMessageHandler;
-    // While a drain is in flight the queue is still the ordering authority: a
-    // frame that arrives BECAUSE an earlier one is being handled must land BEHIND
-    // whatever is still held (codex review, P1). Delivering it now would reorder
-    // A, B, C into A, C, B.
-    if (fn && !this.draining) {
+    // The queue is the ordering authority whenever ANYTHING is still waiting on it
+    // (codex rounds 1 and 3, both P1). Three conditions, one rule — deliver
+    // directly only when there is nothing ahead of this frame:
+    //   * a drain in flight: a frame produced BY a handler must land behind what is
+    //     still held, or A,B,C arrives as A,C,B;
+    //   * a scheduled continuation: a socket frame D arriving between the pass and
+    //     its setImmediate would otherwise overtake the C that is already queued;
+    //   * a non-empty queue at all: nothing may be delivered around held frames.
+    if (fn && !this.draining && !this.drainScheduled && this.preHandlerFrames.length === 0) {
       fn(event);
       return;
     }
@@ -1825,10 +1830,18 @@ export class UiBridge {
     // and never spun on: each pass does a bounded amount of synchronous work.
     if (this.preHandlerFrames.length > 0 && this.panelMessageHandler && !this.drainScheduled) {
       this.drainScheduled = true;
-      setImmediate(() => {
+      const pending = setImmediate(() => {
+        this.pendingDrain = null;
         this.drainScheduled = false;
         this.drainPreHandlerFrames();
       });
+      // UNREF'd (codex round 3, P1): a handler that emits a frame per delivery keeps
+      // one continuation perpetually pending, and a referenced immediate would stop
+      // a short-lived CLI — or a test — from ever exiting. Held so stop() can cancel
+      // it: a bridge torn down inside the schedule-to-callback window must not run
+      // it afterwards.
+      pending.unref?.();
+      this.pendingDrain = pending;
     }
     if (delivered > 0) {
       logger.info(
@@ -4661,6 +4674,11 @@ export class UiBridge {
   }
 
   async stop(): Promise<void> {
+    if (this.pendingDrain) {
+      clearImmediate(this.pendingDrain);
+      this.pendingDrain = null;
+      this.drainScheduled = false;
+    }
     for (const armed of this.tabGoneTimers.values()) clearTimeout(armed.timer);
     this.tabGoneTimers.clear();
     if (this.bindRetryTimer) {
