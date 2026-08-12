@@ -315,7 +315,7 @@ describe("#646 a graph_ prefix does not mean the effect is on the canvas", () =>
 });
 
 describe("#646 workflow navigation has a reader too", () => {
-  it("workflow_open / workflow_new name panel_list_workflows", () => {
+  it("workflow_open / workflow_new name the OPEN RECEIPT, not `active`", () => {
     // Found by running the LIVE panel's registered command names through the
     // classifier after the fix merged: these two fell to the default branch, which
     // names no tool. Not wrong — but a reader that can answer exists, and naming it
@@ -324,12 +324,38 @@ describe("#646 workflow navigation has a reader too", () => {
     // navigation differently, but the EVIDENCE is the same.
     for (const cmd of ["workflow_open", "workflow_new"]) {
       const text = midCommandVerifyClause(cmd);
-      expect(text, cmd).toMatch(/panel_list_workflows/);
+      expect(text, cmd).toMatch(/last_open_receipt/);
+      // codex review, P1: the first attempt named panel_list_workflows and stopped
+      // there, on the reasoning that an opened workflow appears in it. The panel had
+      // already written the rebuttal — after a backend reconnect the frontend restores
+      // a tab BY ITSELF, so `active` matching your target is not proof your open ran.
+      // Naming that as the check would have been this module's own defect, for the one
+      // command class that already has a purpose-built correct mechanism.
+      expect(text, cmd).toMatch(/Do NOT conclude anything from `active`/);
+      // The instruction AND the reason. A mutation that kept "restores a tab by
+      // itself" but deleted what it explains survived an earlier version of this —
+      // and the causal half is the part that stops an agent reasoning its way back
+      // to `active` ("but it matched, so surely…").
+      expect(text, cmd).toMatch(/restores a tab by\s+itself/);
+      expect(text, cmd).toMatch(/without your command ever running/);
+      // A receipt is over-readable without the rule that scopes it.
+      expect(text, cmd).toMatch(/answers ONLY for the command whose id equals/);
       expect(text, cmd).not.toMatch(/panel_query_graph/);
       expect(text, cmd).not.toMatch(/queue action:"list"/);
     }
+    // All three applied states, because they demand different actions.
+    const open = midCommandVerifyClause("workflow_open");
+    expect(open).toMatch(/`applied:true`/);
+    expect(open).toMatch(/`applied:false`.*safe to re-issue/);
+    expect(open).toMatch(/must NOT be blindly retried/);
     // And the specific cost of a blind retry, which differs from the mutators'.
-    expect(midCommandVerifyClause("workflow_new")).toMatch(/two empty tabs/);
+    // Asserted as a PROPERTY — that the cost of a blind retry is stated, and stated
+    // for workflow_new specifically. A control mutation swapping "empty" for "blank"
+    // killed the literal form, which punishes rewording rather than protecting
+    // behaviour.
+    const nw = midCommandVerifyClause("workflow_new");
+    expect(nw).toMatch(/blind retry costs/);
+    expect(nw).toMatch(/second workflow_new/);
   });
 
   it("navigation is still NOT treated as an active-workflow mutator", () => {

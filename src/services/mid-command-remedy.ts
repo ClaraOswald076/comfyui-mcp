@@ -112,9 +112,23 @@ const WORKFLOW_MUTATORS = new Set<string>([
  *  panel_list_workflows.
  *
  *  Found by running the LIVE panel's registered command names through this classifier
- *  after the fix merged — these two fell to the default branch, which names no tool at
- *  all. Not wrong, but a reader that can answer exists, and the point of this module is
- *  to name it. */
+ *  after the fix merged — these two fell to the default branch, which names no tool.
+ *
+ *  The first attempt sent them to `panel_list_workflows` on the reasoning that an opened
+ *  workflow appears there. Codex caught it, and the panel had already written the
+ *  rebuttal: `active` matching your target is NOT proof your open ran, because after a
+ *  backend reconnect the frontend restores a tab BY ITSELF (#433). Naming that reader
+ *  would have been the exact defect this module exists to remove — a confident check
+ *  that cannot answer — for the one command class that already has a purpose-built
+ *  correct mechanism.
+ *
+ *  That mechanism is the panel's OPEN RECEIPTS (#402): every workflow_open/workflow_new
+ *  that RAN is journaled with the selector it was asked for, the identity it resolved
+ *  to, and whether it applied. The latest one rides in the workflow-list reply as
+ *  `last_open_receipt`, and it answers ONLY for the command whose id equals its `rid` —
+ *  so an EARLIER successful open of the same file is not evidence about a later dropped
+ *  one. The message says both halves, because the receipt is over-readable without the
+ *  rule that comes with it. */
 const WORKFLOW_NAVIGATION = new Set<string>(["workflow_open", "workflow_new"]);
 
 export function midCommandVerifyClause(cmd: string): string {
@@ -155,9 +169,15 @@ export function midCommandVerifyClause(cmd: string): string {
   }
   if (WORKFLOW_NAVIGATION.has(cmd)) {
     return (
-      `Verify with panel_list_workflows before retrying — an opened or newly created ` +
-      `workflow appears there. If it is already open, do NOT re-issue it: a second ` +
-      `workflow_new leaves the user with two empty tabs.`
+      `Verify with panel_list_workflows and read its \`last_open_receipt\` — the panel's own ` +
+      `execution record for opens (#402). It answers ONLY for the command whose id equals ` +
+      `its \`rid\`: \`applied:true\` means it completed, \`applied:false\` means nothing was ` +
+      `applied and it is safe to re-issue, \`applied:"unknown"\` means it may have taken ` +
+      `effect and must NOT be blindly retried. Do NOT conclude anything from \`active\` ` +
+      `matching your target, and do not read an EARLIER receipt for the same file as ` +
+      `evidence about this one — after a backend reconnect the frontend restores a tab by ` +
+      `itself, which explains a matching \`active\` without your command ever running. A ` +
+      `blind retry costs: a second workflow_new leaves the user with two empty tabs.`
     );
   }
   if (WORKFLOW_MUTATORS.has(cmd)) {
