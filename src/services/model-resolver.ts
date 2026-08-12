@@ -6,7 +6,11 @@ import { dirname, join, basename, normalize, resolve, relative, sep, isAbsolute,
 import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
 import { getClient, getLogs, getSystemStats, comfyApiFetch } from "../comfyui/client.js";
 import { getExtraModelRoots, getLiveExtraModelRoots } from "./extra-paths.js";
-import { resolveEffectiveComfyUIBase, resolveLiveServerRoot } from "./workspace-env.js";
+import {
+  liveRootFromArgv,
+  resolveEffectiveComfyUIBase,
+  resolveLiveServerRoot,
+} from "./workspace-env.js";
 import { installModelViaManager } from "./node-management.js";
 import { ModelError, ValidationError, unreachableHostMessage } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -14,6 +18,7 @@ import { downloadWithCache, probeRemoteModelPayload } from "./download-cache.js"
 import { reportDownloadProgress } from "./download-progress.js";
 import type { ResumeReporter } from "./download-resume-diag.js";
 import { modelNotFoundMessage } from "./model-root-scope.js";
+import { divergentInstallRefusal } from "./download-root-correspondence.js";
 import {
   resolveModelsDir,
   resolveModelsDirWithBases,
@@ -2081,6 +2086,13 @@ export interface ResolvedDownloadTarget {
   liveRootAtResolve?: string;
 }
 
+/** The models CATEGORY a target subfolder belongs to — its first segment. Live extra
+ *  roots are category-scoped, so a `checkpoints` root must not vouch for a LoRA. */
+function normalizedSubfolderFor(targetSubfolder: string): string | undefined {
+  const first = (targetSubfolder ?? "").trim().replace(/\\/g, "/").split("/")[0];
+  return first || undefined;
+}
+
 /**
  * The SINGLE source of truth for a model download's final on-disk destination,
  * shared by downloadModel (the writer) AND the background job registry (which
@@ -2123,6 +2135,35 @@ export async function resolveDownloadTarget(
       "Refusing to write outside the target model directory.",
       { filename: rawFilename },
     );
+  }
+  // #1371 — a stale COMFYUI_PATH wrote a model into a DIFFERENT local install than the
+  // one serving the session. The destination is rooted at the server's own models dir
+  // when it can be, but falls back to <COMFYUI_PATH>/models when the server was not
+  // launched with --base-directory — and nothing then checked that the fallback belongs
+  // to THAT server.
+  //
+  // A server can still name its install root through its main.py argv. When it does and
+  // the destination is outside it, the installs are PROVABLY different. Positive
+  // evidence, so this does not reintroduce the false-refusal class the content check's
+  // own note warns about — and it is skipped entirely when the destination came from
+  // the live server (nothing to disagree with) or when no root can be derived.
+  if (!liveRootAtResolve) {
+    const membership = await isUnderLiveModelRoots(targetDir, normalizedSubfolderFor(targetSubfolder));
+    const refusal = divergentInstallRefusal({
+      targetDir,
+      inRoots: membership.inRoots,
+      liveRoot: membership.liveRoot,
+      // Defensive: decoration on a refusal, and an existing suite mocks config.js
+      // without this export — a message detail must never fail a download.
+      serverUrl: (() => {
+        try {
+          return getComfyUIBaseUrl();
+        } catch {
+          return undefined;
+        }
+      })(),
+    });
+    if (refusal) throw new ModelError(refusal, { path: targetDir });
   }
   return { targetDir, filename: resolvedFilename, targetPath, liveRootAtResolve };
 }
