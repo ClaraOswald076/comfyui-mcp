@@ -34,12 +34,15 @@ export function npxUpdateNote(latest: string): string {
     `again. The panel's /restart and panel_reload do NOT do that: they restart ` +
     `ComfyUI and the agent, not the long-lived orchestrator process serving these ` +
     `tools, which keeps the build it started with (#1471). Stop that process and ` +
-    `start it again — the same command that launched it (npx -y comfyui-mcp ...) — ` +
-    `then re-check with self_update_action:"status". If currentVersion is unchanged ` +
-    `the new build is NOT running, but that alone does not say why: a restart that ` +
-    `never reached this process and a relaunch served an older build from the npx ` +
-    `cache look identical from here. If you did restart this process and the version ` +
-    `still has not moved, suspect the cache — a pinned package spec (comfyui-mcp@X) ` +
-    `pins it by design, and \`npm cache clean --force\` clears a stale entry.`
+    `start it again with the SAME command that launched it — whatever that was; if ` +
+    `it named a version (comfyui-mcp@X) keep that, because changing it here would ` +
+    `silently undo a pin you chose. Then re-check with self_update_action:"status". ` +
+    `If currentVersion is unchanged the new build is NOT running, but that alone ` +
+    `does not say why — a restart that never reached this process, a deliberate ` +
+    `version pin, and npx's execution cache serving an older copy all look identical ` +
+    `from here. If you did restart this process and meant to be on the latest, ` +
+    `relaunch once with an explicit comfyui-mcp@latest: that overrides both a pin ` +
+    `and a cached copy, which is what makes it the check worth running (note that ` +
+    `npm cache clean does NOT clear npx's execution cache — a different cache).`
   );
 }
