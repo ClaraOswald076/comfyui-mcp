@@ -6166,6 +6166,11 @@ export function makePanelToolCtx(
       dispatchedRid = rid;
       onDispatchedRid?.(rid);
     };
+    // panel#1097 — captured BEFORE any await, and used by BOTH the success and the
+    // refusal paths. `ctx.tabId` is mutable and ensureReachable can rebind this
+    // session onto another tab mid-flight, so reading it after the await can clear
+    // or age the WRONG tab's run (codex review).
+    const holdTab = ctx.tabId;
     try {
       // #436: a MUTATING graph edit must not fire into the "Connected: none"
       // window a ComfyUI restart/reload opens. A read survives that window (it is
@@ -6184,10 +6189,9 @@ export function makePanelToolCtx(
       }
       ensureReachable();
       const sent = ok(await sendRouted(cmd, timeoutMs, observeRid));
-      // panel#1097 — the switch cleared, so a LATER refusal starts a fresh run
-      // rather than inheriting this one's age. Without this the elapsed figure only
-      // ever grows, and a message built on it becomes as misleading as none.
-      clearSwitchHold(ctx.tabId);
+      // The switch cleared, so a LATER refusal starts a fresh run rather than
+      // inheriting this one's age — otherwise the figure only ever grows.
+      clearSwitchHold(holdTab);
       return sent;
     } catch (err) {
       // Post-reconnect retry-once: a reboot/free_vram/reconnect can drop the tab's
@@ -6214,7 +6218,7 @@ export function makePanelToolCtx(
             // panel#1097 — time the RUN of these refusals. "Simply retry" is right
             // for the fraction of a second this normally lasts and wrong for a
             // switch held open by a dialog, and the two were indistinguishable.
-            const held = describeSwitchHold(recordSwitchHold(ctx.tabId));
+            const held = describeSwitchHold(recordSwitchHold(holdTab));
             return fail(
               `${name} was NOT applied — nothing changed. The panel is still switching or ` +
                 `reloading the workflow on the canvas, which it refuses commands during so a ` +

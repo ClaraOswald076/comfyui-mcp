@@ -31,12 +31,31 @@ interface Hold {
 
 const holds = new Map<string, Hold>();
 
+/** A run nobody has touched for this long is over — the tab closed, rebound, or
+ *  simply moved on without a routed success to clear it. Without eviction this map
+ *  keeps an entry per tab id for the life of the process (codex review), and a
+ *  reused id would inherit a stale age. */
+const HOLD_TTL_MS = 10 * 60 * 1000;
+/** A hard ceiling for the pathological case (many short-lived tab ids). Oldest
+ *  runs go first: the freshest are the ones a message could still be built from. */
+const MAX_HOLDS = 200;
+
+function evict(now: number): void {
+  for (const [tab, hold] of holds) {
+    if (now - hold.since > HOLD_TTL_MS) holds.delete(tab);
+  }
+  if (holds.size <= MAX_HOLDS) return;
+  const byAge = [...holds.entries()].sort((a, b) => a[1].since - b[1].since);
+  for (const [tab] of byAge.slice(0, holds.size - MAX_HOLDS)) holds.delete(tab);
+}
+
 /**
  * Record a switch-guard refusal for `tabId` and return the run so far.
  *
  * `now` is injected so the wording is testable without faking a clock.
  */
 export function recordSwitchHold(tabId: string, now: number = Date.now()): Hold {
+  evict(now);
   const prev = holds.get(tabId);
   // A clock that jumped backwards must not produce a negative age: restart the run
   // rather than report something that cannot be true.
@@ -82,10 +101,16 @@ export function describeSwitchHold(hold: Hold | undefined, now: number = Date.no
   if (!Number.isFinite(ms) || ms < 3000 || hold.count < 2) return "";
   const secs = Math.round(ms / 1000);
   const howLong = secs < 90 ? `${secs}s` : `${Math.round(secs / 60)}m`;
+  // States the OBSERVATION and both explanations, never a verdict (codex review).
+  // Elapsed time does not prove a modal: a very large graph, a slow disk or a
+  // remote canvas can legitimately switch for longer than this, and telling that
+  // user the canvas is "not busy" and that retrying cannot work would be wrong in
+  // the one direction that costs them the thing that would have worked.
   return (
-    ` THIS HAS BEEN HELD FOR ${howLong} across ${hold.count} attempts, which is far longer than a ` +
-    `switch takes — treat the canvas as waiting for a person, not as busy. A load dialog, an ` +
-    `unsaved-changes prompt, or a modal on the ComfyUI tab will hold it open indefinitely, and no ` +
-    `number of retries will clear it.`
+    ` THIS HAS BEEN HELD FOR ${howLong} across ${hold.count} refusals, which is longer than a ` +
+    `switch usually takes. Two things look like this: it may still be loading — a very large ` +
+    `graph, a slow disk, a remote canvas — or it may be held open by something on the ComfyUI ` +
+    `tab awaiting a person, such as a load dialog or an unsaved-changes prompt. Retrying clears ` +
+    `the first and never the second, so if it keeps growing, look at the canvas.`
   );
 }

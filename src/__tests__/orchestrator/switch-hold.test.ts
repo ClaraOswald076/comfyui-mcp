@@ -76,17 +76,41 @@ describe("panel#1097 what it says, and when it says nothing", () => {
     const held = recordSwitchHold("tab", T0 + 4000);
     const text = describeSwitchHold(held, T0 + 4000);
     expect(text).toContain("HELD FOR 4s");
-    expect(text).toContain("across 2 attempts");
+    expect(text).toContain("across 2 refusals");
   });
 
-  it("names the human-waiting cause, and that retrying cannot fix it", () => {
+  it("offers BOTH explanations and asserts neither", () => {
+    // codex review, P1: elapsed time does not prove a modal. A very large graph, a
+    // slow disk or a remote canvas can legitimately switch for longer than this,
+    // and telling that user the canvas is "not busy" and that retrying cannot work
+    // would be wrong in the one direction that costs them the fix.
     recordSwitchHold("tab", T0);
     const held = recordSwitchHold("tab", T0 + 240_000);
     const text = describeSwitchHold(held, T0 + 240_000);
     expect(text).toContain("HELD FOR 4m");
-    expect(text).toContain("waiting for a person");
+    expect(text).toContain("it may still be loading");
     expect(text).toMatch(/load dialog|unsaved-changes prompt/);
-    expect(text).toContain("no number of retries will clear it");
+    expect(text).toContain("Retrying clears the first and never the second");
+    // The verdicts that are not established by elapsed time.
+    expect(text).not.toContain("waiting for a person, not as busy");
+    expect(text).not.toContain("no number of retries will clear it");
+  });
+
+  it("counts REFUSALS, and says so — that is what it measures", () => {
+    // codex review, P2: "attempts" overstated it. The run counts terminal refusals,
+    // not routed sends, and with a ~400ms settle those differ by a factor of two.
+    recordSwitchHold("tab", T0);
+    const held = recordSwitchHold("tab", T0 + 5000);
+    expect(describeSwitchHold(held, T0 + 5000)).toContain("across 2 refusals");
+  });
+
+  it("evicts runs nobody has touched, so the map cannot grow forever", () => {
+    // codex review, P2: without eviction an entry survives per tab id for the life
+    // of the process, and a reused id inherits a stale age.
+    recordSwitchHold("old-tab", T0);
+    recordSwitchHold("new-tab", T0 + 11 * 60_000);
+    expect(switchHoldFor("old-tab")).toBeUndefined();
+    expect(switchHoldFor("new-tab")).toBeTruthy();
   });
 
   it("renders minutes past 90s and seconds below it", () => {

@@ -154,8 +154,11 @@ describe("panel#1097: a switch that never clears stops reading like one that wil
     const text = textOf(await ctx.call({ cmd: "graph_outline" }));
 
     expect(text).toContain("HELD FOR");
-    expect(text).toContain("waiting for a person");
-    expect(text).toContain("no number of retries will clear it");
+    // Both explanations, neither asserted (codex review) — elapsed time does not
+    // prove a modal, and a large graph or remote canvas can legitimately take this.
+    expect(text).toContain("it may still be loading");
+    expect(text).toContain("awaiting a person");
+    expect(text).toContain("Retrying clears the first and never the second");
   }, 15_000);
 
   it("a SUCCESS between refusals resets the run — the age is not cumulative", async () => {
