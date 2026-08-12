@@ -114,23 +114,44 @@ describe("#890 WIRING: it reaches both results and both renderers", () => {
     // path — and nothing is installed on that branch, which makes it read as the MOST
     // settled answer of the three.
     //
-    // Anchored on the FIELD, not on return-block boundaries: the returns sit at
-    // different nesting depths, so an indent/brace terminator matched nothing and an
-    // earlier version of this test passed while checking zero sites. The `const `
-    // exclusion keeps the local `const unresolved: string[] = []` declaration out —
-    // that is not a reply, and demanding the caveat near it fails for no reason.
+    // The window is bounded to the ENCLOSING OBJECT by brace depth, not by a character
+    // count (codex round 3). A fixed 2600-char forward scan happened to be correct at
+    // today's distances — removing the early return's caveat did fail this test — but
+    // its correctness rested on two returns staying far enough apart, so an edit that
+    // moved them closer would let one return's caveat satisfy another's check and the
+    // test would pass while `unresolved` went out bare. That is the vacuous pass this
+    // test exists to prevent, so it must not depend on layout.
+    //
+    // Anchored on the FIELD rather than on `return {`: the returns sit at different
+    // nesting depths, and an indent-based terminator matched nothing at all. The
+    // `const ` exclusion drops the local `const unresolved: string[] = []` declaration,
+    // which is not a reply.
     const FIELD = new RegExp(String.raw`\n\s+unresolved: `, "g");
     const sites = [...deps.matchAll(FIELD)]
       .map((m) => m.index ?? 0)
       .filter((i) => !/const\s+$/.test(deps.slice(Math.max(0, i - 24), i + 1)));
     expect(sites.length).toBeGreaterThanOrEqual(3); // analysis + install + early return
+
+    /** The rest of the object literal this field sits in — to its matching `}`. */
+    const enclosingObject = (from: number): string => {
+      let depth = 1; // we are already inside the object that holds this field
+      for (let j = from; j < deps.length; j++) {
+        const c = deps[j];
+        if (c === "{") depth++;
+        else if (c === "}") {
+          depth--;
+          if (depth === 0) return deps.slice(from, j);
+        }
+      }
+      return deps.slice(from); // unbalanced — fail loudly below rather than pass
+    };
+
     for (const i of sites) {
-      // FORWARD-only, and wide enough to clear a long message literal: the install
-      // return carries ~600 characters of `catalogue_unavailable` prose between the
-      // field and the caveat, so a 900-char window reported a defect that was not one.
-      // Forward-only also means a neighbouring return's caveat cannot satisfy this one.
-      const window = deps.slice(i, i + 2600);
-      expect(window, deps.slice(i, i + 60)).toMatch(/catalogue_currency_unverified/);
+      const object = enclosingObject(i);
+      // A bound that is not a bound would reintroduce the vacuous pass, so assert the
+      // walk actually terminated before the end of the file.
+      expect(object.length).toBeLessThan(deps.length - i);
+      expect(object, deps.slice(i, i + 60)).toMatch(/catalogue_currency_unverified/);
     }
   });
 
