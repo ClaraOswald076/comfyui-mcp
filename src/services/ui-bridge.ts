@@ -1676,8 +1676,220 @@ export class UiBridge {
   private readyPromise: Promise<boolean> | null = null;
   private readyResolve: ((ok: boolean) => void) | null = null;
 
-  /** Called for panel-initiated frames (no rid): user messages, hellos. */
-  onPanelMessage: ((event: PanelEvent) => void) | null = null;
+  /**
+   * Called for panel-initiated frames (no rid): user messages, hellos.
+   *
+   * #1411 — ASSIGNING THIS DRAINS WHATEVER ARRIVED BEFORE IT.
+   *
+   * The bridge binds its port and starts accepting frames several seconds before
+   * the orchestrator installs this handler (measured on the reporting machine:
+   * listening at T+0.0s, orchestrator ready at T+3.7s). Every frame in that window
+   * used to hit `this.onPanelMessage?.(…)` and vanish — accepted, stamped, echoed
+   * into the panel transcript, then dropped with no queue, no ack and no error. The
+   * user watches their own message appear and nothing happen, which reads as the
+   * agent ignoring them rather than as a fault.
+   *
+   * A panel reaches this window whenever the orchestrator restarts under an open
+   * sidebar: a self-restart on rebuild, a crash restart, a machine waking up.
+   */
+  private panelMessageHandler: ((event: PanelEvent) => void) | null = null;
+
+  get onPanelMessage(): ((event: PanelEvent) => void) | null {
+    return this.panelMessageHandler;
+  }
+
+  set onPanelMessage(fn: ((event: PanelEvent) => void) | null) {
+    this.panelMessageHandler = fn;
+    if (fn) this.drainPreHandlerFrames();
+  }
+
+  /** Frames that arrived before the handler existed, in ARRIVAL ORDER — so the
+   *  handler sees the sequence the panel actually sent (its `hello` before its
+   *  first message), not a reordering invented by the queue. */
+  private preHandlerFrames: PanelEvent[] = [];
+  /** How many were refused once the cap was hit. Reported, never silent. */
+  private preHandlerDropped = 0;
+  private draining = false;
+  private drainScheduled = false;
+  private pendingDrain: ReturnType<typeof setImmediate> | null = null;
+  /** Set by stop(): no further continuation may be scheduled after teardown. */
+  private drainStopped = false;
+
+  /**
+   * Bounds on the pre-handler queue — COUNT and BYTES (codex review, P1).
+   *
+   * The window is bounded by boot, so these are generous for the case they exist
+   * for. They are bounds rather than an unbounded buffer because nothing
+   * guarantees a handler is EVER installed, and because this is an INGRESS path
+   * that previously discarded: retaining 200 arbitrarily large frames would be new
+   * memory exposure, quieter than the bug being fixed. A frame count alone is not
+   * a resource bound.
+   *
+   * On overflow the EARLIEST frames are kept: the first of them is the `hello` that
+   * identifies the tab, and a message replayed without it is worth less than the
+   * message that was refused.
+   */
+  private static readonly MAX_PRE_HANDLER_FRAMES = 200;
+  private static readonly MAX_PRE_HANDLER_BYTES = 1_000_000;
+  private preHandlerBytes = 0;
+
+  /** Rough wire size of a held frame. Only ever computed inside the pre-handler
+   *  window, which both bounds cap, so this cannot become a hot-path cost. */
+  private static frameBytes(event: PanelEvent): number {
+    try {
+      return JSON.stringify(event)?.length ?? 0;
+    } catch {
+      return 0; // unserialisable: counted as free rather than refused
+    }
+  }
+
+  /** Deliver a panel-initiated frame, or hold it until there is somewhere to
+   *  deliver it (#1411). Never drops silently. */
+  private deliverPanelEvent(event: PanelEvent): void {
+    // A stopped bridge dispatches NOTHING. Past teardown there is nowhere for a
+    // frame to go: delivering it pretends a dead bridge is live, and holding it is
+    // a leak nothing will ever drain. This has to precede the live-delivery path —
+    // sitting after it, a frame arriving post-stop was handed straight to a handler
+    // that was still installed.
+    if (this.drainStopped) return;
+    const fn = this.panelMessageHandler;
+    // The queue is the ordering authority whenever ANYTHING is still waiting on it
+    // (codex rounds 1 and 3, both P1). Three conditions, one rule — deliver
+    // directly only when there is nothing ahead of this frame:
+    //   * a drain in flight: a frame produced BY a handler must land behind what is
+    //     still held, or A,B,C arrives as A,C,B;
+    //   * a scheduled continuation: a socket frame D arriving between the pass and
+    //     its setImmediate would otherwise overtake the C that is already queued;
+    //   * a non-empty queue at all: nothing may be delivered around held frames.
+    if (fn && !this.draining && !this.drainScheduled && this.preHandlerFrames.length === 0) {
+      fn(event);
+      return;
+    }
+    const bytes = UiBridge.frameBytes(event);
+    if (
+      this.preHandlerFrames.length >= UiBridge.MAX_PRE_HANDLER_FRAMES ||
+      this.preHandlerBytes + bytes > UiBridge.MAX_PRE_HANDLER_BYTES
+    ) {
+      this.preHandlerDropped += 1;
+      if (this.preHandlerDropped === 1) {
+        logger.warn(
+          `[ui-bridge] the panel-message handler is still not installed and the held-frame ` +
+            `budget is full (${this.preHandlerFrames.length} frames, ${this.preHandlerBytes} B) ` +
+            `— further frames are being REFUSED, not queued (#1411). Anything sent from here ` +
+            `until the orchestrator finishes starting is lost.`,
+        );
+      }
+      return;
+    }
+    this.preHandlerBytes += bytes;
+    this.preHandlerFrames.push(event);
+  }
+
+  /**
+   * Hand over everything held, in order, then report anything that was refused.
+   *
+   * A WORK LOOP, not a snapshot of the queue (codex review, P1). Two things can
+   * happen while a frame is being handled, and both are handled by re-reading the
+   * queue and the handler on every iteration rather than by capturing them once:
+   * a handler can cause another frame to arrive (it must go to the BACK), and a
+   * handler can swap itself out and back (its own drain is suppressed by
+   * `draining`, so this loop has to be the thing that finishes the job).
+   */
+  private drainPreHandlerFrames(): void {
+    if (this.draining) return; // a handler assigned FROM a handler must not re-enter
+    if (this.preHandlerFrames.length === 0 && this.preHandlerDropped === 0) return;
+    const held = this.preHandlerFrames.length;
+    this.draining = true;
+    let delivered = 0;
+    // A BUDGET, because the loop body can extend the queue it is draining (codex
+    // round 2, P1): a handler that feeds one frame back per frame it handles would
+    // otherwise keep this synchronous loop non-empty forever and wedge the event
+    // loop — worse than the bug being fixed. The budget is the number of frames
+    // held when the drain STARTED, which is exactly the pre-handler backlog this
+    // exists to deliver; anything produced while draining is new work and is
+    // rescheduled below rather than dropped.
+    let budget = held;
+    try {
+      for (;;) {
+        const handler = this.panelMessageHandler;
+        // Cleared mid-drain: keep the rest HELD rather than dropping them — there
+        // is nowhere to deliver them, which is the situation this queue exists for.
+        if (!handler || this.preHandlerFrames.length === 0) break;
+        if (budget <= 0) break; // yield the rest to the next tick
+        budget -= 1;
+        const event = this.preHandlerFrames.shift() as PanelEvent;
+        this.preHandlerBytes = Math.max(0, this.preHandlerBytes - UiBridge.frameBytes(event));
+        delivered += 1;
+        try {
+          handler(event);
+        } catch (err) {
+          // One bad frame must not strand the rest — including the user's message.
+          logger.warn(
+            `[ui-bridge] a held frame threw while being delivered: ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+    } finally {
+      this.draining = false;
+    }
+    // Anything still held — produced during this pass, or queued by a handler that
+    // swapped itself out and back — is delivered on a later tick. Never dropped,
+    // and never spun on: each pass does a bounded amount of synchronous work.
+    // The teardown race codex round 4 raised — a handler calling stop() mid-drain,
+    // leaving pendingDrain null at the moment stop() looks for it — is closed
+    // upstream of here rather than by a fourth condition on this line: stop() drops
+    // whatever is held, and deliverPanelEvent refuses anything after it, so by this
+    // point a stopped bridge has nothing left to schedule. A `!drainStopped` clause
+    // was tried and removed: mutation testing showed it could never change the
+    // outcome, and a guard that cannot fail reads as protection while providing
+    // none.
+    if (this.preHandlerFrames.length > 0 && this.panelMessageHandler && !this.drainScheduled) {
+      this.drainScheduled = true;
+      const pending = setImmediate(() => {
+        this.pendingDrain = null;
+        this.drainScheduled = false;
+        this.drainPreHandlerFrames();
+      });
+      // UNREF'd (codex round 3, P1; re-examined round 4): a handler that emits a frame per delivery keeps
+      // one continuation perpetually pending, and a referenced immediate would stop
+      // a short-lived CLI — or a test — from ever exiting. Held so stop() can cancel
+      // it: a bridge torn down inside the schedule-to-callback window must not run
+      // it afterwards.
+      //
+      // The cost of unref is that a process which would otherwise exit does not wait
+      // for this. That is acceptable HERE and nowhere else in the queue: the budget
+      // is the whole backlog, so everything that arrived before the handler is
+      // delivered in the FIRST, synchronous pass. A continuation therefore only ever
+      // carries frames a handler produced while being drained — work whose consumer
+      // is going away too. The alternative, a referenced immediate, hangs the process
+      // forever on a self-feeding handler, which is strictly worse.
+      pending.unref?.();
+      this.pendingDrain = pending;
+    }
+    if (delivered > 0) {
+      logger.info(
+        `[ui-bridge] delivered ${delivered} of ${held} panel frame(s) that arrived before the ` +
+          `handler was installed (#1411)`,
+      );
+    }
+    if (this.preHandlerDropped > 0) {
+      logger.warn(
+        `[ui-bridge] ${this.preHandlerDropped} panel frame(s) were REFUSED before the handler ` +
+          `was installed and are gone (#1411)`,
+      );
+      this.preHandlerDropped = 0;
+    }
+  }
+
+  /** Test seam: how many frames are held right now, and how many were refused. */
+  preHandlerBacklog(): { held: number; dropped: number; bytes: number } {
+    return {
+      held: this.preHandlerFrames.length,
+      dropped: this.preHandlerDropped,
+      bytes: this.preHandlerBytes,
+    };
+  }
 
   constructor(port = DEFAULT_BRIDGE_PORT, token: string | null = null, host = "127.0.0.1") {
     this.port = port;
@@ -2284,7 +2496,7 @@ export class UiBridge {
         // buffered items below — which belong to the PRIOR workflow — are NOT replayed into
         // the replacement (a wrong-conversation/media delivery). For a PROVEN reconnect it
         // drops nothing, so the replay/flush proceeds exactly as before, just after the ack.
-        this.onPanelMessage?.(msg as PanelEvent);
+        this.deliverPanelEvent(msg as PanelEvent);
         // Replay anything this tab's agent produced while the tab had no live connection
         // (its socket was re-helloed to another workflow). The panel swaps to this
         // workflow's thread synchronously, so they render + record into the RIGHT
@@ -2499,7 +2711,7 @@ export class UiBridge {
           msg.title = this.conns.get(effectiveTab)?.title;
           if (msg.type === "user_message") this.setLastActiveTab(effectiveTab);
         }
-        this.onPanelMessage?.(msg as PanelEvent);
+        this.deliverPanelEvent(msg as PanelEvent);
       }
     });
 
@@ -4486,6 +4698,25 @@ export class UiBridge {
   }
 
   async stop(): Promise<void> {
+    // Fence FIRST, then cancel: a drain in flight must not schedule a successor
+    // behind this call (codex round 4, P1).
+    this.drainStopped = true;
+    if (this.pendingDrain) {
+      clearImmediate(this.pendingDrain);
+      this.pendingDrain = null;
+      this.drainScheduled = false;
+    }
+    if (this.preHandlerFrames.length > 0) {
+      // Held frames die with the bridge. That is the honest end state — there is
+      // nowhere left to deliver them — but it is never silent, because "the frame
+      // vanished and nothing said so" is the whole of #1411.
+      logger.warn(
+        `[ui-bridge] stopping with ${this.preHandlerFrames.length} panel frame(s) still held ` +
+          `and undelivered (#1411)`,
+      );
+      this.preHandlerFrames = [];
+      this.preHandlerBytes = 0;
+    }
     for (const armed of this.tabGoneTimers.values()) clearTimeout(armed.timer);
     this.tabGoneTimers.clear();
     if (this.bindRetryTimer) {
