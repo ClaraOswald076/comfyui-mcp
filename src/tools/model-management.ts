@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { emptyDownloadListingNote } from "../services/empty-download-listing.js";
+import { describeRecordStore } from "../services/download-progress.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
@@ -985,8 +987,13 @@ async function statusAction(args: {
                 text: unresolvedLive
                   ? unresolvedLive
                   : (args.id || args.url)
-                  ? `No download matching ${selector}. Several causes reach this same message and it does not distinguish them — treat it as "not found", NOT as "finished": it may have finished long ago (settled records are pruned after a while), never started, been interrupted by an orchestrator restart with the carry-over that records that (#1148) not having run (it is best-effort by design), been given a valid \`id\` with a \`tray_id\` that does not match it, been looked up by a \`url\` that does not match BYTE FOR BYTE (matching includes the query, so a re-signed CDN link or a dropped query misses a record that is still there — retry by \`id\`), or named a \`url\` that TWO live downloads share, which declines rather than guessing: omit the selector to list them both. Check the panel download tray before re-downloading. Within the SAME session, re-issuing an identical in-flight download adopts it rather than duplicating; across a reconnect, confirm via the tray first.`
-                  : "No downloads are being tracked.",
+                  ? `No download matching ${selector}. Several causes reach this same message and it does not distinguish them — treat it as "not found", NOT as "finished": it may have finished long ago (settled records are pruned after a while), never started, been interrupted by an orchestrator restart with the carry-over that records that (#1148) not having run (it is best-effort by design), been given a valid \`id\` with a \`tray_id\` that does not match it, been looked up by a \`url\` that does not match BYTE FOR BYTE (matching includes the query, so a re-signed CDN link or a dropped query misses a record that is still there — retry by \`id\`), or named a \`url\` that TWO live downloads share, which declines rather than guessing: omit the selector to list them both. If this session has the ComfyUI sidebar panel, check its download tray before re-downloading; without a panel there is no equivalent read, so wait and re-check rather than act. Within the SAME session, re-issuing an identical in-flight LOCAL download adopts it rather than duplicating; across a reconnect, confirm first — via the tray if this session has the panel, otherwise by waiting and re-checking. Do NOT re-issue a transfer that was dispatched to ComfyUI-Manager: it runs server-side, so a re-issue is a SECOND dispatch to the same destination and can corrupt the file (#1197) — check whether the file landed instead. If you cannot tell which route was used, ask before re-issuing.`
+                  // #1420 — an empty listing is not proof that nothing is
+                  // running. The store is nonced per orchestrator start, so a
+                  // reconnect empties it while transfers keep streaming.
+                  : emptyDownloadListingNote({
+                      storeCreatedMs: describeRecordStore().createdMs,
+                    }),
               },
             ],
           };

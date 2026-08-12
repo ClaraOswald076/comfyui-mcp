@@ -9,7 +9,7 @@
 // This no-ops entirely when COMFYUI_MCP_PROGRESS_DIR is unset — i.e. for every
 // normal (non-panel) use of the MCP — so it costs nothing outside the panel.
 
-import { mkdirSync, readFileSync, readdirSync, writeFileSync, renameSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -977,6 +977,47 @@ export function readPersistedDownloadJob(id: string): PersistedDownloadJob | nul
 
 /** Every persisted job record (freshest not guaranteed; caller sorts). Used to
  *  list in-flight downloads after a reconnect and to look one up by URL/destination. */
+/**
+ * When was THIS session's record store created, and where is it? (#1420)
+ *
+ * The store is nonced per orchestrator start and earlier ones are reaped, so a
+ * restart or reconnect gives a session a brand-new, EMPTY store while transfers
+ * begun under the old one keep streaming inside the processes that own them. An
+ * empty listing therefore says as much about the store's age as about the world,
+ * and a reader deserves to be told which.
+ *
+ * `createdMs` is undefined when the directory cannot be stat'd — unknown, which is
+ * reported as unknown rather than as "old".
+ */
+/**
+ * The creation time of a record store, from its stat — or UNDEFINED (#1420).
+ *
+ * BIRTHTIME ONLY. ctime was written as a fallback and removed: where birthtime is
+ * unavailable, ctime moves whenever a record is written into the directory — which
+ * is constantly, since that is what the directory is for — so a long-lived store
+ * would report itself as seconds old, and the sentence built on it ("anything
+ * started before then was never in it") would be FALSE exactly when it is most
+ * load-bearing. Unknown is reported as unknown.
+ *
+ * Extracted so the rule is testable: on a filesystem that supplies birthtime — as
+ * this project's own does — no test could otherwise reach the fallback, and a
+ * mutation putting ctime back survived because of it.
+ */
+export function storeCreatedFrom(st: { birthtimeMs: number; ctimeMs: number }): number | undefined {
+  const born = st.birthtimeMs;
+  return Number.isFinite(born) && born > 0 ? born : undefined;
+}
+
+export function describeRecordStore(): { dir: string; createdMs?: number } {
+  const dir = recordsDir();
+  if (!dir) return { dir: "" };
+  try {
+    return { dir, createdMs: storeCreatedFrom(statSync(dir)) };
+  } catch {
+    return { dir };
+  }
+}
+
 export function listPersistedDownloadJobs(): PersistedDownloadJob[] {
   const dir = recordsDir();
   if (!dir) return [];
