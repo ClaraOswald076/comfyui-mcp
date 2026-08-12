@@ -197,6 +197,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.16] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- an unresolved pack must not read as 'does not exist' on a possibly-stale catalogue (#1463)
+
+
 ## [0.51.15] - 2026-08-12
 
 ### MCP
