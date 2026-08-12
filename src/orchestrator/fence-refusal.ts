@@ -51,6 +51,28 @@ export function noPanelTabReason(tabId: string): string {
  * BEFORE the structural no-Origin case, or it borrows a remedy that cannot help
  * it and is told its problem is permanent.
  */
+/**
+ * The remedy for "this connection has no server-observed Origin" (panel#1065).
+ *
+ * Shared, because it was NOT shared and the two copies drifted. #1077/#1240 gave
+ * the relay path the origin it already knows from COMFYUI_URL, and updated the
+ * refusal below to say so. The OTHER surface rendering this same refusal — the
+ * `rejected` branch of describeFenceRebind in panel-tools.ts — kept the pre-fix
+ * text, which told the user to abandon the relay backend and to "report it: the
+ * relay protocol has to forward the browser's handshake Origin for this path to
+ * work at all".
+ *
+ * A user on 0.50.114 — a version that HAS the fix — followed that instruction and
+ * filed panel#1065 quoting it back. The stale sentence manufactured its own bug
+ * report, and told someone to downgrade a working setup on the way.
+ */
+export const NO_ORIGIN_REMEDY =
+  `Set COMFYUI_URL to the URL the panel is served from — that is what supplies this ` +
+  `connection's origin, and it is what is missing or unparseable when this happens. ` +
+  `Refreshing the tab will not change it, and switching away from the relay backend is ` +
+  `no longer necessary: a relay session supplies the origin it already knows. Reads and ` +
+  `non-graph tools keep working meanwhile — they do not need the fence.`;
+
 export function identityReason(
   tabId: string,
   origin: string | undefined,
@@ -68,10 +90,9 @@ export function identityReason(
     // reader to change a backend that is no longer the reason (#1077).
     return (
       `this tab's connection carries no server-observed Origin, and the workflow identity is ` +
-      `bound to one — so the fence cannot be adopted for it. Refreshing the tab will not ` +
-      `change it. This means the connection reached the orchestrator by a path that neither ` +
-      `observed nor was told the panel's origin; if COMFYUI_URL is unset or unparseable for ` +
-      `this session, setting it to the URL the panel is served from is what supplies it.`
+      `bound to one — so the fence cannot be adopted for it. This means the connection reached ` +
+      `the orchestrator by a path that neither observed nor was told the panel's origin. ` +
+      NO_ORIGIN_REMEDY
     );
   }
   // #1255 — this used to end "a malformed uuid, or one bound to a different
