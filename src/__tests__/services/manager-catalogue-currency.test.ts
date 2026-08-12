@@ -183,7 +183,11 @@ describe("#890 WIRING: it reaches both results and both renderers", () => {
       }
       // A walk that never closed is not a bound, and would silently widen the window.
       expect(close, `unterminated object at ${deps.slice(i, i + 60)}`).toBeGreaterThan(i);
-      const object = deps.slice(i, close);
+      // Matched on the MASKED slice too (codex round 6). Searching the raw source let a
+      // COMMENT mentioning one of these names satisfy the check — and this file is full
+      // of comments that name them, so a bare return sitting under one would have passed.
+      // Masking leaves only code, so the match proves a field, not a mention.
+      const object = masked.slice(i, close);
       expect(object, deps.slice(i, i + 60)).toMatch(
         /catalogue_currency_unverified|mappings_unavailable|catalogue_unavailable/,
       );
