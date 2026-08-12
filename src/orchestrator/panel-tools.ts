@@ -52,6 +52,11 @@ import type { UiBridge } from "../services/ui-bridge.js";
 import { conversationOfScopeAddress, isScopeAddress, shortTabId } from "../services/session-scope.js";
 import type { ScopeRepinOutcome } from "./turn-origins.js";
 import { NODE_ID_MESSAGE, NODE_ID_PATTERN, normalizeNodeId } from "./node-id.js";
+import {
+  clearSwitchHold,
+  describeSwitchHold,
+  recordSwitchHold,
+} from "./switch-hold.js";
 import { NO_ORIGIN_REMEDY } from "./fence-refusal.js";
 
 /** #884 — journal TICKETS (run completions #468, ask answers #486) must be
@@ -6178,7 +6183,12 @@ export function makePanelToolCtx(
         await awaitReachable();
       }
       ensureReachable();
-      return ok(await sendRouted(cmd, timeoutMs, observeRid));
+      const sent = ok(await sendRouted(cmd, timeoutMs, observeRid));
+      // panel#1097 — the switch cleared, so a LATER refusal starts a fresh run
+      // rather than inheriting this one's age. Without this the elapsed figure only
+      // ever grows, and a message built on it becomes as misleading as none.
+      clearSwitchHold(ctx.tabId);
+      return sent;
     } catch (err) {
       // Post-reconnect retry-once: a reboot/free_vram/reconnect can drop the tab's
       // transport (or replace it under a new tab id) the instant after we dispatch.
@@ -6201,6 +6211,10 @@ export function makePanelToolCtx(
           // it is simply mid-switch. Name the actual state and the actual wait.
           if (isWorkflowSwitchGuardRefusal(err2)) {
             const name = typeof cmd.cmd === "string" ? cmd.cmd : "panel command";
+            // panel#1097 — time the RUN of these refusals. "Simply retry" is right
+            // for the fraction of a second this normally lasts and wrong for a
+            // switch held open by a dialog, and the two were indistinguishable.
+            const held = describeSwitchHold(recordSwitchHold(ctx.tabId));
             return fail(
               `${name} was NOT applied — nothing changed. The panel is still switching or ` +
                 `reloading the workflow on the canvas, which it refuses commands during so a ` +
@@ -6208,7 +6222,8 @@ export function makePanelToolCtx(
                 `reconnect: it normally clears in well under a second, so simply retry. If a ` +
                 `switch appears stuck, check the canvas — a load dialog or an unsaved-changes ` +
                 `prompt can hold it open awaiting the user. ` +
-                `(${err2 instanceof Error ? err2.message : String(err2)})`,
+                `(${err2 instanceof Error ? err2.message : String(err2)})` +
+                held,
             );
           }
           // The retry also failed — surface an actionable reconnecting status rather

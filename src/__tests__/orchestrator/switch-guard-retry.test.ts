@@ -28,6 +28,7 @@ import {
   type PanelToolCtx,
   type ToolResult,
 } from "../../orchestrator/panel-tools.js";
+import { resetSwitchHolds } from "../../orchestrator/switch-hold.js";
 
 const textOf = (res: ToolResult): string => (res.content[0] as { text: string }).text;
 
@@ -60,6 +61,7 @@ function bridgeFailing(failures: number, err: () => Error = switchGuardError) {
 
 beforeEach(() => {
   __panelToolsTestHooks.setRetrySettleMs(0); // the real wait is ~400ms
+  resetSwitchHolds(); // panel#1097 — the run is per tab and outlives one call
 });
 
 describe("#1027: a mid-switch refusal is retried, not surfaced", () => {
@@ -131,4 +133,42 @@ describe("#1027: the other refusals keep their own handling", () => {
     expect(res.isError).toBe(true);
     expect(attempts).toBe(1);
   });
+});
+
+describe("panel#1097: a switch that never clears stops reading like one that will", () => {
+  // The reporter retried into this refusal indefinitely. Every one of them said
+  // "it normally clears in well under a second, so simply retry", because nothing
+  // timed the RUN — so the tool could not notice its own advice failing.
+  it("says nothing extra while the hold is still momentary", async () => {
+    const ctx = makePanelToolCtx(bridgeFailing(99), "tab-1");
+    const text = textOf(await ctx.call({ cmd: "graph_outline" }));
+    expect(text).toContain("still switching or reloading");
+    expect(text).not.toContain("HELD FOR");
+  });
+
+  it("reports the hold once a run of refusals contradicts that advice", async () => {
+    const ctx = makePanelToolCtx(bridgeFailing(99), "tab-1");
+    // Each call refuses twice (initial + the one retry), so the run builds.
+    await ctx.call({ cmd: "graph_outline" });
+    await new Promise((r) => setTimeout(r, 3100)); // past the "worth saying" floor
+    const text = textOf(await ctx.call({ cmd: "graph_outline" }));
+
+    expect(text).toContain("HELD FOR");
+    expect(text).toContain("waiting for a person");
+    expect(text).toContain("no number of retries will clear it");
+  }, 15_000);
+
+  it("a SUCCESS between refusals resets the run — the age is not cumulative", async () => {
+    const ctx = makePanelToolCtx(bridgeFailing(99), "tab-1");
+    await ctx.call({ cmd: "graph_outline" });
+    await new Promise((r) => setTimeout(r, 3100));
+
+    // A command that lands clears the hold…
+    const okCtx = makePanelToolCtx(bridgeFailing(0), "tab-1");
+    expect((await okCtx.call({ cmd: "graph_outline" })).isError).toBeFalsy();
+
+    // …so the next refusal is a fresh, momentary one again.
+    const after = textOf(await makePanelToolCtx(bridgeFailing(99), "tab-1").call({ cmd: "graph_outline" }));
+    expect(after).not.toContain("HELD FOR");
+  }, 15_000);
 });
