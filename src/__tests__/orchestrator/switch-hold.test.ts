@@ -27,9 +27,9 @@ beforeEach(() => resetSwitchHolds());
 
 describe("panel#1097 timing a run of switch refusals", () => {
   it("starts a run on the first refusal and counts the rest", () => {
-    expect(recordSwitchHold("tab", T0)).toEqual({ since: T0, count: 1 });
-    expect(recordSwitchHold("tab", T0 + 1000)).toEqual({ since: T0, count: 2 });
-    expect(recordSwitchHold("tab", T0 + 9000)).toEqual({ since: T0, count: 3 });
+    expect(recordSwitchHold("tab", T0)).toEqual({ since: T0, last: T0, count: 1 });
+    expect(recordSwitchHold("tab", T0 + 1000)).toEqual({ since: T0, last: T0 + 1000, count: 2 });
+    expect(recordSwitchHold("tab", T0 + 9000)).toEqual({ since: T0, last: T0 + 9000, count: 3 });
   });
 
   it("keeps runs per TAB — one stuck canvas must not age another's", () => {
@@ -45,12 +45,20 @@ describe("panel#1097 timing a run of switch refusals", () => {
     clearSwitchHold("tab");
     expect(switchHoldFor("tab")).toBeUndefined();
     // …and the fresh run is dated from now, not from the old start.
-    expect(recordSwitchHold("tab", T0 + 60_000)).toEqual({ since: T0 + 60_000, count: 1 });
+    expect(recordSwitchHold("tab", T0 + 60_000)).toEqual({
+      since: T0 + 60_000,
+      last: T0 + 60_000,
+      count: 1,
+    });
   });
 
   it("a backwards clock restarts the run rather than reporting a negative age", () => {
     recordSwitchHold("tab", T0);
-    expect(recordSwitchHold("tab", T0 - 5000)).toEqual({ since: T0 - 5000, count: 1 });
+    expect(recordSwitchHold("tab", T0 - 5000)).toEqual({
+      since: T0 - 5000,
+      last: T0 - 5000,
+      count: 1,
+    });
   });
 });
 
@@ -107,12 +115,24 @@ describe("panel#1097 what it says, and when it says nothing", () => {
   });
 
   it("evicts runs nobody has touched, so the map cannot grow forever", () => {
-    // codex review, P2: without eviction an entry survives per tab id for the life
+    // codex round 1, P2: without eviction an entry survives per tab id for the life
     // of the process, and a reused id inherits a stale age.
     recordSwitchHold("old-tab", T0);
     recordSwitchHold("new-tab", T0 + 11 * 60_000);
     expect(switchHoldFor("old-tab")).toBeUndefined();
     expect(switchHoldFor("new-tab")).toBeTruthy();
+  });
+
+  it("does NOT evict a hold that is still being retried — the most stuck case", () => {
+    // codex round 3, P2: eviction keyed on the run's START dropped a hold that had
+    // been retried for over ten minutes, resetting it to the momentary wording at
+    // exactly the moment it was most obviously stuck.
+    recordSwitchHold("stuck", T0);
+    for (let m = 1; m <= 15; m++) recordSwitchHold("stuck", T0 + m * 60_000);
+    const hold = switchHoldFor("stuck");
+    expect(hold, "still tracked after 15 minutes of retrying").toBeTruthy();
+    expect(hold?.since).toBe(T0); // and still aged from the START of the run
+    expect(describeSwitchHold(hold, T0 + 15 * 60_000)).toContain("HELD FOR 15m");
   });
 
   it("renders minutes past 90s and seconds below it", () => {

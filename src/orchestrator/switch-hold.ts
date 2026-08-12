@@ -23,8 +23,12 @@
 
 /** A run of consecutive switch-guard refusals for one tab. */
 interface Hold {
-  /** When the FIRST refusal of this run was seen. */
+  /** When the FIRST refusal of this run was seen — what the age is measured from. */
   since: number;
+  /** When the LAST one was. Eviction keys on THIS: a hold that is still being
+   *  retried after ten minutes is the most stuck one there is, and evicting it by
+   *  start time would reset it to the momentary wording exactly then (codex). */
+  last: number;
   /** How many of those runs have ended in a terminal refusal. One per FAILED
    *  CALL, not per panel refusal: each call refuses, settles, retries and refuses
    *  again, so the panel sees roughly twice this (codex review). The message says
@@ -46,10 +50,10 @@ const MAX_HOLDS = 200;
 
 function evict(now: number): void {
   for (const [tab, hold] of holds) {
-    if (now - hold.since > HOLD_TTL_MS) holds.delete(tab);
+    if (now - hold.last > HOLD_TTL_MS) holds.delete(tab);
   }
   if (holds.size <= MAX_HOLDS) return;
-  const byAge = [...holds.entries()].sort((a, b) => a[1].since - b[1].since);
+  const byAge = [...holds.entries()].sort((a, b) => a[1].last - b[1].last);
   for (const [tab] of byAge.slice(0, holds.size - MAX_HOLDS)) holds.delete(tab);
 }
 
@@ -64,7 +68,9 @@ export function recordSwitchHold(tabId: string, now: number = Date.now()): Hold 
   // A clock that jumped backwards must not produce a negative age: restart the run
   // rather than report something that cannot be true.
   const next: Hold =
-    prev && now >= prev.since ? { since: prev.since, count: prev.count + 1 } : { since: now, count: 1 };
+    prev && now >= prev.since
+      ? { since: prev.since, last: now, count: prev.count + 1 }
+      : { since: now, last: now, count: 1 };
   holds.set(tabId, next);
   return next;
 }

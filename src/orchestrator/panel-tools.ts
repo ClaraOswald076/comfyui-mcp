@@ -6207,12 +6207,13 @@ export function makePanelToolCtx(
           ensureReachable(); // rebinds a current-mode session onto the reconnected tab
           holdTab = ctx.tabId;
           const retried = ok(await sendRouted(cmd, timeoutMs, observeRid));
-          // Cleared HERE and nowhere else: this is the one path that knows a switch
-          // refusal preceded this success. Clearing on every routed success let an
-          // unguarded command (a status read) wipe the evidence while graph commands
-          // stayed refused, and left the retry path not clearing at all — so a later
-          // refusal inherited a stale age (codex round 2).
-          clearSwitchHold(holdTab);
+          // Cleared HERE and nowhere else, and only when the failure this retried
+          // was a SWITCH refusal. Clearing on every routed success let an unguarded
+          // status read wipe the evidence while graph commands stayed refused
+          // (codex round 2); clearing after a transient-reconnect retry does the
+          // same thing one step removed, because reconnecting proves nothing about
+          // whether the switch cleared (codex round 3).
+          if (isWorkflowSwitchGuardRefusal(err)) clearSwitchHold(holdTab);
           return retried;
         } catch (err2) {
           // #1027 — a switch STILL in progress is not a reconnect, and saying so

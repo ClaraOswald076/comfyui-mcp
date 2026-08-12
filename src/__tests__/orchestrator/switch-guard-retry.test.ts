@@ -206,3 +206,36 @@ describe("panel#1097: the run belongs to the tab the command was DISPATCHED on",
     expect(switchHoldFor("tab-1"), "the tab the call merely started on").toBeUndefined();
   });
 });
+
+describe("panel#1097: only a SWITCH refusal that then succeeds clears the run", () => {
+  // codex round 3, P2: clearing after a transient-reconnect retry resets the
+  // evidence one step removed — reconnecting proves nothing about whether the
+  // canvas switch cleared, and a status read can reconnect while graph commands
+  // stay refused.
+  it("a reconnect-retry success leaves a switch run intact", async () => {
+    // Build a run first.
+    const stuck = makePanelToolCtx(bridgeFailing(99), "tab-1");
+    await stuck.call({ cmd: "graph_outline" });
+    expect(switchHoldFor("tab-1")).toBeTruthy();
+
+    // A DIFFERENT failure kind that retries and succeeds.
+    let n = 0;
+    const reconnecting = {
+      send: async () => {
+        n += 1;
+        // A real transient-reconnect shape (isTransientReconnectError matches this).
+        if (n === 1) throw new Error("socket hang up");
+        return { ok: true, nodes: [] };
+      },
+      push: () => 1,
+      canReach: () => true,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: "tab-1", title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => "tab-1",
+    } as unknown as PanelToolCtx["bridge"];
+
+    const res = await makePanelToolCtx(reconnecting, "tab-1").call({ cmd: "graph_outline" });
+    expect(res.isError).toBeFalsy();
+    expect(switchHoldFor("tab-1"), "the switch run is not evidence about a reconnect").toBeTruthy();
+  });
+});
