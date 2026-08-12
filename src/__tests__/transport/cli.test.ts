@@ -394,10 +394,13 @@ describe("--help is translated, and degrades to English", () => {
   });
 
   it("lays the two columns out in terminal CELLS, not characters", () => {
-    // The mutation this catches: `padTo(...)` swapped for `String.prototype.padEnd`. Every
-    // string on the screen is ASCII until a catalog lands, so the assembled output is
-    // IDENTICAL under both — the row helper is the only place the difference is observable
-    // before the bug ships to twelve languages at once.
+    // The mutation this catches: `padTo(...)` swapped for `String.prototype.padEnd`.
+    //
+    // Written when no catalog existed, at which point every string on the screen was ASCII, the
+    // assembled output was IDENTICAL under both, and this helper was the ONLY place the
+    // difference could be observed. Catalogs ship now, so the full-screen test above would also
+    // notice — but only for the locales it happens to render. This stays because it isolates
+    // the property (cells, not characters) from any particular translation.
     const ascii = helpRow("--host <host>", "HTTP bind host", "env: MCP_HOST");
     const korean = helpRow("--host <host>", "호스트", "env: MCP_HOST");
     expect(displayWidth(ascii.slice(0, ascii.indexOf("env:")))).toBe(

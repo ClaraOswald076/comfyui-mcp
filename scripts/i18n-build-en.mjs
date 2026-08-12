@@ -150,6 +150,50 @@ function maskNonCode(src) {
 }
 
 /**
+ * Blank COMMENTS ONLY, leaving every string and template exactly as written.
+ *
+ * This exists to give the blind-spot counter below a view of the file that `maskNonCode` has
+ * not touched. Counting on the masked copy is what made the counter useless: anything masking
+ * erased vanished from both sides of the comparison, so reinstating the template-hole bug hid
+ * 58 keys and the counter said nothing — the build only failed by luck, through an unrelated
+ * "unreadable fallback" error from two constants that happen to be shared. A check computed
+ * from the parser's own view of the world cannot detect a fault in that view.
+ *
+ * Comments still have to go, because a `tr("x", "y")` written inside one is not a call site.
+ */
+function stripComments(src) {
+  const out = src.split("");
+  let i = 0;
+  let quote = null;
+  while (i < src.length) {
+    const c = src[i];
+    if (quote) {
+      if (c === "\\") i += 2;
+      else {
+        if (c === quote) quote = null;
+        i++;
+      }
+      continue;
+    }
+    if (c === "/" && src[i + 1] === "/") {
+      while (i < src.length && src[i] !== "\n") out[i++] = " ";
+      continue;
+    }
+    if (c === "/" && src[i + 1] === "*") {
+      const end = src.indexOf("*/", i + 2);
+      const stop = end === -1 ? src.length : end + 2;
+      for (; i < stop; i++) if (src[i] !== "\n") out[i] = " ";
+      continue;
+    }
+    // Backticks are treated as an ordinary delimiter here: a `${…}` hole stays visible, which
+    // is the whole point — that is where the say frames' translator calls live.
+    if (c === '"' || c === "'" || c === "`") quote = c;
+    i++;
+  }
+  return out.join("");
+}
+
+/**
  * Split a bracketed group's comma-separated parts. `open` indexes the `(`, `[` or `{`.
  * Returns the parts as raw source slices plus their absolute start offsets, so a caller can
  * read an argument back out of the UNMASKED source.
@@ -223,6 +267,13 @@ function readString(expr, consts) {
   for (;;) {
     const m = rest.match(/^(["'`])((?:\\.|(?!\1)[^\\])*)\1/);
     if (m) {
+      // A template literal with a HOLE is not a fallback, it is a computed string, and this is
+      // the one place the reader would otherwise guess where it refuses everywhere else.
+      // Captured verbatim, `` `Hello ${NAME}, welcome back.` `` lands in the catalog with the
+      // `${NAME}` still in it. English looks perfect — the template evaluates at runtime — while
+      // every translation renders a literal `${NAME}`, because `trFor` substitutes `{name}` and
+      // has never heard of `${…}`. Refusing sends the author to a real `{placeholder}` instead.
+      if (m[1] === "`" && m[2].includes("${")) return null;
       // A fallback split across lines as `"first " + "second"` is ONE sentence. Reading only
       // the first literal would put half of it in the catalog: English still renders whole
       // (the expression evaluates at runtime), so every translation would silently lose the
@@ -554,11 +605,32 @@ const DYNAMIC_SITES = [
 const candidates = [];
 const unparsed = [];
 const wrappersByFile = new Map();
+/** Every `"a.b.c"`-shaped literal in the scanned sources — the second, independent detector. */
+const keyShapedLiterals = [];
 
 for (const file of sources()) {
   const raw = fs.readFileSync(file, "utf8");
-  if (!/(?<![\w$])tr(?:For)?\s*\(/.test(raw)) continue;
   const rel = path.relative(ROOT, file).replace(/\\/g, "/");
+  const code = stripComments(raw);
+  const lineAt = (idx) => raw.slice(0, idx).split("\n").length;
+
+  // SECOND DETECTOR, collected for EVERY source file — deliberately in front of the `tr(`
+  // pre-filter below, because a file that never names `tr` is precisely the case the primary
+  // counter cannot see. A wrapper defined in another module (`panelT(locale, key, fallback)`
+  // exported from a helper) leaves its consumer with no `tr(` at all: the file is skipped
+  // wholesale, the counter is satisfied at 0 === 0, and the key is dropped in silence. Measured
+  // before this moved: exit 0, no diagnostic, and `i18n-check` then certifies the catalog 100%
+  // translated while the string renders English in all eleven languages forever.
+  //
+  // This detector knows nothing about call syntax — only that a literal shaped like a key, in a
+  // namespace the catalog owns, had better be in the catalog. That is why it survives a wrapper
+  // nobody anticipated. (Placing it behind the filter was my first attempt, and it reproduced
+  // the bug it was written to catch.)
+  for (const m of code.matchAll(/["']([a-z][a-zA-Z0-9]*(?:\.[a-zA-Z0-9_]+)+)["']/g)) {
+    keyShapedLiterals.push({ key: m[1], file: rel, line: lineAt(m.index) });
+  }
+
+  if (!/(?<![\w$])tr(?:For)?\s*\(/.test(code)) continue;
   const masked = maskNonCode(raw);
   const consts = readConsts(masked, raw);
   const calls = callSites(masked);
@@ -568,8 +640,6 @@ for (const file of sources()) {
     [...known.keys()].filter((n) => !SEED.some(([s]) => s === n)),
   );
 
-  const lineAt = (idx) => raw.slice(0, idx).split("\n").length;
-
   // BLIND SPOT. Everything below can only police call sites the scanner produced; one it never
   // produced — an unbalanced group, a shape the regex misses — is absent from both sides of
   // every comparison, so a check written against the candidates would stay green while the key
@@ -577,11 +647,16 @@ for (const file of sources()) {
   // now found two: masking used to blank template holes (hiding every `${trFor(…)}` say frame),
   // and the callee rule used to reject `...tr(` as a property access.
   //
-  // The pattern is deliberately LOOSER than `CALLEE_START` — it would also count a genuine
-  // `obj.tr(` property access. Over-counting produces a failure a human resolves; matching the
-  // parser's own rule produces silence, which is how the second bug survived the first fix.
+  // Two things keep this independent of the parser, and both were added only after a
+  // measurement showed the previous version silent on the exact fault it names:
+  //   - it counts on `stripComments(raw)`, NOT on `masked`. Masking is the parser's view; a
+  //     bug in it erases the evidence from both sides.
+  //   - the pattern is deliberately LOOSER than `CALLEE_START` — it would also count a genuine
+  //     `obj.tr(` property access. Over-counting produces a failure a human resolves; matching
+  //     the parser's own rule produces silence, which is how the `...tr(` bug survived the
+  //     template-hole fix.
   const seen = calls.filter((c) => SEED.some(([name]) => name === c.name)).length;
-  const present = (masked.match(/(?<![\w$])tr(?:For)?\s*\(/g) ?? []).length;
+  const present = (code.match(/(?<![\w$])tr(?:For)?\s*\(/g) ?? []).length;
   if (seen !== present) {
     unparsed.push({ file: rel, line: 0, why: `${present} tr/trFor call(s) in the source, ${seen} readable` });
   }
@@ -593,15 +668,20 @@ for (const file of sources()) {
 
     const keyLit = call.parts[spec.keyIndex].trim().match(/^(["'])((?:\\.|(?!\1)[^\\])*)\1$/);
     if (!keyLit) {
-      // A non-literal key at a translator call is a WRAPPER body (`trFor(loc, key, …)`), which
-      // discovery above has already turned into its own translator — the real keys arrive at
-      // the wrapper's own call sites. If it is NOT that, the keys behind it are invisible to
-      // this build and would be missing from English, so say so.
       const passed = passthroughKey(call, spec.keyIndex, raw);
-      if (passed && paramOwner(masked, passed.ident, call.index)) continue;
-
       const fbIdx = spec.keyIndex + 1;
       const fbSrc = fbIdx < call.parts.length ? call.parts[fbIdx] : "";
+
+      // DYNAMIC SITES FIRST, and the order is load-bearing rather than stylistic.
+      //
+      // The passthrough test below asks "is this key an enclosing PARAMETER?", and it used to
+      // run first. `dtr(backend, …)` is matched here because `backend` is a local const today —
+      // but the natural refactor of that 4000-line handler makes it a parameter, at which point
+      // `paramOwner` starts matching, the `continue` fires, and the registry fan-out is skipped.
+      // Measured by forcing that condition: exit 0, no stderr, and `say.degraded.glm/kimi/
+      // minimax/moonshot` simply gone — four live keys, untranslatable, with nothing to say so.
+      // An enumerated site (file + prefix + identifier + fallback shape) is far more specific
+      // than a structural guess, so it gets to answer first.
       const dyn = DYNAMIC_SITES.find(
         (d) => d.file === rel && d.prefix === spec.prefix && passed?.ident === d.ident && d.fallback.test(fbSrc),
       );
@@ -614,6 +694,12 @@ for (const file of sources()) {
         for (const [key, text] of rows) candidates.push({ key, text, file: rel, line });
         continue;
       }
+
+      // Otherwise: a non-literal key at a translator call is a WRAPPER body (`trFor(loc, key,
+      // …)`), which discovery above has already turned into its own translator — the real keys
+      // arrive at the wrapper's own call sites. If it is NOT that, the keys behind it are
+      // invisible to this build and would be missing from English, so say so.
+      if (passed && paramOwner(masked, passed.ident, call.index)) continue;
 
       unparsed.push({ file: rel, line, why: `key is not a literal: ${call.parts[spec.keyIndex].trim().slice(0, 60)}` });
       continue;
@@ -668,6 +754,23 @@ for (const c of candidates) {
     process.exit(1);
   }
   flat.set(c.key, c.text);
+}
+
+// SECOND DETECTOR — see the collection site above. A literal shaped like a key, in a namespace
+// this catalog owns, that no call site produced, is a key some path reaches at runtime and this
+// build cannot see. Scoped to namespaces the catalog already declares so it never has an opinion
+// about unrelated dotted strings: `panel.persona` is a prompt id, not vocabulary, and stays out.
+const OWNED = new Set([...flat.keys()].map((k) => k.split(".")[0]));
+const orphans = keyShapedLiterals.filter((l) => OWNED.has(l.key.split(".")[0]) && !flat.has(l.key));
+if (orphans.length) {
+  console.error("key-shaped literals this build did not capture:");
+  for (const o of orphans) console.error(`  ${o.file}:${o.line}  ${o.key}`);
+  console.error(
+    "\nEach names a catalog namespace but reached no call site this build understands — most" +
+      "\nlikely a translator wrapper defined in ANOTHER module. Teach the build about it, or" +
+      "\nthe key is missing from English and untranslatable in every language, silently.",
+  );
+  process.exit(1);
 }
 
 if (process.argv.includes("--json")) {

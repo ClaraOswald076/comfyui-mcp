@@ -121,7 +121,10 @@ describe("panel-console-http", () => {
           ["ru", "ru"],
         ] as const) {
           const html = await (await fetch(srv.url, { headers: { "accept-language": lang } })).text();
-          expect(html).toContain(`<html lang="${code}"`);
+          // Anchored on the character that ENDS the attribute, so `lang="ja"` cannot be
+          // satisfied by a `lang="ja-x"` the negotiator was never supposed to emit. RTL pages
+          // continue with ` dir="rtl"`, so the boundary is a space or the closing bracket.
+          expect(html).toMatch(new RegExp(`<html lang="${code}"[ >]`));
           // The subtitle is the sentence `renderedLocale` probes, so its presence in the
           // reader's language is what proves the declared code was EARNED rather than echoed.
           expect(html).not.toContain("Control plane for the panel orchestrator");

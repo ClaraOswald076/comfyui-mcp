@@ -52,6 +52,13 @@ describe("locale resolution", () => {
   it("--lang beats the environment, and explicit env beats the POSIX chain", () => {
     const prev = { ...process.env };
     try {
+      // Own the WHOLE chain, not just the link under test. The suite now pins
+      // COMFYUI_MCP_LANG=en (see helpers/isolated-test-home.ts), and this case asserts that
+      // LANG is consulted — which is only observable when the higher-precedence variables are
+      // absent. Leaving them to the ambient environment made the test assert "en beats fr" on
+      // a pinned machine and "ja beats fr" for anyone with LANG=ja_JP, i.e. it measured the
+      // developer rather than the code.
+      for (const k of ["COMFYUI_MCP_LANG", "LC_ALL", "LC_MESSAGES"]) delete process.env[k];
       process.env.LANG = "fr_FR.UTF-8";
       expect(processLocale(["node", "cli", "--lang", "ko"])).toBe("ko");
       expect(processLocale(["node", "cli", "--lang=ja"])).toBe("ja");
