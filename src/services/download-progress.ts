@@ -9,7 +9,7 @@
 // This no-ops entirely when COMFYUI_MCP_PROGRESS_DIR is unset — i.e. for every
 // normal (non-panel) use of the MCP — so it costs nothing outside the panel.
 
-import { mkdirSync, readFileSync, readdirSync, writeFileSync, renameSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -977,6 +977,31 @@ export function readPersistedDownloadJob(id: string): PersistedDownloadJob | nul
 
 /** Every persisted job record (freshest not guaranteed; caller sorts). Used to
  *  list in-flight downloads after a reconnect and to look one up by URL/destination. */
+/**
+ * When was THIS session's record store created, and where is it? (#1420)
+ *
+ * The store is nonced per orchestrator start and earlier ones are reaped, so a
+ * restart or reconnect gives a session a brand-new, EMPTY store while transfers
+ * begun under the old one keep streaming inside the processes that own them. An
+ * empty listing therefore says as much about the store's age as about the world,
+ * and a reader deserves to be told which.
+ *
+ * `createdMs` is undefined when the directory cannot be stat'd — unknown, which is
+ * reported as unknown rather than as "old".
+ */
+export function describeRecordStore(): { dir: string; createdMs?: number } {
+  const dir = recordsDir();
+  if (!dir) return { dir: "" };
+  try {
+    const st = statSync(dir);
+    // birthtime is 0 on filesystems that do not record it; ctime is the fallback.
+    const born = st.birthtimeMs > 0 ? st.birthtimeMs : st.ctimeMs;
+    return { dir, createdMs: Number.isFinite(born) && born > 0 ? born : undefined };
+  } catch {
+    return { dir };
+  }
+}
+
 export function listPersistedDownloadJobs(): PersistedDownloadJob[] {
   const dir = recordsDir();
   if (!dir) return [];
