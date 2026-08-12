@@ -52,6 +52,12 @@ import type { UiBridge } from "../services/ui-bridge.js";
 import { conversationOfScopeAddress, isScopeAddress, shortTabId } from "../services/session-scope.js";
 import type { ScopeRepinOutcome } from "./turn-origins.js";
 import { NODE_ID_MESSAGE, NODE_ID_PATTERN, normalizeNodeId } from "./node-id.js";
+import {
+  clearSwitchHold,
+  describeSwitchHold,
+  recordSwitchHold,
+  successProvesSwitchCleared,
+} from "./switch-hold.js";
 import { NO_ORIGIN_REMEDY } from "./fence-refusal.js";
 
 /** #884 — journal TICKETS (run completions #468, ask answers #486) must be
@@ -6178,7 +6184,13 @@ export function makePanelToolCtx(
         await awaitReachable();
       }
       ensureReachable();
-      return ok(await sendRouted(cmd, timeoutMs, observeRid));
+      const firstTry = ok(await sendRouted(cmd, timeoutMs, observeRid));
+      // panel#1097 — a guard-domain command that SUCCEEDS is the evidence that the
+      // switch is over, whichever attempt lands it. Without this an ordinary
+      // first-attempt success left the old run in place, and a later unrelated
+      // switch inherited its age and was announced as stuck at once (codex r4).
+      if (successProvesSwitchCleared(cmd.cmd)) clearSwitchHold(ctx.tabId);
+      return firstTry;
     } catch (err) {
       // Post-reconnect retry-once: a reboot/free_vram/reconnect can drop the tab's
       // transport (or replace it under a new tab id) the instant after we dispatch.
@@ -6191,16 +6203,40 @@ export function makePanelToolCtx(
       // is what retrySettleMs already waits. Still gated on RETRY-SAFE commands,
       // so a mutation is never re-issued on our own initiative.
       if (isRetrySafeCmd(cmd) && (isTransientReconnectError(err) || isWorkflowSwitchGuardRefusal(err))) {
+        // panel#1097 — declared out here so the refusal branch below can see it,
+        // and REASSIGNED after ensureReachable so it names the tab the command is
+        // actually dispatched on. Reading it before the rebind attributed a refusal
+        // from B to A; reading it after the await let a later rebind move it again
+        // (codex rounds 1 and 2).
+        let holdTab = ctx.tabId;
         try {
           await sleep(retrySettleMs());
           ensureReachable(); // rebinds a current-mode session onto the reconnected tab
-          return ok(await sendRouted(cmd, timeoutMs, observeRid));
+          holdTab = ctx.tabId;
+          const retried = ok(await sendRouted(cmd, timeoutMs, observeRid));
+          // Cleared HERE and nowhere else, and only when the failure this retried
+          // was a SWITCH refusal. Clearing on every routed success let an unguarded
+          // status read wipe the evidence while graph commands stayed refused
+          // (codex round 2); clearing after a transient-reconnect retry does the
+          // same thing one step removed, because reconnecting proves nothing about
+          // whether the switch cleared (codex round 3).
+          // Same rule on the retry path. A transient-RECONNECT retry that succeeds
+          // proves nothing about the switch (codex r3), so the command still has to
+          // be one the guard would have refused.
+          if (isWorkflowSwitchGuardRefusal(err) && successProvesSwitchCleared(cmd.cmd)) {
+            clearSwitchHold(holdTab);
+          }
+          return retried;
         } catch (err2) {
           // #1027 — a switch STILL in progress is not a reconnect, and saying so
           // would be the #1001 mistake again: the tab is connected and healthy,
           // it is simply mid-switch. Name the actual state and the actual wait.
           if (isWorkflowSwitchGuardRefusal(err2)) {
             const name = typeof cmd.cmd === "string" ? cmd.cmd : "panel command";
+            // panel#1097 — time the RUN of these refusals. "Simply retry" is right
+            // for the fraction of a second this normally lasts and wrong for a
+            // switch held open by a dialog, and the two were indistinguishable.
+            const held = describeSwitchHold(recordSwitchHold(holdTab));
             return fail(
               `${name} was NOT applied — nothing changed. The panel is still switching or ` +
                 `reloading the workflow on the canvas, which it refuses commands during so a ` +
@@ -6208,7 +6244,8 @@ export function makePanelToolCtx(
                 `reconnect: it normally clears in well under a second, so simply retry. If a ` +
                 `switch appears stuck, check the canvas — a load dialog or an unsaved-changes ` +
                 `prompt can hold it open awaiting the user. ` +
-                `(${err2 instanceof Error ? err2.message : String(err2)})`,
+                `(${err2 instanceof Error ? err2.message : String(err2)})` +
+                held,
             );
           }
           // The retry also failed — surface an actionable reconnecting status rather
