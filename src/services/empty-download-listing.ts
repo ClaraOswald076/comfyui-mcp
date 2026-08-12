@@ -17,6 +17,13 @@
  *     completion, so the obvious corroborating check — look at the destination
  *     folder — is ALSO empty.
  *
+ * The remedy has to match the SIBLING message in the same function, which already
+ * negotiated this across #1148/#1197/#1183: adoption is a SAME-SESSION property,
+ * across a reconnect the tray is what to trust, and a Manager-dispatched transfer
+ * must not be re-issued at all. A first draft here said "re-issue, it is the safe
+ * check" to every caller, which contradicted that and would have handed a
+ * server-side transfer the one instruction that corrupts it.
+ *
  * Between them the state is indistinguishable from "the downloads died and their
  * partials were cleaned up", which is exactly the wrong conclusion this text exists
  * to prevent.
@@ -72,9 +79,13 @@ export function emptyDownloadListingNote(opts?: {
     `not tell the user so. In-flight bytes are staged OUTSIDE models/<subfolder> and only ` +
     `moved on completion, so the destination folder looks empty too, which makes these two ` +
     `very different states look identical.\n\n` +
-    `TO FIND OUT: the panel's download tray shows live transfers regardless of this store. ` +
-    `Or re-issue download_model action:"download" with the SAME url — an in-flight transfer ` +
-    `is ADOPTED, not duplicated, and the reply carries its real progress. That is the cheap, ` +
-    `safe check; starting over is not.`
+    `TO FIND OUT, IN THIS ORDER: check the panel's download tray — it shows live transfers ` +
+    `regardless of this store, and it is the check that is safe in every configuration. ` +
+    `Within the SAME session, re-issuing an identical in-flight download_model ` +
+    `action:"download" adopts it rather than duplicating it; ACROSS a reconnect — which is ` +
+    `the situation you are most likely in when this listing is empty — confirm via the tray ` +
+    `FIRST. Re-issuing is NOT universally safe: a transfer dispatched to ComfyUI-Manager runs ` +
+    `SERVER-side, and re-issuing that one is a second dispatch to the same destination, which ` +
+    `is the corrupting move (#1197) — for those, check whether the file landed instead.`
   );
 }

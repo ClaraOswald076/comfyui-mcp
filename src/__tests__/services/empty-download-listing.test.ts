@@ -11,6 +11,7 @@
 
 import { describe, expect, it } from "vitest";
 import { emptyDownloadListingNote } from "../../services/empty-download-listing.js";
+import { storeCreatedFrom } from "../../services/download-progress.js";
 
 const NOW = 1_800_000_000_000;
 
@@ -38,10 +39,28 @@ describe("#1420 the empty listing refuses to claim absence", () => {
     expect(note).toContain("staged OUTSIDE models/<subfolder>");
   });
 
-  it("gives the two cheap checks, and says re-downloading is not one of them", () => {
-    expect(note).toContain("download tray");
-    expect(note).toContain("ADOPTED, not duplicated");
-    expect(note).toContain("starting over is not");
+  it("puts the UNIVERSALLY safe check first — the tray", () => {
+    expect(note).toContain("check the panel's download tray");
+    expect(note).toContain("safe in every configuration");
+  });
+
+  it("scopes adoption to the SAME session, matching the sibling message", () => {
+    // codex review, P1: a first draft told every caller that re-issuing adopts and
+    // is "the safe check". Adoption is a same-session property; across a reconnect
+    // the sibling id/url-miss message says to confirm via the tray first, and two
+    // branches of one tool must not give incompatible route advice.
+    expect(note).toContain("Within the SAME session");
+    expect(note).toContain("ACROSS a reconnect");
+    expect(note).toContain("confirm via the tray");
+  });
+
+  it("warns that a Manager-dispatched transfer must NOT be re-issued", () => {
+    // #1197: that one runs server-side, and re-issuing it is the corrupting move.
+    // Telling every caller to re-issue would have handed exactly that transfer the
+    // one instruction that destroys it.
+    expect(note).toContain("NOT universally safe");
+    expect(note).toContain("corrupting move");
+    expect(note).toContain("check whether the file landed");
   });
 
   it("does not use the old bare sentence", () => {
@@ -80,5 +99,25 @@ describe("#1420 the store's age is offered only when it explains something", () 
       const note = emptyDownloadListingNote({ now: NOW, storeCreatedMs: bad });
       expect(note, String(bad)).not.toMatch(/store was created -?\d+[smh] ago/);
     }
+  });
+});
+
+describe("#1420 the store's creation time comes from birthtime ONLY", () => {
+  it("uses birthtime when the filesystem records it", () => {
+    expect(storeCreatedFrom({ birthtimeMs: 1_700_000_000_000, ctimeMs: NOW })).toBe(
+      1_700_000_000_000,
+    );
+  });
+
+  it("returns UNDEFINED rather than falling back to ctime", () => {
+    // codex review, P2: ctime moves whenever a record is written into the directory,
+    // so a long-lived, ACTIVE store would report itself as seconds old — and the age
+    // sentence would be false precisely when downloads are running, which is when it
+    // is read. On this project's own filesystem birthtime is always present, so no
+    // test could reach the fallback through the real stat; this is why the rule is
+    // extracted and asserted directly.
+    expect(storeCreatedFrom({ birthtimeMs: 0, ctimeMs: NOW })).toBeUndefined();
+    expect(storeCreatedFrom({ birthtimeMs: Number.NaN, ctimeMs: NOW })).toBeUndefined();
+    expect(storeCreatedFrom({ birthtimeMs: -1, ctimeMs: NOW })).toBeUndefined();
   });
 });

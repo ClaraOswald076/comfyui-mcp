@@ -989,14 +989,30 @@ export function readPersistedDownloadJob(id: string): PersistedDownloadJob | nul
  * `createdMs` is undefined when the directory cannot be stat'd — unknown, which is
  * reported as unknown rather than as "old".
  */
+/**
+ * The creation time of a record store, from its stat — or UNDEFINED (#1420).
+ *
+ * BIRTHTIME ONLY. ctime was written as a fallback and removed: where birthtime is
+ * unavailable, ctime moves whenever a record is written into the directory — which
+ * is constantly, since that is what the directory is for — so a long-lived store
+ * would report itself as seconds old, and the sentence built on it ("anything
+ * started before then was never in it") would be FALSE exactly when it is most
+ * load-bearing. Unknown is reported as unknown.
+ *
+ * Extracted so the rule is testable: on a filesystem that supplies birthtime — as
+ * this project's own does — no test could otherwise reach the fallback, and a
+ * mutation putting ctime back survived because of it.
+ */
+export function storeCreatedFrom(st: { birthtimeMs: number; ctimeMs: number }): number | undefined {
+  const born = st.birthtimeMs;
+  return Number.isFinite(born) && born > 0 ? born : undefined;
+}
+
 export function describeRecordStore(): { dir: string; createdMs?: number } {
   const dir = recordsDir();
   if (!dir) return { dir: "" };
   try {
-    const st = statSync(dir);
-    // birthtime is 0 on filesystems that do not record it; ctime is the fallback.
-    const born = st.birthtimeMs > 0 ? st.birthtimeMs : st.ctimeMs;
-    return { dir, createdMs: Number.isFinite(born) && born > 0 ? born : undefined };
+    return { dir, createdMs: storeCreatedFrom(statSync(dir)) };
   } catch {
     return { dir };
   }

@@ -52,7 +52,8 @@ describe("#1420 status with no selector answers honestly", () => {
     // returns rather than on what the helper can produce.
     expect(text).toContain("THIS session's record store");
     expect(text).toContain("DO NOT conclude");
-    expect(text).toContain("ADOPTED, not duplicated");
+    expect(text).toContain("check the panel's download tray");
+    expect(text).toContain("corrupting move");
   });
 
   it("is not an error — nothing failed, the answer is just not proof", async () => {
