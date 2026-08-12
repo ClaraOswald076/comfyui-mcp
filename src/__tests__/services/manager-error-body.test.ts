@@ -170,19 +170,27 @@ describe("#1397 a credential never reaches the message", () => {
     expect(out).not.toMatch(/ghp_ZZZ/);
   });
 
-  it("redacts an Authorization: Basic header - both halves of a credential at once", () => {
-    // Found by review: `basic` was the one scheme the alternation missed. It matters
-    // MORE than the others, not less - the base64 blob decodes to `user:password`, so
-    // leaking it leaks the account itself, not a token that can be rotated.
-    const secret = "QWxhZGRpbjpvcGVuc2VzYW1l";
-    const out = managerBodyExcerpt(
-      "HTTPError: 401 Client Error for url http://127.0.0.1:8188/api/manager/queue/install " +
-        "(sent Authorization: Basic " + secret + ")",
-    );
+  it("redacts Authorization: Basic at ANY length, including a 4-char credential", () => {
+    // `Basic YTpi` decodes to `a:b`. A shape/length discriminator missed exactly this
+    // (round 3 of review), which is why the rule keys on the HEADER context instead:
+    // once `Authorization: Basic` is present, whatever follows is the credential
+    // regardless of how short or how word-like it looks.
+    for (const secret of ["YTpi", "QWxhZGRpbjpvcGVuc2VzYW1l", "dXNlcjpwYXNzd29yZA"]) {
+      const out = managerBodyExcerpt(
+        "HTTPError: 401 Client Error for url http://127.0.0.1:8188/api/manager/queue " +
+          "(sent Authorization: Basic " + secret + ")",
+      );
+      expect(out).not.toContain(secret);
+      expect(out).toMatch(/Basic \*\*\*/i);
+      expect(out).toMatch(/401/); // the diagnosis survives
+    }
+  });
+
+  it("redacts a Proxy-Authorization Basic header too", () => {
+    const secret = "cHJveHl1c2VyOnB3";
+    const out = managerBodyExcerpt("502 from proxy (Proxy-Authorization: Basic " + secret + ")");
     expect(out).not.toContain(secret);
-    expect(out).toMatch(/Basic \*\*\*/);
-    // The diagnosis still survives - redaction must not cost the reason.
-    expect(out).toMatch(/401/);
+    expect(out).toMatch(/Basic \*\*\*/i);
   });
 
   it("truncation never ends on half a surrogate pair", () => {
@@ -211,6 +219,11 @@ describe("#1397 a credential never reaches the message", () => {
     const out = managerBodyExcerpt("ValueError: Basic configuration missing for Deno package");
     expect(out).toContain("Basic configuration missing");
     expect(out).not.toContain("***");
+    // Round 3: a long alphanumeric identifier is still ordinary prose, not a
+    // credential. The shape-based rule ate this one; the context-based rule cannot.
+    const out2 = managerBodyExcerpt("ValueError: Basic ConfigVersion2026 missing for Deno package");
+    expect(out2).toContain("ConfigVersion2026");
+    expect(out2).not.toContain("***");
   });
 
   it("redacts a Cookie / session value", () => {
@@ -231,6 +244,18 @@ describe("#1397 a credential never reaches the message", () => {
     const out = managerBodyExcerpt("RequestError: authorization=" + v + " rejected upstream");
     expect(out).not.toContain(v);
     expect(out).toMatch(/authorization=\*\*\*/);
+  });
+
+  it("redacts a git remote whose PASSWORD contains a colon", () => {
+    // Round 3 claimed `https://user:pa:ss@host` leaks because the pattern "rejects the
+    // second colon". Measured here rather than argued: the user part excludes `:` but
+    // the password part does not, so the match runs to the `@` and the whole
+    // credential goes. Keeping the case pinned so a future tightening of that charset
+    // cannot silently reintroduce the leak.
+    const out = managerBodyExcerpt("fatal: could not read from https://user:pa:ss@host/repo.git");
+    expect(out).not.toContain("pa:ss");
+    expect(out).toContain("***");
+    expect(out).toContain("host/repo.git");
   });
 
   it("does not over-redact an ordinary exception", () => {

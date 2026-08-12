@@ -46,21 +46,20 @@ function redactCredentials(text: string): string {
       .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1***:***@")
       // Authorization-style headers echoed into a traceback.
       .replace(/\b(bearer|token|apikey|api_key)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 ***")
-      // `Basic` needs its OWN rule, and a narrower one. It carries base64 of
-      // `user:password`, so a leak is both halves of a credential at once — but
-      // "basic" is also an ordinary English word, and matching it the same way as
-      // `bearer` turned "Basic configuration missing for Deno package" into
-      // "Basic *** missing for Deno package", destroying the diagnosis. (Review found
-      // that; it was a defect the first fix INTRODUCED.)
+      // `Basic` needs its OWN rule, because it is the one scheme name that is also an
+      // ordinary English word. Two earlier attempts failed in opposite directions:
+      // matching it like `bearer` redacted "Basic configuration missing for Deno
+      // package"; keying on base64 SHAPE then missed short credentials (`Basic YTpi`
+      // is `a:b`) and still ate "Basic ConfigVersion2026". Both were defects the
+      // fixes themselves introduced.
       //
-      // The discriminator is the SHAPE of what follows: base64 at credential length,
-      // required to carry a digit or a base64-only character. An English word is
-      // pure letters, so it cannot match; `user:password` base64 essentially always
-      // can at 16+ characters. A digitless all-alpha base64 blob would slip through —
-      // accepted, because the alternative is redacting ordinary prose, and this
-      // excerpt exists to make an opaque failure readable.
+      // So discriminate on CONTEXT, not on the value: redact only where `basic`
+      // follows an `Authorization`/`Proxy-Authorization` header. Prose does not say
+      // "Authorization: Basic configuration". That admits ANY value, however short or
+      // however word-like, which is what the shape rule could never do safely — and a
+      // bare `Basic <blob>` with no header in sight stays readable.
       .replace(
-        /\b(basic)\s+(?=[A-Za-z0-9+/]{16,}={0,2}\b)(?=[A-Za-z0-9+/=]*[0-9+/=])[A-Za-z0-9+/]{16,}={0,2}/gi,
+        /\b((?:proxy-)?authoriz(?:ation|ed)?["']?\s*[=:]\s*["']?\s*basic)\s+\S+/gi,
         "$1 ***",
       )
       // token=… / api_key=… / access_token=… in a query string or a repr.
