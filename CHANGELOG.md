@@ -197,6 +197,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.14] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- tell a dropped graph write to verify with a graph READ, not the render queue (#1457)
+
+
 ## [0.51.13] - 2026-08-12
 
 ### MCP
