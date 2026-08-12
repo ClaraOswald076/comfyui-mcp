@@ -63,6 +63,45 @@ import { listSessions, loadTranscript } from "./history.js";
 import { uploadImageHttp, resetClient } from "../comfyui/client.js";
 import { setConnectedPanelOrigins } from "../comfyui/fetch.js";
 import { logger } from "../utils/logger.js";
+import { assembleVocabularyHash, describeVocabularySkew } from "../tools/vocabulary.js";
+import { buildPanelToolDefs } from "./panel-tools.js";
+
+/** The panel vocabulary hashes whose MISMATCH has already been reported (#236).
+ *
+ *  Keyed by the HASH ALONE, not by tab. Codex round 2 found that a per-tab key lets a
+ *  stale entry suppress a real mismatch: `wf:` ids are reused, so a tab that closes
+ *  after warning leaves an entry that silences the NEXT tab opening the same workflow.
+ *
+ *  Keying by hash is not a patch for that, it is the correct granularity. The fact
+ *  being reported — "the vocabulary this panel build vendored disagrees with this
+ *  server's" — is a property of the panel BUILD, not of a tab or a workflow. Saying it
+ *  once per distinct disagreeing vocabulary is exactly the news there is; saying it
+ *  once per tab was always repeating one fact under different labels.
+ *
+ *  It also bounds itself: a process sees one or two panel builds, so the set holds one
+ *  or two entries where the per-tab map grew with every id ever minted. */
+const loggedVocabularySkew = new Set<string>();
+
+/** A cap anyway (codex round 1, P2). Nothing legitimate mints hashes — a panel
+ *  advertises one per build — but this reads a value off the wire, and a broken or
+ *  hand-modified panel that sent a fresh hash every hello would otherwise grow the set
+ *  without limit. Oldest-first eviction, and the direction stays safe: an evicted entry
+ *  can only cause a mismatch to be reported a SECOND time, never suppress one, because
+ *  entries only ever suppress. */
+const MAX_LOGGED_VOCABULARY_SKEW = 64;
+
+/** This server's vocabulary hash, computed once.
+ *
+ *  Memoised because it cannot change without a restart (the tool surface is fixed at
+ *  build time) and buildPanelToolDefs() walks every panel tool definition — work that
+ *  has no business running on every hello, which is a hot path during a reconnect loop. */
+let cachedServerVocabularyHash: string | undefined;
+function serverVocabularyHash(): string {
+  cachedServerVocabularyHash ??= assembleVocabularyHash(
+    buildPanelToolDefs().map((d) => d.name),
+  );
+  return cachedServerVocabularyHash;
+}
 import {
   PanelAgentManager,
   fetchSupportedModels,
@@ -3404,6 +3443,50 @@ export async function runPanelOrchestrator(): Promise<void> {
       if (typeof helloPanelVer === "string" && helloPanelVer && helloPanelVer !== latestPanelVersion) {
         latestPanelVersion = helloPanelVer;
         void refreshEnvCapabilities();
+      }
+      // #236 — THE VOCABULARY HANDSHAKE, at the handshake.
+      //
+      // `describeVocabularySkew` and the hash it compares have existed, fully
+      // unit-tested, since the #683 follow-up, and NOTHING called them: the bridge
+      // stored the panel's advertised hash on every hello under a comment promising
+      // this exact check, and no code read the field. A mechanism can be completely
+      // unreachable and still pass every test it has — the tests proved the function
+      // worked, never that it ran — so the call site below is asserted directly, by
+      // source, in vocabulary-handshake.test.ts.
+      //
+      // The comparison is done HERE rather than in the bridge because the server's own
+      // hash needs buildPanelToolDefs(), and panel-tools.ts imports ui-bridge.ts — the
+      // bridge cannot reach it without a cycle. The orchestrator already imports both.
+      const helloVocabHash = (event as { vocabulary_hash?: unknown }).vocabulary_hash;
+      {
+        const advertised =
+          typeof helloVocabHash === "string" && helloVocabHash ? helloVocabHash : undefined;
+        const skew = describeVocabularySkew(
+          serverVocabularyHash(),
+          advertised,
+          typeof helloPanelVer === "string" ? helloPanelVer : undefined,
+        );
+        // Reported once per DISTINCT disagreeing vocabulary, for the whole process.
+        // A reconnect ping-pong repeats the same hello every few seconds and the same
+        // skew is not new news; a panel that UPDATES to a different (still disagreeing)
+        // vocabulary is, and its new hash reports again.
+        //
+        // There is deliberately NO "clear on match" here. Under the per-tab key a
+        // stale entry had to be cleared so a tab that came back into agreement and
+        // later regressed would report again; keyed by hash there is nothing stale to
+        // clear — a regression re-advertises the same disagreeing hash, and if it was
+        // already reported, that is genuinely the same news the user already has.
+        if (skew.status === "mismatch" && !loggedVocabularySkew.has(advertised!)) {
+          // Insertion-ordered, so the first entry is the oldest. Evicted BEFORE the
+          // add so the cap is a real bound rather than a bound-plus-one.
+          while (loggedVocabularySkew.size >= MAX_LOGGED_VOCABULARY_SKEW) {
+            const oldest = loggedVocabularySkew.values().next().value;
+            if (oldest === undefined) break;
+            loggedVocabularySkew.delete(oldest);
+          }
+          loggedVocabularySkew.add(advertised!);
+          logger.warn(`[panel-orchestrator] ${skew.message}`);
+        }
       }
       // #706 — an npm-orchestrator update can require a newer Registry panel.
       // The panel-sync service owns the ENTIRE safety decision: it re-reads the
