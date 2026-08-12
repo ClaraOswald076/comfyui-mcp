@@ -197,6 +197,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.11] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- a relay fence stops assuming the panel is served from COMFYUI_URL (#1446)
+
+
 ## [0.51.10] - 2026-08-11
 
 ### MCP
