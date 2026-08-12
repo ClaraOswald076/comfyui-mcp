@@ -117,12 +117,30 @@ export function insufficientCacheSpaceMessage(opts: {
   cacheFree: number;
   destDir?: string;
   destFree?: number | null;
-  /** True when this refusal interrupts a RESUME, so a .partial already exists. */
+  /** Reserve applied to the DESTINATION volume, so this clause agrees with policy. */
+  destHeadroom?: number;
+  /** True when this refusal interrupts a RESUME (appending to a partial). */
   resuming?: boolean;
+  /** True when a .partial exists on disk AT ALL — including a restart that is about
+   *  to discard it. Distinct from `resuming`: review found the two conflated, so a
+   *  restart-after-a-rejected-Range wrongly claimed nothing had been downloaded. */
+  partialExists?: boolean;
 }): string {
-  const { needBytes, cacheDir, cacheFree, destDir, destFree, resuming = false } = opts;
+  const {
+    needBytes,
+    cacheDir,
+    cacheFree,
+    destDir,
+    destFree,
+    resuming = false,
+    partialExists = false,
+  } = opts;
+  // The SAME reserve the policy applies, not the flat one: review found the message
+  // demanding 1 GiB of the destination while `checkCacheVolumeSpace` would have
+  // accepted a 5% reserve, so a destination that fits could be reported as too small.
+  // A remediation hint that contradicts the policy is worse than no hint.
   const destHasRoom =
-    typeof destFree === "number" && destFree >= needBytes + VOLUME_HEADROOM_BYTES;
+    typeof destFree === "number" && destFree >= needBytes + (opts.destHeadroom ?? VOLUME_HEADROOM_BYTES);
 
   const head =
     `NOT downloaded: this needs ${gb(needBytes)} of staging space and the download ` +
@@ -145,9 +163,14 @@ export function insufficientCacheSpaceMessage(opts: {
   const state = resuming
     ? ` Your existing partial download is untouched and still resumable — this ` +
       `refusal happens before any further bytes are written.`
-    : ` Nothing was written and nothing was partially downloaded — this refusal ` +
-      `happens before the first byte, precisely so a full volume is not driven to ` +
-      `zero (#1477).`;
+    : partialExists
+      ? ` A partial download from an earlier attempt is still on disk; this refusal ` +
+        `happens before any further bytes are written, so it is unchanged. Freeing ` +
+        `space may require removing it, and the figure above does NOT assume it was ` +
+        `reclaimed.`
+      : ` Nothing was written and nothing was partially downloaded — this refusal ` +
+        `happens before the first byte, precisely so a full volume is not driven to ` +
+        `zero (#1477).`;
   const fix =
     ` Point the cache at a volume with room by setting COMFYUI_DOWNLOAD_CACHE_DIR ` +
     `(for example to a directory beside your models), then retry.` + state;
@@ -167,20 +190,39 @@ export async function checkCacheVolumeSpace(opts: {
   cacheDir: string;
   destDir?: string;
   resuming?: boolean;
+  partialExists?: boolean;
 }): Promise<string | null> {
-  const { needBytes, cacheDir, destDir, resuming } = opts;
+  const { needBytes, cacheDir, destDir, resuming, partialExists } = opts;
   if (!needBytes || !Number.isFinite(needBytes) || needBytes <= 0) return null;
   const space = await volumeSpaceFor(cacheDir);
   if (space === null) return null;
   const headroom = headroomFor(space.total);
   if (space.free >= needBytes + headroom) return null;
-  const destFree = destDir ? await freeBytesFor(destDir) : null;
+  const destSpace = destDir ? await volumeSpaceFor(destDir) : null;
+  const destFree = destSpace?.free ?? null;
   return insufficientCacheSpaceMessage({
     needBytes,
     cacheDir,
     cacheFree: space.free,
     destDir,
     destFree,
+    destHeadroom: destSpace ? headroomFor(destSpace.total) : undefined,
     resuming,
+    partialExists,
   });
 }
+
+/*
+ * DELIBERATELY CONSERVATIVE: a restart that is about to truncate a stale .partial
+ * will reclaim its bytes, and crediting them here would let a few more downloads
+ * through. It is not done, because the truncation happens on two different paths —
+ * one BEFORE the request (a declined full response) and one at the write flags AFTER
+ * this check — and on the first of those the space is already free, so crediting it
+ * would DOUBLE-COUNT and permit exactly the overflow this module exists to stop.
+ *
+ * The two error directions are not symmetric. A false refusal costs one retry after
+ * setting COMFYUI_DOWNLOAD_CACHE_DIR; a false allow costs the system drive. Until the
+ * ordering is established by measurement rather than by reading, this stays on the
+ * side that cannot cause the harm — and the message above says plainly that the
+ * figure does not assume the partial was reclaimed, so the number is never misread.
+ */

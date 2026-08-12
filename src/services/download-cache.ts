@@ -2104,7 +2104,11 @@ async function streamUrlToFile(
     const refusal = await checkCacheVolumeSpace({
       needBytes,
       cacheDir: dirname(targetPath),
+      // `resuming` is "we are APPENDING"; `partialExists` is "there are bytes on disk
+      // either way". Review found these conflated, so a restart after a server ignored
+      // our Range told the user nothing had been downloaded while a partial sat there.
       resuming: appendMode,
+      partialExists: (resumeFromBytes || 0) > 0,
     });
     if (refusal) throw new ModelError(refusal, { path: targetPath });
   }

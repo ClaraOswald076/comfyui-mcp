@@ -224,3 +224,60 @@ describe("#1477 round 2: the reserve scales, and the message tells the truth on 
     expect(typeof free).toBe("number");
   });
 });
+
+describe("#1477 round 3: a partial on disk is never denied", () => {
+  it("does not claim nothing was downloaded when a RESTART will discard a partial", () => {
+    // Review found `resuming` and "a partial exists" conflated. When a server ignores
+    // our Range we restart rather than append, so `resuming` is false - and the old
+    // message then told a user with a 22 GB .partial that nothing had been downloaded.
+    const m = insufficientCacheSpaceMessage({
+      needBytes: 10 * GB,
+      cacheDir: "C:/cache",
+      cacheFree: 1 * GB,
+      resuming: false,
+      partialExists: true,
+    });
+    expect(m).not.toMatch(/Nothing was written/);
+    expect(m).toMatch(/partial download from an earlier attempt is still on disk/);
+  });
+
+  it("says the free-space figure does NOT assume the partial was reclaimed", () => {
+    // The space math is deliberately conservative; the message must not imply
+    // otherwise, or the number reads as wrong.
+    const m = insufficientCacheSpaceMessage({
+      needBytes: 10 * GB,
+      cacheDir: "C:/cache",
+      cacheFree: 1 * GB,
+      partialExists: true,
+    });
+    expect(m).toMatch(/does NOT assume it was\s+reclaimed/);
+  });
+
+  it("the destination clause uses the SAME reserve as the policy", () => {
+    // A 4 GiB destination with 2 GiB free and a 1.5 GiB download: the policy's 5%
+    // reserve (200 MiB) says it fits, so the message must not demand a flat 1 GiB and
+    // report it as too small.
+    const small = 4 * GB;
+    const m = insufficientCacheSpaceMessage({
+      needBytes: 1.5 * GB,
+      cacheDir: "C:/cache",
+      cacheFree: 0.2 * GB,
+      destDir: "E:/models",
+      destFree: 2 * GB,
+      destHeadroom: headroomFor(small),
+    });
+    expect(m).toMatch(/DESTINATION has room/);
+  });
+
+  it("still refuses to claim destination room when there genuinely is none", () => {
+    const m = insufficientCacheSpaceMessage({
+      needBytes: 10 * GB,
+      cacheDir: "C:/cache",
+      cacheFree: 0.2 * GB,
+      destDir: "E:/models",
+      destFree: 1 * GB,
+      destHeadroom: headroomFor(4 * GB),
+    });
+    expect(m).not.toMatch(/DESTINATION has room/);
+  });
+});
