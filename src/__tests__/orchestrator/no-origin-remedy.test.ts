@@ -24,8 +24,23 @@ import { NO_ORIGIN_REMEDY, identityReason } from "../../orchestrator/fence-refus
 const NO_ORIGIN = identityReason("tab-1", undefined, "not-a-uuid", "none" as never);
 
 describe("panel#1065 the no-origin remedy is the one that works", () => {
-  it("names the thing that actually supplies the origin", () => {
-    expect(NO_ORIGIN_REMEDY).toContain("Set COMFYUI_URL to the URL the panel is served from");
+  it("states what the gate actually checks — presence, never agreement", () => {
+    // Measured, not assumed: workflowIdentityParts requires an origin to EXIST and
+    // both call sites take only `.uuid`; `identity.origin` is never read again. This
+    // is what resolves the reporter's stated tension — their COMFYUI_URL
+    // "intentionally is not the browser panel origin", and it does not have to be.
+    expect(NO_ORIGIN_REMEDY).toContain("PRESENCE, not agreement");
+    expect(NO_ORIGIN_REMEDY).toContain("does not have ");
+    expect(NO_ORIGIN_REMEDY).toContain("to match where the panel is served from");
+  });
+
+  it("gives the RELAY cause and the non-relay cause separately", () => {
+    // codex review, P1: the predicate is generic. A blanket "set COMFYUI_URL" sends a
+    // direct/LAN/pairing or non-browser caller to a configuration change that cannot
+    // add a handshake Origin, and leaves them fenced with nothing left to try.
+    expect(NO_ORIGIN_REMEDY).toContain("On a RELAY connection");
+    expect(NO_ORIGIN_REMEDY).toContain("On any other path");
+    expect(NO_ORIGIN_REMEDY).toContain("never presented an Origin header");
   });
 
   it("does NOT tell the user to abandon the relay backend", () => {
@@ -33,7 +48,8 @@ describe("panel#1065 the no-origin remedy is the one that works", () => {
     // costs them a working remote setup and fixes nothing.
     expect(NO_ORIGIN_REMEDY).not.toMatch(/unset COMFYUI_MCP_TUNNEL_BACKEND/i);
     expect(NO_ORIGIN_REMEDY).not.toMatch(/rather than the relay backend/i);
-    expect(NO_ORIGIN_REMEDY).toContain("switching away from the relay backend is");
+    expect(NO_ORIGIN_REMEDY).toContain("you do not have ");
+    expect(NO_ORIGIN_REMEDY).toContain("to leave the relay backend");
   });
 
   it("does NOT ask for a report about a protocol gap that is closed", () => {

@@ -67,11 +67,26 @@ export function noPanelTabReason(tabId: string): string {
  * report, and told someone to downgrade a working setup on the way.
  */
 export const NO_ORIGIN_REMEDY =
-  `Set COMFYUI_URL to the URL the panel is served from — that is what supplies this ` +
-  `connection's origin, and it is what is missing or unparseable when this happens. ` +
-  `Refreshing the tab will not change it, and switching away from the relay backend is ` +
-  `no longer necessary: a relay session supplies the origin it already knows. Reads and ` +
-  `non-graph tools keep working meanwhile — they do not need the fence.`;
+  // The gate's OWN semantics come first, because they dissolve the fear the old
+  // wording created and the reporter's stated obstacle at once. Measured, not
+  // assumed: workflowIdentityParts requires an origin to EXIST, both call sites
+  // take only `.uuid`, and `identity.origin` is never read again — so the value
+  // is a scope, not a claim to be checked against the browser.
+  `What this gate checks is PRESENCE, not agreement: the identity needs SOME origin to be ` +
+  `scoped to, and nothing ever compares it against the browser's — so the value does not have ` +
+  `to match where the panel is served from. ` +
+  // Two causes, named separately (codex review, P1). The predicate that selects this
+  // remedy is generic, and a blanket "set COMFYUI_URL" sends a direct/LAN/pairing or
+  // non-browser caller to a change that CANNOT add a handshake origin, leaving them
+  // fenced with nothing left to try.
+  `On a RELAY connection the origin is derived from COMFYUI_URL, so an unset or unparseable ` +
+  `COMFYUI_URL is the usual cause and setting it to any valid URL supplies one; you do not have ` +
+  `to leave the relay backend, which has supplied its own origin since 0.50.67. ` +
+  `On any other path the connection never presented an Origin header at all — a non-browser ` +
+  `client, or a proxy that strips it — and what fixes that is reaching the orchestrator from the ` +
+  `browser panel itself. ` +
+  `Refreshing the tab will not change either case. Reads and non-graph tools keep working ` +
+  `meanwhile — they do not need the fence.`;
 
 export function identityReason(
   tabId: string,

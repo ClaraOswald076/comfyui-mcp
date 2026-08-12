@@ -177,13 +177,15 @@ describe("the refusal message names the gate and matches the remedy to it", () =
     // because the copy asserted here had gone stale — it still told the user to
     // abandon the relay backend and to report a protocol gap that #1240 closed,
     // which is how panel#1065 came to be filed, quoting this exact sentence.
-    expect(text).toMatch(/Refreshing the tab will not change it/i);
+    expect(text).toMatch(/Refreshing the tab will not change either case/i);
     expect(text).toContain(NO_ORIGIN_REMEDY);
     // The advice that cost a working setup must be gone, not merely reworded.
     expect(text).not.toMatch(/COMFYUI_MCP_TUNNEL_BACKEND=relay/);
     expect(text).not.toMatch(/forward the browser'?s handshake Origin/i);
-    // The real remedy has to be the one they are actually given.
-    expect(text).toMatch(/Set COMFYUI_URL to the URL the panel is served from/);
+    // The real remedy has to be the one they are actually given — and it has to be
+    // true for a NON-relay caller too, so it names both causes rather than one.
+    expect(text).toMatch(/On a RELAY connection/);
+    expect(text).toMatch(/On any other path/);
     // The generic remedy must be suppressed, not merely preceded.
     expect(text).not.toMatch(/Ask the user to manually refresh/);
   });
