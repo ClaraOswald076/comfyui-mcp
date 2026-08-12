@@ -45,15 +45,35 @@ function redactCredentials(text: string): string {
       // scheme://user:secret@host — the git-remote case, and the one most likely here.
       .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1***:***@")
       // Authorization-style headers echoed into a traceback.
+      .replace(/\b(bearer|token|apikey|api_key)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 ***")
+      // `Basic` needs its OWN rule, and a narrower one. It carries base64 of
+      // `user:password`, so a leak is both halves of a credential at once — but
+      // "basic" is also an ordinary English word, and matching it the same way as
+      // `bearer` turned "Basic configuration missing for Deno package" into
+      // "Basic *** missing for Deno package", destroying the diagnosis. (Review found
+      // that; it was a defect the first fix INTRODUCED.)
       //
-      // `basic` is here for a reason found by review: it carries base64 of
-      // `user:password`, so a leak here is BOTH halves of a credential at once — the
-      // worst single case in this function — and it was the one scheme the original
-      // alternation missed. It is also why the length floor is lower for it: a short
-      // base64 blob is still a whole password.
-      .replace(/\b(bearer|basic|token|apikey|api_key)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 ***")
+      // The discriminator is the SHAPE of what follows: base64 at credential length,
+      // required to carry a digit or a base64-only character. An English word is
+      // pure letters, so it cannot match; `user:password` base64 essentially always
+      // can at 16+ characters. A digitless all-alpha base64 blob would slip through —
+      // accepted, because the alternative is redacting ordinary prose, and this
+      // excerpt exists to make an opaque failure readable.
+      .replace(
+        /\b(basic)\s+(?=[A-Za-z0-9+/]{16,}={0,2}\b)(?=[A-Za-z0-9+/=]*[0-9+/=])[A-Za-z0-9+/]{16,}={0,2}/gi,
+        "$1 ***",
+      )
       // token=… / api_key=… / access_token=… in a query string or a repr.
-      .replace(/\b([a-z_]*(?:token|secret|password|passwd|api[_-]?key))(["']?\s*[=:]\s*["']?)[A-Za-z0-9._~+/=-]{6,}/gi, "$1$2***")
+      // `authorization`, `cookie` and `session` join the key list for the same reason
+      // the others are on it: each is a credential essentially whenever it carries a
+      // value. A `Cookie: session=…` in a proxy's 401 body is a live session — as
+      // reusable as the password that minted it.
+      // The negative lookahead keeps this rule off the SCHEME NAME. Without it,
+      // `Authorization: Bearer <tok>` — already reduced to `Bearer ***` by the rule
+      // above — matched again with "Bearer" itself as the value, giving `*** ***` and
+      // hiding WHICH auth scheme was in play. That is diagnostic information with no
+      // secret in it, and a caller debugging a 401 wants it.
+      .replace(/\b([a-z_]*(?:token|secret|password|passwd|api[_-]?key|authorization|cookie|session))(["']?\s*[=:]\s*["']?)(?!(?:bearer|basic|digest|negotiate)\b)[A-Za-z0-9._~+/=-]{6,}/gi, "$1$2***")
   );
 }
 

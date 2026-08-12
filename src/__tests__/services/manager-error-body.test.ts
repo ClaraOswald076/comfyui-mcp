@@ -203,6 +203,36 @@ describe("#1397 a credential never reaches the message", () => {
     }
   });
 
+  it('does not redact the ORDINARY word "basic"', () => {
+    // Regression from round 1 of review: matching `basic` like `bearer` turned
+    // "Basic configuration missing for Deno package" into "Basic *** missing ...",
+    // deleting the diagnosis this excerpt exists to deliver. An English word is pure
+    // letters; a credential blob carries a digit or a base64-only character.
+    const out = managerBodyExcerpt("ValueError: Basic configuration missing for Deno package");
+    expect(out).toContain("Basic configuration missing");
+    expect(out).not.toContain("***");
+  });
+
+  it("redacts a Cookie / session value", () => {
+    // A live session in a proxy's 401 body is as reusable as the password that
+    // minted it.
+    const sid = "abcdefghijklmnopQRST9xY";
+    const out = managerBodyExcerpt("HTTPError: 401 for /api/manager/queue (Cookie: session=" + sid + ")");
+    expect(out).not.toContain(sid);
+    // Asserting the PROPERTY, not the shape: `Cookie:` consumes `session=<value>`
+    // greedily, so the redacted form is `Cookie: ***` rather than `session=***`.
+    // Pinning the exact form here would fail on a harmless rule reorder.
+    expect(out).toContain("***");
+    expect(out).toMatch(/401/);
+  });
+
+  it("redacts a bare authorization=<value> pair", () => {
+    const v = "AbcDef123456789xyz";
+    const out = managerBodyExcerpt("RequestError: authorization=" + v + " rejected upstream");
+    expect(out).not.toContain(v);
+    expect(out).toMatch(/authorization=\*\*\*/);
+  });
+
   it("does not over-redact an ordinary exception", () => {
     // Over-redaction makes the excerpt useless, and this exists to make an opaque
     // failure readable. A normal traceback must come through intact.
