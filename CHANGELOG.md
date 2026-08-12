@@ -197,6 +197,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.12] - 2026-08-11
+
+### MCP
+
+#### Fixed
+- say how long the workflow switch has been holding (#1450)
+
+
 ## [0.51.11] - 2026-08-11
 
 ### MCP
