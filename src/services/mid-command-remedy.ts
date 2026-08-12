@@ -35,15 +35,54 @@ export function isInteractiveCommand(cmd: string): boolean {
 /**
  * The "verify before retrying" clause, chosen by what the command actually did.
  *
- * Two kinds, because they have different evidence and different costs:
+ * The point of OUTCOME UNKNOWN is that the caller checks instead of retrying blind.
+ * That only works if the check named can actually hold the answer — and for a graph
+ * write it did not. Every non-interactive command got the same sentence:
  *
- *  • an INTERACTIVE card — nothing in the tool surface can observe it, and a
- *    the answer to it will NEVER arrive (the panel refuses to replay a reply of
- *    this kind across a reconnect), and a retry duplicates the card. Say all
- *    three, and give the route that works — which differs for a secret.
- *  • anything else — the existing queue/output check, which is real evidence for
- *    a run or a write.
+ *     Verify before retrying (e.g. check queue action:"list" /
+ *     get_image (action:"list_outputs"))
+ *
+ * which is RENDER evidence. panel#646's interrupted command was `graph_set_widget`.
+ * Neither the queue nor the output list can say whether a widget edit landed, so an
+ * agent following that advice looks somewhere structurally incapable of answering,
+ * learns nothing, and ends up exactly where the message was trying to keep it from:
+ * retry blindly or give up. The old doc here asserted the queue check was "real
+ * evidence for a run or a write". It is evidence for a run.
+ *
+ * So the kinds are separated by WHAT CAN BE OBSERVED:
+ *
+ *  • an INTERACTIVE card — nothing in the tool surface can observe it, the answer
+ *    will NEVER arrive, and a retry duplicates the card in front of a human.
+ *  • a RUN — the queue and the output list are exactly right, and stay.
+ *  • a GRAPH WRITE — read the graph back. A graph read is idempotent and safe to
+ *    run the instant a tab is connected, which makes it a better check than
+ *    anything the run path offers.
+ *  • a WORKFLOW mutator — the workflow list, not the graph: these change which
+ *    workflows exist or are open, which a canvas read does not see.
+ *  • anything else — say to verify without naming tools that may not apply.
+ *    Naming a plausible-but-wrong check is what this fix exists to remove; doing
+ *    it again in the default branch would be the same defect with a different tool.
+ *
+ * Classified by NAME here rather than by importing GRAPH_CMD_EFFECT, for two
+ * reasons: ui-bridge.ts imports this module, so reading its table would be a cycle;
+ * and that table answers a different question (does this need the workflow fence),
+ * which is not the same as what evidence exists for it afterwards.
  */
+/** The one command whose evidence really is the render queue (panel#646). */
+const RUN_COMMAND = "graph_run";
+
+/** The four active-workflow mutators. A canvas read cannot see these — they change
+ *  which workflows exist or are open, not what is on the current graph. Mirrors
+ *  ACTIVE_WORKFLOW_MUTATORS in ui-bridge.ts, which cannot be imported here (it
+ *  imports this module). Duplicated deliberately and kept honest by a test that
+ *  reads the ui-bridge source and compares the two. */
+const WORKFLOW_MUTATORS = new Set<string>([
+  "workflow_save",
+  "workflow_save_as",
+  "workflow_rename",
+  "workflow_close",
+]);
+
 export function midCommandVerifyClause(cmd: string): string {
   if (isInteractiveCommand(cmd)) {
     // WAITING IS NOT A RECOVERY, and an earlier draft of this said it was
@@ -72,9 +111,37 @@ export function midCommandVerifyClause(cmd: string): string {
       `user may see two. Tell them which one to answer.`
     );
   }
+  if (cmd === RUN_COMMAND) {
+    // The one command the original sentence was actually right about.
+    return (
+      `Verify before retrying (check queue action:"list" / get_image ` +
+      `(action:"list_outputs")) instead of re-issuing it blindly — a second run costs ` +
+      `GPU time and produces a duplicate output.`
+    );
+  }
+  if (WORKFLOW_MUTATORS.has(cmd)) {
+    return (
+      `Verify with panel_list_workflows before retrying — these change which workflows ` +
+      `exist or are open, which a canvas read does not see. Re-issuing blindly can save ` +
+      `or close a second time.`
+    );
+  }
+  if (cmd.startsWith("graph_")) {
+    return (
+      `Verify with a graph READ before retrying — panel_query_graph on the node(s) this ` +
+      `touched (or panel_graph_outline for a structural change) and compare against what ` +
+      `you asked for. A read is idempotent, so it is safe the moment a tab is connected, ` +
+      `and it is the only check that can see a canvas edit: the render queue and the ` +
+      `output list cannot (panel#646). If the read shows the change already applied, do ` +
+      `NOT re-issue it. If the command only moved the view or the selection, it changed ` +
+      `no graph content, so there is nothing to verify and nothing worth re-issuing.`
+    );
+  }
+  // Deliberately names no tool. The defect being fixed was a confidently wrong
+  // check; an unrecognised command is exactly where a guess would be wrong again.
   return (
-    `Verify before retrying (e.g. check queue action:"list" / get_image (action:"list_outputs")) ` +
-    `instead of re-issuing it blindly.`
+    `Verify that it applied before retrying, rather than re-issuing it blindly — the ` +
+    `command reached the panel, so a retry may apply it twice.`
   );
 }
 
