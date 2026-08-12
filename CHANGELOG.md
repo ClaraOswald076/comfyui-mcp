@@ -4,6 +4,30 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.18
+
+### Fixed
+
+- **A model download can no longer exhaust the system drive (#1477).** `download_model` stages
+  the whole file in the content-addressed cache before it lands, and that cache path came only
+  from `homedir()` -- on Windows essentially always the system drive, while models are almost
+  always on a big secondary volume. The reporter's ComfyUI lives on `F:` with 1 TB free; `C:`
+  had 0.7 GB free of 232 GB, and a 32.29 GB download grew a `.partial` to 22.62 GB heading for
+  zero. Taking a Windows system drive to zero risks the page file and general OS stability, so
+  the failure did not stay confined to the download that caused it.
+
+  `Content-Length` is already known before the first byte is written, and there was no
+  free-space check anywhere in the codebase. There is now: the download is REFUSED up front,
+  naming the space needed, the space available, the destination's free space when it is a
+  different volume, and `COMFYUI_DOWNLOAD_CACHE_DIR` as the lever. The reserve scales as
+  min(1 GiB, 5% of the volume) so a small or removable cache volume stays usable. Every check
+  fails soft: an unknown size or an unreadable volume proceeds exactly as before, because an
+  unmeasurable volume must not become an unusable one.
+
+  Not addressed here, and deliberately: relocating the cache to the destination volume, the
+  cached copies retained after a model lands, and the ~10x progress under-report -- all three
+  are recorded on the issue.
+
 ## 0.51.17
 
 ### Fixed
@@ -227,6 +251,14 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.51.18] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- refuse a download that would exhaust the cache volume (#1482)
+
 
 ## [0.51.17] - 2026-08-12
 
