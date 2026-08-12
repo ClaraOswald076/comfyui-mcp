@@ -24,6 +24,7 @@ import { logger } from "../utils/logger.js";
 import { redactUrlForLogs } from "./download-auth.js";
 import { reportDownloadProgress, type DownloadProgress } from "./download-progress.js";
 import type { ResumeReporter } from "./download-resume-diag.js";
+import { checkCacheVolumeSpace } from "./download-volume.js";
 import {
   abortableDelay,
   backoffDelayMs,
@@ -2071,6 +2072,45 @@ async function streamUrlToFile(
     // A resume was actually taken (validated 206 append). Record it so
     // download_model action:"status" can report the partial was reused, not discarded (#467).
     onResume?.({ outcome: "resumed", discardedBytes: 0, discarded: false });
+  }
+
+  // #1477 — REFUSE before the first byte when the staging volume cannot hold this.
+  //
+  // The whole file is staged in the download cache before it lands at its
+  // destination, and that cache lives under homedir() — on Windows, essentially
+  // always the system drive, while models are almost always on a big secondary
+  // volume. A 32 GB download to a volume with 1 TB free was written to one with
+  // 0.7 GB free, and took it to the edge of zero. Driving a system drive to zero
+  // risks the page file and general OS stability, so this failure does not stay
+  // confined to the download that caused it.
+  //
+  // Content-Length is already parsed here, so the check costs nothing. It fails
+  // SOFT: an unmeasurable volume must not become an unusable one.
+  {
+    const lengthHeaderPre = Number(res.headers.get("content-length") || 0);
+    const fresh200TotalPre = Math.max(lengthHeaderPre > 0 ? lengthHeaderPre : 0, redirectSize ?? 0);
+    // On a resume only the REMAINING bytes are written; the rest is already on disk.
+    //
+    // When the 206 carries no Content-Range total, `rangeTotal` is null and the old
+    // arithmetic produced 0 — silently SKIPPING the guard on exactly the resume path
+    // it was written to protect (review found this). Content-Length on a 206 is the
+    // remaining slice, which is precisely the quantity still to be written, so fall
+    // back to it rather than to nothing.
+    const remainingFromRange =
+      rangeTotal != null ? Math.max(rangeTotal - (resumeFromBytes || 0), 0) : undefined;
+    const needBytes = appendMode
+      ? (remainingFromRange ?? (lengthHeaderPre > 0 ? lengthHeaderPre : 0))
+      : fresh200TotalPre;
+    const refusal = await checkCacheVolumeSpace({
+      needBytes,
+      cacheDir: dirname(targetPath),
+      // `resuming` is "we are APPENDING"; `partialExists` is "there are bytes on disk
+      // either way". Review found these conflated, so a restart after a server ignored
+      // our Range told the user nothing had been downloaded while a partial sat there.
+      resuming: appendMode,
+      partialExists: (resumeFromBytes || 0) > 0,
+    });
+    if (refusal) throw new ModelError(refusal, { path: targetPath });
   }
 
   const nodeStream = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream);
