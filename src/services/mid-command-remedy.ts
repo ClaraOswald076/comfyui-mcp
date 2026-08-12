@@ -105,6 +105,18 @@ const WORKFLOW_MUTATORS = new Set<string>([
   "workflow_close",
 ]);
 
+/** Workflow NAVIGATION/creation. Deliberately not in ACTIVE_WORKFLOW_MUTATORS — they
+ *  carry their own explicit or new target rather than mutating active content, so the
+ *  fence treats them differently. But the QUESTION HERE IS EVIDENCE, not fencing, and
+ *  the evidence is identical: an opened or newly created workflow shows up in
+ *  panel_list_workflows.
+ *
+ *  Found by running the LIVE panel's registered command names through this classifier
+ *  after the fix merged — these two fell to the default branch, which names no tool at
+ *  all. Not wrong, but a reader that can answer exists, and the point of this module is
+ *  to name it. */
+const WORKFLOW_NAVIGATION = new Set<string>(["workflow_open", "workflow_new"]);
+
 export function midCommandVerifyClause(cmd: string): string {
   if (isInteractiveCommand(cmd)) {
     // WAITING IS NOT A RECOVERY, and an earlier draft of this said it was
@@ -139,6 +151,13 @@ export function midCommandVerifyClause(cmd: string): string {
       `Verify before retrying (check queue action:"list" / get_image ` +
       `(action:"list_outputs")) instead of re-issuing it blindly — a second run costs ` +
       `GPU time and produces a duplicate output.`
+    );
+  }
+  if (WORKFLOW_NAVIGATION.has(cmd)) {
+    return (
+      `Verify with panel_list_workflows before retrying — an opened or newly created ` +
+      `workflow appears there. If it is already open, do NOT re-issue it: a second ` +
+      `workflow_new leaves the user with two empty tabs.`
     );
   }
   if (WORKFLOW_MUTATORS.has(cmd)) {

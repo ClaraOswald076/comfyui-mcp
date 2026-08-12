@@ -313,3 +313,36 @@ describe("#646 a graph_ prefix does not mean the effect is on the canvas", () =>
     expect(midCommandVerifyClause("graph_add_subgraph")).toMatch(/panel_query_graph/);
   });
 });
+
+describe("#646 workflow navigation has a reader too", () => {
+  it("workflow_open / workflow_new name panel_list_workflows", () => {
+    // Found by running the LIVE panel's registered command names through the
+    // classifier after the fix merged: these two fell to the default branch, which
+    // names no tool. Not wrong — but a reader that can answer exists, and naming it
+    // is what this module is for. An opened or newly created workflow appears in
+    // panel_list_workflows exactly as a saved or renamed one does; the fence treats
+    // navigation differently, but the EVIDENCE is the same.
+    for (const cmd of ["workflow_open", "workflow_new"]) {
+      const text = midCommandVerifyClause(cmd);
+      expect(text, cmd).toMatch(/panel_list_workflows/);
+      expect(text, cmd).not.toMatch(/panel_query_graph/);
+      expect(text, cmd).not.toMatch(/queue action:"list"/);
+    }
+    // And the specific cost of a blind retry, which differs from the mutators'.
+    expect(midCommandVerifyClause("workflow_new")).toMatch(/two empty tabs/);
+  });
+
+  it("navigation is still NOT treated as an active-workflow mutator", () => {
+    // The two sets stay separate: ui-bridge deliberately excludes navigation from
+    // ACTIVE_WORKFLOW_MUTATORS, and collapsing them here would blur a real
+    // distinction even though both happen to share a reader.
+    const src = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../../services/mid-command-remedy.ts"),
+      "utf8",
+    );
+    expect(src).toMatch(/const WORKFLOW_NAVIGATION = new Set/);
+    const mutators = src.slice(src.indexOf("const WORKFLOW_MUTATORS"));
+    const block = mutators.slice(0, mutators.indexOf("]"));
+    expect(block).not.toMatch(/workflow_open|workflow_new/);
+  });
+});
