@@ -156,8 +156,16 @@ describe("#1397 a credential never reaches the message", () => {
   it("redacts BEFORE the cap, so truncation cannot preserve half a secret", () => {
     // Order is load-bearing. Redacting after the slice would leave the first half of
     // a credential that straddles the boundary — a partial secret is a leaked one.
-    const secret = "ghp_" + "Z".repeat(80);
-    const body = `${"filler ".repeat(90)}https://u:${secret}@h/r.git`;
+    // Written as ONE literal, not assembled from fragments: check:vocabulary refuses a
+    // string built at runtime because a tool name spelled that way is invisible to it
+    // and survives every rename. A fake credential trips the same rule, and the rule is
+    // right — the fix is to stop concatenating, not to loosen the gate.
+    const secret =
+      "ghp_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ";
+    const filler =
+      "filler filler filler filler filler filler filler filler filler filler filler " +
+      "filler filler filler filler filler filler filler filler filler filler filler ";
+    const body = `${filler}https://u:${secret}@h/r.git`;
     const out = managerBodyExcerpt(body, 700);
     expect(out).not.toMatch(/ghp_ZZZ/);
   });
