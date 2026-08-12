@@ -94,11 +94,15 @@ describe("panel-console-http", () => {
 
   // ── i18n of the two served pages ───────────────────────────────────────────
   //
-  // No catalogs are installed in this repo, so every page here renders English no
-  // matter what the browser asks for. That is exactly the case these guard: the
-  // document must not CLAIM a language it did not render. Negotiation and RTL, which
-  // need a catalog to be observable at all, are covered in panel-console-i18n.test.ts.
-  describe("page language, with no catalogs installed", () => {
+  // These used to assert that every page came back `lang="en"` no matter what the
+  // browser asked for, because no catalog existed and stamping `lang="fa" dir="rtl"`
+  // onto English prose is worse than saying nothing — it mirrors the layout and tells
+  // a screen reader to pronounce English as Persian. Catalogs now ship, so the same
+  // rule points the other way: the document must declare the language it RENDERED,
+  // which is now the reader's own. `renderedLocale` is the single mechanism behind
+  // both directions, and the English direction is still reachable for a language we
+  // do not ship — which is what the second test here holds down.
+  describe("page language", () => {
     const serve = async () =>
       startPanelConsoleHttpServer({
         port: 0,
@@ -107,24 +111,47 @@ describe("panel-console-http", () => {
         token: "tok-123",
       });
 
-    // Stamping lang="fa" dir="rtl" onto untranslated English is worse than saying
-    // nothing: it mirrors the whole layout and tells a screen reader to pronounce
-    // English as Persian. Before the pages were translatable, an Arabic-speaking
-    // reader got a correct LTR English page — that must not regress on the way in.
-    it("declares English, not the requested language, while the prose is English", async () => {
+    it("declares the language it rendered, and mirrors the page for RTL", async () => {
       const srv = await serve();
       try {
-        for (const lang of ["fa-IR,fa;q=0.9", "ar", "ja-JP", "ru"]) {
+        for (const [lang, code] of [
+          ["fa-IR,fa;q=0.9", "fa"],
+          ["ar", "ar"],
+          ["ja-JP", "ja"],
+          ["ru", "ru"],
+        ] as const) {
           const html = await (await fetch(srv.url, { headers: { "accept-language": lang } })).text();
-          expect(html).toContain(`<html lang="en">`);
-          expect(html).not.toContain(`dir="rtl"`);
-          expect(html).toContain("Control plane for the panel orchestrator");
+          // Anchored on the character that ENDS the attribute, so `lang="ja"` cannot be
+          // satisfied by a `lang="ja-x"` the negotiator was never supposed to emit. RTL pages
+          // continue with ` dir="rtl"`, so the boundary is a space or the closing bracket.
+          expect(html).toMatch(new RegExp(`<html lang="${code}"[ >]`));
+          // The subtitle is the sentence `renderedLocale` probes, so its presence in the
+          // reader's language is what proves the declared code was EARNED rather than echoed.
+          expect(html).not.toContain("Control plane for the panel orchestrator");
         }
+        const rtl = await (await fetch(srv.url, { headers: { "accept-language": "ar" } })).text();
+        expect(rtl).toContain(`<html lang="ar" dir="rtl">`);
+        const ltr = await (await fetch(srv.url, { headers: { "accept-language": "ja" } })).text();
+        expect(ltr).not.toContain(`dir="rtl"`);
+
         const creds = await (
           await fetch(`${srv.url}/credentials?token=tok-123`, { headers: { "accept-language": "ar" } })
         ).text();
-        expect(creds).toContain(`<html lang="en">`);
-        expect(creds).not.toContain(`dir="rtl"`);
+        expect(creds).toContain(`<html lang="ar" dir="rtl">`);
+      } finally {
+        await srv.stop();
+      }
+    });
+
+    it("stays English and LTR for a language we do not ship", async () => {
+      // The direction that used to be the only one: a reader whose language has no catalog
+      // gets a correct English LTR page, never a mirrored layout around English prose.
+      const srv = await serve();
+      try {
+        const html = await (await fetch(srv.url, { headers: { "accept-language": "kl-GL,kl" } })).text();
+        expect(html).toContain(`<html lang="en">`);
+        expect(html).not.toContain(`dir="rtl"`);
+        expect(html).toContain("Control plane for the panel orchestrator");
       } finally {
         await srv.stop();
       }
@@ -138,7 +165,14 @@ describe("panel-console-http", () => {
           headers: { "accept-language": "fa" },
         });
         expect(res.status).toBe(401);
-        expect(await res.text()).toBe(`<p lang="en">Unauthorized — reconnect the panel.</p>`);
+        const body = await res.text();
+        expect(body).toMatch(/^<p lang="fa" dir="rtl">/);
+        expect(body).not.toContain("Unauthorized — reconnect the panel.");
+
+        const unshipped = await fetch(`${srv.url}/credentials?token=wrong`, {
+          headers: { "accept-language": "kl-GL,kl" },
+        });
+        expect(await unshipped.text()).toBe(`<p lang="en">Unauthorized — reconnect the panel.</p>`);
       } finally {
         await srv.stop();
       }

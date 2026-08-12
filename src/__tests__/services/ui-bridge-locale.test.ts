@@ -290,17 +290,30 @@ describe("say frames degrade to English rather than failing", () => {
   });
 
   it("renders a counted string from a plain-string fallback, so English keeps its '(s)' hedge", () => {
-    // The lost-completion notice passes `{ count }` with a STRING fallback: a catalog may
-    // still supply `_one`/`_few`/`_other` forms, while English stays byte-identical to what
-    // it said before this unit. If the count path ever stopped falling back to a plain
-    // string, that notice would render empty — in the middle of reporting a data loss.
+    // The lost-completion notice passes `{ count }` with a STRING fallback. The count path
+    // looks for `key_one`/`key_few`/`key_other` FIRST and only then the bare key, so a
+    // catalog that carries just the bare key — which is every one we ship, English having no
+    // plural forms to model — has to resolve through that last step. If it ever stopped, the
+    // notice would render EMPTY, in the middle of reporting a data loss.
+    //
+    // Asserted against a key no catalog carries, so it measures the fallback rather than the
+    // Russian text; the shipped catalogs' own counted strings are covered beside them.
     expect(
-      trFor("ru", "say.restart_lost.withheld", "{count} further answer(s) on this tab", {
+      trFor("ru", "say.restart_lost.not_a_real_key", "{count} further answer(s) on this tab", {
         count: 3,
       }),
     ).toBe("3 further answer(s) on this tab");
+    // ...and the same shape resolving THROUGH a catalog still substitutes and is never empty.
+    for (const locale of ["ru", "ko"]) {
+      const out = trFor(locale, "say.restart_lost.withheld", "{count} further answer(s) on this tab", {
+        count: 3,
+      });
+      expect(out).toContain("3");
+      expect(out).not.toBe("");
+      expect(out).not.toContain("{count}");
+    }
     expect(
-      trFor("ko", "say.restart_lost.runs", "{count} result(s) ({runs})", {
+      trFor("ko", "say.restart_lost.no_such_key", "{count} result(s) ({runs})", {
         count: 1,
         runs: "a; b",
       }),
