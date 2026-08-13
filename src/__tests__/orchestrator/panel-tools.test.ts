@@ -29,7 +29,11 @@ import {
   type ToolResult,
 } from "../../orchestrator/panel-tools.js";
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
-import { BRIDGE_READ_DEFAULT_TIMEOUT_MS, markReplyTimeout } from "../../services/ui-bridge.js";
+import {
+  BRIDGE_DEFAULT_TIMEOUT_MS,
+  BRIDGE_READ_DEFAULT_TIMEOUT_MS,
+  markReplyTimeout,
+} from "../../services/ui-bridge.js";
 import { RunCompletions } from "../../orchestrator/run-completion-journal.js";
 import { QueueMonitor } from "../../services/queue-monitor.js";
 import { AskAnswers } from "../../orchestrator/ask-answer-journal.js";
@@ -54,8 +58,11 @@ function makeFakeCtx(
     // inspect the panel's reply. Record the forwarded cmd on the same `calls`
     // array and hand back a caller-supplied reply.
     bridge: {
-      send: async (cmd: Forwarded) => {
+      // Record the bound on the same index-aligned `timeouts` array as ctx.call,
+      // so a bound assertion reads the same way for both dispatch paths (#1520).
+      send: async (cmd: Forwarded, opts?: { timeoutMs?: number }) => {
         calls.push(cmd);
+        timeouts.push(opts?.timeoutMs);
         return bridgeReply ?? {};
       },
     } as unknown as PanelToolCtx["bridge"],
@@ -2238,10 +2245,17 @@ describe("panel-tools: agent-driven CivitAI + training modals", () => {
   // them a bound sized for a local read fails a *healthy* panel.
   //
   // This asserts BOTH directions. Raising the coupled pair is the fix; leaving
-  // the other four alone is the scope, and a test that only checked the pair
+  // the local commands alone is the scope, and a test that only checked the pair
   // would pass just as happily if someone raised all six — which would hide a
-  // genuinely dead tab behind an extra 10 s on four commands that answer
-  // locally and immediately.
+  // genuinely dead tab behind an extra 10 s on commands that answer locally and
+  // immediately.
+  //
+  // The family is NOT uniform, and an earlier version of this comment said it
+  // was ("all six were on 10000; the other four keep the tighter bound"). Both
+  // halves were false. civitai_search dispatches through ctx.bridge.send, not
+  // ctx.call, and already takes BRIDGE_DEFAULT_TIMEOUT_MS — #1468 raised it for
+  // an unrelated reason. So only THREE keep 10 s, and search is pinned below on
+  // its own path so "raise search too" cannot pass unnoticed.
   describe("civitai bridge bounds (#1520)", () => {
     const COUPLED = ["panel_civitai_results", "panel_civitai_highlight"] as const;
     const LOCAL = [
@@ -2278,6 +2292,17 @@ describe("panel-tools: agent-driven CivitAI + training modals", () => {
         expect(timeouts[i], `${name} bound`).toBe(10000);
         expect(timeouts[i]).toBeLessThan(BRIDGE_READ_DEFAULT_TIMEOUT_MS);
       }
+    });
+
+    it("civitai_search keeps its own path and bound — it is not part of this change", async () => {
+      // Pinned so the scope assertion above cannot be quietly widened: search is
+      // the sixth command, it does NOT go through ctx.call, and its bound was
+      // already raised by #1468 because driveSearch dispatches without awaiting.
+      const { ctx, calls, timeouts } = makeFakeCtx({ ok: true, results: [] });
+      await defByName("panel_civitai_search").handler({ query: "flux" }, ctx);
+      const i = calls.findIndex((c) => c.cmd === "civitai_search");
+      expect(i, "panel_civitai_search never forwarded civitai_search").toBeGreaterThanOrEqual(0);
+      expect(timeouts[i], "civitai_search bound").toBe(BRIDGE_DEFAULT_TIMEOUT_MS);
     });
   });
 

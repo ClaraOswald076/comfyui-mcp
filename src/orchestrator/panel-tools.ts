@@ -3100,8 +3100,14 @@ const CIVITAI_SAMPLE_MAX = 8; // hard ceiling even if the agent asks for more
  * The `civitai_*` commands whose reply time is bounded by CivitAI rather than by
  * the tab (#1520). Of the six in the family, exactly these two await the
  * in-flight fetch panel-side (`state.activeReloadPromise`): `civitai_results`
- * and `civitai_highlight`. `clear_highlight`, `switch_tab`, `open_lightbox` and
- * `search` do not, and keep the family's tighter bound.
+ * and `civitai_highlight`. `clear_highlight`, `switch_tab` and `open_lightbox`
+ * do not, and keep the tighter bound.
+ *
+ * `civitai_search` is the sixth and is not on either path: it dispatches through
+ * `ctx.bridge.send` so the handler can inspect the reply, and already takes
+ * `BRIDGE_DEFAULT_TIMEOUT_MS` — #1468 raised it because `driveSearch` returns
+ * without awaiting at all. The family is not uniform; do not assume a single
+ * bound describes it.
  *
  * That await is deliberate (panel#793): without it an agent that opened the
  * browser and immediately asked for results got `{count:0, total:0}`, which
