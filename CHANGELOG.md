@@ -4,6 +4,36 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.22
+
+### Fixed
+
+- **A remote ComfyUI that a restart stops and nothing brings back is now reported, not described
+  as restarting (#742).** `panel_restart_comfyui` against a REMOTE-classified target returned
+  "it is restarting out-of-band -- check in a few seconds" whether the server was mid-restart or
+  dead for good: the recovery probe is loopback-only, so on that path nothing was ever watched and
+  the two outcomes were indistinguishable.
+
+  The reporter's Pinokio install was addressed by its LAN IP -- which classifies as remote even
+  though it is the same machine -- stopped, and never relaunched, because Pinokio's launcher only
+  re-launches on the Manager's dependency-install signal. They learned the server was gone from
+  every later panel call failing with a generic "still reconnecting".
+
+  The address this session already uses for every other call is now watched after a remote
+  dispatch, and what it may conclude is one-directional by design: it can report a failure to come
+  back, and can never manufacture readiness. `ready` and `confirmed_cycle` stay false on every
+  branch here exactly as before -- a healthy answer proves the address responds, not that this
+  instance cycled.
+
+  The report is deliberately narrow about what it knows. It states that the address went down and
+  had not come back within the window, says outright that this does not prove the server is gone
+  (a remote host can boot slower than the budget), names the other explanation, and names the one
+  check that separates them. It also requires the LAST observation to still be unreachable rather
+  than trusting a flag that latches on a single missed connection, so a brief refusal from a
+  tunnel or NAT can no longer be reported as a dead install.
+
+  Nothing about what gets refused changed, so a working supervised-remote restart is untouched.
+
 ## 0.51.21
 
 ### Fixed
@@ -321,6 +351,15 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.51.22] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- report a remote ComfyUI that a restart stopped and nothing brought back (#1497)
+- stop telling users to turn on a setting that does not exist (#1498)
+
 
 ## [0.51.21] - 2026-08-12
 
