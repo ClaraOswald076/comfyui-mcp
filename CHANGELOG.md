@@ -4,6 +4,39 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.30
+
+### Fixed
+
+- **A panel command that WAS applied stops being reported as a failed mutation (#1468).**
+  `panel_civitai_search` timed out at 10 s while the search demonstrably ran (`renderRev`
+  advanced, the grid reported `loading:true`), and `panel_exit_subgraph` timed out at 15 s
+  while the very next `panel_graph_outline` showed the view already back at `root`. Both
+  handed back a failure for work that had happened.
+
+  The reported cause -- that these wait on a slow frontend or external request -- turned out
+  not to be true on the affected build, and the earlier diagnosis in that issue has been
+  corrected. `driveSearch` does not await the CivitAI fetch: it dispatches and returns
+  `{dispatched:true, renderRev}` immediately, which shipped in panel 0.11.0 while the report
+  came from 0.11.44. `graph_exit_subgraph`'s own navigation receipt budgets about a second
+  and returns early on success. Neither was waiting on anything.
+
+  What was left was a bound tighter than this codebase's own default failing on a busy but
+  alive tab. `civitai_search` now waits as long as every other panel command instead of half
+  as long. And because an exit's effect is something the panel can simply be ASKED about,
+  an unanswered exit now takes one scope read and reports what it found: at the root graph
+  is decisive and says so; still inside a subgraph is NOT decisive -- an exit pops to the
+  immediate parent, so that reading cannot separate "never landed" from "landed, from a
+  nested subgraph" -- and it says which question is open rather than guessing. A read that
+  cannot answer claims nothing in either direction.
+
+  The confirmation reports where the canvas IS, not that this command is what put it there,
+  and it is pinned to the tab the navigation was dispatched to, so a session that silently
+  rebinds to another tab can never have that tab's canvas read as this navigation landing.
+  Whether the tab answered at all is now taken from the bridge's own reply-timeout marker
+  rather than inferred from message wording, so a panel error that merely reads like a
+  timeout can never be promoted to a success.
+
 ## 0.51.29
 
 ### Fixed
