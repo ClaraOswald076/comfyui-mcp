@@ -777,6 +777,48 @@ function isRetrySafeCmd(cmd: Record<string, unknown>): boolean {
   return RETRY_SAFE_CMDS.has(name);
 }
 
+/**
+ * #1529 — a refusal the panel raised BEFORE running the executor, and therefore
+ * the only kind a MUTATION may be re-issued against.
+ *
+ * `graphMutationReconnectGate` produces exactly two, and states the property this
+ * depends on: "Both refusals are retryable and state that nothing was applied —
+ * true because the gate runs BEFORE the executor." That is what removes the
+ * double-apply risk; it is not a guess about timing.
+ *
+ * DELIBERATELY NARROW, because the cost of being wrong here is re-issuing a
+ * mutation that already applied — the harm RETRY_SAFE_CMDS exists to prevent:
+ *
+ *   - anchored on the panel's own bracketed marker at the START of the message,
+ *     so an error merely MENTIONING a reconnect cannot qualify, and neither can
+ *     one that wraps or quotes this text;
+ *   - AND requires the not-applied claim, so if a future panel ever reuses these
+ *     markers somewhere the executor has run, this stops matching rather than
+ *     silently widening. Two independent conditions, both authored by the side
+ *     that knows.
+ */
+/**
+ * #1529 — how long to keep waiting out a reconnect refusal.
+ *
+ * The panel calls backend-down "usually seconds" and tells a caller to escalate
+ * on post-reconnect settling at about thirty. This sits between: long enough that
+ * an ordinary reconnect is simply absorbed, short enough to stay well inside the
+ * MCP tools/call budget (~300s) with the command's own timeout on top, so waiting
+ * never turns a refusal into a transport timeout — which would be a worse answer
+ * than the refusal it replaced.
+ */
+function preExecutorRetryBudgetMs(): number {
+  return Math.round(parsePositiveNumberEnv("COMFYUI_PANEL_RECONNECT_RETRY_S", 12) * 1000);
+}
+
+function isPreExecutorReconnectRefusal(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? "");
+  if (!/^\s*(?:Error:\s*)?\[(?:backend-reconnecting|post-reconnect-settling)\]/.test(msg)) {
+    return false;
+  }
+  return /was NOT applied/.test(msg) && /nothing changed/.test(msg);
+}
+
 // Graph-EDIT mutations that CHANGE the user's canvas (undoable edits). These are
 // the #436 bug surface: a real side effect the bridge will NOT auto-retry, so —
 // unlike a read — such a command can be neither parked mid-command nor retried
@@ -6675,6 +6717,53 @@ export function makePanelToolCtx(
       // for a retry in a moment; the section lasts a fraction of a second, which
       // is what retrySettleMs already waits. Still gated on RETRY-SAFE commands,
       // so a mutation is never re-issued on our own initiative.
+      // #1529 — the ONE case a MUTATION may be re-issued on our own initiative.
+      //
+      // The rule everywhere else is that a mutation is never retried, because a
+      // command already on the wire may have applied. These two refusals are the
+      // documented exception, and the panel makes the argument itself in
+      // `graphMutationReconnectGate`:
+      //
+      //   "Both refusals are retryable and state that nothing was applied — true
+      //    because the gate runs BEFORE the executor."
+      //
+      // Same licence as #1143's pre-queue Manager refusal: the answer is about the
+      // REQUEST, so nothing ran, so re-issuing cannot double-apply. Without this a
+      // caller mid-reconnect gets "not applied, retry later" with no idea when —
+      // which is exactly #1529, where two manual attempts hit the same wall.
+      // A SEPARATE branch, not a widening of the one below, because the timing is
+      // different by an order of magnitude. That path waits `retrySettleMs()` —
+      // 400ms — and retries ONCE, which is right for the workflow-switch section
+      // it was built for ("a fraction of a second"). A backend reconnect takes
+      // "usually seconds" by the panel's own account, so a single 400ms retry
+      // would land in the same window and this fix would do nothing at all while
+      // looking correct. It polls instead, and gives up honestly.
+      if (isPreExecutorReconnectRefusal(err)) {
+        const deadline = Date.now() + preExecutorRetryBudgetMs();
+        let last: unknown = err;
+        while (Date.now() < deadline) {
+          await sleep(Math.min(retrySettleMs() * 2, Math.max(0, deadline - Date.now())));
+          try {
+            ensureReachable();
+            return ok(await sendRouted(cmd, timeoutMs, observeRid));
+          } catch (again) {
+            // Still pre-executor: nothing ran, so going round again is as safe as
+            // the first attempt was. ANY other error ends it immediately — it is
+            // no longer the case this exception was licensed for, and re-issuing
+            // past that point is the double-apply the allowlist forbids.
+            // `fail(...)`, NOT `throw` — a throw here escapes ctx.call's own error
+            // handling and rejects the handler, so the caller gets a rejected
+            // promise where every other path returns an error RESULT. Its own test
+            // caught that: the assertion never ran because the call threw.
+            if (!isPreExecutorReconnectRefusal(again)) return fail(again);
+            last = again;
+          }
+        }
+        // Budget spent and still refusing. Hand back the panel's own last words —
+        // they name the recovery — rather than inventing a verdict about a
+        // reconnect that has not finished.
+        return fail(last);
+      }
       if (isRetrySafeCmd(cmd) && (isTransientReconnectError(err) || isWorkflowSwitchGuardRefusal(err))) {
         // panel#1097 — declared out here so the refusal branch below can see it,
         // and REASSIGNED after ensureReachable so it names the tab the command is
