@@ -52,21 +52,31 @@ function searchCorpus(tool: CatalogedTool): string {
  * ordinary English — so the one tool the caller obviously wanted was the one tool
  * excluded, and the only tool returned was the coincidence.
  *
- * Underscores, hyphens, dots and slashes become spaces on BOTH sides, so a
- * caller may type a tool's name the way they say it.
+ * Underscores and hyphens become spaces on BOTH sides, so a caller may type a
+ * tool's name the way they say it.
+ *
+ * DOTS AND SLASHES ARE LEFT ALONE, deliberately. Folding them bought nothing —
+ * no tool name contains one — while costing literal queries their meaning: `v1.2`
+ * would split into `v1` + `2` and `foo/bar` into `foo` + `bar`, each fragment
+ * then matching anywhere, so a precise version or path search would return
+ * unrelated tools (codex). The separators worth folding are exactly the ones that
+ * exist because names are identifiers.
  */
 function normalizeForSearch(text: string): string {
-  return text.toLowerCase().replace(/[_\-/.]+/g, " ").replace(/\s+/g, " ").trim();
+  return text.toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
 /**
  * Every term must appear, in any order and anywhere in the corpus.
  *
- * Strictly WIDER than the phrase match it replaces, never narrower: a single
- * term behaves identically, and a multi-word query no longer demands that the
- * words be adjacent in that order. So no query that used to find something can
- * stop finding it — the failure mode being fixed is a MISS, and the fix cannot
- * introduce the opposite one.
+ * Wider than the phrase match it replaces: a single term behaves identically, and
+ * a multi-word query no longer demands the words be adjacent in that order.
+ *
+ * NOTE that the name tier below IS narrowing, and I claimed otherwise (codex).
+ * `search:"download model"` used to return `runpod` and now does not. That is a
+ * deliberate ranking policy, not preservation, and calling it "strictly wider"
+ * was simply wrong. The footer says so when it happens, so a caller can see that
+ * results were chosen by name rather than drawn from everything that matched.
  */
 function matchesSearch(corpus: string, terms: readonly string[]): boolean {
   return terms.every((term) => corpus.includes(term));
@@ -93,8 +103,18 @@ export function buildManifest(
   // models. When no name matches — "checkpoint", "liveness" — this is inert and
   // the corpus search answers exactly as before, which is the case that made the
   // corpus search worth having.
+  //
+  // Scoped to the CATEGORY when one is given. Computing it over the whole catalog
+  // meant `{category:"models", search:"install node"}` found `install_custom_node`
+  // in a different category, then displayed nothing at all from `models` — a name
+  // tier suppressing the corpus results inside the very category the caller asked
+  // to browse. Within a category the question is "which of THESE", so the tier is
+  // answered from the same set the loop will show.
+  const inScope = [...catalog.tools.values()].filter(
+    (t) => !opts.category || t.category === opts.category,
+  );
   const nameMatches = terms.length
-    ? [...catalog.tools.values()].filter((t) => matchesSearch(normalizeForSearch(t.name), terms))
+    ? inScope.filter((t) => matchesSearch(normalizeForSearch(t.name), terms))
     : [];
   const byName = new Set(nameMatches.map((t) => t.name));
   const lines: string[] = [];
@@ -119,9 +139,20 @@ export function buildManifest(
     `comfyui-mcp tool catalog — ${shown} of ${catalog.tools.size} tools` +
     (opts.category || opts.search ? " (filtered)" : "") +
     ". Workflow: pick a tool → describe_tool {\"name\": ...} for its parameters → call_tool {\"name\": ..., \"args\": {...}}.";
+  // #1525 — DISCLOSE the name tier when it did the selecting (codex). Results
+  // chosen by name are not "everything that matched", and a caller who cannot
+  // tell the difference will read a short list as the whole answer. Counted
+  // rather than asserted: this is how many tools the corpus search WOULD have
+  // returned and this view is not showing.
+  const suppressed = byName.size
+    ? inScope.filter((t) => !byName.has(t.name) && matchesSearch(searchCorpus(t), terms)).length
+    : 0;
+  const tierNote = suppressed
+    ? ` Showing tools whose NAME matches; ${suppressed} more mention these terms in their description or parameters — search a distinctive word from one to see them.`
+    : "";
   const footer =
     (opts.category || opts.search) && shown < catalog.tools.size
-      ? `\n\nThis is a FILTERED view (${catalog.tools.size - shown} tools hidden). If nothing here fits the task, call list_tools again with a broader search or no filter.`
+      ? `\n\nThis is a FILTERED view (${catalog.tools.size - shown} tools hidden).${tierNote} If nothing here fits the task, call list_tools again with a broader search or no filter.`
       : "";
   return header + lines.join("\n") + footer;
 }

@@ -193,6 +193,56 @@ describe("buildManifest", () => {
     expect(buildManifest(separatorCatalog(), { search: "memory run" })).toContain("clear_vram");
   });
 
+  it("scopes the NAME tier to the category being browsed", () => {
+    // Computed over the whole catalog, a name hit in ANOTHER category suppressed
+    // the corpus results inside the one the caller asked for — the tier silently
+    // emptying the very view being browsed. Within a category the question is
+    // "which of THESE", so the tier is answered from the set the loop will show.
+    const manifest = buildManifest(separatorCatalog(), { category: "cloud", search: "download model" });
+
+    // `download_model` is in `models`, so it cannot appear here...
+    expect(manifest).not.toContain("download_model");
+    // ...and `runpod`, which mentions downloading model files, is the honest
+    // answer for this category rather than an empty result.
+    expect(manifest).toContain("runpod");
+  });
+
+  it("DISCLOSES that results were chosen by name, and how many it withheld", () => {
+    // The name tier is narrowing, not preserving: "download model" used to return
+    // runpod and no longer does. A caller who cannot tell a name-tier result from
+    // "everything that matched" will read a one-line answer as the whole answer.
+    const manifest = buildManifest(separatorCatalog(), { search: "download model" });
+
+    expect(manifest).toContain("Showing tools whose NAME matches");
+    // Counted, not hand-waved: runpod is the one tool the corpus search would
+    // have returned here and this view is not showing.
+    expect(manifest).toContain("1 more mention these terms");
+  });
+
+  it("says nothing about a name tier when the corpus answered", () => {
+    // No tool NAME contains both terms, so nothing was withheld and the note must
+    // not appear — otherwise it would read as though results were being hidden.
+    const manifest = buildManifest(separatorCatalog(), { search: "run memory" });
+
+    expect(manifest).toContain("clear_vram");
+    expect(manifest).not.toContain("Showing tools whose NAME matches");
+  });
+
+  it("keeps dots and slashes LITERAL (codex)", () => {
+    // Folding them bought nothing — no tool name has one — and cost precision:
+    // "v1.2" would split into "v1" + "2", each matching anywhere.
+    const catalog = new ToolCatalog();
+    const r = catalog.asRegistrar();
+    catalog.setCategory("misc");
+    r.tool("alpha", "Handles v1.2 payloads.", {}, async () => ({ content: [] }));
+    r.tool("beta", "Handles v1 and takes 2 arguments.", {}, async () => ({ content: [] }));
+
+    const manifest = buildManifest(catalog, { search: "v1.2" });
+    expect(manifest).toContain("alpha");
+    // `beta` would match if the dot were folded into a term separator.
+    expect(manifest).not.toContain("- beta");
+  });
+
   it("requires EVERY term, so multi-word search still narrows", () => {
     // Order-independent, but not an OR: a tool matching only one term is excluded.
     const both = buildManifest(separatorCatalog(), { search: "model download" });
