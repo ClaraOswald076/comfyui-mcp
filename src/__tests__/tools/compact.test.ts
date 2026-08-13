@@ -143,6 +143,13 @@ describe("buildManifest", () => {
     r.tool("list_local_models", "List installed checkpoints.", {}, async () => ({ content: [] }));
     catalog.setCategory("cloud");
     r.tool("runpod", "Manage pods. You can download model files onto a pod.", {}, async () => ({ content: [] }));
+    // Terms deliberately FAR APART and in neither order, so a phrase match cannot
+    // pass by accident. The download_model fixture cannot serve this: its corpus
+    // reads "download model download a model file…", which contains the reversed
+    // phrase "model download" by sheer concatenation — a surviving mutation is
+    // what exposed that, and the test it made vacuous looked perfectly good.
+    catalog.setCategory("system");
+    r.tool("clear_vram", "Free GPU memory held by the cache after a long run.", {}, async () => ({ content: [] }));
     return catalog;
   }
 
@@ -156,7 +163,7 @@ describe("buildManifest", () => {
     // real 37-tool surface, term-matching alone returned 10 tools here and 19 for
     // "install node" — findable, but still the "misleading filter" the report is
     // actually about.
-    expect(manifest).toContain("1 of 3 tools");
+    expect(manifest).toContain("1 of 4 tools");
     expect(manifest).not.toContain("runpod");
     expect(manifest).not.toContain("list_local_models");
   });
@@ -178,6 +185,14 @@ describe("buildManifest", () => {
     expect(buildManifest(separatorCatalog(), { search: "download-model" })).toContain("download_model");
   });
 
+  it("matches terms in ANY order and NOT adjacent (#1525)", () => {
+    // "run" and "memory" both appear in clear_vram's description, far apart, in
+    // neither given order — and no tool NAME carries both, so this exercises the
+    // corpus tier specifically. A literal phrase match finds nothing here.
+    expect(buildManifest(separatorCatalog(), { search: "run memory" })).toContain("clear_vram");
+    expect(buildManifest(separatorCatalog(), { search: "memory run" })).toContain("clear_vram");
+  });
+
   it("requires EVERY term, so multi-word search still narrows", () => {
     // Order-independent, but not an OR: a tool matching only one term is excluded.
     const both = buildManifest(separatorCatalog(), { search: "model download" });
@@ -191,7 +206,7 @@ describe("buildManifest", () => {
 
   it("treats a whitespace-only search as no search at all", () => {
     const manifest = buildManifest(separatorCatalog(), { search: "   " });
-    expect(manifest).toContain("3 of 3 tools");
+    expect(manifest).toContain("4 of 4 tools");
     expect(manifest).not.toContain("FILTERED view");
   });
 
