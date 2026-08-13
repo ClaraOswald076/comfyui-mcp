@@ -4,6 +4,33 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.29
+
+### Fixed
+
+- **A rebind refusal after a reconnect now runs the check it tells you to run (#1473).**
+  Right after a ComfyUI restart, `panel_set_workflow_target({mode:"current"})` reported that
+  the graph binding was NOT restored -- and the very next `panel_graph_outline` succeeded
+  with the expected graph. The session was never wedged; it was told it was, and then sent
+  to find out for itself.
+
+  That refusal already explained the situation correctly: the panel had flagged its active
+  workflow UNCONFIRMED, so nothing could be adopted, and the identity it reported already
+  matched the fence this session held. It ended by prescribing a cheap graph read to settle
+  which of the two remaining cases this was. It now RUNS that read and reports what it
+  found: a read that passes is reported as evidence of a reconciliation race, and a read
+  the fence rejects confirms the wedge instead of leaving it ambiguous.
+
+  The result is still reported as a failure, deliberately: the rebind genuinely did not
+  happen, and softening the diagnosis must not soften the result. What changed is that the
+  answer arrives WITH the refusal instead of one call later.
+
+  The message says only what the read established -- that this fence did not reject THAT
+  command a moment ago -- and not that graph tools work in general. Mutations are governed
+  by a separate write-fence capability, so a tab that serves reads while refusing every edit
+  is told so rather than waved through, and a read that fails for any reason OTHER than a
+  fence refusal (a timeout, a backgrounded tab) settles nothing and claims nothing.
+
 ## 0.51.28
 
 ### Fixed
@@ -525,6 +552,14 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.51.29] - 2026-08-13
+
+### MCP
+
+#### Fixed
+- take the graph read this refusal prescribes, and report what it found (#1515)
+
 
 ## [0.51.28] - 2026-08-13
 
