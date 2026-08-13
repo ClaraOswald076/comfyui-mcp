@@ -4,6 +4,33 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.33
+
+### Fixed
+
+- **An install ComfyUI-Manager accepted but never queued no longer looks like it worked (#1129).**
+  On legacy ComfyUI-Manager 3.x, `panel_install_node` could report an install as queued
+  while the Manager silently dropped it -- the queue then sat idle having seen no task
+  at all, and nothing appeared under `custom_nodes`. The panel's "queued" is an
+  acknowledgement, not a receipt, and it was being passed on as though it were one.
+
+  The reply now carries what a follow-up read actually found. It is careful about how
+  much that proves: the same counters are cleared by a queue reset, which other
+  operations here can issue, so an install that really did run can look identical. So it
+  says what was observed, says plainly that this settles nothing on its own, and asks for
+  the one check that does -- `panel_list_nodes`. It does not guess at the cause, and it
+  does not report a failure it cannot demonstrate; a wrong "this definitely failed" would
+  cost a needless reinstall, which is the same harm as the false success in the other
+  direction.
+
+  A related fix from 0.50.40 handled the case where the Manager REFUSES the install
+  outright (it falls back to a direct clone). This is the opposite shape -- accepted, then
+  dropped -- which that path could never catch, because nothing was refused.
+
+  The follow-up read is also pinned to the exact panel the install went to, so a browser
+  tab that reconnects or is replaced mid-install can never have its empty queue reported
+  as evidence about someone else's install.
+
 ## 0.51.32
 
 ### Fixed
