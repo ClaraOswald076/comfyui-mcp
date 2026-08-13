@@ -30,7 +30,6 @@
     "connect_quiet_note": "在你点击“连接”之前，这个窗口会一直安静 —— 这是正常的，\n不是卡住了。智能体就运行在这里，使用你的 Claude/Codex 登录；\nComfyUI 那台机器上不会安装任何东西。请保持这个终端打开。",
     "connect_secure_note": "Pod 的 HTTPS 面板会通过加密隧道自动连接 ——\n无需粘贴任何 URL，在任何浏览器中都能用。",
     "connect_step_click_connect": "在面板中点击“连接”（Agent 面板的连接下拉菜单）。",
-    "connect_step_enable_external_orchestrator": "在 Agent 面板的设置 → 常规中打开\n'Use external/local orchestrator (advanced)'。",
     "connect_step_open_comfyui": "在浏览器中打开该 ComfyUI：{url}",
     "connect_title": "正在启动本地智能体桥接",
     "connect_url_invalid": "传给 `connect` 的 ComfyUI URL 无效：\"{url}\"（{reason}）。请传入完整的 http(s) URL，例如 https://abcd-8188.proxy.runpod.net 或 http://127.0.0.1:8188 。",

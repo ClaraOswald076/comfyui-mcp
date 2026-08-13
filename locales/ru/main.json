@@ -30,7 +30,6 @@
     "connect_quiet_note": "Пока вы не нажмёте «Подключиться», это окно молчит — так и должно\nбыть, это не зависание. Агент работает ЗДЕСЬ, на вашем логине\nClaude/Codex; на машине с ComfyUI ничего не устанавливается.\nНе закрывайте этот терминал.",
     "connect_secure_note": "HTTPS-панель пода подключается автоматически по\nшифрованному туннелю — URL вставлять не нужно,\nработает в любом браузере.",
     "connect_step_click_connect": "Нажмите «Подключиться» в панели (меню подключения в панели Agent).",
-    "connect_step_enable_external_orchestrator": "В панели Agent откройте Настройки → Общие и включите\n'Use external/local orchestrator (advanced)'.",
     "connect_step_open_comfyui": "Откройте этот ComfyUI в браузере: {url}",
     "connect_title": "запускается локальный мост агента",
     "connect_url_invalid": "В `connect` передан некорректный URL ComfyUI: \"{url}\" ({reason}). Укажите полный http(s) URL, например https://abcd-8188.proxy.runpod.net или http://127.0.0.1:8188.",

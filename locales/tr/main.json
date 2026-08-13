@@ -30,7 +30,6 @@
     "connect_quiet_note": "Bağlan'a tıklayana kadar bu pencere sessiz kalır — bu beklenen bir\ndurumdur, takılma değildir. Aracı BURADA, sizin Claude/Codex\noturumunuzla çalışır; ComfyUI makinesine hiçbir şey kurulmaz.\nBu terminali açık bırakın.",
     "connect_secure_note": "pod'un HTTPS paneli şifreli bir tünel üzerinden otomatik\nbağlanır — yapıştırılacak URL yok, her tarayıcıda çalışır.",
     "connect_step_click_connect": "Panelde Bağlan'a tıklayın (Agent panelindeki Bağlan menüsü).",
-    "connect_step_enable_external_orchestrator": "Agent panelinde Ayarlar → Genel bölümünde\n'Use external/local orchestrator (advanced)' seçeneğini AÇIN.",
     "connect_step_open_comfyui": "O ComfyUI'yi tarayıcınızda açın: {url}",
     "connect_title": "yerel aracı köprüsü başlatılıyor",
     "connect_url_invalid": "`connect` komutuna geçersiz bir ComfyUI URL'si verildi: \"{url}\" ({reason}). Tam bir http(s) URL'si verin, örneğin https://abcd-8188.proxy.runpod.net veya http://127.0.0.1:8188.",

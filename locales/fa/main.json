@@ -30,7 +30,6 @@
     "connect_quiet_note": "تا وقتی «اتصال» را نزنید این پنجره ساکت می‌ماند — این طبیعی است و\nبه معنای گیر کردن نیست. عامل همین‌جا و با ورود Claude/Codex شما\nاجرا می‌شود؛ روی دستگاه ComfyUI چیزی نصب نمی‌شود.\nاین پایانه را باز نگه دارید.",
     "connect_secure_note": "پنل HTTPS این pod به‌صورت خودکار از راه یک تونل\nرمزگذاری‌شده وصل می‌شود — نشانی‌ای برای چسباندن\nنیست و در هر مرورگری کار می‌کند.",
     "connect_step_click_connect": "در پنل روی «اتصال» بزنید (منوی اتصال در پنل Agent).",
-    "connect_step_enable_external_orchestrator": "در پنل Agent، از تنظیمات ← عمومی گزینهٔ\n'Use external/local orchestrator (advanced)' را روشن کنید.",
     "connect_step_open_comfyui": "آن ComfyUI را در مرورگرتان باز کنید: {url}",
     "connect_title": "پل عامل محلی در حال راه‌اندازی است",
     "connect_url_invalid": "نشانی ComfyUI نامعتبری به `connect` داده شد: ‏\"{url}\" ‏({reason}). یک نشانی کامل http(s) بدهید، مثلاً https://abcd-8188.proxy.runpod.net یا http://127.0.0.1:8188 .",
