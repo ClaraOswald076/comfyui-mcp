@@ -41,6 +41,8 @@ import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 import type { PanelToolCtx, ToolResult } from "../../orchestrator/panel-tools.js";
 
 const TAB = "11111111-2222-3333-4444-555555555555";
+/** A second live tab, which the session silently rebinds onto if TAB vanishes. */
+const OTHER_TAB = "99999999-8888-7777-6666-555555555555";
 
 const textOf = (res: ToolResult): string =>
   res.content.map((c) => (c as { text?: string }).text ?? "").join(" ");
@@ -63,10 +65,13 @@ let sent: { cmd: string; timeoutMs?: number }[] = [];
  * decides what the settling read finds afterwards.
  */
 function bridge(opts: {
-  exitReply?: "timeout" | "acked-error";
+  exitReply?: "timeout" | "acked-error" | "acked-error-timeout-worded";
   probeScope?: "root" | "subgraph" | "timeout";
   probeTitle?: string;
+  /** The dispatch tab vanishes after the exit, so ctx.call silently rebinds. */
+  loseTabAfterExit?: boolean;
 }) {
+  let tabGone = false;
   return {
     send: async (
       cmd: Record<string, unknown>,
@@ -82,6 +87,16 @@ function bridge(opts: {
               "graph: no observation ever saw the canvas there.",
           );
         }
+        if (opts.exitReply === "acked-error-timeout-worded") {
+          // An ACKED executor error that OPENS with the bridge's preamble. The
+          // loose predicate accepted it on the start anchor alone; the canonical
+          // one does not, because the frozen-tab clause never follows.
+          throw new Error(
+            `Panel tab ${TAB} did not reply to "graph_exit_subgraph" within 15000 ms, so the ` +
+              `subgraph owner could not be resolved and nothing was applied.`,
+          );
+        }
+        if (opts.loseTabAfterExit) tabGone = true;
         // Reproduce the PRODUCTION shape, not a simplified one. graph_exit_subgraph
         // is in RETRY_TOKEN_CMDS, so a *tagged* reply-timeout on a dispatched rid
         // makes ctx.call append its `retry_of` instruction to the message. A
@@ -106,10 +121,13 @@ function bridge(opts: {
       return { ok: true };
     },
     push: () => 1,
-    canReach: (id: string) => id === TAB,
+    canReach: (id: string) => (tabGone ? id === OTHER_TAB : id === TAB),
     isHeadless: () => false,
-    tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
-    resolveActiveTabId: () => TAB,
+    tabs: () =>
+      tabGone
+        ? [{ tab_id: OTHER_TAB, title: "other", connected_at: 0 }]
+        : [{ tab_id: TAB, title: "wf", connected_at: 0 }],
+    resolveActiveTabId: () => (tabGone ? OTHER_TAB : TAB),
     refreshWorkflowUuid: () => true,
     workflowUuidFor: () => ({ known: false }),
     tabCanMutateGraph: () => true,
@@ -121,12 +139,16 @@ async function runTool(
   name: string,
   args: Record<string, unknown>,
   opts: Parameters<typeof bridge>[0],
-): Promise<{ text: string; isError: boolean }> {
+): Promise<{ text: string; isError: boolean; boundTab: string }> {
   const ctx = makePanelToolCtx(bridge(opts), TAB, new WorkflowTargetStore());
   const def = buildPanelToolDefs().find((d) => d.name === name);
   if (!def) throw new Error(`${name} is not registered`);
   const res: ToolResult = await def.handler(args as never, ctx);
-  return { text: textOf(res), isError: res.isError === true };
+  // The tab the session ENDED on. Exposed so the rebind case can assert the race
+  // it guards actually occurred, rather than inferring it from the verdict — a
+  // rebind that silently failed to happen would leave that test green while
+  // exercising nothing.
+  return { text: textOf(res), isError: res.isError === true, boundTab: ctx.tabId };
 }
 
 beforeEach(() => {
@@ -202,6 +224,42 @@ describe("an unacknowledged exit is settled by a read, not by a guess (#1468)", 
     expect(out.text).not.toMatch(/does NOT settle it/);
     // The original disclosure survives untouched.
     expect(out.text).toMatch(/may have been applied despite the missing reply/);
+  });
+
+  it("claims nothing when the probe lands on a DIFFERENT tab (codex P1)", async () => {
+    // ctx.call runs ensureReachable first, which silently rebinds an unpinned
+    // current-mode session onto the sole remaining interactive tab when the bound
+    // one has gone — exactly what an unanswered command makes likely. That tab
+    // sitting at root is not evidence about the navigation we dispatched
+    // elsewhere, and reporting it as success would be a WRONG-TARGET success:
+    // worse than the false failure this issue is about.
+    const out = await runTool(
+      "panel_exit_subgraph",
+      {},
+      { probeScope: "root", loseTabAfterExit: true },
+    );
+
+    // The rebind really happened — asserted directly, not inferred from the
+    // verdict. Without this the test would stay green if ensureReachable silently
+    // declined to rebind, proving only that a root read reports root.
+    expect(out.boundTab).toBe(OTHER_TAB);
+    expect(sent.some((s) => s.cmd === "graph_query")).toBe(true);
+    expect(out.isError).toBe(true);
+    expect(out.text).not.toMatch(/CHECKED FOR YOU/);
+    expect(out.text).not.toMatch(/canvas at the ROOT graph/);
+  });
+
+  it("does not settle an ACKED error that merely OPENS with the preamble (codex P1)", async () => {
+    // Without a receipt to correlate against, the predicate alone decides whether
+    // an error becomes a success — so it must require the bridge's whole no-reply
+    // sentence, not just its opening. This message starts identically and then
+    // says nothing was applied.
+    const out = await runTool("panel_exit_subgraph", {}, { exitReply: "acked-error-timeout-worded" });
+
+    expect(sent.map((s) => s.cmd)).not.toContain("graph_query");
+    expect(out.isError).toBe(true);
+    expect(out.text).toMatch(/nothing was applied/);
+    expect(out.text).not.toMatch(/CHECKED FOR YOU/);
   });
 
   it("does not second-guess an ACKED executor error", async () => {

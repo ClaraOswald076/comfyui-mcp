@@ -2056,29 +2056,41 @@ function isAckTimeout(res: ToolResult): boolean {
   // isReplyTimeoutError documents). The bridge message never carries leading
   // whitespace, so trimming buys nothing and only lets a whitespace/newline-
   // prefixed acked error reach the receipt-recovery path.
-  return isAckTimeoutForCmd(res, "workflow_open");
+  return /^(?:Error: )?Panel tab .+? did not reply to "workflow_open" within \d+\s*ms/i.test(text);
 }
 
 /**
- * The command-parameterised form of {@link isAckTimeout}. Every constraint
- * documented above is load-bearing and preserved verbatim — start anchor, lazy
- * tab-id segment, open tail, raw (untrimmed) text, exact command name — so a
- * second caller cannot quietly get a looser test than `workflow_open` has.
+ * #1468 — the STRICTER sibling of {@link isAckTimeout}, for callers that have no
+ * receipt to correlate against.
  *
- * #1468 — `panel_exit_subgraph` needs the same "did the tab merely fail to
- * ANSWER?" question `workflow_open` has asked since #215/#319/#496/#661. The
- * command name is escaped even though every current bridge command is
- * `[a-z_]+`: this is a regex built from a caller-supplied string, and a future
- * command containing a metacharacter would silently widen the match rather than
- * fail loudly, which is the direction that turns a guard into a rubber stamp.
+ * `isAckTimeout` is deliberately loose at the tail: it accepts anything starting
+ * with the preamble. That is safe for `workflow_open` because a match there only
+ * buys entry to a recovery gated on the panel's #514 receipt matching this
+ * request's exact rid — the predicate opens a door, the receipt decides.
+ * `panel_exit_subgraph` has no such receipt: a match plus one root-looking read
+ * is by itself enough to promote an error to success (codex P1). A predicate
+ * doing that much work has to be tight, so this one additionally requires the
+ * bridge's canonical frozen-tab clause and the literal single space in
+ * `within <N> ms` — both MEASURED against a live UiBridge, not transcribed.
+ *
+ * That closes the reclassification path: an ACKED executor error would have to
+ * reproduce the bridge's whole no-reply sentence, not merely open with it. The
+ * tail stays open on purpose — the mutating-delivery disclosure and the appended
+ * `retry_of` token both follow it, and anchoring the end would silently switch
+ * this off for exactly the real timeouts it exists to catch.
+ *
+ * The command name is escaped even though every current bridge command is
+ * `[a-z_]+`: this builds a regex from a caller-supplied string, and a future
+ * command carrying a metacharacter would widen the match rather than fail loudly
+ * — the direction that turns a guard into a rubber stamp.
  */
-function isAckTimeoutForCmd(res: ToolResult, cmdName: string): boolean {
+function isCanonicalAckTimeoutFor(res: ToolResult, cmdName: string): boolean {
   if (!res?.isError) return false;
   const text = res?.content?.find((c) => c.type === "text")?.text ?? "";
   const escaped = cmdName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(
-    `^(?:Error: )?Panel tab .+? did not reply to "${escaped}" within \\d+\\s*ms`,
-    "i",
+    `^(?:Error: )?Panel tab .+? did not reply to "${escaped}" within \\d+ ms — ` +
+      `the ComfyUI tab may be backgrounded or frozen`,
   ).test(text);
 }
 
@@ -2096,10 +2108,14 @@ function isAckTimeoutForCmd(res: ToolResult, cmdName: string): boolean {
 function exitConfirmedAtRootNote(): string {
   return (
     `CHECKED FOR YOU: the tab did not ACKNOWLEDGE the exit within the window, but a graph read ` +
-    `taken immediately afterwards reports the canvas at the ROOT graph — the state this tool ` +
-    `exists to reach. No recovery step is needed and a retry would be wasted work. A missing ` +
-    `acknowledgement is not evidence the navigation failed; here it is evidence the tab was too ` +
-    `busy to answer in time.`
+    `taken immediately afterwards, on that same tab, reports the canvas at the ROOT graph — the ` +
+    `state this tool exists to reach. No recovery step is needed and a retry would be wasted ` +
+    `work. A missing acknowledgement is not evidence the navigation failed; here it is evidence ` +
+    `the tab was too busy to answer in time. Stated precisely: what is established is WHERE THE ` +
+    `CANVAS IS, not that this command is what put it there — someone navigating out on the ` +
+    `canvas while the tab was unresponsive would read identically. Both leave you where you ` +
+    `asked to be, so the distinction changes nothing you would do next; it is drawn because only ` +
+    `one of the two was actually observed.`
   );
 }
 
@@ -2137,9 +2153,21 @@ async function settleExitSubgraphAfterAckTimeout(
   ctx: PanelToolCtx,
   timedOut: ToolResult,
 ): Promise<ToolResult> {
+  // The observation is only evidence about the tab the navigation was DISPATCHED
+  // to (codex P1). `ctx.call` runs `ensureReachable` first, which silently rebinds
+  // an unpinned current-mode session onto the sole remaining interactive tab when
+  // the bound one has gone — the exact situation an unanswered command makes
+  // likely. Without this the probe could read a DIFFERENT tab's canvas, and that
+  // tab sitting at root would be reported as this navigation having landed: a
+  // wrong-target success, which is worse than the false failure being fixed.
+  const dispatchTab = ctx.tabId;
   // `fields:"ids", limit:1` is the cheapest shape that still carries `viewing` —
   // the panel builds that field unconditionally on every graph_query return path.
   const probe = await ctx.call({ cmd: "graph_query", fields: "ids", limit: 1 }, 8000);
+  // Checked AFTER the call, because the rebind happens inside it. A moved binding
+  // makes the reading inconclusive, not false — so it takes the same "claim
+  // nothing" exit as an unanswerable probe.
+  if (ctx.tabId !== dispatchTab) return timedOut;
   const viewing = parseToolResultJson(probe)?.viewing as
     | { scope?: unknown; title?: unknown; owner_node_id?: unknown }
     | undefined;
@@ -11389,7 +11417,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // reasoned about this exact uncertainty and prescribes its own next step,
         // so re-deciding it from out here would overwrite a better-informed verdict
         // with a worse-informed one.
-        if (!isAckTimeoutForCmd(res, "graph_exit_subgraph")) return res;
+        if (!isCanonicalAckTimeoutFor(res, "graph_exit_subgraph")) return res;
         return settleExitSubgraphAfterAckTimeout(ctx, res);
       },
     ),
