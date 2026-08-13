@@ -86,8 +86,12 @@ export function buildManifest(
   catalog: ToolCatalog,
   opts: { category?: string; search?: string } = {},
 ): string {
-  // #1525 — split into TERMS rather than matching the raw phrase. An empty or
-  // whitespace-only search is treated as no search, exactly as before.
+  // #1525 — split into TERMS rather than matching the raw phrase.
+  //
+  // A whitespace-only search is treated as no search. That is a CHANGE, not a
+  // preservation (codex): it used to be a literal `includes("   ")`, which
+  // matched nothing and returned "No tools matched". Showing the catalog is the
+  // better answer, but it is a different one.
   const terms = opts.search ? normalizeForSearch(opts.search).split(" ").filter(Boolean) : [];
   // #1525 — NAME MATCHES WIN, when there are any.
   //
@@ -100,9 +104,14 @@ export function buildManifest(
   //
   // So: if any tool's NAME carries every term, the answer is those tools. Nobody
   // typing "download model" wants the nine tools that merely mention downloading
-  // models. When no name matches — "checkpoint", "liveness" — this is inert and
-  // the corpus search answers exactly as before, which is the case that made the
-  // corpus search worth having.
+  // models. When no name matches — "checkpoint", "liveness" — this tier is inert
+  // and the corpus search answers, which is the case that made the corpus search
+  // worth having.
+  //
+  // NOT "exactly as before" there either (codex): the corpus search is now
+  // term-based, so it finds strictly more than the old phrase match. `run memory`
+  // matches `clear_vram` — terms far apart, in neither order — where the phrase
+  // search found nothing.
   //
   // Scoped to the CATEGORY when one is given. Computing it over the whole catalog
   // meant `{category:"models", search:"install node"}` found `install_custom_node`
