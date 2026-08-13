@@ -2037,18 +2037,18 @@ export class UiBridge {
         // tries to reclaim the port and then `process.exit(1)`s. So the sentence
         // described a mode the code cannot enter, and anyone diagnosing a
         // portless orchestrator against it was reading a fiction.
-        // Careful with what this promises. The first rewrite of this line said the
-        // orchestrator "will now try to take the port over" — also false, because
-        // tryReclaimBridgePort refuses immediately unless BOTH stdio streams are
-        // TTYs, so a non-interactive launch goes straight to the exit. Two false
-        // sentences in a row here is a fair sign that this path is easier to
-        // describe wrongly than rightly, so this one says only the part that holds
-        // in every case: the process does not continue without the port.
+        // THREE rewrites of this sentence were false, each in a new way: it
+        // promised a degraded-but-running mode that cannot exist; then a takeover
+        // attempt that only happens on a TTY; then an interactive prompt that also
+        // requires a reclaimable pid, and an owner that need not be ours at all.
+        //
+        // Every error was the same mistake — narrating what the ORCHESTRATOR will
+        // do next, from a module that cannot see those conditions. So this now
+        // reports only what the bridge itself observed, and leaves the outcome to
+        // the code that decides it (which logs its own, accurate message).
         logger.warn(
-          `[ui-bridge] port ${this.port} still in use after ${UiBridge.MAX_BIND_ATTEMPTS} attempts — ` +
-            `another comfyui-mcp session almost certainly owns the panel. This process will EXIT ` +
-            `rather than run without it (an INTERACTIVE launch is offered the chance to take the ` +
-            `port over first; a non-interactive one is not).`,
+          `[ui-bridge] could not bind port ${this.port} after ${UiBridge.MAX_BIND_ATTEMPTS} ` +
+            `attempts — it is held by another process. The panel bridge is NOT listening.`,
         );
         this.readyResolve?.(false);
         this.readyResolve = null;
