@@ -101,13 +101,23 @@ describe("an install the Manager accepted and dropped says so (#1129)", () => {
     expect(sent).toContain("nodes_queue_status");
 
     expect(out.text).toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
-    // States what was observed and why zero is decisive, rather than asserting it.
-    expect(out.text).toMatch(/includes finished ones/);
+    // States WHAT WAS OBSERVED, and refuses to convert it into proof. A queue
+    // reset clears these same counters, so an install that really ran can read
+    // this way — the message must say so rather than assert the task never ran.
+    expect(out.text).toMatch(/total_count, done, in_progress all 0/);
     expect(out.text).toMatch(/not a receipt/);
+    expect(out.text).toMatch(/it is NOT proof/);
+    expect(out.text).toMatch(/cleared by a queue RESET/);
+    expect(out.text).toMatch(/do not reinstall on\s+the assumption it did not/);
+    // The earlier wording asserted both of these outright; neither is supportable
+    // once a queue reset can produce this same reading after a real install.
+    expect(out.text).not.toMatch(/this is not a task that already ran/);
+    expect(out.text).not.toMatch(/Retrying HERE will be dropped/);
     // Names the confirmation and the tool that CAN clone.
     expect(out.text).toMatch(/panel_list_nodes/);
     expect(out.text).toMatch(/install_custom_node/);
-    expect(out.text).toMatch(/Retrying HERE will be dropped/);
+    // Hedged, not asserted: "likely to be dropped".
+    expect(out.text).toMatch(/likely to be dropped/);
 
     // NOT an error. Absence could not be proven, so the result is not flipped —
     // a false definite failure on a working install is the mirror of this bug.
@@ -156,9 +166,79 @@ describe("an install the Manager accepted and dropped says so (#1129)", () => {
   it("says nothing on a v4-style shape with no total_count", async () => {
     // v4 reports `pending_count` directly. The dropped-enqueue defect is legacy
     // 3.x behaviour, so a shape that cannot answer is left alone.
-    const out = await install({ status: { pending_count: 0, in_progress_count: 0, is_processing: false } });
+    //
+    // EVERY OTHER FIELD IS PRESENT AND ZERO on purpose. An earlier version of this
+    // fixture also omitted `done_count`, so the presence requirement rejected it
+    // before `total_count` was ever consulted — the case passed while proving
+    // nothing about the check it names. A surviving mutation ("treat a missing
+    // total_count as zero") is what exposed that.
+    const out = await install({
+      status: { pending_count: 0, done_count: 0, in_progress_count: 0, is_processing: false },
+    });
 
     expect(out.text).not.toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
+  });
+
+  it("claims nothing when a count is MISSING rather than zero (codex P2)", async () => {
+    // Absent is not zero. The repo's established legacy-empty proof requires every
+    // count to be reported and exact; accepting a missing field would let a
+    // payload that never described the queue stand in for one that did.
+    const noDone = await install({
+      status: { total_count: 0, in_progress_count: 0, is_processing: false },
+    });
+    expect(noDone.text).not.toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
+
+    const noInProgress = await install({
+      status: { total_count: 0, done_count: 0, is_processing: false },
+    });
+    expect(noInProgress.text).not.toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
+
+    // A reported pending_count has to agree too.
+    const pending = await install({
+      status: { total_count: 0, done_count: 0, in_progress_count: 0, pending_count: 2, is_processing: false },
+    });
+    expect(pending.text).not.toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
+  });
+
+  it("claims nothing when the read lands on a DIFFERENT tab (codex P1)", async () => {
+    // ctx.call runs ensureReachable first, which silently rebinds an unpinned
+    // current-mode session onto the sole remaining interactive tab. Another
+    // ComfyUI's empty queue is not evidence about an install dispatched
+    // elsewhere. Same guard #1468 needed — this is the second probe in this file
+    // to need it, which is why it is asserted rather than assumed.
+    const OTHER = "99999999-8888-7777-6666-555555555555";
+    let gone = false;
+    const b = {
+      send: async (cmd: Record<string, unknown>) => {
+        sent.push(String(cmd.cmd));
+        if (cmd.cmd === "nodes_install") {
+          gone = true; // the bound tab disappears right after the install
+          return { queued: true, pending: true, dialect: "legacy" };
+        }
+        return { status: { total_count: 0, done_count: 0, in_progress_count: 0, is_processing: false } };
+      },
+      push: () => 1,
+      canReach: (id: string) => (gone ? id === OTHER : id === TAB),
+      isHeadless: () => false,
+      tabs: () =>
+        gone
+          ? [{ tab_id: OTHER, title: "other", connected_at: 0 }]
+          : [{ tab_id: TAB, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => (gone ? OTHER : TAB),
+      refreshWorkflowUuid: () => true,
+      workflowUuidFor: () => ({ known: false }),
+      tabCanMutateGraph: () => true,
+      tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
+    } as unknown as PanelToolCtx["bridge"];
+
+    const ctx = makePanelToolCtx(b, TAB, new WorkflowTargetStore());
+    const def = buildPanelToolDefs().find((d) => d.name === "panel_install_node");
+    const res: ToolResult = await def!.handler({ repository: REPO } as never, ctx);
+
+    // The rebind really happened — asserted, not inferred, or this test would
+    // stay green if ensureReachable quietly declined to rebind.
+    expect(ctx.tabId).toBe(OTHER);
+    expect(textOf(res)).not.toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
   });
 
   it("claims nothing when the queue read itself fails", async () => {

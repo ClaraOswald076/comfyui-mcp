@@ -2243,13 +2243,28 @@ function claimsQueued(reply: Record<string, unknown> | null): boolean {
  * this simply never fires there. That is correct: the dropped-enqueue defect is a
  * legacy-3.x behaviour, and a shape that cannot answer must not be made to.
  *
- * Should a Manager ever RESET the counter after draining, this would read zero on
- * a genuine success — which is exactly why a second, independent observation is
- * required before anything is contradicted.
+ * ONE KNOWN WAY THIS READS ZERO AFTER A REAL INSTALL: the counters are cleared by
+ * `POST /manager/queue/reset`, which this codebase itself issues from
+ * manager-config.ts and workflow-deps.ts. Neither is in panel_install_node's
+ * path, and the read below happens immediately after the install returns, so it
+ * takes a CONCURRENT reset from another operation to land in that window.
+ *
+ * That residual case is the reason this only WARNS. A definite failure verdict
+ * would be wrong there, and wrong in the same direction as the bug being fixed —
+ * a confident claim the evidence does not support. A spurious "go and check"
+ * costs one read; a spurious "it definitely failed" costs a reinstall.
  */
 function queueNeverSawATask(reply: Record<string, unknown> | null): boolean {
   const status = (reply?.status ?? reply) as Record<string, unknown> | undefined;
   if (typeof status?.total_count !== "number" || status.total_count !== 0) return false;
+  // PRESENT and zero, not absent-or-zero (codex P2). `panel-installer.ts`'s
+  // established legacy-empty proof requires every count to be reported and exact;
+  // accepting a missing field would let a payload that never described the queue
+  // stand in for one that did. A `pending_count`, if this build reports one, has
+  // to agree as well.
+  const presentZero = (v: unknown): boolean => v === 0;
+  if (!presentZero(status.done_count) || !presentZero(status.in_progress_count)) return false;
+  if (status.pending_count !== undefined && !presentZero(status.pending_count)) return false;
   // IDLE TOO, not just empty (codex P1). A snapshot taken while the Manager is
   // mid-accept can read zero before its counters move, and a running worker is
   // the one state where zero means "not yet" rather than "never". The panel's own
@@ -2258,8 +2273,7 @@ function queueNeverSawATask(reply: Record<string, unknown> | null): boolean {
   if (status.is_processing !== false) return false;
   // Coherent, by the 3.x contract quoted above: with total 0, both of these must
   // be 0 as well. Anything else is a shape this reasoning does not describe.
-  const zeroish = (v: unknown): boolean => v === undefined || v === 0;
-  return zeroish(status.done_count) && zeroish(status.in_progress_count);
+  return true;
 }
 
 /**
@@ -2277,22 +2291,34 @@ async function settleDroppedEnqueue(ctx: PanelToolCtx, res: ToolResult): Promise
   if (res.isError) return res;
   if (!claimsQueued(parseToolResultJson(res))) return res;
 
+  // The queue is only evidence about the panel the install was DISPATCHED to
+  // (codex P1 — and the same guard #1468 needed, which I did not carry across).
+  // `ctx.call` runs ensureReachable first, which silently rebinds an unpinned
+  // current-mode session onto the sole remaining interactive tab. A reconnect
+  // between the two calls would let ANOTHER ComfyUI's empty queue be reported as
+  // evidence about this install.
+  const dispatchTab = ctx.tabId;
   const queue = await ctx.call({ cmd: "nodes_queue_status" }, 15000);
+  if (ctx.tabId !== dispatchTab) return res;
   if (queue.isError || !queueNeverSawATask(parseToolResultJson(queue))) return res;
 
   return appendNote(
     res,
-    `WARNING — THE QUEUE DOES NOT HAVE THIS TASK. The Manager accepted the install above, but ` +
-      `its queue is IDLE and reports it has seen no tasks at all (total_count 0, a counter that ` +
-      `includes finished ones — so this is not a task that already ran). On legacy ` +
-      `ComfyUI-Manager 3.x a git URL it does not recognise is accepted and then dropped ` +
-      `silently (#1129): "queued" is its acknowledgement, not a receipt.\n\n` +
-      `VERIFY BEFORE RELYING ON IT: call panel_list_nodes and confirm the pack is actually ` +
-      `there. Do not restart on the assumption it installed.\n\n` +
+    `WARNING — THE QUEUE DOES NOT HAVE THIS TASK. The Manager accepted the install above, but a ` +
+      `read taken immediately afterwards, on that same panel, reports an IDLE queue holding no ` +
+      `tasks at all (total_count, done, in_progress all 0).\n\n` +
+      `WHAT THAT DOES AND DOES NOT MEAN. The likely reading is legacy ComfyUI-Manager 3.x ` +
+      `accepting a git URL it does not recognise and dropping it silently (#1129) — there ` +
+      `"queued" is an acknowledgement, not a receipt. But it is NOT proof: those counters are ` +
+      `also cleared by a queue RESET, which other operations in this server issue, so an install ` +
+      `that really ran can read this way if a reset landed in between.\n\n` +
+      `SO CHECK, do not assume either way: call panel_list_nodes and see whether the pack is ` +
+      `actually there. Do not restart on the assumption it installed, and do not reinstall on ` +
+      `the assumption it did not.\n\n` +
       `IF IT IS ABSENT: install it from its git URL with the headless install_custom_node ` +
       `(action:"install", source:"git"), which clones directly and verifies a real pack landed. ` +
-      `Retrying HERE will be dropped the same way. This tool cannot clone for you — it drives ` +
-      `whatever ComfyUI the panel is bound to, which need not be this machine.`,
+      `A plain retry here is likely to be dropped the same way. This tool cannot clone for you — ` +
+      `it drives whatever ComfyUI the panel is bound to, which need not be this machine.`,
   );
 }
 
