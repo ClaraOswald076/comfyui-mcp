@@ -4,6 +4,34 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.27
+
+### Fixed
+
+- **A workflow-instance mismatch right after loading a workflow now names the load as its
+  cause (#1478).** `panel_load_workflow` returned `loaded:true` and the very next graph
+  call was refused with *"workflow instance mismatch … the active workflow last moved …
+  and NO PANEL COMMAND CLAIMED IT"*. A panel command had caused it one call earlier, so
+  that sentence sent the reader looking for a tab switch that never happened -- twice,
+  deterministically, in the reporting session.
+
+  The load now says so itself: an API-format load can re-mint the canvas workflow
+  instance, and if the next graph command is refused this is why, with the one call that
+  clears it (`panel_set_workflow_target({mode:"current"})`). If nothing is refused, nothing
+  needs doing.
+
+  Deliberately a CONDITIONAL rather than a claim that the fence is stale, because the
+  reply cannot tell: a UI-format load into an active workflow preserves the instance on
+  purpose, and a second API load into the same active workflow reuses it as well. Nothing
+  in the reply separates "re-minted" from "reused", so stating it as fact would be a guess
+  wearing the clothes of a measurement.
+
+  It also does NOT repair the fence automatically. The obvious repair adopts whatever
+  workflow is active at that moment, which has no tie to the load -- a user switching
+  canvases in that window would silently re-point the session and the next edit would land
+  on the wrong graph. Reporting the cause accurately is worth more than a repair that can
+  aim at the wrong workflow.
+
 ## 0.51.26
 
 ### Fixed
@@ -471,6 +499,14 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.51.27] - 2026-08-13
+
+### MCP
+
+#### Fixed
+- name the load as the cause of a workflow-instance mismatch (#1510)
+
 
 ## [0.51.26] - 2026-08-13
 
