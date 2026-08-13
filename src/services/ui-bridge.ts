@@ -4381,8 +4381,22 @@ export class UiBridge {
       // could supply its own workflow_uuid would just set it to the DESTINATION workflow after a
       // switch and sail past the panel fence. So ALWAYS overwrite with the trusted resolver value
       // (ctx.workflowUuid), and STRIP any caller-supplied value entirely when we have no trusted
-      // one — an identity-less tab / old panel ships unstamped (mutations are already refused by
-      // the requiresWorkflowStampEnforcement gate above; reads execute, reply still server-fenced).
+      // one — an identity-less tab / old panel ships unstamped. Mutations are already refused by
+      // the requiresWorkflowStampEnforcement gate above.
+      //
+      // #1519 — this used to add "reads execute, reply still server-fenced". THAT IS NOT TRUE of a
+      // current panel. Its fence refuses an UNSTAMPED command outright, reads included, because
+      // #718 closed exactly that fail-open hole ("An UNSTAMPED command is refused too … an
+      // advertised fence must not fail open" — comfyui-mcp-panel.js). So a read dispatched from a
+      // session with no trusted identity comes back as `workflow instance mismatch: this command
+      // carries no workflow-instance stamp`, which is what #1519 reports.
+      //
+      // The two halves therefore hold incompatible contracts, both deliberate: this side expects
+      // an unstamped read to run, that side refuses it. Which one gives is an OPEN DESIGN
+      // QUESTION on #1519 — weakening #718, adopting the active workflow automatically (removed
+      // from #1478 for cause: it can bind the session to a DIFFERENT workflow), or refusing here
+      // with a better message all trade different risks. Recorded rather than silently picked.
+      // What is settled is that the old sentence described behaviour that does not happen.
       // #694 hardening: mint the rid LAST so a caller-supplied cmd.rid can NEVER
       // override it — the rid is BRIDGE-OWNED (reply correlation in `pending`,
       // the onDispatchedRid observer, and the panel's retry_of dedupe token all
