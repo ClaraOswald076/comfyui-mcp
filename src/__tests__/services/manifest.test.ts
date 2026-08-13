@@ -985,6 +985,63 @@ describe("applyManifest", () => {
     expect(msg).toMatch(/EXTERNALLY MANAGED/);
   });
 
+  it("does not fire on the PEP 668 token appearing MID-LINE (codex P2)", async () => {
+    // The token is anchored to the start of a line because that is where pip
+    // prints it. Unanchored, any output merely CONTAINING it — a path, a package
+    // name, a vendored log — would be rewritten as this failure and lose its own
+    // cause. That is the same defect as the prose case, one token narrower.
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      const probesUv = IS_WIN
+        ? cmd === "where" && args[0] === "uv"
+        : cmd === "uv" && args[0] === "--version";
+      if (probesUv) throw new Error("no uv");
+      if (args[0] === "-m" && args[1] === "pip") {
+        throw Object.assign(new Error("build failed"), {
+          stderr:
+            "  Downloading from /var/cache/externally-managed-environment/wheels/x.whl\n" +
+            "error: metadata generation failed",
+        });
+      }
+      return "ok";
+    });
+
+    const result = await applyManifest({ manifest: { pip: ["somepkg"] } });
+
+    const msg = result.results[0].message ?? "";
+    expect(msg).not.toMatch(/EXTERNALLY MANAGED \(PEP 668\)/);
+    expect(msg).toMatch(/metadata generation failed|build failed/);
+  });
+
+  it("never echoes the command line — a direct-URL spec can carry credentials", async () => {
+    // Node builds execFileSync's Error.message as `Command failed: <whole argv>`,
+    // so it embeds the package spec. A pip spec may legitimately be a direct URL,
+    // and a direct URL may carry credentials — that entry passes
+    // validatePipPackageSpec, which only rejects options, control chars and
+    // whitespace. Carrying the message into a user-facing refusal would copy the
+    // token into it. Detection may still read the message; only what is SHOWN is
+    // narrowed.
+    const SPEC = "https://ci:s3cr3t-token@example.invalid/pkg-1.0-py3-none-any.whl";
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      const probesUv = IS_WIN
+        ? cmd === "where" && args[0] === "uv"
+        : cmd === "uv" && args[0] === "--version";
+      if (probesUv) throw new Error("no uv");
+      if (args[0] === "-m" && args[1] === "pip") {
+        throw Object.assign(new Error(`Command failed: python -m pip install ${SPEC}`), {
+          stderr: PEP668,
+        });
+      }
+      return "ok";
+    });
+
+    const result = await applyManifest({ manifest: { pip: [SPEC] } });
+    const msg = result.results[0].message ?? "";
+
+    expect(msg).toMatch(/EXTERNALLY MANAGED/);
+    expect(msg).not.toMatch(/s3cr3t-token/);
+    expect(msg).not.toMatch(/Command failed:/);
+  });
+
   it("still surfaces an ORDINARY pip failure as itself (#1508)", async () => {
     // The guard must not swallow every pip error into a managed-environment
     // story — a missing package is a different problem with a different answer.
