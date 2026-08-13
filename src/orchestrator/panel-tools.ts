@@ -4135,6 +4135,11 @@ function describeFenceRebind(
 ): {
   binding: "bound" | "reads_only" | "unverified" | "not_recovered";
   note: string;
+  /** #1473 — this verdict is UNRESOLVED rather than negative, and one cheap graph read
+   *  settles it. Set only where the reported identity MATCHES the fence already held: the
+   *  session is then either fine (a reconciliation race) or fenced to a stale record, and
+   *  those are indistinguishable from here but trivially distinguishable by asking. */
+  settleByRead?: true;
 } {
   // A panel that cannot fence a WRITE gives reads only, however good the stamp is.
   const mutationsRefused = canMutate === false;
@@ -4425,6 +4430,7 @@ function describeFenceRebind(
       if (fenceStillMatches) {
         return {
           binding: "not_recovered",
+          settleByRead: true,
           note:
             `${lead}. This session's fence was NOT re-derived, and whether that reply describes ` +
             `the LIVE canvas is exactly what could not be confirmed — a stale or background ` +
@@ -10794,11 +10800,92 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         const fence = fenceRebind
           ? describeFenceRebind(fenceRebind, canMutateNow, refusalCause)
           : undefined;
+        // #1473 — TAKE THE ADVICE THIS MESSAGE GIVES, instead of assigning it as homework.
+        //
+        // The reporter restarted ComfyUI, called this, was told the binding was NOT
+        // restored — and their very next `panel_graph_outline` succeeded with the expected
+        // graph. #1401 already made the message right for this shape: when the panel's
+        // reported identity MATCHES the fence this session already holds, it says so, says
+        // it is NOT a claim that graph tools work, and prescribes a cheap graph read to
+        // settle it. All true. It just left the caller to run that read themselves.
+        //
+        // So the read is taken here, on the matching-uuid path ONLY, and its ANSWER is put
+        // in the message.
+        //
+        // THE RESULT STILL REPORTS FAILURE, deliberately, and that is #1401's call not
+        // mine: "softening the DIAGNOSIS must not soften the RESULT — the rebind genuinely
+        // did not happen". It did not. What changes is that the caller no longer has to
+        // discover, one call later, that nothing was wrong: the answer arrives with the
+        // refusal instead of after it. Whether this should become a SUCCESS is a real
+        // product question and a reversal of a reasoned decision, so it is raised on the
+        // issue rather than decided here.
+        let settledNote = "";
+        if (fence && fence.binding === "not_recovered" && fence.settleByRead) {
+          // WHAT THE PROBE PROVES, AND ONLY THAT (codex).
+          //
+          // Two ways to overclaim here, and the first version did both:
+          //
+          //  • EVERY error read as "refused". `ctx.call` turns a transport failure into an
+          //    error result too, so a `graph_query` that merely TIMED OUT on a backgrounded
+          //    tab would have been reported as a confirmed fence refusal — inventing a wedge
+          //    out of a slow tab, and contradicting this block's own "unknown says nothing"
+          //    rule. Only an actual instance-mismatch refusal proves the fence rejected it.
+          //  • A passing READ read as "graph tools work". The write fence is a SEPARATE
+          //    capability: a panel can serve reads while refusing every mutation, and the
+          //    capability probe above already knows. So the claim is scoped to reads, and the
+          //    known-negative write case is stated rather than papered over.
+          let probeRefused: boolean | undefined;
+          let probeOk = false;
+          try {
+            // The cheapest fenced read there is: ids only, one row. It is refused by the
+            // same instance fence every graph command carries, which is exactly the
+            // question — a full outline would answer it no better and would cost the caller
+            // a page of graph on a recovery path.
+            const probe = await ctx.call({ cmd: "graph_query", fields: "ids", limit: 1 }, 8000);
+            if (!probe.isError) probeOk = true;
+            else probeRefused = isWorkflowInstanceMismatch(toolResultText(probe));
+          } catch (err) {
+            probeRefused = isWorkflowInstanceMismatch(err);
+          }
+          if (probeOk) {
+            settledNote =
+              // ONE OBSERVATION, STATED AS ONE (codex r2). A passing graph_query proves that
+              // read passed this fence just now — not that every command will, and not that
+              // the cause "was" a race. The earlier wording generalised to "READS work" and
+              // asserted the cause outright, which is the same overclaim this reply exists to
+              // stop making.
+              `
+
+CHECKED FOR YOU: the graph read this message prescribes was just run — a ` +
+              `graph_query against this fence — and it SUCCEEDED. So the fence did not reject ` +
+              `THAT command a moment ago, which is the single fact this settles: it is evidence ` +
+              `of a reconciliation race after the reconnect rather than a broken binding, not a ` +
+              `guarantee about the next command.` +
+              (canMutateNow === false
+                ? ` MUTATIONS are a separate matter and remain refused on this tab — that is the ` +
+                  `write-fence capability above, not the binding, and re-running this will not ` +
+                  `change it.`
+                : ` Nothing suggests a recovery step is needed for the binding; the next graph ` +
+                  `command is still the authority.`) +
+              ` (The rebind itself still did not happen, which is why this is reported as a ` +
+              `failure.)`;
+          } else if (probeRefused === true) {
+            settledNote =
+              `
+
+CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
+              `was REFUSED by the instance fence — so the reply was stale after all and graph ` +
+              `commands really are being rejected. The remedy above applies.`;
+          }
+          // Anything else — a timeout, a dropped tab, an error that is not a fence refusal —
+          // settles NOTHING and says nothing. An inconclusive probe must not become evidence
+          // in either direction.
+        }
         if (fence && fence.binding === "not_recovered") {
           return fail(
             `panel_set_workflow_target({mode:"current"}) did NOT restore this session's graph ` +
               `binding.\n\nAPPLIED (do not repeat this part): the workflow target is now ` +
-              `mode:"current"${rebindNote ? `.${rebindNote}` : "."}\n\nNOT APPLIED:${fence.note}`,
+              `mode:"current"${rebindNote ? `.${rebindNote}` : "."}\n\nNOT APPLIED:${fence.note}${settledNote}`,
           );
         }
         // #888 — SAY what the scope repin did. A silent success is as unhelpful
