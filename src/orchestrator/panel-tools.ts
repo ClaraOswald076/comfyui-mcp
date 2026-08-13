@@ -87,6 +87,7 @@ function journalConversationFor(ctx: PanelToolCtx): string | undefined {
 }
 import {
   BRIDGE_DEFAULT_TIMEOUT_MS,
+  BRIDGE_READ_DEFAULT_TIMEOUT_MS,
   dispatchOutcomeOf,
   isCapabilityRefusal,
   isPanelCmdUnsupportedError,
@@ -3094,6 +3095,34 @@ function fitQueryGraphReply(res: ToolResult, requested: unknown): ToolResult {
 const CIVITAI_SAMPLE_MAX_BYTES = 4 * 1024 * 1024; // per-thumbnail cap (450px jpeg ≈ tens of KB)
 const CIVITAI_SAMPLE_DEFAULT = 4; // thumbnails delivered by default — bounds context
 const CIVITAI_SAMPLE_MAX = 8; // hard ceiling even if the agent asks for more
+
+/**
+ * The `civitai_*` commands whose reply time is bounded by CivitAI rather than by
+ * the tab (#1520). Of the six in the family, exactly these two await the
+ * in-flight fetch panel-side (`state.activeReloadPromise`): `civitai_results`
+ * and `civitai_highlight`. `clear_highlight`, `switch_tab`, `open_lightbox` and
+ * `search` do not, and keep the family's tighter bound.
+ *
+ * That await is deliberate (panel#793): without it an agent that opened the
+ * browser and immediately asked for results got `{count:0, total:0}`, which
+ * reads as "this search found nothing" while a concurrent `civitai_highlight`
+ * *did* wait and *did* see cards — two commands disagreeing about whether
+ * results existed. So the fix is not to remove the wait but to stop charging it
+ * against a bound sized for a local read.
+ *
+ * Timing out here is not harmless in either case:
+ *   - `civitai_results` is a pure read; the caller simply loses the answer.
+ *   - `civitai_highlight` *lands* — the panel installs the glow once the reload
+ *     resolves — so the caller is told the command failed while its effect
+ *     arrives anyway. That is the #1468 false-failure shape. Re-issuing is safe
+ *     (`driveHighlight` clears before installing), but the report was wrong.
+ *
+ * 20 s is not a cure — no bound covers a CivitAI 503-and-retry. It is the
+ * tolerant bound every other read already gets (#357: a busy-but-alive tab
+ * fails a tight one), and it is the window the panel's own bounded wait has to
+ * fit inside to be able to answer at all.
+ */
+const CIVITAI_COUPLED_READ_TIMEOUT_MS = BRIDGE_READ_DEFAULT_TIMEOUT_MS;
 const CIVITAI_SAMPLE_FETCH_TIMEOUT_MS = 8000;
 // Extra fetch ATTEMPTS allowed beyond the requested image count, so a few
 // 404/non-image/oversize URLs don't starve the result — but a malformed reply
@@ -10506,7 +10535,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           ),
       },
       async (args: A, ctx) => {
-        const res = await ctx.call({ cmd: "civitai_results", limit: args.limit }, 10000);
+        const res = await ctx.call(
+          { cmd: "civitai_results", limit: args.limit },
+          CIVITAI_COUPLED_READ_TIMEOUT_MS,
+        );
         // Enrich with inline sample pixels (#623). Best-effort + additive: on any
         // problem we return the untouched text results, so the read path can never
         // regress to an error just because a thumbnail fetch failed.
@@ -10553,7 +10585,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .optional()
           .describe("Which result kind these ids refer to (media = images/videos, model = checkpoints/loras/workflows). Match the active tab if omitted."),
       },
-      async (args: A, ctx) => ctx.call({ cmd: "civitai_highlight", ids: args.ids, kind: args.kind }, 10000),
+      async (args: A, ctx) =>
+        ctx.call(
+          { cmd: "civitai_highlight", ids: args.ids, kind: args.kind },
+          CIVITAI_COUPLED_READ_TIMEOUT_MS,
+        ),
     ),
     def(
       "panel_civitai_clear_highlight",

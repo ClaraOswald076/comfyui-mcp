@@ -29,7 +29,7 @@ import {
   type ToolResult,
 } from "../../orchestrator/panel-tools.js";
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
-import { markReplyTimeout } from "../../services/ui-bridge.js";
+import { BRIDGE_READ_DEFAULT_TIMEOUT_MS, markReplyTimeout } from "../../services/ui-bridge.js";
 import { RunCompletions } from "../../orchestrator/run-completion-journal.js";
 import { QueueMonitor } from "../../services/queue-monitor.js";
 import { AskAnswers } from "../../orchestrator/ask-answer-journal.js";
@@ -2228,6 +2228,57 @@ describe("panel-tools: agent-driven CivitAI + training modals", () => {
     ]) {
       expect(names).toContain(expected);
     }
+  });
+
+  // ── #1520: the two commands coupled to CivitAI get the tolerant read bound ──
+  //
+  // Of the six civitai_* commands, exactly two await the in-flight fetch panel
+  // side (`state.activeReloadPromise`): civitai_results and civitai_highlight.
+  // Their reply time is bounded by a third party, not by the tab, so charging
+  // them a bound sized for a local read fails a *healthy* panel.
+  //
+  // This asserts BOTH directions. Raising the coupled pair is the fix; leaving
+  // the other four alone is the scope, and a test that only checked the pair
+  // would pass just as happily if someone raised all six — which would hide a
+  // genuinely dead tab behind an extra 10 s on four commands that answer
+  // locally and immediately.
+  describe("civitai bridge bounds (#1520)", () => {
+    const COUPLED = ["panel_civitai_results", "panel_civitai_highlight"] as const;
+    const LOCAL = [
+      "panel_civitai_clear_highlight",
+      "panel_civitai_switch_tab",
+      "panel_civitai_open_lightbox",
+    ] as const;
+    // Minimal valid args per tool — the bound is forwarded before any of these
+    // matter, but the handlers must not reject before reaching ctx.call.
+    const ARGS: Record<string, Record<string, unknown>> = {
+      panel_civitai_results: { limit: 20 },
+      panel_civitai_highlight: { ids: ["1"] },
+      panel_civitai_clear_highlight: {},
+      panel_civitai_switch_tab: { tab: "models" },
+      panel_civitai_open_lightbox: { id: "1" },
+    };
+
+    it("the two fetch-coupled reads forward the 20s read bound, not 10s", async () => {
+      for (const name of COUPLED) {
+        const { ctx, calls, timeouts } = makeFakeCtx();
+        await defByName(name).handler(ARGS[name], ctx);
+        const i = calls.findIndex((c) => String(c.cmd).startsWith("civitai_"));
+        expect(i, `${name} never forwarded a civitai_* command`).toBeGreaterThanOrEqual(0);
+        expect(timeouts[i], `${name} bound`).toBe(BRIDGE_READ_DEFAULT_TIMEOUT_MS);
+      }
+    });
+
+    it("the commands that answer locally keep the tighter bound", async () => {
+      for (const name of LOCAL) {
+        const { ctx, calls, timeouts } = makeFakeCtx();
+        await defByName(name).handler(ARGS[name], ctx);
+        const i = calls.findIndex((c) => String(c.cmd).startsWith("civitai_"));
+        expect(i, `${name} never forwarded a civitai_* command`).toBeGreaterThanOrEqual(0);
+        expect(timeouts[i], `${name} bound`).toBe(10000);
+        expect(timeouts[i]).toBeLessThan(BRIDGE_READ_DEFAULT_TIMEOUT_MS);
+      }
+    });
   });
 
   it("panel_open_civitai forwards a dock flag alongside the existing args", async () => {
