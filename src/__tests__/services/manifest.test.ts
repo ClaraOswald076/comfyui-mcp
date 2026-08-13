@@ -826,13 +826,21 @@ describe("applyManifest", () => {
     expect(msg).toMatch(/EXTERNALLY MANAGED/);
     expect(msg).toMatch(/PEP 668/);
     expect(msg).toMatch(/deliberate guard, not a broken interpreter/);
-    // ...and both supported routes out.
-    expect(msg).toMatch(/uv pip install --python/);
+    // ...and routes out that ACTUALLY WORK. An earlier draft of this message
+    // recommended `uv pip install --python <interp>`; measured against a real
+    // uv-managed CPython, uv refuses that too ("the interpreter ... is externally
+    // managed", hint: `uv venv`). A remedy that cannot work is worse than none —
+    // it reads as the answer and costs the reader the time to disprove it. So the
+    // message now says uv is NOT a way around this, and points at a venv.
+    expect(msg).toMatch(/uv does NOT get around this/);
+    expect(msg).toMatch(/uv venv/);
     expect(msg).toMatch(/COMFYUI_PYTHON/);
+    // The wrong remedy must not creep back as a bare suggestion.
+    expect(msg).not.toMatch(/^\s*-\s*.*uv pip install --python/m);
     // The refusal must SAY it declined to force it, and why — otherwise the
     // obvious next move is the one that quietly breaks their install later.
     expect(msg).toMatch(/break-system-packages/);
-    expect(msg).toMatch(/may reset/);
+    expect(msg).toMatch(/may later reset/);
     // It must NOT have actually forced it.
     expect(execFileSyncMock).not.toHaveBeenCalledWith(
       expect.anything(),
@@ -859,7 +867,7 @@ describe("applyManifest", () => {
     expect(result.success).toBe(false);
     const msg = result.results[0].message ?? "";
     expect(msg).toMatch(/EXTERNALLY MANAGED/);
-    expect(msg).toMatch(/uv pip install --python/);
+    expect(msg).toMatch(/uv does NOT get around this/);
     // It must NOT have quietly retried through bare pip after uv refused — that
     // walks into the same wall and buries the reason under a second failure.
     expect(execFileSyncMock).not.toHaveBeenCalledWith(

@@ -277,25 +277,29 @@ function errorText(err: unknown): string {
  * that names the two supported routes is worth more than a write that appears to
  * work.
  */
-function externallyManagedRefusal(pkg: string, python: string, uvAvailable: boolean): string {
+function externallyManagedRefusal(pkg: string, python: string): string {
   return (
     `Refusing to install "${pkg}": the Python that ComfyUI runs (${python}) declares itself ` +
-    `EXTERNALLY MANAGED (PEP 668), so its own pip will not install into it. This is normal for ` +
-    `a uv-managed install (Stability Matrix), and for distro Pythons on Linux — it is a ` +
-    `deliberate guard, not a broken interpreter.\n\n` +
-    (uvAvailable
-      ? `Installing through uv was attempted and also failed; the output above is uv's own.\n\n`
-      : `\`uv\` is not on PATH here, which is why the interpreter's pip was used directly. If ` +
-        `your install ships uv (Stability Matrix does, inside its own directory), putting it on ` +
-        `PATH lets this install through the supported route.\n\n`) +
-    `What works:\n` +
-    `  - install the package with the manager that owns this environment (Stability Matrix's ` +
-    `own package UI, or \`uv pip install --python "${python}" ${pkg}\`);\n` +
-    `  - or point COMFYUI_PYTHON at a virtual environment you control, and restart ComfyUI ` +
-    `through this server so the manifest installs there.\n\n` +
-    `Not doing it for you: forcing the install (\`--break-system-packages\`) would write into an ` +
-    `environment uv manages and may reset, which turns this clear failure into a broken ComfyUI ` +
-    `later. That is your call to make deliberately, not one to inherit from a manifest.`
+    `EXTERNALLY MANAGED (PEP 668), so nothing may install into it directly. This is normal for a ` +
+    `uv-managed install (Stability Matrix) and for distro Pythons on Linux — a deliberate guard, ` +
+    `not a broken interpreter.\n\n` +
+    `uv does NOT get around this: \`uv pip install --python "${python}"\` is refused by uv too, ` +
+    `with "the interpreter ... is externally managed". Measured, not assumed — so do not spend ` +
+    `time on it.\n\n` +
+    `What actually works — the environment needs to be a VIRTUAL one:\n` +
+    `  - if your launcher owns this install (Stability Matrix), add the package through its own ` +
+    `Python-packages UI, which installs into the environment it manages for ComfyUI;\n` +
+    `  - or create a venv and run ComfyUI from it: \`uv venv <dir>\` (uv's own suggestion for ` +
+    `exactly this error), install there, then set COMFYUI_PYTHON to that interpreter and restart ` +
+    `ComfyUI through this server so the manifest installs into it.\n\n` +
+    `WORTH CHECKING FIRST: if ComfyUI already runs from a virtual environment, then the ` +
+    `interpreter above is the wrong one — a base install picked up instead of the venv — and the ` +
+    `fix is to point COMFYUI_PYTHON at the venv rather than to change anything about packaging. ` +
+    `The path in this message is the one to compare against.\n\n` +
+    `Not doing it for you: pip offers \`--break-system-packages\` and this refuses to pass it. On ` +
+    `a uv-managed interpreter that writes into an environment uv owns and may later reset, which ` +
+    `turns a clear failure now into a broken ComfyUI later. That stays a decision you make ` +
+    `deliberately, not one inherited from a manifest.`
   );
 }
 
@@ -322,7 +326,7 @@ async function installPipPackage(
       // directory rather than on PATH, so `useUv` is false and we come straight
       // here — into an interpreter whose pip refuses by design (PEP 668).
       if (isExternallyManagedError(errorText(err))) {
-        throw new ValidationError(externallyManagedRefusal(pkg, python, false));
+        throw new ValidationError(externallyManagedRefusal(pkg, python));
       }
       throw err;
     }
@@ -346,7 +350,7 @@ async function installPipPackage(
     // bare pip there walks straight into the same wall one step later, burying
     // the real reason under a second failure.
     if (isExternallyManagedError(detail)) {
-      throw new ValidationError(externallyManagedRefusal(pkg, python, true));
+      throw new ValidationError(externallyManagedRefusal(pkg, python));
     }
     if (isUvNonVenvError(detail)) {
       // System-Python ComfyUI (no venv): uv can't use the interpreter directly.
@@ -363,7 +367,7 @@ async function installPipPackage(
         // case it is, not as a bare pip error, so the caller is not left reading
         // uv's non-venv complaint as the cause.
         if (isExternallyManagedError(errorText(err2))) {
-          throw new ValidationError(externallyManagedRefusal(pkg, python, true));
+          throw new ValidationError(externallyManagedRefusal(pkg, python));
         }
         throw err2;
       }
