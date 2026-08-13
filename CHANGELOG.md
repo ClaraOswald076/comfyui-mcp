@@ -4,6 +4,44 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.32
+
+### Fixed
+
+- **`apply_manifest` explains a PEP 668 refusal instead of walking into it (#1508).**
+  Installing a manifest's Python packages against a uv-managed interpreter (Stability
+  Matrix, and distro Pythons on Linux) is refused by design: the environment declares
+  itself externally managed. The manifest run simply failed with that raw error and no
+  way forward. Three different paths reached it -- with uv absent, with uv present and
+  refusing, and through the older non-venv fallback, where uv's unrelated "no virtual
+  environment" complaint sat on top of the real reason and sent readers off to fix the
+  wrong thing.
+
+  All three now say the same actionable thing: the interpreter is externally managed,
+  that is a deliberate guard rather than a broken install, and here is what actually
+  works. Notably it says what does NOT work -- routing through uv is refused by uv too,
+  which was worth measuring rather than assuming, because recommending it would have
+  cost the reader the time to find that out. It also names the check worth doing first:
+  if ComfyUI already runs from a virtual environment, the interpreter in the message is
+  the wrong one, and the fix is to point `COMFYUI_PYTHON` at the venv.
+
+  It does not force the install. pip offers an override for exactly this, and passing it
+  on a uv-managed interpreter writes into an environment uv may later reset -- turning a
+  clear failure now into a broken ComfyUI later. That stays a deliberate decision rather
+  than one inherited from a manifest, and the message says so.
+
+### Security
+
+- **A manifest entry's credentials no longer reach messages, results or logs (#1508).**
+  A pip entry or model URL may legitimately carry credentials (`https://user:token@...`).
+  Several failure paths echoed the entry back verbatim -- into the error message, into
+  the per-item report, and into the log line naming the package -- and a failed
+  subprocess additionally embeds the whole command line, so the spec travelled inside
+  ordinary install errors too. URL credentials are now masked at the single point every
+  manifest item passes through, which covers the Python-package, model and custom-node
+  paths together. Entries stay identifiable: only the user/password portion is masked,
+  so the host and path still read normally, and the underlying diagnosis is unchanged.
+
 ## 0.51.31
 
 ### Fixed
