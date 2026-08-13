@@ -1057,6 +1057,14 @@ interface PanelReadyResult {
   via?: "observed-cycle";
   /** True once the boot endpoint was observed unreachable after the accepted dispatch. */
   sawDown: boolean;
+  /** The status of the LAST sample taken, or undefined if none was.
+   *
+   *  `sawDown` LATCHES on a single "down" and never clears, which is right for proving a
+   *  cycle STARTED and wrong for describing where things ended up: a transient refusal
+   *  followed by an endpoint that answers (or answers 5xx, i.e. "unknown") leaves sawDown
+   *  true forever (codex #742 r2). Anything reporting a server as not-back must read this
+   *  instead — it is the only field that says what the last observation actually saw. */
+  lastStatus?: ProbeStatus;
 }
 
 /** True when a decoded /system_stats body has the recognizable ComfyUI shape (a
@@ -1939,6 +1947,7 @@ async function observeRecovery(
   const probe = healthProbeOverride ?? probeComfyEndpoint;
   const currentDeadline = () => gate?.deadline ?? deadline;
   let sawDown = false;
+  let lastStatus: ProbeStatus | undefined;
   let attempts = 0;
   for (;;) {
     if (gate?.cancelled) break;
@@ -1970,10 +1979,18 @@ async function observeRecovery(
     // COUNTING gate: a sample contributes to the cycle only if taken at/after the post-write
     // dispatched instant (defensive — the observer also defers its first probe to dispatch).
     if (gate == null || sampleAt >= gate.dispatchedAt) {
+      lastStatus = status;
       if (status === "down") {
         sawDown = true;
       } else if (status === "healthy" && sawDown) {
-        return { ready: true, waited_ms: Date.now() - start, attempts, via: "observed-cycle", sawDown };
+        return {
+          ready: true,
+          waited_ms: Date.now() - start,
+          attempts,
+          via: "observed-cycle",
+          sawDown,
+          lastStatus,
+        };
       }
       // "healthy" without a prior down, and "unknown", are ignored — keep looking.
     }
@@ -1982,7 +1999,7 @@ async function observeRecovery(
     if (left <= 0) break;
     await sleep(Math.min(intervalMs, left));
   }
-  return { ready: false, waited_ms: Date.now() - start, attempts, sawDown };
+  return { ready: false, waited_ms: Date.now() - start, attempts, sawDown, lastStatus };
 }
 
 // ---- workflow_open verify-after-timeout (#215/#319/#496/#661) --------------
@@ -11735,10 +11752,31 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             signalDispatched = r;
           }),
         };
+        // #742 — A REMOTE TARGET HAS NO LOOPBACK BOOT ENDPOINT, BUT IT DOES HAVE AN ADDRESS.
+        //
+        // `captureRebootHealthBase` is loopback-only, so on the remote path nothing was ever
+        // probed and the dispatch returned "it is restarting out-of-band … check in a few
+        // seconds". For a Pinokio install nothing restarts it — its launcher only re-launches
+        // on the Manager's dependency-install message — so the reporter's server stopped and
+        // stayed stopped while the result described a restart in progress.
+        //
+        // The base this session already talks to for every other call is probeable, with the
+        // same configured auth, so it is watched here too. What it may CONCLUDE is deliberately
+        // one-directional (see the await below): a healthy answer proves the ADDRESS responds,
+        // never that this instance cycled — a tab can front a different instance than the
+        // orchestrator is configured for, which is the whole reason the loopback path demands a
+        // handshake-Origin match before it certifies anything. So this can report a failure to
+        // come back; it can never manufacture readiness.
+        const remoteProbeBase =
+          healthBase == null && isRemoteMode()
+            ? (getComfyUIBaseUrl() || "").replace(/\/+$/, "") || null
+            : null;
         const recoveryPromise =
           healthBase != null
             ? observeRecovery(timing, gate.deadline, { healthBase, gate })
-            : null;
+            : remoteProbeBase != null
+              ? observeRecovery(timing, gate.deadline, { healthBase: remoteProbeBase, gate })
+              : null;
         // The AUTHORITATIVE, TYPED dispatch outcome from the bridge rejection (if any):
         // false = a PRE-write send failure (nothing transmitted), true = a POST-write
         // mid-command OUTCOME-UNKNOWN drop / reply-timeout. Captured from the RAW error —
@@ -12060,12 +12098,75 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // tells the caller to verify, NOT the #509 false-TIMEOUT *error* (the real #509 local
         // case is a probeable boot endpoint and is certified by observeRecovery below).
         if (healthBase == null) {
-          // No probeable boot endpoint — the concurrent observer was never started.
+          // #742 — REPORT A SERVER THAT NEVER CAME BACK, instead of describing a restart.
+          //
+          // Only the NEGATIVE direction is read from this observation, and only when the
+          // window closed with the address still down. `sawDown` alone is not enough: a
+          // successful fast restart also goes down, so treating it as failure would call
+          // every healthy remote reboot a death. And a healthy answer is never upgraded to
+          // readiness — `ready`/`confirmed_cycle` stay false on every branch here, exactly
+          // as before, because this probe cannot prove WHICH instance answered.
+          // Measure the readiness budget from ACK COMPLETION, exactly as the bound path
+          // below does — without this the observer would run to the whole-handler cap and a
+          // remote dispatch could sit here far longer than a local one.
+          gate.deadline = Math.min(Date.now() + timing.budgetMs, overallDeadline);
+          const remote = remoteProbeBase != null ? await recoveryPromise : null;
+          // The trigger reads the LAST observation, not the latched `sawDown` (codex r2):
+          // a remote tunnel/NAT can refuse one connection and then answer — 401, 503, a
+          // timeout, all of which classify "unknown" — leaving `sawDown` true for the rest
+          // of the window while the endpoint was responding the whole time. Reporting a
+          // dead server from that is a false alarm about someone's live install. Requiring
+          // the final sample to still be "down" means the claim describes where the window
+          // actually ENDED, which is the only thing this note asserts.
+          if (
+            remote != null &&
+            remote.sawDown &&
+            !remote.ready &&
+            remote.lastStatus === "down"
+          ) {
+            const waited = Math.round(remote.waited_ms / 1000);
+            // SAY WHAT WAS MEASURED, AND NOT ONE STEP FURTHER (codex P1).
+            //
+            // A first version told the reader "do not wait for it — it will stay down". That
+            // is a claim about the FUTURE built from a bounded window: a remote host can take
+            // longer than this budget to boot, and it would have sent someone off to hand-start
+            // a server that was seconds from coming back. Unmeasured advice stated confidently
+            // is the exact defect #742 is about; making it point the other way is not a fix.
+            //
+            // What IS established: this address went down and did not answer again inside the
+            // window. Both explanations are named, and so is the one cheap check that separates
+            // them — which is all the caller needs to pick a next step.
+            //
+            // (A second probe after the window was tried and dropped: it added a call that
+            // could start past the handler's own deadline (codex P2) to support a "still not
+            // answering RIGHT NOW" phrasing that this wording no longer needs.)
+            return ok({
+              rebooting: true,
+              ready: false,
+              confirmed_cycle: false,
+              dispatched: true,
+              saw_down: true,
+              probes: remote.attempts,
+              note:
+                `ComfyUI restart was dispatched and accepted, and ${remoteProbeBase} WENT DOWN — ` +
+                `it has NOT come back within ${waited}s and was still not answering on the last ` +
+                `check. That does NOT prove it is gone for good: a remote host can take longer ` +
+                `than this to boot. It is also what a restart that nothing relaunches looks like, ` +
+                `which is common for an externally-managed install (e.g. Pinokio, whose launcher ` +
+                `only re-launches on the Manager's dependency-install signal). Check ` +
+                `get_system_stats (action:"health") in a moment. If it is still unreachable then, ` +
+                `start ComfyUI from its own launcher (Pinokio, the Desktop app, your terminal) ` +
+                `and reload the browser tab so the panel reconnects.`,
+            });
+          }
+          // Unchanged for every other case — including "it answered", which is NOT promoted
+          // to a confirmed cycle.
           return ok({
             rebooting: true,
             ready: false,
             confirmed_cycle: false,
             dispatched: true,
+            ...(remote != null ? { saw_down: remote.sawDown, probes: remote.attempts } : {}),
             note:
               "ComfyUI restart was dispatched and accepted; it is restarting out-of-band. " +
               "There is no local boot endpoint I can safely probe from here, so I can't " +
