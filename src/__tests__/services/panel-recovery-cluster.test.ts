@@ -263,6 +263,29 @@ interface Harness {
   gitMerges: number;
 }
 
+/**
+ * Can this machine create a symlink/junction to a MISSING target? Windows needs
+ * either Developer Mode or elevation for symlinks; junctions usually work
+ * without, but a locked-down runner may refuse both.
+ *
+ * Probed rather than assumed, and used with `it.runIf` so the dangling-link test
+ * is either RUN or visibly SKIPPED — never silently degraded. An earlier version
+ * wrapped the creation in try/catch, which turned it into a duplicate of the
+ * plain-absent test on any machine without the privilege: green, and unable to
+ * detect removal of the very term it exists to pin (review finding).
+ */
+function canMakeDanglingLink(): boolean {
+  const probe = mkdtempSync(join(tmpdir(), "cmcp-linkprobe-"));
+  try {
+    symlinkSync(join(probe, "no-such-target"), join(probe, "link"), "junction");
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
+  }
+}
+
 function makeDeps(opts: {
   /** Version a `git clone` of the panel repo lands. undefined ⇒ clone fails. */
   cloneVersion?: string;
@@ -972,7 +995,9 @@ describe("update no longer contradicts status on a registry-zip install (#771)",
     expect(h.clones).toHaveLength(1);
   });
 
-  it("a DANGLING SYMLINK at the panel path is still moved aside, not skipped", async () => {
+  it.runIf(canMakeDanglingLink())(
+    "a DANGLING SYMLINK at the panel path is still moved aside, not skipped",
+    async () => {
     // `existsSync` follows the link, so a broken one reads as absent while the
     // directory ENTRY is still there. Skipping the backup move on that reading
     // would leave it in place and the final rename onto it would fail — a safe
@@ -983,17 +1008,22 @@ describe("update no longer contradicts status on a registry-zip install (#771)",
       updateDetails: { total_count: 0, done_count: 4 },
       cloneVersion: "0.11.38",
     });
-    const orig = h.deps.update;
-    h.deps.update = async (...a: Parameters<typeof orig>) => {
-      const r = await orig(...a);
-      // Manager replaces the pack with a link to somewhere that no longer exists.
+    // Simulated through the INJECTED probes rather than a real junction. A
+    // first version created one on disk and swallowed the failure on machines
+    // without the privilege — which silently degraded it into a duplicate of
+    // the plain-absent test above, unable to detect the very term it exists to
+    // pin. Review caught that. The dep set is the seam this file already uses,
+    // and it behaves identically on every platform and CI runner.
+    //
+    // The entry stays REAL on disk (so the backup rename can succeed) while the
+    // two probes report what they would for a dangling link: `existsSync`
+    // follows it and says absent, `isSymlink` lstats it and says present.
+    const origUpdate = h.deps.update;
+    h.deps.update = async (...a: Parameters<typeof origUpdate>) => {
+      const r = await origUpdate(...a);
+      // Manager replaces the pack with a link whose target no longer exists.
       rmSync(PANEL_DIR(), { recursive: true, force: true });
-      try {
-        symlinkSync(join(root, "gone-target"), PANEL_DIR(), "junction");
-      } catch {
-        // Windows without the privilege — fall back to proving the plain
-        // absent case, which the sibling test already covers in full.
-      }
+      symlinkSync(join(root, "gone-target"), PANEL_DIR(), "junction");
       return r;
     };
 
@@ -1001,7 +1031,21 @@ describe("update no longer contradicts status on a registry-zip install (#771)",
 
     expect(result.installedVersion).toBe("0.11.38");
     expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.38");
-  });
+    // THE assertion that binds. The version check above passes either way — the
+    // final rename can still land — so it cannot see whether the entry was
+    // moved aside. Only the backup can: with the isSymlink term the old copy is
+    // preserved under custom_nodes_backup, without it the move is skipped and
+    // nothing is backed up. An earlier version of this test asserted only the
+    // version and survived the mutation that removes the term.
+    //
+    // Its CONTENTS are deliberately not read: what was moved aside IS the
+    // broken link, so it resolves to nothing. That the entry exists is the
+    // whole claim.
+    const backups = readdirSync(join(root, "custom_nodes_backup"));
+    expect(backups).toHaveLength(1);
+    expect(backups[0]).toContain("comfyui-agent-panel");
+    },
+  );
 
   it("a CHECKOUT whose pack vanished still THROWS — a re-clone would destroy local work", async () => {
     // The scope limit, and the reason this is not a blanket "reinstall on any
