@@ -12,7 +12,9 @@
 // and partial downloads land in a directory that is not the configured one — with
 // nothing checking the result against intent.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
+import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 const ORIGINAL = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
 
@@ -64,15 +66,23 @@ describe("COMFYUI_DOWNLOAD_CACHE_DIR is normalized (#1526)", () => {
   });
 
   it("does not redirect a directory that REALLY ends in a space", async () => {
-    // The non-destructive property of the #1512 helper: a value that resolves as
-    // given is returned untouched. This machine has no such directory, so the
-    // assertion is that the repair is a FALLBACK — it only ever acts on a value
-    // that names nothing — which the resolve() below reflects.
-    const spaced = "/srv/comfy-cache ";
-    const got = await cacheDirFor(spaced);
-    // Either it resolved the literal (directory exists) or the trimmed form
-    // (it does not). Both are correct; what must NOT happen is a crash or an
-    // empty path.
-    expect([resolve(spaced), resolve("/srv/comfy-cache")]).toContain(got);
+    // The non-destructive property of the #1512 helper, and it has to be proven
+    // against a directory that EXISTS. An earlier version of this test named a
+    // path with no such directory and accepted either result — so an
+    // unconditional trim passed it. Review caught that; it asserted nothing.
+    //
+    // A user with a cache root legitimately ending in a space must keep it: the
+    // alternative is silently relocating their cache and stranding every partial
+    // already on disk, which is the #1512 reporter's 11.35 GB in a new costume.
+    const base = mkdtempSync(join(tmpdir(), "cachedir-"));
+    const spaced = join(base, "cache ");
+    mkdirSync(spaced);
+    try {
+      expect(await cacheDirFor(spaced)).toBe(resolve(spaced));
+      // ...and the trimmed sibling, which does NOT exist, is still repaired.
+      expect(await cacheDirFor(join(base, "gone "))).toBe(resolve(join(base, "gone")));
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 });
