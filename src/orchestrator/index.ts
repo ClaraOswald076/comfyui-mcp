@@ -137,7 +137,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { registerAllTools } from "../tools/index.js";
 import { tryInstallRetiredNameRedirect } from "../tools/retired-redirect.js";
-import { isForceRemoteFlagSet, isLoopbackHost, detectLocalComfyUIPath, setComfyuiTarget, onComfyuiTargetChanged, isTargetingLocal, isTargetingLocalOrLan, isTargetingPod, getComfyUIBaseUrl, getLocalComfyuiUrl, rescopeLocalTargetFile, getComfyUIAuthHeaders, normalizeInstallPathEnv, warnIfInstallPathWasMalformed } from "../config.js";
+import { isForceRemoteFlagSet, isLoopbackHost, detectLocalComfyUIPath, setComfyuiTarget, onComfyuiTargetChanged, isTargetingLocal, isTargetingLocalOrLan, isTargetingPod, getComfyUIBaseUrl, getLocalComfyuiUrl, rescopeLocalTargetFile, getComfyUIAuthHeaders } from "../config.js";
+import { normalizeInstallPathEnv } from "../utils/install-path-env.js";
 import {
   buildComfyuiMcpEnv,
   comfyuiSecretKeys,
@@ -1315,9 +1316,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   // check locally — it is passed on to every agent this orchestrator starts.
   // Same normalizer as config.ts so the two can never drift apart, which is the
   // shape of the original bug (panel stripped it, orchestrator did not).
-  const rawEnvComfyuiPath = process.env.COMFYUI_PATH;
-  const { path: envComfyuiPath } = normalizeInstallPathEnv(rawEnvComfyuiPath);
-  warnIfInstallPathWasMalformed(rawEnvComfyuiPath, envComfyuiPath);
+  const envComfyuiPath = normalizeInstallPathEnv(process.env.COMFYUI_PATH).path;
   // `||` not `??`: a set-but-empty COMFYUI_PATH= means "unset" (the headless
   // MCP's config truthy-checks it the same way) — it must not block detection.
   // normalizeInstallPathEnv already maps a whitespace-only value to undefined,

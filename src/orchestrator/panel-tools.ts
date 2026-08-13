@@ -162,6 +162,7 @@ import {
   getComfyUIBaseUrl,
   getComfyuiTargetGeneration,
 } from "../config.js";
+import { normalizeInstallPathEnv } from "../utils/install-path-env.js";
 import { sliceWorkflow } from "../services/workflow-slicer.js";
 import { validateA2UISpecServer } from "../services/a2ui-spec.js";
 import type { UiWorkflow } from "../comfyui/types.js";
@@ -5554,7 +5555,10 @@ function readPackWorkflow(packName: string): Record<string, unknown> {
  * an absolute path.
  */
 function comfyWorkflowsDirs(): string[] {
-  const base = process.env.COMFYUI_PATH;
+  // #1512 — a trailing space here does not fail loudly: it silently builds
+  // `<path> /user/default/workflows`, a directory that does not exist, so the
+  // workflow library simply appears empty and every lookup misses.
+  const base = normalizeInstallPathEnv(process.env.COMFYUI_PATH).path;
   if (!base) return [];
   return [
     join(base, "user", "default", "workflows"),
