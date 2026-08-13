@@ -972,6 +972,37 @@ describe("update no longer contradicts status on a registry-zip install (#771)",
     expect(h.clones).toHaveLength(1);
   });
 
+  it("a DANGLING SYMLINK at the panel path is still moved aside, not skipped", async () => {
+    // `existsSync` follows the link, so a broken one reads as absent while the
+    // directory ENTRY is still there. Skipping the backup move on that reading
+    // would leave it in place and the final rename onto it would fail — a safe
+    // failure, but it would defeat this whole recovery on a real filesystem
+    // shape. Caught in review; `isSymlink` lstats and sees the link itself.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    const h = makeDeps({
+      updateDetails: { total_count: 0, done_count: 4 },
+      cloneVersion: "0.11.38",
+    });
+    const orig = h.deps.update;
+    h.deps.update = async (...a: Parameters<typeof orig>) => {
+      const r = await orig(...a);
+      // Manager replaces the pack with a link to somewhere that no longer exists.
+      rmSync(PANEL_DIR(), { recursive: true, force: true });
+      try {
+        symlinkSync(join(root, "gone-target"), PANEL_DIR(), "junction");
+      } catch {
+        // Windows without the privilege — fall back to proving the plain
+        // absent case, which the sibling test already covers in full.
+      }
+      return r;
+    };
+
+    const result = await runPanelActionInner("update", h.deps);
+
+    expect(result.installedVersion).toBe("0.11.38");
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.38");
+  });
+
   it("a CHECKOUT whose pack vanished still THROWS — a re-clone would destroy local work", async () => {
     // The scope limit, and the reason this is not a blanket "reinstall on any
     // unverifiable result". A git checkout has history and possibly local

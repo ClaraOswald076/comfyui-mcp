@@ -5103,9 +5103,19 @@ async function updateViaRegistryZipReinstall(opts: {
   //
   // Skipping the move is not a relaxation of the #641 guard. That guard exists
   // so an OLD copy cannot shadow the new one, and here there is no old copy.
-  // Requires PROVEN absence — `existsSync` false — so a probe that merely
-  // failed still takes the careful path below.
-  const hadExistingPanel = deps.existsSync(dir);
+  //
+  // The question is "is there a directory ENTRY in the way", not "does a panel
+  // resolve there", and those differ for a DANGLING SYMLINK (review finding):
+  // `existsSync` follows the link and reports false, while the entry is still
+  // very much present — so skipping the move on `existsSync` alone would leave
+  // it sitting there and STEP 3's rename onto it would fail. That is milder
+  // than the bug it replaces (a safe failure, not a shadow) but it would defeat
+  // this very recovery on a real filesystem shape. `isSymlink` lstats, so it
+  // sees the link itself.
+  //
+  // Requires PROVEN absence in BOTH senses — no resolvable target and no link
+  // entry — so a probe that merely failed still takes the careful path below.
+  const hadExistingPanel = deps.existsSync(dir) || deps.isSymlink(dir) === true;
   if (hadExistingPanel) {
     try {
       ops.rename(dir, backupDir);
