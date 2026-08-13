@@ -263,6 +263,11 @@ describe("buildManifest", () => {
     const manifest = buildManifest(separatorCatalog(), { search: "   " });
     expect(manifest).toContain("4 of 4 tools");
     expect(manifest).not.toContain("FILTERED view");
+    // The HEADER too. It used to test raw `opts.search`, so a whitespace-only
+    // query stamped "(filtered)" onto a complete catalog — the behaviour was
+    // right and this one line disagreed with it, which is exactly the sort of
+    // half-true label this file keeps having to correct.
+    expect(manifest).not.toContain("(filtered)");
   });
 
   it("suggests categories when nothing matches", () => {

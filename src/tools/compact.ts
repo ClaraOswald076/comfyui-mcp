@@ -135,9 +135,15 @@ export function buildManifest(
     const cats = [...catalog.byCategory().keys()].join(", ");
     return `No tools matched (category=${opts.category ?? "any"}, search=${opts.search ?? "none"}). Categories: ${cats}`;
   }
+  // `terms.length`, not raw `opts.search` (codex). A whitespace-only search
+  // filters nothing, and stamping "(filtered)" on a complete catalog tells the
+  // caller something untrue about what they are looking at — while the source
+  // comment two lines away claimed such a search was treated as no search at all.
+  // The behaviour was right; only this line disagreed with it.
+  const filtered = Boolean(opts.category) || terms.length > 0;
   const header =
     `comfyui-mcp tool catalog — ${shown} of ${catalog.tools.size} tools` +
-    (opts.category || opts.search ? " (filtered)" : "") +
+    (filtered ? " (filtered)" : "") +
     ". Workflow: pick a tool → describe_tool {\"name\": ...} for its parameters → call_tool {\"name\": ..., \"args\": {...}}.";
   // #1525 — DISCLOSE the name tier when it did the selecting (codex). Results
   // chosen by name are not "everything that matched", and a caller who cannot
@@ -157,7 +163,7 @@ export function buildManifest(
     ? ` Showing tools whose NAME matches; ${suppressed} other tool(s) also match this search — search a distinctive word from one to see them.`
     : "";
   const footer =
-    (opts.category || opts.search) && shown < catalog.tools.size
+    filtered && shown < catalog.tools.size
       ? `\n\nThis is a FILTERED view (${catalog.tools.size - shown} tools hidden).${tierNote} If nothing here fits the task, call list_tools again with a broader search or no filter.`
       : "";
   return header + lines.join("\n") + footer;
