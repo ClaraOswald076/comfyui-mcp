@@ -124,7 +124,16 @@ describe("the startup deadline (#1524)", () => {
       exits = [];
       process.env.COMFYUI_MCP_STARTUP_DEADLINE_MS = bad;
       const disarm = armStartupDeadline(PORT, { exit, incumbent: () => undefined });
-      vi.advanceTimersByTime(91_000);
+
+      // WHEN it fires, not merely THAT it fires. Dropping the `raw > 0` guard
+      // turns "0" and "-1" into a ZERO-millisecond deadline that kills every
+      // startup instantly — strictly worse than disabling it — and an
+      // exits-are-[1]-after-91s assertion cannot tell that apart from a sane
+      // default. A surviving mutation is what exposed the gap.
+      vi.advanceTimersByTime(89_000);
+      expect(exits, `override ${JSON.stringify(bad)} must not fire early`).toEqual([]);
+
+      vi.advanceTimersByTime(2_000);
       expect(exits, `override ${JSON.stringify(bad)} should fall back to the default`).toEqual([1]);
       disarm();
     }
@@ -168,5 +177,23 @@ describe("the startup deadline (#1524)", () => {
     expect(timers).toBeGreaterThan(0);
     disarm();
     expect(vi.getTimerCount()).toBe(timers - 1);
+
+    // `unref` is not observable under fake timers — the count above is identical
+    // with or without it — so the call is asserted against the source instead.
+    // Without it a process that finishes its work inside the window cannot exit
+    // until the deadline elapses, which is a hang introduced by the anti-hang
+    // guard. A surviving mutation is what showed the behavioural test could not
+    // see this.
+    const src = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "..", "..", "orchestrator", "index.ts"),
+      "utf8",
+    );
+    // SCOPED to this function. index.ts has more than one `timer.unref?.()`, so a
+    // file-wide match passed even with THIS one deleted — an assertion satisfied
+    // by an unrelated line. Only the deadline's own body counts.
+    const start = src.indexOf("export function armStartupDeadline");
+    expect(start, "armStartupDeadline is gone — this test is checking nothing").toBeGreaterThan(-1);
+    const body = src.slice(start, src.indexOf("return () => clearTimeout(timer);", start));
+    expect(body).toMatch(/timer\.unref\?\.\(\)/);
   });
 });
