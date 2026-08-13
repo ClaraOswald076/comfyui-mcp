@@ -3891,6 +3891,52 @@ WHY THIS READ WAS NEEDED AT ALL: this session's panel is ${v.version}, and a ` +
  */
 const FENCE_CORROBORATION_RECHECK_STEPS_MS = [400, 900, 1600] as const;
 
+/**
+ * #1478 — NAME THE CAUSE OF A MISMATCH THE LOAD MAY HAVE CREATED.
+ *
+ * An API-format `graph_load` can re-mint the canvas workflow instance, which leaves this
+ * session's fence naming the old one — so the very next `panel_graph_outline` is refused
+ * with `workflow instance mismatch`. The reporter hit that twice, deterministically. The
+ * refusal then says "NO PANEL COMMAND CLAIMED IT", pointing at "the user switched tabs"
+ * when a panel command one call earlier is the actual cause.
+ *
+ * WHAT THIS DELIBERATELY DOES NOT DO — and four review rounds are the reason:
+ *
+ *  1. It does NOT auto-repair the fence. The obvious fix runs the same re-derivation the
+ *     documented recovery runs, and that adopts WHATEVER IS ACTIVE NOW with no tie to the
+ *     load: a user switching canvases in the window would stamp the session to a different
+ *     workflow and the next edit would land on the wrong graph. `panel_set_workflow_target`
+ *     is sound doing this only because the user explicitly asked to follow what is live.
+ *  2. It does NOT claim the fence IS stale. Every categorical version of that sentence was
+ *     falsified: a UI-format load with an active workflow passes `__cmcpKeepInstance: true`
+ *     and preserves the instance outright; and a second API load into the same
+ *     already-active `graph_load.json` workflow reuses that object, so its uuid — which is
+ *     object-keyed — does not change either. The reply carries nothing that separates
+ *     "re-minted" from "reused", so asserting staleness is a guess dressed as a fact.
+ *
+ * So it states the CONDITIONAL, which is true on every path: this kind of load can move
+ * the instance, here is the symptom, here is the cause, here is the one call that clears
+ * it. A reader who is not refused ignores it; a reader who is refused stops hunting a tab
+ * switch that never happened.
+ *
+ * The categorical version needs the panel's help: give `graph_load`'s reply a
+ * `workflow_uuid`, as #762/#800 did for `workflow_new` / `workflow_save`, and the load can
+ * then compare it against the fence and say exactly what happened — or claim the identity
+ * it created outright, which is race-proof and refusal-proof and is why those two work
+ * that way.
+ */
+function noteStaleFenceAfterLoad(): string {
+  return (
+    `
+
+NOTE: an API-format load CAN re-mint the canvas workflow instance. If your next ` +
+    `graph command is refused with "workflow instance mismatch", that is why — the cause is ` +
+    `this load, NOT the user switching tabs (the refusal's own text suggests otherwise). ` +
+    `Clear it with panel_set_workflow_target({mode:"current"}), which re-derives the fence ` +
+    `from the live canvas, then retry. If the next command is not refused, nothing needs doing.`
+  );
+}
+
 async function rebindWorkflowFence(ctx: PanelToolCtx): Promise<WorkflowFenceRebind> {
   const tabAtStart = ctx.tabId;
   let before = currentWorkflowFence(ctx);
@@ -8850,7 +8896,24 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             throw new Error("Provide one of `pack` (a bundled pack name), `path` (a workflow .json on disk), or `graph` (a UI workflow).");
           }
           // Generous timeout — loading a large graph onto the live canvas can take a moment.
-          return await ctx.call({ cmd: "graph_load", graph: data }, 30000);
+          const loaded = await ctx.call({ cmd: "graph_load", graph: data }, 30000);
+          if (loaded.isError) return loaded;
+          // Keyed on the reply SAYING the graph was replaced, not merely on the call not
+          // erroring (codex r2). A non-error envelope that reports `loaded:false` did not
+          // replace anything, and telling that caller their fence is stale would be a
+          // fabricated consequence of a load that never happened — the same
+          // unmeasured-claim defect this note exists to remove.
+          // ONLY THE API-FORMAT LOAD MINTS A NEW INSTANCE (codex r3, checked in the panel).
+          // The UI-format path passes `__cmcpKeepInstance: true` whenever a workflow is
+          // active, deliberately PRESERVING the instance so the agent's own follow-up
+          // commands are not rejected — so a note claiming the fence went stale would be
+          // false for the commonest load. The API path (`app.loadApiJson`) passes no such
+          // option and does re-mint, and it is the path the reporter hit: their reply reads
+          // `format:"api"`. That field is present only on this branch, which makes it the
+          // signal rather than an inference.
+          const reply = parseToolResultJson(loaded);
+          const remintedInstance = reply?.loaded === true && reply?.format === "api";
+          return remintedInstance ? appendNote(loaded, noteStaleFenceAfterLoad()) : loaded;
         } catch (err) {
           return fail(err);
         }
