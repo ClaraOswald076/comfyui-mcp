@@ -210,13 +210,13 @@ async function resolveWorkspacePython(comfyuiPath: string): Promise<InstallInter
 
 function validatePipPackageSpec(pkg: string): void {
   if (pkg.startsWith("-")) {
-    throw new ValidationError(`Manifest pip entry must be a package spec, not an option: ${pkg}`);
+    throw new ValidationError(`Manifest pip entry must be a package spec, not an option: ${redactUrlCredentials(pkg)}`);
   }
   if (ASCII_CONTROL_RE.test(pkg)) {
     throw new ValidationError("Manifest pip entry cannot contain ASCII control characters.");
   }
   if (WHITESPACE_RE.test(pkg)) {
-    throw new ValidationError(`Manifest pip entry cannot contain whitespace: ${pkg}`);
+    throw new ValidationError(`Manifest pip entry cannot contain whitespace: ${redactUrlCredentials(pkg)}`);
   }
 }
 
@@ -304,10 +304,15 @@ function isExternallyManagedError(text: string): boolean {
  * output it carries, since pip prints the URL it is fetching.
  */
 function redactUrlCredentials(text: string): string {
-  // Userinfo runs from `://` to the LAST `@` before the host, and may contain
-  // ':' in the password. Bounded to a single line/token so it cannot run away
-  // across an entire log.
-  return text.replace(/(\w+:\/\/)([^/\s@]+)@/g, (_m, scheme: string) => `${scheme}***:***@`);
+  // Userinfo runs from `://` to the LAST `@` before the path, and may contain
+  // BOTH ':' and '@' in the password — `https://u:alpha@beta@host` is a valid URL
+  // whose password is `alpha@beta`. An earlier version stopped at the FIRST `@`
+  // ([^/\s@]+@) and so rendered that as `https://***:***@beta@host`, leaking half
+  // the secret while looking redacted (codex P1).
+  //
+  // `[^/\s]*` is GREEDY and cannot cross `/` or whitespace, so it runs to the
+  // last `@` within the authority and no further.
+  return text.replace(/(\w+:\/\/)[^/\s]*@/g, (_m, scheme: string) => `${scheme}***:***@`);
 }
 
 function clipInstallerOutput(text: string): string {
@@ -361,7 +366,10 @@ function externallyManagedRefusal(pkg: string, python: string, output = ""): str
   // is gone, and an earlier draft even claimed it was "above" when nothing had
   // been printed. Anything the tool said that this message does not anticipate
   // would have been lost silently.
-  const detail = redactUrlCredentials(clipInstallerOutput(output));
+  // REDACT, then clip — never the other way round (codex P1). Clipping first can
+  // sever the `@` that the redaction pattern anchors on, so a secret sitting near
+  // the cut survives as `https://u:token` in a message that looks sanitised.
+  const detail = clipInstallerOutput(redactUrlCredentials(output));
   return (
     (detail ? `${detail}\n\n` : "") +
     `Refusing to install "${redactUrlCredentials(pkg)}": the Python that ComfyUI runs (${python}) declares itself ` +
@@ -396,7 +404,7 @@ async function installPipPackage(
   const resolved = await resolveWorkspacePython(comfyuiPath);
   if (!resolved.python) {
     throw new ValidationError(
-      `Refusing to install "${pkg}". ${resolved.reason} Set COMFYUI_PYTHON to the interpreter ComfyUI runs with, or restart ComfyUI through this MCP server and retry.`,
+      `Refusing to install "${redactUrlCredentials(pkg)}". ${resolved.reason} Set COMFYUI_PYTHON to the interpreter ComfyUI runs with, or restart ComfyUI through this MCP server and retry.`,
     );
   }
   const python = resolved.python;
@@ -713,7 +721,15 @@ function report(
   status: ManifestItemStatus,
   message: string,
 ): ManifestItemReport {
-  return { action, item, status, message };
+  // `item` is echoed back verbatim from the manifest, and a pip entry or a model
+  // URL may legitimately carry credentials in its userinfo. Redacting only the
+  // MESSAGE left the secret in the structured result — which is what actually
+  // travels into transcripts and logs (codex, and my own test asserted the
+  // narrower claim while believing the wider one).
+  //
+  // The entry stays identifiable: only the userinfo is masked, so the host and
+  // path a reader matches on are untouched.
+  return { action, item: redactUrlCredentials(item), status, message };
 }
 
 /**

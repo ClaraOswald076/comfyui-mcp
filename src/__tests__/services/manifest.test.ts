@@ -1040,6 +1040,38 @@ describe("applyManifest", () => {
     expect(msg).toMatch(/EXTERNALLY MANAGED/);
     expect(msg).not.toMatch(/s3cr3t-token/);
     expect(msg).not.toMatch(/Command failed:/);
+    // THE WHOLE RESULT, not just the message. `item` echoes the manifest entry
+    // verbatim, so asserting only on `message` claimed more than it checked —
+    // the structured result is what travels into transcripts and logs.
+    expect(JSON.stringify(result)).not.toMatch(/s3cr3t-token/);
+    // ...and the entry is still identifiable by host and path.
+    expect(result.results[0].item).toMatch(/example\.invalid\/pkg-1\.0/);
+  });
+
+  it("redacts a password containing '@' and one sitting past the output clip", async () => {
+    // Two ways a redaction can look right and not be (codex P1):
+    //   - the pattern stopping at the FIRST '@' when the password contains one;
+    //   - clipping the carried output BEFORE redacting, severing the '@' the
+    //     pattern anchors on so a secret near the cut survives.
+    const SPEC = "https://ci:alpha@beta-s3cr3t@example.invalid/pkg-1.0.whl";
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      const probesUv = IS_WIN
+        ? cmd === "where" && args[0] === "uv"
+        : cmd === "uv" && args[0] === "--version";
+      if (probesUv) throw new Error("no uv");
+      if (args[0] === "-m" && args[1] === "pip") {
+        throw Object.assign(new Error("pip failed"), {
+          // Filler pushes the credential past the 1200-char clip boundary.
+          stderr: `${PEP668}\n${"x".repeat(1250)}\nLooking in: ${SPEC}`,
+        });
+      }
+      return "ok";
+    });
+
+    const result = await applyManifest({ manifest: { pip: [SPEC] } });
+
+    expect(JSON.stringify(result)).not.toMatch(/s3cr3t/);
+    expect(JSON.stringify(result)).not.toMatch(/alpha@beta/);
   });
 
   it("still surfaces an ORDINARY pip failure as itself (#1508)", async () => {
