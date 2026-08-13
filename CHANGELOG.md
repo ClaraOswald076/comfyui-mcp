@@ -4,6 +4,42 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.35
+
+### Fixed
+
+- **An orchestrator that never finishes starting no longer lingers silently (#1524).**
+  A respawned instance was found alive for hours holding no listening ports at all,
+  while an older one still owned them. Nothing was wrong from the sidebar's point of
+  view, and nothing reported a problem -- the process simply sat there, burning a slot
+  and making "which one is the orchestrator?" ambiguous for anything that looks by
+  process name.
+
+  Failing to claim the port was already handled: that path retries, tries to take the
+  port over, and exits with a clear message. A process holding NO port never got that
+  far, so there was nothing to catch it. There is now a deadline covering startup
+  itself: if the bridge port has not been claimed within the window, the process says
+  why and exits instead of staying. It names the process holding the port when it can
+  identify one -- which is also when "your other copy is on an older version" becomes
+  worth saying -- and says plainly that the stall is earlier than the port when nothing
+  is holding it.
+
+  Tunable with `COMFYUI_MCP_STARTUP_DEADLINE_MS` for a genuinely slow machine, and a
+  value outside a sane range falls back to the default rather than being taken
+  literally: a number large enough to overflow, or smaller than a millisecond, would
+  otherwise be rounded into an immediate exit -- the guard causing the very outage it
+  exists to prevent.
+
+  Deliberately scoped: this catches a startup that hangs waiting on something. It
+  cannot catch one wedged in a tight loop with the event loop blocked, and the code
+  says so rather than implying otherwise.
+
+- **A misleading warning when the panel port is already taken (#1524).** It claimed the
+  session would keep working with only `panel_*` unavailable. No such mode exists -- the
+  process does not continue without that port -- and the sentence sent this session's
+  own debugging down a false path within minutes. It now reports what was actually
+  observed and leaves the outcome to the code that decides it.
+
 ## 0.51.34
 
 ### Fixed
