@@ -996,11 +996,24 @@ export class DownloadProgressSnapshots {
  * ports at all never got that far — it hung EARLIER, so any guard wrapped around
  * the bind itself would miss it.
  *
- * Hence a deadline over the whole of startup, armed before anything can block
- * and disarmed only once the port is actually held. It does not care where the
- * hang is, which is the point: the failure it prevents is not "bind failed" but
- * "we never found out", and the reporter's own framing is that silently staying
- * alive with zero bound ports is the worst of the available outcomes.
+ * Hence a deadline armed as early as this function runs and disarmed only once
+ * the port is actually held. It does not care WHERE the hang is, which is the
+ * point: the failure it prevents is not "bind failed" but "we never found out",
+ * and the reporter's framing is that silently staying alive with zero bound ports
+ * is the worst of the available outcomes.
+ *
+ * WHAT IT DOES NOT COVER, because an earlier draft of this comment claimed "the
+ * whole of startup" and that was false (codex):
+ *
+ *   - anything before `boot.ts` finishes dynamically importing this module — the
+ *     timer does not exist yet;
+ *   - a SYNCHRONOUS stall anywhere, which no timer can interrupt, because the
+ *     event loop it would fire on is the one that is blocked.
+ *
+ * So this closes the async-hang shape of the report and cannot close the
+ * synchronous one. If a portless process is ever seen again with this in place,
+ * that difference is the first thing to check, and it is written down here so the
+ * next reader does not have to rediscover it.
  *
  * Generous by default (90s) because a cold `npx` start on a slow disk is
  * legitimately slow, and env-tunable for pathological machines. Exits non-zero so
@@ -1012,8 +1025,16 @@ export function armStartupDeadline(
 ): () => void {
   const exit = deps.exit ?? ((code: number) => process.exit(code));
   const findIncumbent = deps.incumbent ?? pidListeningOnPort;
+  // CLAMPED, not merely "positive and finite" (codex). Node coerces a
+  // sub-millisecond delay AND anything past the 32-bit signed limit to 1ms — so
+  // `0.5`, or a large number typed by someone trying to RAISE the deadline, would
+  // fire almost instantly and kill every healthy startup. A guard whose escape
+  // hatch can cause the outage it prevents is worse than no guard, so out-of-range
+  // values fall back to the default rather than being honoured literally.
   const raw = Number(process.env.COMFYUI_MCP_STARTUP_DEADLINE_MS);
-  const ms = Number.isFinite(raw) && raw > 0 ? raw : 90_000;
+  const MIN_MS = 1_000;
+  const MAX_MS = 2_147_483_647; // Node's setTimeout ceiling
+  const ms = Number.isFinite(raw) && raw >= MIN_MS && raw <= MAX_MS ? Math.floor(raw) : 90_000;
   const timer = setTimeout(() => {
     const incumbent = findIncumbent(port);
     logger.error(

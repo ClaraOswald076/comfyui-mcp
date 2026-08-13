@@ -2037,11 +2037,18 @@ export class UiBridge {
         // tries to reclaim the port and then `process.exit(1)`s. So the sentence
         // described a mode the code cannot enter, and anyone diagnosing a
         // portless orchestrator against it was reading a fiction.
+        // Careful with what this promises. The first rewrite of this line said the
+        // orchestrator "will now try to take the port over" — also false, because
+        // tryReclaimBridgePort refuses immediately unless BOTH stdio streams are
+        // TTYs, so a non-interactive launch goes straight to the exit. Two false
+        // sentences in a row here is a fair sign that this path is easier to
+        // describe wrongly than rightly, so this one says only the part that holds
+        // in every case: the process does not continue without the port.
         logger.warn(
           `[ui-bridge] port ${this.port} still in use after ${UiBridge.MAX_BIND_ATTEMPTS} attempts — ` +
-            `another comfyui-mcp session almost certainly owns the panel. The orchestrator will ` +
-            `now try to take the port over, and will EXIT if it cannot: it does not continue in a ` +
-            `panel-less mode.`,
+            `another comfyui-mcp session almost certainly owns the panel. This process will EXIT ` +
+            `rather than run without it (an INTERACTIVE launch is offered the chance to take the ` +
+            `port over first; a non-interactive one is not).`,
         );
         this.readyResolve?.(false);
         this.readyResolve = null;

@@ -120,7 +120,11 @@ describe("the startup deadline (#1524)", () => {
   it("ignores a nonsense override rather than disabling itself", () => {
     // `0`, a negative, or a word must not silently switch the guard off — that
     // would reintroduce exactly the silent-zombie state, via a typo.
-    for (const bad of ["0", "-1", "soon", ""]) {
+    // `0.5` and anything past Node's 32-bit setTimeout ceiling both COERCE TO 1ms
+    // — so a value typed while trying to RAISE the deadline would fire almost
+    // instantly and kill every healthy startup. An escape hatch that can cause the
+    // outage it exists to prevent is worse than none (codex).
+    for (const bad of ["0", "-1", "soon", "", "0.5", "999", "2147483648", "1e30"]) {
       exits = [];
       process.env.COMFYUI_MCP_STARTUP_DEADLINE_MS = bad;
       const disarm = armStartupDeadline(PORT, { exit, incumbent: () => undefined });
