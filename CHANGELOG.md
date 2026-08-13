@@ -4,6 +4,40 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.23
+
+### Fixed
+
+- **`check_runtime` no longer calls a paid third-party service node "local -- no paid credits"
+  (#1483).** A workflow containing `NanoBananaPro_fal` -- a node whose whole job is to bill a
+  fal.ai endpoint -- was reported as `runtime:"local"`, `usesApiNodes:false`, with the guidance
+  "every node runs on the user's own GPU, no paid credits". Being INSTALLED is what made it
+  confidently wrong: the node is in `/object_info`, so it was never "unknown", and
+  known-and-unmarked resolved to local.
+
+  Measured against a real 4304-node `/object_info` rather than assumed: not one of the 3464
+  custom-node-registered classes carries ComfyUI's `api_node` marker -- all 220 marked nodes are
+  core. So the partner marker can never fire for a third-party pack, and this was a category-wide
+  hole that fal.ai happened to expose.
+
+  Two signals now catch it, because neither covers the case alone: an enumerated registry of packs
+  known to bill a remote service (matched on the pack's module path AND its category, so cloning it
+  into a differently-named folder does not slip past), and any node declaring a service credential
+  input -- the general catch for packs nobody has enumerated. A pack's own local helpers stay free:
+  `FAL/Utils` resizes an image before upload and spends nothing.
+
+  The tempting one-line fix -- flag anything taking an `api_key` -- was rejected because it misses
+  the reported node: that pack reads its key from the environment, so its nodes expose only
+  `prompt`/`aspect_ratio`/`seed`. Equally rejected: treating every custom node as unclassifiable,
+  which would flag 3464 of 4304 classes and make the warning meaningless.
+
+  These stay OUT of the Comfy partner-node list, which feeds tools that hand out schemas assuming
+  Comfy's own auth model -- a fal.ai node is paid, but it is not a partner node. They ride a
+  separate `externalApiNodes` field that counts the same way for the verdict, and the guidance now
+  names WHO bills (e.g. fal.ai, on the user's own account with them, not Comfy api credits) so a
+  reader who checks their Comfy balance and finds it untouched does not conclude the warning was
+  wrong.
+
 ## 0.51.22
 
 ### Fixed
@@ -351,6 +385,14 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.51.23] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- a paid third-party service node is not "local, no paid credits" (#1501)
+
 
 ## [0.51.22] - 2026-08-12
 
