@@ -45,15 +45,20 @@ export function normalizeInstallPathEnv(
   } = {},
 ): { path: string | undefined; changed: boolean } {
   if (typeof raw !== "string") return { path: undefined, changed: false };
-  const exists =
-    opts.exists ??
-    ((p: string): boolean => {
-      try {
-        return existsSync(p);
-      } catch {
-        return false;
-      }
-    });
+
+  let v = raw.trim();
+  const first = v[0];
+  if ((first === '"' || first === "'") && v.length >= 2 && v[v.length - 1] === first) {
+    v = v.slice(1, -1).trim();
+  }
+
+  // NOTHING TO REPAIR — return without touching the disk (codex P2). This is the
+  // overwhelmingly common case: a well-formed value, on every call, at five
+  // readers, some of them hot. Probing first would add synchronous I/O to what
+  // used to be a plain environment read, and on a UNC/network root that stat can
+  // block. The existence question only ever matters when the repair would
+  // actually change something, so it is asked only then.
+  if (v === raw) return { path: raw === "" ? undefined : raw, changed: false };
 
   // THE GUARD THAT MAKES THIS NON-DESTRUCTIVE (codex P1). Trailing whitespace and
   // quote characters are LEGAL in POSIX filenames, and a directory literally named
@@ -66,24 +71,32 @@ export function normalizeInstallPathEnv(
   // does not name anything. This still fixes the report: measured on win32,
   // existsSync("<root> ") is false and join("<root> ", "main.py") does not resolve
   // either, which is precisely why every install-root check missed.
+  //
+  // The TOCTOU here is inherent to any existence-based fallback and is benign in
+  // both directions: a path created after a failed probe gets normalized away (it
+  // did not exist when we were asked), and one deleted after a successful probe is
+  // returned as given and fails downstream exactly as it would have before.
+  const exists =
+    opts.exists ??
+    ((p: string): boolean => {
+      try {
+        return existsSync(p);
+      } catch {
+        return false;
+      }
+    });
   if (raw !== "" && exists(raw)) return { path: raw, changed: false };
 
-  let v = raw.trim();
-  const first = v[0];
-  if ((first === '"' || first === "'") && v.length >= 2 && v[v.length - 1] === first) {
-    v = v.slice(1, -1).trim();
-  }
   // An all-whitespace value normalizes to "" — treated as UNSET, matching the
   // existing `||` truthy checks at the call sites (a set-but-empty COMFYUI_PATH=
   // already means "unset" here).
   const path = v === "" ? undefined : v;
-  const changed = v !== raw;
   // Warned HERE rather than by each caller, so a new ingestion point cannot get
   // the normalization while silently forgetting to report it — and so every call
   // site is the same single expression, which is what lets the source gate demand
   // the raw read be consumed inline.
-  if (changed && opts.warn !== false) warnInstallPathWasMalformed(raw, path, opts.varName);
-  return { path, changed };
+  if (opts.warn !== false) warnInstallPathWasMalformed(raw, path, opts.varName);
+  return { path, changed: true };
 }
 
 /** Warn ONCE per distinct malformed value — the retarget path re-resolves on

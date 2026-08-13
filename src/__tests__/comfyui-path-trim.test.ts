@@ -82,6 +82,30 @@ describe("normalizeInstallPathEnv (#1512)", () => {
     expect(out.path).toBe("/opt/ComfyUI");
     expect(out.changed).toBe(false);
   });
+
+  it("does NO filesystem probe for a value it cannot change (codex P2)", () => {
+    // Five readers call this, some of them hot, and it replaced a plain env read.
+    // A stat per call would be new synchronous I/O on every one — and on a UNC or
+    // network root that call can block. The existence question only matters when
+    // the repair would change something, so it must not be asked otherwise.
+    // Counted, because "we only probe when needed" is the kind of claim that
+    // silently stops being true.
+    const probed: string[] = [];
+    const spy = (p: string) => {
+      probed.push(p);
+      return false;
+    };
+
+    normalizeInstallPathEnv("/opt/ComfyUI", { exists: spy, warn: false });
+    normalizeInstallPathEnv("", { exists: spy, warn: false });
+    normalizeInstallPathEnv(undefined, { exists: spy, warn: false });
+    expect(probed).toEqual([]);
+
+    // ...and exactly one probe when it WOULD change the value, since that is the
+    // only case where the answer decides anything.
+    normalizeInstallPathEnv("/opt/ComfyUI ", { exists: spy, warn: false });
+    expect(probed).toEqual(["/opt/ComfyUI "]);
+  });
 });
 
 describe("the malformed value is REPORTED, not silently repaired (#1512)", () => {
@@ -206,17 +230,27 @@ describe("NO reader of COMFYUI_PATH consumes it raw (#1512)", () => {
         if (trimmed.startsWith("*") || trimmed.startsWith("/*") || trimmed.startsWith("//")) return;
         const code = line.replace(/\/\/.*$/, "");
         if (!/process\.env\.COMFYUI_PATH/.test(code)) return;
-        totalReads++;
-        // INLINE consumption, not "a normalizer appears nearby" (codex P2). A
-        // proximity rule passes when the normalized result is discarded and the
-        // raw variable is forwarded anyway — which is the exact bug, with a
-        // normalizer call sitting next to it as decoration. Requiring the read to
-        // BE an argument means the raw value has no name to be forwarded under.
-        const consumedInline =
-          /normalizeInstallPathEnv\(\s*process\.env\.COMFYUI_PATH/.test(code) ||
-          /resolveComfyUIPath\(\s*process\.env\.COMFYUI_PATH/.test(code);
-        if (consumedInline) return;
-        offenders.push(`${file.replace(SRC, "src")}:${i + 1}  ${line.trim()}`);
+        // EVERY occurrence on the line must be an argument — counted, not merely
+        // "the line contains a safe-looking call" (codex P2, twice).
+        //
+        // A proximity rule passes when the normalized result is discarded and the
+        // raw variable is forwarded anyway. A line-level rule passes on
+        //
+        //     const p = normalizeInstallPathEnv(process.env.COMFYUI_PATH).path; f(process.env.COMFYUI_PATH);
+        //
+        // because the first occurrence exempts the second. Comparing counts is
+        // what actually encodes "no raw read survives": the guarded tally has to
+        // account for all of them.
+        const occurrences = (code.match(/process\.env\.COMFYUI_PATH/g) ?? []).length;
+        const guarded = (
+          code.match(/(?:normalizeInstallPathEnv|resolveComfyUIPath)\(\s*process\.env\.COMFYUI_PATH/g) ??
+          []
+        ).length;
+        totalReads += occurrences;
+        if (guarded === occurrences) return;
+        offenders.push(
+          `${file.replace(SRC, "src")}:${i + 1}  (${guarded}/${occurrences} consumed)  ${line.trim()}`,
+        );
       });
     }
 
