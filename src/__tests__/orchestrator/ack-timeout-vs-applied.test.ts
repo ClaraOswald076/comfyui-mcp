@@ -88,12 +88,16 @@ function bridge(opts: {
           );
         }
         if (opts.exitReply === "acked-error-timeout-worded") {
-          // An ACKED executor error that OPENS with the bridge's preamble. The
-          // loose predicate accepted it on the start anchor alone; the canonical
-          // one does not, because the frozen-tab clause never follows.
+          // codex round 2's exact case, and the reason text was abandoned as the
+          // discriminator: an ACKED executor error carrying the bridge's WHOLE
+          // canonical sentence verbatim, then continuing. ACKed panel errors enter
+          // as arbitrary `msg.error` text, so any sentence the bridge can write, a
+          // panel error can also contain — no regex separates these two. It is NOT
+          // markReplyTimeout-tagged, which is the difference that actually exists.
           throw new Error(
-            `Panel tab ${TAB} did not reply to "graph_exit_subgraph" within 15000 ms, so the ` +
-              `subgraph owner could not be resolved and nothing was applied.`,
+            `Panel tab ${TAB} did not reply to "graph_exit_subgraph" within 15000 ms — the ` +
+              `ComfyUI tab may be backgrounded or frozen. Reported by the subgraph owner walk: ` +
+              `nothing was applied.`,
           );
         }
         if (opts.loseTabAfterExit) tabGone = true;
@@ -249,13 +253,19 @@ describe("an unacknowledged exit is settled by a read, not by a guess (#1468)", 
     expect(out.text).not.toMatch(/canvas at the ROOT graph/);
   });
 
-  it("does not settle an ACKED error that merely OPENS with the preamble (codex P1)", async () => {
-    // Without a receipt to correlate against, the predicate alone decides whether
-    // an error becomes a success — so it must require the bridge's whole no-reply
-    // sentence, not just its opening. This message starts identically and then
-    // says nothing was applied.
+  it("does not settle an ACKED error reproducing the canonical sentence VERBATIM (codex P1)", async () => {
+    // The decisive test for choosing the bridge's tag over message text. This
+    // error is textually indistinguishable from a real no-reply for the whole
+    // length of the canonical sentence — every regex that admits the genuine
+    // timeout admits this too. It must still be refused, and it is, because the
+    // bridge never tagged it: the tab ANSWERED, with a failure.
     const out = await runTool("panel_exit_subgraph", {}, { exitReply: "acked-error-timeout-worded" });
 
+    // The premise really holds — if this stopped matching the canonical opening,
+    // the test would pass while no longer testing the collision it exists for.
+    expect(out.text).toMatch(
+      /did not reply to "graph_exit_subgraph" within 15000 ms — the ComfyUI tab may be backgrounded or frozen/,
+    );
     expect(sent.map((s) => s.cmd)).not.toContain("graph_query");
     expect(out.isError).toBe(true);
     expect(out.text).toMatch(/nothing was applied/);

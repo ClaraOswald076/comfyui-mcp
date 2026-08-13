@@ -2060,38 +2060,42 @@ function isAckTimeout(res: ToolResult): boolean {
 }
 
 /**
- * #1468 — the STRICTER sibling of {@link isAckTimeout}, for callers that have no
- * receipt to correlate against.
+ * #1468 — carry the bridge's AUTHORITATIVE reply-timeout marker across the
+ * error → ToolResult conversion in `ctx.call`.
  *
- * `isAckTimeout` is deliberately loose at the tail: it accepts anything starting
- * with the preamble. That is safe for `workflow_open` because a match there only
- * buys entry to a recovery gated on the panel's #514 receipt matching this
- * request's exact rid — the predicate opens a door, the receipt decides.
- * `panel_exit_subgraph` has no such receipt: a match plus one root-looking read
- * is by itself enough to promote an error to success (codex P1). A predicate
- * doing that much work has to be tight, so this one additionally requires the
- * bridge's canonical frozen-tab clause and the literal single space in
- * `within <N> ms` — both MEASURED against a live UiBridge, not transcribed.
+ * Two codex rounds rejected deciding this from message TEXT, and both were right.
+ * `isAckTimeout`'s looseness is safe for `workflow_open` because a match there
+ * only opens a door — the panel's #514 receipt, correlated to the request's exact
+ * rid, is what actually decides. A caller with no receipt has the predicate doing
+ * all the work: match plus one root-looking read promotes an error to success. No
+ * amount of regex tightening fixes that, because ACKED panel errors arrive as
+ * ARBITRARY `msg.error` text (ui-bridge) and `ctx.call` flattens both kinds into
+ * the same text-only result — so any sentence the bridge can write, a panel error
+ * can also contain.
  *
- * That closes the reclassification path: an ACKED executor error would have to
- * reproduce the bridge's whole no-reply sentence, not merely open with it. The
- * tail stays open on purpose — the mutating-delivery disclosure and the appended
- * `retry_of` token both follow it, and anchoring the end would silently switch
- * this off for exactly the real timeouts it exists to catch.
- *
- * The command name is escaped even though every current bridge command is
- * `[a-z_]+`: this builds a regex from a caller-supplied string, and a future
- * command carrying a metacharacter would widen the match rather than fail loudly
- * — the direction that turns a guard into a rubber stamp.
+ * `markReplyTimeout`/`isReplyTimeoutTagged` already answer the question exactly,
+ * on the error object, at the only place that KNOWS: the bridge. The information
+ * was simply being dropped in translation. This preserves it as a non-enumerable
+ * symbol so the result's JSON payload is byte-identical and nothing downstream
+ * can observe it by accident.
  */
-function isCanonicalAckTimeoutFor(res: ToolResult, cmdName: string): boolean {
-  if (!res?.isError) return false;
-  const text = res?.content?.find((c) => c.type === "text")?.text ?? "";
-  const escaped = cmdName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(
-    `^(?:Error: )?Panel tab .+? did not reply to "${escaped}" within \\d+ ms — ` +
-      `the ComfyUI tab may be backgrounded or frozen`,
-  ).test(text);
+const REPLY_TIMEOUT_RESULT = Symbol("panel.replyTimeoutResult");
+
+function carryReplyTimeoutMark(err: unknown, res: ToolResult): ToolResult {
+  if (!isReplyTimeoutTagged(err)) return res;
+  Object.defineProperty(res, REPLY_TIMEOUT_RESULT, {
+    value: true,
+    enumerable: false,
+    configurable: true,
+  });
+  return res;
+}
+
+/** True only for a ToolResult that `ctx.call` produced from a BRIDGE-TAGGED
+ *  reply timeout — the tab was reached and never answered. An acked executor
+ *  error can never carry this, whatever its text says. */
+function isReplyTimeoutResult(res: ToolResult): boolean {
+  return res?.isError === true && (res as Record<symbol, unknown>)[REPLY_TIMEOUT_RESULT] === true;
 }
 
 // ---- panel_exit_subgraph settle-after-ack-timeout (#1468) ------------------
@@ -6812,11 +6816,14 @@ export function makePanelToolCtx(
         (dispatchOutcomeOf(err) === true || isReplyTimeoutTagged(err))
       ) {
         const cause = err instanceof Error ? err.message : String(err);
-        return fail(
-          `${cause}\n\nTo retry this exact mutation, re-issue identical args plus retry_of:"${dispatchedRid}"; otherwise call normally.`,
+        return carryReplyTimeoutMark(
+          err,
+          fail(
+            `${cause}\n\nTo retry this exact mutation, re-issue identical args plus retry_of:"${dispatchedRid}"; otherwise call normally.`,
+          ),
         );
       }
-      return fail(err);
+      return carryReplyTimeoutMark(err, fail(err));
     }
   };
   // Human-in-the-loop confirmation for a DESTRUCTIVE op: render a yes/no card in
@@ -11417,7 +11424,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // reasoned about this exact uncertainty and prescribes its own next step,
         // so re-deciding it from out here would overwrite a better-informed verdict
         // with a worse-informed one.
-        if (!isCanonicalAckTimeoutFor(res, "graph_exit_subgraph")) return res;
+        if (!isReplyTimeoutResult(res)) return res;
         return settleExitSubgraphAfterAckTimeout(ctx, res);
       },
     ),
