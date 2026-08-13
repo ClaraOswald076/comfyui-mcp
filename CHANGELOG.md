@@ -4,6 +4,38 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.25
+
+### Fixed
+
+- **A very large render can be inspected again -- `get_image` no longer inlines an
+  unbounded image (#1495).** An 8504x17008 output encoded to about 267 MB and exceeded the
+  caller's 64 MB message limit, so a render that had saved perfectly could not be looked at
+  at all; the reporter added a low-resolution preview branch to their own workflow to
+  inspect their own output. The only check before inlining was a media-type test that sent
+  video and audio to disk -- there was no size budget of any kind.
+
+  The saved file is untouched. Only what goes back over the wire is capped, and when it is,
+  the reply says so: the preview reports the true original dimensions and states plainly
+  that fine detail, small text and pixel-level artefacts must not be judged from it. A
+  silently downscaled image would be a worse failure than the original bug, because an
+  agent reads detail off it and answers confidently.
+
+  The budget is on the ENCODED size and the scale is MEASURED rather than predicted --
+  base64 inflates by a third and PNG size swings by an order of magnitude with content, so
+  a pixel cap alone still overshoots on exactly the images that matter. Decoding is bounded
+  by a MEMORY budget computed from the file's own depth and channel count, not by a pixel
+  count: a pixel limit is the wrong unit for protecting memory, which is how a 16-bit image
+  can pass a generous-looking ceiling and still need over a gigabyte to open.
+
+  Everything else about the preview is disclosed too: whether the source format could have
+  held animation (in which case you are seeing one frame), and whether colour depth or
+  colour space changed. A preview that cannot be built at all never destroys the fetch --
+  the reply keeps the saved path and says why, and says honestly when the save ALSO failed
+  and the image is not available locally either.
+
+  `max_preview_bytes` and `max_preview_dimension` let a caller tighten both bounds.
+
 ## 0.51.24
 
 ### Fixed
@@ -410,6 +442,14 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.51.25] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- bound the inline image so a huge render stays inspectable (#1505)
+
 
 ## [0.51.24] - 2026-08-12
 
