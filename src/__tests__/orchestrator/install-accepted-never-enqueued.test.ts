@@ -307,6 +307,35 @@ describe("an install the Manager accepted and dropped says so (#1129)", () => {
     expect(textOf(res)).toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
   });
 
+  it("does not blame a git URL on an id-only install (codex P2)", async () => {
+    // panel_install_node also accepts a registry `id`. For an id-only request no
+    // URL was submitted and none is retained, so "the Manager dropped a git URL"
+    // is an unsupported cause and "install it from its git URL" is an instruction
+    // the caller cannot follow. Same observation, different remedy.
+    const ctx = makePanelToolCtx(bridge({}), TAB, new WorkflowTargetStore());
+    const def = buildPanelToolDefs().find((d) => d.name === "panel_install_node");
+    const res: ToolResult = await def!.handler({ id: "comfyui-kjnodes" } as never, ctx);
+    const text = textOf(res);
+
+    // The OBSERVATION is unchanged — that part is not about how it was requested.
+    expect(text).toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
+    expect(text).toMatch(/cleared by a queue RESET/);
+    // ...but the git-URL cause and remedy must not appear.
+    expect(text).not.toMatch(/accepting a git URL/);
+    expect(text).not.toMatch(/install it from its git URL/);
+    // It names what they actually have instead.
+    expect(text).toMatch(/pass `repository` rather than `id`/);
+  });
+
+  it("still blames the git URL when one WAS submitted", async () => {
+    // The other half, so the branch above cannot quietly suppress the git-URL
+    // guidance for the case this issue was actually filed about.
+    const out = await install({});
+
+    expect(out.text).toMatch(/accepting a git URL/);
+    expect(out.text).toMatch(/install it from its git URL/);
+  });
+
   it("claims nothing when the queue read itself fails", async () => {
     const out = await install({ queueErrors: true });
 

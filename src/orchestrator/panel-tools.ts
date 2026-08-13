@@ -2298,8 +2298,9 @@ function panelIncarnation(ctx: PanelToolCtx, tabId: string): string | undefined 
 async function settleDroppedEnqueue(
   ctx: PanelToolCtx,
   res: ToolResult,
-  dispatch: { tab: string; incarnation: string | undefined },
+  dispatch: { tab: string; incarnation: string | undefined; fromGitUrl: boolean },
 ): Promise<ToolResult> {
+  const { fromGitUrl } = dispatch;
   if (res.isError) return res;
   if (!claimsQueued(parseToolResultJson(res))) return res;
 
@@ -2328,16 +2329,28 @@ async function settleDroppedEnqueue(
     `WARNING — THE QUEUE DOES NOT HAVE THIS TASK. The Manager accepted the install above, but a ` +
       `read taken immediately afterwards, on that same panel, reports an IDLE queue holding no ` +
       `tasks at all (total_count, done, in_progress all 0).\n\n` +
-      `WHAT THAT DOES AND DOES NOT MEAN. The likely reading is legacy ComfyUI-Manager 3.x ` +
-      `accepting a git URL it does not recognise and dropping it silently (#1129) — there ` +
-      `"queued" is an acknowledgement, not a receipt. But it is NOT proof: those counters are ` +
+      `WHAT THAT DOES AND DOES NOT MEAN. "queued" is the Manager's acknowledgement, not a ` +
+      (fromGitUrl
+        ? `receipt — and the likely reading here is legacy ComfyUI-Manager 3.x accepting a git URL ` +
+          `it does not recognise and dropping it silently (#1129). `
+        : `receipt. `) +
+      `But it is NOT proof: those counters are ` +
       `also cleared by a queue RESET, which other operations in this server issue, so an install ` +
       `that really ran can read this way if a reset landed in between.\n\n` +
       `SO CHECK, do not assume either way: call panel_list_nodes and see whether the pack is ` +
       `actually there. Do not restart on the assumption it installed, and do not reinstall on ` +
       `the assumption it did not.\n\n` +
-      `IF IT IS ABSENT: install it from its git URL with the headless install_custom_node ` +
-      `(action:"install", source:"git"), which clones directly and verifies a real pack landed. ` +
+      (fromGitUrl
+        ? `IF IT IS ABSENT: install it from its git URL with the headless install_custom_node ` +
+          `(action:"install", source:"git"), which clones directly and verifies a real pack ` +
+          `landed. `
+        : // No URL was submitted and none is retained, so "install it from its git
+          // URL" would be an instruction the caller cannot follow (codex P2). Name
+          // what they actually have: a registry id, and the tool that verifies.
+          `IF IT IS ABSENT: retry through the headless install_custom_node ` +
+          `(action:"install"), which verifies the pack really landed rather than trusting the ` +
+          `queue. If this pack is not in the Manager's registry at all, install it from its ` +
+          `repository URL instead — pass \`repository\` rather than \`id\`. `) +
       `A plain retry here is likely to be dropped the same way. This tool cannot clone for you — ` +
       `it drives whatever ComfyUI the panel is bound to, which need not be this machine.`,
   );
@@ -11684,6 +11697,9 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         const dispatch = {
           tab: ctx.tabId,
           incarnation: panelIncarnation(ctx, ctx.tabId),
+          // Whether a repository URL was actually submitted. An id-only install
+          // has no URL to be told to use (codex P2).
+          fromGitUrl: typeof cmdArgs.repository === "string" && cmdArgs.repository.length > 0,
         };
         const res = await ctx.call(
           { cmd: "nodes_install", ...cmdArgs },
