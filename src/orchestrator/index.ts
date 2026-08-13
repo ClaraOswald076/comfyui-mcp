@@ -986,6 +986,75 @@ export class DownloadProgressSnapshots {
   }
 }
 
+/**
+ * #1524 — a startup that never finishes must not become a silent resident.
+ *
+ * A respawn was observed alive for hours holding NO listening ports, while an
+ * older instance owned 9180/9181/9183. That is not the bind-failure path: that
+ * one is bounded (five attempts, then `whenReady()` resolves false), tries to
+ * reclaim the port, and exits non-zero with a clear message. A process with no
+ * ports at all never got that far — it hung EARLIER, so any guard wrapped around
+ * the bind itself would miss it.
+ *
+ * Hence a deadline armed as early as this function runs and disarmed only once
+ * the port is actually held. It does not care WHERE the hang is, which is the
+ * point: the failure it prevents is not "bind failed" but "we never found out",
+ * and the reporter's framing is that silently staying alive with zero bound ports
+ * is the worst of the available outcomes.
+ *
+ * WHAT IT DOES NOT COVER, because an earlier draft of this comment claimed "the
+ * whole of startup" and that was false (codex):
+ *
+ *   - anything before `boot.ts` finishes dynamically importing this module — the
+ *     timer does not exist yet;
+ *   - a SYNCHRONOUS stall anywhere, which no timer can interrupt, because the
+ *     event loop it would fire on is the one that is blocked.
+ *
+ * So this closes the async-hang shape of the report and cannot close the
+ * synchronous one. If a portless process is ever seen again with this in place,
+ * that difference is the first thing to check, and it is written down here so the
+ * next reader does not have to rediscover it.
+ *
+ * Generous by default (90s) because a cold `npx` start on a slow disk is
+ * legitimately slow, and env-tunable for pathological machines. Exits non-zero so
+ * a supervisor restarts rather than inheriting a half-alive process.
+ */
+export function armStartupDeadline(
+  port: number,
+  deps: { exit?: (code: number) => never; incumbent?: (p: number) => number | undefined } = {},
+): () => void {
+  const exit = deps.exit ?? ((code: number) => process.exit(code));
+  const findIncumbent = deps.incumbent ?? pidListeningOnPort;
+  // CLAMPED, not merely "positive and finite" (codex). Node coerces a
+  // sub-millisecond delay AND anything past the 32-bit signed limit to 1ms — so
+  // `0.5`, or a large number typed by someone trying to RAISE the deadline, would
+  // fire almost instantly and kill every healthy startup. A guard whose escape
+  // hatch can cause the outage it prevents is worse than no guard, so out-of-range
+  // values fall back to the default rather than being honoured literally.
+  const raw = Number(process.env.COMFYUI_MCP_STARTUP_DEADLINE_MS);
+  const MIN_MS = 1_000;
+  const MAX_MS = 2_147_483_647; // Node's setTimeout ceiling
+  const ms = Number.isFinite(raw) && raw >= MIN_MS && raw <= MAX_MS ? Math.floor(raw) : 90_000;
+  const timer = setTimeout(() => {
+    const incumbent = findIncumbent(port);
+    logger.error(
+      `[panel-orchestrator] startup did not complete within ${Math.round(ms / 1000)}s and this ` +
+        `process holds no bridge port — exiting rather than lingering with no way to serve panel_* ` +
+        `tools.` +
+        (incumbent
+          ? ` Port ${port} is held by pid ${incumbent}; if that is an older comfyui-mcp, stop it ` +
+            `and start this one again.`
+          : ` Nothing is listening on ${port} either, so the hang is before the bind — please ` +
+            `report this with the last lines above (#1524).`) +
+        ` Raise COMFYUI_MCP_STARTUP_DEADLINE_MS if this machine is legitimately slower than that.`,
+    );
+    exit(1);
+  }, ms);
+  // Never hold the event loop open on this timer's account.
+  timer.unref?.();
+  return () => clearTimeout(timer);
+}
+
 export async function runPanelOrchestrator(): Promise<void> {
   // Crash guard: the orchestrator is a long-lived background process the user
   // can't see. A stray rejection (e.g. a fire-and-forget push to a tab that
@@ -998,6 +1067,13 @@ export async function runPanelOrchestrator(): Promise<void> {
       `[panel-orchestrator] unhandled rejection (ignored): ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`,
     );
   });
+
+  // #1524 — armed HERE, before anything that can block, and disarmed only once
+  // the bridge port is actually held. The port is re-derived rather than passed
+  // in because the deadline has to exist before the block that computes it.
+  const disarmStartupDeadline = armStartupDeadline(
+    Number(process.env.COMFYUI_MCP_BRIDGE_PORT) || 9180,
+  );
   process.on("uncaughtException", (err) => {
     // A synchronous uncaught throw leaves the process in an UNDEFINED state. The
     // old "log + continue" here was a zombie root cause — the orchestrator stayed
@@ -1202,6 +1278,9 @@ export async function runPanelOrchestrator(): Promise<void> {
     );
     process.exit(1);
   }
+  // The port is ours — startup got where it needed to. Everything after this is
+  // long-running work the deadline must not police.
+  disarmStartupDeadline();
 
   // With a pinned pair token, bring the LAN pairing listener up now so a phone's
   // saved URL reconnects across restarts without ever touching the panel. This is
