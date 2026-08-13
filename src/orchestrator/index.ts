@@ -137,7 +137,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { registerAllTools } from "../tools/index.js";
 import { tryInstallRetiredNameRedirect } from "../tools/retired-redirect.js";
-import { isForceRemoteFlagSet, isLoopbackHost, detectLocalComfyUIPath, setComfyuiTarget, onComfyuiTargetChanged, isTargetingLocal, isTargetingLocalOrLan, isTargetingPod, getComfyUIBaseUrl, getLocalComfyuiUrl, rescopeLocalTargetFile, getComfyUIAuthHeaders } from "../config.js";
+import { isForceRemoteFlagSet, isLoopbackHost, detectLocalComfyUIPath, setComfyuiTarget, onComfyuiTargetChanged, isTargetingLocal, isTargetingLocalOrLan, isTargetingPod, getComfyUIBaseUrl, getLocalComfyuiUrl, rescopeLocalTargetFile, getComfyUIAuthHeaders, normalizeInstallPathEnv, warnIfInstallPathWasMalformed } from "../config.js";
 import {
   buildComfyuiMcpEnv,
   comfyuiSecretKeys,
@@ -1308,9 +1308,20 @@ export async function runPanelOrchestrator(): Promise<void> {
   // orchestrator previously read ONLY the env var, so a Desktop user without
   // COMFYUI_PATH always landed in "local install/pack tools limited" even with
   // a local install the MCP itself could find.
-  const envComfyuiPath = process.env.COMFYUI_PATH;
+  // #1512 — the SECOND ingestion point, and the one a fix confined to
+  // resolveComfyUIPath would have missed: this reads the env var directly, and
+  // what it produces is handed to the spawn env builders and to
+  // resolveComfyuiPathForTarget. A trailing space here does not merely fail a
+  // check locally — it is passed on to every agent this orchestrator starts.
+  // Same normalizer as config.ts so the two can never drift apart, which is the
+  // shape of the original bug (panel stripped it, orchestrator did not).
+  const rawEnvComfyuiPath = process.env.COMFYUI_PATH;
+  const { path: envComfyuiPath } = normalizeInstallPathEnv(rawEnvComfyuiPath);
+  warnIfInstallPathWasMalformed(rawEnvComfyuiPath, envComfyuiPath);
   // `||` not `??`: a set-but-empty COMFYUI_PATH= means "unset" (the headless
   // MCP's config truthy-checks it the same way) — it must not block detection.
+  // normalizeInstallPathEnv already maps a whitespace-only value to undefined,
+  // so "   " now reaches detection too instead of being adopted as a path.
   const localComfyuiPath = envComfyuiPath || detectLocalComfyUIPath();
   const isLoopbackUrl = (u: string): boolean => {
     try {

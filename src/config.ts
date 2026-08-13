@@ -67,6 +67,84 @@ export function looksLikeComfyUIRoot(p: string): boolean {
  * (already a valid root, or no nested root found), so this is a strict no-op for
  * a correctly-installed (non-nested) ComfyUI.
  */
+/**
+ * #1512 — normalize an install-root path arriving from the ENVIRONMENT.
+ *
+ * `COMFYUI_PATH` was consumed exactly as given, so one trailing space made every
+ * install-root check miss and the connected ComfyUI was reported as
+ * undeterminable — 40 minutes after the bad value took effect, at the first
+ * write, with a message that echoed the path but never pointed at the space.
+ *
+ * That value is trivially easy to produce on Windows. `cmd.exe` assigns
+ * everything up to the `&&`, INCLUDING the space before it:
+ *
+ *     cmd /k "set COMFYUI_PATH=E:\...\ComfyUI && comfyui-mcp connect ..."
+ *
+ * so the launcher line people actually paste bakes in a trailing space. The
+ * panel pack already strips this (`__init__.py`); the orchestrator did not, and
+ * the two halves of one product disagreeing is the actual defect.
+ *
+ * Quote stripping is deliberately CONSERVATIVE: only a matched leading+trailing
+ * pair of the SAME character is removed, because that is the paste artifact
+ * (`set COMFYUI_PATH="C:\...\ComfyUI"`). A lone trailing quote is left alone —
+ * `"` is an illegal filename character on Windows but LEGAL on POSIX, so
+ * stripping one unconditionally would corrupt a real path to fix a typo.
+ *
+ * Returns `changed` so callers can SAY the value was malformed rather than
+ * silently repairing it: a launcher that produces a bad value here will produce
+ * one everywhere else too, and silent normalization hides that.
+ */
+export function normalizeInstallPathEnv(raw: string | undefined): {
+  path: string | undefined;
+  changed: boolean;
+} {
+  if (typeof raw !== "string") return { path: undefined, changed: false };
+  let v = raw.trim();
+  const first = v[0];
+  if ((first === '"' || first === "'") && v.length >= 2 && v[v.length - 1] === first) {
+    v = v.slice(1, -1).trim();
+  }
+  // An all-whitespace value normalizes to "" — treated as UNSET, matching the
+  // existing `||` truthy checks at both call sites (a set-but-empty
+  // COMFYUI_PATH= already means "unset" here).
+  return { path: v === "" ? undefined : v, changed: v !== raw };
+}
+
+/** Warn ONCE per distinct malformed value — the retarget path re-resolves on
+ *  every switch, and a warning that repeats on a timer is one people learn to
+ *  scroll past. */
+const warnedMalformedPaths = new Set<string>();
+
+/**
+ * #1512 — say that the value was malformed, at INGESTION, instead of letting it
+ * surface much later as "the models directory could not be determined". The
+ * reporter's own follow-up, and the half that turns a 40-minute-delayed mystery
+ * into an immediate, actionable line.
+ */
+export function warnIfInstallPathWasMalformed(
+  raw: string | undefined,
+  normalized: string | undefined,
+  varName = "COMFYUI_PATH",
+): void {
+  if (typeof raw !== "string" || raw === normalized) return;
+  if (warnedMalformedPaths.has(raw)) return;
+  warnedMalformedPaths.add(raw);
+  console.error(
+    `[comfyui-mcp] WARNING: ${varName} had surrounding whitespace or quotes and was ` +
+      `normalized.\n` +
+      `  as given:   ${JSON.stringify(raw)}\n` +
+      `  using:      ${JSON.stringify(normalized ?? null)}\n` +
+      `  On Windows, \`set ${varName}=<path> && <cmd>\` captures the space BEFORE the \`&&\` — ` +
+      `fix the launcher line, or the same malformed value will reach anything else it starts.`,
+  );
+}
+
+/** Reset the warn-once ledger. Test-only — a module-level Set otherwise leaks
+ *  across cases in the same worker and makes the second assertion vacuous. */
+export function __resetMalformedPathWarnings(): void {
+  warnedMalformedPaths.clear();
+}
+
 export function descendToNestedRoot(p: string, label = "COMFYUI_PATH"): string {
   try {
     if (looksLikeComfyUIRoot(p)) return p;
@@ -249,9 +327,13 @@ export function isLoopbackHost(host: string | undefined): boolean {
  * COMFYUI_PATH env var still wins.
  */
 function resolveComfyUIPath(
-  envPath: string | undefined,
+  rawEnvPath: string | undefined,
   opts: { remoteUrl: boolean; cloud: boolean; remoteHost?: string },
 ): string | undefined {
+  // #1512 — normalize BEFORE the truthy check, so a whitespace-only value falls
+  // through to auto-detection instead of being adopted as a real (unusable) path.
+  const { path: envPath } = normalizeInstallPathEnv(rawEnvPath);
+  warnIfInstallPathWasMalformed(rawEnvPath, envPath);
   if (envPath) {
     if (opts.remoteUrl) {
       console.error(
