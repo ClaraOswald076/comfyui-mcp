@@ -4,6 +4,35 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.21
+
+### Fixed
+
+- **A wrong-canvas refusal on a NEVER-SAVED workflow is no longer a dead end (#1480).** The
+  `root-workflow-uuid-mismatch` guard tells the caller to re-open the tab with
+  `panel_open_workflow(<path>)`. A tab that has never been saved has no path -- the workflow list
+  reports `path: null, filename: null` for it, because ComfyUI reuses the "Unsaved Workflow" title
+  across unsaved tabs -- so the reporter passed the tab's TITLE, got "no workflow matching", and
+  found every other documented exit closed too: reload refuses while unsaved, save refuses under
+  this same guard. The agent could read the user's canvas and change nothing, and handed the
+  problem back with "please press Ctrl+S yourself".
+
+  The exit existed the whole time and nothing named it. Each tab's per-instance ROUTING KEY is a
+  valid selector -- for an unsaved tab it is the only one it has -- and the workflow list already
+  publishes it on every record.
+
+  So this refusal now does what the two refusals beside it already do: one read-only workflow-list
+  read, exempt from the fence it is reporting on, establishes the single fact that decides which
+  remedy is followable, and the message names THAT one -- the routing key for an unsaved tab, the
+  real path for a saved one, and neither when the read did not land. It also warns off the two
+  exits that refuse from this state.
+
+  Nothing is auto-applied and the guard is not weakened: a canvas that really does belong to
+  another workflow still refuses, and the saved-tab advice is unchanged. Reads get the diagnosis
+  too, because a refused `panel_graph_outline` was half of the reported dead end. Verified on a
+  live rig, not only in tests: with the fix the named remedy re-opens the unsaved tab, restores its
+  identity tag, and the previously-refused read and widget edit both succeed.
+
 ## 0.51.20
 
 ### Fixed
@@ -292,6 +321,14 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.51.21] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- the mismatch guard names a selector an unsaved tab actually has (#1492)
+
 
 ## [0.51.20] - 2026-08-12
 
