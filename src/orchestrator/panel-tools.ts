@@ -2287,7 +2287,19 @@ function queueNeverSawATask(reply: Record<string, unknown> | null): boolean {
  *
  * Anything inconclusive returns the panel's own reply untouched (#1473's rule).
  */
-async function settleDroppedEnqueue(ctx: PanelToolCtx, res: ToolResult): Promise<ToolResult> {
+/** The panel identity a route key currently resolves to. `undefined` on a bridge
+ *  that cannot report one, which then compares equal and preserves the older
+ *  behaviour for lightweight contexts. */
+function panelIncarnation(ctx: PanelToolCtx, tabId: string): string | undefined {
+  const b = ctx.bridge as { tabIncarnation?: (t: string) => string | undefined };
+  return typeof b.tabIncarnation === "function" ? b.tabIncarnation(tabId) : undefined;
+}
+
+async function settleDroppedEnqueue(
+  ctx: PanelToolCtx,
+  res: ToolResult,
+  dispatch: { tab: string; incarnation: string | undefined },
+): Promise<ToolResult> {
   if (res.isError) return res;
   if (!claimsQueued(parseToolResultJson(res))) return res;
 
@@ -2297,9 +2309,18 @@ async function settleDroppedEnqueue(ctx: PanelToolCtx, res: ToolResult): Promise
   // current-mode session onto the sole remaining interactive tab. A reconnect
   // between the two calls would let ANOTHER ComfyUI's empty queue be reported as
   // evidence about this install.
-  const dispatchTab = ctx.tabId;
+  // The ROUTE KEY alone is not the panel (codex P1, round 3). A `wf:` key is
+  // `wf:<tabRouteId>:<path>` — it names a WORKFLOW, so it recurs, and a different
+  // browser tab can take it over without `ctx.tabId` changing at all. The bridge
+  // draws exactly this distinction and exposes `tabIncarnation` for it (#486), so
+  // both are captured: the key AND the incarnation currently holding it.
   const queue = await ctx.call({ cmd: "nodes_queue_status" }, 15000);
-  if (ctx.tabId !== dispatchTab) return res;
+  if (ctx.tabId !== dispatch.tab) return res;
+  // Both captured BEFORE the install was dispatched, not here — a takeover that
+  // happens DURING the install is already baked in by the time this function
+  // runs, so comparing two post-install readings would always agree and the guard
+  // would be decorative. Its own test caught exactly that.
+  if (panelIncarnation(ctx, ctx.tabId) !== dispatch.incarnation) return res;
   if (queue.isError || !queueNeverSawATask(parseToolResultJson(queue))) return res;
 
   return appendNote(
@@ -11657,6 +11678,13 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // repository install that works, and disclose the rewrite.
         const { conflict, note, ...cmdArgs } = nodesInstallCommandArgs(args);
         if (conflict) return fail(conflict);
+        // #1129 — the panel identity is captured BEFORE dispatch, because a
+        // takeover during the install is exactly what the follow-up read must not
+        // be attributed to.
+        const dispatch = {
+          tab: ctx.tabId,
+          incarnation: panelIncarnation(ctx, ctx.tabId),
+        };
         const res = await ctx.call(
           { cmd: "nodes_install", ...cmdArgs },
           30000,
@@ -11667,7 +11695,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // queue, and silently does nothing. Found by printing the real reply
         // rather than by reasoning about it: the first version of this shipped
         // the check and the check never ran.
-        const settled = await settleDroppedEnqueue(ctx, res);
+        const settled = await settleDroppedEnqueue(ctx, res, dispatch);
         if (note) {
           const text = settled.content.find((c) => c.type === "text");
           if (text && text.type === "text") {

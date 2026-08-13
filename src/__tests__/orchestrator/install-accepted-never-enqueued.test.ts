@@ -241,6 +241,72 @@ describe("an install the Manager accepted and dropped says so (#1129)", () => {
     expect(textOf(res)).not.toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
   });
 
+  it("claims nothing when the SAME key is taken over by another panel (codex P1)", async () => {
+    // The route key is not the panel. A `wf:` key is `wf:<tabRouteId>:<path>` — it
+    // names a WORKFLOW, so it recurs, and a different browser tab can take it over
+    // with `ctx.tabId` completely unchanged. The previous guard compared only the
+    // key and would have read the REPLACEMENT panel's empty queue while the
+    // message claimed it was "on that same panel".
+    let incarnation = "inc-A";
+    const b = {
+      send: async (cmd: Record<string, unknown>) => {
+        sent.push(String(cmd.cmd));
+        if (cmd.cmd === "nodes_install") {
+          incarnation = "inc-B"; // another browser tab takes over the same key
+          return { queued: true, pending: true, dialect: "legacy" };
+        }
+        return { status: { total_count: 0, done_count: 0, in_progress_count: 0, is_processing: false } };
+      },
+      tabIncarnation: () => incarnation,
+      push: () => 1,
+      canReach: (id: string) => id === TAB,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => TAB,
+      refreshWorkflowUuid: () => true,
+      workflowUuidFor: () => ({ known: false }),
+      tabCanMutateGraph: () => true,
+      tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
+    } as unknown as PanelToolCtx["bridge"];
+
+    const ctx = makePanelToolCtx(b, TAB, new WorkflowTargetStore());
+    const def = buildPanelToolDefs().find((d) => d.name === "panel_install_node");
+    const res: ToolResult = await def!.handler({ repository: REPO } as never, ctx);
+
+    // The key really did NOT change — that is the whole point of this case.
+    expect(ctx.tabId).toBe(TAB);
+    expect(textOf(res)).not.toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
+  });
+
+  it("still warns when the same panel holds the key throughout", async () => {
+    // The other half: a stable incarnation must not suppress the warning, or the
+    // guard above would quietly switch the whole feature off.
+    const b = {
+      send: async (cmd: Record<string, unknown>) => {
+        sent.push(String(cmd.cmd));
+        return cmd.cmd === "nodes_install"
+          ? { queued: true, pending: true, dialect: "legacy" }
+          : { status: { total_count: 0, done_count: 0, in_progress_count: 0, is_processing: false } };
+      },
+      tabIncarnation: () => "inc-STABLE",
+      push: () => 1,
+      canReach: (id: string) => id === TAB,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => TAB,
+      refreshWorkflowUuid: () => true,
+      workflowUuidFor: () => ({ known: false }),
+      tabCanMutateGraph: () => true,
+      tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
+    } as unknown as PanelToolCtx["bridge"];
+
+    const ctx = makePanelToolCtx(b, TAB, new WorkflowTargetStore());
+    const def = buildPanelToolDefs().find((d) => d.name === "panel_install_node");
+    const res: ToolResult = await def!.handler({ repository: REPO } as never, ctx);
+
+    expect(textOf(res)).toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
+  });
+
   it("claims nothing when the queue read itself fails", async () => {
     const out = await install({ queueErrors: true });
 
