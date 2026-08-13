@@ -4,6 +4,32 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.28
+
+### Fixed
+
+- **Installing a custom node from a Git URL with `version:"nightly"` no longer fails and
+  deletes the clone (#1470).** The repository cloned successfully, then the checkout died
+  with `fatal: '--detach' cannot be used with '-b/-B/--orphan'` and the clone was discarded
+  as a husk -- so a perfectly good install left nothing behind.
+
+  "nightly" is overloaded in this tool's own surface, which is what made it awkward to fix.
+  For a Manager install it names the git-HEAD channel -- one of our own paths mints it,
+  rewriting an absent or "latest" version because ComfyUI-Manager rejects a registry
+  "latest" for a repository-style entry. For a from-source git install, `version` is
+  documented as a git ref. Someone typing it may mean either.
+
+  So the meaning is resolved by ASKING the repository rather than guessing: tags are
+  fetched, the ref is looked up, and only if the repository genuinely has no such ref -- and
+  the ref came from `version` rather than an explicit `ref:` -- is the checkout skipped and
+  the clone left at the default HEAD, which is what the channel reading asks for. The reply
+  says that happened.
+
+  Everything else is unchanged: a repository that DOES have a `nightly` branch gets it, an
+  explicit `ref:"nightly"` still fails loudly when it is absent, and any other missing ref
+  still fails rather than quietly installing something else. Asking for `v1.2.3` and
+  silently receiving HEAD would be a worse bug than the one being fixed.
+
 ## 0.51.27
 
 ### Fixed
@@ -499,6 +525,14 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.51.28] - 2026-08-13
+
+### MCP
+
+#### Fixed
+- resolve "nightly" by asking the repository, not by guessing (#1513)
+
 
 ## [0.51.27] - 2026-08-13
 
