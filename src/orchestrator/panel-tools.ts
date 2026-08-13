@@ -6565,7 +6565,13 @@ export function makePanelToolCtx(
                 `panel_set_workflow_target({mode:"current"}). (${err2 instanceof Error ? err2.message : String(err2)})`,
             );
           }
-          return fail(err2);
+          // #1468 — the RETRY's own failure can be a reply timeout too: this branch
+          // is only entered when the FIRST error was a reconnect flap or a switch
+          // refusal, so a tagged no-reply lands here rather than on the outer path.
+          // Leaving it unmarked fails closed (nothing is settled, no false success)
+          // but silently switches the settle off for a real sequence, which is the
+          // kind of gap that reads as "the fix does not work" much later.
+          return carryReplyTimeoutMark(err2, fail(err2));
         }
       }
       // #442 defect 4: a MUTATING command (deliberately excluded from RETRY_SAFE_CMDS)
