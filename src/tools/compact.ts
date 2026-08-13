@@ -147,8 +147,14 @@ export function buildManifest(
   const suppressed = byName.size
     ? inScope.filter((t) => !byName.has(t.name) && matchesSearch(searchCorpus(t), terms)).length
     : 0;
+  // WORDING, not the count (codex). The count is right: `suppressed` is exactly
+  // what the corpus search would have returned and this view is withholding. But
+  // saying those tools match "in their description or parameters" claims WHERE
+  // they matched, and the corpus includes the name — `download_asset` described
+  // as "handles model files" takes one term from each, so the claim is false for
+  // it while the count is still correct. The note now says only what it knows.
   const tierNote = suppressed
-    ? ` Showing tools whose NAME matches; ${suppressed} more mention these terms in their description or parameters — search a distinctive word from one to see them.`
+    ? ` Showing tools whose NAME matches; ${suppressed} other tool(s) also match this search — search a distinctive word from one to see them.`
     : "";
   const footer =
     (opts.category || opts.search) && shown < catalog.tools.size

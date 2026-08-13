@@ -216,7 +216,12 @@ describe("buildManifest", () => {
     expect(manifest).toContain("Showing tools whose NAME matches");
     // Counted, not hand-waved: runpod is the one tool the corpus search would
     // have returned here and this view is not showing.
-    expect(manifest).toContain("1 more mention these terms");
+    expect(manifest).toContain("1 other tool(s) also match");
+    // It must NOT claim WHERE those tools matched. The corpus includes the name,
+    // so a tool taking one term from its name and the rest from its description
+    // is counted correctly while "matches in its description or parameters" would
+    // be false for it — an accurate number wrapped in an inaccurate sentence.
+    expect(manifest).not.toMatch(/mention these terms in their description/);
   });
 
   it("says nothing about a name tier when the corpus answered", () => {
