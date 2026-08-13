@@ -4,6 +4,36 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.31
+
+### Fixed
+
+- **A trailing space in `COMFYUI_PATH` no longer breaks every install-root check silently (#1512).**
+  On Windows the usual launcher line -- `set COMFYUI_PATH=C:\...\ComfyUI && comfyui-mcp connect ...`
+  -- captures the space BEFORE the `&&`, because that is how `cmd.exe` assigns. The
+  orchestrator then consumed the value exactly as given, so nothing matched and the
+  connected ComfyUI was reported as undeterminable. The failure surfaced about forty
+  minutes later, at the first write, with a message that echoed the path back but never
+  pointed at the space. It cost a 12.3 GB download, stranded at 11.35 GB and finished by
+  hand. The panel pack had always stripped this; the orchestrator had not.
+
+  The value is normalized now -- surrounding whitespace, and a matched pair of surrounding
+  quotes, which is the other thing that survives a paste. This is a REPAIR, not a cleanup:
+  a value that already names a real directory is never touched, because a trailing space
+  is a legal filename character (on POSIX, and in fact on Windows too), and redirecting
+  someone away from a folder that works would be worse than the bug. Only a value that
+  names nothing is repaired.
+
+  It also says so at startup, naming both forms and the launcher line that produced them,
+  instead of leaving a malformed value to surface as a mystery much later. A launcher that
+  bakes in a bad value will hand the same one to everything else it starts.
+
+  Applied at every reader, not just the obvious one: the same value feeds workflow-library
+  lookups, the environment handed to spawned agents, and the check that decides whether a
+  ComfyUI root was named explicitly or inferred. Fixing only the first would have left the
+  rest wrong -- and would have made that last one worse, by comparing a normalized value
+  against a raw one.
+
 ## 0.51.30
 
 ### Fixed
