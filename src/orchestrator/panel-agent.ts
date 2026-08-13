@@ -108,6 +108,14 @@ function runIdentityPreamble(ev: {
  *  COMFYUI_MCP_TURN_IDLE_MS. Default 3.5 min. */
 const TURN_IDLE_MS = Number(process.env.COMFYUI_MCP_TURN_IDLE_MS) || 210_000;
 
+/** Automatic render previews are context, not the user's explicit attachment
+ * request. Keep one completion from turning into an unbounded multimodal turn
+ * (a seven-way comparison can expose dozens of PreviewImage outputs). The panel
+ * already shows every output; the agent only needs a representative bounded set.
+ * Foreign/unidentified completions get no pixels at all because their own
+ * correlation preamble forbids the agent from treating them as its awaited run. */
+const MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS = 8;
+
 /** Longest a single tool call may hold the idle watchdog off before it's treated
  *  as genuinely stuck rather than legitimately slow. An MCP tool call streams NO
  *  progress notification between its start and end (e.g. install_custom_node
@@ -697,6 +705,12 @@ export class PanelAgent {
     let images: ImageRef[] | undefined;
     if (ev.kind === "executed") {
       const imgs = ev.images ?? [];
+      const correlationIsUntrusted =
+        ev.run_correlation === "foreign" || ev.run_correlation === "unidentified";
+      const attachedImgs = correlationIsUntrusted
+        ? []
+        : imgs.slice(0, MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS);
+      const omittedImgs = imgs.length - attachedImgs.length;
       const names = imgs.map((i) => i.filename).filter(Boolean).join(", ") || "(unnamed)";
       // A custom `note` (e.g. the panel's video-storyboard summary) replaces the
       // default image-acknowledgement wording so the agent is told accurately
@@ -728,11 +742,15 @@ export class PanelAgent {
         // e.g. a video that produced no storyboard — has none), and only when this
         // backend can actually see them — a text-only backend told "attached below"
         // would confabulate having viewed the render.
-        (imgs.length
-          ? this.backend.capabilities.vision
-            ? `The image(s) are attached below and already shown to the user in the panel. `
-            : `You cannot view images on this provider, but they are already shown to the user in the panel. `
-          : ``) +
+          (imgs.length
+            ? this.backend.capabilities.vision
+              ? correlationIsUntrusted
+                ? `The outputs are already shown to the user in the panel, but their pixels are NOT attached to this agent turn because the run's origin is UNDETERMINED. `
+                : omittedImgs > 0
+                  ? `The first ${attachedImgs.length} image(s) are attached below; all ${imgs.length} outputs are already shown to the user in the panel. ${omittedImgs} further preview(s) were omitted from this agent turn to keep its image context bounded. `
+                  : `The image(s) are attached below and already shown to the user in the panel. `
+              : `You cannot view images on this provider, but they are already shown to the user in the panel. `
+            : ``) +
         // #977 — this used to be a FIXED "you do NOT need to call any tools",
         // i.e. "stop now", sent after every render. Paired with panel_run's own
         // "just end your turn now and wait", the emergent default was:
@@ -749,7 +767,9 @@ export class PanelAgent {
         runCompletionDirective(this.tabId);
       // Attach the outputs inline so the agent SEES the render (no fetch needed).
       if (this.backend.capabilities.vision) {
-        images = imgs.filter((i) => i.filename).map((i) => ({ ...i, type: i.type ?? "output" }));
+        images = attachedImgs
+          .filter((i) => i.filename)
+          .map((i) => ({ ...i, type: i.type ?? "output" }));
       }
     } else if (ev.kind === "ask_answer") {
       // #486 — the user ANSWERED a question card, but no tool call was alive to

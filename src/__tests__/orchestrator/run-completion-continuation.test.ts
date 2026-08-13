@@ -61,6 +61,7 @@ class ContinuationBackend implements AgentBackend {
   readonly id = "claude" as const;
   readonly capabilities = CLAUDE_CAPABILITIES; // declares turnMarkers: true
   turns: string[] = [];
+  turnImages: string[][] = [];
   /** Resolves the turn currently in flight. */
   private release: (() => void) | null = null;
   /** When true, a turn never produces a `result` (a stalled/abandoned turn). */
@@ -71,6 +72,7 @@ class ContinuationBackend implements AgentBackend {
     let turnSeq = 0;
     for await (const turn of opts.channel) {
       this.turns.push((turn as { text?: string }).text ?? "");
+      this.turnImages.push((turn.images ?? []).map((image) => image.filename));
       turnSeq += 1;
       await new Promise<void>((resolve) => {
         this.release = resolve;
@@ -207,6 +209,7 @@ describe("run completion across automatic goal continuation (#468)", () => {
     expect(backend.turns[1]).toContain("out_0001.png");
     expect(backend.turns[1]).toContain(PROMPT_A);
     expect(backend.turns[1]).toContain("This is the run YOU queued");
+    expect(backend.turnImages[1]).toEqual(["out_0001.png"]);
     // Still journaled until the turn CARRYING it ends — hand-off is not proof.
     expect(journal.outstanding(tab)).toHaveLength(1);
 
@@ -377,6 +380,8 @@ describe("run completion across automatic goal continuation (#468)", () => {
     expect(text).toContain("UNDETERMINED");
     expect(text).toContain("get_history");
     expect(text).not.toContain("This is the run YOU queued");
+    expect(text).toContain("pixels are NOT attached");
+    expect(backend.turnImages[1]).toEqual([]);
     // …and it must not settle the run the agent is actually waiting on.
     backend.finishTurn();
     await waitFor(() => journal.outstanding(tab).length === 0);
@@ -400,10 +405,32 @@ describe("run completion across automatic goal continuation (#468)", () => {
     expect(text).toContain("does NOT match any run you queued");
     expect(text).toContain("UNDETERMINED");
     expect(text).toContain(PROMPT_B);
+    expect(text).toContain("pixels are NOT attached");
+    expect(backend.turnImages[1]).toEqual([]);
 
     backend.finishTurn();
     await waitFor(() => journal.outstanding(tab).length === 0);
     expect(journal.ticketFor(PROMPT_A)?.settled).toBe(false); // our run is still open
+  });
+
+  it("bounds a matched run's automatic previews while leaving every output visible in the panel", async () => {
+    const backend = new ContinuationBackend();
+    const { journal, manager, arrive } = makeHarness(backend);
+    const tab = "tab-many-previews";
+    const images = Array.from({ length: 28 }, (_, i) => ({ filename: `preview_${i + 1}.png` }));
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "render comparison");
+    await waitFor(() => backend.turns.length >= 1);
+    backend.finishTurn();
+
+    arrive(tab, { kind: "executed", prompt_id: PROMPT_A, images });
+    await waitFor(() => backend.turns.length >= 2);
+
+    expect(backend.turnImages[1]).toEqual(images.slice(0, 8).map((image) => image.filename));
+    expect(backend.turns[1]).toContain("The first 8 image(s) are attached below");
+    expect(backend.turns[1]).toContain("20 further preview(s) were omitted");
+    expect(backend.turns[1]).toContain("all 28 outputs are already shown to the user");
   });
 
   it("a completion parked in HELD mail survives a reset that discards that mail", async () => {
