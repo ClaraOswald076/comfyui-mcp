@@ -128,6 +128,73 @@ describe("buildManifest", () => {
     expect(buildManifest(fakeCatalog())).not.toContain("FILTERED view");
   });
 
+  // #1525 — `list_tools search:"download model"` returned ONLY `runpod`. The filter
+  // was matching the literal PHRASE, so `download_model` (an identifier, spelled
+  // with an underscore) never contained it, while an unrelated tool whose prose
+  // happens to say "download model" did. The one tool the caller obviously wanted
+  // was the one excluded, and the only hit was the coincidence.
+  function separatorCatalog(): ToolCatalog {
+    const catalog = new ToolCatalog();
+    const r = catalog.asRegistrar();
+    // Category is set on the catalog, not passed per tool — matching fakeCatalog
+    // above and the real registration order.
+    catalog.setCategory("models");
+    r.tool("download_model", "Download a model file to the local install.", {}, async () => ({ content: [] }));
+    r.tool("list_local_models", "List installed checkpoints.", {}, async () => ({ content: [] }));
+    catalog.setCategory("cloud");
+    r.tool("runpod", "Manage pods. You can download model files onto a pod.", {}, async () => ({ content: [] }));
+    return catalog;
+  }
+
+  it("matches an identifier when the caller types it with a SPACE (#1525)", () => {
+    const manifest = buildManifest(separatorCatalog(), { search: "download model" });
+
+    // The reporter's tool is present — this is the whole bug.
+    expect(manifest).toContain("download_model");
+    // And it is the ONLY result: the tool whose NAME says it wins outright over
+    // one that merely mentions downloading models in prose. Measured against the
+    // real 37-tool surface, term-matching alone returned 10 tools here and 19 for
+    // "install node" — findable, but still the "misleading filter" the report is
+    // actually about.
+    expect(manifest).toContain("1 of 3 tools");
+    expect(manifest).not.toContain("runpod");
+    expect(manifest).not.toContain("list_local_models");
+  });
+
+  it("falls back to the full corpus when NO name matches", () => {
+    // The name tier must not cost the corpus search that makes parameter and
+    // description text findable — "liveness" and "sampling" appear in no tool
+    // name at all, and those cases are why the corpus search exists.
+    const manifest = buildManifest(separatorCatalog(), { search: "checkpoints" });
+    expect(manifest).toContain("list_local_models");
+    expect(manifest).not.toContain("download_model");
+  });
+
+  it("matches with the separator typed either way round", () => {
+    // Both spellings of the same intent must work, in both directions.
+    expect(buildManifest(separatorCatalog(), { search: "download_model" })).toContain("download_model");
+    expect(buildManifest(separatorCatalog(), { search: "DOWNLOAD MODEL" })).toContain("download_model");
+    // A hyphenated query for an underscored name.
+    expect(buildManifest(separatorCatalog(), { search: "download-model" })).toContain("download_model");
+  });
+
+  it("requires EVERY term, so multi-word search still narrows", () => {
+    // Order-independent, but not an OR: a tool matching only one term is excluded.
+    const both = buildManifest(separatorCatalog(), { search: "model download" });
+    expect(both).toContain("download_model");
+
+    const onlyOne = buildManifest(separatorCatalog(), { search: "download checkpoints" });
+    // list_local_models has "checkpoints" but not "download"; download_model the
+    // reverse. Neither has both, so neither matches.
+    expect(onlyOne).toContain("No tools matched");
+  });
+
+  it("treats a whitespace-only search as no search at all", () => {
+    const manifest = buildManifest(separatorCatalog(), { search: "   " });
+    expect(manifest).toContain("3 of 3 tools");
+    expect(manifest).not.toContain("FILTERED view");
+  });
+
   it("suggests categories when nothing matches", () => {
     const manifest = buildManifest(fakeCatalog(), { search: "no-such-thing" });
     expect(manifest).toContain("No tools matched");

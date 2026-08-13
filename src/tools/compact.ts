@@ -39,19 +39,71 @@ function searchCorpus(tool: CatalogedTool): string {
   const params = Object.entries(tool.schema ?? {})
     .map(([key, schema]) => `${key} ${(schema as { description?: string }).description ?? ""}`)
     .join(" ");
-  return `${tool.name} ${tool.description} ${params}`.toLowerCase();
+  return normalizeForSearch(`${tool.name} ${tool.description} ${params}`);
+}
+
+/**
+ * #1525 — fold the separators that only exist because tool names are identifiers.
+ *
+ * `list_tools search:"download model"` returned ONLY `runpod`, which reads as a
+ * broken index. It was doing exactly what it was told: matching the literal
+ * phrase. `download_model` is spelled with an UNDERSCORE, so the phrase never
+ * occurred in it, while runpod's prose happens to contain "download model" as
+ * ordinary English — so the one tool the caller obviously wanted was the one tool
+ * excluded, and the only tool returned was the coincidence.
+ *
+ * Underscores, hyphens, dots and slashes become spaces on BOTH sides, so a
+ * caller may type a tool's name the way they say it.
+ */
+function normalizeForSearch(text: string): string {
+  return text.toLowerCase().replace(/[_\-/.]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Every term must appear, in any order and anywhere in the corpus.
+ *
+ * Strictly WIDER than the phrase match it replaces, never narrower: a single
+ * term behaves identically, and a multi-word query no longer demands that the
+ * words be adjacent in that order. So no query that used to find something can
+ * stop finding it — the failure mode being fixed is a MISS, and the fix cannot
+ * introduce the opposite one.
+ */
+function matchesSearch(corpus: string, terms: readonly string[]): boolean {
+  return terms.every((term) => corpus.includes(term));
 }
 
 export function buildManifest(
   catalog: ToolCatalog,
   opts: { category?: string; search?: string } = {},
 ): string {
-  const search = opts.search?.toLowerCase();
+  // #1525 — split into TERMS rather than matching the raw phrase. An empty or
+  // whitespace-only search is treated as no search, exactly as before.
+  const terms = opts.search ? normalizeForSearch(opts.search).split(" ").filter(Boolean) : [];
+  // #1525 — NAME MATCHES WIN, when there are any.
+  //
+  // Matching every term across name + description + parameter docs is what makes
+  // `download_model` findable at all, but on the real 37-tool surface it is barely
+  // a filter: "install node" hit 19 tools, because "install" and "node" are
+  // ordinary words in a dozen descriptions. The reporter's complaint was not only
+  // that their tool was missing — it was that the filtered view "is misleading and
+  // forces a full-catalog workaround". A result set of 19 does that too.
+  //
+  // So: if any tool's NAME carries every term, the answer is those tools. Nobody
+  // typing "download model" wants the nine tools that merely mention downloading
+  // models. When no name matches — "checkpoint", "liveness" — this is inert and
+  // the corpus search answers exactly as before, which is the case that made the
+  // corpus search worth having.
+  const nameMatches = terms.length
+    ? [...catalog.tools.values()].filter((t) => matchesSearch(normalizeForSearch(t.name), terms))
+    : [];
+  const byName = new Set(nameMatches.map((t) => t.name));
   const lines: string[] = [];
   let shown = 0;
   for (const [category, tools] of catalog.byCategory()) {
     if (opts.category && category !== opts.category) continue;
-    const matching = search ? tools.filter((t) => searchCorpus(t).includes(search)) : tools;
+    const matching = terms.length
+      ? tools.filter((t) => (byName.size ? byName.has(t.name) : matchesSearch(searchCorpus(t), terms)))
+      : tools;
     if (matching.length === 0) continue;
     lines.push("", `## ${category} (${matching.length})`);
     for (const t of matching) {
