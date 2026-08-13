@@ -303,16 +303,28 @@ export function isOwnHostAddress(host: string | undefined): boolean {
 function canonicalHostForCompare(host: string | undefined): string {
   const raw = (host ?? "").trim().toLowerCase().replace(/^\[|\]$/g, "");
   if (!raw) return "";
-  // ::ffff:a.b.c.d → a.b.c.d (the form interfaces report)
-  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(raw);
-  if (mapped) return mapped[1];
   if (!raw.includes(":")) return raw; // IPv4 or a name — already canonical
+  let canon: string;
   try {
     // URL canonicalizes IPv6 and re-brackets it; strip the brackets back off.
-    return new URL(`http://[${raw}]/`).hostname.replace(/^\[|\]$/g, "");
+    canon = new URL(`http://[${raw}]/`).hostname.replace(/^\[|\]$/g, "");
   } catch {
     return raw; // not a valid IPv6 literal — compare as written
   }
+  // The IPv4-mapped fold happens AFTER canonicalization, not before, and that
+  // ordering is the whole point (round-2 review). URL rewrites EVERY mapped
+  // spelling to the same hex form — `::ffff:192.168.1.179`,
+  // `0:0:0:0:0:ffff:c0a8:1b3` and `::FFFF:C0A8:1B3` all become
+  // `::ffff:c0a8:1b3` — so folding here catches all of them with one rule.
+  // Folding beforehand caught only the dotted spelling and left the rest
+  // classified as somebody else's machine.
+  const m = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(canon);
+  if (m) {
+    const hi = parseInt(m[1], 16);
+    const lo = parseInt(m[2], 16);
+    return `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+  }
+  return canon;
 }
 
 /** True when a hostname is loopback (or absent → assume local). Bracketed IPv6

@@ -95,15 +95,42 @@ describe("isOwnHostAddress — loopback is a SUBSET of 'this machine' (#742)", (
     expect(isOwnHostAddress("2600:1700:5892:BC10::22")).toBe(true);
   });
 
-  it("accepts our IPv4 written as an IPv4-mapped IPv6 address", async () => {
-    // `::ffff:192.168.1.179` is our LAN address. Interfaces report the dotted
-    // form, and URL canonicalizes the mapped form to `::ffff:c0a8:1b3`, so
-    // without the explicit fold neither spelling meets the other.
+  it("accepts our IPv4 written as an IPv4-mapped IPv6 address, in EVERY spelling", async () => {
+    // All five of these are 192.168.1.179, which is what the interface reports.
+    // URL rewrites every one of them to `::ffff:c0a8:1b3`, so the fold back to
+    // dotted form has to happen AFTER canonicalization — a first version folded
+    // beforehand, caught only the dotted spelling, and left the hex forms
+    // classified as someone else's machine (round-2 review).
     const { isOwnHostAddress } = await loadConfig();
-    expect(isOwnHostAddress("::ffff:192.168.1.179")).toBe(true);
-    expect(isOwnHostAddress("[::ffff:192.168.1.179]")).toBe(true);
-    // ...and the mapped form of a NEIGHBOUR is still not ours.
+    for (const h of [
+      "::ffff:192.168.1.179",
+      "[::ffff:192.168.1.179]",
+      "::ffff:c0a8:1b3",
+      "0:0:0:0:0:ffff:c0a8:1b3",
+      "::FFFF:C0A8:1B3",
+    ]) {
+      expect(isOwnHostAddress(h), h).toBe(true);
+    }
+    // ...and the mapped forms of a NEIGHBOUR are still not ours.
     expect(isOwnHostAddress("::ffff:192.168.1.180")).toBe(false);
+    expect(isOwnHostAddress("::ffff:c0a8:1b4")).toBe(false);
+  });
+
+  it("keeps the wildcard binds local, and leaves the odd mapped zero alone", async () => {
+    const { isOwnHostAddress } = await loadConfig();
+    // `::` and `0.0.0.0` are already in LOOPBACK_HOSTS — a wildcard bind is
+    // reachable on loopback, so calling it local is pre-existing and right.
+    // (I first asserted `::` was false here, from assumption rather than from
+    // the set; the test caught me.)
+    expect(isOwnHostAddress("::")).toBe(true);
+    expect(isOwnHostAddress("0.0.0.0")).toBe(true);
+    // `::ffff:0:0` is the mapped spelling of 0.0.0.0 and is NOT in that set, so
+    // it folds to "0.0.0.0" and then matches no interface. Inconsistent with
+    // the line above, but in the SAFE direction: it leaves the remote
+    // short-circuit exactly as it was rather than pulling a target into
+    // assessment on a technicality. Not worth widening a security-adjacent set
+    // for a spelling nothing emits.
+    expect(isOwnHostAddress("::ffff:0:0")).toBe(false);
   });
 
   it("rejects a LAN address on the same subnet that is NOT ours", async () => {
