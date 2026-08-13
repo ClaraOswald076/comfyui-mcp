@@ -989,6 +989,39 @@ describe("restart truthfulness + Pinokio-shaped refusal (#742)", () => {
       expect(mockGetSystemStats).toHaveBeenCalled();
     });
 
+    it("a refusal reached this way NAMES the assumption and the escape hatch", async () => {
+      // An address on one of our interfaces proves the ROUTE lands here, not
+      // that the instance does: a reverse proxy or port-forward bound to this
+      // machine's LAN address can front a ComfyUI that is genuinely elsewhere.
+      // Such a setup used to restart through the Manager and now meets the
+      // guard, so the refusal has to say which assumption produced it — a
+      // silent behaviour change is the part that would actually cost time.
+      mockLocality.remote = true;
+      mockLocality.onThisMachine = true;
+      mockPinokioShapedInstall();
+
+      const preflight = await preflightLocalRestart();
+
+      expect(preflight.ok).toBe(false);
+      expect(preflight.reason).toMatch(/could not build a relaunch command/i);
+      expect(preflight.reason).toMatch(/own network interfaces/i);
+      expect(preflight.reason).toMatch(/COMFYUI_MCP_FORCE_REMOTE=1|--force-remote/);
+    });
+
+    it("a LOOPBACK-addressed refusal does NOT carry that note", async () => {
+      // The note explains a decision only this new path makes. On the ordinary
+      // local path it would be noise pointing at an irrelevant setting.
+      mockLocality.remote = false;
+      mockLocality.onThisMachine = true;
+      mockPinokioShapedInstall();
+
+      const preflight = await preflightLocalRestart();
+
+      expect(preflight.ok).toBe(false);
+      expect(preflight.reason).not.toMatch(/own network interfaces/i);
+      expect(preflight.reason).not.toMatch(/FORCE_REMOTE/i);
+    });
+
     it("remote + IS this machine + resolvable install: assesses and PASSES", async () => {
       // The guard must not become a blanket refusal for everyone who addresses a
       // local ComfyUI by LAN IP. A normal install still restarts.

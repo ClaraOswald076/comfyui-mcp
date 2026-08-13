@@ -263,14 +263,14 @@ const LOOPBACK_HOSTS = new Set([
  */
 export function isOwnHostAddress(host: string | undefined): boolean {
   if (isLoopbackHost(host)) return true;
-  const h = normalizeHostForCompare(host);
+  const h = canonicalHostForCompare(host);
   // An empty host must never fall through to the comparison: an interface that
   // reported an empty address would then match it.
   if (!h) return false;
   try {
     for (const addrs of Object.values(networkInterfaces())) {
       for (const a of addrs ?? []) {
-        if (normalizeHostForCompare(a.address) === h) return true;
+        if (canonicalHostForCompare(a.address) === h) return true;
       }
     }
   } catch {
@@ -280,13 +280,39 @@ export function isOwnHostAddress(host: string | undefined): boolean {
   return false;
 }
 
-/** Lowercase, strip URL brackets, and drop an IPv6 zone suffix (`%eth0`), which
- *  `networkInterfaces()` omits on the addresses it reports. */
-function normalizeHostForCompare(host: string | undefined): string {
-  return (host ?? "")
-    .toLowerCase()
-    .replace(/^\[|\]$/g, "")
-    .replace(/%.*$/, "");
+/**
+ * One canonical spelling for an address, so equality means "same address"
+ * rather than "same characters" (#742 review).
+ *
+ * Textual comparison alone is wrong in the direction that keeps the bug: an
+ * interface reports `2600:1700:5892:bc10::22` while a config may carry the same
+ * address written `2600:1700:5892:BC10:0:0:0:22`, and a plain `===` calls those
+ * different machines. `URL` already implements the canonicalization — it
+ * lowercases, collapses to the `::` form, and rewrites IPv4-mapped addresses —
+ * so both sides are run through it rather than hand-rolling the rules.
+ *
+ * IPv4-mapped IPv6 (`::ffff:192.168.1.179`) is folded to its dotted IPv4 form
+ * FIRST, because that is the form `networkInterfaces()` reports; left alone,
+ * `URL` canonicalizes it to `::ffff:c0a8:1b3` and it still would not match.
+ *
+ * No zone-suffix handling: `new URL("http://[fe80::1%eth0]/")` throws, so a
+ * scoped address cannot reach here through a configured target at all. An
+ * earlier version stripped `%eth0` and had a test for it — which passed while
+ * exercising something production could never deliver.
+ */
+function canonicalHostForCompare(host: string | undefined): string {
+  const raw = (host ?? "").trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (!raw) return "";
+  // ::ffff:a.b.c.d → a.b.c.d (the form interfaces report)
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(raw);
+  if (mapped) return mapped[1];
+  if (!raw.includes(":")) return raw; // IPv4 or a name — already canonical
+  try {
+    // URL canonicalizes IPv6 and re-brackets it; strip the brackets back off.
+    return new URL(`http://[${raw}]/`).hostname.replace(/^\[|\]$/g, "");
+  } catch {
+    return raw; // not a valid IPv6 literal — compare as written
+  }
 }
 
 /** True when a hostname is loopback (or absent → assume local). Bracketed IPv6

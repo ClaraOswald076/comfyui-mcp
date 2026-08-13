@@ -16,9 +16,9 @@
 // guard.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// One fake NIC set for every test: a real-looking LAN address, a loopback pair,
-// and a link-local v6 with the zone suffix `networkInterfaces()` omits but URLs
-// carry.
+// One fake NIC set for every test, shaped like a real Windows box: a LAN
+// address, a loopback pair, a global and a link-local IPv6, and a virtual
+// adapter.
 const FAKE_IFACES = {
   Ethernet: [
     { address: "192.168.1.179", family: "IPv4", internal: false },
@@ -84,11 +84,26 @@ describe("isOwnHostAddress — loopback is a SUBSET of 'this machine' (#742)", (
     expect(isOwnHostAddress("192.168.1.179")).toBe(true);
   });
 
-  it("accepts an own IPv6 address, bracketed and with a zone suffix", async () => {
+  it("accepts an own IPv6 address however it is SPELLED", async () => {
+    // URL canonicalization, not string equality. An interface reports
+    // `2600:1700:5892:bc10::22`; a config may carry the identical address
+    // written long-hand or upper-case, and calling those different machines is
+    // exactly the false-negative that keeps the bug alive (review finding).
     const { isOwnHostAddress } = await loadConfig();
     expect(isOwnHostAddress("[2600:1700:5892:bc10::22]")).toBe(true);
-    // A URL can carry `%eth0`; networkInterfaces() reports the address without it.
-    expect(isOwnHostAddress("fe80::5f10:6918:84e6:1873%eth0")).toBe(true);
+    expect(isOwnHostAddress("2600:1700:5892:bc10:0:0:0:22")).toBe(true);
+    expect(isOwnHostAddress("2600:1700:5892:BC10::22")).toBe(true);
+  });
+
+  it("accepts our IPv4 written as an IPv4-mapped IPv6 address", async () => {
+    // `::ffff:192.168.1.179` is our LAN address. Interfaces report the dotted
+    // form, and URL canonicalizes the mapped form to `::ffff:c0a8:1b3`, so
+    // without the explicit fold neither spelling meets the other.
+    const { isOwnHostAddress } = await loadConfig();
+    expect(isOwnHostAddress("::ffff:192.168.1.179")).toBe(true);
+    expect(isOwnHostAddress("[::ffff:192.168.1.179]")).toBe(true);
+    // ...and the mapped form of a NEIGHBOUR is still not ours.
+    expect(isOwnHostAddress("::ffff:192.168.1.180")).toBe(false);
   });
 
   it("rejects a LAN address on the same subnet that is NOT ours", async () => {
@@ -119,13 +134,25 @@ describe("isOwnHostAddress — loopback is a SUBSET of 'this machine' (#742)", (
   });
 
   it("rejects a host that normalizes to nothing, even against an empty interface address", async () => {
-    // `[]` and `%eth0` both normalize to "" while NOT being loopback, so they
-    // reach the comparison. An adapter reporting an empty address would then
-    // match them. This is what makes the empty-host guard load-bearing rather
-    // than decorative — remove it and these become true.
+    // `[]` normalizes to "" while NOT being loopback, so it reaches the
+    // comparison, where the adapter above reporting an empty address would match
+    // it. That is what makes the empty-host guard load-bearing rather than
+    // decorative — remove it and this becomes true.
     const { isOwnHostAddress } = await loadConfig();
     expect(isOwnHostAddress("[]")).toBe(false);
+  });
+
+  it("rejects a scoped address, which cannot reach here through a URL anyway", async () => {
+    // `%eth0` is NOT emptied — it survives canonicalization as written and then
+    // matches nothing. Asserted because an earlier version stripped the zone
+    // suffix on the theory that a configured target could carry one; it cannot.
+    // `new URL("http://[fe80::1%eth0]/")` throws, so that code was unreachable
+    // and its test was checking something production could never deliver.
+    const { isOwnHostAddress } = await loadConfig();
     expect(isOwnHostAddress("%eth0")).toBe(false);
+    expect(isOwnHostAddress("fe80::5f10:6918:84e6:1873%eth0")).toBe(false);
+    // The same address WITHOUT a scope is ours.
+    expect(isOwnHostAddress("fe80::5f10:6918:84e6:1873")).toBe(true);
   });
 
   it("rejects addresses that merely look like ours", async () => {
