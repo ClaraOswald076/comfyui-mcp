@@ -5,6 +5,7 @@ import { homedir, platform } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve as pathResolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
+import { normalizeInstallPathEnv } from "../utils/install-path-env.js";
 import { getSystemStats } from "../comfyui/client.js";
 import { resolveLiveInterpreter } from "./live-interpreter.js";
 import { logger } from "../utils/logger.js";
@@ -375,7 +376,9 @@ export async function getWorkspace(): Promise<WorkspaceInfo> {
   let source: WorkspaceInfo["workspace_source"];
   if (config.comfyuiPath) {
     // config.comfyuiPath is COMFYUI_PATH env or auto-detection
-    source = process.env.COMFYUI_PATH ? "env" : "auto-detected";
+    // #1512 — normalized so a whitespace-only value is not reported as "env"
+    // while config.comfyuiPath actually came from auto-detection.
+    source = normalizeInstallPathEnv(process.env.COMFYUI_PATH).path ? "env" : "auto-detected";
   } else if (cfg.defaultWorkspace) {
     source = "default-config";
   } else {

@@ -4,6 +4,7 @@ import { dirname, resolve, join } from "path";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isIP } from "node:net";
+import { normalizeInstallPathEnv } from "./utils/install-path-env.js";
 import { parseComfyUIUrl, type ComfyUITarget } from "./transport/comfyui-url.js";
 import { resetManagerApiCache } from "./services/manager-api-cache.js";
 import { comfyuiEnvFilePath, freshSecretValue, loadEnvFileIntoProcess } from "./env-file.js";
@@ -249,9 +250,12 @@ export function isLoopbackHost(host: string | undefined): boolean {
  * COMFYUI_PATH env var still wins.
  */
 function resolveComfyUIPath(
-  envPath: string | undefined,
+  rawEnvPath: string | undefined,
   opts: { remoteUrl: boolean; cloud: boolean; remoteHost?: string },
 ): string | undefined {
+  // #1512 — normalize BEFORE the truthy check, so a whitespace-only value falls
+  // through to auto-detection instead of being adopted as a real (unusable) path.
+  const { path: envPath } = normalizeInstallPathEnv(rawEnvPath);
   if (envPath) {
     if (opts.remoteUrl) {
       console.error(
