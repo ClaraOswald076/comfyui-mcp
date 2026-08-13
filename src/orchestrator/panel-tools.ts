@@ -2204,6 +2204,168 @@ async function settleExitSubgraphAfterAckTimeout(
   return timedOut;
 }
 
+// ---- panel_install_node: accepted-but-never-enqueued (#1129) ---------------
+// #1143 fixed the pre-queue REFUSAL (403/404 → direct clone). This is the other
+// half of the same family: legacy Manager 3.x answers the install POST with
+// `queued: true`, and the task never enters the queue at all. The reporter's
+// follow-up read showed an idle queue with `total_count: 0` and no directory
+// under custom_nodes, while this tool had already said "queued".
+//
+// It is the third time this repo has met the same lesson, so it is worth stating
+// once: ComfyUI-Manager's acknowledgement is not a receipt. `getlist` cannot
+// distinguish an unreachable registry from an empty one; a download reports done
+// when the QUEUE DRAINS rather than when the transfer finishes; and here an
+// accepted request is simply dropped. "Accepted" is never evidence of "happened",
+// so the only honest reply is one that went and looked.
+//
+// NOTE the asymmetry with install_custom_node, which already verifies and clones:
+// that path owns the filesystem it installs into. This one drives whatever
+// ComfyUI the PANEL is bound to, which need not be this machine — so it can
+// report the truth but must not quietly clone somewhere else.
+
+/** True when the panel's reply claims the install was accepted/queued. */
+function claimsQueued(reply: Record<string, unknown> | null): boolean {
+  if (!reply) return false;
+  return reply.queued === true || reply.pending === true;
+}
+
+/**
+ * `total_count` counts EVERY task the Manager has seen, completed ones included —
+ * so a fast install that already finished still leaves it ≥ 1. Zero therefore
+ * means nothing was ever enqueued, which is the decisive reading and the
+ * reporter's exact signature.
+ *
+ * Not my arithmetic: `countsFromStatus` in node-management.ts states the 3.x
+ * contract outright — "total_count = done + in_progress + queued exactly" — and
+ * derives pending from it. So `done_count` cannot be non-zero while total is 0.
+ *
+ * v4 reports `pending_count` directly and need not carry `total_count` at all, so
+ * this simply never fires there. That is correct: the dropped-enqueue defect is a
+ * legacy-3.x behaviour, and a shape that cannot answer must not be made to.
+ *
+ * ONE KNOWN WAY THIS READS ZERO AFTER A REAL INSTALL: the counters are cleared by
+ * `POST /manager/queue/reset`, which this codebase itself issues from
+ * manager-config.ts and workflow-deps.ts. Neither is in panel_install_node's
+ * path, and the read below happens immediately after the install returns, so it
+ * takes a CONCURRENT reset from another operation to land in that window.
+ *
+ * That residual case is the reason this only WARNS. A definite failure verdict
+ * would be wrong there, and wrong in the same direction as the bug being fixed —
+ * a confident claim the evidence does not support. A spurious "go and check"
+ * costs one read; a spurious "it definitely failed" costs a reinstall.
+ */
+function queueNeverSawATask(reply: Record<string, unknown> | null): boolean {
+  const status = (reply?.status ?? reply) as Record<string, unknown> | undefined;
+  if (typeof status?.total_count !== "number" || status.total_count !== 0) return false;
+  // PRESENT and zero, not absent-or-zero (codex P2). `panel-installer.ts`'s
+  // established legacy-empty proof requires every count to be reported and exact;
+  // accepting a missing field would let a payload that never described the queue
+  // stand in for one that did. A `pending_count`, if this build reports one, has
+  // to agree as well.
+  const presentZero = (v: unknown): boolean => v === 0;
+  if (!presentZero(status.done_count) || !presentZero(status.in_progress_count)) return false;
+  if (status.pending_count !== undefined && !presentZero(status.pending_count)) return false;
+  // IDLE TOO, not just empty (codex P1). A snapshot taken while the Manager is
+  // mid-accept can read zero before its counters move, and a running worker is
+  // the one state where zero means "not yet" rather than "never". The panel's own
+  // queue predicate draws the same line, so this matches rather than invents one.
+  // Absent/non-boolean is NOT treated as idle: unknown answers nothing.
+  if (status.is_processing !== false) return false;
+  // Coherent, by the 3.x contract quoted above: with total 0, both of these must
+  // be 0 as well. Anything else is a shape this reasoning does not describe.
+  return true;
+}
+
+/**
+ * After an install the panel reported as queued, confirm it actually was.
+ *
+ * Two NEGATIVE observations are required before this contradicts the panel: the
+ * queue never saw a task, AND the pack is absent from the installed list. Either
+ * alone is too weak — a queue shape without `total_count` proves nothing, and a
+ * pack missing from the list moments after enqueuing is normal, because it has
+ * not been cloned yet. Together they are the reported failure exactly.
+ *
+ * Anything inconclusive returns the panel's own reply untouched (#1473's rule).
+ */
+/**
+ * The panel identity a route key currently resolves to, or `undefined` when this
+ * bridge cannot report one.
+ *
+ * `undefined` means UNKNOWN, and callers must treat it as such rather than as
+ * "unchanged" (codex, final pass). Comparing two unknowns yields equality, which
+ * would let a same-key takeover pass the guard while the message claims the read
+ * happened "on that same panel" — a false statement produced by a guard that
+ * cannot see. The real UiBridge always implements this; only lightweight or mock
+ * contexts do not, and those simply do not get the warning.
+ */
+function panelIncarnation(ctx: PanelToolCtx, tabId: string): string | undefined {
+  const b = ctx.bridge as { tabIncarnation?: (t: string) => string | undefined };
+  return typeof b.tabIncarnation === "function" ? b.tabIncarnation(tabId) : undefined;
+}
+
+async function settleDroppedEnqueue(
+  ctx: PanelToolCtx,
+  res: ToolResult,
+  dispatch: { tab: string; incarnation: string | undefined },
+): Promise<ToolResult> {
+  if (res.isError) return res;
+  if (!claimsQueued(parseToolResultJson(res))) return res;
+
+  // The queue is only evidence about the panel the install was DISPATCHED to
+  // (codex P1 — and the same guard #1468 needed, which I did not carry across).
+  // `ctx.call` runs ensureReachable first, which silently rebinds an unpinned
+  // current-mode session onto the sole remaining interactive tab. A reconnect
+  // between the two calls would let ANOTHER ComfyUI's empty queue be reported as
+  // evidence about this install.
+  // The ROUTE KEY alone is not the panel (codex P1, round 3). A `wf:` key is
+  // `wf:<tabRouteId>:<path>` — it names a WORKFLOW, so it recurs, and a different
+  // browser tab can take it over without `ctx.tabId` changing at all. The bridge
+  // draws exactly this distinction and exposes `tabIncarnation` for it (#486), so
+  // both are captured: the key AND the incarnation currently holding it.
+  const queue = await ctx.call({ cmd: "nodes_queue_status" }, 15000);
+  if (ctx.tabId !== dispatch.tab) return res;
+  // Both captured BEFORE the install was dispatched, not here — a takeover that
+  // happens DURING the install is already baked in by the time this function
+  // runs, so comparing two post-install readings would always agree and the guard
+  // would be decorative. Its own test caught exactly that.
+  // UNKNOWN is not "unchanged": a bridge that cannot report an incarnation cannot
+  // rule out a same-key takeover, so it does not get to make a claim about which
+  // panel answered.
+  if (dispatch.incarnation === undefined) return res;
+  if (panelIncarnation(ctx, ctx.tabId) !== dispatch.incarnation) return res;
+  if (queue.isError || !queueNeverSawATask(parseToolResultJson(queue))) return res;
+
+  // NO PROVENANCE CLAIM AT ALL — deliberately, after five review rounds.
+  //
+  // Earlier drafts explained WHY the task was probably dropped ("the Manager
+  // accepted a git URL it does not recognise") and prescribed accordingly. Every
+  // round found that explanation false in some reachable state: an id-only
+  // install submits no URL; a `repository` that is any non-empty string is not
+  // necessarily a URL. Each fix branched on a fact the request does not reliably
+  // carry, and each branch was a fresh chance to assert the wrong cause.
+  //
+  // What this function actually observed is the queue reading. That is worth
+  // saying, needs no provenance, and cannot be wrong. The cause belongs to
+  // whoever can see the install — so the message asks for the ONE check that
+  // settles it and stops there. Less useful in the common case; never false.
+  return appendNote(
+    res,
+    `WARNING — THE QUEUE DOES NOT HAVE THIS TASK. The Manager accepted the install above, but a ` +
+      `read taken immediately afterwards, on that same panel, reports an IDLE queue holding no ` +
+      `tasks at all (total_count, done, in_progress all 0). "queued" is its acknowledgement, not ` +
+      `a receipt.\n\n` +
+      `THIS IS NOT PROOF EITHER WAY. Those counters are also cleared by a queue RESET, which ` +
+      `other operations in this server issue, so an install that really ran can read exactly ` +
+      `like this if a reset landed in between.\n\n` +
+      `SO CHECK: call panel_list_nodes and see whether the pack is actually there. Do not restart ` +
+      `on the assumption it installed, and do not reinstall on the assumption it did not.\n\n` +
+      `IF IT IS ABSENT: install it through the headless install_custom_node, which verifies the ` +
+      `pack really landed instead of trusting the queue, and can clone a repository URL directly ` +
+      `when the Manager will not take it. This tool cannot clone for you — it drives whatever ` +
+      `ComfyUI the panel is bound to, which need not be this machine.`,
+  );
+}
+
 /** Parse a ctx.call ToolResult's text payload as JSON, or null if not parseable. */
 function parseToolResultJson(res: ToolResult): Record<string, unknown> | null {
   if (!res || res.isError) return null;
@@ -11539,17 +11701,31 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // repository install that works, and disclose the rewrite.
         const { conflict, note, ...cmdArgs } = nodesInstallCommandArgs(args);
         if (conflict) return fail(conflict);
+        // #1129 — the panel identity is captured BEFORE dispatch, because a
+        // takeover during the install is exactly what the follow-up read must not
+        // be attributed to.
+        const dispatch = {
+          tab: ctx.tabId,
+          incarnation: panelIncarnation(ctx, ctx.tabId),
+        };
         const res = await ctx.call(
           { cmd: "nodes_install", ...cmdArgs },
           30000,
         );
+        // #1129 — settle BEFORE the note is appended. The note is glued on after
+        // the JSON body, which makes the payload unparseable as JSON, so a probe
+        // running afterwards reads `null`, concludes the panel never claimed a
+        // queue, and silently does nothing. Found by printing the real reply
+        // rather than by reasoning about it: the first version of this shipped
+        // the check and the check never ran.
+        const settled = await settleDroppedEnqueue(ctx, res, dispatch);
         if (note) {
-          const text = res.content.find((c) => c.type === "text");
+          const text = settled.content.find((c) => c.type === "text");
           if (text && text.type === "text") {
             text.text += `\n\nNOTE: ${note}`;
           }
         }
-        return res;
+        return settled;
       },
     ),
     def(
