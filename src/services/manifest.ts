@@ -256,7 +256,29 @@ function isUvNonVenvError(text: string): boolean {
  * would have fixed this reporter and no one else.
  */
 function isExternallyManagedError(text: string): boolean {
-  return /externally[- ]managed[- ]environment|externally managed/i.test(text);
+  return (
+    // pip's canonical PEP 668 error IDENTIFIER. Stable across distributors —
+    // the line under it is the distributor's prose and says something different
+    // on Debian, Homebrew and uv, so keying on that would have fixed one
+    // reporter and nobody else.
+    /externally-managed-environment/i.test(text) ||
+    // uv's own refusal, which uses no error id:
+    //   error: The interpreter at <path> is externally managed, and indicates ...
+    // Anchored on "interpreter at ... is externally managed" rather than the bare
+    // phrase (codex P2): plain "externally managed" appears in ordinary build and
+    // dependency output, and matching it would rewrite an unrelated failure as a
+    // managed-environment story — discarding the real cause behind a remedy that
+    // does not apply. Both forms below were MEASURED against uv 0.11.21 and a
+    // uv-managed CPython 3.12.13, not transcribed from documentation.
+    /interpreter at .+ is externally managed/i.test(text)
+  );
+}
+
+/** Cap the installer's own output carried into a refusal. Enough to diagnose,
+ *  bounded so a verbose failure cannot swamp the actionable part. */
+function clipInstallerOutput(text: string): string {
+  const cleaned = text.replace(/\r/g, "").split("\n").filter((l) => l.trim()).join("\n").trim();
+  return cleaned.length > 1200 ? `${cleaned.slice(0, 1200)}\n… (truncated)` : cleaned;
 }
 
 /** Both pip and uv write the refusal to stderr, but a non-zero exit from
@@ -277,8 +299,16 @@ function errorText(err: unknown): string {
  * that names the two supported routes is worth more than a write that appears to
  * work.
  */
-function externallyManagedRefusal(pkg: string, python: string): string {
+function externallyManagedRefusal(pkg: string, python: string, output = ""): string {
+  // The installer's OWN output is carried through (codex P2). This refusal
+  // replaces the underlying error rather than wrapping it, and apply_manifest
+  // reports only `err.message` per item — so without this the actual diagnostic
+  // is gone, and an earlier draft even claimed it was "above" when nothing had
+  // been printed. Anything the tool said that this message does not anticipate
+  // would have been lost silently.
+  const detail = clipInstallerOutput(output);
   return (
+    (detail ? `${detail}\n\n` : "") +
     `Refusing to install "${pkg}": the Python that ComfyUI runs (${python}) declares itself ` +
     `EXTERNALLY MANAGED (PEP 668), so nothing may install into it directly. This is normal for a ` +
     `uv-managed install (Stability Matrix) and for distro Pythons on Linux — a deliberate guard, ` +
@@ -326,7 +356,7 @@ async function installPipPackage(
       // directory rather than on PATH, so `useUv` is false and we come straight
       // here — into an interpreter whose pip refuses by design (PEP 668).
       if (isExternallyManagedError(errorText(err))) {
-        throw new ValidationError(externallyManagedRefusal(pkg, python));
+        throw new ValidationError(externallyManagedRefusal(pkg, python, errorText(err)));
       }
       throw err;
     }
@@ -350,7 +380,7 @@ async function installPipPackage(
     // bare pip there walks straight into the same wall one step later, burying
     // the real reason under a second failure.
     if (isExternallyManagedError(detail)) {
-      throw new ValidationError(externallyManagedRefusal(pkg, python));
+      throw new ValidationError(externallyManagedRefusal(pkg, python, errorText(err)));
     }
     if (isUvNonVenvError(detail)) {
       // System-Python ComfyUI (no venv): uv can't use the interpreter directly.
@@ -366,8 +396,12 @@ async function installPipPackage(
         // The fallback's OWN refusal (#1508). Reported as the managed-environment
         // case it is, not as a bare pip error, so the caller is not left reading
         // uv's non-venv complaint as the cause.
+        // `err2`, NOT `err`. The output carried into the refusal must be the one
+        // that actually refused — pip's. Attaching uv's earlier non-venv complaint
+        // here is precisely the misdirection this branch exists to prevent, and it
+        // would send the reader off to create a venv for the wrong reason.
         if (isExternallyManagedError(errorText(err2))) {
-          throw new ValidationError(externallyManagedRefusal(pkg, python));
+          throw new ValidationError(externallyManagedRefusal(pkg, python, errorText(err2)));
         }
         throw err2;
       }

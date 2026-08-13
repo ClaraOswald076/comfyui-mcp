@@ -928,6 +928,63 @@ describe("applyManifest", () => {
     expect(result.results[0].message ?? "").toMatch(/EXTERNALLY MANAGED/);
   });
 
+  it("does NOT claim PEP 668 for prose that merely says 'externally managed' (codex P2)", async () => {
+    // The detector originally matched the bare phrase anywhere in the output. Build
+    // and dependency errors do say it in passing, and rewriting one of those as the
+    // managed-environment story discards the real cause AND hands over a remedy
+    // that does not apply — a strictly worse failure than the raw error.
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      const probesUv = IS_WIN
+        ? cmd === "where" && args[0] === "uv"
+        : cmd === "uv" && args[0] === "--version";
+      if (probesUv) throw new Error("no uv");
+      if (args[0] === "-m" && args[1] === "pip") {
+        throw Object.assign(new Error("build failed"), {
+          stderr:
+            "note: This package vendors a library whose headers are externally managed by the " +
+            "distribution; see BUILD.md.\nerror: command 'cl.exe' failed with exit code 2",
+        });
+      }
+      return "ok";
+    });
+
+    const result = await applyManifest({ manifest: { pip: ["somepkg"] } });
+
+    expect(result.success).toBe(false);
+    const msg = result.results[0].message ?? "";
+    expect(msg).not.toMatch(/EXTERNALLY MANAGED \(PEP 668\)/);
+    expect(msg).not.toMatch(/uv venv/);
+    // The real cause survives.
+    expect(msg).toMatch(/cl\.exe|build failed/);
+  });
+
+  it("carries the installer's OWN output into the refusal (codex P2)", async () => {
+    // The refusal REPLACES the underlying error and apply_manifest reports only
+    // `err.message` per item, so anything the tool said that this message does not
+    // anticipate would be lost silently. An earlier draft even told the reader the
+    // output was "above" when nothing had been printed.
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      const probesUv = IS_WIN
+        ? cmd === "where" && args[0] === "uv"
+        : cmd === "uv" && args[0] === "--version";
+      if (probesUv) throw new Error("no uv");
+      if (args[0] === "-m" && args[1] === "pip") {
+        throw Object.assign(new Error("pip failed"), {
+          stderr: `${PEP668}\nhint: See PEP 668 for the detailed specification.`,
+        });
+      }
+      return "ok";
+    });
+
+    const result = await applyManifest({ manifest: { pip: ["imageio-ffmpeg"] } });
+    const msg = result.results[0].message ?? "";
+
+    expect(msg).toMatch(/This Python installation is managed by uv/);
+    expect(msg).toMatch(/hint: See PEP 668/);
+    // ...and the actionable part is still there, not drowned by it.
+    expect(msg).toMatch(/EXTERNALLY MANAGED/);
+  });
+
   it("still surfaces an ORDINARY pip failure as itself (#1508)", async () => {
     // The guard must not swallow every pip error into a managed-environment
     // story — a missing package is a different problem with a different answer.
