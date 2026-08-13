@@ -210,13 +210,13 @@ async function resolveWorkspacePython(comfyuiPath: string): Promise<InstallInter
 
 function validatePipPackageSpec(pkg: string): void {
   if (pkg.startsWith("-")) {
-    throw new ValidationError(`Manifest pip entry must be a package spec, not an option: ${pkg}`);
+    throw new ValidationError(`Manifest pip entry must be a package spec, not an option: ${redactUrlCredentials(pkg)}`);
   }
   if (ASCII_CONTROL_RE.test(pkg)) {
     throw new ValidationError("Manifest pip entry cannot contain ASCII control characters.");
   }
   if (WHITESPACE_RE.test(pkg)) {
-    throw new ValidationError(`Manifest pip entry cannot contain whitespace: ${pkg}`);
+    throw new ValidationError(`Manifest pip entry cannot contain whitespace: ${redactUrlCredentials(pkg)}`);
   }
 }
 
@@ -241,6 +241,161 @@ function isUvNonVenvError(text: string): boolean {
   );
 }
 
+/**
+ * #1508 — PEP 668: the interpreter declares itself EXTERNALLY MANAGED, so its own
+ * pip refuses to install into it. Stability Matrix's uv-managed CPython does
+ * exactly this:
+ *
+ *   error: externally-managed-environment
+ *   This Python installation is managed by uv and should not be modified.
+ *
+ * Keyed on the PEP's own error id first (`externally-managed-environment`, the
+ * literal pip emits) and the prose form second, because the second line is
+ * supplied by the distributor's EXTERNALLY-MANAGED file and therefore says
+ * something different on Debian, Homebrew, and uv. Matching only the uv wording
+ * would have fixed this reporter and no one else.
+ */
+function isExternallyManagedError(text: string): boolean {
+  return (
+    // pip's canonical PEP 668 error IDENTIFIER. Stable across distributors —
+    // the line under it is the distributor's prose and says something different
+    // on Debian, Homebrew and uv, so keying on that would have fixed one
+    // reporter and nobody else.
+    // Anchored to the START OF A LINE, which is where pip prints it:
+    //   error: externally-managed-environment
+    // (measured). An unanchored match would fire on any output that merely
+    // CONTAINS the token — a file path, a package name, a vendored log line —
+    // and rewrite an unrelated failure as this one, discarding its real cause
+    // (codex P2).
+    /^\s*error: externally-managed-environment/im.test(text) ||
+    // uv's own refusal, which uses no error id:
+    //   error: The interpreter at <path> is externally managed, and indicates ...
+    // Anchored on "interpreter at ... is externally managed" rather than the bare
+    // phrase (codex P2): plain "externally managed" appears in ordinary build and
+    // dependency output, and matching it would rewrite an unrelated failure as a
+    // managed-environment story — discarding the real cause behind a remedy that
+    // does not apply. Both forms below were MEASURED against uv 0.11.21 and a
+    // uv-managed CPython 3.12.13, not transcribed from documentation.
+    /interpreter at .+ is externally managed/i.test(text)
+  );
+  // WHICH WAY THIS FAILS MATTERS, and it is chosen deliberately (codex P2, the
+  // opposite direction). PEP 668 requires only that the installer error out; it
+  // does not mandate pip's renderer token, so a distributor-patched or localized
+  // installer can refuse in wording neither pattern above matches.
+  //
+  // That miss is the SAFE failure. It surfaces the installer's own error
+  // unchanged — exactly today's behaviour, no regression — and that error already
+  // names PEP 668 itself. The reader loses this message's extra guidance and
+  // nothing else. The opposite error, matching too eagerly, REPLACES a real cause
+  // with a remedy that does not apply, which is strictly worse than saying
+  // nothing. So this stays tight and is widened only against a refusal someone
+  // has actually seen.
+}
+
+/** Cap the installer's own output carried into a refusal. Enough to diagnose,
+ *  bounded so a verbose failure cannot swamp the actionable part. */
+/**
+ * Mask credentials embedded in a URL's userinfo (`https://user:token@host/...`).
+ *
+ * A pip entry may legitimately BE such a URL — `validatePipPackageSpec` only
+ * rejects options, control characters and whitespace — so the spec itself is a
+ * secret-bearing string, not just the command line built around it. Applied to
+ * everything this refusal renders: the package name it echoes AND the installer
+ * output it carries, since pip prints the URL it is fetching.
+ */
+function redactUrlCredentials(text: string): string {
+  // Userinfo runs from `://` to the LAST `@` before the path, and may contain
+  // BOTH ':' and '@' in the password — `https://u:alpha@beta@host` is a valid URL
+  // whose password is `alpha@beta`. An earlier version stopped at the FIRST `@`
+  // ([^/\s@]+@) and so rendered that as `https://***:***@beta@host`, leaking half
+  // the secret while looking redacted (codex P1).
+  //
+  // `[^/\s]*` is GREEDY and cannot cross `/` or whitespace, so it runs to the
+  // last `@` within the authority and no further.
+  return text.replace(/(\w+:\/\/)[^/\s]*@/g, (_m, scheme: string) => `${scheme}***:***@`);
+}
+
+function clipInstallerOutput(text: string): string {
+  const cleaned = text.replace(/\r/g, "").split("\n").filter((l) => l.trim()).join("\n").trim();
+  return cleaned.length > 1200 ? `${cleaned.slice(0, 1200)}\n… (truncated)` : cleaned;
+}
+
+/** Both pip and uv write the refusal to stderr, but a non-zero exit from
+ *  execFileSync carries it across `stderr`, `stdout` and `message` inconsistently
+ *  depending on how the child died — so every failure is read from all three. */
+function errorText(err: unknown): string {
+  const e = err as NodeJS.ErrnoException & { stdout?: Buffer | string; stderr?: Buffer | string };
+  return `${e?.stderr?.toString() ?? ""}\n${e?.stdout?.toString() ?? ""}\n${e?.message ?? ""}`;
+}
+
+/**
+ * The installer's OWN output — stderr and stdout only, deliberately WITHOUT
+ * `Error.message`.
+ *
+ * Node builds that message as `Command failed: <the whole argv>`, so it embeds
+ * the package spec. A pip spec may legitimately be a direct URL, and a direct URL
+ * may carry credentials (`https://user:token@host/pkg.whl`) — that entry passes
+ * `validatePipPackageSpec`, which only rejects options, control characters and
+ * whitespace. Echoing the command back into a user-facing refusal would copy the
+ * token into it.
+ *
+ * `errorText` still includes the message, because DETECTION wants the breadth (a
+ * child that dies before writing to a stream can leave the reason only there).
+ * What gets shown is narrower than what gets matched, which is the right way
+ * round.
+ */
+function installerOutput(err: unknown): string {
+  const e = err as NodeJS.ErrnoException & { stdout?: Buffer | string; stderr?: Buffer | string };
+  return `${e?.stderr?.toString() ?? ""}\n${e?.stdout?.toString() ?? ""}`;
+}
+
+/**
+ * #1508 — the refusal, said in a way that can be acted on.
+ *
+ * Deliberately does NOT reach for `--break-system-packages`, which is the
+ * reporter's own caution and the right one: on a uv-managed interpreter that
+ * writes into an environment uv owns and may later reset, converting a clean
+ * refusal into a silent, delayed breakage of their ComfyUI install. A refusal
+ * that names the two supported routes is worth more than a write that appears to
+ * work.
+ */
+function externallyManagedRefusal(pkg: string, python: string, output = ""): string {
+  // The installer's OWN output is carried through (codex P2). This refusal
+  // replaces the underlying error rather than wrapping it, and apply_manifest
+  // reports only `err.message` per item — so without this the actual diagnostic
+  // is gone, and an earlier draft even claimed it was "above" when nothing had
+  // been printed. Anything the tool said that this message does not anticipate
+  // would have been lost silently.
+  // REDACT, then clip — never the other way round (codex P1). Clipping first can
+  // sever the `@` that the redaction pattern anchors on, so a secret sitting near
+  // the cut survives as `https://u:token` in a message that looks sanitised.
+  const detail = clipInstallerOutput(redactUrlCredentials(output));
+  return (
+    (detail ? `${detail}\n\n` : "") +
+    `Refusing to install "${redactUrlCredentials(pkg)}": the Python that ComfyUI runs (${python}) declares itself ` +
+    `EXTERNALLY MANAGED (PEP 668), so nothing may install into it directly. This is normal for a ` +
+    `uv-managed install (Stability Matrix) and for distro Pythons on Linux — a deliberate guard, ` +
+    `not a broken interpreter.\n\n` +
+    `uv does NOT get around this: \`uv pip install --python "${python}"\` is refused by uv too, ` +
+    `with "the interpreter ... is externally managed". Measured, not assumed — so do not spend ` +
+    `time on it.\n\n` +
+    `What actually works — the environment needs to be a VIRTUAL one:\n` +
+    `  - if your launcher owns this install (Stability Matrix), add the package through its own ` +
+    `Python-packages UI, which installs into the environment it manages for ComfyUI;\n` +
+    `  - or create a venv and run ComfyUI from it: \`uv venv <dir>\` (uv's own suggestion for ` +
+    `exactly this error), install there, then set COMFYUI_PYTHON to that interpreter and restart ` +
+    `ComfyUI through this server so the manifest installs into it.\n\n` +
+    `WORTH CHECKING FIRST: if ComfyUI already runs from a virtual environment, then the ` +
+    `interpreter above is the wrong one — a base install picked up instead of the venv — and the ` +
+    `fix is to point COMFYUI_PYTHON at the venv rather than to change anything about packaging. ` +
+    `The path in this message is the one to compare against.\n\n` +
+    `Not doing it for you: pip offers \`--break-system-packages\` and this refuses to pass it. On ` +
+    `a uv-managed interpreter that writes into an environment uv owns and may later reset, which ` +
+    `turns a clear failure now into a broken ComfyUI later. That stays a decision you make ` +
+    `deliberately, not one inherited from a manifest.`
+  );
+}
+
 async function installPipPackage(
   pkg: string,
   comfyuiPath: string,
@@ -249,19 +404,29 @@ async function installPipPackage(
   const resolved = await resolveWorkspacePython(comfyuiPath);
   if (!resolved.python) {
     throw new ValidationError(
-      `Refusing to install "${pkg}". ${resolved.reason} Set COMFYUI_PYTHON to the interpreter ComfyUI runs with, or restart ComfyUI through this MCP server and retry.`,
+      `Refusing to install "${redactUrlCredentials(pkg)}". ${resolved.reason} Set COMFYUI_PYTHON to the interpreter ComfyUI runs with, or restart ComfyUI through this MCP server and retry.`,
     );
   }
   const python = resolved.python;
   const useUv = commandExists("uv");
 
   if (!useUv) {
-    logger.info("Installing manifest Python package", { package: pkg, installer: "pip" });
-    runPythonPipInstall(python, pkg, comfyuiPath);
+    logger.info("Installing manifest Python package", { package: redactUrlCredentials(pkg), installer: "pip" });
+    try {
+      runPythonPipInstall(python, pkg, comfyuiPath);
+    } catch (err) {
+      // #1508 — THE reporter's path. Stability Matrix bundles uv inside its own
+      // directory rather than on PATH, so `useUv` is false and we come straight
+      // here — into an interpreter whose pip refuses by design (PEP 668).
+      if (isExternallyManagedError(errorText(err))) {
+        throw new ValidationError(externallyManagedRefusal(pkg, python, installerOutput(err)));
+      }
+      throw err;
+    }
     return resolved;
   }
 
-  logger.info("Installing manifest Python package", { package: pkg, installer: "uv" });
+  logger.info("Installing manifest Python package", { package: redactUrlCredentials(pkg), installer: "uv" });
   try {
     const out = execFileSync("uv", ["pip", "install", "--python", python, pkg], {
       cwd: comfyuiPath,
@@ -272,17 +437,37 @@ async function installPipPackage(
     void out;
     return resolved;
   } catch (err) {
-    const e = err as NodeJS.ErrnoException & { stdout?: Buffer | string; stderr?: Buffer | string };
-    const detail = `${e.stderr?.toString() ?? ""}\n${e.stdout?.toString() ?? ""}\n${e.message ?? ""}`;
+    const detail = errorText(err);
+    // #1508 — checked BEFORE the #377 fallback. uv's non-venv message and a PEP
+    // 668 refusal can both appear on a managed interpreter, and falling back to
+    // bare pip there walks straight into the same wall one step later, burying
+    // the real reason under a second failure.
+    if (isExternallyManagedError(detail)) {
+      throw new ValidationError(externallyManagedRefusal(pkg, python, installerOutput(err)));
+    }
     if (isUvNonVenvError(detail)) {
       // System-Python ComfyUI (no venv): uv can't use the interpreter directly.
       // The interpreter's own pip installs into that exact environment, which is
       // what we want (#377).
       logger.info(
         "uv rejected the non-venv ComfyUI interpreter; falling back to `python -m pip install`",
-        { package: pkg },
+        { package: redactUrlCredentials(pkg) },
       );
-      runPythonPipInstall(python, pkg, comfyuiPath);
+      try {
+        runPythonPipInstall(python, pkg, comfyuiPath);
+      } catch (err2) {
+        // The fallback's OWN refusal (#1508). Reported as the managed-environment
+        // case it is, not as a bare pip error, so the caller is not left reading
+        // uv's non-venv complaint as the cause.
+        // `err2`, NOT `err`. The output carried into the refusal must be the one
+        // that actually refused — pip's. Attaching uv's earlier non-venv complaint
+        // here is precisely the misdirection this branch exists to prevent, and it
+        // would send the reader off to create a venv for the wrong reason.
+        if (isExternallyManagedError(errorText(err2))) {
+          throw new ValidationError(externallyManagedRefusal(pkg, python, installerOutput(err2)));
+        }
+        throw err2;
+      }
       return resolved;
     }
     throw err;
@@ -536,7 +721,28 @@ function report(
   status: ManifestItemStatus,
   message: string,
 ): ManifestItemReport {
-  return { action, item, status, message };
+  // `item` is echoed back verbatim from the manifest, and a pip entry or a model
+  // URL may legitimately carry credentials in its userinfo. Redacting only the
+  // MESSAGE left the secret in the structured result — which is what actually
+  // travels into transcripts and logs (codex, and my own test asserted the
+  // narrower claim while believing the wider one).
+  //
+  // The entry stays identifiable: only the userinfo is masked, so the host and
+  // path a reader matches on are untouched.
+  //
+  // `message` too, and this is the CHOKE POINT that closes the class rather than
+  // the instances (codex r4). An ordinary, non-PEP-668 failure is rethrown raw by
+  // design — that is the right call for diagnosis — and the caller reports
+  // `err.message`, which Node builds as `Command failed: <whole argv>`. So every
+  // pip failure that ISN'T the case this issue is about was still echoing the
+  // spec. Redacting here covers those, the model and custom-node paths, and any
+  // future one, instead of requiring each new call site to remember.
+  return {
+    action,
+    item: redactUrlCredentials(item),
+    status,
+    message: redactUrlCredentials(message),
+  };
 }
 
 /**
