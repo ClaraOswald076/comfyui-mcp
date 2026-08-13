@@ -411,7 +411,7 @@ async function installPipPackage(
   const useUv = commandExists("uv");
 
   if (!useUv) {
-    logger.info("Installing manifest Python package", { package: pkg, installer: "pip" });
+    logger.info("Installing manifest Python package", { package: redactUrlCredentials(pkg), installer: "pip" });
     try {
       runPythonPipInstall(python, pkg, comfyuiPath);
     } catch (err) {
@@ -426,7 +426,7 @@ async function installPipPackage(
     return resolved;
   }
 
-  logger.info("Installing manifest Python package", { package: pkg, installer: "uv" });
+  logger.info("Installing manifest Python package", { package: redactUrlCredentials(pkg), installer: "uv" });
   try {
     const out = execFileSync("uv", ["pip", "install", "--python", python, pkg], {
       cwd: comfyuiPath,
@@ -451,7 +451,7 @@ async function installPipPackage(
       // what we want (#377).
       logger.info(
         "uv rejected the non-venv ComfyUI interpreter; falling back to `python -m pip install`",
-        { package: pkg },
+        { package: redactUrlCredentials(pkg) },
       );
       try {
         runPythonPipInstall(python, pkg, comfyuiPath);
@@ -729,7 +729,20 @@ function report(
   //
   // The entry stays identifiable: only the userinfo is masked, so the host and
   // path a reader matches on are untouched.
-  return { action, item: redactUrlCredentials(item), status, message };
+  //
+  // `message` too, and this is the CHOKE POINT that closes the class rather than
+  // the instances (codex r4). An ordinary, non-PEP-668 failure is rethrown raw by
+  // design — that is the right call for diagnosis — and the caller reports
+  // `err.message`, which Node builds as `Command failed: <whole argv>`. So every
+  // pip failure that ISN'T the case this issue is about was still echoing the
+  // spec. Redacting here covers those, the model and custom-node paths, and any
+  // future one, instead of requiring each new call site to remember.
+  return {
+    action,
+    item: redactUrlCredentials(item),
+    status,
+    message: redactUrlCredentials(message),
+  };
 }
 
 /**

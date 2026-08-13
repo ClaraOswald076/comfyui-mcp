@@ -1048,6 +1048,32 @@ describe("applyManifest", () => {
     expect(result.results[0].item).toMatch(/example\.invalid\/pkg-1\.0/);
   });
 
+  it("redacts the spec on an ORDINARY failure too, not just the PEP 668 one", async () => {
+    // The non-PEP-668 path rethrows raw by design — right for diagnosis — and the
+    // caller reports err.message, which Node builds as `Command failed: <argv>`.
+    // So every pip failure that is NOT this issue's case was still echoing the
+    // spec. Closed at report(), the one place every item passes through, rather
+    // than at each call site.
+    const SPEC = "https://ci:s3cr3t-token@example.invalid/pkg-1.0.whl";
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      const probesUv = IS_WIN
+        ? cmd === "where" && args[0] === "uv"
+        : cmd === "uv" && args[0] === "--version";
+      if (probesUv) throw new Error("no uv");
+      if (args[0] === "-m" && args[1] === "pip") {
+        throw new Error(`Command failed: python -m pip install ${SPEC}\nERROR: no matching dist`);
+      }
+      return "ok";
+    });
+
+    const result = await applyManifest({ manifest: { pip: [SPEC] } });
+
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result)).not.toMatch(/s3cr3t-token/);
+    // The real cause still survives — redaction must not cost the diagnosis.
+    expect(result.results[0].message ?? "").toMatch(/no matching dist/);
+  });
+
   it("redacts a password containing '@' and one sitting past the output clip", async () => {
     // Two ways a redaction can look right and not be (codex P1):
     //   - the pattern stopping at the FIRST '@' when the password contains one;
