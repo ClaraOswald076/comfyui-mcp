@@ -86,6 +86,7 @@ function journalConversationFor(ctx: PanelToolCtx): string | undefined {
   return conversationOfScopeAddress(ctx.tabId);
 }
 import {
+  BRIDGE_DEFAULT_TIMEOUT_MS,
   dispatchOutcomeOf,
   isCapabilityRefusal,
   isPanelCmdUnsupportedError,
@@ -2056,6 +2057,150 @@ function isAckTimeout(res: ToolResult): boolean {
   // whitespace, so trimming buys nothing and only lets a whitespace/newline-
   // prefixed acked error reach the receipt-recovery path.
   return /^(?:Error: )?Panel tab .+? did not reply to "workflow_open" within \d+\s*ms/i.test(text);
+}
+
+/**
+ * #1468 — carry the bridge's AUTHORITATIVE reply-timeout marker across the
+ * error → ToolResult conversion in `ctx.call`.
+ *
+ * Two codex rounds rejected deciding this from message TEXT, and both were right.
+ * `isAckTimeout`'s looseness is safe for `workflow_open` because a match there
+ * only opens a door — the panel's #514 receipt, correlated to the request's exact
+ * rid, is what actually decides. A caller with no receipt has the predicate doing
+ * all the work: match plus one root-looking read promotes an error to success. No
+ * amount of regex tightening fixes that, because ACKED panel errors arrive as
+ * ARBITRARY `msg.error` text (ui-bridge) and `ctx.call` flattens both kinds into
+ * the same text-only result — so any sentence the bridge can write, a panel error
+ * can also contain.
+ *
+ * `markReplyTimeout`/`isReplyTimeoutTagged` already answer the question exactly,
+ * on the error object, at the only place that KNOWS: the bridge. The information
+ * was simply being dropped in translation. This preserves it as a non-enumerable
+ * symbol so the result's JSON payload is byte-identical and nothing downstream
+ * can observe it by accident.
+ */
+const REPLY_TIMEOUT_RESULT = Symbol("panel.replyTimeoutResult");
+
+function carryReplyTimeoutMark(err: unknown, res: ToolResult): ToolResult {
+  if (!isReplyTimeoutTagged(err)) return res;
+  Object.defineProperty(res, REPLY_TIMEOUT_RESULT, {
+    value: true,
+    enumerable: false,
+    configurable: true,
+  });
+  return res;
+}
+
+/** True only for a ToolResult that `ctx.call` produced from a BRIDGE-TAGGED
+ *  reply timeout — the tab was reached and never answered. An acked executor
+ *  error can never carry this, whatever its text says. */
+function isReplyTimeoutResult(res: ToolResult): boolean {
+  return res?.isError === true && (res as Record<symbol, unknown>)[REPLY_TIMEOUT_RESULT] === true;
+}
+
+// ---- panel_exit_subgraph settle-after-ack-timeout (#1468) ------------------
+// `graph_exit_subgraph` timed out at 15 s while a following `panel_graph_outline`
+// proved the view HAD returned to root — an applied navigation reported as a
+// failed one. The bound is not the cause: the panel's own receipt
+// (`confirmCanvasNavigation`) budgets 25 polls × 40 ms ≈ 1 s and returns early on
+// success, so 15 s already clears its worst case by 15×. What fails is the ANSWER
+// getting back from a busy tab. The effect, though, is locally observable — so on
+// a no-reply we ask, exactly as #1473 does for the fence, instead of handing the
+// caller "may have been applied" and the homework.
+
+/** The one decisive observation: the canvas is at the root graph. */
+function exitConfirmedAtRootNote(): string {
+  return (
+    `CHECKED FOR YOU: the tab did not ACKNOWLEDGE the exit within the window, but a graph read ` +
+    `taken immediately afterwards, on that same tab, reports the canvas at the ROOT graph — the ` +
+    `state this tool exists to reach. No recovery step is needed and a retry would be wasted ` +
+    `work. A missing acknowledgement is not evidence the navigation failed; here it is evidence ` +
+    `the tab was too busy to answer in time. Stated precisely: what is established is WHERE THE ` +
+    `CANVAS IS, not that this command is what put it there — someone navigating out on the ` +
+    `canvas while the tab was unresponsive would read identically. Both leave you where you ` +
+    `asked to be, so the distinction changes nothing you would do next; it is drawn because only ` +
+    `one of the two was actually observed.`
+  );
+}
+
+/**
+ * The NON-decisive observation, stated as non-decisive. `graph_exit_subgraph`
+ * pops to the IMMEDIATE PARENT, not to root (#412) — so "still inside a subgraph"
+ * is equally consistent with the exit never landing and with the exit landing in
+ * the parent of a NESTED subgraph. Recommending a retry on this reading would pop
+ * a level the caller wanted to keep, which is the same class of harm as the false
+ * failure being fixed, one step removed.
+ */
+function exitInconclusiveInSubgraphNote(title: string | null): string {
+  const where = title ? `subgraph “${title}”` : "a subgraph";
+  return (
+    `CHECKED FOR YOU — and the check does NOT settle it. A graph read taken immediately after the ` +
+    `missing acknowledgement reports the canvas inside ${where}. panel_exit_subgraph pops to the ` +
+    `IMMEDIATE PARENT, not to the root graph, so this single observation cannot separate two ` +
+    `cases: the exit never landed and you are where you started, OR the exit DID land and this is ` +
+    `the parent you popped into from a nested subgraph. Settle it with a scope read ` +
+    `(panel_graph_outline, or the canvas breadcrumb) before acting. If you do re-issue, use the ` +
+    `retry_of token above rather than a bare repeat: a token names the original mutation and is ` +
+    `answered from its ledger entry WITHOUT running the executor again (#694), whereas identical ` +
+    `args with no token execute fresh — and from the second case that pops another level you may ` +
+    `have wanted to keep.`
+  );
+}
+
+/**
+ * After an ack timeout on `graph_exit_subgraph`, take ONE scope read and report
+ * what it found. Returns the untouched timeout when the read cannot answer —
+ * #1473's rule: an unknown answer claims nothing in either direction, and reading
+ * every probe failure as proof would invent a verdict out of a backgrounded tab.
+ */
+async function settleExitSubgraphAfterAckTimeout(
+  ctx: PanelToolCtx,
+  timedOut: ToolResult,
+): Promise<ToolResult> {
+  // The observation is only evidence about the tab the navigation was DISPATCHED
+  // to (codex P1). `ctx.call` runs `ensureReachable` first, which silently rebinds
+  // an unpinned current-mode session onto the sole remaining interactive tab when
+  // the bound one has gone — the exact situation an unanswered command makes
+  // likely. Without this the probe could read a DIFFERENT tab's canvas, and that
+  // tab sitting at root would be reported as this navigation having landed: a
+  // wrong-target success, which is worse than the false failure being fixed.
+  const dispatchTab = ctx.tabId;
+  // `fields:"ids", limit:1` is the cheapest shape that still carries `viewing` —
+  // the panel builds that field unconditionally on every graph_query return path.
+  const probe = await ctx.call({ cmd: "graph_query", fields: "ids", limit: 1 }, 8000);
+  // Checked AFTER the call, because the rebind happens inside it. A moved binding
+  // makes the reading inconclusive, not false — so it takes the same "claim
+  // nothing" exit as an unanswerable probe.
+  if (ctx.tabId !== dispatchTab) return timedOut;
+  const viewing = parseToolResultJson(probe)?.viewing as
+    | { scope?: unknown; title?: unknown; owner_node_id?: unknown }
+    | undefined;
+  const scope = typeof viewing?.scope === "string" ? viewing.scope : null;
+
+  if (scope === "root") {
+    // `at_root`, NOT `exited`. The read proves WHERE THE CANVAS IS; it cannot
+    // prove this command is what put it there (the user may have navigated out on
+    // the canvas while the tab was too busy to answer us). Those happen to be the
+    // same actionable answer — the caller's goal state holds either way — but only
+    // one of them is something the observation actually establishes, and naming
+    // the stronger claim would be this issue's own defect pointed the other way.
+    return ok({
+      viewing,
+      at_root: true,
+      acknowledged: false,
+      confirmed_by: "graph read after ack timeout",
+      note: exitConfirmedAtRootNote(),
+    });
+  }
+  if (scope === "subgraph") {
+    const title = typeof viewing?.title === "string" && viewing.title ? viewing.title : null;
+    const text = timedOut.content?.find((c) => c.type === "text")?.text ?? "";
+    return {
+      ...timedOut,
+      content: [{ type: "text", text: `${text}\n\n${exitInconclusiveInSubgraphNote(title)}` }],
+    };
+  }
+  return timedOut;
 }
 
 /** Parse a ctx.call ToolResult's text payload as JSON, or null if not parseable. */
@@ -6420,7 +6565,13 @@ export function makePanelToolCtx(
                 `panel_set_workflow_target({mode:"current"}). (${err2 instanceof Error ? err2.message : String(err2)})`,
             );
           }
-          return fail(err2);
+          // #1468 — the RETRY's own failure can be a reply timeout too: this branch
+          // is only entered when the FIRST error was a reconnect flap or a switch
+          // refusal, so a tagged no-reply lands here rather than on the outer path.
+          // Leaving it unmarked fails closed (nothing is settled, no false success)
+          // but silently switches the settle off for a real sequence, which is the
+          // kind of gap that reads as "the fix does not work" much later.
+          return carryReplyTimeoutMark(err2, fail(err2));
         }
       }
       // #442 defect 4: a MUTATING command (deliberately excluded from RETRY_SAFE_CMDS)
@@ -6671,11 +6822,14 @@ export function makePanelToolCtx(
         (dispatchOutcomeOf(err) === true || isReplyTimeoutTagged(err))
       ) {
         const cause = err instanceof Error ? err.message : String(err);
-        return fail(
-          `${cause}\n\nTo retry this exact mutation, re-issue identical args plus retry_of:"${dispatchedRid}"; otherwise call normally.`,
+        return carryReplyTimeoutMark(
+          err,
+          fail(
+            `${cause}\n\nTo retry this exact mutation, re-issue identical args plus retry_of:"${dispatchedRid}"; otherwise call normally.`,
+          ),
         );
       }
-      return fail(err);
+      return carryReplyTimeoutMark(err, fail(err));
     }
   };
   // Human-in-the-loop confirmation for a DESTRUCTIVE op: render a yes/no card in
@@ -10287,9 +10441,29 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // other direct-bridge call site) — without this an orphaned session
           // wrongly returns "no connected tab" even when a live tab exists (#381).
           ctx.ensureReachable?.();
+          // #1468 — was a hardcoded 10_000, HALF this codebase's own default, and
+          // the tight bound is the entire bug: `civitai_search` kept timing out
+          // while the search demonstrably applied (renderRev advanced,
+          // civitai_results reported loading:true), so an applied mutation was
+          // reported to the caller as a failure.
+          //
+          // The tight bound was there to fence a wait on CivitAI's HTTP. That wait
+          // is GONE: panel #282 made `driveSearch` resolve on DISPATCH — it fires
+          // `void reload(...)` and returns `{dispatched:true, renderRev}` with no
+          // await anywhere in the handler. That shipped at panel 0.11.0; #1468 was
+          // filed from 0.11.44, so the reporter already had it. Measured, not
+          // assumed — my own first reading of this issue asserted the coupling was
+          // still there and argued AGAINST raising the bound on that basis.
+          //
+          // With nothing external left to wait on, what remains between the panel's
+          // return and the caller's error is only whether the reply gets back in
+          // time — the #357/#694 shape, a busy-but-alive main thread missing a
+          // tighter-than-default bound and succeeding moments later. So this takes
+          // the shared default like every other panel command, rather than keeping
+          // a fence around a wait that no longer exists.
           const reply = await ctx.bridge.send(
             { cmd: "civitai_search", query, filters: args.filters, browsingLevels } as { cmd: string },
-            { tabId: ctx.tabId, timeoutMs: 10000 },
+            { tabId: ctx.tabId, timeoutMs: BRIDGE_DEFAULT_TIMEOUT_MS },
           );
           // Do NOT let a supplied-but-unapplied creator filter masquerade as a
           // legitimate empty result: if the panel echoes back a different (or null)
@@ -11248,7 +11422,17 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
       "panel_exit_subgraph",
       "Leave the current subgraph and return to the root graph (undo a panel_enter_subgraph). After this, panel_* tools target the root graph again.",
       {},
-      async (_args, ctx) => ctx.call({ cmd: "graph_exit_subgraph" }, 15000),
+      async (_args, ctx) => {
+        const res = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+        // #1468 — ONLY a no-reply is settled by a read. A genuine executor error
+        // (the panel's own "could not confirm … no observation ever saw the canvas
+        // there") is an ACKED reply the bridge received and relayed; it already
+        // reasoned about this exact uncertainty and prescribes its own next step,
+        // so re-deciding it from out here would overwrite a better-informed verdict
+        // with a worse-informed one.
+        if (!isReplyTimeoutResult(res)) return res;
+        return settleExitSubgraphAfterAckTimeout(ctx, res);
+      },
     ),
     def(
       "panel_move_rail",
