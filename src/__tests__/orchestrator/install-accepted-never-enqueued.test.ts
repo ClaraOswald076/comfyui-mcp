@@ -1,22 +1,30 @@
 // #1129 (reopened) — legacy ComfyUI-Manager 3.x answers the install POST with
-// `queued: true` and then never enqueues the task. The reporter's follow-up read
+// `queued: true` and never enqueues the task. The reporter's follow-up read
 // showed an idle queue with `total_count: 0` and no directory under
 // custom_nodes, while panel_install_node had already reported success.
 //
-// #1143 fixed the OTHER half of this family — a pre-queue 403/404 refusal now
-// falls through to a direct clone. That fix keys on the rejection status, so it
-// cannot fire here: the POST succeeded.
+// #1143 fixed the OTHER half of this family — a pre-queue 403/404 refusal falls
+// through to a direct clone. It keys on the rejection status, so it cannot fire
+// here: the POST succeeded.
 //
-// WHY THIS IS NOT THE SAME FIX AS install_custom_node's. That tool already
-// verifies and clones, and it may: it owns the filesystem it installs into.
-// panel_install_node drives whatever ComfyUI the PANEL is bound to, which need
-// not be this machine — so it may report the truth but must not clone somewhere
-// else on the caller's behalf.
+// WHY THIS ONLY WARNS, AND DOES NOT REPORT FAILURE. The first version checked the
+// installed list too and, finding the pack absent, flipped the result to an
+// error. Adversarial review killed that, correctly, on three counts:
 //
-// THE BAR FOR CONTRADICTING THE PANEL is two NEGATIVE observations, because
-// either alone is too weak: a queue shape without `total_count` proves nothing,
-// and a pack missing from the installed list moments after enqueuing is entirely
-// normal — it has not been cloned yet.
+//   - it substring-searched the RAW reply text instead of a validated shape, so
+//     an error envelope or an unfamiliar dialect payload read as "absent" —
+//     breaking this file's own rule that an unknown answer claims nothing;
+//   - the fixture it was tested against (`{nodes:[{name}]}`) is not the panel's
+//     production shape at all (`{installed: ...}`), so the check was only ever
+//     passing because it searched text;
+//   - a git URL's checkout directory need not match its URL basename, and the
+//     panel documents those targets as rename-prone. Absence by derived name
+//     therefore cannot PROVE failure.
+//
+// Since the second observation cannot be made decisive, the honest reply is a
+// warning that says exactly what WAS observed — the queue has no such task — and
+// tells the caller to confirm. A false "definitely failed" on a working install
+// is the same class of harm as the false success this issue is about.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../comfyui/client.js", () => ({
@@ -38,33 +46,23 @@ const textOf = (r: ToolResult): string =>
 
 let sent: string[] = [];
 
-/**
- * `install` is what the panel says to the install POST; `total` is the queue's
- * `total_count` afterwards; `installedNames` is what the node list reports.
- */
 function bridge(opts: {
   install?: Record<string, unknown>;
-  total?: number | null;
-  installedNames?: string[];
+  /** The `status` block nodes_queue_status wraps. */
+  status?: Record<string, unknown> | null;
   queueErrors?: boolean;
-  listErrors?: boolean;
 }) {
   return {
     send: async (cmd: Record<string, unknown>) => {
       sent.push(String(cmd.cmd));
       if (cmd.cmd === "nodes_install") {
-        // The reporter's exact reply shape.
+        // The reporter's exact reply.
         return opts.install ?? { queued: true, pending: true, dialect: "legacy" };
       }
       if (cmd.cmd === "nodes_queue_status") {
         if (opts.queueErrors) throw new Error("queue unreachable");
-        return opts.total === null
-          ? { status: { done_count: 0 } } // a v4-ish shape with no total_count
-          : { status: { total_count: opts.total ?? 0, done_count: 0 } };
-      }
-      if (cmd.cmd === "nodes_list") {
-        if (opts.listErrors) throw new Error("list unreachable");
-        return { nodes: (opts.installedNames ?? []).map((n) => ({ name: n })) };
+        // The panel wraps it: `{ status }` (plus recent_failures/note sometimes).
+        return { status: opts.status ?? { total_count: 0, done_count: 0, in_progress_count: 0, is_processing: false } };
       }
       return { ok: true };
     },
@@ -81,13 +79,12 @@ function bridge(opts: {
 }
 
 async function install(
-  args: Record<string, unknown>,
   opts: Parameters<typeof bridge>[0],
 ): Promise<{ text: string; isError: boolean }> {
   const ctx = makePanelToolCtx(bridge(opts), TAB, new WorkflowTargetStore());
   const def = buildPanelToolDefs().find((d) => d.name === "panel_install_node");
   if (!def) throw new Error("panel_install_node is not registered");
-  const res: ToolResult = await def.handler(args as never, ctx);
+  const res: ToolResult = await def.handler({ repository: REPO } as never, ctx);
   return { text: textOf(res), isError: res.isError === true };
 }
 
@@ -95,75 +92,86 @@ beforeEach(() => {
   sent = [];
 });
 
-describe("an install the Manager accepted and dropped is reported as such (#1129)", () => {
-  it("contradicts the queued reply when the queue saw NOTHING and the pack is absent", async () => {
-    const out = await install({ repository: REPO }, { total: 0, installedNames: [] });
+describe("an install the Manager accepted and dropped says so (#1129)", () => {
+  it("warns when the queue is IDLE and has seen no task at all", async () => {
+    const out = await install({});
 
-    // Both observations really happened — otherwise this asserts on a verdict
-    // reached without looking, which is the defect itself.
+    // The read really happened — otherwise this asserts on a verdict reached
+    // without looking, which is the defect itself.
     expect(sent).toContain("nodes_queue_status");
-    expect(sent).toContain("nodes_list");
 
-    expect(out.isError).toBe(true);
-    expect(out.text).toMatch(/CHECKED, AND IT WAS NOT/);
-    expect(out.text).toMatch(/ComfyUI-H3-Motion-Context/);
-    // The reason total_count 0 is decisive gets stated, not assumed.
+    expect(out.text).toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
+    // States what was observed and why zero is decisive, rather than asserting it.
     expect(out.text).toMatch(/includes finished ones/);
-    // ...and it points at the tool that CAN clone, rather than cloning here.
+    expect(out.text).toMatch(/not a receipt/);
+    // Names the confirmation and the tool that CAN clone.
+    expect(out.text).toMatch(/panel_list_nodes/);
     expect(out.text).toMatch(/install_custom_node/);
-    expect(out.text).toMatch(/Do NOT simply retry/);
+    expect(out.text).toMatch(/Retrying HERE will be dropped/);
+
+    // NOT an error. Absence could not be proven, so the result is not flipped —
+    // a false definite failure on a working install is the mirror of this bug.
+    expect(out.isError).toBe(false);
+  });
+
+  it("says nothing while the worker is PROCESSING, even at total_count 0 (codex P1)", async () => {
+    // A snapshot taken mid-accept can read zero before the counters move. Treating
+    // that as "never queued" would warn about an install that is starting
+    // normally — the reporter's own signature requires an IDLE queue.
+    const out = await install({
+      status: { total_count: 0, done_count: 0, in_progress_count: 0, is_processing: true },
+    });
+
+    expect(sent).toContain("nodes_queue_status");
+    expect(out.text).not.toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
+  });
+
+  it("says nothing when idleness is UNKNOWN", async () => {
+    // No `is_processing` at all: the shape cannot answer whether the worker is
+    // running, so it is not made to.
+    const out = await install({ status: { total_count: 0, done_count: 0 } });
+
+    expect(out.text).not.toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
   });
 
   it("says nothing when the queue DID see a task", async () => {
-    // The normal case: enqueued, not yet cloned. Absent from the installed list
-    // is expected here and must not be read as a failure.
-    const out = await install({ repository: REPO }, { total: 1, installedNames: [] });
+    const out = await install({
+      status: { total_count: 1, done_count: 0, in_progress_count: 1, is_processing: true },
+    });
 
-    expect(sent).toContain("nodes_queue_status");
-    // The second read is not even reached — one positive observation settles it.
-    expect(sent).not.toContain("nodes_list");
+    expect(out.text).not.toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
+  });
+
+  it("says nothing on INCOHERENT counts", async () => {
+    // total 0 with work recorded against it does not match the 3.x contract
+    // (total = done + in_progress + queued), so this reasoning does not describe
+    // that payload and must not be applied to it.
+    const out = await install({
+      status: { total_count: 0, done_count: 3, in_progress_count: 0, is_processing: false },
+    });
+
+    expect(out.text).not.toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
+  });
+
+  it("says nothing on a v4-style shape with no total_count", async () => {
+    // v4 reports `pending_count` directly. The dropped-enqueue defect is legacy
+    // 3.x behaviour, so a shape that cannot answer is left alone.
+    const out = await install({ status: { pending_count: 0, in_progress_count: 0, is_processing: false } });
+
+    expect(out.text).not.toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
+  });
+
+  it("claims nothing when the queue read itself fails", async () => {
+    const out = await install({ queueErrors: true });
+
+    expect(out.text).not.toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
     expect(out.isError).toBe(false);
-    expect(out.text).not.toMatch(/CHECKED, AND IT WAS NOT/);
   });
 
-  it("says nothing when the pack IS installed despite an empty queue", async () => {
-    // A fast install whose task already cleared. One negative observation is not
-    // enough, and this is precisely the case that makes it not enough.
-    const out = await install(
-      { repository: REPO },
-      { total: 0, installedNames: ["ComfyUI-H3-Motion-Context"] },
-    );
-
-    expect(sent).toContain("nodes_list");
-    expect(out.isError).toBe(false);
-    expect(out.text).not.toMatch(/CHECKED, AND IT WAS NOT/);
-  });
-
-  it("claims nothing when the queue shape cannot answer", async () => {
-    // A v4-style status with no `total_count` proves neither way, so the panel's
-    // own reply stands (#1473's rule).
-    const out = await install({ repository: REPO }, { total: null, installedNames: [] });
-
-    expect(out.isError).toBe(false);
-    expect(sent).not.toContain("nodes_list");
-  });
-
-  it("claims nothing when either read fails", async () => {
-    const q = await install({ repository: REPO }, { queueErrors: true });
-    expect(q.isError).toBe(false);
-
-    sent = [];
-    const l = await install({ repository: REPO }, { total: 0, listErrors: true });
-    expect(l.isError).toBe(false);
-  });
-
-  it("does not probe at all when the panel never claimed it was queued", async () => {
-    // A reply that makes no such claim has nothing to contradict, and probing it
-    // would spend two round trips per install for nothing.
-    const out = await install(
-      { repository: REPO },
-      { install: { installed: true, dialect: "v4" }, total: 0 },
-    );
+  it("does not read the queue at all when nothing claimed it was queued", async () => {
+    // Nothing to contradict, and probing would spend a round trip per install for
+    // no reason (codex P2 — this is the only extra read, and it is conditional).
+    const out = await install({ install: { installed: true, dialect: "v4" } });
 
     expect(sent).not.toContain("nodes_queue_status");
     expect(out.isError).toBe(false);

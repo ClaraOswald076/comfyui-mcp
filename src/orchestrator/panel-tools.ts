@@ -2230,15 +2230,36 @@ function claimsQueued(reply: Record<string, unknown> | null): boolean {
 }
 
 /**
- * `total_count` counts EVERY task the Manager has seen this run, completed ones
- * included — so a fast install that already finished still leaves it ≥ 1. Zero
- * therefore means nothing was ever enqueued, which is the decisive reading and
- * the reporter's exact signature. Anything else (missing, non-numeric, a v4 shape
- * without it) answers nothing and is treated as such.
+ * `total_count` counts EVERY task the Manager has seen, completed ones included —
+ * so a fast install that already finished still leaves it ≥ 1. Zero therefore
+ * means nothing was ever enqueued, which is the decisive reading and the
+ * reporter's exact signature.
+ *
+ * Not my arithmetic: `countsFromStatus` in node-management.ts states the 3.x
+ * contract outright — "total_count = done + in_progress + queued exactly" — and
+ * derives pending from it. So `done_count` cannot be non-zero while total is 0.
+ *
+ * v4 reports `pending_count` directly and need not carry `total_count` at all, so
+ * this simply never fires there. That is correct: the dropped-enqueue defect is a
+ * legacy-3.x behaviour, and a shape that cannot answer must not be made to.
+ *
+ * Should a Manager ever RESET the counter after draining, this would read zero on
+ * a genuine success — which is exactly why a second, independent observation is
+ * required before anything is contradicted.
  */
 function queueNeverSawATask(reply: Record<string, unknown> | null): boolean {
   const status = (reply?.status ?? reply) as Record<string, unknown> | undefined;
-  return typeof status?.total_count === "number" && status.total_count === 0;
+  if (typeof status?.total_count !== "number" || status.total_count !== 0) return false;
+  // IDLE TOO, not just empty (codex P1). A snapshot taken while the Manager is
+  // mid-accept can read zero before its counters move, and a running worker is
+  // the one state where zero means "not yet" rather than "never". The panel's own
+  // queue predicate draws the same line, so this matches rather than invents one.
+  // Absent/non-boolean is NOT treated as idle: unknown answers nothing.
+  if (status.is_processing !== false) return false;
+  // Coherent, by the 3.x contract quoted above: with total 0, both of these must
+  // be 0 as well. Anything else is a shape this reasoning does not describe.
+  const zeroish = (v: unknown): boolean => v === undefined || v === 0;
+  return zeroish(status.done_count) && zeroish(status.in_progress_count);
 }
 
 /**
@@ -2252,49 +2273,27 @@ function queueNeverSawATask(reply: Record<string, unknown> | null): boolean {
  *
  * Anything inconclusive returns the panel's own reply untouched (#1473's rule).
  */
-async function settleDroppedEnqueue(
-  ctx: PanelToolCtx,
-  res: ToolResult,
-  packId: unknown,
-): Promise<ToolResult> {
+async function settleDroppedEnqueue(ctx: PanelToolCtx, res: ToolResult): Promise<ToolResult> {
   if (res.isError) return res;
   if (!claimsQueued(parseToolResultJson(res))) return res;
 
   const queue = await ctx.call({ cmd: "nodes_queue_status" }, 15000);
   if (queue.isError || !queueNeverSawATask(parseToolResultJson(queue))) return res;
 
-  const listed = await ctx.call({ cmd: "nodes_list" }, 20000);
-  if (listed.isError) return res;
-  const name = typeof packId === "string" ? packId : "";
-  const haystack = (listed.content.find((c) => c.type === "text")?.text ?? "").toLowerCase();
-  // Match on the repo/dir NAME rather than the full URL: the installed list
-  // reports directories, so a git-URL install lands as its last path segment.
-  const needle = name.replace(/\.git$/i, "").split(/[/\\]/).filter(Boolean).pop() ?? "";
-  if (!needle || haystack.includes(needle.toLowerCase())) return res;
-
-  return {
-    ...res,
-    isError: true,
-    content: [
-      {
-        type: "text",
-        text:
-          `${res.content.find((c) => c.type === "text")?.text ?? ""}\n\n` +
-          `CHECKED, AND IT WAS NOT: the Manager ACCEPTED this install and then never queued ` +
-          `it. Its queue reports it has seen NO tasks at all (total_count 0 — that counter ` +
-          `includes finished ones, so this is not a task that already completed), and "${needle}" ` +
-          `is absent from the installed list. Nothing was installed, and the "queued" above is ` +
-          `the Manager's acknowledgement, not a receipt.\n\n` +
-          `This is a known legacy ComfyUI-Manager 3.x behaviour for a git URL it does not ` +
-          `recognise (#1129): the POST succeeds, the task is dropped silently.\n\n` +
-          `WHAT WORKS: install it from its git URL with the headless install_custom_node ` +
-          `(action:"install", source:"git"). That path owns the local filesystem and falls back ` +
-          `to a direct clone when the Manager will not take it — this tool drives whatever ` +
-          `ComfyUI the panel is bound to, which need not be this machine, so it will not clone ` +
-          `on your behalf. Do NOT simply retry here: the same request is dropped the same way.`,
-      },
-    ],
-  };
+  return appendNote(
+    res,
+    `WARNING — THE QUEUE DOES NOT HAVE THIS TASK. The Manager accepted the install above, but ` +
+      `its queue is IDLE and reports it has seen no tasks at all (total_count 0, a counter that ` +
+      `includes finished ones — so this is not a task that already ran). On legacy ` +
+      `ComfyUI-Manager 3.x a git URL it does not recognise is accepted and then dropped ` +
+      `silently (#1129): "queued" is its acknowledgement, not a receipt.\n\n` +
+      `VERIFY BEFORE RELYING ON IT: call panel_list_nodes and confirm the pack is actually ` +
+      `there. Do not restart on the assumption it installed.\n\n` +
+      `IF IT IS ABSENT: install it from its git URL with the headless install_custom_node ` +
+      `(action:"install", source:"git"), which clones directly and verifies a real pack landed. ` +
+      `Retrying HERE will be dropped the same way. This tool cannot clone for you — it drives ` +
+      `whatever ComfyUI the panel is bound to, which need not be this machine.`,
+  );
 }
 
 /** Parse a ctx.call ToolResult's text payload as JSON, or null if not parseable. */
@@ -11642,7 +11641,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // queue, and silently does nothing. Found by printing the real reply
         // rather than by reasoning about it: the first version of this shipped
         // the check and the check never ran.
-        const settled = await settleDroppedEnqueue(ctx, res, cmdArgs.id ?? cmdArgs.repository);
+        const settled = await settleDroppedEnqueue(ctx, res);
         if (note) {
           const text = settled.content.find((c) => c.type === "text");
           if (text && text.type === "text") {
