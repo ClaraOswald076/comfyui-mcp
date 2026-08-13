@@ -4,6 +4,34 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.34
+
+### Fixed
+
+- **`list_tools` search finds the tool you named, and stops returning half the catalog (#1525).**
+  Searching `"download model"` returned only `runpod` -- while the unfiltered catalog
+  plainly contains `download_model`. The filter was matching the phrase literally, and
+  tool names are identifiers: `download_model` is spelled with an underscore, so the
+  phrase never occurred in it, whereas another tool's prose happens to say "download
+  model" as ordinary English. The one tool you obviously wanted was the one excluded,
+  and the only result was the coincidence.
+
+  Underscores and hyphens are now folded on both sides, so you can type a tool's name
+  the way you say it, and the words are matched individually rather than as a fixed
+  phrase. Dots and slashes are deliberately left alone, so a literal query like `v1.2`
+  still means what it says.
+
+  Matching every word across names, descriptions and parameter docs turned out to be
+  barely a filter on its own -- `"install node"` matched 19 of 37 tools, since those are
+  ordinary words in a dozen descriptions. So a tool whose NAME matches now wins outright:
+  `"download model"` gives you `download_model`, `"install node"` gives you
+  `install_custom_node`. When no name matches -- `"checkpoint"`, `"free vram"` -- the
+  search still looks through descriptions and parameters, which is the case that made
+  searching them worthwhile.
+
+  When results were chosen by name, the reply says so and tells you how many other tools
+  also matched, so a short list is never mistaken for the whole answer.
+
 ## 0.51.33
 
 ### Fixed
