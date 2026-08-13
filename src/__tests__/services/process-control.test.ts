@@ -8,6 +8,12 @@ const mockConfig = vi.hoisted(() => ({
   comfyuiPath: "/fake/ComfyUI" as string | undefined,
 }));
 
+// #742: the two classifications the preflight now distinguishes. `remote` is
+// how the target is ADDRESSED; `onThisMachine` is where the instance actually
+// runs. They disagree for a local install reached by its own LAN address, and
+// that disagreement is the bug.
+const mockLocality = vi.hoisted(() => ({ remote: false, onThisMachine: true }));
+
 const mockExecSync = vi.hoisted(() => vi.fn());
 const mockSpawn = vi.hoisted(() => vi.fn());
 const mockGetSystemStats = vi.hoisted(() => vi.fn());
@@ -19,7 +25,8 @@ vi.mock("../../config.js", () => ({
   getComfyUIAuthHeaders: () => ({}),
   // #848 instance fence — a stable target here; the retarget case has its own test.
   getComfyuiTargetGeneration: () => 0,
-  isRemoteMode: () => false,
+  isRemoteMode: () => mockLocality.remote,
+  targetIsOnThisMachine: () => mockLocality.onThisMachine,
 }));
 
 vi.mock("node:child_process", () => ({
@@ -176,6 +183,10 @@ beforeEach(() => {
   vi.useRealTimers();
   vi.clearAllMocks();
   vi.unstubAllGlobals();
+  // #742: back to an ordinary loopback-addressed local target. Without this a
+  // test that flips these leaks its classification into every test after it.
+  mockLocality.remote = false;
+  mockLocality.onThisMachine = true;
   process.env = { ...ORIGINAL_ENV };
   delete process.env.COMFYUI_ALWAYS_RESTART;
   delete process.env.COMFYUI_RESTART_MAX_ATTEMPTS;
@@ -936,6 +947,63 @@ describe("restart truthfulness + Pinokio-shaped refusal (#742)", () => {
     expect(killSpy).not.toHaveBeenCalled();
 
     killSpy.mockRestore();
+  });
+
+  // ── #742 recurrence: the guard was UNREACHABLE, not missing ────────────────
+  //
+  // Reported on 0.51.18. A Pinokio ComfyUI on the same host, addressed as
+  // `http://192.168.x.x:5000`, classified as remote — so `preflightLocalRestart`
+  // returned ok:true from its first line and the refuse-safe check above never
+  // ran. The Manager reboot stopped the server and Pinokio did not relaunch it.
+  //
+  // The refusal that should have fired is the very test above this one; it was
+  // passing the whole time. So these assert REACHABILITY, and the sharpest
+  // observable is whether the assessment was entered at all: on the early-return
+  // path nothing is probed, so `getSystemStats` is never called.
+  describe("a LOCAL install addressed REMOTELY still gets assessed (#742)", () => {
+    it("remote + NOT this machine: passes without probing anything (unchanged)", async () => {
+      mockLocality.remote = true;
+      mockLocality.onThisMachine = false;
+      mockPinokioShapedInstall(); // would REFUSE if it were ever assessed
+
+      const preflight = await preflightLocalRestart();
+
+      expect(preflight.ok).toBe(true);
+      // The early return is correct for a genuinely remote target: there is no
+      // local process to look at, so nothing should be probed.
+      expect(mockGetSystemStats).not.toHaveBeenCalled();
+    });
+
+    it("remote + IS this machine: assesses, and REFUSES the Pinokio shape", async () => {
+      mockLocality.remote = true;
+      mockLocality.onThisMachine = true;
+      mockPinokioShapedInstall();
+
+      const preflight = await preflightLocalRestart();
+
+      // Identical to the loopback-addressed case above — which is the point.
+      // How the instance is ADDRESSED must not decide whether we check that it
+      // can come back.
+      expect(preflight.ok).toBe(false);
+      expect(preflight.reason).toMatch(/could not build a relaunch command/i);
+      expect(mockGetSystemStats).toHaveBeenCalled();
+    });
+
+    it("remote + IS this machine + resolvable install: assesses and PASSES", async () => {
+      // The guard must not become a blanket refusal for everyone who addresses a
+      // local ComfyUI by LAN IP. A normal install still restarts.
+      mockLocality.remote = true;
+      mockLocality.onThisMachine = true;
+      mockLivePortNoKill();
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: ["/fake/ComfyUI/main.py", "--port", "8188"] },
+      });
+
+      const preflight = await preflightLocalRestart();
+
+      expect(preflight.ok).toBe(true);
+      expect(mockGetSystemStats).toHaveBeenCalled();
+    });
   });
 
   it("preflightLocalRestart passes a resolvable local install", async () => {

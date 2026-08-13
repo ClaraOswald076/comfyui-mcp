@@ -2,7 +2,7 @@ import { z } from "zod";
 import { fileURLToPath } from "url";
 import { dirname, resolve, join } from "path";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, networkInterfaces } from "node:os";
 import { isIP } from "node:net";
 import { normalizeInstallPathEnv } from "./utils/install-path-env.js";
 import { parseComfyUIUrl, type ComfyUITarget } from "./transport/comfyui-url.js";
@@ -229,6 +229,65 @@ const LOOPBACK_HOSTS = new Set([
   "::", // IPv6 wildcard bind — reachable on loopback (::1)
   "0000:0000:0000:0000:0000:0000:0000:0000",
 ]);
+
+/**
+ * True when `host` is an address THIS machine answers on — loopback, or any
+ * literal IP currently bound to one of its own interfaces (#742).
+ *
+ * `isLoopbackHost` answers a narrower question than most of its callers need.
+ * Loopback proves the ROUTE is local; it does not follow that a non-loopback
+ * address is a different machine. A ComfyUI on this very host addressed as
+ * `http://192.168.1.50:8188` — which is how anyone reaches it from a phone, or
+ * how Pinokio and several launchers advertise it — is not loopback and is not
+ * remote either. The recurrence on #742 is exactly that: the restart guard read
+ * "not loopback" as "not ours", skipped its refuse-safe check, and stopped a
+ * server it then could not bring back.
+ *
+ * NO DNS. A hostname is compared as a string against the literal addresses the
+ * interfaces report, so it simply never matches — `comfy.lan` returns false even
+ * if it resolves here. That is deliberate, not a gap: resolving would mean a DNS
+ * round trip on a path that must not block, and a name can resolve differently —
+ * or be made to — between this check and the action it authorizes. This gates a
+ * REFUSAL, so "cannot prove it is ours" is the safe answer; it leaves today's
+ * behaviour exactly as it was.
+ *
+ * (An earlier version guarded the comparison with an explicit is-this-a-literal-IP
+ * test. Mutation testing showed removing it changed no outcome — the equality
+ * below already refuses names — so it was a check that could never fire, next to
+ * a comment claiming it was what enforced the rule.)
+ *
+ * Not cached. `networkInterfaces()` is a cheap syscall, and a laptop that
+ * changes networks would keep answering from a stale snapshot — wrong in the
+ * direction that matters, since the whole point is to be right about which
+ * machine we are talking to right now.
+ */
+export function isOwnHostAddress(host: string | undefined): boolean {
+  if (isLoopbackHost(host)) return true;
+  const h = normalizeHostForCompare(host);
+  // An empty host must never fall through to the comparison: an interface that
+  // reported an empty address would then match it.
+  if (!h) return false;
+  try {
+    for (const addrs of Object.values(networkInterfaces())) {
+      for (const a of addrs ?? []) {
+        if (normalizeHostForCompare(a.address) === h) return true;
+      }
+    }
+  } catch {
+    // Enumerating interfaces can fail in a locked-down container. Unknown is
+    // not proof, and this gates a refusal — fall through to false.
+  }
+  return false;
+}
+
+/** Lowercase, strip URL brackets, and drop an IPv6 zone suffix (`%eth0`), which
+ *  `networkInterfaces()` omits on the addresses it reports. */
+function normalizeHostForCompare(host: string | undefined): string {
+  return (host ?? "")
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "")
+    .replace(/%.*$/, "");
+}
 
 /** True when a hostname is loopback (or absent → assume local). Bracketed IPv6
  *  (`[::1]`, as URL parsing stores it) is normalized first so every consumer
@@ -771,6 +830,30 @@ export function isLocalMode(): boolean {
 /** For env-capabilities.ts, which classifies a URL independently of urlOverride. */
 export function isForceRemoteFlagSet(): boolean {
   return forceRemote;
+}
+
+/**
+ * True when the configured ComfyUI target is provably on THIS machine (#742).
+ *
+ * Distinct from `isLocalMode()`, which reports the classification. This reports
+ * the physical question that classification stands in for, and the two disagree
+ * for exactly one case: a local instance addressed by one of this host's own
+ * non-loopback addresses. That case is `isRemoteMode() === true` and
+ * `targetIsOnThisMachine() === true`, and it is the #742 recurrence.
+ *
+ * `--force-remote` / `COMFYUI_MCP_FORCE_REMOTE` wins outright. A tunnel or
+ * port-forward makes the address say "here" about an instance that is
+ * elsewhere, and the flag exists for the user to say so; an inference must not
+ * overrule it. (This is the mirror of the note in panel-tools about a cloud pod
+ * fronted at 127.0.0.1.)
+ */
+export function targetIsOnThisMachine(): boolean {
+  if (forceRemote) return false;
+  try {
+    return isOwnHostAddress(new URL(getComfyUIBaseUrl()).hostname);
+  } catch {
+    return false; // unparseable target — cannot prove it is ours
+  }
 }
 
 /** Filesystem-safe id for the target instance — scopes per-instance data (e.g. generations DB). */

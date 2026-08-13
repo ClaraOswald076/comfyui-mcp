@@ -24,6 +24,7 @@ import {
   getComfyUIBaseUrl,
   getComfyuiTargetGeneration,
   isRemoteMode,
+  targetIsOnThisMachine,
 } from "../config.js";
 import { comfyuiFetch, describeTargetDrift } from "../comfyui/fetch.js";
 import { scrubLogLines } from "../comfyui/json-guard.js";
@@ -4347,7 +4348,25 @@ export async function preflightLocalRestart(): Promise<{
   /** Whether the assessed instance is ComfyUI Desktop — selects the #848 remedy. */
   isDesktopApp?: boolean;
 }> {
-  if (isRemoteMode()) return { ok: true };
+  // Remote mode passes because there is no local process to assess — but that
+  // reasoning only holds when the target really is another machine, and the
+  // classification behind it does not establish that. `remoteUrlActive` is
+  // `forceRemote || !isLoopbackHost(host)`, so a ComfyUI on THIS host reached
+  // through its own LAN address is "remote" here, and this line waves the whole
+  // refuse-safe check through for an install we could have assessed.
+  //
+  // That is the #742 recurrence, reported on 0.51.18 — a Pinokio ComfyUI on the
+  // same machine addressed as `http://192.168.x.x:5000` with COMFYUI_PATH set to
+  // it. The preflight passed without looking, the Manager reboot stopped the
+  // server, and Pinokio does not relaunch on a plain restart, so it stayed down.
+  // The guard that exists precisely to refuse that stop never ran.
+  //
+  // An address bound to one of our own interfaces is assessable, so assess it.
+  // Forced remote is still honoured unconditionally: `--force-remote` is the
+  // user telling us the instance is elsewhere regardless of how it is addressed
+  // (a tunnel or port-forward makes the route say otherwise), and overriding an
+  // explicit statement of intent with an inference would be its own bug.
+  if (isRemoteMode() && !targetIsOnThisMachine()) return { ok: true };
   const { info, diagnostic } = await acquireProcessInfo();
   // NOTHING COULD BE RESOLVED — and that is not a pass (coordinator gate).
   //
