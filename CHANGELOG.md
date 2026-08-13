@@ -4,6 +4,35 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.26
+
+### Fixed
+
+- **Cancelling a large batch no longer floods every later turn with a growing block of
+  errors (#1489).** Stopping a 27-scene run left ComfyUI with no history for the prompts it
+  cleared while pending, so each one came back after reconnect as an urgent error -- and the
+  block GREW every turn, carrying prompts 1..N, then 1..N+1, dragging the user's original
+  message along with it. It reproduced roughly 25 messages dozens of times and consumed a
+  large share of the context window on noise.
+
+  The report describes this as missing deduplication, and it is not: every notice names a
+  different prompt, so all of them are distinct and nothing would dedupe. The cause is that
+  each error INTERRUPTED the live turn and re-queued it, and after the first error the
+  interrupted turn is itself an error turn -- so error N re-queued errors 1 through N-1 and
+  the next turn carried all of them.
+
+  A burst now collapses into one turn instead of nesting. An error arriving while an error
+  turn is already waiting joins it; one arriving while an error turn is being handled waits
+  its turn instead of interrupting the handling. A single error arriving during ordinary
+  work still stops that work, which was the intended behaviour all along.
+
+  Every cancelled prompt is still reported exactly once -- collapsing the noise must not
+  swallow a real failure -- and notices from DIFFERENT workflow tabs are never merged, so
+  each keeps the origin that pins "diagnose and fix it" to the graph that actually failed.
+
+  Not fixed here, and still open on the issue: those prompts should not be reported as
+  errors at all, since the cancellation was requested. That half lives in the panel.
+
 ## 0.51.25
 
 ### Fixed
@@ -442,6 +471,14 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.51.26] - 2026-08-13
+
+### MCP
+
+#### Fixed
+- coalesce a burst of run_errors instead of nesting them (#1507)
+
 
 ## [0.51.25] - 2026-08-12
 
