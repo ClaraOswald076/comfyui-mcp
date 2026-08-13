@@ -276,6 +276,13 @@ function makeDeps(opts: {
   revs?: Record<string, string>;
   /** Leave the swap primitives off the dep set (fallback unavailable). */
   withoutSwapOps?: boolean;
+  /**
+   * Manager UNLINKS the pack during the update and then fails to put it back,
+   * while still reporting a drained queue (#771 r2). This is the state every
+   * other test in this file cannot reach: they all leave the pack on disk, so
+   * the post-op reading is usable and the `!post.installed` throw never fires.
+   */
+  updateDeletesPack?: boolean;
 }): Harness {
   const revs = opts.revs ?? {};
   const h: Harness = { deps: null as never, updateCalls: 0, clones: [], gitMerges: 0 };
@@ -327,6 +334,7 @@ function makeDeps(opts: {
     update: async () => {
       h.updateCalls++;
       if (opts.updateThrows) throw new Error(opts.updateThrows);
+      if (opts.updateDeletesPack) rmSync(PANEL_DIR(), { recursive: true, force: true });
       return {
         mechanism: "manager-http",
         message: "updated",
@@ -912,6 +920,90 @@ describe("update no longer contradicts status on a registry-zip install (#771)",
     expect(h.clones).toHaveLength(1);
     // Staged OUTSIDE custom_nodes: a half-written clone in there would be served.
     expect(h.clones[0].startsWith(join(root, "custom_nodes"))).toBe(false);
+  });
+
+  // ── #771 r2: the pack is GONE after a drained queue ────────────────────────
+  //
+  // Every other test in this file writes the pack and leaves it there, so the
+  // post-op reading is always usable and the `!post.installed` throw never
+  // fires. That throw sits ~200 lines ABOVE the verified reinstall and gates it
+  // on `post.dir`, so the one state where a fresh clone is the ONLY remedy was
+  // the state routed to a bare throw — whose own text says "reinstall the panel
+  // from source", naming the operation it had just declined to run.
+  //
+  // Reported on 0.50.93; the file is byte-identical between that tag and main.
+  it("a pack DELETED by the update is reinstalled, not thrown about (#771)", async () => {
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    const h = makeDeps({
+      updateDetails: { total_count: 0, done_count: 4 }, // Manager: queue drained
+      updateDeletesPack: true, // ...and the pack is gone
+      cloneVersion: "0.11.38",
+    });
+
+    const result = await runPanelActionInner("update", h.deps);
+
+    expect(result.installedVersion).toBe("0.11.38");
+    expect(h.clones).toHaveLength(1);
+    // Recovered in place, at the path it was detected at before the Manager ran.
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.38");
+    // Same staging invariant as the sibling path: never inside custom_nodes.
+    expect(h.clones[0].startsWith(join(root, "custom_nodes"))).toBe(false);
+  });
+
+  it("a pack left with an UNREADABLE version is reinstalled on the same path", async () => {
+    // The throw's other half. `post.installed` is true but `post.version` is
+    // not, which is equally unverifiable and equally recoverable by reinstall.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    const h = makeDeps({
+      updateDetails: { total_count: 0, done_count: 4 },
+      cloneVersion: "0.11.38",
+    });
+    // Manager leaves the directory but corrupts the manifest.
+    const orig = h.deps.update;
+    h.deps.update = async (...a: Parameters<typeof orig>) => {
+      const r = await orig(...a);
+      writeFileSync(join(PANEL_DIR(), "pyproject.toml"), "this is not toml\n");
+      return r;
+    };
+
+    const result = await runPanelActionInner("update", h.deps);
+
+    expect(result.installedVersion).toBe("0.11.38");
+    expect(h.clones).toHaveLength(1);
+  });
+
+  it("a CHECKOUT whose pack vanished still THROWS — a re-clone would destroy local work", async () => {
+    // The scope limit, and the reason this is not a blanket "reinstall on any
+    // unverifiable result". A git checkout has history and possibly local
+    // commits; wholesale replacement is the wrong answer even when the working
+    // tree is missing. Only the registry-zip shape (no previousRev) recovers.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    const h = makeDeps({
+      updateDetails: { total_count: 0, done_count: 4 },
+      updateDeletesPack: true,
+      revs: { [PANEL_DIR()]: "a".repeat(40) }, // it IS a checkout
+      cloneVersion: "0.11.38",
+    });
+
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+
+    expect((err as Error).message).toMatch(/not present|could not verify/i);
+    expect(h.clones).toHaveLength(0);
+  });
+
+  it("with the swap primitives unavailable it still THROWS rather than half-acting", async () => {
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    const h = makeDeps({
+      updateDetails: { total_count: 0, done_count: 4 },
+      updateDeletesPack: true,
+      withoutSwapOps: true,
+      cloneVersion: "0.11.38",
+    });
+
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+
+    expect((err as Error).message).toMatch(/not present|could not verify/i);
+    expect(h.clones).toHaveLength(0);
   });
 
   it("the replaced copy is parked OUTSIDE custom_nodes, never beside the panel (#641)", async () => {
