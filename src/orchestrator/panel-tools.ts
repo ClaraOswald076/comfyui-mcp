@@ -2204,6 +2204,99 @@ async function settleExitSubgraphAfterAckTimeout(
   return timedOut;
 }
 
+// ---- panel_install_node: accepted-but-never-enqueued (#1129) ---------------
+// #1143 fixed the pre-queue REFUSAL (403/404 → direct clone). This is the other
+// half of the same family: legacy Manager 3.x answers the install POST with
+// `queued: true`, and the task never enters the queue at all. The reporter's
+// follow-up read showed an idle queue with `total_count: 0` and no directory
+// under custom_nodes, while this tool had already said "queued".
+//
+// It is the third time this repo has met the same lesson, so it is worth stating
+// once: ComfyUI-Manager's acknowledgement is not a receipt. `getlist` cannot
+// distinguish an unreachable registry from an empty one; a download reports done
+// when the QUEUE DRAINS rather than when the transfer finishes; and here an
+// accepted request is simply dropped. "Accepted" is never evidence of "happened",
+// so the only honest reply is one that went and looked.
+//
+// NOTE the asymmetry with install_custom_node, which already verifies and clones:
+// that path owns the filesystem it installs into. This one drives whatever
+// ComfyUI the PANEL is bound to, which need not be this machine — so it can
+// report the truth but must not quietly clone somewhere else.
+
+/** True when the panel's reply claims the install was accepted/queued. */
+function claimsQueued(reply: Record<string, unknown> | null): boolean {
+  if (!reply) return false;
+  return reply.queued === true || reply.pending === true;
+}
+
+/**
+ * `total_count` counts EVERY task the Manager has seen this run, completed ones
+ * included — so a fast install that already finished still leaves it ≥ 1. Zero
+ * therefore means nothing was ever enqueued, which is the decisive reading and
+ * the reporter's exact signature. Anything else (missing, non-numeric, a v4 shape
+ * without it) answers nothing and is treated as such.
+ */
+function queueNeverSawATask(reply: Record<string, unknown> | null): boolean {
+  const status = (reply?.status ?? reply) as Record<string, unknown> | undefined;
+  return typeof status?.total_count === "number" && status.total_count === 0;
+}
+
+/**
+ * After an install the panel reported as queued, confirm it actually was.
+ *
+ * Two NEGATIVE observations are required before this contradicts the panel: the
+ * queue never saw a task, AND the pack is absent from the installed list. Either
+ * alone is too weak — a queue shape without `total_count` proves nothing, and a
+ * pack missing from the list moments after enqueuing is normal, because it has
+ * not been cloned yet. Together they are the reported failure exactly.
+ *
+ * Anything inconclusive returns the panel's own reply untouched (#1473's rule).
+ */
+async function settleDroppedEnqueue(
+  ctx: PanelToolCtx,
+  res: ToolResult,
+  packId: unknown,
+): Promise<ToolResult> {
+  if (res.isError) return res;
+  if (!claimsQueued(parseToolResultJson(res))) return res;
+
+  const queue = await ctx.call({ cmd: "nodes_queue_status" }, 15000);
+  if (queue.isError || !queueNeverSawATask(parseToolResultJson(queue))) return res;
+
+  const listed = await ctx.call({ cmd: "nodes_list" }, 20000);
+  if (listed.isError) return res;
+  const name = typeof packId === "string" ? packId : "";
+  const haystack = (listed.content.find((c) => c.type === "text")?.text ?? "").toLowerCase();
+  // Match on the repo/dir NAME rather than the full URL: the installed list
+  // reports directories, so a git-URL install lands as its last path segment.
+  const needle = name.replace(/\.git$/i, "").split(/[/\\]/).filter(Boolean).pop() ?? "";
+  if (!needle || haystack.includes(needle.toLowerCase())) return res;
+
+  return {
+    ...res,
+    isError: true,
+    content: [
+      {
+        type: "text",
+        text:
+          `${res.content.find((c) => c.type === "text")?.text ?? ""}\n\n` +
+          `CHECKED, AND IT WAS NOT: the Manager ACCEPTED this install and then never queued ` +
+          `it. Its queue reports it has seen NO tasks at all (total_count 0 — that counter ` +
+          `includes finished ones, so this is not a task that already completed), and "${needle}" ` +
+          `is absent from the installed list. Nothing was installed, and the "queued" above is ` +
+          `the Manager's acknowledgement, not a receipt.\n\n` +
+          `This is a known legacy ComfyUI-Manager 3.x behaviour for a git URL it does not ` +
+          `recognise (#1129): the POST succeeds, the task is dropped silently.\n\n` +
+          `WHAT WORKS: install it from its git URL with the headless install_custom_node ` +
+          `(action:"install", source:"git"). That path owns the local filesystem and falls back ` +
+          `to a direct clone when the Manager will not take it — this tool drives whatever ` +
+          `ComfyUI the panel is bound to, which need not be this machine, so it will not clone ` +
+          `on your behalf. Do NOT simply retry here: the same request is dropped the same way.`,
+      },
+    ],
+  };
+}
+
 /** Parse a ctx.call ToolResult's text payload as JSON, or null if not parseable. */
 function parseToolResultJson(res: ToolResult): Record<string, unknown> | null {
   if (!res || res.isError) return null;
@@ -11543,13 +11636,20 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           { cmd: "nodes_install", ...cmdArgs },
           30000,
         );
+        // #1129 — settle BEFORE the note is appended. The note is glued on after
+        // the JSON body, which makes the payload unparseable as JSON, so a probe
+        // running afterwards reads `null`, concludes the panel never claimed a
+        // queue, and silently does nothing. Found by printing the real reply
+        // rather than by reasoning about it: the first version of this shipped
+        // the check and the check never ran.
+        const settled = await settleDroppedEnqueue(ctx, res, cmdArgs.id ?? cmdArgs.repository);
         if (note) {
-          const text = res.content.find((c) => c.type === "text");
+          const text = settled.content.find((c) => c.type === "text");
           if (text && text.type === "text") {
             text.text += `\n\nNOTE: ${note}`;
           }
         }
-        return res;
+        return settled;
       },
     ),
     def(
