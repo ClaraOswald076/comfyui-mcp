@@ -2030,8 +2030,18 @@ export class UiBridge {
           return;
         }
         this.portInUse = true;
+        // #1524 — this used to promise "this session's MCP tools still work, but
+        // panel_* commands are unavailable until that session exits", describing
+        // a degraded-but-running process. That process does not exist:
+        // `startUiBridge` has exactly ONE caller, and on a false `whenReady()` it
+        // tries to reclaim the port and then `process.exit(1)`s. So the sentence
+        // described a mode the code cannot enter, and anyone diagnosing a
+        // portless orchestrator against it was reading a fiction.
         logger.warn(
-          `[ui-bridge] port ${this.port} still in use after ${UiBridge.MAX_BIND_ATTEMPTS} attempts — another comfyui-mcp session likely owns the panel. This session's MCP tools still work, but panel_* commands are unavailable until that session exits.`,
+          `[ui-bridge] port ${this.port} still in use after ${UiBridge.MAX_BIND_ATTEMPTS} attempts — ` +
+            `another comfyui-mcp session almost certainly owns the panel. The orchestrator will ` +
+            `now try to take the port over, and will EXIT if it cannot: it does not continue in a ` +
+            `panel-less mode.`,
         );
         this.readyResolve?.(false);
         this.readyResolve = null;
