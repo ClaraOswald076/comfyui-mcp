@@ -106,7 +106,7 @@ describe("an install the Manager accepted and dropped says so (#1129)", () => {
     // this way — the message must say so rather than assert the task never ran.
     expect(out.text).toMatch(/total_count, done, in_progress all 0/);
     expect(out.text).toMatch(/not a receipt/);
-    expect(out.text).toMatch(/it is NOT proof/);
+    expect(out.text).toMatch(/NOT PROOF EITHER WAY/);
     expect(out.text).toMatch(/cleared by a queue RESET/);
     expect(out.text).toMatch(/do not reinstall on\s+the assumption it did not/);
     // The earlier wording asserted both of these outright; neither is supportable
@@ -116,8 +116,15 @@ describe("an install the Manager accepted and dropped says so (#1129)", () => {
     // Names the confirmation and the tool that CAN clone.
     expect(out.text).toMatch(/panel_list_nodes/);
     expect(out.text).toMatch(/install_custom_node/);
-    // Hedged, not asserted: "likely to be dropped".
-    expect(out.text).toMatch(/likely to be dropped/);
+
+    // NO PROVENANCE CLAIM, in either direction. Five review rounds each found the
+    // explanation of WHY the task was dropped false in some reachable state — an
+    // id-only install submits no URL, and a `repository` that is any non-empty
+    // string need not be one. Every fix branched on a fact the request does not
+    // reliably carry. The observation needs no such fact, so the message no
+    // longer makes one: less useful in the common case, never false.
+    expect(out.text).not.toMatch(/git URL/i);
+    expect(out.text).not.toMatch(/does not recognise/);
 
     // NOT an error. Absence could not be proven, so the result is not flipped —
     // a false definite failure on a working install is the mirror of this bug.
@@ -305,35 +312,6 @@ describe("an install the Manager accepted and dropped says so (#1129)", () => {
     const res: ToolResult = await def!.handler({ repository: REPO } as never, ctx);
 
     expect(textOf(res)).toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
-  });
-
-  it("does not blame a git URL on an id-only install (codex P2)", async () => {
-    // panel_install_node also accepts a registry `id`. For an id-only request no
-    // URL was submitted and none is retained, so "the Manager dropped a git URL"
-    // is an unsupported cause and "install it from its git URL" is an instruction
-    // the caller cannot follow. Same observation, different remedy.
-    const ctx = makePanelToolCtx(bridge({}), TAB, new WorkflowTargetStore());
-    const def = buildPanelToolDefs().find((d) => d.name === "panel_install_node");
-    const res: ToolResult = await def!.handler({ id: "comfyui-kjnodes" } as never, ctx);
-    const text = textOf(res);
-
-    // The OBSERVATION is unchanged — that part is not about how it was requested.
-    expect(text).toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
-    expect(text).toMatch(/cleared by a queue RESET/);
-    // ...but the git-URL cause and remedy must not appear.
-    expect(text).not.toMatch(/accepting a git URL/);
-    expect(text).not.toMatch(/install it from its git URL/);
-    // It names what they actually have instead.
-    expect(text).toMatch(/pass `repository` rather than `id`/);
-  });
-
-  it("still blames the git URL when one WAS submitted", async () => {
-    // The other half, so the branch above cannot quietly suppress the git-URL
-    // guidance for the case this issue was actually filed about.
-    const out = await install({});
-
-    expect(out.text).toMatch(/accepting a git URL/);
-    expect(out.text).toMatch(/install it from its git URL/);
   });
 
   it("claims nothing when the queue read itself fails", async () => {
