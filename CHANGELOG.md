@@ -4,6 +4,31 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.24
+
+### Fixed
+
+- **The MCP server now reports the version it actually is (#1447).** `serverInfo.version` was
+  the hardcoded literal `0.1.0` -- a version this package has never shipped. That string is what
+  an MCP client displays and what a bug report quotes, so every report was ambiguous about which
+  build produced it, including the reports we ask people to send us. It is now read from the
+  package's own manifest, once, at startup.
+
+  Deliberately kept CHEAP: resolving it through the install-mode detector would have put a
+  symlink-resolving directory walk in front of the MCP handshake, which is self-defeating in a
+  fix filed under "startup exceeds the client's timeout". It is one small read of our own
+  manifest, resolved relative to the module so it can never pick up a parent directory's
+  package.json, and a UTF-8 byte-order mark no longer downgrades a working install to the
+  fallback.
+
+  If that read ever fails the version reads `0.0.0-unknown` -- a sentinel no release can carry,
+  rather than a plausible-looking number that would recreate the same ambiguity.
+
+  This is the second defect in #1447 and does not close it: the report's headline -- a cold `npx`
+  install exceeding the client's startup budget -- is a distribution problem measured on the
+  issue, where the tempting one-flag fix was tried and rejected because it produces an install
+  that cannot start.
+
 ## 0.51.23
 
 ### Fixed
@@ -385,6 +410,14 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.51.24] - 2026-08-12
+
+### MCP
+
+#### Fixed
+- advertise the real version instead of a hardcoded 0.1.0 (#1503)
+
 
 ## [0.51.23] - 2026-08-12
 
