@@ -30,7 +30,6 @@
     "connect_quiet_note": "تبقى هذه النافذة صامتة حتى تضغط «اتصال» — وهذا متوقَّع وليس تعليقًا.\nفالوكيل يعمل هنا، على تسجيل دخولك في Claude/Codex؛ ولا يُثبَّت أي\nشيء على جهاز ComfyUI. أبقِ هذه الطرفية مفتوحة.",
     "connect_secure_note": "لوحة HTTPS الخاصة بالـ pod تتصل تلقائيًا عبر نفق\nمشفَّر — لا يوجد رابط تلصقه، وتعمل في أي متصفح.",
     "connect_step_click_connect": "اضغط «اتصال» في اللوحة (قائمة الاتصال المنسدلة في لوحة Agent).",
-    "connect_step_enable_external_orchestrator": "في لوحة Agent، من الإعدادات ← عام، فعّل\n'Use external/local orchestrator (advanced)'.",
     "connect_step_open_comfyui": "افتح ComfyUI ذاك في متصفحك: {url}",
     "connect_title": "جارٍ تشغيل جسر الوكيل المحلي",
     "connect_url_invalid": "تم تمرير رابط ComfyUI غير صالح إلى `connect`: ‏\"{url}\" ‏({reason}). مرّر رابط http(s) كاملًا، مثل https://abcd-8188.proxy.runpod.net أو http://127.0.0.1:8188 .",

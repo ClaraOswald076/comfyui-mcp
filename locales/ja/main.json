@@ -30,7 +30,6 @@
     "connect_quiet_note": "「接続」を押すまで、このウィンドウは静かなままです —\n止まっているわけではありません。エージェントはあなたの\nClaude/Codex ログインでここで動き、ComfyUI 側には何も\nインストールされません。このターミナルは開いたままにしてください。",
     "connect_secure_note": "ポッドの HTTPS パネルは暗号化された\nトンネルで自動接続します — 貼り付ける URL は\nなく、どのブラウザーでも動きます。",
     "connect_step_click_connect": "パネルで「接続」を押してください（Agent パネルの接続ドロップダウン）。",
-    "connect_step_enable_external_orchestrator": "Agent パネルの設定 → 一般で\n'Use external/local orchestrator (advanced)' をオンにしてください。",
     "connect_step_open_comfyui": "その ComfyUI をブラウザーで開く: {url}",
     "connect_title": "ローカルのエージェントブリッジを起動しています",
     "connect_url_invalid": "`connect` に不正な ComfyUI URL が渡されました: \"{url}\"（{reason}）。https://abcd-8188.proxy.runpod.net や http://127.0.0.1:8188 のような完全な http(s) URL を指定してください。",

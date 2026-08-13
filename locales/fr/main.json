@@ -30,7 +30,6 @@
     "connect_quiet_note": "Tant que vous ne cliquez pas sur Connecter, cette fenêtre reste\nsilencieuse — c'est normal, ce n'est pas un blocage. L'agent tourne\nICI, sur votre compte Claude/Codex ; rien n'est installé sur la\nmachine ComfyUI. Laissez ce terminal ouvert.",
     "connect_secure_note": "le panneau HTTPS du pod se connecte automatiquement par\nun tunnel chiffré — aucune URL à coller, fonctionne\ndans tout navigateur.",
     "connect_step_click_connect": "Cliquez sur Connecter dans le panneau (menu Connecter du panneau Agent).",
-    "connect_step_enable_external_orchestrator": "Dans le panneau Agent, Paramètres → Général, activez\n'Use external/local orchestrator (advanced)'.",
     "connect_step_open_comfyui": "Ouvrez ce ComfyUI dans le navigateur : {url}",
     "connect_title": "démarrage du pont d'agent local",
     "connect_url_invalid": "URL ComfyUI invalide passée à `connect` : \"{url}\" ({reason}). Indiquez une URL http(s) complète, par exemple https://abcd-8188.proxy.runpod.net ou http://127.0.0.1:8188.",

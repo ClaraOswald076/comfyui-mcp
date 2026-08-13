@@ -159,7 +159,6 @@ const BOXED_KEYS = [
   "connect_secure_note",
   "connect_next_steps",
   "connect_step_open_comfyui",
-  "connect_step_enable_external_orchestrator",
   "connect_step_click_connect",
   "connect_quiet_note",
   "tunnel_title",

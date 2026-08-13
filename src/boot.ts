@@ -428,14 +428,19 @@ async function main() {
       // the only wording that still matches the button the user has to find. A catalog entry
       // for one of these keys is only correct if it uses the panel's translation of that
       // control, not a fresh translation of the sentence.
+      // There used to be a step here telling the user to turn ON "Use external/local
+      // orchestrator (advanced)" in the panel's Settings → General. That control does not
+      // exist. The panel declares the setting id and never registers a row for it, and
+      // `externalOrchestratorMode()` returns true unconditionally — its own comment calls the
+      // setting "a back-compat no-op", because a Registry-compliant pure-frontend pack can no
+      // longer spawn the orchestrator, so external/local is the only mode there is. The step
+      // therefore sent people hunting for a toggle that isn't there, to enable something that
+      // cannot be turned off. It had just been translated into eleven languages, which is how
+      // it surfaced: faithfully wrong in twelve.
       const steps = [
         tr("cli.connect_step_open_comfyui", "Open that ComfyUI in your browser: {url}", {
           url: cli.comfyuiUrl,
         }),
-        tr(
-          "cli.connect_step_enable_external_orchestrator",
-          "In the Agent panel's Settings → General, turn ON\n'Use external/local orchestrator (advanced)'.",
-        ),
         tr(
           "cli.connect_step_click_connect",
           "Click Connect in the panel (the Agent panel's Connect dropdown).",
