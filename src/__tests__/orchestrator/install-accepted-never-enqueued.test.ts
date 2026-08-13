@@ -51,6 +51,8 @@ function bridge(opts: {
   /** The `status` block nodes_queue_status wraps. */
   status?: Record<string, unknown> | null;
   queueErrors?: boolean;
+  /** Model a bridge that cannot say which panel holds the route key. */
+  noIncarnation?: boolean;
 }) {
   return {
     send: async (cmd: Record<string, unknown>) => {
@@ -66,6 +68,10 @@ function bridge(opts: {
       }
       return { ok: true };
     },
+    // The REAL UiBridge always reports this; a fixture without it models a
+    // bridge that cannot identify which panel answered, which is a separate case
+    // asserted below.
+    tabIncarnation: () => (opts.noIncarnation ? undefined : "inc-A"),
     push: () => 1,
     canReach: (id: string) => id === TAB,
     isHeadless: () => false,
@@ -224,6 +230,12 @@ describe("an install the Manager accepted and dropped says so (#1129)", () => {
         }
         return { status: { total_count: 0, done_count: 0, in_progress_count: 0, is_processing: false } };
       },
+      // A STABLE incarnation on purpose: the route key must be the only thing
+      // that differs, or this case stops isolating the route-key pin. Without it
+      // the fail-closed unknown-incarnation rule short-circuits first and the
+      // test passes for the wrong reason — a surviving mutation caught exactly
+      // that.
+      tabIncarnation: () => "inc-STABLE",
       push: () => 1,
       canReach: (id: string) => (gone ? id === OTHER : id === TAB),
       isHeadless: () => false,
@@ -312,6 +324,18 @@ describe("an install the Manager accepted and dropped says so (#1129)", () => {
     const res: ToolResult = await def!.handler({ repository: REPO } as never, ctx);
 
     expect(textOf(res)).toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
+  });
+
+  it("claims nothing when the bridge cannot identify the panel (codex final)", async () => {
+    // UNKNOWN is not "unchanged". Comparing two undefined incarnations yields
+    // equality, so a same-key takeover would pass the guard while the message
+    // claims the read happened "on that same panel" — a false statement produced
+    // by a guard that cannot see. A bridge that cannot answer does not get to.
+    const out = await install({ noIncarnation: true });
+
+    expect(sent).toContain("nodes_queue_status");
+    expect(out.text).not.toMatch(/THE QUEUE DOES NOT HAVE THIS TASK/);
+    expect(out.text).not.toMatch(/on that same panel/);
   });
 
   it("claims nothing when the queue read itself fails", async () => {

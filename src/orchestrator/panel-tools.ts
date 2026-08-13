@@ -2287,9 +2287,17 @@ function queueNeverSawATask(reply: Record<string, unknown> | null): boolean {
  *
  * Anything inconclusive returns the panel's own reply untouched (#1473's rule).
  */
-/** The panel identity a route key currently resolves to. `undefined` on a bridge
- *  that cannot report one, which then compares equal and preserves the older
- *  behaviour for lightweight contexts. */
+/**
+ * The panel identity a route key currently resolves to, or `undefined` when this
+ * bridge cannot report one.
+ *
+ * `undefined` means UNKNOWN, and callers must treat it as such rather than as
+ * "unchanged" (codex, final pass). Comparing two unknowns yields equality, which
+ * would let a same-key takeover pass the guard while the message claims the read
+ * happened "on that same panel" — a false statement produced by a guard that
+ * cannot see. The real UiBridge always implements this; only lightweight or mock
+ * contexts do not, and those simply do not get the warning.
+ */
 function panelIncarnation(ctx: PanelToolCtx, tabId: string): string | undefined {
   const b = ctx.bridge as { tabIncarnation?: (t: string) => string | undefined };
   return typeof b.tabIncarnation === "function" ? b.tabIncarnation(tabId) : undefined;
@@ -2320,6 +2328,10 @@ async function settleDroppedEnqueue(
   // happens DURING the install is already baked in by the time this function
   // runs, so comparing two post-install readings would always agree and the guard
   // would be decorative. Its own test caught exactly that.
+  // UNKNOWN is not "unchanged": a bridge that cannot report an incarnation cannot
+  // rule out a same-key takeover, so it does not get to make a claim about which
+  // panel answered.
+  if (dispatch.incarnation === undefined) return res;
   if (panelIncarnation(ctx, ctx.tabId) !== dispatch.incarnation) return res;
   if (queue.isError || !queueNeverSawATask(parseToolResultJson(queue))) return res;
 
