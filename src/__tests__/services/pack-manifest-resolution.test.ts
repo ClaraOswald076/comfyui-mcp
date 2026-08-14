@@ -20,7 +20,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { resolvePackManifestFile, repairStalePackManifestPath } from "../../services/manifest.js";
+import { resolvePackManifestFile, bundledPackNamedByStalePath } from "../../services/manifest.js";
 
 describe("a pack manifest resolves by NAME, never by a captured path (#1568)", () => {
   it("resolves a real bundled pack", () => {
@@ -57,16 +57,14 @@ describe("a stale npx path is recognised as the pack it names (#1568)", () => {
     "C:/Users/u/AppData/Local/npm-cache/_npx/28eae33d00f3f7f1/node_modules/comfyui-mcp/packs/krea2-combo/manifest.yaml";
 
   it("repairs the exact path from the report", () => {
-    const repaired = repairStalePackManifestPath(STALE);
-    expect(repaired, "a dead npx root naming a real pack must be recoverable").toBeTruthy();
-    expect(repaired).toMatch(/krea2-combo[\\/]manifest\.ya?ml$/);
-    expect(repaired).not.toContain("_npx");
+    const repaired = bundledPackNamedByStalePath(STALE);
+    expect(repaired, "a dead npx root naming a real pack must be recognised").toBe("krea2-combo");
   });
 
   it("repairs the POSIX form too", () => {
     const posix =
       "/home/u/.npm/_npx/9f2c1/node_modules/comfyui-mcp/packs/krea2-combo/manifest.yaml";
-    expect(repairStalePackManifestPath(posix)).toMatch(/krea2-combo[\\/]manifest\.ya?ml$/);
+    expect(bundledPackNamedByStalePath(posix)).toBe("krea2-combo");
   });
 
   it("does NOT repair a path that is not a bundled pack manifest", () => {
@@ -79,8 +77,14 @@ describe("a stale npx path is recognised as the pack it names (#1568)", () => {
       "/npx/x/node_modules/comfyui-mcp/manifest.yaml", // no pack segment
       "/npx/x/node_modules/comfyui-mcp/packs/../../evil/manifest.yaml", // traversal
       "/npx/x/node_modules/other-pkg/packs/krea2-combo/manifest.yaml", // a different package
+      // A SOURCE CHECKOUT, not an install (review). The first version authenticated only
+      // the last four segments, so a developer's own tree — or any directory that happened
+      // to be called comfyui-mcp — was accepted. The reported failure is an installed copy
+      // under an npx cache, so `node_modules` is required.
+      "/home/u/dev/comfyui-mcp/packs/krea2-combo/manifest.yaml",
+      "/home/u/comfyui-mcp/packs/krea2-combo/manifest.yaml",
     ]) {
-      expect(repairStalePackManifestPath(other), other).toBeNull();
+      expect(bundledPackNamedByStalePath(other), other).toBeNull();
     }
   });
 
@@ -88,7 +92,7 @@ describe("a stale npx path is recognised as the pack it names (#1568)", () => {
     // The name has to exist HERE. Otherwise this invents a file for a pack that was removed
     // between versions, which is exactly the confusion it is meant to remove.
     expect(
-      repairStalePackManifestPath(
+      bundledPackNamedByStalePath(
         "/x/_npx/abc/node_modules/comfyui-mcp/packs/no-such-pack-1568/manifest.yaml",
       ),
     ).toBeNull();
@@ -99,7 +103,7 @@ describe("a stale npx path is recognised as the pack it names (#1568)", () => {
     // could retarget a legitimately different checkout.
     const live = resolvePackManifestFile("krea2-combo") as string;
     expect(live).toBeTruthy();
-    expect(repairStalePackManifestPath(live)).toBeNull();
+    expect(bundledPackNamedByStalePath(live)).toBeNull();
   });
 
   it("leaves an EXISTING path alone even when it is shaped like an install", () => {
@@ -118,7 +122,7 @@ describe("a stale npx path is recognised as the pack it names (#1568)", () => {
     try {
       expect(existsSync(file), "the fixture must actually exist").toBe(true);
       expect(
-        repairStalePackManifestPath(file),
+        bundledPackNamedByStalePath(file),
         "a live installed path is already correct — repairing it would retarget a real checkout",
       ).toBeNull();
     } finally {
@@ -131,7 +135,7 @@ describe("a stale npx path is recognised as the pack it names (#1568)", () => {
     // the pack name IS real, so only the segment rule can refuse it. The earlier refusal
     // case had a non-matching owner and so passed with this rule deleted.
     expect(
-      repairStalePackManifestPath(
+      bundledPackNamedByStalePath(
         "/x/_npx/abc/node_modules/comfyui-mcp/skills/krea2-combo/manifest.yaml",
       ),
     ).toBeNull();

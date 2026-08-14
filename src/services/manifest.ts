@@ -180,45 +180,47 @@ export function resolvePackManifestFile(packName: string): string | null {
 }
 
 /**
- * Recognise a DEAD path as the bundled pack it names, and return the live one.
+ * Which bundled pack a MISSING path was almost certainly naming, or null.
  *
- * Returns null unless every one of these holds — and the strictness is the point. This
- * substitutes a file the caller did not name, and applying the wrong manifest installs
- * custom nodes and downloads model weights, so a wrong answer here is far worse than the
- * ENOENT it replaces:
+ * This deliberately does NOT substitute the file. An earlier version of this returned the
+ * live path and applied it, and review was right to attack that: `apply_manifest` installs
+ * custom nodes and downloads model weights, so running a file the caller did not name is a
+ * much worse failure than the ENOENT it replaces — and the recogniser authenticated only
+ * the last four segments, so a user's own `~/dev/comfyui-mcp/packs/<name>/manifest.yaml`
+ * would have been retargeted at a bundled pack that merely shares a directory name.
  *
- *   - the path does not exist (a live path is already correct, and re-deriving it could
- *     retarget a legitimately different checkout);
- *   - it ends `packs/<name>/manifest.(yaml|yml)`;
- *   - `<name>` is a plain segment naming a pack THIS BUILD ships;
- *   - and the segment before `packs` is a `comfyui-mcp` package root, so a user's own
- *     `packs/` directory — or another package's — is never adopted.
+ * So it answers a question instead: "is there a bundled pack this dead path was pointing
+ * at?" The caller turns that into an actionable refusal naming `pack:<name>`, which is one
+ * call away and leaves the choice with the user. `pack:` is the actual fix for #1568; this
+ * only stops the failure being a bare ENOENT that reads like a missing pack.
+ *
+ * Still requires `node_modules` in the path, because the reported failure is an INSTALLED
+ * copy under an npx cache — that keeps a source checkout out of it entirely.
  */
-export function repairStalePackManifestPath(candidate: string): string | null {
-  const raw = String(candidate ?? "").trim();
-  if (!raw) return null;
-  // A path that still resolves is not stale; leave it alone.
+export function bundledPackNamedByStalePath(candidate: string): string | null {
+  const raw = String(candidate ?? "");
+  if (!raw.trim()) return null;
+  // Only a path that resolves to nothing is a candidate. This is not a security boundary —
+  // nothing is substituted on the strength of it — so an ambiguous stat (a permission
+  // error, a dangling symlink) costing us a suggestion is the harmless direction.
   if (existsSync(raw)) return null;
-  // Compare on a normalised, separator-agnostic form — the report's path is Windows-shaped
-  // and the same defect exists on POSIX.
   const parts = raw.replace(/\\/g, "/").split("/").filter(Boolean);
-  if (parts.length < 4) return null;
-  const [file, name, packs, owner] = [
-    parts[parts.length - 1],
-    parts[parts.length - 2],
-    parts[parts.length - 3],
-    parts[parts.length - 4],
-  ];
+  if (parts.length < 5) return null;
+  const file = parts[parts.length - 1];
+  const name = parts[parts.length - 2];
+  const packs = parts[parts.length - 3];
+  const owner = parts[parts.length - 4];
+  const container = parts[parts.length - 5];
   if (file !== "manifest.yaml" && file !== "manifest.yml") return null;
   if (packs !== "packs") return null;
-  // The owning package must be ours. Without this, a user's own
-  // `my-project/packs/<name>/manifest.yaml` would be silently replaced by a bundled pack
-  // that merely shares a directory name.
   if (owner !== "comfyui-mcp") return null;
+  // An INSTALLED copy, which is what an npx cache holds. A working checkout at
+  // `~/dev/comfyui-mcp/packs/…` is not this, and its missing file is its own business.
+  if (container !== "node_modules") return null;
   if (!SAFE_PACK_NAME.test(name)) return null;
-  // …and the pack has to exist HERE. Otherwise this invents a file for a pack that was
-  // removed between versions, which is the confusion it exists to remove.
-  return resolvePackManifestFile(name);
+  // …and only if this build actually ships it, so the hint never names a pack that is not
+  // there to apply.
+  return resolvePackManifestFile(name) ? name : null;
 }
 
 export type ManifestAction =
@@ -240,10 +242,6 @@ export interface ApplyManifestResult {
   success: boolean;
   summary: Record<ManifestItemStatus, number>;
   results: ManifestItemReport[];
-  /** #1568 — set when the `path` given was a dead npx-cache path and a bundled pack of the
-   *  same name was applied instead. Reported rather than done silently: this is a different
-   *  file from the one the caller named, and they are entitled to know which one ran. */
-  resolved_from_stale_path?: { requested: string; applied: string; pack: string };
 }
 
 function parseManifestText(path: string, text: string): unknown {
@@ -276,7 +274,7 @@ interface ResolvedManifest {
   staleRepair?: { requested: string; applied: string; pack: string };
 }
 
-async function resolveManifest(opts: ApplyManifestOptions): Promise<ResolvedManifest> {
+async function resolveManifest(opts: ApplyManifestOptions): Promise<ComfyManifest> {
   const hasInline = opts.manifest !== undefined;
   const hasPath = opts.path !== undefined && opts.path.trim().length > 0;
   const hasPack = opts.pack !== undefined && opts.pack.trim().length > 0;
@@ -286,7 +284,7 @@ async function resolveManifest(opts: ApplyManifestOptions): Promise<ResolvedMani
       "Provide exactly one of `manifest`, `path`, or `pack` to apply_manifest.",
     );
   }
-  if (hasInline) return { manifest: manifestSchema.parse(opts.manifest) };
+  if (hasInline) return manifestSchema.parse(opts.manifest);
 
   // #1568 — a NAME, resolved against the running package root. This is the durable form: a
   // pack name cannot expire the way a path captured under an npx cache hash does.
@@ -299,27 +297,26 @@ async function resolveManifest(opts: ApplyManifestOptions): Promise<ResolvedMani
           `List the available packs with list_packs (action:"list") and use the \`name\` it reports.`,
       );
     }
-    return { manifest: await loadManifestFile(file) };
+    return loadManifestFile(file);
   }
 
-  const requested = opts.path!.trim();
+  // The path is opened EXACTLY as given. Trimming was only ever meant to decide whether an
+  // input was present; trimming what gets opened would silently retarget a legitimate
+  // POSIX path with leading or trailing whitespace (review).
+  const requested = opts.path!;
   // #1568 — the reported failure: a path handed out by an EARLIER npx process, whose cache
-  // directory no longer exists. Recognise it as the bundled pack it names rather than
-  // reporting a missing file, but only under the strict conditions in
-  // repairStalePackManifestPath — this substitutes a file the caller did not name.
-  const repaired = repairStalePackManifestPath(requested);
-  if (repaired) {
-    const pack = basename(dirname(repaired));
-    logger.info(
-      "apply_manifest: the manifest path given no longer exists; applying the bundled pack of the same name from this build (#1568)",
-      { requested, applied: repaired, pack },
+  // directory no longer exists. Turn the bare ENOENT into the one-call remedy rather than
+  // applying a file nobody named.
+  const stalePack = bundledPackNamedByStalePath(requested);
+  if (stalePack) {
+    throw new ValidationError(
+      `That manifest path no longer exists: it points into a package directory from an earlier ` +
+        `npx run, which is replaced on each respawn (#1568). The pack itself is still here — ` +
+        `re-run with pack: "${stalePack}" instead of a path, which resolves against the running ` +
+        `build and cannot go stale. (Nothing was installed.)`,
     );
-    return {
-      manifest: await loadManifestFile(repaired),
-      staleRepair: { requested, applied: repaired, pack },
-    };
   }
-  return { manifest: await loadManifestFile(requested) };
+  return loadManifestFile(requested);
 }
 
 function commandExists(cmd: string): boolean {
@@ -962,7 +959,7 @@ async function installedNodesOrEmpty(): Promise<InstalledNode[]> {
 export async function applyManifest(
   opts: ApplyManifestOptions,
 ): Promise<ApplyManifestResult> {
-  const { manifest, staleRepair } = await resolveManifest(opts);
+  const manifest = await resolveManifest(opts);
 
   // Resolve the LOCAL ComfyUI base this call should target, WITHOUT mutating the
   // process-global config.comfyuiPath (a global temp-set would leak the path to
@@ -979,10 +976,7 @@ export async function applyManifest(
   // classification + pip's interpreter, never where a model lands.
   const localBase = await resolveLocalManifestBase();
 
-  const result = await applyManifestSections(manifest, localBase);
-  // #1568 — surface the substitution on the RESULT, not only in the log. The caller named
-  // one file and a different one ran; that belongs in the answer they read.
-  return staleRepair ? { ...result, resolved_from_stale_path: staleRepair } : result;
+  return applyManifestSections(manifest, localBase);
 }
 
 /**
