@@ -64,6 +64,8 @@ import { uploadImageHttp, resetClient } from "../comfyui/client.js";
 import { setConnectedPanelOrigins } from "../comfyui/fetch.js";
 import { publishConnectedPanelOrigins } from "../services/panel-origin-channel.js";
 import { logger } from "../utils/logger.js";
+import { listDownloadJobs } from "../services/download-jobs.js";
+import { completionContradictedByRecord } from "./download-done-guard.js";
 import { assembleVocabularyHash, describeVocabularySkew } from "../tools/vocabulary.js";
 import { buildPanelToolDefs } from "./panel-tools.js";
 
@@ -5723,6 +5725,38 @@ export async function runPanelOrchestrator(): Promise<void> {
       // filename, so the (id, target) eviction above cannot see it. The live rows
       // are already in hand this tick; markSupersededByLive asks them by name.
       markSupersededByLive(settled, downloads);
+      // #1574 — DROP a completion this orchestrator's own status tool would contradict.
+      //
+      // The event is built from the progress ROW; `download_model action:"status"` answers
+      // from the job RECORD. A reporter got "transfer completed" for an 11.46GB file while
+      // status said it was still streaming and the file was not on disk — it landed minutes
+      // later. Whatever wrote that row, the record is in hand right here.
+      //
+      // Only a POSITIVE contradiction drops it (the record exists, same id, still
+      // "downloading"). An absent record means nothing: the record store resets on a
+      // respawn, which is the reported session, and treating absence as in-flight would
+      // silence every completion after any respawn.
+      const records = (() => {
+        try {
+          return listDownloadJobs();
+        } catch {
+          // Never let the guard break the event path — a completion we cannot check is
+          // still a completion worth delivering.
+          return [];
+        }
+      })();
+      const honest = settled.filter((d) => !completionContradictedByRecord(d, records));
+      if (honest.length === 0) continue;
+      if (honest.length !== settled.length) {
+        logger.warn(
+          "[panel-orchestrator] suppressed download completion(s) the job record contradicts (#1574)",
+          {
+            suppressed: settled
+              .filter((d) => completionContradictedByRecord(d, records))
+              .map((d) => String((d as { id?: unknown }).id ?? "")),
+          },
+        );
+      }
       // #884 — a download has no originating TAB (its row names the owning
       // conversation), so its turn INHERITS the conversation's LAST
       // ESTABLISHED origin — never the active tab (confirming gate 2, P0 rule:
@@ -5732,7 +5766,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       // ran — the turn routed to whatever tab was active (confirming gate 3,
       // P1). The minted mid contributes nothing and the batch close inherits
       // (or refuses, when no origin was ever established).
-      manager.injectEvent(key, { kind: "download_done", downloads: settled }, {
+      manager.injectEvent(key, { kind: "download_done", downloads: honest }, {
         mid: turnOrigins.mintInheritedOrigin(),
       });
     }

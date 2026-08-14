@@ -87,3 +87,53 @@ describe("a completion the record contradicts is not announced (#1574)", () => {
     expect(completionContradictedByRecord(row(), null as never)).toBe(false);
   });
 });
+
+// ── WIRING. The guard is inert unless the emit path consults it, and that is a few lines
+//    inside the orchestrator tick — the shape that deletes with every unit test green.
+
+describe("the emit path actually consults the guard (#1574)", () => {
+  const source = async (): Promise<string> => {
+    const { readFileSync } = await import("node:fs");
+    return readFileSync(new URL("../../orchestrator/index.ts", import.meta.url), "utf-8");
+  };
+
+  it("filters the settled bucket before injecting the event", async () => {
+    const src = await source();
+    const at = src.indexOf('kind: "download_done"');
+    expect(at, "the download_done injection must still be recognisable").toBeGreaterThan(-1);
+    // Bounded by the injection itself rather than a byte count — a fixed window around
+    // growing code has reported missing wiring three times in this repo already.
+    const block = src.slice(Math.max(0, at - 2500), at + 200);
+    expect(block).toMatch(/listDownloadJobs\(\)/);
+    // The FILTER specifically, not merely a mention of the guard. Deleting the filter while
+    // keeping the log line below it left an earlier version of this green: the call still
+    // appeared in the block, just no longer on the path that decides anything.
+    expect(block).toMatch(
+      /settled\.filter\(\(d\) => !completionContradictedByRecord\(d, records\)\)/,
+    );
+  });
+
+  it("injects the FILTERED list, not the raw bucket", async () => {
+    // The defect this would leave: compute `honest`, log about it, and then hand `settled`
+    // to injectEvent anyway. Every guard test would still pass.
+    const src = await source();
+    expect(src).toMatch(/kind: "download_done", downloads: honest/);
+    expect(src).not.toMatch(/kind: "download_done", downloads: settled/);
+  });
+
+  it("skips the turn entirely when everything was contradicted", async () => {
+    // Injecting an empty download_done wakes the agent for nothing.
+    const src = await source();
+    expect(src).toMatch(/if \(honest\.length === 0\) continue;/);
+  });
+
+  it("a failure to read the record does not break the event path", async () => {
+    // A completion we cannot check is still a completion worth delivering. The guard must
+    // never be able to turn a working notification into a lost one.
+    const src = await source();
+    const at = src.indexOf("listDownloadJobs()");
+    const block = src.slice(at - 200, at + 400);
+    expect(block).toMatch(/catch/);
+    expect(block).toMatch(/return \[\];/);
+  });
+});
