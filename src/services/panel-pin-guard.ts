@@ -679,6 +679,18 @@ export function reclaimAbandonedPanelLock(): PanelLockReclaimResult {
   }
 }
 
+/** The `token` from a lock record, or undefined when it cannot be read. Used to
+ *  identify a lock across observations (#1489); pid+startedAt alone cannot. */
+function lockRecordToken(obs: { raw?: string }): string | undefined {
+  if (typeof obs.raw !== "string") return undefined;
+  try {
+    const t = (JSON.parse(obs.raw) as { token?: unknown }).token;
+    return typeof t === "string" ? t : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function acquireFileLock(timeoutMs: number): Promise<() => void> {
   const path = panelLockPath();
   assertNotWritingRealHomeInTests(path, "the panel operation lock");
@@ -935,15 +947,29 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
         // atomic take can — but it converts "one glance" into "unchanged across
         // a second", and the failure it protects is a false refusal, never a
         // deletion.
+        // The record's `token` is what makes a lock IDENTIFIABLE rather than
+        // merely attributable — it exists because pid+startedAt cannot
+        // distinguish two locks taken by the same process, and a replacement
+        // could in principle reuse both (review finding). Include it, and fall
+        // back to the raw record when it cannot be parsed, so an unreadable
+        // record can never fingerprint-match a different unreadable one.
         const fingerprint =
           early && early.alive === false && early.ageMs >= STALE_LOCK_MS
-            ? `${String(early.pid)}@${String(early.startedAt)}`
+            ? `${String(early.pid)}@${String(early.startedAt)}#${lockRecordToken(early) ?? `raw:${String(early.raw)}`}`
             : undefined;
         const confirmed = fingerprint !== undefined && fingerprint === deadOwnerCandidate;
         deadOwnerCandidate = fingerprint;
         if (confirmed && early) {
+          // Stated as an OBSERVATION, not as present-tense fact. The lock can
+          // still be replaced between this read and this throw — that window is
+          // inherent to observe-then-act and no amount of re-reading removes it
+          // (review, round 2). What two matching probes DO establish is that the
+          // sentence below was true for a full interval, which is a claim this
+          // can actually keep. The cost of being overtaken is one spurious error
+          // on a retryable operation; nothing is deleted either way.
           throw new Error(
-            `The panel operation lock at ${path} is held by a process that is no longer ` +
+            `The panel operation lock at ${path} was held, for at least the last ` +
+              `${Math.round(LIVENESS_PROBE_MS / 1000)}s, by a process that is no longer ` +
               `running. ${describeObservedLock(path, early)} Not waiting out the remaining ` +
               `timeout, and not deleting it either: a concurrent orchestrator could have ` +
               `replaced it since it was observed. To clear a proven abandoned lock, run ` +

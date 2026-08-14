@@ -207,6 +207,36 @@ describe("#1489 a provably dead lock owner is reported at once", () => {
     expect(elapsed).toBeGreaterThanOrEqual(1_800);
   });
 
+  it("a replacement reusing pid AND startedAt is still caught by the token", async () => {
+    // pid+startedAt is attribution, not identity — the record carries a `token`
+    // precisely because two locks from the same process can share both. A
+    // replacement that reuses them would collide on a fingerprint built from
+    // pid@startedAt alone and be confirmed as the earlier dead lock (review
+    // finding). Same elapsed-time discriminator as the sibling test: correct
+    // behaviour needs a fresh pair of matching probes after the swap.
+    const frozenAge = 20 * 60_000;
+    const stamp = new Date(Date.now() - frozenAge).toISOString();
+    const writeWithToken = (token: string) => {
+      const p = join(dir, "panel-op.lock");
+      writeFileSync(p, JSON.stringify({ pid: DEAD_PID, startedAt: stamp, token }));
+      const when = (Date.now() - frozenAge) / 1000;
+      utimesSync(p, when, when);
+    };
+    writeWithToken("token-A");
+    const { withPanelMutationLock } = await lockModule();
+    const swap = setTimeout(() => writeWithToken("token-B"), 400);
+
+    const started = Date.now();
+    const err = await withPanelMutationLock(async () => "unreachable", {
+      timeoutMs: 8_000,
+    }).catch((e: Error) => e);
+    const elapsed = Date.now() - started;
+    clearTimeout(swap);
+
+    expect((err as Error).message).toMatch(/Not waiting out the remaining timeout/i);
+    expect(elapsed).toBeGreaterThanOrEqual(1_800);
+  });
+
   it("a lock REPLACED between probes resets the candidate and is not fast-failed", async () => {
     // The TOCTOU the two-observation rule exists for: a dead+stale lock is seen,
     // then a different holder takes the path before the next probe. Refusing on
