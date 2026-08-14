@@ -1,12 +1,21 @@
-// #1371 r2 — the refusal that shipped in v0.51.19 and had never once fired.
+// #1371 r2 — the refusal that shipped in v0.51.19 and has never once fired.
 //
 // `divergentInstallRefusal` is reached from ONE place, admitted by
 // `if (!liveRootAtResolve)` — which holds exactly when
-// `isLiveAuthoritativeModelsDir(source)` was FALSE. Its evidence comes from
-// `isUnderLiveModelRoots`, which used to bail with `{inRoots: undefined}` unless
-// `isLiveAuthoritativeModelsDir(dest.source)` was TRUE. Same predicate, opposite
-// directions, same server moments apart — so the answer was always `undefined`,
-// and `divergentInstallRefusal` returns null at its first line when it is.
+// `isLiveAuthoritativeModelsDir(source)` is FALSE. Its evidence comes from
+// `isUnderLiveModelRoots`, which bails with `{inRoots: undefined}` unless
+// `modelsDirNamedByServer(dest.source)` is TRUE. And `modelsDirNamedByServer` is
+// a deliberate SUBSET of `isLiveAuthoritativeModelsDir` ({argv-flag, live-root}
+// vs {argv-flag, live-root, observed-root}), so the admitting condition IMPLIES
+// the evidence bails. The answer on that path is always `undefined`, and
+// `divergentInstallRefusal` returns null at its first line when it is.
+//
+// (When this file was first written the evidence gate read
+// `isLiveAuthoritativeModelsDir(dest.source)` — the same predicate as the caller,
+// in the opposite direction. Main has since narrowed it to the separate, stricter
+// `modelsDirNamedByServer` for #369/#1374. That WIDENED the gap rather than
+// closing it: the contradiction survives the rename a fortiori, which is why the
+// executable proof below enumerates the source values instead of matching a name.)
 //
 // The existing suite could not see this: it tests `divergentInstallRefusal` as a
 // PURE function with `inRoots: false` handed in, and its "#1371 WIRING" block is
@@ -16,20 +25,37 @@
 // THESE ARE CHARACTERIZATION TESTS. They pass on main today and are not a
 // regression net for a fix — there is no fix here, and that is the finding.
 //
-// What they pin is the working half: `isUnderLiveModelRoots` answers `false`
-// correctly whenever `dest.source` IS live-authoritative. Combined with the last
-// test in this file, which pins the caller's gate as requiring the NEGATION of
-// that condition, they document why the refusal cannot fire.
+// What they pin:
+//   - the working half: `isUnderLiveModelRoots` answers `false` correctly whenever
+//     `dest.source` IS one the server named. Nothing is wrong with that function.
+//   - REACHABILITY: `resolveDownloadTarget` really does enter the refusal branch in
+//     the reporter's shape — proven from its own return value, not from source text
+//     — and returns a destination inside the STALE install without refusing. A test
+//     that passed only because the branch never ran would prove nothing; this one
+//     asserts the branch runs and is inert.
+//   - THE CONTRADICTION, enumerated over every `ModelsDirSource` the resolver can
+//     produce, so repairing either gate fails it and points here.
 //
 // I also tried the obvious repair — fall back to `snapshot.liveRoot` when the
 // models dir is not live-derived — and it is a NO-OP. output-dir.ts adopts the
-// live root as the models dir precisely when `live.root && existsSync(live.root)`,
-// so "not live-authoritative" IMPLIES the live root is absent from this
-// filesystem; the fallback path then fails `realpath`, `fullyCanonical` goes
+// live root as the models dir precisely when `live.root && existsSync(live.root)`
+// (with `argv-flag` covering the explicit-flag case), so a non-authoritative
+// source implies the live root is EITHER underivable OR absent from this
+// filesystem — and `snapshot.liveRoot` is published whenever `live.root` is
+// truthy, WITHOUT an existence check. The fallback therefore gets `undefined` or
+// a path that is not here; `canon()` fails `realpath`, `fullyCanonical` goes
 // false, and the answer is `undefined` exactly as before. Reverted rather than
 // shipped. See the issue thread for where a real fix would have to live.
+//
+// NOTE: #1371 is not wholly unguarded on main — `resolveModelsDirWithBases` grew a
+// separate refusal (output-dir.ts, "#1371 — DO NOT WRITE INTO A BASE THE SERVER
+// DEMONSTRABLY DOES NOT READ") that fires EARLIER, when the server's own listing
+// positively contradicts the configured base. That one works. It just needs a
+// non-empty, contradicting listing, which is exactly what the reporter's sparse
+// category did not provide — so the dead refusal downstream is still the one that
+// was supposed to cover this case, and still cannot.
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { readFileSync } from "node:fs";
@@ -55,8 +81,15 @@ let reachable = true;
 /** The cwd `/system_stats` reports. Undefined = the server cannot anchor itself. */
 let cwd: string | undefined = CONNECTED_ROOT;
 
+/** How many times the running server was asked to describe itself. The refusal
+ *  branch's own work — `isUnderLiveModelRoots` — costs one extra `/system_stats`,
+ *  which is how the reachability test observes that the BODY ran and not merely
+ *  that its condition was true. */
+let statsCalls = 0;
+
 vi.mock("../../comfyui/client.js", () => ({
   getSystemStats: async () => {
+    statsCalls += 1;
     if (!reachable) throw new Error("ECONNREFUSED");
     return { system: { argv, cwd } };
   },
@@ -84,8 +117,12 @@ async function membershipFor(targetDir: string, category?: string) {
 beforeEach(() => {
   reachable = true;
   cwd = CONNECTED_ROOT;
-  // `main.py` under the connected install, no --models-directory: the models dir
-  // is NOT live-authoritative, but the install ROOT is derivable from argv.
+  // An ABSOLUTE `main.py` under the connected install, no --models-directory. The
+  // install root resolves from argv and EXISTS here, so output-dir adopts
+  // `<root>/models` with `source = "live-root"` — server-named, and therefore the
+  // one state in which `isUnderLiveModelRoots` is allowed to answer at all. That is
+  // what the first tests below exercise: the working half, reached DIRECTLY.
+  // Production never calls it in this state — see the REACHED AND INERT test.
   argv = [join(CONNECTED_ROOT, "main.py"), "--port", "8190"];
 });
 
@@ -97,7 +134,7 @@ afterAll(() => {
   rmSync(SANDBOX, { recursive: true, force: true });
 });
 
-describe("#1371 the divergent-install guard can actually answer", () => {
+describe("#1371 the divergent-install refusal: reached, and unable to answer", () => {
   it("a destination under the STALE install is reported OUTSIDE the live roots", async () => {
     // The working half. Called DIRECTLY like this — with a live-authoritative
     // source — the function answers correctly. That is exactly why the bug is so
@@ -137,26 +174,117 @@ describe("#1371 the divergent-install guard can actually answer", () => {
     expect(m.inRoots).toBeUndefined();
   });
 
-  it("THE CONTRADICTION: the caller's gate requires the negation of what this needs", async () => {
-    // The two conditions, read off the source rather than asserted from memory.
-    // If someone repairs the gate, this test fails and points them here — which
-    // is the only useful thing a test can do about dead code.
-    const src = readFileSync(join(HERE, "../../services/model-resolver.ts"), "utf8");
+  it("REACHED AND INERT: the refusal branch runs in the reporter's shape and refuses nothing", async () => {
+    // The proof that matters, and the one the pure-function tests cannot give.
+    //
+    // A test asserting "no refusal was thrown" passes just as happily when the
+    // branch never executed, so it proves nothing on its own. This drives the real
+    // production entry point and reads REACHABILITY off its own return value:
+    // `resolveDownloadTarget` returns `liveRootAtResolve`, and the refusal branch
+    // is gated on exactly `if (!liveRootAtResolve)`. So `liveRootAtResolve ===
+    // undefined` in the RESULT is a direct observation that the branch was entered.
+    //
+    // The shape is the reporter's: a reachable ComfyUI whose install root is known
+    // but NOT present on this filesystem (Docker / a port-forward), so the models
+    // dir cannot come from the server and falls back to a stale COMFYUI_PATH.
+    const containerRoot = join(SANDBOX, "container-only", "ComfyUI"); // never created
+    argv = [join(containerRoot, "main.py"), "--port", "8190"];
+    cwd = containerRoot;
 
-    // The ONLY call site is admitted when liveRootAtResolve is falsy...
+    vi.resetModules();
+    const mod = await import("../../services/model-resolver.js");
+    const before = statsCalls;
+    const res = await mod.resolveDownloadTarget(
+      "https://example.invalid/m.safetensors",
+      "vae",
+      "m.safetensors",
+    );
+    const consultedDuring = statsCalls - before;
+
+    // REACHABILITY, two independent readings.
+    //
+    // (1) The gate's own condition, observed from the production return value: the
+    // branch is gated on exactly `if (!liveRootAtResolve)` and this IS that value.
+    expect(res.liveRootAtResolve).toBeUndefined();
+    // (2) The branch BODY ran. (1) alone cannot show that — deleting the branch
+    // outright leaves the returned value untouched — so this counts the extra
+    // `/system_stats` the body's `isUnderLiveModelRoots` call necessarily costs.
+    // Measured at 3 on current main (resolution, the symlink-ancestor guard, then
+    // the membership evidence); deleting the branch drops it to 2 and fails here.
+    expect(consultedDuring).toBeGreaterThanOrEqual(3);
+
+    // ...and it refused nothing: the destination is inside the STALE install, which
+    // is #1371 happening, on current main, past a guard written to stop it.
+    // `+ sep`, so a sibling like "comfy-other-2" cannot satisfy this by prefix.
+    expect(resolve(res.targetDir).startsWith(resolve(STALE_ROOT) + sep)).toBe(true);
+
+    // WHY it refused nothing: in that very state the evidence cannot answer.
+    const m = await mod.isUnderLiveModelRoots(res.targetDir, "vae");
+    expect(m.inRoots).toBeUndefined();
+  });
+
+  it("THE CONTRADICTION: the caller's gate requires the negation of what the evidence needs", async () => {
+    // Enumerated over the WHOLE `ModelsDirSource` union rather than matched against
+    // a predicate NAME, because the name has already changed once: main narrowed the
+    // evidence gate from `isLiveAuthoritativeModelsDir` to `modelsDirNamedByServer`,
+    // which a regex on the old name reported as a repair when it was the opposite.
+    //
+    // If someone repairs the gate for real — widening what can answer, or narrowing
+    // what admits — the intersection stops being empty and this fails, pointing here.
+    const { isLiveAuthoritativeModelsDir, modelsDirNamedByServer } = await import(
+      "../../services/output-dir.js"
+    );
+    type Source = Parameters<typeof isLiveAuthoritativeModelsDir>[0];
+    // PARSED from the union declaration, not hardcoded here.
+    //
+    // A hand-written list silently stops covering a `ModelsDirSource` that someone
+    // adds later, and the types cannot catch that: tsconfig EXCLUDES `src/__tests__`,
+    // so `npm run lint` never type-checks this file and vitest strips types without
+    // checking them. A `Record<Source, true>` exhaustiveness trick was tried here and
+    // is worthless for exactly that reason — verified by adding a member and watching
+    // lint stay green. Reading the union keeps a new member automatically covered.
+    const dirSrc = readFileSync(join(HERE, "../../services/output-dir.ts"), "utf8");
+    const decl = /export type ModelsDirSource =([\s\S]*?);/.exec(dirSrc);
+    expect(decl, "could not find the ModelsDirSource union").not.toBeNull();
+    const ALL_SOURCES = [...(decl as RegExpExecArray)[1].matchAll(/"([a-z-]+)"/g)].map(
+      (m) => m[1],
+    ) as Source[];
+
+    // A failed parse yields an empty list, which would make every assertion below
+    // trivially true. Pin the count and two known members so it cannot pass vacuously.
+    expect(ALL_SOURCES.length).toBeGreaterThanOrEqual(6);
+    expect(ALL_SOURCES).toContain("configured-base");
+    expect(ALL_SOURCES).toContain("live-root");
+
+    // The call site is admitted when liveRootAtResolve is falsy, and that is set
+    // exactly when the source IS live-authoritative — so the branch runs only for
+    // sources where the predicate is FALSE.
+    const admitsTheRefusal = ALL_SOURCES.filter((s) => !isLiveAuthoritativeModelsDir(s));
+    // The evidence bails with `{inRoots: undefined}` unless the server NAMED the dir.
+    const canAnswer = ALL_SOURCES.filter((s) => modelsDirNamedByServer(s));
+
+    // Neither set may be empty, or the emptiness — not the contradiction — would be
+    // carrying this test.
+    expect(admitsTheRefusal.length).toBeGreaterThan(0);
+    expect(canAnswer.length).toBeGreaterThan(0);
+    // ...and they are disjoint. Both `source` values come from
+    // resolveModelsDirWithBases() against the same server moments apart, so they
+    // agree; a source that admits the refusal can therefore never answer it.
+    expect(admitsTheRefusal.filter((s) => canAnswer.includes(s))).toEqual([]);
+
+    // Anchor the enumeration to the two gates it is reasoning about, so this cannot
+    // drift into a fact about two predicates nothing calls.
+    const src = readFileSync(join(HERE, "../../services/model-resolver.ts"), "utf8");
     expect(src).toMatch(/if \(!liveRootAtResolve\) \{[\s\S]{0,400}?divergentInstallRefusal\(\{/);
-    // ...and liveRootAtResolve is set exactly when the source IS live-authoritative...
     expect(src).toMatch(
       /liveRootAtResolve: isLiveAuthoritativeModelsDir\(source\) \? modelsRoot : undefined/,
     );
-    // ...while the evidence bails unless the source IS live-authoritative.
     expect(src).toMatch(
-      /if \(!isLiveAuthoritativeModelsDir\(dest\.source\)\) return \{ inRoots: undefined \}/,
+      /if \(!modelsDirNamedByServer\(dest\.source\)\) return \{ inRoots: undefined \}/,
     );
-    // Both `source` values come from resolveModelsDirWithBases() against the same
-    // server, so they agree — making the admitting and answering conditions
-    // mutually exclusive. inRoots is therefore always undefined on that path, and
-    // divergentInstallRefusal returns null at its first line.
+
+    // inRoots is therefore always undefined on that path, and divergentInstallRefusal
+    // returns null at its first line.
     const { divergentInstallRefusal } = await import(
       "../../services/download-root-correspondence.js"
     );
