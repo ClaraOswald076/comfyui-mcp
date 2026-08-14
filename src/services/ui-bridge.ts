@@ -19,6 +19,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { resolveLocale, trFor, type Locale } from "../i18n/index.js";
 import { logger } from "../utils/logger.js";
+import { attachPanelRefusal, readPanelRefusal } from "./panel-refusal.js";
 import { midCommandDisconnectMessage } from "./mid-command-remedy.js";
 import {
   describePanelUpdateRecovery,
@@ -2632,7 +2633,20 @@ export class UiBridge {
           served?.provenSupportedCmds.add(p.cmd);
           p.resolve(msg.result);
         } else {
-          p.reject(new Error(String(msg.error ?? "panel reported an error")));
+          // #1529 — carry the panel's STRUCTURED refusal onto the error.
+          //
+          // `msg.error` is arbitrary text, and the retry path needs one fact it
+          // cannot get from text: did the executor run? The panel states that in a
+          // field (panel 0.14.35), and dropping it here is why the first attempt at
+          // the retry had to match wording — which was reverted as a P0, because a
+          // genuine mid-write failure can contain the same sentence and the cost of
+          // being wrong is a re-applied mutation.
+          //
+          // Validated before it is attached, so only a complete pre-executor claim
+          // travels; anything else leaves the error exactly as it was.
+          const err = new Error(String(msg.error ?? "panel reported an error"));
+          const refusal = readPanelRefusal((msg as { refusal?: unknown }).refusal);
+          p.reject(refusal ? attachPanelRefusal(err, refusal) : err);
         }
         return;
       }
