@@ -27,7 +27,7 @@
     "dev": "tsx src/index.ts",
     "dev:agent-poc": "tsx src/experimental/run.ts",
     "start": "node dist/index.js",
-    "test": "vitest run --passWithNoTests && npm run i18n:check && npm run check:docs-links && npm run check:docs-locale && npm run check:blog && npm run check:blog-packs",
+    "test": "vitest run --passWithNoTests && npm run i18n:check && npm run check:docs-links && npm run check:docs-locale && npm run check:blog && npm run check:blog-packs && npm run check:blog-stale",
     "smoke": "npm run build && node scripts/smoke-install.mjs",
     "test:watch": "vitest",
     "test:integration": "cross-env COMFYUI_INTEGRATION=true vitest run",
@@ -62,7 +62,8 @@
     "check:docs-links": "node scripts/check-docs-links.mjs",
     "check:docs-locale": "node scripts/check-docs-locale.mjs",
     "check:blog": "node scripts/check-blog-boilerplate.mjs",
-    "check:blog-packs": "node scripts/check-blog-packs.mjs"
+    "check:blog-packs": "node scripts/check-blog-packs.mjs",
+    "check:blog-stale": "node scripts/check-blog-staleness.mjs --check"
   },
   "dependencies": {
     "@comfyorg/sdk": "^0.1.5",

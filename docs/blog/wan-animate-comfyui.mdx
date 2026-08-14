@@ -10,6 +10,7 @@ keywords:
   - video to video ComfyUI
   - motion transfer AI video
   - kijai WanVideoWrapper
+verified: 2026-08-14
 ---
 
 _by [artokun](https://github.com/artokun) · June 16, 2026 · wan · video · ComfyUI · model highlight_
@@ -30,8 +31,9 @@ instead of hand-cloning six custom-node repos and chasing dtype errors.
 
 > **TL;DR — one-command setup.** Install comfyui-mcp, apply the `wan-animate` pack
 > (`apply_manifest --path packs/wan-animate/manifest.yaml`, or run the generated
-> installer), install SageAttention + Triton with the bundled `.bat`, then drive
-> the graph from your own Claude session via the Panel. Jump to
+> installer), then drive the graph from your own Claude session via the Panel. The
+> shipped graph asks for SageAttention — if you don't have it, set `attention_mode`
+> to `sdpa` and skip the toolchain entirely. Jump to
 > [Install](#install-wan-animate-2-2-in-comfyui).
 
 ## What is WAN Animate 2.2?
