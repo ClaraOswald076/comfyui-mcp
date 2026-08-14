@@ -4186,6 +4186,35 @@ async function unreadableOrHealed(
 function panelTooOldNote(ctx: PanelToolCtx): string {
   try {
     const v = ctx.bridge?.panelTooOldForReplyUuid?.(ctx.tabId);
+    // #1560 — A PANEL TOO OLD TO HELP IS ALSO TOO OLD TO SAY SO.
+    //
+    // The note below needs an advertised version, and `panel_version` has only
+    // ridden the hello since panel v0.11.83. So the panels most likely to be
+    // causing this deadlock — anything below 0.11.45 — cannot report it, and the
+    // reporter of #1560 (on 0.11.37, after two Manager self-updates of the pack
+    // crashed) got a bare "the panel did not answer" with nothing to act on.
+    //
+    // Deliberately WEAKER wording than the version case: this is inferred from a
+    // field that is absent, not from a comparison, so it says "older than" and
+    // "very likely" rather than asserting a version. It also names the check, so
+    // a reader can confirm rather than take it on faith.
+    if (v?.neverAdvertised) {
+      return (
+        `
+
+WHY THIS READ WAS NEEDED AT ALL: this session's panel has never reported its ` +
+        `version. Panels have advertised one on connect since 0.11.83, so a panel that ` +
+        `reports none is OLDER than that — and therefore older than ${v.needed}, from which ` +
+        `a panel reports the new workflow's identity ON THE REPLY. From ${v.needed}+ the ` +
+        `command that re-pointed the canvas repairs the fence from its own reply and never ` +
+        `makes this read, so an outdated panel is very likely the whole cause here rather ` +
+        `than anything about this workflow. Check it with install_comfyui (action:"panel", ` +
+        `panel_action:"status"); update with install_comfyui (action:"panel", ` +
+        `panel_action:"sync"), then restart ComfyUI and ` +
+        `HARD-REFRESH the browser tab (Ctrl+Shift+R) — a pack update that ComfyUI-Manager ` +
+        `reported as failed leaves the OLD panel JS running in the open tab.`
+      );
+    }
     if (!v?.tooOld) return "";
     return (
       `

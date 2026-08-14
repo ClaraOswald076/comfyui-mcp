@@ -2943,6 +2943,22 @@ export class UiBridge {
     tooOld: boolean;
     version?: string;
     needed: string;
+    /**
+     * The panel has NEVER advertised a version on this tab (#1560).
+     *
+     * Distinct from `advertised === false`, which only means THIS connection's
+     * hello omitted it while a previous one supplied a value — the inherited case
+     * the tri-state guard above exists for, where staying silent is right.
+     *
+     * Never having one is different, and it is evidence rather than absence:
+     * `panel_version` has ridden the hello since panel v0.11.83 (measured — the
+     * commit is an ancestor of v0.11.83 and of no earlier tag), so a panel that
+     * has never sent one is BELOW that, and therefore also below the 0.11.45 this
+     * check is about. A panel old enough to cause the #1043 deadlock is, by
+     * construction, too old to report that it is — which is why #1560's reporter
+     * got a bare "the panel did not answer" on a panel from 0.11.37.
+     */
+    neverAdvertised?: boolean;
   } {
     const needed = PANEL_MIN_VERSION_REPLY_UUID;
     let version: string | undefined;
@@ -2960,7 +2976,18 @@ export class UiBridge {
     } catch {
       version = undefined;
     }
-    if (!advertised) return { tooOld: false, needed };
+    // NEVER advertised is not the same as "not advertised on this connection"
+    // (#1560). The latter inherits a known value and must stay silent; the former
+    // is only possible below v0.11.83, which is itself below `needed`.
+    //
+    // `tooOld` stays FALSE for it on purpose: this is an inference from a missing
+    // field, not a version comparison, and the two must not be reported with the
+    // same confidence. The caller renders it as a hedge.
+    if (!advertised) {
+      return version === undefined
+        ? { tooOld: false, needed, neverAdvertised: true }
+        : { tooOld: false, needed };
+    }
     if (!version || !SEMVER_RE.test(version.trim())) return { tooOld: false, needed };
     return { tooOld: compareSemver(version, needed) < 0, version, needed };
   }
