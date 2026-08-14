@@ -745,6 +745,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.45] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- a Get/Set bus node is not an unknown runtime (#1564)
+
+
 ## [0.51.44] - 2026-08-14
 
 ### MCP
