@@ -27,7 +27,7 @@
     "dev": "tsx src/index.ts",
     "dev:agent-poc": "tsx src/experimental/run.ts",
     "start": "node dist/index.js",
-    "test": "vitest run --passWithNoTests && npm run i18n:check && npm run check:docs-links",
+    "test": "vitest run --passWithNoTests && npm run i18n:check && npm run check:docs-links && npm run check:docs-locale",
     "smoke": "npm run build && node scripts/smoke-install.mjs",
     "test:watch": "vitest",
     "test:integration": "cross-env COMFYUI_INTEGRATION=true vitest run",
@@ -59,7 +59,8 @@
     "prepare": "tsc",
     "i18n:build": "node scripts/i18n-build-en.mjs",
     "i18n:check": "node scripts/i18n-check.mjs",
-    "check:docs-links": "node scripts/check-docs-links.mjs"
+    "check:docs-links": "node scripts/check-docs-links.mjs",
+    "check:docs-locale": "node scripts/check-docs-locale.mjs"
   },
   "dependencies": {
     "@comfyorg/sdk": "^0.1.5",
