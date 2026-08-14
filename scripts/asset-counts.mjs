@@ -180,6 +180,13 @@ const CLAIMS = [
   { file: "docs/local-vs-comfy-cloud.mdx", key: "mcp_tools", re: /(\d+) MCP tools/ },
   { file: "docs/local-vs-comfy-cloud.mdx", key: "skills", re: /(\d+) model-specific skills/ },
   { file: "docs/local-llms.mdx", key: "mcp_tools", re: /The full surface is (\d+) tools/ },
+  // PROSE counts, not just badges. The badge patterns above were all correct while
+  // "35 skills total" sat five lines under a correct "**38 AI skills**" badge in the same
+  // file, and docs/index.mdx advertised "80+ tools" against a real 37 — both invisible to
+  // this gate because it only matched the bolded forms. A count is a count wherever it is
+  // written.
+  { file: "README.md", key: "skills", re: /(\d+) skills total/ },
+  { file: "docs/index.mdx", key: "mcp_tools", re: /(\d+)\+? tools, auto-documented/ },
 ];
 
 const c = await counts();

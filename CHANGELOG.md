@@ -4,6 +4,198 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.51.35
+
+### Fixed
+
+- **An orchestrator that never finishes starting no longer lingers silently (#1524).**
+  A respawned instance was found alive for hours holding no listening ports at all,
+  while an older one still owned them. Nothing was wrong from the sidebar's point of
+  view, and nothing reported a problem -- the process simply sat there, burning a slot
+  and making "which one is the orchestrator?" ambiguous for anything that looks by
+  process name.
+
+  Failing to claim the port was already handled: that path retries, tries to take the
+  port over, and exits with a clear message. A process holding NO port never got that
+  far, so there was nothing to catch it. There is now a deadline covering startup
+  itself: if the bridge port has not been claimed within the window, the process says
+  why and exits instead of staying. It names the process holding the port when it can
+  identify one -- which is also when "your other copy is on an older version" becomes
+  worth saying -- and says plainly that the stall is earlier than the port when nothing
+  is holding it.
+
+  Tunable with `COMFYUI_MCP_STARTUP_DEADLINE_MS` for a genuinely slow machine, and a
+  value outside a sane range falls back to the default rather than being taken
+  literally: a number large enough to overflow, or smaller than a millisecond, would
+  otherwise be rounded into an immediate exit -- the guard causing the very outage it
+  exists to prevent.
+
+  Deliberately scoped: this catches a startup that hangs waiting on something. It
+  cannot catch one wedged in a tight loop with the event loop blocked, and the code
+  says so rather than implying otherwise.
+
+- **A misleading warning when the panel port is already taken (#1524).** It claimed the
+  session would keep working with only `panel_*` unavailable. No such mode exists -- the
+  process does not continue without that port -- and the sentence sent this session's
+  own debugging down a false path within minutes. It now reports what was actually
+  observed and leaves the outcome to the code that decides it.
+
+## 0.51.34
+
+### Fixed
+
+- **`list_tools` search finds the tool you named, and stops returning half the catalog (#1525).**
+  Searching `"download model"` returned only `runpod` -- while the unfiltered catalog
+  plainly contains `download_model`. The filter was matching the phrase literally, and
+  tool names are identifiers: `download_model` is spelled with an underscore, so the
+  phrase never occurred in it, whereas another tool's prose happens to say "download
+  model" as ordinary English. The one tool you obviously wanted was the one excluded,
+  and the only result was the coincidence.
+
+  Underscores and hyphens are now folded on both sides, so you can type a tool's name
+  the way you say it, and the words are matched individually rather than as a fixed
+  phrase. Dots and slashes are deliberately left alone, so a literal query like `v1.2`
+  still means what it says.
+
+  Matching every word across names, descriptions and parameter docs turned out to be
+  barely a filter on its own -- `"install node"` matched 19 of 37 tools, since those are
+  ordinary words in a dozen descriptions. So a tool whose NAME matches now wins outright:
+  `"download model"` gives you `download_model`, `"install node"` gives you
+  `install_custom_node`. When no name matches -- `"checkpoint"`, `"free vram"` -- the
+  search still looks through descriptions and parameters, which is the case that made
+  searching them worthwhile.
+
+  When results were chosen by name, the reply says so and tells you how many other tools
+  also matched, so a short list is never mistaken for the whole answer.
+
+## 0.51.33
+
+### Fixed
+
+- **An install ComfyUI-Manager accepted but never queued no longer looks like it worked (#1129).**
+  On legacy ComfyUI-Manager 3.x, `panel_install_node` could report an install as queued
+  while the Manager silently dropped it -- the queue then sat idle having seen no task
+  at all, and nothing appeared under `custom_nodes`. The panel's "queued" is an
+  acknowledgement, not a receipt, and it was being passed on as though it were one.
+
+  The reply now carries what a follow-up read actually found. It is careful about how
+  much that proves: the same counters are cleared by a queue reset, which other
+  operations here can issue, so an install that really did run can look identical. So it
+  says what was observed, says plainly that this settles nothing on its own, and asks for
+  the one check that does -- `panel_list_nodes`. It does not guess at the cause, and it
+  does not report a failure it cannot demonstrate; a wrong "this definitely failed" would
+  cost a needless reinstall, which is the same harm as the false success in the other
+  direction.
+
+  A related fix from 0.50.40 handled the case where the Manager REFUSES the install
+  outright (it falls back to a direct clone). This is the opposite shape -- accepted, then
+  dropped -- which that path could never catch, because nothing was refused.
+
+  The follow-up read is also pinned to the exact panel the install went to, so a browser
+  tab that reconnects or is replaced mid-install can never have its empty queue reported
+  as evidence about someone else's install.
+
+## 0.51.32
+
+### Fixed
+
+- **`apply_manifest` explains a PEP 668 refusal instead of walking into it (#1508).**
+  Installing a manifest's Python packages against a uv-managed interpreter (Stability
+  Matrix, and distro Pythons on Linux) is refused by design: the environment declares
+  itself externally managed. The manifest run simply failed with that raw error and no
+  way forward. Three different paths reached it -- with uv absent, with uv present and
+  refusing, and through the older non-venv fallback, where uv's unrelated "no virtual
+  environment" complaint sat on top of the real reason and sent readers off to fix the
+  wrong thing.
+
+  All three now say the same actionable thing: the interpreter is externally managed,
+  that is a deliberate guard rather than a broken install, and here is what actually
+  works. Notably it says what does NOT work -- routing through uv is refused by uv too,
+  which was worth measuring rather than assuming, because recommending it would have
+  cost the reader the time to find that out. It also names the check worth doing first:
+  if ComfyUI already runs from a virtual environment, the interpreter in the message is
+  the wrong one, and the fix is to point `COMFYUI_PYTHON` at the venv.
+
+  It does not force the install. pip offers an override for exactly this, and passing it
+  on a uv-managed interpreter writes into an environment uv may later reset -- turning a
+  clear failure now into a broken ComfyUI later. That stays a deliberate decision rather
+  than one inherited from a manifest, and the message says so.
+
+### Security
+
+- **A manifest entry's credentials no longer reach messages, results or logs (#1508).**
+  A pip entry or model URL may legitimately carry credentials (`https://user:token@...`).
+  Several failure paths echoed the entry back verbatim -- into the error message, into
+  the per-item report, and into the log line naming the package -- and a failed
+  subprocess additionally embeds the whole command line, so the spec travelled inside
+  ordinary install errors too. URL credentials are now masked at the single point every
+  manifest item passes through, which covers the Python-package, model and custom-node
+  paths together. Entries stay identifiable: only the user/password portion is masked,
+  so the host and path still read normally, and the underlying diagnosis is unchanged.
+
+## 0.51.31
+
+### Fixed
+
+- **A trailing space in `COMFYUI_PATH` no longer breaks every install-root check silently (#1512).**
+  On Windows the usual launcher line -- `set COMFYUI_PATH=C:\...\ComfyUI && comfyui-mcp connect ...`
+  -- captures the space BEFORE the `&&`, because that is how `cmd.exe` assigns. The
+  orchestrator then consumed the value exactly as given, so nothing matched and the
+  connected ComfyUI was reported as undeterminable. The failure surfaced about forty
+  minutes later, at the first write, with a message that echoed the path back but never
+  pointed at the space. It cost a 12.3 GB download, stranded at 11.35 GB and finished by
+  hand. The panel pack had always stripped this; the orchestrator had not.
+
+  The value is normalized now -- surrounding whitespace, and a matched pair of surrounding
+  quotes, which is the other thing that survives a paste. This is a REPAIR, not a cleanup:
+  a value that already names a real directory is never touched, because a trailing space
+  is a legal filename character (on POSIX, and in fact on Windows too), and redirecting
+  someone away from a folder that works would be worse than the bug. Only a value that
+  names nothing is repaired.
+
+  It also says so at startup, naming both forms and the launcher line that produced them,
+  instead of leaving a malformed value to surface as a mystery much later. A launcher that
+  bakes in a bad value will hand the same one to everything else it starts.
+
+  Applied at every reader, not just the obvious one: the same value feeds workflow-library
+  lookups, the environment handed to spawned agents, and the check that decides whether a
+  ComfyUI root was named explicitly or inferred. Fixing only the first would have left the
+  rest wrong -- and would have made that last one worse, by comparing a normalized value
+  against a raw one.
+
+## 0.51.30
+
+### Fixed
+
+- **A panel command that WAS applied stops being reported as a failed mutation (#1468).**
+  `panel_civitai_search` timed out at 10 s while the search demonstrably ran (`renderRev`
+  advanced, the grid reported `loading:true`), and `panel_exit_subgraph` timed out at 15 s
+  while the very next `panel_graph_outline` showed the view already back at `root`. Both
+  handed back a failure for work that had happened.
+
+  The reported cause -- that these wait on a slow frontend or external request -- turned out
+  not to be true on the affected build, and the earlier diagnosis in that issue has been
+  corrected. `driveSearch` does not await the CivitAI fetch: it dispatches and returns
+  `{dispatched:true, renderRev}` immediately, which shipped in panel 0.11.0 while the report
+  came from 0.11.44. `graph_exit_subgraph`'s own navigation receipt budgets about a second
+  and returns early on success. Neither was waiting on anything.
+
+  What was left was a bound tighter than this codebase's own default failing on a busy but
+  alive tab. `civitai_search` now waits as long as every other panel command instead of half
+  as long. And because an exit's effect is something the panel can simply be ASKED about,
+  an unanswered exit now takes one scope read and reports what it found: at the root graph
+  is decisive and says so; still inside a subgraph is NOT decisive -- an exit pops to the
+  immediate parent, so that reading cannot separate "never landed" from "landed, from a
+  nested subgraph" -- and it says which question is open rather than guessing. A read that
+  cannot answer claims nothing in either direction.
+
+  The confirmation reports where the canvas IS, not that this command is what put it there,
+  and it is pinned to the tab the navigation was dispatched to, so a session that silently
+  rebinds to another tab can never have that tab's canvas read as this navigation landing.
+  Whether the tab answered at all is now taken from the bridge's own reply-timeout marker
+  rather than inferred from message wording, so a panel error that merely reads like a
+  timeout can never be promoted to a success.
+
 ## 0.51.29
 
 ### Fixed
@@ -552,6 +744,94 @@ All notable changes to this project are documented here. This project adheres to
   ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
 
 ## Unreleased
+
+## [0.51.50] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- let the loader fail first, then append the remedy
+- refuse a stale path with the remedy — never substitute the manifest
+- resolve a pack manifest by NAME, and recognise a path that expired
+
+#### Changed
+- click the logo to go home, not to GitHub (#1581)
+- play the panel demo on the landing page instead of a placeholder (#1580)
+- Korean pilot — five entry pages, and the hreflang gate (#1577)
+
+
+## [0.51.49] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- a tab leaves the watch when its restart RESOLVES, not only when dropped
+- a watch can no longer outlive the save that created it
+- only an ARMED credential respawn may speak, and only once
+- take the at-risk snapshot when the respawn FIRES, not when it is queued
+
+#### Changed
+- fix what the docs claim, before translating them into eleven languages (#1558)
+
+
+## [0.51.48] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- bind the own-property test at load, not through the prototype
+- require an OWN property at every hop of the refusal claim
+- retry a PRE-EXECUTOR refusal, keyed on the field the panel publishes
+- wait out a reconnect refusal instead of handing it back
+
+
+## [0.51.47] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- a panel too old to help is also too old to say so (#1572)
+
+
+## [0.51.46] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- settle whether an unlisted git repo can install at all (#1566)
+
+
+## [0.51.45] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- a Get/Set bus node is not an unknown runtime (#1564)
+
+
+## [0.51.44] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- an INFERRED models root must still be corroborated before a download lands there (#1562)
+
+
+## [0.51.43] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- a relative interpreter path no longer sends a LOCAL download to Manager (#1555)
+
+
+## [0.51.42] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- let the spawned child make the #952 drift comparison (#1553)
+
 
 ## [0.51.29] - 2026-08-13
 

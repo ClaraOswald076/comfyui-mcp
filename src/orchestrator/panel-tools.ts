@@ -44,6 +44,7 @@ import { fileURLToPath } from "node:url";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { assertPanelNotTargetedUnverifiable } from "../services/panel-pin-guard.js";
 import { nodesInstallCommandArgs } from "../services/node-management.js";
+import { isPreExecutorRefusal } from "../services/panel-refusal.js";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { parse as parseYaml } from "yaml";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
@@ -86,6 +87,8 @@ function journalConversationFor(ctx: PanelToolCtx): string | undefined {
   return conversationOfScopeAddress(ctx.tabId);
 }
 import {
+  BRIDGE_DEFAULT_TIMEOUT_MS,
+  BRIDGE_READ_DEFAULT_TIMEOUT_MS,
   dispatchOutcomeOf,
   isCapabilityRefusal,
   isPanelCmdUnsupportedError,
@@ -161,6 +164,7 @@ import {
   getComfyUIBaseUrl,
   getComfyuiTargetGeneration,
 } from "../config.js";
+import { normalizeInstallPathEnv } from "../utils/install-path-env.js";
 import { sliceWorkflow } from "../services/workflow-slicer.js";
 import { validateA2UISpecServer } from "../services/a2ui-spec.js";
 import type { UiWorkflow } from "../comfyui/types.js";
@@ -430,9 +434,36 @@ export function describeComfyuiSecretSave(receipt: SecretSaveReceipt): string {
     // This is the property that makes the answer safe to act on immediately: the
     // tools resolve this key from the file at USE time, so the already-running
     // tool process sees it whether or not any respawn happens.
-    parts.push(
-      `The comfyui tools re-read that file each time they use this credential, so the tool process already running picks it up — no reload, and no respawn required.`,
-    );
+    //
+    // #1567 — but "no respawn required" was printed UNCONDITIONALLY, including on
+    // the same message that reported one already queued. Both statements were
+    // true about different things: the key needs no respawn, and a respawn is
+    // pending anyway. Read together they say "nothing is about to happen", and a
+    // reporter acted on that by starting ~48GB of downloads that the pending
+    // respawn then killed.
+    //
+    // The sentence is kept where it is correct — nothing scheduled, nothing
+    // applied — because that is the case it was written for and deleting it
+    // would lose a genuinely useful "you can retry right now".
+    const pending = receipt.respawn?.scheduled ?? 0;
+    const already = receipt.respawn?.applied ?? 0;
+    const readsItAtUseTime = `The comfyui tools re-read that file each time they use this credential, so the tool process already running picks it up — no reload needed`;
+    if (pending > 0) {
+      parts.push(
+        `${readsItAtUseTime}. But a tool-session respawn is STILL PENDING from this save ` +
+          `(${pending} queued for the end of this turn), and it replaces the tool session when it fires. ` +
+          `Anything long-running that session owns is lost at that point — model downloads in ` +
+          `particular. This message cannot list them, because a transfer started AFTER this save ` +
+          `did not exist when the check ran (#1567). If you are about to start a long download, ` +
+          `let the respawn land first.`,
+      );
+    } else if (already > 0) {
+      // A respawn HAPPENED. Saying none was required describes a different save,
+      // and #1378's at-risk warning above is reporting what that one cost.
+      parts.push(`${readsItAtUseTime} — and the tool session was rebuilt just now regardless.`);
+    } else {
+      parts.push(`${readsItAtUseTime}, and no respawn required.`);
+    }
   } else {
     parts.push(
       `This key is read from the tool process's environment at startup, so only a respawned tool session will see it.`,
@@ -2058,6 +2089,312 @@ function isAckTimeout(res: ToolResult): boolean {
   return /^(?:Error: )?Panel tab .+? did not reply to "workflow_open" within \d+\s*ms/i.test(text);
 }
 
+/**
+ * #1468 — carry the bridge's AUTHORITATIVE reply-timeout marker across the
+ * error → ToolResult conversion in `ctx.call`.
+ *
+ * Two codex rounds rejected deciding this from message TEXT, and both were right.
+ * `isAckTimeout`'s looseness is safe for `workflow_open` because a match there
+ * only opens a door — the panel's #514 receipt, correlated to the request's exact
+ * rid, is what actually decides. A caller with no receipt has the predicate doing
+ * all the work: match plus one root-looking read promotes an error to success. No
+ * amount of regex tightening fixes that, because ACKED panel errors arrive as
+ * ARBITRARY `msg.error` text (ui-bridge) and `ctx.call` flattens both kinds into
+ * the same text-only result — so any sentence the bridge can write, a panel error
+ * can also contain.
+ *
+ * `markReplyTimeout`/`isReplyTimeoutTagged` already answer the question exactly,
+ * on the error object, at the only place that KNOWS: the bridge. The information
+ * was simply being dropped in translation. This preserves it as a non-enumerable
+ * symbol so the result's JSON payload is byte-identical and nothing downstream
+ * can observe it by accident.
+ */
+const REPLY_TIMEOUT_RESULT = Symbol("panel.replyTimeoutResult");
+
+function carryReplyTimeoutMark(err: unknown, res: ToolResult): ToolResult {
+  if (!isReplyTimeoutTagged(err)) return res;
+  Object.defineProperty(res, REPLY_TIMEOUT_RESULT, {
+    value: true,
+    enumerable: false,
+    configurable: true,
+  });
+  return res;
+}
+
+/** True only for a ToolResult that `ctx.call` produced from a BRIDGE-TAGGED
+ *  reply timeout — the tab was reached and never answered. An acked executor
+ *  error can never carry this, whatever its text says. */
+function isReplyTimeoutResult(res: ToolResult): boolean {
+  return res?.isError === true && (res as Record<symbol, unknown>)[REPLY_TIMEOUT_RESULT] === true;
+}
+
+// ---- panel_exit_subgraph settle-after-ack-timeout (#1468) ------------------
+// `graph_exit_subgraph` timed out at 15 s while a following `panel_graph_outline`
+// proved the view HAD returned to root — an applied navigation reported as a
+// failed one. The bound is not the cause: the panel's own receipt
+// (`confirmCanvasNavigation`) budgets 25 polls × 40 ms ≈ 1 s and returns early on
+// success, so 15 s already clears its worst case by 15×. What fails is the ANSWER
+// getting back from a busy tab. The effect, though, is locally observable — so on
+// a no-reply we ask, exactly as #1473 does for the fence, instead of handing the
+// caller "may have been applied" and the homework.
+
+/** The one decisive observation: the canvas is at the root graph. */
+function exitConfirmedAtRootNote(): string {
+  return (
+    `CHECKED FOR YOU: the tab did not ACKNOWLEDGE the exit within the window, but a graph read ` +
+    `taken immediately afterwards, on that same tab, reports the canvas at the ROOT graph — the ` +
+    `state this tool exists to reach. No recovery step is needed and a retry would be wasted ` +
+    `work. A missing acknowledgement is not evidence the navigation failed; here it is evidence ` +
+    `the tab was too busy to answer in time. Stated precisely: what is established is WHERE THE ` +
+    `CANVAS IS, not that this command is what put it there — someone navigating out on the ` +
+    `canvas while the tab was unresponsive would read identically. Both leave you where you ` +
+    `asked to be, so the distinction changes nothing you would do next; it is drawn because only ` +
+    `one of the two was actually observed.`
+  );
+}
+
+/**
+ * The NON-decisive observation, stated as non-decisive. `graph_exit_subgraph`
+ * pops to the IMMEDIATE PARENT, not to root (#412) — so "still inside a subgraph"
+ * is equally consistent with the exit never landing and with the exit landing in
+ * the parent of a NESTED subgraph. Recommending a retry on this reading would pop
+ * a level the caller wanted to keep, which is the same class of harm as the false
+ * failure being fixed, one step removed.
+ */
+function exitInconclusiveInSubgraphNote(title: string | null): string {
+  const where = title ? `subgraph “${title}”` : "a subgraph";
+  return (
+    `CHECKED FOR YOU — and the check does NOT settle it. A graph read taken immediately after the ` +
+    `missing acknowledgement reports the canvas inside ${where}. panel_exit_subgraph pops to the ` +
+    `IMMEDIATE PARENT, not to the root graph, so this single observation cannot separate two ` +
+    `cases: the exit never landed and you are where you started, OR the exit DID land and this is ` +
+    `the parent you popped into from a nested subgraph. Settle it with a scope read ` +
+    `(panel_graph_outline, or the canvas breadcrumb) before acting. If you do re-issue, use the ` +
+    `retry_of token above rather than a bare repeat: a token names the original mutation and is ` +
+    `answered from its ledger entry WITHOUT running the executor again (#694), whereas identical ` +
+    `args with no token execute fresh — and from the second case that pops another level you may ` +
+    `have wanted to keep.`
+  );
+}
+
+/**
+ * After an ack timeout on `graph_exit_subgraph`, take ONE scope read and report
+ * what it found. Returns the untouched timeout when the read cannot answer —
+ * #1473's rule: an unknown answer claims nothing in either direction, and reading
+ * every probe failure as proof would invent a verdict out of a backgrounded tab.
+ */
+async function settleExitSubgraphAfterAckTimeout(
+  ctx: PanelToolCtx,
+  timedOut: ToolResult,
+): Promise<ToolResult> {
+  // The observation is only evidence about the tab the navigation was DISPATCHED
+  // to (codex P1). `ctx.call` runs `ensureReachable` first, which silently rebinds
+  // an unpinned current-mode session onto the sole remaining interactive tab when
+  // the bound one has gone — the exact situation an unanswered command makes
+  // likely. Without this the probe could read a DIFFERENT tab's canvas, and that
+  // tab sitting at root would be reported as this navigation having landed: a
+  // wrong-target success, which is worse than the false failure being fixed.
+  const dispatchTab = ctx.tabId;
+  // `fields:"ids", limit:1` is the cheapest shape that still carries `viewing` —
+  // the panel builds that field unconditionally on every graph_query return path.
+  const probe = await ctx.call({ cmd: "graph_query", fields: "ids", limit: 1 }, 8000);
+  // Checked AFTER the call, because the rebind happens inside it. A moved binding
+  // makes the reading inconclusive, not false — so it takes the same "claim
+  // nothing" exit as an unanswerable probe.
+  if (ctx.tabId !== dispatchTab) return timedOut;
+  const viewing = parseToolResultJson(probe)?.viewing as
+    | { scope?: unknown; title?: unknown; owner_node_id?: unknown }
+    | undefined;
+  const scope = typeof viewing?.scope === "string" ? viewing.scope : null;
+
+  if (scope === "root") {
+    // `at_root`, NOT `exited`. The read proves WHERE THE CANVAS IS; it cannot
+    // prove this command is what put it there (the user may have navigated out on
+    // the canvas while the tab was too busy to answer us). Those happen to be the
+    // same actionable answer — the caller's goal state holds either way — but only
+    // one of them is something the observation actually establishes, and naming
+    // the stronger claim would be this issue's own defect pointed the other way.
+    return ok({
+      viewing,
+      at_root: true,
+      acknowledged: false,
+      confirmed_by: "graph read after ack timeout",
+      note: exitConfirmedAtRootNote(),
+    });
+  }
+  if (scope === "subgraph") {
+    const title = typeof viewing?.title === "string" && viewing.title ? viewing.title : null;
+    const text = timedOut.content?.find((c) => c.type === "text")?.text ?? "";
+    return {
+      ...timedOut,
+      content: [{ type: "text", text: `${text}\n\n${exitInconclusiveInSubgraphNote(title)}` }],
+    };
+  }
+  return timedOut;
+}
+
+// ---- panel_install_node: accepted-but-never-enqueued (#1129) ---------------
+// #1143 fixed the pre-queue REFUSAL (403/404 → direct clone). This is the other
+// half of the same family: legacy Manager 3.x answers the install POST with
+// `queued: true`, and the task never enters the queue at all. The reporter's
+// follow-up read showed an idle queue with `total_count: 0` and no directory
+// under custom_nodes, while this tool had already said "queued".
+//
+// It is the third time this repo has met the same lesson, so it is worth stating
+// once: ComfyUI-Manager's acknowledgement is not a receipt. `getlist` cannot
+// distinguish an unreachable registry from an empty one; a download reports done
+// when the QUEUE DRAINS rather than when the transfer finishes; and here an
+// accepted request is simply dropped. "Accepted" is never evidence of "happened",
+// so the only honest reply is one that went and looked.
+//
+// NOTE the asymmetry with install_custom_node, which already verifies and clones:
+// that path owns the filesystem it installs into. This one drives whatever
+// ComfyUI the PANEL is bound to, which need not be this machine — so it can
+// report the truth but must not quietly clone somewhere else.
+
+/** True when the panel's reply claims the install was accepted/queued. */
+function claimsQueued(reply: Record<string, unknown> | null): boolean {
+  if (!reply) return false;
+  return reply.queued === true || reply.pending === true;
+}
+
+/**
+ * `total_count` counts EVERY task the Manager has seen, completed ones included —
+ * so a fast install that already finished still leaves it ≥ 1. Zero therefore
+ * means nothing was ever enqueued, which is the decisive reading and the
+ * reporter's exact signature.
+ *
+ * Not my arithmetic: `countsFromStatus` in node-management.ts states the 3.x
+ * contract outright — "total_count = done + in_progress + queued exactly" — and
+ * derives pending from it. So `done_count` cannot be non-zero while total is 0.
+ *
+ * v4 reports `pending_count` directly and need not carry `total_count` at all, so
+ * this simply never fires there. That is correct: the dropped-enqueue defect is a
+ * legacy-3.x behaviour, and a shape that cannot answer must not be made to.
+ *
+ * ONE KNOWN WAY THIS READS ZERO AFTER A REAL INSTALL: the counters are cleared by
+ * `POST /manager/queue/reset`, which this codebase itself issues from
+ * manager-config.ts and workflow-deps.ts. Neither is in panel_install_node's
+ * path, and the read below happens immediately after the install returns, so it
+ * takes a CONCURRENT reset from another operation to land in that window.
+ *
+ * That residual case is the reason this only WARNS. A definite failure verdict
+ * would be wrong there, and wrong in the same direction as the bug being fixed —
+ * a confident claim the evidence does not support. A spurious "go and check"
+ * costs one read; a spurious "it definitely failed" costs a reinstall.
+ */
+function queueNeverSawATask(reply: Record<string, unknown> | null): boolean {
+  const status = (reply?.status ?? reply) as Record<string, unknown> | undefined;
+  if (typeof status?.total_count !== "number" || status.total_count !== 0) return false;
+  // PRESENT and zero, not absent-or-zero (codex P2). `panel-installer.ts`'s
+  // established legacy-empty proof requires every count to be reported and exact;
+  // accepting a missing field would let a payload that never described the queue
+  // stand in for one that did. A `pending_count`, if this build reports one, has
+  // to agree as well.
+  const presentZero = (v: unknown): boolean => v === 0;
+  if (!presentZero(status.done_count) || !presentZero(status.in_progress_count)) return false;
+  if (status.pending_count !== undefined && !presentZero(status.pending_count)) return false;
+  // IDLE TOO, not just empty (codex P1). A snapshot taken while the Manager is
+  // mid-accept can read zero before its counters move, and a running worker is
+  // the one state where zero means "not yet" rather than "never". The panel's own
+  // queue predicate draws the same line, so this matches rather than invents one.
+  // Absent/non-boolean is NOT treated as idle: unknown answers nothing.
+  if (status.is_processing !== false) return false;
+  // Coherent, by the 3.x contract quoted above: with total 0, both of these must
+  // be 0 as well. Anything else is a shape this reasoning does not describe.
+  return true;
+}
+
+/**
+ * After an install the panel reported as queued, confirm it actually was.
+ *
+ * Two NEGATIVE observations are required before this contradicts the panel: the
+ * queue never saw a task, AND the pack is absent from the installed list. Either
+ * alone is too weak — a queue shape without `total_count` proves nothing, and a
+ * pack missing from the list moments after enqueuing is normal, because it has
+ * not been cloned yet. Together they are the reported failure exactly.
+ *
+ * Anything inconclusive returns the panel's own reply untouched (#1473's rule).
+ */
+/**
+ * The panel identity a route key currently resolves to, or `undefined` when this
+ * bridge cannot report one.
+ *
+ * `undefined` means UNKNOWN, and callers must treat it as such rather than as
+ * "unchanged" (codex, final pass). Comparing two unknowns yields equality, which
+ * would let a same-key takeover pass the guard while the message claims the read
+ * happened "on that same panel" — a false statement produced by a guard that
+ * cannot see. The real UiBridge always implements this; only lightweight or mock
+ * contexts do not, and those simply do not get the warning.
+ */
+function panelIncarnation(ctx: PanelToolCtx, tabId: string): string | undefined {
+  const b = ctx.bridge as { tabIncarnation?: (t: string) => string | undefined };
+  return typeof b.tabIncarnation === "function" ? b.tabIncarnation(tabId) : undefined;
+}
+
+async function settleDroppedEnqueue(
+  ctx: PanelToolCtx,
+  res: ToolResult,
+  dispatch: { tab: string; incarnation: string | undefined },
+): Promise<ToolResult> {
+  if (res.isError) return res;
+  if (!claimsQueued(parseToolResultJson(res))) return res;
+
+  // The queue is only evidence about the panel the install was DISPATCHED to
+  // (codex P1 — and the same guard #1468 needed, which I did not carry across).
+  // `ctx.call` runs ensureReachable first, which silently rebinds an unpinned
+  // current-mode session onto the sole remaining interactive tab. A reconnect
+  // between the two calls would let ANOTHER ComfyUI's empty queue be reported as
+  // evidence about this install.
+  // The ROUTE KEY alone is not the panel (codex P1, round 3). A `wf:` key is
+  // `wf:<tabRouteId>:<path>` — it names a WORKFLOW, so it recurs, and a different
+  // browser tab can take it over without `ctx.tabId` changing at all. The bridge
+  // draws exactly this distinction and exposes `tabIncarnation` for it (#486), so
+  // both are captured: the key AND the incarnation currently holding it.
+  const queue = await ctx.call({ cmd: "nodes_queue_status" }, 15000);
+  if (ctx.tabId !== dispatch.tab) return res;
+  // Both captured BEFORE the install was dispatched, not here — a takeover that
+  // happens DURING the install is already baked in by the time this function
+  // runs, so comparing two post-install readings would always agree and the guard
+  // would be decorative. Its own test caught exactly that.
+  // UNKNOWN is not "unchanged": a bridge that cannot report an incarnation cannot
+  // rule out a same-key takeover, so it does not get to make a claim about which
+  // panel answered.
+  if (dispatch.incarnation === undefined) return res;
+  if (panelIncarnation(ctx, ctx.tabId) !== dispatch.incarnation) return res;
+  if (queue.isError || !queueNeverSawATask(parseToolResultJson(queue))) return res;
+
+  // NO PROVENANCE CLAIM AT ALL — deliberately, after five review rounds.
+  //
+  // Earlier drafts explained WHY the task was probably dropped ("the Manager
+  // accepted a git URL it does not recognise") and prescribed accordingly. Every
+  // round found that explanation false in some reachable state: an id-only
+  // install submits no URL; a `repository` that is any non-empty string is not
+  // necessarily a URL. Each fix branched on a fact the request does not reliably
+  // carry, and each branch was a fresh chance to assert the wrong cause.
+  //
+  // What this function actually observed is the queue reading. That is worth
+  // saying, needs no provenance, and cannot be wrong. The cause belongs to
+  // whoever can see the install — so the message asks for the ONE check that
+  // settles it and stops there. Less useful in the common case; never false.
+  return appendNote(
+    res,
+    `WARNING — THE QUEUE DOES NOT HAVE THIS TASK. The Manager accepted the install above, but a ` +
+      `read taken immediately afterwards, on that same panel, reports an IDLE queue holding no ` +
+      `tasks at all (total_count, done, in_progress all 0). "queued" is its acknowledgement, not ` +
+      `a receipt.\n\n` +
+      `THIS IS NOT PROOF EITHER WAY. Those counters are also cleared by a queue RESET, which ` +
+      `other operations in this server issue, so an install that really ran can read exactly ` +
+      `like this if a reset landed in between.\n\n` +
+      `SO CHECK: call panel_list_nodes and see whether the pack is actually there. Do not restart ` +
+      `on the assumption it installed, and do not reinstall on the assumption it did not.\n\n` +
+      `IF IT IS ABSENT: install it through the headless install_custom_node, which verifies the ` +
+      `pack really landed instead of trusting the queue, and can clone a repository URL directly ` +
+      `when the Manager will not take it. This tool cannot clone for you — it drives whatever ` +
+      `ComfyUI the panel is bound to, which need not be this machine.`,
+  );
+}
+
 /** Parse a ctx.call ToolResult's text payload as JSON, or null if not parseable. */
 function parseToolResultJson(res: ToolResult): Record<string, unknown> | null {
   if (!res || res.isError) return null;
@@ -2786,6 +3123,40 @@ function fitQueryGraphReply(res: ToolResult, requested: unknown): ToolResult {
 const CIVITAI_SAMPLE_MAX_BYTES = 4 * 1024 * 1024; // per-thumbnail cap (450px jpeg ≈ tens of KB)
 const CIVITAI_SAMPLE_DEFAULT = 4; // thumbnails delivered by default — bounds context
 const CIVITAI_SAMPLE_MAX = 8; // hard ceiling even if the agent asks for more
+
+/**
+ * The `civitai_*` commands whose reply time is bounded by CivitAI rather than by
+ * the tab (#1520). Of the six in the family, exactly these two await the
+ * in-flight fetch panel-side (`state.activeReloadPromise`): `civitai_results`
+ * and `civitai_highlight`. `clear_highlight`, `switch_tab` and `open_lightbox`
+ * do not, and keep the tighter bound.
+ *
+ * `civitai_search` is the sixth and is not on either path: it dispatches through
+ * `ctx.bridge.send` so the handler can inspect the reply, and already takes
+ * `BRIDGE_DEFAULT_TIMEOUT_MS` — #1468 raised it because `driveSearch` returns
+ * without awaiting at all. The family is not uniform; do not assume a single
+ * bound describes it.
+ *
+ * That await is deliberate (panel#793): without it an agent that opened the
+ * browser and immediately asked for results got `{count:0, total:0}`, which
+ * reads as "this search found nothing" while a concurrent `civitai_highlight`
+ * *did* wait and *did* see cards — two commands disagreeing about whether
+ * results existed. So the fix is not to remove the wait but to stop charging it
+ * against a bound sized for a local read.
+ *
+ * Timing out here is not harmless in either case:
+ *   - `civitai_results` is a pure read; the caller simply loses the answer.
+ *   - `civitai_highlight` *lands* — the panel installs the glow once the reload
+ *     resolves — so the caller is told the command failed while its effect
+ *     arrives anyway. That is the #1468 false-failure shape. Re-issuing is safe
+ *     (`driveHighlight` clears before installing), but the report was wrong.
+ *
+ * 20 s is not a cure — no bound covers a CivitAI 503-and-retry. It is the
+ * tolerant bound every other read already gets (#357: a busy-but-alive tab
+ * fails a tight one), and it is the window the panel's own bounded wait has to
+ * fit inside to be able to answer at all.
+ */
+const CIVITAI_COUPLED_READ_TIMEOUT_MS = BRIDGE_READ_DEFAULT_TIMEOUT_MS;
 const CIVITAI_SAMPLE_FETCH_TIMEOUT_MS = 8000;
 // Extra fetch ATTEMPTS allowed beyond the requested image count, so a few
 // 404/non-image/oversize URLs don't starve the result — but a malformed reply
@@ -3843,6 +4214,39 @@ async function unreadableOrHealed(
 function panelTooOldNote(ctx: PanelToolCtx): string {
   try {
     const v = ctx.bridge?.panelTooOldForReplyUuid?.(ctx.tabId);
+    // #1560 — A PANEL TOO OLD TO HELP IS ALSO TOO OLD TO SAY SO.
+    //
+    // The note below needs an advertised version, and `panel_version` has only
+    // ridden the hello since panel v0.11.83. So the panels most likely to be
+    // causing this deadlock — anything below 0.11.45 — cannot report it, and the
+    // reporter of #1560 (on 0.11.37, after two Manager self-updates of the pack
+    // crashed) got a bare "the panel did not answer" with nothing to act on.
+    //
+    // Deliberately WEAKER than the version case, and weaker still after review: an
+    // absent version proves only "below 0.11.83", NOT "below the minimum". Panels
+    // in 0.11.45–0.11.82 publish the reply uuid and simply predate version
+    // advertisement, so this must read as SOMETHING TO CHECK and never as a finding
+    // — naming a cause that is not theirs is the failure this whole cluster exists
+    // to avoid.
+    if (v?.neverAdvertised) {
+      return (
+        `
+
+WORTH CHECKING — THE PANEL'S VERSION IS UNKNOWN HERE: this session's panel has never ` +
+        `reported its version, and panels have advertised one on connect since 0.11.83, so ` +
+        `this one is older than that. That does NOT by itself mean it is too old: a panel ` +
+        `reports the new workflow's identity ON THE REPLY from ${v.needed} onwards, and ` +
+        `0.11.45–0.11.82 do that while still not advertising a version. But if it IS below ` +
+        `${v.needed}, that is the whole cause of this failure rather than anything about this ` +
+        `workflow — on ${v.needed}+ the command that re-pointed the canvas repairs the fence ` +
+        `from its own reply and never makes the read that just failed. ` +
+        `Find out with install_comfyui (action:"panel", panel_action:"status"). If it is ` +
+        `older, update with install_comfyui (action:"panel", panel_action:"sync"), restart ` +
+        `ComfyUI, and HARD-REFRESH the browser tab (Ctrl+Shift+R) — a pack update that ` +
+        `ComfyUI-Manager reported as FAILED leaves the old panel JS running in the open tab, ` +
+        `so a restart alone does not pick it up.`
+      );
+    }
     if (!v?.tooOld) return "";
     return (
       `
@@ -5409,7 +5813,10 @@ function readPackWorkflow(packName: string): Record<string, unknown> {
  * an absolute path.
  */
 function comfyWorkflowsDirs(): string[] {
-  const base = process.env.COMFYUI_PATH;
+  // #1512 — a trailing space here does not fail loudly: it silently builds
+  // `<path> /user/default/workflows`, a directory that does not exist, so the
+  // workflow library simply appears empty and every lookup misses.
+  const base = normalizeInstallPathEnv(process.env.COMFYUI_PATH).path;
   if (!base) return [];
   return [
     join(base, "user", "default", "workflows"),
@@ -6364,7 +6771,24 @@ export function makePanelToolCtx(
       // for a retry in a moment; the section lasts a fraction of a second, which
       // is what retrySettleMs already waits. Still gated on RETRY-SAFE commands,
       // so a mutation is never re-issued on our own initiative.
-      if (isRetrySafeCmd(cmd) && (isTransientReconnectError(err) || isWorkflowSwitchGuardRefusal(err))) {
+      // #1529 — a PRE-EXECUTOR refusal is retryable even for a MUTATION.
+      //
+      // Every other branch here is gated on RETRY_SAFE_CMDS precisely because a
+      // mutation might have landed before the failure, and re-issuing it would
+      // double-apply. That reasoning does not hold for this one: the panel's
+      // reconnect gate runs BEFORE its executor, and says so in a structured field
+      // (`applied:false, stage:"pre-executor"`) rather than in prose. Nothing ran,
+      // so there is nothing to double-apply — which is the entire point of the
+      // channel, and why it is keyed on the FIELD and never on the message text.
+      //
+      // The refusal is the panel's own claim about its own execution, validated on
+      // arrival; an older panel sends no field, `preExecutorRefusal` is null, and
+      // this branch simply never fires.
+      const preExecutorRefusal = isPreExecutorRefusal(err);
+      if (
+        preExecutorRefusal ||
+        (isRetrySafeCmd(cmd) && (isTransientReconnectError(err) || isWorkflowSwitchGuardRefusal(err)))
+      ) {
         // panel#1097 — declared out here so the refusal branch below can see it,
         // and REASSIGNED after ensureReachable so it names the tab the command is
         // actually dispatched on. Reading it before the rebind attributed a refusal
@@ -6420,7 +6844,13 @@ export function makePanelToolCtx(
                 `panel_set_workflow_target({mode:"current"}). (${err2 instanceof Error ? err2.message : String(err2)})`,
             );
           }
-          return fail(err2);
+          // #1468 — the RETRY's own failure can be a reply timeout too: this branch
+          // is only entered when the FIRST error was a reconnect flap or a switch
+          // refusal, so a tagged no-reply lands here rather than on the outer path.
+          // Leaving it unmarked fails closed (nothing is settled, no false success)
+          // but silently switches the settle off for a real sequence, which is the
+          // kind of gap that reads as "the fix does not work" much later.
+          return carryReplyTimeoutMark(err2, fail(err2));
         }
       }
       // #442 defect 4: a MUTATING command (deliberately excluded from RETRY_SAFE_CMDS)
@@ -6671,11 +7101,14 @@ export function makePanelToolCtx(
         (dispatchOutcomeOf(err) === true || isReplyTimeoutTagged(err))
       ) {
         const cause = err instanceof Error ? err.message : String(err);
-        return fail(
-          `${cause}\n\nTo retry this exact mutation, re-issue identical args plus retry_of:"${dispatchedRid}"; otherwise call normally.`,
+        return carryReplyTimeoutMark(
+          err,
+          fail(
+            `${cause}\n\nTo retry this exact mutation, re-issue identical args plus retry_of:"${dispatchedRid}"; otherwise call normally.`,
+          ),
         );
       }
-      return fail(err);
+      return carryReplyTimeoutMark(err, fail(err));
     }
   };
   // Human-in-the-loop confirmation for a DESTRUCTIVE op: render a yes/no card in
@@ -10186,7 +10619,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           ),
       },
       async (args: A, ctx) => {
-        const res = await ctx.call({ cmd: "civitai_results", limit: args.limit }, 10000);
+        const res = await ctx.call(
+          { cmd: "civitai_results", limit: args.limit },
+          CIVITAI_COUPLED_READ_TIMEOUT_MS,
+        );
         // Enrich with inline sample pixels (#623). Best-effort + additive: on any
         // problem we return the untouched text results, so the read path can never
         // regress to an error just because a thumbnail fetch failed.
@@ -10233,7 +10669,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .optional()
           .describe("Which result kind these ids refer to (media = images/videos, model = checkpoints/loras/workflows). Match the active tab if omitted."),
       },
-      async (args: A, ctx) => ctx.call({ cmd: "civitai_highlight", ids: args.ids, kind: args.kind }, 10000),
+      async (args: A, ctx) =>
+        ctx.call(
+          { cmd: "civitai_highlight", ids: args.ids, kind: args.kind },
+          CIVITAI_COUPLED_READ_TIMEOUT_MS,
+        ),
     ),
     def(
       "panel_civitai_clear_highlight",
@@ -10287,9 +10727,29 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // other direct-bridge call site) — without this an orphaned session
           // wrongly returns "no connected tab" even when a live tab exists (#381).
           ctx.ensureReachable?.();
+          // #1468 — was a hardcoded 10_000, HALF this codebase's own default, and
+          // the tight bound is the entire bug: `civitai_search` kept timing out
+          // while the search demonstrably applied (renderRev advanced,
+          // civitai_results reported loading:true), so an applied mutation was
+          // reported to the caller as a failure.
+          //
+          // The tight bound was there to fence a wait on CivitAI's HTTP. That wait
+          // is GONE: panel #282 made `driveSearch` resolve on DISPATCH — it fires
+          // `void reload(...)` and returns `{dispatched:true, renderRev}` with no
+          // await anywhere in the handler. That shipped at panel 0.11.0; #1468 was
+          // filed from 0.11.44, so the reporter already had it. Measured, not
+          // assumed — my own first reading of this issue asserted the coupling was
+          // still there and argued AGAINST raising the bound on that basis.
+          //
+          // With nothing external left to wait on, what remains between the panel's
+          // return and the caller's error is only whether the reply gets back in
+          // time — the #357/#694 shape, a busy-but-alive main thread missing a
+          // tighter-than-default bound and succeeding moments later. So this takes
+          // the shared default like every other panel command, rather than keeping
+          // a fence around a wait that no longer exists.
           const reply = await ctx.bridge.send(
             { cmd: "civitai_search", query, filters: args.filters, browsingLevels } as { cmd: string },
-            { tabId: ctx.tabId, timeoutMs: 10000 },
+            { tabId: ctx.tabId, timeoutMs: BRIDGE_DEFAULT_TIMEOUT_MS },
           );
           // Do NOT let a supplied-but-unapplied creator filter masquerade as a
           // legitimate empty result: if the panel echoes back a different (or null)
@@ -11248,7 +11708,17 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
       "panel_exit_subgraph",
       "Leave the current subgraph and return to the root graph (undo a panel_enter_subgraph). After this, panel_* tools target the root graph again.",
       {},
-      async (_args, ctx) => ctx.call({ cmd: "graph_exit_subgraph" }, 15000),
+      async (_args, ctx) => {
+        const res = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+        // #1468 — ONLY a no-reply is settled by a read. A genuine executor error
+        // (the panel's own "could not confirm … no observation ever saw the canvas
+        // there") is an ACKED reply the bridge received and relayed; it already
+        // reasoned about this exact uncertainty and prescribes its own next step,
+        // so re-deciding it from out here would overwrite a better-informed verdict
+        // with a worse-informed one.
+        if (!isReplyTimeoutResult(res)) return res;
+        return settleExitSubgraphAfterAckTimeout(ctx, res);
+      },
     ),
     def(
       "panel_move_rail",
@@ -11328,12 +11798,19 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
     ),
     def(
       "panel_install_node",
-      "Install a custom-node pack into the user's ComfyUI via the BUILT-IN Manager (queues the install). Pass `id` (registry id like 'comfyui-kjnodes' or 'author/repo') from panel_search_nodes, or `repository` (git URL) for a nightly install. A search result whose `id` IS a git URL (legacy/repository-style entries) is auto-routed to a from-source 'nightly' install — 'latest' cannot resolve for those. A ComfyUI restart (panel_restart_comfyui) is usually required afterward to load the nodes — poll panel_node_queue_status first. Prefer this over the headless install_custom_node tool. " +
-        "⚠️ QUEUE-DONE IS NOT INSTALLED: Manager marks a task 'done' (queue drained) even when the git clone produced NOTHING — an empty dir, a transient git failure, or a repo not in its registry. So after the queue is idle you MUST VERIFY with panel_list_nodes that each pack actually appears before you restart or report success; a pack you installed that is absent from that list did NOT install (retry it, or install it from its git `repository` URL). " +
+      "Install a custom-node pack into the user's ComfyUI via the BUILT-IN Manager (queues the install). Pass `id` (registry id like 'comfyui-kjnodes' or 'author/repo') from panel_search_nodes, or `repository` (git URL) to request a nightly/from-source install — see the v4 limit below before relying on it. A search result whose `id` IS a git URL (legacy/repository-style entries) is auto-routed to a from-source 'nightly' install — 'latest' cannot resolve for those. " +
+        "⚠️ ON MANAGER v4, `repository` DOES NOT INSTALL A REPO THE MANAGER'S REGISTRY DOES NOT LIST (#1539) — being listed is necessary; whether it is sufficient was not measured. Measured against Manager V4.2.2: a request carrying `repository` AND `selected_version:'nightly'` — the exact combination Manager's own schema documents as 'repository required if selected_version is nightly' — is still resolved by `id` against its registry, and an unlisted repo fails with \"Node '<name>@nightly' not found in [ManagerChannel.dev, ManagerDatabaseSource.cache]\". The URL is sent and recorded; for an unlisted repo v4 never reaches a clone (only that case was probed). This is an UPSTREAM limitation, not a missing field on our side. On Manager 3.x we send a DIFFERENT request shape that carries the URL directly (that much is our own code); whether 3.x then installs an unlisted repo was NOT measured here, so treat 'it worked before on 3.x' as unverified rather than as a regression on our side. For an unlisted repo on v4, clone it into custom_nodes yourself and restart. " +
+        "A ComfyUI restart (panel_restart_comfyui) is usually required afterward to load the nodes — poll panel_node_queue_status first. Prefer this over the headless install_custom_node tool. " +
+        "⚠️ QUEUE-DONE IS NOT INSTALLED: Manager marks a task 'done' (queue drained) even when the git clone produced NOTHING — an empty dir, a transient git failure, or a repo not in its registry. So after the queue is idle you MUST VERIFY with panel_list_nodes that each pack actually appears before you restart or report success; a pack you installed that is absent from that list did NOT install (retry it, or install it from its git `repository` URL — but see the v4 note above: on Manager v4 that retry fails for a repo its registry does not list, so clone it yourself instead of retrying). " +
         "Install packs ONE AT A TIME and confirm each populated before the next — batching several installs then restarting is exactly how you end up with empty dirs and a broken restart.",
       {
         id: z.string().optional().describe("Registry id or 'author/repo'."),
-        repository: z.string().optional().describe("Git URL (for a nightly/from-source install)."),
+        repository: z
+          .string()
+          .optional()
+          .describe(
+            "Git URL, to REQUEST a nightly/from-source install. On Manager v4 an install only proceeds for a repo the Manager's registry already lists — an unlisted URL is rejected by id lookup despite this field (#1539, measured on V4.2.2).",
+          ),
         version: z.string().optional().describe("Specific version; default 'latest' (or 'nightly' with repository)."),
         channel: z.string().optional().describe("Manager channel (default 'default')."),
         mode: z.enum(["remote", "local", "cache"]).optional().describe("DB source (default 'remote')."),
@@ -11351,17 +11828,31 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // repository install that works, and disclose the rewrite.
         const { conflict, note, ...cmdArgs } = nodesInstallCommandArgs(args);
         if (conflict) return fail(conflict);
+        // #1129 — the panel identity is captured BEFORE dispatch, because a
+        // takeover during the install is exactly what the follow-up read must not
+        // be attributed to.
+        const dispatch = {
+          tab: ctx.tabId,
+          incarnation: panelIncarnation(ctx, ctx.tabId),
+        };
         const res = await ctx.call(
           { cmd: "nodes_install", ...cmdArgs },
           30000,
         );
+        // #1129 — settle BEFORE the note is appended. The note is glued on after
+        // the JSON body, which makes the payload unparseable as JSON, so a probe
+        // running afterwards reads `null`, concludes the panel never claimed a
+        // queue, and silently does nothing. Found by printing the real reply
+        // rather than by reasoning about it: the first version of this shipped
+        // the check and the check never ran.
+        const settled = await settleDroppedEnqueue(ctx, res, dispatch);
         if (note) {
-          const text = res.content.find((c) => c.type === "text");
+          const text = settled.content.find((c) => c.type === "text");
           if (text && text.type === "text") {
             text.text += `\n\nNOTE: ${note}`;
           }
         }
-        return res;
+        return settled;
       },
     ),
     def(

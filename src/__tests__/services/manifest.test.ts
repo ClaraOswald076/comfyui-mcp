@@ -792,6 +792,338 @@ describe("applyManifest", () => {
     );
   });
 
+  // #1508 — the interpreter declares itself EXTERNALLY MANAGED (PEP 668), so its
+  // own pip refuses by design. Stability Matrix's uv-managed CPython does exactly
+  // this. The refusal text below is the reporter's, verbatim.
+  //
+  // TWO routes reach it, which is why there are three tests rather than one:
+  // uv-absent goes straight to bare pip (the reporter's route, because Stability
+  // Matrix keeps uv inside its own directory rather than on PATH), and the #377
+  // non-venv fallback lands on bare pip too — so a managed interpreter can hit
+  // the same wall one step later, with uv's unrelated complaint on top of it.
+  const PEP668 =
+    "error: externally-managed-environment\n" +
+    "This Python installation is managed by uv and should not be modified.";
+
+  it("refuses with an actionable message when pip is EXTERNALLY MANAGED, uv absent (#1508)", async () => {
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      const probesUv = IS_WIN
+        ? cmd === "where" && args[0] === "uv"
+        : cmd === "uv" && args[0] === "--version";
+      if (probesUv) throw new Error("no uv");
+      if (args[0] === "-m" && args[1] === "pip") {
+        throw Object.assign(new Error("pip failed"), { stderr: PEP668 });
+      }
+      return "ok";
+    });
+
+    const result = await applyManifest({ manifest: { pip: ["imageio-ffmpeg"] } });
+
+    expect(result.success).toBe(false);
+    expect(result.results).toMatchObject([{ action: "pip", status: "failed" }]);
+    const msg = result.results[0].message ?? "";
+    // Names the CAUSE as a deliberate guard, not a broken interpreter...
+    expect(msg).toMatch(/EXTERNALLY MANAGED/);
+    expect(msg).toMatch(/PEP 668/);
+    expect(msg).toMatch(/deliberate guard, not a broken interpreter/);
+    // ...and routes out that ACTUALLY WORK. An earlier draft of this message
+    // recommended `uv pip install --python <interp>`; measured against a real
+    // uv-managed CPython, uv refuses that too ("the interpreter ... is externally
+    // managed", hint: `uv venv`). A remedy that cannot work is worse than none —
+    // it reads as the answer and costs the reader the time to disprove it. So the
+    // message now says uv is NOT a way around this, and points at a venv.
+    expect(msg).toMatch(/uv does NOT get around this/);
+    expect(msg).toMatch(/uv venv/);
+    expect(msg).toMatch(/COMFYUI_PYTHON/);
+    // The wrong remedy must not creep back as a bare suggestion.
+    expect(msg).not.toMatch(/^\s*-\s*.*uv pip install --python/m);
+    // The refusal must SAY it declined to force it, and why — otherwise the
+    // obvious next move is the one that quietly breaks their install later.
+    expect(msg).toMatch(/break-system-packages/);
+    expect(msg).toMatch(/may later reset/);
+    // It must NOT have actually forced it.
+    expect(execFileSyncMock).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.arrayContaining(["--break-system-packages"]),
+      expect.anything(),
+    );
+  });
+
+  it("uses the actionable refusal when UV ITSELF reports PEP 668 (#1508)", async () => {
+    // The third route, and the one a mutation caught me not covering: uv is
+    // present and `uv pip install --python <interp>` is itself refused, because
+    // uv will not modify a managed environment either. Without the check that
+    // runs BEFORE the #377 non-venv branch, this falls through to a bare rethrow
+    // and the caller gets uv's raw output with no route out of it.
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === "uv" && args[0] === "pip") {
+        throw Object.assign(new Error("uv failed"), { stderr: PEP668 });
+      }
+      return "ok";
+    });
+
+    const result = await applyManifest({ manifest: { pip: ["imageio-ffmpeg"] } });
+
+    expect(result.success).toBe(false);
+    const msg = result.results[0].message ?? "";
+    expect(msg).toMatch(/EXTERNALLY MANAGED/);
+    expect(msg).toMatch(/uv does NOT get around this/);
+    // It must NOT have quietly retried through bare pip after uv refused — that
+    // walks into the same wall and buries the reason under a second failure.
+    expect(execFileSyncMock).not.toHaveBeenCalledWith(
+      expect.stringMatching(/python/),
+      ["-m", "pip", "install", "imageio-ffmpeg"],
+      expect.anything(),
+    );
+  });
+
+  it("does not blame uv's non-venv error when the FALLBACK hits PEP 668 (#1508)", async () => {
+    // uv is present, rejects the non-venv interpreter (#377), and the bare-pip
+    // fallback is then refused as externally managed. Reporting uv's complaint
+    // here would send the reader to create a venv when the real obstacle is the
+    // managed environment.
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === "uv" && args[0] === "pip") {
+        throw Object.assign(new Error("uv failed"), {
+          stderr: "error: No virtual environment found for executable name python",
+        });
+      }
+      if (args[0] === "-m" && args[1] === "pip") {
+        throw Object.assign(new Error("pip failed"), { stderr: PEP668 });
+      }
+      return "ok";
+    });
+
+    const result = await applyManifest({ manifest: { pip: ["imageio-ffmpeg"] } });
+
+    expect(result.success).toBe(false);
+    const msg = result.results[0].message ?? "";
+    expect(msg).toMatch(/EXTERNALLY MANAGED/);
+    expect(msg).not.toMatch(/No virtual environment found/);
+  });
+
+  it("keys on the PEP 668 error id, not uv's distributor wording (#1508)", async () => {
+    // The second line comes from the distributor's EXTERNALLY-MANAGED file, so it
+    // reads differently on Debian and Homebrew. Matching only uv's sentence would
+    // have fixed this one reporter and nobody else.
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      const probesUv = IS_WIN
+        ? cmd === "where" && args[0] === "uv"
+        : cmd === "uv" && args[0] === "--version";
+      if (probesUv) throw new Error("no uv");
+      if (args[0] === "-m" && args[1] === "pip") {
+        throw Object.assign(new Error("pip failed"), {
+          stderr:
+            "error: externally-managed-environment\n" +
+            "× This environment is externally managed\n" +
+            "╰─> To install Python packages system-wide, try apt install python3-xyz.",
+        });
+      }
+      return "ok";
+    });
+
+    const result = await applyManifest({ manifest: { pip: ["imageio-ffmpeg"] } });
+
+    expect(result.success).toBe(false);
+    expect(result.results[0].message ?? "").toMatch(/EXTERNALLY MANAGED/);
+  });
+
+  it("does NOT claim PEP 668 for prose that merely says 'externally managed' (codex P2)", async () => {
+    // The detector originally matched the bare phrase anywhere in the output. Build
+    // and dependency errors do say it in passing, and rewriting one of those as the
+    // managed-environment story discards the real cause AND hands over a remedy
+    // that does not apply — a strictly worse failure than the raw error.
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      const probesUv = IS_WIN
+        ? cmd === "where" && args[0] === "uv"
+        : cmd === "uv" && args[0] === "--version";
+      if (probesUv) throw new Error("no uv");
+      if (args[0] === "-m" && args[1] === "pip") {
+        throw Object.assign(new Error("build failed"), {
+          stderr:
+            "note: This package vendors a library whose headers are externally managed by the " +
+            "distribution; see BUILD.md.\nerror: command 'cl.exe' failed with exit code 2",
+        });
+      }
+      return "ok";
+    });
+
+    const result = await applyManifest({ manifest: { pip: ["somepkg"] } });
+
+    expect(result.success).toBe(false);
+    const msg = result.results[0].message ?? "";
+    expect(msg).not.toMatch(/EXTERNALLY MANAGED \(PEP 668\)/);
+    expect(msg).not.toMatch(/uv venv/);
+    // The real cause survives.
+    expect(msg).toMatch(/cl\.exe|build failed/);
+  });
+
+  it("carries the installer's OWN output into the refusal (codex P2)", async () => {
+    // The refusal REPLACES the underlying error and apply_manifest reports only
+    // `err.message` per item, so anything the tool said that this message does not
+    // anticipate would be lost silently. An earlier draft even told the reader the
+    // output was "above" when nothing had been printed.
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      const probesUv = IS_WIN
+        ? cmd === "where" && args[0] === "uv"
+        : cmd === "uv" && args[0] === "--version";
+      if (probesUv) throw new Error("no uv");
+      if (args[0] === "-m" && args[1] === "pip") {
+        throw Object.assign(new Error("pip failed"), {
+          stderr: `${PEP668}\nhint: See PEP 668 for the detailed specification.`,
+        });
+      }
+      return "ok";
+    });
+
+    const result = await applyManifest({ manifest: { pip: ["imageio-ffmpeg"] } });
+    const msg = result.results[0].message ?? "";
+
+    expect(msg).toMatch(/This Python installation is managed by uv/);
+    expect(msg).toMatch(/hint: See PEP 668/);
+    // ...and the actionable part is still there, not drowned by it.
+    expect(msg).toMatch(/EXTERNALLY MANAGED/);
+  });
+
+  it("does not fire on the PEP 668 token appearing MID-LINE (codex P2)", async () => {
+    // The token is anchored to the start of a line because that is where pip
+    // prints it. Unanchored, any output merely CONTAINING it — a path, a package
+    // name, a vendored log — would be rewritten as this failure and lose its own
+    // cause. That is the same defect as the prose case, one token narrower.
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      const probesUv = IS_WIN
+        ? cmd === "where" && args[0] === "uv"
+        : cmd === "uv" && args[0] === "--version";
+      if (probesUv) throw new Error("no uv");
+      if (args[0] === "-m" && args[1] === "pip") {
+        throw Object.assign(new Error("build failed"), {
+          stderr:
+            "  Downloading from /var/cache/externally-managed-environment/wheels/x.whl\n" +
+            "error: metadata generation failed",
+        });
+      }
+      return "ok";
+    });
+
+    const result = await applyManifest({ manifest: { pip: ["somepkg"] } });
+
+    const msg = result.results[0].message ?? "";
+    expect(msg).not.toMatch(/EXTERNALLY MANAGED \(PEP 668\)/);
+    expect(msg).toMatch(/metadata generation failed|build failed/);
+  });
+
+  it("never echoes the command line — a direct-URL spec can carry credentials", async () => {
+    // Node builds execFileSync's Error.message as `Command failed: <whole argv>`,
+    // so it embeds the package spec. A pip spec may legitimately be a direct URL,
+    // and a direct URL may carry credentials — that entry passes
+    // validatePipPackageSpec, which only rejects options, control chars and
+    // whitespace. Carrying the message into a user-facing refusal would copy the
+    // token into it. Detection may still read the message; only what is SHOWN is
+    // narrowed.
+    const SPEC = "https://ci:s3cr3t-token@example.invalid/pkg-1.0-py3-none-any.whl";
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      const probesUv = IS_WIN
+        ? cmd === "where" && args[0] === "uv"
+        : cmd === "uv" && args[0] === "--version";
+      if (probesUv) throw new Error("no uv");
+      if (args[0] === "-m" && args[1] === "pip") {
+        throw Object.assign(new Error(`Command failed: python -m pip install ${SPEC}`), {
+          stderr: PEP668,
+        });
+      }
+      return "ok";
+    });
+
+    const result = await applyManifest({ manifest: { pip: [SPEC] } });
+    const msg = result.results[0].message ?? "";
+
+    expect(msg).toMatch(/EXTERNALLY MANAGED/);
+    expect(msg).not.toMatch(/s3cr3t-token/);
+    expect(msg).not.toMatch(/Command failed:/);
+    // THE WHOLE RESULT, not just the message. `item` echoes the manifest entry
+    // verbatim, so asserting only on `message` claimed more than it checked —
+    // the structured result is what travels into transcripts and logs.
+    expect(JSON.stringify(result)).not.toMatch(/s3cr3t-token/);
+    // ...and the entry is still identifiable by host and path.
+    expect(result.results[0].item).toMatch(/example\.invalid\/pkg-1\.0/);
+  });
+
+  it("redacts the spec on an ORDINARY failure too, not just the PEP 668 one", async () => {
+    // The non-PEP-668 path rethrows raw by design — right for diagnosis — and the
+    // caller reports err.message, which Node builds as `Command failed: <argv>`.
+    // So every pip failure that is NOT this issue's case was still echoing the
+    // spec. Closed at report(), the one place every item passes through, rather
+    // than at each call site.
+    const SPEC = "https://ci:s3cr3t-token@example.invalid/pkg-1.0.whl";
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      const probesUv = IS_WIN
+        ? cmd === "where" && args[0] === "uv"
+        : cmd === "uv" && args[0] === "--version";
+      if (probesUv) throw new Error("no uv");
+      if (args[0] === "-m" && args[1] === "pip") {
+        throw new Error(`Command failed: python -m pip install ${SPEC}\nERROR: no matching dist`);
+      }
+      return "ok";
+    });
+
+    const result = await applyManifest({ manifest: { pip: [SPEC] } });
+
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result)).not.toMatch(/s3cr3t-token/);
+    // The real cause still survives — redaction must not cost the diagnosis.
+    expect(result.results[0].message ?? "").toMatch(/no matching dist/);
+  });
+
+  it("redacts a password containing '@' and one sitting past the output clip", async () => {
+    // Two ways a redaction can look right and not be (codex P1):
+    //   - the pattern stopping at the FIRST '@' when the password contains one;
+    //   - clipping the carried output BEFORE redacting, severing the '@' the
+    //     pattern anchors on so a secret near the cut survives.
+    const SPEC = "https://ci:alpha@beta-s3cr3t@example.invalid/pkg-1.0.whl";
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      const probesUv = IS_WIN
+        ? cmd === "where" && args[0] === "uv"
+        : cmd === "uv" && args[0] === "--version";
+      if (probesUv) throw new Error("no uv");
+      if (args[0] === "-m" && args[1] === "pip") {
+        throw Object.assign(new Error("pip failed"), {
+          // Filler pushes the credential past the 1200-char clip boundary.
+          stderr: `${PEP668}\n${"x".repeat(1250)}\nLooking in: ${SPEC}`,
+        });
+      }
+      return "ok";
+    });
+
+    const result = await applyManifest({ manifest: { pip: [SPEC] } });
+
+    expect(JSON.stringify(result)).not.toMatch(/s3cr3t/);
+    expect(JSON.stringify(result)).not.toMatch(/alpha@beta/);
+  });
+
+  it("still surfaces an ORDINARY pip failure as itself (#1508)", async () => {
+    // The guard must not swallow every pip error into a managed-environment
+    // story — a missing package is a different problem with a different answer.
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      const probesUv = IS_WIN
+        ? cmd === "where" && args[0] === "uv"
+        : cmd === "uv" && args[0] === "--version";
+      if (probesUv) throw new Error("no uv");
+      if (args[0] === "-m" && args[1] === "pip") {
+        throw Object.assign(new Error("pip failed"), {
+          stderr: "ERROR: Could not find a version that satisfies the requirement nope",
+        });
+      }
+      return "ok";
+    });
+
+    const result = await applyManifest({ manifest: { pip: ["nope"] } });
+
+    expect(result.success).toBe(false);
+    const msg = result.results[0].message ?? "";
+    expect(msg).not.toMatch(/EXTERNALLY MANAGED/);
+    expect(msg).toMatch(/Could not find a version|pip failed/);
+  });
+
   it("reports pip as failed — never applied — when the server interpreter cannot be verified (#651)", async () => {
     installInterpreterMock.mockResolvedValue({
       source: "undetermined",
