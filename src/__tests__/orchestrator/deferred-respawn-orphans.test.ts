@@ -349,6 +349,51 @@ describe("a DEFERRED respawn reaches the note (#1567)", () => {
     ).toHaveLength(0);
   });
 
+  it("two saves on one busy tab share the coalesced restart and report ONCE", async () => {
+    // Review raised this as a possible leak: the second save's watch "adopts" the restart
+    // the first save queued. That is not a defect, and this pins why rather than leaving it
+    // to be rediscovered.
+    //
+    // `restartAllForMcpEnv` COALESCES — a tab with a pending restart does not get a second
+    // one. So the queued restart is the vehicle for both saves: it rebuilds the child with
+    // an env carrying both changes, and it is the moment both are waiting for. The note
+    // describes the transfers that actually die at that moment, which is the same set for
+    // either save. One restart, one note, and no watch left over.
+    atRisk.jobs = [{ id: "j1", filename: "flux-dev.safetensors", bytes: 4_000_000_000 }];
+    const backend = new RecordingBackend();
+    backend.autoComplete = false;
+    const manager = makeManager(backend);
+    const tab = "tab-two-saves";
+
+    manager.send(tab, "hello");
+    await waitFor(() => backend.runCount >= 1 && backend.turnTexts.length >= 1);
+
+    expect(manager.restartAllForMcpEnvAfterCredentialChange(tab).scheduled).toBe(1);
+    expect(
+      manager.restartAllForMcpEnvAfterCredentialChange(tab).scheduled,
+      "coalesced, not a second restart",
+    ).toBe(1);
+
+    backend.autoComplete = true;
+    backend.release();
+    await waitFor(() => backend.runCount >= 2);
+    await waitFor(() => backend.turnTexts.some((t) => t.includes("flux-dev.safetensors")));
+    await new Promise((r) => setTimeout(r, 120));
+
+    expect(backend.turnTexts.filter((t) => t.includes("flux-dev.safetensors"))).toHaveLength(1);
+    expect(backend.runCount, "exactly one respawn happened").toBe(2);
+
+    // And nothing is left armed: a later unrelated respawn stays quiet.
+    backend.autoComplete = false;
+    manager.send(tab, "again");
+    await waitFor(() => backend.turnTexts.includes("again"));
+    manager.restartAllForMcpEnv();
+    backend.autoComplete = true;
+    backend.release();
+    await new Promise((r) => setTimeout(r, 150));
+    expect(backend.turnTexts.filter((t) => t.includes("flux-dev.safetensors"))).toHaveLength(1);
+  });
+
   it("stays silent when the respawn orphans nothing", async () => {
     // The direction that fails quietly: a note pushed unconditionally would still pass the
     // test above, while costing a real agent turn on every env respawn. A nudge is a turn,
