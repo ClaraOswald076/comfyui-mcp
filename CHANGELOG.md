@@ -745,6 +745,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.50] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- let the loader fail first, then append the remedy
+- refuse a stale path with the remedy — never substitute the manifest
+- resolve a pack manifest by NAME, and recognise a path that expired
+
+#### Changed
+- click the logo to go home, not to GitHub (#1581)
+- play the panel demo on the landing page instead of a placeholder (#1580)
+- Korean pilot — five entry pages, and the hreflang gate (#1577)
+
+
 ## [0.51.49] - 2026-08-14
 
 ### MCP
