@@ -564,6 +564,49 @@ export function atRiskNote(
   );
 }
 
+/**
+ * #1567 — what a DEFERRED respawn is orphaning, said at the moment it fires.
+ *
+ * `atRiskNote` above is for the save. It is built from a snapshot taken before the emit,
+ * which is correct for an `applied` respawn — the emit IS the damage — and structurally
+ * incapable of covering a `scheduled` one, where the damage happens arbitrarily later. A
+ * reporter saved a token with nothing in flight (so the save-time check correctly warned
+ * about nothing), started nine downloads over the next two turns, and lost all ~48GB when
+ * the queued respawn landed, with no warning at any point.
+ *
+ * ## Why this does NOT reuse `atRiskNote`'s consequence
+ *
+ * That sentence says the transfers will not resume and re-issuing restarts from 0%,
+ * because the new credential changes each download's cache identity. True when the
+ * credential changes MID-TRANSFER. It is wrong for the case this note exists for, and the
+ * reporter proved it: their downloads began AFTER the save, so identity never moved and
+ * re-issuing resumed from the `.partial` files at 4%/1%/2%. ~11GB was recoverable — but
+ * only because they checked the partials rather than believing the prediction.
+ *
+ * So this states what is observable here (these are being killed now, the partials are on
+ * disk) and is explicit that resumability depends on something this code cannot see: which
+ * side of the credential change each transfer started on. Claiming either outcome would be
+ * asserting the thing that actually varies.
+ */
+export function orphanedByDeferredRespawnNote(
+  orphaned: AtRiskDownloads | readonly { filename: string; bytes: number }[],
+): string | null {
+  if (!orphaned.length) return null;
+  return (
+    `🛑 The queued tool-session rebuild is happening NOW, and ${atRiskDownloadSummary(orphaned)} ` +
+    `were still transferring. They belong to the session being replaced, so they are being ` +
+    `killed — this is the rebuild that was queued when a comfyui credential was saved earlier ` +
+    `(#1567).\n\n` +
+    `The partial files are still on disk, so re-issuing each download is worth doing: it can ` +
+    `RESUME from them rather than starting over. A transfer that was already running when the ` +
+    `credential changed has a different cache identity and definitely restarts from 0%; one ` +
+    `started after that save keeps its identity and usually resumes — but resumption also needs ` +
+    `the server to still offer the same validator and honour a range request, so it is not ` +
+    `guaranteed either way. Read the progress each re-issue reports instead of assuming.\n\n` +
+    `Re-issue them now if they are still wanted; nothing else will pick them up.`
+  );
+}
+
 /** A pre-write snapshot the write could not delete: a readable copy of the store
  *  holding the PREVIOUS credential for this key. Harmless clutter after a
  *  rotation on a single-user machine, but the user should know it is there. */

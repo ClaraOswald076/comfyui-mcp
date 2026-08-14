@@ -44,6 +44,7 @@ import { fileURLToPath } from "node:url";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { assertPanelNotTargetedUnverifiable } from "../services/panel-pin-guard.js";
 import { nodesInstallCommandArgs } from "../services/node-management.js";
+import { isPreExecutorRefusal } from "../services/panel-refusal.js";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { parse as parseYaml } from "yaml";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
@@ -433,9 +434,36 @@ export function describeComfyuiSecretSave(receipt: SecretSaveReceipt): string {
     // This is the property that makes the answer safe to act on immediately: the
     // tools resolve this key from the file at USE time, so the already-running
     // tool process sees it whether or not any respawn happens.
-    parts.push(
-      `The comfyui tools re-read that file each time they use this credential, so the tool process already running picks it up — no reload, and no respawn required.`,
-    );
+    //
+    // #1567 — but "no respawn required" was printed UNCONDITIONALLY, including on
+    // the same message that reported one already queued. Both statements were
+    // true about different things: the key needs no respawn, and a respawn is
+    // pending anyway. Read together they say "nothing is about to happen", and a
+    // reporter acted on that by starting ~48GB of downloads that the pending
+    // respawn then killed.
+    //
+    // The sentence is kept where it is correct — nothing scheduled, nothing
+    // applied — because that is the case it was written for and deleting it
+    // would lose a genuinely useful "you can retry right now".
+    const pending = receipt.respawn?.scheduled ?? 0;
+    const already = receipt.respawn?.applied ?? 0;
+    const readsItAtUseTime = `The comfyui tools re-read that file each time they use this credential, so the tool process already running picks it up — no reload needed`;
+    if (pending > 0) {
+      parts.push(
+        `${readsItAtUseTime}. But a tool-session respawn is STILL PENDING from this save ` +
+          `(${pending} queued for the end of this turn), and it replaces the tool session when it fires. ` +
+          `Anything long-running that session owns is lost at that point — model downloads in ` +
+          `particular. This message cannot list them, because a transfer started AFTER this save ` +
+          `did not exist when the check ran (#1567). If you are about to start a long download, ` +
+          `let the respawn land first.`,
+      );
+    } else if (already > 0) {
+      // A respawn HAPPENED. Saying none was required describes a different save,
+      // and #1378's at-risk warning above is reporting what that one cost.
+      parts.push(`${readsItAtUseTime} — and the tool session was rebuilt just now regardless.`);
+    } else {
+      parts.push(`${readsItAtUseTime}, and no respawn required.`);
+    }
   } else {
     parts.push(
       `This key is read from the tool process's environment at startup, so only a respawned tool session will see it.`,
@@ -4186,6 +4214,39 @@ async function unreadableOrHealed(
 function panelTooOldNote(ctx: PanelToolCtx): string {
   try {
     const v = ctx.bridge?.panelTooOldForReplyUuid?.(ctx.tabId);
+    // #1560 — A PANEL TOO OLD TO HELP IS ALSO TOO OLD TO SAY SO.
+    //
+    // The note below needs an advertised version, and `panel_version` has only
+    // ridden the hello since panel v0.11.83. So the panels most likely to be
+    // causing this deadlock — anything below 0.11.45 — cannot report it, and the
+    // reporter of #1560 (on 0.11.37, after two Manager self-updates of the pack
+    // crashed) got a bare "the panel did not answer" with nothing to act on.
+    //
+    // Deliberately WEAKER than the version case, and weaker still after review: an
+    // absent version proves only "below 0.11.83", NOT "below the minimum". Panels
+    // in 0.11.45–0.11.82 publish the reply uuid and simply predate version
+    // advertisement, so this must read as SOMETHING TO CHECK and never as a finding
+    // — naming a cause that is not theirs is the failure this whole cluster exists
+    // to avoid.
+    if (v?.neverAdvertised) {
+      return (
+        `
+
+WORTH CHECKING — THE PANEL'S VERSION IS UNKNOWN HERE: this session's panel has never ` +
+        `reported its version, and panels have advertised one on connect since 0.11.83, so ` +
+        `this one is older than that. That does NOT by itself mean it is too old: a panel ` +
+        `reports the new workflow's identity ON THE REPLY from ${v.needed} onwards, and ` +
+        `0.11.45–0.11.82 do that while still not advertising a version. But if it IS below ` +
+        `${v.needed}, that is the whole cause of this failure rather than anything about this ` +
+        `workflow — on ${v.needed}+ the command that re-pointed the canvas repairs the fence ` +
+        `from its own reply and never makes the read that just failed. ` +
+        `Find out with install_comfyui (action:"panel", panel_action:"status"). If it is ` +
+        `older, update with install_comfyui (action:"panel", panel_action:"sync"), restart ` +
+        `ComfyUI, and HARD-REFRESH the browser tab (Ctrl+Shift+R) — a pack update that ` +
+        `ComfyUI-Manager reported as FAILED leaves the old panel JS running in the open tab, ` +
+        `so a restart alone does not pick it up.`
+      );
+    }
     if (!v?.tooOld) return "";
     return (
       `
@@ -6710,7 +6771,24 @@ export function makePanelToolCtx(
       // for a retry in a moment; the section lasts a fraction of a second, which
       // is what retrySettleMs already waits. Still gated on RETRY-SAFE commands,
       // so a mutation is never re-issued on our own initiative.
-      if (isRetrySafeCmd(cmd) && (isTransientReconnectError(err) || isWorkflowSwitchGuardRefusal(err))) {
+      // #1529 — a PRE-EXECUTOR refusal is retryable even for a MUTATION.
+      //
+      // Every other branch here is gated on RETRY_SAFE_CMDS precisely because a
+      // mutation might have landed before the failure, and re-issuing it would
+      // double-apply. That reasoning does not hold for this one: the panel's
+      // reconnect gate runs BEFORE its executor, and says so in a structured field
+      // (`applied:false, stage:"pre-executor"`) rather than in prose. Nothing ran,
+      // so there is nothing to double-apply — which is the entire point of the
+      // channel, and why it is keyed on the FIELD and never on the message text.
+      //
+      // The refusal is the panel's own claim about its own execution, validated on
+      // arrival; an older panel sends no field, `preExecutorRefusal` is null, and
+      // this branch simply never fires.
+      const preExecutorRefusal = isPreExecutorRefusal(err);
+      if (
+        preExecutorRefusal ||
+        (isRetrySafeCmd(cmd) && (isTransientReconnectError(err) || isWorkflowSwitchGuardRefusal(err)))
+      ) {
         // panel#1097 — declared out here so the refusal branch below can see it,
         // and REASSIGNED after ensureReachable so it names the tab the command is
         // actually dispatched on. Reading it before the rebind attributed a refusal
@@ -11720,12 +11798,19 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
     ),
     def(
       "panel_install_node",
-      "Install a custom-node pack into the user's ComfyUI via the BUILT-IN Manager (queues the install). Pass `id` (registry id like 'comfyui-kjnodes' or 'author/repo') from panel_search_nodes, or `repository` (git URL) for a nightly install. A search result whose `id` IS a git URL (legacy/repository-style entries) is auto-routed to a from-source 'nightly' install — 'latest' cannot resolve for those. A ComfyUI restart (panel_restart_comfyui) is usually required afterward to load the nodes — poll panel_node_queue_status first. Prefer this over the headless install_custom_node tool. " +
-        "⚠️ QUEUE-DONE IS NOT INSTALLED: Manager marks a task 'done' (queue drained) even when the git clone produced NOTHING — an empty dir, a transient git failure, or a repo not in its registry. So after the queue is idle you MUST VERIFY with panel_list_nodes that each pack actually appears before you restart or report success; a pack you installed that is absent from that list did NOT install (retry it, or install it from its git `repository` URL). " +
+      "Install a custom-node pack into the user's ComfyUI via the BUILT-IN Manager (queues the install). Pass `id` (registry id like 'comfyui-kjnodes' or 'author/repo') from panel_search_nodes, or `repository` (git URL) to request a nightly/from-source install — see the v4 limit below before relying on it. A search result whose `id` IS a git URL (legacy/repository-style entries) is auto-routed to a from-source 'nightly' install — 'latest' cannot resolve for those. " +
+        "⚠️ ON MANAGER v4, `repository` DOES NOT INSTALL A REPO THE MANAGER'S REGISTRY DOES NOT LIST (#1539) — being listed is necessary; whether it is sufficient was not measured. Measured against Manager V4.2.2: a request carrying `repository` AND `selected_version:'nightly'` — the exact combination Manager's own schema documents as 'repository required if selected_version is nightly' — is still resolved by `id` against its registry, and an unlisted repo fails with \"Node '<name>@nightly' not found in [ManagerChannel.dev, ManagerDatabaseSource.cache]\". The URL is sent and recorded; for an unlisted repo v4 never reaches a clone (only that case was probed). This is an UPSTREAM limitation, not a missing field on our side. On Manager 3.x we send a DIFFERENT request shape that carries the URL directly (that much is our own code); whether 3.x then installs an unlisted repo was NOT measured here, so treat 'it worked before on 3.x' as unverified rather than as a regression on our side. For an unlisted repo on v4, clone it into custom_nodes yourself and restart. " +
+        "A ComfyUI restart (panel_restart_comfyui) is usually required afterward to load the nodes — poll panel_node_queue_status first. Prefer this over the headless install_custom_node tool. " +
+        "⚠️ QUEUE-DONE IS NOT INSTALLED: Manager marks a task 'done' (queue drained) even when the git clone produced NOTHING — an empty dir, a transient git failure, or a repo not in its registry. So after the queue is idle you MUST VERIFY with panel_list_nodes that each pack actually appears before you restart or report success; a pack you installed that is absent from that list did NOT install (retry it, or install it from its git `repository` URL — but see the v4 note above: on Manager v4 that retry fails for a repo its registry does not list, so clone it yourself instead of retrying). " +
         "Install packs ONE AT A TIME and confirm each populated before the next — batching several installs then restarting is exactly how you end up with empty dirs and a broken restart.",
       {
         id: z.string().optional().describe("Registry id or 'author/repo'."),
-        repository: z.string().optional().describe("Git URL (for a nightly/from-source install)."),
+        repository: z
+          .string()
+          .optional()
+          .describe(
+            "Git URL, to REQUEST a nightly/from-source install. On Manager v4 an install only proceeds for a repo the Manager's registry already lists — an unlisted URL is rejected by id lookup despite this field (#1539, measured on V4.2.2).",
+          ),
         version: z.string().optional().describe("Specific version; default 'latest' (or 'nightly' with repository)."),
         channel: z.string().optional().describe("Manager channel (default 'default')."),
         mode: z.enum(["remote", "local", "cache"]).optional().describe("DB source (default 'remote')."),

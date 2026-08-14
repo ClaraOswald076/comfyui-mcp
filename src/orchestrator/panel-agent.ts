@@ -23,6 +23,8 @@ import type {
   McpSdkServerConfigWithInstance,
 } from "@anthropic-ai/claude-agent-sdk";
 import { logger } from "../utils/logger.js";
+import { downloadsAtRiskOfRespawn } from "../services/download-jobs.js";
+import { orphanedByDeferredRespawnNote } from "../services/panel-secrets.js";
 import { errorText, promptText } from "./error-text.js";
 import type { SessionStore } from "./session-store.js";
 import type { AgentBackend, AgentEvent, NeutralTurn } from "./agent-backend.js";
@@ -2391,6 +2393,89 @@ export class PanelAgentManager {
    *
    * No-op unless something is pending and the agent has fully settled (idle).
    */
+  /**
+   * #1567 — ARM the orphan check for the next respawn, for ONE tab.
+   *
+   * Only a comfyui CREDENTIAL change may arm this, and the caller says which tab it
+   * belongs to. Both restrictions come from review, and each fixes a real defect in the
+   * first version, which hooked every restart unconditionally:
+   *
+   *  - `applyPendingRestarts` also serves retargets (#1429) and the base_path recovery
+   *    respawn. Those are not credential saves, so a note saying one "was saved earlier"
+   *    would have been false — and `retargetAllForMcpEnv` deliberately gives an IDLE tab
+   *    NO turn, which an unconditional note broke for any tab while a download ran.
+   *  - `restartAllForMcpEnv` applies each tab separately and the download list is global,
+   *    so every restarted tab would have reported the SAME transfers. The credential
+   *    respawn does replace every tab's comfyui child, so the global list is the right
+   *    set — it just has to be told once, exactly like the retry nudge it travels with.
+   *
+   * `null` means "no particular tab" (a Settings-slot save): the first tab to restart
+   * carries it. Either way it is consumed once.
+   */
+  /**
+   * The credential-save respawn: restart every tab's comfyui child AND watch for what that
+   * kills. One call rather than arm-then-restart, deliberately.
+   *
+   * Arming separately left a window that review's leak finding lives in: a watch created by
+   * one call and bound by a LATER `restartAllForMcpEnv` would attach itself to whatever
+   * tabs that later, unrelated respawn happened to queue. Creating and binding it in the
+   * same call means a watch can never outlive the save that made it — if this save queues
+   * nothing, it dies here.
+   */
+  restartAllForMcpEnvAfterCredentialChange(tabId: string | null): McpEnvRestartTally {
+    this.credentialOrphanWatch = { tab: tabId, awaiting: new Set() };
+    const tally = this.restartAllForMcpEnv();
+    // An idle tab consumed it inside that call; otherwise bind it to exactly the tabs that
+    // still owe a restart, and drop it when there are none.
+    if (this.credentialOrphanWatch) {
+      const awaiting = this.liveKeys().filter((k) => this.pendingMcpRestart.has(k));
+      if (awaiting.length === 0) this.credentialOrphanWatch = null;
+      else this.credentialOrphanWatch.awaiting = new Set(awaiting);
+    }
+    return tally;
+  }
+  /**
+   * `tab` is who it is for; `awaiting` is what keeps it from LEAKING (review, P1).
+   *
+   * Consuming it only on delivery is not enough: a save that queues no restart at all — no
+   * managed tabs — or whose named tab disappears before its restart runs would leave this
+   * armed forever, and the next unrelated mcp-env respawn would then present a stale
+   * "a credential was saved earlier" note. `awaiting` is the exact set of tabs this save
+   * queued; the watch dies when that set empties, whether or not anything was delivered.
+   */
+  private credentialOrphanWatch: { tab: string | null; awaiting: Set<string> } | null = null;
+
+  /** #1567 — this tab will never deliver the armed watch (its restart is being dropped).
+   *  When nothing is left that could, the watch dies rather than waiting for a respawn it
+   *  has no relationship to. */
+  private releaseOrphanWatch(tabId: string): void {
+    const watch = this.credentialOrphanWatch;
+    if (!watch) return;
+    watch.awaiting.delete(tabId);
+    if (watch.awaiting.size === 0) this.credentialOrphanWatch = null;
+  }
+
+  /** #1567 — what this respawn is about to orphan, enumerated NOW rather than at save
+   *  time. Never throws: a rebuild that fails because its warning failed is strictly
+   *  worse than a rebuild with no warning.
+   *
+   *  It is NOT non-blocking, and the earlier comment claiming otherwise was wrong
+   *  (review): this reads job records and each active download's progress with sync IO,
+   *  so a stalled filesystem stalls here. That is tolerated because it now runs at most
+   *  once per credential save rather than on every restart — the same IO the save path
+   *  already performs, moved to where it can see the right answer. A try/catch cannot
+   *  time-bound a blocking syscall and is not pretended to. */
+  private deferredRespawnOrphanNote(): string | null {
+    try {
+      return orphanedByDeferredRespawnNote(downloadsAtRiskOfRespawn());
+    } catch (err) {
+      logger.debug("[panel-orchestrator] could not enumerate downloads a respawn will orphan", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  }
+
   private applyPendingRestarts(tabId: string): McpEnvRestartOutcome {
     const wantEffort = this.pendingEffortRestart.has(tabId);
     const wantMcp = this.pendingMcpRestart.has(tabId);
@@ -2400,6 +2485,8 @@ export class PanelAgentManager {
       this.pendingEffortRestart.delete(tabId);
       this.pendingMcpRestart.delete(tabId);
       this.pendingRetargetFrom.delete(tabId);
+      // #1567 — this restart is being dropped, so it will never deliver an armed watch.
+      this.releaseOrphanWatch(tabId);
       return "no-agent";
     }
     // Still mid-work (a queued message will start the next turn) — wait for the
@@ -2407,10 +2494,38 @@ export class PanelAgentManager {
     if (agent.isBusy || agent.hasPending) return "scheduled";
     // Only the MCP respawn carries a retry nudge.
     const nudge = wantMcp ? (this.pendingMcpRestart.get(tabId) ?? undefined) : undefined;
+    // #1567 — RE-TAKE the at-risk snapshot HERE. The save-time one (#1378) is taken
+    // before the emit because for an APPLIED respawn the emit is the damage. For a
+    // QUEUED one the damage is this line, arbitrarily many turns later, so a save-time
+    // snapshot cannot see a transfer that started in between — which is exactly what
+    // happened: nothing in flight at save, nine downloads started over the next two
+    // turns, all killed here with no warning at any point.
+    //
+    // ONLY for an armed credential respawn, and ONLY once — see
+    // armCredentialRespawnOrphanWatch. A note on any other restart would be both untrue
+    // and a spurious agent TURN, which is a response the user did not ask for.
+    const watch = this.credentialOrphanWatch;
+    const watched = wantMcp && watch !== null && (watch.tab === null || watch.tab === tabId);
+    // A tab leaves `awaiting` when its queued restart RESOLVES, whichever way — delivery
+    // retires the whole watch, and anything else just means this tab can no longer be the
+    // one to deliver it (review, round 3).
+    //
+    // Releasing only on the dropped path was not enough. A save on tab A with B also busy
+    // leaves awaiting={A,B}; retiring A trims it to {B}; B then restarts successfully,
+    // matches nothing, and releases nothing — so the set never empties. The watch sits
+    // there until a recreated A restarts and collects a warning about a save from long
+    // before it existed.
+    //
+    // The busy early-return above is deliberately upstream of this: "scheduled" means the
+    // tab still owes a restart, so it has not resolved and must stay in the set.
+    if (watched) this.credentialOrphanWatch = null;
+    else this.releaseOrphanWatch(tabId);
+    const orphanNote = watched ? this.deferredRespawnOrphanNote() : null;
+    const finalNudge = orphanNote ? [nudge, orphanNote].filter(Boolean).join("\n\n") : nudge;
     this.pendingEffortRestart.delete(tabId);
     this.pendingMcpRestart.delete(tabId);
     this.pendingRetargetFrom.delete(tabId);
-    const carried = this.restartAgentResume(tabId, agent, nudge);
+    const carried = this.restartAgentResume(tabId, agent, finalNudge);
     const reasons = [wantEffort ? "effort" : null, wantMcp ? "comfyui-mcp-env" : null]
       .filter(Boolean)
       .join("+");
@@ -2914,6 +3029,9 @@ export class PanelAgentManager {
   private unbindAgent(key: string, opts: { dropHeldMail: boolean; reason: string }): PanelAgent | undefined {
     const agent = this.agents.get(key);
     this.agents.delete(key);
+    // #1567 — this tab can no longer deliver an armed orphan watch. The single choke point
+    // for removal, so a retire/reset cannot strand one waiting on a tab that is gone.
+    this.releaseOrphanWatch(key);
     this.detachHeldCompletions(key, opts.reason);
     if (opts.dropHeldMail) this.heldMessages.delete(key);
     return agent;

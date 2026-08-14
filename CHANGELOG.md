@@ -745,6 +745,94 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.50] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- let the loader fail first, then append the remedy
+- refuse a stale path with the remedy — never substitute the manifest
+- resolve a pack manifest by NAME, and recognise a path that expired
+
+#### Changed
+- click the logo to go home, not to GitHub (#1581)
+- play the panel demo on the landing page instead of a placeholder (#1580)
+- Korean pilot — five entry pages, and the hreflang gate (#1577)
+
+
+## [0.51.49] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- a tab leaves the watch when its restart RESOLVES, not only when dropped
+- a watch can no longer outlive the save that created it
+- only an ARMED credential respawn may speak, and only once
+- take the at-risk snapshot when the respawn FIRES, not when it is queued
+
+#### Changed
+- fix what the docs claim, before translating them into eleven languages (#1558)
+
+
+## [0.51.48] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- bind the own-property test at load, not through the prototype
+- require an OWN property at every hop of the refusal claim
+- retry a PRE-EXECUTOR refusal, keyed on the field the panel publishes
+- wait out a reconnect refusal instead of handing it back
+
+
+## [0.51.47] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- a panel too old to help is also too old to say so (#1572)
+
+
+## [0.51.46] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- settle whether an unlisted git repo can install at all (#1566)
+
+
+## [0.51.45] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- a Get/Set bus node is not an unknown runtime (#1564)
+
+
+## [0.51.44] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- an INFERRED models root must still be corroborated before a download lands there (#1562)
+
+
+## [0.51.43] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- a relative interpreter path no longer sends a LOCAL download to Manager (#1555)
+
+
+## [0.51.42] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- let the spawned child make the #952 drift comparison (#1553)
+
+
 ## [0.51.29] - 2026-08-13
 
 ### MCP
