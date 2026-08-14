@@ -745,6 +745,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.43] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- a relative interpreter path no longer sends a LOCAL download to Manager (#1555)
+
+
 ## [0.51.42] - 2026-08-14
 
 ### MCP
