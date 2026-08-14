@@ -745,6 +745,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.46] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- settle whether an unlisted git repo can install at all (#1566)
+
+
 ## [0.51.45] - 2026-08-14
 
 ### MCP
