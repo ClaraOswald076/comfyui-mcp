@@ -431,6 +431,92 @@ describe("run completion across automatic goal continuation (#468)", () => {
     expect(backend.turns[1]).toContain("The first 8 image(s) are attached below");
     expect(backend.turns[1]).toContain("20 further preview(s) were omitted");
     expect(backend.turns[1]).toContain("all 28 outputs are already shown to the user");
+    // Every output is still NAMED, and the bound names a reader that can produce
+    // the pixels — a bounded-away preview costs a tool call, it is not lost.
+    expect(backend.turns[1]).toContain("preview_28.png");
+    expect(backend.turns[1]).toContain("get_image");
+
+    // …and the bound holds on the REPLAY too. The turn carrying it is abandoned,
+    // so the journal hands the completion back and re-delivers it; a bound that
+    // only applied to the first delivery would let the replay re-inflate.
+    await manager.interrupt(tab, { requeueInFlight: false });
+    await waitFor(() => backend.turns.length >= 3);
+    expect(backend.turns[2]).toContain("RE-DELIVERED");
+    expect(backend.turnImages[2]).toEqual(images.slice(0, 8).map((image) => image.filename));
+  });
+
+  it("#1516: a replayed foreign completion re-reports its outputs but never re-attaches pixels", async () => {
+    // The reported amplifier, in order: two FOREIGN completions at startup
+    // attached 28 images each; the interrupted turn handed both back to the
+    // journal; the replay produced a second ~105 MB record carrying the same 28
+    // images, and the app-server stopped replying. The replay is the half that
+    // compounds, so the withholding has to hold on EVERY delivery — not only the
+    // first one, which is all a first-delivery test can see.
+    const backend = new ContinuationBackend();
+    const { journal, manager, arrive } = makeHarness(backend);
+    const tab = "tab-foreign-replay";
+    const images = Array.from({ length: 28 }, (_, i) => ({ filename: `foreign_${i + 1}.png` }));
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "go");
+    await waitFor(() => backend.turns.length >= 1);
+    backend.finishTurn();
+
+    arrive(tab, { kind: "executed", prompt_id: PROMPT_B, images });
+    await waitFor(() => backend.turns.length >= 2);
+    expect(backend.turnImages[1]).toEqual([]);
+
+    await manager.interrupt(tab, { requeueInFlight: false });
+    await waitFor(() => backend.turns.length >= 3);
+    expect(backend.turns[2]).toContain("RE-DELIVERED");
+    expect(backend.turns[2]).toContain("foreign_28.png"); // still fully REPORTED…
+    expect(backend.turns[2]).toContain("get_image"); // …and still reachable…
+    expect(backend.turnImages[2]).toEqual([]); // …but no pixels ride the replay.
+  });
+
+  it("#1516: the bound sits on the route a real panel completion travels", async () => {
+    // makeHarness MIRRORS index.ts. A mirror can show the bound works; it can
+    // never show the orchestrator still uses the route it mirrors — and a bound
+    // helper nothing calls is this repo's recurring failure mode. Pin the hops
+    // that carry a panel `agent_event` into the bounded method:
+    //   agent_event kind:"executed" → flushRunCompletions
+    //   flushRunCompletions         → manager.injectEvent → PanelAgent.injectEvent
+    const { readFile } = await import("node:fs/promises");
+    const orchestrator = await readFile(
+      new URL("../../orchestrator/index.ts", import.meta.url),
+      "utf-8",
+    );
+    // Every slice below is bounded by an index that must EXIST — an unfound
+    // marker returns -1, and a slice to -1 hands `toContain` most of the file,
+    // which would make this whole test pass while measuring nothing.
+    const branchAt = orchestrator.indexOf('if (ev.kind === "executed") {');
+    expect(branchAt).toBeGreaterThan(-1);
+    const branchEnd = orchestrator.indexOf("return;", branchAt);
+    expect(branchEnd).toBeGreaterThan(branchAt);
+    const executedBranch = orchestrator.slice(branchAt, branchEnd);
+    expect(executedBranch).toContain("flushRunCompletions(event.tab_id)");
+
+    const flushAt = orchestrator.indexOf("function flushRunCompletions(");
+    expect(flushAt).toBeGreaterThan(-1);
+    const flushEnd = orchestrator.indexOf("\n  }\n", flushAt);
+    expect(flushEnd).toBeGreaterThan(flushAt);
+    const flushBody = orchestrator.slice(flushAt, flushEnd);
+    expect(flushBody).toContain("manager.injectEvent(");
+
+    // …and the method they land in is the one that applies the bound: the
+    // attachment is built from the BOUNDED list, so no later edit can re-widen
+    // it by reaching past `attachedImgs`.
+    const agent = await readFile(
+      new URL("../../orchestrator/panel-agent.ts", import.meta.url),
+      "utf-8",
+    );
+    const injectAt = agent.indexOf("\n  injectEvent(");
+    expect(injectAt).toBeGreaterThan(-1);
+    const injectEnd = agent.indexOf("\n  }\n", injectAt);
+    expect(injectEnd).toBeGreaterThan(injectAt);
+    const injectBody = agent.slice(injectAt, injectEnd);
+    expect(injectBody).toContain("MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS");
+    expect(injectBody).toMatch(/images = attachedImgs/);
   });
 
   it("a completion parked in HELD mail survives a reset that discards that mail", async () => {

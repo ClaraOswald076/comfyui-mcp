@@ -709,10 +709,16 @@ export class PanelAgent {
       const imgs = ev.images ?? [];
       const correlationIsUntrusted =
         ev.run_correlation === "foreign" || ev.run_correlation === "unidentified";
+      // Bound the SAME list that becomes the attachment. An entry with no
+      // filename was never attachable (it has been filtered out below since long
+      // before this bound existed), so counting it would make the new sentence
+      // claim a number of pixels the turn does not carry and blame the bound for
+      // a drop it did not cause.
+      const attachableImgs = imgs.filter((i) => i.filename);
       const attachedImgs = correlationIsUntrusted
         ? []
-        : imgs.slice(0, MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS);
-      const omittedImgs = imgs.length - attachedImgs.length;
+        : attachableImgs.slice(0, MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS);
+      const omittedImgs = attachableImgs.length - attachedImgs.length;
       const names = imgs.map((i) => i.filename).filter(Boolean).join(", ") || "(unnamed)";
       // A custom `note` (e.g. the panel's video-storyboard summary) replaces the
       // default image-acknowledgement wording so the agent is told accurately
@@ -744,15 +750,20 @@ export class PanelAgent {
         // e.g. a video that produced no storyboard — has none), and only when this
         // backend can actually see them — a text-only backend told "attached below"
         // would confabulate having viewed the render.
-          (imgs.length
-            ? this.backend.capabilities.vision
-              ? correlationIsUntrusted
-                ? `The outputs are already shown to the user in the panel, but their pixels are NOT attached to this agent turn because the run's origin is UNDETERMINED. `
-                : omittedImgs > 0
-                  ? `The first ${attachedImgs.length} image(s) are attached below; all ${imgs.length} outputs are already shown to the user in the panel. ${omittedImgs} further preview(s) were omitted from this agent turn to keep its image context bounded. `
-                  : `The image(s) are attached below and already shown to the user in the panel. `
-              : `You cannot view images on this provider, but they are already shown to the user in the panel. `
-            : ``) +
+        // A withheld or bounded-away output is still NAMED in this same event, so
+        // name a reader that can turn one of those names back into pixels (#1516).
+        // Deliberately not "nothing was lost": preview outputs live in ComfyUI's
+        // temp folder and a restart clears it, so the honest claim is that a fetch
+        // is the way to look — not that the fetch is guaranteed to succeed.
+        (imgs.length
+          ? this.backend.capabilities.vision
+            ? correlationIsUntrusted
+              ? `The outputs are already shown to the user in the panel, but their pixels are NOT attached to this agent turn because the run's origin is UNDETERMINED. Use get_image if you need to look at one. `
+              : omittedImgs > 0
+                ? `The first ${attachedImgs.length} image(s) are attached below; all ${imgs.length} outputs are already shown to the user in the panel. ${omittedImgs} further preview(s) were omitted from this agent turn to keep its image context bounded — use get_image if you need to see one of those. `
+                : `The image(s) are attached below and already shown to the user in the panel. `
+            : `You cannot view images on this provider, but they are already shown to the user in the panel. `
+          : ``) +
         // #977 — this used to be a FIXED "you do NOT need to call any tools",
         // i.e. "stop now", sent after every render. Paired with panel_run's own
         // "just end your turn now and wait", the emergent default was:
@@ -767,11 +778,11 @@ export class PanelAgent {
         // evidence only — no checklist, or one that is finished, keeps the
         // acknowledge-and-stop wording, so nothing changes for a single render.
         runCompletionDirective(this.tabId);
-      // Attach the outputs inline so the agent SEES the render (no fetch needed).
+      // Attach the outputs inline so the agent SEES the render without a fetch —
+      // up to the bound above. Past it (or for an UNDETERMINED origin) the text
+      // says so and points at get_image, so a fetch is needed but never a guess.
       if (this.backend.capabilities.vision) {
-        images = attachedImgs
-          .filter((i) => i.filename)
-          .map((i) => ({ ...i, type: i.type ?? "output" }));
+        images = attachedImgs.map((i) => ({ ...i, type: i.type ?? "output" }));
       }
     } else if (ev.kind === "ask_answer") {
       // #486 — the user ANSWERED a question card, but no tool call was alive to
