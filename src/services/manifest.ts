@@ -12,6 +12,7 @@ import {
   resolve,
   sep,
 } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { config, isRemoteMode } from "../config.js";
@@ -132,6 +133,94 @@ export type ComfyManifest = z.infer<typeof manifestSchema>;
 export interface ApplyManifestOptions {
   manifest?: unknown;
   path?: string;
+  /** #1568 — a bundled pack by NAME. Resolved against the RUNNING package root at apply
+   *  time, so it cannot expire the way a captured path does. */
+  pack?: string;
+}
+
+// ---------------------------------------------------------------------------
+// #1568 — bundled pack manifests, resolved by name rather than by a path that expires
+//
+// `list_packs` hands out an absolute `manifest_path` built from the running package root.
+// Under npx that root is `…/_npx/<hash>/node_modules/comfyui-mcp`, and the next respawn
+// gets a different <hash> — so a path captured earlier stats ENOENT while the pack is
+// still sitting there under its name.
+//
+// The lookup was never the broken part. `packsDir()` already derives from the current
+// root; what goes stale is the string we publish and invite the caller to hand back.
+// ---------------------------------------------------------------------------
+
+/** A single safe path segment — a pack directory name with no traversal or separators.
+ *  Mirrors skills-access.ts's SAFE_NAME, which guards the same directory. */
+const SAFE_PACK_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/** The bundled packs directory of the CURRENTLY RUNNING build. */
+function bundledPacksDir(): string {
+  return join(fileURLToPath(new URL("../../", import.meta.url)), "packs");
+}
+
+/**
+ * The manifest file of a bundled pack, or null when there is no such pack.
+ *
+ * Name-guarded and existence-checked: the name reaches the filesystem, so traversal must
+ * not. Returns the `.yaml` or `.yml` form, whichever the pack actually ships.
+ */
+export function resolvePackManifestFile(packName: string): string | null {
+  const name = String(packName ?? "").trim();
+  if (!SAFE_PACK_NAME.test(name)) return null;
+  const root = bundledPacksDir();
+  const packDir = join(root, name);
+  // Belt and braces over the name test: never leave the packs directory.
+  if (!packDir.startsWith(root)) return null;
+  for (const file of ["manifest.yaml", "manifest.yml"]) {
+    const candidate = join(packDir, file);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Which bundled pack a MISSING path was almost certainly naming, or null.
+ *
+ * This deliberately does NOT substitute the file. An earlier version of this returned the
+ * live path and applied it, and review was right to attack that: `apply_manifest` installs
+ * custom nodes and downloads model weights, so running a file the caller did not name is a
+ * much worse failure than the ENOENT it replaces — and the recogniser authenticated only
+ * the last four segments, so a user's own `~/dev/comfyui-mcp/packs/<name>/manifest.yaml`
+ * would have been retargeted at a bundled pack that merely shares a directory name.
+ *
+ * So it answers a question instead: "is there a bundled pack this dead path was pointing
+ * at?" The caller turns that into an actionable refusal naming `pack:<name>`, which is one
+ * call away and leaves the choice with the user. `pack:` is the actual fix for #1568; this
+ * only stops the failure being a bare ENOENT that reads like a missing pack.
+ *
+ * Still requires `node_modules` in the path, because the reported failure is an INSTALLED
+ * copy under an npx cache — that keeps a source checkout out of it entirely.
+ */
+export function bundledPackNamedByStalePath(candidate: string): string | null {
+  const raw = String(candidate ?? "");
+  if (!raw.trim()) return null;
+  // Only a path that resolves to nothing is a candidate. This is not a security boundary —
+  // nothing is substituted on the strength of it — so an ambiguous stat (a permission
+  // error, a dangling symlink) costing us a suggestion is the harmless direction.
+  if (existsSync(raw)) return null;
+  const parts = raw.replace(/\\/g, "/").split("/").filter(Boolean);
+  if (parts.length < 5) return null;
+  const file = parts[parts.length - 1];
+  const name = parts[parts.length - 2];
+  const packs = parts[parts.length - 3];
+  const owner = parts[parts.length - 4];
+  const container = parts[parts.length - 5];
+  if (file !== "manifest.yaml" && file !== "manifest.yml") return null;
+  if (packs !== "packs") return null;
+  if (owner !== "comfyui-mcp") return null;
+  // An INSTALLED copy, which is what an npx cache holds. A working checkout at
+  // `~/dev/comfyui-mcp/packs/…` is not this, and its missing file is its own business.
+  if (container !== "node_modules") return null;
+  if (!SAFE_PACK_NAME.test(name)) return null;
+  // …and only if this build actually ships it, so the hint never names a pack that is not
+  // there to apply.
+  return resolvePackManifestFile(name) ? name : null;
 }
 
 export type ManifestAction =
@@ -178,16 +267,67 @@ export async function loadManifestFile(path: string): Promise<ComfyManifest> {
   return manifestSchema.parse(raw);
 }
 
+/** What `resolveManifest` resolved, plus how — so the caller can report a substitution it
+ *  did not ask for (#1568). */
+interface ResolvedManifest {
+  manifest: ComfyManifest;
+  staleRepair?: { requested: string; applied: string; pack: string };
+}
+
 async function resolveManifest(opts: ApplyManifestOptions): Promise<ComfyManifest> {
   const hasInline = opts.manifest !== undefined;
   const hasPath = opts.path !== undefined && opts.path.trim().length > 0;
-  if (hasInline === hasPath) {
+  const hasPack = opts.pack !== undefined && opts.pack.trim().length > 0;
+  const given = [hasInline, hasPath, hasPack].filter(Boolean).length;
+  if (given !== 1) {
     throw new ValidationError(
-      "Provide exactly one of `manifest` or `path` to apply_manifest.",
+      "Provide exactly one of `manifest`, `path`, or `pack` to apply_manifest.",
     );
   }
   if (hasInline) return manifestSchema.parse(opts.manifest);
-  return loadManifestFile(opts.path!);
+
+  // #1568 — a NAME, resolved against the running package root. This is the durable form: a
+  // pack name cannot expire the way a path captured under an npx cache hash does.
+  if (hasPack) {
+    const name = opts.pack!.trim();
+    const file = resolvePackManifestFile(name);
+    if (!file) {
+      throw new ValidationError(
+        `No bundled pack named "${name}" ships a manifest in this build. ` +
+          `List the available packs with list_packs (action:"list") and use the \`name\` it reports.`,
+      );
+    }
+    return loadManifestFile(file);
+  }
+
+  // The path is opened EXACTLY as given. Trimming was only ever meant to decide whether an
+  // input was present; trimming what gets opened would silently retarget a legitimate
+  // POSIX path with leading or trailing whitespace (review).
+  const requested = opts.path!;
+  // #1568 — the reported failure: a path handed out by an EARLIER npx process, whose cache
+  // directory no longer exists. Turn the bare ENOENT into the one-call remedy rather than
+  // applying a file nobody named.
+  // ATTEMPT THE OPEN FIRST, and only then explain (review, round 2). Deciding "this is a
+  // stale npx path" before trying it replaced the loader's real error — an ordinary npm
+  // install under node_modules, or a permission failure, would both have been relabelled,
+  // hiding the actual ENOENT/EACCES and pointing at a pack the caller never asked for.
+  //
+  // So the real error is what surfaces, and the remedy is appended to it.
+  try {
+    return await loadManifestFile(requested);
+  } catch (err) {
+    const stalePack = bundledPackNamedByStalePath(requested);
+    if (!stalePack) throw err;
+    const cause = err instanceof Error ? err.message : String(err);
+    throw new ValidationError(
+      `${cause}\n\nThat path points inside an installed comfyui-mcp package directory. If it came ` +
+        `from an earlier npx run, that directory is replaced on each respawn, which is why a ` +
+        `manifest_path captured earlier stops resolving (#1568). This build does ship a pack ` +
+        `called "${stalePack}" — if that is the one you meant, re-run with pack: "${stalePack}" ` +
+        `instead of a path: it resolves against the running build and cannot go stale. ` +
+        `(Nothing was installed.)`,
+    );
+  }
 }
 
 function commandExists(cmd: string): boolean {

@@ -14,6 +14,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
+import { normalizeInstallPathEnv } from "../utils/install-path-env.js";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -1096,8 +1097,25 @@ export interface DownloadCacheResult {
 }
 
 function cacheDir(): string {
-  return resolve(process.env.COMFYUI_DOWNLOAD_CACHE_DIR || DEFAULT_CACHE_DIR);
+  // #1526 — the one install-path env var still read raw. Its siblings all trim
+  // (`COMFYUI_MCP_DATA_DIR?.trim()` and friends); this one did not, so a trailing
+  // space — which `set VAR=<path> && <cmd>` bakes in on Windows (#1512) — sends
+  // partial downloads to a directory that is not the configured one. Silently:
+  // `resolve()` accepts it happily and nothing checks the result against intent.
+  //
+  // Uses the #1512 helper rather than a bare `.trim()` so a pasted quote pair is
+  // also stripped and the malformed value is REPORTED once at ingestion. It is
+  // non-destructive by construction: a directory that genuinely ends in a space
+  // is left alone, and no filesystem probe happens when nothing would change.
+  const configured = normalizeInstallPathEnv(process.env.COMFYUI_DOWNLOAD_CACHE_DIR, {
+    varName: "COMFYUI_DOWNLOAD_CACHE_DIR",
+  }).path;
+  return resolve(configured || DEFAULT_CACHE_DIR);
 }
+
+/** #1526 — expose the env-derived cache root so its normalization is testable
+ *  without reaching into module internals or touching the filesystem. */
+export const __downloadCacheTestHooks = { cacheDir };
 
 function cacheSizeLimitBytes(): number {
   const raw = Number(process.env.COMFYUI_LRU_CACHE_SIZE_GB ?? "0");

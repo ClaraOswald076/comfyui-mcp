@@ -7,7 +7,7 @@
 // of relying on an idle interactive session to notice a channel push — and spawns
 // one Claude Agent SDK streaming session per panel tab (src/orchestrator/
 // panel-agent.ts). Each agent runs on the user's Claude SUBSCRIPTION with no API
-// key. See docs/design/panel-orchestrator.md.
+// key. See design/panel-orchestrator.md.
 
 import {
   existsSync,
@@ -62,6 +62,7 @@ import {
 import { listSessions, loadTranscript } from "./history.js";
 import { uploadImageHttp, resetClient } from "../comfyui/client.js";
 import { setConnectedPanelOrigins } from "../comfyui/fetch.js";
+import { publishConnectedPanelOrigins } from "../services/panel-origin-channel.js";
 import { logger } from "../utils/logger.js";
 import { assembleVocabularyHash, describeVocabularySkew } from "../tools/vocabulary.js";
 import { buildPanelToolDefs } from "./panel-tools.js";
@@ -3249,7 +3250,14 @@ export async function runPanelOrchestrator(): Promise<void> {
     // the action" nudge is not, so it must never broadcast to unrelated tabs.
     // restartAllForMcpEnv() is nudge-preserving, so this can't erase a per-request
     // nudge already queued on another tab (#164).
-    const tally = manager.restartAllForMcpEnv();
+    //
+    // #1567 — arm the orphan check BEFORE restarting, because an idle tab respawns
+    // inside this call. This is the ONLY path allowed to arm it: a respawn from a
+    // credential save is the one that queues, waits turns, and then kills whatever
+    // transfers exist by then. Scoped to the tab this change belongs to, matching the
+    // retry nudge below — the transfers are global (every tab's child is replaced), so
+    // it must be reported once rather than once per tab.
+    const tally = manager.restartAllForMcpEnvAfterCredentialChange(change.tabId ?? null);
     // NUDGE only the tab whose panel_request_secret this change answers — a
     // Settings slot save, a background token (re)load, or a revoke leaves
     // `requested` false and nudges nothing. The per-tab pending-restart map
@@ -5572,6 +5580,15 @@ export async function runPanelOrchestrator(): Promise<void> {
     // no saved state
   }
   const pollDownloads = () => {
+    // #1415 — the OTHER half of the #952 drift comparison installed above. That
+    // source only serves THIS process, and the tools that fail with `fetch
+    // failed` run in the spawned comfyui children, which have no bridge. Publish
+    // the current set into the progress dir they already share so a child's
+    // failure can make the same comparison. Level-triggered on this tick (not on
+    // connect/disconnect events) so a tab that goes away blanks it within 700ms —
+    // the child must never quote a panel that has since disconnected. Writes only
+    // when the set changed.
+    publishConnectedPanelOrigins(progressDir, bridge.connectedServerOrigins());
     let files: string[] = [];
     try {
       files = readdirSync(progressDir).filter((f) => f.endsWith(".json"));

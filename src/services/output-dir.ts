@@ -76,6 +76,37 @@ export function isLiveAuthoritativeModelsDir(source: ModelsDirSource): boolean {
   return source === "argv-flag" || source === "live-root" || source === "observed-root";
 }
 
+/**
+ * Did the SERVER ITSELF name this root, rather than us inferring it? (#369)
+ *
+ * Deliberately narrower than `isLiveAuthoritativeModelsDir`, and deliberately a
+ * SEPARATE predicate rather than a change to it — that one has four other callers
+ * answering different questions, and widening or narrowing it in place would move
+ * all of them at once.
+ *
+ * The distinction is what a source is EVIDENCE OF:
+ *
+ *   argv-flag / live-root — the server's own command line, naming its base or its
+ *     script root. A statement about where the server reads.
+ *   observed-root — a relative `main.py` re-anchored on the interpreter the OS
+ *     reports for the process on our port. A statement about where the BINARY
+ *     lives, from which the root is INFERRED.
+ *
+ * Those come apart in an ordinary Windows setup: with a stale portable bundle's
+ * python on PATH, `cd D:\live && python ComfyUI\main.py` anchors
+ * `C:\stale\ComfyUI` — measured, and reachable through both the absolute-argv[0]
+ * tier and the OS-image reading (#1374). A download then lands in an install the
+ * running server never reads, which is #369's original outcome by a new route.
+ *
+ * So only the first two skip the disagreement check. The inferred one runs it, at
+ * the cost of one `/models/<category>` listing call — a check that needs positive
+ * contradicting evidence and fails open on everything else, so it cannot refuse a
+ * fresh or shared tree.
+ */
+export function modelsDirNamedByServer(source: ModelsDirSource): boolean {
+  return source === "argv-flag" || source === "live-root";
+}
+
 /** Resolve a possibly-relative dir against a base (or COMFYUI_PATH, or cwd). */
 function resolveDir(value: string, base?: string): string {
   if (isAbsolute(value)) return resolve(value);
