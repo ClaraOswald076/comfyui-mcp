@@ -160,6 +160,16 @@ for (const loc of locales) {
         fail(loc, slug, `relative link "${href}" — use an absolute /docs/... path from a locale directory`);
         continue;
       }
+      // A DOUBLED prefix is the one link form that genuinely 404s, and the normalization below
+// would hide it: `/docs/docs/backends` strips to `docs/backends`, which resolves on disk.
+      // Measured on the live site: /docs/backends and /backends both render the real page;
+      // /docs/docs/backends returns the same shell as a nonsense URL. Two review agents reached
+      // OPPOSITE conclusions about the prefix by reasoning from repo conventions, which is why
+      // this is pinned to an observation rather than an argument.
+      if (/^\/docs\/docs\//.test(rawTarget)) {
+        fail(loc, slug, `link "${href}" doubles the /docs prefix — it 404s; use "/docs/..." once`);
+        continue;
+      }
       const target = rawTarget.replace(/^\/docs\//, '').replace(/^\//, '').replace(/\/$/, '');
       if (!target) continue;
       const isLocal = target.startsWith(`${loc}/`);
