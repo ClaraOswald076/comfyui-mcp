@@ -1,136 +1,164 @@
 // #1574 — the tray announced "transfer completed" while the transfer was still streaming.
 //
-// The reporter checked three independent things immediately after the event arrived:
+// The reporter checked three things immediately after the event arrived:
 //
 //   download_model action:"status" {id}  → **downloading** … still streaming, started 634s ago
 //   list_local_models                    → the file was ABSENT
 //   get_system_stats a few minutes later → the category count went 8 → 9
 //
-// So the file landed AFTER the completion event. They also read the formatting code and
-// correctly concluded it is not at fault: it emits `transfer completed` for rows where
-// `d.status === "done"`, so something upstream had already put the row in that state.
+// The file landed AFTER the event. They also read the formatting code and correctly ruled it
+// out: it emits the completion clause for rows where `status === "done"`, so something
+// upstream had already put the row in that state.
 //
-// ## What this pins
+// The completion event is built from a PROGRESS ROW; `download_model action:"status"` answers
+// from the JOB RECORD. Two stores, and the event consults only one.
 //
-// The completion event is driven by a PROGRESS ROW read off disk, while
-// `download_model action:"status"` answers from the JOB RECORD. Two stores, and the event
-// consults only one of them. A false `done` is the dangerous direction — the natural next
-// action is to USE the file — and #1150 was the same disagreement on the `error` side, where
-// the wording at least warns the reader.
+// ## Two review findings shaped this file
 //
-// This does not require knowing which writer set the row: whatever did, the orchestrator
-// holds the authoritative record in the same tick and can decline to announce a completion
-// that its own status tool would contradict.
+// 1. SUPPRESSING the contradicted event is wrong. A terminal record can legitimately still
+//    read "downloading" until the ~15s persistence heartbeat retries (#1545), and the
+//    debounce bucket is deleted before the check and never requeued — so dropping the event
+//    would PERMANENTLY lose the completion for a download that genuinely finished. The event
+//    always fires; the disagreement is disclosed on it.
+//
+// 2. The first guard compared the row's id to the JOB's id. Those are different identities —
+//    the report shows both (`6226e26ba97f8527` against tray `93015fbfa0fa9933`) — so it never
+//    matched and was completely INERT. Its unit tests missed that because they fed synthetic
+//    rows carrying whatever id the assertion wanted. Every fixture here now uses the REAL
+//    shape: the row carries the progress/tray id, the job carries its own separate id.
 import { describe, expect, it } from "vitest";
 
-import { completionContradictedByRecord } from "../../orchestrator/download-done-guard.js";
+import {
+  COMPLETION_DISAGREEMENT_NOTE,
+  completionDisagreesWithRecord,
+} from "../../orchestrator/download-done-guard.js";
 
+/** A progress row: identified by the PROGRESS/TRAY id, as written on disk. */
 const row = (over: Record<string, unknown> = {}) => ({
-  id: "6226e26ba97f8527",
+  id: "93015fbfa0fa9933",
   name: "model.safetensors",
   status: "done",
   ...over,
 });
 
+/** A job record: its own public `id`, plus the tray/progress identity the rows use. */
 const job = (over: Record<string, unknown> = {}) => ({
   id: "6226e26ba97f8527",
+  trayId: "93015fbfa0fa9933",
   filename: "model.safetensors",
   status: "downloading",
   ...over,
 });
 
-describe("a completion the record contradicts is not announced (#1574)", () => {
-  it("REFUSES the reported case: row says done, the job record still says downloading", () => {
-    expect(completionContradictedByRecord(row(), [job()])).toBe(true);
+describe("a completion the record disagrees with is DISCLOSED (#1574)", () => {
+  it("flags the reported case: row says done, the job record still says downloading", () => {
+    expect(completionDisagreesWithRecord(row(), [job()])).toBe(true);
   });
 
-  it("allows a completion the record agrees with", () => {
-    expect(completionContradictedByRecord(row(), [job({ status: "done" })])).toBe(false);
-  });
-
-  it("allows a completion when the record has no opinion", () => {
-    // The record store is reset by an orchestrator respawn — which is exactly the session
-    // the reporter hit. An ABSENT record is not evidence the transfer is still running, and
-    // suppressing every completion after a respawn would lose the events entirely.
-    expect(completionContradictedByRecord(row(), [])).toBe(false);
-    expect(completionContradictedByRecord(row(), [job({ id: "someone-else" })])).toBe(false);
-  });
-
-  it("matches on ID, not on filename", () => {
-    // A retry of a 404 is a DIFFERENT id writing the SAME filename (#1150). Matching by name
-    // would let an unrelated live attempt suppress a genuine completion.
+  it("matches on the PROGRESS identity, not the job's public id", () => {
+    // The bug that made the first version inert. A row is never written under the job's
+    // public id, so comparing against it matched nothing and silently agreed with everything.
+    expect(completionDisagreesWithRecord(row({ id: "6226e26ba97f8527" }), [job()])).toBe(false);
+    // progressId wins over trayId when both are present — it is what writes the rows.
     expect(
-      completionContradictedByRecord(row({ id: "attempt-2" }), [
-        job({ id: "attempt-1", status: "downloading" }),
+      completionDisagreesWithRecord(row({ id: "prog-1" }), [job({ progressId: "prog-1" })]),
+    ).toBe(true);
+    expect(
+      completionDisagreesWithRecord(row({ id: "93015fbfa0fa9933" }), [
+        job({ progressId: "prog-1" }),
       ]),
     ).toBe(false);
   });
 
-  it("only guards COMPLETIONS — a failure row is never suppressed", () => {
-    // #1150's direction. A FAILED event carries its own hedged wording and must keep
-    // firing; silencing it would strand the user with no signal at all.
-    expect(completionContradictedByRecord(row({ status: "error" }), [job()])).toBe(false);
+  it("says nothing when the record agrees", () => {
+    expect(completionDisagreesWithRecord(row(), [job({ status: "done" })])).toBe(false);
   });
 
-  it("a terminal record other than done does not contradict", () => {
-    // cancelled / error in the record are terminal too. The guard exists for the one
-    // disagreement that matters: the record says the bytes are STILL MOVING.
-    for (const status of ["error", "cancelled"]) {
-      expect(completionContradictedByRecord(row(), [job({ status })]), status).toBe(false);
+  it("says nothing when the record has no opinion", () => {
+    // The record store resets on an orchestrator respawn — exactly the reported session. An
+    // ABSENT record is not evidence the transfer is still running.
+    expect(completionDisagreesWithRecord(row(), [])).toBe(false);
+    expect(completionDisagreesWithRecord(row(), [job({ trayId: "someone-else" })])).toBe(false);
+  });
+
+  it("only looks at COMPLETIONS — a failure row is untouched", () => {
+    expect(completionDisagreesWithRecord(row({ status: "error" }), [job()])).toBe(false);
+  });
+
+  it("a terminal record other than downloading does not disagree", () => {
+    for (const status of ["error", "cancelled", "done"]) {
+      expect(completionDisagreesWithRecord(row(), [job({ status })]), status).toBe(false);
     }
   });
 
   it("junk never throws — this runs on the event path", () => {
     for (const bad of [null, undefined, {}, { status: "done" }]) {
-      expect(() => completionContradictedByRecord(bad as never, [job()])).not.toThrow();
+      expect(() => completionDisagreesWithRecord(bad as never, [job()])).not.toThrow();
     }
-    expect(completionContradictedByRecord(row(), null as never)).toBe(false);
+    expect(completionDisagreesWithRecord(row(), null as never)).toBe(false);
+  });
+
+  it("the note states BOTH readings rather than picking a winner", () => {
+    // It cannot establish which store is right, and saying "this download is not finished"
+    // would be a claim it has not earned — the record legitimately lags sometimes.
+    expect(COMPLETION_DISAGREEMENT_NOTE).toMatch(/still reports this transfer as downloading/i);
+    expect(COMPLETION_DISAGREEMENT_NOTE).toMatch(/can lag/i);
+    expect(COMPLETION_DISAGREEMENT_NOTE).toMatch(/before loading it/i);
+    // …and it must NOT assert the download is unfinished. It cannot establish that — the
+    // record legitimately lags sometimes — and stating it would make every lagging record
+    // read as a failed download.
+    expect(COMPLETION_DISAGREEMENT_NOTE).not.toMatch(/is NOT finished|did not finish|has not finished/i);
+    expect(COMPLETION_DISAGREEMENT_NOTE).toMatch(/may simply be that/i);
   });
 });
 
-// ── WIRING. The guard is inert unless the emit path consults it, and that is a few lines
-//    inside the orchestrator tick — the shape that deletes with every unit test green.
+// ── WIRING. The guard is inert unless the tick sets the flag, the bucket carries the id the
+//    match needs, and the formatter renders the note. All three are single lines.
 
-describe("the emit path actually consults the guard (#1574)", () => {
-  const source = async (): Promise<string> => {
+describe("the disagreement actually reaches the user (#1574)", () => {
+  const read = async (file: string): Promise<string> => {
     const { readFileSync } = await import("node:fs");
-    return readFileSync(new URL("../../orchestrator/index.ts", import.meta.url), "utf-8");
+    return readFileSync(new URL(`../../orchestrator/${file}`, import.meta.url), "utf-8");
   };
 
-  it("filters the settled bucket before injecting the event", async () => {
-    const src = await source();
-    const at = src.indexOf('kind: "download_done"');
-    expect(at, "the download_done injection must still be recognisable").toBeGreaterThan(-1);
-    // Bounded by the injection itself rather than a byte count — a fixed window around
-    // growing code has reported missing wiring three times in this repo already.
-    const block = src.slice(Math.max(0, at - 2500), at + 200);
-    expect(block).toMatch(/listDownloadJobs\(\)/);
-    // The FILTER specifically, not merely a mention of the guard. Deleting the filter while
-    // keeping the log line below it left an earlier version of this green: the call still
-    // appeared in the block, just no longer on the path that decides anything.
-    expect(block).toMatch(
-      /settled\.filter\(\(d\) => !completionContradictedByRecord\(d, records\)\)/,
-    );
+  it("the bucket carries the row id the match depends on", async () => {
+    // Without this the guard has nothing to match a job against, and agrees with everything.
+    // That is precisely how the first version shipped as a no-op.
+    const src = await read("index.ts");
+    const at = src.indexOf("bucket.downloads.set(supKey, {");
+    expect(at).toBeGreaterThan(-1);
+    expect(src.slice(at, at + 400)).toMatch(/id: typeof row\.id === "string" \? row\.id : undefined/);
   });
 
-  it("injects the FILTERED list, not the raw bucket", async () => {
-    // The defect this would leave: compute `honest`, log about it, and then hand `settled`
-    // to injectEvent anyway. Every guard test would still pass.
-    const src = await source();
-    expect(src).toMatch(/kind: "download_done", downloads: honest/);
-    expect(src).not.toMatch(/kind: "download_done", downloads: settled/);
+  it("the tick FLAGS the disagreeing entries", async () => {
+    const src = await read("index.ts");
+    expect(src).toMatch(/settled\.filter\(\(d\) => completionDisagreesWithRecord\(d, records\)\)/);
+    expect(src).toMatch(/\.recordDisagrees = true/);
   });
 
-  it("skips the turn entirely when everything was contradicted", async () => {
-    // Injecting an empty download_done wakes the agent for nothing.
-    const src = await source();
-    expect(src).toMatch(/if \(honest\.length === 0\) continue;/);
+  it("and still injects EVERY settled entry", async () => {
+    // The review finding. Suppressing loses a real completion permanently, because the
+    // bucket is already deleted and never requeued.
+    const src = await read("index.ts");
+    // EXACTLY settled, with nothing chained onto it. A .filter() appended here reads as
+    // "still uses settled" to a looser regex, and is the exact regression this forbids.
+    expect(src).toMatch(/kind: "download_done", downloads: settled }/);
+    expect(src).not.toMatch(/downloads: settled\s*\.filter/);
+    expect(src).not.toMatch(/downloads: honest/);
+    expect(src).not.toMatch(/if \(honest\.length === 0\) continue;/);
   });
 
-  it("a failure to read the record does not break the event path", async () => {
-    // A completion we cannot check is still a completion worth delivering. The guard must
-    // never be able to turn a working notification into a lost one.
-    const src = await source();
+  it("the formatter renders the caveat beside the completion", async () => {
+    const src = await read("panel-agent.ts");
+    const at = src.indexOf("transfer completed: ${done.join");
+    expect(at).toBeGreaterThan(-1);
+    const block = src.slice(at, at + 900);
+    expect(block).toMatch(/recordDisagrees/);
+    expect(block).toMatch(/COMPLETION_DISAGREEMENT_NOTE/);
+  });
+
+  it("a record read that throws leaves the event untouched", async () => {
+    const src = await read("index.ts");
     const at = src.indexOf("listDownloadJobs()");
     const block = src.slice(at - 200, at + 400);
     expect(block).toMatch(/catch/);

@@ -23,6 +23,7 @@ import type {
   McpSdkServerConfigWithInstance,
 } from "@anthropic-ai/claude-agent-sdk";
 import { logger } from "../utils/logger.js";
+import { COMPLETION_DISAGREEMENT_NOTE } from "./download-done-guard.js";
 import { downloadsAtRiskOfRespawn } from "../services/download-jobs.js";
 import { orphanedByDeferredRespawnNote } from "../services/panel-secrets.js";
 import { errorText, promptText } from "./error-text.js";
@@ -664,7 +665,14 @@ export class PanelAgent {
       images?: ImageRef[];
       error?: string;
       note?: string;
-      downloads?: Array<{ name: string; status: string; supersededByLive?: boolean }>;
+      // #1574 — set by the orchestrator when the job RECORD still reads "downloading" for
+      // a row claiming done. Disclosed on the event; never used to suppress it.
+      downloads?: Array<{
+        name: string;
+        status: string;
+        supersededByLive?: boolean;
+        recordDisagrees?: boolean;
+      }>;
       /** #468 — run identity + how it correlates to a run this session queued. */
       prompt_id?: string;
       run_correlation?: "matched" | "foreign" | "unidentified";
@@ -827,6 +835,15 @@ export class PanelAgent {
       // install the running server never reads — so the wording says only what the
       // event actually proves and points at download_model action:"status" for the verdict.
       if (done.length) parts.push(`transfer completed: ${done.join(", ")}`);
+      // #1574 — the completion is built from the progress ROW; `download_model
+      // action:"status"` answers from the job RECORD. When the record still says the bytes
+      // are moving, say so ON the event rather than announcing a bare completion: a reporter
+      // got "transfer completed" for an 11.46GB file minutes before it existed on disk, and
+      // acted on it. Disclosed, never suppressed — see download-done-guard.ts for why
+      // dropping the event would be the worse failure.
+      if (dl.some((d) => d.status === "done" && d.recordDisagrees)) {
+        parts.push(COMPLETION_DISAGREEMENT_NOTE);
+      }
       if (failedDead.length) parts.push(`FAILED: ${failedDead.map((d) => d.name).join(", ")}`);
       if (failedRetried.length) {
         parts.push(
@@ -2602,7 +2619,14 @@ export class PanelAgentManager {
       images?: ImageRef[];
       error?: string;
       note?: string;
-      downloads?: Array<{ name: string; status: string; supersededByLive?: boolean }>;
+      // #1574 — set by the orchestrator when the job RECORD still reads "downloading" for
+      // a row claiming done. Disclosed on the event; never used to suppress it.
+      downloads?: Array<{
+        name: string;
+        status: string;
+        supersededByLive?: boolean;
+        recordDisagrees?: boolean;
+      }>;
       prompt_id?: string;
       run_correlation?: "matched" | "foreign" | "unidentified";
       run_correlation_prior?: boolean;

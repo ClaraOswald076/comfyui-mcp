@@ -1,69 +1,83 @@
 /**
- * #1574 — do not announce a completion this orchestrator's own status tool would contradict.
+ * #1574 — when the completion event and `download_model action:"status"` disagree, say so.
  *
  * The tray raised `transfer completed` for an 11.46GB download while
- * `download_model action:"status"` reported it still streaming, `list_local_models` showed
- * the file absent, and the category count only rose minutes later. The file landed AFTER the
+ * `download_model action:"status"` reported it still streaming, `list_local_models` showed the
+ * file absent, and the category count only rose minutes later. The file landed AFTER the
  * event.
  *
- * ## Why the guard sits here and not at the writer
- *
- * The completion event is driven by a PROGRESS ROW read off disk each tick. `status` answers
+ * The completion event is built from a PROGRESS ROW read off disk each tick. `status` answers
  * from the JOB RECORD. Two stores, and the event consults only one — the same split #1545
- * documented from the other side, where the completion is raised from this process's memory
- * while `status` reads the record from the spawned stdio child.
+ * documented from the other side.
  *
- * Which writer set that row to `done` is not established. The three sites that write it look
- * sound in isolation (a `stat()` on the landed file; the filename appearing in the server's
- * model listing; the rename itself), and the reported session had both an orchestrator
- * respawn mid-transfer and two comfyui-mcp copies in the npx cache — so a stale or foreign
- * writer is the open question, and naming one without evidence would be a guess.
+ * ## Why this ANNOTATES and never suppresses
  *
- * The guard does not need the answer. Whatever wrote the row, the authoritative record is in
- * hand in the same tick, and announcing a completion it contradicts is the one outcome worth
- * preventing: a false `done` invites USING the file, where #1150's false `FAILED` at least
- * warned the reader.
+ * The first version of this dropped the contradicted event. Review killed it, correctly: a
+ * terminal record may legitimately still read `downloading` until the ~15s persistence
+ * heartbeat retries (see `persistDownloadJob`'s return value, #1545). The debounce bucket is
+ * deleted before filtering and never requeued, so suppressing on a lagging record would
+ * PERMANENTLY lose the completion notification for a download that genuinely finished.
  *
- * ## Everything ambiguous stays silent
+ * That trades a confusing message for a missing one, which is worse: the user is waiting on
+ * that event. So the event always fires, and a disagreement is disclosed on it. The harm in
+ * the report is a CONFIDENT false completion — "the natural next action is to use the file" —
+ * and a hedge is precisely what removes that.
  *
- * This suppresses an event a user is waiting for, so it fires only on a POSITIVE
- * contradiction — the record exists, is for this exact download, and says the bytes are still
- * moving. In particular an ABSENT record is NOT evidence: the record store resets on an
- * orchestrator respawn, which is precisely the reported session, and treating absence as "in
- * flight" would silence every completion after any respawn.
+ * ## Identity
+ *
+ * The two stores do not share an id. A progress row's `id` is the progress/tray identity;
+ * the job's `id` is its public status handle (`6226e26ba97f8527` in the report, against tray
+ * `93015fbfa0fa9933`). The row is matched against the job's `progressId ?? trayId`, which is
+ * what writes those rows. An earlier version compared row id to job id and was therefore
+ * INERT — it never matched anything, and its unit tests missed that because they fed
+ * synthetic rows carrying whatever id the assertion wanted.
  */
 
-/** The fields this reads. Deliberately structural rather than importing the row/job types:
- *  both stores are read as parsed JSON here, and a shape mismatch must degrade to "no
- *  opinion", never throw on the event path. */
+/** Only the fields this reads. Both stores arrive as parsed JSON, so a shape mismatch must
+ *  degrade to "no disagreement", never throw on the event path. */
 interface RowLike {
   id?: unknown;
   status?: unknown;
 }
 interface JobLike {
   id?: unknown;
+  trayId?: unknown;
+  progressId?: unknown;
   status?: unknown;
 }
 
+/** The identity a PROGRESS ROW is written under. */
+function progressIdentityOf(job: JobLike): string | null {
+  const progress = typeof job.progressId === "string" ? job.progressId : null;
+  const tray = typeof job.trayId === "string" ? job.trayId : null;
+  return progress ?? tray;
+}
+
 /**
- * Would `download_model action:"status"` disagree with announcing this row as completed?
+ * Does the job record disagree with announcing this row as completed?
  *
- * True ONLY when the record for this exact id says `downloading`. Anything else — a missing
- * record, a different id, a non-completion row, a record that is terminal in some other way —
- * answers false, because none of them establish that the transfer is still running.
+ * True ONLY on a positive contradiction: a record exists for this exact progress identity and
+ * still says `downloading`. A missing record is not evidence — the record store resets on an
+ * orchestrator respawn, which is exactly the reported session.
  */
-export function completionContradictedByRecord(row: RowLike, jobs: readonly JobLike[]): boolean {
+export function completionDisagreesWithRecord(row: RowLike, jobs: readonly JobLike[]): boolean {
   if (!row || typeof row !== "object") return false;
-  // Only COMPLETIONS are guarded. A failure event carries its own hedged wording (#1150) and
-  // suppressing it would strand the user with no signal at all.
+  // Only COMPLETIONS. A failure event carries its own hedged wording (#1150) and must be
+  // left entirely alone.
   if (row.status !== "done") return false;
   const id = typeof row.id === "string" ? row.id : null;
   if (!id) return false;
   if (!Array.isArray(jobs)) return false;
-  // Matched on ID, never filename: a corrected retry of a 404 is a DIFFERENT id writing the
-  // SAME name (#1150), so a name match would let an unrelated live attempt silence a genuine
-  // completion.
-  const record = jobs.find((j) => j && typeof j === "object" && j.id === id);
-  if (!record) return false; // no opinion — see the respawn note above
+  const record = jobs.find((j) => j && typeof j === "object" && progressIdentityOf(j) === id);
+  if (!record) return false;
   return record.status === "downloading";
 }
+
+/** The disclosure appended to a completion the record disagrees with. Deliberately states
+ *  BOTH readings and what to do, rather than picking a winner this cannot establish. */
+export const COMPLETION_DISAGREEMENT_NOTE =
+  "CAVEAT: `download_model action:\"status\"` still reports this transfer as downloading. " +
+  "The two are read from different stores and the record can lag a real completion by a few " +
+  "seconds, so this may simply be that — but a completion event has also been observed to " +
+  "arrive minutes before the file existed (#1574). Check `download_model action:\"status\"` " +
+  "and that the file is present before loading it.";
