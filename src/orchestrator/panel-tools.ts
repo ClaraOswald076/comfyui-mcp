@@ -44,6 +44,7 @@ import { fileURLToPath } from "node:url";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { assertPanelNotTargetedUnverifiable } from "../services/panel-pin-guard.js";
 import { nodesInstallCommandArgs } from "../services/node-management.js";
+import { isPreExecutorRefusal } from "../services/panel-refusal.js";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { parse as parseYaml } from "yaml";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
@@ -6743,7 +6744,24 @@ export function makePanelToolCtx(
       // for a retry in a moment; the section lasts a fraction of a second, which
       // is what retrySettleMs already waits. Still gated on RETRY-SAFE commands,
       // so a mutation is never re-issued on our own initiative.
-      if (isRetrySafeCmd(cmd) && (isTransientReconnectError(err) || isWorkflowSwitchGuardRefusal(err))) {
+      // #1529 — a PRE-EXECUTOR refusal is retryable even for a MUTATION.
+      //
+      // Every other branch here is gated on RETRY_SAFE_CMDS precisely because a
+      // mutation might have landed before the failure, and re-issuing it would
+      // double-apply. That reasoning does not hold for this one: the panel's
+      // reconnect gate runs BEFORE its executor, and says so in a structured field
+      // (`applied:false, stage:"pre-executor"`) rather than in prose. Nothing ran,
+      // so there is nothing to double-apply — which is the entire point of the
+      // channel, and why it is keyed on the FIELD and never on the message text.
+      //
+      // The refusal is the panel's own claim about its own execution, validated on
+      // arrival; an older panel sends no field, `preExecutorRefusal` is null, and
+      // this branch simply never fires.
+      const preExecutorRefusal = isPreExecutorRefusal(err);
+      if (
+        preExecutorRefusal ||
+        (isRetrySafeCmd(cmd) && (isTransientReconnectError(err) || isWorkflowSwitchGuardRefusal(err)))
+      ) {
         // panel#1097 — declared out here so the refusal branch below can see it,
         // and REASSIGNED after ensureReachable so it names the tab the command is
         // actually dispatched on. Reading it before the rebind attributed a refusal
