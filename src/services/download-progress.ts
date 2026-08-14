@@ -857,8 +857,13 @@ function sleepSyncMs(ms: number): void {
   try {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
   } catch {
-    const until = Date.now() + ms;
-    while (Date.now() < until) {
+    // performance.now() is MONOTONIC; Date.now() is not. A backward wall-clock
+    // adjustment (NTP step, DST on some platforms) during this loop would make
+    // the exit condition unreachable and freeze the event loop in the very
+    // fallback meant to be safe (review finding). The iteration cap is a second
+    // belt: even a pathological clock cannot make this run forever.
+    const until = performance.now() + ms;
+    for (let i = 0; performance.now() < until && i < 5_000_000; i++) {
       /* bounded spin — only reached where Atomics.wait is unavailable */
     }
   }

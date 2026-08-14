@@ -110,8 +110,13 @@ describe("#1545 the terminal record survives a reader holding it open", () => {
     // [2,2,2,2] totals ~62ms. Per-gap thresholds cannot separate those, and an
     // earlier version of this test claimed they could. What the fix actually
     // buys is that the attempts are SPREAD rather than simultaneous.
+    //
+    // The floor is 25ms, NOT 40: the configured sleeps total 37ms, and on a
+    // high-resolution host (Linux CI) Atomics.wait lands near that — so a 40ms
+    // floor would have failed a CORRECT implementation (review finding). My
+    // ~73ms measurement was Windows granularity, not the schedule.
     const totalBackoff = gaps.reduce((a, b) => a + b, 0);
-    expect(totalBackoff).toBeGreaterThanOrEqual(40);
+    expect(totalBackoff).toBeGreaterThanOrEqual(25);
   });
 
   it("does not retry at all when the first attempt lands", async () => {
@@ -121,6 +126,39 @@ describe("#1545 the terminal record survives a reader holding it open", () => {
     // defect worth a test. The attempt COUNT is the real invariant.
     expect(await persist(JOB)).toBe(true);
     expect(renameAttempts.length).toBe(1);
+  });
+
+  it("commitDone CHECKS the persist result — the primary fix, and nothing else here sees it", async () => {
+    // Review finding: every other test in this file calls persistDownloadJob
+    // directly, so removing commitDone's check and its warning left them all
+    // green. commitDone is a closure inside downloadModelJob and cannot be
+    // driven without a whole download, so the honest instrument is the source —
+    // bounded to the function, and asserting the PROPERTY (the result is
+    // consumed) rather than an exact spelling.
+    const src = readFileSync(
+      new URL("../../services/download-jobs.ts", import.meta.url),
+      "utf8",
+    );
+    const start = src.indexOf("const commitDone = (");
+    expect(start).toBeGreaterThan(0);
+    const open = src.indexOf("{", src.indexOf("=>", start));
+    let depth = 0;
+    let end = open;
+    for (let i = open; i < src.length; i++) {
+      if (src[i] === "{") depth++;
+      else if (src[i] === "}" && --depth === 0) {
+        end = i;
+        break;
+      }
+    }
+    const body = src.slice(open, end);
+
+    // The bare, result-discarding call is exactly the defect.
+    expect(body).not.toMatch(/^\s*persistJobRecord\(job\);\s*$/m);
+    // The result must be consumed in a condition...
+    expect(body).toMatch(/if \(!persistJobRecord\(job\)[\s\S]{0,80}\)/);
+    // ...and the failure must say something, or it is silent again.
+    expect(body).toMatch(/logger\.warn\(/);
   });
 
   it("a published record reads back as the terminal state", async () => {
