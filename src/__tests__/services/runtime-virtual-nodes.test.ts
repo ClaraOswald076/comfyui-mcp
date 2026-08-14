@@ -179,6 +179,19 @@ describe("a Get/Set bus node is not an unknown runtime (#1400)", () => {
     expect(r.apiNodes).toContain("GetNode");
   });
 
+  it("bus nodes leave the DENOMINATOR too — one API node beside a bus is 'api', not 'mixed'", async () => {
+    // The ratio decides "api" vs "mixed". A virtual node is not classifiable in either
+    // direction, so counting it as classifiable makes an all-paid workflow read as
+    // partly local — the same arithmetic #1372 fixed for Notes, which the Get/Set half
+    // would otherwise reintroduce. (Mutation testing found nothing covered this.)
+    const r = await checkWorkflowRuntime(
+      graphOf("FluxProImageNode", "GetNode", "SetNode"),
+      depsWith({ FluxProImageNode: API_NODE }),
+    );
+    expect(r.runtime).toBe("api");
+    expect(r.usesApiNodes).toBe(true);
+  });
+
   it("rgthree's canvas-only nodes are still UNKNOWN — cautious, and deliberately so", async () => {
     // The rest of #1400's population (Label, Fast Groups Bypasser/Muter) is NOT covered.
     // The converter does not strip them, so nothing here can prove they never execute, and
