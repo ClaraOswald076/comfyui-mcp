@@ -691,6 +691,9 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
   // an orchestrator that died some time ago, and that is answerable at once).
   const LIVENESS_PROBE_MS = 1_000;
   let nextLivenessProbe = 0;
+  /** `pid@startedAt` of a dead+stale lock seen on the PREVIOUS probe. The fast
+   *  path fires only when the next probe sees the same one — see below. */
+  let deadOwnerCandidate: string | undefined;
 
   for (;;) {
     try {
@@ -916,7 +919,29 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
       if (Date.now() >= nextLivenessProbe) {
         nextLivenessProbe = Date.now() + LIVENESS_PROBE_MS;
         const early = observePanelLock(path);
-        if (early?.alive === false && early.ageMs >= STALE_LOCK_MS) {
+        // TWO CONSISTENT OBSERVATIONS, a probe interval apart (review finding).
+        //
+        // One reading is not enough to cut a wait short. Between observing a
+        // dead+stale lock and raising the refusal, another process can release
+        // and a third can take a FRESH one at the same path — and we would then
+        // reject a legitimate current holder while asserting its owner is dead.
+        // The deadline path does not have this problem: by then the full budget
+        // is spent and the refusal is owed regardless of what sits there now.
+        //
+        // Identity is `pid + startedAt` from the record, not the path. A
+        // replacement changes it and resets the candidate, so the fast path only
+        // fires on a lock that was demonstrably the same one for a full probe
+        // interval. It cannot close the window absolutely — nothing short of an
+        // atomic take can — but it converts "one glance" into "unchanged across
+        // a second", and the failure it protects is a false refusal, never a
+        // deletion.
+        const fingerprint =
+          early && early.alive === false && early.ageMs >= STALE_LOCK_MS
+            ? `${String(early.pid)}@${String(early.startedAt)}`
+            : undefined;
+        const confirmed = fingerprint !== undefined && fingerprint === deadOwnerCandidate;
+        deadOwnerCandidate = fingerprint;
+        if (confirmed && early) {
           throw new Error(
             `The panel operation lock at ${path} is held by a process that is no longer ` +
               `running. ${describeObservedLock(path, early)} Not waiting out the remaining ` +

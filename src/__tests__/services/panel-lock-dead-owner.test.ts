@@ -15,6 +15,13 @@
 //               been recycled → keep waiting. Treating this as dead is the
 //               existence-for-identity fold `pidLiveness` exists to prevent.
 //   true      — a real operation may still be running → keep waiting.
+//
+// NOTE ON ASSERTIONS: the fast path is identified by "Not waiting out the
+// remaining timeout", NOT by "is no longer running". The ORDINARY timeout
+// message contains that phrase too (describeObservedLock composes it), so
+// keying on it cannot tell the two paths apart in EITHER direction — every
+// assertion in this file was written that way at first, which made the
+// positives weak and one negative outright wrong.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -77,7 +84,7 @@ describe("#1489 a provably dead lock owner is reported at once", () => {
     }).catch((e: Error) => e);
     const elapsed = Date.now() - started;
 
-    expect((err as Error).message).toMatch(/no longer\s+running/i);
+    expect((err as Error).message).toMatch(/Not waiting out the remaining timeout/i);
     expect(elapsed).toBeLessThan(5_000);
   });
 
@@ -121,7 +128,7 @@ describe("#1489 a provably dead lock owner is reported at once", () => {
     const elapsed = Date.now() - started;
 
     expect((err as Error).message).toMatch(/Timed out/i);
-    expect((err as Error).message).not.toMatch(/no longer\s+running/i);
+    expect((err as Error).message).not.toMatch(/Not waiting out the remaining timeout/i);
     // It waited the budget rather than short-circuiting.
     expect(elapsed).toBeGreaterThanOrEqual(1_000);
   });
@@ -136,7 +143,7 @@ describe("#1489 a provably dead lock owner is reported at once", () => {
     }).catch((e: Error) => e);
 
     expect((err as Error).message).toMatch(/Timed out/i);
-    expect((err as Error).message).not.toMatch(/no longer\s+running/i);
+    expect((err as Error).message).not.toMatch(/Not waiting out the remaining timeout/i);
   });
 
   it("an uninspectable lock keeps waiting — a bad read is not proof of death", async () => {
@@ -145,10 +152,81 @@ describe("#1489 a provably dead lock owner is reported at once", () => {
     writeFileSync(join(dir, "panel-op.lock"), "not json at all");
     const { withPanelMutationLock } = await lockModule();
 
+    const started = Date.now();
     const err = await withPanelMutationLock(async () => "unreachable", {
       timeoutMs: 1_200,
     }).catch((e: Error) => e);
+    const elapsed = Date.now() - started;
 
-    expect((err as Error).message).not.toMatch(/no longer\s+running/i);
+    // Asserting only the ABSENCE of a phrase would pass on any early unrelated
+    // error, proving nothing about waiting (review finding). Assert the positive
+    // outcome and the elapsed time.
+    expect((err as Error).message).toMatch(/Timed out/i);
+    expect((err as Error).message).not.toMatch(/Not waiting out the remaining timeout/i);
+    expect(elapsed).toBeGreaterThanOrEqual(1_000);
+  });
+
+  it("a FRESH lock with a dead owner is NOT fast-failed, however long we wait", async () => {
+    // The age gate. `reclaimAbandonedPanelLock` refuses on AGE before it ever
+    // consults a pid, and this module must not hold a second opinion about what
+    // freshness means. The budget is long enough for several probes, so a
+    // missing age gate would fire here rather than hide behind a short timeout —
+    // which is exactly how mutation M3 slipped through a first version of these
+    // tests once the two-observation rule slowed the fast path down.
+    writeLock(DEAD_PID, 60_000); // a minute old: dead owner, but FRESH
+    const { withPanelMutationLock } = await lockModule();
+
+    const err = await withPanelMutationLock(async () => "unreachable", {
+      timeoutMs: 2_500,
+    }).catch((e: Error) => e);
+
+    expect((err as Error).message).toMatch(/Timed out/i);
+    expect((err as Error).message).not.toMatch(/Not waiting out the remaining timeout/i);
+  });
+
+  it("a DIFFERENT dead lock at the same path restarts the two-observation count", async () => {
+    // Identity, not merely "something dead is there". If the fingerprint ignored
+    // pid/startedAt, probe 2 would confirm the FIRST lock's observation against
+    // a second, unrelated one and fast-fail a full interval early.
+    //
+    // Correct: probe1 sees A, probe2 sees B (candidate resets), probe3 confirms
+    // B — so the refusal lands near 2 s, not 1 s. The elapsed bound is what
+    // separates the two behaviours.
+    writeLock(DEAD_PID, 20 * 60_000);
+    const { withPanelMutationLock } = await lockModule();
+    const swap = setTimeout(() => writeLock(DEAD_PID - 1, 20 * 60_000), 400);
+
+    const started = Date.now();
+    const err = await withPanelMutationLock(async () => "unreachable", {
+      timeoutMs: 8_000,
+    }).catch((e: Error) => e);
+    const elapsed = Date.now() - started;
+    clearTimeout(swap);
+
+    expect((err as Error).message).toMatch(/Not waiting out the remaining timeout/i);
+    expect(elapsed).toBeGreaterThanOrEqual(1_800);
+  });
+
+  it("a lock REPLACED between probes resets the candidate and is not fast-failed", async () => {
+    // The TOCTOU the two-observation rule exists for: a dead+stale lock is seen,
+    // then a different holder takes the path before the next probe. Refusing on
+    // the stale reading would reject a legitimate current holder while claiming
+    // its owner is dead.
+    writeLock(DEAD_PID, 20 * 60_000);
+    const { withPanelMutationLock } = await lockModule();
+
+    // Swap in a LIVE, fresh lock BETWEEN the two probes. The first fires
+    // immediately and the second one probe-interval (1 s) later, so the swap has
+    // to land inside that window — at 1_200 ms it arrived after the fast path
+    // had already confirmed and thrown at ~1 s.
+    const swap = setTimeout(() => writeLock(process.pid, 1_000), 400);
+
+    const err = await withPanelMutationLock(async () => "unreachable", {
+      timeoutMs: 3_000,
+    }).catch((e: Error) => e);
+    clearTimeout(swap);
+
+    expect((err as Error).message).toMatch(/Timed out/i);
+    expect((err as Error).message).not.toMatch(/Not waiting out the remaining timeout/i);
   });
 });
