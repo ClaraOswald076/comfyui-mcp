@@ -338,19 +338,29 @@ the work and feeds Pusa an off-cadence, harder-to-match conditioning clip.
 
 ## Get it running
 
-Pusa doesn't ship a dedicated installer pack yet — but it doesn't need one. It
-reuses the WanVideoWrapper + KJNodes + VideoHelperSuite stack and the WAN 2.2 T2V
-A14B models that the **[`wan-longer-videos` pack](https://github.com/artokun/comfyui-mcp/tree/main/packs/wan-longer-videos)**
-already installs. So the path is:
+Pusa has a dedicated pack —
+**[`wan-pusa-extend`](https://github.com/artokun/comfyui-mcp/tree/main/packs/wan-pusa-extend)** —
+and it is self-contained: the WanVideoWrapper + KJNodes + VideoHelperSuite nodes, the
+WAN 2.2 T2V A14B HIGH/LOW **fp8** checkpoints, both Pusa V1 LoRAs, the umt5-xxl
+encoder, the WAN 2.1 VAE, and the lightx2v distill LoRA. Nothing to place by hand.
 
 1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the
-   [Panel](../panel), and apply the `wan-longer-videos` pack — that lands the nodes
-   and the shared T2V A14B stack. **Don't re-download the big models.**
-2. Grab the **two Pusa V1 LoRAs** from `Kijai/WanVideo_comfy/Pusa/` into
-   `models/loras/`.
-3. Open the [Panel](../panel) and let the panel's agent load kijai's extension graph,
-   re-point the model/VAE/LoRA dropdowns, set `merge_loras=false`, and tune the
-   noise ramp for you — conversationally, with full undo and no extra API keys.
+   [Panel](../panel) — then start the agent with `npx -y comfyui-mcp@latest connect`
+   and click **Connect** in the panel (no API keys; sign in with `claude` once).
+2. Apply the pack: `apply_manifest --path packs/wan-pusa-extend/manifest.yaml`. It
+   lands the nodes and every model above in the right folders, and ships the graph
+   pre-wired — `flowmatch_pusa`, `merge_loras=false`, the ColorMatchV2 seam regrade,
+   and `attention_mode=sdpa` so it runs without SageAttention/triton.
+3. Open the [Panel](../panel) and drive the graph from your own Claude session — load
+   your clip, tune the noise ramp, iterate on the tail conversationally, with full
+   undo and no extra API keys.
+
+<Warning>
+Don't substitute the `wan-longer-videos` pack here. It ships the **GGUF** A14B experts
+for the ComfyUI-GGUF loader stack; the Pusa graph is built on WanVideoWrapper and wants
+the **fp8 `..._KJ.safetensors`** checkpoints. They are different files on a different
+node stack — mixing them leaves you re-pointing every loader by hand.
+</Warning>
 
 That's the whole point of the project: expert ComfyUI setups that drive themselves
 from your own agent session. For the model underneath this whole pipeline, read the
