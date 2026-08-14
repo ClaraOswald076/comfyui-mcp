@@ -3257,8 +3257,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     // transfers exist by then. Scoped to the tab this change belongs to, matching the
     // retry nudge below — the transfers are global (every tab's child is replaced), so
     // it must be reported once rather than once per tab.
-    manager.armCredentialRespawnOrphanWatch(change.tabId ?? null);
-    const tally = manager.restartAllForMcpEnv();
+    const tally = manager.restartAllForMcpEnvAfterCredentialChange(change.tabId ?? null);
     // NUDGE only the tab whose panel_request_secret this change answers — a
     // Settings slot save, a background token (re)load, or a revoke leaves
     // `requested` false and nudges nothing. The per-tab pending-restart map

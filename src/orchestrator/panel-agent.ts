@@ -2412,10 +2412,48 @@ export class PanelAgentManager {
    * `null` means "no particular tab" (a Settings-slot save): the first tab to restart
    * carries it. Either way it is consumed once.
    */
-  armCredentialRespawnOrphanWatch(tabId: string | null): void {
-    this.credentialOrphanWatch = { tab: tabId };
+  /**
+   * The credential-save respawn: restart every tab's comfyui child AND watch for what that
+   * kills. One call rather than arm-then-restart, deliberately.
+   *
+   * Arming separately left a window that review's leak finding lives in: a watch created by
+   * one call and bound by a LATER `restartAllForMcpEnv` would attach itself to whatever
+   * tabs that later, unrelated respawn happened to queue. Creating and binding it in the
+   * same call means a watch can never outlive the save that made it — if this save queues
+   * nothing, it dies here.
+   */
+  restartAllForMcpEnvAfterCredentialChange(tabId: string | null): McpEnvRestartTally {
+    this.credentialOrphanWatch = { tab: tabId, awaiting: new Set() };
+    const tally = this.restartAllForMcpEnv();
+    // An idle tab consumed it inside that call; otherwise bind it to exactly the tabs that
+    // still owe a restart, and drop it when there are none.
+    if (this.credentialOrphanWatch) {
+      const awaiting = this.liveKeys().filter((k) => this.pendingMcpRestart.has(k));
+      if (awaiting.length === 0) this.credentialOrphanWatch = null;
+      else this.credentialOrphanWatch.awaiting = new Set(awaiting);
+    }
+    return tally;
   }
-  private credentialOrphanWatch: { tab: string | null } | null = null;
+  /**
+   * `tab` is who it is for; `awaiting` is what keeps it from LEAKING (review, P1).
+   *
+   * Consuming it only on delivery is not enough: a save that queues no restart at all — no
+   * managed tabs — or whose named tab disappears before its restart runs would leave this
+   * armed forever, and the next unrelated mcp-env respawn would then present a stale
+   * "a credential was saved earlier" note. `awaiting` is the exact set of tabs this save
+   * queued; the watch dies when that set empties, whether or not anything was delivered.
+   */
+  private credentialOrphanWatch: { tab: string | null; awaiting: Set<string> } | null = null;
+
+  /** #1567 — this tab will never deliver the armed watch (its restart is being dropped).
+   *  When nothing is left that could, the watch dies rather than waiting for a respawn it
+   *  has no relationship to. */
+  private releaseOrphanWatch(tabId: string): void {
+    const watch = this.credentialOrphanWatch;
+    if (!watch) return;
+    watch.awaiting.delete(tabId);
+    if (watch.awaiting.size === 0) this.credentialOrphanWatch = null;
+  }
 
   /** #1567 — what this respawn is about to orphan, enumerated NOW rather than at save
    *  time. Never throws: a rebuild that fails because its warning failed is strictly
@@ -2447,6 +2485,8 @@ export class PanelAgentManager {
       this.pendingEffortRestart.delete(tabId);
       this.pendingMcpRestart.delete(tabId);
       this.pendingRetargetFrom.delete(tabId);
+      // #1567 — this restart is being dropped, so it will never deliver an armed watch.
+      this.releaseOrphanWatch(tabId);
       return "no-agent";
     }
     // Still mid-work (a queued message will start the next turn) — wait for the
@@ -2976,6 +3016,9 @@ export class PanelAgentManager {
   private unbindAgent(key: string, opts: { dropHeldMail: boolean; reason: string }): PanelAgent | undefined {
     const agent = this.agents.get(key);
     this.agents.delete(key);
+    // #1567 — this tab can no longer deliver an armed orphan watch. The single choke point
+    // for removal, so a retire/reset cannot strand one waiting on a tab that is gone.
+    this.releaseOrphanWatch(key);
     this.detachHeldCompletions(key, opts.reason);
     if (opts.dropHeldMail) this.heldMessages.delete(key);
     return agent;

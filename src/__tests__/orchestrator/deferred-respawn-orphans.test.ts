@@ -150,8 +150,7 @@ describe("a DEFERRED respawn reaches the note (#1567)", () => {
 
     // BUSY, so this respawn is genuinely DEFERRED — the path whose damage the save-time
     // snapshot cannot see. It reports "scheduled", not "applied".
-    manager.armCredentialRespawnOrphanWatch(tab);
-    const tally = manager.restartAllForMcpEnv();
+    const tally = manager.restartAllForMcpEnvAfterCredentialChange(tab);
     expect(tally.scheduled, "the respawn must be queued, not applied").toBe(1);
     expect(tally.applied).toBe(0);
 
@@ -203,8 +202,8 @@ describe("a DEFERRED respawn reaches the note (#1567)", () => {
     manager.send("tab-b", "hello");
     await waitFor(() => backend.runCount >= 2 && backend.turnTexts.length >= 2);
 
-    manager.armCredentialRespawnOrphanWatch(null); // a Settings save: no particular tab
-    expect(manager.restartAllForMcpEnv().scheduled).toBe(2);
+    // A Settings-slot save: no particular tab.
+    expect(manager.restartAllForMcpEnvAfterCredentialChange(null).scheduled).toBe(2);
 
     backend.autoComplete = true;
     backend.release(); // releases BOTH held turns
@@ -234,8 +233,7 @@ describe("a DEFERRED respawn reaches the note (#1567)", () => {
     manager.send("tab-b", "hello from b");
     await waitFor(() => backend.runCount >= 2 && backend.turnTexts.length >= 2);
 
-    manager.armCredentialRespawnOrphanWatch("tab-b");
-    expect(manager.restartAllForMcpEnv().scheduled).toBe(2);
+        expect(manager.restartAllForMcpEnvAfterCredentialChange("tab-b").scheduled).toBe(2);
 
     backend.autoComplete = true;
     backend.release();
@@ -252,6 +250,66 @@ describe("a DEFERRED respawn reaches the note (#1567)", () => {
     expect(carrying[0].run, "the note belongs to the tab the credential was saved on").toBe(4);
   });
 
+  it("an armed watch that nothing can deliver does NOT survive to a later restart", async () => {
+    // Review, P1. Consuming on delivery alone leaks: a save with no managed tabs queues
+    // nothing, so nothing ever consumes the watch, and the next unrelated mcp-env respawn
+    // — a retarget, a base_path recovery — would present a stale "a credential was saved
+    // earlier" note about transfers it had no part in killing.
+    atRisk.jobs = [{ id: "j1", filename: "flux-dev.safetensors", bytes: 4_000_000_000 }];
+    const backend = new RecordingBackend();
+    const manager = makeManager(backend);
+
+    // Armed with NO tabs alive: nothing to queue, nothing to deliver it.
+        expect(manager.restartAllForMcpEnvAfterCredentialChange(null).live).toBe(0);
+
+    // A completely unrelated restart, later, on a tab that did not exist at save time.
+    backend.autoComplete = false;
+    manager.send("tab-later", "hello");
+    await waitFor(() => backend.runCount >= 1 && backend.turnTexts.length >= 1);
+    manager.restartAllForMcpEnv(); // e.g. a retarget — never armed
+    backend.autoComplete = true;
+    backend.release();
+    await waitFor(() => backend.runCount >= 2);
+    await new Promise((r) => setTimeout(r, 120));
+
+    expect(backend.turnTexts.filter((t) => t.includes("flux-dev.safetensors"))).toHaveLength(0);
+  });
+
+  it("a watch whose tab disappears does not wait around for an unrelated respawn", async () => {
+    // Review, P1, second half. The tab the watch names can be retired before its queued
+    // restart ever runs, so nothing reaches the delivery site to consume it. Without a
+    // release on removal the watch would sit armed and attach to whatever respawn came
+    // next — presenting a stale "a credential was saved earlier" note in a conversation
+    // that had nothing to do with it.
+    atRisk.jobs = [{ id: "j1", filename: "flux-dev.safetensors", bytes: 4_000_000_000 }];
+    const backend = new RecordingBackend();
+    backend.autoComplete = false;
+    const manager = makeManager(backend);
+
+    // Armed with NO tab — a Settings-slot save. This is the case that actually leaks: a
+    // tab-scoped watch is already refused by the tab check, so it would pass this test
+    // whether or not removal released anything. A null watch matches ANY tab, so only the
+    // release keeps it from landing on a stranger.
+    manager.send("tab-doomed", "hello");
+    await waitFor(() => backend.runCount >= 1 && backend.turnTexts.length >= 1);
+    expect(manager.restartAllForMcpEnvAfterCredentialChange(null).scheduled).toBe(1);
+
+    // The tab goes away before its queued restart can run.
+    manager.retire("tab-doomed");
+    expect(manager.liveKeys()).not.toContain("tab-doomed");
+
+    // A later, unrelated respawn on a different tab must stay quiet.
+    manager.send("tab-other", "hello again");
+    await waitFor(() => backend.runCount >= 2);
+    manager.restartAllForMcpEnv();
+    backend.autoComplete = true;
+    backend.release();
+    await waitFor(() => backend.runCount >= 3);
+    await new Promise((r) => setTimeout(r, 120));
+
+    expect(backend.turnTexts.filter((t) => t.includes("flux-dev.safetensors"))).toHaveLength(0);
+  });
+
   it("stays silent when the respawn orphans nothing", async () => {
     // The direction that fails quietly: a note pushed unconditionally would still pass the
     // test above, while costing a real agent turn on every env respawn. A nudge is a turn,
@@ -264,8 +322,7 @@ describe("a DEFERRED respawn reaches the note (#1567)", () => {
 
     manager.send(tab, "hello");
     await waitFor(() => backend.runCount >= 1 && backend.turnTexts.length >= 1);
-    manager.armCredentialRespawnOrphanWatch(tab);
-    expect(manager.restartAllForMcpEnv().scheduled).toBe(1);
+        expect(manager.restartAllForMcpEnvAfterCredentialChange(tab).scheduled).toBe(1);
 
     backend.autoComplete = true;
     backend.release();
@@ -285,8 +342,12 @@ describe("a DEFERRED respawn reaches the note (#1567)", () => {
 
     manager.send(tab, "hello");
     await waitFor(() => backend.runCount >= 1 && backend.turnTexts.length >= 1);
-    manager.armCredentialRespawnOrphanWatch(tab);
+    // A per-request retry nudge is queued FIRST (#164), then the credential respawn lands
+    // on top of it — the real ordering, since the secrets subscriber restarts silently and
+    // nudges the requesting tab separately. The orphan note must join that nudge, not
+    // replace it.
     manager.restartAllForMcpEnv("RETRY the download");
+    manager.restartAllForMcpEnvAfterCredentialChange(tab);
 
     backend.autoComplete = true;
     backend.release();
