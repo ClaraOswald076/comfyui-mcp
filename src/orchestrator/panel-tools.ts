@@ -4186,6 +4186,39 @@ async function unreadableOrHealed(
 function panelTooOldNote(ctx: PanelToolCtx): string {
   try {
     const v = ctx.bridge?.panelTooOldForReplyUuid?.(ctx.tabId);
+    // #1560 — A PANEL TOO OLD TO HELP IS ALSO TOO OLD TO SAY SO.
+    //
+    // The note below needs an advertised version, and `panel_version` has only
+    // ridden the hello since panel v0.11.83. So the panels most likely to be
+    // causing this deadlock — anything below 0.11.45 — cannot report it, and the
+    // reporter of #1560 (on 0.11.37, after two Manager self-updates of the pack
+    // crashed) got a bare "the panel did not answer" with nothing to act on.
+    //
+    // Deliberately WEAKER than the version case, and weaker still after review: an
+    // absent version proves only "below 0.11.83", NOT "below the minimum". Panels
+    // in 0.11.45–0.11.82 publish the reply uuid and simply predate version
+    // advertisement, so this must read as SOMETHING TO CHECK and never as a finding
+    // — naming a cause that is not theirs is the failure this whole cluster exists
+    // to avoid.
+    if (v?.neverAdvertised) {
+      return (
+        `
+
+WORTH CHECKING — THE PANEL'S VERSION IS UNKNOWN HERE: this session's panel has never ` +
+        `reported its version, and panels have advertised one on connect since 0.11.83, so ` +
+        `this one is older than that. That does NOT by itself mean it is too old: a panel ` +
+        `reports the new workflow's identity ON THE REPLY from ${v.needed} onwards, and ` +
+        `0.11.45–0.11.82 do that while still not advertising a version. But if it IS below ` +
+        `${v.needed}, that is the whole cause of this failure rather than anything about this ` +
+        `workflow — on ${v.needed}+ the command that re-pointed the canvas repairs the fence ` +
+        `from its own reply and never makes the read that just failed. ` +
+        `Find out with install_comfyui (action:"panel", panel_action:"status"). If it is ` +
+        `older, update with install_comfyui (action:"panel", panel_action:"sync"), restart ` +
+        `ComfyUI, and HARD-REFRESH the browser tab (Ctrl+Shift+R) — a pack update that ` +
+        `ComfyUI-Manager reported as FAILED leaves the old panel JS running in the open tab, ` +
+        `so a restart alone does not pick it up.`
+      );
+    }
     if (!v?.tooOld) return "";
     return (
       `
