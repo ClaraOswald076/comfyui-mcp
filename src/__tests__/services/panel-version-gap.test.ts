@@ -150,6 +150,21 @@ describe("the rebind failure message carries the version gap (#1043)", () => {
     expect(r.tooOld).toBe(false);
   });
 
+  it("an UNRESOLVABLE tab is not narrated as an old panel (review, P1)", async () => {
+    // resolveTarget throwing leaves version undefined, which is indistinguishable
+    // from "never sent one" unless the lookup's own success is tracked. Without
+    // that, a CURRENT panel whose socket closed mid-command would be told to
+    // update — a false accusation built from a failed observation.
+    const { UiBridge } = await import("../../services/ui-bridge.js");
+    const b = new UiBridge(0) as UiBridge & { resolveTarget: () => never };
+    b.resolveTarget = () => {
+      throw new Error("no such tab");
+    };
+    const r = b.panelTooOldForReplyUuid("ghost");
+    expect(r.neverAdvertised, "an unreadable tab proves nothing about the panel").toBeUndefined();
+    expect(r.tooOld).toBe(false);
+  });
+
   it("the never-advertised note hedges, and names a reader that can answer", async () => {
     const { readFileSync } = await import("node:fs");
     const src = readFileSync(
@@ -162,9 +177,13 @@ describe("the rebind failure message carries the version gap (#1043)", () => {
     // It must not assert a version it never saw.
     // Asserted on text that is CONTIGUOUS in source — the sentence spans a string
     // concatenation, so the full phrase never appears as one literal.
-    expect(body).toContain("has never reported its");
-    expect(body).toMatch(/OLDER than/);
-    expect(body).toMatch(/very likely/, "a hedge, because this is inferred from an absent field");
+    expect(body).toContain("has never ");
+    // Review, P1: an absent version proves only "below 0.11.83". Panels in
+    // 0.11.45–0.11.82 publish the reply uuid and simply do not advertise, so the
+    // note must NOT conclude they are too old — it must say what to check.
+    expect(body).toMatch(/does NOT by itself mean it is too old/i);
+    expect(body).toMatch(/0.11.45–0.11.82 do that while still not advertising/);
+    expect(body).toMatch(/WORTH CHECKING/);
     // The remedy must name tools that exist — a citation nobody can run reads as
     // the answer while being a dead end.
     expect(body).toMatch(/panel_action:"status"/);

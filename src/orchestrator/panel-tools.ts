@@ -4194,25 +4194,29 @@ function panelTooOldNote(ctx: PanelToolCtx): string {
     // reporter of #1560 (on 0.11.37, after two Manager self-updates of the pack
     // crashed) got a bare "the panel did not answer" with nothing to act on.
     //
-    // Deliberately WEAKER wording than the version case: this is inferred from a
-    // field that is absent, not from a comparison, so it says "older than" and
-    // "very likely" rather than asserting a version. It also names the check, so
-    // a reader can confirm rather than take it on faith.
+    // Deliberately WEAKER than the version case, and weaker still after review: an
+    // absent version proves only "below 0.11.83", NOT "below the minimum". Panels
+    // in 0.11.45–0.11.82 publish the reply uuid and simply predate version
+    // advertisement, so this must read as SOMETHING TO CHECK and never as a finding
+    // — naming a cause that is not theirs is the failure this whole cluster exists
+    // to avoid.
     if (v?.neverAdvertised) {
       return (
         `
 
-WHY THIS READ WAS NEEDED AT ALL: this session's panel has never reported its ` +
-        `version. Panels have advertised one on connect since 0.11.83, so a panel that ` +
-        `reports none is OLDER than that — and therefore older than ${v.needed}, from which ` +
-        `a panel reports the new workflow's identity ON THE REPLY. From ${v.needed}+ the ` +
-        `command that re-pointed the canvas repairs the fence from its own reply and never ` +
-        `makes this read, so an outdated panel is very likely the whole cause here rather ` +
-        `than anything about this workflow. Check it with install_comfyui (action:"panel", ` +
-        `panel_action:"status"); update with install_comfyui (action:"panel", ` +
-        `panel_action:"sync"), then restart ComfyUI and ` +
-        `HARD-REFRESH the browser tab (Ctrl+Shift+R) — a pack update that ComfyUI-Manager ` +
-        `reported as failed leaves the OLD panel JS running in the open tab.`
+WORTH CHECKING — THE PANEL'S VERSION IS UNKNOWN HERE: this session's panel has never ` +
+        `reported its version, and panels have advertised one on connect since 0.11.83, so ` +
+        `this one is older than that. That does NOT by itself mean it is too old: a panel ` +
+        `reports the new workflow's identity ON THE REPLY from ${v.needed} onwards, and ` +
+        `0.11.45–0.11.82 do that while still not advertising a version. But if it IS below ` +
+        `${v.needed}, that is the whole cause of this failure rather than anything about this ` +
+        `workflow — on ${v.needed}+ the command that re-pointed the canvas repairs the fence ` +
+        `from its own reply and never makes the read that just failed. ` +
+        `Find out with install_comfyui (action:"panel", panel_action:"status"). If it is ` +
+        `older, update with install_comfyui (action:"panel", panel_action:"sync"), restart ` +
+        `ComfyUI, and HARD-REFRESH the browser tab (Ctrl+Shift+R) — a pack update that ` +
+        `ComfyUI-Manager reported as FAILED leaves the old panel JS running in the open tab, ` +
+        `so a restart alone does not pick it up.`
       );
     }
     if (!v?.tooOld) return "";
