@@ -39,6 +39,21 @@ const PACKS = path.join(ROOT, 'packs');
 const MODEL_EXT = /\.(gguf|safetensors|pth|ckpt|pt|onnx)$/i;
 const FILENAME = /[A-Za-z0-9][A-Za-z0-9._-]*\.(?:gguf|safetensors|pth|ckpt|pt|onnx)/g;
 
+/**
+ * Installer scripts, checked the same way and for the same reason.
+ *
+ * `wan-2.2-comfyui` and `wan-transparent-comfyui` both told readers to run
+ * `WAN2_2-ULTRA-MODELS-NODES_INSTALL.bat`. No such file has ever existed in this repo; the
+ * packs ship `install-windows.bat` / `install-runpod.sh`. A reader following the quickstart
+ * hit a filename that isn't there.
+ *
+ * Scoped to fenced code only — NOT tables, NOT prose. A fence is where a post says "type
+ * this", so the file must exist. Prose is where a post can legitimately discuss a
+ * third-party script it does not ship, which is exactly what the SageAttention helper in
+ * `wan-animate-comfyui` turned out to be.
+ */
+const SCRIPT = /[A-Za-z0-9][A-Za-z0-9._-]*\.(?:bat|sh|ps1)/g;
+
 /** Every pack a post could be talking about, by name -> the text that proves what it ships. */
 function loadPacks() {
   const packs = new Map();
@@ -80,8 +95,9 @@ function claimLines(src) {
       }
       continue;
     }
-    if (inFence) out.push([i + 1, line]);
-    else if (/^\s*\|.*\|/.test(line) && !/^\s*\|[\s|:-]*\|?\s*$/.test(line)) out.push([i + 1, line]);
+    if (inFence) out.push([i + 1, line, 'fence']);
+    else if (/^\s*\|.*\|/.test(line) && !/^\s*\|[\s|:-]*\|?\s*$/.test(line))
+      out.push([i + 1, line, 'table']);
   }
   return out;
 }
@@ -109,8 +125,29 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   if (!named.size) continue;
 
   const haystack = [...named].map((n) => packs.get(n)).join('\n');
+  // Scripts must EXIST as files in a pack the post documents — the pack text is irrelevant.
+  const shipped = new Set();
+  for (const n of named) {
+    for (const f of fs.readdirSync(path.join(PACKS, n))) shipped.add(f.toLowerCase());
+  }
+
   const seen = new Set();
-  for (const [lineNo, line] of claimLines(src)) {
+  for (const [lineNo, line, kind] of claimLines(src)) {
+    if (kind === 'fence') {
+      for (const raw of line.match(SCRIPT) ?? []) {
+        const key = `s:${raw}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        checked++;
+        if (!shipped.has(raw.toLowerCase())) {
+          failures++;
+          console.error(
+            `  ✗ blog/${file}:${lineNo}: tells the reader to run "${raw}", but no pack it ` +
+              `documents (${[...named].join(', ')}) ships that file`,
+          );
+        }
+      }
+    }
     for (const raw of line.match(FILENAME) ?? []) {
       if (!MODEL_EXT.test(raw)) continue;
       // A glob names a family, not a file — the post is describing a set, not promising one.
@@ -131,7 +168,7 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   }
 }
 
-console.log(`checked ${checked} model filename claim(s) against packs/`);
+console.log(`checked ${checked} model/script filename claim(s) against packs/`);
 if (failures) {
   console.error(
     `\n${failures} claim(s) do not match the pack. Either the post is stale — check what ` +

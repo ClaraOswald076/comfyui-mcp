@@ -127,12 +127,20 @@ apply_manifest --path packs/wan-animate/manifest.yaml
 # (the folder containing custom_nodes/ and models/)
 ```
 
-> **Required: SageAttention + Triton.** The WanVideoWrapper sampler needs them.
-> Run the bundled `install_triton_and_sageattention_auto.bat` from your portable
-> Python folder (`...\ComfyUI_windows_portable\python_embeded\`) **before your first
-> generate**. It detects your Torch/CUDA, installs `triton-windows` and the matching
-> woct0rdho SageAttention wheel, and drops the Python include/libs zip so Triton can
-> compile. Restart ComfyUI afterward, then load `workflow.json`.
+> **The shipped graph asks for SageAttention.** `WanVideoModelLoader` is set to
+> `attention_mode: sageattn`, which needs `triton-windows` plus a matching
+> SageAttention wheel in the Python that runs ComfyUI (on Windows portable, that is
+> `...\ComfyUI_windows_portable\python_embeded\`). **This pack does not install
+> them**, and it does not ship a script that does — if you have seen
+> `install_triton_and_sageattention_auto.bat` referenced, that is a third-party
+> community helper, not something included here.
+>
+> **You do not have to install either.** Set `attention_mode` to **`sdpa`** on the
+> `WanVideoModelLoader` node and the graph runs on stock PyTorch attention — slower
+> per step, no Triton, no wheel matching. That is a supported value on this exact
+> node; the [`wan-pusa-extend`](https://github.com/artokun/comfyui-mcp/tree/main/packs/wan-pusa-extend)
+> pack ships `sdpa` for the same reason. Switch to `sageattn` later if you want the
+> speed and have the toolchain working.
 
 Because the pack ships with the [plugin](../plugin), your **own Claude session can
 drive the live graph through the [Panel](../panel)** — load the reference image,
@@ -219,8 +227,10 @@ If you're already running our WAN stack, note that the WAN 2.2 T2V pack also shi
   from the matching CUDA index, e.g.
   `pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128`
   (use the `cuXXX` matching your driver).
-- **Triton/SageAttention errors at sampling.** Re-run
-  `install_triton_and_sageattention_auto.bat` from `python_embeded\` and restart.
+- **Triton/SageAttention errors at sampling.** Set `attention_mode` to `sdpa` on the
+  `WanVideoModelLoader` node and restart — that removes the dependency entirely and
+  costs only speed. Chasing a working Triton + SageAttention wheel pair is the harder
+  path, and nothing in this pack installs them for you.
 - **Masking is wrong / character not isolated.** The shipped workflow defaults to
   **SeC** (manual/prompted); the SAM2 auto path is muted. Pick the matching
   mask / background_image getter per the in-graph notes.
@@ -264,7 +274,7 @@ not a universal benchmark.
 
 1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — then start the agent with `npx -y comfyui-mcp@latest connect` and click **Connect** in the panel (no API keys; sign in with `claude` once).
 2. Apply the **`wan-animate` pack** — nodes + models land in the right folders, validated.
-3. Run `install_triton_and_sageattention_auto.bat`, restart, and load `workflow.json`.
+3. Restart and load `workflow.json`. If you don't have Triton + SageAttention set up, set `attention_mode` to `sdpa` on the `WanVideoModelLoader` node — slower, but no toolchain to install.
 4. Open the [Panel](../panel) and let the panel's agent load the image, point at the driving video, and iterate.
 
 That's the whole point of the project: expert ComfyUI setups that install in one

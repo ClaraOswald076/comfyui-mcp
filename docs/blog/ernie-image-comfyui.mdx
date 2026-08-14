@@ -109,11 +109,23 @@ with the same filenames as the third-party mirror.)
 
 If you grab the popular third-party installer, beware: **it's contaminated with
 Z-Image leftovers.** The upstream scripts are copy-pasted from a Z-Image pack —
-their headers literally say "Z-IMAGE-BASE" and they download Z-Image-only files
-(`z_image_turbo-*.gguf`, `Qwen3-4B-*.gguf`, `ae.safetensors`) that **ERNIE never
-uses**. Pull those by mistake and you waste disk and end up wiring the wrong VAE.
-**The comfyui-mcp `ernie` pack excludes them** — it installs only ERNIE's actual
-files (`ernie-image-turbo`, `ministral-3-3b`, `flux2-vae`, and the optional enhancer).
+their headers literally say "Z-IMAGE-BASE" and they download Z-Image files
+(`z_image_turbo-*.gguf`, `Qwen3-4B-*.gguf`, `ae.safetensors`) while wiring **none**
+of them. You pay the disk and can end up pointing at the wrong VAE.
+
+Which pack you want depends on whether you actually want the combos:
+
+| pack | pulls Z-Image models? | why |
+|---|---|---|
+| **`ernie-txt2img`** | **no** | pure ERNIE text-to-image — this is the "ERNIE-only" install |
+| **`ernie-img2img`** | **no** | pure ERNIE image-to-image |
+| `ernie` (monolith) | **yes**, deliberately | 10 of its 20 groups are ERNIE↔Z-Image combo pipelines, and they load those models |
+| `ernie-combo` | **yes**, deliberately | it *is* the combo pipeline |
+
+The difference from the third-party installer isn't the file list — it's that when a
+comfyui-mcp pack downloads `z_image_turbo-Q8_0.gguf`, a group in the graph loads it.
+Nothing lands unused. If you want ERNIE and nothing else, take `ernie-txt2img` rather
+than the monolith.
 
 ### The fast way — comfyui-mcp + the Panel
 
@@ -121,8 +133,8 @@ Untangling that installer by hand is exactly the busywork the
 [comfyui-mcp](https://github.com/artokun/comfyui-mcp) **`ernie` pack** removes. One
 declarative manifest installs the custom nodes (ComfyUI-GGUF, rgthree, KJNodes,
 essentials, RES4LYF, and friends) and pulls every model to the correct folder —
-ERNIE-only, no Z-Image cruft — and the same manifest drives both an MCP-native
-install and the generated double-click scripts:
+every file it downloads is one the graph loads — and the same manifest drives both an
+MCP-native install and the generated double-click scripts:
 
 ```bash
 # MCP-native (from a Claude Code session, with COMFYUI_PATH set)

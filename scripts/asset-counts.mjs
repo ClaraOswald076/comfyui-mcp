@@ -187,6 +187,9 @@ const CLAIMS = [
   // written.
   { file: "README.md", key: "skills", re: /(\d+) skills total/ },
   { file: "docs/index.mdx", key: "mcp_tools", re: /(\d+)\+? tools, auto-documented/ },
+  // The blog drifts the same way the README did. local-llms-comfyui said "roughly 200 tools"
+  // — five times the real surface — because the consolidation landed and the post didn't move.
+  { file: "docs/blog/local-llms-comfyui.mdx", key: "mcp_tools", re: /MCP server exposes \*\*(\d+) tools\*\*/ },
 ];
 
 const c = await counts();
