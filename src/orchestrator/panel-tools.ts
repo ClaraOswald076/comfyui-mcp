@@ -11720,12 +11720,19 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
     ),
     def(
       "panel_install_node",
-      "Install a custom-node pack into the user's ComfyUI via the BUILT-IN Manager (queues the install). Pass `id` (registry id like 'comfyui-kjnodes' or 'author/repo') from panel_search_nodes, or `repository` (git URL) for a nightly install. A search result whose `id` IS a git URL (legacy/repository-style entries) is auto-routed to a from-source 'nightly' install — 'latest' cannot resolve for those. A ComfyUI restart (panel_restart_comfyui) is usually required afterward to load the nodes — poll panel_node_queue_status first. Prefer this over the headless install_custom_node tool. " +
+      "Install a custom-node pack into the user's ComfyUI via the BUILT-IN Manager (queues the install). Pass `id` (registry id like 'comfyui-kjnodes' or 'author/repo') from panel_search_nodes, or `repository` (git URL) for a nightly install. A search result whose `id` IS a git URL (legacy/repository-style entries) is auto-routed to a from-source 'nightly' install — 'latest' cannot resolve for those. " +
+        "⚠️ ON MANAGER v4, `repository` ONLY WORKS FOR A REPO THE MANAGER ALREADY KNOWS (#1539). Measured against Manager V4.2.2: a request carrying `repository` AND `selected_version:'nightly'` — the exact combination Manager's own schema documents as 'repository required if selected_version is nightly' — is still resolved by `id` against its registry, and an unlisted repo fails with \"Node '<name>@nightly' not found in [ManagerChannel.dev, ManagerDatabaseSource.cache]\". The URL is sent and recorded; v4 does not clone from it. This is an UPSTREAM limitation, not a missing field on our side. Manager 3.x installs an unlisted URL natively (a different request shape whose handler reads the URL directly), so the same call can succeed there and fail on v4. For an unlisted repo on v4, clone it into custom_nodes yourself and restart. " +
+        "A ComfyUI restart (panel_restart_comfyui) is usually required afterward to load the nodes — poll panel_node_queue_status first. Prefer this over the headless install_custom_node tool. " +
         "⚠️ QUEUE-DONE IS NOT INSTALLED: Manager marks a task 'done' (queue drained) even when the git clone produced NOTHING — an empty dir, a transient git failure, or a repo not in its registry. So after the queue is idle you MUST VERIFY with panel_list_nodes that each pack actually appears before you restart or report success; a pack you installed that is absent from that list did NOT install (retry it, or install it from its git `repository` URL). " +
         "Install packs ONE AT A TIME and confirm each populated before the next — batching several installs then restarting is exactly how you end up with empty dirs and a broken restart.",
       {
         id: z.string().optional().describe("Registry id or 'author/repo'."),
-        repository: z.string().optional().describe("Git URL (for a nightly/from-source install)."),
+        repository: z
+          .string()
+          .optional()
+          .describe(
+            "Git URL (for a nightly/from-source install). On Manager v4 this only installs a repo the Manager's registry already lists — an unlisted URL is rejected by id lookup despite this field (#1539, measured on V4.2.2).",
+          ),
         version: z.string().optional().describe("Specific version; default 'latest' (or 'nightly' with repository)."),
         channel: z.string().optional().describe("Manager channel (default 'default')."),
         mode: z.enum(["remote", "local", "cache"]).optional().describe("DB source (default 'remote')."),
