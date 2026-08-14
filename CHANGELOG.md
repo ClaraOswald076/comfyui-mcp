@@ -745,6 +745,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.48] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- bind the own-property test at load, not through the prototype
+- require an OWN property at every hop of the refusal claim
+- retry a PRE-EXECUTOR refusal, keyed on the field the panel publishes
+- wait out a reconnect refusal instead of handing it back
+
+
 ## [0.51.47] - 2026-08-14
 
 ### MCP
