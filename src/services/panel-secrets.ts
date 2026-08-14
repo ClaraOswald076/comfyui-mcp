@@ -597,11 +597,12 @@ export function orphanedByDeferredRespawnNote(
     `were still transferring. They belong to the session being replaced, so they are being ` +
     `killed — this is the rebuild that was queued when a comfyui credential was saved earlier ` +
     `(#1567).\n\n` +
-    `The partial files are still on disk. Re-issuing each download RESUMES from them when the ` +
-    `credential did not change mid-transfer — which is the case for anything started after that ` +
-    `save. A transfer that was already running when the credential changed has a different ` +
-    `cache identity and restarts from 0% instead. Check the reported progress on re-issue ` +
-    `rather than assuming either.\n\n` +
+    `The partial files are still on disk, so re-issuing each download is worth doing: it can ` +
+    `RESUME from them rather than starting over. A transfer that was already running when the ` +
+    `credential changed has a different cache identity and definitely restarts from 0%; one ` +
+    `started after that save keeps its identity and usually resumes — but resumption also needs ` +
+    `the server to still offer the same validator and honour a range request, so it is not ` +
+    `guaranteed either way. Read the progress each re-issue reports instead of assuming.\n\n` +
     `Re-issue them now if they are still wanted; nothing else will pick them up.`
   );
 }

@@ -43,28 +43,37 @@ class RecordingBackend implements AgentBackend {
   readonly capabilities = CLAUDE_CAPABILITIES;
   runCount = 0;
   turnTexts: string[] = [];
+  /** Which run() (i.e. which agent, i.e. which tab) each turn arrived on. Needed to tell
+   *  "the right tab got the note" from "some tab did" — without it, a watch that leaks to
+   *  whichever tab restarts first looks identical to a correctly scoped one. */
+  turns: { run: number; text: string }[] = [];
   autoComplete = true;
-  private releaseTurn: (() => void) | null = null;
+  // A LIST, not a single slot: the multi-tab test holds two turns open at once, and one
+  // field means the first tab's resolver is overwritten and never settles — the whole
+  // test then times out on a harness bug rather than a finding.
+  private held: (() => void)[] = [];
 
   async *run(opts: BackendStartOptions): AsyncGenerator<AgentEvent> {
     this.runCount += 1;
+    const myRun = this.runCount;
     yield { type: "session", sessionId: "sess-x" };
     for await (const turn of opts.channel) {
       this.turnTexts.push(turn.text);
+      this.turns.push({ run: myRun, text: turn.text });
       if (!this.autoComplete) {
         await new Promise<void>((resolve) => {
-          this.releaseTurn = resolve;
+          this.held.push(resolve);
         });
-        this.releaseTurn = null;
       }
       yield { type: "result", ok: true, subtype: "success" };
     }
   }
 
+  /** Release every held turn. */
   release(): void {
-    const r = this.releaseTurn;
-    this.releaseTurn = null;
-    r?.();
+    const all = this.held;
+    this.held = [];
+    for (const r of all) r();
   }
 
   async interrupt(): Promise<void> {
@@ -141,6 +150,7 @@ describe("a DEFERRED respawn reaches the note (#1567)", () => {
 
     // BUSY, so this respawn is genuinely DEFERRED — the path whose damage the save-time
     // snapshot cannot see. It reports "scheduled", not "applied".
+    manager.armCredentialRespawnOrphanWatch(tab);
     const tally = manager.restartAllForMcpEnv();
     expect(tally.scheduled, "the respawn must be queued, not applied").toBe(1);
     expect(tally.applied).toBe(0);
@@ -156,6 +166,92 @@ describe("a DEFERRED respawn reaches the note (#1567)", () => {
     expect(note).toMatch(/partial/i);
   });
 
+  it("an UNARMED respawn says nothing, even with transfers in flight", async () => {
+    // Review, P1. The first version hooked EVERY mcp-env restart. `applyPendingRestarts`
+    // also serves retargets (#1429) and the base_path recovery respawn — neither is a
+    // credential save, so the note would have claimed one "was saved earlier", and
+    // `retargetAllForMcpEnv` deliberately gives an IDLE tab no turn at all. Only an armed
+    // credential respawn may speak.
+    atRisk.jobs = [{ id: "j1", filename: "flux-dev.safetensors", bytes: 4_000_000_000 }];
+    const backend = new RecordingBackend();
+    backend.autoComplete = false;
+    const manager = makeManager(backend);
+    const tab = "tab-1567-unarmed";
+
+    manager.send(tab, "hello");
+    await waitFor(() => backend.runCount >= 1 && backend.turnTexts.length >= 1);
+    manager.restartAllForMcpEnv(); // NOT armed — e.g. a retarget or base_path recovery
+
+    backend.autoComplete = true;
+    backend.release();
+    await waitFor(() => backend.runCount >= 2);
+    await new Promise((r) => setTimeout(r, 120));
+
+    expect(backend.turnTexts.filter((t) => t.includes("flux-dev.safetensors"))).toHaveLength(0);
+  });
+
+  it("reports ONCE, not once per tab", async () => {
+    // Review, P1. The download list is global and a credential respawn replaces every
+    // tab's comfyui child — so the list is the right SET, but N tabs restarting would each
+    // have announced the same transfers, N times.
+    atRisk.jobs = [{ id: "j1", filename: "flux-dev.safetensors", bytes: 4_000_000_000 }];
+    const backend = new RecordingBackend();
+    backend.autoComplete = false;
+    const manager = makeManager(backend);
+
+    manager.send("tab-a", "hello");
+    manager.send("tab-b", "hello");
+    await waitFor(() => backend.runCount >= 2 && backend.turnTexts.length >= 2);
+
+    manager.armCredentialRespawnOrphanWatch(null); // a Settings save: no particular tab
+    expect(manager.restartAllForMcpEnv().scheduled).toBe(2);
+
+    backend.autoComplete = true;
+    backend.release(); // releases BOTH held turns
+    await waitFor(() => backend.runCount >= 4);
+    await waitFor(() => backend.turnTexts.some((t) => t.includes("flux-dev.safetensors")));
+    await new Promise((r) => setTimeout(r, 120)); // let a second copy arrive if it would
+
+    expect(
+      backend.turnTexts.filter((t) => t.includes("flux-dev.safetensors")),
+      "exactly one tab carries it",
+    ).toHaveLength(1);
+  });
+
+  it("goes to the tab it was armed for, not whichever restarts first", async () => {
+    // Consuming the watch once is not enough on its own: without the tab check the FIRST
+    // tab to restart takes it, so the note lands in a conversation that did not save the
+    // credential. The transfers really are dying, so the text is true — it is just being
+    // told to the wrong person, which is how a report gets ignored.
+    atRisk.jobs = [{ id: "j1", filename: "flux-dev.safetensors", bytes: 4_000_000_000 }];
+    const backend = new RecordingBackend();
+    backend.autoComplete = false;
+    const manager = makeManager(backend);
+
+    // tab-a is created (and therefore restarts) FIRST; the credential belongs to tab-b.
+    manager.send("tab-a", "hello from a");
+    await waitFor(() => backend.runCount >= 1);
+    manager.send("tab-b", "hello from b");
+    await waitFor(() => backend.runCount >= 2 && backend.turnTexts.length >= 2);
+
+    manager.armCredentialRespawnOrphanWatch("tab-b");
+    expect(manager.restartAllForMcpEnv().scheduled).toBe(2);
+
+    backend.autoComplete = true;
+    backend.release();
+    await waitFor(() => backend.runCount >= 4);
+    await waitFor(() => backend.turnTexts.some((t) => t.includes("flux-dev.safetensors")));
+    await new Promise((r) => setTimeout(r, 120));
+
+    // Exactly one turn carries it…
+    const carrying = backend.turns.filter((t) => t.text.includes("flux-dev.safetensors"));
+    expect(carrying).toHaveLength(1);
+    // …and it must be tab-b's respawned agent, not tab-a's. Tabs restart in insertion
+    // order, so the runs are: 1 = tab-a, 2 = tab-b, 3 = tab-a respawned, 4 = tab-b
+    // respawned. A watch that ignores the tab hands the note to run 3.
+    expect(carrying[0].run, "the note belongs to the tab the credential was saved on").toBe(4);
+  });
+
   it("stays silent when the respawn orphans nothing", async () => {
     // The direction that fails quietly: a note pushed unconditionally would still pass the
     // test above, while costing a real agent turn on every env respawn. A nudge is a turn,
@@ -168,6 +264,7 @@ describe("a DEFERRED respawn reaches the note (#1567)", () => {
 
     manager.send(tab, "hello");
     await waitFor(() => backend.runCount >= 1 && backend.turnTexts.length >= 1);
+    manager.armCredentialRespawnOrphanWatch(tab);
     expect(manager.restartAllForMcpEnv().scheduled).toBe(1);
 
     backend.autoComplete = true;
@@ -188,6 +285,7 @@ describe("a DEFERRED respawn reaches the note (#1567)", () => {
 
     manager.send(tab, "hello");
     await waitFor(() => backend.runCount >= 1 && backend.turnTexts.length >= 1);
+    manager.armCredentialRespawnOrphanWatch(tab);
     manager.restartAllForMcpEnv("RETRY the download");
 
     backend.autoComplete = true;

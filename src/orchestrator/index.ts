@@ -3250,6 +3250,14 @@ export async function runPanelOrchestrator(): Promise<void> {
     // the action" nudge is not, so it must never broadcast to unrelated tabs.
     // restartAllForMcpEnv() is nudge-preserving, so this can't erase a per-request
     // nudge already queued on another tab (#164).
+    //
+    // #1567 — arm the orphan check BEFORE restarting, because an idle tab respawns
+    // inside this call. This is the ONLY path allowed to arm it: a respawn from a
+    // credential save is the one that queues, waits turns, and then kills whatever
+    // transfers exist by then. Scoped to the tab this change belongs to, matching the
+    // retry nudge below — the transfers are global (every tab's child is replaced), so
+    // it must be reported once rather than once per tab.
+    manager.armCredentialRespawnOrphanWatch(change.tabId ?? null);
     const tally = manager.restartAllForMcpEnv();
     // NUDGE only the tab whose panel_request_secret this change answers — a
     // Settings slot save, a background token (re)load, or a revoke leaves

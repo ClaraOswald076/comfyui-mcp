@@ -2393,9 +2393,40 @@ export class PanelAgentManager {
    *
    * No-op unless something is pending and the agent has fully settled (idle).
    */
+  /**
+   * #1567 — ARM the orphan check for the next respawn, for ONE tab.
+   *
+   * Only a comfyui CREDENTIAL change may arm this, and the caller says which tab it
+   * belongs to. Both restrictions come from review, and each fixes a real defect in the
+   * first version, which hooked every restart unconditionally:
+   *
+   *  - `applyPendingRestarts` also serves retargets (#1429) and the base_path recovery
+   *    respawn. Those are not credential saves, so a note saying one "was saved earlier"
+   *    would have been false — and `retargetAllForMcpEnv` deliberately gives an IDLE tab
+   *    NO turn, which an unconditional note broke for any tab while a download ran.
+   *  - `restartAllForMcpEnv` applies each tab separately and the download list is global,
+   *    so every restarted tab would have reported the SAME transfers. The credential
+   *    respawn does replace every tab's comfyui child, so the global list is the right
+   *    set — it just has to be told once, exactly like the retry nudge it travels with.
+   *
+   * `null` means "no particular tab" (a Settings-slot save): the first tab to restart
+   * carries it. Either way it is consumed once.
+   */
+  armCredentialRespawnOrphanWatch(tabId: string | null): void {
+    this.credentialOrphanWatch = { tab: tabId };
+  }
+  private credentialOrphanWatch: { tab: string | null } | null = null;
+
   /** #1567 — what this respawn is about to orphan, enumerated NOW rather than at save
-   *  time. Never throws and never blocks the restart: a rebuild that cannot run because
-   *  the warning failed is strictly worse than a rebuild with no warning. */
+   *  time. Never throws: a rebuild that fails because its warning failed is strictly
+   *  worse than a rebuild with no warning.
+   *
+   *  It is NOT non-blocking, and the earlier comment claiming otherwise was wrong
+   *  (review): this reads job records and each active download's progress with sync IO,
+   *  so a stalled filesystem stalls here. That is tolerated because it now runs at most
+   *  once per credential save rather than on every restart — the same IO the save path
+   *  already performs, moved to where it can see the right answer. A try/catch cannot
+   *  time-bound a blocking syscall and is not pretended to. */
   private deferredRespawnOrphanNote(): string | null {
     try {
       return orphanedByDeferredRespawnNote(downloadsAtRiskOfRespawn());
@@ -2430,10 +2461,13 @@ export class PanelAgentManager {
     // happened: nothing in flight at save, nine downloads started over the next two
     // turns, all killed here with no warning at any point.
     //
-    // This nudge is not a spurious turn. It only exists when transfers are being
-    // destroyed right now, and the resumed session is the only thing positioned to
-    // re-issue them — the alternative, which shipped, is silence.
-    const orphanNote = wantMcp ? this.deferredRespawnOrphanNote() : null;
+    // ONLY for an armed credential respawn, and ONLY once — see
+    // armCredentialRespawnOrphanWatch. A note on any other restart would be both untrue
+    // and a spurious agent TURN, which is a response the user did not ask for.
+    const watch = this.credentialOrphanWatch;
+    const watched = wantMcp && watch !== null && (watch.tab === null || watch.tab === tabId);
+    if (watched) this.credentialOrphanWatch = null;
+    const orphanNote = watched ? this.deferredRespawnOrphanNote() : null;
     const finalNudge = orphanNote ? [nudge, orphanNote].filter(Boolean).join("\n\n") : nudge;
     this.pendingEffortRestart.delete(tabId);
     this.pendingMcpRestart.delete(tabId);
