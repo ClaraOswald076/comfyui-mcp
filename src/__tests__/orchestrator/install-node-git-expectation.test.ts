@@ -26,6 +26,16 @@
 // unqualified promise in the tool description. These tests pin the corrected claim —
 // a silent revert to "git URL → nightly install" would restore an expectation the path
 // cannot meet on v4.
+// WHAT THESE TESTS ARE, AND ARE NOT (review, P2). They assert that the tool's own text
+// still carries claims this commit measured. That is a REVERSION FENCE — delete the
+// caveat and they fail — and nothing more. They cannot validate that the claims are true:
+// every asserted string lives in the definition under test, so a wrong claim written
+// consistently in both places would pass.
+//
+// The truth of the v4 claim rests on the live probe recorded above, not on these. The
+// 3.x sentence is explicitly attributed rather than asserted, because it was NOT measured
+// here — and the text says so, which is the property worth pinning.
+
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("../../comfyui/client.js", () => ({
@@ -64,15 +74,36 @@ describe("panel_install_node states the v4 git-install limit (#1539)", () => {
     const text = installNodeDef().description ?? "";
     expect(text).toMatch(/clone it into custom_nodes yourself/i);
     // 3.x is not the same as v4 here, and saying so stops a "it worked before" report
-    // reading as a regression on our side.
-    expect(text).toMatch(/3\.x installs an unlisted URL natively/i);
+    // reading as a regression on our side — but it is ATTRIBUTED, not asserted, because
+    // 3.x was NOT measured in this change. Claiming it as fact would be the same
+    // over-reach this issue is about (review, P2).
+    expect(text).toMatch(/3\.x is reported/i);
+    expect(text).toMatch(/NOT measured here/i);
   });
 
   it("does NOT promise a git URL installs unconditionally", () => {
     // The sentence this issue is about. `repository` is still offered — it is the right
     // field for a listed repo — but the unqualified promise is gone.
     const text = installNodeDef().description ?? "";
-    expect(text).toMatch(/ONLY WORKS FOR A REPO THE MANAGER ALREADY KNOWS/i);
+    expect(text).toMatch(/DOES NOT INSTALL A REPO THE MANAGER'S REGISTRY DOES NOT LIST/i);
+    // Necessary, not sufficient — a listed repo was not measured, and the text must not
+    // imply it always succeeds.
+    expect(text).toMatch(/whether it is sufficient was not measured/i);
+  });
+
+  it("the LATER recovery advice does not contradict the v4 caveat", () => {
+    // Review, P1. A few sentences on, the queue-done warning tells a caller whose pack is
+    // absent to "retry it, or install it from its git `repository` URL" — the exact action
+    // the new caveat says fails on v4. Left alone, the tool would talk a v4 user into a
+    // failing retry loop, which is worse than the over-promise this commit set out to fix.
+    //
+    // Mutation testing caught that nothing pinned the repair.
+    const text = installNodeDef().description ?? "";
+    const retryAdvice = text.slice(text.indexOf("a pack you installed that is absent"));
+    expect(retryAdvice, "the retry advice must be qualified for v4").toMatch(
+      /on Manager v4 that retry fails/i,
+    );
+    expect(retryAdvice).toMatch(/clone it yourself instead of retrying/i);
   });
 
   it("the repository PARAM carries the caveat too", () => {
