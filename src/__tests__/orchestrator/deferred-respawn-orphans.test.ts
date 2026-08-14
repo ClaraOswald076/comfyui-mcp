@@ -310,6 +310,45 @@ describe("a DEFERRED respawn reaches the note (#1567)", () => {
     expect(backend.turnTexts.filter((t) => t.includes("flux-dev.safetensors"))).toHaveLength(0);
   });
 
+  it("a watch is not kept alive by tabs it will never be delivered to", async () => {
+    // Review, round 3. Releasing only on the DROPPED path leaves the set non-empty forever:
+    // a save on tab-a with tab-b also busy gives awaiting={a,b}; retiring a trims it to
+    // {b}; b then restarts successfully, matches nothing, and released nothing. The watch
+    // survives until a RECREATED tab-a restarts and collects a warning about a save from
+    // before it existed.
+    atRisk.jobs = [{ id: "j1", filename: "flux-dev.safetensors", bytes: 4_000_000_000 }];
+    const backend = new RecordingBackend();
+    backend.autoComplete = false;
+    const manager = makeManager(backend);
+
+    manager.send("tab-a", "hello a");
+    await waitFor(() => backend.runCount >= 1);
+    manager.send("tab-b", "hello b");
+    await waitFor(() => backend.runCount >= 2 && backend.turnTexts.length >= 2);
+
+    // The credential is saved on tab-a; both tabs are busy, so both are queued.
+    expect(manager.restartAllForMcpEnvAfterCredentialChange("tab-a").scheduled).toBe(2);
+
+    manager.retire("tab-a"); // the named tab goes away before its restart runs
+    backend.autoComplete = true;
+    backend.release(); // tab-b restarts, matches nothing, and must clear the last hold
+    await waitFor(() => backend.runCount >= 3);
+
+    // tab-a comes back later and does an ordinary, unrelated env respawn.
+    backend.autoComplete = false;
+    manager.send("tab-a", "hello again");
+    await waitFor(() => backend.turnTexts.includes("hello again"));
+    manager.restartAllForMcpEnv();
+    backend.autoComplete = true;
+    backend.release();
+    await new Promise((r) => setTimeout(r, 150));
+
+    expect(
+      backend.turnTexts.filter((t) => t.includes("flux-dev.safetensors")),
+      "no warning about a save that predates this tab",
+    ).toHaveLength(0);
+  });
+
   it("stays silent when the respawn orphans nothing", async () => {
     // The direction that fails quietly: a note pushed unconditionally would still pass the
     // test above, while costing a real agent turn on every env respawn. A nudge is a turn,

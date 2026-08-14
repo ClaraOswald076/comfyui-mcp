@@ -2506,7 +2506,20 @@ export class PanelAgentManager {
     // and a spurious agent TURN, which is a response the user did not ask for.
     const watch = this.credentialOrphanWatch;
     const watched = wantMcp && watch !== null && (watch.tab === null || watch.tab === tabId);
+    // A tab leaves `awaiting` when its queued restart RESOLVES, whichever way — delivery
+    // retires the whole watch, and anything else just means this tab can no longer be the
+    // one to deliver it (review, round 3).
+    //
+    // Releasing only on the dropped path was not enough. A save on tab A with B also busy
+    // leaves awaiting={A,B}; retiring A trims it to {B}; B then restarts successfully,
+    // matches nothing, and releases nothing — so the set never empties. The watch sits
+    // there until a recreated A restarts and collects a warning about a save from long
+    // before it existed.
+    //
+    // The busy early-return above is deliberately upstream of this: "scheduled" means the
+    // tab still owes a restart, so it has not resolved and must stay in the set.
     if (watched) this.credentialOrphanWatch = null;
+    else this.releaseOrphanWatch(tabId);
     const orphanNote = watched ? this.deferredRespawnOrphanNote() : null;
     const finalNudge = orphanNote ? [nudge, orphanNote].filter(Boolean).join("\n\n") : nudge;
     this.pendingEffortRestart.delete(tabId);
