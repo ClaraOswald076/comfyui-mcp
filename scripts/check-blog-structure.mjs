@@ -1,0 +1,75 @@
+#!/usr/bin/env node
+/**
+ * Every model post must state its license in a section of its own.
+ *
+ *   node scripts/check-blog-structure.mjs
+ *
+ * ## Why this section and not a whole skeleton
+ *
+ * The model posts already share a spine — measured across the eleven of them, VRAM appeared
+ * in 11, install in 10, troubleshooting in 10, FAQ in 10. That structure is real and emerged
+ * without a gate, so gating it would be ceremony.
+ *
+ * Licensing was the exception, and not by a little:
+ *
+ *   a heading of its own ....  1 / 11   (krea2, and only an H3)
+ *   buried in prose or FAQ ..  8 / 11   (between 1 and 8 passing mentions)
+ *   absent entirely ......... 2 / 11   (wan-transparent, video-extend-pusa)
+ *
+ * It is also the highest-stakes fact on the page and where both money-costing errors in this
+ * audit were: krea2 invented a 50-seat allowance for a license with a $1M REVENUE gate, and
+ * ltx-2.3 called the LTX-2 Community License "Apache 2.0" three times. Both errors are the
+ * kind a reader acts on commercially.
+ *
+ * A fact that important should not be discoverable only by reading the whole post, and "we
+ * forgot to mention the license" should not be silent. So: one required section, in the page
+ * TOC, checked.
+ *
+ * ## Scope
+ *
+ * A post is model-shaped if it documents a pack. Engineering posts are exempt — they discuss
+ * the software, not a model whose weights carry terms.
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+
+const ROOT = path.resolve(import.meta.dirname, '..');
+const BLOG = path.join(ROOT, 'docs', 'blog');
+const PACKS = path.join(ROOT, 'packs');
+
+const packNames = fs.existsSync(PACKS)
+  ? new Set(fs.readdirSync(PACKS).filter((d) => fs.statSync(path.join(PACKS, d)).isDirectory()))
+  : new Set();
+
+/** Posts that document packs but are about the tooling, not a model's weights. */
+const EXEMPT = new Set(['installer-packs-that-cant-rot.mdx']);
+
+let failures = 0;
+let checked = 0;
+for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
+  if (file === 'index.mdx' || EXEMPT.has(file)) continue;
+  const src = fs.readFileSync(path.join(BLOG, file), 'utf8');
+
+  const documentsAPack =
+    [...src.matchAll(/packs\/([a-z0-9][a-z0-9-]*)/gi)].some((m) => packNames.has(m[1])) ||
+    [...src.matchAll(/`([a-z0-9][a-z0-9-]*)`\s+pack/gi)].some((m) => packNames.has(m[1]));
+  if (!documentsAPack) continue;
+
+  checked++;
+  if (!/^##\s+Licensing\s*$/m.test(src.replace(/\r\n/g, '\n'))) {
+    failures++;
+    console.error(`  ✗ blog/${file}: no "## Licensing" section`);
+  }
+}
+
+console.log(`${checked} model post(s) checked for a Licensing section`);
+if (failures) {
+  console.error(
+    `\n${failures} model post(s) do not state their license in a section of their own. Read the ` +
+      `license off the model card — not from another post, and not from memory — then add a ` +
+      `"## Licensing" H2 before the VRAM section. Name the license exactly, and say whether ` +
+      `commercial use is gated and on what (revenue, not seats).`,
+  );
+  process.exit(1);
+}
+console.log('blog structure OK');

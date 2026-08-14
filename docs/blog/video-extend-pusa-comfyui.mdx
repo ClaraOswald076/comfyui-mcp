@@ -269,6 +269,20 @@ The rules that keep a long chain from falling apart:
 - `clear_vram` isn't needed between hops, but **decode/cache long chains to disk** so
   you don't hold every segment in VRAM.
 
+## Licensing
+
+Both halves of this pipeline are **Apache 2.0**, which is unusually clean for a
+video stack:
+
+- **WAN 2.2 T2V A14B** — the base model — is Apache 2.0 per
+  [Wan-AI/Wan2.2-T2V-A14B](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B).
+- **Pusa V1** — the LoRAs that make temporal extension work — is Apache 2.0 per
+  [RaphaelLiu/PusaV1](https://huggingface.co/RaphaelLiu/PusaV1).
+
+So commercial use is permitted on both, with no revenue threshold and no separate
+agreement. The fp8 checkpoints and LoRA conversions the pack downloads are
+redistributions of those weights via kijai's ComfyUI repos.
+
 ## VRAM tiers
 
 Same envelope as `wan-t2v-video` (dual A14B fp8 + UMT5) — Pusa adds only ~1.9 GB of

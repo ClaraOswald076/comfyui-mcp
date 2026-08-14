@@ -1,5 +1,5 @@
 ---
-title: "Run ERNIE-Image Locally in ComfyUI (Apache-2.0, 2026)"
+title: "Run ERNIE-Image Locally in ComfyUI (Apache-2.0)"
 description: "Run Baidu's ERNIE-Image — the Apache-2.0, 8B text-to-image model with sharp multilingual EN/CN/JP text — locally in ComfyUI. Install, settings, VRAM."
 keywords:
   - ERNIE Image ComfyUI
@@ -72,6 +72,21 @@ is the speed king for fast general ideation. But ERNIE wins decisively on the tw
 axes that matter for production text work: a **permissive license** and **clean
 multilingual typography**. Each of those models gets its own post in this series —
 this one is ERNIE's spotlight for **commercial-safe, text-rich images**.
+
+## Licensing
+
+**ERNIE-Image is Apache 2.0** — commercial use, modification and redistribution, full
+stop. No revenue threshold, no seat count, no separate agreement. Both
+[baidu/ERNIE-Image](https://huggingface.co/baidu/ERNIE-Image) and
+[baidu/ERNIE-Image-Turbo](https://huggingface.co/baidu/ERNIE-Image-Turbo) declare
+`apache-2.0`, and the Comfy-Org repackage carries the same terms.
+
+This is the post's headline claim and it holds up. It is a real difference from
+[Ideogram 4](./ideogram-4-comfyui), whose weights are open but **non-commercial**.
+
+If you install the monolith `ernie` pack, note that its combo groups also load
+Z-Image-Turbo, which is separately Apache 2.0 — so the combined pipeline stays
+commercially usable.
 
 ## System & VRAM requirements
 

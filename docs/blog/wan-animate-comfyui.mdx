@@ -1,5 +1,5 @@
 ---
-title: "WAN Animate 2.2 in ComfyUI: Character Replace (2026)"
+title: "WAN Animate 2.2 in ComfyUI: Character Replace"
 description: "Replace any character in a video from ONE reference image, or transfer motion to a still, with WAN Animate 2.2 in ComfyUI. Install, VRAM, fixes."
 keywords:
   - WAN Animate ComfyUI
@@ -90,6 +90,20 @@ There's no single "best" — pick by the job:
 Where rivals win: VACE for breadth of edit types, T2V for from-scratch creation,
 LTX for raw speed. WAN Animate earns the spotlight for the one thing it's built
 to dominate — **driving a character with another character's performance.**
+
+## Licensing
+
+**WAN Animate 2.2 is Apache 2.0** — fully permissive, commercial use included.
+[Wan-AI/Wan2.2-Animate-14B](https://huggingface.co/Wan-AI/Wan2.2-Animate-14B) states
+it in the model card: the models in the repository are licensed under Apache 2.0.
+
+That is rare in the video-model space and is a large part of why this model got
+adopted so fast against the closed Runway and ByteDance options — you can put
+character replacement into a commercial pipeline without negotiating anything.
+
+The detection and segmentation models the pack pulls alongside it (SeC, ViTPose,
+YOLO) are separate projects with their own terms; check those if you redistribute
+the bundle rather than just using it.
 
 ## System & VRAM requirements
 

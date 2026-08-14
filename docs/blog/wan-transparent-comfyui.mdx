@@ -67,6 +67,26 @@ repeatable little factory for living character sprites.
 > experts work, and see [WAN Animate](./wan-animate-comfyui) for
 > motion-transfer character animation.
 
+## Licensing
+
+Two different licenses meet in this pipeline, and only one of them is stated by the
+repo the pack downloads from:
+
+- **WAN 2.2** (the video model doing the work) is **Apache 2.0** — commercial use
+  included, no revenue threshold. Confirmed on
+  [Wan-AI/Wan2.2-T2V-A14B](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B). The GGUF
+  builds this pack pulls are quantizations of those weights, redistributed via a
+  community mirror.
+- **BiRefNet** (the matting model that produces the alpha channel) is **MIT**
+  upstream at
+  [ZhengPeng7/BiRefNet](https://huggingface.co/ZhengPeng7/BiRefNet). Note that the
+  mirror the pack fetches from, `1038lab/BiRefNet`, **declares no license of its
+  own** — it has no model card. If licensing provenance matters for your use, pull
+  the weights from the upstream repo instead of relying on the mirror.
+
+Neither is a blocker for commercial work, but "the mirror doesn't say" is a real
+answer, not a shrug — treat the upstream repo as the authority.
+
 ## System & VRAM requirements
 
 This is a *video* workflow, so it's heavier than an image pack — but the GGUF

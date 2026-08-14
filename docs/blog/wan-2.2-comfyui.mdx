@@ -1,5 +1,5 @@
 ---
-title: "WAN 2.2 in ComfyUI: The Open Video King (2026 Guide)"
+title: "WAN 2.2 in ComfyUI: The Open Video King"
 description: "Run WAN 2.2 — the open-source MoE video model — locally in ComfyUI. High/low-noise experts, I2V & T2V, GGUF VRAM tiers, Lightning, one-command install."
 keywords:
   - WAN 2.2 ComfyUI
@@ -80,6 +80,23 @@ FP8/GGUF path fits 16 GB cards where a dense model can't. ([WaveSpeed: LTX-2.3 v
 resolution, steps, and hardware. Each rival gets its own post:
 [LTX-2.3](./ltx-2.3-comfyui) and [WAN Animate](./wan-animate-comfyui) are
 elsewhere in the series.
+
+## Licensing
+
+**WAN 2.2 is Apache 2.0** — commercial use included, no revenue threshold, no seat
+count, no separate agreement to sign. The
+[Wan-AI/Wan2.2-T2V-A14B](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B) model card
+states it directly: the models in the repository are licensed under Apache 2.0. The
+license does carry ordinary use restrictions (no illegal content, no misuse of
+personal information, no targeting vulnerable groups), which is a conduct clause,
+not a commercial gate.
+
+That makes it one of the genuinely permissive open video models — worth contrasting
+with [LTX-2.3](./ltx-2.3-comfyui), which is open-weight but gates commercial use on
+a $10M revenue threshold.
+
+The LoRAs and upscaler the pack pulls are separate projects under their own terms;
+check those before shipping if you redistribute them.
 
 ## System & VRAM requirements
 
