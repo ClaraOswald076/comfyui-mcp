@@ -68,9 +68,13 @@ describe("a stale npx path refuses with the remedy, and installs NOTHING (#1568)
   const STALE =
     "C:/Users/u/AppData/Local/npm-cache/_npx/28eae33d00f3f7f1/node_modules/comfyui-mcp/packs/krea2-combo/manifest.yaml";
 
-  it("names the pack to use instead", async () => {
+  it("keeps the REAL loader error and appends the remedy", async () => {
+    // Review, round 2. An earlier version decided "this is a stale npx path" BEFORE trying
+    // to open it, which relabelled an ordinary ENOENT/EACCES under any node_modules install
+    // and hid what actually went wrong. The loader's own error is what the caller needs; the
+    // suggestion is additional.
     const msg = await failureOf({ path: STALE });
-    expect(msg).toMatch(/no longer exists/i);
+    expect(msg, "the underlying failure must still be visible").toMatch(/ENOENT|EACCES|ENOTDIR/);
     expect(msg).toMatch(/pack: "krea2-combo"/);
     // The reason matters as much as the remedy: without it this reads as a missing pack.
     expect(msg).toMatch(/npx/i);

@@ -307,16 +307,27 @@ async function resolveManifest(opts: ApplyManifestOptions): Promise<ComfyManifes
   // #1568 — the reported failure: a path handed out by an EARLIER npx process, whose cache
   // directory no longer exists. Turn the bare ENOENT into the one-call remedy rather than
   // applying a file nobody named.
-  const stalePack = bundledPackNamedByStalePath(requested);
-  if (stalePack) {
+  // ATTEMPT THE OPEN FIRST, and only then explain (review, round 2). Deciding "this is a
+  // stale npx path" before trying it replaced the loader's real error — an ordinary npm
+  // install under node_modules, or a permission failure, would both have been relabelled,
+  // hiding the actual ENOENT/EACCES and pointing at a pack the caller never asked for.
+  //
+  // So the real error is what surfaces, and the remedy is appended to it.
+  try {
+    return await loadManifestFile(requested);
+  } catch (err) {
+    const stalePack = bundledPackNamedByStalePath(requested);
+    if (!stalePack) throw err;
+    const cause = err instanceof Error ? err.message : String(err);
     throw new ValidationError(
-      `That manifest path no longer exists: it points into a package directory from an earlier ` +
-        `npx run, which is replaced on each respawn (#1568). The pack itself is still here — ` +
-        `re-run with pack: "${stalePack}" instead of a path, which resolves against the running ` +
-        `build and cannot go stale. (Nothing was installed.)`,
+      `${cause}\n\nThat path points inside an installed comfyui-mcp package directory. If it came ` +
+        `from an earlier npx run, that directory is replaced on each respawn, which is why a ` +
+        `manifest_path captured earlier stops resolving (#1568). This build does ship a pack ` +
+        `called "${stalePack}" — if that is the one you meant, re-run with pack: "${stalePack}" ` +
+        `instead of a path: it resolves against the running build and cannot go stale. ` +
+        `(Nothing was installed.)`,
     );
   }
-  return loadManifestFile(requested);
 }
 
 function commandExists(cmd: string): boolean {
