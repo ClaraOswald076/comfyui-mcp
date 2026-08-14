@@ -7,6 +7,35 @@
 
 ---
 
+> ### ⚠️ Freshness check — re-verified 2026-08-14 (written 2026-08-01)
+>
+> This RFC names external models and libraries, which go stale fast. Everything
+> below was re-checked against live Ollama / GitHub listings on **2026-08-14**.
+> Read this box before acting on §1 or §3.
+>
+> **Still true.** [#642](https://github.com/artokun/comfyui-mcp/issues/642) is
+> **still open**; the shipped model is **still `artokun/gemma4-comfyui-mcp`**
+> (`:e4b` default — see `docs/local-llms.mdx`); every in-repo anchor in the
+> grounding table below still exists. **No part of this plan has been built** —
+> Phases 0–5 are all unstarted (details in §7).
+>
+> **Corrected since writing** (all marked inline):
+> - **One candidate does not exist as named.** `richardyoung/qwen3.6-14b-abliterated:agent`
+>   is not a real model — see §1.
+> - **`huihui_ai/Qwen3.6-abliterated` is vision-capable**, not text-only as the
+>   original table claimed — which changes the Qwen shortlist.
+> - **`huihui_ai/qwen3-coder-next-abliterated` is ~52 GB**, so it cannot serve as
+>   the local "tool-only sibling" this doc proposes.
+> - **The default lean is no longer safe to assert** on freshness grounds — the
+>   proposed pick is the *oldest* build on the shortlist. See §1.
+> - **distilabel and Argilla both lost their original maintainers.** Neither is
+>   archived; neither is getting new features. See §3.
+>
+> Claims that could not be checked against a primary source are labelled
+> **`[unverified]`** rather than guessed at.
+
+---
+
 ## The pitch
 
 We ship an in-house model (`artokun/gemma4-comfyui-mcp` in `e2b / e4b / 12b`)
@@ -62,16 +91,28 @@ This doc is deliberately opinionated so there's something to argue with. The
 This is not greenfield. The relevant machinery already exists; Fine-tune 2.0
 mostly *re-points and extends* it.
 
+> **Reviewer warning — half this table is not in the repo.** `/finetune-v2/` is
+> **gitignored** (`.gitignore` L56, alongside `/finetune/` L55: "multi-GB, never
+> committed"). It exists on the maintainer's machine — verified 2026-08-14, all
+> files dated 2026-07-09, and every path cited below was confirmed present
+> there — but **it is not on GitHub**, so a reviewer reading this PR in a browser
+> cannot open `train_qlora.py`, `panel-arena.mjs`, `datagen/lib.mjs` or the
+> `Modelfile.template` to check any claim made about them. Rows below are marked
+> **(local-only)** where this applies. The tracked `scripts/arena-*.mjs` files are
+> a *different, smaller* surface — do not confuse the two. Making the pipeline
+> reviewable at all may be a prerequisite for the community phases (§2–§3), since
+> contributors cannot match a format spec they cannot read.
+
 | Concern | Lives in | Notes |
 |---|---|---|
-| Current recipe | `finetune-v2/finetune/README.md`, `train/config.yaml`, `train/train_qlora.py` | TOUCAN-style synth → **Unsloth QLoRA** → arena → GGUF. Size ladder `e2b / e4b / 12b / 31b` on **Heretic-abliterated Gemma 4** (`coder3101/gemma-4-*-it-heretic`). LoRA r=32/α=32, 2 epochs, lr 2e-4, seq 16384, per-example tool-menu rendering. |
-| Base was chosen by a bake-off | `finetune-v2/finetune/README.md` (2026-07-04) | Heretic-12B scored 13/20, beat a manual huihui build at 6/20. **That bake-off predates #642 and did not weight vision** — a reason to re-run it. |
-| Eval ladder | `finetune-v2/finetune/arena/arena-scenarios.mjs` (+ `scripts/arena-scenarios.mjs`) | Tiered scenarios with harness-side `verify()` that **never trusts the model** (re-queries `/history`, reads PNG dims, polls `get_job_status`). Tiers: **Base** (health/models/registry/queue/generate) → **Gauntlet** (precision/breakfix/provenance) → **Crucible** (multiout/pipeline). |
-| Verdict / gating | `finetune-v2/finetune/arena/panel-arena.mjs` (~L335) | Per-run `PASS / PARTIAL / UNVERIFIED-OK / FAIL`; only `PASS`/`UNVERIFIED-OK` trajectories are harvested. Release gates: **100% parseable tool calls**, **beats stock `gemma4:12b`**, **no BFCL-v3 collapse vs base**. |
-| Secret/PII scrubber | `src/services/oauth-flow.ts` → **`redactTokens(s)`** (L68) | Covers `access_token`/`refresh_token`/`client_secret`/`Bearer …`/prefixed keys (`ghp_ ya29. sk- xai-`) → `<redacted>`. Policy contract in `plugin/skills/report-bug/SKILL.md` Step 5. **Reuse this; do not build a new scrubber.** |
-| "Session succeeded" signal | `src/services/job-watcher.ts` → `CompletionNotification.status === "success"` (L36, built L132) | Derived from ComfyUI `execution_success` vs `execution_error` (`src/comfyui/events.ts`). Fanned out as `queue_status`/`lastCompleted` (`src/services/queue-status-broadcast.ts`). This is our ground-truth "the render actually happened." |
-| Teacher routing | `src/orchestrator/kimi-backend.ts`; `src/services/openai-provider-registry.ts` (`OPENAI_KEY_PROVIDERS`, L74) | `moonshot` → default model **`kimi-k3`**; `kimi` → `kimi-for-coding`. Teacher allowlist already exists in datagen: `finetune-v2/finetune/datagen/lib.mjs` `ALLOWED_TEACHER_PREFIXES` includes `moonshotai/`; **blocks** `anthropic/ openai/ google/ x-ai/` for ToS. |
-| Submission channel | `src/tools/report-issue.ts` → `submitAndPoll()` | `POST` to `comfyui-mcp-issue-worker.artokun.workers.dev`, `X-Client-Key` gate, `X-Triage-Async` marker, poll `GET /status/<job_id>`. Natural channel to extend for transcript upload. |
+| Current recipe | **(local-only)** `finetune-v2/finetune/README.md`, `train/config.yaml`, `train/train_qlora.py` | TOUCAN-style synth → **Unsloth QLoRA** → arena → GGUF. Size ladder `e2b / e4b / 12b / 31b` on **Heretic-abliterated Gemma 4** (`coder3101/gemma-4-*-it-heretic`). LoRA r=32/α=32, 2 epochs, lr 2e-4, seq 16384, per-example tool-menu rendering. |
+| Base was chosen by a bake-off | **(local-only)** `finetune-v2/finetune/README.md` (2026-07-04) | Heretic-12B scored 13/20, beat a manual huihui build at 6/20. **That bake-off predates #642 and did not weight vision** — a reason to re-run it. |
+| Eval ladder | **(local-only)** `finetune-v2/finetune/arena/arena-scenarios.mjs` · **(tracked)** `scripts/arena-scenarios.mjs` | Tiered scenarios with harness-side `verify()` that **never trusts the model** (re-queries `/history`, reads PNG dims, polls `get_job_status`). Tiers: **Base** (health/models/registry/queue/generate) → **Gauntlet** (precision/breakfix/provenance) → **Crucible** (multiout/pipeline). *Verified 2026-08-14: the tracked copy contains the Gauntlet tier; it has **no** VISION or FORMAT tier, and there is no `arena:gate` npm script — only `arena` (`scripts/llm-arena.mjs`). §5 is unbuilt.* |
+| Verdict / gating | **(local-only)** `finetune-v2/finetune/arena/panel-arena.mjs` (~L335) | Per-run `PASS / PARTIAL / UNVERIFIED-OK / FAIL`; only `PASS`/`UNVERIFIED-OK` trajectories are harvested. Release gates: **100% parseable tool calls**, **beats stock `gemma4:12b`**, **no BFCL-v3 collapse vs base**. |
+| Secret/PII scrubber | **(tracked)** `src/services/oauth-flow.ts` → **`redactTokens(s)`** (L68 — ✅ still exact) | Verified 2026-08-14. Covers `access_token`/`refresh_token`/`id_token`/`code`/`code_verifier`/`client_secret`/`token` key-value pairs, prefixed keys (`ghu_ gho_ ghp_ ya29. sk- xai-`), `Bearer …` and bare `token …` → `<redacted>`. Slightly *broader* than this doc originally claimed. Policy contract in `plugin/skills/report-bug/SKILL.md` Step 5. **Reuse this; do not build a new scrubber.** |
+| "Session succeeded" signal | **(tracked)** `src/services/job-watcher.ts` → `CompletionNotification.status === "success"` (~~L36, built L132~~ → **now L38, built L150**) | Verified 2026-08-14 — type and `status: "success" \| "error" \| "interrupted"` unchanged; line numbers drifted. Derived from ComfyUI `execution_success` vs `execution_error` (`src/comfyui/events.ts`). Fanned out as `queue_status`/`lastCompleted` (`src/services/queue-status-broadcast.ts`). This is our ground-truth "the render actually happened." |
+| Teacher routing | **(tracked)** `src/orchestrator/kimi-backend.ts`; `src/services/openai-provider-registry.ts` | Verified 2026-08-14: `moonshot` → default model **`kimi-k3`** (registry L141); `kimi` → **`kimi-for-coding`** (`KIMI_DEFAULT_MODEL`, L8–9). Both still exact. Registry provider ids are **`glm \| kimi \| moonshot \| minimax`** (L33) — note **there is no `xiaomi` backend**, which bears on open question #2. Teacher allowlist **(local-only)** `finetune-v2/finetune/datagen/lib.mjs` `ALLOWED_TEACHER_PREFIXES` (L18–25) = `deepseek/ z-ai/ moonshotai/ minimax/ xiaomi/ qwen/`; **blocks** `anthropic/ openai/ google/ x-ai/` for ToS. |
+| Submission channel | **(tracked)** `src/tools/report-issue.ts` → `submitAndPoll()` (L127) | Verified 2026-08-14: `POST` to `comfyui-mcp-issue-worker.artokun.workers.dev` (L22), `X-Client-Key` gate (L175), `X-Triage-Async` marker (L187), polls `GET /status/<job_id>` (L234). Natural channel to extend for transcript upload. |
 | **Not this** | `src/tools/train.ts`, `src/services/ai-toolkit.ts`, `docker/trainer/` | The `train_*` MCP tools are **image/LoRA (diffusion) training** (ostris ai-toolkit). Unrelated to the LLM fine-tune. Don't conflate. |
 
 **Implication:** the teacher allowlist, the scrubber, the success signal, the
@@ -90,25 +131,49 @@ smaller siblings (~4–9 GB) for wide adoption; **tool-calling is non-negotiable
 
 ### The field
 
-| Model (Ollama) | Params / size @ Q4_K_M | Vision | Tool-calling | Abliteration & publisher | Notes for us |
-|---|---|---|---|---|---|
-| `huihui_ai/gemma-4-abliterated` `:e2b/:e4b/:12b/:26b/:31b` (+`-qat`) | e2b ~4.6 GB · e4b ~5 GB · 12b ~8 GB · 31b ~17 GB · 26b MoE (4B active) | **Yes** (proj. retained) + audio | Yes (`<tool_call>` XML) | **huihui-ai** (abliteration) | Same family we ship, but the **vision-retaining** build (#642). Gemma tool-calling rated *weaker* than Qwen. |
-| `coder3101/gemma-4-*-it-heretic` (current base) | matches size ladder | **No** (projector dropped) | Yes | Heretic method | What we ship now — the #642 regression. |
-| `huihui_ai/qwen3-abliterated`, `qwen3.5-abliterated`, `Qwen3.6-abliterated` | 8B ~8 GB (Q4); 14B ~9 GB; 27B/35B-A3B MoE larger | text (base) | **Yes, strong** (Hermes `<tool_call>`, `qwen3_coder` parser) | **huihui-ai** | Qwen 3 8B = "best local agent model 2026", cleanest tool calls. |
-| `huihui_ai/qwen3-vl-abliterated` | ~ VL tier | **Yes** | Yes | huihui-ai | Vision **and** strong tool-calling in one family — the both-worlds option. |
-| `richardyoung/qwen3.6-14b-abliterated:agent` | ~9 GB, fits 12 GB | **Yes** | Yes (`:agent` tag) | community | Concrete 14B vision+tools that fits mid-range cards. |
-| `huihui_ai/qwen3-coder-next-abliterated` | coder tier | text | **Yes (coder-tuned)** | huihui-ai | Strongest raw tool/coding, no vision — a "tool-only sibling" candidate. |
-| Llama-3.x-Groq-Tool-Use (8B/70B) | 8B ~5.7 GB | No | **Yes, top BFCL** (89–90%) | Groq (not abliterated) | Reference ceiling for tool-calling; not uncensored. |
+**All rows re-verified against live listings 2026-08-14.** Capability strings in
+quotes are the publisher's own chips, copied verbatim. "Updated" is the age the
+listing reported on that date — it is the freshness signal the original draft
+lacked, and it changes the recommendation.
 
-Kimi K3 itself (2.8T, released 2026-07-16, frontier agentic — Terminal-Bench 2.1
-88.3) is **not** a local base — it's the **teacher** (§3–4).
+| Model | Params / size | Vision | Tool-calling | Publisher | Updated | Notes for us |
+|---|---|---|---|---|---|---|
+| `huihui_ai/gemma-4-abliterated` `:e2b/:e4b/:12b/:26b/:31b`/**`:48b`** | 12b = 11.9B params · e2b ~4.6 GB · e4b ~5 GB · 12b ~8 GB · 31b ~17 GB · 26b MoE (4B active) | **Yes** | **Yes** | **huihui-ai** | **~2 mo** | ✅ Verified. Chips read **"vision tools thinking audio"** — so the vision *and* audio claim holds. **Correction: a `:48b` tier exists** that this doc omitted. Same family we ship, but the **vision-retaining** build (#642). **Freshest build on the shortlist.** |
+| `coder3101/gemma-4-*-it-heretic` (current base) | matches size ladder | **No** (projector dropped) | Yes | Heretic method | — | ⚠️ **Correction: this is not an Ollama model.** `ollama.com/coder3101` and `.../coder3101/gemma-4-12b-it-heretic` both **404**; the weights live on **Hugging Face** (`coder3101/gemma-4-31B-it-heretic` confirmed). Per-tier siblings below 31B **[unverified]**. What we ship now — the #642 regression. |
+| `huihui_ai/qwen3-abliterated`, `qwen3.5-abliterated` | 8B ~8 GB (Q4); 14B ~9 GB | text (base) | **Yes, strong** (Hermes `<tool_call>`, `qwen3_coder` parser) | **huihui-ai** | **[unverified]** | Qwen 3 8B = "best local agent model 2026", cleanest tool calls. |
+| `huihui_ai/Qwen3.6-abliterated` `:27b/:35b` | 27b **17 GB** · 35b **24 GB** · 256K ctx | ⚠️ **Yes — correction** | **Yes** | **huihui-ai** | **~3 mo** | ⚠️ **This doc originally filed it as text-only. That was wrong.** Chips read **"vision tools thinking"**. It is the **newest vision+tools Qwen** available and belongs in the bake-off. Caveat: **no small sibling** — 17 GB is the floor, so it cannot serve the "~4–5 GB wide adoption" tier. |
+| `huihui_ai/qwen3-vl-abliterated` `:2b/:4b/:8b/:30b/:32b` | 2b 1.9 GB · 4b 3.3 GB · **8b 6.1 GB** · 30b 20 GB · 32b 21 GB | **Yes** | **Yes** | huihui-ai | **~9 mo** ⚠️ | ✅ Exists; chips read **"vision tools thinking"**. Concrete tiers now filled in (the draft said only "~ VL tier"): `:8b` is the 4090 pick, `:4b` the wide-adoption sibling. **But it is the *oldest* build on this shortlist** — this is the doc's "default lean", and its freshness is now its weakest point. |
+| ~~`richardyoung/qwen3.6-14b-abliterated:agent`~~ | — | — | — | — | — | ❌ **Does not exist as named — struck.** No `qwen3.6-14b` under that publisher. The real model is **`richardyoung/qwen3-14b-abliterated`** (Qwen**3**, not 3.6; tags `latest/IQ3_M/Q4_K_M/Q5_K_M/q8_0/iq4_xs`, 6.9–16 GB, updated ~8 mo), whose page lists input **"Text"** only — **no vision chip, no tools chip, and no `:agent` tag among its 6 tags**. Secondary write-ups assert an `:agent` tag; the model page does not show one **[unverified — treat the write-ups as wrong until the tag is seen]**. The draft's "concrete 14B vision+tools" row was mistaken on the name, the vision claim and the tag. |
+| `huihui_ai/qwen3-coder-next-abliterated` | ⚠️ **q4_K ~52 GB** · q8_0 85 GB · fp16 159 GB · 256K ctx | text | **Yes (coder-tuned)** | huihui-ai | ~6 mo | ⚠️ **Correction: this blows the hard constraint.** At **~52 GB quantised** it does not fit a 24 GB 4090, let alone the ~4–9 GB adoption tier — so it **cannot be the local "tool-only sibling"** §1 and open question #4 propose. Either drop that proposal or name a different, smaller text-only model **[no verified replacement — do not substitute one without checking]**. |
+| Llama-3.x-Groq-Tool-Use (8B/70B) | 8B ~5.7 GB | No | **Yes, top BFCL** (89–90%) **[unverified]** | Groq (not abliterated) | — | Reference ceiling for tool-calling; not uncensored. |
+
+**Not surveyed, but our own docs recommend it:** `docs/local-llms.mdx` (L25)
+names **Xiaomi MiMo-V2.5** (vision + tools + long context) as the mid-2026 pick
+that "fits the full experience", and `xiaomi/` is already on the teacher
+allowlist. The field survey above omits it entirely. Worth adding to the bake-off
+before the base is decided — capabilities and sizes **[unverified here]**.
+
+Kimi K3 itself (2.8T, multimodal, ~1M context) is **not** a local base — it's the
+**teacher** (§3–4). *Re-checked 2026-08-14: K3 is real and frontier-class, but
+the draft's "**the** current frontier agentic coder" now overstates it — on
+Artificial Analysis' AA-Briefcase agentic benchmark it sits **2nd (1,527) behind
+Fable 5 Max (1,587)**, and 2nd to Fable 5 on most real-world automation
+benchmarks. The specific "Terminal-Bench 2.1 88.3" and the 2026-07-16 release
+date are **[unverified]** — sources disagree on the date.* **This does not change
+the teacher choice:** the stronger models are all on the ToS **blocklist**
+(`anthropic/ openai/ google/ x-ai/`), so K3 remains the best *allowlisted*
+teacher. Ranking is not the reason we picked it — licensing is.
 
 ### Reading of the evidence
 
 - **Tool-calling quality** — the panel's #1 job — favors **Qwen 3**. Multiple
   independent 2026 evaluations say Gemma tool-calling is comparatively weak and
   Qwen 3 emits clean, argument-complete calls. This directly matches the
-  *complaints* we get.
+  *complaints* we get. ⚠️ *2026-08-14: those "evaluations" are blog round-ups,
+  **[unverified]** and not re-checked this pass — and one of them was shown wrong
+  on a checkable detail (see Appendix). Note also that `huihui_ai/gemma-4-abliterated`
+  does advertise a `tools` capability chip. This bullet is the main argument for
+  the Qwen pivot and it currently rests on the weakest sources in the doc.*
 - **Vision** — the #642 lesson — is satisfiable in *both* families **if we pick
   the vision-retaining build**: `huihui_ai/gemma-4-abliterated` (retains
   proj.+audio) or `huihui_ai/qwen3-vl-abliterated` / Qwen3.6-14B-`:agent`.
@@ -126,26 +191,52 @@ Kimi K3 itself (2.8T, released 2026-07-16, frontier agentic — Terminal-Bench 2
 > Gemma-4-huihui vs Qwen 3 vs new. This is the lean, not the verdict; the arena
 > ladder (§5) casts the deciding vote in a re-run bake-off.
 
-- **Default lean → Qwen 3 (vision-capable), abliterated by huihui-ai.**
-  Concretely: `huihui_ai/qwen3-vl-abliterated` (or Qwen3.5) at a **~8–9B** default
-  tier for the 4090, a **~4–5B** small sibling for wide adoption, and optionally a
-  **larger MoE** for headroom. Rationale: it wins on the panel's dominant axis
-  (tool-calling) *and* clears #642 (vision), from a maintained abliteration
-  publisher, with a well-supported Ollama tool template.
+> **⚠️ 2026-08-14 — the default lean no longer follows from the evidence.**
+> The draft leaned Qwen partly on *recency*, but the freshness column added above
+> inverts that: `qwen3-vl-abliterated` (**~9 mo**) is the **oldest** build on the
+> shortlist, while the Gemma co-primary (**~2 mo**) is the newest, and
+> `Qwen3.6-abliterated` (**~3 mo**) — which this doc wrongly filed as text-only —
+> is a vision+tools Qwen that was never actually considered. **Treat "default
+> lean: Qwen 3" as unsettled** until the bake-off runs; the three viable entrants
+> are listed below. No verdict is asserted here.
+
+- **Lean, now qualified → Qwen 3 (vision-capable), abliterated by huihui-ai.**
+  Concretely: `huihui_ai/qwen3-vl-abliterated` at **`:8b`** (6.1 GB) for the 4090
+  and **`:4b`** (3.3 GB) as the wide-adoption sibling — tiers verified 2026-08-14.
+  Rationale as written: it wins on the panel's dominant axis (tool-calling) *and*
+  clears #642 (vision), with a well-supported Ollama tool template. **Caveat: the
+  build is ~9 months old**, so "from a maintained abliteration publisher" is the
+  claim to re-check before committing — the publisher is active, but *this
+  particular model* has not moved.
+- **New entrant the draft missed → `huihui_ai/Qwen3.6-abliterated` `:27b`.**
+  Vision + tools, 256K context, ~3 months old. The strongest *current* Qwen
+  option. **Blocker:** at 17 GB it fits the 4090 but has **no small sibling**, so
+  shipping it means either dropping the wide-adoption tier or pairing it with a
+  different family for the small rungs.
 - **Co-primary → `huihui_ai/gemma-4-abliterated` (vision-retaining).** If we stay
   Gemma, this is the build — it *directly fixes #642* by keeping the projector,
   reuses everything the current pipeline already knows about Gemma templates, and
   keeps the size ladder we've validated. The single change from today is
   **swap the Heretic base for the vision-retaining huihui base.**
-- **Tool-only sibling (optional) → `huihui_ai/qwen3-coder-next-abliterated`** for
-  users who explicitly opt out of sending pixels (the panel's "Blind" toggle) and
-  just want the strongest tool driver.
+- ~~**Tool-only sibling (optional) → `huihui_ai/qwen3-coder-next-abliterated`**~~
+  ❌ **Withdrawn 2026-08-14 — it is ~52 GB quantised** and cannot run on the
+  hardware this doc targets. The *use case* (users who opt out of sending pixels
+  via the panel's "Blind" toggle and just want the strongest tool driver) is still
+  legitimate; it needs a different, smaller model. **No verified replacement is
+  proposed here** — picking one is now an open question, not a recommendation.
 
 **Decision rule:** re-run the 2026-07-04 bake-off methodology on the arena ladder
-(§5), this time **weighting vision-verification scenarios**, head-to-head:
-`qwen3-vl-abliterated` vs `huihui gemma-4-abliterated` at the e4b/12b-equivalent
-tiers. Ship whichever wins the extended ladder; my money is on Qwen, but the
-number decides.
+(§5), this time **weighting vision-verification scenarios**. Given the
+2026-08-14 corrections the head-to-head should be **three-way**, at the
+e4b/12b-equivalent tiers:
+
+1. `huihui_ai/qwen3-vl-abliterated:8b` — the draft's lean (oldest build)
+2. `huihui_ai/gemma-4-abliterated:12b` — least pipeline churn, fixes #642 directly (newest build)
+3. `huihui_ai/Qwen3.6-abliterated:27b` — newest vision+tools Qwen (no small sibling)
+
+Ship whichever wins the extended ladder. The draft said "my money is on Qwen";
+with the freshness and vision corrections above, **that prior is no longer
+well-founded** — run the ladder and let the number decide.
 
 ---
 
@@ -250,13 +341,36 @@ tool-calling training pairs, curated by an LLM rather than by hand.
 
 ### Recommendation & justification
 
+> **⚠️ 2026-08-14 — both halves of this recommendation lost their original
+> maintainers.** Neither project is archived and neither is broken, but the
+> "most widely adopted, actively developed" framing below is now too strong:
+> - **distilabel** — README: *"The original authors have moved on to other
+>   projects. A group of community members have recently joined the GitHub
+>   project as collaborators to maintain the project and are actively working
+>   towards the next release. Check out the `develop` branch for access to the
+>   latest fixes."* Community-maintained; ~3.4k stars.
+> - **Argilla** — README: *"The original authors have moved on to exciting new
+>   projects! … While we won't be adding new features going forward, we're
+>   committed to solve bug fixes and publish patches as needed."* Explicit
+>   **maintenance mode, no new features**; ~5.1k stars.
+>
+> This does not invalidate the choice — a mature, stable, feature-frozen curation
+> library is a defensible dependency for a boutique pipeline, and the primitives
+> we need (LLM-as-judge, MinHash dedup, Argilla export) already exist and work.
+> But **"most widely adopted OSS framework, actively developed" is no longer the
+> reason to pick it**, and a reviewer should weigh the handover risk before this
+> becomes load-bearing. The alternatives in the table above were **not**
+> re-verified on 2026-08-14 **[unverified]** — if distilabel's community
+> maintenance is judged too thin, that comparison needs redoing, not guessing.
+
 **distilabel as the agentic cleaning backbone, Argilla as the human-in-the-loop
 review UI, with an optional data-juicer heuristic pre-pass.** Why:
 
 - distilabel's core primitive is exactly what we need — an **LLM-as-judge** step
   that scores each candidate trajectory and keeps only top-K, plus **MinHash
-  dedup** out of the box. It's the most widely adopted OSS framework for this,
-  HF-integrated, "based on verified research papers."
+  dedup** out of the box. It is widely adopted and HF-integrated. *(The draft
+  called it "the most widely adopted … actively developed" — see the maintenance
+  note above; the primitives are what justify it now, not the momentum.)*
 - Argilla gives us the **review surface** the opt-in pipeline wants anyway — a
   place to spot-check contributed transcripts before they train anything.
 - It composes cleanly with our reality: contributions arrive as JSONL shards;
@@ -370,6 +484,28 @@ failed gate, so "publish" is mechanically blocked on a red ladder.
 
 ## 6. Phasing + open questions
 
+### Build status — re-checked 2026-08-14
+
+**Nothing in this plan has been built.** Every phase below is still open; no part
+of it needs to be re-scoped as "already shipped". Evidence:
+
+| Phase | Status | Evidence (verified 2026-08-14) |
+|---|---|---|
+| 0 — Bootstrap & contract | **Not started** | No golden reference shards; no `/contribute` path anywhere in `src/`. |
+| 1 — Base bake-off | **Not started** | Shipped model is still `artokun/gemma4-comfyui-mcp` (`:e4b` default, `:e2b`, `:12b`) per `README.md` L657, `docs/local-llms.mdx` L257–259 and `locales/*/main.json` L157. No re-based build exists. |
+| 2 — Community pipeline | **Not started** | No transcript/contribution setting, no `X-Transcript-Contribution` marker, no `/contribute` worker route in the repo. |
+| 3 — Agentic cleaning | **Not started** | No distilabel/Argilla dependency or pipeline in the repo. |
+| 4 — Train & gate | **Not started** | `scripts/arena-scenarios.mjs` has the Gauntlet tier but **no VISION or FORMAT tier**; the only arena npm script is `arena` → `scripts/llm-arena.mjs`. **No `arena:gate` exists.** |
+| 5 — Iterate | **Not started** | — |
+
+**The driving issue is also still open:** [#642](https://github.com/artokun/comfyui-mcp/issues/642)
+(`enhancement`, `severity:P3`, `models`, `via-panel`) — last updated 2026-08-03,
+**not closed**. So the premise of §1 still holds: the model we ship today still
+cannot see its own renders.
+
+Note also that the repo is under a **feature freeze** (stabilisation first), which
+is the likeliest reason none of this has moved — not a judgement on the plan.
+
 ### Phasing
 
 - **Phase 0 — Bootstrap & contract (artokun).** Hand-produce a few Kimi-K3 panel
@@ -391,25 +527,52 @@ failed gate, so "publish" is mechanically blocked on a red ladder.
 
 ### Open questions for the community (react here)
 
-1. **Base:** Qwen 3 (my lean — best tool-calling + vision via `qwen3-vl`) or
-   vision-retaining Gemma 4 huihui (fixes #642 with least pipeline churn)? The
-   ladder decides — but which do you *want* to win?
+1. **Base:** now a **three-way** question (updated 2026-08-14) — `qwen3-vl-abliterated:8b`
+   (the original lean, but the oldest build), vision-retaining
+   `gemma-4-abliterated:12b` (fixes #642 with least pipeline churn, newest build),
+   or `Qwen3.6-abliterated:27b` (newest vision+tools Qwen, but no small sibling)?
+   And should **Xiaomi MiMo-V2.5** — which our own `docs/local-llms.mdx` already
+   recommends — be entered too? The ladder decides; which do you *want* to win?
 2. **Teacher parity threshold:** how close to Kimi K3 must a candidate be to
    ship (proposed within 15%)? And do we allow other allowlisted teachers
    (`glm`, `minimax`, `xiaomi`) to contribute too, or Kimi-only for consistency?
+   *Note: `xiaomi/` is on the datagen allowlist but there is **no `xiaomi`
+   backend** in `OPENAI_KEY_PROVIDERS` (`glm | kimi | moonshot | minimax`), so
+   allowing it as a teacher means shipping a backend first.*
 3. **Contribution incentive & trust:** what makes contributors comfortable
    sending transcripts — the double-scrub + review UI + revocable token, or do we
    need more (e.g. fully local pre-review, published dataset transparency,
    contributor credit)? How do we keep low-quality/poisoned contributions out
    beyond the LLM judges (§3)?
 4. **Vision cost:** do we ship vision on *every* tier, or a vision tier + a
-   tool-only sibling (`qwen3-coder-next-abliterated`) for the "Blind" crowd?
+   tool-only sibling for the "Blind" crowd? *(Updated 2026-08-14: the proposed
+   sibling `qwen3-coder-next-abliterated` is ~52 GB and is withdrawn — if we want
+   this tier, **which small text-only model?** Unanswered.)*
 5. **WSL2-4090 recipe:** pull the external local-training recipe into the repo so
    community members can reproduce small-tier LoRA runs on consumer GPUs?
+6. **New (2026-08-14) — does `/finetune-v2/` need to become reviewable?** It is
+   gitignored, so the training code, arena harness, teacher allowlist and
+   Modelfile template that this plan builds on are invisible to everyone but the
+   maintainer. Phases 2–3 ask outsiders to match a format spec they cannot read.
+   Do we commit the code (excluding the multi-GB artifacts that motivated the
+   ignore), publish it separately, or keep the community role limited to
+   *submitting* transcripts and not inspecting the pipeline?
 
 ---
 
 ## Appendix — sources (Aug 2026)
+
+> **Verification note (2026-08-14).** The Ollama model pages below were re-fetched
+> and their capability chips / tag lists copied verbatim into §1 — those are
+> primary sources and are reliable. The **blog-style "best model of 2026"
+> round-ups** (locallyuncensored, dev.to, localaimaster, insiderllm, lushbinary)
+> were **not** re-verified, and at least one secondary source was **contradicted**
+> by a primary page this pass: write-ups describing an `:agent` tag on
+> `richardyoung/qwen3-14b-abliterated` are not borne out by the model page.
+> Treat the ranking claims sourced from those round-ups — including "Gemma
+> tool-calling is weaker than Qwen" and "Qwen 3 8B is the best local agent model
+> of 2026", which are load-bearing for §1's argument — as **[unverified]**. The
+> bake-off (§5) exists precisely so we don't have to trust them.
 
 - Issue [#642](https://github.com/artokun/comfyui-mcp/issues/642) — vision/audio dropped by the current fine-tune; huihui base retains it.
 - huihui-ai abliterated models (Ollama): [`gemma-4-abliterated`](https://ollama.com/huihui_ai/gemma-4-abliterated), [`qwen3-abliterated`](https://ollama.com/huihui_ai/qwen3-abliterated), [`qwen3.5-abliterated`](https://ollama.com/huihui_ai/qwen3.5-abliterated), [`qwen3-vl-abliterated`](https://ollama.com/huihui_ai/qwen3-vl-abliterated), [`qwen3-coder-next-abliterated`](https://ollama.com/huihui_ai/qwen3-coder-next-abliterated), [`Qwen3.6-abliterated`](https://ollama.com/huihui_ai/Qwen3.6-abliterated).
