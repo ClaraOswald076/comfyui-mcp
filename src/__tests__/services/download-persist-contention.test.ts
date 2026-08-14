@@ -117,6 +117,22 @@ describe("#1545 the terminal record survives a reader holding it open", () => {
     // ~73ms measurement was Windows granularity, not the schedule.
     const totalBackoff = gaps.reduce((a, b) => a + b, 0);
     expect(totalBackoff).toBeGreaterThanOrEqual(25);
+
+    // CORROBORATION, not proof. Wall-clock cannot be a reliable discriminator in
+    // either direction here: too high a floor fails a correct implementation on a
+    // fast host, and any floor can be met by host/event-loop jitter with no
+    // backoff at all (review, round 2). So the structural fact is asserted too —
+    // deterministic, and immune to a loaded CI box.
+    const src = readFileSync(
+      new URL("../../services/download-progress.ts", import.meta.url),
+      "utf8",
+    );
+    const loop = src.slice(
+      src.indexOf("let renamed = false;"),
+      src.indexOf("if (!renamed) {"),
+    );
+    expect(loop).toMatch(/sleepSyncMs\(RENAME_BACKOFF_MS\[attempt - 1\]/);
+    expect(loop).toMatch(/if \(attempt > 0\)/); // never before the first attempt
   });
 
   it("does not retry at all when the first attempt lands", async () => {
