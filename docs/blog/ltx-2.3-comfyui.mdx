@@ -89,8 +89,11 @@ that matter for running it locally:
   two-stage "generate small, upscale in latent space" pipeline, plus an IC-LoRA
   detailer for refinement.
 
-> **Open weight, attribute carefully.** LTX-2 was released under **Apache 2.0**,
-> which is genuinely permissive — a real contrast to most "open" video models.
+> **Open weight, not Apache.** LTX-2 ships under the
+> [**LTX-2 Community License Agreement**](https://huggingface.co/Lightricks/LTX-2/blob/main/LICENSE),
+> not Apache 2.0 — open weights, but commercial use requires a separate paid
+> license once your annual revenue reaches **$10,000,000 USD**. Permissive for
+> almost everyone, and worth knowing about before you build a business on it.
 > LTX-2.3's exact license and the canonical repo you should pull from
 > (`huggingface.co/Lightricks`) are worth confirming before commercial use; some
 > community write-ups treat 2.3's terms as identical to LTX-2's, which we have not
@@ -105,8 +108,8 @@ There is no LTX 3.2. The correct name is **LTX-2.3** — a point release in the
 - **LTX-Video** (2024) — Lightricks' first open text-to-video model.
 - **LTX-2 / LTX-V2** (early 2026) — the ~19B-class DiT audio-video foundation
   model: the first production-ready **open-weight** model to generate synchronized
-  audio and video in one pass, up to native **4K @ 50fps** and ~20s clips,
-  Apache 2.0.
+  audio and video in one pass, up to native **4K @ 50fps** and ~20s clips, under
+  the LTX-2 Community License.
 - **LTX-2.3** (~March 2026) — a **~22B** DiT update with a rebuilt VAE (sharper
   textures, faces, hair, and on-screen text), a much larger text-projection
   connector for better prompt adherence, improved 9:16 portrait, cleaner
@@ -348,7 +351,9 @@ drafts; dev (~20 steps, cfg 3) for final quality.
 adds keyframes, prompt relay across the clip, custom audio, and built-in T2V/I2V to
 LTX-2.3 inside ComfyUI.
 
-**Is it really open / free?** LTX-2 shipped under **Apache 2.0**. LTX-2.3's exact
+**Is it really open / free?** Open weights, but not Apache. LTX-2 shipped under the
+**LTX-2 Community License Agreement**, which permits commercial use only while your
+annual revenue is under **$10,000,000 USD**. LTX-2.3's exact
 terms are worth confirming on the official Lightricks repo before commercial use —
 and the "sulphur" finetune is a separate third-party project with its own license.
 
@@ -356,7 +361,7 @@ and the "sulphur" finetune is a separate third-party project with its own licens
 
 ## Get it running in one command
 
-1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
+1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — then start the agent with `npx -y comfyui-mcp@latest connect` and click **Connect** in the panel (no API keys; sign in with `claude` once).
 2. Apply the **`ltx-2.3` pack** — GGUF UNet, both VAEs, the Gemma encoder, text
    projection, upscaler, and LoRAs land in the right folders, validated.
 3. Run the bundled **kornia fix**, restart, then open the [Panel](../panel) and let

@@ -323,7 +323,7 @@ vendor/blog benchmarks, not independently audited.)
 
 ## Get it running in one command
 
-1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
+1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — then start the agent with `npx -y comfyui-mcp@latest connect` and click **Connect** in the panel (no API keys; sign in with `claude` once).
 2. Apply the **[`wan-longer-videos` pack](https://github.com/artokun/comfyui-mcp/tree/main/packs/wan-longer-videos)** — nodes + the four hi/lo GGUFs, encoder, VAE, LoRAs, and upscaler land in the right folders, validated. Pick your quant tier.
 3. Open the [Panel](../panel) and let the panel's agent set the hi/lo split, swap LoRAs, and stitch longer clips for you.
 
