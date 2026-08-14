@@ -63,6 +63,20 @@ const RETIRED = [
     pattern: /external\/local orchestrator/i,
     why: 'that setting has no UI row and the mode is unconditionally on',
   },
+  {
+    // Caught in comfyui-agent-claude-or-chatgpt AFTER the first two patterns had already
+    // cleaned ten posts: same false claim, different verb, so it sailed through. The panel
+    // is a pure frontend extension and spawns nothing.
+    pattern: /panel\s+(?:starts|spawns|launches|boots)\b[^.]{0,60}orchestrator/i,
+    why: 'the panel is a pure frontend extension and cannot spawn a process; the user runs `connect`',
+  },
+  {
+    // Same post claimed a bridge port per backend. src/orchestrator/index.ts:1450 is explicit:
+    // "Single-port multi-provider: ONE orchestrator on ONE bridge port (default 9180) serves
+    // ALL providers" — the provider is chosen per TAB over the hello/set_backend handshake.
+    pattern: /each backend runs its\s+\*{0,2}own\*{0,2}\s+orchestrator/i,
+    why: 'one orchestrator on one bridge port serves every provider; the panel selects per tab',
+  },
 ];
 
 let failures = 0;
