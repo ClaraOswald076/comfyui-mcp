@@ -59,8 +59,11 @@ describe("panel_install_node states the v4 git-install limit (#1539)", () => {
     expect(text).toMatch(/Manager v4/i);
     expect(text).toMatch(/V4\.2\.2/, "the measured version, so a later Manager can be re-checked");
     expect(text).toMatch(/UPSTREAM limitation/i);
-    // The distinguishing fact: the URL is sent, it is simply not used to clone.
-    expect(text).toMatch(/does not clone from it/i);
+    // The distinguishing fact: the URL is sent, it is simply never reached. Scoped to the
+    // case actually probed — an UNLISTED repo — because that is all the run showed
+    // (review r2).
+    expect(text).toMatch(/for an unlisted repo v4 never reaches a clone/i);
+    expect(text).toMatch(/only that case was probed/i);
   });
 
   it("quotes the ACTUAL error, so the symptom is recognisable when it happens", () => {
@@ -73,12 +76,13 @@ describe("panel_install_node states the v4 git-install limit (#1539)", () => {
   it("gives the caller something to DO, and does not strand them", () => {
     const text = installNodeDef().description ?? "";
     expect(text).toMatch(/clone it into custom_nodes yourself/i);
-    // 3.x is not the same as v4 here, and saying so stops a "it worked before" report
-    // reading as a regression on our side — but it is ATTRIBUTED, not asserted, because
-    // 3.x was NOT measured in this change. Claiming it as fact would be the same
-    // over-reach this issue is about (review, P2).
-    expect(text).toMatch(/3\.x is reported/i);
-    expect(text).toMatch(/NOT measured here/i);
+    // 3.x: our own code is evidence of what we SEND, never of what the Manager DOES with
+    // it — review r2 was right that attributing it to "the panel's install-request code"
+    // still endorsed an outcome nobody here observed. The text now separates the two and
+    // marks the outcome unverified.
+    expect(text).toMatch(/that much is our own code/i);
+    expect(text).toMatch(/was NOT measured here/i);
+    expect(text).toMatch(/as unverified rather than as a regression/i);
   });
 
   it("does NOT promise a git URL installs unconditionally", () => {
