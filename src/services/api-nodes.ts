@@ -4,7 +4,7 @@ import type {
   NodeInputSpec,
   WorkflowJSON,
 } from "../comfyui/types.js";
-import { NON_EXECUTING_NODE_TYPES } from "./workflow-converter.js";
+import { FRONTEND_ONLY_NODE_TYPES } from "./workflow-converter.js";
 import { getObjectInfo } from "../comfyui/client.js";
 import { enqueueWorkflow } from "./workflow-executor.js";
 import { config } from "../config.js";
@@ -424,7 +424,7 @@ export async function checkWorkflowRuntime(
     // Absence from /object_info is not a heuristic for "virtual", it is the definition:
     // the frontend registers these, the backend does not. So a REGISTERED node of the same
     // name is a real node and is classified as one.
-    if (!def && NON_EXECUTING_NODE_TYPES.has(ct)) continue;
+    if (!def && FRONTEND_ONLY_NODE_TYPES.has(ct)) continue;
     if (!def) {
       unknownNodes.push(ct);
       continue;
@@ -445,7 +445,7 @@ export async function checkWorkflowRuntime(
   // otherwise a workflow of one KSampler plus three Notes reads as 1-of-4 API and reports
   // "mixed" when it is entirely local.
   const virtualCount = classTypes.filter(
-    (ct) => !objectInfo[ct] && NON_EXECUTING_NODE_TYPES.has(ct),
+    (ct) => !objectInfo[ct] && FRONTEND_ONLY_NODE_TYPES.has(ct),
   ).length;
   const classifiable = classTypes.length - unknownNodes.length - virtualCount;
   let runtime: "local" | "api" | "mixed" | "unknown";
