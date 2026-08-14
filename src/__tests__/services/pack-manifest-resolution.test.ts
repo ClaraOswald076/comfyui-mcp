@@ -16,6 +16,9 @@
 //   2. A path that IS one of our bundled packs, merely under a dead package root, should be
 //      recognised rather than reported as a missing file — the pack is right there.
 import { describe, expect, it } from "vitest";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { resolvePackManifestFile, repairStalePackManifestPath } from "../../services/manifest.js";
 
@@ -33,6 +36,15 @@ describe("a pack manifest resolves by NAME, never by a captured path (#1568)", (
     for (const bad of ["../../etc/passwd", "a/b", "..", "", "  ", "pack;rm -rf /"]) {
       expect(resolvePackManifestFile(bad), bad).toBeNull();
     }
+  });
+
+  it("refuses a name that traverses but LANDS BACK inside packs/", () => {
+    // Isolates the name test from the containment test. `../../etc/passwd` escapes the
+    // packs root, so the `startsWith` guard refuses it and the name pattern is never
+    // exercised — deleting the pattern left that case passing. This one resolves to a real
+    // pack directory, so containment is satisfied and only the name rule can refuse it.
+    expect(resolvePackManifestFile("krea2-combo/../krea2-combo")).toBeNull();
+    expect(resolvePackManifestFile("./krea2-combo")).toBeNull();
   });
 
   it("returns null for a pack that does not exist, rather than a path that does not", () => {
@@ -88,5 +100,40 @@ describe("a stale npx path is recognised as the pack it names (#1568)", () => {
     const live = resolvePackManifestFile("krea2-combo") as string;
     expect(live).toBeTruthy();
     expect(repairStalePackManifestPath(live)).toBeNull();
+  });
+
+  it("leaves an EXISTING path alone even when it is shaped like an install", () => {
+    // Isolates the exists-check from the owner-check. This repo's checkout directory is not
+    // named `comfyui-mcp`, so the test above is refused by the OWNER guard and passes with
+    // the exists-check deleted — the case that matters in production, where the path really
+    // does live under `node_modules/comfyui-mcp/packs/…`, was never covered.
+    //
+    // So build one on disk: a real file, at the real installed shape, that must be returned
+    // untouched because it is not stale.
+    const root = mkdtempSync(join(tmpdir(), "cmcp-1568-"));
+    const dir = join(root, "node_modules", "comfyui-mcp", "packs", "krea2-combo");
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, "manifest.yaml");
+    writeFileSync(file, "models: []\n");
+    try {
+      expect(existsSync(file), "the fixture must actually exist").toBe(true);
+      expect(
+        repairStalePackManifestPath(file),
+        "a live installed path is already correct — repairing it would retarget a real checkout",
+      ).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("requires the `packs` segment, not merely a comfyui-mcp root", () => {
+    // Isolates the packs-segment check from the owner check: owner IS comfyui-mcp here, and
+    // the pack name IS real, so only the segment rule can refuse it. The earlier refusal
+    // case had a non-matching owner and so passed with this rule deleted.
+    expect(
+      repairStalePackManifestPath(
+        "/x/_npx/abc/node_modules/comfyui-mcp/skills/krea2-combo/manifest.yaml",
+      ),
+    ).toBeNull();
   });
 });
