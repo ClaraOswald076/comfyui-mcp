@@ -745,6 +745,54 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.47] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- a panel too old to help is also too old to say so (#1572)
+
+
+## [0.51.46] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- settle whether an unlisted git repo can install at all (#1566)
+
+
+## [0.51.45] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- a Get/Set bus node is not an unknown runtime (#1564)
+
+
+## [0.51.44] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- an INFERRED models root must still be corroborated before a download lands there (#1562)
+
+
+## [0.51.43] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- a relative interpreter path no longer sends a LOCAL download to Manager (#1555)
+
+
+## [0.51.42] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- let the spawned child make the #952 drift comparison (#1553)
+
+
 ## [0.51.29] - 2026-08-13
 
 ### MCP

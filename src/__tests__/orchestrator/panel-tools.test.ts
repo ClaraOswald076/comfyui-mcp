@@ -29,7 +29,11 @@ import {
   type ToolResult,
 } from "../../orchestrator/panel-tools.js";
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
-import { markReplyTimeout } from "../../services/ui-bridge.js";
+import {
+  BRIDGE_DEFAULT_TIMEOUT_MS,
+  BRIDGE_READ_DEFAULT_TIMEOUT_MS,
+  markReplyTimeout,
+} from "../../services/ui-bridge.js";
 import { RunCompletions } from "../../orchestrator/run-completion-journal.js";
 import { QueueMonitor } from "../../services/queue-monitor.js";
 import { AskAnswers } from "../../orchestrator/ask-answer-journal.js";
@@ -54,8 +58,11 @@ function makeFakeCtx(
     // inspect the panel's reply. Record the forwarded cmd on the same `calls`
     // array and hand back a caller-supplied reply.
     bridge: {
-      send: async (cmd: Forwarded) => {
+      // Record the bound on the same index-aligned `timeouts` array as ctx.call,
+      // so a bound assertion reads the same way for both dispatch paths (#1520).
+      send: async (cmd: Forwarded, opts?: { timeoutMs?: number }) => {
         calls.push(cmd);
+        timeouts.push(opts?.timeoutMs);
         return bridgeReply ?? {};
       },
     } as unknown as PanelToolCtx["bridge"],
@@ -2228,6 +2235,75 @@ describe("panel-tools: agent-driven CivitAI + training modals", () => {
     ]) {
       expect(names).toContain(expected);
     }
+  });
+
+  // ── #1520: the two commands coupled to CivitAI get the tolerant read bound ──
+  //
+  // Of the six civitai_* commands, exactly two await the in-flight fetch panel
+  // side (`state.activeReloadPromise`): civitai_results and civitai_highlight.
+  // Their reply time is bounded by a third party, not by the tab, so charging
+  // them a bound sized for a local read fails a *healthy* panel.
+  //
+  // This asserts BOTH directions. Raising the coupled pair is the fix; leaving
+  // the local commands alone is the scope, and a test that only checked the pair
+  // would pass just as happily if someone raised all six — which would hide a
+  // genuinely dead tab behind an extra 10 s on commands that answer locally and
+  // immediately.
+  //
+  // The family is NOT uniform, and an earlier version of this comment said it
+  // was ("all six were on 10000; the other four keep the tighter bound"). Both
+  // halves were false. civitai_search dispatches through ctx.bridge.send, not
+  // ctx.call, and already takes BRIDGE_DEFAULT_TIMEOUT_MS — #1468 raised it for
+  // an unrelated reason. So only THREE keep 10 s, and search is pinned below on
+  // its own path so "raise search too" cannot pass unnoticed.
+  describe("civitai bridge bounds (#1520)", () => {
+    const COUPLED = ["panel_civitai_results", "panel_civitai_highlight"] as const;
+    const LOCAL = [
+      "panel_civitai_clear_highlight",
+      "panel_civitai_switch_tab",
+      "panel_civitai_open_lightbox",
+    ] as const;
+    // Minimal valid args per tool — the bound is forwarded before any of these
+    // matter, but the handlers must not reject before reaching ctx.call.
+    const ARGS: Record<string, Record<string, unknown>> = {
+      panel_civitai_results: { limit: 20 },
+      panel_civitai_highlight: { ids: ["1"] },
+      panel_civitai_clear_highlight: {},
+      panel_civitai_switch_tab: { tab: "models" },
+      panel_civitai_open_lightbox: { id: "1" },
+    };
+
+    it("the two fetch-coupled reads forward the 20s read bound, not 10s", async () => {
+      for (const name of COUPLED) {
+        const { ctx, calls, timeouts } = makeFakeCtx();
+        await defByName(name).handler(ARGS[name], ctx);
+        const i = calls.findIndex((c) => String(c.cmd).startsWith("civitai_"));
+        expect(i, `${name} never forwarded a civitai_* command`).toBeGreaterThanOrEqual(0);
+        expect(timeouts[i], `${name} bound`).toBe(BRIDGE_READ_DEFAULT_TIMEOUT_MS);
+      }
+    });
+
+    it("the commands that answer locally keep the tighter bound", async () => {
+      for (const name of LOCAL) {
+        const { ctx, calls, timeouts } = makeFakeCtx();
+        await defByName(name).handler(ARGS[name], ctx);
+        const i = calls.findIndex((c) => String(c.cmd).startsWith("civitai_"));
+        expect(i, `${name} never forwarded a civitai_* command`).toBeGreaterThanOrEqual(0);
+        expect(timeouts[i], `${name} bound`).toBe(10000);
+        expect(timeouts[i]).toBeLessThan(BRIDGE_READ_DEFAULT_TIMEOUT_MS);
+      }
+    });
+
+    it("civitai_search keeps its own path and bound — it is not part of this change", async () => {
+      // Pinned so the scope assertion above cannot be quietly widened: search is
+      // the sixth command, it does NOT go through ctx.call, and its bound was
+      // already raised by #1468 because driveSearch dispatches without awaiting.
+      const { ctx, calls, timeouts } = makeFakeCtx({ ok: true, results: [] });
+      await defByName("panel_civitai_search").handler({ query: "flux" }, ctx);
+      const i = calls.findIndex((c) => c.cmd === "civitai_search");
+      expect(i, "panel_civitai_search never forwarded civitai_search").toBeGreaterThanOrEqual(0);
+      expect(timeouts[i], "civitai_search bound").toBe(BRIDGE_DEFAULT_TIMEOUT_MS);
+    });
   });
 
   it("panel_open_civitai forwards a dock flag alongside the existing args", async () => {

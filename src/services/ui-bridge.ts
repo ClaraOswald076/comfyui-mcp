@@ -2943,12 +2943,43 @@ export class UiBridge {
     tooOld: boolean;
     version?: string;
     needed: string;
+    /**
+     * The panel has NEVER advertised a version on this tab (#1560).
+     *
+     * Distinct from `advertised === false`, which only means THIS connection's
+     * hello omitted it while a previous one supplied a value — the inherited case
+     * the tri-state guard above exists for, where staying silent is right.
+     *
+     * Never having one is different, and it is evidence rather than absence:
+     * `panel_version` has ridden the hello since panel v0.11.83 (measured — the
+     * commit is an ancestor of v0.11.83 and of no earlier tag), so a panel that
+     * has never sent one is BELOW 0.11.83.
+     *
+     * THAT IS ALL IT PROVES, and an earlier version of this said more (review, P1):
+     * "below 0.11.83" does NOT imply "below 0.11.45". Panels in 0.11.45–0.11.82
+     * publish the reply uuid perfectly well and simply predate version
+     * advertisement, so telling one of those to update would name a cause that is
+     * not theirs. The caller renders this as a possibility to CHECK, never as a
+     * finding.
+     *
+     * It is still worth saying, because the band that cannot speak for itself is
+     * where the #1043 deadlock lives: #1560's reporter was on 0.11.37 and got a
+     * bare "the panel did not answer" with nothing to act on.
+     */
+    neverAdvertised?: boolean;
   } {
     const needed = PANEL_MIN_VERSION_REPLY_UUID;
     let version: string | undefined;
     let advertised = false;
+    // Did the LOOKUP itself succeed? A throw leaves `version` undefined, which is
+    // indistinguishable from "the panel never sent one" unless it is tracked
+    // separately — and rendering an unreadable tab as "your panel is old" would
+    // accuse a CURRENT panel whose socket merely closed (review, P1). Absence of
+    // evidence, one level down.
+    let resolved = false;
     try {
       const t = this.resolveTarget(tabId);
+      resolved = true;
       version = t.panelVersion;
       // #1043 (codex review) — the version must come from THIS connection's own
       // hello. A re-hello that omits `panel_version` INHERITS the previous value,
@@ -2960,7 +2991,18 @@ export class UiBridge {
     } catch {
       version = undefined;
     }
-    if (!advertised) return { tooOld: false, needed };
+    // NEVER advertised is not the same as "not advertised on this connection"
+    // (#1560). The latter inherits a known value and must stay silent; the former
+    // is only possible below v0.11.83, which is itself below `needed`.
+    //
+    // `tooOld` stays FALSE for it on purpose: this is an inference from a missing
+    // field, not a version comparison, and the two must not be reported with the
+    // same confidence. The caller renders it as a hedge.
+    if (!advertised) {
+      return resolved && version === undefined
+        ? { tooOld: false, needed, neverAdvertised: true }
+        : { tooOld: false, needed };
+    }
     if (!version || !SEMVER_RE.test(version.trim())) return { tooOld: false, needed };
     return { tooOld: compareSemver(version, needed) < 0, version, needed };
   }

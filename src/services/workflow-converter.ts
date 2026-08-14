@@ -577,7 +577,17 @@ function getOrderedInputNames(def: ComfyUINodeDef): string[] {
 
 // ── De-virtualization (Get/Set/Reroute) pre-pass ────────────────────────────
 
-const WIRING_VIRTUAL_TYPES = new Set([
+/**
+ * The KJNodes-style Get/Set BUS types. Frontend-only: the pre-pass below rewrites
+ * each consumer's link straight to the real upstream source, so none of these ever
+ * appears in a queued prompt.
+ *
+ * EXPORTED (#1400) for the same reason `NON_EXECUTING_NODE_TYPES` is: the runtime
+ * classifier needs to know which types never reach the backend, and a second copy
+ * of that knowledge is how two lists drift. This one is already load-bearing for a
+ * much heavier reason than a verdict — a stale entry here drops links.
+ */
+export const WIRING_VIRTUAL_TYPES: ReadonlySet<string> = new Set([
   "GetNode", "SetNode", "PRO_GetNode", "PRO_SetNode",
   "SetNode_GetNode", "SetNode_SetNode",
 ]);
@@ -2273,6 +2283,31 @@ export const NON_EXECUTING_NODE_TYPES: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Every type that never reaches the backend — the LiteGraph natives above PLUS the
+ * Get/Set bus virtuals the de-virtualization pre-pass strips (#1400).
+ *
+ * A SEPARATE set from `NON_EXECUTING_NODE_TYPES` because the two answer different
+ * questions, and conflating them would be a silent behaviour change:
+ *
+ *   NON_EXECUTING_NODE_TYPES also drives the converter's own `SKIP_TYPES`. A
+ *     Get/Set node that the pre-pass could NOT resolve (a broken bus, a missing
+ *     Set for a Get) still reaches the main loop, where dedicated logic handles it
+ *     and reports the loss. Adding the bus types there would route those into the
+ *     skip path instead, quietly dropping the diagnostic.
+ *
+ *   FRONTEND_ONLY_NODE_TYPES answers the runtime classifier's question: could this
+ *     class_type be a paid API node the server does not expose? For anything in
+ *     here the answer is no, whether or not this particular graph's bus resolved.
+ *
+ * Callers that mean "does not execute anywhere" want THIS one; callers that mean
+ * "the converter emits nothing for it" want the narrower one above.
+ */
+export const FRONTEND_ONLY_NODE_TYPES: ReadonlySet<string> = new Set([
+  ...NON_EXECUTING_NODE_TYPES,
+  ...WIRING_VIRTUAL_TYPES,
+]);
+
+/**
  * Convert a ComfyUI UI-format workflow to API format.
  * Requires objectInfo from /object_info to map widgets_values to named inputs.
  */
@@ -2315,11 +2350,19 @@ export function convertUiToApi(
   // Node types that are purely visual/internal and have no API equivalent
   const SKIP_TYPES = NON_EXECUTING_NODE_TYPES;
 
-  // Get/Set node types that need special handling (not in object_info)
-  const GET_SET_TYPES = new Set([
-    "GetNode", "SetNode", "PRO_GetNode", "PRO_SetNode",
-    "SetNode_GetNode", "SetNode_SetNode",
-  ]);
+  // Get/Set node types that need special handling (not in object_info). The SAME
+  // set the de-virtualization pre-pass uses — this was a verbatim second copy, and
+  // two lists of third-party type names in one file is precisely the drift the
+  // exported sets exist to prevent (#1400).
+  //
+  // NOT covered by a test, and mutation testing says so: narrowing this back to a
+  // hand-written `new Set(["GetNode", "SetNode"])` kills nothing, because the
+  // pre-pass strips every RESOLVABLE bus before the main loop runs. What reaches
+  // here is only a bus the pre-pass could not resolve (a Get with no matching Set,
+  // a broken chain), and no fixture builds one. Sharing the set is still strictly
+  // better than a second copy — it just cannot be proven from outside, so it is
+  // written down instead of assumed.
+  const GET_SET_TYPES = WIRING_VIRTUAL_TYPES;
 
   const nodesById = new Map(expanded.nodes.map((n) => [n.id, n]));
 
