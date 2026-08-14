@@ -684,6 +684,13 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
   assertNotWritingRealHomeInTests(path, "the panel operation lock");
   mkdirSync(dirname(path), { recursive: true });
   const deadline = Date.now() + timeoutMs;
+  // #1489 — throttle for the dead-owner probe below. The poll runs every 100 ms
+  // and `observePanelLock` does a stat + read, so probing on every tick would be
+  // ~600 syscall pairs over a full wait to answer a question that cannot change
+  // that fast. First probe fires immediately (the common case is a lock left by
+  // an orchestrator that died some time ago, and that is answerable at once).
+  const LIVENESS_PROBE_MS = 1_000;
+  let nextLivenessProbe = 0;
 
   for (;;) {
     try {
@@ -881,6 +888,46 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
             `Or do it by hand: stop or restart every comfyui-mcp orchestrator, verify ` +
             `none remain, delete this exact lock file, then retry.`,
         );
+      }
+      // #1489 — a PROVABLY DEAD owner is knowable now, so do not spend the rest
+      // of the 60 s discovering it. This is a latency narrowing ONLY: the outcome
+      // is the same refusal with the same remedy, delivered when it is first
+      // provable instead of at the deadline.
+      //
+      // Deliberately NOT an auto-reclaim. #779 made stale-lock recovery
+      // fail closed on purpose — a concurrent pre-upgrade orchestrator can
+      // replace an observed stale path with a fresh lock, so deleting on our own
+      // observation can destroy a live holder's lock. `panel_action:"unlock"`
+      // re-verifies under its own rules and stays the only path that removes
+      // anything.
+      //
+      // ONLY `alive === false` short-circuits. `"unsure"` is a recycled-pid
+      // maybe and MUST keep waiting — treating it as dead is the exact
+      // existence-for-identity fold `pidLiveness` was written to stop. `true`
+      // means a real operation may still be running.
+      // AGE GATES BEFORE LIVENESS, matching `reclaimAbandonedPanelLock`, which
+      // refuses on age before it ever consults a pid. A FRESH lock is protected
+      // even when its recorded owner is dead — that is a deliberate rule with
+      // its own test ("does NOT reclaim a fresh lock even when its recorded pid
+      // is dead"), and an early report that ignored it would be this module
+      // holding two different opinions about what freshness means. Short-cutting
+      // only the STALE case still covers the report, whose lock had been
+      // blocking long enough to need a manual unlock.
+      if (Date.now() >= nextLivenessProbe) {
+        nextLivenessProbe = Date.now() + LIVENESS_PROBE_MS;
+        const early = observePanelLock(path);
+        if (early?.alive === false && early.ageMs >= STALE_LOCK_MS) {
+          throw new Error(
+            `The panel operation lock at ${path} is held by a process that is no longer ` +
+              `running. ${describeObservedLock(path, early)} Not waiting out the remaining ` +
+              `timeout, and not deleting it either: a concurrent orchestrator could have ` +
+              `replaced it since it was observed. To clear a proven abandoned lock, run ` +
+              `install_comfyui(action:'panel', panel_action:'unlock') — it re-verifies that the recorded ` +
+              `owner is dead and the lock is old before deleting anything, and refuses ` +
+              `otherwise. Or do it by hand: stop or restart every comfyui-mcp orchestrator, ` +
+              `verify none remain, delete this exact lock file, then retry.`,
+          );
+        }
       }
       await sleep(POLL_MS);
     }
