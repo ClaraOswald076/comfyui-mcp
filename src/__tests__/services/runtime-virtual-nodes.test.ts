@@ -19,7 +19,10 @@
 import { describe, expect, it } from "vitest";
 
 import { checkWorkflowRuntime } from "../../services/api-nodes.js";
-import { NON_EXECUTING_NODE_TYPES } from "../../services/workflow-converter.js";
+import {
+  FRONTEND_ONLY_NODE_TYPES,
+  NON_EXECUTING_NODE_TYPES,
+} from "../../services/workflow-converter.js";
 
 const KSAMPLER = { input: { required: { seed: ["INT"] } }, output: ["LATENT"], name: "KSampler" };
 /** An API node as the classifier recognises one. */
@@ -120,5 +123,72 @@ describe("a frontend-only node is not an unknown runtime (#1372)", () => {
     );
     expect(r.runtime).toBe("mixed");
     expect(r.usesApiNodes).toBe(true);
+  });
+});
+
+// #1400 — the follow-up. #1372 covered the four LiteGraph-NATIVE virtuals, which left the
+// larger half of the measured population: KJNodes Get/Set bus nodes. In the same four-pack
+// measurement they were the most common entries by far — 3x GetNode, 3x SetNode against
+// 2x Note — so a Get/Set-routed workflow still collapsed to "unknown" and still stopped the
+// safety flow.
+//
+// The converter has ALWAYS known these never reach the backend: `deVirtualize` strips the
+// whole Get/Set bus before a prompt is built, rewriting each consumer's link to the real
+// upstream source. So this is not a new list of third-party names to keep current — it is
+// the classifier finally consulting the list the converter must already keep correct, for
+// a reason far more load-bearing than this verdict (a stale entry there drops links).
+describe("a Get/Set bus node is not an unknown runtime (#1400)", () => {
+  it("THE REPORTED CASE: a Get/Set-routed local workflow is local, not unknown", async () => {
+    const r = await checkWorkflowRuntime(
+      graphOf("KSampler", "GetNode", "SetNode"),
+      depsWith({ KSampler: KSAMPLER }),
+    );
+    expect(r.runtime).toBe("local");
+    expect(r.usesApiNodes).toBe(false);
+    expect(r.unknownNodes).toEqual([]);
+  });
+
+  it("every wiring virtual the CONVERTER strips is treated the same way", async () => {
+    // Imported, not restated: if the converter learns a new bus type, the classifier
+    // learns it in the same commit or this fails.
+    for (const t of FRONTEND_ONLY_NODE_TYPES) {
+      const r = await checkWorkflowRuntime(graphOf("KSampler", t), depsWith({ KSampler: KSAMPLER }));
+      expect(r.runtime, `${t} must not make the runtime unknown`).toBe("local");
+      expect(r.unknownNodes, `${t} must not be reported as unknown`).toEqual([]);
+    }
+  });
+
+  it("the shared set CONTAINS both halves — natives and wiring virtuals", async () => {
+    // Guards the union itself: dropping either half would leave the other's tests green.
+    for (const t of NON_EXECUTING_NODE_TYPES) expect(FRONTEND_ONLY_NODE_TYPES.has(t)).toBe(true);
+    for (const t of ["GetNode", "SetNode", "PRO_GetNode", "PRO_SetNode"]) {
+      expect(FRONTEND_ONLY_NODE_TYPES.has(t), `${t} must be classified frontend-only`).toBe(true);
+    }
+  });
+
+  it("a REGISTERED backend node named GetNode is still examined, not skipped", async () => {
+    // The #1396 codex P1, inherited: the skip applies only when the server does NOT
+    // register the type. A third-party backend node that happens to be called GetNode —
+    // and is a paid API node — must not be waved through unexamined.
+    const r = await checkWorkflowRuntime(
+      graphOf("KSampler", "GetNode"),
+      depsWith({ KSampler: KSAMPLER, GetNode: API_NODE }),
+    );
+    expect(r.runtime).toBe("mixed");
+    expect(r.usesApiNodes).toBe(true);
+    expect(r.apiNodes).toContain("GetNode");
+  });
+
+  it("rgthree's canvas-only nodes are still UNKNOWN — cautious, and deliberately so", async () => {
+    // The rest of #1400's population (Label, Fast Groups Bypasser/Muter) is NOT covered.
+    // The converter does not strip them, so nothing here can prove they never execute, and
+    // guessing "free" is a guess with someone's money on it. Recorded as a test so the gap
+    // is a decision rather than an oversight.
+    const r = await checkWorkflowRuntime(
+      graphOf("KSampler", "Fast Groups Bypasser (rgthree)"),
+      depsWith({ KSampler: KSAMPLER }),
+    );
+    expect(r.runtime).toBe("unknown");
+    expect(r.unknownNodes).toEqual(["Fast Groups Bypasser (rgthree)"]);
   });
 });
