@@ -745,6 +745,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.49] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- a tab leaves the watch when its restart RESOLVES, not only when dropped
+- a watch can no longer outlive the save that created it
+- only an ARMED credential respawn may speak, and only once
+- take the at-risk snapshot when the respawn FIRES, not when it is queued
+
+#### Changed
+- fix what the docs claim, before translating them into eleven languages (#1558)
+
+
 ## [0.51.48] - 2026-08-14
 
 ### MCP
