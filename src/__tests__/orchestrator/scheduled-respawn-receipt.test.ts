@@ -55,6 +55,18 @@ describe("a QUEUED respawn is never described as 'no respawn required' (#1567)",
       respawn: { live: 1, applied: 0, scheduled: 1 },
     });
     expect(text).toMatch(/download|transfer/i);
+    // Naming downloads is not enough on its own: the load-bearing part is WHY nothing is
+    // listed. Without it the message reads as a generic caution rather than "the check you
+    // are used to seeing cannot cover what you do next", which is the actual trap.
+    // A first version of this test asserted only the word "download" and was satisfied by
+    // an unrelated sentence, so a mutation deleting the warning survived.
+    // BOTH halves, not an alternation: the first draft accepted any one of three phrases,
+    // so deleting one of them left the test green. The claim is a conjunction — nothing is
+    // listed (1) BECAUSE a transfer started later did not exist when the check ran (2) —
+    // and either half alone is a different, weaker statement.
+    expect(text).toMatch(/cannot list/i);
+    expect(text).toMatch(/after this save/i);
+    expect(text).toMatch(/did not exist/i);
   });
 
   it("keeps the claim when NOTHING is scheduled — the sentence is correct there", () => {

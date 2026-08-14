@@ -434,9 +434,36 @@ export function describeComfyuiSecretSave(receipt: SecretSaveReceipt): string {
     // This is the property that makes the answer safe to act on immediately: the
     // tools resolve this key from the file at USE time, so the already-running
     // tool process sees it whether or not any respawn happens.
-    parts.push(
-      `The comfyui tools re-read that file each time they use this credential, so the tool process already running picks it up — no reload, and no respawn required.`,
-    );
+    //
+    // #1567 — but "no respawn required" was printed UNCONDITIONALLY, including on
+    // the same message that reported one already queued. Both statements were
+    // true about different things: the key needs no respawn, and a respawn is
+    // pending anyway. Read together they say "nothing is about to happen", and a
+    // reporter acted on that by starting ~48GB of downloads that the pending
+    // respawn then killed.
+    //
+    // The sentence is kept where it is correct — nothing scheduled, nothing
+    // applied — because that is the case it was written for and deleting it
+    // would lose a genuinely useful "you can retry right now".
+    const pending = receipt.respawn?.scheduled ?? 0;
+    const already = receipt.respawn?.applied ?? 0;
+    const readsItAtUseTime = `The comfyui tools re-read that file each time they use this credential, so the tool process already running picks it up — no reload needed`;
+    if (pending > 0) {
+      parts.push(
+        `${readsItAtUseTime}. But a tool-session respawn is STILL PENDING from this save ` +
+          `(${pending} queued for the end of this turn), and it replaces the tool session when it fires. ` +
+          `Anything long-running that session owns is lost at that point — model downloads in ` +
+          `particular. This message cannot list them, because a transfer started AFTER this save ` +
+          `did not exist when the check ran (#1567). If you are about to start a long download, ` +
+          `let the respawn land first.`,
+      );
+    } else if (already > 0) {
+      // A respawn HAPPENED. Saying none was required describes a different save,
+      // and #1378's at-risk warning above is reporting what that one cost.
+      parts.push(`${readsItAtUseTime} — and the tool session was rebuilt just now regardless.`);
+    } else {
+      parts.push(`${readsItAtUseTime}, and no respawn required.`);
+    }
   } else {
     parts.push(
       `This key is read from the tool process's environment at startup, so only a respawned tool session will see it.`,

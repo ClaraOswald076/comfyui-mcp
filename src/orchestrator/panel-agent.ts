@@ -23,6 +23,8 @@ import type {
   McpSdkServerConfigWithInstance,
 } from "@anthropic-ai/claude-agent-sdk";
 import { logger } from "../utils/logger.js";
+import { downloadsAtRiskOfRespawn } from "../services/download-jobs.js";
+import { orphanedByDeferredRespawnNote } from "../services/panel-secrets.js";
 import { errorText, promptText } from "./error-text.js";
 import type { SessionStore } from "./session-store.js";
 import type { AgentBackend, AgentEvent, NeutralTurn } from "./agent-backend.js";
@@ -2391,6 +2393,20 @@ export class PanelAgentManager {
    *
    * No-op unless something is pending and the agent has fully settled (idle).
    */
+  /** #1567 — what this respawn is about to orphan, enumerated NOW rather than at save
+   *  time. Never throws and never blocks the restart: a rebuild that cannot run because
+   *  the warning failed is strictly worse than a rebuild with no warning. */
+  private deferredRespawnOrphanNote(): string | null {
+    try {
+      return orphanedByDeferredRespawnNote(downloadsAtRiskOfRespawn());
+    } catch (err) {
+      logger.debug("[panel-orchestrator] could not enumerate downloads a respawn will orphan", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  }
+
   private applyPendingRestarts(tabId: string): McpEnvRestartOutcome {
     const wantEffort = this.pendingEffortRestart.has(tabId);
     const wantMcp = this.pendingMcpRestart.has(tabId);
@@ -2407,10 +2423,22 @@ export class PanelAgentManager {
     if (agent.isBusy || agent.hasPending) return "scheduled";
     // Only the MCP respawn carries a retry nudge.
     const nudge = wantMcp ? (this.pendingMcpRestart.get(tabId) ?? undefined) : undefined;
+    // #1567 — RE-TAKE the at-risk snapshot HERE. The save-time one (#1378) is taken
+    // before the emit because for an APPLIED respawn the emit is the damage. For a
+    // QUEUED one the damage is this line, arbitrarily many turns later, so a save-time
+    // snapshot cannot see a transfer that started in between — which is exactly what
+    // happened: nothing in flight at save, nine downloads started over the next two
+    // turns, all killed here with no warning at any point.
+    //
+    // This nudge is not a spurious turn. It only exists when transfers are being
+    // destroyed right now, and the resumed session is the only thing positioned to
+    // re-issue them — the alternative, which shipped, is silence.
+    const orphanNote = wantMcp ? this.deferredRespawnOrphanNote() : null;
+    const finalNudge = orphanNote ? [nudge, orphanNote].filter(Boolean).join("\n\n") : nudge;
     this.pendingEffortRestart.delete(tabId);
     this.pendingMcpRestart.delete(tabId);
     this.pendingRetargetFrom.delete(tabId);
-    const carried = this.restartAgentResume(tabId, agent, nudge);
+    const carried = this.restartAgentResume(tabId, agent, finalNudge);
     const reasons = [wantEffort ? "effort" : null, wantMcp ? "comfyui-mcp-env" : null]
       .filter(Boolean)
       .join("+");
