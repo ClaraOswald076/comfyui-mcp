@@ -745,6 +745,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.44] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- an INFERRED models root must still be corroborated before a download lands there (#1562)
+
+
 ## [0.51.43] - 2026-08-14
 
 ### MCP
