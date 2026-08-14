@@ -51,6 +51,17 @@ export interface PreExecutorRefusal {
 export function readPanelRefusal(value: unknown): PreExecutorRefusal | null {
   if (!value || typeof value !== "object") return null;
   const r = value as Record<string, unknown>;
+  // OWN PROPERTIES, at every hop (review, P0). An earlier version applied this rule
+  // to the Error only, and read the claim's fields with plain lookups — so a
+  // polluted `Object.prototype` carrying a valid-looking `applied`/`stage`/
+  // `retryable` would let a claim that names none of them authorise a retry, and
+  // the mutation this channel exists to protect gets re-issued after it landed.
+  //
+  // Inheritance is the wrong shape for a claim of provenance in either direction:
+  // what matters is that THIS object states it, not that something up its chain
+  // does.
+  const own = (k: string): boolean => Object.prototype.hasOwnProperty.call(r, k);
+  if (!own("code") || !own("applied") || !own("stage") || !own("retryable")) return null;
   if (typeof r.code !== "string" || !RETRYABLE_REFUSAL_CODES.has(r.code)) return null;
   if (r.applied !== false) return null;
   if (r.stage !== "pre-executor") return null;

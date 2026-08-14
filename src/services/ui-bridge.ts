@@ -2645,7 +2645,13 @@ export class UiBridge {
           // Validated before it is attached, so only a complete pre-executor claim
           // travels; anything else leaves the error exactly as it was.
           const err = new Error(String(msg.error ?? "panel reported an error"));
-          const refusal = readPanelRefusal((msg as { refusal?: unknown }).refusal);
+          // OWN property on the WIRE message too (review, P0). A polluted
+          // Object.prototype.refusal would otherwise give every ordinary panel
+          // error — including a genuine mid-write one carrying no refusal of its
+          // own — the authority to have a mutation re-issued.
+          const refusal = Object.prototype.hasOwnProperty.call(msg, "refusal")
+            ? readPanelRefusal((msg as { refusal?: unknown }).refusal)
+            : null;
           p.reject(refusal ? attachPanelRefusal(err, refusal) : err);
         }
         return;

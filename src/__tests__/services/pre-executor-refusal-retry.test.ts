@@ -147,8 +147,8 @@ describe("the channel is actually connected (#1529)", () => {
     const src = readFileSync(new URL("../../services/ui-bridge.ts", import.meta.url), "utf-8");
     const at = src.indexOf('new Error(String(msg.error ?? "panel reported an error"))');
     expect(at, "the reply-to-error conversion must still be recognisable").toBeGreaterThan(-1);
-    const block = src.slice(at, at + 400);
-    expect(block).toMatch(/readPanelRefusal\(\(msg as \{ refusal\?: unknown \}\)\.refusal\)/);
+    const block = src.slice(at, at + 700);
+    expect(block).toMatch(/readPanelRefusal\(/);
     expect(block).toMatch(/refusal \? attachPanelRefusal\(err, refusal\) : err/);
   });
 
@@ -187,5 +187,58 @@ describe("the channel is actually connected (#1529)", () => {
       );
       expect(codeOnly, `no string test may key on "${phrase}"`).not.toMatch(tested);
     }
+  });
+});
+
+// ── PROTOTYPE POLLUTION, at every hop (review, P0) ──────────────────────────
+//
+// The own-property rule was applied to the Error only. The wire message and the
+// claim's own fields were read with plain lookups, so a polluted Object.prototype
+// could supply the parts a real refusal omits — and an ordinary mid-write failure
+// would gain the authority to have its mutation re-issued.
+
+describe("a polluted prototype cannot manufacture retry authority (#1529)", () => {
+  it("inherited CLAIM FIELDS do not complete a partial refusal", () => {
+    Object.defineProperty(Object.prototype, "applied", {
+      value: false,
+      configurable: true,
+      writable: true,
+      enumerable: false,
+    });
+    Object.defineProperty(Object.prototype, "stage", {
+      value: "pre-executor",
+      configurable: true,
+      writable: true,
+      enumerable: false,
+    });
+    Object.defineProperty(Object.prototype, "retryable", {
+      value: true,
+      configurable: true,
+      writable: true,
+      enumerable: false,
+    });
+    try {
+      // A refusal naming only a code: everything else would be inherited.
+      const partial = { code: "backend-reconnecting" };
+      expect((partial as Record<string, unknown>).applied, "the pollution is live").toBe(false);
+      expect(readPanelRefusal(partial), "an inherited claim is not a claim").toBeNull();
+      // …and a complete OWN refusal still works while the prototype is polluted.
+      expect(readPanelRefusal({ ...GOOD })?.code).toBe("backend-reconnecting");
+    } finally {
+      delete (Object.prototype as unknown as Record<string, unknown>).applied;
+      delete (Object.prototype as unknown as Record<string, unknown>).stage;
+      delete (Object.prototype as unknown as Record<string, unknown>).retryable;
+    }
+  });
+
+  it("the BRIDGE requires an own `refusal` on the reply", async () => {
+    // Source-asserted: the conversion lives inside the socket handler and is not
+    // reachable without a live bridge. The property is one line and deleting it is
+    // the whole defect, so it is pinned where it lives.
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(new URL("../../services/ui-bridge.ts", import.meta.url), "utf-8");
+    const at = src.indexOf('new Error(String(msg.error ?? "panel reported an error"))');
+    const block = src.slice(at, at + 600);
+    expect(block).toMatch(/hasOwnProperty\.call\(msg, "refusal"\)/);
   });
 });
