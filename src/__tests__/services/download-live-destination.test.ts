@@ -336,14 +336,54 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     );
   });
 
-  it("does NOT second-guess a LIVE-AUTHORITATIVE root that exists locally — no listing call", async () => {
-    h.modelsDirSource = "observed-root";
+  it("does NOT second-guess a root the SERVER'S OWN ARGV named, when it exists locally", async () => {
+    // `argv-flag` and `live-root` come from the server stating where it reads.
+    // Nothing this side infers can be better evidence than that, so the listing
+    // call is skipped entirely.
+    h.modelsDirSource = "live-root";
     h.onDisk = { loras: ["stale.safetensors"] };
     h.liveListings["loras"] = ["completely-different.safetensors"];
     await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
       resolve("/comfy/models/loras"),
     );
     expect(h.fetchCalls).toEqual([]);
+  });
+
+  // ── #369 recurrence: `observed-root` is INFERRED, not vouched for ──────────
+  //
+  // This test previously asserted the opposite, for `observed-root`, on the
+  // ground that a "live-resolved" root is authoritative and needs no second
+  // opinion. Measured against the anchor, that ground does not hold:
+  // `observed-root` is the relative `main.py` re-anchored on the interpreter the
+  // OS reports, which establishes where the BINARY lives — not where the server
+  // reads models. With a stale bundle's python on PATH, `cd D:\live && python
+  // ComfyUI\main.py` anchors `C:\stale\ComfyUI`, and the download lands in an
+  // install the running server never reads. That is #369's original outcome
+  // reached by a different route, which is why it was reopened.
+  //
+  // So the exemption now covers only the two sources the SERVER ITSELF named.
+  // `observed-root` runs the same cheap, fail-open disagreement check every
+  // configured root runs — it cannot refuse a fresh or shared tree, because the
+  // check needs POSITIVE contradicting evidence (containment, root-wide).
+  it("#369: an INFERRED root IS checked, and a contradicting live listing refuses it", async () => {
+    h.modelsDirSource = "observed-root";
+    h.onDisk = { loras: ["stale.safetensors"] };
+    h.liveListings["loras"] = ["completely-different.safetensors"];
+    await expect(resolveModelSubfolderPreferServer("loras")).rejects.toThrow(
+      /does not read|not part of its search path|stale/i,
+    );
+    expect(h.fetchCalls.length).toBeGreaterThan(0);
+  });
+
+  it("#369: an inferred root that AGREES with the live server still proceeds", async () => {
+    // The direction that must not regress: the check is fail-open and needs
+    // positive contradiction, so a correct anchor is unaffected.
+    h.modelsDirSource = "observed-root";
+    h.onDisk = { loras: ["shared.safetensors"] };
+    h.liveListings["loras"] = ["shared.safetensors", "other.safetensors"];
+    await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
+      resolve("/comfy/models/loras"),
+    );
   });
 
   it("PROCEEDS on a container-side models root that does not exist here (post-write reports it)", async () => {
