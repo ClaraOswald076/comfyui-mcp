@@ -7,7 +7,7 @@
 // of relying on an idle interactive session to notice a channel push — and spawns
 // one Claude Agent SDK streaming session per panel tab (src/orchestrator/
 // panel-agent.ts). Each agent runs on the user's Claude SUBSCRIPTION with no API
-// key. See docs/design/panel-orchestrator.md.
+// key. See design/panel-orchestrator.md.
 
 import {
   existsSync,
