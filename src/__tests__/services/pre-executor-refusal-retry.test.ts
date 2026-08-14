@@ -17,6 +17,7 @@ import { describe, expect, it } from "vitest";
 import {
   PANEL_REFUSAL_PROP,
   attachPanelRefusal,
+  hasOwnField,
   isPreExecutorRefusal,
   readPanelRefusal,
 } from "../../services/panel-refusal.js";
@@ -239,6 +240,65 @@ describe("a polluted prototype cannot manufacture retry authority (#1529)", () =
     const src = readFileSync(new URL("../../services/ui-bridge.ts", import.meta.url), "utf-8");
     const at = src.indexOf('new Error(String(msg.error ?? "panel reported an error"))');
     const block = src.slice(at, at + 600);
-    expect(block).toMatch(/hasOwnProperty\.call\(msg, "refusal"\)/);
+    expect(block).toMatch(/hasOwnField\(msg, "refusal"\)/);
+  });
+
+  it("the own-property TEST itself is not reachable through the prototype", () => {
+    // Review, round 3. `Object.prototype.hasOwnProperty.call(x, k)` reads the method
+    // off the very prototype the check exists to distrust. Swapping it for one that
+    // answers `true` does not break through on its own — a claim with no values is
+    // still rejected on its values. It breaks through COMBINED with pollution that
+    // supplies them, which is what this reproduces. The module binds the intrinsic at
+    // load, so neither half reaches it.
+    //
+    // Under this project's threat model this guards a MISTAKE, not an attacker: a
+    // process that can rewrite Object.prototype can call the retry path directly.
+    const realHasOwn = Object.prototype.hasOwnProperty;
+    const define = (target: object, key: string, value: unknown): void => {
+      Object.defineProperty(target, key, {
+        value,
+        configurable: true,
+        writable: true,
+        enumerable: false,
+      });
+    };
+    // Assertions run AFTER the window closes — `expect` itself uses hasOwnProperty.
+    let partial: unknown;
+    let inherited: unknown;
+    let genuine: unknown;
+    let swapWasLive = false;
+    define(Object.prototype, "applied", false);
+    define(Object.prototype, "stage", "pre-executor");
+    define(Object.prototype, "retryable", true);
+    define(Error.prototype, PANEL_REFUSAL_PROP, { ...GOOD });
+    define(Object.prototype, "hasOwnProperty", () => true);
+    try {
+      swapWasLive = realHasOwn.call({}, "nothing") === false && ({}).hasOwnProperty("nothing") === true;
+      // A claim naming only its code, with the rest inherited.
+      partial = readPanelRefusal({ code: "backend-reconnecting" });
+      // An unrelated mid-write failure, with the attachment inherited.
+      inherited = isPreExecutorRefusal(new Error("the node was added, then the socket died"));
+      // A real refusal must still work under both.
+      genuine = isPreExecutorRefusal(attachPanelRefusal(new Error("x"), { ...GOOD } as never));
+    } finally {
+      define(Object.prototype, "hasOwnProperty", realHasOwn);
+      delete (Object.prototype as unknown as Record<string, unknown>).applied;
+      delete (Object.prototype as unknown as Record<string, unknown>).stage;
+      delete (Object.prototype as unknown as Record<string, unknown>).retryable;
+      delete (Error.prototype as unknown as Record<string, unknown>)[PANEL_REFUSAL_PROP];
+    }
+    expect(swapWasLive, "both halves of the attack were in place").toBe(true);
+    expect(partial, "an inherited claim is not a claim, whoever answers hasOwnProperty").toBeNull();
+    expect(inherited, "an inherited attachment must not authorise a mutation retry").toBeNull();
+    expect((genuine as { code?: string } | null)?.code).toBe("backend-reconnecting");
+    expect(({}).hasOwnProperty("x")).toBe(false);
+  });
+
+  it("a refusal that crossed JSON still passes — the rule costs a real panel nothing", () => {
+    // The own-property rule must not reject the shape an actual panel produces. Every
+    // reply arrives through JSON.parse, whose objects own all their fields.
+    const overTheWire = JSON.parse(JSON.stringify({ refusal: GOOD })) as { refusal: unknown };
+    expect(readPanelRefusal(overTheWire.refusal)?.code).toBe("backend-reconnecting");
+    expect(hasOwnField(overTheWire, "refusal")).toBe(true);
   });
 });

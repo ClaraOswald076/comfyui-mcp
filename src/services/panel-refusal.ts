@@ -36,6 +36,23 @@
  *  claim attached to it was written for a case we have not reasoned about. */
 const RETRYABLE_REFUSAL_CODES = new Set(["backend-reconnecting", "post-reconnect-settling"]);
 
+/**
+ * The own-property test, CAPTURED AT MODULE LOAD (review, round 3).
+ *
+ * `Object.prototype.hasOwnProperty.call(x, k)` reads the method off the very
+ * prototype the check exists to distrust, so a replacement returning `true` would
+ * re-open the hole it closes. Binding the intrinsic once removes that, and exporting
+ * it keeps the bridge from growing a second, weaker copy.
+ *
+ * This is defence against a mistake, not an adversary: a process that can rewrite
+ * `Object.prototype` can call anything here directly, so the value is that the rule
+ * stays true under a careless dependency rather than under an attacker.
+ */
+const OWN = Object.prototype.hasOwnProperty;
+export function hasOwnField(target: unknown, key: string): boolean {
+  return !!target && typeof target === "object" && OWN.call(target, key);
+}
+
 export interface PreExecutorRefusal {
   code: string;
   applied: false;
@@ -60,7 +77,7 @@ export function readPanelRefusal(value: unknown): PreExecutorRefusal | null {
   // Inheritance is the wrong shape for a claim of provenance in either direction:
   // what matters is that THIS object states it, not that something up its chain
   // does.
-  const own = (k: string): boolean => Object.prototype.hasOwnProperty.call(r, k);
+  const own = (k: string): boolean => hasOwnField(r, k);
   if (!own("code") || !own("applied") || !own("stage") || !own("retryable")) return null;
   if (typeof r.code !== "string" || !RETRYABLE_REFUSAL_CODES.has(r.code)) return null;
   if (r.applied !== false) return null;
@@ -104,6 +121,6 @@ export function attachPanelRefusal(err: Error, refusal: PreExecutorRefusal): Err
  */
 export function isPreExecutorRefusal(err: unknown): PreExecutorRefusal | null {
   if (!err || typeof err !== "object") return null;
-  if (!Object.prototype.hasOwnProperty.call(err, PANEL_REFUSAL_PROP)) return null;
+  if (!hasOwnField(err, PANEL_REFUSAL_PROP)) return null;
   return readPanelRefusal((err as Record<string, unknown>)[PANEL_REFUSAL_PROP]);
 }

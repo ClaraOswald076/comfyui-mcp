@@ -19,7 +19,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { resolveLocale, trFor, type Locale } from "../i18n/index.js";
 import { logger } from "../utils/logger.js";
-import { attachPanelRefusal, readPanelRefusal } from "./panel-refusal.js";
+import { attachPanelRefusal, hasOwnField, readPanelRefusal } from "./panel-refusal.js";
 import { midCommandDisconnectMessage } from "./mid-command-remedy.js";
 import {
   describePanelUpdateRecovery,
@@ -2649,7 +2649,7 @@ export class UiBridge {
           // Object.prototype.refusal would otherwise give every ordinary panel
           // error — including a genuine mid-write one carrying no refusal of its
           // own — the authority to have a mutation re-issued.
-          const refusal = Object.prototype.hasOwnProperty.call(msg, "refusal")
+          const refusal = hasOwnField(msg, "refusal")
             ? readPanelRefusal((msg as { refusal?: unknown }).refusal)
             : null;
           p.reject(refusal ? attachPanelRefusal(err, refusal) : err);
