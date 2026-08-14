@@ -25,6 +25,7 @@ import {
   parseModelsDirFromArgv,
   hasUnresolvableRelativeModelDirFlag,
   isLiveAuthoritativeModelsDir,
+  modelsDirNamedByServer,
   type LiveServerSnapshot,
   type ModelsDirSource,
 } from "./output-dir.js";
@@ -1074,7 +1075,12 @@ async function assertDestinationVisibleToLiveServer(
   // reports its CONTAINER-side `--models-directory`, and writing that path here
   // silently creates a host directory the server never reads (codex gate, round 3).
   // The check below is cheap and fails open, so run it for that case too.
-  if (isLiveAuthoritativeModelsDir(source) && existsSync(modelsRoot)) return;
+  // Only a root the SERVER ITSELF named skips this (#369). `observed-root` reads
+  // as live-authoritative elsewhere and is not wrong to — it beats local config —
+  // but it is INFERRED from where the interpreter lives, and that inference can
+  // land on a stale bundle whose python happens to be on PATH. The exemption
+  // needs a statement from the server, not our best reading of the OS.
+  if (modelsDirNamedByServer(source) && existsSync(modelsRoot)) return;
   if (!snapshot.reachable || isRemoteMode()) return;
 
   // The target category first (it is the one that matters), then the rest of the
@@ -1264,7 +1270,19 @@ export async function isUnderLiveModelRoots(
   } catch {
     return { inRoots: undefined };
   }
-  if (!isLiveAuthoritativeModelsDir(dest.source)) return { inRoots: undefined };
+  // Same narrowing as the pre-write guard, and for the sharper reason (#369,
+  // review): this answer authorizes the POST-write "visible" verdict. An INFERRED
+  // root that is actually stale makes the membership test pass against a root the
+  // server does not read, and a live listing that names the file for an unrelated
+  // reason — the user already had that model — then reads as proof the download
+  // landed somewhere the server can see. That is #369's original symptom exactly:
+  // reported success, model never appears.
+  //
+  // Answering UNKNOWN here costs a correct `observed-root` install its confident
+  // "visible" and gives it the qualified note instead. That is the right trade:
+  // the note names the file, the root, and the remedy, whereas the false positive
+  // is silent and the user discovers it at queue time.
+  if (!modelsDirNamedByServer(dest.source)) return { inRoots: undefined };
   const liveRoot = resolve(dest.modelsDir);
 
   // A negative answer is only honest when everything it rests on could actually be
@@ -1649,8 +1667,9 @@ export async function verifyLandedModel(
           liveVisible: "unknown",
           note:
             `The connected ComfyUI (${getComfyUIBaseUrl()}) lists "${wanted}" under "${category}", ` +
-            "but this destination came from local configuration rather than from the running " +
-            "server, so that listing cannot be tied to the file just written to " +
+            "but this destination was not named by the running server — it came from local " +
+            "configuration, or was inferred from where the server's interpreter lives — so that " +
+            "listing cannot be tied to the file just written to " +
             `${verifiedPath} — it may be the server's own copy elsewhere` +
             (opts?.listedBefore === true
               ? " (it already listed that name before this download)"
