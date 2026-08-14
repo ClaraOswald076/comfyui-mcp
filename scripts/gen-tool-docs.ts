@@ -181,10 +181,14 @@ const CATEGORIES: Array<{
     tools: ["restart_comfyui"],
   },
   {
-    group: "Defaults, Stats & Skills",
+    group: "Defaults",
+    // Slug deliberately unchanged: it is the published URL. The GROUP outgrew its name when
+    // stats and skills moved elsewhere (stats onto get_history in 0.50.0 slice 16, skills to
+    // the Skills & Knowledge page), leaving a page titled for three subjects that documents
+    // one tool. Renaming the slug too would 404 the existing page for a cosmetic win.
     slug: "defaults-stats-skills",
     icon: "sliders",
-    description: "Generation defaults, ComfyUI frontend UI settings, and skill generation. (History-based suggestions and stats moved onto get_history in 0.50.0 slice 16.)",
+    description: "Generation defaults and ComfyUI frontend UI settings. Stats now live on get_system_stats and get_history; skills on the Skills & Knowledge page.",
     tools: [
       "get_defaults",
     ],

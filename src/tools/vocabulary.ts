@@ -1069,7 +1069,7 @@ export const DEAD_NAMES: readonly DeadName[] = [
     replacement: 'get_defaults (action:"get_ui")',
     allowedIn: [
       {
-        path: "docs/design/comfyui-settings-tools.md",
+        path: "design/comfyui-settings-tools.md",
         context: "The read tool shipped as `get_comfyui_settings`",
         why: "The dated design spec for the PR that BUILT these two tools. Its superseded banner records the name each tool shipped under and maps it to today's action — the same mapping-away-from-the-name shape as the docs/using-tools.mdx migration table, never an instruction to call it. The banner's two mentions are on separate lines so each is a single occurrence bound to its own context.",
       },
@@ -1081,7 +1081,7 @@ export const DEAD_NAMES: readonly DeadName[] = [
     replacement: 'get_defaults (action:"set_ui")',
     allowedIn: [
       {
-        path: "docs/design/comfyui-settings-tools.md",
+        path: "design/comfyui-settings-tools.md",
         context: "The write tool shipped as `set_comfyui_setting`",
         why: "Second line of the same superseded banner — see the get_comfyui_settings entry above.",
       },
@@ -1910,7 +1910,11 @@ export const DEAD_NAMES: readonly DeadName[] = [
       },
       {
         path: "docs/tools/workflow-authoring.mdx",
-        context: "ace_step_15, stable_audio_3, remove_background, ltx_video). Pure local generation",
+        // Trimmed to the template-key run itself. It used to carry the trailing prose
+        // ("). Pure local generation"), which broke the moment the description stopped
+        // hand-listing four templates and started interpolating all ten from
+        // TEMPLATE_NAMES — an exception keyed to wording that is not the part being excused.
+        context: "stable_audio_3, remove_background, ltx_video",
         why: "GENERATED from create_workflow's description, which lists the template keys above. Fixing it at the source would mean renaming the template.",
       },
       {
