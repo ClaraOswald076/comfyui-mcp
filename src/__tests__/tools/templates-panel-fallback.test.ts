@@ -1383,9 +1383,64 @@ describe('list_packs action:"list_templates" — panel fallback', () => {
 
     expect(res.isError).toBe(true);
     expect(textOf(res)).toContain("redirect loop");
-    // Bounded: the walk gave up rather than spinning. Five hops allowed, so six
-    // requests are made before it stops.
-    expect(calls).toHaveLength(6);
+    // Bounded: the walk gave up rather than spinning. Twenty hops allowed, so
+    // twenty-one requests are made before it stops.
+    expect(calls).toHaveLength(21);
+  });
+
+  it("FOLLOWS a six-redirect chain, which native fetch reaches a 200 through", async () => {
+    // #1600 gate. The cap was 5, with a comment calling that "the usual browser
+    // allowance". It is not: the Fetch standard's limit is 20, undici implements
+    // it, and the `comfyuiFetch` call this walker replaced followed all 20. So the
+    // cap did not tighten a policy, it BROKE configured targets that worked before
+    // this PR. Measured against a live socket before this test was written: a
+    // six-redirect chain returns 200 through native `fetch`, and died here as
+    // "redirected more than 5 times".
+    //
+    // Six is the smallest chain that separates the two bounds, so this fails on
+    // the old constant and passes on the new one.
+    let hop = 0;
+    stubFetch(async (url) => {
+      if (hop++ < 6) {
+        return new Response(null, { status: 302, headers: { location: `${url}?hop=${hop}` } });
+      }
+      return jsonResponse({ core: [{ name: "reached-through-six-redirects" }] });
+    });
+
+    const res = await handler()({ action: "list_templates" });
+
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toContain('"template_count": 1');
+    // No fallback was involved: the CONFIGURED server answered, at the far end of
+    // its own redirect chain.
+    expect(textOf(res)).not.toContain("answered_by");
+  });
+
+  it("spends ONE timeout budget across the whole walk, not a fresh one per hop", async () => {
+    // #1600 gate. Round 7 dropped the hard-coded signal so
+    // COMFYUI_MCP_HTTP_TIMEOUT_S could govern — right, and kept. But a ceiling
+    // re-applied on EVERY hop is not what this loop replaced: one `comfyuiFetch`
+    // with one signal walked the whole chain under a single deadline, whereas
+    // per-hop multiplies by the hop count, and the cap is now 20.
+    //
+    // Measured on a live socket at 200ms budget / 150ms per hop before this was
+    // written: native aborted at 209ms, a per-hop walker returned 200 after 620ms,
+    // the shared signal aborts at 201ms. The assertion is structural rather than
+    // clock-based so it cannot go flaky — every hop must carry the SAME signal.
+    let hop = 0;
+    stubFetch(async (url) => {
+      if (hop++ < 3) {
+        return new Response(null, { status: 302, headers: { location: `${url}?hop=${hop}` } });
+      }
+      return jsonResponse({ core: [{ name: "t" }] });
+    });
+
+    await handler()({ action: "list_templates" });
+
+    expect(calls.length).toBeGreaterThan(1);
+    const signals = new Set(calls.map((c) => c.init?.signal));
+    expect(signals.size).toBe(1);
+    expect([...signals][0]).toBeInstanceOf(AbortSignal);
   });
 
   // ── #1600 merge gate, round 5 ──────────────────────────────────────────────

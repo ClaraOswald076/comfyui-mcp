@@ -7,7 +7,11 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { parse as parseYaml } from "yaml";
 import { describeFetchFailure, errorToToolResult, ValidationError } from "../utils/errors.js";
 import { getComfyUIBaseUrl } from "../config.js";
-import { comfyuiFetch, connectedPanelOriginsSnapshot } from "../comfyui/fetch.js";
+import {
+  comfyuiFetch,
+  connectedPanelOriginsSnapshot,
+  defaultComfyTimeoutSignal,
+} from "../comfyui/fetch.js";
 import {
   choosePanelFallbackOrigin,
   describeDeclinedPanelFallback,
@@ -804,9 +808,26 @@ async function askOnePanelOrigin(opts: {
   return { res, url: altUrl, origin: answeringOrigin(res, choice.origin), ageMs: snapshot.ageMs };
 }
 
-/** Redirect hops followed on the CONFIGURED target before giving up. Five is the
- *  usual browser allowance; a proxy chain longer than this is a loop. */
-const MAX_CONFIGURED_REDIRECTS = 5;
+/**
+ * Redirect hops followed on the CONFIGURED target before giving up.
+ *
+ * TWENTY, because that is what this walker REPLACED (#1600 gate). The comment
+ * here used to say five was "the usual browser allowance" — it is not. The Fetch
+ * standard's redirect limit is 20, undici implements it, and the `comfyuiFetch`
+ * call this loop took over followed all 20. Capping at five therefore did not
+ * tighten a policy, it BROKE configured targets that worked before this PR:
+ * measured on a live socket, a six-redirect chain that native `fetch` walks to a
+ * 200 died here as "redirected more than 5 times".
+ *
+ * A loop is still caught — at 20 hops rather than 5 — which is the same bound
+ * every other fetch in this process already relies on.
+ */
+const MAX_CONFIGURED_REDIRECTS = 20;
+
+/** A redirect target chosen by the FAR END gets its own ceiling: the user's
+ *  ComfyUI timeout is a statement about their ComfyUI, not about a host a proxy
+ *  named. Applied on top of the whole-walk deadline, never instead of it. */
+const FOREIGN_HOP_TIMEOUT_MS = 8000;
 
 /**
  * The configured server ANSWERED — so no other server may be asked, whatever the
@@ -896,23 +917,36 @@ async function fetchConfiguredTemplateIndex(
 ): Promise<{ res: Response; url: string; redirected: boolean }> {
   let current = startUrl;
   let redirected = false;
+  // ONE budget for the WHOLE walk, started before the first hop (#1600 gate).
+  //
+  // Round 7 removed the hard-coded signal so COMFYUI_MCP_HTTP_TIMEOUT_S could
+  // govern — right, and kept here. But a per-CALL ceiling is not what this loop
+  // replaced: `comfyuiFetch(url, {signal})` let native redirect handling walk the
+  // entire chain under ONE deadline, whereas a ceiling re-applied on every hop
+  // multiplies by the hop count. Measured on a live socket at 200ms/150ms scale:
+  // native aborted at 209ms, a per-hop walker returned 200 after 620ms, and this
+  // shared signal aborts at 201ms. With the cap now at the standard's 20, per-hop
+  // would have stretched the worst case to 20x the configured timeout.
+  //
+  // A caller's deadline is about getting an ANSWER, not about each leg of however
+  // many redirects a proxy decides to emit.
+  const deadline = defaultComfyTimeoutSignal();
   for (let hop = 0; hop <= MAX_CONFIGURED_REDIRECTS; hop++) {
     let res: Response;
     try {
       res = sameCredentialOrigin(current, startUrl)
-        ? // NO SIGNAL, deliberately (#1600 gate round 7). A hard-coded
-          // `AbortSignal.timeout(8000)` here — inherited from before this PR, not
-          // introduced by it — ALWAYS WINS over comfyuiFetch's ceiling, because
-          // that ceiling is only applied to callers who passed none. So a user who
-          // set COMFYUI_MCP_HTTP_TIMEOUT_S=60 for a slow remote still had this one
-          // read aborted at 8s, and the setting silently did nothing here.
-          // Omitting it lets the configured value govern, which is what every
-          // other ComfyUI call in the process does.
-          await comfyuiFetch(current, { redirect: "manual" })
-        : // An origin the user did NOT configure gets its own bound: their
-          // ComfyUI timeout is a statement about their ComfyUI, and a redirect
-          // target chosen by the far end is not it.
-          await fetch(current, { redirect: "manual", signal: AbortSignal.timeout(8000) });
+        ? // The configured ceiling governs (round 7), now as a whole-walk deadline
+          // rather than a fresh one per hop.
+          await comfyuiFetch(current, { redirect: "manual", signal: deadline })
+        : // An origin the user did NOT configure gets its own bound ON TOP of the
+          // walk's: their ComfyUI timeout is a statement about their ComfyUI, and a
+          // redirect target chosen by the far end is not it. `any` takes whichever
+          // fires first, so a foreign hop can shorten the budget but never extend
+          // past the deadline the whole walk is under.
+          await fetch(current, {
+            redirect: "manual",
+            signal: AbortSignal.any([deadline, AbortSignal.timeout(FOREIGN_HOP_TIMEOUT_MS)]),
+          });
     } catch (err) {
       // Hop 0 is the ordinary case: nothing answered, and the caller decides
       // whether that licenses asking a connected panel.
