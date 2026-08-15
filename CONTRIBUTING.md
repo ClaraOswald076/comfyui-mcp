@@ -103,10 +103,14 @@ Run `cd docs && npx mint broken-links` to validate links.
 
 ### Blog posts and translated pages
 
-`docs/blog/*.mdx` and `docs/<locale>/*.mdx` are covered by their own gates (all run in
-`npm test`) — a `## Licensing` section is required on model posts, model and script filenames
-are checked against the pack that ships them, advertised counts are checked against the live
-registry, and translated pages are compared structurally to their English source.
+`docs/blog/*.mdx` and `docs/<locale>/*.mdx` are covered by their own gates — a `## Licensing`
+section is required on model posts, model and script filenames are checked against the pack
+that ships them, and translated pages are compared structurally to their English source. Those
+run in `npm test`.
+
+Two related checks do **not**: `node scripts/asset-counts.mjs --check` (advertised counts vs the
+live registry) runs in CI and needs a fresh `dist/`, and `node scripts/check-docs-deployed.mjs`
+(every nav page actually serves) runs only when you invoke it against a published site.
 
 Read **[design/writing-blog-posts.md](design/writing-blog-posts.md)** before writing one. It
 also documents the Mintlify caveats that make a page fail to build — including the one page

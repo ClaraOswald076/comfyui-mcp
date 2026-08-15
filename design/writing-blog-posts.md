@@ -16,31 +16,35 @@ The gates exist so those specific failures cannot recur silently.
 ## 1. Run the gates before you push
 
 ```bash
-npm test           # includes all of them
+npm test           # runs the six below
 ```
 
-Individually, when iterating:
+| command | enforces | in `npm test`? |
+|---|---|---|
+| `npm run check:blog` | the shared install step matches `docs/snippets/panel-install.mdx`; no retired claims | yes |
+| `npm run check:blog-packs` | every model/script filename you name is one the pack actually ships | yes |
+| `npm run check:blog-structure` | every model post has a non-empty `## Licensing` section | yes |
+| `npm run check:blog-stale` | a post's `verified:` stamp is newer than the packs it documents | yes |
+| `npm run check:docs-links` | nav ↔ files ↔ links all resolve | yes |
+| `npm run check:docs-locale` | translated pages match their English source structurally | yes |
+| `node scripts/asset-counts.mjs --check` | advertised counts match the live registry | **no — CI only** |
+| `node scripts/check-docs-deployed.mjs` | every nav page actually serves | **no — after deploy** |
 
-| command | enforces |
-|---|---|
-| `npm run check:blog` | the shared install step matches `docs/snippets/panel-install.mdx`; no retired claims |
-| `npm run check:blog-packs` | every model/script filename you name is one the pack actually ships |
-| `npm run check:blog-structure` | every model post has a non-empty `## Licensing` section |
-| `npm run check:blog-stale` | a post's `verified:` stamp is newer than the packs it documents |
-| `npm run check:docs-links` | nav ↔ files ↔ links all resolve |
-| `npm run check:docs-locale` | translated pages match their English source structurally |
-| `node scripts/asset-counts.mjs --check` | advertised counts match the live registry |
+The last two are the ones to remember, because `npm test` passing does **not** mean they did:
 
-One more is deliberately **not** in `npm test`, because it needs the network and a published
-site — run it after a deploy:
+- **`asset-counts --check` runs in CI** (`.github/workflows/ci.yml` and `release.yml`), not in
+  `npm test` — it needs a fresh `dist/` to read the live tool registry. Run it yourself after
+  `npm run build` if you touched a count.
+- **`check-docs-deployed.mjs` runs nowhere automatically.** It needs the network and a
+  published site, and a gate that fails on flaky wifi gets ignored. Run it after a deploy:
 
-```bash
-node scripts/check-docs-deployed.mjs          # every nav page actually serves
-node scripts/check-docs-deployed.mjs ko ja    # or specific locales
-```
+  ```bash
+  node scripts/check-docs-deployed.mjs          # every nav page actually serves
+  node scripts/check-docs-deployed.mjs ko ja    # or specific locales
+  ```
 
-It exists because a page can be correct in git, correct in navigation, pass every static
-check, and still not exist for a reader. Two currently do exactly that.
+  It exists because a page can be correct in git, correct in navigation, pass every static
+  check, and still not exist for a reader. Two currently do exactly that.
 
 ---
 
