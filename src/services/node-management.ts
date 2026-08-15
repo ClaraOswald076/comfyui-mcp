@@ -4321,11 +4321,58 @@ function gitInstallChannelNote(channel: string): string {
     `from this install rules the pack out of "${channel}" ONLY; it says NOTHING about ` +
     `dev/recent/legacy/forked/tutorial. If that happens, retry with an explicit channel ` +
     `(e.g. channel:"dev") before concluding the pack does not exist. ` +
-    `NOT retried for you on purpose: v4 resolves a from-source install by the BARE REPO ` +
-    `NAME and clones the URL in the CHANNEL's entry, not the URL you passed — and 35 ` +
-    `names exist in both channels under DIFFERENT authors, so an automatic second attempt ` +
-    `could install a repository you did not name. For the same reason, verify with ` +
-    `panel_list_nodes that what landed is the repo you meant.`
+    `NOT retried for you on purpose: by the same bare-name resolution described above, ` +
+    `an automatic second attempt could install a repository you did not name.`
+  );
+}
+
+/** `owner/repo` out of a git URL, or undefined when it does not parse that way. */
+function gitUrlOwnerRepo(url: string): string | undefined {
+  const m = /[/:]([^/:]+)\/([^/]+?)(?:\.git)?\/*$/.exec(url.trim());
+  return m ? `${m[1]}/${m[2]}` : undefined;
+}
+
+/**
+ * #1539 gate round 2 — THE FIRST ATTEMPT CAN ALSO HIT THE WRONG AUTHOR, and until now
+ * this only said so as a reason not to RETRY.
+ *
+ * The gate's finding, restated: because v4 resolves by bare repo name against the
+ * channel's list and clones the URL in THAT entry, a caller who passes
+ * `mohammadaboulela/ComfyUI-BiRefNet` with no channel now resolves the same bare name
+ * in `default` and gets `hieuck/ComfyUI-BiRefNet` — a repository they never named, and
+ * it reports success. That is real, and it is disclosed here rather than left to the
+ * retry paragraph.
+ *
+ * WHAT THE GATE HAD BACKWARDS, measured rather than argued. The hazard is not created
+ * by this change; it is PRE-EXISTING and SYMMETRIC — before it, the same call with no
+ * channel asked `dev`, so a caller passing hieuck's URL got mohammadaboulela's. What
+ * changed is which way it points, and the direction is now the safe one. Of the 35 bare
+ * names listed in both channels under different authors, `extension-node-map.json` —
+ * the channel-independent file `panel_search_nodes` reads, and where the reporter got
+ * their URL — carries the DEFAULT author's repo for 33 and the DEV author's repo for
+ * ZERO (2 in neither; fetched live 2026-08-15). So every colliding URL this tool can
+ * actually hand a caller resolved to the WRONG author under the old `dev` default and
+ * resolves to the RIGHT one now. The residue is a caller who hand-types a dev-only
+ * author's URL, which search never returns.
+ *
+ * Stated on EVERY git-URL install, not just the defaulted-channel one: bare-name
+ * resolution is a property of the v4 from-source route, not of who picked the channel,
+ * so a caller who passed `channel:"dev"` themselves faces exactly the same substitution.
+ * It names the owner from the caller's own URL so the check is concrete — the standing
+ * rule being that two candidates are NAMED, never silently picked between.
+ */
+function gitInstallSubstitutionNote(channel: string, url: string): string {
+  const owner = gitUrlOwnerRepo(url);
+  const bare = url.trim().replace(/\.git$/, "").replace(/\/+$/, "").split("/").pop();
+  return (
+    `WHAT GETS CLONED IS NOT NECESSARILY THE URL YOU PASSED. Manager v4 resolves a ` +
+    `from-source install by the BARE REPO NAME ("${bare}") against the "${channel}" ` +
+    `channel's list, then clones the URL recorded in THAT entry — 35 bare names are ` +
+    `listed in both default and dev under DIFFERENT authors. So if "${channel}" lists ` +
+    `that name under anyone other than ${owner ? `the ${owner} you passed` : "the author you passed"}, ` +
+    `this installs THEIR repository and still reports success. Confirm with ` +
+    `panel_list_nodes that what landed is the repo you meant before you restart or ` +
+    `report success.`
   );
 }
 
@@ -4368,15 +4415,23 @@ export function nodesInstallCommandArgs(args: {
   // only the "latest"→nightly branch — so an explicit version with no channel would
   // otherwise dispatch a defaulted channel with nothing said about it.
   const defaultedChannel = rerouted && explicitChannel === undefined;
+  const effectiveChannel = explicitChannel ?? GIT_INSTALL_DEFAULT_CHANNEL;
+  // The substitution warning rides EVERY git-URL install (gate round 2), because
+  // bare-name resolution is a property of the v4 from-source route rather than of
+  // who chose the channel — an explicit `channel:"dev"` substitutes just as readily.
   const note =
-    [norm.note, defaultedChannel ? gitInstallChannelNote(GIT_INSTALL_DEFAULT_CHANNEL) : undefined]
+    [
+      norm.note,
+      rerouted && norm.repository ? gitInstallSubstitutionNote(effectiveChannel, norm.repository) : undefined,
+      defaultedChannel ? gitInstallChannelNote(GIT_INSTALL_DEFAULT_CHANNEL) : undefined,
+    ]
       .filter((s): s is string => typeof s === "string" && s.length > 0)
       .join(" ") || undefined;
   return {
     id: rerouted ? norm.id : args.id,
     repository: rerouted ? norm.repository : args.repository,
     version: rerouted ? norm.version : args.version,
-    channel: rerouted ? (explicitChannel ?? GIT_INSTALL_DEFAULT_CHANNEL) : args.channel,
+    channel: rerouted ? effectiveChannel : args.channel,
     mode: args.mode,
     ...(note ? { note } : {}),
   };

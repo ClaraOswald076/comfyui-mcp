@@ -84,6 +84,44 @@ function installNodeDef() {
   return def;
 }
 
+/**
+ * Drive the REAL tool definition against a fake bridge and return both what was put on
+ * the wire and what the caller was told. A green unit test on nodesInstallCommandArgs
+ * proves the helper computes a channel and a note, never that either reaches anyone —
+ * deleting the `...cmdArgs` spread at the call site, or computing a note and never
+ * appending it (#1129, which shipped once and never ran), fails here and nowhere else.
+ */
+async function dispatchInstall(
+  args: Record<string, unknown>,
+): Promise<{ sent: Record<string, unknown>; text: string }> {
+  let sent: Record<string, unknown> | undefined;
+  const bridge = {
+    send: async (cmd: Record<string, unknown>) => {
+      if (cmd.cmd === "nodes_install") {
+        sent = cmd;
+        return { queued: true, pending: true, id: "comfyui-anima-ipadapter", dialect: "v2" };
+      }
+      // Leave the #1129 dropped-enqueue probe inconclusive so it appends nothing.
+      return { status: { in_progress_count: 0, is_processing: true } };
+    },
+    tabIncarnation: () => "inc-A",
+    push: () => 1,
+    canReach: (id: string) => id === TAB,
+    isHeadless: () => false,
+    tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
+    resolveActiveTabId: () => TAB,
+    refreshWorkflowUuid: () => true,
+    workflowUuidFor: () => ({ known: false }),
+    tabCanMutateGraph: () => true,
+    tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
+  } as unknown as PanelToolCtx["bridge"];
+  const ctx = makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
+  const res: ToolResult = await installNodeDef().handler(args as never, ctx);
+  expect(res.isError).not.toBe(true);
+  if (!sent) throw new Error("nodes_install was never dispatched");
+  return { sent, text: res.content.map((c) => (c as { text?: string }).text ?? "").join(" ") };
+}
+
 describe("the git-URL install asks a channel that can list the pack (#1539)", () => {
   it("THE REPORT'S OWN INPUT: a bare repository URL no longer asks the 'dev' channel", () => {
     // The whole bug in one assertion. `dev` lists 1210 packs and shares 3 with the
@@ -201,11 +239,13 @@ describe("the channel it picked is DISCLOSED, never silent (#1539 review P1)", (
     expect(note).toMatch(/asked ComfyUI-Manager's "default" channel/i);
   });
 
-  it("says NOTHING about the channel when the caller chose one themselves", () => {
+  it("says NOTHING about the channel CHOICE when the caller made it themselves", () => {
     // Disclosing a choice the caller made is noise, and would misreport whose choice it
-    // was. The nightly-rewrite note is still theirs to receive.
+    // was. The nightly-rewrite note is still theirs to receive — and so is the
+    // substitution warning below, which is about the route, not about the choice.
     const chosen = nodesInstallCommandArgs({ repository: REPORTED_URL, channel: "dev" });
     expect(chosen.note ?? "").not.toMatch(/asked ComfyUI-Manager's/i);
+    expect(chosen.note ?? "").not.toMatch(/NOT retried for you on purpose/i);
     expect(chosen.note ?? "").toMatch(/from-source/i);
   });
 
@@ -217,82 +257,82 @@ describe("the channel it picked is DISCLOSED, never silent (#1539 review P1)", (
   });
 });
 
-describe("panel_install_node actually DISPATCHES the channel (#1539 wiring)", () => {
-  // A green unit test on nodesInstallCommandArgs proves the helper computes a channel,
-  // never that the value reaches the panel. This drives the real tool definition and
-  // reads the command object off the bridge; deleting the `...cmdArgs` spread at the
-  // call site fails it, which a helper-only suite does not notice.
-  async function dispatch(args: Record<string, unknown>): Promise<Record<string, unknown>> {
-    let sent: Record<string, unknown> | undefined;
-    const bridge = {
-      send: async (cmd: Record<string, unknown>) => {
-        if (cmd.cmd === "nodes_install") {
-          sent = cmd;
-          return { queued: true, pending: true, id: "comfyui-anima-ipadapter", dialect: "v2" };
-        }
-        // Leave the #1129 dropped-enqueue probe inconclusive so it appends nothing.
-        return { status: { in_progress_count: 0, is_processing: true } };
-      },
-      tabIncarnation: () => "inc-A",
-      push: () => 1,
-      canReach: (id: string) => id === TAB,
-      isHeadless: () => false,
-      tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
-      resolveActiveTabId: () => TAB,
-      refreshWorkflowUuid: () => true,
-      workflowUuidFor: () => ({ known: false }),
-      tabCanMutateGraph: () => true,
-      tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
-    } as unknown as PanelToolCtx["bridge"];
-    const ctx = makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
-    const res: ToolResult = await installNodeDef().handler(args as never, ctx);
-    expect(res.isError).not.toBe(true);
-    if (!sent) throw new Error("nodes_install was never dispatched");
-    return sent;
-  }
+describe("the FIRST attempt's wrong-author risk is disclosed too (#1539 gate round 2)", () => {
+  // The gate's P1: defaulting to `default` means a caller who passed the dev-channel
+  // author's URL for one of the 35 colliding bare names gets the OTHER author's repo,
+  // and the old note only framed that hazard as a reason not to RETRY. It is not a
+  // regression — extension-node-map (what panel_search_nodes reads, and where the
+  // reporter got their URL) carries the DEFAULT author for 33 of the 35 and the DEV
+  // author for 0, so every colliding URL this tool can hand a caller was resolving to
+  // the WRONG author under `dev` and resolves correctly now. But it is real, and a
+  // caller cannot check it unless told, so the note names it.
+  const COLLIDING = "https://github.com/mohammadaboulela/ComfyUI-BiRefNet";
 
+  it("warns that the URL passed is not necessarily the URL cloned", () => {
+    const note = nodesInstallCommandArgs({ repository: COLLIDING }).note ?? "";
+    expect(note).toMatch(/NOT NECESSARILY THE URL YOU PASSED/i);
+    expect(note).toMatch(/BARE REPO NAME \("ComfyUI-BiRefNet"\)/);
+    expect(note).toMatch(/still reports success/i);
+  });
+
+  it("names the OWNER the caller passed, so the check is concrete", () => {
+    // A generic "verify what landed" is unactionable; the caller has to know which
+    // author to compare against.
+    const note = nodesInstallCommandArgs({ repository: COLLIDING }).note ?? "";
+    expect(note).toMatch(/mohammadaboulela\/ComfyUI-BiRefNet you passed/);
+    const other = nodesInstallCommandArgs({ repository: REPORTED_URL }).note ?? "";
+    expect(other).toMatch(/Wenaka2004\/comfyui-anima-ipadapter you passed/);
+    expect(other).not.toMatch(/mohammadaboulela/);
+  });
+
+  it("rides an EXPLICIT channel too — the hazard is the route, not the choice", () => {
+    // A caller who picked `dev` themselves faces the same bare-name substitution, so
+    // scoping this to the defaulted case would leave them unwarned.
+    const note = nodesInstallCommandArgs({ repository: REPORTED_URL, channel: "dev" }).note ?? "";
+    expect(note).toMatch(/NOT NECESSARILY THE URL YOU PASSED/i);
+    expect(note).toMatch(/against the "dev" channel's list/);
+  });
+
+  it("names the channel that will actually be consulted, not a hard-coded one", () => {
+    const def = nodesInstallCommandArgs({ repository: REPORTED_URL }).note ?? "";
+    expect(def).toMatch(/against the "default" channel's list/);
+    const legacy = nodesInstallCommandArgs({ repository: REPORTED_URL, channel: "legacy" }).note ?? "";
+    expect(legacy).toMatch(/against the "legacy" channel's list/);
+    expect(legacy).not.toMatch(/against the "default" channel's list/);
+  });
+
+  it("stays off the registry-id route, which resolves by id as documented", () => {
+    expect(nodesInstallCommandArgs({ id: "comfyui-kjnodes" }).note ?? "").not.toMatch(
+      /NOT NECESSARILY THE URL YOU PASSED/i,
+    );
+  });
+
+  it("REACHES THE CALLER — asserted on the tool's returned text, not the args", async () => {
+    const cmd = await dispatchInstall({ repository: COLLIDING });
+    expect(cmd.sent.channel).toBe("default");
+    expect(cmd.text).toMatch(/NOT NECESSARILY THE URL YOU PASSED/i);
+    expect(cmd.text).toMatch(/mohammadaboulela\/ComfyUI-BiRefNet you passed/);
+  });
+});
+
+describe("panel_install_node actually DISPATCHES the channel (#1539 wiring)", () => {
   it("sends channel 'default' to the panel for the reporter's request", async () => {
-    const cmd = await dispatch({ repository: REPORTED_URL });
-    expect(cmd.cmd).toBe("nodes_install");
-    expect(cmd.repository).toBe(REPORTED_URL);
-    expect(cmd.channel).toBe("default");
+    const { sent } = await dispatchInstall({ repository: REPORTED_URL });
+    expect(sent.cmd).toBe("nodes_install");
+    expect(sent.repository).toBe(REPORTED_URL);
+    expect(sent.channel).toBe("default");
   });
 
   it("relays an explicit channel unchanged", async () => {
-    const cmd = await dispatch({ repository: REPORTED_URL, channel: "dev" });
-    expect(cmd.channel).toBe("dev");
+    const { sent } = await dispatchInstall({ repository: REPORTED_URL, channel: "dev" });
+    expect(sent.channel).toBe("dev");
   });
 
   it("the channel disclosure REACHES THE CALLER, not just the args object", async () => {
     // A note computed and never appended is the #1129 failure again — that probe
     // shipped once and never ran. This asserts on the tool's returned TEXT.
-    let sent: Record<string, unknown> | undefined;
-    const bridge = {
-      send: async (cmd: Record<string, unknown>) => {
-        if (cmd.cmd === "nodes_install") {
-          sent = cmd;
-          return { queued: true, pending: true, id: "comfyui-anima-ipadapter", dialect: "v2" };
-        }
-        return { status: { in_progress_count: 0, is_processing: true } };
-      },
-      tabIncarnation: () => "inc-A",
-      push: () => 1,
-      canReach: (id: string) => id === TAB,
-      isHeadless: () => false,
-      tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
-      resolveActiveTabId: () => TAB,
-      refreshWorkflowUuid: () => true,
-      workflowUuidFor: () => ({ known: false }),
-      tabCanMutateGraph: () => true,
-      tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
-    } as unknown as PanelToolCtx["bridge"];
-    const ctx = makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
-    const res: ToolResult = await installNodeDef().handler(
-      { repository: REPORTED_URL } as never,
-      ctx,
-    );
-    const text = res.content.map((c) => (c as { text?: string }).text ?? "").join(" ");
-    expect(sent?.channel).toBe("default");
+    const { sent, text } = await dispatchInstall({ repository: REPORTED_URL });
+    expect(sent.channel).toBe("default");
     expect(text).toMatch(/asked ComfyUI-Manager's "default" channel/i);
     expect(text).toMatch(/rules the pack out of "default" ONLY/);
   });
@@ -351,6 +391,16 @@ describe("panel_install_node describes what was measured (#1539)", () => {
     expect(text).toMatch(/absent from the channel THIS CALL ASKED and nothing more/i);
     expect(text).toMatch(/will NOT retry another channel for you/i);
     expect(text).toMatch(/could install a repo you never named/i);
+  });
+
+  it("warns that a SUCCESS can be the wrong author, not just a retry (gate round 2)", () => {
+    // The blurb framed the 35 colliding names purely as a reason not to auto-retry. The
+    // same resolution makes the FIRST attempt substitutable, and that one reports
+    // success — so a caller who never reads the retry paragraph is the one at risk.
+    const text = installNodeDef().description ?? "";
+    expect(text).toMatch(/A SUCCESS CAN ALSO BE THE WRONG REPO/);
+    expect(text).toMatch(/THAT author's repository installs and the call still reports success/i);
+    expect(text).toMatch(/names the owner you passed/i);
   });
 
   it("keeps the local-only precondition on the tool that CAN clone", () => {
