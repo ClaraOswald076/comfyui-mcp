@@ -18,7 +18,16 @@ const PROMPT_SRC = readFileSync(new URL("../../orchestrator/index.ts", import.me
 // bundled" below), not as a module-scope throw that collects zero tests and hides which
 // of the two halves of #1551 regressed.
 const SKILL_URL = new URL("../../../plugin/skills/rgthree/SKILL.md", import.meta.url);
-const SKILL = existsSync(SKILL_URL) ? readFileSync(SKILL_URL, "utf-8") : "";
+// Normalized the way the LOADER normalizes it. `splitFrontmatter` (tools/skills-access.ts)
+// strips the BOM and folds CRLF before it matches the fence, so the bytes on disk are not
+// what any consumer of this file ever sees — and asserting on the raw bytes made the
+// frontmatter check fail on every Windows checkout with `core.autocrlf=true` (the default
+// for most Windows developers), where `/^---\n/` cannot match `---\r\n`. The product was
+// never affected; only this assertion was, and it failed for a reason that says nothing
+// about the thing it is testing.
+const SKILL = existsSync(SKILL_URL)
+  ? readFileSync(SKILL_URL, "utf-8").replace(/^﻿/, "").replace(/\r\n/g, "\n")
+  : "";
 
 describe("the system prompt teaches AUTHORING rgthree toggles, not just reading them (#1551)", () => {
   it("carries the authoring section", () => {
