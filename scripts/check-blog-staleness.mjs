@@ -41,6 +41,39 @@ const packNames = fs.existsSync(PACKS)
   ? new Set(fs.readdirSync(PACKS).filter((d) => fs.statSync(path.join(PACKS, d)).isDirectory()))
   : new Set();
 
+/**
+ * A shallow clone cannot answer the only question this gate asks.
+ *
+ * `actions/checkout` defaults to `fetch-depth: 1`. In that repo there is exactly ONE commit, so
+ * `git log -1 -- packs/<name>` returns the tip for EVERY path — every pack looks like it changed
+ * today. The comparison below then reports every stamped post as stale, for a reason that has
+ * nothing to do with the packs.
+ *
+ * This is not hypothetical: it is how this gate first ran red. Its runs on this branch split on
+ * UTC midnight to the minute — 23:35 and 23:58 green, 00:09 and 00:15 red, with nothing touching
+ * packs/ in between (the 23:58 and 00:09 heads are eleven minutes and two blog paragraphs apart).
+ * Before midnight the tip commit's date still equalled the `verified: 2026-08-14` stamp; after it,
+ * the tip read 2026-08-15 and beat every stamp. With real history those packs last moved
+ * 2026-07-30.
+ *
+ * So: refuse to answer rather than answer wrong. A false stale is worse than no reading — it
+ * trains people to bump stamps they did not earn, which is the exact failure the stamp exists to
+ * prevent. CI fetches full history (see .github/workflows/ci.yml) so the gate stays live there.
+ */
+function isShallowClone() {
+  try {
+    return (
+      execFileSync('git', ['rev-parse', '--is-shallow-repository'], {
+        cwd: ROOT,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim() === 'true'
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** Last commit date touching a path, as YYYY-MM-DD. Null when git can't say. */
 function lastChanged(rel) {
   try {
@@ -53,6 +86,14 @@ function lastChanged(rel) {
   } catch {
     return null;
   }
+}
+
+if (isShallowClone()) {
+  console.log(
+    'skipped: shallow clone — git cannot say when a pack last changed, and guessing here ' +
+      'reports every stamped post as stale. Re-run with full history (`git fetch --unshallow`).',
+  );
+  process.exit(0);
 }
 
 const stale = [];
