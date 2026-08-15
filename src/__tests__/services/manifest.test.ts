@@ -588,16 +588,63 @@ describe("applyManifest", () => {
     expect(downloadModelMock).not.toHaveBeenCalled();
   });
 
-  it("reports PENDING (never skipped) when containment cannot be established — even if the server lists the NAME", async () => {
-    // The stale tree and the live tree both hold `big.safetensors`. A name-only
-    // listing hit must NOT promote an unconfirmed placement to "installed".
+  // #1587 — this block was previously pinned the other way ("reports PENDING
+  // (never skipped) ... even if the server lists the NAME"). It is deliberately
+  // re-pinned. The old fixture's own premise is that the LIVE tree holds the file,
+  // and it then asserted the manifest report it as unsatisfied: `pending`, and
+  // therefore `success:false`, for a model the connected server demonstrably has.
+  //
+  // The verdict came from `isUnderLiveModelRoots`, a filesystem containment test
+  // against a root the server never named — a source that does not look at
+  // /models at all. It cannot see a server-visible model, so it can only ever
+  // answer "unknown" here, and the message it produced asserted a specific and
+  // often false reason ("its install root could only be inferred from local
+  // configuration") — ComfyUI Desktop's OS-process-observed root lands in the same
+  // bucket.
+  //
+  // #369 is unaffected: its failure is a stale same-named file satisfying the
+  // manifest while the live server has NEVER seen it, and that case is the
+  // `listed === false` test below, which still reports pending and still downloads.
+  it("#1587 SKIPS a model the connected server already serves when containment is unknown", async () => {
     resolveExistingModelFileMock.mockResolvedValueOnce({
       path: "C:/comfy/models/checkpoints/big.safetensors",
       root: "C:/comfy/models",
       info: { isFile: () => true },
     });
     isUnderLiveModelRootsMock.mockResolvedValueOnce({ inRoots: undefined });
-    liveListingHasEntryMock.mockResolvedValueOnce(true);
+    liveListingHasBasenameMock.mockResolvedValueOnce(true);
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          {
+            url: "https://example.com/big.safetensors",
+            model_type: "checkpoints",
+            filename: "big.safetensors",
+          },
+        ],
+      },
+    });
+
+    expect(result.summary).toMatchObject({ skipped: 1, failed: 0, pending: 0 });
+    expect(result.success).toBe(true);
+    expect(downloadModelMock).not.toHaveBeenCalled();
+    expect(result.results[0].message).toMatch(/already serves/);
+    // What was NOT established is still stated — the fix moves the uncertainty
+    // into a note, it does not delete it.
+    expect(result.results[0].message).toMatch(/NOT confirmed that the copy at/);
+    // ...and the claim that was never the code's to make is gone.
+    expect(result.results[0].message).not.toMatch(/inferred from local configuration/);
+  });
+
+  it("#1587 still reports PENDING when the server does NOT list it (#369's shape, unchanged)", async () => {
+    resolveExistingModelFileMock.mockResolvedValueOnce({
+      path: "C:/stale/models/checkpoints/big.safetensors",
+      root: "C:/stale/models",
+      info: { isFile: () => true },
+    });
+    isUnderLiveModelRootsMock.mockResolvedValueOnce({ inRoots: undefined });
+    liveListingHasBasenameMock.mockResolvedValueOnce(false);
 
     const result = await applyManifest({
       manifest: {
@@ -612,8 +659,84 @@ describe("applyManifest", () => {
     });
 
     expect(result.summary).toMatchObject({ skipped: 0, failed: 0, pending: 1 });
-    expect(result.results[0].message).toMatch(/not confirmed as installed/);
-    expect(result.results[0].message).toMatch(/may be its OWN copy elsewhere/);
+    expect(result.results[0].message).toMatch(/does NOT list/);
+  });
+
+  it("#1587 still reports PENDING when the server could not be ASKED (listing unavailable)", async () => {
+    // A failed observation and an observed negative must not collapse into the
+    // same answer, and neither may become a confirmation.
+    resolveExistingModelFileMock.mockResolvedValueOnce({
+      path: "C:/comfy/models/checkpoints/big.safetensors",
+      root: "C:/comfy/models",
+      info: { isFile: () => true },
+    });
+    isUnderLiveModelRootsMock.mockResolvedValueOnce({ inRoots: undefined });
+    liveListingHasBasenameMock.mockResolvedValueOnce(undefined);
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          {
+            url: "https://example.com/big.safetensors",
+            model_type: "checkpoints",
+            filename: "big.safetensors",
+          },
+        ],
+      },
+    });
+
+    expect(result.summary).toMatchObject({ skipped: 0, failed: 0, pending: 1 });
+    expect(result.results[0].message).toMatch(/could not be asked/);
+  });
+
+  it("#1587 a NESTED target needs the EXACT category-relative entry, not a basename anywhere", async () => {
+    // `loras/Krea2/x.safetensors` is loaded by that exact string. A same-named
+    // file loose in loras/ does not satisfy it, so the basename probe must not be
+    // the one consulted here.
+    resolveExistingModelFileMock.mockResolvedValueOnce({
+      path: "C:/comfy/models/loras/Krea2/x.safetensors",
+      root: "C:/comfy/models",
+      info: { isFile: () => true },
+    });
+    isUnderLiveModelRootsMock.mockResolvedValueOnce({ inRoots: undefined });
+    liveListingHasEntryMock.mockResolvedValueOnce(false);
+    liveListingHasBasenameMock.mockResolvedValueOnce(true); // must be IGNORED here
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          {
+            url: "https://example.com/x.safetensors",
+            local_path: "loras/Krea2/x.safetensors",
+          },
+        ],
+      },
+    });
+
+    expect(result.summary).toMatchObject({ skipped: 0, pending: 1 });
+    expect(result.results[0].message).toMatch(/does NOT list/);
+  });
+
+  it("#1587 a NESTED target IS skipped when the server lists that exact entry", async () => {
+    resolveExistingModelFileMock.mockResolvedValueOnce({
+      path: "C:/comfy/models/loras/Krea2/x.safetensors",
+      root: "C:/comfy/models",
+      info: { isFile: () => true },
+    });
+    isUnderLiveModelRootsMock.mockResolvedValueOnce({ inRoots: undefined });
+    liveListingHasEntryMock.mockResolvedValueOnce(true);
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          { url: "https://example.com/x.safetensors", local_path: "loras/Krea2/x.safetensors" },
+        ],
+      },
+    });
+
+    expect(result.summary).toMatchObject({ skipped: 1, pending: 0 });
+    expect(result.success).toBe(true);
+    expect(downloadModelMock).not.toHaveBeenCalled();
   });
 
   it("skips a CATEGORY-ROOT target found by filename anywhere in the served category", async () => {

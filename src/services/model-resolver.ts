@@ -1343,23 +1343,39 @@ export async function currentLiveModelsRoot(): Promise<string | undefined> {
  * into a verified answer.
  *
  * Saying "unconfirmed" without saying WHY leaves the user with nothing to act on.
- * There are exactly two reasons the live root stays unpinnable: the running server
- * reported a relative `main.py` with no working directory (so its own report is not
- * enough), and the OS process table could not be read to identify the process on our
- * port. The second is a TOOLING gap on POSIX — `lsof` is simply not installed on
- * many minimal images — and installing it converts this host into a verifiable one.
+ * The running server reported a relative `main.py` with no working directory, so its
+ * own report is not enough to pin the install, and the root had to come from
+ * somewhere it never named.
+ *
+ * #1587 — this used to assert a CONJUNCTION as the cause: "...AND the process
+ * listening on the ComfyUI port could not be identified". That second half is often
+ * FALSE. On ComfyUI Desktop the process is identified — the same session's
+ * `install_comfyui(action:"environment")` reports `python_probe_trusted:true` with a
+ * process-table PID — and the root is STILL unpinnable, because an interpreter's
+ * location is evidence of where the BINARY lives, not of where the server reads
+ * (see `modelsDirNamedByServer`, and the measured stale-portable-python shape in
+ * #1374). Telling that user their process could not be identified sends them to fix
+ * something that is not broken, and "make its process observable" is advice they
+ * have already followed.
+ *
+ * So the reasons are stated as ALTERNATIVES, and the `lsof` gap — real, and worth
+ * naming on POSIX — is offered as a possibility to check rather than as a finding.
  */
 function unverifiableDestinationRemedy(): string {
   const probe =
     platform() === "win32"
-      ? "the process listening on the ComfyUI port could not be identified"
-      : "the process listening on the ComfyUI port could not be identified (this needs `lsof`, " +
-        "which is missing on many minimal images — installing it makes future downloads verifiable)";
+      ? ""
+      : " If the process on that port could not be identified at all, that needs `lsof`, " +
+        "which is missing on many minimal images — installing it makes future downloads " +
+        "verifiable.";
   return (
-    "This happens when the running ComfyUI reports a RELATIVE main.py with no working " +
-    `directory AND ${probe}. To get a definite answer: point COMFYUI_PATH at the ComfyUI ` +
-    "that is actually running, launch it with an absolute --base-directory, or make its " +
-    "process observable. Meanwhile, confirm with list_local_models."
+    "This happens when the running ComfyUI names a RELATIVE main.py with no working " +
+    "directory, so its models root has to come from somewhere the server did not name — " +
+    "local configuration, or the install tree around the interpreter the OS reports for " +
+    "the process on that port (which locates the BINARY, not the models the server " +
+    `reads).${probe} To get a definite answer, NAME the root: point COMFYUI_PATH at the ` +
+    "ComfyUI that is actually running, or launch it with an absolute --base-directory. " +
+    "Meanwhile, confirm with list_local_models."
   );
 }
 
