@@ -20,9 +20,11 @@ import { extname, basename, dirname, join } from "node:path";
 import {
   downloadModel,
   liveListingHasEntry,
+  managerJobFilename,
   resolveDownloadTarget,
   shouldDispatchDownloadToManager,
   verifyLandedModel,
+  verifyManagerVisibility,
 } from "./model-resolver.js";
 import type { DownloadAuth } from "./download-auth.js";
 import type { ResumeDiagnostic } from "./download-resume-diag.js";
@@ -422,6 +424,20 @@ export async function startDownloadJob(
     destKey = downloadJobIdFor(`${target.targetPath}\n${authIdentity(auth)}`);
     serializeKey = await localSerializeKey(target.targetPath);
   } else {
+    // #1374 — CAPTURE IT FOR THE MANAGER ROUTE TOO. The post-dispatch check below
+    // asks the connected server whether it now lists the file; without this
+    // baseline, a pre-existing file of the same name reads as a successful
+    // landing, which is the exact trap `listedBefore` was added for on the local
+    // path (#369). The Manager route resolves no local target, so the name asked
+    // for is the name to ask about — that is also what `managerJobFilename` will
+    // report, so the baseline and the check are about the same entry.
+    if (filename) {
+      try {
+        listedBefore = await liveListingHasEntry(targetSubfolder, filename);
+      } catch {
+        listedBefore = undefined; // unknowable → the check stays conservative
+      }
+    }
     serializeKey = remoteSerializeKey(url, targetSubfolder, filename);
   }
   // The PUBLIC id (download_model action:"status" handle): the destination key when we have one
@@ -674,6 +690,57 @@ export async function startDownloadJob(
           // post-download hook — swallowing this must not skip onComplete. The
           // on-disk check did not complete either, so nothing may claim it did.
           job.disk_verified = false;
+          job.live_visible = "unknown";
+          job.verify_note = `Placement could not be verified: ${err instanceof Error ? err.message : String(err)}`;
+        }
+        persistJobRecord(job);
+      }
+      // #1374 — ASK, DON'T ASSUME, ON THE MANAGER ROUTE EITHER.
+      //
+      // A Manager-dispatched download settles "done" when the Manager QUEUE
+      // DRAINS, and Manager increments its done counter for a REJECTED item
+      // exactly as for a fetched one — the v2 status endpoint carries only
+      // aggregate counts, with no per-item result. So a reporter whose Manager
+      // refused the fetch outright (security_level / network_mode=personal_cloud)
+      // got a job that said `done` for a 13.2 GB file that a filesystem-wide
+      // search could not find. Everything downstream was honest about this in
+      // PROSE and nothing ever looked.
+      //
+      // `verifyManagerVisibility` (#1086) is the look, and it already exists: it
+      // asks the CONNECTED server whether it now lists the entry, which is
+      // answerable remotely where `verifyLandedModel`'s on-disk stat is not. This
+      // runs the same shape as the local branch above, in the same place, so a
+      // download that settles inside download_model's grace window is already
+      // checked when the tool answers — and `action:"status"` reads the verdict
+      // off the record rather than reprinting a static caveat.
+      //
+      // WHAT THIS MUST NOT BECOME. "not-listed" is NOT failure and the verdict is
+      // deliberately not allowed to demote `status`: a Manager dispatch returns on
+      // ACCEPTANCE, so a large file is still arriving for minutes afterwards, and
+      // "not there yet" is indistinguishable from "landed where the server cannot
+      // read" from here. What changes is that the report now carries an OBSERVED
+      // answer where one is obtainable, instead of a caveat that was true of every
+      // outcome and therefore distinguished none of them.
+      if (dispatchToManager && (job.status as DownloadJob["status"]) === "done") {
+        try {
+          const verdict = await verifyManagerVisibility(
+            targetSubfolder,
+            managerJobFilename(job),
+            { listedBefore },
+          );
+          // Mapped onto the SAME three-valued field the local path writes, so
+          // every renderer keeps one vocabulary. "not-listed" is the Manager
+          // route's spelling of "the connected server does not list this".
+          job.live_visible =
+            verdict.visibility === "visible"
+              ? "visible"
+              : verdict.visibility === "not-listed"
+                ? "not-visible"
+                : "unknown";
+          job.verify_note = verdict.note;
+        } catch (err) {
+          // verifyManagerVisibility documents that it never throws; this is the
+          // belt for that brace, and it fails to UNKNOWN — never to a verdict.
           job.live_visible = "unknown";
           job.verify_note = `Placement could not be verified: ${err instanceof Error ? err.message : String(err)}`;
         }
@@ -998,6 +1065,46 @@ export function describePlacement(
     };
   }
   if (job.viaManager) {
+    // #1374 — REPORT WHAT WAS OBSERVED, when anything was.
+    //
+    // This arm used to return one static sentence for every Manager outcome. It
+    // was true — the queue reports 'done' on a drain, not on a landing — and
+    // precisely because it was true of every outcome it distinguished none of
+    // them. A reporter whose Manager REFUSED the fetch on security_level read
+    // `done` and went looking for a 13.2 GB file that was never fetched.
+    //
+    // `verifyManagerVisibility` now runs on this route (see startDownloadJob), so
+    // there is usually a real answer to print. `confirmed` stays FALSE in every
+    // arm: a listing proves a file of that NAME exists somewhere the server
+    // reads, which is placement and not validity (#473 — a login page saved as a
+    // .safetensors lists perfectly happily).
+    if (job.live_visible === "not-visible") {
+      return {
+        confirmed: false,
+        // The one Manager outcome that IS a positive finding, so it is flagged
+        // the same way the local route flags it rather than buried in prose.
+        wrongPlace: true,
+        pathLabel: "requested destination",
+        pathQualifier: "",
+        warning:
+          `the dispatch was ACCEPTED and the connected ComfyUI does NOT list this file — ` +
+          `${job.verify_note ?? "the running server does not list this entry."} ` +
+          `ComfyUI-Manager reports its queue task 'done' even when it refused the fetch ` +
+          `outright (a security_level / network_mode rejection is the common cause), so a ` +
+          `'done' here is not evidence the file exists.`,
+      };
+    }
+    if (job.live_visible === "visible") {
+      return {
+        confirmed: false,
+        wrongPlace: false,
+        pathLabel: "requested destination",
+        pathQualifier: " (the connected ComfyUI lists it)",
+        warning:
+          `the connected ComfyUI lists this file, so the dispatch landed somewhere it reads — ` +
+          `but that is PLACEMENT, not validity. ${job.verify_note ?? ""}`.trim(),
+      };
+    }
     return {
       confirmed: false,
       wrongPlace: false,
@@ -1005,8 +1112,9 @@ export function describePlacement(
       pathQualifier: "",
       warning:
         "the dispatch was ACCEPTED, NOT verified as landed — ComfyUI-Manager reports its queue " +
-        "task 'done' even on failure, so this does not guarantee the file is present. Confirm " +
-        "with list_local_models before relying on it.",
+        "task 'done' even on failure, so this does not guarantee the file is present. " +
+        (job.verify_note ? `${job.verify_note} ` : "") +
+        "Confirm with list_local_models before relying on it.",
     };
   }
   switch (job.live_visible) {
