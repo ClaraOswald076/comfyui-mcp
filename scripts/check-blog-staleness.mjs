@@ -49,10 +49,12 @@ const packNames = fs.existsSync(PACKS)
  * today. The comparison below then reports every stamped post as stale, for a reason that has
  * nothing to do with the packs.
  *
- * This is not hypothetical: it is how this gate first ran red. It passed its first CI run only
- * because that run happened before UTC midnight, when "the tip commit's date" still equalled the
- * stamp; the next run, four hours later, failed all five stamped posts. With real history those
- * same packs last moved 2026-07-30.
+ * This is not hypothetical: it is how this gate first ran red. Its runs on this branch split on
+ * UTC midnight to the minute — 23:35 and 23:58 green, 00:09 and 00:15 red, with nothing touching
+ * packs/ in between (the 23:58 and 00:09 heads are eleven minutes and two blog paragraphs apart).
+ * Before midnight the tip commit's date still equalled the `verified: 2026-08-14` stamp; after it,
+ * the tip read 2026-08-15 and beat every stamp. With real history those packs last moved
+ * 2026-07-30.
  *
  * So: refuse to answer rather than answer wrong. A false stale is worse than no reading — it
  * trains people to bump stamps they did not earn, which is the exact failure the stamp exists to
