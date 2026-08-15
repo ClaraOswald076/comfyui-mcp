@@ -232,6 +232,33 @@ describe("the bridge marks a RECEIVED reply, and nothing else (#1560)", () => {
     expect(isPanelAnsweredError(err), "nothing answered, so nothing may claim it did").toBe(false);
   });
 
+  it("a REWRITTEN Unknown-command reply still says the panel answered", async () => {
+    // The bridge substitutes its own actionable "update your panel" error for an old
+    // panel's raw `Unknown command` reply. That rewrite is still a REPLY — the tab
+    // answered, it just answered that it does not know the command — so the mark has
+    // to survive the substitution. Without this the call site is untested and only
+    // the helper is: deleting the propagation kills nothing.
+    sock.on("message", (raw) => {
+      const msg = JSON.parse(String(raw)) as { rid?: string; cmd?: string };
+      if (!msg.rid || !msg.cmd) return;
+      sock.send(
+        JSON.stringify({ rid: msg.rid, ok: false, error: `Unknown command "${msg.cmd}"` }),
+      );
+    });
+
+    const err = await bridge
+      .send({ cmd: "workflow_list" }, { tabId: TAB, timeoutMs: 3000 })
+      .then(() => null)
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    // The substitution REALLY happened — otherwise this test would pass on the
+    // pass-through path and prove nothing about the propagation.
+    expect((err as Error).message).toMatch(/does not implement "workflow_list"|too old for/);
+    expect((err as Error).message).not.toContain("Unknown command");
+    expect(isPanelAnsweredError(err), "a rewritten reply is still a reply").toBe(true);
+  });
+
   it("an ok:true reply is not an error at all", async () => {
     sock.on("message", (raw) => {
       const msg = JSON.parse(String(raw)) as { rid?: string; cmd?: string };
