@@ -51,14 +51,33 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   const src = fs.readFileSync(path.join(BLOG, file), 'utf8');
 
   const documentsAPack =
-    [...src.matchAll(/packs\/([a-z0-9][a-z0-9-]*)/gi)].some((m) => packNames.has(m[1])) ||
+    // Dots are legal in pack names (ltx-2.3-txt2vid) — see check-blog-staleness for the same fix.
+    [...src.matchAll(/packs\/([a-z0-9][a-z0-9.-]*[a-z0-9])/gi)].some((m) => packNames.has(m[1])) ||
     [...src.matchAll(/`([a-z0-9][a-z0-9-]*)`\s+pack/gi)].some((m) => packNames.has(m[1]));
   if (!documentsAPack) continue;
 
   checked++;
-  if (!/^##\s+Licensing\s*$/m.test(src.replace(/\r\n/g, '\n'))) {
+  // Strip fenced code first: a `## Licensing` line inside an example block is not a section,
+  // and matching raw text would let a post satisfy this rule with a code sample.
+  const body = src.replace(/\r\n/g, '\n').replace(/^\s*(```+|~~~+)[\s\S]*?^\s*\1\s*$/gm, '');
+  const m = body.match(/^##\s+Licensing\s*$/m);
+  if (!m) {
     failures++;
     console.error(`  ✗ blog/${file}: no "## Licensing" section`);
+    continue;
+  }
+  // ...and the section must SAY something. An empty heading followed straight by the next
+  // one passes a presence check while telling the reader nothing, which is the failure this
+  // gate exists to prevent — the posts that got licensing wrong were wrong in prose, not in
+  // their table of contents.
+  const after = body.slice(m.index + m[0].length);
+  const sectionText = after.split(/^##\s+/m)[0].trim();
+  if (sectionText.length < 80) {
+    failures++;
+    console.error(
+      `  ✗ blog/${file}: "## Licensing" is empty or near-empty (${sectionText.length} chars) — ` +
+        `name the license and say whether commercial use is gated`,
+    );
   }
 }
 

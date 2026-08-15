@@ -183,7 +183,12 @@ for (const loc of locales) {
       // "fixing" it either direction, and one did: it stripped the prefix from zh/installation
       // to match ja, arguing from repo conventions that the prefix was invented. It is not.
       // Pinning the form removes the ambiguity that made the rewrite look correct.
-      if (/^\/(?!docs\/)(?!images\/)(?!logo\/)(?!favicon)[a-z]/.test(rawTarget)) {
+      // Only DOC PAGES. A root-absolute path with a file extension is a site asset or a
+      // well-known file — /robots.txt, /sitemap.xml, /favicon.svg — and prefixing those with
+      // /docs turns a working link into a 404. Rewriting a correct link to satisfy a gate is
+      // the worst outcome available here, so the rule is scoped to extensionless paths.
+      const looksLikeAsset = /\.[a-z0-9]{2,5}$/i.test(rawTarget) || /^\/(api|_|assets)\//.test(rawTarget);
+      if (!looksLikeAsset && /^\/(?!docs\/)(?!images\/)(?!logo\/)[a-z]/.test(rawTarget)) {
         fail(
           loc,
           slug,

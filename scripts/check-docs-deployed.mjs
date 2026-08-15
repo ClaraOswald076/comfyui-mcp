@@ -21,12 +21,27 @@
  * static check, and still not exist for a reader. With 12 locales × 5 pages, one silently
  * missing page is easy to never notice — it was, for the entire Korean pilot.
  *
- * ## Detecting a 404 without trusting the status code
+ * ## What actually discriminates
  *
- * Mintlify serves an SPA shell with HTTP 200 for unknown paths, so `%{http_code}` is useless
- * here — every URL "works". The discriminator that does hold: a real page carries a
- * `<title>`, and the 404 shell does not. Verified against three URLs — a real English page, a
- * real localized page, and a deliberately nonsensical path.
+ * Measured, after first getting this wrong. The table:
+ *
+ *   /docs/backends        200  308213 bytes  has <title>   real
+ *   /backends             200  308213 bytes  has <title>   real
+ *   /docs/ko/quickstart   200  218541 bytes  has <title>   real
+ *   /docs/ko/panel        404   91213 bytes  no <title>    MISSING
+ *   /docs/docs/backends   404   91228 bytes  no <title>    404
+ *   /totally-made-up-xyz  404   91242 bytes  no <title>    404
+ *
+ * The HTTP status is a clean signal and agrees with the title check on every row. An earlier
+ * version of this comment asserted the opposite — that Mintlify answers 200 for unknown paths
+ * so the status is useless. That was generalized from three URLs which all happened to be REAL
+ * pages; no known-bad URL had been probed. Stating it confidently in a header comment is how a
+ * wrong belief outlives the five minutes it takes to check.
+ *
+ * All three signals are kept because they fail differently: status catches the ordinary case,
+ * `<title>` catches an SPA shell served with 200 (the shape this was built for), and comparing
+ * the final URL catches a missing page quietly redirected to a real, titled one — which neither
+ * of the other two can see.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -63,7 +78,18 @@ async function serves(url) {
     const body = await res.text();
     // A real page has a <title>. The SPA 404 shell does not — and both are HTTP 200.
     const m = body.match(/<title>([^<]*)<\/title>/i);
-    return { ok: Boolean(m && m[1].trim()), title: m?.[1]?.trim() ?? null, bytes: body.length };
+    const titled = Boolean(m && m[1].trim());
+    // A <title> alone is not proof THIS page exists: a missing page that redirects to the
+    // docs home returns the home page's perfectly good title. Require the response to still
+    // be at the URL we asked for, and the status to be a success.
+    const landed = res.url ? res.url.replace(/\/$/, '') === url.replace(/\/$/, '') : true;
+    return {
+      ok: titled && res.ok && landed,
+      title: m?.[1]?.trim() ?? null,
+      bytes: body.length,
+      status: res.status,
+      landedAt: landed ? null : res.url,
+    };
   } catch (err) {
     return { ok: false, title: null, bytes: 0, error: String(err.message ?? err) };
   }
@@ -80,8 +106,14 @@ for (const lang of languages) {
     checked++;
     if (!r.ok) {
       broken++;
-      console.error(`  ✗ ${url} — no <title>, so the build did not produce this page` +
-        (r.error ? ` (${r.error})` : ` (${r.bytes} bytes, the 404 shell)`));
+      const why = r.error
+        ? r.error
+        : r.landedAt
+          ? `redirected to ${r.landedAt}`
+          : !r.status || r.status >= 400
+            ? `HTTP ${r.status}`
+            : `${r.bytes} bytes, the 404 shell (no <title>)`;
+      console.error(`  ✗ ${url} — did not serve this page: ${why}`);
     }
   }
 }

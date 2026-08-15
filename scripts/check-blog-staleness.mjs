@@ -98,6 +98,7 @@ if (isShallowClone()) {
 
 const stale = [];
 const unverified = [];
+const unreadable = [];
 let ok = 0;
 
 for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
@@ -105,7 +106,10 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   const src = fs.readFileSync(path.join(BLOG, file), 'utf8');
 
   const named = new Set();
-  for (const m of src.matchAll(/packs\/([a-z0-9][a-z0-9-]*)/gi)) {
+  // Dots are legal in pack names (ltx-2.3-txt2vid). A dot-blind class captured "ltx-2", which
+  // matches no pack, so every ltx post looked like it documented nothing and was skipped
+  // entirely — by this gate AND by check-blog-structure, which carried the same regex.
+  for (const m of src.matchAll(/packs\/([a-z0-9][a-z0-9.-]*[a-z0-9])/gi)) {
     if (packNames.has(m[1])) named.add(m[1]);
   }
   for (const m of src.matchAll(/`([a-z0-9][a-z0-9-]*)`\s+pack/gi)) {
@@ -113,7 +117,11 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   }
   if (!named.size) continue; // nothing pack-shaped to go stale against
 
-  const stamp = src.match(/^verified:\s*(\d{4}-\d{2}-\d{2})\s*$/m)?.[1];
+  // FRONTMATTER ONLY. Scanning the whole file let any body line — including one inside a
+  // fenced example — act as a stamp, so a post could claim `verified: 9999-99-99` in prose and
+  // sort ahead of every real git date forever. The stamp is metadata; read it as metadata.
+  const fm = src.replace(/\r\n/g, '\n').match(/^---\n([\s\S]*?)\n---/);
+  const stamp = fm?.[1].match(/^verified:\s*(\d{4}-\d{2}-\d{2})\s*$/m)?.[1];
   if (!stamp) {
     unverified.push([file, [...named]]);
     continue;
@@ -122,7 +130,14 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   const moved = [];
   for (const p of named) {
     const when = lastChanged(`packs/${p}`);
-    if (when && when > stamp) moved.push(`${p} (${when})`);
+    // A null here means git could not answer — a broken invocation, not "the pack never
+    // changed". Treating the two alike made an unusable git report every stamped post as
+    // current and exit 0, which is the failure mode this gate is supposed to be immune to.
+    if (when === null) {
+      unreadable.push(`${file} → packs/${p}`);
+      continue;
+    }
+    if (when > stamp) moved.push(`${p} (${when})`);
   }
   if (moved.length) stale.push([file, stamp, moved]);
   else ok++;
@@ -133,6 +148,10 @@ for (const [file, stamp, moved] of stale) {
 }
 for (const [file, named] of unverified) {
   console.error(`  ? blog/${file}: no \`verified:\` stamp (documents ${named.join(', ')})`);
+}
+
+for (const u of unreadable) {
+  console.error(`  ! ${u}: git could not report when this pack last changed`);
 }
 
 console.log(
@@ -151,7 +170,7 @@ console.log(
  * manufactures exactly the false assurance the stamp exists to prevent. So it stays loud and
  * non-blocking, and shrinks as posts are genuinely verified.
  */
-if (CHECK && stale.length) {
+if (CHECK && (stale.length || unreadable.length)) {
   console.error(
     `\nRe-read the post against the pack, fix what moved, then bump \`verified:\` to today. ` +
       `Bump it only after actually checking — a stamp nobody earned is worse than no stamp.`,

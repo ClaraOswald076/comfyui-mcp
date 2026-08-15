@@ -41,6 +41,16 @@ if (!fs.existsSync(SNIPPET)) {
   process.exit(1);
 }
 const canonical = flat(fs.readFileSync(SNIPPET, 'utf8'));
+// An empty source of truth silently disables the comparison: `"".includes("")` is true, so
+// every post would "match" and the gate would report green while checking nothing. Existence
+// is not enough — a truncated or cleared snippet is exactly how this dies quietly.
+if (canonical.length < 40) {
+  console.error(
+    `${path.relative(ROOT, SNIPPET)} is empty or too short (${canonical.length} chars) — ` +
+      `with no canonical text every post trivially matches and this gate checks nothing`,
+  );
+  process.exit(1);
+}
 
 /**
  * How we find posts carrying the SHARED step.
@@ -67,7 +77,12 @@ const RETIRED = [
     // Caught in comfyui-agent-claude-or-chatgpt AFTER the first two patterns had already
     // cleaned ten posts: same false claim, different verb, so it sailed through. The panel
     // is a pure frontend extension and spawns nothing.
-    pattern: /panel\s+(?:starts|spawns|launches|boots)\b[^.]{0,60}orchestrator/i,
+    // `[^.]` let the match run across a CLAUSE boundary, so correct prose like
+    // "The panel starts disconnected; launch the orchestrator yourself" tripped it — a false
+    // positive whose only fix is deleting accurate manual-launch guidance, which is the worst
+    // way for a docs gate to be wrong. Bar `;`, `,`, `—` and newlines too: the false claim is
+    // one clause ("the panel starts the orchestrator"), never a sentence spanning punctuation.
+    pattern: /panel\s+(?:starts|spawns|launches|boots)\b[^.;,\n—]{0,40}orchestrator/i,
     why: 'the panel is a pure frontend extension and cannot spawn a process; the user runs `connect`',
   },
   {

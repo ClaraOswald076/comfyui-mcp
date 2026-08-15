@@ -116,11 +116,24 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   // Which packs does this post document? Only these are consulted, so a post naming a file that
   // some OTHER pack happens to ship is still caught.
   const named = new Set();
-  for (const m of src.matchAll(/packs\/([a-z0-9][a-z0-9-]*)/gi)) {
+  // A `packs/<name>` reference to a pack that does NOT exist is itself a defect, and the more
+  // likely one over time: packs get renamed and deleted, and the post that documents one is
+  // exactly what goes stale. Silently dropping unknown names (the original behaviour) meant a
+  // post pointing at a deleted pack sailed through — and if any OTHER pack in the post still
+  // resolved, its filename claims were checked against the wrong manifest.
+  const missing = new Set();
+  for (const m of src.matchAll(/packs\/([a-z0-9][a-z0-9.-]*[a-z0-9])/gi)) {
     if (packs.has(m[1])) named.add(m[1]);
+    else missing.add(m[1]);
   }
   for (const m of src.matchAll(/`([a-z0-9][a-z0-9-]*)`\s+pack/gi)) {
     if (packs.has(m[1])) named.add(m[1]);
+    // NOT collected as missing: `foo` pack is a loose prose pattern that matches things which
+    // were never pack directories. Only the explicit packs/<name> path is treated as a promise.
+  }
+  for (const m of missing) {
+    failures++;
+    console.error(`  ✗ blog/${file}: references packs/${m}, which does not exist`);
   }
   if (!named.size) continue;
 
@@ -151,13 +164,34 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
     for (const raw of line.match(FILENAME) ?? []) {
       if (!MODEL_EXT.test(raw)) continue;
       // A glob names a family, not a file — the post is describing a set, not promising one.
-      const ctx = line.slice(Math.max(0, line.indexOf(raw) - 40), line.indexOf(raw) + raw.length);
-      if (ctx.includes('*') || ctx.includes('{')) continue;
+      //
+      // Adjacency, NOT a 40-character window. The window looked at unrelated context and
+      // markdown bold is everywhere in these tables, so `| **Download** | Missing.gguf |`
+      // suppressed the check entirely. Measured before fixing: 5 of 47 filename claims were
+      // being skipped for a `*` that belonged to `**bold**`, including two in a post I had
+      // already stamped as verified.
+      const at = line.indexOf(raw);
+      const before = line.slice(Math.max(0, at - 1), at);
+      const after = line.slice(at + raw.length, at + raw.length + 1);
+      if (/[*{}]/.test(before) || /[*{}]/.test(after)) continue;
+      // A leading filename char means we matched the TAIL of a longer name. The posts write
+      // `-Q8_0.gguf` and `-LowNoise-Q8_0.gguf` as deliberate suffix shorthand ("the LowNoise
+      // variant"), and the extractor drops the leading hyphen and yields a fragment. Checking
+      // that fragment against the manifest is meaningless — under the old substring match it
+      // passed by accident, and under whole-token matching it would fail by accident.
+      if (/[A-Za-z0-9._-]/.test(before)) continue;
       const key = `${raw}`;
       if (seen.has(key)) continue;
       seen.add(key);
       checked++;
-      if (!haystack.includes(raw)) {
+      // Whole-token match, not `includes`. A substring test passes a filename the pack does
+      // NOT ship whenever a longer one contains it: a manifest with `my-model.gguf` would
+      // satisfy a post claiming `model.gguf`. Require a non-filename char (or start of input)
+      // on the left — the extension already bounds the right.
+      const shipsFile = new RegExp(`(^|[^A-Za-z0-9._-])${raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).test(
+        haystack,
+      );
+      if (!shipsFile) {
         failures++;
         console.error(
           `  ✗ blog/${file}:${lineNo}: names "${raw}", but no pack it documents ` +
