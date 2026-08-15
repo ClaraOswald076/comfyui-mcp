@@ -34,6 +34,11 @@ import {
   bareNameAmbiguity,
   registryVersionAmbiguity,
   registryVersionRefusal,
+  rekeyedRegistryVersionAmbiguity,
+  rekeyedRegistryVersionRefusal,
+  rekeyedRepoAmbiguity,
+  rekeyedRepoRefusal,
+  rekeyedRepoWarning,
 } from "./manager-bare-name-collisions.js";
 import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -4571,12 +4576,32 @@ export function nodesInstallCommandArgs(args: {
       ? registryVersionAmbiguity(norm.repository, norm.version)
       : undefined;
   if (registryAmbiguity) return { conflict: registryVersionRefusal(registryAmbiguity) };
+  // #1624 — THE SAME REGISTRY-ROUTE HAZARD FOR A REPO THAT NO CHANNEL CONTESTS. Above is
+  // scoped to the contested names; a repository filed under a Comfy Registry id that is
+  // not its own name loses the id race just as completely, and needs no second channel to
+  // do it. Same route, same reason it takes no channel bypass — Manager reads no channel
+  // here — so it is refused in the same place rather than warned about later.
+  const rekeyedVersionAmbiguity =
+    rerouted && norm.repository && norm.version
+      ? rekeyedRegistryVersionAmbiguity(norm.repository, norm.version)
+      : undefined;
+  if (rekeyedVersionAmbiguity) {
+    return { conflict: rekeyedRegistryVersionRefusal(rekeyedVersionAmbiguity) };
+  }
   // Past that return, the request is necessarily on the from-source route — a contested
   // name with a registry version has already been refused — so the channel-based
   // reasoning below is only ever applied where a channel is actually consulted.
   const ambiguity =
     rerouted && norm.repository ? bareNameAmbiguity(norm.repository, effectiveChannel) : undefined;
   if (ambiguity && defaultedChannel) return { conflict: ambiguousBareNameRefusal(ambiguity) };
+  // #1624 — AND THE FROM-SOURCE ROUTE FOR THE SAME REPOSITORIES. Consulted only when the
+  // contested-name table said nothing, because when it DOES fire it already reasons about
+  // re-keying (`REKEYED_REPOS`) for that name and a second message would say it twice.
+  const rekeyed =
+    rerouted && norm.repository && !ambiguity
+      ? rekeyedRepoAmbiguity(norm.repository, effectiveChannel)
+      : undefined;
+  if (rekeyed && defaultedChannel) return { conflict: rekeyedRepoRefusal(rekeyed) };
   // The substitution warning rides EVERY git-URL install (gate round 2), because
   // bare-name resolution is a property of the v4 from-source route rather than of
   // who chose the channel — an explicit `channel:"dev"` substitutes just as readily.
@@ -4585,6 +4610,7 @@ export function nodesInstallCommandArgs(args: {
       norm.note,
       rerouted && norm.repository ? gitInstallSubstitutionNote(effectiveChannel, norm.repository) : undefined,
       ambiguity ? ambiguousBareNameWarning(ambiguity) : undefined,
+      rekeyed ? rekeyedRepoWarning(rekeyed) : undefined,
       defaultedChannel ? gitInstallChannelNote(GIT_INSTALL_DEFAULT_CHANNEL) : undefined,
     ]
       .filter((s): s is string => typeof s === "string" && s.length > 0)

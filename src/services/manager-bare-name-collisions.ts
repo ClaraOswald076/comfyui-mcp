@@ -67,10 +67,12 @@
  *    list appears to say. `REGISTRY_TARGETS` records what `cnr_map[name]` then clones, so
  *    the refusal names that repository outright instead of guessing.
  *
- *    STILL NOT CLOSED IN GENERAL, and that is #1624: this covers the 111 names measured
- *    here, but the hazard needs no channel collision at all — ANY pack whose entry is
- *    re-keyed and whose bare name matches a different registry id is exposed, and those
- *    are not enumerated here.
+ *    NOW ALSO COVERED WITHOUT A CHANNEL COLLISION (#1624). The paragraph above used to
+ *    end "still not closed in general": this table is keyed by CONTESTED names, and the
+ *    hazard needs no contest — a pack whose entry is re-keyed and whose bare name answers
+ *    to a different registry id is exposed on its own. That class is enumerated now, in
+ *    `REKEYED_SUBSTITUTIONS` and `rekeyedRepoAmbiguity` below: 98 repositories, 56 of them
+ *    invisible to this table. What remains uncovered is stated there.
  *
  *  * A pip-installed Manager. `get_data_by_mode` reads the cache file for the configured
  *    channel URL, else the snapshot BUNDLED in the package — a stale, default-flavoured
@@ -107,7 +109,9 @@ import {
   MANAGER_CHANNEL_NAMES,
   REGISTRY_TARGETS,
   REKEYED_REPOS,
+  REKEYED_SUBSTITUTIONS,
   type ManagerChannelName,
+  type RekeyedSubstitution,
 } from "./manager-bare-name-data.js";
 
 export {
@@ -116,8 +120,9 @@ export {
   MANAGER_CHANNEL_NAMES,
   REGISTRY_TARGETS,
   REKEYED_REPOS,
+  REKEYED_SUBSTITUTIONS,
 };
-export type { ManagerChannelName };
+export type { ManagerChannelName, RekeyedSubstitution };
 
 /**
  * The pack name Manager will resolve by — EXACTLY the panel's `gitRepoName`
@@ -324,6 +329,242 @@ export function bareNameAmbiguity(url: string, channel: string): BareNameAmbigui
     resolvedVia: channelCandidates.length === 0 ? "cnr-fallback" : "channel",
     allCandidates,
   };
+}
+
+/**
+ * #1624 — THE SUBSTITUTION THAT NEEDS NO CHANNEL COLLISION AT ALL.
+ *
+ * Everything above is keyed by a CONTESTED bare name: a name the six channel lists carry
+ * under more than one repository. That is narrower than the hazard, and #1619 shipped
+ * saying so. Re-keying alone is enough:
+ *
+ *   1. the repository a caller names is registered in the Comfy Registry under an id that
+ *      is not its own bare name, so `get_custom_nodes` files it under THAT id
+ *      (`if cnr: node_id = v['id']`) and a bare-name lookup cannot return it — from any
+ *      channel, however plainly that channel's list carries it; and
+ *   2. something else answers to the bare name: another channel entry that was not
+ *      re-keyed, or, when the channel carries nothing, the registry pack whose id IS that
+ *      name, which `install_by_id`'s nightly branch falls back to and clones.
+ *
+ * Both are properties of the global registry, so a pack needs no cross-channel collision
+ * to be exposed. Replaying 4.2.2's resolution over every repository in the six channel
+ * lists plus the whole registry (5117 repos), the shipped guard misses 56 live
+ * repositories that resolve to another author's code today — the class this closes.
+ *
+ * WHY A PRECOMPUTED VERDICT RATHER THAN THE RAW MAP. #1624 proposed mirroring the
+ * registry's `repository -> id` and `id -> repository` tables into the snapshot and
+ * simulating at call time. The simulation is the right idea; shipping its INPUT is not.
+ * Both directions of a 5117-row table are needed to answer one yes/no question per repo,
+ * the answer never varies per caller, and a runtime simulation is a second implementation
+ * of Manager's keying that can drift from the generator's. So the generator runs the
+ * simulation once, against data it fetched in the same pass as the channel lists, and
+ * emits only the repositories whose answer is "someone else": 98 records instead of 5117
+ * rows, with the losing 1268 (re-keyed but resolving to nothing, where Manager answers
+ * "not found" and installs nobody's code) deliberately left out.
+ *
+ * WHAT IS STILL NOT COVERED, stated rather than implied. This is keyed by the CALLER'S
+ * repository, so it can only fire for repositories the registry knows. A fork that is
+ * neither registered nor channel-listed — `someone/ComfyUI-GGUF`, say — hits exactly the
+ * same substitution (the name resolves to city96's) and is not in here, because the set
+ * of unregistered forks is not enumerable from any snapshot. Those keep today's behaviour:
+ * the standing dispatch note warns that the name, not the URL, is what resolves.
+ */
+export interface RekeyedRepoAmbiguity {
+  /** The name as it will be SENT (case preserved) — the id `install_by_id` looks up. */
+  bare: string;
+  /** The URL the caller passed, verbatim. */
+  callerUrl: string;
+  /** `owner/repo` the caller named, cased as they typed it. */
+  callerRepo: string;
+  /** The same repository, cased as the Comfy Registry records it. */
+  registeredRepo: string;
+  /** The Comfy Registry id it is filed under — the reason its own name misses. */
+  registryId: string;
+  /** The channel about to be asked. */
+  channel: string;
+  /** What a bare-name lookup DOES reach in that channel — never the caller's own repo. */
+  channelCandidates: readonly string[];
+  /** What `cnr_map[<bare name>]` clones when the channel carries nothing under the name. */
+  registryTarget?: string;
+  /** Which of the two decides the clone, exactly as in `BareNameAmbiguity`. */
+  resolvedVia: "channel" | "cnr-fallback";
+}
+
+/** The caller's repo, looked up the way the table is keyed, or undefined. */
+function rekeyedRecordFor(url: string): { repo: string; rec: RekeyedSubstitution } | undefined {
+  // An `owner/repo` that came off another host is a DIFFERENT repository that merely
+  // shares a path, exactly as `bareNameAmbiguity` reasons — matching it here would refuse
+  // a gitlab URL by quoting a github repository the caller never named.
+  if (!comparableToSnapshot(url)) return undefined;
+  const repo = ownerRepoOf(url);
+  if (!repo) return undefined;
+  const rec = ownCandidates(REKEYED_SUBSTITUTIONS, repo.toLowerCase());
+  return rec ? { repo, rec } : undefined;
+}
+
+/**
+ * Would a from-source install of this URL land on a repository other than the caller's,
+ * because theirs is filed under a Comfy Registry id rather than under its own name?
+ *
+ * `undefined` when the repository is not one the snapshot measured as re-keyed, when the
+ * channel is not one Manager accepts, or when the name resolves to NOTHING on that channel
+ * — the last being Manager's "not found", which substitutes nobody's code and is a
+ * different complaint than this one.
+ */
+export function rekeyedRepoAmbiguity(url: string, channel: string): RekeyedRepoAmbiguity | undefined {
+  const found = rekeyedRecordFor(url);
+  if (!found) return undefined;
+  const asked = channel.trim().toLowerCase();
+  // Same reasoning as `bareNameAmbiguity`: `normalize_channel` raises InvalidChannel on a
+  // name Manager does not accept, so no list is consulted and there is no CNR fallback to
+  // reach. This is also what keeps an INHERITED key from being read as a miss.
+  if (!KNOWN_CHANNELS.has(asked)) return undefined;
+  const { repo, rec } = found;
+  const channelCandidates = ownCandidates(rec.channelTargets, asked as ManagerChannelName) ?? [];
+  if (channelCandidates.length === 0 && rec.registryTarget === undefined) return undefined;
+  return {
+    bare: managerBareName(url),
+    callerUrl: url.trim(),
+    callerRepo: repo,
+    registeredRepo: rec.repo,
+    registryId: rec.id,
+    channel,
+    channelCandidates,
+    registryTarget: rec.registryTarget,
+    resolvedVia: channelCandidates.length === 0 ? "cnr-fallback" : "channel",
+  };
+}
+
+/**
+ * The one sentence both messages below are built on, kept in one place so the refusal and
+ * the warning cannot drift into saying different things about the same repository.
+ */
+function rekeyedMechanism(a: RekeyedRepoAmbiguity): string {
+  return (
+    `ComfyUI-Manager v4 does not look a from-source install up by the URL you pass — it ` +
+    `files every channel entry under the pack's Comfy Registry id when the repo is ` +
+    `registered, and under the bare repo name only when it is not (get_custom_nodes: ` +
+    `\`cnr = get_cnr_by_repo(files[0]); if cnr: node_id = v['id']\`). ` +
+    `https://github.com/${a.registeredRepo} is registered as "${a.registryId}", so it is ` +
+    `filed under THAT id and a lookup for "${a.bare}" cannot return it — on any channel, ` +
+    `however plainly a channel's list carries it.`
+  );
+}
+
+/** What actually lands instead, for either message. */
+function rekeyedLanding(a: RekeyedRepoAmbiguity): string {
+  return a.resolvedVia === "channel"
+    ? `The "${a.channel}" channel's list DOES answer to "${a.bare}" — with ` +
+        `${listRepos(a.channelCandidates)} — so that is what would be cloned`
+    : `Nothing in the "${a.channel}" channel's list answers to "${a.bare}", which is not ` +
+        `the end of it: on a "nightly" spec v4 falls back to the registry map ` +
+        `(install_by_id → cnr_map) and clones what the id "${a.bare}" is registered to, ` +
+        `which is https://github.com/${a.registryTarget}`;
+}
+
+/**
+ * The pre-dispatch refusal. Unlike `ambiguousBareNameRefusal` there is no channel that
+ * resolves this name to the caller's repository — not "none in the snapshot", but none
+ * that can exist, because the id it is filed under is not its name — so the remedy is the
+ * verbatim-clone route and the message says only that.
+ */
+export function rekeyedRepoRefusal(a: RekeyedRepoAmbiguity): string {
+  return (
+    `REFUSED before dispatch — this install would have fetched a repository other than ` +
+    `the one you named. ${rekeyedMechanism(a)} You asked for ` +
+    `https://github.com/${a.callerRepo}. ${rekeyedLanding(a)}, and the install would have ` +
+    `reported success. Not picked for you: no \`channel\` argument can rescue this one — ` +
+    `changing the list consulted cannot make your repository reachable by a name it is ` +
+    `not filed under — so use install_custom_node (source:"git"), which clones the URL ` +
+    `you pass verbatim instead of resolving a name. ` +
+    `(This check ran because no \`channel\` was named, against a snapshot of the Comfy ` +
+    `Registry and the six published channel lists measured ` +
+    `${AMBIGUOUS_BARE_NAMES_MEASURED}; naming a \`channel\` explicitly does still bypass ` +
+    `it, but it cannot aim the install — the one reason to take that bypass is a ComfyUI ` +
+    `running Manager 3.x, where the from-source request carries the URL in \`files\` and ` +
+    `IS cloned as passed, and this check cannot tell the generations apart because the ` +
+    `panel picks the dialect after the request leaves here.)`
+  );
+}
+
+/**
+ * The same finding for a caller who DID name the channel. It dispatches — their choice,
+ * and on 3.x the URL is what gets cloned — but it must not repeat `ambiguousBareNameWarning`'s
+ * "you chose the channel" framing, because here the channel choice decided nothing at all.
+ */
+export function rekeyedRepoWarning(a: RekeyedRepoAmbiguity): string {
+  return (
+    `RE-KEYED PACK: you asked for https://github.com/${a.callerRepo}, and naming a ` +
+    `channel did not aim this install. ${rekeyedMechanism(a)} ${rekeyedLanding(a)}. ` +
+    `Dispatched because you named a channel, and because on Manager 3.x the URL you ` +
+    `passed IS what gets cloned; if this is v4 and you need the repository you typed, ` +
+    `install_custom_node (source:"git") clones it directly instead of resolving a name. ` +
+    `Verify with panel_list_nodes before you restart or report success. ` +
+    `(Snapshot measured ${AMBIGUOUS_BARE_NAMES_MEASURED}.)`
+  );
+}
+
+/**
+ * The registry-version route for the same repositories. `registryVersionAmbiguity` below
+ * covers it only for the CONTESTED names, and the reasoning transfers unchanged: an
+ * explicit version skips `get_custom_nodes` entirely and installs the Comfy Registry pack
+ * whose id is the bare repo name. For a re-keyed repository that id is by definition not
+ * the one it is registered under, so what lands is `registryTarget` — someone else.
+ *
+ * Requires `registryTarget`: with no registry pack of that name `cnr_install` fails and
+ * nobody's code is installed, which is not this bug.
+ */
+export interface RekeyedRegistryVersionAmbiguity {
+  bare: string;
+  callerUrl: string;
+  callerRepo: string;
+  registeredRepo: string;
+  registryId: string;
+  version: string;
+  registryTarget: string;
+}
+
+export function rekeyedRegistryVersionAmbiguity(
+  url: string,
+  version: string,
+): RekeyedRegistryVersionAmbiguity | undefined {
+  const spec = version.trim().toLowerCase();
+  if (spec === "nightly" || spec === "unknown" || spec.length === 0) return undefined;
+  const found = rekeyedRecordFor(url);
+  if (!found?.rec.registryTarget) return undefined;
+  return {
+    bare: managerBareName(url),
+    callerUrl: url.trim(),
+    callerRepo: found.repo,
+    registeredRepo: found.rec.repo,
+    registryId: found.rec.id,
+    version: version.trim(),
+    registryTarget: found.rec.registryTarget,
+  };
+}
+
+/**
+ * The refusal for that route. Dropping `version` is NOT the remedy here — unlike
+ * `registryVersionRefusal`, where the from-source path does honour the channel's entry —
+ * because the from-source path cannot reach this repository by name either.
+ */
+export function rekeyedRegistryVersionRefusal(a: RekeyedRegistryVersionAmbiguity): string {
+  return (
+    `REFUSED before dispatch — the version you passed takes this install off the ` +
+    `from-source path, and on the path it lands on your \`repository\` is not read at ` +
+    `all. ComfyUI-Manager only consults a channel's list for version "nightly" or ` +
+    `"unknown"; with an explicit version ("${a.version}") it installs the Comfy Registry ` +
+    `pack whose ID is the bare repo name — here "${a.bare}" — which is registered to ` +
+    `https://github.com/${a.registryTarget}, not to you. You asked for ` +
+    `https://github.com/${a.callerRepo}, and that repository is registered under the id ` +
+    `"${a.registryId}" instead, so the name you sent belongs to somebody else's pack. ` +
+    `Not picked for you: dropping \`version\` does NOT rescue this one — the from-source ` +
+    `route resolves the same name and cannot reach a repository filed under a different ` +
+    `id — so use install_custom_node (source:"git"), which clones the URL you pass ` +
+    `verbatim. If you specifically want the registry pack, pass its id as \`id\` instead ` +
+    `of a URL, so what you are asking for is the thing that gets installed. ` +
+    `(Snapshot measured ${AMBIGUOUS_BARE_NAMES_MEASURED}.)`
+  );
 }
 
 /**
