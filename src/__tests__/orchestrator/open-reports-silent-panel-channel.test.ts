@@ -31,6 +31,7 @@ import {
   type PanelToolCtx,
   type ToolResult,
 } from "../../orchestrator/panel-tools.js";
+import { attachPanelAnswered } from "../../services/panel-answered.js";
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 
 const TAB = "wf:workflows/a.json";
@@ -59,7 +60,11 @@ type ListBehaviour =
   /** The probe read fails and the NEXT one succeeds — a tab that reconnected in the
    *  gap. Two separate round trips, so this is a real production state, and it is the
    *  only one in which the fence is repaired DESPITE a silent probe. */
-  | "throw_then_ok";
+  | "throw_then_ok"
+  /** The panel RECEIVED the read and refused it — the bridge's `ok:false` branch,
+   *  whose error carries the "something answered" mark (`attachPanelAnswered`). This
+   *  is `isError` like a timeout and is its exact OPPOSITE: the tab is talking. */
+  | "acked_error";
 
 function bridge(openVerdict: string, list: ListBehaviour) {
   const calls: string[] = [];
@@ -70,6 +75,14 @@ function bridge(openVerdict: string, list: ListBehaviour) {
       calls.push(String(cmd.cmd));
       if (cmd.cmd === "workflow_list") {
         listCalls += 1;
+        if (list === "acked_error") {
+          // Worded to LOOK like a silence on purpose: the classification must come
+          // from the mark, and a message-shaped rule would also have to survive
+          // being translated. This is the shape ui-bridge mints on `ok:false`.
+          throw attachPanelAnswered(
+            new Error(`the panel could not answer workflow_list: its workflow store is not ready`),
+          );
+        }
         const silent = list === "throw" || (list === "throw_then_ok" && listCalls === 1);
         if (silent) throw new Error(`Panel tab ${TAB} did not reply to "workflow_list" within 6000 ms`);
         const active = {
@@ -195,6 +208,39 @@ describe("a post-open exempt read that did not answer is REPORTED (#1560)", () =
 
     expect(text).toMatch(/FENCE: NOT cleared/);
     expect(text).toMatch(/PANEL CHANNEL: NOT ANSWERING/);
+  });
+
+  it("a panel that ANSWERS the probe with an ERROR is never called silent (review, P1)", async () => {
+    // THE FALSE CLAIM THIS NOTE COULD MAKE. `isError` covers two opposite
+    // observations: nothing came back, and the tab received the read, ran it and
+    // replied refusing it. The first version of this fix mapped both to "unanswered",
+    // so a working panel got `PANEL CHANNEL: NOT ANSWERING` — a statement contradicted
+    // by the very reply that produced it — plus a hard-refresh prescription for a
+    // problem this user does not have. The suite only covered the canonical timeout,
+    // where the two agree.
+    const { text, isError, calls } = await openWorkflow(IDENTITY_UNPROVEN, "acked_error");
+
+    // The probe really ran and really failed — this is not the "nothing to observe"
+    // case sneaking in through the back door.
+    expect(calls).toContain("workflow_list");
+    expect(isError).toBe(true);
+    // The panel's own verdict is still reported verbatim; only the CHANNEL claim goes.
+    expect(text).toContain("could not prove that the active canvas was rebound");
+    expect(text).not.toMatch(/PANEL CHANNEL: NOT ANSWERING/);
+    // …including the remedy it carries. Sending this caller to reload their tab is
+    // the actionable half of the false claim.
+    expect(text).not.toMatch(/Ctrl\+Shift\+R/);
+    expect(text).not.toMatch(/reads the same channel that just failed/i);
+  });
+
+  it("the same, through the identity-PROVEN verdict", async () => {
+    // The other route to the note. Here the #1337 re-derivation runs first and hits
+    // the same answering-but-refusing panel, so the fence genuinely is not cleared —
+    // and that is still not evidence of a dead channel.
+    const { text } = await openWorkflow(IDENTITY_PROVEN_DRIFT, "acked_error");
+
+    expect(text).toMatch(/FENCE: NOT cleared/);
+    expect(text).not.toMatch(/PANEL CHANNEL: NOT ANSWERING/);
   });
 
   it("a GENUINE acked failure provokes no probe and no note", async () => {

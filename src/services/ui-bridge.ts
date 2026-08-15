@@ -19,6 +19,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { resolveLocale, trFor, type Locale } from "../i18n/index.js";
 import { logger } from "../utils/logger.js";
+import { attachPanelAnswered, inheritPanelAnswered } from "./panel-answered.js";
 import { attachPanelRefusal, hasOwnField, readPanelRefusal } from "./panel-refusal.js";
 import { midCommandDisconnectMessage } from "./mid-command-remedy.js";
 import {
@@ -2644,7 +2645,13 @@ export class UiBridge {
           //
           // Validated before it is attached, so only a complete pre-executor claim
           // travels; anything else leaves the error exactly as it was.
-          const err = new Error(String(msg.error ?? "panel reported an error"));
+          // #1560 — and record the fact that this reply EXISTS, structurally.
+          // `ctx.call` flattens every failure into `isError`, so a command the panel
+          // SERVED and refused arrives indistinguishable from one the tab never
+          // answered — and a caller that reports "the channel is not answering" then
+          // says it about a panel that is demonstrably talking. This branch is the
+          // one place that knows the difference: a reply was received.
+          const err = attachPanelAnswered(new Error(String(msg.error ?? "panel reported an error")));
           // OWN property on the WIRE message too (review, P0). A polluted
           // Object.prototype.refusal would otherwise give every ordinary panel
           // error — including a genuine mid-write one carrying no refusal of its
@@ -4477,7 +4484,13 @@ export class UiBridge {
       if (isUnknownCommandReply(err.message)) {
         target.provenSupportedCmds.delete(cmd.cmd);
       }
-      ctx.reject(friendly ?? err);
+      // #1560 — a rewrite is still a REPLY. `friendly` is minted from an "Unknown
+      // command" answer the panel sent, so the substituted error must carry the
+      // same "something answered" mark the original does; dropping it here would
+      // label a talking panel silent and send its user to hard-refresh a healthy
+      // tab. PROPAGATED from the source error, never re-derived from the
+      // replacement's wording.
+      ctx.reject(friendly ? inheritPanelAnswered(err, friendly) : err);
     };
     const timer = setTimeout(() => {
       this.pending.delete(rid);

@@ -44,6 +44,7 @@ import { fileURLToPath } from "node:url";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { assertPanelNotTargetedUnverifiable } from "../services/panel-pin-guard.js";
 import { nodesInstallCommandArgs } from "../services/node-management.js";
+import { isPanelAnsweredError } from "../services/panel-answered.js";
 import { isPreExecutorRefusal } from "../services/panel-refusal.js";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { parse as parseYaml } from "yaml";
@@ -2250,6 +2251,45 @@ function isReplyTimeoutResult(res: ToolResult): boolean {
   return res?.isError === true && (res as Record<symbol, unknown>)[REPLY_TIMEOUT_RESULT] === true;
 }
 
+/**
+ * #1560 — the same translation problem, for the OTHER fact: did anything answer?
+ *
+ * `isReplyTimeoutResult` above identifies ONE way a command can go unanswered (the
+ * bridge's own tagged reply timeout). That is not the question a caller reporting on
+ * the CHANNEL is asking — a routing refusal, a dead socket and a mid-command
+ * disconnect are equally "no answer", and none of them carry that tag. The complement
+ * is what can be stated positively and exactly: the panel SENT a reply, which the
+ * bridge marks at the single branch that receives one (`attachPanelAnswered`).
+ *
+ * Kept off the JSON payload as a module-private Symbol, exactly like the marker
+ * above, so the result's serialisation is byte-identical and nothing downstream can
+ * observe it by accident. A Symbol created here is unreachable from any wire object,
+ * which is why this — unlike the string-keyed read on the Error — needs no
+ * own-property dance: there is no `Object.prototype` slot an attacker or a careless
+ * dependency could fill. And the read's failure direction is the safe one anyway: a
+ * mark wrongly seen suppresses a note, which is how this path behaved before #1560.
+ */
+const PANEL_ANSWERED_RESULT = Symbol("panel.answeredResult");
+
+function carryPanelAnsweredMark(err: unknown, res: ToolResult): ToolResult {
+  if (res?.isError !== true) return res;
+  if (!isPanelAnsweredError(err)) return res;
+  Object.defineProperty(res, PANEL_ANSWERED_RESULT, {
+    value: true,
+    enumerable: false,
+    configurable: true,
+  });
+  return res;
+}
+
+/** True only for a ToolResult `ctx.call` produced from an error the BRIDGE minted
+ *  out of a received reply. A timeout, a routing refusal or a dead socket can never
+ *  carry this, whatever their text says — and neither can an error from a panel too
+ *  old to be marked, which is why its absence claims nothing on its own. */
+function isPanelAnsweredResult(res: ToolResult): boolean {
+  return res?.isError === true && (res as Record<symbol, unknown>)[PANEL_ANSWERED_RESULT] === true;
+}
+
 // ---- panel_exit_subgraph settle-after-ack-timeout (#1468) ------------------
 // `graph_exit_subgraph` timed out at 15 s while a following `panel_graph_outline`
 // proved the view HAD returned to root — an applied navigation reported as a
@@ -3907,11 +3947,24 @@ async function observeActiveAfterOpen(
   let list: Record<string, unknown> | null = null;
   try {
     const res = await ctx.call({ cmd: "workflow_list" }, 6000);
-    // An ERROR reply and a THROW are the same observation — the fence-exempt read did
-    // not come back with a usable list — and both are reported as such. A reply that
-    // ARRIVED and merely did not parse is NOT this: something answered, so the channel
-    // claim below would be false. That case keeps the old silence.
-    if (res?.isError) return { status: "unanswered", detail: toolResultText(res) };
+    // NOT EVERY `isError` IS A SILENCE (review, P1). The first version of this read
+    // every failed read as "the panel never came back", and an ACKNOWLEDGED panel
+    // error is `isError` too — the tab received the command, ran its gate and replied
+    // refusing it. Labelling that `NOT ANSWERING` states the opposite of what was
+    // observed and hands the user a hard-refresh for a tab that is working, which is
+    // this bug's own failure mode pointed the other way.
+    //
+    // The two are told apart STRUCTURALLY, at the bridge branch that receives the
+    // reply — never from the message, which is arbitrary panel text and is
+    // TRANSLATED, so a wording rule would answer wrongly in eleven of twelve locales.
+    // Absence of the mark is the honest default: a timeout, a routing refusal and a
+    // dead socket all mint no reply, and so does a panel too old to be marked at all.
+    if (res?.isError) {
+      // It answered. That says nothing about this workflow — same silence as a reply
+      // that arrived and did not parse, below — but it does refute a channel claim.
+      if (isPanelAnsweredResult(res)) return { status: "quiet" };
+      return { status: "unanswered", detail: toolResultText(res) };
+    }
     list = parseToolResultJson(res);
   } catch (err) {
     // BELT AND BRACES, and stated as such rather than dressed up as a guard: `ctx.call`
@@ -6946,10 +6999,17 @@ export function makePanelToolCtx(
     return bridge.send(routed as { cmd: string }, { tabId: ctx.tabId, timeoutMs, onDispatchedRid });
   };
 
-  const call = async (
+  const callOnce = async (
     cmd: Record<string, unknown>,
     timeoutMs?: number,
     onDispatchedRid?: (rid: string) => void,
+    // #1560 — reports the error each attempt failed on, so the wrapper below can
+    // stamp the bridge's structural marks onto the ToolResult from ONE place. The
+    // catch has more than a dozen `fail(...)` exits, each shaping its own message;
+    // decorating them individually is the shape that goes stale the moment a
+    // fourteenth is added, and the fact being carried belongs to the ERROR rather
+    // than to any one of those wordings.
+    onFailure?: (err: unknown) => void,
   ): Promise<ToolResult> => {
     // #694: capture the rid of THIS call's dispatched attempt so an OUTCOME-UNKNOWN
     // mutating failure can name it as the caller's explicit retry token (see the
@@ -6985,6 +7045,7 @@ export function makePanelToolCtx(
       if (successProvesSwitchCleared(cmd.cmd)) clearSwitchHold(ctx.tabId);
       return firstTry;
     } catch (err) {
+      onFailure?.(err); // #1560 — the error this attempt failed on (see the wrapper).
       // Post-reconnect retry-once: a reboot/free_vram/reconnect can drop the tab's
       // transport (or replace it under a new tab id) the instant after we dispatch.
       // For idempotent commands, settle briefly, rebind onto the now-live tab, and
@@ -7038,6 +7099,10 @@ export function makePanelToolCtx(
           }
           return retried;
         } catch (err2) {
+          // #1560 — the RETRY's failure is the one every exit below describes, so it
+          // supersedes the first. A retried read that comes back refused is a panel
+          // that answered, whatever the flap that provoked the retry looked like.
+          onFailure?.(err2);
           // #1027 — a switch STILL in progress is not a reconnect, and saying so
           // would be the #1001 mistake again: the tab is connected and healthy,
           // it is simply mid-switch. Name the actual state and the actual wait.
@@ -7334,6 +7399,32 @@ export function makePanelToolCtx(
       }
       return carryReplyTimeoutMark(err, fail(err));
     }
+  };
+  /**
+   * #1560 — ONE exit, so a structural fact about the failure survives the trip into a
+   * ToolResult no matter which of `callOnce`'s exits produced it.
+   *
+   * `carryReplyTimeoutMark` is applied at three of those exits by hand, which is fine
+   * for a fact only those three can carry. "The panel answered" is not like that: an
+   * acknowledged `ok:false` reply can leave through the capability branch, the
+   * root-uuid branch, the mismatch branch or the bare tail, and a caller reading the
+   * mark has to be able to trust its ABSENCE. Stamping it here means a new `fail(...)`
+   * exit added later inherits the mark instead of quietly losing it.
+   *
+   * The failure is captured per invocation (a closure local, not shared state), so
+   * concurrent `ctx.call`s — including the `rebindWorkflowFence` round trip that
+   * `callOnce`'s own catch makes — cannot read each other's.
+   */
+  const call = async (
+    cmd: Record<string, unknown>,
+    timeoutMs?: number,
+    onDispatchedRid?: (rid: string) => void,
+  ): Promise<ToolResult> => {
+    let failure: unknown;
+    const res = await callOnce(cmd, timeoutMs, onDispatchedRid, (err) => {
+      failure = err;
+    });
+    return carryPanelAnsweredMark(failure, res);
   };
   // Human-in-the-loop confirmation for a DESTRUCTIVE op: render a yes/no card in
   // the panel and block on the user's pick. Returns false on decline, timeout, or
