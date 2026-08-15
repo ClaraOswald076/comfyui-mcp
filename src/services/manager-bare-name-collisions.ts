@@ -203,6 +203,115 @@ export function bareNameAmbiguity(url: string, channel: string): BareNameAmbigui
   return { bare, callerUrl: url.trim(), callerRepo, channel, channelCandidates, channelsResolvingToCaller };
 }
 
+/**
+ * GATE ROUND 4 — THE CHANNEL EXEMPTION IS INVALID WHEN NO CHANNEL IS CONSULTED.
+ *
+ * `bareNameAmbiguity` above waves a call through when the asked-for channel carries
+ * exactly the caller's repository and nothing else: there is nothing to pick between, so
+ * nothing to refuse. That reasoning holds only on the from-source path. Manager gates the
+ * whole channel lookup on the version:
+ *
+ *   install_by_id(node_id, version_spec, channel, mode)
+ *     if version_spec == 'unknown' or version_spec == 'nightly':
+ *         custom_nodes = await self.get_custom_nodes(channel, mode)   # <- channel read HERE
+ *         ...
+ *     ...
+ *     res = self.cnr_install(node_id, version_spec, ...)              # <- and NOT here
+ *
+ * So an explicit CNR version skips the channel entirely and installs the Comfy Registry
+ * pack whose **id is the bare name** — the `repository` the caller passed is not read on
+ * that path either. Measured: `{repository:"https://github.com/hieuck/ComfyUI-BiRefNet",
+ * version:"1.0.0"}` was allowed through because `default` carries hieuck's repo, but
+ * registry id `comfyui-birefnet` is `viperyl/ComfyUI-BiRefNet` (api.comfy.org, publisher
+ * "Zephrus shawn"). The caller named hieuck and would have got viperyl, reported as a
+ * success — the exact substitution this guard exists to refuse, waved through by the
+ * guard's own exemption.
+ *
+ * Scoped to the names this snapshot measured as contested. A git URL whose name is NOT
+ * known to collide keeps today's behaviour on this path: its `repository` is ignored just
+ * the same, but that is the standing CNR-route property #1616 did not open and this PR
+ * does not close — the dispatch note already discloses it.
+ */
+export interface RegistryVersionAmbiguity {
+  /** The bare name, which on this path IS the registry id looked up. */
+  bare: string;
+  /** The URL the caller passed, verbatim. */
+  callerUrl: string;
+  /** `owner/repo` the caller named, when comparable to the snapshot. */
+  callerRepo?: string;
+  /** The non-nightly version that routes this to the registry instead of a channel. */
+  version: string;
+  /** Every repository the snapshot has seen under this name, across all channels. */
+  candidates: readonly string[];
+}
+
+/**
+ * Is this a registry-version install of a name measured to be contested? `version` is the
+ * value that will actually be sent. `nightly` and `unknown` are the from-source specs that
+ * DO consult the channel — those belong to `bareNameAmbiguity`, not here.
+ */
+export function registryVersionAmbiguity(
+  url: string,
+  version: string,
+): RegistryVersionAmbiguity | undefined {
+  const spec = version.trim().toLowerCase();
+  if (spec === "nightly" || spec === "unknown" || spec.length === 0) return undefined;
+  const bare = managerBareName(url);
+  const entry = ownCandidates(AMBIGUOUS_BARE_NAMES, bare.trim().toLowerCase());
+  if (!entry) return undefined;
+  const candidates = [
+    ...new Set(MANAGER_CHANNEL_NAMES.flatMap((c) => ownCandidates(entry, c) ?? [])),
+  ];
+  if (candidates.length === 0) return undefined;
+  return {
+    bare,
+    callerUrl: url.trim(),
+    callerRepo: comparableToSnapshot(url) ? ownerRepoOf(url) : undefined,
+    version: version.trim(),
+    candidates,
+  };
+}
+
+/**
+ * The refusal for that case. The remedy is not a channel — a channel changes nothing on
+ * this route — it is DROPPING the version, which puts the call back on the from-source
+ * path where the channel does decide and where this guard can actually reason about it.
+ */
+export function registryVersionRefusal(a: RegistryVersionAmbiguity): string {
+  const asked = a.callerRepo ? `https://github.com/${a.callerRepo}` : `"${a.callerUrl}"`;
+  return (
+    `REFUSED before dispatch — the version you passed takes this install off the ` +
+    `from-source path entirely, and on the path it lands on your \`repository\` is not ` +
+    `read at all. ComfyUI-Manager only consults a channel's list for version "nightly" ` +
+    `or "unknown"; with an explicit version ("${a.version}") it installs the Comfy ` +
+    `Registry pack whose ID is the bare repo name — here "${a.bare}" — and that registry ` +
+    `entry belongs to whoever published the id, not to you. You asked for ${asked}, and ` +
+    `"${a.bare}" is one of the names measured to be claimed by more than one repository ` +
+    `(${listRepos(a.candidates)}), so the id may well not resolve to yours. ` +
+    `Not picked for you: drop \`version\` (or pass "nightly") and this becomes the ` +
+    `from-source install that DOES honour the channel's entry for that name — which is ` +
+    `the only route where naming a repository means anything. If you specifically want ` +
+    `the registry pack, pass its id as \`id\` instead of a URL, so what you are asking ` +
+    `for is the thing that gets installed. (Snapshot measured ` +
+    `${AMBIGUOUS_BARE_NAMES_MEASURED}.)`
+  );
+}
+
+/** The same finding for a caller who named a channel — dispatched, but the channel is inert here. */
+export function registryVersionWarning(a: RegistryVersionAmbiguity): string {
+  const asked = a.callerRepo ? `https://github.com/${a.callerRepo}` : `"${a.callerUrl}"`;
+  return (
+    `REGISTRY-VERSION COLLISION: you asked for ${asked} at version "${a.version}", but an ` +
+    `explicit version routes this through the Comfy Registry by the id "${a.bare}" — ` +
+    `Manager reads a channel's list only for "nightly"/"unknown", so the \`channel\` you ` +
+    `named is inert here and your \`repository\` is not read either. "${a.bare}" is ` +
+    `measured to be claimed by more than one repository (${listRepos(a.candidates)}). ` +
+    `Drop \`version\` to get the from-source install that honours the channel entry. ` +
+    `Verify with panel_list_nodes before you restart or report success. (Snapshot ` +
+    `measured ${AMBIGUOUS_BARE_NAMES_MEASURED}.)`
+  );
+}
+
 /** "X, Y and Z" — the candidates are NAMED, never reduced to a count. */
 function listRepos(repos: readonly string[]): string {
   const urls = repos.map((r) => `https://github.com/${r}`);

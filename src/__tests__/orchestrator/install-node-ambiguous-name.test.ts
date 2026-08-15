@@ -301,6 +301,70 @@ describe("the ambiguous from-source install is refused, not picked (#1616)", () 
     expect(note).not.toMatch(/did NOT disambiguate/);
   });
 
+  it("REFUSES the registry-version install the channel exemption used to wave through", async () => {
+    // GATE ROUND 4, and the most dangerous of the four because it was a WRONG ALLOW rather
+    // than a wrong message. `default` carries hieuck's ComfyUI-BiRefNet, so
+    // `bareNameAmbiguity` exempted it — nothing to pick between. But Manager reads a
+    // channel's list ONLY for "nightly"/"unknown":
+    //
+    //   if version_spec == 'unknown' or version_spec == 'nightly':
+    //       custom_nodes = await self.get_custom_nodes(channel, mode)
+    //   ...
+    //   res = self.cnr_install(node_id, version_spec, ...)
+    //
+    // With an explicit version it falls through to cnr_install and installs the COMFY
+    // REGISTRY pack whose id is the bare name. Measured against api.comfy.org: registry id
+    // `comfyui-birefnet` is viperyl/ComfyUI-BiRefNet (publisher "Zephrus shawn"). So the
+    // caller named hieuck, the guard said fine, and viperyl's code would have installed
+    // and reported success.
+    const out = nodesInstallCommandArgs({ repository: DEFAULT_AUTHORS, version: "1.0.0" });
+    expect(out.conflict).toBeTruthy();
+    expect(out.conflict).toMatch(/your `repository` is not read at all/i);
+    expect(out.conflict).toMatch(/"nightly"/);
+    // The remedy is dropping the version, NOT naming a channel — a channel is inert here.
+    expect(out.conflict).toMatch(/drop `version`/i);
+    // And it refuses on the wire, not just in the helper.
+    const wire = await attemptInstall({ repository: DEFAULT_AUTHORS, version: "1.0.0" });
+    expect(wire.isError).toBe(true);
+    expect(wire.sent).toBeUndefined();
+  });
+
+  it("the from-source spellings are NOT diverted to the registry refusal", () => {
+    // "nightly" and "unknown" are the two specs that DO consult the channel, and an
+    // omitted/"latest" version normalizes to "nightly". Those must keep the channel-based
+    // reasoning: hieuck on `default` stays allowed, mohammadaboulela stays refused with
+    // the CHANNEL explanation rather than the registry one.
+    for (const version of [undefined, "latest", "nightly", "unknown"]) {
+      const allowed = nodesInstallCommandArgs({ repository: DEFAULT_AUTHORS, ...(version ? { version } : {}) });
+      expect(allowed.conflict, `allowed @ ${String(version)}`).toBeUndefined();
+      const refused = nodesInstallCommandArgs({ repository: DEV_AUTHORS, ...(version ? { version } : {}) });
+      expect(refused.conflict, `refused @ ${String(version)}`).toMatch(/BARE REPO NAME/);
+      expect(refused.conflict, `refused @ ${String(version)}`).not.toMatch(/Comfy Registry pack whose ID/);
+    }
+  });
+
+  it("a registry-version call on a NAMED channel dispatches, but says the channel is inert", () => {
+    // The channel cannot disambiguate what it is never asked about. Keep the escape, drop
+    // the pretence that the argument did anything.
+    const out = nodesInstallCommandArgs({
+      repository: DEFAULT_AUTHORS,
+      version: "1.0.0",
+      channel: "dev",
+    });
+    expect(out.conflict).toBeUndefined();
+    expect(out.note ?? "").toMatch(/REGISTRY-VERSION COLLISION/);
+    expect(out.note ?? "").toMatch(/inert here/i);
+  });
+
+  it("leaves a name the snapshot has not seen collide alone on the registry route too", () => {
+    // Scope. Every git URL loses its `repository` on the CNR route, not just these 111 —
+    // that is the standing route property #1616 did not open. Only the measured set is
+    // refused; everything else keeps the disclosure it had.
+    const out = nodesInstallCommandArgs({ repository: UNCOLLIDING, version: "1.0.0" });
+    expect(out.conflict).toBeUndefined();
+    expect(out.version).toBe("1.0.0");
+  });
+
   it("matches the name CASE-INSENSITIVELY, the way Manager's own lookup does", () => {
     // `NormalizedKeyDict.get` keys on `key.strip().lower()`. A case-sensitive guard is
     // exactly what undercounted the hazard at 65 in the first place.

@@ -32,6 +32,9 @@ import {
   ambiguousBareNameRefusal,
   ambiguousBareNameWarning,
   bareNameAmbiguity,
+  registryVersionAmbiguity,
+  registryVersionRefusal,
+  registryVersionWarning,
 } from "./manager-bare-name-collisions.js";
 import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -4534,8 +4537,28 @@ export function nodesInstallCommandArgs(args: {
   // thing the standing rule says to refuse. A caller who named the channel made the choice
   // themselves and gets the collision NAMED instead (`ambiguousBareNameWarning`), which
   // also leaves a stale snapshot escapable in one argument rather than bricking the tool.
+  //
+  // GATE ROUND 4 — AND IT ONLY APPLIES WHERE A CHANNEL IS ACTUALLY READ. Manager gates
+  // the whole channel lookup on the version: `install_by_id` calls `get_custom_nodes`
+  // only for "nightly"/"unknown" and otherwise falls through to `cnr_install`, which
+  // resolves the bare name as a COMFY REGISTRY ID and reads neither the channel nor the
+  // `repository` passed. `bareNameAmbiguity`'s exemption — "this channel carries exactly
+  // your repo, so there is nothing to pick between" — is therefore not just unhelpful
+  // there, it is wrong: measured, `{repository:"hieuck/ComfyUI-BiRefNet",
+  // version:"1.0.0"}` was allowed through on that exemption while registry id
+  // `comfyui-birefnet` is viperyl's. Split the two routes so each is judged by the thing
+  // that actually decides it.
+  const registryAmbiguity =
+    rerouted && norm.repository && norm.version
+      ? registryVersionAmbiguity(norm.repository, norm.version)
+      : undefined;
+  if (registryAmbiguity && defaultedChannel) {
+    return { conflict: registryVersionRefusal(registryAmbiguity) };
+  }
   const ambiguity =
-    rerouted && norm.repository ? bareNameAmbiguity(norm.repository, effectiveChannel) : undefined;
+    rerouted && norm.repository && !registryAmbiguity
+      ? bareNameAmbiguity(norm.repository, effectiveChannel)
+      : undefined;
   if (ambiguity && defaultedChannel) return { conflict: ambiguousBareNameRefusal(ambiguity) };
   // The substitution warning rides EVERY git-URL install (gate round 2), because
   // bare-name resolution is a property of the v4 from-source route rather than of
@@ -4545,6 +4568,7 @@ export function nodesInstallCommandArgs(args: {
       norm.note,
       rerouted && norm.repository ? gitInstallSubstitutionNote(effectiveChannel, norm.repository) : undefined,
       ambiguity ? ambiguousBareNameWarning(ambiguity) : undefined,
+      registryAmbiguity ? registryVersionWarning(registryAmbiguity) : undefined,
       defaultedChannel ? gitInstallChannelNote(GIT_INSTALL_DEFAULT_CHANNEL) : undefined,
     ]
       .filter((s): s is string => typeof s === "string" && s.length > 0)
