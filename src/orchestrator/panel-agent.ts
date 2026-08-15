@@ -2727,18 +2727,20 @@ export class PanelAgentManager {
     return hold?.tabs.has(tabId) ? Math.max(0, Date.now() - hold.since) : 0;
   }
 
-  /** What a respawn would orphan right now. Never throws — see deferredRespawnOrphanNote. */
-  private atRiskNow(): { id: string; filename: string; bytes: number }[] {
+  /** What a respawn would orphan right now, or `null` for COULD NOT TELL. Never throws.
+   *
+   *  The two are different answers and the caller treats them differently — collapsing a
+   *  failed enumeration into `[]` is a real defect the gate caught here: an EIO on one poll
+   *  tick reads as "the downloads finished", releases a hold that was working, and kills the
+   *  48 GB transfer it had been protecting for an hour. */
+  private atRiskNow(): { id: string; filename: string; bytes: number }[] | null {
     try {
       return downloadsAtRiskOfRespawn();
     } catch (err) {
       logger.debug("[panel-orchestrator] could not enumerate downloads a respawn would orphan", {
         error: err instanceof Error ? err.message : String(err),
       });
-      // An enumeration that failed establishes NOTHING about what is in flight, so it must
-      // not read as "nothing is". It cannot hold either — a hold on an unknown is a respawn
-      // that may never fire — so the respawn proceeds, exactly as it did before this change.
-      return [];
+      return null;
     }
   }
 
@@ -2757,6 +2759,26 @@ export class PanelAgentManager {
   private holdRespawnForTransfers(tabId: string): boolean {
     const atRisk = this.atRiskNow();
     const now = Date.now();
+    if (atRisk === null) {
+      // COULD NOT TELL. This may not answer either question, so it answers neither: it does
+      // not start a hold (a hold on an unknown is a respawn that may never fire, and this is
+      // the pre-#1567 behaviour, which killed nothing that was not already being killed), and
+      // it does not END one — the case the gate found, where one EIO on a poll tick undoes an
+      // hour of correctly protecting a live transfer.
+      //
+      // A hold survives on the stall clock, which is exactly right while the state is
+      // unreadable: no progress can be OBSERVED, so `movedAt` does not advance, and repeated
+      // failure gives up after the same window a frozen transfer would. Unreadable state
+      // therefore delays the respawn by at most one stall window rather than indefinitely.
+      const held = this.respawnHold;
+      if (!held?.tabs.has(tabId)) return false;
+      if (now - held.movedAt < respawnHoldStallMs()) return true;
+      logger.info(
+        `[panel-orchestrator] tab ${tabId.slice(0, 8)} credential respawn giving up its hold — the ` +
+          `transfers it was waiting on could not be read for ${Math.round(respawnHoldStallMs() / 1000)}s (#1567)`,
+      );
+      return false;
+    }
     if (atRisk.length === 0) {
       // Drained. This is the good ending: the respawn fires having killed nothing.
       if (this.respawnHold?.tabs.has(tabId)) {

@@ -30,10 +30,20 @@ import { CLAUDE_CAPABILITIES } from "../../orchestrator/agent-backend.js";
 /** The transfers a respawn would orphan. Mocked at the MODULE boundary panel-agent imports
  *  across — `listDownloadJobs` is called from inside download-jobs.js, so mocking that would
  *  replace an export nobody reads. */
-const atRisk = vi.hoisted(() => ({ jobs: [] as { id: string; filename: string; bytes: number }[] }));
+const atRisk = vi.hoisted(() => ({
+  jobs: [] as { id: string; filename: string; bytes: number }[],
+  /** The enumeration reads job records and each progress file with sync IO, so it CAN throw. */
+  throws: false,
+}));
 vi.mock("../../services/download-jobs.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../services/download-jobs.js")>();
-  return { ...actual, downloadsAtRiskOfRespawn: () => atRisk.jobs };
+  return {
+    ...actual,
+    downloadsAtRiskOfRespawn: () => {
+      if (atRisk.throws) throw new Error("EIO: reading the download job store failed");
+      return atRisk.jobs;
+    },
+  };
 });
 
 let PanelAgentManager: typeof import("../../orchestrator/panel-agent.js").PanelAgentManager;
@@ -59,6 +69,7 @@ afterEach(() => {
   delete process.env.COMFYUI_MCP_RESPAWN_HOLD_POLL_MS;
   delete process.env.COMFYUI_MCP_RESPAWN_HOLD_STALL_MS;
   atRisk.jobs = [];
+  atRisk.throws = false;
 });
 
 class RecordingBackend implements AgentBackend {
@@ -336,6 +347,85 @@ describe("a queued credential respawn waits for in-flight transfers (#1567 item 
       spawns.filter((t) => t === "tab-busy"),
       "the busy tab's respawn must wait too",
     ).toHaveLength(1);
+  });
+
+  it("an unreadable job store does not END a hold that is working", async () => {
+    // Codex gate, P1. The enumeration does sync IO, so it can throw, and a failure was being
+    // converted into the same empty list as "everything finished" — so one EIO on one poll
+    // tick reads as the good ending, releases an hour of correctly protecting a live 48 GB
+    // transfer, and kills it. "I could not tell" may not answer a question it did not answer.
+    setWindows({ pollMs: 10, stallMs: 60_000 });
+    atRisk.jobs = [job(4_000_000_000)];
+    const backend = new RecordingBackend();
+    const spawns: string[] = [];
+    const manager = makeManager(backend, spawns);
+    const tab = "tab-unreadable";
+    await busyTab(manager, backend, tab);
+
+    manager.restartAllForMcpEnvAfterCredentialChange(tab);
+    backend.autoComplete = true;
+    backend.release();
+    await sleep(60); // established: held, and the transfer is real
+
+    atRisk.throws = true;
+    await sleep(200); // ~20 poll ticks, every one of them unable to read the store
+    expect(spawns.filter((t) => t === tab), "the hold must survive an unreadable store").toHaveLength(1);
+
+    // …and the store coming back with the transfer really finished still releases it.
+    atRisk.throws = false;
+    atRisk.jobs = [];
+    await waitFor(() => spawns.filter((t) => t === tab).length >= 2);
+  });
+
+  it("an unreadable job store does not START a hold either", async () => {
+    // The other direction of the same rule. A respawn held on a state nobody can read is a
+    // respawn that may never fire, so an unreadable store at the decision point leaves the
+    // pre-#1567 behaviour in place rather than inventing transfers to wait for.
+    setWindows({ pollMs: 10, stallMs: 60_000 });
+    atRisk.throws = true;
+    const backend = new RecordingBackend();
+    const spawns: string[] = [];
+    const manager = makeManager(backend, spawns);
+    const tab = "tab-unreadable-start";
+    await busyTab(manager, backend, tab);
+
+    manager.restartAllForMcpEnvAfterCredentialChange(tab);
+    backend.autoComplete = true;
+    backend.release();
+
+    await waitFor(() => spawns.filter((t) => t === tab).length >= 2);
+  });
+
+  it("a store that stays unreadable gives the hold up after one stall window", async () => {
+    // Bounded, for the same reason a frozen transfer is: an unreadable store cannot show
+    // progress, so `movedAt` never advances and the ordinary give-up applies. Without this
+    // the respawn is pinned for as long as the IO failure lasts.
+    //
+    // The transfer is kept MOVING right up to the failure, which is what isolates this path:
+    // with a frozen list the hold would end on the ordinary stall whether or not the
+    // unreadable case is bounded at all, and a first version of this test passed against a
+    // hold that could never be given up.
+    setWindows({ pollMs: 10, stallMs: 60 });
+    atRisk.jobs = [job(1_000_000)];
+    const backend = new RecordingBackend();
+    const spawns: string[] = [];
+    const manager = makeManager(backend, spawns);
+    const tab = "tab-unreadable-forever";
+    await busyTab(manager, backend, tab);
+
+    manager.restartAllForMcpEnvAfterCredentialChange(tab);
+    backend.autoComplete = true;
+    backend.release();
+
+    const ticker = setInterval(() => {
+      atRisk.jobs = [job((atRisk.jobs[0]?.bytes ?? 0) + 5_000_000)];
+    }, 10);
+    await sleep(140); // twice the stall window, still moving, still held
+    expect(spawns.filter((t) => t === tab), "a live transfer is held, not given up on").toHaveLength(1);
+
+    clearInterval(ticker);
+    atRisk.throws = true; // …and now the store itself goes unreadable, permanently
+    await waitFor(() => spawns.filter((t) => t === tab).length >= 2);
   });
 
   it("does not delay an unrelated restart after the credential respawn has resolved", async () => {
