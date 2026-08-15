@@ -4339,10 +4339,16 @@ export function normalizeGitUrlInstallArgs(
  * `get_data_by_mode(mode, 'custom-node-list.json', channel_url)`, keys that map by
  * the BARE REPO NAME (`repo_name = y.split('/')[-1]`), and on a hit clones
  * `the_node['repository']` — the CHANNEL's URL. The `repository` field we send is
- * never read on that path; it is stored in the task params and nothing more. On a
- * miss it returns the reported
+ * never read on that path; it is stored in the task params and nothing more.
+ *
+ * A MISS IS NOT AUTOMATICALLY THE REPORTED FAILURE (#1616 gate round 6). For a
+ * `nightly` spec, v4 first tries `self.cnr_map.get(node_id)` and clones that entry's
+ * `repository` — the COMFY REGISTRY's repo for an id equal to the bare name — and only
+ * when the registry lacks the id too does it return the reported
  * `Node '<name>@nightly' not found in [ManagerChannel.<ch>, ManagerDatabaseSource.<mode>]`,
- * naming the channel THIS argument chose.
+ * naming the channel THIS argument chose. So a channel that carries nothing under the
+ * name still resolves to SOMETHING, which is why `bareNameAmbiguity` treats a miss on a
+ * contested name as an ambiguity rather than an exemption.
  *
  * WHAT THIS DOES NOT CLAIM. Not that `default` always resolves — and gate round 2
  * corrected WHY. On a pip Manager v4 `manager_util.is_manager_pip_package()` is true,
