@@ -178,6 +178,14 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
     invalid.push([file, stamp, `in the future (today is ${today})`]);
     continue;
   }
+  // Symmetric with the removal check. A post stamped WITHOUT being added to STAMPED gets no
+  // protection: delete its stamp later and it silently reverts to a passing "unverified"
+  // entry, which is the escape hatch STAMPED exists to close. Registering is one line and is
+  // the same deliberate act as earning the stamp.
+  if (!STAMPED.has(file)) {
+    invalid.push([file, stamp, 'stamped but not listed in STAMPED — add it there so removing the stamp cannot silently downgrade this post']);
+    continue;
+  }
 
   const moved = [];
   for (const p of named) {

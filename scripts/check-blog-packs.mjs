@@ -144,9 +144,12 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
 
   const haystack = [...named].map((n) => packs.get(n)).join('\n');
   // Scripts must EXIST as files in a pack the post documents — the pack text is irrelevant.
+  // EXACT filenames, not lowercased. Case-folding meant `INSTALL-RUNPOD.SH` matched
+  // `install-runpod.sh` and passed — while the command as printed fails on any
+  // case-sensitive filesystem, which is where RunPod and CI run.
   const shipped = new Set();
   for (const n of named) {
-    for (const f of fs.readdirSync(path.join(PACKS, n))) shipped.add(f.toLowerCase());
+    for (const f of fs.readdirSync(path.join(PACKS, n))) shipped.add(f);
   }
 
   const seen = new Set();
@@ -157,7 +160,7 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
         if (seen.has(key)) continue;
         seen.add(key);
         checked++;
-        if (!shipped.has(raw.toLowerCase())) {
+        if (!shipped.has(raw)) {
           failures++;
           console.error(
             `  ✗ blog/${file}:${lineNo}: tells the reader to run "${raw}", but no pack it ` +

@@ -155,8 +155,15 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   // Against the NORMALIZED-but-unflattened source. `flat()` collapses every newline to a
   // space, so excluding the newline character inside these patterns was a no-op — a retired
   // claim could still match across a paragraph break. Line structure is signal here, not noise.
+  // Strip NEGATED forms before testing. "The panel no longer auto-starts a background agent"
+  // is the CORRECTION, not the retired claim, and flagging it would push an author to delete
+  // the sentence that documents the change. Only affirmative statements are banned.
+  const prose = unwrap(src).replace(
+    /\b(?:no longer|does not|doesn['’]t|cannot|can['’]t|never|isn['’]t able to|used to)\s+[^.;\n]{0,60}/gi,
+    ' ',
+  );
   for (const { pattern, why } of RETIRED) {
-    if (pattern.test(unwrap(src))) {
+    if (pattern.test(prose)) {
       failures++;
       console.error(`  ✗ blog/${file}: retired claim "${pattern.source}" — ${why}`);
     }

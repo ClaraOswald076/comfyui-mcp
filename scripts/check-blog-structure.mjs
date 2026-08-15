@@ -99,7 +99,13 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   // gate exists to prevent — the posts that got licensing wrong were wrong in prose, not in
   // their table of contents.
   const after = body.slice(m.index + m[0].length);
-  const sectionText = after.split(/^##\s+/m)[0].trim();
+  // HTML comments are not content — they render as nothing. A long
+  // `<!-- TODO: add licensing details -->` would otherwise satisfy the length check while the
+  // reader sees an empty section, which is the exact state this rule exists to catch.
+  const sectionText = after
+    .split(/^##\s+/m)[0]
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .trim();
   // 30, not 80. The point is to catch an EMPTY section, and 80 rejected concise correct prose
   // — "MIT License. Commercial use is permitted without restriction." says everything required
   // in 61 characters. Length cannot establish semantics either way, so it is set where it
