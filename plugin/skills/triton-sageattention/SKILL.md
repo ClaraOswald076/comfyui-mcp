@@ -1,6 +1,6 @@
 ---
 name: triton-sageattention
-description: Install Triton + SageAttention to accelerate ComfyUI (the sageattn attention_mode and inductor torch.compile used by WanVideoWrapper / many video graphs) — Windows-first (triton-windows + woct0rdho prebuilt SageAttention wheels matched to torch/CUDA/python into the RIGHT python), plus Linux (official triton + build) and Mac (N/A → sdpa/MPS). Critically also covers the SAFE sdpa / no-compile fallback so an example that assumes sageattn + torch.compile still runs when these aren't installed (video-extend TRAP 5). Use when a loader crashes with "No module named 'sageattention'" / "triton: unavailable", when asked to speed up Wan/video workflows, or when deciding whether to install acceleration vs. fall back.
+description: Install Triton + SageAttention to accelerate ComfyUI (the sageattn attention_mode and inductor torch.compile used by WanVideoWrapper / many video graphs) — Windows-first (triton-windows + woct0rdho prebuilt SageAttention wheels matched to torch/CUDA/python into the RIGHT python), plus Linux (official triton + build) and Mac (N/A → sdpa/MPS). Critically also covers the SAFE sdpa / no-compile fallback so an example that assumes sageattn + torch.compile still runs when these aren't installed (video-extend TRAP 5). Use when a loader crashes with "No module named 'sageattention'" or reports triton unavailable, when asked to speed up Wan/video workflows, or when deciding whether to install acceleration vs. fall back.
 globs:
   - "**/*.json"
   - "**/packs/**"
