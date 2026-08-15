@@ -9352,7 +9352,23 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // signal rather than an inference.
           const reply = parseToolResultJson(loaded);
           const remintedInstance = reply?.loaded === true && reply?.format === "api";
-          return remintedInstance ? appendNote(loaded, noteStaleFenceAfterLoad()) : loaded;
+          if (!remintedInstance) return loaded;
+          // #1478 — ADOPT the instance this load just proved, rather than warning about it.
+          //
+          // The note below is the right answer only while we cannot know the new uuid. Panel
+          // 0.14.39+ publishes `workflow_uuid` on this very reply
+          // (comfyui-mcp-panel#1225), which is the same race-proof shape
+          // `refreshFenceFromOwnReply` already trusts for workflow_save / workflow_save_as /
+          // workflow_new (#1161): read from the command's OWN reply, never re-derived from
+          // whatever is active now — a re-derivation rejected as a P1 here more than once,
+          // because the active workflow can move during the await.
+          //
+          // It validates before adopting (canonical uuid or nothing), so a malformed or
+          // absent field leaves the fence alone and falls through to the warning. That
+          // matters: anyone on a panel below 0.14.39 still has the original bug, and
+          // withdrawing the note for them would make it silent.
+          const refreshed = refreshFenceFromOwnReply(ctx, loaded);
+          return refreshed ? loaded : appendNote(loaded, noteStaleFenceAfterLoad());
         } catch (err) {
           return fail(err);
         }
