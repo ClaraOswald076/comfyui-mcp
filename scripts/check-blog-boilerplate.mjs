@@ -140,7 +140,7 @@ const RETIRED = [
     // stoplist below is what actually separates the two meanings, because in the CORRECT
     // sentences a verb like "launch" or a conjunction always intervenes.
     pattern:
-      /panel\s+(?:starts|spawns|launches|boots)\s+(?:(?!(?:until|unless|before|after|when|then|so|because|and|but|if|once|launch|run|start|connect|yourself)\b)[A-Za-z][A-Za-z’'-]*\s+){0,3}orchestrator/i,
+      /panel\s+(?:starts|spawns|launches|boots)\s+(?:(?!(?:until|unless|before|after|when|then|so|because|and|but|if|once|launch|run|start|connect|yourself|without|no|nothing|neither|instead)\b)[A-Za-z][A-Za-z’'-]*\s+){0,3}orchestrator/i,
     why: 'the panel is a pure frontend extension and cannot spawn a process; the user runs `connect`',
   },
   {
