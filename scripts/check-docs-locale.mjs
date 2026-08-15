@@ -209,7 +209,13 @@ for (const loc of locales) {
         );
         continue;
       }
-      const target = rawTarget.replace(/^\/docs\//, '').replace(/^\//, '').replace(/\/$/, '');
+      // `/docs` (no trailing slash) is the docs ROOT, not a page called "docs". Stripping only
+      // `/docs/` left the bare form as the slug "docs", which resolves to no file and was
+      // reported as a broken link — a correct docs-home link failing the gate.
+      const target = rawTarget
+        .replace(/^\/docs(\/|$)/, '')
+        .replace(/^\//, '')
+        .replace(/\/$/, '');
       if (!target) continue;
       const isLocal = target.startsWith(`${loc}/`);
       const bare = isLocal ? target.slice(loc.length + 1) : target;

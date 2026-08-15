@@ -87,7 +87,7 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   checked++;
   // Strip fenced code first: a `## Licensing` line inside an example block is not a section,
   // and matching raw text would let a post satisfy this rule with a code sample.
-  const body = src.replace(/\r\n/g, '\n').replace(/^\s*(```+|~~~+)[\s\S]*?^\s*\1\s*$/gm, '');
+  const body = stripFences(src);
   const m = body.match(/^##\s+Licensing\s*$/m);
   if (!m) {
     failures++;
@@ -100,7 +100,11 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   // their table of contents.
   const after = body.slice(m.index + m[0].length);
   const sectionText = after.split(/^##\s+/m)[0].trim();
-  if (sectionText.length < 80) {
+  // 30, not 80. The point is to catch an EMPTY section, and 80 rejected concise correct prose
+  // — "MIT License. Commercial use is permitted without restriction." says everything required
+  // in 61 characters. Length cannot establish semantics either way, so it is set where it
+  // separates "nothing" from "something" and no higher.
+  if (sectionText.length < 30) {
     failures++;
     console.error(
       `  ✗ blog/${file}: "## Licensing" is empty or near-empty (${sectionText.length} chars) — ` +

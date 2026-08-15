@@ -81,22 +81,27 @@ function loadPacks() {
 function claimLines(src) {
   const lines = src.replace(/\r\n/g, '\n').split('\n');
   const out = [];
-  let inFence = false;
-  let fenceMark = '';
+  // Markdown fence rules, not "any same-character marker". A fence closes only on a line of
+  // the SAME character, at least as long as the opener, with nothing after it but whitespace.
+  // The looser version let a ```bash opener inside a ```` block close it early, which ends
+  // scanning and hides every filename claim after that point.
+  let fence = null; // { char, len }
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    const fence = line.match(/^\s*(```+|~~~+)/);
+    const m = line.match(/^\s*(`{3,}|~{3,})(.*)$/);
     if (fence) {
-      if (!inFence) {
-        inFence = true;
-        fenceMark = fence[1][0];
-      } else if (fence[1][0] === fenceMark) {
-        inFence = false;
+      if (m && m[1][0] === fence.char && m[1].length >= fence.len && m[2].trim() === '') {
+        fence = null;
+        continue;
       }
+      out.push([i + 1, line, 'fence']);
       continue;
     }
-    if (inFence) out.push([i + 1, line, 'fence']);
-    else if (/^\s*\|.*\|/.test(line) && !/^\s*\|[\s|:-]*\|?\s*$/.test(line))
+    if (m) {
+      fence = { char: m[1][0], len: m[1].length };
+      continue;
+    }
+    if (/^\s*\|.*\|/.test(line) && !/^\s*\|[\s|:-]*\|?\s*$/.test(line))
       out.push([i + 1, line, 'table']);
   }
   return out;

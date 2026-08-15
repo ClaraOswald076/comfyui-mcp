@@ -129,7 +129,12 @@ const RETIRED = [
     // positive whose only fix is deleting accurate manual-launch guidance, which is the worst
     // way for a docs gate to be wrong. Bar `;`, `,`, `—` and newlines too: the false claim is
     // one clause ("the panel starts the orchestrator"), never a sentence spanning punctuation.
-    pattern: /panel\s+(?:starts|spawns|launches|boots)\b[^.;,\n—]{0,40}orchestrator/i,
+    // The object must be the orchestrator, not merely near it. A `[^.;,]{0,40}` allowance
+    // still matched "The panel starts disconnected until you launch the orchestrator" —
+    // correct guidance saying the OPPOSITE of the retired claim. Only determiners, possessives
+    // and adjectives may sit between the verb and the noun.
+    pattern:
+      /panel\s+(?:starts|spawns|launches|boots)\s+(?:up\s+)?(?:the|its|a|that)?\s*(?:\w+['’]s\s+|background\s+|provider['’]?s?\s+)*orchestrator/i,
     why: 'the panel is a pure frontend extension and cannot spawn a process; the user runs `connect`',
   },
   {
