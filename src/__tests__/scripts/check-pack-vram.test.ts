@@ -27,10 +27,29 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
-/** Write one pack fixture. `unets` are manifest local_paths. */
+/** A manifest model entry. A bare string is the common `local_path` shape, with the
+ *  url defaulted to match it. The object form expresses the OTHER shapes
+ *  `manifestSchema` accepts (src/services/manifest.ts:110) — `url` is the only
+ *  required field, so `model_type`/`filename` and url-only entries are legal too. */
+type Entry = string | { url?: string; local_path?: string; model_type?: string; filename?: string };
+
+function entryYaml(e: Entry): string {
+  if (typeof e === "string") {
+    return `  - url: https://example.invalid/${e.split("/").pop()}\n    local_path: ${e}\n`;
+  }
+  const url = e.url ?? `https://example.invalid/${(e.local_path ?? e.filename ?? "m.safetensors").split("/").pop()}`;
+  return (
+    `  - url: ${url}\n` +
+    (e.local_path ? `    local_path: ${e.local_path}\n` : "") +
+    (e.model_type ? `    model_type: ${e.model_type}\n` : "") +
+    (e.filename ? `    filename: ${e.filename}\n` : "")
+  );
+}
+
+/** Write one pack fixture. `unets` are manifest entries. */
 function pack(
   name: string,
-  opts: { vram?: string; description?: string; unets: string[]; extraModels?: string[] },
+  opts: { vram?: string; description?: string; unets: Entry[]; extraModels?: Entry[] },
 ) {
   const dir = join(root, name);
   mkdirSync(dir, { recursive: true });
@@ -39,9 +58,7 @@ function pack(
     (opts.description === undefined ? "" : `description: ${JSON.stringify(opts.description)}\n`) +
     (opts.vram === undefined ? "" : `vram: ${JSON.stringify(opts.vram)}\n`);
   writeFileSync(join(dir, "pack.yaml"), yaml, "utf8");
-  const models = [...opts.unets, ...(opts.extraModels ?? [])]
-    .map((p) => `  - url: https://example.invalid/${p.split("/").pop()}\n    local_path: ${p}\n`)
-    .join("");
+  const models = [...opts.unets, ...(opts.extraModels ?? [])].map(entryYaml).join("");
   writeFileSync(join(dir, "manifest.yaml"), `models:\n${models}`, "utf8");
 }
 
@@ -108,6 +125,81 @@ describe("#1585 what the gate FLAGS", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// The gate's own FALSE-NEGATIVE direction. A pre-merge review ran `checkPack`
+// against the two cases below and both returned an EMPTY finding list: the first
+// version inspected only a precision-tagged `local_path`, so a Q8 headline backed
+// by an fp16 URL passed, and a manifest written in the `model_type`/`filename`
+// shape was never examined at all.
+//
+// This is the SECOND false negative in this script (the `\b` boundary was the
+// first). Both were invisible in its own output. These tests exist so the gate is
+// pinned at every place the precision can actually appear, not just the one place
+// the shipped packs happen to put it today.
+// ---------------------------------------------------------------------------
+describe("#1585 the gate reads the precision wherever it appears", () => {
+  it("a local_path RENAMED to drop the precision, contradicted by the url it fetches", () => {
+    // `WanModel.safetensors` says nothing; the URL it is fetched from says fp8.
+    // This is not hypothetical — `packs/wan-animate-ofm` ships exactly this shape.
+    pack("renamed", {
+      vram: "24GB+ (Q8_0)",
+      unets: [
+        {
+          url: "https://example.invalid/model_fp16.safetensors",
+          local_path: "diffusion_models/model.safetensors",
+        },
+      ],
+    });
+    const r = run();
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/renamed — vram: says "Q8_0", manifest fetches fp16/);
+  });
+
+  it("the model_type/filename manifest shape, which has no local_path at all", () => {
+    // `manifestSchema` requires only `url`; local_path is optional and the target
+    // is `model_type`/`filename` when it is absent. A gate keyed on local_path
+    // does not examine such an entry at all.
+    pack("schemaform", {
+      vram: "24GB+ (Q8_0)",
+      unets: [
+        {
+          url: "https://example.invalid/model_fp16.safetensors",
+          model_type: "diffusion_models",
+          filename: "model_fp16.safetensors",
+        },
+      ],
+    });
+    const r = run();
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/schemaform — vram: says "Q8_0", manifest fetches fp16/);
+  });
+
+  it("a url-only entry, whose target defaults to checkpoints/<url basename>", () => {
+    // The most minimal legal entry: neither local_path nor filename nor model_type.
+    pack("urlonly", {
+      vram: "24GB+ (Q8_0)",
+      unets: [{ url: "https://example.invalid/some_model_fp16.safetensors" }],
+    });
+    const r = run();
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/urlonly — vram: says "Q8_0", manifest fetches fp16/);
+  });
+
+  it("a stated tier the manifest cannot corroborate anywhere is a FAILURE, not a pass", () => {
+    // The hole both false negatives went through: "no precision found" was treated
+    // as "consistent". It is not — it is UNVERIFIABLE, and silently passing it is
+    // what let a renamed local_path through. Fail, so the headline is either
+    // dropped or made checkable.
+    pack("unverifiable", {
+      vram: "16GB+ (Q8_0)",
+      unets: [{ url: "https://example.invalid/ltx-2.3-22b-dev.safetensors", local_path: "unet/ltx-2.3-22b-dev.safetensors" }],
+    });
+    const r = run();
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/unverifiable — vram: states "Q8_0", which nothing in the manifest corroborates/);
+  });
+});
+
 describe("#1585 what the gate must stay QUIET about", () => {
   it("a vram string naming no precision at all — most packs", () => {
     pack("plain", { vram: "12GB+", unets: ["unet/thing-Q8_0.gguf"] });
@@ -130,10 +222,28 @@ describe("#1585 what the gate must stay QUIET about", () => {
     expect(run().code).toBe(0);
   });
 
-  it("a UNet filename that names no precision — nothing to compare, so no verdict", () => {
-    // Inventing a verdict from an unanswerable comparison is the defect class this
-    // repo keeps fixing; the gate must answer "nothing known", not "contradiction".
-    pack("noprec", { vram: "16GB+ (Q8_0)", unets: ["unet/ltx-2.3-22b-dev.safetensors"] });
+  it("a UNet naming no precision, under a headline that claims none either", () => {
+    // Neither side states a precision, so there is nothing to contradict. Six
+    // shipped packs are this shape (the four `anima-*` and both `ltx-2.3-*`), and
+    // firing on them would switch the gate off.
+    //
+    // Note the narrow scope: this stays quiet because the PACK claims nothing. If
+    // it claimed a tier, the same manifest would FAIL as unverifiable — see
+    // "a stated tier the manifest cannot corroborate anywhere".
+    pack("noprec", { vram: "16GB+", unets: ["unet/ltx-2.3-22b-dev.safetensors"] });
+    expect(run().code).toBe(0);
+  });
+
+  it("a pack that fetches no diffusion model at all — its tier is not about a weight here", () => {
+    // An upscaler/LoRA-only pack may legitimately state a tier for a base model it
+    // does not download. No shipped pack is in this state today (all 56 fetch at
+    // least one diffusion model), but failing here would be a false positive on a
+    // legal shape, so the gate declines to judge.
+    pack("nounet", {
+      vram: "24GB+ (fp16)",
+      unets: [],
+      extraModels: ["loras/detail-tweaker.safetensors", "vae/ae.safetensors"],
+    });
     expect(run().code).toBe(0);
   });
 
