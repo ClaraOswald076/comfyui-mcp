@@ -745,6 +745,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.55] - 2026-08-15
+
+### MCP
+
+#### Fixed
+- let the SERVER answer whether a model is installed (#1587)
+- panel_strip_workflow hands back a graph a script can parse (#1589)
+
 ## [0.51.54] - 2026-08-15
 
 ### MCP
