@@ -41,11 +41,31 @@
  *  * CNR re-keying. When a channel entry's repo is registered in the Comfy Registry,
  *    `get_custom_nodes` keys it by the CNR id instead of the bare name. Of the 249 channel
  *    entries behind these 111 names, 32 are re-keyed to an id that is not the bare name —
- *    for those, the real lookup MISSES and Manager answers "not found". The guard cannot
- *    know a host's CNR state, so it refuses there too. That trade only ever converts a
- *    not-found into a clearer refusal: it can never block a resolution that would have
- *    returned the caller's own URL, because a channel that lists exactly the caller's repo
- *    under that name is allowed through below.
+ *    for those the channel lookup MISSES, which is NOT the same as Manager giving up (see
+ *    the CNR fallback below). The guard cannot know a host's CNR state, so it refuses
+ *    there too. That trade can never block a resolution that would have returned the
+ *    caller's own URL, because a channel that lists exactly the caller's repo under that
+ *    name is allowed through below.
+ *
+ * GATE ROUND 6 — A CHANNEL MISS IS NOT A DEAD END, AND TREATING IT AS ONE WAS A HOLE.
+ * This module's first shape returned "no ambiguity" whenever the asked channel carried
+ * nothing under the name, on the reasoning that Manager then answers "not found" and no
+ * substitution can occur. That reasoning is wrong, and 4.2.2's own source says so —
+ * `install_by_id`, on the `nightly` branch, when the channel lookup misses:
+ *
+ *   cnr_fallback = self.cnr_map.get(node_id)          # NormalizedKeyDict, lowercased
+ *   if cnr_fallback is not None and cnr_fallback.get('repository'):
+ *       repo_url = cnr_fallback['repository']         # <- CLONES THE REGISTRY'S REPO
+ *   else:
+ *       return result.fail(f"Node '{node_id}@{version_spec}' not found in ...")
+ *
+ * So a miss falls back to the COMFY REGISTRY entry whose id is the bare name, and clones
+ * whatever repository that id is registered to — the caller's `repository` is not read
+ * there either. "Not found" is only what happens when the registry ALSO lacks the id.
+ * Measured against this snapshot: 18 of the 111 contested names are absent from `default`,
+ * so on the channel this code defaults to they reached that fallback with nothing checked.
+ * A miss on a contested name is therefore an ambiguity in its own right — resolved by
+ * registry id rather than by the channel — and is refused with that named as the reason.
  *  * A pip-installed Manager. `get_data_by_mode` reads the cache file for the configured
  *    channel URL, else the snapshot BUNDLED in the package — a stale, default-flavoured
  *    list — so on that host the list consulted is not the one measured here. The bundled
@@ -168,28 +188,54 @@ export interface BareNameAmbiguity {
   callerRepo?: string;
   /** The channel about to be asked. */
   channel: string;
-  /** What that channel's list carries under the name — >1 means it is ambiguous alone. */
+  /**
+   * What that channel's list carries under the name — >1 means it is ambiguous alone.
+   * EMPTY means the channel carries nothing under it, which is not a dead end: see
+   * `resolvedVia`.
+   */
   channelCandidates: readonly string[];
   /** Channels whose list resolves the name to exactly the caller's repo, if any. */
   channelsResolvingToCaller: readonly string[];
+  /**
+   * WHAT WILL ACTUALLY DECIDE THE CLONE (gate round 6).
+   *  * `"channel"` — the asked channel carries the name, so `channelCandidates` is what
+   *    v4 may clone.
+   *  * `"cnr-fallback"` — it carries nothing under it, so v4's `nightly` path falls back
+   *    to `cnr_map[bare]` and clones the repository registered under that COMFY REGISTRY
+   *    id. Nothing here can see which repo that is, so every candidate is named instead.
+   */
+  resolvedVia: "channel" | "cnr-fallback";
+  /** Every repository the snapshot has seen under the name, across all six channels. */
+  allCandidates: readonly string[];
 }
+
+/** The channels `normalize_channel` accepts — anything else never reaches a list. */
+const KNOWN_CHANNELS: ReadonlySet<string> = new Set(MANAGER_CHANNEL_NAMES);
 
 /**
  * Would asking `channel` for this URL's bare name resolve to a repository other than the
- * one the caller named? Returns the two (or more) candidates when so, `undefined` when the
- * name is not known to collide, when the channel does not list it, or when the channel
- * lists exactly the caller's repo and nothing else under it.
+ * one the caller named? Returns the candidates when so, `undefined` when the name is not
+ * known to collide, when the channel is not one Manager accepts, or when the channel lists
+ * exactly the caller's repo and nothing else under it.
  *
- * Absence is NOT proof of uniqueness — an unlisted name is one this snapshot has not seen
- * collide, which is precisely today's behaviour for it.
+ * A channel that does NOT list the name is an ambiguity rather than an exemption — v4's
+ * `nightly` path falls back to the Comfy Registry id (gate round 6, quoted in the header),
+ * so the caller's `repository` goes unread there just the same.
+ *
+ * Absence FROM THE SNAPSHOT is NOT proof of uniqueness — an unlisted name is one this
+ * snapshot has not seen collide, which is precisely today's behaviour for it.
  */
 export function bareNameAmbiguity(url: string, channel: string): BareNameAmbiguity | undefined {
   const bare = managerBareName(url);
   const entry = ownCandidates(AMBIGUOUS_BARE_NAMES, bare.trim().toLowerCase());
   if (!entry) return undefined;
-  const asked = channel.trim().toLowerCase() as ManagerChannelName;
-  const channelCandidates = ownCandidates(entry, asked);
-  if (!channelCandidates || channelCandidates.length === 0) return undefined;
+  const asked = channel.trim().toLowerCase();
+  // A channel name Manager does not accept is not reasoned about at all: `normalize_channel`
+  // raises InvalidChannel and no list is ever consulted, so there is no substitution to
+  // warn about and no CNR fallback to reach. This is also what keeps an INHERITED key
+  // (`__proto__`, `constructor`) from being read as a miss and refused on that basis.
+  if (!KNOWN_CHANNELS.has(asked)) return undefined;
+  const channelCandidates = ownCandidates(entry, asked as ManagerChannelName) ?? [];
   const callerRepo = comparableToSnapshot(url) ? ownerRepoOf(url) : undefined;
   if (channelCandidates.length === 1 && callerRepo && sameRepo(channelCandidates[0], callerRepo)) {
     return undefined;
@@ -200,7 +246,19 @@ export function bareNameAmbiguity(url: string, channel: string): BareNameAmbigui
         return cands?.length === 1 && sameRepo(cands[0], callerRepo);
       })
     : [];
-  return { bare, callerUrl: url.trim(), callerRepo, channel, channelCandidates, channelsResolvingToCaller };
+  const allCandidates = [
+    ...new Set(MANAGER_CHANNEL_NAMES.flatMap((c) => ownCandidates(entry, c) ?? [])),
+  ];
+  return {
+    bare,
+    callerUrl: url.trim(),
+    callerRepo,
+    channel,
+    channelCandidates,
+    channelsResolvingToCaller,
+    resolvedVia: channelCandidates.length === 0 ? "cnr-fallback" : "channel",
+    allCandidates,
+  };
 }
 
 /**
@@ -316,9 +374,15 @@ export function ambiguousBareNameRefusal(a: BareNameAmbiguity): string {
   // no github owner to name, and inventing one would report a repository they never typed.
   const asked = a.callerRepo ? `https://github.com/${a.callerRepo}` : `"${a.callerUrl}"`;
   const within =
-    a.channelCandidates.length > 1
-      ? `the "${a.channel}" channel's list carries that name TWICE — under ${listRepos(a.channelCandidates)} — and which one v4 returns depends on the order of that list`
-      : `the "${a.channel}" channel's list carries that name under ${listRepos(a.channelCandidates)}`;
+    a.resolvedVia === "cnr-fallback"
+      ? `the "${a.channel}" channel's list does not carry that name at all — which is NOT ` +
+        `the end of it: on a "nightly" spec v4 then falls back to the Comfy Registry map ` +
+        `and clones whatever repository is registered under the id "${a.bare}" ` +
+        `(install_by_id → cnr_map), and that name is one of the ones measured to be ` +
+        `claimed by more than one repository (${listRepos(a.allCandidates)})`
+      : a.channelCandidates.length > 1
+        ? `the "${a.channel}" channel's list carries that name TWICE — under ${listRepos(a.channelCandidates)} — and which one v4 returns depends on the order of that list`
+        : `the "${a.channel}" channel's list carries that name under ${listRepos(a.channelCandidates)}`;
   const escape = a.channelsResolvingToCaller.length
     ? `The repository you named is what ${a.channelsResolvingToCaller
         .map((c) => `channel:"${c}"`)
@@ -348,11 +412,18 @@ export function ambiguousBareNameRefusal(a: BareNameAmbiguity): string {
       `lands on whichever entry that channel's list order happens to keep. The one reason ` +
       `to take it is a ComfyUI running Manager 3.x, where the from-source request carries ` +
       `the URL in \`files\` and IS cloned as passed`;
+  // The opener must not assert the mechanism the NEXT clause rules out: on a miss there is
+  // no channel entry and nothing is cloned "from there".
+  const opener =
+    a.resolvedVia === "cnr-fallback"
+      ? `ComfyUI-Manager v4 resolves a from-source install by the BARE REPO NAME ` +
+        `("${a.bare}"), ignoring the \`repository\` field entirely.`
+      : `ComfyUI-Manager v4 resolves a from-source install by the BARE REPO NAME ` +
+        `("${a.bare}") against ONE channel's list and clones the URL recorded there, ` +
+        `ignoring the \`repository\` field entirely.`;
   return (
     `REFUSED before dispatch — this install would not necessarily have installed the ` +
-    `repository you named. ComfyUI-Manager v4 resolves a from-source install by the BARE ` +
-    `REPO NAME ("${a.bare}") against ONE channel's list and clones the URL recorded there, ` +
-    `ignoring the \`repository\` field entirely. You asked for ${asked}, and ${within}. ` +
+    `repository you named. ${opener} You asked for ${asked}, and ${within}. ` +
     `So this would have cloned someone else's code and reported success. Not picked for ` +
     `you: ${escape} ` +
     `(This check ran because no \`channel\` was named, against a snapshot of the six ` +
@@ -381,22 +452,39 @@ export function ambiguousBareNameWarning(a: BareNameAmbiguity): string {
   // no github owner to name, and inventing one would report a repository they never typed.
   const asked = a.callerRepo ? `https://github.com/${a.callerRepo}` : `"${a.callerUrl}"`;
   const ambiguousAlone = a.channelCandidates.length > 1;
-  const carries = ambiguousAlone
-    ? `carries "${a.bare}" TWICE — under ${listRepos(a.channelCandidates)} — and v4 keeps whichever comes last in that list`
-    : `resolves "${a.bare}" to ${listRepos(a.channelCandidates)}`;
-  const why = ambiguousAlone
-    ? `Naming that channel did NOT disambiguate this one — both entries are in the list ` +
-      `you named, so no \`channel\` argument can separate them and on v4 the winner is ` +
-      `that list's order. Dispatched because you named a channel, and because on Manager ` +
-      `3.x the URL you passed IS what gets cloned; if this is v4 and you need the ` +
-      `repository you typed, install_custom_node (source:"git") clones it directly ` +
-      `instead of resolving a name`
-    : `Dispatched anyway because you chose the channel`;
+  const carries =
+    a.resolvedVia === "cnr-fallback"
+      ? `does not carry "${a.bare}" at all — so v4 falls back to the Comfy Registry id of ` +
+        `that name and clones whatever repository it is registered to, which the snapshot ` +
+        `has seen claimed by ${listRepos(a.allCandidates)}`
+      : ambiguousAlone
+        ? `carries "${a.bare}" TWICE — under ${listRepos(a.channelCandidates)} — and v4 keeps whichever comes last in that list`
+        : `resolves "${a.bare}" to ${listRepos(a.channelCandidates)}`;
+  const why =
+    a.resolvedVia === "cnr-fallback"
+      ? `Naming that channel did NOT aim this one either — it lists nothing under that ` +
+        `name, so v4 never reads your channel at all and resolves the registry id ` +
+        `instead; any other channel that also misses lands in exactly the same place. ` +
+        `Dispatched because you named a channel, and because on Manager 3.x the URL you ` +
+        `passed IS what gets cloned; if this is v4 and you need the repository you typed, ` +
+        `install_custom_node (source:"git") clones it directly instead of resolving a name`
+      : ambiguousAlone
+        ? `Naming that channel did NOT disambiguate this one — both entries are in the list ` +
+          `you named, so no \`channel\` argument can separate them and on v4 the winner is ` +
+          `that list's order. Dispatched because you named a channel, and because on Manager ` +
+          `3.x the URL you passed IS what gets cloned; if this is v4 and you need the ` +
+          `repository you typed, install_custom_node (source:"git") clones it directly ` +
+          `instead of resolving a name`
+        : `Dispatched anyway because you chose the channel`;
+  const resolves =
+    a.resolvedVia === "cnr-fallback"
+      ? `v4 resolves this install by the bare name, and with no channel entry to use it ` +
+        `takes the registry's repository for that id`
+      : `v4 resolves this install by the bare name and clones the URL from ITS list`;
   return (
     `NAMED-CHANNEL COLLISION: you asked for ${asked}, but the "${a.channel}" channel you ` +
-    `named ${carries}. v4 resolves this install by the bare name and clones the URL from ` +
-    `ITS list, so what lands is very likely not what you passed. ${why} — verify with ` +
-    `panel_list_nodes before you restart or report success. (Snapshot measured ` +
-    `${AMBIGUOUS_BARE_NAMES_MEASURED}.)`
+    `named ${carries}. ${resolves}, so what lands is very likely not what you passed. ` +
+    `${why} — verify with panel_list_nodes before you restart or report success. ` +
+    `(Snapshot measured ${AMBIGUOUS_BARE_NAMES_MEASURED}.)`
   );
 }

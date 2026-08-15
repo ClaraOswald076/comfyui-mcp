@@ -525,11 +525,62 @@ describe("the snapshot and its predicate (#1616)", () => {
     expect(ownerRepoOf("Own-er/Repo")).toBe("Own-er/Repo");
   });
 
-  it("says nothing about a channel that does not list the name at all", () => {
-    // `comfyui-birefnet` is on default/dev/legacy. `forked` does not carry it, so asking
-    // `forked` resolves nothing and there is no substitution to refuse.
-    expect(bareNameAmbiguity(DEV_AUTHORS, "forked")).toBeUndefined();
-    expect(bareNameAmbiguity(DEV_AUTHORS, "legacy")).toBeTruthy();
+  it("treats a channel MISS as the CNR fallback it is, not as a dead end", () => {
+    // GATE ROUND 6. This assertion used to read `toBeUndefined()`, on the reasoning that
+    // a channel which does not carry the name "resolves nothing, so there is no
+    // substitution to refuse". ComfyUI-Manager 4.2.2 says otherwise — `install_by_id`, on
+    // the `nightly` branch, when `custom_nodes.get(node_id)` misses:
+    //
+    //   cnr_fallback = self.cnr_map.get(node_id)        # NormalizedKeyDict -> lowercased
+    //   if cnr_fallback is not None and cnr_fallback.get('repository'):
+    //       repo_url = cnr_fallback['repository']       # clones the REGISTRY's repo
+    //   else:
+    //       return result.fail(f"Node '{node_id}@{version_spec}' not found in ...")
+    //
+    // So a miss resolves the bare name as a Comfy Registry id and clones whatever that id
+    // is registered to; "not found" is only what happens when the registry ALSO lacks it.
+    // `comfyui-birefnet` is on default/dev/legacy and NOT on `forked`, so asking `forked`
+    // reaches that fallback with the caller's `repository` unread.
+    const amb = bareNameAmbiguity(DEV_AUTHORS, "forked");
+    expect(amb).toBeTruthy();
+    expect(amb?.resolvedVia).toBe("cnr-fallback");
+    expect(amb?.channelCandidates).toEqual([]);
+    // It can still name every repository the id is contested by.
+    expect(amb?.allCandidates).toEqual(
+      expect.arrayContaining([
+        "hieuck/ComfyUI-BiRefNet",
+        "MohammadAboulEla/ComfyUI-BiRefNet",
+        "viperyl/ComfyUI-BiRefNet",
+      ]),
+    );
+    // A channel that DOES carry it is still the channel-resolved case.
+    expect(bareNameAmbiguity(DEV_AUTHORS, "legacy")?.resolvedVia).toBe("channel");
+  });
+
+  it("REFUSES the defaulted call whose contested name `default` does not carry", () => {
+    // The hole this closes is on the PRIMARY path, not just an explicit odd channel: 18 of
+    // the 111 contested names are absent from `default`, so before this they dispatched
+    // with nothing checked and Manager resolved them by registry id.
+    const absent = Object.entries(AMBIGUOUS_BARE_NAMES).filter(
+      ([, per]) => !(per as Record<string, string[]>).default?.length,
+    );
+    expect(absent.length).toBeGreaterThan(0);
+    const [name, per] = absent[0];
+    const someRepo = Object.values(per as Record<string, string[]>).flat()[0];
+    const res = nodesInstallCommandArgs({ repository: `https://github.com/${someRepo}` });
+    expect(res.conflict, `${name} must not dispatch unchecked`).toBeTruthy();
+    expect(res.conflict).toContain("does not carry that name at all");
+    expect(res.conflict).toContain("cnr_map");
+  });
+
+  it("the CNR-fallback refusal does not claim a channel list carries anything", () => {
+    // The channel-hit refusal says "the channel's list carries that name under X". Saying
+    // that when the list carries NOTHING would be a fabricated mechanism, and this file's
+    // whole contract is that the stated reason is the real one.
+    const amb = bareNameAmbiguity(DEV_AUTHORS, "forked");
+    const text = ambiguousBareNameRefusal(amb!);
+    expect(text).toContain("does not carry that name at all");
+    expect(text).not.toContain("channel's list carries that name under");
   });
 
   it("tolerates a channel name it has never heard of rather than throwing", () => {
