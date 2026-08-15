@@ -223,3 +223,35 @@ describe("the event does not contradict its own caveat (#1574)", () => {
     expect(src.slice(at, at + 200)).toMatch(/see the caveat above/);
   });
 });
+
+describe("an exact (id, target) record wins over a targetless one (#1574)", () => {
+  it("does not let a targetless DOWNLOADING shadow the exact DONE", () => {
+    // Review, round 3. Scanning in array order and accepting the first id match reported a
+    // disagreement that does not exist — hedging a completion that was perfectly fine.
+    expect(
+      completionDisagreesWithRecord(row({ target: "/local/models" }), [
+        job({ target: undefined, status: "downloading" }),
+        job({ target: "/local/models", status: "done" }),
+      ]),
+    ).toBe(false);
+  });
+
+  it("…and finds the exact DOWNLOADING behind a targetless DONE", () => {
+    // The same ordering hazard in the direction that must still be reported.
+    expect(
+      completionDisagreesWithRecord(row({ target: "/local/models" }), [
+        job({ target: undefined, status: "done" }),
+        job({ target: "/local/models", status: "downloading" }),
+      ]),
+    ).toBe(true);
+  });
+
+  it("falls back to a targetless record only when nothing matches on target", () => {
+    expect(
+      completionDisagreesWithRecord(row({ target: "/local/models" }), [
+        job({ target: "/pod/models", status: "done" }),
+        job({ target: undefined, status: "downloading" }),
+      ]),
+    ).toBe(true);
+  });
+});

@@ -81,13 +81,20 @@ export function completionDisagreesWithRecord(row: RowLike, jobs: readonly JobLi
   // field, or a route that never sets it, must not silently stop matching — that would make
   // the check inert again, which is exactly how the first version shipped.
   const target = typeof row.target === "string" ? row.target : null;
-  const record = jobs.find((j) => {
-    if (!j || typeof j !== "object") return false;
-    if (progressIdentityOf(j) !== id) return false;
-    const jobTarget = typeof j.target === "string" ? j.target : null;
-    if (target && jobTarget && target !== jobTarget) return false;
-    return true;
-  });
+  const sameId = jobs.filter((j) => j && typeof j === "object" && progressIdentityOf(j) === id);
+  if (!sameId.length) return false;
+  // PREFER THE EXACT (id, target) MATCH (review, round 3). Taking the first id match in
+  // array order let a TARGETLESS record shadow the exact one: a targetless "downloading"
+  // sitting before an exact-target "done" reported a disagreement that does not exist, and
+  // would have hedged a completion that was perfectly fine.
+  //
+  // The targetless record still stands in when nothing matches on target — that is what
+  // keeps rows and records predating the field from silently going unmatched, which would
+  // make the whole check inert again.
+  const record =
+    (target ? sameId.find((j) => j.target === target) : undefined) ??
+    sameId.find((j) => typeof j.target !== "string") ??
+    (target ? undefined : sameId[0]);
   if (!record) return false;
   return record.status === "downloading";
 }
