@@ -11,7 +11,17 @@
 // So the snapshot is re-taken AT THE RESPAWN. These pin both halves: the note itself, and
 // that a genuinely deferred respawn actually reaches it — a helper nothing calls would
 // leave the defect exactly where it was.
-import { beforeAll, describe, expect, it, vi } from "vitest";
+//
+// ## What item 2 changed under this file, and why it still asserts the same things
+//
+// A queued credential respawn now WAITS for in-flight transfers instead of killing them
+// (respawn-holds-for-transfers.test.ts). So every test here that puts transfers in flight
+// now reaches this note by the OTHER route: the hold gives up on transfers that make no
+// progress, and a mocked list returning a constant byte count is, correctly, exactly that.
+// The assertions are unchanged and mean what they always did — when the rebuild does go
+// ahead over live-looking transfers, it names them — and the windows below are shortened
+// only so the stall is reached in test time rather than in two minutes.
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type {
   AgentBackend,
@@ -34,8 +44,17 @@ let PanelAgentManager: typeof import("../../orchestrator/panel-agent.js").PanelA
 let orphanedByDeferredRespawnNote: typeof import("../../services/panel-secrets.js").orphanedByDeferredRespawnNote;
 
 beforeAll(async () => {
+  // #1567 item 2 — reach the hold's give-up in test time. Read live by the manager, so
+  // setting them here covers every manager this file builds.
+  process.env.COMFYUI_MCP_RESPAWN_HOLD_POLL_MS = "10";
+  process.env.COMFYUI_MCP_RESPAWN_HOLD_STALL_MS = "40";
   ({ PanelAgentManager } = await import("../../orchestrator/panel-agent.js"));
   ({ orphanedByDeferredRespawnNote } = await import("../../services/panel-secrets.js"));
+});
+
+afterAll(() => {
+  delete process.env.COMFYUI_MCP_RESPAWN_HOLD_POLL_MS;
+  delete process.env.COMFYUI_MCP_RESPAWN_HOLD_STALL_MS;
 });
 
 class RecordingBackend implements AgentBackend {

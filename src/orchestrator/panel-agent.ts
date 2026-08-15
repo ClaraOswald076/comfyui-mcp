@@ -168,6 +168,24 @@ function toolBusyMaxMs(): number {
   return Number(process.env.COMFYUI_MCP_TOOL_BUSY_MAX_MS) || 900_000;
 }
 
+/** #1567 — how often a HELD credential respawn re-asks whether the transfers it is waiting
+ *  on have finished. Nothing else can wake it: `applyPendingRestarts` runs at turn-done, and
+ *  a user watching a long download is idle by definition. Read live (not a load-time const)
+ *  so it stays overridable per test, like `toolBusyMaxMs` above. */
+function respawnHoldPollMs(): number {
+  return Number(process.env.COMFYUI_MCP_RESPAWN_HOLD_POLL_MS) || 15_000;
+}
+
+/** #1567 — how long every at-risk transfer may make NO progress before a held respawn stops
+ *  waiting on them and fires anyway (with the orphan note). This is the ONLY thing that ends
+ *  a hold other than the transfers finishing: a wall-clock cap would kill a healthy 48 GB
+ *  download for being long, which is the loss the hold exists to prevent. Generous enough to
+ *  ride out a slow mirror's stall, short enough that a dead transfer cannot pin a respawn for
+ *  the rest of the session. Overridable via COMFYUI_MCP_RESPAWN_HOLD_STALL_MS. */
+function respawnHoldStallMs(): number {
+  return Number(process.env.COMFYUI_MCP_RESPAWN_HOLD_STALL_MS) || 120_000;
+}
+
 /** How long after an interrupt to wait for the aborted turn's `result` (which
  *  releases the turn gate at the correct moment) before force-releasing it as a
  *  fallback. Short enough to feel immediate if a result somehow never arrives;
@@ -2630,6 +2648,16 @@ export class PanelAgentManager {
    */
   restartAllForMcpEnvAfterCredentialChange(tabId: string | null): McpEnvRestartTally {
     this.credentialOrphanWatch = { tab: tabId, awaiting: new Set() };
+    // #1567 item 2 — mark EVERY tab this save is about to respawn, BEFORE the loop that
+    // respawns them, because an idle tab is replaced inside that call and would otherwise
+    // reach the hold check unmarked.
+    //
+    // This deliberately does NOT ride on `credentialOrphanWatch`. That watch answers "who
+    // gets TOLD, once" and is consumed by the first delivery; the hold has to answer "may
+    // THIS tab's child be torn down yet", per tab, for as long as the restart is owed. An
+    // early version keyed the hold off the watch and lost the second tab of a two-tab save
+    // the moment the first one was served — that tab then killed its own transfers.
+    for (const key of this.liveKeys()) this.credentialRespawnTabs.add(key);
     const tally = this.restartAllForMcpEnv();
     // An idle tab consumed it inside that call; otherwise bind it to exactly the tabs that
     // still owe a restart, and drop it when there are none.
@@ -2637,6 +2665,11 @@ export class PanelAgentManager {
       const awaiting = this.liveKeys().filter((k) => this.pendingMcpRestart.has(k));
       if (awaiting.length === 0) this.credentialOrphanWatch = null;
       else this.credentialOrphanWatch.awaiting = new Set(awaiting);
+    }
+    // Same trim for the marks: a tab that respawned (or had no agent) inside that call owes
+    // nothing more to this save, so it must not stay marked and hold a LATER restart.
+    for (const key of [...this.credentialRespawnTabs]) {
+      if (!this.pendingMcpRestart.has(key)) this.credentialRespawnTabs.delete(key);
     }
     return tally;
   }
@@ -2661,6 +2694,139 @@ export class PanelAgentManager {
     if (watch.awaiting.size === 0) this.credentialOrphanWatch = null;
   }
 
+  /** #1567 item 2 — tabs whose still-owed MCP respawn came from a CREDENTIAL save, and are
+   *  therefore allowed to wait for in-flight transfers. Membership is dropped the moment the
+   *  restart resolves (applied, or the tab is gone), so it can never delay an unrelated one. */
+  private credentialRespawnTabs = new Set<string>();
+
+  /**
+   * #1567 item 2 — a credential respawn that came due while transfers are running is HELD.
+   *
+   * `bytes`/`movedAt` are the stall detector, and the reason the hold has no wall-clock cap:
+   * a cap does precisely the damage the hold exists to prevent — it kills a healthy 48 GB
+   * transfer for being long. What it waits on instead is PROGRESS, so a dead or wedged
+   * transfer stops being waited on after one stall window while a live one is waited on for
+   * as long as it keeps moving.
+   *
+   * One record for the whole manager because the thing being waited on is global: the at-risk
+   * enumeration lists every downloading job on this machine, not this tab's.
+   */
+  private respawnHold: {
+    tabs: Set<string>;
+    timer: ReturnType<typeof setInterval> | null;
+    since: number;
+    /** Total bytes fetched across the at-risk set at the last observation. */
+    bytes: number;
+    /** When that total last CHANGED — not when it was last read. */
+    movedAt: number;
+  } | null = null;
+
+  /** How long the respawn now being applied was held, for the note. 0 when it was not. */
+  private heldForMs(tabId: string): number {
+    const hold = this.respawnHold;
+    return hold?.tabs.has(tabId) ? Math.max(0, Date.now() - hold.since) : 0;
+  }
+
+  /** What a respawn would orphan right now. Never throws — see deferredRespawnOrphanNote. */
+  private atRiskNow(): { id: string; filename: string; bytes: number }[] {
+    try {
+      return downloadsAtRiskOfRespawn();
+    } catch (err) {
+      logger.debug("[panel-orchestrator] could not enumerate downloads a respawn would orphan", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // An enumeration that failed establishes NOTHING about what is in flight, so it must
+      // not read as "nothing is". It cannot hold either — a hold on an unknown is a respawn
+      // that may never fire — so the respawn proceeds, exactly as it did before this change.
+      return [];
+    }
+  }
+
+  /**
+   * #1567 item 2 — WAIT rather than kill: is this credential respawn still worth holding?
+   *
+   * The reporter's loss was not that the respawn was late, it was that firing it destroyed
+   * ~48 GB of transfers that had every reason to be alive. A QUEUED respawn is by definition
+   * not urgent — it has already waited turns — and for a comfyui credential the running tools
+   * re-read the value from disk at use time, so nothing about the new credential is waiting on
+   * the rebuild. The transfers are what cannot be recreated cheaply, so they win.
+   *
+   * Called once per decision point (turn-done, or a poll tick), and it is also where the
+   * stall bookkeeping is updated — so it must be called ONLY when the answer will be acted on.
+   */
+  private holdRespawnForTransfers(tabId: string): boolean {
+    const atRisk = this.atRiskNow();
+    const now = Date.now();
+    if (atRisk.length === 0) {
+      // Drained. This is the good ending: the respawn fires having killed nothing.
+      if (this.respawnHold?.tabs.has(tabId)) {
+        logger.info(
+          `[panel-orchestrator] tab ${tabId.slice(0, 8)} credential respawn released after ` +
+            `${Math.round(this.heldForMs(tabId) / 1000)}s — the transfers it was waiting on are done (#1567)`,
+        );
+      }
+      this.releaseRespawnHold(tabId);
+      return false;
+    }
+    const bytes = atRisk.reduce((n, d) => n + d.bytes, 0);
+    const hold = this.respawnHold;
+    if (!hold) {
+      this.respawnHold = { tabs: new Set([tabId]), timer: null, since: now, bytes, movedAt: now };
+      this.startRespawnHoldPoll();
+      logger.info(
+        `[panel-orchestrator] tab ${tabId.slice(0, 8)} credential respawn HELD — ${atRisk.length} ` +
+          `download(s) in flight; it fires when they finish, or stop making progress (#1567)`,
+      );
+      return true;
+    }
+    hold.tabs.add(tabId);
+    // ANY change is activity, including a DECREASE: one transfer finishing shrinks the set
+    // and the total, and reading that as "no progress" would start the stall clock running
+    // during the very thing being waited for.
+    if (bytes !== hold.bytes) {
+      hold.bytes = bytes;
+      hold.movedAt = now;
+    }
+    if (now - hold.movedAt < respawnHoldStallMs()) return true;
+    logger.info(
+      `[panel-orchestrator] tab ${tabId.slice(0, 8)} credential respawn giving up its hold after ` +
+        `${Math.round((now - hold.since) / 1000)}s — ${atRisk.length} download(s) made no progress ` +
+        `for ${Math.round(respawnHoldStallMs() / 1000)}s (#1567)`,
+    );
+    return false;
+  }
+
+  /** Drop this tab from the hold, and retire the whole record (and its timer) with the last
+   *  one. Called from every path that resolves a restart, so a hold cannot outlive its tabs. */
+  private releaseRespawnHold(tabId: string): void {
+    const hold = this.respawnHold;
+    if (!hold) return;
+    hold.tabs.delete(tabId);
+    if (hold.tabs.size > 0) return;
+    if (hold.timer) clearInterval(hold.timer);
+    this.respawnHold = null;
+  }
+
+  /**
+   * The only thing that can wake a held respawn.
+   *
+   * `applyPendingRestarts` runs at turn-done, so without this a tab that goes idle and stays
+   * idle — which is exactly what a user watching a 48 GB download does — would hold its
+   * respawn forever with nothing left to re-ask the question. The tick re-enters
+   * `applyPendingRestarts`, which re-evaluates the hold and fires the restart when it lifts.
+   *
+   * unref'd: a pending respawn must never be the reason the process cannot exit.
+   */
+  private startRespawnHoldPoll(): void {
+    const hold = this.respawnHold;
+    if (!hold || hold.timer) return;
+    hold.timer = setInterval(() => {
+      // Snapshot: applyPendingRestarts mutates hold.tabs (and can retire the record).
+      for (const tabId of [...(this.respawnHold?.tabs ?? [])]) this.applyPendingRestarts(tabId);
+    }, respawnHoldPollMs());
+    hold.timer.unref?.();
+  }
+
   /** #1567 — what this respawn is about to orphan, enumerated NOW rather than at save
    *  time. Never throws: a rebuild that fails because its warning failed is strictly
    *  worse than a rebuild with no warning.
@@ -2671,9 +2837,9 @@ export class PanelAgentManager {
    *  once per credential save rather than on every restart — the same IO the save path
    *  already performs, moved to where it can see the right answer. A try/catch cannot
    *  time-bound a blocking syscall and is not pretended to. */
-  private deferredRespawnOrphanNote(): string | null {
+  private deferredRespawnOrphanNote(heldMs: number): string | null {
     try {
-      return orphanedByDeferredRespawnNote(downloadsAtRiskOfRespawn());
+      return orphanedByDeferredRespawnNote(downloadsAtRiskOfRespawn(), heldMs);
     } catch (err) {
       logger.debug("[panel-orchestrator] could not enumerate downloads a respawn will orphan", {
         error: err instanceof Error ? err.message : String(err),
@@ -2691,13 +2857,38 @@ export class PanelAgentManager {
       this.pendingEffortRestart.delete(tabId);
       this.pendingMcpRestart.delete(tabId);
       this.pendingRetargetFrom.delete(tabId);
-      // #1567 — this restart is being dropped, so it will never deliver an armed watch.
+      // #1567 — this restart is being dropped, so it will never deliver an armed watch,
+      // and there is no longer a session whose transfers a hold could protect.
       this.releaseOrphanWatch(tabId);
+      this.credentialRespawnTabs.delete(tabId);
+      this.releaseRespawnHold(tabId);
       return "no-agent";
     }
     // Still mid-work (a queued message will start the next turn) — wait for the
     // next idle so we don't restart between back-to-back turns.
     if (agent.isBusy || agent.hasPending) return "scheduled";
+    // #1567 item 2 — WAIT FOR THE TRANSFERS, don't kill them.
+    //
+    // Everything below this line replaces the tool session, which is what orphaned the
+    // reporter's nine downloads. A credential respawn has no deadline — the tools re-read
+    // the credential from disk at use time, so it is a tidy-up, not the thing that makes
+    // the new value work — and the transfers it would destroy cost hours and tens of GB.
+    //
+    // Two exclusions, both about respawns that are NOT tidy-ups:
+    //   * unmarked tabs — a base_path recovery or any other plain mcp-env respawn, which
+    //     this has no license to delay;
+    //   * a RETARGET (#1429), where the running child is addressing the machine the user
+    //     just left. Waiting there prolongs calls landing on the wrong ComfyUI, which is
+    //     the failure retargeting exists to end. It kills the transfers, and the note
+    //     below says so.
+    const mayHold =
+      wantMcp && this.credentialRespawnTabs.has(tabId) && !this.pendingRetargetFrom.has(tabId);
+    if (mayHold && this.holdRespawnForTransfers(tabId)) return "scheduled";
+    // Held or not, this restart is now resolving, so the mark is spent. Read the hold's age
+    // BEFORE releasing it — that is what the note reports.
+    const heldMs = this.heldForMs(tabId);
+    this.credentialRespawnTabs.delete(tabId);
+    this.releaseRespawnHold(tabId);
     // Only the MCP respawn carries a retry nudge.
     const nudge = wantMcp ? (this.pendingMcpRestart.get(tabId) ?? undefined) : undefined;
     // #1567 — RE-TAKE the at-risk snapshot HERE. The save-time one (#1378) is taken
@@ -2726,7 +2917,7 @@ export class PanelAgentManager {
     // tab still owes a restart, so it has not resolved and must stay in the set.
     if (watched) this.credentialOrphanWatch = null;
     else this.releaseOrphanWatch(tabId);
-    const orphanNote = watched ? this.deferredRespawnOrphanNote() : null;
+    const orphanNote = watched ? this.deferredRespawnOrphanNote(heldMs) : null;
     const finalNudge = orphanNote ? [nudge, orphanNote].filter(Boolean).join("\n\n") : nudge;
     this.pendingEffortRestart.delete(tabId);
     this.pendingMcpRestart.delete(tabId);
@@ -3091,6 +3282,12 @@ export class PanelAgentManager {
       this.pendingMcpRestart.set(newKey, this.pendingMcpRestart.get(oldKey)!);
       this.pendingMcpRestart.delete(oldKey);
     }
+    // #1567 — the mark and the hold classify that same queued restart, so they travel with
+    // it. Left behind, the renamed tab's credential respawn stops being one this may wait
+    // for, and fires into whatever downloads are running under the new key.
+    if (this.credentialRespawnTabs.delete(oldKey)) this.credentialRespawnTabs.add(newKey);
+    const hold = this.respawnHold;
+    if (hold?.tabs.delete(oldKey)) hold.tabs.add(newKey);
     // The marker classifies that value (#1429), so it has to travel with it: left
     // behind, the renamed tab's queued retarget nudge reads as a per-request one
     // and the next retarget preserves an obsolete target instead of recomposing.
@@ -3245,6 +3442,11 @@ export class PanelAgentManager {
     // #1567 — this tab can no longer deliver an armed orphan watch. The single choke point
     // for removal, so a retire/reset cannot strand one waiting on a tab that is gone.
     this.releaseOrphanWatch(key);
+    // …and its held respawn dies with it: the session whose transfers the hold was protecting
+    // is being torn down here regardless, so waiting longer protects nothing and would leave
+    // a poll timer re-entering applyPendingRestarts for a key with no agent.
+    this.credentialRespawnTabs.delete(key);
+    this.releaseRespawnHold(key);
     this.detachHeldCompletions(key, opts.reason);
     if (opts.dropHeldMail) this.heldMessages.delete(key);
     return agent;
@@ -3415,6 +3617,12 @@ export class PanelAgentManager {
   async stopAll(): Promise<void> {
     this.pendingEffortRestart.clear();
     this.pendingMcpRestart.clear();
+    // #1567 — no restart is owed any more, so nothing may be held for one. The poll timer is
+    // unref'd, but a shutdown that leaves it running would keep re-entering
+    // applyPendingRestarts against agents this method is in the middle of stopping.
+    this.credentialRespawnTabs.clear();
+    if (this.respawnHold?.timer) clearInterval(this.respawnHold.timer);
+    this.respawnHold = null;
     // #468 — go through the same detach seam as reset()/retire() for EVERY key
     // before dropping held mail. The journal is about to be reported on by the
     // orchestrator's shutdown disclosure, and an entry still marked `handed_off`
