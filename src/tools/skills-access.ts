@@ -900,11 +900,19 @@ async function fetchConfiguredTemplateIndex(
     let res: Response;
     try {
       res = sameCredentialOrigin(current, startUrl)
-        ? await comfyuiFetch(current, {
-            redirect: "manual",
-            signal: AbortSignal.timeout(8000),
-          })
-        : await fetch(current, { redirect: "manual", signal: AbortSignal.timeout(8000) });
+        ? // NO SIGNAL, deliberately (#1600 gate round 7). A hard-coded
+          // `AbortSignal.timeout(8000)` here — inherited from before this PR, not
+          // introduced by it — ALWAYS WINS over comfyuiFetch's ceiling, because
+          // that ceiling is only applied to callers who passed none. So a user who
+          // set COMFYUI_MCP_HTTP_TIMEOUT_S=60 for a slow remote still had this one
+          // read aborted at 8s, and the setting silently did nothing here.
+          // Omitting it lets the configured value govern, which is what every
+          // other ComfyUI call in the process does.
+          await comfyuiFetch(current, { redirect: "manual" })
+        : // An origin the user did NOT configure gets its own bound: their
+          // ComfyUI timeout is a statement about their ComfyUI, and a redirect
+          // target chosen by the far end is not it.
+          await fetch(current, { redirect: "manual", signal: AbortSignal.timeout(8000) });
     } catch (err) {
       // Hop 0 is the ordinary case: nothing answered, and the caller decides
       // whether that licenses asking a connected panel.
