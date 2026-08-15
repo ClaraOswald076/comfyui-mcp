@@ -43,6 +43,7 @@ import {
   bareNameAmbiguity,
   REKEYED_REPOS,
   REKEYED_SUBSTITUTIONS,
+  registryVersionAmbiguity,
   rekeyedRegistryVersionAmbiguity,
   rekeyedRepoAmbiguity,
   rekeyedRepoRefusal,
@@ -137,7 +138,12 @@ describe("#1624 — a re-keyed repository is refused instead of substituted", ()
     // reads a channel: it calls `cnr_install("ComfyUI-ElevenLabs", "1.2.3")`, finds no
     // such id, and fails. Refusing was directionally right and the remedy was correct,
     // which is precisely how a fabricated mechanism survives — so the call dispatches and
-    // takes Manager's own "not found" instead. 12 of the 98 records are in this shape.
+    // takes Manager's own "not found" instead.
+    //
+    // Counted, not estimated: 26 of the 98 records have no `registryTarget`. 12 of them
+    // are reachable on the channel this code defaults to and were REFUSED (this test);
+    // the other 14 answer only on an explicitly named channel and got the WARNING
+    // instead (the test below).
     const url = "https://github.com/GuardSkill/ComfyUI-ElevenLabs";
     const rec = REKEYED_SUBSTITUTIONS["guardskill/comfyui-elevenlabs"];
     expect(rec?.channelTargets.default ?? []).toHaveLength(1);
@@ -149,6 +155,31 @@ describe("#1624 — a re-keyed repository is refused instead of substituted", ()
     expect(nodesInstallCommandArgs({ repository: url }).conflict).toContain(
       "jerilseb/ComfyUI-ElevenLabs",
     );
+  });
+
+  it("does not ride the warning on a registry-version route either", () => {
+    // The same gate finding on the OTHER side of the channel split. The warning is what a
+    // caller who NAMED the channel gets, and it describes the same channel resolution —
+    // so on a route where no channel is read it is just as fabricated as the refusal,
+    // and it rides a call that DISPATCHES, where nothing later contradicts it.
+    // RUFFY-369/ComfyUI-StreamDiffusion is re-keyed ("streamdiffusion"), nothing is
+    // registered as `comfyui-streamdiffusion`, and only `dev` answers to the name — with
+    // pschroedl's. Deliberately NOT one of the contested names: those are refused a step
+    // earlier by #1616's registry-version check, which would mask what this pins.
+    const url = "https://github.com/RUFFY-369/ComfyUI-StreamDiffusion";
+    const rec = REKEYED_SUBSTITUTIONS["ruffy-369/comfyui-streamdiffusion"];
+    expect(rec?.registryTarget).toBeUndefined();
+    expect(rec?.channelTargets.default ?? []).toHaveLength(0);
+    expect(registryVersionAmbiguity(url, "1.2.3")).toBeUndefined();
+    expect(rekeyedRepoAmbiguity(url, "dev")).toBeTruthy();
+    const res = nodesInstallCommandArgs({ repository: url, version: "1.2.3", channel: "dev" });
+    expect(res.conflict).toBeUndefined();
+    expect(res.note ?? "").not.toContain("RE-KEYED PACK");
+    // Drop the version and the same call IS on the from-source route, where the channel
+    // it names is genuinely read — so the warning is true there and does ride.
+    const fromSource = nodesInstallCommandArgs({ repository: url, channel: "dev" });
+    expect(fromSource.conflict).toBeUndefined();
+    expect(fromSource.note ?? "").toContain("RE-KEYED PACK");
   });
 
   it("does not treat a from-source spec as a registry version", () => {
