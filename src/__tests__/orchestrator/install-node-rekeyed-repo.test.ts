@@ -153,6 +153,37 @@ describe("#1624 — a re-keyed repository is refused instead of substituted", ()
     expect(res.conflict).not.toContain("RE-KEYED PACK");
   });
 
+  it("says it ONCE on the named-channel path too, where neither message returns early", () => {
+    // The refusal path above returns at the first conflict, so the ordering guard costs
+    // nothing there and a mutation that drops it survives. The WARNING path is where it
+    // is load-bearing: both messages ride the same `note`, so without the guard a caller
+    // who named a channel reads the same finding twice, in two voices, with two different
+    // remedies. Measured with the guard removed: the note carries both.
+    const res = nodesInstallCommandArgs({
+      repository: "https://github.com/wildminder/ComfyUI-Chatterbox",
+      channel: "default",
+    });
+    expect(res.conflict).toBeUndefined();
+    expect(res.note).toContain("NAMED-CHANNEL COLLISION");
+    expect(res.note).not.toContain("RE-KEYED PACK");
+  });
+
+  it("does not refuse a re-keyed repo whose name resolves to nothing on the asked channel", () => {
+    // RUFFY-369/ComfyUI-StreamDiffusion is re-keyed ("streamdiffusion") and `dev` answers
+    // to its name — but `default` answers with nothing and the registry holds no pack of
+    // that name, so Manager returns "not found". That installs nobody's code. Refusing it
+    // would turn a clean failure into a refusal and widen this fix past what it measured;
+    // this is the assertion that fails if the not-found branch is dropped.
+    const url = "https://github.com/RUFFY-369/ComfyUI-StreamDiffusion";
+    expect(REKEYED_SUBSTITUTIONS["ruffy-369/comfyui-streamdiffusion"]).toBeTruthy();
+    expect(REKEYED_SUBSTITUTIONS["ruffy-369/comfyui-streamdiffusion"]?.registryTarget)
+      .toBeUndefined();
+    expect(rekeyedRepoAmbiguity(url, "default")).toBeUndefined();
+    expect(nodesInstallCommandArgs({ repository: url }).conflict).toBeUndefined();
+    // ...and on the channel that DOES answer, it is refused.
+    expect(rekeyedRepoAmbiguity(url, "dev")?.resolvedVia).toBe("channel");
+  });
+
   it("independently agrees with #1619's table on the reproduction #1624 was filed with", () => {
     // The two tables are computed by separate passes over the same registry fetch. If
     // they ever disagreed about the same repository, one of them would be wrong and
