@@ -527,6 +527,57 @@ describe("run completion across automatic goal continuation (#468)", () => {
     expect(backend.turnImages[2].length).toBeLessThanOrEqual(8);
   });
 
+  it("#1516: a turn that trims an IN-FLIGHT-window completion corrects its own claim", async () => {
+    // The state a per-queue budget cannot see, and the reason the drain has to
+    // speak rather than log. `queuedPreviewImageCount()` reads `queue`; an
+    // in-flight batch is not on it. So:
+    //   1. completion A is taken IN FLIGHT with its 8 previews;
+    //   2. completion B arrives behind it, reads the budget as untouched
+    //      (queue is empty), and commits its own 8 — saying "attached below";
+    //   3. an interrupt requeues A beside B, and ONE drain sees 16.
+    // The ceiling holds at 8, but B's images are the ones cut, so B's notice now
+    // describes attachments that are not on the turn. Measured before the drain
+    // disclosed it: 8 images delivered, all A's, B's filenames nowhere in the
+    // text because B carried a custom note — an unfetchable false claim.
+    const backend = new ContinuationBackend();
+    const { journal, manager, arrive } = makeHarness(backend);
+    const tab = "tab-inflight-window";
+    const previews = (tag: string) =>
+      Array.from({ length: 28 }, (_, i) => ({ filename: `${tag}_${i}.png`, type: "temp" }));
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    journal.openRun(PROMPT_B, { tabId: tab });
+    manager.send(tab, "go");
+    await waitFor(() => backend.turns.length >= 1);
+
+    arrive(tab, { kind: "executed", prompt_id: PROMPT_A, images: previews("A") });
+    backend.finishTurn();
+    await waitFor(() => backend.turns.length >= 2);
+    expect(backend.turnImages[1]).toHaveLength(8); // A is in flight with its 8
+
+    // B lands while A is IN FLIGHT, and carries a note — so its filenames never
+    // enter its own text and only the drain can name them.
+    arrive(tab, {
+      kind: "executed",
+      prompt_id: PROMPT_B,
+      note: "A 3-second video was rendered; this is its storyboard.",
+      images: previews("B"),
+    });
+    await manager.interrupt(tab, { requeueInFlight: true });
+    await waitFor(() => backend.turns.length >= 3);
+
+    const turn = backend.turns[2];
+    // The ceiling still holds…
+    expect(backend.turnImages[2]).toHaveLength(8);
+    // …and the turn does NOT quietly carry a notice that contradicts it.
+    expect(turn).toContain("were NOT attached to this turn");
+    expect(turn).toContain("THIS note is the accurate one");
+    // The trimmed outputs are named, WITH the coordinates get_image needs — this
+    // is the only place they appear, because B's note replaced its own list.
+    expect(turn).toContain('B_0.png (type:"temp")');
+    expect(turn).toContain('get_image action:"get"');
+  });
+
   it("#1516: a withheld preview is named with coordinates get_image can actually use", async () => {
     // The remedy has to be callable. get_image action:"get" takes a FILENAME and
     // defaults `type` to "output" — but a PreviewImage output lives in `temp`, and

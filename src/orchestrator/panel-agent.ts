@@ -123,12 +123,37 @@ const TURN_IDLE_MS = Number(process.env.COMFYUI_MCP_TURN_IDLE_MS) || 210_000;
  * busy. Measured before this was fixed: four matched completions queued during
  * one turn put 32 images on the next one, which is exactly #1516's compounding
  * shape. Enforced in two places doing DIFFERENT jobs: injectEvent spends the
- * remaining budget, which is what lets each notice state a count true of the
- * turn it lands in; the drain caps the assembled batch, because that is the one
- * seam every path crosses. Measured, so the second is not sold as more than it
- * is: each holds alone, including across an interrupt that requeues a budgeted
- * batch, so the drain is a ceiling rather than the fix for a known escape. */
+ * remaining budget, which is what lets a notice state a count true of the turn
+ * it EXPECTS to land in; the drain caps the assembled batch, and is the only
+ * place that knows the turn that actually happened.
+ *
+ * The gap between those two is real and measured, not theoretical. An in-flight
+ * batch is not on `queue`, so injectEvent cannot see it: with 8 previews in
+ * flight, a completion arriving behind them is told the budget is untouched and
+ * commits its own 8. An interrupt then requeues the in-flight items beside it and
+ * one drain sees 16. The ceiling holds (8 delivered), but the second completion's
+ * notice already claimed "attached below" for images that no longer ride the
+ * turn — so the drain has to CORRECT that claim, not merely enforce the number.
+ * Counting in-flight items at inject time is not the fix: a turn that ends
+ * normally never comes back, so charging for it would starve every sequential
+ * render of its preview. */
 const MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS = 8;
+
+/** Name outputs so `get_image action:"get"` can actually fetch them.
+ *
+ *  Filename alone is not a coordinate: `type` defaults to "output" and a
+ *  PreviewImage lives in `temp`, so a bare name sends the agent looking in the
+ *  wrong directory. Only the parts that differ from the default are spelled out,
+ *  to keep an ordinary output list readable. */
+function describeImageRefs(refs: ImageRef[]): string {
+  return refs
+    .map((i) => {
+      const type = i.type ?? "output";
+      const sub = i.subfolder ? `, subfolder:"${i.subfolder}"` : "";
+      return type === "output" && !i.subfolder ? i.filename : `${i.filename} (type:"${type}"${sub})`;
+    })
+    .join(", ");
+}
 
 /** Longest a single tool call may hold the idle watchdog off before it's treated
  *  as genuinely stuck rather than legitimately slow. An MCP tool call streams NO
@@ -744,8 +769,10 @@ export class PanelAgent {
       // Spend what is LEFT of this turn's budget, not a fresh 8. Everything
       // already queued is drained into the same turn as this event, so a per-
       // event cap is not a cap at all. Synchronous from here to `queue.push`
-      // below — nothing can drain in between — so this count is the batch this
-      // event is actually joining.
+      // below, so nothing drains in between — but this counts the QUEUE only. A
+      // batch already in flight is invisible here and can be requeued back onto
+      // this one, which is why the drain corrects the count rather than trusting
+      // it (see MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS).
       const previewBudgetLeft = Math.max(
         0,
         MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS - this.queuedPreviewImageCount(),
@@ -762,13 +789,7 @@ export class PanelAgent {
       const withheldImgs = correlationIsUntrusted
         ? attachableImgs
         : attachableImgs.slice(attachedImgs.length);
-      const withheldRefs = withheldImgs
-        .map((i) => {
-          const type = i.type ?? "output";
-          const sub = i.subfolder ? `, subfolder:"${i.subfolder}"` : "";
-          return type === "output" && !i.subfolder ? i.filename : `${i.filename} (type:"${type}"${sub})`;
-        })
-        .join(", ");
+      const withheldRefs = describeImageRefs(withheldImgs);
       const names = imgs.map((i) => i.filename).filter(Boolean).join(", ") || "(unnamed)";
       // A custom `note` (e.g. the panel's video-storyboard summary) replaces the
       // default image-acknowledgement wording so the agent is told accurately
@@ -1331,37 +1352,47 @@ export class PanelAgent {
       // #1516 — THE PER-TURN CEILING ON AUTOMATIC PREVIEWS, and the reason it
       // lives here rather than only at injectEvent: this line is where N
       // completions become ONE turn. A per-event cap of 8 measured 32 images on
-      // one turn for four queued completions. injectEvent spends the remaining
-      // budget so each notice can state a true count; this is the seam every
-      // path crosses, including an interrupt that requeues an already-budgeted
-      // batch alongside a fresh one. A user's own attachment is never touched —
-      // only `completionOnly` items, which are the injected panel events.
+      // one turn for four queued completions.
+      //
+      // injectEvent's budget is the ESTIMATE — true when written, and blind to
+      // any batch already in flight. This is the FACT. The two diverge on a
+      // measured path (in-flight previews requeued beside a completion that
+      // budgeted as if the queue were empty), which is why the block below
+      // corrects the notices instead of assuming they agree with the outcome.
+      // A user's own attachment is never touched — only `completionOnly` items,
+      // which are the injected panel events.
       let previewBudget = MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS;
-      let previewsDropped = 0;
+      const trimmedPreviews: ImageRef[] = [];
       let images = batch.flatMap((it) => {
         const refs = it.images ?? [];
         if (!it.completionOnly) return refs;
         const take = refs.slice(0, Math.max(0, previewBudget));
         previewBudget -= take.length;
-        previewsDropped += refs.length - take.length;
+        trimmedPreviews.push(...refs.slice(take.length));
         return take;
       });
-      // Reaching here means injectEvent's budget did NOT already hold the queue
-      // under the ceiling — something queued a completionOnly item without
-      // spending it. I could not construct such a path: across a burst landing on
-      // a busy agent and an interrupt that requeues a budgeted batch beside a
-      // fresh one, this trim never fired with the inject-time budget in place,
-      // and held the turn at 8 with it disabled. That is two scenarios, not a
-      // proof, which is exactly why the ceiling stays here. It is deliberately
-      // NOT disclosed to the agent: a paragraph I cannot reach is a paragraph I
-      // cannot test, and an untested claim about what the turn carries is the
-      // defect this whole change is about. A shortfall here is OUR bug, so it
-      // goes where we read our bugs.
-      if (previewsDropped > 0) {
-        logger.warn(
-          `[panel-agent ${this.short()}] ${previewsDropped} automatic preview image(s) were trimmed at the drain — ` +
-            `a completionOnly item reached the queue without spending the per-turn budget, so a notice in this turn ` +
-            `may claim an attachment the turn does not carry (#1516)`,
+      // A trim here means a notice ABOVE is now wrong: it was composed when its
+      // images were going to ride this turn, and they are not. Measured sequence
+      // — 8 previews in flight, a second completion queued behind them (its own
+      // budget reads as untouched, because in-flight items are not on `queue`),
+      // then an interrupt requeues the first batch: one drain sees 16, delivers
+      // 8, and the second completion's "attached below" describes nothing.
+      //
+      // So this cannot be a log line. The agent is the one being misled, the
+      // agent is the one that has to be told, and it needs the coordinates
+      // because the trimmed completion may have carried a custom `note` — in
+      // which case its filenames appear NOWHERE else in this turn and get_image
+      // is otherwise impossible. Suppressed only for a text-only backend, which
+      // has its own notice below and no attachments to contradict.
+      if (trimmedPreviews.length && this.backend.capabilities.vision) {
+        text +=
+          `\n\n[panel note: ${trimmedPreviews.length} automatic preview image(s) were NOT attached to this turn. ` +
+          `Several run completions were merged into one turn and they SHARE a single ${MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS}-image budget, ` +
+          `so a notice above may say its images are "attached below" when they are not — where they disagree, THIS note is the accurate one. ` +
+          `They are outputs on the ComfyUI side that this turn does not carry — fetch any of them with get_image action:"get" — ${describeImageRefs(trimmedPreviews)}.]`;
+        logger.info(
+          `[panel-agent ${this.short()}] trimmed ${trimmedPreviews.length} automatic preview image(s) at the drain ` +
+            `(completions merged into one turn); the turn says so and names them (#1516)`,
         );
       }
       // Deduped across the BATCH, not just within one message: two queued
