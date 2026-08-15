@@ -1299,25 +1299,59 @@ async function applyManifestSections(
         if (visible === false) {
           staleOutsideLiveRoots = existing;
         } else if (visible === undefined) {
-          // We could not establish that the running server reads from this path, so
-          // "already exists" is an UNVERIFIED claim. Report it as pending, never as
-          // a satisfied item (codex gate, rounds 4 and 8).
-          const listed = await liveListingHasEntry(target.targetSubfolder, target.filename);
+          // #1587 — containment could not answer, and about THIS question it never
+          // could. `isUnderLiveModelRoots` compares `existing` against a models root
+          // the running server did not name (`modelsDirNamedByServer`); it never
+          // consults the server's own listing. Deriving `pending` from that silence
+          // overruled the one source that CAN answer — /models — with a source
+          // structurally blind to it, and then said so in a message that told the
+          // user their install root "could only be inferred from local
+          // configuration". That is not what `undefined` means here: an
+          // OS-process-observed root (ComfyUI Desktop's shape, where the interpreter
+          // is identified from the process table serving our port) lands in exactly
+          // this bucket, and the file was often FOUND by the server's own listing in
+          // the first place (findExistingModel step 3).
+          //
+          // So ask what the manifest actually needs to know — does the running server
+          // already have this model? — and let the server answer it. Precision
+          // mirrors findExistingModel: a category-root target is satisfied by the
+          // basename anywhere in the category, a nested target by the exact
+          // category-relative path.
+          //
+          // This does NOT weaken #369. #369's failure is a stale same-named file
+          // satisfying the manifest while the live server has never seen it — there
+          // the server does NOT list the entry, so this branch still reports pending
+          // and the download still runs. What is dropped is only the claim that the
+          // local copy is the served one, which the note now STATES instead of the
+          // verdict asserting its opposite.
+          const nested = target.targetSubfolder.split(/[\\/]+/).filter(Boolean).length > 1;
+          const listed = nested
+            ? await liveListingHasEntry(target.targetSubfolder, target.filename)
+            : await liveListingHasBasename(target.targetSubfolder, target.filename);
           results.push(
-            report(
-              "model",
-              item,
-              "pending",
-              `A file exists at ${existing}, but it could NOT be established that the ` +
-                "connected ComfyUI reads models from there (its install root could only be " +
-                "inferred from local configuration), so this is not confirmed as installed." +
-                (listed === true
-                  ? ` The server does list "${target.filename}" under "${target.targetSubfolder}", but that may be its OWN copy elsewhere.`
-                  : listed === false
-                    ? ` The server does NOT list "${target.filename}" under "${target.targetSubfolder}".`
-                    : "") +
-                " Check list_local_models.",
-            ),
+            listed === true
+              ? report(
+                  "model",
+                  item,
+                  "skipped",
+                  `The connected ComfyUI already serves "${target.filename}" in ` +
+                    `"${target.targetSubfolder}", so the manifest's model is present for it. ` +
+                    "NOTE: containment could not be established — the running server did not " +
+                    `name its models root — so it is NOT confirmed that the copy at ${existing} ` +
+                    "is the one it serves.",
+                )
+              : report(
+                  "model",
+                  item,
+                  "pending",
+                  `A file exists at ${existing}, but it could NOT be established that the ` +
+                    "connected ComfyUI reads models from there — the running server did not " +
+                    "name its models root, so the root had to be inferred — and " +
+                    (listed === false
+                      ? `the server does NOT list "${target.filename}" under "${target.targetSubfolder}".`
+                      : `the server could not be asked whether it lists "${target.filename}" under "${target.targetSubfolder}".`) +
+                    " Check list_local_models.",
+                ),
           );
           continue;
         }
