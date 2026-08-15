@@ -259,8 +259,10 @@ A few notes that save grief:
   wired and steps ≥ 8 for Turbo.
 - **You wanted to EDIT a photo and it ignored you** → expected. ERNIE is txt2img;
   use Qwen-Image-Edit or Flux Kontext for grounded edits.
-- **Installer pulled Z-Image files too** → that's the contaminated upstream script;
-  use the `ernie` pack, which excludes them.
+- **Installer pulled Z-Image files the graph never loads** → that's the contaminated
+  upstream script. Use `ernie-txt2img` (or `ernie-img2img`) if you want ERNIE and
+  nothing else; the `ernie` monolith downloads Z-Image models on purpose, because its
+  combo groups load them.
 
 ## FAQ
 
@@ -296,7 +298,7 @@ designed for layout-sensitive, multilingual text rendering, not as an afterthoug
 ## Get it running in one command
 
 1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — then start the agent with `npx -y comfyui-mcp@latest connect` and click **Connect** in the panel (no API keys; sign in with `claude` once).
-2. Apply the **`ernie` pack** — nodes + ERNIE-only models land in the right folders, validated, with the Z-Image cruft stripped out.
+2. Apply the **`ernie` pack** — nodes + models land in the right folders, validated, and every file it downloads is one the graph loads. Want ERNIE and nothing else, without the combo pipelines? Use **`ernie-txt2img`**.
 3. Open the [Panel](../panel) and let the panel's agent write multilingual prompts and wire the graph for you.
 
 That's the whole point of the project: expert ComfyUI setups that install in one
