@@ -122,9 +122,12 @@ const TURN_IDLE_MS = Number(process.env.COMFYUI_MCP_TURN_IDLE_MS) || 210_000;
  * per-event cap of 8 delivers 8N for N completions that land while the agent is
  * busy. Measured before this was fixed: four matched completions queued during
  * one turn put 32 images on the next one, which is exactly #1516's compounding
- * shape. Enforced in two places on purpose — injectEvent spends the remaining
- * budget so each notice can state a true count, and the drain caps the assembled
- * batch so no requeue path can route around it. */
+ * shape. Enforced in two places doing DIFFERENT jobs: injectEvent spends the
+ * remaining budget, which is what lets each notice state a count true of the
+ * turn it lands in; the drain caps the assembled batch, because that is the one
+ * seam every path crosses. Measured, so the second is not sold as more than it
+ * is: each holds alone, including across an interrupt that requeues a budgeted
+ * batch, so the drain is a ceiling rather than the fix for a known escape. */
 const MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS = 8;
 
 /** Longest a single tool call may hold the idle watchdog off before it's treated
