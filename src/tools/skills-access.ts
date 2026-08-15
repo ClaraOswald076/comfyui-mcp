@@ -822,6 +822,32 @@ const MAX_CONFIGURED_REDIRECTS = 5;
  * So the fact "it answered" is carried explicitly by the type, and the caller
  * checks the type instead of interrogating the error.
  */
+/**
+ * Is this the SAME SOCKET ADDRESS, for the purpose of handing over a credential?
+ *
+ * #1600 gate round 5, finding 1 — and it is this module's own recurring mistake,
+ * made one more time. `sameOrigin` is #1175's predicate: it collapses `localhost`
+ * / `127.0.0.1` / `[::1]` so a spelling difference is not reported as drift. That
+ * is right for DESCRIBING and wrong for ACTING, which is exactly what round 3
+ * established one level up — and the redirect walk then used it to decide whether
+ * to re-inject COMFYUI_AUTH_*. So a redirect from `127.0.0.1:p` to `[::1]:p`
+ * counted as "same origin" and forwarded `Authorization` to a DIFFERENT listener.
+ * Proven with two live sockets: native redirect handling strips the header there,
+ * and this path sent it.
+ *
+ * A credential may cross only an EXACT origin — scheme, host and port as `URL`
+ * normalises them (case folding only). No alias is close enough, because the
+ * thing on the other end of an alias is a different process that the user never
+ * configured.
+ */
+function sameCredentialOrigin(a: string, b: string): boolean {
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
+}
+
 class ConfiguredServerAnswered extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
@@ -873,7 +899,7 @@ async function fetchConfiguredTemplateIndex(
   for (let hop = 0; hop <= MAX_CONFIGURED_REDIRECTS; hop++) {
     let res: Response;
     try {
-      res = sameOrigin(current, startUrl)
+      res = sameCredentialOrigin(current, startUrl)
         ? await comfyuiFetch(current, {
             redirect: "manual",
             signal: AbortSignal.timeout(8000),

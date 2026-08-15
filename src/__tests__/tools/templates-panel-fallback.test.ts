@@ -1388,6 +1388,63 @@ describe('list_packs action:"list_templates" — panel fallback', () => {
     expect(calls).toHaveLength(6);
   });
 
+  // ── #1600 merge gate, round 5 ──────────────────────────────────────────────
+
+  it("does NOT send the configured credential across a LOOPBACK ALIAS redirect", async () => {
+    // Finding 1, and it is this module's own recurring mistake made one more
+    // time: the redirect walk decided "same origin" with #1175's predicate, which
+    // collapses `127.0.0.1` / `[::1]` / `localhost`. Those are different
+    // LISTENERS. Native redirect handling strips Authorization there; this path
+    // sent it. A credential may cross only an EXACT origin.
+    stubFetch(async (url) => {
+      if (url === CONFIGURED) {
+        return new Response(null, {
+          status: 302,
+          headers: { location: "http://[::1]:8199/api/workflow_templates" },
+        });
+      }
+      return jsonResponse({ other: [{ name: "t" }] });
+    });
+
+    await handler()({ action: "list_templates" });
+
+    const hop = calls.find((c) => c.url.startsWith("http://[::1]:8199"));
+    expect(hop).toBeDefined();
+    expect(new Headers(hop?.init?.headers).get("authorization")).toBeNull();
+  });
+
+  it("tries EVERY spelling of the one foreign server", () => {
+    // Finding 2. Foreign origins kept `spellings[0]` and dropped the rest — the
+    // same defect round 3 fixed for aliases, on the other branch. A ComfyUI bound
+    // to one stack leaves the other refusing, so the live address could be the one
+    // discarded.
+    expect(
+      choosePanelFallbackOrigin("http://127.0.0.1:8199/api/workflow_templates", [
+        "http://127.0.0.1:8188",
+        "http://[::1]:8188",
+      ]),
+    ).toEqual({
+      kind: "use",
+      origin: "http://127.0.0.1:8188",
+      then: [{ origin: "http://[::1]:8188", kind: "use" }],
+    });
+  });
+
+  it("still refuses when two DIFFERENT servers are connected, naming each once", () => {
+    // The grouping must not weaken the ambiguity rule, and must not list one
+    // machine twice just because two spellings of it are connected.
+    expect(
+      choosePanelFallbackOrigin("http://127.0.0.1:8199/api/workflow_templates", [
+        "http://127.0.0.1:8188",
+        "http://[::1]:8188",
+        "http://192.168.1.50:8188",
+      ]),
+    ).toEqual({
+      kind: "ambiguous",
+      origins: ["http://127.0.0.1:8188", "http://192.168.1.50:8188"],
+    });
+  });
+
   it("passes the configured target through untouched when it works", async () => {
     setConnectedPanelOrigins(() => [PANEL_ORIGIN]);
     stubFetch(async () => jsonResponse({ core: [{ name: "a" }] }));

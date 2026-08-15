@@ -340,15 +340,28 @@ export function choosePanelFallbackOrigin(
   //
   // So a same-canonical origin whose HOST IS SPELLED DIFFERENTLY is a separate
   // socket address and gets its own verdict.
-  const different: string[] = [];
+  // Foreign origins are grouped, not flattened (#1600 gate round 5, finding 2).
+  //
+  // This used to keep `spellings[0]` and drop the rest, which is the SAME mistake
+  // round 3 fixed for aliases, on the other branch: two spellings of one canonical
+  // origin are two SOCKETS, and a ComfyUI bound to only one stack leaves the other
+  // refusing. Keeping the first meant the live address could be the one thrown
+  // away, and the fallback failed with an answer available.
+  //
+  // The GROUP stays the unit of ambiguity, because that is the question ambiguity
+  // asks — "which of several machines did the caller mean?" — and #1175 holds one
+  // group to be one machine. Within a group there is no such question, so the
+  // spellings are chained in order exactly as aliases are. Refusing instead would
+  // decline the ordinary case (two tabs on one ComfyUI, spelled differently) to
+  // guard a case this module cannot detect anyway, and the result names the origin
+  // that answered either way.
+  const differentGroups: string[][] = [];
   const aliases: string[] = [];
   let sameAs: string | undefined;
   const wantHost = hostOf(failedTarget);
   for (const [canon, spellings] of byCanonical) {
     if (canon !== want) {
-      // A foreign origin contributes ONE candidate however many spellings of it
-      // are connected — they are the same server by the same rule.
-      different.push(spellings[0]);
+      differentGroups.push(spellings);
       continue;
     }
     for (const spelling of spellings) {
@@ -396,7 +409,11 @@ export function choosePanelFallbackOrigin(
   // candidate — they are ordered, not filtered.
   const chain: PanelFallbackCandidate[] = [
     ...aliases.map((origin) => ({ origin, kind: "alias" as const })),
-    ...(different.length === 1 ? [{ origin: different[0], kind: "use" as const }] : []),
+    // Every spelling of the single foreign server, in published order — for the
+    // same reason the aliases above are not filtered (gate round 5, finding 2).
+    ...(differentGroups.length === 1
+      ? differentGroups[0].map((origin) => ({ origin, kind: "use" as const }))
+      : []),
   ];
   const first = chain[0];
   if (first !== undefined) {
@@ -405,7 +422,11 @@ export function choosePanelFallbackOrigin(
       ? { kind: "alias", origin: first.origin, then }
       : { kind: "use", origin: first.origin, then };
   }
-  if (different.length > 1) return { kind: "ambiguous", origins: different };
+  // One name per foreign SERVER, not per spelling: the reader is being told which
+  // machines were candidates, and listing one twice would misdescribe the choice.
+  if (differentGroups.length > 1) {
+    return { kind: "ambiguous", origins: differentGroups.map((g) => g[0]) };
+  }
   // `sameAs` is necessarily set here: the map is non-empty and nothing landed in
   // `different` or `aliases`. Asserted through a fallback rather than a `!` so a
   // future edit that breaks the partition degrades to "say nothing".
