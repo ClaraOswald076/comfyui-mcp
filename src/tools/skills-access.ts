@@ -5,9 +5,13 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { parse as parseYaml } from "yaml";
-import { errorToToolResult, ValidationError } from "../utils/errors.js";
+import { describeFetchFailure, errorToToolResult, ValidationError } from "../utils/errors.js";
 import { getComfyUIBaseUrl } from "../config.js";
-import { comfyuiFetch } from "../comfyui/fetch.js";
+import { comfyuiFetch, connectedPanelOriginsNow } from "../comfyui/fetch.js";
+import {
+  choosePanelFallbackOrigin,
+  describeDeclinedPanelFallback,
+} from "../services/panel-fallback-target.js";
 import { checkWorkflowRuntime, extractWorkflowClassTypes } from "../services/api-nodes.js";
 import {
   extractWorkflowDependencies,
@@ -520,6 +524,84 @@ function readPackWorkflowAction(rawName: string): ToolText {
   return { content: [{ type: "text" as const, text }] };
 }
 
+/** The workflow-templates index path, appended to a base or an origin. */
+const TEMPLATE_INDEX_PATH = "/api/workflow_templates";
+
+/** Attribution for a NON-2xx that came back from the panel fallback rather than
+ *  the configured target. "" for the ordinary case, so the untouched path keeps
+ *  its exact wording. */
+function panelFallbackNote(origin: string | undefined, configuredUrl: string): string {
+  if (!origin) return "";
+  return (
+    ` NOTE: that address is NOT your configured ComfyUI — ${configuredUrl} could not be reached ` +
+    `at all, so this request went to ${origin}, the ComfyUI a connected sidebar panel is on. ` +
+    `The status above describes THAT server.`
+  );
+}
+
+/**
+ * #1415 — RETRY THE TEMPLATE INDEX AGAINST THE SERVER THE PANEL IS ON.
+ *
+ * The reported session: a connected sidebar panel driving a live ComfyUI,
+ * `panel_graph_outline` working, and this action failing against a headless
+ * COMFYUI_URL of `http://127.0.0.1:9`. #954 named the address that failed and
+ * #952/#1553 said whether a panel is on a different one. Neither answers the
+ * question — and the orchestrator has been publishing the answer since 0.51.42.
+ *
+ * The bar this has to clear, because the shortcut it resembles was rejected
+ * twice (#1006, #1359) as a REPLACEMENT for panel routing:
+ *
+ *   - It is a FALLBACK, never a substitute. The configured target is asked
+ *     first, always, and only a NETWORK-LAYER throw reaches this. A non-2xx
+ *     means the configured server exists and answered; asking a different
+ *     machine because we disliked its answer is exactly the silently-wrong
+ *     result this must not produce.
+ *   - It carries NO credentials. `comfyuiFetch` injects COMFYUI_AUTH_*, which
+ *     was configured for the headless target — a plain `fetch` here is the point,
+ *     not an oversight, and it is why this stays a bespoke request rather than a
+ *     second comfyuiFetch call.
+ *   - It NAMES the server that answered, in the payload, so a reader can never
+ *     mistake this for the configured target having worked.
+ *   - It REFUSES when two panels front different ComfyUIs, rather than picking.
+ *
+ * What it still cannot do: reach a ComfyUI only the browser can see (a tunnel, a
+ * container boundary). That topology needs the panel to fetch on our behalf, and
+ * this deliberately does not pretend otherwise — it fails, naming both addresses
+ * it tried.
+ */
+async function fetchTemplateIndexViaPanel(
+  failedUrl: string,
+  primaryError: unknown,
+): Promise<{ res: Response; url: string; origin: string }> {
+  const choice = choosePanelFallbackOrigin(failedUrl, connectedPanelOriginsNow());
+  const declined = describeDeclinedPanelFallback(choice);
+  if (choice.kind !== "use") {
+    if (declined && primaryError instanceof Error) {
+      throw new Error(`${primaryError.message}${declined}`, { cause: primaryError });
+    }
+    throw primaryError;
+  }
+  const altUrl = `${choice.origin.replace(/\/+$/, "")}${TEMPLATE_INDEX_PATH}`;
+  try {
+    return {
+      // Deliberately the global fetch: see the credential note above.
+      res: await fetch(altUrl, { signal: AbortSignal.timeout(8000) }),
+      url: altUrl,
+      origin: choice.origin,
+    };
+  } catch (err) {
+    const primary = primaryError instanceof Error ? primaryError.message : String(primaryError);
+    const secondary = describeFetchFailure(err).message;
+    throw new Error(
+      `${primary} I then tried the ComfyUI a connected sidebar panel is on (${altUrl}), and that ` +
+        `failed too: ${secondary}. The browser can reach that origin — this process cannot — so ` +
+        `something between them (a tunnel, a container boundary, or a server bound to one ` +
+        `interface) is in the way, and no address here will fix it.`,
+      { cause: err },
+    );
+  }
+}
+
 /** action:"list_templates" */
 async function listWorkflowTemplatesAction(): Promise<ToolText> {
   traceToolCall("list_packs", { action: "list_templates" });
@@ -528,15 +610,31 @@ async function listWorkflowTemplatesAction(): Promise<ToolText> {
   // remote resolves
   // consistently between listing and schema lookup.
   const base = getComfyUIBaseUrl();
-  const url = `${base}/api/workflow_templates`;
+  const configuredUrl = `${base}${TEMPLATE_INDEX_PATH}`;
+  let url = configuredUrl;
+  let res: Response;
+  // Which ComfyUI actually answered, when it was NOT the configured one (#1415).
+  let answeredByPanelOrigin: string | undefined;
   // #954: a bare `fetch` here rejected with the opaque `TypeError: fetch failed`
   // and the reader had no way to see WHICH target was tried — the reported
   // symptom, from a session where the panel bridge was connected and this
   // headless address was not. comfyuiFetch names the target on a network throw,
   // and it is the same auth path every other ComfyUI call uses.
-  const res = await comfyuiFetch(url, {
-    signal: AbortSignal.timeout(8000),
-  });
+  try {
+    res = await comfyuiFetch(url, {
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch (err) {
+    // A caller-side abort (the 8s ceiling above) is NOT evidence the address is
+    // wrong — the connection was accepted and the server was simply slow — so a
+    // second server must not be asked on its account. Only a transport failure
+    // reaches the panel fallback.
+    if (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) throw err;
+    const viaPanel = await fetchTemplateIndexViaPanel(url, err);
+    res = viaPanel.res;
+    url = viaPanel.url;
+    answeredByPanelOrigin = viaPanel.origin;
+  }
   if (!res.ok) {
     // A NON-2xx may still be an HTML proxy/login page — say which, instead
     // of blaming a possibly-fine ComfyUI version (#828).
@@ -557,7 +655,8 @@ async function listWorkflowTemplatesAction(): Promise<ToolText> {
       content: [
         {
           type: "text" as const,
-          text: parsedOk
+          text:
+            (parsedOk
             ? // Do NOT attribute the status to ComfyUI: a JSON error body
               // can just as easily be a gateway's own envelope that never
               // reached it (#828). Offer both readings, assert neither.
@@ -566,7 +665,12 @@ async function listWorkflowTemplatesAction(): Promise<ToolText> {
               // otherwise echo our ComfyUI token into this tool result.
               `The request to ${url} returned ${res.status} with this JSON body: ${bodyPrefixOf(body)}. ` +
               `If that is a ComfyUI error, the server may predate the workflow-templates endpoint; if it is a gateway's own error envelope, the request never reached ComfyUI.`
-            : classifyNonJson({ url, status: res.status, contentType, body }).message,
+            : classifyNonJson({ url, status: res.status, contentType, body }).message) +
+            // #1415 — a status from the PANEL'S server must not read as a status from
+            // the configured one. This branch names `url`, and after a fallback that
+            // is an address the caller never configured; without this the reader
+            // would go and check COMFYUI_URL, which is not what answered.
+            panelFallbackNote(answeredByPanelOrigin, configuredUrl),
         },
       ],
     };
@@ -592,6 +696,20 @@ async function listWorkflowTemplatesAction(): Promise<ToolText> {
           {
             source_count: groups.length,
             template_count: total,
+            // #1415 — WHICH SERVER ANSWERED, not which one was asked. Present only
+            // when the configured target could not be reached and a connected
+            // panel's ComfyUI answered instead: a caller that read this listing as
+            // describing COMFYUI_URL would be reading it about the wrong machine.
+            ...(answeredByPanelOrigin
+              ? {
+                  answered_by: answeredByPanelOrigin,
+                  answered_by_note:
+                    `The configured ComfyUI (${configuredUrl}) could not be reached, so this index ` +
+                    `came from ${answeredByPanelOrigin} — the ComfyUI a connected sidebar panel is ` +
+                    `on. It describes THAT server, not the configured one. Point COMFYUI_URL at ` +
+                    `${answeredByPanelOrigin} so every headless tool agrees with the panel.`,
+                }
+              : {}),
             // #1454 — the counts above describe what the SERVER registers, not what is
             // installed. Said on every listing, not only an empty one: the reporter's
             // had 4 sources and 53 templates, and the pack they wanted was still absent.

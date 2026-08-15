@@ -59,6 +59,28 @@ export function setConnectedPanelOrigins(fn: (() => string[]) | null): void {
   connectedPanelOrigins = fn;
 }
 
+/**
+ * The connected-panel origins, for a caller that wants to ACT on them rather
+ * than describe them (#1415).
+ *
+ * Exported so there is exactly ONE resolution of "injected source, else the
+ * published channel" in the process. A second reader that called
+ * readPublishedPanelOrigins() directly would silently disagree with the drift
+ * sentence in the very error it is reacting to — inside the orchestrator, where
+ * the injected bridge source is both fresher and authoritative and the channel
+ * file may not have been written yet.
+ *
+ * Never throws, for the same reason describeTargetDrift does not: a broken
+ * source must not replace the real failure being handled.
+ */
+export function connectedPanelOriginsNow(): string[] {
+  try {
+    return panelOrigins();
+  } catch {
+    return [];
+  }
+}
+
 /** Origin (scheme://host:port) of a request target, or undefined if unparsable. */
 function originOf(target: string): string | undefined {
   try {
