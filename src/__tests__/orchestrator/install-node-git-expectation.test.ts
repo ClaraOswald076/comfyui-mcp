@@ -194,6 +194,69 @@ describe("the git-URL install asks a channel that can list the pack (#1539)", ()
   });
 });
 
+describe("EVERY spelling the panel routes as git gets the channel (#1539 gate round 3)", () => {
+  // The hole the gate found, and it swallowed the reporter's own pack. The orchestrator
+  // decided "is this a git install?" with a NARROWER predicate than the panel's:
+  //
+  //   orchestrator  /^(https?:\/\/|git@|git\+)/i  ||  endsWith(".git")
+  //   panel         /^(https?|ssh|git):\/\//i  || /^git\+/ || /^git@/ || ".git"
+  //                 || looksLikeOwnerRepoShorthand   ← #301
+  //
+  // So `id:"Wenaka2004/comfyui-anima-ipadapter"` — the `author/repo` form this tool's
+  // OWN description tells callers to pass — was not rerouted here, dispatched with no
+  // channel, and then the panel's `channel || "dev"` put it straight back on `dev`. The
+  // fix reached the URL spelling and missed the documented shorthand.
+  const CASES: Array<[string, string]> = [
+    ["author/repo shorthand — the documented `id` form", "Wenaka2004/comfyui-anima-ipadapter"],
+    ["ssh:// URL", "ssh://git@github.com/Wenaka2004/comfyui-anima-ipadapter"],
+    ["git:// URL", "git://github.com/Wenaka2004/comfyui-anima-ipadapter"],
+  ];
+
+  for (const [label, spelling] of CASES) {
+    it(`sends a channel for a ${label}, passed as id`, () => {
+      const out = nodesInstallCommandArgs({ id: spelling });
+      expect(out.channel).toBe("default");
+      // Rerouted like any other git install: the URL travels as `repository`, never as
+      // an `id` the Manager would try to resolve verbatim.
+      expect(out.id).toBeUndefined();
+      expect(out.repository).toBeTruthy();
+    });
+
+    it(`sends a channel for a ${label}, passed as repository`, () => {
+      expect(nodesInstallCommandArgs({ repository: spelling }).channel).toBe("default");
+    });
+  }
+
+  it("expands author/repo to a clonable URL, as the panel does (#301)", () => {
+    // 3.x dialects put this value straight into Manager's `files` clone list, where the
+    // bare shorthand is not fetchable.
+    const out = nodesInstallCommandArgs({ id: "Wenaka2004/comfyui-anima-ipadapter" });
+    expect(out.repository).toBe(REPORTED_URL);
+  });
+
+  it("still rewrites 'latest' to nightly for these spellings", () => {
+    // The same predicate gates the #1254 rewrite. Leaving the shorthand out of it sent
+    // `selected_version:"latest"` for a from-source install — the failure that helper
+    // exists to prevent.
+    const out = nodesInstallCommandArgs({ id: "Wenaka2004/comfyui-anima-ipadapter", version: "latest" });
+    expect(out.version).toBe("nightly");
+  });
+
+  it("a plain registry id is STILL not a git install", () => {
+    // The shorthand test must not swallow the ordinary case: no slash, no reroute.
+    const out = nodesInstallCommandArgs({ id: "comfyui-kjnodes" });
+    expect(out.id).toBe("comfyui-kjnodes");
+    expect(out.repository).toBeUndefined();
+    expect(out.channel).toBeUndefined();
+  });
+
+  it("REACHES THE PANEL for the shorthand too, not just the args object", async () => {
+    const { sent } = await dispatchInstall({ id: "Wenaka2004/comfyui-anima-ipadapter" });
+    expect(sent.channel).toBe("default");
+    expect(sent.repository).toBe(REPORTED_URL);
+  });
+});
+
 describe("the channel it picked is DISCLOSED, never silent (#1539 review P1)", () => {
   // Review, correctly: with default and dev near-disjoint, NO single default is right,
   // so the 1207 dev-only packs are on the losing side of whichever one is chosen. The

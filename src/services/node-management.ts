@@ -4213,6 +4213,49 @@ function unregisteredPackEscapeHatch(): string {
   );
 }
 
+/**
+ * #1539 GATE ROUND 3 — THE ROUTING PREDICATE HAD TO MATCH THE PANEL'S, AND DID NOT.
+ *
+ * Whether this function reroutes decides the version rewrite, the channel, and every
+ * note attached to them — but the PANEL decides, independently, whether its own
+ * `buildInstallRequest` takes the git branch (and so whether `channel || "dev"` fires).
+ * When the two predicates disagree, the orchestrator sends a payload normalized for one
+ * route down the other one.
+ *
+ * They disagreed. `looksLikeGitUrl` above recognizes `https?://`, `git@`, `git+` and a
+ * `.git` suffix. The panel's recognizes those PLUS `ssh://`, `git://`, and a bare
+ * `author/repo` shorthand (#301) — and `author/repo` is the form this tool's own
+ * description tells callers to pass in `id`. So
+ * `panel_install_node({id:"Wenaka2004/comfyui-anima-ipadapter"})` — the reporter's own
+ * pack, in the documented spelling — fell through here with no channel, and the panel
+ * then routed it as git and asked `dev`. The channel fix reached the URL spelling and
+ * missed the shorthand.
+ *
+ * Mirrored here rather than by widening `looksLikeGitUrl`, which is shared with the
+ * HEADLESS `install_custom_node` clone path: widening it there would newly treat a
+ * slash-bearing registry id as a URL to clone, which is a different tool's behaviour and
+ * not this fix's business.
+ */
+function looksLikeOwnerRepoShorthand(s: string): boolean {
+  return /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(s);
+}
+
+/** Exactly the panel's `looksLikeGitUrl` (web/js/lib/manager-install.js). */
+function panelRoutesAsGitInstall(s: string): boolean {
+  return (
+    /^(https?|ssh|git):\/\//i.test(s) ||
+    /^git\+/i.test(s) ||
+    /^git@/i.test(s) ||
+    s.endsWith(".git") ||
+    looksLikeOwnerRepoShorthand(s)
+  );
+}
+
+/** Exactly the panel's `installGitUrl` expansion: a bare shorthand becomes clonable. */
+function panelGitInstallUrl(s: string): string {
+  return looksLikeOwnerRepoShorthand(s) ? `https://github.com/${s}` : s;
+}
+
 export function normalizeGitUrlInstallArgs(
   args: GitUrlInstallArgs,
 ): NormalizedGitUrlInstallArgs {
@@ -4225,13 +4268,16 @@ export function normalizeGitUrlInstallArgs(
         `git repository URL.`,
     };
   }
-  const gitTarget =
-    args.repository && looksLikeGitUrl(args.repository)
+  const gitSpelling =
+    args.repository && panelRoutesAsGitInstall(args.repository)
       ? args.repository
-      : args.id && looksLikeGitUrl(args.id)
+      : args.id && panelRoutesAsGitInstall(args.id)
         ? args.id
         : undefined;
-  if (!gitTarget) return {};
+  if (!gitSpelling) return {};
+  // Expanded the way the panel expands it, so `repository` is a fetchable URL on the
+  // 3.x dialects that put it straight into Manager's `files` clone list.
+  const gitTarget = panelGitInstallUrl(gitSpelling);
   const version = args.version?.trim();
   // The URL travels as `repository` ONLY: a URL that arrived as `id` is not
   // forwarded as both (routing off the id path is the whole point), and
