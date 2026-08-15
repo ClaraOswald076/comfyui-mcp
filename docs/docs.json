@@ -205,6 +205,206 @@
             ]
           }
         ]
+      },
+      {
+        "language": "ja",
+        "tabs": [
+          {
+            "tab": "ガイド",
+            "groups": [
+              {
+                "group": "はじめに",
+                "pages": [
+                  "ja/index",
+                  "ja/quickstart",
+                  "ja/installation",
+                  "ja/panel",
+                  "ja/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "zh",
+        "tabs": [
+          {
+            "tab": "指南",
+            "groups": [
+              {
+                "group": "入门",
+                "pages": [
+                  "zh/index",
+                  "zh/quickstart",
+                  "zh/installation",
+                  "zh/panel",
+                  "zh/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "fr",
+        "tabs": [
+          {
+            "tab": "Guides",
+            "groups": [
+              {
+                "group": "Démarrage",
+                "pages": [
+                  "fr/index",
+                  "fr/quickstart",
+                  "fr/installation",
+                  "fr/panel",
+                  "fr/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "es",
+        "tabs": [
+          {
+            "tab": "Guías",
+            "groups": [
+              {
+                "group": "Primeros pasos",
+                "pages": [
+                  "es/index",
+                  "es/quickstart",
+                  "es/installation",
+                  "es/panel",
+                  "es/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "zh-TW",
+        "tabs": [
+          {
+            "tab": "指南",
+            "groups": [
+              {
+                "group": "入門",
+                "pages": [
+                  "zh-TW/index",
+                  "zh-TW/quickstart",
+                  "zh-TW/installation",
+                  "zh-TW/panel",
+                  "zh-TW/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "ru",
+        "tabs": [
+          {
+            "tab": "Руководства",
+            "groups": [
+              {
+                "group": "Начало работы",
+                "pages": [
+                  "ru/index",
+                  "ru/quickstart",
+                  "ru/installation",
+                  "ru/panel",
+                  "ru/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "ar",
+        "tabs": [
+          {
+            "tab": "الأدلة",
+            "groups": [
+              {
+                "group": "البداية",
+                "pages": [
+                  "ar/index",
+                  "ar/quickstart",
+                  "ar/installation",
+                  "ar/panel",
+                  "ar/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "pt-BR",
+        "tabs": [
+          {
+            "tab": "Guias",
+            "groups": [
+              {
+                "group": "Primeiros passos",
+                "pages": [
+                  "pt-BR/index",
+                  "pt-BR/quickstart",
+                  "pt-BR/installation",
+                  "pt-BR/panel",
+                  "pt-BR/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "tr",
+        "tabs": [
+          {
+            "tab": "Kılavuzlar",
+            "groups": [
+              {
+                "group": "Başlangıç",
+                "pages": [
+                  "tr/index",
+                  "tr/quickstart",
+                  "tr/installation",
+                  "tr/panel",
+                  "tr/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "fa",
+        "tabs": [
+          {
+            "tab": "راهنماها",
+            "groups": [
+              {
+                "group": "شروع به کار",
+                "pages": [
+                  "fa/index",
+                  "fa/quickstart",
+                  "fa/installation",
+                  "fa/panel",
+                  "fa/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
       }
     ]
   },

@@ -1343,23 +1343,39 @@ export async function currentLiveModelsRoot(): Promise<string | undefined> {
  * into a verified answer.
  *
  * Saying "unconfirmed" without saying WHY leaves the user with nothing to act on.
- * There are exactly two reasons the live root stays unpinnable: the running server
- * reported a relative `main.py` with no working directory (so its own report is not
- * enough), and the OS process table could not be read to identify the process on our
- * port. The second is a TOOLING gap on POSIX — `lsof` is simply not installed on
- * many minimal images — and installing it converts this host into a verifiable one.
+ * The running server reported a relative `main.py` with no working directory, so its
+ * own report is not enough to pin the install, and the root had to come from
+ * somewhere it never named.
+ *
+ * #1587 — this used to assert a CONJUNCTION as the cause: "...AND the process
+ * listening on the ComfyUI port could not be identified". That second half is often
+ * FALSE. On ComfyUI Desktop the process is identified — the same session's
+ * `install_comfyui(action:"environment")` reports `python_probe_trusted:true` with a
+ * process-table PID — and the root is STILL unpinnable, because an interpreter's
+ * location is evidence of where the BINARY lives, not of where the server reads
+ * (see `modelsDirNamedByServer`, and the measured stale-portable-python shape in
+ * #1374). Telling that user their process could not be identified sends them to fix
+ * something that is not broken, and "make its process observable" is advice they
+ * have already followed.
+ *
+ * So the reasons are stated as ALTERNATIVES, and the `lsof` gap — real, and worth
+ * naming on POSIX — is offered as a possibility to check rather than as a finding.
  */
 function unverifiableDestinationRemedy(): string {
   const probe =
     platform() === "win32"
-      ? "the process listening on the ComfyUI port could not be identified"
-      : "the process listening on the ComfyUI port could not be identified (this needs `lsof`, " +
-        "which is missing on many minimal images — installing it makes future downloads verifiable)";
+      ? ""
+      : " If the process on that port could not be identified at all, that needs `lsof`, " +
+        "which is missing on many minimal images — installing it makes future downloads " +
+        "verifiable.";
   return (
-    "This happens when the running ComfyUI reports a RELATIVE main.py with no working " +
-    `directory AND ${probe}. To get a definite answer: point COMFYUI_PATH at the ComfyUI ` +
-    "that is actually running, launch it with an absolute --base-directory, or make its " +
-    "process observable. Meanwhile, confirm with list_local_models."
+    "This happens when the running ComfyUI names a RELATIVE main.py with no working " +
+    "directory, so its models root has to come from somewhere the server did not name — " +
+    "local configuration, or the install tree around the interpreter the OS reports for " +
+    "the process on that port (which locates the BINARY, not the models the server " +
+    `reads).${probe} To get a definite answer, NAME the root: point COMFYUI_PATH at the ` +
+    "ComfyUI that is actually running, or launch it with an absolute --base-directory. " +
+    "Meanwhile, confirm with list_local_models."
   );
 }
 
@@ -1388,6 +1404,21 @@ const LIVE_VISIBILITY_RETRY_MS = 1000;
  *  established. Three states, because "the server did not list it" and "the
  *  server could not be asked" are different facts (#796). */
 export type ManagerVisibility = "visible" | "not-listed" | "unknown";
+
+/**
+ * What the caller established about whether the connected server ALREADY listed
+ * this entry before the dispatch started. THREE states, and the third is
+ * load-bearing (#1374 review, P1-1).
+ *
+ * `false` is the only one that licenses crediting a later listing to THIS
+ * dispatch. `true` means a same-named file was already there. `"unknown"` means
+ * the baseline was never established — the name was not known up front, or the
+ * pre-dispatch listing could not be read — and that is NOT the same fact as
+ * "was not listed before". Spelling both as `undefined` is what let a
+ * PRE-EXISTING file answer "visible" for a dispatch that fetched nothing, which
+ * is the #369 trap wearing a Manager's clothes.
+ */
+export type ListedBeforeBaseline = boolean | "unknown";
 
 /**
  * Ask the CONNECTED server whether it now lists a model a Manager dispatch was
@@ -1419,7 +1450,11 @@ export async function verifyManagerVisibility(
   opts?: {
     attempts?: number;
     retryMs?: number;
-    listedBefore?: boolean;
+    /** Tri-state — see ListedBeforeBaseline. OMITTING it is NOT "it was not
+     *  there before": an absent baseline is an unknown one, and is treated
+     *  exactly like `"unknown"`. Only an explicit `false` licenses a `visible`
+     *  verdict. */
+    listedBefore?: ListedBeforeBaseline;
     /** The listing probe, injectable so this is testable without a live server.
      *  Defaults to liveListingHasEntry — which a test CANNOT intercept by mocking
      *  the module, because the call below resolves a module-local binding rather
@@ -1442,6 +1477,20 @@ export async function verifyManagerVisibility(
         `still be the older file. Compare the file size or hash on the server if that matters.`,
     };
   }
+  // #1374 review, P1-1 — AN UNKNOWN BASELINE IS NOT A NEGATIVE ONE.
+  //
+  // `listedBefore === false` is the ONLY answer that lets a listing seen now be
+  // credited to this dispatch. Anything else — an explicit `"unknown"`, or an
+  // omitted option — means nobody established what the server listed beforehand,
+  // so a hit here is equally consistent with a file that was always there. The
+  // previous shape checked only `=== true`, which folded "we could not find out"
+  // into "it was not there" and re-opened the #369 trap on the one route that
+  // had never had a guard against it.
+  //
+  // This is NOT short-circuited like the `true` case: a NEGATIVE answer is still
+  // worth reporting (and is the #1374 finding), and an unaskable server is still
+  // `unknown`. Only the POSITIVE direction is withheld.
+  const baselineIsNegative = opts?.listedBefore === false;
   const attempts = Math.max(1, opts?.attempts ?? LIVE_VISIBILITY_ATTEMPTS);
   const retryMs = opts?.retryMs ?? LIVE_VISIBILITY_RETRY_MS;
   let asked = false;
@@ -1451,6 +1500,16 @@ export async function verifyManagerVisibility(
       has = await probe(targetSubfolder, filename);
     } catch {
       has = undefined; // never throws outward — see the docblock
+    }
+    if (has === true && !baselineIsNegative) {
+      return {
+        visibility: "unknown",
+        note:
+          `The connected ComfyUI lists "${filename}" in ${targetSubfolder} now, but whether it ` +
+          `ALREADY listed that name before this dispatch was never established, so the listing ` +
+          `cannot be attributed to this download — it may be a pre-existing file of the same ` +
+          `name. Compare the file size or hash on the server if that matters.`,
+      };
     }
     if (has === true) {
       return {

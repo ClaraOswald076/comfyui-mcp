@@ -76,7 +76,14 @@ const slugify = (heading) =>
     .replace(/^#{1,6}\s+/, '')
     .trim()
     .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s-]/gu, '')
+    // \p{M} — COMBINING MARKS — are kept. They are not decoration: in Arabic, Hebrew, and the
+    // Indic scripts a mark is part of the word. Dropping them is a Latin-centric assumption,
+    // and it fired the moment a non-Latin locale arrived: the Arabic heading
+    // "3. تشغيل منسّق اللوحة" contains a shadda (U+0651, category Mn), so this slugified to
+    // ...منسق while the link written beside it kept the mark, and the gate reported a correct
+    // cross-page anchor as broken. Excluding marks here would have pushed a translator to
+    // "fix" the prose instead.
+    .replace(/[^\p{L}\p{N}\p{M}\s-]/gu, '')
     // Each space becomes its own hyphen — runs are NOT collapsed. "readiness & onboarding"
     // loses the ampersand and keeps both surrounding spaces, so Mintlify emits
     // `readiness--onboarding` with two hyphens. Collapsing here reported two correct,
@@ -160,7 +167,55 @@ for (const loc of locales) {
         fail(loc, slug, `relative link "${href}" — use an absolute /docs/... path from a locale directory`);
         continue;
       }
-      const target = rawTarget.replace(/^\/docs\//, '').replace(/^\//, '').replace(/\/$/, '');
+      // A DOUBLED prefix is the one link form that genuinely 404s, and the normalization below
+// would hide it: `/docs/docs/backends` strips to `docs/backends`, which resolves on disk.
+      // Measured on the live site: /docs/backends and /backends both render the real page;
+      // /docs/docs/backends returns the same shell as a nonsense URL. Two review agents reached
+      // OPPOSITE conclusions about the prefix by reasoning from repo conventions, which is why
+      // this is pinned to an observation rather than an argument.
+      // `(\/|$)` — the trailing-slash-only form let the bare `/docs/docs` through, which is
+      // the same 404 without a suffix.
+      if (/^\/docs\/docs(\/|$)/.test(rawTarget)) {
+        fail(loc, slug, `link "${href}" doubles the /docs prefix — it 404s; use "/docs/..." once`);
+        continue;
+      }
+      // ONE form, enforced. Both `/docs/backends` and `/backends` render the real page, so
+      // this is not correctness — it is anti-churn. With ko/fr at 36 prefixed links and
+      // ja/zh/es at 30 prefixed + 6 bare, a review agent inside any single file could justify
+      // "fixing" it either direction, and one did: it stripped the prefix from zh/installation
+      // to match ja, arguing from repo conventions that the prefix was invented. It is not.
+      // Pinning the form removes the ambiguity that made the rewrite look correct.
+      // Only DOC PAGES. A root-absolute path with a file extension is a site asset or a
+      // well-known file — /robots.txt, /sitemap.xml, /favicon.svg — and prefixing those with
+      // /docs turns a working link into a 404. Rewriting a correct link to satisfy a gate is
+      // the worst outcome available here, so the rule is scoped to extensionless paths.
+      // Any extension length (`/site.webmanifest` is 12), and any underscore-prefixed route
+      // (`/_next/...`) — the earlier `/_/` alternative only matched a literal single underscore
+      // segment, which is not a thing. Getting this wrong tells an author to rewrite a working
+      // asset link into a 404, so it errs toward exempting.
+      const looksLikeAsset =
+        /\.[a-z0-9]+$/i.test(rawTarget) || /^\/(api|assets|static|_[a-z0-9-]*)\//i.test(rawTarget);
+      // `(?!docs\/)` alone rejected the bare `/docs` link — the lookahead wants a slash after
+      // "docs", which the docs root does not have — so a correct link to the docs home was
+      // reported as missing the prefix it already is.
+      const alreadyPrefixed = /^\/docs(\/|$)/.test(rawTarget);
+      const isSiteAsset = /^\/(images|logo)\//.test(rawTarget);
+      if (!looksLikeAsset && !alreadyPrefixed && !isSiteAsset && /^\/[a-z]/.test(rawTarget)) {
+        fail(
+          loc,
+          slug,
+          `link "${href}" is missing the /docs prefix — localized pages use "/docs/..." ` +
+            `everywhere (both forms resolve; we pin one so agents stop rewriting each other)`,
+        );
+        continue;
+      }
+      // `/docs` (no trailing slash) is the docs ROOT, not a page called "docs". Stripping only
+      // `/docs/` left the bare form as the slug "docs", which resolves to no file and was
+      // reported as a broken link — a correct docs-home link failing the gate.
+      const target = rawTarget
+        .replace(/^\/docs(\/|$)/, '')
+        .replace(/^\//, '')
+        .replace(/\/$/, '');
       if (!target) continue;
       const isLocal = target.startsWith(`${loc}/`);
       const bare = isLocal ? target.slice(loc.length + 1) : target;
