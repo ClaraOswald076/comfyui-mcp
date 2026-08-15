@@ -613,6 +613,39 @@ describe('list_packs action:"list_templates" — panel fallback', () => {
     expect(body).not.toContain("the ComfyUI a connected sidebar panel is on");
   });
 
+  it("never asserts where the panel is, on ANY fallback outcome", async () => {
+    // The success path is not the only place the claim was made. The
+    // secondary-failure and redirect-refusal messages carried the same sentence,
+    // and fixing one wording while two survive is how a corrected message gets
+    // re-quoted later as though it were current. All three, in one sweep.
+    const RETIRED = "the ComfyUI a connected sidebar panel is on";
+    const outcomes: Array<[string, (url: string) => Promise<Response>]> = [
+      ["success", async (url) => (url === CONFIGURED ? Promise.reject(transportFailure()) : jsonResponse({ a: [] }))],
+      ["fallback also unreachable", async () => Promise.reject(transportFailure())],
+      [
+        "fallback redirects",
+        async (url) =>
+          url === CONFIGURED
+            ? Promise.reject(transportFailure())
+            : new Response("", { status: 302, headers: { location: "http://elsewhere/" } }),
+      ],
+      [
+        "fallback non-2xx",
+        async (url) =>
+          url === CONFIGURED ? Promise.reject(transportFailure()) : jsonResponse({ e: 1 }, 404),
+      ],
+    ];
+    for (const [label, impl] of outcomes) {
+      setConnectedPanelOrigins(() => [PANEL_ORIGIN]);
+      stubFetch(impl);
+      const body = textOf(await handler()({ action: "list_templates" }));
+      expect(body, `outcome: ${label}`).not.toContain(RETIRED);
+      // …and each still names the origin it actually dealt with, so the phrase is
+      // gone because the claim was corrected, not because the text was dropped.
+      expect(body, `outcome: ${label}`).toContain(PANEL_ORIGIN);
+    }
+  });
+
   it("DISCLOSES how old the origin evidence was, reading it off the channel record", async () => {
     const dir = mkdtempSync(join(tmpdir(), "panel-origins-age-"));
     try {

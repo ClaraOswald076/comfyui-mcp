@@ -540,9 +540,9 @@ function panelFallbackNote(
   if (!origin) return "";
   return (
     ` NOTE: that address is NOT your configured ComfyUI — ${configuredUrl} could not be reached ` +
-    `at all, so this request went to ${origin}, an origin published as a connected sidebar ` +
-    `panel's${observedAgo(ageMs)}. The status above came from ${origin} and describes THAT ` +
-    `server. It does not establish that a panel is on it now.`
+    `at all, so this request went to ${origin}, published${observedAgo(ageMs)} as the origin of a ` +
+    `connected sidebar panel. The status above came from ${origin} and describes THAT server. ` +
+    `It does not establish that a panel is on it now.`
   );
 }
 
@@ -660,8 +660,9 @@ async function fetchTemplateIndexViaPanel(
   } catch (err) {
     const secondary = describeFetchFailure(err).message;
     throw new Error(
-      `${primary} I then tried the ComfyUI a connected sidebar panel is on (${altUrl}), and that ` +
-        `failed too: ${secondary}. The browser can reach that origin — this process cannot — so ` +
+      `${primary} I then tried ${altUrl}, published${observedAgo(snapshot.ageMs)} as the origin ` +
+        `of a connected sidebar panel, and that failed too: ${secondary}. A browser was connected ` +
+        `from that origin, so it was reachable from there while this process cannot reach it: ` +
         `something between them (a tunnel, a container boundary, or a server bound to one ` +
         `interface) is in the way, and no address here will fix it.`,
       { cause: err },
@@ -681,8 +682,8 @@ async function fetchTemplateIndexViaPanel(
   if (res.status >= 300 && res.status < 400) {
     const location = res.headers.get("location");
     throw new Error(
-      `${primary} I then tried the ComfyUI a connected sidebar panel is on (${altUrl}), and it ` +
-        `answered ${res.status} — a REDIRECT, which was NOT followed` +
+      `${primary} I then tried ${altUrl}, published${observedAgo(snapshot.ageMs)} as the origin ` +
+        `of a connected sidebar panel, and it answered ${res.status}: a REDIRECT, which was NOT followed` +
         (location ? ` (to ${location})` : "") +
         `. That origin came from a browser handshake rather than from your configuration, so ` +
         `following it could send this request to any host the redirect names and report the ` +
@@ -819,7 +820,8 @@ async function listWorkflowTemplatesAction(): Promise<ToolText> {
                   answered_by_note:
                     `The configured ComfyUI (${configuredUrl}) could not be reached, so this index ` +
                     `came from ${answeredByPanelOrigin}, which ANSWERED this request. That address ` +
-                    `was published as a connected sidebar panel's origin${observedAgo(panelOriginAgeMs)}; ` +
+                    `was published${observedAgo(panelOriginAgeMs)} as the origin of a connected ` +
+                    `sidebar panel; ` +
                     `it is not a live reading of where a panel is now, and one may since have moved ` +
                     `to a different ComfyUI. What is established is that ${answeredByPanelOrigin} ` +
                     `served this index — it describes THAT server, not the configured one. If it is ` +
