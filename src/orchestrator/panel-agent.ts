@@ -710,10 +710,12 @@ export class PanelAgent {
       const correlationIsUntrusted =
         ev.run_correlation === "foreign" || ev.run_correlation === "unidentified";
       // Bound the SAME list that becomes the attachment. An entry with no
-      // filename was never attachable (it has been filtered out below since long
-      // before this bound existed), so counting it would make the new sentence
-      // claim a number of pixels the turn does not carry and blame the bound for
-      // a drop it did not cause.
+      // filename has never been attachable — this filter used to sit down at the
+      // `images =` assignment, long before any bound existed — so counting one
+      // here would make the sentence below claim a number of pixels the turn does
+      // not carry, and blame the bound for a drop it did not cause. `filename:
+      // string` is the TYPE; the payload arrives over the wire, which is why
+      // `names` still needs its own "(unnamed)" fallback.
       const attachableImgs = imgs.filter((i) => i.filename);
       const attachedImgs = correlationIsUntrusted
         ? []
