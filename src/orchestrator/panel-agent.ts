@@ -111,11 +111,20 @@ function runIdentityPreamble(ev: {
 const TURN_IDLE_MS = Number(process.env.COMFYUI_MCP_TURN_IDLE_MS) || 210_000;
 
 /** Automatic render previews are context, not the user's explicit attachment
- * request. Keep one completion from turning into an unbounded multimodal turn
- * (a seven-way comparison can expose dozens of PreviewImage outputs). The panel
+ * request. Keep them from turning a turn into an unbounded multimodal one (a
+ * seven-way comparison can expose dozens of PreviewImage outputs). The panel
  * already shows every output; the agent only needs a representative bounded set.
  * Foreign/unidentified completions get no pixels at all because their own
- * correlation preamble forbids the agent from treating them as its awaited run. */
+ * correlation preamble forbids the agent from treating them as its awaited run.
+ *
+ * PER TURN, NOT PER EVENT — and that distinction is the whole budget. channel()
+ * drains the WHOLE queue into one turn and flatMaps the attachments, so a
+ * per-event cap of 8 delivers 8N for N completions that land while the agent is
+ * busy. Measured before this was fixed: four matched completions queued during
+ * one turn put 32 images on the next one, which is exactly #1516's compounding
+ * shape. Enforced in two places on purpose — injectEvent spends the remaining
+ * budget so each notice can state a true count, and the drain caps the assembled
+ * batch so no requeue path can route around it. */
 const MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS = 8;
 
 /** Longest a single tool call may hold the idle watchdog off before it's treated
@@ -637,6 +646,18 @@ export class PanelAgent {
     return true;
   }
 
+  /** How many AUTOMATIC preview images are already queued for the next turn.
+   *
+   *  Keyed on `completionOnly`, which marks an injected panel event, so a user's
+   *  explicit attachment never spends the preview budget — #1516 asks for those
+   *  to have their own reviewed policy rather than sharing this one implicitly. */
+  private queuedPreviewImageCount(): number {
+    return this.queue.reduce(
+      (n, it) => n + (it.completionOnly ? (it.images?.length ?? 0) : 0),
+      0,
+    );
+  }
+
   /** Drop a still-queued message (the user cancelled/edited it before the agent
    *  got to it). Returns true if it was found and removed; false if it was
    *  already dequeued (the turn started — too late to cancel). */
@@ -717,10 +738,34 @@ export class PanelAgent {
       // string` is the TYPE; the payload arrives over the wire, which is why
       // `names` still needs its own "(unnamed)" fallback.
       const attachableImgs = imgs.filter((i) => i.filename);
+      // Spend what is LEFT of this turn's budget, not a fresh 8. Everything
+      // already queued is drained into the same turn as this event, so a per-
+      // event cap is not a cap at all. Synchronous from here to `queue.push`
+      // below — nothing can drain in between — so this count is the batch this
+      // event is actually joining.
+      const previewBudgetLeft = Math.max(
+        0,
+        MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS - this.queuedPreviewImageCount(),
+      );
       const attachedImgs = correlationIsUntrusted
         ? []
-        : attachableImgs.slice(0, MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS);
+        : attachableImgs.slice(0, previewBudgetLeft);
       const omittedImgs = attachableImgs.length - attachedImgs.length;
+      // What the agent is NOT being shown, in coordinates it can actually call
+      // get_image with. `names` is filenames only and a `note` replaces it
+      // outright, so neither can carry a withheld PreviewImage that lives in
+      // `temp` or a subfolder — get_image would default to type "output" and
+      // miss it. Withholding pixels is only honest if the pointer works.
+      const withheldImgs = correlationIsUntrusted
+        ? attachableImgs
+        : attachableImgs.slice(attachedImgs.length);
+      const withheldRefs = withheldImgs
+        .map((i) => {
+          const type = i.type ?? "output";
+          const sub = i.subfolder ? `, subfolder:"${i.subfolder}"` : "";
+          return type === "output" && !i.subfolder ? i.filename : `${i.filename} (type:"${type}"${sub})`;
+        })
+        .join(", ");
       const names = imgs.map((i) => i.filename).filter(Boolean).join(", ") || "(unnamed)";
       // A custom `note` (e.g. the panel's video-storyboard summary) replaces the
       // default image-acknowledgement wording so the agent is told accurately
@@ -752,18 +797,33 @@ export class PanelAgent {
         // e.g. a video that produced no storyboard — has none), and only when this
         // backend can actually see them — a text-only backend told "attached below"
         // would confabulate having viewed the render.
-        // A withheld or bounded-away output is still NAMED in this same event, so
-        // name a reader that can turn one of those names back into pixels (#1516).
-        // Deliberately not "nothing was lost": preview outputs live in ComfyUI's
-        // temp folder and a restart clears it, so the honest claim is that a fetch
-        // is the way to look — not that the fetch is guaranteed to succeed.
+        // Withheld pixels are disclosed WITH their coordinates, so the remedy is
+        // callable rather than reassuring (#1516). Deliberately not "nothing was
+        // lost": preview outputs live in ComfyUI's temp folder and a restart
+        // clears it, so the honest claim is that a fetch is the way to look — not
+        // that the fetch is guaranteed to succeed.
         (imgs.length
           ? this.backend.capabilities.vision
             ? correlationIsUntrusted
-              ? `The outputs are already shown to the user in the panel, but their pixels are NOT attached to this agent turn because the run's origin is UNDETERMINED. Use get_image if you need to look at one. `
-              : omittedImgs > 0
-                ? `The first ${attachedImgs.length} image(s) are attached below; all ${imgs.length} outputs are already shown to the user in the panel. ${omittedImgs} further preview(s) were omitted from this agent turn to keep its image context bounded — use get_image if you need to see one of those. `
-                : `The image(s) are attached below and already shown to the user in the panel. `
+              ? // An UNDETERMINED run can also arrive with no usable filename —
+                // this is the id-less case, so that pairing is ordinary, not
+                // exotic. Offering "fetch it with get_image:" followed by an
+                // empty list would be the exact false remedy this branch exists
+                // to avoid.
+                withheldRefs
+                ? `The outputs are already shown to the user in the panel, but their pixels are NOT attached to this agent turn because the run's origin is UNDETERMINED. Fetch one with get_image action:"get" if you need to look: ${withheldRefs}. `
+                : `The outputs are already shown to the user in the panel, but their pixels are NOT attached to this agent turn because the run's origin is UNDETERMINED — and the panel reported no usable filename for them, so they cannot be fetched by name either. Check get_history (action:"list") if you need to know what ran. `
+              : // Nothing had a usable filename, so nothing COULD be attached —
+                // and there are no coordinates to offer either. Say that rather
+                // than the default "attached below", which would promise pixels
+                // this turn does not carry.
+                attachableImgs.length === 0
+                ? `The panel reported no usable filename for ${imgs.length === 1 ? "it" : "them"}, so ${imgs.length === 1 ? "it is" : "they are"} NOT attached to this agent turn and cannot be fetched by name — check get_history (action:"list") if you need to see what this run produced. `
+                : attachedImgs.length === 0
+                  ? `NONE of these outputs are attached to this agent turn: earlier completion(s) in this same turn already spent its ${MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS}-image preview budget. All ${imgs.length} are shown to the user in the panel — fetch one with get_image action:"get" if you need to look: ${withheldRefs}. `
+                  : omittedImgs > 0
+                    ? `The first ${attachedImgs.length} image(s) are attached below; all ${imgs.length} outputs are already shown to the user in the panel. ${omittedImgs} further preview(s) were omitted to keep this TURN's image context bounded — fetch one with get_image action:"get" if you need it: ${withheldRefs}. `
+                    : `The image(s) are attached below and already shown to the user in the panel. `
             : `You cannot view images on this provider, but they are already shown to the user in the panel. `
           : ``) +
         // #977 — this used to be a FIXED "you do NOT need to call any tools",
@@ -1265,7 +1325,42 @@ export class PanelAgent {
       // Coerce each part before joining: a structured payload that slipped past
       // ingress would otherwise stringify to "[object Object]" here (#175).
       let text = batch.map((it) => promptText(it.text)).join("\n\n");
-      let images = batch.flatMap((it) => it.images ?? []);
+      // #1516 — THE PER-TURN CEILING ON AUTOMATIC PREVIEWS, and the reason it
+      // lives here rather than only at injectEvent: this line is where N
+      // completions become ONE turn. A per-event cap of 8 measured 32 images on
+      // one turn for four queued completions. injectEvent spends the remaining
+      // budget so each notice can state a true count; this is the seam every
+      // path crosses, including an interrupt that requeues an already-budgeted
+      // batch alongside a fresh one. A user's own attachment is never touched —
+      // only `completionOnly` items, which are the injected panel events.
+      let previewBudget = MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS;
+      let previewsDropped = 0;
+      let images = batch.flatMap((it) => {
+        const refs = it.images ?? [];
+        if (!it.completionOnly) return refs;
+        const take = refs.slice(0, Math.max(0, previewBudget));
+        previewBudget -= take.length;
+        previewsDropped += refs.length - take.length;
+        return take;
+      });
+      // Reaching here means injectEvent's budget did NOT already hold the queue
+      // under the ceiling — something queued a completionOnly item without
+      // spending it. I could not construct such a path: across a burst landing on
+      // a busy agent and an interrupt that requeues a budgeted batch beside a
+      // fresh one, this trim never fired with the inject-time budget in place,
+      // and held the turn at 8 with it disabled. That is two scenarios, not a
+      // proof, which is exactly why the ceiling stays here. It is deliberately
+      // NOT disclosed to the agent: a paragraph I cannot reach is a paragraph I
+      // cannot test, and an untested claim about what the turn carries is the
+      // defect this whole change is about. A shortfall here is OUR bug, so it
+      // goes where we read our bugs.
+      if (previewsDropped > 0) {
+        logger.warn(
+          `[panel-agent ${this.short()}] ${previewsDropped} automatic preview image(s) were trimmed at the drain — ` +
+            `a completionOnly item reached the queue without spending the per-turn budget, so a notice in this turn ` +
+            `may claim an attachment the turn does not carry (#1516)`,
+        );
+      }
       // Deduped across the BATCH, not just within one message: two queued
       // messages that each carried the same file become one turn here, and the
       // duplicate would spend a second of the turn's two audio slots on bytes

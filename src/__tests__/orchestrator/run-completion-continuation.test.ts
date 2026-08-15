@@ -43,6 +43,9 @@ beforeAll(async () => {
 
 const PROMPT_A = "246da5fc-a6b4-4e85-bbd5-5f2463a757a0";
 const PROMPT_B = "5bc36c41-fe83-481f-8a71-b9dd1c3b05a4";
+// #1516 — a sweep queues several runs, and their completions share one turn.
+const PROMPT_C = "9f1e2d3c-4b5a-6978-8c7d-0e1f2a3b4c5d";
+const PROMPT_D = "11112222-3333-4444-5555-666677778888";
 
 async function waitFor(cond: () => boolean, timeoutMs = 2000): Promise<void> {
   const start = Date.now();
@@ -474,6 +477,146 @@ describe("run completion across automatic goal continuation (#468)", () => {
     expect(backend.turnImages[2]).toEqual([]); // …but no pixels ride the replay.
   });
 
+  it("#1516: the preview budget is PER TURN — N completions sharing a turn do not deliver 8N", async () => {
+    // The defect a per-event cap hides. channel() drains the WHOLE queue into one
+    // turn and flatMaps the attachments, so four completions that land while the
+    // agent is busy each passed their own 8-image budget and the turn carried 32
+    // — measured at 32 before the budget moved per-turn, which is #1516's
+    // compounding shape rather than a hypothetical.
+    const backend = new ContinuationBackend();
+    const { journal, manager, arrive } = makeHarness(backend);
+    const tab = "tab-shared-turn";
+    const prompts = [PROMPT_A, PROMPT_B, PROMPT_C, PROMPT_D];
+
+    for (const p of prompts) journal.openRun(p, { tabId: tab });
+    manager.send(tab, "run the sweep");
+    await waitFor(() => backend.turns.length >= 1);
+
+    // All four finish WHILE the agent is inside turn 1, so all four queue up.
+    for (const p of prompts) {
+      arrive(tab, {
+        kind: "executed",
+        prompt_id: p,
+        images: Array.from({ length: 28 }, (_, i) => ({ filename: `${p.slice(0, 4)}_${i}.png` })),
+      });
+    }
+    expect(backend.turns.length).toBe(1); // still busy — nothing delivered yet
+
+    backend.finishTurn();
+    await waitFor(() => backend.turns.length >= 2);
+
+    // ONE budget for the turn, not one per completion.
+    expect(backend.turnImages[1]).toHaveLength(8);
+    // …and the completions that got nothing say so, instead of inheriting the
+    // first one's "attached below".
+    expect(backend.turns[1]).toContain("NONE of these outputs are attached");
+    expect(backend.turns[1]).toContain("already spent its 8-image preview budget");
+
+    // An interrupt that REQUEUES the batch cannot route around it either: the
+    // requeued items are back on the queue, so the next arrivals see them.
+    await manager.interrupt(tab, { requeueInFlight: true });
+    for (const p of prompts) {
+      journal.openRun(`${p}-b`, { tabId: tab });
+      arrive(tab, {
+        kind: "executed",
+        prompt_id: `${p}-b`,
+        images: Array.from({ length: 28 }, (_, i) => ({ filename: `${p.slice(0, 4)}b_${i}.png` })),
+      });
+    }
+    await waitFor(() => backend.turns.length >= 3);
+    expect(backend.turnImages[2].length).toBeLessThanOrEqual(8);
+  });
+
+  it("#1516: a withheld preview is named with coordinates get_image can actually use", async () => {
+    // The remedy has to be callable. get_image action:"get" takes a FILENAME and
+    // defaults `type` to "output" — but a PreviewImage output lives in `temp`, and
+    // the event's own name list carries filenames only. Worse, a custom `note`
+    // (the panel's video-storyboard summary) replaces that list outright, so a
+    // withheld output would be named nowhere at all.
+    const backend = new ContinuationBackend();
+    const { journal, manager, arrive } = makeHarness(backend);
+    const tab = "tab-coordinates";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "go");
+    await waitFor(() => backend.turns.length >= 1);
+    backend.finishTurn();
+
+    // Foreign → every pixel withheld, and a note that suppresses the name list.
+    arrive(tab, {
+      kind: "executed",
+      prompt_id: PROMPT_B,
+      note: "A 3-second video was rendered; this is its storyboard.",
+      images: [
+        { filename: "preview_a.png", type: "temp" },
+        { filename: "preview_b.png", type: "temp", subfolder: "clips" },
+        { filename: "final_c.png" },
+      ],
+    });
+    await waitFor(() => backend.turns.length >= 2);
+
+    const text = backend.turns[1];
+    expect(backend.turnImages[1]).toEqual([]); // pixels withheld…
+    expect(text).toContain("storyboard"); // the panel's note still replaces the default wording
+    // …and each withheld output is still reachable: the temp ones carry the type
+    // (get_image would otherwise look in output/ and miss them) and the nested
+    // one carries its subfolder.
+    expect(text).toContain('preview_a.png (type:"temp")');
+    expect(text).toContain('preview_b.png (type:"temp", subfolder:"clips")');
+    expect(text).toContain("final_c.png"); // plain output needs no coordinates
+    expect(text).toContain('get_image action:"get"');
+  });
+
+  it("#1516: a completion whose outputs have no usable filename promises nothing", async () => {
+    // attachedImgs is empty here for a reason that is NOT the budget, and the
+    // old wording said "The image(s) are attached below" while attaching none.
+    const backend = new ContinuationBackend();
+    const { journal, manager, arrive } = makeHarness(backend);
+    const tab = "tab-unnamed";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "go");
+    await waitFor(() => backend.turns.length >= 1);
+    backend.finishTurn();
+
+    arrive(tab, {
+      kind: "executed",
+      prompt_id: PROMPT_A,
+      images: [{ filename: "" }, { filename: "" }],
+    });
+    await waitFor(() => backend.turns.length >= 2);
+
+    const text = backend.turns[1];
+    expect(backend.turnImages[1]).toEqual([]);
+    expect(text).not.toContain("attached below");
+    expect(text).toContain("no usable filename");
+    expect(text).toContain("get_history"); // the only reader left when there is no name
+    // …and it must never offer get_image with an empty list after the colon.
+    expect(text).not.toMatch(/get_image action:"get"[^.]*:\s*\./);
+  });
+
+  it("#1516: an UNDETERMINED run with no usable filename offers no empty remedy either", async () => {
+    // The id-less case is exactly where "unidentified" and "no filename" meet, so
+    // the withheld-coordinates sentence must not degrade to a dangling colon.
+    const backend = new ContinuationBackend();
+    const { journal, manager, arrive } = makeHarness(backend);
+    const tab = "tab-unnamed-foreign";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "go");
+    await waitFor(() => backend.turns.length >= 1);
+    backend.finishTurn();
+
+    arrive(tab, { kind: "executed", images: [{ filename: "" }] }); // no id, no name
+    await waitFor(() => backend.turns.length >= 2);
+
+    const text = backend.turns[1];
+    expect(text).toContain("UNDETERMINED");
+    expect(text).toContain("cannot be fetched by name");
+    expect(text).not.toMatch(/get_image action:"get"[^.]*:\s*\./);
+    expect(backend.turnImages[1]).toEqual([]);
+  });
+
   it("#1516: the bound sits on the route a real panel completion travels", async () => {
     // makeHarness MIRRORS index.ts. A mirror can show the bound works; it can
     // never show the orchestrator still uses the route it mirrors — and a bound
@@ -518,6 +661,15 @@ describe("run completion across automatic goal continuation (#468)", () => {
     const injectBody = agent.slice(injectAt, injectEnd);
     expect(injectBody).toContain("MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS");
     expect(injectBody).toMatch(/images = attachedImgs/);
+    // …and the ceiling also sits at the seam where N completions become ONE
+    // turn, which is the only place a per-event budget cannot reach.
+    const channelAt = agent.indexOf("private async *channel(");
+    expect(channelAt).toBeGreaterThan(-1);
+    const channelEnd = agent.indexOf("\n  }\n", channelAt);
+    expect(channelEnd).toBeGreaterThan(channelAt);
+    const channelBody = agent.slice(channelAt, channelEnd);
+    expect(channelBody).toContain("MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS");
+    expect(channelBody).toMatch(/it\.completionOnly/);
   });
 
   it("a completion parked in HELD mail survives a reset that discards that mail", async () => {
