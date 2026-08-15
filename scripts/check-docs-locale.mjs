@@ -187,7 +187,12 @@ for (const loc of locales) {
       // well-known file — /robots.txt, /sitemap.xml, /favicon.svg — and prefixing those with
       // /docs turns a working link into a 404. Rewriting a correct link to satisfy a gate is
       // the worst outcome available here, so the rule is scoped to extensionless paths.
-      const looksLikeAsset = /\.[a-z0-9]{2,5}$/i.test(rawTarget) || /^\/(api|_|assets)\//.test(rawTarget);
+      // Any extension length (`/site.webmanifest` is 12), and any underscore-prefixed route
+      // (`/_next/...`) — the earlier `/_/` alternative only matched a literal single underscore
+      // segment, which is not a thing. Getting this wrong tells an author to rewrite a working
+      // asset link into a 404, so it errs toward exempting.
+      const looksLikeAsset =
+        /\.[a-z0-9]+$/i.test(rawTarget) || /^\/(api|assets|static|_[a-z0-9-]*)\//i.test(rawTarget);
       if (!looksLikeAsset && /^\/(?!docs\/)(?!images\/)(?!logo\/)[a-z]/.test(rawTarget)) {
         fail(
           loc,

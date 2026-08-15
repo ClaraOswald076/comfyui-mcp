@@ -53,7 +53,7 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   const documentsAPack =
     // Dots are legal in pack names (ltx-2.3-txt2vid) — see check-blog-staleness for the same fix.
     [...src.matchAll(/packs\/([a-z0-9][a-z0-9.-]*[a-z0-9])/gi)].some((m) => packNames.has(m[1])) ||
-    [...src.matchAll(/`([a-z0-9][a-z0-9-]*)`\s+pack/gi)].some((m) => packNames.has(m[1]));
+    [...src.matchAll(/`([a-z0-9][a-z0-9.-]*[a-z0-9])`\s+pack/gi)].some((m) => packNames.has(m[1]));
   if (!documentsAPack) continue;
 
   checked++;

@@ -89,16 +89,27 @@ function lastChanged(rel) {
 }
 
 if (isShallowClone()) {
-  console.log(
-    'skipped: shallow clone — git cannot say when a pack last changed, and guessing here ' +
-      'reports every stamped post as stale. Re-run with full history (`git fetch --unshallow`).',
-  );
+  const msg =
+    'shallow clone — git cannot say when a pack last changed, and guessing here reports ' +
+    'every stamped post as stale.';
+  // Report mode skips. GATE mode FAILS: exiting 0 here means a checkout-depth regression
+  // silently disables the gate while still printing a reassuring line, which is the exact
+  // shape of "looks like coverage, checks nothing".
+  if (CHECK) {
+    console.error(
+      `cannot run: ${msg} Fetch full history in CI (actions/checkout fetch-depth: 0) or run ` +
+        'without --check for a report.',
+    );
+    process.exit(1);
+  }
+  console.log(`skipped: ${msg} Re-run with full history (\`git fetch --unshallow\`).`);
   process.exit(0);
 }
 
 const stale = [];
 const unverified = [];
 const unreadable = [];
+const invalid = [];
 let ok = 0;
 
 for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
@@ -112,7 +123,7 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   for (const m of src.matchAll(/packs\/([a-z0-9][a-z0-9.-]*[a-z0-9])/gi)) {
     if (packNames.has(m[1])) named.add(m[1]);
   }
-  for (const m of src.matchAll(/`([a-z0-9][a-z0-9-]*)`\s+pack/gi)) {
+  for (const m of src.matchAll(/`([a-z0-9][a-z0-9.-]*[a-z0-9])`\s+pack/gi)) {
     if (packNames.has(m[1])) named.add(m[1]);
   }
   if (!named.size) continue; // nothing pack-shaped to go stale against
@@ -124,6 +135,20 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   const stamp = fm?.[1].match(/^verified:\s*(\d{4}-\d{2}-\d{2})\s*$/m)?.[1];
   if (!stamp) {
     unverified.push([file, [...named]]);
+    continue;
+  }
+  // The shape check alone is not enough: `9999-99-99` matches it, is not a date, and sorts
+  // after every real git date — so it would suppress this gate on that post permanently. A
+  // FUTURE date does the same thing more plausibly. Both are rejected as invalid rather than
+  // trusted, because the whole mechanism rests on the stamp meaning "somebody looked, then".
+  const asDate = new Date(`${stamp}T00:00:00Z`);
+  const today = new Date().toISOString().slice(0, 10);
+  if (Number.isNaN(asDate.getTime()) || asDate.toISOString().slice(0, 10) !== stamp) {
+    invalid.push([file, stamp, 'not a real calendar date']);
+    continue;
+  }
+  if (stamp > today) {
+    invalid.push([file, stamp, `in the future (today is ${today})`]);
     continue;
   }
 
@@ -150,6 +175,9 @@ for (const [file, named] of unverified) {
   console.error(`  ? blog/${file}: no \`verified:\` stamp (documents ${named.join(', ')})`);
 }
 
+for (const [file, stamp, why] of invalid) {
+  console.error(`  ✗ blog/${file}: \`verified: ${stamp}\` is ${why} — a stamp that cannot be earned suppresses this gate forever`);
+}
 for (const u of unreadable) {
   console.error(`  ! ${u}: git could not report when this pack last changed`);
 }
@@ -170,7 +198,7 @@ console.log(
  * manufactures exactly the false assurance the stamp exists to prevent. So it stays loud and
  * non-blocking, and shrinks as posts are genuinely verified.
  */
-if (CHECK && (stale.length || unreadable.length)) {
+if (CHECK && (stale.length || unreadable.length || invalid.length)) {
   console.error(
     `\nRe-read the post against the pack, fix what moved, then bump \`verified:\` to today. ` +
       `Bump it only after actually checking — a stamp nobody earned is worse than no stamp.`,

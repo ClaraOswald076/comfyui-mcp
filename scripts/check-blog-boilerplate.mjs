@@ -63,6 +63,15 @@ if (canonical.length < 40) {
  * rewrites. The retired-claim check below still applies to every post regardless.
  */
 const MARKER = /sign in with `claude` once/;
+/**
+ * Exact expected carrier count — not a loose floor.
+ *
+ * First attempt used 10 as a safety margin, and mutation-testing immediately showed why that
+ * is useless: editing one post's marker dropped the count to 10, still passed, and the post
+ * silently left coverage — the precise failure the floor was added to catch. A margin only
+ * hides the first defection. Bump this deliberately when a post joins or leaves.
+ */
+const EXPECTED_CARRIERS = 11;
 /** Claims this step must never make again, with why. */
 const RETIRED = [
   {
@@ -100,8 +109,11 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   const src = fs.readFileSync(path.join(BLOG, file), 'utf8');
   const f = flat(src);
 
+  // Against the NORMALIZED-but-unflattened source. `flat()` collapses every newline to a
+  // space, so excluding the newline character inside these patterns was a no-op — a retired
+  // claim could still match across a paragraph break. Line structure is signal here, not noise.
   for (const { pattern, why } of RETIRED) {
-    if (pattern.test(f)) {
+    if (pattern.test(eol(src))) {
       failures++;
       console.error(`  ✗ blog/${file}: retired claim "${pattern.source}" — ${why}`);
     }
@@ -115,6 +127,20 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
       `  ✗ blog/${file}: the install step has drifted from docs/snippets/panel-install.mdx`,
     );
   }
+}
+
+// A FLOOR on carriers. The marker both selects and validates, so editing the marker text
+// opts a post out of coverage entirely — and if every post drifted, `carrying` would be 0 and
+// this gate would report success having compared nothing. codex called this fail-open twice;
+// a floor does not fix the selector, but it does make total collapse loud instead of green.
+if (carrying !== EXPECTED_CARRIERS) {
+  failures++;
+  console.error(
+    `  ✗ ${carrying} post(s) carry the shared install step, expected exactly ` +
+      `${EXPECTED_CARRIERS}. FEWER means a post's marker text was edited and it silently left ` +
+      `coverage — check the tail of docs/snippets/panel-install.mdx. MORE means a new post ` +
+      `adopted the step; bump EXPECTED_CARRIERS once you have confirmed it should match.`,
+  );
 }
 
 console.log(`${carrying} post(s) carry the shared install step`);

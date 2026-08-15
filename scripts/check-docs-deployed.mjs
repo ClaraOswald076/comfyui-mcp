@@ -95,6 +95,18 @@ async function serves(url) {
   }
 }
 
+// An unrecognized locale argument used to select nothing, probe nothing, and exit 0 with a
+// cheerful "0 navigation page(s) probed" — a typo'd locale in a deploy script would have read
+// as a clean run forever.
+const known = new Set(languages.map((l) => l.language));
+const unknown = only.filter((c) => !known.has(c));
+if (unknown.length) {
+  console.error(
+    `unknown locale(s): ${unknown.join(', ')} — navigation declares ${[...known].join(', ')}`,
+  );
+  process.exit(1);
+}
+
 let checked = 0;
 let broken = 0;
 for (const lang of languages) {
@@ -119,6 +131,10 @@ for (const lang of languages) {
 }
 
 console.log(`${checked} navigation page(s) probed on ${BASE} · ${broken} not serving`);
+if (checked === 0) {
+  console.error('probed nothing — navigation declared no pages for the selected locale(s)');
+  process.exit(1);
+}
 if (broken) {
   console.error(
     `\nThese pages exist in git and in navigation but do not exist for a reader. That is a ` +

@@ -126,7 +126,7 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
     if (packs.has(m[1])) named.add(m[1]);
     else missing.add(m[1]);
   }
-  for (const m of src.matchAll(/`([a-z0-9][a-z0-9-]*)`\s+pack/gi)) {
+  for (const m of src.matchAll(/`([a-z0-9][a-z0-9.-]*[a-z0-9])`\s+pack/gi)) {
     if (packs.has(m[1])) named.add(m[1]);
     // NOT collected as missing: `foo` pack is a loose prose pattern that matches things which
     // were never pack directories. Only the explicit packs/<name> path is treated as a promise.
@@ -161,18 +161,22 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
         }
       }
     }
-    for (const raw of line.match(FILENAME) ?? []) {
+    // Markdown EMPHASIS is stripped before extraction rather than treated as a wildcard.
+    // Round 1 replaced a 40-char context window with an adjacency test, which fixed
+    // `| **Download** | Missing.gguf |` but broke `**Missing.gguf**` — a literal claim wrapped
+    // in bold, now read as a glob and skipped. Removing emphasis first means a `*` still
+    // touching the name is a real wildcard.
+    const bare = line.replace(/\*\*([^*]*)\*\*/g, '$1').replace(/(^|[^*])\*([^*]+)\*/g, '$1$2');
+    // matchAll + m.index, NOT line.indexOf(raw): indexOf always returns the FIRST occurrence,
+    // so on `| -Q8_0.gguf | Q8_0.gguf |` the second, legitimate claim inherited the first
+    // one's suffix-fragment classification and both were skipped.
+    for (const m of bare.matchAll(FILENAME)) {
+      const raw = m[0];
       if (!MODEL_EXT.test(raw)) continue;
-      // A glob names a family, not a file — the post is describing a set, not promising one.
-      //
-      // Adjacency, NOT a 40-character window. The window looked at unrelated context and
-      // markdown bold is everywhere in these tables, so `| **Download** | Missing.gguf |`
-      // suppressed the check entirely. Measured before fixing: 5 of 47 filename claims were
-      // being skipped for a `*` that belonged to `**bold**`, including two in a post I had
-      // already stamped as verified.
-      const at = line.indexOf(raw);
-      const before = line.slice(Math.max(0, at - 1), at);
-      const after = line.slice(at + raw.length, at + raw.length + 1);
+      const at = m.index;
+      const before = bare.slice(Math.max(0, at - 1), at);
+      const after = bare.slice(at + raw.length, at + raw.length + 1);
+      // A glob names a family, not a file — the post describes a set, not a promise.
       if (/[*{}]/.test(before) || /[*{}]/.test(after)) continue;
       // A leading filename char means we matched the TAIL of a longer name. The posts write
       // `-Q8_0.gguf` and `-LowNoise-Q8_0.gguf` as deliberate suffix shorthand ("the LowNoise
@@ -186,11 +190,10 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
       checked++;
       // Whole-token match, not `includes`. A substring test passes a filename the pack does
       // NOT ship whenever a longer one contains it: a manifest with `my-model.gguf` would
-      // satisfy a post claiming `model.gguf`. Require a non-filename char (or start of input)
-      // on the left — the extension already bounds the right.
-      const shipsFile = new RegExp(`(^|[^A-Za-z0-9._-])${raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).test(
-        haystack,
-      );
+      // satisfy a post claiming `model.gguf`. BOTH boundaries are required — with only a left
+      // boundary, `foo.gguf` was still satisfied by `foo.gguf.part` or `foo.gguf2`.
+      const esc = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const shipsFile = new RegExp(`(^|[^A-Za-z0-9._-])${esc}($|[^A-Za-z0-9._-])`).test(haystack);
       if (!shipsFile) {
         failures++;
         console.error(
