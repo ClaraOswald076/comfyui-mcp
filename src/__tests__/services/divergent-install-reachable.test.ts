@@ -1,25 +1,43 @@
-// #1371 r2 — the refusal that shipped in v0.51.19 and has never once fired.
+// #1371 r3 — the divergent-install refusal fires ONLY in a race, so it never fires
+// for the case it was added to catch.
 //
-// `divergentInstallRefusal` is reached from ONE place, admitted by
-// `if (!liveRootAtResolve)` — which holds exactly when
-// `isLiveAuthoritativeModelsDir(source)` is FALSE. Its evidence comes from
-// `isUnderLiveModelRoots`, which bails with `{inRoots: undefined}` unless
-// `modelsDirNamedByServer(dest.source)` is TRUE. And `modelsDirNamedByServer` is
-// a deliberate SUBSET of `isLiveAuthoritativeModelsDir` ({argv-flag, live-root}
-// vs {argv-flag, live-root, observed-root}), so the admitting condition IMPLIES
-// the evidence bails. The answer on that path is always `undefined`, and
-// `divergentInstallRefusal` returns null at its first line when it is.
+// AN EARLIER REVISION OF THIS FILE CLAIMED THE BRANCH WAS DEAD CODE. That was
+// WRONG, and the correction is the point of this file. The argument was:
 //
-// (When this file was first written the evidence gate read
-// `isLiveAuthoritativeModelsDir(dest.source)` — the same predicate as the caller,
-// in the opposite direction. Main has since narrowed it to the separate, stricter
-// `modelsDirNamedByServer` for #369/#1374. That WIDENED the gap rather than
-// closing it: the contradiction survives the rename a fortiori, which is why the
-// executable proof below enumerates the source values instead of matching a name.)
+//   `divergentInstallRefusal` is reached from ONE place, admitted by
+//   `if (!liveRootAtResolve)` — which holds exactly when
+//   `isLiveAuthoritativeModelsDir(source)` is FALSE. Its evidence comes from
+//   `isUnderLiveModelRoots`, which bails with `{inRoots: undefined}` unless
+//   `modelsDirNamedByServer(dest.source)` is TRUE. `modelsDirNamedByServer` is a
+//   deliberate SUBSET of `isLiveAuthoritativeModelsDir` ({argv-flag, live-root} vs
+//   {argv-flag, live-root, observed-root}), so admitting implies the evidence bails.
 //
-// The existing suite could not see this: it tests `divergentInstallRefusal` as a
-// PURE function with `inRoots: false` handed in, and its "#1371 WIRING" block is
-// `readFileSync` + regex over source text. Both pass whether or not production
+// Every step of that is true, and the conclusion still does not follow. It holds
+// the two `source` values to ONE value. Production resolves the first in
+// `resolveModelSubfolderWithLiveRoot`, then fetches a SECOND, FRESH snapshot inside
+// `isUnderLiveModelRoots`. Nothing pins the server across that await. When the
+// second observation names a root the first could not, the sets no longer apply and
+// the refusal FIRES — measured below, not argued.
+//
+// TWO PRECONDITIONS, both measured:
+//   1. the two observations disagree — non-server-named first, server-named second
+//      (an outage then recovery, a restart onto another install, a reused port);
+//   2. the destination directory ALREADY EXISTS, because a negative answer requires
+//      `realpath` to succeed on both sides. A first download into a category the
+//      stale install lacks is allowed through even under the race.
+//
+// (2) is also what hid this: the earlier fixture downloaded into `vae`, which the
+// stale install does not have, so it measured UNKNOWN and read it as deadness.
+//
+// SO THE HONEST STATEMENT IS NARROWER THAN "DEAD" AND NARROWER THAN "WORKS":
+// in the steady state — one server, both observations agreeing — the refusal cannot
+// fire, which covers #1371 as reported. It fires only when the server changes
+// underneath a single download. #1371 is therefore still not fixed by this guard,
+// but the branch is live code with a real, if rare, effect.
+//
+// The pre-existing suite could see none of this: it tests `divergentInstallRefusal`
+// as a PURE function with `inRoots: false` handed in, and its "#1371 WIRING" block
+// is `readFileSync` + regex over source text. Both pass whether or not production
 // can reach the branch — the "tested but unreachable" shape.
 //
 // THESE ARE CHARACTERIZATION TESTS. They pass on main today and are not a
@@ -28,13 +46,14 @@
 // What they pin:
 //   - the working half: `isUnderLiveModelRoots` answers `false` correctly whenever
 //     `dest.source` IS one the server named. Nothing is wrong with that function.
-//   - REACHABILITY: `resolveDownloadTarget` really does enter the refusal branch in
-//     the reporter's shape — proven from its own return value, not from source text
-//     — and returns a destination inside the STALE install without refusing. A test
-//     that passed only because the branch never ran would prove nothing; this one
-//     asserts the branch runs and is inert.
-//   - THE CONTRADICTION, enumerated over every `ModelsDirSource` the resolver can
-//     produce, so repairing either gate fails it and points here.
+//   - the STEADY STATE: `resolveDownloadTarget` really does enter the refusal branch
+//     in the reporter's shape — proven from its own return value, not from source
+//     text — and refuses nothing there.
+//   - the RACE: some interleaving of a changing server DOES fire the refusal, and
+//     the same interleaving does NOT when the destination has yet to be created.
+//   - a SAME-SOURCE LEMMA, explicitly scoped, which is why the steady state is safe.
+//     It is no longer load-bearing for reachability; it cannot be, because it
+//     assumes the agreement that the race breaks.
 //
 // I also tried the obvious repair — fall back to `snapshot.liveRoot` when the
 // models dir is not live-derived — and it is a NO-OP. output-dir.ts adopts the
@@ -87,9 +106,14 @@ let cwd: string | undefined = CONNECTED_ROOT;
  *  that its condition was true. */
 let statsCalls = 0;
 
+/** Lets a test rewrite what the server reports BETWEEN calls, by call number —
+ *  the only way to simulate a server that changes across an await boundary. */
+let onStats: ((call: number) => void) | undefined;
+
 vi.mock("../../comfyui/client.js", () => ({
   getSystemStats: async () => {
     statsCalls += 1;
+    onStats?.(statsCalls);
     if (!reachable) throw new Error("ECONNREFUSED");
     return { system: { argv, cwd } };
   },
@@ -116,6 +140,7 @@ async function membershipFor(targetDir: string, category?: string) {
 
 beforeEach(() => {
   reachable = true;
+  onStats = undefined;
   cwd = CONNECTED_ROOT;
   // An ABSOLUTE `main.py` under the connected install, no --models-directory. The
   // install root resolves from argv and EXISTS here, so output-dir adopts
@@ -174,8 +199,10 @@ describe("#1371 the divergent-install refusal: reached, and unable to answer", (
     expect(m.inRoots).toBeUndefined();
   });
 
-  it("REACHED AND INERT: the refusal branch runs in the reporter's shape and refuses nothing", async () => {
-    // The proof that matters, and the one the pure-function tests cannot give.
+  it("STEADY STATE: the refusal branch runs in the reporter's shape and refuses nothing", async () => {
+    // The reporter's case, and the common one: ONE server, answering consistently at
+    // every observation. This is the half of the story the "dead code" claim got
+    // right — see the RACE test below for the half it got wrong.
     //
     // A test asserting "no refusal was thrown" passes just as happily when the
     // branch never executed, so it proves nothing on its own. This drives the real
@@ -223,14 +250,111 @@ describe("#1371 the divergent-install refusal: reached, and unable to answer", (
     expect(m.inRoots).toBeUndefined();
   });
 
-  it("THE CONTRADICTION: the caller's gate requires the negation of what the evidence needs", async () => {
+  /**
+   * Drive the production entry point with a server whose self-report CHANGES between
+   * `/system_stats` calls, swapping after call `swapAfter`. Returns the refusal
+   * message, or null when the download was allowed.
+   *
+   * Server A reports a root that is real but NOT on this filesystem (a container /
+   * port-forward), so the models dir falls back to the stale COMFYUI_PATH and the
+   * source is NOT server-named. Server B reports an absolute `main.py` that does
+   * exist here, so its source IS server-named and the evidence can answer.
+   */
+  async function refusalWithServerSwap(
+    swapAfter: number,
+    category: string,
+  ): Promise<string | null> {
+    const containerRoot = join(SANDBOX, "container-only", "ComfyUI"); // never created
+    vi.resetModules();
+    reachable = true;
+    // Per-scenario, or `swapAfter` would be compared against an ever-growing counter
+    // and every sweep iteration after the first would silently run the SAME
+    // (post-swap) server — measuring "cannot fire" as a fixture artefact.
+    statsCalls = 0;
+    onStats = (n) => {
+      if (n <= swapAfter) {
+        argv = [join(containerRoot, "main.py"), "--port", "8190"];
+        cwd = containerRoot;
+      } else {
+        argv = [join(CONNECTED_ROOT, "main.py"), "--port", "8190"];
+        cwd = CONNECTED_ROOT;
+      }
+    };
+    const mod = await import("../../services/model-resolver.js");
+    try {
+      await mod.resolveDownloadTarget(
+        "https://example.invalid/m.safetensors",
+        category,
+        "m.safetensors",
+      );
+      return null;
+    } catch (e) {
+      return (e as Error).message;
+    }
+  }
+
+  it("IT CAN FIRE: two resolutions that disagree across the await DO reach a refusal", async () => {
+    // THIS TEST EXISTS BECAUSE THE BRANCH IS NOT DEAD, and an earlier revision of
+    // this file claimed it was. The claim rested on the two `source` values being
+    // equal — but production resolves the first in
+    // `resolveModelSubfolderWithLiveRoot` and then fetches a SECOND, FRESH snapshot
+    // inside `isUnderLiveModelRoots`. Nothing pins the server across that await.
+    //
+    // A server that is a container/port-forward at the first observation and a
+    // locally-rooted ComfyUI at the second — an outage then recovery, a restart onto
+    // a different install, a reused port — yields a non-server-named source first and
+    // a server-named one second. The evidence can then answer `false`, and the
+    // refusal fires. Measured, not argued.
+    //
+    // SWEPT rather than pinned to one call index: the number of `/system_stats` calls
+    // is an implementation detail, and hardcoding "swap after call 2" would silently
+    // stop exercising the race if that count ever changed, going green for the wrong
+    // reason. Asserting "SOME interleaving fires" survives that.
+    const fired: number[] = [];
+    for (const swapAfter of [0, 1, 2, 3, 4, 5]) {
+      const msg = await refusalWithServerSwap(swapAfter, "checkpoints");
+      if (msg?.startsWith("NOT downloaded: the connected ComfyUI")) fired.push(swapAfter);
+    }
+    expect(fired.length).toBeGreaterThan(0);
+
+    // And the control: with NO swap — the same server at every observation, which is
+    // the steady state and the reporter's own case — it never fires.
+    const steady = await refusalWithServerSwap(99, "checkpoints");
+    expect(steady).toBeNull();
+  });
+
+  it("...but only when the destination already exists on disk", async () => {
+    // The second precondition, and the one that hid this from an earlier revision of
+    // this file: its fixture downloaded into `vae`, which the stale install does not
+    // have. `isUnderLiveModelRoots` only answers `false` when everything it compares
+    // could be canonicalized, so a not-yet-created destination fails `realpath`,
+    // `fullyCanonical` goes false, and the honest answer is UNKNOWN.
+    //
+    // So the same race that refuses a `checkpoints` download silently allows a `vae`
+    // one. That is the difference between "impossible" and "my fixture never tried
+    // it", which is exactly what the old set-intersection proof could not see.
+    for (const swapAfter of [0, 1, 2, 3, 4, 5]) {
+      expect(await refusalWithServerSwap(swapAfter, "vae")).toBeNull();
+    }
+  });
+
+  it("SAME-SOURCE LEMMA (not a deadness proof): equal sources cannot both admit and answer", async () => {
+    // SCOPE — read this before using it for anything.
+    //
+    // This is a lemma about the two PREDICATES, and it holds only for a single
+    // `source` value fed to both. It was once the load-bearing proof that the refusal
+    // is dead code, and in that role it was WRONG: it silently assumed the two
+    // resolutions agree, which is the very thing production does not guarantee. The
+    // test above measures what actually happens when they disagree.
+    //
+    // What it still establishes, and all it establishes: in the STEADY STATE — one
+    // server, one answer at both observations — a source that admits the refusal can
+    // never be one that answers it. That is why the common case cannot fire.
+    //
     // Enumerated over the WHOLE `ModelsDirSource` union rather than matched against
     // a predicate NAME, because the name has already changed once: main narrowed the
     // evidence gate from `isLiveAuthoritativeModelsDir` to `modelsDirNamedByServer`,
     // which a regex on the old name reported as a repair when it was the opposite.
-    //
-    // If someone repairs the gate for real — widening what can answer, or narrowing
-    // what admits — the intersection stops being empty and this fails, pointing here.
     const { isLiveAuthoritativeModelsDir, modelsDirNamedByServer } = await import(
       "../../services/output-dir.js"
     );
@@ -267,9 +391,7 @@ describe("#1371 the divergent-install refusal: reached, and unable to answer", (
     // carrying this test.
     expect(admitsTheRefusal.length).toBeGreaterThan(0);
     expect(canAnswer.length).toBeGreaterThan(0);
-    // ...and they are disjoint. Both `source` values come from
-    // resolveModelsDirWithBases() against the same server moments apart, so they
-    // agree; a source that admits the refusal can therefore never answer it.
+    // ...and they are disjoint, so ONE source cannot both admit and answer.
     expect(admitsTheRefusal.filter((s) => canAnswer.includes(s))).toEqual([]);
 
     // Anchor the enumeration to the two gates it is reasoning about, so this cannot
