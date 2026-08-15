@@ -91,7 +91,13 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   // `## Licensing` that lived inside `<!-- ... -->` — the heading matched, the opening `<!--`
   // sat above it and so was never in the measured span, and the trailing `-->` plus the hidden
   // prose counted as content. A fully commented-out section passed while rendering nothing.
-  const body = stripFences(src).replace(/<!--[\s\S]*?-->/g, '');
+  // BOTH comment syntaxes. These are .mdx files, where `{/* ... */}` is the native comment and
+  // renders as nothing — stripping only HTML comments left a commented-out `## Licensing`
+  // plus its prose searchable, so the heading and its 30+ characters satisfied the gate while
+  // the reader saw an empty section.
+  const body = stripFences(src)
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/\{\s*\/\*[\s\S]*?\*\/\s*\}/g, '');
   const m = body.match(/^##\s+Licensing\s*$/m);
   if (!m) {
     failures++;

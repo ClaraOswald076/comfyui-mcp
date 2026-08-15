@@ -133,8 +133,14 @@ const RETIRED = [
     // still matched "The panel starts disconnected until you launch the orchestrator" —
     // correct guidance saying the OPPOSITE of the retired claim. Only determiners, possessives
     // and adjectives may sit between the verb and the noun.
+    // Any adjective may sit between the verb and the noun, EXCEPT words that open a new
+    // clause. The previous version whitelisted only "background" and possessives while its
+    // comment claimed it allowed adjectives, so "the panel starts a local orchestrator" — a
+    // genuinely false claim — passed. Whitelists of adjectives are unwinnable; the short
+    // stoplist below is what actually separates the two meanings, because in the CORRECT
+    // sentences a verb like "launch" or a conjunction always intervenes.
     pattern:
-      /panel\s+(?:starts|spawns|launches|boots)\s+(?:up\s+)?(?:the|its|a|that)?\s*(?:\w+['’]s\s+|background\s+|provider['’]?s?\s+)*orchestrator/i,
+      /panel\s+(?:starts|spawns|launches|boots)\s+(?:(?!(?:until|unless|before|after|when|then|so|because|and|but|if|once|launch|run|start|connect|yourself)\b)[A-Za-z][A-Za-z’'-]*\s+){0,3}orchestrator/i,
     why: 'the panel is a pure frontend extension and cannot spawn a process; the user runs `connect`',
   },
   {
