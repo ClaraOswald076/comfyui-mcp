@@ -625,8 +625,16 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     // An unverifiable result must say WHY and how to become verifiable, or the user
     // has nothing to act on.
     expect(res.note).toMatch(/RELATIVE main\.py/);
-    expect(res.note).toMatch(/could not be identified/);
     expect(res.note).toMatch(/list_local_models/);
+    // ...and the remedy has to be actionable: NAME the root.
+    expect(res.note).toMatch(/COMFYUI_PATH/);
+    expect(res.note).toMatch(/--base-directory/);
+    // #1587 — but it must not assert the process could not be identified. That is a
+    // CONJUNCT the code never established: ComfyUI Desktop identifies the process
+    // (python_probe_trusted:true, process-table PID) and the root is unpinnable
+    // anyway, so a user who reads this goes and "fixes" a working probe.
+    expect(res.note).not.toMatch(/main\.py with no working directory AND/);
+    expect(res.note).not.toMatch(/make its process observable/);
   });
 
   // #369 review, P1: the pre-write guard fails OPEN on an empty candidate tree —

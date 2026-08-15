@@ -745,6 +745,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.54] - 2026-08-15
+
+### MCP
+
+#### Fixed
+- a stale panel MCP session is a session problem, not a bad request (#1524)
+- the loopback MCP reports the port it BOUND, not the one it was asked for
+
 ## [0.51.53] - 2026-08-15
 
 ### MCP

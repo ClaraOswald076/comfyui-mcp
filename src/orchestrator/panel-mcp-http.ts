@@ -85,6 +85,14 @@ export function startPanelMcpHttpServer(
   // across reconnects; each is its own server+transport over the SAME tab ctx.
   const tabs = new Map<string, Map<string, Session>>();
 
+  // The port ACTUALLY bound, which is not always the port asked for: `listen(0)`
+  // means "any free port", and the OS picks it. Everything downstream — the URL
+  // handed to the backend, the transport's DNS-rebinding allowlist, and the Host
+  // guard below — has to name the real one, or a server that came up fine is
+  // unreachable at the address it advertises and rejects the requests that do
+  // arrive. Kept in sync at `listen`, before any of those readers can run.
+  let boundPort = port;
+
   const newSession = async (tabId: string): Promise<Session> => {
     const server = new McpServer({ name: "comfyui-panel", version: "1.0.0" });
     // Tab-bound context: every tool forwards to the bridge for THIS tab — the
@@ -96,7 +104,7 @@ export function startPanelMcpHttpServer(
       // host to 127.0.0.1 to reach this loopback server). We also Host/Origin-guard
       // in the request handler since we hand-roll http.createServer.
       enableDnsRebindingProtection: true,
-      allowedHosts: [`127.0.0.1:${port}`, `localhost:${port}`],
+      allowedHosts: [`127.0.0.1:${boundPort}`, `localhost:${boundPort}`],
       allowedOrigins: [], // no browser origin should ever reach this (Codex sends none)
       onsessioninitialized: (sid) => {
         let m = tabs.get(tabId);
@@ -127,7 +135,7 @@ export function startPanelMcpHttpServer(
         // local Codex app-server should reach it — and it sends an exact-loopback
         // Host and NO browser Origin. Reject anything else before doing any work.
         const hostHeader = req.headers.host;
-        if (hostHeader !== `127.0.0.1:${port}` && hostHeader !== `localhost:${port}`) {
+        if (hostHeader !== `127.0.0.1:${boundPort}` && hostHeader !== `localhost:${boundPort}`) {
           res.writeHead(403, { "content-type": "application/json" }).end(
             JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "Forbidden host." }, id: null }),
           );
@@ -149,6 +157,38 @@ export function startPanelMcpHttpServer(
         const sessionId = req.headers["mcp-session-id"] as string | undefined;
         const tabSessions = tabs.get(tabId);
         const existing = sessionId ? tabSessions?.get(sessionId) : undefined;
+
+        // #1524 — a session id we do not know is a SESSION problem, and the status
+        // code is the only place the protocol says so. 404 means "that session is
+        // gone", on which the client MUST open a new one with a fresh
+        // InitializeRequest; 400 means "this request was malformed", which no
+        // client retries and none re-initializes on. Answering the first case with
+        // the second is why the panel half of a dropped session never came back
+        // while the stdio `comfyui` half — which the client simply respawns, and
+        // which needs no such signal — always did.
+        //
+        // Every session map here is process-local, so an orchestrator restart
+        // invalidates every id at once. That is not an edge case on this install:
+        // the dev build self-restarts on rebuild.
+        //
+        // Scoped deliberately to "an id was presented and is unknown". A request
+        // with NO id keeps its 400 below: there is no session to recover, and
+        // sending it to re-initialize something it never opened would loop it.
+        if (sessionId && !existing) {
+          res.writeHead(404, { "content-type": "application/json" }).end(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              error: {
+                code: -32001,
+                message:
+                  "Session not found — this session id is not known to this orchestrator " +
+                  "(it may have restarted). Open a new session with an initialize request.",
+              },
+              id: null,
+            }),
+          );
+          return;
+        }
 
         if (existing) {
           // Established session — GET (SSE), POST (messages), DELETE (close).
@@ -204,10 +244,18 @@ export function startPanelMcpHttpServer(
   return new Promise<PanelMcpHttpServer>((resolve, reject) => {
     httpServer.on("error", (err) => reject(err));
     httpServer.listen(port, host, () => {
-      logger.info(`[panel-mcp-http] panel_* MCP listening on http://${host}:${port}/<tabId> (loopback, Codex)`);
+      // Read the port back off the socket rather than echoing the request. They
+      // are the same number for every caller that names one, and different for
+      // `listen(0)` — where echoing produced a server advertising `:0`, which no
+      // client can dial and whose own Host guard would reject anything that did.
+      const addr = httpServer.address();
+      boundPort = typeof addr === "object" && addr ? addr.port : port;
+      logger.info(
+        `[panel-mcp-http] panel_* MCP listening on http://${host}:${boundPort}/<tabId> (loopback, Codex)`,
+      );
       resolve({
-        port,
-        urlFor: (tabId: string) => `http://${host}:${port}/${encodeURIComponent(tabId)}`,
+        port: boundPort,
+        urlFor: (tabId: string) => `http://${host}:${boundPort}/${encodeURIComponent(tabId)}`,
         stop: async () => {
           for (const tabSessions of tabs.values()) {
             for (const s of tabSessions.values()) {
