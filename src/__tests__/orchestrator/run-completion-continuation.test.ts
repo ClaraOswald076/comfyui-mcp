@@ -482,13 +482,17 @@ describe("run completion across automatic goal continuation (#468)", () => {
     //   agent_event kind:"executed" → flushRunCompletions
     //   flushRunCompletions         → manager.injectEvent → PanelAgent.injectEvent
     const { readFile } = await import("node:fs/promises");
-    const orchestrator = await readFile(
-      new URL("../../orchestrator/index.ts", import.meta.url),
-      "utf-8",
-    );
+    // Normalise line endings FIRST. A Windows checkout stores these files CRLF,
+    // so an end-of-block marker written `\n  }\n` finds nothing here and matches
+    // on CI — the test would then be green on Linux and red on the platform this
+    // project is developed on.
+    const read = async (rel: string) =>
+      (await readFile(new URL(rel, import.meta.url), "utf-8")).replace(/\r\n/g, "\n");
+    const orchestrator = await read("../../orchestrator/index.ts");
     // Every slice below is bounded by an index that must EXIST — an unfound
     // marker returns -1, and a slice to -1 hands `toContain` most of the file,
-    // which would make this whole test pass while measuring nothing.
+    // which would make this whole test pass while measuring nothing. That is not
+    // hypothetical: it is what the first version of this test did.
     const branchAt = orchestrator.indexOf('if (ev.kind === "executed") {');
     expect(branchAt).toBeGreaterThan(-1);
     const branchEnd = orchestrator.indexOf("return;", branchAt);
@@ -506,10 +510,7 @@ describe("run completion across automatic goal continuation (#468)", () => {
     // …and the method they land in is the one that applies the bound: the
     // attachment is built from the BOUNDED list, so no later edit can re-widen
     // it by reaching past `attachedImgs`.
-    const agent = await readFile(
-      new URL("../../orchestrator/panel-agent.ts", import.meta.url),
-      "utf-8",
-    );
+    const agent = await read("../../orchestrator/panel-agent.ts");
     const injectAt = agent.indexOf("\n  injectEvent(");
     expect(injectAt).toBeGreaterThan(-1);
     const injectEnd = agent.indexOf("\n  }\n", injectAt);
