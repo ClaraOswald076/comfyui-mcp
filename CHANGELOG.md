@@ -745,6 +745,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.51] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- the refusal says UNKNOWN where it cannot know reads still work
+- prefer the EXACT (id, target) record over a targetless one
+- a write refusal stops promising that graph reads still work
+- scope identity by (id, target), and stop contradicting the caveat
+- DISCLOSE the disagreement — suppressing it was worse, and inert besides
+- never announce a completion this orchestrator's own status tool contradicts
+
+
 ## [0.51.50] - 2026-08-14
 
 ### MCP
