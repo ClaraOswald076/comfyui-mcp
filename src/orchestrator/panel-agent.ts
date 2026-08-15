@@ -781,6 +781,17 @@ export class PanelAgent {
         ? []
         : attachableImgs.slice(0, previewBudgetLeft);
       const omittedImgs = attachableImgs.length - attachedImgs.length;
+      // The unnamed remainder. Every sentence below counts outputs with
+      // `imgs.length` but attaches and names from `attachableImgs`, so on a MIXED
+      // event — one output with a filename, one without — the two disagree and
+      // nothing said so: the turn reported 2 outputs, attached 1, and closed with
+      // "The image(s) are attached below". The all-unnamed case has its own branch;
+      // this is the case where a named sibling kept the generic wording alive, and
+      // it also makes `omittedImgs` understate the drop above 8. Unnamed outputs
+      // have no coordinates, so the honest remedy here is get_history, not
+      // get_image — offering a fetch we cannot address is the false remedy the
+      // sibling branches already refuse.
+      const unnamedImgs = imgs.length - attachableImgs.length;
       // What the agent is NOT being shown, in coordinates it can actually call
       // get_image with. `names` is filenames only and a `note` replaces it
       // outright, so neither can carry a withheld PreviewImage that lives in
@@ -849,6 +860,15 @@ export class PanelAgent {
                     ? `The first ${attachedImgs.length} image(s) are attached below; all ${imgs.length} outputs are already shown to the user in the panel. ${omittedImgs} further preview(s) were omitted to keep this TURN's image context bounded — fetch one with get_image action:"get" if you need it: ${withheldRefs}. `
                     : `The image(s) are attached below and already shown to the user in the panel. `
             : `You cannot view images on this provider, but they are already shown to the user in the panel. `
+          : ``) +
+        // Said on TOP of whichever branch fired, because every one of them is
+        // arithmetically incomplete while an unnamed output is in the event: the
+        // counts above are over `imgs.length` and the attachments are not. Only
+        // reached when something WAS attachable — the all-unnamed case already
+        // says this in its own words, and a text-only backend attaches nothing to
+        // contradict.
+        (imgs.length && this.backend.capabilities.vision && attachableImgs.length && unnamedImgs > 0
+          ? `${unnamedImgs} of those ${imgs.length} output(s) arrived with no usable filename, so ${unnamedImgs === 1 ? "it is" : "they are"} NOT attached to this agent turn and cannot be fetched by name — check get_history (action:"list") if you need to see ${unnamedImgs === 1 ? "it" : "them"}. `
           : ``) +
         // #977 — this used to be a FIXED "you do NOT need to call any tools",
         // i.e. "stop now", sent after every render. Paired with panel_run's own

@@ -646,6 +646,120 @@ describe("run completion across automatic goal continuation (#468)", () => {
     expect(text).not.toMatch(/get_image action:"get"[^.]*:\s*\./);
   });
 
+  it("#1516: a MIXED event discloses the unnamed remainder instead of saying they are attached", async () => {
+    // The gap a pre-merge review found. Every count in this text is over the
+    // event's outputs; the attachments are over the ones with a filename. When
+    // NONE has a name that disagreement has its own branch — but one named
+    // sibling was enough to keep the generic "The image(s) are attached below"
+    // alive, so a 2-output event attached 1 and said nothing about the other.
+    const backend = new ContinuationBackend();
+    const { journal, manager, arrive } = makeHarness(backend);
+    const tab = "tab-mixed";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "go");
+    await waitFor(() => backend.turns.length >= 1);
+    backend.finishTurn();
+
+    arrive(tab, {
+      kind: "executed",
+      prompt_id: PROMPT_A,
+      images: [{ filename: "named_a.png" }, { filename: "" }],
+    });
+    await waitFor(() => backend.turns.length >= 2);
+
+    const text = backend.turns[1];
+    // The named one really is attached — the disclosure must not cost the pixels
+    // this event was able to carry.
+    expect(backend.turnImages[1]).toHaveLength(1);
+    expect(text).toContain("2 output image(s)");
+    expect(text).toContain("attached below"); // still true of the one that has a name
+    // …and the other one is now accounted for, with the only reader that can
+    // answer for a nameless output.
+    expect(text).toContain("1 of those 2 output(s) arrived with no usable filename");
+    expect(text).toContain("get_history");
+  });
+
+  it("#1516: past the cap, a MIXED event's arithmetic closes", async () => {
+    // `omittedImgs` counts only the attachable ones, so on a mixed event
+    // attached + omitted was less than the total the same sentence quotes. The
+    // unnamed clause is what makes those numbers add up.
+    const backend = new ContinuationBackend();
+    const { journal, manager, arrive } = makeHarness(backend);
+    const tab = "tab-mixed-capped";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "go");
+    await waitFor(() => backend.turns.length >= 1);
+    backend.finishTurn();
+
+    // 10 named + 2 unnamed: 8 attach, 2 named are omitted under the bound, and 2
+    // were never attachable at all.
+    arrive(tab, {
+      kind: "executed",
+      prompt_id: PROMPT_A,
+      images: [
+        ...Array.from({ length: 10 }, (_, i) => ({ filename: `named_${i}.png` })),
+        { filename: "" },
+        { filename: "" },
+      ],
+    });
+    await waitFor(() => backend.turns.length >= 2);
+
+    const text = backend.turns[1];
+    expect(backend.turnImages[1]).toHaveLength(8);
+    expect(text).toContain("The first 8 image(s) are attached below");
+    expect(text).toContain("2 further preview(s) were omitted");
+    expect(text).toContain("2 of those 12 output(s) arrived with no usable filename");
+    // 8 attached + 2 bounded + 2 nameless = the 12 the sentence claims.
+  });
+
+  it("#1516: an UNDETERMINED mixed event does not offer a fetch for the nameless half", async () => {
+    // The withheld-coordinates list can only name what has a name, so on an
+    // UNDETERMINED run the "fetch one with get_image" sentence silently covered
+    // fewer outputs than it counted.
+    const backend = new ContinuationBackend();
+    const { journal, manager, arrive } = makeHarness(backend);
+    const tab = "tab-mixed-foreign";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "go");
+    await waitFor(() => backend.turns.length >= 1);
+    backend.finishTurn();
+
+    arrive(tab, { kind: "executed", images: [{ filename: "named_a.png" }, { filename: "" }] });
+    await waitFor(() => backend.turns.length >= 2);
+
+    const text = backend.turns[1];
+    expect(backend.turnImages[1]).toEqual([]); // UNDETERMINED attaches nothing
+    expect(text).toContain("UNDETERMINED");
+    expect(text).toContain("1 of those 2 output(s) arrived with no usable filename");
+    expect(text).toContain("get_history");
+  });
+
+  it("#1516: an all-named event says nothing about a remainder that does not exist", async () => {
+    // The clause must be silent in the ordinary case, or every completion grows a
+    // sentence about images that were never missing.
+    const backend = new ContinuationBackend();
+    const { journal, manager, arrive } = makeHarness(backend);
+    const tab = "tab-all-named";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "go");
+    await waitFor(() => backend.turns.length >= 1);
+    backend.finishTurn();
+
+    arrive(tab, {
+      kind: "executed",
+      prompt_id: PROMPT_A,
+      images: [{ filename: "named_a.png" }, { filename: "named_b.png" }],
+    });
+    await waitFor(() => backend.turns.length >= 2);
+
+    expect(backend.turns[1]).not.toContain("no usable filename");
+    expect(backend.turnImages[1]).toHaveLength(2);
+  });
+
   it("#1516: an UNDETERMINED run with no usable filename offers no empty remedy either", async () => {
     // The id-less case is exactly where "unidentified" and "no filename" meet, so
     // the withheld-coordinates sentence must not degrade to a dangling colon.
