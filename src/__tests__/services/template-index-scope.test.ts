@@ -70,20 +70,61 @@ describe("#1454 when it attaches", () => {
 describe("#1454 WIRING: the reply carries it", () => {
   const src = readFileSync(join(HERE, "../../tools/skills-access.ts"), "utf8");
 
+  /**
+   * The reply object that contains `needle`, bounded by its OWN braces.
+   *
+   * This used to be `src.slice(at, at + 600)`, and a fixed byte window is a trap
+   * this repo has now sprung four times: the window says nothing about the code,
+   * so any legitimate insertion ABOVE the field being asserted pushes that field
+   * out of frame and the test fails for a reason unrelated to what it checks.
+   * #1415 added two fields and a four-line comment between the counts and
+   * `index_scope`, and that alone turned this red. Widening the number would only
+   * move the cliff. Bounding by the enclosing literal cannot drift.
+   */
+  function enclosingObject(source: string, needle: string): string {
+    const at = source.indexOf(needle);
+    expect(at, `the wiring anchor ${JSON.stringify(needle)} is gone`).toBeGreaterThan(-1);
+    // Walk back to the `{` that opens the object this field sits in.
+    let depth = 0;
+    let start = -1;
+    for (let i = at; i >= 0; i--) {
+      const c = source[i];
+      if (c === "}") depth++;
+      else if (c === "{") {
+        if (depth === 0) {
+          start = i;
+          break;
+        }
+        depth--;
+      }
+    }
+    expect(start, "no opening brace above the anchor").toBeGreaterThan(-1);
+    // …and forward to the brace that closes it.
+    depth = 0;
+    for (let i = start; i < source.length; i++) {
+      const c = source[i];
+      if (c === "{") depth++;
+      else if (c === "}") {
+        depth--;
+        if (depth === 0) return source.slice(start, i + 1);
+      }
+    }
+    throw new Error("unterminated object literal around the wiring anchor");
+  }
+
   it("list_templates emits index_scope alongside the counts", () => {
     // The behavioural tests cannot see the reply shape, and a note nothing attaches
     // is the defect this repo keeps paying for.
     expect(src).toMatch(
       /import \{ templateIndexScopeNote \} from "\.\.\/services\/template-index-scope\.js";/,
     );
-    const at = src.indexOf("source_count: groups.length");
-    expect(at).toBeGreaterThan(-1);
-    expect(src.slice(at, at + 600)).toMatch(/index_scope: templateIndexScopeNote\(\)/);
+    expect(enclosingObject(src, "source_count: groups.length")).toMatch(
+      /index_scope: templateIndexScopeNote\(\)/,
+    );
   });
 
   it("the counts are still reported — the note adds, it does not replace", () => {
-    const at = src.indexOf("source_count: groups.length");
-    const block = src.slice(at, at + 600);
+    const block = enclosingObject(src, "source_count: groups.length");
     expect(block).toMatch(/template_count: total/);
     expect(block).toMatch(/templates: index/);
   });
