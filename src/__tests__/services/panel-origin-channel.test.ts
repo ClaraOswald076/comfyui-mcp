@@ -17,6 +17,7 @@ import {
   PANEL_ORIGINS_MAX_AGE_MS,
   publishConnectedPanelOrigins,
   readPublishedPanelOrigins,
+  readPublishedPanelOriginsRecord,
   resetPublishedPanelOrigins,
 } from "../../services/panel-origin-channel.js";
 import { CONTROL_PREFIX, listTargetChangeRequests } from "../../services/download-progress.js";
@@ -53,6 +54,38 @@ describe("panel-origin channel", () => {
     publishConnectedPanelOrigins(dir, ["http://127.0.0.1:8188"]);
     publishConnectedPanelOrigins(dir, []);
     expect(readPublishedPanelOrigins()).toEqual([]);
+  });
+
+  // A caller that ACTS on an origin — fetches it, then describes it — needs the
+  // stamp, because "accepted" and "current" are two minutes apart here (#1415
+  // review, finding 3). Discarding it is what let the acting caller assert a
+  // present-tense fact about a panel from an aged record.
+  it("carries the timestamp through, so an acting caller can disclose the age", () => {
+    const at = Date.now() - 45_000;
+    writeFileSync(
+      join(dir, PANEL_ORIGINS_FILE),
+      JSON.stringify({ origins: ["http://127.0.0.1:8188"], updated: at, pid: process.pid }),
+    );
+    expect(readPublishedPanelOriginsRecord()).toEqual({
+      origins: ["http://127.0.0.1:8188"],
+      updatedAt: at,
+    });
+  });
+
+  it("dates nothing when it has nothing to report", () => {
+    // An age attached to an empty set would invite a caller to report the
+    // freshness of a record that named nobody.
+    expect(readPublishedPanelOriginsRecord()).toEqual({ origins: [] });
+    publishConnectedPanelOrigins(dir, ["http://127.0.0.1:8188"]);
+    publishConnectedPanelOrigins(dir, []);
+    expect(readPublishedPanelOriginsRecord().updatedAt).toBeUndefined();
+  });
+
+  it("keeps readPublishedPanelOrigins as the origins of that same record", () => {
+    // One reader, two shapes — so the describing caller and the acting caller can
+    // never disagree about what is published.
+    publishConnectedPanelOrigins(dir, ["http://127.0.0.1:8188"]);
+    expect(readPublishedPanelOrigins()).toEqual(readPublishedPanelOriginsRecord().origins);
   });
 
   it("reads nothing when there is no channel — a plain MCP server", () => {

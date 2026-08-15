@@ -7,11 +7,13 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { parse as parseYaml } from "yaml";
 import { describeFetchFailure, errorToToolResult, ValidationError } from "../utils/errors.js";
 import { getComfyUIBaseUrl } from "../config.js";
-import { comfyuiFetch, connectedPanelOriginsNow } from "../comfyui/fetch.js";
+import { comfyuiFetch, connectedPanelOriginsSnapshot } from "../comfyui/fetch.js";
 import {
   choosePanelFallbackOrigin,
   describeDeclinedPanelFallback,
+  mayAskAnotherServer,
 } from "../services/panel-fallback-target.js";
+import { sameOrigin } from "../utils/origin.js";
 import { checkWorkflowRuntime, extractWorkflowClassTypes } from "../services/api-nodes.js";
 import {
   extractWorkflowDependencies,
@@ -530,13 +532,64 @@ const TEMPLATE_INDEX_PATH = "/api/workflow_templates";
 /** Attribution for a NON-2xx that came back from the panel fallback rather than
  *  the configured target. "" for the ordinary case, so the untouched path keeps
  *  its exact wording. */
-function panelFallbackNote(origin: string | undefined, configuredUrl: string): string {
+function panelFallbackNote(
+  origin: string | undefined,
+  configuredUrl: string,
+  ageMs: number | undefined,
+): string {
   if (!origin) return "";
   return (
     ` NOTE: that address is NOT your configured ComfyUI — ${configuredUrl} could not be reached ` +
-    `at all, so this request went to ${origin}, the ComfyUI a connected sidebar panel is on. ` +
-    `The status above describes THAT server.`
+    `at all, so this request went to ${origin}, an origin published as a connected sidebar ` +
+    `panel's${observedAgo(ageMs)}. The status above came from ${origin} and describes THAT ` +
+    `server. It does not establish that a panel is on it now.`
   );
+}
+
+/**
+ * How old the panel-origin evidence is, said out loud (#1415 review, finding 3).
+ *
+ * The channel accepts a record up to PANEL_ORIGINS_MAX_AGE_MS (two minutes) old
+ * and the fetch that follows proves nothing about the panel — only about the
+ * server that answered. So the age is DISCLOSED rather than smoothed over, and
+ * the surrounding sentences claim only what was observed.
+ *
+ * "" when the age is unknown, which is the honest reading of "we cannot date
+ * this" and never an implied "it is current".
+ */
+function observedAgo(ageMs: number | undefined): string {
+  if (ageMs === undefined) return "";
+  if (ageMs < 1000) return " a moment ago";
+  return ` about ${Math.round(ageMs / 1000)}s ago`;
+}
+
+/**
+ * WHICH ORIGIN ACTUALLY ANSWERED — read off the response, not restated from the
+ * request (#1415 review, finding 1).
+ *
+ * `res.url` is the URL that produced this body. With `redirect: "manual"` below
+ * nothing is ever followed, so today this equals what was asked for and returns
+ * `requested`. It is read from the response ANYWAY because the alternative is an
+ * assertion: attribution that merely re-states our own intent cannot detect the
+ * day that intent stops holding, and `answered_by` naming the wrong server is
+ * precisely the silently-wrong result this whole path exists to avoid.
+ *
+ * Falls back to `requested` when `res.url` is absent or unparseable — a
+ * hand-constructed Response carries "" — which is the honest answer to "the
+ * response did not say", not a claim that they agree.
+ *
+ * A spelling difference is not a different server: the published origin may be
+ * `http://LOCALHOST:8188` while `URL.origin` normalises the case, and reporting
+ * that as a redirect away would be the #1175 mistake pointed at attribution.
+ */
+function answeringOrigin(res: Response, requested: string): string {
+  let observed: string;
+  try {
+    observed = new URL(res.url).origin;
+  } catch {
+    return requested;
+  }
+  return sameOrigin(observed, requested) ? requested : observed;
 }
 
 /**
@@ -552,10 +605,15 @@ function panelFallbackNote(origin: string | undefined, configuredUrl: string): s
  * twice (#1006, #1359) as a REPLACEMENT for panel routing:
  *
  *   - It is a FALLBACK, never a substitute. The configured target is asked
- *     first, always, and only a NETWORK-LAYER throw reaches this. A non-2xx
- *     means the configured server exists and answered; asking a different
- *     machine because we disliked its answer is exactly the silently-wrong
+ *     first, always, and only a failure that proves NO CONNECTION WAS EVER
+ *     ESTABLISHED reaches this (mayAskAnotherServer). A non-2xx means the
+ *     configured server exists and answered; so, less obviously, does a reset
+ *     mid-request or a rejected TLS handshake. Asking a different machine
+ *     because we disliked — or lost — its answer is exactly the silently-wrong
  *     result this must not produce.
+ *   - It does not follow REDIRECTS. The origin is supplied from outside the
+ *     configuration, so a 3xx is refused rather than chased to a host nobody
+ *     named, and the attribution is read off the response that answered.
  *   - It carries NO credentials. `comfyuiFetch` injects COMFYUI_AUTH_*, which
  *     was configured for the headless target — a plain `fetch` here is the point,
  *     not an oversight, and it is why this stays a bespoke request rather than a
@@ -572,8 +630,9 @@ function panelFallbackNote(origin: string | undefined, configuredUrl: string): s
 async function fetchTemplateIndexViaPanel(
   failedUrl: string,
   primaryError: unknown,
-): Promise<{ res: Response; url: string; origin: string }> {
-  const choice = choosePanelFallbackOrigin(failedUrl, connectedPanelOriginsNow());
+): Promise<{ res: Response; url: string; origin: string; ageMs?: number }> {
+  const snapshot = connectedPanelOriginsSnapshot();
+  const choice = choosePanelFallbackOrigin(failedUrl, snapshot.origins);
   const declined = describeDeclinedPanelFallback(choice);
   if (choice.kind !== "use") {
     if (declined && primaryError instanceof Error) {
@@ -582,15 +641,23 @@ async function fetchTemplateIndexViaPanel(
     throw primaryError;
   }
   const altUrl = `${choice.origin.replace(/\/+$/, "")}${TEMPLATE_INDEX_PATH}`;
+  const primary = primaryError instanceof Error ? primaryError.message : String(primaryError);
+  let res: Response;
   try {
-    return {
+    res = await fetch(altUrl, {
       // Deliberately the global fetch: see the credential note above.
-      res: await fetch(altUrl, { signal: AbortSignal.timeout(8000) }),
-      url: altUrl,
-      origin: choice.origin,
-    };
+      //
+      // REDIRECTS ARE NOT FOLLOWED (#1415 review, finding 1). `fetch` follows by
+      // default, and this is the one request in the process whose address comes
+      // from OUTSIDE the configuration — a handshake Origin the browser reported.
+      // Following a redirect would let whatever is listening there move the
+      // request to any host it names, while the attribution below went on saying
+      // the origin we chose. The body would be surfaced as a template index and
+      // credited to a server that never produced it.
+      redirect: "manual",
+      signal: AbortSignal.timeout(8000),
+    });
   } catch (err) {
-    const primary = primaryError instanceof Error ? primaryError.message : String(primaryError);
     const secondary = describeFetchFailure(err).message;
     throw new Error(
       `${primary} I then tried the ComfyUI a connected sidebar panel is on (${altUrl}), and that ` +
@@ -600,6 +667,30 @@ async function fetchTemplateIndexViaPanel(
       { cause: err },
     );
   }
+  // A 3xx is a REFUSAL, not a hop. A ComfyUI serves the template index at this
+  // path directly, so there is no reading of a redirect here that is safe to
+  // follow blind — the destination is chosen by the far end, not by the user.
+  //
+  // VERIFIED ON THE RUNTIME, not inferred from the spec. The fetch standard says
+  // `redirect: "manual"` yields an OPAQUEREDIRECT filtered response — status 0,
+  // no headers — which would make this branch dead and the `location` below
+  // always null. That is the BROWSER behaviour; undici (node 24) returns the real
+  // response, `type: "basic"`, status 302, with Location readable. Probed against
+  // a live http server before this was written, because the test below builds its
+  // 302 by hand and would have passed either way.
+  if (res.status >= 300 && res.status < 400) {
+    const location = res.headers.get("location");
+    throw new Error(
+      `${primary} I then tried the ComfyUI a connected sidebar panel is on (${altUrl}), and it ` +
+        `answered ${res.status} — a REDIRECT, which was NOT followed` +
+        (location ? ` (to ${location})` : "") +
+        `. That origin came from a browser handshake rather than from your configuration, so ` +
+        `following it could send this request to any host the redirect names and report the ` +
+        `answer as ${choice.origin}'s. A ComfyUI serves ${TEMPLATE_INDEX_PATH} directly. Point ` +
+        `COMFYUI_URL at the server you mean.`,
+    );
+  }
+  return { res, url: altUrl, origin: answeringOrigin(res, choice.origin), ageMs: snapshot.ageMs };
 }
 
 /** action:"list_templates" */
@@ -615,6 +706,8 @@ async function listWorkflowTemplatesAction(): Promise<ToolText> {
   let res: Response;
   // Which ComfyUI actually answered, when it was NOT the configured one (#1415).
   let answeredByPanelOrigin: string | undefined;
+  // How old the evidence for that origin was — disclosed, never assumed current.
+  let panelOriginAgeMs: number | undefined;
   // #954: a bare `fetch` here rejected with the opaque `TypeError: fetch failed`
   // and the reader had no way to see WHICH target was tried — the reported
   // symptom, from a session where the panel bridge was connected and this
@@ -625,15 +718,27 @@ async function listWorkflowTemplatesAction(): Promise<ToolText> {
       signal: AbortSignal.timeout(8000),
     });
   } catch (err) {
-    // A caller-side abort (the 8s ceiling above) is NOT evidence the address is
-    // wrong — the connection was accepted and the server was simply slow — so a
-    // second server must not be asked on its account. Only a transport failure
-    // reaches the panel fallback.
-    if (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) throw err;
+    // #1415 review, finding 2 — WHAT LICENSES ASKING A SECOND SERVER.
+    //
+    // This used to read "any error that is not a named abort", which admitted
+    // every transport failure there is: an ECONNRESET or a socket hang-up on an
+    // ESTABLISHED connection (the server was plainly there and may well have
+    // answered), a TLS handshake rejection (a peer completed the TCP connection
+    // and presented a certificate), a bare ETIMEDOUT (ambiguous between an
+    // unanswered SYN and a dead established socket). The PR body claimed the
+    // fallback never fires once the connection was accepted; it did.
+    //
+    // mayAskAnotherServer establishes exactly one thing, and only from codes that
+    // prove it: NO CONNECTION TO THIS ADDRESS WAS EVER ESTABLISHED, so no server
+    // there received the request. Anything else — including an unrecognised code,
+    // which now DENIES rather than allows — rethrows untouched and the user gets
+    // the real failure instead of an answer from a machine they did not ask.
+    if (!mayAskAnotherServer(err)) throw err;
     const viaPanel = await fetchTemplateIndexViaPanel(url, err);
     res = viaPanel.res;
     url = viaPanel.url;
     answeredByPanelOrigin = viaPanel.origin;
+    panelOriginAgeMs = viaPanel.ageMs;
   }
   if (!res.ok) {
     // A NON-2xx may still be an HTML proxy/login page — say which, instead
@@ -670,7 +775,7 @@ async function listWorkflowTemplatesAction(): Promise<ToolText> {
             // the configured one. This branch names `url`, and after a fallback that
             // is an address the caller never configured; without this the reader
             // would go and check COMFYUI_URL, which is not what answered.
-            panelFallbackNote(answeredByPanelOrigin, configuredUrl),
+            panelFallbackNote(answeredByPanelOrigin, configuredUrl, panelOriginAgeMs),
         },
       ],
     };
@@ -700,14 +805,25 @@ async function listWorkflowTemplatesAction(): Promise<ToolText> {
             // when the configured target could not be reached and a connected
             // panel's ComfyUI answered instead: a caller that read this listing as
             // describing COMFYUI_URL would be reading it about the wrong machine.
+            //
+            // The note says what was OBSERVED (#1415 review, finding 3). It used to
+            // assert "the ComfyUI a connected sidebar panel is on" — a present-tense
+            // claim about the PANEL, built on a published record the channel accepts
+            // at up to two minutes old. A panel that moved A→B inside that window
+            // leaves the fetch of A succeeding while the sentence about A is false.
+            // The response establishes one thing only: A answered. That is now all
+            // it says, with the age of the origin evidence attached.
             ...(answeredByPanelOrigin
               ? {
                   answered_by: answeredByPanelOrigin,
                   answered_by_note:
                     `The configured ComfyUI (${configuredUrl}) could not be reached, so this index ` +
-                    `came from ${answeredByPanelOrigin} — the ComfyUI a connected sidebar panel is ` +
-                    `on. It describes THAT server, not the configured one. Point COMFYUI_URL at ` +
-                    `${answeredByPanelOrigin} so every headless tool agrees with the panel.`,
+                    `came from ${answeredByPanelOrigin}, which ANSWERED this request. That address ` +
+                    `was published as a connected sidebar panel's origin${observedAgo(panelOriginAgeMs)}; ` +
+                    `it is not a live reading of where a panel is now, and one may since have moved ` +
+                    `to a different ComfyUI. What is established is that ${answeredByPanelOrigin} ` +
+                    `served this index — it describes THAT server, not the configured one. If it is ` +
+                    `the server you meant, point COMFYUI_URL at it so every headless tool agrees.`,
                 }
               : {}),
             // #1454 — the counts above describe what the SERVER registers, not what is

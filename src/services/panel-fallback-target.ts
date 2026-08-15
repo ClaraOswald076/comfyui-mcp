@@ -44,7 +44,95 @@
 // which is worse than the loud failure it replaced. So the ambiguity is
 // reported, both candidates are named, and the caller keeps failing.
 
+import { describeFetchFailure } from "../utils/errors.js";
 import { canonicalOrigin } from "../utils/origin.js";
+
+/**
+ * Failure codes that establish NO CONNECTION TO THE FAILED ADDRESS WAS EVER
+ * ESTABLISHED — so no HTTP server there received this request.
+ *
+ * That sentence is the entire contract, and it is deliberately much narrower
+ * than "the request failed". Member by member:
+ *
+ *   - ECONNREFUSED             the host answered the SYN with a RST: something is
+ *                              at that address, nothing is listening on that port.
+ *   - ENOTFOUND                the name did not resolve, so nothing was dialled.
+ *   - EAI_AGAIN                the resolver itself failed; again no address, so
+ *                              no connection was attempted.
+ *   - EHOSTUNREACH/ENETUNREACH the stack could not route there at all.
+ *   - UND_ERR_CONNECT_TIMEOUT  undici's CONNECT phase expired with no completed
+ *                              handshake.
+ *
+ * What it does NOT establish, and must not be read as: that no ComfyUI exists
+ * there. A firewall dropping SYNs, a stopped container and a genuinely empty
+ * address are identical from here. It establishes only that THIS PROCESS did not
+ * talk to a server — which is the precondition for asking a different one, and
+ * nothing more.
+ *
+ * ## Why this is NOT comfyui/fetch.ts's NEVER_DELIVERED_CODES
+ *
+ * The two sets look interchangeable and answer OPPOSITE questions. Sharing one
+ * would be exactly the failure this project has already paid for once — a
+ * loopback test that stood in for "this machine", kept its name after the
+ * question changed, and silently un-shipped #742.
+ *
+ * NEVER_DELIVERED_CODES asks "could the server have ACTED on my POST?". A TLS
+ * handshake failure counts as never-delivered there, and correctly so: no
+ * application byte was ever written.
+ *
+ * This set asks "was there no server at that address at all?". To THAT question a
+ * TLS handshake failure is the opposite answer — the TCP connection completed and
+ * a peer answered the ClientHello, so a server IS there and the problem is trust
+ * configuration. Falling back on it would hide a fixable local misconfiguration
+ * behind an answer from a different machine.
+ *
+ * So the TLS codes are present there and absent here on purpose, and the two sets
+ * must not be merged. A test pins them apart.
+ *
+ * Also deliberately absent:
+ *   - ECONNRESET, EPIPE, UND_ERR_SOCKET, "socket hang up" — an ESTABLISHED
+ *     connection died. A server was there and completed the handshake.
+ *   - ETIMEDOUT — AMBIGUOUS. The OS raises it both for an unanswered SYN and for
+ *     an idle established socket, and "unambiguous" is the bar.
+ *   - UND_ERR_HEADERS_TIMEOUT / UND_ERR_BODY_TIMEOUT — connected; the server was
+ *     merely slow to answer.
+ *   - ERR_INVALID_URL, ERR_UNSUPPORTED_PROTOCOL — a malformed COMFYUI_URL says
+ *     nothing about any server and must be reported rather than routed around.
+ *     (choosePanelFallbackOrigin already answers `none` for a target it cannot
+ *     parse, so these would be dead weight even under a different policy.)
+ */
+export const NEVER_CONNECTED_CODES: ReadonlySet<string> = new Set([
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+/**
+ * May a DIFFERENT server be asked because of this failure?
+ *
+ * True only for NEVER_CONNECTED_CODES: this process never established a
+ * connection to the address it was configured to use, so nothing there answered
+ * and nothing there can have acted.
+ *
+ * An UNRECOGNISED or absent code answers false. That default is the whole point —
+ * the trigger this replaces allowed every error it did not specifically name, so
+ * an ECONNRESET on an established connection (the server was plainly there) sent
+ * the question to a second machine.
+ *
+ * Aborts are rejected explicitly rather than by omission from the set, because
+ * they carry no code to look up: a caller's own deadline says only that we
+ * stopped waiting, and the connection may well have been accepted.
+ */
+export function mayAskAnotherServer(err: unknown): boolean {
+  if (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) {
+    return false;
+  }
+  const { code } = describeFetchFailure(err);
+  return code !== undefined && NEVER_CONNECTED_CODES.has(code);
+}
 
 /**
  * What to do about a connected panel after a headless read failed at the network

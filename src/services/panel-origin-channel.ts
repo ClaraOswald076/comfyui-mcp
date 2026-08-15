@@ -326,8 +326,30 @@ export function resetPublishedPanelOrigins(): void {
  * never "there is no drift".
  */
 export function readPublishedPanelOrigins(now: number = Date.now()): string[] {
+  return readPublishedPanelOriginsRecord(now).origins;
+}
+
+/**
+ * The published set together with WHEN it was written (#1415 review, finding 3).
+ *
+ * The origins alone were enough while the only consumer DESCRIBED them. A caller
+ * that ACTS on one — fetches it, and then tells the reader a panel is on it — is
+ * making a present-tense claim out of a record this reader accepts at up to
+ * PANEL_ORIGINS_MAX_AGE_MS old. A panel that moved A→B inside that window makes
+ * the claim false while the fetch of A still succeeds, so the response proves
+ * only that A answered.
+ *
+ * A bare `string[]` cannot carry that caveat, so the stamp travels with the set
+ * and the acting caller discloses the age instead of asserting freshness it does
+ * not have. `updatedAt` is undefined exactly when `origins` is empty — there is
+ * then nothing to date.
+ */
+export function readPublishedPanelOriginsRecord(now: number = Date.now()): {
+  origins: string[];
+  updatedAt?: number;
+} {
   const file = channelFile();
-  if (!file) return [];
+  if (!file) return { origins: [] };
   try {
     // Bounded read through ONE descriptor. `statSync` then `readFileSync` names
     // the path twice, so the thing measured need not be the thing read — the
@@ -341,11 +363,11 @@ export function readPublishedPanelOrigins(now: number = Date.now()): string[] {
       updated?: unknown;
       pid?: unknown;
     };
-    if (!Array.isArray(raw?.origins)) return [];
+    if (!Array.isArray(raw?.origins)) return { origins: [] };
     // A record whose publisher is gone describes panels that are gone with it.
     // Both checks, for the reasons in the header: liveness catches the death,
     // freshness catches a reused pid.
-    if (!publisherAlive(raw.pid)) return [];
+    if (!publisherAlive(raw.pid)) return { origins: [] };
     // A missing or non-numeric stamp becomes 0, which the age comparison below
     // rejects on its own — `now - 0` is ~55 years. An explicit `updated <= 0`
     // guard was written here and removed: mutation testing showed deleting it
@@ -355,9 +377,12 @@ export function readPublishedPanelOrigins(now: number = Date.now()): string[] {
     const updated = typeof raw.updated === "number" ? raw.updated : 0;
     // `updated > now` (a clock step, or a future-dated write) is NOT freshness
     // evidence — without this it would read as maximally fresh, forever.
-    if (updated > now || now - updated > PANEL_ORIGINS_MAX_AGE_MS) return [];
-    return raw.origins.filter((o): o is string => typeof o === "string" && o !== "");
+    if (updated > now || now - updated > PANEL_ORIGINS_MAX_AGE_MS) return { origins: [] };
+    const origins = raw.origins.filter((o): o is string => typeof o === "string" && o !== "");
+    // The stamp rides along ONLY with a non-empty answer. Dating an empty set
+    // would invite a caller to report the age of a record that named nobody.
+    return origins.length === 0 ? { origins } : { origins, updatedAt: updated };
   } catch {
-    return [];
+    return { origins: [] };
   }
 }

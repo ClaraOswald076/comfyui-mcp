@@ -1,7 +1,10 @@
 import { getComfyUIAuthHeaders } from "../config.js";
 import { describeFetchFailure, isBareFetchFailure } from "../utils/errors.js";
 import { sameOrigin } from "../utils/origin.js";
-import { readPublishedPanelOrigins } from "../services/panel-origin-channel.js";
+import {
+  readPublishedPanelOrigins,
+  readPublishedPanelOriginsRecord,
+} from "../services/panel-origin-channel.js";
 
 /** The request target, for the diagnostic. Never throws on an odd input. */
 export function targetOf(input: string | URL | Request): string {
@@ -60,24 +63,48 @@ export function setConnectedPanelOrigins(fn: (() => string[]) | null): void {
 }
 
 /**
- * The connected-panel origins, for a caller that wants to ACT on them rather
- * than describe them (#1415).
+ * The connected-panel origins, WITH the age of the evidence behind them, for a
+ * caller that wants to ACT on one rather than describe it (#1415).
  *
  * Exported so there is exactly ONE resolution of "injected source, else the
  * published channel" in the process. A second reader that called
  * readPublishedPanelOrigins() directly would silently disagree with the drift
  * sentence in the very error it is reacting to — inside the orchestrator, where
  * the injected bridge source is both fresher and authoritative and the channel
- * file may not have been written yet.
+ * file may not have been written yet. So this resolves the two in the SAME order
+ * as panelOrigins() does.
  *
- * Never throws, for the same reason describeTargetDrift does not: a broken
- * source must not replace the real failure being handled.
+ * `ageMs` is what an acting caller needs in order to describe the set honestly
+ * instead of asserting it (#1415 review, finding 3):
+ *
+ *   - 0 for the INJECTED bridge source. It walks the live socket collection at
+ *     call time, so the answer is as of this instant and there is no staleness to
+ *     disclose. (Not "fresh forever": a tab can still drop between this read and
+ *     the fetch that follows. Zero is the age of the READING, and never a
+ *     guarantee about the future.)
+ *   - the record's age for the published channel, which admits a record up to
+ *     PANEL_ORIGINS_MAX_AGE_MS old — two minutes in which a panel can have moved.
+ *   - undefined when there are no origins at all, since there is then nothing to
+ *     date.
+ *
+ * Never throws, for the same reason describeTargetDrift does not: a broken source
+ * must not replace the real failure being handled.
  */
-export function connectedPanelOriginsNow(): string[] {
+export function connectedPanelOriginsSnapshot(): { origins: string[]; ageMs?: number } {
   try {
-    return panelOrigins();
+    if (connectedPanelOrigins) {
+      const origins = connectedPanelOrigins();
+      return origins.length === 0 ? { origins } : { origins, ageMs: 0 };
+    }
+    // One `now` for BOTH the staleness check and the age, so the number reported
+    // cannot describe a different instant than the one that admitted the record.
+    const now = Date.now();
+    const record = readPublishedPanelOriginsRecord(now);
+    return record.updatedAt === undefined
+      ? { origins: record.origins }
+      : { origins: record.origins, ageMs: now - record.updatedAt };
   } catch {
-    return [];
+    return { origins: [] };
   }
 }
 
