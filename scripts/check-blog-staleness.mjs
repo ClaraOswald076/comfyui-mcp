@@ -41,6 +41,37 @@ const packNames = fs.existsSync(PACKS)
   ? new Set(fs.readdirSync(PACKS).filter((d) => fs.statSync(path.join(PACKS, d)).isDirectory()))
   : new Set();
 
+/**
+ * A shallow clone cannot answer the only question this gate asks.
+ *
+ * `actions/checkout` defaults to `fetch-depth: 1`. In that repo there is exactly ONE commit, so
+ * `git log -1 -- packs/<name>` returns the tip for EVERY path — every pack looks like it changed
+ * today. The comparison below then reports every stamped post as stale, for a reason that has
+ * nothing to do with the packs.
+ *
+ * This is not hypothetical: it is how this gate first ran red. It passed its first CI run only
+ * because that run happened before UTC midnight, when "the tip commit's date" still equalled the
+ * stamp; the next run, four hours later, failed all five stamped posts. With real history those
+ * same packs last moved 2026-07-30.
+ *
+ * So: refuse to answer rather than answer wrong. A false stale is worse than no reading — it
+ * trains people to bump stamps they did not earn, which is the exact failure the stamp exists to
+ * prevent. CI fetches full history (see .github/workflows/ci.yml) so the gate stays live there.
+ */
+function isShallowClone() {
+  try {
+    return (
+      execFileSync('git', ['rev-parse', '--is-shallow-repository'], {
+        cwd: ROOT,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim() === 'true'
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** Last commit date touching a path, as YYYY-MM-DD. Null when git can't say. */
 function lastChanged(rel) {
   try {
@@ -53,6 +84,14 @@ function lastChanged(rel) {
   } catch {
     return null;
   }
+}
+
+if (isShallowClone()) {
+  console.log(
+    'skipped: shallow clone — git cannot say when a pack last changed, and guessing here ' +
+      'reports every stamped post as stale. Re-run with full history (`git fetch --unshallow`).',
+  );
+  process.exit(0);
 }
 
 const stale = [];
