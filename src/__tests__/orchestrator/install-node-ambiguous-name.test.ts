@@ -343,17 +343,23 @@ describe("the ambiguous from-source install is refused, not picked (#1616)", () 
     }
   });
 
-  it("a registry-version call on a NAMED channel dispatches, but says the channel is inert", () => {
-    // The channel cannot disambiguate what it is never asked about. Keep the escape, drop
-    // the pretence that the argument did anything.
-    const out = nodesInstallCommandArgs({
-      repository: DEFAULT_AUTHORS,
-      version: "1.0.0",
-      channel: "dev",
-    });
-    expect(out.conflict).toBeUndefined();
-    expect(out.note ?? "").toMatch(/REGISTRY-VERSION COLLISION/);
-    expect(out.note ?? "").toMatch(/inert here/i);
+  it("takes NO channel bypass — unlike the from-source refusal, which does", () => {
+    // GATE ROUND 5. The first shape of this fix mirrored the from-source refusal and let
+    // an explicit `channel` through, which put the wrong-repo install straight back:
+    // `{hieuck/ComfyUI-BiRefNet, version:"1.0.0", channel:"default"}` dispatched and
+    // installed viperyl's registry pack. Every reason the OTHER refusal yields to a
+    // channel is absent here — Manager never reads a channel on this route, and the 3.x
+    // escape does not apply because the panel's 3.x shapes hardcode `version:"unknown"`
+    // with `files:[url]`, so a 3.x host never reaches the registry route at all. Dropping
+    // `version` is a remedy that works on BOTH generations, so a bypass would only ever
+    // hand back a repository the caller did not name.
+    for (const channel of ["default", "dev", "legacy"]) {
+      const out = nodesInstallCommandArgs({ repository: DEFAULT_AUTHORS, version: "1.0.0", channel });
+      expect(out.conflict, channel).toBeTruthy();
+      expect(out.conflict, channel).toMatch(/Naming a `channel` does NOT clear this one/);
+    }
+    // The asymmetry is deliberate: the from-source refusal still yields to a channel.
+    expect(nodesInstallCommandArgs({ repository: DEV_AUTHORS, channel: "dev" }).conflict).toBeUndefined();
   });
 
   it("leaves a name the snapshot has not seen collide alone on the registry route too", () => {

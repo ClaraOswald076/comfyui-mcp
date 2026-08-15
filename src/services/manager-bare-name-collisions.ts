@@ -292,23 +292,10 @@ export function registryVersionRefusal(a: RegistryVersionAmbiguity): string {
     `from-source install that DOES honour the channel's entry for that name — which is ` +
     `the only route where naming a repository means anything. If you specifically want ` +
     `the registry pack, pass its id as \`id\` instead of a URL, so what you are asking ` +
-    `for is the thing that gets installed. (Snapshot measured ` +
+    `for is the thing that gets installed. Naming a \`channel\` does NOT clear this one — ` +
+    `Manager never reads a channel on this route, so there is no channel argument that ` +
+    `could make it fetch what you named. (Snapshot measured ` +
     `${AMBIGUOUS_BARE_NAMES_MEASURED}.)`
-  );
-}
-
-/** The same finding for a caller who named a channel — dispatched, but the channel is inert here. */
-export function registryVersionWarning(a: RegistryVersionAmbiguity): string {
-  const asked = a.callerRepo ? `https://github.com/${a.callerRepo}` : `"${a.callerUrl}"`;
-  return (
-    `REGISTRY-VERSION COLLISION: you asked for ${asked} at version "${a.version}", but an ` +
-    `explicit version routes this through the Comfy Registry by the id "${a.bare}" — ` +
-    `Manager reads a channel's list only for "nightly"/"unknown", so the \`channel\` you ` +
-    `named is inert here and your \`repository\` is not read either. "${a.bare}" is ` +
-    `measured to be claimed by more than one repository (${listRepos(a.candidates)}). ` +
-    `Drop \`version\` to get the from-source install that honours the channel entry. ` +
-    `Verify with panel_list_nodes before you restart or report success. (Snapshot ` +
-    `measured ${AMBIGUOUS_BARE_NAMES_MEASURED}.)`
   );
 }
 

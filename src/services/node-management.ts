@@ -34,7 +34,6 @@ import {
   bareNameAmbiguity,
   registryVersionAmbiguity,
   registryVersionRefusal,
-  registryVersionWarning,
 } from "./manager-bare-name-collisions.js";
 import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -4548,13 +4547,24 @@ export function nodesInstallCommandArgs(args: {
   // version:"1.0.0"}` was allowed through on that exemption while registry id
   // `comfyui-birefnet` is viperyl's. Split the two routes so each is judged by the thing
   // that actually decides it.
+  //
+  // GATE ROUND 5 — AND THIS REFUSAL TAKES NO CHANNEL BYPASS, unlike the one below it.
+  // Every reason the from-source refusal yields to an explicit `channel` is absent here:
+  //   * the channel is not merely unhelpful on this route, Manager never reads it, so
+  //     naming one expresses nothing at all about which repository lands;
+  //   * the 3.x escape does not apply either — the panel's 3.x shapes HARDCODE
+  //     `version:"unknown"` with `files:[url]` (manager-install.js, verified on the panel's
+  //     origin/main), so a 3.x host never takes the registry route no matter what version
+  //     the caller passed;
+  //   * and the remedy costs the caller nothing on either generation: dropping `version`
+  //     gives v4 the channel-resolved from-source install and gives 3.x the same clone it
+  //     would have done anyway.
+  // So a bypass here would only ever hand back a repository the caller did not name.
   const registryAmbiguity =
     rerouted && norm.repository && norm.version
       ? registryVersionAmbiguity(norm.repository, norm.version)
       : undefined;
-  if (registryAmbiguity && defaultedChannel) {
-    return { conflict: registryVersionRefusal(registryAmbiguity) };
-  }
+  if (registryAmbiguity) return { conflict: registryVersionRefusal(registryAmbiguity) };
   const ambiguity =
     rerouted && norm.repository && !registryAmbiguity
       ? bareNameAmbiguity(norm.repository, effectiveChannel)
@@ -4568,7 +4578,6 @@ export function nodesInstallCommandArgs(args: {
       norm.note,
       rerouted && norm.repository ? gitInstallSubstitutionNote(effectiveChannel, norm.repository) : undefined,
       ambiguity ? ambiguousBareNameWarning(ambiguity) : undefined,
-      registryAmbiguity ? registryVersionWarning(registryAmbiguity) : undefined,
       defaultedChannel ? gitInstallChannelNote(GIT_INSTALL_DEFAULT_CHANNEL) : undefined,
     ]
       .filter((s): s is string => typeof s === "string" && s.length > 0)
