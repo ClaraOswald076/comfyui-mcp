@@ -10,7 +10,6 @@ import {
   describeManagerDestination,
   managerJobFilename,
   currentLiveModelsRoot,
-  verifyManagerVisibility,
   MODEL_SUBDIRS,
 } from "../services/model-resolver.js";
 import type { ModelListingCoverage } from "../services/model-resolver.js";
@@ -812,24 +811,25 @@ async function downloadAction(args: {
           // branch could only ever say "confirm with list_local_models yourself",
           // and a reporter who did not lost a multi-GB model to an ephemeral
           // overlay. The listing question IS answerable remotely, so answer it.
-          // "not-listed" is deliberately not rendered as failure: the dispatch
-          // returns on ACCEPTANCE, so a large file may still be arriving.
-          // unknown-ok: undefined is the COULD-NOT-VERIFY state, and it is kept
-          // distinct from both "visible" and "not-listed" below — the render
-          // appends the note only when one exists, and never upgrades a missing
-          // verification into a confirmation. (verifyManagerVisibility documents
-          // that it never throws, so this catch is belt-and-braces.)
-          const managerSeen = job.viaManager
-            ? await verifyManagerVisibility(
-                job.target_subfolder,
-                // #1086 (codex review) — was `job.filename ?? path.split(…).pop()`.
-                // For a Manager dispatch `job.path` is a DESCRIPTOR, not a path, so
-                // that returned the whole trailing note and made every URL-only
-                // download unverifiable. Pre-existing; exposed by the review.
-                managerJobFilename(job),
-                { attempts: 1 },
-              ).catch(() => undefined)
-            : undefined;
+          //
+          // #1374 review, P1-3 — THE ANSWER IS READ OFF THE RECORD, NOT RE-ASKED.
+          //
+          // This used to call verifyManagerVisibility a SECOND time, right here,
+          // and prefer its result. Two things were wrong with that. It could not
+          // pass `listedBefore` — the pre-dispatch baseline lives inside
+          // startDownloadJob and is unreachable from a tool — so this call was
+          // structurally incapable of telling "the dispatch landed it" from "a
+          // file of that name was already there", and preferring it DEFEATED the
+          // baselined verdict the job had just recorded. And it spent a second
+          // Manager-only network round trip re-asking a question already answered
+          // on the record.
+          //
+          // `startDownloadJob` now writes the verdict onto the job (and marks it
+          // "pending" in the same synchronous step it publishes "done"), so
+          // describePlacement below reads one baselined answer. When the grace
+          // window expires before the check concludes, that reads "pending" and
+          // renders as the honest unverified caveat — which is the truth at that
+          // instant, and re-probing here could not have made it otherwise.
           // #1086 — the destination is unknowable only until we LOOK.
           //
           // The standing caveat says we cannot know where a Manager dispatch
@@ -868,10 +868,9 @@ async function downloadAction(args: {
               // The word stays out of the Manager branch entirely. LISTED is the
               // observation; validity is not established here and must not be
               // implied by the label.
-              (managerSeen?.visibility === "visible"
-                ? `LISTED (placement only, NOT validity): ${managerSeen.note}`
-                : `NOTE: ${placement.warning}` +
-                  (managerSeen ? `\n\n${managerSeen.note}` : "")) +
+              (job.live_visible === "visible"
+                ? `LISTED (placement only, NOT validity): ${placement.warning}`
+                : `NOTE: ${placement.warning}`) +
               // Appended to BOTH Manager arms: a listed file whose destination is
               // outside the live root is exactly the #1086 shape, so the "LISTED"
               // arm needs this every bit as much as the unverified one.

@@ -26,6 +26,7 @@ import {
   verifyLandedModel,
   verifyManagerVisibility,
 } from "./model-resolver.js";
+import type { ListedBeforeBaseline } from "./model-resolver.js";
 import type { DownloadAuth } from "./download-auth.js";
 import type { ResumeDiagnostic } from "./download-resume-diag.js";
 import { ModelError } from "../utils/errors.js";
@@ -265,6 +266,32 @@ function remoteSerializeKey(url: string, targetSubfolder: string, filename?: str
 }
 
 /**
+ * Read the pre-download listing baseline as a TRI-STATE (#1374 review, P1-1).
+ *
+ * Three distinct things used to arrive as `undefined` and be treated alike:
+ * the caller named no file, the listing call threw, and the server answered
+ * "cannot say". None of them is "the server did not list it before", and reading
+ * them as that is what lets a pre-existing file be credited to a dispatch that
+ * fetched nothing. Only a real, answered `false` is a negative baseline.
+ *
+ * Never throws — a baseline is a nicety and must not fail a download.
+ */
+async function captureListingBaseline(
+  targetSubfolder: string,
+  name: string | undefined,
+): Promise<ListedBeforeBaseline> {
+  if (!name) return "unknown";
+  try {
+    const has = await liveListingHasEntry(targetSubfolder, name);
+    // liveListingHasEntry ITSELF returns undefined for "could not be asked", and
+    // that is the state this whole helper exists to keep distinct.
+    return has === undefined ? "unknown" : has;
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
  * Point `key` at `entry`, ENTRY-SCOPED (#420 codex round 3, rule 2/3): never clobber
  * a row currently owned by a DIFFERENT, still-in-flight writer — that would orphan a
  * live download's index. Records the key on the entry so it can be retired later.
@@ -407,37 +434,33 @@ export async function startDownloadJob(
   // too (the local callback race is inherently local, but this keeps the server
   // write single-writer and the last-started result deterministic).
   let serializeKey: string;
-  /** Did the live server ALREADY list this exact entry before we started? Captured
-   *  HERE, before any bytes are written, so the post-landing check can tell "the
-   *  server sees it BECAUSE we wrote it" from "it already knew that name" (#369). */
-  let listedBefore: boolean | undefined;
+  /** Did the live server ALREADY list this exact entry before we started? Filled in
+   *  by `captureListingBaseline` inside `settled` — NOT here. See #1374 review P1-2
+   *  at the capture site for why the position matters. */
+  let listedBefore: ListedBeforeBaseline = "unknown";
+  /** The entry the baseline is about: the RESOLVED local filename on the local
+   *  route, the requested name on the Manager route. `undefined` on the Manager
+   *  route when the caller named no file — the Manager decides the name from the
+   *  URL and only reports it in the dispatch descriptor, so guessing one here
+   *  would baseline the WRONG entry, which is worse than having no baseline. */
+  let baselineName: string | undefined;
   if (!dispatchToManager) {
     const target = await resolveDownloadTarget(url, targetSubfolder, filename);
-    try {
-      listedBefore = await liveListingHasEntry(targetSubfolder, target.filename);
-    } catch {
-      listedBefore = undefined; // unknowable → the check stays conservative
-    }
+    baselineName = target.filename;
     // Fold auth into the destination key too (#467 P1-A): two concurrent calls to
     // the SAME on-disk destination with DIFFERENT auth are DIFFERENT downloads
     // (different representations) and must NOT dedup to one writer/one job.
     destKey = downloadJobIdFor(`${target.targetPath}\n${authIdentity(auth)}`);
     serializeKey = await localSerializeKey(target.targetPath);
   } else {
-    // #1374 — CAPTURE IT FOR THE MANAGER ROUTE TOO. The post-dispatch check below
-    // asks the connected server whether it now lists the file; without this
-    // baseline, a pre-existing file of the same name reads as a successful
-    // landing, which is the exact trap `listedBefore` was added for on the local
-    // path (#369). The Manager route resolves no local target, so the name asked
-    // for is the name to ask about — that is also what `managerJobFilename` will
-    // report, so the baseline and the check are about the same entry.
-    if (filename) {
-      try {
-        listedBefore = await liveListingHasEntry(targetSubfolder, filename);
-      } catch {
-        listedBefore = undefined; // unknowable → the check stays conservative
-      }
-    }
+    // #1374 — BASELINE THE MANAGER ROUTE TOO. The post-dispatch check below asks
+    // the connected server whether it now lists the file; without a baseline, a
+    // pre-existing file of the same name reads as a successful landing, which is
+    // the exact trap `listedBefore` was added for on the local path (#369). The
+    // Manager route resolves no local target, so the name asked for is the name
+    // to ask about — that is also what `managerJobFilename` will report, so the
+    // baseline and the check are about the same entry.
+    baselineName = filename;
     serializeKey = remoteSerializeKey(url, targetSubfolder, filename);
   }
   // The PUBLIC id (download_model action:"status" handle): the destination key when we have one
@@ -598,12 +621,18 @@ export async function startDownloadJob(
     job.path = landedPath;
     job.status = "done";
     job.finished_at = Date.now();
-    // A LOCAL landing is not yet a verified placement. Mark it PENDING in the SAME
+    // A landing is not yet a verified placement. Mark it PENDING in the SAME
     // synchronous step that publishes "done" (and in the same persisted record), so
     // no reader — this session's tool call inside its grace window, or another
-    // session reading the record — can ever see a completed local download with no
+    // session reading the record — can ever see a completed download with no
     // verification field and render it as confirmed success (#369, codex gate).
-    if (!dispatchToManager) job.live_visible = "pending";
+    //
+    // #1374 review, P1-3 — THE MANAGER ROUTE GETS THIS TOO. Its check runs a beat
+    // after this commit, so `done` with no field was a real, reachable window; a
+    // reader landing in it could not tell "not checked yet" from "pre-fix record"
+    // and the tool re-probed the server by hand to cover for it. With the field
+    // always populated, the record is the single source of the verdict.
+    job.live_visible = "pending";
     // #1545 — this return value was DISCARDED, and it is the one that says
     // whether any OTHER process can see the job finish. `persistDownloadJob`
     // returns false when the atomic replace loses to a reader holding the record
@@ -632,6 +661,20 @@ export async function startDownloadJob(
     // Wait for the prior same-destination job to fully finish (never fail THIS job
     // because that one errored — swallow its result).
     if (priorSameDest) await priorSameDest.catch(() => undefined);
+    // #1374 review, P1-2 — THE BASELINE IS TAKEN HERE, NOT BEFORE THE WAIT.
+    //
+    // It used to be read at job-construction time, which is BEFORE this job takes
+    // its turn in the same-destination chain (#467 P1-C). A second dispatch to the
+    // same (subfolder, name) therefore baselined a directory the FIRST job had not
+    // written to yet, sat in the queue while that job landed the file, and then
+    // read its own post-check as "it appeared → this dispatch landed it" — the
+    // #369 misattribution, manufactured by the serialization it was queued behind.
+    // Rejected second dispatches are exactly the case #1374 is about, so this
+    // window was the bug's own shape.
+    //
+    // Taken immediately before `downloadModel`, with nothing but this job's own
+    // transfer between the two observations.
+    listedBefore = await captureListingBaseline(targetSubfolder, baselineName);
     try {
       // A cancel that arrived before (or while waiting for) our turn makes downloadModel
       // throw at its up-front abort guard → the catch records the cancellation. So there
@@ -675,7 +718,14 @@ export async function startDownloadJob(
       // and the catch below keeps `done`.
       if (!dispatchToManager && (job.status as DownloadJob["status"]) === "done") {
         try {
-          const verdict = await verifyLandedModel(path, targetSubfolder, { listedBefore });
+          const verdict = await verifyLandedModel(path, targetSubfolder, {
+            // verifyLandedModel's own `visible` verdict is gated on the
+            // DESTINATION being one the running server named, not on this
+            // baseline — it uses it only to word an already-inconclusive answer,
+            // and already words `undefined` as "could not be checked". So the
+            // tri-state's third state maps onto the `undefined` it expects.
+            listedBefore: listedBefore === "unknown" ? undefined : listedBefore,
+          });
           if (verdict.verifiedPath) job.path = verdict.verifiedPath;
           job.verified_root = verdict.verifiedAgainstRoot;
           // No verifiedPath means the on-disk stat did NOT succeed — the file was
@@ -1081,9 +1131,25 @@ export function describePlacement(
     if (job.live_visible === "not-visible") {
       return {
         confirmed: false,
-        // The one Manager outcome that IS a positive finding, so it is flagged
-        // the same way the local route flags it rather than buried in prose.
-        wrongPlace: true,
+        // #1374 review, P1-4 — NOT `wrongPlace`, AND THE DIFFERENCE IS NOT
+        // COSMETIC.
+        //
+        // `wrongPlace` means DEMONSTRABLY misplaced, and its consumers act on it:
+        // apply_manifest renders it as `failed`. On the LOCAL route that is
+        // earned — the file was stat'd on disk, so "present but unlisted" is a
+        // real contradiction. Here nothing was stat'd at all. A Manager dispatch
+        // returns on ACCEPTANCE (and #1197: its queue can drain hours before the
+        // transfer does), so "not listed yet" is equally a 13 GB fetch still in
+        // flight or a stale listing. Calling that `failed` invents a failure, and
+        // a caller who believes it re-issues the download and pays for the
+        // transfer twice — the standing rule here is that a false failure costs
+        // more than an unconfirmed success.
+        //
+        // The finding is not softened, only correctly typed: the warning below
+        // states it in full, and `confirmed` stays false, so the item settles as
+        // PENDING — "the placement has not been established" — which is exactly
+        // what was observed.
+        wrongPlace: false,
         pathLabel: "requested destination",
         pathQualifier: "",
         warning:
