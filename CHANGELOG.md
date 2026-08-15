@@ -745,6 +745,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.52] - 2026-08-14
+
+### MCP
+
+#### Fixed
+- adopt the instance the load proved, instead of warning about it (#1478)
+- claim — an API load proves a new instance and leaves the fence stale
+
 ## [0.51.51] - 2026-08-14
 
 ### MCP
