@@ -38,6 +38,20 @@ export type BackendReadiness = {
    *  false) for every other backend so this frame stays a pure ADDITION for
    *  existing consumers/tests. */
   experimental?: boolean;
+  /** Discovery-only signal used for automatic selection. `ready` retains its
+   *  historical install/config semantics; `available` means usable right now.
+   *  Optional so older panel/orchestrator pairs remain wire-compatible. */
+  available?: boolean;
+};
+
+export type BackendDiscoveryOptions = {
+  home?: string;
+  ollamaBaseUrl?: string;
+  ollamaApi?: "ollama" | "openai";
+  lmstudioBaseUrl?: string;
+  llamacppBaseUrl?: string;
+  timeoutMs?: number;
+  fetchImpl?: typeof fetch;
 };
 
 // CLI binary names per provider (Windows resolves .cmd/.exe via PATHEXT, but we
@@ -128,6 +142,94 @@ function fileExists(...parts: string[]): boolean {
   } catch {
     return false;
   }
+}
+
+function claudeCredentialPresent(home: string): boolean {
+  try {
+    const raw = JSON.parse(
+      readFileSync(join(home, ".claude", ".credentials.json"), "utf8"),
+    ) as { claudeAiOauth?: { accessToken?: unknown; refreshToken?: unknown } };
+    const oauth = raw?.claudeAiOauth;
+    return [oauth?.accessToken, oauth?.refreshToken].some(
+      (value) => typeof value === "string" && value.trim().length > 0,
+    );
+  } catch {
+    return false;
+  }
+}
+
+function staticAvailability(readiness: BackendReadiness, home: string): boolean {
+  if (["ollama", "lmstudio", "llamacpp"].includes(readiness.backend)) return false;
+  if (readiness.backend === "claude") return claudeCredentialPresent(home);
+  return readiness.ready;
+}
+
+function modelsEndpoint(baseUrl: string): string {
+  const base = baseUrl.replace(/\/+$/, "");
+  return /\/v1$/i.test(base) ? `${base}/models` : `${base}/v1/models`;
+}
+
+async function probeJsonShape(
+  url: string,
+  valid: (value: unknown) => boolean,
+  options: Required<Pick<BackendDiscoveryOptions, "timeoutMs" | "fetchImpl">>,
+): Promise<boolean> {
+  try {
+    const response = await options.fetchImpl(url, {
+      signal: AbortSignal.timeout(options.timeoutMs),
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) return false;
+    return valid(await response.json());
+  } catch {
+    return false;
+  }
+}
+
+/** Overlay live local-service availability onto the static snapshot. Raw open
+ *  ports do not count: every endpoint must return its provider's JSON shape. */
+export async function discoverBackendAvailability(
+  snapshot: BackendReadiness[],
+  options: BackendDiscoveryOptions = {},
+): Promise<BackendReadiness[]> {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const timeoutMs = options.timeoutMs ?? 1500;
+  const ollamaBase = (options.ollamaBaseUrl ?? "http://127.0.0.1:11434").replace(/\/+$/, "");
+  const lmstudioBase = options.lmstudioBaseUrl ?? "http://127.0.0.1:1234/v1";
+  const llamacppBase = options.llamacppBaseUrl ?? "http://127.0.0.1:8080/v1";
+  const json = { fetchImpl, timeoutMs };
+  const checks = new Map<string, Promise<boolean>>([
+    [
+      "ollama",
+      options.ollamaApi === "openai"
+        ? probeJsonShape(modelsEndpoint(ollamaBase), (v) => Array.isArray((v as { data?: unknown })?.data), json)
+        : probeJsonShape(`${ollamaBase.replace(/\/v1$/i, "")}/api/tags`, (v) => Array.isArray((v as { models?: unknown })?.models), json),
+    ],
+    [
+      "lmstudio",
+      probeJsonShape(modelsEndpoint(lmstudioBase), (v) => Array.isArray((v as { data?: unknown })?.data), json),
+    ],
+    [
+      "llamacpp",
+      probeJsonShape(modelsEndpoint(llamacppBase), (v) => Array.isArray((v as { data?: unknown })?.data), json),
+    ],
+  ]);
+  const live = new Map<string, boolean>();
+  await Promise.all(
+    [...checks].map(async ([backend, check]) => live.set(backend, await check)),
+  );
+  return snapshot.map((entry) => {
+    if (!live.has(entry.backend)) return entry;
+    const available = live.get(entry.backend) === true;
+    return {
+      ...entry,
+      available,
+      // A reachable local service is usable even if its binary/app lives outside
+      // our install probes. Preserve cli=false when stopped so the UI can still
+      // distinguish "not installed" from "installed but not running".
+      ...(available ? { cli: true, auth: true, ready: true } : {}),
+    };
+  });
 }
 
 /** The panel's in-panel-OAuth status records — injectable for tests (so a test
@@ -352,6 +454,10 @@ export function allBackendReadiness(
   backends: BackendReadiness[];
   any_ready: boolean;
 } {
-  const list = [...backends].map((b) => backendReadiness(b, opts));
+  const home = opts?.home ?? homedir();
+  const list = [...backends].map((b) => {
+    const readiness = backendReadiness(b, opts);
+    return { ...readiness, available: staticAvailability(readiness, home) };
+  });
   return { backends: list, any_ready: list.some((r) => r.ready) };
 }

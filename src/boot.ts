@@ -332,6 +332,49 @@ async function main() {
     return;
   }
 
+  // The panel companion is an explicit, out-of-band install. Handle it before
+  // every server/orchestrator branch so launcher management can never start the
+  // MCP stdio server by accident.
+  if (cli.launcherAction !== undefined) {
+    const {
+      installPanelLauncher,
+      queryPanelLauncher,
+      startPanelLauncherBroker,
+      uninstallPanelLauncher,
+    } = await import("./services/panel-launcher.js");
+    const usage = "comfyui-mcp launcher <install|status|uninstall>";
+    if (!cli.launcherAction) {
+      process.stderr.write(`\n${tr("cli.launcher_usage", "Usage: {command}", { command: usage })}\n\n`);
+      process.exitCode = 1;
+      return;
+    }
+    try {
+      if (cli.launcherAction === "install") {
+        installPanelLauncher();
+        process.stdout.write(
+          `\n${tr("cli.launcher_installed", "✓ ComfyUI MCP panel launcher installed for this user.")}\n` +
+            `  ${tr("cli.launcher_installed_note", "MCP itself still starts only when the Agent panel asks for it.")}\n\n`,
+        );
+      } else if (cli.launcherAction === "uninstall") {
+        uninstallPanelLauncher();
+        process.stdout.write(`\n${tr("cli.launcher_uninstalled", "✓ ComfyUI MCP panel launcher uninstalled.")}\n\n`);
+      } else if (cli.launcherAction === "status") {
+        process.stdout.write(`${JSON.stringify(await queryPanelLauncher(), null, 2)}\n`);
+      } else {
+        await startPanelLauncherBroker();
+      }
+    } catch (err) {
+      process.stderr.write(
+        `\n${tr("cli.launcher_failed", "ComfyUI MCP launcher {action} failed: {error}", {
+          action: cli.launcherAction,
+          error: err instanceof Error ? err.message : String(err),
+        })}\n\n`,
+      );
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   // `setup <agent>`: write the comfyui MCP entry into a non-Claude harness's
   // config (Hermes Agent / OpenClaw / Copilot CLI — issue #97), print next
   // steps, and exit. Never starts the MCP server.

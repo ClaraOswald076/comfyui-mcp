@@ -5,11 +5,15 @@
 // on PATH AND a cached login. These tests drive PATH + a fake HOME so the on-disk
 // probes are deterministic across platforms.
 
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join, delimiter } from "node:path";
-import { backendReadiness, allBackendReadiness } from "../../orchestrator/backend-readiness.js";
+import {
+  backendReadiness,
+  allBackendReadiness,
+  discoverBackendAvailability,
+} from "../../orchestrator/backend-readiness.js";
 
 const REAL_PATH = process.env.PATH;
 const REAL_GEMINI_HOME = process.env.GEMINI_CLI_HOME;
@@ -329,5 +333,66 @@ describe("allBackendReadiness", () => {
         delete process.env[envVar];
       }
     });
+  });
+});
+
+describe("live backend discovery", () => {
+  const snapshot = [
+    { backend: "ollama", cli: true, auth: true, ready: true },
+    { backend: "lmstudio", cli: true, auth: true, ready: true },
+    { backend: "llamacpp", cli: false, auth: null, ready: false },
+    { backend: "codex", cli: true, auth: true, ready: true, available: true },
+  ];
+
+  it("requires provider-shaped JSON rather than an open port", async () => {
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("11434")) return new Response('{"models":[]}', { status: 200 });
+      if (url.includes("1234")) return new Response('{"hello":"foreign service"}', { status: 200 });
+      return new Response('{"data":[{"id":"model.gguf"}]}', { status: 200 });
+    }) as typeof fetch;
+    const result = await discoverBackendAvailability(snapshot, { fetchImpl, timeoutMs: 50 });
+    expect(result.find((b) => b.backend === "ollama")?.available).toBe(true);
+    expect(result.find((b) => b.backend === "lmstudio")?.available).toBe(false);
+    expect(result.find((b) => b.backend === "llamacpp")).toMatchObject({
+      available: true,
+      ready: true,
+      cli: true,
+    });
+    expect(result.find((b) => b.backend === "codex")?.available).toBe(true);
+  });
+
+  it("marks installed-but-stopped local providers unavailable without downgrading readiness", async () => {
+    const result = await discoverBackendAvailability(snapshot, {
+      fetchImpl: vi.fn(async () => {
+        throw new Error("connection refused");
+      }) as typeof fetch,
+      timeoutMs: 20,
+    });
+    expect(result.find((b) => b.backend === "ollama")).toMatchObject({
+      cli: true,
+      ready: true,
+      available: false,
+    });
+  });
+});
+
+describe("automatic-selection availability", () => {
+  it("does not claim a Claude login when its credential file is absent", () => {
+    const home = tmp;
+    expect(allBackendReadiness(["claude"], { home }).backends[0]).toMatchObject({
+      ready: true,
+      available: false,
+    });
+  });
+
+  it("recognizes a non-empty Claude OAuth credential", () => {
+    const home = tmp;
+    mkdirSync(join(home, ".claude"), { recursive: true });
+    writeFileSync(
+      join(home, ".claude", ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "oauth-token" } }),
+    );
+    expect(allBackendReadiness(["claude"], { home }).backends[0]?.available).toBe(true);
   });
 });

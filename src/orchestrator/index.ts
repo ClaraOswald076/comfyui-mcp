@@ -173,7 +173,11 @@ import { resolveOpenAiKeyCredentials } from "../services/code-provider-auth.js";
 import { CopilotBackend, COPILOT_DEFAULT_MODEL } from "./copilot-backend.js";
 import { SYSTEM as MODEL_CARD_SYSTEM } from "./ai-proposer.js";
 import { resolvePrompt, registerPrompt, onPromptsChanged } from "../services/prompt-overrides.js";
-import { allBackendReadiness, piCredentialPresent } from "./backend-readiness.js";
+import {
+  allBackendReadiness,
+  discoverBackendAvailability,
+  piCredentialPresent,
+} from "./backend-readiness.js";
 import { handleOAuthBegin, handleOAuthStatus, handleOAuthSignout } from "./oauth-bridge.js";
 // HUMAN-facing `say` bubbles only — `trFor`, never `tr`: each frame renders inside one
 // specific panel tab, in THAT user's language (bridge.tabLocale), not the language of
@@ -3492,30 +3496,62 @@ export async function runPanelOrchestrator(): Promise<void> {
   // truth — not the ComfyUI host's probe, which is blind to the laptop in the
   // "remote ComfyUI, local agent" model (and never sees Claude's SDK, which has
   // no CLI). The panel prefers this frame over its GET /backends probe.
+  const readinessProbeGeneration = new Map<string, number>();
   function pushReadiness(tabId: string): void {
     try {
       const { backends, any_ready } = allBackendReadiness(KNOWN_BACKENDS, {
         customEndpointConfigured: !!customBaseUrl,
       });
-      bridge.push({ type: "backends", backends, any_ready, console_url: consoleUrl, console_token: consoleToken }, tabId);
-      // llama.cpp reality check (async re-push): the binary is often unzipped
-      // anywhere (not on PATH), so static detection says "not installed" while
-      // a server is HAPPILY ANSWERING. A live endpoint beats a missing binary —
-      // probe it and, when it answers, re-push the frame with llamacpp ready.
-      const lc = backends.find((b) => b.backend === "llamacpp");
-      if (lc && !lc.ready) {
-        void fetch(`${LLAMACPP_BASE_URL.replace(/\/v1$/, "")}/health`, {
-          signal: AbortSignal.timeout(1500),
+      const generation = (readinessProbeGeneration.get(tabId) ?? 0) + 1;
+      readinessProbeGeneration.set(tabId, generation);
+      bridge.push(
+        {
+          type: "backends",
+          backends,
+          any_ready,
+          discovery_complete: false,
+          console_url: consoleUrl,
+          console_token: consoleToken,
+        },
+        tabId,
+      );
+      void discoverBackendAvailability(backends, {
+        ollamaBaseUrl: ollamaBaseUrl ?? "http://127.0.0.1:11434",
+        ollamaApi,
+        lmstudioBaseUrl: LMSTUDIO_BASE_URL,
+        llamacppBaseUrl: LLAMACPP_BASE_URL,
+      })
+        .then((discovered) => {
+          if (readinessProbeGeneration.get(tabId) !== generation) return;
+          bridge.push(
+            {
+              type: "backends",
+              backends: discovered,
+              any_ready: discovered.some((entry) => entry.ready),
+              discovery_complete: true,
+              console_url: consoleUrl,
+              console_token: consoleToken,
+            },
+            tabId,
+          );
         })
-          .then((r) => {
-            if (!r.ok) return;
-            lc.cli = true;
-            lc.auth = true;
-            lc.ready = true;
-            bridge.push({ type: "backends", backends, any_ready: true, console_url: consoleUrl, console_token: consoleToken }, tabId);
-          })
-          .catch(() => {});
-      }
+        .catch((err) => {
+          if (readinessProbeGeneration.get(tabId) !== generation) return;
+          logger.warn(
+            `[panel-orchestrator] live provider discovery failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          bridge.push(
+            {
+              type: "backends",
+              backends,
+              any_ready,
+              discovery_complete: true,
+              console_url: consoleUrl,
+              console_token: consoleToken,
+            },
+            tabId,
+          );
+        });
     } catch (err) {
       logger.warn(`[panel-orchestrator] readiness probe failed: ${err instanceof Error ? err.message : String(err)}`);
     }
