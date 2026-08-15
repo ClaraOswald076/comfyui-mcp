@@ -211,6 +211,28 @@ export function ambiguousBareNameRefusal(a: BareNameAmbiguity): string {
     : `No channel in the snapshot resolves "${a.bare}" to the repository you named, so a ` +
       `Manager install cannot be made to fetch it: use install_custom_node (source:"git"), ` +
       `which clones the URL directly instead of resolving a name.`;
+  // GATE ROUND 2 — THE BYPASS SENTENCE USED TO CONTRADICT THE REMEDY ABOVE IT. It read
+  // "naming any `channel` explicitly makes the choice yours and bypasses it" for EVERY
+  // refusal, including the ones whose `escape` had just said no channel resolves this name
+  // to the caller's repository at all. A caller who followed the last thing they read
+  // passed `channel:"default"`, dispatched, and got the other author's code reported as a
+  // success — the exact install this guard exists to stop, reached through the guard's own
+  // advice. Measured: for all 65 repositories that sit inside a multi-candidate channel,
+  // NO channel resolves them uniquely, so that sentence was wrong for every one of them.
+  //
+  // The bypass still has to exist — those 65 have no other `channel` to be sent to, and on
+  // Manager 3.x the install is correct — so it is kept and re-described rather than
+  // removed: it dispatches, it cannot aim, and 3.x is the one reason to take it.
+  const bypass = a.channelsResolvingToCaller.length
+    ? `naming any \`channel\` explicitly makes the choice yours and bypasses it. Bypass it ` +
+      `that way also if this ComfyUI runs Manager 3.x, where the from-source request ` +
+      `carries the URL in \`files\` and IS cloned as passed`
+    : `naming a \`channel\` explicitly does still bypass this check — but do not read that ` +
+      `as the remedy here, because no channel resolves "${a.bare}" to the repository you ` +
+      `named. The bypass would dispatch an install you have no way to aim, and on v4 it ` +
+      `lands on whichever entry that channel's list order happens to keep. The one reason ` +
+      `to take it is a ComfyUI running Manager 3.x, where the from-source request carries ` +
+      `the URL in \`files\` and IS cloned as passed`;
   return (
     `REFUSED before dispatch — this install would not necessarily have installed the ` +
     `repository you named. ComfyUI-Manager v4 resolves a from-source install by the BARE ` +
@@ -219,11 +241,9 @@ export function ambiguousBareNameRefusal(a: BareNameAmbiguity): string {
     `So this would have cloned someone else's code and reported success. Not picked for ` +
     `you: ${escape} ` +
     `(This check ran because no \`channel\` was named, against a snapshot of the six ` +
-    `published channel lists measured ${AMBIGUOUS_BARE_NAMES_MEASURED}; naming any ` +
-    `\`channel\` explicitly makes the choice yours and bypasses it. Bypass it that way ` +
-    `also if this ComfyUI runs Manager 3.x, where the from-source request carries the URL ` +
-    `in \`files\` and IS cloned as passed — this check cannot tell the generations apart, ` +
-    `because the panel picks the dialect after the request leaves here.)`
+    `published channel lists measured ${AMBIGUOUS_BARE_NAMES_MEASURED}; ${bypass} — this ` +
+    `check cannot tell the generations apart, because the panel picks the dialect after ` +
+    `the request leaves here.)`
   );
 }
 
@@ -231,20 +251,37 @@ export function ambiguousBareNameRefusal(a: BareNameAmbiguity): string {
  * The same collision, for a caller who DID name the channel. They made that choice, so
  * this dispatches — but it names the concrete repository their channel carries instead of
  * the generic "111 bare names collide" warning that would otherwise ride along.
+ *
+ * GATE ROUND 2 — "BECAUSE YOU CHOSE THE CHANNEL" IS FALSE FOR AN INTRA-CHANNEL COLLISION.
+ * When the named channel carries the name once, the caller really did choose between the
+ * channels and this dispatches on their choice. When it carries the name TWICE, both
+ * entries live in the list they named: their channel argument selected nothing, no other
+ * channel argument could, and v4 falls back on upstream list order. Telling that caller
+ * their choice was honoured invites them to trust an install they never actually aimed —
+ * so it says instead that nothing here disambiguated, and names the route that clones the
+ * URL verbatim.
  */
 export function ambiguousBareNameWarning(a: BareNameAmbiguity): string {
   // Quote the URL verbatim when `callerRepo` is unset — an off-host or owner-less URL has
   // no github owner to name, and inventing one would report a repository they never typed.
   const asked = a.callerRepo ? `https://github.com/${a.callerRepo}` : `"${a.callerUrl}"`;
-  const carries =
-    a.channelCandidates.length > 1
-      ? `carries "${a.bare}" TWICE — under ${listRepos(a.channelCandidates)} — and v4 keeps whichever comes last in that list`
-      : `resolves "${a.bare}" to ${listRepos(a.channelCandidates)}`;
+  const ambiguousAlone = a.channelCandidates.length > 1;
+  const carries = ambiguousAlone
+    ? `carries "${a.bare}" TWICE — under ${listRepos(a.channelCandidates)} — and v4 keeps whichever comes last in that list`
+    : `resolves "${a.bare}" to ${listRepos(a.channelCandidates)}`;
+  const why = ambiguousAlone
+    ? `Naming that channel did NOT disambiguate this one — both entries are in the list ` +
+      `you named, so no \`channel\` argument can separate them and on v4 the winner is ` +
+      `that list's order. Dispatched because you named a channel, and because on Manager ` +
+      `3.x the URL you passed IS what gets cloned; if this is v4 and you need the ` +
+      `repository you typed, install_custom_node (source:"git") clones it directly ` +
+      `instead of resolving a name`
+    : `Dispatched anyway because you chose the channel`;
   return (
     `NAMED-CHANNEL COLLISION: you asked for ${asked}, but the "${a.channel}" channel you ` +
     `named ${carries}. v4 resolves this install by the bare name and clones the URL from ` +
-    `ITS list, so what lands is very likely not what you passed. Dispatched anyway because ` +
-    `you chose the channel — verify with panel_list_nodes before you restart or report ` +
-    `success. (Snapshot measured ${AMBIGUOUS_BARE_NAMES_MEASURED}.)`
+    `ITS list, so what lands is very likely not what you passed. ${why} — verify with ` +
+    `panel_list_nodes before you restart or report success. (Snapshot measured ` +
+    `${AMBIGUOUS_BARE_NAMES_MEASURED}.)`
   );
 }

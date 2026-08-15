@@ -38,6 +38,7 @@ import { describe, expect, it, vi } from "vitest";
 import { nodesInstallCommandArgs } from "../../services/node-management.js";
 import {
   AMBIGUOUS_BARE_NAMES,
+  ambiguousBareNameRefusal,
   bareNameAmbiguity,
   gitHostOf,
   managerBareName,
@@ -143,7 +144,7 @@ describe("the ambiguous from-source install is refused, not picked (#1616)", () 
   it("ALLOWS the caller who named the repository the asked-for channel carries", () => {
     // The same colliding NAME, the other author: `default` carries hieuck's, so there is
     // nothing to pick between. A guard that fired on the name alone would break every
-    // correct install of a colliding pack — 92 of the 104 have a `default` entry.
+    // correct install of a colliding pack — most of the 111 have a `default` entry.
     const out = nodesInstallCommandArgs({ repository: DEFAULT_AUTHORS });
     expect(out.conflict).toBeUndefined();
     expect(out.channel).toBe("default");
@@ -228,6 +229,78 @@ describe("the ambiguous from-source install is refused, not picked (#1616)", () 
     expect(conflict).toMatch(/IS cloned as passed/i);
   });
 
+  it("does NOT offer the channel bypass as the remedy when no channel can deliver", () => {
+    // GATE ROUND 2, and the worst kind of defect this PR could have shipped: the refusal
+    // told EVERY caller that "naming any `channel` explicitly makes the choice yours and
+    // bypasses it" — including the ones it had just told, one sentence earlier, that no
+    // channel resolves the name to their repository. Following the last thing they read
+    // (`channel:"default"`) dispatches and installs ciga2011's code as a success. That is
+    // the exact install this guard exists to prevent, reached through the guard's own
+    // advice. Measured: all 65 repositories trapped inside a multi-candidate channel have
+    // NO uniquely-resolving channel, so the sentence was wrong for every one of them.
+    const conflict =
+      nodesInstallCommandArgs({ repository: "https://github.com/1038lab/ComfyUI-Pollinations" })
+        .conflict ?? "";
+    expect(conflict).toMatch(/No channel in the snapshot resolves/);
+    expect(conflict).not.toMatch(/makes the choice yours/);
+    expect(conflict).toMatch(/do not read that as the remedy here/i);
+    // The bypass is still disclosed — it must stay reachable for Manager 3.x — but as the
+    // 3.x escape it actually is, not as the way to get the repository they named.
+    expect(conflict).toMatch(/Manager 3\.x/);
+    expect(conflict).toMatch(/no way to aim/i);
+  });
+
+  it("KEEPS the plain bypass wording where a channel really does deliver", () => {
+    // The cross-channel case is untouched: `dev` resolves the caller's repo, so naming it
+    // both bypasses the check AND fetches what they asked for. Narrowing the sentence must
+    // not have flattened this one into the same hedged text.
+    const conflict = nodesInstallCommandArgs({ repository: DEV_AUTHORS }).conflict ?? "";
+    expect(conflict).toMatch(/makes the choice yours and bypasses it/);
+    expect(conflict).not.toMatch(/do not read that as the remedy here/i);
+  });
+
+  it("NO refusal ever recommends a bypass it has just ruled out", () => {
+    // The report's own input, applied to all 111 names rather than the two hand-picked
+    // above: a message that says "no channel resolves this" and "naming a channel makes
+    // the choice yours" in the same breath is self-contradictory whichever name produced
+    // it. Enumerate instead of trusting the two examples.
+    for (const [name, byChannel] of Object.entries(AMBIGUOUS_BARE_NAMES)) {
+      for (const channel of Object.keys(byChannel)) {
+        for (const repo of byChannel[channel as keyof typeof byChannel] ?? []) {
+          const amb = bareNameAmbiguity(`https://github.com/${repo}`, channel);
+          if (!amb) continue;
+          const text = ambiguousBareNameRefusal(amb);
+          const deadEnd = /No channel in the snapshot resolves/.test(text);
+          const promisesAChannel = /makes the choice yours/.test(text);
+          expect(deadEnd && promisesAChannel, `${name} @ ${channel} -> ${repo}`).toBe(false);
+        }
+      }
+    }
+  });
+
+  it("the NAMED-channel warning does not claim a choice the caller could not make", () => {
+    // GATE ROUND 2. `default` carries ComfyUI-Pollinations twice, so `channel:"default"`
+    // selected nothing — both entries are in the list they named and v4 falls back on
+    // upstream list order. "Dispatched anyway because you chose the channel" invites them
+    // to trust an install they never aimed.
+    const out = nodesInstallCommandArgs({
+      repository: "https://github.com/1038lab/ComfyUI-Pollinations",
+      channel: "default",
+    });
+    expect(out.conflict).toBeUndefined(); // still dispatches — the escape must survive
+    const note = out.note ?? "";
+    expect(note).toMatch(/did NOT disambiguate this one/);
+    expect(note).not.toMatch(/Dispatched anyway because you chose the channel/);
+    expect(note).toMatch(/install_custom_node \(source:"git"\)/);
+  });
+
+  it("the cross-channel warning still credits the choice the caller DID make", () => {
+    // `legacy` carries the name once, so naming it was a real selection between channels.
+    const note = nodesInstallCommandArgs({ repository: DEV_AUTHORS, channel: "legacy" }).note ?? "";
+    expect(note).toMatch(/Dispatched anyway because you chose the channel/);
+    expect(note).not.toMatch(/did NOT disambiguate/);
+  });
+
   it("matches the name CASE-INSENSITIVELY, the way Manager's own lookup does", () => {
     // `NormalizedKeyDict.get` keys on `key.strip().lower()`. A case-sensitive guard is
     // exactly what undercounted the hazard at 65 in the first place.
@@ -265,7 +338,7 @@ describe("the ambiguous from-source install is refused, not picked (#1616)", () 
   });
 
   it("MUST NOT touch a name the snapshot has not seen collide", () => {
-    // 104 names out of ~5850 in `default` alone. Everything else keeps what it had.
+    // 111 names out of ~5850 in `default` alone. Everything else keeps what it had.
     expect(nodesInstallCommandArgs({ repository: UNCOLLIDING }).conflict).toBeUndefined();
     expect(nodesInstallCommandArgs({ repository: UNCOLLIDING }).channel).toBe("default");
   });
