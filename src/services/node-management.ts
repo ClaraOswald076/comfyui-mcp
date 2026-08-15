@@ -4466,9 +4466,9 @@ function gitUrlOwnerRepo(url: string): string | undefined {
  * comparing bare names case-SENSITIVELY. Manager's own lookup is not: `get_custom_nodes`
  * returns a `NormalizedKeyDict` whose `get` keys on `key.strip().lower()`, so
  * `comfyui_tagger` and `ComfyUI_tagger` are one name. Counted the way the lookup counts:
- * 104 names resolve to different repositories across the six published channels, 60 of
+ * 111 names resolve to different repositories across the six published channels, 60 of
  * them between `default` and `dev` alone. This note is now the FALLBACK disclosure — the
- * measured 104 are refused before dispatch by `bareNameAmbiguity` when the channel was
+ * measured 111 are refused before dispatch by `bareNameAmbiguity` when the channel was
  * defaulted, and this text covers everything that snapshot has not seen.
  */
 function gitInstallSubstitutionNote(channel: string, url: string): string {
@@ -4477,7 +4477,7 @@ function gitInstallSubstitutionNote(channel: string, url: string): string {
   return (
     `WHAT GETS CLONED IS NOT NECESSARILY THE URL YOU PASSED. Manager v4 resolves a ` +
     `from-source install by the BARE REPO NAME ("${bare}") against the "${channel}" ` +
-    `channel's list, then clones the URL recorded in THAT entry — 104 bare names resolve ` +
+    `channel's list, then clones the URL recorded in THAT entry — 111 bare names resolve ` +
     `to DIFFERENT repositories depending on the channel asked. So if "${channel}" lists ` +
     `that name under anyone other than ${owner ? `the ${owner} you passed` : "the author you passed"}, ` +
     `this installs THEIR repository and still reports success. Confirm with ` +

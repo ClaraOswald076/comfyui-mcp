@@ -20,11 +20,13 @@
 // case-SENSITIVE and the lookup is not — `NormalizedKeyDict.get` lowercases, so
 // `comfyui_tagger` and `ComfyUI_tagger` are ONE name. Counted the way the lookup counts:
 //
-//   * 104 bare names resolve to different repositories depending on the channel
+//   * 111 bare names resolve to different repositories depending on the channel
 //   * 60 of those disagree between `default` and `dev` alone
-//   * 13 are ambiguous WITHIN a single channel — a class #1616 does not mention. Two
-//     case-variant entries collapse onto one key and the winner is list order, so no
-//     second channel is needed to hand back someone else's repository.
+//   * 28 are ambiguous WITHIN a single channel — a class #1616 does not mention. Two
+//     entries under one name collapse onto one key (`load_nightly` overwrites on an
+//     exact-case duplicate, `NormalizedKeyDict` on a case-variant one) and the survivor
+//     is upstream list order, so no second channel is needed to hand back someone
+//     else's repository.
 //
 // ## What the guard deliberately does NOT do
 //
@@ -37,6 +39,7 @@ import { nodesInstallCommandArgs } from "../../services/node-management.js";
 import {
   AMBIGUOUS_BARE_NAMES,
   bareNameAmbiguity,
+  gitHostOf,
   managerBareName,
   ownerRepoOf,
 } from "../../services/manager-bare-name-collisions.js";
@@ -169,15 +172,60 @@ describe("the ambiguous from-source install is refused, not picked (#1616)", () 
   });
 
   it("catches the name that is ambiguous INSIDE one channel, with no second channel", () => {
-    // 13 names collapse two case-variant entries onto one NormalizedKeyDict key, where
-    // the winner is list order. `default` lists BOTH Zuellni/ComfyUI-Custom-Nodes and
-    // rcsaquino/comfyui-custom-nodes, so asking it for that name cannot be answered.
+    // 28 names collapse two entries onto one key, where the survivor is list order.
+    // `default` lists BOTH Zuellni/ComfyUI-Custom-Nodes and rcsaquino/comfyui-custom-nodes
+    // (a case variant), so asking it for that name cannot be answered.
     const conflict =
       nodesInstallCommandArgs({ repository: "https://github.com/Zuellni/ComfyUI-Custom-Nodes" })
         .conflict ?? "";
     expect(conflict).toMatch(/carries that name TWICE/i);
     expect(conflict).toMatch(/Zuellni\/ComfyUI-Custom-Nodes/);
     expect(conflict).toMatch(/rcsaquino\/comfyui-custom-nodes/);
+  });
+
+  it("catches the EXACT-CASE duplicate too, which Manager drops before anyone sees it", () => {
+    // Gate finding. `load_nightly` does `res[repo_name] = (x, False)` into a plain dict, so
+    // two entries whose bare names match EXACTLY overwrite — one of them is gone before
+    // `NormalizedKeyDict` is involved at all. The first shape of the generator modelled
+    // that overwrite and so recorded only the survivor, which made the name look unique
+    // and the guard never fire: `default` carries both 1038lab/ComfyUI-Pollinations and
+    // ciga2011/ComfyUI-Pollinations, and asking for either one could get the other.
+    const conflict =
+      nodesInstallCommandArgs({ repository: "https://github.com/1038lab/ComfyUI-Pollinations" })
+        .conflict ?? "";
+    expect(conflict).toMatch(/carries that name TWICE/i);
+    expect(conflict).toMatch(/1038lab\/ComfyUI-Pollinations/);
+    expect(conflict).toMatch(/ciga2011\/ComfyUI-Pollinations/);
+  });
+
+  it("does NOT read an off-host URL as a match for the GitHub repo of the same path", () => {
+    // Gate finding. `gitlab.com/0dot77/comfyui-annotations` is not
+    // `github.com/0dot77/comfyui-annotations`; comparing only owner/repo made the first
+    // one look like an exact match for `default`'s entry and waved it through, while v4
+    // would still have resolved the bare name and cloned the GitHub one.
+    const out = nodesInstallCommandArgs({
+      repository: "https://gitlab.com/0dot77/comfyui-annotations",
+    });
+    expect(out.conflict).toBeTruthy();
+    // And it quotes the URL they actually passed rather than inventing a github owner.
+    expect(out.conflict).toMatch(/"https:\/\/gitlab\.com\/0dot77\/comfyui-annotations"/);
+    expect(out.conflict).not.toMatch(/github\.com\/0dot77\/comfyui-annotations, and/);
+    // The same path ON github is the channel's own entry, so that one still installs.
+    expect(
+      nodesInstallCommandArgs({ repository: "https://github.com/0dot77/comfyui-annotations" })
+        .conflict,
+    ).toBeUndefined();
+  });
+
+  it("names the Manager 3.x escape, where the URL IS cloned as passed", () => {
+    // Gate finding, and it cannot be fixed by detection: the 3.x dialects send
+    // `files:[url]` and clone it directly, so this refusal is a false positive there — but
+    // the PANEL picks the dialect after the request leaves the orchestrator, and the
+    // orchestrator's own dialect cache is keyed to a ComfyUI that need not be the panel's.
+    // So it is disclosed with the one argument that clears it.
+    const conflict = nodesInstallCommandArgs({ repository: DEV_AUTHORS }).conflict ?? "";
+    expect(conflict).toMatch(/Manager 3\.x/);
+    expect(conflict).toMatch(/IS cloned as passed/i);
   });
 
   it("matches the name CASE-INSENSITIVELY, the way Manager's own lookup does", () => {
@@ -254,8 +302,10 @@ describe("the ambiguous from-source install is refused, not picked (#1616)", () 
   it("the tool's DESCRIPTION says the refusal exists, before any call is made", () => {
     const text = installNodeDef().description ?? "";
     expect(text).toMatch(/REFUSES instead of picking/i);
-    expect(text).toMatch(/104 bare names/);
-    expect(text).toMatch(/13 are ambiguous inside ONE channel/i);
+    expect(text).toMatch(/111 bare names/);
+    expect(text).toMatch(/28 are ambiguous inside ONE channel/i);
+    // And the 3.x false positive is disclosed where a caller reads before calling.
+    expect(text).toMatch(/Manager 3\.x/);
   });
 });
 
@@ -286,15 +336,33 @@ describe("the snapshot and its predicate (#1616)", () => {
     }
   });
 
-  it("holds the measured population — 104 names, 13 ambiguous within one channel", () => {
+  it("holds the measured population — 111 names, 28 ambiguous within one channel", () => {
     // Pinned so a regeneration that silently drops the table (an empty object still
     // passes every "for each entry" assertion above) is caught.
     const names = Object.keys(AMBIGUOUS_BARE_NAMES);
-    expect(names.length).toBe(104);
+    expect(names.length).toBe(111);
     const intra = names.filter((n) =>
       Object.values(AMBIGUOUS_BARE_NAMES[n]).some((repos) => repos.length > 1),
     );
-    expect(intra.length).toBe(13);
+    expect(intra.length).toBe(28);
+  });
+
+  it("records EVERY repository under a name, not the one list order would pick", () => {
+    // The generator must not model Manager's overwrite. If it does, the loser vanishes and
+    // an exact-case duplicate reads as a unique name — the guard then never fires for it.
+    expect(AMBIGUOUS_BARE_NAMES["comfyui-pollinations"]?.default).toEqual([
+      "1038lab/ComfyUI-Pollinations",
+      "ciga2011/ComfyUI-Pollinations",
+    ]);
+  });
+
+  it("reads the host, so an off-host URL is never a match", () => {
+    expect(gitHostOf("https://gitlab.com/a/b")).toBe("gitlab.com");
+    expect(gitHostOf("git@gitlab.com:a/b.git")).toBe("gitlab.com");
+    expect(gitHostOf("ssh://git@github.com/a/b")).toBe("github.com");
+    expect(gitHostOf("https://GitHub.com/a/b")).toBe("github.com");
+    // A bare shorthand names no host; the panel expands it to github.com.
+    expect(gitHostOf("a/b")).toBeUndefined();
   });
 
   it("derives the bare name exactly as the panel's gitRepoName does", () => {

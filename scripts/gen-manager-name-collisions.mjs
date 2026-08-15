@@ -53,28 +53,38 @@ function ownerRepo(url) {
   return `${owner}/${repo}`;
 }
 
+/**
+ * lower(bare name) -> Set(owner/repo) that this channel's list carries under it.
+ *
+ * EVERY repository under the name, not the one that would win. Manager drops all but one:
+ * `load_nightly`'s `res[repo_name] = (x, False)` overwrites on an exact-case duplicate, and
+ * `NormalizedKeyDict.__setitem__` re-points `_key_map` on a case-variant one. So exactly
+ * one entry is reachable and WHICH one is decided by the order of an upstream JSON file.
+ *
+ * Modelling that order and letting the winner through was this generator's first shape,
+ * and it is wrong twice over: it hides the loser completely — an exact-case duplicate then
+ * looks like a unique name and the guard never fires for it — and an upstream reorder
+ * silently flips a call from correct to wrong-repo with nothing here changing. Recording
+ * every candidate is order-independent and refuses both spellings, which is the standing
+ * rule: name the candidates, never pick between them.
+ */
 async function channelMap(channel) {
   const res = await fetch(`${CHANNEL_URLS[channel]}/custom-node-list.json`);
   if (!res.ok) throw new Error(`${channel}: HTTP ${res.status}`);
   const raw = await res.json();
-  // load_nightly's `res`: the entries reachable at all (plain dict, case-sensitive keys).
-  const reachable = new Map();
-  for (const x of raw.custom_nodes) {
-    for (const y of x.files ?? []) {
-      if (y.includes("github.com") && !y.endsWith(".py") && !y.endsWith(".js")) {
-        reachable.set(y.split("/").pop(), x);
-      }
-    }
-    if (x.id !== undefined && !reachable.has(x.id)) reachable.set(x.id, x);
-  }
-  // get_custom_nodes' re-key, collapsed the way NormalizedKeyDict.get() collapses it.
   const out = new Map();
-  for (const x of new Set(reachable.values())) {
+  for (const x of raw.custom_nodes) {
     const files = x.files ?? [];
+    // len(files) > 1 is keyed by files[0] — a whole URL, unreachable by a bare name.
     if (files.length !== 1) continue;
-    const repo = ownerRepo(files[0]);
+    const url = files[0];
+    // load_nightly reaches an entry through a github file or through its `id`;
+    // get_custom_nodes then keys it by the file's basename either way.
+    const viaFile = url.includes("github.com") && !url.endsWith(".py") && !url.endsWith(".js");
+    if (!viaFile && x.id === undefined) continue;
+    const repo = ownerRepo(url);
     if (!repo) continue;
-    const key = files[0].split("/").pop().trim().toLowerCase();
+    const key = url.split("/").pop().trim().toLowerCase();
     if (!out.has(key)) out.set(key, new Set());
     out.get(key).add(repo);
   }
