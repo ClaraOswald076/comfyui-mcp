@@ -181,6 +181,45 @@ describe("bundled skills stay inside the documented Agent Skills limits (#1620)"
   });
 });
 
+describe("the .agents generator can read a CRLF checkout (#1620)", () => {
+  // scripts/sync-agents.mjs runs everything at module scope (it mkdirs and writes on
+  // import), so it cannot be imported and exercised here. Assert at the SOURCE instead —
+  // this is a one-line normalization whose absence is invisible to every behavioural test
+  // and whose failure is silent: `^---\n` does not match `---\r\n`, so on any checkout
+  // with core.autocrlf=true (the Windows default) extractFrontmatter took its
+  // no-frontmatter branch and emitted all 39 skills with an EMPTY description and the
+  // original frontmatter duplicated into the body. Nothing was red; the output was just
+  // wrong. Same root cause as #1617, in the generator rather than in a test.
+  const SRC = readFileSync(
+    fileURLToPath(new URL("../../../scripts/sync-agents.mjs", import.meta.url)),
+    "utf-8",
+  );
+
+  it("folds CRLF before matching the frontmatter fence", () => {
+    const fn = SRC.slice(SRC.indexOf("function extractFrontmatter"));
+    // Strip `//` comment lines first. The explanatory comment above the fix quotes both
+    // `\r\n` and `^---`, so an ordering check over the raw text finds the prose rather
+    // than the code and reports backwards.
+    const body = fn
+      .slice(0, fn.indexOf("\n}"))
+      .split("\n")
+      .filter((l) => !l.trim().startsWith("//"))
+      .join("\n");
+    // The normalization must happen BEFORE the fence match, not after.
+    const normAt = body.indexOf("\\r\\n");
+    const matchAt = body.indexOf("^---");
+    expect(normAt, "sync-agents.mjs no longer folds CRLF").toBeGreaterThan(-1);
+    expect(matchAt, "sync-agents.mjs no longer matches a frontmatter fence").toBeGreaterThan(-1);
+    expect(normAt).toBeLessThan(matchAt);
+  });
+
+  it("falls back to the NORMALIZED text, not the raw bytes", () => {
+    // The no-frontmatter branch has to return normalized content too, or a file that
+    // genuinely has no frontmatter still carries CRLF into the generated copy.
+    expect(SRC).toMatch(/return \{ frontmatter: \{\}, body: normalized \}/);
+  });
+});
+
 describe("long reference files open with a table of contents (#1620)", () => {
   const docs = listReferenceDocs();
 
