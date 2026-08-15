@@ -128,6 +128,29 @@ describe("#1624 — a re-keyed repository is refused instead of substituted", ()
     expect(res.conflict).toContain('install_custom_node (source:"git")');
   });
 
+  it("does not apply channel reasoning to a route Manager reads no channel for", () => {
+    // GATE FINDING. GuardSkill/ComfyUI-ElevenLabs is re-keyed ("ElevenLabs") and `default`
+    // answers to its name with jerilseb's — but the registry holds no pack called
+    // `comfyui-elevenlabs`, so `rekeyedRegistryVersionAmbiguity` declines and the call
+    // used to fall through to the FROM-SOURCE refusal, which told the caller the default
+    // channel's list was what would be cloned. With an explicit version Manager never
+    // reads a channel: it calls `cnr_install("ComfyUI-ElevenLabs", "1.2.3")`, finds no
+    // such id, and fails. Refusing was directionally right and the remedy was correct,
+    // which is precisely how a fabricated mechanism survives — so the call dispatches and
+    // takes Manager's own "not found" instead. 12 of the 98 records are in this shape.
+    const url = "https://github.com/GuardSkill/ComfyUI-ElevenLabs";
+    const rec = REKEYED_SUBSTITUTIONS["guardskill/comfyui-elevenlabs"];
+    expect(rec?.channelTargets.default ?? []).toHaveLength(1);
+    expect(rec?.registryTarget).toBeUndefined();
+    const res = nodesInstallCommandArgs({ repository: url, version: "1.2.3" });
+    expect(res.conflict).toBeUndefined();
+    expect(res.note ?? "").not.toContain("RE-KEYED PACK");
+    // The same URL with no version IS on the from-source route, and is still refused.
+    expect(nodesInstallCommandArgs({ repository: url }).conflict).toContain(
+      "jerilseb/ComfyUI-ElevenLabs",
+    );
+  });
+
   it("does not treat a from-source spec as a registry version", () => {
     // "nightly" and "unknown" DO consult the channel, so they belong to the from-source
     // refusal — routing them to the registry-version message would state a mechanism that

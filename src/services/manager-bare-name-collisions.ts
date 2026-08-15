@@ -524,12 +524,30 @@ export interface RekeyedRegistryVersionAmbiguity {
   registryTarget: string;
 }
 
+/**
+ * Does this version spec put the install on the FROM-SOURCE path — the one where Manager
+ * reads a channel's list at all? `install_by_id` consults `get_custom_nodes` only for
+ * "unknown"/"nightly" and otherwise goes straight to `cnr_install` (quoted in full above
+ * `RegistryVersionAmbiguity`).
+ *
+ * One predicate for every caller, because the two things it decides are opposites: the
+ * channel-based messages are only TRUE here, and the registry-id ones are only true where
+ * this is false. Two copies that drifted would not fail loudly — each side would simply
+ * describe the wrong route to somebody.
+ *
+ * An absent version counts as from-source: `normalizeGitUrlInstallArgs` sends "nightly"
+ * for it.
+ */
+export function isFromSourceSpec(version: string | undefined): boolean {
+  const spec = version?.trim().toLowerCase() ?? "";
+  return spec === "nightly" || spec === "unknown" || spec.length === 0;
+}
+
 export function rekeyedRegistryVersionAmbiguity(
   url: string,
   version: string,
 ): RekeyedRegistryVersionAmbiguity | undefined {
-  const spec = version.trim().toLowerCase();
-  if (spec === "nightly" || spec === "unknown" || spec.length === 0) return undefined;
+  if (isFromSourceSpec(version)) return undefined;
   const found = rekeyedRecordFor(url);
   if (!found?.rec.registryTarget) return undefined;
   return {
@@ -618,8 +636,7 @@ export function registryVersionAmbiguity(
   url: string,
   version: string,
 ): RegistryVersionAmbiguity | undefined {
-  const spec = version.trim().toLowerCase();
-  if (spec === "nightly" || spec === "unknown" || spec.length === 0) return undefined;
+  if (isFromSourceSpec(version)) return undefined;
   const bare = managerBareName(url);
   const entry = ownCandidates(AMBIGUOUS_BARE_NAMES, bare.trim().toLowerCase());
   if (!entry) return undefined;

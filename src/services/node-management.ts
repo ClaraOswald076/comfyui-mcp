@@ -32,6 +32,7 @@ import {
   ambiguousBareNameRefusal,
   ambiguousBareNameWarning,
   bareNameAmbiguity,
+  isFromSourceSpec,
   registryVersionAmbiguity,
   registryVersionRefusal,
   rekeyedRegistryVersionAmbiguity,
@@ -4597,8 +4598,20 @@ export function nodesInstallCommandArgs(args: {
   // #1624 — AND THE FROM-SOURCE ROUTE FOR THE SAME REPOSITORIES. Consulted only when the
   // contested-name table said nothing, because when it DOES fire it already reasons about
   // re-keying (`REKEYED_REPOS`) for that name and a second message would say it twice.
+  //
+  // GATE FINDING — AND ONLY ON THE ROUTE THAT READS A CHANNEL. The two returns above do
+  // NOT leave "necessarily from-source" true for this table the way they do for the
+  // contested one. `registryVersionAmbiguity` covers every contested name a channel can
+  // answer to, but `rekeyedRegistryVersionAmbiguity` requires a `registryTarget`, and 12
+  // of the 98 re-keyed records have none — the registry holds nothing under their bare
+  // name. For those, an explicit version fell through to a refusal that told the caller
+  // the channel's list was what would be cloned, when on that route Manager calls
+  // `cnr_install(bare, version)`, reads no channel, finds no such id and fails. Refusing
+  // was directionally defensible and the remedy it named was even correct, which is how a
+  // fabricated mechanism survives review — so the check is scoped to the route it
+  // describes, and Manager's own "not found" (which substitutes nobody's code) stands.
   const rekeyed =
-    rerouted && norm.repository && !ambiguity
+    rerouted && norm.repository && !ambiguity && isFromSourceSpec(norm.version)
       ? rekeyedRepoAmbiguity(norm.repository, effectiveChannel)
       : undefined;
   if (rekeyed && defaultedChannel) return { conflict: rekeyedRepoRefusal(rekeyed) };
