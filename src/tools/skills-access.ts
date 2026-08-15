@@ -529,9 +529,20 @@ function readPackWorkflowAction(rawName: string): ToolText {
 /** The workflow-templates index path, appended to a base or an origin. */
 const TEMPLATE_INDEX_PATH = "/api/workflow_templates";
 
-/** Attribution for a NON-2xx that came back from the panel fallback rather than
- *  the configured target. "" for the ordinary case, so the untouched path keeps
- *  its exact wording. */
+/**
+ * Attribution for a FAILING response that came back from the panel fallback
+ * rather than from the configured target. "" for the ordinary case, so the
+ * untouched path keeps its exact wording.
+ *
+ * Used by both failing outcomes — a non-2xx, and a 2xx whose body is not an index
+ * (#1600). It says "the response above" rather than "the status above" because
+ * the second of those is a 200 with a wrong body, and a note that describes the
+ * wrong half of its own message is how a correction gets read as boilerplate.
+ *
+ * The last sentence is the one that matters on the body-shape path: that
+ * diagnosis is produced by a shared helper whose remedy names the CONFIGURED base
+ * URL, which is a server this call has just established it cannot reach.
+ */
 function panelFallbackNote(
   origin: string | undefined,
   configuredUrl: string,
@@ -541,8 +552,9 @@ function panelFallbackNote(
   return (
     ` NOTE: that address is NOT your configured ComfyUI — ${configuredUrl} could not be reached ` +
     `at all, so this request went to ${origin}, published${observedAgo(ageMs)} as the origin of a ` +
-    `connected sidebar panel. The status above came from ${origin} and describes THAT server. ` +
-    `It does not establish that a panel is on it now.`
+    `connected sidebar panel. The response above came from ${origin} and describes THAT server. ` +
+    `It does not establish that a panel is on it now, and any advice above about your configured ` +
+    `base URL is about the server that did NOT answer this — check ${origin} instead.`
   );
 }
 
@@ -634,7 +646,11 @@ async function fetchTemplateIndexViaPanel(
   const snapshot = connectedPanelOriginsSnapshot();
   const choice = choosePanelFallbackOrigin(failedUrl, snapshot.origins);
   const declined = describeDeclinedPanelFallback(choice, snapshot.ageMs);
-  if (choice.kind !== "use") {
+  // `alias` is retried on the same terms as `use` (#1600 gate, finding 2): it is
+  // the configured server reached by another host spelling — a ComfyUI bound to
+  // `[::1]` while COMFYUI_URL says `127.0.0.1` — and declining it left the
+  // clearest case for this whole feature unserved.
+  if (choice.kind !== "use" && choice.kind !== "alias") {
     if (declined && primaryError instanceof Error) {
       throw new Error(`${primaryError.message}${declined}`, { cause: primaryError });
     }
@@ -659,12 +675,26 @@ async function fetchTemplateIndexViaPanel(
     });
   } catch (err) {
     const secondary = describeFetchFailure(err).message;
+    // WHY BOTH ADDRESSES FAILED depends on which kind of address this was, and
+    // saying the wrong one is a false mechanism claim (#1600 gate, finding 2).
+    //
+    // For a genuinely DIFFERENT origin, "the browser reached it and we cannot"
+    // is the finding. For an ALIAS it would be nonsense: `[::1]` and
+    // `127.0.0.1` are the same machine, and there is no tunnel or container
+    // boundary between a host and itself. All that was learned there is that
+    // neither spelling answered.
+    const why =
+      choice.kind === "alias"
+        ? `Both addresses name the same server under this project's loopback rules (#1175), ` +
+          `reached by a different host spelling — an IPv4/IPv6 split is the usual reason one ` +
+          `spelling answers when the other refuses. Neither answered here, so that is not what ` +
+          `is wrong: nothing this process can reach is serving that port.`
+        : `A browser was connected from that origin, so it was reachable from there while this ` +
+          `process cannot reach it: something between them (a tunnel, a container boundary, or a ` +
+          `server bound to one interface) is in the way, and no address here will fix it.`;
     throw new Error(
       `${primary} I then tried ${altUrl}, published${observedAgo(snapshot.ageMs)} as the origin ` +
-        `of a connected sidebar panel, and that failed too: ${secondary}. A browser was connected ` +
-        `from that origin, so it was reachable from there while this process cannot reach it: ` +
-        `something between them (a tunnel, a container boundary, or a server bound to one ` +
-        `interface) is in the way, and no address here will fix it.`,
+        `of a connected sidebar panel, and that failed too: ${secondary}. ${why}`,
       { cause: err },
     );
   }
@@ -790,11 +820,35 @@ async function listWorkflowTemplatesAction(): Promise<ToolText> {
   // A 200 whose body is an HTML document is the #828 case: the frontend's
   // catch-all (or a proxy) answered a route it never forwarded to the API.
   // readComfyJson names that instead of throwing "Unexpected token '<'".
-  const index = await readComfyJson<Record<string, unknown>>(res, {
-    url,
-    expectShape: (v) => !!v && typeof v === "object" && !Array.isArray(v),
-    shapeHint: "the /api/workflow_templates index (an object keyed by source)",
-  });
+  // #1600 — THE SIXTH OUTCOME, and the one that pointed at the wrong machine.
+  //
+  // A 2xx whose body is not an index throws from here, and classifyNonJson's
+  // remedy is built from getComfyUIBaseUrl(): it tells the reader to go and check
+  // the CONFIGURED base's /system_stats. After a fallback that is a server we
+  // just established cannot be reached at all, while the body being diagnosed
+  // came from somewhere else entirely — one message naming two machines as
+  // though they were one. Round one corrected four sites and round two a fifth;
+  // this is the sixth, and it is the exact path a path-prefixed ComfyUI (gate
+  // finding 1) lands on.
+  //
+  // The note is appended rather than the helper re-plumbed: classifyNonJson is
+  // shared by every JSON read in the process, and widening its signature to carry
+  // "who actually answered" is a change to all of them for one caller's benefit.
+  let index: Record<string, unknown>;
+  try {
+    index = await readComfyJson<Record<string, unknown>>(res, {
+      url,
+      expectShape: (v) => !!v && typeof v === "object" && !Array.isArray(v),
+      shapeHint: "the /api/workflow_templates index (an object keyed by source)",
+    });
+  } catch (err) {
+    const note = panelFallbackNote(answeredByPanelOrigin, configuredUrl, panelOriginAgeMs);
+    if (!note || !(err instanceof Error)) throw err;
+    // Rethrown as the SAME class, so the error code and every downstream reader
+    // of it are unchanged — only the text gains the attribution.
+    err.message = `${err.message}${note}`;
+    throw err;
+  }
   const groups = Object.keys(index);
   const total = Object.values(index).reduce<number>(
     (n, v) => n + (Array.isArray(v) ? v.length : 0),
@@ -830,8 +884,19 @@ async function listWorkflowTemplatesAction(): Promise<ToolText> {
                     `sidebar panel; ` +
                     `it is not a live reading of where a panel is now, and one may since have moved ` +
                     `to a different ComfyUI. What is established is that ${answeredByPanelOrigin} ` +
-                    `served this index — it describes THAT server, not the configured one. If it is ` +
-                    `the server you meant, point COMFYUI_URL at it so every headless tool agrees.`,
+                    `served this index — it describes THAT server, not the configured one. ` +
+                    // #1600 gate, finding 1 — SAID OUT LOUD BECAUSE IT CANNOT BE DETECTED.
+                    // A browser Origin carries no path, so a panel served from
+                    // `http://host/comfy/` publishes `http://host` and this request goes
+                    // to the ROOT of that address. Where a different ComfyUI answers the
+                    // root, this index is a real index from the wrong install — and the
+                    // reader cannot tell from the numbers. Nothing here can distinguish
+                    // the two, so the assumption is disclosed rather than implied.
+                    `An origin carries no path, so this was read from the ROOT of that address: if the ` +
+                    `ComfyUI your panel is on is served under a path prefix, whatever answers that ` +
+                    `root is what replied — which can be a different install. If ` +
+                    `${answeredByPanelOrigin} is the server you meant, point COMFYUI_URL at it so ` +
+                    `every headless tool agrees.`,
                 }
               : {}),
             // #1454 — the counts above describe what the SERVER registers, not what is

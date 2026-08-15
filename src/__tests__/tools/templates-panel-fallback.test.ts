@@ -160,13 +160,65 @@ describe("choosePanelFallbackOrigin", () => {
     });
   });
 
-  it("treats loopback aliases as one server, so a spelling difference is not a candidate", () => {
-    // #1175's lesson, applied to the ACTING side: `includes` compares spellings.
-    // A fallback that fires here would re-request the same server that just
-    // refused the connection.
+  it("reports ALIAS when the same server was published under a different host spelling", () => {
+    // THIS TEST USED TO ASSERT `same`, and its stated reason — "a fallback here
+    // would re-request the same server that just refused" — is false. #1175
+    // collapses these spellings so DRIFT is not reported for them; it does not
+    // make them one socket. A ComfyUI bound only to `[::1]:8199` refuses
+    // `127.0.0.1:8199` and answers `[::1]:8199`, so the address that works was
+    // the one being declined. (#1600 gate, finding 2 — demonstrated by
+    // execution.)
     expect(
       choosePanelFallbackOrigin("http://localhost:8199/api/workflow_templates", ["http://127.0.0.1:8199"]),
+    ).toEqual({ kind: "alias", origin: "http://127.0.0.1:8199" });
+    expect(
+      choosePanelFallbackOrigin("http://127.0.0.1:8199/api/workflow_templates", ["http://[::1]:8199"]),
+    ).toEqual({ kind: "alias", origin: "http://[::1]:8199" });
+  });
+
+  it("still reports SAME for an identical host spelling, so nothing is re-asked pointlessly", () => {
+    // The boundary on the other side of the finding above: same canonical AND
+    // same host is one socket, and retrying it would be a second request to the
+    // address that just refused.
+    expect(
+      choosePanelFallbackOrigin("http://127.0.0.1:8199/api/workflow_templates", [
+        "http://127.0.0.1:8199",
+      ]),
     ).toEqual({ kind: "same", origin: "http://127.0.0.1:8199" });
+    // Case is a spelling of one host, not two — `URL` lowercases it, so the
+    // alias route must not fire on it and start re-asking the failed address.
+    expect(
+      choosePanelFallbackOrigin("http://Comfy.Test:8199/api/workflow_templates", [
+        "http://comfy.test:8199",
+      ]),
+    ).toEqual({ kind: "same", origin: "http://comfy.test:8199" });
+  });
+
+  it("prefers an ALIAS over a foreign origin, and over an ambiguous pair of them", () => {
+    // An alias is not a guess about which machine was meant — #1175 already holds
+    // it IS the configured server. Taking it first strictly shrinks the
+    // wrong-server risk that the ambiguous refusal exists to manage.
+    expect(
+      choosePanelFallbackOrigin("http://127.0.0.1:8199/api/workflow_templates", [
+        "http://192.168.1.50:8188",
+        "http://[::1]:8199",
+      ]),
+    ).toEqual({ kind: "alias", origin: "http://[::1]:8199" });
+    expect(
+      choosePanelFallbackOrigin("http://127.0.0.1:8199/api/workflow_templates", [
+        "http://192.168.1.50:8188",
+        "http://10.0.0.9:8188",
+        "http://localhost:8199",
+      ]),
+    ).toEqual({ kind: "alias", origin: "http://localhost:8199" });
+  });
+
+  it("does not treat a DIFFERENT PORT on an alias host as the same server", () => {
+    // The alias rule is about the host spelling only. A different port is a
+    // different origin by every rule here, so it stays an ordinary candidate.
+    expect(
+      choosePanelFallbackOrigin("http://127.0.0.1:8199/api/workflow_templates", ["http://[::1]:8188"]),
+    ).toEqual({ kind: "use", origin: "http://[::1]:8188" });
   });
 
   it("picks the single different origin, keeping the spelling the browser reported", () => {
@@ -204,6 +256,7 @@ describe("choosePanelFallbackOrigin", () => {
     expect(describeDeclinedPanelFallback({ kind: "none" })).toBe("");
     expect(describeDeclinedPanelFallback({ kind: "same", origin: "http://x:1" })).toBe("");
     expect(describeDeclinedPanelFallback({ kind: "use", origin: "http://x:1" })).toBe("");
+    expect(describeDeclinedPanelFallback({ kind: "alias", origin: "http://x:1" })).toBe("");
   });
 });
 
@@ -342,7 +395,12 @@ describe('list_packs action:"list_templates" — panel fallback', () => {
   });
 
   it("does not re-ask the same server when the panel is on the address that failed", async () => {
-    setConnectedPanelOrigins(() => ["http://localhost:8199"]);
+    // The published spelling is BYTE-IDENTICAL to the configured one on purpose.
+    // It used to be `http://localhost:8199` against a configured
+    // `http://127.0.0.1:8199`, which is not the same socket — that pairing is now
+    // an alias and IS retried (#1600 gate, finding 2). Testing "do not re-ask the
+    // same address" with two different addresses proved nothing about either.
+    setConnectedPanelOrigins(() => ["http://127.0.0.1:8199"]);
     stubFetch(async () => {
       throw transportFailure();
     });
@@ -862,6 +920,130 @@ describe('list_packs action:"list_templates" — panel fallback', () => {
     expect(cause?.code).toBeUndefined();
     // …and that is exactly why the address, not the error, has to decide.
     expect(mayAskAnotherServer(caught, BLOCKED_PORT_URL)).toBe(true);
+  });
+
+
+  // ── #1600 merge gate, round 1 ──────────────────────────────────────────────
+
+  it("RETRIES the alias spelling when only the other loopback family answers", async () => {
+    // Gate finding 2, end to end and over a real socket. The server listens on
+    // IPv6 loopback ONLY; the configured target is the IPv4 spelling of the same
+    // port, which therefore refuses. Before the fix the chooser said `same` and
+    // this returned the original failure while an address that answers was
+    // sitting in the published set.
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"v6-only":[{"name":"a"}]}');
+    });
+    await new Promise<void>((r) => server.listen(0, "::1", () => r()));
+    const port = (server.address() as AddressInfo).port;
+    const previous = configuredBase;
+    // The IPv4 spelling of a port bound only to ::1 — a real ECONNREFUSED, not a
+    // synthesized one.
+    configuredBase = `http://127.0.0.1:${port}`;
+    try {
+      setConnectedPanelOrigins(() => [`http://[::1]:${port}`]);
+      const res = await handler()({ action: "list_templates" });
+
+      expect(res.isError).toBeFalsy();
+      const body = textOf(res);
+      expect(body).toContain('"template_count": 1');
+      expect(body).toContain(`"answered_by": "http://[::1]:${port}"`);
+    } finally {
+      configuredBase = previous;
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  it("does NOT claim a tunnel or boundary when both addresses are one machine", async () => {
+    // The `use` message's mechanism sentence ("a browser reached it and we
+    // cannot — something is in the way") is nonsense between a host and itself.
+    setConnectedPanelOrigins(() => ["http://[::1]:8199"]);
+    stubFetch(async () => {
+      throw transportFailure();
+    });
+
+    const body = textOf(await handler()({ action: "list_templates" }));
+
+    expect(body).toContain("[::1]:8199");
+    expect(body).not.toContain("a tunnel, a container boundary");
+    expect(body).toContain("loopback rules");
+  });
+
+  it("keeps the tunnel wording for a genuinely different origin", async () => {
+    // The other side of that boundary: the sentence must not have been dropped
+    // for everyone in the course of removing it from the alias path.
+    setConnectedPanelOrigins(() => [PANEL_ORIGIN]);
+    stubFetch(async () => {
+      throw transportFailure();
+    });
+
+    const body = textOf(await handler()({ action: "list_templates" }));
+
+    expect(body).toContain("a tunnel, a container boundary");
+  });
+
+  it("DISCLOSES that an origin carries no path, so a prefixed mount is invisible", async () => {
+    // Gate finding 1. A panel served from `http://host/comfy/` publishes
+    // `http://host`, so this reads the ROOT — and where a different ComfyUI
+    // answers the root, the index is real and from the wrong install. Nothing
+    // available here can tell the two apart (an Origin has no path), so the
+    // assumption is stated in the payload instead of left implied.
+    setConnectedPanelOrigins(() => [PANEL_ORIGIN]);
+    stubFetch(async (url) => {
+      if (url === CONFIGURED) throw transportFailure();
+      return jsonResponse({ core: [{ name: "a" }] });
+    });
+
+    const body = textOf(await handler()({ action: "list_templates" }));
+
+    expect(body).toContain("carries no path");
+    expect(body).toContain("ROOT of that address");
+    expect(body).toContain("path prefix");
+  });
+
+  it("attributes a 2xx with a NON-INDEX body to the server that answered", async () => {
+    // The SIXTH emitted outcome, and the one that sent the reader to the wrong
+    // machine: classifyNonJson's remedy is built from the CONFIGURED base, and
+    // after a fallback that is the address we just proved unreachable, while the
+    // body being diagnosed came from somewhere else.
+    setConnectedPanelOrigins(() => [PANEL_ORIGIN]);
+    stubFetch(async (url) => {
+      if (url === CONFIGURED) throw transportFailure();
+      return new Response("<!doctype html><html><body>ComfyUI</body></html>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      });
+    });
+
+    const res = await handler()({ action: "list_templates" });
+
+    expect(res.isError).toBe(true);
+    const body = textOf(res);
+    // The shared helper's own diagnosis survives — the error code and text are
+    // not replaced, only attributed.
+    expect(body).toContain("NON_JSON_RESPONSE");
+    expect(body).toContain("NOT your configured ComfyUI");
+    expect(body).toContain(PANEL_ORIGIN);
+    // …and the remedy is redirected at the server that actually answered.
+    expect(body).toContain(`check ${PANEL_ORIGIN}`);
+  });
+
+  it("leaves the non-fallback diagnosis byte-for-byte alone", async () => {
+    // The note must appear ONLY after a fallback. When the configured target
+    // answers with a bad body there is nothing to attribute, and a stray note
+    // would name a panel that never entered the request.
+    stubFetch(async () =>
+      new Response("<!doctype html><html></html>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      }),
+    );
+
+    const body = textOf(await handler()({ action: "list_templates" }));
+
+    expect(body).toContain("NON_JSON_RESPONSE");
+    expect(body).not.toContain("NOT your configured ComfyUI");
   });
 
   it("passes the configured target through untouched when it works", async () => {

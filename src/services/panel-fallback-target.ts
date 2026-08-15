@@ -96,10 +96,16 @@ import { canonicalOrigin } from "../utils/origin.js";
  *     an idle established socket, and "unambiguous" is the bar.
  *   - UND_ERR_HEADERS_TIMEOUT / UND_ERR_BODY_TIMEOUT — connected; the server was
  *     merely slow to answer.
- *   - ERR_INVALID_URL, ERR_UNSUPPORTED_PROTOCOL — a malformed COMFYUI_URL says
- *     nothing about any server and must be reported rather than routed around.
- *     (choosePanelFallbackOrigin already answers `none` for a target it cannot
- *     parse, so these would be dead weight even under a different policy.)
+ *   - ERR_INVALID_URL — a COMFYUI_URL that does not parse says nothing about any
+ *     server, and choosePanelFallbackOrigin answers `none` for a target it cannot
+ *     read, so this would be dead weight here anyway.
+ *
+ * NOT a claim this set makes, and it used to say otherwise: that an UNSUPPORTED
+ * SCHEME is reported rather than routed around. `COMFYUI_URL=ftp://host:8188`
+ * takes the STRUCTURAL route below (isUndialableTarget) and does reach the
+ * fallback — measured, not assumed. That is consistent with the contract, since
+ * `fetch` will not dial such a URL at all, and it is recorded here because the
+ * sentence that stood in its place was false the moment that route was added.
  */
 export const NEVER_CONNECTED_CODES: ReadonlySet<string> = new Set([
   "ECONNREFUSED",
@@ -231,9 +237,13 @@ export function mayAskAnotherServer(err: unknown, failedUrl: string): boolean {
  *                   handshake that carried no Origin), or the failed target does
  *                   not parse. Say nothing; an absent comparison is not a
  *                   negative result.
- *  - `same`       — every connected panel is on the origin that just failed.
- *                   There is no different address to try, and the drift text
- *                   already says so.
+ *  - `same`       — every connected panel is on the origin that just failed,
+ *                   spelled the same way. There is no other address to try, and
+ *                   the drift text already says so.
+ *  - `alias`      — a panel is on what #1175 calls the SAME server, reached by a
+ *                   DIFFERENT host spelling (`[::1]` vs `127.0.0.1` vs
+ *                   `localhost`). Retryable, and the safest candidate there is —
+ *                   see the resolution order below.
  *  - `ambiguous`  — two or more DIFFERENT origins are connected. Refuse to pick.
  *  - `use`        — exactly one different origin. `origin` is the ORIGINAL
  *                   published spelling, not the canonical one: the canonical
@@ -243,8 +253,21 @@ export function mayAskAnotherServer(err: unknown, failedUrl: string): boolean {
 export type PanelFallbackChoice =
   | { kind: "none" }
   | { kind: "same"; origin: string }
+  | { kind: "alias"; origin: string }
   | { kind: "ambiguous"; origins: string[] }
   | { kind: "use"; origin: string };
+
+/** The host as #1175 compares it: lowercased, with the FQDN's trailing dot gone.
+ *  undefined when the input does not parse — never "" , which would read as a
+ *  host that matched everything. */
+function hostOf(url: string): string | undefined {
+  try {
+    const host = new URL(url.trim()).hostname.toLowerCase();
+    return host.endsWith(".") ? host.slice(0, -1) : host;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Pick the one connected-panel origin worth retrying `failedTarget` against.
@@ -275,16 +298,47 @@ export function choosePanelFallbackOrigin(
   const want = canonicalOrigin(failedTarget);
   if (want === undefined) return { kind: "none" };
 
+  // #1600 gate, finding 2 — A CANONICAL MATCH IS NOT A SOCKET MATCH.
+  //
+  // #1175 collapses `localhost` / `127.0.0.1` / `[::1]` into one server so a
+  // spelling difference stops being reported as drift. That is right for
+  // DESCRIBING, and it was silently wrong once this module started ACTING: a
+  // ComfyUI bound only to `[::1]:8188` refuses `127.0.0.1:8188` with
+  // ECONNREFUSED, and the published panel origin `http://[::1]:8188` — an
+  // address that answers — collapsed to `same` and was never tried. The one
+  // topology where the fallback is most obviously right (a v4/v6 split on this
+  // machine) was the one it declined. Demonstrated by execution, not argued.
+  //
+  // So a same-canonical origin whose HOST IS SPELLED DIFFERENTLY is a separate
+  // socket address and gets its own verdict.
   const different: string[] = [];
+  const aliases: string[] = [];
   let sameAs: string | undefined;
+  const wantHost = hostOf(failedTarget);
   for (const [canon, spelling] of byCanonical) {
-    if (canon === want) sameAs = spelling;
-    else different.push(spelling);
+    if (canon !== want) {
+      different.push(spelling);
+      continue;
+    }
+    const host = hostOf(spelling);
+    if (host !== undefined && wantHost !== undefined && host !== wantHost) aliases.push(spelling);
+    else sameAs = spelling;
   }
+  // AN ALIAS OUTRANKS A FOREIGN ORIGIN, including an ambiguous pair of them.
+  // Every other verdict here is a judgement about which of several machines the
+  // caller meant; this one is not a judgement at all — #1175 already holds that
+  // this IS the configured server, so retrying it cannot answer from a machine
+  // the user did not choose. Preferring it strictly shrinks the wrong-server
+  // risk the `ambiguous` refusal exists to manage, so it is taken first.
+  //
+  // Two aliases (`[::1]` and `localhost` both published) are not an ambiguity
+  // either: by the same rule they are one server, so the first is as good as the
+  // second.
+  if (aliases.length > 0) return { kind: "alias", origin: aliases[0] };
   if (different.length === 0) {
     // `sameAs` is necessarily set here: the map is non-empty and nothing landed
-    // in `different`. Asserted through a fallback rather than a `!` so a future
-    // edit that breaks the partition degrades to "say nothing".
+    // in `different` or `aliases`. Asserted through a fallback rather than a `!`
+    // so a future edit that breaks the partition degrades to "say nothing".
     return sameAs === undefined ? { kind: "none" } : { kind: "same", origin: sameAs };
   }
   if (different.length > 1) return { kind: "ambiguous", origins: different };
