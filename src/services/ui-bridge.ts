@@ -1306,6 +1306,65 @@ function mutatedButUnacked(ctx: SendCtx): string {
   );
 }
 
+/**
+ * A mutation the panel acknowledged AFTER its reply timeout (#694, #1175).
+ *
+ * `result` is the panel's own reply body, present only when it was retained (see
+ * MAX_LATE_MUTATION_RESULT_CHARS). ABSENT IS NOT EMPTY: a consumer that needs the
+ * body must branch on the property existing, never read `undefined` as "the panel
+ * replied with nothing".
+ */
+export type LateMutation = {
+  ok: true;
+  cmd: string;
+  tabId: string;
+  lateByMs: number;
+  result?: unknown;
+};
+
+/**
+ * Size ceiling on a RETAINED reply payload (#1175).
+ *
+ * #694 kept only the FACT of a late completion, which is all its consumer (the
+ * retry-token notice) needs. panel_run needs the reply itself: the run's prompt
+ * ids live in it, and without them a recovered run cannot be ticketed for its
+ * completion. So the body is kept too — but the late-mutation map is bounded by
+ * COUNT, not by bytes, and a mutation reply is small only by convention. Over the
+ * ceiling the ENTRY IS STILL RETAINED and only the body is dropped, so the
+ * retry-token notice is never lost to a large payload; that caller falls back to
+ * the recovery they already had. 32 KiB of JSON is far above any panel mutation
+ * reply this repo measures and bounds the map's bodies at 8 MiB worst case.
+ */
+export const MAX_LATE_MUTATION_RESULT_CHARS = 32 * 1024;
+
+/**
+ * The retainable form of a late reply's body: `{ result }` when it is worth
+ * keeping, `{}` when it is not (#1175).
+ *
+ * Returns a SPREADABLE object rather than a value so "no body retained" and "the
+ * panel's body was literally undefined" stay distinguishable at the property
+ * level — the distinction panel_run branches on before deciding it can rebuild a
+ * run from this entry.
+ *
+ * Declines on two grounds, both measured rather than assumed:
+ *  - NOT SERIALISABLE. A body with a cycle (or a throwing toJSON) cannot reach a
+ *    ToolResult anyway, and must never take the retention path down with it: the
+ *    FACT of the completion is the more valuable half and is retained regardless.
+ *  - OVER THE CEILING. Bounded by the same JSON the caller would have received,
+ *    so the check measures the thing being stored.
+ */
+function retainableLateResult(result: unknown): { result?: unknown } {
+  if (result === undefined) return {};
+  try {
+    const json = JSON.stringify(result);
+    if (typeof json !== "string") return {};
+    if (json.length > MAX_LATE_MUTATION_RESULT_CHARS) return {};
+    return { result };
+  } catch {
+    return {};
+  }
+}
+
 /** Tag an error as a reply-timeout and return it (for throw/reject). */
 /**
  * Key for a pending "is this tab gone?" clock (#486).
@@ -1603,7 +1662,7 @@ export class UiBridge {
    *  takeLateMutation(). Success only: see the recordLateMutation comment. */
   private lateMutations = new Map<
     string,
-    { ok: true; cmd: string; tabId: string; ts: number; lateByMs: number }
+    { ok: true; cmd: string; tabId: string; ts: number; lateByMs: number; result?: unknown }
   >();
   /**
    * TTL for both maps above.
@@ -3437,7 +3496,7 @@ export class UiBridge {
    * fold as #796 pointing the other way. Only `ok:true` carries information the
    * caller does not already have.
    */
-  private recordLateMutation(rid: string, msg: { ok?: unknown }): void {
+  private recordLateMutation(rid: string, msg: { ok?: unknown; result?: unknown }): void {
     const started = this.timedOutMutations.get(rid);
     if (!started) return;
     this.timedOutMutations.delete(rid);
@@ -3450,6 +3509,7 @@ export class UiBridge {
       tabId: started.tabId,
       ts: now,
       lateByMs: now - started.ts,
+      ...retainableLateResult(msg.result),
     });
     logger.debug(
       `[ui-bridge] "${started.cmd}" on tab ${started.tabId} completed ${now - started.ts} ms AFTER its reply timeout — retained for the caller (#694)`,
@@ -3462,14 +3522,41 @@ export class UiBridge {
    * Drains once: this exists so a caller can be TOLD, and telling them twice
    * would read as two separate recoveries of the same write.
    */
-  takeLateMutation(
-    rid: string,
-  ): { ok: true; cmd: string; tabId: string; lateByMs: number } | undefined {
+  takeLateMutation(rid: string): LateMutation | undefined {
     this.pruneLateMutations();
     const hit = this.lateMutations.get(rid);
     if (!hit) return undefined;
     this.lateMutations.delete(rid);
-    return { ok: true, cmd: hit.cmd, tabId: hit.tabId, lateByMs: hit.lateByMs };
+    return {
+      ok: true,
+      cmd: hit.cmd,
+      tabId: hit.tabId,
+      lateByMs: hit.lateByMs,
+      ...("result" in hit ? { result: hit.result } : {}),
+    };
+  }
+
+  /**
+   * Look at the late outcome for `rid` WITHOUT draining it (#1175).
+   *
+   * takeLateMutation drains, deliberately, so a caller is told once. That makes
+   * it the wrong instrument for a caller that has to DECIDE whether this entry is
+   * the one it can use: panel_run can only rebuild a run from a retained
+   * `graph_run` BODY, and a take that then walked away would have consumed the
+   * retry-token notice -- the recovery the caller still had -- to answer a
+   * question. Peek first, take only what will be used.
+   */
+  peekLateMutation(rid: string): LateMutation | undefined {
+    this.pruneLateMutations();
+    const hit = this.lateMutations.get(rid);
+    if (!hit) return undefined;
+    return {
+      ok: true,
+      cmd: hit.cmd,
+      tabId: hit.tabId,
+      lateByMs: hit.lateByMs,
+      ...("result" in hit ? { result: hit.result } : {}),
+    };
   }
 
   /** TTL + cardinality bound for both #694 maps. */
