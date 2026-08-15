@@ -64,6 +64,8 @@ import { uploadImageHttp, resetClient } from "../comfyui/client.js";
 import { setConnectedPanelOrigins } from "../comfyui/fetch.js";
 import { publishConnectedPanelOrigins } from "../services/panel-origin-channel.js";
 import { logger } from "../utils/logger.js";
+import { listDownloadJobs } from "../services/download-jobs.js";
+import { completionDisagreesWithRecord } from "./download-done-guard.js";
 import { assembleVocabularyHash, describeVocabularySkew } from "../tools/vocabulary.js";
 import { buildPanelToolDefs } from "./panel-tools.js";
 
@@ -5474,7 +5476,20 @@ export async function runPanelOrchestrator(): Promise<void> {
   const downloadDonePending = new Map<
     string,
     {
-      downloads: Map<string, { name: string; status: string; attempt?: number; supKey: string }>;
+      downloads: Map<
+        string,
+        {
+          // #1574 — the PROGRESS/tray id. The record cross-check at the flush needs it, and
+          // it is a different identity from the job's public `id`.
+          id?: string;
+          target?: string;
+          name: string;
+          status: string;
+          attempt?: number;
+          supKey: string;
+          recordDisagrees?: boolean;
+        }
+      >;
       flushAt: number;
     }
   >();
@@ -5670,13 +5685,34 @@ export async function runPanelOrchestrator(): Promise<void> {
           if (key && manager.hasLiveAgent(key)) {
             const bucket =
               downloadDonePending.get(key) ??
-              { downloads: new Map<string, { name: string; status: string; attempt?: number; supKey: string }>(), flushAt: 0 };
+              {
+                downloads: new Map<
+                  string,
+                  {
+                    id?: string;
+                    target?: string;
+                    name: string;
+                    status: string;
+                    attempt?: number;
+                    supKey: string;
+                    recordDisagrees?: boolean;
+                  }
+                >(),
+                flushAt: 0,
+              };
             // Identify each pending download by its (id, target) supersession key — NOT
             // the id alone: a concurrent LOCAL + POD transfer of the same URL shares an id
             // but must produce TWO #547 outcomes, and the same key lets a newer attempt
             // evict this entry above. Fall back to the file path when the row has no id.
             const supKey = downloadAttemptKey(row) ?? ` ${full}`;
             bucket.downloads.set(supKey, {
+              // #1574 — CARRY THE ROW ID. Without it the record cross-check at the flush has
+              // nothing to match a job against, silently agrees with everything, and the
+              // whole disclosure is a no-op. That is exactly how the first version shipped.
+              id: typeof row.id === "string" ? row.id : undefined,
+              // (id, target) is the row identity — id alone collides for a concurrent
+              // LOCAL + POD transfer of the same URL (review).
+              target: typeof row.target === "string" ? row.target : undefined,
               name: String(row.name ?? row.id ?? "model"),
               status: String(status),
               attempt: typeof row.attempt === "number" ? row.attempt : undefined,
@@ -5723,6 +5759,39 @@ export async function runPanelOrchestrator(): Promise<void> {
       // filename, so the (id, target) eviction above cannot see it. The live rows
       // are already in hand this tick; markSupersededByLive asks them by name.
       markSupersededByLive(settled, downloads);
+      // #1574 — DROP a completion this orchestrator's own status tool would contradict.
+      //
+      // The event is built from the progress ROW; `download_model action:"status"` answers
+      // from the job RECORD. A reporter got "transfer completed" for an 11.46GB file while
+      // status said it was still streaming and the file was not on disk — it landed minutes
+      // later. Whatever wrote that row, the record is in hand right here.
+      //
+      // Only a POSITIVE contradiction drops it (the record exists, same id, still
+      // "downloading"). An absent record means nothing: the record store resets on a
+      // respawn, which is the reported session, and treating absence as in-flight would
+      // silence every completion after any respawn.
+      const records = (() => {
+        try {
+          return listDownloadJobs();
+        } catch {
+          // Never let the guard break the event path — a completion we cannot check is
+          // still a completion worth delivering.
+          return [];
+        }
+      })();
+      // ANNOTATE, never suppress (review). A terminal record can legitimately still read
+      // "downloading" until the ~15s persistence heartbeat retries (#1545), and this bucket
+      // is deleted before this point and never requeued — so dropping the event here would
+      // permanently lose the completion for a download that genuinely finished. That trades
+      // a confusing message for a missing one, which is worse: the user is waiting on it.
+      const disagreeing = settled.filter((d) => completionDisagreesWithRecord(d, records));
+      for (const d of disagreeing) (d as { recordDisagrees?: boolean }).recordDisagrees = true;
+      if (disagreeing.length) {
+        logger.warn(
+          "[panel-orchestrator] a download completion disagrees with the job record; disclosing rather than suppressing (#1574)",
+          { ids: disagreeing.map((d) => String((d as { id?: unknown }).id ?? "")) },
+        );
+      }
       // #884 — a download has no originating TAB (its row names the owning
       // conversation), so its turn INHERITS the conversation's LAST
       // ESTABLISHED origin — never the active tab (confirming gate 2, P0 rule:
