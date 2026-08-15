@@ -155,7 +155,17 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   const seen = new Set();
   for (const [lineNo, line, kind] of claimLines(src)) {
     if (kind === 'fence') {
-      for (const raw of line.match(SCRIPT) ?? []) {
+      // A line that FETCHES a script is not claiming the pack ships it —
+      // `curl -fsSL https://vendor.example/install.sh | sh` downloads it, and demanding that
+      // filename exist in packs/ would fail a correct command. Same for anything under a
+      // non-pack directory. The rule only means "a file the reader is told to run FROM the
+      // pack", so it applies to bare filenames and packs/… paths only.
+      const fetchesRemotely = /\b(?:https?|ftp):\/\//i.test(line);
+      for (const raw of fetchesRemotely ? [] : line.match(SCRIPT) ?? []) {
+        const at = line.indexOf(raw);
+        const prefix = line.slice(0, at);
+        // `foo/bar/install.sh` where foo/bar is not a pack path — someone else's tree.
+        if (/[A-Za-z0-9._-][\\/]$/.test(prefix) && !/packs[\\/][A-Za-z0-9._-]+[\\/]$/.test(prefix)) continue;
         const key = `s:${raw}`;
         if (seen.has(key)) continue;
         seen.add(key);
