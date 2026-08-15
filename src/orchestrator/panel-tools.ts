@@ -234,6 +234,25 @@ export type ToolResult = {
     | { type: "image"; data: string; mimeType: string }
   >;
   isError?: boolean;
+  /**
+   * #1589 — the MACHINE-READABLE half of a reply, for tools whose result is a
+   * DOCUMENT rather than a sentence.
+   *
+   * `content` is written for the model: prose first, so a conversion warning is
+   * read before the graph it applies to (#361). That ordering is right for the
+   * reader and useless for a script, which then has to hunt for the first `{`
+   * and slice. `structuredContent` is the MCP field for exactly this — the same
+   * data, already parsed.
+   *
+   * NO `outputSchema` is declared for these tools, deliberately. The MCP SDK
+   * validates structuredContent ONLY when the tool declares one
+   * (`validateToolOutput` returns early on `!tool.outputSchema`), and it hard-
+   * fails a reply that declares a schema and omits the structured half. Adding a
+   * schema would make every future non-structured branch of the same tool — every
+   * `fail(...)`, every early return — a protocol error, so the field stays
+   * additive: present when there is a document, absent otherwise.
+   */
+  structuredContent?: Record<string, unknown>;
 };
 
 function ok(value: unknown): ToolResult {
@@ -9058,7 +9077,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         "plus a node-type summary for INSPECTION / EXECUTION / REBUILD — it does NOT and CANNOT load the " +
         "result back onto the canvas (the canvas only loads UI-format graphs). Use it to understand an " +
         "expert workflow's real wiring, run the resolved graph headless, or rebuild connections with the " +
-        "graph edit tools. The resolved graph is much smaller than the raw UI JSON.",
+        "graph edit tools. The resolved graph is much smaller than the raw UI JSON. The reply is TWO " +
+        "blocks — the summary and any conversion notes first, then the graph alone as a whole JSON " +
+        "document — and the same graph is returned as structuredContent.graph, so nothing has to be " +
+        "sliced out of prose to parse it.",
       {
         pack: z
           .string()
@@ -9154,21 +9176,56 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .map(([t, c]) => `${c}× ${t}`)
           .join(", ");
 
-        return ok(
+        // #1589 — THE GRAPH IS NOW ITS OWN CONTENT BLOCK, and its own
+        // `structuredContent.graph`.
+        //
+        // It used to be string-concatenated onto the end of the summary, so the
+        // single text block began "Stripped to N nodes" and `JSON.parse` of it
+        // failed on the first character. Every programmatic caller had to find the
+        // first `{` and slice — a heuristic that is wrong the moment a conversion
+        // note quotes a brace, which the warning lines can and do (they name
+        // widget values).
+        //
+        // The PROSE ORDER IS UNCHANGED on purpose. #361 put the conversion notes
+        // ahead of the graph so a model reads "this differs from the source"
+        // before the thing it differs from; moving the JSON first to make
+        // `content[0]` parse would have traded a script's convenience for the
+        // reader's warning. Splitting instead keeps both: block 0 is the same
+        // sentence it always was, block 1 is a whole JSON document with nothing
+        // before or after it, and `structuredContent` is the parsed form for
+        // callers that read it.
+        const proseSummary =
           `Stripped to ${Object.keys(workflow).length} nodes` +
-            (warnings.length ? ` · ⚠ ${warnings.length} conversion note(s)` : "") +
-            `\nNode types: ${summary}` +
-            // #361: a strip that quietly loses a Set/Get link or substitutes a
-            // widget value produces a graph that LOOKS fine and renders
-            // differently. Say plainly that these are places the stripped graph
-            // does NOT match the source, so they are not skimmed as noise.
-            (warnings.length
-              ? `\nThe stripped graph DIFFERS from the source workflow where listed below — read these before running or rebuilding from it:\n${warnings
-                  .map((w) => `- ${w}`)
-                  .join("\n")}`
-              : "") +
-            `\n\n${JSON.stringify(workflow, null, 2)}`,
-        );
+          (warnings.length ? ` · ⚠ ${warnings.length} conversion note(s)` : "") +
+          `\nNode types: ${summary}` +
+          // #361: a strip that quietly loses a Set/Get link or substitutes a
+          // widget value produces a graph that LOOKS fine and renders
+          // differently. Say plainly that these are places the stripped graph
+          // does NOT match the source, so they are not skimmed as noise.
+          (warnings.length
+            ? `\nThe stripped graph DIFFERS from the source workflow where listed below — read these before running or rebuilding from it:\n${warnings
+                .map((w) => `- ${w}`)
+                .join("\n")}`
+            : "");
+        // Annotated, not inferred. `def()`'s handler type is enough for TS to accept
+        // this object but NOT to reject a key ToolResult does not declare — excess-
+        // property checking does not survive the inferred return type (measured: with
+        // `structuredContent` deleted from ToolResult, `tsc --noEmit` still exited 0).
+        // A typed local restores it, so the field is a contract the compiler enforces
+        // rather than a comment.
+        const reply: ToolResult = {
+          content: [
+            { type: "text", text: proseSummary },
+            { type: "text", text: JSON.stringify(workflow, null, 2) },
+          ],
+          structuredContent: {
+            graph: workflow,
+            node_count: Object.keys(workflow).length,
+            node_types: hist,
+            warnings,
+          },
+        };
+        return reply;
       },
     ),
     def(
