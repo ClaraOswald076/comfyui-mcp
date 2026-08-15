@@ -745,6 +745,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.56] - 2026-08-15
+
+### MCP
+
+#### Fixed
+- the restart refusal stops sending you at a server it knows is the wrong one (#1593)
+- pack VRAM tiers say what their own manifest fetches (#1585)
+
 ## [0.51.55] - 2026-08-15
 
 ### MCP
