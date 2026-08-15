@@ -49,6 +49,9 @@ const hoisted = vi.hoisted(() => ({
   })(),
   /** The mcpServers object the backend actually handed the SDK. */
   lastMcpServers: null as Record<string, unknown> | null,
+  /** What `q.mcpServerStatus()` answers, and how many times it was asked. */
+  statusPoll: null as null | Array<{ name: string; status: string }>,
+  statusPolls: 0,
 }));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
@@ -63,6 +66,11 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
       supportedCommands: async () => [],
       interrupt: async () => {},
       setModel: async () => {},
+      mcpServerStatus: async () => {
+        hoisted.statusPolls += 1;
+        if (!hoisted.statusPoll) throw new Error("no status available");
+        return hoisted.statusPoll;
+      },
     });
   },
 }));
@@ -70,6 +78,8 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
 beforeEach(() => {
   hoisted.queue.reset();
   hoisted.lastMcpServers = null;
+  hoisted.statusPoll = null;
+  hoisted.statusPolls = 0;
 });
 
 const initWith = (mcp_servers?: Array<{ name: string; status: string }>) => ({
@@ -105,6 +115,36 @@ async function drive(
   })();
   hoisted.queue.push(init);
   await waitFor(() => expect(events.some((e) => e.type === "session")).toBe(true));
+  hoisted.queue.end();
+  await done;
+  return events;
+}
+
+/** Same, but the session takes a turn and ends it — the point at which a server
+ *  still connecting at init is re-read. `turns` result messages are pushed. */
+async function driveTurns(
+  deps: { mcpServers?: Record<string, unknown>; panelServer?: unknown },
+  init: unknown,
+  turns = 1,
+): Promise<AgentEvent[]> {
+  const { ClaudeBackend } = await import("../../orchestrator/claude-backend.js");
+  const backend = new ClaudeBackend({
+    mcpServers: (deps.mcpServers ?? {}) as never,
+    systemAppend: "",
+    ...(deps.panelServer ? { panelServer: deps.panelServer as never } : {}),
+  });
+  const events: AgentEvent[] = [];
+  async function* oneTurn(): AsyncGenerator<{ text: string }> {
+    yield { text: "hello" };
+    await new Promise<void>(() => {});
+  }
+  const done = (async () => {
+    for await (const ev of backend.run({ channel: oneTurn() as never })) events.push(ev);
+  })();
+  hoisted.queue.push(init);
+  await waitFor(() => expect(events.some((e) => e.type === "session")).toBe(true));
+  for (let i = 0; i < turns; i++) hoisted.queue.push({ type: "result", subtype: "success" });
+  await waitFor(() => expect(events.filter((e) => e.type === "result")).toHaveLength(turns));
   hoisted.queue.end();
   await done;
   return events;
@@ -180,6 +220,19 @@ describe("a Claude session that started without an MCP server reports it (#1524)
     expect(noticesOf(events)).toHaveLength(0);
   });
 
+  it("stays silent for a server still CONNECTING at init", async () => {
+    // Server startup does not block the session, so `pending` at init is a slow
+    // connection, not a failed one. Reporting it would fire on healthy sessions.
+    const events = await drive(
+      { mcpServers: { comfyui: COMFYUI_SERVER }, panelServer: PANEL_SERVER },
+      initWith([
+        { name: "comfyui", status: "connected" },
+        { name: "panel", status: "pending" },
+      ]),
+    );
+    expect(noticesOf(events)).toHaveLength(0);
+  });
+
   it("still emits the session event alongside the notice", async () => {
     // The notice must not displace init's real job — a swallowed session id
     // would break resume, which is a far worse bug than the one being fixed.
@@ -189,5 +242,91 @@ describe("a Claude session that started without an MCP server reports it (#1524)
     );
     expect(events.filter((e) => e.type === "session")).toHaveLength(1);
     expect(noticesOf(events)).toHaveLength(1);
+  });
+});
+
+describe("a server that was still connecting at init gets settled (#1524)", () => {
+  it("reports it when it settled as FAILED", async () => {
+    // The hole an init-only check leaves: `init` is the only MCP report the
+    // session pushes, so `pending` there followed by a failure is silent forever
+    // — the same six-hour silence, moved a few hundred milliseconds later.
+    hoisted.statusPoll = [
+      { name: "comfyui", status: "connected" },
+      { name: "panel", status: "failed" },
+    ];
+    const events = await driveTurns(
+      { mcpServers: { comfyui: COMFYUI_SERVER }, panelServer: PANEL_SERVER },
+      initWith([
+        { name: "comfyui", status: "connected" },
+        { name: "panel", status: "pending" },
+      ]),
+    );
+    const notices = noticesOf(events);
+    expect(notices).toHaveLength(1);
+    expect(notices[0].message).toContain("panel");
+    expect(hoisted.statusPolls).toBe(1);
+  });
+
+  it("says nothing when it settled as connected", async () => {
+    hoisted.statusPoll = [
+      { name: "comfyui", status: "connected" },
+      { name: "panel", status: "connected" },
+    ];
+    const events = await driveTurns(
+      { mcpServers: { comfyui: COMFYUI_SERVER }, panelServer: PANEL_SERVER },
+      initWith([
+        { name: "comfyui", status: "connected" },
+        { name: "panel", status: "pending" },
+      ]),
+    );
+    expect(noticesOf(events)).toHaveLength(0);
+    expect(hoisted.statusPolls).toBe(1);
+  });
+
+  it("re-reads ONCE, not on every turn", async () => {
+    hoisted.statusPoll = [
+      { name: "comfyui", status: "connected" },
+      { name: "panel", status: "connected" },
+    ];
+    await driveTurns(
+      { mcpServers: { comfyui: COMFYUI_SERVER }, panelServer: PANEL_SERVER },
+      initWith([
+        { name: "comfyui", status: "connected" },
+        { name: "panel", status: "pending" },
+      ]),
+      3,
+    );
+    expect(hoisted.statusPolls).toBe(1);
+  });
+
+  it("does not poll at all when nothing was pending", async () => {
+    // The re-read is a control round-trip. A healthy session must not pay for it
+    // on every turn it completes.
+    hoisted.statusPoll = [{ name: "comfyui", status: "connected" }];
+    await driveTurns(
+      { mcpServers: { comfyui: COMFYUI_SERVER }, panelServer: PANEL_SERVER },
+      initWith([
+        { name: "comfyui", status: "connected" },
+        { name: "panel", status: "connected" },
+      ]),
+      2,
+    );
+    expect(hoisted.statusPolls).toBe(0);
+  });
+
+  it("stays silent when the poll is unavailable or throws", async () => {
+    // `mcpServerStatus()` is an optional Query method. A harness without it
+    // leaves the pending servers unmentioned rather than guessed at — and must
+    // never take the turn stream down with it.
+    hoisted.statusPoll = null; // the mock throws
+    const events = await driveTurns(
+      { mcpServers: { comfyui: COMFYUI_SERVER }, panelServer: PANEL_SERVER },
+      initWith([
+        { name: "comfyui", status: "connected" },
+        { name: "panel", status: "pending" },
+      ]),
+    );
+    expect(noticesOf(events)).toHaveLength(0);
+    expect(events.filter((e) => e.type === "result")).toHaveLength(1);
   });
 });

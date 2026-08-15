@@ -38,6 +38,27 @@ export interface DegradedMcpServer {
   status: string | null;
 }
 
+/** What a report says about the servers we configured. */
+export interface McpSessionHealth {
+  /** Configured servers the session does not have. */
+  degraded: DegradedMcpServer[];
+  /**
+   * Configured servers still CONNECTING when this report was taken.
+   *
+   * `pending` is a settled-later status, not a failure: the SDK's server startup
+   * does not block the session, so a slow server is legitimately pending in the
+   * `init` report and connects a moment afterwards. Calling that degraded would
+   * fire on healthy sessions, which is the one outcome worse than the silence
+   * this replaces.
+   *
+   * But it must not be read as "fine" either — a server pending at init can go
+   * on to FAIL, and since `init` is the only report the session pushes, nothing
+   * would ever say so. The caller re-reads these names later (the SDK's
+   * `mcpServerStatus()` poll) and reports whatever they settled as.
+   */
+  pending: string[];
+}
+
 /**
  * Compare the MCP servers we handed the session against the ones it reports.
  *
@@ -46,10 +67,11 @@ export interface DegradedMcpServer {
  * ours — no user/project config can appear in the report and no name of ours can
  * be legitimately replaced.
  *
- * Returns the configured servers that are NOT connected, in the order they were
- * configured. Empty means every server we asked for is up — which is the case this
- * has to get right first, since a false "your tools are gone" is worse than the
- * silence it replaces.
+ * Splits the configured servers into the ones the session does not have
+ * (`degraded`) and the ones still connecting (`pending`), in the order they were
+ * configured. Both empty means every server we asked for is up — which is the
+ * case this has to get right first, since a false "your tools are gone" is worse
+ * than the silence it replaces.
  *
  * Two deliberate silences:
  *
@@ -64,33 +86,39 @@ export interface DegradedMcpServer {
  * have. That case matters — a server whose connection fails before it is
  * advertised is missing rather than failed.
  */
-export function degradedMcpServers(
+export function inspectMcpServers(
   configured: readonly string[],
   reported: readonly ReportedMcpServer[] | undefined,
-): DegradedMcpServer[] {
-  if (!Array.isArray(reported) || reported.length === 0) return [];
+): McpSessionHealth {
+  if (!Array.isArray(reported) || reported.length === 0) return { degraded: [], pending: [] };
   const byName = new Map<string, string>();
   for (const entry of reported) {
     if (entry && typeof entry.name === "string") byName.set(entry.name, String(entry.status ?? ""));
   }
-  const out: DegradedMcpServer[] = [];
+  const degraded: DegradedMcpServer[] = [];
+  const pending: string[] = [];
   for (const name of configured) {
     if (!byName.has(name)) {
-      out.push({ name, status: null });
+      degraded.push({ name, status: null });
       continue;
     }
-    const status = byName.get(name) ?? "";
-    if (!isConnectedStatus(status)) out.push({ name, status });
+    const status = (byName.get(name) ?? "").trim().toLowerCase();
+    if (status === "pending") pending.push(name);
+    else if (FAILED_STATUSES.has(status)) degraded.push({ name, status: byName.get(name) ?? "" });
   }
-  return out;
+  return { degraded, pending };
 }
 
-/** Whether a reported status means the server is usable this session. Unknown
- *  statuses count as connected — see the silence rules above. */
-function isConnectedStatus(status: string): boolean {
-  const s = status.trim().toLowerCase();
-  return s !== "failed" && s !== "needs-auth" && s !== "disabled" && s !== "error";
-}
+/**
+ * Statuses that mean the server is not usable. Taken from the SDK's own
+ * `McpServerStatus` union (`connected | failed | needs-auth | pending |
+ * disabled`), plus `error` for a host that words it that way.
+ *
+ * A closed list, deliberately: anything the CLI adds later reads as connected
+ * rather than as an alarm, so a vocabulary change cannot start telling healthy
+ * sessions their tools are gone.
+ */
+const FAILED_STATUSES = new Set(["failed", "needs-auth", "disabled", "error"]);
 
 /**
  * The line the user sees when a session starts without a server it was given.

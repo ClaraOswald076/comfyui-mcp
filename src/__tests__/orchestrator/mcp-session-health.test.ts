@@ -26,29 +26,31 @@
 import { describe, expect, it } from "vitest";
 import {
   degradedMcpNotice,
-  degradedMcpServers,
+  inspectMcpServers,
 } from "../../orchestrator/mcp-session-health.js";
 
 const CONFIGURED = ["comfyui", "panel"];
 
-describe("degradedMcpServers — what the session reports vs what it was given", () => {
+const HEALTHY = { degraded: [], pending: [] };
+
+describe("inspectMcpServers — what the session reports vs what it was given", () => {
   it("says nothing when every configured server connected", () => {
     expect(
-      degradedMcpServers(CONFIGURED, [
+      inspectMcpServers(CONFIGURED, [
         { name: "comfyui", status: "connected" },
         { name: "panel", status: "connected" },
       ]),
-    ).toEqual([]);
+    ).toEqual(HEALTHY);
   });
 
   it("names a server the session reports as failed", () => {
     // The reporter's shape: one half of the pair back, the other not.
     expect(
-      degradedMcpServers(CONFIGURED, [
+      inspectMcpServers(CONFIGURED, [
         { name: "comfyui", status: "connected" },
         { name: "panel", status: "failed" },
       ]),
-    ).toEqual([{ name: "panel", status: "failed" }]);
+    ).toEqual({ degraded: [{ name: "panel", status: "failed" }], pending: [] });
   });
 
   it("names a server MISSING from a populated report", () => {
@@ -56,45 +58,61 @@ describe("degradedMcpServers — what the session reports vs what it was given",
     // failed. Both readings of the reporter's evidence land here: their
     // `ToolSearch` found the panel server genuinely gone from the session, not
     // merely un-indexed.
-    expect(
-      degradedMcpServers(CONFIGURED, [{ name: "comfyui", status: "connected" }]),
-    ).toEqual([{ name: "panel", status: null }]);
+    expect(inspectMcpServers(CONFIGURED, [{ name: "comfyui", status: "connected" }])).toEqual({
+      degraded: [{ name: "panel", status: null }],
+      pending: [],
+    });
   });
 
   it("says nothing when the report is absent or empty", () => {
     // A harness that does not populate the field tells us nothing about our
     // servers. Reading its silence as failure would fire on EVERY healthy
     // session — the one outcome worse than the bug being fixed.
-    expect(degradedMcpServers(CONFIGURED, undefined)).toEqual([]);
-    expect(degradedMcpServers(CONFIGURED, [])).toEqual([]);
+    expect(inspectMcpServers(CONFIGURED, undefined)).toEqual(HEALTHY);
+    expect(inspectMcpServers(CONFIGURED, [])).toEqual(HEALTHY);
   });
 
   it("treats an unrecognized status as connected", () => {
     // The status vocabulary belongs to the CLI and can grow. A new value must
     // not become an alarm here; only the ones that DO mean unusable are alarms.
     expect(
-      degradedMcpServers(CONFIGURED, [
+      inspectMcpServers(CONFIGURED, [
         { name: "comfyui", status: "connected" },
         { name: "panel", status: "some-future-status" },
       ]),
-    ).toEqual([]);
+    ).toEqual(HEALTHY);
   });
 
   it("catches the failure vocabulary the CLI actually uses", () => {
     for (const status of ["failed", "needs-auth", "error", "disabled", "FAILED"]) {
-      expect(degradedMcpServers(["panel"], [{ name: "panel", status }])).toHaveLength(1);
+      expect(inspectMcpServers(["panel"], [{ name: "panel", status }]).degraded).toHaveLength(1);
     }
+  });
+
+  it("holds a STILL-CONNECTING server apart from a failed one", () => {
+    // `pending` is settled-later, not failed: server startup does not block the
+    // session, so a slow server is legitimately pending in the init report and
+    // connected a moment after. Reporting it would fire on healthy sessions…
+    const health = inspectMcpServers(CONFIGURED, [
+      { name: "comfyui", status: "connected" },
+      { name: "panel", status: "pending" },
+    ]);
+    expect(health.degraded).toEqual([]);
+    // …and dropping it would be the silence this whole change exists to end:
+    // init is the only report the session pushes, so a pending server that goes
+    // on to FAIL would never be mentioned anywhere. It is carried, not ignored.
+    expect(health.pending).toEqual(["panel"]);
   });
 
   it("ignores servers we did not configure", () => {
     // `strictMcpConfig: true` means the set should be exactly ours, but a report
     // naming something else is not this message's business either way.
     expect(
-      degradedMcpServers(["comfyui"], [
+      inspectMcpServers(["comfyui"], [
         { name: "comfyui", status: "connected" },
         { name: "somebody-elses", status: "failed" },
       ]),
-    ).toEqual([]);
+    ).toEqual(HEALTHY);
   });
 });
 
