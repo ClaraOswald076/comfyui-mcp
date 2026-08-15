@@ -23,6 +23,7 @@ import { logger } from "../utils/logger.js";
 import { errorText } from "./error-text.js";
 import { buildAgentSpawnEnv } from "../services/panel-secrets.js";
 import { loadTurnRegistry, saveTurnRegistry, tombstoneTurn } from "./turn-registry.js";
+import { degradedMcpNotice, degradedMcpServers } from "./mcp-session-health.js";
 import { randomUUID } from "node:crypto";
 import {
   type AgentBackend,
@@ -419,6 +420,25 @@ export class ClaudeBackend implements AgentBackend {
     };
   }
 
+  /**
+   * The MCP server set this session is given: the comfyui stdio child, plus the
+   * in-process panel server when this key drives the canvas.
+   *
+   * Split out of buildOptions() so #1524's init check can name the servers we
+   * ASKED for without re-deriving them. Deriving them twice is how the check
+   * would end up comparing the session's report against a set the session was
+   * never handed — which is a false alarm in one direction and blindness in the
+   * other, and neither shows up in a test that builds both sides itself.
+   */
+  private mcpServersForRun(): Options["mcpServers"] {
+    return {
+      ...this.deps.mcpServers,
+      // Live-graph control of THIS tab's open workflow (in-process; talks to
+      // the bridge). Lets the agent build on what the user sees.
+      ...(this.deps.panelServer ? { panel: this.deps.panelServer } : {}),
+    };
+  }
+
   private buildOptions(opts: BackendStartOptions): Options {
     const model = opts.model;
     const effort = toClaudeEffort(opts.effort);
@@ -440,12 +460,7 @@ export class ClaudeBackend implements AgentBackend {
       // these into onStream deltas; the final assistant message still commits the
       // authoritative text via onSay (reconciled by message id).
       includePartialMessages: true,
-      mcpServers: {
-        ...this.deps.mcpServers,
-        // Live-graph control of THIS tab's open workflow (in-process; talks to
-        // the bridge). Lets the agent build on what the user sees.
-        ...(this.deps.panelServer ? { panel: this.deps.panelServer } : {}),
-      },
+      mcpServers: this.mcpServersForRun(),
       // Only our comfyui MCP — never inherit the user's project/user MCP config
       // (which may run a second comfyui that grabs the bridge port).
       strictMcpConfig: true,
@@ -738,6 +753,30 @@ export class ClaudeBackend implements AgentBackend {
           logger.info(
             `[panel-agent] init model=${message.model} session=${message.session_id.slice(0, 8)} apiKeySource=${message.apiKeySource} skills=${message.skills?.length ?? 0}`,
           );
+          // #1524 — the session just told us which of its MCP servers actually
+          // connected. Say so when one did not, instead of letting the agent run
+          // for hours against a toolset that was silently thinned. This is the
+          // reported failure exactly: `comfyui` came back after a mid-session
+          // drop, the 92 `panel_*` tools did not, and the only signal anywhere
+          // was a tool-list diff the agent had to notice on its own.
+          //
+          // It reports the observation, not a cause. WHY a server goes missing is
+          // still open on #1524 and the candidates need different fixes; this
+          // fires the same either way, which is the point — it turns a silent,
+          // unreproducible degradation into one that names itself the moment it
+          // happens, on whichever transport it happens to.
+          const degraded = degradedMcpServers(
+            Object.keys(this.mcpServersForRun() ?? {}),
+            message.mcp_servers,
+          );
+          if (degraded.length) {
+            logger.error(
+              `[claude-backend] session ${message.session_id.slice(0, 8)} started WITHOUT ` +
+                `${degraded.map((d) => `${d.name}=${d.status ?? "absent"}`).join(" ")} ` +
+                `(reported: ${(message.mcp_servers ?? []).map((s) => `${s.name}=${s.status}`).join(" ") || "none"})`,
+            );
+            yield { type: "error", sessionNotice: true, message: degradedMcpNotice(degraded) };
+          }
         } else if (message.subtype === "thinking_tokens") {
           // Live extended-thinking token count → drives a "thinking… (N)" meter
           // so the user can see the agent reasoning (not stuck) before any text.
