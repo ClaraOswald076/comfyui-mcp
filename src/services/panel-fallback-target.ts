@@ -340,28 +340,39 @@ export function choosePanelFallbackOrigin(
   //
   // So a same-canonical origin whose HOST IS SPELLED DIFFERENTLY is a separate
   // socket address and gets its own verdict.
-  // Foreign origins are grouped, not flattened (#1600 gate round 5, finding 2).
+  // EVERY DISTINCT FOREIGN SPELLING IS ITS OWN CANDIDATE (#1600 gate rounds 5-6).
   //
-  // This used to keep `spellings[0]` and drop the rest, which is the SAME mistake
-  // round 3 fixed for aliases, on the other branch: two spellings of one canonical
-  // origin are two SOCKETS, and a ComfyUI bound to only one stack leaves the other
-  // refusing. Keeping the first meant the live address could be the one thrown
-  // away, and the fallback failed with an answer available.
+  // This kept `spellings[0]` and dropped the rest, so two ComfyUIs bound to
+  // `127.0.0.1:p` and `[::1]:p` — separate processes, different indexes, proven by
+  // execution — collapsed to one candidate and the first to connect won.
   //
-  // The GROUP stays the unit of ambiguity, because that is the question ambiguity
-  // asks — "which of several machines did the caller mean?" — and #1175 holds one
-  // group to be one machine. Within a group there is no such question, so the
-  // spellings are chained in order exactly as aliases are. Refusing instead would
-  // decline the ordinary case (two tabs on one ComfyUI, spelled differently) to
-  // guard a case this module cannot detect anyway, and the result names the origin
-  // that answered either way.
-  const differentGroups: string[][] = [];
+  // I first fixed that by CHAINING the spellings, the way aliases are chained, and
+  // the gate refused it again. It was right and the distinction is the point of
+  // this whole module: an ALIAS of the CONFIGURED target is anchored — #1175 holds
+  // it to be the server the user named, so trying another spelling of it cannot
+  // answer from a machine they did not choose. A FOREIGN origin has no such
+  // anchor. There, "these two spellings are one server" is the DESCRIBING rule
+  // applied to an ACTING decision, which is the single mistake this PR has now
+  // made in four different places.
+  //
+  // So foreign spellings do not chain. Two of them is exactly the state
+  // `ambiguous` exists for — two addresses that may be two installs, with no
+  // evidence of which was meant — and a loud refusal naming both beats an index
+  // silently taken from whichever tab connected first.
+  //
+  // The cost, stated rather than hidden: one dual-stack ComfyUI reached by two
+  // spellings in two tabs now declines instead of answering. That reads as
+  // over-cautious to someone who knows it is one server, and there is no signal
+  // here that can tell them apart — a wrong install's index is unrecoverable,
+  // while this failure names both addresses and the fix (point COMFYUI_URL at the
+  // one you want).
+  const different: string[] = [];
   const aliases: string[] = [];
   let sameAs: string | undefined;
   const wantHost = hostOf(failedTarget);
   for (const [canon, spellings] of byCanonical) {
     if (canon !== want) {
-      differentGroups.push(spellings);
+      different.push(...spellings);
       continue;
     }
     for (const spelling of spellings) {
@@ -409,11 +420,8 @@ export function choosePanelFallbackOrigin(
   // candidate — they are ordered, not filtered.
   const chain: PanelFallbackCandidate[] = [
     ...aliases.map((origin) => ({ origin, kind: "alias" as const })),
-    // Every spelling of the single foreign server, in published order — for the
-    // same reason the aliases above are not filtered (gate round 5, finding 2).
-    ...(differentGroups.length === 1
-      ? differentGroups[0].map((origin) => ({ origin, kind: "use" as const }))
-      : []),
+    // Exactly ONE foreign address, or none: two never chain (gate rounds 5-6).
+    ...(different.length === 1 ? [{ origin: different[0], kind: "use" as const }] : []),
   ];
   const first = chain[0];
   if (first !== undefined) {
@@ -422,11 +430,10 @@ export function choosePanelFallbackOrigin(
       ? { kind: "alias", origin: first.origin, then }
       : { kind: "use", origin: first.origin, then };
   }
-  // One name per foreign SERVER, not per spelling: the reader is being told which
-  // machines were candidates, and listing one twice would misdescribe the choice.
-  if (differentGroups.length > 1) {
-    return { kind: "ambiguous", origins: differentGroups.map((g) => g[0]) };
-  }
+  // Every candidate address is named, including two spellings that #1175 would
+  // call one server: the reader is being told which ADDRESSES could have answered,
+  // and that is the set this refusal is about.
+  if (different.length > 1) return { kind: "ambiguous", origins: different };
   // `sameAs` is necessarily set here: the map is non-empty and nothing landed in
   // `different` or `aliases`. Asserted through a fallback rather than a `!` so a
   // future edit that breaks the partition degrades to "say nothing".

@@ -1413,26 +1413,27 @@ describe('list_packs action:"list_templates" — panel fallback', () => {
     expect(new Headers(hop?.init?.headers).get("authorization")).toBeNull();
   });
 
-  it("tries EVERY spelling of the one foreign server", () => {
-    // Finding 2. Foreign origins kept `spellings[0]` and dropped the rest — the
-    // same defect round 3 fixed for aliases, on the other branch. A ComfyUI bound
-    // to one stack leaves the other refusing, so the live address could be the one
-    // discarded.
+  it("REFUSES two spellings of a foreign address rather than picking one", () => {
+    // Rounds 5-6. These used to collapse to one candidate, so two ComfyUIs bound
+    // to `127.0.0.1:p` and `[::1]:p` — separate processes with different indexes —
+    // let whichever tab connected first decide the answer.
+    //
+    // Chaining them was tried and refused: an ALIAS of the CONFIGURED target is
+    // anchored by #1175 to the server the user named, and a FOREIGN origin has no
+    // such anchor, so "one server" there is the describing rule driving an acting
+    // decision. Two foreign addresses is what `ambiguous` is for.
     expect(
       choosePanelFallbackOrigin("http://127.0.0.1:8199/api/workflow_templates", [
         "http://127.0.0.1:8188",
         "http://[::1]:8188",
       ]),
     ).toEqual({
-      kind: "use",
-      origin: "http://127.0.0.1:8188",
-      then: [{ origin: "http://[::1]:8188", kind: "use" }],
+      kind: "ambiguous",
+      origins: ["http://127.0.0.1:8188", "http://[::1]:8188"],
     });
   });
 
-  it("still refuses when two DIFFERENT servers are connected, naming each once", () => {
-    // The grouping must not weaken the ambiguity rule, and must not list one
-    // machine twice just because two spellings of it are connected.
+  it("names EVERY candidate address in the refusal", () => {
     expect(
       choosePanelFallbackOrigin("http://127.0.0.1:8199/api/workflow_templates", [
         "http://127.0.0.1:8188",
@@ -1441,8 +1442,18 @@ describe('list_packs action:"list_templates" — panel fallback', () => {
       ]),
     ).toEqual({
       kind: "ambiguous",
-      origins: ["http://127.0.0.1:8188", "http://192.168.1.50:8188"],
+      origins: ["http://127.0.0.1:8188", "http://[::1]:8188", "http://192.168.1.50:8188"],
     });
+  });
+
+  it("still USES a lone foreign origin published under one spelling", () => {
+    // The refusal above must not swallow the ordinary single-panel case, which is
+    // the entire point of #1415.
+    expect(
+      choosePanelFallbackOrigin("http://127.0.0.1:8199/api/workflow_templates", [
+        "http://192.168.1.50:8188",
+      ]),
+    ).toEqual({ kind: "use", origin: "http://192.168.1.50:8188", then: [] });
   });
 
   it("passes the configured target through untouched when it works", async () => {
