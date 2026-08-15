@@ -4148,9 +4148,9 @@ export interface NormalizedGitUrlInstallArgs extends GitUrlInstallArgs {
  *     — ManagerChannel.dev, ManagerDatabaseSource.remote
  *
  * Manager v4's do_install resolves a pack by its registry ID, never by URL (the
- * 3.x `files:[url]` clone path does not exist there), so on a v4 host an
- * unregistered repository has NO Manager route by any spelling. The panel cannot
- * clone either — it is browser JS.
+ * 3.x `files:[url]` clone path does not exist there), so a repository the resolved
+ * LIST does not carry has no Manager route. The panel cannot clone either — it is
+ * browser JS.
  *
  * `install_custom_node` can: it tries the Manager first and then clones the URL
  * directly into custom_nodes, verifying the result is a real pack. That is the
@@ -4161,15 +4161,99 @@ export interface NormalizedGitUrlInstallArgs extends GitUrlInstallArgs {
  * the panel and matching on it would be brittle, and an agent that reads this
  * when the install is queued needs one fewer round trip than one that reads it
  * after the queue drains.
+ *
+ * #1539 GATE ROUND 2 — THIS CONTRADICTED THE NOTE IT SHIPS ALONGSIDE. It said a
+ * not-found means "the pack is not in the Manager's registry at all ... NO Manager
+ * route, by any spelling", and then the channel note appended right after it said the
+ * miss rules out ONE channel and to retry with another. Both reached the caller in the
+ * same reply, and the first one sends a pack that IS remotely installable — the
+ * reporter's own, which is listed in `default` — down the local-only clone path. That
+ * is the same over-claim this branch retracted from the tool description, surviving one
+ * layer down because the description test could not see a runtime string.
+ *
+ * WHAT A NOT-FOUND ACTUALLY MEANS, read out of V4.2.2 rather than inferred. The lookup
+ * resolves against ONE list, chosen by channel, and which file that is depends on how
+ * the Manager was installed:
+ *
+ *   * `get_data_by_mode` takes an OFFLINE branch when `network_mode == 'offline'` OR
+ *     `is_manager_pip_package()` — the latter being simply "the Manager is not inside a
+ *     custom_nodes tree", i.e. every pip/Desktop install. That branch reads the cache
+ *     file for that exact channel URL, else the snapshot BUNDLED in the package, and
+ *     never fetches. So on a pip host `mode` is inert and a channel name only reaches a
+ *     real list if a cache for its URL happens to exist.
+ *   * Measured on this rig: the only cache present is for `DEFAULT_CHANNEL`
+ *     (`ltdrdata/ComfyUI-Manager`), written at startup by `default_cache_update()` —
+ *     while the channel NAME "default" normalizes through `channels.list` to
+ *     `Comfy-Org/ComfyUI-Manager`, which hashes to a different cache file that does not
+ *     exist. So a pip host serves the bundled snapshot (3587 packs), and the reporter's
+ *     pack is NOT in it (checked directly).
+ *   * A Manager cloned into custom_nodes takes the public branch and FETCHES the
+ *     channel URL, where `default` carries 5891 packs including the reporter's.
+ *
+ * So the channel fix is a strict improvement on a cloned Manager and a NO-OP on a pip
+ * one (there, old `dev` and new `default` both land on the same bundled file) — it
+ * cannot make any host worse. The earlier note attributed the pip fallback to "a host
+ * configured to a non-default channel URL"; that was wrong, the trigger is the pip
+ * packaging, not the configuration.
+ *
+ * The text below therefore stops declaring the registry empty of the pack, names both
+ * causes it could actually be, and puts the retry that CAN succeed before the local
+ * clone that ends the road.
  */
 function unregisteredPackEscapeHatch(): string {
   return (
-    `If this comes back "not found" / "not available node", the pack is not in the ` +
-    `Manager's registry at all — on Manager v4 that leaves NO Manager route for a ` +
-    `repository URL, by any spelling. Use install_custom_node (source:"git") instead: ` +
-    `it clones the URL directly into custom_nodes and verifies a real pack landed. ` +
-    `Requires a LOCAL ComfyUI, since the clone writes to its filesystem.`
+    `If this comes back "not found" / "not available node", that is one LIST saying no, ` +
+    `not the Manager's whole registry: v4 resolves against a single channel's node list, ` +
+    `and on a pip-installed Manager it reads a bundled snapshot rather than fetching. So ` +
+    `try an explicit \`channel\` first (the pack may simply live on another one), and if ` +
+    `the plausible channels are ruled out, use install_custom_node (source:"git"): it ` +
+    `clones the URL directly into custom_nodes and verifies a real pack landed. That one ` +
+    `requires a LOCAL ComfyUI, since the clone writes to its filesystem — which need not ` +
+    `be the ComfyUI this panel drives.`
   );
+}
+
+/**
+ * #1539 GATE ROUND 3 — THE ROUTING PREDICATE HAD TO MATCH THE PANEL'S, AND DID NOT.
+ *
+ * Whether this function reroutes decides the version rewrite, the channel, and every
+ * note attached to them — but the PANEL decides, independently, whether its own
+ * `buildInstallRequest` takes the git branch (and so whether `channel || "dev"` fires).
+ * When the two predicates disagree, the orchestrator sends a payload normalized for one
+ * route down the other one.
+ *
+ * They disagreed. `looksLikeGitUrl` above recognizes `https?://`, `git@`, `git+` and a
+ * `.git` suffix. The panel's recognizes those PLUS `ssh://`, `git://`, and a bare
+ * `author/repo` shorthand (#301) — and `author/repo` is the form this tool's own
+ * description tells callers to pass in `id`. So
+ * `panel_install_node({id:"Wenaka2004/comfyui-anima-ipadapter"})` — the reporter's own
+ * pack, in the documented spelling — fell through here with no channel, and the panel
+ * then routed it as git and asked `dev`. The channel fix reached the URL spelling and
+ * missed the shorthand.
+ *
+ * Mirrored here rather than by widening `looksLikeGitUrl`, which is shared with the
+ * HEADLESS `install_custom_node` clone path: widening it there would newly treat a
+ * slash-bearing registry id as a URL to clone, which is a different tool's behaviour and
+ * not this fix's business.
+ */
+function looksLikeOwnerRepoShorthand(s: string): boolean {
+  return /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(s);
+}
+
+/** Exactly the panel's `looksLikeGitUrl` (web/js/lib/manager-install.js). */
+function panelRoutesAsGitInstall(s: string): boolean {
+  return (
+    /^(https?|ssh|git):\/\//i.test(s) ||
+    /^git\+/i.test(s) ||
+    /^git@/i.test(s) ||
+    s.endsWith(".git") ||
+    looksLikeOwnerRepoShorthand(s)
+  );
+}
+
+/** Exactly the panel's `installGitUrl` expansion: a bare shorthand becomes clonable. */
+function panelGitInstallUrl(s: string): string {
+  return looksLikeOwnerRepoShorthand(s) ? `https://github.com/${s}` : s;
 }
 
 export function normalizeGitUrlInstallArgs(
@@ -4184,13 +4268,16 @@ export function normalizeGitUrlInstallArgs(
         `git repository URL.`,
     };
   }
-  const gitTarget =
-    args.repository && looksLikeGitUrl(args.repository)
+  const gitSpelling =
+    args.repository && panelRoutesAsGitInstall(args.repository)
       ? args.repository
-      : args.id && looksLikeGitUrl(args.id)
+      : args.id && panelRoutesAsGitInstall(args.id)
         ? args.id
         : undefined;
-  if (!gitTarget) return {};
+  if (!gitSpelling) return {};
+  // Expanded the way the panel expands it, so `repository` is a fetchable URL on the
+  // 3.x dialects that put it straight into Manager's `files` clone list.
+  const gitTarget = panelGitInstallUrl(gitSpelling);
   const version = args.version?.trim();
   // The URL travels as `repository` ONLY: a URL that arrived as `id` is not
   // forwarded as both (routing off the id path is the whole point), and
@@ -4211,6 +4298,178 @@ export function normalizeGitUrlInstallArgs(
     out.version = args.version;
   }
   return out;
+}
+
+/**
+ * #1539 — the Manager channel a git-URL ("nightly") install asks for when the
+ * caller named none.
+ *
+ * WHY THIS EXISTS AT ALL. The panel's `buildInstallRequest` defaults the v4 git-URL
+ * payload to `channel: "dev"` while defaulting the registry-ID payload — and BOTH
+ * of the 3.x payload shapes — to `"default"`. Nothing justifies the difference, and
+ * because the panel spells it `channel || "dev"`, only a NON-EMPTY channel sent from
+ * here can displace it. So this is the field that fixes it on panels already in the
+ * field, including the version the report was filed from.
+ *
+ * WHAT "dev" COSTS, MEASURED. Manager's channels are separate lists, not a
+ * superset/subset pair. Fetched 2026-08-14 from the channel URLs the live Manager
+ * itself reports (`GET /v2/manager/channel_url_list`):
+ *
+ *   default  .../ComfyUI-Manager/main/custom-node-list.json               5887 packs
+ *   dev      .../ComfyUI-Manager/main/node_db/dev/custom-node-list.json   1210 packs
+ *   overlap                                                                 3 packs
+ *
+ * So asking `dev` hides ~99.9% of what `default` lists — including packs
+ * `panel_search_nodes` had just returned, because that search reads
+ * `extension-node-map.json`, which is NOT channel-scoped (measured: the live
+ * `getmappings?mode=cache` and `getmappings?mode=cache&channel=dev` returned
+ * byte-identical bodies). Search answered from one file, the install resolved
+ * against a different one, and the reporter was told their pack did not exist.
+ *
+ * WHY THE CHANNEL DECIDES ANYTHING. Read out of ComfyUI-Manager V4.2.2's own source
+ * (`glob/manager_core.py`), not inferred: `install_by_id` for a `nightly` spec does
+ * `custom_nodes = await self.get_custom_nodes(channel, mode)` → `load_nightly` →
+ * `get_data_by_mode(mode, 'custom-node-list.json', channel_url)`, keys that map by
+ * the BARE REPO NAME (`repo_name = y.split('/')[-1]`), and on a hit clones
+ * `the_node['repository']` — the CHANNEL's URL. The `repository` field we send is
+ * never read on that path; it is stored in the task params and nothing more. On a
+ * miss it returns the reported
+ * `Node '<name>@nightly' not found in [ManagerChannel.<ch>, ManagerDatabaseSource.<mode>]`,
+ * naming the channel THIS argument chose.
+ *
+ * WHAT THIS DOES NOT CLAIM. Not that `default` always resolves — and gate round 2
+ * corrected WHY. On a pip Manager v4 `manager_util.is_manager_pip_package()` is true,
+ * which sends `get_data_by_mode` down its offline branch unconditionally — it reads the
+ * cache file for that exact channel URL, else the snapshot bundled in the package, and
+ * never fetches, so `mode` is inert there. The earlier wording blamed "a host configured
+ * to a non-default channel URL"; that is not the trigger. `is_manager_pip_package()` is
+ * simply "the Manager is not inside a custom_nodes tree", so it is true of every
+ * pip/Desktop install regardless of configuration, and the caches a stock host actually
+ * holds do not line up with the channel NAMES: `default_cache_update()` writes the cache
+ * for `DEFAULT_CHANNEL` (`ltdrdata/ComfyUI-Manager`) at startup, while the name
+ * "default" normalizes through `channels.list` to `Comfy-Org/ComfyUI-Manager` — a
+ * different URL, so a different cache file, which does not exist. Measured on this rig:
+ * the cache directory holds exactly one node list, hashed from the ltdrdata URL, and the
+ * bundled snapshot it therefore falls back to (3587 packs) does NOT contain the
+ * reporter's pack.
+ *
+ * So the honest split is by PACKAGING, not by configuration: on a Manager cloned into
+ * custom_nodes this reaches the real 5891-pack list and fixes the report; on a pip
+ * Manager old `dev` and new `default` both land on the same bundled file, so the change
+ * is a no-op there rather than an improvement. It cannot make any host worse. Reaching
+ * the pip case would need the Manager to be asked for the channel the USER configured,
+ * which v4.2.2 gives no way to name (`channel: null` makes `load_nightly` return `{}`
+ * outright), so it is out of reach from here and is not claimed to be fixed.
+ *
+ * What IS established is narrower and still worth shipping: `dev` is the wrong
+ * question for every host, `default` is the right one for a host on the stock
+ * channel, and the registry-ID path has been asking `default` all along.
+ */
+export const GIT_INSTALL_DEFAULT_CHANNEL = "default";
+
+/**
+ * #1539 review — NO SINGLE DEFAULT IS CORRECT, so the one taken is DISCLOSED.
+ *
+ * `default` and `dev` are near-disjoint (5887 vs 1210 packs, 3 shared), which cuts
+ * both ways: whichever this call picks, the other one is a list it did not search.
+ * Review proposed resolving that by trying the picked channel and retrying the other
+ * on a not-found — a not-found being a proven negative that installed nothing, which
+ * it is (`install_by_id` returns before `to_path` is even computed, and four live
+ * probes left `custom_nodes` untouched).
+ *
+ * MEASURED, AND IT DOES NOT HOLD. The premise is true about the FIRST attempt and
+ * false about the SECOND. v4 resolves a from-source install by the BARE REPO NAME —
+ * `load_nightly` keys its map on `y.split('/')[-1]` — and then clones
+ * `the_node['repository']`, the URL recorded in THAT channel's entry, not the URL the
+ * caller passed. Comparing the two channels on that key: 38 bare names appear in
+ * both, and for 35 of them the two channels point at DIFFERENT authors' repositories
+ * (`comfyui-birefnet` is hieuck's on default and mohammadaboulela's on dev;
+ * `comfyui-lmstudio`, `comfyui-kittentts`, `ComfyUI-Image-Selector` and 31 more are
+ * the same story). An automatic second attempt would therefore clone, silently, a
+ * repository the caller never named — arbitrary code from an unintended author. That
+ * is the wrong-target bug this project already has a standing finding about, only
+ * automated. So the fallback position applies: do not silently pick between two
+ * candidates, NAME them.
+ *
+ * Refusing outright was rejected as the larger harm — it breaks every existing bare
+ * git-URL call — so the choice is taken, disclosed, and made reversible in one
+ * argument. Stated at DISPATCH rather than on the failure, for the reason
+ * `unregisteredPackEscapeHatch` already gives: the failure text comes back from the
+ * panel, matching on it would be brittle, and a caller who reads this when the
+ * install is queued needs one fewer round trip than one who reads it after.
+ *
+ * HOW BIG THE REGRESSION ACTUALLY IS, since review costed it as all 1207 dev-only
+ * packs. On a pip Manager v4 `get_data_by_mode` reads the cache file for that exact
+ * channel URL, else the snapshot bundled in the package — so a channel name only
+ * reaches its real list when it is the channel the user CONFIGURED (nothing else
+ * writes that cache). The bundled snapshot is a stale `default`-flavoured list: 3587
+ * packs, holding 3482 of default's 5891 and exactly 1 of dev's 1223 dev-only entries.
+ * So on a stock v4 the old `dev` never reached the dev list either — it landed on
+ * that same bundled file. The population that genuinely regresses is users whose
+ * Manager is CONFIGURED to the dev channel, and the note below hands them the exact
+ * argument that restores them.
+ */
+function gitInstallChannelNote(channel: string): string {
+  return (
+    `CHANNEL: this asked ComfyUI-Manager's "${channel}" channel, because the call named ` +
+    `none — saying so rather than picking silently, since Manager's channels are ` +
+    `near-disjoint lists (default ~5900 packs, dev ~1200, sharing 3). So a "not found" ` +
+    `from this install rules the pack out of "${channel}" ONLY; it says NOTHING about ` +
+    `dev/recent/legacy/forked/tutorial. If that happens, retry with an explicit channel ` +
+    `(e.g. channel:"dev") before concluding the pack does not exist. ` +
+    `NOT retried for you on purpose: by the same bare-name resolution described above, ` +
+    `an automatic second attempt could install a repository you did not name.`
+  );
+}
+
+/** `owner/repo` out of a git URL, or undefined when it does not parse that way. */
+function gitUrlOwnerRepo(url: string): string | undefined {
+  const m = /[/:]([^/:]+)\/([^/]+?)(?:\.git)?\/*$/.exec(url.trim());
+  return m ? `${m[1]}/${m[2]}` : undefined;
+}
+
+/**
+ * #1539 gate round 2 — THE FIRST ATTEMPT CAN ALSO HIT THE WRONG AUTHOR, and until now
+ * this only said so as a reason not to RETRY.
+ *
+ * The gate's finding, restated: because v4 resolves by bare repo name against the
+ * channel's list and clones the URL in THAT entry, a caller who passes
+ * `mohammadaboulela/ComfyUI-BiRefNet` with no channel now resolves the same bare name
+ * in `default` and gets `hieuck/ComfyUI-BiRefNet` — a repository they never named, and
+ * it reports success. That is real, and it is disclosed here rather than left to the
+ * retry paragraph.
+ *
+ * WHAT THE GATE HAD BACKWARDS, measured rather than argued. The hazard is not created
+ * by this change; it is PRE-EXISTING and SYMMETRIC — before it, the same call with no
+ * channel asked `dev`, so a caller passing hieuck's URL got mohammadaboulela's. What
+ * changed is which way it points, and the direction is now the safe one. Of the 35 bare
+ * names listed in both channels under different authors, `extension-node-map.json` —
+ * the channel-independent file `panel_search_nodes` reads, and where the reporter got
+ * their URL — carries the DEFAULT author's repo for 33 and the DEV author's repo for
+ * ZERO (2 in neither; fetched live 2026-08-15). So every colliding URL this tool can
+ * actually hand a caller resolved to the WRONG author under the old `dev` default and
+ * resolves to the RIGHT one now. The residue is a caller who hand-types a dev-only
+ * author's URL, which search never returns.
+ *
+ * Stated on EVERY git-URL install, not just the defaulted-channel one: bare-name
+ * resolution is a property of the v4 from-source route, not of who picked the channel,
+ * so a caller who passed `channel:"dev"` themselves faces exactly the same substitution.
+ * It names the owner from the caller's own URL so the check is concrete — the standing
+ * rule being that two candidates are NAMED, never silently picked between.
+ */
+function gitInstallSubstitutionNote(channel: string, url: string): string {
+  const owner = gitUrlOwnerRepo(url);
+  const bare = url.trim().replace(/\.git$/, "").replace(/\/+$/, "").split("/").pop();
+  return (
+    `WHAT GETS CLONED IS NOT NECESSARILY THE URL YOU PASSED. Manager v4 resolves a ` +
+    `from-source install by the BARE REPO NAME ("${bare}") against the "${channel}" ` +
+    `channel's list, then clones the URL recorded in THAT entry — 35 bare names are ` +
+    `listed in both default and dev under DIFFERENT authors. So if "${channel}" lists ` +
+    `that name under anyone other than ${owner ? `the ${owner} you passed` : "the author you passed"}, ` +
+    `this installs THEIR repository and still reports success. Confirm with ` +
+    `panel_list_nodes that what landed is the repo you meant before you restart or ` +
+    `report success.`
+  );
 }
 
 /**
@@ -4237,13 +4496,40 @@ export function nodesInstallCommandArgs(args: {
   const norm = normalizeGitUrlInstallArgs(args);
   if (norm.conflict) return { conflict: norm.conflict };
   const rerouted = norm.repository !== undefined;
+  // #1539 — only the git-URL route is touched, and only when the caller named no
+  // channel. A caller who passed one keeps it (including on this route: naming a
+  // channel is the one way to reach a pack that really does live in `dev`), and
+  // the registry-ID route is left exactly as it was, because the panel already
+  // defaults THAT one to "default".
+  //
+  // Blank counts as unset. The panel's `channel || "dev"` treats "" as absent and
+  // substitutes `dev`, so forwarding an empty string would silently land back on
+  // the channel this fix exists to stop asking for.
+  const explicitChannel = args.channel?.trim() ? args.channel : undefined;
+  // DISCLOSE only what THIS function chose. A caller who named a channel made the
+  // choice themselves and does not need it read back to them, and `norm.note` rides
+  // only the "latest"→nightly branch — so an explicit version with no channel would
+  // otherwise dispatch a defaulted channel with nothing said about it.
+  const defaultedChannel = rerouted && explicitChannel === undefined;
+  const effectiveChannel = explicitChannel ?? GIT_INSTALL_DEFAULT_CHANNEL;
+  // The substitution warning rides EVERY git-URL install (gate round 2), because
+  // bare-name resolution is a property of the v4 from-source route rather than of
+  // who chose the channel — an explicit `channel:"dev"` substitutes just as readily.
+  const note =
+    [
+      norm.note,
+      rerouted && norm.repository ? gitInstallSubstitutionNote(effectiveChannel, norm.repository) : undefined,
+      defaultedChannel ? gitInstallChannelNote(GIT_INSTALL_DEFAULT_CHANNEL) : undefined,
+    ]
+      .filter((s): s is string => typeof s === "string" && s.length > 0)
+      .join(" ") || undefined;
   return {
     id: rerouted ? norm.id : args.id,
     repository: rerouted ? norm.repository : args.repository,
     version: rerouted ? norm.version : args.version,
-    channel: args.channel,
+    channel: rerouted ? effectiveChannel : args.channel,
     mode: args.mode,
-    ...(norm.note ? { note: norm.note } : {}),
+    ...(note ? { note } : {}),
   };
 }
 
