@@ -1197,7 +1197,12 @@ describe('list_packs action:"list_templates" — panel fallback', () => {
 
         expect(res.isError).toBe(true);
         const body = textOf(res);
-        expect(body).toContain("302");
+        // The redirect is now FOLLOWED (gate round 4, finding 2 — refusing it
+        // broke working proxies), so what must hold is not "it reported the 302"
+        // but that a failure AFTER the configured server answered never becomes
+        // someone else's index. Both addresses are named.
+        expect(body).toContain("REDIRECT");
+        expect(body).toContain(`http://127.0.0.1:${deadPort}`);
         // The panel's index must be nowhere in this result.
         expect(body).not.toContain("from-the-panel");
         expect(body).not.toContain("answered_by");
@@ -1295,6 +1300,92 @@ describe('list_packs action:"list_templates" — panel fallback', () => {
     } finally {
       configuredBase = previous;
     }
+  });
+
+  // ── #1600 merge gate, round 4 ──────────────────────────────────────────────
+
+  it("FOLLOWS a healthy redirect from the configured server, over a real socket", async () => {
+    // Finding 2, and it is a regression THIS PR introduced. Round 2 set
+    // `redirect: "manual"` on the configured request to stop a post-redirect
+    // failure from being read as "never reached" — correct — but it also broke a
+    // reverse proxy that legitimately redirects this endpoint to its canonical
+    // address, which used to return the index and started returning a 302.
+    const canonical = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"from-the-canonical-endpoint":[{"name":"t1"},{"name":"t2"}]}');
+    });
+    await new Promise<void>((r) => canonical.listen(0, "127.0.0.1", () => r()));
+    const canonicalPort = (canonical.address() as AddressInfo).port;
+
+    const proxy = createServer((_req, res) => {
+      res.writeHead(302, {
+        location: `http://127.0.0.1:${canonicalPort}/api/workflow_templates`,
+      });
+      res.end();
+    });
+    await new Promise<void>((r) => proxy.listen(0, "127.0.0.1", () => r()));
+    const proxyPort = (proxy.address() as AddressInfo).port;
+
+    const previous = configuredBase;
+    configuredBase = `http://127.0.0.1:${proxyPort}`;
+    try {
+      // A panel is connected and must stay unused: the configured server answered.
+      setConnectedPanelOrigins(() => [PANEL_ORIGIN]);
+
+      const res = await handler()({ action: "list_templates" });
+
+      expect(res.isError).toBeFalsy();
+      const body = textOf(res);
+      expect(body).toContain("from-the-canonical-endpoint");
+      expect(body).toContain('"template_count": 2');
+      // It came from the configured target's own redirect, NOT from the panel.
+      expect(body).not.toContain("answered_by");
+    } finally {
+      configuredBase = previous;
+      await new Promise<void>((r) => proxy.close(() => r()));
+      await new Promise<void>((r) => canonical.close(() => r()));
+    }
+  });
+
+  it("does NOT send the configured credential across a redirect to another origin", async () => {
+    // The rule the panel fallback already follows, applied to a hop the user's own
+    // server chose: COMFYUI_AUTH_* was configured for the configured origin. This
+    // is also what undici does when it follows a redirect itself, so following
+    // them by hand must not quietly become more permissive than what it replaced.
+    stubFetch(async (url) => {
+      if (url === CONFIGURED) {
+        return new Response(null, {
+          status: 302,
+          headers: { location: "http://192.168.9.9:8188/api/workflow_templates" },
+        });
+      }
+      return jsonResponse({ elsewhere: [{ name: "t" }] });
+    });
+
+    await handler()({ action: "list_templates" });
+
+    const hop = calls.find((c) => c.url.startsWith("http://192.168.9.9:8188"));
+    expect(hop).toBeDefined();
+    expect(new Headers(hop?.init?.headers).get("authorization")).toBeNull();
+    // …while the first, same-origin request did carry it.
+    expect(new Headers(calls[0].init?.headers).get("authorization")).toBe(
+      "Bearer configured-token",
+    );
+  });
+
+  it("stops a redirect LOOP instead of following it forever", async () => {
+    stubFetch(async (url) => {
+      const next = `${url}?hop`;
+      return new Response(null, { status: 302, headers: { location: next } });
+    });
+
+    const res = await handler()({ action: "list_templates" });
+
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("redirect loop");
+    // Bounded: the walk gave up rather than spinning. Five hops allowed, so six
+    // requests are made before it stops.
+    expect(calls).toHaveLength(6);
   });
 
   it("passes the configured target through untouched when it works", async () => {

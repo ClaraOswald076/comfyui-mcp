@@ -804,6 +804,114 @@ async function askOnePanelOrigin(opts: {
   return { res, url: altUrl, origin: answeringOrigin(res, choice.origin), ageMs: snapshot.ageMs };
 }
 
+/** Redirect hops followed on the CONFIGURED target before giving up. Five is the
+ *  usual browser allowance; a proxy chain longer than this is a loop. */
+const MAX_CONFIGURED_REDIRECTS = 5;
+
+/**
+ * The configured server ANSWERED — so no other server may be asked, whatever the
+ * eventual failure looks like.
+ *
+ * A distinct class rather than a shape the caller re-derives, because the shape
+ * lies. The post-redirect failure carries the transport error as its `cause`, and
+ * `describeFetchFailure` walks the cause chain: it finds the ECONNREFUSED from the
+ * REDIRECT TARGET and reports it as though the configured address had never been
+ * reached, which is exactly the confusion this whole path exists to prevent —
+ * round 2's finding, reintroduced one level down. Caught by the real-socket test.
+ *
+ * So the fact "it answered" is carried explicitly by the type, and the caller
+ * checks the type instead of interrogating the error.
+ */
+class ConfiguredServerAnswered extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "ConfiguredServerAnswered";
+  }
+}
+
+/**
+ * The configured target, WITH its redirects followed explicitly (#1600 gate round
+ * 4, finding 2).
+ *
+ * Round 2 set `redirect: "manual"` here and stopped at the 3xx. That fixed a real
+ * defect — with automatic following, a proxy answering 302 toward a dead address
+ * rejects with a bare ECONNREFUSED naming only the LAST hop, indistinguishable
+ * from the configured address itself refusing, so `mayAskAnotherServer` read "no
+ * connection was ever established" off an error produced AFTER the configured
+ * server had answered, and the index came back from another machine.
+ *
+ * But it fixed it by breaking a setup that worked: a reverse proxy that
+ * legitimately redirects this endpoint to its canonical HTTPS address used to
+ * return the index and now returns a 302 as an error. Measured by the gate
+ * against a live proxy. Trading a working configuration for a diagnostic is the
+ * wrong side of that trade, and it was this PR that introduced the regression.
+ *
+ * Following them HERE gets both, because the loop knows something automatic
+ * following cannot tell the caller: whether a redirect happened at all.
+ *
+ *   - No redirect, transport failure  → the caller's fallback rules apply
+ *                                       unchanged (this is the #1415 case).
+ *   - A redirect, then a failure      → the configured server ANSWERED. No
+ *                                       fallback; the error names both the
+ *                                       address that redirected and the hop that
+ *                                       failed, which is what round 2's bare
+ *                                       ECONNREFUSED could not do.
+ *   - A redirect, then a response     → returned normally, from the final URL.
+ *
+ * CREDENTIALS DO NOT CROSS AN ORIGIN. `comfyuiFetch` injects COMFYUI_AUTH_*,
+ * configured for the configured target; a same-origin hop keeps it, and a hop to
+ * any other origin is a plain `fetch`. That is deliberately what undici already
+ * does when it follows a redirect itself (Authorization is dropped cross-origin),
+ * so this restores the previous behaviour rather than inventing a new one — and
+ * it is the same rule the panel fallback follows.
+ */
+async function fetchConfiguredTemplateIndex(
+  startUrl: string,
+): Promise<{ res: Response; url: string; redirected: boolean }> {
+  let current = startUrl;
+  let redirected = false;
+  for (let hop = 0; hop <= MAX_CONFIGURED_REDIRECTS; hop++) {
+    let res: Response;
+    try {
+      res = sameOrigin(current, startUrl)
+        ? await comfyuiFetch(current, {
+            redirect: "manual",
+            signal: AbortSignal.timeout(8000),
+          })
+        : await fetch(current, { redirect: "manual", signal: AbortSignal.timeout(8000) });
+    } catch (err) {
+      // Hop 0 is the ordinary case: nothing answered, and the caller decides
+      // whether that licenses asking a connected panel.
+      if (!redirected) throw err;
+      throw new ConfiguredServerAnswered(
+        `The configured ComfyUI (${startUrl}) answered with a REDIRECT to ${current}, and that ` +
+          `address could not be reached: ${describeFetchFailure(err).message}. The configured ` +
+          `server did answer, so this was NOT retried against a connected sidebar panel — the ` +
+          `redirect target is the thing to fix.`,
+        { cause: err },
+      );
+    }
+    if (res.status < 300 || res.status >= 400) return { res, url: current, redirected };
+    const location = res.headers.get("location");
+    // A 3xx with no usable Location is an answer, not a hop. Hand it back and let
+    // the non-2xx branch report the status against the address that sent it.
+    if (!location) return { res, url: current, redirected };
+    let next: string;
+    try {
+      next = new URL(location, current).toString();
+    } catch {
+      return { res, url: current, redirected };
+    }
+    current = next;
+    redirected = true;
+  }
+  throw new ConfiguredServerAnswered(
+    `The configured ComfyUI (${startUrl}) redirected more than ${MAX_CONFIGURED_REDIRECTS} times ` +
+      `without answering — the last address tried was ${current}. That is a redirect loop in ` +
+      `front of ComfyUI, not a missing template index.`,
+  );
+}
+
 /** action:"list_templates" */
 async function listWorkflowTemplatesAction(): Promise<ToolText> {
   traceToolCall("list_packs", { action: "list_templates" });
@@ -825,32 +933,17 @@ async function listWorkflowTemplatesAction(): Promise<ToolText> {
   // headless address was not. comfyuiFetch names the target on a network throw,
   // and it is the same auth path every other ComfyUI call uses.
   try {
-    res = await comfyuiFetch(url, {
-      // #1600 gate round 2, finding 1 — A FOLLOWED REDIRECT MAKES THE FAILURE LIE.
-      //
-      // `fetch` follows redirects by default, and the error it raises names only
-      // the LAST hop. A configured ComfyUI behind a proxy that answers 302 with a
-      // Location nobody is listening on therefore rejects with a bare
-      // `ECONNREFUSED` — measured against a real socket, not inferred — which is
-      // byte-identical to the configured address itself refusing. mayAskAnotherServer
-      // then reads "no connection was ever established" off an error produced
-      // AFTER the configured server answered, and the index comes back from
-      // another machine with a note saying this one could not be reached at all.
-      //
-      // With `manual` there is no second hop to be confused by: a 3xx is a
-      // RESPONSE, `res.ok` is false, and it falls through to the non-2xx branch
-      // below, which names the status and the address. The configured server
-      // answered, so no fallback fires — which is the invariant this whole path
-      // is built on.
-      //
-      // The cost is real and is the right trade: a proxy that legitimately
-      // redirects this endpoint used to be followed silently and now reports the
-      // 3xx instead. That is a loud, addressable message about the user's own
-      // configuration, where the behaviour it replaces was a silent answer from a
-      // server they did not configure.
-      redirect: "manual",
-      signal: AbortSignal.timeout(8000),
-    });
+    // #1600 gate round 2 finding 1, then round 4 finding 2 — REDIRECTS ARE
+    // FOLLOWED, BUT NOT BLINDLY. fetchConfiguredTemplateIndex walks them itself,
+    // so a proxy that legitimately redirects this endpoint still works (round 2's
+    // `manual` broke that), while a failure AFTER a redirect can no longer be
+    // mistaken for "the configured address was never reached" and send the
+    // question to a different machine (which is what automatic following caused).
+    // `url` becomes the address that actually answered, so every message below
+    // names the final hop rather than the one we started from.
+    const configured = await fetchConfiguredTemplateIndex(url);
+    res = configured.res;
+    url = configured.url;
   } catch (err) {
     // #1415 review, finding 2 — WHAT LICENSES ASKING A SECOND SERVER.
     //
@@ -873,6 +966,12 @@ async function listWorkflowTemplatesAction(): Promise<ToolText> {
     // before any socket opens, and that refusal carries no error code at all — so
     // a code-only predicate said "no" to the exact case this feature exists for.
     // The address settles it where the error cannot.
+    // THE CONFIGURED SERVER ANSWERED — asked and settled by the type, before any
+    // inspection of the error (#1600 gate round 4, finding 2). It must come first:
+    // the post-redirect failure carries the redirect target's transport error as
+    // its cause, and mayAskAnotherServer would find that ECONNREFUSED and read it
+    // as "the configured address was never reached".
+    if (err instanceof ConfiguredServerAnswered) throw err;
     if (!mayAskAnotherServer(err, url)) throw err;
     const viaPanel = await fetchTemplateIndexViaPanel(url, err);
     res = viaPanel.res;
