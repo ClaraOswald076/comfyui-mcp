@@ -101,6 +101,18 @@ npm run docs:gen
 and commit the regenerated MDX. Guide pages (`docs/*.mdx`) are hand-written; edit those directly.
 Run `cd docs && npx mint broken-links` to validate links.
 
+### Blog posts and translated pages
+
+`docs/blog/*.mdx` and `docs/<locale>/*.mdx` are covered by their own gates (all run in
+`npm test`) — a `## Licensing` section is required on model posts, model and script filenames
+are checked against the pack that ships them, advertised counts are checked against the live
+registry, and translated pages are compared structurally to their English source.
+
+Read **[design/writing-blog-posts.md](design/writing-blog-posts.md)** before writing one. It
+also documents the Mintlify caveats that make a page fail to build — including the one page
+that has never built and why — and a short list of things previously believed about this build
+that turned out, on measurement, to be false.
+
 ## Optional / experimental dependencies
 
 Cloud storage (`@aws-sdk/client-s3`, `@azure/storage-blob`) and the experimental agent-panel POC
