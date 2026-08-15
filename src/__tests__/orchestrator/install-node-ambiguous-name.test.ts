@@ -469,6 +469,45 @@ describe("the snapshot and its predicate (#1616)", () => {
       .toBeUndefined();
   });
 
+  it("treats an INHERITED key as a channel it has never heard of, not as a hit", () => {
+    // GATE ROUND 3. The test above passed while three specific strings still threw,
+    // because both lookups indexed object literals with `obj[key]` — and an object
+    // literal ANSWERS for what it inherits from Object.prototype. Measured before the
+    // fix, on `repository:".../ComfyUI-BiRefNet"`:
+    //
+    //   channel:"__proto__"    -> TypeError: repos.map is not a function
+    //   channel:"constructor"  -> TypeError: Cannot read properties of undefined
+    //
+    // `__proto__` hands back Object.prototype, whose `.length` is undefined, so neither
+    // the falsy check nor `length === 0` stops it and it rides into listRepos.
+    // `constructor` is worse: Object.length is 1, so it passes the `length === 1` branch
+    // and reaches sameRepo(undefined, …). Not a trust boundary — one machine — just a
+    // name no table contains being read as a hit, which turns the tool into a throw
+    // instead of the answer the case above promises.
+    for (const inherited of ["__proto__", "constructor", "toString", "valueOf", "hasOwnProperty"]) {
+      expect(bareNameAmbiguity(DEV_AUTHORS, inherited), inherited).toBeUndefined();
+      expect(
+        nodesInstallCommandArgs({ repository: DEV_AUTHORS, channel: inherited }).conflict,
+        inherited,
+      ).toBeUndefined();
+    }
+  });
+
+  it("treats an inherited BARE NAME the same way — though nothing today depends on it", () => {
+    // HONEST SCOPE: unlike the case above, this one passes with OR without the
+    // own-property guard, so it is not what proves that guard. It cannot currently
+    // reach the throw: an inherited bare name makes `entry` Object.prototype (or the
+    // Object constructor), and the CHANNEL lookup that runs next asks it for "default",
+    // gets undefined, and returns at the `!channelCandidates` check. The guard is
+    // applied at the name lookup anyway because being saved by the next statement is
+    // not the same as being correct, and this test pins the outcome so a reorder of
+    // those two lookups cannot quietly turn a repo named `constructor` into a throw.
+    for (const inherited of ["__proto__", "constructor", "toString"]) {
+      expect(bareNameAmbiguity(`https://github.com/someone/${inherited}`, "default"), inherited)
+        .toBeUndefined();
+    }
+  });
+
   it("refuses a URL it cannot parse an owner out of, rather than assuming a match", () => {
     // No owner means no way to tell the caller's repo from the channel's, and the
     // fallback position is to name both rather than to guess.

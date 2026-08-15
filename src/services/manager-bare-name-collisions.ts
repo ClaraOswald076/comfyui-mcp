@@ -124,6 +124,25 @@ export function gitHostOf(url: string): string | undefined {
 const sameRepo = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase();
 
 /**
+ * Read a key that the object OWNS, or `undefined`.
+ *
+ * Both lookups below are indexed by a caller-supplied string — the bare name off their URL
+ * and the `channel` they passed — against object literals, which inherit from
+ * `Object.prototype`. A plain `obj[key]` therefore ANSWERS for `__proto__`, `constructor`
+ * and `toString`: `entry["__proto__"]` hands back `Object.prototype`, whose `.length` is
+ * `undefined`, so neither the falsy check nor the `length === 0` check stops it and the
+ * inherited object rides all the way into `listRepos`, where `.map` is not a function and
+ * the tool throws instead of answering. `channel:"constructor"` is worse — `Object.length`
+ * is 1, so it reaches `sameRepo(undefined, …)`. Not a trust boundary (this is one machine),
+ * just a name nobody's table contains being treated as a hit. An own-property check is the
+ * whole fix, and it keeps the promise the unknown-channel path already makes: a channel
+ * this table has never heard of is NOT checked, rather than throwing.
+ */
+function ownCandidates<T>(obj: Readonly<Record<string, T>>, key: string): T | undefined {
+  return Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
+}
+
+/**
  * Is this URL comparable to a snapshot candidate at all? The snapshot holds github.com
  * repositories only — `load_nightly` reaches an entry through a `github.com` file — so an
  * `owner/repo` that came off ANOTHER host is a different repository that merely shares a
@@ -166,10 +185,10 @@ export interface BareNameAmbiguity {
  */
 export function bareNameAmbiguity(url: string, channel: string): BareNameAmbiguity | undefined {
   const bare = managerBareName(url);
-  const entry = AMBIGUOUS_BARE_NAMES[bare.trim().toLowerCase()];
+  const entry = ownCandidates(AMBIGUOUS_BARE_NAMES, bare.trim().toLowerCase());
   if (!entry) return undefined;
   const asked = channel.trim().toLowerCase() as ManagerChannelName;
-  const channelCandidates = entry[asked];
+  const channelCandidates = ownCandidates(entry, asked);
   if (!channelCandidates || channelCandidates.length === 0) return undefined;
   const callerRepo = comparableToSnapshot(url) ? ownerRepoOf(url) : undefined;
   if (channelCandidates.length === 1 && callerRepo && sameRepo(channelCandidates[0], callerRepo)) {
@@ -177,7 +196,7 @@ export function bareNameAmbiguity(url: string, channel: string): BareNameAmbigui
   }
   const channelsResolvingToCaller = callerRepo
     ? MANAGER_CHANNEL_NAMES.filter((c) => {
-        const cands = entry[c];
+        const cands = ownCandidates(entry, c);
         return cands?.length === 1 && sameRepo(cands[0], callerRepo);
       })
     : [];
