@@ -35,6 +35,20 @@ const SNIPPET = path.join(ROOT, 'docs', 'snippets', 'panel-install.mdx');
 const eol = (s) => s.replace(/\r\n/g, '\n');
 /** Collapse wrapping so a line-broken copy compares equal to a single-line one. */
 const flat = (s) => eol(s).replace(/\s+/g, ' ').trim();
+/**
+ * Join SOFT line breaks, keep paragraph breaks.
+ *
+ * These posts are hard-wrapped at ~80 columns, so a retired claim routinely straddles a
+ * newline: "the panel auto-starts a\nbackground agent" renders identically to the banned
+ * sentence. Round 1 tested `flat(src)` (immune to wrapping, but a pattern could then match
+ * across a paragraph boundary); round 2 moved to raw source and reintroduced the wrap hole in
+ * the process. Neither is right — unwrap within a paragraph, preserve the blank line between.
+ */
+const unwrap = (s) =>
+  eol(s)
+    .split(/\n{2,}/)
+    .map((para) => para.replace(/\n[ \t]*/g, ' '))
+    .join('\n\n');
 
 if (!fs.existsSync(SNIPPET)) {
   console.error(`missing ${path.relative(ROOT, SNIPPET)} — it is the source of truth for this step`);
@@ -64,14 +78,38 @@ if (canonical.length < 40) {
  */
 const MARKER = /sign in with `claude` once/;
 /**
- * Exact expected carrier count — not a loose floor.
+ * The exact SET of posts that carry the shared step — identity, not a count.
  *
- * First attempt used 10 as a safety margin, and mutation-testing immediately showed why that
- * is useless: editing one post's marker dropped the count to 10, still passed, and the post
- * silently left coverage — the precise failure the floor was added to catch. A margin only
- * hides the first defection. Bump this deliberately when a post joins or leaves.
+ * Three attempts, each killed by the next mutation:
+ *   `>= 10` floor  — one post opted out, count hit exactly 10, passed. A margin hides the
+ *                    first defection, which is the only one that matters.
+ *   `=== 11` count — catches a lone departure, but a swap is invisible: one carrier edits its
+ *                    marker and leaves while a new post adopts the step, and 11 still holds.
+ *   this set       — names them. A departure, an arrival, or a swap all fail, by filename.
+ *
+ * The underlying weakness is that MARKER both selects and validates, so the marker text can
+ * opt a post out. codex confirmed no content-only selector can infer intended membership; the
+ * clean fix is importing a shared component, which is blocked on rendering a block component
+ * inside a numbered list. Until then, membership is recorded here on purpose.
  */
-const EXPECTED_CARRIERS = 11;
+const EXPECTED_CARRIERS = new Set([
+  'anima-comfyui.mdx',
+  'ernie-image-comfyui.mdx',
+  'ideogram-4-comfyui.mdx',
+  'lora-trainer-p1.mdx',
+  'ltx-2.3-comfyui.mdx',
+  'qwen-image-comfyui.mdx',
+  'video-extend-pusa-comfyui.mdx',
+  'wan-2.2-comfyui.mdx',
+  'wan-animate-comfyui.mdx',
+  'wan-transparent-comfyui.mdx',
+  'z-image-comfyui.mdx',
+]);
+// Written from a MEASUREMENT, not from memory. The first version of this list was typed from
+// recall and was wrong three ways in eleven entries — it invented two carriers
+// (comfyui-agent-claude-or-chatgpt, krea2) and missed ltx-2.3. The gate caught all three on
+// its first run, which is the argument for identity over a count: a count cannot tell you
+// that the members are wrong, only that there are the right number of them.
 /** Claims this step must never make again, with why. */
 const RETIRED = [
   {
@@ -104,7 +142,7 @@ const RETIRED = [
 ];
 
 let failures = 0;
-let carrying = 0;
+const carrying = new Set();
 for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   const src = fs.readFileSync(path.join(BLOG, file), 'utf8');
   const f = flat(src);
@@ -113,14 +151,14 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   // space, so excluding the newline character inside these patterns was a no-op — a retired
   // claim could still match across a paragraph break. Line structure is signal here, not noise.
   for (const { pattern, why } of RETIRED) {
-    if (pattern.test(eol(src))) {
+    if (pattern.test(unwrap(src))) {
       failures++;
       console.error(`  ✗ blog/${file}: retired claim "${pattern.source}" — ${why}`);
     }
   }
 
   if (!MARKER.test(f)) continue;
-  carrying++;
+  carrying.add(file);
   if (!f.includes(canonical)) {
     failures++;
     console.error(
@@ -133,17 +171,24 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
 // opts a post out of coverage entirely — and if every post drifted, `carrying` would be 0 and
 // this gate would report success having compared nothing. codex called this fail-open twice;
 // a floor does not fix the selector, but it does make total collapse loud instead of green.
-if (carrying !== EXPECTED_CARRIERS) {
+const missingCarriers = [...EXPECTED_CARRIERS].filter((f) => !carrying.has(f));
+const extraCarriers = [...carrying].filter((f) => !EXPECTED_CARRIERS.has(f));
+for (const f of missingCarriers) {
   failures++;
   console.error(
-    `  ✗ ${carrying} post(s) carry the shared install step, expected exactly ` +
-      `${EXPECTED_CARRIERS}. FEWER means a post's marker text was edited and it silently left ` +
-      `coverage — check the tail of docs/snippets/panel-install.mdx. MORE means a new post ` +
-      `adopted the step; bump EXPECTED_CARRIERS once you have confirmed it should match.`,
+    `  ✗ blog/${f}: expected to carry the shared install step but does not — its marker ` +
+      `text was probably edited, which silently removes it from this gate`,
+  );
+}
+for (const f of extraCarriers) {
+  failures++;
+  console.error(
+    `  ✗ blog/${f}: carries the shared install step but is not in EXPECTED_CARRIERS — ` +
+      `add it once you have confirmed the step is right for this post`,
   );
 }
 
-console.log(`${carrying} post(s) carry the shared install step`);
+console.log(`${carrying.size} post(s) carry the shared install step`);
 if (failures) {
   console.error(
     `\n${failures} problem(s). Edit docs/snippets/panel-install.mdx, then make every post match ` +

@@ -173,7 +173,9 @@ for (const loc of locales) {
       // /docs/docs/backends returns the same shell as a nonsense URL. Two review agents reached
       // OPPOSITE conclusions about the prefix by reasoning from repo conventions, which is why
       // this is pinned to an observation rather than an argument.
-      if (/^\/docs\/docs\//.test(rawTarget)) {
+      // `(\/|$)` — the trailing-slash-only form let the bare `/docs/docs` through, which is
+      // the same 404 without a suffix.
+      if (/^\/docs\/docs(\/|$)/.test(rawTarget)) {
         fail(loc, slug, `link "${href}" doubles the /docs prefix — it 404s; use "/docs/..." once`);
         continue;
       }
@@ -193,7 +195,12 @@ for (const loc of locales) {
       // asset link into a 404, so it errs toward exempting.
       const looksLikeAsset =
         /\.[a-z0-9]+$/i.test(rawTarget) || /^\/(api|assets|static|_[a-z0-9-]*)\//i.test(rawTarget);
-      if (!looksLikeAsset && /^\/(?!docs\/)(?!images\/)(?!logo\/)[a-z]/.test(rawTarget)) {
+      // `(?!docs\/)` alone rejected the bare `/docs` link — the lookahead wants a slash after
+      // "docs", which the docs root does not have — so a correct link to the docs home was
+      // reported as missing the prefix it already is.
+      const alreadyPrefixed = /^\/docs(\/|$)/.test(rawTarget);
+      const isSiteAsset = /^\/(images|logo)\//.test(rawTarget);
+      if (!looksLikeAsset && !alreadyPrefixed && !isSiteAsset && /^\/[a-z]/.test(rawTarget)) {
         fail(
           loc,
           slug,

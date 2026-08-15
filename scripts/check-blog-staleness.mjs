@@ -106,6 +106,25 @@ if (isShallowClone()) {
   process.exit(0);
 }
 
+/**
+ * Posts known to carry a `verified:` stamp.
+ *
+ * Recorded because `--check` deliberately fails on STALE and not on UNSTAMPED, which leaves an
+ * escape hatch: delete the stamp from a stale post and the blocking failure becomes a passing
+ * backlog line. Naming the members closes it — removal fails, and adding a stamp to a post not
+ * listed here is fine (it just shrinks the backlog, so a new entry is a one-line follow-up).
+ *
+ * Measured from the tree, not typed from memory — the same list written by hand for
+ * check-blog-boilerplate was wrong three ways in eleven entries.
+ */
+const STAMPED = new Set([
+  'ernie-image-comfyui.mdx',
+  'video-extend-pusa-comfyui.mdx',
+  'wan-2.2-comfyui.mdx',
+  'wan-animate-comfyui.mdx',
+  'wan-transparent-comfyui.mdx',
+]);
+
 const stale = [];
 const unverified = [];
 const unreadable = [];
@@ -134,7 +153,15 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   const fm = src.replace(/\r\n/g, '\n').match(/^---\n([\s\S]*?)\n---/);
   const stamp = fm?.[1].match(/^verified:\s*(\d{4}-\d{2}-\d{2})\s*$/m)?.[1];
   if (!stamp) {
-    unverified.push([file, [...named]]);
+    // A post that WAS stamped and lost its stamp is a regression, not a backlog item —
+    // otherwise the cheapest way to silence a stale failure is to delete the stamp, which
+    // converts a blocking error into a passing "unverified". Membership is recorded so
+    // removal is loud; arrival still just shrinks the backlog.
+    if (STAMPED.has(file)) {
+      invalid.push([file, '(none)', 'previously stamped — the stamp was REMOVED, which would silently downgrade a stale post to an unverified one']);
+    } else {
+      unverified.push([file, [...named]]);
+    }
     continue;
   }
   // The shape check alone is not enough: `9999-99-99` matches it, is not a date, and sorts

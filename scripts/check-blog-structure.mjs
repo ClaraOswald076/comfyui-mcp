@@ -44,6 +44,34 @@ const packNames = fs.existsSync(PACKS)
 /** Posts that document packs but are about the tooling, not a model's weights. */
 const EXEMPT = new Set(['installer-packs-that-cant-rot.mdx']);
 
+/**
+ * Strip fenced code, following Markdown's actual fence rules.
+ *
+ * A regex backreference demands the closing fence be the SAME LENGTH as the opener, so a
+ * three-backtick block closed with four backticks was never stripped — and a fake
+ * `## Licensing` inside it satisfied this gate. Markdown closes on a fence of the same
+ * character, at least as long as the opener, with nothing after it but whitespace.
+ */
+function stripFences(src) {
+  const out = [];
+  let fence = null; // { char, len }
+  for (const line of src.replace(/\r\n/g, '\n').split('\n')) {
+    const m = line.match(/^\s*(`{3,}|~{3,})(.*)$/);
+    if (fence) {
+      if (m && m[1][0] === fence.char && m[1].length >= fence.len && m[2].trim() === '') {
+        fence = null;
+      }
+      continue;
+    }
+    if (m) {
+      fence = { char: m[1][0], len: m[1].length };
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join('\n');
+}
+
 let failures = 0;
 let checked = 0;
 for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
