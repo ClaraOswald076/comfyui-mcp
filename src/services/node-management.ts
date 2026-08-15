@@ -4565,10 +4565,11 @@ export function nodesInstallCommandArgs(args: {
       ? registryVersionAmbiguity(norm.repository, norm.version)
       : undefined;
   if (registryAmbiguity) return { conflict: registryVersionRefusal(registryAmbiguity) };
+  // Past that return, the request is necessarily on the from-source route — a contested
+  // name with a registry version has already been refused — so the channel-based
+  // reasoning below is only ever applied where a channel is actually consulted.
   const ambiguity =
-    rerouted && norm.repository && !registryAmbiguity
-      ? bareNameAmbiguity(norm.repository, effectiveChannel)
-      : undefined;
+    rerouted && norm.repository ? bareNameAmbiguity(norm.repository, effectiveChannel) : undefined;
   if (ambiguity && defaultedChannel) return { conflict: ambiguousBareNameRefusal(ambiguity) };
   // The substitution warning rides EVERY git-URL install (gate round 2), because
   // bare-name resolution is a property of the v4 from-source route rather than of
