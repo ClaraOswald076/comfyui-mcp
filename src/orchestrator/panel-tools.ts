@@ -1519,6 +1519,53 @@ export function classifyTabReconnect({
   return baselineCaptured ? false : "unknown";
 }
 
+/**
+ * Is `restart_comfyui` aimed at the same ComfyUI this panel is on? (#851, #1233)
+ *
+ * Extracted from restartTimeoutFallbackAdvice for #1593, which needs the same
+ * DECISION with different wording. The alternative was a second comparison
+ * somewhere else, and two readers of the same evidence that can disagree is the
+ * defect #851 itself was: a call that recommends another tool without checking
+ * which machine that tool points at.
+ *
+ *  - `same`     — provably one instance. Recommending the headless tool is safe.
+ *  - `different`— PROVEN two. `proven` names the panel's side. Recommending the
+ *                 headless tool would aim a restart at the wrong server, which on
+ *                 a shared instance is worse than doing nothing.
+ *  - `unproven` — no proof either way. Recommend it, and say what was not checked.
+ *
+ * Nothing here is new logic; the branches and their reasons are documented at
+ * their original site below and are unchanged.
+ */
+export function classifyRestartFallbackTarget({
+  headlessBase,
+  panelBase,
+  observedOrigin = null,
+}: {
+  headlessBase: string;
+  panelBase: string | null;
+  observedOrigin?: string | null;
+}): { kind: "same" } | { kind: "different"; proven: string } | { kind: "unproven" } {
+  if (panelBase != null && sameHttpBase(headlessBase, panelBase)) return { kind: "same" };
+  const dnsAmbiguous = (u: string | null) => {
+    if (!u) return false;
+    try {
+      return new URL(u).hostname.toLowerCase().replace(/^\[|\]$/g, "") === "localhost";
+    } catch {
+      return false;
+    }
+  };
+  const originMismatch =
+    observedOrigin != null &&
+    !dnsAmbiguous(observedOrigin) &&
+    !dnsAmbiguous(headlessBase) &&
+    !sameHttpOrigin(headlessBase, observedOrigin)
+      ? observedOrigin
+      : null;
+  const proven = panelBase ?? originMismatch;
+  return proven != null ? { kind: "different", proven } : { kind: "unproven" };
+}
+
 export function restartTimeoutFallbackAdvice({
   headlessBase,
   panelBase,
@@ -1539,7 +1586,11 @@ export function restartTimeoutFallbackAdvice({
    */
   observedOrigin?: string | null;
 }): string {
-  if (panelBase != null && sameHttpBase(headlessBase, panelBase)) {
+  // The DECISION lives in classifyRestartFallbackTarget (above) so #1593's refusal
+  // reaches the same verdict rather than re-deriving it. The prose below, and the
+  // reasoning attached to each branch, is unchanged.
+  const verdict = classifyRestartFallbackTarget({ headlessBase, panelBase, observedOrigin });
+  if (verdict.kind === "same") {
     return "or use restart_comfyui to restart the server directly without a panel card.";
   }
   // Proven different: either the proof resolved a base that differs, or the observed
@@ -1559,26 +1610,10 @@ export function restartTimeoutFallbackAdvice({
   // is very likely the same instance. Absence of proof is not proof of difference, so
   // an ambiguous host degrades to UNPROVEN — the same direction captureRebootHealthBase
   // takes for the same input.
-  const dnsAmbiguous = (u: string | null) => {
-    if (!u) return false;
-    try {
-      return new URL(u).hostname.toLowerCase().replace(/^\[|\]$/g, "") === "localhost";
-    } catch {
-      return false;
-    }
-  };
-  const originMismatch =
-    observedOrigin != null &&
-    !dnsAmbiguous(observedOrigin) &&
-    !dnsAmbiguous(headlessBase) &&
-    !sameHttpOrigin(headlessBase, observedOrigin)
-      ? observedOrigin
-      : null;
-  const proven = panelBase ?? originMismatch;
-  if (proven != null) {
+  if (verdict.kind === "different") {
     return (
       `Do NOT reach for restart_comfyui here without checking: it targets ${headlessBase}, ` +
-      `while this panel is running inside ${proven}. Restarting the first would hit a ` +
+      `while this panel is running inside ${verdict.proven}. Restarting the first would hit a ` +
       "different server than the one you have been working on. That may find nothing there " +
       "at all — or it may SUCCEED and take down a ComfyUI you did not mean to touch, which " +
       "on a shared instance is the worse outcome."
@@ -1588,6 +1623,66 @@ export function restartTimeoutFallbackAdvice({
     `or use restart_comfyui, which restarts ${headlessBase} directly without a panel ` +
     "card — check that this is the same ComfyUI you have been working on, since I " +
     "could not confirm which one this panel is running inside."
+  );
+}
+
+/**
+ * #1593 — WHAT TO TELL A CALLER WHOSE PANEL RESTART WAS REFUSED.
+ *
+ * The #814 refusal ends "USE restart_comfyui INSTEAD", unconditionally. #851 is
+ * the record of why an unconditional recommendation is a defect: `restart_comfyui`
+ * targets COMFYUI_URL, not the ComfyUI the panel is running inside, and a reporter
+ * who followed exactly that advice aimed a restart at a different machine.
+ *
+ * #851 fixed the branch it was filed against — the confirmation-card timeout — and
+ * that fix has been sitting next door ever since, never consulted here. This is
+ * the same evidence reaching the branch a user is far more likely to hit, because
+ * the refusal fires whenever the panel's instance cannot be accounted for, which is
+ * precisely when the two addresses are most likely to differ.
+ *
+ * The three answers are not cosmetic variations:
+ *
+ *   same       — the handoff is PROVEN good. The caller is told so, and told why,
+ *                so the second tool is not treated as a gamble.
+ *   different  — the handoff is PROVEN bad, and the old text recommended it anyway.
+ *                This is the case that matters: on a shared instance, aiming a
+ *                restart at the wrong server is worse than doing nothing.
+ *   unproven   — recommend it, and NAME what was not established, rather than
+ *                implying a check that did not happen.
+ *
+ * Both addresses are named in every branch. The refusal previously named neither,
+ * so the reader could not tell which two things had failed to be shown equal —
+ * #1593's reporter had to paraphrase the address back to us.
+ */
+export function restartRefusalHandoffAdvice(args: {
+  headlessBase: string;
+  panelBase: string | null;
+  observedOrigin?: string | null;
+}): string {
+  const verdict = classifyRestartFallbackTarget(args);
+  if (verdict.kind === "same") {
+    return (
+      `USE restart_comfyui INSTEAD: it is not tied to a browser tab — it acts on ` +
+      `${args.headlessBase}, which this panel is PROVABLY on, and which it CAN identify and ` +
+      `check before stopping. That handoff is verified here, not assumed.`
+    );
+  }
+  if (verdict.kind === "different") {
+    return (
+      `Do NOT reach for restart_comfyui here: it targets ${args.headlessBase}, while this ` +
+      `panel is running inside ${verdict.proven} — a DIFFERENT server, so it would restart ` +
+      `something you have not been working on. That may find nothing there at all, or it may ` +
+      `SUCCEED and take down a ComfyUI you did not mean to touch. Restart this one from ` +
+      `whatever launches it (its own launcher, the Desktop app, or your terminal).`
+    );
+  }
+  return (
+    `USE restart_comfyui INSTEAD: unlike this panel-scoped restart, it is not tied to a ` +
+    `browser tab — it acts on the ComfyUI this server is configured for ` +
+    `(${args.headlessBase}), which it CAN identify and check before stopping. I could NOT ` +
+    `confirm that this is the same ComfyUI this panel is running inside, so check that ` +
+    `before you run it. Or restart ComfyUI from whatever launches it (its own launcher, ` +
+    `the Desktop app, or your terminal).`
   );
 }
 
@@ -12265,17 +12360,25 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
               // A claim about what I DID, not about a server I have just said I cannot
               // identify: "it is still running" would be exactly the unvalidated
               // assertion the stale-target rule forbids (r8).
-              "again. Nothing was dispatched, so nothing was stopped. USE restart_comfyui " +
+              "again. Nothing was dispatched, so nothing was stopped. " +
               // The alternative is NAMED and the difference EXPLAINED (coordinator
               // ruling): this tool restarts whatever the calling TAB fronts, which is
               // exactly the thing that could not be identified here. restart_comfyui is
               // not tab-scoped — it acts on the ComfyUI this server is configured for,
               // which it can identify and assess — so it remains available. A user who
               // loses one entry point must be told the other one works, and why.
-              "INSTEAD: unlike this panel-scoped restart, it is not tied to a browser tab " +
-              "— it acts on the ComfyUI this server is configured for, which it CAN " +
-              "identify and check before stopping. Or restart ComfyUI from whatever " +
-              "launches it (its own launcher, the Desktop app, or your terminal)." +
+              //
+              // #1593 — but only when it is actually the other one. This line used to
+              // recommend restart_comfyui unconditionally, which is #851's defect
+              // exactly: it targets COMFYUI_URL, not the ComfyUI the panel is inside,
+              // and this branch fires precisely when those are most likely to differ.
+              // The discriminator #851 built has been next door ever since and was
+              // never consulted here; now it is, and both addresses are named.
+              restartRefusalHandoffAdvice({
+                headlessBase: getComfyUIBaseUrl(),
+                panelBase: preflightHealthBase,
+                observedOrigin: ctx.bridge?.tabServerOrigin?.(ctx.tabId) ?? null,
+              }) +
               // artokun/comfyui-mcp-panel#769 — a REMOTE ComfyUI reached over a
               // tunnel or port-forward has a LOOPBACK host, and remoteUrlActive is
               // derived from exactly that (`forceRemote || !isLoopbackHost(host)`).
@@ -12427,9 +12530,16 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
               "fronts — a restart STOPS a server, so it is never sent to one I cannot " +
               // Again: what I did, not what an unidentified instance is doing.
               "identify. Nothing was dispatched, so nothing was stopped. Retry once the " +
-              "panel has settled, or USE restart_comfyui INSTEAD: unlike this panel-scoped " +
-              "restart, it is not tied to a browser tab — it acts on the ComfyUI this " +
-              "server is configured for, which it CAN identify and check before stopping.",
+              // #1593 — the SAME unconditional recommendation, in the second refusal.
+              // Fixing only the first would leave half the door open, and this branch
+              // fires on a connection that just CHANGED, which is if anything a
+              // stronger reason to check which server the other tool would hit.
+              "panel has settled. " +
+              restartRefusalHandoffAdvice({
+                headlessBase: getComfyUIBaseUrl(),
+                panelBase: healthBase,
+                observedOrigin: ctx.bridge?.tabServerOrigin?.(ctx.tabId) ?? null,
+              }),
           });
         }
         const timing = getPanelRebootTiming();

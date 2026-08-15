@@ -25,6 +25,9 @@ import {
   __panelToolsTestHooks,
   __panelRunTestHooks,
   __panelAskTestHooks,
+  classifyRestartFallbackTarget,
+  restartRefusalHandoffAdvice,
+  restartTimeoutFallbackAdvice,
   type PanelToolCtx,
   type ToolResult,
 } from "../../orchestrator/panel-tools.js";
@@ -6596,6 +6599,12 @@ describe("panel#769 restart refusal names the tunnelled-remote case", () => {
   // local process to account for — because there is none. The refusal was right
   // about what it observed and useless about what to do: the reader goes looking
   // for a local install that does not exist.
+  // BOUNDED BY THE ENCLOSING BLOCK, not by a character count. The original
+  // `slice(i, i + 3000)` broke the moment #1593 made part of this note a function
+  // call: the window is not a unit of anything, so growing the block by a comment
+  // silently moves a real assertion outside it and the test fails for a reason
+  // unrelated to what it checks. Walk to the brace that closes the `ok({ … })`
+  // this note lives in, and the assertion tracks the block instead of its length.
   const refusal = () => {
     const src = readFileSync(
       new URL("../../orchestrator/panel-tools.ts", import.meta.url),
@@ -6603,7 +6612,15 @@ describe("panel#769 restart refusal names the tunnelled-remote case", () => {
     );
     const i = src.indexOf("Refusing to restart ComfyUI: I could not confirm");
     expect(i).toBeGreaterThan(-1);
-    return src.slice(i, i + 3000);
+    let depth = 0;
+    for (let j = i; j < src.length; j++) {
+      if (src[j] === "{") depth++;
+      else if (src[j] === "}") {
+        if (depth === 0) return src.slice(i, j);
+        depth--;
+      }
+    }
+    throw new Error("refusal block is unterminated");
   };
 
   it("names the classification as HOST-based, not instance-based", () => {
@@ -6628,7 +6645,101 @@ describe("panel#769 restart refusal names the tunnelled-remote case", () => {
   it("keeps the original alternative — this is additive", () => {
     // restart_comfyui remains the answer for a genuinely local install that
     // simply could not be identified; the tunnel note must not displace it.
-    const t = refusal();
+    //
+    // #1593 moved this sentence out of the literal and into
+    // restartRefusalHandoffAdvice, because it must no longer be unconditional —
+    // so it is asserted on the RUNTIME message rather than on the source, which
+    // is a stronger check than the one it replaces: source proximity never
+    // proved the sentence was reached, and this does. The "unproven" verdict is
+    // the shape this branch was written for (a local install we could not tie to
+    // the panel's instance).
+    expect(
+      restartRefusalHandoffAdvice({
+        headlessBase: "http://127.0.0.1:8188",
+        panelBase: null,
+        observedOrigin: null,
+      }),
+    ).toMatch(/USE restart_comfyui/);
+  });
+});
+
+// #1593 — the refusal must stop recommending a restart aimed at a DIFFERENT
+// server.
+//
+// The #814 refusal ended "USE restart_comfyui INSTEAD" for every caller. #851 is
+// the record of why that is a defect: restart_comfyui targets COMFYUI_URL, not the
+// ComfyUI the panel is inside, and a reporter who followed exactly that advice
+// restarted a different machine. #851 fixed the confirmation-TIMEOUT branch and
+// left the discriminator unused in the refusal — which fires precisely when the
+// two addresses are most likely to differ.
+describe("#1593 restart refusal checks WHICH server the fallback would hit", () => {
+  const HEADLESS = "http://127.0.0.1:8188";
+
+  it("endorses the handoff when the panel is PROVABLY on the configured target", () => {
+    const t = restartRefusalHandoffAdvice({ headlessBase: HEADLESS, panelBase: HEADLESS });
     expect(t).toMatch(/USE restart_comfyui/);
+    expect(t).toContain(HEADLESS);
+    // The difference from "unproven": this one was checked, and says so.
+    expect(t).toMatch(/PROVABLY/);
+    expect(t).not.toMatch(/could NOT confirm/);
+  });
+
+  it("REFUSES to recommend it when the panel is provably on a different server", () => {
+    const t = restartRefusalHandoffAdvice({
+      headlessBase: HEADLESS,
+      panelBase: null,
+      // Server-observed handshake Origin; page JS cannot forge it.
+      observedOrigin: "http://127.0.0.1:8189",
+    });
+    expect(t).toMatch(/Do NOT reach for restart_comfyui/);
+    // BOTH addresses named — the reporter had to paraphrase one back to us.
+    expect(t).toContain(HEADLESS);
+    expect(t).toContain("http://127.0.0.1:8189");
+    // And it must not also tell them to run it.
+    expect(t).not.toMatch(/USE restart_comfyui/);
+  });
+
+  it("recommends it, naming what was NOT established, when nothing is proven", () => {
+    const t = restartRefusalHandoffAdvice({
+      headlessBase: HEADLESS,
+      panelBase: null,
+      observedOrigin: null,
+    });
+    expect(t).toMatch(/USE restart_comfyui/);
+    expect(t).toMatch(/could NOT confirm/);
+    expect(t).toContain(HEADLESS);
+  });
+
+  it("does NOT call a DNS-ambiguous localhost a different server", () => {
+    // A coordinator P0 that captureRebootHealthBase already honours: `localhost`
+    // can resolve to either family, so it is not proof of difference. Firing the
+    // strong warning here would send a user away from a tool that would have
+    // worked — the cry-wolf failure, which is how the same bug was found in #1233.
+    const t = restartRefusalHandoffAdvice({
+      headlessBase: HEADLESS,
+      panelBase: null,
+      observedOrigin: "http://localhost:8188",
+    });
+    expect(t).not.toMatch(/Do NOT reach for restart_comfyui/);
+    expect(t).toMatch(/USE restart_comfyui/);
+  });
+
+  it("shares ONE comparison with the #851 timeout advice", () => {
+    // Two readers of the same evidence that can disagree is the defect being
+    // fixed, pointed inward. Same inputs, same verdict, different wording.
+    const inputs = [
+      { headlessBase: HEADLESS, panelBase: HEADLESS, observedOrigin: null },
+      { headlessBase: HEADLESS, panelBase: null, observedOrigin: "http://127.0.0.1:8189" },
+      { headlessBase: HEADLESS, panelBase: null, observedOrigin: null },
+    ];
+    for (const args of inputs) {
+      const verdict = classifyRestartFallbackTarget(args);
+      const timeoutAdvice = restartTimeoutFallbackAdvice(args);
+      const refusalAdvice = restartRefusalHandoffAdvice(args);
+      const timeoutWarns = /Do NOT reach for restart_comfyui/.test(timeoutAdvice);
+      const refusalWarns = /Do NOT reach for restart_comfyui/.test(refusalAdvice);
+      expect(timeoutWarns).toBe(verdict.kind === "different");
+      expect(refusalWarns).toBe(verdict.kind === "different");
+    }
   });
 });

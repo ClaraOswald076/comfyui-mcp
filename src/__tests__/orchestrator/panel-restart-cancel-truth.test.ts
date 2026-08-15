@@ -73,6 +73,13 @@ function makeCtx(opts: {
   /** Called on every ctx.ensureReachable() — lets a test land a retarget at a
    *  specific point in the handler (the DISPATCH point is the third call). */
   onEnsureReachable?: () => void;
+  /** #1593 — the SERVER-OBSERVED handshake Origin, overridden independently of
+   *  `frontsBoot`. The two are separable in reality and the distinction is the
+   *  whole point: a tab can be unbindable (so the restart is refused) while its
+   *  origin is a perfectly concrete address that PROVES it is a different server
+   *  from the configured one. Without this the fixture can only produce the
+   *  "unproven" verdict, and the branch that matters is unreachable. */
+  serverOrigin?: string;
 }): { ctx: PanelToolCtx; sends: Array<Record<string, unknown>> } {
   const sends: Array<Record<string, unknown>> = [];
   const frontsBoot = opts.frontsBoot ?? true;
@@ -86,7 +93,7 @@ function makeCtx(opts: {
     },
     tabOrigin: () => (fronted() ? BOOT_BASE : undefined),
     // The gate reads the SERVER-OBSERVED handshake origin, not the spoofable hello URL.
-    tabServerOrigin: () => (fronted() ? BOOT_BASE : undefined),
+    tabServerOrigin: () => opts.serverOrigin ?? (fronted() ? BOOT_BASE : undefined),
     tabIsLocal: () => fronted(),
     canReach: () => true,
   } as unknown as PanelToolCtx["bridge"];
@@ -711,6 +718,62 @@ describe("panel_restart_comfyui — Pinokio-style refuse-safe preflight (#742)",
     expect(preflight).not.toHaveBeenCalled();
     // CRITICAL: nothing was dispatched, so nothing was stopped.
     expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
+  });
+
+  it("#1593: the refusal does NOT send you to restart_comfyui when it would hit a DIFFERENT server", async () => {
+    // REACHABILITY, and the reason this issue is not just a wording change.
+    //
+    // #1593's reporter had a panel on :8189 while the orchestrator was configured
+    // for another address. The refusal fired — correctly, it could not account for
+    // that instance — and then told them to run restart_comfyui, which targets the
+    // CONFIGURED address. That is #851's defect verbatim, in the branch #851 did
+    // not cover: a call that recommends another tool without checking which machine
+    // that tool points at. On a shared instance, restarting the wrong one is worse
+    // than doing nothing.
+    //
+    // The tab is unbindable (so the refusal fires) but its server-observed Origin
+    // is concrete and provably different — the exact shape that was previously
+    // collapsed into "recommend it anyway".
+    const preflight = vi.fn(async () => ({ ok: true }));
+    __panelToolsTestHooks.setLocalRestartPreflight(preflight);
+    const { ctx, sends } = makeCtx({
+      confirm: "yes",
+      frontsBoot: false,
+      serverOrigin: "http://127.0.0.1:8189",
+    });
+
+    const out = parse(await restartTool().handler({}, ctx));
+    const note = String(out.note ?? "");
+
+    expect(out.refused).toBe(true);
+    expect(note).toMatch(/cannot tell which server the restart would stop/i);
+    // THE change: it warns instead of recommending, and names BOTH addresses so
+    // the reader can see which two things failed to be shown equal.
+    expect(note).toMatch(/Do NOT reach for restart_comfyui/);
+    expect(note).toContain("http://127.0.0.1:8189");
+    expect(note).toContain(BOOT_BASE);
+    expect(note).not.toMatch(/USE restart_comfyui/);
+    // Everything the #814 refusal guarantees is untouched.
+    expect(preflight).not.toHaveBeenCalled();
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
+  });
+
+  it("#1593: a DNS-ambiguous localhost origin still gets the recommendation", async () => {
+    // Absence of proof is not proof of difference (a coordinator P0 that
+    // captureRebootHealthBase already honours). `localhost` can resolve to either
+    // family, so warning here would send a user away from a tool that would very
+    // likely have worked — the cry-wolf failure #1233 was filed for.
+    __panelToolsTestHooks.setLocalRestartPreflight(vi.fn(async () => ({ ok: true })));
+    const { ctx } = makeCtx({
+      confirm: "yes",
+      frontsBoot: false,
+      serverOrigin: "http://localhost:8188",
+    });
+
+    const note = String(parse(await restartTool().handler({}, ctx)).note ?? "");
+
+    expect(note).toMatch(/USE restart_comfyui/);
+    expect(note).not.toMatch(/Do NOT reach for restart_comfyui/);
   });
 
   it("#814: a BOUND local target with a failing assessment refuses with its reason", async () => {
