@@ -156,6 +156,67 @@ describe("the git-URL install asks a channel that can list the pack (#1539)", ()
   });
 });
 
+describe("the channel it picked is DISCLOSED, never silent (#1539 review P1)", () => {
+  // Review, correctly: with default and dev near-disjoint, NO single default is right,
+  // so the 1207 dev-only packs are on the losing side of whichever one is chosen. The
+  // proposed remedy was to retry the other channel on a not-found. That premise is true
+  // about the FIRST attempt — a not-found returns before any clone — and false about
+  // the SECOND: v4 resolves by BARE REPO NAME and clones the CHANNEL's recorded URL, and
+  // 35 bare names exist in both channels under DIFFERENT authors. An automatic retry
+  // would sometimes install a repository the caller never named. So the choice is taken,
+  // disclosed, and reversible in one argument instead.
+
+  it("names the channel asked and refuses to generalise a miss beyond it", () => {
+    const note = nodesInstallCommandArgs({ repository: REPORTED_URL }).note ?? "";
+    expect(note).toMatch(/asked ComfyUI-Manager's "default" channel/i);
+    // The P1-2 claim, in the note's own words: a miss is evidence about ONE list.
+    expect(note).toMatch(/rules the pack out of "default" ONLY/);
+    expect(note).toMatch(/says NOTHING about/i);
+    // And the way out, spelled as an argument the caller can actually pass.
+    expect(note).toMatch(/channel:"dev"/);
+  });
+
+  it("says WHY it does not retry the other channel for you", () => {
+    // Without this the disclosure reads as laziness, and the next reviewer re-proposes
+    // the retry. The hazard is specific and measured, so it is stated.
+    const note = nodesInstallCommandArgs({ repository: REPORTED_URL }).note ?? "";
+    expect(note).toMatch(/NOT retried for you on purpose/i);
+    expect(note).toMatch(/BARE REPO ?NAME/i);
+    expect(note).toMatch(/DIFFERENT authors/i);
+    expect(note).toMatch(/could install a repository you did not name/i);
+  });
+
+  it("discloses even when no OTHER note applies — an explicit version has none", () => {
+    // `norm.note` rides only the "latest"→nightly rewrite. A caller passing an explicit
+    // ref gets no such note, and would otherwise have a channel chosen for them in
+    // silence — the exact thing this is meant to prevent.
+    const out = nodesInstallCommandArgs({ repository: REPORTED_URL, version: "abc123" });
+    expect(out.version).toBe("abc123");
+    expect(out.note ?? "").toMatch(/asked ComfyUI-Manager's "default" channel/i);
+  });
+
+  it("keeps the #789 nightly-rewrite note as well, not instead", () => {
+    const note = nodesInstallCommandArgs({ repository: REPORTED_URL }).note ?? "";
+    expect(note).toMatch(/is a git repository URL, so this was queued as a from-source/i);
+    expect(note).toMatch(/asked ComfyUI-Manager's "default" channel/i);
+  });
+
+  it("says NOTHING about the channel when the caller chose one themselves", () => {
+    // Disclosing a choice the caller made is noise, and would misreport whose choice it
+    // was. The nightly-rewrite note is still theirs to receive.
+    const chosen = nodesInstallCommandArgs({ repository: REPORTED_URL, channel: "dev" });
+    expect(chosen.note ?? "").not.toMatch(/asked ComfyUI-Manager's/i);
+    expect(chosen.note ?? "").toMatch(/from-source/i);
+  });
+
+  it("says nothing about the channel on a registry-id install", () => {
+    // That route never had a channel chosen for it here.
+    expect(nodesInstallCommandArgs({ id: "comfyui-kjnodes" }).note ?? "").not.toMatch(
+      /asked ComfyUI-Manager's/i,
+    );
+  });
+});
+
 describe("panel_install_node actually DISPATCHES the channel (#1539 wiring)", () => {
   // A green unit test on nodesInstallCommandArgs proves the helper computes a channel,
   // never that the value reaches the panel. This drives the real tool definition and
@@ -200,6 +261,40 @@ describe("panel_install_node actually DISPATCHES the channel (#1539 wiring)", ()
   it("relays an explicit channel unchanged", async () => {
     const cmd = await dispatch({ repository: REPORTED_URL, channel: "dev" });
     expect(cmd.channel).toBe("dev");
+  });
+
+  it("the channel disclosure REACHES THE CALLER, not just the args object", async () => {
+    // A note computed and never appended is the #1129 failure again — that probe
+    // shipped once and never ran. This asserts on the tool's returned TEXT.
+    let sent: Record<string, unknown> | undefined;
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) => {
+        if (cmd.cmd === "nodes_install") {
+          sent = cmd;
+          return { queued: true, pending: true, id: "comfyui-anima-ipadapter", dialect: "v2" };
+        }
+        return { status: { in_progress_count: 0, is_processing: true } };
+      },
+      tabIncarnation: () => "inc-A",
+      push: () => 1,
+      canReach: (id: string) => id === TAB,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => TAB,
+      refreshWorkflowUuid: () => true,
+      workflowUuidFor: () => ({ known: false }),
+      tabCanMutateGraph: () => true,
+      tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
+    const res: ToolResult = await installNodeDef().handler(
+      { repository: REPORTED_URL } as never,
+      ctx,
+    );
+    const text = res.content.map((c) => (c as { text?: string }).text ?? "").join(" ");
+    expect(sent?.channel).toBe("default");
+    expect(text).toMatch(/asked ComfyUI-Manager's "default" channel/i);
+    expect(text).toMatch(/rules the pack out of "default" ONLY/);
   });
 });
 
@@ -246,6 +341,18 @@ describe("panel_install_node describes what was measured (#1539)", () => {
     expect(text).toMatch(/not measured/i);
   });
 
+  it("does NOT turn a one-channel miss into a verdict about the pack (review P1)", () => {
+    // The shipped sentence said "the pack is absent from every channel this Manager can
+    // read". A `default` miss establishes nothing about `dev` — the same class of
+    // over-claim this PR retracted, handing out harmful recovery advice.
+    const text = installNodeDef().description ?? "";
+    expect(text).not.toMatch(/absent from every channel this Manager can read/i);
+    expect(text).toMatch(/A NOT-FOUND RULES OUT ONE CHANNEL, NOT THE PACK/);
+    expect(text).toMatch(/absent from the channel THIS CALL ASKED and nothing more/i);
+    expect(text).toMatch(/will NOT retry another channel for you/i);
+    expect(text).toMatch(/could install a repo you never named/i);
+  });
+
   it("keeps the local-only precondition on the tool that CAN clone", () => {
     const text = installNodeDef().description ?? "";
     expect(text).toMatch(/install_custom_node/);
@@ -259,8 +366,12 @@ describe("panel_install_node describes what was measured (#1539)", () => {
     // a retry is futile — absence from every readable channel — rather than "unlisted".
     const text = installNodeDef().description ?? "";
     const retryAdvice = text.slice(text.indexOf("a pack you installed that is absent"));
-    expect(retryAdvice).toMatch(/resolves against a CHANNEL list/i);
-    expect(retryAdvice).toMatch(/clone it yourself instead of retrying/i);
+    expect(retryAdvice).toMatch(/resolves against ONE channel.s list/i);
+    // Names the action that CAN change the outcome (a different channel) before the
+    // one that gives up. The old wording said "clone it yourself instead of retrying",
+    // which skipped straight past the retry that actually works.
+    expect(retryAdvice).toMatch(/change the `channel` first/i);
+    expect(retryAdvice).toMatch(/once the plausible channels are ruled out/i);
   });
 
   it("the repository and channel PARAMS carry it too", () => {

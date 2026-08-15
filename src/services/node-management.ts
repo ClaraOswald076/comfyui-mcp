@@ -4272,6 +4272,64 @@ export function normalizeGitUrlInstallArgs(
 export const GIT_INSTALL_DEFAULT_CHANNEL = "default";
 
 /**
+ * #1539 review — NO SINGLE DEFAULT IS CORRECT, so the one taken is DISCLOSED.
+ *
+ * `default` and `dev` are near-disjoint (5887 vs 1210 packs, 3 shared), which cuts
+ * both ways: whichever this call picks, the other one is a list it did not search.
+ * Review proposed resolving that by trying the picked channel and retrying the other
+ * on a not-found — a not-found being a proven negative that installed nothing, which
+ * it is (`install_by_id` returns before `to_path` is even computed, and four live
+ * probes left `custom_nodes` untouched).
+ *
+ * MEASURED, AND IT DOES NOT HOLD. The premise is true about the FIRST attempt and
+ * false about the SECOND. v4 resolves a from-source install by the BARE REPO NAME —
+ * `load_nightly` keys its map on `y.split('/')[-1]` — and then clones
+ * `the_node['repository']`, the URL recorded in THAT channel's entry, not the URL the
+ * caller passed. Comparing the two channels on that key: 38 bare names appear in
+ * both, and for 35 of them the two channels point at DIFFERENT authors' repositories
+ * (`comfyui-birefnet` is hieuck's on default and mohammadaboulela's on dev;
+ * `comfyui-lmstudio`, `comfyui-kittentts`, `ComfyUI-Image-Selector` and 31 more are
+ * the same story). An automatic second attempt would therefore clone, silently, a
+ * repository the caller never named — arbitrary code from an unintended author. That
+ * is the wrong-target bug this project already has a standing finding about, only
+ * automated. So the fallback position applies: do not silently pick between two
+ * candidates, NAME them.
+ *
+ * Refusing outright was rejected as the larger harm — it breaks every existing bare
+ * git-URL call — so the choice is taken, disclosed, and made reversible in one
+ * argument. Stated at DISPATCH rather than on the failure, for the reason
+ * `unregisteredPackEscapeHatch` already gives: the failure text comes back from the
+ * panel, matching on it would be brittle, and a caller who reads this when the
+ * install is queued needs one fewer round trip than one who reads it after.
+ *
+ * HOW BIG THE REGRESSION ACTUALLY IS, since review costed it as all 1207 dev-only
+ * packs. On a pip Manager v4 `get_data_by_mode` reads the cache file for that exact
+ * channel URL, else the snapshot bundled in the package — so a channel name only
+ * reaches its real list when it is the channel the user CONFIGURED (nothing else
+ * writes that cache). The bundled snapshot is a stale `default`-flavoured list: 3587
+ * packs, holding 3482 of default's 5891 and exactly 1 of dev's 1223 dev-only entries.
+ * So on a stock v4 the old `dev` never reached the dev list either — it landed on
+ * that same bundled file. The population that genuinely regresses is users whose
+ * Manager is CONFIGURED to the dev channel, and the note below hands them the exact
+ * argument that restores them.
+ */
+function gitInstallChannelNote(channel: string): string {
+  return (
+    `CHANNEL: this asked ComfyUI-Manager's "${channel}" channel, because the call named ` +
+    `none — saying so rather than picking silently, since Manager's channels are ` +
+    `near-disjoint lists (default ~5900 packs, dev ~1200, sharing 3). So a "not found" ` +
+    `from this install rules the pack out of "${channel}" ONLY; it says NOTHING about ` +
+    `dev/recent/legacy/forked/tutorial. If that happens, retry with an explicit channel ` +
+    `(e.g. channel:"dev") before concluding the pack does not exist. ` +
+    `NOT retried for you on purpose: v4 resolves a from-source install by the BARE REPO ` +
+    `NAME and clones the URL in the CHANNEL's entry, not the URL you passed — and 35 ` +
+    `names exist in both channels under DIFFERENT authors, so an automatic second attempt ` +
+    `could install a repository you did not name. For the same reason, verify with ` +
+    `panel_list_nodes that what landed is the repo you meant.`
+  );
+}
+
+/**
  * The FINAL dispatch fields for the panel's `nodes_install` command, after
  * #789 normalization. Built here — not by `??`-merging with the raw args at
  * the call site — because a rerouted git URL must DROP `id`, and a
@@ -4305,13 +4363,22 @@ export function nodesInstallCommandArgs(args: {
   // substitutes `dev`, so forwarding an empty string would silently land back on
   // the channel this fix exists to stop asking for.
   const explicitChannel = args.channel?.trim() ? args.channel : undefined;
+  // DISCLOSE only what THIS function chose. A caller who named a channel made the
+  // choice themselves and does not need it read back to them, and `norm.note` rides
+  // only the "latest"→nightly branch — so an explicit version with no channel would
+  // otherwise dispatch a defaulted channel with nothing said about it.
+  const defaultedChannel = rerouted && explicitChannel === undefined;
+  const note =
+    [norm.note, defaultedChannel ? gitInstallChannelNote(GIT_INSTALL_DEFAULT_CHANNEL) : undefined]
+      .filter((s): s is string => typeof s === "string" && s.length > 0)
+      .join(" ") || undefined;
   return {
     id: rerouted ? norm.id : args.id,
     repository: rerouted ? norm.repository : args.repository,
     version: rerouted ? norm.version : args.version,
     channel: rerouted ? (explicitChannel ?? GIT_INSTALL_DEFAULT_CHANNEL) : args.channel,
     mode: args.mode,
-    ...(norm.note ? { note: norm.note } : {}),
+    ...(note ? { note } : {}),
   };
 }
 
