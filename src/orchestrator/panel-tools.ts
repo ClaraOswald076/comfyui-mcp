@@ -1642,13 +1642,21 @@ export function restartTimeoutFallbackAdvice({
  *
  * The three answers are not cosmetic variations:
  *
- *   same       — the handoff is PROVEN good. The caller is told so, and told why,
- *                so the second tool is not treated as a gamble.
  *   different  — the handoff is PROVEN bad, and the old text recommended it anyway.
  *                This is the case that matters: on a shared instance, aiming a
  *                restart at the wrong server is worse than doing nothing.
  *   unproven   — recommend it, and NAME what was not established, rather than
  *                implying a check that did not happen.
+ *   same       — NOT REACHABLE FROM EITHER REFUSAL, and deliberately kept anyway.
+ *                Both call sites are guarded by `!bound`, and `bound` is the same
+ *                predicate as this verdict (panelBase != null && sameHttpBase(...)),
+ *                so a refusal that fires has already excluded `same`. It is not a
+ *                user-visible branch and must not be described as one. It stays
+ *                because this function is TOTAL over the classifier's three
+ *                verdicts: a future caller whose boundness test is not that exact
+ *                predicate would otherwise fall through to the "unproven" text and
+ *                claim a check failed that in fact succeeded. A tripwire in this
+ *                branch is not hit by any of the handler-driven tests.
  *
  * Both addresses are named in every branch. The refusal previously named neither,
  * so the reader could not tell which two things had failed to be shown equal —

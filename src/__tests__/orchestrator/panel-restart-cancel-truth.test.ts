@@ -841,6 +841,46 @@ describe("panel_restart_comfyui — Pinokio-style refuse-safe preflight (#742)",
     expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
   });
 
+  it("#1593: the DISPATCH-POINT refusal also stops recommending the wrong server", async () => {
+    // THE SECOND CALL SITE, driven through the real handler. The test above proves
+    // this branch is reached and refuses; it says nothing about what it then tells
+    // the caller, and reverting this site to the old unconditional "USE
+    // restart_comfyui INSTEAD" survives it — and survives the whole suite. So the
+    // fix shipped one tested call site and one untested one.
+    //
+    // This is also the only path that reaches the "different" verdict with a
+    // NON-NULL panelBase: the retarget moves the configured target to :9999 while
+    // the tab stays provably on the boot instance, so both sides of the comparison
+    // are concrete and proven. The preflight-site test reaches the same verdict by
+    // the other limb (null base, concrete observed Origin).
+    let calls = 0;
+    const { ctx, sends } = makeCtx({
+      confirm: "yes",
+      frontsBoot: true,
+      onEnsureReachable: () => {
+        calls++;
+        if (calls >= 3) {
+          hoistedConfig.configBase.value = "http://127.0.0.1:9999";
+          hoistedConfig.generation.value += 1;
+        }
+      },
+    });
+
+    const out = parse(await restartTool().handler({}, ctx));
+    const note = String(out.note ?? "");
+
+    expect(out.refused).toBe(true);
+    expect(note).toMatch(/the panel connection changed while the restart was being prepared/i);
+    // Sending this caller to restart_comfyui would aim it at :9999 — the target
+    // that was just retargeted AWAY from the instance they are working in.
+    expect(note).toMatch(/Do NOT reach for restart_comfyui/);
+    expect(note).not.toMatch(/USE restart_comfyui/);
+    // Both addresses named, so the reader can see which two failed to match.
+    expect(note).toContain("http://127.0.0.1:9999");
+    expect(note).toContain(BOOT_BASE);
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
+  });
+
   it("a REMOTE target is not assessed — the Manager reboot is its only restart path", async () => {
     // There is no local process to assess, and a supervised remote (the tunnelled
     // Desktop app) restarts through exactly this reboot by design. Refusing here

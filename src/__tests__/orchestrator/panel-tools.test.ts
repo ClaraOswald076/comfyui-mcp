@@ -6676,6 +6676,12 @@ describe("#1593 restart refusal checks WHICH server the fallback would hit", () 
   const HEADLESS = "http://127.0.0.1:8188";
 
   it("endorses the handoff when the panel is PROVABLY on the configured target", () => {
+    // A TOTALITY check, not a shipped message. Neither refusal can reach this
+    // verdict — both are guarded by `!bound`, and `bound` is this same predicate,
+    // so a refusal that fires has already ruled `same` out (a tripwire here is not
+    // hit by any handler-driven test). It is asserted so that a future call site
+    // with a different boundness test gets this text rather than falling through
+    // to "unproven" and claiming a check failed that actually succeeded.
     const t = restartRefusalHandoffAdvice({ headlessBase: HEADLESS, panelBase: HEADLESS });
     expect(t).toMatch(/USE restart_comfyui/);
     expect(t).toContain(HEADLESS);
