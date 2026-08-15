@@ -28,6 +28,13 @@ import {
   runComfyCliSync,
 } from "./comfy-cli.js";
 import { withPanelPinGuard } from "./panel-pin-guard.js";
+import {
+  ambiguousBareNameRefusal,
+  ambiguousBareNameWarning,
+  bareNameAmbiguity,
+  registryVersionAmbiguity,
+  registryVersionRefusal,
+} from "./manager-bare-name-collisions.js";
 import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { managerBodyClause } from "./manager-error-body.js";
@@ -4332,10 +4339,16 @@ export function normalizeGitUrlInstallArgs(
  * `get_data_by_mode(mode, 'custom-node-list.json', channel_url)`, keys that map by
  * the BARE REPO NAME (`repo_name = y.split('/')[-1]`), and on a hit clones
  * `the_node['repository']` — the CHANNEL's URL. The `repository` field we send is
- * never read on that path; it is stored in the task params and nothing more. On a
- * miss it returns the reported
+ * never read on that path; it is stored in the task params and nothing more.
+ *
+ * A MISS IS NOT AUTOMATICALLY THE REPORTED FAILURE (#1616 gate round 6). For a
+ * `nightly` spec, v4 first tries `self.cnr_map.get(node_id)` and clones that entry's
+ * `repository` — the COMFY REGISTRY's repo for an id equal to the bare name — and only
+ * when the registry lacks the id too does it return the reported
  * `Node '<name>@nightly' not found in [ManagerChannel.<ch>, ManagerDatabaseSource.<mode>]`,
- * naming the channel THIS argument chose.
+ * naming the channel THIS argument chose. So a channel that carries nothing under the
+ * name still resolves to SOMETHING, which is why `bareNameAmbiguity` treats a miss on a
+ * contested name as an ambiguity rather than an exemption.
  *
  * WHAT THIS DOES NOT CLAIM. Not that `default` always resolves — and gate round 2
  * corrected WHY. On a pip Manager v4 `manager_util.is_manager_pip_package()` is true,
@@ -4456,6 +4469,15 @@ function gitUrlOwnerRepo(url: string): string | undefined {
  * so a caller who passed `channel:"dev"` themselves faces exactly the same substitution.
  * It names the owner from the caller's own URL so the check is concrete — the standing
  * rule being that two candidates are NAMED, never silently picked between.
+ *
+ * #1616 — THE COUNT IN THIS TEXT WAS AN UNDERCOUNT, and is corrected here. "35" came from
+ * comparing bare names case-SENSITIVELY. Manager's own lookup is not: `get_custom_nodes`
+ * returns a `NormalizedKeyDict` whose `get` keys on `key.strip().lower()`, so
+ * `comfyui_tagger` and `ComfyUI_tagger` are one name. Counted the way the lookup counts:
+ * 111 names resolve to different repositories across the six published channels, 60 of
+ * them between `default` and `dev` alone. This note is now the FALLBACK disclosure — the
+ * measured 111 are refused before dispatch by `bareNameAmbiguity` when the channel was
+ * defaulted, and this text covers everything that snapshot has not seen.
  */
 function gitInstallSubstitutionNote(channel: string, url: string): string {
   const owner = gitUrlOwnerRepo(url);
@@ -4463,8 +4485,8 @@ function gitInstallSubstitutionNote(channel: string, url: string): string {
   return (
     `WHAT GETS CLONED IS NOT NECESSARILY THE URL YOU PASSED. Manager v4 resolves a ` +
     `from-source install by the BARE REPO NAME ("${bare}") against the "${channel}" ` +
-    `channel's list, then clones the URL recorded in THAT entry — 35 bare names are ` +
-    `listed in both default and dev under DIFFERENT authors. So if "${channel}" lists ` +
+    `channel's list, then clones the URL recorded in THAT entry — 111 bare names resolve ` +
+    `to DIFFERENT repositories depending on the channel asked. So if "${channel}" lists ` +
     `that name under anyone other than ${owner ? `the ${owner} you passed` : "the author you passed"}, ` +
     `this installs THEIR repository and still reports success. Confirm with ` +
     `panel_list_nodes that what landed is the repo you meant before you restart or ` +
@@ -4512,6 +4534,49 @@ export function nodesInstallCommandArgs(args: {
   // otherwise dispatch a defaulted channel with nothing said about it.
   const defaultedChannel = rerouted && explicitChannel === undefined;
   const effectiveChannel = explicitChannel ?? GIT_INSTALL_DEFAULT_CHANNEL;
+  // #1616 — WHERE THE DISCLOSURE BECOMES A REFUSAL. `gitInstallSubstitutionNote` below
+  // warns that v4's bare-name resolution CAN hand back another author's repository; for
+  // the names where that is not hypothetical but measured, this refuses instead. It fires
+  // only on the channel THIS code defaulted to, because that is the case where the tool
+  // would be picking between two candidate repositories on the caller's behalf — the one
+  // thing the standing rule says to refuse. A caller who named the channel made the choice
+  // themselves and gets the collision NAMED instead (`ambiguousBareNameWarning`), which
+  // also leaves a stale snapshot escapable in one argument rather than bricking the tool.
+  //
+  // GATE ROUND 4 — AND IT ONLY APPLIES WHERE A CHANNEL IS ACTUALLY READ. Manager gates
+  // the whole channel lookup on the version: `install_by_id` calls `get_custom_nodes`
+  // only for "nightly"/"unknown" and otherwise falls through to `cnr_install`, which
+  // resolves the bare name as a COMFY REGISTRY ID and reads neither the channel nor the
+  // `repository` passed. `bareNameAmbiguity`'s exemption — "this channel carries exactly
+  // your repo, so there is nothing to pick between" — is therefore not just unhelpful
+  // there, it is wrong: measured, `{repository:"hieuck/ComfyUI-BiRefNet",
+  // version:"1.0.0"}` was allowed through on that exemption while registry id
+  // `comfyui-birefnet` is viperyl's. Split the two routes so each is judged by the thing
+  // that actually decides it.
+  //
+  // GATE ROUND 5 — AND THIS REFUSAL TAKES NO CHANNEL BYPASS, unlike the one below it.
+  // Every reason the from-source refusal yields to an explicit `channel` is absent here:
+  //   * the channel is not merely unhelpful on this route, Manager never reads it, so
+  //     naming one expresses nothing at all about which repository lands;
+  //   * the 3.x escape does not apply either — the panel's 3.x shapes HARDCODE
+  //     `version:"unknown"` with `files:[url]` (manager-install.js, verified on the panel's
+  //     origin/main), so a 3.x host never takes the registry route no matter what version
+  //     the caller passed;
+  //   * and the remedy costs the caller nothing on either generation: dropping `version`
+  //     gives v4 the channel-resolved from-source install and gives 3.x the same clone it
+  //     would have done anyway.
+  // So a bypass here would only ever hand back a repository the caller did not name.
+  const registryAmbiguity =
+    rerouted && norm.repository && norm.version
+      ? registryVersionAmbiguity(norm.repository, norm.version)
+      : undefined;
+  if (registryAmbiguity) return { conflict: registryVersionRefusal(registryAmbiguity) };
+  // Past that return, the request is necessarily on the from-source route — a contested
+  // name with a registry version has already been refused — so the channel-based
+  // reasoning below is only ever applied where a channel is actually consulted.
+  const ambiguity =
+    rerouted && norm.repository ? bareNameAmbiguity(norm.repository, effectiveChannel) : undefined;
+  if (ambiguity && defaultedChannel) return { conflict: ambiguousBareNameRefusal(ambiguity) };
   // The substitution warning rides EVERY git-URL install (gate round 2), because
   // bare-name resolution is a property of the v4 from-source route rather than of
   // who chose the channel — an explicit `channel:"dev"` substitutes just as readily.
@@ -4519,6 +4584,7 @@ export function nodesInstallCommandArgs(args: {
     [
       norm.note,
       rerouted && norm.repository ? gitInstallSubstitutionNote(effectiveChannel, norm.repository) : undefined,
+      ambiguity ? ambiguousBareNameWarning(ambiguity) : undefined,
       defaultedChannel ? gitInstallChannelNote(GIT_INSTALL_DEFAULT_CHANNEL) : undefined,
     ]
       .filter((s): s is string => typeof s === "string" && s.length > 0)
