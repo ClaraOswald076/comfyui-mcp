@@ -633,7 +633,7 @@ async function fetchTemplateIndexViaPanel(
 ): Promise<{ res: Response; url: string; origin: string; ageMs?: number }> {
   const snapshot = connectedPanelOriginsSnapshot();
   const choice = choosePanelFallbackOrigin(failedUrl, snapshot.origins);
-  const declined = describeDeclinedPanelFallback(choice);
+  const declined = describeDeclinedPanelFallback(choice, snapshot.ageMs);
   if (choice.kind !== "use") {
     if (declined && primaryError instanceof Error) {
       throw new Error(`${primaryError.message}${declined}`, { cause: primaryError });
@@ -729,12 +729,18 @@ async function listWorkflowTemplatesAction(): Promise<ToolText> {
     // unanswered SYN and a dead established socket). The PR body claimed the
     // fallback never fires once the connection was accepted; it did.
     //
-    // mayAskAnotherServer establishes exactly one thing, and only from codes that
-    // prove it: NO CONNECTION TO THIS ADDRESS WAS EVER ESTABLISHED, so no server
-    // there received the request. Anything else — including an unrecognised code,
-    // which now DENIES rather than allows — rethrows untouched and the user gets
-    // the real failure instead of an answer from a machine they did not ask.
-    if (!mayAskAnotherServer(err)) throw err;
+    // mayAskAnotherServer establishes exactly one thing: NO CONNECTION TO THIS
+    // ADDRESS WAS EVER ESTABLISHED, so no server there received the request.
+    // Anything else — including an unrecognised code, which DENIES rather than
+    // allows — rethrows untouched and the user gets the real failure instead of
+    // an answer from a machine they did not ask.
+    //
+    // `url` is passed because the error alone cannot answer it. The reporter's
+    // own COMFYUI_URL (`http://127.0.0.1:9`) is refused by fetch as a BAD PORT
+    // before any socket opens, and that refusal carries no error code at all — so
+    // a code-only predicate said "no" to the exact case this feature exists for.
+    // The address settles it where the error cannot.
+    if (!mayAskAnotherServer(err, url)) throw err;
     const viaPanel = await fetchTemplateIndexViaPanel(url, err);
     res = viaPanel.res;
     url = viaPanel.url;

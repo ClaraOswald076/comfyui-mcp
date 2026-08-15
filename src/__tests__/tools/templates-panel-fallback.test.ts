@@ -21,10 +21,29 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+/**
+ * The configured target, switchable per test.
+ *
+ * DEFAULTS TO A DIALABLE PORT, and that is load-bearing. It used to be the
+ * reporter's own `http://127.0.0.1:9`, which is on the Fetch BLOCKED-PORT list —
+ * so `fetch` refuses it before opening a socket and no connection can ever be
+ * established to it. Under the structural half of `mayAskAnotherServer`, that
+ * address alone licenses the fallback, which meant every test in this file
+ * would pass with the entire error-code half deleted, and the "does NOT fall
+ * back on ECONNRESET" cases were asserting against a combination that cannot
+ * physically occur: port 9 never dials, so it can never reset.
+ *
+ * So the bulk of the file runs against a port that DOES dial and simply has
+ * nothing listening (8199), which is what exercises the code half — and the
+ * reporter's blocked-port case gets its own describe block that sets port 9
+ * explicitly and drives the REAL rejection.
+ */
+let configuredBase = "http://127.0.0.1:8199";
+
 vi.mock("../../config.js", () => ({
   // json-guard's credential redaction reads these three off `config`.
   config: { comfyuiApiKey: undefined, huggingfaceToken: undefined, civitaiApiToken: undefined },
-  getComfyUIBaseUrl: () => "http://127.0.0.1:9",
+  getComfyUIBaseUrl: () => configuredBase,
   // Non-empty on purpose: the fallback must NOT forward it to an origin the user
   // never configured. An empty header set would make that assertion vacuous.
   getComfyUIAuthHeaders: () => ({ Authorization: "Bearer configured-token" }),
@@ -57,9 +76,17 @@ function handler(): Handler {
   return t.handler;
 }
 
-const CONFIGURED = "http://127.0.0.1:9/api/workflow_templates";
+const CONFIGURED = "http://127.0.0.1:8199/api/workflow_templates";
 const PANEL_ORIGIN = "http://127.0.0.1:8188";
 const PANEL_URL = `${PANEL_ORIGIN}/api/workflow_templates`;
+
+/** A target `fetch` will actually dial, so the ERROR is what decides. */
+const DIALABLE = CONFIGURED;
+/** The reporter's own COMFYUI_URL. Port 9 is on the Fetch blocked-port list, so
+ *  `fetch` refuses it before opening a socket — the address decides, and the
+ *  error never even gets a code. */
+const BLOCKED_PORT_BASE = "http://127.0.0.1:9";
+const BLOCKED_PORT_URL = `${BLOCKED_PORT_BASE}/api/workflow_templates`;
 
 /** A `TypeError: fetch failed` carrying `code` on its cause — the exact shape
  *  undici raises for every transport failure, and the only one comfyuiFetch
@@ -71,6 +98,16 @@ const PANEL_URL = `${PANEL_ORIGIN}/api/workflow_templates`;
 function transportFailure(code = "ECONNREFUSED", detail = "connect"): TypeError {
   const err = new TypeError("fetch failed");
   (err as { cause?: unknown }).cause = Object.assign(new Error(`${detail} ${code}`), { code });
+  return err;
+}
+
+/** The REAL shape node raises for a blocked port — `TypeError: fetch failed`
+ *  whose cause is a bare `Error("bad port")` with NO code. Measured against the
+ *  live runtime; `fetch-bad-port.test.ts` drives the genuine article rather than
+ *  this reconstruction, so the two cannot silently drift apart. */
+function badPortFailure(): TypeError {
+  const err = new TypeError("fetch failed");
+  (err as { cause?: unknown }).cause = new Error("bad port");
   return err;
 }
 
@@ -117,9 +154,9 @@ describe("choosePanelFallbackOrigin", () => {
   });
 
   it("reports SAME when the only panel is on the address that failed", () => {
-    expect(choosePanelFallbackOrigin(CONFIGURED, ["http://127.0.0.1:9"])).toEqual({
+    expect(choosePanelFallbackOrigin(CONFIGURED, ["http://127.0.0.1:8199"])).toEqual({
       kind: "same",
-      origin: "http://127.0.0.1:9",
+      origin: "http://127.0.0.1:8199",
     });
   });
 
@@ -128,8 +165,8 @@ describe("choosePanelFallbackOrigin", () => {
     // A fallback that fires here would re-request the same server that just
     // refused the connection.
     expect(
-      choosePanelFallbackOrigin("http://localhost:9/api/workflow_templates", ["http://127.0.0.1:9"]),
-    ).toEqual({ kind: "same", origin: "http://127.0.0.1:9" });
+      choosePanelFallbackOrigin("http://localhost:8199/api/workflow_templates", ["http://127.0.0.1:8199"]),
+    ).toEqual({ kind: "same", origin: "http://127.0.0.1:8199" });
   });
 
   it("picks the single different origin, keeping the spelling the browser reported", () => {
@@ -154,7 +191,7 @@ describe("choosePanelFallbackOrigin", () => {
 
   it("ignores the panel that is on the failed address when picking among the rest", () => {
     expect(
-      choosePanelFallbackOrigin(CONFIGURED, ["http://127.0.0.1:9", "http://127.0.0.1:8188"]),
+      choosePanelFallbackOrigin(CONFIGURED, ["http://127.0.0.1:8199", "http://127.0.0.1:8188"]),
     ).toEqual({ kind: "use", origin: "http://127.0.0.1:8188" });
   });
 
@@ -173,26 +210,56 @@ describe("choosePanelFallbackOrigin", () => {
 describe("mayAskAnotherServer", () => {
   it("answers only for codes that prove no connection was established", () => {
     for (const code of ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "UND_ERR_CONNECT_TIMEOUT"]) {
-      expect(mayAskAnotherServer(transportFailure(code))).toBe(true);
+      expect(mayAskAnotherServer(transportFailure(code), DIALABLE)).toBe(true);
     }
     for (const code of ["ECONNRESET", "EPIPE", "UND_ERR_SOCKET", "ETIMEDOUT", "CERT_HAS_EXPIRED"]) {
-      expect(mayAskAnotherServer(transportFailure(code))).toBe(false);
+      expect(mayAskAnotherServer(transportFailure(code), DIALABLE)).toBe(false);
     }
   });
 
   it("DENIES an unrecognised or absent code, rather than allowing it", () => {
     // The inversion. The trigger this replaced allowed everything it did not name.
-    expect(mayAskAnotherServer(transportFailure("ENOBODYKNOWS"))).toBe(false);
-    expect(mayAskAnotherServer(new Error("something went wrong"))).toBe(false);
-    expect(mayAskAnotherServer(undefined)).toBe(false);
-    expect(mayAskAnotherServer("a string")).toBe(false);
+    expect(mayAskAnotherServer(transportFailure("ENOBODYKNOWS"), DIALABLE)).toBe(false);
+    expect(mayAskAnotherServer(new Error("something went wrong"), DIALABLE)).toBe(false);
+    expect(mayAskAnotherServer(undefined, DIALABLE)).toBe(false);
+    expect(mayAskAnotherServer("a string", DIALABLE)).toBe(false);
+  });
+
+  // ── The structural route: an address fetch cannot dial ──────────────────────
+  //
+  // The reporter's `http://127.0.0.1:9` is refused as a Fetch BAD PORT before a
+  // socket exists, and that refusal carries NO error code. A code-only predicate
+  // therefore answered "no" for the exact configuration this feature was written
+  // for, and the fallback never ran — with a fully green suite, because every
+  // test synthesized ECONNREFUSED.
+
+  it("allows the fallback on a BLOCKED PORT, whatever the error says", () => {
+    // No socket is ever opened, so "no connection was established" holds by
+    // construction — a stronger proof than ECONNREFUSED, not a weaker one.
+    expect(mayAskAnotherServer(badPortFailure(), BLOCKED_PORT_URL)).toBe(true);
+    // Even an error that would be DENIED on a dialable address: on this target
+    // it cannot have come from a connection, because there was none.
+    expect(mayAskAnotherServer(transportFailure("ECONNRESET"), BLOCKED_PORT_URL)).toBe(true);
+    // …and the same error on a dialable address is still denied, so the line
+    // above is the address talking and not a loosened rule.
+    expect(mayAskAnotherServer(transportFailure("ECONNRESET"), DIALABLE)).toBe(false);
+  });
+
+  it("allows the fallback on a scheme fetch does not dial", () => {
+    expect(mayAskAnotherServer(new TypeError("fetch failed"), "ftp://127.0.0.1/api")).toBe(true);
+  });
+
+  it("does NOT treat an ordinary port as undialable", () => {
+    for (const base of ["http://127.0.0.1:8188", "http://127.0.0.1:8199", "http://x.test"]) {
+      expect(mayAskAnotherServer(transportFailure("ECONNRESET"), `${base}/api`)).toBe(false);
+    }
   });
 
   it("rejects an abort, which carries no code to look up", () => {
     for (const name of ["TimeoutError", "AbortError"]) {
       const err = new Error("aborted");
       err.name = name;
-      expect(mayAskAnotherServer(err)).toBe(false);
+      expect(mayAskAnotherServer(err, DIALABLE)).toBe(false);
     }
   });
 
@@ -210,12 +277,12 @@ describe("mayAskAnotherServer", () => {
     // edit ever points one at the other's set, this diverging case fails.
     const tls = "CERT_HAS_EXPIRED";
     expect(deliveryDoubt(tls, "POST")).toBe(""); // never delivered — no doubt raised
-    expect(mayAskAnotherServer(transportFailure(tls))).toBe(false); // but a server WAS there
+    expect(mayAskAnotherServer(transportFailure(tls), DIALABLE)).toBe(false); // but a server WAS there
 
     // And they agree where they genuinely should, so the test above is pinning a
     // real divergence rather than an unrelated pair of answers.
     expect(deliveryDoubt("ECONNREFUSED", "POST")).toBe("");
-    expect(mayAskAnotherServer(transportFailure("ECONNREFUSED"))).toBe(true);
+    expect(mayAskAnotherServer(transportFailure("ECONNREFUSED"), DIALABLE)).toBe(true);
   });
 });
 
@@ -275,7 +342,7 @@ describe('list_packs action:"list_templates" — panel fallback', () => {
   });
 
   it("does not re-ask the same server when the panel is on the address that failed", async () => {
-    setConnectedPanelOrigins(() => ["http://localhost:9"]);
+    setConnectedPanelOrigins(() => ["http://localhost:8199"]);
     stubFetch(async () => {
       throw transportFailure();
     });
@@ -385,7 +452,7 @@ describe('list_packs action:"list_templates" — panel fallback', () => {
 
     expect(res.isError).toBe(true);
     expect(calls).toHaveLength(1);
-    expect(textOf(res)).toContain("127.0.0.1:9/api/workflow_templates");
+    expect(textOf(res)).toContain("127.0.0.1:8199/api/workflow_templates");
   });
 
   it("names BOTH addresses when the panel's server cannot be reached either", async () => {
@@ -644,6 +711,56 @@ describe('list_packs action:"list_templates" — panel fallback', () => {
       // gone because the claim was corrected, not because the text was dropped.
       expect(body, `outcome: ${label}`).toContain(PANEL_ORIGIN);
     }
+
+    // The AMBIGUOUS branch needs two origins, so it could not appear in the loop
+    // above — and that is exactly why the stale claim survived there for a whole
+    // review round. A sweep that cannot reach a branch does not cover it.
+    setConnectedPanelOrigins(() => [PANEL_ORIGIN, "http://192.168.1.50:8188"]);
+    stubFetch(async () => Promise.reject(transportFailure()));
+    const declinedBody = textOf(await handler()({ action: "list_templates" }));
+    expect(declinedBody, "outcome: ambiguous/declined").not.toContain(RETIRED);
+    // The retired present-tense wording this branch used, specifically.
+    expect(declinedBody, "outcome: ambiguous/declined").not.toContain("origins are connected");
+    expect(declinedBody).toContain("were published");
+    expect(declinedBody).toContain(PANEL_ORIGIN);
+    expect(declinedBody).toContain("192.168.1.50:8188");
+  });
+
+  it("discloses the age on the DECLINED (ambiguous) path too", async () => {
+    // Round one corrected four emitted sites and missed this fifth one, because
+    // it is the only branch that reaches none of them.
+    setConnectedPanelOrigins(() => [PANEL_ORIGIN, "http://192.168.1.50:8188"]);
+    stubFetch(async () => Promise.reject(transportFailure()));
+
+    const body = textOf(await handler()({ action: "list_templates" }));
+
+    expect(body).toContain("did NOT retry");
+    expect(body).toContain("a moment ago");
+  });
+
+  it("discloses a CHANNEL age on the declined path, not just the live bridge", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "panel-origins-declined-"));
+    try {
+      writeFileSync(
+        join(dir, PANEL_ORIGINS_FILE),
+        JSON.stringify({
+          origins: [PANEL_ORIGIN, "http://192.168.1.50:8188"],
+          updated: Date.now() - 45_000,
+          pid: process.pid,
+        }),
+      );
+      vi.stubEnv("COMFYUI_MCP_PROGRESS_DIR", dir);
+      setConnectedPanelOrigins(null);
+      stubFetch(async () => Promise.reject(transportFailure()));
+
+      const body = textOf(await handler()({ action: "list_templates" }));
+
+      expect(body).toContain("did NOT retry");
+      expect(body).toMatch(/about 4[4-9]s ago/);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("DISCLOSES how old the origin evidence was, reading it off the channel record", async () => {
@@ -696,6 +813,55 @@ describe('list_packs action:"list_templates" — panel fallback', () => {
     const body = textOf(await handler()({ action: "list_templates" }));
     expect(body).toContain("a moment ago");
     expect(body).toContain("does not establish that a panel is on it now");
+  });
+
+  // ── The REPORTER'S OWN CONFIGURATION, end to end, unsynthesized ─────────────
+
+  it("reaches the fallback for the reporter's http://127.0.0.1:9 — REAL rejection", async () => {
+    // No stubbed error. The configured target is the reporter's blocked port and
+    // the REAL global fetch produces the real refusal; only the panel's origin is
+    // served, by a real socket. If node's pre-dial refusal ever stops being
+    // recognised, this goes red — which the synthesized ECONNREFUSED tests could
+    // never do, and did not, while the feature was a no-op for this exact input.
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"from-the-panel":[{"name":"t1"},{"name":"t2"}]}');
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const port = (server.address() as AddressInfo).port;
+    const previous = configuredBase;
+    configuredBase = BLOCKED_PORT_BASE;
+    try {
+      setConnectedPanelOrigins(() => [`http://127.0.0.1:${port}`]);
+      // Deliberately NOT stubbing fetch: this must exercise the genuine article.
+      const res = await handler()({ action: "list_templates" });
+
+      expect(res.isError).toBeFalsy();
+      const body = textOf(res);
+      expect(body).toContain('"template_count": 2');
+      expect(body).toContain(`"answered_by": "http://127.0.0.1:${port}"`);
+    } finally {
+      configuredBase = previous;
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  it("proves the reporter's failure carries NO error code to match on", async () => {
+    // The premise of the fix above, measured rather than asserted. If node ever
+    // starts attaching a code here, the structural route stops being the only
+    // thing that can save this case and this test says so.
+    let caught: unknown;
+    try {
+      await fetch(BLOCKED_PORT_URL);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(TypeError);
+    const cause = (caught as { cause?: { message?: string; code?: string } }).cause;
+    expect(cause?.message).toBe("bad port");
+    expect(cause?.code).toBeUndefined();
+    // …and that is exactly why the address, not the error, has to decide.
+    expect(mayAskAnotherServer(caught, BLOCKED_PORT_URL)).toBe(true);
   });
 
   it("passes the configured target through untouched when it works", async () => {

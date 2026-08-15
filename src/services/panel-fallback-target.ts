@@ -111,25 +111,114 @@ export const NEVER_CONNECTED_CODES: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Ports `fetch` REFUSES BEFORE DIALING — the Fetch standard's "bad port" list.
+ *
+ * ## Why this exists at all: the code-only predicate shipped DEAD
+ *
+ * #1415's reporter had `COMFYUI_URL=http://127.0.0.1:9`. Port 9 is on this list,
+ * so node never opens a socket: it rejects with `TypeError: fetch failed` whose
+ * cause is a bare `Error: "bad port"` carrying **no `code`**. A predicate that
+ * asks only "is there a never-connected error code?" therefore answered NO for
+ * the exact configuration the feature was written for, and the fallback never
+ * ran — while a suite full of synthesized `ECONNREFUSED` stayed green. Green
+ * tests proved the code matched the tests; they could not prove production
+ * reached it.
+ *
+ * ## Why a pre-dial refusal BELONGS in a "never connected" predicate
+ *
+ * It satisfies the contract more strongly than `ECONNREFUSED` does. On
+ * ECONNREFUSED a packet left this machine and something answered with a RST; on
+ * a bad port nothing is sent at all — the request dies in the URL check. So "no
+ * connection to that address was ever established" is not merely true, it is
+ * true by construction, and no server can possibly have acted.
+ *
+ * ## Why the PORT is checked and not the error text
+ *
+ * The refusal carries no code, so the only thing undici hands over is the string
+ * "bad port". Gating production behaviour on a library's internal prose is the
+ * shape of predicate this project has been burned by. The port is structural: if
+ * a URL names a blocked port, `fetch` can never dial it, so ANY failure on that
+ * URL is necessarily pre-dial — which is why the check below does not need to
+ * inspect the error at all.
+ *
+ * ## This list is MEASURED, not remembered
+ *
+ * Every entry was driven through a real `fetch` on this runtime and confirmed to
+ * answer "bad port", and a control set (80, 443, 3000, 8000, 8080, 8188, 8199,
+ * 11434, …) was confirmed NOT to be refused. `fetch-bad-port-list.test.ts` re-runs
+ * that measurement against the live runtime, so if node's list ever diverges from
+ * this one the suite says so instead of the feature quietly dying again.
+ */
+export const FETCH_BLOCKED_PORTS: ReadonlySet<number> = new Set([
+  1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101, 102,
+  103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389, 427, 465,
+  512, 513, 514, 515, 526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990, 993,
+  995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668,
+  6669, 6679, 6697, 10080,
+]);
+
+/** Schemes `fetch` will actually dial. Anything else dies in the URL check with
+ *  "unknown scheme" — measured — and again carries no code. */
+const DIALABLE_PROTOCOLS: ReadonlySet<string> = new Set(["http:", "https:"]);
+
+/**
+ * Can `fetch` not even ATTEMPT this URL?
+ *
+ * True when the target names a blocked port or a scheme fetch does not dial. In
+ * both cases the request is refused during the URL check, before any socket
+ * exists — so the answer is a property of the ADDRESS, independent of whatever
+ * error came back.
+ *
+ * An unparseable URL answers false: "I cannot read this" is not evidence about a
+ * server, and choosePanelFallbackOrigin already declines a target it cannot
+ * parse.
+ */
+export function isUndialableTarget(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (!DIALABLE_PROTOCOLS.has(parsed.protocol)) return true;
+  // `port` is "" for a default port (80/443), neither of which is blocked.
+  if (parsed.port === "") return false;
+  return FETCH_BLOCKED_PORTS.has(Number(parsed.port));
+}
+
+/**
  * May a DIFFERENT server be asked because of this failure?
  *
- * True only for NEVER_CONNECTED_CODES: this process never established a
- * connection to the address it was configured to use, so nothing there answered
- * and nothing there can have acted.
+ * Establishes exactly one thing, by either of two independent routes:
  *
- * An UNRECOGNISED or absent code answers false. That default is the whole point —
- * the trigger this replaces allowed every error it did not specifically name, so
- * an ECONNRESET on an established connection (the server was plainly there) sent
- * the question to a second machine.
+ *   **NO CONNECTION TO `failedUrl` WAS EVER ESTABLISHED.**
  *
- * Aborts are rejected explicitly rather than by omission from the set, because
- * they carry no code to look up: a caller's own deadline says only that we
- * stopped waiting, and the connection may well have been accepted.
+ *   1. STRUCTURAL — `fetch` cannot dial that address at all (a blocked port, a
+ *      scheme it does not speak). Then no socket was opened whatever the error
+ *      says, which is why this route ignores `err` entirely. This is the route
+ *      the #1415 reporter's `http://127.0.0.1:9` takes, and the route whose
+ *      absence made the first version of this fix a no-op for them.
+ *   2. BY CODE — the transport reported a failure that happens before any byte
+ *      reaches an application (NEVER_CONNECTED_CODES).
+ *
+ * An UNRECOGNISED or absent code still answers false on route 2. That default is
+ * the point: the trigger this replaced allowed every error it did not name, so an
+ * ECONNRESET on an established connection (the server was plainly there) sent the
+ * question to a second machine. Route 1 is not a loosening of that — it is a
+ * stronger proof of the same claim, established from the address rather than from
+ * the error.
+ *
+ * Aborts are rejected first and explicitly, because they carry no code to look up:
+ * a caller's own deadline says only that we stopped waiting, and the connection
+ * may well have been accepted. (An abort cannot in practice reach route 1 — a
+ * blocked-port fetch rejects before there is anything to wait for — but the order
+ * is fixed here rather than left to that argument holding.)
  */
-export function mayAskAnotherServer(err: unknown): boolean {
+export function mayAskAnotherServer(err: unknown, failedUrl: string): boolean {
   if (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) {
     return false;
   }
+  if (isUndialableTarget(failedUrl)) return true;
   const { code } = describeFetchFailure(err);
   return code !== undefined && NEVER_CONNECTED_CODES.has(code);
 }
@@ -211,11 +300,36 @@ export function choosePanelFallbackOrigin(
  * repeating them would be noise, and re-deriving them here would be a second
  * comparison that can disagree with the first.
  */
-export function describeDeclinedPanelFallback(choice: PanelFallbackChoice): string {
+export function describeDeclinedPanelFallback(
+  choice: PanelFallbackChoice,
+  ageMs?: number,
+): string {
   if (choice.kind !== "ambiguous") return "";
   return (
     ` I did NOT retry against a connected panel: ${choice.origins.length} different ComfyUI ` +
-    `origins are connected (${choice.origins.join(", ")}), and choosing one of them would risk ` +
-    `answering from a server you did not mean. Point COMFYUI_URL at the one you want.`
+    `origins were published${describeOriginAge(ageMs)} as connected sidebar panel origins ` +
+    `(${choice.origins.join(", ")}), and choosing one of them would risk answering from a server ` +
+    `you did not mean. Point COMFYUI_URL at the one you want.`
   );
+}
+
+/**
+ * The age of the published origin evidence, as a phrase (#1415 review r2,
+ * finding 2).
+ *
+ * This sentence used to say the origins "are connected" — the same present-tense
+ * claim about panels, from the same up-to-two-minutes-old record, that round one
+ * retired from four other messages. It survived here because the declined path is
+ * the one branch that never reaches them, and the sweep that proved the others
+ * used a single origin, so the ambiguous case it guards could not arise.
+ *
+ * Kept next to the only sentence that uses it rather than shared with
+ * skills-access's observedAgo: this module is a leaf that must not import a tool,
+ * and one duplicated four-line formatter is cheaper than the dependency. A test
+ * pins the two spellings together.
+ */
+function describeOriginAge(ageMs: number | undefined): string {
+  if (ageMs === undefined) return "";
+  if (ageMs < 1000) return " a moment ago";
+  return ` about ${Math.round(ageMs / 1000)}s ago`;
 }
