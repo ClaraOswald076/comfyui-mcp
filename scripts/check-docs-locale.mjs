@@ -170,6 +170,21 @@ for (const loc of locales) {
         fail(loc, slug, `link "${href}" doubles the /docs prefix — it 404s; use "/docs/..." once`);
         continue;
       }
+      // ONE form, enforced. Both `/docs/backends` and `/backends` render the real page, so
+      // this is not correctness — it is anti-churn. With ko/fr at 36 prefixed links and
+      // ja/zh/es at 30 prefixed + 6 bare, a review agent inside any single file could justify
+      // "fixing" it either direction, and one did: it stripped the prefix from zh/installation
+      // to match ja, arguing from repo conventions that the prefix was invented. It is not.
+      // Pinning the form removes the ambiguity that made the rewrite look correct.
+      if (/^\/(?!docs\/)(?!images\/)(?!logo\/)(?!favicon)[a-z]/.test(rawTarget)) {
+        fail(
+          loc,
+          slug,
+          `link "${href}" is missing the /docs prefix — localized pages use "/docs/..." ` +
+            `everywhere (both forms resolve; we pin one so agents stop rewriting each other)`,
+        );
+        continue;
+      }
       const target = rawTarget.replace(/^\/docs\//, '').replace(/^\//, '').replace(/\/$/, '');
       if (!target) continue;
       const isLocal = target.startsWith(`${loc}/`);

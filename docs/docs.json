@@ -225,6 +225,66 @@
             ]
           }
         ]
+      },
+      {
+        "language": "zh",
+        "tabs": [
+          {
+            "tab": "指南",
+            "groups": [
+              {
+                "group": "入门",
+                "pages": [
+                  "zh/index",
+                  "zh/quickstart",
+                  "zh/installation",
+                  "zh/panel",
+                  "zh/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "fr",
+        "tabs": [
+          {
+            "tab": "Guides",
+            "groups": [
+              {
+                "group": "Démarrage",
+                "pages": [
+                  "fr/index",
+                  "fr/quickstart",
+                  "fr/installation",
+                  "fr/panel",
+                  "fr/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "es",
+        "tabs": [
+          {
+            "tab": "Guías",
+            "groups": [
+              {
+                "group": "Primeros pasos",
+                "pages": [
+                  "es/index",
+                  "es/quickstart",
+                  "es/installation",
+                  "es/panel",
+                  "es/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
       }
     ]
   },

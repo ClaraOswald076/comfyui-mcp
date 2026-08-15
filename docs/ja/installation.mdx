@@ -11,7 +11,7 @@ icon: "download"
     macOS / Windows で管理型インストールを最も簡単に済ませる方法です。
   </Card>
   <Card title="ソースから" icon="github" href="https://github.com/comfyanonymous/ComfyUI">
-    自分でクローンして手動で実行する — または [`install_comfyui`](/tools/install-environment) ツールを使います。
+    自分でクローンして手動で実行する — または [`install_comfyui`](/docs/tools/install-environment) ツールを使います。
   </Card>
 </CardGroup>
 
@@ -55,7 +55,7 @@ ComfyUI MCP は npm に `comfyui-mcp` として公開されており、`npx` で
       ほとんどのツールはリモートの ComfyUI に対しても問題なく動作します — ComfyUI-Manager の
       HTTP API を介したカスタムノードのインストールも含まれます。本当にローカルのインストールパスが
       必要なのは、ComfyUI 自体のインストール、comfy-cli に依存する操作、ログの読み取り、モデル
-      ファイルの削除で、これらはリモートモードでは明確なエラーを返します。[しくみ](/concepts)
+      ファイルの削除で、これらはリモートモードでは明確なエラーを返します。[しくみ](/docs/concepts)
       を参照してください。
     </Note>
   </Tab>
@@ -84,11 +84,11 @@ ComfyUI MCP は npm に `comfyui-mcp` として公開されており、`npx` で
       ライブラリを使用します。ローカルのプロセスやファイルシステムにアクセスするツールは
       `CLOUD_UNSUPPORTED` を投げますが、それ以外のツールはエラーを投げる代わりに機能を縮退させます
       — `list_local_models` は空のリストを返し、`apply_manifest` は全体をエラーにせず項目ごとに
-      `skipped`/`failed` を報告します。機能対応表の全体は [設定](/configuration#deployment-modes)
+      `skipped`/`failed` を報告します。機能対応表の全体は [設定](/docs/configuration#deployment-modes)
       ページを参照してください。
     </Note>
     <Note>
-      **クラウドだけをお使いですか？** [Comfy-Org の Comfy Cloud MCP](https://docs.comfy.org/agent-tools)（パブリックベータ）が本来の選択肢です — [ローカル vs. Comfy Cloud](/local-vs-comfy-cloud) を参照してください。ローカル / リモート / クラウドを 1 つの MCP でまとめたい場合や、今すぐクラウド対応が必要な場合は、`comfyui-mcp` のクラウドモードを使ってください。
+      **クラウドだけをお使いですか？** [Comfy-Org の Comfy Cloud MCP](https://docs.comfy.org/agent-tools)（パブリックベータ）が本来の選択肢です — [ローカル vs. Comfy Cloud](/docs/local-vs-comfy-cloud) を参照してください。ローカル / リモート / クラウドを 1 つの MCP でまとめたい場合や、今すぐクラウド対応が必要な場合は、`comfyui-mcp` のクラウドモードを使ってください。
     </Note>
   </Tab>
 </Tabs>
@@ -121,11 +121,11 @@ npx -y comfyui-mcp@latest connect https://your-pod-url
 ```
 
 プロバイダーへのログインとエージェントはローカルに留まり、リモートホストには何もインストールされ
-ません。トンネルの詳細は [クラウドデプロイ](/cloud-deployment) を参照してください。
+ません。トンネルの詳細は [クラウドデプロイ](/docs/cloud-deployment) を参照してください。
 
 ## 4.（任意）トークン
 
-一部のツールは API トークンを使用します。サーバーの `env` ブロックで設定してください（[設定](/configuration) を参照）:
+一部のツールは API トークンを使用します。サーバーの `env` ブロックで設定してください（[設定](/docs/configuration) を参照）:
 
 - `CIVITAI_API_TOKEN` — 制限付きの CivitAI ダウンロード
 - `HUGGINGFACE_TOKEN` — HuggingFace のレート制限の緩和
