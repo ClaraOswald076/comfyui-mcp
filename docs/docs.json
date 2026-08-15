@@ -205,6 +205,26 @@
             ]
           }
         ]
+      },
+      {
+        "language": "ja",
+        "tabs": [
+          {
+            "tab": "ガイド",
+            "groups": [
+              {
+                "group": "はじめに",
+                "pages": [
+                  "ja/index",
+                  "ja/quickstart",
+                  "ja/installation",
+                  "ja/panel",
+                  "ja/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
       }
     ]
   },
