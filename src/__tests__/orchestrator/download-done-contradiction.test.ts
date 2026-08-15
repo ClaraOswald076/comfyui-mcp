@@ -165,3 +165,61 @@ describe("the disagreement actually reaches the user (#1574)", () => {
     expect(block).toMatch(/return \[\];/);
   });
 });
+
+// ── (id, target) IDENTITY and the CONTRADICTING SENTENCE — both from review round 2.
+
+describe("a row is identified by (id, target), not id alone (#1574)", () => {
+  it("does not match a record for the same id at a DIFFERENT target", () => {
+    // A concurrent LOCAL and POD transfer of one URL share an id and must stay two
+    // transfers with two outcomes — the same reason supersession keys on (id, target).
+    // Matching id alone could annotate the wrong completion, or miss a real disagreement
+    // by finding the other one first.
+    expect(
+      completionDisagreesWithRecord(row({ target: "/local/models" }), [
+        job({ target: "/pod/models", status: "downloading" }),
+      ]),
+    ).toBe(false);
+  });
+
+  it("matches when the targets agree", () => {
+    expect(
+      completionDisagreesWithRecord(row({ target: "/local/models" }), [
+        job({ target: "/local/models", status: "downloading" }),
+      ]),
+    ).toBe(true);
+  });
+
+  it("still matches when EITHER side has no target", () => {
+    // Rows and records predating the field, or a route that never sets it, must keep
+    // matching — requiring it on both sides would make the check inert again, which is
+    // exactly how the first version shipped.
+    expect(completionDisagreesWithRecord(row(), [job({ target: "/pod/models" })])).toBe(true);
+    expect(completionDisagreesWithRecord(row({ target: "/local" }), [job()])).toBe(true);
+  });
+});
+
+describe("the event does not contradict its own caveat (#1574)", () => {
+  const formatter = async (): Promise<string> => {
+    const { readFileSync } = await import("node:fs");
+    return readFileSync(new URL("../../orchestrator/panel-agent.ts", import.meta.url), "utf-8");
+  };
+
+  it("the bytes-finished claim is conditional on there being no disagreement", async () => {
+    // Review found the caveat being appended and then flatly contradicted two sentences
+    // later by an unconditional "The bytes finished transferring" — the same defect #1150
+    // fixed here in the other direction.
+    const src = await formatter();
+    const at = src.indexOf("The bytes finished transferring");
+    expect(at).toBeGreaterThan(-1);
+    const block = src.slice(Math.max(0, at - 700), at + 200);
+    expect(block).toMatch(/disagrees/);
+    expect(block).toMatch(/The tray reported the bytes finished/);
+  });
+
+  it("the disagreeing wording reports what the tray SAID rather than asserting it", async () => {
+    const src = await formatter();
+    const at = src.indexOf("The tray reported the bytes finished");
+    expect(at).toBeGreaterThan(-1);
+    expect(src.slice(at, at + 200)).toMatch(/see the caveat above/);
+  });
+});

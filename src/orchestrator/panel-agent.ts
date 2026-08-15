@@ -841,9 +841,8 @@ export class PanelAgent {
       // got "transfer completed" for an 11.46GB file minutes before it existed on disk, and
       // acted on it. Disclosed, never suppressed — see download-done-guard.ts for why
       // dropping the event would be the worse failure.
-      if (dl.some((d) => d.status === "done" && d.recordDisagrees)) {
-        parts.push(COMPLETION_DISAGREEMENT_NOTE);
-      }
+      const disagrees = dl.some((d) => d.status === "done" && d.recordDisagrees);
+      if (disagrees) parts.push(COMPLETION_DISAGREEMENT_NOTE);
       if (failedDead.length) parts.push(`FAILED: ${failedDead.map((d) => d.name).join(", ")}`);
       if (failedRetried.length) {
         parts.push(
@@ -860,7 +859,15 @@ export class PanelAgent {
         // transfer completed while the file was still streaming (#1150). It is
         // only ever a statement about the `done` entries.
         (done.length
-          ? `The bytes finished transferring for the completed one${done.length > 1 ? "s" : ""}; ` +
+          ? // #1574 — this sentence ASSERTS the bytes finished. When the job record still
+            // says they are moving, that is precisely the claim we cannot make, and stating
+            // it right after the caveat argues against our own disclosure — the same defect
+            // #1150 fixed here for the FAILED case, in the other direction. Report what the
+            // tray said instead of asserting it happened.
+            (disagrees
+              ? `The tray reported the bytes finished for the completed one${done.length > 1 ? "s" : ""}, ` +
+                `but see the caveat above before relying on that; `
+              : `The bytes finished transferring for the completed one${done.length > 1 ? "s" : ""}; `) +
             `whether the connected ComfyUI can actually LOAD ${plural} is confirmed separately. `
           : `NOTHING is claimed to have transferred here. `) +
         `If you were waiting on ${plural} to continue a task, ` +

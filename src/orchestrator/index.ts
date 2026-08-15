@@ -5482,6 +5482,7 @@ export async function runPanelOrchestrator(): Promise<void> {
           // #1574 — the PROGRESS/tray id. The record cross-check at the flush needs it, and
           // it is a different identity from the job's public `id`.
           id?: string;
+          target?: string;
           name: string;
           status: string;
           attempt?: number;
@@ -5689,6 +5690,7 @@ export async function runPanelOrchestrator(): Promise<void> {
                   string,
                   {
                     id?: string;
+                    target?: string;
                     name: string;
                     status: string;
                     attempt?: number;
@@ -5708,6 +5710,9 @@ export async function runPanelOrchestrator(): Promise<void> {
               // nothing to match a job against, silently agrees with everything, and the
               // whole disclosure is a no-op. That is exactly how the first version shipped.
               id: typeof row.id === "string" ? row.id : undefined,
+              // (id, target) is the row identity — id alone collides for a concurrent
+              // LOCAL + POD transfer of the same URL (review).
+              target: typeof row.target === "string" ? row.target : undefined,
               name: String(row.name ?? row.id ?? "model"),
               status: String(status),
               attempt: typeof row.attempt === "number" ? row.attempt : undefined,

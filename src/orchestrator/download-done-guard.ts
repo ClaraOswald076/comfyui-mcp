@@ -37,12 +37,16 @@
  *  degrade to "no disagreement", never throw on the event path. */
 interface RowLike {
   id?: unknown;
+  /** #1574 review — a progress row is scoped by (id, target), NOT id alone: a concurrent
+   *  LOCAL and POD transfer of the same URL share an id and must stay distinguishable. */
+  target?: unknown;
   status?: unknown;
 }
 interface JobLike {
   id?: unknown;
   trayId?: unknown;
   progressId?: unknown;
+  target?: unknown;
   status?: unknown;
 }
 
@@ -68,7 +72,22 @@ export function completionDisagreesWithRecord(row: RowLike, jobs: readonly JobLi
   const id = typeof row.id === "string" ? row.id : null;
   if (!id) return false;
   if (!Array.isArray(jobs)) return false;
-  const record = jobs.find((j) => j && typeof j === "object" && progressIdentityOf(j) === id);
+  // (id, target) — the SAME key the supersession logic uses, and for the same reason: a
+  // concurrent LOCAL and POD transfer of one URL shares an id but is two transfers with two
+  // outcomes. Matching on id alone could annotate the wrong completion, or miss a real
+  // disagreement by finding the other one first (review).
+  //
+  // A target is compared only when BOTH sides carry one. Rows and records that predate the
+  // field, or a route that never sets it, must not silently stop matching — that would make
+  // the check inert again, which is exactly how the first version shipped.
+  const target = typeof row.target === "string" ? row.target : null;
+  const record = jobs.find((j) => {
+    if (!j || typeof j !== "object") return false;
+    if (progressIdentityOf(j) !== id) return false;
+    const jobTarget = typeof j.target === "string" ? j.target : null;
+    if (target && jobTarget && target !== jobTarget) return false;
+    return true;
+  });
   if (!record) return false;
   return record.status === "downloading";
 }
