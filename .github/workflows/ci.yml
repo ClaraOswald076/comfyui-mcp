@@ -39,6 +39,17 @@ jobs:
       # becomes real once the matrix actually varies the OS — comfyui-mcp-bi9.)
       - run: npm run check:vocabulary
 
+      # #1585 — a pack's `vram:` headline must name the precision its own
+      # manifest fetches. `list_packs` hands these strings to the agent verbatim,
+      # so a stale one is not cosmetic: overstating makes a capable card skip the
+      # pack, understating sends the user into an OOM (four packs said "24GB+
+      # (Q8_0)" while fetching 26.6GB-per-UNet fp16). `packs:check-models` cannot
+      # see this class — it compares workflow.json to manifest.yaml and never
+      # reads `vram` at all. Also asserted from `npm test`
+      # (src/__tests__/scripts/check-pack-vram.test.ts); the explicit step is here
+      # so the failure is legible without reading a vitest report.
+      - run: npm run packs:check-vram
+
       # #796 — the "could not determine" -> "determined not" collapse. A caught
       # failure answered with [] / null / false tells the caller a negative was
       # OBSERVED, and the caller then reports it to a user as fact. Twenty-seven

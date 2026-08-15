@@ -48,6 +48,7 @@
     "packs:test": "bash scripts/test-packs.sh",
     "packs:check-urls": "node scripts/check-model-urls.mjs",
     "packs:check-models": "node scripts/check-pack-models.mjs",
+    "packs:check-vram": "node scripts/check-pack-vram.mjs",
     "packs:verify-render": "node scripts/verify-render.mjs",
     "postinstall": "node scripts/postinstall.mjs",
     "generations:stats": "node scripts/generation-stats.mjs",
