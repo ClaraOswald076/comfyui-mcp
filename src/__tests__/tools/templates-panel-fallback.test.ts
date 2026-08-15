@@ -194,16 +194,26 @@ describe("choosePanelFallbackOrigin", () => {
     ).toEqual({ kind: "same", origin: "http://comfy.test:8199" });
   });
 
-  it("prefers an ALIAS over a foreign origin, and over an ambiguous pair of them", () => {
-    // An alias is not a guess about which machine was meant — #1175 already holds
-    // it IS the configured server. Taking it first strictly shrinks the
-    // wrong-server risk that the ambiguous refusal exists to manage.
+  it("does NOT let an alias displace a single foreign candidate", () => {
+    // The regression the obvious rule would cause, pinned. "An alias always wins"
+    // is tempting — it is the only candidate that is not a guess — but with one
+    // alias and one foreign origin it swaps a panel that may well answer for an
+    // address that just refused under another spelling, and when that fails the
+    // call fails having never asked. A path that answers today must keep
+    // answering.
     expect(
       choosePanelFallbackOrigin("http://127.0.0.1:8199/api/workflow_templates", [
         "http://192.168.1.50:8188",
         "http://[::1]:8199",
       ]),
-    ).toEqual({ kind: "alias", origin: "http://[::1]:8199" });
+    ).toEqual({ kind: "use", origin: "http://192.168.1.50:8188" });
+  });
+
+  it("prefers an ALIAS over a REFUSAL, which is the verdict that answers nothing", () => {
+    // Two foreign origins mean neither can be chosen, and the alias is not a third
+    // guess between them — #1175 already holds it IS the configured server. Taking
+    // it resolves the refusal without picking between the two, so this can only
+    // turn "no answer" into an answer.
     expect(
       choosePanelFallbackOrigin("http://127.0.0.1:8199/api/workflow_templates", [
         "http://192.168.1.50:8188",

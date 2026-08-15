@@ -324,25 +324,37 @@ export function choosePanelFallbackOrigin(
     if (host !== undefined && wantHost !== undefined && host !== wantHost) aliases.push(spelling);
     else sameAs = spelling;
   }
-  // AN ALIAS OUTRANKS A FOREIGN ORIGIN, including an ambiguous pair of them.
-  // Every other verdict here is a judgement about which of several machines the
-  // caller meant; this one is not a judgement at all — #1175 already holds that
-  // this IS the configured server, so retrying it cannot answer from a machine
-  // the user did not choose. Preferring it strictly shrinks the wrong-server
-  // risk the `ambiguous` refusal exists to manage, so it is taken first.
+  // RESOLUTION ORDER, and the reasoning is a trade between two ways of being
+  // wrong. It is written out because the obvious order is the wrong one.
+  //
+  // The tempting rule is "an alias always wins": it is the only candidate here
+  // that is not a guess, since #1175 already holds it IS the configured server,
+  // so answering from it cannot answer from a machine the user did not choose.
+  //
+  // That rule REGRESSES a case that works today. With one alias and one foreign
+  // origin published, taking the alias replaces a candidate that may well answer
+  // with one that just refused under another spelling — and when it fails, the
+  // call fails, having never asked the panel that could have served it. Trading a
+  // working answer for a safer-sounding one is not an improvement.
+  //
+  // So the alias outranks only the verdicts that produce NO ANSWER AT ALL:
+  //   - `ambiguous`, where two foreign origins mean neither can be chosen. The
+  //     alias is not a third guess between them; it is the configured server, so
+  //     taking it resolves the refusal without ever picking between the two.
+  //   - `same`, which is the finding this whole comment is about.
+  // A single foreign candidate keeps precedence, exactly as before this rule
+  // existed, so no path that answered yesterday stops answering today.
   //
   // Two aliases (`[::1]` and `localhost` both published) are not an ambiguity
   // either: by the same rule they are one server, so the first is as good as the
   // second.
+  if (different.length === 1) return { kind: "use", origin: different[0] };
   if (aliases.length > 0) return { kind: "alias", origin: aliases[0] };
-  if (different.length === 0) {
-    // `sameAs` is necessarily set here: the map is non-empty and nothing landed
-    // in `different` or `aliases`. Asserted through a fallback rather than a `!`
-    // so a future edit that breaks the partition degrades to "say nothing".
-    return sameAs === undefined ? { kind: "none" } : { kind: "same", origin: sameAs };
-  }
   if (different.length > 1) return { kind: "ambiguous", origins: different };
-  return { kind: "use", origin: different[0] };
+  // `sameAs` is necessarily set here: the map is non-empty and nothing landed in
+  // `different` or `aliases`. Asserted through a fallback rather than a `!` so a
+  // future edit that breaks the partition degrades to "say nothing".
+  return sameAs === undefined ? { kind: "none" } : { kind: "same", origin: sameAs };
 }
 
 /**
