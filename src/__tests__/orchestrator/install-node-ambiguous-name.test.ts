@@ -1,0 +1,338 @@
+// #1616 — AN AMBIGUOUS BARE NAME IS REFUSED BEFORE DISPATCH, NOT PICKED.
+//
+// #1611 measured this hazard and DISCLOSED it; #1616 was split out to prevent it. The
+// mechanism is unchanged and re-read at ComfyUI-Manager 4.2.2's own source
+// (comfyui_manager/glob/manager_core.py), not inferred:
+//
+//   load_nightly      for y in x['files']: res[y.split('/')[-1]] = (x, False)
+//   get_custom_nodes  NormalizedKeyDict; its get() keys on key.strip().lower()
+//   install_by_id     the_node = custom_nodes.get(node_id)
+//                     repo_url = the_node['repository']        # the CHANNEL's URL
+//
+// The `repository` a caller passes is stored in the task params and never read on this
+// path, so what gets cloned is whatever the asked-for channel's list has under the bare
+// repo name — which need not be the repository the caller named, and the install still
+// reports success.
+//
+// ## What was measured, 2026-08-15, against all six published channel lists
+//
+// #1616 reports 65 colliding names (35 between `default` and `dev`). That count is
+// case-SENSITIVE and the lookup is not — `NormalizedKeyDict.get` lowercases, so
+// `comfyui_tagger` and `ComfyUI_tagger` are ONE name. Counted the way the lookup counts:
+//
+//   * 104 bare names resolve to different repositories depending on the channel
+//   * 60 of those disagree between `default` and `dev` alone
+//   * 13 are ambiguous WITHIN a single channel — a class #1616 does not mention. Two
+//     case-variant entries collapse onto one key and the winner is list order, so no
+//     second channel is needed to hand back someone else's repository.
+//
+// ## What the guard deliberately does NOT do
+//
+// It fires only on the channel THIS code defaulted to. A caller who names a channel made
+// the choice themselves and gets the collision named instead — which is also the escape
+// hatch from a stale snapshot, since a refusal a caller cannot get past would be a worse
+// tool than the hazard it prevents.
+import { describe, expect, it, vi } from "vitest";
+import { nodesInstallCommandArgs } from "../../services/node-management.js";
+import {
+  AMBIGUOUS_BARE_NAMES,
+  bareNameAmbiguity,
+  managerBareName,
+  ownerRepoOf,
+} from "../../services/manager-bare-name-collisions.js";
+
+vi.mock("../../comfyui/client.js", () => ({
+  getObjectInfo: vi.fn(),
+  backfillObjectInfo: vi.fn(),
+  resetClient: vi.fn(),
+  resetObjectInfoCache: vi.fn(),
+}));
+
+const { buildPanelToolDefs, makePanelToolCtx } = await import("../../orchestrator/panel-tools.js");
+import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
+import type { PanelToolCtx, ToolResult } from "../../orchestrator/panel-tools.js";
+
+const TAB = "11111111-2222-3333-4444-555555555555";
+
+// `ComfyUI-BiRefNet` is three different authors' repository depending on the channel:
+// default -> hieuck, dev -> MohammadAboulEla, legacy -> viperyl.
+const DEV_AUTHORS = "https://github.com/mohammadaboulela/ComfyUI-BiRefNet";
+const DEFAULT_AUTHORS = "https://github.com/hieuck/ComfyUI-BiRefNet";
+/** The reporter's pack from #1539 — a git URL whose name the snapshot has NOT seen collide. */
+const UNCOLLIDING = "https://github.com/Wenaka2004/comfyui-anima-ipadapter";
+
+function installNodeDef() {
+  const def = buildPanelToolDefs().find((d) => d.name === "panel_install_node");
+  if (!def) throw new Error("panel_install_node is not registered");
+  return def;
+}
+
+/**
+ * Drive the REAL tool against a fake bridge. A green unit test on nodesInstallCommandArgs
+ * proves the helper computes a conflict, never that anyone acts on it — deleting the
+ * `if (conflict) return fail(conflict)` line at the call site passes every unit assertion
+ * in this file and fails only here.
+ */
+async function attemptInstall(
+  args: Record<string, unknown>,
+): Promise<{ sent: Record<string, unknown> | undefined; text: string; isError: boolean }> {
+  let sent: Record<string, unknown> | undefined;
+  const bridge = {
+    send: async (cmd: Record<string, unknown>) => {
+      if (cmd.cmd === "nodes_install") {
+        sent = cmd;
+        return { queued: true, pending: true, id: "ComfyUI-BiRefNet", dialect: "v2" };
+      }
+      return { status: { in_progress_count: 0, is_processing: true } };
+    },
+    tabIncarnation: () => "inc-A",
+    push: () => 1,
+    canReach: (id: string) => id === TAB,
+    isHeadless: () => false,
+    tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
+    resolveActiveTabId: () => TAB,
+    refreshWorkflowUuid: () => true,
+    workflowUuidFor: () => ({ known: false }),
+    tabCanMutateGraph: () => true,
+    tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
+  } as unknown as PanelToolCtx["bridge"];
+  const ctx = makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
+  const res: ToolResult = await installNodeDef().handler(args as never, ctx);
+  return {
+    sent,
+    text: res.content.map((c) => (c as { text?: string }).text ?? "").join(" "),
+    isError: res.isError === true,
+  };
+}
+
+describe("the ambiguous from-source install is refused, not picked (#1616)", () => {
+  it("refuses the defaulted-channel install that would clone another author's repo", () => {
+    const out = nodesInstallCommandArgs({ repository: DEV_AUTHORS });
+    expect(out.conflict).toBeTruthy();
+    // Refuses by REFUSING — no half state where the dispatch fields survive alongside it.
+    expect(out.repository).toBeUndefined();
+    expect(out.channel).toBeUndefined();
+  });
+
+  it("NAMES BOTH candidates rather than picking between them", () => {
+    // The standing rule this exists to satisfy. A refusal that says only "ambiguous"
+    // leaves the caller with nothing to act on.
+    const conflict = nodesInstallCommandArgs({ repository: DEV_AUTHORS }).conflict ?? "";
+    expect(conflict).toMatch(/mohammadaboulela\/ComfyUI-BiRefNet/i);
+    expect(conflict).toMatch(/hieuck\/ComfyUI-BiRefNet/i);
+    expect(conflict).toMatch(/BARE REPO NAME \("ComfyUI-BiRefNet"\)/);
+  });
+
+  it("hands back the channel that DOES resolve to the repository the caller named", () => {
+    // Without this the refusal is a dead end. `dev` carries MohammadAboulEla's repo, so
+    // that is the one argument that gets this caller what they actually asked for.
+    const conflict = nodesInstallCommandArgs({ repository: DEV_AUTHORS }).conflict ?? "";
+    expect(conflict).toMatch(/channel:"dev"/);
+    expect(conflict).not.toMatch(/channel:"legacy"/);
+  });
+
+  it("says an explicit channel bypasses it, so a stale snapshot is escapable", () => {
+    const conflict = nodesInstallCommandArgs({ repository: DEV_AUTHORS }).conflict ?? "";
+    expect(conflict).toMatch(/naming any `channel` explicitly makes the choice yours/i);
+    expect(conflict).toMatch(/measured 20\d\d-\d\d-\d\d/);
+  });
+
+  it("ALLOWS the caller who named the repository the asked-for channel carries", () => {
+    // The same colliding NAME, the other author: `default` carries hieuck's, so there is
+    // nothing to pick between. A guard that fired on the name alone would break every
+    // correct install of a colliding pack — 92 of the 104 have a `default` entry.
+    const out = nodesInstallCommandArgs({ repository: DEFAULT_AUTHORS });
+    expect(out.conflict).toBeUndefined();
+    expect(out.channel).toBe("default");
+    expect(out.repository).toBe(DEFAULT_AUTHORS);
+  });
+
+  it("an EXPLICIT channel dispatches — and names the collision instead of refusing", () => {
+    const out = nodesInstallCommandArgs({ repository: DEV_AUTHORS, channel: "legacy" });
+    expect(out.conflict).toBeUndefined();
+    expect(out.channel).toBe("legacy");
+    expect(out.note ?? "").toMatch(/NAMED-CHANNEL COLLISION/);
+    expect(out.note ?? "").toMatch(/viperyl\/ComfyUI-BiRefNet/);
+  });
+
+  it("an explicit channel that DOES carry the caller's repo adds nothing", () => {
+    const out = nodesInstallCommandArgs({ repository: DEV_AUTHORS, channel: "dev" });
+    expect(out.conflict).toBeUndefined();
+    expect(out.note ?? "").not.toMatch(/NAMED-CHANNEL COLLISION/);
+  });
+
+  it("a BLANK channel is not an explicit one — it still refuses", () => {
+    // The panel's `channel || "dev"` treats "" as absent, so forwarding it would land on
+    // a channel nobody chose AND skip the guard. Both spellings count as unset.
+    expect(nodesInstallCommandArgs({ repository: DEV_AUTHORS, channel: "" }).conflict).toBeTruthy();
+    expect(nodesInstallCommandArgs({ repository: DEV_AUTHORS, channel: "  " }).conflict).toBeTruthy();
+  });
+
+  it("catches the name that is ambiguous INSIDE one channel, with no second channel", () => {
+    // 13 names collapse two case-variant entries onto one NormalizedKeyDict key, where
+    // the winner is list order. `default` lists BOTH Zuellni/ComfyUI-Custom-Nodes and
+    // rcsaquino/comfyui-custom-nodes, so asking it for that name cannot be answered.
+    const conflict =
+      nodesInstallCommandArgs({ repository: "https://github.com/Zuellni/ComfyUI-Custom-Nodes" })
+        .conflict ?? "";
+    expect(conflict).toMatch(/carries that name TWICE/i);
+    expect(conflict).toMatch(/Zuellni\/ComfyUI-Custom-Nodes/);
+    expect(conflict).toMatch(/rcsaquino\/comfyui-custom-nodes/);
+  });
+
+  it("matches the name CASE-INSENSITIVELY, the way Manager's own lookup does", () => {
+    // `NormalizedKeyDict.get` keys on `key.strip().lower()`. A case-sensitive guard is
+    // exactly what undercounted the hazard at 65 in the first place.
+    for (const spelling of ["ComfyUI-BiRefNet", "comfyui-birefnet", "COMFYUI-BIREFNET"]) {
+      const out = nodesInstallCommandArgs({
+        repository: `https://github.com/mohammadaboulela/${spelling}`,
+      });
+      expect(out.conflict, spelling).toBeTruthy();
+    }
+  });
+
+  it("compares the OWNER case-insensitively too — GitHub owners are", () => {
+    // `dev` records the owner as `MohammadAboulEla`; the caller types it lowercase. A
+    // case-sensitive owner comparison would refuse a caller who named exactly the repo
+    // that channel carries.
+    const out = nodesInstallCommandArgs({ repository: DEV_AUTHORS, channel: "dev" });
+    expect(out.conflict).toBeUndefined();
+    expect(out.channel).toBe("dev");
+  });
+
+  it("reaches every spelling the panel routes as git, not just an https URL", () => {
+    // The routing predicate and the guard have to agree or a shorthand slips past — the
+    // #1539 gate-round-3 defect in a new place. `author/repo` is the form this tool's own
+    // description tells callers to pass.
+    for (const spelling of [
+      "mohammadaboulela/ComfyUI-BiRefNet",
+      "https://github.com/mohammadaboulela/ComfyUI-BiRefNet.git",
+      "git@github.com:mohammadaboulela/ComfyUI-BiRefNet.git",
+      "ssh://git@github.com/mohammadaboulela/ComfyUI-BiRefNet",
+      "git://github.com/mohammadaboulela/ComfyUI-BiRefNet",
+    ]) {
+      expect(nodesInstallCommandArgs({ id: spelling }).conflict, spelling).toBeTruthy();
+      expect(nodesInstallCommandArgs({ repository: spelling }).conflict, spelling).toBeTruthy();
+    }
+  });
+
+  it("MUST NOT touch a name the snapshot has not seen collide", () => {
+    // 104 names out of ~5850 in `default` alone. Everything else keeps what it had.
+    expect(nodesInstallCommandArgs({ repository: UNCOLLIDING }).conflict).toBeUndefined();
+    expect(nodesInstallCommandArgs({ repository: UNCOLLIDING }).channel).toBe("default");
+  });
+
+  it("MUST NOT touch the registry-id route, which never resolves by bare name", () => {
+    // A slash-free registry id goes to the CNR path, where the id IS the identifier —
+    // even when it spells a name that collides on the from-source route.
+    const out = nodesInstallCommandArgs({ id: "comfyui-birefnet", version: "latest" });
+    expect(out.conflict).toBeUndefined();
+    expect(out.id).toBe("comfyui-birefnet");
+    expect(nodesInstallCommandArgs({ id: "comfyui-kjnodes" }).conflict).toBeUndefined();
+  });
+
+  it("the id+repository conflict still wins — it is checked first", () => {
+    const out = nodesInstallCommandArgs({ id: "comfyui-kjnodes", repository: DEV_AUTHORS });
+    expect(out.conflict).toMatch(/BOTH id .* and repository/);
+  });
+
+  it("REFUSES ON THE WIRE — nothing is dispatched, and the caller is told why", async () => {
+    const out = await attemptInstall({ repository: DEV_AUTHORS });
+    expect(out.isError).toBe(true);
+    expect(out.sent).toBeUndefined();
+    expect(out.text).toMatch(/REFUSED before dispatch/i);
+    expect(out.text).toMatch(/hieuck\/ComfyUI-BiRefNet/);
+  });
+
+  it("STILL DISPATCHES the allowed one, so the guard is not a blanket block", async () => {
+    const out = await attemptInstall({ repository: DEFAULT_AUTHORS });
+    expect(out.isError).toBe(false);
+    expect(out.sent?.cmd).toBe("nodes_install");
+    expect(out.sent?.channel).toBe("default");
+  });
+
+  it("the tool's DESCRIPTION says the refusal exists, before any call is made", () => {
+    const text = installNodeDef().description ?? "";
+    expect(text).toMatch(/REFUSES instead of picking/i);
+    expect(text).toMatch(/104 bare names/);
+    expect(text).toMatch(/13 are ambiguous inside ONE channel/i);
+  });
+});
+
+describe("the snapshot and its predicate (#1616)", () => {
+  it("every listed name really is ambiguous — no entry that agrees with itself", () => {
+    // A name whose channels all point at one repository can only produce false refusals.
+    for (const [name, byChannel] of Object.entries(AMBIGUOUS_BARE_NAMES)) {
+      const repos = new Set(
+        Object.values(byChannel)
+          .flat()
+          .map((r) => r.toLowerCase()),
+      );
+      expect(repos.size, name).toBeGreaterThan(1);
+    }
+  });
+
+  it("every key is already lowercased, since the lookup lowercases", () => {
+    for (const name of Object.keys(AMBIGUOUS_BARE_NAMES)) {
+      expect(name, name).toBe(name.toLowerCase());
+    }
+  });
+
+  it("every candidate parses as owner/repo, so the refusal can name it", () => {
+    for (const [name, byChannel] of Object.entries(AMBIGUOUS_BARE_NAMES)) {
+      for (const repo of Object.values(byChannel).flat()) {
+        expect(repo, `${name} -> ${repo}`).toMatch(/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/);
+      }
+    }
+  });
+
+  it("holds the measured population — 104 names, 13 ambiguous within one channel", () => {
+    // Pinned so a regeneration that silently drops the table (an empty object still
+    // passes every "for each entry" assertion above) is caught.
+    const names = Object.keys(AMBIGUOUS_BARE_NAMES);
+    expect(names.length).toBe(104);
+    const intra = names.filter((n) =>
+      Object.values(AMBIGUOUS_BARE_NAMES[n]).some((repos) => repos.length > 1),
+    );
+    expect(intra.length).toBe(13);
+  });
+
+  it("derives the bare name exactly as the panel's gitRepoName does", () => {
+    // That is the string the panel puts in `id`, and therefore the string Manager looks
+    // up. Deriving it any other way here checks a name that never gets sent.
+    expect(managerBareName("https://github.com/a/Repo-Name.git")).toBe("Repo-Name");
+    expect(managerBareName("git@github.com:a/Repo-Name.git")).toBe("Repo-Name");
+    expect(managerBareName("https://github.com/a/Repo-Name/")).toBe("Repo-Name");
+    expect(managerBareName("https://github.com/a/Repo-Name?x=1#y")).toBe("Repo-Name");
+    expect(managerBareName("a/Repo-Name")).toBe("Repo-Name");
+  });
+
+  it("parses owner/repo from every spelling the bare name comes from", () => {
+    expect(ownerRepoOf("https://github.com/Own-er/Repo.git")).toBe("Own-er/Repo");
+    expect(ownerRepoOf("git@github.com:Own-er/Repo.git")).toBe("Own-er/Repo");
+    expect(ownerRepoOf("ssh://git@github.com/Own-er/Repo")).toBe("Own-er/Repo");
+    expect(ownerRepoOf("Own-er/Repo")).toBe("Own-er/Repo");
+  });
+
+  it("says nothing about a channel that does not list the name at all", () => {
+    // `comfyui-birefnet` is on default/dev/legacy. `forked` does not carry it, so asking
+    // `forked` resolves nothing and there is no substitution to refuse.
+    expect(bareNameAmbiguity(DEV_AUTHORS, "forked")).toBeUndefined();
+    expect(bareNameAmbiguity(DEV_AUTHORS, "legacy")).toBeTruthy();
+  });
+
+  it("tolerates a channel name it has never heard of rather than throwing", () => {
+    // A caller can pass any string; Manager validates it, this must not crash first.
+    expect(bareNameAmbiguity(DEV_AUTHORS, "not-a-channel")).toBeUndefined();
+    expect(nodesInstallCommandArgs({ repository: DEV_AUTHORS, channel: "not-a-channel" }).conflict)
+      .toBeUndefined();
+  });
+
+  it("refuses a URL it cannot parse an owner out of, rather than assuming a match", () => {
+    // No owner means no way to tell the caller's repo from the channel's, and the
+    // fallback position is to name both rather than to guess.
+    const amb = bareNameAmbiguity("https://github.com/ComfyUI-BiRefNet", "default");
+    expect(amb).toBeTruthy();
+    expect(amb?.callerRepo).toBeUndefined();
+  });
+});

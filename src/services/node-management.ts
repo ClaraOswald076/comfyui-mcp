@@ -28,6 +28,11 @@ import {
   runComfyCliSync,
 } from "./comfy-cli.js";
 import { withPanelPinGuard } from "./panel-pin-guard.js";
+import {
+  ambiguousBareNameRefusal,
+  ambiguousBareNameWarning,
+  bareNameAmbiguity,
+} from "./manager-bare-name-collisions.js";
 import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { managerBodyClause } from "./manager-error-body.js";
@@ -4456,6 +4461,15 @@ function gitUrlOwnerRepo(url: string): string | undefined {
  * so a caller who passed `channel:"dev"` themselves faces exactly the same substitution.
  * It names the owner from the caller's own URL so the check is concrete — the standing
  * rule being that two candidates are NAMED, never silently picked between.
+ *
+ * #1616 — THE COUNT IN THIS TEXT WAS AN UNDERCOUNT, and is corrected here. "35" came from
+ * comparing bare names case-SENSITIVELY. Manager's own lookup is not: `get_custom_nodes`
+ * returns a `NormalizedKeyDict` whose `get` keys on `key.strip().lower()`, so
+ * `comfyui_tagger` and `ComfyUI_tagger` are one name. Counted the way the lookup counts:
+ * 104 names resolve to different repositories across the six published channels, 60 of
+ * them between `default` and `dev` alone. This note is now the FALLBACK disclosure — the
+ * measured 104 are refused before dispatch by `bareNameAmbiguity` when the channel was
+ * defaulted, and this text covers everything that snapshot has not seen.
  */
 function gitInstallSubstitutionNote(channel: string, url: string): string {
   const owner = gitUrlOwnerRepo(url);
@@ -4463,8 +4477,8 @@ function gitInstallSubstitutionNote(channel: string, url: string): string {
   return (
     `WHAT GETS CLONED IS NOT NECESSARILY THE URL YOU PASSED. Manager v4 resolves a ` +
     `from-source install by the BARE REPO NAME ("${bare}") against the "${channel}" ` +
-    `channel's list, then clones the URL recorded in THAT entry — 35 bare names are ` +
-    `listed in both default and dev under DIFFERENT authors. So if "${channel}" lists ` +
+    `channel's list, then clones the URL recorded in THAT entry — 104 bare names resolve ` +
+    `to DIFFERENT repositories depending on the channel asked. So if "${channel}" lists ` +
     `that name under anyone other than ${owner ? `the ${owner} you passed` : "the author you passed"}, ` +
     `this installs THEIR repository and still reports success. Confirm with ` +
     `panel_list_nodes that what landed is the repo you meant before you restart or ` +
@@ -4512,6 +4526,17 @@ export function nodesInstallCommandArgs(args: {
   // otherwise dispatch a defaulted channel with nothing said about it.
   const defaultedChannel = rerouted && explicitChannel === undefined;
   const effectiveChannel = explicitChannel ?? GIT_INSTALL_DEFAULT_CHANNEL;
+  // #1616 — WHERE THE DISCLOSURE BECOMES A REFUSAL. `gitInstallSubstitutionNote` below
+  // warns that v4's bare-name resolution CAN hand back another author's repository; for
+  // the names where that is not hypothetical but measured, this refuses instead. It fires
+  // only on the channel THIS code defaulted to, because that is the case where the tool
+  // would be picking between two candidate repositories on the caller's behalf — the one
+  // thing the standing rule says to refuse. A caller who named the channel made the choice
+  // themselves and gets the collision NAMED instead (`ambiguousBareNameWarning`), which
+  // also leaves a stale snapshot escapable in one argument rather than bricking the tool.
+  const ambiguity =
+    rerouted && norm.repository ? bareNameAmbiguity(norm.repository, effectiveChannel) : undefined;
+  if (ambiguity && defaultedChannel) return { conflict: ambiguousBareNameRefusal(ambiguity) };
   // The substitution warning rides EVERY git-URL install (gate round 2), because
   // bare-name resolution is a property of the v4 from-source route rather than of
   // who chose the channel — an explicit `channel:"dev"` substitutes just as readily.
@@ -4519,6 +4544,7 @@ export function nodesInstallCommandArgs(args: {
     [
       norm.note,
       rerouted && norm.repository ? gitInstallSubstitutionNote(effectiveChannel, norm.repository) : undefined,
+      ambiguity ? ambiguousBareNameWarning(ambiguity) : undefined,
       defaultedChannel ? gitInstallChannelNote(GIT_INSTALL_DEFAULT_CHANNEL) : undefined,
     ]
       .filter((s): s is string => typeof s === "string" && s.length > 0)

@@ -1,0 +1,200 @@
+/**
+ * #1616 — REFUSE THE AMBIGUOUS FROM-SOURCE INSTALL INSTEAD OF PICKING A REPOSITORY.
+ *
+ * #1611 measured the hazard and DISCLOSED it: ComfyUI-Manager v4 resolves a from-source
+ * ("nightly") install by the pack's BARE REPO NAME against one channel's list, then clones
+ * the URL recorded in THAT entry — the `repository` the caller passed is stored in the task
+ * params and never read on that path. So a caller who names one author's repo can get
+ * another author's, and the install reports success. Read off Manager 4.2.2's own source:
+ *
+ *   load_nightly:      res[y.split('/')[-1]] = (x, False)      # key = bare repo name
+ *   get_custom_nodes:  NormalizedKeyDict, get() -> key.strip().lower()
+ *   install_by_id:     repo_url = the_node['repository']       # the CHANNEL's URL
+ *
+ * Disclosure was the right call for #1611 (it was scoped to the channel bug) but it leaves
+ * the tool picking silently between two candidate repositories — the exact thing the
+ * standing rule says to refuse. This module supplies the pre-dispatch refusal.
+ *
+ * WHAT WAS MEASURED, 2026-08-15, against all six published channel lists. #1616 reported
+ * 65 colliding bare names (35 between `default` and `dev`). That count is CASE-SENSITIVE
+ * and therefore low: `get_custom_nodes` stores into a `NormalizedKeyDict` whose `get`
+ * normalizes `key.strip().lower()`, so `comfyui_tagger` and `ComfyUI_tagger` are one key.
+ * Counting the way the lookup counts gives **104** ambiguous names — and surfaces a class
+ * #1616 does not mention at all: **13** names are ambiguous WITHIN a single channel, where
+ * two case-variant entries collapse onto one key and the winner is list order. Those need
+ * no second channel to hand back the wrong repository.
+ *
+ * WHAT THE GUARD CANNOT SEE, stated rather than papered over:
+ *
+ *  * CNR re-keying. When a channel entry's repo is registered in the Comfy Registry,
+ *    `get_custom_nodes` keys it by the CNR id instead of the bare name. Of the 219 channel
+ *    entries behind these 104 names, 28 are re-keyed to an id that is not the bare name —
+ *    for those, the real lookup MISSES and Manager answers "not found". The guard cannot
+ *    know a host's CNR state, so it refuses there too. That trade only ever converts a
+ *    not-found into a clearer refusal: it can never block a resolution that would have
+ *    returned the caller's own URL, because a channel that lists exactly the caller's repo
+ *    under that name is allowed through below.
+ *  * A pip-installed Manager. `get_data_by_mode` reads the cache file for the configured
+ *    channel URL, else the snapshot BUNDLED in the package — a stale, default-flavoured
+ *    list — so on that host the list consulted is not the one measured here. The bundled
+ *    list is default-flavoured, which is the channel this guard is most accurate about.
+ *  * Staleness. The table is a snapshot. A collision added after it was measured is simply
+ *    not caught (today's behaviour), and an entry that has since been corrected upstream
+ *    causes an unnecessary refusal — which the caller clears by naming a channel, since
+ *    the refusal only fires on the channel THIS code defaulted to.
+ */
+import {
+  AMBIGUOUS_BARE_NAMES,
+  AMBIGUOUS_BARE_NAMES_MEASURED,
+  MANAGER_CHANNEL_NAMES,
+  type ManagerChannelName,
+} from "./manager-bare-name-data.js";
+
+export { AMBIGUOUS_BARE_NAMES, AMBIGUOUS_BARE_NAMES_MEASURED, MANAGER_CHANNEL_NAMES };
+export type { ManagerChannelName };
+
+/**
+ * The pack name Manager will resolve by — EXACTLY the panel's `gitRepoName`
+ * (web/js/lib/manager-install.js), because that is the value the panel puts in `id` and
+ * therefore the value `install_by_id` looks up. Deriving it any other way here would check
+ * a different string than the one that gets sent.
+ */
+export function managerBareName(url: string): string {
+  const pathPart =
+    url.includes(":") && !url.includes("://") ? url.slice(url.lastIndexOf(":") + 1) : url;
+  const clean = pathPart.replace(/[?#].*$/, "").replace(/\/+$/, "");
+  const base = clean.slice(clean.lastIndexOf("/") + 1);
+  return base.replace(/\.git$/i, "");
+}
+
+/**
+ * `owner/repo` from a git URL, or undefined when the URL does not carry one.
+ *
+ * The HOST is never the owner. A last-two-path-segments regex reads
+ * `https://github.com/ComfyUI-BiRefNet` as `github.com/ComfyUI-BiRefNet`, which then
+ * matches no candidate and gets quoted back to the caller as a repository they never
+ * named. An owner-less URL has to come back `undefined` so the refusal says "the URL you
+ * passed" instead of inventing one.
+ */
+export function ownerRepoOf(url: string): string | undefined {
+  const noGit = url.trim().replace(/[?#].*$/, "").replace(/\/+$/, "").replace(/\.git$/i, "");
+  let path: string;
+  const scp = /^(?:[^/@]+@)?[^/:]+:(?!\/\/)(.+)$/.exec(noGit); // git@host:owner/repo
+  if (scp) {
+    path = scp[1];
+  } else {
+    const proto = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/(.*)$/.exec(noGit);
+    if (proto) {
+      const afterHost = proto[1].replace(/^[^/]*\//, "");
+      if (afterHost === proto[1]) return undefined; // host with no path
+      path = afterHost;
+    } else {
+      path = noGit;
+    }
+  }
+  const segs = path.split("/").filter(Boolean);
+  if (segs.length < 2) return undefined;
+  return `${segs[segs.length - 2]}/${segs[segs.length - 1]}`;
+}
+
+const sameRepo = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase();
+
+export interface BareNameAmbiguity {
+  /** The name as it will be SENT (case preserved), e.g. "ComfyUI-BiRefNet". */
+  bare: string;
+  /** `owner/repo` the caller named, or undefined when their URL does not parse. */
+  callerRepo?: string;
+  /** The channel about to be asked. */
+  channel: string;
+  /** What that channel's list carries under the name — >1 means it is ambiguous alone. */
+  channelCandidates: readonly string[];
+  /** Channels whose list resolves the name to exactly the caller's repo, if any. */
+  channelsResolvingToCaller: readonly string[];
+}
+
+/**
+ * Would asking `channel` for this URL's bare name resolve to a repository other than the
+ * one the caller named? Returns the two (or more) candidates when so, `undefined` when the
+ * name is not known to collide, when the channel does not list it, or when the channel
+ * lists exactly the caller's repo and nothing else under it.
+ *
+ * Absence is NOT proof of uniqueness — an unlisted name is one this snapshot has not seen
+ * collide, which is precisely today's behaviour for it.
+ */
+export function bareNameAmbiguity(url: string, channel: string): BareNameAmbiguity | undefined {
+  const bare = managerBareName(url);
+  const entry = AMBIGUOUS_BARE_NAMES[bare.trim().toLowerCase()];
+  if (!entry) return undefined;
+  const asked = channel.trim().toLowerCase() as ManagerChannelName;
+  const channelCandidates = entry[asked];
+  if (!channelCandidates || channelCandidates.length === 0) return undefined;
+  const callerRepo = ownerRepoOf(url);
+  if (channelCandidates.length === 1 && callerRepo && sameRepo(channelCandidates[0], callerRepo)) {
+    return undefined;
+  }
+  const channelsResolvingToCaller = callerRepo
+    ? MANAGER_CHANNEL_NAMES.filter((c) => {
+        const cands = entry[c];
+        return cands?.length === 1 && sameRepo(cands[0], callerRepo);
+      })
+    : [];
+  return { bare, callerRepo, channel, channelCandidates, channelsResolvingToCaller };
+}
+
+/** "X, Y and Z" — the candidates are NAMED, never reduced to a count. */
+function listRepos(repos: readonly string[]): string {
+  const urls = repos.map((r) => `https://github.com/${r}`);
+  if (urls.length === 1) return urls[0];
+  return `${urls.slice(0, -1).join(", ")} and ${urls[urls.length - 1]}`;
+}
+
+/**
+ * The pre-dispatch refusal. Names BOTH sides — what the caller asked for and what the
+ * channel would actually clone — and gives the one argument that proceeds, because a
+ * refusal a caller cannot get past is a worse tool than the hazard it prevents.
+ */
+export function ambiguousBareNameRefusal(a: BareNameAmbiguity): string {
+  const asked = a.callerRepo ? `https://github.com/${a.callerRepo}` : "the URL you passed";
+  const within =
+    a.channelCandidates.length > 1
+      ? `the "${a.channel}" channel's list carries that name TWICE — under ${listRepos(a.channelCandidates)} — and which one v4 returns depends on the order of that list`
+      : `the "${a.channel}" channel's list carries that name under ${listRepos(a.channelCandidates)}`;
+  const escape = a.channelsResolvingToCaller.length
+    ? `The repository you named is what ${a.channelsResolvingToCaller
+        .map((c) => `channel:"${c}"`)
+        .join(" or ")} resolves "${a.bare}" to — pass that and this proceeds.`
+    : `No channel in the snapshot resolves "${a.bare}" to the repository you named, so a ` +
+      `Manager install cannot be made to fetch it: use install_custom_node (source:"git"), ` +
+      `which clones the URL directly instead of resolving a name.`;
+  return (
+    `REFUSED before dispatch — this install would not necessarily have installed the ` +
+    `repository you named. ComfyUI-Manager v4 resolves a from-source install by the BARE ` +
+    `REPO NAME ("${a.bare}") against ONE channel's list and clones the URL recorded there, ` +
+    `ignoring the \`repository\` field entirely. You asked for ${asked}, and ${within}. ` +
+    `So this would have cloned someone else's code and reported success. Not picked for ` +
+    `you: ${escape} ` +
+    `(This check ran because no \`channel\` was named, against a snapshot of the six ` +
+    `published channel lists measured ${AMBIGUOUS_BARE_NAMES_MEASURED}; naming any ` +
+    `\`channel\` explicitly makes the choice yours and bypasses it.)`
+  );
+}
+
+/**
+ * The same collision, for a caller who DID name the channel. They made that choice, so
+ * this dispatches — but it names the concrete repository their channel carries instead of
+ * the generic "104 bare names collide" warning that would otherwise ride along.
+ */
+export function ambiguousBareNameWarning(a: BareNameAmbiguity): string {
+  const asked = a.callerRepo ? `https://github.com/${a.callerRepo}` : "the URL you passed";
+  const carries =
+    a.channelCandidates.length > 1
+      ? `carries "${a.bare}" TWICE — under ${listRepos(a.channelCandidates)} — and v4 keeps whichever comes last in that list`
+      : `resolves "${a.bare}" to ${listRepos(a.channelCandidates)}`;
+  return (
+    `NAMED-CHANNEL COLLISION: you asked for ${asked}, but the "${a.channel}" channel you ` +
+    `named ${carries}. v4 resolves this install by the bare name and clones the URL from ` +
+    `ITS list, so what lands is very likely not what you passed. Dispatched anyway because ` +
+    `you chose the channel — verify with panel_list_nodes before you restart or report ` +
+    `success. (Snapshot measured ${AMBIGUOUS_BARE_NAMES_MEASURED}.)`
+  );
+}

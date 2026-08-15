@@ -283,7 +283,11 @@ describe("the channel it picked is DISCLOSED, never silent (#1539 review P1)", (
     const note = nodesInstallCommandArgs({ repository: REPORTED_URL }).note ?? "";
     expect(note).toMatch(/NOT retried for you on purpose/i);
     expect(note).toMatch(/BARE REPO ?NAME/i);
-    expect(note).toMatch(/DIFFERENT authors/i);
+    // #1616 corrected the figure this sentence carries. "35 ... under DIFFERENT authors"
+    // counted bare names case-SENSITIVELY and Manager's lookup does not — its
+    // `NormalizedKeyDict.get` keys on `key.strip().lower()`. Counted the way the lookup
+    // counts, 104 names resolve to different repositories depending on the channel.
+    expect(note).toMatch(/104 bare names resolve to DIFFERENT repositories/i);
     expect(note).toMatch(/could install a repository you did not name/i);
   });
 
@@ -329,7 +333,15 @@ describe("the FIRST attempt's wrong-author risk is disclosed too (#1539 gate rou
   // author for 0, so every colliding URL this tool can hand a caller was resolving to
   // the WRONG author under `dev` and resolves correctly now. But it is real, and a
   // caller cannot check it unless told, so the note names it.
-  const COLLIDING = "https://github.com/mohammadaboulela/ComfyUI-BiRefNet";
+  //
+  // #1616 SPLIT THIS POPULATION IN TWO. For the 104 names measured to collide, a
+  // defaulted-channel call is now REFUSED outright — see install-node-ambiguous-name.
+  // What this note still covers, and what these tests now pin, is every name that
+  // snapshot has NOT seen collide, plus the caller who names the very repository the
+  // asked-for channel carries. hieuck's is what `default` resolves "ComfyUI-BiRefNet"
+  // to, so it is allowed through and still warned: there was nothing to pick between,
+  // which is not the same as a guarantee about what lands.
+  const COLLIDING = "https://github.com/hieuck/ComfyUI-BiRefNet";
 
   it("warns that the URL passed is not necessarily the URL cloned", () => {
     const note = nodesInstallCommandArgs({ repository: COLLIDING }).note ?? "";
@@ -342,10 +354,10 @@ describe("the FIRST attempt's wrong-author risk is disclosed too (#1539 gate rou
     // A generic "verify what landed" is unactionable; the caller has to know which
     // author to compare against.
     const note = nodesInstallCommandArgs({ repository: COLLIDING }).note ?? "";
-    expect(note).toMatch(/mohammadaboulela\/ComfyUI-BiRefNet you passed/);
+    expect(note).toMatch(/hieuck\/ComfyUI-BiRefNet you passed/);
     const other = nodesInstallCommandArgs({ repository: REPORTED_URL }).note ?? "";
     expect(other).toMatch(/Wenaka2004\/comfyui-anima-ipadapter you passed/);
-    expect(other).not.toMatch(/mohammadaboulela/);
+    expect(other).not.toMatch(/hieuck/);
   });
 
   it("rides an EXPLICIT channel too — the hazard is the route, not the choice", () => {
@@ -400,7 +412,7 @@ describe("the FIRST attempt's wrong-author risk is disclosed too (#1539 gate rou
     const cmd = await dispatchInstall({ repository: COLLIDING });
     expect(cmd.sent.channel).toBe("default");
     expect(cmd.text).toMatch(/NOT NECESSARILY THE URL YOU PASSED/i);
-    expect(cmd.text).toMatch(/mohammadaboulela\/ComfyUI-BiRefNet you passed/);
+    expect(cmd.text).toMatch(/hieuck\/ComfyUI-BiRefNet you passed/);
   });
 });
 
