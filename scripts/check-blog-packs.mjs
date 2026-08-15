@@ -165,7 +165,15 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
         const at = line.indexOf(raw);
         const prefix = line.slice(0, at);
         // `foo/bar/install.sh` where foo/bar is not a pack path — someone else's tree.
-        if (/[A-Za-z0-9._-][\\/]$/.test(prefix) && !/packs[\\/][A-Za-z0-9._-]+[\\/]$/.test(prefix)) continue;
+        //
+        // `./` and `.\` are NOT that: they are how a quickstart invokes a script in the
+        // current directory, which after a `cd packs/<pack>` is exactly the file this rule
+        // should check. Treating them as a foreign directory skipped them — a false NEGATIVE,
+        // the dangerous direction, introduced by the previous round's fix for remote URLs.
+        const dir = prefix.match(/([A-Za-z0-9._-]*[\\/])$/)?.[1];
+        const isCurrentDir = dir === './' || dir === '.\\';
+        const isPackPath = /packs[\\/][A-Za-z0-9._-]+[\\/]$/.test(prefix);
+        if (dir && !isCurrentDir && !isPackPath) continue;
         const key = `s:${raw}`;
         if (seen.has(key)) continue;
         seen.add(key);
