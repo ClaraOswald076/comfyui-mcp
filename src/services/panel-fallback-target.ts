@@ -250,16 +250,24 @@ export function mayAskAnotherServer(err: unknown, failedUrl: string): boolean {
  *                   host would be addressing something the browser never named.
  *
  * `then` carries the REMAINING candidates in preference order, so an `alias` that
- * does not answer can fall through to the single foreign panel rather than ending
- * the call. It is empty far more often than not, and a caller that ignores it
- * degrades to trying only the first — the behaviour before the chain existed.
+ * does not answer can fall through to the next spelling — or to the single
+ * foreign panel — rather than ending the call. It is empty far more often than
+ * not, and a caller that ignores it degrades to trying only the first: the
+ * behaviour before the chain existed.
+ *
+ * Each entry carries its OWN kind (#1600 gate round 3, finding 1). The caller
+ * renders a different explanation for an alias than for a foreign origin, and
+ * with more than one alias in the chain the position no longer implies which is
+ * which — deriving it from the index would silently mislabel the second spelling.
  */
+export type PanelFallbackCandidate = { origin: string; kind: "alias" | "use" };
+
 export type PanelFallbackChoice =
   | { kind: "none" }
   | { kind: "same"; origin: string }
-  | { kind: "alias"; origin: string; then: string[] }
+  | { kind: "alias"; origin: string; then: PanelFallbackCandidate[] }
   | { kind: "ambiguous"; origins: string[] }
-  | { kind: "use"; origin: string; then: string[] };
+  | { kind: "use"; origin: string; then: PanelFallbackCandidate[] };
 
 /** The host as #1175 compares it: lowercased, with the FQDN's trailing dot gone.
  *  undefined when the input does not parse — never "" , which would read as a
@@ -375,15 +383,27 @@ export function choosePanelFallbackOrigin(
   // third guess between them.
   //
   // Two aliases (`[::1]` and `localhost` both published) are not an ambiguity
-  // either: by the same rule they are one server, so the first is as good as the
-  // second.
-  const chain = [...aliases.slice(0, 1), ...(different.length === 1 ? different : [])];
-  if (chain.length > 0) {
-    return {
-      kind: aliases.length > 0 ? "alias" : "use",
-      origin: chain[0],
-      then: chain.slice(1),
-    };
+  // either: by the same rule they are one server, so there is no wrong one to
+  // pick between them.
+  //
+  // #1600 gate round 3, finding 3 — BUT THEY ARE NOT INTERCHANGEABLE. This kept
+  // only the first (`aliases.slice(0, 1)`) on the reasoning that one server means
+  // one answer. That is the very mistake this module fixed one level up: a
+  // canonical match is not a SOCKET match. With `localhost` configured and both
+  // `127.0.0.1` and `[::1]` published, a ComfyUI bound to IPv6 only leaves the
+  // first spelling refusing and the live address discarded before it was tried.
+  // Every distinct spelling is its own socket, so every one of them is a
+  // candidate — they are ordered, not filtered.
+  const chain: PanelFallbackCandidate[] = [
+    ...aliases.map((origin) => ({ origin, kind: "alias" as const })),
+    ...(different.length === 1 ? [{ origin: different[0], kind: "use" as const }] : []),
+  ];
+  const first = chain[0];
+  if (first !== undefined) {
+    const then = chain.slice(1);
+    return first.kind === "alias"
+      ? { kind: "alias", origin: first.origin, then }
+      : { kind: "use", origin: first.origin, then };
   }
   if (different.length > 1) return { kind: "ambiguous", origins: different };
   // `sameAs` is necessarily set here: the map is non-empty and nothing landed in

@@ -208,7 +208,10 @@ describe("choosePanelFallbackOrigin", () => {
     ).toEqual({
       kind: "alias",
       origin: "http://[::1]:8199",
-      then: ["http://192.168.1.50:8188"],
+      // Each candidate carries its OWN kind, so the caller does not infer it from
+      // the position — which stopped being sound once a chain could hold more
+      // than one alias (#1600 gate round 3, finding 3).
+      then: [{ origin: "http://192.168.1.50:8188", kind: "use" }],
     });
   });
 
@@ -1204,6 +1207,93 @@ describe('list_packs action:"list_templates" — panel fallback', () => {
     } finally {
       configuredBase = previous;
       await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  // ── #1600 merge gate, round 3 ──────────────────────────────────────────────
+
+  it("does NOT walk past an alias that ANSWERED and then failed", async () => {
+    // Finding 1. The walk continued on ANY rejection, so an alias whose
+    // connection was ESTABLISHED and then reset advanced to a foreign server —
+    // the exact move the PRIMARY path refuses to make. A reset proves a server IS
+    // there, and asking a different machine because we lost its answer is how one
+    // install's index gets reported as another's.
+    setConnectedPanelOrigins(() => ["http://[::1]:8199", "http://192.168.1.50:8188"]);
+    stubFetch(async (url) => {
+      if (url === CONFIGURED) throw transportFailure();
+      if (url.startsWith("http://[::1]:8199")) throw transportFailure("ECONNRESET", "read");
+      return jsonResponse({ "from-the-foreign-panel": [{ name: "x" }] });
+    });
+
+    const res = await handler()({ action: "list_templates" });
+
+    expect(res.isError).toBe(true);
+    const body = textOf(res);
+    expect(body).not.toContain("from-the-foreign-panel");
+    expect(body).not.toContain("answered_by");
+    expect(body).toContain("[::1]:8199");
+    // The foreign panel must never have been dialled at all.
+    expect(calls.map((c) => c.url)).not.toContain(
+      "http://192.168.1.50:8188/api/workflow_templates",
+    );
+  });
+
+  it("REFUSES a fallback body that is not a template index", async () => {
+    // Finding 2. `expectShape` accepted any non-array object, so a 200 carrying
+    // `{"error": "..."}` from an origin the user never configured was surfaced as
+    // a listing — source_count 1, the error object presented as templates. The
+    // whole design rests on a fallback body being CHECKED before it is believed.
+    setConnectedPanelOrigins(() => [PANEL_ORIGIN]);
+    stubFetch(async (url) => {
+      if (url === CONFIGURED) throw transportFailure();
+      return jsonResponse({ error: "not a template index" });
+    });
+
+    const res = await handler()({ action: "list_templates" });
+
+    expect(res.isError).toBe(true);
+    const body = textOf(res);
+    expect(body).not.toContain('"source_count": 1');
+    expect(body).not.toContain('"templates"');
+    expect(body).toContain(PANEL_ORIGIN);
+  });
+
+  it("keeps EVERY alias spelling in the chain", () => {
+    // Finding 3. `aliases.slice(0, 1)` threw away the other spellings — the same
+    // "a canonical match is not a socket match" mistake this PR fixed one level
+    // up. Two spellings of one server are two SOCKETS, and only one may answer.
+    expect(
+      choosePanelFallbackOrigin("http://localhost:8199/api/workflow_templates", [
+        "http://127.0.0.1:8199",
+        "http://[::1]:8199",
+      ]),
+    ).toEqual({
+      kind: "alias",
+      origin: "http://127.0.0.1:8199",
+      then: [{ origin: "http://[::1]:8199", kind: "alias" }],
+    });
+  });
+
+  it("tries a SECOND alias spelling when the first refuses", async () => {
+    // Finding 3, end to end: the live IPv6 address was never dialled.
+    const previous = configuredBase;
+    configuredBase = "http://localhost:8199";
+    try {
+      setConnectedPanelOrigins(() => ["http://127.0.0.1:8199", "http://[::1]:8199"]);
+      stubFetch(async (url) => {
+        if (url.startsWith("http://localhost:8199")) throw transportFailure();
+        if (url.startsWith("http://127.0.0.1:8199")) throw transportFailure();
+        return jsonResponse({ "from-the-v6-alias": [{ name: "t" }] });
+      });
+
+      const res = await handler()({ action: "list_templates" });
+
+      expect(res.isError).toBeFalsy();
+      const body = textOf(res);
+      expect(body).toContain("from-the-v6-alias");
+      expect(body).toContain('"answered_by": "http://[::1]:8199"');
+    } finally {
+      configuredBase = previous;
     }
   });
 

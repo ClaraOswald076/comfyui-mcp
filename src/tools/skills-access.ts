@@ -662,17 +662,22 @@ async function fetchTemplateIndexViaPanel(
   // WITHOUT that preference making the foreign panel unreachable; the two
   // single-choice orderings each cost one of those, and the gate found both.
   //
-  // Only a TRANSPORT failure continues the walk. A status, a redirect, or a body
-  // is an answer from the address we asked, and moving on from an answer is how a
-  // caller ends up reading one server's reply as another's.
-  const rest = choice.then;
+  // Only a NEVER-CONNECTED failure continues the walk (tightened by gate round 3,
+  // finding 1 — "any transport failure" let a reset on an ESTABLISHED connection
+  // advance). A status, a redirect, a body, or a connection that was accepted and
+  // then died is an answer from the address we asked, and moving on from an
+  // answer is how a caller ends up reading one server's reply as another's.
+  const chain = [{ origin: choice.origin, kind: choice.kind }, ...choice.then];
   const primaryText = primaryError instanceof Error ? primaryError.message : String(primaryError);
-  for (const [index, candidate] of [choice.origin, ...rest].entries()) {
-    const isLast = index === rest.length;
+  for (const [index, candidate] of chain.entries()) {
+    const isLast = index === chain.length - 1;
     try {
       return await askOnePanelOrigin({
-        origin: candidate,
-        kind: index === 0 ? choice.kind : "use",
+        origin: candidate.origin,
+        // Each candidate's OWN kind (#1600 gate round 3, finding 1). Deriving it
+        // from the position was right only while the chain held at most one
+        // alias; it now mislabels a second spelling as a foreign server.
+        kind: candidate.kind,
         primary: primaryText,
         ageMs: snapshot.ageMs,
       });
@@ -728,6 +733,17 @@ async function askOnePanelOrigin(opts: {
     });
   } catch (err) {
     const secondary = describeFetchFailure(err).message;
+    // #1600 gate round 3, finding 1 — DID ANYTHING ANSWER AT THIS ADDRESS?
+    //
+    // Every rejection used to become PanelOriginUnreachable, which licenses the
+    // caller to walk on to the next candidate. So an alias that ACCEPTED a
+    // connection and then reset — or failed its TLS handshake — sent the question
+    // to a foreign server, which is precisely the move the primary request
+    // refuses to make. A server that answered and then failed is evidence a
+    // ComfyUI is there; walking past it is how one install's index gets reported
+    // as another's, and the same predicate that guards the primary must guard
+    // each hop.
+    const neverConnected = mayAskAnotherServer(err, altUrl);
     // WHY BOTH ADDRESSES FAILED depends on which kind of address this was, and
     // saying the wrong one is a false mechanism claim (#1600 gate, finding 2).
     //
@@ -736,8 +752,16 @@ async function askOnePanelOrigin(opts: {
     // `127.0.0.1` are the same machine, and there is no tunnel or container
     // boundary between a host and itself. All that was learned there is that
     // neither spelling answered.
-    const why =
-      choice.kind === "alias"
+    //
+    // And when something DID answer there, neither sentence is true — so it gets
+    // its own, rather than one of these two asserting an empty address over a
+    // connection that was established.
+    const why = !neverConnected
+      ? `That address ACCEPTED a connection and the request then failed, so something is ` +
+        `serving it — this is not an empty address. No other server was asked, because a ` +
+        `reply that was lost is not the same as a server that is not there, and answering ` +
+        `from somewhere else would report one machine's templates as this one's.`
+      : choice.kind === "alias"
         ? `Both addresses name the same server under this project's loopback rules (#1175), ` +
           `reached by a different host spelling — an IPv4/IPv6 split is the usual reason one ` +
           `spelling answers when the other refuses. Neither answered here, so that is not what ` +
@@ -745,13 +769,14 @@ async function askOnePanelOrigin(opts: {
         : `A browser was connected from that origin, so it was reachable from there while this ` +
           `process cannot reach it: something between them (a tunnel, a container boundary, or a ` +
           `server bound to one interface) is in the way, and no address here will fix it.`;
-    throw new PanelOriginUnreachable(
-      new Error(
-        `${primary} I then tried ${altUrl}, published${observedAgo(snapshot.ageMs)} as the origin ` +
-          `of a connected sidebar panel, and that failed too: ${secondary}. ${why}`,
-        { cause: err },
-      ),
+    const reported = new Error(
+      `${primary} I then tried ${altUrl}, published${observedAgo(snapshot.ageMs)} as the origin ` +
+        `of a connected sidebar panel, and that failed too: ${secondary}. ${why}`,
+      { cause: err },
     );
+    // Only a NEVER-CONNECTED failure may continue the walk.
+    if (!neverConnected) throw reported;
+    throw new PanelOriginUnreachable(reported);
   }
   // A 3xx is a REFUSAL, not a hop. A ComfyUI serves the template index at this
   // path directly, so there is no reading of a redirect here that is safe to
@@ -926,6 +951,38 @@ async function listWorkflowTemplatesAction(): Promise<ToolText> {
     // of it are unchanged — only the text gains the attribution.
     err.message = `${err.message}${note}`;
     throw err;
+  }
+  // #1600 gate round 3, finding 2 — A FALLBACK BODY MUST BE PROVEN, NOT ASSUMED.
+  //
+  // `expectShape` above accepts any non-array object, which is the right bar for
+  // the CONFIGURED target: that is the user's own server, its contract predates
+  // this path, and tightening it here could reject a real ComfyUI over a shape
+  // detail this issue never measured. It is the wrong bar for an origin that came
+  // from a browser handshake rather than from configuration. A 200 carrying
+  // `{"error": "..."}` from whatever happens to be listening there was surfaced as
+  // a listing — source_count 1, the error object presented as templates — which is
+  // exactly the silently-wrong answer this whole path exists to avoid.
+  //
+  // The check is the shape the index actually has and that the count below
+  // already assumes: source name → ARRAY of templates. An empty object stays
+  // valid, because a ComfyUI with no templates is a real answer (#1454).
+  if (answeredByPanelOrigin && !Object.values(index).every((v) => Array.isArray(v))) {
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text" as const,
+          text:
+            `The configured ComfyUI (${configuredUrl}) could not be reached, so I asked ` +
+            `${answeredByPanelOrigin} — published${observedAgo(panelOriginAgeMs)} as the origin of ` +
+            `a connected sidebar panel — and it answered ${res.status} with JSON that is NOT a ` +
+            `template index: ${bodyPrefixOf(JSON.stringify(index))}. A template index maps each ` +
+            `source to an ARRAY of templates. Something is serving that address, but it did not ` +
+            `answer this question, so nothing here is reported as a listing. Point COMFYUI_URL at ` +
+            `the ComfyUI you mean.`,
+        },
+      ],
+    };
   }
   const groups = Object.keys(index);
   const total = Object.values(index).reduce<number>(
