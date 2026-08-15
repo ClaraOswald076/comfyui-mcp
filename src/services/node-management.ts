@@ -4148,9 +4148,9 @@ export interface NormalizedGitUrlInstallArgs extends GitUrlInstallArgs {
  *     — ManagerChannel.dev, ManagerDatabaseSource.remote
  *
  * Manager v4's do_install resolves a pack by its registry ID, never by URL (the
- * 3.x `files:[url]` clone path does not exist there), so on a v4 host an
- * unregistered repository has NO Manager route by any spelling. The panel cannot
- * clone either — it is browser JS.
+ * 3.x `files:[url]` clone path does not exist there), so a repository the resolved
+ * LIST does not carry has no Manager route. The panel cannot clone either — it is
+ * browser JS.
  *
  * `install_custom_node` can: it tries the Manager first and then clones the URL
  * directly into custom_nodes, verifying the result is a real pack. That is the
@@ -4161,14 +4161,55 @@ export interface NormalizedGitUrlInstallArgs extends GitUrlInstallArgs {
  * the panel and matching on it would be brittle, and an agent that reads this
  * when the install is queued needs one fewer round trip than one that reads it
  * after the queue drains.
+ *
+ * #1539 GATE ROUND 2 — THIS CONTRADICTED THE NOTE IT SHIPS ALONGSIDE. It said a
+ * not-found means "the pack is not in the Manager's registry at all ... NO Manager
+ * route, by any spelling", and then the channel note appended right after it said the
+ * miss rules out ONE channel and to retry with another. Both reached the caller in the
+ * same reply, and the first one sends a pack that IS remotely installable — the
+ * reporter's own, which is listed in `default` — down the local-only clone path. That
+ * is the same over-claim this branch retracted from the tool description, surviving one
+ * layer down because the description test could not see a runtime string.
+ *
+ * WHAT A NOT-FOUND ACTUALLY MEANS, read out of V4.2.2 rather than inferred. The lookup
+ * resolves against ONE list, chosen by channel, and which file that is depends on how
+ * the Manager was installed:
+ *
+ *   * `get_data_by_mode` takes an OFFLINE branch when `network_mode == 'offline'` OR
+ *     `is_manager_pip_package()` — the latter being simply "the Manager is not inside a
+ *     custom_nodes tree", i.e. every pip/Desktop install. That branch reads the cache
+ *     file for that exact channel URL, else the snapshot BUNDLED in the package, and
+ *     never fetches. So on a pip host `mode` is inert and a channel name only reaches a
+ *     real list if a cache for its URL happens to exist.
+ *   * Measured on this rig: the only cache present is for `DEFAULT_CHANNEL`
+ *     (`ltdrdata/ComfyUI-Manager`), written at startup by `default_cache_update()` —
+ *     while the channel NAME "default" normalizes through `channels.list` to
+ *     `Comfy-Org/ComfyUI-Manager`, which hashes to a different cache file that does not
+ *     exist. So a pip host serves the bundled snapshot (3587 packs), and the reporter's
+ *     pack is NOT in it (checked directly).
+ *   * A Manager cloned into custom_nodes takes the public branch and FETCHES the
+ *     channel URL, where `default` carries 5891 packs including the reporter's.
+ *
+ * So the channel fix is a strict improvement on a cloned Manager and a NO-OP on a pip
+ * one (there, old `dev` and new `default` both land on the same bundled file) — it
+ * cannot make any host worse. The earlier note attributed the pip fallback to "a host
+ * configured to a non-default channel URL"; that was wrong, the trigger is the pip
+ * packaging, not the configuration.
+ *
+ * The text below therefore stops declaring the registry empty of the pack, names both
+ * causes it could actually be, and puts the retry that CAN succeed before the local
+ * clone that ends the road.
  */
 function unregisteredPackEscapeHatch(): string {
   return (
-    `If this comes back "not found" / "not available node", the pack is not in the ` +
-    `Manager's registry at all — on Manager v4 that leaves NO Manager route for a ` +
-    `repository URL, by any spelling. Use install_custom_node (source:"git") instead: ` +
-    `it clones the URL directly into custom_nodes and verifies a real pack landed. ` +
-    `Requires a LOCAL ComfyUI, since the clone writes to its filesystem.`
+    `If this comes back "not found" / "not available node", that is one LIST saying no, ` +
+    `not the Manager's whole registry: v4 resolves against a single channel's node list, ` +
+    `and on a pip-installed Manager it reads a bundled snapshot rather than fetching. So ` +
+    `try an explicit \`channel\` first (the pack may simply live on another one), and if ` +
+    `the plausible channels are ruled out, use install_custom_node (source:"git"): it ` +
+    `clones the URL directly into custom_nodes and verifies a real pack landed. That one ` +
+    `requires a LOCAL ComfyUI, since the clone writes to its filesystem — which need not ` +
+    `be the ComfyUI this panel drives.`
   );
 }
 
@@ -4250,20 +4291,29 @@ export function normalizeGitUrlInstallArgs(
  * `Node '<name>@nightly' not found in [ManagerChannel.<ch>, ManagerDatabaseSource.<mode>]`,
  * naming the channel THIS argument chose.
  *
- * WHAT THIS DOES NOT CLAIM. Not that `default` always resolves. On a pip Manager v4
- * `manager_util.is_manager_pip_package()` is true, which sends `get_data_by_mode`
- * down its offline branch unconditionally — it reads the cache file for that exact
- * channel URL, else the snapshot bundled in the package, and never fetches, so
- * `mode` is inert there. A host whose configured `channel_url` is not the default
- * one therefore has no cache for `default` either and falls back to the bundled
- * list. That was measured too: on a rig configured to a custom channel URL, the
- * reporter's pack resolved from NEITHER `dev` nor `default` (the server log shows
- * both reads landing on `site-packages/comfyui_manager/custom-node-list.json`),
- * even though that same rig's own cached list — the one its search reads — contains
- * the pack. Fixing that needs the Manager to be asked for the channel the USER
- * configured, which v4.2.2 gives no way to name (`channel: null` makes
- * `load_nightly` return `{}` outright), so it is out of reach from here and is not
- * claimed to be fixed.
+ * WHAT THIS DOES NOT CLAIM. Not that `default` always resolves — and gate round 2
+ * corrected WHY. On a pip Manager v4 `manager_util.is_manager_pip_package()` is true,
+ * which sends `get_data_by_mode` down its offline branch unconditionally — it reads the
+ * cache file for that exact channel URL, else the snapshot bundled in the package, and
+ * never fetches, so `mode` is inert there. The earlier wording blamed "a host configured
+ * to a non-default channel URL"; that is not the trigger. `is_manager_pip_package()` is
+ * simply "the Manager is not inside a custom_nodes tree", so it is true of every
+ * pip/Desktop install regardless of configuration, and the caches a stock host actually
+ * holds do not line up with the channel NAMES: `default_cache_update()` writes the cache
+ * for `DEFAULT_CHANNEL` (`ltdrdata/ComfyUI-Manager`) at startup, while the name
+ * "default" normalizes through `channels.list` to `Comfy-Org/ComfyUI-Manager` — a
+ * different URL, so a different cache file, which does not exist. Measured on this rig:
+ * the cache directory holds exactly one node list, hashed from the ltdrdata URL, and the
+ * bundled snapshot it therefore falls back to (3587 packs) does NOT contain the
+ * reporter's pack.
+ *
+ * So the honest split is by PACKAGING, not by configuration: on a Manager cloned into
+ * custom_nodes this reaches the real 5891-pack list and fixes the report; on a pip
+ * Manager old `dev` and new `default` both land on the same bundled file, so the change
+ * is a no-op there rather than an improvement. It cannot make any host worse. Reaching
+ * the pip case would need the Manager to be asked for the channel the USER configured,
+ * which v4.2.2 gives no way to name (`channel: null` makes `load_nightly` return `{}`
+ * outright), so it is out of reach from here and is not claimed to be fixed.
  *
  * What IS established is narrower and still worth shipping: `dev` is the wrong
  * question for every host, `default` is the right one for a host on the stock

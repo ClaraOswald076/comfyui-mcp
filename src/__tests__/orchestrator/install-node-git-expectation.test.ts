@@ -307,6 +307,32 @@ describe("the FIRST attempt's wrong-author risk is disclosed too (#1539 gate rou
     );
   });
 
+  it("THE NOTE DOES NOT CONTRADICT ITSELF — no 'absent from the whole registry' claim", () => {
+    // Gate round 2, and the sharpest of its findings: the escape hatch rides the SAME
+    // reply as the channel note, and said a not-found means the pack "is not in the
+    // Manager's registry at all ... NO Manager route, by any spelling" — while the note
+    // appended right after it said the miss rules out one channel and to retry another.
+    // Two mutually exclusive conclusions in one message, and the first one sends a pack
+    // that IS remotely installable (the reporter's own) down the local-only clone path.
+    // The description test could not catch this: it reads the tool blurb, not the note.
+    const note = nodesInstallCommandArgs({ repository: REPORTED_URL }).note ?? "";
+    expect(note).not.toMatch(/not in the Manager's registry at all/i);
+    expect(note).not.toMatch(/NO Manager route/i);
+    expect(note).toMatch(/one LIST saying no, not the Manager's whole registry/i);
+  });
+
+  it("orders the recovery so the retry that CAN work comes before the local clone", () => {
+    const note = nodesInstallCommandArgs({ repository: REPORTED_URL }).note ?? "";
+    const retryAt = note.search(/try an explicit `channel` first/i);
+    const cloneAt = note.search(/install_custom_node \(source:"git"\)/);
+    expect(retryAt).toBeGreaterThanOrEqual(0);
+    expect(cloneAt).toBeGreaterThan(retryAt);
+    // And the local-only precondition survives the rewrite — install_custom_node writes
+    // to the ORCHESTRATOR's filesystem, which need not be the panel's ComfyUI.
+    expect(note).toMatch(/LOCAL ComfyUI/);
+    expect(note).toMatch(/need not be the ComfyUI this panel drives/i);
+  });
+
   it("REACHES THE CALLER — asserted on the tool's returned text, not the args", async () => {
     const cmd = await dispatchInstall({ repository: COLLIDING });
     expect(cmd.sent.channel).toBe("default");
@@ -376,9 +402,23 @@ describe("panel_install_node describes what was measured (#1539)", () => {
     // the opposite direction. Both limits that were measured have to survive.
     const text = installNodeDef().description ?? "";
     expect(text).toMatch(/STILL NOT GUARANTEED/);
-    expect(text).toMatch(/non-default channel URL still resolves from that stale bundled list/i);
     expect(text).toMatch(/`mode` is inert/i);
     expect(text).toMatch(/not measured/i);
+  });
+
+  it("attributes the pip fallback to PACKAGING, not to the channel config (gate round 2)", () => {
+    // The shipped caveat said the bundled-snapshot fallback hits "a host configured to a
+    // non-default channel URL". Measured false: `is_manager_pip_package()` is just "not
+    // inside a custom_nodes tree", so it fires on every pip/Desktop install whatever the
+    // config — and a stock host's one startup-written cache is for a DIFFERENT URL than
+    // the name 'default' resolves to. Blaming the configuration would send a reader to
+    // check a setting that is not the cause.
+    const text = installNodeDef().description ?? "";
+    expect(text).not.toMatch(/host configured to a non-default channel URL/i);
+    expect(text).toMatch(/not inside a custom_nodes tree/i);
+    expect(text).toMatch(/cloned into custom_nodes fetches/i);
+    // And it must not claim the pip host is fixed — there it is a no-op, not a win.
+    expect(text).toMatch(/both land on that same file/i);
   });
 
   it("does NOT turn a one-channel miss into a verdict about the pack (review P1)", () => {
