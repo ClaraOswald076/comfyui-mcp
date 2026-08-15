@@ -226,6 +226,33 @@ describe("panel_run reconciles a late graph_run acknowledgement (#1175)", () => 
     expect(text).toContain("[RECOVERED]");
   });
 
+  it("a run that answers ON TIME pays nothing for the grace", async () => {
+    // The gate that makes this true is one clause — `isReplyTimeoutResult(res)` —
+    // and deleting it kept every other test in this file green while making EVERY
+    // healthy run wait out the full grace before returning. The grace has no
+    // observable effect on a success other than the wall clock, so the wall clock
+    // is what has to be asserted.
+    //
+    // Measured monotonically: a suite-wide clock change (or a machine whose wall
+    // clock steps) must not be readable as the reconcile having fired.
+    const sock = await connectPanel("tab-on-time");
+    const panel = scriptRunPanel(sock, { queued: true, prompt_id: "p-on-time" }, 0);
+    // A bound the panel comfortably beats, and a grace far larger than it — so
+    // "did this pay the grace?" is unambiguous in the elapsed time.
+    const ctx = fastCtx("tab-on-time", 5_000);
+    __panelToolsTestHooks.setRunLateAckGraceMs(4_000);
+
+    const startedAt = performance.now();
+    const res = await panelRun().handler({}, ctx);
+    const elapsedMs = performance.now() - startedAt;
+
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toContain("p-on-time");
+    expect(textOf(res)).not.toContain("[RECOVERED]");
+    expect(panel.rids).toHaveLength(1);
+    expect(elapsedMs, "an on-time run waited out the late-ack grace").toBeLessThan(2_000);
+  });
+
   it("a run that NEVER answers is reported exactly as it is today", async () => {
     // The over-fire guard. Reconciling must not invent an outcome for a tab that
     // simply never replied — that caller is still owed the honest unknown and
