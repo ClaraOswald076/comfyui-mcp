@@ -64,10 +64,10 @@
  *    could never happen. Closing it needs the registry's repo->id map mirrored here, and
  *    the hazard is NOT confined to these 111 names — any pack whose entry is re-keyed and
  *    whose bare name matches someone else's registry id is exposed, which makes it a
- *    wider bug than the channel collision this module was split out to prevent. Tracked
- *    separately rather than half-fixed for an arbitrary 111 names. What is true here is
- *    only this: nothing below makes that case worse than it already is, and the standing
- *    substitution warning still rides the exempted call.
+ *    wider bug than the channel collision this module was split out to prevent. Filed as
+ *    #1624 with this reproduction, rather than half-fixed for an arbitrary 111 names.
+ *    What is true here is only this: nothing below makes that case worse than it already
+ *    is, and `contestedNameCaveat` states the gap on the call it exempts.
  *
  *  * A pip-installed Manager. `get_data_by_mode` reads the cache file for the configured
  *    channel URL, else the snapshot BUNDLED in the package — a stale, default-flavoured
