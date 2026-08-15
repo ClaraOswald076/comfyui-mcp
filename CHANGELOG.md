@@ -745,6 +745,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.53] - 2026-08-15
+
+### MCP
+
+#### Fixed
+- bound the images a run completion attaches to an agent turn (#1516)
+- account for the unnamed outputs the counts already include
+- the drain CORRECTS the claim, rather than only enforcing the number
+- the preview budget is per TURN — a per-event cap was not a cap
+
 ## [0.51.52] - 2026-08-14
 
 ### MCP
