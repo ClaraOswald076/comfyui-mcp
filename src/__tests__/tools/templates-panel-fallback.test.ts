@@ -15,6 +15,9 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 vi.mock("../../config.js", () => ({
   // json-guard's credential redaction reads these three off `config`.
@@ -27,6 +30,7 @@ vi.mock("../../config.js", () => ({
 
 import { registerSkillsAccessTools } from "../../tools/skills-access.js";
 import { setConnectedPanelOrigins } from "../../comfyui/fetch.js";
+import { PANEL_ORIGINS_FILE } from "../../services/panel-origin-channel.js";
 import {
   choosePanelFallbackOrigin,
   describeDeclinedPanelFallback,
@@ -297,6 +301,39 @@ describe('list_packs action:"list_templates" — panel fallback', () => {
     const body = textOf(res);
     expect(body).toContain(PANEL_URL);
     expect(body).toContain("NOT your configured ComfyUI");
+  });
+
+  it("reaches the fallback in the SPAWNED CHILD, with no injected source at all", async () => {
+    // REACHABILITY, not behaviour. Every test above installs the origin source by
+    // hand, which is the ORCHESTRATOR's shape — and the reporter's failure happens
+    // in the spawned stdio child, which never loads orchestrator/index.js and has
+    // no bridge to inject from. The only thing it has is the file #1553 publishes
+    // into the progress dir it shares with its parent. If this path did not reach
+    // the fallback, every assertion above would still pass and the fix would ship
+    // dead for the process that needs it.
+    const dir = mkdtempSync(join(tmpdir(), "panel-origins-"));
+    try {
+      writeFileSync(
+        join(dir, PANEL_ORIGINS_FILE),
+        JSON.stringify({ origins: [PANEL_ORIGIN], updated: Date.now(), pid: process.pid }),
+      );
+      vi.stubEnv("COMFYUI_MCP_PROGRESS_DIR", dir);
+      // Deliberately NOT installed: this is the child.
+      setConnectedPanelOrigins(null);
+      stubFetch(async (url) => {
+        if (url === CONFIGURED) throw transportFailure();
+        return jsonResponse({ "from-the-channel": [{ name: "t" }] });
+      });
+
+      const res = await handler()({ action: "list_templates" });
+
+      expect(res.isError).toBeFalsy();
+      expect(textOf(res)).toContain(`"answered_by": "${PANEL_ORIGIN}"`);
+      expect(calls.map((c) => c.url)).toEqual([CONFIGURED, PANEL_URL]);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("passes the configured target through untouched when it works", async () => {
