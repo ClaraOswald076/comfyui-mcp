@@ -76,7 +76,14 @@ const slugify = (heading) =>
     .replace(/^#{1,6}\s+/, '')
     .trim()
     .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s-]/gu, '')
+    // \p{M} — COMBINING MARKS — are kept. They are not decoration: in Arabic, Hebrew, and the
+    // Indic scripts a mark is part of the word. Dropping them is a Latin-centric assumption,
+    // and it fired the moment a non-Latin locale arrived: the Arabic heading
+    // "3. تشغيل منسّق اللوحة" contains a shadda (U+0651, category Mn), so this slugified to
+    // ...منسق while the link written beside it kept the mark, and the gate reported a correct
+    // cross-page anchor as broken. Excluding marks here would have pushed a translator to
+    // "fix" the prose instead.
+    .replace(/[^\p{L}\p{N}\p{M}\s-]/gu, '')
     // Each space becomes its own hyphen — runs are NOT collapsed. "readiness & onboarding"
     // loses the ampersand and keeps both surrounding spaces, so Mintlify emits
     // `readiness--onboarding` with two hyphens. Collapsing here reported two correct,
