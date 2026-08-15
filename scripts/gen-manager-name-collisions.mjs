@@ -114,6 +114,77 @@ const ambiguous = [...byName.entries()]
 const intra = ambiguous.filter(([, per]) => Object.values(per).some((r) => r.length > 1)).length;
 process.stderr.write(`\nambiguous bare names: ${ambiguous.length} (${intra} ambiguous inside a single channel)\n`);
 
+/**
+ * THE COMFY REGISTRY, because a channel entry is not always reachable by the bare name.
+ *
+ * `get_custom_nodes` keys an entry by its CNR id whenever the repo is registered, and only
+ * falls back to the file's basename when it is not:
+ *
+ *   cnr = self.get_cnr_by_repo(v['files'][0])
+ *   if cnr: v['id'] = cnr['id']; node_id = v['id']
+ *   else:   node_id = v['files'][0].split('/')[-1]
+ *   res[node_id] = v
+ *
+ * So a repo registered under an id OTHER than its own name disappears from the bare-name
+ * keyspace, `install_by_id` misses, and the nightly path falls back to `cnr_map[name]` —
+ * a DIFFERENT publisher's pack. Without this table the guard exempts exactly that case,
+ * because the channel does list the caller's repo; it just cannot be reached by name.
+ *
+ * `repo_cnr_map` is a plain dict keyed by `git_utils.normalize_url` — which for a github
+ * URL is `https://github.com/{author}/{repo}` with case PRESERVED — so the match is
+ * case-sensitive and is done that way here. `cnr_map`, by contrast, is a NormalizedKeyDict
+ * whose `get` lowercases, which is why the id side is folded.
+ */
+async function registryMaps() {
+  const repoToId = new Map(); // "Owner/Repo" (case-sensitive) -> cnr id
+  const idToRepo = new Map(); // lowercased cnr id -> "Owner/Repo"
+  let page = 1;
+  let totalPages = 1;
+  do {
+    const res = await fetch(`https://api.comfy.org/nodes?page=${page}&limit=100`);
+    if (!res.ok) throw new Error(`registry page ${page}: HTTP ${res.status}`);
+    const j = await res.json();
+    totalPages = j.totalPages ?? 1;
+    for (const n of j.nodes ?? []) {
+      if (!n.id) continue;
+      const repo = n.repository ? ownerRepo(n.repository) : null;
+      if (repo) {
+        repoToId.set(repo, String(n.id));
+        idToRepo.set(String(n.id).trim().toLowerCase(), repo);
+      }
+    }
+    if (page % 10 === 0 || page === totalPages) {
+      process.stderr.write(`  registry page ${page}/${totalPages}\n`);
+    }
+    page++;
+  } while (page <= totalPages);
+  return { repoToId, idToRepo };
+}
+
+process.stderr.write(`\nfetching the Comfy Registry (for CNR re-keying)…\n`);
+const { repoToId, idToRepo } = await registryMaps();
+process.stderr.write(`registry: ${repoToId.size} repositories, ${idToRepo.size} ids\n`);
+
+// A candidate is UNREACHABLE by the bare name when it is registered under a different id.
+const rekeyed = {};
+const registryTargets = {};
+for (const [name, per] of ambiguous) {
+  const lost = [];
+  for (const repos of Object.values(per)) {
+    for (const r of repos) {
+      const id = repoToId.get(r);
+      if (id !== undefined && id.trim().toLowerCase() !== name) lost.push(r);
+    }
+  }
+  if (lost.length) rekeyed[name] = [...new Set(lost)].sort();
+  const target = idToRepo.get(name);
+  if (target) registryTargets[name] = target;
+}
+process.stderr.write(
+  `re-keyed candidates: ${Object.values(rekeyed).flat().length} across ${Object.keys(rekeyed).length} names; ` +
+    `${Object.keys(registryTargets).length} names have a registry pack of their own name\n`,
+);
+
 const measured = new Date().toISOString().slice(0, 10);
 const body = ambiguous
   .map(([name, per]) => {
@@ -148,6 +219,30 @@ export const AMBIGUOUS_BARE_NAMES: Readonly<
   Record<string, Readonly<Partial<Record<ManagerChannelName, readonly string[]>>>>
 > = {
 ${body}
+};
+
+//
+// Candidates above that a BARE-NAME lookup cannot reach, because ComfyUI-Manager keys a
+// channel entry by its Comfy Registry id when the repo is registered (get_custom_nodes:
+// \`if cnr: node_id = v['id']\`). A name whose only listed repo is in here resolves through
+// the registry instead of through the channel, so "the channel lists exactly your repo" is
+// NOT on its own a reason to let the install through.
+export const REKEYED_REPOS: Readonly<Record<string, readonly string[]>> = {
+${Object.entries(rekeyed)
+  .sort((a, b) => a[0].localeCompare(b[0]))
+  .map(([n, repos]) => `  ${JSON.stringify(n)}: [${repos.map((r) => JSON.stringify(r)).join(", ")}],`)
+  .join("\n")}
+};
+
+//
+// What \`cnr_map[<bare name>]\` resolves to — the repository Manager clones when the channel
+// lookup misses and the registry holds that id (install_by_id's nightly fallback). This is
+// the repo a caller actually gets in that case, so the refusal can name it outright.
+export const REGISTRY_TARGETS: Readonly<Record<string, string>> = {
+${Object.entries(registryTargets)
+  .sort((a, b) => a[0].localeCompare(b[0]))
+  .map(([n, repo]) => `  ${JSON.stringify(n)}: ${JSON.stringify(repo)},`)
+  .join("\n")}
 };
 
 /** When AMBIGUOUS_BARE_NAMES was measured, for the refusal to cite. */

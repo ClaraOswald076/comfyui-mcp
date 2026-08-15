@@ -43,6 +43,7 @@ import {
   gitHostOf,
   managerBareName,
   ownerRepoOf,
+  REKEYED_REPOS,
 } from "../../services/manager-bare-name-collisions.js";
 
 vi.mock("../../comfyui/client.js", () => ({
@@ -60,10 +61,28 @@ const TAB = "11111111-2222-3333-4444-555555555555";
 
 // `ComfyUI-BiRefNet` is three different authors' repository depending on the channel:
 // default -> hieuck, dev -> MohammadAboulEla, legacy -> viperyl.
+//
+// GATE ROUND 8 — AND NONE OF THEM IS REACHABLE BY THAT NAME ON `default`. hieuck's repo is
+// registered in the Comfy Registry as id `viperyl_ComfyUI-BiRefNet`, so `get_custom_nodes`
+// keys default's entry by THAT and a lookup for "ComfyUI-BiRefNet" misses; the nightly
+// fallback then resolves cnr_map["comfyui-birefnet"], which is viperyl's repo. So every
+// BiRefNet spelling here is a CNR-FALLBACK case, including the one this file used to call
+// the safe one — that example was itself a wrong install, which is why it moved.
 const DEV_AUTHORS = "https://github.com/mohammadaboulela/ComfyUI-BiRefNet";
 const DEFAULT_AUTHORS = "https://github.com/hieuck/ComfyUI-BiRefNet";
 /** The reporter's pack from #1539 — a git URL whose name the snapshot has NOT seen collide. */
 const UNCOLLIDING = "https://github.com/Wenaka2004/comfyui-anima-ipadapter";
+
+// A CROSS-CHANNEL collision whose entries Manager can actually reach by name: `default`
+// resolves `ComfyUI_TiledKSampler` to BlenderNeko's and `forked` to ltdrdata's, and neither
+// is re-keyed. This is the pair that exercises "refuse the other author, allow the one the
+// channel really does resolve to" without a registry fallback confusing the picture.
+const REACHABLE_DEFAULT = "https://github.com/BlenderNeko/ComfyUI_TiledKSampler";
+const REACHABLE_OTHER = "https://github.com/ltdrdata/ComfyUI_TiledKSampler";
+// An INTRA-channel collision with both entries reachable: `default` alone lists
+// `ComfyUI-Bagel` twice, differing only in case, so no `channel` argument can separate them.
+const INTRA_A = "https://github.com/Yuan-ManX/ComfyUI-Bagel";
+const INTRA_B = "https://github.com/neverbiasu/ComfyUI-BAGEL";
 
 function installNodeDef() {
   const def = buildPanelToolDefs().find((d) => d.name === "panel_install_node");
@@ -141,14 +160,22 @@ describe("the ambiguous from-source install is refused, not picked (#1616)", () 
     expect(conflict).toMatch(/measured 20\d\d-\d\d-\d\d/);
   });
 
-  it("ALLOWS the caller who named the repository the asked-for channel carries", () => {
-    // The same colliding NAME, the other author: `default` carries hieuck's, so there is
-    // nothing to pick between. A guard that fired on the name alone would break every
-    // correct install of a colliding pack — most of the 111 have a `default` entry.
-    const out = nodesInstallCommandArgs({ repository: DEFAULT_AUTHORS });
+  it("ALLOWS the caller who named the repository the asked-for channel RESOLVES to", () => {
+    // The same colliding NAME, the other author: `default` resolves ComfyUI_TiledKSampler
+    // to BlenderNeko's and that entry is reachable by the name, so there is nothing to
+    // pick between. A guard that fired on the name alone would break every correct install
+    // of a colliding pack — 74 of the 111 have exactly one reachable `default` entry.
+    const out = nodesInstallCommandArgs({ repository: REACHABLE_DEFAULT });
     expect(out.conflict).toBeUndefined();
     expect(out.channel).toBe("default");
-    expect(out.repository).toBe(DEFAULT_AUTHORS);
+    expect(out.repository).toBe(REACHABLE_DEFAULT);
+  });
+
+  it("refuses the OTHER author of that same reachable pair, and names the channel that has them", () => {
+    const conflict = nodesInstallCommandArgs({ repository: REACHABLE_OTHER }).conflict ?? "";
+    expect(conflict).toMatch(/BlenderNeko\/ComfyUI_TiledKSampler/);
+    expect(conflict).toMatch(/ltdrdata\/ComfyUI_TiledKSampler/);
+    expect(conflict).toMatch(/channel:"forked"/);
   });
 
   it("an EXPLICIT channel dispatches — and names the collision instead of refusing", () => {
@@ -173,15 +200,13 @@ describe("the ambiguous from-source install is refused, not picked (#1616)", () 
   });
 
   it("catches the name that is ambiguous INSIDE one channel, with no second channel", () => {
-    // 28 names collapse two entries onto one key, where the survivor is list order.
-    // `default` lists BOTH Zuellni/ComfyUI-Custom-Nodes and rcsaquino/comfyui-custom-nodes
-    // (a case variant), so asking it for that name cannot be answered.
-    const conflict =
-      nodesInstallCommandArgs({ repository: "https://github.com/Zuellni/ComfyUI-Custom-Nodes" })
-        .conflict ?? "";
+    // Names that collapse two entries onto one key, where the survivor is list order.
+    // `default` lists BOTH Yuan-ManX/ComfyUI-Bagel and neverbiasu/ComfyUI-BAGEL (a case
+    // variant), and BOTH are reachable by the name, so asking it cannot be answered.
+    const conflict = nodesInstallCommandArgs({ repository: INTRA_A }).conflict ?? "";
     expect(conflict).toMatch(/carries that name TWICE/i);
-    expect(conflict).toMatch(/Zuellni\/ComfyUI-Custom-Nodes/);
-    expect(conflict).toMatch(/rcsaquino\/comfyui-custom-nodes/);
+    expect(conflict).toMatch(/Yuan-ManX\/ComfyUI-Bagel/);
+    expect(conflict).toMatch(/neverbiasu\/ComfyUI-BAGEL/);
   });
 
   it("catches the EXACT-CASE duplicate too, which Manager drops before anyone sees it", () => {
@@ -189,14 +214,16 @@ describe("the ambiguous from-source install is refused, not picked (#1616)", () 
     // two entries whose bare names match EXACTLY overwrite — one of them is gone before
     // `NormalizedKeyDict` is involved at all. The first shape of the generator modelled
     // that overwrite and so recorded only the survivor, which made the name look unique
-    // and the guard never fire: `default` carries both 1038lab/ComfyUI-Pollinations and
-    // ciga2011/ComfyUI-Pollinations, and asking for either one could get the other.
+    // and the guard never fire: `default` carries both DrkSun81/ComfyUI-FilterLoRATriggers
+    // and Unitas81/ComfyUI-FilterLoRATriggers under an identical spelling, and asking for
+    // either one could get the other.
     const conflict =
-      nodesInstallCommandArgs({ repository: "https://github.com/1038lab/ComfyUI-Pollinations" })
-        .conflict ?? "";
+      nodesInstallCommandArgs({
+        repository: "https://github.com/DrkSun81/ComfyUI-FilterLoRATriggers",
+      }).conflict ?? "";
     expect(conflict).toMatch(/carries that name TWICE/i);
-    expect(conflict).toMatch(/1038lab\/ComfyUI-Pollinations/);
-    expect(conflict).toMatch(/ciga2011\/ComfyUI-Pollinations/);
+    expect(conflict).toMatch(/DrkSun81\/ComfyUI-FilterLoRATriggers/);
+    expect(conflict).toMatch(/Unitas81\/ComfyUI-FilterLoRATriggers/);
   });
 
   it("does NOT read an off-host URL as a match for the GitHub repo of the same path", () => {
@@ -234,13 +261,12 @@ describe("the ambiguous from-source install is refused, not picked (#1616)", () 
     // told EVERY caller that "naming any `channel` explicitly makes the choice yours and
     // bypasses it" — including the ones it had just told, one sentence earlier, that no
     // channel resolves the name to their repository. Following the last thing they read
-    // (`channel:"default"`) dispatches and installs ciga2011's code as a success. That is
+    // (`channel:"default"`) dispatches and installs neverbiasu's code as a success. That is
     // the exact install this guard exists to prevent, reached through the guard's own
     // advice. Measured: all 65 repositories trapped inside a multi-candidate channel have
     // NO uniquely-resolving channel, so the sentence was wrong for every one of them.
     const conflict =
-      nodesInstallCommandArgs({ repository: "https://github.com/1038lab/ComfyUI-Pollinations" })
-        .conflict ?? "";
+      nodesInstallCommandArgs({ repository: INTRA_A }).conflict ?? "";
     expect(conflict).toMatch(/No channel in the snapshot resolves/);
     expect(conflict).not.toMatch(/makes the choice yours/);
     expect(conflict).toMatch(/do not read that as the remedy here/i);
@@ -279,12 +305,12 @@ describe("the ambiguous from-source install is refused, not picked (#1616)", () 
   });
 
   it("the NAMED-channel warning does not claim a choice the caller could not make", () => {
-    // GATE ROUND 2. `default` carries ComfyUI-Pollinations twice, so `channel:"default"`
+    // GATE ROUND 2. `default` carries ComfyUI-Bagel twice, so `channel:"default"`
     // selected nothing — both entries are in the list they named and v4 falls back on
     // upstream list order. "Dispatched anyway because you chose the channel" invites them
     // to trust an install they never aimed.
     const out = nodesInstallCommandArgs({
-      repository: "https://github.com/1038lab/ComfyUI-Pollinations",
+      repository: INTRA_A,
       channel: "default",
     });
     expect(out.conflict).toBeUndefined(); // still dispatches — the escape must survive
@@ -332,10 +358,10 @@ describe("the ambiguous from-source install is refused, not picked (#1616)", () 
   it("the from-source spellings are NOT diverted to the registry refusal", () => {
     // "nightly" and "unknown" are the two specs that DO consult the channel, and an
     // omitted/"latest" version normalizes to "nightly". Those must keep the channel-based
-    // reasoning: hieuck on `default` stays allowed, mohammadaboulela stays refused with
-    // the CHANNEL explanation rather than the registry one.
+    // reasoning: BlenderNeko on `default` stays allowed, mohammadaboulela stays refused
+    // with the CHANNEL explanation rather than the registry one.
     for (const version of [undefined, "latest", "nightly", "unknown"]) {
-      const allowed = nodesInstallCommandArgs({ repository: DEFAULT_AUTHORS, ...(version ? { version } : {}) });
+      const allowed = nodesInstallCommandArgs({ repository: REACHABLE_DEFAULT, ...(version ? { version } : {}) });
       expect(allowed.conflict, `allowed @ ${String(version)}`).toBeUndefined();
       const refused = nodesInstallCommandArgs({ repository: DEV_AUTHORS, ...(version ? { version } : {}) });
       expect(refused.conflict, `refused @ ${String(version)}`).toMatch(/BARE REPO NAME/);
@@ -436,7 +462,7 @@ describe("the ambiguous from-source install is refused, not picked (#1616)", () 
   });
 
   it("STILL DISPATCHES the allowed one, so the guard is not a blanket block", async () => {
-    const out = await attemptInstall({ repository: DEFAULT_AUTHORS });
+    const out = await attemptInstall({ repository: REACHABLE_DEFAULT });
     expect(out.isError).toBe(false);
     expect(out.sent?.cmd).toBe("nodes_install");
     expect(out.sent?.channel).toBe("default");
@@ -545,16 +571,12 @@ describe("the snapshot and its predicate (#1616)", () => {
     expect(amb).toBeTruthy();
     expect(amb?.resolvedVia).toBe("cnr-fallback");
     expect(amb?.channelCandidates).toEqual([]);
-    // It can still name every repository the id is contested by.
-    expect(amb?.allCandidates).toEqual(
-      expect.arrayContaining([
-        "hieuck/ComfyUI-BiRefNet",
-        "MohammadAboulEla/ComfyUI-BiRefNet",
-        "viperyl/ComfyUI-BiRefNet",
-      ]),
-    );
-    // A channel that DOES carry it is still the channel-resolved case.
-    expect(bareNameAmbiguity(DEV_AUTHORS, "legacy")?.resolvedVia).toBe("channel");
+    // And it names the repository the fallback ACTUALLY clones, measured rather than
+    // guessed: registry id "comfyui-birefnet" is viperyl's.
+    expect(amb?.registryTarget).toBe("viperyl/ComfyUI-BiRefNet");
+    expect(amb?.allCandidates).toEqual(expect.arrayContaining(["viperyl/ComfyUI-BiRefNet"]));
+    // A channel with a REACHABLE entry under the name is still the channel-resolved case.
+    expect(bareNameAmbiguity(REACHABLE_OTHER, "default")?.resolvedVia).toBe("channel");
   });
 
   it("REFUSES the defaulted call whose contested name `default` does not carry", () => {
@@ -569,43 +591,53 @@ describe("the snapshot and its predicate (#1616)", () => {
     const someRepo = Object.values(per as Record<string, string[]>).flat()[0];
     const res = nodesInstallCommandArgs({ repository: `https://github.com/${someRepo}` });
     expect(res.conflict, `${name} must not dispatch unchecked`).toBeTruthy();
-    expect(res.conflict).toContain("does not carry that name at all");
+    expect(res.conflict).toContain("no entry reachable by that name exists");
     expect(res.conflict).toContain("cnr_map");
   });
 
-  it("the EXEMPTED contested name discloses what the exemption could not check", () => {
-    // GATE ROUND 7. `default` carries wildminder/ComfyUI-Chatterbox, so the exemption
-    // applies and this dispatches. It is NOT safe on that basis: `get_custom_nodes` keys
-    // an entry by its CNR id when the repo is registered, and (verified against the live
-    // registry, 2026-08-15) wildminder's repo is registered as "ComfyUI-ChatterboxTTS".
-    // The sent "ComfyUI-Chatterbox" therefore misses, and cnr_map["comfyui-chatterbox"] is
-    // sm079/comfyui-chatterbox — which is what Manager clones.
+  it("REFUSES the exact-match install whose entry Manager cannot reach by name", () => {
+    // GATE ROUNDS 7-8, and the case that proved the exemption unsound. `default` lists
+    // wildminder/ComfyUI-Chatterbox — exactly what this caller names — so the old
+    // "nothing to pick between" exemption dispatched it. Verified against the live
+    // registry 2026-08-15, that is a WRONG install:
     //
-    // Mirroring the registry to catch that is a wider fix than these 111 names (any
-    // re-keyed entry whose bare name matches another id is exposed), so what is pinned
-    // here is that the call does not pass in SILENCE implying it was verified.
+    //   * `get_custom_nodes` keys an entry by its CNR id when the repo is registered, and
+    //     wildminder's repo is registered as "ComfyUI-ChatterboxTTS";
+    //   * so the sent "ComfyUI-Chatterbox" matches nothing and the nightly path falls back
+    //     to cnr_map["comfyui-chatterbox"] = sm079/comfyui-chatterbox, which is cloned.
+    //
+    // The caller names wildminder and gets sm079, reported as success.
     const res = nodesInstallCommandArgs({
       repository: "https://github.com/wildminder/ComfyUI-Chatterbox",
     });
-    expect(res.conflict).toBeUndefined(); // still dispatches — no over-refusal
-    expect(res.note).toContain("COMFY REGISTRY id");
-    expect(res.note).toContain("panel_list_nodes");
+    expect(res.conflict).toBeTruthy();
+    // It must name the repository that would ACTUALLY land, not merely list suspects.
+    expect(res.conflict).toContain("sm079/comfyui-chatterbox");
+    // And it must not pretend the channel simply lacks the pack — the caller can see it there.
+    expect(res.conflict).toContain("registered in the Comfy Registry under a different id");
   });
 
-  it("the caveat rides ONLY the exempted call, never a refused or uncontested one", () => {
-    // Refused: the refusal already says everything, and appending a milder caveat to it
-    // would read as a way out of it.
-    expect(
-      nodesInstallCommandArgs({ repository: DEV_AUTHORS }).note ?? "",
-    ).not.toContain("ONE RESIDUAL ON THIS NAME");
-    // Uncontested: no measured collision, so no extra noise beyond the standing note.
-    expect(
-      nodesInstallCommandArgs({ repository: UNCOLLIDING }).note ?? "",
-    ).not.toContain("ONE RESIDUAL ON THIS NAME");
-    // Exempted contested name: present.
-    expect(nodesInstallCommandArgs({ repository: DEFAULT_AUTHORS }).note ?? "").toContain(
-      "ONE RESIDUAL ON THIS NAME",
+  it("an exact match that IS reachable still dispatches — no blanket over-refusal", () => {
+    // The fix must not degrade into "refuse every contested name". hieuck's repo is not
+    // re-keyed, so `default` really does resolve the name to it and there is nothing to
+    // refuse. This is the assertion that fails if reachability is computed too eagerly.
+    expect(REKEYED_REPOS["comfyui_tiledksampler"] ?? []).not.toContain(
+      "BlenderNeko/ComfyUI_TiledKSampler",
     );
+    expect(nodesInstallCommandArgs({ repository: REACHABLE_DEFAULT }).conflict).toBeUndefined();
+    // ...and the counterpart: hieuck's IS re-keyed, which is why that one refuses.
+    expect(REKEYED_REPOS["comfyui-birefnet"] ?? []).toContain("hieuck/ComfyUI-BiRefNet");
+  });
+
+  it("the re-keyed table only ever removes reachability, never invents it", () => {
+    // Every repo listed as re-keyed must actually appear as a candidate somewhere,
+    // otherwise the table is filtering against names nothing uses.
+    for (const [name, repos] of Object.entries(REKEYED_REPOS)) {
+      const per = AMBIGUOUS_BARE_NAMES[name] as Record<string, string[]> | undefined;
+      expect(per, `${name} is re-keyed but not in the snapshot`).toBeTruthy();
+      const listed = Object.values(per ?? {}).flat();
+      for (const r of repos) expect(listed, `${name}: ${r}`).toContain(r);
+    }
   });
 
   it("the CNR-fallback refusal does not claim a channel list carries anything", () => {
@@ -614,7 +646,7 @@ describe("the snapshot and its predicate (#1616)", () => {
     // whole contract is that the stated reason is the real one.
     const amb = bareNameAmbiguity(DEV_AUTHORS, "forked");
     const text = ambiguousBareNameRefusal(amb!);
-    expect(text).toContain("does not carry that name at all");
+    expect(text).toContain("no entry reachable by that name exists");
     expect(text).not.toContain("channel's list carries that name under");
   });
 

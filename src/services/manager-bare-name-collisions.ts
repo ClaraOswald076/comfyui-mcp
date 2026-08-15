@@ -60,14 +60,17 @@
  *              "ComfyUI-Chatterbox" misses, and cnr_map["comfyui-chatterbox"] is
  *              sm079/comfyui-chatterbox — which is what gets cloned.
  *
- *    THIS GUARD DOES NOT CATCH THAT, and an earlier version of this comment claimed it
- *    could never happen. Closing it needs the registry's repo->id map mirrored here, and
- *    the hazard is NOT confined to these 111 names — any pack whose entry is re-keyed and
- *    whose bare name matches someone else's registry id is exposed, which makes it a
- *    wider bug than the channel collision this module was split out to prevent. Filed as
- *    #1624 with this reproduction, rather than half-fixed for an arbitrary 111 names.
- *    What is true here is only this: nothing below makes that case worse than it already
- *    is, and `contestedNameCaveat` states the gap on the call it exempts.
+ *    An earlier version of this comment claimed that could never happen, and then that it
+ *    was unfixable here. Both were wrong: the re-keying is MEASURABLE, and `REKEYED_REPOS`
+ *    now records exactly which candidates a bare-name lookup cannot reach, so the
+ *    exemption is applied to what the lookup can actually return rather than to what the
+ *    list appears to say. `REGISTRY_TARGETS` records what `cnr_map[name]` then clones, so
+ *    the refusal names that repository outright instead of guessing.
+ *
+ *    STILL NOT CLOSED IN GENERAL, and that is #1624: this covers the 111 names measured
+ *    here, but the hazard needs no channel collision at all — ANY pack whose entry is
+ *    re-keyed and whose bare name matches a different registry id is exposed, and those
+ *    are not enumerated here.
  *
  *  * A pip-installed Manager. `get_data_by_mode` reads the cache file for the configured
  *    channel URL, else the snapshot BUNDLED in the package — a stale, default-flavoured
@@ -102,10 +105,18 @@ import {
   AMBIGUOUS_BARE_NAMES,
   AMBIGUOUS_BARE_NAMES_MEASURED,
   MANAGER_CHANNEL_NAMES,
+  REGISTRY_TARGETS,
+  REKEYED_REPOS,
   type ManagerChannelName,
 } from "./manager-bare-name-data.js";
 
-export { AMBIGUOUS_BARE_NAMES, AMBIGUOUS_BARE_NAMES_MEASURED, MANAGER_CHANNEL_NAMES };
+export {
+  AMBIGUOUS_BARE_NAMES,
+  AMBIGUOUS_BARE_NAMES_MEASURED,
+  MANAGER_CHANNEL_NAMES,
+  REGISTRY_TARGETS,
+  REKEYED_REPOS,
+};
 export type { ManagerChannelName };
 
 /**
@@ -212,11 +223,25 @@ export interface BareNameAmbiguity {
   /** The channel about to be asked. */
   channel: string;
   /**
-   * What that channel's list carries under the name — >1 means it is ambiguous alone.
-   * EMPTY means the channel carries nothing under it, which is not a dead end: see
-   * `resolvedVia`.
+   * What a BARE-NAME lookup can actually get back from that channel's list — >1 means it
+   * is ambiguous alone. EMPTY means nothing under that name is reachable, which is not a
+   * dead end: see `resolvedVia`. Entries the channel lists but Manager re-keys to a CNR id
+   * are NOT here (they are in `unreachableCandidates`), because the lookup cannot return
+   * them and a message naming them would describe an install that cannot happen.
    */
   channelCandidates: readonly string[];
+  /**
+   * Repos the channel does list under the name but which a bare-name lookup cannot reach,
+   * because Manager keyed them by their Comfy Registry id instead. These are why an
+   * apparently exact match is not proof of anything.
+   */
+  unreachableCandidates: readonly string[];
+  /**
+   * What `cnr_map[<bare name>]` resolves to — the repository actually cloned when the
+   * channel lookup misses. Undefined when the registry holds no pack of that name, in
+   * which case Manager answers "not found" instead.
+   */
+  registryTarget?: string;
   /** Channels whose list resolves the name to exactly the caller's repo, if any. */
   channelsResolvingToCaller: readonly string[];
   /**
@@ -258,23 +283,34 @@ export function bareNameAmbiguity(url: string, channel: string): BareNameAmbigui
   // warn about and no CNR fallback to reach. This is also what keeps an INHERITED key
   // (`__proto__`, `constructor`) from being read as a miss and refused on that basis.
   if (!KNOWN_CHANNELS.has(asked)) return undefined;
-  const channelCandidates = ownCandidates(entry, asked as ManagerChannelName) ?? [];
+  const nameKey = bare.trim().toLowerCase();
+  // GATE ROUND 8 — WHAT THE CHANNEL LISTS IS NOT WHAT THE LOOKUP CAN REACH. A repo that
+  // is registered in the Comfy Registry under some other id is keyed by that id, so the
+  // bare name cannot return it however plainly the list "carries" it.
+  const rekeyed = REKEYED_REPOS[nameKey] ?? [];
+  const reachableIn = (cands: readonly string[] | undefined): readonly string[] =>
+    (cands ?? []).filter((r) => !rekeyed.some((k) => k === r));
+  const listed = ownCandidates(entry, asked as ManagerChannelName) ?? [];
+  const channelCandidates = reachableIn(listed);
+  const unreachableCandidates = listed.filter((r) => !channelCandidates.includes(r));
   const callerRepo = comparableToSnapshot(url) ? ownerRepoOf(url) : undefined;
   if (channelCandidates.length === 1 && callerRepo && sameRepo(channelCandidates[0], callerRepo)) {
-    // EXEMPT: the channel carries exactly what was asked for, so there is nothing to pick
-    // between. Sound ONLY if that entry is reachable by the bare name — see the CNR
-    // re-keying note in the header for the case where it is not. The caveat is disclosed
-    // by `contestedNameCaveat`, which is why this returns silence rather than a warning.
+    // EXEMPT, and now soundly: the one entry the lookup can reach under this name IS the
+    // caller's repo, so there is nothing to pick between and nothing to fall back to.
     return undefined;
   }
   const channelsResolvingToCaller = callerRepo
     ? MANAGER_CHANNEL_NAMES.filter((c) => {
-        const cands = ownCandidates(entry, c);
-        return cands?.length === 1 && sameRepo(cands[0], callerRepo);
+        const cands = reachableIn(ownCandidates(entry, c));
+        return cands.length === 1 && sameRepo(cands[0], callerRepo);
       })
     : [];
+  const registryTarget = REGISTRY_TARGETS[nameKey];
   const allCandidates = [
-    ...new Set(MANAGER_CHANNEL_NAMES.flatMap((c) => ownCandidates(entry, c) ?? [])),
+    ...new Set([
+      ...MANAGER_CHANNEL_NAMES.flatMap((c) => reachableIn(ownCandidates(entry, c))),
+      ...(registryTarget ? [registryTarget] : []),
+    ]),
   ];
   return {
     bare,
@@ -282,6 +318,8 @@ export function bareNameAmbiguity(url: string, channel: string): BareNameAmbigui
     callerRepo,
     channel,
     channelCandidates,
+    unreachableCandidates,
+    registryTarget,
     channelsResolvingToCaller,
     resolvedVia: channelCandidates.length === 0 ? "cnr-fallback" : "channel",
     allCandidates,
@@ -358,38 +396,6 @@ export function registryVersionAmbiguity(
 }
 
 /**
- * THE ONE THING THE EXEMPTION CANNOT PROMISE, said out loud on the call it exempts.
- *
- * `bareNameAmbiguity` returns `undefined` — dispatch, nothing to refuse — when the asked
- * channel carries exactly the repository the caller named. That is sound only while that
- * entry is reachable BY THE BARE NAME, and `get_custom_nodes` re-keys an entry to its CNR
- * id when its repo is registered, which makes it unreachable and sends the call to the
- * registry fallback instead (header, with a measured example). Nothing here can see a
- * registry, so the choice is between silently implying safety and saying what is unknown.
- *
- * Returns a caveat only for a name this snapshot has MEASURED as contested and only when
- * the call was exempted — an uncontested name gets the standing substitution note and no
- * extra noise, and a refused call already says far more than this.
- */
-export function contestedNameCaveat(url: string, channel: string): string | undefined {
-  const bare = managerBareName(url);
-  const entry = ownCandidates(AMBIGUOUS_BARE_NAMES, bare.trim().toLowerCase());
-  if (!entry) return undefined;
-  if (bareNameAmbiguity(url, channel) !== undefined) return undefined; // refused/warned already
-  return (
-    `ONE RESIDUAL ON THIS NAME: "${bare}" is one of the ${Object.keys(AMBIGUOUS_BARE_NAMES).length} ` +
-    `names measured to be claimed by more than one repository, and the "${channel}" channel ` +
-    `does list the repository you named — which is why this was not refused. That check ` +
-    `cannot see one last step: Manager keys a channel entry by its COMFY REGISTRY id ` +
-    `rather than by the repo name whenever that repo is registered, so if yours is ` +
-    `registered under a different id, "${bare}" will not match it and Manager falls back ` +
-    `to whatever repository the REGISTRY has under that name. Confirm with panel_list_nodes ` +
-    `that what landed is the repo you meant; install_custom_node (source:"git") clones the ` +
-    `URL verbatim if you need to be certain.`
-  );
-}
-
-/**
  * The refusal for that case. The remedy is not a channel — a channel changes nothing on
  * this route — it is DROPPING the version, which puts the call back on the from-source
  * path where the channel does decide and where this guard can actually reason about it.
@@ -432,13 +438,23 @@ export function ambiguousBareNameRefusal(a: BareNameAmbiguity): string {
   // Quote the URL verbatim when `callerRepo` is unset — an off-host or owner-less URL has
   // no github owner to name, and inventing one would report a repository they never typed.
   const asked = a.callerRepo ? `https://github.com/${a.callerRepo}` : `"${a.callerUrl}"`;
+  // When the channel DOES list the caller's repo but Manager cannot reach it by name, say
+  // so explicitly — otherwise "the channel does not carry that name" reads as flatly wrong
+  // to anyone who just looked the pack up in that list.
+  const shadowed = a.unreachableCandidates.length
+    ? ` (it does list ${listRepos(a.unreachableCandidates)}, but that entry is registered ` +
+      `in the Comfy Registry under a different id, so Manager keyed it by THAT id and a ` +
+      `lookup for "${a.bare}" cannot return it)`
+    : "";
   const within =
     a.resolvedVia === "cnr-fallback"
-      ? `the "${a.channel}" channel's list does not carry that name at all — which is NOT ` +
-        `the end of it: on a "nightly" spec v4 then falls back to the Comfy Registry map ` +
-        `and clones whatever repository is registered under the id "${a.bare}" ` +
-        `(install_by_id → cnr_map), and that name is one of the ones measured to be ` +
-        `claimed by more than one repository (${listRepos(a.allCandidates)})`
+      ? `no entry reachable by that name exists in the "${a.channel}" channel's list` +
+        `${shadowed} — which is NOT the end of it: on a "nightly" spec v4 then falls back ` +
+        `to the Comfy Registry map (install_by_id → cnr_map) and clones ` +
+        (a.registryTarget
+          ? `what the id "${a.bare}" is registered to, which is ` +
+            `https://github.com/${a.registryTarget}`
+          : `whatever repository is registered under the id "${a.bare}"`)
       : a.channelCandidates.length > 1
         ? `the "${a.channel}" channel's list carries that name TWICE — under ${listRepos(a.channelCandidates)} — and which one v4 returns depends on the order of that list`
         : `the "${a.channel}" channel's list carries that name under ${listRepos(a.channelCandidates)}`;
@@ -513,9 +529,15 @@ export function ambiguousBareNameWarning(a: BareNameAmbiguity): string {
   const ambiguousAlone = a.channelCandidates.length > 1;
   const carries =
     a.resolvedVia === "cnr-fallback"
-      ? `does not carry "${a.bare}" at all — so v4 falls back to the Comfy Registry id of ` +
-        `that name and clones whatever repository it is registered to, which the snapshot ` +
-        `has seen claimed by ${listRepos(a.allCandidates)}`
+      ? `has nothing reachable under "${a.bare}"` +
+        (a.unreachableCandidates.length
+          ? ` (it lists ${listRepos(a.unreachableCandidates)}, but that entry is keyed by ` +
+            `its Comfy Registry id, not by the repo name)`
+          : "") +
+        ` — so v4 falls back to the registry id of that name and clones ` +
+        (a.registryTarget
+          ? `https://github.com/${a.registryTarget}`
+          : `whatever repository it is registered to`)
       : ambiguousAlone
         ? `carries "${a.bare}" TWICE — under ${listRepos(a.channelCandidates)} — and v4 keeps whichever comes last in that list`
         : `resolves "${a.bare}" to ${listRepos(a.channelCandidates)}`;
