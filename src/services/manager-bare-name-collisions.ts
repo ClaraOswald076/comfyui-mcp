@@ -47,6 +47,15 @@
  *    caller's own URL, because a channel that lists exactly the caller's repo under that
  *    name is allowed through below.
  *
+ *  * A pip-installed Manager. `get_data_by_mode` reads the cache file for the configured
+ *    channel URL, else the snapshot BUNDLED in the package — a stale, default-flavoured
+ *    list — so on that host the list consulted is not the one measured here. The bundled
+ *    list is default-flavoured, which is the channel this guard is most accurate about.
+ *  * Staleness. The table is a snapshot. A collision added after it was measured is simply
+ *    not caught (today's behaviour), and an entry that has since been corrected upstream
+ *    causes an unnecessary refusal — which the caller clears by naming a channel, since
+ *    the refusal only fires on the channel THIS code defaulted to.
+ *
  * GATE ROUND 6 — A CHANNEL MISS IS NOT A DEAD END, AND TREATING IT AS ONE WAS A HOLE.
  * This module's first shape returned "no ambiguity" whenever the asked channel carried
  * nothing under the name, on the reasoning that Manager then answers "not found" and no
@@ -66,14 +75,6 @@
  * so on the channel this code defaults to they reached that fallback with nothing checked.
  * A miss on a contested name is therefore an ambiguity in its own right — resolved by
  * registry id rather than by the channel — and is refused with that named as the reason.
- *  * A pip-installed Manager. `get_data_by_mode` reads the cache file for the configured
- *    channel URL, else the snapshot BUNDLED in the package — a stale, default-flavoured
- *    list — so on that host the list consulted is not the one measured here. The bundled
- *    list is default-flavoured, which is the channel this guard is most accurate about.
- *  * Staleness. The table is a snapshot. A collision added after it was measured is simply
- *    not caught (today's behaviour), and an entry that has since been corrected upstream
- *    causes an unnecessary refusal — which the caller clears by naming a channel, since
- *    the refusal only fires on the channel THIS code defaulted to.
  */
 import {
   AMBIGUOUS_BARE_NAMES,
