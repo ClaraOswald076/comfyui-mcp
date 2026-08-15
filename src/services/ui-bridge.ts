@@ -4272,11 +4272,101 @@ export class UiBridge {
               `boundary after asynchronous work (${observed}; ` +
                 `${needs("rechecks the fence after an await")}). ${recovery}`
           : `this workflow has no trusted identity for the panel to fence the command against`;
+        // #1519 — WHAT THIS REFUSAL MAY SAY ABOUT READS, which is less than it used
+        // to say, and in one state is nothing at all.
+        //
+        // The trailing sentence used to be unconditional, and in the state #1519
+        // reports it is FALSE. A panel that advertises the per-command fence refuses
+        // an UNSTAMPED command OUTRIGHT, reads included, because #718 closed exactly
+        // that fail-open hole ("An UNSTAMPED command is refused too … an advertised
+        // fence must not fail open" — comfyui-mcp-panel.js; the predicate is
+        // commandWorkflowMismatch, which counts a missing stamp as a mismatch, and
+        // activeWorkflowFenceApplies, which covers every graph_* read). So when this
+        // refusal fires for the no-trusted-stamp reason, graph_outline does NOT work
+        // either — it answers `workflow instance mismatch: this command carries no
+        // workflow-instance stamp`, which is the error #1519 was filed with. The
+        // reporter was told reads still worked, hit a refusal this sentence says
+        // cannot happen, and had to find the rebind themselves.
+        //
+        // THREE answers, because PRESENCE IS NOT AGREEMENT (review, P1 — and the
+        // first version of this fix got it wrong in exactly the way #1519 is about).
+        //
+        // That version asked "is there a trusted stamp?" and promised reads work
+        // whenever there was one. But a read does not succeed because a stamp
+        // EXISTS; it succeeds when the stamp still EQUALS the active canvas. The
+        // resolver answers with the workflow the turn was ISSUED FOR (#570/#884) —
+        // a value that is deliberately allowed to go stale, since declining a
+        // command aimed at the workflow the user has since left is the fence's
+        // whole purpose. So "trusted" and "current" are different questions, and
+        // the fix had merely MOVED the false promise from the no-stamp branch into
+        // the stale-stamp one. Measured on a real bridge before this was changed: a
+        // stale-stamped connection was told reads still work, and the very next
+        // graph_outline came back "workflow instance mismatch: this command was
+        // issued for workflow instance aaaa…, and the active canvas reports bbbb…".
+        //
+        //   no fence advertised   → reads EXECUTE. Nothing compares them; this is
+        //                           the old panel the two capability branches exist
+        //                           for, and the original sentence is true for it.
+        //   fence, no stamp       → reads are REFUSED, provably: a missing stamp is
+        //                           a mismatch by definition (commandWorkflowMismatch).
+        //   fence, stamp present  → UNKNOWN, and it must SAY unknown. Whether the
+        //                           read passes depends on stamp-vs-active equality,
+        //                           and this side cannot evaluate it: `Conn` carries
+        //                           no live canvas uuid, and workflowUuidFor() reads
+        //                           the SAME resolver the stamp came from, so
+        //                           comparing them would compare a value with itself
+        //                           and always agree. Only the panel can answer, and
+        //                           a pre-dispatch refusal may not take a round trip
+        //                           to ask. Asserting either outcome here would be
+        //                           the unmeasured claim this whole issue is about.
+        //
+        // It deliberately names no remedy. This gate is entered only for a MUTATION,
+        // and the orchestrator's #1331 handler MEASURES which of the two no-identity
+        // states this is before naming one — including saying, when it applies, that
+        // panel_set_workflow_target({mode:"current"}) will NOT clear it. A remedy
+        // guessed here would contradict the one that was checked.
+        const trustedStamp = typeof stamp === "string" && stamp.length > 0 ? stamp : "";
+        const readsVerdict: "execute" | "refused" | "unknown" = !conn.enforcesWorkflowStamp
+          ? "execute"
+          : trustedStamp
+            ? "unknown"
+            : "refused";
+        // The exempt probe is named in both fenced verdicts, as the thing to TRY and
+        // by its ROLE rather than by an outcome: `workflow_list` is fence-EXEMPT
+        // because it is the recovery probe (commandIsCanvasTargetless, panel #759),
+        // but in the #1331 state the repair it exists for finds no identity to adopt
+        // and does NOT clear the refusal — so "so a stale binding can be repaired"
+        // would read as a promise the appended #1331 verdict then contradicts. The
+        // exemption also first shipped in panel 0.11.83 while this branch is reachable
+        // from 0.11.35, so a build in between fences the probe too (the state
+        // panel-tools' `unreadable` remedy documents). Measured against the panel
+        // repo, not assumed: #1519's own reporter is on 0.13.0, whose release commit
+        // HAS the exemption. Naming a version here would need a table entry for a
+        // value this message cannot usually read anyway, so it says which builds
+        // differ instead of asserting one.
+        const PROBE =
+          `Try panel_list_workflows — the panel exempts that read from this fence (it is the ` +
+          `recovery probe), though a build predating the exemption fences it too. Non-graph ` +
+          `tools are unaffected.`;
+        const readsNote =
+          readsVerdict === "refused"
+            ? `GRAPH READS ARE REFUSED TOO, for this same missing stamp: this tab's panel ` +
+              `enforces the per-command fence and refuses an UNSTAMPED command rather than ` +
+              `fail open, so graph_outline / graph_query answer "workflow instance mismatch: ` +
+              `this command carries no workflow-instance stamp" as well. ${PROBE}`
+            : readsVerdict === "unknown"
+              ? `WHETHER GRAPH READS STILL WORK IS NOT KNOWN FROM HERE, and is not claimed: a ` +
+                `read carries this session's stamp (${trustedStamp}), and this tab's panel runs ` +
+                `it only while that stamp still names the ACTIVE canvas — a comparison only the ` +
+                `panel can make. If the workflow was switched or replaced after this session ` +
+                `bound to it, graph_outline / graph_query are refused with "workflow instance ` +
+                `mismatch" as well; if it was not, they work. ${PROBE}`
+              : `Reads and view-only commands still work (graph_outline, graph_query, ` +
+                `graph_get_state, graph_find_nodes, graph_list_subgraphs, graph_screenshot, ` +
+                `graph_canvas).`;
         const refusal = markDispatched(
           new Error(
-            `"${cmd.cmd}" cannot be safely targeted to the active workflow: ${why}. Reads and ` +
-              `view-only commands still work (graph_outline, graph_query, graph_get_state, ` +
-              `graph_find_nodes, graph_list_subgraphs, graph_screenshot, graph_canvas).`,
+            `"${cmd.cmd}" cannot be safely targeted to the active workflow: ${why}. ${readsNote}`,
           ),
           false,
         );
@@ -4443,8 +4533,26 @@ export class UiBridge {
       // could supply its own workflow_uuid would just set it to the DESTINATION workflow after a
       // switch and sail past the panel fence. So ALWAYS overwrite with the trusted resolver value
       // (ctx.workflowUuid), and STRIP any caller-supplied value entirely when we have no trusted
-      // one — an identity-less tab / old panel ships unstamped (mutations are already refused by
-      // the requiresWorkflowStampEnforcement gate above; reads execute, reply still server-fenced).
+      // one — an identity-less tab / old panel ships unstamped. Mutations are already refused by
+      // the requiresWorkflowStampEnforcement gate above.
+      //
+      // #1519 — this used to add "reads execute, reply still server-fenced". THAT IS NOT TRUE of a
+      // current panel. Its fence refuses an UNSTAMPED command outright, reads included, because
+      // #718 closed exactly that fail-open hole ("An UNSTAMPED command is refused too … an
+      // advertised fence must not fail open" — comfyui-mcp-panel.js). So a read dispatched from a
+      // session with no trusted identity comes back as `workflow instance mismatch: this command
+      // carries no workflow-instance stamp`, which is what #1519 reports.
+      //
+      // The two halves therefore hold incompatible contracts, both deliberate: this side expects
+      // an unstamped read to run, that side refuses it. Which one gives is an OPEN DESIGN
+      // QUESTION on #1519 — weakening #718, adopting the active workflow automatically (removed
+      // from #1478 for cause: it can bind the session to a DIFFERENT workflow), or refusing here
+      // with a better message all trade different risks. Recorded rather than silently picked.
+      // What is settled is that the old sentence described behaviour that does not happen —
+      // and the USER-FACING half of the same claim is fixed: the write refusal above no longer
+      // promises that graph reads still work when this side has no stamp to give them (see
+      // `graphReadsRefusedToo`). Nothing about what is DISPATCHED changed here.
+      //
       // #694 hardening: mint the rid LAST so a caller-supplied cmd.rid can NEVER
       // override it — the rid is BRIDGE-OWNED (reply correlation in `pending`,
       // the onDispatchedRid observer, and the panel's retry_of dedupe token all
