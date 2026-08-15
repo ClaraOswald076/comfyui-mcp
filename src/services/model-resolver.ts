@@ -1010,6 +1010,13 @@ async function coreModelFilesUnder(categoryDir: string): Promise<string[]> {
  *  per folder. */
 const DISAGREEMENT_PROBE_CATEGORIES = 6;
 
+/** How many model files a fully-agreeing category must hold before it CORROBORATES
+ *  that the live server reads this root (#1147). One is not enough: two unrelated
+ *  installs routinely share a single popular checkpoint, and a category holding
+ *  only that file is "fully accounted for" by coincidence (codex gate, round 5).
+ *  Two independent names both coinciding is not an ordinary explanation. */
+const CORROBORATING_CONTAINMENT_MIN_FILES = 2;
+
 /** Immediate subdirectories of the candidate models root, in a stable order. */
 async function categoriesUnder(modelsRoot: string): Promise<string[]> {
   try {
@@ -1050,6 +1057,15 @@ async function categoriesUnder(modelsRoot: string): Promise<string[]> {
  * server scans has ALL of its model files in that server's listing. A single shared
  * filename proves nothing — two unrelated installs routinely hold the same popular
  * checkpoint — so overlap alone must never suppress the refusal.
+ *
+ * CORROBORATION (#1147): a category the server lists COMPLETELY, holding more than
+ * one file, is positive evidence that it reads this ROOT — every one of those names
+ * would have to coincide otherwise. That outweighs a single unaccounted file in
+ * another category, which has ordinary explanations that say nothing about the root
+ * (an unregistered extension, a cached listing, a nested HuggingFace dump). So the
+ * scan does not stop at the first disagreement, and a tree the server demonstrably
+ * reads is not refused over a stray file. A tree it accounts for NOWHERE — the #369
+ * signature — has no such category to offer and still refuses.
  *
  * POSITIVE EVIDENCE ONLY. There is deliberately no "the live server lists models
  * this tree cannot account for" rule: being unable to EXPLAIN the server's models is
@@ -1092,6 +1108,7 @@ async function assertDestinationVisibleToLiveServer(
 
   let probed = 0;
   let worst: { category: string; missing: string[]; onDisk: number; live: number } | undefined;
+  let corroborating: { category: string; files: number } | undefined;
 
   for (const category of primary) {
     if (probed >= DISAGREEMENT_PROBE_CATEGORIES) break;
@@ -1129,9 +1146,61 @@ async function assertDestinationVisibleToLiveServer(
     // `b/shared.safetensors` (codex gate, round 9).
     const liveNames = new Set(listing.map((n) => normRel(n)));
     const missing = onDisk.filter((n) => !liveNames.has(n));
-    if (missing.length === 0) continue; // this folder is fully accounted for — agrees
-    worst = { category, missing, onDisk: onDisk.length, live: listing.length };
-    break;
+    if (missing.length === 0) {
+      // This folder is fully accounted for — it AGREES, and that is itself positive
+      // evidence (see the corroboration note below). Keep the largest such category:
+      // the more names that had to coincide, the less coincidence explains it.
+      if (
+        onDisk.length >= CORROBORATING_CONTAINMENT_MIN_FILES &&
+        onDisk.length > (corroborating?.files ?? 0)
+      ) {
+        corroborating = { category, files: onDisk.length };
+      }
+      continue;
+    }
+    // Record the FIRST disagreement, but do NOT stop scanning. Evidence that this
+    // root IS read can only come from the categories after it, and breaking here
+    // threw it away — see the corroboration note below (#1147, 0.51.56).
+    if (!worst) worst = { category, missing, onDisk: onDisk.length, live: listing.length };
+  }
+
+  // #1147 — CORROBORATED READERSHIP OUTWEIGHS A SINGLE UNACCOUNTED FILE.
+  //
+  // A reporter's ComfyUI Desktop install was refused an `animatediff_models`
+  // download because ONE unlisted file under `ipadapter` was read as proof of a
+  // different install, while that same server listed other categories of that same
+  // tree file for file. This guard gathered positive evidence in the REFUSE
+  // direction and discarded the positive evidence it had already computed in the
+  // PROCEED direction — `missing.length === 0` was a bare `continue`, and the first
+  // disagreement `break`ed before any later category could speak.
+  //
+  // The two facts are not symmetric:
+  //
+  //   A category the server lists COMPLETELY is evidence about the ROOT. For a
+  //   different install to produce it, EVERY name in that category would have to
+  //   coincide — which is why one file is not enough (two unrelated installs really
+  //   do share `sd_xl_base_1.0.safetensors`; codex gate round 5), and why the
+  //   largest agreeing category is the one worth keeping.
+  //
+  //   A file the server does not name is evidence about that FILE. It has ordinary
+  //   explanations that say nothing about the root: an extension not registered for
+  //   that category, a listing cached before the file arrived, a nested HuggingFace
+  //   dump (#1147's original birefnet report), a folder a custom node registers
+  //   against a different path.
+  //
+  // The #369 signature is a tree the server accounts for NOWHERE — 3 files on disk,
+  // 24 unrelated files live. That still refuses, here and for an inferred root
+  // (#1562), because a stale bundle has no fully-agreeing category to offer.
+  //
+  // Bounded by DISAGREEMENT_PROBE_CATEGORIES like the disagreement scan itself: a
+  // tree whose agreeing category sorts past the budget is refused as before.
+  if (worst && corroborating) {
+    logger.info(
+      `[models] "${worst.category}" holds ${worst.missing.length} file(s) the server does not ` +
+        `list, but it lists all ${corroborating.files} file(s) of "${corroborating.category}" ` +
+        `in this same tree — proceeding (#1147).`,
+    );
+    worst = undefined;
   }
 
   if (worst) {
