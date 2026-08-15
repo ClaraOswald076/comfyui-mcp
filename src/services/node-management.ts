@@ -4214,6 +4214,64 @@ export function normalizeGitUrlInstallArgs(
 }
 
 /**
+ * #1539 — the Manager channel a git-URL ("nightly") install asks for when the
+ * caller named none.
+ *
+ * WHY THIS EXISTS AT ALL. The panel's `buildInstallRequest` defaults the v4 git-URL
+ * payload to `channel: "dev"` while defaulting the registry-ID payload — and BOTH
+ * of the 3.x payload shapes — to `"default"`. Nothing justifies the difference, and
+ * because the panel spells it `channel || "dev"`, only a NON-EMPTY channel sent from
+ * here can displace it. So this is the field that fixes it on panels already in the
+ * field, including the version the report was filed from.
+ *
+ * WHAT "dev" COSTS, MEASURED. Manager's channels are separate lists, not a
+ * superset/subset pair. Fetched 2026-08-14 from the channel URLs the live Manager
+ * itself reports (`GET /v2/manager/channel_url_list`):
+ *
+ *   default  .../ComfyUI-Manager/main/custom-node-list.json               5887 packs
+ *   dev      .../ComfyUI-Manager/main/node_db/dev/custom-node-list.json   1210 packs
+ *   overlap                                                                 3 packs
+ *
+ * So asking `dev` hides ~99.9% of what `default` lists — including packs
+ * `panel_search_nodes` had just returned, because that search reads
+ * `extension-node-map.json`, which is NOT channel-scoped (measured: the live
+ * `getmappings?mode=cache` and `getmappings?mode=cache&channel=dev` returned
+ * byte-identical bodies). Search answered from one file, the install resolved
+ * against a different one, and the reporter was told their pack did not exist.
+ *
+ * WHY THE CHANNEL DECIDES ANYTHING. Read out of ComfyUI-Manager V4.2.2's own source
+ * (`glob/manager_core.py`), not inferred: `install_by_id` for a `nightly` spec does
+ * `custom_nodes = await self.get_custom_nodes(channel, mode)` → `load_nightly` →
+ * `get_data_by_mode(mode, 'custom-node-list.json', channel_url)`, keys that map by
+ * the BARE REPO NAME (`repo_name = y.split('/')[-1]`), and on a hit clones
+ * `the_node['repository']` — the CHANNEL's URL. The `repository` field we send is
+ * never read on that path; it is stored in the task params and nothing more. On a
+ * miss it returns the reported
+ * `Node '<name>@nightly' not found in [ManagerChannel.<ch>, ManagerDatabaseSource.<mode>]`,
+ * naming the channel THIS argument chose.
+ *
+ * WHAT THIS DOES NOT CLAIM. Not that `default` always resolves. On a pip Manager v4
+ * `manager_util.is_manager_pip_package()` is true, which sends `get_data_by_mode`
+ * down its offline branch unconditionally — it reads the cache file for that exact
+ * channel URL, else the snapshot bundled in the package, and never fetches, so
+ * `mode` is inert there. A host whose configured `channel_url` is not the default
+ * one therefore has no cache for `default` either and falls back to the bundled
+ * list. That was measured too: on a rig configured to a custom channel URL, the
+ * reporter's pack resolved from NEITHER `dev` nor `default` (the server log shows
+ * both reads landing on `site-packages/comfyui_manager/custom-node-list.json`),
+ * even though that same rig's own cached list — the one its search reads — contains
+ * the pack. Fixing that needs the Manager to be asked for the channel the USER
+ * configured, which v4.2.2 gives no way to name (`channel: null` makes
+ * `load_nightly` return `{}` outright), so it is out of reach from here and is not
+ * claimed to be fixed.
+ *
+ * What IS established is narrower and still worth shipping: `dev` is the wrong
+ * question for every host, `default` is the right one for a host on the stock
+ * channel, and the registry-ID path has been asking `default` all along.
+ */
+export const GIT_INSTALL_DEFAULT_CHANNEL = "default";
+
+/**
  * The FINAL dispatch fields for the panel's `nodes_install` command, after
  * #789 normalization. Built here — not by `??`-merging with the raw args at
  * the call site — because a rerouted git URL must DROP `id`, and a
@@ -4237,11 +4295,21 @@ export function nodesInstallCommandArgs(args: {
   const norm = normalizeGitUrlInstallArgs(args);
   if (norm.conflict) return { conflict: norm.conflict };
   const rerouted = norm.repository !== undefined;
+  // #1539 — only the git-URL route is touched, and only when the caller named no
+  // channel. A caller who passed one keeps it (including on this route: naming a
+  // channel is the one way to reach a pack that really does live in `dev`), and
+  // the registry-ID route is left exactly as it was, because the panel already
+  // defaults THAT one to "default".
+  //
+  // Blank counts as unset. The panel's `channel || "dev"` treats "" as absent and
+  // substitutes `dev`, so forwarding an empty string would silently land back on
+  // the channel this fix exists to stop asking for.
+  const explicitChannel = args.channel?.trim() ? args.channel : undefined;
   return {
     id: rerouted ? norm.id : args.id,
     repository: rerouted ? norm.repository : args.repository,
     version: rerouted ? norm.version : args.version,
-    channel: args.channel,
+    channel: rerouted ? (explicitChannel ?? GIT_INSTALL_DEFAULT_CHANNEL) : args.channel,
     mode: args.mode,
     ...(norm.note ? { note: norm.note } : {}),
   };
