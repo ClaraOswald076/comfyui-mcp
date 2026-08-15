@@ -170,10 +170,10 @@ describe("choosePanelFallbackOrigin", () => {
     // execution.)
     expect(
       choosePanelFallbackOrigin("http://localhost:8199/api/workflow_templates", ["http://127.0.0.1:8199"]),
-    ).toEqual({ kind: "alias", origin: "http://127.0.0.1:8199" });
+    ).toEqual({ kind: "alias", origin: "http://127.0.0.1:8199", then: [] });
     expect(
       choosePanelFallbackOrigin("http://127.0.0.1:8199/api/workflow_templates", ["http://[::1]:8199"]),
-    ).toEqual({ kind: "alias", origin: "http://[::1]:8199" });
+    ).toEqual({ kind: "alias", origin: "http://[::1]:8199", then: [] });
   });
 
   it("still reports SAME for an identical host spelling, so nothing is re-asked pointlessly", () => {
@@ -194,19 +194,48 @@ describe("choosePanelFallbackOrigin", () => {
     ).toEqual({ kind: "same", origin: "http://comfy.test:8199" });
   });
 
-  it("does NOT let an alias displace a single foreign candidate", () => {
-    // The regression the obvious rule would cause, pinned. "An alias always wins"
-    // is tempting — it is the only candidate that is not a guess — but with one
-    // alias and one foreign origin it swaps a panel that may well answer for an
-    // address that just refused under another spelling, and when that fails the
-    // call fails having never asked. A path that answers today must keep
-    // answering.
+  it("CHAINS the alias ahead of a single foreign candidate instead of choosing", () => {
+    // Both single-choice orderings are wrong in one direction, and the gate found
+    // each in turn: preferring the foreign origin answers from a machine the user
+    // did not configure while their own server was available (round 2), and
+    // preferring the alias makes the foreign panel unreachable when the alias does
+    // not answer (round 1's fix, which caused that). The chain owes neither.
     expect(
       choosePanelFallbackOrigin("http://127.0.0.1:8199/api/workflow_templates", [
         "http://192.168.1.50:8188",
         "http://[::1]:8199",
       ]),
-    ).toEqual({ kind: "use", origin: "http://192.168.1.50:8188" });
+    ).toEqual({
+      kind: "alias",
+      origin: "http://[::1]:8199",
+      then: ["http://192.168.1.50:8188"],
+    });
+  });
+
+  it("keeps an ORDER-INDEPENDENT verdict — connection order is not a fact about servers", () => {
+    // Gate round 2, finding 3. The canonical dedup kept the FIRST spelling per
+    // origin and dropped the rest, so the alias was discarded before anything
+    // could classify it: the same two panels answered `same` or `alias` depending
+    // purely on which browser tab connected first. Both orders, one verdict.
+    const failed = "http://127.0.0.1:8199/api/workflow_templates";
+    const expected = { kind: "alias", origin: "http://[::1]:8199", then: [] };
+    expect(choosePanelFallbackOrigin(failed, ["http://127.0.0.1:8199", "http://[::1]:8199"])).toEqual(
+      expected,
+    );
+    expect(choosePanelFallbackOrigin(failed, ["http://[::1]:8199", "http://127.0.0.1:8199"])).toEqual(
+      expected,
+    );
+  });
+
+  it("collapses REPEATS of one address, which are not extra candidates", () => {
+    // Deduplication is by host, so two tabs on the same address stay one
+    // candidate — the thing the old canonical dedup got right and must keep.
+    expect(
+      choosePanelFallbackOrigin(CONFIGURED, [
+        "http://192.168.1.50:8188",
+        "http://192.168.1.50:8188",
+      ]),
+    ).toEqual({ kind: "use", origin: "http://192.168.1.50:8188", then: [] });
   });
 
   it("prefers an ALIAS over a REFUSAL, which is the verdict that answers nothing", () => {
@@ -220,7 +249,7 @@ describe("choosePanelFallbackOrigin", () => {
         "http://10.0.0.9:8188",
         "http://localhost:8199",
       ]),
-    ).toEqual({ kind: "alias", origin: "http://localhost:8199" });
+    ).toEqual({ kind: "alias", origin: "http://localhost:8199", then: [] });
   });
 
   it("does not treat a DIFFERENT PORT on an alias host as the same server", () => {
@@ -228,13 +257,14 @@ describe("choosePanelFallbackOrigin", () => {
     // different origin by every rule here, so it stays an ordinary candidate.
     expect(
       choosePanelFallbackOrigin("http://127.0.0.1:8199/api/workflow_templates", ["http://[::1]:8188"]),
-    ).toEqual({ kind: "use", origin: "http://[::1]:8188" });
+    ).toEqual({ kind: "use", origin: "http://[::1]:8188", then: [] });
   });
 
   it("picks the single different origin, keeping the spelling the browser reported", () => {
     expect(choosePanelFallbackOrigin(CONFIGURED, ["http://LOCALHOST:8188"])).toEqual({
       kind: "use",
       origin: "http://LOCALHOST:8188",
+      then: [],
     });
   });
 
@@ -254,7 +284,7 @@ describe("choosePanelFallbackOrigin", () => {
   it("ignores the panel that is on the failed address when picking among the rest", () => {
     expect(
       choosePanelFallbackOrigin(CONFIGURED, ["http://127.0.0.1:8199", "http://127.0.0.1:8188"]),
-    ).toEqual({ kind: "use", origin: "http://127.0.0.1:8188" });
+    ).toEqual({ kind: "use", origin: "http://127.0.0.1:8188", then: [] });
   });
 
   it("says nothing when the failed target does not parse", () => {
@@ -265,8 +295,8 @@ describe("choosePanelFallbackOrigin", () => {
   it("adds prose ONLY for the ambiguous case", () => {
     expect(describeDeclinedPanelFallback({ kind: "none" })).toBe("");
     expect(describeDeclinedPanelFallback({ kind: "same", origin: "http://x:1" })).toBe("");
-    expect(describeDeclinedPanelFallback({ kind: "use", origin: "http://x:1" })).toBe("");
-    expect(describeDeclinedPanelFallback({ kind: "alias", origin: "http://x:1" })).toBe("");
+    expect(describeDeclinedPanelFallback({ kind: "use", origin: "http://x:1", then: [] })).toBe("");
+    expect(describeDeclinedPanelFallback({ kind: "alias", origin: "http://x:1", then: [] })).toBe("");
   });
 });
 
@@ -1054,6 +1084,127 @@ describe('list_packs action:"list_templates" — panel fallback', () => {
 
     expect(body).toContain("NON_JSON_RESPONSE");
     expect(body).not.toContain("NOT your configured ComfyUI");
+  });
+
+  // ── #1600 merge gate, round 2 ──────────────────────────────────────────────
+
+  it("FALLS THROUGH to the foreign panel when the alias does not answer", async () => {
+    // The chain, end to end. The alias is asked FIRST because it is the configured
+    // server; when nothing is there, the foreign panel is still asked rather than
+    // the call dying on a preference.
+    setConnectedPanelOrigins(() => ["http://[::1]:8199", PANEL_ORIGIN]);
+    stubFetch(async (url) => {
+      if (url === CONFIGURED || url === "http://[::1]:8199/api/workflow_templates") {
+        throw transportFailure();
+      }
+      return jsonResponse({ core: [{ name: "a" }] });
+    });
+
+    const res = await handler()({ action: "list_templates" });
+
+    expect(res.isError).toBeFalsy();
+    expect(calls.map((c) => c.url)).toEqual([
+      CONFIGURED,
+      "http://[::1]:8199/api/workflow_templates",
+      PANEL_URL,
+    ]);
+    expect(textOf(res)).toContain(`"answered_by": "${PANEL_ORIGIN}"`);
+  });
+
+  it("STOPS the chain at an answer, and never walks past one", async () => {
+    // A status is an answer from the address we asked. Walking on from it is how a
+    // caller ends up reading one server's reply as another's — so a 404 from the
+    // alias ends the chain, and the foreign panel is never asked.
+    setConnectedPanelOrigins(() => ["http://[::1]:8199", PANEL_ORIGIN]);
+    stubFetch(async (url) => {
+      if (url === CONFIGURED) throw transportFailure();
+      if (url === "http://[::1]:8199/api/workflow_templates") return jsonResponse({ e: 1 }, 404);
+      return jsonResponse({ core: [{ name: "a" }] });
+    });
+
+    const res = await handler()({ action: "list_templates" });
+
+    expect(res.isError).toBe(true);
+    expect(calls.map((c) => c.url)).toEqual([
+      CONFIGURED,
+      "http://[::1]:8199/api/workflow_templates",
+    ]);
+    expect(textOf(res)).toContain("[::1]:8199");
+  });
+
+  it("does NOT walk past a REDIRECT REFUSAL to the next candidate", async () => {
+    // The guard the test above does NOT reach. A 404 is returned, not thrown, so
+    // the chain stops there whatever the continue-condition says — a mutation
+    // letting ANY error continue survived that test. The only failure that can
+    // reach the guard is the redirect refusal, and it must stop the walk: a 3xx is
+    // an ANSWER from that origin, and moving on from it to a different server is
+    // the attribution mistake this whole path exists to prevent.
+    setConnectedPanelOrigins(() => ["http://[::1]:8199", PANEL_ORIGIN]);
+    stubFetch(async (url) => {
+      if (url === CONFIGURED) throw transportFailure();
+      if (url === "http://[::1]:8199/api/workflow_templates") {
+        return new Response("", { status: 302, headers: { location: "http://elsewhere/" } });
+      }
+      return jsonResponse({ core: [{ name: "a" }] });
+    });
+
+    const res = await handler()({ action: "list_templates" });
+
+    expect(res.isError).toBe(true);
+    expect(calls.map((c) => c.url)).toEqual([
+      CONFIGURED,
+      "http://[::1]:8199/api/workflow_templates",
+    ]);
+    const body = textOf(res);
+    expect(body).toContain("REDIRECT");
+    expect(body).toContain("NOT followed");
+  });
+
+  it("does NOT fall back when the configured server answered with a REDIRECT", async () => {
+    // Gate round 2, finding 1, over a real socket. `fetch` follows redirects, and
+    // the error names only the LAST hop — so a configured server that 302s to a
+    // dead address rejected with a bare ECONNREFUSED, indistinguishable from the
+    // configured address itself refusing, and the index came back from another
+    // machine under a note saying this one could not be reached at all.
+    const dead = createServer(() => {});
+    await new Promise<void>((r) => dead.listen(0, "127.0.0.1", () => r()));
+    const deadPort = (dead.address() as AddressInfo).port;
+    await new Promise<void>((r) => dead.close(() => r()));
+
+    const server = createServer((_req, res) => {
+      res.writeHead(302, { location: `http://127.0.0.1:${deadPort}/api/workflow_templates` });
+      res.end();
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const port = (server.address() as AddressInfo).port;
+    const previous = configuredBase;
+    configuredBase = `http://127.0.0.1:${port}`;
+    try {
+      // A panel IS connected and WOULD answer. It must not be asked: the
+      // configured server replied, and a reply is not a failure to reach it.
+      const panel = createServer((_req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end('{"from-the-panel":[{"name":"x"}]}');
+      });
+      await new Promise<void>((r) => panel.listen(0, "127.0.0.1", () => r()));
+      const panelPort = (panel.address() as AddressInfo).port;
+      setConnectedPanelOrigins(() => [`http://127.0.0.1:${panelPort}`]);
+      try {
+        const res = await handler()({ action: "list_templates" });
+
+        expect(res.isError).toBe(true);
+        const body = textOf(res);
+        expect(body).toContain("302");
+        // The panel's index must be nowhere in this result.
+        expect(body).not.toContain("from-the-panel");
+        expect(body).not.toContain("answered_by");
+      } finally {
+        await new Promise<void>((r) => panel.close(() => r()));
+      }
+    } finally {
+      configuredBase = previous;
+      await new Promise<void>((r) => server.close(() => r()));
+    }
   });
 
   it("passes the configured target through untouched when it works", async () => {

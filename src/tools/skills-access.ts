@@ -656,8 +656,61 @@ async function fetchTemplateIndexViaPanel(
     }
     throw primaryError;
   }
-  const altUrl = `${choice.origin.replace(/\/+$/, "")}${TEMPLATE_INDEX_PATH}`;
-  const primary = primaryError instanceof Error ? primaryError.message : String(primaryError);
+  // THE CHAIN (#1600 gate round 2, finding 2). `then` is the candidates left
+  // after this one, in preference order — in practice at most the single foreign
+  // panel behind an alias. Walking it is what lets the alias be tried first
+  // WITHOUT that preference making the foreign panel unreachable; the two
+  // single-choice orderings each cost one of those, and the gate found both.
+  //
+  // Only a TRANSPORT failure continues the walk. A status, a redirect, or a body
+  // is an answer from the address we asked, and moving on from an answer is how a
+  // caller ends up reading one server's reply as another's.
+  const rest = choice.then;
+  const primaryText = primaryError instanceof Error ? primaryError.message : String(primaryError);
+  for (const [index, candidate] of [choice.origin, ...rest].entries()) {
+    const isLast = index === rest.length;
+    try {
+      return await askOnePanelOrigin({
+        origin: candidate,
+        kind: index === 0 ? choice.kind : "use",
+        primary: primaryText,
+        ageMs: snapshot.ageMs,
+      });
+    } catch (err) {
+      // Not the last candidate, and nothing answered: try the next address rather
+      // than reporting a dead end we have not reached yet.
+      if (!isLast && err instanceof PanelOriginUnreachable) continue;
+      throw err instanceof PanelOriginUnreachable ? err.reported : err;
+    }
+  }
+  // Unreachable: the loop always returns or throws, since the chain is non-empty
+  // for both `use` and `alias`. Kept as a total function rather than a `!`.
+  throw primaryError;
+}
+
+/** A candidate that could not be reached AT ALL, carrying the error that should
+ *  be reported if there is nothing left to try. Distinguished from every other
+ *  failure because it is the only one that licenses walking on: a status or a
+ *  body means that address answered, and the walk must stop there. */
+class PanelOriginUnreachable extends Error {
+  constructor(readonly reported: Error) {
+    super(reported.message);
+    this.name = "PanelOriginUnreachable";
+  }
+}
+
+/** One candidate, asked once. Throws PanelOriginUnreachable when nothing at that
+ *  address answered, and an ordinary Error for every answer we refuse to use. */
+async function askOnePanelOrigin(opts: {
+  origin: string;
+  kind: "use" | "alias";
+  primary: string;
+  ageMs?: number;
+}): Promise<{ res: Response; url: string; origin: string; ageMs?: number }> {
+  const { origin, kind, primary, ageMs } = opts;
+  const snapshot = { ageMs };
+  const choice = { kind, origin };
+  const altUrl = `${origin.replace(/\/+$/, "")}${TEMPLATE_INDEX_PATH}`;
   let res: Response;
   try {
     res = await fetch(altUrl, {
@@ -692,10 +745,12 @@ async function fetchTemplateIndexViaPanel(
         : `A browser was connected from that origin, so it was reachable from there while this ` +
           `process cannot reach it: something between them (a tunnel, a container boundary, or a ` +
           `server bound to one interface) is in the way, and no address here will fix it.`;
-    throw new Error(
-      `${primary} I then tried ${altUrl}, published${observedAgo(snapshot.ageMs)} as the origin ` +
-        `of a connected sidebar panel, and that failed too: ${secondary}. ${why}`,
-      { cause: err },
+    throw new PanelOriginUnreachable(
+      new Error(
+        `${primary} I then tried ${altUrl}, published${observedAgo(snapshot.ageMs)} as the origin ` +
+          `of a connected sidebar panel, and that failed too: ${secondary}. ${why}`,
+        { cause: err },
+      ),
     );
   }
   // A 3xx is a REFUSAL, not a hop. A ComfyUI serves the template index at this
@@ -746,6 +801,29 @@ async function listWorkflowTemplatesAction(): Promise<ToolText> {
   // and it is the same auth path every other ComfyUI call uses.
   try {
     res = await comfyuiFetch(url, {
+      // #1600 gate round 2, finding 1 — A FOLLOWED REDIRECT MAKES THE FAILURE LIE.
+      //
+      // `fetch` follows redirects by default, and the error it raises names only
+      // the LAST hop. A configured ComfyUI behind a proxy that answers 302 with a
+      // Location nobody is listening on therefore rejects with a bare
+      // `ECONNREFUSED` — measured against a real socket, not inferred — which is
+      // byte-identical to the configured address itself refusing. mayAskAnotherServer
+      // then reads "no connection was ever established" off an error produced
+      // AFTER the configured server answered, and the index comes back from
+      // another machine with a note saying this one could not be reached at all.
+      //
+      // With `manual` there is no second hop to be confused by: a 3xx is a
+      // RESPONSE, `res.ok` is false, and it falls through to the non-2xx branch
+      // below, which names the status and the address. The configured server
+      // answered, so no fallback fires — which is the invariant this whole path
+      // is built on.
+      //
+      // The cost is real and is the right trade: a proxy that legitimately
+      // redirects this endpoint used to be followed silently and now reports the
+      // 3xx instead. That is a loud, addressable message about the user's own
+      // configuration, where the behaviour it replaces was a silent answer from a
+      // server they did not configure.
+      redirect: "manual",
       signal: AbortSignal.timeout(8000),
     });
   } catch (err) {

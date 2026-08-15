@@ -242,20 +242,24 @@ export function mayAskAnotherServer(err: unknown, failedUrl: string): boolean {
  *                   the drift text already says so.
  *  - `alias`      — a panel is on what #1175 calls the SAME server, reached by a
  *                   DIFFERENT host spelling (`[::1]` vs `127.0.0.1` vs
- *                   `localhost`). Retryable, and the safest candidate there is —
- *                   see the resolution order below.
+ *                   `localhost`). Tried first — see the resolution order below.
  *  - `ambiguous`  — two or more DIFFERENT origins are connected. Refuse to pick.
  *  - `use`        — exactly one different origin. `origin` is the ORIGINAL
  *                   published spelling, not the canonical one: the canonical
  *                   form exists to compare with, and connecting to a rewritten
  *                   host would be addressing something the browser never named.
+ *
+ * `then` carries the REMAINING candidates in preference order, so an `alias` that
+ * does not answer can fall through to the single foreign panel rather than ending
+ * the call. It is empty far more often than not, and a caller that ignores it
+ * degrades to trying only the first — the behaviour before the chain existed.
  */
 export type PanelFallbackChoice =
   | { kind: "none" }
   | { kind: "same"; origin: string }
-  | { kind: "alias"; origin: string }
+  | { kind: "alias"; origin: string; then: string[] }
   | { kind: "ambiguous"; origins: string[] }
-  | { kind: "use"; origin: string };
+  | { kind: "use"; origin: string; then: string[] };
 
 /** The host as #1175 compares it: lowercased, with the FQDN's trailing dot gone.
  *  undefined when the input does not parse — never "" , which would read as a
@@ -280,16 +284,33 @@ export function choosePanelFallbackOrigin(
   failedTarget: string,
   origins: readonly string[],
 ): PanelFallbackChoice {
-  // Keep the FIRST spelling seen for each canonical origin, so `use` returns
-  // something the browser actually reported. Insertion order is connection
-  // order, which is not evidence of anything — it is used only to make the
-  // single-candidate case deterministic, never to break a tie between two.
-  const byCanonical = new Map<string, string>();
+  // Group by canonical origin, keeping EVERY DISTINCT HOST SPELLING in each
+  // group, so `use` returns something the browser actually reported. Insertion
+  // order is connection order, which is not evidence of anything — it is used
+  // only to make the single-candidate case deterministic, never to break a tie.
+  //
+  // #1600 gate round 2, finding 3 — THE SPELLINGS CANNOT BE COLLAPSED HERE. This
+  // used to keep the FIRST spelling per canonical origin and throw the rest away,
+  // which discarded the alias before anything could classify it: with panels on
+  // `127.0.0.1:p` and `[::1]:p` and a failed `127.0.0.1:p`, the answer was `same`
+  // when the tabs connected in that order and `alias` when they connected in the
+  // other. Connection order is not a fact about which ComfyUI is running, so it
+  // must not decide whether the retry happens. Deduplication is now BY HOST,
+  // which drops genuine repeats (two tabs on one address) and keeps the only
+  // difference that can matter to a socket.
+  const byCanonical = new Map<string, string[]>();
   for (const raw of origins) {
     if (typeof raw !== "string" || raw.trim() === "") continue;
-    const canon = canonicalOrigin(raw);
+    const spelling = raw.trim();
+    const canon = canonicalOrigin(spelling);
     if (canon === undefined) continue;
-    if (!byCanonical.has(canon)) byCanonical.set(canon, raw.trim());
+    const host = hostOf(spelling);
+    const group = byCanonical.get(canon);
+    if (group === undefined) {
+      byCanonical.set(canon, [spelling]);
+      continue;
+    }
+    if (!group.some((s) => hostOf(s) === host)) group.push(spelling);
   }
   if (byCanonical.size === 0) return { kind: "none" };
   // An unparseable target cannot be compared, and "different from something I
@@ -315,41 +336,55 @@ export function choosePanelFallbackOrigin(
   const aliases: string[] = [];
   let sameAs: string | undefined;
   const wantHost = hostOf(failedTarget);
-  for (const [canon, spelling] of byCanonical) {
+  for (const [canon, spellings] of byCanonical) {
     if (canon !== want) {
-      different.push(spelling);
+      // A foreign origin contributes ONE candidate however many spellings of it
+      // are connected — they are the same server by the same rule.
+      different.push(spellings[0]);
       continue;
     }
-    const host = hostOf(spelling);
-    if (host !== undefined && wantHost !== undefined && host !== wantHost) aliases.push(spelling);
-    else sameAs = spelling;
+    for (const spelling of spellings) {
+      const host = hostOf(spelling);
+      if (host !== undefined && wantHost !== undefined && host !== wantHost) aliases.push(spelling);
+      else sameAs = spelling;
+    }
   }
-  // RESOLUTION ORDER, and the reasoning is a trade between two ways of being
-  // wrong. It is written out because the obvious order is the wrong one.
+  // RESOLUTION ORDER — and the two single-choice orderings are each wrong in one
+  // direction, which is why this returns a SEQUENCE instead of picking one.
   //
-  // The tempting rule is "an alias always wins": it is the only candidate here
-  // that is not a guess, since #1175 already holds it IS the configured server,
-  // so answering from it cannot answer from a machine the user did not choose.
+  // Gate round 1 said the alias must be preferred: it is the only candidate that
+  // is not a guess, since #1175 already holds it IS the configured server, so a
+  // foreign panel answering while the user's own server was available is a
+  // wrong-server answer.
   //
-  // That rule REGRESSES a case that works today. With one alias and one foreign
-  // origin published, taking the alias replaces a candidate that may well answer
-  // with one that just refused under another spelling — and when it fails, the
-  // call fails, having never asked the panel that could have served it. Trading a
-  // working answer for a safer-sounding one is not an improvement.
+  // It was then made to lose to a lone foreign candidate, because always
+  // preferring it regresses a case that works today: when the alias does not
+  // answer either, the call fails having never asked the panel that could have
+  // served it. Gate round 2 called THAT a P1, and both readings are right — each
+  // ordering trades one real failure for the other.
   //
-  // So the alias outranks only the verdicts that produce NO ANSWER AT ALL:
-  //   - `ambiguous`, where two foreign origins mean neither can be chosen. The
-  //     alias is not a third guess between them; it is the configured server, so
-  //     taking it resolves the refusal without ever picking between the two.
-  //   - `same`, which is the finding this whole comment is about.
-  // A single foreign candidate keeps precedence, exactly as before this rule
-  // existed, so no path that answered yesterday stops answering today.
+  // A CHAIN has neither failure. The alias is tried FIRST, because it is the
+  // configured server and that is the one the user asked for; the foreign
+  // candidate is tried AFTER it, because once the configured server has failed
+  // under every spelling we know of, answering from a connected panel and naming
+  // it is exactly the policy `use` already represents.
+  //
+  // Two foreign origins still REFUSE. A chain resolves precedence, not ambiguity,
+  // and there is still no evidence of which of two machines was meant — so they
+  // never enter it. An alias is tried before that refusal, since it is not a
+  // third guess between them.
   //
   // Two aliases (`[::1]` and `localhost` both published) are not an ambiguity
   // either: by the same rule they are one server, so the first is as good as the
   // second.
-  if (different.length === 1) return { kind: "use", origin: different[0] };
-  if (aliases.length > 0) return { kind: "alias", origin: aliases[0] };
+  const chain = [...aliases.slice(0, 1), ...(different.length === 1 ? different : [])];
+  if (chain.length > 0) {
+    return {
+      kind: aliases.length > 0 ? "alias" : "use",
+      origin: chain[0],
+      then: chain.slice(1),
+    };
+  }
   if (different.length > 1) return { kind: "ambiguous", origins: different };
   // `sameAs` is necessarily set here: the map is non-empty and nothing landed in
   // `different` or `aliases`. Asserted through a fallback rather than a `!` so a
