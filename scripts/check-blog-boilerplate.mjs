@@ -155,15 +155,19 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   // Against the NORMALIZED-but-unflattened source. `flat()` collapses every newline to a
   // space, so excluding the newline character inside these patterns was a no-op — a retired
   // claim could still match across a paragraph break. Line structure is signal here, not noise.
-  // Strip NEGATED forms before testing. "The panel no longer auto-starts a background agent"
-  // is the CORRECTION, not the retired claim, and flagging it would push an author to delete
-  // the sentence that documents the change. Only affirmative statements are banned.
-  const prose = unwrap(src).replace(
-    /\b(?:no longer|does not|doesn['’]t|cannot|can['’]t|never|isn['’]t able to|used to)\s+[^.;\n]{0,60}/gi,
-    ' ',
-  );
+  const prose = unwrap(src);
   for (const { pattern, why } of RETIRED) {
-    if (pattern.test(prose)) {
+    // Look BACKWARDS from each match instead of blanket-stripping negated spans. The strip
+    // approach deleted any 60 characters after a negation cue, so an unrelated correct
+    // negation earlier in the sentence swallowed a real claim: "The user does not connect
+    // because the panel auto-starts a background agent" erased the very phrase being checked.
+    // Now the cue only excuses a claim it is actually attached to.
+    const NEGATION = /\b(?:no longer|not|doesn['’]t|does not|cannot|can['’]t|never|used to)\s*$/i;
+    // 'gi' outright — the source patterns already carry `i`, and appending produced 'igi',
+    // which throws. matchAll requires the global flag.
+    const hits = [...prose.matchAll(new RegExp(pattern.source, 'gi'))];
+    const affirmative = hits.filter((h) => !NEGATION.test(prose.slice(Math.max(0, h.index - 24), h.index)));
+    if (affirmative.length) {
       failures++;
       console.error(`  ✗ blog/${file}: retired claim "${pattern.source}" — ${why}`);
     }

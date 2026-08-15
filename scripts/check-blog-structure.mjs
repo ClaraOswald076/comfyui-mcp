@@ -87,7 +87,11 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   checked++;
   // Strip fenced code first: a `## Licensing` line inside an example block is not a section,
   // and matching raw text would let a post satisfy this rule with a code sample.
-  const body = stripFences(src);
+  // Comments are stripped BEFORE the heading search, not after. Stripping later found a
+  // `## Licensing` that lived inside `<!-- ... -->` — the heading matched, the opening `<!--`
+  // sat above it and so was never in the measured span, and the trailing `-->` plus the hidden
+  // prose counted as content. A fully commented-out section passed while rendering nothing.
+  const body = stripFences(src).replace(/<!--[\s\S]*?-->/g, '');
   const m = body.match(/^##\s+Licensing\s*$/m);
   if (!m) {
     failures++;
@@ -102,10 +106,7 @@ for (const file of fs.readdirSync(BLOG).filter((f) => f.endsWith('.mdx'))) {
   // HTML comments are not content — they render as nothing. A long
   // `<!-- TODO: add licensing details -->` would otherwise satisfy the length check while the
   // reader sees an empty section, which is the exact state this rule exists to catch.
-  const sectionText = after
-    .split(/^##\s+/m)[0]
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .trim();
+  const sectionText = after.split(/^##\s+/m)[0].trim();
   // 30, not 80. The point is to catch an EMPTY section, and 80 rejected concise correct prose
   // — "MIT License. Commercial use is permitted without restriction." says everything required
   // in 61 characters. Length cannot establish semantics either way, so it is set where it
