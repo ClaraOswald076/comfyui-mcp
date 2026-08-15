@@ -345,6 +345,66 @@
             ]
           }
         ]
+      },
+      {
+        "language": "pt-BR",
+        "tabs": [
+          {
+            "tab": "Guias",
+            "groups": [
+              {
+                "group": "Primeiros passos",
+                "pages": [
+                  "pt-BR/index",
+                  "pt-BR/quickstart",
+                  "pt-BR/installation",
+                  "pt-BR/panel",
+                  "pt-BR/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "tr",
+        "tabs": [
+          {
+            "tab": "Kılavuzlar",
+            "groups": [
+              {
+                "group": "Başlangıç",
+                "pages": [
+                  "tr/index",
+                  "tr/quickstart",
+                  "tr/installation",
+                  "tr/panel",
+                  "tr/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "fa",
+        "tabs": [
+          {
+            "tab": "راهنماها",
+            "groups": [
+              {
+                "group": "شروع به کار",
+                "pages": [
+                  "fa/index",
+                  "fa/quickstart",
+                  "fa/installation",
+                  "fa/panel",
+                  "fa/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
       }
     ]
   },
