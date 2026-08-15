@@ -573,6 +573,41 @@ describe("the snapshot and its predicate (#1616)", () => {
     expect(res.conflict).toContain("cnr_map");
   });
 
+  it("the EXEMPTED contested name discloses what the exemption could not check", () => {
+    // GATE ROUND 7. `default` carries wildminder/ComfyUI-Chatterbox, so the exemption
+    // applies and this dispatches. It is NOT safe on that basis: `get_custom_nodes` keys
+    // an entry by its CNR id when the repo is registered, and (verified against the live
+    // registry, 2026-08-15) wildminder's repo is registered as "ComfyUI-ChatterboxTTS".
+    // The sent "ComfyUI-Chatterbox" therefore misses, and cnr_map["comfyui-chatterbox"] is
+    // sm079/comfyui-chatterbox — which is what Manager clones.
+    //
+    // Mirroring the registry to catch that is a wider fix than these 111 names (any
+    // re-keyed entry whose bare name matches another id is exposed), so what is pinned
+    // here is that the call does not pass in SILENCE implying it was verified.
+    const res = nodesInstallCommandArgs({
+      repository: "https://github.com/wildminder/ComfyUI-Chatterbox",
+    });
+    expect(res.conflict).toBeUndefined(); // still dispatches — no over-refusal
+    expect(res.note).toContain("COMFY REGISTRY id");
+    expect(res.note).toContain("panel_list_nodes");
+  });
+
+  it("the caveat rides ONLY the exempted call, never a refused or uncontested one", () => {
+    // Refused: the refusal already says everything, and appending a milder caveat to it
+    // would read as a way out of it.
+    expect(
+      nodesInstallCommandArgs({ repository: DEV_AUTHORS }).note ?? "",
+    ).not.toContain("ONE RESIDUAL ON THIS NAME");
+    // Uncontested: no measured collision, so no extra noise beyond the standing note.
+    expect(
+      nodesInstallCommandArgs({ repository: UNCOLLIDING }).note ?? "",
+    ).not.toContain("ONE RESIDUAL ON THIS NAME");
+    // Exempted contested name: present.
+    expect(nodesInstallCommandArgs({ repository: DEFAULT_AUTHORS }).note ?? "").toContain(
+      "ONE RESIDUAL ON THIS NAME",
+    );
+  });
+
   it("the CNR-fallback refusal does not claim a channel list carries anything", () => {
     // The channel-hit refusal says "the channel's list carries that name under X". Saying
     // that when the list carries NOTHING would be a fabricated mechanism, and this file's

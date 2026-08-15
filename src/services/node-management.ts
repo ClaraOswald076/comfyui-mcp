@@ -32,6 +32,7 @@ import {
   ambiguousBareNameRefusal,
   ambiguousBareNameWarning,
   bareNameAmbiguity,
+  contestedNameCaveat,
   registryVersionAmbiguity,
   registryVersionRefusal,
 } from "./manager-bare-name-collisions.js";
@@ -4585,6 +4586,10 @@ export function nodesInstallCommandArgs(args: {
       norm.note,
       rerouted && norm.repository ? gitInstallSubstitutionNote(effectiveChannel, norm.repository) : undefined,
       ambiguity ? ambiguousBareNameWarning(ambiguity) : undefined,
+      // #1616 gate round 7 — the exempted contested name says what it could not check,
+      // rather than letting silence read as "verified yours". Returns undefined for every
+      // call that was refused or warned above, so it never doubles up.
+      rerouted && norm.repository ? contestedNameCaveat(norm.repository, effectiveChannel) : undefined,
       defaultedChannel ? gitInstallChannelNote(GIT_INSTALL_DEFAULT_CHANNEL) : undefined,
     ]
       .filter((s): s is string => typeof s === "string" && s.length > 0)

@@ -38,14 +38,36 @@
  *    another machine's Manager. A 3.x caller clears this with the same explicit `channel`
  *    everyone else uses, and the refusal text says so.
  *
- *  * CNR re-keying. When a channel entry's repo is registered in the Comfy Registry,
- *    `get_custom_nodes` keys it by the CNR id instead of the bare name. Of the 249 channel
- *    entries behind these 111 names, 32 are re-keyed to an id that is not the bare name —
- *    for those the channel lookup MISSES, which is NOT the same as Manager giving up (see
- *    the CNR fallback below). The guard cannot know a host's CNR state, so it refuses
- *    there too. That trade can never block a resolution that would have returned the
- *    caller's own URL, because a channel that lists exactly the caller's repo under that
- *    name is allowed through below.
+ *  * CNR RE-KEYING, WHICH ALSO DEFEATS THE EXEMPTION BELOW — the one limit here that is
+ *    a WRONG ALLOW rather than an over-refusal, so it is stated first and plainly.
+ *    `get_custom_nodes` does not key a channel entry by its bare name when that entry's
+ *    repo is registered in the Comfy Registry; it keys it by the CNR id:
+ *
+ *      cnr = self.get_cnr_by_repo(v['files'][0])
+ *      if cnr: v['id'] = cnr['id']; node_id = v['id']     # <- the CNR ID, not the name
+ *      else:   node_id = v['files'][0].split('/')[-1]     # <- the bare name
+ *      res[node_id] = v
+ *
+ *    So when the repo a channel lists under a name is registered under a DIFFERENT id,
+ *    that entry is not reachable by the bare name at all: the lookup misses and falls
+ *    through to the CNR fallback below. `bareNameAmbiguity` exempts a call when the
+ *    channel carries exactly the caller's repo — and for a re-keyed entry that exemption
+ *    is unsound. Verified end to end against the live registry, 2026-08-15:
+ *
+ *      caller: https://github.com/wildminder/ComfyUI-Chatterbox   (`default` carries it,
+ *              so this is exempted here and dispatches)
+ *      but:    that repo is registered as id "ComfyUI-ChatterboxTTS", so the sent
+ *              "ComfyUI-Chatterbox" misses, and cnr_map["comfyui-chatterbox"] is
+ *              sm079/comfyui-chatterbox — which is what gets cloned.
+ *
+ *    THIS GUARD DOES NOT CATCH THAT, and an earlier version of this comment claimed it
+ *    could never happen. Closing it needs the registry's repo->id map mirrored here, and
+ *    the hazard is NOT confined to these 111 names — any pack whose entry is re-keyed and
+ *    whose bare name matches someone else's registry id is exposed, which makes it a
+ *    wider bug than the channel collision this module was split out to prevent. Tracked
+ *    separately rather than half-fixed for an arbitrary 111 names. What is true here is
+ *    only this: nothing below makes that case worse than it already is, and the standing
+ *    substitution warning still rides the exempted call.
  *
  *  * A pip-installed Manager. `get_data_by_mode` reads the cache file for the configured
  *    channel URL, else the snapshot BUNDLED in the package — a stale, default-flavoured
@@ -239,6 +261,10 @@ export function bareNameAmbiguity(url: string, channel: string): BareNameAmbigui
   const channelCandidates = ownCandidates(entry, asked as ManagerChannelName) ?? [];
   const callerRepo = comparableToSnapshot(url) ? ownerRepoOf(url) : undefined;
   if (channelCandidates.length === 1 && callerRepo && sameRepo(channelCandidates[0], callerRepo)) {
+    // EXEMPT: the channel carries exactly what was asked for, so there is nothing to pick
+    // between. Sound ONLY if that entry is reachable by the bare name — see the CNR
+    // re-keying note in the header for the case where it is not. The caveat is disclosed
+    // by `contestedNameCaveat`, which is why this returns silence rather than a warning.
     return undefined;
   }
   const channelsResolvingToCaller = callerRepo
@@ -329,6 +355,38 @@ export function registryVersionAmbiguity(
     version: version.trim(),
     candidates,
   };
+}
+
+/**
+ * THE ONE THING THE EXEMPTION CANNOT PROMISE, said out loud on the call it exempts.
+ *
+ * `bareNameAmbiguity` returns `undefined` — dispatch, nothing to refuse — when the asked
+ * channel carries exactly the repository the caller named. That is sound only while that
+ * entry is reachable BY THE BARE NAME, and `get_custom_nodes` re-keys an entry to its CNR
+ * id when its repo is registered, which makes it unreachable and sends the call to the
+ * registry fallback instead (header, with a measured example). Nothing here can see a
+ * registry, so the choice is between silently implying safety and saying what is unknown.
+ *
+ * Returns a caveat only for a name this snapshot has MEASURED as contested and only when
+ * the call was exempted — an uncontested name gets the standing substitution note and no
+ * extra noise, and a refused call already says far more than this.
+ */
+export function contestedNameCaveat(url: string, channel: string): string | undefined {
+  const bare = managerBareName(url);
+  const entry = ownCandidates(AMBIGUOUS_BARE_NAMES, bare.trim().toLowerCase());
+  if (!entry) return undefined;
+  if (bareNameAmbiguity(url, channel) !== undefined) return undefined; // refused/warned already
+  return (
+    `ONE RESIDUAL ON THIS NAME: "${bare}" is one of the ${Object.keys(AMBIGUOUS_BARE_NAMES).length} ` +
+    `names measured to be claimed by more than one repository, and the "${channel}" channel ` +
+    `does list the repository you named — which is why this was not refused. That check ` +
+    `cannot see one last step: Manager keys a channel entry by its COMFY REGISTRY id ` +
+    `rather than by the repo name whenever that repo is registered, so if yours is ` +
+    `registered under a different id, "${bare}" will not match it and Manager falls back ` +
+    `to whatever repository the REGISTRY has under that name. Confirm with panel_list_nodes ` +
+    `that what landed is the repo you meant; install_custom_node (source:"git") clones the ` +
+    `URL verbatim if you need to be certain.`
+  );
 }
 
 /**
