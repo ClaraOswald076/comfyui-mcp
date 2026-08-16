@@ -745,6 +745,30 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.51.57] - 2026-08-16
+
+### MCP
+
+#### Fixed
+- a node read by id returns its full widget value, not a survey clip (#1634)
+- cancel_queued reports the removal it observed, not the one it requested (#1632)
+- a repo filed under a Comfy Registry id is refused, not swapped for another author's (#1624)
+- a run acknowledged after its reply timeout is not an unknown outcome (#1175)
+- a skill description with a colon in it ships with NO description at all (#1620)
+- a tree the server demonstrably reads is not refused over one stray file (#1147)
+- a session that came up without an MCP server says so (#1524)
+- a queued credential respawn waits for in-flight transfers instead of killing them (#1567)
+- a post-open exempt read that got no answer is REPORTED (#1560)
+- refuse the ambiguous from-source install instead of picking a repo (#1616)
+- a refused offer is not a verdict anyone was told (#1327)
+- a git-URL install stops asking a Manager channel nobody chose (#1539)
+- the Manager verdict never asserts more than it observed (#1374)
+- a drained ComfyUI-Manager queue is not evidence the file landed (#1374)
+
+#### Changed
+- rgthree skill — the toggles agents keep getting wrong (#1551)
+
+
 ## [0.51.56] - 2026-08-15
 
 ### MCP
