@@ -746,6 +746,10 @@ export const __panelToolsTestHooks = {
   setReconnectWaitTiming(timing: { budgetMs: number; intervalMs: number } | null): void {
     reconnectWaitTimingOverride = timing;
   },
+  /** Shrink the #1175 late-acknowledgement grace so a reconcile test doesn't wait 10s. */
+  setRunLateAckGraceMs(ms: number | null): void {
+    runLateAckGraceMsOverride = ms;
+  },
   isRetrySafeCmd,
   isTransientReconnectError,
   // CivitAI sample-image gating (#623): the predicate that decides which results'
@@ -7982,6 +7986,116 @@ function reResolveDesktopTab(ctx: PanelToolCtx, label: string): string | undefin
  *  handler started. Without it the observed worst case is deadline + grace +
  *  everything else, which is how an ask still ended in a raw transport timeout
  *  instead of a clean result. */
+// ---- panel_run late-acknowledgement reconcile (#1175) ----------------------
+//
+// `panel_run({to_node_id:8})` returned OUTCOME UNKNOWN on the 20 000 ms reply
+// bound; the panel acknowledged that same run 5.3 s later, having queued it. The
+// caller was then sent to `queue (action:"list")`, which came back EMPTY — during
+// the propagation window an accepted prompt is not visible there yet, so the one
+// check the disclosure offers reads as "nothing was queued" for a run that was.
+// Only the #694 retry token eventually recovered it, and that costs a whole extra
+// agent round trip to learn something the orchestrator was already holding.
+//
+// THE BOUND IS NOT WHAT IS BEING FIXED, and it is worth saying why. `graph_run`
+// is bounded at the shared 20 000 ms default, which was chosen for commands whose
+// panel-side work is one synchronous canvas edit. A SCOPED run's is not: the panel
+// serialises the prompt for its pre-flight, serialises it again for the scoped
+// run's content hash, then makes up to four `app.queuePrompt` attempts (each of
+// which serialises AGAIN and POSTs /prompt), and holds a 5 000 ms verification
+// budget it can only enter AFTER queuePrompt returns — i.e. work that begins near
+// the end of our window and runs past it. None of that is bounded from out here,
+// so any literal we pick is a number that happens to fit the rigs we measured.
+// Raising it would have made this reporter's run fit and the next one's not.
+//
+// So: keep the bound, and stop declaring the outcome unknown while the answer is
+// still arriving. This is the deadline+grace shape `confirm()` already uses for a
+// slow `ask_user` card, over the retention #694 already installs for exactly these
+// commands. Nothing is re-dispatched, and a run that never acknowledges is
+// reported exactly as it is today.
+
+/** How long panel_run waits for a `graph_run` acknowledgement that missed its
+ *  reply bound (#1175).
+ *
+ *  Derived from the panel's own post-queue budget rather than from the reporter's
+ *  5.3 s: `dispatchScopedRun`'s verification wait is 5 000 ms and it is entered
+ *  AFTER `app.queuePrompt` resolves, so the panel can legitimately still be
+ *  working 5 s past our bound, plus the reply's own trip. 10 s covers that with
+ *  headroom and stays far inside the ~300 s tools/call ceiling.
+ *
+ *  Paid ONLY on a path that has already spent its full bound and is otherwise
+ *  about to hand the caller an unknown outcome — so the worst case is 10 s added
+ *  to a call that already failed, in exchange for not re-rendering. */
+export const RUN_LATE_ACK_GRACE_MS = 10_000;
+/** Poll interval for the grace above. Matches pollLateAskReply's granularity. */
+const RUN_LATE_ACK_POLL_MS = 200;
+let runLateAckGraceMsOverride: number | null = null;
+/** The grace actually applied. Test-overridable on the same terms as
+ *  retrySettleMs: a suite proving the RECONCILE must not also pay for the real
+ *  wall clock, and the duration is not what any of them assert. */
+function runLateAckGraceMs(): number {
+  return runLateAckGraceMsOverride ?? RUN_LATE_ACK_GRACE_MS;
+}
+
+/**
+ * Wait, bounded, for the panel to acknowledge a `graph_run` we stopped waiting
+ * for — and hand back the reply it would have produced on time (#1175).
+ *
+ * Returns null when there is nothing to reconcile, which is every case except a
+ * retained `graph_run` success WITH its body. The negatives are deliberate:
+ *
+ *  - NOT a reply timeout ⇒ nothing to wait for. Gated on the bridge's own typed
+ *    mark, never on message text: an acked panel error can quote our timeout
+ *    sentence verbatim (#1468 round 2), and the difference between the two is
+ *    whether the tab answered, which only the bridge knows.
+ *  - NO retained body ⇒ leave the entry ALONE. The retry-token layer drains this
+ *    same rid to tell the caller their earlier attempt landed; consuming it here
+ *    to answer a question we then could not act on would delete the recovery the
+ *    caller still had. Hence peek-then-take.
+ *  - A DIFFERENT command's entry ⇒ leave it alone for the same reason. The rid is
+ *    ours, so this should not happen; if it ever does, the safe reading of a
+ *    surprise is not to spend someone else's notice on it.
+ */
+async function reconcileLateRunAck(
+  ctx: PanelToolCtx,
+  res: ToolResult,
+  rid: string | undefined,
+): Promise<{ result: unknown; lateByMs: number } | null> {
+  if (!rid || !isReplyTimeoutResult(res)) return null;
+  const bridge = ctx.bridge;
+  if (typeof bridge?.peekLateMutation !== "function") return null;
+  if (typeof bridge?.takeLateMutation !== "function") return null;
+  const deadline = Date.now() + runLateAckGraceMs();
+  for (;;) {
+    const seen = bridge.peekLateMutation(rid);
+    if (seen) {
+      if (seen.cmd !== "graph_run" || !("result" in seen)) return null;
+      // Only now is it certain this entry will be USED, so draining it costs the
+      // caller nothing: they are about to be handed its contents.
+      const taken = bridge.takeLateMutation(rid);
+      if (!taken || !("result" in taken)) return null;
+      return { result: taken.result, lateByMs: taken.lateByMs };
+    }
+    const left = deadline - Date.now();
+    if (left <= 0) return null;
+    await sleep(Math.max(1, Math.min(RUN_LATE_ACK_POLL_MS, left)));
+  }
+}
+
+/** The disclosure that rides on a run recovered by the grace above. Says what was
+ *  observed and nothing more: the panel answered late, this is THAT answer, and
+ *  no second dispatch was made. */
+function lateRunAckNote(lateByMs: number): string {
+  const secs = (lateByMs / 1000).toFixed(1);
+  return (
+    `\n\n[RECOVERED] This run's acknowledgement arrived ${secs}s AFTER its reply window closed, ` +
+    `and the result above IS that acknowledgement — the panel's own reply, read verbatim, not a ` +
+    `state inferred afterwards. Nothing was dispatched a second time, so nothing here is a ` +
+    `duplicate render. You may see the earlier attempt described as outcome-unknown in a log; ` +
+    `this is its outcome. (A queue listing taken in the moments after a run is accepted can still ` +
+    `be empty, so an empty queue would not have settled this either way.)`
+  );
+}
+
 async function pollLateAskReply(
   bridge: PanelToolCtx["bridge"],
   askId: string,
@@ -9897,7 +10011,28 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // it. Without the timestamp the journal has no way to tell the agent's own
         // 0.1s render from a stranger's, and reported it as UNDETERMINED.
         const runDispatchedAt = Date.now();
-        let res = await ctx.call(runCmd, 20000);
+        // #1175 — the rid of the dispatch we are about to make, so an unanswered
+        // one can be reconciled against the panel's late acknowledgement. Rebound
+        // by the re-issue below, deliberately: the entry that matters is always
+        // the LAST dispatch, which is the only one whose outcome is still open.
+        let runRid: string | undefined;
+        const observeRunRid = (rid: string): void => {
+          runRid = rid;
+        };
+        let lateAckNote = "";
+        let res = await ctx.call(runCmd, 20000, observeRunRid);
+        // #1175 — fold a late acknowledgement into `res` BEFORE anything reads it,
+        // so a recovered run takes the identical path an on-time one takes: the same
+        // rejection detection, the same prompt-id ticketing, the same anti-poll
+        // guidance. Rebuilding the reply here (rather than describing it) is what
+        // makes that possible — `ok()` is exactly what ctx.call would have produced.
+        const reconcileRun = async (): Promise<void> => {
+          const recovered = await reconcileLateRunAck(ctx, res, runRid);
+          if (!recovered) return;
+          res = ok(recovered.result);
+          lateAckNote = lateRunAckNote(recovered.lateByMs);
+        };
+        await reconcileRun();
         // Derive the verdict from the AUTHORITATIVE reply, not a bare `queued`
         // flag. A rejection — a no-connected-tab / thrown-queuePrompt error
         // (#331/#248), or a ComfyUI /prompt refusal on EITHER channel
@@ -9932,7 +10067,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // nothing more. A graph still moving after it (a user actively editing)
             // races again and is SURFACED, never re-raced.
             await sleep(retrySettleMs());
-            res = await ctx.call(runCmd, 20000);
+            res = await ctx.call(runCmd, 20000, observeRunRid);
+            // #1175 — the re-issue can miss its window exactly as the first
+            // dispatch can, and this is the one whose outcome is genuinely open
+            // (the first was CERTIFIED to have queued nothing). Reconcile it on
+            // the same terms; observeRunRid has already rebound to this attempt.
+            await reconcileRun();
             rejection = detectRunRejection(res);
           } catch (err) {
             // ctx.call settles every panel/transport failure into a ToolResult and does
@@ -9956,7 +10096,14 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // FIRST dispatch queued nothing — and leaves the second attempt's outcome to be
           // read from the rejection itself, which may be a post-write timeout whose
           // outcome nobody can honestly claim to know.
-          if (!scopeRebuilt) return rejection;
+          // #1175 — a recovered acknowledgement can carry the panel's own REFUSAL
+          // (the bridge retains `ok:true`, which means the executor answered, not
+          // that it queued anything). That verdict is authoritative and is surfaced
+          // as the failure it is — but it still has to say it arrived late, or the
+          // caller reads a refusal for a dispatch they were told was unknown and
+          // cannot tell whether these are one event or two.
+          if (!scopeRebuilt)
+            return lateAckNote ? appendToolResultText(rejection, lateAckNote) : rejection;
           return appendToolResultText(
             rejection,
             `\n\n(Dispatch history: the first graph_run was refused by the panel's run-to-node ` +
@@ -9965,7 +10112,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               `(#1050). The failure above is that SECOND dispatch; it was not retried again. ` +
               `Judge whether anything was queued from that message alone — the first dispatch ` +
               `definitely queued nothing. Racing AGAIN after the pause means the graph is still ` +
-              `changing under the run: let the canvas settle, then re-run.)`,
+              `changing under the run: let the canvas settle, then re-run.)` +
+              lateAckNote,
           );
         }
         // Attribute this genuine queue to ourselves so a later panel_run in the
@@ -10085,11 +10233,31 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               // droppedNote sits FIRST among the appendices: "some outputs were
               // dropped" changes what the caller should expect from this run, so
               // it must not trail behind the anti-poll boilerplate (#944).
-              { type: "text", text: res.content[0].text + droppedNote + retryBypassNote + retryNote + warn + note },
+              //
+              // lateAckNote sits second, ahead of the anti-poll guidance, for the
+              // same reason: a caller who has already been handed an
+              // outcome-unknown for this dispatch needs to know THIS is its
+              // resolution before being told to idle and wait (#1175).
+              {
+                type: "text",
+                text:
+                  res.content[0].text +
+                  droppedNote +
+                  lateAckNote +
+                  retryBypassNote +
+                  retryNote +
+                  warn +
+                  note,
+              },
               ...res.content.slice(1),
             ],
           };
         }
+        // A recovered run must never lose its disclosure to a non-text reply
+        // shape. `ok()` always produces text, so this is unreachable for the
+        // #1175 path today — but "unreachable today" is why the branch above was
+        // the only one carrying the appendices in the first place.
+        if (lateAckNote) return appendToolResultText(res, lateAckNote);
         return res;
       },
     ),
