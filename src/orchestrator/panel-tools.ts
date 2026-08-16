@@ -470,11 +470,19 @@ export function describeComfyuiSecretSave(receipt: SecretSaveReceipt): string {
     if (pending > 0) {
       parts.push(
         `${readsItAtUseTime}. But a tool-session respawn is STILL PENDING from this save ` +
-          `(${pending} queued for the end of this turn), and it replaces the tool session when it fires. ` +
-          `Anything long-running that session owns is lost at that point — model downloads in ` +
-          `particular. This message cannot list them, because a transfer started AFTER this save ` +
-          `did not exist when the check ran (#1567). If you are about to start a long download, ` +
-          `let the respawn land first.`,
+          `(${pending} queued, normally for the end of this turn), and it replaces the tool session ` +
+          `when it fires. Anything long-running that session owns is lost at that point — model ` +
+          `downloads in particular. This message cannot list them, because a transfer started AFTER ` +
+          `this save did not exist when the check ran (#1567). ` +
+          // #1567 item 2 — the advice used to be "let the respawn land before you start a long
+          // download", which put the burden on the user to sequence around a rebuild they cannot
+          // see. The respawn now WAITS instead, so this says what the scheduler will actually do
+          // — including the one case that still costs transfers, since a promise with an
+          // unstated exception is how this receipt misled someone the first time.
+          `You do not have to sequence around it: when it comes due it waits for in-flight model ` +
+          `downloads to finish rather than killing them. It stops waiting only if every one of them ` +
+          `makes no progress for a couple of minutes, and it reports what it gave up on when that ` +
+          `happens.`,
       );
     } else if (already > 0) {
       // A respawn HAPPENED. Saying none was required describes a different save,

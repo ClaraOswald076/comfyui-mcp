@@ -587,16 +587,33 @@ export function atRiskNote(
  * disk) and is explicit that resumability depends on something this code cannot see: which
  * side of the credential change each transfer started on. Claiming either outcome would be
  * asserting the thing that actually varies.
+ *
+ * ## `heldMs` — why the rebuild is going ahead anyway
+ *
+ * A queued respawn now WAITS for in-flight transfers instead of killing them (#1567 item
+ * 2), so reaching this note at all means the wait was given up on: every remaining transfer
+ * stopped making progress for the whole stall window. That is a different event from the
+ * original report — "it killed them the moment it came due" — and saying so is what stops
+ * the note reading as though the wait never happened. Omitted when there was no wait (the
+ * transfers are being killed immediately), because inventing one would be a false claim
+ * about how long the user had.
  */
 export function orphanedByDeferredRespawnNote(
   orphaned: AtRiskDownloads | readonly { filename: string; bytes: number }[],
+  heldMs?: number,
 ): string | null {
   if (!orphaned.length) return null;
+  const waited =
+    typeof heldMs === "number" && heldMs > 0
+      ? ` The rebuild WAITED ${Math.round(heldMs / 1000)}s for them rather than killing them ` +
+        `when it came due, and gave up because they stopped making progress — so each of these ` +
+        `is either stalled or already dead, and re-issuing is how you find out which.`
+      : ``;
   return (
     `🛑 The queued tool-session rebuild is happening NOW, and ${atRiskDownloadSummary(orphaned)} ` +
     `were still transferring. They belong to the session being replaced, so they are being ` +
     `killed — this is the rebuild that was queued when a comfyui credential was saved earlier ` +
-    `(#1567).\n\n` +
+    `(#1567).${waited}\n\n` +
     `The partial files are still on disk, so re-issuing each download is worth doing: it can ` +
     `RESUME from them rather than starting over. A transfer that was already running when the ` +
     `credential changed has a different cache identity and definitely restarts from 0%; one ` +
