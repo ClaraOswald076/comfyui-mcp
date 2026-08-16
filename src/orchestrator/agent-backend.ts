@@ -149,6 +149,14 @@ export type AgentEvent = (
        *  verified success, so renderers must not frame it as either (no "turn
        *  failed", no "nothing was lost — try again"). */
       unverifiedCompletion?: boolean;
+      /** The error is about the SESSION, not about a turn (#1524): it is emitted
+       *  at session start — before any turn exists — so the turn framing every
+       *  other error gets ("the <model> turn failed … try again") would name a
+       *  turn that never ran and offer a retry that changes nothing. It must be
+       *  rendered as its own self-contained line, and must NOT consume the
+       *  once-per-turn error slot, or a session notice would silence the first
+       *  REAL turn error that follows it. */
+      sessionNotice?: boolean;
     }
 ) & {
   /** Backend-minted TURN MARKER (#728): a monotonically increasing id (1 = the

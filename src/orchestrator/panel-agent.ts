@@ -2029,6 +2029,17 @@ export class PanelAgent {
         // was already surfaced (the stall watchdog's warning, or an earlier
         // error event this turn), skip the chat line but still log it (#728).
         const detail = typeof ev.message === "string" && ev.message.trim() ? ev.message.trim() : "unknown error";
+        // #1524 — a SESSION notice (an MCP server the session did not come up
+        // with) is not a turn failure. It arrives at init, before any turn
+        // exists, so the turn framing below would name a turn that never ran and
+        // offer a retry that re-runs nothing. It also must not spend the
+        // once-per-turn error slot: doing so would let a notice about the
+        // toolset swallow the first genuine turn error after it.
+        if (ev.sessionNotice) {
+          this.deps.onSay(this.tabId, `⚠️ ${detail}`);
+          logger.error(`[panel-agent ${this.short()}] session notice: ${detail}`);
+          break;
+        }
         if (!this.errorSurfaced) {
           this.errorSurfaced = true;
           // #886: a "completed but unverified" disclosure is NOT a turn failure

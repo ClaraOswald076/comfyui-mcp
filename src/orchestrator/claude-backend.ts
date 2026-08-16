@@ -23,6 +23,8 @@ import { logger } from "../utils/logger.js";
 import { errorText } from "./error-text.js";
 import { buildAgentSpawnEnv } from "../services/panel-secrets.js";
 import { loadTurnRegistry, saveTurnRegistry, tombstoneTurn } from "./turn-registry.js";
+import { degradedMcpNotice, inspectMcpServers } from "./mcp-session-health.js";
+import type { DegradedMcpServer } from "./mcp-session-health.js";
 import { randomUUID } from "node:crypto";
 import {
   type AgentBackend,
@@ -419,6 +421,81 @@ export class ClaudeBackend implements AgentBackend {
     };
   }
 
+  /** Configured servers still CONNECTING in this session's `init` report (#1524).
+   *  Settled once, at the first turn end, by settlePendingMcpServers(). */
+  private pendingMcpServers: string[] = [];
+
+  /** Say — in the log — that this session does not have servers it was given.
+   *  Shared by the init check and the deferred settle so both report identically. */
+  private reportDegradedMcp(
+    degraded: readonly DegradedMcpServer[],
+    reported: readonly { name: string; status: string }[] | undefined,
+    sessionId: string,
+    when = "started",
+  ): void {
+    logger.error(
+      `[claude-backend] session ${sessionId.slice(0, 8)} ${when} WITHOUT ` +
+        `${degraded.map((d) => `${d.name}=${d.status ?? "absent"}`).join(" ")} ` +
+        `(reported: ${(reported ?? []).map((s) => `${s.name}=${s.status}`).join(" ") || "none"})`,
+    );
+  }
+
+  /**
+   * Settle the servers that were still connecting at `init` (#1524).
+   *
+   * `init` is the only MCP report the session PUSHES, and server startup does not
+   * block it — so a server that is `pending` there and FAILS a moment later would
+   * otherwise never be mentioned anywhere, which is the same silence this change
+   * exists to end, just moved a few hundred milliseconds later.
+   *
+   * Re-read once per run, at the first turn end: by then a pending server has
+   * settled, and a turn boundary needs no timer and cannot spam. A session that
+   * never takes a turn is never re-read, which is the right trade — there is no
+   * agent work to degrade.
+   *
+   * Best-effort by construction: `mcpServerStatus()` is an optional Query method
+   * (a harness that lacks it, or a poll that throws, leaves the pending servers
+   * unmentioned rather than guessed at).
+   */
+  private async settlePendingMcpServers(): Promise<AgentEvent | null> {
+    const names = this.pendingMcpServers;
+    if (names.length === 0) return null;
+    // Taking the names IS the once-only guard: the next turn end finds the list
+    // empty and returns before the poll. A re-read on every turn would spend a
+    // control round-trip per turn for a question that is already answered.
+    this.pendingMcpServers = [];
+    let reported: Array<{ name: string; status: string }> | undefined;
+    try {
+      reported = await this.q?.mcpServerStatus?.();
+    } catch (err) {
+      logger.debug(`[claude-backend] mcpServerStatus: ${msgOf(err)}`);
+      return null;
+    }
+    const { degraded } = inspectMcpServers(names, reported);
+    if (!degraded.length) return null;
+    this.reportDegradedMcp(degraded, reported, this.registrySessionId ?? "", "is running");
+    return { type: "error", sessionNotice: true, message: degradedMcpNotice(degraded) };
+  }
+
+  /**
+   * The MCP server set this session is given: the comfyui stdio child, plus the
+   * in-process panel server when this key drives the canvas.
+   *
+   * Split out of buildOptions() so #1524's init check can name the servers we
+   * ASKED for without re-deriving them. Deriving them twice is how the check
+   * would end up comparing the session's report against a set the session was
+   * never handed — which is a false alarm in one direction and blindness in the
+   * other, and neither shows up in a test that builds both sides itself.
+   */
+  private mcpServersForRun(): Options["mcpServers"] {
+    return {
+      ...this.deps.mcpServers,
+      // Live-graph control of THIS tab's open workflow (in-process; talks to
+      // the bridge). Lets the agent build on what the user sees.
+      ...(this.deps.panelServer ? { panel: this.deps.panelServer } : {}),
+    };
+  }
+
   private buildOptions(opts: BackendStartOptions): Options {
     const model = opts.model;
     const effort = toClaudeEffort(opts.effort);
@@ -440,12 +517,7 @@ export class ClaudeBackend implements AgentBackend {
       // these into onStream deltas; the final assistant message still commits the
       // authoritative text via onSay (reconciled by message id).
       includePartialMessages: true,
-      mcpServers: {
-        ...this.deps.mcpServers,
-        // Live-graph control of THIS tab's open workflow (in-process; talks to
-        // the bridge). Lets the agent build on what the user sees.
-        ...(this.deps.panelServer ? { panel: this.deps.panelServer } : {}),
-      },
+      mcpServers: this.mcpServersForRun(),
       // Only our comfyui MCP — never inherit the user's project/user MCP config
       // (which may run a second comfyui that grabs the bridge port).
       strictMcpConfig: true,
@@ -505,6 +577,10 @@ export class ClaudeBackend implements AgentBackend {
     this.turns.length = 0;
     this.lastResultTurnId = this.turnSeq;
     this.classificationPoisoned = false;
+    // #1524 — MCP health is per SESSION. A restart re-runs every connection, so
+    // the previous run's pending set and its "already settled" mark must not
+    // suppress the new session's report.
+    this.pendingMcpServers = [];
     this.parkedInterrupted.clear(); // dead session's parks die with it
     this.consumedInterrupted.clear(); // …and its landing history
     this.markerBase = this.lastResultTurnId; // turn markers are run-relative (#728)
@@ -579,6 +655,14 @@ export class ClaudeBackend implements AgentBackend {
           continue;
         }
         yield streamTurn === undefined ? ev : { ...ev, turn: streamTurn - this.markerBase };
+      }
+      // #1524 — settle whatever was still CONNECTING at init, once, at the first
+      // turn end. Placed here rather than in route() because it has to await a
+      // control request, and after the turn's own events so a session notice
+      // never interleaves into the middle of a reply.
+      if (message.type === "result") {
+        const settled = await this.settlePendingMcpServers();
+        if (settled) yield settled;
       }
     }
   }
@@ -738,6 +822,33 @@ export class ClaudeBackend implements AgentBackend {
           logger.info(
             `[panel-agent] init model=${message.model} session=${message.session_id.slice(0, 8)} apiKeySource=${message.apiKeySource} skills=${message.skills?.length ?? 0}`,
           );
+          // #1524 — the session just told us which of its MCP servers actually
+          // connected. Say so when one did not, instead of letting the agent run
+          // for hours against a toolset that was silently thinned. This is the
+          // reported failure exactly: `comfyui` came back after a mid-session
+          // drop, the 92 `panel_*` tools did not, and the only signal anywhere
+          // was a tool-list diff the agent had to notice on its own.
+          //
+          // It reports the observation, not a cause. WHY a server goes missing is
+          // still open on #1524 and the candidates need different fixes; this
+          // fires the same either way, which is the point — it turns a silent,
+          // unreproducible degradation into one that names itself the moment it
+          // happens, on whichever transport it happens to.
+          const health = inspectMcpServers(
+            Object.keys(this.mcpServersForRun() ?? {}),
+            message.mcp_servers,
+          );
+          // A server still CONNECTING at init is not a failure — server startup
+          // does not block the session, so a slow one is legitimately `pending`
+          // here and connected a moment later. It is not "fine" either: `init` is
+          // the only report the session PUSHES, so a pending server that goes on
+          // to fail would never be mentioned. Remember the names and settle them
+          // at the first turn end (see settlePendingMcpServers).
+          this.pendingMcpServers = health.pending;
+          if (health.degraded.length) {
+            this.reportDegradedMcp(health.degraded, message.mcp_servers, message.session_id);
+            yield { type: "error", sessionNotice: true, message: degradedMcpNotice(health.degraded) };
+          }
         } else if (message.subtype === "thinking_tokens") {
           // Live extended-thinking token count → drives a "thinking… (N)" meter
           // so the user can see the agent reasoning (not stuck) before any text.
