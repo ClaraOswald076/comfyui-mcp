@@ -444,16 +444,9 @@ export function queryApiGraph(graph: ApiGraph, opts: GraphQueryOptions = {}): Gr
   // quoted back to the user as the node's prompt.
   //
   // So a pinpoint read gets the SAME per-value cap the `detail` projection uses. Note
-  // what this deliberately does NOT do: it does not exempt the row from `max_chars`, and
-  // it does not change the compact SHAPE (still one line per node). A large `ids` list
-  // still degrades through the existing row-drop path, so the token bound is intact.
+  // what this deliberately does NOT do: it does not change the compact SHAPE (still one
+  // line per node), and it does not touch the survey path or the outline ladder.
   //
-  // The cap is tightened to `max_chars` exactly as capWidgets() does for the detail
-  // projection. Without that reserve the FIRST row — which #609 protects from the budget
-  // and never drops — carries a 2048-char value on a 500-char budget and breaches the
-  // bound outright: measured 740 chars against `max_chars`=500, where main returned 465.
-  // The protected row is the one line that cannot be dropped to recover, so its per-value
-  // cap has to respect the budget itself.
   // Only a SINGLE id is a pinpoint read. Treating any `ids` list as one cost rows the
   // caller explicitly asked for and main returned in full — 20 ordinary 600-char prompts
   // at the default budget went from 20/20 to 18/20 (gate). One id also means at most one
@@ -632,10 +625,6 @@ export function queryApiGraph(graph: ApiGraph, opts: GraphQueryOptions = {}): Gr
   };
   // #809: the compact projection's 60-char value clip is FIXED — no parameter lifts it,
   // so point at the projection that carries fuller values instead of at a dead lever.
-  //
-  // #1634: on a PINPOINT read the values are already capped at WIDGET_VALUE_CAP, so
-  // "read fuller values with `fields`:"detail"" would be exactly the dead retry #809
-  // exists to remove — detail applies the SAME cap. Name the cap actually in force.
   const buildClipNote = (n: number): string => {
     if (n <= 0) return "";
     // #1634: the cap is uniform across the row and is only ever the survey clip or the
