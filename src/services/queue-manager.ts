@@ -790,6 +790,20 @@ export interface CancelQueuedResult {
  * is the one queue mutation that never got it.
  */
 export async function cancelQueuedJob(promptId: string): Promise<CancelQueuedResult> {
+  // Comfy Cloud has NO /queue endpoint: `cloudClient.getQueue()` returns a
+  // hardcoded empty queue without making a request. A "not pending" read there
+  // is not an observation, it is the absence of an endpoint — and the two are
+  // byte-identical to the checks below, so verifying against it would report
+  // every cloud job as `absent` ("it already finished"), swallow the delete,
+  // and replace a correct CLOUD_UNSUPPORTED error that names action:"cancel"
+  // with the exact false report this function exists to prevent. Nothing about
+  // a stub can be verified, so don't pretend: go straight to the delete.
+  if (isCloudMode()) {
+    await clientDeleteQueueItem(promptId);
+    logger.info("Queued job removed", { prompt_id: promptId, cloud: true });
+    return { removed: true, state: "removed", verified: false };
+  }
+
   const holds = (items: QueueItem[]): boolean => items.some((item) => item[1] === promptId);
 
   // unknown-ok: null degrades to the old fire-and-report behaviour rather than
