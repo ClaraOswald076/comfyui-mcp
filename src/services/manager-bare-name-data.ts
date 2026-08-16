@@ -255,5 +255,132 @@ export const REGISTRY_TARGETS: Readonly<Record<string, string>> = {
   "was-node-suite-comfyui": "WASasquatch/was-node-suite-comfyui",
 };
 
+//
+// #1624 — REPOSITORIES THAT CANNOT BE INSTALLED BY THEIR OWN NAME, AND WHO ANSWERS INSTEAD.
+//
+// Keyed by the caller's `owner/repo`, LOWERCASED: the question this answers is "did the
+// caller name one of these", and a caller types whatever case they like. (The generator
+// throws if two distinct repositories ever collapse onto one such key.)
+//
+// Every repository here is registered in the Comfy Registry under an id that is not its
+// own bare name, so `get_custom_nodes` files it under that id and a bare-name lookup
+// CANNOT return it — from any channel, whatever the channel's list appears to say. What a
+// lookup returns instead is recorded: `channelTargets` per channel, and `registryTarget`
+// for the nightly fallback that fires when the channel carries nothing under the name.
+//
+// Recorded ONLY where something else actually answers. A re-keyed repository whose name
+// resolves nowhere gets Manager's "not found", which installs nobody's code, and is left
+// out rather than turned into a refusal.
+export interface RekeyedSubstitution {
+  /** The repository, cased as the Comfy Registry records it. */
+  readonly repo: string;
+  /** The Comfy Registry id it is filed under — the reason its own name misses. */
+  readonly id: string;
+  /** Per channel, what a bare-name lookup DOES reach under that name. */
+  readonly channelTargets: Readonly<Partial<Record<ManagerChannelName, readonly string[]>>>;
+  /** What `cnr_map[<bare name>]` clones when the channel carries nothing under it. */
+  readonly registryTarget?: string;
+}
+export const REKEYED_SUBSTITUTIONS: Readonly<Record<string, RekeyedSubstitution>> = {
+  "1038lab/comfyui-sparktts": { repo: "1038lab/ComfyUI-SparkTTS", id: "Comfyui-Spark-TTS", channelTargets: {  }, registryTarget: "civen-cn/ComfyUI_SparkTTS" },
+  "1038lab/kittentts": { repo: "1038lab/KittenTTS", id: "ComfyUI-KittenTTS", channelTargets: {  }, registryTarget: "neverbiasu/ComfyUI-KittenTTS" },
+  "aifsh/comfyui-aurasr": { repo: "AIFSH/ComfyUI-AuraSR", id: "AIFSH_ComfyUI-AuraSR", channelTargets: { dev: ["alexisrolland/ComfyUI-AuraSR"] }, registryTarget: "alexisrolland/ComfyUI-AuraSR" },
+  "aigcteam/comfyui_kktranslator_nodes": { repo: "AIGCTeam/ComfyUI_kkTranslator_nodes", id: "kingzcheung_ComfyUI_kkTranslator_nodes", channelTargets: {  }, registryTarget: "kingzcheung/ComfyUI_kkTranslator_nodes" },
+  "akshaylaghate/comfyui_catvton_wrapper": { repo: "AkshayLaghate/ComfyUI_CatVTON_Wrapper", id: "catvton_wrapper", channelTargets: { default: ["chflame163/ComfyUI_CatVTON_Wrapper"] }, registryTarget: "chflame163/ComfyUI_CatVTON_Wrapper" },
+  "akshaylaghate/comfyui_segment_anything": { repo: "AkshayLaghate/comfyui_segment_anything", id: "comfyui_segment_anything_alt", channelTargets: { default: ["storyicon/comfyui_segment_anything"] }, registryTarget: "storyicon/comfyui_segment_anything" },
+  "apache0ne/comfyui-kokoro": { repo: "Apache0ne/ComfyUI-kokoro", id: "ComfyUI-kokoro-TTS", channelTargets: { default: ["stavsap/comfyui-kokoro"] }, registryTarget: "stavsap/comfyui-kokoro" },
+  "bikecicle/comfyui-waveform-extensions": { repo: "Bikecicle/ComfyUI-Waveform-Extensions", id: "Bikecicle_ComfyUI-Waveform-Extensions", channelTargets: {  }, registryTarget: "NeuralNotW0rk/ComfyUI-Waveform-Extensions" },
+  "cy-chenyue/comfyui-gemini-api": { repo: "CY-CHENYUE/ComfyUI-Gemini-API", id: "gemini-api", channelTargets: { dev: ["JiangAogo/ComfyUI-Gemini-API"] } },
+  "cyber-bcat/comfyui_auto_caption": { repo: "Cyber-BCat/ComfyUI_Auto_Caption", id: "Cyber-BCat_ComfyUI_Auto_Caption", channelTargets: { default: ["Cyber-BlackCat/ComfyUI_Auto_Caption"] }, registryTarget: "Cyber-BlackCat/ComfyUI_Auto_Caption" },
+  "darioft/comfyui-qwen3-asr": { repo: "DarioFT/ComfyUI-Qwen3-ASR", id: "comfyui-qwen-asr", channelTargets: { default: ["kaushiknishchay/ComfyUI-Qwen3-ASR"] }, registryTarget: "kaushiknishchay/ComfyUI-Qwen3-ASR" },
+  "delcado19/comfyui-nag": { repo: "Delcado19/ComfyUI-NAG", id: "comfyui-nag-delcado", channelTargets: { default: ["ChenDarYen/ComfyUI-NAG"] }, registryTarget: "AkshayLaghate/ComfyUI-NAG" },
+  "delcado19/comfyui-nodes-docs": { repo: "Delcado19/comfyui-nodes-docs", id: "comfyui-nodes-docs-en", channelTargets: { default: ["CavinHuang/comfyui-nodes-docs"] }, registryTarget: "CavinHuang/comfyui-nodes-docs" },
+  "docworkbox/heartmula_comfyui": { repo: "DocWorkBox/HeartMuLa_ComfyUI", id: "zhaoke1006-heartmula-comfyui", channelTargets: {  }, registryTarget: "benjiyaya/HeartMuLa_ComfyUI" },
+  "flibens/comfyui-image-browser": { repo: "Flibens/comfyui-image-browser", id: "image-browser", channelTargets: {  }, registryTarget: "laurigates/comfyui-image-browser" },
+  "franckyb/comfyui-prompt-manager": { repo: "FranckyB/ComfyUI-Prompt-Manager", id: "prompt-manager", channelTargets: { dev: ["colorAi/comfyui-prompt-manager"] }, registryTarget: "colorAi/comfyui-prompt-manager" },
+  "guardskill/comfyui-elevenlabs": { repo: "GuardSkill/ComfyUI-ElevenLabs", id: "ElevenLabs", channelTargets: { default: ["jerilseb/ComfyUI-ElevenLabs"], recent: ["jerilseb/ComfyUI-ElevenLabs"] } },
+  "juanberta/comfyui_ollama_vl_prompt": { repo: "JuanBerta/comfyui_ollama_vl_prompt", id: "ollama_vl_prompt", channelTargets: {  }, registryTarget: "JuanBerta/ollama_vl_prompt" },
+  "juanberta/ollama_vl_prompt": { repo: "JuanBerta/ollama_vl_prompt", id: "comfyui_ollama_vl_prompt", channelTargets: { default: ["JuanBerta/comfyui_ollama_vl_prompt"] }, registryTarget: "JuanBerta/comfyui_ollama_vl_prompt" },
+  "karurochori/comfy_felsirnodes": { repo: "KaruroChori/Comfy_Felsirnodes", id: "felsir-image-tools", channelTargets: {  }, registryTarget: "Felsir/Comfy_Felsirnodes" },
+  "koinnai/comfyui-dynpromptsimplified": { repo: "KoinnAI/ComfyUI-DynPromptSimplified", id: "dynpromptsimplified", channelTargets: { default: ["RegulusAlpha/ComfyUI-DynPromptSimplified"] } },
+  "mattabyte/comfyui-gguf": { repo: "Mattabyte/ComfyUI-GGUF", id: "ComfyUI-GGUF_Forked", channelTargets: { default: ["city96/ComfyUI-GGUF"] }, registryTarget: "city96/ComfyUI-GGUF" },
+  "mattabyte/comfyui-gimm-vfi": { repo: "Mattabyte/ComfyUI-GIMM-VFI", id: "comfy-gimm-vfi", channelTargets: { default: ["kijai/ComfyUI-GIMM-VFI"] }, registryTarget: "kijai/ComfyUI-GIMM-VFI" },
+  "mattabyte/comfyui-wanvideowrapper": { repo: "Mattabyte/ComfyUI-WanVideoWrapper", id: "ComfyUI-WanVideoWrapper_ALPHA", channelTargets: { default: ["kijai/ComfyUI-WanVideoWrapper"] }, registryTarget: "kijai/ComfyUI-WanVideoWrapper" },
+  "momentfactory/comfyui-mf-piponodes": { repo: "MomentFactory/ComfyUI-MF-PipoNodes", id: "mf-piponodes", channelTargets: { default: ["pierreb-mf/ComfyUI-MF-PipoNodes"] } },
+  "pozzettiandrea/comfyui-pixal3d": { repo: "PozzettiAndrea/ComfyUI-Pixal3D", id: "ComfyUI-Pixal3D-Pozzetti", channelTargets: { default: ["dreamrec/ComfyUI-Pixal3D"] }, registryTarget: "dreamrec/ComfyUI-Pixal3D" },
+  "ruffy-369/comfyui-streamdiffusion": { repo: "RUFFY-369/ComfyUI-StreamDiffusion", id: "streamdiffusion", channelTargets: { dev: ["pschroedl/ComfyUI-StreamDiffusion"] } },
+  "rinne414/comfyui-bananaforge": { repo: "Rinne414/ComfyUI-BananaForge", id: "bananaforge", channelTargets: { default: ["peter119lee/ComfyUI-BananaForge"] } },
+  "sxqbw/comfyui-qwen": { repo: "SXQBW/ComfyUI-Qwen", id: "ComfyUI-Qwen3", channelTargets: { dev: ["Lovzu/ComfyUI-Qwen", "ZHO-ZHO-ZHO/ComfyUI-Qwen", "mr-krak3n/ComfyUI-Qwen"] }, registryTarget: "ZHO-ZHO-ZHO/ComfyUI-Qwen" },
+  "saganaki22/comfyui-kittentts": { repo: "Saganaki22/ComfyUI-KittenTTS", id: "comfyui-kitten-tts", channelTargets: { default: ["Lovzu/ComfyUI-KittenTTS"] }, registryTarget: "1038lab/KittenTTS" },
+  "sergey004/comfyui-telegram-sender": { repo: "Sergey004/ComfyUI-Telegram-Sender", id: "telegram-sender", channelTargets: { dev: ["gulajawalegit/ComfyUI-Telegram-Sender"] } },
+  "t8mars/comfyui-purgevram": { repo: "T8mars/comfyui-purgevram", id: "purgevram", channelTargets: { legacy: ["T8star1984/comfyui-purgevram"] } },
+  "tothebeginning/comfyui-dreamo": { repo: "ToTheBeginning/ComfyUI-DreamO", id: "dreamo", channelTargets: { dev: ["jax-explorer/ComfyUI-DreamO"] } },
+  "ttl/comfyui_nnlatentupscale": { repo: "Ttl/ComfyUi_NNLatentUpscale", id: "Ttl_ComfyUi_NNLatentUpscale", channelTargets: {  }, registryTarget: "Goktug/ComfyUi_NNLatentUpscale" },
+  "zho-zho-zho/comfyui-gemini": { repo: "ZHO-ZHO-ZHO/ComfyUI-Gemini", id: "ZHO-ZHO-ZHO_ComfyUI-Gemini", channelTargets: { default: ["Visionatrix/ComfyUI-Gemini"], dev: ["NakanoSanku/ComfyUI-Gemini"] }, registryTarget: "Visionatrix/ComfyUI-Gemini" },
+  "zuellni/comfyui-custom-nodes": { repo: "Zuellni/ComfyUI-Custom-Nodes", id: "Zuellni_ComfyUI-Custom-Nodes", channelTargets: { default: ["rcsaquino/comfyui-custom-nodes"], dev: ["DanielBartolic/comfyui-custom-nodes", "artisanalcomputing/ComfyUI-Custom-Nodes", "brycegoh/comfyui-custom-nodes"], tutorial: ["foxtrot-roger/comfyui-custom-nodes"] }, registryTarget: "rcsaquino/comfyui-custom-nodes" },
+  "ai-joe-git/comfyui-qwen3-tts": { repo: "ai-joe-git/ComfyUI-Qwen3-TTS", id: "comfyui-simple-qwen3-tts", channelTargets: { legacy: ["ncky/ComfyUI-Qwen3-TTS"], dev: ["DarioFT/ComfyUI-Qwen3-TTS", "NaomiVK/comfyui-qwen3-tts", "amenoyoya/ComfyUI-Qwen3-TTS"] }, registryTarget: "DarioFT/ComfyUI-Qwen3-TTS" },
+  "ai-joe-git/comfyui-faster-whisper": { repo: "ai-joe-git/ComfyUI-faster-whisper", id: "comfyui-fast-whisper", channelTargets: {  }, registryTarget: "jhj0517/ComfyUI-faster-whisper" },
+  "aistudynow/comfyui-qwenvl": { repo: "aistudynow/ComfyUI-QwenVL", id: "aistudynow-qwenvl", channelTargets: { default: ["1038lab/ComfyUI-QwenVL"], dev: ["Malloc-pix/comfyui-QwenVL"] }, registryTarget: "1038lab/ComfyUI-QwenVL" },
+  "awsl1110/comfyui-oss-upload": { repo: "awsl1110/ComfyUI-OSS-Upload", id: "oss-upload", channelTargets: { dev: ["ahkimkoo/ComfyUI-OSS-Upload"] }, registryTarget: "ahkimkoo/ComfyUI-OSS-Upload" },
+  "benjiyaya/comfyui-kokorotts": { repo: "benjiyaya/ComfyUI-KokoroTTS", id: "benjiyaya_ComfyUI-KokoroTTS", channelTargets: {  }, registryTarget: "1038lab/ComfyUI-KokoroTTS" },
+  "billwuhao/comfyui_csm": { repo: "billwuhao/ComfyUI_CSM", id: "csm_mw", channelTargets: { legacy: ["AiSatan/ComfyUI_CSM"] } },
+  "brantje/comfyui_magicquill": { repo: "brantje/ComfyUI_MagicQuill", id: "comfyui_magicquill_fixed", channelTargets: { legacy: ["magic-quill/ComfyUI_MagicQuill"] }, registryTarget: "magic-quill/ComfyUI_MagicQuill" },
+  "bytedance/comfyui_infiniteyou": { repo: "bytedance/ComfyUI_InfiniteYou", id: "infiniteyou", channelTargets: { dev: ["ZenAI-Vietnam/ComfyUI_InfiniteYou"] } },
+  "ciga2011/comfyui-pollinations": { repo: "ciga2011/ComfyUI-Pollinations", id: "pollinations", channelTargets: { default: ["1038lab/ComfyUI-Pollinations"] }, registryTarget: "1038lab/ComfyUI-Pollinations" },
+  "deforum-art/deforum-comfy-nodes": { repo: "deforum-art/deforum-comfy-nodes", id: "comfyui-deforum", channelTargets: { default: ["XmYx/deforum-comfy-nodes"] }, registryTarget: "XmYx/deforum-comfy-nodes" },
+  "diffus3/comfyui-extensions": { repo: "diffus3/ComfyUI-extensions", id: "diffus3_ComfyUI-extensions", channelTargets: {  }, registryTarget: "ailex000/ComfyUI-Extensions" },
+  "dseditor/comfyui-listhelper": { repo: "dseditor/ComfyUI-ListHelper", id: "Listhelper", channelTargets: { dev: ["panchovial-max/ComfyUI-ListHelper"] } },
+  "eliteprox/comfyui-sam2-realtime": { repo: "eliteprox/ComfyUI-SAM2-Realtime", id: "sam2_realtime_forktest", channelTargets: { default: ["pschroedl/ComfyUI-SAM2-Realtime"] }, registryTarget: "pschroedl/ComfyUI-SAM2-Realtime" },
+  "endman100/comfyui-qwen3-asr": { repo: "endman100/ComfyUI-Qwen3-ASR", id: "comfyui-qwen3-asr-endman100", channelTargets: { default: ["kaushiknishchay/ComfyUI-Qwen3-ASR"] }, registryTarget: "kaushiknishchay/ComfyUI-Qwen3-ASR" },
+  "eokoo/comfyui-photopea": { repo: "eokoo/ComfyUI-Photopea", id: "ComfyUI_Photopea", channelTargets: { default: ["coolzilj/ComfyUI-Photopea"] }, registryTarget: "coolzilj/ComfyUI-Photopea" },
+  "ethanfel/comfyui-omnivoice": { repo: "ethanfel/ComfyUI-Omnivoice", id: "comfyui-omnivoice-fel", channelTargets: { default: ["PGCRT/ComfyUI-OmniVoice_CRT"] }, registryTarget: "PGCRT/ComfyUI-OmniVoice_CRT" },
+  "evrardt/comfyui-spectrum": { repo: "evrardt/ComfyUI-Spectrum", id: "lafabrique-spectrum-flux", channelTargets: { dev: ["benjiyaya/ComfyUI-Spectrum"] } },
+  "flybirdxx/comfyui-qwen-tts": { repo: "flybirdxx/ComfyUI-Qwen-TTS", id: "qwen3-tts-comfyui", channelTargets: {  }, registryTarget: "mailzwj/ComfyUI-Qwen-TTS" },
+  "fredconex/comfyui-soundflow": { repo: "fredconex/ComfyUI-SoundFlow", id: "soundflow", channelTargets: { forked: ["huixingyun/ComfyUI-SoundFlow"] } },
+  "fredconex/comfyui-triposg": { repo: "fredconex/ComfyUI-TripoSG", id: "triposg", channelTargets: {  }, registryTarget: "tungnguyensipher/ComfyUI-TripoSG" },
+  "hben35096/comfyui-toolbox": { repo: "hben35096/ComfyUI-ToolBox", id: "hben35096_ComfyUI-ToolBox", channelTargets: { default: ["zcfrank1st/Comfyui-Toolbox"], dev: ["synthetai/ComfyUI-ToolBox"] }, registryTarget: "zcfrank1st/Comfyui-Toolbox" },
+  "hekmon/comfyui-openai-api": { repo: "hekmon/comfyui-openai-api", id: "openai-api", channelTargets: {  }, registryTarget: "bgreene2/ComfyUI-OpenAI-API" },
+  "hieuck/comfyui-birefnet": { repo: "hieuck/ComfyUI-BiRefNet", id: "viperyl_ComfyUI-BiRefNet", channelTargets: { legacy: ["viperyl/ComfyUI-BiRefNet"], dev: ["MohammadAboulEla/ComfyUI-BiRefNet"] }, registryTarget: "viperyl/ComfyUI-BiRefNet" },
+  "hylarucoder/comfyui-copilot": { repo: "hylarucoder/comfyui-copilot", id: "hylarucoder_comfyui-copilot", channelTargets: { default: ["AIDC-AI/ComfyUI-Copilot"] }, registryTarget: "AIDC-AI/ComfyUI-Copilot" },
+  "juemingai/comfyui-jm-gemini-api": { repo: "juemingai/ComfyUI-JM-Gemini-API", id: "jm-gemini-api", channelTargets: { default: ["synthetai/ComfyUI-JM-Gemini-API"] } },
+  "katalist-ai/comfyui-nsfw-detection": { repo: "katalist-ai/comfyUI-nsfw-detection", id: "katalist-ai_comfyUI-nsfw-detection", channelTargets: { default: ["trumanwong/ComfyUI-NSFW-Detection"] }, registryTarget: "trumanwong/ComfyUI-NSFW-Detection" },
+  "kosbeko/comfyui-glifnodes": { repo: "kosbeko/ComfyUI-GlifNodes", id: "comfyui-glifnodes-fork", channelTargets: { default: ["glifxyz/ComfyUI-GlifNodes"] }, registryTarget: "glifxyz/ComfyUI-GlifNodes" },
+  "laubsauger/comfyui-storyboard": { repo: "laubsauger/comfyui-storyboard", id: "storyboard", channelTargets: {  }, registryTarget: "colorAi/comfyui-storyboard" },
+  "lordgasmic/comfyui-wildcards": { repo: "lordgasmic/ComfyUI-Wildcards", id: "lordgasmic_ComfyUI-Wildcards", channelTargets: { default: ["lordgasmic/comfyui_wildcards"] }, registryTarget: "lordgasmic/comfyui_wildcards" },
+  "ltdrdata/was-node-suite-comfyui": { repo: "ltdrdata/was-node-suite-comfyui", id: "was-ns", channelTargets: { legacy: ["WASasquatch/was-node-suite-comfyui"] }, registryTarget: "WASasquatch/was-node-suite-comfyui" },
+  "m957ymj75urz/comfyui-custom-nodes": { repo: "m957ymj75urz/ComfyUI-Custom-Nodes", id: "m957ymj75urz_ComfyUI-Custom-Nodes", channelTargets: { default: ["rcsaquino/comfyui-custom-nodes"], dev: ["DanielBartolic/comfyui-custom-nodes", "artisanalcomputing/ComfyUI-Custom-Nodes", "brycegoh/comfyui-custom-nodes"], tutorial: ["foxtrot-roger/comfyui-custom-nodes"] }, registryTarget: "rcsaquino/comfyui-custom-nodes" },
+  "mailzwj/comfyui-qwen3-asr": { repo: "mailzwj/ComfyUI-Qwen3-ASR", id: "comfyui_qwen3_asr", channelTargets: { default: ["kaushiknishchay/ComfyUI-Qwen3-ASR"] }, registryTarget: "kaushiknishchay/ComfyUI-Qwen3-ASR" },
+  "molbal/comfyui-gguf": { repo: "molbal/ComfyUI-GGUF", id: "comfyui-gguf-reboot", channelTargets: { default: ["city96/ComfyUI-GGUF"] }, registryTarget: "city96/ComfyUI-GGUF" },
+  "mr-pepe69/comfyui-selectstringfromlistwithindex": { repo: "mr-pepe69/ComfyUI-SelectStringFromListWithIndex", id: "Iterator-Nodes-MrPepe", channelTargets: { default: ["wirytiox/ComfyUI-SelectStringFromListWithIndex"] } },
+  "muse-collective-26/minimaxh3-director": { repo: "muse-collective-26/MiniMaxH3-Director", id: "muse-minimax-director", channelTargets: {  }, registryTarget: "seesee75-commits/ComfyUI-MiniMaxH3-Director" },
+  "nazgut/comfyui-pulid-flux-chroma": { repo: "nazgut/ComfyUI-PuLID-Flux-Chroma", id: "pulid-flux-chroma", channelTargets: { default: ["PaoloC68/ComfyUI-PuLID-Flux-Chroma"] } },
+  "neverbiasu/comfyui-kittentts": { repo: "neverbiasu/ComfyUI-KittenTTS", id: "kittentts", channelTargets: { default: ["Lovzu/ComfyUI-KittenTTS"] }, registryTarget: "1038lab/KittenTTS" },
+  "npiriou/comfyui-pid": { repo: "npiriou/ComfyUI-PiD", id: "nvidia-pid-decoder", channelTargets: { default: ["Merserk/ComfyUI-PiD"] }, registryTarget: "Merserk/ComfyUI-PiD" },
+  "open-ghibli/comfyui-easycontrol": { repo: "open-ghibli/ComfyUI-EasyControl", id: "EasyControl", channelTargets: { default: ["jax-explorer/ComfyUI-easycontrol"] } },
+  "pamparamm/comfyui_ipadapter_plus": { repo: "pamparamm/ComfyUI_IPAdapter_plus", id: "comfyui_ipadapter_plus_fork", channelTargets: { default: ["cubiq/ComfyUI_IPAdapter_plus"] }, registryTarget: "cubiq/ComfyUI_IPAdapter_plus" },
+  "rabanti-github/comfymath": { repo: "rabanti-github/ComfyMath", id: "comfymath-ng", channelTargets: { default: ["evanspearman/ComfyMath"] }, registryTarget: "evanspearman/ComfyMath" },
+  "rafek1241/comfy-pilot": { repo: "rafek1241/comfy-pilot", id: "comfyui-pilot-extended", channelTargets: {  }, registryTarget: "ConstantineB6/comfy-pilot" },
+  "rslosh/comfyui-nodesweet": { repo: "rslosh/comfyui-nodesweet", id: "nodesweet", channelTargets: { default: ["rslosch/comfyui-nodesweet"] } },
+  "silveroxides/comfyui_bitsandbytes_nf4": { repo: "silveroxides/ComfyUI_bitsandbytes_NF4", id: "ComfyUI_bnb_nf4_fp4_Loaders", channelTargets: { dev: ["comfyanonymous/ComfyUI_bitsandbytes_NF4"] } },
+  "silveroxides/comfyui-lama-remover": { repo: "silveroxides/comfyui-lama-remover", id: "ComfyUI_Lama_Remover_Revived", channelTargets: { default: ["Layer-norm/comfyui-lama-remover"] }, registryTarget: "Layer-norm/comfyui-lama-remover" },
+  "sinfisum/comfyui-prompter": { repo: "sinfisum/comfyui-prompter", id: "prompter", channelTargets: { dev: ["saltchicken/ComfyUI-Prompter"] } },
+  "space-nuko/comfyui-openpose-editor": { repo: "space-nuko/ComfyUI-OpenPose-Editor", id: "space-nuko_ComfyUI-OpenPose-Editor", channelTargets: { default: ["huchenlei/ComfyUI-openpose-editor"] }, registryTarget: "huchenlei/ComfyUI-openpose-editor" },
+  "starsfriday/comfyui-matanyone2": { repo: "starsFriday/ComfyUI-MatAnyone2", id: "MatAnyone2", channelTargets: { default: ["ijoy222333/ComfyUI-MatAnyone2"], dev: ["AJbeckliy/ComfyUI-MatAnyone2"] } },
+  "starsfriday/comfyui-qwen3-tts": { repo: "starsFriday/ComfyUI-Qwen3-TTS", id: "Qwen3-TTS-Audio", channelTargets: { legacy: ["ncky/ComfyUI-Qwen3-TTS"], dev: ["DarioFT/ComfyUI-Qwen3-TTS", "NaomiVK/comfyui-qwen3-tts", "amenoyoya/ComfyUI-Qwen3-TTS"] }, registryTarget: "DarioFT/ComfyUI-Qwen3-TTS" },
+  "starsfriday/comfyui-sapiens2": { repo: "starsFriday/ComfyUI-Sapiens2", id: "Sapiens2", channelTargets: {  }, registryTarget: "kijai/ComfyUI-Sapiens2" },
+  "starsfriday/comfyui-voxcpm": { repo: "starsFriday/ComfyUI-VoxCPM", id: "VoxCPM2", channelTargets: { default: ["wildminder/ComfyUI-VoxCPM"] }, registryTarget: "wildminder/ComfyUI-VoxCPM" },
+  "symbiotica-ai/comfyui-nodes": { repo: "symbiotica-ai/comfyui-nodes", id: "symbiotica", channelTargets: { dev: ["Ronnasayd/comfyui-nodes"] } },
+  "time-river/comfyui-clipseg": { repo: "time-river/ComfyUI-CLIPSeg", id: "time-river_ComfyUI-CLIPSeg", channelTargets: { dev: ["shadowcz007/comfyui-CLIPSeg", "zhengxyz123/ComfyUI-CLIPSeg"] }, registryTarget: "alessandrozonta/ComfyUI-CLIPSeg" },
+  "trashkollector/tknodes": { repo: "trashkollector/TKNodes", id: "ComfyUI-HandyNodes-KT", channelTargets: { default: ["throttlekitty/tkNodes"] } },
+  "wanaigc/comfyui-qwen3-tts": { repo: "wanaigc/ComfyUI-Qwen3-TTS", id: "qwen3-tts", channelTargets: { legacy: ["ncky/ComfyUI-Qwen3-TTS"], dev: ["DarioFT/ComfyUI-Qwen3-TTS", "NaomiVK/comfyui-qwen3-tts", "amenoyoya/ComfyUI-Qwen3-TTS"] }, registryTarget: "DarioFT/ComfyUI-Qwen3-TTS" },
+  "wildminder/comfyui-chatterbox": { repo: "wildminder/ComfyUI-Chatterbox", id: "ComfyUI-ChatterboxTTS", channelTargets: { dev: ["ai-joe-git/ComfyUI-Chatterbox"] }, registryTarget: "sm079/comfyui-chatterbox" },
+  "xmarre/comfyui-cfg-ctrl": { repo: "xmarre/ComfyUI-CFG-Ctrl", id: "cfg-ctrl", channelTargets: { default: ["flyghtxmz/ComfyUI-CFG-Ctrl"], dev: ["ethanfel/ComfyUI-CFG-CTRL"] } },
+  "yabo083/comfyui-saveimages3": { repo: "yabo083/ComfyUI-SaveImageS3", id: "comfyui-saveimages3-r2-sidebar", channelTargets: { default: ["mrchipset/ComfyUI-SaveImageS3"] }, registryTarget: "mrchipset/ComfyUI-SaveImageS3" },
+  "yichengup/comfyui-deepseek": { repo: "yichengup/Comfyui-Deepseek", id: "yichengup_Comfyui-Deepseek", channelTargets: { dev: ["neverbiasu/ComfyUI-DeepSeek", "yanhuifair/comfyui-deepseek"] }, registryTarget: "yanhuifair/comfyui-deepseek" },
+  "yourusername/comfyui_qwen3-vl": { repo: "yourusername/ComfyUI_Qwen3-VL", id: "ComfyUI-Qwen3-VL", channelTargets: { dev: ["xuchenxu168/ComfyUI_Qwen3-VL"] } },
+  "zade23/comfyui-moge2": { repo: "zade23/ComfyUI-MoGe2", id: "moge2", channelTargets: {  }, registryTarget: "PozzettiAndrea/ComfyUI-MoGe2" },
+  "zhonglushu/comfyui_frontend_vue_basic": { repo: "zhonglushu/ComfyUI_frontend_vue_basic", id: "comfyui_browser_url_workflow", channelTargets: { dev: ["jtydhr88/ComfyUI_frontend_vue_basic"] }, registryTarget: "jtydhr88/ComfyUI_frontend_vue_basic" },
+};
+
 /** When AMBIGUOUS_BARE_NAMES was measured, for the refusal to cite. */
 export const AMBIGUOUS_BARE_NAMES_MEASURED = "2026-08-15";

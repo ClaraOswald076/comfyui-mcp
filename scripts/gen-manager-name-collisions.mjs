@@ -68,11 +68,11 @@ function ownerRepo(url) {
  * every candidate is order-independent and refuses both spellings, which is the standing
  * rule: name the candidates, never pick between them.
  */
-async function channelMap(channel) {
+async function channelEntries(channel) {
   const res = await fetch(`${CHANNEL_URLS[channel]}/custom-node-list.json`);
   if (!res.ok) throw new Error(`${channel}: HTTP ${res.status}`);
   const raw = await res.json();
-  const out = new Map();
+  const out = [];
   for (const x of raw.custom_nodes) {
     const files = x.files ?? [];
     // len(files) > 1 is keyed by files[0] — a whole URL, unreachable by a bare name.
@@ -84,16 +84,27 @@ async function channelMap(channel) {
     if (!viaFile && x.id === undefined) continue;
     const repo = ownerRepo(url);
     if (!repo) continue;
-    const key = url.split("/").pop().trim().toLowerCase();
+    out.push({ repo, bare: url.split("/").pop().trim() });
+  }
+  return out;
+}
+
+/** lower(bare name) -> Set(owner/repo), the shape AMBIGUOUS_BARE_NAMES is built from. */
+function channelMap(entries) {
+  const out = new Map();
+  for (const { repo, bare } of entries) {
+    const key = bare.toLowerCase();
     if (!out.has(key)) out.set(key, new Set());
     out.get(key).add(repo);
   }
   return out;
 }
 
+const entries = {};
 const maps = {};
 for (const c of CHANNELS) {
-  maps[c] = await channelMap(c);
+  entries[c] = await channelEntries(c);
+  maps[c] = channelMap(entries[c]);
   process.stderr.write(`${c}: ${maps[c].size} bare-name keys\n`);
 }
 
@@ -185,6 +196,96 @@ process.stderr.write(
     `${Object.keys(registryTargets).length} names have a registry pack of their own name\n`,
 );
 
+/**
+ * #1624 — THE SAME SUBSTITUTION WITHOUT ANY CHANNEL COLLISION.
+ *
+ * The table above is keyed by CONTESTED bare names, which is a narrower thing than the
+ * hazard. Re-keying needs no second channel to hand back another author's repository: it
+ * is enough that the repo a caller names is registered under an id that is not its own
+ * name (so `get_custom_nodes` files it under THAT id and a bare-name lookup can never
+ * return it) and that something else answers to the name. Measured, that is 56 live
+ * repositories the contested-name table does not cover at all.
+ *
+ * So simulate the real lookup instead of approximating it. For every repository a caller
+ * could plausibly name — everything in the six channel lists plus everything in the
+ * registry — replay 4.2.2's own resolution:
+ *
+ *   get_custom_nodes: key = get_cnr_by_repo(files[0]) ? cnr['id'] : files[0].basename
+ *                     (repo_cnr_map is a PLAIN dict on a case-preserving normalize_url,
+ *                      so that match is case-SENSITIVE and is done that way here)
+ *   install_by_id:    the_node = custom_nodes.get(bare)        # NormalizedKeyDict, lower
+ *                     miss + nightly -> cnr_map.get(bare)      # the registry's repo
+ *
+ * and record only the repositories for which that lands somewhere ELSE. A repo that is
+ * re-keyed but whose name resolves to nothing at all (1271 of them) is NOT recorded:
+ * Manager answers "not found" there, which installs nobody's code and is a different bug.
+ */
+const REKEY_CHANNELS = CHANNELS;
+const bareOf = (repo) => repo.split("/")[1];
+const sameRepo = (a, b) => a.toLowerCase() === b.toLowerCase();
+
+// channel -> Map(lower(node_id Manager files it under) -> Set(owner/repo))
+const keyedByManager = {};
+for (const c of REKEY_CHANNELS) {
+  const m = new Map();
+  for (const { repo, bare } of entries[c]) {
+    const id = repoToId.get(repo); // case-sensitive, mirrors repo_cnr_map
+    const key = (id !== undefined ? id : bare).trim().toLowerCase();
+    if (!m.has(key)) m.set(key, new Set());
+    m.get(key).add(repo);
+  }
+  keyedByManager[c] = m;
+}
+
+const nameable = new Set();
+for (const c of REKEY_CHANNELS) for (const e of entries[c]) nameable.add(e.repo);
+for (const r of repoToId.keys()) nameable.add(r);
+
+const substitutions = [];
+let unreachableButHarmless = 0;
+for (const repo of [...nameable].sort()) {
+  const nameKey = bareOf(repo).trim().toLowerCase();
+  const id = repoToId.get(repo);
+  // Not registered, or registered under its own name: a bare-name lookup CAN return it.
+  if (id === undefined || id.trim().toLowerCase() === nameKey) continue;
+  const channelTargets = {};
+  for (const c of REKEY_CHANNELS) {
+    // By construction none of these can be `repo` itself — it is filed under `id`, not
+    // under its name — but filter anyway rather than trust the construction, because a
+    // record naming the caller's own repository as the substitute would be nonsense.
+    const hit = [...(keyedByManager[c].get(nameKey) ?? [])].filter((r) => !sameRepo(r, repo)).sort();
+    if (hit.length) channelTargets[c] = hit;
+  }
+  const target = idToRepo.get(nameKey);
+  const registryTarget = target && !sameRepo(target, repo) ? target : undefined;
+  if (!Object.keys(channelTargets).length && !registryTarget) {
+    unreachableButHarmless++; // resolves to nothing -> Manager's "not found", not a swap
+    continue;
+  }
+  substitutions.push({ repo, id, channelTargets, registryTarget });
+}
+
+// The lookup key is lowercased, so two DIFFERENT repositories differing only in case
+// would collapse onto one record and the guard would answer about the wrong one. Nothing
+// in the guard could detect that, so it is caught HERE, where the fix is to change the
+// key rather than to ship a table that quietly answers wrong.
+{
+  const seen = new Map();
+  for (const s of substitutions) {
+    const k = s.repo.toLowerCase();
+    if (seen.has(k)) throw new Error(`case-collision on ${k}: ${seen.get(k)} vs ${s.repo}`);
+    seen.set(k, s.repo);
+  }
+}
+const onDefault = substitutions.filter(
+  (s) => (s.channelTargets.default ?? []).length > 0 || s.registryTarget !== undefined,
+).length;
+process.stderr.write(
+  `\nre-keyed repositories whose own name resolves to someone ELSE: ${substitutions.length} ` +
+    `(${onDefault} of them on the "default" channel); ` +
+    `${unreachableButHarmless} more are re-keyed but resolve to nothing (Manager answers "not found")\n`,
+);
+
 const measured = new Date().toISOString().slice(0, 10);
 const body = ambiguous
   .map(([name, per]) => {
@@ -242,6 +343,44 @@ export const REGISTRY_TARGETS: Readonly<Record<string, string>> = {
 ${Object.entries(registryTargets)
   .sort((a, b) => a[0].localeCompare(b[0]))
   .map(([n, repo]) => `  ${JSON.stringify(n)}: ${JSON.stringify(repo)},`)
+  .join("\n")}
+};
+
+//
+// #1624 — REPOSITORIES THAT CANNOT BE INSTALLED BY THEIR OWN NAME, AND WHO ANSWERS INSTEAD.
+//
+// Keyed by the caller's \`owner/repo\`, LOWERCASED: the question this answers is "did the
+// caller name one of these", and a caller types whatever case they like. (The generator
+// throws if two distinct repositories ever collapse onto one such key.)
+//
+// Every repository here is registered in the Comfy Registry under an id that is not its
+// own bare name, so \`get_custom_nodes\` files it under that id and a bare-name lookup
+// CANNOT return it — from any channel, whatever the channel's list appears to say. What a
+// lookup returns instead is recorded: \`channelTargets\` per channel, and \`registryTarget\`
+// for the nightly fallback that fires when the channel carries nothing under the name.
+//
+// Recorded ONLY where something else actually answers. A re-keyed repository whose name
+// resolves nowhere gets Manager's "not found", which installs nobody's code, and is left
+// out rather than turned into a refusal.
+export interface RekeyedSubstitution {
+  /** The repository, cased as the Comfy Registry records it. */
+  readonly repo: string;
+  /** The Comfy Registry id it is filed under — the reason its own name misses. */
+  readonly id: string;
+  /** Per channel, what a bare-name lookup DOES reach under that name. */
+  readonly channelTargets: Readonly<Partial<Record<ManagerChannelName, readonly string[]>>>;
+  /** What \`cnr_map[<bare name>]\` clones when the channel carries nothing under it. */
+  readonly registryTarget?: string;
+}
+export const REKEYED_SUBSTITUTIONS: Readonly<Record<string, RekeyedSubstitution>> = {
+${substitutions
+  .map((s) => {
+    const chans = REKEY_CHANNELS.filter((c) => s.channelTargets[c])
+      .map((c) => `${c}: [${s.channelTargets[c].map((r) => JSON.stringify(r)).join(", ")}]`)
+      .join(", ");
+    const reg = s.registryTarget ? `, registryTarget: ${JSON.stringify(s.registryTarget)}` : "";
+    return `  ${JSON.stringify(s.repo.toLowerCase())}: { repo: ${JSON.stringify(s.repo)}, id: ${JSON.stringify(s.id)}, channelTargets: { ${chans} }${reg} },`;
+  })
   .join("\n")}
 };
 
