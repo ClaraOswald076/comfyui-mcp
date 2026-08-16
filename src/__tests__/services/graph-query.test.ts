@@ -417,12 +417,17 @@ describe("queryApiGraph", () => {
       expect(r.text).not.toContain('read fuller values with `fields`:"detail"');
     });
 
-    it("when max_chars (not the fixed cap) is what cut a pinpoint value, it says so", () => {
+    it("a pinpoint row that does NOT fit falls back to main's rendering and main's note", () => {
+      // The cap is raised only when the generous row demonstrably fits. Arithmetic
+      // reserves leaked: a per-widget floor still grows without bound across many
+      // widgets, so a 24-widget node breached max_chars on DEFAULT parameters while
+      // reporting truncated:false. A fit test cannot leak.
       const G8 = { "8": { class_type: "Note", inputs: { text: "c".repeat(4000) } } };
       const r = queryApiGraph(G8, { ids: ["8"], max_chars: 2000 });
       expect(r.text.length).toBeLessThanOrEqual(2000);
-      expect(r.text).toContain("`max_chars`=2000");
-      expect(r.text).toContain("raise `max_chars`");
+      // Fell back, so the note is main's: it names 60 and the lever that genuinely helps.
+      expect(r.text).toContain('clipped to 60 chars by `fields`:"compact"');
+      expect(r.text).toContain('read fuller values with `fields`:"detail"');
     });
     // Both found by the review gate on the first version of this fix, which capped each
     // value at 2048 INDEPENDENTLY and dropped the fields:"detail" pointer outright.
@@ -450,22 +455,28 @@ describe("queryApiGraph", () => {
         }
       });
 
-      it("below the fixed cap the note still names fields:'detail' — there it carries MORE", () => {
-        // Dropping the pointer is only honest AT the fixed cap, where detail applies the
-        // same 2048. Below it, capWidgets() reserves 256 where the compact row reserves
-        // 1024, so at max_chars=1084 compact carries 59 value chars against detail's 747.
-        // Suppressing the pointer there hands back the very 60-char clipped prompt this
-        // issue is about, with the one lever that works at that budget omitted.
-        const blob = { "9": { class_type: "Note", inputs: { t: "x".repeat(9000) } } };
-        for (const maxChars of [1200, 1500, 2000]) {
-          const r = queryApiGraph(blob, { ids: ["9"], max_chars: maxChars });
-          expect(r.text, `max_chars=${maxChars}`).toContain('`fields`:"detail"');
-          expect(r.text).toContain("`max_chars`=" + maxChars);
+      it("the note never names a cap that was in force for NO widget", () => {
+        // A budget-derived per-widget cap rendered values at 2048, 736 and 60 and reported
+        // them all as "clipped to 2048 … which no parameter raises", while raising
+        // max_chars demonstrably lifted them — the #809 wrong-lever defect verbatim. The
+        // cap is uniform across the row now, so the note has exactly two honest forms.
+        for (const [count, len, maxChars] of [[10, 3000, 12000], [40, 200, 2000], [24, 1200, 12000]] as const) {
+          const r = queryApiGraph(wide(count, len) as never, { ids: ["2"], max_chars: maxChars });
+          const note = r.text.slice(r.text.lastIndexOf("\n("));
+          const named = /clipped to (\d+) chars/.exec(note)?.[1];
+          expect([undefined, "60", "2048"], `cap named for ${count}x${len}@${maxChars}`).toContain(named);
+          if (named === "60") expect(note).toContain('`fields`:"detail"');
         }
-        // At the fixed cap, detail applies the SAME cap, so pointing there is a dead retry.
-        const atCap = queryApiGraph(blob, { ids: ["9"], max_chars: 60000 });
-        expect(atCap.text).toContain("clipped to 2048 chars");
-        expect(atCap.text).not.toContain('read fuller values with `fields`:"detail"');
+      });
+
+      it("only a SINGLE id is a pinpoint — a multi-id read keeps every row main returned", () => {
+        // Treating any ids list as a pinpoint cost rows the caller explicitly asked for:
+        // 20 ordinary 600-char prompts at the default budget went 20/20 -> 18/20.
+        const many: Record<string, unknown> = {};
+        for (let i = 1; i <= 30; i++) many[String(i)] = { class_type: "CLIPTextEncode", inputs: { text: "p".repeat(600) } };
+        const r = queryApiGraph(many as never, { ids: Object.keys(many) });
+        expect(r.shown).toBe(30);
+        expect(r.truncated).toBe(false);
       });
     });
   });
