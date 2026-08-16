@@ -2,6 +2,7 @@ import {
   getClient,
   getHistory,
   getQueue as clientGetQueue,
+  getQueueVerified as clientGetQueueVerified,
   interrupt as clientInterrupt,
   deleteQueueItem as clientDeleteQueueItem,
   clearQueue as clientClearQueue,
@@ -806,13 +807,23 @@ export async function cancelQueuedJob(promptId: string): Promise<CancelQueuedRes
 
   const holds = (items: QueueItem[]): boolean => items.some((item) => item[1] === promptId);
 
-  // unknown-ok: null degrades to the old fire-and-report behaviour rather than
-  // failing a removal the caller can still make — but it costs `verified`, so
-  // the outcome is disclosed as unconfirmed instead of claiming a proof.
-  const before = await clientGetQueue().catch((err) => {
-    logger.debug("Could not read /queue before cancel_queued", { err, prompt_id: promptId });
-    return null;
-  });
+  // Deliberately NOT getQueue(): that one resolves an EMPTY queue for a 500, an
+  // HTML proxy page and a dead port alike, so "this job is not pending" and "I
+  // could not look" are the same value. Reading the guard below off it would
+  // report a live pending job as `absent` — "it already finished, its outputs
+  // already exist" — with ComfyUI simply unreachable, and would skip the delete
+  // that the old code at least always attempted. getQueueVerified() throws
+  // instead, which is what makes `null` below mean ignorance and nothing else.
+  //
+  // null = we did not get to look. A look we did not get NEVER decides an early
+  // return and NEVER counts toward `verified`; it only ever costs disclosure.
+  const readQueue = async (when: "before" | "after") =>
+    await clientGetQueueVerified().catch((err) => {
+      logger.debug(`Could not read /queue ${when} cancel_queued`, { err, prompt_id: promptId });
+      return null;
+    });
+
+  const before = await readQueue("before");
   if (before) {
     if (holds(before.queue_running)) {
       logger.info("Queued job is already running; not removed", { prompt_id: promptId });
@@ -826,10 +837,7 @@ export async function cancelQueuedJob(promptId: string): Promise<CancelQueuedRes
 
   await clientDeleteQueueItem(promptId);
 
-  const after = await clientGetQueue().catch((err) => {
-    logger.debug("Could not read /queue after cancel_queued", { err, prompt_id: promptId });
-    return null;
-  });
+  const after = await readQueue("after");
   if (after) {
     if (holds(after.queue_running)) {
       logger.info("Queued job started before the removal landed", { prompt_id: promptId });

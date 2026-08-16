@@ -18,13 +18,14 @@ vi.mock("../../config.js", async () => {
   return { ...actual, isCloudMode: () => false };
 });
 
-const getQueueMock = vi.fn();
+const getQueueVerifiedMock = vi.fn();
 const deleteQueueItemMock = vi.fn();
 
 vi.mock("../../comfyui/client.js", () => ({
   getClient: vi.fn(),
   getHistory: vi.fn(),
-  getQueue: (...args: unknown[]) => getQueueMock(...args),
+  getQueue: vi.fn(),
+  getQueueVerified: (...args: unknown[]) => getQueueVerifiedMock(...args),
   interrupt: vi.fn(),
   deleteQueueItem: (...args: unknown[]) => deleteQueueItemMock(...args),
   clearQueue: vi.fn(),
@@ -48,14 +49,14 @@ function queue(running: string[], pending: string[]): QueueStatus {
 }
 
 beforeEach(() => {
-  getQueueMock.mockReset();
+  getQueueVerifiedMock.mockReset();
   deleteQueueItemMock.mockReset();
   deleteQueueItemMock.mockResolvedValue(undefined);
 });
 
 describe("cancelQueuedJob reports the state it observed", () => {
   it("removes a pending job and confirms it is gone", async () => {
-    getQueueMock
+    getQueueVerifiedMock
       .mockResolvedValueOnce(queue([OTHER], [TARGET]))
       .mockResolvedValueOnce(queue([OTHER], []));
 
@@ -73,7 +74,7 @@ describe("cancelQueuedJob reports the state it observed", () => {
    * the tool said "removed successfully."
    */
   it("does NOT claim a removal for a job that started between the check and the delete", async () => {
-    getQueueMock
+    getQueueVerifiedMock
       .mockResolvedValueOnce(queue([OTHER], [TARGET]))
       .mockResolvedValueOnce(queue([TARGET], []));
 
@@ -87,7 +88,7 @@ describe("cancelQueuedJob reports the state it observed", () => {
   });
 
   it("does not even issue the delete for a job already running", async () => {
-    getQueueMock.mockResolvedValue(queue([TARGET], [OTHER]));
+    getQueueVerifiedMock.mockResolvedValue(queue([TARGET], [OTHER]));
 
     await expect(cancelQueuedJob(TARGET)).resolves.toEqual({
       removed: false,
@@ -98,7 +99,7 @@ describe("cancelQueuedJob reports the state it observed", () => {
   });
 
   it("reports a prompt_id that is not in the queue as absent, not removed", async () => {
-    getQueueMock.mockResolvedValue(queue([OTHER], ["someone-else"]));
+    getQueueVerifiedMock.mockResolvedValue(queue([OTHER], ["someone-else"]));
 
     await expect(cancelQueuedJob(TARGET)).resolves.toEqual({
       removed: false,
@@ -109,7 +110,7 @@ describe("cancelQueuedJob reports the state it observed", () => {
   });
 
   it("reports a delete that did not take effect as still pending", async () => {
-    getQueueMock
+    getQueueVerifiedMock
       .mockResolvedValueOnce(queue([OTHER], [TARGET]))
       .mockResolvedValueOnce(queue([OTHER], [TARGET]));
 
@@ -126,7 +127,7 @@ describe("cancelQueuedJob reports the state it observed", () => {
    * delete returning rather than something we saw.
    */
   it("still removes when /queue cannot be read, but marks the result unverified", async () => {
-    getQueueMock.mockRejectedValue(new Error("ECONNREFUSED"));
+    getQueueVerifiedMock.mockRejectedValue(new Error("ECONNREFUSED"));
 
     await expect(cancelQueuedJob(TARGET)).resolves.toEqual({
       removed: true,
@@ -137,7 +138,7 @@ describe("cancelQueuedJob reports the state it observed", () => {
   });
 
   it("marks the result unverified when only the after-read fails", async () => {
-    getQueueMock
+    getQueueVerifiedMock
       .mockResolvedValueOnce(queue([OTHER], [TARGET]))
       .mockRejectedValueOnce(new Error("ECONNREFUSED"));
 
@@ -153,7 +154,7 @@ describe("cancelQueuedJob reports the state it observed", () => {
    * removal — that would be the same false report in a narrower window.
    */
   it("marks the result unverified when only the before-read fails", async () => {
-    getQueueMock
+    getQueueVerifiedMock
       .mockRejectedValueOnce(new Error("ECONNREFUSED"))
       .mockResolvedValueOnce(queue([OTHER], []));
 
@@ -164,7 +165,7 @@ describe("cancelQueuedJob reports the state it observed", () => {
   });
 
   it("propagates a failed delete instead of reporting a removal", async () => {
-    getQueueMock.mockResolvedValue(queue([OTHER], [TARGET]));
+    getQueueVerifiedMock.mockResolvedValue(queue([OTHER], [TARGET]));
     deleteQueueItemMock.mockRejectedValueOnce(new Error("HTTP 500"));
 
     await expect(cancelQueuedJob(TARGET)).rejects.toThrow("HTTP 500");
