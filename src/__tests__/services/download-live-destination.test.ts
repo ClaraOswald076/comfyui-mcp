@@ -297,6 +297,69 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     );
   });
 
+  // #1147 (recurrence, 0.51.56) — CORROBORATED READERSHIP OUTWEIGHS ONE STRAY FILE.
+  //
+  // A reporter's ComfyUI Desktop install was refused an `animatediff_models`
+  // download because ONE unlisted file in `ipadapter` was read as proof the server
+  // reads a different install — while other categories of that same tree were
+  // listed by that same server, file for file.
+  //
+  // Those two facts are not symmetric. A category the server lists COMPLETELY is
+  // positive evidence it scans this root: for a wrong install to produce that, every
+  // name in the category would have to coincide. A single file the server does not
+  // name has ordinary explanations that say nothing about the root — an extension not
+  // registered for that category, a listing cached before the file arrived, a nested
+  // HuggingFace dump, a folder a custom node registers elsewhere. The #369 signature
+  // is a tree the server accounts for NOWHERE, so corroborated readership must win.
+  it("#1147: PROCEEDS when another category is FULLY accounted for by the same server", async () => {
+    h.onDisk = {
+      // Alphabetically first, so the contradiction is found BEFORE the corroboration
+      // and the scan must not stop at it.
+      animatediff_models: [],
+      ipadapter: ["ip-adapter_sd15.safetensors", "stale/pytorch_model.bin"],
+      loras: ["a.safetensors", "b.safetensors"],
+    };
+    h.liveListings["ipadapter"] = ["ip-adapter_sd15.safetensors"];
+    h.liveListings["loras"] = ["a.safetensors", "b.safetensors"];
+
+    await expect(resolveModelSubfolderPreferServer("animatediff_models")).resolves.toBe(
+      resolve("/comfy/models/animatediff_models"),
+    );
+  });
+
+  it("#1147: a ONE-FILE coincidence does NOT corroborate — the refusal stands (codex gate r5)", async () => {
+    // The round-5 hole at category granularity: two unrelated installs routinely
+    // share ONE popular checkpoint, and a category that holds only that file is
+    // "fully accounted for" by pure coincidence. Corroboration needs a category
+    // whose every name coincides AND that holds more than one file.
+    h.onDisk = {
+      checkpoints: ["sd_xl_base_1.0.safetensors"],
+      loras: ["stale-a.safetensors", "stale-b.safetensors"],
+    };
+    h.liveListings["checkpoints"] = ["sd_xl_base_1.0.safetensors", "live-only.safetensors"];
+    h.liveListings["loras"] = ["live-lora.safetensors"];
+
+    await expect(resolveModelSubfolderPreferServer("loras")).rejects.toThrow(
+      /DIFFERENT install/,
+    );
+  });
+
+  it("#1147: an INFERRED root is corroborated the same way (#1562 stays fixed either way)", async () => {
+    // #1562 made `observed-root` run this check. A stale bundle reached through a
+    // python-on-PATH inference is accounted for NOWHERE, so it still refuses; a
+    // correct one that the server lists file-for-file must not be refused over a
+    // stray file.
+    h.modelsDirSource = "observed-root";
+    h.onDisk = {
+      ipadapter: ["listed.safetensors", "unlisted.bin"],
+      loras: ["a.safetensors", "b.safetensors"],
+    };
+    h.liveListings["ipadapter"] = ["listed.safetensors"];
+    h.liveListings["loras"] = ["a.safetensors", "b.safetensors"];
+
+    await expect(resolveModelSubfolderPreferServer("ipadapter")).resolves.toBeTruthy();
+  });
+
   // There is deliberately NO "the server lists models this tree cannot account for"
   // refusal. Not being able to EXPLAIN the server's models is absence of evidence,
   // not proof of a different install: the roots may come from a config we cannot
