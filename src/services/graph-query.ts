@@ -435,6 +435,44 @@ export function queryApiGraph(graph: ApiGraph, opts: GraphQueryOptions = {}): Gr
 
   // 4) Projection, char-bounded.
   const fields = opts.fields ?? "compact";
+  // #1634: a compact row's 60-char value clip is a SURVEY cap — it exists so a 200-node
+  // listing of nodes you have not identified yet stays small. When the caller passed
+  // explicit `ids` they have ALREADY identified the nodes, so the read is a PINPOINT one
+  // and the survey cap is simply starving the value they asked for. Measured on a 4-node
+  // graph: `{ids:["2"]}` returned the prompt cut at 60 chars in a 301-char reply against
+  // a 12000-char budget — the clip was not protecting anything, and the cut-off value was
+  // quoted back to the user as the node's prompt.
+  //
+  // So a pinpoint read gets the SAME per-value cap the `detail` projection uses. Note
+  // what this deliberately does NOT do: it does not change the compact SHAPE (still one
+  // line per node), and it does not touch the survey path or the outline ladder.
+  //
+  // Only a SINGLE id is a pinpoint read. Treating any `ids` list as one cost rows the
+  // caller explicitly asked for and main returned in full — 20 ordinary 600-char prompts
+  // at the default budget went from 20/20 to 18/20 (gate). One id also means at most one
+  // row, so there is no budget to divide and no row-count to regress.
+  const pinpoint = wantIds?.length === 1;
+  // Raise the cap only when the generous row DEMONSTRABLY fits. Arithmetic reserves kept
+  // leaking — a floor of 60 per widget still grows without bound across many widgets, so
+  // a 24-widget node breached `max_chars` on default parameters while reporting
+  // truncated:false (gate). A fit test cannot leak: if the generous rendering does not fit,
+  // we use main's rendering instead.
+  //
+  // Precisely: this does not make the `max_chars` bound any softer than main's. The bound
+  // is already soft — `clipLine` bounds the LINE, while the header and clip note ride
+  // outside it, so main overshoots by ~173 chars on hostile shapes too (1893 of 4000 in
+  // the gate's fuzz). This branch overshoots on 80 of those 4000 by the same magnitude.
+  // It does not FIX that pre-existing softness, and it must not be read as claiming to.
+  const compactValueCap = ((): number => {
+    if (!pinpoint) return COMPACT_VALUE_CLIP;
+    const n = graph[wantIds[0]] ?? {};
+    let total = 0;
+    for (const [k, v] of Object.entries(widgetsOf(n)))
+      total += k.length + 2 + clipFlag(v, WIDGET_VALUE_CAP).text.length;
+    // The reserve covers what shares the budget with the row: header, the row's own
+    // prefix and ref lists, the truncation tail and the clip note.
+    return total <= maxChars - 1024 ? WIDGET_VALUE_CAP : COMPACT_VALUE_CLIP;
+  })();
   const header =
     `${matched.length} match(es) of ${candidates.length} in scope (graph: ${total} nodes)` +
     (scope ? ` · traversal${Number.isFinite(depth) ? ` depth≤${depth}` : ""}` : "");
@@ -521,9 +559,13 @@ export function queryApiGraph(graph: ApiGraph, opts: GraphQueryOptions = {}): Gr
       // is never dropped yet can't flood — every rendered detail line ends up ≤ max_chars.
       line = fitDetailLine(line, { id, type: clip(n.class_type ?? "?", 200) }, maxChars);
     } else {
+      // ONE cap across the row (see compactValueCap above). A per-widget cap that varied
+      // as a budget drained made the clip note incoherent: values cut at 2048, 736 and 60
+      // were all reported as "clipped to 2048 … which no parameter raises", while raising
+      // `max_chars` demonstrably lifted them (gate).
       const w = Object.entries(widgetsOf(n))
         .map(([k, v]) => {
-          const c = clipFlag(v);
+          const c = clipFlag(v, compactValueCap);
           if (c.clipped) rowClips++;
           return `${k}=${c.text}`;
         })
@@ -583,10 +625,16 @@ export function queryApiGraph(graph: ApiGraph, opts: GraphQueryOptions = {}): Gr
   };
   // #809: the compact projection's 60-char value clip is FIXED — no parameter lifts it,
   // so point at the projection that carries fuller values instead of at a dead lever.
-  const buildClipNote = (n: number): string =>
-    n > 0
-      ? `\n(${n} widget value(s) clipped to ${COMPACT_VALUE_CLIP} chars by \`fields\`:"compact" — read fuller values with \`fields\`:"detail", which caps values at ${WIDGET_VALUE_CAP} chars.)`
-      : "";
+  const buildClipNote = (n: number): string => {
+    if (n <= 0) return "";
+    // #1634: the cap is uniform across the row and is only ever the survey clip or the
+    // fixed per-value cap, so the note has exactly two honest forms. An intermediate,
+    // budget-derived cap was tried and removed: it made the note name a number that was in
+    // force for no widget, and called a cut "unraisable" that raising `max_chars` lifted.
+    if (compactValueCap <= COMPACT_VALUE_CLIP)
+      return `\n(${n} widget value(s) clipped to ${COMPACT_VALUE_CLIP} chars by \`fields\`:"compact" — read fuller values with \`fields\`:"detail", which caps values at ${WIDGET_VALUE_CAP} chars.)`;
+    return `\n(${n} widget value(s) clipped to ${WIDGET_VALUE_CAP} chars — the same fixed per-value cap \`fields\`:"detail" applies, which no parameter raises.)`;
+  };
   const assemble = (): string => {
     const body = fields === "ids" ? lines.join(",") : lines.join("\n");
     return `${header}\n${body}${buildTail(truncatedBy, shown)}${buildClipNote(lineClips.reduce((x, y) => x + y, 0))}`;
