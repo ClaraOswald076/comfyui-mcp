@@ -350,4 +350,79 @@ describe("queryApiGraph", () => {
       expect(r.text).toContain("narrow with `types`/`where`/`ids`/`depth`");
     });
   });
+
+  // #1634: a Discord reporter kept getting a CUT-OFF positive prompt back from the agent.
+  // It was not the outline ladder degrading on a big graph (the filed hypothesis) — it
+  // reproduces on a 4-node graph, because the compact projection's 60-char clip is a
+  // SURVEY cap and it also applied to a read that named the node explicitly by `ids`.
+  describe("#1634 — an explicit `ids` read is a PINPOINT read, not a survey", () => {
+    const PROMPT =
+      "masterpiece, best quality, ultra detailed, a lone astronaut standing on a windswept " +
+      "red dune at golden hour, visor reflecting twin suns, volumetric god rays, fine sand " +
+      "particles drifting, cinematic composition, 85mm lens, shallow depth of field, " +
+      "photorealistic, 8k, sharp focus, dramatic rim lighting";
+    const Gp = {
+      "1": { class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: "sdxl.safetensors" } },
+      "2": { class_type: "CLIPTextEncode", _meta: { title: "Positive Prompt" }, inputs: { text: PROMPT, clip: ["1", 1] } },
+      "3": { class_type: "KSampler", inputs: { seed: 1, model: ["1", 0], positive: ["2", 0] } },
+    };
+
+    it("returns the node's FULL widget value on a small graph, without fields:'detail'", () => {
+      expect(PROMPT.length).toBeGreaterThan(60);
+      const r = queryApiGraph(Gp, { ids: ["2"] });
+      // The whole reply is ~400 chars against a 12000 budget: the clip was never
+      // protecting anything here, it was starving the value that was asked for.
+      expect(r.text).toContain(PROMPT);
+      expect(r.text.length).toBeLessThan(1000);
+    });
+
+    it("does NOT emit a clip note when nothing was clipped", () => {
+      const r = queryApiGraph(Gp, { ids: ["2"] });
+      expect(r.text).not.toContain("widget value(s) clipped");
+    });
+
+    it("a SURVEY read (no ids) still clips at the fixed 60 and names fields:'detail'", () => {
+      const r = queryApiGraph(Gp, {});
+      expect(r.text).not.toContain(PROMPT);
+      expect(r.text).toContain('clipped to 60 chars by `fields`:"compact"');
+      expect(r.text).toContain('read fuller values with `fields`:"detail"');
+    });
+
+    it("a `where`/`types` filter is still a survey — only explicit ids are a pinpoint", () => {
+      const r = queryApiGraph(Gp, { types: ["CLIPTextEncode"] });
+      expect(r.text).not.toContain(PROMPT);
+      expect(r.text).toContain('clipped to 60 chars by `fields`:"compact"');
+    });
+
+    it("max_chars still bounds a large ids list — the token guard is intact", () => {
+      const big: Record<string, { class_type: string; inputs: Record<string, unknown> }> = {};
+      for (let i = 1; i <= 60; i++) big[String(i)] = { class_type: "CLIPTextEncode", inputs: { text: "z".repeat(900) } };
+      const ids = Object.keys(big);
+      // The FIRST row is protected from the budget and can never be dropped, so its
+      // per-value cap has to respect max_chars: an unreserved 2048 cap returned 740
+      // chars against max_chars=500 while main returned 465.
+      for (const maxChars of [500, 800, 1500, 2000, 4000, 12000, 60000]) {
+        const r = queryApiGraph(big, { ids, max_chars: maxChars });
+        expect(r.text.length).toBeLessThanOrEqual(maxChars);
+      }
+    });
+
+    it("a value past the fixed 2048 cap is still capped, and the note names no dead lever", () => {
+      const G7 = { "7": { class_type: "Note", inputs: { text: "b".repeat(5000) } } };
+      const r = queryApiGraph(G7, { ids: ["7"], max_chars: 60000 });
+      expect(r.text.length).toBeLessThan(5000);
+      expect(r.text).toContain("clipped to 2048 chars");
+      // `fields`:"detail" applies the SAME 2048 cap, so pointing there would be the dead
+      // retry #809 exists to remove.
+      expect(r.text).not.toContain('read fuller values with `fields`:"detail"');
+    });
+
+    it("when max_chars (not the fixed cap) is what cut a pinpoint value, it says so", () => {
+      const G8 = { "8": { class_type: "Note", inputs: { text: "c".repeat(4000) } } };
+      const r = queryApiGraph(G8, { ids: ["8"], max_chars: 2000 });
+      expect(r.text.length).toBeLessThanOrEqual(2000);
+      expect(r.text).toContain("`max_chars`=2000");
+      expect(r.text).toContain("raise `max_chars`");
+    });
+  });
 });
