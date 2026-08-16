@@ -469,6 +469,23 @@ describe("queryApiGraph", () => {
         }
       });
 
+      it("the fit test RESERVES budget for the framing that rides outside the row", () => {
+        // Gate class 4: mutating the reserve to 0 survived all 103 tests, so the constant
+        // was unpinned. The reserve is what the row does NOT get to spend: header, the
+        // row's own prefix and ref lists, the truncation tail and the clip note. Pin it by
+        // asserting the raise is DECLINED where the widgets alone would eat the budget.
+        const near = { "2": { class_type: "T", inputs: { w: "x".repeat(1500) } } };
+        // 1500 chars of value + framing against a 2000 budget: without a reserve the fit
+        // test says yes and the reply has no room left for its own tail and note.
+        const declined = queryApiGraph(near, { ids: ["2"], max_chars: 2000 });
+        expect(declined.text).toContain('clipped to 60 chars by `fields`:"compact"');
+        expect(declined.text.length).toBeLessThanOrEqual(2000);
+        // Raise the budget past the reserve and the SAME node renders in full.
+        const granted = queryApiGraph(near, { ids: ["2"], max_chars: 4000 });
+        expect(granted.text).toContain("x".repeat(1500));
+        expect(granted.text.length).toBeLessThanOrEqual(4000);
+      });
+
       it("only a SINGLE id is a pinpoint — a multi-id read keeps every row main returned", () => {
         // Treating any ids list as a pinpoint cost rows the caller explicitly asked for:
         // 20 ordinary 600-char prompts at the default budget went 20/20 -> 18/20.

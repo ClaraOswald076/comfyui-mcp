@@ -463,7 +463,13 @@ export function queryApiGraph(graph: ApiGraph, opts: GraphQueryOptions = {}): Gr
   // leaking — a floor of 60 per widget still grows without bound across many widgets, so
   // a 24-widget node breached `max_chars` on default parameters while reporting
   // truncated:false (gate). A fit test cannot leak: if the generous rendering does not fit,
-  // we use main's, so this is never worse than main on any shape.
+  // we use main's rendering instead.
+  //
+  // Precisely: this does not make the `max_chars` bound any softer than main's. The bound
+  // is already soft — `clipLine` bounds the LINE, while the header and clip note ride
+  // outside it, so main overshoots by ~173 chars on hostile shapes too (1893 of 4000 in
+  // the gate's fuzz). This branch overshoots on 80 of those 4000 by the same magnitude.
+  // It does not FIX that pre-existing softness, and it must not be read as claiming to.
   const compactValueCap = ((): number => {
     if (!pinpoint) return COMPACT_VALUE_CLIP;
     const n = graph[wantIds[0]] ?? {};
