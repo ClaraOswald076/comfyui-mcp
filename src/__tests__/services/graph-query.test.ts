@@ -424,5 +424,49 @@ describe("queryApiGraph", () => {
       expect(r.text).toContain("`max_chars`=2000");
       expect(r.text).toContain("raise `max_chars`");
     });
+    // Both found by the review gate on the first version of this fix, which capped each
+    // value at 2048 INDEPENDENTLY and dropped the fields:"detail" pointer outright.
+    describe("#1634 gate findings", () => {
+      const wide = (count: number, len: number) => {
+        const inputs: Record<string, unknown> = {};
+        for (let i = 0; i < count; i++) inputs[`w${i}`] = "x".repeat(len);
+        return { "2": { class_type: "Efficient Loader", inputs } };
+      };
+
+      it("a MULTI-widget pinpoint row respects max_chars — a per-value cap does not bound the row", () => {
+        // N widgets at the cap sum to N x cap, and the #609-protected first row can never
+        // be dropped to recover. The first version breached on DEFAULT parameters: 12169
+        // of 12000 with six long widgets, and 2700 of 2500 with an ordinary
+        // positive+negative pair.
+        const shapes: Array<[Record<string, unknown>, number]> = [
+          [wide(6, 2100), 12000],
+          [wide(4, 3000), 2000],
+          [wide(2, 3000), 2500],
+          [wide(1, 9000), 600],
+        ];
+        for (const [g, maxChars] of shapes) {
+          const r = queryApiGraph(g as never, { ids: ["2"], max_chars: maxChars });
+          expect(r.text.length, `max_chars=${maxChars}`).toBeLessThanOrEqual(maxChars);
+        }
+      });
+
+      it("below the fixed cap the note still names fields:'detail' — there it carries MORE", () => {
+        // Dropping the pointer is only honest AT the fixed cap, where detail applies the
+        // same 2048. Below it, capWidgets() reserves 256 where the compact row reserves
+        // 1024, so at max_chars=1084 compact carries 59 value chars against detail's 747.
+        // Suppressing the pointer there hands back the very 60-char clipped prompt this
+        // issue is about, with the one lever that works at that budget omitted.
+        const blob = { "9": { class_type: "Note", inputs: { t: "x".repeat(9000) } } };
+        for (const maxChars of [1200, 1500, 2000]) {
+          const r = queryApiGraph(blob, { ids: ["9"], max_chars: maxChars });
+          expect(r.text, `max_chars=${maxChars}`).toContain('`fields`:"detail"');
+          expect(r.text).toContain("`max_chars`=" + maxChars);
+        }
+        // At the fixed cap, detail applies the SAME cap, so pointing there is a dead retry.
+        const atCap = queryApiGraph(blob, { ids: ["9"], max_chars: 60000 });
+        expect(atCap.text).toContain("clipped to 2048 chars");
+        expect(atCap.text).not.toContain('read fuller values with `fields`:"detail"');
+      });
+    });
   });
 });

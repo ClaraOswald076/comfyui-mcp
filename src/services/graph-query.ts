@@ -548,10 +548,22 @@ export function queryApiGraph(graph: ApiGraph, opts: GraphQueryOptions = {}): Gr
       // is never dropped yet can't flood — every rendered detail line ends up ≤ max_chars.
       line = fitDetailLine(line, { id, type: clip(n.class_type ?? "?", 200) }, maxChars);
     } else {
+      // #1634 (gate): a PER-VALUE cap does not bound the ROW — N widgets at the cap sum
+      // to N×cap, and the #609-protected first row can never be dropped to recover, so a
+      // multi-widget pinpoint node breached `max_chars` on DEFAULT parameters: measured
+      // 12169/12000 with six long widgets, and 2700/2500 with just TWO (an ordinary
+      // positive+negative pair). Spend ONE row budget across the widgets instead, so the
+      // raised cap is what a row may spend in total, not what each widget may spend.
+      // Never below the survey clip, so a tight budget degrades to main's behaviour.
+      let rowBudget = pinpoint
+        ? Math.max(COMPACT_VALUE_CLIP, maxChars - 1024)
+        : Number.POSITIVE_INFINITY;
       const w = Object.entries(widgetsOf(n))
         .map(([k, v]) => {
-          const c = clipFlag(v, compactValueCap);
+          const cap = Math.min(compactValueCap, Math.max(COMPACT_VALUE_CLIP, rowBudget));
+          const c = clipFlag(v, cap);
           if (c.clipped) rowClips++;
+          rowBudget -= c.text.length;
           return `${k}=${c.text}`;
         })
         .join(" ");
@@ -616,13 +628,25 @@ export function queryApiGraph(graph: ApiGraph, opts: GraphQueryOptions = {}): Gr
   // exists to remove — detail applies the SAME cap. Name the cap actually in force.
   const buildClipNote = (n: number): string => {
     if (n <= 0) return "";
-    if (!pinpoint)
+    // When the budget degraded the pinpoint cap all the way back to the survey clip, the
+    // cap in force IS the survey one and `fields`:"detail" is exactly the right lever —
+    // so emit main's note verbatim rather than a longer one saying the same thing. The
+    // longer text is not free: it rides inside `max_chars`, and at the 500 floor it was
+    // enough on its own to push a reply that fitted (465) past the bound (545).
+    if (!pinpoint || compactValueCap <= COMPACT_VALUE_CLIP)
       return `\n(${n} widget value(s) clipped to ${COMPACT_VALUE_CLIP} chars by \`fields\`:"compact" — read fuller values with \`fields\`:"detail", which caps values at ${WIDGET_VALUE_CAP} chars.)`;
     // Name the cap ACTUALLY in force: below WIDGET_VALUE_CAP it was `max_chars` that cut
     // the value, and raising `max_chars` genuinely helps — so say which lever applies
     // rather than reporting the constant and sending the caller at a dead one.
+    //
+    // #1634 (gate): dropping the `fields`:"detail" pointer is only honest AT the fixed
+    // cap, where detail applies the same 2048. Below it detail is strictly better —
+    // capWidgets() reserves 256 where this row reserves 1024, so at `max_chars`=1084
+    // compact carries 59 value chars against detail's 747. Suppressing the pointer there
+    // would hand a caller the very 60-char clipped prompt #1634 is about, with the one
+    // lever that works at their budget omitted — the #809 wrong-lever class exactly.
     return compactValueCap < WIDGET_VALUE_CAP
-      ? `\n(${n} widget value(s) clipped to ${compactValueCap} chars to fit \`max_chars\`=${maxChars} — ${raiseOrCeiling("max_chars", maxChars, MAX_CHARS_CEILING)} for fuller values, up to a fixed ${WIDGET_VALUE_CAP}-char per-value cap.)`
+      ? `\n(${n} widget value(s) clipped to ${compactValueCap} chars to fit \`max_chars\`=${maxChars} — ${raiseOrCeiling("max_chars", maxChars, MAX_CHARS_CEILING)}, or read this node with \`fields\`:"detail", which reserves less of the budget for framing and so carries more at this size.)`
       : `\n(${n} widget value(s) clipped to ${WIDGET_VALUE_CAP} chars — the same fixed per-value cap \`fields\`:"detail" applies, which no parameter raises.)`;
   };
   const assemble = (): string => {
