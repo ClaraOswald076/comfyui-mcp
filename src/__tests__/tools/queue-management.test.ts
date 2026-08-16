@@ -249,10 +249,77 @@ describe("queue actions call the same services with the same arguments", () => {
     });
   });
 
-  it('action:"cancel_queued" returns the exact prose confirmation', async () => {
+  it('action:"cancel_queued" returns the exact prose confirmation for a verified removal', async () => {
+    mocks.cancelQueuedJob.mockResolvedValueOnce({ removed: true, state: "removed", verified: true });
     const res = await handler()({ action: "cancel_queued", prompt_id: "p1" });
     expect(mocks.cancelQueuedJob).toHaveBeenCalledWith("p1");
     expect(text(res)).toBe("Queued job p1 removed successfully.");
+    expect(res.isError).toBeUndefined();
+  });
+
+  /**
+   * #1632. The service now reports what it OBSERVED, and this layer may not
+   * launder any of those observations into "removed successfully." — an agent
+   * that reads a success here tells the user it stopped a render, and for
+   * `running` that render finishes and delivers its outputs anyway.
+   */
+  describe('action:"cancel_queued" never claims a removal it was not given', () => {
+    it("marks an already-running job as an error and points at action:\"cancel\"", async () => {
+      mocks.cancelQueuedJob.mockResolvedValueOnce({
+        removed: false,
+        state: "running",
+        verified: true,
+      });
+      const res = await handler()({ action: "cancel_queued", prompt_id: "p1" });
+      expect(res.isError).toBe(true);
+      expect(text(res)).not.toMatch(/removed successfully/);
+      expect(text(res)).toMatch(/NOT removed/);
+      expect(text(res)).toMatch(/already RUNNING/);
+      expect(text(res)).toMatch(/outputs WILL still be delivered/);
+      expect(text(res)).toMatch(/action:"cancel"/);
+    });
+
+    it("marks a prompt_id that was not in the queue as an error", async () => {
+      mocks.cancelQueuedJob.mockResolvedValueOnce({
+        removed: false,
+        state: "absent",
+        verified: true,
+      });
+      const res = await handler()({ action: "cancel_queued", prompt_id: "p1" });
+      expect(res.isError).toBe(true);
+      expect(text(res)).not.toMatch(/removed successfully/);
+      expect(text(res)).toMatch(/not in the queue/);
+    });
+
+    it("marks a job still pending after the request as an error", async () => {
+      mocks.cancelQueuedJob.mockResolvedValueOnce({
+        removed: false,
+        state: "pending",
+        verified: true,
+      });
+      const res = await handler()({ action: "cancel_queued", prompt_id: "p1" });
+      expect(res.isError).toBe(true);
+      expect(text(res)).not.toMatch(/removed successfully/);
+      expect(text(res)).toMatch(/STILL PENDING/);
+    });
+
+    /**
+     * DISCLOSE, DO NOT HIDE — same contract as action:"cancel". An unverified
+     * removal is a success (the request went through), so it is NOT an error;
+     * it just may not say "removed successfully", which claims a proof no
+     * /queue read supplied.
+     */
+    it("succeeds but withholds the confirmation when the queue could not be read", async () => {
+      mocks.cancelQueuedJob.mockResolvedValueOnce({
+        removed: true,
+        state: "removed",
+        verified: false,
+      });
+      const res = await handler()({ action: "cancel_queued", prompt_id: "p1" });
+      expect(res.isError).toBeUndefined();
+      expect(text(res)).not.toMatch(/removed successfully/);
+      expect(text(res)).toMatch(/could not be read to confirm/);
+    });
   });
 
   it('action:"clear" returns the exact prose confirmation', async () => {
