@@ -4,6 +4,18 @@ Maps legacy patterns (`app.registerExtension()`, `nodeType.prototype` patching,
 `api.addEventListener`, `widget.callback`) to their `@comfyorg/extension-api` v2
 equivalents. See [`../SKILL.md`](../SKILL.md) for full authoring patterns.
 
+## Contents
+
+- [The big picture](#the-big-picture) — what v2 split apart, and why
+- [Top-level registration](#top-level-registration) — `registerExtension` → `defineExtension`
+- [Lifecycle hooks](#lifecycle-hooks) — `setup`/`init` → `onLoad`/`onUnload`
+- [Node prototype patching → `NodeHandle` events](#node-prototype-patching--nodehandle-events)
+- [Widgets](#widgets) — `addWidget`/`widget.callback` → typed widget handles
+- [Events: `api.addEventListener` → typed namespaces](#events-apiaddeventlistener--typed-namespaces)
+- [Shell UI](#shell-ui) — sidebar tabs, commands, keybindings, settings, toasts
+- [Cleanup / teardown](#cleanup--teardown) — disposers replace manual unpatching
+- [Migration checklist](#migration-checklist) — the ordered pass to run over an extension
+
 ## The big picture
 
 v1 packed everything into a single `app.registerExtension({...})` mega-call with

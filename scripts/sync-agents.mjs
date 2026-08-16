@@ -10,8 +10,16 @@ fs.mkdirSync(path.join(AGENTS_DIR, 'skills'), { recursive: true });
 fs.mkdirSync(GEMINI_DIR, { recursive: true });
 
 function extractFrontmatter(content) {
-  const match = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
-  if (!match) return { frontmatter: {}, body: content };
+  // Normalize BOM + CRLF before matching the fence, the same way splitFrontmatter
+  // (src/tools/skills-access.ts) does. Without this, every checkout with
+  // core.autocrlf=true — the Windows default — fails `^---\n`, falls through to the
+  // no-frontmatter branch, and generates .agents/skills/<n>/SKILL.md with an EMPTY
+  // description plus the original frontmatter duplicated into the body. That was true
+  // for all 39 skills. Same root cause as #1617, which fixed a test that read raw bytes;
+  // this is the generator that had the identical bug.
+  const normalized = content.replace(/^﻿/, '').replace(/\r\n/g, '\n');
+  const match = normalized.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+  if (!match) return { frontmatter: {}, body: normalized };
   
   const frontmatterStr = match[1];
   const body = match[2];
