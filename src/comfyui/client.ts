@@ -415,6 +415,46 @@ export async function getQueue(): Promise<QueueStatus> {
   };
 }
 
+/**
+ * /queue, but a read that is allowed to FAIL.
+ *
+ * `getQueue()` above cannot say "I could not look". It goes through the
+ * vendored client, whose failure path resolves a document with no Running or
+ * Pending key — and the `?? []` normalizer then turns that into an EMPTY
+ * QUEUE. Measured against a real HTTP server: a 500, a 502 HTML proxy page, a
+ * 200 `{}`, and a dead port (ECONNREFUSED) ALL resolve
+ * `{queue_running:[],queue_pending:[]}`. Nothing throws.
+ *
+ * That collapse is harmless for a summary — an unreachable ComfyUI has no jobs
+ * to list — and fatal for any caller that must tell "this job is not queued"
+ * from "I could not check", because those are the same bytes. #1632 is exactly
+ * that mistake one level up: reporting a job as removed without looking.
+ *
+ * So this takes the guarded JSON path every other verifying read here uses.
+ * A network error, a non-2xx, an HTML body, and a JSON document that is not a
+ * queue all THROW; only a real /queue document resolves. Callers that must not
+ * confuse absence with ignorance use this one.
+ */
+export async function getQueueVerified(): Promise<QueueStatus> {
+  requireLocalMode("getQueueVerified");
+  const res = await comfyApiFetch("/queue");
+  const queue = await readComfyJson<Record<string, unknown>>(res, {
+    url: "/queue",
+    // Both halves must be present. Accepting a bare `{}` would reinstate the
+    // very collapse this function exists to avoid — silently, and now wearing
+    // the word "verified".
+    expectShape: (v) =>
+      typeof v === "object" && v !== null && !Array.isArray(v) &&
+      ("queue_running" in v || "Running" in v) &&
+      ("queue_pending" in v || "Pending" in v),
+    shapeHint: "a ComfyUI /queue document (queue_running + queue_pending)",
+  });
+  return {
+    queue_running: (queue.Running ?? queue.queue_running ?? []) as QueueStatus["queue_running"],
+    queue_pending: (queue.Pending ?? queue.queue_pending ?? []) as QueueStatus["queue_pending"],
+  };
+}
+
 export async function interrupt(promptId?: string): Promise<void> {
   if (isCloudMode()) return cloudClient.interrupt(promptId);
   const client = getClient();

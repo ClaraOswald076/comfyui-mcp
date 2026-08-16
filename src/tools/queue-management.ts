@@ -42,7 +42,7 @@ export function registerQueueManagementTools(server: McpServer): void {
       '- action:"move" — Move a PENDING queue item to the front or back by removing it and re-enqueuing its saved workflow payload; `position` ("front"|"back") is required. The job receives a NEW prompt_id; the old prompt_id is removed. Running jobs cannot be moved.\n' +
       '- action:"edit" — Edit a PENDING queue item by removing it and re-enqueuing an updated workflow. Provide either a complete replacement `workflow` or `node_inputs` patches keyed by node id; `position` selects where to requeue (default back). The job receives a NEW prompt_id; the old prompt_id is removed. Running jobs cannot be edited.\n' +
       '- action:"cancel" — Stop the CURRENTLY RUNNING job ROBUSTLY. Sends an interrupt, then WAITS and verifies the job actually stopped — ComfyUI only honors interrupts BETWEEN steps, so a long single step (e.g. a high-res video sampler) can ignore a plain cancel. If the interrupt isn\'t honored it escalates to freeing VRAM (POST /free) and re-checks; if it STILL won\'t die it reports the job as WEDGED and tells you to restart_comfyui (an HTTP cancel cannot kill a stuck step). Set clear_pending:true to also drop ALL pending jobs in the same call — the correct "reset the queue" action, since cancelling alone leaves pending jobs that would run next. The partial result is discarded. With `prompt_id` given, only interrupts the running job when its prompt_id matches; omit to interrupt whatever is currently running. Use action:"cancel_queued" to remove one specific PENDING job instead.\n' +
-      '- action:"cancel_queued" — Remove one specific PENDING job from the queue by prompt_id. Does not affect running jobs.\n' +
+      '- action:"cancel_queued" — Remove one specific PENDING job from the queue by prompt_id, then VERIFY the removal against a live /queue read on both sides of it. Only PENDING jobs can be removed this way: ComfyUI silently ignores the request for a job it has already started, so if the job won the race and is now RUNNING this reports isError and tells you the outputs will still be delivered — use action:"cancel" to interrupt that. Also reports isError when the prompt_id was not in the queue at all (it already finished, or was never queued) rather than calling that a removal.\n' +
       '- action:"clear" — Clear ALL pending jobs from the queue. Does not affect the currently running job.',
     {
       action: z
@@ -171,12 +171,38 @@ export function registerQueueManagementTools(server: McpServer): void {
           }
           case "cancel_queued": {
             const promptId = requirePromptId("cancel_queued", "the pending job to remove");
-            await cancelQueuedJob(promptId);
+            const outcome = await cancelQueuedJob(promptId);
+            // NEVER report a removal we did not observe. ComfyUI's /queue delete
+            // no-ops for a job that already started, so the old unconditional
+            // "removed successfully." told the agent it had superseded a render
+            // that then ran to completion and delivered its outputs (#1632).
+            // Same contract as action:"cancel" right above: isError marks a
+            // request that was NOT carried out, and the prose says what the job
+            // is actually doing and what to do instead — it does not hide it.
+            if (!outcome.removed) {
+              const text =
+                outcome.state === "running"
+                  ? `Queued job ${promptId} was NOT removed — it is already RUNNING. ` +
+                    `action:"cancel_queued" only removes PENDING items, so this job will run to ` +
+                    `completion and its outputs WILL still be delivered. Use action:"cancel" with ` +
+                    `this prompt_id to interrupt it.`
+                  : outcome.state === "absent"
+                    ? `Queued job ${promptId} was NOT removed — it is not in the queue. It already ` +
+                      `finished, was removed earlier, or was never queued; if it finished, its ` +
+                      `outputs already exist. Check action:"status" for this prompt_id.`
+                    : `Queued job ${promptId} is STILL PENDING after the remove request — the ` +
+                      `removal did not take effect. Re-check with action:"list".`;
+              return { content: [{ type: "text" as const, text }], isError: true };
+            }
             return {
               content: [
                 {
                   type: "text" as const,
-                  text: `Queued job ${promptId} removed successfully.`,
+                  text: outcome.verified
+                    ? `Queued job ${promptId} removed successfully.`
+                    : `Queued job ${promptId}: the removal request succeeded, but /queue could not ` +
+                      `be read to confirm the job was pending and is now gone. Verify with ` +
+                      `action:"list".`,
                 },
               ],
             };

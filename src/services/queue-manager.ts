@@ -2,6 +2,7 @@ import {
   getClient,
   getHistory,
   getQueue as clientGetQueue,
+  getQueueVerified as clientGetQueueVerified,
   interrupt as clientInterrupt,
   deleteQueueItem as clientDeleteQueueItem,
   clearQueue as clientClearQueue,
@@ -756,9 +757,103 @@ export async function cancelRunningJobEscalating(opts: {
   };
 }
 
-export async function cancelQueuedJob(promptId: string): Promise<void> {
+/** What a `cancel_queued` request was OBSERVED to do, not what it asked for. */
+export interface CancelQueuedResult {
+  /** True only when a job we saw PENDING is gone from a later /queue read. */
+  removed: boolean;
+  /** `removed` = it was pending and is gone. `running` = ComfyUI is already
+   *  executing it, so the delete is a no-op and its outputs will still arrive.
+   *  `absent` = it was not in the queue at all. `pending` = the delete did not
+   *  take effect. */
+  state: "removed" | "running" | "pending" | "absent";
+  /** False when a /queue read failed, so `removed` rests on the delete call
+   *  returning rather than on an observation. Callers must disclose it. */
+  verified: boolean;
+}
+
+/**
+ * Remove ONE pending job, and report the state we actually observed.
+ *
+ * VERIFY, DON'T ASSUME. ComfyUI's /queue delete silently no-ops for a prompt
+ * that has already started running: the render keeps going and its outputs are
+ * still delivered. Firing the delete and returning void left every caller with
+ * nothing to branch on, so the tool hardcoded "removed successfully." — a FALSE
+ * report for exactly the case an agent cares about, superseding a job it just
+ * queued. In #1632 the job won the race by one second, the agent told the user
+ * it was cancelled, and four stale images arrived 70s later.
+ *
+ * So: read /queue on BOTH sides of the delete. The read BEFORE separates a job
+ * that was never pending from one we removed (after the delete those two look
+ * identical), and the read AFTER catches the race that produced the bug — the
+ * job starting between our check and the delete landing.
+ *
+ * This mirrors the verify-then-report contract action:"cancel" already has; it
+ * is the one queue mutation that never got it.
+ */
+export async function cancelQueuedJob(promptId: string): Promise<CancelQueuedResult> {
+  // Comfy Cloud has NO /queue endpoint: `cloudClient.getQueue()` returns a
+  // hardcoded empty queue without making a request. A "not pending" read there
+  // is not an observation, it is the absence of an endpoint — and the two are
+  // byte-identical to the checks below, so verifying against it would report
+  // every cloud job as `absent` ("it already finished"), swallow the delete,
+  // and replace a correct CLOUD_UNSUPPORTED error that names action:"cancel"
+  // with the exact false report this function exists to prevent. Nothing about
+  // a stub can be verified, so don't pretend: go straight to the delete.
+  if (isCloudMode()) {
+    await clientDeleteQueueItem(promptId);
+    logger.info("Queued job removed", { prompt_id: promptId, cloud: true });
+    return { removed: true, state: "removed", verified: false };
+  }
+
+  const holds = (items: QueueItem[]): boolean => items.some((item) => item[1] === promptId);
+
+  // Deliberately NOT getQueue(): that one resolves an EMPTY queue for a 500, an
+  // HTML proxy page and a dead port alike, so "this job is not pending" and "I
+  // could not look" are the same value. Reading the guard below off it would
+  // report a live pending job as `absent` — "it already finished, its outputs
+  // already exist" — with ComfyUI simply unreachable, and would skip the delete
+  // that the old code at least always attempted. getQueueVerified() throws
+  // instead, which is what makes `null` below mean ignorance and nothing else.
+  //
+  // null = we did not get to look. A look we did not get NEVER decides an early
+  // return and NEVER counts toward `verified`; it only ever costs disclosure.
+  const readQueue = async (when: "before" | "after") =>
+    await clientGetQueueVerified().catch((err) => {
+      logger.debug(`Could not read /queue ${when} cancel_queued`, { err, prompt_id: promptId });
+      return null;
+    });
+
+  const before = await readQueue("before");
+  if (before) {
+    if (holds(before.queue_running)) {
+      logger.info("Queued job is already running; not removed", { prompt_id: promptId });
+      return { removed: false, state: "running", verified: true };
+    }
+    if (!holds(before.queue_pending)) {
+      logger.info("Queued job is not in the queue; nothing to remove", { prompt_id: promptId });
+      return { removed: false, state: "absent", verified: true };
+    }
+  }
+
   await clientDeleteQueueItem(promptId);
+
+  const after = await readQueue("after");
+  if (after) {
+    if (holds(after.queue_running)) {
+      logger.info("Queued job started before the removal landed", { prompt_id: promptId });
+      return { removed: false, state: "running", verified: true };
+    }
+    if (holds(after.queue_pending)) {
+      logger.info("Queued job still pending after the removal", { prompt_id: promptId });
+      return { removed: false, state: "pending", verified: true };
+    }
+  }
+
   logger.info("Queued job removed", { prompt_id: promptId });
+  // BOTH reads are required for `verified`: the after-read alone cannot tell a
+  // job we removed from one that was never queued, and calling the second case
+  // "removed" is the same false report in a narrower window.
+  return { removed: true, state: "removed", verified: !!before && !!after };
 }
 
 export async function clearAllQueued(): Promise<void> {
