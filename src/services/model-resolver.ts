@@ -3278,6 +3278,10 @@ export async function downloadModel(
       onResume,
       signal,
       onLanded,
+      // #1635 — the failure hint must know a per-request override authenticated
+      // this request, so a CivitAI 401 indicts THAT credential instead of
+      // claiming no CIVITAI_API_TOKEN is configured.
+      callerAuth: auth !== undefined,
     });
   } catch (err) {
     // On a user cancel (#515) the transfer was aborted, not a real failure — do NOT

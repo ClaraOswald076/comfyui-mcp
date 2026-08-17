@@ -148,11 +148,23 @@ function redactUrlQueryValues(text: string, requestUrl?: string): string {
  * an auth failure" would send them off exactly as the original bug did, one
  * layer along. Only a 404 gets the URL-form remedy — the case the reporter
  * actually established.
+ *
+ * WHEN A PER-REQUEST `auth` OVERRIDE WAS USED (#1635) the same logic applies one
+ * level up: the request already carried a credential — the override REPLACES the
+ * configured-token handling (downloadModel attaches the config token only when no
+ * `auth` was passed) — so "set CIVITAI_API_TOKEN" is a wrong remedy that sends the
+ * caller to configure a credential they deliberately bypassed. A 401/403 then
+ * indicts the OVERRIDE credential, and any other status is probably not an auth
+ * failure either.
  */
 export function downloadFailureHint(opts: {
   status: number;
   url: string;
   hasCivitaiToken: boolean;
+  /** A per-request `auth` override was supplied AND threaded into this request.
+   *  See the note above: it replaces the configured token for this download, so
+   *  the no-token remedy must not fire. */
+  callerAuth?: boolean;
 }): string {
   let host = "";
   try {
@@ -164,7 +176,7 @@ export function downloadFailureHint(opts: {
   }
   if (!/(^|\.)civitai\.com$/i.test(host)) return "";
 
-  if (!opts.hasCivitaiToken) {
+  if (!opts.hasCivitaiToken && !opts.callerAuth) {
     return (
       " — NOTE: no CIVITAI_API_TOKEN is configured, and CivitAI requires a token for ALL model " +
       "downloads, so that is the most likely cause whatever status came back (an unauthenticated " +
@@ -175,6 +187,16 @@ export function downloadFailureHint(opts: {
   }
 
   if (opts.status === 401 || opts.status === 403) {
+    if (opts.callerAuth) {
+      return (
+        " — a per-request `auth` override was supplied AND used for this request, so this status " +
+        "indicts THAT credential, not a missing CIVITAI_API_TOKEN (the override replaced the " +
+        "configured-token handling for this download): it is INVALID, expired, or lacks access " +
+        "to this model (early-access and gated models need entitlement, not just any token). " +
+        "Re-check the credential you passed, and whether this model requires purchase or " +
+        "early-access on its page."
+      );
+    }
     return (
       " — a CIVITAI_API_TOKEN is configured, and this status is what CivitAI returns for a token " +
       "that is INVALID, expired, or lacks access to this model (early-access and gated models " +
@@ -192,5 +214,11 @@ export function downloadFailureHint(opts: {
         "https://civitai.com/api/download/models/<versionId>?fileId=<fileId>, taking fileId from " +
         "that version's `files[]` in the CivitAI API."
       : "";
+  if (opts.callerAuth) {
+    return (
+      " — a per-request `auth` override was supplied AND used for this request, so this is " +
+      `probably not a missing-token failure.${fileIdTip}`
+    );
+  }
   return ` — a CIVITAI_API_TOKEN IS configured, so this is probably not an auth failure.${fileIdTip}`;
 }

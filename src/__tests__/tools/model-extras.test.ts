@@ -325,6 +325,33 @@ describe('download_model action:"download_civitai"', () => {
     );
   });
 
+  it("forwards a per-request `auth` override to the download job (#1635)", async () => {
+    // The reported bug: `auth` was accepted by the tool schema but dropped on this
+    // path, so a caller holding a valid CivitAI token still got a 401.
+    const auth = { type: "bearer", token: "civ-token" } as const;
+    resolveCivitaiModelVersionMock.mockResolvedValueOnce({
+      downloadUrl: "https://civitai.com/api/download/models/55",
+      filename: "v.safetensors",
+      versionId: 55,
+    });
+    downloadModelMock.mockResolvedValueOnce(join(MODELS_ROOT, "loras", "v.safetensors"));
+
+    const { downloadCivitai } = makeServer();
+    await downloadCivitai({ model_version_id: 55, target_subfolder: "loras", auth });
+
+    expect(downloadModelMock).toHaveBeenCalledWith(
+      "https://civitai.com/api/download/models/55",
+      "loras",
+      "v.safetensors",
+      auth,
+      false, // routing decision threaded through (local, #420 codex round 1)
+      expect.any(Function), // onResume callback — reports the resume decision onto the job (#467)
+      expect.any(AbortSignal), // per-download abort signal threaded from the job's controller (#515)
+      expect.any(Function), // onTrayId callback — aligns the job trayId with the tray row id (#515)
+      expect.any(Function), // onLanded callback — commits done synchronously at the destination rename (#515)
+    );
+  });
+
   it("writes .civitai.json + .civitai.md sidecars when metadata is present", async () => {
     const savedPath = join(MODELS_ROOT, "loras", "cool.safetensors");
     resolveCivitaiModelMock.mockResolvedValueOnce({

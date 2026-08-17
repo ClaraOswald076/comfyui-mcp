@@ -1869,6 +1869,33 @@ describe("downloadModel model-payload validation (#473)", () => {
     ).rejects.toThrow(/CIVITAI_API_TOKEN/);
   });
 
+  it("a CivitAI 401 with a per-request `auth` override blames the override, not a missing token (#1635)", async () => {
+    // The override replaced the configured-token handling for this request, so
+    // telling the caller to set CIVITAI_API_TOKEN is a misdiagnosis.
+    fetchMock.mockResolvedValueOnce(
+      new Response('{"error":"Unauthorized"}', { status: 401, statusText: "Unauthorized" }),
+    );
+    const err = await downloadModel(
+      "https://civitai.com/api/download/models/55",
+      "loras",
+      "v.safetensors",
+      { type: "bearer", token: "civ-token" },
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    const message = (err as Error).message;
+    expect(message).toMatch(/`auth` override was supplied AND used/);
+    expect(message).not.toMatch(/no CIVITAI_API_TOKEN is configured/);
+  });
+
+  it("a CivitAI 401 WITHOUT an override still names the missing configured token (#1635)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response('{"error":"Unauthorized"}', { status: 401, statusText: "Unauthorized" }),
+    );
+    await expect(
+      downloadModel("https://civitai.com/api/download/models/55", "loras", "v.safetensors"),
+    ).rejects.toThrow(/no CIVITAI_API_TOKEN is configured/);
+  });
+
   it("still succeeds for a legitimate binary model body (GGUF magic)", async () => {
     // A real binary payload — leading "GGUF" magic, then bytes that are not text.
     const gguf = Buffer.concat([Buffer.from("GGUF"), Buffer.from([0x00, 0x01, 0x02, 0x03, 0x00])]);
