@@ -8,7 +8,10 @@
 // here (no ws frame + no successful /queue poll within the window). A reachable
 // ComfyUI keeps the 1 Hz poll fresh, so a busy decode stays live; a crashed /
 // wedged server lets the heartbeat lapse → a real stall still surfaces. A hard
-// floor of 30 min backstops a genuine in-node deadlock on a reachable server.
+// floor of 30 min backstops a genuine in-node deadlock on a reachable server —
+// but NOT for runs whose graph contains a known TRAINING node class (#1652):
+// TrainLoraNode & co. emit no per-step progress frames for hours by design, so
+// the floor fired on every healthy long training run.
 import { beforeEach, describe, expect, it } from "vitest";
 import { QueueMonitor, type CompletionEvent, type StallReport } from "./queue-monitor.js";
 
@@ -22,6 +25,7 @@ type Priv = {
     progressValue: number | null;
     progressMax: number | null;
     queueRemaining: number;
+    runningNodeClassTypes: Record<string, string>;
     lastActivityTs: number | null;
     lastFrameTs: number | null;
     lastServerAliveTs: number | null;
@@ -41,6 +45,7 @@ function primeRunning(opts: {
   serverAliveAgoMs: number | null; // null = never / stale beyond memory
   wsFrameAgoMs: number | null;
   currentNode?: string | null;
+  nodeClassTypes?: Record<string, string>;
 }): void {
   const now = Date.now();
   priv.state.runningPromptId = "prompt-1";
@@ -48,6 +53,7 @@ function primeRunning(opts: {
   priv.state.progressValue = 4;
   priv.state.progressMax = 8;
   priv.state.queueRemaining = 1;
+  priv.state.runningNodeClassTypes = opts.nodeClassTypes ?? {};
   priv.state.lastActivityTs = now - opts.idleForMs;
   priv.state.lastServerAliveTs = opts.serverAliveAgoMs == null ? null : now - opts.serverAliveAgoMs;
   priv.state.lastFrameTs = opts.wsFrameAgoMs == null ? null : now - opts.wsFrameAgoMs;
@@ -62,6 +68,7 @@ beforeEach(() => {
   priv.state.progressValue = null;
   priv.state.progressMax = null;
   priv.state.queueRemaining = 0;
+  priv.state.runningNodeClassTypes = {};
   priv.state.lastActivityTs = null;
   priv.state.lastFrameTs = null;
   priv.state.lastServerAliveTs = null;
@@ -104,5 +111,92 @@ describe("QueueMonitor.report — liveness-gated stall (#183)", () => {
     priv.state.runningPromptId = null;
     priv.state.lastActivityTs = Date.now() - 10 * HARD_FLOOR_MS;
     expect(priv.report(STALL_MS).stalled).toBe(false);
+  });
+});
+
+describe("QueueMonitor.report — training exemption from the hard floor (#1652)", () => {
+  // A TrainLoraNode run emits no per-step progress frames: idleFor grows for
+  // the whole run while ComfyUI stays perfectly responsive. The hard floor
+  // fired on EVERY training run past 30 minutes and the injected note told the
+  // agent to cancel it — killing a healthy 65-minute job.
+  const TRAINING_GRAPH = {
+    "3": "LoadImageTextDataSetFromFolder",
+    "5": "MakeTrainingDataset",
+    "7": "TrainLoraNode",
+    "9": "SaveLoRA",
+  };
+
+  it("does NOT flag a healthy training run past the hard floor — current node unknown (the reported case)", () => {
+    // Attached mid-run: no progress_state transition ever arrives, so
+    // currentNode stays null and only the /queue graph names the trainer.
+    primeRunning({
+      idleForMs: HARD_FLOOR_MS + 15 * 60_000, // 45 min in — mid-training
+      serverAliveAgoMs: 800, // /queue poll fresh: server fully responsive
+      wsFrameAgoMs: null,
+      currentNode: null,
+      nodeClassTypes: TRAINING_GRAPH,
+    });
+    const rep = priv.report(STALL_MS);
+    expect(rep.stalled).toBe(false);
+    expect(rep.stalledForMs).toBe(0);
+  });
+
+  it("does NOT flag when the current node IS the trainer", () => {
+    primeRunning({
+      idleForMs: HARD_FLOOR_MS + 60_000,
+      serverAliveAgoMs: 800,
+      wsFrameAgoMs: null,
+      currentNode: "7",
+      nodeClassTypes: TRAINING_GRAPH,
+    });
+    expect(priv.report(STALL_MS).stalled).toBe(false);
+  });
+
+  it("still hard-flags a NON-training node past the floor, even inside a training graph", () => {
+    // Stuck on an ordinary node in a graph that also trains: the exemption is
+    // scoped to the trainer itself, so the deadlock backstop is preserved.
+    primeRunning({
+      idleForMs: HARD_FLOOR_MS + 60_000,
+      serverAliveAgoMs: 500,
+      wsFrameAgoMs: null,
+      currentNode: "9", // SaveLoRA
+      nodeClassTypes: TRAINING_GRAPH,
+    });
+    expect(priv.report(STALL_MS).stalled).toBe(true);
+  });
+
+  it("still hard-flags an ordinary render past the floor when class types were captured", () => {
+    primeRunning({
+      idleForMs: HARD_FLOOR_MS + 60_000,
+      serverAliveAgoMs: 500,
+      wsFrameAgoMs: null,
+      currentNode: "4",
+      nodeClassTypes: { "4": "KSampler", "6": "SaveImage" },
+    });
+    expect(priv.report(STALL_MS).stalled).toBe(true);
+  });
+
+  it("still flags a training run when the server has gone DARK (liveness gate is untouched)", () => {
+    primeRunning({
+      idleForMs: STALL_MS + 60_000,
+      serverAliveAgoMs: STALL_MS + 60_000,
+      wsFrameAgoMs: STALL_MS + 60_000,
+      currentNode: null,
+      nodeClassTypes: TRAINING_GRAPH,
+    });
+    expect(priv.report(STALL_MS).stalled).toBe(true);
+  });
+
+  it("applies the floor as before when the /queue graph was never captured", () => {
+    // No class types on record (poll never succeeded / pre-fix state) → nothing
+    // is exempt; behaviour is exactly the pre-fix backstop.
+    primeRunning({
+      idleForMs: HARD_FLOOR_MS + 60_000,
+      serverAliveAgoMs: 500,
+      wsFrameAgoMs: null,
+      currentNode: null,
+      nodeClassTypes: {},
+    });
+    expect(priv.report(STALL_MS).stalled).toBe(true);
   });
 });
