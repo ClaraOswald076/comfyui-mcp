@@ -10,10 +10,12 @@ import {
   type LiveServerSnapshot,
 } from "./output-dir.js";
 import {
+  liveRelDirFromArgv,
   liveRootFromArgv,
   liveScriptFromArgv,
   didLaunchLocalComfyUI,
   getLiveServerSnapshot,
+  resolveLiveServerRoot,
   resolveEffectiveComfyUIBase,
 } from "./workspace-env.js";
 import { ValidationError } from "../utils/errors.js";
@@ -776,6 +778,14 @@ function implicitLiveTarget(
  * has to be resolving from the live server rather than warning about a divergence.
  * Skipped in remote mode (the live root is a path on the remote host).
  *
+ * When argv names its script RELATIVELY and the server reports no cwd — `cd <root> &&
+ * python main.py`, and ComfyUI Desktop / the Windows portable bundle's `ComfyUI\main.py`
+ * — the argv derivation yields nothing absolute, and every branch below used to refuse a
+ * local install that was sitting right there (#1621). That shape is resolved through
+ * `resolveLiveServerRoot`'s observed-process tier instead: the same canonical live root
+ * (#369) the DOWNLOAD DESTINATION is written into. See the call site for why that tier can
+ * only ever add a resolution, never move one.
+ *
  * Everything the live server contributes comes from ONE `/system_stats` snapshot, so the
  * launch flags and the install root can never be read from two different server states.
  * And when the server IS reachable but tells us nothing usable — a relative
@@ -809,17 +819,62 @@ async function resolveTargetPathPreferServer(
   // written to in that state. Proven once, for every argv-derived branch below: a main.py
   // present-but-unresolvable throws here; NO main.py at all leaves liveRoot undefined, and
   // every branch below refuses on that before touching an argv-derived path.
-  const script = liveScriptFromArgv(snapshot.argv, snapshot.cwd);
+  const argvScript = liveScriptFromArgv(snapshot.argv, snapshot.cwd);
+  // #1621: `cd <root> && python main.py` reports argv[0] as the RELATIVE string "main.py"
+  // and current ComfyUI reports no cwd, so the server's own argv names NOTHING absolute —
+  // the ordinary manual Linux/macOS launch, and (as `ComfyUI\main.py`) the shape ComfyUI
+  // Desktop and the Windows portable bundle report too. The argv derivation above then
+  // yields no script, every branch below refuses, and a LOCAL server sitting right there
+  // was answered with UNRESOLVED — including for getExtraModelRoots(), which left model
+  // discovery with no filesystem roots at all.
+  //
+  // `resolveLiveServerRoot` is the ONE canonical notion of the live install root (#369),
+  // and its observed-process tier answers exactly this shape: the OS names the process
+  // listening on our port (correlated against this same argv, so a proxy cannot
+  // impersonate it) and the relative main.py dir is re-anchored on the install its
+  // interpreter lives in. That resolver already decides where a DOWNLOADED MODEL is
+  // written, so resolving the yaml that sits BESIDE those models through anything else is
+  // how the two come to disagree about which install is "the live one".
+  //
+  // It can only ever ADD a resolution: `liveRootFromArgv` and `liveScriptFromArgv` share
+  // scriptTokenFromArgv, so a script-less argv is a root-less one — the argv tier inside
+  // `resolveLiveServerRoot` has already failed wherever this runs, and no path that
+  // resolves today can be redirected by it. `remote:false` is settled, not assumed:
+  // `getLiveServerSnapshot` only reports reachable in local mode.
+  const observed = argvScript
+    ? undefined
+    : resolveLiveServerRoot(snapshot.argv, snapshot.cwd, { remote: false });
+  // `anchorDir` is the working directory the server MUST have had for its relative
+  // main.py to name that install, so feeding it back through the same parser yields the
+  // absolute SCRIPT — which is what `realLiveRoot` needs to follow a symlinked main.py
+  // the way ComfyUI's own os.path.realpath(__file__) does. No second parser is
+  // introduced, and the root still has to prove itself on this filesystem below.
+  const script =
+    argvScript ??
+    (observed?.source === "observed-process" && observed.anchorDir
+      ? liveScriptFromArgv(snapshot.argv, observed.anchorDir)
+      : undefined);
   // The REAL (symlink-resolved) install root, kept for every downstream use — notably the
   // "other configs" disclosure, which must name the file ComfyUI actually loads
   // (realpath(__file__) dir), not the launcher spelling (codex round 10).
   const rootResult: LiveRootResult = script ? realLiveRoot(script) : { why: "absent" };
   const liveRoot = rootResult.root;
 
+  /** The relative `main.py` dir the server reported, when its argv named one relatively.
+   *  Present exactly when "argv revealed no main.py" would be a FALSE account of why the
+   *  script could not be resolved. */
+  const relDir = liveRelDirFromArgv(snapshot.argv);
+
   /** Why locality is unproven, stated as what was OBSERVED. Reused by the refusals and
    *  by the read-only disclosures, so the two can never drift apart. */
   const localityGap = !script || rootResult.root !== undefined
-    ? "its /system_stats launch argv does not reveal a main.py at all"
+    ? relDir === undefined
+      ? "its /system_stats launch argv does not reveal a main.py at all"
+      : `its /system_stats launch argv names its launch script RELATIVELY (${
+          relDir === "." ? "a bare main.py" : `under "${relDir}"`
+        }) and the server reports no working directory, so its argv names no absolute ` +
+        "path, and the process listening on its port could not be anchored to an install " +
+        "holding that script on this filesystem either"
     : rootResult.why === "indeterminate"
       ? `this process could not determine whether its launch script "${script}" is a file on ` +
         `this filesystem (the lookup failed with ${rootResult.detail ?? "an unknown error"}); ` +
@@ -878,7 +933,11 @@ async function resolveTargetPathPreferServer(
     }
     throw new ValidationError(
       "UNRESOLVED: the running ComfyUI was not launched with --extra-model-paths-config and " +
-        "its launch argv does not reveal a main.py, so the extra_model_paths.yaml it reads " +
+        // Built from `localityGap` for the same reason the read-only caption above is:
+        // this arm is reached whenever the script could not be resolved, and hardcoding
+        // "argv does not reveal a main.py" states a cause that is false for every
+        // relative-argv launch (#1621) and for a lookup that merely failed.
+        `${localityGap}, so the extra_model_paths.yaml it reads ` +
         "cannot be located. Nothing was read or written — the local heuristic would just be a " +
         'guess at a file this server may not read. Pass config_path explicitly, or target: ' +
         '"standalone"/"desktop" to use the local heuristic deliberately.',
