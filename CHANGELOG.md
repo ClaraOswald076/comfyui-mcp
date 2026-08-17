@@ -745,6 +745,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.0] - 2026-08-17
+
+### MCP
+
+#### Added
+- panel MCP autostart — an explicit per-user launcher starts MCP when the panel opens, loopback-only and bearer-authenticated, with live provider discovery (#1590)
+- exact per-action tool allowlist — COMFYUI_MCP_TOOL_ACTION_ALLOW names the tool:action pairs an operator permits, no wildcards (#1452)
+
+#### Fixed
+- get_defaults names the live-preview id the frontend actually reads (#1638)
+- download_civitai sends the per-request auth override instead of dropping it (#1635)
+- a pack's install manifest is readable via list_packs action:"read_manifest" (#1649)
+- panel_search_nodes documents its own limit bound (#1287)
+
+
 ## [0.51.57] - 2026-08-16
 
 ### MCP
