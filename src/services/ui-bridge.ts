@@ -1077,6 +1077,50 @@ export function requiresWorkflowStampEnforcement(cmd: { cmd?: unknown }): boolea
   return ACTIVE_WORKFLOW_MUTATORS.has(name);
 }
 
+/** #602 — commands whose execution and reply never reference a canvas (Manager
+ *  registry/server operations, ComfyUI-server controls). Mirrors the panel's
+ *  CANVAS_INDEPENDENT_COMMANDS: a stale stamp/target pairing is irrelevant to
+ *  them, so the dispatch-time agreement gate must not refuse them. */
+const STAMP_TARGET_CANVAS_INDEPENDENT = new Set<string>([
+  "nodes_search",
+  "nodes_list",
+  "nodes_install",
+  "nodes_queue_status",
+  "graph_update_node",
+  "comfy_reboot",
+  "free_vram",
+]);
+
+/** #1656 — commands that read or mutate whichever canvas the routed tab has ACTIVE,
+ *  and therefore may only be dispatched when the session's workflow stamp and the
+ *  tab's reported active workflow AGREE (see the dispatch gate in send()).
+ *
+ *  Mirrors the panel's activeWorkflowFenceApplies as far as the server can evaluate
+ *  it. Exempt, deliberately:
+ *   - canvas-independent server/Manager commands (#602): no canvas to get wrong;
+ *   - workflow_list: the fence-EXEMPT recovery probe — gating it would make the
+ *     documented rebind depend on the fence being already-correct (panel #932's
+ *     circularity), and its handler reads the live binding at execution time, so a
+ *     stale pairing cannot make it report a stale answer;
+ *   - workflow_open / workflow_new: navigation/creation with their own explicit or
+ *     new target — they are how a diverged session re-selects;
+ *   - workflow_rename / workflow_close carrying a path selector: the selector may
+ *     name a genuinely NON-active workflow, which the panel resolves precisely and
+ *     exempts; the server cannot evaluate that, so those stay with the panel's
+ *     fence rather than risk a false refusal of a legitimate background op. */
+export function requiresStampTargetAgreement(cmd: { cmd?: unknown }): boolean {
+  const name = typeof cmd.cmd === "string" ? cmd.cmd : "";
+  if (!name) return false;
+  if (STAMP_TARGET_CANVAS_INDEPENDENT.has(name)) return false;
+  if (name === "workflow_list" || name === "workflow_open" || name === "workflow_new") return false;
+  if (name === "workflow_rename" || name === "workflow_close") {
+    const path = (cmd as { path?: unknown }).path;
+    return !(typeof path === "string" && path.trim());
+  }
+  if (name.startsWith("graph_")) return true;
+  return name === "workflow_save" || name === "workflow_save_as";
+}
+
 /**
  * Default reply timeout for a MUTATING command with no explicit timeout.
  *
@@ -4465,6 +4509,47 @@ export class UiBridge {
           false,
         );
         return Promise.reject(capabilityMissing ? markCapabilityRefusal(refusal) : refusal);
+      }
+    }
+    // #1656 — the stamp and the routing target are resolved from DIFFERENT inputs,
+    // and after a tab switch they can name different canvases. Routing follows the
+    // panel's re-hello at once (the migration alias / last-active carry move the
+    // connection onto the NEW canvas), while the stamp is resolved from the
+    // CALLER'S address — for the shared scope, the conversation's issue-time
+    // workflow, which is deliberately never re-resolved at dispatch (#570/#884) and
+    // so still names the PREVIOUS canvas. The panel-side fence is meant to refuse
+    // that pairing, but it compares the stamp against the frontend's LIVE identity,
+    // which can lag the very switch the hello already reported — and in that window
+    // the command executes on the previous canvas instead of being refused
+    // (observed: outline + save ran on the prior workflow after the switch and
+    // returned its uuid/path, with no error).
+    //
+    // This side sees both halves: the session's stamp (the caller-address answer)
+    // and the identity the routed tab last advertised (the canonical-id answer,
+    // refreshed by every hello). When BOTH are known and they DISAGREE, the
+    // command's fence provably does not name the canvas it would land on, so refuse
+    // BEFORE the socket write — nothing is dispatched, and the refusal names the
+    // documented rebind. With a settled panel this changes no outcome (a
+    // mismatched stamp is refused there too); it closes the window in which the
+    // refusal does not happen. An UNREADABLE side is not evidence of divergence:
+    // either value missing keeps the existing behaviour and lets the panel fence
+    // judge. And a caller addressing the connection by its canonical id is skipped
+    // outright — both answers then come from the same lookup and can only agree.
+    if (opts.tabId && opts.tabId !== conn.tabId && requiresStampTargetAgreement(cmd)) {
+      const issuedFor = this.resolveTabWorkflowUuid?.(opts.tabId);
+      const landedOn = this.resolveTabWorkflowUuid?.(conn.tabId);
+      if (issuedFor && landedOn && issuedFor !== landedOn) {
+        return Promise.reject(
+          markDispatched(
+            new Error(
+              `workflow instance mismatch: this command was issued for workflow instance ${issuedFor}, ` +
+                `but the tab it routed to has since reported a different active workflow (${landedOn}). ` +
+                `Nothing was dispatched. Re-target with panel_set_workflow_target({mode:"current"}), ` +
+                `then retry.`,
+            ),
+            false,
+          ),
+        );
       }
     }
     if (conn.sock.readyState !== WebSocket.OPEN) {
