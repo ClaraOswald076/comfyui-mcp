@@ -13,7 +13,7 @@ import { DEAD_NAMES, TOOL_NAMES } from "../../tools/vocabulary.js";
  * flat-enum shape actually EXPOSES its parameters (the discriminated-union trap
  * renders zero params).
  *
- * The one thing this tool has that `queue` did not: EIGHT read actions and ONE
+ * The one thing this tool has that `queue` did not: NINE read actions and ONE
  * that installs custom node packs (third-party code) on the connected ComfyUI.
  * A read-only-looking tool that silently installs is a wrong-expectation defect,
  * so "no read action reaches the install service" is asserted explicitly rather
@@ -50,7 +50,7 @@ vi.mock("../../config.js", () => ({
   getComfyUIAuthHeaders: () => ({}),
 }));
 
-import { registerSkillsAccessTools } from "../../tools/skills-access.js";
+import { registerSkillsAccessTools, enumeratePacks } from "../../tools/skills-access.js";
 
 type Handler = (args: Record<string, any>) => Promise<{
   isError?: boolean;
@@ -88,6 +88,7 @@ const text = (res: Awaited<ReturnType<Handler>>) => res.content.map((c) => c.tex
 const ACTIONS = [
   "list",
   "read_workflow",
+  "read_manifest",
   "list_templates",
   "check_runtime",
   "extract_deps",
@@ -158,7 +159,7 @@ describe("list_packs registration", () => {
   });
 
   // The description is the ONLY thing standing between a model and an unexpected
-  // write: seven actions read, one installs third-party code, and one overwrites
+  // write: eight actions read, one installs third-party code, and one overwrites
   // a file when `install_in` is given. A reworded description that drops either
   // warning re-opens exactly that wrong expectation — and a note that UNDERCOUNTS
   // the mutations (the first draft of this said "eight of nine only read") is the
@@ -235,6 +236,25 @@ describe("actions call the same services with the same arguments", () => {
     const res = await handler()({ action: "read_workflow", name: "definitely-not-a-pack" });
     expect(res.isError).toBe(true);
     expect(text(res)).toContain('No pack named "definitely-not-a-pack"');
+  });
+
+  it('action:"read_manifest" returns the pack\'s install manifest and refuses a bad name', async () => {
+    // The build ships at least one pack with a manifest (action:"list" reports
+    // has_manifest) — read it through the same name apply_manifest takes.
+    const pack = enumeratePacks().find((p) => p.has_manifest === true);
+    expect(pack, "expected at least one bundled pack with a manifest").toBeDefined();
+    const res = await handler()({ action: "read_manifest", name: String(pack!.name) });
+    expect(res.isError).toBeUndefined();
+    // Raw manifest.yaml text, like read_workflow returns the raw graph.
+    expect(text(res)).toMatch(/custom_nodes|models/);
+
+    const unknown = await handler()({ action: "read_manifest", name: "definitely-not-a-pack" });
+    expect(unknown.isError).toBe(true);
+    expect(text(unknown)).toContain('No pack named "definitely-not-a-pack"');
+
+    const traversal = await handler()({ action: "read_manifest", name: "../skills-access" });
+    expect(traversal.isError).toBe(true);
+    expect(text(traversal)).toContain("Invalid pack name");
   });
 
   it('action:"skill_read" resolves by skill name and reports an unknown one', async () => {
@@ -421,8 +441,8 @@ describe("only action:\"install_deps\" can reach the install service", () => {
 });
 
 describe("per-action presence guards (the flat shape cannot schema-require these)", () => {
-  it("read_workflow/skill_read without a name name the field and call nothing", async () => {
-    for (const action of ["read_workflow", "skill_read"]) {
+  it("read_workflow/read_manifest/skill_read without a name name the field and call nothing", async () => {
+    for (const action of ["read_workflow", "read_manifest", "skill_read"]) {
       const res = await handler()({ action });
       expect(res.isError).toBe(true);
       expect(text(res)).toContain(`list_packs action:"${action}" requires \`name\``);

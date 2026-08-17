@@ -15,6 +15,7 @@ import {
   defaultWorkflowDepsDeps,
 } from "../services/workflow-deps.js";
 import { generateSkillCached } from "../services/skill-cache.js";
+import { resolvePackManifestFile } from "../services/manifest.js";
 import type { WorkflowJSON } from "../comfyui/types.js";
 import { templateIndexScopeNote } from "../services/template-index-scope.js";
 import {
@@ -36,7 +37,7 @@ import {
 // The record's `tool` is the LIVE tool name and the action rides in `args`, so a
 // consumer (scripts/codex-knowledge-parity-smoke.mjs) reads exactly what was
 // invoked. Only the six actions whose pre-0.50.0 tools traced are traced — adding
-// the other three would change what the harness observes, which is behaviour, not
+// the other four would change what the harness observes, which is behaviour, not
 // surface.
 function traceToolCall(tool: string, args: Record<string, unknown>): void {
   const path = process.env.COMFYUI_MCP_TOOL_TRACE;
@@ -275,7 +276,7 @@ export function resolvePackWorkflowFile(packName: string): string | null {
  *   the cache write is unconditional on a miss and lands in configurable
  *   user-home state.
  *
- * The other seven actions read. Both mutations are stated in their own
+ * The other eight actions read. Both mutations are stated in their own
  * description bullets, because a read-only-looking tool that quietly installs or
  * overwrites is a wrong-expectation defect — and so is a safety note that
  * undercounts them.
@@ -284,8 +285,9 @@ export function registerSkillsAccessTools(server: McpServer): void {
   server.tool(
     "list_packs",
     "Bundled ComfyUI knowledge — installer packs, model-family skills, workflow templates — plus the two workflow-readiness checks. Driven by the `action` parameter:\n" +
-      '- action:"list" — List the bundled installer packs under packs/: one-command setups for a model family (custom nodes + model weights via manifest.yaml) PLUS a ready workflow.json graph. Each entry reports its family/kind, its runtime (these packs are LOCAL-GPU / FREE — they run on the user\'s own GPU and never spend paid API credits), whether it has a ready workflow + manifest, and the manifest path for install_comfyui apply_manifest. When asked to "set up / build a <model-family> workflow", PREFER applying the matching pack and loading its ready workflow (panel_load_workflow pack:<name>) over building a generic graph from scratch. Read the ready graph with action:"read_workflow".\n' +
+      '- action:"list" — List the bundled installer packs under packs/: one-command setups for a model family (custom nodes + model weights via manifest.yaml) PLUS a ready workflow.json graph. Each entry reports its family/kind, its runtime (these packs are LOCAL-GPU / FREE — they run on the user\'s own GPU and never spend paid API credits), whether it has a ready workflow + manifest, and the manifest path for install_comfyui apply_manifest. When asked to "set up / build a <model-family> workflow", PREFER applying the matching pack and loading its ready workflow (panel_load_workflow pack:<name>) over building a generic graph from scratch. Read the ready graph with action:"read_workflow", and inspect its install manifest with action:"read_manifest".\n' +
       '- action:"read_workflow" — Return a bundled pack\'s ready workflow.json graph by pack name (`name`; discover names + which packs have a workflow with action:"list"). This is the EXPERT graph for that model family — use it as the source of truth when setting up the family on the user\'s canvas: recreate it node-by-node with the panel_* tools (panel_add_node / panel_connect / panel_set_widget) so it lands on their live canvas, or enqueue it headlessly. Prefer this over inventing a graph from scratch. Names are validated (no path traversal) and must match an existing pack directory.\n' +
+      '- action:"read_manifest" — Return a bundled pack\'s install manifest (its manifest.yaml — the custom nodes + model weights apply_manifest would install) by pack name (`name`; discover names + which packs have a manifest with action:"list"). READ-ONLY — the way to INSPECT what a pack will install BEFORE calling the mutating apply_manifest. Names are validated (no path traversal) and must match an existing pack directory.\n' +
       '- action:"list_templates" — List CUSTOM-NODE-contributed ComfyUI workflow templates on the connected ComfyUI, grouped by source (each pack\'s own example_workflows/*.json). Hits the live server\'s /api/workflow_templates index. SCOPE LIMIT: this endpoint does NOT include ComfyUI\'s own core bundled templates from the comfyui-workflow-templates package (e.g. "Flux.1 Inpaint") — those are served to the frontend as static assets via a separate code path this action cannot see, so a small/empty result here does NOT mean no official template exists, only that no custom-node pack contributed one. When asked to "set up / build a <model-family> workflow", check here for a custom-node-contributed starter AFTER checking the bundled skills + installer packs (action:"skill_list" / action:"list"), and also tell the user to check the ComfyUI frontend\'s own Templates browser directly for core templates, since this action cannot enumerate those. NOTE: this lists what\'s available; loading a template onto the canvas is done in the ComfyUI frontend\'s Templates browser (the panel agent cannot load a template graph headlessly yet) — surface the matching template name to the user.\n' +
       '- action:"check_runtime" — Determine whether a workflow runs on the user\'s OWN GPU (LOCAL — free) or uses hosted API NODES (PAID api credits). Pass `pack` (a bundled pack name — always local/free) OR `graph` (a UI or API/prompt workflow JSON, as object or string). It scans the workflow\'s node class_types against the connected ComfyUI\'s API-node set (the same signal list_api_nodes uses) and returns { runtime: \'local\'|\'api\'|\'mixed\'|\'unknown\', usesApiNodes, apiNodes[], externalApiNodes[], unknownNodes[] } — \'unknown\' means some nodes couldn\'t be classified (could be paid), so treat it (and \'api\'/\'mixed\') as POSSIBLY PAID; only \'local\' is confirmed free. `externalApiNodes` is the THIRD-PARTY paid kind (a fal.ai-style pack, or any node taking a service credential): those are INSTALLED LOCALLY yet still cost money, billed by that provider on the user\'s own account with them rather than out of Comfy api credits — so when you ask the user, name the provider, not "Comfy credits" (`externalProviders` names it when recognised — e.g. ["fal.ai"]; it is absent when the node was flagged only by taking a service credential, which proves it authenticates somewhere but not to whom). ALWAYS call this before building OR loading a non-pack/ad-hoc workflow so you can ASK the user before spending paid API credits — never silently use API nodes.\n' +
       '- action:"extract_deps" — Analyze a ComfyUI workflow (`workflow`, API JSON) and determine which custom node packs it requires. Maps each node class_type to its owning node pack using ComfyUI-Manager mappings and the server\'s installed node definitions, reporting which packs are installed vs missing. READ-ONLY — it installs nothing. Works remotely (HTTP only) — mirrors `comfy-cli node deps-in-workflow`.\n' +
@@ -298,6 +300,7 @@ export function registerSkillsAccessTools(server: McpServer): void {
         .enum([
           "list",
           "read_workflow",
+          "read_manifest",
           "list_templates",
           "check_runtime",
           "extract_deps",
@@ -307,14 +310,14 @@ export function registerSkillsAccessTools(server: McpServer): void {
           "generate_skill",
         ])
         .describe(
-          'Which knowledge operation to perform. "list", "list_templates" and "skill_list" take no other parameters; "read_workflow" and "skill_read" require `name`; "check_runtime" takes `pack` OR `graph`; "extract_deps" and "install_deps" require `workflow` (and "install_deps" INSTALLS custom nodes — the only action here that installs, though "generate_skill" also WRITES to disk: its skill cache on every miss, plus `install_in` when set); "generate_skill" requires `source` (optional `install_in`/`refresh`).',
+          'Which knowledge operation to perform. "list", "list_templates" and "skill_list" take no other parameters; "read_workflow", "read_manifest" and "skill_read" require `name`; "check_runtime" takes `pack` OR `graph`; "extract_deps" and "install_deps" require `workflow` (and "install_deps" INSTALLS custom nodes — the only action here that installs, though "generate_skill" also WRITES to disk: its skill cache on every miss, plus `install_in` when set); "generate_skill" requires `source` (optional `install_in`/`refresh`).',
         ),
       name: z
         .string()
         .min(1)
         .optional()
         .describe(
-          'REQUIRED for action:"read_workflow" — the pack name (a directory under packs/, e.g. \'krea2-txt2img-manual\'), from action:"list". REQUIRED for action:"skill_read" — the skill name (a directory under plugin/skills/, e.g. \'krea2-txt2img\'), from action:"skill_list".',
+          'REQUIRED for action:"read_workflow" and action:"read_manifest" — the pack name (a directory under packs/, e.g. \'krea2-txt2img-manual\'), from action:"list". REQUIRED for action:"skill_read" — the skill name (a directory under plugin/skills/, e.g. \'krea2-txt2img\'), from action:"skill_list".',
         ),
       pack: z
         .string()
@@ -387,6 +390,10 @@ export function registerSkillsAccessTools(server: McpServer): void {
             return readPackWorkflowAction(
               requireName("read_workflow", "the pack whose ready workflow.json to read"),
             );
+          case "read_manifest":
+            return readPackManifestAction(
+              requireName("read_manifest", "the pack whose install manifest.yaml to read"),
+            );
           case "list_templates":
             return await listWorkflowTemplatesAction();
           case "check_runtime":
@@ -418,7 +425,7 @@ export function registerSkillsAccessTools(server: McpServer): void {
             // silent undefined if the schema and switch ever drift apart.
             const exhaustive: never = args.action;
             throw new Error(
-              `Unknown list_packs action "${String(exhaustive)}". Expected one of: list, read_workflow, list_templates, check_runtime, extract_deps, install_deps, skill_list, skill_read, generate_skill.`,
+              `Unknown list_packs action "${String(exhaustive)}". Expected one of: list, read_workflow, read_manifest, list_templates, check_runtime, extract_deps, install_deps, skill_list, skill_read, generate_skill.`,
             );
           }
         }
@@ -517,6 +524,51 @@ function readPackWorkflowAction(rawName: string): ToolText {
     };
   }
   const text = readFileSync(wfFile, "utf8");
+  return { content: [{ type: "text" as const, text }] };
+}
+
+/** action:"read_manifest" */
+function readPackManifestAction(rawName: string): ToolText {
+  const name = rawName.trim();
+  if (!SAFE_NAME.test(name)) {
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text" as const,
+          text: `Invalid pack name "${rawName}". Use a plain pack directory name from list_packs (action:"list").`,
+        },
+      ],
+    };
+  }
+  const packDir = join(packsDir(), name);
+  if (!packDir.startsWith(packsDir()) || !existsSync(packDir) || !statSync(packDir).isDirectory()) {
+    const known = enumeratePacks().map((p) => p.name);
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text" as const,
+          text: `No pack named "${name}". Available packs: ${known.join(", ") || "(none bundled)"}.`,
+        },
+      ],
+    };
+  }
+  // Same resolver apply_manifest (pack:<name>) uses, so the manifest read here is
+  // exactly the one a later apply would install (.yaml or .yml, name-guarded).
+  const manifestFile = resolvePackManifestFile(name);
+  if (!manifestFile) {
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text" as const,
+          text: `Pack "${name}" has no install manifest (manifest.yaml not found).`,
+        },
+      ],
+    };
+  }
+  const text = readFileSync(manifestFile, "utf8");
   return { content: [{ type: "text" as const, text }] };
 }
 

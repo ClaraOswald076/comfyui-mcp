@@ -153,6 +153,7 @@ describe("call_tool admission", () => {
     for (const action of [
       "list",
       "read_workflow",
+      "read_manifest",
       "list_templates",
       "check_runtime",
       "skill_list",
