@@ -1,0 +1,69 @@
+name: Publish to MCP Registry
+
+# The npm/GitHub release workflow (release.yml) does not cover the MCP Registry
+# listing at registry.modelcontextprotocol.io — without this workflow the public
+# listing froze at whatever version was last published by hand (0.4.1, while npm
+# was at 0.51.x). Runs on every release tag, after release.yml publishes the
+# matching npm version; workflow_dispatch exists to backfill a version whose tag
+# predates this workflow (it reads the version from package.json on main).
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  id-token: write # github-oidc login to the MCP Registry
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version (tag, else package.json)
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(jq -r .version package.json)"
+          fi
+          [ -n "$version" ] && [ "$version" != "null" ] || { echo "::error::could not resolve version"; exit 1; }
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "publishing MCP Registry version $version"
+
+      # The registry validates the npm package at server.json's version exists and
+      # carries the matching mcpName. On a tag push, release.yml publishes that npm
+      # version in parallel — wait for it to be visible instead of racing it.
+      - name: Wait for the npm version to exist
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            if npm view "comfyui-mcp@${{ steps.version.outputs.value }}" version >/dev/null 2>&1; then
+              echo "npm has comfyui-mcp@${{ steps.version.outputs.value }}"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::comfyui-mcp@${{ steps.version.outputs.value }} never appeared on npm — publish it first (release.yml), then re-run this workflow"
+          exit 1
+
+      - name: Pin server.json to the release version
+        run: |
+          set -euo pipefail
+          jq --arg v "${{ steps.version.outputs.value }}" '.version = $v | .packages[0].version = $v' server.json > server.tmp.json
+          mv server.tmp.json server.json
+
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+
+      - name: Authenticate to MCP Registry
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server to MCP Registry
+        run: ./mcp-publisher publish
