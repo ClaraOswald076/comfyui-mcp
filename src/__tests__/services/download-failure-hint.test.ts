@@ -119,6 +119,57 @@ describe("the CivitAI hint fires on the status the reporter actually got (#1300)
   });
 });
 
+describe("a per-request `auth` override was used (#1635)", () => {
+  it("a 401 indicts the OVERRIDE credential — never claims no token is configured", () => {
+    // The reported misdirection: the caller deliberately passed `auth` instead of
+    // configuring CIVITAI_API_TOKEN, got a 401, and was told to set the very
+    // variable they bypassed. The override REPLACED the configured-token handling
+    // for the request, so that remedy can only waste their time.
+    const hint = downloadFailureHint({
+      status: 401,
+      url: CIVITAI,
+      hasCivitaiToken: false,
+      callerAuth: true,
+    });
+    expect(hint).toMatch(/`auth` override was supplied AND used/);
+    expect(hint).toMatch(/INVALID, expired, or lacks access/);
+    expect(hint).not.toMatch(/no CIVITAI_API_TOKEN is configured/);
+    expect(hint).not.toMatch(/Set it in panel Settings/);
+  });
+
+  it("the override answer wins even when a config token IS also set — the override replaced it", () => {
+    // downloadModel attaches the config token only when NO `auth` was passed, so
+    // with an override the configured token never reached the wire; the "re-create
+    // your configured token" remedy would be just as wrong as the missing-token one.
+    const hint = downloadFailureHint({
+      status: 403,
+      url: CIVITAI,
+      hasCivitaiToken: true,
+      callerAuth: true,
+    });
+    expect(hint).toMatch(/`auth` override was supplied AND used/);
+    expect(hint).not.toMatch(/Re-create the token at civitai\.com\/user\/account/);
+  });
+
+  it("a non-auth status with an override is not blamed on a missing token, and keeps the fileId remedy", () => {
+    const hint = downloadFailureHint({
+      status: 404,
+      url: METADATA_URL,
+      hasCivitaiToken: false,
+      callerAuth: true,
+    });
+    expect(hint).toMatch(/probably not a missing-token failure/);
+    expect(hint).toMatch(/selects a file by METADATA/);
+    expect(hint).not.toMatch(/no CIVITAI_API_TOKEN is configured/);
+  });
+
+  it("without an override the missing-token note is unchanged", () => {
+    expect(downloadFailureHint({ status: 401, url: CIVITAI, hasCivitaiToken: false })).toMatch(
+      /no CIVITAI_API_TOKEN is configured/,
+    );
+  });
+});
+
 describe("the server's own explanation is carried back (#1300)", () => {
   it("quotes the body, which is what distinguishes 401-needs-token from a real 404", async () => {
     const b = await readErrorBody({ text: async () => '{"error":"Unauthorized"}' });
@@ -241,6 +292,10 @@ describe("WIRING: the download failure path uses them (#1300)", () => {
     expect(branch).toContain("await readErrorBody(res, currentUrl)");
     expect(branch).toContain("downloadFailureHint({");
     expect(branch).toContain("hasCivitaiToken: Boolean(config.civitaiApiToken)");
+    // And whether a per-request `auth` override authenticated the request (#1635),
+    // so the hint never blames a missing configured token for the caller's own
+    // credential being rejected.
+    expect(branch).toContain("callerAuth");
     // The status is still reported — the body and hint are additions, not a
     // replacement for the fact the caller already had.
     expect(branch).toMatch(/Download failed: \$\{res\.status\}/);

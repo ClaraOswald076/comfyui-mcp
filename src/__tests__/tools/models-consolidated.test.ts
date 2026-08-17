@@ -427,6 +427,30 @@ describe("download_model dispatch", () => {
     expect(mocks.resolveCivitaiModelVersion).toHaveBeenCalledWith(55);
   });
 
+  it('action:"download_civitai" forwards a per-request `auth` override to startDownloadJob (#1635)', async () => {
+    // The reported bug: the dispatcher omitted `auth` on this arm and the action
+    // hardcoded `undefined`, so the documented override was silently ignored.
+    const auth = { type: "bearer", token: "civ-token" } as const;
+    mocks.resolveCivitaiModelVersion.mockResolvedValueOnce({
+      downloadUrl: "https://civitai.com/api/download/models/55",
+      filename: "v.safetensors",
+      versionId: 55,
+    });
+    await download()({
+      action: "download_civitai",
+      model_version_id: 55,
+      target_subfolder: "loras",
+      auth,
+    });
+    expect(mocks.startDownloadJob).toHaveBeenCalledWith(
+      "https://civitai.com/api/download/models/55",
+      "loras",
+      "v.safetensors",
+      auth,
+      expect.any(Function), // postDownload completion hook (sidecars, not-a-model guard)
+    );
+  });
+
   it('action:"resolve_missing" parses the workflow and asks findMissingModels about it', async () => {
     mocks.getObjectInfo.mockResolvedValueOnce({ CheckpointLoaderSimple: {} });
     await download()({

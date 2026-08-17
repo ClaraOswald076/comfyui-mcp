@@ -8,6 +8,7 @@ import {
   currentLiveModelsRoot,
 } from "../services/model-resolver.js";
 import { startDownloadJob, describePlacement } from "../services/download-jobs.js";
+import type { DownloadAuth } from "../services/download-auth.js";
 
 /** Mirrors download_model's grace window — see download-jobs.ts. CivitAI
  *  checkpoints are routinely multi-GB, so this is the path that actually
@@ -284,6 +285,7 @@ export async function downloadCivitaiModelAction(args: {
   model_version_id?: number;
   model_id?: number;
   filename?: string;
+  auth?: DownloadAuth;
 }): Promise<CallToolResult> {
       try {
         if (args.model_id === undefined && args.model_version_id === undefined) {
@@ -349,7 +351,7 @@ export async function downloadCivitaiModelAction(args: {
           resolved.downloadUrl,
           args.target_subfolder,
           filename,
-          undefined,
+          args.auth,
           postDownload,
         );
 

@@ -1087,6 +1087,13 @@ export interface DownloadCacheOptions {
    *  Not fired for the remote Manager path (no local rename); that commits done when
    *  downloadModel returns. */
   onLanded?: (targetPath: string) => void;
+  /** A per-request `auth` override was supplied for THIS download (#1635). The
+   *  failure hint needs to know: the override replaces the configured HF/CivitAI
+   *  token for the request, so a CivitAI 401 must indict the override credential —
+   *  never claim "no CIVITAI_API_TOKEN is configured". Not derivable from
+   *  `headers`: query auth rides in the URL, and header presence can't
+   *  distinguish an override from the config token. */
+  callerAuth?: boolean;
 }
 
 export interface DownloadCacheResult {
@@ -1377,6 +1384,10 @@ async function streamUrlToFile(
    * because no other writer can name it.
    */
   stagedFileIsShared = false,
+  /** A per-request `auth` override authenticated this request (#1635) — threaded
+   *  to the CivitAI failure hint so it never blames a missing configured token
+   *  for a request that carried the caller's own credential. */
+  callerAuth = false,
 ): Promise<string> {
   // Fail fast if we were cancelled before any bytes moved — no request, no partial.
   if (signal?.aborted) throw new DOMException("The download was cancelled.", "AbortError");
@@ -1741,6 +1752,7 @@ async function streamUrlToFile(
       status: res.status,
       url: currentUrl,
       hasCivitaiToken: Boolean(config.civitaiApiToken),
+      callerAuth,
     });
     throw new ModelError(
       `Download failed: ${res.status} ${res.statusText}${body ? ` — the server said: ${body}` : ""}${hint}`,
@@ -1849,6 +1861,7 @@ async function streamUrlToFile(
         deferErrorRow,
         beforeWrite,
         stagedFileIsShared,
+        callerAuth,
       );
     }
   }
@@ -2347,6 +2360,8 @@ async function downloadIntoCache(
   onResume?: ResumeReporter,
   modelExt = "",
   signal?: AbortSignal,
+  /** See DownloadCacheOptions.callerAuth (#1635). */
+  callerAuth = false,
 ): Promise<string> {
   // Representation-aware identity (#467): a same-URL download with different HTTP
   // auth headers OR different cloud (S3/Azure) credentials gets its OWN cache file,
@@ -2839,6 +2854,7 @@ async function downloadIntoCache(
           // directory, so a second process running this download reaches the very
           // same file. Its post-download cleanups must prove ownership.
           true,
+          callerAuth,
         );
         await downloadCacheFs.rename(partial, target);
         await touch(target);
@@ -3206,6 +3222,8 @@ export async function downloadUrlToFile(
    *  downloadModel already publishes exactly one row when the whole call throws;
    *  emitting here as well would write that outcome twice (#470/#547). */
   deferErrorRow = false,
+  /** See DownloadCacheOptions.callerAuth (#1635). */
+  callerAuth = false,
 ): Promise<void> {
   await streamUrlToFile(
     url,
@@ -3221,6 +3239,9 @@ export async function downloadUrlToFile(
     signal,
     undefined,
     deferErrorRow,
+    undefined,
+    false,
+    callerAuth,
   );
 }
 
@@ -3243,6 +3264,7 @@ export async function downloadWithCache(
       options.onResume,
       modelExt,
       options.signal,
+      options.callerAuth,
     );
     // CANCEL GUARD (#515): a COALESCED caller (or a CACHE HIT) reaches here without
     // ever streaming — it awaited another job's shared physical download. If THIS
@@ -3341,6 +3363,7 @@ export async function downloadWithCache(
         // throws; this fallback stream must not emit a second one for the same
         // failure (#470/#547).
         true,
+        options.callerAuth,
       );
       // PRE-RENAME CANCEL GUARD (#515), mirroring the cache-path materialize guard: a
       // cancel that arrived during the post-stream validation lets the stream return
