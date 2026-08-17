@@ -1822,6 +1822,36 @@ export async function verifyLandedModel(
         `"${category}" model folder, so it could not be confirmed that it reads from this location.`,
     };
   }
+  // A CORE category's listing enumerates only ComfyUI's own weight extensions
+  // (folder_paths.supported_pt_extensions — mirrored above as CORE_MODEL_EXTENSIONS).
+  // A landed file of any OTHER type (.gguf, .onnx, .engine, …) is served, if at all,
+  // through a custom node's OWN registered category (ComfyUI-GGUF's unet_gguf /
+  // clip_gguf views, #526), so its absence from THIS listing is contractual — the
+  // #844 diffusers fold one level down: not the category but the FILE'S EXTENSION is
+  // outside the enumeration contract. A listing HIT above still confirmed the file
+  // (a node may re-register the core category to admit the type); only the MISS is
+  // inconclusive, and it must not render as "the server does NOT list it". The
+  // 0.51.56 #369 report was exactly that fold: a correctly-placed .gguf answered
+  // with WARNING: NOT VISIBLE and a "move the file" remedy for a file that was
+  // already where the server reads.
+  const ext = extname(basename(targetPath)).toLowerCase();
+  const isCoreCategory = (MODEL_SUBDIRS as readonly string[]).includes(category.toLowerCase());
+  if (isCoreCategory && !CORE_MODEL_EXTENSIONS.has(ext)) {
+    return {
+      verifiedPath,
+      liveVisible: "unknown",
+      note:
+        `The file IS on disk at ${verifiedPath}, but the connected ComfyUI ` +
+        `(${getComfyUIBaseUrl()}) cannot confirm it from its "${category}" listing: that ` +
+        `endpoint enumerates only ComfyUI's core weight extensions ` +
+        `(${[...CORE_MODEL_EXTENSIONS].join(", ")}), and "${ext || "(none)"}" is not one ` +
+        `of them. A file of this type is served through a custom node's own registered ` +
+        `category instead (for .gguf, ComfyUI-GGUF's "unet_gguf"/"clip_gguf" views), so ` +
+        `its ABSENCE here is contractual, not evidence of misplacement. Confirm with ` +
+        `list_local_models, which reads those categories too — and if no installed node ` +
+        `registers a category serving this file type, this server cannot load it at all.`,
+    };
+  }
   let liveModelsDir: string | undefined;
   try {
     liveModelsDir = await resolveModelsDir();
@@ -1836,6 +1866,12 @@ export async function verifyLandedModel(
       wanted,
       category,
       baseUrl: getComfyUIBaseUrl(),
+      // The membership answer above was computed on the LEXICAL write path and is
+      // canonical-aware: a destination reached through an in-tree junction
+      // (StabilityMatrix, #870) realpaths OUTSIDE the lexical live root, so the
+      // verdict's own path comparison would call a correctly-placed file
+      // misplaced and prescribe moving it (#369, 0.51.56).
+      knownInsideLiveRoots: membership.inRoots === true,
     }),
   };
 }
@@ -1862,22 +1898,35 @@ export function notVisibleVerdict(args: {
   wanted: string;
   category: string;
   baseUrl: string;
+  /** The caller's CANONICAL membership answer for the lexical write path
+   *  (isUnderLiveModelRoots). true means the file sits in a tree the server reads
+   *  even when the REALPATH'd verifiedPath escapes the lexical root — a
+   *  StabilityMatrix junction (`models/vae` → the shared store, #870) realpaths
+   *  outside it, and comparing paths alone would prescribe moving a file that is
+   *  already in the right place (#369). */
+  knownInsideLiveRoots?: boolean;
 }): { liveVisible: "not-visible"; note: string } {
   const { verifiedPath, liveModelsDir, wanted, category, baseUrl } = args;
-  const insideLiveRoot = liveModelsDir !== undefined && isUnderRoot(verifiedPath, liveModelsDir);
+  const insideLexically = liveModelsDir !== undefined && isUnderRoot(verifiedPath, liveModelsDir);
+  const insideLiveRoot = insideLexically || args.knownInsideLiveRoots === true;
   return {
     // Still not VISIBLE — we did not observe it in the listing, and #369 exists
     // because an unobserved placement must not render as confirmed. The verdict
     // is unchanged; what changes is the explanation and the remedy.
     liveVisible: "not-visible",
     note: insideLiveRoot
-      ? `The file IS on disk at ${verifiedPath}, which is INSIDE the models directory the ` +
-        `connected ComfyUI reads (${liveModelsDir}) — so it is in the right place. That server ` +
-        `does not list "${wanted}" under "${category}" YET, which almost always means its ` +
-        `cached loader options have not been re-read since the write (ComfyUI invalidates them ` +
-        `on the directory's mtime). Do NOT move the file. Refresh the node/model definitions ` +
-        `— install_comfyui (action:"refresh_nodes"), or the panel's refresh — or restart ` +
-        `ComfyUI, then check list_local_models again.`
+      ? (insideLexically
+          ? `The file IS on disk at ${verifiedPath}, which is INSIDE the models directory the ` +
+            `connected ComfyUI reads (${liveModelsDir}) — so it is in the right place. `
+          : `The file IS on disk at ${verifiedPath}, which is inside a models tree the ` +
+            `connected ComfyUI reads — reached through a link/junction` +
+            `${liveModelsDir ? ` under ${liveModelsDir}` : ""}, so its real path lying ` +
+            `outside that directory is the layout working as intended, not a misplacement. `) +
+        `That server does not list "${wanted}" under "${category}" YET, which almost always ` +
+        `means its cached loader options have not been re-read since the write (ComfyUI ` +
+        `invalidates them on the directory's mtime). Do NOT move the file. Refresh the ` +
+        `node/model definitions — install_comfyui (action:"refresh_nodes"), or the panel's ` +
+        `refresh — or restart ComfyUI, then check list_local_models again.`
       : `The file IS on disk at ${verifiedPath}, but the connected ComfyUI ` +
         `(${baseUrl}) does NOT list "${wanted}" under "${category}" — it will not be ` +
         `usable in a workflow from there.` +

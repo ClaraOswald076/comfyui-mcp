@@ -79,6 +79,27 @@ describe("a file outside that root keeps the move remedy", () => {
   });
 });
 
+describe("a file inside via a junction keeps the refresh remedy (#369/#870)", () => {
+  // StabilityMatrix: the write path is inside the live root, but the REALPATH
+  // escapes it through the junction. The membership answer (knownInsideLiveRoots)
+  // — not the path comparison — decides which remedy is followable.
+  const junctioned = notVisibleVerdict({
+    ...BASE,
+    verifiedPath: "E:/StabilityMatrix/models/VAE/example.safetensors",
+    liveModelsDir: "C:/ComfyUI/models",
+    knownInsideLiveRoots: true,
+  });
+
+  it("does not prescribe moving a file the server already reads", () => {
+    expect(junctioned.note).toMatch(/Do NOT move the file/);
+    expect(junctioned.note).not.toMatch(/Move the file into the running server's models tree/);
+  });
+
+  it("still reports not-visible — the verdict did not weaken", () => {
+    expect(junctioned.liveVisible).toBe("not-visible");
+  });
+});
+
 describe("isUnderRoot", () => {
   // The platform is a PARAMETER, not read from the host, so the Windows case is
   // genuinely exercised on ubuntu CI rather than quietly passing there for the
