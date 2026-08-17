@@ -576,6 +576,92 @@ describe('download_model action:"status"', () => {
       }
     });
   });
+
+  // ── #1644: cancel must not assert a live heartbeat it never checked ────────
+  describe("#1644 unprobed foreign record", () => {
+    it("cancel REFUSES without claiming liveness — and no longer contradicts status for the SAME id", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-1644-"));
+      setProgressDir(dir);
+      try {
+        // The reporter's shape: the record's heartbeat is still FRESH (the
+        // #858 reclaim gate keys on staleness, so cancel never probes the
+        // writer), yet the recorded pid is already dead — status proves it
+        // gone (#1479) while the old cancel fallback asserted "a live
+        // heartbeat … actively writing" about the SAME id.
+        const id = "fresh-dead-job-1644";
+        const res = spawnSync(process.execPath, ["-e", ""]);
+        await writeFile(
+          join(dir, `control-job-${id}-other-session.json`),
+          JSON.stringify({
+            id,
+            trayId: "freshtray164400",
+            progressId: "fresh-prog-1644",
+            url: "https://example.com/large.safetensors",
+            target_subfolder: "checkpoints",
+            status: "downloading",
+            started_at: Date.now() - 30 * 1000,
+            owner: "other-session",
+            pid: res.pid, // exited before this test runs — provably gone
+            updated: Date.now(), // heartbeat fresh: no reclaim verdict is produced
+          }),
+        );
+
+        const { cancelDownload, downloadStatus } = makeServer();
+
+        // status probes the pid regardless of staleness and reports the truth.
+        const status = (await downloadStatus({ id })).content[0].text;
+        expect(status).toContain("NOT running — the owning process is gone");
+
+        // cancel never probed anything, so it must SAY that — not assert the
+        // opposite of what status just reported.
+        const text = (await cancelDownload({ id, tray_id: "freshtray164400" })).content[0].text;
+        expect(text).toContain("status: downloading");
+        expect(text).not.toContain("live heartbeat");
+        expect(text).not.toContain("actively writing");
+        expect(text).toContain("could not be established from here");
+        // The remedy is the recovery that actually works for a dead writer:
+        // status decides, and re-issuing adopts the record and resumes.
+        expect(text).toContain('action:"status"');
+        expect(text).toContain("adopts the record and resumes from the .partial");
+      } finally {
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("the explicit reclaim-denied verdicts keep their established wording", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "model-management-1644-"));
+      setProgressDir(dir);
+      try {
+        // owner-alive: stale heartbeat, but the pid probe PROVES a live owner —
+        // only there is "stop it from the panel download tray" the right remedy.
+        const id = "stale-live-job-1644";
+        await writeFile(
+          join(dir, `control-job-${id}-other-session.json`),
+          JSON.stringify({
+            id,
+            trayId: "livetray1644000",
+            progressId: "live-prog-1644",
+            url: "https://example.com/large.safetensors",
+            target_subfolder: "checkpoints",
+            status: "downloading",
+            started_at: Date.now() - 10 * 60 * 1000,
+            owner: "other-session",
+            pid: process.pid, // a live process stands in for the other session
+            updated: Date.now() - 5 * 60 * 1000,
+          }),
+        );
+
+        const { cancelDownload } = makeServer();
+        const text = (await cancelDownload({ id, tray_id: "livetray1644000" })).content[0].text;
+        expect(text).toContain("STILL RUNNING");
+        expect(text).toContain("panel download tray");
+      } finally {
+        setProgressDir("");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  });
 });
 
 describe("list_local_models rendering", () => {
