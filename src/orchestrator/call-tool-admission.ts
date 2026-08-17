@@ -248,7 +248,7 @@ export const CALL_TOOL_ACTION_WHITELIST: ReadonlyMap<string, ReadonlySet<string>
   // action:"install_deps" stays REFUSED — it queues ComfyUI-Manager installs,
   // which download and execute third-party code on the rig, and no
   // confirmation-less call_tool frame ever had that reach. The remaining actions
-  // (list/read_workflow/list_templates/check_runtime/skill_list/skill_read),
+  // (list/read_workflow/read_manifest/list_templates/check_runtime/skill_list/skill_read),
   // though read-only, were never whitelisted either, and generate_skill writes a
   // file when `install_in` is set.
   ["list_packs", new Set(["extract_deps"])],

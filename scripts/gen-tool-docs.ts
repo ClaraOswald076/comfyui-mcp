@@ -237,7 +237,7 @@ const HAND_WRITTEN_PAGES: Array<{ slug: string; tools: string[] }> = [
   {
     slug: "skills-knowledge",
     // One tool since 0.50.0 slice 9: the nine knowledge tools folded into
-    // `list_packs`, whose nine actions this page documents by hand.
+    // `list_packs`, whose ten actions this page documents by hand.
     tools: ["list_packs"],
   },
 ];

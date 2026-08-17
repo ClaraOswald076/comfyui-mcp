@@ -22,7 +22,7 @@ It is one tool, `list_packs`, driven by an `action` parameter. `action` is the
 only required field; everything else is per-action.
 
 <Warning>
-  Seven of the nine actions only read. Two can change your machine:
+  Eight of the ten actions only read. Two can change your machine:
 
   - `action: "install_deps"` **installs** custom node packs through
     ComfyUI-Manager, which downloads and runs third-party code on the connected
@@ -56,6 +56,17 @@ manifest, and the manifest path for `apply_manifest`.
 
 Return a bundled pack's ready `workflow.json` graph (discover names with
 `action: "list"`).
+
+<ParamField path="name" type="string" required>
+  The pack name (from `action: "list"`). Validated against path traversal; must
+  match an existing pack.
+</ParamField>
+
+### `action: "read_manifest"`
+
+Return a bundled pack's install manifest (its `manifest.yaml` — the custom nodes +
+model weights `apply_manifest` would install), as raw YAML. **Read-only** — the way
+to inspect what a pack installs **before** running the mutating `apply_manifest`.
 
 <ParamField path="name" type="string" required>
   The pack name (from `action: "list"`). Validated against path traversal; must
