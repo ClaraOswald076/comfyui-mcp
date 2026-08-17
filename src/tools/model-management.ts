@@ -1297,11 +1297,30 @@ async function cancelAction(args: { id: string; tray_id?: string }): Promise<Cal
                 ? `its heartbeat has been stale for ${staleSecs}s, but whether the writing session is gone cannot be proven from here (its record carries no writer identity to check), so aborting it from here is refused — it may still be writing`
                 : res.reclaimDenied === "persist-failed"
                   ? `the session that started it is confirmed gone, but closing its stale record failed transiently`
-                  : `it is owned by another session with a live heartbeat, so the transfer is actively writing`;
+                  // #1644 — reaching this branch means NO reclaim verdict came
+                  // back (cancelDownloadJob returns the plain foreign-job result
+                  // with no `reclaimDenied`), so this call never probed the writer
+                  // at all. The previous text asserted "a live heartbeat …
+                  // actively writing" — the most confident liveness claim in the
+                  // function — from the one path that established none, and it
+                  // directly contradicted action:"status", which probes the
+                  // writer's pid and can report the SAME id's owner as proven
+                  // gone (#1479). Say only what is known: not owned here,
+                  // liveness not established here.
+                  : `this session does not own it and its writer was not probed by this call, so whether the transfer is still running could not be established from here`;
           const remedy =
             res.reclaimDenied === "persist-failed"
               ? `Retry download_model \`action:"cancel"\`.`
-              : `Stop it from the panel download tray instead.`;
+              : res.reclaimDenied
+                ? `Stop it from the panel download tray instead.`
+                // #1644 — with no reclaim verdict the old remedy ("stop it from
+                // the panel download tray") was a guess: the tray cannot close a
+                // record whose writer is already dead, which is exactly the case
+                // this branch cannot rule out. Point at the path that actually
+                // resolves it: action:"status" probes the writer's pid, and when
+                // it proves the writer gone, re-issuing action:"download" adopts
+                // the record and resumes from the leftover .partial.
+                : `Check download_model \`action:"status"\` for this id — it probes the writer's process directly. If status reports the owning process is gone, the transfer is NOT running and re-issuing download_model \`action:"download"\` for the same URL adopts the record and resumes from the .partial. Only if status shows it genuinely still writing, stop it from the panel download tray.`;
           return {
             content: [
               {
