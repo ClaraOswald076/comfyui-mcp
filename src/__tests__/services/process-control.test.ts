@@ -1074,11 +1074,18 @@ describe("restart truthfulness + Pinokio-shaped refusal (#742)", () => {
     expect(preflight.ok).toBe(true);
   });
 
-  it("preflightLocalRestart REFUSES a Desktop app whose supervision cannot be established (#814)", async () => {
-    // The counterpart, and the policy the #814 loss forced. A reboot has not happened
-    // yet and cannot be undone, so "I could not establish that anything will restart
-    // this" refuses — unlike `listener_ownership`, where the launch has ALREADY
-    // happened and uncertainty is merely disclosed. Refuse before, disclose after.
+  it("preflightLocalRestart PASSES a Desktop app whose parentage is unreadable — disclosed, not silent (#1647)", async () => {
+    // The issue's own shape: a live Desktop backend whose argv carries the Desktop
+    // launch signatures (here: a `main.py` inside the Desktop install), on a host
+    // where the parent pid cannot be read — so the ancestry walk cannot prove a
+    // supervisor. The preflight used to refuse outright; it now passes on the
+    // strength of the launch arguments (only the Desktop app launches a backend
+    // that way) and CARRIES THE DISCLOSURE, so the caller that dispatches on this
+    // pass reports an inference as an inference.
+    //
+    // What has NOT changed: every other unreadable shape still refuses (a chain
+    // read partway and found ambiguous — see the lifecycle suite), and a parent
+    // PROVEN gone refuses outright (#814).
     mockLivePortNoKill();
     mockGetSystemStats.mockResolvedValue({
       system: {
@@ -1094,8 +1101,9 @@ describe("restart truthfulness + Pinokio-shaped refusal (#742)", () => {
 
     const preflight = await preflightLocalRestart();
 
-    expect(preflight.ok).toBe(false);
-    expect(preflight.reason).toMatch(/could not be established/i);
+    expect(preflight.ok).toBe(true);
+    expect(preflight.note).toMatch(/INFERRED, not proven/i);
+    expect(preflight.note).toMatch(/could not be read/i);
   });
 
   it("preflightLocalRestart REFUSES when no running process can be identified", async () => {

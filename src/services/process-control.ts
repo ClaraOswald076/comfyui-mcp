@@ -1992,8 +1992,22 @@ function processExists(pid: number): boolean | undefined {
  * "couldn't confirm it came back" — a verdict computed AFTER the stop, about a stop
  * it should never have made.
  *
- * ONLY `supervised` proceeds. `unconfirmed` REFUSES, and the asymmetry with the rest
- * of this file is deliberate rather than an inconsistency (coordinator gate):
+ * ONLY `supervised` proceeds silently. `unconfirmed` REFUSES — with ONE disclosed
+ * exception (#1647): when the walk never got off the ground because the port owner's
+ * OWN parent could not be read (a host that cannot read parentage at all — the
+ * reporter's macOS Desktop install), and the server's own launch arguments carry the
+ * ComfyUI Desktop launch signatures (`--extra-model-paths-config` pointing into the
+ * `Comfy Desktop` data directory, a `main.py` inside the Desktop install), then the
+ * same argv that told us this IS a Desktop instance also tells us WHO launched it:
+ * the Desktop app. In that one shape the reboot proceeds and the inference is stated
+ * in the result (`note`) — what was not proven, what it was inferred from, and the
+ * residual case where nothing will bring the server back (a backend someone started
+ * BY HAND with Desktop's flags). Every other `unconfirmed` shape — a chain that was
+ * read and found ambiguous partway up — still refuses, and `abandoned` always does:
+ * a parent PROVEN gone is a fact, not a gap in the evidence.
+ *
+ * The asymmetry with the rest of this file is deliberate rather than an
+ * inconsistency (coordinator gate):
  *
  *   `listener_ownership` reports on an action that HAS ALREADY HAPPENED — the child
  *   was spawned, the server is answering — and only the DESCRIPTION of it is
@@ -2017,6 +2031,14 @@ function processExists(pid: number): boolean | undefined {
 function assessDesktopSupervision(info: ProcessInfo): {
   ok: boolean;
   reason?: string;
+  /**
+   * The disclosure owed when `ok` was reached by INFERENCE rather than by proof
+   * (#1647): what could not be established, what was proceeded on, and the case
+   * in which nothing brings the server back. Carried on the result so the
+   * caller's message can state it — proceeding quietly would be the silent
+   * success this file exists to prevent.
+   */
+  note?: string;
   supervision: SupervisorRelaunch;
 } {
   const cannotAssess = (because: string): {
@@ -2052,7 +2074,7 @@ function assessDesktopSupervision(info: ProcessInfo): {
   // already handles pid 0 the way it handles any pid it cannot read — the identity
   // and parent reads come back empty and the verdict is `unconfirmed`, which now
   // refuses — so letting it fall through inherits a path that IS tested.
-  const { verdict, because } = classifyDesktopSupervision({
+  const { verdict, because, parentUnreadableAt } = classifyDesktopSupervision({
     pid: info.pid,
     readParentPid,
     readIdentity: resolveProcessIdentity,
@@ -2069,6 +2091,41 @@ function assessDesktopSupervision(info: ProcessInfo): {
         `Desktop app is still supervising it — its parent process is gone. A restart from here ` +
         `asks ComfyUI-Manager to stop the process and relies on that supervisor to start it ` +
         `again, so it would be stopped and nothing would bring it back.`,
+    };
+  }
+  // #1647 — the host cannot read parentage AT ALL (the FIRST link failed), and the
+  // server's own argv already carries the Desktop launch signatures. The walk has
+  // nothing to say, but the argv does: only the Desktop app launches its backend
+  // with those flags, so Desktop is what started this server and a live Desktop app
+  // restarts a backend that exits under it. Proceed on that inference — DISCLOSED,
+  // via `note`, never silently — rather than refusing a restart that works.
+  //
+  // Restricted to the first hop on purpose: an unreadable parent DEEPER in the chain
+  // means wrappers between the backend and whatever spawned it, a layout nothing here
+  // can reason about. And the signature guard is the same test the Desktop routing
+  // itself used, re-applied rather than assumed, so this fallback can never be
+  // reached by an instance that was not independently identified as Desktop.
+  //
+  // The risk being accepted, and which the note names: a server started BY HAND with
+  // Desktop's flags (borrowing its model-paths config) has no supervisor, and the
+  // reboot would stop it for good. That is the disclosure's whole content — the user
+  // who did that knows they did, and is told to check afterwards.
+  if (
+    parentUnreadableAt === info.pid &&
+    isDesktopApp(info.argv.length > 0 ? info.argv : (info.osArgv ?? []))
+  ) {
+    return {
+      ok: true,
+      supervision: verdict,
+      note:
+        `NOTE: Desktop supervision was INFERRED, not proven — ${because ?? `the process tree above PID ${info.pid} could not be read`}, ` +
+        `so no live Desktop shell could be confirmed above this server. The restart proceeded on ` +
+        `the strength of the server's own launch arguments, which are the ones the ComfyUI Desktop ` +
+        `app passes when it launches its backend — so Desktop is what started it, and a running ` +
+        `Desktop app restarts its backend when it stops. If you actually started this server BY ` +
+        `HAND with Desktop's flags, nothing will bring it back: verify afterwards with ` +
+        `get_system_stats (action:"health"), and start it from the ComfyUI Desktop app if it does ` +
+        `not come back.`,
     };
   }
   return {
@@ -3595,6 +3652,13 @@ async function restartViaManagerReboot(context: {
   prior?: { argv: string[]; generation: number };
   /** Is this a ComfyUI Desktop instance? Selects the remedy in the #848 sentence. */
   isDesktop?: boolean;
+  /**
+   * Set when the reboot was allowed on INFERRED supervision (#1647) — the Desktop
+   * launch-signature fallback, reached when the process tree could not be read.
+   * Appended to the outcome message verbatim: a dispatch that proceeded on an
+   * inference must say so, on every path that reports one.
+   */
+  supervisionNote?: string;
 }): Promise<RestartResult> {
   logger.info(`Restarting ${context.label} ComfyUI via ComfyUI-Manager reboot...`);
 
@@ -3630,6 +3694,7 @@ async function restartViaManagerRebootDispatch(
     label: string;
     prior?: { argv: string[]; generation: number };
     isDesktop?: boolean;
+    supervisionNote?: string;
   },
   anchoredBase: string,
   witness: InstanceWitness | undefined,
@@ -3794,7 +3859,11 @@ async function restartViaManagerRebootDispatch(
         `another ${RECHECK_HINT_S}s before intervening. If it is still down then, start ` +
         "ComfyUI from whatever supervises it (" +
         (context.label === "Desktop" ? "the ComfyUI Desktop app" : "its host") +
-        "), or raise that budget to wait longer next time.",
+        "), or raise that budget to wait longer next time." +
+        // #1647: when the dispatch was allowed on inferred supervision, that
+        // caveat is part of the outcome — especially here, where nothing
+        // confirmed the server came back.
+        (context.supervisionNote ? ` ${context.supervisionNote}` : ""),
       listener_ownership: unclassifiedOwnership(),
     };
   }
@@ -3936,7 +4005,10 @@ async function restartViaManagerRebootDispatch(
       ` ComfyUI is healthy now (${readiness.waited_ms}ms) — ${context.label}/supervised ` +
       "restart. The cycle itself was not directly observed from here, so verify with " +
       'get_system_stats (action:"health") if you need certainty that it actually restarted.' +
-      argvNote,
+      argvNote +
+      // #1647: same disclosure as the not-ready branch — an inferred supervision
+      // is stated whatever the probes saw.
+      (context.supervisionNote ? ` ${context.supervisionNote}` : ""),
     // We launched nothing on this path — a supervisor is what would have cycled the
     // process — so the listener is never ours to claim. (Nor is it established that
     // one DID cycle it; that is `startup`'s business, and it says "unconfirmed".)
@@ -4046,6 +4118,9 @@ export async function restartComfyUI(): Promise<RestartResult> {
       label: "Desktop",
       prior: { argv: info.argv, generation: infoGeneration },
       isDesktop: true,
+      // #1647: set when supervision was INFERRED from the launch signatures rather
+      // than proven from the process tree — the result must say so.
+      supervisionNote: desktop.note,
     });
   }
 
@@ -4347,6 +4422,13 @@ export async function preflightLocalRestart(): Promise<{
   observedArgv?: string[];
   /** Whether the assessed instance is ComfyUI Desktop — selects the #848 remedy. */
   isDesktopApp?: boolean;
+  /**
+   * The disclosure owed when the pass rests on INFERRED supervision (#1647 — the
+   * Desktop launch-signature fallback). A caller that dispatches on this pass
+   * appends it to the outcome it reports; passing silently would hide that the
+   * process tree was never read.
+   */
+  note?: string;
 }> {
   // Remote mode passes because there is no local process to assess — but that
   // reasoning only holds when the target really is another machine, and the
@@ -4398,6 +4480,7 @@ async function assessLocalRestart(): Promise<{
   reason?: string;
   observedArgv?: string[];
   isDesktopApp?: boolean;
+  note?: string;
 }> {
   const { info, diagnostic } = await acquireProcessInfo();
   // NOTHING COULD BE RESOLVED — and that is not a pass (coordinator gate).
@@ -4449,7 +4532,7 @@ async function assessLocalRestart(): Promise<{
     // property of the install. See assessDesktopSupervision for why UNCONFIRMED
     // refuses here while it is merely disclosed on the post-launch ownership path.
     const desktop = assessDesktopSupervision(info);
-    if (desktop.ok) return { ok: true, ...observedLaunch(info) };
+    if (desktop.ok) return { ok: true, ...observedLaunch(info), note: desktop.note };
     return { ok: false, reason: `${desktop.reason}${describeRecovery(recoveryHint(info))}` };
   }
   // NOTE (#776): the launch-ENVIRONMENT check is deliberately NOT applied here.

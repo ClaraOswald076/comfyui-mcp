@@ -87,6 +87,19 @@ export function unclassifiedSupervision(): SupervisorRelaunch {
 export interface SupervisionAssessment {
   verdict: SupervisorRelaunch;
   because?: string;
+  /**
+   * Set ONLY when the walk stopped because the parent of this pid could not be
+   * read at all — the first shape of `unconfirmed` below. Recorded as a field
+   * (not just folded into `because`) so a caller can tell "the chain was
+   * unreadable from the start" apart from the later, richer shapes — a parent
+   * that exists but cannot be probed, an identity that cannot be read, start
+   * times that cannot be compared — without parsing prose. The distinction
+   * decides whether the #1647 fallback (proceed on the server's own Desktop
+   * launch signatures, disclosed) may even be considered: that fallback exists
+   * for the host that cannot read parentage at all, never for a chain that was
+   * read and found ambiguous partway up.
+   */
+  parentUnreadableAt?: number;
 }
 
 export interface SupervisionEvidence {
@@ -176,9 +189,14 @@ export function compareStartTimes(
  *   `unconfirmed`— the chain became unreadable, a pid could not be probed, or the hop
  *                  budget ran out. NOT an answer in either direction — and note that
  *                  it is the CALLER that decides what to do with it. For a reboot,
- *                  which is irreversible and has not happened yet, the caller refuses:
- *                  see assessDesktopSupervision. Each such outcome carries `because`,
- *                  so a refusal can name what it failed to establish.
+ *                  which is irreversible and has not happened yet, the caller refuses —
+ *                  with one disclosed exception (#1647: the FIRST link unreadable on a
+ *                  host that cannot read parentage at all, where the server's own
+ *                  Desktop launch signatures say who started it): see
+ *                  assessDesktopSupervision. Each such outcome carries `because`, so a
+ *                  refusal can name what it failed to establish, and
+ *                  `parentUnreadableAt`, so the fallback can tell the first-hop shape
+ *                  from a chain that ran out of road partway up.
  *
  * The hop budget is small on purpose. A Desktop backend sits one or two levels under
  * its shell; a chain longer than that is not a layout we can reason about, and
@@ -213,7 +231,15 @@ export function classifyDesktopSupervision(
   for (let hop = 0; hop < maxHops; hop++) {
     const parent = input.readParentPid(current);
     // The chain stopped being readable. Nothing was learned in either direction.
-    if (parent == null) return unconfirmed(`the parent process of PID ${current} could not be read`);
+    // WHICH pid failed is recorded: a caller that falls back to weaker evidence
+    // (#1647) may do so only when the FIRST link — the port owner's own parent —
+    // is the unreadable one, not when a walk that got partway up ran out of road.
+    if (parent == null) {
+      return {
+        ...unconfirmed(`the parent process of PID ${current} could not be read`),
+        parentUnreadableAt: current,
+      };
+    }
     // A process cannot be its own parent; that reading is damage, not a tree root.
     if (parent === current) return unconfirmed(`PID ${current} was reported as its own parent, which is not a tree this can be read from`);
     // The TOP of the tree, reached without passing a supervisor. On POSIX an

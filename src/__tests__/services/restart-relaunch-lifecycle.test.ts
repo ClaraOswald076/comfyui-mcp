@@ -305,8 +305,28 @@ describe("classifyDesktopSupervision — is anything going to start this again? 
     // Refusing on missing evidence would take the Desktop restart away from every
     // host whose process tree cannot be read, which is the far more common and far
     // more damaging failure. Only a positive finding refuses.
-    const { verdict } = classifyDesktopSupervision(tree({ 500: {} }));
+    const { verdict, parentUnreadableAt } = classifyDesktopSupervision(tree({ 500: {} }));
     expect(verdict).toBe("unconfirmed");
+    // #1647: WHICH link failed is reported, so the caller's launch-signature
+    // fallback can tell "the FIRST hop was unreadable" (a host that cannot read
+    // parentage at all) from a walk that ran out of road partway up — only the
+    // former may proceed on the argv evidence.
+    expect(parentUnreadableAt).toBe(500);
+  });
+
+  it("an unreadable parent DEEPER in the chain is marked at that hop, not the first", () => {
+    // The walk read one link fine (a wrapper), then ran out of road. The marker
+    // names the hop that actually failed, so the #1647 fallback — which exists for
+    // the host that cannot read parentage AT ALL — cannot mistake a partially-read
+    // chain for it.
+    const { verdict, parentUnreadableAt } = classifyDesktopSupervision(
+      tree({
+        500: { parent: 400, started: "5000" },
+        400: { cmd: "wrapper", started: "1000" },
+      }),
+    );
+    expect(verdict).toBe("unconfirmed");
+    expect(parentUnreadableAt).toBe(400);
   });
 
   it("A RECYCLED parent pid that looks exactly like a supervisor is ABANDONED, not supervised", () => {
@@ -1348,12 +1368,19 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
     expect(killWasIssued()).toBe(false);
   });
 
-  it("#400 is not disturbed: the refusal leaves the server RUNNING, it never kills it", async () => {
-    // The claim this policy had to be separated from. #400 established that a Desktop
-    // process must never be KILLED locally, because respawning the exe does not
-    // reliably bring the listener back. Refusing an unverified Manager stop does not
-    // touch that: the server stays up and the user is pointed at the app that
-    // restarts it reliably.
+  it("#1647: an unreadable parent pid DEGRADES to a disclosed reboot when Desktop launch signatures are present", async () => {
+    // The issue itself: a live ComfyUI Desktop instance (reported on macOS), whose
+    // backend's argv carries the Desktop launch signatures — `--enable-manager` and
+    // an `--extra-model-paths-config` pointing into the Comfy Desktop data
+    // directory — but whose parent pid could not be read, so the ancestry walk
+    // never got off the ground and the restart was REFUSED outright, blocking a
+    // just-installed custom node from loading.
+    //
+    // The same argv that identifies the instance as Desktop also names its
+    // launcher: only the Desktop app starts a backend with those flags. So the
+    // reboot now proceeds on that inference — DISCLOSED in the result, never
+    // silent — and #400 is still not disturbed: the process is never KILLED
+    // locally, the Manager reboot cycles it through its supervisor.
     desktopServer();
     __processControlTestHooks.setProcessIdentityResolver((pid) =>
       pid === 4321 ? { startedAt: "5000" } : undefined,
@@ -1364,10 +1391,50 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
 
     const result = await restartComfyUI();
 
-    expect(result.message).toMatch(/refusing to restart/i);
-    expect(result.message).toMatch(/Restart it from the ComfyUI Desktop app/i);
+    expect(result.message).not.toMatch(/refusing to restart/i);
+    // The Manager reboot route was actually taken…
+    expect(fetchSpy).toHaveBeenCalled();
+    // …the inference is DISCLOSED, with what could not be read named…
+    expect(result.message).toMatch(/INFERRED, not proven/i);
+    expect(result.message).toMatch(/parent process of PID 4321 could not be read/i);
+    // …and the residual risk is stated, so a hand-started server is not silently
+    // stopped for good.
+    expect(result.message).toMatch(/started this server BY HAND/i);
+    // #400 stands: nothing was killed — the reboot cycles the process through its
+    // supervisor, it is never stopped locally.
     expect(killWasIssued()).toBe(false);
+  });
+
+  it("#1647: the fallback stops at the FIRST hop — an unreadable parent higher up still refuses", async () => {
+    // The boundary of the fallback. It exists for a host that cannot read
+    // parentage AT ALL (the port owner's own parent is unreadable). A walk that
+    // read one link — a wrapper, not a supervisor — and THEN hit an unreadable
+    // parent is a partially-read chain with an ambiguous middle, and that shape
+    // keeps the #814 refusal: nothing about the argv can speak for what sits
+    // above the wrapper.
+    desktopServer();
+    __processControlTestHooks.setProcessIdentityResolver((pid) => {
+      if (pid === 4321) return { startedAt: "5000", parentPid: 300 };
+      if (pid === 300) {
+        return {
+          // Readable, causally sound, and plainly NOT the Desktop shell.
+          commandLine: "python.exe wrapper.py",
+          startedAt: "2000",
+        };
+      }
+      return undefined;
+    });
+    __processControlTestHooks.setParentPidResolver((pid) => (pid === 4321 ? 300 : undefined));
+    __processControlTestHooks.setProcessExistsProbe(() => true);
+    const fetchSpy = vi.fn(async () => ({ ok: true }) as Response);
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(result.message).toMatch(/the parent process of PID 300 could not be read/i);
     expect(fetchSpy).not.toHaveBeenCalled();
+    expect(killWasIssued()).toBe(false);
   });
 
   it("a wedged DESKTOP instance is recognised from the OS command line and never killed", async () => {
