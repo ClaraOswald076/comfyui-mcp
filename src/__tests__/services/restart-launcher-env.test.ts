@@ -614,6 +614,122 @@ describe("restart_comfyui — Stability Matrix launcher environment (#776)", () 
   });
 });
 
+describe("restart_comfyui — the interpreter the HEALTHY server runs wins (#1654)", () => {
+  // #1654: a Stability Matrix package holding BOTH `.venv` and `venv`. The layout
+  // resolution prefers `.venv` whenever both exist, and this one was an EMPTY,
+  // unrelated Python — so the restart stopped a healthy server and relaunched an
+  // interpreter with no torch/sqlalchemy (exit 1 at `import sqlalchemy`), leaving
+  // ComfyUI down. The working environment was `venv/Scripts/python.exe` — named
+  // all along by the OS command line of the very process being restarted.
+  const SM_EMPTY_PY = join(SM_PKG, ".venv", "Scripts", "python.exe");
+  const SM_ARGV = [SM_MAIN, "--preview-method", "auto", "--enable-manager"];
+
+  /**
+   * The issue's disk shape: both environments exist under the package, the layout
+   * resolution prefers the EMPTY `.venv`, and the launcher tooling roots are
+   * present so the environment plan is reproducible either way.
+   */
+  function useDualVenvStabilityMatrix(): void {
+    mockFindComfyuiPython.mockReturnValue(SM_EMPTY_PY);
+    mockLiveRootFromArgv.mockReturnValue(SM_PKG);
+    mockGetSystemStats.mockResolvedValue({ system: { argv: SM_ARGV } });
+    const roots = [SM_GIT_ROOT, SM_FFMPEG_ROOT];
+    // A real filesystem implies every ancestor of an existing directory.
+    const existingDirs = new Set<string>();
+    for (const root of roots) {
+      let cur = root;
+      while (cur.length > SM_DATA.length && cur.startsWith(SM_DATA)) {
+        existingDirs.add(cur);
+        cur = dirname(cur);
+      }
+      existingDirs.add(SM_DATA);
+    }
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      if (s === SM_MAIN || s === SM_PY || s === SM_EMPTY_PY) return true;
+      if (existingDirs.has(s)) return true;
+      if (s === SM_GIT_EXE || s === SM_FFMPEG_EXE) return true;
+      return false;
+    });
+  }
+
+  /** The OS's view of the healthy server, as WMI reports it on Windows. */
+  function osReportsInterpreter(commandLine: string): void {
+    __processControlTestHooks.setProcessIdentityResolver((pid) =>
+      pid === 4321 ? { startedAt: "stable-stamp", commandLine } : undefined,
+    );
+  }
+
+  async function restartAndReturnSpawn(): Promise<{
+    result: Awaited<ReturnType<typeof restartComfyUI>>;
+    exe: string;
+    args: string[];
+  }> {
+    mockLivePortThenFree();
+    spawnCapturingChildren();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(true);
+    expect(result.started).toBe(true);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    const [exe, args] = mockSpawn.mock.calls[0];
+    killSpy.mockRestore();
+    return { result, exe: String(exe), args: args as string[] };
+  }
+
+  it("relaunches the interpreter the OS reports for the running server, not the layout's empty `.venv`", async () => {
+    // THE issue shape: the healthy server runs under `venv`, the layout prefers
+    // `.venv`. The restart must preserve the environment the process was observed
+    // running under — that observation is corroborated against the server's own
+    // argv, so it cannot be a different install's interpreter.
+    useDualVenvStabilityMatrix();
+    osReportsInterpreter(
+      `"${SM_PY}" "${SM_MAIN}" --preview-method auto --enable-manager`,
+    );
+
+    const { result, exe, args } = await restartAndReturnSpawn();
+
+    expect(exe).toBe(SM_PY);
+    expect(exe).not.toBe(SM_EMPTY_PY);
+    expect(args).toEqual(SM_ARGV);
+    // The launcher environment is still reconstructed around the observed
+    // interpreter — the #776 preservation is untouched.
+    expect(result.launch_env?.source).toBe("stability-matrix");
+  });
+
+  it("falls back to the layout resolution when the OS names no usable interpreter", async () => {
+    // A shell with an activated venv launches a BARE `python`: argv[0] names no
+    // file we can verify (the process's cwd is not ours), so the observation is
+    // honestly unknown and the pre-#1654 resolution is what remains.
+    useDualVenvStabilityMatrix();
+    osReportsInterpreter(`python "${SM_MAIN}" --preview-method auto --enable-manager`);
+    mockFindComfyuiPython.mockReturnValue(SM_PY);
+
+    const { exe } = await restartAndReturnSpawn();
+
+    expect(exe).toBe(SM_PY);
+  });
+
+  it("never adopts the SCRIPT as the interpreter (a directly exec'd main.py)", async () => {
+    // A shebang-launched server has main.py AS argv[0]. Adopting that as the
+    // interpreter would spawn a Python file as a program after the stop.
+    useDualVenvStabilityMatrix();
+    osReportsInterpreter(`"${SM_MAIN}" --preview-method auto --enable-manager`);
+    mockFindComfyuiPython.mockReturnValue(SM_PY);
+
+    const { exe, args } = await restartAndReturnSpawn();
+
+    expect(exe).toBe(SM_PY);
+    expect(args).toEqual(SM_ARGV);
+  });
+});
+
 describe("launcher layout detection — path-root handling (#776)", () => {
   // The paths come from the running ComfyUI's sys.argv, which is WINDOWS-flavored
   // whenever ComfyUI runs on Windows regardless of this host. These are pure

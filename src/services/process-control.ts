@@ -121,6 +121,20 @@ interface ProcessInfo {
   /** The OS's raw command line — the recovery hint even when argv is not spawnable. */
   osCommandLine?: string;
   /**
+   * The interpreter the HEALTHY server is actually running under (#1654): argv[0]
+   * of the corroborated OS command line, captured at gather-time while the process
+   * is alive. The layout-based interpreter resolution prefers `<root>/.venv` over
+   * `<root>/venv` whenever both exist, and a Stability Matrix package routinely HAS
+   * both — an empty `.venv` beside the working `venv` — so a restart that trusted
+   * the layout stopped the healthy server and relaunched an environment with no
+   * torch/sqlalchemy, leaving ComfyUI down. This is the observed truth the layout
+   * guess is only ever a fallback for: the command line it came from was already
+   * matched against the server's own argv, so it describes THIS server. Set only
+   * when the observation is an absolute, existing, non-script path; absent
+   * otherwise, and the layout resolution stands.
+   */
+  observedInterpreter?: string;
+  /**
    * TRUE when `pid` was found by SCANNING PROCESS NAMES for a Desktop shell, rather
    * than resolved from the port.
    *
@@ -1435,6 +1449,34 @@ function resolveCorroboratedIdentity(
 }
 
 /**
+ * The interpreter a CORROBORATED OS identity says this server is running under
+ * (#1654) — argv[0] of the observed command line.
+ *
+ * The command line was already matched against the server's own argv, so its first
+ * token is the interpreter THAT process was launched with: the ground truth the
+ * install-layout resolution in resolveLaunchCommand is only ever a guess at. The
+ * guess prefers `<root>/.venv` over `<root>/venv` whenever both exist, and a
+ * Stability Matrix package routinely has both (an empty `.venv` beside the working
+ * `venv`), which is how a restart relaunched an environment with no
+ * torch/sqlalchemy and left the server down.
+ *
+ * Accepted only as an ABSOLUTE path that exists on disk and is not itself the
+ * script (a shebang-launched `main.py` has the script AS argv[0] — adopting that
+ * as the interpreter would spawn a Python file as a program). A relative or bare
+ * argv[0] (`python`, `.\python`) names no file we can verify — the process's cwd
+ * is not ours — so it is honestly unknown and the layout resolution stands. Same
+ * acceptance rule as live-interpreter's tier 2.
+ */
+function observedInterpreterFromIdentity(
+  identity: ProcessIdentity,
+): string | undefined {
+  const argv0 = argv0FromCommandLine(identity.commandLine ?? "");
+  if (!argv0 || /\.pyw?$/i.test(argv0)) return undefined;
+  if (!isAbsolute(argv0)) return undefined;
+  return fileExists(argv0) ? argv0 : undefined;
+}
+
+/**
  * The live environment of a pid we can still PROVE is the process we identified.
  *
  * Reading `/proc/<pid>/environ` from a bare number is not enough: between the port
@@ -1758,7 +1800,14 @@ function resolveLaunchCommand(
   const firstUnquoted = first.trim().replace(/^["']+/, "").replace(/["']+$/, "");
   const looksLikeScript = /\.pyw?$/i.test(firstUnquoted);
   if (looksLikeScript) {
-    const python = findComfyuiPython(config.comfyuiPath ?? undefined, argv);
+    // #1654: the interpreter the OS observed THIS server running under outranks the
+    // layout resolution — a guess that prefers `<root>/.venv` over `<root>/venv`
+    // whenever both exist is how a restart relaunched an empty environment and left
+    // the server down. The observation was captured corroborated against the
+    // server's own argv, so it IS the environment the healthy process imports from.
+    const python =
+      info.observedInterpreter ??
+      findComfyuiPython(config.comfyuiPath ?? undefined, argv);
     if (!python) return null;
     // sys.argv[0] can be RELATIVE (the standard Windows portable launcher runs
     // `python ComfyUI\main.py` from the portable root). We force cwd to
@@ -1832,7 +1881,11 @@ function resolveLaunchCommand(
     // against, so the relaunch never depends on a wrong/undefined working
     // directory. Only an UNANCHORED relative script leaves cwd unset — the
     // refuse-safe preflight (#476/#426) rejects that case before any stop.
-    const exe = liveCwdScript ? liveCwdPython! : python;
+    // The OBSERVED interpreter (#1654) outranks both layout-derived pythons: it is
+    // the environment this exact process was seen running under, while the other
+    // two are install-layout inferences that cannot tell a working `venv` from an
+    // empty `.venv` sitting beside it.
+    const exe = info.observedInterpreter ?? (liveCwdScript ? liveCwdPython! : python);
     const cwd = liveCwdScript ? info.liveCwd : anchor;
     return { exe, args: [script, ...rest], cwd };
   }
@@ -2660,6 +2713,15 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
     err.identityAmbiguous = true;
     throw err;
   }
+  // #1654: preserve the interpreter the healthy process is RUNNING under, from the
+  // same corroborated OS observation that bound the pid — captured now, while the
+  // process is alive, for the same reason `liveCwd` is. The relaunch prefers it
+  // over the install-layout guess, which picks `.venv` over `venv` whenever both
+  // exist regardless of which environment the server actually imports from.
+  const observedInterpreter =
+    !desktop && corroboration.kind === "confirmed"
+      ? observedInterpreterFromIdentity(corroboration.identity)
+      : undefined;
   const startedAt = desktop
     ? undefined
     : corroboration.kind === "confirmed"
@@ -2715,6 +2777,7 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
     osArgv,
     osArgvExact,
     osCommandLine,
+    observedInterpreter,
     isDesktopApp: desktop,
     desktopExePath: desktopExe,
     liveCwd,
