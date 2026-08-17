@@ -1035,16 +1035,31 @@ describe("UiBridge (multi-tab)", () => {
       expect(after).toMatchObject({ ok: true });
       expect(frames.pop()?.workflow_uuid).toBe(UUID);
 
-      // 4) ISSUE-TIME WINS (codex round 1, P0): if the turn was issued for a
-      //    DIFFERENT workflow than the one the active tab now shows, the frame
-      //    must carry the ISSUE-TIME uuid — the panel (comparing against its
-      //    active workflow) then DECLINES, instead of the stamp silently
-      //    re-aiming the mutation at whatever is on screen.
+      // 4) ISSUE-TIME WINS (codex round 1, P0): a turn issued for a DIFFERENT
+      //    workflow than the one the active tab now shows must never be re-aimed
+      //    at whatever is on screen. Before #1656 the frame shipped carrying the
+      //    ISSUE-TIME uuid and the panel (comparing against its active workflow)
+      //    DECLINED. That decline depended on the panel's live-identity read having
+      //    settled — the window #1656 reports, where it had not and the command ran
+      //    on the previous canvas. The stamp still comes from the SCOPE (issue-time),
+      //    but the divergence it creates is now refused by the BRIDGE, before any
+      //    socket write: the outcome #570 required (never applied to the wrong
+      //    workflow) no longer depends on the timing of the panel's read.
       const TURN_UUID = "33333333-3333-4333-8333-333333333333";
       stamps.set(SHARED_SESSION_SCOPE, TURN_UUID);
-      const reaimed = await bridge.send({ cmd: "graph_add_node" }, { tabId: SHARED_SESSION_SCOPE });
-      expect(reaimed).toMatchObject({ ok: true }); // this mock panel accepts; a real one fences
-      expect(frames.pop()?.workflow_uuid).toBe(TURN_UUID); // NOT the conn's own UUID
+      frames.length = 0; // step 2's read left a frame; what matters is nothing NEW ships
+      const reaimedErr = await bridge
+        .send({ cmd: "graph_add_node" }, { tabId: SHARED_SESSION_SCOPE })
+        .then(
+          () => null,
+          (e) => e as Error,
+        );
+      expect(reaimedErr).not.toBeNull();
+      expect(reaimedErr!.message).toMatch(/^workflow instance mismatch:/);
+      expect(reaimedErr!.message).toContain(TURN_UUID); // the issue-time stamp is named…
+      expect(reaimedErr!.message).toContain(UUID); // …against the tab's advertised identity
+      expect(dispatchOutcomeOf(reaimedErr)).toBe(false);
+      expect(frames).toEqual([]); // nothing reached the switched-to canvas
 
       sock.close();
     });
@@ -2126,7 +2141,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     expect(drove?.tab_id).toBe("phone-7");
   });
 
-  it("STAMPS a dispatched command with the ORIGIN workflow uuid so the panel can fence a post-switch apply (#570 P0)", async () => {
+  it("STAMPS a dispatched command with the ORIGIN workflow uuid — and after a switch the divergence is REFUSED pre-dispatch (#570 P0, #1656)", async () => {
     // The orchestrator maps each tab to its trusted per-instance workflow uuid.
     const uuidByTab: Record<string, string> = { "tmp:A": "uuid-A", "tmp:B": "uuid-B" };
     bridge.setTabWorkflowUuidResolver((tabId) => uuidByTab[tabId]);
@@ -2152,13 +2167,28 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     desktop.send(JSON.stringify({ type: "hello", tab_id: "tmp:B", title: "B", enforces_workflow_stamp: true, enforces_workflow_stamp_at_write: true }));
     await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:B")).toBe(true));
 
-    // A late command still ISSUED FOR A (its agent's tab id) must stamp A's uuid — even though
-    // it now resolves onto B's socket — so the panel (showing B) declines to apply it. Stamping
-    // B's uuid would let it cross-apply. The resolver reads the ORIGIN tab, so it stays uuid-A.
+    // A late command still ISSUED FOR A (its agent's tab id) must never land on B's
+    // canvas. Before #1656 the bridge delivered it stamped uuid-A — even though it
+    // resolved onto B's socket — and relied on the panel (showing B) to decline;
+    // stamping B's uuid would have let it cross-apply. The guarantee is unchanged
+    // (no cross-apply, ever) but the refusal moved EARLIER: the bridge can see that
+    // the stamp it would attach (uuid-A) and the identity the routed tab now
+    // advertises (uuid-B) disagree, so it refuses BEFORE the socket write — the
+    // panel's live-identity read no longer has to have settled for the mutation to
+    // be fenced.
     frames.length = 0;
-    await bridge.send({ cmd: "graph_add_node", node: "y" } as never, { tabId: "tmp:A" });
-    await waitFor(() => expect(frames.find((f) => f.cmd === "graph_add_node")).toBeTruthy());
-    expect(frames.find((f) => f.cmd === "graph_add_node")?.workflow_uuid).toBe("uuid-A");
+    const err = await bridge
+      .send({ cmd: "graph_add_node", node: "y" } as never, { tabId: "tmp:A" })
+      .then(
+        () => null,
+        (e) => e as Error,
+      );
+    expect(err).not.toBeNull();
+    expect(err!.message).toMatch(/^workflow instance mismatch:/);
+    expect(err!.message).toContain("uuid-A");
+    expect(err!.message).toContain("uuid-B");
+    expect(dispatchOutcomeOf(err)).toBe(false); // typed: nothing was transmitted
+    expect(frames).toEqual([]); // and in fact nothing was — B's canvas never saw it
     desktop.close();
   });
 
