@@ -47,6 +47,14 @@ interface MonitorState {
   // ComfyUI's status.exec_info.queue_remaining — the total tasks the server still
   // has (running + pending). Last-known value between status frames.
   queueRemaining: number;
+  // Node id → class_type for the RUNNING prompt's graph, captured from the
+  // /queue poll's queue_running entry — the only place this passive client
+  // learns class types on modern ComfyUI (sid-scoped frames never arrive here).
+  // Drives the training exemption in report() (#1652): TrainLoraNode & co. emit
+  // no per-step progress frames, so the hard stall floor would otherwise fire on
+  // EVERY healthy training run past 30 minutes. Empty until the poll captures
+  // the graph; cleared with the run.
+  runningNodeClassTypes: Record<string, string>;
   // Monotonic ms timestamp of the last FORWARD-progress signal (node advanced or
   // progress value ticked up) while a job runs. A stuck step re-emits the same
   // progress value, which must NOT refresh this — that's how we see the stall.
@@ -134,9 +142,26 @@ const HISTORY_TAIL_ITEMS = 32;
 // Absolute floor of zero-forward-progress time after which a running job is
 // flagged as stalled EVEN when the server still looks alive here — the backstop
 // for a genuine in-node deadlock on a reachable ComfyUI (#183). Far beyond any
-// legitimate single-node runtime (a long tiled VAE decode / video sample is
-// minutes, not half an hour), so it never trips on a healthy render.
+// legitimate single-node NON-training runtime (a long tiled VAE decode / video
+// sample is minutes, not half an hour), so it never trips on a healthy render.
+// Training nodes legitimately exceed it (hours of silent tqdm), which is why
+// report() exempts runs whose graph contains a known trainer class (#1652).
 const HARD_STALL_FLOOR_MS = 30 * 60 * 1000; // 30 minutes
+// Node classes whose HEALTHY runtime legitimately exceeds the hard floor with
+// ZERO forward-progress frames: ComfyUI's built-in LoRA training only rewrites
+// a tqdm bar on stdout — no per-step `progress` WS frames — so lastActivityTs
+// never bumps and idleFor grows monotonically for the whole run (#1652). A
+// 1500-step SDXL LoRA at ~2.6 s/it runs ~65 minutes and crossed the 30-minute
+// floor every single time; the false STALLED note (whose remedy is to CANCEL
+// the run) was structural, not a race. Best-effort list of known trainer
+// classes — deliberately narrow: a class that also appears in ordinary render
+// graphs (e.g. LoraModelLoader) must NOT be added, or common renders would
+// silently lose the deadlock backstop.
+const TRAINING_NODE_CLASS_TYPES = new Set([
+  "TrainLoraNode", // ComfyUI core
+  "TrainLoraNodeAdvanced", // core advanced variant
+  "LoraTrainer", // common community trainer packs
+]);
 
 class QueueMonitorImpl {
   private ws: WebSocket | null = null;
@@ -158,6 +183,7 @@ class QueueMonitorImpl {
     progressValue: null,
     progressMax: null,
     queueRemaining: 0,
+    runningNodeClassTypes: {},
     lastActivityTs: null,
     lastFrameTs: null,
     lastServerAliveTs: null,
@@ -471,6 +497,7 @@ class QueueMonitorImpl {
     this.state.currentNode = null;
     this.state.progressValue = null;
     this.state.progressMax = null;
+    this.state.runningNodeClassTypes = {};
     this.state.lastActivityTs = null;
   }
 
@@ -688,6 +715,19 @@ class QueueMonitorImpl {
     const first = running[0];
     if (Array.isArray(first) && typeof first[1] === "string") {
       this.adoptRunningPrompt(first[1]);
+      // Index 2 is the full prompt graph (node id → { class_type, ... }) — the
+      // ONLY place this passive client learns the running run's class types.
+      // Captured so report() can tell a long TRAINING node (no per-step
+      // progress frames by design, #1652) from a wedge.
+      const prompt = first[2];
+      const types: Record<string, string> = {};
+      if (prompt && typeof prompt === "object" && !Array.isArray(prompt)) {
+        for (const [nodeId, def] of Object.entries(prompt as Record<string, unknown>)) {
+          const ct = (def as { class_type?: unknown } | null)?.class_type;
+          if (typeof ct === "string") types[nodeId] = ct;
+        }
+      }
+      this.state.runningNodeClassTypes = types;
     } else if (running.length === 0 && this.state.runningPromptId !== null) {
       // Empty queue → the tracked run is over. Skip the clear if a run was
       // adopted AFTER this fetch began (the response would be stale for it).
@@ -812,11 +852,26 @@ class QueueMonitorImpl {
     // also freezes ComfyUI's own HTTP handler → the /queue heartbeat lapses and
     // `serverAlive` catches it at stallMs without this floor; the floor only
     // covers the rarer non-GIL wedge (a node stuck in a network/IO wait) that
-    // keeps HTTP alive. The floor is a deliberate finite tradeoff: a healthy but
-    // progress-silent node exceeding it is re-flagged (unavoidable — "busy" and
-    // "wedged" are indistinguishable from outside past some horizon), so it is
-    // set far beyond any legitimate single-node runtime.
-    const hardStalled = running && idleFor >= Math.max(stallMs, HARD_STALL_FLOOR_MS);
+    // keeps HTTP alive.
+    //
+    // TRAINING EXEMPTION (#1652): a run whose CURRENT node is a known trainer —
+    // or, when the current node is unknown here (the reported case: attaching
+    // mid-run sees no progress_state transition, so currentNode stays null for
+    // the whole training), whose GRAPH contains one — legitimately sits silent
+    // for HOURS, so the floor must not override liveness for it: while the
+    // server keeps answering, it is not stalled. The tradeoff, stated plainly:
+    // a genuinely wedged trainer on a still-reachable server is no longer
+    // hard-flagged — but a GIL-holding deadlock freezes ComfyUI's HTTP too, and
+    // `serverAlive` catches that at stallMs regardless of node class. When the
+    // graph was never captured (poll never succeeded), nothing is exempt and
+    // the floor applies exactly as before.
+    const types = this.state.runningNodeClassTypes;
+    const currentType = this.state.currentNode !== null ? types[this.state.currentNode] : undefined;
+    const trainingRun =
+      currentType !== undefined
+        ? TRAINING_NODE_CLASS_TYPES.has(currentType)
+        : Object.values(types).some((t) => TRAINING_NODE_CLASS_TYPES.has(t));
+    const hardStalled = running && !trainingRun && idleFor >= Math.max(stallMs, HARD_STALL_FLOOR_MS);
     const stalled = running && idleFor >= stallMs && (!serverAlive || hardStalled);
     const progress =
       this.state.progressValue !== null && this.state.progressMax !== null
