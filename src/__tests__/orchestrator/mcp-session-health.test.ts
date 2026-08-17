@@ -27,6 +27,9 @@ import { describe, expect, it } from "vitest";
 import {
   degradedMcpNotice,
   inspectMcpServers,
+  reconnectableMcpStatus,
+  recoveredMcpNotice,
+  unrecoveredMcpNotice,
 } from "../../orchestrator/mcp-session-health.js";
 
 const CONFIGURED = ["comfyui", "panel"];
@@ -132,12 +135,14 @@ describe("degradedMcpNotice — states the observation, and stops", () => {
     expect(note).toContain("not reported");
   });
 
-  it("says the loss lasts the session, without promising a restart fixes it", () => {
+  it("says the loss lasts until the server connects, without promising recovery works", () => {
     // Same discipline as NO_PANEL_TOOLS_OVERRIDE: a cause that persists survives
-    // a restart, so "reconnecting restores them" is a claim this cannot make.
+    // a reconnect and a restart alike, so "recovery restores them" is a claim
+    // this cannot make. What it CAN say is what the session itself will do.
     const note = degradedMcpNotice([{ name: "panel", status: "failed" }]);
-    expect(note).toMatch(/rest of this session/);
-    expect(note).toMatch(/whether it succeeds depends on why this one did not/);
+    expect(note).toMatch(/until the server connects/);
+    expect(note).toMatch(/reconnect is attempted/);
+    expect(note).toMatch(/[Ww]hether either succeeds depends on why this one did not/);
     expect(note).not.toMatch(/will fix|will restore|restores them/);
   });
 
@@ -147,5 +152,78 @@ describe("degradedMcpNotice — states the observation, and stops", () => {
     // wearing the fix's clothes.
     const note = degradedMcpNotice([{ name: "panel", status: "failed" }]);
     expect(note).not.toMatch(/because|caused by|due to/i);
+  });
+});
+
+describe("reconnectableMcpStatus — which failures an automatic retry can speak to", () => {
+  it("retries the drop shapes", () => {
+    expect(reconnectableMcpStatus("failed")).toBe(true);
+    expect(reconnectableMcpStatus("error")).toBe(true);
+    expect(reconnectableMcpStatus("FAILED")).toBe(true);
+    // Absent from a populated report — the connection died before the server
+    // was advertised — is a drop shape too.
+    expect(reconnectableMcpStatus(null)).toBe(true);
+  });
+
+  it("does not retry what only the user or an explicit switch can change", () => {
+    // needs-auth waits on the user completing auth; disabled is a deliberate
+    // off switch. Retrying either claims effort that cannot land, or overrides
+    // intent.
+    expect(reconnectableMcpStatus("needs-auth")).toBe(false);
+    expect(reconnectableMcpStatus("disabled")).toBe(false);
+  });
+});
+
+describe("unrecoveredMcpNotice — says which dead end this is, and stops", () => {
+  it("is empty when nothing is degraded", () => {
+    expect(unrecoveredMcpNotice([], "reconnect-failed")).toBe("");
+  });
+
+  it("names the failed reconnect when one was tried", () => {
+    const note = unrecoveredMcpNotice([{ name: "panel", status: "failed" }], "reconnect-failed");
+    expect(note).toContain("panel");
+    expect(note).toMatch(/automatic reconnect did not bring it back/);
+  });
+
+  it("says when nothing was attempted, and why", () => {
+    // "We tried and failed" and "there was nothing to try" are different
+    // situations; the reader must not have to guess which one they are in.
+    const notRetriable = unrecoveredMcpNotice(
+      [{ name: "panel", status: "needs-auth" }],
+      "not-retriable",
+    );
+    expect(notRetriable).toMatch(/cannot clear this status/);
+    expect(notRetriable).not.toMatch(/did not bring/);
+    const unsupported = unrecoveredMcpNotice([{ name: "panel", status: "failed" }], "unsupported");
+    expect(unsupported).toMatch(/no reconnect to ask for/);
+    expect(unsupported).not.toMatch(/did not bring/);
+  });
+
+  it("does not promise a new session fixes it", () => {
+    const note = unrecoveredMcpNotice([{ name: "panel", status: "failed" }], "reconnect-failed");
+    expect(note).toMatch(/whether it succeeds depends on why the server is down/);
+    expect(note).not.toMatch(/will fix|will restore/i);
+  });
+});
+
+describe("recoveredMcpNotice — claims only what the status poll reported", () => {
+  it("is empty when nothing came back", () => {
+    expect(recoveredMcpNotice([], true)).toBe("");
+  });
+
+  it("credits the reconnect when the reconnect did it", () => {
+    const note = recoveredMcpNotice(["panel"], true);
+    expect(note).toContain("panel");
+    expect(note).toMatch(/reconnect brought it back/);
+    expect(note).toMatch(/available to the agent/);
+  });
+
+  it("does not take credit for a server the harness healed itself", () => {
+    // The reporter watched `comfyui` come back on the harness's own reconnect
+    // while `panel` stayed down. Claiming that recovery would be the same
+    // dishonesty as claiming the drop was diagnosed.
+    const note = recoveredMcpNotice(["comfyui"], false);
+    expect(note).toMatch(/connected again/);
+    expect(note).not.toMatch(/reconnect brought/);
   });
 });

@@ -23,7 +23,13 @@ import { logger } from "../utils/logger.js";
 import { errorText } from "./error-text.js";
 import { buildAgentSpawnEnv } from "../services/panel-secrets.js";
 import { loadTurnRegistry, saveTurnRegistry, tombstoneTurn } from "./turn-registry.js";
-import { degradedMcpNotice, inspectMcpServers } from "./mcp-session-health.js";
+import {
+  degradedMcpNotice,
+  inspectMcpServers,
+  reconnectableMcpStatus,
+  recoveredMcpNotice,
+  unrecoveredMcpNotice,
+} from "./mcp-session-health.js";
 import type { DegradedMcpServer } from "./mcp-session-health.js";
 import { randomUUID } from "node:crypto";
 import {
@@ -427,12 +433,17 @@ export class ClaudeBackend implements AgentBackend {
     };
   }
 
-  /** Configured servers still CONNECTING in this session's `init` report (#1524).
-   *  Settled once, at the first turn end, by settlePendingMcpServers(). */
-  private pendingMcpServers: string[] = [];
+  /** MCP servers this run currently knows are DOWN, name → reconnect attempted.
+   *  An episode opens when the `init` report or a turn-end status poll finds a
+   *  configured server unusable (#1524), and closes when a later poll reads it
+   *  connected again — whether our reconnect brought it back or the harness's
+   *  own supervision did. The boolean bounds retries: ONE automatic reconnect
+   *  per episode, so a server that stays down is reported once, not fought on
+   *  every turn. */
+  private mcpDown = new Map<string, boolean>();
 
   /** Say — in the log — that this session does not have servers it was given.
-   *  Shared by the init check and the deferred settle so both report identically. */
+   *  Shared by the init check and the turn-end watch so both report identically. */
   private reportDegradedMcp(
     degraded: readonly DegradedMcpServer[],
     reported: readonly { name: string; status: string }[] | undefined,
@@ -447,40 +458,140 @@ export class ClaudeBackend implements AgentBackend {
   }
 
   /**
-   * Settle the servers that were still connecting at `init` (#1524).
-   *
-   * `init` is the only MCP report the session PUSHES, and server startup does not
-   * block it — so a server that is `pending` there and FAILS a moment later would
-   * otherwise never be mentioned anywhere, which is the same silence this change
-   * exists to end, just moved a few hundred milliseconds later.
-   *
-   * Re-read once per run, at the first turn end: by then a pending server has
-   * settled, and a turn boundary needs no timer and cannot spam. A session that
-   * never takes a turn is never re-read, which is the right trade — there is no
-   * agent work to degrade.
-   *
-   * Best-effort by construction: `mcpServerStatus()` is an optional Query method
-   * (a harness that lacks it, or a poll that throws, leaves the pending servers
-   * unmentioned rather than guessed at).
+   * One best-effort read of the harness's MCP server statuses. `undefined`
+   * means "nothing learned" — a harness without the method, a poll that
+   * throws, or an empty report all land here, and all three must leave the
+   * session exactly as informed as before: silent, never guessed at.
    */
-  private async settlePendingMcpServers(): Promise<AgentEvent | null> {
-    const names = this.pendingMcpServers;
-    if (names.length === 0) return null;
-    // Taking the names IS the once-only guard: the next turn end finds the list
-    // empty and returns before the poll. A re-read on every turn would spend a
-    // control round-trip per turn for a question that is already answered.
-    this.pendingMcpServers = [];
-    let reported: Array<{ name: string; status: string }> | undefined;
+  private async pollMcpStatus(q: Query): Promise<Array<{ name: string; status: string }> | undefined> {
     try {
-      reported = await this.q?.mcpServerStatus?.();
+      const reported = await q.mcpServerStatus?.();
+      return Array.isArray(reported) && reported.length > 0 ? reported : undefined;
     } catch (err) {
       logger.debug(`[claude-backend] mcpServerStatus: ${msgOf(err)}`);
-      return null;
+      return undefined;
     }
-    const { degraded } = inspectMcpServers(names, reported);
-    if (!degraded.length) return null;
-    this.reportDegradedMcp(degraded, reported, this.registrySessionId ?? "", "is running");
-    return { type: "error", sessionNotice: true, message: degradedMcpNotice(degraded) };
+  }
+
+  /**
+   * Watch the toolset for a MID-SESSION drop, and try to bring it back (#1524).
+   *
+   * The reporter's session came up healthy and lost all 92 panel_* tools hours
+   * in: the harness's own reconnect brought `comfyui` back and never retried
+   * the in-process panel server — and since `init` is the only MCP report a
+   * session PUSHES, nothing host-side ever learned of it. There is no
+   * mid-session push to listen for (the SDK's message vocabulary has none), so
+   * the only detection is to ASK: one `mcpServerStatus()` poll per turn end —
+   * turn-driven, so it needs no timer and cannot spam — read against the set
+   * this session was actually given.
+   *
+   * Recovery is the SDK's own verb, `reconnectMcpServer()` ("reconnects a
+   * disconnected or failed MCP server"), bounded to ONE attempt per
+   * down-episode. The attempt is never claimed to have worked on the strength
+   * of the call alone: the status is re-read once and the re-read is what the
+   * notice quotes. `needs-auth` and `disabled` are reported but not retried —
+   * the first waits on the user, the second is a deliberate off switch.
+   *
+   * Best-effort throughout: a harness without these control methods, or a poll
+   * that throws, leaves the session as informed as it was before this existed
+   * — silent — and never takes the turn stream down with it.
+   */
+  private async checkMcpServers(q: Query): Promise<AgentEvent[]> {
+    const names = Object.keys(this.mcpServersForRun() ?? {});
+    if (names.length === 0) return [];
+    let reported = await this.pollMcpStatus(q);
+    if (!reported) return [];
+    const events: AgentEvent[] = [];
+
+    // Attempt the one reconnect each down server is owed BEFORE reporting, so a
+    // drop the reconnect fixes right away is narrated once and accurately,
+    // instead of "gone" followed by "back". Servers just found down (no open
+    // episode) and episodes opened at init (attempt owed to this turn boundary)
+    // are both due; an episode already retried is not.
+    const triable = inspectMcpServers(names, reported).degraded.filter(
+      (d) => this.mcpDown.get(d.name) !== true && reconnectableMcpStatus(d.status),
+    );
+    const attempted = new Set<string>();
+    if (typeof q.reconnectMcpServer === "function") {
+      for (const d of triable) {
+        attempted.add(d.name);
+        this.mcpDown.set(d.name, true); // the attempt is spent, whatever it returns
+        try {
+          await q.reconnectMcpServer(d.name);
+        } catch (err) {
+          logger.debug(`[claude-backend] reconnectMcpServer(${d.name}): ${msgOf(err)}`);
+        }
+      }
+      if (attempted.size > 0) {
+        // The verdict on the attempts: re-read once. A failed re-read keeps the
+        // pre-attempt reading — the servers stay "down" — the safe direction.
+        const after = await this.pollMcpStatus(q);
+        if (after) reported = after;
+      }
+    }
+
+    const degraded = inspectMcpServers(names, reported).degraded;
+    const downNow = new Set(degraded.map((d) => d.name));
+
+    // Episodes that CLOSED: the server reads connected again. An episode our
+    // own attempt just closed says so; one the harness healed on its own
+    // (the reporter watched `comfyui` do exactly this) is reported as what it
+    // is — it came back, and we did not do it.
+    const backByUs: string[] = [];
+    const backOnItsOwn: string[] = [];
+    for (const name of [...this.mcpDown.keys()]) {
+      if (downNow.has(name)) continue;
+      this.mcpDown.delete(name);
+      (attempted.has(name) ? backByUs : backOnItsOwn).push(name);
+    }
+    if (backByUs.length) {
+      logger.info(`[claude-backend] MCP reconnect brought back: ${backByUs.join(", ")}`);
+      events.push({ type: "error", sessionNotice: true, message: recoveredMcpNotice(backByUs, true) });
+    }
+    if (backOnItsOwn.length) {
+      logger.info(`[claude-backend] MCP servers connected again on their own: ${backOnItsOwn.join(", ")}`);
+      events.push({ type: "error", sessionNotice: true, message: recoveredMcpNotice(backOnItsOwn, false) });
+    }
+
+    // Episodes still OPEN that have not been reported yet: a fresh drop whose
+    // reconnect just failed, an init-time episode whose owed attempt failed
+    // (the init notice promised the outcome), and drops there is no attempt
+    // for. One line per server per episode — a server that stays down is not
+    // re-narrated on every turn.
+    const unreported = degraded.filter((d) => attempted.has(d.name) || !this.mcpDown.has(d.name));
+    const failedAttempt = unreported.filter((d) => attempted.has(d.name));
+    const notRetriable = unreported.filter(
+      (d) => !attempted.has(d.name) && !reconnectableMcpStatus(d.status),
+    );
+    const unsupported = unreported.filter(
+      (d) => !attempted.has(d.name) && reconnectableMcpStatus(d.status),
+    );
+    for (const d of unreported) this.mcpDown.set(d.name, true);
+    if (failedAttempt.length) {
+      this.reportDegradedMcp(failedAttempt, reported, this.registrySessionId ?? "", "lost");
+      events.push({
+        type: "error",
+        sessionNotice: true,
+        message: unrecoveredMcpNotice(failedAttempt, "reconnect-failed"),
+      });
+    }
+    if (notRetriable.length) {
+      this.reportDegradedMcp(notRetriable, reported, this.registrySessionId ?? "", "lost");
+      events.push({
+        type: "error",
+        sessionNotice: true,
+        message: unrecoveredMcpNotice(notRetriable, "not-retriable"),
+      });
+    }
+    if (unsupported.length) {
+      this.reportDegradedMcp(unsupported, reported, this.registrySessionId ?? "", "lost");
+      events.push({
+        type: "error",
+        sessionNotice: true,
+        message: unrecoveredMcpNotice(unsupported, "unsupported"),
+      });
+    }
+    return events;
   }
 
   /**
@@ -592,9 +703,9 @@ export class ClaudeBackend implements AgentBackend {
     this.lastResultTurnId = this.turnSeq;
     this.classificationPoisoned = false;
     // #1524 — MCP health is per SESSION. A restart re-runs every connection, so
-    // the previous run's pending set and its "already settled" mark must not
-    // suppress the new session's report.
-    this.pendingMcpServers = [];
+    // the previous run's down-episodes and their "already retried" marks must
+    // not suppress the new session's report or its one reconnect attempt.
+    this.mcpDown.clear();
     this.parkedInterrupted.clear(); // dead session's parks die with it
     this.consumedInterrupted.clear(); // …and its landing history
     this.markerBase = this.lastResultTurnId; // turn markers are run-relative (#728)
@@ -670,13 +781,13 @@ export class ClaudeBackend implements AgentBackend {
         }
         yield streamTurn === undefined ? ev : { ...ev, turn: streamTurn - this.markerBase };
       }
-      // #1524 — settle whatever was still CONNECTING at init, once, at the first
-      // turn end. Placed here rather than in route() because it has to await a
-      // control request, and after the turn's own events so a session notice
-      // never interleaves into the middle of a reply.
+      // #1524 — watch the toolset at every turn end: poll the servers this
+      // session was given, attempt the one reconnect each down server is owed,
+      // and narrate the outcome. Placed here rather than in route() because it
+      // has to await control requests, and after the turn's own events so a
+      // session notice never interleaves into the middle of a reply.
       if (message.type === "result") {
-        const settled = await this.settlePendingMcpServers();
-        if (settled) yield settled;
+        for (const ev of await this.checkMcpServers(q)) yield ev;
       }
     }
   }
@@ -854,11 +965,15 @@ export class ClaudeBackend implements AgentBackend {
           );
           // A server still CONNECTING at init is not a failure — server startup
           // does not block the session, so a slow one is legitimately `pending`
-          // here and connected a moment later. It is not "fine" either: `init` is
-          // the only report the session PUSHES, so a pending server that goes on
-          // to fail would never be mentioned. Remember the names and settle them
-          // at the first turn end (see settlePendingMcpServers).
-          this.pendingMcpServers = health.pending;
+          // here and connected a moment later. It needs no tracking of its own:
+          // the turn-end watch (checkMcpServers) reads every configured server
+          // at each turn boundary, so a pending server that goes on to FAIL
+          // surfaces there as a fresh drop, and one that connects simply never
+          // opens an episode.
+          //
+          // A server already DOWN at init opens its episode now — reported
+          // below, with the reconnect it is owed landing at the first turn end.
+          for (const d of health.degraded) this.mcpDown.set(d.name, false);
           if (health.degraded.length) {
             this.reportDegradedMcp(health.degraded, message.mcp_servers, message.session_id);
             yield { type: "error", sessionNotice: true, message: degradedMcpNotice(health.degraded) };
