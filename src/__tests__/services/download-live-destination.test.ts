@@ -593,10 +593,13 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
   });
 
   it("still says MOVE IT when the file is outside the live models root", async () => {
-    const stray = resolve("/somewhere/else/new.safetensors");
-    realpathMock.mockImplementation(async () => stray);
+    // The write path itself is outside the live root (no junction involved), so
+    // membership cannot vouch for it and the remedy stays "move it". (A write
+    // path INSIDE the root whose realpath escapes is the junction case — covered
+    // below — and takes the refresh remedy by design.)
+    const strayTarget = resolve("/somewhere/else/new.safetensors");
     h.liveListings["loras"] = ["something-else.safetensors"];
-    const res = await verifyLandedModel(target, "loras", { attempts: 2, retryMs: 0 });
+    const res = await verifyLandedModel(strayTarget, "loras", { attempts: 2, retryMs: 0 });
     expect(res.liveVisible).toBe("not-visible");
     expect(res.note).toMatch(/does NOT list "new\.safetensors"/);
     expect(res.note).toMatch(/will not be usable/);
@@ -975,5 +978,66 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     expect(res.verifiedPath).toBe(dTarget);
     expect(res.note).toMatch(/never lists individual files/);
     expect(res.note).not.toMatch(/does NOT list/);
+  });
+
+  it("reports UNKNOWN — never a false not-visible — for a .gguf the core listing contractually omits (#369, 0.51.56)", async () => {
+    // Core /models/diffusion_models enumerates only supported_pt_extensions — no
+    // .gguf (those surface via ComfyUI-GGUF's *_gguf views, #526). A correctly
+    // placed GGUF therefore NEVER appears in this listing, and reading that
+    // contractual absence as "the server does NOT list it" is the 0.51.56 report:
+    // WARNING: NOT VISIBLE plus a "move the file" remedy for a file that was
+    // already where the server reads.
+    const gTarget = resolve("/live/ComfyUI/models/diffusion_models/new.gguf");
+    h.modelsDirSource = "live-root";
+    h.destModelsDir = "/live/ComfyUI/models";
+    h.liveListings["diffusion_models"] = ["other.safetensors"]; // answered; the .gguf is absent BY CONTRACT
+    const res = await verifyLandedModel(gTarget, "diffusion_models", { attempts: 2, retryMs: 0 });
+    expect(res.liveVisible).toBe("unknown");
+    expect(res.verifiedPath).toBe(gTarget);
+    expect(res.note).toMatch(/contractual/);
+    expect(res.note).toMatch(/list_local_models/);
+    expect(res.note).not.toMatch(/does NOT list/);
+    expect(res.note).not.toMatch(/Move the file/);
+  });
+
+  it("still confirms a .gguf the server DOES list (a node re-registered the core category to admit it)", async () => {
+    // Only the MISS is contractual. A custom node can re-register a core category
+    // to admit .gguf, and then the listing names the file — that confirmation
+    // must survive the extension gate.
+    const gTarget = resolve("/live/ComfyUI/models/diffusion_models/new.gguf");
+    h.modelsDirSource = "live-root";
+    h.destModelsDir = "/live/ComfyUI/models";
+    h.liveListings["diffusion_models"] = ["new.gguf"];
+    const res = await verifyLandedModel(gTarget, "diffusion_models", { attempts: 1, retryMs: 0 });
+    expect(res.liveVisible).toBe("visible");
+  });
+
+  it("prescribes REFRESH, not a move, when a junctioned destination realpaths outside the live root (#369/#870)", async () => {
+    // StabilityMatrix: models/vae is a junction to the shared store, so the LEXICAL
+    // write path is inside the live root while the REALPATH'd verified path is not.
+    // The not-visible remedy must follow the membership answer (lexical and
+    // canonical), not a comparison of the realpath against the lexical root —
+    // that comparison names a directory the file is already reachable from and
+    // tells the user to move it, which is the 0.51.56 report's remedy half.
+    const smTarget = resolve("/comfy/models/vae/new.safetensors");
+    const real = resolve("/E/StabilityMatrix/models/VAE/new.safetensors");
+    realpathMock.mockImplementation(async (p: string) => {
+      const s = String(p);
+      if (s === smTarget) return real;
+      if (resolve(s) === resolve("/comfy/models/vae")) {
+        return resolve("/E/StabilityMatrix/models/VAE");
+      }
+      return resolve(s);
+    });
+    h.modelsDirSource = "live-root";
+    h.destModelsDir = "/comfy/models";
+    h.liveExtraRoots = { authoritative: true, roots: [] };
+    h.liveListings["vae"] = ["something-else.safetensors"]; // answered; ours not yet listed
+    const res = await verifyLandedModel(smTarget, "vae", { attempts: 1, retryMs: 0 });
+    expect(res.liveVisible).toBe("not-visible");
+    expect(res.verifiedPath).toBe(real);
+    expect(res.note).toMatch(/Do NOT move the file/);
+    expect(res.note).toMatch(/junction/);
+    expect(res.note).not.toMatch(/Move the file into the running server's models tree/);
   });
 });
