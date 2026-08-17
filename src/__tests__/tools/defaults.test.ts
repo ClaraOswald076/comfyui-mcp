@@ -139,6 +139,18 @@ describe("get_defaults registration", () => {
     expect(description).toMatch(/action:"set_ui"[\s\S]*NOT our generation defaults/);
   });
 
+  // Regression for #1638: the description listed `Comfy.PreviewMethod`, an id no
+  // frontend code has ever read — the real live-preview setting lives under
+  // Comfy.Execution.* (verified against comfyui_frontend coreSettings.ts, where
+  // it is a combo of default|none|auto|latent2rgb|taesd since frontend 1.36.0).
+  it("the description names real frontend setting ids, not the dead Comfy.PreviewMethod", () => {
+    const server = { tool: vi.fn() };
+    registerDefaultsTools(server as never);
+    const description = server.tool.mock.calls[0][1] as string;
+    expect(description).toContain("Comfy.Execution.PreviewMethod");
+    expect(description).not.toContain("Comfy.PreviewMethod");
+  });
+
   it("an unknown action returns a clear error result", async () => {
     const res = await handler()({ action: "bogus" });
     expect(res.isError).toBe(true);
@@ -198,7 +210,7 @@ describe("the ComfyUI UI-settings actions (COMFYUI's store)", () => {
 
   it('action:"get_ui" without an id lists all stored settings, sorted and filtered', async () => {
     mocks.getSettings.mockResolvedValueOnce({
-      "Comfy.PreviewMethod": "auto",
+      "Comfy.Execution.PreviewMethod": "auto",
       "Comfy.UseNewMenu": "Top",
       "Comfy.LinkRenderMode": 2,
     });
@@ -206,7 +218,7 @@ describe("the ComfyUI UI-settings actions (COMFYUI's store)", () => {
     expect(mocks.getSettings).toHaveBeenCalled();
     const payload = JSON.parse(text(res));
     expect(payload.count).toBe(1);
-    expect(payload.settings).toEqual({ "Comfy.PreviewMethod": "auto" });
+    expect(payload.settings).toEqual({ "Comfy.Execution.PreviewMethod": "auto" });
     expect(payload.note).toMatch(/unset ids use frontend defaults/);
   });
 
@@ -272,8 +284,8 @@ describe("the two stores stay separate", () => {
 
   it('action:"set_ui" writes COMFYUI\'s settings and never touches our defaults', async () => {
     mocks.getSetting.mockResolvedValueOnce(undefined);
-    await handler()({ action: "set_ui", id: "Comfy.PreviewMethod", value: "taesd" });
-    expect(mocks.setSetting).toHaveBeenCalledWith("Comfy.PreviewMethod", "taesd");
+    await handler()({ action: "set_ui", id: "Comfy.Execution.PreviewMethod", value: "taesd" });
+    expect(mocks.setSetting).toHaveBeenCalledWith("Comfy.Execution.PreviewMethod", "taesd");
     for (const mock of ourStoreWrites()) expect(mock).not.toHaveBeenCalled();
   });
 
