@@ -2299,6 +2299,9 @@ export function buildComfyuiMcpEnv(base: Record<string, string>): Record<string,
     ...(process.env.COMFYUI_MCP_TOOL_DENY
       ? { COMFYUI_MCP_TOOL_DENY: process.env.COMFYUI_MCP_TOOL_DENY }
       : {}),
+    ...(process.env.COMFYUI_MCP_TOOL_ACTION_ALLOW !== undefined
+      ? { COMFYUI_MCP_TOOL_ACTION_ALLOW: process.env.COMFYUI_MCP_TOOL_ACTION_ALLOW }
+      : {}),
     // KEY NAMES only — never values.
     ...(managed.length ? { [MANAGED_SECRET_KEYS_ENV]: managed.join(",") } : {}),
     ...secrets,
