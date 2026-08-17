@@ -12336,7 +12336,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
     def(
       "panel_search_nodes",
       "Search installable custom-node packs via the user's BUILT-IN ComfyUI Manager (the same source the Manager UI uses). Returns matching packs {id, title, description}. Use the `id` with panel_install_node. Prefer this over the headless search_custom_nodes tool — it works against the user's actual (Desktop) Manager.",
-      { query: z.string().describe("Search text, e.g. 'kjnodes', 'controlnet', 'ipadapter'."), limit: z.number().int().min(1).max(40).optional() },
+      { query: z.string().describe("Search text, e.g. 'kjnodes', 'controlnet', 'ipadapter'."), limit: z.number().int().min(1).max(40).optional().describe("Max results to return, 1-40 (default 15). Requests above 40 are refused; the panel also clamps to 40 and discloses limit_cap.") },
       async (args: A, ctx) => ctx.call({ cmd: "nodes_search", query: args.query, limit: args.limit }, 20000),
     ),
     def(
