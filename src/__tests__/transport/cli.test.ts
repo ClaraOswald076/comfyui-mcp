@@ -27,6 +27,7 @@ describe("parseCliArgs", () => {
       insecureBridge: false,
       setupAgent: undefined,
       setupDryRun: false,
+      launcherAction: undefined,
     });
   });
 
@@ -40,17 +41,17 @@ describe("parseCliArgs", () => {
 
   it("supports --port value and --host value", () => {
     const o = parseCliArgs([...base, "--http", "--host", "0.0.0.0", "--port", "8080"], {});
-    expect(o).toEqual({ help: false, transport: "http", toolMode: "full", toolModeExplicit: false, host: "0.0.0.0", port: 8080, panelOrchestrator: false, token: undefined, tunnel: false, allowUnauthenticated: false, insecureBridge: false, setupAgent: undefined, setupDryRun: false });
+    expect(o).toEqual({ help: false, transport: "http", toolMode: "full", toolModeExplicit: false, host: "0.0.0.0", port: 8080, panelOrchestrator: false, token: undefined, tunnel: false, allowUnauthenticated: false, insecureBridge: false, setupAgent: undefined, setupDryRun: false, launcherAction: undefined });
   });
 
   it("supports --flag=value form", () => {
     const o = parseCliArgs([...base, "--transport=http", "--port=3000", "--host=0.0.0.0"], {});
-    expect(o).toEqual({ help: false, transport: "http", toolMode: "full", toolModeExplicit: false, host: "0.0.0.0", port: 3000, panelOrchestrator: false, token: undefined, tunnel: false, allowUnauthenticated: false, insecureBridge: false, setupAgent: undefined, setupDryRun: false });
+    expect(o).toEqual({ help: false, transport: "http", toolMode: "full", toolModeExplicit: false, host: "0.0.0.0", port: 3000, panelOrchestrator: false, token: undefined, tunnel: false, allowUnauthenticated: false, insecureBridge: false, setupAgent: undefined, setupDryRun: false, launcherAction: undefined });
   });
 
   it("reads env defaults", () => {
     const o = parseCliArgs(base, { MCP_TRANSPORT: "http", MCP_HOST: "0.0.0.0", MCP_PORT: "5000" });
-    expect(o).toEqual({ help: false, transport: "http", toolMode: "full", toolModeExplicit: false, host: "0.0.0.0", port: 5000, panelOrchestrator: false, token: undefined, tunnel: false, allowUnauthenticated: false, insecureBridge: false, setupAgent: undefined, setupDryRun: false });
+    expect(o).toEqual({ help: false, transport: "http", toolMode: "full", toolModeExplicit: false, host: "0.0.0.0", port: 5000, panelOrchestrator: false, token: undefined, tunnel: false, allowUnauthenticated: false, insecureBridge: false, setupAgent: undefined, setupDryRun: false, launcherAction: undefined });
   });
 
   it("FULL is the default tool mode since 0.50.0; --compact / COMFYUI_MCP_TOOL_MODE=compact opts in (#726)", () => {
@@ -104,6 +105,16 @@ describe("parseCliArgs", () => {
     // `setup` with no agent yields empty string so index.ts can print usage
     expect(parseCliArgs([...base, "setup"], {}).setupAgent).toBe("");
     expect(parseCliArgs([...base, "setup", "--dry-run"], {}).setupAgent).toBe("");
+  });
+
+  it("parses launcher management without selecting a server transport", () => {
+    for (const action of ["install", "status", "uninstall", "run"] as const) {
+      const parsed = parseCliArgs([...base, "launcher", action], {});
+      expect(parsed.launcherAction).toBe(action);
+      expect(parsed.panelOrchestrator).toBe(false);
+    }
+    expect(parseCliArgs([...base, "launcher"], {}).launcherAction).toBe("");
+    expect(parseCliArgs([...base, "launcher", "bogus"], {}).launcherAction).toBe("");
   });
 
   it("--insecure-bridge sets insecureBridge=true; COMFYUI_MCP_INSECURE_BRIDGE env works too", () => {
@@ -352,6 +363,10 @@ describe("--help (#860)", () => {
     const help = renderCliHelp();
     expect(help).toContain("--lang <code>");
     expect(help).toContain("env: COMFYUI_MCP_LANG");
+  });
+
+  it("documents launcher setup", () => {
+    expect(renderCliHelp()).toContain("launcher <install|status|uninstall>");
   });
 });
 

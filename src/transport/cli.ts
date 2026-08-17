@@ -4,6 +4,7 @@ import { padTo } from "../i18n/terminal-layout.js";
 
 export type TransportMode = "stdio" | "http";
 export type ToolMode = "full" | "compact";
+export type LauncherAction = "install" | "uninstall" | "status" | "run";
 
 export interface CliOptions {
   /** --help / -h: print usage and exit WITHOUT starting a server. There was no
@@ -57,6 +58,10 @@ export interface CliOptions {
   setupAgent?: string;
   /** --dry-run (setup only): print the merged config instead of writing it. */
   setupDryRun: boolean;
+  /** `launcher <action>` manages the explicitly-installed, per-user companion
+   *  that can open the panel orchestrator from a native terminal. `run` is the
+   *  login-service entrypoint written by `launcher install`. */
+  launcherAction?: LauncherAction | "";
   /** Whether --compact/--tool-mode was passed explicitly (vs defaulted): lets
    *  `setup` distinguish "user chose a mode" from "use the per-agent default". */
   toolModeExplicit: boolean;
@@ -105,6 +110,7 @@ export function parseCliArgs(
   let comfyuiUrl: string | undefined;
   let setupAgent: string | undefined;
   let setupDryRun = false;
+  let launcherAction: LauncherAction | "" | undefined;
   let toolModeExplicit =
     env.COMFYUI_MCP_TOOL_MODE === "compact" || env.COMFYUI_MCP_TOOL_MODE === "full";
 
@@ -115,7 +121,17 @@ export function parseCliArgs(
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === "connect") {
+    if (a === "launcher") {
+      const next = args[i + 1];
+      if (next && !next.startsWith("-")) {
+        launcherAction = ["install", "uninstall", "status", "run"].includes(next)
+          ? (next as LauncherAction)
+          : "";
+        i += 1;
+      } else {
+        launcherAction = "";
+      }
+    } else if (a === "connect") {
       // `comfyui-mcp connect <comfyui-url>` — one-command local connect: run the
       // panel orchestrator (subscription auth, no API key) and point it at the
       // given ComfyUI via COMFYUI_URL. The URL is the next positional token (a
@@ -221,6 +237,7 @@ export function parseCliArgs(
     insecureBridge,
     setupAgent,
     setupDryRun,
+    launcherAction,
   };
 }
 
@@ -346,6 +363,10 @@ export function renderCliHelp(): string {
     ),
     helpRow("comfyui-mcp setup <hermes|openclaw|copilot> [--compact|--full] [--comfyui-url <url>] [--dry-run]", ""),
     helpRow("", tr("cli.help_usage_setup", "write the comfyui entry into that harness's config, then exit")),
+    helpRow(
+      "comfyui-mcp launcher <install|status|uninstall>",
+      tr("cli.help_usage_launcher", "manage the panel autostart companion"),
+    ),
     "",
     tr("cli.help_section_tool_surface", "TOOL SURFACE"),
     helpRow(
