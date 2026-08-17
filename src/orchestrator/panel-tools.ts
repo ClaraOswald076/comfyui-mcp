@@ -708,6 +708,7 @@ export const __panelToolsTestHooks = {
           reason?: string;
           observedArgv?: string[];
           isDesktopApp?: boolean;
+          note?: string;
         }>)
       | null,
   ): void {
@@ -1980,6 +1981,7 @@ let localRestartPreflightOverride:
       reason?: string;
       observedArgv?: string[];
       isDesktopApp?: boolean;
+      note?: string;
     }>)
   | null = null;
 
@@ -12725,6 +12727,10 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // the no-await invariant between the binding capture and the reboot stands.
         let preflightArgv: string[] | undefined;
         let preflightIsDesktop = false;
+        // #1647: set when the preflight passed on INFERRED Desktop supervision (the
+        // process tree was unreadable, so the launch signatures stood in). Appended
+        // to the outcome note below — a dispatch allowed on an inference says so.
+        let preflightNote: string | undefined;
         // The target generation as of BEFORE the preflight resolved that argv, so the
         // whole span up to the post-restart reading sits inside one instance fence.
         let preflightArgvGeneration = -1;
@@ -12797,6 +12803,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           // exactly the fence this reading needs.
           preflightArgv = preflight.observedArgv;
           preflightIsDesktop = preflight.isDesktopApp === true;
+          preflightNote = preflight.note;
           preflightArgvGeneration = preflightTargetGeneration;
           // r8/r9/r10: the preflight AWAIT makes the pre-decision captures
           // STALE — and the preflight itself reads MUTABLE config (target URL,
@@ -13381,7 +13388,8 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
               "There is no local boot endpoint I can safely probe from here, so I can't " +
               "confirm it finished coming back — a panel reconnect wouldn't prove this " +
               'instance actually cycled. Check get_system_stats (action:"health") / panel_node_queue_status in a ' +
-              "few seconds to confirm it's back.",
+              "few seconds to confirm it's back." +
+              (preflightNote ? ` ${preflightNote}` : ""),
           });
         }
         // The concurrent observer has been probing since dispatch (catching a fast down→up
@@ -13407,9 +13415,11 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
             recovered_ms: recovery.waited_ms,
             probes: recovery.attempts,
             saw_down: recovery.sawDown,
-            note: recovery.sawDown
-              ? `Reboot was dispatched and ComfyUI went down, but it has not become healthy within ${waited}s — it may still be starting or the restart failed. Verify with get_system_stats (action:"health") / panel_node_queue_status before retrying; do NOT assume it is back.`
-              : `The reboot command was sent but I could NOT confirm ComfyUI actually cycled within ${waited}s (it never went down — the panel may have merely disconnected/inferred a reboot without one). Verify with get_system_stats (action:"health") / panel_node_queue_status; do NOT assume it restarted.`,
+            note:
+              (recovery.sawDown
+                ? `Reboot was dispatched and ComfyUI went down, but it has not become healthy within ${waited}s — it may still be starting or the restart failed. Verify with get_system_stats (action:"health") / panel_node_queue_status before retrying; do NOT assume it is back.`
+                : `The reboot command was sent but I could NOT confirm ComfyUI actually cycled within ${waited}s (it never went down — the panel may have merely disconnected/inferred a reboot without one). Verify with get_system_stats (action:"health") / panel_node_queue_status; do NOT assume it restarted.`) +
+              (preflightNote ? ` ${preflightNote}` : ""),
           });
         }
         // #400/#709: ComfyUI is healthy, but the panel's browser tab re-registers its own
@@ -13523,7 +13533,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
                 : "; ComfyUI is back but the panel tab has NOT reconnected yet (ready:false) — " +
                   'wait a moment then retry, or rebind with panel_set_workflow_target({mode:"current"}) ' +
                   "before issuing graph tools.") +
-            ".") + argvNote,
+            ".") + argvNote + (preflightNote ? ` ${preflightNote}` : ""),
         });
       },
     ),
