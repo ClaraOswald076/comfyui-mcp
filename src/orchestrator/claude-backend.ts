@@ -431,6 +431,16 @@ export class ClaudeBackend implements AgentBackend {
    *  Settled once, at the first turn end, by settlePendingMcpServers(). */
   private pendingMcpServers: string[] = [];
 
+  /** Configured servers the `init` report showed as DOWN (#1524), carried out of
+   *  route() — a sync generator that cannot await the reconnect control request —
+   *  so run() can attempt recovery BEFORE the loss is announced (#1228).
+   *  null = nothing was down at init (or it was already handled). */
+  private initMcpDegraded: {
+    degraded: DegradedMcpServer[];
+    reported: readonly { name: string; status: string }[] | undefined;
+    sessionId: string;
+  } | null = null;
+
   /** Say — in the log — that this session does not have servers it was given.
    *  Shared by the init check and the deferred settle so both report identically. */
   private reportDegradedMcp(
@@ -444,6 +454,91 @@ export class ClaudeBackend implements AgentBackend {
         `${degraded.map((d) => `${d.name}=${d.status ?? "absent"}`).join(" ")} ` +
         `(reported: ${(reported ?? []).map((s) => `${s.name}=${s.status}`).join(" ") || "none"})`,
     );
+  }
+
+  /**
+   * One bounded recovery attempt per down server (#1228): ask the harness to
+   * reconnect each (`reconnectMcpServer`), then re-read the status report and
+   * return only the servers that are STILL down. The respawn this issue reports
+   * reconnected the comfyui stdio child but never re-registered the in-process
+   * panel server — an explicit reconnect is the one remedy short of a full new
+   * session, and trying it before speaking turns "your tools are gone" from a
+   * guess at init time into a verified fact.
+   *
+   * `verified` is false when the outcome could not be READ (a harness without
+   * the control method, or a status poll that threw): the caller still reports
+   * the servers as down — clearing a degradation nobody checked is the false
+   * success this change exists to prevent — but without the "reconnect did not
+   * help" sentence, which would itself be an unverified claim.
+   *
+   * A server that went back to CONNECTING after the reconnect is neither
+   * declared down nor cleared: with `rearmPending` it is handed to the
+   * first-turn-end settle, which re-reads it once (the init path). The settle
+   * path passes false — it IS that re-read, and re-arming there would retry a
+   * flapping server on every turn end.
+   */
+  private async attemptMcpReconnect(
+    degraded: readonly DegradedMcpServer[],
+    rearmPending: boolean,
+  ): Promise<{ stillDown: DegradedMcpServer[]; verified: boolean }> {
+    if (degraded.length === 0) return { stillDown: [], verified: true };
+    const q = this.q as (Query & { reconnectMcpServer?: (name: string) => Promise<void> }) | null;
+    if (typeof q?.reconnectMcpServer !== "function") {
+      return { stillDown: [...degraded], verified: false };
+    }
+    for (const d of degraded) {
+      try {
+        await q.reconnectMcpServer(d.name);
+      } catch (err) {
+        logger.warn(`[claude-backend] reconnectMcpServer(${d.name}) failed: ${msgOf(err)}`);
+      }
+    }
+    let after: Array<{ name: string; status: string }> | undefined;
+    try {
+      after = await q.mcpServerStatus?.();
+    } catch (err) {
+      logger.debug(`[claude-backend] mcpServerStatus after reconnect: ${msgOf(err)}`);
+    }
+    if (!after) return { stillDown: [...degraded], verified: false };
+    const check = inspectMcpServers(
+      degraded.map((d) => d.name),
+      after,
+    );
+    const recovered = degraded.filter(
+      (d) => !check.degraded.some((s) => s.name === d.name) && !check.pending.includes(d.name),
+    );
+    if (recovered.length) {
+      logger.info(
+        `[claude-backend] reconnect recovered MCP server(s): ${recovered.map((d) => d.name).join(", ")}`,
+      );
+    }
+    if (rearmPending) {
+      for (const name of check.pending) {
+        if (!this.pendingMcpServers.includes(name)) this.pendingMcpServers.push(name);
+      }
+    }
+    return { stillDown: check.degraded, verified: true };
+  }
+
+  /**
+   * Recover-or-report for the servers the `init` report showed as down (#1228),
+   * run once per session right after init. Only what is still down after one
+   * reconnect attempt earns the notice; a server the reconnect brought back is
+   * logged and stays silent — the tool surface is intact, so there is nothing
+   * to degrade, and the harness's own reconnected notice already says so.
+   */
+  private async settleInitMcpServers(): Promise<AgentEvent | null> {
+    const pending = this.initMcpDegraded;
+    if (!pending) return null;
+    this.initMcpDegraded = null;
+    const { stillDown, verified } = await this.attemptMcpReconnect(pending.degraded, true);
+    if (!stillDown.length) return null;
+    this.reportDegradedMcp(stillDown, pending.reported, pending.sessionId);
+    return {
+      type: "error",
+      sessionNotice: true,
+      message: degradedMcpNotice(stillDown, { reconnectAttempted: verified }),
+    };
   }
 
   /**
@@ -479,8 +574,16 @@ export class ClaudeBackend implements AgentBackend {
     }
     const { degraded } = inspectMcpServers(names, reported);
     if (!degraded.length) return null;
-    this.reportDegradedMcp(degraded, reported, this.registrySessionId ?? "", "is running");
-    return { type: "error", sessionNotice: true, message: degradedMcpNotice(degraded) };
+    // #1228 — one reconnect attempt before the loss is announced, same as the
+    // init path; only a server that is STILL down afterwards is reported.
+    const { stillDown, verified } = await this.attemptMcpReconnect(degraded, false);
+    if (!stillDown.length) return null;
+    this.reportDegradedMcp(stillDown, reported, this.registrySessionId ?? "", "is running");
+    return {
+      type: "error",
+      sessionNotice: true,
+      message: degradedMcpNotice(stillDown, { reconnectAttempted: verified }),
+    };
   }
 
   /**
@@ -595,6 +698,7 @@ export class ClaudeBackend implements AgentBackend {
     // the previous run's pending set and its "already settled" mark must not
     // suppress the new session's report.
     this.pendingMcpServers = [];
+    this.initMcpDegraded = null;
     this.parkedInterrupted.clear(); // dead session's parks die with it
     this.consumedInterrupted.clear(); // …and its landing history
     this.markerBase = this.lastResultTurnId; // turn markers are run-relative (#728)
@@ -669,6 +773,14 @@ export class ClaudeBackend implements AgentBackend {
           continue;
         }
         yield streamTurn === undefined ? ev : { ...ev, turn: streamTurn - this.markerBase };
+      }
+      // #1228 — init's down-servers get ONE reconnect attempt before any notice
+      // goes out (route() carried them into initMcpDegraded; it cannot await the
+      // control round-trip itself). Placed after init's own events so the
+      // session id lands first, ahead of any notice.
+      if (message.type === "system" && (message as { subtype?: string }).subtype === "init") {
+        const initNotice = await this.settleInitMcpServers();
+        if (initNotice) yield initNotice;
       }
       // #1524 — settle whatever was still CONNECTING at init, once, at the first
       // turn end. Placed here rather than in route() because it has to await a
@@ -859,9 +971,19 @@ export class ClaudeBackend implements AgentBackend {
           // to fail would never be mentioned. Remember the names and settle them
           // at the first turn end (see settlePendingMcpServers).
           this.pendingMcpServers = health.pending;
+          // #1228 — a down server gets ONE reconnect attempt before the loss is
+          // announced (the respawn this issue reports reconnected `comfyui` but
+          // never re-registered `panel`; an explicit reconnect is the remedy
+          // short of a new session). The attempt awaits a control round-trip this
+          // sync generator cannot make, so the degraded set is carried out to
+          // run()'s loop (settleInitMcpServers), which announces only what is
+          // still down afterwards.
           if (health.degraded.length) {
-            this.reportDegradedMcp(health.degraded, message.mcp_servers, message.session_id);
-            yield { type: "error", sessionNotice: true, message: degradedMcpNotice(health.degraded) };
+            this.initMcpDegraded = {
+              degraded: health.degraded,
+              reported: message.mcp_servers,
+              sessionId: message.session_id,
+            };
           }
         } else if (message.subtype === "thinking_tokens") {
           // Live extended-thinking token count → drives a "thinking… (N)" meter

@@ -51,7 +51,14 @@ const hoisted = vi.hoisted(() => ({
   lastMcpServers: null as Record<string, unknown> | null,
   /** What `q.mcpServerStatus()` answers, and how many times it was asked. */
   statusPoll: null as null | Array<{ name: string; status: string }>,
+  /** Sequential poll answers: each mcpServerStatus() call shifts one entry, and
+   *  the static statusPoll answers once the queue is drained. Lets a test give
+   *  the settle poll and the post-reconnect verify poll DIFFERENT outcomes. */
+  statusPollQueue: [] as Array<Array<{ name: string; status: string }>>,
   statusPolls: 0,
+  /** `q.reconnectMcpServer()` calls, in order, and whether it throws. */
+  reconnectCalls: [] as string[],
+  reconnectThrows: false,
 }));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
@@ -66,10 +73,15 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
       supportedCommands: async () => [],
       interrupt: async () => {},
       setModel: async () => {},
+      reconnectMcpServer: async (name: string) => {
+        hoisted.reconnectCalls.push(name);
+        if (hoisted.reconnectThrows) throw new Error("reconnect refused");
+      },
       mcpServerStatus: async () => {
         hoisted.statusPolls += 1;
-        if (!hoisted.statusPoll) throw new Error("no status available");
-        return hoisted.statusPoll;
+        const poll = hoisted.statusPollQueue.shift() ?? hoisted.statusPoll;
+        if (!poll) throw new Error("no status available");
+        return poll;
       },
     });
   },
@@ -79,7 +91,10 @@ beforeEach(() => {
   hoisted.queue.reset();
   hoisted.lastMcpServers = null;
   hoisted.statusPoll = null;
+  hoisted.statusPollQueue = [];
   hoisted.statusPolls = 0;
+  hoisted.reconnectCalls = [];
+  hoisted.reconnectThrows = false;
 });
 
 const initWith = (mcp_servers?: Array<{ name: string; status: string }>) => ({
@@ -264,7 +279,11 @@ describe("a server that was still connecting at init gets settled (#1524)", () =
     const notices = noticesOf(events);
     expect(notices).toHaveLength(1);
     expect(notices[0].message).toContain("panel");
-    expect(hoisted.statusPolls).toBe(1);
+    // #1228 — the failure was reconnect-attempted and verified still down before
+    // the notice went out: one settle poll, one reconnect, one verify poll.
+    expect(hoisted.reconnectCalls).toEqual(["panel"]);
+    expect(hoisted.statusPolls).toBe(2);
+    expect(notices[0].message).toMatch(/reconnect was already attempted/);
   });
 
   it("says nothing when it settled as connected", async () => {
@@ -328,5 +347,155 @@ describe("a server that was still connecting at init gets settled (#1524)", () =
     );
     expect(noticesOf(events)).toHaveLength(0);
     expect(events.filter((e) => e.type === "result")).toHaveLength(1);
+  });
+});
+
+describe("a down server gets ONE reconnect attempt before any notice (#1228)", () => {
+  // The reported failure: a tool-session respawn reconnected `comfyui` but never
+  // re-registered the in-process `panel` server, and the reconnect notice read
+  // as success. The respawn path now tries the one remedy short of a new session
+  // — an explicit reconnectMcpServer — and only announces what is still down.
+
+  it("recovers without a notice when the reconnect brings the panel server back", async () => {
+    // The reporter's exact shape at init — panel failed — but the reconnect
+    // fixes it. The tool surface is intact, so there is nothing to announce.
+    hoisted.statusPoll = [
+      { name: "comfyui", status: "connected" },
+      { name: "panel", status: "connected" },
+    ];
+    const events = await drive(
+      { mcpServers: { comfyui: COMFYUI_SERVER }, panelServer: PANEL_SERVER },
+      initWith([
+        { name: "comfyui", status: "connected" },
+        { name: "panel", status: "failed" },
+      ]),
+    );
+    expect(hoisted.reconnectCalls).toEqual(["panel"]);
+    expect(noticesOf(events)).toHaveLength(0);
+    // The recovery is only claimed after being READ BACK: one verify poll.
+    expect(hoisted.statusPolls).toBe(1);
+  });
+
+  it("announces only what is STILL down after the attempt, and says the attempt happened", async () => {
+    hoisted.statusPoll = [
+      { name: "comfyui", status: "connected" },
+      { name: "panel", status: "failed" },
+    ];
+    const events = await drive(
+      { mcpServers: { comfyui: COMFYUI_SERVER }, panelServer: PANEL_SERVER },
+      initWith([
+        { name: "comfyui", status: "connected" },
+        { name: "panel", status: "failed" },
+      ]),
+    );
+    expect(hoisted.reconnectCalls).toEqual(["panel"]);
+    const notices = noticesOf(events);
+    expect(notices).toHaveLength(1);
+    expect(notices[0].message).toContain("panel");
+    expect(notices[0].message).not.toContain("comfyui");
+    // Verified still down AFTER the attempt — the notice must say so, or the
+    // agent would try the same reconnect itself and call that a remedy.
+    expect(notices[0].message).toMatch(/reconnect was already attempted/);
+  });
+
+  it("still reports when the reconnect itself throws", async () => {
+    hoisted.reconnectThrows = true;
+    hoisted.statusPoll = [
+      { name: "comfyui", status: "connected" },
+      { name: "panel", status: "failed" },
+    ];
+    const events = await drive(
+      { mcpServers: { comfyui: COMFYUI_SERVER }, panelServer: PANEL_SERVER },
+      initWith([
+        { name: "comfyui", status: "connected" },
+        { name: "panel", status: "failed" },
+      ]),
+    );
+    const notices = noticesOf(events);
+    expect(notices).toHaveLength(1);
+    expect(notices[0].message).toContain("panel");
+  });
+
+  it("does not claim the attempt failed when its outcome could not be verified", async () => {
+    // The reconnect ran but the verify poll is unavailable. "Did not come back"
+    // would be a claim nobody checked — the notice falls back to the plain
+    // observation, still naming the server.
+    hoisted.statusPoll = null; // the poll throws
+    const events = await drive(
+      { mcpServers: { comfyui: COMFYUI_SERVER }, panelServer: PANEL_SERVER },
+      initWith([
+        { name: "comfyui", status: "connected" },
+        { name: "panel", status: "failed" },
+      ]),
+    );
+    expect(hoisted.reconnectCalls).toEqual(["panel"]);
+    const notices = noticesOf(events);
+    expect(notices).toHaveLength(1);
+    expect(notices[0].message).toContain("panel");
+    expect(notices[0].message).not.toMatch(/reconnect was already attempted/);
+  });
+
+  it("attempts nothing when every configured server connected", async () => {
+    // Recovery must not cost a healthy session a control round-trip.
+    const events = await drive(
+      { mcpServers: { comfyui: COMFYUI_SERVER }, panelServer: PANEL_SERVER },
+      initWith([
+        { name: "comfyui", status: "connected" },
+        { name: "panel", status: "connected" },
+      ]),
+    );
+    expect(hoisted.reconnectCalls).toEqual([]);
+    expect(noticesOf(events)).toHaveLength(0);
+  });
+
+  it("recovers a server that was still connecting at init and failed by the first turn end", async () => {
+    // Same remedy on the settle path: the settle poll sees the failure, the
+    // reconnect fixes it, the verify poll confirms — nothing is announced.
+    hoisted.statusPollQueue = [
+      [
+        { name: "comfyui", status: "connected" },
+        { name: "panel", status: "failed" },
+      ],
+      [
+        { name: "comfyui", status: "connected" },
+        { name: "panel", status: "connected" },
+      ],
+    ];
+    const events = await driveTurns(
+      { mcpServers: { comfyui: COMFYUI_SERVER }, panelServer: PANEL_SERVER },
+      initWith([
+        { name: "comfyui", status: "connected" },
+        { name: "panel", status: "pending" },
+      ]),
+    );
+    expect(hoisted.reconnectCalls).toEqual(["panel"]);
+    expect(noticesOf(events)).toHaveLength(0);
+    expect(hoisted.statusPolls).toBe(2);
+  });
+
+  it("a server still CONNECTING after the reconnect is settled later, not announced", async () => {
+    // The reconnect turned `failed` into `pending`: neither down nor verified
+    // up. It is carried into the first-turn-end settle, which reads it once
+    // more — connected here, so the session never hears about it.
+    hoisted.statusPollQueue = [
+      [
+        { name: "comfyui", status: "connected" },
+        { name: "panel", status: "pending" },
+      ],
+      [
+        { name: "comfyui", status: "connected" },
+        { name: "panel", status: "connected" },
+      ],
+    ];
+    const events = await driveTurns(
+      { mcpServers: { comfyui: COMFYUI_SERVER }, panelServer: PANEL_SERVER },
+      initWith([
+        { name: "comfyui", status: "connected" },
+        { name: "panel", status: "failed" },
+      ]),
+    );
+    expect(hoisted.reconnectCalls).toEqual(["panel"]);
+    expect(noticesOf(events)).toHaveLength(0);
+    expect(hoisted.statusPolls).toBe(2);
   });
 });

@@ -128,18 +128,31 @@ const FAILED_STATUSES = new Set(["failed", "needs-auth", "disabled", "error"]);
  * not say a restart fixes it (a cause that persists survives a restart), and does
  * not vouch for the servers that DID come up — the reader can see those in the
  * same sentence.
+ *
+ * `reconnectAttempted` is set only when an automatic reconnect was tried AND the
+ * re-read afterwards confirmed the server is still down (#1228) — the sentence it
+ * adds is then a verified fact, not a hope. When the attempt's outcome could not
+ * be verified the caller leaves it unset, because "did not come back" would be a
+ * claim nobody checked.
  */
-export function degradedMcpNotice(degraded: readonly DegradedMcpServer[]): string {
+export function degradedMcpNotice(
+  degraded: readonly DegradedMcpServer[],
+  opts?: { reconnectAttempted?: boolean },
+): string {
   if (degraded.length === 0) return "";
   const named = degraded
     .map((d) => (d.status === null ? `\`${d.name}\` (not reported)` : `\`${d.name}\` (${d.status})`))
     .join(", ");
   const plural = degraded.length > 1 ? "servers" : "server";
   const theirTools = degraded.length > 1 ? "Their tools are" : "Its tools are";
+  const reconnect = opts?.reconnectAttempted
+    ? `An automatic reconnect was already attempted and did not bring ${degraded.length > 1 ? "them" : "it"} back. `
+    : "";
   return (
     `This session started without ${degraded.length} of its MCP ${plural}: ${named}. ` +
     `${theirTools} not available to the agent for the rest of this session, ` +
     `so anything that needs them will fail or be worked around silently. ` +
+    reconnect +
     `Starting a new session (Disconnect → Connect) is what re-runs the connection; ` +
     `whether it succeeds depends on why this one did not, which this message does not know.`
   );

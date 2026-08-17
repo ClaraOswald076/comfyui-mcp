@@ -148,4 +148,24 @@ describe("degradedMcpNotice — states the observation, and stops", () => {
     const note = degradedMcpNotice([{ name: "panel", status: "failed" }]);
     expect(note).not.toMatch(/because|caused by|due to/i);
   });
+
+  it("names the reconnect attempt only when it was made AND verified still down (#1228)", () => {
+    // The agent's standing guidance is to recover its tools; a notice that
+    // hides the failed reconnect would send it retrying the same remedy and
+    // calling the retry a fix.
+    const note = degradedMcpNotice([{ name: "panel", status: "failed" }], {
+      reconnectAttempted: true,
+    });
+    expect(note).toMatch(/automatic reconnect was already attempted/);
+    // …and the manual remedy is still named, still without a promise.
+    expect(note).toMatch(/Disconnect → Connect/);
+    expect(note).not.toMatch(/will fix|will restore|restores them/);
+  });
+
+  it("says nothing about a reconnect that was not verified", () => {
+    // reconnectAttempted is unset when no attempt ran OR its outcome could not
+    // be read back — "did not come back" would be an unverified claim either way.
+    const note = degradedMcpNotice([{ name: "panel", status: "failed" }]);
+    expect(note).not.toMatch(/reconnect/);
+  });
 });
