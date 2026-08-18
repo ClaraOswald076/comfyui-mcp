@@ -4262,6 +4262,10 @@ function currentWorkflowFence(ctx: PanelToolCtx): FenceRead {
 export type WorkflowFenceRebind =
   /** Read the live identity; it differed from the stamp and has REPLACED it. */
   | { status: "refreshed"; uuid: string; before: FenceRead }
+  /** #1646 — a READ-ONLY probe (`adopt:false`) found the live identity differs
+   *  from the fence and deliberately did NOT adopt it: a mismatch diagnosis
+   *  must never re-point mutation routing on its own authority. */
+  | { status: "diverged"; uuid: string; before: FenceRead }
   /** Read the live identity; the stamp already named it. Nothing to repair. */
   | { status: "already_current"; uuid: string; before: FenceRead }
   /** The panel did not answer, or its reply was not readable. Unknown, not "fine". */
@@ -4625,7 +4629,10 @@ NOTE: an API-format load CAN re-mint the canvas workflow instance. If your next 
   );
 }
 
-async function rebindWorkflowFence(ctx: PanelToolCtx): Promise<WorkflowFenceRebind> {
+async function rebindWorkflowFence(
+  ctx: PanelToolCtx,
+  opts?: { adopt?: boolean },
+): Promise<WorkflowFenceRebind> {
   const tabAtStart = ctx.tabId;
   let before = currentWorkflowFence(ctx);
   // `before` describes the tab we are ABOUT to compare against — but ctx.call can
@@ -4723,6 +4730,12 @@ async function rebindWorkflowFence(ctx: PanelToolCtx): Promise<WorkflowFenceRebi
   // UNKNOWN prior fence must not short-circuit the adoption: we would be claiming
   // the stamp already matched without ever having read it.
   if (before.known && before.uuid === uuid) return { status: "already_current", uuid, before };
+  // #1646 — a READ-ONLY probe never moves the fence: the live canvas naming a
+  // DIFFERENT workflow is reported, not adopted. Only a deliberate rebind
+  // (panel_set_workflow_target, open/new) may replace the fence — a mismatch
+  // diagnosis that re-pointed the session on its own authority routed the
+  // caller's NEXT edits onto the very canvas the refusal named as the wrong one.
+  if (opts?.adopt === false) return { status: "diverged", uuid, before };
   // refreshWorkflowUuid routes through the orchestrator's validator, which
   // re-checks reachability and the uuid's shape/origin binding. A `false` here is
   // a REFUSAL, not a no-op, so it gets its own status rather than being reported
@@ -4877,6 +4890,22 @@ function describeFenceRebind(
       `(#803).`
     : "";
   switch (r.status) {
+    case "diverged":
+      // #1646 — produced ONLY by a read-only probe (`adopt:false`), which the
+      // mismatch diagnosis uses; the deliberate rebinds this renderer serves
+      // never pass it. Handled anyway, because an unhandled union member would
+      // silently render as `undefined` — say exactly what happened if a future
+      // caller ever routes one here.
+      return {
+        binding: "not_recovered",
+        note:
+          ` The live canvas is a DIFFERENT workflow instance (${r.uuid}) than this session's ` +
+          `fence, and it was deliberately NOT adopted — a diagnosis must never re-point ` +
+          `mutation routing on its own.` +
+          (r.before.known && r.before.uuid ? ` The fence still names ${r.before.uuid}.` : "") +
+          `\n\nWHAT TO DO: re-open the workflow you mean with panel_open_workflow, or re-target ` +
+          `the live canvas deliberately by calling this tool with mode:"current".`,
+      };
     case "refreshed":
       return {
         binding: okBinding,
@@ -7247,9 +7276,16 @@ export function makePanelToolCtx(
       // because nothing in the refusal distinguishes "the canvas really is a different
       // workflow" from "the identity flipped for a moment while you were building".
       //
-      // The fence is NOT weakened and nothing is auto-applied. This performs the same
-      // read-only re-derivation the documented recovery performs, then says which of the
-      // two states was found. One informed retry replaces fourteen blind ones.
+      // The fence is NOT weakened, nothing is auto-applied, and — #1646 — the
+      // probe is READ-ONLY. The first version of this check re-derived the fence
+      // onto the live canvas when the two genuinely differed ("AUTO-REBIND"), so
+      // every later mutation in the caller's sequence was silently re-pointed at
+      // the very canvas the refusal had just named as the wrong one — the exact
+      // corruption the fence exists to prevent, delivered as recovery. Now the
+      // check says which of the two states it found and the fence moves ONLY on
+      // an explicit rebind: panel_set_workflow_target({mode:"current"}) or a
+      // successful open. Until then every write stays refused against the target
+      // the caller actually named. One informed retry replaces fourteen blind ones.
       //
       // Safe to recommend a retry because a fence refusal is checked BEFORE the handler
       // runs — "Nothing was applied" is structural here, not an echoed claim.
@@ -7267,32 +7303,46 @@ export function makePanelToolCtx(
         )?.[1] ?? null;
         let verdict: string;
         try {
-          const rebind = await rebindWorkflowFence(ctx);
+          const probe = await rebindWorkflowFence(ctx, { adopt: false });
           verdict =
-            rebind.status === "already_current" && stamped && rebind.uuid === stamped
-              ? `\n\nAUTO-REBIND: ATTEMPTED, and the live canvas now reports the SAME workflow ` +
-                `instance this command carried (${stamped}) — nothing needed repairing. The ` +
-                `mismatch was TRANSIENT: the identity flipped and settled back, which happens ` +
-                `while a new unsaved workflow is still materialising. RETRY THIS EXACT CALL ONCE. ` +
-                `Nothing was applied, so a retry cannot double-apply, and re-issuing the whole ` +
-                `build would duplicate the work that already succeeded.`
-              : rebind.status === "already_current"
-                ? `\n\nAUTO-REBIND: ATTEMPTED; the fence already named the live canvas ` +
-                  `(${rebind.uuid}), so it was not the stale side. Retry once — if it refuses ` +
+            probe.status === "already_current" && stamped && probe.uuid === stamped
+              ? `\n\nCHECKED: the live canvas now reports the SAME workflow instance this ` +
+                `command carried (${stamped}), so the mismatch was TRANSIENT: the identity ` +
+                `flipped and settled back, which happens while a new unsaved workflow is still ` +
+                `materialising. RETRY THIS EXACT CALL ONCE. Nothing was applied, so a retry ` +
+                `cannot double-apply, and re-issuing the whole build would duplicate the work ` +
+                `that already succeeded.`
+              : probe.status === "already_current"
+                ? `\n\nCHECKED: the session's fence already names the live canvas ` +
+                  `(${probe.uuid}), so it was not the stale side. Retry once — if it refuses ` +
                   `again with the same pair, the two identities are genuinely disagreeing and ` +
                   `panel_open_workflow is the way to settle which one you mean.`
-                : rebind.status === "refreshed"
-                  ? `\n\nAUTO-REBIND: ATTEMPTED and the fence was RE-DERIVED onto the live canvas ` +
-                    `(now ${rebind.uuid}). Retry once. If you meant the EARLIER workflow, re-select ` +
-                    `it with panel_open_workflow first — this session now points at the live one.`
-                  : `\n\nAUTO-REBIND: ATTEMPTED and did NOT succeed (${rebind.status}), so the fence ` +
-                    `is unchanged and a bare retry will fail the same way. Re-select the workflow ` +
-                    `you mean with panel_open_workflow, then retry.`;
-        } catch (rebindErr) {
+                : probe.status === "diverged"
+                  ? `\n\nCHECKED, and this session was NOT re-pointed: the live canvas is a ` +
+                    `DIFFERENT workflow (${probe.uuid}) than the one this command was issued ` +
+                    `for${stamped ? ` (${stamped})` : ""}. The fence is unchanged, so later ` +
+                    `edits in this sequence keep being refused rather than landing on the ` +
+                    `wrong canvas. WHAT TO DO: to edit the workflow you issued for, bring it ` +
+                    `back with panel_open_workflow; to follow the live canvas instead, ` +
+                    `re-target deliberately with panel_set_workflow_target({mode:"current"}). ` +
+                    `Either way the move is explicit — it is never made for you off a refused ` +
+                    `mutation.`
+                  : probe.status === "healed_by_panel"
+                    ? `\n\nCHECKED, and the answer CHANGED while it was being read: the panel ` +
+                      `re-advertised its identity and this session's fence moved to the live ` +
+                      `canvas (${probe.uuid}) — through the panel's own repair, not this ` +
+                      `check. If you meant the EARLIER workflow, re-select it with ` +
+                      `panel_open_workflow before any further edits; they now target the live one.`
+                    : `\n\nCHECKED, but the live canvas could not be established ` +
+                      `(${probe.status}), so the fence is unchanged and a bare retry will fail ` +
+                      `the same way. Re-select the workflow you mean with panel_open_workflow, ` +
+                      `then retry.`;
+        } catch (probeErr) {
           // Never let the diagnosis fail the call differently than it already failed.
           verdict =
-            `\n\nAUTO-REBIND: ATTEMPTED and threw, so the fence state is UNKNOWN — this refusal ` +
-            `stands on its own terms. (${rebindErr instanceof Error ? rebindErr.message : String(rebindErr)})`;
+            `\n\nCHECKED, and the check itself threw, so the live canvas is UNKNOWN — this ` +
+            `refusal stands on its own terms and the fence is unchanged. ` +
+            `(${probeErr instanceof Error ? probeErr.message : String(probeErr)})`;
         }
         return fail(`${name} was NOT applied — nothing changed. ${raw}${verdict}`);
       }

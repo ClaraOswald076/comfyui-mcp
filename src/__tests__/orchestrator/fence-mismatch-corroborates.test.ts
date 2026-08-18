@@ -12,10 +12,14 @@
 // while a new unsaved workflow was materialising, and nothing in the refusal separated
 // that from "you are genuinely pointed at another workflow".
 //
-// THE FENCE IS NOT WEAKENED AND NOTHING IS AUTO-APPLIED. The refusal still stands; what
-// changes is that the orchestrator now performs the same read-only re-derivation the
-// documented recovery performs, and reports WHICH of the two states it found. One
-// informed retry replaces fourteen blind ones.
+// THE FENCE IS NOT WEAKENED, NOTHING IS AUTO-APPLIED — AND (#1646) THE PROBE IS
+// READ-ONLY. The refusal still stands; the orchestrator re-reads the live canvas and
+// reports WHICH of the two states it found. What it no longer does is adopt: the first
+// version re-derived the fence onto the live canvas when the two genuinely differed,
+// so the caller's NEXT mutations were silently re-pointed at the canvas the refusal
+// had named as the wrong one. The fence now moves only on an explicit rebind
+// (panel_set_workflow_target({mode:"current"}) or a successful open). One informed
+// retry replaces fourteen blind ones.
 //
 // Recommending a retry is safe here specifically because the panel checks the fence
 // BEFORE running the handler — "Nothing was applied" is structural, not an echoed claim.
@@ -103,7 +107,7 @@ describe("a fenced mutation is corroborated before the caller retries blindly (#
     // satisfied by a message that never consulted the panel at all.
     expect(listCalls).toBeGreaterThan(0);
 
-    expect(text).toMatch(/AUTO-REBIND: ATTEMPTED/);
+    expect(text).toMatch(/CHECKED/);
     expect(text).toMatch(/TRANSIENT/);
     expect(text).toMatch(/RETRY THIS EXACT CALL ONCE/);
     // The instruction that actually saves the 14 calls.
@@ -111,19 +115,45 @@ describe("a fenced mutation is corroborated before the caller retries blindly (#
     // The refusal itself is preserved verbatim — the comparison is the evidence.
     expect(text).toContain(STAMP);
     expect(text).toMatch(/NOT applied — nothing changed/);
+    // The transient probe must not have touched the fence either.
+    expect(stamp).toBe(STAMP);
   });
 
-  it("GENUINELY DIFFERENT: the fence is re-derived and the caller is told which", async () => {
+  it("GENUINELY DIFFERENT: the fence is NOT re-pointed, and the caller is told which (#1646)", async () => {
     // Not the reporter's case, and it must not be described as transient — telling an
     // agent to retry into a different workflow is how an edit lands on the wrong graph.
+    // #1646: the first version of this check RE-DERIVED the fence onto the live canvas
+    // here, so every later mutation in the same sequence was accepted against the OTHER
+    // tab. The probe now reports the divergence and leaves the fence exactly as it was.
     stamp = STAMP;
     const text = await connect(OTHER);
 
     expect(listCalls).toBeGreaterThan(0);
-    expect(text).toMatch(/RE-DERIVED onto the live canvas/);
+    expect(text).toMatch(/NOT re-pointed/);
     expect(text).toContain(OTHER);
+    expect(text).toContain(STAMP);
+    // Both deliberate recoveries are named; the move is never made for the caller.
     expect(text).toMatch(/panel_open_workflow/);
+    expect(text).toMatch(/panel_set_workflow_target\(\{mode:"current"\}\)/);
     expect(text).not.toMatch(/TRANSIENT/);
+    expect(text).not.toMatch(/RETRY THIS EXACT CALL ONCE/);
+    // THE assertion this issue exists for: the fence still names the workflow the
+    // command was issued for, so a later edit in the same sequence is refused
+    // rather than mutating the other canvas.
+    expect(stamp, "the probe never adopted the live canvas's identity").toBe(STAMP);
+  });
+
+  it("a later mutation after a GENUINE mismatch is still refused against the original target", async () => {
+    // The reported corruption, end to end: open/routing raced, the first mutation
+    // mismatched, and the auto-rebind then ACCEPTED the following edits against the
+    // wrong canvas. With the fence preserved, the next mutation fails the same way.
+    stamp = STAMP;
+    await connect(OTHER);
+    const second = await connect(OTHER);
+
+    expect(second).toMatch(/NOT applied — nothing changed/);
+    expect(second).toMatch(/NOT re-pointed/);
+    expect(stamp).toBe(STAMP);
   });
 
   it("UNREADABLE: promises nothing, because nothing was established", async () => {
@@ -132,10 +162,11 @@ describe("a fenced mutation is corroborated before the caller retries blindly (#
     // loop this issue is about — with our encouragement this time.
     const text = await connect(null);
 
-    expect(text).toMatch(/did NOT succeed/);
+    expect(text).toMatch(/could not be established/);
     expect(text).toMatch(/a bare retry will fail the same way/);
     expect(text).not.toMatch(/TRANSIENT/);
     expect(text).not.toMatch(/RETRY THIS EXACT CALL ONCE/);
+    expect(stamp).toBe(STAMP);
   });
 
   it("the fence still REFUSES — this discloses, it never applies", async () => {
