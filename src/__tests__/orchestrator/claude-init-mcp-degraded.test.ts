@@ -52,6 +52,8 @@ const hoisted = vi.hoisted(() => ({
   /** What `q.mcpServerStatus()` answers, and how many times it was asked. */
   statusPoll: null as null | Array<{ name: string; status: string }>,
   statusPolls: 0,
+  /** Servers the harness was asked to reconnect, in order. */
+  reconnectCalls: [] as string[],
 }));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
@@ -71,6 +73,9 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
         if (!hoisted.statusPoll) throw new Error("no status available");
         return hoisted.statusPoll;
       },
+      reconnectMcpServer: async (name: string) => {
+        hoisted.reconnectCalls.push(name);
+      },
     });
   },
 }));
@@ -80,6 +85,7 @@ beforeEach(() => {
   hoisted.lastMcpServers = null;
   hoisted.statusPoll = null;
   hoisted.statusPolls = 0;
+  hoisted.reconnectCalls = [];
 });
 
 const initWith = (mcp_servers?: Array<{ name: string; status: string }>) => ({
@@ -245,8 +251,8 @@ describe("a Claude session that started without an MCP server reports it (#1524)
   });
 });
 
-describe("a server that was still connecting at init gets settled (#1524)", () => {
-  it("reports it when it settled as FAILED", async () => {
+describe("the turn-end watch settles what init could not (#1524)", () => {
+  it("reports a pending-at-init server that settled as FAILED, after trying the reconnect", async () => {
     // The hole an init-only check leaves: `init` is the only MCP report the
     // session pushes, so `pending` there followed by a failure is silent forever
     // — the same six-hour silence, moved a few hundred milliseconds later.
@@ -264,7 +270,11 @@ describe("a server that was still connecting at init gets settled (#1524)", () =
     const notices = noticesOf(events);
     expect(notices).toHaveLength(1);
     expect(notices[0].message).toContain("panel");
-    expect(hoisted.statusPolls).toBe(1);
+    // The one bounded reconnect was tried, and the outcome line quotes the
+    // verdict re-read — so two polls, not one.
+    expect(hoisted.reconnectCalls).toEqual(["panel"]);
+    expect(hoisted.statusPolls).toBe(2);
+    expect(notices[0].message).toMatch(/reconnect did not bring it back/);
   });
 
   it("says nothing when it settled as connected", async () => {
@@ -280,10 +290,15 @@ describe("a server that was still connecting at init gets settled (#1524)", () =
       ]),
     );
     expect(noticesOf(events)).toHaveLength(0);
+    expect(hoisted.reconnectCalls).toEqual([]);
     expect(hoisted.statusPolls).toBe(1);
   });
 
-  it("re-reads ONCE, not on every turn", async () => {
+  it("watches on EVERY turn end — the mid-session drop has no other signal", async () => {
+    // `init` is the only report the session pushes, so a healthy-init session
+    // that loses a server hours in is invisible unless something asks. The ask
+    // is one control round-trip per completed turn — turn-driven, so it needs
+    // no timer and cannot spam.
     hoisted.statusPoll = [
       { name: "comfyui", status: "connected" },
       { name: "panel", status: "connected" },
@@ -296,14 +311,18 @@ describe("a server that was still connecting at init gets settled (#1524)", () =
       ]),
       3,
     );
-    expect(hoisted.statusPolls).toBe(1);
+    expect(hoisted.statusPolls).toBe(3);
   });
 
-  it("does not poll at all when nothing was pending", async () => {
-    // The re-read is a control round-trip. A healthy session must not pay for it
-    // on every turn it completes.
-    hoisted.statusPoll = [{ name: "comfyui", status: "connected" }];
-    await driveTurns(
+  it("polls a healthy session too — and stays silent while it stays healthy", async () => {
+    // The watch cannot know the toolset thinned without looking, so the healthy
+    // session pays the same one round-trip per turn. What it must NEVER pay is
+    // a false alarm or an unneeded reconnect.
+    hoisted.statusPoll = [
+      { name: "comfyui", status: "connected" },
+      { name: "panel", status: "connected" },
+    ];
+    const events = await driveTurns(
       { mcpServers: { comfyui: COMFYUI_SERVER }, panelServer: PANEL_SERVER },
       initWith([
         { name: "comfyui", status: "connected" },
@@ -311,13 +330,15 @@ describe("a server that was still connecting at init gets settled (#1524)", () =
       ]),
       2,
     );
-    expect(hoisted.statusPolls).toBe(0);
+    expect(hoisted.statusPolls).toBe(2);
+    expect(noticesOf(events)).toHaveLength(0);
+    expect(hoisted.reconnectCalls).toEqual([]);
   });
 
   it("stays silent when the poll is unavailable or throws", async () => {
     // `mcpServerStatus()` is an optional Query method. A harness without it
-    // leaves the pending servers unmentioned rather than guessed at — and must
-    // never take the turn stream down with it.
+    // leaves the servers unmentioned rather than guessed at — and must never
+    // take the turn stream down with it.
     hoisted.statusPoll = null; // the mock throws
     const events = await driveTurns(
       { mcpServers: { comfyui: COMFYUI_SERVER }, panelServer: PANEL_SERVER },
@@ -327,6 +348,7 @@ describe("a server that was still connecting at init gets settled (#1524)", () =
       ]),
     );
     expect(noticesOf(events)).toHaveLength(0);
+    expect(hoisted.reconnectCalls).toEqual([]);
     expect(events.filter((e) => e.type === "result")).toHaveLength(1);
   });
 });

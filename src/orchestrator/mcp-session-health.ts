@@ -20,10 +20,12 @@
 // panel server (Claude lane) and the stdio `comfyui` child. `route()` already reads
 // that message for the session id and throws the rest away.
 //
-// This module is only the comparison. It says what was observed and nothing more:
-// it does not diagnose WHY a server is missing (still unknown for #1524, and the
-// two candidate causes need different fixes), and it does not promise a restart
-// would help.
+// This module is the comparison and the wording. The comparison says what was
+// observed and nothing more: it does not diagnose WHY a server is missing
+// (still open for #1524, and the two candidate causes need different fixes).
+// The wording carries the recovery story the same way: a reconnect attempt is
+// reported as attempted, its outcome as whatever the re-read status poll said —
+// never as a promise that a restart or reconnect would help.
 
 /** One entry of the `system`/`init` `mcp_servers` report. */
 export interface ReportedMcpServer {
@@ -121,6 +123,21 @@ export function inspectMcpServers(
 const FAILED_STATUSES = new Set(["failed", "needs-auth", "disabled", "error"]);
 
 /**
+ * Whether an automatic reconnect is worth attempting for a degraded status.
+ *
+ * `failed` / `error` / absent-from-the-report are DROP shapes — re-running the
+ * connection can bring the server back. `needs-auth` waits on the user
+ * completing an auth flow and `disabled` is a deliberate off switch: an
+ * automatic retry of the first claims effort that cannot land, and of the
+ * second overrides intent — so neither is retried, only reported.
+ */
+export function reconnectableMcpStatus(status: string | null): boolean {
+  if (status === null) return true;
+  const s = status.trim().toLowerCase();
+  return s === "failed" || s === "error";
+}
+
+/**
  * The line the user sees when a session starts without a server it was given.
  *
  * Scoped the way `NO_PANEL_TOOLS_OVERRIDE` is scoped: it states the observation
@@ -138,9 +155,82 @@ export function degradedMcpNotice(degraded: readonly DegradedMcpServer[]): strin
   const theirTools = degraded.length > 1 ? "Their tools are" : "Its tools are";
   return (
     `This session started without ${degraded.length} of its MCP ${plural}: ${named}. ` +
-    `${theirTools} not available to the agent for the rest of this session, ` +
+    `${theirTools} not available to the agent until the server connects, ` +
     `so anything that needs them will fail or be worked around silently. ` +
-    `Starting a new session (Disconnect → Connect) is what re-runs the connection; ` +
-    `whether it succeeds depends on why this one did not, which this message does not know.`
+    `A reconnect is attempted at the next turn boundary for any of them that can be retried, ` +
+    `and the outcome is reported; starting a new session (Disconnect → Connect) ` +
+    `re-runs the connection from scratch. ` +
+    `Whether either succeeds depends on why this one did not, which this message does not know.`
+  );
+}
+
+/** Format a degraded-server list the way every notice in this module does. */
+function namedDegraded(degraded: readonly DegradedMcpServer[]): string {
+  return degraded
+    .map((d) => (d.status === null ? `\`${d.name}\` (not reported)` : `\`${d.name}\` (${d.status})`))
+    .join(", ");
+}
+
+/**
+ * The line the user sees when a server is down and STAYS down past the
+ * recovery this session can offer (#1524). `why` names exactly which situation
+ * the session is in — the one thing the reader must not have to guess:
+ *
+ *  - `reconnect-failed`: an automatic reconnect was tried and the re-read still
+ *    reports the server down;
+ *  - `unverified`: an automatic reconnect was tried but the status re-read that
+ *    would judge it could not be read — so the outcome is not claimed either
+ *    way ("did not come back" would be a claim nobody checked);
+ *  - `not-retriable`: the status (`needs-auth`, `disabled`) is not one an
+ *    automatic reconnect can clear — nothing was attempted;
+ *  - `unsupported`: the harness exposes no reconnect to ask for — nothing
+ *    could be attempted.
+ *
+ * Like `degradedMcpNotice`, it stops at the observation: it does not diagnose
+ * why the server is down and does not promise a new session fixes it.
+ */
+export function unrecoveredMcpNotice(
+  degraded: readonly DegradedMcpServer[],
+  why: "reconnect-failed" | "unverified" | "not-retriable" | "unsupported",
+): string {
+  if (degraded.length === 0) return "";
+  const plural = degraded.length > 1;
+  const reason =
+    why === "reconnect-failed"
+      ? `the automatic reconnect did not bring ${plural ? "them" : "it"} back`
+      : why === "unverified"
+        ? "an automatic reconnect was attempted, but its outcome could not be read back"
+        : why === "not-retriable"
+          ? "an automatic reconnect cannot clear this status, so none was attempted"
+          : "this harness offers no reconnect to ask for";
+  return (
+    `MCP ${plural ? "servers" : "server"} ${namedDegraded(degraded)} ${plural ? "are" : "is"} ` +
+    `unavailable to the agent — ${reason}. ` +
+    `Anything that needs ${plural ? "their" : "its"} tools will fail or be worked around ` +
+    `silently for the rest of this session. ` +
+    `Starting a new session (Disconnect → Connect) re-runs the connection; ` +
+    `whether it succeeds depends on why the server is down, which this message does not know.`
+  );
+}
+
+/**
+ * The line the user sees when a down server reads CONNECTED again (#1524).
+ * `byReconnect` distinguishes the two honest shapes: the session's own
+ * reconnect attempt landed, or the harness's supervision brought the server
+ * back on its own (the reporter watched `comfyui` do exactly this while
+ * `panel` stayed down). The claim is only ever what a status poll reported —
+ * never that the tools were exercised.
+ */
+export function recoveredMcpNotice(names: readonly string[], byReconnect: boolean): string {
+  if (names.length === 0) return "";
+  const named = names.map((n) => `\`${n}\``).join(", ");
+  const plural = names.length > 1;
+  const how = byReconnect
+    ? `the automatic reconnect brought ${plural ? "them" : "it"} back`
+    : `${plural ? "they are" : "it is"} connected again`;
+  return (
+    `MCP ${plural ? "servers" : "server"} ${named}: ${how} — ` +
+    `${plural ? "their" : "its"} tools are available to the agent. ` +
+    `Anything the agent reported as unreachable while the server was down may be worth another try.`
   );
 }
