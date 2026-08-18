@@ -382,10 +382,6 @@ Every `enqueue_workflow` call automatically logs settings to a local SQLite data
 npm run generations:stats
 ```
 
-### Model Settings
-
-Community-maintained preset library (`model-settings.json`) with research-backed sampler, scheduler, steps, and CFG values for 10+ model families. User overrides in `model-settings.user.jsonc` (auto-created from template on install, gitignored).
-
 ---
 
 ## Examples
@@ -776,10 +772,7 @@ claude --plugin-dir ./plugin
 ### Project structure
 
 ```
-model-settings.json            # Community-maintained model presets (shipped)
-model-settings.user.jsonc.example  # User override template (copied on install)
 scripts/
-  postinstall.mjs              # Auto-creates user config from template
   generation-stats.mjs         # CLI: npm run generations:stats
 src/
   index.ts                 # MCP server entry point (stdio transport)

@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /**
  * Release smoke test: pack the package exactly as `npm publish` would, install
- * that tarball into a clean throwaway project (which RUNS the postinstall hook),
- * and verify the published layout + entrypoint actually boot.
+ * that tarball into a clean throwaway project, and verify the published
+ * layout + entrypoint actually boot.
  *
  * Catches the class of bug that shipped in 0.17.0: a `files` allowlist that
- * dropped `scripts/` while `package.json` still declared
- * `postinstall: node scripts/postinstall.mjs` — so every `npm install` / `npx`
- * crashed on a missing file. Unit tests (`npm test`) never exercise the packed
- * tarball, so this is the gap. Run in CI and as a pre-publish gate.
+ * dropped `scripts/` while `package.json` still declared a lifecycle script
+ * pointing into it — so every `npm install` / `npx` crashed on a missing file.
+ * Unit tests (`npm test`) never exercise the packed tarball, so this is the
+ * gap. Run in CI and as a pre-publish gate.
  */
 import { execSync, spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, existsSync, readdirSync, readFileSync } from "node:fs";
@@ -67,18 +67,19 @@ const tgz = readdirSync(packDir).find((f) => f.endsWith(".tgz"));
 if (!tgz) throw new Error("npm pack produced no tarball");
 const tarball = join(packDir, tgz);
 
-// 2. Install the tarball in a clean project — this RUNS the postinstall hook.
+// 2. Install the tarball in a clean project.
 const proj = mkdtempSync(join(tmpdir(), "cmcp-smoke-"));
 writeFileSync(
   join(proj, "package.json"),
   JSON.stringify({ name: "comfyui-mcp-smoke", private: true, version: "0.0.0" }),
 );
-// --foreground-scripts surfaces postinstall output; a crashing hook exits non-zero.
+// --foreground-scripts surfaces dependency install-script output; a crashing
+// script exits non-zero.
 run(`npm install --foreground-scripts --no-audit --no-fund "${tarball}"`, { cwd: proj });
 
 // 3. Verify the published layout is intact (files the runtime/install need).
 const pkg = join(proj, "node_modules", "comfyui-mcp");
-for (const f of ["dist/index.js", "scripts/postinstall.mjs", "package.json"]) {
+for (const f of ["dist/index.js", "package.json"]) {
   if (!existsSync(join(pkg, f))) {
     console.error(`❌ published package is missing ${f}`);
     process.exit(1);
