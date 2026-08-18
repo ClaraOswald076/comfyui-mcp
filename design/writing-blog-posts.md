@@ -27,6 +27,7 @@ npm test           # runs the six below
 | `npm run check:blog-stale` | a post's `verified:` stamp is newer than the packs it documents | yes |
 | `npm run check:docs-links` | nav ↔ files ↔ links all resolve | yes |
 | `npm run check:docs-locale` | translated pages match their English source structurally | yes |
+| `npm run check:docs-mdx` | no unescaped lowercase JSX tags (`<pod>`) in prose | yes |
 | `node scripts/asset-counts.mjs --check` | advertised counts match the live registry | **no — CI only** |
 | `node scripts/check-docs-deployed.mjs` | every nav page actually serves | **no — after deploy** |
 
@@ -167,26 +168,18 @@ than it reads. This is why the shared install step is still copied text rather t
 snippet — converting ten live posts to it without a local `mint dev` render check is a bet on
 the docs site.
 
-### Page size — the open one
+### Unescaped `<placeholder>` is JSX — it 404s the page
 
-`docs/ko/panel.mdx` has **never** built. Its four siblings serve fine, and so does the English
-`panel` page. Ruled out with evidence: the config, MDX tag balance, stray braces, odd
-backticks, the Korean anchor (valid), exotic characters (all appear on pages that build), and
-URL variants (404 in every form).
+MDX treats `<pod>` as a component named `pod`. A page that contains it
+**outside a code span** does not build; Mintlify serves the 404 shell and
+the rest of the site still deploys. That is why every locale `panel` page
+and `changelog/2026-07-21` 404'd while their siblings (and the older
+English `panel`, which had not yet gained the RunPod sentence) served.
 
-The one remaining signal is size:
-
-| page | bytes | serves |
-|---|---|---|
-| `ko/panel` | 24,058 | **404** |
-| `panel` (en) | 18,639 | 200 |
-| `ko/troubleshooting` | 13,295 | 200 |
-
-**This is a hypothesis, not a measurement** — a threshold has not been demonstrated. If you are
-writing a very long translated page and it does not appear after a deploy, suspect this first
-and try splitting it.
-
-`docs/changelog/2026-07-21` fails the same way, so it is not locale-specific.
+Size was the wrong hypothesis: `zh/panel` is only ~1 KB larger than
+English and 404'd for the same `<pod>`. Write placeholders as `` `<pod>` ``
+or drop the angle brackets. `check:docs-mdx` rejects a lowercase HTML/JSX
+tag in prose.
 
 ---
 
