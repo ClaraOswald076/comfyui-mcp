@@ -721,6 +721,11 @@ export const __panelToolsTestHooks = {
   ): void {
     declineProbeTimingOverride = timing;
   },
+  /** Inject a fake #1249 server-side /free so the frozen-tab settle can be
+   *  driven without real HTTP. null restores the live freeVramDirect. */
+  setFreeVramDirect(fn: ((base: string) => Promise<FreeVramDirectOutcome>) | null): void {
+    freeVramDirectOverride = fn;
+  },
   /** Direct access to the #742 decline recheck loop so its hard-deadline
    *  guarantee (codex gate r2) can be unit-tested with a custom deadline. */
   probeDeclineRecovery,
@@ -2411,6 +2416,186 @@ async function settleExitSubgraphAfterAckTimeout(
     };
   }
   return timedOut;
+}
+
+// ---- panel_free_vram: verifiable when the canvas tab is frozen (#1249) -----
+// `free_vram` is a purely SERVER-SIDE operation — the panel's handler is a plain
+// `POST /free` against the ComfyUI the tab fronts — yet the tool treated the
+// frozen tab's ACK as the only source of truth: a reply timeout left the caller
+// with "MUTATES … may have been applied" and no way to verify recovery. The
+// settle below takes the path the tab was only proxying: when the tab PROVABLY
+// fronts the orchestrator's local boot instance (the captureRebootHealthBase
+// gate — loopback, server-trusted, handshake-origin-matched), issue /free
+// DIRECTLY and read /system_stats around it.
+//
+// Why re-issuing is safe HERE and nowhere else on the timeout path: /free is
+// IDEMPOTENT. Unloading already-unloaded models and freeing an already-empty
+// cache is a no-op, so the copy the frozen tab may still execute when it wakes
+// cannot double-apply — the exact hazard the bridge's "do not blind-retry"
+// disclosure guards against for every other mutation does not exist for this
+// one command. This is a per-command exception, argued per command; it is NOT a
+// precedent for settling other mutations this way.
+
+/** Per-request bound for the direct /free + /system_stats round-trips, so a
+ *  wedged server degrades to the honest outcome-unknown instead of hanging the
+ *  tool call. ComfyUI applies /free synchronously before answering, so a large
+ *  unload can take seconds — 10s matches the bound probeComfyEndpoint callers
+ *  already pay on this same server. */
+const FREE_VRAM_DIRECT_TIMEOUT_MS = 10_000;
+
+/** The VRAM counters of one /system_stats device entry, read when present. */
+interface VramDeviceSample {
+  name?: string;
+  vram_total?: number;
+  vram_free?: number;
+}
+
+/** GET `${base}/system_stats` and return its device VRAM counters, or null when
+ *  the read cannot answer (unreachable, non-2xx, non-ComfyUI body). Never
+ *  throws: an unreadable stat is "no numbers", never evidence in either
+ *  direction — the POST's own status is what certifies the free. */
+async function readVramDevices(
+  base: string,
+  timeoutMs: number,
+): Promise<VramDeviceSample[] | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
+  timer.unref?.();
+  try {
+    const res = await comfyuiFetch(`${base}/system_stats`, {
+      signal: controller.signal,
+      redirect: "manual",
+    });
+    if (res.status < 200 || res.status >= 300) return null;
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch {
+      return null; // 2xx but not JSON — up, but not a /system_stats we trust
+    }
+    if (!looksLikeSystemStats(body)) return null;
+    const devices = (body as { devices?: unknown }).devices;
+    if (!Array.isArray(devices)) return null;
+    return devices.map((d) => {
+      const dev = (d ?? {}) as Record<string, unknown>;
+      const sample: VramDeviceSample = {};
+      if (typeof dev.name === "string") sample.name = dev.name;
+      if (typeof dev.vram_total === "number") sample.vram_total = dev.vram_total;
+      if (typeof dev.vram_free === "number") sample.vram_free = dev.vram_free;
+      return sample;
+    });
+  } catch {
+    return null; // unreachable/timed out — no numbers to report
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+interface FreeVramDirectOutcome {
+  ok: boolean;
+  /** Failure detail when !ok (HTTP status / transport error), already worded
+   *  for the caller. Absent on success. */
+  reason?: string;
+  before?: VramDeviceSample[] | null;
+  after?: VramDeviceSample[] | null;
+}
+
+/** Issue ComfyUI's /free DIRECTLY against a proven-local base and read the
+ *  VRAM counters around it. Never throws — every failure is a value, so the
+ *  settle can degrade to the honest outcome-unknown instead of masking the
+ *  original timeout behind a new error. */
+async function freeVramDirect(base: string): Promise<FreeVramDirectOutcome> {
+  const before = await readVramDevices(base, FREE_VRAM_DIRECT_TIMEOUT_MS);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FREE_VRAM_DIRECT_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    const res = await comfyuiFetch(`${base}/free`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ unload_models: true, free_memory: true }),
+      signal: controller.signal,
+      redirect: "manual",
+    });
+    if (res.status < 200 || res.status >= 300) {
+      return { ok: false, reason: `POST ${base}/free answered HTTP ${res.status}` };
+    }
+  } catch (err) {
+    const msg = controller.signal.aborted
+      ? `POST ${base}/free did not answer within ${FREE_VRAM_DIRECT_TIMEOUT_MS} ms`
+      : `POST ${base}/free failed: ${err instanceof Error ? err.message : String(err)}`;
+    return { ok: false, reason: msg };
+  } finally {
+    clearTimeout(timer);
+  }
+  const after = await readVramDevices(base, FREE_VRAM_DIRECT_TIMEOUT_MS);
+  return { ok: true, before, after };
+}
+
+/** Test injection for the direct server-side /free, so the settle can be
+ *  driven without real HTTP. null restores the live path. */
+let freeVramDirectOverride: ((base: string) => Promise<FreeVramDirectOutcome>) | null = null;
+
+/**
+ * After an ack timeout on `free_vram`, settle the outcome against the one
+ * channel a frozen tab cannot block: the ComfyUI server itself.
+ *
+ * Returns the timeout UNTOUCHED in every case where nothing was verified —
+ * no provable local server (remote/cloud tab, ambiguous origin, untrusted
+ * socket), or a direct /free that itself failed. #1473's rule: an unknown
+ * answer claims nothing in either direction, and the bridge's original
+ * outcome-unknown disclosure is already the honest verdict there.
+ */
+async function settleFreeVramAfterAckTimeout(
+  ctx: PanelToolCtx,
+  timedOut: ToolResult,
+): Promise<ToolResult> {
+  // The same gate the restart certification uses: null unless the tab PROVABLY
+  // fronts THIS orchestrator's local boot instance (loopback + server-trusted +
+  // handshake-origin match). Without that proof a direct /free could aim at a
+  // DIFFERENT server than the one the tab was asked to free — reporting that as
+  // this command's success would be the wrong-target success the gate exists to
+  // prevent, which is worse than the honest unknown being fixed.
+  const base = captureRebootHealthBase(ctx);
+  if (!base) return timedOut;
+  const direct = await (freeVramDirectOverride ?? freeVramDirect)(base);
+  if (!direct.ok) {
+    // The tab never answered AND the server-side path failed. The outcome stays
+    // unknown — say so, and name what was tried, without claiming either way.
+    const text = timedOut.content?.find((c) => c.type === "text")?.text ?? "";
+    return {
+      ...timedOut,
+      content: [
+        {
+          type: "text",
+          text:
+            `${text}\n\nThe server-side fallback also could not reach ComfyUI's /free ` +
+            `(${direct.reason ?? "no detail"}), so whether VRAM was freed remains UNVERIFIED — ` +
+            `check with get_system_stats (action:"health") once the server answers.`,
+        },
+      ],
+    };
+  }
+  const statsNote =
+    direct.before != null && direct.after != null
+      ? "vram_before/vram_after are the server's own /system_stats counters around the free."
+      : "The /system_stats read around it did not answer, so no VRAM counters are reported — the 2xx from /free is the verification, not a measured delta.";
+  return ok({
+    freed: true,
+    unload_models: true,
+    free_memory: true,
+    acknowledged: false,
+    verified: "server-side",
+    via: `POST ${base}/free`,
+    ...(direct.before != null ? { vram_before: direct.before } : {}),
+    ...(direct.after != null ? { vram_after: direct.after } : {}),
+    note:
+      `The panel tab never acknowledged (frozen or backgrounded), so the free was issued ` +
+      `DIRECTLY to the ComfyUI server this tab provably fronts — the same /free endpoint the ` +
+      `panel would have called — and the server confirmed it. /free is idempotent: if the tab's ` +
+      `queued copy still executes when the tab wakes, it is a no-op, so nothing was applied ` +
+      `twice. ${statsNote}`,
+  });
 }
 
 // ---- panel_install_node: accepted-but-never-enqueued (#1129) ---------------
@@ -13582,9 +13767,18 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
     ),
     def(
       "panel_free_vram",
-      "Unload all loaded models and free VRAM (ComfyUI /free). Use to unwedge a stuck/OOM ComfyUI when a cancel didn't free memory — before retrying or, last resort, restarting (panel_restart_comfyui). Does NOT restart ComfyUI; it just drops resident models and frees cached memory.",
+      "Unload all loaded models and free VRAM (ComfyUI /free). Use to unwedge a stuck/OOM ComfyUI when a cancel didn't free memory — before retrying or, last resort, restarting (panel_restart_comfyui). Does NOT restart ComfyUI; it just drops resident models and frees cached memory. If the panel tab is frozen and cannot acknowledge, the free is instead issued DIRECTLY to the ComfyUI server and verified there (same /free, idempotent) whenever the tab provably fronts the local server — otherwise the outcome is reported unknown rather than claimed.",
       {},
-      async (_args, ctx) => ctx.call({ cmd: "free_vram" }, 15000),
+      async (_args, ctx) => {
+        const res = await ctx.call({ cmd: "free_vram" }, 15000);
+        // #1249 — ONLY a no-reply is settled server-side. An acked executor error
+        // (the panel's own "Failed to free VRAM: …") is a reply the bridge
+        // received and relayed; it already says what failed, and re-issuing from
+        // out here would fire a second mutation behind a verdict the caller was
+        // given. A tagged reply-timeout is the one case where nothing answered.
+        if (!isReplyTimeoutResult(res)) return res;
+        return settleFreeVramAfterAckTimeout(ctx, res);
+      },
     ),
     def(
       "panel_show_media",
