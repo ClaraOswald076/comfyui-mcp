@@ -56,6 +56,7 @@ import {
   type ListenerOwnership,
   type SupervisorRelaunch,
 } from "./listener-ownership.js";
+import { isLoopbackServerUrl } from "./local-vram.js";
 import { resetManagerApiCache } from "./manager-api-cache.js";
 import {
   parseListenerPidFromNetstat,
@@ -348,10 +349,14 @@ interface StartupReadinessResult {
  *                         could not be mapped, so our process cannot be shown to be
  *                         the listener (the #449 shape);
  *                       • ready:true, Manager reboot — the server is up but no cycle
- *                         was observed, which is EVERY Manager reboot: that path
- *                         watches for a healthy probe, never for a down→up, so an
- *                         accepted request in front of a server that never restarted
- *                         looks identical to a successful one.
+ *                         was observed. That is every Manager reboot whose witness
+ *                         stayed open, dropped on a REMOTE endpoint, or could not be
+ *                         acquired at all: the readiness poll alone only certifies a
+ *                         healthy answer, never a down→up, so an accepted request in
+ *                         front of a server that never restarted looks identical to a
+ *                         successful one. On a LOOPBACK endpoint a witness that closed
+ *                         after the dispatch IS the observed down→up and the verdict is
+ *                         "confirmed" instead (#1642).
  *                     A caller composing its own message MUST check `ready` before
  *                     saying anything about the server being up.
  *   "not-attempted" — this call never launched or rebooted anything (a refusal, or
@@ -4016,6 +4021,57 @@ async function restartViaManagerRebootDispatch(
         )
       : "";
 
+  // #1642: the readiness poll alone can never see a cycle — it certifies that
+  // SOMETHING healthy answers now, which is why every Manager reboot used to
+  // land on `started:false, startup:"unconfirmed"` no matter how cleanly the
+  // server came back (the issue's exact report). But since #871 this path holds
+  // the instance WITNESS across the dispatch, and on a LOOPBACK endpoint that
+  // witness supplies the down→up the poller cannot: a socket on this machine
+  // has no tunnel to hiccup and no proxy to idle out (instance-witness.ts's
+  // reasons a close is inconclusive are all off-loopback), so its close AFTER
+  // the dispatch is the instance that accepted the reboot going away, and the
+  // healthy probe is the successor answering. That is precisely the positive
+  // evidence the rounds-7/8 ruling below says `started` requires, so this
+  // branch returns the confirmed verdict the fields below must withhold.
+  //
+  // Scoped to loopback on purpose: past the first hop a close still proves
+  // nothing, so a remote endpoint keeps the unconfirmed verdict even with a
+  // dropped witness. A loopback REVERSE PROXY could in principle drop the
+  // client connection while its origin never cycled — the substitution edge
+  // the witness module already declines to cover, not a reason to deny every
+  // plain local install the confirmation its reboot earned. The strict `>`
+  // boundary is the same one the argv fence uses: a same-millisecond stamp is
+  // ambiguous (event-delivery slack), and ambiguous declines.
+  const witnessSawTheCycle =
+    witness !== undefined &&
+    witnessClosedAt !== undefined &&
+    witnessClosedAt > dispatchedAt &&
+    isLoopbackServerUrl(anchoredBase);
+  if (witnessSawTheCycle) {
+    return {
+      stopped: true,
+      started: true,
+      ready: true,
+      startup: "confirmed",
+      readiness,
+      message:
+        (reboot.acked
+          ? "The ComfyUI-Manager reboot request was acknowledged."
+          : `A ComfyUI-Manager reboot was dispatched but not acknowledged (${reboot.note ?? "no reply"}).`) +
+        ` ComfyUI is healthy now (${readiness.waited_ms}ms) — ${context.label}/supervised ` +
+        "restart, CONFIRMED: the instance that accepted the reboot dropped the " +
+        "connection this call was holding open across the dispatch (the down), " +
+        "and the same endpoint answers healthy again (the up)." +
+        argvNote +
+        // #1647: same disclosure as every other branch — an inferred
+        // supervision is stated whatever the probes saw.
+        (context.supervisionNote ? ` ${context.supervisionNote}` : ""),
+      // This path still launched nothing of ours — a supervisor cycled the
+      // process — so the listener is never ours to claim, confirmed or not.
+      listener_ownership: unclassifiedOwnership(),
+    };
+  }
+
   return {
     stopped: true,
     // THE FIELDS MUST AGREE WITH THE SENTENCE (codex gate rounds 7 and 8). A message
@@ -4029,7 +4085,9 @@ async function restartViaManagerRebootDispatch(
     // demonstrably existed and only its attribution was uncertain. HERE this call
     // spawned nothing at all, and an acknowledged Manager request can be a no-op —
     // so there is no positive evidence that this call started anything, and
-    // `started` is exactly the claim that it did.
+    // `started` is exactly the claim that it did. (#1642: when the loopback witness
+    // DID supply that evidence — the observed down→up — the confirmed branch above
+    // has already returned; this return is the unobserved case only.)
     //
     // The fear that drove the earlier choice — that `false` reads as a failed
     // restart — is answered by the fields beside it rather than by overstating this

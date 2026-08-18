@@ -25,6 +25,7 @@ import { describe, expect, it, afterEach, beforeEach, vi } from "vitest";
 
 const hoisted = vi.hoisted(() => ({
   remoteMode: { value: true },
+  base: { value: "http://127.0.0.1:8188" },
   fetchMock: vi.fn(),
   resetClient: vi.fn(),
   resetObjectInfoCache: vi.fn(),
@@ -49,7 +50,7 @@ vi.mock("node:os", async (importOriginal) => {
 
 vi.mock("../../config.js", () => ({
   config: { resolvedPort: 8188, comfyuiPath: "/fake/comfy", comfyuiBasePath: "" },
-  getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
+  getComfyUIBaseUrl: () => hoisted.base.value,
   getComfyUIAuthHeaders: () => ({}),
   getComfyuiTargetGeneration: () => 0,
   isRemoteMode: () => hoisted.remoteMode.value,
@@ -121,6 +122,7 @@ const BASE_ARGV = ["python", "main.py", "--port", "8188"];
 
 beforeEach(() => {
   hoisted.remoteMode.value = true;
+  hoisted.base.value = "http://127.0.0.1:8188";
   hoisted.fetchMock.mockReset();
   hoisted.resetClient.mockClear();
   hoisted.resetObjectInfoCache.mockClear();
@@ -193,6 +195,9 @@ describe("#871 — the argv comparison is fenced by the instance, not the endpoi
     expect(res.message).not.toMatch(/launch arguments/i);
     expect(res.message).not.toContain("--other-agents-flag");
     expect(res.message).toContain("ComfyUI is healthy now");
+    // #1642: a close stamped BEFORE the dispatch is no evidence of our cycle.
+    expect(res.started).toBe(false);
+    expect(res.startup).toBe("unconfirmed");
   });
 
   it("compares normally when the witness dies AFTER the dispatch — consistent with our own reboot", async () => {
@@ -232,6 +237,77 @@ describe("#871 — the argv comparison is fenced by the instance, not the endpoi
     expect(res.message).toContain("--new-flag");
   });
 
+  it("#1642: a witness that died AFTER the dispatch on a LOOPBACK endpoint confirms the restart", async () => {
+    // The issue's report: the Manager reboot completed and the health probe
+    // found ComfyUI healthy, yet the flow answered started:false /
+    // startup:"unconfirmed". On loopback the witness close after the dispatch
+    // is the down→up the readiness poll cannot see, so the verdict is now the
+    // confirmed restart that actually happened.
+    hoisted.getSystemStats.mockImplementation(async () => ({
+      system: { argv: [...BASE_ARGV] },
+    }));
+    __processControlTestHooks.setRemoteRebootTimingForTests({
+      settleMs: 0,
+      budgetMs: 1000,
+      intervalMs: 5,
+    });
+    hoisted.fetchMock.mockImplementation(async (url: string) => {
+      const path = pathOf(url);
+      if (path === "/v2/manager/reboot") {
+        return new Response("", { status: 200 });
+      }
+      if (path === "/system_stats") {
+        hoisted.witness.closedAt ??= Date.now() + 5000;
+        return new Response(JSON.stringify({ system: {} }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    const res = await restartComfyUI();
+
+    expect(res.stopped).toBe(true);
+    expect(res.started).toBe(true);
+    expect(res.ready).toBe(true);
+    expect(res.startup).toBe("confirmed");
+    expect(res.message).toContain("CONFIRMED");
+    expect(res.message).toContain("ComfyUI is healthy now");
+    // We launched nothing of ours, so ownership is never claimed even here.
+    expect(res.listener_ownership).toBe("unconfirmed");
+  });
+
+  it("#1642: the same witness drop on a REMOTE endpoint stays unconfirmed", async () => {
+    // Past the first hop a close proves nothing (tunnels hiccup, proxies idle
+    // out), so a dropped witness must NOT upgrade the verdict there — the
+    // conservative reading the confirmed branch is scoped away from.
+    hoisted.base.value = "http://remote.example:8188";
+    hoisted.getSystemStats.mockImplementation(async () => ({
+      system: { argv: [...BASE_ARGV] },
+    }));
+    __processControlTestHooks.setRemoteRebootTimingForTests({
+      settleMs: 0,
+      budgetMs: 1000,
+      intervalMs: 5,
+    });
+    hoisted.fetchMock.mockImplementation(async (url: string) => {
+      const path = pathOf(url);
+      if (path === "/v2/manager/reboot") {
+        return new Response("", { status: 200 });
+      }
+      if (path === "/system_stats") {
+        hoisted.witness.closedAt ??= Date.now() + 5000;
+        return new Response(JSON.stringify({ system: {} }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    const res = await restartComfyUI();
+
+    expect(res.ready).toBe(true);
+    expect(res.started).toBe(false);
+    expect(res.startup).toBe("unconfirmed");
+    expect(res.message).toContain("not directly observed");
+  });
+
   it("compares normally when the witness never dies — the instance provably never went away", async () => {
     // A Manager that accepts the request and does nothing leaves the witness
     // open: both readings are then provably one instance's, and UNCHANGED is
@@ -245,6 +321,10 @@ describe("#871 — the argv comparison is fenced by the instance, not the endpoi
 
     expect(res.ready).toBe(true);
     expect(res.message).toContain("launch arguments are UNCHANGED");
+    // #1642: an OPEN witness means the instance provably never went away — no
+    // cycle to confirm, so the verdict must stay unconfirmed.
+    expect(res.started).toBe(false);
+    expect(res.startup).toBe("unconfirmed");
   });
 
   it("declines the comparison when no witness could be acquired at all", async () => {
@@ -265,6 +345,9 @@ describe("#871 — the argv comparison is fenced by the instance, not the endpoi
     expect(findCall((p) => p === "/v2/manager/reboot")).toBeDefined();
     expect(res.message).not.toMatch(/launch arguments/i);
     expect(res.message).toContain("ComfyUI is healthy now");
+    // #1642: no witness at all — nothing observed the cycle.
+    expect(res.started).toBe(false);
+    expect(res.startup).toBe("unconfirmed");
   });
 });
 
