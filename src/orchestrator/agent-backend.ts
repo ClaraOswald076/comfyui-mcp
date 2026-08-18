@@ -274,6 +274,17 @@ export interface AgentBackend {
   setModel?(model: string): Promise<void>;
   /** Models the current account can use (empty if `modelEnumeration` is false). */
   listModels(): Promise<ModelChoice[]>;
+  /**
+   * #1516 — fetched BYTES of AUTOMATIC run-completion previews this backend has
+   * actually delivered into the CURRENT provider conversation (ImageRefs flagged
+   * `automatic`; a user's explicit attachments are never counted). PanelAgent
+   * reads this when composing an injection so the cumulative per-conversation
+   * byte budget (preview-budget.ts) is enforced against real fetch sizes, not a
+   * count-times-constant guess. Optional: a backend that does not report bytes
+   * is bounded by the image COUNT alone. Reset by the backend whenever the
+   * underlying provider conversation changes (a fresh thread starts at zero).
+   */
+  automaticPreviewBytes?(): number;
   /** Permanently dispose of the backend's resources: kill any child process tree,
    *  remove listeners, drop the live connection. Called by PanelAgent.stop() and on
    *  every path that retires/replaces an agent (reset, effort restart, stopAll).
