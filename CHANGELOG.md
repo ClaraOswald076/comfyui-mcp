@@ -745,6 +745,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.2] - 2026-08-18
+
+### MCP
+
+#### Fixed
+- a new session resumes the downloads its predecessor's death orphaned (#1567)
+- upload tools return the subfolder-qualified reference a loader can use (#946)
+- stop shipping a preset library nothing reads (#1597)
+- search_custom_nodes tries the comfyui-prefixed registry id, so repo-name queries like WanVideoWrapper no longer false-empty (#773)
+- automatic previews stop at a per-conversation budget instead of compounding a Codex rollout without bound (#1516)
+- a fence the settling read proved live is reported BOUND, not unrestored (#980)
+- a download destination is judged by the one observation that produced it (#1371)
+
+
 ## [0.52.1] - 2026-08-17
 
 ### MCP
