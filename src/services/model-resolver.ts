@@ -18,7 +18,6 @@ import { downloadWithCache, probeRemoteModelPayload } from "./download-cache.js"
 import { reportDownloadProgress } from "./download-progress.js";
 import type { ResumeReporter } from "./download-resume-diag.js";
 import { modelNotFoundMessage } from "./model-root-scope.js";
-import { divergentInstallRefusal } from "./download-root-correspondence.js";
 import {
   resolveModelsDir,
   resolveModelsDirWithBases,
@@ -2282,13 +2281,6 @@ export interface ResolvedDownloadTarget {
   liveRootAtResolve?: string;
 }
 
-/** The models CATEGORY a target subfolder belongs to — its first segment. Live extra
- *  roots are category-scoped, so a `checkpoints` root must not vouch for a LoRA. */
-function normalizedSubfolderFor(targetSubfolder: string): string | undefined {
-  const first = (targetSubfolder ?? "").trim().replace(/\\/g, "/").split("/")[0];
-  return first || undefined;
-}
-
 /**
  * The SINGLE source of truth for a model download's final on-disk destination,
  * shared by downloadModel (the writer) AND the background job registry (which
@@ -2333,34 +2325,38 @@ export async function resolveDownloadTarget(
     );
   }
   // #1371 — a stale COMFYUI_PATH wrote a model into a DIFFERENT local install than the
-  // one serving the session. The destination is rooted at the server's own models dir
-  // when it can be, but falls back to <COMFYUI_PATH>/models when the server was not
-  // launched with --base-directory — and nothing then checked that the fallback belongs
-  // to THAT server.
+  // one serving the session. There is deliberately NO divergent-install refusal in THIS
+  // function anymore. The one added for this issue took a SECOND, fresh server
+  // observation here (isUnderLiveModelRoots re-resolved the models dir), and nothing
+  // pinned the server across that await. Characterization tests (#1550) measured the
+  // result: in the steady state — one server, both observations agreeing — the branch
+  // could never fire, because a source that admits the guard (the destination did NOT
+  // come from the server) can never be one that answers it (the evidence bails unless
+  // the server NAMED the root); it fired only when the server changed mid-resolution,
+  // i.e. it judged the destination against a DIFFERENT server than the one that
+  // produced it. Nondeterministic exactly where it was needed, unsound where it fired.
   //
-  // A server can still name its install root through its main.py argv. When it does and
-  // the destination is outside it, the installs are PROVABLY different. Positive
-  // evidence, so this does not reintroduce the false-refusal class the content check's
-  // own note warns about — and it is skipped entirely when the destination came from
-  // the live server (nothing to disagree with) or when no root can be derived.
-  if (!liveRootAtResolve) {
-    const membership = await isUnderLiveModelRoots(targetDir, normalizedSubfolderFor(targetSubfolder));
-    const refusal = divergentInstallRefusal({
-      targetDir,
-      inRoots: membership.inRoots,
-      liveRoot: membership.liveRoot,
-      // Defensive: decoration on a refusal, and an existing suite mocks config.js
-      // without this export — a message detail must never fail a download.
-      serverUrl: (() => {
-        try {
-          return getComfyUIBaseUrl();
-        } catch {
-          return undefined;
-        }
-      })(),
-    });
-    if (refusal) throw new ModelError(refusal, { path: targetDir });
-  }
+  // The coverage for this report is instead deterministic and lives with the SINGLE
+  // resolution that produced targetDir, so the destination and the evidence can never
+  // come from two different observations of the server:
+  //   - resolveModelsDirWithBases REFUSES a configured base the server's own listing
+  //     positively contradicts (output-dir.ts, "DO NOT WRITE INTO A BASE THE SERVER
+  //     DEMONSTRABLY DOES NOT READ"), and refuses an unanchorable relative-main.py
+  //     server outright unless the base corroborates it;
+  //   - assertDestinationVisibleToLiveServer (same snapshot) refuses the #369
+  //     signature — a POPULATED on-disk category the live listing does not account
+  //     for;
+  //   - the writer binds to liveRootAtResolve and re-checks currentLiveModelsRoot
+  //     before any bytes move, so a mid-flight server swap is refused when both roots
+  //     are server-named;
+  //   - verifyLandedModel confirms the landed file against the connected server AFTER
+  //     the write, so any residual wrong destination is reported, never a silent
+  //     success.
+  // What remains unguardable BY DESIGN: the server's root is known but not on this
+  // filesystem (Docker / port-forward / remote mount), where COMFYUI_PATH may
+  // legitimately be the mapped host path. No local evidence can distinguish that from
+  // a stale install, and the maintainer ruling is to proceed with the existing
+  // unconfirmed-visibility disclosure rather than refuse a correct setup.
   return { targetDir, filename: resolvedFilename, targetPath, liveRootAtResolve };
 }
 
