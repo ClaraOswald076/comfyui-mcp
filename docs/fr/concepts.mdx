@@ -1,0 +1,99 @@
+---
+title: "Comment ça fonctionne"
+description: "Le modèle derrière les outils — transports, l'API ComfyUI-Manager, et les modes local/distant/cloud."
+icon: "diagram-project"
+---
+
+## Le modèle mental
+
+ComfyUI MCP est une couche mince et bien décrite au-dessus d'une **instance
+ComfyUI en cours d'exécution**. La plupart des outils parlent à cette
+instance via son API HTTP/WebSocket, donc ils marchent de la même façon que
+ComfyUI soit local, distant (`--comfyui-url`), ou
+[Comfy Cloud](https://cloud.comfy.org) (`COMFYUI_API_KEY`).
+
+<Steps>
+  <Step title="Génération et workflows → API HTTP ComfyUI">
+    `generate_image`, `enqueue_workflow`, file/historique/stats-système, et les
+    outils de création de workflows appellent `/prompt`, `/queue`, `/history`,
+    `/object_info`, etc. de ComfyUI. La mise en file est lancer-et-oublier : vous
+    obtenez un `prompt_id` tout de suite et les résultats arrivent via une
+    notification de fin. En mode cloud, un `cloud-client` alternatif dispatche
+    les mêmes opérations vers `cloud.comfy.org` via `X-API-Key`.
+  </Step>
+  <Step title="Nœuds personnalisés et modèles → ComfyUI-Manager (HTTP), avec un repli sous-processus">
+    L'installation/mise à jour/instantané/bisect de nœuds et les installations
+    de dépendances de workflows préfèrent l'API HTTP de
+    [ComfyUI-Manager](https://github.com/Comfy-Org/ComfyUI-Manager) (donc elles
+    marchent aussi contre des instances distantes), avec un repli sur
+    `cm-cli` / `git` / `pip`/`uv` contre une installation locale là où l'API
+    ne peut pas faire le travail.
+  </Step>
+  <Step title="Installation et opérations système de fichiers → local seulement">
+    Installer ComfyUI, mettre à jour le cœur, supprimer des fichiers de
+    modèles, lire les logs du serveur, et lister le répertoire de sortie
+    opèrent sur le système de fichiers local. Ils exigent un `COMFYUI_PATH`
+    connu et renvoient une erreur claire en mode distant ou cloud.
+  </Step>
+  <Step title="WebSocket → local + distant, pas cloud">
+    Les notifications de fin de job s'attachent au WebSocket de ComfyUI là où
+    c'est disponible. Comfy Cloud n'a pas de WebSocket — le surveillant de
+    jobs retombe sur son chemin de sondage HTTP existant.
+  </Step>
+</Steps>
+
+<Note>
+  Règle empirique : tout ce qui **lit ou exécute** le serveur connecté marche
+  dans n'importe quel mode ; tout ce qui **installe du logiciel ou touche des
+  fichiers sur disque** a besoin d'une installation locale. La matrice
+  complète de parité fonctionnelle est dans
+  [Configuration → Modes de déploiement](/docs/fr/configuration#modes-de-déploiement).
+</Note>
+
+## Auto-réparation : le chien de garde file/rendu
+
+Une étape de sampler haute résolution coincée laissait autrefois l'agent
+empiler des jobs derrière un rendu zombie qu'il ne pouvait ni voir ni tuer.
+Trois gardes au mieux de leur capacité ferment ce trou, pour que l'agent
+arrête de remettre en file à l'aveugle derrière un rendu coincé :
+
+- **Rétropression** — `panel_run` ajoute un QUEUE WARNING à son résultat
+  quand un rendu tourne déjà, pour que l'agent n'empile pas derrière.
+- **Détection de blocage** — un WebSocket passif vers ComfyUI suit le
+  prompt / nœud / progression en cours ; une étape qui cesse d'avancer
+  au-delà du seuil
+  ([`COMFYUI_MCP_STALL_S`](/docs/fr/configuration#orchestrateur-du-panneau-et-le-pont),
+  défaut 180 s) ajoute en tête une note STALL/BACKLOG d'une ligne au
+  prochain tour de l'agent.
+- **Annulation qui escalade** — `queue` (action:"cancel") interrompt,
+  **vérifie** que le job s'est vraiment arrêté (dans
+  [`COMFYUI_MCP_INTERRUPT_S`](/docs/fr/configuration#surveillance-des-jobs),
+  défaut 30 s), puis escalade vers `/free` et signale le rendu WEDGED (en
+  suggérant `restart_comfyui`) s'il ne meurt toujours pas ;
+  `clear_pending` abandonne tous les jobs en attente dans le même appel.
+
+Tout est fail-safe : si le WebSocket du chien de garde ne s'ouvre jamais,
+rien ne change. L'agent peut aussi raisonner sur les couleurs d'une image
+sans aller-retour vision via `get_image (action:"analyze_color")` (palette
+dominante, stats moyenne + luminance, vérifications de contraste).
+
+## Catégories d'outils
+
+<CardGroup cols={2}>
+  <Card title="Génération d'images" icon="image" href="/docs/tools/image-generation" />
+  <Card title="Exécution de workflows" icon="play" href="/docs/tools/workflow-execution" />
+  <Card title="Création de workflows" icon="pen-ruler" href="/docs/tools/workflow-authoring" />
+  <Card title="Bibliothèque de workflows" icon="folder-open" href="/docs/tools/workflow-library" />
+  <Card title="Assets et images" icon="images" href="/docs/tools/assets-images" />
+  <Card title="Modèles" icon="box" href="/docs/tools/models" />
+  <Card title="Nœuds personnalisés" icon="puzzle" href="/docs/tools/custom-nodes" />
+  <Card title="Nœuds API" icon="cloud" href="/docs/tools/api-nodes" />
+  <Card title="Installation et environnement" icon="wrench" href="/docs/tools/install-environment" />
+  <Card title="Contrôle de processus" icon="power" href="/docs/tools/process-control" />
+  <Card title="Défauts, stats et skills" icon="sliders" href="/docs/tools/defaults-stats-skills" />
+</CardGroup>
+
+<Info>
+  La Référence des outils est générée à partir des schémas d'outils MCP en
+  direct (`npm run docs:gen`), donc elle ne dérive jamais du code.
+</Info>

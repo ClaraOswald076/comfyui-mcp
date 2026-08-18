@@ -320,8 +320,29 @@
                 "pages": [
                   "fr/index",
                   "fr/quickstart",
+                  "fr/using-tools",
+                  "fr/local-vs-comfy-cloud",
                   "fr/installation",
+                  "fr/roadmap"
+                ]
+              },
+              {
+                "group": "Configuration",
+                "pages": [
+                  "fr/configuration",
+                  "fr/remote-connector",
+                  "fr/cloud-deployment",
+                  "fr/docker",
+                  "fr/self-hosted-relay",
+                  "fr/concepts",
+                  "fr/plugin",
                   "fr/panel",
+                  "fr/apps",
+                  "fr/mobile",
+                  "fr/third-party-hosts",
+                  "fr/backends",
+                  "fr/local-llms",
+                  "fr/arena",
                   "fr/troubleshooting"
                 ]
               }

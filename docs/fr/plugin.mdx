@@ -1,0 +1,135 @@
+---
+title: "Plugin Claude Code"
+description: "comfyui-mcp est un plugin Claude Code complet : 39 skills IA, 11 commandes slash, 4 agents autonomes, et 3 hooks par-dessus les 37 outils MCP — une expertise ComfyUI qui grandit à chaque version."
+icon: "puzzle-piece"
+---
+
+`comfyui-mcp` n'est pas seulement un serveur MCP — il se livre comme un
+**plugin Claude Code** complet. Installer le plugin donne à Claude une
+connaissance experte, spécifique aux modèles, de ComfyUI pour qu'il choisisse
+le bon sampler, CFG, résolution et fichiers de modèles sans essais-erreurs.
+
+```bash
+# In Claude Code
+/plugin marketplace add artokun/comfyui-mcp
+/plugin install comfy
+```
+
+## 39 skills IA — et ça grandit
+
+Les skills sont des documents de connaissance soignés que Claude charge à la
+demande. Chaque famille de modèles reçoit des paramètres de génération, des
+graphes de nœuds, des URL de téléchargement de modèles soignées, et un guide
+des modes d'échec :
+
+| Skill | Ce que Claude apprend |
+|---|---|
+| `flux-txt2img` | Flux.1 Dev/Schnell + Flux 2 Klein — pièges BF16 vs FP8, câblage dual-CLIP, choix de VAE |
+| `wan-t2v-video` / `wan-flf-video` | Workflows WAN 2.x texte-vers-vidéo et première-dernière-image |
+| `wan-scail-replacement` | Remplacement de personnage in-video SCAIL-2 — règle cadrage-de-référence→échelle, pièges de réglage et de compositing |
+| `ltxv2-video` | LTX-2.3 (et LTX-2 19B) — UNet GGUF, modèle distillé, LoRA de contrôle caméra, upscale en deux étapes, correctif kornia |
+| `qwen-txt2img` / `qwen-image-edit` | Génération Qwen-Image et édition par instruction |
+| `z-image-txt2img` | Workflows Z-Image Turbo |
+| `ideogram-ultra` | Ideogram 4 — texte-vers-image open-weight, prompting par zones, logos / posters / texte lisible |
+| `ernie-image` | ERNIE-Image — texte-vers-image rapide, rendu de texte multilingue précis, tourne sous 8 Go de VRAM |
+| `anima-base` | ANIMA 1.0 — modèle anime/illustration ~2B, tags Danbooru + langage naturel, inpainting anime, sous 6 Go de VRAM |
+| `anima-lora-trainer` | Entraîner des LoRA anime personnalisés — trainer Gradio kohya `sd-scripts`, sous 6 Go de VRAM |
+| `ai-toolkit-trainer` | Entraîner des LoRA WAN 2.2 + Z-Image personnalisés (personnes / styles / mouvement) — ostris AI-Toolkit, local ou RunPod |
+| `installer-packs` | Utiliser, construire et dériver des packs d'installation en une commande — et inviter les utilisateurs à contribuer de nouveaux packs en amont |
+| `panel-node-pack-sync` | Garder le pack de nœuds du panneau latéral aligné avec l'orchestrateur après une mise à jour — détection de décalage de version, une épingle de version dont on avertit plutôt que de l'écraser, et une synchro dont le résultat est relu depuis le disque |
+| `model-compatibility` | Quelle paire VAE/CLIP/text-encoder va avec quelle architecture — la source n°1 des workflows cassés |
+| `model-registry` | URL de téléchargement soignées + répertoires cibles pour chaque modèle que les skills référencent — grandit à chaque version |
+| `civitai` | Boucle native découverte Civitai → téléchargement local / câblage / génération via `download_model` `action:"search_civitai"` intégré (pas de clé, pas de serveur supplémentaire) ; le [Civitai MCP](https://mcp.civitai.com/mcp) officiel est un add-on de surface communautaire optionnel, pas bundlé |
+| `comfyui-core` | Sémantique de file, d'historique et d'API |
+| `comfyui-node-registry` | Création + publication de packs de nœuds personnalisés sur le Comfy Registry |
+| `comfyui-frontend-extensions` | Création d'extensions frontend v1/v2 (onglets de barre latérale, widgets) |
+| `rgthree` | Configurer rgthree-comfy — bascules de groupe Fast Groups Bypasser/Muter (nœuds frontend-only absents de `/object_info`, réglés via les PROPERTIES du nœud pas les widgets), empilement Power Lora Loader, bus Context |
+| `director` | Direction de scène multi-plans pour les pipelines vidéo |
+| `prompt-engineering` | Prompting spécifique à l'architecture (langage naturel vs tags) |
+| `troubleshooting` | OOM, nœuds manquants, dérive de version — arbres de diagnostic |
+| `comfyui-launch-flags` | La matrice des drapeaux de lancement VRAM/attention/cache/perf — `--reserve-vram`, `--novram`+`--cache-none`, `--use-sage-attention` vs `--use-pytorch-cross-attention` (Z-Image), plus les notes de pile d'accélération Blackwell/RTX 5000 |
+
+De nouvelles skills arrivent à chaque version — générées depuis les packs
+populaires du registre via l'outil intégré `list_packs`
+(`action: "generate_skill"`), puis soignées par un humain.
+
+**Essayez la connaissance avant de brancher quoi que ce soit** — chaque skill
+est un fichier markdown simple, utile tout seul. Le plus largement applicable
+est
+[`prompt-engineering`](https://github.com/artokun/comfyui-mcp/blob/main/plugin/skills/prompt-engineering/SKILL.md)
+— la limite de 77 jetons de CLIP et le découpage `BREAK`, la syntaxe de
+poids, et la stratégie par architecture (pourquoi Flux veut du langage
+naturel et pas de prompt négatif tandis que SD1.5 veut des tags). Lisez-le
+dans le navigateur, ou collez-le dans le contexte de n'importe quel agent
+comme prompt système — aucun ComfyUI, MCP ni installation requis. Quand
+vous connectez le plugin complet, les agents chargent les mêmes fichiers
+automatiquement (`list_packs` avec `action: "skill_read"`).
+
+### Recherche Civitai — intégrée
+
+`download_model` `action:"search_civitai"` cherche sur Civitai nativement
+(API REST publique, pas de clé, pas de serveur supplémentaire) : mot-clé +
+filtres `types` + `base_models` (« un LoRA **Flux** »), SFW seulement par
+défaut, et chaque résultat renvoie le `model_version_id` que
+`action:"download_civitai"` prend directement — plus les **mots déclencheurs**
+du modèle pour le prompt. Parce que c'est un outil de première classe, ça
+marche sur **chaque backend**, y compris les petits modèles locaux derrière
+le routeur compact. La skill `civitai` enseigne toute la passation
+découverte → téléchargement → génération.
+
+**Clé API optionnelle.** La recherche n'en a besoin d'aucune.
+`CIVITAI_API_TOKEN` déverrouille les téléchargements gated/early-access et
+les résultats de recherche gated — une seule variable alimente à la fois
+la recherche et le téléchargement.
+
+**Optionnel : le Civitai MCP officiel.** Pour la surface communautaire
+au-delà de chercher→installer (parcourir les images d'exemple + leurs
+paramètres de génération, publier, collections), associez le
+[serveur distant officiel](https://mcp.civitai.com/mcp) de Civitai —
+plus auto-bundlé, ajoutez-le une fois :
+
+```bash
+claude mcp add --transport http civitai https://mcp.civitai.com/mcp \
+  --header "Authorization: Bearer YOUR_CIVITAI_API_KEY"
+```
+
+## 11 commandes slash
+
+`/comfy:gen` (générer depuis un prompt), `/comfy:debug` (diagnostiquer un
+workflow en échec), `/comfy:install` (installer des packs de nœuds),
+`/comfy:viz` (workflow → Mermaid), `/comfy:batch`, `/comfy:compare`,
+`/comfy:convert`, `/comfy:gallery`, `/comfy:recipe`, `/comfy:director`,
+`/comfy:node-skill`.
+
+## 4 agents autonomes
+
+- **comfy-explorer** — plonge dans le source d'un pack de nœuds pour le
+  documenter
+- **comfy-researcher** — énoncé de problème → recommandations de packs
+  classées
+- **comfy-debugger** — trouve la cause racine des workflows en échec depuis
+  l'historique + les logs
+- **comfy-optimizer** — réglage VRAM et vitesse pour un GPU donné
+
+## Le panneau latéral — pas de clés API
+
+<Note>
+  Le panneau latéral se livre comme son propre pack, **sur le Comfy Registry
+  et dans ComfyUI-Manager sous `comfyui-agent-panel`** — cherchez-le là et
+  choisissez **Latest**, pas Nightly. Guide complet :
+  [Panneau latéral](/docs/fr/panel).
+</Note>
+
+La barre latérale [comfyui-mcp-panel](https://github.com/artokun/comfyui-mcp-panel)
+exécute un agent autonome sur votre **abonnement Claude** (pas de
+facturation API au jeton). Installez le pack, ouvrez l'onglet Agent, et
+cliquez sur **Connecter** — il démarre l'[orchestrateur du
+panneau](/docs/fr/configuration) à la demande ; demandez-lui une image, un
+workflow ou une modification et il travaille contre votre ComfyUI.
+
+## Hooks
+
+Trois hooks gardent les sessions de génération serrées : **vérifications
+VRAM pré-vol** avant de mettre un workflow en file, **notifications de fin
+de job**, et **avertissements d'enregistrement** avant les opérations
+destructrices.

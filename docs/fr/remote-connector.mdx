@@ -1,0 +1,173 @@
+---
+title: "Connecteur distant / hébergé"
+description: "Exposez comfyui-mcp comme un serveur MCP Streamable-HTTP authentifié et joignable publiquement — ajoutez-le aux Connecteurs personnalisés de Claude Desktop ou à n'importe quel client distant, une seule commande."
+icon: "globe"
+---
+
+`comfyui-mcp` parle le même transport MCP **Streamable-HTTP** que les
+connecteurs hébergés (par exemple le Custom Connector propre de Comfy,
+`cloud.comfy.org/mcp`). En une commande il tourne comme un serveur
+authentifié par jeton derrière un tunnel HTTPS public, pour que vous puissiez
+l'ajouter à **Claude Desktop → Connectors** ou l'appeler en headless depuis
+n'importe où.
+
+<Note>
+C'est opt-in. Le transport `stdio` par défaut (et le `--http` en clair sur
+loopback) se comporte exactement comme avant — ouvert et local. L'auth et le
+tunnel ne s'activent que lorsque vous définissez un jeton ou passez
+`--tunnel`.
+</Note>
+
+<Note>
+**Vous cherchez plutôt à piloter un pod ComfyUI distant (par ex. RunPod) avec
+le panneau agent ?** C'est une fonctionnalité différente — voir
+[Déploiement cloud](/docs/fr/cloud-deployment). Cette page concerne
+l'exposition du **serveur MCP comfyui-mcp lui-même** à des clients distants
+comme Claude Desktop ; elle ne touche ni ComfyUI ni le pont du panneau.
+Les deux se trouvent utiliser un quick tunnel cloudflared sous le capot, ce
+qui est la façon la plus facile de les confondre.
+</Note>
+
+## Tunnel en une commande
+
+```bash
+npx -y comfyui-mcp@latest --tunnel
+```
+
+Cela fait quatre choses :
+
+1. Force le transport HTTP (`MCP_TRANSPORT=http`).
+2. Génère un jeton d'auth aléatoire fort si vous n'en avez pas défini un.
+3. Démarre un quick tunnel [cloudflared](https://github.com/cloudflare/cloudflared)
+   vers le port MCP local.
+4. Affiche un bloc prêt à coller : l'URL publique `https://…/mcp`, le jeton,
+   et un extrait de connecteur Claude Desktop.
+
+La sortie ressemble à :
+
+```text
+════════════════════════════════════════════════════════════════════
+ ComfyUI MCP — Remote / Hosted Connector is LIVE
+════════════════════════════════════════════════════════════════════
+ Public MCP URL : https://shiny-otter-1234.trycloudflare.com/mcp
+ Auth token     : 9f2c…<redacted>
+ ...
+════════════════════════════════════════════════════════════════════
+```
+
+<Warning>
+Laissez le terminal ouvert. Un **quick tunnel** cloudflared est éphémère —
+son URL change à chaque lancement et il se ferme quand le processus se
+termine. Pour un nom d'hôte stable, lancez votre propre
+[tunnel cloudflared nommé](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
+pointé vers le port HTTP local à la place.
+</Warning>
+
+### cloudflared n'est pas installé ?
+
+`cloudflared` se livre comme une dépendance optionnelle. Si le binaire est
+introuvable, le serveur continue de tourner en local et affiche un guide
+d'installation :
+
+```bash
+npm install -g cloudflared          # cross-platform
+brew install cloudflared            # macOS
+winget install cloudflare.cloudflared  # Windows
+```
+
+Puis relancez avec `--tunnel`.
+
+## L'ajouter à Claude Desktop
+
+Ouvrez **Claude Desktop → Settings → Connectors → Add custom connector** et
+remplissez :
+
+| Champ  | Valeur |
+|--------|-------|
+| Name   | `ComfyUI` |
+| URL    | l'URL `https://…/mcp` affichée |
+| Header | `X-API-Key: <token>` (ou `Authorization: Bearer <token>`) |
+
+Enregistrez, puis activez le connecteur dans une conversation. Les outils
+ComfyUI apparaissent exactement comme pour le serveur stdio local.
+
+## Config headless / programmatique
+
+Tout client MCP qui prend en charge un serveur Streamable-HTTP distant
+marche. Fournissez l'URL et l'en-tête d'auth :
+
+```json
+{
+  "mcpServers": {
+    "comfyui": {
+      "url": "https://shiny-otter-1234.trycloudflare.com/mcp",
+      "headers": { "X-API-Key": "<token>" }
+    }
+  }
+}
+```
+
+Les deux formes d'en-tête sont acceptées sur **chaque** requête vers `/mcp` :
+
+```bash
+# X-API-Key (matches Comfy Cloud's convention)
+curl -H "X-API-Key: <token>" https://…/mcp
+
+# Authorization: Bearer
+curl -H "Authorization: Bearer <token>" https://…/mcp
+```
+
+## Mise en place manuelle (apportez votre propre tunnel / proxy)
+
+Si vous préférez gérer l'endpoint public vous-même, lancez le transport HTTP
+avec un jeton fixe et placez-le derrière votre propre reverse proxy, tunnel
+ou VPN :
+
+```bash
+COMFYUI_MCP_HTTP_TOKEN=my-long-random-secret \
+  npx -y comfyui-mcp@latest --http --host 0.0.0.0 --port 9100
+```
+
+Puis pointez votre tunnel/proxy vers `http://127.0.0.1:9100/mcp`.
+
+<Warning>
+Se lier à un hôte non-loopback (par ex. `0.0.0.0`) **sans** jeton est un
+**échec dur** — le serveur refuse de démarrer plutôt que d'exposer un
+endpoint `/mcp` ouvert hors de la machine. Définissez
+`COMFYUI_MCP_HTTP_TOKEN` (recommandé), utilisez `--tunnel`, ou liez un hôte
+loopback. Si vous voulez vraiment un endpoint ouvert (par ex. derrière
+votre propre proxy authentifiant), optez-y explicitement avec
+`--allow-unauthenticated-non-loopback` (env `COMFYUI_MCP_ALLOW_UNAUTH=1`),
+ce qui rétrograde l'échec en avertissement.
+</Warning>
+
+## Référence d'auth
+
+| Réglage | Effet |
+|---------|--------|
+| `COMFYUI_MCP_HTTP_TOKEN` | Jeton secret partagé exigé sur `/mcp`. Non défini → l'endpoint est ouvert. |
+| `--token <value>` | Identique à la variable d'environnement ; le drapeau CLI l'emporte sur la variable. |
+| `--tunnel` / `MCP_TUNNEL=1` | Forcer HTTP, auto-générer un jeton s'il n'est pas défini, ouvrir un tunnel cloudflared. |
+| `--http` / `MCP_TRANSPORT=http` | Transport HTTP sans tunnel (l'auth s'applique encore si un jeton est défini). |
+| `--host`, `--port` | Adresse de liaison (défaut `127.0.0.1:9100`). |
+| `--allow-unauthenticated-non-loopback` / `COMFYUI_MCP_ALLOW_UNAUTH=1` | Opter pour un `/mcp` OUVERT sur un hôte non-loopback. Sans ça, cette combinaison est un échec dur au démarrage. |
+
+Les jetons sont comparés en temps constant, et la barrière est appliquée sur
+chaque méthode HTTP (`POST`/`GET`/`DELETE`) à l'endpoint MCP. Lier un hôte
+non-loopback sans jeton est refusé au démarrage sauf si la trappe ci-dessus
+est définie.
+
+## Feuille de route : OAuth
+
+L'auth d'aujourd'hui est un **jeton secret partagé manuel** (Bearer /
+`X-API-Key`), qui couvre à la fois le chemin headless et le Custom Connector
+de Claude Desktop. Un flux de connexion **OAuth** complet dans le navigateur
+(comme le connecteur hébergé de Comfy) est un suivi prévu — c'est un
+changement plus lourd et il n'est pas requis pour se connecter manuellement.
+
+## Voir aussi
+
+- [Déploiement cloud](/docs/fr/cloud-deployment) — piloter un pod ComfyUI
+  distant avec le panneau agent (un tunnel différent, un but différent)
+- [Configuration](/docs/fr/configuration) — la référence complète des
+  variables d'environnement
