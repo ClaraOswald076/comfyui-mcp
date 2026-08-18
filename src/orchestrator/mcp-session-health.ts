@@ -178,6 +178,9 @@ function namedDegraded(degraded: readonly DegradedMcpServer[]): string {
  *
  *  - `reconnect-failed`: an automatic reconnect was tried and the re-read still
  *    reports the server down;
+ *  - `unverified`: an automatic reconnect was tried but the status re-read that
+ *    would judge it could not be read — so the outcome is not claimed either
+ *    way ("did not come back" would be a claim nobody checked);
  *  - `not-retriable`: the status (`needs-auth`, `disabled`) is not one an
  *    automatic reconnect can clear — nothing was attempted;
  *  - `unsupported`: the harness exposes no reconnect to ask for — nothing
@@ -188,16 +191,18 @@ function namedDegraded(degraded: readonly DegradedMcpServer[]): string {
  */
 export function unrecoveredMcpNotice(
   degraded: readonly DegradedMcpServer[],
-  why: "reconnect-failed" | "not-retriable" | "unsupported",
+  why: "reconnect-failed" | "unverified" | "not-retriable" | "unsupported",
 ): string {
   if (degraded.length === 0) return "";
   const plural = degraded.length > 1;
   const reason =
     why === "reconnect-failed"
       ? `the automatic reconnect did not bring ${plural ? "them" : "it"} back`
-      : why === "not-retriable"
-        ? "an automatic reconnect cannot clear this status, so none was attempted"
-        : "this harness offers no reconnect to ask for";
+      : why === "unverified"
+        ? "an automatic reconnect was attempted, but its outcome could not be read back"
+        : why === "not-retriable"
+          ? "an automatic reconnect cannot clear this status, so none was attempted"
+          : "this harness offers no reconnect to ask for";
   return (
     `MCP ${plural ? "servers" : "server"} ${namedDegraded(degraded)} ${plural ? "are" : "is"} ` +
     `unavailable to the agent — ${reason}. ` +

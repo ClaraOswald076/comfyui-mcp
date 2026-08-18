@@ -512,6 +512,10 @@ export class ClaudeBackend implements AgentBackend {
       (d) => this.mcpDown.get(d.name) !== true && reconnectableMcpStatus(d.status),
     );
     const attempted = new Set<string>();
+    // Whether the post-attempt status re-read was READ. "Reconnect failed" is
+    // only claimable when it was — otherwise the still-down reading is the
+    // pre-attempt one and the notice must not assert an outcome nobody saw.
+    let verdictRead = true;
     if (typeof q.reconnectMcpServer === "function") {
       for (const d of triable) {
         attempted.add(d.name);
@@ -527,6 +531,7 @@ export class ClaudeBackend implements AgentBackend {
         // pre-attempt reading — the servers stay "down" — the safe direction.
         const after = await this.pollMcpStatus(q);
         if (after) reported = after;
+        else verdictRead = false;
       }
     }
 
@@ -568,11 +573,15 @@ export class ClaudeBackend implements AgentBackend {
     );
     for (const d of unreported) this.mcpDown.set(d.name, true);
     if (failedAttempt.length) {
+      // "Did not bring it back" is claimable only off the post-attempt re-read;
+      // when that re-read could not be read the attempt is reported WITHOUT an
+      // outcome — "did not come back" would be a claim nobody checked (#1228).
+      const why = verdictRead ? "reconnect-failed" : "unverified";
       this.reportDegradedMcp(failedAttempt, reported, this.registrySessionId ?? "", "lost");
       events.push({
         type: "error",
         sessionNotice: true,
-        message: unrecoveredMcpNotice(failedAttempt, "reconnect-failed"),
+        message: unrecoveredMcpNotice(failedAttempt, why),
       });
     }
     if (notRetriable.length) {

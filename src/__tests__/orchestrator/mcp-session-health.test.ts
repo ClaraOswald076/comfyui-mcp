@@ -185,6 +185,17 @@ describe("unrecoveredMcpNotice — says which dead end this is, and stops", () =
     expect(note).toMatch(/automatic reconnect did not bring it back/);
   });
 
+  it("claims no outcome when the reconnect's verdict could not be read back (#1228)", () => {
+    // "We tried and it failed" is only sayable off the post-attempt status
+    // re-read; when that read is unavailable the notice reports the attempt
+    // without asserting an outcome nobody checked.
+    const note = unrecoveredMcpNotice([{ name: "panel", status: "failed" }], "unverified");
+    expect(note).toContain("panel");
+    expect(note).toMatch(/reconnect was attempted/);
+    expect(note).toMatch(/could not be read back/);
+    expect(note).not.toMatch(/did not bring/);
+  });
+
   it("says when nothing was attempted, and why", () => {
     // "We tried and failed" and "there was nothing to try" are different
     // situations; the reader must not have to guess which one they are in.

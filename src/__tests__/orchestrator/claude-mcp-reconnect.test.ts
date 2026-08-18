@@ -50,8 +50,9 @@ const hoisted = vi.hoisted(() => ({
       }
     }
   })(),
-  /** Poll answers, in order; the LAST one repeats when the script runs out. */
-  statusScript: [] as Array<Array<{ name: string; status: string }>>,
+  /** Poll answers, in order; the LAST one repeats when the script runs out.
+   *  The entry "throw" makes that poll throw (an unreadable status report). */
+  statusScript: [] as Array<Array<{ name: string; status: string }> | "throw">,
   polls: 0,
   /** Servers the harness was asked to reconnect, in order. */
   reconnectCalls: [] as string[],
@@ -74,7 +75,9 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
         hoisted.polls += 1;
         const script = hoisted.statusScript;
         if (script.length === 0) throw new Error("no status available");
-        return script.length > 1 ? script.shift() : script[0];
+        const next = script.length > 1 ? script.shift()! : script[0];
+        if (next === "throw") throw new Error("no status available");
+        return next;
       },
       ...(hoisted.omitReconnect
         ? {}
@@ -290,5 +293,25 @@ describe("a mid-session MCP drop is met with one bounded reconnect (#1524)", () 
     expect(notices).toHaveLength(2);
     expect(notices[0].message).toMatch(/started without/);
     expect(notices[1].message).toMatch(/connected again/);
+  });
+
+  it("an attempt whose verdict cannot be read back claims no outcome (#1228)", async () => {
+    // The reconnect ran but the status re-read that would judge it is
+    // unavailable. The server is still reported — clearing a degradation
+    // nobody checked is the false success to avoid — but "did not come back"
+    // would be a claim nobody checked either, so the notice names the attempt
+    // and stops there.
+    hoisted.statusScript = [PANEL_DOWN, "throw"];
+    const drive = await startDrive(INIT_HEALTHY);
+    await drive.endTurn();
+    await drive.finish();
+
+    expect(hoisted.reconnectCalls).toEqual(["panel"]);
+    const notices = noticesOf(drive.events);
+    expect(notices).toHaveLength(1);
+    expect(notices[0].message).toContain("panel");
+    expect(notices[0].message).toMatch(/reconnect was attempted/);
+    expect(notices[0].message).toMatch(/could not be read back/);
+    expect(notices[0].message).not.toMatch(/did not bring it back/);
   });
 });
