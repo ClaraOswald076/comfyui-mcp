@@ -1121,8 +1121,12 @@ function cacheDir(): string {
 }
 
 /** #1526 — expose the env-derived cache root so its normalization is testable
- *  without reaching into module internals or touching the filesystem. */
-export const __downloadCacheTestHooks = { cacheDir };
+ *  without reaching into module internals or touching the filesystem.
+ *  #1567 adds `cachePathForUrl` so a test can stage a `.partial` under a SPECIFIC
+ *  header identity (the writer's own derivation) instead of re-implementing the
+ *  hash — a fixture derived from a parallel implementation cannot falsify the
+ *  lookup it feeds (#1370). */
+export const __downloadCacheTestHooks = { cacheDir, cachePathForUrl };
 
 function cacheSizeLimitBytes(): number {
   const raw = Number(process.env.COMFYUI_LRU_CACHE_SIZE_GB ?? "0");
@@ -3438,14 +3442,24 @@ export function stagedPartialPathForUrl(url: string): string {
  * A zero-byte partial reports as absent: resuming from it saves nothing, and calling it
  * resumable would restate this issue's bug in miniature — a claim of retained bytes where
  * there are none.
+ *
+ * `headers` are the representation-affecting request headers the lookup should assume —
+ * the staged name folds them into the cache identity (#467 P1-2), so a download that
+ * streamed WITH auth headers stages its partial under a different name than the bare URL
+ * produces. A caller looking for the partial a re-issued download would resume from must
+ * pass the headers that re-issue would send NOW (see
+ * `findResumablePartialForLocalDownload` in model-resolver, #1567); omitting them keeps
+ * the historical bare-URL behaviour, whose scope the note on `stagedPartialPathForUrl`
+ * states. A miss still means "none found under this identity", never "none exists".
  */
 export async function findResumablePartial(
   url: string | undefined,
+  headers: Record<string, string> = {},
 ): Promise<{ path: string; bytes: number } | null> {
   if (typeof url !== "string" || !url.trim()) return null;
   let candidate: string;
   try {
-    candidate = stagedPartialPathForUrl(url.trim());
+    candidate = stagedPartialPathForTarget(cachePathForUrl(url.trim(), headers));
   } catch {
     return null;
   }

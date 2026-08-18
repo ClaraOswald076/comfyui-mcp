@@ -14,7 +14,7 @@ import {
 import { installModelViaManager } from "./node-management.js";
 import { ModelError, ValidationError, unreachableHostMessage } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
-import { downloadWithCache, probeRemoteModelPayload } from "./download-cache.js";
+import { downloadWithCache, findResumablePartial, probeRemoteModelPayload } from "./download-cache.js";
 import { reportDownloadProgress } from "./download-progress.js";
 import type { ResumeReporter } from "./download-resume-diag.js";
 import { modelNotFoundMessage } from "./model-root-scope.js";
@@ -2529,6 +2529,34 @@ function localAuthHeadersFor(
     headers["Authorization"] = `Bearer ${civitaiToken}`;
   }
   return headers;
+}
+
+/**
+ * #1567 (item 3) — the resumable `.partial` a LOCAL writer for `url` would pick up
+ * if the download were re-issued RIGHT NOW, or null when none is found.
+ *
+ * The bare-URL `findResumablePartial(url)` reproduces the writer's staged name only
+ * for an UNAUTHENTICATED download: the cache identity folds in the representation
+ * headers (#467 P1-2), and the common gated case — a CivitAI/HuggingFace token from
+ * the environment, exactly the #1567 reporter's setup — sends one, so its partial
+ * is staged under a name the bare URL never produces and the plain lookup reports
+ * "no partial" for gigabytes that are sitting on disk.
+ *
+ * This wrapper rebuilds the request the local streaming path would make TODAY —
+ * the same HF_ENDPOINT rewrite and the same env-credential header block
+ * `downloadModel` applies, through the same `localAuthHeadersFor` definition, so
+ * the lookup and the writer cannot drift apart — and stats the partial under THAT
+ * identity. Explicit per-request auth (and cloud credentials) are deliberately NOT
+ * reproducible here: a job record keeps no credential, so those partials miss, and
+ * a miss means "none found under the identity a re-issue would use now", never
+ * "none exists".
+ */
+export async function findResumablePartialForLocalDownload(
+  url: string,
+): Promise<{ path: string; bytes: number } | null> {
+  const wasHfUrl = /^https?:\/\/huggingface\.co([/?#]|$)/i.test(url);
+  const rewritten = applyHfEndpoint(url);
+  return findResumablePartial(rewritten, localAuthHeadersFor(rewritten, undefined, wasHfUrl));
 }
 
 /**

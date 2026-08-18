@@ -18,6 +18,7 @@ import { startHttpServer } from "./transport/http.js";
 import { resolveToolSurfacePolicy } from "./tools/tool-surface-filter.js";
 import { isLocalMode } from "./config.js";
 import { ensurePanelInstalled } from "./services/panel-installer.js";
+import { adoptOrphanedDownloadJobs } from "./services/download-jobs.js";
 import { checkAndSelfUpdate } from "./services/self-update.js";
 import { tr } from "./i18n/index.js";
 import { banner, labelRows, numberedSteps } from "./i18n/terminal-layout.js";
@@ -70,6 +71,47 @@ function ensurePanelOnLoad(): void {
       }
     })
     .catch(() => {});
+}
+
+/**
+ * #1567 (item 3) — resume the downloads the PREVIOUS session's death orphaned.
+ *
+ * A tool-session respawn (or a crash) kills every transfer that session owned and
+ * leaves their records reading "downloading" forever; recovery used to be cancel
+ * × N + re-issue × N by hand. The new session has everything a resume needs — the
+ * job records and the staged `.partial` files — so it adopts them itself. What gets
+ * adopted and what is deliberately left alone is decided inside
+ * adoptOrphanedDownloadJobs (proven-dead owners only, local route only, resumable
+ * partial required, redacted URLs refused).
+ *
+ * Fire-and-forget, hard-guarded, and never throws — it must never block or crash
+ * startup, mirrors the ensure-panel/self-update pattern. Silent when there is
+ * nothing to adopt: an ordinary boot has no orphans, and a boot line about zero
+ * downloads would be noise on every start.
+ */
+function adoptOrphanedDownloadsOnLoad(): void {
+  void adoptOrphanedDownloadJobs()
+    .then((adopted) => {
+      for (const a of adopted) {
+        logger.info(
+          `Adopted an orphaned download from a dead session (#1567): ` +
+            `${a.filename ?? a.id} — resuming from ${(a.resumedBytes / 1024 / 1024).toFixed(1)} MB ` +
+            `already staged on disk (id ${a.id}, tray ${a.trayId}).` +
+            (a.staleRecordLeft
+              ? ` The dead session's record file could not be deleted (a transient ` +
+                `filesystem error), so action:"status" may keep showing its stale row ` +
+                `for a while — it expires on its own.`
+              : ""),
+        );
+      }
+    })
+    .catch((err) => {
+      logger.warn(
+        `Orphaned-download adoption failed (#1567): ${err instanceof Error ? err.message : String(err)}. ` +
+          `Any downloads a previous session left behind stay on the manual path: ` +
+          `download_model action:"status", then cancel + re-issue each one.`,
+      );
+    });
 }
 
 /**
@@ -581,6 +623,10 @@ async function main() {
   ensurePanelOnLoad();
   // ...and self-check the npm registry for a newer published version (non-blocking).
   selfUpdateOnLoad();
+  // ...and resume any downloads the previous session's death orphaned (non-blocking).
+  // After the server is up deliberately: adoption re-issues real transfers, so it
+  // must not delay or endanger the transport coming up.
+  adoptOrphanedDownloadsOnLoad();
 }
 
 main().catch((err) => {
