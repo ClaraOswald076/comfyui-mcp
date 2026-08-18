@@ -1,0 +1,151 @@
+---
+title: "远程 / 托管连接器"
+description: "把 comfyui-mcp 暴露成带认证、可公网访问的 Streamable-HTTP MCP 服务器 —— 一条命令，就能加到 Claude Desktop 的自定义连接器或任何远程客户端。"
+icon: "globe"
+---
+
+`comfyui-mcp` 说的是托管连接器所用的同一种 **Streamable-HTTP** MCP 传输（例如 Comfy
+自己的 `cloud.comfy.org/mcp` 自定义连接器）。一条命令就能把它跑成带令牌认证、挂在公网
+HTTPS 隧道后面的服务器，于是你可以把它加到 **Claude Desktop → Connectors**，或从任何
+地方无界面调用。
+
+<Note>
+这是可选的。默认的 `stdio` 传输（以及回环上的普通 `--http`）行为和以前完全一样 ——
+开放且本地。只有你设置了令牌或传入 `--tunnel` 时，认证和隧道才会启用。
+</Note>
+
+<Note>
+**其实是想用智能体面板驱动远程 ComfyUI 实例（例如 RunPod）？** 那是另一个功能 ——
+见 [云端部署](/docs/zh/cloud-deployment)。本页讲的是把 **comfyui-mcp MCP 服务器本身**
+暴露给 Claude Desktop 这类远程客户端；它完全不碰 ComfyUI 或面板桥接。两者碰巧都在底层
+用 cloudflared 快速隧道，这也是最容易把它们搞混的地方。
+</Note>
+
+## 一条命令的隧道
+
+```bash
+npx -y comfyui-mcp@latest --tunnel
+```
+
+它会做四件事：
+
+1. 强制使用 HTTP 传输（`MCP_TRANSPORT=http`）。
+2. 如果你还没设置令牌，就生成一个足够强的随机认证令牌。
+3. 启动一条 [cloudflared](https://github.com/cloudflare/cloudflared) 快速隧道，
+   指向本地 MCP 端口。
+4. 打印一块可直接粘贴的内容：公网 `https://…/mcp` URL、令牌，以及 Claude Desktop
+   连接器片段。
+
+输出看起来像：
+
+```text
+════════════════════════════════════════════════════════════════════
+ ComfyUI MCP — Remote / Hosted Connector is LIVE
+════════════════════════════════════════════════════════════════════
+ Public MCP URL : https://shiny-otter-1234.trycloudflare.com/mcp
+ Auth token     : 9f2c…<redacted>
+ ...
+════════════════════════════════════════════════════════════════════
+```
+
+<Warning>
+保持终端打开。cloudflared **快速隧道**是临时的 —— 每次运行 URL 都会变，进程退出时隧道
+关闭。要稳定主机名，请自己跑一条指向本地 HTTP 端口的
+[具名 cloudflared 隧道](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)。
+</Warning>
+
+### 没有安装 cloudflared？
+
+`cloudflared` 作为可选依赖随包提供。找不到二进制时，服务器会继续在本地运行，并打印安装
+指引：
+
+```bash
+npm install -g cloudflared          # cross-platform
+brew install cloudflared            # macOS
+winget install cloudflare.cloudflared  # Windows
+```
+
+然后带 `--tunnel` 再跑一次。
+
+## 添加到 Claude Desktop
+
+打开 **Claude Desktop → Settings → Connectors → Add custom connector**，填入：
+
+| 字段  | 值 |
+|--------|-------|
+| Name   | `ComfyUI` |
+| URL    | 打印出来的 `https://…/mcp` URL |
+| Header | `X-API-Key: <token>`（或 `Authorization: Bearer <token>`） |
+
+保存，然后在聊天里启用该连接器。ComfyUI 工具会出现，和本地 stdio 服务器一样。
+
+## 无界面 / 程序化配置
+
+任何支持远程 Streamable-HTTP 服务器的 MCP 客户端都能用。提供 URL 和认证头：
+
+```json
+{
+  "mcpServers": {
+    "comfyui": {
+      "url": "https://shiny-otter-1234.trycloudflare.com/mcp",
+      "headers": { "X-API-Key": "<token>" }
+    }
+  }
+}
+```
+
+对 `/mcp` 的**每一次**请求都接受两种头形式：
+
+```bash
+# X-API-Key (matches Comfy Cloud's convention)
+curl -H "X-API-Key: <token>" https://…/mcp
+
+# Authorization: Bearer
+curl -H "Authorization: Bearer <token>" https://…/mcp
+```
+
+## 手动设置（自带隧道 / 代理）
+
+如果更想自己管公网端点，就用固定令牌跑 HTTP 传输，再把它放在自己的反向代理、隧道或 VPN
+后面：
+
+```bash
+COMFYUI_MCP_HTTP_TOKEN=my-long-random-secret \
+  npx -y comfyui-mcp@latest --http --host 0.0.0.0 --port 9100
+```
+
+然后把隧道/代理指到 `http://127.0.0.1:9100/mcp`。
+
+<Warning>
+绑定到非回环主机（例如 `0.0.0.0`）且**没有**令牌是**硬失败** —— 服务器会拒绝启动，
+而不是把一个开放的 `/mcp` 端点暴露到机器外。请设置 `COMFYUI_MCP_HTTP_TOKEN`（推荐）、
+使用 `--tunnel`，或绑定回环主机。如果你确实想要开放端点（例如已经在自己的认证代理后面），
+请用 `--allow-unauthenticated-non-loopback`（环境变量 `COMFYUI_MCP_ALLOW_UNAUTH=1`）
+显式选择，这会把失败降成警告。
+</Warning>
+
+## 认证参考
+
+| 设置 | 效果 |
+|---------|--------|
+| `COMFYUI_MCP_HTTP_TOKEN` | `/mcp` 上要求的共享密钥令牌。未设置 → 端点开放。 |
+| `--token <value>` | 与环境变量相同；CLI 标志优先于环境变量。 |
+| `--tunnel` / `MCP_TUNNEL=1` | 强制 HTTP，未设置时自动生成令牌，打开一条 cloudflared 隧道。 |
+| `--http` / `MCP_TRANSPORT=http` | 不带隧道的 HTTP 传输（设了令牌时认证仍然生效）。 |
+| `--host`, `--port` | 绑定地址（默认 `127.0.0.1:9100`）。 |
+| `--allow-unauthenticated-non-loopback` / `COMFYUI_MCP_ALLOW_UNAUTH=1` | 选择在非回环主机上开放 `/mcp`。没有它，这种组合就是启动硬失败。 |
+
+令牌按常量时间比较，门禁对 MCP 端点上的每一种 HTTP 方法（`POST`/`GET`/`DELETE`）都强制
+执行。绑定非回环主机且没有令牌时，除非设置了上面的逃生口，否则启动会被拒绝。
+
+## 路线图：OAuth
+
+今天的认证是**手动共享密钥令牌**（Bearer / `X-API-Key`），无界面路径和 Claude Desktop
+自定义连接器都能覆盖。完整的浏览器 **OAuth** 登录流程（类似 Comfy 的托管连接器）是规划中
+的后续 —— 改动更重，手动连接并不需要它。
+
+## 参见
+
+- [云端部署](/docs/zh/cloud-deployment) —— 用智能体面板驱动远程 ComfyUI 实例
+  （另一条隧道，另一个目的）
+- [配置](/docs/zh/configuration) —— 完整的环境变量参考

@@ -1,0 +1,56 @@
+---
+title: "移动端 App（测试版）"
+description: "ComfyUI-MCP Mobile —— 用手机和你的 ComfyUI 智能体对话。用智能体面板的二维码配对，从你网络上的任何地方驱动生成、工作流和模型。目前在 Android 和 iOS 上封闭测试。"
+icon: "mobile"
+---
+
+<Note>
+**加入测试。** ComfyUI-MCP 移动端 App 正在封闭测试 —— 为你的平台安装构建：
+
+- **Android** — [Firebase App Distribution](https://appdistribution.firebase.dev/i/27a5cccde72ffb42)
+- **iOS** — [TestFlight](https://testflight.apple.com/join/ws65s4a2)
+</Note>
+
+移动端 App 是驱动 [侧边栏面板](/docs/zh/panel) 的同一个智能体的手机原生前端。它连到面板编排器
+的桥接，所以面板能做的事 —— 生成图片、运行并检查工作流、切换模型 —— 都可以从手机完成，
+真正干活的仍是桌面上的 ComfyUI。
+
+## 配对
+
+App 通过面板桥接和智能体主机通信，所以配对一次就能用：
+
+1. 在桌面上安装并运行 [comfyui-mcp](/docs/zh/quickstart)，并装上
+   [智能体面板](/docs/zh/panel)。
+2. 在 ComfyUI 的**设置**里打开 **「通过移动端 App 控制（测试版）」** —— **默认关闭**，
+   打开之前配对按钮会一直隐藏。
+3. 打开面板，点标题栏里的 **QR** 按钮，显示**配对二维码**。
+4. 在移动端 App 里点 **扫描面板上的二维码** —— 或者手动粘贴桥接 URL
+   （`ws://…?token=…`）。
+
+二维码编码的是一个落地页 URL，配对数据走 URL fragment，所以主机和令牌不会离开你的设备。
+App 还为落地页的 **在 App 中打开** 按钮注册了 `comfyui-mcp://pair` 深链接。
+
+<Note>
+手机和桌面之间需要有网络通路 —— 简单情况下是同一局域网，主机不能直达时则用
+[安全中继](/docs/zh/self-hosted-relay) /
+[云端部署](/docs/zh/cloud-deployment)。
+</Note>
+
+## App 里有什么
+
+- **智能体聊天** —— 和面板侧边栏里同一段对话，从手机进行。
+- **模型选择器** —— 编排器上的实时模型目录；会话中途就能换模型。
+- **Civitai 浏览** —— 搜索模型和创作者，点赞和收藏。
+- **远程控制** —— 镜像桌面面板标签页，出门也能看工作流诊断。
+
+## 反馈
+
+测试反馈和缺陷报告欢迎发到
+[Discord](https://discord.gg/cW9arBhzCu) 或
+[issue 跟踪器](https://github.com/artokun/comfyui-mcp/issues)。
+
+## 参见
+
+- [侧边栏面板](/docs/zh/panel) —— App 所配对的 ComfyUI 内智能体
+- [云端部署](/docs/zh/cloud-deployment) —— 驱动远程 ComfyUI 实例
+- [自建中继](/docs/zh/self-hosted-relay) —— 自己拥有安全桥接路径

@@ -1,0 +1,107 @@
+---
+title: "LLM 竞技场"
+description: "用真实 ComfyUI 任务给任意智能体 LLM 打分 —— 本地（Ollama）、托管（OpenRouter/DeepSeek/GLM/MiMo）或前沿模型。每个分数都对照 ComfyUI 服务器核实，而不是模型自己说的。一条命令，可分享的报告。"
+icon: "trophy"
+---
+
+**ComfyUI LLM 竞技场** 诚实地回答一个问题：*这个模型真的能驱动 ComfyUI 吗？*
+不是「它听起来有没有自信」—— 每个场景的结果都**对照 ComfyUI 服务器本身核实**
+（任务历史、已执行节点图参数、真实输出文件及其像素尺寸）。它跑在面板和 MCP 客户端
+所用的同一套 [紧凑工具路由器](/docs/zh/local-llms) 上，所以竞技场分数能预测真实
+智能体行为。
+
+```bash
+npm run arena          # scores the default local field via Ollama
+```
+
+## 任务阶梯
+
+十个场景，三个难度带，PASS = 2（完成且服务器已核实），PARTIAL = 1（工具家族对了，
+结果不完整），FAIL = 0 —— 满分 **20**：
+
+| 难度带 | 场景 | 它证明什么 |
+| --- | --- | --- |
+| Basics | `health` · `models` · `registry` · `queue` | 工具发现 + 单次调用任务 |
+| Gauntlet | `generate`（异步渲染 + 轮询） · `precision`（精确步数 / 尺寸落到已执行节点图里） · `breakfix`（故意失败 → 诊断 → 恢复） · `provenance`（找到资源注册表，用 generate_image (action:"regenerate") 带覆盖重渲） | 多跳链条、参数保真、错误恢复 |
+| Crucible | `multiout`（一张图同时保存 512px + 1024px 输出 —— 读 PNG 头核实） · `pipeline`（两阶段 img2img 通过 `upload_image (action:"stage")` 串起来） | 原始节点图编排 —— 没有模板能覆盖这些 |
+
+平局按 **轻推次数 → 工具轮次 → 墙钟时间** 打破，所以一次做对的模型会排在挣扎到同样
+分数的模型前面。
+
+## 带上你自己的模型
+
+竞技场说两种方言 —— 本地 Ollama，以及任何兼容 OpenAI 的端点：
+
+```bash
+# Local models (Ollama)
+ARENA_MODELS="gemma4:e4b,qwen3:4b" npm run arena
+
+# Any hosted model — one OpenRouter key covers most of the market
+ARENA_API=openai ARENA_BASE_URL=https://openrouter.ai/api/v1 \
+ARENA_API_KEY=sk-or-... ARENA_TIER=B-tier \
+ARENA_MODELS="deepseek/deepseek-v3.2,z-ai/glm-5.1,xiaomi/mimo-v2.5" \
+npm run arena
+
+# Direct providers work too (any /v1/chat/completions endpoint):
+#   DeepSeek:  ARENA_BASE_URL=https://api.deepseek.com/v1
+#   vLLM/LM Studio: point ARENA_BASE_URL at your server
+```
+
+结果会**跨多次调用合并**（想一次只跑一个模型也可以）到 `arena-results/`：一份 JSON、
+完整的按场景记录，以及可分享的 `arena-report.md`。用下面命令生成排行榜图：
+
+```bash
+node scripts/arena-graphic.mjs    # light + dark SVGs from your own results
+```
+
+有用的旋钮：`ARENA_TIER` 给一次运行的模型打标签（SoTA / B-tier / local）；
+`ARENA_OUT` 重定向输出；`ARENA_MAX_ROUNDS` 和 `ARENA_SCENARIO_TIMEOUT_MS` 限制跑飞
+的模型；`COMFYUI_DEFAULT_CHECKPOINT` 钉死渲染用的 checkpoint（如果你的 checkpoints
+目录第一个不是文生图模型，请这么做）。
+
+**要求**：一台正在运行的、带文生图 checkpoint 的 ComfyUI（SD 1.5 就够 —— 场景按内容
+核实，不按画质），先跑一次 `npm run build`，再加上 Ollama 或一把 API 密钥。
+
+## 每次运行会记录什么
+
+除了分数，每条排行榜记录还带上让结果能落地的那些轴（#792）：
+
+- **量化与参数量**（Ollama `/api/show`）以及**常驻显存**（`/api/ps`，在模型仍加载时
+  采样）—— 于是「我的 8 GB 卡到底能跑什么，q4 够不够？」可以从表里直接回答。把同一
+  模型按 q4 / q8 / fp16 跑完阶梯，能看出分数真正掉在哪。探测答不上来时这些字段留空
+  （托管端点没有对等物）—— 从不猜测。
+- **comfyui-mcp 版本**，打在每次运行能读到它的条目上（读不到自己包版本的运行记成
+  *未版本化*，和打戳之前的运行一模一样）。工具面一变，绝对分数就会动，所以报告会把
+  混了版本（或未版本化运行）的排行榜标成**不可直接比较**。
+- **失败时模型伸手去够的每一个工具**，不只是成功的那些。当 2 个以上模型在同一场景
+  选了同一个错误工具后失败（且没有任何通过的运行用过它），报告会标出一个**可疑场景**
+  —— 全场选错是工具*描述*可疑，而不是能力缺口（先例：#557/#654，错的是我们自己的
+  措辞，不是模型）。在相信该场景分数之前先查描述。
+
+## 当前排行榜
+
+<img className="block dark:hidden" src="/images/arena-leaderboard-light.svg" alt="ComfyUI LLM 竞技场排行榜" />
+<img className="hidden dark:block" src="/images/arena-leaderboard-dark.svg" alt="ComfyUI LLM 竞技场排行榜" />
+
+14 个模型，顶部集群取三次里最好的一次。头条发现：
+
+- **gemini-3.1-pro-preview 是唯一每次都满分的模型**（20-20-20）。
+- claude-opus-4.8 和 gpt-5.5 都能到 20，但在其他运行里掉过一分。
+- **B 档离前沿只差一分** —— GLM-5.1（19-19-19，全场最稳的模型）、Kimi-k2.5 和
+  MiMo-v2.5 都是 19 —— 价格只是前沿的一小部分。
+- 小型本地模型能过基础和 gauntlet 的一部分，但卡在 crucible 的节点图编排上；
+  llama3.1:8b 完全握不住工具格式。
+
+我们很欢迎社区跑我们还没覆盖的模型 —— 把你的 `arena-report.md`（和图）发到
+[GitHub discussion](https://github.com/artokun/comfyui-mcp/discussions) 或 issue，
+并带上 GPU + 模型标签，好让结果可比较。
+
+## 面板冒烟测试
+
+竞技场分数证明的是无界面工具驱动；`npm run smoke:panel` 证明同一模型能在**实时侧边栏
+面板**里活下来（流式、轮次门禁、桥接上的 6 工具路由器）。它为每个模型拉起一个独立
+编排器、占用自己的端口，并驱动一轮真实对话：
+
+```bash
+SMOKE_MODELS="gemma4:e4b,xiaomi/mimo-v2.5" npm run smoke:panel
+```

@@ -1,0 +1,61 @@
+---
+title: "自建安全桥接中继（企业）"
+description: "把整条回路握在自己手里：为安全的 wss:// 桥接运行你自己的中继，而不是依赖第三方服务 —— 面向数据驻留、合规，或「不能有外部依赖」的要求。"
+icon: "building-columns"
+---
+
+当 [`connect`](/docs/zh/cloud-deployment) 驱动一台远程 HTTPS 实例时，comfyui-mcp 需要一条
+从实例浏览器面板回到你机器上智能体桥接的、具备有效 TLS 的 `wss://` 路径（从 `https://`
+页面发起的普通 `ws://` 会被浏览器拦截）。默认走的是 **cloudflared 快速隧道** —— 零配置，
+但寿命很短（每次运行都会换一个随机主机名）。
+
+面向需要**端到端拥有这条路径**的组织 —— 控制通道绝不经过第三方、防火墙/审计规则需要固定
+域名，或者基础设施之外不能有依赖 —— comfyui-mcp 支持把安全桥接改走**你自己运维**的中继，
+替代默认的快速隧道。
+
+<Note>
+参考实现是开源的：
+**[artokun/comfyui-mcp-relay](https://github.com/artokun/comfyui-mcp-relay)** —— 一个
+Cloudflare Worker + Durable Object，MIT 许可，并标成了 GitHub 模板，点 **Use this template**
+几秒就能拿到自己的副本。可以 fork 后原样部署，也可以改成你组织里已经在跑的、支持 WebSocket
+的基础设施 —— README 完整记录了线路协议、会话生命周期，以及设计取舍（多路复用、认证、休眠）。
+</Note>
+
+## 为什么要自建
+
+- **数据驻留 / 合规** —— 桥接上走的是工具调用和节点图操作（图像字节是实例↔浏览器直连），
+  但仍有组织需要这条控制通道留在自己运维的基础设施里。
+- **没有第三方运行时依赖** —— 一个固定、自有的端点，而不是依赖外部中继的可用性。
+- **防火墙 / 审计规则** —— 你自己控制的稳定域名，比每次会话都变的临时主机名更容易加入
+  允许列表和日志。
+
+## 它怎么接在一起
+
+桥接的两端都是**向外**拨号 —— 任何地方都不需要开放入站端口。中继的工作是把一台编排器
+（跑在用户机器上）和它正在驱动的实例上的浏览器面板连接配对，并在它们之间搬运字节；它
+完全不需要理解骑在上面的 comfyui-mcp 自己的工具调用协议。
+
+中继部署好之后，把 comfyui-mcp 指过去只需几个环境变量：
+
+```bash
+export COMFYUI_MCP_TUNNEL_BACKEND=relay
+export COMFYUI_MCP_RELAY_URL=wss://your-relay.internal.example.com
+# optional: a shared secret gating who can open a session on your relay at all
+export COMFYUI_MCP_RELAY_KEY=your-shared-deploy-secret
+```
+
+`COMFYUI_MCP_TUNNEL_BACKEND` 未设置时，comfyui-mcp 继续使用默认的临时快速隧道行为 ——
+这完全是可选的。
+
+## 部署参考实现
+
+```bash
+gh repo create your-org/your-relay --template artokun/comfyui-mcp-relay --clone
+cd your-relay
+npm install
+wrangler login
+npm run deploy
+```
+
+完整 README —— 线路协议、认证模型和部署步骤 —— 见
+**[artokun/comfyui-mcp-relay](https://github.com/artokun/comfyui-mcp-relay)**。
