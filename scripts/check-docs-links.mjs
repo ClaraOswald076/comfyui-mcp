@@ -25,6 +25,18 @@ const DOCS = path.join(ROOT, 'docs');
 
 const cfg = JSON.parse(fs.readFileSync(path.join(DOCS, 'docs.json'), 'utf8'));
 
+// Mintlify's docs.json schema enum for navigation.languages[].language.
+// Measured 2026-08-18 from https://www.mintlify.com/docs.json — `fa` is NOT in it.
+// An unsupported code fails the whole production build and leaves the last good
+// deploy up (Korean-only, after #1577, once `fa` landed in #9b241e0).
+const MINTLIFY_LANGUAGES = new Set([
+  "en", "cn", "zh", "zh-Hans", "zh-Hant", "zh-CN", "zh-TW",
+  "es", "fr", "fr-CA", "fr-ca", "ja", "jp", "ja-jp", "ja-JP",
+  "pt", "pt-BR", "de", "ko", "it", "ru", "ro", "cs", "id",
+  "ar", "tr", "hi", "sv", "no", "da", "lv", "nl", "uk", "vi",
+  "pl", "uz", "he", "ca", "fi", "hu",
+]);
+
 /** Every page path the navigation references, wherever it is nested. */
 function navPages(node, out = []) {
   if (Array.isArray(node)) {
@@ -112,6 +124,17 @@ console.log(`pages in navigation: ${listed.length}`);
 console.log(`anchor-only links (not checked): ${anchorOnly.length}`);
 
 let failures = 0;
+const langCodes = (cfg.navigation?.languages ?? [])
+  .map((l) => l?.language)
+  .filter((c) => typeof c === "string");
+const badLangs = langCodes.filter((c) => !MINTLIFY_LANGUAGES.has(c));
+if (badLangs.length) {
+  failures += badLangs.length;
+  console.error(
+    `\n✗ ${badLangs.length} language code(s) Mintlify's docs.json schema does not accept — this fails the production build:`,
+  );
+  for (const c of badLangs) console.error(`    ${c}`);
+}
 if (missing.length) {
   failures += missing.length;
   console.error(`\n✗ ${missing.length} navigation entr(ies) with no file — these 404 from the sidebar:`);
