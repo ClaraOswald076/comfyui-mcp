@@ -27,6 +27,7 @@ const mocks = vi.hoisted(() => ({
   writeNodeFile: vi.fn(),
   applyNodePatch: vi.fn(),
   nodePackGit: vi.fn(),
+  resolveEffectiveComfyUIBaseLive: vi.fn(),
 }));
 
 vi.mock("../../services/node-authoring.js", () => ({
@@ -36,6 +37,14 @@ vi.mock("../../services/node-authoring.js", () => ({
 
 vi.mock("../../services/node-verify.js", () => ({
   verifyCustomNode: (...a: unknown[]) => mocks.verifyCustomNode(...a),
+}));
+
+// The handler resolves the local install base ASYNC and live-aware (#1653)
+// before dispatching to the sync authoring services; seam it so no test
+// depends on real config or a reachable server.
+vi.mock("../../services/workspace-env.js", () => ({
+  resolveEffectiveComfyUIBaseLive: (...a: unknown[]) =>
+    mocks.resolveEffectiveComfyUIBaseLive(...a),
 }));
 
 vi.mock("../../services/node-dev.js", () => ({
@@ -109,6 +118,9 @@ beforeEach(() => {
   for (const mock of Object.values(mocks)) mock.mockReset();
   for (const name of ALL_SERVICES) mocks[name].mockReturnValue({ ok: true });
   mocks.verifyCustomNode.mockResolvedValue({ ok: true });
+  // Default: no local base resolvable — the service's own refusal is what a
+  // caller must see then.
+  mocks.resolveEffectiveComfyUIBaseLive.mockResolvedValue(undefined);
 });
 
 describe("node_pack registration", () => {
@@ -224,16 +236,20 @@ describe("node_pack actions call the same services with the same arguments", () 
       with_ci: true,
       overwrite: true,
     });
-    expect(mocks.scaffoldCustomNode).toHaveBeenCalledWith({
-      name: "my-pack",
-      displayName: "My Pack",
-      category: "custom/mine",
-      description: "does things",
-      publisherId: "pub123",
-      withFrontend: true,
-      withCi: true,
-      overwrite: true,
-    });
+    expect(mocks.scaffoldCustomNode).toHaveBeenCalledWith(
+      {
+        name: "my-pack",
+        displayName: "My Pack",
+        category: "custom/mine",
+        description: "does things",
+        publisherId: "pub123",
+        withFrontend: true,
+        withCi: true,
+        overwrite: true,
+      },
+      undefined,
+      undefined,
+    );
     expect(JSON.parse(text(res))).toEqual({ created: ["pyproject.toml"] });
   });
 
@@ -255,12 +271,20 @@ describe("node_pack actions call the same services with the same arguments", () 
 
   it('action:"publish" takes name or path, and needs neither', async () => {
     await handler()({ action: "publish", name: "my-pack" });
-    expect(mocks.publishCustomNode).toHaveBeenCalledWith({ name: "my-pack", path: undefined });
+    expect(mocks.publishCustomNode).toHaveBeenCalledWith(
+      { name: "my-pack", path: undefined },
+      undefined,
+      undefined,
+    );
     await handler()({ action: "publish", path: "/abs/packs/my-pack" });
-    expect(mocks.publishCustomNode).toHaveBeenCalledWith({
-      name: undefined,
-      path: "/abs/packs/my-pack",
-    });
+    expect(mocks.publishCustomNode).toHaveBeenCalledWith(
+      {
+        name: undefined,
+        path: "/abs/packs/my-pack",
+      },
+      undefined,
+      undefined,
+    );
   });
 
   it('action:"list_files" maps max_entries → maxEntries', async () => {
@@ -355,6 +379,43 @@ describe("node_pack actions call the same services with the same arguments", () 
   });
 });
 
+describe("node_pack adopts the trusted live workspace (#1653)", () => {
+  it('action:"scaffold" threads the live-resolved local base to the service', async () => {
+    // The session shape from #1653: install_comfyui (action:"environment")
+    // detected the trusted local workspace, but neither COMFYUI_PATH nor a
+    // default workspace is set. The handler must hand that running server's
+    // root to scaffold instead of letting it refuse as "no local install".
+    mocks.resolveEffectiveComfyUIBaseLive.mockResolvedValueOnce("/live/ComfyUI");
+    await handler()({ action: "scaffold", name: "my-pack", display_name: "My Pack" });
+    expect(mocks.scaffoldCustomNode).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "my-pack" }),
+      undefined,
+      "/live/ComfyUI",
+    );
+  });
+
+  it('action:"publish" by name resolves the live base; an explicit path never probes it', async () => {
+    mocks.resolveEffectiveComfyUIBaseLive.mockResolvedValue("/live/ComfyUI");
+    await handler()({ action: "publish", name: "my-pack" });
+    expect(mocks.publishCustomNode).toHaveBeenCalledWith(
+      { name: "my-pack", path: undefined },
+      undefined,
+      "/live/ComfyUI",
+    );
+
+    mocks.resolveEffectiveComfyUIBaseLive.mockClear();
+    await handler()({ action: "publish", path: "/abs/packs/my-pack" });
+    // An explicit path is a self-contained local target (and stays legal in
+    // remote mode) — resolving a live base for it would be a wasted probe.
+    expect(mocks.resolveEffectiveComfyUIBaseLive).not.toHaveBeenCalled();
+    expect(mocks.publishCustomNode).toHaveBeenCalledWith(
+      { name: undefined, path: "/abs/packs/my-pack" },
+      undefined,
+      undefined,
+    );
+  });
+});
+
 describe("node_pack per-action requiredness names the missing field", () => {
   it.each([
     [{ action: "scaffold", display_name: "X" }, "scaffold", "name"],
@@ -382,7 +443,11 @@ describe("node_pack per-action requiredness names the missing field", () => {
       restart: undefined,
     });
     expect((await handler()({ action: "publish" })).isError).toBeUndefined();
-    expect(mocks.publishCustomNode).toHaveBeenCalledWith({ name: undefined, path: undefined });
+    expect(mocks.publishCustomNode).toHaveBeenCalledWith(
+      { name: undefined, path: undefined },
+      undefined,
+      undefined,
+    );
   });
 });
 
@@ -418,6 +483,8 @@ describe("node_pack guards on absence, never falsiness", () => {
     await handler()({ action: "scaffold", name: "", display_name: "" });
     expect(mocks.scaffoldCustomNode).toHaveBeenCalledWith(
       expect.objectContaining({ name: "", displayName: "" }),
+      undefined,
+      undefined,
     );
   });
 
