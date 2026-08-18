@@ -156,6 +156,48 @@ export function resolveEffectiveComfyUIBase(): string | undefined {
 }
 
 /**
+ * The ASYNC, live-aware variant of `resolveEffectiveComfyUIBase` (#1653).
+ *
+ * The sync resolver answers from CONFIGURATION alone (COMFYUI_PATH, then the
+ * saved default workspace), so a loopback session with neither configured is
+ * told "no local install" even while `install_comfyui(action:"environment")`
+ * is reporting the running server's own install root as `local.workspace_path`
+ * with `python_probe_trusted:true` — one machine, two contradictory answers,
+ * and the writing tools (node_pack scaffold/publish) believed the wrong one.
+ *
+ * The resolution order, which only ever fills a GAP (a configured base still
+ * wins and is never overridden):
+ *   1. `resolveEffectiveComfyUIBase()` — configuration, unchanged.
+ *   2. `resolveLiveComfyUIBase()` — the live connected server's own install
+ *      root, derived from the `/system_stats` launch argv. That is the server's
+ *      SELF-REPORT of where it runs from, the same source `workspace
+ *      action:"get"` already surfaces as `workspace_source:"live-server"`
+ *      (#769) and `apply_manifest` adopts (#463). It refuses remote mode
+ *      internally, so the loopback-only guarantee of question 2 is kept.
+ *
+ * The live root is adopted only when it exists on disk and looks like a
+ * ComfyUI install (models/ or custom_nodes/ present) — the same validity
+ * check `resolveLocalManifestBase` applies — because an argv-derived path is
+ * the server's claim, and the disk check is what keeps a stale or relocated
+ * install report from becoming a write target. Returns undefined (never
+ * throws) when nothing checks out; the caller then refuses with an actionable
+ * error, exactly as before.
+ */
+export async function resolveEffectiveComfyUIBaseLive(): Promise<string | undefined> {
+  const configured = resolveEffectiveComfyUIBase();
+  if (configured) return configured;
+  const liveBase = await resolveLiveComfyUIBase();
+  if (
+    liveBase &&
+    existsSync(liveBase) &&
+    (existsSync(join(liveBase, "models")) || existsSync(join(liveBase, "custom_nodes")))
+  ) {
+    return liveBase;
+  }
+  return undefined;
+}
+
+/**
  * The install root a LOCAL, DESTRUCTIVE operation may act on — or the reason it
  * must not act at all.
  *

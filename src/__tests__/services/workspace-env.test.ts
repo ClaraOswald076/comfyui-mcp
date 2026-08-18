@@ -99,6 +99,7 @@ import {
   liveScriptFromArgv,
   resolveComfyuiPython,
   resolveEffectiveComfyUIBase,
+  resolveEffectiveComfyUIBaseLive,
   resolveLocalWorkspaceBase,
   resolveInstallInterpreter,
   resolveLiveComfyUIBase,
@@ -1487,6 +1488,52 @@ describe("resolveLiveComfyUIBase (#490 / #463 — live connected install root)",
   it("returns undefined (never throws) when the server is unreachable", async () => {
     mockGetSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
     await expect(resolveLiveComfyUIBase()).resolves.toBeUndefined();
+  });
+});
+
+describe("resolveEffectiveComfyUIBaseLive (#1653 — configuration first, live server fills the gap)", () => {
+  it("returns the configured base without probing the live server", async () => {
+    mockConfig.comfyuiPath = IS_WIN ? "C:\\cfg\\ComfyUI" : "/cfg/ComfyUI";
+    expect(await resolveEffectiveComfyUIBaseLive()).toBe(mockConfig.comfyuiPath);
+    expect(mockGetSystemStats).not.toHaveBeenCalled();
+  });
+
+  it("adopts the live server's own root when nothing is configured and it looks like an install", async () => {
+    const root = await tmpDir();
+    try {
+      await mkdir(join(root, "custom_nodes"), { recursive: true });
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: [join(root, "main.py"), "--listen"] },
+      });
+      expect(await resolveEffectiveComfyUIBaseLive()).toBe(root);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a live root that does not look like a ComfyUI install on disk", async () => {
+    // The argv root is the server's CLAIM; the models/ or custom_nodes/ check
+    // is what keeps a stale or relocated report from becoming a write target.
+    const root = await tmpDir();
+    try {
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: [join(root, "main.py")] },
+      });
+      expect(await resolveEffectiveComfyUIBaseLive()).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns undefined in remote mode without probing /system_stats", async () => {
+    h.remoteMode.value = true;
+    expect(await resolveEffectiveComfyUIBaseLive()).toBeUndefined();
+    expect(mockGetSystemStats).not.toHaveBeenCalled();
+  });
+
+  it("returns undefined (never throws) when the server is unreachable", async () => {
+    mockGetSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+    await expect(resolveEffectiveComfyUIBaseLive()).resolves.toBeUndefined();
   });
 });
 

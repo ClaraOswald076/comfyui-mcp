@@ -259,15 +259,28 @@ function toClassName(slug: string): string {
  * reject a loopback session that has a saved default workspace as if it were remote
  * (#506). Returns undefined only in remote mode or when no local install is known —
  * then we refuse with a clear, actionable error.
+ *
+ * `resolvedBase` is the caller's ASYNC, live-aware resolution
+ * (`resolveEffectiveComfyUIBaseLive`, #1653): when nothing is configured, the
+ * running LOCAL server's own install root — the same trusted workspace
+ * install_comfyui (action:"environment") reports — fills the gap, so a session
+ * that tool just proved local is not rejected as unconfigured. The sync
+ * configured-only resolution remains the fallback for callers that never
+ * resolved one.
  */
-function customNodesRoot(): string {
-  const base = resolveEffectiveComfyUIBase();
+function customNodesRoot(resolvedBase?: string): string {
+  // Configuration wins; a caller-resolved live base only fills the gap
+  // (resolveEffectiveComfyUIBaseLive already encodes that order — restated
+  // here so a threaded live root can never override COMFYUI_PATH).
+  const base = resolveEffectiveComfyUIBase() ?? resolvedBase;
   if (!base) {
     throw new ValidationError(
-      "This operation needs a local ComfyUI install, but none is configured " +
-        "(COMFYUI_PATH is unset, no saved default workspace, or running in remote " +
-        "--comfyui-url mode). Set COMFYUI_PATH or a default workspace " +
-        "(workspace action:\"set_default\") to scaffold or publish custom nodes.",
+      "This operation needs a local ComfyUI install, but none could be resolved: " +
+        "COMFYUI_PATH is unset, no default workspace is saved, and no running " +
+        "LOCAL ComfyUI could be adopted from the connected server (or this " +
+        "session targets a remote --comfyui-url instance). Set COMFYUI_PATH, " +
+        "save a default workspace (workspace action:\"set_default\"), or connect " +
+        "to a running local ComfyUI to scaffold or publish custom nodes.",
     );
   }
   return join(base, "custom_nodes");
@@ -277,8 +290,8 @@ function customNodesRoot(): string {
  * Resolve and confirm a target pack directory is strictly inside custom_nodes/.
  * Defends against traversal even if validation upstream were bypassed.
  */
-function resolvePackDir(name: string): string {
-  const root = customNodesRoot();
+function resolvePackDir(name: string, resolvedBase?: string): string {
+  const root = customNodesRoot(resolvedBase);
   const dir = resolve(root, name);
   const rel = relative(root, dir);
   if (rel === "" || rel.startsWith("..") || isAbsolute(rel) || rel.includes(`..${sep}`)) {
@@ -458,6 +471,7 @@ jobs:
 export function scaffoldCustomNode(
   options: ScaffoldOptions,
   deps: AuthoringDeps = defaultDeps,
+  resolvedBase?: string,
 ): ScaffoldResult {
   const name = validatePackName(options.name);
   const displayName = (options.displayName ?? "").trim() || name;
@@ -470,7 +484,7 @@ export function scaffoldCustomNode(
   const withFrontend = options.withFrontend ?? false;
   const className = toClassName(name);
 
-  const packDir = resolvePackDir(name);
+  const packDir = resolvePackDir(name, resolvedBase);
 
   // Refuse to clobber an existing pack unless explicitly allowed.
   if (deps.isNonEmptyDir(packDir) && !options.overwrite) {
@@ -596,6 +610,7 @@ export function extractRegistryUrl(output: string): string | undefined {
 export function publishCustomNode(
   options: PublishOptions,
   deps: AuthoringDeps = defaultDeps,
+  resolvedBase?: string,
 ): PublishResult {
   // Resolve the pack directory from either an explicit path or a name.
   let packDir: string;
@@ -607,7 +622,7 @@ export function publishCustomNode(
     // resolvePackDir, which fails clearly when there is no local install.
     packDir = resolve(options.path.trim());
   } else if (options.name && options.name.trim()) {
-    packDir = resolvePackDir(validatePackName(options.name));
+    packDir = resolvePackDir(validatePackName(options.name), resolvedBase);
   } else {
     throw new ValidationError(
       "Provide either `name` (a pack under custom_nodes/) or an explicit `path`.",
