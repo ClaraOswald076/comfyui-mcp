@@ -146,8 +146,14 @@ export async function searchNodes(
   // the fallback has no pagination of its own, so it must not answer for a
   // later page (an out-of-window exact match would otherwise surface ON page 2).
   if (lowerQuery && filtered.length === 0 && page === 1) {
-    const candidate = registryIdCandidateFromQuery(query);
-    if (candidate) {
+    const candidates = registryIdCandidatesFromQuery(query);
+    // The candidates are guesses, not one answer: a 404 only rules out THAT id,
+    // so keep trying the rest. A non-404 failure means absence was never
+    // established for that candidate — remember it; if no candidate resolves,
+    // reporting "no matches" would be an unearned negative, so refuse with the
+    // reason instead of returning the empty page.
+    let unresolved: unknown;
+    for (const candidate of candidates) {
       try {
         const details = await getNodePackDetails(candidate);
         logger.info(
@@ -156,28 +162,27 @@ export async function searchNodes(
         );
         return [normalizeSearchResult(details)];
       } catch (err) {
-        // Only an observed 404 establishes "no pack with that id". Anything
-        // else (500, network) means the fallback could not answer — and the
-        // window search cannot establish absence on its own (that is why the
-        // fallback exists), so reporting "no matches" would be an unearned
-        // negative. Refuse with the reason instead.
         const status =
           err instanceof RegistryError
             ? (err.details as { status?: number } | undefined)?.status
             : undefined;
         if (status !== 404) {
-          throw new RegistryError(
-            `Registry search "${query}" matched nothing in the fetched pack window, ` +
-              `and the exact-id fallback for "${candidate}" could not be resolved ` +
-              `(${err instanceof Error ? err.message : String(err)}) — so "no matches" ` +
-              `cannot be confirmed. Retry, or look the pack up directly with ` +
-              `search_custom_nodes (action:"details").`,
-          );
+          unresolved ??= err;
+          continue;
         }
         logger.debug(
           `Registry exact-id fallback for "${query}": no pack with id "${candidate}" (404)`,
         );
       }
+    }
+    if (unresolved !== undefined) {
+      throw new RegistryError(
+        `Registry search "${query}" matched nothing in the fetched pack window, ` +
+          `and the exact-id fallback could not be resolved ` +
+          `(${unresolved instanceof Error ? unresolved.message : String(unresolved)}) — so "no matches" ` +
+          `cannot be confirmed. Retry, or look the pack up directly with ` +
+          `search_custom_nodes (action:"details").`,
+      );
     }
   }
 
@@ -188,18 +193,25 @@ export async function searchNodes(
 }
 
 /**
- * Normalize a free-text query to a candidate Comfy Registry pack id: lowercase,
- * runs of non-alphanumerics collapsed to single hyphens, edges trimmed
- * ("comfyui kjnodes" → "comfyui-kjnodes"). Undefined when nothing usable
- * remains.
+ * Normalize a free-text query to candidate Comfy Registry pack ids, most
+ * literal first: lowercase, runs of non-alphanumerics collapsed to single
+ * hyphens, edges trimmed ("comfyui kjnodes" → "comfyui-kjnodes").
+ *
+ * #773 recurrence (0.52.1): one slug is not enough. Registry ids are derived
+ * from GitHub repo names, and most packs live under a "ComfyUI-" repo prefix —
+ * so "WanVideoWrapper" slugs to "wanvideowrapper" while the real pack is
+ * "comfyui-wanvideowrapper" (same for VideoHelperSuite, SAM3). The endpoint is
+ * case-insensitive but not prefix-insensitive, so the prefixed form is offered
+ * as a second candidate unless the slug already carries it.
  */
-export function registryIdCandidateFromQuery(query: string): string | undefined {
+export function registryIdCandidatesFromQuery(query: string): string[] {
   const slug = query
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
-  return slug.length > 0 ? slug : undefined;
+  if (slug.length === 0) return [];
+  return slug.startsWith("comfyui-") ? [slug] : [slug, `comfyui-${slug}`];
 }
 
 /** Coerce the registry's object-shaped `latest_version` into a string. */

@@ -3,6 +3,7 @@ import {
   searchNodes,
   getNodePackDetails,
   extractVersionString,
+  registryIdCandidatesFromQuery,
 } from "../../services/registry-client.js";
 
 const NODES = [
@@ -203,6 +204,122 @@ describe("searchNodes exact-id fallback (#773)", () => {
     expect(results).toEqual([]);
     // Only the window fetch — no /nodes/<id> call for a later page.
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  // #773 recurrence on 0.52.1: "WanVideoWrapper" slugs to "wanvideowrapper",
+  // but the real pack id is "comfyui-wanvideowrapper" — registry ids are
+  // derived from GitHub repo names, and most packs carry the "ComfyUI-" prefix.
+  it("tries the comfyui-prefixed candidate when the bare slug 404s", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/nodes/comfyui-wanvideowrapper")) {
+        return new Response(
+          JSON.stringify({
+            id: "ComfyUI-WanVideoWrapper",
+            name: "WanVideoWrapper",
+            description: "Wan Video diffusion nodes",
+            author: "kijai",
+            repository: "https://github.com/kijai/ComfyUI-WanVideoWrapper",
+            latest_version: { version: "1.0.0" },
+            total_install: 50000,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (/\/nodes\/[^?]+$/.test(url)) {
+        return new Response("not found", { status: 404 });
+      }
+      // The window never contains the pack — that is why the fallback runs.
+      return new Response(JSON.stringify({ nodes: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const results = await searchNodes("WanVideoWrapper");
+    expect(results.map((r) => r.id)).toEqual(["ComfyUI-WanVideoWrapper"]);
+    const detailCalls = fetchMock.mock.calls.map((c) => String(c[0])).filter((u) =>
+      /\/nodes\/[^?]+$/.test(u),
+    );
+    expect(detailCalls).toEqual([
+      expect.stringContaining("/nodes/wanvideowrapper"),
+      expect.stringContaining("/nodes/comfyui-wanvideowrapper"),
+    ]);
+  });
+
+  it("a query already carrying the comfyui- prefix is tried once, not doubled", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (/\/nodes\/[^?]+$/.test(url)) {
+        return new Response("not found", { status: 404 });
+      }
+      return new Response(JSON.stringify({ nodes: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const results = await searchNodes("comfyui kjnodes");
+    expect(results).toEqual([]);
+    const detailCalls = fetchMock.mock.calls.map((c) => String(c[0])).filter((u) =>
+      /\/nodes\/[^?]+$/.test(u),
+    );
+    expect(detailCalls).toEqual([expect.stringContaining("/nodes/comfyui-kjnodes")]);
+  });
+
+  it("a later candidate still resolves after an earlier candidate fails non-404", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/nodes/sam3")) {
+        return new Response("boom", { status: 500 });
+      }
+      if (url.includes("/nodes/comfyui-sam3")) {
+        return new Response(
+          JSON.stringify({
+            id: "ComfyUI-SAM3",
+            name: "SAM3",
+            description: "Segment anything",
+            author: "someone",
+            repository: "https://github.com/someone/ComfyUI-SAM3",
+            latest_version: "1.0.0",
+            total_install: 100,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ nodes: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const results = await searchNodes("SAM3");
+    expect(results.map((r) => r.id)).toEqual(["ComfyUI-SAM3"]);
+  });
+});
+
+describe("registryIdCandidatesFromQuery", () => {
+  it("offers the bare slug first, then the comfyui-prefixed form", () => {
+    expect(registryIdCandidatesFromQuery("WanVideoWrapper")).toEqual([
+      "wanvideowrapper",
+      "comfyui-wanvideowrapper",
+    ]);
+    expect(registryIdCandidatesFromQuery("impact pack")).toEqual([
+      "impact-pack",
+      "comfyui-impact-pack",
+    ]);
+  });
+
+  it("does not double a prefix the query already carries", () => {
+    expect(registryIdCandidatesFromQuery("comfyui kjnodes")).toEqual(["comfyui-kjnodes"]);
+  });
+
+  it("offers nothing when no usable slug remains", () => {
+    expect(registryIdCandidatesFromQuery("   ")).toEqual([]);
+    expect(registryIdCandidatesFromQuery("!!!")).toEqual([]);
   });
 });
 
