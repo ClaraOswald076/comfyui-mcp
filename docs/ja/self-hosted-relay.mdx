@@ -1,0 +1,68 @@
+---
+title: "セルフホストのセキュアブリッジリレー（エンタープライズ）"
+description: "ループ全体を自分で持つ: サードパーティのサービスに頼らず、セキュアな wss:// ブリッジ用のリレーを自分で運用する — データ所在地、コンプライアンス、外部依存なしの要件向けです。"
+icon: "building-columns"
+---
+
+[`connect`](/docs/ja/cloud-deployment) がリモートの HTTPS ポッドを操作するとき、comfyui-mcp には
+ポッドのブラウザーパネルから自分のマシン上のエージェントブリッジへ戻る、有効な TLS の `wss://`
+経路が必要です（`https://` のページからの素の `ws://` はブラウザーにブロックされます）。既定では
+これは **cloudflared のクイックトンネル** です — セットアップは不要ですが、一時的です（実行のたびに
+新しいランダムなホスト名になります）。
+
+その経路を **端から端まで自分で持ちたい** 組織向けに — 制御チャネルが第三者を経由しない、
+ファイアウォール / 監査ルール用の固定ドメイン、インフラ外のサービスへの依存なし —
+comfyui-mcp は、既定のクイックトンネルの代わりに、**自分で運用する** リレー経由でセキュア
+ブリッジをルーティングできます。
+
+<Note>
+リファレンス実装はオープンソースです:
+**[artokun/comfyui-mcp-relay](https://github.com/artokun/comfyui-mcp-relay)** — Cloudflare
+Worker + Durable Object、MIT ライセンス、GitHub のテンプレートとしてマークされているので
+**Use this template** をクリックすれば数秒で自分のコピーができます。フォークしてそのまま
+デプロイするか、組織がすでに動かしている WebSocket 対応インフラに合わせて改変してください —
+README にワイヤプロトコル、セッションのライフサイクル、設計上のトレードオフ（多重化、認証、
+ハイバネーション）がすべて書かれています。
+</Note>
+
+## セルフホストする理由
+
+- **データ所在地 / コンプライアンス** — ブリッジが運ぶのはツール呼び出しとグラフ操作です
+  （画像バイトはポッド↔ブラウザーで直接流れます）が、その制御チャネルを自分で運用する
+  インフラの内側に置きたい組織もあります。
+- **サードパーティのランタイム依存なし** — 外部リレーの可用性に頼るのではなく、固定された
+  自分のエンドポイント。
+- **ファイアウォール / 監査ルール** — セッションごとに変わる一時的なホスト名より、自分で
+  管理する安定したドメインのほうが許可リストとログに載せやすいです。
+
+## 全体のつながり
+
+ブリッジの両側は **外向き** にダイヤルします — どこにも着信ポートを開ける必要はありません。
+リレーの仕事は、1 つのオーケストレーター（ユーザーのマシンで動く）と、それが操作している
+ポッド上のブラウザーパネル接続をペアリングし、その間でバイトを運ぶことです。上に乗っている
+comfyui-mcp 自身のツール呼び出しプロトコルを理解する必要はありません。
+
+リレーをデプロイしたら、comfyui-mcp を向けるのは環境変数をいくつか設定するだけです:
+
+```bash
+export COMFYUI_MCP_TUNNEL_BACKEND=relay
+export COMFYUI_MCP_RELAY_URL=wss://your-relay.internal.example.com
+# optional: a shared secret gating who can open a session on your relay at all
+export COMFYUI_MCP_RELAY_KEY=your-shared-deploy-secret
+```
+
+`COMFYUI_MCP_TUNNEL_BACKEND` が未設定なら、comfyui-mcp は既定の一時的なクイックトンネル
+動作のままです — これは完全にオプトインです。
+
+## リファレンス実装をデプロイする
+
+```bash
+gh repo create your-org/your-relay --template artokun/comfyui-mcp-relay --clone
+cd your-relay
+npm install
+wrangler login
+npm run deploy
+```
+
+完全な README — ワイヤプロトコル、認証モデル、デプロイ手順 — は
+**[artokun/comfyui-mcp-relay](https://github.com/artokun/comfyui-mcp-relay)** を参照してください。

@@ -1,0 +1,222 @@
+---
+title: "クラウドデプロイ（RunPod）"
+description: "エージェントパネルから出ずに、ComfyUI 用のクラウド GPU ポッドをデプロイ、接続、監視、停止する — ワンタップのデプロイ、正直なローカル⇄ポッドのホスト切り替え、ライブのコスト / GPU 状態、アイドル自動停止。またはワンコマンドで既存のポッドを操作します。"
+icon: "cloud"
+---
+
+ローカル GPU がない — またはオンデマンドでもっと大きいものが欲しい？ ComfyUI を
+**クラウド GPU ポッド** にデプロイし、**自分の** マシン上のエージェントから、自分の
+Claude または ChatGPT サブスクリプションで自然言語操作します。
+
+<Note>
+ポッドが提供するのは **ComfyUI + Manager + エージェントパネル UI** だけです。エージェントの
+頭脳（[パネルオーケストレーター](/docs/ja/panel)）は **自分のマシン上でローカルに**、自分の
+サブスクリプションで動きます — なのでクラウドポッドが LLM に GPU 時間を燃やすことはなく、
+API キーもエージェントのログインも箱に触れません。[トポロジー](#トポロジー-エージェントが動く場所)
+を参照してください。
+</Note>
+
+## ワンクリックテンプレート（最短経路）
+
+事前ビルドのイメージは **エージェントパネルからすぐ操作できる状態** で起動します — ComfyUI +
+[エージェントパネル](https://github.com/artokun/comfyui-mcp-panel) +
+ComfyUI-Manager v2 が焼き込まれ、セットアップ不要です:
+
+[![Deploy on RunPod](https://img.shields.io/badge/Deploy_on-RunPod-673AB7?style=for-the-badge)](https://console.runpod.io/deploy?template=bnqtkvcer3&ref=dkx71w9b)
+
+1. **Deploy on RunPod** をクリックし、GPU を選びます（RTX 5090 / 任意の Blackwell または
+   Ada カードが動きます — イメージは cu128 torch を同梱します）。
+2. テンプレートの既定を保ちます: HTTP ポート **3000** を公開し、ネットワークボリュームを
+   **`/workspace`** にマウント。
+3. ポッドが上がるまで待ちます。自動更新の「ComfyUI is starting…」ページが準備できるまで
+   出ます（ComfyUI 初期化は約 30–60 秒）。
+
+それから [自分のマシンから接続する](#自分のマシンから接続する) へ進んでください。
+
+## エージェントパネルからデプロイと操作する（v0.44 以降）
+
+**comfyui-mcp 0.44** 以降、RunPod コンソールに触れる必要も CLI コマンドを実行する必要も
+ありません — [エージェントパネル](/docs/ja/panel) に **RunPod のコントロールパネル** があり、
+ポッドのデプロイ、接続、監視、停止を行い、同じコントロールシートは
+[モバイルアプリ](/docs/ja/mobile) にも載っています。
+
+1. **キーを一度設定する。** パネルの **API キー** カードに `RUNPOD_API_KEY` を貼ります。
+   サーバー側の `~/.comfyui-mcp/.env` に保存され、ブラウザーには入りません。
+2. パネルツールバーのホストピルから **RunPod のコントロールパネル** を開きます
+   （最初は **🟢 ローカル · 自分のマシン** と読めます）。
+3. **デプロイまたは接続。** **デプロイ** でワンタップのポッド（テンプレートのデプロイリンクを
+   通り、空きが厳しいときは GPU タイプ / COMMUNITY→SECURE を横断してフォールバックします）、
+   またはドロップダウンから既存ポッドを **名前で** 選び **接続**。
+4. **ライブで見る。** ステータスカードは GPU / VRAM / 稼働時間 / **$·hr** と
+   **アイドル自動停止** のカウントダウンを出し、ホストピルは
+   **🔵 RunPod · `<pod>` · GPU · $/hr** に切り替わります — レンダーがどこで走るかが曖昧に
+   なりません。エージェントはカスタムノード + LoRA をインストールし、モデルをポッドへ
+   ダウンロードするので、ローカルリグと **正確なキャンバスのパリティ** が得られます。
+5. **戻して止める。** **ローカルを使用** はレンダリングを自分のリグへ即座に向け直します。
+   **停止** はポッドを止めます。アイドル自動停止（`RUNPOD_IDLE_STOP_MINUTES`、既定 15。
+   ポッドで実際にレンダリングしている間だけ数えます）は、忘れたときのコストの最後の砦です。
+
+**デッドマンスイッチ（v0.47 以降）。** アイドル自動停止は comfyui-mcp プロセスの中にあります —
+そのプロセスが死ぬと（クラッシュ、閉じたラップトップ）、砦も一緒に死に、ポッドは永遠に課金
+されていました。**コネクタ経由で作られた** ポッドはいまポッド側のウォッチドッグを運びます:
+comfyui-mcp がポッドを見守っている間は数秒ごとにハートビートし、ビートが止まるとポッドは
+猶予のあと **自分で停止** します（終了はしません — `/workspace` は残ります。起動後ハートビート
+なし 45 分、その後ビート間 20 分。`RUNPOD_DEADMAN_BOOT_GRACE_S` /
+`RUNPOD_DEADMAN_BEAT_GRACE_S`）。「見守る」は **ローカルを使用** と **監視解除** を生き延びます —
+それらは UI の表示だけを変え、ウォッチドッグが発火するのは comfyui-mcp 自身がいなくなった
+（またはポッドが終了した）ときだけです。ウォッチドッグは **RunPod がすべてのポッドに自動注入
+するポッドスコープの API キー** でポッドを止めます — アカウント全体のキーがマシンを出ることは
+なく、資格情報の面でオプトアウトするものはありません。武装させないには
+`runpod` / `action: "create"` で `deadman:false`（または `RUNPOD_DEADMAN=0`）、あるいは
+ポッド環境に `DEADMAN_DISABLE=1`。コンソールからデプロイしたポッドはハートビートトークンを
+運ばず、カスタムテンプレートのデプロイ（`RUNPOD_TEMPLATE_ID`）は既定で **オフ** です —
+そのイメージがこちらのウォッチドッグを同梱しているときだけ `deadman:true` を渡してください。
+
+<Note>
+ComfyUI 用の GPU レンタルが初めてですか？ ブログが流れ全体を端から端まで歩きます:
+[レンタルしたクラウド GPU で ComfyUI を動かす](/docs/blog/runpod-comfyui)。
+</Note>
+
+このページの残りは **手動 / CLI 経路** です — いまも完全にサポートされ、コントロールパネルが
+裏で駆動するものです。
+
+## 自分のマシンから接続する
+
+ポッドが上がったら、公開プロキシ URL を取り（RunPod → 自分のポッド → **:3000** の HTTP
+エンドポイント、例: `https://<pod-id>-3000.proxy.runpod.net`）、ラップトップで **ワンコマンド**
+を実行します:
+
+```bash
+npx -y comfyui-mcp@latest connect https://<pod-id>-3000.proxy.runpod.net
+```
+
+**リモートの HTTPS ポッド** では、`connect` は自動的に **安全な暗号化 `wss://` トンネル**
+（Cloudflare 経由）を自分のマシン上のエージェントブリッジへ開き、ポッドのパネルにその URL を
+渡します — なのでポッドの HTTPS ページは、**ブラウザーのプロンプトなし、コピーするものなし、
+どのブラウザーでも** エージェントに届きます。**ローカル** の ComfyUI では素の
+`ws://127.0.0.1:9180` ループバックブリッジを使います。どちらでもエージェント — と
+Claude/ChatGPT のログイン — は **自分の** マシン上だけで動き、ポッドには何もインストール
+されません。
+
+仕上げは、`connect` を自分のマシンで動かしたまま、ブラウザーでポッドの ComfyUI を開き、
+**エージェントパネル** サイドバーを開き、**接続** をクリックします。
+
+あとは自然言語でグラフを操作します。
+
+<Note>
+**なぜトンネルか？** ポッドのページは `https://` で提供され、ブラウザーは安全なページが
+自分のマシンへの安全でない `ws://` ソケットを開くことをブロックします（混合コンテンツ /
+Private Network Access）。トンネルはブリッジに有効な TLS の `wss://` URL を与えます —
+セッションごとのランダムトークンでゲートされ — なのでプロンプトなしでどこでも動きます。
+</Note>
+
+<Note>
+ポッドが認証の背後にある場合、ローカルの `connect` コマンドに `COMFYUI_AUTH_TOKEN`
+（任意で `COMFYUI_AUTH_HEADER` / `COMFYUI_AUTH_SCHEME` も）を設定します。
+**Cloudflare Access** の手前にあるポッドでは、Access の **サービストークン** を作り、
+`CF_ACCESS_CLIENT_ID` + `CF_ACCESS_CLIENT_SECRET` を設定します — どちらもすべての
+ComfyUI リクエスト（HTTP + キューウォッチャーの WebSocket）に乗るので、コネクタはゲートを
+通り、人間のサインインページはブラウザー向けに残ります。
+</Note>
+
+### すべてを自分のマシンに置く（Cloudflare なし）
+
+ブリッジを Cloudflare 経由にしたくない？ 自分の **SSH ポートフォワード** でポッドに届き、
+ページをループバックオリジンにします（素の `ws://` が動き、トンネル不要）:
+
+```bash
+ssh <pod-ssh> -L 3000:localhost:3000   # grab the SSH command from RunPod → Connect
+npx -y comfyui-mcp@latest connect http://localhost:3000
+```
+
+それから **http://localhost:3000** を開きます。またはポッドの直接 https URL で接続しつつ、
+**`--insecure-bridge`** で素のループバックブリッジを強制します（その場合、ポッドページが
+`ws://127.0.0.1:9180` に届く経路は自分で用意します）。
+
+上のどちらかではなく、既定の Cloudflare クイックトンネルに対する **安定したセルフホストの
+代替** — 自分のドメイン、一時的なホスト名なし、そのホップの完全な所有 — が欲しいですか？
+[セルフホストのリレー](/docs/ja/self-hosted-relay) を参照してください。
+
+## トポロジー: エージェントが動く場所
+
+```
+  YOUR LAPTOP                                   CLOUD GPU POD (RunPod)
+  ┌───────────────────────────┐                ┌───────────────────────────────────┐
+  │ npx comfyui-mcp connect …  │  HTTP/WS  ───▶ │ nginx :3000 ─▶ ComfyUI :3001        │
+  │  └─ panel orchestrator     │                │   ├─ Manager v2 (--enable-manager) │
+  │     (Claude/ChatGPT Agent  │ ◀───  events   │   └─ Agent Panel (sidebar)         │
+  │      SDK on YOUR sub)      │                │                                     │
+  └───────────────────────────┘                └───────────────────────────────────┘
+```
+
+ポッドは意図的に **Node.js エージェントも、Agent SDK も、LLM クライアントも同梱しません** —
+GPU 時間を無駄に燃やすだけです。推論ループは自分のマシンにあり、ポッドは純粋な ComfyUI
+バックエンドです。これはローカルのエージェントパネルが使うのと同じ
+[リモート操作モデル](/docs/ja/panel) で、ComfyUI が localhost ではなくクラウド GPU 上に
+あるだけです。
+
+## 何が永続するか（しないか）
+
+イメージは **速い停止 / 起動** 向けに最適化されています。重いソフトウェア — ComfyUI、その
+venv、Manager v2 — は不変イメージに焼き込まれ `/opt/ComfyUI` から動き、`custom_nodes` は
+`/workspace` ボリューム上にあります（シンボリックリンク）ので、インストールは残ります。
+温かい再起動は完全なインストール / 同期 / シードをせず、ComfyUI を再起動するだけです。
+
+| 何か | 置かれる場所 | 再起動を生き延びるか？ |
+|------|----------------|---------------------|
+| モデル（Manager のダウンロードも含む） | ボリューム `/workspace/models` | **はい** |
+| ワークフロー + ComfyUI 設定 + Manager 設定 | ボリューム `/workspace/user` | **はい** |
+| 入力 / 出力 | ボリューム `/workspace/input`、`/output` | **はい** |
+| **カスタムノード**（エージェント / Manager のインストール） | ボリューム `/workspace/custom_nodes`（シンボリックリンク） | **はい** |
+| ComfyUI インストール + venv + Manager | イメージ `/opt/ComfyUI` | イメージと一緒に再取得 |
+
+<Note>
+**実行時にインストールしたカスタムノードは再起動を生き延びます。** `custom_nodes` は
+`/workspace/custom_nodes` へシンボリックリンクされます。起動のたびにイメージに焼かれた
+ノード（エージェントパネル + 組み込み）がそこにシード / 更新され（イメージアップグレードが
+新しいパネルを届け、自分のノードは残る）、各ノードの Python 依存はボリューム上の
+**永続 pip キャッシュ** から venv へ再インストールされます — 初回のあと速いです。モデルも
+残ります。起動時作業ゼロでノードを焼くには、`Dockerfile` に足してイメージを再ビルドして
+ください（下記）。
+</Note>
+
+## 自分のイメージをビルドしてデプロイする
+
+ワンクリックテンプレートは事前ビルドのイメージです。**薄い事前ビルドイメージ** — 同じ
+ComfyUI + エージェントパネル + Manager ですが、任意のドナー追加
+（`runpod-uploader`/`croc`/`app-manager`）や焼かれた SDXL スポットチェックチェックポイント
+なし。CI で継続ビルドされ、
+[`ghcr.io/artokun/comfyui-mcp-runpod:cu128-lean`](https://github.com/artokun/comfyui-mcp/pkgs/container/comfyui-mcp-runpod)
+で公開されています。自分で何もビルドせず RunPod テンプレートを向けたいだけならこれです。
+
+カスタマイズする — バージョンをピン留めし、追加のカスタムノードを焼き、モデル配置を変える —
+には [`docker/runpod/`](https://github.com/artokun/comfyui-mcp/tree/main/docker/runpod)
+から自分でビルドしてプッシュします:
+
+```bash
+cd docker/runpod
+docker build -t <your-registry>/comfyui-mcp-runpod:cu128 .
+docker push     <your-registry>/comfyui-mcp-runpod:cu128
+```
+
+ビルド時に GPU は不要です。それから自分のイメージを向いた RunPod の **Pod テンプレート** を
+作り、**HTTP ポート 3000** を公開し、**`/workspace` にネットワークボリューム** を付けます。
+
+[`docker/runpod/README.md`](https://github.com/artokun/comfyui-mcp/blob/main/docker/runpod/README.md)
+が完全なビルドリファレンスです — マルチステージ Dockerfile、正確な ComfyUI 起動フラグ、
+`extra_model_paths.yaml` のボリュームマッピング、Manager のリモートインストールゲート、
+環境変数、サイズ / ピンのトレードオフ。
+
+## その他のクラウドターゲット
+
+`connect` の流れは RunPod 専用ではありません — エージェントパネルを提供する **任意の**
+到達可能な ComfyUI（別のクラウドホスト、VPS、LAN 上の箱）に対して動きます。`connect` を
+その URL に向け、外部オーケストレーターのトグルを切り替えます:
+
+```bash
+npx -y comfyui-mcp@latest connect https://your-comfyui.example.com
+```
+
+**comfyui-mcp 自体** をホスト型の認証付き MCP サーバーとして公開する（ComfyUI をデプロイ
+するのではなく）場合は、[リモート / ホスト型コネクタ](/docs/ja/remote-connector) を参照して
+ください。

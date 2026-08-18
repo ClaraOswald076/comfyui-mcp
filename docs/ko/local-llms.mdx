@@ -1,0 +1,432 @@
+---
+title: "로컬 LLM과 다른 에이전트"
+description: "Hermes Agent, OpenClaw, Copilot CLI에 대한 일급 지원 — 더하기 로컬(Ollama) 또는 호스팅 모델의 어떤 MCP 클라이언트든. 원커맨드 설정, 그리고 약 200개 도구 스키마를 메타 도구 3개로 접는 컴팩트 도구 모드."
+icon: "microchip"
+---
+
+comfyui-mcp는 표준 stdio MCP 서버이므로, **MCP를 할 수 있는 어떤 에이전트든
+구동할 수 있습니다** — Claude Code만이 아닙니다. 이 페이지는 일급으로 지원하는
+하네스(**Hermes Agent, OpenClaw, Copilot CLI**), 모델이 가져와야 하는 것,
+그리고 작은/로컬 모델을 가능하게 하는 **컴팩트 도구 모드**를 다룹니다.
+
+## 모델 요구 사항
+
+가져오는 모델에 대해 스스로 솔직하세요. *전체* 경험의 최소 사양은
+**도구 호출 + 사고 + 비전**이 있는 모델입니다:
+
+| 기능 | 없으면 |
+| --- | --- |
+| **도구 호출** (네이티브 함수 호출) | **동작하지 않습니다.** 모든 comfyui-mcp 동작이 도구 호출입니다. 어떤 하네스의 프롬프트 에뮬 도구 호출은 기술적으로 실행되지만, 신뢰성이 무너집니다 — 미지원으로 다루세요. |
+| **사고 / 추론** | 동작합니다, 저하됨. 다단계 체인 (도구 고르기 → 스키마 가져오기 → 인자 만들기 → 오류에서 복구)이 눈에 띄게 나빠집니다. 에이전트가 다시 프롬프트/넛지를 필요로 할 것으로 기대하세요. |
+| **비전** | 동작합니다, 저하됨. 에이전트가 생성할 수는 있지만 *볼* 수는 없습니다 — `get_image (action:"view")` 비평 루프, `get_workflow (action:"from_image")`, 시각 비교를 쓸 수 없어, 자신의 출력에 눈먼 채로 날아갑니다. |
+
+전체 사양에 맞는 호스팅 모델은 달마다 바뀝니다 — 목록을 믿기보다
+제공자의 모델 카드에서 세 기능을 확인하세요. 2026년
+중반 기준: **Xiaomi MiMo-V2.5** (비전 + 도구 + 긴 컨텍스트)가 전체
+사양에 싸게 맞습니다. **DeepSeek-V3.x / GLM / MiniMax** 계열 모델은 강한 도구
+호출 + 사고가 있지만 텍스트 전용 변형은 비전 루프를 잃습니다. 작은 로컬
+모델(아래)은 보통 도구 호출을 유지하고 나머지를 떨어뜨립니다.
+
+## 컴팩트 도구 모드
+
+전체 표면은 풍부한 JSON 스키마를 가진 도구 37개입니다 (`tools/list`당 약 200 KB, 대략 50k
+토큰). Claude가 아닌 대부분의 하네스는 등록된 모든
+스키마를 모델 컨텍스트에 바로 주입합니다 — 프런티어 모델에는 괜찮고, 4B
+로컬에는 치명적입니다. **컴팩트 도구 모드**는 정확히 **세
+메타 도구**만 등록하고 진짜 카탈로그는 그 뒤에 둡니다:
+
+| 메타 도구 | 하는 일 |
+| --- | --- |
+| `list_tools` | 토큰이 가벼운 카탈로그: 모든 도구 이름 + 한 줄 요약, 카테고리별 묶음. `category`와 `search` 필터를 지원. |
+| `describe_tool` | 도구 하나의 전체 설명 + JSON Schema, 필요할 때만 가져옴. |
+| `call_tool` | 카탈로그된 어떤 도구든 실행: `{"name": "generate_image", "args": {...}}`. 아래 도구가 반환하는 것을 그대로 반환. |
+
+모델의 루프는: `list_tools` → 고르기 → `describe_tool` → `call_tool`.
+스키마는 한 번에 도구 하나씩 컨텍스트에 들어갑니다. 메타 도구는 작은 모델
+버릇에 의도적으로 관대합니다: `args`가 객체 **또는** JSON 인코딩된
+문자열일 수 있고, 흔한 필드 별칭(`tool_name`, `arguments`)이 받아들여지며,
+유효성 오류가 기대 스키마와 함께 돌아와 모델이
+불투명한 프로토콜 오류에서 죽는 대신 스스로 고칠 수 있습니다.
+
+컴팩트는 **선택 사항**입니다 — 직접 표면이 기본값이므로, 작은 모델은
+이 중 하나가 필요합니다 (플래그가 환경 변수보다 이깁니다):
+
+```bash
+npx -y comfyui-mcp --compact
+# or
+COMFYUI_MCP_TOOL_MODE=compact npx -y comfyui-mcp
+```
+
+기본값은 프런티어 모델 하네스(Claude Code / Cursor / Claude
+Desktop)에 맞습니다. 그 클라이언트가 큰 도구 목록을 잘 다룹니다. `--full`은 여전히
+받아들여지며 이제 no-op입니다.
+
+### 자동 선택: 제공자가 아니라 모델을 기준으로
+
+패널의 로컬 LLM 백엔드(Ollama / LM Studio / llama.cpp /
+OpenAI 호환)에서, **모드를 고르지 않았을 때**, *모델*이 하나를 고릅니다:
+
+- id에 파라미터 수가 **70B** 이상으로 실린 모델
+  (`llama3.3:70b`, `gpt-oss:120b`, `mixtral:8x22b`)은 **전체** 표면을 받습니다.
+- 더 작은 것은 **컴팩트**에 남습니다.
+- 읽을 수 있는 파라미터 수가 없는 모델 id (`moonshotai/kimi-k2.5`)는
+  작은 것이 아니라 **알 수 없음**으로 다루어, 문서화된 컴팩트
+  폴백을 받습니다.
+
+"Ollama ⇒ 컴팩트"는 양쪽 방향으로 틀립니다 — 70B 로컬 모델은
+전체 표면을 다루며 불필요하게 불구가 될 것이고, 어떤 작은
+호스팅 모델은 컴팩트를 원합니다. 그래서 신호는 모델입니다.
+
+**당신의 선택이 항상 이깁니다, 양쪽 방향으로.** `COMFYUI_MCP_TOOL_MODE=full`은
+4B 모델에 전체 표면을 강제하고, `COMFYUI_MCP_TOOL_MODE=compact`는
+405B에 라우터를 강제합니다. 자동 선택은 아무것도 고르지 않은
+틈만 채웁니다.
+
+70B 임계값은 의도적으로 보수적입니다: 이 축에 대해 실제로
+주장된 유일한 숫자이므로, 추측으로 승격하지 않습니다.
+`COMFYUI_MCP_FULL_SURFACE_MIN_PARAMS_B=30`이 하드웨어의 진짜 천장을
+찾고 싶으면 낮춥니다.
+
+**시스템 프롬프트가 모드를 따릅니다.** 컴팩트 프롬프트는 모델에게
+도구 여섯 개가 있고 ComfyUI를 `call_tool`로 라우팅한다고 말합니다. 전체 표면이
+선택되면 그것은 그냥 거짓이므로, 전체 모드 프롬프트는 ComfyUI 도구가
+직접 광고된다고 말하고 `panel_*`에만 라우터 설명을 유지합니다.
+도구가 없다고 부정하면서 전체를 자동 선택하는 것은 대체한
+기본값보다 나쁠 것입니다.
+
+활성 모드**와 그 이유**가 백엔드의 준비 줄에 출력됩니다.
+예: `Tool mode: compact — chosen for this MODEL: "qwen3:4b" is ~4B
+parameters, below the 70B full-surface threshold…`. 그래서 레버가 다시는
+보이지 않게 되지 않습니다.
+
+<Note>
+이 자동 선택은 패널의 로컬 LLM 레인을 커버합니다. Codex / Gemini /
+Grok / Copilot HTTP 레인은 다른 이유로 컴팩트에 고정됩니다 —
+자체 도구 예산이 그렇지 않으면 `panel_*` 도구를 밀어내기 때문입니다 — 그리고
+독립 MCP 서버의 기본값은 바뀌지 않습니다.
+</Note>
+
+## 오디오 입력
+
+**`ollama` 백엔드에서 (네이티브 `/api/chat`)**, 오디오는 모델이 실제로
+들을 수 있다고 보고하는 곳에서만 모델에 닿습니다. 보내기 전에 백엔드가
+그 모델의 기능을 `POST /api/show`에 묻습니다:
+
+```bash
+ollama pull gemma4:e2b      # capabilities: completion, vision, audio, tools, thinking
+```
+
+선택한 모델에 `audio` 기능이 없으면, 첨부가 **소리 내어
+거절**됩니다 — 서버가 보고한 기능 목록과 들을 수 있는
+모델의 pull 명령과 함께 — 모델이 텍스트만으로 답할 요청에
+떨어지는 대신. 오디오 형식이 아닌 파일, 또는 있지만
+0바이트인 파일에도 같습니다.
+
+바이트를 전달하는 것이 일의 전부는 아닙니다. `gemma4:e2b`에 대해 라이브로
+측정했습니다: WAV가 컨텍스트에 분명히 있는데도 (프롬프트 토큰 555,
+`/api/show`가 `audio`를 보고), 모델이 여전히 *"I do not have the
+capability to transcribe audio — my functions are limited to operating
+ComfyUI"*라고 답했습니다. 패널 시스템 프롬프트가 그래프 연산자로 캐스팅하고 작은
+모델이 실제로 가진 감각에서 스스로를 빠져나가게 추론합니다. 그래서 오디오가
+기능 확인되고 첨부된 턴은, 오디오가 거기 있고 들은 것으로
+답해야 한다고 모델에게 말하는 짧은 노트도 싣습니다. 그 노트로
+같은 모델이 네 번 중 네 번 올바르게 받아적었습니다.
+
+**OpenAI 호환 백엔드에서** (LM Studio, llama.cpp, OpenRouter,
+커스텀) 물을 기능 엔드포인트가 없습니다. 오디오는
+`input_audio` 콘텐츠 파트로 보내지고 턴이 명시적인 *"모델이 실제로
+받는지 확인할 수 없습니다"* 줄을 싣습니다. 거절하면 기능 API가
+없는 모든 엔드포인트에서 오디오를 막을 것입니다. 실행할 수 없는 가드는
+판결이 아닙니다 — 확인도 아니며, 문구가 그렇게 말합니다.
+
+다른 모든 제공자가 하는 일은 [백엔드 → 오디오 입력](/docs/ko/backends#오디오-입력--어느-백엔드가-정직하게-지원하는가)을
+참고하세요.
+
+## 원커맨드 설정
+
+`comfyui-mcp setup <agent>`는 하네스 자체의 설정 파일에 서버 항목을
+씁니다 (이미 있는 것과 병합 — 기존 서버,
+YAML의 주석, 모두 보존):
+
+```bash
+npx -y comfyui-mcp setup hermes     # → ~/.hermes/config.yaml      (compact by default)
+npx -y comfyui-mcp setup openclaw   # → ~/.openclaw/openclaw.json  (compact by default)
+npx -y comfyui-mcp setup copilot    # → ~/.copilot/mcp-config.json (full by default)
+```
+
+플래그: `--compact` / `--full`이 에이전트별 기본값을 재정의하고,
+`--comfyui-url <url>`이 ComfyUI 대상을 임베드하며 (로컬, LAN, 또는 RunPod 프록시
+URL), `--dry-run`은 쓰는 대신 병합된 설정을 출력합니다.
+
+## Hermes Agent
+
+```bash
+npx -y comfyui-mcp setup hermes --comfyui-url http://127.0.0.1:8188
+```
+
+이것이 `~/.hermes/config.yaml`에 이것을 만듭니다 (원하면 손으로 추가하세요):
+
+```yaml
+mcp_servers:
+  comfyui:
+    command: "npx"
+    args: ["-y", "comfyui-mcp", "--compact"]
+    env:
+      COMFYUI_URL: "http://127.0.0.1:8188"
+```
+
+`/reload-mcp`로 다시 불러오거나 (또는 Hermes를 재시작). Hermes가 도구에 접두사를 붙이므로
+모델은 `mcp_comfyui_list_tools`, `mcp_comfyui_describe_tool`,
+`mcp_comfyui_call_tool`을 봅니다 — 이백 개 대신 컨텍스트에 정의 세 개.
+
+<Note>
+프런티어 모델에서 (Nous Portal / OpenRouter를 통해) 설정을 `--full`로
+다시 실행하고 선택적으로 Hermes 자체 `tools.include` 허용 목록을 쓸 수 있습니다. 컴팩트는
+더 작은 모든 것에 맞는 기본값입니다.
+</Note>
+
+Hermes는 또한 Python 스크립트에서 raw REST로 ComfyUI를 구동하는 번들된
+`comfyui` *스킬*을 싣습니다. 동작하지만, 이 서버보다 앞섭니다 — MCP
+경로가 워크플로우 작성/검증, 모델 + 커스텀 노드 관리,
+설치 팩, 대기열 제어, 자가 진단을 줍니다. 에이전트가 MCP 도구 대신
+그것에 손을 뻗으면 스킬을 끄세요.
+
+## OpenClaw
+
+```bash
+npx -y comfyui-mcp setup openclaw
+```
+
+이것이 `~/.openclaw/openclaw.json`에 이것을 만듭니다:
+
+```json
+{
+  "mcpServers": {
+    "comfyui": {
+      "command": "npx",
+      "args": ["-y", "comfyui-mcp", "--compact"],
+      "transport": "stdio"
+    }
+  }
+}
+```
+
+서버를 집어 올리려면 OpenClaw 게이트웨이를 재시작하세요. OpenClaw의 문서는
+MCP 도구 수를 낮게 유지하라고 권합니다 — 그것이 정확히 컴팩트 모드가 하는 일이고,
+여기서 기본값인 이유입니다.
+
+## Copilot CLI
+
+```bash
+npx -y comfyui-mcp setup copilot
+# or use Copilot's own command:
+copilot mcp add comfyui -- npx -y comfyui-mcp
+```
+
+이것이 `~/.copilot/mcp-config.json`에 이것을 만듭니다:
+
+```json
+{
+  "mcpServers": {
+    "comfyui": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "comfyui-mcp"],
+      "env": {},
+      "tools": ["*"]
+    }
+  }
+}
+```
+
+Copilot CLI는 프런티어 모델을 실행하므로, 설정은 **전체** 도구
+표면을 기본으로 합니다 (더 작은 모델로 Copilot을 라우팅하면 `--compact`를 넘기세요).
+`copilot` 안에서 `/mcp show`로 확인하세요.
+
+## 자체 파인튜닝 모델 (무료, 권장)
+
+에이전트를 **로컬에서 무료로** 실행하고 싶다면, 여기서 시작하세요. Gemma 4
+계열을 comfyui-mcp를 위해 특별히 파인튜닝했습니다: 라이브 ComfyUI에 대해 합성된
+**서버 검증 도구 사용 궤적 1,055개**로 QLoRA 학습 —
+**전체 178도구 표면** (MCP 113 + 패널 도구 65)을 커버 — 그래서 모델이
+이 정확한 도구 모음을 차갑게 만나는 대신 네이티브로 압니다.
+
+```bash
+# 1. Install Ollama (once):  https://ollama.com/download
+# 2. Pull the size that fits your GPU:
+ollama pull artokun/gemma4-comfyui-mcp:e4b     # default — ~3.5 GB VRAM at q4
+ollama pull artokun/gemma4-comfyui-mcp:12b     # ~8 GB VRAM
+ollama pull artokun/gemma4-comfyui-mcp:e2b     # smallest — ~2 GB VRAM (see caveat)
+```
+
+**약속이 아니라 측정** — [LLM 아레나](/docs/ko/arena) 점수가 실제 10시나리오
+사다리에서 (best of 3, 모든 결과가 라이브 ComfyUI 서버에 대해 검증됨, RTX 4090):
+
+| 태그 | VRAM (q4) | 아레나 점수 | 기본 대비 |
+|---|---|---|---|
+| `:e4b` | ~3.5 GB | **14/20** (13–14) — 테스트한 최고 로컬 모델 | stock gemma4:e4b: 12/20 |
+| `:12b` | ~8 GB | 13/20 (12–13) | stock 12b 미벤치마크 |
+| `:e2b` (v2) | ~2 GB | 10/20 (7–10) | stock gemma4:e2b: 8/20 |
+
+이제 모든 단이 기본 베이스를 이깁니다. `:e2b` v2 재학습 (이중 보기
+학습: 직접 도구 호출 AND 배포된 라우터 봉투)이 v1의
+`call_tool` 형식 회귀를 고쳤습니다 — 판결 실행에서 잘못된 봉투 제로.
+크기 안내는 그대로입니다: `:e4b`가 최적점입니다 (e2b보다 약 1.5 GB만 더
+쓰고 아레나에서 +4). `:e2b`는 이제 빠듯한 VRAM에 정당한 선택입니다.
+`:12b`는 날것의 점수가 아니라 긴 다단계 작업의 안정성을 삽니다.
+
+| 태그 | 베이스 | VRAM (q4) | 메모 |
+| --- | --- | --- | --- |
+| `:e4b` | Gemma 4 E4B | ~3.5 GB | **기본값** — 최고의 크기/품질 균형 |
+| `:e2b` | Gemma 4 E2B | ~2 GB | 장황하게 생각함 — 넉넉한 `max_tokens`를 허용 (≥512) |
+| `:12b` | Gemma 4 12B | ~8 GB | 가장 강한 단 |
+
+패널의 Ollama 백엔드는 **`:e4b`를 기본**으로 합니다 — 백엔드 선택기에서
+**Ollama (로컬)**을 고르면 모델을 받은 뒤 그냥 동작합니다. 계정 없음,
+API 키 없음, 토큰당 비용 없음.
+
+**컨텍스트 창:** 태그가 **65,536토큰** 창을 구워 싣고, 오케스트레이터가
+그것을 따릅니다 (기본 모델은 16K). 아키텍처는
+**128K** (`:e2b`/`:e4b`)와 **256K** (`:12b`)까지 지원합니다 —
+VRAM이 있으면 `COMFYUI_MCP_OLLAMA_NUM_CTX=131072`로 올리세요 (KV 캐시가
+창과 함께 자랍니다). 에이전트가 대화 중간에 "잊어버리기" 시작하면
+오케스트레이터 로그를 보세요: 턴이 창의 ≥85%를 채우면 경고합니다. 웨이트, LoRA 어댑터, 학습
+파이프라인은 열려 있습니다: [`artokun/gemma4-comfyui-mcp`](https://huggingface.co/artokun/gemma4-comfyui-mcp)
+(데이터셋: [`artokun/comfyui-mcp-trajectories`](https://huggingface.co/datasets/artokun/comfyui-mcp-trajectories)).
+
+## LM Studio
+
+패널은 LM Studio를 네이티브로 말합니다: 백엔드 선택기에서 **LM Studio**를 고르면
+오케스트레이터가 로컬 서버를 구동합니다 (`http://127.0.0.1:1234/v1`,
+`COMFYUI_MCP_LMSTUDIO_HOST`로 재정의). 설정은 클릭 두 번입니다:
+[lmstudio.ai](https://lmstudio.ai)에서 설치한 뒤, **도구 호출 모델**이
+로드된 채로 **Developer → Start Server**. 모델 선택기가 서버가
+제공하는 것을 미러합니다. 기본값이 없으면 첫 제공 모델이
+자동으로 채택됩니다. 오케스트레이터가 **전체 수명 주기**를 손대지 않고
+관리합니다: 필요할 때 서버를 자동 시작하고, 모델을 JIT 로드하고,
+ComfyUI 렌더가 실행되는 동안 VRAM을 비우며 (채팅은 보류되고 렌더가 끝나면 답함),
+모델 전환 시 나가는 모델을 언로드하고, 다른 제공자로 전환하면
+모든 것을 해제합니다.
+
+자체 파인튜닝 GGUF도 여기서 동작합니다 — LM Studio의 모델 다운로더에서
+`artokun/gemma4-comfyui-mcp`를 검색하고 `model-q4_k_m.gguf`를 받으세요. Ollama와 같은
+JIT 콜드 로드 정지를 첫 메시지에서 기대하세요 (30초+가 정상).
+
+## llama.cpp (llama-server)
+
+날것의 `llama.cpp`를 실행하나요? 백엔드 선택기에서 **llama.cpp**를 고르세요 —
+오케스트레이터가 `llama-server`의 OpenAI 호환 엔드포인트를 구동합니다
+(`http://127.0.0.1:8080/v1`, `COMFYUI_MCP_LLAMACPP_HOST`로 재정의):
+
+```bash
+llama-server -m gemma4-comfyui-mcp-e2b.Q4_K_M.gguf -c 16384
+```
+
+현장 메모: 컨텍스트는 **실행 플래그** (`-c`)입니다 — 서버가 16K 아래에서
+돌면 에이전트가 경고합니다 (도구 페이로드가 그것을 필요로 함). 도구 호출은 현재
+빌드에서 기본으로 켜집니다. **오래된 빌드는 `--jinja`가 필요합니다** (패널이 연결 시
+도구 불가 서버를 감지하고 정확히 그렇게 말합니다). 로드된 단일
+모델이 자동으로 채택됩니다 — 고를 필요 없음.
+
+단일 GPU 상자에서 **로컬** llama-server (또는 앞의 llama-swap)는
+Ollama와 LM Studio와 같은 VRAM 인계에 합류합니다: ComfyUI 렌더가
+실행되는 동안, 채팅이 보류되고 렌더가 끝나는 순간 답합니다.
+llama-server에는 언로드 API가 없으므로 (그리고 llama-swap은 수요에 따라
+업스트림에서 모델을 바꿈), 인계는 보류만입니다 — 명시적으로 언로드하거나 워밍하지 않습니다.
+**원격** `COMFYUI_MCP_LLAMACPP_HOST`는 다른 사람의 GPU이며 절대
+게이트되지 않습니다. 인계는 세 로컬 백엔드 모두에서 기본으로 켜집니다. 옵트아웃은
+`COMFYUI_MCP_PAUSE_LOCAL_ON_GEN=0` (레거시
+`COMFYUI_MCP_OLLAMA_PAUSE_ON_GEN=0`도 여전히 존중됩니다).
+
+## 커스텀 엔드포인트 (OpenAI 호환 서버라면 무엇이든)
+
+`/v1/chat/completions`를 말하는 모든 것 — vLLM, DeepSeek, Together, Azure
+OpenAI, 다른 상자의 llama-server, 회사의 게이트웨이 — 가
+**커스텀 엔드포인트** 제공자로 꽂힙니다:
+
+1. ComfyUI 설정 → **Comfy MCP Agent → 커스텀 엔드포인트** → 
+   **엔드포인트 기본 URL**을 설정하세요 (`/v1`을 포함, 예: `http://192.168.1.20:8000/v1`).
+2. 서버가 키를 필요로 하면: **API 키 설정…** — 마스킹된 입력. 키는
+   오케스트레이터가 `~/.comfyui-mcp`에 `0600`으로 저장하며, ComfyUI
+   설정이나 채팅에는 절대 없습니다.
+3. 백엔드 선택기에서 **커스텀 엔드포인트**를 고르고 연결하세요.
+
+모델 목록은 서버의 `/v1/models`에서 옵니다. 단일 모델 서버는
+자동으로 채택되거나, 모델을 나열하지 않는 엔드포인트를 위해 **기본 모델**
+id를 명시적으로 설정하세요. 환경 탈출구: `COMFYUI_MCP_CUSTOM_BASE_URL`,
+`COMFYUI_MCP_CUSTOM_MODEL`, `COMFYUI_MCP_CUSTOM_API_KEY`. 모델은
+**도구 호출**을 지원해야 합니다.
+
+## Ollama와 로컬 모델 — LLM 아레나
+
+Ollama (또는 OpenAI 호환 엔드포인트)와 대화하는 어떤 MCP 하네스든
+로컬 모델로 컴팩트 모드를 구동할 수 있습니다. 저장소에 반복 가능한 하네스가
+둘 실립니다: `npm run test:local-llm` (빠른 단일 모델 점검)과
+`node scripts/llm-arena.mjs` — **ComfyUI LLM 아레나**. *라이브* ComfyUI에 대해
+동일한 작업 세트를 모델 필드에 돌리고 모든 결과를
+모델의 주장이 아니라 서버에 대해 검증합니다.
+
+전체 10시나리오 사다리의 로컬 티어 점수 (RTX 4090, ComfyUI 0.27,
+temperature 0 — 작업 사다리와 프런티어 및 호스팅 모델을 포함한
+전체 티어 리더보드는 [아레나 페이지](/docs/ko/arena)를 참고):
+
+| 모델 | 크기 | 점수 /20 |
+| --- | --- | --- |
+| `qwen3:4b` | 2.6 GB | **13** |
+| `gemma4:e4b` | 9.6 GB | **12** |
+| `qwen3:8b` | 5.2 GB | **11** |
+| `gemma4:e2b` | 7.2 GB | **8** |
+| `llama3.1:8b` | 4.9 GB | **2** |
+| `gemma3` (어떤 크기든) | — | ❌ 네이티브 도구 호출 없음 — 미지원 |
+
+가져갈 점: qwen3/gemma4 계열은 단일 도구 작업(상태,
+설치된 모델, 레지스트리 검색, 대기열)을 단단히 넘고 더 어려운
+밴드에서 점을 줍니다. 하지만 다단계 그래프 구성 (파이프된 출력 둘의 그래프 하나,
+단계적 2단계 img2img 파이프라인)은 여전히 프런티어/B-tier 영역입니다.
+llama3.1:8b의 도구 형식 규율이 이 카탈로그에서 무너집니다 (도구
+이름을 환각하고 도구 호출 JSON을 텍스트로 출력). Gemma 4는 계열 전체에
+네이티브 함수 호출을 실었습니다 (Ollama ≥ v0.20). `e4b` 이상이
+최적점입니다.
+
+위의 기능 사다리를 기억하세요: 이 작은 모델은 도구 호출을
+유지하지만 비전과 사고가 제한적이거나 없어, 생성하고 워크플로우를
+관리할 수는 있어도 결과를 시각적으로 비평할 수는 없습니다.
+
+## 로컬 모델로 사이드바 패널 쓰기
+
+[패널 에이전트](/docs/ko/panel)가 Claude / ChatGPT / Gemini 옆에
+**Ollama 백엔드**를 얻습니다: 백엔드 선택기에서 **Ollama (로컬)**을 고르면
+오케스트레이터가 로컬 모델로 라이브 그래프를 구동합니다 — 계정 없음, API
+키 없음, 완전히 오프라인. 모델은 6도구 라우터를 봅니다 (컴팩트 comfyui
+메타 도구 3개 더하기 라이브 캔버스용 `panel_list_tools` / `panel_describe_tool` /
+`panel_call_tool`). 그래서 4B 모델도 스키마에 빠지지 않습니다. 기본 모델:
+**`artokun/gemma4-comfyui-mcp:e4b`** — [자체 gemma4
+파인튜닝](#자체-파인튜닝-모델-무료-권장). 이 정확한 도구 모음으로 학습됨
+(이전 아레나 최고인 기본 `gemma4:e4b`를 대체). `COMFYUI_MCP_OLLAMA_MODEL` 또는
+로컬로 받은 것을 나열하는 패널의 모델 선택기로 재정의하세요. 프런티어
+백엔드 대비 정직한 트레이드오프를 기대하세요: 더 느린 턴 (특히 첫 번째, 모델이
+로드되는 동안), 비전 없음, 대화 롤백 없음.
+
+## 얻는 것과 얻지 못하는 것
+
+어떤 MCP 클라이언트든 **전체 도구 표면**을 얻습니다 — 생성, 워크플로우
+작성, 모델, 커스텀 노드, 대기열, 진단 — 어느 도구 모드에서든.
+Claude Code **플러그인 엑스트라** (스킬, 슬래시 명령어, 훅, 설치
+팩, 사이드바 패널 에이전트)는 플러그인 기능이며 다른
+하네스로 여행하지 않습니다. `list_tools` 카탈로그는 그 지식 계층이
+없는 에이전트도 길을 찾을 수 있을 만큼의 방향을 싣도록 설계되었습니다.
+
+## 문제 해결
+
+- **모델이 문자열화된 `args`로 `call_tool`을 호출함** — 지원됩니다. 서버가
+  JSON 인코딩된 문자열을 자동으로 파싱합니다.
+- **모델이 도구 이름을 발명함** — 알 수 없는 이름이 가까운 일치
+  제안과 `list_tools`로 돌아가는 포인터를 반환합니다.
+- **잘못되거나 빠진 매개변수** — 오류에 도구의 JSON Schema가 포함됩니다.
+  능력 있는 모델이 다음 시도에서 스스로 고칩니다.
+- **모델이 아무것도 실행하지 않고 카탈로그에서 답함** — 알려진
+  작은 모델 실패 모드. 넛지하세요 ("카탈로그 항목은 데이터가 아니라 도구
+  이름입니다 — call_tool로 도구를 실행하세요").
+- **ComfyUI에 닿을 수 없음** — 컴팩트 모드는 도구 *등록*만 바꿉니다.
+  연결 설정은 다른 모든 설정과 동일합니다
+  ([설정](/docs/ko/configuration) 참고).

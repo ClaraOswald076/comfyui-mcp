@@ -1,0 +1,114 @@
+---
+title: "LLM アリーナ"
+description: "任意のエージェント LLM を実際の ComfyUI タスクでベンチマークする — ローカル（Ollama）、ホスト型（OpenRouter/DeepSeek/GLM/MiMo）、またはフロンティア。すべてのスコアはモデルの主張ではなく、ComfyUI サーバーに対して検証されます。ワンコマンド、共有できるレポート。"
+icon: "trophy"
+---
+
+**ComfyUI LLM アリーナ** は 1 つの問いを正直に答えます: *このモデルは本当に ComfyUI を
+操作できるか？* 「自信ありそうに聞こえるか」ではありません — 各シナリオの結果は
+**ComfyUI サーバー自身に対して検証** されます（ジョブ履歴、実行されたグラフのパラメータ、
+実際の出力ファイルとそのピクセルサイズ）。パネルと MCP クライアントが使うのと同じ
+[コンパクトツールルーター](/docs/ja/local-llms) の上で走るので、アリーナのスコアは実際の
+エージェント挙動を予測します。
+
+```bash
+npm run arena          # scores the default local field via Ollama
+```
+
+## タスクのはしご
+
+10 シナリオ、3 つの難易度帯、PASS = 2（完了かつサーバー検証済み）、
+PARTIAL = 1（正しいツールファミリー、結果は不完全）、FAIL = 0 — 最大 **20**:
+
+| 帯 | シナリオ | 証明すること |
+| --- | --- | --- |
+| Basics | `health` · `models` · `registry` · `queue` | ツール発見 + 単発呼び出しのタスク |
+| Gauntlet | `generate`（非同期レンダー + ポーリング）· `precision`（正確な steps/size が実行グラフに載る）· `breakfix`（意図的な失敗 → 診断 → 復旧）· `provenance`（アセットレジストリを見つけ、generate_image (action:"regenerate") で上書きして再レンダー） | 複数ホップの連鎖、パラメータ忠実度、エラー復旧 |
+| Crucible | `multiout`（512px + 1024px の出力を保存する 1 つのグラフ — PNG ヘッダーを読んで検証）· `pipeline`（`upload_image (action:"stage")` でつなぐ 2 段階 img2img） | 生のグラフ構成 — テンプレートではカバーできない |
+
+同点は **ナッジ → ツールラウンド → 実時間** で決まります。一度で決めたモデルが、同じスコアまで
+もがいたモデルより上になります。
+
+## 自分のモデルを持ち込む
+
+アリーナは 2 つの方言を話します — ローカルの Ollama と、任意の OpenAI 互換:
+
+```bash
+# Local models (Ollama)
+ARENA_MODELS="gemma4:e4b,qwen3:4b" npm run arena
+
+# Any hosted model — one OpenRouter key covers most of the market
+ARENA_API=openai ARENA_BASE_URL=https://openrouter.ai/api/v1 \
+ARENA_API_KEY=sk-or-... ARENA_TIER=B-tier \
+ARENA_MODELS="deepseek/deepseek-v3.2,z-ai/glm-5.1,xiaomi/mimo-v2.5" \
+npm run arena
+
+# Direct providers work too (any /v1/chat/completions endpoint):
+#   DeepSeek:  ARENA_BASE_URL=https://api.deepseek.com/v1
+#   vLLM/LM Studio: point ARENA_BASE_URL at your server
+```
+
+結果は呼び出しをまたいで **マージ** されます（1 モデルずつ実行しても構いません）
+`arena-results/` へ: JSON、シナリオごとの完全なトランスクリプト、共有できる
+`arena-report.md`。リーダーボード画像の生成:
+
+```bash
+node scripts/arena-graphic.mjs    # light + dark SVGs from your own results
+```
+
+便利なつまみ: `ARENA_TIER` は実行のモデルにラベルを付けます（SoTA / B-tier / local）。
+`ARENA_OUT` は出力先を変えます。`ARENA_MAX_ROUNDS` と
+`ARENA_SCENARIO_TIMEOUT_MS` は暴走モデルを抑えます。
+`COMFYUI_DEFAULT_CHECKPOINT` はレンダーのチェックポイントを固定します（チェックポイント
+フォルダーの先頭が txt2img 以外のモデルならこれを）。
+
+**要件**: 動いている ComfyUI と txt2img チェックポイント（SD 1.5 で十分 — シナリオは品質ではなく
+内容で検証されます）、一度の `npm run build`、および Ollama または API キー。
+
+## 毎回の実行が記録するもの
+
+スコア以外に、各リーダーボード項目は結果を使える軸を持ちます（#792）:
+
+- **量子化とパラメータサイズ**（Ollama `/api/show`）と **常駐 VRAM**（`/api/ps`、モデルがまだ
+  載っている間にサンプリング）— なので「8 GB カードで実際に何が動き、q4 で足りるか？」が
+  表から答えられます。同じモデルを q4 / q8 / fp16 ではしごに通すと、スコアが落ちる場所が
+  見えます。プローブが答えられないときはこれらの欄は空です（ホスト型エンドポイントに同等のものは
+  ありません）— 推測しません。
+- **comfyui-mcp のバージョン**。読めればすべての項目に押されます（自分のパッケージバージョンを
+  読めない実行は *未バージョン* として記録され、スタンプ以前の実行と同じです）。絶対スコアは
+  ツール面が変わると動くので、レポートはバージョンが混ざった（または未バージョンの実行が混ざった）
+  リーダーボードを **直接比較できない** と旗を立てます。
+- **失敗時にモデルが手を伸ばしたすべてのツール**、成功したものだけではありません。2 つ以上の
+  モデルが同じ間違ったツールを選んで同じシナリオに失敗し（かつ合格した実行がそのツールを使って
+  いない）とき、レポートは **疑わしいシナリオ** と旗を立てます — フィールド全体の誤選択は
+  ツールの *説明* の疑いであり、能力の隙間ではありません（前例: #557/#654。間違っていたのは
+  モデルではなくこちらの文言でした）。そのシナリオのスコアを信じる前に説明を確認してください。
+
+## 現在のリーダーボード
+
+<img className="block dark:hidden" src="/images/arena-leaderboard-light.svg" alt="ComfyUI LLM Arena リーダーボード" />
+<img className="hidden dark:block" src="/images/arena-leaderboard-dark.svg" alt="ComfyUI LLM Arena リーダーボード" />
+
+14 モデル、上位クラスタは 3 回中ベスト。見出しの知見:
+
+- **gemini-3.1-pro-preview だけが毎回完璧**（20-20-20）。
+- claude-opus-4.8 と gpt-5.5 はどちらも 20 に届きますが、他の実行では 1 点落としました。
+- **B-tier はフロンティアから 1 点差** — GLM-5.1（19-19-19、フィールドでいちばん安定）、
+  Kimi-k2.5 と MiMo-v2.5 が 19 — フロンティア価格のごく一部です。
+- 小さなローカルモデルは Basics と Gauntlet の一部はクリアしますが、Crucible のグラフ構成で
+  止まります。llama3.1:8b はツール形式をまったく保てません。
+
+カバーしていないモデルのコミュニティ実行が欲しいです — `arena-report.md`（と画像）を
+[GitHub discussion](https://github.com/artokun/comfyui-mcp/discussions) または Issue に投稿し、
+比較できるよう GPU + モデルタグを添えてください。
+
+## パネルのスモークテスト
+
+アリーナのスコアはヘッドレスのツール操作を証明します。`npm run smoke:panel` は同じモデルが
+**ライブのサイドバーパネル**（ストリーミング、ターンゲート、ブリッジ上の 6 ツールルーター）を
+生き延びることを証明します。モデルごとに隔離されたオーケストレーターを独自ポートで起動し、
+本物のターンを 1 回駆動します:
+
+```bash
+SMOKE_MODELS="gemma4:e4b,xiaomi/mimo-v2.5" npm run smoke:panel
+```

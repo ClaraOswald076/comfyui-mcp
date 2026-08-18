@@ -1,0 +1,87 @@
+---
+title: "동작 원리"
+description: "도구 뒤의 모델 — 트랜스포트, ComfyUI-Manager API, 그리고 로컬/원격/클라우드 모드."
+icon: "diagram-project"
+---
+
+## 머릿속 모델
+
+ComfyUI MCP는 **실행 중인 ComfyUI 인스턴스** 위의 얇고 잘 기술된 계층입니다. 대부분의 도구는
+그 인스턴스의 HTTP/WebSocket API로 대화하므로, ComfyUI가 로컬이든, 원격
+(`--comfyui-url`)이든, [Comfy Cloud](https://cloud.comfy.org) (`COMFYUI_API_KEY`)든
+똑같이 동작합니다.
+
+<Steps>
+  <Step title="생성과 워크플로우 → ComfyUI HTTP API">
+    `generate_image`, `enqueue_workflow`, 대기열/히스토리/시스템 통계, 그리고 워크플로우
+    작성 도구는 ComfyUI의 `/prompt`, `/queue`, `/history`, `/object_info` 등을 호출합니다.
+    대기열 추가는 fire-and-forget입니다: `prompt_id`를 즉시 받고 결과는
+    완료 알림으로 도착합니다. 클라우드 모드에서는 대체 `cloud-client`가 같은
+    작업을 `X-API-Key`로 `cloud.comfy.org`에 보냅니다.
+  </Step>
+  <Step title="커스텀 노드와 모델 → ComfyUI-Manager (HTTP), 서브프로세스 폴백">
+    노드 설치/업데이트/스냅샷/바이섹트와 워크플로우 의존성 설치는
+    [ComfyUI-Manager](https://github.com/Comfy-Org/ComfyUI-Manager) HTTP API를 우선 사용하고
+    (원격 인스턴스에서도 동작하도록), API가 할 수 없는 일은 로컬 설치에 대해
+    `cm-cli` / `git` / `pip`/`uv`로 폴백합니다.
+  </Step>
+  <Step title="설치와 파일시스템 작업 → 로컬 전용">
+    ComfyUI 설치, 코어 업데이트, 모델 파일 삭제, 서버 로그 읽기, 출력
+    디렉터리 나열은 로컬 파일시스템에서 동작합니다. 알려진
+    `COMFYUI_PATH`가 필요하며 원격 또는 클라우드 모드에서는 명확한 오류를 반환합니다.
+  </Step>
+  <Step title="WebSocket → 로컬 + 원격, 클라우드는 아님">
+    작업 완료 알림은 가능한 경우 ComfyUI의 WebSocket에 붙습니다. Comfy Cloud에는
+    WebSocket이 없습니다 — 작업 감시자가 기존 HTTP 폴링 경로로 넘어갑니다.
+  </Step>
+</Steps>
+
+<Note>
+  경험 법칙: 연결된 서버를 **읽거나 실행**하는 것은 어떤 모드에서든 동작하고,
+  **소프트웨어를 설치하거나 디스크의 파일을 건드리는** 것은 로컬 설치가 필요합니다.
+  전체 기능 대응표는 [설정 → 배포 모드](/docs/ko/configuration#배포-모드)에 있습니다.
+</Note>
+
+## 자가 치유: 대기열/렌더 워치독
+
+정체된 고해상도 샘플러 단계가 에이전트로 하여금, 보지도 죽이지도 못하는
+좀비 렌더 뒤에 작업을 쌓게 만들곤 했습니다. 세 가지 최선을 다하는 가드가
+그 틈을 막아, 에이전트가 멈춘 렌더 뒤에 무작정 다시 대기열에 넣지 않게 합니다:
+
+- **배압** — `panel_run`은 렌더가 이미 실행 중이면 결과에 QUEUE WARNING을
+  붙여, 에이전트가 그 뒤에 쌓지 않게 합니다.
+- **정체 감지** — ComfyUI로의 수동 WebSocket이 실행 중인 프롬프트 / 노드 /
+  진행률을 추적합니다. 임계값
+  ([`COMFYUI_MCP_STALL_S`](/docs/ko/configuration#패널-오케스트레이터와-브리지), 기본값 180초)
+  을 넘겨 더 이상 나아가지 않는 단계는 에이전트의 다음 턴 앞에 한 줄
+  STALL/BACKLOG 노트를 붙입니다.
+- **단계적 취소** — `queue` (action:"cancel")는 중단하고, 작업이 실제로
+  멈췄는지 **확인**한 뒤
+  ([`COMFYUI_MCP_INTERRUPT_S`](/docs/ko/configuration#작업-감시) 이내, 기본값 30초)
+  `/free`로 격상하고 그래도 죽지 않으면 렌더를 WEDGED로 보고합니다
+  (`restart_comfyui` 제안). `clear_pending`은 같은 호출에서 대기 중인 작업을 모두 버립니다.
+
+모두 페일세이프입니다: 워치독 WebSocket이 열리지 않으면 아무것도 바뀌지 않습니다. 에이전트는
+또한 `get_image (action:"analyze_color")`로 비전 왕복 없이 이미지의 색을 추론할 수 있습니다
+(주 팔레트, 평균 + 휘도 통계, 대비 검사).
+
+## 도구 카테고리
+
+<CardGroup cols={2}>
+  <Card title="이미지 생성" icon="image" href="/docs/tools/image-generation" />
+  <Card title="워크플로우 실행" icon="play" href="/docs/tools/workflow-execution" />
+  <Card title="워크플로우 작성" icon="pen-ruler" href="/docs/tools/workflow-authoring" />
+  <Card title="워크플로우 라이브러리" icon="folder-open" href="/docs/tools/workflow-library" />
+  <Card title="에셋과 이미지" icon="images" href="/docs/tools/assets-images" />
+  <Card title="모델" icon="box" href="/docs/tools/models" />
+  <Card title="커스텀 노드" icon="puzzle" href="/docs/tools/custom-nodes" />
+  <Card title="API 노드" icon="cloud" href="/docs/tools/api-nodes" />
+  <Card title="설치와 환경" icon="wrench" href="/docs/tools/install-environment" />
+  <Card title="프로세스 제어" icon="power" href="/docs/tools/process-control" />
+  <Card title="기본값, 통계, 스킬" icon="sliders" href="/docs/tools/defaults-stats-skills" />
+</CardGroup>
+
+<Info>
+  도구 레퍼런스는 실시간 MCP 도구 스키마에서 생성되므로 (`npm run docs:gen`)
+  코드와 어긋나지 않습니다.
+</Info>

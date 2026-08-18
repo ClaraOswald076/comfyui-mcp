@@ -1,0 +1,120 @@
+---
+title: "LLM 아레나"
+description: "실제 ComfyUI 작업으로 어떤 에이전트 LLM이든 벤치마크하세요 — 로컬(Ollama), 호스팅(OpenRouter/DeepSeek/GLM/MiMo), 또는 프런티어. 모든 점수는 모델의 주장이 아니라 ComfyUI 서버에 대해 검증됩니다. 명령 하나, 공유할 수 있는 리포트."
+icon: "trophy"
+---
+
+**ComfyUI LLM 아레나**는 한 질문에 정직하게 답합니다: *이 모델이
+정말로 ComfyUI를 구동할 수 있는가?* "자신 있어 보이는가"가 아닙니다 — 모든
+시나리오의 결과는 **ComfyUI 서버 자체에 대해 검증**됩니다 (작업 히스토리,
+실행된 그래프 매개변수, 실제 출력 파일과 픽셀 크기). 패널과 MCP 클라이언트가
+쓰는 것과 같은 [컴팩트 도구 라우터](/docs/ko/local-llms) 위에서 실행되므로,
+아레나 점수는 실제 에이전트 행동을 예측합니다.
+
+```bash
+npm run arena          # scores the default local field via Ollama
+```
+
+## 과제 사다리
+
+시나리오 열 개, 난이도 밴드 세 개, PASS = 2 (완료 & 서버 검증),
+PARTIAL = 1 (맞는 도구 계열, 불완전한 결과), FAIL = 0 — 최대 **20**:
+
+| 밴드 | 시나리오 | 증명하는 것 |
+| --- | --- | --- |
+| Basics | `health` · `models` · `registry` · `queue` | 도구 발견 + 단일 호출 작업 |
+| Gauntlet | `generate` (비동기 렌더 + 폴링) · `precision` (정확한 steps/size가 실행된 그래프에 착지) · `breakfix` (의도적 실패 → 진단 → 복구) · `provenance` (에셋 레지스트리를 찾아 generate_image (action:"regenerate")로 오버라이드하여 다시 렌더) | 멀티홉 체인, 매개변수 충실도, 오류 복구 |
+| Crucible | `multiout` (512px + 1024px 출력을 저장하는 그래프 하나 — PNG 헤더를 읽어 검증) · `pipeline` (`upload_image (action:"stage")`로 이어진 2단계 img2img) | 날것의 그래프 구성 — 템플릿이 이것들을 커버하지 않음 |
+
+동점은 **넛지 → 도구 라운드 → 벽시계 시간**으로 가릅니다. 그래서 한 번에
+맞춘 모델이 같은 점수까지 허우적댄 모델보다 위에 옵니다.
+
+## 직접 모델을 가져오기
+
+아레나는 두 방언을 말합니다 — 로컬 Ollama와 OpenAI 호환이면 무엇이든:
+
+```bash
+# Local models (Ollama)
+ARENA_MODELS="gemma4:e4b,qwen3:4b" npm run arena
+
+# Any hosted model — one OpenRouter key covers most of the market
+ARENA_API=openai ARENA_BASE_URL=https://openrouter.ai/api/v1 \
+ARENA_API_KEY=sk-or-... ARENA_TIER=B-tier \
+ARENA_MODELS="deepseek/deepseek-v3.2,z-ai/glm-5.1,xiaomi/mimo-v2.5" \
+npm run arena
+
+# Direct providers work too (any /v1/chat/completions endpoint):
+#   DeepSeek:  ARENA_BASE_URL=https://api.deepseek.com/v1
+#   vLLM/LM Studio: point ARENA_BASE_URL at your server
+```
+
+결과는 호출 **사이에 병합**됩니다 (원하면 한 번에 모델 하나) `arena-results/`로:
+JSON, 시나리오별 전체 트랜스크립트, 공유할 수 있는
+`arena-report.md`. 리더보드 그래픽은 다음으로 생성하세요:
+
+```bash
+node scripts/arena-graphic.mjs    # light + dark SVGs from your own results
+```
+
+유용한 손잡이: `ARENA_TIER`는 실행의 모델에 라벨을 붙입니다 (SoTA / B-tier / local).
+`ARENA_OUT`은 출력을 돌립니다. `ARENA_MAX_ROUNDS`와
+`ARENA_SCENARIO_TIMEOUT_MS`는 폭주 모델을 묶습니다.
+`COMFYUI_DEFAULT_CHECKPOINT`는 렌더 체크포인트를 고정합니다 (체크포인트
+폴더가 txt2img가 아닌 모델로 시작하면 이렇게 하세요).
+
+**요구 사항**: txt2img 체크포인트가 있는 실행 중인 ComfyUI (SD 1.5면
+충분합니다 — 시나리오는 품질이 아니라 내용으로 검증됩니다), 한 번의
+`npm run build`, 그리고 Ollama 또는 API 키.
+
+## 매번 기록되는 것
+
+점수 너머로, 각 리더보드 항목은 결과를 쓸모 있게 만드는 축을 실습니다 (#792):
+
+- **양자화와 파라미터 크기** (Ollama `/api/show`)와 **상주
+  VRAM** (`/api/ps`, 모델이 아직 로드된 동안 샘플) — 그래서 "내
+  8 GB 카드가 실제로 뭘 돌릴 수 있고, q4면 충분한가?"를 표에서 답할 수
+  있습니다. 같은 모델을 q4 / q8 / fp16으로 사다리를 돌리면
+  점수가 어디서 실제로 떨어지는지 보입니다. 프로브가 답할 수 없으면 이 필드는
+  비어 있습니다 (호스팅 엔드포인트에는 동등한 것이 없음) — 추측하지 않습니다.
+- **comfyui-mcp 버전**, 읽을 수 있었던 모든 항목에 찍힙니다
+  (자체 패키지 버전을 읽지 못한 실행은 *버전 없음*으로 기록되며,
+  스탬프 이전 실행과 같습니다). 도구 표면이 바뀌면 절대 점수가
+  움직이므로, 리포트는 버전을 섞은(또는 버전 없는 실행을 섞은)
+  리더보드를 **직접 비교할 수 없음**으로 표시합니다.
+- **실패한 실행에서 모델이 손을 뻗은 모든 도구**, 성공한 것만 아니라.
+  2개 이상의 모델이 같은 잘못된 도구를 고른 뒤 같은 시나리오에서 실패하고
+  (그리고 통과한 실행이 그것을 쓰지 않았다면), 리포트는 **의심스러운
+  시나리오**로 표시합니다 — 필드 전체의 잘못된 선택은 능력 공백이 아니라
+  도구 *설명* 용의자입니다 (선례: #557/#654, 모델이 아니라 우리 문구가
+  틀렸던 경우). 그 시나리오의 점수를 믿기 전에 설명을 확인하세요.
+
+## 현재 리더보드
+
+<img className="block dark:hidden" src="/images/arena-leaderboard-light.svg" alt="ComfyUI LLM 아레나 리더보드" />
+<img className="hidden dark:block" src="/images/arena-leaderboard-dark.svg" alt="ComfyUI LLM 아레나 리더보드" />
+
+모델 14개, 상위 클러스터는 best-of-3. 헤드라인 발견:
+
+- **gemini-3.1-pro-preview는 매번 완벽한 유일한 모델입니다** (20-20-20).
+- claude-opus-4.8과 gpt-5.5는 둘 다 20에 닿지만 다른 실행에서 한 점을 떨어뜨렸습니다.
+- **B-tier는 프런티어보다 한 점 뒤입니다** — GLM-5.1 (19-19-19, 필드에서 가장 안정적인
+  모델), Kimi-k2.5와 MiMo-v2.5가 19 — 프런티어 가격의 작은 분수로.
+- 작은 로컬 모델은 기초와 가틀릿의 일부를 넘지만
+  도가니의 그래프 구성에서 멈춥니다. llama3.1:8b는 도구 형식을
+  전혀 붙잡지 못합니다.
+
+아직 다루지 않은 모델의 커뮤니티 실행을 환영합니다 —
+`arena-report.md`(와 그래픽)를
+[GitHub 토론](https://github.com/artokun/comfyui-mcp/discussions)이나
+이슈에 올려 주세요. GPU + 모델 태그를 함께 주시면 결과를 비교할 수 있습니다.
+
+## 패널 스모크 테스트
+
+아레나 점수는 헤드리스 도구 구동을 증명합니다. `npm run smoke:panel`은 같은
+모델이 **라이브 사이드바 패널**을 견디는지 증명합니다 (스트리밍, 턴 게이팅,
+브리지 위의 6도구 라우터). 모델마다 자체 포트에서 격리된 오케스트레이터를
+띄우고 실제 턴 하나를 구동합니다:
+
+```bash
+SMOKE_MODELS="gemma4:e4b,xiaomi/mimo-v2.5" npm run smoke:panel
+```

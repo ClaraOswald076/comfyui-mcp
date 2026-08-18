@@ -1,0 +1,117 @@
+---
+title: "Claude Code プラグイン"
+description: "comfyui-mcp は完全な Claude Code プラグインです: 39 の AI スキル、11 のスラッシュコマンド、4 つの自律エージェント、37 の MCP ツールの上に 3 つのフック — リリースごとに増える ComfyUI の専門知識です。"
+icon: "puzzle-piece"
+---
+
+`comfyui-mcp` は単なる MCP サーバーではありません — 完全な **Claude Code
+プラグイン** として出荷されます。プラグインをインストールすると、Claude に ComfyUI の
+モデル固有の専門知識が渡り、試行錯誤なしに正しいサンプラー、CFG、解像度、モデルファイルを
+選べるようになります。
+
+```bash
+# In Claude Code
+/plugin marketplace add artokun/comfyui-mcp
+/plugin install comfy
+```
+
+## 39 の AI スキル — 増え続けています
+
+スキルは、Claude が必要に応じて読み込むキュレーション済みの知識ドキュメントです。各モデル
+ファミリーには生成パラメータ、ノードグラフ、キュレーション済みのモデルダウンロード URL、
+失敗モードの案内があります:
+
+| スキル | Claude が学ぶこと |
+|---|---|
+| `flux-txt2img` | Flux.1 Dev/Schnell + Flux 2 Klein — BF16 と FP8 の落とし穴、dual-CLIP の配線、VAE の選択 |
+| `wan-t2v-video` / `wan-flf-video` | WAN 2.x のテキストから動画、および最初と最後のフレームのワークフロー |
+| `wan-scail-replacement` | SCAIL-2 の動画内キャラクター置換 — 参照フレーミング→スケールの規則、調整と合成の落とし穴 |
+| `ltxv2-video` | LTX-2.3（および LTX-2 19B）— GGUF UNet、蒸留モデル、カメラ制御 LoRA、2 段階アップスケール、kornia 修正 |
+| `qwen-txt2img` / `qwen-image-edit` | Qwen-Image の生成と指示ベースの編集 |
+| `z-image-txt2img` | Z-Image Turbo のワークフロー |
+| `ideogram-ultra` | Ideogram 4 — オープンウェイトのテキストから画像、エリアプロンプト、ロゴ / ポスター / 読める文字 |
+| `ernie-image` | ERNIE-Image — 速いテキストから画像、正確な多言語テキスト描画、VRAM 8 GB 未満で動作 |
+| `anima-base` | ANIMA 1.0 — 約 2B のアニメ / イラストモデル、Danbooru タグ + 自然言語、アニメのインペイント、VRAM 6 GB 未満 |
+| `anima-lora-trainer` | カスタムのアニメ LoRA を学習 — kohya `sd-scripts` の Gradio トレーナー、VRAM 6 GB 未満 |
+| `ai-toolkit-trainer` | カスタムの WAN 2.2 + Z-Image LoRA を学習（人物 / スタイル / 動き）— ostris AI-Toolkit、ローカルまたは RunPod |
+| `installer-packs` | ワンコマンドのインストーラーパックの使用・作成・派生 — 新しいパックの上流への貢献をユーザーに促す |
+| `panel-node-pack-sync` | 更新後にサイドバーパネルのノードパックをオーケストレーターと揃える — バージョン不一致の検出、上書きではなく警告されるバージョンピン、ディスクから結果を再読み込みする同期 |
+| `model-compatibility` | どの VAE/CLIP/テキストエンコーダーがどのアーキテクチャと組むか — 壊れたワークフローの最大の原因 |
+| `model-registry` | スキルが参照するすべてのモデルのキュレーション済みダウンロード URL + 配置先ディレクトリ — リリースごとに増える |
+| `civitai` | 組み込みの `download_model` `action:"search_civitai"` によるネイティブの Civitai 発見 → ローカルダウンロード / 配線 / 生成ループ（キー不要、追加サーバー不要）。公式の [Civitai MCP](https://mcp.civitai.com/mcp) は任意のコミュニティ面のアドオンで、同梱しません |
+| `comfyui-core` | キュー、履歴、API の意味論 |
+| `comfyui-node-registry` | カスタムノードパックの作成と Comfy Registry への公開 |
+| `comfyui-frontend-extensions` | v1/v2 フロントエンド拡張の作成（サイドバータブ、ウィジェット） |
+| `rgthree` | rgthree-comfy の設定 — Fast Groups Bypasser/Muter のグループトグル（`/object_info` にないフロントエンド専用ノード、ウィジェットではなくノード PROPERTIES で設定）、Power Lora Loader の積み重ね、Context バス |
+| `director` | 動画パイプライン向けのマルチショット演出 |
+| `prompt-engineering` | アーキテクチャ固有のプロンプト（自然言語 vs タグ） |
+| `troubleshooting` | OOM、欠落ノード、バージョンずれ — 診断ツリー |
+| `comfyui-launch-flags` | VRAM/attention/cache/perf の起動フラグ行列 — `--reserve-vram`、`--novram`+`--cache-none`、`--use-sage-attention` vs `--use-pytorch-cross-attention`（Z-Image）、加えて Blackwell/RTX 5000 のアクセラレーションスタックのメモ |
+
+新しいスキルはリリースごとに追加されます — 組み込みの `list_packs` ツール
+（`action: "generate_skill"`）で人気のレジストリパックから生成し、その後人間がキュレーション
+します。
+
+**何も配線する前に知識を試せます** — どのスキルもプレーンな markdown ファイルで、単体でも
+役立ちます。いちばん広く使えるのは
+[`prompt-engineering`](https://github.com/artokun/comfyui-mcp/blob/main/plugin/skills/prompt-engineering/SKILL.md)
+です — CLIP の 77 トークン制限と `BREAK` チャンク、重み構文、アーキテクチャごとの戦略
+（なぜ Flux は自然言語でネガティブプロンプトなしを欲し、SD1.5 はタグを欲するか）。
+ブラウザーで読むか、任意のエージェントのコンテキストにシステムプロンプトとして貼り付けて
+ください — ComfyUI も MCP もインストールも不要です。完全なプラグインを接続すると、
+エージェントは同じファイルを自動で読み込みます（`list_packs` の `action: "skill_read"`）。
+
+### Civitai 検索 — 組み込み
+
+`download_model` `action:"search_civitai"` は Civitai をネイティブに検索します（公開 REST API、
+キー不要、追加サーバー不要）: キーワード + `types` + `base_models` フィルタ（「**Flux** の
+LoRA」）、既定は SFW のみ、各ヒットは `action:"download_civitai"` が直接受け取る
+`model_version_id` と、プロンプト用のモデルの **トリガーワード** を返します。ファーストクラスの
+ツールなので **すべてのバックエンド** で動き、コンパクトルーター背後の小さなローカルモデルも
+含まれます。`civitai` スキルが発見 → ダウンロード → 生成の受け渡し全体を教えます。
+
+**任意の API キー。** 検索にキーは不要です。`CIVITAI_API_TOKEN` で制限付き / 早期アクセスの
+ダウンロードと制限付き検索結果が解禁されます — 1 つの変数が検索とダウンロードの両方を動かします。
+
+**任意: 公式の Civitai MCP。** 検索→インストールを超えたコミュニティ面（作例画像とその生成
+パラメータの閲覧、投稿、コレクション）には、Civitai の
+[公式リモートサーバー](https://mcp.civitai.com/mcp) を組み合わせてください —
+もう自動同梱はしません。一度追加します:
+
+```bash
+claude mcp add --transport http civitai https://mcp.civitai.com/mcp \
+  --header "Authorization: Bearer YOUR_CIVITAI_API_KEY"
+```
+
+## 11 のスラッシュコマンド
+
+`/comfy:gen`（プロンプトから生成）、`/comfy:debug`（失敗したワークフローの診断）、
+`/comfy:install`（ノードパックのインストール）、`/comfy:viz`（ワークフロー → Mermaid）、
+`/comfy:batch`、`/comfy:compare`、`/comfy:convert`、`/comfy:gallery`、
+`/comfy:recipe`、`/comfy:director`、`/comfy:node-skill`。
+
+## 4 つの自律エージェント
+
+- **comfy-explorer** — ノードパックのソースを深く読み、文書化する
+- **comfy-researcher** — 問題文 → 順位付きのパック推奨
+- **comfy-debugger** — 履歴 + ログから失敗したワークフローの根本原因を探す
+- **comfy-optimizer** — 指定 GPU 向けの VRAM と速度の調整
+
+## サイドバーパネル — API キー不要
+
+<Note>
+  サイドバーパネルは独自のパックとして出荷され、**Comfy Registry と ComfyUI-Manager に
+  `comfyui-agent-panel` として掲載** されています — そこで検索し、Nightly ではなく
+  **Latest** を選んでください。完全なガイド: [サイドバーパネル](/docs/ja/panel)。
+</Note>
+
+[comfyui-mcp-panel](https://github.com/artokun/comfyui-mcp-panel) サイドバーは、あなたの
+**Claude サブスクリプション** 上で自律エージェントを動かします（トークン単位の API 課金なし）。
+パックをインストールし、エージェントタブを開き、**接続** をクリックします — 必要に応じて
+[パネルオーケストレーター](/docs/ja/configuration) を起動します。画像、ワークフロー、変更を
+頼めば、あなたの ComfyUI を相手に作業します。
+
+## フック
+
+3 つのフックが生成セッションを引き締めます: ワークフローをキューに入れる前の **VRAM 事前チェック**、
+**ジョブ完了通知**、破壊的な操作の前の **保存警告**。
