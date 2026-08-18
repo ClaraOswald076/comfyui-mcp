@@ -1,0 +1,87 @@
+---
+title: "しくみ"
+description: "ツールの背後にあるモデル — トランスポート、ComfyUI-Manager API、ローカル / リモート / クラウドの各モード。"
+icon: "diagram-project"
+---
+
+## 頭の中のモデル
+
+ComfyUI MCP は、**動いている ComfyUI インスタンス** の上に載った薄い、よく説明された層です。
+ほとんどのツールはそのインスタンスと HTTP/WebSocket API で話すので、ComfyUI がローカルでも、
+リモート（`--comfyui-url`）でも、[Comfy Cloud](https://cloud.comfy.org)（`COMFYUI_API_KEY`）
+でも同じように動きます。
+
+<Steps>
+  <Step title="生成とワークフロー → ComfyUI HTTP API">
+    `generate_image`、`enqueue_workflow`、キュー / 履歴 / システム統計、およびワークフロー
+    作成ツールは、ComfyUI の `/prompt`、`/queue`、`/history`、`/object_info` などを呼びます。
+    キュー投入は投げっぱなしです: すぐに `prompt_id` が返り、結果は完了通知で届きます。
+    クラウドモードでは、代替の `cloud-client` が同じ操作を `X-API-Key` 経由で
+    `cloud.comfy.org` に送ります。
+  </Step>
+  <Step title="カスタムノードとモデル → ComfyUI-Manager（HTTP）、サブプロセスのフォールバック付き">
+    ノードのインストール / 更新 / スナップショット / バイセクトとワークフロー依存のインストールは、
+    [ComfyUI-Manager](https://github.com/Comfy-Org/ComfyUI-Manager) の HTTP API を優先します
+    （リモートインスタンスでも動くように）、API では足りないところはローカルインストールに対する
+    `cm-cli` / `git` / `pip`/`uv` にフォールバックします。
+  </Step>
+  <Step title="インストールとファイルシステム操作 → ローカルのみ">
+    ComfyUI のインストール、コアの更新、モデルファイルの削除、サーバーログの読み取り、
+    出力ディレクトリの一覧はローカルのファイルシステムを操作します。既知の
+    `COMFYUI_PATH` が必要で、リモートまたはクラウドモードでは明確なエラーを返します。
+  </Step>
+  <Step title="WebSocket → ローカル + リモート、クラウドは不可">
+    ジョブ完了通知は、使えるところでは ComfyUI の WebSocket に接続します。Comfy Cloud には
+    WebSocket がありません — ジョブウォッチャーは既存の HTTP ポーリング経路に落ちます。
+  </Step>
+</Steps>
+
+<Note>
+  目安: 接続先サーバーを **読む、または動かす** ものはどのモードでも動きます。
+  **ソフトウェアをインストールする、またはディスク上のファイルに触れる** ものはローカル
+  インストールが必要です。機能対応表の全体は
+  [設定 → デプロイモード](/docs/ja/configuration#デプロイモード) にあります。
+</Note>
+
+## 自己修復: キュー / レンダーのウォッチドッグ
+
+固まった高解像度サンプラーのステップが、エージェントに見えないゾンビレンダーの後ろへジョブを
+積み上げさせていました。3 つの最善努力のガードがその隙間を閉じ、エージェントが固まったレンダーの
+後ろへ盲目的に再キューすることを止めます:
+
+- **バックプレッシャー** — すでにレンダーが走っているとき、`panel_run` は結果に QUEUE WARNING
+  を付け、エージェントがその後ろに積まないようにします。
+- **停滞検出** — ComfyUI への受動的な WebSocket が実行中のプロンプト / ノード / 進捗を追跡し、
+  しきい値を超えて進まなくなったステップ
+  （[`COMFYUI_MCP_STALL_S`](/docs/ja/configuration#パネルオーケストレーターとブリッジ)、既定 180 秒）
+  は、エージェントの次のターンの先頭に 1 行の STALL/BACKLOG メモを付けます。
+- **段階的なキャンセル** — `queue`（action:"cancel"）は割り込み、ジョブが本当に止まったかを
+  **検証** し
+  （[`COMFYUI_MCP_INTERRUPT_S`](/docs/ja/configuration#ジョブの監視) 以内、既定 30 秒）、
+  それでも死ななければ `/free` へエスカレートしてレンダーを WEDGED と報告します
+  （`restart_comfyui` を提案）。`clear_pending` は同じ呼び出しで保留中のジョブをすべて落とします。
+
+すべてフェイルセーフです: ウォッチドッグの WebSocket が開かなければ、何も変わりません。
+エージェントはビジョンの往復なしに、`get_image (action:"analyze_color")` で画像の色についても
+推論できます（支配的なパレット、平均 + 輝度統計、コントラストチェック）。
+
+## ツールのカテゴリ
+
+<CardGroup cols={2}>
+  <Card title="画像生成" icon="image" href="/docs/tools/image-generation" />
+  <Card title="ワークフローの実行" icon="play" href="/docs/tools/workflow-execution" />
+  <Card title="ワークフローの作成" icon="pen-ruler" href="/docs/tools/workflow-authoring" />
+  <Card title="ワークフローライブラリ" icon="folder-open" href="/docs/tools/workflow-library" />
+  <Card title="アセットと画像" icon="images" href="/docs/tools/assets-images" />
+  <Card title="モデル" icon="box" href="/docs/tools/models" />
+  <Card title="カスタムノード" icon="puzzle" href="/docs/tools/custom-nodes" />
+  <Card title="API ノード" icon="cloud" href="/docs/tools/api-nodes" />
+  <Card title="インストールと環境" icon="wrench" href="/docs/tools/install-environment" />
+  <Card title="プロセス制御" icon="power" href="/docs/tools/process-control" />
+  <Card title="既定値、統計、スキル" icon="sliders" href="/docs/tools/defaults-stats-skills" />
+</CardGroup>
+
+<Info>
+  ツールリファレンスはライブの MCP ツールスキーマから生成されます（`npm run docs:gen`）。
+  そのためコードからずれることはありません。
+</Info>

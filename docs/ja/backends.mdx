@@ -1,0 +1,256 @@
+---
+title: "バックエンド / プロバイダー"
+description: "パネルエージェントは任意の LLM で動きます: 自分のサブスクリプション / プラン上の Claude、ChatGPT、Gemini、Grok、Kimi、GLM、Ollama / LM Studio / llama.cpp 経由の無料ローカルモデル（アカウント不要）、または OpenAI 互換エンドポイント上の任意のホスト型モデル。プロバイダー中立の AgentBackend ポート、ピッカー、機能対応表のしくみ。"
+icon: "shuffle"
+---
+
+[サイドバーパネル](/docs/ja/panel) のエージェントは **プロバイダー非依存** です。
+**Claude**、**ChatGPT**、**Gemini**、または **Ollama（ローカル）** を選ぶと、対応する
+エージェントがバックグラウンドで動きます — サブスクリプションに API キーは不要、ローカル
+モデルにアカウントは不要です。Ollama バックエンドは **任意の OpenAI 互換エンドポイント**
+（OpenRouter、DeepSeek、GLM、MiMo、vLLM、LM Studio）も話すので、「自分のモデルを持ち込む」
+は自分の GPU 上の無料 4B からフロンティアまでをカバーします。すべてのプロバイダーが同じ
+ライブキャンバスツール、同じモデル知識、同じワンショットのワークフロー読み込み、同じコスト
+ガードレールを共有します。[LLM アリーナ](/docs/ja/arena) がどれでも実際の ComfyUI タスクで
+採点します。
+
+```
+panel (pick a provider) ⇄ loopback bridge ⇄ orchestrator (Claude · ChatGPT · Gemini · any LLM) ⇄ your graph
+```
+
+## ポートではなくプロバイダーを選ぶ
+
+パネルは **バックエンドピッカー** を出します — Claude / ChatGPT / Gemini /
+Antigravity / Grok / Kimi / GLM / Ollama / LM Studio / llama.cpp /
+OpenRouter / カスタムエンドポイント
+のチップ（Copilot のような実験的プロバイダーは実験的トグルの向こうに現れます）。1 つを
+クリックすると、1 つの共有オーケストレーター上でそのプロバイダーに接続します
+（1 つのブリッジポートがすべてのプロバイダーを受け持ち、各パネルタブはハンドシェイク時に
+自分のプロバイダーを選びます）。ブリッジ URL は、ユーザー管理のオーケストレーター向けに
+**詳細設定** の下にあります。
+
+プロバイダーを切り替えると **新しいチャットが始まります** — 会話はプロバイダーをまたいで
+共有されません — パネルはその旨のシステムメモを出します。コンポーザーのプレースホルダーは
+アクティブなバックエンドに従います（「Claude に聞く…」/「Ollama に聞く…」）。
+
+## サインイン（プロバイダーごとに一度 — または不要）
+
+- **Claude** — `claude`（または `claude setup-token`）— claude.ai OAuth（サブスクリプション）。
+- **ChatGPT（Codex）** — `codex login` — ChatGPT ログイン（サブスクリプション）。Codex
+  app-server 経由で動きます。
+- **ChatGPT（直接 OAuth）** — 一度でも `codex login` を実行していれば追加手順なし:
+  `chatgpt` バックエンドは `~/.codex/auth.json` を再利用し、ChatGPT に直接話します
+  （Codex プロセスなし）。ack が認証ファイル欠落と言ったら、`codex login` を一度実行して
+  ください。
+- **Gemini** — `gemini` — Google サインイン。個人向け無料 Google ログインは 2026-06-18 に
+  引退した点に注意: Gemini CLI バックエンドはいま `GEMINI_API_KEY` または企業 / Code Assist
+  アカウントが必要です。個人サブスクライバーは下の **Antigravity** を使ってください。
+- **Antigravity（Google サブスクリプション）** — [antigravity.google](https://antigravity.google)
+  から公式 Antigravity CLI をインストールし、`agy` を一度実行して Google サインインを完了
+  します（AI Pro/Ultra と無料ティア）。バックエンドはターンごとに `agy -p` を `--continue`
+  の会話継続で駆動し、`agy models` からライブのモデルカタログを読み、ComfyUI + パネルの
+  MCP ツールをマージ安全なワークスペース `.agents/mcp_config.json` 経由で配線します。
+  機能は設計上縮小されています（文書化された機械可読イベントストリームなし）: 最終回答テキストは
+  ストリームされますが、ツールごとの進捗も画像入力もありません。会話継続は `agy --continue`
+  （アカウントの最新会話）を使うので、Antigravity タブは一度に 1 つだけ動かしてください —
+  2 つ目のタブ、またはターミナルの対話型 `agy` セッションがスレッドを奪えます。
+  `COMFYUI_MCP_ANTIGRAVITY_MODEL` がモデルをピン留めし、
+  `COMFYUI_MCP_ANTIGRAVITY_PATH` が標準外のインストールを指します。
+- **Grok** — Grok CLI（xAI / Grok Build）をインストールし、サインインのため `grok` を一度
+  実行します。バックエンドは ACP モードで駆動します。Grok が準備できていないときは、パネル内
+  OAuth サインイン行も出します。
+- **Kimi（推奨）** — [Kimi Code CLI](https://moonshotai.github.io/kimi-code/) をインストールし、
+  `kimi login` を実行します（デバイスコードフロー）。バックエンドはそのログインを
+  `~/.kimi-code/credentials/kimi-code.json` から再利用します（レガシーの `~/.kimi` パスは
+  フォールバックとしてまだ読みます）。これは **Kimi Code サブスクリプション** を使い、Kimi を
+  動かす好ましい方法です — 下の従量課金 Moonshot キーより安く、上限も高いです。CI / CLI なし
+  の用途だけ `KIMI_API_KEY` を代わりに設定するか、既定以外の資格情報ディレクトリを指す
+  `KIMI_CODE_HOME`（古い名前を設定した人向けに `KIMI_SHARE_DIR` もまだ尊重されます）。
+  パネル内 OAuth サインインも出します。
+- **GLM** — `ZAI_API_KEY` を設定（Z.AI Coding Plan。`GLM_API_KEY` /
+  `ZHIPUAI_API_KEY` も受け付けます）。CLI なし。
+- **Kimi K3（Moonshot）** — Kimi Code サブスクリプションがないときの **従量課金の代替**
+  （あるなら上の **Kimi** 経路を優先）。[platform.kimi.ai](https://platform.kimi.ai/console/api-keys)
+  から `MOONSHOT_API_KEY` を設定。CLI なし。これは Moonshot **プラットフォーム** キー
+  （既定モデル `kimi-k3`、ベース `https://api.moonshot.ai/v1`）で、上の **Kimi** プロバイダー
+  （Kimi Code コーディングサブスクリプション）とは別です。モデルは
+  `COMFYUI_MCP_MOONSHOT_MODEL`、ベースは `COMFYUI_MCP_MOONSHOT_BASE_URL` で上書き。
+- **MiniMax** — [platform.minimax.io](https://platform.minimax.io/console/api-keys) から
+  `MINIMAX_API_KEY` を設定。CLI なし。既定モデルは `MiniMax-M3`、既定ベースはグローバル
+  エンドポイント `https://api.minimax.io/v1`（OpenAI 互換、素の Bearer 認証）。中国リージョン
+  では `COMFYUI_MCP_MINIMAX_BASE_URL=https://api.minimaxi.com/v1` を設定。モデルは
+  `COMFYUI_MCP_MINIMAX_MODEL` で上書き。
+- **Copilot（実験的）** — パネルの実験的プロバイダー行からサインイン。既定はオフ。先に設定で
+  実験的バックエンドを有効にしてください。
+- **Ollama（ローカル）** — サインイン不要。Ollama をインストールし、ツール呼び出し対応モデルを
+  取得（`ollama pull gemma4:e4b`）。**ホスト型** モデルにするなら
+  `COMFYUI_MCP_OLLAMA_API=openai`、`COMFYUI_MCP_OLLAMA_BASE_URL`（例:
+  `https://openrouter.ai/api/v1`）、および API キー
+  （`COMFYUI_MCP_OLLAMA_API_KEY` / `OPENROUTER_API_KEY`）を設定。
+- **カスタムエンドポイント** — サインインフローなし。任意の OpenAI 互換 `/v1`（vLLM、
+  DeepSeek、Together、Azure、リモート llama-server）を設定 → カスタムエンドポイントで指定。
+  サーバーがキーを必要とするならそこで追加（マスク入力、オーケストレーターが 0600 で保存）。
+  [ローカル LLM → カスタムエンドポイント](/docs/ja/local-llms#カスタムエンドポイント任意の-openai-互換サーバー)
+  を参照。
+
+### 接続時の準備状況とオンボーディング
+
+どのプロバイダーチップも、準備できていないときは正直に劣化します: 接続 ack が欠けている手順を
+正確に伝え（「ZAI_API_KEY を設定…」、「`codex login` を実行…」、「実験的な行からサインイン…」）、
+最初のメッセージで失敗する代わりに — あとから資格情報が現れたプロバイダーは、再起動なしで次の
+接続で準備完了に切り替わります。
+
+パネルは **接続** 時に各プロバイダーの準備状況を検出します — サブスクリプションプロバイダーは
+`PATH` 上の CLI + ディスク上のログイン、Ollama は存在するバイナリ（止まったデーモンは接続時に
+優雅に劣化）。どのプロバイダーが揃っているか当てる必要はありません:
+
+- **オンボーディングカード** は **どの** プロバイダーも準備できていないときだけ現れ、
+  プロバイダーごとの一度きりのセットアップ手順を出します（Ollama ではサインインではなく
+  インストール + モデル取得）。
+- 保存したプロバイダー選択が使えない場合、パネルは **準備できているプロバイダーへ自動で切り替え**
+  ます（保存した設定はセットアップが済むと復元されます）。
+- 準備できていないプロバイダーの行は、動いているエージェントへセットアッププロンプトを種まきする
+  **「セットアップ」** アクションになります。
+
+## 各プロバイダーの駆動方法
+
+オーケストレーターはプロバイダー中立の **`AgentBackend`** ポートに依存します
+（依存性注入）。各プロバイダーはアダプターです:
+
+| | Claude | ChatGPT（Codex） | Gemini | Ollama / 任意の LLM |
+|---|---|---|---|---|
+| ドライバー | Claude Agent SDK — 永続ストリーミングセッション | `codex app-server` JSON-RPC | `gemini --acp`（Agent Client Protocol） | 直接 HTTP — Ollama `/api/chat` または任意の OpenAI 互換 `/v1/chat/completions`。バックエンドがエージェントループ全体を所有 |
+| 認証 | claude.ai OAuth | ChatGPT ログイン | Google ログイン | なし（ローカル）/ Bearer キー（ホスト型） |
+| ライブキャンバスツール | プロセス内 SDK MCP サーバー | ループバック streamable-HTTP MCP | ループバック streamable-HTTP MCP | 同じループバック MCP 上の [6 ツールルーター](/docs/ja/local-llms) |
+| ヘッドレス `comfyui` MCP | プロセス内 | 設定宣言の stdio | 設定宣言の stdio | ルーター背後のコンパクトモード stdio サブプロセス |
+
+`panel_*` ツール定義は **1 つの共有リスト** にあり、すべての経路に登録されるので、
+ライブキャンバス面（`panel_clear` / `panel_restart_comfyui` の破壊的確認ゲートも含む）は
+プロバイダーをまたいで同一です。パリティは自動です — どの経路もツールを再実装しません。
+Ollama / 任意 LLM バックエンドは加えて、両方のツール面を 6 つのルーターツールの後ろに包み、
+小さなモデルがスキーマに溺れないようにします — [ローカル LLM とその他のエージェント](/docs/ja/local-llms)
+を参照。
+
+## 機能対応表
+
+バックエンドごとの機能記述子により、パネルはプロバイダーができない機能を **優雅に劣化**
+させます:
+
+| 機能 | Claude | ChatGPT（Codex） | Gemini | Ollama / 任意の LLM |
+|---|---|---|---|---|
+| 永続チャネル（時間をかけてターンをプッシュ） | ✅ | ✅（スレッド + `turn/start`） | ✅ | ✅（メモリ内履歴） |
+| ストリーミングデルタ | ✅ | ✅ | ✅ | ✅（NDJSON / SSE） |
+| ターン途中の割り込み | ✅ | ✅（`turn/interrupt`） | ✅（`session/cancel`） | ✅（リクエスト中止） |
+| 会話のロールバック（ターンでフォーク） | ✅ `forkSession` | ⚠️ ゲートオフ | ⚠️ ゲートオフ | ⚠️ ゲートオフ |
+| プロセス内 MCP ツール | ✅ | ❌ | ❌ | ❌（MCP クライアント上のルーター） |
+| モデル列挙 | ✅ | ✅（`config/read`） | 静的カタログ | ✅（`/api/tags` または `/models`） |
+| ビジョン（画像入力） | ✅ | ✅ | ✅ | ❌（モデル依存。いまはオフ） |
+| 音声入力 | ❌ | ❌ | ❌ | ✅ Ollama（確認済み）· ⚠️ その他（未検証） |
+| プロバイダーのスラッシュコマンド | ✅ | ❌ | ❌ | ❌ |
+
+### 音声入力 — どのバックエンドか、正直に
+
+エージェントはすべてのバックエンドで ComfyUI の音声ツールを操作できます。音声ファイルを
+**聞く** のはより狭く、上の表は意図的に保守的です。黙って落ちる添付は、拒否されるより悪いからです:
+
+- **Ollama（`ollama` バックエンド、ネイティブ `/api/chat`）— 対応、機能確認済み、端から端まで
+  検証済み。** 音声は `images[]` 配列に乗ります。これはハックではなく、Ollama 自身の音声キャリア
+  です。ローカル Ollama と `gemma4:e2b` に対してライブで確認し、本物の WAV を書き起こしました。
+  - **プロバイダーごとではなく、モデルごと。** 何かを送る前に、バックエンドは
+    `POST /api/show` に *この* モデルが `audio` 機能を報告するか聞きます。しなければ、添付は
+    名前で拒否され、報告された機能一覧が引用され、聞けるモデルが教えられます
+    （`ollama pull gemma4:e2b` / `gemma4:e4b` / `nemotron3:33b`）。`GET /api/tags` も
+    `capabilities` 配列を返しますが、**同じ答えではありません** — 同じモデルがそちらでは
+    音声なし、`/api/show` では音声ありと報告した — ので `/api/show` だけを参照します。
+  - 機能は音声を運ぶターンごとに再確認されます。Ollama タグは可変だからです: `ollama pull` が
+    同じ名前の下の重みを置き換えられ、キャッシュした判定が記述したモデルより長生きし得ます。
+- **LM Studio / llama.cpp / OpenRouter / GLM / Kimi / Moonshot / MiniMax /
+  Copilot / カスタム OpenAI 互換エンドポイント — 試行し、機能確認はしない。**
+  これらはすべて `/v1/chat/completions` を話し、聞く機能エンドポイントがないので、音声は
+  `input_audio` コンテンツパートとして送られ、そのターンで配送は **未確認** だと伝えられます:
+  *「モデルが実際に受け取ったかは確認できません — 返信がファイルの内容を反映していなければ、
+  聞いていません。」* 拒否すると、機能 API がないだけのすべてのエンドポイントから音声を奪います。
+  走れないガードは判定ではありません。`input_audio` の形自体は Ollama の OpenAI 互換
+  エンドポイントに対して検証済みです。任意の *特定の* サードパーティホストがそれを尊重するかは
+  こちらでは確認できず、主張しません。
+- **Claude、ChatGPT（Codex）、Codex CLI、Gemini、Grok、Antigravity、pi** — このビルドでは
+  音声入力なし。音声の添付はターンが組まれる前に拒否され、あなたとモデルの両方に、プロバイダー
+  を名指しして代わりに何が動くかを伝えます。
+
+  Gemini/Grok ではプロトコルの隙間ではなく意図的な省略です: ACP は `audio` ContentBlock を
+  *定義しています* が、エージェントが先に `audio` プロンプト機能を広告する必要があり、どちらの
+  CLI もそうしているところは観測されていません。一度も行使できない送信経路で、失敗モードが
+  ユーザーに届かなかったと告げられない添付であるのは、正直な拒否より悪い — なので出荷しません。
+
+**ブラインド** トグルは *ピクセル* についてです: 画像を隠し、音声は **隠しません**。
+
+ブラインドの強制はエージェントの **ネイティブツール** にも届き、comfyui MCP 面だけではありません:
+組み込みの Claude バックエンドは PreToolUse ゲート付きで動き、ブラインドがオンのとき自分の
+`Read`/`WebFetch` を画像コンテンツ（拡張子 *と* マジックバイトによるラスターファイル、PDF、
+ノートブック出力、ComfyUI `/view` URL）で拒否します — 呼び出しごとにライブで読むので、
+セッション途中のトグルが次のツール呼び出しに効きます。API / ローカルレーン（Ollama ファミリー、
+GLM、Kimi、カスタムエンドポイント）はこちらのツール面だけを運ぶので、MCP スクラブが完全に
+カバーします。**CLI レーン**（Codex、Gemini、Grok、Antigravity、pi、Copilot）は独自の
+エージェントバイナリを走らせ、組み込みファイルツールをフックできません — そこでブラインドを
+オンにすると、守れない保証をほのめかす代わりに、まさにそれを言う見える警告を出します。
+
+#### 音声ファイルがターンに乗る方法
+
+オーケストレーターは、パネルの `message` フレーム上の音声を 2 通りで受け付けます:
+
+```jsonc
+{ "type": "message", "text": "what key is this in?",
+  "audio":  [{ "filename": "song.mp3", "type": "input" }],   // preferred
+  "images": [{ "filename": "song.mp3", "type": "input" }] }  // also routed to audio
+```
+
+2 つ目の形があるのは、`images` しか知らないパネルビルドが、そうしないと音声ファイルを
+ビジョンのコンテンツパートに渡してしまうからです。音声拡張子を持つものは自動的に音声経路へ
+移されます — エンコードできない形式（`.wma`、`.mid`、`.aiff`）も含み、画像エラーではなく
+「次のいずれかに変換して…」が得られます。
+
+同じファイルを **両方** の配列に送る（上の例のように）のは安全です: 参照はファイル名 +
+サブフォルダー + タイプで識別されるので、一度だけ配送され、ターンあたり 2 添付の上限にも
+一度だけ数えられます。2 つ目のファイルと誤認されて収まらないとして拒否されることはありません。
+
+<Note>
+音声ファイルを選ぶ **コンポーザー操作** はパネル（`comfyui-mcp-panel`）にあり、別リポジトリ
+です — その部分はこのリリースにはありません。着地するまで、上のワイヤ契約がクライアントの
+送るもので、経路はオーケストレーター側から端から端まで行使されています。
+</Note>
+
+端から端まで検証されているのは上のネイティブ Ollama 経路だけであり、「このモデルは聞ける」が
+仮定ではなく確立されている唯一のものです。OpenAI 互換経路は正直な試行と正直な但し書きです。
+この節のそれ以外は機能ではなく拒否を記述しています。
+
+**会話のロールバック**（チャットを過去のターンへフォークすること）は Claude 専用です。
+**コード / グラフ** のロールバック（`/revert`、Esc 2 回、ターンごとのスナップショット）は
+すべてのバックエンドで動きます。オーケストレーターの中にあり、プロバイダーの中ではないからです。
+
+## 切り替え時の推論の強さ
+
+強さ / モデルピッカーは **プロバイダーごと** です。選んだ強さは、対象バックエンドの最も近い
+有効レベルへ写像することでプロバイダー切り替えを生き延びます（パネルとオーケストレーターの
+バックエンドは同じ写像をします）:
+
+- **Claude:** `low` · `medium` · `high` · `xhigh` · `max`
+- **ChatGPT（Codex）:** `none` · `minimal` · `low` · `medium` · `high` · `xhigh` · `max` · `ultra`
+  （GPT-5.6 クラスモデルでの `max` / `ultra`）
+- **Gemini / Ollama:** ユーザー向けの強さ尺度なし — セレクターは隠れます。
+
+## 知識とコストのパリティ
+
+ネイティブスキルを読み込めるのは Claude だけなので、同梱の専門知識はどのバックエンドでも呼べる
+1 つの MCP ツールとして公開されます — `list_packs`。そのアクションはスキル（`skill_list`、
+`skill_read`）、インストーラーパック（`list`、`read_workflow`）、サーバーのテンプレート
+（`list_templates`）をカバーし、ローカル GPU vs 有料 API のガードレール
+（`action: "check_runtime"`）とワンショットの `panel_load_workflow` もです。
+[スキル・パック・ランタイムコスト](/docs/tools/skills-knowledge) を参照。
+
+## 関連情報
+
+- [サイドバーパネル](/docs/ja/panel) — パネル UX の全体
+- [ローカル LLM とその他のエージェント](/docs/ja/local-llms) — 6 ツールルーター、モデル要件、Hermes/OpenClaw/Copilot のセットアップ
+- [LLM アリーナ](/docs/ja/arena) — 実際の ComfyUI タスクで自分のモデルを採点する
+- [スキル・パック・ランタイムコスト](/docs/tools/skills-knowledge) — パリティ + コストのツール
+- 設計ドキュメント: [`design/agent-backend-injection.md`](https://github.com/artokun/comfyui-mcp/blob/main/design/agent-backend-injection.md)

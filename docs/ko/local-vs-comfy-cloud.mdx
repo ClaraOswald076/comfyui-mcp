@@ -1,0 +1,131 @@
+---
+title: "로컬 vs. Comfy Cloud 에이전트"
+description: "Comfy-Org의 In-App Agent와 Comfy Cloud MCP는 Comfy Cloud에서 실행됩니다. comfyui-mcp는 사용자의 ComfyUI 설치에서, 어떤 LLM으로든 실행됩니다 — 기존 구독의 Claude나 ChatGPT, 또는 계정도 네트워크도 없는 Ollama의 무료 로컬 모델. 어느 것을 언제 쓸지, Comfy Cloud가 더 나은 답을 주는 경우를 포함해 정직하게 비교합니다."
+icon: "scale-balanced"
+---
+
+Comfy-Org의 공식 에이전트 툴링과 이 프로젝트 사이에서 고르고 있다면,
+짧은 답은 **서로 다른 문제를 푼다**는 것입니다 — 그리고 꽤 많은
+사람에게는 공식 옵션이 맞는 선택입니다. 이 페이지는 둘을 정직하게
+펼쳐 한 번 고르고 넘어갈 수 있게 합니다.
+
+<Note>
+Comfy-Org는 빠르게 출시하며, 아래 상태는 **2026년 7월** 기준입니다. 어느
+것도 확정으로 다루기 전에 [docs.comfy.org/agent-tools](https://docs.comfy.org/agent-tools)에서
+현재 상태를 확인하세요.
+</Note>
+
+## 한 줄 답변
+
+**로컬 GPU가 없거나, 설정을 전혀 하고 싶지 않나요?** Comfy Cloud를 쓰세요. 퍼스트파티이고,
+ComfyUI를 만드는 팀이 유지 관리하며, 드라이버나 VRAM,
+모델 다운로드를 생각할 필요가 없습니다.
+
+**이미 자신의 머신에서 ComfyUI를 돌리고 있나요?** 그것이 이 프로젝트가
+하는 일입니다. GPU는 이미 값을 냈고, 모델은 이미 디스크에 있으며,
+Claude나 ChatGPT 구독이 이미 추론을 커버합니다.
+
+## Comfy-Org가 제공하는 것
+
+Comfy-Org의 [Agent Tools](https://docs.comfy.org/agent-tools) 페이지는 관련된
+제품 세 가지를 나열합니다:
+
+| 제품 | 무엇인가 | 상태 (2026년 7월) |
+|---|---|---|
+| **Comfy Cloud MCP** | 호스팅 MCP 서버. 생성은 Comfy Cloud GPU에서 실행 | 퍼블릭 베타 |
+| **Comfy In-App Agent** | Comfy Cloud 안에서 채팅으로 그래프를 만들고 편집하는 에이전트 | 프라이빗 알파 |
+| **Comfy Local MCP** | 사용자의 ComfyUI 설치를 구동하는 퍼스트파티 로컬 MCP 서버 | 프라이빗 테스트. 아직 공개되지 않음 |
+
+Comfy Cloud MCP는 하는 일에서 정말로 좋습니다: ComfyUI 엔진을
+MCP로 노출하고, Claude Code, Claude Desktop, Codex에서 OAuth로 로그인하며,
+GPU를 소유하지 않고도 Kling, Veo, Seedance, Flux,
+ElevenLabs 같은 모델에 관리형으로 접근하게 합니다.
+
+## 이 프로젝트가 제공하는 것
+
+`comfyui-mcp`는 **사용자의** ComfyUI 설치 — 로컬, LAN, VPS, 또는 RunPod — 를
+구동하는 MCP 서버 + 사이드바 에이전트입니다. 37개 MCP 도구, 39개 모델별 스킬,
+그리고 자연어로 라이브 그래프를 편집하는 패널 에이전트.
+
+구조적 차이는 **추론이 어디서 오느냐**입니다. 이 프로젝트는
+제공자에 중립적입니다: 같은 도구와 같은 패널이 이미 값을 내는 구독으로
+Claude, ChatGPT, Gemini, Grok, 또는 Kimi에서, 어떤 OpenAI 호환
+엔드포인트에서, 또는 Ollama, LM Studio, llama.cpp의 무료 로컬 모델에서
+실행됩니다 — 계정도, 나가는 네트워크도 전혀 없이.
+
+## 나란히 비교
+
+| | Comfy Cloud (In-App Agent / Cloud MCP) | comfyui-mcp |
+|---|---|---|
+| 생성이 실행되는 곳 | Comfy Cloud GPU | 사용자의 GPU (또는 VPS / RunPod 파드) |
+| Comfy 계정 필요 | 예 | 아니오 |
+| 완전히 오프라인으로 동작 | 아니오 | 예, 로컬 모델과 함께 |
+| 추론 모델 | 서비스가 제공 | **사용자의 것** — 어떤 LLM이든, 무료 로컬 포함 |
+| 비용 모델 | 클라우드 크레딧 | 기존 구독, 또는 로컬 $0 |
+| 이미지/프롬프트가 머신을 떠남 | 예 | 호스팅 LLM을 고를 때만 |
+| 커스텀 노드와 모델 파일을 관리 | 해당 없음 (관리형 환경) | 예 — 노드 설치, 모델 다운로드 |
+| 가용성 | Cloud MCP 퍼블릭 베타. 에이전트 프라이빗 알파 | 지금 사용 가능 |
+| 퍼스트파티 지원 | 예 | 커뮤니티 프로젝트 |
+
+## 이럴 때 Comfy Cloud를 선택하세요
+
+- GPU가 없거나, 원하는 모델에 비해 너무 작음
+- 설정과 유지 관리 없이 동작하기를 원함
+- CUDA, VRAM, 체크포인트 다운로드를 관리하는 대신 크레딧을 사고 싶음
+- 팀이 이미 Comfy Cloud에 있어 벤더와 청구서를 하나로 두고 싶음
+- ComfyUI를 만드는 사람들의 퍼스트파티 지원을 원함
+
+좋은 이유입니다. 여러 개가 해당되면, 읽기를 멈추고
+[Comfy Cloud](https://comfy.org/)를 쓰세요 — 더 편할 것입니다.
+
+## 이럴 때 comfyui-mcp를 선택하세요
+
+- **이미 GPU가 있습니다.** 값을 냈습니다. 클라우드 크레딧은 이미 소유한
+  연산에 대한 두 번째 청구서입니다.
+- **작업이 머신을 떠나면 안 됩니다.** NDA 아래의 클라이언트 자료, 라이선스된
+  학습 데이터, 업로드할 수 없는 모든 것. 로컬 모델이면 아무것도 떠나지 않습니다.
+- **이미 가진 LLM 구독을 쓰고 싶습니다.** Claude나
+  ChatGPT 플랜이 이미 추론을 커버합니다 — 에이전트를 위한 두 번째 미터가 없습니다.
+- **무료로, 또는 오프라인으로 쓰고 싶습니다.** Ollama, LM Studio, llama.cpp는
+  계정도 네트워크도 없이 실행됩니다. [로컬 LLM](/docs/ko/local-llms)을 참고하세요.
+- **설치 그 자체가 핵심입니다.** 사용자의 커스텀 노드, LoRA, 체크포인트
+  컬렉션. 에이전트는 실제로 쓰는 설치에 [노드를 설치하고 모델을 다운로드](/docs/tools/models)합니다.
+- **모델을 직접 고르고 싶습니다.** LLM마다 잘하는 일이 다릅니다.
+  [LLM 아레나](/docs/ko/arena)가 실제 ComfyUI 작업으로 점수를 매겨 증거로
+  고를 수 있게 합니다. [백엔드](/docs/ko/backends)를 참고하세요.
+
+## "공식 로컬 MCP가 나오면 이 프로젝트가 불필요해지지 않나요?"
+
+타당한 질문이며, 아닌 척하지 않고 바로 답할 가치가 있습니다.
+
+Comfy Local MCP는 **로컬 설치를 위한 퍼스트파티 드라이버**이며, 출시되면
+좋은 것이 될 것입니다. 하지만 이 프로젝트와는 다른 계층입니다: 에이전트를
+ComfyUI에 연결하는 것이고, `comfyui-mcp`는 에이전트 자체, 열한 개 제공자와
+로컬 런타임에서 돌리는 제공자 중립 백엔드, 사이드바 UI, 모델별 스킬,
+노드/모델 관리까지 가져옵니다.
+
+정직한 읽기: 원하는 것이 "Claude Code가 내 로컬 ComfyUI와 대화하게 하자"뿐이라면,
+퍼스트파티 툴링이 결국 그것을 커버할 것이고, 그걸 쓰는 편이 맞습니다.
+직접 모델을 가져오고 — 무료 로컬 포함 — 에이전트가 ComfyUI 안에서 살며
+설치 자체를 관리하기를 원한다면, 그것이 이 프로젝트가 메우는 간격입니다.
+
+또한 조합됩니다. 이 프로젝트는 Comfy Cloud도 대상으로 삼을 수 있습니다
+(`COMFYUI_API_KEY` 설정 — [클라우드 배포](/docs/ko/cloud-deployment) 참고).
+그래서 설정 하나가 로컬 설치, LAN 박스, VPS, Comfy Cloud를 커버합니다.
+
+## 시작하기
+
+<CardGroup cols={2}>
+  <Card title="빠른 시작" icon="rocket" href="/docs/ko/quickstart">
+    로컬 ComfyUI를 대상으로 MCP 서버가 약 1분 만에 돌아갑니다.
+  </Card>
+  <Card title="로컬 LLM" icon="microchip" href="/docs/ko/local-llms">
+    Ollama, LM Studio, llama.cpp에서 완전히 오프라인 — 계정 없음.
+  </Card>
+  <Card title="백엔드" icon="shuffle" href="/docs/ko/backends">
+    Claude, ChatGPT, Gemini, Grok, Kimi, 또는 어떤 OpenAI 호환 엔드포인트든.
+  </Card>
+  <Card title="에이전트 패널" icon="window" href="/docs/ko/panel">
+    라이브 그래프를 구동하는 사이드바 에이전트.
+  </Card>
+</CardGroup>

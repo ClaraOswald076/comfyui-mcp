@@ -205,6 +205,18 @@ they are the most commonly skipped item.
 Reuse the panel's settled vocabulary from `comfyui-mcp-panel/locales/<code>/main.json`. Docs
 disagreeing with the UI the reader is looking at is worse than either choice alone.
 
+### One-locale wave (after ko/ja)
+
+Korean and Japanese are the template: every **guide** page, not tools/blog/changelog.
+
+1. Copy the 16 remaining English guides into `docs/<lang>/` (or the ones that locale still lacks).
+2. Translate under the hard rules above. Do **one language per PR**.
+3. Expand that language in `docs.json` to the same two groups as English (Getting Started + Configuration). Never add `fa` to the switcher.
+4. Stop only when all three pass: `check:docs-locale <lang>`, `check:docs-links`, `check:docs-mdx`.
+5. After merge, `node scripts/check-docs-deployed.mjs <lang>`. A nav page that 404s stops the next wave.
+
+Do not `/loop` the rest. The finish line is the gates plus a live URL, not "I wrote the files."
+
 ---
 
 ## What is *not* true

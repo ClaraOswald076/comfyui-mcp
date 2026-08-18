@@ -197,8 +197,29 @@
                 "pages": [
                   "ko/index",
                   "ko/quickstart",
+                  "ko/using-tools",
+                  "ko/local-vs-comfy-cloud",
                   "ko/installation",
+                  "ko/roadmap"
+                ]
+              },
+              {
+                "group": "설정",
+                "pages": [
+                  "ko/configuration",
+                  "ko/remote-connector",
+                  "ko/cloud-deployment",
+                  "ko/docker",
+                  "ko/self-hosted-relay",
+                  "ko/concepts",
+                  "ko/plugin",
                   "ko/panel",
+                  "ko/apps",
+                  "ko/mobile",
+                  "ko/third-party-hosts",
+                  "ko/backends",
+                  "ko/local-llms",
+                  "ko/arena",
                   "ko/troubleshooting"
                 ]
               }
@@ -217,8 +238,29 @@
                 "pages": [
                   "ja/index",
                   "ja/quickstart",
+                  "ja/using-tools",
+                  "ja/local-vs-comfy-cloud",
                   "ja/installation",
+                  "ja/roadmap"
+                ]
+              },
+              {
+                "group": "設定",
+                "pages": [
+                  "ja/configuration",
+                  "ja/remote-connector",
+                  "ja/cloud-deployment",
+                  "ja/docker",
+                  "ja/self-hosted-relay",
+                  "ja/concepts",
+                  "ja/plugin",
                   "ja/panel",
+                  "ja/apps",
+                  "ja/mobile",
+                  "ja/third-party-hosts",
+                  "ja/backends",
+                  "ja/local-llms",
+                  "ja/arena",
                   "ja/troubleshooting"
                 ]
               }

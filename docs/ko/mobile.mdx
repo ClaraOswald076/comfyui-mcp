@@ -1,0 +1,65 @@
+---
+title: "모바일 앱 (베타)"
+description: "ComfyUI-MCP 모바일 — 휴대폰에서 ComfyUI 에이전트와 대화하세요. 에이전트 패널의 QR 코드로 페어링하고 네트워크 어디서든 생성, 워크플로우, 모델을 제어합니다. 지금 Android와 iOS 클로즈드 베타입니다."
+icon: "mobile"
+---
+
+<Note>
+**베타에 참여하세요.** ComfyUI-MCP 모바일 앱은 클로즈드 베타입니다 — 플랫폼에
+맞는 빌드를 설치하세요:
+
+- **Android** — [Firebase App Distribution](https://appdistribution.firebase.dev/i/27a5cccde72ffb42)
+- **iOS** — [TestFlight](https://testflight.apple.com/join/ws65s4a2)
+</Note>
+
+모바일 앱은 [사이드바 패널](/docs/ko/panel)을 구동하는 것과 같은 에이전트의
+휴대폰 네이티브 프론트엔드입니다. 패널 오케스트레이터의 브리지에 연결하므로,
+패널이 할 수 있는 모든 것 — 이미지 생성, 워크플로우 실행과 검사, 모델
+전환 — 을 휴대폰에서 쓸 수 있고, 작업은 데스크톱의 ComfyUI가 합니다.
+
+## 페어링
+
+앱은 패널 브리지를 통해 에이전트 호스트와 대화하므로, 한 번 페어링하면
+들어갑니다:
+
+1. 데스크톱에서 [comfyui-mcp](/docs/ko/quickstart)와
+   [에이전트 패널](/docs/ko/panel)을 설치하고 실행하세요.
+2. ComfyUI의 **설정**에서 **"모바일 앱으로 제어 (베타)"**를 켜세요 — **기본값은
+   꺼짐**이며, 켜기 전까지 페어링 버튼은 숨겨져 있습니다.
+3. 패널을 열고 헤더의 **QR** 버튼을 눌러
+   **페어링 QR**을 표시하세요.
+4. 모바일 앱에서 **패널의 QR 스캔**을 탭하세요 — 또는 브리지 URL
+   (`ws://…?token=…`)을 직접 붙여넣으세요.
+
+QR은 페어링 데이터가 URL 프래그먼트에 실린 랜더 URL을 인코딩하므로,
+호스트와 토큰이 기기를 떠나지 않습니다. 앱은 또한 랜더의 **앱에서 열기**
+버튼을 위해 `comfyui-mcp://pair` 딥 링크를 등록합니다.
+
+<Note>
+휴대폰과 데스크톱 사이에 네트워크 경로가 필요합니다 — 단순한 경우에는
+같은 LAN, 호스트에 직접 닿지 않을 때는 [보안 릴레이](/docs/ko/self-hosted-relay) /
+[클라우드 배포](/docs/ko/cloud-deployment).
+</Note>
+
+## 앱에 있는 것
+
+- **에이전트 채팅** — 패널 사이드바에서 나누는 것과 같은 대화를
+  휴대폰에서.
+- **모델 선택기** — 오케스트레이터의 실시간 모델 카탈로그. 세션 도중에
+  모델을 전환합니다.
+- **Civitai 둘러보기** — 모델과 크리에이터 검색, 좋아요와 즐겨찾기.
+- **원격 제어** — 데스크톱 패널 탭을 미러하고 이동 중에 워크플로우
+  진단을 확인합니다.
+
+## 피드백
+
+베타 피드백과 버그 리포트는
+[Discord](https://discord.gg/cW9arBhzCu)나
+[이슈 트래커](https://github.com/artokun/comfyui-mcp/issues)에서
+환영합니다.
+
+## 참고
+
+- [사이드바 패널](/docs/ko/panel) — 앱이 페어링하는 ComfyUI 속 에이전트
+- [클라우드 배포](/docs/ko/cloud-deployment) — 원격 ComfyUI 파드 제어
+- [셀프호스팅 릴레이](/docs/ko/self-hosted-relay) — 보안 브리지 경로를 직접 소유

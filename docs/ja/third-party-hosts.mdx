@@ -1,0 +1,218 @@
+---
+title: "サードパーティホスト"
+description: "モバイルアプリが使うのと同じペアリングプロトコルの上に、自分のフロントエンド（Blender パネル、ブラウザー拡張、別のアプリ）を作る — 1 つのエージェント、共有コンテキスト、薄いクライアント。メッセージの形、エンドポイント、セキュリティの不変条件、LLM にアダプターの足場を作らせるコピペ用プロンプト。"
+icon: "plug"
+---
+
+エージェントパネル、[モバイルアプリ](/docs/ja/mobile)、動いているセッションにペアリングする
+任意のツールはすべて、オーケストレーターのペアリングリスナーに対して **1 つの小さな
+WebSocket プロトコル** を話します。**サードパーティホスト** は、そのプロトコルの上にあなたが
+作る任意のクライアントです — Blender パネル、ブラウザー拡張、CLI、別のエディター —
+**ライブのデスクトップタブに接続し、そのエージェントセッションを操作します**。同じエージェント、
+同じコンテキスト、2 つ目の Claude Code プロセスなし、ユーザーが追加でインストールするものは
+ありません。
+
+<Note>
+これはモバイルアプリが載っている面そのものです。WebSocket を開いて JSON を送れれば、
+ホストを作れます。
+</Note>
+
+## しくみ
+
+<Steps>
+<Step title="デスクトップはすでに待ち受けている">
+エージェントパネルが開いているとき、オーケストレーターは LAN 上で **トークンゲートされた
+ペアリングリスナー** を動かします（[エンドポイント](#エンドポイント) を参照）。開いている
+各パネルタブは、安定した `tab_id` とライブのエージェントセッションを持つ **デスクトップタブ**
+です。
+</Step>
+<Step title="ホストがペアリングトークンで接続する">
+クエリ文字列にトークンを付けてペアリング URL へ WebSocket を開きます。有効なトークンがなければ
+接続は拒否されます — ペアリングがセキュリティ境界の全体です。
+</Step>
+<Step title="タブを一覧し、接続する">
+`list_tabs` を送って開いているデスクトップタブを見つけ、`attach_tab` で 1 つをミラーします。
+ホストはいま **そのタブの活動を受け取り**（ストリーム）、**操作できます**。
+</Step>
+<Step title="共有セッションを操作する">
+`user_message` フレームを送ります。接続中、サーバーはそれらを **ミラーしたタブ** へルーティング
+します — なのでメッセージは、デスクトップエージェントがいる *同じ* 会話に入ります。それが
+「1 つのエージェント、共有コンテキスト」であり、2 つ目のセッションではない理由です。
+</Step>
+</Steps>
+
+## エンドポイント
+
+ペアリングリスナーはブリッジポート（`COMFYUI_MCP_BRIDGE_PORT`、既定 **9180**）から派生します:
+
+| ポート | 用途 |
+|---|---|
+| `bridge`（9180） | パネル ⇄ オーケストレーターの UI ブリッジ（デスクトップ自身の接続）。 |
+| `bridge + 1`（9181） | `panel_*` の HTTP-MCP 面 — **このプロトコルではない**。 |
+| **`bridge + 2`（9182）** | **接続するペアリング / リモート操作リスナー。** トークンゲート、`0.0.0.0` にバインド（LAN から到達可能）。 |
+
+**ペアリング URL:**
+
+```
+ws://<desktop-machine-ip>:9182/?token=<PAIR_TOKEN>
+```
+
+- トークンはユーザーが `COMFYUI_MCP_PAIR_TOKEN` で **固定** するか（常時ペアリング）、
+  **セッションごとに発行** され、パネルの QR / ペアフローで渡されます。ホストはモバイルアプリと
+  同じ方法でそれを得ます: ユーザーが一度ペアリングします。
+- **既定は LAN 限定** ですが、ユーザーが求めれば公開露出も組み込みです: パネルのペアモーダルは
+  暗号化された cloudflared クイックトンネルを開く **インターネット** モードを出し、企業は
+  セルフホストのリレー（`COMFYUI_MCP_TUNNEL_BACKEND=relay`）経由にもできます。どちらでも
+  トークンがゲートします。
+
+## メッセージの形
+
+すべてのフレームは `type` を持つ JSON オブジェクトです。リクエスト / レスポンスフレームは、
+あなたが選ぶ `cid`（相関 ID）を運び、対応する返信でエコーされます。
+
+### 受信 — ホスト → オーケストレーター
+
+| `type` | フィールド | 効果 |
+|---|---|---|
+| `hello` | `tab_id`、`headless: true` | 接続を登録する。サードパーティホストは **ヘッドレス** クライアントです（自分のキャンバスはない）。 |
+| `list_tabs` | `cid` | 開いているデスクトップタブを求める。 |
+| `attach_tab` | `cid`、`target_tab_id` | そのデスクトップタブをミラー + 操作する。**本物の、非ヘッドレス** デスクトップタブにのみ有効。 |
+| `detach_tab` | — | ミラー / 操作を止める。入力は自分の（空の）セッションに戻る。 |
+| `user_message` | `text`（+ いつものメッセージフィールド） | **ミラーした** タブの会話の 1 ターン。サーバーが接続先タブへスタンプする。 |
+
+接続中に送る他のパネルイベントも同様に、ミラーしたタブへルーティングされます。
+
+### 送信 — オーケストレーター → ホスト
+
+| `type` | フィールド | 意味 |
+|---|---|---|
+| `tab_list` | `cid`、`tabs[]` | `list_tabs` への返信: 接続可能なデスクトップタブ。 |
+| `tab_attached` | `cid`、`tab_id`、`ok`、`error?` | `attach_tab` への返信。対象が古い / ヘッドレスなら `ok:false` + `error`。 |
+| `mailbox_flush` | バッファされたフレーム | ライブ接続がなかった間にタブが出したものの再生。 |
+
+加えて、ミラーしたタブのライブエージェント活動（ストリームされた返信、ステータス、カード）が
+あり、ホストが描画します。
+
+<Warning>
+**`attach_tab` が権威です — 対象を偽造できません。** サーバーは、外向きフレームにあなたが
+載せた `tab_id` を、実際に接続したタブで上書きします。ホストは明示的に接続したタブだけを
+操作できます。これは意図的です。以下を参照。
+</Warning>
+
+## セキュリティの不変条件 — ホストはこれらを必ず守る
+
+これらがペアリングを安全にする保証です。それを守るホストを作ることが契約の全体です。
+迂回しようとするホストは、リスナーが拒否するよう設計されたものです。
+
+<Note>
+これらを守ることはホストへの制約ではありません — *それが* 機能です。一度もペアリングしていない
+セッションをクライアントが乗っ取ることを止めます。
+</Note>
+
+1. **トークンゲート。** リスナーは有効なペアトークンのない接続を拒否します
+   （`verifyClient`）。トークンを自動で出荷したり埋め込んだりするフローを作らないでください —
+   ユーザーが一度、意図してペアリングします。
+2. **権威ある `attach_tab` スタンプ。** フレームの対象タブを決めるのはサーバーであり、
+   クライアントではありません。ルーティングにクライアント供給の `tab_id` を頼らないでください。
+   先に接続し、それから送ってください。
+3. **非ヘッドレスの対象のみ。** 本物のデスクトップタブには接続できます。別のヘッドレス
+   クライアントにはできません（別のスマートフォン / ホストをミラーできません）。
+4. **一度に 1 タブ。** B に接続すると A への購読は落ちます。接続ごとにアクティブなミラーは
+   1 つとしてモデルしてください。
+5. **固定されたソケット種別。** 接続の種別（ヘッドレス vs デスクトップ）は最初の `hello` で
+   固定されます。テイオーバーガードを逃れるために切り替えないでください。
+
+## 最小限のリファレンスクライアント
+
+```js
+const token = "<PAIR_TOKEN>";            // obtained via the user's pair flow
+const ws = new WebSocket(`ws://192.168.1.50:9182/?token=${token}`);
+let cid = 0;
+
+ws.onopen = () => {
+  ws.send(JSON.stringify({ type: "hello", tab_id: "myhost:" + crypto.randomUUID(), headless: true }));
+  ws.send(JSON.stringify({ type: "list_tabs", cid: ++cid }));
+};
+
+ws.onmessage = (ev) => {
+  const m = JSON.parse(ev.data);
+  if (m.type === "tab_list") {
+    // pick a desktop tab and attach to it
+    const target = m.tabs[0]?.tab_id;
+    if (target) ws.send(JSON.stringify({ type: "attach_tab", cid: ++cid, target_tab_id: target }));
+  } else if (m.type === "tab_attached" && m.ok) {
+    // now you're driving that tab's session
+    ws.send(JSON.stringify({ type: "user_message", text: "Add a KSampler and wire it up." }));
+  } else {
+    // render streamed agent activity for the mirrored tab
+    console.log("from session:", m);
+  }
+};
+```
+
+## LLM にアダプターを作らせる
+
+下のプロンプトを Claude、ChatGPT、またはコーディングエージェントに貼り付けて、プラットフォーム
+向けのホストアダプターの足場を作らせてください。プロトコル契約の全体を運ぶので、モデルが
+推測する必要はありません。
+
+```text Copy this into your LLM
+You are building a THIRD-PARTY HOST ("adapter") for comfyui-mcp. A host connects
+to a running comfyui-mcp orchestrator over WebSocket, attaches to a live desktop
+"tab", and drives that tab's agent session — same agent, shared context, no second
+session. Build the adapter for THIS platform: <describe your platform, e.g. a
+Blender sidebar panel / a Chrome extension / a Neovim plugin>.
+
+CONNECTION
+- WebSocket to:  ws://<desktop-ip>:9182/?token=<PAIR_TOKEN>
+  (port = bridge port + 2; bridge default 9180. Token is provided by the user via
+  their pairing flow — NEVER hardcode, embed, or auto-provision it.)
+- On open, send:  {"type":"hello","tab_id":"<your-unique-id>","headless":true}
+
+DISCOVER + ATTACH
+- Send {"type":"list_tabs","cid":1}; you receive {"type":"tab_list","cid":1,"tabs":[...]}.
+- Send {"type":"attach_tab","cid":2,"target_tab_id":"<a tab_id from tab_list>"};
+  you receive {"type":"tab_attached","cid":2,"tab_id":"...","ok":true|false,"error"?}.
+  Only real, non-headless desktop tabs are attachable.
+
+DRIVE
+- Send {"type":"user_message","text":"..."} to post a turn into the ATTACHED tab's
+  conversation. The server routes it to the mirrored tab automatically.
+- Send {"type":"detach_tab"} to stop.
+
+RENDER
+- After attaching you receive the mirrored tab's live activity (streamed agent
+  replies, status, interactive cards) and a {"type":"mailbox_flush"} replay of
+  anything produced while you were disconnected. Render these in your UI.
+
+SECURITY — these are non-negotiable; preserve every one:
+1. Only connect with a user-provided pair token; never embed or auto-ship it.
+2. Never assume you can target a tab you did not attach_tab to — the server stamps
+   the target authoritatively; trust tab_attached.ok, don't spoof tab_id.
+3. Attach only to non-headless desktop tabs; never to another headless client.
+4. One active attachment per connection (attaching to a new tab drops the old).
+5. Do not try to change your connection's kind after the first hello.
+
+DELIVERABLE
+- A minimal, working adapter for the platform above: connect → list → attach →
+  send a user_message → render streamed replies → detach. Handle reconnects and
+  the mailbox_flush replay. Keep the pairing/token handling explicit and
+  user-driven.
+```
+
+## 連携を登録する
+
+何か作りましたか？ **登録** して、一覧できるようにし、プロトコル変更が出荷される前に旗を
+立てられるようにしてください:
+
+<Card title="サードパーティホストを登録する" icon="plug" href="https://github.com/artokun/comfyui-mcp/issues/new?template=third-party-host.yml">
+GitHub の登録テンプレートを開く — 名前、プラットフォーム、リポジトリ、どのプロトコル
+バージョンに対して作ったか。
+</Card>
+
+<Note>
+**安定性:** 上のフレームはモバイルアプリが出荷しているものですが、まだ凍結されたバージョン付き
+契約ではありません — ソース
+（[`src/services/ui-bridge.ts`](https://github.com/artokun/comfyui-mcp/blob/main/src/services/ui-bridge.ts)）
+を権威として読み、ホストを登録して形が動くときに通知を受けてください。
+</Note>

@@ -1,0 +1,160 @@
+---
+title: "リモート / ホスト型コネクタ"
+description: "comfyui-mcp を認証付きで公開到達可能な Streamable-HTTP MCP サーバーとして公開する — Claude Desktop のカスタムコネクタや任意のリモートクライアントに、ワンコマンドで追加できます。"
+icon: "globe"
+---
+
+`comfyui-mcp` は、ホスト型コネクタが使うのと同じ **Streamable-HTTP** MCP トランスポートを話します
+（例: Comfy 自身の `cloud.comfy.org/mcp` カスタムコネクタ）。ワンコマンドで、公開 HTTPS
+トンネルの背後にあるトークン認証サーバーとして動き、**Claude Desktop → Connectors** に追加したり、
+どこからでもヘッドレスに呼び出したりできます。
+
+<Note>
+これはオプトインです。既定の `stdio` トランスポート（およびループバック上の素の `--http`）は
+これまでどおり — 開いていてローカルです。認証とトンネルが有効になるのは、トークンを設定したとき
+または `--tunnel` を渡したときだけです。
+</Note>
+
+<Note>
+**代わりにエージェントパネルでリモートの ComfyUI ポッド（例: RunPod）を操作したいですか？**
+それは別の機能です — [クラウドデプロイ](/docs/ja/cloud-deployment) を参照してください。
+このページは **comfyui-mcp の MCP サーバー自体** を Claude Desktop のようなリモートクライアントに
+公開する話です。ComfyUI にもパネルブリッジにも触れません。どちらも裏で cloudflared のクイック
+トンネルを使うので、混同しやすいです。
+</Note>
+
+## ワンコマンドのトンネル
+
+```bash
+npx -y comfyui-mcp@latest --tunnel
+```
+
+これは 4 つのことをします:
+
+1. HTTP トランスポートを強制します（`MCP_TRANSPORT=http`）。
+2. まだ設定していなければ、強いランダムな認証トークンを生成します。
+3. ローカルの MCP ポートへ [cloudflared](https://github.com/cloudflare/cloudflared) のクイック
+   トンネルを開始します。
+4. そのまま貼れるブロックを表示します: 公開の `https://…/mcp` URL、トークン、Claude Desktop
+   コネクタのスニペット。
+
+出力は次のようになります:
+
+```text
+════════════════════════════════════════════════════════════════════
+ ComfyUI MCP — Remote / Hosted Connector is LIVE
+════════════════════════════════════════════════════════════════════
+ Public MCP URL : https://shiny-otter-1234.trycloudflare.com/mcp
+ Auth token     : 9f2c…<redacted>
+ ...
+════════════════════════════════════════════════════════════════════
+```
+
+<Warning>
+ターミナルは開いたままにしてください。cloudflared の **クイックトンネル** は一時的です — URL は
+実行のたびに変わり、プロセスが終了すると閉じます。安定したホスト名が欲しい場合は、ローカルの
+HTTP ポートを向いた自分の
+[名前付き cloudflared トンネル](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
+を動かしてください。
+</Warning>
+
+### cloudflared がインストールされていない場合
+
+`cloudflared` は任意依存として同梱されています。バイナリが見つからない場合、サーバーはローカルで
+動き続け、インストール手順を表示します:
+
+```bash
+npm install -g cloudflared          # cross-platform
+brew install cloudflared            # macOS
+winget install cloudflare.cloudflared  # Windows
+```
+
+それから `--tunnel` でもう一度実行してください。
+
+## Claude Desktop に追加する
+
+**Claude Desktop → Settings → Connectors → カスタムコネクタを追加** を開き、次を入力します:
+
+| 項目   | 値 |
+|--------|-------|
+| 名前   | `ComfyUI` |
+| URL    | 表示された `https://…/mcp` URL |
+| ヘッダー | `X-API-Key: <token>`（または `Authorization: Bearer <token>`） |
+
+保存し、チャットでコネクタを有効にします。ComfyUI のツールは、ローカルの stdio サーバーと
+同じように現れます。
+
+## ヘッドレス / プログラム用の設定
+
+リモートの Streamable-HTTP サーバーに対応した任意の MCP クライアントが動きます。URL と
+認証ヘッダーを渡してください:
+
+```json
+{
+  "mcpServers": {
+    "comfyui": {
+      "url": "https://shiny-otter-1234.trycloudflare.com/mcp",
+      "headers": { "X-API-Key": "<token>" }
+    }
+  }
+}
+```
+
+`/mcp` への **すべての** リクエストで、どちらのヘッダー形式も受け付けます:
+
+```bash
+# X-API-Key (matches Comfy Cloud's convention)
+curl -H "X-API-Key: <token>" https://…/mcp
+
+# Authorization: Bearer
+curl -H "Authorization: Bearer <token>" https://…/mcp
+```
+
+## 手動セットアップ（自分のトンネル / プロキシを使う）
+
+公開エンドポイントを自分で管理したい場合は、固定トークン付きで HTTP トランスポートを動かし、
+自分のリバースプロキシ、トンネル、または VPN の背後に置きます:
+
+```bash
+COMFYUI_MCP_HTTP_TOKEN=my-long-random-secret \
+  npx -y comfyui-mcp@latest --http --host 0.0.0.0 --port 9100
+```
+
+それからトンネル / プロキシを `http://127.0.0.1:9100/mcp` に向けます。
+
+<Warning>
+ループバック以外のホスト（例: `0.0.0.0`）にトークン **なし** でバインドするのは **即失敗**
+です — サーバーは、箱の外に開いた `/mcp` エンドポイントを晒すより起動を拒否します。
+`COMFYUI_MCP_HTTP_TOKEN` を設定する（推奨）、`--tunnel` を使う、またはループバックホストに
+バインドしてください。本当に開いたエンドポイントが欲しい場合（例: 自分の認証プロキシの背後）は、
+`--allow-unauthenticated-non-loopback`（環境変数 `COMFYUI_MCP_ALLOW_UNAUTH=1`）で明示的に
+オプトインすると、失敗が警告に下がります。
+</Warning>
+
+## 認証リファレンス
+
+| 設定 | 効果 |
+|---------|--------|
+| `COMFYUI_MCP_HTTP_TOKEN` | `/mcp` で要求される共有シークレットトークン。未設定 → エンドポイントは開いています。 |
+| `--token <value>` | 環境変数と同じ。CLI フラグが環境変数より優先されます。 |
+| `--tunnel` / `MCP_TUNNEL=1` | HTTP を強制し、未設定ならトークンを自動生成し、cloudflared トンネルを開きます。 |
+| `--http` / `MCP_TRANSPORT=http` | トンネルなしの HTTP トランスポート（トークンがあれば認証は適用されます）。 |
+| `--host`、`--port` | バインドアドレス（既定 `127.0.0.1:9100`）。 |
+| `--allow-unauthenticated-non-loopback` / `COMFYUI_MCP_ALLOW_UNAUTH=1` | ループバック以外のホストで **開いた** `/mcp` をオプトイン。なしではその組み合わせは起動時の即失敗です。 |
+
+トークンは定数時間で比較され、ゲートは MCP エンドポイントのすべての HTTP メソッド
+（`POST`/`GET`/`DELETE`）で強制されます。トークンなしでループバック以外のホストにバインド
+するのは、上の逃げ道を設定しない限り起動時に拒否されます。
+
+## ロードマップ: OAuth
+
+いまの認証は **手動の共有シークレットトークン**（Bearer / `X-API-Key`）で、ヘッドレスと
+Claude Desktop のカスタムコネクタの両方をカバーします。ブラウザーベースの完全な **OAuth**
+サインインフロー（Comfy のホスト型コネクタのようなもの）は予定されている後続です — より重い
+変更で、手動接続には不要です。
+
+## 関連情報
+
+- [クラウドデプロイ](/docs/ja/cloud-deployment) — エージェントパネルでリモートの ComfyUI
+  ポッドを操作する（別のトンネル、別の目的）
+- [設定](/docs/ja/configuration) — 環境変数の完全なリファレンス

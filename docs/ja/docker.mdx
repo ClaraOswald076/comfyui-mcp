@@ -1,0 +1,112 @@
+---
+title: "Docker と Compose"
+description: "ComfyUI を docker-compose のサービスとして動かし、comfyui-mcp を接続する — そして comfyui-mcp 自体がなぜ compose のサービスにならないのか。"
+icon: "docker"
+---
+
+## comfyui-mcp は stdio — compose のサービスにはできない
+
+`comfyui-mcp` は **stdio の MCP サーバー** です。ポートはなく、ネットワーク上に何も公開しません:
+MCP クライアント（Claude Code、Cursor、MCP ブリッジなど）が **子プロセスとして起動し**、
+stdin/stdout で話します。
+
+そのため `docker-compose.yml` に `comfyui-mcp` サービスを置いても行き止まりです — 起動し、
+話す相手がなく、終了します。ComfyUI を compose に組み込むほぼ全員がこれに引っかかります。
+正しい compose ファイルはサービスが「足りない」ように見えるからです。足りていません: compose
+するのは **ComfyUI** で、MCP サーバーは MCP クライアントが動く場所で動き、`COMFYUI_URL` 経由の
+素の HTTP で ComfyUI に届きます。
+
+<Note>
+  サーバーを起動する `npx` コマンドには、それを動かすマシン（またはコンテナ）に
+  **Node.js >= 22** が必要です — スリムなベースイメージでの最大の落とし穴です。
+</Note>
+
+## 2 つのデプロイ形態
+
+<CardGroup cols={2}>
+  <Card title="ローカルの npx + ローカルの ComfyUI" icon="laptop">
+    既定です。ComfyUI はマシン上で直接動き、MCP クライアントが
+    `npx -y comfyui-mcp@latest` を起動し、ローカルインストールとそのポートを自動検出します。
+    設定は不要です。[インストール](/docs/ja/installation) を参照してください。
+  </Card>
+  <Card title="ローカルの npx + Docker 化 / リモートの ComfyUI" icon="docker">
+    ComfyUI はコンテナ（または別ホスト）で動き、MCP クライアントは今までどおりローカルで
+    `comfyui-mcp` を起動し、`COMFYUI_URL`（または `--comfyui-url`）でそこに向けます。
+    ループバック以外の URL はサーバーを **リモートモード** にします: すべての HTTP ツールが
+    動きます — カスタムノードのインストールも含み、これは ComfyUI-Manager の HTTP API 経由です。
+    ファイルシステムやローカルプロセスが必要なツール（ComfyUI 自体のインストール、comfy-cli
+    の操作、ログの読み取り、モデルファイルの削除）は明確なエラーを返します。
+  </Card>
+</CardGroup>
+
+## 例: docker-compose の ComfyUI
+
+すぐ使える例がリポジトリの
+[`docker/compose/`](https://github.com/artokun/comfyui-mcp/tree/main/docker/compose)
+にあります — ComfyUI をサービスとして（既定は NVIDIA、AMD/ROCm 版はコメントアウト）、
+モデルと出力のバインドマウント、ヘッダーコメントにクライアント設定:
+
+```yaml
+services:
+  comfyui:
+    image: yanwk/comfyui-boot:cu130-slim-v2   # community image; :rocm for AMD
+    ports:
+      - "8188:8188"
+    volumes:
+      - ./storage/models:/root/ComfyUI/models
+      - ./storage/custom_nodes:/root/ComfyUI/custom_nodes
+      - ./storage/input:/root/ComfyUI/input
+      - ./storage/output:/root/ComfyUI/output
+      - ./storage/user:/root/ComfyUI/user
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+```
+
+それから MCP クライアントをコンテナに向けます。**ホスト** 上（よくあるケース —
+同じマシンの Claude Code）では、公開したポートを使います:
+
+```json
+{
+  "mcpServers": {
+    "comfyui": {
+      "command": "npx",
+      "args": ["-y", "comfyui-mcp@latest"],
+      "env": {
+        "COMFYUI_URL": "http://localhost:8188"
+      }
+    }
+  }
+}
+```
+
+MCP クライアントが同じネットワーク上の **別の compose サービス内** で動く場合
+（例: Open WebUI の手前にある MCP-to-HTTP ブリッジ）は、`localhost` ではなく
+**compose のサービス名** を使います:
+
+```
+COMFYUI_URL=http://comfyui:8188
+```
+
+この構成ではブリッジサービスが `comfyui-mcp` を起動するので、そのイメージには
+Node.js >= 22 と `npx -y comfyui-mcp@latest` で起動できるサーバーが必要です。
+ブリッジはサードパーティのソフトウェアです — それぞれのドキュメントに従って設定して
+ください。例の compose ファイルにはコメントアウトされたスケッチがあります。
+
+## AMD / ROCm の注意点
+
+- `yanwk/comfyui-boot:rocm` のイメージタグを使い、例の ROCm パススルーのコメントを
+  外してください — 見逃しやすいのは次です:
+  `devices: [/dev/kfd, /dev/dri]`、`group_add: [video]`、
+  `security_opt: [seccomp:unconfined]`。
+- `comfyui-mcp` 自体に **GPU/CUDA 依存はありません** — ROCm ホストは完全にサポート
+  されています。[エージェントパネル](/docs/ja/panel) は **ComfyUI の拡張機能** であり
+  サービスではなく、外部フロントエンドが操作面なら任意です。
+- このリポジトリの
+  [`docker/runpod/`](https://github.com/artokun/comfyui-mcp/tree/main/docker/runpod)
+  は **CUDA 向けの RunPod クラウドイメージ** です（[クラウドデプロイ](/docs/ja/cloud-deployment)
+  を参照）。汎用の ComfyUI イメージではないので、AMD ユーザーはそこから始めないでください。
