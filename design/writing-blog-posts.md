@@ -194,6 +194,14 @@ and try splitting it.
 
 `docs/<locale>/` mirrors five entry pages. When adding or regenerating one:
 
+**Mintlify language codes are a closed enum.** `navigation.languages[].language` must be a
+code their schema accepts (`https://www.mintlify.com/docs.json`). An unknown code fails the
+**entire** production build and leaves the previous deploy up — that is how the site froze
+on the Korean pilot after Persian (`fa`) was added. `fa` is a real BCP-47 tag and a real
+panel locale; it is not a Mintlify language. Keep `docs/fa/*.mdx` in git; do not put `fa`
+back in the switcher until their schema lists it. `check:docs-links` now rejects an
+unsupported code.
+
 **Never translate:** fenced code (including comments inside it), inline backticks (flags, env
 vars, paths, tool names, `action` values, JSON keys), MDX component names and props, URLs, the
 target half of a link, `icon:` tokens, or frontmatter *keys*.

@@ -385,26 +385,6 @@
             ]
           }
         ]
-      },
-      {
-        "language": "fa",
-        "tabs": [
-          {
-            "tab": "راهنماها",
-            "groups": [
-              {
-                "group": "شروع به کار",
-                "pages": [
-                  "fa/index",
-                  "fa/quickstart",
-                  "fa/installation",
-                  "fa/panel",
-                  "fa/troubleshooting"
-                ]
-              }
-            ]
-          }
-        ]
       }
     ]
   },
