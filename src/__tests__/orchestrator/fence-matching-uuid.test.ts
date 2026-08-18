@@ -12,6 +12,10 @@
 //
 // So: the refusal does not move, nothing is adopted, and the fence is not written.
 // Only the DIAGNOSIS splits, on evidence that was already in hand and discarded.
+//
+// panel#980 later took the last step: when the settling read the diagnosis prescribes
+// is run and ACCEPTED, with write capability confirmed, the verdict itself flips to
+// BOUND — the gate matrix lives in unconfirmed-matching-fence.test.ts.
 
 import { beforeEach, describe, expect, it } from "vitest";
 import {
@@ -89,49 +93,32 @@ describe("#1401 an uncorroborated uuid that MATCHES the fence", () => {
     expect(text).not.toContain("graph tools will keep failing");
   });
 
-  it("says the fence was not re-derived, and names what that rules OUT", async () => {
-    const { text } = await setCurrent();
+  it("reports BOUND: the held fence was PROVEN live, which is what the uuid alone could not say (panel#980)", async () => {
+    // This bridge answers the settling graph read and confirms the write
+    // capability — the measurement #1401's codex review demanded before any
+    // liveness claim: a matching uuid rules OUT "fenced to another instance"
+    // but cannot rule IN liveness. The ACCEPTED stamped read can, so the claim
+    // no longer rests on the comparison alone.
+    const { res, text } = await setCurrent();
+    expect(res.isError ?? false).toBe(false);
+    expect(text).toMatch(/"graph_binding":\s*"bound"/);
     expect(text).toContain("NOT re-derived");
     expect(text).toContain(LIVE);
-    expect(text).toContain("matches the fence this session already holds");
-    expect(text).toContain("DIFFERENT workflow instance");
+    expect(text).toContain("equals the fence this session already holds");
+    expect(text).toContain("ACCEPTED by the panel");
   });
 
-  it("does NOT promise the graph tools work — that is what could not be confirmed", async () => {
-    // codex review: a matching uuid rules OUT "fenced to another instance"; it does
-    // not rule IN liveness, because a stale or background record can carry the right
-    // uuid and still not be the canvas in front of the user. Claiming health here
-    // would be the mirror image of the bug being fixed — turning "could not confirm"
-    // into "is fine" instead of into "is broken".
+  it("assigns no homework the tool already did", async () => {
+    // The settling read was taken by the tool itself (#1473); prescribing it
+    // again would send the caller to re-run a check whose answer they hold.
     const { text } = await setCurrent();
-    expect(text).toContain("NOT a claim that graph tools work");
-    expect(text).not.toMatch(/likely to work|should work|will work/i);
-  });
-
-  it("prescribes a cheap probe FIRST, not a hard refresh", async () => {
-    // A hard refresh throws away the user's canvas state; it must not be the
-    // opening move for a case where the binding is probably fine.
-    const { text } = await setCurrent();
-    const probeAt = text.indexOf("panel_graph_outline");
-    const refreshAt = text.search(/hard[- ]refresh|refresh the ComfyUI tab|F5/i);
-    expect(probeAt, "the probe must be mentioned").toBeGreaterThan(-1);
-    if (refreshAt > -1) expect(probeAt).toBeLessThan(refreshAt);
+    expect(text).not.toContain("call panel_graph_outline");
   });
 
   it("still ADOPTS NOTHING — the fail-closed rule does not move", async () => {
     await setCurrent();
     expect(adopted, "no uncorroborated identity may be written").toBeUndefined();
     expect(stamp).toBe(LIVE); // unchanged, because it already was LIVE
-  });
-
-  it("is still reported as a FAILURE, not as success", async () => {
-    // Softening the DIAGNOSIS must not soften the RESULT: the rebind genuinely
-    // did not happen, and the caller must still see an error rather than a
-    // reassuring success. (The failure path answers as an error result, not the
-    // JSON body the success path returns.)
-    const { res, text } = await setCurrent();
-    expect(res.isError).toBe(true);
-    expect(text).toContain("did NOT restore this session's graph binding");
   });
 });
 

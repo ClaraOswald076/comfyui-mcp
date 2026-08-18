@@ -5,9 +5,11 @@
 //
 // #1401 had already got the MESSAGE right for this shape: when the panel's reported identity
 // MATCHES the fence the session already holds, it says so, says it is not a claim that graph
-// tools work, and tells the caller to settle it with a graph read. What was left is that it
-// still reported FAILURE — so this takes the advice it gives instead of handing the caller a
-// failure plus homework.
+// tools work, and tells the caller to settle it with a graph read. #1473 took that read
+// itself and put the answer in the reply. What was left (panel#980) is the VERDICT: when the
+// settling read is ACCEPTED and the write-capability probe also says edits are allowed,
+// "did NOT restore the graph binding" is a false negative — so that one shape now reports
+// BOUND, on exactly the gate #1473's discussion scoped.
 //
 // Narrow by design: the probe runs only on the matching-uuid path, where the two remaining
 // possibilities (a reconciliation race vs a stale/background record) are indistinguishable
@@ -44,7 +46,8 @@ function bridge(opts: {
   activeUuid: string;
   /** "ok" passes; "mismatch" is a real fence refusal; "timeout" is an inconclusive failure. */
   graphRead: "ok" | "mismatch" | "timeout";
-  canMutate?: boolean;
+  /** true/false answer the write-capability probe; "unknown" leaves it unanswerable. */
+  canMutate?: boolean | "unknown";
 }) {
   return {
     send: async (cmd: Record<string, unknown>) => {
@@ -88,19 +91,22 @@ function bridge(opts: {
     resolveActiveTabId: () => TAB,
     refreshWorkflowUuid: () => true,
     workflowUuidFor: () => ({ known: true, uuid: SAME_UUID }),
-    tabCanMutateGraph: () => opts.canMutate !== false,
-    tabGraphMutationCapability: () => ({
-      known: true,
-      canMutate: opts.canMutate !== false,
-      ...(opts.canMutate === false ? { because: "capability" as const } : {}),
-    }),
+    tabCanMutateGraph: () => (opts.canMutate === "unknown" ? undefined : opts.canMutate !== false),
+    tabGraphMutationCapability: () =>
+      opts.canMutate === "unknown"
+        ? { known: false }
+        : {
+            known: true,
+            canMutate: opts.canMutate !== false,
+            ...(opts.canMutate === false ? { because: "capability" as const } : {}),
+          },
   } as unknown as PanelToolCtx["bridge"];
 }
 
 async function setTargetCurrent(opts: {
   activeUuid: string;
   graphRead: "ok" | "mismatch" | "timeout";
-  canMutate?: boolean;
+  canMutate?: boolean | "unknown";
 }) {
   const ctx = makePanelToolCtx(bridge(opts), TAB, new WorkflowTargetStore());
   const def = buildPanelToolDefs().find((d) => d.name === "panel_set_workflow_target");
@@ -114,28 +120,43 @@ beforeEach(() => {
 });
 
 describe("an UNCONFIRMED record whose uuid matches the fence gets its answer up front (#1473)", () => {
-  it("probes a graph read and reports what it found", async () => {
+  it("reports BOUND when the settling read passes and writes are accepted (panel#980)", async () => {
     const out = await setTargetCurrent({ activeUuid: SAME_UUID, graphRead: "ok" });
 
     // The probe really ran — without this the assertions could pass on a branch that
     // simply stopped failing, which would be a claim rather than a measurement.
     expect(sent).toContain("graph_query");
 
-    // STILL A FAILURE, and that is #1401's reasoned call, not an oversight: "softening the
-    // DIAGNOSIS must not soften the RESULT — the rebind genuinely did not happen." It did
-    // not. What changed is that the caller learns, in this reply, that nothing is broken —
-    // instead of discovering it one call later.
+    // The flip #1473 left open: an ACCEPTED stamped read plus confirmed write capability
+    // is binding health measured directly, so the false-negative failure is gone.
+    expect(out.isError).toBe(false);
+    expect(out.text).toMatch(/"graph_binding":\s*"bound"/);
+    expect(out.text).toMatch(/ACCEPTED by the panel/);
+    expect(out.text).toMatch(/did not need to be/);
+    // No residue of the old verdict: neither the failure headline nor the homework.
+    expect(out.text).not.toMatch(/did NOT restore/);
+    expect(out.text).not.toMatch(/call panel_graph_outline/);
+    // The disclosure survives the flip: the rebind itself still did not happen, and the
+    // proof's scope is stated as one read, not a general promise.
+    expect(out.text).toMatch(/nothing was adopted/);
+    expect(out.text).toMatch(/one read a moment ago/);
+  });
+
+  it("stays a FAILURE when the read passes but write capability is UNKNOWN", async () => {
+    // The gate is canMutateNow === true, not "not observed to refuse". An unanswerable
+    // capability probe must not be rounded up to BOUND — that would report mutation
+    // readiness nobody measured.
+    const out = await setTargetCurrent({
+      activeUuid: SAME_UUID,
+      graphRead: "ok",
+      canMutate: "unknown",
+    });
+
+    expect(sent).toContain("graph_query");
     expect(out.isError).toBe(true);
+    expect(out.text).toMatch(/did NOT restore/);
     expect(out.text).toMatch(/CHECKED FOR YOU/);
     expect(out.text).toMatch(/it SUCCEEDED/);
-    expect(out.text).toMatch(/did not reject THAT command/);
-    expect(out.text).toMatch(/evidence of a reconciliation race/);
-    // ONE observation stated as one: no generalisation to every command (codex r2).
-    expect(out.text).toMatch(/not a\s+guarantee about the next command/);
-    expect(out.text).not.toMatch(/READS work/);
-    expect(out.text).toMatch(/Nothing suggests a recovery step is needed/);
-    // And it does not overclaim: the rebind itself is still reported as not having happened.
-    expect(out.text).toMatch(/rebind itself still did not happen/);
   });
 
   it("keeps the failure when the graph read is REFUSED", async () => {

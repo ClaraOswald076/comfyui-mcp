@@ -11767,7 +11767,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // target write DID happen, so the outcome is DISCLOSED either way — never
         // retracted as if nothing had been applied — but when the graph binding was NOT
         // restored the result is an ERROR, because "your recovery worked" is the one
-        // thing it must never say when it did not. `graph_binding` carries the same
+        // thing it must never say when it did not. The single exception is measured,
+        // not inferred (panel#980, below): a fence the panel just ACCEPTED a stamped
+        // read against, on a tab whose write capability is confirmed, was never
+        // unrestored. `graph_binding` carries the same
         // verdict machine-readably, and `graph_binding_status` the specific cause, so a
         // caller never has to infer four different remedies from one sentence.
         // A stamp is necessary but not sufficient for a graph EDIT — the panel build
@@ -11823,14 +11826,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // So the read is taken here, on the matching-uuid path ONLY, and its ANSWER is put
         // in the message.
         //
-        // THE RESULT STILL REPORTS FAILURE, deliberately, and that is #1401's call not
-        // mine: "softening the DIAGNOSIS must not soften the RESULT — the rebind genuinely
-        // did not happen". It did not. What changes is that the caller no longer has to
-        // discover, one call later, that nothing was wrong: the answer arrives with the
-        // refusal instead of after it. Whether this should become a SUCCESS is a real
-        // product question and a reversal of a reasoned decision, so it is raised on the
-        // issue rather than decided here.
+        // THE RESULT below is decided by what the probe OBSERVED. #1401's call —
+        // "softening the DIAGNOSIS must not soften the RESULT" — still holds for every
+        // outcome but one: panel#980's recurrence showed that a settling read the fence
+        // ACCEPTED, on a session whose write capability is likewise confirmed, is a
+        // false negative wearing #1401's caution (the reporters' mutations succeeded
+        // immediately after the error). That one shape flips to BOUND below, on the
+        // exact gate #1473's discussion scoped — probe passed AND writes accepted.
+        // Every other outcome keeps the failure, with the probe's answer inside it.
         let settledNote = "";
+        let probePassed = false;
         if (fence && fence.binding === "not_recovered" && fence.settleByRead) {
           // WHAT THE PROBE PROVES, AND ONLY THAT (codex).
           //
@@ -11859,6 +11864,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             probeRefused = isWorkflowInstanceMismatch(err);
           }
           if (probeOk) {
+            probePassed = true;
             settledNote =
               // ONE OBSERVATION, STATED AS ONE (codex r2). A passing graph_query proves that
               // read passed this fence just now — not that every command will, and not that
@@ -11878,8 +11884,8 @@ CHECKED FOR YOU: the graph read this message prescribes was just run — a ` +
                   `change it.`
                 : ` Nothing suggests a recovery step is needed for the binding; the next graph ` +
                   `command is still the authority.`) +
-              ` (The rebind itself still did not happen, which is why this is reported as a ` +
-              `failure.)`;
+              ` (The rebind itself still did not happen, and with graph EDITS not confirmed ` +
+              `on this tab the result stays a failure.)`;
           } else if (probeRefused === true) {
             settledNote =
               `
@@ -11893,6 +11899,43 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           // in either direction.
         }
         if (fence && fence.binding === "not_recovered") {
+          // panel#980 — the flip #1473 left open, on the gate its discussion scoped.
+          // The rebind genuinely did not happen — but on this shape nothing NEEDED
+          // to: the fence this session already holds was just proven live twice over.
+          // The identity the panel reported equals it, and a read stamped with it was
+          // ACCEPTED by the panel — the binding-health question itself, measured
+          // rather than inferred. Reporting that as "did NOT restore the graph
+          // binding" is the false negative the recurrences kept hitting. The write
+          // half is not waved through on the read: BOUND requires canMutateNow ===
+          // true, so a read-only or unknown-capability panel keeps the failure below.
+          if (probePassed && canMutateNow === true) {
+            // fenceStillMatches guarantees a held uuid, but read it defensively: a
+            // missing value must degrade to an unnamed fence, never print "undefined".
+            const heldUuid =
+              fenceRebind && fenceRebind.status === "no_identity" && fenceRebind.before.known
+                ? fenceRebind.before.uuid
+                : undefined;
+            return ok({
+              ...target,
+              graph_binding: "bound",
+              ...(fenceRebind ? { graph_binding_status: fenceRebind.status } : {}),
+              note:
+                hint +
+                rebindNote +
+                ` The graph binding was NOT re-derived (the panel's active reply could ` +
+                `not be corroborated, so nothing was adopted) — and it did not need to ` +
+                `be: the identity the panel reported equals the fence this session ` +
+                `already holds${heldUuid ? ` (${heldUuid})` : ""}, and a graph read ` +
+                `stamped with that fence was just run ` +
+                `and ACCEPTED by the panel. That acceptance is the binding-health ` +
+                `question itself, so this session is reported BOUND: graph reads pass ` +
+                `this fence, and the write-fence capability probe reports this tab ` +
+                `accepting edits. The proof is one read a moment ago — if the user ` +
+                `switched tabs in the instant since, the next graph command fails ` +
+                `closed with a fresh instance mismatch, safe and cleared by calling ` +
+                `this again.`,
+            });
+          }
           return fail(
             `panel_set_workflow_target({mode:"current"}) did NOT restore this session's graph ` +
               `binding.\n\nAPPLIED (do not repeat this part): the workflow target is now ` +
