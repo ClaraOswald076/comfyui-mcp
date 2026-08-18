@@ -513,6 +513,49 @@ describe("upload_image: each action writes to exactly one destination", () => {
     expect(uploadAudioAutoMock).not.toHaveBeenCalled();
     expect(uploadOutputMock).not.toHaveBeenCalled();
   });
+
+  it('action:"image" reports the SUBFOLDER-qualified reference when the upload landed in one (#946)', async () => {
+    // The recurrence: filename "minimax_h3/walter_ropeflow_clip1_end.png"
+    // uploaded fine, but the tool answered with the bare name — which does not
+    // resolve in a loader, because the file sits in input/minimax_h3/. The
+    // reported reference must be the path a loader accepts.
+    uploadImageAutoMock.mockResolvedValue({
+      filename: "walter_ropeflow_clip1_end.png",
+      subfolder: "minimax_h3",
+    });
+    const res = await uploadImage()({
+      action: "image",
+      source_path: "/tmp/a.png",
+      filename: "minimax_h3/walter_ropeflow_clip1_end.png",
+    });
+    const t = text(res);
+    expect(t).toContain("Filename: minimax_h3/walter_ropeflow_clip1_end.png");
+    expect(t).toContain('Use "minimax_h3/walter_ropeflow_clip1_end.png"');
+    expect(t).not.toContain('Use "walter_ropeflow_clip1_end.png"');
+  });
+
+  it('action:"video" keeps the bare reference when there is no subfolder (unchanged)', async () => {
+    uploadVideoAutoMock.mockResolvedValue({ filename: "in.mp4", subfolder: "" });
+    const res = await uploadImage()({ action: "video", source_path: "/tmp/a.mp4" });
+    expect(text(res)).toContain('Use "in.mp4"');
+  });
+
+  it('action:"stage" reports the qualified reference when as_filename carried a path', async () => {
+    stageOutputAsInputMock.mockResolvedValue({
+      filename: "staged.png",
+      subfolder: "assets",
+      type: "input",
+      kind: "image",
+    });
+    const res = await uploadImage()({
+      action: "stage",
+      filename: "out.png",
+      as_filename: "assets/staged.png",
+    });
+    const t = text(res);
+    expect(t).toContain('Use "assets/staged.png"');
+    expect(t).toContain('panel_set_widget the loader\'s widget to "assets/staged.png"');
+  });
 });
 
 describe("per-action requiredness is enforced in the handler and NAMES the field", () => {

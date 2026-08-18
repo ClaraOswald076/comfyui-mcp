@@ -231,7 +231,7 @@ Put a file where ComfyUI (or cloud storage) can read it. Driven by the `action` 
   Absolute path to the local file to upload. REQUIRED for actions "image", "video" and "audio".
 </ParamField>
 <ParamField path="filename" type="string">
-  Two meanings, one per action. actions "image"/"video"/"audio" — OPTIONAL override for the filename in ComfyUI's input/ directory (auto-detected from source_path if omitted). action:"stage" — REQUIRED filename of the EXISTING output/temp asset to re-register (from get_history or get_image action:"list_outputs"), e.g. LTX_video_00001.mp4; its destination name override is `as_filename`, not this field.
+  Two meanings, one per action. actions "image"/"video"/"audio" — OPTIONAL override for the filename in ComfyUI's input/ directory (auto-detected from source_path if omitted). A path prefix (e.g. assets/clip.mp4) places the upload in that SUBFOLDER of input/ — ".." is refused — and the returned filename reference includes the subfolder, since loaders need the qualified path. action:"stage" — REQUIRED filename of the EXISTING output/temp asset to re-register (from get_history or get_image action:"list_outputs"), e.g. LTX_video_00001.mp4; its destination name override is `as_filename`, not this field.
 </ParamField>
 <ParamField path="subfolder" type="string">
   action:"stage" — subfolder the source asset currently lives in, if any.

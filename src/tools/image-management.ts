@@ -877,7 +877,7 @@ export function registerImageManagementTools(server: McpServer): void {
         .string()
         .optional()
         .describe(
-          'Two meanings, one per action. actions "image"/"video"/"audio" — OPTIONAL override for the filename in ComfyUI\'s input/ directory (auto-detected from source_path if omitted). action:"stage" — REQUIRED filename of the EXISTING output/temp asset to re-register (from get_history or get_image action:"list_outputs"), e.g. LTX_video_00001.mp4; its destination name override is `as_filename`, not this field.',
+          'Two meanings, one per action. actions "image"/"video"/"audio" — OPTIONAL override for the filename in ComfyUI\'s input/ directory (auto-detected from source_path if omitted). A path prefix (e.g. assets/clip.mp4) places the upload in that SUBFOLDER of input/ — ".." is refused — and the returned filename reference includes the subfolder, since loaders need the qualified path. action:"stage" — REQUIRED filename of the EXISTING output/temp asset to re-register (from get_history or get_image action:"list_outputs"), e.g. LTX_video_00001.mp4; its destination name override is `as_filename`, not this field.',
         ),
       subfolder: z
         .string()
@@ -948,13 +948,21 @@ export function registerImageManagementTools(server: McpServer): void {
               "the absolute path of the local file to upload",
             );
             const result = await fn(sourcePath, args.filename);
+            // #946 recurrence: when the filename override carried a path, the
+            // file landed in that SUBFOLDER of input/ — and the bare name the
+            // old text returned did not resolve in a loader (FileNotFoundError
+            // on input/<name>). The reference a loader accepts is the
+            // subfolder-qualified path, so that is what we hand back.
+            const reference = result.subfolder
+              ? `${result.subfolder}/${result.filename}`
+              : result.filename;
             return {
               content: [
                 {
                   type: "text" as const,
                   text:
-                    `Uploaded via HTTP.\n\nFilename: ${result.filename}\n\n` +
-                    `Use "${result.filename}" ${nodeHint}.`,
+                    `Uploaded via HTTP.\n\nFilename: ${reference}\n\n` +
+                    `Use "${reference}" ${nodeHint}.`,
                 },
               ],
             };
@@ -981,20 +989,26 @@ export function registerImageManagementTools(server: McpServer): void {
                 : staged.kind === "audio"
                   ? "the audio input in LoadAudio (or similar)"
                   : "the `image` input in LoadImage";
+            // Same #946 rule as the local uploads above: an as_filename with a
+            // path lands in a subfolder, and the loader reference is the
+            // subfolder-qualified path — the bare filename does not resolve.
+            const stagedRef = staged.subfolder
+              ? `${staged.subfolder}/${staged.filename}`
+              : staged.filename;
             return {
               content: [
                 {
                   type: "text" as const,
                   text:
                     `Staged ${staged.kind} output as input via the server API.\n\n` +
-                    `Input filename: ${staged.filename}\n` +
+                    `Input filename: ${stagedRef}\n` +
                     `subfolder: ${staged.subfolder || "(none)"}\n` +
                     `type: ${staged.type}\n\n` +
-                    `Use "${staged.filename}" as ${loaderHint}.\n\n` +
+                    `Use "${stagedRef}" as ${loaderHint}.\n\n` +
                     `NOTE: the open ComfyUI tab's loader dropdown was populated at page-load, ` +
                     `so this just-registered input is not in it yet — call panel_refresh_nodes ` +
                     `first (it re-pulls /object_info so the new file becomes selectable), THEN ` +
-                    `panel_set_widget the loader's widget to "${staged.filename}". ` +
+                    `panel_set_widget the loader's widget to "${stagedRef}". ` +
                     `(panel_set_widget also self-refreshes on a rejected value, so a single ` +
                     `retry after panel_refresh_nodes will always accept it.)`,
                 },

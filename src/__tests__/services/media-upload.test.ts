@@ -41,6 +41,7 @@ vi.mock("../../comfyui/client.js", () => ({
 
 import { config } from "../../config.js";
 import {
+  uploadImageAuto,
   uploadVideoAuto,
   uploadVideoLocal,
   uploadAudioAuto,
@@ -134,6 +135,53 @@ describe("uploadVideoLocal / uploadAudioLocal (filesystem)", () => {
       ValidationError,
     );
     expect(copyFileMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("upload subfolder propagation (#946 recurrence)", () => {
+  // A filename override carrying a path ("minimax_h3/clip1_end.png") is a
+  // subfolder request: the server stores the file UNDER that subfolder and
+  // answers { name, subfolder }. Dropping the subfolder here handed the caller
+  // a bare name that did not resolve — queuing a loader failed with
+  // FileNotFoundError for input/<name> while the file sat in input/minimax_h3/.
+  it("uploadVideoAuto returns the subfolder alongside the stored name", async () => {
+    uploadImageHttpMock.mockResolvedValueOnce({
+      name: "clip1_end.mp4",
+      subfolder: "minimax_h3",
+      type: "input",
+    });
+    const r = await uploadVideoAuto("/src/clip1_end.mp4", "minimax_h3/clip1_end.mp4");
+    expect(r).toEqual({ filename: "clip1_end.mp4", subfolder: "minimax_h3" });
+  });
+
+  it("uploadImageAuto returns the subfolder alongside the stored name", async () => {
+    uploadImageHttpMock.mockResolvedValueOnce({
+      name: "frame.png",
+      subfolder: "assets",
+      type: "input",
+    });
+    const r = await uploadImageAuto("/src/frame.png", "assets/frame.png");
+    expect(r).toEqual({ filename: "frame.png", subfolder: "assets" });
+  });
+
+  it("defaults the subfolder to '' when the server omits it", async () => {
+    uploadImageHttpMock.mockResolvedValueOnce({ name: "in.png" });
+    const r = await uploadImageAuto("/src/in.png");
+    expect(r).toEqual({ filename: "in.png", subfolder: "" });
+  });
+
+  it("passes the path-shaped override through to the transport, which owns the split", async () => {
+    uploadImageHttpMock.mockResolvedValueOnce({
+      name: "clip.mp4",
+      subfolder: "assets",
+      type: "input",
+    });
+    await uploadVideoAuto("/src/clip.mp4", "assets/clip.mp4");
+    expect(uploadImageHttpMock).toHaveBeenCalledWith(
+      "assets/clip.mp4",
+      expect.any(Buffer),
+      "video/mp4",
+    );
   });
 });
 
