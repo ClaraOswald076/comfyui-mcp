@@ -86,7 +86,7 @@ handles auth:
 | Model | CivitAI |
 |---|---|
 | RedCraft RedZ ImageDX | `civitai.com/models/958009` |
-| (2027494 entry in model-settings.json) | `civitai.com/models/2027494` |
+| Qwen Ultimate Realism v1.1 | `civitai.com/models/2027494` |
 | Copax Timeless | `civitai.com/models/copaxTimeless` (search by name) |
 
 ## Failure modes

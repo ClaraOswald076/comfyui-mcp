@@ -16,8 +16,6 @@
     "packs",
     "scripts",
     "docker",
-    "model-settings.json",
-    "model-settings.user.jsonc.example",
     "docs/design/tool-surface.txt",
     "docs/design/panel-surface.txt"
   ],
@@ -49,7 +47,6 @@
     "packs:check-urls": "node scripts/check-model-urls.mjs",
     "packs:check-models": "node scripts/check-pack-models.mjs",
     "packs:verify-render": "node scripts/verify-render.mjs",
-    "postinstall": "node scripts/postinstall.mjs",
     "generations:stats": "node scripts/generation-stats.mjs",
     "release": "npm version patch && git push --follow-tags",
     "release:minor": "npm version minor && git push --follow-tags",

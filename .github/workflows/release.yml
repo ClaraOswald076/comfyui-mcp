@@ -54,9 +54,9 @@ jobs:
           fi
 
       # Gate the publish on a real install of the packed tarball: catches a
-      # broken postinstall / missing-file packaging regression (e.g. 0.17.0,
-      # where the files allowlist dropped scripts/ but postinstall still ran
-      # node scripts/postinstall.mjs) BEFORE it reaches npm.
+      # missing-file packaging regression (e.g. 0.17.0, where the files
+      # allowlist dropped scripts/ while a lifecycle script still pointed into
+      # it) BEFORE it reaches npm.
       - name: Pack & install smoke
         run: node scripts/smoke-install.mjs
 

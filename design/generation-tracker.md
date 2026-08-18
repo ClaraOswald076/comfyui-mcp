@@ -58,7 +58,7 @@ CREATE TABLE generations (
   model_family  TEXT    NOT NULL,  -- 'qwen_image', 'sdxl', 'flux', etc.
   model_hash    TEXT    NOT NULL,  -- AutoV2 (first 10 chars of SHA256) of checkpoint/unet
   model_name    TEXT,              -- checkpoint/unet filename (for full-text search, not part of hash)
-  preset_name   TEXT,              -- from model-settings.json, or 'custom'
+  preset_name   TEXT,              -- reserved; never assigned today
 
   -- Sampler settings
   sampler       TEXT    NOT NULL,
@@ -209,9 +209,10 @@ LIMIT 10;
 ```
 
 The advisor returns the top settings to the LLM as context, letting it
-suggest proven combos to the user. Combined with model-settings.json presets,
-this creates a feedback loop: defaults → user experiments → local tracking →
-better suggestions.
+suggest proven combos to the user. This creates a feedback loop: defaults →
+user experiments → local tracking → better suggestions. (The companion
+`model-settings.json` preset library sketched here was never wired to a
+loader and was removed in #1597.)
 
 ---
 

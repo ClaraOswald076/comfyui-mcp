@@ -100,7 +100,7 @@ jobs:
       - run: npm ci
       - run: npm run build
       # Packs the tarball exactly as `npm publish` would, installs it into a
-      # clean project (running the postinstall hook), and boots the entrypoint —
-      # catches packaging regressions (e.g. a files allowlist dropping a file the
-      # postinstall hook needs) that unit tests can't see.
+      # clean project, and boots the entrypoint — catches packaging regressions
+      # (e.g. a files allowlist dropping a file the runtime needs) that unit
+      # tests can't see.
       - run: node scripts/smoke-install.mjs

@@ -41,7 +41,7 @@ src/
   comfyui/      # ComfyUI client + workflow types
   utils/        # errors, logger, shared helpers
   __tests__/    # vitest tests, mirroring the source path
-scripts/        # build/docs/util scripts (gen-tool-docs.ts, postinstall.mjs, …)
+scripts/        # build/docs/util scripts (gen-tool-docs.ts, smoke-install.mjs, …)
 docs/           # Mintlify docs site (tool reference is GENERATED — see below)
 plugin/         # the Claude Code plugin (skills, agents, slash commands, hooks)
 ```

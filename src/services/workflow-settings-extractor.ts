@@ -306,7 +306,7 @@ export async function extractSettings(
     modelFamily,
     modelHash,
     modelName,
-    presetName: null, // Could be inferred from model-settings.json match in the future
+    presetName: null, // Reserved; nothing assigns preset names today
     sampler,
     scheduler,
     steps,
