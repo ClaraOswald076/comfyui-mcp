@@ -155,8 +155,10 @@ describe("sessions are orchestrator-scoped, never workflow-scoped (#884)", () =>
     // and a mid-less (non-panel/legacy) message gets a SYNTHETIC one, so both
     // pin/stamp through the same dequeue path (gate 3: the old
     // apply-at-receipt-while-idle shortcut left a mid-less message queued
-    // behind a busy turn with no origin at all).
-    expect(src).toContain("userMid ?? turnOrigins.mintInjectionOrigin(event.tab_id);");
+    // behind a busy turn with no origin at all). The synthetic mid is marked
+    // `userMessage: true` (#1001): the REQUEST is still the user's, so a mixed
+    // batch containing it fails closed rather than inheriting.
+    expect(src).toContain("userMid ?? turnOrigins.mintInjectionOrigin(event.tab_id, { userMessage: true });");
     expect(src).toContain(
       "turnOrigins.recordForMid(userMid, tabCommandWorkflowUuid.get(event.tab_id), event.tab_id);",
     );

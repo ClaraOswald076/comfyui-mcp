@@ -5400,8 +5400,11 @@ export async function runPanelOrchestrator(): Promise<void> {
     // BEHIND a busy turn with no origin at all, so its own turn later routed
     // to whatever tab was active). Panels ignore seen-acks for unknown mids,
     // exactly as with the evt- mids injected events already ride.
+    // `userMessage: true` (#1001): the mid is synthetic but the REQUEST is the
+    // user's, so a mixed batch containing it must still fail closed — only
+    // genuine orchestrator-injected events get the notification treatment.
     const dispatchMid =
-      userMid ?? turnOrigins.mintInjectionOrigin(event.tab_id);
+      userMid ?? turnOrigins.mintInjectionOrigin(event.tab_id, { userMessage: true });
     if (userMid) {
       turnOrigins.recordForMid(userMid, tabCommandWorkflowUuid.get(event.tab_id), event.tab_id);
     }

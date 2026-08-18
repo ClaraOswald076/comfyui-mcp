@@ -392,6 +392,113 @@ describe("TurnOriginTracker — inherited origins for tab-less turns (gate 3, P1
   });
 });
 
+describe("TurnOriginTracker — an ALL-INJECTED multi-origin batch inherits, never wedges (#1001)", () => {
+  // The recurrence #1047 could not reach: journaled run completions / ask
+  // answers from SEVERAL workflows replay into ONE turn at a delivery
+  // opportunity (a fresh spawn, a reconnect sweep). Each origin is genuine,
+  // but the batch is a stack of NOTIFICATIONS — no user request rides it, so
+  // there is nothing to launder onto the wrong tab. Failing it closed wedged
+  // every scope-addressed graph tool with "issued from multiple workflows at
+  // once" until a manual panel_set_workflow_target rebind (mcp 0.50.52, again
+  // on 0.51.38).
+  it("re-delivered events from two workflows in ONE turn inherit the last established origin", async () => {
+    const { tracker, warnings } = makeTracker();
+    // An earlier user turn established the conversation's origin…
+    tracker.recordForMid("m-user", "uuid-c", "tab-c");
+    tracker.onSeen(KEY, "m-user");
+    await flushMicrotasks();
+    tracker.turnEnded(KEY);
+    // …then completions journaled under two OTHER tabs replay together.
+    const e1 = tracker.mintInjectionOrigin("tab-a");
+    const e2 = tracker.mintInjectionOrigin("tab-b");
+    tracker.onSeen(KEY, e1);
+    tracker.onSeen(KEY, e2);
+    await flushMicrotasks();
+    // No refusal, no arbitrary pick between a and b — the turn routes and
+    // stamps from the conversation's established context, and says so.
+    expect(tracker.pinOf(KEY)).toBe("tab-c");
+    expect(tracker.stampOf(KEY)).toBe("uuid-c");
+    expect(warnings.join("\n")).toMatch(/re-delivered events from 2 workflows/);
+  });
+
+  it("with NO established origin, a multi-workflow event replay still REFUSES (fail closed preserved)", async () => {
+    const { tracker, warnings } = makeTracker();
+    const e1 = tracker.mintInjectionOrigin("tab-a");
+    const e2 = tracker.mintInjectionOrigin("tab-b");
+    tracker.onSeen(KEY, e1);
+    tracker.onSeen(KEY, e2);
+    await flushMicrotasks();
+    expect(tracker.pinOf(KEY)).toBeNull();
+    expect(tracker.stampOf(KEY)).toBeUndefined();
+    expect(warnings.join("\n")).toMatch(/no user origin.*no established prior origin/);
+  });
+
+  it("a SINGLE-tab injected batch still pins its own tab (the run-error gate is untouched)", async () => {
+    const { tracker } = makeTracker();
+    tracker.recordForMid("m-user", "uuid-c", "tab-c");
+    tracker.onSeen(KEY, "m-user");
+    await flushMicrotasks();
+    tracker.turnEnded(KEY);
+    // One origin, honestly identified: the turn pins IT, not the established
+    // origin — "a run error on tab A must pin A" (confirming gate 2, P0).
+    const e1 = tracker.mintInjectionOrigin("tab-a");
+    tracker.onSeen(KEY, e1);
+    await flushMicrotasks();
+    expect(tracker.pinOf(KEY)).toBe("tab-a");
+  });
+
+  it("a USER message mixed with another tab's injected event still fails BOTH closed — the laundering P0 is untouched", async () => {
+    const { tracker, warnings } = makeTracker();
+    tracker.recordForMid("m-user", "uuid-a", "tab-a");
+    const e1 = tracker.mintInjectionOrigin("tab-b");
+    tracker.onSeen(KEY, "m-user");
+    tracker.onSeen(KEY, e1);
+    await flushMicrotasks();
+    expect(tracker.pinOf(KEY)).toBeNull();
+    expect(tracker.stampOf(KEY)).toBeUndefined();
+    expect(warnings.join("\n")).toMatch(/mixed\/unknown-origin/);
+  });
+
+  it("a mid-less USER message (synthetic mid, userMessage:true) mixed with another tab's event also fails closed", async () => {
+    // index.ts mints a synthetic origin mid for a mid-less user message; the
+    // mid is synthetic but the REQUEST is the user's, so it must count as a
+    // user contribution — otherwise two mid-less user messages from different
+    // tabs would inherit instead of refusing, re-opening the laundering P0.
+    const { tracker, warnings } = makeTracker();
+    const mUser = tracker.mintInjectionOrigin("tab-a", { userMessage: true });
+    const e1 = tracker.mintInjectionOrigin("tab-b");
+    tracker.onSeen(KEY, mUser);
+    tracker.onSeen(KEY, e1);
+    await flushMicrotasks();
+    expect(tracker.pinOf(KEY)).toBeNull();
+    expect(tracker.stampOf(KEY)).toBeUndefined();
+    expect(warnings.join("\n")).toMatch(/mixed\/unknown-origin/);
+  });
+
+  it("a RE-QUEUED injected event keeps its injected marking — a replay batch still inherits", async () => {
+    // interrupt + send-now restores the original queue items, so the same mid
+    // dequeues again from appliedTurnMids. The re-application must not turn
+    // the notification into a user contribution.
+    const { tracker } = makeTracker();
+    tracker.recordForMid("m-user", "uuid-c", "tab-c");
+    tracker.onSeen(KEY, "m-user");
+    await flushMicrotasks();
+    tracker.turnEnded(KEY);
+    const e1 = tracker.mintInjectionOrigin("tab-a");
+    const e2 = tracker.mintInjectionOrigin("tab-b");
+    tracker.onSeen(KEY, e1);
+    tracker.onSeen(KEY, e2);
+    await flushMicrotasks();
+    tracker.turnEnded(KEY);
+    // Both mids dequeue AGAIN (re-queue) — still an all-injected batch.
+    tracker.onSeen(KEY, e1);
+    tracker.onSeen(KEY, e2);
+    await flushMicrotasks();
+    expect(tracker.pinOf(KEY)).toBe("tab-c");
+    expect(tracker.stampOf(KEY)).toBe("uuid-c");
+  });
+});
+
 describe("TurnOriginTracker — origins are BACKEND-BOUND (gate 3, P0)", () => {
   it("a queued event whose tab switched provider before dequeue fails the turn closed, not pinned", async () => {
     const { tracker, tabBackends, tabUuids, warnings } = makeTracker();

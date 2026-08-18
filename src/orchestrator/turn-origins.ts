@@ -13,7 +13,9 @@
 // asserted source strings against index.ts and could not fail):
 //   - per-mid issue-time origins (recorded at receipt, applied at DEQUEUE);
 //   - the dispatch-batch aggregation (one turn may batch several messages; only
-//     an AGREEING batch pins/stamps — mixed or unknown fails closed);
+//     an AGREEING batch pins/stamps — a mixed batch with a user message, or an
+//     unknown origin, fails closed; an all-injected mixed batch inherits the
+//     last established origin, #1001);
 //   - the turn-target pin + issue-time stamp + last-established origin;
 //   - the explicit-repin recovery and the scope target resolver the UiBridge
 //     consults (built here so tests drive the REAL handlers, not test stand-ins).
@@ -54,6 +56,14 @@ interface MidOrigin {
   /** The backend `tab` belonged to when this origin was recorded — verified
    *  again at dequeue (confirming gate 3, P0). */
   backend: string;
+  /** True when the origin rides an orchestrator-INJECTED event (a run
+   *  completion, an ask answer, a panel event) rather than a USER message.
+   *  The distinction decides what a multi-origin batch means at close (#1001):
+   *  mixed USER messages carry requests that must never be laundered onto one
+   *  tab (fail closed); a batch of injected NOTIFICATIONS carries no request
+   *  at all, so it inherits the conversation's last established origin
+   *  instead of wedging scope routing until a manual rebind. */
+  injected: boolean;
 }
 
 interface PendingBatch {
@@ -65,6 +75,9 @@ interface PendingBatch {
    *  judged on THIS set, so a save's tmp:→wf: rename does not read as two
    *  workflows (see onSeen). */
   routes: Set<string>;
+  /** At least one contribution came from a USER message (not an injected
+   *  event). Only then does a multi-route batch fail closed (#1001). */
+  user: boolean;
   unknown: boolean;
 }
 
@@ -134,9 +147,11 @@ export class TurnOriginTracker {
 
   /** Record a message's issue-time origin, keyed by its mid, to be applied at
    *  dequeue. Captures the tab's backend NOW so the application can verify the
-   *  tab still belongs to the same conversation then. */
-  recordForMid(mid: string, uuid: string | undefined, tab: string): void {
-    this.turnUuidByMid.set(mid, { uuid, tab, backend: this.deps.backendForTab(tab) });
+   *  tab still belongs to the same conversation then. `injected` marks an
+   *  orchestrator-minted EVENT origin (see MidOrigin.injected) — callers with a
+   *  real user mid leave it false. */
+  recordForMid(mid: string, uuid: string | undefined, tab: string, injected = false): void {
+    this.turnUuidByMid.set(mid, { uuid, tab, backend: this.deps.backendForTab(tab), injected });
     while (this.turnUuidByMid.size > TurnOriginTracker.TURN_UUID_BY_MID_CAP) {
       const oldest = this.turnUuidByMid.keys().next().value as string | undefined;
       if (oldest === undefined) break;
@@ -147,10 +162,15 @@ export class TurnOriginTracker {
   /** Origin for an orchestrator-side INJECTED turn (run errors, completions,
    *  ask answers, panel events): a synthetic mid rides the queue item so the
    *  dequeue fires onSeen and the injected turn pins/stamps like any user turn
-   *  (a run error on tab A must pin A — confirming gate 2, P0). */
-  mintInjectionOrigin(originTab: string): string {
+   *  (a run error on tab A must pin A — confirming gate 2, P0).
+   *
+   *  `userMessage: true` is for the one caller that mints a synthetic mid for a
+   *  mid-less USER message (rare: non-panel callers — index.ts): the origin is
+   *  synthetic but the REQUEST is the user's, so the batch must still treat it
+   *  as a user contribution — a mixed batch containing it fails closed (#1001). */
+  mintInjectionOrigin(originTab: string, opts?: { userMessage?: boolean }): string {
     const mid = `evt-${randomUUID()}`;
-    this.recordForMid(mid, this.deps.uuidOfTab(originTab), originTab);
+    this.recordForMid(mid, this.deps.uuidOfTab(originTab), originTab, opts?.userMessage !== true);
     return mid;
   }
 
@@ -188,16 +208,18 @@ export class TurnOriginTracker {
   /**
    * The agent dequeued a message — the true start of its turn. One dispatch may
    * batch SEVERAL messages: the batch's origins aggregate over a microtask and
-   * pin/stamp only when they AGREE — a mixed or unknown-origin batch fails
-   * closed (undefined stamp, null pin) instead of letting the last message
-   * re-aim the whole turn's mutations (codex rounds 2–3). A batch with NO
-   * origin contribution inherits the conversation's last established origin.
+   * pin/stamp only when they AGREE — a batch mixing USER messages from
+   * different tabs, or one with an unknown origin, fails closed (undefined
+   * stamp, null pin) instead of letting the last message re-aim the whole
+   * turn's mutations (codex rounds 2–3). A batch with NO user origin — an
+   * origin-less injected turn, or re-delivered events from several workflows
+   * (#1001) — inherits the conversation's last established origin.
    */
   onSeen(key: string, mid: string): void {
     let batch = this.pendingBatchStamp.get(key);
     const opensBatch = !batch;
     if (!batch) {
-      batch = { known: [], tabs: new Set<string>(), routes: new Set<string>(), unknown: false };
+      batch = { known: [], tabs: new Set<string>(), routes: new Set<string>(), user: false, unknown: false };
       this.pendingBatchStamp.set(key, batch);
     }
     // A mid's origin comes from the LIVE record (first dequeue) or the APPLIED
@@ -266,6 +288,11 @@ export class TurnOriginTracker {
         // closed — only the aliases of ONE tab collapse.
         batch.tabs.add(rec.tab);
         batch.routes.add(liveOrigin);
+        // #1001 — remember whether any contribution is a USER message. Only a
+        // user request can be laundered onto the wrong tab, so only a batch
+        // containing one fails closed on disagreement; an all-injected batch
+        // (re-delivered completions/answers/events) inherits instead.
+        if (!rec.injected) batch.user = true;
         this.turnUuidByMid.delete(mid);
         this.noteAppliedTurnMid(mid, rec); // keeps its origin for a re-queue
       }
@@ -281,11 +308,16 @@ export class TurnOriginTracker {
       queueMicrotask(() => {
         this.pendingBatchStamp.delete(key);
         const distinct = new Set(closed.known);
-        if (closed.unknown || closed.routes.size > 1) {
-          // Mixed/unknown-TAB batch: no single stamp or target is honest for
-          // it — fail BOTH closed (the bridge refuses routing; the panel fence
-          // refuses mutations) until an explicit target or the next
-          // single-origin message.
+        if (closed.unknown || (closed.routes.size > 1 && closed.user)) {
+          // Mixed/unknown-TAB batch involving a USER message: no single stamp
+          // or target is honest for it — fail BOTH closed (the bridge refuses
+          // routing; the panel fence refuses mutations) until an explicit
+          // target or the next single-origin message. The `user` qualifier is
+          // #1001: the laundering P0 this gate exists for is a user REQUEST
+          // re-aimed onto another tab's graph. A batch of orchestrator-
+          // INJECTED events carries no request — nothing to launder — so it
+          // falls through to the inherit branch below instead of wedging every
+          // scope-addressed tool until a manual rebind.
           this.lastTurnUuidByKey.set(key, undefined);
           this.turnTargetTabByKey.set(key, null);
           this.deps.warn(
@@ -303,24 +335,46 @@ export class TurnOriginTracker {
           this.turnTargetTabByKey.set(key, tab);
           this.lastOriginByKey.set(key, { tab, uuid });
         } else {
-          // NO origin contribution (a deliberately origin-less injected turn
-          // such as a coalesced download_done — re-queued items now contribute
-          // their own origin, see appliedTurnMids): the turn inherits the
-          // conversation's LAST ESTABLISHED origin — NEVER "whatever tab is
-          // active" (confirming gate 2, P0). The inherited tab must STILL
-          // belong to this conversation's backend (confirming gate 3, P0); no
-          // established/valid origin at all → refuse.
+          // NO user origin to pin on. Two shapes land here:
+          //
+          //   routes.size === 0 — a deliberately origin-less injected turn
+          //     (a coalesced download_done; re-queued items contribute their
+          //     own origin, see appliedTurnMids).
+          //
+          //   routes.size > 1, all injected — #1001: journaled run completions
+          //     / ask answers from SEVERAL workflows replayed into ONE turn at
+          //     a delivery opportunity (a fresh spawn, a reconnect sweep of
+          //     flushAllJournaledEvents). Each origin is real, but the batch is
+          //     a stack of NOTIFICATIONS, not a request — refusing here wedged
+          //     panel_graph_outline / panel_list_workflows / panel_get_errors
+          //     with "issued from multiple workflows at once" until a manual
+          //     panel_set_workflow_target rebind, on sessions with as few as
+          //     ONE live tab (observed on mcp 0.50.52 and again on 0.51.38).
+          //
+          // Both inherit the conversation's LAST ESTABLISHED origin — NEVER
+          // "whatever tab is active" (confirming gate 2, P0). The inherited tab
+          // must STILL belong to this conversation's backend (confirming gate
+          // 3, P0); no established/valid origin at all → refuse. A follow-up
+          // mutation stays honest: it is stamped with the inherited origin's
+          // issue-time uuid, so the panel fence (and the dispatch-time
+          // stamp-target agreement gate, #1656) refuse it loudly if the routed
+          // canvas is not the one the stamp names.
           const last = this.lastOriginByKey.get(key);
           if (last && this.deps.backendForTab(last.tab) === this.deps.backendOfKey(key)) {
             this.lastTurnUuidByKey.set(key, last.uuid);
             this.turnTargetTabByKey.set(key, last.tab);
+            if (closed.routes.size > 1) {
+              this.deps.warn(
+                `[panel-orchestrator] ${key} dispatched re-delivered events from ${closed.routes.size} workflows in one turn — no user message to pin on, so the turn inherits the conversation's last established origin (${last.tab.slice(0, 8)}) instead of refusing; name a workflow explicitly to work on one of the others (#1001)`,
+              );
+            }
           } else {
             this.lastTurnUuidByKey.set(key, undefined);
             this.turnTargetTabByKey.set(key, null);
             this.deps.warn(
               last
-                ? `[panel-orchestrator] ${key} dispatched an origin-less turn whose last established origin tab ${last.tab.slice(0, 8)} now belongs to another backend's conversation — scope routing FAILS CLOSED until an explicit target or an origin-bearing message (#884 confirming gate 3)`
-                : `[panel-orchestrator] ${key} dispatched a turn with no origin and no established prior origin — scope routing FAILS CLOSED until an explicit target or an origin-bearing message (#884)`,
+                ? `[panel-orchestrator] ${key} dispatched ${closed.routes.size > 1 ? "a multi-workflow event replay (#1001)" : "an origin-less turn"} whose last established origin tab ${last.tab.slice(0, 8)} now belongs to another backend's conversation — scope routing FAILS CLOSED until an explicit target or an origin-bearing message (#884 confirming gate 3)`
+                : `[panel-orchestrator] ${key} dispatched a turn with no ${closed.routes.size > 1 ? "user origin (a multi-workflow event replay, #1001) and no" : "origin and no"} established prior origin — scope routing FAILS CLOSED until an explicit target or an origin-bearing message (#884)`,
             );
           }
         }
