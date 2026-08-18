@@ -745,6 +745,27 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.1] - 2026-08-17
+
+### MCP
+
+#### Added
+- Grok 4.6 is now in the Agent Panel catalog (#1494)
+
+#### Fixed
+- re-delivered multi-workflow events inherit the established origin instead of wedging scope routing (#1685)
+- a timed-out clone's lingering git tree is killed so cleanup can remove the husk, and an existing husk is refused rather than reported installed (#1684)
+- a mid-session MCP drop is met with one bounded reconnect, reported either way (#1681)
+- a post-switch panel_* command whose stamp no longer names the routed tab's canvas is refused before dispatch (#1682)
+- restart relaunches the interpreter the healthy server was observed running under (#1680)
+- a landed file the core listing contractually omits is unconfirmed, never "not-visible" (#1679)
+- an unreadable parent PID degrades to a disclosed Desktop restart (#1677)
+- training runs no longer trip the hard stall floor while the server stays alive (#1676)
+- download_model action:"cancel" no longer asserts a live heartbeat it never probed (#1675)
+- resolve list_paths through the live root the OS can see (#1629)
+- Blind gates the Claude backend's native Read/WebFetch with a PreToolUse deny hook (#1643)
+
+
 ## [0.52.0] - 2026-08-17
 
 ### MCP
