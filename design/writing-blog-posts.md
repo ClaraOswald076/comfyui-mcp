@@ -213,7 +213,8 @@ Korean and Japanese are the template: every **guide** page, not tools/blog/chang
 2. Translate under the hard rules above. Do **one language per PR**.
 3. Expand that language in `docs.json` to the same two groups as English (Getting Started + Configuration). Never add `fa` to the switcher.
 4. Stop only when all three pass: `check:docs-locale <lang>`, `check:docs-links`, `check:docs-mdx`.
-5. After merge, `node scripts/check-docs-deployed.mjs <lang>`. A nav page that 404s stops the next wave.
+5. `npm run check:vocabulary` — the `using-tools` old-name → new-form table must keep **English cells** (identifiers). Add `allowedIn` rows in `src/tools/vocabulary.ts` for `docs/<lang>/using-tools.mdx` with the same context strings as `docs/using-tools.mdx`. Do not invent a glob.
+6. After merge, `node scripts/check-docs-deployed.mjs <lang>`. A nav page that 404s stops the next wave.
 
 Do not `/loop` the rest. The finish line is the gates plus a live URL, not "I wrote the files."
 

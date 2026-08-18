@@ -657,6 +657,16 @@ export const DEAD_NAMES: readonly DeadName[] = [
         why: "The old-name → new-form migration table on the human-facing tools guide. A community reader (#660-adjacent confusion) read the 0.49.0 consolidation as capability being REMOVED; the table exists to show the same behaviour under a new label, so the left column must spell the retired name. It is a mapping AWAY from the name, never an instruction to call it.",
       },
       {
+        path: "docs/ko/using-tools.mdx",
+        context: "| `get_workspace` | `workspace` with `action: \"get\"` |",
+        why: "Same migration table as docs/using-tools.mdx, in the Korean translation. Cells stay English (identifiers); only the surrounding prose is translated.",
+      },
+      {
+        path: "docs/ja/using-tools.mdx",
+        context: "| `get_workspace` | `workspace` with `action: \"get\"` |",
+        why: "Same migration table as docs/using-tools.mdx, in the Japanese translation. Cells stay English (identifiers); only the surrounding prose is translated.",
+      },
+      {
         path: "src/tools/retired-redirect.ts",
         context: '"Tool get_workspace not found"',
         why: "A verbatim quotation of MEASURED output: the three-row table in that module's header records what each call path actually answered on 0.49.0 for an already-retired name, which is the evidence the module exists at all. Quoting the SDK's bare 404 is the opposite of instructing anyone to call the name — it is the defect being removed. Deliberately the ONLY mention left in that file: the surrounding prose was reworded to say 'a name the 0.49.0 slices had already retired', and its test file derives the name from this ledger rather than spelling it, so this exemption covers one quoted line instead of seven comments. Pinned to the quotation because a quotation is the part least likely to be reworded — and if it IS reworded the gate should fire.",
@@ -705,6 +715,16 @@ export const DEAD_NAMES: readonly DeadName[] = [
         path: "docs/using-tools.mdx",
         context: "| `get_queue` | `queue` with `action: \"list\"` |",
         why: "Same migration table as get_workspace above — the retired name appears only in the left column, mapped to its live replacement on the right.",
+      },
+      {
+        path: "docs/ko/using-tools.mdx",
+        context: "| `get_queue` | `queue` with `action: \"list\"` |",
+        why: "Same migration table as docs/using-tools.mdx, Korean translation. Cells stay English.",
+      },
+      {
+        path: "docs/ja/using-tools.mdx",
+        context: "| `get_queue` | `queue` with `action: \"list\"` |",
+        why: "Same migration table as docs/using-tools.mdx, Japanese translation. Cells stay English.",
       },
     ],
   },
@@ -883,6 +903,16 @@ export const DEAD_NAMES: readonly DeadName[] = [
         path: "docs/using-tools.mdx",
         context: "| `apps_run_status` | `apps` with `action: \"run_status\"` |",
         why: "Same migration table as get_workspace above. Included as the third row because it is from a DIFFERENT consolidation slice, showing the reader that the pattern is general rather than one tool's quirk.",
+      },
+      {
+        path: "docs/ko/using-tools.mdx",
+        context: "| `apps_run_status` | `apps` with `action: \"run_status\"` |",
+        why: "Same migration table as docs/using-tools.mdx, Korean translation. Cells stay English.",
+      },
+      {
+        path: "docs/ja/using-tools.mdx",
+        context: "| `apps_run_status` | `apps` with `action: \"run_status\"` |",
+        why: "Same migration table as docs/using-tools.mdx, Japanese translation. Cells stay English.",
       },
     ],
   },
@@ -1124,6 +1154,16 @@ export const DEAD_NAMES: readonly DeadName[] = [
         path: "docs/using-tools.mdx",
         context: '| `install_workflow_dependencies` | `list_packs` with `action: "install_deps"` |',
         why: "The old-name → new-form migration table on the human-facing tools guide, same as the get_workspace/get_queue rows above. The left column must spell the retired name; it is a mapping AWAY from the name, never an instruction to call it.",
+      },
+      {
+        path: "docs/ko/using-tools.mdx",
+        context: '| `install_workflow_dependencies` | `list_packs` with `action: "install_deps"` |',
+        why: "Same migration table as docs/using-tools.mdx, Korean translation. Cells stay English.",
+      },
+      {
+        path: "docs/ja/using-tools.mdx",
+        context: '| `install_workflow_dependencies` | `list_packs` with `action: "install_deps"` |',
+        why: "Same migration table as docs/using-tools.mdx, Japanese translation. Cells stay English.",
       },
     ],
   },
@@ -1424,6 +1464,16 @@ export const DEAD_NAMES: readonly DeadName[] = [
         context: "| `validate_workflow` | `create_workflow` with `action: \"validate\"` |",
         why: "The old-name -> new-form migration table on the human-facing tools guide, the same row-per-retirement the get_workspace entry above documents. Readers watching the tool count fall read a consolidation as capability being REMOVED; the table exists to show the same behaviour under a new label, so the left column must spell the retired name. It is a mapping AWAY from the name, never an instruction to call it.",
       },
+      {
+        path: "docs/ko/using-tools.mdx",
+        context: "| `validate_workflow` | `create_workflow` with `action: \"validate\"` |",
+        why: "Same migration table as docs/using-tools.mdx, Korean translation. Cells stay English.",
+      },
+      {
+        path: "docs/ja/using-tools.mdx",
+        context: "| `validate_workflow` | `create_workflow` with `action: \"validate\"` |",
+        why: "Same migration table as docs/using-tools.mdx, Japanese translation. Cells stay English.",
+      },
     ],
   },
   {
@@ -1461,6 +1511,16 @@ export const DEAD_NAMES: readonly DeadName[] = [
         context: "| `list_workflows` | `get_workflow` with `action: \"list\"` |",
         why: "The old-name -> new-form migration table on the human-facing tools guide, the same row-per-retirement the get_workspace entry above documents. Readers watching the tool count fall read a consolidation as capability being REMOVED; the table exists to show the same behaviour under a new label, so the left column must spell the retired name. It is a mapping AWAY from the name, never an instruction to call it.",
       },
+      {
+        path: "docs/ko/using-tools.mdx",
+        context: "| `list_workflows` | `get_workflow` with `action: \"list\"` |",
+        why: "Same migration table as docs/using-tools.mdx, Korean translation. Cells stay English.",
+      },
+      {
+        path: "docs/ja/using-tools.mdx",
+        context: "| `list_workflows` | `get_workflow` with `action: \"list\"` |",
+        why: "Same migration table as docs/using-tools.mdx, Japanese translation. Cells stay English.",
+      },
     ],
   },
   {
@@ -1487,6 +1547,16 @@ export const DEAD_NAMES: readonly DeadName[] = [
         path: "docs/using-tools.mdx",
         context: "| `analyze_workflow` | `get_workflow` with `action: \"analyze\"` |",
         why: "The old-name -> new-form migration table on the human-facing tools guide, the same row-per-retirement the get_workspace entry above documents. Readers watching the tool count fall read a consolidation as capability being REMOVED; the table exists to show the same behaviour under a new label, so the left column must spell the retired name. It is a mapping AWAY from the name, never an instruction to call it.",
+      },
+      {
+        path: "docs/ko/using-tools.mdx",
+        context: "| `analyze_workflow` | `get_workflow` with `action: \"analyze\"` |",
+        why: "Same migration table as docs/using-tools.mdx, Korean translation. Cells stay English.",
+      },
+      {
+        path: "docs/ja/using-tools.mdx",
+        context: "| `analyze_workflow` | `get_workflow` with `action: \"analyze\"` |",
+        why: "Same migration table as docs/using-tools.mdx, Japanese translation. Cells stay English.",
       },
     ],
   },
