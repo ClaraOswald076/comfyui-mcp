@@ -19,6 +19,7 @@ import { realpath } from "node:fs/promises";
 import { extname, basename, dirname, join } from "node:path";
 import {
   downloadModel,
+  findResumablePartialForLocalDownload,
   liveListingHasEntry,
   managerJobFilename,
   resolveDownloadTarget,
@@ -1654,6 +1655,152 @@ function reclaimDeadPersistedDownload(
     }
   }
   return { reclaimed: true, staleRecordLeft: !removed };
+}
+
+/** One orphan a new session resumed — the report boot logs from. */
+export interface OrphanedDownloadAdoption {
+  /** The DEAD record's public id (the replacement job may key itself differently
+   *  when the destination re-resolves onto another root — the report names the
+   *  record that was adopted, not the new job). */
+  id: string;
+  trayId: string;
+  filename?: string;
+  /** Bytes found staged in the `.partial` the replacement writer resumes from. */
+  resumedBytes: number;
+  /** The replacement writer is running, but the dead owner's record file could not
+   *  be deleted — action:"status" may show its stale row until it expires. Disclosed,
+   *  never hidden (same contract as the cancel path's reclaim). */
+  staleRecordLeft?: boolean;
+}
+
+/**
+ * #1567 (item 3) — AUTO-ADOPT the downloads a dead session left behind.
+ *
+ * A respawned tool session used to find its predecessor's transfers like this:
+ * every record still said "downloading", `action:"status"` correctly proved each
+ * owner dead ("NOT running — the owning process is gone"), and recovery was
+ * cancel × N + re-issue × N — by hand, for a job record plus a `.partial` that
+ * between them already contained everything a resume needs. The reporter did that
+ * dance for nine transfers and ~48 GB.
+ *
+ * This is the recovery the record was always rich enough to perform: run once when
+ * a new session boots, it finds each in-flight record whose writer is PROVEN dead
+ * and whose staged `.partial` a re-issue would resume from, closes the dead record
+ * through the same reviewed reclaim the cancel path uses (#858 — terminal state
+ * durable BEFORE anything is destroyed, dead tray row cleared unless something
+ * live shares it), and re-issues the download. The new writer's own resume
+ * handshake (If-Range against the staged bytes) decides how much of the partial
+ * still counts — adoption never asserts a resume the server did not honour.
+ *
+ * Every guard below REFUSES rather than guesses, and each refusal leaves the record
+ * on the manual cancel + re-issue path exactly as before:
+ *
+ *  - PROVEN dead only (ESRCH). A live or unprovable owner (`undefined`) is never
+ *    touched — absence of evidence is not evidence of absence (#761/#858).
+ *  - Never a Manager dispatch: the server-side fetch may still be running on the
+ *    host, and "adopting" it would be a second dispatch into the same destination
+ *    (the one outcome the proven-dead note exists to prevent).
+ *  - Never from a redacted URL. Persisted records strip query auth before disk, so
+ *    the record's URL can differ from the one that was requested; re-issuing THAT
+ *    would fetch a different (unauthenticated) representation. `trayId` hashes the
+ *    ORIGINAL URL, so `downloadIdFor(rec.url) === rec.trayId` proves the URL
+ *    survived byte-identically; anything else is declined.
+ *  - Never a from-zero restart. The issue's condition is a `.partial` the new
+ *    session can actually resume: without one, automatically beginning a multi-GB
+ *    transfer is a new download, not a recovery — and a miss can also mean the
+ *    partial is keyed under a credential this session no longer holds, which #1378
+ *    makes deliberately unreachable. Either way the record is left for the user.
+ *  - Never twice. A FRESH in-flight record for the same id means another session
+ *    already adopted the orphan; stand down. (Two sessions scanning in the same
+ *    instant can still both pass this check — startDownloadJob's own fresh-foreign
+ *    adoption then makes the loser a read-only observer, and the #467 O_EXCL
+ *    staging bounds the residue to a duplicate transfer, never a corrupt file.
+ *    Best-effort, same contract as #529.)
+ *  - Never on the Manager route: if THIS session would dispatch to the remote
+ *    Manager, "resuming" a local orphan would be a fresh server-side fetch, not a
+ *    resume — so the whole pass stands down when the route (or the server needed
+ *    to decide it) is unavailable.
+ *
+ * Best-effort by construction: a re-issue that fails (destination unresolvable,
+ * server unreachable) is logged and skipped, and the record — already closed as an
+ * administrative cancel by the reclaim — stays exactly where the manual path would
+ * have left it. Never throws: it runs at server boot, which must not fail over a
+ * recovery convenience.
+ */
+export async function adoptOrphanedDownloadJobs(): Promise<OrphanedDownloadAdoption[]> {
+  const adopted: OrphanedDownloadAdoption[] = [];
+  if (!persistedRecordsEnabled()) return adopted;
+  let routeToManager: boolean;
+  try {
+    routeToManager = await shouldDispatchDownloadToManager();
+  } catch {
+    // No live server answer — the route cannot be decided, so no adoption verdict
+    // is safe. Fail closed: the records keep for the next session (or the manual path).
+    return adopted;
+  }
+  if (routeToManager) return adopted;
+
+  const now = Date.now();
+  const records = listPersistedDownloadJobs();
+  // Ids this pass already re-issued. `records` is a SNAPSHOT taken before the loop,
+  // so without this a second dead record for the SAME id (two dead sessions each
+  // left one) would be reclaimed AFTER our replacement job persisted its fresh
+  // record — and the reclaim's administrative-cancel write targets the same
+  // owner-scoped file, clobbering the live "downloading" record until the next
+  // heartbeat. One adoption per id per pass.
+  const adoptedIds = new Set<string>();
+  for (const rec of records) {
+    if (rec.status !== "downloading") continue;
+    if (!rec.owner || rec.owner === PERSIST_OWNER) continue;
+    if (rec.via_manager) continue;
+    if (writerProcessGone(rec) !== true) continue;
+    if (!rec.url || downloadIdFor(rec.url) !== rec.trayId) continue;
+    if (adoptedIds.has(rec.id)) continue;
+    const alreadyAdopted = records.some(
+      (other) =>
+        other !== rec &&
+        other.id === rec.id &&
+        other.status === "downloading" &&
+        now - (other.updated ?? 0) < PERSISTED_INFLIGHT_STALE_MS,
+    );
+    if (alreadyAdopted) continue;
+    // unknown-ok: adoption only ever ACTS on a positive answer. "The lookup
+    // failed" and "nothing is staged" both lead to `continue` — the record is
+    // left untouched on the manual cancel + re-issue path, nothing is reclaimed,
+    // destroyed, or re-issued — so collapsing a failed observation into "none
+    // found" can only decline a convenience, never assert a wrong one.
+    const partial = await findResumablePartialForLocalDownload(rec.url).catch(() => null);
+    if (!partial) continue;
+
+    const reclaim = reclaimDeadPersistedDownload(rec);
+    // Lost a race with the probe or the persist — fail closed, touch nothing more.
+    if (!reclaim.reclaimed) continue;
+
+    try {
+      const entry = await startDownloadJob(rec.url, rec.target_subfolder, rec.filename);
+      // A keys-less entry is the READ-ONLY view of another session's fresh writer
+      // (#529): the orphan is adopted, but not by us — let that session's boot log
+      // claim it rather than reporting a writer we do not own.
+      if (entry.keys.length === 0) continue;
+    } catch (err) {
+      logger.warn(
+        `[download] orphaned job ${rec.id} (${rec.filename ?? rec.url}) could not be ` +
+          `re-issued in this session: ${err instanceof Error ? err.message : String(err)}. ` +
+          `Its record is already closed as an administrative cancel; re-issue ` +
+          `download_model action:"download" to retry it.`,
+      );
+      continue;
+    }
+    adopted.push({
+      id: rec.id,
+      trayId: rec.trayId,
+      filename: rec.filename,
+      resumedBytes: partial.bytes,
+      staleRecordLeft: reclaim.staleRecordLeft || undefined,
+    });
+    adoptedIds.add(rec.id);
+  }
+  return adopted;
 }
 
 /**
