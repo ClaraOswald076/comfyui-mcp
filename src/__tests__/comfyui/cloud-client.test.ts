@@ -23,6 +23,7 @@ const {
   getSamplers,
   getSchedulers,
   interrupt,
+  uploadImageHttp,
 } = await import("../../comfyui/cloud-client.js");
 
 describe("cloud-client", () => {
@@ -139,5 +140,30 @@ describe("cloud-client", () => {
     await expect(getHistory("abc")).rejects.toMatchObject({
       code: "CLOUD_API_ERROR",
     });
+  });
+
+  // #946 — the twin split: a path in `filename` is a subfolder request, sent
+  // as the form field the API has. The self-hosted client got this fix first;
+  // this twin kept the original defect (the whole path as the multipart
+  // filename) until the split was shared.
+  it("uploadImageHttp splits a path filename into the subfolder form field", async () => {
+    await uploadImageHttp("assets/clip.mp4", Buffer.from("x"), "video/mp4");
+    const form = calls.at(-1)?.init?.body as FormData;
+    expect(form.get("subfolder")).toBe("assets");
+    expect((form.get("image") as File).name).toBe("clip.mp4");
+  });
+
+  it("uploadImageHttp sends NO subfolder field for a plain filename", async () => {
+    await uploadImageHttp("clip.mp4", Buffer.from("x"), "video/mp4");
+    const form = calls.at(-1)?.init?.body as FormData;
+    expect(form.has("subfolder")).toBe(false);
+    expect((form.get("image") as File).name).toBe("clip.mp4");
+  });
+
+  it("uploadImageHttp refuses a traversal before anything is sent", async () => {
+    await expect(uploadImageHttp("../escape.png", Buffer.from("x"))).rejects.toThrow(
+      /walks outside/,
+    );
+    expect(calls).toHaveLength(0);
   });
 });

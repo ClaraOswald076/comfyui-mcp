@@ -23,6 +23,7 @@ import {
   isTimeoutAbort,
 } from "./fetch.js";
 import { bodyPrefixOf, describeStatus } from "./json-guard.js";
+import { splitUploadTarget } from "./upload-target.js";
 import { ComfyUIError, ConnectionError, describeFetchFailure } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import type { HistoryEntry } from "./client.js";
@@ -362,11 +363,17 @@ export async function uploadImageHttp(
   data: Buffer,
   mimeType = "image/png",
 ): Promise<{ name: string; subfolder: string; type: string }> {
+  // #946 — same split as client.ts's uploadImageHttp: a `filename` carrying a
+  // path ("assets/clip.mp4") is a subfolder request, and the API takes that as
+  // its own form field. This twin kept the original defect until now — the rot
+  // the header above warns about.
+  const { subfolder, name } = splitUploadTarget(filename);
   const formData = new FormData();
   const blob = new Blob([data], { type: mimeType });
-  formData.append("image", blob, filename);
+  formData.append("image", blob, name);
   formData.append("type", "input");
   formData.append("overwrite", "true");
+  if (subfolder) formData.append("subfolder", subfolder);
   // multipart sets its own Content-Type; skip the JSON header.
   const res = await cloudFetch("/upload/image", {
     method: "POST",

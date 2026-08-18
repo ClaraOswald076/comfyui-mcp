@@ -950,11 +950,16 @@ function jsonAttachmentRefusal(base64: string): JsonRefusal | null {
 /**
  * Upload a local image to ComfyUI via HTTP multipart POST.
  * Falls back to HTTP when COMFYUI_PATH is not available (remote ComfyUI).
+ *
+ * The returned `subfolder` is part of the answer, not a detail: when the
+ * requested `filename` carried a path ("minimax_h3/clip.png"), the server
+ * stores the file UNDER that subfolder and the bare `name` does not resolve
+ * in a loader — only `subfolder/name` does (#946).
  */
 export async function uploadImageAuto(
   sourcePath: string,
   filename?: string,
-): Promise<{ filename: string }> {
+): Promise<{ filename: string; subfolder: string }> {
   const resolvedFilename = filename ?? basename(sourcePath);
   const ext = extname(resolvedFilename).toLowerCase();
   if (!(ext in IMAGE_MIME)) {
@@ -966,7 +971,7 @@ export async function uploadImageAuto(
   const mimeType = IMAGE_MIME[ext] ?? "application/octet-stream";
   logger.info("Uploading image to ComfyUI via HTTP", { sourcePath, resolvedFilename });
   const result = await uploadImageHttp(resolvedFilename, data, mimeType);
-  return { filename: result.name };
+  return { filename: result.name, subfolder: result.subfolder ?? "" };
 }
 
 // ---------------------------------------------------------------------------
@@ -1025,13 +1030,15 @@ async function uploadMediaHttp(
   filename: string | undefined,
   mimeMap: Record<string, string>,
   kind: "video" | "audio",
-): Promise<{ filename: string }> {
+): Promise<{ filename: string; subfolder: string }> {
   const resolvedFilename = filename ?? basename(sourcePath);
   const mimeType = resolveMediaMime(resolvedFilename, mimeMap, kind);
   const data = await nodeReadFile(sourcePath);
   logger.info(`Uploading ${kind} to ComfyUI via HTTP`, { sourcePath, resolvedFilename });
   const result = await uploadImageHttp(resolvedFilename, data, mimeType);
-  return { filename: result.name };
+  // Same contract as uploadImageAuto: the subfolder travels with the name,
+  // because a subfolder upload's bare name is not a usable loader reference.
+  return { filename: result.name, subfolder: result.subfolder ?? "" };
 }
 
 /** Local filesystem copy of a media file into ComfyUI's input/ (needs COMFYUI_PATH). */

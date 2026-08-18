@@ -11,7 +11,6 @@ import { logger } from "../utils/logger.js";
 import {
   ComfyUIError,
   ConnectionError,
-  ValidationError,
   WorkflowExecutionError,
 } from "../utils/errors.js";
 import { comfyuiFetch } from "./fetch.js";
@@ -1212,34 +1211,9 @@ export async function uploadImageHttp(
 /**
  * Split an upload target into ComfyUI's two fields (#946).
  *
- * `filename` is the caller's whole intent — "clip.mp4" or "assets/clip.mp4" —
- * while ComfyUI's /upload/image wants a bare filename plus a separate
- * `subfolder`. Backslashes count as separators too: a caller on Windows
- * naturally writes "assets\clip.mp4".
- *
- * Traversal is REFUSED rather than sanitised. Silently rewriting "../../x.png"
- * into something safe would upload to a place the caller did not name and then
- * report the name they asked for — a wrong answer dressed as a right one. The
- * caller gets told instead.
+ * The implementation lives in ./upload-target.js so BOTH upload clients can
+ * share it (cloud-client.ts cannot import from here without a circular
+ * import); re-exported so existing imports keep working.
  */
-export function splitUploadTarget(filename: string): { subfolder: string; name: string } {
-  // A TRAILING separator has to be caught before the empty segments are filtered
-  // out: "assets/" would otherwise leave ["assets"], and the directory would be
-  // adopted as the filename — an upload to a name the caller never wrote.
-  const endsInSeparator = /[/\\]\s*$/.test(filename);
-  const parts = filename.split(/[/\\]+/).filter((p) => p !== "" && p !== ".");
-  const name = endsInSeparator ? "" : (parts.pop() ?? "");
-  if (name === "" || name === "..") {
-    throw new ValidationError(
-      `"${filename}" does not name a file to upload — it ends in a path separator or a "..". ` +
-        `Pass a filename, optionally prefixed with a subfolder (e.g. "assets/clip.mp4").`,
-    );
-  }
-  if (parts.some((p) => p === "..")) {
-    throw new ValidationError(
-      `"${filename}" walks outside ComfyUI's input directory with "..". ` +
-        `A subfolder prefix may only go downwards (e.g. "assets/clip.mp4").`,
-    );
-  }
-  return { subfolder: parts.join("/"), name };
-}
+import { splitUploadTarget } from "./upload-target.js";
+export { splitUploadTarget };
