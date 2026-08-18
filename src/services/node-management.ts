@@ -2285,10 +2285,51 @@ function looksLikeAPack(dir: string): boolean {
 }
 
 /**
+ * Kill a TIMED-OUT git clone's whole process tree, not just the direct child.
+ *
+ * execFileSync's timeout signals only the `git` it spawned. Git's descendants —
+ * `git-remote-https`, `index-pack` — keep running, and on Windows they hold open
+ * locks on `.git/objects/pack/tmp_pack_*`, so the removal below fails EBUSY and
+ * the husk stays put (#900 recurrence, observed 2026-08-05: `spawnSync git
+ * ETIMEDOUT` with the pack tmpfiles still locked). Mirrors the house pattern
+ * (orchestrator/index.ts killProcessTreeCrossPlatform): Windows `taskkill /T /F`
+ * (tree + force); POSIX a best-effort children sweep around the direct signal.
+ */
+function killGitProcessTree(pid: number): void {
+  if (process.platform === "win32") {
+    // No graceful tree-signal exists on Windows; /T /F is the reliable path.
+    execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+    return;
+  }
+  try {
+    execFileSync("pkill", ["-TERM", "-P", String(pid)], { stdio: "ignore" });
+  } catch {
+    // no children / pkill absent — the direct signal below still applies
+  }
+  process.kill(pid, "SIGTERM");
+}
+
+/** Sync sleep for the settle window after a process-tree kill: this cleanup runs
+ *  inside a synchronous catch, so it may not await. Same Atomics.wait idiom as
+ *  download-progress.ts / lora-catalog.ts. */
+function sleepSyncMs(ms: number): void {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    // Atomics.wait disallowed here — the retry below just runs a touch early.
+  }
+}
+
+/**
  * Remove a clone directory THIS call created, after the clone failed.
  *
  * Returns a sentence to append to the error — a leftover nobody was told about
  * is how the husk in #900 survived a month.
+ *
+ * `settlingProcesses` says a process-tree kill just ran (the clone timed out):
+ * the OS releases the killed processes' file handles asynchronously, so a
+ * removal that would EBUSY on the spot succeeds a moment later. Retry briefly
+ * before concluding the directory cannot be removed.
  *
  * `alreadyPresent` is a PRECONDITION, not live logic: every call site today sits
  * inside `if (!alreadyPresent)`, so it is always false here and the guard below
@@ -2298,19 +2339,29 @@ function looksLikeAPack(dir: string): boolean {
  * its unreachability is deliberate: an unreachable check that reads like live
  * protection is worse than one that says what it is.
  */
-function discardFailedClone(nodeDir: string, alreadyPresent: boolean): string {
+function discardFailedClone(
+  nodeDir: string,
+  alreadyPresent: boolean,
+  settlingProcesses = false,
+): string {
   if (alreadyPresent) return ""; // precondition — see above; unreachable today
   if (!existsSync(nodeDir)) return ""; // git cleaned up after itself
-  try {
-    rmSync(nodeDir, { recursive: true, force: true });
-    return "";
-  } catch (rmErr) {
-    return (
-      ` NOTE: the partial clone at ${nodeDir} could NOT be removed ` +
-      `(${rmErr instanceof Error ? rmErr.message : String(rmErr)}). ComfyUI will try to ` +
-      `import it on every start and log an error — delete that directory by hand.`
-    );
+  const attempts = settlingProcesses ? 4 : 1;
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) sleepSyncMs(250 * attempt);
+    try {
+      rmSync(nodeDir, { recursive: true, force: true });
+      return "";
+    } catch (rmErr) {
+      lastErr = rmErr;
+    }
   }
+  return (
+    ` NOTE: the partial clone at ${nodeDir} could NOT be removed ` +
+    `(${lastErr instanceof Error ? lastErr.message : String(lastErr)}). ComfyUI will try to ` +
+    `import it on every start and log an error — delete that directory by hand.`
+  );
 }
 
 /**
@@ -2413,6 +2464,21 @@ async function cloneCustomNodeFallback(
   const warnings: string[] = [];
   const alreadyPresent = existsSync(nodeDir);
 
+  // A directory that is already there but holds nothing but git metadata is NOT
+  // a pack — it is the husk an earlier failed install left behind (#900). Without
+  // this check the clone below is skipped ("the directory exists") and the call
+  // reports a successful install of nothing. It is also not ours to delete: this
+  // call did not create it, and a directory we did not create is the user's —
+  // so REFUSE, name it, and leave it untouched.
+  if (alreadyPresent && !looksLikeAPack(nodeDir)) {
+    throw new NodeManagementError(
+      `${because}, and custom_nodes/${repoName} already exists but holds nothing but ` +
+        `git metadata — the husk of an install that did not complete, which ComfyUI ` +
+        `cannot import and logs an error for on every start. This call did not create ` +
+        `it, so it was left untouched. Delete ${nodeDir} by hand and retry the install.`,
+    );
+  }
+
   if (!alreadyPresent) {
     // A concrete ref needs the full history reachable; otherwise shallow-clone.
     // `--end-of-options` ensures gitId/nodeDir are never parsed as git options.
@@ -2431,8 +2497,23 @@ async function cloneCustomNodeFallback(
       const e = err as NodeJS.ErrnoException & {
         stdout?: Buffer | string;
         stderr?: Buffer | string;
+        pid?: number;
       };
-      const leftover = discardFailedClone(nodeDir, alreadyPresent);
+      // A TIMEOUT killed only the direct `git` child; its descendants
+      // (git-remote-https, index-pack) may still be running and holding locks on
+      // the partial pack, which is exactly how the #900 husk survived its own
+      // cleanup (EBUSY on .git/objects/pack/tmp_pack_*). Kill the tree first —
+      // best-effort: if the kill itself fails, the removal below still runs and
+      // still discloses what it could not remove.
+      const timedOut = e.code === "ETIMEDOUT";
+      if (timedOut && typeof e.pid === "number") {
+        try {
+          killGitProcessTree(e.pid);
+        } catch {
+          // best-effort — see above
+        }
+      }
+      const leftover = discardFailedClone(nodeDir, alreadyPresent, timedOut);
       throw new NodeManagementError(
         `Failed to clone "${gitId}" into custom_nodes/${repoName}: ${e.message}${leftover}`,
         {

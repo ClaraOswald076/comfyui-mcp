@@ -966,6 +966,83 @@ describe("node-management service", () => {
       ).rejects.toThrow(/could NOT be removed/i);
     });
 
+    it("a TIMED-OUT clone kills the leftover git process tree before cleanup", async () => {
+      // #900 recurrence, observed 2026-08-05 on Windows: execFileSync's timeout
+      // killed the direct `git` child but `git-remote-https`/`index-pack` kept
+      // running with locks on .git/objects/pack/tmp_pack_*, so the removal failed
+      // EBUSY and the husk stayed. The timeout path must kill the whole tree and
+      // only then remove.
+      stubFetch({ installedBody: {} });
+      let cloned = false;
+      mockedExists.mockImplementation((p: unknown) => {
+        const str = String(p);
+        if (str.includes("requirements.txt") || str.includes("install.py")) return false;
+        if (str.includes(".venv") || str.includes("cm-cli.py")) return false;
+        if (str.includes(NODE_DIR_UTILS)) return cloned;
+        return false;
+      });
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") {
+          cloned = true;
+          // The shape Node's execFileSync throws on timeout: code ETIMEDOUT with
+          // the dead child's pid — the pid whose TREE must be killed.
+          throw Object.assign(new Error("spawnSync git ETIMEDOUT"), {
+            code: "ETIMEDOUT",
+            pid: 4242,
+          });
+        }
+        return ""; // taskkill / pkill succeed
+      }) as never);
+
+      await expect(
+        installCustomNode({ id: "https://github.com/teskor-hub/comfyui-teskors-utils" }),
+      ).rejects.toThrow(/Failed to clone/);
+
+      // The process-tree kill went out for the timed-out child's pid (taskkill
+      // /T /F on Windows, a pkill children sweep on POSIX).
+      const treeKill = mockedExec.mock.calls.find(
+        (c) => c[0] === "taskkill" || c[0] === "pkill",
+      );
+      expect(treeKill, "expected a process-tree kill for the timed-out git").toBeDefined();
+      expect(treeKill![1]).toContain("4242");
+      // …and the husk itself was removed once nothing held it open.
+      expect(fsCtl.removed).toContain(NODE_DIR_UTILS);
+    });
+
+    it("REFUSES to install over an existing husk instead of reporting success", async () => {
+      // The other half of #900: a husk already sitting in custom_nodes passed
+      // every check — the clone is skipped because "the directory exists", and
+      // the pack verification ran only for directories THIS call created — so a
+      // retry over a husk reported a successful install of nothing. The husk is
+      // not this call's to delete, so the install refuses and names it.
+      stubFetch({ installedBody: {} });
+      mockedExists.mockImplementation((p: unknown) => {
+        const str = String(p);
+        if (str.includes("requirements.txt") || str.includes("install.py")) return false;
+        if (str.includes(".venv") || str.includes("cm-cli.py")) return false;
+        if (str.includes(NODE_DIR_UTILS)) return true; // left over from an earlier failure
+        return false;
+      });
+      fsCtl.readdirSync = () => [".git"]; // git metadata and nothing else
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") throw new Error("should not clone");
+        return "";
+      }) as never);
+
+      await expect(
+        installCustomNode({ id: "https://github.com/teskor-hub/comfyui-teskors-utils" }),
+      ).rejects.toThrow(/husk of an install that did not complete/i);
+
+      // No clone ran over it, and the husk — not this call's creation — was left
+      // exactly where it was.
+      expect(
+        mockedExec.mock.calls.some(
+          (c) => c[0] === "git" && (c[1] as string[])[0] === "clone",
+        ),
+      ).toBe(false);
+      expect(fsCtl.removed).not.toContain(NODE_DIR_UTILS);
+    });
+
     it("throws ProcessControlError on clone fallback when comfyuiPath is unset", async () => {
       config.comfyuiPath = undefined;
       stubFetch({ installedBody: {} });
