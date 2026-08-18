@@ -51,6 +51,11 @@ interface Entry {
    *  Unused for shared-scope keys (a shared session legitimately spans
    *  workflows); preserved on legacy entries so nothing is rewritten. */
   u?: string;
+  /** #1516 — cumulative AUTOMATIC-preview ledger for THIS session id: how many
+   *  run-completion previews (and fetched bytes) the conversation already
+   *  carries. Persisted so an orchestrator restart does not reset the budget
+   *  of a provider conversation that lives on and keeps every inline image. */
+  pl?: { i: number; b: number };
 }
 
 interface StoreFileV2 {
@@ -171,7 +176,7 @@ export class SessionStore {
           dirty = true;
           continue;
         }
-        const e = v as { s?: unknown; t?: unknown; u?: unknown };
+        const e = v as { s?: unknown; t?: unknown; u?: unknown; pl?: unknown };
         if (typeof e.s !== "string") {
           dirty = true;
           continue;
@@ -188,6 +193,21 @@ export class SessionStore {
         }
         const entry: Entry = { s: e.s, t };
         if (typeof e.u === "string") entry.u = e.u;
+        // #1516 — keep a well-formed preview ledger; a malformed one is dropped
+        // (the budget then starts un-spent, the safe direction: under-bounding
+        // a conversation is the failure mode this ledger exists to prevent,
+        // and a fresh-zero ledger can never over-claim delivered media).
+        if (e.pl && typeof e.pl === "object" && !Array.isArray(e.pl)) {
+          const pl = e.pl as { i?: unknown; b?: unknown };
+          if (
+            typeof pl.i === "number" && Number.isFinite(pl.i) && pl.i >= 0 &&
+            typeof pl.b === "number" && Number.isFinite(pl.b) && pl.b >= 0
+          ) {
+            entry.pl = { i: pl.i, b: pl.b };
+          } else {
+            dirty = true;
+          }
+        }
         out[k] = entry;
       }
       return out;
@@ -447,7 +467,38 @@ export class SessionStore {
     }
     const entry: Entry = { s: sessionId, t: this.now() };
     if (u) entry.u = u;
+    // #1516 — the preview ledger is a property OF THE CONVERSATION: it carries
+    // over only when the session id is unchanged, and a fresh conversation
+    // provably starts at zero (its rollout holds no previews yet).
+    if (existing?.s === sessionId && existing.pl) entry.pl = existing.pl;
     this.sessions[key] = entry;
+    return this.flush();
+  }
+
+  /** #1516 — the durable automatic-preview ledger for a key's current session,
+   *  joined with the session id it was recorded against so a caller can adopt
+   *  it only for that exact conversation. */
+  previewLedger(key: string): { sid: string; images: number; bytes: number } | undefined {
+    const e = this.sessions[key];
+    if (!e?.pl) return undefined;
+    return { sid: e.s, images: e.pl.i, bytes: e.pl.b };
+  }
+
+  /** #1516 — record (and persist) the automatic-preview ledger for a session.
+   *  REFUSES when the stored session id is not the one the ledger describes:
+   *  writing it anyway would either un-bound the conversation actually on disk
+   *  or saddle a fresh one with media cost it never incurred — both silent
+   *  corruptions of a safety bound. Returns whether the state reached disk. */
+  setPreviewLedger(
+    key: string,
+    sessionId: string,
+    ledger: { images: number; bytes: number },
+  ): boolean {
+    const e = this.sessions[key];
+    if (!e || e.s !== sessionId) return false;
+    if (e.pl?.i === ledger.images && e.pl?.b === ledger.bytes) return this.settled();
+    e.pl = { i: ledger.images, b: ledger.bytes };
+    e.t = this.now();
     return this.flush();
   }
 

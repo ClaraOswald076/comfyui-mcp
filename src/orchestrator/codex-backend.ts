@@ -56,6 +56,7 @@ import {
   stampTurn,
 } from "./agent-backend.js";
 import type { ImageRef } from "./panel-agent.js";
+import { MAX_SESSION_PREVIEW_BYTES, previewByteBudgetLabel } from "./preview-budget.js";
 
 function msgOf(err: unknown): string {
   return errorText(err);
@@ -675,6 +676,14 @@ export class CodexBackend implements AgentBackend {
    *  Tracked so each turn cleans up its own files, and close() sweeps any
    *  stragglers. */
   private tempImageFiles = new Set<string>();
+  /** #1516 — fetched bytes of AUTOMATIC previews delivered into the CURRENT
+   *  thread (refs flagged `automatic`; user attachments never count). Codex
+   *  persists every localImage as an inline input_image data URL and its
+   *  compaction recopies them unboundedly, so this is the ledger the cumulative
+   *  byte budget enforces against. Reset when the thread changes. */
+  private previewBytes = 0;
+  /** The thread {@link previewBytes} belongs to (a fresh thread starts at 0). */
+  private previewBytesThread: string | null = null;
 
   constructor(deps: CodexBackendDeps = {}) {
     this.deps = deps;
@@ -733,14 +742,16 @@ export class CodexBackend implements AgentBackend {
 
   /**
    * Fetch a ComfyUI image (/view) and spill the bytes to a temp file, returning
-   * its absolute path — or null on any failure (the text reference still names the
-   * image as a fallback). The app-server `turn/start` `localImage` input item takes
-   * a FILE PATH (mirrors the codex CLI `-i, --image <FILE>`), so unlike Claude
-   * (inline base64) we must write the bytes to disk. Mirrors
-   * ClaudeBackend.fetchImageBlock's source/size guards. Each written path is
-   * tracked in tempImageFiles for per-turn + close() cleanup.
+   * its absolute path and byte size — or null on any failure (the text reference
+   * still names the image as a fallback). The app-server `turn/start`
+   * `localImage` input item takes a FILE PATH (mirrors the codex CLI
+   * `-i, --image <FILE>`), so unlike Claude (inline base64) we must write the
+   * bytes to disk. Mirrors ClaudeBackend.fetchImageBlock's source/size guards.
+   * Each written path is tracked in tempImageFiles for per-turn + close()
+   * cleanup. The byte count rides along so the caller can charge the #1516
+   * cumulative preview ledger with the size that was ACTUALLY delivered.
    */
-  private async fetchImageFile(ref: ImageRef): Promise<string | null> {
+  private async fetchImageFile(ref: ImageRef): Promise<{ path: string; bytes: number } | null> {
     if (!this.deps.comfyuiUrl || !ref?.filename) return null;
     try {
       const u = new URL("/view", this.deps.comfyuiUrl);
@@ -772,10 +783,17 @@ export class CodexBackend implements AgentBackend {
       );
       await fsp.writeFile(file, buf);
       this.tempImageFiles.add(file);
-      return file;
+      return { path: file, bytes: buf.length };
     } catch {
       return null;
     }
+  }
+
+  /** #1516 — fetched bytes of AUTOMATIC previews delivered into the current
+   *  thread, as the AgentBackend port exposes them: PanelAgent adds this to the
+   *  durable pre-restart base when it checks the cumulative session budget. */
+  automaticPreviewBytes(): number {
+    return this.previewBytes;
   }
 
   /**
@@ -970,6 +988,13 @@ export class CodexBackend implements AgentBackend {
       this.needsSystemPreamble = !!this.deps.systemAppend;
     }
     // The thread id is our session id (PanelAgent persists it for resume).
+    // #1516 — the cumulative preview byte ledger is a property OF THE THREAD:
+    // a different conversation (fresh start, or a resume of another id after a
+    // fork) provably holds none of this process's earlier previews.
+    if (this.threadId !== this.previewBytesThread) {
+      this.previewBytesThread = this.threadId;
+      this.previewBytes = 0;
+    }
     yield {
       type: "session",
       sessionId: this.threadId,
@@ -1297,12 +1322,45 @@ export class CodexBackend implements AgentBackend {
       { type: "text", text: turnText, text_elements: [] },
     ];
     const turnTempFiles: string[] = [];
+    // #1516 — the BYTE budget's point of fact. PanelAgent gates the cumulative
+    // session budget when it COMPOSES the turn, but it cannot see the bytes of
+    // the batch already in flight, so this loop is the backstop: an automatic
+    // preview that would arrive past the conversation's cumulative byte budget
+    // is NOT attached, and the turn text says so with fetchable coordinates —
+    // the same correct-the-claim discipline as PanelAgent's drain trim, one
+    // layer down where the real fetch sizes are known. A user's own attachment
+    // (no `automatic` flag) is never touched by this budget.
+    const byteWithheld: ImageRef[] = [];
     for (const ref of turn.images ?? []) {
-      const file = await this.fetchImageFile(ref);
-      if (file) {
-        turnTempFiles.push(file);
-        turnInput.push({ type: "localImage", path: file });
+      if (ref?.automatic && this.previewBytes >= MAX_SESSION_PREVIEW_BYTES) {
+        byteWithheld.push(ref);
+        continue;
       }
+      const got = await this.fetchImageFile(ref);
+      if (got) {
+        turnTempFiles.push(got.path);
+        turnInput.push({ type: "localImage", path: got.path });
+        if (ref.automatic) this.previewBytes += got.bytes;
+      }
+    }
+    if (byteWithheld.length) {
+      const refs = byteWithheld
+        .map((i) => {
+          const type = i.type ?? "output";
+          const sub = i.subfolder ? `, subfolder:"${i.subfolder}"` : "";
+          return type === "output" && !i.subfolder
+            ? i.filename
+            : `${i.filename} (type:"${type}"${sub})`;
+        })
+        .join(", ");
+      turnInput[0]!.text +=
+        `\n\n[panel note: ${byteWithheld.length} automatic preview image(s) named above were NOT attached to this turn: ` +
+        `this conversation's cumulative automatic-preview byte budget (~${previewByteBudgetLabel()}) is spent — the bound that keeps a long session's rollout from growing without limit (every attached preview is retained inline and recopied at compaction). ` +
+        `The outputs are already shown to the user in the panel — fetch one with get_image action:"get" if you need to look: ${refs}.]`;
+      logger.info(
+        `[codex] withheld ${byteWithheld.length} automatic preview image(s) at the cumulative byte budget ` +
+          `(${this.previewBytes}/${MAX_SESSION_PREVIEW_BYTES} bytes delivered to this thread); the turn says so and names them (#1516)`,
+      );
     }
 
     try {

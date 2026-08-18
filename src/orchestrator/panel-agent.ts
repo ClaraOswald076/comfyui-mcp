@@ -27,6 +27,12 @@ import { COMPLETION_DISAGREEMENT_NOTE } from "./download-done-guard.js";
 import { downloadsAtRiskOfRespawn } from "../services/download-jobs.js";
 import { orphanedByDeferredRespawnNote } from "../services/panel-secrets.js";
 import { errorText, promptText } from "./error-text.js";
+import {
+  MAX_SESSION_PREVIEW_ATTACHMENTS,
+  MAX_SESSION_PREVIEW_BYTES,
+  previewByteBudgetLabel,
+  type PreviewLedger,
+} from "./preview-budget.js";
 import type { SessionStore } from "./session-store.js";
 import type { AgentBackend, AgentEvent, NeutralTurn } from "./agent-backend.js";
 import { type AudioRef, dedupeAudioRefs, noAudioPartText } from "./audio-attachment.js";
@@ -252,6 +258,11 @@ export interface ImageRef {
   filename: string;
   subfolder?: string;
   type?: string; // "input" | "output" | "temp" (ComfyUI /view folder)
+  /** #1516 — set by PanelAgent on AUTOMATIC run-completion previews (never on a
+   *  user's explicit attachment, which keeps its own reviewed policy). This is
+   *  what the backend keys the cumulative per-conversation byte ledger on, and
+   *  it never arrives from the panel wire — only injectEvent sets it. */
+  automatic?: boolean;
 }
 
 /** One queued user turn (a panel message, or an injected panel event).
@@ -330,6 +341,15 @@ export interface PanelAgentDeps {
   /** Report the SDK session id once known, so the panel can persist/resume it.
    *  `model` is the SDK-resolved model (#376), used to correct the ready banner. */
   onSession?: (tabId: string, sessionId: string, model?: string) => void;
+  /** #1516 — the cumulative automatic-preview ledger changed (previews were
+   *  committed to a turn, or delivery stopped at the budget). The manager
+   *  persists it beside the session id so an orchestrator RESTART does not
+   *  reset the budget while the provider conversation it bounds lives on. */
+  onPreviewLedger?: (tabId: string, ledger: PreviewLedger) => void;
+  /** #1516 — the durable ledger the session store holds for the conversation
+   *  this agent is expected to resume. Adopted ONLY when the live session id
+   *  proves to be exactly `sid`; a different conversation starts at zero. */
+  initialPreviewLedger?: PreviewLedger & { sid: string };
   /** Report each turn's ending assistant-message UUID — the anchor the panel
    *  stores so a later "rewind conversation to here" can fork the session at that
    *  point (resumeSessionAt + forkSession). */
@@ -514,6 +534,23 @@ export class PanelAgent {
   private pendingRewind: { anchor: string | null } | null = null;
   /** Captured from the session's init message; enables resume across restarts. */
   sessionId: string | null = null;
+  /** #1516 — cumulative AUTOMATIC previews committed to turns of the CURRENT
+   *  provider conversation (charged at the drain, the point of fact). Reset
+   *  whenever the session id changes: a fresh conversation starts at zero. */
+  private previewImagesCharged = 0;
+  /** #1516 — the byte half of the ledger ADOPTED from the durable store (see
+   *  initialPreviewLedger). Live bytes come from the backend; the total is
+   *  previewBytesBase + backend.automaticPreviewBytes(). */
+  private previewBytesBase = 0;
+  /** #1516 — automatic previews composed but NOT delivered, accounted where the
+   *  withholding was decided (session budget at inject, either budget at the
+   *  drain trim). Diagnostics; each was named in an agent-visible note. */
+  private previewWithheldSession = 0;
+  /** #1516 — the session id the charged ledger belongs to; reconciled lazily. */
+  private previewLedgerSid: string | null = null;
+  /** #1516 — durable ledger awaiting adoption once the live session id proves
+   *  to be the conversation it was recorded against (never applied blindly). */
+  private pendingPreviewLedger: (PreviewLedger & { sid: string }) | null = null;
   /** Id of the assistant message currently streaming (from message_start), so
    *  stream deltas and the final committed `say` share one bubble id. */
   private streamMsgId: string | null = null;
@@ -544,6 +581,7 @@ export class PanelAgent {
     this.deps = deps;
     this.model = deps.model;
     this.effort = deps.effort;
+    this.pendingPreviewLedger = deps.initialPreviewLedger ?? null;
     // Default to the Claude adapter; injectable so a future toggle can swap it.
     this.backend =
       backend ??
@@ -711,6 +749,83 @@ export class PanelAgent {
     );
   }
 
+  /** #1516 — keep the cumulative preview ledger attached to the conversation it
+   *  measures. The session id only becomes known at the init event and can
+   *  change under us (fresh fork, resume-miss restart, provider switch), so
+   *  this runs lazily at every budget decision: a new id resets the ledger to
+   *  zero, and the durable pending ledger is adopted ONLY when the live id is
+   *  exactly the one it was recorded against — a ledger applied to the wrong
+   *  conversation would either starve a fresh one or un-bound an old one. */
+  private reconcilePreviewLedger(): void {
+    if (this.sessionId === this.previewLedgerSid) return;
+    this.previewLedgerSid = this.sessionId;
+    this.previewImagesCharged = 0;
+    this.previewBytesBase = 0;
+    this.previewWithheldSession = 0;
+    if (this.sessionId && this.pendingPreviewLedger) {
+      if (this.pendingPreviewLedger.sid === this.sessionId) {
+        this.previewImagesCharged = this.pendingPreviewLedger.images;
+        this.previewBytesBase = this.pendingPreviewLedger.bytes;
+      }
+      this.pendingPreviewLedger = null;
+    }
+  }
+
+  /** #1516 — cumulative delivered automatic-preview BYTES for the current
+   *  conversation: the durable base (pre-restart) plus what this process's
+   *  backend actually fetched. Backends that do not report bytes contribute
+   *  zero and are bounded by the image count alone. */
+  private sessionPreviewBytes(): number {
+    return this.previewBytesBase + (this.backend.automaticPreviewBytes?.() ?? 0);
+  }
+
+  /** #1516 — how many automatic previews this conversation may still receive:
+   *  the tighter of the remaining COUNT and the remaining BYTES. Bytes
+   *  delivered so far is what is knowable here — the in-flight turn's fetches
+   *  have not happened yet — so the byte gate can overshoot by at most one
+   *  turn's worth; the backend enforces the same budget at fetch time, which
+   *  is the bound of record (see codex-backend's image loop). */
+  private sessionPreviewBudgetLeft(): number {
+    this.reconcilePreviewLedger();
+    if (this.sessionPreviewBytes() >= MAX_SESSION_PREVIEW_BYTES) return 0;
+    return Math.max(0, MAX_SESSION_PREVIEW_ATTACHMENTS - this.previewImagesCharged);
+  }
+
+  /** #1516 — the cumulative automatic-preview ledger, for diagnostics: what was
+   *  delivered to the current provider conversation, what was withheld at the
+   *  session budget, and the budget itself. */
+  previewBudgetStatus(): PreviewLedger & {
+    withheld: number;
+    budgetImages: number;
+    budgetBytes: number;
+  } {
+    this.reconcilePreviewLedger();
+    return {
+      images: this.previewImagesCharged,
+      bytes: this.sessionPreviewBytes(),
+      withheld: this.previewWithheldSession,
+      budgetImages: MAX_SESSION_PREVIEW_ATTACHMENTS,
+      budgetBytes: MAX_SESSION_PREVIEW_BYTES,
+    };
+  }
+
+  /** #1516 — persist the ledger through the manager so an orchestrator restart
+   *  does not reset a budget the still-living provider conversation keeps
+   *  accumulating against. Bytes are read NOW (the in-flight turn's fetches
+   *  lag), so the stored value is a lower bound — disclosed, and refreshed on
+   *  every later change. */
+  private reportPreviewLedger(): void {
+    if (!this.deps.onPreviewLedger) return;
+    try {
+      this.deps.onPreviewLedger(this.tabId, {
+        images: this.previewImagesCharged,
+        bytes: this.sessionPreviewBytes(),
+      });
+    } catch (err) {
+      logger.debug(`[panel-agent ${this.short()}] preview-ledger report failed: ${msgOf(err)}`);
+    }
+  }
+
   /** Drop a still-queued message (the user cancelled/edited it before the agent
    *  got to it). Returns true if it was found and removed; false if it was
    *  already dequeued (the turn started — too late to cancel). */
@@ -809,10 +924,32 @@ export class PanelAgent {
         0,
         MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS - this.queuedPreviewImageCount(),
       );
+      // #1516 — ...AND what is left of the CONVERSATION's cumulative budget.
+      // The per-turn bound above stops one turn from going unbounded; this one
+      // stops N turns from accumulating 8N inline images into a Codex rollout
+      // that compaction then recopies without a media-aware bound. Queued
+      // previews are charged against the session budget HERE too (they drain
+      // into this conversation), so a burst queueing behind a busy turn cannot
+      // over-commit it. `sessionBound` remembers WHICH budget spoke, so the
+      // notice below names the bound that actually fired.
+      const sessionBudgetLeft = Math.max(
+        0,
+        this.sessionPreviewBudgetLeft() - this.queuedPreviewImageCount(),
+      );
+      const sessionBound = sessionBudgetLeft < previewBudgetLeft;
+      const effectiveBudget = sessionBound ? sessionBudgetLeft : previewBudgetLeft;
       const attachedImgs = correlationIsUntrusted
         ? []
-        : attachableImgs.slice(0, previewBudgetLeft);
+        : attachableImgs.slice(0, effectiveBudget);
       const omittedImgs = attachableImgs.length - attachedImgs.length;
+      // #1516 — account for what the SESSION budget withheld (diagnostics +
+      // durable ledger). Only the session-bound case counts here: a per-turn
+      // trim is the pre-existing turn budget doing its job, and an untrusted
+      // correlation never had pixels to withhold.
+      if (sessionBound && !correlationIsUntrusted && omittedImgs > 0) {
+        this.previewWithheldSession += omittedImgs;
+        this.reportPreviewLedger();
+      }
       // The unnamed remainder. Every sentence below counts outputs with
       // `imgs.length` but attaches and names from `attachableImgs`, so on a MIXED
       // event — one output with a filename, one without — the two disagree and
@@ -887,9 +1024,13 @@ export class PanelAgent {
                 attachableImgs.length === 0
                 ? `The panel reported no usable filename for ${imgs.length === 1 ? "it" : "them"}, so ${imgs.length === 1 ? "it is" : "they are"} NOT attached to this agent turn and cannot be fetched by name — check get_history (action:"list") if you need to see what this run produced. `
                 : attachedImgs.length === 0
-                  ? `NONE of these outputs are attached to this agent turn: earlier completion(s) in this same turn already spent its ${MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS}-image preview budget. All ${imgs.length} are shown to the user in the panel — fetch one with get_image action:"get" if you need to look: ${withheldRefs}. `
+                  ? sessionBound
+                    ? `NONE of these outputs are attached to this agent turn: this conversation's cumulative automatic-preview budget (${MAX_SESSION_PREVIEW_ATTACHMENTS} images / ~${previewByteBudgetLabel()}) is spent — the bound that keeps a long session from accumulating unbounded inline media the provider retains and recopies at compaction. All ${imgs.length} are shown to the user in the panel — fetch one with get_image action:"get" if you need to look: ${withheldRefs}. `
+                    : `NONE of these outputs are attached to this agent turn: earlier completion(s) in this same turn already spent its ${MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS}-image preview budget. All ${imgs.length} are shown to the user in the panel — fetch one with get_image action:"get" if you need to look: ${withheldRefs}. `
                   : omittedImgs > 0
-                    ? `The first ${attachedImgs.length} image(s) are attached below; all ${imgs.length} outputs are already shown to the user in the panel. ${omittedImgs} further preview(s) were omitted to keep this TURN's image context bounded — fetch one with get_image action:"get" if you need it: ${withheldRefs}. `
+                    ? sessionBound
+                      ? `The first ${attachedImgs.length} image(s) are attached below; all ${imgs.length} outputs are already shown to the user in the panel. ${omittedImgs} further preview(s) were omitted because this conversation's cumulative automatic-preview budget (${MAX_SESSION_PREVIEW_ATTACHMENTS} images / ~${previewByteBudgetLabel()}) is nearly spent — fetch one with get_image action:"get" if you need it: ${withheldRefs}. `
+                      : `The first ${attachedImgs.length} image(s) are attached below; all ${imgs.length} outputs are already shown to the user in the panel. ${omittedImgs} further preview(s) were omitted to keep this TURN's image context bounded — fetch one with get_image action:"get" if you need it: ${withheldRefs}. `
                     : `The image(s) are attached below and already shown to the user in the panel. `
             : `You cannot view images on this provider, but they are already shown to the user in the panel. `
           : ``) +
@@ -920,7 +1061,10 @@ export class PanelAgent {
       // up to the bound above. Past it (or for an UNDETERMINED origin) the text
       // says so and points at get_image, so a fetch is needed but never a guess.
       if (this.backend.capabilities.vision) {
-        images = attachedImgs.map((i) => ({ ...i, type: i.type ?? "output" }));
+        // `automatic` is what the backend's cumulative byte ledger keys on —
+        // a user's explicit attachment never carries it and never spends the
+        // session preview budget (#1516).
+        images = attachedImgs.map((i) => ({ ...i, type: i.type ?? "output", automatic: true }));
       }
     } else if (ev.kind === "ask_answer") {
       // #486 — the user ANSWERED a question card, but no tool call was alive to
@@ -1429,16 +1573,36 @@ export class PanelAgent {
       // corrects the notices instead of assuming they agree with the outcome.
       // A user's own attachment is never touched — only `completionOnly` items,
       // which are the injected panel events.
-      let previewBudget = MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS;
+      // The drain is also where the CUMULATIVE session budget (#1516) meets the
+      // fact of the turn: the ceiling is the tighter of the per-turn 8 and what
+      // the conversation has left. injectEvent already charged queued previews
+      // against its estimate, so an in-flight batch (invisible there) is the
+      // divergence this line absorbs — same estimate/fact split as the per-turn
+      // budget above.
+      let previewBudget = Math.min(
+        MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS,
+        this.sessionPreviewBudgetLeft(),
+      );
       const trimmedPreviews: ImageRef[] = [];
+      let deliveredPreviews = 0;
       let images = batch.flatMap((it) => {
         const refs = it.images ?? [];
         if (!it.completionOnly) return refs;
         const take = refs.slice(0, Math.max(0, previewBudget));
         previewBudget -= take.length;
+        deliveredPreviews += take.length;
         trimmedPreviews.push(...refs.slice(take.length));
         return take;
       });
+      // Charge the conversation for what THIS turn actually carries, and persist
+      // the ledger so a restart does not reset the budget of a conversation that
+      // lives on. A replayed (interrupted-then-requeued) batch charges AGAIN —
+      // deliberately: the replay really does write those pixels into the
+      // provider thread a second time, which is the accumulation being bounded.
+      if (deliveredPreviews > 0) {
+        this.previewImagesCharged += deliveredPreviews;
+        this.reportPreviewLedger();
+      }
       // A trim here means a notice ABOVE is now wrong: it was composed when its
       // images were going to ride this turn, and they are not. Measured sequence
       // — 8 previews in flight, a second completion queued behind them (its own
@@ -1455,9 +1619,13 @@ export class PanelAgent {
       if (trimmedPreviews.length && this.backend.capabilities.vision) {
         text +=
           `\n\n[panel note: ${trimmedPreviews.length} automatic preview image(s) were NOT attached to this turn. ` +
-          `Several run completions were merged into one turn and they SHARE a single ${MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS}-image budget, ` +
+          `Several run completions were merged into one turn and they SHARE one bounded automatic-preview budget (at most ${MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS} per turn, and a cumulative per-conversation ceiling of ${MAX_SESSION_PREVIEW_ATTACHMENTS} images / ~${previewByteBudgetLabel()}), ` +
           `so a notice above may say its images are "attached below" when they are not — where they disagree, THIS note is the accurate one. ` +
           `They are outputs on the ComfyUI side that this turn does not carry — fetch any of them with get_image action:"get" — ${describeImageRefs(trimmedPreviews)}.]`;
+        // These previews are withheld from the conversation for good (the note
+        // redirects to get_image), so the diagnostics counter accounts them.
+        this.previewWithheldSession += trimmedPreviews.length;
+        this.reportPreviewLedger();
         logger.info(
           `[panel-agent ${this.short()}] trimmed ${trimmedPreviews.length} automatic preview image(s) at the drain ` +
             `(completions merged into one turn); the turn says so and names them (#1516)`,
@@ -2407,6 +2575,18 @@ export class PanelAgentManager {
         this.opts.sessionStore?.set(id, sid, this.opts.identityForKey?.(id));
         this.opts.onSession?.(id, sid, model);
       },
+      // #1516 — persist the cumulative preview ledger beside the session id it
+      // belongs to. setPreviewLedger REFUSES a session mismatch, so a ledger is
+      // only ever stored against the exact conversation it measures — a stale
+      // report for a since-replaced session is dropped, not misfiled.
+      onPreviewLedger: (id, ledger) => {
+        const sid = this.agents.get(id)?.sessionId;
+        if (sid) this.opts.sessionStore?.setPreviewLedger(id, sid, ledger);
+      },
+      // #1516 — hand the freshly-spawned agent the durable ledger of the
+      // conversation it is expected to resume; the agent adopts it only when
+      // the live session id proves to be that exact conversation.
+      initialPreviewLedger: this.opts.sessionStore?.previewLedger(tabId),
       onTurnAnchor: this.opts.onTurnAnchor,
       // Wrap onTurn so the manager learns when a turn ends — the safe point to
       // apply a deferred, session-restarting effort change.
