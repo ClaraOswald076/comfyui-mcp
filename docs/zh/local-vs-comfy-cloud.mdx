@@ -1,0 +1,120 @@
+---
+title: "本地 vs. Comfy Cloud 智能体"
+description: "Comfy-Org 的应用内智能体和 Comfy Cloud MCP 跑在 Comfy Cloud 上；comfyui-mcp 跑在你自己的 ComfyUI 安装上，用任意 LLM —— 用现有订阅跑 Claude 或 ChatGPT，或通过 Ollama 跑免费本地模型，无需账号也无需网络。一份诚实的对照：什么时候用哪个，也包括 Comfy Cloud 更合适的情况。"
+icon: "scale-balanced"
+---
+
+如果你在 Comfy-Org 的官方智能体工具和本项目之间做选择，短版是：**它们解决的是不同
+问题** —— 对相当一部分人来说，官方选项才是正确选择。本页把两边都摊开，让你选一次
+就能往下走。
+
+<Note>
+Comfy-Org 出货很快，下面的状态截至 **2026 年 7 月**。把它当成定论之前，请先查
+[docs.comfy.org/agent-tools](https://docs.comfy.org/agent-tools) 的当前状态。
+</Note>
+
+## 一句话结论
+
+**没有本地 GPU，或者想要零配置？** 用 Comfy Cloud。它是官方产品，由构建 ComfyUI 的
+团队维护，你不用去想驱动、显存或模型下载。
+
+**已经在自己的机器上跑 ComfyUI？** 这就是本项目存在的理由。GPU 已经买过了，模型已经
+在磁盘上，Claude 或 ChatGPT 订阅已经覆盖了推理。
+
+## Comfy-Org 提供什么
+
+Comfy-Org 的 [Agent Tools](https://docs.comfy.org/agent-tools) 页面列出了三款相关
+产品：
+
+| 产品 | 它是什么 | 状态（2026 年 7 月） |
+|---|---|---|
+| **Comfy Cloud MCP** | 托管 MCP 服务器；生成跑在 Comfy Cloud GPU 上 | 公开测试版 |
+| **Comfy In-App Agent** | Comfy Cloud 里的聊天驱动智能体，构建并编辑你的节点图 | 私有内测版 |
+| **Comfy Local MCP** | 官方本地 MCP 服务器，驱动你自己的 ComfyUI 安装 | 私有测试；尚未公开提供 |
+
+Comfy Cloud MCP 在它擅长的事情上确实好：它通过 MCP 暴露 ComfyUI 引擎，从 Claude Code、
+Claude Desktop 和 Codex 用 OAuth 登录，并在你没有 GPU 的情况下托管访问 Kling、Veo、
+Seedance、Flux 和 ElevenLabs 这类模型。
+
+## 本项目提供什么
+
+`comfyui-mcp` 是一个 MCP 服务器加上一个侧边栏智能体，驱动的是**你的** ComfyUI 安装
+—— 本地、局域网、VPS 或 RunPod。37 个 MCP 工具、39 个针对具体模型的技能，以及一个
+用自然语言编辑实时节点图的面板智能体。
+
+结构上的差别是**推理从哪来**。本项目与服务商无关：同一套工具和同一块面板可以跑在
+Claude、ChatGPT、Gemini、Grok 或 Kimi 上，用你已经在付的订阅；也可以跑在任何兼容
+OpenAI 的端点上；或通过 Ollama、LM Studio、llama.cpp 跑免费本地模型 —— 无需账号，
+也完全不需要出站网络。
+
+## 并列对比
+
+| | Comfy Cloud（In-App Agent / Cloud MCP） | comfyui-mcp |
+|---|---|---|
+| 生成跑在 | Comfy Cloud GPU | 你的 GPU（或你的 VPS / RunPod 实例） |
+| 需要 Comfy 账号 | 是 | 否 |
+| 可完全离线工作 | 否 | 是，配合本地模型 |
+| 推理模型 | 由服务提供 | **你的** —— 任意 LLM，包括免费本地 |
+| 成本模型 | 云端积分 | 你已有的订阅，或本地 $0 |
+| 图片 / 提示离开本机 | 是 | 只有你选择托管 LLM 时才会 |
+| 管理你的自定义节点和模型文件 | 不适用（托管环境） | 是 —— 安装节点、下载模型 |
+| 可用性 | Cloud MCP 公开测试；智能体私有内测 | 现在就能用 |
+| 官方支持 | 是 | 社区项目 |
+
+## 在这些情况下选 Comfy Cloud
+
+- 你没有 GPU，或现有的太小，跑不动想用的模型
+- 你希望零配置、零维护就能用
+- 你宁愿买积分，也不想管 CUDA、显存和 checkpoint 下载
+- 团队已经在 Comfy Cloud 上，你想要一个供应商、一张发票
+- 你想要构建 ComfyUI 的人提供的官方支持
+
+这些都是好理由。如果好几条都符合，就别再往下读了，去用
+[Comfy Cloud](https://comfy.org/) —— 你会更省心。
+
+## 在这些情况下选 comfyui-mcp
+
+- **你已经有 GPU。** 钱已经付过了；云端积分是为你已经拥有的算力再开一张账单。
+- **你的工作不能离开这台机器。** NDA 下的客户素材、有授权的训练数据、任何你不能上传
+  的东西。配合本地模型，什么都不会出去。
+- **你想用已经在付的 LLM 订阅。** Claude 或 ChatGPT 套餐已经覆盖推理 —— 智能体不用
+  再开第二个计量表。
+- **你想免费，或想离线。** Ollama、LM Studio 和 llama.cpp 无需账号、无需网络就能跑。
+  见 [本地 LLM](/docs/zh/local-llms)。
+- **你的安装本身就是重点。** 你的自定义节点、你的 LoRA、你的 checkpoint 收藏。智能体
+  会[安装节点并下载模型](/docs/tools/models)到你真正在用的那份安装里。
+- **你想自己选模型。** 不同 LLM 擅长不同事情；[LLM 竞技场](/docs/zh/arena) 用真实
+  ComfyUI 任务给它们打分，让你凭证据选。见 [后端](/docs/zh/backends)。
+
+## 「官方本地 MCP 会不会让这个项目多余？」
+
+问得公平，值得正面回答，而不是假装没这回事。
+
+Comfy Local MCP 是**面向本地安装的官方驱动**，它发布时会是个好驱动。但它和本项目处在
+不同一层：它把一个智能体接到 ComfyUI，而 `comfyui-mcp` 还带上智能体本身、能在十一个
+服务商和本地运行时上跑的中立后端、侧边栏 UI、针对具体模型的技能，以及节点 / 模型管理。
+
+诚实的读法：如果你只想要「让 Claude Code 和我的本地 ComfyUI 说话」，官方工具最终会覆盖
+这一点，你大概就该用它。如果你想带上自己的模型 —— 包括免费本地模型 —— 并让智能体住在
+ComfyUI 里面、自己管理这份安装，这才是本项目要填的缺口。
+
+它们也可以组合。本项目也能指向 Comfy Cloud（设置 `COMFYUI_API_KEY` —— 见
+[云端部署](/docs/zh/cloud-deployment)），所以一份配置就能覆盖本地安装、局域网机器、
+VPS 和 Comfy Cloud。
+
+## 开始使用
+
+<CardGroup cols={2}>
+  <Card title="快速开始" icon="rocket" href="/docs/zh/quickstart">
+    大约一分钟，对着本地 ComfyUI 跑起 MCP 服务器。
+  </Card>
+  <Card title="本地 LLM" icon="microchip" href="/docs/zh/local-llms">
+    在 Ollama、LM Studio 或 llama.cpp 上完全离线 —— 无需账号。
+  </Card>
+  <Card title="后端" icon="shuffle" href="/docs/zh/backends">
+    Claude、ChatGPT、Gemini、Grok、Kimi，或任何兼容 OpenAI 的端点。
+  </Card>
+  <Card title="智能体面板" icon="window" href="/docs/zh/panel">
+    驱动你实时节点图的侧边栏智能体。
+  </Card>
+</CardGroup>

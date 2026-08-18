@@ -1,0 +1,204 @@
+---
+title: "第三方主机"
+description: "在移动端 App 所用的同一套配对协议上，构建你自己的前端（Blender 面板、浏览器扩展、另一个应用）—— 一个智能体、共享上下文、薄客户端。消息形状、端点、安全不变量，以及一段可粘贴的提示，让 LLM 给你搭适配器脚手架。"
+icon: "plug"
+---
+
+智能体面板、[移动端 App](/docs/zh/mobile)，以及任何与正在运行的会话配对的工具，都对编排器
+的配对监听器说**同一种小型 WebSocket 协议**。**第三方主机**是你在那套协议上构建的任何
+客户端 —— Blender 面板、浏览器扩展、CLI、另一个编辑器 —— 它**附着到一个实时桌面标签页
+并驱动那个智能体会话**。同一个智能体，同一段上下文，没有第二个 Claude Code 进程，用户
+也不用额外安装任何东西。
+
+<Note>
+这正是移动端 App 建在上面的那一面。只要你能打开 WebSocket 并发送 JSON，就能构建主机。
+</Note>
+
+## 工作原理
+
+<Steps>
+<Step title="桌面已经在听">
+智能体面板打开时，编排器会在局域网上跑一个**令牌把门的配对监听器**（见
+[端点](#端点)）。每个打开的面板标签页都是一个带稳定 `tab_id` 和实时智能体会话的
+**桌面标签页**。
+</Step>
+<Step title="你的主机带着配对令牌连接">
+用查询字符串里的令牌打开到配对 URL 的 WebSocket。没有有效令牌，连接会被拒绝 ——
+配对就是整条安全边界。
+</Step>
+<Step title="列出并附着到一个标签页">
+发送 `list_tabs` 发现打开的桌面标签页，再发 `attach_tab` 镜像其中一个。你的主机现在
+**接收那个标签页的活动**（流式），并且可以**驱动它**。
+</Step>
+<Step title="驱动共享会话">
+发送 `user_message` 帧。附着期间，服务器把它们路由到**被镜像的标签页** —— 于是你的
+消息进入桌面智能体所在的*同一段*对话。这才是「一个智能体、共享上下文」，而不是第二个
+会话。
+</Step>
+</Steps>
+
+## 端点
+
+配对监听器从桥接端口派生（`COMFYUI_MCP_BRIDGE_PORT`，默认 **9180**）：
+
+| 端口 | 用途 |
+|---|---|
+| `bridge`（9180） | 面板 ⇄ 编排器 UI 桥接（桌面自己的连接）。 |
+| `bridge + 1`（9181） | `panel_*` HTTP-MCP 面 —— **不是**本协议。 |
+| **`bridge + 2`（9182）** | **你要连的配对 / 远程控制监听器。** 令牌把门，绑在 `0.0.0.0`（局域网可达）。 |
+
+**配对 URL：**
+
+```
+ws://<desktop-machine-ip>:9182/?token=<PAIR_TOKEN>
+```
+
+- 令牌要么由用户通过 `COMFYUI_MCP_PAIR_TOKEN` **钉死**（始终开启配对），要么**按会话
+  铸造**并通过面板的二维码 / 配对流程发出。你的主机拿到它的方式和移动端 App 一样：
+  用户配对一次。
+- **默认绑在局域网上**，但用户要求时也内置了公网暴露：面板的配对对话框提供
+  **Internet** 模式，打开一条加密的 cloudflared 快速隧道；企业也可以把它走自建中继
+  （`COMFYUI_MCP_TUNNEL_BACKEND=relay`）。无论哪种，令牌都把门。
+
+## 消息形状
+
+所有帧都是带 `type` 的 JSON 对象。请求 / 响应帧携带一个你自己选的 `cid`（关联 id），
+在对应回复上原样回显。
+
+### 入站 —— 主机 → 编排器
+
+| `type` | 字段 | 效果 |
+|---|---|---|
+| `hello` | `tab_id`，`headless: true` | 注册你的连接。第三方主机是**无头**客户端（自己没有画布）。 |
+| `list_tabs` | `cid` | 询问打开的桌面标签页。 |
+| `attach_tab` | `cid`，`target_tab_id` | 镜像并驱动那个桌面标签页。只对**真实、非无头**的桌面标签页有效。 |
+| `detach_tab` | — | 停止镜像 / 驱动；你的输入回到你自己的（空）会话。 |
+| `user_message` | `text`（+ 你平时的消息字段） | **被镜像**标签页对话里的一轮。由服务器盖戳到已附着的标签页。 |
+
+附着期间你发送的任何其他面板事件，同样会路由到被镜像的标签页。
+
+### 出站 —— 编排器 → 主机
+
+| `type` | 字段 | 含义 |
+|---|---|---|
+| `tab_list` | `cid`，`tabs[]` | 对 `list_tabs` 的回复：可附着的桌面标签页。 |
+| `tab_attached` | `cid`，`tab_id`，`ok`，`error?` | 对 `attach_tab` 的回复。目标过期 / 无头时是 `ok:false` + `error`。 |
+| `mailbox_flush` | 缓冲的帧 | 你没有实时连接时该标签页产出的任何内容的回放。 |
+
+再加上被镜像标签页的实时智能体活动（流式回复、状态、卡片），由你的主机来渲染。
+
+<Warning>
+**`attach_tab` 是权威的 —— 你不能伪造目标。** 服务器会用你实际附着到的标签页覆盖你
+在出站帧上放的任何 `tab_id`。主机永远只能驱动它显式附着过的标签页。这是故意的；见下。
+</Warning>
+
+## 安全不变量 —— 主机必须守住这些
+
+这些保证让配对是安全的。构建一个尊重它们的主机就是整份合约；试图绕过它们的主机，正是
+监听器设计来拒绝的东西。
+
+<Note>
+守住这些不是对你主机的约束 —— 它*就是*功能本身。它们阻止客户端劫持它从未配对过的
+会话。
+</Note>
+
+1. **令牌门。** 监听器拒绝任何没有有效配对令牌的连接（`verifyClient`）。永远不要做
+   自动下发或内嵌令牌的流程 —— 用户配对，一次，故意的。
+2. **权威的 `attach_tab` 盖戳。** 决定你的帧打向哪个标签页的是服务器，不是客户端。
+   不要依赖客户端提供的 `tab_id` 做路由；先附着，再发送。
+3. **只允许非无头目标。** 你可以附着到真实桌面标签页，永远不能附着到另一个无头客户端
+   （你不能镜像另一部手机 / 主机）。
+4. **一次一个标签页。** 附着到 B 会丢掉你对 A 的订阅。按每个连接一个活动镜像来建模。
+5. **钉死的套接字种类。** 连接的种类（无头 vs 桌面）在第一次 `hello` 时固定；不要试图
+   翻转它来逃过接管护栏。
+
+## 最小参考客户端
+
+```js
+const token = "<PAIR_TOKEN>";            // obtained via the user's pair flow
+const ws = new WebSocket(`ws://192.168.1.50:9182/?token=${token}`);
+let cid = 0;
+
+ws.onopen = () => {
+  ws.send(JSON.stringify({ type: "hello", tab_id: "myhost:" + crypto.randomUUID(), headless: true }));
+  ws.send(JSON.stringify({ type: "list_tabs", cid: ++cid }));
+};
+
+ws.onmessage = (ev) => {
+  const m = JSON.parse(ev.data);
+  if (m.type === "tab_list") {
+    // pick a desktop tab and attach to it
+    const target = m.tabs[0]?.tab_id;
+    if (target) ws.send(JSON.stringify({ type: "attach_tab", cid: ++cid, target_tab_id: target }));
+  } else if (m.type === "tab_attached" && m.ok) {
+    // now you're driving that tab's session
+    ws.send(JSON.stringify({ type: "user_message", text: "Add a KSampler and wire it up." }));
+  } else {
+    // render streamed agent activity for the mirrored tab
+    console.log("from session:", m);
+  }
+};
+```
+
+## 教 LLM 构建你的适配器
+
+把下面的提示粘进 Claude、ChatGPT 或你的编码智能体，让它为你的平台搭一份主机适配器
+脚手架。它带着完整的协议合约，模型不用猜。
+
+```text Copy this into your LLM
+You are building a THIRD-PARTY HOST ("adapter") for comfyui-mcp. A host connects
+to a running comfyui-mcp orchestrator over WebSocket, attaches to a live desktop
+"tab", and drives that tab's agent session — same agent, shared context, no second
+session. Build the adapter for THIS platform: <describe your platform, e.g. a
+Blender sidebar panel / a Chrome extension / a Neovim plugin>.
+
+CONNECTION
+- WebSocket to:  ws://<desktop-ip>:9182/?token=<PAIR_TOKEN>
+  (port = bridge port + 2; bridge default 9180. Token is provided by the user via
+  their pairing flow — NEVER hardcode, embed, or auto-provision it.)
+- On open, send:  {"type":"hello","tab_id":"<your-unique-id>","headless":true}
+
+DISCOVER + ATTACH
+- Send {"type":"list_tabs","cid":1}; you receive {"type":"tab_list","cid":1,"tabs":[...]}.
+- Send {"type":"attach_tab","cid":2,"target_tab_id":"<a tab_id from tab_list>"};
+  you receive {"type":"tab_attached","cid":2,"tab_id":"...","ok":true|false,"error"?}.
+  Only real, non-headless desktop tabs are attachable.
+
+DRIVE
+- Send {"type":"user_message","text":"..."} to post a turn into the ATTACHED tab's
+  conversation. The server routes it to the mirrored tab automatically.
+- Send {"type":"detach_tab"} to stop.
+
+RENDER
+- After attaching you receive the mirrored tab's live activity (streamed agent
+  replies, status, interactive cards) and a {"type":"mailbox_flush"} replay of
+  anything produced while you were disconnected. Render these in your UI.
+
+SECURITY — these are non-negotiable; preserve every one:
+1. Only connect with a user-provided pair token; never embed or auto-ship it.
+2. Never assume you can target a tab you did not attach_tab to — the server stamps
+   the target authoritatively; trust tab_attached.ok, don't spoof tab_id.
+3. Attach only to non-headless desktop tabs; never to another headless client.
+4. One active attachment per connection (attaching to a new tab drops the old).
+5. Do not try to change your connection's kind after the first hello.
+
+DELIVERABLE
+- A minimal, working adapter for the platform above: connect → list → attach →
+  send a user_message → render streamed replies → detach. Handle reconnects and
+  the mailbox_flush replay. Keep the pairing/token handling explicit and
+  user-driven.
+```
+
+## 登记你的集成
+
+做出了什么？**登记它**，这样它可以被列出，我们也能在协议变更发货前通知你：
+
+<Card title="登记第三方主机" icon="plug" href="https://github.com/artokun/comfyui-mcp/issues/new?template=third-party-host.yml">
+在 GitHub 上打开登记模板 —— 名称、平台、仓库，以及你对照构建的协议版本。
+</Card>
+
+<Note>
+**稳定性：** 上面的帧是移动端 App 发货时用的，但这还不是一份冻结、带版本的合约 ——
+以源码（[`src/services/ui-bridge.ts`](https://github.com/artokun/comfyui-mcp/blob/main/src/services/ui-bridge.ts)）
+为准，并登记你的主机，形状变动时你会收到通知。
+</Note>

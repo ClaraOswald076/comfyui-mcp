@@ -1,0 +1,364 @@
+---
+title: "本地 LLM 与其他智能体"
+description: "对 Hermes Agent、OpenClaw 和 Copilot CLI 的一等支持 —— 再加上任何跑在本地（Ollama）或托管模型上的 MCP 客户端。一条命令完成设置，以及把约 200 个工具 schema 收成 3 个元工具的紧凑工具模式。"
+icon: "microchip"
+---
+
+comfyui-mcp 是标准的 stdio MCP 服务器，所以**任何具备 MCP 能力的智能体都能驱动它**
+—— 不只是 Claude Code。本页覆盖我们一等支持的套件（**Hermes Agent、OpenClaw、
+Copilot CLI**）、你的模型需要带上什么，以及让小型 / 本地模型能用的**紧凑工具模式**。
+
+## 模型要求
+
+对自己带来的模型要诚实。*完整*体验的最低规格是带 **工具调用 + 思考 + 视觉** 的模型：
+
+| 能力 | 没有它 |
+| --- | --- |
+| **工具调用**（原生函数调用） | **不能用。** 每一个 comfyui-mcp 动作都是一次工具调用。某些套件里用提示词模拟的工具调用技术上能跑，但可靠性会崩 —— 当作不支持。 |
+| **思考 / 推理** | 能用，降级。多步链（选工具 → 取 schema → 建参数 → 从错误恢复）会明显变差；预期智能体需要再提示 / 推一把。 |
+| **视觉** | 能用，降级。智能体能生成但看不见 —— `get_image (action:"view")` 批评循环、`get_workflow (action:"from_image")`，以及视觉对比都不可用，于是它对自己的输出是盲飞。 |
+
+符合完整规格的托管模型每月都在变 —— 查你服务商的模型卡上这三项能力，不要信一份名单。
+截至 2026 年中：**Xiaomi MiMo-V2.5**（视觉 + 工具 + 长上下文）便宜地符合完整规格；
+**DeepSeek-V3.x / GLM / MiniMax** 级模型有很强的工具调用 + 思考，但纯文本变体会丢掉
+视觉循环；小型本地模型（见下）通常保住工具调用、丢掉其余。
+
+## 紧凑工具模式
+
+完整面是 37 个工具，带着丰富的 JSON schema（约 200 KB，大约 5 万 token，每次
+`tools/list`）。大多数非 Claude 套件会把每个已注册 schema 直接注入模型上下文 —— 对
+前沿模型没问题，对 4B 本地模型是致命的。**紧凑工具模式**正好注册**三个元工具**，
+并把真正的目录放在它们后面：
+
+| 元工具 | 它做什么 |
+| --- | --- |
+| `list_tools` | 省 token 的目录：每个工具名 + 一行摘要，按分类分组。支持 `category` 和 `search` 过滤。 |
+| `describe_tool` | 一个工具的完整描述 + JSON Schema，只在需要时取。 |
+| `call_tool` | 跑任何已编目的工具：`{"name": "generate_image", "args": {...}}`。返回底层工具原样返回的东西。 |
+
+模型的循环是：`list_tools` → 挑选 → `describe_tool` → `call_tool`。schema 一次只进
+一个工具的上下文。元工具故意容忍小型模型的怪癖：`args` 可以是对象**或** JSON 编码的
+字符串，常见字段别名（`tool_name`、`arguments`）会被接受，校验错误会带着期望的
+schema 回来，好让模型自己纠正，而不是死在一条不透明的协议错误上。
+
+紧凑是**可选开启** —— 直接面是默认，所以小型模型需要下面之一（标志优先于环境变量）：
+
+```bash
+npx -y comfyui-mcp --compact
+# or
+COMFYUI_MCP_TOOL_MODE=compact npx -y comfyui-mcp
+```
+
+默认适合前沿模型套件（Claude Code / Cursor / Claude Desktop），它们的客户端能很好地
+处理大工具列表。`--full` 仍然接受，现在是空操作。
+
+### 自动选择：按模型，不按服务商
+
+在面板的本地 LLM 后端（Ollama / LM Studio / llama.cpp / 兼容 OpenAI）里，当你**没有
+选过模式**时，由*模型*来选：
+
+- 模型 id 带着参数量且达到或超过 **70B** 的（`llama3.3:70b`、`gpt-oss:120b`、
+  `mixtral:8x22b`）拿到**完整**面；
+- 更小的保持**紧凑**；
+- 没有可读参数量的模型 id（`moonshotai/kimi-k2.5`）当作**未知**，不当作小，拿到文档
+  里写的紧凑回退。
+
+「Ollama ⇒ 紧凑」两个方向都错 —— 70B 本地模型扛得住完整面，没必要被瘸掉；一些小型
+托管模型却想要紧凑。所以信号是模型。
+
+**你的选择永远赢，两个方向都是。** `COMFYUI_MCP_TOOL_MODE=full` 会把完整面硬塞给 4B
+模型；`COMFYUI_MCP_TOOL_MODE=compact` 会把路由器硬塞给 405B。自动选择只填「什么都没
+选」的缺口。
+
+70B 阈值故意保守：这是任何人在这条轴上真正断言过的唯一数字，所以没有什么是靠猜提上去
+的。`COMFYUI_MCP_FULL_SURFACE_MIN_PARAMS_B=30` 会把它调低，如果你想找到硬件真正的
+天花板。
+
+**系统提示跟着模式走。** 紧凑提示告诉模型它有六个工具，并把 ComfyUI 走 `call_tool`；
+选了完整面时那句话就是假的，所以完整模式提示说 ComfyUI 工具直接广告，路由器描述只留给
+`panel_*`。自动选了完整面却否认工具存在，会比它替换掉的默认更糟。
+
+当前模式**以及原因**会打在后端的就绪行上，例如 `Tool mode: compact — chosen for this
+MODEL: "qwen3:4b" is ~4B parameters, below the 70B full-surface threshold…`，于是这根
+杠杆再也不会隐形。
+
+<Note>
+这套自动选择覆盖面板的本地 LLM 通道。Codex / Gemini / Grok / Copilot HTTP 通道出于
+另一个原因钉在紧凑 —— 它们自己的工具预算否则会挤掉 `panel_*` 工具 —— 独立 MCP 服务器
+的默认不变。
+</Note>
+
+## 音频输入
+
+**在 `ollama` 后端上（原生 `/api/chat`）**，音频只在模型实际报告它能听时才到达模型。
+发送之前，后端会为那个模型问 `POST /api/show` 的能力：
+
+```bash
+ollama pull gemma4:e2b      # capabilities: completion, vision, audio, tools, thinking
+```
+
+如果选中的模型没有 `audio` 能力，附件会被**大声拒绝** —— 带着服务器报告的能力列表，
+以及一条能听的模型的 pull 命令 —— 而不是丢进请求里，让模型只根据你的文本回答。文件
+不是音频格式，或存在但零字节，同样如此。
+
+把字节送过去还不是整份工作。对着 `gemma4:e2b` 现场测过：WAV 明确在上下文里（555 个
+提示 token，`/api/show` 报告 `audio`），模型仍然回答 *「我没有转录音频的能力 —— 我的
+功能仅限于操作 ComfyUI」*。面板系统提示把它塑造成节点图操作员，小型模型会把自己从
+它实际拥有的感官里推理出去。所以一轮音频经过能力检查并附着之后，还会带一条短说明，
+告诉模型音频在那里、它该根据听见的来回答。有了那条说明，同一个模型四次运行里四次都
+转录对了。
+
+**在兼容 OpenAI 的后端上**（LM Studio、llama.cpp、OpenRouter、自定义）没有可以问的
+能力端点。音频作为 `input_audio` 内容块发送，这一轮带着一句明确的 *「我无法确认模型
+真的收到了它们」*。拒绝会把音频拒给每一个只是没有能力 API 的端点；跑不起来的护栏不是
+判决 —— 但也不是确认，措辞就是这么说的。
+
+每个其他服务商做什么，见 [后端 → 音频输入](/docs/zh/backends#音频输入--哪些后端老实说)。
+
+## 一条命令完成设置
+
+`comfyui-mcp setup <agent>` 把服务器条目写进该套件自己的配置文件（与已经在那里的东西
+合并 —— 已有服务器、YAML 里的注释，全部保留）：
+
+```bash
+npx -y comfyui-mcp setup hermes     # → ~/.hermes/config.yaml      (compact by default)
+npx -y comfyui-mcp setup openclaw   # → ~/.openclaw/openclaw.json  (compact by default)
+npx -y comfyui-mcp setup copilot    # → ~/.copilot/mcp-config.json (full by default)
+```
+
+标志：`--compact` / `--full` 覆盖按智能体的默认，`--comfyui-url <url>` 嵌入你的
+ComfyUI 目标（本地、局域网或 RunPod 代理 URL），`--dry-run` 打印合并后的配置而不写入。
+
+## Hermes Agent
+
+```bash
+npx -y comfyui-mcp setup hermes --comfyui-url http://127.0.0.1:8188
+```
+
+会在 `~/.hermes/config.yaml` 里产出这个（更想手写也可以）：
+
+```yaml
+mcp_servers:
+  comfyui:
+    command: "npx"
+    args: ["-y", "comfyui-mcp", "--compact"]
+    env:
+      COMFYUI_URL: "http://127.0.0.1:8188"
+```
+
+用 `/reload-mcp` 重载（或重启 Hermes）。Hermes 会给工具加前缀，所以模型看见的是
+`mcp_comfyui_list_tools`、`mcp_comfyui_describe_tool` 和 `mcp_comfyui_call_tool`
+—— 上下文里三个定义，而不是两百个。
+
+<Note>
+在前沿模型上（经 Nous Portal / OpenRouter）你可以带着 `--full` 再跑一次 setup，并
+可选使用 Hermes 自己的 `tools.include` 允许列表。对任何更小的东西，紧凑都是正确默认。
+</Note>
+
+Hermes 还自带一个捆绑的 `comfyui` *技能*，用 Python 脚本经原始 REST 驱动 ComfyUI。
+它能用，但早于这台服务器 —— MCP 路径给你工作流编写 / 校验、模型 + 自定义节点管理、
+安装包、队列控制和自诊断。如果智能体一直伸手去够技能而不是 MCP 工具，就关掉那个技能。
+
+## OpenClaw
+
+```bash
+npx -y comfyui-mcp setup openclaw
+```
+
+会在 `~/.openclaw/openclaw.json` 里产出这个：
+
+```json
+{
+  "mcpServers": {
+    "comfyui": {
+      "command": "npx",
+      "args": ["-y", "comfyui-mcp", "--compact"],
+      "transport": "stdio"
+    }
+  }
+}
+```
+
+重启 OpenClaw 网关以加载服务器。OpenClaw 的文档建议把 MCP 工具数量保持得低 —— 这正是
+紧凑模式的用途，也是这里默认它的原因。
+
+## Copilot CLI
+
+```bash
+npx -y comfyui-mcp setup copilot
+# or use Copilot's own command:
+copilot mcp add comfyui -- npx -y comfyui-mcp
+```
+
+会在 `~/.copilot/mcp-config.json` 里产出这个：
+
+```json
+{
+  "mcpServers": {
+    "comfyui": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "comfyui-mcp"],
+      "env": {},
+      "tools": ["*"]
+    }
+  }
+}
+```
+
+Copilot CLI 跑前沿模型，所以 setup 默认是**完整**工具面（如果你把 Copilot 指到更小的
+模型，传入 `--compact`）。在 `copilot` 里用 `/mcp show` 检查。
+
+## 我们微调的本地模型（免费、推荐）
+
+如果你想**在本地免费**跑智能体，从这里开始。我们专门为 comfyui-mcp 微调了 Gemma 4
+家族：在对着一台实时 ComfyUI 合成的 **1,055 条经服务器核实的工具使用轨迹** 上做
+QLoRA 训练 —— 覆盖**完整 178 工具面**（113 个 MCP + 65 个面板工具）—— 于是模型原生
+认识这一套工具，而不是冷遇见它。
+
+```bash
+# 1. Install Ollama (once):  https://ollama.com/download
+# 2. Pull the size that fits your GPU:
+ollama pull artokun/gemma4-comfyui-mcp:e4b     # default — ~3.5 GB VRAM at q4
+ollama pull artokun/gemma4-comfyui-mcp:12b     # ~8 GB VRAM
+ollama pull artokun/gemma4-comfyui-mcp:e2b     # smallest — ~2 GB VRAM (see caveat)
+```
+
+**测过的，不是许诺的** —— [LLM 竞技场](/docs/zh/arena) 在真实 10 场景阶梯上的分数
+（三次取最好，每个结果都对照实时 ComfyUI 服务器核实，RTX 4090）：
+
+| 标签 | 显存（q4） | 竞技场分数 | 对比原版 |
+|---|---|---|---|
+| `:e4b` | ~3.5 GB | **14/20**（13–14）—— 我们测过最好的本地模型 | 原版 gemma4:e4b：12/20 |
+| `:12b` | ~8 GB | 13/20（12–13） | 原版 12b 未跑分 |
+| `:e2b`（v2） | ~2 GB | 10/20（7–10） | 原版 gemma4:e2b：8/20 |
+
+现在每一档都超过它的原版底座。`:e2b` v2 重训（双视角训练：直接工具调用 **以及** 部署
+的路由器信封）修好了 v1 的 `call_tool` 格式回退 —— 裁决运行里零个畸形信封。体量指引
+仍然成立：`:e4b` 是甜点（只比 e2b 多约 1.5 GB，竞技场 +4）；`:e2b` 现在是显存紧时的
+正经选择；`:12b` 买的是长多步任务上的稳，不是原始分数。
+
+| 标签 | 底座 | 显存（q4） | 说明 |
+| --- | --- | --- | --- |
+| `:e4b` | Gemma 4 E4B | ~3.5 GB | **默认** —— 体量 / 质量最好的平衡 |
+| `:e2b` | Gemma 4 E2B | ~2 GB | 想得很啰嗦 —— 给足 `max_tokens`（≥512） |
+| `:12b` | Gemma 4 12B | ~8 GB | 最强的一档 |
+
+面板的 Ollama 后端**默认 `:e4b`** —— 在后端选择器里选 **Ollama（本地）**，模型拉下来
+就能用。无需账号，无需 API 密钥，没有按 token 费用。
+
+**上下文窗口：** 这些标签烤进了 **65,536 token** 窗口，编排器听从它（原版模型拿 16K）。
+架构支持到 **128K**（`:e2b`/`:e4b`）和 **256K**（`:12b`）—— 有显存就用
+`COMFYUI_MCP_OLLAMA_NUM_CTX=131072` 调高（KV 缓存随窗口涨）。如果智能体开始在对话
+中途「忘记」，看编排器日志：一轮填满窗口的 ≥85% 时它会警告。权重、LoRA 适配器和训练
+管线是开放的：[`artokun/gemma4-comfyui-mcp`](https://huggingface.co/artokun/gemma4-comfyui-mcp)
+（数据集：[`artokun/comfyui-mcp-trajectories`](https://huggingface.co/datasets/artokun/comfyui-mcp-trajectories)）。
+
+## LM Studio
+
+面板原生说 LM Studio：在后端选择器里选 **LM Studio**，编排器驱动它的本地服务器
+（`http://127.0.0.1:1234/v1`，用 `COMFYUI_MCP_LMSTUDIO_HOST` 覆盖）。设置是两下点击：
+从 [lmstudio.ai](https://lmstudio.ai) 安装，然后 **Developer → Start Server**，并加载
+一个**支持工具调用的模型**。模型选择器镜像服务器提供的任何东西；没设默认时，自动采用
+第一个在服务的模型。编排器**全生命周期**放手管理：需要时自动启动服务器，JIT 加载你的
+模型，ComfyUI 渲染跑着时释放它的显存（聊天被按住，渲染结束再答），换模型时卸载离去的
+模型，切到别的服务商时释放一切。
+
+我们微调的 GGUF 在这里也能用 —— 在 LM Studio 的模型下载器里搜
+`artokun/gemma4-comfyui-mcp`，拿一个 `model-q4_k_m.gguf`。预期第一次消息会有和
+Ollama 一样的 JIT 冷加载停顿（30 秒以上是正常的）。
+
+## llama.cpp（llama-server）
+
+跑原始 `llama.cpp`？在后端选择器里选 **llama.cpp** —— 编排器驱动 `llama-server` 兼容
+OpenAI 的端点（`http://127.0.0.1:8080/v1`，用 `COMFYUI_MCP_LLAMACPP_HOST` 覆盖）：
+
+```bash
+llama-server -m gemma4-comfyui-mcp-e2b.Q4_K_M.gguf -c 16384
+```
+
+现场注意：上下文是**启动标志**（`-c`）—— 服务器跑在 16K 以下时智能体会警告（工具
+载荷需要它）。当前构建默认打开工具调用；**更旧的构建需要 `--jinja`**（面板在连接时
+检测到不会工具的服务器，会原样这么说）。自动采用那个唯一已加载的模型 —— 不用挑。
+
+在单 GPU 盒子上，**本地** llama-server（或前面再套 llama-swap）加入和 Ollama、
+LM Studio 一样的显存交接：ComfyUI 渲染跑着时，你的聊天被按住，渲染一结束就答。因为
+llama-server 没有卸载 API（llama-swap 则在需要时在上游换模型），交接只是按住 ——
+没有东西被显式卸载或预热。**远程** `COMFYUI_MCP_LLAMACPP_HOST` 是别人的 GPU，永远
+不会被门住。交接对三个本地后端默认打开；用 `COMFYUI_MCP_PAUSE_LOCAL_ON_GEN=0` 退出
+（旧的 `COMFYUI_MCP_OLLAMA_PAUSE_ON_GEN=0` 仍然被尊重）。
+
+## 自定义端点（任何兼容 OpenAI 的服务器）
+
+任何说 `/v1/chat/completions` 的东西 —— vLLM、DeepSeek、Together、Azure OpenAI、
+另一台盒子上的 llama-server、公司网关 —— 都能作为**自定义端点**服务商插进来：
+
+1. ComfyUI 设置 → **Comfy MCP Agent → 自定义端点** → 设置 **端点基址 URL**
+   （带上 `/v1`，例如 `http://192.168.1.20:8000/v1`）。
+2. 如果服务器需要密钥：**设置 API 密钥…** —— 遮罩输入；密钥由编排器按 `0600` 存在
+   `~/.comfyui-mcp`，从不进 ComfyUI 设置或聊天。
+3. 在后端选择器里选 **自定义端点** 并连接。
+
+模型列表来自服务器的 `/v1/models`；单模型服务器会自动采用，或不列出模型的端点请显式
+设一个 **默认模型** id。环境逃生口：`COMFYUI_MCP_CUSTOM_BASE_URL`、
+`COMFYUI_MCP_CUSTOM_MODEL`、`COMFYUI_MCP_CUSTOM_API_KEY`。模型必须支持**工具调用**。
+
+## Ollama 与本地模型 —— LLM 竞技场
+
+任何和 Ollama（或兼容 OpenAI 的端点）说话的 MCP 套件，都能用本地模型驱动紧凑模式。
+仓库里带两套可重复的套件：`npm run test:local-llm`（快速单模型检查）和
+`node scripts/llm-arena.mjs` —— **ComfyUI LLM 竞技场**，让一群模型对着*实时*
+ComfyUI 跑同一套任务，并对照服务器核实每一个结果，从不信模型自己说的。
+
+完整 10 场景阶梯上的本地档分数（RTX 4090，ComfyUI 0.27，temperature 0 —— 任务阶梯
+和含前沿、托管模型的全档排行榜见 [竞技场页](/docs/zh/arena)）：
+
+| 模型 | 体积 | 分数 /20 |
+| --- | --- | --- |
+| `qwen3:4b` | 2.6 GB | **13** |
+| `gemma4:e4b` | 9.6 GB | **12** |
+| `qwen3:8b` | 5.2 GB | **11** |
+| `gemma4:e2b` | 7.2 GB | **8** |
+| `llama3.1:8b` | 4.9 GB | **2** |
+| `gemma3`（任意体积） | — | ❌ 没有原生工具调用 —— 不支持 |
+
+要点：qwen3/gemma4 这一档稳稳过掉单工具任务（健康、已装模型、注册表搜索、队列），
+并在更难的带上捡分，但多阶段节点图编排（一张图两个管道输出、分阶段的两段 img2img
+管线）仍是前沿 / B 档的地盘。llama3.1:8b 的工具格式纪律在这份目录上会崩（它幻觉
+工具名，并把工具调用 JSON 当文本打印）。Gemma 4 全家族都带了原生函数调用（Ollama
+≥ v0.20）；`e4b` 或更大是甜点。
+
+记住上面的能力阶梯：这些小型模型保住工具调用，但视觉和思考有限 / 没有，所以它们能
+生成并管理工作流，却不能在视觉上批评结果。
+
+## 本地模型上的侧边栏面板
+
+[面板智能体](/docs/zh/panel) 在 Claude / ChatGPT / Gemini 之外多了一个 **Ollama
+后端**：在后端选择器里选 **Ollama（本地）**，编排器就用本地模型驱动你的实时节点图
+—— 无需账号，无需 API 密钥，完全离线。模型看见的是 6 工具路由器（3 个紧凑 comfyui
+元工具，加上实时画布用的 `panel_list_tools` / `panel_describe_tool` /
+`panel_call_tool`），所以即使 4B 模型也不会被 schema 淹死。默认模型：
+**`artokun/gemma4-comfyui-mcp:e4b`** —— [我们的 gemma4
+微调](#我们微调的本地模型免费推荐)，在这一套工具上训练（取代原版 `gemma4:e4b`，
+以前的竞技场最佳）；用 `COMFYUI_MCP_OLLAMA_MODEL` 或面板的模型选择器覆盖，选择器
+列出你本地拉过的任何东西。预期相对前沿后端的诚实取舍：更慢的轮次（尤其是第一次，
+模型加载时）、没有视觉、没有对话回滚。
+
+## 你得到什么（得不到什么）
+
+任何 MCP 客户端都能拿到**完整工具面** —— 生成、工作流编写、模型、自定义节点、队列、
+诊断 —— 两种工具模式都是。Claude Code 的**插件附加**（技能、斜杠命令、钩子、安装包、
+侧边栏面板智能体）是插件功能，不会跟到其他套件。`list_tools` 目录设计成带着足够的
+定向，好让没有那一层知识的智能体仍然找得到路。
+
+## 故障排查
+
+- **模型用字符串化的 `args` 调用 `call_tool`** —— 支持；服务器会自动解析 JSON 编码
+  的字符串。
+- **模型发明工具名** —— 未知名字会返回接近的匹配建议，外加指回 `list_tools`。
+- **错误 / 缺失参数** —— 错误里带着工具的 JSON Schema；能做到的模型会在下一次尝试
+  自己纠正。
+- **模型从目录里回答、什么都不跑** —— 已知的小型模型失败模式；推它一把（「目录条目
+  是工具名，不是数据 —— 用 call_tool 跑工具」）。
+- **ComfyUI 够不到** —— 紧凑模式只改工具的*注册*；连接配置和所有其他设置一样（见
+  [配置](/docs/zh/configuration)）。

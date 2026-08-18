@@ -279,8 +279,29 @@
                 "pages": [
                   "zh/index",
                   "zh/quickstart",
+                  "zh/using-tools",
+                  "zh/local-vs-comfy-cloud",
                   "zh/installation",
+                  "zh/roadmap"
+                ]
+              },
+              {
+                "group": "配置",
+                "pages": [
+                  "zh/configuration",
+                  "zh/remote-connector",
+                  "zh/cloud-deployment",
+                  "zh/docker",
+                  "zh/self-hosted-relay",
+                  "zh/concepts",
+                  "zh/plugin",
                   "zh/panel",
+                  "zh/apps",
+                  "zh/mobile",
+                  "zh/third-party-hosts",
+                  "zh/backends",
+                  "zh/local-llms",
+                  "zh/arena",
                   "zh/troubleshooting"
                 ]
               }
