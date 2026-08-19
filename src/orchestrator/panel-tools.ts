@@ -65,6 +65,10 @@ import { conversationOfScopeAddress, isScopeAddress, shortTabId } from "../servi
 import type { ScopeRepinOutcome } from "./turn-origins.js";
 import { NODE_ID_MESSAGE, NODE_ID_PATTERN, normalizeNodeId } from "./node-id.js";
 import {
+  parseContradictoryPromotedWidgetRefusal,
+  resolveInnerPromotedTarget,
+} from "./promoted-widget.js";
+import {
   clearSwitchHold,
   describeSwitchHold,
   recordSwitchHold,
@@ -10396,9 +10400,100 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // a single revalidation, #338/#458) — that authoritative fetch can outlast
         // the 6000 ms default ack on a large install and return a FALSE timeout.
         // Give the guarded write the bounded refresh ack budget.
-        return ctx.call(
-          { cmd: "graph_set_widget", node_id: args.node_id, widget: args.widget, value },
-          OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+        const write = (nodeId: unknown, widget: string): Promise<ToolResult> =>
+          ctx.call(
+            { cmd: "graph_set_widget", node_id: nodeId, widget, value },
+            OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+          );
+        const first = await write(args.node_id, args.widget as string);
+        if (!first.isError) return first;
+
+        // #1655 — the panel listed this widget as promoted while refusing it as
+        // not promoted. The listing is node.widgets; the write looks up host
+        // inputs. When those disagree, resolve the displayed name to the unique
+        // inner mapping and set it there (the issue's own workaround), then
+        // leave the subgraph so the caller's scope is unchanged.
+        const refusal = parseContradictoryPromotedWidgetRefusal(
+          textOfToolResult(first),
+          args.widget as string,
+        );
+        if (!refusal || String(refusal.nodeId) !== String(args.node_id)) return first;
+
+        if (refusal.widget !== args.widget) {
+          const remapped = await write(args.node_id, refusal.widget);
+          if (!remapped.isError) return remapped;
+          if (
+            !parseContradictoryPromotedWidgetRefusal(
+              textOfToolResult(remapped),
+              refusal.widget,
+            )
+          ) {
+            return remapped;
+          }
+        }
+
+        const sub = await ctx.call({ cmd: "graph_get_subgraph", node_id: args.node_id });
+        if (sub.isError) {
+          return appendToolResultText(
+            first,
+            `\n\n(The panel listed "${refusal.widget}" as promoted while refusing it. ` +
+              `Tried to resolve that name to the inner widget and graph_get_subgraph FAILED: ` +
+              `${textOfToolResult(sub)})`,
+          );
+        }
+        const inner = resolveInnerPromotedTarget(parseToolResultJson(sub), refusal.widget);
+        if (!inner) {
+          return appendToolResultText(
+            first,
+            `\n\n(The panel listed "${refusal.widget}" as promoted while refusing it. ` +
+              `graph_get_subgraph did not uniquely identify an inner node that owns that widget, ` +
+              `so the write was not retried — guessing among several inners, or acting on a ` +
+              `truncated inner list, would target the wrong node.)`,
+          );
+        }
+
+        const entered = await ctx.call(
+          { cmd: "graph_enter_subgraph", node_id: args.node_id },
+          15000,
+        );
+        if (entered.isError) {
+          return appendToolResultText(
+            first,
+            `\n\n(The panel listed "${refusal.widget}" as promoted while refusing it. ` +
+              `Resolved it to inner node ${inner.innerNodeId} but panel_enter_subgraph FAILED: ` +
+              `${textOfToolResult(entered)})`,
+          );
+        }
+
+        const written = await write(inner.innerNodeId, inner.widget);
+        const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+        if (!written.isError) {
+          const via =
+            `\n\n(Applied via the inner widget this promotion lists: node ${inner.innerNodeId} ` +
+            `"${inner.widget}". The panel listed "${refusal.widget}" as promoted while refusing ` +
+            `it as not promoted; the displayed name was resolved to that inner mapping.)`;
+          if (exited.isError) {
+            return appendToolResultText(
+              written,
+              `${via} panel_exit_subgraph then FAILED — the canvas may still be inside the ` +
+                `subgraph. Call panel_exit_subgraph. (${textOfToolResult(exited)})`,
+            );
+          }
+          return appendToolResultText(written, via);
+        }
+        if (exited.isError) {
+          return appendToolResultText(
+            first,
+            `\n\n(Tried the inner mapping node ${inner.innerNodeId} "${inner.widget}" and it ` +
+              `FAILED: ${textOfToolResult(written)} panel_exit_subgraph also FAILED — the ` +
+              `canvas may still be inside the subgraph. Call panel_exit_subgraph. ` +
+              `(${textOfToolResult(exited)}))`,
+          );
+        }
+        return appendToolResultText(
+          first,
+          `\n\n(Tried the inner mapping node ${inner.innerNodeId} "${inner.widget}" and it ` +
+            `FAILED: ${textOfToolResult(written)})`,
         );
       },
     ),
