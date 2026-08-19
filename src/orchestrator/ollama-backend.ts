@@ -782,11 +782,54 @@ export class OllamaBackend implements AgentBackend {
       }
       if (name === "panel_call_tool") {
         if (!this.panel) return { text: "panel tools are unavailable in this session.", isError: true };
-        const wanted = typeof args.name === "string" ? args.name : typeof args.tool_name === "string" ? (args.tool_name as string) : "";
+        let wanted = typeof args.name === "string" ? args.name : typeof args.tool_name === "string" ? (args.tool_name as string) : "";
+        let inner: unknown = args.args ?? args.arguments ?? {};
+        // #1297 — ROUTER SELF-NESTING: a malformed call wraps the real invocation
+        // in a second router envelope (panel_call_tool {"name": "panel_call_tool",
+        // "args": {"name": "<tool>", "args": {...}}}). The old reply — "Unknown
+        // panel tool 'panel_call_tool'" — was doubly unhelpful: the name IS known
+        // (it is this router itself), and the answer discarded a call whose inner
+        // tool and args were fully spelled out. Peek one envelope deep: when it
+        // carries a real panel tool, unwrap it and run exactly that; otherwise
+        // refuse with the correct shape. ONE level only — a deeper nest fails
+        // closed through the same refusal.
+        let unwrapped = false;
+        if (wanted === "panel_call_tool" || wanted === "panel_list_tools" || wanted === "panel_describe_tool") {
+          let peek: unknown = inner;
+          if (typeof peek === "string") {
+            try {
+              peek = peek.trim() ? JSON.parse(peek) : {};
+            } catch {
+              // Not parseable JSON — cannot be a nested envelope, so fall through
+              // to the self-call refusal below rather than guessing.
+              peek = undefined;
+            }
+          }
+          const nested = peek !== null && typeof peek === "object" && !Array.isArray(peek) ? (peek as Record<string, unknown>) : undefined;
+          const nestedName = nested && typeof nested.name === "string" ? nested.name : "";
+          if (wanted === "panel_call_tool" && nested && this.panelTools.some((t) => t.name === nestedName)) {
+            wanted = nestedName;
+            inner = nested.args ?? nested.arguments ?? {};
+            unwrapped = true;
+          } else {
+            return {
+              text:
+                `'${wanted}' is this router itself, not a panel tool — the router cannot run its own ` +
+                `panel_list_tools / panel_describe_tool / panel_call_tool. Pass the inner tool directly: ` +
+                `panel_call_tool {"name": "<panel tool>", "args": {...}}. Use panel_list_tools to see the tools.`,
+              isError: true,
+            };
+          }
+        }
+        if (!wanted) {
+          return {
+            text: `panel_call_tool requires a "name" field naming the panel tool to run: {"name": "<panel tool>", "args": {...}}. Use panel_list_tools to see the tools.`,
+            isError: true,
+          };
+        }
         if (!this.panelTools.some((t) => t.name === wanted)) {
           return { text: `Unknown panel tool '${wanted}'. Use panel_list_tools.`, isError: true };
         }
-        let inner = args.args ?? args.arguments ?? {};
         if (typeof inner === "string") {
           try {
             inner = inner.trim() ? (JSON.parse(inner) as Record<string, unknown>) : {};
@@ -810,7 +853,13 @@ export class OllamaBackend implements AgentBackend {
         if (res.isError) {
           logger.warn(`[ollama-backend] panel tool '${wanted}' returned isError: ${textOf(res).slice(0, 300)}`);
         }
-        return { text: textOf(res), isError: !!res.isError };
+        const resultText = textOf(res);
+        return {
+          text: unwrapped
+            ? `Recovered a nested panel_call_tool envelope by unwrapping it once; call panel_call_tool {"name": "${wanted}", "args": {...}} directly next time.\n\n${resultText}`
+            : resultText,
+          isError: !!res.isError,
+        };
       }
       // FORGIVING DIRECT DISPATCH — small models routinely call an inner tool
       // by its bare name instead of going through the router. If the name is a
