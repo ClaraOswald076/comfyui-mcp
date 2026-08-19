@@ -8,6 +8,7 @@
 // identical set.
 
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -250,6 +251,98 @@ describe("panel-tools: fresh /object_info ack timeout (#599)", () => {
   it("keeps the ack bounded (never Infinity) so a genuinely dead tab still fails", () => {
     expect(Number.isFinite(REFRESH_ACK_MS)).toBe(true);
     expect(REFRESH_ACK_MS).toBeLessThanOrEqual(60_000);
+  });
+});
+
+describe("panel-tools: panel_set_widget echo summary (#1695)", () => {
+  // #1695: a code-mode script that batches panel_set_widget calls accumulates
+  // every nested reply in the OUTER tool result; each reply echoes the previous
+  // and new widget values verbatim, so two long prompts per call overflow the
+  // outer budget ("Output exceeded the available model context and was
+  // truncated") even though every mutation succeeded. Long strings are now
+  // echoed as {chars, sha256, preview} by default, with `echo: "full"` opting
+  // back into the verbatim reply.
+  const LONG = "a pretty elaborate prompt, ".repeat(100); // 2700 chars
+  const sha256 = (s: string) => createHash("sha256").update(s, "utf8").digest("hex");
+
+  async function runSetWidget(
+    args: Record<string, unknown>,
+    reply: unknown,
+  ): Promise<ToolResult> {
+    const res = await defByName("panel_set_widget").handler(
+      { node_id: 6, widget: "text", value: "x", ...args },
+      {
+        call: async () =>
+          typeof reply === "object" && reply !== null && "isError" in reply
+            ? reply
+            : { content: [{ type: "text" as const, text: JSON.stringify(reply, null, 2) }] },
+      } as unknown as PanelToolCtx,
+    );
+    return res as ToolResult;
+  }
+
+  const setReply = (previous: unknown, value: unknown) => ({
+    set: { node_id: 6, widget: "text", previous, value },
+  });
+
+  it("summarizes long string previous/value as {chars, sha256, preview} by default", async () => {
+    const res = await runSetWidget({}, setReply(LONG, LONG + "v2"));
+    expect(res.isError).toBeUndefined();
+    const payload = JSON.parse(res.content[0].text!) as Record<string, any>;
+    expect(payload.set.node_id).toBe(6);
+    expect(payload.set.previous).toMatchObject({
+      chars: LONG.length,
+      sha256: sha256(LONG),
+    });
+    expect(payload.set.value.chars).toBe(LONG.length + 2);
+    expect(payload.set.value.sha256).toBe(sha256(LONG + "v2"));
+    // The preview is a disclosed PREFIX of the real value, never a rewrite.
+    expect((LONG + "v2").startsWith(payload.set.value.preview.slice(0, -1))).toBe(true);
+    expect(payload.set.value.preview.endsWith("…")).toBe(true);
+    // The way back to the full strings is named in the reply itself.
+    expect(payload.echo).toBe("summary");
+    expect(payload.echo_full).toContain('echo: "full"');
+  });
+
+  it("leaves short values verbatim and adds no echo rider", async () => {
+    const res = await runSetWidget({}, setReply("old", "new"));
+    const payload = JSON.parse(res.content[0].text!) as Record<string, any>;
+    expect(payload.set.previous).toBe("old");
+    expect(payload.set.value).toBe("new");
+    expect(payload.echo).toBeUndefined();
+    expect(payload.echo_full).toBeUndefined();
+  });
+
+  it("echo: \"full\" returns long strings verbatim", async () => {
+    const res = await runSetWidget({ echo: "full" }, setReply(LONG, LONG));
+    const payload = JSON.parse(res.content[0].text!) as Record<string, any>;
+    expect(payload.set.previous).toBe(LONG);
+    expect(payload.set.value).toBe(LONG);
+    expect(payload.echo).toBeUndefined();
+  });
+
+  it("leaves non-string values (numbers, booleans) untouched", async () => {
+    const res = await runSetWidget({ widget: "steps" }, setReply(20, 30));
+    const payload = JSON.parse(res.content[0].text!) as Record<string, any>;
+    expect(payload.set.previous).toBe(20);
+    expect(payload.set.value).toBe(30);
+    expect(payload.echo).toBeUndefined();
+  });
+
+  it("passes an error result through untouched", async () => {
+    const err = {
+      isError: true as const,
+      content: [{ type: "text" as const, text: "Error: widget not found" }],
+    };
+    const res = await runSetWidget({}, err);
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toBe("Error: widget not found");
+  });
+
+  it("passes a reply with no `set` envelope through untouched", async () => {
+    const reply = { ok: true, note: "no set envelope" };
+    const res = await runSetWidget({}, reply);
+    expect(res.content[0].text).toBe(JSON.stringify(reply, null, 2));
   });
 });
 
