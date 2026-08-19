@@ -41,6 +41,7 @@ import {
   guardClientFetch,
   isNonJsonResponseError,
   redactUrlForDiagnosis,
+  resetComfyApiRootValidated,
 } from "../../comfyui/json-guard.js";
 
 /** Every response the fake server will give, in order. */
@@ -59,6 +60,7 @@ beforeEach(() => {
   // wiring under test rather than one another's leftovers.
   resetClient();
   resetObjectInfoCache();
+  resetComfyApiRootValidated();
 });
 
 describe("the library's non-2xx path can no longer eat the response (#828)", () => {
@@ -222,6 +224,10 @@ describe("classifyNonJson on an empty body", () => {
       body: "",
     });
     expect(d.kind).toBe("proxy-error");
+    // #1670 — a 502 empty body is an outage, not the SPA-catch-all remedy.
+    expect(d.message).toMatch(/temporary server outage/i);
+    expect(d.message).not.toContain("Confirm the configured ComfyUI base URL");
+    expect(d.message).not.toContain("the same catch-all that produced this page");
   });
 
   // Pins the empty branch's POSITION, not just its existence. Moving it above

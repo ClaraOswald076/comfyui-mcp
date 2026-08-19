@@ -23,6 +23,7 @@ import {
   isNonJsonResponseError,
   looksLikeHtmlParsedAsJson,
   NonJsonResponseError,
+  noteComfyApiRootValidated,
   provesNonJsonAnswer,
   readComfyJson,
   redactErrorMessage,
@@ -209,6 +210,10 @@ export async function getSystemStats(): Promise<SystemStats> {
     expectShape: looksLikeSystemStats,
     shapeHint: "a ComfyUI /system_stats document (it has no `system` object and no `devices` array)",
   });
+  // Shape-valid /system_stats is the in-session proof that this base URL is a
+  // ComfyUI API root. A later empty 502 must not be reported as a misconfigured
+  // URL (#1670).
+  noteComfyApiRootValidated(getComfyUIBaseUrl());
   return stats;
 }
 
