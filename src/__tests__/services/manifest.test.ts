@@ -233,8 +233,13 @@ import {
   applyManifest,
   loadManifestFile,
 } from "../../services/manifest.js";
+import {
+  clearManifestPartialLeftover,
+  getManifestPartialLeftover,
+} from "../../services/manifest-partial.js";
 
 beforeEach(() => {
+  clearManifestPartialLeftover();
   mockConfig.comfyuiPath = "/fake/ComfyUI";
   mockConfig.remote = undefined;
   readFileMock.mockReset();
@@ -1391,10 +1396,50 @@ describe("applyManifest", () => {
       // hard-failure signal.
       expect(result.summary.failed).toBe(0);
       expect(result.success).toBe(false);
+      // #1699 — the not-started entry is a PARTIAL INSTALL, not queue work.
+      // Polling panel_node_queue_status would drain while this pack is absent.
+      expect(result.results[1].message).toMatch(/PARTIAL INSTALL/);
+      expect(result.results[1].message).toMatch(/never submitted/i);
+      expect(result.results[1].message).not.toMatch(/poll the Manager queue/i);
+      expect(result.partial).toMatchObject({
+        kind: "custom_nodes_not_started",
+        source: "this inline manifest",
+        not_started: ["next-pack"],
+        still_installing: ["slow-pack"],
+      });
+      expect(result.partial?.message).toMatch(/PARTIAL INSTALL/);
+      expect(result.partial?.message).toMatch(/next-pack/);
+      expect(getManifestPartialLeftover()?.not_started).toEqual(["next-pack"]);
     } finally {
       if (prevBudget === undefined) delete process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS;
       else process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS = prevBudget;
     }
+  });
+
+  it("clears leftover not-started names when a later apply submits everything (#1699)", async () => {
+    const prevBudget = process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS;
+    process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS = "40";
+    installCustomNodeMock.mockReturnValueOnce(new Promise(() => {}));
+    try {
+      await applyManifest({
+        manifest: { custom_nodes: ["slow-pack", "next-pack"] },
+      });
+      expect(getManifestPartialLeftover()?.not_started).toEqual(["next-pack"]);
+    } finally {
+      if (prevBudget === undefined) delete process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS;
+      else process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS = prevBudget;
+    }
+
+    listInstalledNodesMock.mockResolvedValue([
+      { module: "slow-pack", cnrId: "slow-pack", enabled: true },
+      { module: "next-pack", cnrId: "next-pack", enabled: true },
+    ]);
+    const settled = await applyManifest({
+      manifest: { custom_nodes: ["slow-pack", "next-pack"] },
+    });
+    expect(settled.success).toBe(true);
+    expect(settled.partial).toBeUndefined();
+    expect(getManifestPartialLeftover()).toBeNull();
   });
 
   it("hands a slow model download to a background job (pending, not applied) (#362)", async () => {

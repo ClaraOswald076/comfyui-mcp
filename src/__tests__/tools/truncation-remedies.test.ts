@@ -544,6 +544,22 @@ describe("#809 truncation remedies name a lever that actually exists", () => {
     }
   });
 
+  it("apply_manifest names a PARTIAL INSTALL instead of a drained queue (#1699)", async () => {
+    const t = (await listRegisteredTools()).find((x) => x.name === "apply_manifest");
+    expect(t, "apply_manifest is not registered").toBeTruthy();
+    // The old per-item lie told callers to poll the Manager queue, which then
+    // drained while unsubmitted custom_nodes were still absent. This description
+    // is the remedy: name the leftover, and do not revive that poll instruction.
+    expect(t!.description).toMatch(/PARTIAL INSTALL/);
+    expect(t!.description).toMatch(/unsubmitted/);
+    expect(t!.description).toMatch(/panel_node_queue_status/);
+    expect(t!.description).toMatch(/re-run apply_manifest/);
+    expect(t!.description).not.toMatch(/poll the Manager queue/i);
+    // `partial` is a response field, not a parameter of this tool — backticks
+    // would fail the remedy-sentence check above ("time budget" is the trigger).
+    expect(t!.description).not.toMatch(/`partial`/);
+  });
+
   // ---- the panel riders (#809): a boolean is replaced by a usable instruction --------
   //
   // Driven through the REAL tool definitions with a stubbed panel reply, so the string
