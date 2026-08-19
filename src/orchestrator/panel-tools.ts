@@ -11870,8 +11870,28 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // panel forwarded no `prompt_id` — a later completion can only be reported as
         // UNDETERMINED, so telling the agent to idle and wait would park it on a
         // promise we can't keep. Say so and point at the verification path instead.
+        // #1789 — …AND HONEST ABOUT WHAT "AUTOMATICALLY" RESTS ON. The old text
+        // forbade polling outright on the strength of `correlatable`, which
+        // proves only that a completion COULD be recognised — never that one
+        // will arrive. The producer is the panel's `executed` frame, and a
+        // session that lost it sat idle through a clean 28.77s render until a
+        // human intervened, because the one behaviour that would have caught it
+        // in seconds is the one this rider had banned.
+        //
+        // Delivery is now genuinely stronger (the orchestrator fills in from its
+        // own /history observation — run-completion-watchdog.ts), but it is
+        // still not a guarantee this tool can prove at queue time: the watchdog
+        // sees nothing when the monitored ComfyUI is not the one this run went
+        // to, or cannot be polled. So the anti-poll instruction stays PRIMARY —
+        // it is what keeps an agent from burning a turn a second — and it is
+        // paired with a bounded escape hatch: ONE check, long after the render
+        // should have landed, naming the prompt id so it costs a single call.
+        // A weaker promise with a stated fallback beats a strong one that fails
+        // into an infinite idle.
+        const promptRef = queuedIds.length === 1 ? `, prompt_id:"${queuedIds[0]}"` : "";
         const note = correlatable
-          ? "\n\n[IMPORTANT] You will be notified automatically with the output image(s)/video when the render finishes — do NOT poll queue (action:\"list\"), get_history, or get_image (action:\"list_outputs\"). Just end your turn now and wait for the result to be delivered to you."
+          ? "\n\n[IMPORTANT] You will be notified automatically with the output image(s)/video when the render finishes — do NOT poll queue (action:\"list\"), get_history, or get_image (action:\"list_outputs\"). Just end your turn now and wait for the result to be delivered to you." +
+            `\n[FALLBACK] That notification is journaled and replayed if an agent is not there to take it, and the orchestrator will fill one in from ComfyUI's history if the panel never reports the finish — but it cannot be GUARANTEED, so do not wait forever on it. If nothing has arrived LONG after this render should have finished (roughly twice the time you expect it to take), make ONE check with queue (action:"status"${promptRef}) instead of idling indefinitely. One check, not a loop — and not before then.`
           : "\n\n[IMPORTANT] The run was queued, but the panel reported NO prompt id for it, so a completion event CANNOT be correlated back to this run — its outcome will be reported to you as UNDETERMINED. Do NOT simply idle and wait indefinitely: end your turn, and if nothing arrives, confirm the outcome with get_history (action:\"list\") before acting on it.";
         // Backpressure note. A backlog is only alarming when it's a job we did NOT
         // queue (possibly foreign/stuck). Deliberately batching renders — a sweep,
