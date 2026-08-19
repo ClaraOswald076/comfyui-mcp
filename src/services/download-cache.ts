@@ -2350,7 +2350,14 @@ async function streamUrlToFile(
     await assertModelPayload(await currentStagedBaseline());
     if (resumable) await safeRm(validatorSidecar);
     bytesPerSec = 0;
-    emit("done", true);
+    // #1701 — bytes arriving at THIS path is not a landed destination. This
+    // function writes the cache `.partial` or a materialize temp; dest is
+    // renamed later (and on Windows that rename is often a multi-GB COPY).
+    // The orchestrator treats the first "done" row as "transfer completed"
+    // (#547), which is how the tray announced t5xxl_flux1_int8_convrot.safetensors
+    // while action:"status" still said downloading and dest did not exist.
+    // Keep the row at 100% downloading; the caller that lands dest emits done.
+    emit("downloading", true);
     return responseContentType;
   } catch (err) {
     // On a user cancel (#515) the abort left a resumable .partial on disk. Do NOT emit
@@ -3222,6 +3229,38 @@ async function evictLruIfNeeded(): Promise<void> {
   }
 }
 
+/** Publish a terminal "done" row only when `destPath` is already a non-empty file.
+ *
+ *  #1701 — the orchestrator wakes the agent from the first "done" row. Emitting
+ *  that before dest exists is the false completion. Callers that have just
+ *  landed dest use this; a missing/empty dest stays silent. */
+async function reportProgressDoneIfLanded(
+  progress: ProgressMeta | undefined,
+  destPath: string,
+): Promise<void> {
+  if (!progress) return;
+  let size = 0;
+  try {
+    const st = await downloadCacheFs.stat(destPath);
+    if (!st.isFile() || st.size <= 0) return;
+    size = st.size;
+  } catch {
+    return;
+  }
+  reportDownloadProgress(
+    {
+      id: progress.id,
+      name: progress.name,
+      attempt: progress.attempt,
+      downloaded: size,
+      total: size,
+      bytes_per_sec: 0,
+      status: "done",
+    },
+    true,
+  );
+}
+
 export async function downloadUrlToFile(
   url: string,
   targetPath: string,
@@ -3231,10 +3270,11 @@ export async function downloadUrlToFile(
   progress?: ProgressMeta,
   modelExt = extname(targetPath),
   signal?: AbortSignal,
-  /** See streamUrlToFile: when true the caller owns the terminal "error" row. The
+  /** See streamUrlToFile: when true the caller owns the terminal rows. The
    *  cache-unavailable fallback in downloadWithCache passes true because
-   *  downloadModel already publishes exactly one row when the whole call throws;
-   *  emitting here as well would write that outcome twice (#470/#547). */
+   *  downloadModel already publishes exactly one error row when the whole call
+   *  throws, and because this API is writing a TEMP — a "done" here would
+   *  fire the #1701 completion before dest exists (#470/#547/#1701). */
   deferErrorRow = false,
   /** See DownloadCacheOptions.callerAuth (#1635). */
   callerAuth = false,
@@ -3257,6 +3297,9 @@ export async function downloadUrlToFile(
     false,
     callerAuth,
   );
+  // This API's target IS dest (except the fallback, which defers). streamUrlToFile
+  // no longer claims "done" itself (#1701).
+  if (!deferErrorRow) await reportProgressDoneIfLanded(progress, targetPath);
 }
 
 export async function downloadWithCache(
@@ -3337,6 +3380,9 @@ export async function downloadWithCache(
       options.signal,
       options.onLanded,
     );
+    // Dest exists (onLanded already committed the job). This is the first honest
+    // "done" — downloadModel emits another after its own dest stat, which is fine.
+    await reportProgressDoneIfLanded(options.progress, options.targetPath);
     await evictLruIfNeeded();
     return {
       targetPath: options.targetPath,
@@ -3390,6 +3436,7 @@ export async function downloadWithCache(
       // any backup-cleanup await) — commits "done" with no landed→return window; the
       // signal also aborts the Windows swap after the backup move (#515).
       await renameTempOverDestination(tmp, options.targetPath, options.onLanded, options.signal);
+      await reportProgressDoneIfLanded(options.progress, options.targetPath);
     } catch (e) {
       await downloadCacheFs.rm(tmp, { force: true }).catch(() => undefined);
       throw e;
