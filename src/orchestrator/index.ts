@@ -1780,6 +1780,14 @@ export async function runPanelOrchestrator(): Promise<void> {
   // Set from each hello's trusted identity; #716 lets a successful explicit
   // open/re-pin refresh it between hellos.
   const tabCommandWorkflowUuid = new Map<string, string>();
+  // #1656 — WHO said so, for the entries above. A tab id in this set holds a stamp that
+  // was CARRIED from the tab id a same-socket re-hello retired and has NOT been proven
+  // under its current id. The value is still used to stamp frames (#1331 — an absent
+  // stamp is the unrecoverable half), but the dispatch-time agreement gate may not read
+  // it as this tab's own advertisement: the conversation's issue-time stamp is captured
+  // from this very map, so a carry makes that gate's two sides identical by construction
+  // in exactly the window where the canvas changed.
+  const tabStampCarried = new Set<string>();
   const scopeAgentKeyOf = (scopeId: string): string =>
     scopeId === SHARED_SESSION_SCOPE ? sharedKeyFor(defaultBackend) : scopeId;
   // #884 — each shared conversation's last message origin (tab + workflow uuid),
@@ -3113,6 +3121,10 @@ export async function runPanelOrchestrator(): Promise<void> {
           reason: identityReason(tabId, origin, workflowUuid, bridge.resolveFailure?.(tabId)),
         };
       tabCommandWorkflowUuid.set(panelTab, identity.uuid);
+      // A VALIDATED refresh (an explicit open / panel_set_workflow_target({mode:"current"})
+      // / a save reply's workflow_uuid) is an observation about this tab id — it is the
+      // documented way out of the carried state (#1656).
+      tabStampCarried.delete(panelTab);
       // #716/#884 — an explicit, VALIDATED open/re-pin from the shared agent is
       // the agent deliberately moving its turn to another workflow: refresh
       // that CONVERSATION's issue-time stamp too, so its subsequent edits
@@ -3122,6 +3134,15 @@ export async function runPanelOrchestrator(): Promise<void> {
       return true;
     },
   );
+  // #1656 — the provenance half of the same answer. A SCOPE address never carries: its
+  // stamp is the conversation's issue-time value, not a tab advertisement. A real tab id
+  // is resolved through panelTabOf exactly like the resolver above, so an agent-key
+  // address and the bare tab id give the same verdict.
+  bridge.setCarriedTabStampPredicate((tabId) => {
+    if (isScopeAddress(tabId)) return false;
+    const t = panelTabOf(tabId);
+    return t ? tabStampCarried.has(t) : false;
+  });
 
   // ── Local-agent VRAM pause during generation ────────────────────────────
   // On a single-GPU box the local chat model and ComfyUI fight for VRAM:
@@ -3927,7 +3948,15 @@ export async function runPanelOrchestrator(): Promise<void> {
         //
         // If THIS hello does resolve an identity, the `set` below overwrites what
         // we carried — new evidence always wins over old.
-        carryWorkflowCommandStamp(tabCommandWorkflowUuid, migratedFrom, panelTab);
+        if (carryWorkflowCommandStamp(tabCommandWorkflowUuid, migratedFrom, panelTab)) {
+          // Inherited, not proven — see tabStampCarried.
+          tabStampCarried.add(panelTab);
+        } else {
+          // The new id kept its OWN entry (newer evidence) or there was nothing to
+          // carry; either way nothing was inherited onto it here.
+          tabStampCarried.delete(panelTab);
+        }
+        tabStampCarried.delete(migratedFrom);
         logger.info(
           `[panel-orchestrator] same-socket re-hello ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} — routing state carried; the shared session continues (#884)`,
         );
@@ -3967,6 +3996,9 @@ export async function runPanelOrchestrator(): Promise<void> {
       // it on equality, which is the only test that decides authorization.
       if (newIdentity) {
         tabCommandWorkflowUuid.set(panelTab, newIdentity.uuid);
+        // THIS tab, under THIS id, just advertised an identity — whatever was inherited
+        // is superseded by an observation (#1656).
+        tabStampCarried.delete(panelTab);
       }
       // Blind content mode rides the hello (issue #90) so the FIRST agent spawn
       // already carries the right tool-server env. A CHANGE against a live
