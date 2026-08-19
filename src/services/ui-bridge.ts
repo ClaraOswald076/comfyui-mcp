@@ -1540,6 +1540,8 @@ export class UiBridge {
    *  is not wired (tests/embedders): treated as PROVEN, which is exactly the pre-#1656
    *  behaviour. */
   private isCarriedTabStamp: ((tabId: string) => boolean) | null = null;
+  /** #1656 — orchestrator-injected: see {@link corroborateTabStamp}. */
+  private corroborateTabStampFn: ((tabId: string, workflowUuid: string) => boolean) | null = null;
   /** #884 P0 — orchestrator-injected: the tab a conversation's IN-FLIGHT turn is
    *  PINNED to (string), `null` when the turn's origin is ambiguous (refuse), or
    *  undefined when no turn is in flight (fall back to active-tab resolution).
@@ -5022,6 +5024,33 @@ export class UiBridge {
    *  gate is forbidden to accept it as evidence about the routed tab's canvas. */
   setCarriedTabStampPredicate(fn: (tabId: string) => boolean): void {
     this.isCarriedTabStamp = fn;
+  }
+
+  /** #1656 — inject the CORROBORATION half: "the live canvas was read and it is this
+   *  instance". Deliberately NOT `refreshWorkflowUuid`. That one WRITES a stamp (and a
+   *  conversation's issue-time stamp with it), which is a retarget the read-only mismatch
+   *  probe must never perform (#1646); this one may only promote the PROVENANCE of a value
+   *  that already matches, and the orchestrator's implementation refuses outright when it
+   *  does not match. Nothing it can do changes which workflow anything is fenced to. */
+  setTabStampCorroborator(fn: (tabId: string, workflowUuid: string) => boolean): void {
+    this.corroborateTabStampFn = fn;
+  }
+
+  /**
+   * #1656 — record that the routed tab's CURRENT stamp has been confirmed by a live read
+   * of the canvas, so a value that was inherited on a same-socket re-hello stops being
+   * treated as inherited by the dispatch-time agreement gate.
+   *
+   * Returns whether the corroboration was accepted. Never throws: this is a diagnostic
+   * running inside a refusal path, and a diagnostic must never replace the outcome it is
+   * describing.
+   */
+  corroborateTabStamp(tabId: string, workflowUuid: string): boolean {
+    try {
+      return this.corroborateTabStampFn?.(tabId, workflowUuid) === true;
+    } catch {
+      return false;
+    }
   }
 
   /**

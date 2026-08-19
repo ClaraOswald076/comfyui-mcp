@@ -4,13 +4,16 @@
 // socket in services/carried-stamp-agreement.test.ts. That suite installs the
 // predicate itself, so it stays green if production never installs one — and an
 // uninstalled predicate is defined to mean "proven", i.e. the exact pre-#1656
-// behaviour with the bug intact. Four one-line wirings decide whether the fix runs at
-// all, and every one of them is invisible to a behavioural test:
+// behaviour with the bug intact. Six wirings decide whether the fix runs at all and
+// whether it stays safe, and every one of them is invisible to a behavioural test:
 //
 //   1. the hello handler RECORDING that a carry happened,
 //   2. the hello handler CLEARING it when this hello proves an identity,
-//   3. the validated-refresh path CLEARING it (the documented way out), and
-//   4. `bridge.setCarriedTabStampPredicate(...)` being called at all.
+//   3. the validated-refresh path CLEARING it (the documented way out),
+//   4. `bridge.setCarriedTabStampPredicate(...)` being called at all,
+//   5. `bridge.setTabStampCorroborator(...)` refusing any uuid that does not ALREADY
+//      match — the guarantee that the self-healing path cannot retarget a session, and
+//   6. the read-only mismatch probe calling the corroborator and NOT the fence write.
 //
 // The hello handler is inline in the orchestrator start function, so — as with the
 // other index.ts boundary guards (shared-session-invariant.test.ts,
@@ -66,6 +69,37 @@ describe("#1656 — carried-stamp provenance is WIRED, not merely available", ()
     const setIdx = src.indexOf("tabCommandWorkflowUuid.set(panelTab, identity.uuid);");
     expect(setIdx, "refresh stamp-set not found").toBeGreaterThan(-1);
     expect(src.slice(setIdx, setIdx + 400)).toContain("tabStampCarried.delete(panelTab)");
+  });
+
+  it("SOURCE: the corroborator is installed, and it can only promote a MATCHING value", () => {
+    const src = indexSrc();
+    expect(src).toContain("bridge.setTabStampCorroborator(");
+    const start = src.indexOf("bridge.setTabStampCorroborator(");
+    const block = src.slice(start, start + 1400);
+    // The uuid is validated exactly like every other identity acceptance — never a
+    // bare string off a reply.
+    expect(block).toContain("workflowIdentityParts({");
+    // THE SAFETY ARGUMENT, enforced here rather than trusted from the caller: a uuid
+    // that does not ALREADY equal this tab's stamp is refused, so nothing can be
+    // retargeted through this path.
+    expect(block).toContain("if (tabCommandWorkflowUuid.get(panelTab) !== identity.uuid) return false;");
+    // …and the only write it performs is the provenance bit.
+    expect(block).toContain("tabStampCarried.delete(panelTab)");
+    expect(block).not.toContain("tabCommandWorkflowUuid.set(");
+    expect(block).not.toContain("turnOrigins.setStamp(");
+  });
+
+  it("SOURCE: the read-only mismatch probe corroborates, and never RETARGETS", () => {
+    const toolsSrc = readFileSync(
+      new URL("../../orchestrator/panel-tools.ts", import.meta.url),
+      "utf8",
+    );
+    const idx = toolsSrc.indexOf('if (before.known && before.uuid === uuid) {');
+    expect(idx, "already_current branch not found").toBeGreaterThan(-1);
+    const branch = toolsSrc.slice(idx, toolsSrc.indexOf('return { status: "already_current"', idx));
+    expect(branch).toContain("corroborateTabStamp(ctx, uuid)");
+    // #1646 — the fence-writing call must never appear on this branch.
+    expect(branch).not.toContain("refreshWorkflowUuid(");
   });
 
   it("SOURCE: the gate consults the predicate, and the recovery probe stays exempt", () => {

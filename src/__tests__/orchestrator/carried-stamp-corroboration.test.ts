@@ -12,11 +12,15 @@
 // `workflow_list` says the LIVE canvas is the same instance the fence already names,
 // that is an observation of the tab under its CURRENT id: the value is confirmed and
 // the provenance is promoted from inherited to observed, through the orchestrator's
-// validator (reachability + origin-bound uuid shape), never off the refusal's prose.
+// identity validator, never off the refusal's prose.
 //
-// It is NOT the retarget #1646 removed. The uuid written is the one this branch has
-// just established EQUALS the fence in force, so nothing is re-aimed — the DIVERGED
-// case (live canvas is a different workflow) still adopts nothing at all.
+// It goes through `corroborateTabStamp`, NOT `refreshWorkflowUuid` — and the difference
+// is the whole safety argument. `refreshWorkflowUuid` WRITES a stamp (and a
+// conversation's issue-time stamp with it), which is precisely the retarget #1646
+// removed from this probe. `corroborateTabStamp` writes no stamp at all: the
+// orchestrator re-checks that the uuid ALREADY equals the tab's current stamp and
+// refuses outright when it does not, so the only thing it can change is a provenance
+// bit. The DIVERGED case — live canvas is a different workflow — reaches neither.
 
 import { describe, expect, it } from "vitest";
 
@@ -49,8 +53,10 @@ const carriedRefusal = (): Error =>
   );
 
 function harness(liveUuid: string) {
-  /** Every uuid handed to the orchestrator's validator by this call. */
-  const refreshed: string[] = [];
+  /** Every uuid offered to the provenance-only corroborator by this call. */
+  const corroborated: string[] = [];
+  /** Every uuid handed to the RETARGETING fence write — must stay empty here. */
+  const retargeted: string[] = [];
   const b = {
     send: async (cmd: Record<string, unknown>) => {
       if (cmd.cmd === "workflow_list") {
@@ -68,8 +74,15 @@ function harness(liveUuid: string) {
     isHeadless: () => false,
     tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
     resolveActiveTabId: () => TAB,
+    // The RETARGETING write. It must never be reached by a read-only mismatch probe.
     refreshWorkflowUuid: (_tabId: string, uuid: string) => {
-      refreshed.push(uuid);
+      retargeted.push(uuid);
+      return true;
+    },
+    // The provenance-only promotion. The real implementation refuses unless the uuid
+    // already equals the tab's stamp; this records what it was offered.
+    corroborateTabStamp: (_tabId: string, uuid: string) => {
+      corroborated.push(uuid);
       return true;
     },
     // The session's fence — the carried uuid the command was issued for.
@@ -77,15 +90,16 @@ function harness(liveUuid: string) {
     tabCanMutateGraph: () => true,
     tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
   } as unknown as PanelToolCtx["bridge"];
-  return { bridge: b, refreshed };
+  return { bridge: b, corroborated, retargeted };
 }
 
 async function connect(liveUuid: string): Promise<{
   text: string;
   res: ToolResult;
-  refreshed: string[];
+  corroborated: string[];
+  retargeted: string[];
 }> {
-  const { bridge, refreshed } = harness(liveUuid);
+  const { bridge, corroborated, retargeted } = harness(liveUuid);
   const ctx = makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
   const def = buildPanelToolDefs().find((d) => d.name === "panel_connect");
   if (!def) throw new Error("panel_connect is not registered");
@@ -93,15 +107,21 @@ async function connect(liveUuid: string): Promise<{
     { from_node: 1, from_slot: 0, to_node: 2, to_slot: 0 } as never,
     ctx,
   );
-  return { text: res.content.map((c) => (c as { text?: string }).text ?? "").join(" "), res, refreshed };
+  return {
+    text: res.content.map((c) => (c as { text?: string }).text ?? "").join(" "),
+    res,
+    corroborated,
+    retargeted,
+  };
 }
 
 describe("#1656 — a carried stamp the live canvas CONFIRMS is corroborated, not left inherited", () => {
   it("promotes the provenance when workflow_list names the SAME instance", async () => {
-    const { text, refreshed } = await connect(CARRIED_UUID);
-    // The corroboration ran, and it wrote back exactly the uuid already in force —
-    // so no target moved; only the evidence behind it did.
-    expect(refreshed).toEqual([CARRIED_UUID]);
+    const { text, corroborated, retargeted } = await connect(CARRIED_UUID);
+    // The corroboration ran, offering exactly the uuid already in force — and the
+    // RETARGETING write was not reached at all, so no fence moved.
+    expect(corroborated).toEqual([CARRIED_UUID]);
+    expect(retargeted).toEqual([]);
     // The verdict is unchanged: still the transient reading, still one informed retry.
     expect(text).toMatch(/TRANSIENT/);
     expect(text).toMatch(/RETRY THIS EXACT CALL ONCE/);
@@ -110,8 +130,9 @@ describe("#1656 — a carried stamp the live canvas CONFIRMS is corroborated, no
   });
 
   it("adopts NOTHING when the live canvas is a DIFFERENT workflow (#1646 stands)", async () => {
-    const { text, refreshed } = await connect(OTHER_UUID);
-    expect(refreshed).toEqual([]);
+    const { text, corroborated, retargeted } = await connect(OTHER_UUID);
+    expect(corroborated).toEqual([]);
+    expect(retargeted).toEqual([]);
     expect(text).toMatch(/DIFFERENT workflow/);
     expect(text).toContain(OTHER_UUID);
     // The fence stays on the workflow the caller named, so later edits keep being

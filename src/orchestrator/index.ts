@@ -3143,6 +3143,31 @@ export async function runPanelOrchestrator(): Promise<void> {
     const t = panelTabOf(tabId);
     return t ? tabStampCarried.has(t) : false;
   });
+  // #1656 — and the way OUT of the carried state that does not move anything. The
+  // fence-mismatch probe reads the live canvas with workflow_list; when the corroborated
+  // active record names the instance this tab's stamp ALREADY holds, the inherited value
+  // has been confirmed by an observation of the tab under its CURRENT id.
+  //
+  // The equality test is the whole safety argument, and it is enforced HERE rather than
+  // trusted from the caller: no stamp is written, no conversation stamp is touched, and a
+  // uuid that does not already match is REFUSED outright. So this can never retarget a
+  // session — which is exactly why it is not routed through refreshWorkflowUuid (#1646:
+  // a read-only diagnosis that re-points the fence is the corruption the fence exists to
+  // prevent, delivered as recovery).
+  bridge.setTabStampCorroborator((tabId, workflowUuid) => {
+    const panelTab = scopeToRealTab(tabId);
+    if (!panelTab) return false;
+    // Same validator as every other identity acceptance: server-observed origin +
+    // the uuid's shape/origin binding. Never a bare string from a reply.
+    const identity = workflowIdentityParts({
+      workflowUuid,
+      origin: bridge.tabServerOrigin(tabId),
+    });
+    if (!identity) return false;
+    if (tabCommandWorkflowUuid.get(panelTab) !== identity.uuid) return false;
+    tabStampCarried.delete(panelTab);
+    return true;
+  });
 
   // ── Local-agent VRAM pause during generation ────────────────────────────
   // On a single-GPU box the local chat model and ComfyUI fight for VRAM:
