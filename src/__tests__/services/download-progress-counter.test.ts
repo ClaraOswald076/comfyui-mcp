@@ -1,17 +1,20 @@
-// #1697 — the progress-counting Transform in streamUrlToFile must OBSERVE the
-// transfer, never pace it, and never misreport it.
+// #1697 — the progress-counting Transform in streamUrlToFile must never
+// MISREPORT the transfer: the bytes it tallies are exactly the bytes that
+// reached disk, and no row it publishes claims more than the transfer carried.
 //
-// It was constructed with Node's default 16 KiB highWaterMark — the narrowest
-// buffer in a chain whose write stream alone buffers 64 KiB — so every chunk
-// cost a full backpressure circuit. Measured in the issue: 0.35–0.48 MB/s where
-// curl held 12 MB/s on the same link (~25x), a steady ~16 KiB per ~40 ms.
+// This is a counting-arithmetic guard, and it is deliberately independent of the
+// counter's buffer depth — it passes at Node's default and at any explicit
+// highWaterMark, because the counting is per chunk either way. That
+// independence is the point: re-chunking is the thing that could silently break
+// the tally, so the test pushes 128 chunks of 48 KiB (not a multiple of any
+// stage's buffer) through the REAL exported downloadUrlToFile and compares disk
+// bytes against the counter's terminal progress row.
 //
-// Two things are pinned here:
-//   1. the counter's buffer depth is deep enough that it can never be the
-//      narrowest stage again, and bounded so a stalled sink can't grow memory
-//      without limit;
-//   2. counting honesty: through the deep buffer, the bytes the counter tallies
-//      are exactly the bytes that reached disk.
+// It does NOT pin a buffer depth. #1738 briefly added a 4 MiB highWaterMark here
+// on the theory that the default paced the pipeline; a later alternating A/B
+// against a same-round straight pipe measured the opposite (the default is the
+// fastest depth tried, and 4 MiB ran 0.77x unthrottled), so the override was
+// removed. See the comment beside the Transform in download-cache.ts.
 
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -49,7 +52,7 @@ vi.mock("../../services/download-progress.js", async () => {
   };
 });
 
-import { __downloadCacheTestHooks, downloadUrlToFile } from "../../services/download-cache.js";
+import { downloadUrlToFile } from "../../services/download-cache.js";
 
 const fetchMock = vi.fn();
 let tempDir: string;
@@ -84,17 +87,7 @@ afterEach(async () => {
   await rm(tempDir, { recursive: true, force: true });
 });
 
-describe("progress counter buffer depth (#1697)", () => {
-  it("the counter's highWaterMark is deep enough to never pace the pipeline, and bounded", () => {
-    const hwm = __downloadCacheTestHooks.progressCounterHighWaterMark;
-    // Below 1 MiB the counter risks being the narrowest buffer in the chain
-    // again (the regression: 16 KiB vs the write stream's 64 KiB).
-    expect(hwm).toBeGreaterThanOrEqual(1024 * 1024);
-    // Deep, not unbounded: a stalled sink must not be able to buffer the whole
-    // model in memory.
-    expect(hwm).toBeLessThanOrEqual(64 * 1024 * 1024);
-  });
-
+describe("progress counter honesty (#1697)", () => {
   it("counts exactly the bytes that reach disk, across many chunks", async () => {
     // 128 chunks of 48 KiB = 6 MiB — chunk sizes deliberately NOT a multiple of
     // any stage's buffer, so the count survives arbitrary re-chunking.

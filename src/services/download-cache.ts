@@ -1125,17 +1125,8 @@ function cacheDir(): string {
  *  #1567 adds `cachePathForUrl` so a test can stage a `.partial` under a SPECIFIC
  *  header identity (the writer's own derivation) instead of re-implementing the
  *  hash — a fixture derived from a parallel implementation cannot falsify the
- *  lookup it feeds (#1370).
- *  #1697 adds `progressCounterHighWaterMark` (a getter: the constant is declared
- *  further down, beside the pipeline it belongs to) so a test can pin the
- *  progress counter's buffer depth without re-constructing the pipeline. */
-export const __downloadCacheTestHooks = {
-  cacheDir,
-  cachePathForUrl,
-  get progressCounterHighWaterMark() {
-    return PROGRESS_COUNTER_HIGH_WATER_MARK;
-  },
-};
+ *  lookup it feeds (#1370). */
+export const __downloadCacheTestHooks = { cacheDir, cachePathForUrl };
 
 function cacheSizeLimitBytes(): number {
   const raw = Number(process.env.COMFYUI_LRU_CACHE_SIZE_GB ?? "0");
@@ -1332,22 +1323,6 @@ function normalizeEtag(value: string | null | undefined): string | null {
   if (/^[0-9a-f]+$/i.test(s)) s = s.toLowerCase();
   return s;
 }
-
-/** #1697 — buffer depth for the progress-counting Transform in streamUrlToFile.
- *
- *  Without an explicit highWaterMark a Transform inherits Node's 16 KiB default
- *  and becomes the narrowest buffer in the chain (the write stream alone buffers
- *  64 KiB): every chunk then costs a full backpressure circuit (source pause →
- *  transform → sink → drain → resume), and when that circuit crosses a real
- *  network/disk boundary its latency is tens of ms — a 20 GB download measured
- *  0.35–0.48 MB/s while curl held 12 MB/s on the same link (~25x), steady at
- *  ~16 KiB per ~40 ms, the signature of the 16 KiB window pacing the transfer.
- *  The no-progress branch (a straight pipe, no interposed stream) does not
- *  suffer it. A deep buffer lets the counter OBSERVE bytes instead of
- *  rate-limiting them; bounded at 4 MiB so a stalled sink can't grow memory
- *  without limit, and progress honesty is unchanged — counting is per chunk
- *  either way and the tray emit is already time-windowed (400 ms). */
-const PROGRESS_COUNTER_HIGH_WATER_MARK = 4 * 1024 * 1024;
 
 async function streamUrlToFile(
   url: string,
@@ -2340,10 +2315,17 @@ async function streamUrlToFile(
         )
       : undefined;
   emit("downloading", true); // show the row immediately, even before the first chunk
+  // #1697 — deliberately NO explicit highWaterMark: the counter runs at Node's
+  // default, which matches the write stream it feeds (measured in-pipeline on
+  // Node v24: both `writableHighWaterMark` are 16384; 64 KiB is createReadStream's
+  // default, not createWriteStream's). Benchmarked against a same-round straight
+  // pipe over loopback at 512 MiB x 16 rounds, the default is the fastest counter
+  // depth tried (1.16x) and shows no deficit at any rate measured; WIDENING it is
+  // what costs throughput once the source outruns the sink — 4 MiB ran 0.77x the
+  // straight pipe unthrottled and 0.92x at 400 MB/s, with the crossover between
+  // 200 and 400 MB/s. Do not add one back without a fresh alternating A/B in the
+  // regime you care about.
   const counter = new Transform({
-    // #1697 — deep enough that the counter OBSERVES bytes instead of pacing the
-    // pipeline; see PROGRESS_COUNTER_HIGH_WATER_MARK.
-    highWaterMark: PROGRESS_COUNTER_HIGH_WATER_MARK,
     transform(chunk: Buffer, _enc, cb) {
       downloaded += chunk.length;
       // Feed the watchdog FIRST and unconditionally — before the 400 ms throughput
