@@ -17,11 +17,15 @@
 // cleanly, `/history` had it, and the agent — having been told in so many words
 // not to poll — sat idle until a human broke the silence.
 //
-// AND THE ORCHESTRATOR ALREADY SAW IT FINISH. QueueMonitor keeps its own socket
-// and a 1 Hz `GET /history` tail diff precisely so it can observe completions
-// the panel-driven path never reports (#258/#259) — including runs queued from
-// the browser. Those observations went to ONE consumer, the `queue_status` UI
-// broadcast, and were dropped on the floor. The completion this session was
+// AND THE ORCHESTRATOR ALREADY SAW IT FINISH. QueueMonitor observes a finish on
+// EITHER of two channels, both funnelling through its own recordCompletion: the
+// broadcast WS `execution_success`/`execution_error`/`execution_interrupted`
+// frames, and a 1 Hz `GET /history` tail diff that catches what modern ComfyUI
+// scopes to the queuing client only, including runs shorter than a poll tick
+// (#258/#259) and runs queued from the browser. Which channel saw it is not
+// knowable downstream, so nothing here names one. Those observations went to ONE
+// consumer, the `queue_status` UI broadcast, and were dropped on the floor. The
+// completion this session was
 // promised was in the orchestrator's hands and thrown away.
 //
 // This module is the join, and only the join:
@@ -36,10 +40,19 @@
 // carries the output images, the duration and the metadata; ours carries a
 // terminal status and a pointer. The normal path lands within a second or two,
 // and the panel's OWN recovery sweep re-reconciles every 20 s, so a grace
-// comfortably past both lets the real frame win every time it is coming. When
-// the synthesised entry is still `pending` at that moment the journal COALESCES
-// the real payload onto it (record()), so the late-but-working case costs the
-// agent nothing at all — not even an extra turn.
+// comfortably past both lets the real frame win every time it is coming. Past
+// the grace there are exactly two shapes, and NEITHER loses anything — stated
+// precisely, because the coalescing one is the narrower case, not the general
+// one (gate finding):
+//   • nothing took the synthesised entry (no live agent at that instant), so it
+//     is still `pending` — the journal COALESCES the real payload onto it
+//     (record()), and the agent sees ONE turn, with the images. This is the only
+//     path on which the extra turn disappears.
+//   • an agent DID take it, so the entry is `handed_off` or acked — the real
+//     frame then arrives on its own, still correlated `matched`, flagged a
+//     possible repeat, and NEVER discarded. Cost: one extra turn. That is the
+//     standing trade this journal is built on (a duplicate beats a loss), and it
+//     is the price of the grace being finite rather than a downgrade.
 //
 // WHAT IT DELIBERATELY IS NOT. It is not a poller for runs nobody queued, not a
 // second delivery channel, and not a claim that ComfyUI is reachable: when the
@@ -96,8 +109,11 @@ export interface RunCompletionWatchdog {
  * Compose the synthesised completion payload.
  *
  * Every claim in it is one the orchestrator actually observed. It does NOT say
- * "here is your image" — we have the terminal status from `/history`, not the
- * outputs — and it does not say the panel is broken, only that its completion
+ * "here is your image" — a CompletionEvent carries a prompt id, a terminal
+ * status and a timestamp, never outputs — and it does not name WHICH channel
+ * saw the finish, because recordCompletion is fed by both the WS execution
+ * events and the /history diff and does not record which one won. It does not
+ * say the panel is broken, only that its completion
  * never arrived here. Naming the delay is what lets the agent tell this apart
  * from a fresh render finishing now.
  *
@@ -105,7 +121,7 @@ export interface RunCompletionWatchdog {
  * than `run_error`: run_error INTERRUPTS the live turn and front-queues "your
  * run just ERRORED, diagnose it", which is the right blast radius for a live
  * failure the panel reported and the wrong one for a status this watchdog read
- * out of a history record possibly a minute later. The note states the failure
+ * out of a terminal record possibly a minute later. The note states the failure
  * plainly and names the tool that reads the detail.
  */
 export function synthesizeCompletionPayload(
@@ -122,7 +138,7 @@ export function synthesizeCompletionPayload(
   const next =
     armed.status === "success"
       ? `The output file(s) are NOT attached to this notice — the orchestrator read the run's terminal ` +
-        `status from ComfyUI's history, not its images. Fetch them with get_image (action:"list_outputs") ` +
+        `status, not its images. Fetch them with get_image (action:"list_outputs") ` +
         `or get_history for this prompt id before describing or using the result.`
       : armed.status === "interrupted"
         ? `Nothing crashed; it did not run to completion. Re-queue it if the cancellation was unintended.`
@@ -137,8 +153,8 @@ export function synthesizeCompletionPayload(
     run_status: armed.status,
     note:
       `The render you queued (prompt ${armed.promptId}) ${outcome}, but the panel never delivered its ` +
-      `completion event, so this notice was synthesised by the orchestrator from ComfyUI's own history ` +
-      `about ${waitedS}s after the run finished. ${next}`,
+      `completion event, so this notice was synthesised by the orchestrator from ComfyUI itself — its ` +
+      `execution event or its history record — about ${waitedS}s after the run finished. ${next}`,
   };
 }
 
@@ -205,7 +221,7 @@ export function createRunCompletionWatchdog({
         logger.warn(
           `[run-completion-watchdog] prompt ${entry.promptId} finished (${entry.status}) ${Math.round(
             (at - entry.observedAt) / 1000,
-          )}s ago and the panel NEVER reported its completion — synthesising one from ComfyUI's history so the agent that was told to end its turn and wait is not left idle (#1789)`,
+          )}s ago and the panel NEVER reported its completion — synthesising one from the orchestrator's own ComfyUI observation so the agent that was told to end its turn and wait is not left idle (#1789)`,
         );
         try {
           deliver(synthesizeCompletionPayload(entry, { deliveredAt: at }), ticket);

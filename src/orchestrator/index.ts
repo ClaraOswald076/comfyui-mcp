@@ -6203,7 +6203,8 @@ export async function runPanelOrchestrator(): Promise<void> {
   // reported session sat idle after a clean 28.77 s run until a human intervened.
   //
   // QueueMonitor already observes EVERY completion on the monitored ComfyUI —
-  // that is what its 1 Hz `/history` tail diff is for (#259) — and that
+  // on the broadcast WS execution events OR its 1 Hz `/history` tail diff, both
+  // funnelling through one recordCompletion (#258/#259) — and that
   // observation went only to the `queue_status` UI broadcast. This watchdog is
   // the join: an observed completion whose panel_run ticket is still unanswered
   // after the grace is synthesised into the SAME journal the real frame uses.

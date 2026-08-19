@@ -11888,10 +11888,33 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // should have landed, naming the prompt id so it costs a single call.
         // A weaker promise with a stated fallback beats a strong one that fails
         // into an infinite idle.
-        const promptRef = queuedIds.length === 1 ? `, prompt_id:"${queuedIds[0]}"` : "";
+        // THE REMEDY MUST BE A CALL THAT ACTUALLY RUNS (gate NO-SHIP on the first
+        // cut of this fix). Naming no id for a batch was right — inventing one
+        // would point the agent at a single arbitrary member — but the remedy it
+        // left behind, `queue (action:"status")` with no id, is REFUSED by the
+        // tool: queue-management.ts's requirePromptId throws on an absent
+        // prompt_id, so the agent that obeyed this fallback got an error instead
+        // of a status. That is the reported bug's own shape, one level in: a
+        // rider promising something the code declines to do. Verified live
+        // against the real handler — `status` + id and bare `list` both return
+        // JSON; bare `status` returns isError with "requires `prompt_id`".
+        //
+        // So the two branches get the call that fits what they can name:
+        //   • exactly one id  → status on THAT run, the precise answer;
+        //   • a batch         → list, which takes no id and shows whether any of
+        //                       them are still in flight (get_history settles the
+        //                       outcomes once they are not).
+        const fallbackCheck =
+          queuedIds.length === 1
+            ? `queue (action:"status", prompt_id:"${queuedIds[0]}")`
+            : `queue (action:"list")`;
+        const fallbackTail =
+          queuedIds.length === 1
+            ? ""
+            : ` (this run queued ${queuedIds.length} prompts, so the check is the queue as a whole; get_history settles the outcome of any that are no longer in flight)`;
         const note = correlatable
           ? "\n\n[IMPORTANT] You will be notified automatically with the output image(s)/video when the render finishes — do NOT poll queue (action:\"list\"), get_history, or get_image (action:\"list_outputs\"). Just end your turn now and wait for the result to be delivered to you." +
-            `\n[FALLBACK] That notification is journaled and replayed if an agent is not there to take it, and the orchestrator will fill one in from ComfyUI's history if the panel never reports the finish — but it cannot be GUARANTEED, so do not wait forever on it. If nothing has arrived LONG after this render should have finished (roughly twice the time you expect it to take), make ONE check with queue (action:"status"${promptRef}) instead of idling indefinitely. One check, not a loop — and not before then.`
+            `\n[FALLBACK] That notification is journaled and replayed if an agent is not there to take it, and the orchestrator will fill one in from ComfyUI itself — its execution event or its history record — if the panel never reports the finish. But it cannot be GUARANTEED, so do not wait forever on it. If nothing has arrived LONG after this render should have finished (roughly twice the time you expect it to take), make ONE check with ${fallbackCheck} instead of idling indefinitely${fallbackTail}. One check, not a loop — and not before then.`
           : "\n\n[IMPORTANT] The run was queued, but the panel reported NO prompt id for it, so a completion event CANNOT be correlated back to this run — its outcome will be reported to you as UNDETERMINED. Do NOT simply idle and wait indefinitely: end your turn, and if nothing arrives, confirm the outcome with get_history (action:\"list\") before acting on it.";
         // Backpressure note. A backlog is only alarming when it's a job we did NOT
         // queue (possibly foreign/stuck). Deliberately batching renders — a sweep,

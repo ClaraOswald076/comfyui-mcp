@@ -23,6 +23,7 @@ import { readFileSync } from "node:fs";
 import { buildPanelToolDefs, makePanelToolCtx, type PanelToolCtx } from "../../orchestrator/panel-tools.js";
 import { QueueMonitor } from "../../services/queue-monitor.js";
 import { RunCompletions } from "../../orchestrator/run-completion-journal.js";
+import { registerQueueManagementTools } from "../../tools/queue-management.js";
 
 const indexSrc = (): string =>
   readFileSync(new URL("../../orchestrator/index.ts", import.meta.url), "utf8");
@@ -130,6 +131,52 @@ afterEach(() => {
   qm.url = null;
 });
 
+/**
+ * Drive the REAL `queue` tool with the call the rider just told the agent to
+ * make, and report whether the tool ACCEPTED it.
+ *
+ * This is the assertion the first cut of #1789 was missing, and the gate caught
+ * it: the batch branch printed `queue (action:"status")` with no id, which
+ * queue-management.ts's `requirePromptId` REFUSES — so an agent obeying the
+ * fallback got an error instead of a status, the reported bug's own shape one
+ * level in. A test that only string-matched the rider pinned the broken form.
+ *
+ * The parse is deliberately narrow (exact literal shapes the rider emits) and
+ * THROWS on anything it does not recognise, so a reworded remedy fails loudly
+ * here instead of silently going unchecked.
+ *
+ * `isError` is the only thing read: a reachability failure is a different fact
+ * from a validation refusal, and the local `queue` handler answers both shapes
+ * without a live ComfyUI (verified: `list` and `status`+id return JSON, bare
+ * `status` returns isError "requires `prompt_id`").
+ */
+async function queueCallIsAccepted(call: string): Promise<boolean> {
+  let captured: ((a: Record<string, unknown>) => Promise<{ isError?: boolean }>) | null = null;
+  registerQueueManagementTools({
+    tool: (name: string, _d: unknown, _s: unknown, h: (a: Record<string, unknown>) => Promise<{ isError?: boolean }>) => {
+      if (name === "queue") captured = h;
+    },
+  } as never);
+  if (!captured) throw new Error("the queue tool was not registered");
+  const withId = call.match(/^queue \(action:"([a-z_]+)", prompt_id:"([^"]+)"\)$/);
+  const bare = call.match(/^queue \(action:"([a-z_]+)"\)$/);
+  const args = withId
+    ? { action: withId[1], prompt_id: withId[2] }
+    : bare
+      ? { action: bare[1] }
+      : null;
+  if (!args) throw new Error(`the rider's remedy is in an unrecognised shape: ${call}`);
+  const res = await (captured as (a: Record<string, unknown>) => Promise<{ isError?: boolean }>)(args);
+  return res.isError !== true;
+}
+
+/** The single remedy the rider's [FALLBACK] line tells the agent to run. */
+function fallbackCallIn(text: string): string {
+  const m = text.match(/make ONE check with (queue \(action:"[a-z_]+"(?:, prompt_id:"[^"]+")?\))/);
+  if (!m) throw new Error(`no [FALLBACK] remedy found in the rider:\n${text}`);
+  return m[1];
+}
+
 describe("#1789 — panel_run's rider stops promising more than the code can keep", () => {
   it("keeps the anti-poll instruction AND names one bounded fallback with the prompt id", async () => {
     const res = await defByName("panel_run").handler({}, makeCtx({ queued: true, prompt_id: "p-1789" }));
@@ -155,9 +202,41 @@ describe("#1789 — panel_run's rider stops promising more than the code can kee
     );
     const text = firstText(res);
     expect(text).toContain("[FALLBACK]");
-    // No invented single id when the run queued more than one.
-    expect(text).toContain('queue (action:"status")');
+    // No invented single id when the run queued more than one — and the remedy
+    // is the action that takes none, not a status call with the id left off.
+    expect(text).toContain('queue (action:"list")');
     expect(text).not.toContain('prompt_id:"p-a"');
+    expect(text).not.toContain('queue (action:"status")');
+  });
+
+  // THE POINT OF THE WHOLE FALLBACK: the call it names has to RUN. Both branches,
+  // executed against the real tool rather than string-matched.
+  it("SINGLE run — the remedy the rider prints is ACCEPTED by the queue tool", async () => {
+    const text = firstText(
+      await defByName("panel_run").handler({}, makeCtx({ queued: true, prompt_id: "p-1789" })),
+    );
+    const call = fallbackCallIn(text);
+    expect(call).toBe('queue (action:"status", prompt_id:"p-1789")');
+    expect(await queueCallIsAccepted(call)).toBe(true);
+  });
+
+  it("BATCH — the remedy the rider prints is ACCEPTED by the queue tool", async () => {
+    const text = firstText(
+      await defByName("panel_run").handler(
+        {},
+        makeCtx({ queued: true, prompt_id: "p-a", prompt_ids: ["p-a", "p-b"] }),
+      ),
+    );
+    const call = fallbackCallIn(text);
+    expect(call).toBe('queue (action:"list")');
+    expect(await queueCallIsAccepted(call)).toBe(true);
+  });
+
+  // The guard's own guard: prove queueCallIsAccepted can SAY NO, or the two
+  // assertions above are a rubber stamp. This is the exact call the first cut
+  // shipped.
+  it("…and that acceptance check is not vacuous — the shipped-broken form is REFUSED", async () => {
+    expect(await queueCallIsAccepted('queue (action:"status")')).toBe(false);
   });
 
   it("the UNCORRELATABLE branch is unchanged — it never told the agent to idle", async () => {
