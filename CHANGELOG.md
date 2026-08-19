@@ -759,6 +759,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.8] - 2026-08-19
+
+_No user-facing changes._
+
+
 ## [0.52.7] - 2026-08-19
 
 ### MCP
