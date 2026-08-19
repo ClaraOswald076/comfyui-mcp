@@ -759,6 +759,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.13] - 2026-08-19
+
+### MCP
+
+#### Fixed
+- five ways the launcher fallback could strand or double-serve a user (#1800)
+
+
 ## [0.52.11] - 2026-08-19
 
 ### MCP
