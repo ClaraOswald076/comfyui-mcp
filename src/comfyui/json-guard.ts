@@ -852,6 +852,42 @@ export function describeStatus(status: number, statusText?: string): string {
   return safe === null ? String(status) : `${status} ${safe}`;
 }
 
+/**
+ * In-session proof that the configured base URL is a ComfyUI API root.
+ *
+ * A later empty 502 on /history or /internal/logs used to append "Confirm the
+ * configured ComfyUI base URL really is a ComfyUI API root" — the SPA-catch-all
+ * remedy — even when /system_stats had just returned JSON on that same root
+ * (#1670). A CUDA crash that takes ComfyUI down looks exactly like that 502,
+ * and sending the operator to reconfigure COMFYUI_URL loses the traceback they
+ * came for.
+ *
+ * Recorded only from a shape-valid /system_stats document. A JSON envelope from
+ * some other service on the host is not this proof.
+ */
+let validatedApiRoot: string | undefined;
+
+function normalizeApiRoot(baseUrl: string): string {
+  return baseUrl.replace(/\/+$/, "");
+}
+
+/** Record that this session already got a shape-valid /system_stats from `baseUrl`. */
+export function noteComfyApiRootValidated(baseUrl: string): void {
+  const n = normalizeApiRoot(baseUrl);
+  if (n) validatedApiRoot = n;
+}
+
+/** Test isolation — the note is process-wide, same as the client singleton. */
+export function resetComfyApiRootValidated(): void {
+  validatedApiRoot = undefined;
+}
+
+function wasComfyApiRootValidated(): boolean {
+  return (
+    validatedApiRoot !== undefined && validatedApiRoot === normalizeApiRoot(getComfyUIBaseUrl())
+  );
+}
+
 /** Reason phrases that merely restate their code. Lowercased for comparison. */
 const STANDARD_REASON_PHRASES: ReadonlySet<string> = new Set([
   "ok",
@@ -929,7 +965,9 @@ export function classifyNonJson(args: {
     kind = "proxy-error";
     cause = proxyPage
       ? "a reverse proxy in front of ComfyUI returned its OWN error page (its markers are in the body) — the proxy is up but could not reach, or timed out talking to, ComfyUI itself"
-      : `a gateway-class status (${status}) came back with a non-JSON body; ComfyUI does not normally emit these, so something between you and it most likely did, though this response does not identify what`;
+      : empty
+        ? `a gateway-class status (${status}) came back with an EMPTY body. A reverse proxy typically answers this way when ComfyUI crashed, is restarting, or is otherwise unreachable — a temporary server outage, not a sign that the configured ComfyUI base URL is pointing at the wrong place. This response does not identify which of those happened`
+        : `a gateway-class status (${status}) came back with a non-JSON body; ComfyUI does not normally emit these, so something between you and it most likely did, though this response does not identify what`;
   } else if (authStatus || loginPage) {
     kind = "login";
     cause = loginPage
@@ -995,11 +1033,23 @@ export function classifyNonJson(args: {
         : contentType
           ? `a ${contentType} body that did not parse as JSON`
           : "a body that did not parse as JSON";
+  // A 502/503/504 (or a body-confirmed proxy error page) is not the SPA
+  // catch-all. The catch-all remedy — "confirm the configured base URL is a
+  // ComfyUI API root" — sent operators to reconfigure a working COMFYUI_URL
+  // after a CUDA crash took the server down (#1670). Name the outage; only
+  // HTML/wrong-responder answers still get the base-URL check.
+  const statsCheck = `${redactUrlForDiagnosis(getComfyUIBaseUrl())}/system_stats`;
+  const gatewayOutage = kind === "proxy-error";
+  const nextStep = gatewayOutage
+    ? wasComfyApiRootValidated()
+      ? `This same ComfyUI API root already served ${statsCheck} JSON this session, so the base URL is not newly misconfigured. Treat this as a temporary server outage (crash, restart, or a proxy that cannot reach ComfyUI) and retry after the server is back`
+      : `This is a temporary server outage — ComfyUI crashed, is restarting, or a proxy in front of it could not reach it — not evidence that the configured ComfyUI base URL is pointing at the wrong place. Retry after the server is back; if ${statsCheck} then returns JSON, the base URL was fine`
+    : `Confirm the configured ComfyUI base URL really is a ComfyUI API root — a URL that loads the ComfyUI UI in a browser is not proof, because the UI is served by the same catch-all that produced this page. ` +
+      `The check is that ${statsCheck} returns JSON with a "system"/"devices" shape; if it returns HTML too, the base URL, its path prefix, or the proxy's route map is wrong`;
   const message =
     `${url} answered ${reason} with ${what} where JSON was expected. This means ${cause}. ` +
     `Content-Type: ${contentType || "(none)"}. Body starts: ${bodyPrefix || "(empty)"}. ` +
-    `Confirm the configured ComfyUI base URL really is a ComfyUI API root — a URL that loads the ComfyUI UI in a browser is not proof, because the UI is served by the same catch-all that produced this page. ` +
-    `The check is that ${redactUrlForDiagnosis(getComfyUIBaseUrl())}/system_stats returns JSON with a "system"/"devices" shape; if it returns HTML too, the base URL, its path prefix, or the proxy's route map is wrong` +
+    nextStep +
     // The credential instruction must follow the same evidence rule as the
     // diagnosis above. Only a body-confirmed sign-in page justifies "give it to
     // the gateway"; a bare 401/403 could equally be ComfyUI's own auth layer, and

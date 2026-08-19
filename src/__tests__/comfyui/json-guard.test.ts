@@ -13,7 +13,7 @@
 // reported as HTML, and a valid-JSON-but-wrong-document 200 is reported as such
 // instead of being handed on as data.
 
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // The body prefix is diagnostic, but a gateway that REFLECTS the request could
 // put our own ComfyUI credential in it — and the prefix goes into an error the
@@ -27,9 +27,16 @@ import {
   classifyNonJson,
   isNonJsonResponseError,
   looksLikeHtmlParsedAsJson,
+  noteComfyApiRootValidated,
   readComfyJson,
+  resetComfyApiRootValidated,
   rethrowWithJsonDiagnosis,
 } from "../../comfyui/json-guard.js";
+import { getComfyUIBaseUrl } from "../../config.js";
+
+beforeEach(() => {
+  resetComfyApiRootValidated();
+});
 
 const URL_UNDER_TEST = "http://remote.example:8188/api/workflow_templates";
 
@@ -322,6 +329,41 @@ describe("classifyNonJson names what answered instead of ComfyUI (#828)", () => 
     expect(d.message).toContain("/system_stats");
     expect(d.message).toContain("devices");
     expect(d.message).toContain("is not proof");
+  });
+
+  // #1670 — a CUDA crash that takes ComfyUI down surfaces as an empty 502 on
+  // /history and /internal/logs. The SPA-catch-all remedy ("confirm the base
+  // URL is a ComfyUI API root") is the wrong next step: the host answered, and
+  // a 502 empty body is what a proxy returns when the upstream is gone.
+  it("does not prescribe a base-URL check for an empty 502", () => {
+    const d = classifyNonJson({
+      url: "http://remote.example:8188/history",
+      status: 502,
+      contentType: "",
+      body: "",
+    });
+    expect(d.kind).toBe("proxy-error");
+    expect(d.message).toContain("EMPTY body");
+    expect(d.message).toMatch(/temporary server outage/i);
+    expect(d.message).not.toContain("Confirm the configured ComfyUI base URL");
+    expect(d.message).not.toContain("the same catch-all that produced this page");
+    expect(d.message).not.toContain("really is a ComfyUI API root");
+  });
+
+  it("names a previously-validated root as an outage, not a misconfiguration", () => {
+    noteComfyApiRootValidated(getComfyUIBaseUrl());
+    const d = classifyNonJson({
+      url: "http://remote.example:8188/internal/logs",
+      status: 502,
+      contentType: "",
+      body: "",
+    });
+    expect(d.message).toContain("already served");
+    expect(d.message).toContain("/system_stats");
+    expect(d.message).toContain("not newly misconfigured");
+    expect(d.message).toMatch(/temporary server outage/i);
+    expect(d.message).not.toContain("Confirm the configured ComfyUI base URL");
+    expect(d.message).not.toContain("the same catch-all that produced this page");
   });
 });
 
