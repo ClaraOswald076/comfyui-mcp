@@ -24,7 +24,7 @@
 // so parity is automatic — neither path reimplements a tool.
 
 import { z } from "zod";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 // #873 — the operator's tool-surface policy also governs the panel surface.
 import {
   resolveToolSurfacePolicy,
@@ -3002,6 +3002,62 @@ function appendToolResultText(res: ToolResult, extra: string): ToolResult {
   const content = [...res.content];
   content[idx] = { type: "text", text: `${block.text}${extra}` };
   return { ...res, content };
+}
+
+// ---- #1695: bound the panel_set_widget previous/new echo --------------------
+//
+// Code-mode clients (Codex `functions.exec`) batch several panel_set_widget
+// calls into one script, and the OUTER tool result accumulates every nested
+// reply. Each reply echoes the previous and new widget values verbatim; two
+// long CLIPTextEncode prompts per call push the aggregate past the client's
+// tool-result budget ("Output exceeded the available model context and was
+// truncated") even though every mutation succeeded — and the truncation can
+// hide exactly the per-call status the caller needs. The echo is confirmation,
+// not transport (a read-back belongs to panel_query_graph), so a long string
+// value is summarized server-side as { chars, sha256, preview }: the hash keeps
+// the confirmation verifiable, the preview keeps it legible, and `echo: "full"`
+// opts back into the verbatim reply.
+//
+// Server-side on purpose — the echo is produced by the panel frontend, and an
+// old panel keeps echoing verbatim no matter what a new one would do (the same
+// reason fitQueryGraphReply re-fits here, #807).
+const SET_WIDGET_ECHO_SUMMARY_THRESHOLD = 1000;
+const SET_WIDGET_ECHO_PREVIEW_CHARS = 160;
+
+function summarizeSetWidgetEcho(res: ToolResult, full: boolean): ToolResult {
+  if (full || res.isError) return res;
+  const payload = parseToolResultJson(res);
+  const set = payload?.set;
+  if (!payload || !set || typeof set !== "object" || Array.isArray(set)) return res;
+  const record = set as Record<string, unknown>;
+  const summarize = (v: unknown): unknown => {
+    if (typeof v !== "string" || v.length <= SET_WIDGET_ECHO_SUMMARY_THRESHOLD) return v;
+    return {
+      chars: v.length,
+      sha256: createHash("sha256").update(v, "utf8").digest("hex"),
+      preview: `${v.slice(0, SET_WIDGET_ECHO_PREVIEW_CHARS)}…`,
+    };
+  };
+  const previous = summarize(record.previous);
+  const value = summarize(record.value);
+  // Nothing crossed the threshold — return the reply untouched rather than
+  // dressing up an unfitted payload as a fitted one.
+  if (previous === record.previous && value === record.value) return res;
+  const idx = res.content.findIndex((c) => c.type === "text");
+  if (idx < 0) return res;
+  const fitted = {
+    ...payload,
+    set: { ...record, previous, value },
+    echo: "summary",
+    echo_full:
+      'Long string values were summarized as {chars, sha256, preview} so batched calls do not overflow the outer tool result; the mutation was applied. Re-call with echo: "full" for the verbatim strings, or read the live value back with panel_query_graph.',
+  };
+  return {
+    ...res,
+    content: res.content.map((c, i) =>
+      i === idx && c.type === "text" ? { ...c, text: JSON.stringify(fitted, null, 2) } : c,
+    ),
+  };
 }
 
 // ---- #809: turn the panel's silent `truncated: true` booleans into a remedy --------
@@ -10882,7 +10938,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_set_widget",
-      "Set a widget value on a node in the user's open graph (steps, cfg, seed, ckpt_name, text prompts, …). Returns the previous and new value. Undoable with Ctrl+Z. To CLEAR a text widget to an empty string, pass `clear: true` (some MCP clients drop an empty-string `value` from the serialized payload, so `value: \"\"` may not arrive — `clear: true` always works). For the LTXDirector timeline node (WhatDreamsCost CSGlide), set `timeline_data` with the FULL timeline JSON (segments + global_prompt) to drive its custom timeline UI — this re-syncs the editor and regenerates its derived `local_prompts`/`segment_lengths`/`guide_strength` widgets; setting those derived widgets directly is refused (they are silently reverted).",
+      "Set a widget value on a node in the user's open graph (steps, cfg, seed, ckpt_name, text prompts, …). Returns the previous and new value (a string longer than 1000 chars is echoed as {chars, sha256, preview} so batched calls stay inside the outer tool-result budget — pass `echo: \"full\"` for the verbatim string). Undoable with Ctrl+Z. To CLEAR a text widget to an empty string, pass `clear: true` (some MCP clients drop an empty-string `value` from the serialized payload, so `value: \"\"` may not arrive — `clear: true` always works). For the LTXDirector timeline node (WhatDreamsCost CSGlide), set `timeline_data` with the FULL timeline JSON (segments + global_prompt) to drive its custom timeline UI — this re-syncs the editor and regenerates its derived `local_prompts`/`segment_lengths`/`guide_strength` widgets; setting those derived widgets directly is refused (they are silently reverted).",
       {
         node_id: nodeId().describe("Node id from panel_graph_outline / panel_query_graph."),
         widget: z.string().describe("Widget name (e.g. 'steps', 'cfg', 'text')."),
@@ -10894,6 +10950,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .boolean()
           .optional()
           .describe("Set true to clear the widget to an empty string (\"\"). Escape hatch for when a client cannot carry an empty-string `value` through tool-arg JSON. Overrides `value`."),
+        echo: z
+          .enum(["summary", "full"])
+          .optional()
+          .describe(
+            "How to echo the previous/new values back. 'summary' (default) replaces a string longer than 1000 chars with {chars, sha256, preview} — the mutation is applied either way. 'full' returns the verbatim strings.",
+          ),
       },
       async (args: A, ctx) => {
         // Distinguish "value present but empty" from "value absent" by key
@@ -10910,10 +10972,20 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // a single revalidation, #338/#458) — that authoritative fetch can outlast
         // the 6000 ms default ack on a large install and return a FALSE timeout.
         // Give the guarded write the bounded refresh ack budget.
-        const write = (nodeId: unknown, widget: string): Promise<ToolResult> =>
-          ctx.call(
-            { cmd: "graph_set_widget", node_id: nodeId, widget, value },
-            OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+        // #1695: summarize the previous/new echo of every successful write
+        // (direct, remapped, or inner-subgraph) before anything else touches
+        // it — long prompts batched in one code-mode script otherwise overflow
+        // the outer tool result even though the mutations succeeded. Applied
+        // to the raw success reply so a later appendToolResultText disclosure
+        // (which makes the text no longer parse as JSON) cannot dodge it.
+        const echoFull = args.echo === "full";
+        const write = async (nodeId: unknown, widget: string): Promise<ToolResult> =>
+          summarizeSetWidgetEcho(
+            await ctx.call(
+              { cmd: "graph_set_widget", node_id: nodeId, widget, value },
+              OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+            ),
+            echoFull,
           );
         const first = await write(args.node_id, args.widget as string);
         if (!first.isError) return first;
