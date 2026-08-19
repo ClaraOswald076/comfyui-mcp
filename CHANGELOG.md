@@ -759,6 +759,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.16] - 2026-08-19
+
+### MCP
+
+#### Added
+- check_runtime consults the panel-proven frontend virtual registry (#1817)
+
+#### Fixed
+- panel_restart_comfyui refuses an unidentifiable local instance before asking, leaving the tab connected (#1822)
+- a stale graph fence no longer blocks Manager search/install/reboot or mode:current recovery (#1821)
+- empty registry zip installs fail instead of reporting success (#1820)
+
+
 ## [0.52.15] - 2026-08-19
 
 ### MCP
