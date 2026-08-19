@@ -4619,7 +4619,8 @@ function corroborateActiveForFence(
   // Same tri-state primitive the pin path uses. `false` = they name DIFFERENT
   // canvases (the stale/mixed case). `undefined` = they share no comparable
   // identity field, so agreement was never established — which is not agreement.
-  const verdict = identityVerdict(flaggedActive[0], active);
+  const flagged = flaggedActive[0];
+  const verdict = identityVerdict(flagged, active);
   if (verdict === false) {
     return {
       ok: false,
@@ -4630,6 +4631,20 @@ function corroborateActiveForFence(
     };
   }
   if (verdict !== true) {
+    // #1650 — unsaved (`tmp:`) tabs never have path/filename. After a reconnect
+    // the top-level `active` record historically omitted `key`/`routing_key`
+    // whenever the panel had not yet established a workflow identity, while the
+    // unique flagged-active list entry still carried the per-tab `tmp:` handle
+    // from `workflowTabId()`. Those two records describe the same canvas; they
+    // just do not share a field that `identityVerdict` can pair. The reverse
+    // (handle on `active`, omitted on the list row) is the same gap.
+    //
+    // Restricted to BOTH sides being unsaved and exactly one flagged-active
+    // (already checked above). A saved path on either side is a different
+    // canvas, not a missing field.
+    if (unsavedTmpHandleCorroborates(flagged, active)) {
+      return { ok: true, active: fenceRecordForAdoption(flagged, active) };
+    }
     return {
       ok: false,
       seenUuid,
@@ -4639,7 +4654,7 @@ function corroborateActiveForFence(
       settles: false,
     };
   }
-  return { ok: true, active: active as Record<string, unknown> };
+  return { ok: true, active: fenceRecordForAdoption(flagged, active) };
 }
 
 /**
@@ -5999,16 +6014,81 @@ function computeIsActive(rec: OpenWorkflowRecord, activeObj: unknown): boolean |
 }
 
 /**
- * Stable-identity (key/path/routing_key) verdict between a record and the active object.
- * Returns `true` on a positive match, `false` only when the two expose a COMPARABLE field
- * (both non-empty) that DISAGREES, and `undefined` when they share no comparable field at
- * all (so the caller cannot conclude "background" — stay lenient). Filename is never used
- * (it collides across tabs).
+ * Per-tab unsaved handle (`tmp:<id>`). Unsaved tabs have no path/filename; this
+ * is the only unique identity they publish. Accepts any non-empty `tmp:` token
+ * (not only RFC-uuid suffixes) so a panel that mints a shorter handle still
+ * corroborates — `canonicalUnsavedWorkflowIdentity` stays strict for OPEN,
+ * which is a caller-supplied selector.
+ */
+function recordTmpHandle(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  const rec = value as { key?: unknown; routing_key?: unknown };
+  for (const v of [rec.routing_key, rec.key]) {
+    if (typeof v === "string" && /^tmp:\S+$/.test(v)) return v;
+  }
+  return null;
+}
+
+/** Canonical saved path, or null when the record is unsaved / has no path. */
+function recordSavedPath(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  return canonicalSavedWorkflowPath((value as { path?: unknown }).path);
+}
+
+/**
+ * #1650 — the unique flagged-active list entry and the top-level `active`
+ * record describe the same UNSAVED canvas even when they do not share a
+ * pairable field. True only when BOTH sides lack a saved path and at least
+ * one carries a `tmp:` handle. A saved path on either side is a different
+ * canvas (or a mixed reply), not a missing field.
+ */
+function unsavedTmpHandleCorroborates(listRec: unknown, activeObj: unknown): boolean {
+  if (recordSavedPath(listRec) || recordSavedPath(activeObj)) return false;
+  if (!(recordTmpHandle(listRec) || recordTmpHandle(activeObj))) return false;
+  const listUuid = responseWorkflowUuid(listRec);
+  const activeUuid = responseWorkflowUuid(activeObj);
+  // Two published uuids that disagree are a mixed reply, not a missing field.
+  if (listUuid && activeUuid && listUuid !== activeUuid) return false;
+  return true;
+}
+
+/**
+ * Record to adopt a fence uuid from. Prefer the top-level `active` object
+ * (it is the one that historically carries `workflow_uuid`); fall back to
+ * the flagged list row when only that row published one.
+ */
+function fenceRecordForAdoption(
+  listRec: OpenWorkflowRecord,
+  activeObj: unknown,
+): Record<string, unknown> {
+  const active = activeObj as Record<string, unknown>;
+  if (responseWorkflowUuid(active)) return active;
+  const list = listRec as Record<string, unknown>;
+  if (responseWorkflowUuid(list)) return list;
+  return active;
+}
+
+/**
+ * Stable-identity (key/path/routing_key/tmp: handle) verdict between a record and the
+ * active object. Returns `true` on a positive match, `false` only when the two expose a
+ * COMPARABLE field (both non-empty) that DISAGREES, and `undefined` when they share no
+ * comparable field at all (so the caller cannot conclude "background" — stay lenient).
+ * Filename is never used (it collides across tabs).
  */
 function identityVerdict(rec: OpenWorkflowRecord, activeObj: unknown): boolean | undefined {
   if (!activeObj || typeof activeObj !== "object") return undefined;
-  const a = activeObj as { path?: unknown; key?: unknown; routing_key?: unknown };
-  const r = rec as { path?: unknown; key?: unknown; routing_key?: unknown };
+  const a = activeObj as {
+    path?: unknown;
+    key?: unknown;
+    routing_key?: unknown;
+    workflow_uuid?: unknown;
+  };
+  const r = rec as {
+    path?: unknown;
+    key?: unknown;
+    routing_key?: unknown;
+    workflow_uuid?: unknown;
+  };
   const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
   const pairs: Array<[unknown, unknown]> = [
     [r.key, a.key],
@@ -6016,6 +6096,12 @@ function identityVerdict(rec: OpenWorkflowRecord, activeObj: unknown): boolean |
     [r.routing_key, a.routing_key],
     [r.key, a.routing_key],
     [r.routing_key, a.key],
+    // #1650 — a tmp: handle is a per-tab identity, not a saved path. Pair it
+    // the same way key↔routing_key is paired so an unsaved canvas is not
+    // treated as "no comparable field" when one side published `key` and the
+    // other published `routing_key` (or vice versa).
+    [recordTmpHandle(r), recordTmpHandle(a)],
+    [r.workflow_uuid, a.workflow_uuid],
   ];
   // A CONTRADICTION OUTRANKS AN AGREEMENT (codex gate P0). Returning `true` on
   // the first equal pair meant a mixed reply — matching `key`, conflicting
@@ -6046,6 +6132,12 @@ function identityVerdict(rec: OpenWorkflowRecord, activeObj: unknown): boolean |
     [r.key, a.key, (v) => (nonEmpty(v) ? v : null)],
     [r.path, a.path, canonicalSavedWorkflowPath],
     [r.routing_key, a.routing_key, canonicalSavedWorkflowRoutingIdentity],
+    [recordTmpHandle(r), recordTmpHandle(a), (v) => (nonEmpty(v) ? v : null)],
+    [
+      r.workflow_uuid,
+      a.workflow_uuid,
+      (v) => (typeof v === "string" && WORKFLOW_UUID_RE.test(v) ? v : null),
+    ],
   ];
   for (const [x, y, canon] of sameField) {
     if (!nonEmpty(x) || !nonEmpty(y)) continue;

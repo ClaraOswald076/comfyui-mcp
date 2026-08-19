@@ -8,6 +8,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **`panel_set_workflow_target({mode:"current"})` rebinds an unsaved tmp: tab after a multi-workflow reconnect (#1650).**
+  An unsaved canvas never has path/filename. After a reconnect the top-level
+  `active` record often omitted `key`/`routing_key` as well — the panel had not
+  yet established a reply identity — while the unique flagged-active list row
+  still published `tmp:<uuid>`. Corroboration treated that as "no comparable
+  identity field" and refused to adopt the live fence, so the documented
+  recovery left the next graph call fenced to the previous workflow.
+
+  `mode:"current"` now treats a `tmp:` handle on either side as the comparable
+  identity for that unique unsaved active tab, and adopts the uuid the panel
+  did publish. A saved path on either side, or two disagreeing uuids, still
+  fail closed. Filename-only records stay uncorroborated: that name collides
+  across tabs.
+
 - **An orchestrator that never finishes starting no longer lingers silently (#1524).**
   A respawned instance was found alive for hours holding no listening ports at all,
   while an older one still owned them. Nothing was wrong from the sidebar's point of
