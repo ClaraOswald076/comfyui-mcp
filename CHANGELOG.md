@@ -759,6 +759,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.9] - 2026-08-19
+
+### MCP
+
+#### Fixed
+- a live graph read with a missing instance stamp now runs (#1787)
+
+#### Changed
+- the 0.52.7 changelog names #1784, which shipped in the tag (#1785)
+
+
 ## [0.52.7] - 2026-08-19
 
 ### MCP
