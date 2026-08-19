@@ -155,6 +155,12 @@ const SM_GIT_ROOT = join(SM_DATA, "PortableGit");
 const SM_GIT_DIR = join(SM_GIT_ROOT, "cmd");
 const SM_GIT_EXE = join(SM_GIT_DIR, "git.exe");
 const SM_ASSETS_ROOT = join(SM_DATA, "Assets");
+const SM_ASSETS_PY = join(
+  SM_ASSETS_ROOT,
+  "Python",
+  "cpython-3.12.11-windows-x86_64-none",
+  "python.exe",
+);
 const SM_FFMPEG_ROOT = join(SM_ASSETS_ROOT, "ffmpeg");
 const SM_SETTINGS = join(SM_DATA, "settings.json");
 const SM_FFMPEG_DIR = join(SM_FFMPEG_ROOT, "bin");
@@ -727,6 +733,132 @@ describe("restart_comfyui — the interpreter the HEALTHY server runs wins (#165
 
     expect(exe).toBe(SM_PY);
     expect(args).toEqual(SM_ARGV);
+  });
+});
+
+describe("restart_comfyui — Stability Matrix package venv, not Assets CPython (#1704)", () => {
+  // #1704: restart/start launched
+  //   <Data>/Assets/Python/cpython-…/python.exe
+  // instead of the package venv
+  //   <Data>/Packages/ComfyUI/venv/Scripts/python.exe
+  // The Assets interpreter has no sqlalchemy/torch, so the child exits 1 and
+  // leaves ComfyUI down. Happens when this session never observed the
+  // interpreter (ComfyUI started outside, or action:"start" after another
+  // session) AND when the OS names the venv trampoline's BASE interpreter.
+  const SM_PACKAGES = join(SM_DATA, "Packages");
+  const SM_ARGV = [SM_MAIN, "--preview-method", "auto", "--use-sage-attention"];
+
+  function useAssetsVsPackageVenv(): void {
+    mockFindComfyuiPython.mockReturnValue(SM_ASSETS_PY);
+    mockLiveRootFromArgv.mockReturnValue(SM_PKG);
+    mockGetSystemStats.mockResolvedValue({ system: { argv: SM_ARGV } });
+    const roots = [SM_GIT_ROOT, SM_FFMPEG_ROOT, SM_PACKAGES];
+    const existingDirs = new Set<string>();
+    for (const root of roots) {
+      let cur = root;
+      while (cur.length > SM_DATA.length && cur.startsWith(SM_DATA)) {
+        existingDirs.add(cur);
+        cur = dirname(cur);
+      }
+      existingDirs.add(SM_DATA);
+    }
+    // Every ancestor of the Assets CPython (Assets/Python/cpython-…).
+    let cur = dirname(SM_ASSETS_PY);
+    while (cur.length >= SM_DATA.length && cur.startsWith(SM_DATA)) {
+      existingDirs.add(cur);
+      cur = dirname(cur);
+    }
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      if (s === SM_MAIN || s === SM_PY || s === SM_ASSETS_PY) return true;
+      if (existingDirs.has(s)) return true;
+      if (s === SM_GIT_EXE || s === SM_FFMPEG_EXE) return true;
+      return false;
+    });
+  }
+
+  function osReportsInterpreter(commandLine: string): void {
+    __processControlTestHooks.setProcessIdentityResolver((pid) =>
+      pid === 4321 ? { startedAt: "stable-stamp", commandLine } : undefined,
+    );
+  }
+
+  async function restartAndReturnSpawn(): Promise<{
+    exe: string;
+    args: string[];
+  }> {
+    mockLivePortThenFree();
+    spawnCapturingChildren();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+    const result = await restartComfyUI();
+    expect(result.stopped).toBe(true);
+    expect(result.started).toBe(true);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    const [exe, args] = mockSpawn.mock.calls[0];
+    killSpy.mockRestore();
+    return { exe: String(exe), args: args as string[] };
+  }
+
+  it("relaunches the package venv when the layout/PATH guess is the unused Assets CPython", async () => {
+    // THE additional-reproduction shape: no usable OS interpreter (bare
+    // `python`), layout resolution returns Assets python, package venv exists.
+    useAssetsVsPackageVenv();
+    osReportsInterpreter(`python "${SM_MAIN}" --preview-method auto --use-sage-attention`);
+
+    const { exe, args } = await restartAndReturnSpawn();
+
+    expect(exe).toBe(SM_PY);
+    expect(exe).not.toBe(SM_ASSETS_PY);
+    expect(args).toEqual(SM_ARGV);
+  });
+
+  it("relaunches the package venv when the OS names the Assets CPython (venv trampoline base)", async () => {
+    // Windows reports ExecutablePath / a CommandLine argv[0] of the BASE
+    // interpreter the venv trampoline loads. Spawning that is the original
+    // report: sqlalchemy missing, exit 1.
+    useAssetsVsPackageVenv();
+    osReportsInterpreter(
+      `"${SM_ASSETS_PY}" "${SM_MAIN}" --preview-method auto --use-sage-attention`,
+    );
+
+    const { exe } = await restartAndReturnSpawn();
+
+    expect(exe).toBe(SM_PY);
+    expect(exe).not.toBe(SM_ASSETS_PY);
+  });
+
+  it("start uses the package venv when this session has no observed interpreter", async () => {
+    // action:"start" after ComfyUI was started (and stopped) outside this
+    // session — lastProcessInfo has the script argv but no observedInterpreter.
+    useAssetsVsPackageVenv();
+    __processControlTestHooks.setLastProcessInfo({
+      pid: 0,
+      port: 8188,
+      argv: SM_ARGV,
+      isDesktopApp: false,
+    });
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/netstat/i.test(cmd)) return "";
+      if (/lsof/i.test(cmd)) throw noListener();
+      return "";
+    });
+    spawnCapturingChildren();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+
+    const result = await startComfyUI();
+
+    expect(result.started).toBe(true);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    const [exe] = mockSpawn.mock.calls[0];
+    expect(String(exe)).toBe(SM_PY);
+    expect(String(exe)).not.toBe(SM_ASSETS_PY);
   });
 });
 

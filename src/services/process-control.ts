@@ -43,6 +43,7 @@ import {
 } from "./desktop-launch-args.js";
 import { findComfyuiPython } from "./env-capabilities.js";
 import {
+  preferStabilityMatrixPackagePython,
   readLiveProcessEnv,
   resolveLaunchEnvironment,
   type LaunchEnvInfo,
@@ -1812,10 +1813,14 @@ function resolveLaunchCommand(
     // whenever both exist is how a restart relaunched an empty environment and left
     // the server down. The observation was captured corroborated against the
     // server's own argv, so it IS the environment the healthy process imports from.
+    //
+    // #1704: do NOT return null yet when the layout guess is empty — a Stability
+    // Matrix package venv can still be recovered from the script path even when
+    // this session never observed the interpreter (ComfyUI started outside, or
+    // action:"start" after another session).
     const python =
       info.observedInterpreter ??
       findComfyuiPython(config.comfyuiPath ?? undefined, argv);
-    if (!python) return null;
     // sys.argv[0] can be RELATIVE (the standard Windows portable launcher runs
     // `python ComfyUI\main.py` from the portable root). We force cwd to
     // config.comfyuiPath — the ComfyUI dir that directly holds main.py — so a
@@ -1892,11 +1897,30 @@ function resolveLaunchCommand(
     // the environment this exact process was seen running under, while the other
     // two are install-layout inferences that cannot tell a working `venv` from an
     // empty `.venv` sitting beside it.
-    const exe = info.observedInterpreter ?? (liveCwdScript ? liveCwdPython! : python);
+    //
+    // #1704: Stability Matrix's unused Assets CPython (or a bare PATH `python`
+    // that resolves to it) is never a launch interpreter when the package venv
+    // exists — that tree has no sqlalchemy/torch, so spawning it exits 1 and
+    // leaves ComfyUI down. An observed *package* interpreter is left alone.
+    const rawExe = info.observedInterpreter ?? (liveCwdScript ? liveCwdPython! : python);
     const cwd = liveCwdScript ? info.liveCwd : anchor;
+    const exe = preferStabilityMatrixPackagePython(rawExe, [
+      script,
+      rawExe,
+      cwd,
+      info.liveCwd,
+      info.argv[0],
+    ]);
+    if (!exe) return null;
     return { exe, args: [script, ...rest], cwd };
   }
-  return { exe: first, args: rest };
+  const remapped = preferStabilityMatrixPackagePython(first, [
+    first,
+    ...rest,
+    info.liveCwd,
+    info.argv[0],
+  ]);
+  return { exe: remapped ?? first, args: rest };
 }
 
 /**
@@ -2725,9 +2749,19 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
   // process is alive, for the same reason `liveCwd` is. The relaunch prefers it
   // over the install-layout guess, which picks `.venv` over `venv` whenever both
   // exist regardless of which environment the server actually imports from.
+  //
+  // #1704: `confirmed` also requires a creation stamp (needed to bind a KILL).
+  // A matching command line still names the interpreter when the stamp is
+  // unreadable — the same observation `install_comfyui(action:"environment")`
+  // already reports — so a server started outside this session is not relaunched
+  // with Stability Matrix's unused Assets CPython.
+  const interpreterIdentity =
+    corroboration.kind === "confirmed"
+      ? corroboration.identity
+      : (osIdentity ?? resolveProcessIdentity(pid));
   const observedInterpreter =
-    !desktop && corroboration.kind === "confirmed"
-      ? observedInterpreterFromIdentity(corroboration.identity)
+    !desktop && interpreterIdentity
+      ? observedInterpreterFromIdentity(interpreterIdentity)
       : undefined;
   const startedAt = desktop
     ? undefined
