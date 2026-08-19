@@ -22,14 +22,12 @@ call :clone "ComfyUI-KJNodes" "https://github.com/kijai/ComfyUI-KJNodes"
 call :clone "ComfyUI_UltimateSDUpscale" "https://github.com/ssitu/ComfyUI_UltimateSDUpscale"
 call :clone "ComfyUI_essentials" "https://github.com/cubiq/ComfyUI_essentials"
 call :clone "wlsh_nodes" "https://github.com/wallish77/wlsh_nodes"
-call :clone "comfyui-vrgamedevgirl" "https://github.com/vrgamegirl19/comfyui-vrgamedevgirl"
 call :clone "RES4LYF" "https://github.com/ClownsharkBatwing/RES4LYF"
 call :clone "SeedVarianceEnhancer" "https://github.com/ChangeTheConstants/SeedVarianceEnhancer"
 call :clone "ComfyUI-Detail-Daemon" "https://github.com/Jonseed/ComfyUI-Detail-Daemon"
 call :clone "comfyui_controlnet_aux" "https://github.com/Fannovel16/comfyui_controlnet_aux"
 
 echo -------- pip (manifest extras) --------
-"%PY%" -m pip install "librosa"
 "%PY%" -m pip install "scikit-image"
 
 echo -------- models --------

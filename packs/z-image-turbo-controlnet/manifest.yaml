@@ -4,11 +4,14 @@
 # the slicer's backward closure.
 # Mirror base: https://huggingface.co/Aitrepreneur/FLX/resolve/main  (third-party)
 
-# comfyui-vrgamedevgirl's nodes.py (FastFilmGrain / FastLaplacianSharpen) imports
-# librosa at module load; pin it so the post-proc nodes register.
+# DWPreprocessor (DWPose) needs skimage or it silently fails to register.
+# Do NOT add comfyui-vrgamedevgirl: its requirements.txt pulls llama-cpp-python,
+# which has no Windows wheel for Desktop's Python and compiles from source
+# during Manager's pre-bind startup, blowing past Desktop's 300s port timeout
+# (#1698). FastFilmGrain / FastLaplacianSharpen are cosmetic only; this pack's
+# graph does not use them.
 pip:
-  - librosa
-  - scikit-image   # DWPreprocessor (DWPose) needs skimage or it silently fails to register
+  - scikit-image
 
 custom_nodes:
   - https://github.com/city96/ComfyUI-GGUF
@@ -18,7 +21,6 @@ custom_nodes:
   - https://github.com/ssitu/ComfyUI_UltimateSDUpscale
   - https://github.com/cubiq/ComfyUI_essentials
   - https://github.com/wallish77/wlsh_nodes
-  - https://github.com/vrgamegirl19/comfyui-vrgamedevgirl
   - https://github.com/ClownsharkBatwing/RES4LYF
   - https://github.com/ChangeTheConstants/SeedVarianceEnhancer
   - https://github.com/Jonseed/ComfyUI-Detail-Daemon
