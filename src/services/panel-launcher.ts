@@ -312,19 +312,40 @@ export async function installPanelLauncher(
             `"${PANEL_LAUNCHER_TASK}" task is already registered — leaving it as the autostart.\n`,
         );
       } else {
-        mkdirSync(dirname(paths.windowsStartup), { recursive: true });
-        writeFileSync(
-          paths.windowsStartup,
-          `@echo off\r\nstart "" /min "${paths.windowsScript}"\r\n`,
-          "utf8",
-        );
+        // The Startup write can fail too — EDR/AppLocker blocking Startup
+        // persistence, or a Roaming AppData redirected to an offline share, on
+        // the very same managed accounts whose policy denied the task. Unguarded,
+        // it threw before the broker was started and the session got NOTHING:
+        // #1798's stranding loop relocated from the schtasks line to this one
+        // (merge-gate P1). Losing the autostart is survivable; losing this
+        // session's broker is the bug we are here to fix, so warn and fall
+        // through to it.
+        let autostartPath = "";
+        try {
+          mkdirSync(dirname(paths.windowsStartup), { recursive: true });
+          writeFileSync(
+            paths.windowsStartup,
+            `@echo off\r\nstart "" /min "${paths.windowsScript}"\r\n`,
+            "utf8",
+          );
+          autostartPath = paths.windowsStartup;
+        } catch (startupErr) {
+          process.stderr?.write?.(
+            `[comfyui-mcp] could not write the Startup autostart ` +
+              `(${startupErr instanceof Error ? startupErr.message : String(startupErr)}); ` +
+              `MCP will run for this session but will NOT start at the next logon. ` +
+              `Start it by hand with: ${paths.windowsScript}\n`,
+          );
+        }
         // Not silent: the user asked for a launcher and got a different mechanism
         // than the one this tool normally installs, which changes how they would
         // later remove or debug it.
-        process.stderr?.write?.(
-          `[comfyui-mcp] scheduled task refused (${schtasksReason(err)}); ` +
-            `registered a Startup-folder autostart instead: ${paths.windowsStartup}\n`,
-        );
+        if (autostartPath) {
+          process.stderr?.write?.(
+            `[comfyui-mcp] scheduled task refused (${schtasksReason(err)}); ` +
+              `registered a Startup-folder autostart instead: ${autostartPath}\n`,
+          );
+        }
       }
     }
     if (taskRegistered) {

@@ -213,6 +213,35 @@ describe("panel launcher install", () => {
     }
   });
 
+  it("an UNWRITABLE Startup folder still leaves this session with a broker", async () => {
+    // EDR/AppLocker blocking Startup persistence, or Roaming AppData redirected
+    // to an offline share — the same managed accounts whose policy denied the
+    // task in the first place. Unguarded, the write threw before the broker was
+    // started and the session got nothing: #1798's stranding loop moved from the
+    // schtasks line to the Startup line. Losing the autostart is survivable;
+    // losing the broker is the bug this whole path exists to fix.
+    const { home, source } = fixture();
+    const spawned: Array<readonly string[]> = [];
+    // A FILE where the Startup tree needs directories → mkdirSync throws ENOTDIR.
+    const blocked = join(home, "blocked-appdata");
+    writeFileSync(blocked, "not a directory", "utf8");
+    const paths = await installPanelLauncher({
+      home,
+      appData: blocked,
+      platform: "win32",
+      brokerSource: source,
+      exec: (() => {
+        throw new Error("denied");
+      }) as never,
+      spawnImpl: ((_file: string, args: readonly string[]) => {
+        spawned.push(args);
+        return { unref() {} };
+      }) as never,
+    });
+    expect(existsSync(paths.windowsStartup)).toBe(false);
+    expect(spawned, "install threw before starting a broker").toEqual([[paths.broker, "run"]]);
+  });
+
   it("the PORT is the evidence — a live broker with no pid recorded still counts", async () => {
     // The pid is not evidence of anything the query needs: it is the port and
     // token that get asked. A config carrying a port but no pid — an older
