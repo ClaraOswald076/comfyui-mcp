@@ -759,6 +759,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.7] - 2026-08-19
+
+### MCP
+
+#### Added
+- skills cite official vs empirical prompting guidance (#1776)
+
+#### Fixed
+- panel_save_workflow corroborates a fence refusal so a save-only retry self-heals (#1782)
+
+
 ## [0.52.6] - 2026-08-19
 
 ### MCP
