@@ -743,6 +743,53 @@ describe("panel-tools: subgraph I/O (expose rails + unpack)", () => {
   });
 });
 
+describe("panel-tools: panel_configure_app_mode (#1709)", () => {
+  it("registers panel_configure_app_mode in the shared def list", () => {
+    const names = buildPanelToolDefs().map((d) => d.name);
+    expect(names).toContain("panel_configure_app_mode");
+  });
+
+  it("exposes inputs/outputs/default_mode schema (plus the retry token)", () => {
+    const def = defByName("panel_configure_app_mode");
+    expect(Object.keys(def.schema).sort()).toEqual(["default_mode", "inputs", "outputs", "retry_of"]);
+    const mode = def.schema.default_mode as { safeParse: (v: unknown) => { success: boolean } };
+    expect(mode.safeParse("graph").success).toBe(true);
+    expect(mode.safeParse("app").success).toBe(true);
+    expect(mode.safeParse("linear").success).toBe(false);
+  });
+
+  it("forwards graph_configure_app_mode with inputs + outputs + default_mode", async () => {
+    const { ctx, calls } = makeFakeCtx();
+    await defByName("panel_configure_app_mode").handler(
+      {
+        inputs: [{ node_id: 3, widget: "seed", config: { description: "Random seed" } }],
+        outputs: [9],
+        default_mode: "app",
+      },
+      ctx,
+    );
+    expect(calls[0]).toMatchObject({
+      cmd: "graph_configure_app_mode",
+      inputs: [{ node_id: 3, widget: "seed", config: { description: "Random seed" } }],
+      outputs: [9],
+      default_mode: "app",
+    });
+  });
+
+  it("forwards a default_mode-only call (partial update)", async () => {
+    const { ctx, calls } = makeFakeCtx();
+    await defByName("panel_configure_app_mode").handler({ default_mode: "graph" }, ctx);
+    expect(calls[0]).toMatchObject({ cmd: "graph_configure_app_mode", default_mode: "graph" });
+  });
+
+  it("refuses a call with nothing to change BEFORE dispatching", async () => {
+    const { ctx, calls } = makeFakeCtx();
+    const res = await defByName("panel_configure_app_mode").handler({}, ctx);
+    expect(res.isError).toBe(true);
+    expect(calls).toEqual([]);
+  });
+});
+
 describe("panel-tools: panel_load_workflow path (server-side disk read)", () => {
   it("reads an ABSOLUTE workflow .json off disk and fires graph_load with its graph", async () => {
     const dir = mkdtempSync(join(tmpdir(), "wf-load-"));

@@ -213,6 +213,7 @@ describe("graph-reading tool descriptions are distinguishable (#557)", () => {
     // last test in this file requires of a claimant.
     "get_workflow",
     "panel_canvas",
+    "panel_configure_app_mode",
     "panel_enter_subgraph",
     "panel_find_nodes",
     "panel_get_subgraph",
@@ -249,6 +250,7 @@ describe("graph-reading tool descriptions are distinguishable (#557)", () => {
   const NOT_A_CANVAS_READ = new Map<string, string>([
     ["panel_strip_workflow", "TRANSFORMS a graph into a resolved form; the result is a conversion, not a view"],
     ["panel_load_workflow", "WRITES the canvas (replaces the open graph); nothing about it answers a read"],
+    ["panel_configure_app_mode", "WRITES App Mode metadata (extra.linearData/linearMode) onto the open graph; nothing about it answers a read"],
     ["panel_run", "QUEUES the open workflow — the canvas is the input, not the output"],
     ["panel_get_workflow_target", "reads the agent's BINDING (current vs pinned), not the graph's contents"],
     ["panel_list_subgraphs", "lists library BLUEPRINTS; the canvas is only where you would drop one"],

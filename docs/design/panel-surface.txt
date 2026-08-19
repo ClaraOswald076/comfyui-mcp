@@ -13,6 +13,7 @@ panel_civitai_search
 panel_civitai_switch_tab
 panel_clear
 panel_close_workflow
+panel_configure_app_mode
 panel_connect
 panel_copy_nodes
 panel_create_group

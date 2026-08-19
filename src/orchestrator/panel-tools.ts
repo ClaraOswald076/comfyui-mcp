@@ -10309,6 +10309,9 @@ export const RETRY_TOKEN_CMD_BY_TOOL: Readonly<Record<string, string>> = {
   panel_load_workflow: "graph_load",
   panel_connect: "graph_connect",
   panel_disconnect: "graph_disconnect",
+  // Idempotent: inputs/outputs/default_mode are absolute values, so a deduped
+  // retry writes the same metadata again rather than doubling anything.
+  panel_configure_app_mode: "graph_configure_app_mode",
   panel_set_widget: "graph_set_widget",
   panel_remove_widget: "graph_remove_widget",
   panel_set_property: "graph_set_node_property",
@@ -11571,6 +11574,48 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       },
       async (args: A, ctx) =>
         ctx.call({ cmd: "graph_set_node_property", node_id: args.node_id, name: args.name, value: args.value }),
+    ),
+    def(
+      "panel_configure_app_mode",
+      "Configure ComfyUI App Mode (the frontend's linear app view) for the OPEN workflow: which node widgets are the app's inputs, which nodes are its outputs, and whether it opens as an app or a graph by default. Writes extra.linearData / extra.linearMode on the live graph, MERGING into the existing workflow metadata — the workflow identity stamp and any other extra keys are preserved, never replaced. inputs and outputs each REPLACE the whole list (pass the full selection, not a delta — an empty array clears that list); omit a field to leave it unchanged. Every node id and widget name is validated against the open graph before anything is written, and unknown ones are refused by name, listing the widgets the node actually has. One Ctrl+Z step, and the App builder view updates without a reload. Requires a panel new enough to implement the command — an older panel answers that it does not implement it (update via ComfyUI Manager → update comfyui-mcp panel).",
+      {
+        inputs: z
+          .array(
+            z.object({
+              node_id: nodeId().describe("Node id from panel_graph_outline / panel_query_graph."),
+              widget: z.string().describe("Exact widget name on that node, as shown by panel_query_graph {fields:'detail'} (e.g. 'seed', 'text')."),
+              config: z
+                .object({ height: z.number(), description: z.string() })
+                .partial()
+                .optional()
+                .describe("Optional per-input app presentation: row height in px and/or the label/description shown in the app."),
+            }),
+          )
+          .optional()
+          .describe("The App Mode input list — one entry per widget control the app exposes. REPLACES the current list; [] clears it; omit to leave unchanged."),
+        outputs: z
+          .array(nodeId())
+          .optional()
+          .describe("Node ids whose outputs the app shows (e.g. the Save Image / preview node). REPLACES the current list; [] clears it; omit to leave unchanged."),
+        default_mode: z
+          .enum(["graph", "app"])
+          .optional()
+          .describe("How the workflow opens by default: 'app' opens the linear App Mode view, 'graph' the node canvas. Omit to leave unchanged."),
+      },
+      async (args: A, ctx) => {
+        // The panel refuses an empty call too — but fail BEFORE the round-trip so
+        // the refusal does not depend on the panel build being new enough to have
+        // the command at all.
+        if (args.inputs === undefined && args.outputs === undefined && args.default_mode === undefined) {
+          return fail('panel_configure_app_mode: provide inputs, outputs, and/or default_mode ("graph" | "app") — nothing to change.');
+        }
+        return ctx.call({
+          cmd: "graph_configure_app_mode",
+          inputs: args.inputs,
+          outputs: args.outputs,
+          default_mode: args.default_mode,
+        });
+      },
     ),
     def(
       "panel_edit_node",

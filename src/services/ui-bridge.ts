@@ -949,6 +949,11 @@ export const GRAPH_CMD_EFFECT: Readonly<Record<string, GraphCmdEffect>> = {
   // the one at dispatch.
   graph_remove_widget: "targeted",
   graph_set_node_property: "targeted",
+  // artokun/comfyui-mcp#1709 — writes App Mode metadata (extra.linearData /
+  // extra.linearMode) onto the live root graph. Not a node edit, but it mutates
+  // the open workflow, so the fence's "acts on the workflow it was issued for"
+  // promise applies exactly as it does to graph_load.
+  graph_configure_app_mode: "targeted",
   graph_move_node: "targeted",
   graph_resize_node: "targeted",
   graph_set_title: "targeted",
