@@ -19,7 +19,6 @@ import { reportDownloadProgress } from "./download-progress.js";
 import type { ResumeReporter } from "./download-resume-diag.js";
 import { modelNotFoundMessage } from "./model-root-scope.js";
 import {
-  resolveModelsDir,
   resolveModelsDirWithBases,
   parseModelsDirFromArgv,
   hasUnresolvableRelativeModelDirFlag,
@@ -1851,17 +1850,39 @@ export async function verifyLandedModel(
         `registers a category serving this file type, this server cannot load it at all.`,
     };
   }
+  // #369 (0.52.1 recurrence) — RESOLVE THE ROOT **WITH** ITS PROVENANCE.
+  //
+  // This used to call `resolveModelsDir()`, which reports the models dir whatever
+  // its `source` — including `configured-base`, the one value a reachable server
+  // never vouched for. The verdict below then compared the landed path against it
+  // and, finding the file inside, told the user the connected ComfyUI READS that
+  // directory. But that root is the very one this download chose, so the file is
+  // inside it BY CONSTRUCTION: the comparison is true for a correct destination and
+  // for a stale second install alike, and cannot tell them apart. On the reporter's
+  // macOS Comfy Desktop pair (two installs under ~/ComfyUI-Installs, the live one
+  // reached through extra_model_paths) that produced "it is in the right place …
+  // Do NOT move the file" for ~25 GB written where the running server never looks.
+  //
+  // So the SOURCE travels with the path, and only a server-NAMED root licenses the
+  // claim. `modelsDirNamedByServer` — not `isLiveAuthoritativeModelsDir` — because
+  // an `observed-root` is INFERRED from where the interpreter lives and is exactly
+  // the inference that lands on the wrong install (#1562).
   let liveModelsDir: string | undefined;
+  let liveModelsDirNamedByServer = false;
   try {
-    liveModelsDir = await resolveModelsDir();
+    const dest = await resolveModelsDirWithBases();
+    liveModelsDir = dest.modelsDir;
+    liveModelsDirNamedByServer = modelsDirNamedByServer(dest.source);
   } catch {
     liveModelsDir = undefined;
+    liveModelsDirNamedByServer = false;
   }
   return {
     verifiedPath,
     ...notVisibleVerdict({
       verifiedPath,
       liveModelsDir,
+      liveModelsDirNamedByServer,
       wanted,
       category,
       baseUrl: getComfyUIBaseUrl(),
@@ -1878,14 +1899,33 @@ export async function verifyLandedModel(
 /**
  * The verdict for a file that is on disk but absent from the live listing (#1131).
  *
- * "Not listed" has TWO causes and they take OPPOSITE remedies. If the file sits
- * UNDER the very models root the server reads, it is not misplaced: the server
- * simply has not re-read that folder yet. ComfyUI caches its loader option lists
- * and invalidates them on the directory's mtime, so a check this soon after the
- * write routinely races it. Telling that user to "move the file into the running
- * server's models tree" names a directory the file is ALREADY in — a remedy that
- * cannot be followed, which is what the reporter received. Only a file OUTSIDE
- * that root is genuinely in the wrong place.
+ * "Not listed" has THREE causes, and the first two take OPPOSITE remedies:
+ *
+ *   INSIDE a root the SERVER NAMED — not misplaced. The server simply has not
+ *     re-read that folder yet: ComfyUI caches its loader option lists and
+ *     invalidates them on the directory's mtime, so a check this soon after the
+ *     write routinely races it. Telling that user to "move the file into the
+ *     running server's models tree" names a directory the file is ALREADY in — a
+ *     remedy that cannot be followed, which is what #1131's reporter received.
+ *
+ *   OUTSIDE that root — genuinely in the wrong place. Move it.
+ *
+ *   INSIDE a root NOBODY VOUCHED FOR — unknown, and it must be SAID (#369, the
+ *     0.52.1 recurrence). This third state used to be folded into the first,
+ *     because the containment test ran against whatever `resolveModelsDir()`
+ *     returned — including a `configured-base`/`observed-root` value the running
+ *     server never named. That root is the one the download itself resolved to, so
+ *     the landed file is inside it BY CONSTRUCTION and the test answers "inside"
+ *     for a correct destination and a stale second install alike. It is the same
+ *     shape as #1603: two states, one indistinguishable answer, and no way to say
+ *     "unknown". The reporter's macOS Comfy Desktop pair got "so it is in the right
+ *     place … Do NOT move the file" for ~25 GB written into an install the running
+ *     server (reached through extra_model_paths) never reads.
+ *
+ * The unverified branch is deliberately NOT the move remedy either: refusing to
+ * assert readership is not evidence of misplacement, and #1131's harm was exactly
+ * an unfollowable move instruction. It states both candidates, orders them by
+ * likelihood, and names the ONE check that separates them.
  *
  * The DECISION lives here rather than at the call site so it is covered by the
  * same tests as the wording; a branch chosen upstream and passed in as a boolean
@@ -1904,17 +1944,65 @@ export function notVisibleVerdict(args: {
    *  outside it, and comparing paths alone would prescribe moving a file that is
    *  already in the right place (#369). */
   knownInsideLiveRoots?: boolean;
+  /** Did the RUNNING SERVER ITSELF name `liveModelsDir` (`modelsDirNamedByServer`
+   *  — its own `--models-directory`/`--base-directory`/argv `main.py` root), or did
+   *  it come from local configuration / an inference the server never vouched for?
+   *  Only the former licenses "the connected ComfyUI reads this directory": the
+   *  path comparison below is against the root THIS DOWNLOAD CHOSE, so it is true
+   *  by construction and cannot distinguish a correct destination from a stale
+   *  install (#369). Omitted ⇒ NOT named, because an unstated provenance is an
+   *  unknown one. */
+  liveModelsDirNamedByServer?: boolean;
 }): { liveVisible: "not-visible"; note: string } {
   const { verifiedPath, liveModelsDir, wanted, category, baseUrl } = args;
   const insideLexically = liveModelsDir !== undefined && isUnderRoot(verifiedPath, liveModelsDir);
-  const insideLiveRoot = insideLexically || args.knownInsideLiveRoots === true;
+  const rootIsServerNamed = args.liveModelsDirNamedByServer === true;
+  // Containment ALONE is not readership. It counts only when the root it is
+  // measured against came from the server (`rootIsServerNamed`), or when the
+  // caller's canonical membership answer — which applies that same narrowing
+  // itself, and additionally covers live extra roots and in-tree junctions —
+  // already said yes.
+  const insideLiveRoot = (insideLexically && rootIsServerNamed) || args.knownInsideLiveRoots === true;
+  // On disk under the root we resolved, with nothing establishing that the server
+  // reads it. Neither remedy is earned; say so, and name the check that decides.
+  const insideUnverifiedRoot = insideLexically && !insideLiveRoot;
+  if (insideUnverifiedRoot) {
+    return {
+      liveVisible: "not-visible",
+      note:
+        `The file IS on disk at ${verifiedPath}, inside ${liveModelsDir} — the models root this ` +
+        `download resolved to. Whether the connected ComfyUI (${baseUrl}) READS that root is ` +
+        `UNCONFIRMED: the running server never named its own models directory, so this root came ` +
+        `from local configuration (COMFYUI_PATH / the saved default workspace) or was inferred ` +
+        `from where the server's interpreter lives — and the file is inside it either way, ` +
+        `because that is the root the download picked. That server does not list "${wanted}" ` +
+        `under "${category}".\n\n` +
+        `TWO very different things produce exactly this, and only one is a problem:\n` +
+        `  1. a STALE LISTING — ComfyUI caches its loader options and invalidates them on the ` +
+        `directory's mtime, so a check this soon after a write routinely races it; or\n` +
+        `  2. a DIFFERENT INSTALL — the bytes are in a models tree the running server never ` +
+        `scans, which is #369 and is how multi-GB downloads get reported as landed and are ` +
+        `never seen again.\n\n` +
+        `Do not move it on the strength of this message alone, and do not treat it as placed ` +
+        `either. SEPARATE THE TWO: refresh the node/model definitions — install_comfyui ` +
+        `(action:"refresh_nodes"), or the panel's refresh — then re-check with list_local_models. ` +
+        `If it STILL does not appear, it is case 2: list_local_models (action:"list_paths") ` +
+        `reports the roots the running server actually reads — move the file into the one for ` +
+        `"${category}". To make future downloads verifiable, point COMFYUI_PATH at the install ` +
+        `that is actually running, or launch it with an absolute --base-directory.`,
+    };
+  }
   return {
     // Still not VISIBLE — we did not observe it in the listing, and #369 exists
     // because an unobserved placement must not render as confirmed. The verdict
     // is unchanged; what changes is the explanation and the remedy.
     liveVisible: "not-visible",
     note: insideLiveRoot
-      ? (insideLexically
+      ? // The lexical phrasing NAMES the directory as one the server reads, so it may
+        // only be used when the SERVER named that directory. Otherwise the membership
+        // answer is what vouched for the placement (an extra root / a junction), and
+        // the wording that does not attribute the root is the honest one.
+        (insideLexically && rootIsServerNamed
           ? `The file IS on disk at ${verifiedPath}, which is INSIDE the models directory the ` +
             `connected ComfyUI reads (${liveModelsDir}) — so it is in the right place. `
           : `The file IS on disk at ${verifiedPath}, which is inside a models tree the ` +
@@ -1929,7 +2017,18 @@ export function notVisibleVerdict(args: {
       : `The file IS on disk at ${verifiedPath}, but the connected ComfyUI ` +
         `(${baseUrl}) does NOT list "${wanted}" under "${category}" — it will not be ` +
         `usable in a workflow from there.` +
-        (liveModelsDir ? ` The models directory that server reads is ${liveModelsDir}.` : "") +
+        // Same rule as above: name it as WHAT THE SERVER READS only when the server
+        // named it. An unvouched root is still worth printing — it is where the
+        // bytes are — but as the destination this download resolved to, not as a
+        // fact about the server (#369).
+        (liveModelsDir
+          ? rootIsServerNamed
+            ? ` The models directory that server reads is ${liveModelsDir}.`
+            : ` This download resolved its destination root to ${liveModelsDir} from local ` +
+              `configuration — the running server never named its own models directory, so that ` +
+              `is not a confirmed answer for where the file belongs; list_local_models ` +
+              `(action:"list_paths") reports the roots it actually reads.`
+          : "") +
         " Move the file into the running server's models tree (or point COMFYUI_PATH at that install and re-download).",
   };
 }

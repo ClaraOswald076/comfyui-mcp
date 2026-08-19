@@ -590,6 +590,59 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     expect(res.note).toMatch(/Do NOT move the file/);
     expect(res.note).not.toMatch(/Move the file into the running server's models tree/);
     expect(res.note).toContain(resolve("/live/ComfyUI/models"));
+    // #369 (0.52.1) — the SERVER named this root, so the note may say so, and must
+    // use the plain wording. If the provenance stops reaching the verdict, this
+    // degrades to the junction phrasing and tells a user with no junction that
+    // their layout is "reached through a link/junction" — prose asserting a
+    // mechanism that is not there.
+    expect(res.note).toMatch(/INSIDE the models directory the connected ComfyUI reads/);
+    expect(res.note).not.toMatch(/link\/junction/);
+  });
+
+  // #369, the 0.52.1/panel-0.15.1 recurrence (macOS, Comfy Desktop extra model
+  // paths). Four downloads landed in the install-local models/ tree of a SECOND
+  // install while the connected server's /models/<category> answered EMPTY, and
+  // the tool reported that the directory was one the connected server reads and
+  // that the file should not be moved. ~25 GB.
+  //
+  // The verdict's containment test ran against whatever the models-dir resolver
+  // returned, provenance and all — and that root is the one THIS DOWNLOAD RESOLVED
+  // TO, so the landed file is inside it by construction. The comparison therefore
+  // answers "inside" identically for a correct destination and for a stale second
+  // install: taxonomy #1, two states collapsed into one answer.
+  //
+  // This exercises the WIRING (verifyLandedModel → notVisibleVerdict), not just the
+  // wording helper: the provenance has to be READ from the resolution and PASSED,
+  // and a helper-level test cannot see that argument go missing.
+  it("#369: does NOT claim readership of a root the server never NAMED (0.52.1 recurrence)", async () => {
+    const staleLanded = resolve("/Users/u/ComfyUI-Installs/ComfyUI/ComfyUI/models/loras/new.safetensors");
+    h.modelsDirSource = "configured-base";
+    h.destModelsDir = "/Users/u/ComfyUI-Installs/ComfyUI/ComfyUI/models";
+    h.liveListings["loras"] = []; // the reporter's observation: answered, and EMPTY
+    const res = await verifyLandedModel(staleLanded, "loras", { attempts: 1, retryMs: 0 });
+    expect(res.liveVisible).toBe("not-visible");
+    expect(res.note).not.toMatch(/INSIDE the models directory the connected ComfyUI reads/);
+    expect(res.note).not.toMatch(/it is in the right place/);
+    expect(res.note).not.toMatch(/Do NOT move the file/);
+    expect(res.note).toMatch(/UNCONFIRMED/);
+    // Both candidates named, plus the check that tells them apart.
+    expect(res.note).toMatch(/STALE LISTING/);
+    expect(res.note).toMatch(/DIFFERENT INSTALL/);
+    expect(res.note).toMatch(/list_paths/);
+  });
+
+  it("#369: an INFERRED (observed-root) destination gets the same unconfirmed verdict", async () => {
+    // #1562's narrowing again: an interpreter's location is evidence about the
+    // BINARY, not about where the server reads. isLiveAuthoritativeModelsDir()
+    // says yes to `observed-root`; the claim here requires modelsDirNamedByServer.
+    const staleLanded = resolve("/stale/ComfyUI/models/loras/new.safetensors");
+    h.modelsDirSource = "observed-root";
+    h.destModelsDir = "/stale/ComfyUI/models";
+    h.liveListings["loras"] = ["someone-elses.safetensors"];
+    const res = await verifyLandedModel(staleLanded, "loras", { attempts: 1, retryMs: 0 });
+    expect(res.liveVisible).toBe("not-visible");
+    expect(res.note).toMatch(/UNCONFIRMED/);
+    expect(res.note).not.toMatch(/it is in the right place/);
   });
 
   it("still says MOVE IT when the file is outside the live models root", async () => {
@@ -605,6 +658,10 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     expect(res.note).toMatch(/will not be usable/);
     expect(res.note).toMatch(/Move the file into the running server's models tree/);
     expect(res.note).toContain(resolve("/live/ComfyUI/models"));
+    // The SERVER named this root, so naming it as what the server reads is earned —
+    // and it is the sentence that makes the move remedy followable. It must not be
+    // downgraded to the unvouched wording just because the provenance went missing.
+    expect(res.note).toMatch(/The models directory that server reads is/);
   });
 
   it("reports UNKNOWN — never a success — when the file is not on disk at all", async () => {
