@@ -42,15 +42,42 @@ MiniMax platform terms.
 
 ## Prefer the Comfy-Org template over hand-wiring
 
-ComfyUI ≥ **0.30.0** (templates in the 0.33 line). Template Library → Video:
+ComfyUI ≥ **0.30.0** (templates in the 0.33 line). These are **core**
+`comfyui-workflow-templates` graphs in the frontend **Template Library →
+Video**, not installer packs and not custom-node `example_workflows`:
 
-| Mode | Template | Diffusion file |
-|---|---|---|
-| T2V / I2V / FL2VA | `video_minimax_h3_t2v.json` / `video_minimax_h3_i2v.json` | `minimax_h3_fl2va_pruned_int8_convrot.safetensors` |
-| R2V (omni-reference) | `video_minimax_h3_r2v.json` | `minimax_h3_ref2va_pruned_int8_convrot.safetensors` |
+| Mode | Template Library card | File | Diffusion file |
+|---|---|---|---|
+| T2V / I2V / FL2VA | MiniMax H3: Text to Video / Image to Video | `video_minimax_h3_t2v.json` / `video_minimax_h3_i2v.json` | `minimax_h3_fl2va_pruned_int8_convrot.safetensors` |
+| R2V (omni-reference) | MiniMax H3: Reference to Video | `video_minimax_h3_r2v.json` | `minimax_h3_ref2va_pruned_int8_convrot.safetensors` |
 
-Load with `panel_load_workflow` or `enqueue_workflow` `action:"run_template"`.
-Then retarget widgets. Hand-building the subgraph is slower and easy to get wrong.
+`list_packs action:"list_templates"` will **not** list them.
+`enqueue_workflow action:"run_template"` will **not** resolve
+`video_minimax_h3_t2v` / `_i2v` / `_r2v` — that action only loads bundled
+installer packs, and there is no `packs/minimax-h3-*` yet. Do not call it
+until a pack exists. `panel_load_workflow` needs `pack:`, a disk `path:`, or
+an inline UI `graph` — a Template Library basename is none of those.
+
+**Load path that actually works:**
+
+1. **Preferred.** Ask the user to open **Template Library → Video → MiniMax H3:
+   Text to Video** (or Image to Video / Reference to Video). Pick the local
+   `video_minimax_h3_*` cards, **not** the `api_minimax_h3_*` paid partner
+   templates.
+2. **Agent, no UI click.** Fetch the UI JSON from
+   https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_minimax_h3_t2v.json
+   (or `_i2v` / `_r2v`; raw.githubusercontent.com is the same files), save it
+   with `save_workflow action:"save"` `filename:"video_minimax_h3_t2v.json"`,
+   then `panel_load_workflow path:"video_minimax_h3_t2v.json"`. Same pattern as
+   `video-extend` (stage on disk, then `path:`). Do not pass the GitHub URL as
+   `path:` or `pack:`.
+
+After it lands, retarget the **subgraph's exposed widgets** (prompt, duration,
+`turbo_mode`, megapixels). Official T2V/I2V graphs wrap
+`MiniMaxH3ImageToVideo` inside a subgraph (`type` is a UUID). Do not flatten
+that interior unless you are hand-building.
+
+Hand-building the subgraph is slower and easy to get wrong.
 
 Comfy tutorial (wiring, not MiniMax's prompt formula):
 https://docs.comfy.org/tutorials/video/minimax/minimax-h3
@@ -231,8 +258,11 @@ Always `clear_vram` before switching to H3 from WAN / LTX / a checkpoint.
 - `prompt-engineering` — generic CLIP syntax; **H3 does not use it**
 - `triton-sageattention` — installing Sage on Windows
 
-No bundled `packs/minimax-h3-*` installer yet. Use the Comfy-Org templates +
-`download_model` against `Comfy-Org/MiniMax-H3`.
+No bundled `packs/minimax-h3-*` installer yet — that is why
+`enqueue_workflow action:"run_template"` cannot load these graphs. Use the
+Template Library (or the GitHub fetch → `save_workflow` →
+`panel_load_workflow path:` path above) + `download_model` against
+`Comfy-Org/MiniMax-H3`.
 
 ## Sources
 

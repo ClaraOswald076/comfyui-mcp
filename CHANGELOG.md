@@ -768,6 +768,15 @@ All notable changes to this project are documented here. This project adheres to
   the free local-weights nodes from the paid Hailuo API nodes. Enhancement — do not
   merge until another agent reviews.
 
+### Fixed
+
+- **MiniMax H3 skill load path (#1167 / #1801).** `plugin/skills/minimax-h3-video/SKILL.md`
+  no longer tells the agent to `panel_load_workflow` / `run_template` a Template
+  Library basename. Core `video_minimax_h3_*` graphs open from the frontend
+  Template Library, or from Comfy-Org/workflow_templates via `save_workflow` then
+  `panel_load_workflow path:`. `run_template` is named only as "won't work until
+  a pack exists."
+
 ## [0.52.13] - 2026-08-19
 
 ### MCP
