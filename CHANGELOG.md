@@ -759,6 +759,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.15] - 2026-08-19
+
+### MCP
+
+#### Added
+- Qwen Code CLI as an Agent Panel backend over ACP (#1813)
+- panel_configure_app_mode — set App Mode inputs, outputs, and default mode (#1809)
+- panel_show_media stage:true stages oversized outside files into a served dir (#1810)
+
+#### Fixed
+- matchTitle on Fast Groups no longer pretends the toggle list rebuilt (#1814)
+
+
 ## [0.52.14] - 2026-08-19
 
 ### Added
