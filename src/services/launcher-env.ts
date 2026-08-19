@@ -341,6 +341,106 @@ export function detectStabilityMatrix(
   return null;
 }
 
+/**
+ * Is `p` Stability Matrix's unused Assets CPython (#1704)?
+ *
+ * SM stores the *base* interpreter it created the package venv FROM under
+ * `<Data>/Assets/Python/cpython-…/python.exe`. That tree has no ComfyUI
+ * site-packages (`import sqlalchemy` fails immediately). Windows also reports
+ * this path as `Win32_Process.ExecutablePath` for a venv trampoline, so a
+ * relaunch that treats the OS image as the interpreter picks it by accident.
+ *
+ * Requires the same on-disk corroboration as `detectStabilityMatrix` so a
+ * random `…/Assets/Python/…` tree is never classified as SM.
+ */
+export function isStabilityMatrixAssetsPython(p: string | undefined): boolean {
+  if (!p) return false;
+  const segs = segmentsOf(p);
+  const lower = segs.map((s) => s.toLowerCase());
+  const assets = lower.lastIndexOf("assets");
+  if (assets < 0 || lower[assets + 1] !== "python") return false;
+  // Parent of `Assets` is the Data root. The Assets path itself never walks
+  // through `Packages`, so `detectStabilityMatrix` cannot corroborate it —
+  // require the Packages sibling on disk instead.
+  const dataRoot = segs.slice(0, assets).join(separatorOf(p));
+  if (!dataRoot) return false;
+  return pathExists(joinPath(dataRoot, "Packages"));
+}
+
+/** A PATH name, not a file we can verify — `python`, `python.exe`, `python3`. */
+function isBarePythonName(p: string): boolean {
+  if (/[\\/]/.test(p) || /^[a-zA-Z]:/.test(p)) return false;
+  const base = p.toLowerCase();
+  return (
+    base === "python" ||
+    base === "python.exe" ||
+    base === "python3" ||
+    base === "python3.exe"
+  );
+}
+
+function samePath(a: string, b: string): boolean {
+  const norm = (s: string): string =>
+    s.replace(/[\\/]+$/, "").replace(/[\\/]/g, "/").toLowerCase();
+  return norm(a) === norm(b);
+}
+
+/**
+ * The Stability Matrix *package* interpreter (`<Packages>/<name>/venv`, then
+ * `.venv`) for the install named by `paths`.
+ *
+ * SM's official env is `venv` (not `.venv`, not the Assets CPython). Used as
+ * the relaunch fallback when the OS did not name a usable interpreter, and as
+ * the replacement when the chosen exe is the unused Assets CPython (#1704).
+ */
+export function resolveStabilityMatrixPackagePython(
+  paths: ReadonlyArray<string | undefined>,
+): string | undefined {
+  const sm = detectStabilityMatrix(paths);
+  if (!sm) return undefined;
+  const packagesRoot = joinPath(sm.dataRoot, "Packages");
+  for (const p of paths) {
+    if (!p) continue;
+    for (const ancestor of [p, ...ancestorsOf(p)]) {
+      const parent = dirOf(ancestor);
+      if (!parent || !samePath(parent, packagesRoot)) continue;
+      if (
+        !pathExists(joinPath(ancestor, "main.py")) &&
+        !pathExists(joinPath(ancestor, "main.pyw"))
+      ) {
+        continue;
+      }
+      const py = firstExisting([
+        joinPath(ancestor, "venv", "Scripts", "python.exe"),
+        joinPath(ancestor, "venv", "bin", "python"),
+        joinPath(ancestor, "venv", "bin", "python3"),
+        joinPath(ancestor, ".venv", "Scripts", "python.exe"),
+        joinPath(ancestor, ".venv", "bin", "python"),
+        joinPath(ancestor, ".venv", "bin", "python3"),
+      ]);
+      if (py) return py;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Replace an Assets CPython (or a bare PATH `python`) with the package venv
+ * when this is a Stability Matrix install. Any other observed interpreter is
+ * left alone (#1654 — the process we saw still wins).
+ */
+export function preferStabilityMatrixPackagePython(
+  chosen: string | undefined,
+  paths: ReadonlyArray<string | undefined>,
+): string | undefined {
+  const packagePy = resolveStabilityMatrixPackagePython(paths);
+  if (!packagePy) return chosen;
+  if (!chosen || isBarePythonName(chosen) || isStabilityMatrixAssetsPython(chosen)) {
+    return packagePy;
+  }
+  return chosen;
+}
+
 // ---------------------------------------------------------------------------
 // Opaque launchers — recognized, but NOT reproducible
 // ---------------------------------------------------------------------------
