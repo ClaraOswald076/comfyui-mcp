@@ -759,6 +759,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.14] - 2026-08-19
+
 ### Added
 
 - **`minimax-h3-video` plugin skill (#1167).** Local MiniMax H3 (Hailuo) T2V/I2V/R2V
@@ -776,6 +778,17 @@ All notable changes to this project are documented here. This project adheres to
   Template Library, or from Comfy-Org/workflow_templates via `save_workflow` then
   `panel_load_workflow path:`. `run_template` is named only as "won't work until
   a pack exists."
+
+### MCP
+
+#### Added
+- MiniMax H3 local-video skill citing official prompting guides (#1801)
+- canonical flows at MCP initialize (call order, async handles, pre-flight, trust) (#1805)
+
+#### Fixed
+- plugin .mcp.json launches via a warm-path wrapper instead of bare npx (#1807)
+- one-arg panelLauncherPaths keeps windowsStartup under the passed home (#1806)
+
 
 ## [0.52.13] - 2026-08-19
 
