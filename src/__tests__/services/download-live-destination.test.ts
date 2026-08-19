@@ -590,6 +590,13 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     expect(res.note).toMatch(/Do NOT move the file/);
     expect(res.note).not.toMatch(/Move the file into the running server's models tree/);
     expect(res.note).toContain(resolve("/live/ComfyUI/models"));
+    // #369 (0.52.1) — the SERVER named this root, so the note may say so, and must
+    // use the plain wording. If the provenance stops reaching the verdict, this
+    // degrades to the junction phrasing and tells a user with no junction that
+    // their layout is "reached through a link/junction" — prose asserting a
+    // mechanism that is not there.
+    expect(res.note).toMatch(/INSIDE the models directory the connected ComfyUI reads/);
+    expect(res.note).not.toMatch(/link\/junction/);
   });
 
   // #369, the 0.52.1/panel-0.15.1 recurrence (macOS, Comfy Desktop extra model
@@ -651,6 +658,10 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     expect(res.note).toMatch(/will not be usable/);
     expect(res.note).toMatch(/Move the file into the running server's models tree/);
     expect(res.note).toContain(resolve("/live/ComfyUI/models"));
+    // The SERVER named this root, so naming it as what the server reads is earned —
+    // and it is the sentence that makes the move remedy followable. It must not be
+    // downgraded to the unvouched wording just because the provenance went missing.
+    expect(res.note).toMatch(/The models directory that server reads is/);
   });
 
   it("reports UNKNOWN — never a success — when the file is not on disk at all", async () => {
