@@ -231,6 +231,88 @@ describe("a fenced graph READ is diagnosed, and a missing stamp is not a wrong o
   });
 });
 
+describe("classified against the panel's REAL wording, not the fixture's short form", () => {
+  // The short refusal above is the one #1519 was filed with. A current panel says more:
+  // since 0.11.83 (`workflowInstanceMismatchMessage`) it appends its own remedy line,
+  // and that line names BOTH exits as interchangeable —
+  //
+  //   Re-target with panel_set_workflow_target({mode:"current"}), or re-select the
+  //   intended workflow with panel_open_workflow, then retry.
+  //
+  // which is right for the panel (it "observed only that the two identities differ")
+  // and is exactly the collapse this branch resolves. Transcribed verbatim from
+  // comfyui-mcp-panel@v0.15.3 so the classification is checked against the shape it
+  // will actually meet, and so the extra prose cannot flip the regexes.
+  const REAL = (compared: string): string =>
+    `workflow instance mismatch: ${compared}. Nothing was applied.\n\n` +
+    `That is the comparison, not the cause — the panel observed only that the two ` +
+    `identities differ. It can mean the workflow was switched or replaced after the ` +
+    `command was issued, that this session's fence was never established or could not ` +
+    `be refreshed, or that the identity could not be read at all.\n\n` +
+    `Re-target with panel_set_workflow_target({mode:"current"}), or re-select the ` +
+    `intended workflow with panel_open_workflow, then retry. If NO panel tab is ` +
+    `connected, neither will help and the connection is the thing to fix — ` +
+    `panel_graph_outline reports connectivity directly.`;
+
+  async function outlineRaw(refusal: string): Promise<string> {
+    const ctx = makePanelToolCtx(
+      {
+        send: async (cmd: Record<string, unknown>) => {
+          if (cmd.cmd === "workflow_list") {
+            listCalls += 1;
+            return settled(LIVE);
+          }
+          throw new Error(refusal);
+        },
+        push: () => 1,
+        canReach: (id: string) => id === TAB,
+        isHeadless: () => false,
+        tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
+        resolveActiveTabId: () => TAB,
+        refreshWorkflowUuid: (_t: string, u: string) => {
+          adopted.push(u);
+          return true;
+        },
+        workflowUuidFor: () => fence,
+        tabCanMutateGraph: () => true,
+        tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
+      } as unknown as PanelToolCtx["bridge"],
+      TAB,
+      new WorkflowTargetStore(),
+    );
+    const def = buildPanelToolDefs().find((d) => d.name === "panel_graph_outline");
+    if (!def) throw new Error("panel_graph_outline is not registered");
+    const res: ToolResult = await def.handler({} as never, ctx);
+    return res.content.map((c) => (c as { text?: string }).text ?? "").join(" ");
+  }
+
+  it("the full MISSING-stamp refusal is still classified as missing", async () => {
+    const text = await outlineRaw(
+      REAL(`this command carries no workflow-instance stamp, and the active canvas reports ${LIVE}`),
+    );
+    expect(text).toMatch(/MISSING stamp rather than a wrong one/);
+    expect(text).toMatch(REBIND);
+    expect(text).not.toMatch(CHOOSE);
+    expect(adopted).toEqual([]);
+  });
+
+  it("the full WRONG-stamp refusal is still classified as wrong", async () => {
+    fence = { known: true, uuid: STALE };
+    const text = await outlineRaw(
+      REAL(
+        `this command was issued for workflow instance ${STALE}, and the active canvas reports ${LIVE}`,
+      ),
+    );
+    expect(text).toMatch(/WRONG stamp, not a missing one/);
+    expect(text).toMatch(CHOOSE);
+    // The panel offered mode:"current" here as an equal option. This side, having
+    // measured which state it is, does NOT — it says what re-targeting costs instead.
+    expect(text).not.toMatch(REBIND);
+    expect(text).toMatch(/re-points every later EDIT/);
+    expect(adopted).toEqual([]);
+  });
+});
+
 describe("the #1519 diagnosis cannot re-enter itself, and changes no other path", () => {
   it("a panel that FENCES the recovery probe surfaces its refusal instead of recursing", async () => {
     // The probe this branch runs is `workflow_list`, which flows back through the same

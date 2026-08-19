@@ -7560,14 +7560,24 @@ export function makePanelToolCtx(
       //   workflow instance mismatch: this command carries no workflow-instance
       //   stamp, and the active canvas reports 2b3f4684-…. Nothing was applied.
       //
-      // Measured on current main before this branch existed: that text is the ENTIRE
-      // tool result. The corroboration above is gated on `isMutatingGraphCmd`, so a
-      // READ refused by the very same fence fell through every branch here and the
-      // panel's raw refusal was surfaced verbatim — no verdict, no remedy. The
-      // reporter had to find `panel_set_workflow_target({mode:"current"})` on their
-      // own, which is the whole content of the report. #1480's guard already extends
-      // its diagnosis to reads "on purpose: `panel_graph_outline` refusing was half
-      // of the reported dead end"; this is the same reasoning for the stamp fence.
+      // Measured on current main before this branch existed: the panel's refusal IS
+      // the entire tool result. The corroboration above is gated on
+      // `isMutatingGraphCmd`, so a READ refused by the very same fence fell through
+      // every branch here and this side added nothing at all. #1480's guard already
+      // extends its diagnosis to reads "on purpose: `panel_graph_outline` refusing
+      // was half of the reported dead end"; this is the same reasoning for the stamp
+      // fence.
+      //
+      // What the panel says on its own is NOT nothing, and the difference is the
+      // point. Since panel 0.11.83 its refusal ends "Re-target with
+      // panel_set_workflow_target({mode:"current"}), or re-select the intended
+      // workflow with panel_open_workflow, then retry" — both exits, offered as
+      // interchangeable, with nothing said about which one this refusal calls for.
+      // That is right for the panel, which by design "observed only that the two
+      // identities differ" and refuses to infer a cause; it is not enough for the
+      // caller, and in the #1331 state the first of the two cannot work at all — it
+      // reports success while the read keeps failing. Only this side can take the
+      // read that decides, so this side takes it.
       //
       // TWO REFUSALS, NOT ONE. `isWorkflowInstanceMismatch` matches both of the
       // panel's states, and they are different facts with OPPOSITE remedies:
