@@ -39,9 +39,9 @@ function skillReadHandler(): Handler {
 
 const textOf = (res: Awaited<ReturnType<Handler>>) => res.content.map((c) => c.text).join(" ");
 
-function sourcesSection(markdown: string): string {
+function sourcesSection(markdown: string, label = "markdown"): string {
   const headingAt = markdown.search(/^## Sources[ \t]*$/m);
-  expect(headingAt, "missing ## Sources heading").toBeGreaterThan(-1);
+  expect(headingAt, `${label}: missing ## Sources heading`).toBeGreaterThan(-1);
   const from = markdown.slice(headingAt);
   const afterHeading = from.slice(SKILL_SOURCES_HEADING.length);
   const nextHeading = afterHeading.search(/\n## /);
@@ -101,7 +101,7 @@ describe("#1155 skill_read returns Official vs Empirical on every bundled skill"
     for (const { name } of skills) {
       const res = await handler({ action: "skill_read", name });
       expect(res.isError, `${name}: skill_read failed`).toBeUndefined();
-      const sources = sourcesSection(textOf(res));
+      const sources = sourcesSection(textOf(res), name);
       expect(sources, name).toContain("**Official:**");
       expect(sources, name).toContain("**Empirical:**");
       // Cited vs uncited: Official is either a URL / in-repo product cite, or an
