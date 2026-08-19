@@ -1077,6 +1077,27 @@ function isFencedGraphRead(cmd: Record<string, unknown>): boolean {
   return name.startsWith("graph_") && !MUTATING_GRAPH_EDIT_CMDS.has(name);
 }
 
+/**
+ * #1778 — a fenced command that is neither a graph edit nor a graph read.
+ *
+ * `workflow_save` / `workflow_save_as` / `workflow_rename` / `workflow_close`
+ * require a workflow stamp (`requiresWorkflowStampEnforcement`) and the
+ * dispatch gate refuses them the same way it refuses a graph_* command. They
+ * are not in MUTATING_GRAPH_EDIT_CMDS and they do not start with `graph_`, so
+ * neither existing probe branch fires. The save handler then returns at
+ * `if (res.isError) return res` with the generic "tab may be disconnected"
+ * wrapper and an empty corroboration, so a save-only retry never self-heals.
+ *
+ * Derived from the stamp-enforcement classifier minus the `graph_` prefix, so
+ * a newly added active-workflow mutator cannot drift out. The prefix is still
+ * load-bearing for the same reason as `isFencedGraphRead`: the diagnosis runs
+ * `workflow_list`, which must not re-enter this branch.
+ */
+function isFencedActiveWorkflowMutator(cmd: Record<string, unknown>): boolean {
+  const name = typeof cmd.cmd === "string" ? cmd.cmd : "";
+  return !name.startsWith("graph_") && requiresWorkflowStampEnforcement(cmd);
+}
+
 /** True when an error is a TRANSIENT transport/reconnect drop (the tab went away
  *  or was replaced), NOT a genuine command error or a live-but-frozen reply
  *  timeout. Deliberately EXCLUDES "did not reply within N ms" (a backgrounded/
@@ -8328,7 +8349,17 @@ export function makePanelToolCtx(
       //
       // Safe to recommend a retry because a fence refusal is checked BEFORE the handler
       // runs — "Nothing was applied" is structural here, not an echoed claim.
-      if (isWorkflowInstanceMismatch(err) && isMutatingGraphCmd(cmd)) {
+      //
+      // #1778 — the same refusal on workflow_save / save_as / rename / close. Those
+      // carry a workflow target but are not graph_*, so neither isMutatingGraphCmd
+      // nor isFencedGraphRead was true and the call fell through to the generic
+      // dispatched:false wrapper: no probe, no corroborateTabStamp, and a
+      // "tab may be disconnected" line that is false here (the tab is connected;
+      // what is stale is the stamp). Widening this branch is the self-heal.
+      if (
+        isWorkflowInstanceMismatch(err) &&
+        (isMutatingGraphCmd(cmd) || isFencedActiveWorkflowMutator(cmd))
+      ) {
         const name = typeof cmd.cmd === "string" ? cmd.cmd : "panel command";
         const raw = err instanceof Error ? err.message : String(err);
         // The uuid the command CARRIED, read from the panel's own refusal rather than
