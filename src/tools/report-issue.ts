@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { detectInstallMode } from "../services/self-update.js";
+import { agentLabel, readAgentIdentity, stampAgentIdentity } from "../services/agent-identity.js";
 
 // Issue reporting. For OUR repos (comfyui-mcp / comfyui-mcp-panel) this FILES the
 // issue through the async AI-triage Worker: submit (with the reporter's versions)
@@ -466,6 +467,57 @@ export function normalizeReportedVersion(
   return asVersionToken(trimmed);
 }
 
+/**
+ * The intake worker truncates a submitted body at 60_000 chars (index.ts:
+ * MAX_BODY_LEN) before anything is stored or filed.
+ *
+ * The identity stamp is the LAST thing in the body, so an oversized report — a
+ * pasted log, the diff the report-bug skill asks for — would have its
+ * attribution cut off server-side, silently, and precisely on the reports with
+ * the most in them. Trim the caller's own text by what the stamp costs instead:
+ * the worker was going to cut that tail anyway, so the content lost is the same
+ * either way, and the attribution survives.
+ *
+ * MEASURE THE BODY THAT SHIPS, never a stand-in for it. The first version
+ * budgeted `stampAgentIdentity("")` — the stamp's own width — and trimmed the
+ * caller's RAW text to fit. But stamping also rewrites every quoted marker the
+ * body carries (`<!-- reporter-agent:` → `<!-- quoted-reporter-agent:`, +7 chars
+ * each), so a body quoting other issues came out 7·n OVER the cap and the worker
+ * cut off the very stamp this exists to protect — 88 quoted markers removed it
+ * outright (round-3 merge gate, P1). The covering test was marker-free, so it
+ * passed either way: blind by construction to the one interaction that mattered.
+ *
+ * So the loop below asks the real question — "how long is the body I am about to
+ * send?" — and shortens by the actual overflow. One correction is provably
+ * enough (removing the overflow can only reduce the number of markers retained,
+ * so the expansion cannot grow), and the bound is there so a future change to
+ * the stamp cannot turn this into a spin.
+ *
+ * Exported for the covering test — nothing else calls it.
+ */
+export const WORKER_MAX_BODY_LEN = 60_000;
+
+export function fitUnderWorkerCap(
+  body: string,
+  identity: Parameters<typeof stampAgentIdentity>[1],
+): string {
+  if (!identity || stampAgentIdentity(body, identity).length <= WORKER_MAX_BODY_LEN) return body;
+  const note = "\n\n…[trimmed to keep the reporting-agent stamp]";
+  // Measure the stamp against THIS identity rather than assuming a width — the
+  // model name is provider-supplied and unbounded in principle.
+  let room = WORKER_MAX_BODY_LEN - stampAgentIdentity("", identity).length - note.length;
+  for (let i = 0; i < 8 && room > 0; i++) {
+    const candidate = body.slice(0, room) + note;
+    const shipped = stampAgentIdentity(candidate, identity).length;
+    if (shipped <= WORKER_MAX_BODY_LEN) return candidate;
+    room -= shipped - WORKER_MAX_BODY_LEN;
+  }
+  // Nothing of the caller's text fits alongside the stamp. Keeping the note
+  // alone is the honest outcome: a report that says it was trimmed, correctly
+  // attributed, beats a full one attributed to nobody.
+  return note;
+}
+
 export function registerReportIssueTools(server: McpServer): void {
   server.tool(
     "report_issue",
@@ -499,10 +551,31 @@ export function registerReportIssueTools(server: McpServer): void {
     async (args) => {
       try {
         const repo = normalizeRepo(args.repo);
-        const prefilledUrl = buildIssueUrl(repo, args.title, args.body, args.labels);
+        const ours = isOurRepo(repo);
+        // WHICH LLM WROTE THIS REPORT. Published by the orchestrator from the
+        // panel's provider/model chips (services/agent-identity.ts) and read
+        // here, in the subprocess the reporting agent's tools run in — NOT asked
+        // of the model, which cannot reliably name itself and was never told its
+        // own model in the first place (the ENVIRONMENT block carries only
+        // `Backend:`). Report quality varies enormously across the providers the
+        // panel can drive, and until this line existed there was no way to tell a
+        // thin report from a local 4B model apart from a thin report from a
+        // frontier one.
+        //
+        // OUR repos only: someone else's tracker is not the place for our
+        // provider telemetry, and a prefilled `agent:*` label would be a label
+        // their repo has never heard of. Absent identity (every non-panel spawn:
+        // plain stdio, CLI, tests) changes nothing — body and labels pass
+        // through as before.
+        const identity = ours ? readAgentIdentity() : undefined;
+        const body = stampAgentIdentity(fitUnderWorkerCap(args.body, identity), identity);
+        const labels = identity
+          ? Array.from(new Set([...(args.labels ?? []), agentLabel(identity)]))
+          : args.labels;
+        const prefilledUrl = buildIssueUrl(repo, args.title, body, labels);
 
         // Third-party (or explicitly disabled): prefilled link only, as before.
-        if (!isOurRepo(repo) || args.no_file) {
+        if (!ours || args.no_file) {
           return jsonResult({
             url: prefilledUrl,
             repo,
@@ -539,8 +612,8 @@ export function registerReportIssueTools(server: McpServer): void {
             clientKey,
             repoName,
             title: args.title,
-            body: args.body,
-            labels: args.labels,
+            body,
+            labels,
             reporterVersions,
             timeoutMs,
             maxPolls,

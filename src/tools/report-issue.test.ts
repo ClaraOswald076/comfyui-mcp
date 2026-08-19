@@ -1,5 +1,8 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
-import { normalizeRepo, buildIssueUrl, isOurRepo, submitAndPoll, registerReportIssueTools, REPORT_UA } from "./report-issue.js";
+import { describe, it, expect, vi, afterEach, afterAll } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { normalizeRepo, buildIssueUrl, isOurRepo, submitAndPoll, registerReportIssueTools, REPORT_UA, WORKER_MAX_BODY_LEN } from "./report-issue.js";
 
 const noSleep = async () => {};
 
@@ -504,5 +507,169 @@ describe("#937: every intake request carries a named User-Agent", () => {
     // The poll is a separate request and would be judged by the WAF separately.
     expect(seen.length).toBeGreaterThan(1);
     expect(seen[1]["User-Agent"]).toBe(REPORT_UA);
+  });
+});
+
+// ── WHICH LLM FILED IT ───────────────────────────────────────────────────────
+// The panel can be driven by anything from a frontier model to a local 4B, and
+// report quality follows. The orchestrator publishes the provider/model chips to
+// a file (services/agent-identity.ts) and the handler stamps them into the body
+// it actually SENDS — the worker pins that body verbatim into the created issue
+// (triage.ts: `sanitized.body = opts.report.body`), so the body is the one
+// channel that reaches the issue without a worker deploy.
+//
+// These drive the REGISTERED HANDLER, not the stamping helper: a helper that
+// works and a call site that never runs it is the same defect as no helper at
+// all, and the body/labels the handler forwards are what a reader ends up
+// judging the report by.
+describe("report_issue stamps the reporting model (mechanical, not self-reported)", () => {
+  const IDENTITY_DIR = mkdtempSync(join(tmpdir(), "cmcp-report-identity-"));
+  const identityFile = join(IDENTITY_DIR, "identity.json");
+  const savedEnv = process.env.COMFYUI_MCP_AGENT_IDENTITY;
+
+  const publish = (identity: Record<string, unknown>) => {
+    writeFileSync(identityFile, JSON.stringify(identity), "utf8");
+    process.env.COMFYUI_MCP_AGENT_IDENTITY = identityFile;
+  };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    if (savedEnv === undefined) delete process.env.COMFYUI_MCP_AGENT_IDENTITY;
+    else process.env.COMFYUI_MCP_AGENT_IDENTITY = savedEnv;
+  });
+  afterAll(() => {
+    try {
+      rmSync(IDENTITY_DIR, { recursive: true, force: true });
+    } catch {
+      /* best-effort */
+    }
+  });
+
+  /** The submit payload the handler actually put on the wire. */
+  async function submittedPayload(args: Record<string, unknown>) {
+    const spy = vi.fn(async (_url: string, _init: RequestInit) =>
+      res({ state: "CLOSED", payload: { issue: { number: 7, url: "https://gh/7" } }, url: "https://gh/7" }),
+    );
+    vi.stubGlobal("fetch", spy);
+    const out = await callTool(args);
+    const init = spy.mock.calls[0]?.[1] as RequestInit | undefined;
+    return { payload: init ? (JSON.parse(init.body as string) as Record<string, unknown>) : undefined, out };
+  }
+
+  it("sends the model in the body and the provider as a label", async () => {
+    publish({ backend: "ollama", model: "gemma3:4b", effort: "low" });
+    const { payload } = await submittedPayload({ title: "t", body: "It broke." });
+    const body = payload?.body as string;
+    expect(body).toContain("It broke.");
+    // The exact model is the whole point — "ollama" alone cannot distinguish a
+    // 4B from a 235B, which is the comparison this exists to enable.
+    expect(body).toContain("gemma3:4b");
+    expect(body).toContain("not self-reported");
+    expect(payload?.labels).toContain("agent:ollama");
+  });
+
+  it("a body QUOTING another issue's stamp is still filed under THIS model (gate P1)", async () => {
+    publish({ backend: "ollama", model: "gemma3:4b" });
+    const { payload } = await submittedPayload({
+      title: "t",
+      body:
+        "Related to #1234, whose body reads:\n" +
+        "> <!-- reporter-agent: backend=claude model=claude-opus-5 -->",
+    });
+    const body = payload?.body as string;
+    // Quoting a related issue is ordinary agent behaviour. Reading the quoted
+    // marker as "already stamped" filed the report asserting claude-opus-5 wrote
+    // it — while the label on the same issue said agent:ollama.
+    expect(body).toContain("<!-- reporter-agent: backend=ollama model=gemma3:4b -->");
+    expect(body.match(/<!-- reporter-agent:/g)?.length).toBe(1);
+    expect(payload?.labels).toContain("agent:ollama");
+  });
+
+  it("keeps the caller's labels alongside the provider label", async () => {
+    publish({ backend: "kimi", model: "kimi-k2-thinking" });
+    const { payload } = await submittedPayload({ title: "t", body: "b", labels: ["bug"] });
+    expect(payload?.labels).toEqual(expect.arrayContaining(["bug", "agent:kimi"]));
+  });
+
+  it("changes NOTHING when no identity was published (every non-panel spawn)", async () => {
+    delete process.env.COMFYUI_MCP_AGENT_IDENTITY;
+    const { payload } = await submittedPayload({ title: "t", body: "It broke.", labels: ["bug"] });
+    // Byte-identical, not merely "contains": a plain stdio/CLI report has no
+    // panel behind it, so there is no model to name and nothing to append.
+    expect(payload?.body).toBe("It broke.");
+    expect(payload?.labels).toEqual(["bug"]);
+  });
+
+  it("an oversized body keeps its stamp — the worker would have cut it off", async () => {
+    publish({ backend: "ollama", model: "gemma3:4b" });
+    const huge = "x".repeat(WORKER_MAX_BODY_LEN + 5_000);
+    const { payload } = await submittedPayload({ title: "t", body: huge });
+    const body = payload?.body as string;
+    // The worker truncates at 60k BEFORE filing, and the stamp is last — so the
+    // attribution would vanish server-side on exactly the longest reports, with
+    // nothing anywhere saying it had been there.
+    expect(body.length).toBeLessThanOrEqual(WORKER_MAX_BODY_LEN);
+    expect(body).toContain("<!-- reporter-agent: backend=ollama model=gemma3:4b -->");
+    expect(body).toContain("trimmed to keep the reporting-agent stamp");
+    // The caller's own text is still nearly all of it — this trims by the
+    // stamp's width, it does not summarize.
+    expect(body.length).toBeGreaterThan(WORKER_MAX_BODY_LEN - 1_000);
+  });
+
+  it("…and keeps it when the oversized body QUOTES stamps (gate P1, round 3)", async () => {
+    publish({ backend: "ollama", model: "gemma3:4b", effort: "high" });
+    // The previous test's body was marker-free, so it could not see this at all:
+    // stamping also REWRITES each quoted marker (+7 chars), so budgeting the
+    // stamp's width against the raw text put the shipped body 7·n OVER the cap —
+    // and the worker cuts the tail, which is the stamp. Blind by construction is
+    // how a covering test ships the bug it covers.
+    for (const markers of [1, 88]) {
+      const quote = "> <!-- reporter-agent: backend=claude model=opus -->\n".repeat(markers);
+      const { payload } = await submittedPayload({
+        title: "t",
+        body: `Related to #1234:\n${quote}${"LOG\n".repeat(20_000)}`,
+      });
+      const body = payload?.body as string;
+      expect(body.length, `markers=${markers}`).toBeLessThanOrEqual(WORKER_MAX_BODY_LEN);
+      // Present AND terminated: a marker cut mid-token is not an attribution.
+      expect(body, `markers=${markers}`).toContain(
+        "<!-- reporter-agent: backend=ollama model=gemma3:4b effort=high -->",
+      );
+      expect(body, `markers=${markers}`).toContain("Filed from the ComfyUI panel");
+      // Still exactly one live marker: the quoted ones stayed neutralized.
+      expect(body.match(/<!-- reporter-agent:/g)?.length, `markers=${markers}`).toBe(1);
+    }
+  });
+
+  it("leaves an oversized body ALONE when there is no identity to protect", async () => {
+    delete process.env.COMFYUI_MCP_AGENT_IDENTITY;
+    const huge = "x".repeat(WORKER_MAX_BODY_LEN + 5_000);
+    const { payload } = await submittedPayload({ title: "t", body: huge });
+    // No stamp to save, so the worker's own truncation is the only one that
+    // should ever apply. Trimming here would drop the caller's text for nothing.
+    expect(payload?.body).toBe(huge);
+  });
+
+  it("never stamps a THIRD-PARTY tracker", async () => {
+    publish({ backend: "ollama", model: "gemma3:4b" });
+    const spy = vi.fn();
+    vi.stubGlobal("fetch", spy);
+    const { json } = await callTool({ title: "t", body: "It broke.", repo: "someone/their-node", labels: ["bug"] });
+    // The prefilled URL is what the user posts to someone else's repo. Our
+    // provider telemetry is not their business, and `agent:ollama` is a label
+    // their repo has never heard of.
+    const url = new URL(json.url as string);
+    expect(url.searchParams.get("body")).toBe("It broke.");
+    expect(url.searchParams.get("labels")).toBe("bug");
+  });
+
+  it("stamps the PREFILLED fallback for our repos too", async () => {
+    publish({ backend: "claude", model: "claude-opus-4-5" });
+    // no_file and the worker-unreachable fallback share this URL — a report that
+    // arrives by the fallback path is no less in need of attribution.
+    const { json } = await callTool({ title: "t", body: "It broke.", no_file: true });
+    const url = new URL(json.url as string);
+    expect(url.searchParams.get("body")).toContain("claude-opus-4-5");
+    expect(url.searchParams.get("labels")).toBe("agent:claude");
   });
 });
