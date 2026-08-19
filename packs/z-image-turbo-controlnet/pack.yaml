@@ -8,8 +8,9 @@ description: >-
   reference image, in ~8-14 steps at cfg 1. Uses a Qwen text encoder (not CLIP/T5)
   and loads the ControlNet via ModelPatchLoader -> QwenImageDiffsynthControlnet.
   Single-purpose graph sliced from the z-image-turbo monolith (one pipeline, no
-  group toggles), with optional film-grain / laplacian-sharpen post-processing and
-  seed-variance.
+  group toggles), with seed-variance. Film-grain / laplacian-sharpen post-proc
+  from comfyui-vrgamedevgirl is omitted — that pack's llama-cpp-python dep
+  compiles from source on Windows and blocks Desktop startup past 300s (#1698).
 vram: "<8GB"
 workflow: workflow.json
 skill: z-image-txt2img

@@ -22,7 +22,7 @@
         {
           "name": "images",
           "type": "IMAGE",
-          "link": 353
+          "link": 301
         }
       ],
       "outputs": [],
@@ -37,100 +37,6 @@
       },
       "widgets_values": [
         "ComfyUI"
-      ]
-    },
-    {
-      "id": 281,
-      "type": "FastFilmGrain",
-      "pos": [
-        16530.748553718997,
-        1862.5677452886166
-      ],
-      "size": [
-        431.5858459472656,
-        106
-      ],
-      "flags": {
-        "collapsed": false
-      },
-      "order": 208,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "link": 302
-        }
-      ],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "links": [
-            305,
-            353
-          ]
-        }
-      ],
-      "properties": {
-        "aux_id": "vrgamegirl19/comfyui-vrgamedevgirl",
-        "ver": "0.1.0",
-        "Node name for S&R": "FastFilmGrain",
-        "cnr_id": "comfyui-aspect-ratio-crop-node",
-        "ue_properties": {
-          "version": "7.5.1",
-          "widget_ue_connectable": {},
-          "input_ue_unconnectable": {}
-        }
-      },
-      "widgets_values": [
-        0.012,
-        0.3,
-        4
-      ]
-    },
-    {
-      "id": 280,
-      "type": "FastLaplacianSharpen",
-      "pos": [
-        16532.162646358895,
-        2060.8049114399064
-      ],
-      "size": [
-        428.9425354003906,
-        58
-      ],
-      "flags": {},
-      "order": 204,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "link": 301
-        }
-      ],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "links": [
-            302
-          ]
-        }
-      ],
-      "properties": {
-        "aux_id": "vrgamegirl19/comfyui-vrgamedevgirl",
-        "ver": "0c5580921e6e6ad56f9fc1ecddce3264790a15fb",
-        "Node name for S&R": "FastLaplacianSharpen",
-        "ue_properties": {
-          "version": "7.5.1",
-          "widget_ue_connectable": {},
-          "input_ue_unconnectable": {}
-        }
-      },
-      "widgets_values": [
-        0.4000000000000001
       ]
     },
     {
@@ -2086,15 +1992,7 @@
       301,
       282,
       0,
-      280,
-      0,
-      "IMAGE"
-    ],
-    [
-      302,
-      280,
-      0,
-      281,
+      316,
       0,
       "IMAGE"
     ],
@@ -2337,14 +2235,6 @@
       292,
       0,
       "INT"
-    ],
-    [
-      353,
-      281,
-      0,
-      316,
-      0,
-      "IMAGE"
     ]
   ],
   "groups": [
@@ -2358,32 +2248,6 @@
         2382.3527642121676
       ],
       "color": "#3f789e",
-      "font_size": 24,
-      "flags": {}
-    },
-    {
-      "id": 27,
-      "title": "CTRL GRAIN",
-      "bounding": [
-        16520.748553718997,
-        1792.5677452886157,
-        451.5858154296875,
-        172.6043701171875
-      ],
-      "color": "#8AA",
-      "font_size": 24,
-      "flags": {}
-    },
-    {
-      "id": 28,
-      "title": "CTRL SHARP",
-      "bounding": [
-        16522.162646358895,
-        1990.8049114399064,
-        448.943359375,
-        141.60000610351562
-      ],
-      "color": "#b58b2a",
       "font_size": 24,
       "flags": {}
     },
