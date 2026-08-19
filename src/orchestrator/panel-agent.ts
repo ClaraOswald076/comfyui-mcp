@@ -532,6 +532,9 @@ export class PanelAgent {
   /** Set by requestRewind() to fork the session on the next (re)start. `anchor`
    *  is the assistant UUID to resume up to (drop everything after); null = fresh. */
   private pendingRewind: { anchor: string | null } | null = null;
+  /** #1700 — next start resumes history into a NEW session so the current
+   *  mcpServers (re-read from ~/.claude.json) replace the session-recorded set. */
+  private pendingForkOnResume = false;
   /** Captured from the session's init message; enables resume across restarts. */
   sessionId: string | null = null;
   /** #1516 — cumulative AUTOMATIC previews committed to turns of the CURRENT
@@ -678,6 +681,7 @@ export class PanelAgent {
     // A rewind deliberately DROPS everything after the anchor (the edited message
     // arrives separately), so the interrupted turn's text must NOT be re-queued.
     this.inFlight = null;
+    this.pendingForkOnResume = false; // rewind owns the next start's fork shape
     // The dropped turn may have been carrying a run completion — that is news,
     // not conversation, so hand it back for replay rather than rewinding it away
     // (#468).
@@ -693,6 +697,12 @@ export class PanelAgent {
     const wake = this.waiting;
     this.waiting = null;
     wake?.();
+  }
+
+  /** #1700 — next start resumes history into a NEW session so the current
+   *  mcpServers replace the set recorded with the old session. */
+  requestForkOnResume(): void {
+    this.pendingForkOnResume = true;
   }
 
   /**
@@ -1765,6 +1775,9 @@ export class PanelAgent {
       // session instead of starting clean. (requestRewind(null) clears sessionId;
       // this also suppresses the resumeSessionId fallback.)
       const resume = rewind?.anchor === null ? undefined : (this.sessionId ?? resumeSessionId);
+      // Consume once: a later self-restart must not keep forking unless asked again.
+      const forkSession = this.pendingForkOnResume && !!resume && !rewind?.anchor;
+      this.pendingForkOnResume = false;
       const startedAt = Date.now();
       // Set below if the backend fails because the resume target is gone; keeps a
       // recoverable resume-miss from counting toward the give-up threshold.
@@ -1796,6 +1809,7 @@ export class PanelAgent {
           model: this.model,
           ...(this.effort ? { effort: this.effort } : {}),
           ...(resume ? { resume } : {}),
+          ...(forkSession ? { forkSession: true } : {}),
           sessionId: this.sessionId,
           rewindAnchor: rewind?.anchor ?? null,
           // LIVENESS: re-arm the freeze watchdog on ANY sign the backend is alive —
@@ -2510,6 +2524,9 @@ export class PanelAgentManager {
    *  an optional nudge to enqueue after the resumed agent comes back (e.g. "retry
    *  the download"). Applied at the next idle so the saving turn finishes first. */
   private pendingMcpRestart = new Map<string, string | null>();
+  /** #1700 — tabs whose pending MCP restart must FORK the session so the
+   *  freshly-read MCP server set replaces the session-recorded one. */
+  private pendingForkOnRestart = new Set<string>();
   /** #1429 — tabs whose queued MCP-restart nudge is a RETARGET nudge, mapped to
    *  the EARLIEST address they were stranded on. Two jobs: it tells a retarget
    *  nudge apart from a per-request retry nudge (#164, which must never be
@@ -2791,6 +2808,18 @@ export class PanelAgentManager {
     // as its own and overwrite it — the exact #164 erasure, one step removed.
     this.pendingRetargetFrom.delete(key);
     return this.applyPendingRestarts(key);
+  }
+
+  /**
+   * #1700 — respawn this conversation so panel_add_mcp / panel_remove_mcp take
+   * effect. Same coalesced at-idle replacement as restartForMcpEnv, but the
+   * replacement FORKS: a plain resume would restore the MCP set recorded with
+   * the old session (the reporter's `magic` server stayed failed after reload).
+   * makeMcpServers() re-reads ~/.claude.json on the new spawn.
+   */
+  restartForMcpConfig(key: string, nudge?: string): McpEnvRestartOutcome {
+    if (this.agents.has(key)) this.pendingForkOnRestart.add(key);
+    return this.restartForMcpEnv(key, nudge);
   }
 
   /** Rebuild a live agent because its PROVIDER credential rotated (#278): keyed
@@ -3078,6 +3107,7 @@ export class PanelAgentManager {
     if (!agent || agent.isStopped) {
       this.pendingEffortRestart.delete(tabId);
       this.pendingMcpRestart.delete(tabId);
+      this.pendingForkOnRestart.delete(tabId);
       this.pendingRetargetFrom.delete(tabId);
       // #1567 — this restart is being dropped, so it will never deliver an armed watch,
       // and there is no longer a session whose transfers a hold could protect.
@@ -3144,8 +3174,12 @@ export class PanelAgentManager {
     this.pendingEffortRestart.delete(tabId);
     this.pendingMcpRestart.delete(tabId);
     this.pendingRetargetFrom.delete(tabId);
-    const carried = this.restartAgentResume(tabId, agent, finalNudge);
-    const reasons = [wantEffort ? "effort" : null, wantMcp ? "comfyui-mcp-env" : null]
+    const forkSession = this.pendingForkOnRestart.delete(tabId);
+    const carried = this.restartAgentResume(tabId, agent, finalNudge, { forkSession });
+    const reasons = [
+      wantEffort ? "effort" : null,
+      wantMcp ? (forkSession ? "mcp-config" : "comfyui-mcp-env") : null,
+    ]
       .filter(Boolean)
       .join("+");
     logger.info(
@@ -3178,10 +3212,15 @@ export class PanelAgentManager {
    *  model/effort/mcpServers), resuming the conversation and carrying over any
    *  unsent queued messages. `nudge`, if given, is enqueued after the carried-over
    *  messages so the resumed agent auto-continues. Returns how many were carried. */
-  private restartAgentResume(tabId: string, oldAgent: PanelAgent, nudge?: string): number {
+  private restartAgentResume(
+    tabId: string,
+    oldAgent: PanelAgent,
+    nudge?: string,
+    spawnOpts?: { forkSession?: boolean },
+  ): number {
     const resume = oldAgent.sessionId ?? undefined;
     const pending = oldAgent.takePending();
-    const fresh = this.spawn(tabId, resume); // new agent owns the tab now
+    const fresh = this.spawn(tabId, resume, spawnOpts); // new agent owns the tab now
     for (const item of pending) {
       fresh.send(item.text, {
         images: item.images,
@@ -3297,8 +3336,9 @@ export class PanelAgentManager {
     return true;
   }
 
-  private spawn(tabId: string, resume?: string): PanelAgent {
+  private spawn(tabId: string, resume?: string, spawnOpts?: { forkSession?: boolean }): PanelAgent {
     const agent = this.makeAgent(tabId);
+    if (spawnOpts?.forkSession) agent.requestForkOnResume();
     this.agents.set(tabId, agent);
     logger.info(
       `[panel-orchestrator] spawning agent for tab ${tabId.slice(0, 8)}${resume ? " (resume)" : ""} (${this.agents.size} active)`,
@@ -3504,6 +3544,7 @@ export class PanelAgentManager {
       this.pendingMcpRestart.set(newKey, this.pendingMcpRestart.get(oldKey)!);
       this.pendingMcpRestart.delete(oldKey);
     }
+    if (this.pendingForkOnRestart.delete(oldKey)) this.pendingForkOnRestart.add(newKey);
     // #1567 — the mark and the hold classify that same queued restart, so they travel with
     // it. Left behind, the renamed tab's credential respawn stops being one this may wait
     // for, and fires into whatever downloads are running under the new key.
@@ -3782,6 +3823,7 @@ export class PanelAgentManager {
     const durableCleared = this.opts.sessionStore ? this.opts.sessionStore.clear(tabId) : true;
     this.pendingEffortRestart.delete(tabId); // a reset supersedes any deferred restart
     this.pendingMcpRestart.delete(tabId);
+    this.pendingForkOnRestart.delete(tabId);
     this.pendingRetargetFrom.delete(tabId); // #1429 — nothing queued, nothing to classify
     // Drop this key's picker override so a provider switch (which reset()s the old
     // key) can't carry the old provider's model/effort into the new backend's spawn.
@@ -3839,6 +3881,7 @@ export class PanelAgentManager {
   async stopAll(): Promise<void> {
     this.pendingEffortRestart.clear();
     this.pendingMcpRestart.clear();
+    this.pendingForkOnRestart.clear();
     // #1567 — no restart is owed any more, so nothing may be held for one. The poll timer is
     // unref'd, but a shutdown that leaves it running would keep re-entering
     // applyPendingRestarts against agents this method is in the middle of stopping.

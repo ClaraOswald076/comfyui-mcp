@@ -49,6 +49,8 @@ const hoisted = vi.hoisted(() => ({
   })(),
   /** The mcpServers object the backend actually handed the SDK. */
   lastMcpServers: null as Record<string, unknown> | null,
+  lastForkSession: undefined as boolean | undefined,
+  lastResume: undefined as string | undefined,
   /** What `q.mcpServerStatus()` answers, and how many times it was asked. */
   statusPoll: null as null | Array<{ name: string; status: string }>,
   statusPolls: 0,
@@ -57,8 +59,13 @@ const hoisted = vi.hoisted(() => ({
 }));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
-  query: (arg: { prompt?: AsyncIterable<unknown>; options?: { mcpServers?: Record<string, unknown> } }) => {
+  query: (arg: {
+    prompt?: AsyncIterable<unknown>;
+    options?: { mcpServers?: Record<string, unknown>; forkSession?: boolean; resume?: string };
+  }) => {
     hoisted.lastMcpServers = arg.options?.mcpServers ?? null;
+    hoisted.lastForkSession = arg.options?.forkSession;
+    hoisted.lastResume = arg.options?.resume;
     void (async () => {
       for await (const _ of arg.prompt ?? []) void _;
     })();
@@ -83,6 +90,8 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
 beforeEach(() => {
   hoisted.queue.reset();
   hoisted.lastMcpServers = null;
+  hoisted.lastForkSession = undefined;
+  hoisted.lastResume = undefined;
   hoisted.statusPoll = null;
   hoisted.statusPolls = 0;
   hoisted.reconnectCalls = [];
@@ -350,5 +359,80 @@ describe("the turn-end watch settles what init could not (#1524)", () => {
     expect(noticesOf(events)).toHaveLength(0);
     expect(hoisted.reconnectCalls).toEqual([]);
     expect(events.filter((e) => e.type === "result")).toHaveLength(1);
+  });
+});
+
+describe("a forked resume uses THIS run's MCP set, not the session-recorded one (#1700)", () => {
+  const MAGIC = { type: "stdio", command: "npx", args: ["-y", "@21st-dev/magic"] } as never;
+
+  it("hands the SDK forkSession plus the post-remove server set", async () => {
+    // The reporter's case: magic was removed from config, then panel_reload
+    // resumed the old session. A plain resume restores the recorded MCP set, so
+    // magic stayed failed. The shipped backend must fork AND pass the current
+    // deps (no magic) so the replacement session cannot relaunch it.
+    const events: AgentEvent[] = [];
+    const { ClaudeBackend } = await import("../../orchestrator/claude-backend.js");
+    const backend = new ClaudeBackend({
+      mcpServers: { comfyui: COMFYUI_SERVER } as never,
+      systemAppend: "",
+      panelServer: PANEL_SERVER,
+    });
+    async function* idle(): AsyncGenerator<{ text: string }> {
+      await new Promise<void>(() => {});
+    }
+    const done = (async () => {
+      for await (const ev of backend.run({
+        channel: idle() as never,
+        resume: "sess-with-magic",
+        forkSession: true,
+      })) {
+        events.push(ev);
+      }
+    })();
+    hoisted.queue.push(
+      initWith([
+        { name: "comfyui", status: "connected" },
+        { name: "panel", status: "connected" },
+      ]),
+    );
+    await waitFor(() => expect(events.some((e) => e.type === "session")).toBe(true));
+    hoisted.queue.end();
+    await done;
+
+    expect(hoisted.lastResume).toBe("sess-with-magic");
+    expect(hoisted.lastForkSession).toBe(true);
+    expect(hoisted.lastMcpServers && Object.keys(hoisted.lastMcpServers).sort()).toEqual([
+      "comfyui",
+      "panel",
+    ]);
+    expect(hoisted.lastMcpServers).not.toHaveProperty("magic");
+    expect(noticesOf(events)).toHaveLength(0);
+  });
+
+  it("a plain resume does not set forkSession — that is the bug's shape", async () => {
+    const events: AgentEvent[] = [];
+    const { ClaudeBackend } = await import("../../orchestrator/claude-backend.js");
+    const backend = new ClaudeBackend({
+      mcpServers: { comfyui: COMFYUI_SERVER, magic: MAGIC } as never,
+      systemAppend: "",
+    });
+    async function* idle(): AsyncGenerator<{ text: string }> {
+      await new Promise<void>(() => {});
+    }
+    const done = (async () => {
+      for await (const ev of backend.run({
+        channel: idle() as never,
+        resume: "sess-with-magic",
+      })) {
+        events.push(ev);
+      }
+    })();
+    hoisted.queue.push(initWith([{ name: "comfyui", status: "connected" }]));
+    await waitFor(() => expect(events.some((e) => e.type === "session")).toBe(true));
+    hoisted.queue.end();
+    await done;
+
+    expect(hoisted.lastResume).toBe("sess-with-magic");
+    expect(hoisted.lastForkSession).toBeUndefined();
   });
 });

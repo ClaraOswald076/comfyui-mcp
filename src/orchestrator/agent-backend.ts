@@ -205,6 +205,14 @@ export interface ModelChoice {
 export interface BackendStartOptions {
   /** Resume an existing session/thread by id. */
   resume?: string;
+  /**
+   * Resume into a NEW session id that keeps conversation history but takes the
+   * CURRENT MCP server set (#1700). A plain `resume` restores the MCP set
+   * recorded with that session, so panel_add_mcp / panel_remove_mcp would not
+   * take effect. Honored by Claude (`forkSession: true`); other backends ignore
+   * it. Distinct from `rewindAnchor`, which also forks but drops later turns.
+   */
+  forkSession?: boolean;
   /** Fork the conversation at this anchor — honored only if `forkAtAnchor`. */
   rewindAnchor?: string | null;
   /** Model id (provider-specific). */
