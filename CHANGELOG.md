@@ -768,6 +768,7 @@ All notable changes to this project are documented here. This project adheres to
 
 #### Fixed
 - panel_save_workflow corroborates a fence refusal so a save-only retry self-heals (#1782)
+- the widened fence arm must not adopt refusals that merely quote it (#1784)
 
 
 ## [0.52.6] - 2026-08-19
