@@ -27,6 +27,16 @@ export interface VerifyOptions {
   classTypes?: string[];
   /** Restart ComfyUI before checking (default true). Set false to check the live server as-is. */
   restart?: boolean;
+  /**
+   * The caller's ASYNC, live-aware install base (resolveEffectiveComfyUIBaseLive,
+   * #1715). AUTHORITATIVE when given: it already encodes the full precedence —
+   * the running runtime's --base-directory (where it actually scans
+   * custom_nodes/ from) ahead of configuration — so verify reads the pack from
+   * the same root scaffold wrote to, closing the split-root failure where the
+   * pack landed under the code install root while the runtime loaded from its
+   * base directory.
+   */
+  resolvedBase?: string;
 }
 
 export interface VerifyResult {
@@ -61,7 +71,7 @@ export interface VerifyDeps {
   inferPackClassTypes?: (packName: string) => Promise<string[]>;
 }
 
-const defaultDeps: VerifyDeps = {
+const makeDefaultDeps = (resolvedBase?: string): VerifyDeps => ({
   restart: async () => {
     const result = await restartComfyUI();
     return { ready: result.readiness?.ready ?? false, message: result.message };
@@ -85,7 +95,7 @@ const defaultDeps: VerifyDeps = {
     return Object.keys(data as Record<string, unknown>);
   },
   readPackInit: (packName: string) => {
-    const base = resolveEffectiveComfyUIBase();
+    const base = resolvedBase ?? resolveEffectiveComfyUIBase();
     if (!base) return undefined;
     const initPath = join(base, "custom_nodes", packName, "__init__.py");
     if (!existsSync(initPath)) return undefined;
@@ -96,7 +106,7 @@ const defaultDeps: VerifyDeps = {
     }
   },
   readPackSources: (packName: string) => {
-    const base = resolveEffectiveComfyUIBase();
+    const base = resolvedBase ?? resolveEffectiveComfyUIBase();
     if (!base) return [];
     const packDir = join(base, "custom_nodes", packName);
     if (!existsSync(packDir)) return [];
@@ -147,7 +157,7 @@ const defaultDeps: VerifyDeps = {
     }
     return classTypesForPack(data as Record<string, unknown>, packName);
   },
-};
+});
 
 /**
  * Given a parsed /object_info map, return the class_types whose `python_module`
@@ -205,15 +215,16 @@ export function parseClassMappingKeys(initPy: string): string[] {
 
 export async function verifyCustomNode(
   options: VerifyOptions,
-  deps: VerifyDeps = defaultDeps,
+  deps: VerifyDeps = makeDefaultDeps(options.resolvedBase),
 ): Promise<VerifyResult> {
   // Classify LOCAL vs remote by the EFFECTIVE local base (COMFYUI_PATH, else the
   // saved default workspace when not targeting a remote ComfyUI), not by
   // COMFYUI_PATH alone — otherwise a local instance backed only by a default
   // workspace was wrongly rejected as remote when COMFYUI_PATH was unset
   // (#386/#409). Only a genuinely remote target (or no local base at all) is
-  // unsupported here.
-  if (!resolveEffectiveComfyUIBase()) {
+  // unsupported here. A threaded resolvedBase (#1715) IS the local-base answer
+  // — the live-aware resolver already ran it through the same gates.
+  if (!(options.resolvedBase ?? resolveEffectiveComfyUIBase())) {
     throw new ProcessControlError(
       'node_pack (action:"verify") is local-only: it restarts and inspects a local ComfyUI ' +
         "install. It cannot verify a remote --comfyui-url target. Set the COMFYUI_PATH " +

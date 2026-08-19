@@ -261,18 +261,17 @@ function toClassName(slug: string): string {
  * then we refuse with a clear, actionable error.
  *
  * `resolvedBase` is the caller's ASYNC, live-aware resolution
- * (`resolveEffectiveComfyUIBaseLive`, #1653): when nothing is configured, the
- * running LOCAL server's own install root — the same trusted workspace
- * install_comfyui (action:"environment") reports — fills the gap, so a session
- * that tool just proved local is not rejected as unconfigured. The sync
- * configured-only resolution remains the fallback for callers that never
- * resolved one.
+ * (`resolveEffectiveComfyUIBaseLive`, #1653/#1715) and is AUTHORITATIVE when
+ * given: that resolver already encodes the full precedence — the live server's
+ * `--base-directory` (where the running runtime actually scans custom_nodes/
+ * from, #1715), then configuration, then the running LOCAL server's own
+ * install root. Re-preferring configuration here would resurrect the Desktop
+ * split-root bug, where scaffold wrote under the code install root while the
+ * runtime loaded from its base directory. The sync configured-only resolution
+ * remains the fallback for callers that never resolved one.
  */
 function customNodesRoot(resolvedBase?: string): string {
-  // Configuration wins; a caller-resolved live base only fills the gap
-  // (resolveEffectiveComfyUIBaseLive already encodes that order — restated
-  // here so a threaded live root can never override COMFYUI_PATH).
-  const base = resolveEffectiveComfyUIBase() ?? resolvedBase;
+  const base = resolvedBase ?? resolveEffectiveComfyUIBase();
   if (!base) {
     throw new ValidationError(
       "This operation needs a local ComfyUI install, but none could be resolved: " +

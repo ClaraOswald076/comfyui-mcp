@@ -302,7 +302,7 @@ function assertNoWindowsHazards(raw: string): void {
   }
 }
 
-export function customNodesRoot(): string {
+export function customNodesRoot(resolvedBase?: string): string {
   // Resolve the effective LOCAL ComfyUI base the same way every other
   // filesystem-backed tool does: COMFYUI_PATH first, then the saved default
   // workspace (set via workspace action:"set_default") when COMFYUI_PATH is unset. This
@@ -310,7 +310,14 @@ export function customNodesRoot(): string {
   // source tools no longer reject a loopback session that has a saved default
   // workspace as if it were remote (#506). Returns undefined only in remote
   // mode or when no local install is known — then we refuse with a clear error.
-  const base = resolveEffectiveComfyUIBase();
+  //
+  // `resolvedBase`, when threaded by the node_pack handler, is the ASYNC
+  // live-aware resolution (resolveEffectiveComfyUIBaseLive, #1653/#1715) and is
+  // AUTHORITATIVE: it already encodes the full precedence — the live server's
+  // own --base-directory (where the running runtime actually scans
+  // custom_nodes/ from) ahead of configuration — so configuration is NOT
+  // re-preferred over it here.
+  const base = resolvedBase ?? resolveEffectiveComfyUIBase();
   if (!base) {
     throw new NodeDevError(
       "This operation requires a local ComfyUI install, but none is configured " +
@@ -360,13 +367,17 @@ export interface JailResult {
  * any lexical- or symlink-based escape. rel === "" denotes the root itself;
  * callers that must not touch the root reject an empty rel.
  */
-export function resolveInJail(input: string, deps: NodeDevDeps = defaultDeps): JailResult {
+export function resolveInJail(
+  input: string,
+  deps: NodeDevDeps = defaultDeps,
+  resolvedBase?: string,
+): JailResult {
   const raw = (input ?? "").trim();
   if (!raw) throw new NodeDevError("A path is required (received an empty string).");
 
   assertNoWindowsHazards(raw);
 
-  const root = customNodesRoot();
+  const root = customNodesRoot(resolvedBase);
   const candidate = isAbsolute(raw) ? resolve(raw) : resolve(root, raw);
 
   // 1. Lexical containment on the un-resolved candidate.
@@ -390,10 +401,14 @@ export function resolveInJail(input: string, deps: NodeDevDeps = defaultDeps): J
 }
 
 /** Resolve a pack folder: name validated + jailed, must be a non-root dir. */
-function resolvePackDir(pack: string, deps: NodeDevDeps): { abs: string; name: string } {
+function resolvePackDir(
+  pack: string,
+  deps: NodeDevDeps,
+  resolvedBase?: string,
+): { abs: string; name: string } {
   const name = (pack ?? "").trim();
   assertSafeRepoName(name);
-  const { abs, rel } = resolveInJail(name, deps);
+  const { abs, rel } = resolveInJail(name, deps, resolvedBase);
   if (!rel) {
     throw new NodeDevError("Refusing to operate on the custom_nodes root itself.");
   }
@@ -513,8 +528,9 @@ export interface ListFilesResult {
 export function listNodePackFiles(
   options: ListFilesOptions,
   deps: NodeDevDeps = defaultDeps,
+  resolvedBase?: string,
 ): ListFilesResult {
-  const { abs: packDir, name } = resolvePackDir(options.pack, deps);
+  const { abs: packDir, name } = resolvePackDir(options.pack, deps, resolvedBase);
   if (!deps.isDirectory(packDir)) {
     throw new NodeDevError(`Pack "${name}" does not exist under custom_nodes/.`);
   }
@@ -639,8 +655,9 @@ export interface ReadFileResult {
 export function readNodeFile(
   options: ReadFileOptions,
   deps: NodeDevDeps = defaultDeps,
+  resolvedBase?: string,
 ): ReadFileResult {
-  const { abs, rel } = resolveInJail(options.path, deps);
+  const { abs, rel } = resolveInJail(options.path, deps, resolvedBase);
   if (!rel) throw new NodeDevError("Refusing to read the custom_nodes root itself.");
   if (!deps.existsSync(abs) || !deps.isFile(abs)) {
     throw new NodeDevError(`File not found under custom_nodes/: "${options.path}".`);
@@ -758,16 +775,21 @@ export function searchTruncationHint(
 }
 
 /** Resolve the directory a search runs over (default "." = the whole jail root). */
-function resolveSearchDir(path: string | undefined, deps: NodeDevDeps): string {
+function resolveSearchDir(
+  path: string | undefined,
+  deps: NodeDevDeps,
+  resolvedBase?: string,
+): string {
   const p = (path ?? ".").trim();
-  if (p === "." || p === "") return customNodesRoot();
-  const { abs } = resolveInJail(p, deps);
+  if (p === "." || p === "") return customNodesRoot(resolvedBase);
+  const { abs } = resolveInJail(p, deps, resolvedBase);
   return abs;
 }
 
 export function searchNodePacks(
   options: SearchOptions,
   deps: NodeDevDeps = defaultDeps,
+  resolvedBase?: string,
 ): SearchResult {
   const query = options.query ?? "";
   if (!query) throw new NodeDevError("A non-empty search query is required.");
@@ -775,7 +797,7 @@ export function searchNodePacks(
     Math.max(1, options.maxResults ?? SEARCH_DEFAULT_RESULTS),
     SEARCH_MAX_RESULTS,
   );
-  const searchDir = resolveSearchDir(options.path, deps);
+  const searchDir = resolveSearchDir(options.path, deps, resolvedBase);
   if (!deps.isDirectory(searchDir)) {
     throw new NodeDevError(`Search path does not exist under custom_nodes/.`);
   }
@@ -966,8 +988,9 @@ export interface WriteFileResult {
 export function writeNodeFile(
   options: WriteFileOptions,
   deps: NodeDevDeps = defaultDeps,
+  resolvedBase?: string,
 ): WriteFileResult {
-  const { abs, rel } = resolveInJail(options.path, deps);
+  const { abs, rel } = resolveInJail(options.path, deps, resolvedBase);
   if (!rel) throw new NodeDevError("Refusing to write the custom_nodes root itself.");
 
   const exists = deps.existsSync(abs);
@@ -1042,11 +1065,12 @@ export const patchBoundNotice = (dropped: number) =>
 export function applyNodePatch(
   patch: string,
   deps: NodeDevDeps = defaultDeps,
+  resolvedBase?: string,
 ): PatchResult {
   if (!patch || !patch.trim()) {
     throw new NodeDevError("An empty patch was provided.");
   }
-  const root = customNodesRoot();
+  const root = customNodesRoot(resolvedBase);
 
   // Phase 1: jail-check EVERY touched path BEFORE any git call.
   const touched = parsePatchPaths(patch);
@@ -1056,7 +1080,7 @@ export function applyNodePatch(
     );
   }
   for (const p of touched) {
-    const { rel } = resolveInJail(p, deps);
+    const { rel } = resolveInJail(p, deps, resolvedBase);
     if (!rel) {
       throw new NodeDevError(`Patch would touch the custom_nodes root itself ("${p}").`);
     }
@@ -1126,8 +1150,13 @@ export function gitWritesEnabled(): boolean {
 }
 
 /** Jail-check a caller-supplied path and return it relative to the pack dir. */
-function packRelativePath(packDir: string, p: string, deps: NodeDevDeps): string {
-  const { abs } = resolveInJail(p, deps);
+function packRelativePath(
+  packDir: string,
+  p: string,
+  deps: NodeDevDeps,
+  resolvedBase?: string,
+): string {
+  const { abs } = resolveInJail(p, deps, resolvedBase);
   const rel = relative(packDir, abs);
   if (rel.startsWith("..") || isAbsolute(rel)) {
     throw new NodeDevError(`Path "${p}" is outside the target pack.`);
@@ -1145,8 +1174,9 @@ export const gitBoundNotice = (maxChars: number) => (dropped: number) =>
 export function nodePackGit(
   options: GitOptions,
   deps: NodeDevDeps = defaultDeps,
+  resolvedBase?: string,
 ): GitResult {
-  const { abs: packDir, name } = resolvePackDir(options.pack, deps);
+  const { abs: packDir, name } = resolvePackDir(options.pack, deps, resolvedBase);
   if (!deps.isDirectory(packDir)) {
     throw new NodeDevError(`Pack "${name}" does not exist under custom_nodes/.`);
   }
@@ -1158,7 +1188,7 @@ export function nodePackGit(
     READ_MAX_CHARS,
   );
 
-  const relPaths = (options.paths ?? []).map((p) => packRelativePath(packDir, p, deps));
+  const relPaths = (options.paths ?? []).map((p) => packRelativePath(packDir, p, deps, resolvedBase));
 
   let argv: string[];
   let timeoutMs = GIT_TIMEOUT_MS;

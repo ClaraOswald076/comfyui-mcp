@@ -145,6 +145,22 @@ describe("verifyCustomNode", () => {
     expect(res.missing).toEqual([]);
   });
 
+  it("a threaded resolvedBase IS the local base — it satisfies the gate when nothing is configured (#1715)", async () => {
+    // The handler threads resolveEffectiveComfyUIBaseLive's answer (the running
+    // runtime's --base-directory on Desktop). Verify must accept that answer as
+    // the local base, so the pack verify reads from the SAME root scaffold
+    // wrote to — the split-root failure of #1715 was verify checking a
+    // different root than the write.
+    config.comfyuiPath = undefined;
+    savedDefaultWorkspace = undefined;
+    const res = await verifyCustomNode(
+      { classTypes: ["FooNode"], resolvedBase: "/live/base-dir" },
+      makeDeps(),
+    );
+    expect(res.loaded).toEqual(["FooNode"]);
+    expect(res.missing).toEqual([]);
+  });
+
   it("infers from a re-exported literal in a non-__init__ pack source file", async () => {
     // __init__.py only re-exports the mappings (no literal of its own); the
     // literal lives in a sibling source file.

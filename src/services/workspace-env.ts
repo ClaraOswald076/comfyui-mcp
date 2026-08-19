@@ -8,6 +8,10 @@ import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
 import { normalizeInstallPathEnv } from "../utils/install-path-env.js";
 import { getSystemStats } from "../comfyui/client.js";
 import { observeLiveServerProcess, resolveLiveInterpreter } from "./live-interpreter.js";
+import {
+  hasUnresolvableRelativeBaseDirFlag,
+  parseBaseDirFromArgv,
+} from "./launch-argv.js";
 import { logger } from "../utils/logger.js";
 import { ValidationError } from "../utils/errors.js";
 
@@ -156,7 +160,7 @@ export function resolveEffectiveComfyUIBase(): string | undefined {
 }
 
 /**
- * The ASYNC, live-aware variant of `resolveEffectiveComfyUIBase` (#1653).
+ * The ASYNC, live-aware variant of `resolveEffectiveComfyUIBase` (#1653, #1715).
  *
  * The sync resolver answers from CONFIGURATION alone (COMFYUI_PATH, then the
  * saved default workspace), so a loopback session with neither configured is
@@ -165,36 +169,62 @@ export function resolveEffectiveComfyUIBase(): string | undefined {
  * with `python_probe_trusted:true` — one machine, two contradictory answers,
  * and the writing tools (node_pack scaffold/publish) believed the wrong one.
  *
- * The resolution order, which only ever fills a GAP (a configured base still
- * wins and is never overridden):
- *   1. `resolveEffectiveComfyUIBase()` — configuration, unchanged.
- *   2. `resolveLiveComfyUIBase()` — the live connected server's own install
- *      root, derived from the `/system_stats` launch argv. That is the server's
- *      SELF-REPORT of where it runs from, the same source `workspace
- *      action:"get"` already surfaces as `workspace_source:"live-server"`
- *      (#769) and `apply_manifest` adopts (#463). It refuses remote mode
- *      internally, so the loopback-only guarantee of question 2 is kept.
+ * The resolution order:
+ *   1. The live server's `--base-directory` (#1715). When the running server
+ *      was launched with one, ComfyUI scans custom_nodes/ from THAT directory
+ *      and nowhere else — on ComfyUI Desktop it is the user-data dir (e.g.
+ *      ~/Documents/ComfyUI), NOT the code install root that holds main.py. A
+ *      pack written under the install root is invisible to that runtime, so
+ *      the server's own self-report wins over configuration here — the same
+ *      precedence the download path already applies (#346: a server whose
+ *      --base-directory differs from COMFYUI_PATH roots the download there).
+ *      Adopted only when it resolves to an absolute path that exists on disk.
+ *   2. `resolveEffectiveComfyUIBase()` — configuration (COMFYUI_PATH, then the
+ *      saved default workspace). Unchanged, and never overridden by anything
+ *      but the runtime's own base directory above.
+ *   3. `liveRootFromArgv()` — the live connected server's own install root
+ *      (the `main.py` directory from `/system_stats` argv), filling the gap
+ *      when nothing is configured (#1653). That is the server's SELF-REPORT of
+ *      where it runs from, the same source `workspace action:"get"` surfaces
+ *      as `workspace_source:"live-server"` (#769) and `apply_manifest` adopts
+ *      (#463).
  *
- * The live root is adopted only when it exists on disk and looks like a
- * ComfyUI install (models/ or custom_nodes/ present) — the same validity
- * check `resolveLocalManifestBase` applies — because an argv-derived path is
- * the server's claim, and the disk check is what keeps a stale or relocated
- * install report from becoming a write target. Returns undefined (never
- * throws) when nothing checks out; the caller then refuses with an actionable
- * error, exactly as before.
+ * The live roots are adopted only when they exist on disk — the install root
+ * additionally must look like a ComfyUI install (models/ or custom_nodes/
+ * present, the same validity check `resolveLocalManifestBase` applies) —
+ * because an argv-derived path is the server's claim, and the disk check is
+ * what keeps a stale or relocated report from becoming a write target.
+ *
+ * FAIL CLOSED: when argv carries a `--base-directory` that cannot be resolved
+ * (a relative value with no absolute server cwd), every root we could derive
+ * names a DIFFERENT tree than the one being served, so the main.py root is NOT
+ * adopted (the same gate `hasUnresolvableRelativeBaseDirFlag` documents).
+ * Returns undefined (never throws) when nothing checks out; the caller then
+ * refuses with an actionable error, exactly as before.
  */
 export async function resolveEffectiveComfyUIBaseLive(): Promise<string | undefined> {
   const configured = resolveEffectiveComfyUIBase();
-  if (configured) return configured;
-  const liveBase = await resolveLiveComfyUIBase();
-  if (
-    liveBase &&
-    existsSync(liveBase) &&
-    (existsSync(join(liveBase, "models")) || existsSync(join(liveBase, "custom_nodes")))
-  ) {
-    return liveBase;
+  const snapshot = await getLiveServerSnapshot();
+  if (snapshot.reachable) {
+    const baseDir = parseBaseDirFromArgv(snapshot.argv, snapshot.cwd);
+    if (baseDir && existsSync(baseDir)) return baseDir;
+    if (configured) return configured;
+    // A --base-directory we cannot resolve overrides the main.py root: that
+    // root is a confidently WRONG answer here, not merely an unproven one.
+    if (hasUnresolvableRelativeBaseDirFlag(snapshot.argv, snapshot.cwd)) {
+      return undefined;
+    }
+    const liveBase = liveRootFromArgv(snapshot.argv, snapshot.cwd);
+    if (
+      liveBase &&
+      existsSync(liveBase) &&
+      (existsSync(join(liveBase, "models")) || existsSync(join(liveBase, "custom_nodes")))
+    ) {
+      return liveBase;
+    }
+    return undefined;
   }
-  return undefined;
+  return configured;
 }
 
 /**
