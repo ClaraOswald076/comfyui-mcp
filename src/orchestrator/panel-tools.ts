@@ -7651,10 +7651,14 @@ export function makePanelToolCtx(
                   `(${live}) — through the panel's own repair, not this check. ${RETRY_IS_FREE}`
                 : probe.status === "already_current"
                   ? shape === "unstamped"
-                    ? `\n\nCHECKED, and the two sides disagree about this session's state: its ` +
-                      `fence NOW names the live canvas (${live}), yet this command reached the ` +
-                      `panel carrying no stamp at all — so the identity was established, or ` +
-                      `re-advertised, after this command went out. ${RETRY_IS_FREE}`
+                    ? // The COMPARISON, not a cause — the panel's own discipline. An
+                      // identity established between dispatch and this read explains
+                      // it, and so does this session having been re-bound onto another
+                      // tab in between; neither was witnessed, so neither is asserted.
+                      `\n\nCHECKED, and the two readings disagree: this session's fence NOW ` +
+                      `names the live canvas (${live}), yet this command reached the panel ` +
+                      `carrying no stamp at all. What produced that gap was not observed from ` +
+                      `here. ${RETRY_IS_FREE}`
                     : `\n\nCHECKED: this session's fence already names the live canvas ` +
                       `(${live}), so it was not the stale side and the disagreement is gone by ` +
                       `the time it was looked at. ${RETRY_IS_FREE} If it refuses again with the ` +
@@ -7662,17 +7666,27 @@ export function makePanelToolCtx(
                       `panel_open_workflow is the way to settle which one you mean.`
                   : probe.status === "diverged"
                     ? shape === "unstamped"
-                      ? `\n\nCHECKED, and this is a MISSING stamp rather than a wrong one: this ` +
-                        `session holds no workflow identity, so nothing was compared — the read ` +
-                        `was refused for arriving bare. The live canvas DOES have one ` +
+                      ? // Says only what the panel reported and what the probe read. It
+                        // does NOT assert that this session holds no fence right now:
+                        // `diverged` is also reached with a fence naming some third
+                        // workflow, and that reading was never taken.
+                        `\n\nCHECKED, and this is a MISSING stamp rather than a wrong one: the ` +
+                        `panel refused it for arriving with NO stamp, so no two identities were ` +
+                        `compared — this is not the case where you are pointed at another ` +
+                        `workflow. The live canvas DOES have an identity ` +
                         `(${live}). Nothing was adopted here; this check is read-only and the ` +
                         `fence is unchanged. RECOVERY: ` +
                         `panel_set_workflow_target({mode:"current"}) derives this session's ` +
                         `fence from the live canvas, after which this read carries a stamp and ` +
                         `runs.${pinNote}`
                       : shape === "stamped"
-                        ? `\n\nCHECKED, and this session was NOT re-pointed: it is fenced to ` +
-                          `${stamped} and the live canvas is a DIFFERENT workflow (${live}). ` +
+                        ? // "was issued for", not "is fenced to": the uuid comes from the
+                          // panel's account of what the COMMAND carried, and the session's
+                          // fence may have moved since. The mutation branch above words
+                          // it the same way for the same reason.
+                          `\n\nCHECKED, and this session was NOT re-pointed: this command was ` +
+                          `issued for ${stamped} and the live canvas is a DIFFERENT workflow ` +
+                          `(${live}). ` +
                           `This is a WRONG stamp, not a missing one, so the two exits are not ` +
                           `interchangeable: to read the workflow you issued for, bring it back ` +
                           `with panel_open_workflow; to read the live canvas instead, re-target ` +
