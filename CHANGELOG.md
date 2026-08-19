@@ -759,6 +759,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.10] - 2026-08-19
+
+### MCP
+
+#### Fixed
+- list_templates honors COMFYUI_MCP_HTTP_TIMEOUT_S instead of aborting at 8s (#1795)
+- environment no longer reports packages missing off the Homebrew base python (#1794)
+- refuse Anima regional prompt writes the custom textarea overwrites (#1793)
+- a PINNED extra-paths target says so when the running server reads a different config (#1792)
+- the orchestrator's own /history observation keeps the completion promise panel_run makes — and the rider stops over-promising (#1791)
+
+
 ## [0.52.9] - 2026-08-19
 
 ### MCP
