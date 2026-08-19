@@ -46,6 +46,14 @@ CLI 旗標完成。ComfyUI 目標的優先順序：
   本機 ComfyUI 安裝的絕對路徑。未設定時從常見位置自動偵測（遠端 / 雲端模式下被抑制）。
   僅本機工具需要它（安裝 / 管理節點、刪除模型、讀記錄、列出輸出檔案）。
 </ParamField>
+<ParamField path="COMFYUI_RESTART_COMMAND" type="string">
+  用於重新啟動**外部託管** ComfyUI 的 shell 命令 — 例如 `docker restart comfyui` 或
+  `systemctl --user restart comfyui`。設定後，`restart_comfyui` 會執行該命令而不是
+  kill+relaunch（後者要求能解析安裝目錄的啟動路徑 — 對容器或啟動器來說不可能，
+  因為它們的 `main.py` 只在自己的命名空間內可定位），`panel_restart_comfyui`
+  也同樣經由該命令。僅對本機目標生效；遠端 / 雲端目標仍走 Manager 重啟路徑。
+  重啟會驗證執行個體恢復健康，只有實際觀測到 down→up 時才回報為 confirmed。
+</ParamField>
 
 ## 反向代理 / API 閘道後面的遠端執行個體
 

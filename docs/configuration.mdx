@@ -47,6 +47,15 @@ mix-and-match.
   (suppressed in remote/cloud modes). Required by local-only tools (install/manage nodes, remove
   models, read logs, list output files).
 </ParamField>
+<ParamField path="COMFYUI_RESTART_COMMAND" type="string">
+  Shell command that restarts an **externally managed** ComfyUI — e.g. `docker restart comfyui`
+  or `systemctl --user restart comfyui`. When set, `restart_comfyui` runs this command instead
+  of kill+relaunch (which needs the install's launch path resolvable — impossible for a
+  container or launcher whose `main.py` anchors only inside its own namespace), and
+  `panel_restart_comfyui` routes through it too. Local targets only; remote/cloud targets keep
+  the Manager-reboot path. The restart verifies the instance came back healthy and reports the
+  cycle as confirmed only when the down→up was actually observed.
+</ParamField>
 
 ## Remote behind a reverse proxy / API gateway
 

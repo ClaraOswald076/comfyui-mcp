@@ -47,6 +47,16 @@ icon: "gear"
   (원격/클라우드 모드에서는 억제). 로컬 전용 도구에 필요합니다 (노드 설치/관리, 모델
   삭제, 로그 읽기, 출력 파일 나열).
 </ParamField>
+<ParamField path="COMFYUI_RESTART_COMMAND" type="string">
+  **외부에서 관리되는** ComfyUI를 재시작하는 셸 명령 — 예: `docker restart comfyui`
+  또는 `systemctl --user restart comfyui`. 설정하면 `restart_comfyui`가
+  kill+relaunch 대신 이 명령을 실행합니다 (kill+relaunch는 설치의 실행 경로를
+  해석할 수 있어야 하는데, 컨테이너나 런처에서는 `main.py`가 자체 네임스페이스
+  안에서만 앵커되므로 불가능합니다). `panel_restart_comfyui`도 이 명령을
+  사용합니다. 로컬 타깃에만 적용되며, 원격/클라우드 타깃은 기존 Manager 재부팅
+  경로를 유지합니다. 재시작은 인스턴스가 정상으로 돌아왔는지 검증하고, down→up을
+  실제로 관찰한 경우에만 confirmed로 보고합니다.
+</ParamField>
 
 ## 리버스 프록시 / API 게이트웨이 뒤의 원격
 

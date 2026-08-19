@@ -46,6 +46,14 @@ CLI 标志完成。ComfyUI 目标的优先级：
   本地 ComfyUI 安装的绝对路径。未设置时从常见位置自动检测（远程 / 云端模式下被抑制）。
   仅本地工具需要它（安装 / 管理节点、删除模型、读日志、列出输出文件）。
 </ParamField>
+<ParamField path="COMFYUI_RESTART_COMMAND" type="string">
+  用于重启**外部托管** ComfyUI 的 shell 命令 — 例如 `docker restart comfyui` 或
+  `systemctl --user restart comfyui`。设置后，`restart_comfyui` 会运行该命令而不是
+  kill+relaunch（后者要求能解析安装目录的启动路径 — 对于容器或启动器来说不可能，
+  因为它们的 `main.py` 只在自己的命名空间内可定位），`panel_restart_comfyui`
+  也同样经由该命令。仅对本地目标生效；远程 / 云端目标仍走 Manager 重启路径。
+  重启会验证实例恢复健康，只有实际观测到 down→up 时才报告为 confirmed。
+</ParamField>
 
 ## 反向代理 / API 网关后面的远程实例
 
