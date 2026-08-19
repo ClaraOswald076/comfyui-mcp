@@ -5446,7 +5446,32 @@ async function rebindWorkflowFence(
   // "already current" requires a KNOWN prior fence equal to the live uuid. An
   // UNKNOWN prior fence must not short-circuit the adoption: we would be claiming
   // the stamp already matched without ever having read it.
-  if (before.known && before.uuid === uuid) return { status: "already_current", uuid, before };
+  if (before.known && before.uuid === uuid) {
+    // #1656 — THE FENCE DOES NOT MOVE HERE, BUT THE EVIDENCE DOES.
+    //
+    // Reaching this line means the panel's own corroborated workflow_list says the
+    // LIVE canvas is this very instance. If the routed tab's stamp was one CARRIED
+    // onto a new tab id by a same-socket re-hello that could not resolve an identity,
+    // that carried value has now been confirmed by an observation of the tab under its
+    // CURRENT id — so the dispatch-time agreement gate must stop treating it as
+    // inherited. Without this, a rename/save whose hello merely RACED the canvas
+    // identity would leave the session refusing edits to a canvas the panel agrees is
+    // the right one: the fix would be worse than the bug.
+    //
+    // This is NOT the retarget #1646 removed. The value written is `uuid`, which this
+    // branch has just established EQUALS the fence already in force, so no target
+    // changes and no later edit is re-aimed — only the provenance of an identical
+    // value is promoted from inherited to observed. It goes through the orchestrator's
+    // validator (reachability + the origin-bound uuid shape), never off parsed prose,
+    // and a refusal or a throw is swallowed: this is corroboration, and a diagnostic
+    // must never replace the outcome it is describing.
+    try {
+      refreshWorkflowUuid(ctx, active);
+    } catch {
+      /* corroboration only — the verdict below is unchanged either way */
+    }
+    return { status: "already_current", uuid, before };
+  }
   // #1646 — a READ-ONLY probe never moves the fence: the live canvas naming a
   // DIFFERENT workflow is reported, not adopted. Only a deliberate rebind
   // (panel_set_workflow_target, open/new) may replace the fence — a mismatch
