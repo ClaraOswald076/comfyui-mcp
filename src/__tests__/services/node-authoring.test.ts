@@ -275,14 +275,23 @@ describe("scaffoldCustomNode", () => {
     expect(mkdirs).toContain(packDir);
   });
 
-  it("a configured base still wins over the threaded live base (#1653)", () => {
-    const { deps } = makeDeps();
+  it("the threaded live-aware base is authoritative, even over COMFYUI_PATH (#1715)", () => {
+    // The handler threads the FULLY-resolved base from
+    // resolveEffectiveComfyUIBaseLive, which prefers the running runtime's
+    // --base-directory over configuration — that is where the server actually
+    // scans custom_nodes/ from. Re-preferring configuration here would
+    // resurrect the Desktop split-root bug: scaffold writes under the code
+    // install root, the runtime loads from its base directory, and verify
+    // reports the class missing.
+    const { deps, mkdirs } = makeDeps();
     const res = scaffoldCustomNode(
       { name: "my-nodes", displayName: "My Nodes" },
       deps,
-      "/live/ComfyUI",
+      "/live/base-dir",
     );
-    expect(res.path).toBe(resolve(CUSTOM_NODES, "my-nodes"));
+    const packDir = resolve(join("/live/base-dir", "custom_nodes"), "my-nodes");
+    expect(res.path).toBe(packDir);
+    expect(mkdirs).toContain(packDir);
   });
 });
 

@@ -289,11 +289,15 @@ describe("node_pack actions call the same services with the same arguments", () 
 
   it('action:"list_files" maps max_entries → maxEntries', async () => {
     await handler()({ action: "list_files", pack: "MyPack", glob: "**/*.py", max_entries: 10 });
-    expect(mocks.listNodePackFiles).toHaveBeenCalledWith({
-      pack: "MyPack",
-      glob: "**/*.py",
-      maxEntries: 10,
-    });
+    expect(mocks.listNodePackFiles).toHaveBeenCalledWith(
+      {
+        pack: "MyPack",
+        glob: "**/*.py",
+        maxEntries: 10,
+      },
+      undefined,
+      undefined,
+    );
   });
 
   it('action:"read" maps start_line/line_count/max_chars', async () => {
@@ -304,12 +308,16 @@ describe("node_pack actions call the same services with the same arguments", () 
       line_count: 50,
       max_chars: 3000,
     });
-    expect(mocks.readNodeFile).toHaveBeenCalledWith({
-      path: "MyPack/nodes.py",
-      startLine: 20,
-      lineCount: 50,
-      maxChars: 3000,
-    });
+    expect(mocks.readNodeFile).toHaveBeenCalledWith(
+      {
+        path: "MyPack/nodes.py",
+        startLine: 20,
+        lineCount: 50,
+        maxChars: 3000,
+      },
+      undefined,
+      undefined,
+    );
   });
 
   it('action:"search" maps max_results/case_sensitive and reuses `path` as the search root', async () => {
@@ -321,13 +329,17 @@ describe("node_pack actions call the same services with the same arguments", () 
       max_results: 7,
       case_sensitive: true,
     });
-    expect(mocks.searchNodePacks).toHaveBeenCalledWith({
-      query: "class Foo",
-      path: "MyPack",
-      glob: "**/*.py",
-      maxResults: 7,
-      caseSensitive: true,
-    });
+    expect(mocks.searchNodePacks).toHaveBeenCalledWith(
+      {
+        query: "class Foo",
+        path: "MyPack",
+        glob: "**/*.py",
+        maxResults: 7,
+        caseSensitive: true,
+      },
+      undefined,
+      undefined,
+    );
   });
 
   it('action:"write" maps create_dirs → createDirs', async () => {
@@ -338,17 +350,25 @@ describe("node_pack actions call the same services with the same arguments", () 
       overwrite: true,
       create_dirs: false,
     });
-    expect(mocks.writeNodeFile).toHaveBeenCalledWith({
-      path: "MyPack/nodes.py",
-      content: "x = 1\n",
-      overwrite: true,
-      createDirs: false,
-    });
+    expect(mocks.writeNodeFile).toHaveBeenCalledWith(
+      {
+        path: "MyPack/nodes.py",
+        content: "x = 1\n",
+        overwrite: true,
+        createDirs: false,
+      },
+      undefined,
+      undefined,
+    );
   });
 
   it('action:"patch" passes the diff POSITIONALLY, as the retired tool did', async () => {
     await handler()({ action: "patch", patch: "--- a/MyPack/x.py\n+++ b/MyPack/x.py\n" });
-    expect(mocks.applyNodePatch).toHaveBeenCalledWith("--- a/MyPack/x.py\n+++ b/MyPack/x.py\n");
+    expect(mocks.applyNodePatch).toHaveBeenCalledWith(
+      "--- a/MyPack/x.py\n+++ b/MyPack/x.py\n",
+      undefined,
+      undefined,
+    );
   });
 
   it('action:"git" hands `git_action` to the service under its original `action` key', async () => {
@@ -360,13 +380,17 @@ describe("node_pack actions call the same services with the same arguments", () 
       paths: ["MyPack/x.py"],
       max_chars: 5000,
     });
-    expect(mocks.nodePackGit).toHaveBeenCalledWith({
-      pack: "MyPack",
-      action: "commit",
-      message: "fix: thing",
-      paths: ["MyPack/x.py"],
-      maxChars: 5000,
-    });
+    expect(mocks.nodePackGit).toHaveBeenCalledWith(
+      {
+        pack: "MyPack",
+        action: "commit",
+        message: "fix: thing",
+        paths: ["MyPack/x.py"],
+        maxChars: 5000,
+      },
+      undefined,
+      undefined,
+    );
   });
 
   it("turns a service throw into an isError result rather than crashing", async () => {
@@ -412,6 +436,50 @@ describe("node_pack adopts the trusted live workspace (#1653)", () => {
       { name: undefined, path: "/abs/packs/my-pack" },
       undefined,
       undefined,
+    );
+  });
+
+  it('threads the SAME live-resolved base to verify and every file-touching action (#1715)', async () => {
+    // The Desktop split-root failure: scaffold wrote under the code install
+    // root while the runtime loaded from its --base-directory. Authoring AND
+    // verification must share one resolution, so every action receives the
+    // resolver's answer — here the runtime-reported base directory.
+    mocks.resolveEffectiveComfyUIBaseLive.mockResolvedValue("/live/base-dir");
+    await handler()({ action: "verify", name: "MyPack" });
+    expect(mocks.verifyCustomNode).toHaveBeenCalledWith(
+      expect.objectContaining({ resolvedBase: "/live/base-dir" }),
+    );
+    await handler()({ action: "list_files", pack: "MyPack" });
+    expect(mocks.listNodePackFiles).toHaveBeenCalledWith(
+      expect.anything(),
+      undefined,
+      "/live/base-dir",
+    );
+    await handler()({ action: "read", path: "MyPack/x.py" });
+    expect(mocks.readNodeFile).toHaveBeenCalledWith(
+      expect.anything(),
+      undefined,
+      "/live/base-dir",
+    );
+    await handler()({ action: "search", query: "q" });
+    expect(mocks.searchNodePacks).toHaveBeenCalledWith(
+      expect.anything(),
+      undefined,
+      "/live/base-dir",
+    );
+    await handler()({ action: "write", path: "MyPack/x.py", content: "c" });
+    expect(mocks.writeNodeFile).toHaveBeenCalledWith(
+      expect.anything(),
+      undefined,
+      "/live/base-dir",
+    );
+    await handler()({ action: "patch", patch: "d" });
+    expect(mocks.applyNodePatch).toHaveBeenCalledWith("d", undefined, "/live/base-dir");
+    await handler()({ action: "git", pack: "MyPack", git_action: "status" });
+    expect(mocks.nodePackGit).toHaveBeenCalledWith(
+      expect.anything(),
+      undefined,
+      "/live/base-dir",
     );
   });
 });
@@ -463,22 +531,36 @@ describe("node_pack guards on absence, never falsiness", () => {
     const res = await handler()({ action: "write", path: "MyPack/__init__.py", content: "" });
     expect(mocks.writeNodeFile).toHaveBeenCalledWith(
       expect.objectContaining({ path: "MyPack/__init__.py", content: "" }),
+      undefined,
+      undefined,
     );
     expect(text(res)).not.toContain("requires `content`");
   });
 
   it("empty strings still reach the service for pack/path/query/patch", async () => {
     await handler()({ action: "list_files", pack: "" });
-    expect(mocks.listNodePackFiles).toHaveBeenCalledWith(expect.objectContaining({ pack: "" }));
+    expect(mocks.listNodePackFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ pack: "" }),
+      undefined,
+      undefined,
+    );
 
     await handler()({ action: "read", path: "" });
-    expect(mocks.readNodeFile).toHaveBeenCalledWith(expect.objectContaining({ path: "" }));
+    expect(mocks.readNodeFile).toHaveBeenCalledWith(
+      expect.objectContaining({ path: "" }),
+      undefined,
+      undefined,
+    );
 
     await handler()({ action: "search", query: "" });
-    expect(mocks.searchNodePacks).toHaveBeenCalledWith(expect.objectContaining({ query: "" }));
+    expect(mocks.searchNodePacks).toHaveBeenCalledWith(
+      expect.objectContaining({ query: "" }),
+      undefined,
+      undefined,
+    );
 
     await handler()({ action: "patch", patch: "" });
-    expect(mocks.applyNodePatch).toHaveBeenCalledWith("");
+    expect(mocks.applyNodePatch).toHaveBeenCalledWith("", undefined, undefined);
 
     await handler()({ action: "scaffold", name: "", display_name: "" });
     expect(mocks.scaffoldCustomNode).toHaveBeenCalledWith(
@@ -492,6 +574,8 @@ describe("node_pack guards on absence, never falsiness", () => {
     await handler()({ action: "read", path: "MyPack/x.py", start_line: 0, max_chars: 0 });
     expect(mocks.readNodeFile).toHaveBeenCalledWith(
       expect.objectContaining({ startLine: 0, maxChars: 0 }),
+      undefined,
+      undefined,
     );
   });
 });

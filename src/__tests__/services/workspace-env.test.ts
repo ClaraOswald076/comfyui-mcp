@@ -1492,10 +1492,12 @@ describe("resolveLiveComfyUIBase (#490 / #463 — live connected install root)",
 });
 
 describe("resolveEffectiveComfyUIBaseLive (#1653 — configuration first, live server fills the gap)", () => {
-  it("returns the configured base without probing the live server", async () => {
+  it("returns the configured base when the live server reports no --base-directory", async () => {
     mockConfig.comfyuiPath = IS_WIN ? "C:\\cfg\\ComfyUI" : "/cfg/ComfyUI";
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: [IS_WIN ? "C:\\live\\main.py" : "/live/main.py", "--listen"] },
+    });
     expect(await resolveEffectiveComfyUIBaseLive()).toBe(mockConfig.comfyuiPath);
-    expect(mockGetSystemStats).not.toHaveBeenCalled();
   });
 
   it("adopts the live server's own root when nothing is configured and it looks like an install", async () => {
@@ -1534,6 +1536,78 @@ describe("resolveEffectiveComfyUIBaseLive (#1653 — configuration first, live s
   it("returns undefined (never throws) when the server is unreachable", async () => {
     mockGetSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
     await expect(resolveEffectiveComfyUIBaseLive()).resolves.toBeUndefined();
+  });
+
+  it("#1715: the live server's --base-directory wins, even over a configured install root", async () => {
+    // The ComfyUI Desktop shape: main.py runs from the code install tree while
+    // --base-directory points at the user-data dir the runtime ACTUALLY scans
+    // custom_nodes/ from. A pack written under the install root (the
+    // configured base here) is invisible to that runtime — the exact split-root
+    // failure of #1715. Same precedence the download path applies (#346).
+    const baseDir = await tmpDir();
+    try {
+      mockConfig.comfyuiPath = IS_WIN ? "C:\\cfg\\ComfyUI" : "/cfg/ComfyUI";
+      mockGetSystemStats.mockResolvedValue({
+        system: {
+          argv: [
+            IS_WIN ? "C:\\install\\ComfyUI\\main.py" : "/install/ComfyUI/main.py",
+            "--base-directory",
+            baseDir,
+          ],
+        },
+      });
+      expect(await resolveEffectiveComfyUIBaseLive()).toBe(baseDir);
+    } finally {
+      await rm(baseDir, { recursive: true, force: true });
+    }
+  });
+
+  it("#1715: a --base-directory that does not exist on disk is not adopted", async () => {
+    // The flag is the server's claim; the disk check keeps a stale or relocated
+    // report from becoming a write target — configuration fills in instead.
+    mockConfig.comfyuiPath = IS_WIN ? "C:\\cfg\\ComfyUI" : "/cfg/ComfyUI";
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: [
+          IS_WIN ? "C:\\install\\main.py" : "/install/main.py",
+          "--base-directory",
+          IS_WIN ? "C:\\gone\\base" : "/gone/base",
+        ],
+      },
+    });
+    expect(await resolveEffectiveComfyUIBaseLive()).toBe(mockConfig.comfyuiPath);
+  });
+
+  it("#1715: a relative --base-directory resolves against the server-reported cwd", async () => {
+    const cwd = await tmpDir();
+    try {
+      await mkdir(join(cwd, "data"), { recursive: true });
+      mockGetSystemStats.mockResolvedValue({
+        system: {
+          argv: ["python", "main.py", "--base-directory", "data"],
+          cwd,
+        },
+      });
+      expect(await resolveEffectiveComfyUIBaseLive()).toBe(join(cwd, "data"));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("#1715: an UNRESOLVABLE relative --base-directory fails closed — the main.py root is not adopted", async () => {
+    // Every root derivable here names a DIFFERENT tree than the one being
+    // served, so adopting the install root would be a confidently WRONG answer
+    // (hasUnresolvableRelativeBaseDirFlag's contract), not a harmless fallback.
+    const root = await tmpDir();
+    try {
+      await mkdir(join(root, "custom_nodes"), { recursive: true });
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: ["python", "main.py", "--base-directory", "data"] },
+      });
+      expect(await resolveEffectiveComfyUIBaseLive()).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 
