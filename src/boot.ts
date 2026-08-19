@@ -392,7 +392,7 @@ async function main() {
     }
     try {
       if (cli.launcherAction === "install") {
-        installPanelLauncher();
+        await installPanelLauncher();
         process.stdout.write(
           `\n${tr("cli.launcher_installed", "✓ ComfyUI MCP panel launcher installed for this user.")}\n` +
             `  ${tr("cli.launcher_installed_note", "MCP itself still starts only when the Agent panel asks for it.")}\n\n`,
