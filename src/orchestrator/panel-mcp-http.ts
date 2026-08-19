@@ -24,6 +24,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { UiBridge } from "../services/ui-bridge.js";
 import type { WorkflowTargetStore } from "../services/workflow-target-store.js";
 import { makePanelToolCtx, registerPanelTools } from "./panel-tools.js";
+import { PANEL_HANDSHAKE_INSTRUCTIONS } from "../handshake-instructions.js";
 import { logger } from "../utils/logger.js";
 
 /** A live MCP session: one McpServer + its streamable-HTTP transport, bound to a
@@ -94,7 +95,12 @@ export function startPanelMcpHttpServer(
   let boundPort = port;
 
   const newSession = async (tabId: string): Promise<Session> => {
-    const server = new McpServer({ name: "comfyui-panel", version: "1.0.0" });
+    const server = new McpServer(
+      { name: "comfyui-panel", version: "1.0.0" },
+      // #1747 — live-canvas flows only. Different audience from the stdio
+      // server; do not recap that catalog here.
+      { instructions: PANEL_HANDSHAKE_INSTRUCTIONS },
+    );
     // Tab-bound context: every tool forwards to the bridge for THIS tab — the
     // same surface the Claude in-process server exposes (shared defs).
     registerPanelTools(server, makePanelToolCtx(bridge, tabId, workflowTargets));

@@ -22,6 +22,7 @@ import { adoptOrphanedDownloadJobs } from "./services/download-jobs.js";
 import { checkAndSelfUpdate } from "./services/self-update.js";
 import { tr } from "./i18n/index.js";
 import { banner, labelRows, numberedSteps } from "./i18n/terminal-layout.js";
+import { STDIO_HANDSHAKE_INSTRUCTIONS } from "./handshake-instructions.js";
 
 /**
  * Fire-and-forget: ensure the ComfyUI sidebar panel is installed (install-if-
@@ -187,6 +188,11 @@ async function createConfiguredServer(toolMode: ToolMode = "compact"): Promise<M
         resources: {},
         prompts: {},
       },
+      // #1747 — cross-cutting flows (call order, async handles, pre-flight,
+      // trust posture). Tool schemas stay on the tools. Compact mode cannot
+      // see the catalog until it asks, so this is the only place those flows
+      // exist at connect.
+      instructions: STDIO_HANDSHAKE_INSTRUCTIONS,
     },
   );
   if (toolMode === "compact") {
