@@ -563,6 +563,126 @@ describe("OllamaBackend", () => {
     expect(events.filter((e) => e.type === "result")).toHaveLength(1);
   });
 
+  it("unwraps a router-self-nested panel_call_tool envelope instead of refusing the real call (#1297)", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel, callTool: panelCall } = fakeMcpClient([
+      { name: "panel_focus_node", description: "Focus a node in the canvas." },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              // the malformed shape from the issue: the model wrapped the real
+              // call in a second panel_call_tool envelope.
+              {
+                function: {
+                  name: "panel_call_tool",
+                  arguments: { name: "panel_call_tool", args: { name: "panel_focus_node", args: { node_id: 3 } } },
+                },
+              },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "focused." }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "focus node 3" }));
+    // the inner call ran exactly as spelled out — name and args unwrapped once
+    expect(panelCall).toHaveBeenCalledWith(
+      { name: "panel_focus_node", arguments: { node_id: 3 } },
+      undefined,
+      { timeout: PANEL_TOOL_MCP_TIMEOUT_MS },
+    );
+    const toolMsg = chatRequests[1].messages.find((m) => m.role === "tool");
+    const content = String(toolMsg?.content);
+    // the recovery is disclosed, and the correct shape is taught for next time
+    expect(content).toContain("Recovered a nested panel_call_tool envelope");
+    expect(content).toContain('panel_call_tool {"name": "panel_focus_node"');
+    expect(content).toContain("result-of-panel_focus_node");
+    expect(content).not.toContain("Unknown panel tool");
+  });
+
+  it("a router self-call WITHOUT a real nested panel tool is refused with the correct shape (#1297)", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel, callTool: panelCall } = fakeMcpClient([
+      { name: "panel_focus_node", description: "Focus a node in the canvas." },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              // nested envelope names a tool that does not exist — fail closed.
+              {
+                function: {
+                  name: "panel_call_tool",
+                  arguments: { name: "panel_call_tool", args: { name: "panel_nope" } },
+                },
+              },
+              // bare self-call with no envelope at all
+              { function: { name: "panel_call_tool", arguments: { name: "panel_list_tools" } } },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "sorry" }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "do the thing" }));
+    expect(panelCall).not.toHaveBeenCalled();
+    const toolMsgs = chatRequests[1].messages.filter((m) => m.role === "tool").map((m) => String(m.content));
+    expect(toolMsgs).toHaveLength(2);
+    for (const content of toolMsgs) {
+      expect(content).toContain("is this router itself, not a panel tool");
+      expect(content).toContain('panel_call_tool {"name": "<panel tool>", "args": {...}}');
+      expect(content).not.toContain("Unknown panel tool");
+    }
+  });
+
+  it("panel_call_tool without a name field says what is missing instead of 'Unknown panel tool '''", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    const { client: panel, callTool: panelCall } = fakeMcpClient([
+      { name: "panel_focus_node", description: "Focus a node in the canvas." },
+    ]);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ comfyui: comfy, panel }),
+    });
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [{ function: { name: "panel_call_tool", arguments: { args: { node_id: 3 } } } }],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "sorry" }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "focus node 3" }));
+    expect(panelCall).not.toHaveBeenCalled();
+    const toolMsg = chatRequests[1].messages.find((m) => m.role === "tool");
+    const content = String(toolMsg?.content);
+    expect(content).toContain('panel_call_tool requires a "name" field');
+    expect(content).toContain("panel_list_tools");
+  });
+
   it("the model sees exactly six tools", async () => {
     const { client: comfy } = fakeMcpClient(COMFY_META);
     const { client: panel } = fakeMcpClient([{ name: "panel_focus_node", description: "x" }]);
