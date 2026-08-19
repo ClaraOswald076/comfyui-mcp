@@ -170,6 +170,35 @@ describe("#1656 recurrence — a CARRIED stamp is not the routed tab's advertise
     sock.close();
   });
 
+  // THE BUG ITSELF, on the same code path. An uninstalled predicate is defined to mean
+  // "proven", which is precisely the pre-#1656 gate: it sees two equal uuids and calls
+  // that agreement. Same sockets, same carry, same commands — and every one of them
+  // reaches the panel, stamped with the PREVIOUS canvas's uuid. Six accepted mutations
+  // and a seventh refusal is what that looks like from the caller's side.
+  it("BASELINE (predicate absent = pre-#1656): the very same sequence DISPATCHES", async () => {
+    bridge.setCarriedTabStampPredicate(() => false);
+    advertised.set(TAB_UNSAVED, UUID_UNTITLED);
+    sessionStamp = advertised.get(TAB_UNSAVED);
+    const sock = await connectPanel(TAB_UNSAVED);
+    await waitFor(() => expect(bridge.tabs().map((t) => t.tab_id)).toContain(TAB_UNSAVED));
+    hello(sock, TAB_SAVED);
+    await waitFor(() => expect(bridge.tabs().map((t) => t.tab_id)).toContain(TAB_SAVED));
+    orchestratorHello(TAB_UNSAVED, TAB_SAVED, undefined);
+    received.length = 0;
+
+    for (const cmd of ["graph_connect", "graph_set_widget", "workflow_save"]) {
+      await expect(bridge.send({ cmd }, { tabId: SCOPE })).resolves.toEqual({ cmd });
+    }
+    expect(received.map((f) => f.cmd)).toEqual([
+      "graph_connect",
+      "graph_set_widget",
+      "workflow_save",
+    ]);
+    // …carrying the RETIRED tab's uuid as this command's target.
+    expect(received.every((f) => f.workflow_uuid === UUID_UNTITLED)).toBe(true);
+    sock.close();
+  });
+
   it("keeps the recovery probe and navigation dispatchable so the rebind is not circular", async () => {
     advertised.set(TAB_UNSAVED, UUID_UNTITLED);
     sessionStamp = advertised.get(TAB_UNSAVED);
