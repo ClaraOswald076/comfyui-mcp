@@ -2,13 +2,14 @@ import * as childProcess from "node:child_process";
 import { existsSync } from "node:fs";
 import { delimiter, dirname, extname, join } from "node:path";
 import { config, isRemoteMode } from "../config.js";
-import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
+import { resolveEffectiveComfyUICodeBase } from "./workspace-env.js";
 
 /**
  * The ComfyUI install a comfy-cli invocation TARGETS when the caller passed no explicit
- * `workspace`. That is the operation-target question, and `resolveEffectiveComfyUIBase`
- * is the only thing that answers it — including its refusal to name a local directory
- * when the session is pointed somewhere else.
+ * `workspace`. That is a CODE-root question: split installs can keep data under
+ * COMFYUI_PATH while the checkout/.venv/custom_nodes live under
+ * COMFYUI_CODE_PATH. `resolveEffectiveComfyUICodeBase` answers it while retaining
+ * the legacy effective-base behavior when no code override is configured.
  *
  * This used to read `config.comfyuiPath ?? resolveEffectiveComfyUIBase()`, which failed
  * twice over (#490): the resolver did not yet enforce the mode check this comment
@@ -26,7 +27,7 @@ import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
  * guess. Do not reintroduce a fallback here; a `??` at this seam is the bug.
  */
 function defaultWorkspace(): string | null {
-  return resolveEffectiveComfyUIBase() ?? null;
+  return resolveEffectiveComfyUICodeBase() ?? null;
 }
 
 export interface ComfyCliError {
@@ -414,7 +415,8 @@ function requireExecutable(options: ComfyCliRunOptions): string {
   if (!executable) {
     throw new Error(
       "comfy-cli was not found. Install comfy-cli>=1.11.1 and ensure `comfy` is on PATH, " +
-        "set COMFY_CLI_PATH, or install it in the selected ComfyUI workspace's .venv.",
+        "set COMFY_CLI_PATH, or install it in the selected ComfyUI code workspace's .venv " +
+        "(COMFYUI_CODE_PATH for split installs).",
     );
   }
   return executable;

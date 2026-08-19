@@ -15,7 +15,7 @@ import { resetManagerApiCache } from "../services/manager-api-cache.js";
 import { errorToToolResult } from "../utils/errors.js";
 
 const whereSchema = z.enum(["local", "cloud"]).optional();
-const workspaceSchema = z.string().optional().describe("Optional ComfyUI workspace override. Otherwise COMFYUI_PATH/auto-detection is used.");
+const workspaceSchema = z.string().optional().describe("Optional ComfyUI workspace override. Otherwise COMFYUI_CODE_PATH, then COMFYUI_PATH/auto-detection is used.");
 
 function textEnvelope(envelope: unknown) {
   const failed = typeof envelope === "object" && envelope !== null && "ok" in envelope && envelope.ok === false;

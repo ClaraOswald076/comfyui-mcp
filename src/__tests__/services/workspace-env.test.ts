@@ -26,7 +26,11 @@ const h = vi.hoisted(() => {
   // which is the default and must always degrade to unknown.
   const mockLiveInterpreter = vi.fn(() => undefined as unknown);
   return {
-    mockConfig: { comfyuiPath: undefined as string | undefined, resolvedPort: 8188 },
+    mockConfig: {
+      comfyuiPath: undefined as string | undefined,
+      comfyuiCodePath: undefined as string | undefined,
+      resolvedPort: 8188,
+    },
     mockGetSystemStats: vi.fn(),
     remoteMode: { value: false },
     mockLiveInterpreter,
@@ -100,6 +104,8 @@ import {
   resolveComfyuiPython,
   resolveEffectiveComfyUIBase,
   resolveEffectiveComfyUIBaseLive,
+  resolveEffectiveComfyUICodeBase,
+  resolveEffectiveComfyUICodeBaseLive,
   resolveLocalWorkspaceBase,
   resolveInstallInterpreter,
   resolveLiveComfyUIBase,
@@ -114,6 +120,7 @@ async function tmpDir(): Promise<string> {
 
 beforeEach(() => {
   mockConfig.comfyuiPath = undefined;
+  mockConfig.comfyuiCodePath = undefined;
   mockConfig.resolvedPort = 8188;
   h.remoteMode.value = false;
   h.mockLiveInterpreter.mockReset();
@@ -128,6 +135,7 @@ beforeEach(() => {
   setExecFileResponder(() => new Error("not configured"));
   resetWorkspaceConfig();
   delete process.env.COMFYUI_PATH;
+  delete process.env.COMFYUI_CODE_PATH;
 });
 
 afterEach(() => {
@@ -663,7 +671,82 @@ describe("resolveEffectiveComfyUIBase vs resolveLocalWorkspaceBase (#490)", () =
   });
 });
 
+describe("split code-root resolution", () => {
+  it("preserves the effective COMFYUI_PATH base when no code override is set", () => {
+    mockConfig.comfyuiPath = "/data-and-code";
+    expect(resolveEffectiveComfyUICodeBase()).toBe("/data-and-code");
+  });
+
+  it("uses COMFYUI_CODE_PATH for synchronous code-facing tools", () => {
+    mockConfig.comfyuiPath = "/data";
+    mockConfig.comfyuiCodePath = "/code";
+    expect(resolveEffectiveComfyUICodeBase()).toBe("/code");
+  });
+
+  it("refuses every local code root in remote mode", async () => {
+    mockConfig.comfyuiPath = "/data";
+    mockConfig.comfyuiCodePath = "/code";
+    h.remoteMode.value = true;
+    expect(resolveEffectiveComfyUICodeBase()).toBeUndefined();
+    await expect(resolveEffectiveComfyUICodeBaseLive()).resolves.toBeUndefined();
+  });
+
+  it("prefers the reachable server's observed main.py root, then falls back to the explicit code root", async () => {
+    const root = await tmpDir();
+    try {
+      await writeFile(join(root, "main.py"), "", "utf-8");
+      mockConfig.comfyuiPath = "/data";
+      mockConfig.comfyuiCodePath = "/offline-code";
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: ["python", join(root, "main.py")] },
+      });
+      await expect(resolveEffectiveComfyUICodeBaseLive()).resolves.toBe(root);
+
+      mockGetSystemStats.mockRejectedValue(new Error("offline"));
+      await expect(resolveEffectiveComfyUICodeBaseLive()).resolves.toBe("/offline-code");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("getEnvironment", () => {
+  it("reports and probes split data and code roots independently", async () => {
+    const dir = await tmpDir();
+    const dataRoot = join(dir, "data");
+    const codeRoot = join(dir, "code");
+    try {
+      await mkdir(dataRoot, { recursive: true });
+      await mkdir(join(codeRoot, ".git"), { recursive: true });
+      await mkdir(join(codeRoot, "custom_nodes", "ComfyUI-Manager"), { recursive: true });
+      await writeFile(
+        join(codeRoot, "custom_nodes", "ComfyUI-Manager", "pyproject.toml"),
+        'version = "3.41"\n',
+        "utf-8",
+      );
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      mockConfig.comfyuiPath = dataRoot;
+      mockConfig.comfyuiCodePath = codeRoot;
+      mockGetSystemStats.mockRejectedValueOnce(new Error("offline"));
+      setExecFileResponder((cmd, args) => {
+        if (cmd === "git" && args.includes("--short")) return { stdout: "abc123\n" };
+        if (cmd === "git" && args.includes("--abbrev-ref")) return { stdout: "main\n" };
+        return new Error("not configured");
+      });
+
+      const env = await getEnvironment();
+
+      expect(env.local.workspace_path).toBe(dataRoot);
+      expect(env.local.code_path).toBe(codeRoot);
+      expect(env.local.code_path_source).toBe("env");
+      expect(env.local.git).toEqual({ rev: "abc123", branch: "main" });
+      expect(env.local.comfyui_manager_version).toBe("3.41");
+      expect(env.local.note).toMatch(/Split install/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("reports running instance from system_stats and degrades local probes when no path", async () => {
     const dir = await tmpDir();
     try {

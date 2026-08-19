@@ -11,6 +11,7 @@ const COMFY = "/fake/ComfyUI";
 
 const mockConfig = vi.hoisted(() => ({
   comfyuiPath: "/fake/ComfyUI" as string | undefined,
+  comfyuiCodePath: undefined as string | undefined,
   // Explicit remote override. When undefined, isRemoteMode mirrors the legacy
   // "no comfyuiPath" gate; set true to model a remote target that COEXISTS with
   // a local COMFYUI_PATH (the regression issue #1 guards against).
@@ -80,6 +81,9 @@ const resolveExistingModelFileMock = vi.hoisted(() => vi.fn());
 const listLocalModelsMock = vi.hoisted(() => vi.fn());
 const savedWorkspaceMock = vi.hoisted(() => vi.fn(() => undefined as string | undefined));
 const liveComfyBaseMock = vi.hoisted(() =>
+  vi.fn(async () => undefined as string | undefined),
+);
+const effectiveCodeBaseLiveMock = vi.hoisted(() =>
   vi.fn(async () => undefined as string | undefined),
 );
 // Overridable per-test: default mirrors a VERIFIED install-root interpreter (the
@@ -207,6 +211,8 @@ vi.mock("../../services/model-resolver.js", () => ({
 vi.mock("../../services/workspace-env.js", () => ({
   getSavedDefaultWorkspaceSync: (...a: unknown[]) => savedWorkspaceMock(...(a as [])),
   resolveLiveComfyUIBase: (...a: unknown[]) => liveComfyBaseMock(...(a as [])),
+  resolveEffectiveComfyUICodeBaseLive: (...a: unknown[]) =>
+    effectiveCodeBaseLiveMock(...(a as [])),
   // Mirrors the real resolver enough for the pip tests: an install-root python.
   resolveRootInterpreter: (root: string | undefined) =>
     root ? `${root}/python` : "python",
@@ -241,6 +247,7 @@ import {
 beforeEach(() => {
   clearManifestPartialLeftover();
   mockConfig.comfyuiPath = "/fake/ComfyUI";
+  mockConfig.comfyuiCodePath = undefined;
   mockConfig.remote = undefined;
   readFileMock.mockReset();
   statMock.mockReset().mockRejectedValue(new Error("missing"));
@@ -261,6 +268,9 @@ beforeEach(() => {
   listLocalModelsMock.mockReset().mockResolvedValue([]);
   savedWorkspaceMock.mockReset().mockReturnValue(undefined);
   liveComfyBaseMock.mockReset().mockResolvedValue(undefined);
+  effectiveCodeBaseLiveMock
+    .mockReset()
+    .mockImplementation(async () => mockConfig.comfyuiCodePath ?? mockConfig.comfyuiPath);
   installInterpreterMock.mockReset().mockImplementation(
     async (root: string | undefined) => ({
       python: root ? `${root}/python` : "python",
@@ -901,6 +911,37 @@ describe("applyManifest", () => {
       ["pip", "install", "--python", expect.stringMatching(/python/), "torch==2.4.0"],
       expect.objectContaining({ cwd: COMFY }),
     );
+  });
+
+  it("routes manifest pip and custom-node fallbacks to the serving code root", async () => {
+    const dataRoot = "/shared/ComfyUI-data";
+    const codeRoot = "/runtime/ComfyUI-code";
+    mockConfig.comfyuiPath = dataRoot;
+    mockConfig.comfyuiCodePath = codeRoot;
+    effectiveCodeBaseLiveMock.mockResolvedValue(codeRoot);
+    listInstalledNodesMock
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ module: "split-root-pack", enabled: true }]);
+
+    const result = await applyManifest({
+      manifest: {
+        pip: ["numpy"],
+        custom_nodes: ["split-root-pack"],
+      },
+    });
+
+    expect(result.summary).toEqual({ applied: 2, skipped: 0, failed: 0, pending: 0 });
+    expect(installInterpreterMock).toHaveBeenCalledWith(codeRoot);
+    expect(execFileSyncMock).toHaveBeenCalledWith(
+      "uv",
+      ["pip", "install", "--python", `${codeRoot}/python`, "numpy"],
+      expect.objectContaining({ cwd: codeRoot }),
+    );
+    expect(installCustomNodeMock).toHaveBeenCalledWith({
+      id: "split-root-pack",
+      comfyuiPath: codeRoot,
+    });
+    expect(installInterpreterMock).not.toHaveBeenCalledWith(dataRoot);
   });
 
   it("falls back to python -m pip when uv is unavailable", async () => {

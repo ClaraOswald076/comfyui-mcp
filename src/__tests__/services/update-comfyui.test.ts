@@ -20,6 +20,7 @@ process.env.COMFYUI_MCP_PANEL_PENDING = join(
 // Created with vi.hoisted so it exists before the hoisted vi.mock factory runs.
 const mockConfig = vi.hoisted(() => ({
   comfyuiPath: "/fake/ComfyUI" as string | undefined,
+  comfyuiCodePath: undefined as string | undefined,
   resolvedPort: 8188,
   comfyuiHost: "127.0.0.1",
   comfyuiSsl: false,
@@ -67,9 +68,11 @@ vi.mock("../../utils/logger.js", () => ({
 // The requirements install now resolves its interpreter through the shared
 // fail-closed live-interpreter resolver (#651) — stub it per-test.
 const mockResolveInstallInterpreter = vi.hoisted(() => vi.fn());
+const mockResolveCodeRoot = vi.hoisted(() => vi.fn());
 
 vi.mock("../../services/workspace-env.js", () => ({
   resolveInstallInterpreter: mockResolveInstallInterpreter,
+  resolveEffectiveComfyUICodeBaseLive: mockResolveCodeRoot,
 }));
 
 import { execFileSync } from "node:child_process";
@@ -172,6 +175,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.unstubAllGlobals();
   mockConfig.comfyuiPath = "/fake/ComfyUI";
+  mockConfig.comfyuiCodePath = undefined;
+  mockResolveCodeRoot.mockImplementation(
+    async () => mockConfig.comfyuiCodePath ?? mockConfig.comfyuiPath,
+  );
   // Default: the resolver has verified an interpreter; refusal tests override.
   mockResolveInstallInterpreter.mockResolvedValue({
     python: "/fake/ComfyUI/.venv/bin/python",
@@ -372,9 +379,30 @@ describe("updateComfyUICore", () => {
     expect(r.steps[0].command).toContain("git pull");
   });
 
+  it("runs core git and dependency work in the split code root, not the data root", async () => {
+    mockConfig.comfyuiPath = "/fake/data";
+    mockConfig.comfyuiCodePath = "/fake/code";
+    mockedExists.mockImplementation((p: string) => {
+      if (p === "/fake/code") return true;
+      if (p.endsWith("requirements.txt")) return false;
+      return false;
+    });
+    mockedExec.mockImplementation((file: string) => {
+      if (file === "uv" || file === "uv.exe") throw new Error("no uv");
+      return "ok";
+    });
+
+    const r = await updateComfyUICore();
+    expect(r.comfyui_path).toBe("/fake/code");
+    const pull = mockedExec.mock.calls.find(
+      (c) => c[0] === "git" && Array.isArray(c[1]) && c[1][0] === "pull",
+    );
+    expect(pull?.[2].cwd).toBe("/fake/code");
+  });
+
   it("throws a clear error when comfyuiPath is undefined (remote mode)", async () => {
     mockConfig.comfyuiPath = undefined;
-    await expect(updateComfyUICore()).rejects.toThrow(/no local install path/i);
+    await expect(updateComfyUICore()).rejects.toThrow(/no local code checkout/i);
     expect(mockedExec).not.toHaveBeenCalled();
   });
 

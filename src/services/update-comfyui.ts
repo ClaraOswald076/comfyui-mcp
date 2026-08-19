@@ -2,8 +2,10 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { platform } from "node:os";
-import { config } from "../config.js";
-import { resolveInstallInterpreter } from "./workspace-env.js";
+import {
+  resolveEffectiveComfyUICodeBaseLive,
+  resolveInstallInterpreter,
+} from "./workspace-env.js";
 import { queueUpdateAllCustomNodes } from "./node-management.js";
 import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -266,19 +268,19 @@ function detectPackageManager(comfyuiPath: string): "uv" | "pip" {
  * Resolve the ComfyUI install path or throw a clear error explaining that core
  * updates require a local install (not available in remote --comfyui-url mode).
  */
-function requireComfyUIPath(): string {
-  const path = config.comfyuiPath;
+async function requireComfyUICodePath(): Promise<string> {
+  const path = await resolveEffectiveComfyUICodeBaseLive();
   if (!path) {
     throw new ProcessControlError(
-      "Cannot update ComfyUI core: no local install path is configured. " +
+      "Cannot update ComfyUI core: no local code checkout could be resolved. " +
         "Core updates run git/pip against the ComfyUI directory and are not " +
         "available when targeting a remote instance via --comfyui-url / COMFYUI_URL. " +
-        "Set COMFYUI_PATH to the local ComfyUI checkout to enable this.",
+        "Set COMFYUI_CODE_PATH to the local checkout (or COMFYUI_PATH for a conventional install) to enable this.",
     );
   }
   if (!existsSync(path)) {
     throw new ProcessControlError(
-      `Configured ComfyUI path does not exist: ${path}. Set COMFYUI_PATH correctly.`,
+      `Resolved ComfyUI code path does not exist: ${path}. Set COMFYUI_CODE_PATH (or COMFYUI_PATH) correctly.`,
     );
   }
   return path;
@@ -289,11 +291,11 @@ function requireComfyUIPath(): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Update ComfyUI core: `git pull` in config.comfyuiPath, then reinstall its
- * Python requirements via uv or pip. Mirrors `comfy-cli update`.
+ * Update ComfyUI core: resolve the running/local checkout, `git pull` there,
+ * then reinstall its Python requirements via uv or pip. Mirrors `comfy-cli update`.
  */
 export async function updateComfyUICore(): Promise<UpdateCoreResult> {
-  const comfyuiPath = requireComfyUIPath();
+  const comfyuiPath = await requireComfyUICodePath();
   const pm = detectPackageManager(comfyuiPath);
   const steps: CommandResult[] = [];
 

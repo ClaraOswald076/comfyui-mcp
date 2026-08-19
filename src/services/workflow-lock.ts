@@ -13,16 +13,16 @@
 
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { getObjectInfo, getSystemStats } from "../comfyui/client.js";
 import type { ObjectInfo, WorkflowJSON } from "../comfyui/types.js";
-import { config } from "../config.js";
-import { ProcessControlError, ValidationError } from "../utils/errors.js";
+import { ModelError, ProcessControlError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
-import { MODEL_SUBDIRS } from "./model-resolver.js";
+import { MODEL_SUBDIRS, resolveExistingModelFile } from "./model-resolver.js";
+import { resolveEffectiveComfyUICodeBase } from "./workspace-env.js";
 import { isUiFormat, looksLikeAssetFilename } from "./workflow-converter.js";
 
 export interface LockedModel {
@@ -93,13 +93,14 @@ const KNOWN_LOADERS: Array<{
 ];
 
 
-function requireLocal(op: string): string {
-  if (!config.comfyuiPath) {
+async function requireLocalCodeRoot(op: string): Promise<string> {
+  const codeRoot = resolveEffectiveComfyUICodeBase();
+  if (!codeRoot) {
     throw new ProcessControlError(
-      `${op} requires a local ComfyUI install (COMFYUI_PATH). Lock generation needs to read model file bytes for SHA-256 and inspect custom_nodes/*/.git/HEAD.`,
+      `${op} requires a local ComfyUI code checkout. Lock generation needs to inspect custom_nodes/*/.git/HEAD; set COMFYUI_CODE_PATH for a split install (or COMFYUI_PATH for a conventional install).`,
     );
   }
-  return config.comfyuiPath;
+  return codeRoot;
 }
 
 /**
@@ -206,23 +207,23 @@ async function hashFile(filePath: string): Promise<string> {
 }
 
 async function findModelOnDisk(
-  comfyPath: string,
   modelType: string,
   filename: string,
 ): Promise<string | undefined> {
-  // Try the canonical subdir first; ComfyUI's extra_model_paths.yaml may add
-  // others, but those resolve at workflow-execution time and we don't have a
-  // good way to enumerate them without parsing the YAML.
+  // Use the shared model resolver so the primary data/models root and every
+  // active extra_model_paths root are searched independently of the checkout
+  // that owns custom_nodes. This is the split-root boundary workflow locks used
+  // to cross by assuming <code>/models.
   const subdirs = MODEL_SUBDIRS.includes(modelType as never)
     ? [modelType]
     : [modelType, ...MODEL_SUBDIRS];
   for (const subdir of subdirs) {
-    const candidate = join(comfyPath, "models", subdir, filename);
     try {
-      const info = await stat(candidate);
-      if (info.isFile()) return candidate;
-    } catch {
-      // Keep looking.
+      const resolved = await resolveExistingModelFile(join(subdir, filename));
+      if (resolved.info.isFile()) return resolved.path;
+    } catch (err) {
+      if (err instanceof ModelError) continue;
+      throw err;
     }
   }
   return undefined;
@@ -308,7 +309,7 @@ async function packsReferencedByWorkflow(
 }
 
 export async function generateLock(workflow: WorkflowJSON): Promise<WorkflowLock> {
-  const comfyPath = requireLocal("generateLock");
+  const codeRoot = await requireLocalCodeRoot("generateLock");
   const stats = (await getSystemStats()) as unknown as { system?: { comfyui_version?: string } };
   const comfyuiVersion = stats.system?.comfyui_version ?? "unknown";
 
@@ -320,7 +321,7 @@ export async function generateLock(workflow: WorkflowJSON): Promise<WorkflowLock
   const models = extractReferencedModels(workflow);
   const lockedModels: LockedModel[] = [];
   for (const m of models) {
-    const path = await findModelOnDisk(comfyPath, m.type, m.name);
+    const path = await findModelOnDisk(m.type, m.name);
     if (!path) {
       lockedModels.push({ ...m, missing: true });
       continue;
@@ -341,7 +342,7 @@ export async function generateLock(workflow: WorkflowJSON): Promise<WorkflowLock
   const packIds = await packsReferencedByWorkflow(workflow, origins);
   const lockedPacks: LockedNodePack[] = [];
   for (const id of packIds) {
-    const packPath = join(comfyPath, "custom_nodes", id);
+    const packPath = join(codeRoot, "custom_nodes", id);
     const commit = await readGitHeadCommit(packPath);
     lockedPacks.push(commit ? { id, commit_sha: commit } : { id });
   }

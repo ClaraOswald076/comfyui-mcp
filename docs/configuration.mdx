@@ -43,9 +43,18 @@ mix-and-match.
   Use `https`/`wss` instead of `http`/`ws`.
 </ParamField>
 <ParamField path="COMFYUI_PATH" type="string">
-  Absolute path to the local ComfyUI install. Auto-detected from common locations when unset
-  (suppressed in remote/cloud modes). Required by local-only tools (install/manage nodes, remove
-  models, read logs, list output files).
+  Absolute path to the local ComfyUI data/base directory. In a conventional install this is also
+  the code checkout. Auto-detected from common locations when unset (suppressed in remote/cloud
+  modes). Component-aware tools prefer the running server's explicit input/output/models paths.
+</ParamField>
+<ParamField path="COMFYUI_CODE_PATH" type="string" default="COMFYUI_PATH">
+  Optional code-checkout root for split installs where `main.py`, `.venv`, and `custom_nodes`
+  are separate from the data/model/user root. Comfy-cli node mutations, `apply_manifest`
+  pip/custom-node fallbacks, workflow-lock pack provenance, and legacy Manager snapshot layouts
+  use this checkout. Core updates prefer the checkout observed from the running local server and
+  use this as their fallback. Data-facing
+  tools remain rooted in their live component paths or `COMFYUI_PATH`. Ignored for local
+  filesystem mutation in remote mode.
 </ParamField>
 <ParamField path="COMFYUI_RESTART_COMMAND" type="string">
   Shell command that restarts an **externally managed** ComfyUI — e.g. `docker restart comfyui`

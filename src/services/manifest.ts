@@ -39,6 +39,7 @@ import { startDownloadJob, describePlacement, type DownloadJob } from "./downloa
 import { resolveModelsDir } from "./output-dir.js";
 import {
   getSavedDefaultWorkspaceSync,
+  resolveEffectiveComfyUICodeBaseLive,
   resolveInstallInterpreter,
   resolveLiveComfyUIBase,
   type InstallInterpreterResolution,
@@ -943,7 +944,7 @@ export async function applyManifest(
 ): Promise<ApplyManifestResult> {
   const manifest = await resolveManifest(opts);
 
-  // Resolve the LOCAL ComfyUI base this call should target, WITHOUT mutating the
+  // Resolve the LOCAL ComfyUI data base this call should target, WITHOUT mutating the
   // process-global config.comfyuiPath (a global temp-set would leak the path to
   // every concurrent tab/tool and could be clobbered by an interleaved restore —
   // #490/#463 codex review). We thread it explicitly to applyManifestSections
@@ -954,11 +955,24 @@ export async function applyManifest(
   //      (#463) — a panel-connected local session with no COMFYUI_PATH still has
   //      a real FS target, so models/pip aren't skipped as "no local filesystem".
   // The actual on-disk model DESTINATION is always re-derived live-first by the
-  // downloader (resolveModelsDir), so this base only governs the local-vs-remote
-  // classification + pip's interpreter, never where a model lands.
-  const localBase = await resolveLocalManifestBase();
+  // downloader (resolveModelsDir), so this base only governs data-filesystem
+  // availability, never where a model lands. Code-facing work is resolved
+  // independently below.
+  const localDataBase = await resolveLocalManifestBase();
+  // A split install can serve models/user/output from COMFYUI_PATH while its
+  // Python environment and custom_nodes checkout live elsewhere. Resolve that
+  // code root independently, once for this composite operation, so pip and the
+  // node install fallback cannot accidentally mutate the data-only tree. The
+  // live server's observed main.py root wins; COMFYUI_CODE_PATH and then the
+  // legacy data/workspace base are fallbacks in workspace-env.
+  const localCodeBase = isRemoteMode()
+    ? undefined
+    : (await resolveEffectiveComfyUICodeBaseLive()) ?? localDataBase;
 
-  return applyManifestSections(manifest, localBase, describeManifestSource(opts));
+  return applyManifestSections(manifest, {
+    dataBase: localDataBase,
+    codeBase: localCodeBase,
+  }, describeManifestSource(opts));
 }
 
 /**
@@ -992,23 +1006,27 @@ async function resolveLocalManifestBase(): Promise<string | undefined> {
 
 async function applyManifestSections(
   manifest: ComfyManifest,
-  localBase: string | undefined,
+  localRoots: {
+    dataBase: string | undefined;
+    codeBase: string | undefined;
+  },
   source: string,
 ): Promise<ApplyManifestResult> {
   const results: ManifestItemReport[] = [];
 
-  // Per-section mode handling. A LOCAL filesystem is usable only when we are NOT
-  // in remote (or cloud) mode AND a local base was resolved (COMFYUI_PATH, saved
-  // default, or the live connected server's own root — see resolveLocalManifestBase,
-  // threaded here as `localBase` WITHOUT any global config mutation). Otherwise we
-  // are targeting a remote/cloud ComfyUI over HTTP. Keying off isRemoteMode()
-  // (rather than mere base presence) matters because a remote target can coexist
-  // with an unrelated COMFYUI_PATH on this machine — in that case we must still
-  // route pip/model handling remotely instead of touching the local install/disk.
+  // Per-section mode handling. Data and code filesystem availability are
+  // independent: COMFYUI_PATH can name shared models/user/output while
+  // COMFYUI_CODE_PATH (or the live main.py root) names .venv/custom_nodes.
+  // Neither local path is usable in remote mode. Keying off isRemoteMode()
+  // (rather than mere path presence) matters because a remote target can coexist
+  // with unrelated local paths on this machine — in that case we must still
+  // route pip/model handling remotely instead of touching either local tree.
   // custom_nodes and models can still be handled remotely through ComfyUI-Manager's
   // HTTP API, but pip/apt have no remote equivalent.
-  const comfyuiPath = localBase;
-  const hasLocalFs = !isRemoteMode() && Boolean(comfyuiPath);
+  const { dataBase, codeBase } = localRoots;
+  const localMode = !isRemoteMode();
+  const hasLocalDataFs = localMode && Boolean(dataBase);
+  const hasLocalCodeFs = localMode && Boolean(codeBase);
 
   for (const pkg of manifest.apt) {
     results.push(
@@ -1016,7 +1034,7 @@ async function applyManifestSections(
         "apt",
         pkg,
         "skipped",
-        hasLocalFs
+        hasLocalDataFs || hasLocalCodeFs
           ? "System packages must be installed manually or with root privileges; apply_manifest does not run apt."
           : "System packages are not supported against a remote ComfyUI (no local shell/root access); install them on the ComfyUI host.",
       ),
@@ -1024,19 +1042,21 @@ async function applyManifestSections(
   }
 
   for (const pkg of manifest.pip) {
-    if (!hasLocalFs) {
+    if (!hasLocalCodeFs) {
       results.push(
         report(
           "pip",
           pkg,
           "skipped",
-          "Python package install is not supported against a remote ComfyUI (no local filesystem/venv); install it on the ComfyUI host.",
+          localMode
+            ? "Python package install needs a local ComfyUI code root/venv. Set COMFYUI_CODE_PATH (or COMFYUI_PATH for a single-root install)."
+            : "Python package install is not supported against a remote ComfyUI (no local filesystem/venv); install it on the ComfyUI host.",
         ),
       );
       continue;
     }
     try {
-      const resolved = await installPipPackage(pkg, comfyuiPath!);
+      const resolved = await installPipPackage(pkg, codeBase!);
       results.push(report("pip", pkg, "applied", `Python package installed. ${resolved.reason}`));
     } catch (err) {
       results.push(
@@ -1108,10 +1128,14 @@ async function applyManifestSections(
 
     // Never REJECTS: fold success/failure into a tagged value so the un-awaited
     // promise (when the deadline wins) can't surface as an unhandled rejection.
-    // Thread the call-scoped local base (no global config mutation) so the
+    // Thread the call-scoped code base (no global config mutation) so the
     // git-clone / ref-checkout fallback works for an adopted saved-default/live
-    // workspace when COMFYUI_PATH is unset (#463).
-    const installOutcome = installCustomNode({ id, comfyuiPath: localBase })
+    // workspace when COMFYUI_PATH is unset (#463), and for split installs where
+    // COMFYUI_PATH is a data root rather than the serving checkout.
+    const installOutcome = installCustomNode({
+      id,
+      ...(codeBase ? { comfyuiPath: codeBase } : {}),
+    })
       .then((res) => ({ kind: "settled" as const, res }))
       .catch((err) => ({ kind: "error" as const, err }));
     const outcome = await raceDeadline(installOutcome, nodeDeadline);
@@ -1187,7 +1211,7 @@ async function applyManifestSections(
   for (const model of manifest.models) {
     const item = model.local_path ?? model.filename ?? model.url;
     try {
-      if (!hasLocalFs) {
+      if (!hasLocalDataFs) {
         // REMOTE: no local filesystem to scan/write. Route the download to the
         // ComfyUI host via ComfyUI-Manager's install-model task (server-side
         // fetch, returns at handoff). Cloud mode has no Manager, so report it as

@@ -52,6 +52,13 @@ verdade — defina `COMFYUI_PATH` explicitamente se quiser misturar.
   não definido (suprimido nos modos remoto/cloud). Exigido pelas ferramentas só locais
   (instalar/gerenciar nós, remover modelos, ler logs, listar arquivos de saída).
 </ParamField>
+<ParamField path="COMFYUI_CODE_PATH" type="string" default="COMFYUI_PATH">
+  Raiz opcional do checkout de código para instalações separadas, em que `main.py`,
+  `.venv` e `custom_nodes` ficam longe dos dados e modelos. Mutações do comfy-cli,
+  procedência de locks e snapshots legados do Manager usam este caminho; atualizações
+  do núcleo preferem o checkout observado do servidor local. Ignorado para mutações
+  do sistema de arquivos em modo remoto.
+</ParamField>
 <ParamField path="COMFYUI_RESTART_COMMAND" type="string">
   Comando de shell que reinicia um ComfyUI **gerenciado externamente** — ex.
   `docker restart comfyui` ou `systemctl --user restart comfyui`. Quando

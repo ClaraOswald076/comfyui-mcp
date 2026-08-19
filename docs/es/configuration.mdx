@@ -59,6 +59,13 @@ mezclar.
   remoto/nube). La exigen las herramientas solo locales (instalar/gestionar
   nodos, eliminar modelos, leer registros, listar archivos de salida).
 </ParamField>
+<ParamField path="COMFYUI_CODE_PATH" type="string" default="COMFYUI_PATH">
+  Raíz opcional del checkout de código para instalaciones divididas, donde `main.py`,
+  `.venv` y `custom_nodes` están separados de los datos y modelos. La usan las
+  mutaciones de comfy-cli, la procedencia de locks y los snapshots heredados de Manager;
+  las actualizaciones del núcleo prefieren el checkout observado del servidor local.
+  Se ignora para mutaciones del sistema de archivos en modo remoto.
+</ParamField>
 <ParamField path="COMFYUI_RESTART_COMMAND" type="string">
   Comando de shell que reinicia un ComfyUI **gestionado externamente** — p. ej.
   `docker restart comfyui` o `systemctl --user restart comfyui`. Cuando está

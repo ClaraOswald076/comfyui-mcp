@@ -53,6 +53,13 @@ ayarlayın.
   gerektirir (düğüm kur/yönet, modelleri kaldır, günlükleri oku, çıktı
   dosyalarını listele).
 </ParamField>
+<ParamField path="COMFYUI_CODE_PATH" type="string" default="COMFYUI_PATH">
+  `main.py`, `.venv` ve `custom_nodes` dizinlerinin veri ve modellerden ayrı olduğu
+  bölünmüş kurulumlar için isteğe bağlı kod checkout köküdür. comfy-cli değişiklikleri,
+  workflow lock paket kaynağı ve eski Manager snapshot düzeni bu yolu kullanır; çekirdek
+  güncellemeleri yerel sunucuda gözlenen checkout'u tercih eder. Uzak kipte yerel dosya
+  sistemi değişiklikleri için yok sayılır.
+</ParamField>
 <ParamField path="COMFYUI_RESTART_COMMAND" type="string">
   **Harici yönetilen** bir ComfyUI'yi yeniden başlatan kabuk komutu — örn.
   `docker restart comfyui` veya `systemctl --user restart comfyui`. Ayarlıyken

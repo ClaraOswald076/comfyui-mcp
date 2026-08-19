@@ -12,12 +12,14 @@ import {
 vi.mock("../../config.js", () => {
   const config: {
     comfyuiPath: string | undefined;
+    comfyuiCodePath: string | undefined;
     resolvedPort: number;
     comfyuiHost: string;
     comfyuiSsl: boolean;
     githubToken: string | undefined;
   } = {
     comfyuiPath: "/fake/comfy",
+    comfyuiCodePath: undefined,
     resolvedPort: 8188,
     comfyuiHost: "127.0.0.1",
     comfyuiSsl: false,
@@ -64,6 +66,8 @@ vi.mock("../../services/workspace-env.js", async () => {
     // Mirror the real resolution order (COMFYUI_PATH, then the saved default);
     // the remote-mode gate is applied separately by callers via isRemoteMode.
     resolveEffectiveComfyUIBase: () => config.comfyuiPath ?? savedDefault.value,
+    resolveEffectiveComfyUICodeBase: () =>
+      config.comfyuiCodePath ?? config.comfyuiPath ?? savedDefault.value,
   };
 });
 
@@ -286,6 +290,7 @@ describe("node-management service", () => {
     fsCtl.readFileSync = undefined;
     savedDefault.value = undefined;
     config.comfyuiPath = "/fake/comfy";
+    config.comfyuiCodePath = undefined;
     config.githubToken = undefined;
     remoteFlags.forceRemote = false;
     remoteFlags.remoteMode = false;
@@ -1260,6 +1265,30 @@ describe("node-management service", () => {
         "abc123",
       ]);
     });
+
+    it("routes forced cm-cli and its git checkout through COMFYUI_CODE_PATH in a split install", async () => {
+      config.comfyuiPath = "/split/data";
+      config.comfyuiCodePath = "/split/code";
+      mockedExec.mockReturnValue(cliEnvelope({ message: "installed ok" }) as never);
+
+      const res = await installCustomNode({
+        id: "https://github.com/foo/bar",
+        ref: "abc123",
+        useCmCli: true,
+      });
+
+      expect(res.mechanism).toBe("comfy-cli");
+      expect(mockedExec.mock.calls[0][1]).toContain("/split/code");
+      expect(mockedExec.mock.calls[0][1]).not.toContain("/split/data");
+      expect(mockedExec.mock.calls[2][1]).toEqual([
+        "-C",
+        resolve("/split/code", "custom_nodes", "bar"),
+        "checkout",
+        "--detach",
+        "--end-of-options",
+        "abc123",
+      ]);
+    });
   });
 
   // ---- update ------------------------------------------------------------
@@ -1491,12 +1520,16 @@ describe("node-management service", () => {
     });
 
     it("routes 'all' to the cm-cli subprocess", async () => {
+      config.comfyuiPath = "/split/data";
+      config.comfyuiCodePath = "/split/code";
       mockedExec.mockReturnValue(cliEnvelope({ message: "fixed all" }) as never);
       const res = await fixCustomNode({ id: "all" });
       expect(res.mechanism).toBe("comfy-cli");
       const [, args] = mockedExec.mock.calls[0];
       expect(args).toContain("fix");
       expect(args).toContain("all");
+      expect(args).toContain("/split/code");
+      expect(args).not.toContain("/split/data");
     });
   });
 

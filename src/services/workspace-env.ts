@@ -160,6 +160,41 @@ export function resolveEffectiveComfyUIBase(): string | undefined {
 }
 
 /**
+ * The checkout/code root for synchronous code-facing operations.
+ *
+ * Split deployments may keep input/output/user/models under COMFYUI_PATH while
+ * running main.py, .venv and custom_nodes from a separate checkout. An explicit
+ * COMFYUI_CODE_PATH names that checkout. When it is absent, this intentionally
+ * preserves the historical COMFYUI_PATH/default-workspace behavior.
+ */
+export function resolveEffectiveComfyUICodeBase(): string | undefined {
+  if (isRemoteMode()) return undefined;
+  return config.comfyuiCodePath ?? resolveEffectiveComfyUIBase();
+}
+
+/**
+ * Live-aware code-root resolver for asynchronous filesystem operations.
+ *
+ * A reachable local server's observed main.py root is strongest evidence of
+ * the checkout actually serving this session. COMFYUI_CODE_PATH is the
+ * explicit offline/unresolvable fallback, followed by the legacy effective
+ * base for backward compatibility. No directory-layout guessing is performed.
+ */
+export async function resolveEffectiveComfyUICodeBaseLive(): Promise<string | undefined> {
+  if (isRemoteMode()) return undefined;
+
+  const snapshot = await getLiveServerSnapshot();
+  if (snapshot.reachable) {
+    const live = resolveLiveServerRoot(snapshot.argv, snapshot.cwd, { remote: false });
+    if (live.root && existsSync(live.root) && hasMainPy(live.root)) {
+      return live.root;
+    }
+  }
+
+  return config.comfyuiCodePath ?? resolveEffectiveComfyUIBase();
+}
+
+/**
  * The ASYNC, live-aware variant of `resolveEffectiveComfyUIBase` (#1653, #1715).
  *
  * The sync resolver answers from CONFIGURATION alone (COMFYUI_PATH, then the
@@ -1515,7 +1550,12 @@ export interface EnvironmentInfo {
   };
   // Local workspace probes (omitted/degraded when no local path)
   local: {
+    /** Data/base workspace (models, input/output and user state in a split install). */
     workspace_path?: string;
+    /** Checkout used for main.py, .venv and custom_nodes. Equal to workspace_path
+     *  for conventional installs. */
+    code_path?: string;
+    code_path_source?: "live-server" | "env" | "workspace";
     python?: { executable: string; version: string };
     /** Whether the probed python is trusted to be the running ComfyUI's own
      *  interpreter. False when a bare PATH python was used or its version
@@ -1594,6 +1634,7 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
   const local: EnvironmentInfo["local"] = {};
   const cfg = await readWorkspaceConfig();
   const workspacePath = config.comfyuiPath ?? cfg.defaultWorkspace;
+  const configuredCodePath = config.comfyuiCodePath ?? workspacePath;
 
   // LIVE-FIRST interpreter resolution — identical to resolveComfyuiPython used by
   // the panel env block, so the two paths can never disagree (#401 / PR #433). The
@@ -1615,7 +1656,7 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
     remote,
     serverArgv: statsArgv,
   });
-  const resolved = resolveComfyuiPython(workspacePath, statsArgv, {
+  const resolved = resolveComfyuiPython(configuredCodePath, statsArgv, {
     cwd: statsCwd,
     remote,
     // Orders the GUESS only (used when there is no ground truth to show instead).
@@ -1625,7 +1666,13 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
   // The install root we can actually inspect on disk: an explicit/saved workspace,
   // else the live server's own root (so we still report git/manager for a live
   // server even when no workspace path is configured).
-  const localRoot = workspacePath ?? resolved.liveRoot;
+  const codeRoot = remote
+    ? undefined
+    : resolved.liveRoot ?? config.comfyuiCodePath ?? workspacePath;
+  // Preserve the existing remote diagnostic shape: an argv-derived root may be
+  // shown as an explicitly untrusted reference even though it can never become
+  // a local mutation/code root in remote mode.
+  const localRoot = workspacePath ?? resolved.liveRoot ?? codeRoot;
   if (!localRoot) {
     local.note =
       "No local ComfyUI path configured (COMFYUI_PATH unset, none auto-detected, " +
@@ -1635,8 +1682,24 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
   }
 
   local.workspace_path = localRoot;
+  if (codeRoot) {
+    local.code_path = codeRoot;
+    local.code_path_source = resolved.liveRoot
+      ? "live-server"
+      : config.comfyuiCodePath
+        ? "env"
+        : "workspace";
+  }
   if (!config.comfyuiPath && cfg.defaultWorkspace) {
     local.note = `Using saved default workspace "${cfg.defaultWorkspace}" (COMFYUI_PATH not set).`;
+  }
+  if (codeRoot && codeRoot !== localRoot) {
+    local.note = [
+      local.note,
+      `Split install: data/base workspace is "${localRoot}"; code checkout is "${codeRoot}" (${local.code_path_source}).`,
+    ]
+      .filter(Boolean)
+      .join(" ");
   }
 
   // GROUND TRUTH first: the interpreter we LAUNCHED ComfyUI with, or the one the OS
@@ -1806,10 +1869,11 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
       .join(" ");
   }
 
-  const git = await probeGitRev(localRoot);
+  const codeProbeRoot = codeRoot ?? localRoot;
+  const git = await probeGitRev(codeProbeRoot);
   if (git) local.git = git;
 
-  const managerVersion = await readManagerVersion(localRoot);
+  const managerVersion = await readManagerVersion(codeProbeRoot);
   if (managerVersion) local.comfyui_manager_version = managerVersion;
 
   return { running_instance: running, local };

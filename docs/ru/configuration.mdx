@@ -48,6 +48,13 @@ icon: "gear"
   (подавляется в удалённом/облачном режимах). Нужен инструментам только для локального режима (установка/управление узлами, удаление
   моделей, чтение логов, список выходных файлов).
 </ParamField>
+<ParamField path="COMFYUI_CODE_PATH" type="string" default="COMFYUI_PATH">
+  Необязательный корень checkout кода для раздельных установок, где `main.py`,
+  `.venv` и `custom_nodes` находятся отдельно от данных и моделей. Этот путь используют
+  изменения comfy-cli, происхождение пакетов в lock-файлах и старые snapshots Manager;
+  обновление ядра предпочитает checkout, обнаруженный у локального сервера. Для локальных
+  изменений файлов в удалённом режиме путь игнорируется.
+</ParamField>
 <ParamField path="COMFYUI_RESTART_COMMAND" type="string">
   Shell-команда, перезапускающая **внешне управляемый** ComfyUI — например,
   `docker restart comfyui` или `systemctl --user restart comfyui`. Если задана,
