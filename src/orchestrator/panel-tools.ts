@@ -828,6 +828,46 @@ function sleep(ms: number): Promise<void> {
 // frozen/backgrounded tab fails in bounded time instead of hanging forever.
 const OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS = 30_000;
 
+// #1639 — while a ComfyUI prompt is running the frontend main thread often
+// cannot service graph_* at all (reads included). Waiting out the 20/30 s ack
+// bound only surfaces "tab may be backgrounded or frozen" with an unknown
+// mutation outcome. Fail closed BEFORE dispatch for canvas-touching graph
+// commands so the agent gets an explicit QUEUE BUSY instead. `graph_run` is
+// excluded: queuing behind an in-flight job is the documented sweep path, and
+// panel_run already has its own duplicate fence.
+function queueBusySnapshotNote(): string {
+  const snap = QueueMonitor.snapshot();
+  if (!snap.running) return "";
+  const prompt = snap.runningPromptId ? ` (running prompt ${snap.runningPromptId}` : "";
+  const node = snap.currentNode ? `, currently at node ${snap.currentNode}` : "";
+  const close = snap.runningPromptId ? ")" : "";
+  return `${prompt}${node}${close}`;
+}
+
+function graphCmdBlockedByRunningPrompt(cmd: Record<string, unknown>): string | null {
+  const name = typeof cmd.cmd === "string" ? cmd.cmd : "";
+  if (!name.startsWith("graph_") || name === "graph_run") return null;
+  const snap = QueueMonitor.snapshot();
+  if (!snap.running) return null;
+  return (
+    `${name} was NOT sent — nothing was applied. QUEUE BUSY: a ComfyUI prompt is running` +
+    `${queueBusySnapshotNote()}. The panel tab typically cannot answer graph_* commands ` +
+    `(including read-only graph_query / graph_outline) while a prompt is executing — ` +
+    `waiting out the ack timeout would only surface a generic "tab may be backgrounded ` +
+    `or frozen" with an unknown outcome. Retry after queue (action:"list") shows running: 0.`
+  );
+}
+
+function queueBusyTimeoutNote(): string {
+  if (!QueueMonitor.snapshot().running) return "";
+  return (
+    `\n\nQUEUE BUSY: a ComfyUI prompt is still running${queueBusySnapshotNote()}. ` +
+    `The panel tab typically cannot answer graph_* (including read-only queries) while a ` +
+    `prompt is executing — this is not a backgrounded or frozen tab. Retry after queue ` +
+    `(action:"list") shows running: 0.`
+  );
+}
+
 const RETRY_SAFE_CMDS = new Set<string>([
   // Idempotent reads (mirror UiBridge.READONLY_CMDS + list/status probes).
   "graph_serialize",
@@ -4112,7 +4152,75 @@ export function readOpenActiveAgainstTarget(
  * FAILS — the content warning is preserved verbatim, because "re-read before editing"
  * is still the right instruction — and nothing is adopted on the UNPROVEN verdict,
  * where identity itself is in doubt.
+ *
+ * #1639 — IDENTITY CLAIM IS NOT CONTENT. The #1337 re-derivation assumed that
+ * "the canvas IS bound to X" meant later graph reads would show X. A later session
+ * showed the opposite: workflow_list / this verdict named B, FENCE: CLEARED, and
+ * both panel_graph_outline and panel_query_graph then returned the PREVIOUS
+ * workflow as ordinary successes. Clearing the fence on an identity claim is what
+ * turns a wrong-graph read into a trusted one. So this path now probes the live
+ * graph UNDER THE EXISTING FENCE first:
+ *   - the read SUCCEEDS → the canvas still answers as the previous workflow.
+ *     Do not re-derive. Contradict "you are on the right workflow".
+ *   - the read is refused with `workflow instance mismatch` → the canvas identity
+ *     actually moved. That is the #1337 wedge; re-derive as before.
+ *   - the read does not come back → content is unverified. Do not re-derive.
  */
+type LiveGraphUnderFence =
+  | { status: "answered" }
+  | { status: "mismatch_refused" }
+  | { status: "unanswered"; detail: string };
+
+async function probeLiveGraphUnderCurrentFence(ctx: PanelToolCtx): Promise<LiveGraphUnderFence> {
+  // `fields:"ids", limit:1` is the cheapest shape that still has to pass the
+  // instance fence — we only need whether the canvas STILL ACCEPTS this session's
+  // stamp, not the graph itself.
+  let res: ToolResult;
+  try {
+    res = await ctx.call({ cmd: "graph_query", fields: "ids", limit: 1 }, 8000);
+  } catch (err) {
+    if (isWorkflowInstanceMismatch(err)) return { status: "mismatch_refused" };
+    return { status: "unanswered", detail: err instanceof Error ? err.message : String(err) };
+  }
+  if (!res?.isError) return { status: "answered" };
+  const text = toolResultText(res);
+  if (isWorkflowInstanceMismatch(text)) return { status: "mismatch_refused" };
+  // An acked executor error still means the fence passed — the canvas is the
+  // one this session was already bound to.
+  if (isPanelAnsweredResult(res)) return { status: "answered" };
+  return { status: "unanswered", detail: text };
+}
+
+function identityClaimedContentUnverifiedNote(detail: string): string {
+  const busy = queueBusyTimeoutNote();
+  return (
+    `\n\nFENCE: NOT cleared (live graph unread). The panel asserted the canvas IS bound to the ` +
+    `requested workflow, but a live graph read did not come back (${detail || "no reason was reported"}), ` +
+    `so content is UNVERIFIED. Identity-matched is not content-matched: do NOT trust ` +
+    `"you are on the right workflow" / "You are NOT on the wrong workflow". Do NOT edit or save ` +
+    `expecting the opened file. Retry the graph read (panel_graph_outline) once the tab answers.` +
+    busy
+  );
+}
+
+function identityClaimedButLiveGraphUnchangedNote(ctx: PanelToolCtx): string {
+  const fence = currentWorkflowFence(ctx);
+  const fenceTxt =
+    fence.known && fence.uuid
+      ? `under this session's existing fence (${fence.uuid})`
+      : `without being refused by a workflow-instance fence`;
+  return (
+    `\n\nFENCE: NOT cleared (live graph still answers). CONTENT MISMATCH: the panel asserted the ` +
+    `canvas IS bound to the requested workflow, but a live graph read still answers ${fenceTxt} — ` +
+    `the graph on screen is the PREVIOUS workflow, not the one just opened. That is the failure ` +
+    `the fence exists to prevent: clearing it here would let later reads of this graph succeed ` +
+    `as if they were the opened file. Do NOT trust "you are on the right workflow" / ` +
+    `"You are NOT on the wrong workflow". Do NOT edit or save expecting the opened file. ` +
+    `Read the graph (panel_graph_outline) to see what is actually open, then retry ` +
+    `panel_open_workflow or panel_load_workflow if the canvas did not switch.`
+  );
+}
+
 async function clearFenceOnIdentityProvenOpen(
   ctx: PanelToolCtx,
   res: ToolResult,
@@ -4122,6 +4230,14 @@ async function clearFenceOnIdentityProvenOpen(
   // prove that the active canvas was rebound") must keep failing closed: re-deriving a
   // fence onto a canvas we cannot identify is how an edit lands on the wrong graph.
   if (!/the canvas IS bound to/i.test(text)) return { res, repaired: false };
+
+  const canvas = await probeLiveGraphUnderCurrentFence(ctx);
+  if (canvas.status === "answered") {
+    return { res: appendToolResultText(res, identityClaimedButLiveGraphUnchangedNote(ctx)), repaired: false };
+  }
+  if (canvas.status === "unanswered") {
+    return { res: appendToolResultText(res, identityClaimedContentUnverifiedNote(canvas.detail)), repaired: false };
+  }
 
   let note: string;
   // #1560 — reported STRUCTURALLY, never re-read out of the sentence below. The caller
@@ -7432,6 +7548,11 @@ export function makePanelToolCtx(
         await awaitReachable();
       }
       ensureReachable();
+      // #1639 — a running prompt freezes the tab's graph_* channel. Refuse
+      // BEFORE dispatch so a mutation is known-not-applied rather than
+      // delivered-into-a-frozen-tab with a 20/30s unknown-outcome timeout.
+      const blocked = graphCmdBlockedByRunningPrompt(cmd);
+      if (blocked) return fail(blocked);
       const firstTry = ok(await sendRouted(cmd, timeoutMs, observeRid));
       // panel#1097 — a guard-domain command that SUCCEEDS is the evidence that the
       // switch is over, whichever attempt lands it. Without this an ordinary
@@ -7534,7 +7655,7 @@ export function makePanelToolCtx(
           // Leaving it unmarked fails closed (nothing is settled, no false success)
           // but silently switches the settle off for a real sequence, which is the
           // kind of gap that reads as "the fix does not work" much later.
-          return carryReplyTimeoutMark(err2, fail(err2));
+          return carryReplyTimeoutMark(err2, fail(`${err2 instanceof Error ? err2.message : String(err2)}${queueBusyTimeoutNote()}`));
         }
       }
       // #442 defect 4: a MUTATING command (deliberately excluded from RETRY_SAFE_CMDS)
@@ -7969,11 +8090,13 @@ export function makePanelToolCtx(
         return carryReplyTimeoutMark(
           err,
           fail(
-            `${cause}\n\nTo retry this exact mutation, re-issue identical args plus retry_of:"${dispatchedRid}"; otherwise call normally.`,
+            `${cause}\n\nTo retry this exact mutation, re-issue identical args plus retry_of:"${dispatchedRid}"; otherwise call normally.` +
+              queueBusyTimeoutNote(),
           ),
         );
       }
-      return carryReplyTimeoutMark(err, fail(err));
+      const timeoutCause = err instanceof Error ? err.message : String(err);
+      return carryReplyTimeoutMark(err, fail(`${timeoutCause}${queueBusyTimeoutNote()}`));
     }
   };
   /**
