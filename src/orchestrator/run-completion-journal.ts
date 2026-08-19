@@ -1015,6 +1015,44 @@ export class RunCompletionJournalImpl {
     return [...this.entries.values()].filter((e) => e.key === key);
   }
 
+  /**
+   * #1789 — is this run STILL owed the completion `panel_run` promised it?
+   *
+   * `openRun` succeeding only proves we could RECOGNISE a completion if one
+   * arrived; it never proved one WOULD. The panel's `agent_event` frame is the
+   * sole producer, so every way that frame can be lost (a missed
+   * `execution_success` the panel's own reconcile also missed, a muted/blinded
+   * feed, a send the socket accepted and the bridge dropped, a panel unmounted
+   * mid-render) ends with an open ticket that nothing will ever answer — and
+   * NOTHING in this process could tell that state apart from "still rendering".
+   * This predicate is what makes it nameable, so the orchestrator's own
+   * /history observation can fill in (see run-completion-watchdog.ts).
+   *
+   * Deliberately conservative — it answers "no completion for this run has been
+   * seen AT ALL", never "delivery is late":
+   *  • no ticket, or a ticket whose ack already settled it ⇒ not owed;
+   *  • ANY journaled entry naming this prompt id (pending OR handed off) ⇒ not
+   *    owed: a completion did arrive and the journal's own replay owns it from
+   *    there;
+   *  • an already-acked (tab, run, generation) memo ⇒ not owed, which covers the
+   *    window where the entry has been deleted but the ticket outlives it.
+   * A `reused` id is NOT owed either: it stands for more than one run, so a
+   * synthesised completion for it could not honestly name which one finished.
+   */
+  awaitingCompletion(promptId: string): RunTicket | undefined {
+    const ticket = this.tickets.get(promptId);
+    if (!ticket || ticket.settled || ticket.reused) return undefined;
+    for (const entry of this.entries.values()) {
+      if (entry.correlation.status !== "unidentified" && entry.correlation.promptId === promptId) {
+        return undefined;
+      }
+    }
+    if (this.delivered.has(deliveredKey(this.ownerOf(ticket), promptId, ticket.seq))) {
+      return undefined;
+    }
+    return ticket;
+  }
+
   /** Is ANY completion still undelivered anywhere? The orchestrator's
    *  self-restart gate reads this: the journal is in-memory, so restarting while
    *  an entry is outstanding would silently drop a render result the agent was

@@ -206,6 +206,7 @@ import {
   describe as describeCorrelation,
   type CompletionPayload,
 } from "./run-completion-journal.js";
+import { createRunCompletionWatchdog } from "./run-completion-watchdog.js";
 import { AskAnswers, preview as previewQuestion } from "./ask-answer-journal.js";
 import { initRunpodWatcher, getRunpodWatcher, type RunpodStatusFrame, type RunpodAlertFrame } from "../services/runpod-watch.js";
 import { getPod } from "../services/runpod-client.js";
@@ -6193,10 +6194,48 @@ export async function runPanelOrchestrator(): Promise<void> {
   // `queue_status` frame at most once per second, and ONLY when the state
   // changed, so an idle rig costs the tabs nothing (see
   // services/queue-status-broadcast.ts for the frame shape + throttle contract).
+  // #1789 — KEEP THE PROMISE panel_run MAKES, or find out that we didn't.
+  //
+  // `panel_run` tells the agent "you WILL be notified … end your turn now and
+  // wait". The only producer of that notification is the panel's `executed`
+  // frame; when it never arrives, the run ticket stays open forever and NOTHING
+  // in this process can tell that apart from a render still in flight. The
+  // reported session sat idle after a clean 28.77 s run until a human intervened.
+  //
+  // QueueMonitor already observes EVERY completion on the monitored ComfyUI —
+  // on the broadcast WS execution events OR its 1 Hz `/history` tail diff, both
+  // funnelling through one recordCompletion (#258/#259) — and that
+  // observation went only to the `queue_status` UI broadcast. This watchdog is
+  // the join: an observed completion whose panel_run ticket is still unanswered
+  // after the grace is synthesised into the SAME journal the real frame uses.
+  // See run-completion-watchdog.ts for why it waits, and why the panel's frame
+  // still wins whenever it is coming.
+  const runCompletionWatchdog = createRunCompletionWatchdog({
+    awaiting: (promptId) => RunCompletions.awaitingCompletion(promptId),
+    deliver: (payload, ticket) => {
+      // The SAME arrival path the panel's frame takes: correlated once, here,
+      // against the ticket that is still open — so the agent is told this is the
+      // run IT queued, and the journal's replay/ack durability covers it too.
+      const entry = RunCompletions.record(ticket.tabId, payload, {
+        ...(ticket.conversation !== undefined ? { conversation: ticket.conversation } : {}),
+      });
+      logger.info(
+        `[panel-orchestrator] tab ${ticket.tabId.slice(0, 8)} synthesised run completion for ${describeCorrelation(entry.correlation)} (the panel never reported it — #1789)`,
+      );
+      flushRunCompletions(ticket.tabId);
+    },
+  });
   const queueStatusBroadcaster = createQueueStatusBroadcaster(
     () => QueueMonitor.snapshot(),
     (frame) => void bridge.push(frame),
-    () => QueueMonitor.drainCompletions(),
+    // TEE, not a second drain: drainCompletions() splices, so the watchdog has
+    // to read the same array the broadcaster is handed rather than call it
+    // again — a second call would race and each consumer would see only half.
+    () => {
+      const completions = QueueMonitor.drainCompletions();
+      runCompletionWatchdog.observe(completions);
+      return completions;
+    },
   );
   // Each tick first refreshes the monitor over HTTP (GET /queue + /history
   // tail): on modern ComfyUI (0.28+) the passive watchdog WS carries no
@@ -6204,7 +6243,13 @@ export async function runPanelOrchestrator(): Promise<void> {
   // restores run attribution (#258) and catches runs shorter than the tick
   // (#259). poll() never rejects and self-guards against overlap.
   const queueStatusTimer = setInterval(() => {
-    void QueueMonitor.poll().finally(() => queueStatusBroadcaster.tick());
+    void QueueMonitor.poll().finally(() => {
+      queueStatusBroadcaster.tick();
+      // …and only THEN expire the watchdog's arms: the broadcaster tick is what
+      // feeds it (the drain tee above), so ticking it first would let an
+      // observation sit a whole extra second before it is even armed. #1789.
+      runCompletionWatchdog.tick();
+    });
   }, 1000);
   queueStatusTimer.unref?.();
 
