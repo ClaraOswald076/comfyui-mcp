@@ -70,6 +70,22 @@ Comfy-Org repackages everything: `huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repac
 | Qwen-Image-Edit 2511 Lightning LoRA | `huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning` | `loras/` |
 | Qwen-Image 2512 Turbo LoRA | `huggingface.co/Wuli-art/Qwen-Image-2512-Turbo-LoRA` | `loras/` |
 
+## MiniMax H3 video (see `minimax-h3-video` skill)
+
+Comfy-Org INT8 pack: `huggingface.co/Comfy-Org/MiniMax-H3`. Local weights are
+under the MiniMax H3 Community License (territory-restricted). Prefer the
+filenames the Comfy-Org templates already name.
+
+| File | Source | Target |
+|---|---|---|
+| `minimax_h3_fl2va_pruned_int8_convrot.safetensors` | `huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors` | `diffusion_models/` |
+| `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | same repo, `diffusion_models/` | `diffusion_models/` |
+| `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | same repo, `text_encoders/` | `text_encoders/` |
+| `minimax_h3_video_vae_fp16.safetensors` | same repo, `vae/` | `vae/` |
+| `minimax_h3_audio_vae_fp32.safetensors` | same repo, `vae/` | `vae/` |
+| `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors` | `huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/main/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors` | `loras/` |
+| `minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors` | `huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors` | `loras/` |
+
 ## Z-Image (see `z-image-txt2img` skill)
 
 | File | Source | Target |
