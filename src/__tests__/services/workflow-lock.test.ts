@@ -3,8 +3,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+const cfg = vi.hoisted(() => ({
+  comfyuiPath: undefined as string | undefined,
+  comfyuiCodePath: undefined as string | undefined,
+  remote: false,
+}));
 vi.mock("../../config.js", () => ({
-  config: { comfyuiPath: undefined as string | undefined },
+  config: cfg,
+  isRemoteMode: () => cfg.remote,
+  isCloudMode: () => false,
 }));
 
 const getObjectInfo = vi.fn();
@@ -24,6 +31,8 @@ let tempDir: string;
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), "workflow-lock-test-"));
   config.comfyuiPath = tempDir;
+  config.comfyuiCodePath = undefined;
+  cfg.remote = false;
   getObjectInfo.mockReset();
   getSystemStats.mockReset();
   getSystemStats.mockResolvedValue({
@@ -39,6 +48,41 @@ afterEach(async () => {
 describe("generateLock", () => {
   it("throws when COMFYUI_PATH is not configured", async () => {
     config.comfyuiPath = undefined;
+    await expect(generateLock({} as never)).rejects.toThrow(/local ComfyUI install/);
+  });
+
+  it("hashes models and pack commits from the data/base root even when a code checkout is set", async () => {
+    const codeRoot = join(tempDir, "separate-code-root");
+    config.comfyuiCodePath = codeRoot;
+    await mkdir(join(tempDir, "models", "checkpoints"), { recursive: true });
+    await writeFile(
+      join(tempDir, "models", "checkpoints", "split.safetensors"),
+      "split-model-bytes",
+    );
+    await mkdir(join(tempDir, "custom_nodes", "SplitPack", ".git"), { recursive: true });
+    await writeFile(
+      join(tempDir, "custom_nodes", "SplitPack", ".git", "HEAD"),
+      "cafebabe00000000000000000000000000000000\n",
+    );
+    getObjectInfo.mockResolvedValue({
+      CheckpointLoaderSimple: { python_module: "nodes" },
+      SplitNode: { python_module: "custom_nodes.SplitPack.nodes" },
+    });
+
+    const lock = await generateLock({
+      "1": { class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: "split.safetensors" } },
+      "2": { class_type: "SplitNode", inputs: {} },
+    } as never);
+
+    expect(lock.models[0]?.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(lock.node_packs).toEqual([
+      { id: "SplitPack", commit_sha: "cafebabe00000000000000000000000000000000" },
+    ]);
+  });
+
+  it("refuses local lock reads in remote mode even when split roots are configured", async () => {
+    cfg.remote = true;
+    config.comfyuiCodePath = join(tempDir, "code");
     await expect(generateLock({} as never)).rejects.toThrow(/local ComfyUI install/);
   });
 

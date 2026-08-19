@@ -19,6 +19,7 @@ describe("config mode detection", () => {
     process.env.COMFYUI_API_KEY = "";
     process.env.COMFYUI_URL = "";
     process.env.COMFYUI_PATH = "";
+    process.env.COMFYUI_CODE_PATH = "";
     process.env.COMFYUI_HOST = "";
     process.env.COMFYUI_PORT = "8188";
     process.env.COMFYUI_MCP_FORCE_REMOTE = "";
@@ -96,6 +97,14 @@ describe("config mode detection", () => {
     expect(mod.config.comfyuiPath).toBe("/explicit/local/comfy");
   });
 
+  it("normalizes an explicit COMFYUI_CODE_PATH independently of the data root", async () => {
+    process.env.COMFYUI_PATH = "/explicit/data";
+    process.env.COMFYUI_CODE_PATH = "  /explicit/code  ";
+    const mod = await import("../config.js");
+    expect(mod.config.comfyuiPath).toBe("/explicit/data");
+    expect(mod.config.comfyuiCodePath).toBe("/explicit/code");
+  });
+
   it("getApiKey() throws when not configured (local mode)", async () => {
     process.env.COMFYUI_PORT = "8188";
     const mod = await import("../config.js");
@@ -130,6 +139,7 @@ describe("remote self-hosted: path prefix + generic auth (#52)", () => {
     process.env.COMFYUI_API_KEY = "";
     process.env.COMFYUI_URL = "";
     process.env.COMFYUI_PATH = "";
+    process.env.COMFYUI_CODE_PATH = "";
     process.env.COMFYUI_HOST = "";
     process.env.COMFYUI_PORT = "8188";
     process.env.COMFYUI_AUTH_HEADER = "";
@@ -245,6 +255,7 @@ describe("COMFYUI_PATH nested/wrapper self-heal (doubled-path bug)", () => {
     process.env.COMFYUI_API_KEY = "";
     process.env.COMFYUI_URL = "";
     process.env.COMFYUI_PATH = "";
+    process.env.COMFYUI_CODE_PATH = "";
     process.env.COMFYUI_HOST = "";
     process.env.COMFYUI_PORT = "8188"; // skip port auto-detect
   });
@@ -321,6 +332,7 @@ describe("getLocalComfyuiUrl (#269 LAN fallback)", () => {
     process.env.COMFYUI_MCP_LOCAL_TARGET_FILE = join(fakeHome, "local-target.json");
     process.env.COMFYUI_API_KEY = "";
     process.env.COMFYUI_PATH = "";
+    process.env.COMFYUI_CODE_PATH = "";
     process.env.COMFYUI_HOST = "";
     process.env.COMFYUI_PORT = "8188";
     process.env.COMFYUI_MCP_FORCE_REMOTE = "";

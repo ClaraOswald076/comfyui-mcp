@@ -2,7 +2,10 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
-import { resolveEffectiveComfyUIBase, resolveLocalMutationTarget } from "./workspace-env.js";
+import {
+  resolveEffectiveComfyUICodeBase,
+  resolveLocalMutationTarget,
+} from "./workspace-env.js";
 import {
   recordPanelPendingOp,
   SNAPSHOT_RESTORE_PENDING_MS,
@@ -23,8 +26,9 @@ import { logger } from "../utils/logger.js";
 // The HTTP API works against remote instances (--comfyui-url). Naming a
 // snapshot is only possible via the file fallback (writes get_current output
 // to the Manager snapshots dir), which requires a resolvable local install
-// root (resolveEffectiveComfyUIBase: COMFYUI_PATH, else the saved default
-// workspace — never in remote mode).
+// data/base root (COMFYUI_PATH, else the saved default workspace — never in
+// remote mode). A split COMFYUI_CODE_PATH is consulted last for Manager's
+// legacy custom_nodes layout (after the data/base root, #1770).
 // ---------------------------------------------------------------------------
 
 export interface SaveSnapshotResult {
@@ -124,11 +128,24 @@ async function managerFetch(
  * the extension dir.
  */
 function managerFilesDirCandidates(comfyuiPath: string): string[] {
-  return [
+  const candidates = [
     join(comfyuiPath, "user", "__manager"),
     join(comfyuiPath, "user", "default", "ComfyUI-Manager"),
-    join(comfyuiPath, "custom_nodes", "ComfyUI-Manager"),
   ];
+  // Modern Manager files are data/user state and stay anchored to the local
+  // mutation target above. The legacy git-clone layout lives under
+  // custom_nodes/, which --base-directory runtimes scan from the data/base
+  // root (#1770). Search the data root first, then the checkout as a last
+  // resort for a non-base-directory split that still keeps Manager next to
+  // main.py.
+  const legacyRoots = new Set([
+    comfyuiPath,
+    resolveEffectiveComfyUICodeBase(),
+  ]);
+  for (const root of legacyRoots) {
+    if (root) candidates.push(join(root, "custom_nodes", "ComfyUI-Manager"));
+  }
+  return candidates;
 }
 
 /**
@@ -232,7 +249,7 @@ export async function listNodeSnapshots(): Promise<ListSnapshotsResult> {
  *   remotely. We diff getlist before/after to report the created name.
  * - Named: fetch GET /snapshot/get_current and write <name>.json into the
  *   local Manager snapshots dir. Requires a resolvable local install root
- *   (resolveEffectiveComfyUIBase); errors clearly when there is none.
+ *   (COMFYUI_PATH or a saved default workspace); errors clearly when there is none.
  */
 export async function saveNodeSnapshot(
   name?: string,
@@ -267,10 +284,10 @@ export async function saveNodeSnapshot(
   }
 
   // Named snapshot — requires a local install to write the file. Resolve the
-  // install root through the SAME resolver install_comfyui (action:"environment") / list_local_models action:"list_paths" /
-  // the comfy-cli wrapper use (#775): config.comfyuiPath, then the saved default
-  // workspace — never a bare "comfyuiPath unset ⇒ remote" conclusion, which
-  // misclassified a local install connected via --comfyui-url as remote.
+  // data/base root through the same local-mutation resolver used by other
+  // filesystem writes (#775): COMFYUI_PATH, then the saved default workspace.
+  // A split COMFYUI_CODE_PATH is consulted later only for the legacy Manager
+  // layout under custom_nodes.
   validateSnapshotName(trimmed);
   // A named save WRITES a file into the install tree, so it must know WHICH
   // install — and in remote mode a stale local COMFYUI_PATH would send that write

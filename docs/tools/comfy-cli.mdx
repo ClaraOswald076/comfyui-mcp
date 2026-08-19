@@ -37,7 +37,7 @@ Drive the official comfy-cli (envelope/1 JSON contract) for the selected ComfyUI
   Options: `version`, `which`, `env`, `discover`.
 </ParamField>
 <ParamField path="workspace" type="string">
-  Optional ComfyUI workspace override. Otherwise COMFYUI_PATH/auto-detection is used.
+  Optional ComfyUI workspace override (the data/base root comfy-cli uses for custom_nodes/models). Otherwise the live --base-directory / COMFYUI_PATH is used; the CLI executable may still come from the COMFYUI_CODE_PATH checkout's .venv.
 </ParamField>
 <ParamField path="launchArgs" type="string[]">
   actions "server_start"/"server_restart" — extra ComfyUI launch arguments, e.g. ['--listen','0.0.0.0','--port','8188'].

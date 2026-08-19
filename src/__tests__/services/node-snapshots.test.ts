@@ -22,7 +22,10 @@ const legacySnapshotDir = join(
 // ---------------------------------------------------------------------------
 
 vi.mock("../../config.js", () => ({
-  config: { comfyuiPath: "/fake/comfyui" as string | undefined },
+  config: {
+    comfyuiPath: "/fake/comfyui" as string | undefined,
+    comfyuiCodePath: undefined as string | undefined,
+  },
   getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
   getComfyUIAuthHeaders: () => ({}),
 }));
@@ -32,6 +35,7 @@ vi.mock("../../config.js", () => ({
 // not a bare config.comfyuiPath check. Control the saved-default half here.
 const wsMock = vi.hoisted(() => ({
   saved: undefined as string | undefined,
+  code: undefined as string | undefined,
   remote: false,
 }));
 vi.mock("../../services/workspace-env.js", async (importOriginal) => {
@@ -41,6 +45,7 @@ vi.mock("../../services/workspace-env.js", async (importOriginal) => {
   return {
     ...actual,
     resolveEffectiveComfyUIBase: effective,
+    resolveEffectiveComfyUICodeBase: () => wsMock.code ?? effective(),
     // Destructive snapshot paths now resolve through this seam instead (codex
     // gate P0), so it has to be controllable here too — the real one calls
     // `resolveEffectiveComfyUIBase` module-internally, where the override above
@@ -146,7 +151,9 @@ beforeEach(() => {
   fsMocks.mkdirSync.mockReset();
   fsMocks.writeFileSync.mockReset();
   (config as { comfyuiPath?: string }).comfyuiPath = "/fake/comfyui";
+  (config as { comfyuiCodePath?: string }).comfyuiCodePath = undefined;
   wsMock.saved = undefined;
+  wsMock.code = undefined;
   vi.stubGlobal("fetch", fetchMock);
 });
 
@@ -308,6 +315,37 @@ describe("saveNodeSnapshot (named — file path)", () => {
     expect(writtenPath).toBe(join(legacySnapshotDir, "named.json"));
     // Dir existed, so no mkdir.
     expect(fsMocks.mkdirSync).not.toHaveBeenCalled();
+  });
+
+  it("keeps modern user snapshots on the data root when a separate code root is configured", async () => {
+    wsMock.code = "/fake/code";
+    (config as { comfyuiCodePath?: string }).comfyuiCodePath = "/fake/code";
+    fsMocks.existsSync.mockImplementation((p: string) => p === managerSnapshotDir);
+    fetchMock.mockResolvedValueOnce(jsonResponse({ comfyui: "v1", git_custom_nodes: {} }));
+
+    await saveNodeSnapshot("split");
+
+    expect(fsMocks.writeFileSync).toHaveBeenCalledWith(
+      join(managerSnapshotDir, "split.json"),
+      expect.any(String),
+      "utf-8",
+    );
+  });
+
+  it("uses the code root only for the legacy custom_nodes Manager layout", async () => {
+    const codeLegacy = join("/fake/code", "custom_nodes", "ComfyUI-Manager", "snapshots");
+    wsMock.code = "/fake/code";
+    (config as { comfyuiCodePath?: string }).comfyuiCodePath = "/fake/code";
+    fsMocks.existsSync.mockImplementation((p: string) => p === codeLegacy);
+    fetchMock.mockResolvedValueOnce(jsonResponse({ comfyui: "v1", git_custom_nodes: {} }));
+
+    await saveNodeSnapshot("legacy-split");
+
+    expect(fsMocks.writeFileSync).toHaveBeenCalledWith(
+      join(codeLegacy, "legacy-split.json"),
+      expect.any(String),
+      "utf-8",
+    );
   });
 
   it("writes a custom_nodes-wrapped YAML file for a .yaml name", async () => {

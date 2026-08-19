@@ -113,6 +113,20 @@ describe("panel-secrets (canonical .env store)", () => {
     expect((base as Record<string, string>).CIVITAI_API_TOKEN).toBeUndefined();
   });
 
+  it("forwards COMFYUI_CODE_PATH to every panel-spawned comfyui MCP child", () => {
+    const previous = process.env.COMFYUI_CODE_PATH;
+    try {
+      process.env.COMFYUI_CODE_PATH = "/runtime/ComfyUI-code";
+      expect(buildComfyuiMcpEnv({ COMFYUI_URL: "http://127.0.0.1:8188" }))
+        .toMatchObject({ COMFYUI_CODE_PATH: "/runtime/ComfyUI-code" });
+      expect(buildComfyuiMcpEnv({ COMFYUI_CODE_PATH: "/call-scoped/code" }))
+        .toMatchObject({ COMFYUI_CODE_PATH: "/call-scoped/code" });
+    } finally {
+      if (previous === undefined) delete process.env.COMFYUI_CODE_PATH;
+      else process.env.COMFYUI_CODE_PATH = previous;
+    }
+  });
+
   it("forwards even an empty action policy so the child refuses it instead of opening up", () => {
     const previous = process.env.COMFYUI_MCP_TOOL_ACTION_ALLOW;
     try {

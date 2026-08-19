@@ -9,6 +9,7 @@ import { join } from "node:path";
 // install on the host running the suite.
 const cfg = vi.hoisted(() => ({
   comfyuiPath: undefined as string | undefined,
+  comfyuiCodePath: undefined as string | undefined,
   remote: false,
 }));
 vi.mock("../../config.js", () => ({ config: cfg, isRemoteMode: () => cfg.remote }));
@@ -30,9 +31,13 @@ vi.mock("node:child_process", async (importOriginal) => {
 });
 
 // Control the saved default workspace resolveEffectiveComfyUIBase() returns.
-const wsMock = vi.hoisted(() => ({ base: undefined as string | undefined }));
+const wsMock = vi.hoisted(() => ({
+  base: undefined as string | undefined,
+  code: undefined as string | undefined,
+}));
 vi.mock("../../services/workspace-env.js", () => ({
   resolveEffectiveComfyUIBase: () => wsMock.base,
+  resolveEffectiveComfyUICodeBase: () => wsMock.code ?? wsMock.base,
 }));
 
 import {
@@ -54,7 +59,9 @@ afterEach(() => {
   if (originalCliPath === undefined) delete process.env.COMFY_CLI_PATH;
   else process.env.COMFY_CLI_PATH = originalCliPath;
   wsMock.base = undefined;
+  wsMock.code = undefined;
   cfg.comfyuiPath = undefined;
+  cfg.comfyuiCodePath = undefined;
   cfg.remote = false;
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
@@ -141,6 +148,24 @@ describe("comfy-cli adapter", () => {
 
     cfg.comfyuiPath = localInstall;
     wsMock.base = localInstall; // a local session: the resolver names the same install
+
+    expect(resolveComfyCliExecutable()).toBe(executable);
+  });
+
+  it("uses the code workspace's venv when code and data roots are split", () => {
+    delete process.env.COMFY_CLI_PATH;
+    const dataRoot = mkdtempSync(join(tmpdir(), "comfy-cli-data-"));
+    const codeRoot = mkdtempSync(join(tmpdir(), "comfy-cli-code-"));
+    tempDirs.push(dataRoot, codeRoot);
+    const binDir = join(codeRoot, ".venv", process.platform === "win32" ? "Scripts" : "bin");
+    mkdirSync(binDir, { recursive: true });
+    const executable = join(binDir, process.platform === "win32" ? "comfy.exe" : "comfy");
+    writeFileSync(executable, "");
+
+    cfg.comfyuiPath = dataRoot;
+    cfg.comfyuiCodePath = codeRoot;
+    wsMock.base = dataRoot;
+    wsMock.code = codeRoot;
 
     expect(resolveComfyCliExecutable()).toBe(executable);
   });

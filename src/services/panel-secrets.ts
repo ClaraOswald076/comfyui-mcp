@@ -2264,6 +2264,14 @@ export function buildComfyuiMcpEnv(base: Record<string, string>): Record<string,
   // still file-owned (codex gate, round 2, finding 2).
   const managed = Object.keys(secrets).filter((k) => !isShellProvided(k));
   const out: Record<string, string> = {
+    // The orchestrator constructs the tool child's env instead of inheriting
+    // process.env. Forward the split-install code root here, at the choke point
+    // shared by every provider lane, or panel-spawned MCP servers silently lose
+    // the setting even though direct stdio launches honor it. A call-scoped base
+    // may still override this value in the future.
+    ...(process.env.COMFYUI_CODE_PATH
+      ? { COMFYUI_CODE_PATH: process.env.COMFYUI_CODE_PATH }
+      : {}),
     ...base,
     // PIN the canonical dotenv path into the child (#826). The child resolves
     // credentials from that file at access time, so if the orchestrator writes

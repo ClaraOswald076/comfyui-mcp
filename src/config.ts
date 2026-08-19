@@ -479,6 +479,13 @@ const configSchema = z.object({
   comfyuiSsl: z.coerce.boolean().default(false),
   comfyuiBasePath: z.string().default(""),
   comfyuiPath: z.string().optional(),
+  /**
+   * Optional checkout/code root for split installs where COMFYUI_PATH is the
+   * server's data/base directory. Code-facing tools (git, comfy-cli,
+   * custom_nodes provenance) use this path without moving input/output/user or
+   * models away from COMFYUI_PATH.
+   */
+  comfyuiCodePath: z.string().optional(),
   // COMFYUI_RESTART_COMMAND (panel#1262): the exact shell command that restarts an
   // EXTERNALLY-MANAGED ComfyUI (a container, a systemd unit, a launcher) — e.g.
   // `docker restart comfyui`. When set, restart runs THIS instead of the
@@ -564,6 +571,10 @@ const parsedConfig = configSchema.parse({
     cloud: cloudActive,
     remoteHost: urlOverride?.host ? `${urlOverride.host}:${urlOverride.port}` : undefined,
   }),
+  comfyuiCodePath: (() => {
+    const { path } = normalizeInstallPathEnv(process.env.COMFYUI_CODE_PATH);
+    return path ? descendToNestedRoot(path, "COMFYUI_CODE_PATH (env)") : undefined;
+  })(),
   comfyuiApiKey: cloudApiKey,
   comfyuiRestartCommand: process.env.COMFYUI_RESTART_COMMAND?.trim() || undefined,
   comfyuiCloudUrl: process.env.COMFYUI_CLOUD_URL,

@@ -49,6 +49,12 @@ icon: "gear"
   يكون مضبوطًا (ويُكبت في الوضعين البعيد/السحابي). مطلوب للأدوات المحلية فقط
   (تثبيت/إدارة العقد، وحذف النماذج، وقراءة السجلات، وسرد ملفات المخرجات).
 </ParamField>
+<ParamField path="COMFYUI_CODE_PATH" type="string" default="COMFYUI_PATH">
+  جذر اختياري لمستودع الكود في التثبيتات المنقسمة، حيث تكون `main.py` و`.venv`
+  منفصلة عن بيانات المستخدم والنماذج. يستخدمه pip وvenv وتحديث النواة.
+  تبقى قراءة/كتابة الحزم (`custom_nodes`) على `--base-directory` / `COMFYUI_PATH`.
+  يُتجاهل في الوضع البعيد.
+</ParamField>
 <ParamField path="COMFYUI_RESTART_COMMAND" type="string">
   أمر shell يُعيد تشغيل ComfyUI **المُدار خارجيًا** — مثل `docker restart comfyui`
   أو `systemctl --user restart comfyui`. عند ضبطه، يُنفّذ `restart_comfyui` هذا
