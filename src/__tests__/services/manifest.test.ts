@@ -1540,60 +1540,113 @@ describe("applyManifest", () => {
     );
   });
 
-  it("rejects model local_path when a symlinked parent escapes models", async () => {
+  it("#870 — a junctioned category folder is NOT refused up front (StabilityMatrix)", async () => {
+    // The reporter's install junctions models/vae -> E:\comfy\StabilityMatrix\
+    // models\VAE. `realpath` of the parent therefore lands OUTSIDE the models
+    // root, which apply_manifest used to read as "local_path escapes the models
+    // directory" and refuse before any download started.
+    //
+    // Since #919 the canonical resolver authorizes an in-tree redirect by its
+    // LOCATION (ComfyUI's own scanner follows the junction), so this layer must
+    // not veto it: the item has to reach the downloader, which applies the one
+    // remaining refusal (a custom_nodes landing) on the same path.
+    //
     // The product resolves these paths with node:path, yielding
     // backslash-separated absolute paths on Windows. Build the mock keys the
     // same way so they match what the product passes to realpath.
     const modelsDir = resolve(COMFY, "models");
-    const linkDir = join(modelsDir, "link");
-    const outside = resolve("/tmp/outside");
+    const junction = join(modelsDir, "vae");
+    const shared = resolve("E:/comfy/StabilityMatrix/models/VAE");
     realpathMock.mockImplementation((path: string) => {
       if (path === modelsDir) return Promise.resolve(modelsDir);
-      if (path === linkDir) return Promise.resolve(outside);
+      if (path === junction) return Promise.resolve(shared);
       return Promise.resolve(path);
     });
 
     const result = await applyManifest({
       manifest: {
-        models: [{ url: "https://example.com/model.safetensors", local_path: "link/model.safetensors" }],
+        models: [
+          { url: "https://example.com/qwen_image_vae.safetensors", local_path: "vae/qwen_image_vae.safetensors" },
+        ],
       },
     });
 
-    expect(result.success).toBe(false);
     expect(result.results).toMatchObject([
-      { action: "model", status: "failed", item: "link/model.safetensors" },
+      { action: "model", item: "vae/qwen_image_vae.safetensors" },
     ]);
-    expect(downloadModelMock).not.toHaveBeenCalled();
+    expect(result.results[0].status).not.toBe("failed");
+    expect(downloadModelMock.mock.calls[0]?.slice(0, 3)).toEqual([
+      "https://example.com/qwen_image_vae.safetensors",
+      "vae",
+      "qwen_image_vae.safetensors",
+    ]);
   });
 
-  it("validates local_path symlinks against the LIVE models dir, not a stale COMFYUI_PATH (#490)", async () => {
-    // #490: COMFYUI_PATH is a stale install; the connected server writes under a
-    // DIFFERENT live root. A symlink that escapes the LIVE models dir must be
-    // caught — the guard has to run against the live write root the downloader
-    // uses, NOT <COMFYUI_PATH>/models (which is never written to here).
-    mockConfig.comfyuiPath = "/stale/ComfyUI";
-    const liveModels = resolve("/live/ComfyUI/models");
-    modelsDirMock.mockResolvedValue(liveModels);
-    const linkDir = join(liveModels, "link");
-    const outside = resolve("/tmp/escape");
-    realpathMock.mockImplementation((path: string) => {
-      if (path === liveModels) return Promise.resolve(liveModels);
-      if (path === linkDir) return Promise.resolve(outside);
-      return Promise.resolve(path);
-    });
+  it("#870 — junctioned and real category folders behave IDENTICALLY (the krea2 pack's three models)", async () => {
+    // The reporter's asymmetry: text_encoders is a real directory under the
+    // package models root and succeeded, while vae and diffusion_models are
+    // junctions and were both refused. All three must now enqueue.
+    const modelsDir = resolve(COMFY, "models");
+    const junctions = new Map([
+      [join(modelsDir, "vae"), resolve("E:/comfy/StabilityMatrix/models/VAE")],
+      [join(modelsDir, "diffusion_models"), resolve("E:/comfy/StabilityMatrix/models/DiffusionModels")],
+    ]);
+    realpathMock.mockImplementation((path: string) =>
+      Promise.resolve(junctions.get(path) ?? path),
+    );
 
     const result = await applyManifest({
       manifest: {
-        models: [{ url: "https://example.com/m.safetensors", local_path: "link/m.safetensors" }],
+        models: [
+          { url: "https://example.com/krea2_turbo_fp8.safetensors", local_path: "diffusion_models/krea2_turbo_fp8.safetensors" },
+          { url: "https://example.com/qwen3vl_4b_fp8_scaled.safetensors", local_path: "text_encoders/qwen3vl_4b_fp8_scaled.safetensors" },
+          { url: "https://example.com/qwen_image_vae.safetensors", local_path: "vae/qwen_image_vae.safetensors" },
+        ],
+      },
+    });
+
+    expect(result.results.filter((r) => r.status === "failed")).toEqual([]);
+    expect(downloadModelMock.mock.calls.map((c) => c[1]).sort()).toEqual([
+      "diffusion_models",
+      "text_encoders",
+      "vae",
+    ]);
+  });
+
+  it("still refuses a local_path that traverses out of models/ lexically", async () => {
+    const result = await applyManifest({
+      manifest: {
+        models: [{ url: "https://example.com/m.safetensors", local_path: "../evil.safetensors" }],
       },
     });
 
     expect(result.success).toBe(false);
     expect(result.results).toMatchObject([
-      { action: "model", status: "failed", item: "link/m.safetensors" },
+      { action: "model", status: "failed", item: "../evil.safetensors" },
     ]);
     expect(result.results[0].message).toMatch(/escapes the models directory/i);
     expect(downloadModelMock).not.toHaveBeenCalled();
+  });
+
+  it("targets the LIVE models dir, not a stale COMFYUI_PATH (#490)", async () => {
+    // #490: COMFYUI_PATH is a stale install; the connected server writes under a
+    // DIFFERENT live root. The destination this layer computes — the path the
+    // "already installed?" check is asked about — must be rooted at the LIVE
+    // models dir, never at <COMFYUI_PATH>/models (which is never written to).
+    mockConfig.comfyuiPath = "/stale/ComfyUI";
+    const liveModels = resolve("/live/ComfyUI/models");
+    modelsDirMock.mockResolvedValue(liveModels);
+
+    await applyManifest({
+      manifest: {
+        models: [{ url: "https://example.com/m.safetensors", local_path: "loras/m.safetensors" }],
+      },
+    });
+
+    expect(statMock).toHaveBeenCalledWith(join(liveModels, "loras", "m.safetensors"));
+    expect(statMock).not.toHaveBeenCalledWith(
+      join(resolve("/stale/ComfyUI/models"), "loras", "m.safetensors"),
+    );
   });
 
   describe("remote mode (no COMFYUI_PATH) — per-section handling", () => {

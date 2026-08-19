@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { lstat, mkdir, readFile, realpath, stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { platform } from "node:os";
 import {
   basename,
@@ -649,67 +649,14 @@ function defaultFilenameForUrl(url: string): string {
   return basename(new URL(url).pathname) || "model.safetensors";
 }
 
-function isWithinRoot(root: string, candidate: string): boolean {
-  const rel = relative(root, candidate);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-}
-
-async function rejectEscapingSymlinkTarget(
-  root: string,
-  path: string,
-  label: string,
-): Promise<void> {
-  try {
-    const info = await lstat(path);
-    if (!info.isSymbolicLink()) return;
-    const realTarget = await realpath(path);
-    if (!isWithinRoot(root, realTarget)) {
-      throw new ValidationError(`${label} escapes the models directory: ${path}`);
-    }
-  } catch (err) {
-    if (err instanceof ValidationError) throw err;
-    // Missing final target is fine; downloadModel will create it.
-  }
-}
-
-async function validateExistingModelAncestors(
-  root: string,
-  parent: string,
-  realRoot: string,
-  localPath: string,
-): Promise<void> {
-  let cursor = parent;
-  while (cursor !== root && cursor.startsWith(root + sep)) {
-    try {
-      const info = await lstat(cursor);
-      if (info.isSymbolicLink()) {
-        const realCursor = await realpath(cursor);
-        if (!isWithinRoot(realRoot, realCursor)) {
-          throw new ValidationError(
-            `Model local_path escapes the models directory: ${localPath}`,
-          );
-        }
-      } else if (!info.isDirectory()) {
-        throw new ValidationError(`Model local_path parent is not a directory: ${localPath}`);
-      }
-      return;
-    } catch (err) {
-      if (err instanceof ValidationError) throw err;
-      cursor = dirname(cursor);
-    }
-  }
-}
-
 async function resolveLocalModelPath(
   model: ComfyManifest["models"][number],
 ): Promise<{ targetSubfolder: string; filename: string; targetPath: string }> {
-  // Root the target — and therefore the local_path symlink/containment guards
-  // below — at the SAME directory the downloader actually writes to: the live
-  // connected server's models dir (resolveModelsDir, live-first), NOT
-  // <COMFYUI_PATH>/models. When the connected install differs from a stale
-  // COMFYUI_PATH (#490), validating against COMFYUI_PATH/models would leave a
-  // symlink that escapes the LIVE models dir unchecked and redirect the write
-  // outside it. Same canonical root as the writer = one authoritative guard.
+  // Root the target — and therefore the local_path containment guard below — at
+  // the SAME directory the downloader actually writes to: the live connected
+  // server's models dir (resolveModelsDir, live-first), NOT <COMFYUI_PATH>/models.
+  // When the connected install differs from a stale COMFYUI_PATH (#490), a target
+  // computed against COMFYUI_PATH/models is not the path the write uses at all.
   const root = resolve(await resolveModelsDir());
 
   if (model.local_path) {
@@ -734,17 +681,27 @@ async function resolveLocalModelPath(
     if (filename === "." || filename === ".." || filename.length === 0) {
       throw new ValidationError(`Model local_path must include a filename: ${model.local_path}`);
     }
-    await mkdir(root, { recursive: true });
-    const realRoot = await realpath(root);
-    await validateExistingModelAncestors(root, dirname(targetPath), realRoot, model.local_path);
-    await mkdir(dirname(targetPath), { recursive: true });
-    const realParent = await realpath(dirname(targetPath));
-    if (!isWithinRoot(realRoot, realParent)) {
-      throw new ValidationError(
-        `Model local_path escapes the models directory: ${model.local_path}`,
-      );
-    }
-    await rejectEscapingSymlinkTarget(realRoot, targetPath, "Model local_path");
+    // NO symlink/realpath policy here (#870). This function used to walk the
+    // parents itself and refuse any that resolved outside the models root — the
+    // pre-#870 rule, kept alive in a second copy. #919 replaced that rule in the
+    // canonical resolver (an in-tree symlink's redirect is authorized by its
+    // LOCATION inside the user's own models tree, because ComfyUI's own scanner
+    // follows it), but this copy was never updated, so apply_manifest kept
+    // refusing the mainstream StabilityMatrix layout — `models/vae` and
+    // `models/diffusion_models` are junctions to shared storage while
+    // `models/text_encoders` is a real directory, which is exactly the
+    // some-categories-work asymmetry #870 reports.
+    //
+    // The guard is not lost, it is de-duplicated: EVERY model this function
+    // resolves is downloaded through startDownloadJob → resolveDownloadTarget →
+    // resolveModelSubfolderWithLiveRoot, which runs assertNoEscapingSymlinkAncestor
+    // on the same destination before a single byte is written — with the
+    // custom_nodes code-root veto and the dangling-symlink refusal intact, and
+    // with the base-install dirs and live snapshot from the SAME /system_stats
+    // call that resolved the root (which this layer does not have). Duplicating
+    // the policy here is what let the two drift; model-resolver.ts says so at the
+    // guard itself ("so it can never diverge from a caller's separate
+    // pre-validation (e.g. apply_manifest resolving the root a second time)").
     return {
       targetSubfolder: dirname(rel),
       filename,
