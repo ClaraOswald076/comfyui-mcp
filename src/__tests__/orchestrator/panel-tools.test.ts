@@ -5214,6 +5214,94 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
     expect(JSON.parse(text).graph_binding_status).toBe("refreshed");
   });
 
+  it("#1650 ADOPTS an unsaved tmp: tab when only the list row carries the handle", async () => {
+    // Live shape after a multi-workflow reconnect: top-level `active` has
+    // path/filename null and no key/routing_key (the panel had not established
+    // a reply identity), while the unique flagged-active list row still
+    // publishes `tmp:<uuid>`. identityVerdict used to return undefined and
+    // refuse adoption — the documented mode:"current" recovery could not
+    // recover. The uuid on `active` is what a later graph command needs.
+    const TMP = "tmp:606a1d57-339c-4304-89b0-51c25c1cd121";
+    const { bridge, refresh, tab, currentStamp } = fenceBridge({
+      fence: STALE,
+      active: {
+        path: null,
+        filename: null,
+        title: "ComfyUI_00727_",
+        workflow_uuid: LIVE,
+      },
+      workflows: [
+        { path: "workflows/a.json", routing_key: "wf:workflows/a.json", active: false },
+        {
+          path: null,
+          filename: null,
+          title: "ComfyUI_00727_",
+          key: TMP,
+          routing_key: TMP,
+          persisted: false,
+          active: true,
+        },
+      ],
+      tabId: TMP,
+    });
+    const { res, ctx, text } = await setCurrent(bridge, tab);
+
+    expect(res.isError).toBeFalsy();
+    expect(ctx.tabId).toBe(TMP);
+    expect(refresh).toHaveBeenCalledExactlyOnceWith(TMP, LIVE);
+    expect(currentStamp()).toBe(LIVE);
+    expect(JSON.parse(text)).toMatchObject({
+      graph_binding: "bound",
+      graph_binding_status: "refreshed",
+    });
+  });
+
+  it("#1650 ADOPTS when only the top-level active record carries the tmp: handle", async () => {
+    // The reverse of the reconnect shape: `active` has the handle + uuid,
+    // the flagged list row is unsaved but omitted key/routing_key.
+    const TMP = "tmp:606a1d57-339c-4304-89b0-51c25c1cd121";
+    const { bridge, refresh, tab, currentStamp } = fenceBridge({
+      fence: STALE,
+      active: {
+        path: null,
+        filename: null,
+        title: "ComfyUI_00727_",
+        key: TMP,
+        routing_key: TMP,
+        workflow_uuid: LIVE,
+      },
+      workflows: [
+        { path: "workflows/a.json", routing_key: "wf:workflows/a.json", active: false },
+        { path: null, filename: null, title: "ComfyUI_00727_", persisted: false, active: true },
+      ],
+      tabId: TMP,
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(res.isError).toBeFalsy();
+    expect(refresh).toHaveBeenCalledExactlyOnceWith(TMP, LIVE);
+    expect(currentStamp()).toBe(LIVE);
+    expect(JSON.parse(text).graph_binding_status).toBe("refreshed");
+  });
+
+  it("#1650 still REFUSES a mixed unsaved/saved pair that share no field", async () => {
+    const TMP = "tmp:606a1d57-339c-4304-89b0-51c25c1cd121";
+    const { bridge, refresh, tab, currentStamp } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+      workflows: [
+        { path: null, filename: null, title: "ComfyUI_00727_", key: TMP, routing_key: TMP, active: true },
+      ],
+      tabId: TMP,
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(refresh).not.toHaveBeenCalled();
+    expect(currentStamp()).toBe(STALE);
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/share no comparable identity field|DIFFERENT workflows/);
+  });
+
   // ---- The corroboration the fence adoption requires -----------------------
   //
   // A stale or MIXED workflow_list can carry a top-level `active` naming ANOTHER
