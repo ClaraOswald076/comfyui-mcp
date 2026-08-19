@@ -759,6 +759,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.17] - 2026-08-19
+
+### MCP
+
+#### Fixed
+- call_tool runs when the payload is under parameters instead of args (#1825)
+
+
 ## [0.52.16] - 2026-08-19
 
 ### MCP
