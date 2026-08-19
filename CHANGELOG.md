@@ -759,6 +759,33 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.4] - 2026-08-19
+
+### MCP
+
+#### Fixed
+- a fence this call REPAIRED is not a fence that was already fine — and the verdict rides in a field (#1740)
+- unwind call_tool when get_system_stats times out mid-decode (#1751)
+- recover panel_restart_comfyui when the crash takes the bridge offline (#1752)
+- recover the turn pin before mode:current claims bound (#1750)
+- do not report a post-crash 502 as a base-URL misconfiguration (#1749)
+- the progress counter runs at Node's default buffer depth again (#1746)
+- graph_* fail fast while a prompt runs; do not clear the fence on an identity-only open (#1745)
+- set a listed promoted subgraph widget (#1743)
+- degrade panel_search_nodes when Manager cache mappings return HTTP 500 (#1742)
+- treat tmp: key/routing_key as fence corroboration identity (#1741)
+- the download progress counter observes bytes instead of pacing them (#1738)
+- a configured COMFYUI_RESTART_COMMAND restarts the externally-managed instance the launch path can't prove (#1737)
+- a fenced graph READ is diagnosed, and a missing stamp is not a wrong one (#1736)
+- a download goes to the extra model root the SERVER named, not an unvouched install (#1734)
+- containment in a root WE picked is not readership — an unvouched destination is UNCONFIRMED, not "in the right place" (#1735)
+- a too-old note with a current disk pack prescribes restart + hard-refresh, not a no-op sync (#1729)
+- panel_show_media's mid-command drop now settles with a re-issue, not an unverifiable check (#1728)
+
+#### Changed
+- lead with the demo, as a poster that links to the video (#1744)
+
+
 ## [0.52.3] - 2026-08-19
 
 ### MCP
