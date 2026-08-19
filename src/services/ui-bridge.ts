@@ -298,7 +298,7 @@ export const BRIDGE_CMD_MIN_PANEL_VERSION: Readonly<Record<string, string>> = {
   // only caller (the orchestrator's hello-time pull) degrades silently on an
   // unknown-command reply, so a too-low floor can never produce a wrong verdict —
   // it just lets an old panel answer "Unknown command", which the pull swallows.
-  graph_get_virtual_types: "0.15.10",
+  graph_get_virtual_types: "0.15.11",
 };
 
 /**
