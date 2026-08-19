@@ -150,7 +150,7 @@ Install, update and configure the local ComfyUI installation, its sidebar panel,
 
 ## apply_manifest
 
-Apply a ComfyUI setup manifest from an inline object or .json/.yaml/.yml file. Composes custom-node installs and model downloads, installs pip packages, and reports apt entries as skipped (system packages need manual/root installation). LOCAL ComfyUI (COMFYUI_PATH set): nodes/models land on the local filesystem and pip installs into the ComfyUI Python env. REMOTE ComfyUI: custom_nodes and models are routed through the ComfyUI-Manager HTTP API (handled on the host), while pip and apt entries are reported as skipped (no remote equivalent). Each item reports applied/skipped/failed independently.
+Apply a ComfyUI setup manifest from an inline object or .json/.yaml/.yml file. Composes custom-node installs and model downloads, installs pip packages, and reports apt entries as skipped (system packages need manual/root installation). LOCAL ComfyUI (COMFYUI_PATH set): nodes/models land on the local filesystem and pip installs into the ComfyUI Python env. REMOTE ComfyUI: custom_nodes and models are routed through the ComfyUI-Manager HTTP API (handled on the host), while pip and apt entries are reported as skipped (no remote equivalent). Each item reports applied/skipped/failed/pending independently. success is true only when nothing failed AND nothing is still pending. A PARTIAL INSTALL (custom_nodes left unsubmitted when the time budget elapsed) is named in the partial field — a drained Manager queue / panel_node_queue_status does not include those entries; re-run apply_manifest to submit them. Do not restart ComfyUI until they report applied or skipped.
 
 ### Parameters
 
