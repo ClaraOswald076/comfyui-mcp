@@ -906,6 +906,27 @@ function isMutatingGraphCmd(cmd: Record<string, unknown>): boolean {
   return MUTATING_GRAPH_EDIT_CMDS.has(name);
 }
 
+/**
+ * #1519 — a graph command the panel FENCES that does not mutate the canvas.
+ *
+ * The panel's `activeWorkflowFenceApplies` fences every `graph_*` command, reads
+ * included, and exempts the recovery probe `workflow_list`
+ * (`commandIsCanvasTargetless`, panel #759). So "fenced, and not a mutation" is
+ * exactly the `graph_*` names that are not in MUTATING_GRAPH_EDIT_CMDS — derived
+ * from that one allowlist rather than kept as a second one, so a newly added edit
+ * command cannot drift into being classified as a read.
+ *
+ * The `graph_` prefix is load-bearing for a second reason: the diagnosis this
+ * gates runs `workflow_list`, which flows back through this same catch. Keying on
+ * the prefix keeps the probe OUT of the branch that launched it, so a panel that
+ * fences the probe too (a build predating the #759 exemption) surfaces its own
+ * refusal instead of recursing.
+ */
+function isFencedGraphRead(cmd: Record<string, unknown>): boolean {
+  const name = typeof cmd.cmd === "string" ? cmd.cmd : "";
+  return name.startsWith("graph_") && !MUTATING_GRAPH_EDIT_CMDS.has(name);
+}
+
 /** True when an error is a TRANSIENT transport/reconnect drop (the tab went away
  *  or was replaced), NOT a genuine command error or a live-but-frozen reply
  *  timeout. Deliberately EXCLUDES "did not reply within N ms" (a backgrounded/
@@ -7530,6 +7551,138 @@ export function makePanelToolCtx(
             `(${probeErr instanceof Error ? probeErr.message : String(probeErr)})`;
         }
         return fail(`${name} was NOT applied — nothing changed. ${raw}${verdict}`);
+      }
+      // #1519 — THE SAME REFUSAL ON A READ, AND AN ABSENT STAMP IS NOT A WRONG ONE.
+      //
+      // The reporter's session resumed onto a different workflow and the very first
+      // live-canvas read came back
+      //
+      //   workflow instance mismatch: this command carries no workflow-instance
+      //   stamp, and the active canvas reports 2b3f4684-…. Nothing was applied.
+      //
+      // Measured on current main before this branch existed: that text is the ENTIRE
+      // tool result. The corroboration above is gated on `isMutatingGraphCmd`, so a
+      // READ refused by the very same fence fell through every branch here and the
+      // panel's raw refusal was surfaced verbatim — no verdict, no remedy. The
+      // reporter had to find `panel_set_workflow_target({mode:"current"})` on their
+      // own, which is the whole content of the report. #1480's guard already extends
+      // its diagnosis to reads "on purpose: `panel_graph_outline` refusing was half
+      // of the reported dead end"; this is the same reasoning for the stamp fence.
+      //
+      // TWO REFUSALS, NOT ONE. `isWorkflowInstanceMismatch` matches both of the
+      // panel's states, and they are different facts with OPPOSITE remedies:
+      //
+      //   "carries no workflow-instance stamp"  → this session has NO workflow
+      //       identity. Nothing was compared; the command was refused for arriving
+      //       bare. Deriving a fence from the live canvas is what fixes it.
+      //   "issued for workflow instance <uuid>" → this session HAS an identity and
+      //       the canvas disagrees with it. Deriving a fence from the live canvas
+      //       ABANDONS the workflow the caller named — the right move only if that
+      //       is what they meant.
+      //
+      // Collapsing them would hand the second case the first case's remedy, which is
+      // the retarget #1646 removed for cause. So the shape is read from the panel's
+      // own words and, when it matches NEITHER wording, the answer is UNKNOWN and is
+      // said to be — never guessed into one of the two.
+      //
+      // Read from the REFUSAL, never from `cmd.workflow_uuid`: the stamp is applied
+      // downstream of here, so that field is undefined at this point for BOTH states
+      // (the trap that silently disabled #1330's transient branch one block up).
+      //
+      // NOTHING IS ADOPTED. The probe is the same read-only one (`adopt:false`), so
+      // this reports which state it found and the fence moves only on an explicit
+      // rebind. The refusal itself is preserved verbatim and the call still fails.
+      if (isWorkflowInstanceMismatch(err) && isFencedGraphRead(cmd)) {
+        const name = typeof cmd.cmd === "string" ? cmd.cmd : "panel command";
+        const raw = err instanceof Error ? err.message : String(err);
+        const stamped = /issued for workflow instance ([0-9a-f-]{36})/i.exec(raw)?.[1] ?? null;
+        const unstamped = /carries no workflow-instance stamp/i.test(raw);
+        // Three-valued on purpose. A panel whose wording matches neither is not
+        // evidence for either state, and this branch must not manufacture one.
+        const shape: "unstamped" | "stamped" | "unstated" = unstamped
+          ? "unstamped"
+          : stamped
+            ? "stamped"
+            : "unstated";
+        // Naming `mode:"current"` to a PINNED session is naming something that also
+        // RELEASES the pin. Say so where it applies rather than letting the caller
+        // discover it by losing their target.
+        const pin = ctx.workflowTarget?.get(ctx.tabId);
+        const pinNote =
+          pin?.mode === "pinned" && pin.path
+            ? ` NOTE: this session is PINNED to ${pin.filename ?? pin.path}, and mode:"current" ` +
+              `RELEASES that pin. To keep it, bring that workflow back to the canvas with ` +
+              `panel_open_workflow(${JSON.stringify(pin.path)}) and retry instead.`
+            : "";
+        const RETRY_IS_FREE =
+          `RETRY THIS EXACT CALL ONCE — this is a read, so re-issuing it cannot double-apply ` +
+          `anything.`;
+        let verdict: string;
+        try {
+          const probe = await rebindWorkflowFence(ctx, { adopt: false });
+          const live = "uuid" in probe ? probe.uuid : null;
+          verdict =
+            probe.status === "no_identity"
+              ? `\n\nCHECKED, so this is not a guess: the live canvas was re-read and it carries ` +
+                `no workflow identity either (${probe.why}). ` +
+                `panel_set_workflow_target({mode:"current"}) will NOT clear this — it chooses ` +
+                `WHICH workflow to fence against and cannot mint an identity for one that has ` +
+                `none, so it reports success while this read keeps being refused. RECOVERY: ` +
+                `panel_open_workflow(<path>) on this same workflow; re-opening it is what gives ` +
+                `it an identity. If it has never been saved there is no path to re-open — save ` +
+                `it first with panel_save_workflow, which also gives it a stable identity.`
+              : probe.status === "healed_by_panel"
+                ? `\n\nCHECKED, and the answer CHANGED while it was being read: the panel ` +
+                  `re-advertised its identity and this session's fence moved to the live canvas ` +
+                  `(${live}) — through the panel's own repair, not this check. ${RETRY_IS_FREE}`
+                : probe.status === "already_current"
+                  ? shape === "unstamped"
+                    ? `\n\nCHECKED, and the two sides disagree about this session's state: its ` +
+                      `fence NOW names the live canvas (${live}), yet this command reached the ` +
+                      `panel carrying no stamp at all — so the identity was established, or ` +
+                      `re-advertised, after this command went out. ${RETRY_IS_FREE}`
+                    : `\n\nCHECKED: this session's fence already names the live canvas ` +
+                      `(${live}), so it was not the stale side and the disagreement is gone by ` +
+                      `the time it was looked at. ${RETRY_IS_FREE} If it refuses again with the ` +
+                      `same pair, the two identities are genuinely disagreeing and ` +
+                      `panel_open_workflow is the way to settle which one you mean.`
+                  : probe.status === "diverged"
+                    ? shape === "unstamped"
+                      ? `\n\nCHECKED, and this is a MISSING stamp rather than a wrong one: this ` +
+                        `session holds no workflow identity, so nothing was compared — the read ` +
+                        `was refused for arriving bare. The live canvas DOES have one ` +
+                        `(${live}). Nothing was adopted here; this check is read-only and the ` +
+                        `fence is unchanged. RECOVERY: ` +
+                        `panel_set_workflow_target({mode:"current"}) derives this session's ` +
+                        `fence from the live canvas, after which this read carries a stamp and ` +
+                        `runs.${pinNote}`
+                      : shape === "stamped"
+                        ? `\n\nCHECKED, and this session was NOT re-pointed: it is fenced to ` +
+                          `${stamped} and the live canvas is a DIFFERENT workflow (${live}). ` +
+                          `This is a WRONG stamp, not a missing one, so the two exits are not ` +
+                          `interchangeable: to read the workflow you issued for, bring it back ` +
+                          `with panel_open_workflow; to read the live canvas instead, re-target ` +
+                          `deliberately with panel_set_workflow_target({mode:"current"}) — that ` +
+                          `also re-points every later EDIT in this session, which is why it is ` +
+                          `never done for you off a refusal.${pinNote}`
+                        : `\n\nCHECKED, and the live canvas reports ${live}. Which side is ` +
+                          `stale is NOT known from here: this panel's refusal states neither ` +
+                          `that the command was unstamped nor which instance it was issued ` +
+                          `for, so no remedy is named for it — read panel_list_workflows (the ` +
+                          `panel exempts it from this fence) and decide which workflow you mean.`
+                    : `\n\nCHECKED, but the live canvas could not be established ` +
+                      `(${probe.status}), so the answer is UNKNOWN and the fence is unchanged. ` +
+                      `Try panel_list_workflows — the panel exempts that read from this fence ` +
+                      `(it is the recovery probe) — and re-select the workflow you mean with ` +
+                      `panel_open_workflow.`;
+        } catch (probeErr) {
+          // A diagnosis must never change how the call failed.
+          verdict =
+            `\n\nCHECKED, and the check itself threw, so the live canvas is UNKNOWN — this ` +
+            `refusal stands on its own terms and the fence is unchanged. ` +
+            `(${probeErr instanceof Error ? probeErr.message : String(probeErr)})`;
+        }
+        return fail(`${name} was refused before it ran — no graph data was read. ${raw}${verdict}`);
       }
       // #1480 — NAME A REMEDY THE TAB CAN ACTUALLY ACCEPT.
       //
