@@ -87,6 +87,12 @@ placeholder follows the active backend ("Ask Claude…" / "Ask Ollama…").
   `https://api.minimax.io/v1` (OpenAI-compatible, plain Bearer auth). For the
   China region, set `COMFYUI_MCP_MINIMAX_BASE_URL=https://api.minimaxi.com/v1`.
   Override the model with `COMFYUI_MCP_MINIMAX_MODEL`.
+- **Atlas Cloud** — set `ATLASCLOUD_API_KEY` from the
+  [Atlas Cloud console](https://www.atlascloud.ai/console/api-keys). The default
+  model is `qwen/qwen3.5-flash` over the OpenAI-compatible
+  `https://api.atlascloud.ai/v1` endpoint. Override the model with
+  `COMFYUI_MCP_ATLASCLOUD_MODEL` or the base URL with
+  `COMFYUI_MCP_ATLASCLOUD_BASE_URL`.
 - **Copilot (experimental)** — sign in from the panel's experimental provider
   row. Off by default; enable experimental backends in Settings first.
 - **Ollama (local)** — no sign-in. Install Ollama and pull a tool-calling
@@ -179,7 +185,7 @@ because a silently dropped attachment is worse than a refused one:
     Ollama tag is mutable: `ollama pull` can replace the weights under the same
     name, and a cached verdict could outlive the model it described.
 - **LM Studio / llama.cpp / OpenRouter / GLM / Kimi / Moonshot / MiniMax /
-  Copilot / custom OpenAI-compatible endpoints — attempted, NOT
+  Atlas Cloud / Copilot / custom OpenAI-compatible endpoints — attempted, NOT
   capability-checked.** These all speak `/v1/chat/completions`,
   which has no capability endpoint to ask, so audio is sent as an `input_audio`
   content part and you are told, on that turn, that the delivery is
