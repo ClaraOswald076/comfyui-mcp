@@ -479,6 +479,12 @@ const configSchema = z.object({
   comfyuiSsl: z.coerce.boolean().default(false),
   comfyuiBasePath: z.string().default(""),
   comfyuiPath: z.string().optional(),
+  // COMFYUI_RESTART_COMMAND (panel#1262): the exact shell command that restarts an
+  // EXTERNALLY-MANAGED ComfyUI (a container, a systemd unit, a launcher) — e.g.
+  // `docker restart comfyui`. When set, restart runs THIS instead of the
+  // kill+relaunch that needs the install's launch path resolvable from here
+  // (which is exactly what an externally managed install does not offer).
+  comfyuiRestartCommand: z.string().optional(),
   comfyuiApiKey: z.string().optional(),
   comfyuiCloudUrl: z.string().default("https://cloud.comfy.org"),
   // Generic auth for self-hosted ComfyUI behind a reverse proxy / API gateway
@@ -559,6 +565,7 @@ const parsedConfig = configSchema.parse({
     remoteHost: urlOverride?.host ? `${urlOverride.host}:${urlOverride.port}` : undefined,
   }),
   comfyuiApiKey: cloudApiKey,
+  comfyuiRestartCommand: process.env.COMFYUI_RESTART_COMMAND?.trim() || undefined,
   comfyuiCloudUrl: process.env.COMFYUI_CLOUD_URL,
   comfyuiAuthHeader: process.env.COMFYUI_AUTH_HEADER,
   comfyuiAuthScheme: process.env.COMFYUI_AUTH_SCHEME,

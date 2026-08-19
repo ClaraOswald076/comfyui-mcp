@@ -48,6 +48,16 @@ icon: "gear"
   （リモート / クラウドモードでは抑制）。ローカル専用ツール（ノードのインストール / 管理、
   モデル削除、ログ読み取り、出力ファイル一覧）が必要とします。
 </ParamField>
+<ParamField path="COMFYUI_RESTART_COMMAND" type="string">
+  **外部管理** の ComfyUI を再起動するシェルコマンド — 例: `docker restart comfyui`
+  や `systemctl --user restart comfyui`。設定すると `restart_comfyui` は
+  kill+relaunch の代わりにこのコマンドを実行します（kill+relaunch はインストールの
+  起動パスを解決できる必要がありますが、コンテナやランチャーでは `main.py` が自分の
+  名前空間の内側にしかアンカーされず不可能です）。`panel_restart_comfyui` もこの
+  コマンド経由になります。ローカルターゲットのみ。リモート / クラウドは従来どおり
+  Manager リブート経路です。再起動後はインスタンスが正常に戻ったかを検証し、
+  down→up を実際に観測できた場合にのみ confirmed と報告します。
+</ParamField>
 
 ## リバースプロキシ / API ゲートウェイの背後にあるリモート
 

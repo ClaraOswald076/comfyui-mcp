@@ -59,6 +59,18 @@ mezclar.
   remoto/nube). La exigen las herramientas solo locales (instalar/gestionar
   nodos, eliminar modelos, leer registros, listar archivos de salida).
 </ParamField>
+<ParamField path="COMFYUI_RESTART_COMMAND" type="string">
+  Comando de shell que reinicia un ComfyUI **gestionado externamente** — p. ej.
+  `docker restart comfyui` o `systemctl --user restart comfyui`. Cuando está
+  definido, `restart_comfyui` ejecuta este comando en lugar de kill+relaunch
+  (que exige que la ruta de arranque de la instalación sea resoluble —
+  imposible para un contenedor o un lanzador cuyo `main.py` solo se ancla
+  dentro de su propio espacio de nombres), y `panel_restart_comfyui` también
+  pasa por él. Solo objetivos locales; los objetivos remotos/nube conservan la
+  vía de reinicio por Manager. El reinicio verifica que la instancia volvió
+  sana y solo reporta el ciclo como confirmado cuando el down→up se observó
+  realmente.
+</ParamField>
 
 ## Remoto detrás de un reverse proxy / pasarela API
 

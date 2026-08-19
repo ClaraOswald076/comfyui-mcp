@@ -1,4 +1,5 @@
 import {
+  exec,
   execSync,
   execFileSync,
   spawn,
@@ -18,6 +19,7 @@ import {
 } from "node:fs";
 import { homedir, platform } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { promisify } from "node:util";
 import { getSystemStats, resetClient, resetObjectInfoCache } from "../comfyui/client.js";
 import {
   config,
@@ -4137,11 +4139,203 @@ async function restartViaManagerRebootDispatch(
   };
 }
 
+// Lazily promisified: several test files mock node:child_process with only the
+// members THEIR path uses (no `exec`), and a module-level promisify(exec) would
+// break their imports. The configured-command path is the only caller, so
+// deferring the wrap keeps those mocks loadable.
+type ExecAsync = (
+  command: string,
+  options: { timeout: number; windowsHide: boolean },
+) => Promise<{ stdout: string | Buffer; stderr: string | Buffer }>;
+let execAsyncImpl: ExecAsync | null = null;
+function execAsync(
+  command: string,
+  options: { timeout: number; windowsHide: boolean },
+): Promise<{ stdout: string | Buffer; stderr: string | Buffer }> {
+  execAsyncImpl ??= promisify(exec) as unknown as ExecAsync;
+  return execAsyncImpl(command, options);
+}
+
+/**
+ * Hard cap on the configured restart command's own runtime (panel#1262). A
+ * `docker restart`/`systemctl restart` answers in seconds; this bounds the
+ * pathological case (a command that hangs) so the tool call still returns.
+ */
+const CONFIGURED_RESTART_COMMAND_TIMEOUT_MS = 120_000;
+
+/**
+ * Restart via the user-configured COMFYUI_RESTART_COMMAND (panel#1262) — the
+ * recovery path for an EXTERNALLY-MANAGED ComfyUI (a local container, a systemd
+ * unit, a launcher) whose relaunch can never be proven from here: its argv[0]
+ * is a bare `main.py` anchored only inside its own mount/namespace, so the
+ * refuse-safe preflight (correctly) refuses a kill+relaunch, and a wedged
+ * server answers no Manager reboot either. The configured command is the user
+ * telling us exactly what cycles the instance, so it IS the proven relaunch.
+ *
+ * The honesty rules are the Manager reboot path's own: we launched nothing, so
+ * `listener_ownership` is never ours to claim; `started` is claimed only when
+ * the loopback witness OBSERVED the down→up (#1642); a healthy answer with no
+ * observed cycle is "unconfirmed", and an expired readiness budget is NOT a
+ * failure verdict (#367).
+ */
+async function restartViaConfiguredCommand(command: string): Promise<RestartResult> {
+  logger.info("Restarting ComfyUI via the configured COMFYUI_RESTART_COMMAND...");
+  // Pin the base and open the instance WITNESS before anything else, exactly as
+  // the Manager reboot path does: the command runs after awaits, and the
+  // configured target is mutable across every one of them.
+  const anchoredBase = getComfyUIBaseUrl();
+  const probeUrl = `${anchoredBase}/system_stats`;
+  const witness = await acquireInstanceWitness(anchoredBase);
+  try {
+    // FENCE BEFORE THE IRREVERSIBLE ACT (same rule as the Manager path): a
+    // retarget during the witness handshake would send the restart at one
+    // server and report the health of another. Nothing has run yet — refuse.
+    if (getComfyUIBaseUrl() !== anchoredBase) {
+      return {
+        stopped: false,
+        started: false,
+        startup: "not-attempted",
+        message:
+          "The configured ComfyUI target changed while this restart was preparing, " +
+          "so the configured restart command was NOT run — it would have acted on a " +
+          "different server than the one this call read. Nothing was restarted. " +
+          "Re-run the restart to act on the current target.",
+        listener_ownership: unclassifiedOwnership(),
+      };
+    }
+    const dispatchedAt = Date.now();
+    try {
+      await execAsync(command, {
+        timeout: CONFIGURED_RESTART_COMMAND_TIMEOUT_MS,
+        windowsHide: true,
+      });
+    } catch (err) {
+      // The command itself reports failure (non-zero exit / timeout / signal).
+      // That is OBSERVED — but only about the command, not about the server:
+      // say what the command did, then probe ONCE and say what answers now.
+      const probe = await waitForApiReady({
+        intervalMs: 250,
+        maxTries: 1,
+        probeUrl,
+      });
+      return {
+        stopped: false,
+        started: false,
+        ready: probe.ready,
+        startup: "failed",
+        readiness: probe,
+        message:
+          `The configured restart command (COMFYUI_RESTART_COMMAND) failed: ${errorText(err)}. ` +
+          (probe.ready
+            ? `Something IS answering on ${probeUrl} — the restart very likely did not ` +
+              "happen and the old instance is still serving. Fix the command and retry."
+            : `and nothing is answering on ${probeUrl} right now. Whether the command ` +
+              "stopped something before failing is not knowable from here — check the " +
+              "instance's own manager (docker ps / systemctl status / its launcher) " +
+              "before assuming either way."),
+        listener_ownership: unclassifiedOwnership(),
+      };
+    }
+    // The command claims to have cycled the instance. Record the dispatch so a
+    // later decline-path DOWN report may name causation (process-wide slot only —
+    // a panel caller stamps its own session token from this result).
+    recordRestartDispatch(anchoredBase, PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
+
+    const timing = getRemoteRebootTiming();
+    if (timing.settleMs > 0) await sleep(timing.settleMs);
+    const intervalMs = Math.max(250, timing.intervalMs);
+    const maxTries = Math.max(1, Math.ceil(timing.budgetMs / intervalMs));
+    const readiness = await waitForApiReady({ intervalMs, maxTries, probeUrl });
+
+    if (!readiness.ready) {
+      return {
+        stopped: true,
+        started: false,
+        ready: false,
+        startup: "unconfirmed",
+        readiness,
+        message:
+          `The configured restart command (COMFYUI_RESTART_COMMAND) ran, but no ` +
+          `readiness probe got a healthy response from ${readiness.probe_url} within ` +
+          `${seconds(readiness.waited_ms)}s (${readiness.attempts}/${readiness.max_tries} ` +
+          `probes over a COMFYUI_REMOTE_REBOOT_BUDGET_S=${seconds(timing.budgetMs)}s ` +
+          "budget). That budget expiring means the restart is NOT CONFIRMED YET — it " +
+          "does NOT mean it failed; a cold start can take longer than this. Re-check " +
+          'with get_system_stats (action:"health") in ' +
+          `another ${RECHECK_HINT_S}s before intervening. If it is still down then, ` +
+          "start ComfyUI from whatever manages it, or raise that budget to wait " +
+          "longer next time.",
+        listener_ownership: unclassifiedOwnership(),
+      };
+    }
+
+    // Back and ready — the caches memoized against the old instance are stale.
+    resetClient();
+    resetObjectInfoCache();
+    resetManagerApiCache("comfyui restarted via configured command");
+    // Answering again, so this dispatch can no longer be the cause of a LATER
+    // down report (the Manager path clears on the same rule).
+    clearRestartDispatch(PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
+
+    // #1642's rule applies unchanged: on a LOOPBACK endpoint the witness's close
+    // AFTER the command ran is the observed down→up the readiness poll alone can
+    // never supply; anything else (no witness, still-open witness, non-loopback)
+    // reports honestly that the cycle itself was not observed.
+    const witnessClosedAt = witness?.closedAt();
+    const witnessSawTheCycle =
+      witness !== undefined &&
+      witnessClosedAt !== undefined &&
+      witnessClosedAt > dispatchedAt &&
+      isLoopbackServerUrl(anchoredBase);
+    if (witnessSawTheCycle) {
+      return {
+        stopped: true,
+        started: true,
+        ready: true,
+        startup: "confirmed",
+        readiness,
+        message:
+          `The configured restart command (COMFYUI_RESTART_COMMAND) ran. ComfyUI is ` +
+          `healthy now (${readiness.waited_ms}ms) — CONFIRMED restart: the instance ` +
+          "dropped the connection this call was holding open across the command " +
+          "(the down), and the same endpoint answers healthy again (the up).",
+        listener_ownership: unclassifiedOwnership(),
+      };
+    }
+    return {
+      stopped: true,
+      started: false,
+      ready: true,
+      startup: "unconfirmed",
+      readiness,
+      message:
+        `The configured restart command (COMFYUI_RESTART_COMMAND) ran. ComfyUI is ` +
+        `healthy now (${readiness.waited_ms}ms). The cycle itself was not directly ` +
+        "observed from here, so verify with " +
+        'get_system_stats (action:"health") if you need certainty that it actually ' +
+        "restarted.",
+      listener_ownership: unclassifiedOwnership(),
+    };
+  } finally {
+    witness?.close();
+  }
+}
+
 export async function restartComfyUI(): Promise<RestartResult> {
   if (isRemoteMode()) {
     // Remote target: can't process-control it, but a Manager HTTP reboot brings
     // back a self-supervised ComfyUI (e.g. the tunnelled Desktop app).
     return restartViaManagerReboot({ label: "remote" });
+  }
+  // panel#1262: an EXTERNALLY-MANAGED local instance (container, systemd unit,
+  // launcher) offers nothing the kill+relaunch path can validate — its bare
+  // `main.py` argv anchors only inside its own namespace — so without this the
+  // restart refused and a wedged server had no recovery. The configured command
+  // is the user's explicit statement of what cycles the instance; it outranks
+  // every inferred path below (including Desktop's), and it needs no live
+  // process info, so it also works when the server is too wedged to answer.
+  if (config.comfyuiRestartCommand) {
+    return restartViaConfiguredCommand(config.comfyuiRestartCommand);
   }
   logger.info("Restarting ComfyUI...");
 
@@ -4258,7 +4452,11 @@ export async function restartComfyUI(): Promise<RestartResult> {
         `Refusing to restart: ${relaunch.reason} ComfyUI was left running (not stopped) ` +
         "so you don't lose the server. " +
         (relaunch.advice ??
-          "Fix the launch path (e.g. COMFYUI_PATH) and try again.") +
+          "Fix the launch path (e.g. COMFYUI_PATH) and try again. If this ComfyUI " +
+          "is externally managed (a container, a systemd unit, a launcher), set " +
+          "COMFYUI_RESTART_COMMAND to the exact command that restarts it (e.g. " +
+          "`docker restart <container>`) — the restart then runs that command " +
+          "instead of needing the launch path resolvable from here.") +
         describeRecovery(recoveryHint(info)),
       // Refused before touching anything: the still-running server is the one that
       // was already there, which this call did not start.

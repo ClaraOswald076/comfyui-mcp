@@ -145,6 +145,7 @@ import {
   getClient,
   getObjectInfo,
   backfillObjectInfo,
+  getQueueVerified,
   resetClient,
   resetObjectInfoCache,
 } from "../comfyui/client.js";
@@ -12945,7 +12946,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
     ),
     def(
       "panel_restart_comfyui",
-      "Restart the user's ComfyUI server via the built-in Manager — needed to load newly installed/updated custom nodes. CALL THIS DIRECTLY when a restart is needed: it pops a confirm card and only restarts on a yes (don't ask separately first). ComfyUI and this agent go down briefly, then the panel auto-reconnects and you resume. ⚠️ BUSY GUARD: a restart ABORTS any in-progress or queued generation — if ComfyUI is generating, this tool REFUSES and tells you (it does NOT restart). When that happens, tell the user a render is running and WAIT for it (poll panel_node_queue_status), or pass force:true ONLY if the user explicitly confirms they want to kill the running generation. Best practice: before restarting after an install, check the queue is idle first. Only call when a restart is actually needed. On an externally-managed install whose relaunch can't be proven from here (e.g. Pinokio), the restart is REFUSED before anything is stopped — restart from the launcher that owns the server instead.",
+      "Restart the user's ComfyUI server via the built-in Manager — needed to load newly installed/updated custom nodes. CALL THIS DIRECTLY when a restart is needed: it pops a confirm card and only restarts on a yes (don't ask separately first). ComfyUI and this agent go down briefly, then the panel auto-reconnects and you resume. ⚠️ BUSY GUARD: a restart ABORTS any in-progress or queued generation — if ComfyUI is generating, this tool REFUSES and tells you (it does NOT restart). When that happens, tell the user a render is running and WAIT for it (poll panel_node_queue_status), or pass force:true ONLY if the user explicitly confirms they want to kill the running generation. Best practice: before restarting after an install, check the queue is idle first. Only call when a restart is actually needed. On an externally-managed install whose relaunch can't be proven from here (e.g. Pinokio), the restart is REFUSED before anything is stopped — restart from the launcher that owns the server instead, or set COMFYUI_RESTART_COMMAND to the exact command that restarts the instance (e.g. `docker restart <container>`): the restart then runs through that command (the busy guard above still applies) instead of needing the launch path.",
       { force: z.boolean().optional() },
       async ({ force }, ctx) => {
         // Whole-handler budget (#536): confirm + dispatch + readiness — INCLUDING
@@ -13178,6 +13179,282 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // server-authorized + immutable, bound to the exact host FAMILY the reboot goes
         // to (null unless the bound tab provably fronts our boot instance).
         ctx.ensureReachable?.();
+        // Run the HEADLESS managed restart (restartComfyUI) from inside this tool and
+        // report its outcome against OUR OWN independent boot-endpoint observation
+        // (never restartComfyUI's self-reported readiness, which a first-healthy
+        // no-op would flunk). Shared by two call sites that must not dispatch the tab
+        // reboot: the legacy no-endpoint fallback below (#425), and a configured
+        // COMFYUI_RESTART_COMMAND (panel#1262). Both require a BOUND-CONFIRMED local
+        // target: restartComfyUI acts on the orchestrator's GLOBAL config target, so
+        // it may run only when the bound tab provably fronts our own boot instance.
+        const runHeadlessManagedRestart = async (args: {
+          healthBase: string;
+          preRestartPanelIdentity: { generation: number; tabSessionId: string } | undefined;
+          /** Lead sentence naming WHY the headless path is running (error paths). */
+          why: string;
+          /** Noun phrase for the mechanism ("the headless managed restart (kill + relaunch)"). */
+          mechanism: string;
+          /** Lead for the came-back-healthy-but-tab-not-ready note. */
+          noteHealthyLead: string;
+          /** Lead for the final outcome note (ready and not-ready shapes). */
+          noteRanLead: string;
+        }): Promise<ToolResult> => {
+          const { healthBase, preRestartPanelIdentity, why, mechanism, noteHealthyLead, noteRanLead } = args;
+          // The managed kill+relaunch does UNPREEMPTIBLE synchronous execSync work — PID
+          // discovery (~5+8s) + termination (~10s) + first port-free lookup (~13s) ≈ 40s
+          // worst case (Windows) — that a Promise.race CANNOT interrupt, and it BLOCKS the
+          // observer during that window. Admit it ONLY with enough budget for that sync
+          // work AND a full cold-start observation AFTER it, and give the observer a
+          // deadline that spans BOTH (coordinator P1: the proof deadline must start after,
+          // not before, the restart's synchronous work — otherwise a genuine cold start
+          // that finishes at sync+coldStart false-times-out).
+          const LEGACY_SYNC_WORST_CASE_MS = 40_000; // execSync PID lookup + kill + port-free
+          const LEGACY_COLD_START_OBS_MS = 100_000; // cold-start observation AFTER the sync
+          const LEGACY_RESTART_MIN_BUDGET_MS = LEGACY_SYNC_WORST_CASE_MS + LEGACY_COLD_START_OBS_MS;
+          if (overallDeadline - Date.now() < LEGACY_RESTART_MIN_BUDGET_MS) {
+            return ok({
+              rebooting: false,
+              ready: false,
+              confirmed_cycle: false,
+              note:
+                `${why}, and there isn't enough remaining time to safely run ${mechanism}. ` +
+                "ComfyUI was NOT restarted — retry panel_restart_comfyui " +
+                "(a fresh call gets the full budget).",
+            });
+          }
+          // A managed kill+relaunch restarts ComfyUI out-of-band, so drop the memoized
+          // caches. The observer watches the boot endpoint itself with a deadline spanning
+          // the ~40s blocking sync + a full cold-start window, and certifies ONLY on an
+          // OBSERVED down→up — a never-restarted healthy endpoint (a Desktop first-healthy
+          // Manager-reboot / preflight no-op) is honestly couldn't-confirm (coordinator P1).
+          resetClient();
+          resetObjectInfoCache();
+          resetManagerApiCache("panel managed restart");
+          const headlessTiming = getPanelRebootTiming();
+          // The observation window spans the ~40s blocking sync + a full cold-start
+          // window. (Under a test timing override, use the injected budget instead so the
+          // never-certify cases don't wait the real ~140s.)
+          const legacyProofWindow = panelRebootTimingOverride
+            ? headlessTiming.settleMs + headlessTiming.budgetMs
+            : LEGACY_RESTART_MIN_BUDGET_MS;
+          const proofDeadline = Math.min(Date.now() + legacyProofWindow, overallDeadline);
+          const proofPromise = observeRecovery(headlessTiming, proofDeadline, { healthBase });
+          const restartBudget = Math.max(1, overallDeadline - Date.now());
+          let restart: Awaited<ReturnType<typeof restartComfyUI>> | undefined;
+          let restartTimer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            restart = await Promise.race([
+              restartComfyUI(),
+              new Promise<undefined>((resolve) => {
+                restartTimer = setTimeout(() => resolve(undefined), restartBudget);
+                restartTimer.unref?.();
+              }),
+            ]);
+          } catch (err) {
+            clearTimeout(restartTimer);
+            void proofPromise.catch(() => {}); // self-terminates at proofDeadline
+            return fail(
+              `${why}, and ${mechanism} also failed: ` +
+                (err instanceof Error ? err.message : String(err)) +
+                " — restart ComfyUI on the host, then reconnect.",
+            );
+          }
+          clearTimeout(restartTimer);
+          // #742 r5/r6: the managed restart stopped the process — record the
+          // dispatch with THIS session holding the token, stamped with the
+          // BOUND-CONFIRMED base (this path only runs when the instance
+          // binding held, so healthBase is non-null here). restartComfyUI
+          // also stamped its own process-wide record, which never grounds
+          // causation. Only a PROVEN stop is recorded; a refusal/timeout
+          // (restart undefined, or stopped!==true) records nothing. The
+          // token is kept so the recovery clear below is CLEAR-IF-SAME (r15).
+          let headlessDispatchToken: string | undefined;
+          if (restart?.stopped === true) {
+            headlessDispatchToken = stampSessionRestartDispatch(ctx, healthBase);
+          }
+          // DEFINITIVE no-restart: a spawn failure, OR restartComfyUI refused before
+          // stopping anything (no process found / unsafe relaunch → stopped:false &&
+          // started:false). The process was NOT cycled, so the still-healthy endpoint is
+          // the OLD one — fail clearly rather than certify a no-op (coordinator P1).
+          if (
+            restart?.spawn_error ||
+            (restart != null && restart.stopped !== true && restart.started !== true)
+          ) {
+            void proofPromise.catch(() => {});
+            return fail(
+              `${why}. Tried ${mechanism}, but it did not restart ` +
+                `ComfyUI: ${restart?.message ?? "unknown error"} ` +
+                "Restart ComfyUI on the host, then reconnect.",
+            );
+          }
+          // Otherwise (the process WAS stopped/started, or restartComfyUI's own readiness
+          // poll merely expired — neither terminal) DEFER to OUR OWN observed DOWN→UP.
+          const recovery = await proofPromise;
+          // #742 r4/r5/r15: the managed restart was observed back — clear THIS
+          // session's record, CLEAR-IF-SAME: only when the session still holds
+          // the token THIS restart stamped (a concurrent dispatch's newer
+          // record survives). restartComfyUI also clears its own process-wide
+          // record on success; this covers only-observer-saw-it recoveries.
+          if (recovery.ready && headlessDispatchToken != null) {
+            clearSessionRestartDispatchIfSame(ctx, headlessDispatchToken);
+          }
+          const observed = recovery.via === "observed-cycle";
+          // The headless path restarts ComfyUI out-of-band too. Server recovery alone
+          // is not graph-tool readiness: wait for the browser tab to reconnect, then verify
+          // the same workflow-stamp capability the bridge requires before it dispatches a
+          // mutation. Without this, updating the panel pack followed by a headless restart can
+          // falsely report ready while the browser is still running stale panel JS (#709).
+          const tabBack = recovery.ready
+            ? ctx.awaitPostRestartReachable
+              ? await ctx.awaitPostRestartReachable(
+                  preRestartPanelIdentity,
+                  Math.max(0, overallDeadline - Date.now()),
+                )
+              : ctx.awaitReachable
+                ? await ctx.awaitReachable(Math.max(0, overallDeadline - Date.now()))
+                : true
+            : false;
+          const graphToolsReady = tabBack && (ctx.tabCanMutateGraph ? ctx.tabCanMutateGraph() : true);
+          // #654 — `ready`/`graph_tools_ready` still come from the BOOLEAN, so an
+          // undetermined reconnect withholds graph tools exactly as before. Only
+          // the reported observation changes.
+          const tabReconnect = classifyTabReconnect({
+            serverReady: recovery.ready,
+            baselineCaptured: preRestartPanelIdentity != null,
+            tabBack,
+          });
+          return ok({
+            rebooting: true,
+            ready: graphToolsReady,
+            graph_tools_ready: graphToolsReady,
+            server_ready: recovery.ready,
+            panel_tab_reconnected: tabReconnect,
+            confirmed_cycle: observed, // true = we directly observed the down→up cycle
+            recovered_ms: recovery.waited_ms,
+            probes: recovery.attempts,
+            saw_down: recovery.sawDown,
+            via: recovery.ready ? recovery.via : undefined,
+            note:
+              recovery.ready && !graphToolsReady
+                ? `${noteHealthyLead} came back healthy in ${(recovery.waited_ms / 1000).toFixed(1)}s, but ` +
+                  (!tabBack
+                    ? tabReconnect === "unknown"
+                      ? "whether the panel tab reconnected could NOT be determined — no pre-restart " +
+                        "baseline was captured for it, so nothing was watched. WHY is not established " +
+                        "here, and it is one of: the tab's socket was not open at the instant the " +
+                        "restart was dispatched; the panel advertised no tab session id (an older " +
+                        "build, or its browser-tab lease was refused because a duplicate tab holds " +
+                        "it); or the tab did not resolve at all. The tab may well be back. Graph " +
+                        "tools are withheld (ready:false) because that is unproven, NOT because the " +
+                        'tab is known to be gone: call panel_list_workflows or panel_set_workflow_target({mode:"current"}) ' +
+                        "to find out, and only refresh the browser if those also fail. If this " +
+                        "repeats on every restart, the panel is probably too old to advertise a tab " +
+                        "session id — update it."
+                      : "the panel tab has NOT reconnected yet (ready:false). Wait a moment then retry, or " +
+                        'rebind with panel_set_workflow_target({mode:"current"}) before issuing graph tools.'
+                    : "the panel tab reconnected but cannot safely run graph mutations (ready:false), usually " +
+                      "because it is still running a stale panel bundle. Hard-refresh the ComfyUI browser tab " +
+                      "(Ctrl+Shift+R) before issuing graph tools; if that does not restore it, update the panel " +
+                      "and open/reload a saved workflow with a stable identity.")
+                : `${noteRanLead} ` +
+                  (recovery.ready
+                    ? `and it came back healthy in ${(recovery.waited_ms / 1000).toFixed(1)}s` +
+                      (observed ? " (observed it go down then come back)." : " (cycle not directly observed).")
+                    : `but it did NOT become healthy within ${Math.round(recovery.waited_ms / 1000)}s — verify with get_system_stats (action:"health") / panel_node_queue_status before assuming it restarted.`),
+          });
+        };
+        // panel#1262: A CONFIGURED RESTART COMMAND REPLACES THE TAB REBOOT.
+        //
+        // On an externally-managed local install (a container, a systemd unit, a
+        // launcher) the tab reboot is the WRONG mechanism twice over: the
+        // refuse-safe preflight below cannot prove a relaunch from a bare
+        // `main.py` argv that anchors only inside the instance's own namespace
+        // (so it refuses and the wedge wins), and a wedged server answers no
+        // Manager reboot anyway. COMFYUI_RESTART_COMMAND is the user's explicit
+        // statement of what cycles the instance, so when it is set the restart
+        // runs through it (headless restartComfyUI honors it) instead of the
+        // tab dispatch. The BUSY GUARD the server-side reboot would have
+        // enforced is re-implemented here against a VERIFIED queue read, with
+        // the same force:true contract; a queue that cannot be read at all (the
+        // wedge itself) refuses without force, because "cannot check" is not
+        // "idle" and a restart aborts whatever is running.
+        const configuredRestartCommand = config.comfyuiRestartCommand;
+        if (configuredRestartCommand && !isRemoteMode() && !isCloudMode()) {
+          const commandHealthBase = captureRebootHealthBase(ctx);
+          if (commandHealthBase != null && sameHttpBase(getComfyUIBaseUrl(), commandHealthBase)) {
+            if (force !== true) {
+              let busyCount: number | null = null;
+              try {
+                const queue = await getQueueVerified();
+                busyCount = queue.queue_running.length + queue.queue_pending.length;
+              } catch {
+                // unknown-ok: an UNREADABLE queue is the wedge case itself — null
+                // below refuses without force (fail closed), it never reads as idle.
+                busyCount = null;
+              }
+              if (busyCount !== 0) {
+                return ok({
+                  rebooting: false,
+                  ready: false,
+                  confirmed_cycle: false,
+                  refused: true,
+                  note:
+                    busyCount === null
+                      ? "Refusing to restart ComfyUI: COMFYUI_RESTART_COMMAND is set, so the " +
+                        "restart runs the configured command — which ABORTS any in-progress or " +
+                        "queued generation — and the queue could not be read to confirm it is " +
+                        "idle (the server is not answering, which may be the very wedge you are " +
+                        "restarting to escape). Nothing was stopped. If the user confirms any " +
+                        "running render may be killed, retry with force:true."
+                      : `Refusing to restart ComfyUI: ${busyCount} generation(s) are in progress ` +
+                        "or queued, and the configured restart command ABORTS them. Nothing was " +
+                        "stopped. Wait for the queue to drain (poll panel_node_queue_status), or " +
+                        "retry with force:true ONLY if the user explicitly confirms they want to " +
+                        "kill the running generation.",
+                });
+              }
+            }
+            // The busy-check AWAIT makes the pre-await binding capture stale (r7's
+            // own rule): a retarget or tab rebind landing during it would run the
+            // command against an instance this tab no longer provably fronts.
+            // Re-heal and re-verify at the point of action, exactly as the
+            // dispatch path below does.
+            ctx.ensureReachable?.();
+            const postCheckHealthBase = captureRebootHealthBase(ctx);
+            if (
+              postCheckHealthBase == null ||
+              !sameHttpBase(commandHealthBase, postCheckHealthBase)
+            ) {
+              return ok({
+                rebooting: false,
+                ready: false,
+                confirmed_cycle: false,
+                refused: true,
+                note:
+                  "Refusing to restart ComfyUI: the panel connection or target changed " +
+                  "while the queue was being checked, so I can no longer confirm the " +
+                  "configured restart command would act on the instance this tab fronts. " +
+                  "Nothing was stopped. Retry once the panel has settled.",
+              });
+            }
+            return runHeadlessManagedRestart({
+              healthBase: commandHealthBase,
+              preRestartPanelIdentity: ctx.panelConnectionIdentity?.(),
+              why: "COMFYUI_RESTART_COMMAND is set",
+              mechanism: "the configured restart command",
+              noteHealthyLead:
+                "COMFYUI_RESTART_COMMAND is set, so the restart ran through the configured " +
+                "command; ComfyUI",
+              noteRanLead:
+                "COMFYUI_RESTART_COMMAND is set, so the restart ran through the configured " +
+                "command (not the Manager reboot)",
+            });
+          }
+          // UNBOUND local target: the configured command acts on the orchestrator's
+          // CONFIGURED target, which is not provably the instance this tab fronts —
+          // fall through to the normal preflight/refusal machinery below (its refusal
+          // names restart_comfyui, the non-tab-scoped entry point that CAN use it).
+        }
         // #742 REFUSE-SAFE PREFLIGHT: a Manager reboot stops ComfyUI OUT-OF-BAND —
         // it never goes through our validated kill+relaunch — so before dispatching
         // anything, the stop must be provable survivable (#368/#370: losing a restart
@@ -13382,7 +13659,10 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
                 "from whatever launches it (its own launcher — e.g. Pinokio's own controls — " +
                 "the Desktop app, or your terminal); for an externally-managed install you " +
                 "can also point COMFYUI_PATH " +
-                "at the live install so a relaunch can be proven and use restart_comfyui.",
+                "at the live install so a relaunch can be proven and use restart_comfyui, " +
+                "or set COMFYUI_RESTART_COMMAND to the exact command that restarts the " +
+                "instance (e.g. `docker restart <container>`) — both restart tools then run " +
+                "that command instead of needing the launch path resolvable from here.",
             });
           }
           // Otherwise: a PASS with a stable config (proven safe for THE
@@ -13613,171 +13893,16 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
             healthBase != null &&
             sameHttpBase(getComfyUIBaseUrl(), healthBase)
           ) {
-            // The managed kill+relaunch does UNPREEMPTIBLE synchronous execSync work — PID
-            // discovery (~5+8s) + termination (~10s) + first port-free lookup (~13s) ≈ 40s
-            // worst case (Windows) — that a Promise.race CANNOT interrupt, and it BLOCKS the
-            // observer during that window. Admit it ONLY with enough budget for that sync
-            // work AND a full cold-start observation AFTER it, and give the observer a
-            // deadline that spans BOTH (coordinator P1: the proof deadline must start after,
-            // not before, the restart's synchronous work — otherwise a genuine cold start
-            // that finishes at sync+coldStart false-times-out).
-            const LEGACY_SYNC_WORST_CASE_MS = 40_000; // execSync PID lookup + kill + port-free
-            const LEGACY_COLD_START_OBS_MS = 100_000; // cold-start observation AFTER the sync
-            const LEGACY_RESTART_MIN_BUDGET_MS = LEGACY_SYNC_WORST_CASE_MS + LEGACY_COLD_START_OBS_MS;
-            if (overallDeadline - Date.now() < LEGACY_RESTART_MIN_BUDGET_MS) {
-              return ok({
-                rebooting: false,
-                ready: false,
-                confirmed_cycle: false,
-                note:
-                  "The built-in Manager exposed no reboot endpoint (legacy Manager 3.x), and " +
-                  "there isn't enough remaining time to safely run the headless managed restart " +
-                  "(kill + relaunch). ComfyUI was NOT restarted — retry panel_restart_comfyui " +
-                  "(a fresh call gets the full budget).",
-              });
-            }
-            // A managed kill+relaunch restarts ComfyUI out-of-band, so drop the memoized
-            // caches. The observer watches the boot endpoint itself with a deadline spanning
-            // the ~40s blocking sync + a full cold-start window, and certifies ONLY on an
-            // OBSERVED down→up — a never-restarted healthy endpoint (a Desktop first-healthy
-            // Manager-reboot / preflight no-op) is honestly couldn't-confirm (coordinator P1).
-            resetClient();
-            resetObjectInfoCache();
-            resetManagerApiCache("panel managed restart");
-            // The observation window spans the ~40s blocking sync + a full cold-start
-            // window. (Under a test timing override, use the injected budget instead so the
-            // never-certify cases don't wait the real ~140s.)
-            const legacyProofWindow = panelRebootTimingOverride
-              ? timing.settleMs + timing.budgetMs
-              : LEGACY_RESTART_MIN_BUDGET_MS;
-            const proofDeadline = Math.min(Date.now() + legacyProofWindow, overallDeadline);
-            const proofPromise = observeRecovery(timing, proofDeadline, { healthBase });
-            const restartBudget = Math.max(1, overallDeadline - Date.now());
-            let restart: Awaited<ReturnType<typeof restartComfyUI>> | undefined;
-            let restartTimer: ReturnType<typeof setTimeout> | undefined;
-            try {
-              restart = await Promise.race([
-                restartComfyUI(),
-                new Promise<undefined>((resolve) => {
-                  restartTimer = setTimeout(() => resolve(undefined), restartBudget);
-                  restartTimer.unref?.();
-                }),
-              ]);
-            } catch (err) {
-              clearTimeout(restartTimer);
-              void proofPromise.catch(() => {}); // self-terminates at proofDeadline
-              return fail(
-                "The built-in Manager exposed no reboot endpoint (legacy Manager 3.x), " +
-                  "and the headless managed restart also failed: " +
-                  (err instanceof Error ? err.message : String(err)) +
-                  " — restart ComfyUI on the host, then reconnect.",
-              );
-            }
-            clearTimeout(restartTimer);
-            // #742 r5/r6: the managed restart stopped the process — record the
-            // dispatch with THIS session holding the token, stamped with the
-            // BOUND-CONFIRMED base (this fallback only runs when the instance
-            // binding held, so healthBase is non-null here). restartComfyUI
-            // also stamped its own process-wide record, which never grounds
-            // causation. Only a PROVEN stop is recorded; a refusal/timeout
-            // (restart undefined, or stopped!==true) records nothing. The
-            // token is kept so the recovery clear below is CLEAR-IF-SAME (r15).
-            let legacyDispatchToken: string | undefined;
-            if (restart?.stopped === true) {
-              legacyDispatchToken = stampSessionRestartDispatch(ctx, healthBase);
-            }
-            // DEFINITIVE no-restart: a spawn failure, OR restartComfyUI refused before
-            // stopping anything (no process found / unsafe relaunch → stopped:false &&
-            // started:false). The process was NOT cycled, so the still-healthy endpoint is
-            // the OLD one — fail clearly rather than certify a no-op (coordinator P1).
-            if (
-              restart?.spawn_error ||
-              (restart != null && restart.stopped !== true && restart.started !== true)
-            ) {
-              void proofPromise.catch(() => {});
-              return fail(
-                "The built-in Manager exposed no reboot endpoint (legacy Manager 3.x). " +
-                  "Tried the headless managed restart (kill + relaunch), but it did not restart " +
-                  `ComfyUI: ${restart?.message ?? "unknown error"} ` +
-                  "Restart ComfyUI on the host, then reconnect.",
-              );
-            }
-            // Otherwise (the process WAS stopped/started, or restartComfyUI's own readiness
-            // poll merely expired — neither terminal) DEFER to OUR OWN observed DOWN→UP.
-            const recovery = await proofPromise;
-            // #742 r4/r5/r15: the managed restart was observed back — clear THIS
-            // session's record, CLEAR-IF-SAME: only when the session still holds
-            // the token THIS restart stamped (a concurrent dispatch's newer
-            // record survives). restartComfyUI also clears its own process-wide
-            // record on success; this covers only-observer-saw-it recoveries.
-            if (recovery.ready && legacyDispatchToken != null) {
-              clearSessionRestartDispatchIfSame(ctx, legacyDispatchToken);
-            }
-            const observed = recovery.via === "observed-cycle";
-            // The legacy Manager path restarts ComfyUI out-of-band too. Server recovery alone
-            // is not graph-tool readiness: wait for the browser tab to reconnect, then verify
-            // the same workflow-stamp capability the bridge requires before it dispatches a
-            // mutation. Without this, updating the panel pack followed by a legacy restart can
-            // falsely report ready while the browser is still running stale panel JS (#709).
-            const tabBack = recovery.ready
-              ? ctx.awaitPostRestartReachable
-                ? await ctx.awaitPostRestartReachable(
-                    preRestartPanelIdentity,
-                    Math.max(0, overallDeadline - Date.now()),
-                  )
-                : ctx.awaitReachable
-                  ? await ctx.awaitReachable(Math.max(0, overallDeadline - Date.now()))
-                  : true
-              : false;
-            const graphToolsReady = tabBack && (ctx.tabCanMutateGraph ? ctx.tabCanMutateGraph() : true);
-            // #654 — `ready`/`graph_tools_ready` still come from the BOOLEAN, so an
-            // undetermined reconnect withholds graph tools exactly as before. Only
-            // the reported observation changes.
-            const tabReconnect = classifyTabReconnect({
-              serverReady: recovery.ready,
-              baselineCaptured: preRestartPanelIdentity != null,
-              tabBack,
-            });
-            return ok({
-              rebooting: true,
-              ready: graphToolsReady,
-              graph_tools_ready: graphToolsReady,
-              server_ready: recovery.ready,
-              panel_tab_reconnected: tabReconnect,
-              confirmed_cycle: observed, // true = we directly observed the down→up cycle
-              recovered_ms: recovery.waited_ms,
-              probes: recovery.attempts,
-              saw_down: recovery.sawDown,
-              via: recovery.ready ? recovery.via : undefined,
-              note:
-                recovery.ready && !graphToolsReady
-                  ? "ComfyUI-Manager (legacy 3.x) had no reboot endpoint; the headless managed restart " +
-                    `came back healthy in ${(recovery.waited_ms / 1000).toFixed(1)}s, but ` +
-                    (!tabBack
-                      ? tabReconnect === "unknown"
-                        ? "whether the panel tab reconnected could NOT be determined — no pre-restart " +
-                          "baseline was captured for it, so nothing was watched. WHY is not established " +
-                          "here, and it is one of: the tab's socket was not open at the instant the " +
-                          "restart was dispatched; the panel advertised no tab session id (an older " +
-                          "build, or its browser-tab lease was refused because a duplicate tab holds " +
-                          "it); or the tab did not resolve at all. The tab may well be back. Graph " +
-                          "tools are withheld (ready:false) because that is unproven, NOT because the " +
-                          'tab is known to be gone: call panel_list_workflows or panel_set_workflow_target({mode:"current"}) ' +
-                          "to find out, and only refresh the browser if those also fail. If this " +
-                          "repeats on every restart, the panel is probably too old to advertise a tab " +
-                          "session id — update it."
-                        : "the panel tab has NOT reconnected yet (ready:false). Wait a moment then retry, or " +
-                          'rebind with panel_set_workflow_target({mode:"current"}) before issuing graph tools.'
-                      : "the panel tab reconnected but cannot safely run graph mutations (ready:false), usually " +
-                        "because it is still running a stale panel bundle. Hard-refresh the ComfyUI browser tab " +
-                        "(Ctrl+Shift+R) before issuing graph tools; if that does not restore it, update the panel " +
-                        "and open/reload a saved workflow with a stable identity.")
-                  : "ComfyUI-Manager (legacy 3.x) had no reboot endpoint; ran the headless managed " +
-                "restart (kill + relaunch) " +
-                (recovery.ready
-                  ? `and it came back healthy in ${(recovery.waited_ms / 1000).toFixed(1)}s` +
-                    (observed ? " (observed it go down then come back)." : " (cycle not directly observed).")
-                  : `but it did NOT become healthy within ${Math.round(recovery.waited_ms / 1000)}s — verify with get_system_stats (action:"health") / panel_node_queue_status before assuming it restarted.`),
+            return runHeadlessManagedRestart({
+              healthBase,
+              preRestartPanelIdentity,
+              why: "The built-in Manager exposed no reboot endpoint (legacy Manager 3.x)",
+              mechanism: "the headless managed restart (kill + relaunch)",
+              noteHealthyLead:
+                "ComfyUI-Manager (legacy 3.x) had no reboot endpoint; the headless managed restart",
+              noteRanLead:
+                "ComfyUI-Manager (legacy 3.x) had no reboot endpoint; ran the headless managed " +
+                "restart (kill + relaunch)",
             });
           }
           // Genuine refusal (busy guard / security / no eligible fallback) — return

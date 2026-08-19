@@ -53,6 +53,17 @@ ayarlayın.
   gerektirir (düğüm kur/yönet, modelleri kaldır, günlükleri oku, çıktı
   dosyalarını listele).
 </ParamField>
+<ParamField path="COMFYUI_RESTART_COMMAND" type="string">
+  **Harici yönetilen** bir ComfyUI'yi yeniden başlatan kabuk komutu — örn.
+  `docker restart comfyui` veya `systemctl --user restart comfyui`. Ayarlıyken
+  `restart_comfyui`, kill+relaunch yerine bu komutu çalıştırır (kill+relaunch,
+  kurulumun başlatma yolunun çözümlenebilir olmasını gerektirir — `main.py`'si
+  yalnızca kendi ad alanı içinde çapalanan bir kapsayıcı ya da başlatıcı için
+  imkânsızdır) ve `panel_restart_comfyui` da onun üzerinden geçer. Yalnızca
+  yerel hedefler; uzak/bulut hedefleri Manager-reboot yolunu korur. Yeniden
+  başlatma, örneğin sağlıklı döndüğünü doğrular ve döngüyü yalnızca down→up
+  gerçekten gözlendiğinde confirmed olarak bildirir.
+</ParamField>
 
 ## Ters vekil / API geçidi arkasındaki uzak
 

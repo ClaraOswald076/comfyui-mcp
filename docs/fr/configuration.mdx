@@ -57,6 +57,18 @@ définissez `COMFYUI_PATH` explicitement si vous voulez mélanger.
   distant/cloud). Requis par les outils uniquement locaux (installer/gérer les
   nœuds, supprimer des modèles, lire les logs, lister les fichiers de sortie).
 </ParamField>
+<ParamField path="COMFYUI_RESTART_COMMAND" type="string">
+  Commande shell qui redémarre un ComfyUI **géré de l'extérieur** — p. ex.
+  `docker restart comfyui` ou `systemctl --user restart comfyui`. Quand elle est
+  définie, `restart_comfyui` exécute cette commande au lieu du kill+relaunch
+  (qui exige que le chemin de lancement de l'installation soit résoluble —
+  impossible pour un conteneur ou un lanceur dont le `main.py` ne s'ancre que
+  dans son propre espace de noms), et `panel_restart_comfyui` passe aussi par
+  elle. Cibles locales uniquement ; les cibles distantes/cloud gardent le
+  redémarrage via le Manager. Le redémarrage vérifie que l'instance est revenue
+  saine et ne déclare le cycle confirmé que si le down→up a été réellement
+  observé.
+</ParamField>
 
 ## Distant derrière un reverse proxy / passerelle API
 
