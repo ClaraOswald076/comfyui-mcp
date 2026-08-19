@@ -165,6 +165,165 @@ describe("panel launcher install", () => {
     expect(spawned).toEqual([]);
   });
 
+  it("still finds the live broker on a SECOND install (no pid needed)", async () => {
+    // The previous version of this test hand-wrote `pid: process.pid` into the
+    // config immediately before installing — manufacturing the exact state that
+    // install itself destroys, and so blind by construction to the real bug:
+    // the config write dropped `pid`, the liveness guard required one, and every
+    // install after the first skipped the query and spawned a duplicate broker
+    // beside a live one. Here the config is only ever written by the code under
+    // test (merge-gate P1).
+    const { home, source } = fixture();
+    const spawned: Array<readonly string[]> = [];
+    const denied = (() => {
+      throw new Error("denied");
+    }) as never;
+    const record = ((_file: string, args: readonly string[]) => {
+      spawned.push(args);
+      return { unref() {} };
+    }) as never;
+
+    await installPanelLauncher({ home, platform: "win32", brokerSource: source, exec: denied, spawnImpl: record });
+    const cfg = JSON.parse(readFileSync(panelLauncherPaths(home).config, "utf8"));
+    const server = createServer((req, res) => {
+      const ok = req.headers.authorization === `Bearer ${cfg.token}`;
+      res.writeHead(ok ? 200 : 401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok, protocol: 1, orchestrator_running: false }));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const port = (server.address() as { port: number }).port;
+    // Exactly what a live broker publishes: its port and pid, nothing hand-made.
+    writeFileSync(
+      panelLauncherPaths(home).config,
+      JSON.stringify({ ...cfg, port, pid: process.pid }),
+      "utf8",
+    );
+
+    try {
+      spawned.length = 0;
+      await installPanelLauncher({ home, platform: "win32", brokerSource: source, exec: denied, spawnImpl: record });
+      expect(spawned, "second install spawned a rival broker").toEqual([]);
+      // …and the install must not have erased the pid for the NEXT one either.
+      expect(readPanelLauncherConfig(home)?.pid).toBe(process.pid);
+      spawned.length = 0;
+      await installPanelLauncher({ home, platform: "win32", brokerSource: source, exec: denied, spawnImpl: record });
+      expect(spawned, "third install spawned a rival broker").toEqual([]);
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  it("the PORT is the evidence — a live broker with no pid recorded still counts", async () => {
+    // The pid is not evidence of anything the query needs: it is the port and
+    // token that get asked. A config carrying a port but no pid — an older
+    // broker, or any write that did not publish one — must not send us spawning
+    // a rival on top of a broker that is plainly answering.
+    const { home, source } = fixture();
+    const spawned: Array<readonly string[]> = [];
+    await installPanelLauncher({
+      home,
+      platform: "win32",
+      brokerSource: source,
+      exec: (() => undefined) as never,
+    });
+    const cfg = JSON.parse(readFileSync(panelLauncherPaths(home).config, "utf8"));
+    const server = createServer((req, res) => {
+      const ok = req.headers.authorization === `Bearer ${cfg.token}`;
+      res.writeHead(ok ? 200 : 401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok, protocol: 1, orchestrator_running: true }));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const port = (server.address() as { port: number }).port;
+    const { pid: _dropped, ...noPid } = { ...cfg, port } as Record<string, unknown>;
+    writeFileSync(panelLauncherPaths(home).config, JSON.stringify(noPid), "utf8");
+    try {
+      await installPanelLauncher({
+        home,
+        platform: "win32",
+        brokerSource: source,
+        exec: (() => {
+          throw new Error("denied");
+        }) as never,
+        spawnImpl: ((_file: string, args: readonly string[]) => {
+          spawned.push(args);
+          return { unref() {} };
+        }) as never,
+      });
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+    expect(spawned).toEqual([]);
+  });
+
+  it("a stranger on the recycled port is not mistaken for our broker", async () => {
+    const { home, source } = fixture();
+    const spawned: Array<readonly string[]> = [];
+    await installPanelLauncher({
+      home,
+      platform: "win32",
+      brokerSource: source,
+      exec: (() => undefined) as never,
+    });
+    const cfg = JSON.parse(readFileSync(panelLauncherPaths(home).config, "utf8"));
+    // 200 + parseable JSON, but not our protocol — ports get recycled and the
+    // next holder may answer anything at all.
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ hello: "some other service" }));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const port = (server.address() as { port: number }).port;
+    writeFileSync(
+      panelLauncherPaths(home).config,
+      JSON.stringify({ ...cfg, port, pid: process.pid }),
+      "utf8",
+    );
+    try {
+      await installPanelLauncher({
+        home,
+        platform: "win32",
+        brokerSource: source,
+        exec: (() => {
+          throw new Error("denied");
+        }) as never,
+        spawnImpl: ((_file: string, args: readonly string[]) => {
+          spawned.push(args);
+          return { unref() {} };
+        }) as never,
+      });
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+    expect(spawned).toEqual([[panelLauncherPaths(home).broker, "run"]]);
+  });
+
+  it("a /Create failure with the task ALREADY registered adds no second autostart", async () => {
+    // /Create failing does not prove the account cannot register a task: the Task
+    // Scheduler service stopped or set to Manual, RPC unavailable, or a GPO
+    // applied after an earlier successful install all fail while leaving a live
+    // registered task. Writing the Startup entry anyway put it beside that task
+    // and both fired at logon — two brokers racing on launcher.json.
+    const { home, source } = fixture();
+    const spawned: Array<readonly string[]> = [];
+    const seen: string[] = [];
+    const paths = await installPanelLauncher({
+      home,
+      platform: "win32",
+      brokerSource: source,
+      exec: ((_file: string, args: readonly string[]) => {
+        seen.push(String(args[0]));
+        if (args[0] === "/Create") throw new Error("The Task Scheduler service is not available.");
+        return undefined; // /Query succeeds → the task exists
+      }) as never,
+      spawnImpl: ((_file: string, args: readonly string[]) => {
+        spawned.push(args);
+        return { unref() {} };
+      }) as never,
+    });
+    expect(seen).toContain("/Query");
+    expect(existsSync(paths.windowsStartup), "wrote a duplicate autostart").toBe(false);
+  });
+
   it("DOES start one when the pid is alive but nothing answers (recycled pid)", async () => {
     const { home, source } = fixture();
     const spawned: Array<readonly string[]> = [];

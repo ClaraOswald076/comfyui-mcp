@@ -203,7 +203,11 @@ export async function installPanelLauncher(
     // its own fix. `queryPanelLauncher` asks the recorded port, with the recorded
     // token, whether a broker is actually answering. Anything short of a live
     // answer means start one (merge-gate P1).
-    if (previous?.pid && previous.port) {
+    // Keyed on the PORT alone. Gating on a pid as well meant the query never ran
+    // on a second install — this function's own config write used to drop the
+    // pid — so a duplicate broker was spawned beside a live one (merge-gate P1).
+    // The port is what the query actually uses; the pid was never evidence.
+    if (previous?.port) {
       const live = (await queryPanelLauncher(home)) as { running?: boolean };
       if (live.running) return; // a real broker answered — leave it alone
     }
@@ -219,6 +223,12 @@ export async function installPanelLauncher(
       host: "127.0.0.1",
       port: previous?.port ?? 0,
       token: previous?.token ?? randomBytes(32).toString("base64url"),
+      // The running broker's pid is the broker's to publish, not this install's
+      // to erase. Dropping it made the config say "no broker has ever run here"
+      // to every subsequent install (merge-gate P1) — the port and token were
+      // carried over but the pid was not, which is an incoherent record of the
+      // same broker.
+      ...(previous?.pid ? { pid: previous.pid } : {}),
       updated_at: new Date().toISOString(),
     },
     home,
@@ -277,19 +287,45 @@ export async function installPanelLauncher(
       );
       taskRegistered = true;
     } catch (err) {
-      mkdirSync(dirname(paths.windowsStartup), { recursive: true });
-      writeFileSync(
-        paths.windowsStartup,
-        `@echo off\r\nstart "" /min "${paths.windowsScript}"\r\n`,
-        "utf8",
-      );
-      // Not silent: the user asked for a launcher and got a different mechanism
-      // than the one this tool normally installs, which changes how they would
-      // later remove or debug it.
-      process.stderr?.write?.(
-        `[comfyui-mcp] scheduled task refused (${schtasksReason(err)}); ` +
-          `registered a Startup-folder autostart instead: ${paths.windowsStartup}\n`,
-      );
+      // A /Create failure does NOT prove this account can never register an
+      // autostart — only that THIS call failed. The Task Scheduler service being
+      // stopped or set to Manual, RPC being unavailable, or a GPO applied after
+      // an earlier successful install all fail here while leaving a registered
+      // task intact. Writing the Startup entry anyway put it beside that task, so
+      // both fired at the next logon and two brokers raced on launcher.json —
+      // the same collapse the /Run branch was split out to avoid, left open on
+      // this branch (merge-gate P1). So ASK whether the task exists.
+      let alreadyRegistered = false;
+      try {
+        run("schtasks.exe", ["/Query", "/TN", PANEL_LAUNCHER_TASK], { stdio: "ignore" });
+        alreadyRegistered = true;
+      } catch {
+        // No such task (or we cannot even query) → the fallback is warranted.
+      }
+      if (alreadyRegistered) {
+        // It IS registered — that task is the autostart. This session may still
+        // need a broker, which the /Run attempt below (and then
+        // startBrokerIfIdle) provides.
+        taskRegistered = true;
+        process.stderr?.write?.(
+          `[comfyui-mcp] schtasks /Create failed (${schtasksReason(err)}), but the ` +
+            `"${PANEL_LAUNCHER_TASK}" task is already registered — leaving it as the autostart.\n`,
+        );
+      } else {
+        mkdirSync(dirname(paths.windowsStartup), { recursive: true });
+        writeFileSync(
+          paths.windowsStartup,
+          `@echo off\r\nstart "" /min "${paths.windowsScript}"\r\n`,
+          "utf8",
+        );
+        // Not silent: the user asked for a launcher and got a different mechanism
+        // than the one this tool normally installs, which changes how they would
+        // later remove or debug it.
+        process.stderr?.write?.(
+          `[comfyui-mcp] scheduled task refused (${schtasksReason(err)}); ` +
+            `registered a Startup-folder autostart instead: ${paths.windowsStartup}\n`,
+        );
+      }
     }
     if (taskRegistered) {
       try {
@@ -673,7 +709,17 @@ export async function queryPanelLauncher(home: string = homedir()): Promise<Reco
         res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
         res.on("end", () => {
           try {
-            resolve({ installed: true, running: res.statusCode === 200, ...JSON.parse(Buffer.concat(chunks).toString("utf8")) });
+            const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<
+              string,
+              unknown
+            >;
+            // 200 + parseable JSON is not proof it is OUR broker: ports get
+            // recycled, and whoever holds this one next may answer anything.
+            // The body already carries the protocol — check it, or the recycled-
+            // port case this liveness probe exists to kill walks straight back in
+            // (merge-gate). Computed AFTER the spread so the body cannot set it.
+            const running = res.statusCode === 200 && body.protocol === PANEL_LAUNCHER_PROTOCOL;
+            resolve({ installed: true, ...body, running });
           } catch {
             resolve({ ok: false, installed: true, running: false, error: "invalid_response" });
           }
