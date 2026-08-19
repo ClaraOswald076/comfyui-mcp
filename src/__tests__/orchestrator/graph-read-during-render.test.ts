@@ -1,0 +1,218 @@
+// #1639 — while a ComfyUI prompt is running, graph_* (including read-only
+// graph_query / graph_outline) time out with "tab may be backgrounded or frozen"
+// and mutating commands report an unknown outcome. 100% correlated with
+// queue action:"list" showing running:1; the same calls succeed the moment
+// the queue drains.
+//
+// The frontend main thread is what cannot answer. The orchestrator CAN see the
+// running prompt via QueueMonitor (HTTP /queue, independent of the panel tab).
+// Fail closed BEFORE dispatch for canvas-touching graph commands so the agent
+// gets an explicit QUEUE BUSY instead of a 20/30s unknown-outcome timeout.
+// `graph_run` is excluded: queuing behind an in-flight job is the documented
+// sweep path. A timeout that still happens (graph_run, or a lagging snapshot)
+// is annotated with the same QUEUE BUSY rather than "backgrounded or frozen".
+
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+import {
+  buildPanelToolDefs,
+  makePanelToolCtx,
+  type PanelToolCtx,
+  type ToolResult,
+} from "../../orchestrator/panel-tools.js";
+import { QueueMonitor } from "../../services/queue-monitor.js";
+import { markReplyTimeout } from "../../services/ui-bridge.js";
+import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
+
+const TAB = "11111111-2222-4333-8444-555555555555";
+
+type QMPriv = {
+  url: string | null;
+  stopped: boolean;
+  selfQueuedIds: Set<string>;
+  lastSelfQueueTs: number | null;
+  state: {
+    connected: boolean;
+    runningPromptId: string | null;
+    pendingPromptIds: string[];
+    currentNode: string | null;
+    queueRemaining: number;
+    lastServerAliveTs: number | null;
+    lastFrameTs: number | null;
+  };
+};
+const qm = QueueMonitor as unknown as QMPriv;
+
+function defByName(name: string) {
+  const def = buildPanelToolDefs().find((d) => d.name === name);
+  if (!def) throw new Error(`tool ${name} not found`);
+  return def;
+}
+
+const textOf = (res: ToolResult): string =>
+  res.content.map((c) => (c as { text?: string }).text ?? "").join(" ");
+
+function makeBridge(opts?: { timeoutCmds?: Set<string> }) {
+  const sent: string[] = [];
+  const timeoutCmds = opts?.timeoutCmds ?? new Set<string>();
+  const bridge = {
+    send: async (cmd: Record<string, unknown>, o?: { onDispatchedRid?: (rid: string) => void }) => {
+      sent.push(String(cmd.cmd));
+      o?.onDispatchedRid?.("rid-timeout-1");
+      if (timeoutCmds.has(String(cmd.cmd))) {
+        throw markReplyTimeout(
+          new Error(
+            `Panel tab ${TAB} did not reply to "${cmd.cmd}" within 20000 ms — the ComfyUI tab ` +
+              `may be backgrounded or frozen`,
+          ),
+        );
+      }
+      return { ok: true, ids: [1], node_count: 1 };
+    },
+    push: () => 1,
+    canReach: () => true,
+    isHeadless: () => false,
+    tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
+    resolveActiveTabId: () => TAB,
+    refreshWorkflowUuid: () => true,
+    workflowUuidFor: () => ({ known: true, uuid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+    tabCanMutateGraph: () => true,
+    tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
+  } as unknown as PanelToolCtx["bridge"];
+  return { bridge, sent };
+}
+
+beforeEach(() => {
+  qm.url = "http://127.0.0.1:9999";
+  qm.stopped = false;
+  qm.selfQueuedIds.clear();
+  qm.lastSelfQueueTs = null;
+  qm.state.connected = true;
+  qm.state.runningPromptId = null;
+  qm.state.pendingPromptIds = [];
+  qm.state.currentNode = null;
+  qm.state.queueRemaining = 0;
+  qm.state.lastServerAliveTs = Date.now();
+  qm.state.lastFrameTs = Date.now();
+});
+
+afterEach(() => {
+  qm.selfQueuedIds.clear();
+  qm.lastSelfQueueTs = null;
+  qm.state.runningPromptId = null;
+  qm.state.currentNode = null;
+  qm.state.queueRemaining = 0;
+  qm.stopped = true;
+  qm.url = null;
+});
+
+describe("graph_* fail fast while a prompt is running (#1639)", () => {
+  it("a read-only graph_query is NOT sent — QUEUE BUSY names the running prompt", async () => {
+    qm.state.runningPromptId = "p-in-flight";
+    qm.state.currentNode = "42";
+    qm.state.queueRemaining = 1;
+
+    const { bridge, sent } = makeBridge();
+    const ctx = makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
+    const res = await defByName("panel_query_graph").handler({ ids: [1], fields: "ids" } as never, ctx);
+    const text = textOf(res);
+
+    expect(sent).toEqual([]);
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/QUEUE BUSY/);
+    expect(text).toMatch(/running prompt p-in-flight/);
+    expect(text).toMatch(/currently at node 42/);
+    expect(text).toMatch(/was NOT sent — nothing was applied/);
+    expect(text).toMatch(/running: 0/);
+    // Mentions the generic frozen-tab wording only as the diagnosis it refuses to
+    // surface — the actual headline is QUEUE BUSY, not a backgrounded tab.
+  });
+
+  it("panel_graph_outline is the same — reads are not exempt", async () => {
+    qm.state.runningPromptId = "p-in-flight";
+    qm.state.queueRemaining = 1;
+
+    const { bridge, sent } = makeBridge();
+    const ctx = makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
+    const res = await defByName("panel_graph_outline").handler({} as never, ctx);
+
+    expect(sent).toEqual([]);
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/QUEUE BUSY/);
+  });
+
+  it("panel_set_widget is NOT delivered — outcome is known (nothing applied)", async () => {
+    qm.state.runningPromptId = "p-in-flight";
+    qm.state.queueRemaining = 1;
+
+    const { bridge, sent } = makeBridge();
+    const ctx = makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
+    const res = await defByName("panel_set_widget").handler(
+      { node_id: 3, widget: "text", value: "a cat" } as never,
+      ctx,
+    );
+    const text = textOf(res);
+
+    expect(sent).toEqual([]);
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/QUEUE BUSY/);
+    expect(text).toMatch(/was NOT sent — nothing was applied/);
+    // A mutation that never left must not invite retry_of / unknown-outcome.
+    expect(text).not.toMatch(/may have been applied/);
+    expect(text).not.toMatch(/retry_of/);
+  });
+
+  it("idle queue: the same read is dispatched", async () => {
+    const { bridge, sent } = makeBridge();
+    const ctx = makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
+    const res = await defByName("panel_query_graph").handler({ ids: [1], fields: "ids" } as never, ctx);
+
+    expect(sent).toEqual(["graph_query"]);
+    expect(res.isError).not.toBe(true);
+  });
+
+  it("graph_run is still dispatched — queuing behind an in-flight job is the sweep path", async () => {
+    qm.state.runningPromptId = "p-own";
+    qm.state.queueRemaining = 1;
+    QueueMonitor.markSelfQueued("p-own");
+
+    const { bridge, sent } = makeBridge();
+    const ctx = makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
+    // panel_run's own duplicate fence would refuse an unaccounted job; mark it ours.
+    const res = await defByName("panel_run").handler({ allow_duplicate: true } as never, ctx);
+
+    expect(sent).toContain("graph_run");
+    expect(textOf(res)).not.toMatch(/was NOT sent/);
+  });
+});
+
+describe("a graph_* timeout while a prompt is running is named QUEUE BUSY (#1639)", () => {
+  it("graph_run's missing ack names the running prompt instead of a frozen tab", async () => {
+    qm.state.runningPromptId = "p-in-flight";
+    qm.state.queueRemaining = 1;
+    QueueMonitor.markSelfQueued("p-in-flight");
+
+    const { bridge, sent } = makeBridge({ timeoutCmds: new Set(["graph_run"]) });
+    const ctx = makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
+    const res = await defByName("panel_run").handler({ allow_duplicate: true } as never, ctx);
+    const text = textOf(res);
+
+    expect(sent).toContain("graph_run");
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/did not reply to "graph_run"/);
+    expect(text).toMatch(/QUEUE BUSY/);
+    expect(text).toMatch(/running prompt p-in-flight/);
+    expect(text).toMatch(/not a backgrounded or frozen tab/i);
+  });
+
+  it("an idle queue does not append QUEUE BUSY onto a genuine timeout", async () => {
+    const { bridge } = makeBridge({ timeoutCmds: new Set(["graph_run"]) });
+    const ctx = makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
+    const res = await defByName("panel_run").handler({} as never, ctx);
+    const text = textOf(res);
+
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/did not reply to "graph_run"/);
+    expect(text).not.toMatch(/QUEUE BUSY/);
+  });
+});

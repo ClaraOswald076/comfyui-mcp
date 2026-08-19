@@ -71,6 +71,17 @@ function bridge(openVerdict: string, listUuid: string | null | "throw") {
         return { active, workflows: [{ ...active, active: true }], active_confirmed: true };
       }
       if (cmd.cmd === "workflow_open") throw new Error(openVerdict);
+      // #1639 — the identity-PROVEN verdict re-derives the fence ONLY when the
+      // live graph refuses this session's existing stamp. A successful graph
+      // read means the canvas did not actually switch; those cases are covered
+      // in open-content-mismatch-fence.test.ts.
+      if (cmd.cmd === "graph_query") {
+        throw new Error(
+          "workflow instance mismatch: issued for workflow instance " +
+            "00000000-0000-4000-8000-000000000000 but canvas is " +
+            LIVE,
+        );
+      }
       return { ok: true };
     },
     push: () => 1,

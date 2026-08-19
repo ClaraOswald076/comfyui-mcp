@@ -93,6 +93,16 @@ function bridge(openVerdict: string, list: ListBehaviour) {
         return { active, workflows: [{ ...active, active: true }], active_confirmed: true };
       }
       if (cmd.cmd === "workflow_open") throw new Error(openVerdict);
+      // #1639 — identity-PROVEN re-derivation is gated on the live graph
+      // refusing this session's stamp. Without this the probe would succeed
+      // (this stub's default `{ok:true}`) and the fence would stay closed.
+      if (cmd.cmd === "graph_query") {
+        throw new Error(
+          "workflow instance mismatch: issued for workflow instance " +
+            "00000000-0000-4000-8000-000000000000 but canvas is " +
+            LIVE,
+        );
+      }
       return { ok: true };
     },
     push: () => 1,
