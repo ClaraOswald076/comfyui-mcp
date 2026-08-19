@@ -41,12 +41,20 @@ function switchGuardError(cmd = "graph_outline"): Error {
 }
 
 let attempts: number;
+/** Every command name this fixture was asked to send, in order. `attempts` counts
+ *  ALL of them, which is not the same question as "was the command under test
+ *  re-issued?": a refusal may cost a read-only DIAGNOSIS round trip (#1519 reads
+ *  `workflow_list` to say which fence state a mismatch is). Keep the two apart so
+ *  a retry assertion is made about the retry. */
+let sent: string[];
 
 /** Fails the first `failures` sends with the switch guard, then succeeds. */
 function bridgeFailing(failures: number, err: () => Error = switchGuardError) {
   attempts = 0;
+  sent = [];
   return {
-    send: async () => {
+    send: async (cmd: Record<string, unknown>) => {
+      sent.push(typeof cmd?.cmd === "string" ? cmd.cmd : "");
       attempts += 1;
       if (attempts <= failures) throw err();
       return { ok: true, nodes: [] };
@@ -131,7 +139,13 @@ describe("#1027: the other refusals keep their own handling", () => {
     );
     const res = await ctx.call({ cmd: "graph_outline" });
     expect(res.isError).toBe(true);
-    expect(attempts).toBe(1);
+    // Asserted about the READ itself, which is what "not retried" means here: the
+    // stamp names a workflow that is no longer active and waiting cannot change
+    // that, so re-issuing it would report the same thing one round trip later.
+    // #1519 does spend one READ-ONLY `workflow_list` to say WHICH fence state the
+    // mismatch is — a diagnosis, not a re-issue — so it is counted separately
+    // rather than folded into a bare send count that cannot tell them apart.
+    expect(sent.filter((c) => c === "graph_outline")).toEqual(["graph_outline"]);
   });
 });
 
