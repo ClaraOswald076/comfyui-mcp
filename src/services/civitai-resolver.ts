@@ -146,6 +146,19 @@ function transportError(err: unknown, url: string): ModelError | null {
     );
   }
   if (err instanceof TypeError) {
+    // A malformed Authorization header (e.g. CIVITAI_API_TOKEN pasted with
+    // non-ASCII characters) ALSO rejects as TypeError, but it is a LOCAL
+    // credential-config fault, not a connectivity fault. Labelling it
+    // "unreachable / check connectivity" sends the caller down the wrong
+    // diagnostic path.
+    if (/ByteString|greater than 255|Invalid header|invalid header/i.test(err.message)) {
+      return new ModelError(
+        `CivitAI credential is invalid: the API token contains characters that ` +
+          `cannot be sent in an HTTP header (non-ASCII). Re-enter CIVITAI_API_TOKEN as the raw ASCII ` +
+          `token — no quotes, no "Bearer " prefix, no label or translated text. (raw: ${err.message})`,
+        { url, credential: true },
+      );
+    }
     return new ModelError(
       `CivitAI is unreachable (network error: ${err.message}) — ` +
         `check connectivity and try again.`,
