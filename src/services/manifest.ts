@@ -45,6 +45,14 @@ import {
 } from "./workspace-env.js";
 import { ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import {
+  buildManifestPartial,
+  describeManifestSource,
+  formatNotStartedMessage,
+  formatStillInstallingMessage,
+  recordManifestPartial,
+  type ManifestPartialInstall,
+} from "./manifest-partial.js";
 
 /** Grace window (ms) to await a manifest model download before handing back a
  *  background job handle. Keeps apply_manifest under the MCP tools/call timeout
@@ -242,6 +250,12 @@ export interface ApplyManifestResult {
   success: boolean;
   summary: Record<ManifestItemStatus, number>;
   results: ManifestItemReport[];
+  /**
+   * Present only when some custom_nodes were never submitted to ComfyUI-Manager
+   * (#1699). Names the PARTIAL INSTALL. A drained Manager queue does not include
+   * these entries — re-run apply_manifest to submit them.
+   */
+  partial?: ManifestPartialInstall;
 }
 
 function parseManifestText(path: string, text: string): unknown {
@@ -944,7 +958,7 @@ export async function applyManifest(
   // classification + pip's interpreter, never where a model lands.
   const localBase = await resolveLocalManifestBase();
 
-  return applyManifestSections(manifest, localBase);
+  return applyManifestSections(manifest, localBase, describeManifestSource(opts));
 }
 
 /**
@@ -979,6 +993,7 @@ async function resolveLocalManifestBase(): Promise<string | undefined> {
 async function applyManifestSections(
   manifest: ComfyManifest,
   localBase: string | undefined,
+  source: string,
 ): Promise<ApplyManifestResult> {
   const results: ManifestItemReport[] = [];
 
@@ -1043,18 +1058,17 @@ async function applyManifestSections(
   // install sequentially, but RACE each install against the remaining budget. If
   // the budget wins, the install keeps running SERVER-SIDE (we stop awaiting it,
   // swallowing its late result) and is reported "pending" — never failed — and
-  // every not-yet-started node is reported "pending" too. The caller polls the
-  // Manager queue / re-runs apply_manifest to finish. A node that SETTLES within
-  // budget is verified and reported applied/failed exactly as before.
+  // every not-yet-started node is reported "pending" too.
+  //
+  // #1699: a "not started" pending is NOT on the Manager queue. Telling the
+  // caller to poll panel_node_queue_status then produced a false complete
+  // (drained queue) while those packs were never submitted. Those entries are
+  // named as a PARTIAL INSTALL; the queue is only the in-flight ones. Re-run
+  // apply_manifest to submit the rest. A node that SETTLES within budget is
+  // verified and reported applied/failed exactly as before.
   const nodeDeadline = Date.now() + manifestNodeBudgetMs();
-  const pendingBudgetMessage = (started: boolean): string =>
-    started
-      ? "Still installing on the ComfyUI-Manager queue when the apply_manifest time " +
-        "budget elapsed. This is NOT a failure — the install continues server-side. " +
-        "Poll the Manager queue for completion; do not re-issue this node."
-      : "Not started: the apply_manifest time budget elapsed while ComfyUI-Manager " +
-        "was still installing earlier packs. This is NOT a failure — poll the " +
-        "Manager queue for completion, then re-run apply_manifest to continue.";
+  const notStarted: string[] = [];
+  const stillInstalling: string[] = [];
   let nodeBudgetSpent = false;
   // Even the INITIAL installed-list probe is budget-bounded — a hung Manager here
   // must not blow the tools/call timeout before we can report anything.
@@ -1087,7 +1101,8 @@ async function applyManifestSections(
     }
     if (nodeBudgetSpent || Date.now() >= nodeDeadline) {
       nodeBudgetSpent = true;
-      results.push(report("custom_node", id, "pending", pendingBudgetMessage(false)));
+      notStarted.push(id);
+      results.push(report("custom_node", id, "pending", formatNotStartedMessage(id)));
       continue;
     }
 
@@ -1106,7 +1121,8 @@ async function applyManifestSections(
       // already has a .catch, so its eventual settle is safely ignored) and stop
       // blocking on the remaining nodes.
       nodeBudgetSpent = true;
-      results.push(report("custom_node", id, "pending", pendingBudgetMessage(true)));
+      stillInstalling.push(id);
+      results.push(report("custom_node", id, "pending", formatStillInstallingMessage()));
       continue;
     }
     if (outcome.kind === "error") {
@@ -1132,7 +1148,8 @@ async function applyManifestSections(
     const verified = await raceDeadline(installedNodesOrEmpty(), nodeDeadline);
     if (verified === BUDGET_TIMEOUT) {
       nodeBudgetSpent = true;
-      results.push(report("custom_node", id, "pending", pendingBudgetMessage(true)));
+      stillInstalling.push(id);
+      results.push(report("custom_node", id, "pending", formatStillInstallingMessage()));
       continue;
     }
     if (nodeAlreadyInstalled(id, verified)) {
@@ -1459,6 +1476,12 @@ async function applyManifestSections(
   };
   for (const result of results) summary[result.status]++;
 
+  // #1699 — name the PARTIAL INSTALL (unsubmitted custom_nodes) so a drained
+  // Manager queue cannot be read as completion. Replacing the leftover record
+  // on every apply keeps queue-status honest about THIS call only.
+  const partial = buildManifestPartial({ source, notStarted, stillInstalling });
+  recordManifestPartial(partial);
+
   return {
     // `success` means the manifest is APPLIED AND VERIFIED — nothing failed AND
     // nothing is still unsettled. A pending item is a real "not done": a transfer
@@ -1467,9 +1490,12 @@ async function applyManifestSections(
     // three used to fold into a `true` here, which is the same fabricate-success
     // shape #369 is about, one level up (codex gate, round 15). Callers that only
     // care about hard failures read `summary.failed`; the per-item results say
-    // exactly what is outstanding and how to confirm it.
+    // exactly what is outstanding and how to confirm it. Unsubmitted custom_nodes
+    // are also named on `partial` so the outstanding work cannot hide in the
+    // per-item array (#1699).
     success: summary.failed === 0 && summary.pending === 0,
     summary,
     results,
+    ...(partial ? { partial } : {}),
   };
 }

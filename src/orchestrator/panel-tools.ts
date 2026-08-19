@@ -48,6 +48,10 @@ import { fileURLToPath } from "node:url";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { assertPanelNotTargetedUnverifiable } from "../services/panel-pin-guard.js";
 import { nodesInstallCommandArgs } from "../services/node-management.js";
+import {
+  formatQueueStatusPartialNote,
+  getManifestPartialLeftover,
+} from "../services/manifest-partial.js";
 import { searchPanelNodes } from "../services/manager-node-search.js";
 import { isPanelAnsweredError } from "../services/panel-answered.js";
 import { isPreExecutorRefusal } from "../services/panel-refusal.js";
@@ -2949,6 +2953,37 @@ async function settleDroppedEnqueue(
       `when the Manager will not take it. This tool cannot clone for you — it drives whatever ` +
       `ComfyUI the panel is bound to, which need not be this machine.`,
   );
+}
+
+/**
+ * #1699 — a drained Manager queue is not apply_manifest completion when
+ * custom_nodes were never submitted. Keep the panel payload parseable (do not
+ * append prose after the JSON) and name the leftover entries on the object.
+ */
+function annotateQueueStatusWithManifestPartial(res: ToolResult): ToolResult {
+  const leftover = getManifestPartialLeftover();
+  if (!leftover || leftover.not_started.length === 0) return res;
+  if (res.isError) return res;
+  const parsed = parseToolResultJson(res);
+  if (!parsed) return appendNote(res, formatQueueStatusPartialNote(leftover));
+  return {
+    ...res,
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(
+          {
+            ...parsed,
+            apply_manifest_partial: leftover,
+            queue_complete_for_apply_manifest: false,
+          },
+          null,
+          2,
+        ),
+      },
+      ...res.content.slice(1),
+    ],
+  };
 }
 
 /** Parse a ctx.call ToolResult's text payload as JSON, or null if not parseable. */
@@ -13685,9 +13720,17 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
     ),
     def(
       "panel_node_queue_status",
-      "Check the built-in Manager's install/update queue status (to see if a queued install finished). Read-only.",
+      "Check the built-in Manager's install/update queue status (to see if a queued install finished). Read-only. " +
+        "A drained queue (total_count: 0, is_processing: false) only means THIS queue is idle — " +
+        "it does not include apply_manifest custom_nodes that were never submitted (#1699). " +
+        "When apply_manifest returned a PARTIAL INSTALL, this tool names the leftover entries and " +
+        "sets queue_complete_for_apply_manifest:false; do not restart ComfyUI until those are " +
+        "submitted (re-run apply_manifest).",
       {},
-      async (_args, ctx) => ctx.call({ cmd: "nodes_queue_status" }, 20000),
+      async (_args, ctx) => {
+        const res = await ctx.call({ cmd: "nodes_queue_status" }, 20000);
+        return annotateQueueStatusWithManifestPartial(res);
+      },
     ),
     def(
       "panel_restart_comfyui",
