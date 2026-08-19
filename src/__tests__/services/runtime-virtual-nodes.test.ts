@@ -192,16 +192,88 @@ describe("a Get/Set bus node is not an unknown runtime (#1400)", () => {
     expect(r.usesApiNodes).toBe(true);
   });
 
-  it("rgthree's canvas-only nodes are still UNKNOWN — cautious, and deliberately so", async () => {
-    // The rest of #1400's population (Label, Fast Groups Bypasser/Muter) is NOT covered.
-    // The converter does not strip them, so nothing here can prove they never execute, and
-    // guessing "free" is a guess with someone's money on it. Recorded as a test so the gap
-    // is a decision rather than an oversight.
+  it("rgthree's canvas-only nodes are still UNKNOWN without panel proof — cautious, and deliberately so", async () => {
+    // The rest of #1400's population (Label, Fast Groups Bypasser/Muter) is not in the
+    // converter's list, so with no connected panel's registry to consult (this deps set
+    // has no getFrontendVirtualTypes — the plain-MCP-server case) the doubt is preserved.
+    // Recorded as a test so the gap is a decision rather than an oversight. The WITH-panel
+    // half is the describe block below.
     const r = await checkWorkflowRuntime(
       graphOf("KSampler", "Fast Groups Bypasser (rgthree)"),
       depsWith({ KSampler: KSAMPLER }),
     );
     expect(r.runtime).toBe("unknown");
     expect(r.unknownNodes).toEqual(["Fast Groups Bypasser (rgthree)"]);
+  });
+});
+
+// #1400 — the parked half, landed: when a panel IS connected, the orchestrator pulls the
+// frontend's own virtual registry (`graph_get_virtual_types` — the registered classes whose
+// probe instances carry `isVirtualNode === true`, the flag ComfyUI's serializer reads) and
+// republishes it to this process. The classifier consults it UNDER THE SAME def-first rule
+// as the static set: only a type the server does NOT register can be exempted.
+describe("the panel-proven virtual registry is consulted (#1400)", () => {
+  const RGTHREE_VIRTUALS = ["Label (rgthree)", "Fast Groups Bypasser (rgthree)", "Fast Groups Muter (rgthree)"];
+  function depsWithVirtuals(objectInfo: Record<string, unknown>, virtuals: readonly string[]) {
+    return {
+      getObjectInfo: async () => objectInfo,
+      getFrontendVirtualTypes: () => new Set(virtuals),
+    } as never;
+  }
+
+  it("THE PARKED CASE: rgthree canvas-only nodes are local once the frontend proves them virtual", async () => {
+    const r = await checkWorkflowRuntime(
+      graphOf("KSampler", ...RGTHREE_VIRTUALS),
+      depsWithVirtuals({ KSampler: KSAMPLER }, RGTHREE_VIRTUALS),
+    );
+    expect(r.runtime).toBe("local");
+    expect(r.usesApiNodes).toBe(false);
+    expect(r.unknownNodes).toEqual([]);
+  });
+
+  it("a type the panel did NOT prove stays unknown — partial proof does not leak", async () => {
+    const r = await checkWorkflowRuntime(
+      graphOf("KSampler", "Label (rgthree)", "SomeUninstalledPackNode"),
+      depsWithVirtuals({ KSampler: KSAMPLER }, RGTHREE_VIRTUALS),
+    );
+    expect(r.runtime).toBe("unknown");
+    expect(r.unknownNodes).toEqual(["SomeUninstalledPackNode"]);
+  });
+
+  it("a REGISTERED api node whose name is in the virtual set is still classified — the def-first rule", async () => {
+    // The #1396 codex P1 applies to the new source identically: the panel's answer exempts
+    // only what the server does not register. A backend node — possibly PAID — that shares
+    // a name with a proven-virtual type is examined, never skipped.
+    const r = await checkWorkflowRuntime(
+      graphOf("KSampler", "Label (rgthree)"),
+      depsWithVirtuals(
+        { KSampler: KSAMPLER, "Label (rgthree)": { ...API_NODE, name: "Label (rgthree)" } },
+        RGTHREE_VIRTUALS,
+      ),
+    );
+    expect(r.runtime).toBe("mixed");
+    expect(r.usesApiNodes).toBe(true);
+    expect(r.apiNodes).toContain("Label (rgthree)");
+  });
+
+  it("panel-proven virtuals leave the DENOMINATOR too — one API node beside them is 'api', not 'mixed'", async () => {
+    const r = await checkWorkflowRuntime(
+      graphOf("FluxProImageNode", ...RGTHREE_VIRTUALS),
+      depsWithVirtuals({ FluxProImageNode: API_NODE }, RGTHREE_VIRTUALS),
+    );
+    expect(r.runtime).toBe("api");
+    expect(r.usesApiNodes).toBe(true);
+  });
+
+  it("a throwing source is 'no proof', never a failed classification", async () => {
+    const deps = {
+      getObjectInfo: async () => ({ KSampler: KSAMPLER }),
+      getFrontendVirtualTypes: () => {
+        throw new Error("channel exploded");
+      },
+    } as never;
+    const r = await checkWorkflowRuntime(graphOf("KSampler", "Label (rgthree)"), deps);
+    expect(r.runtime).toBe("unknown");
+    expect(r.unknownNodes).toEqual(["Label (rgthree)"]);
   });
 });

@@ -193,6 +193,12 @@ export function makeGraph() {
     // things, and a populated one is simply invented. The unknown-command error names the
     // harness, which is the honest answer here.
     graph_select_nodes: ({ node_ids }) => ({ selected: node_ids }),
+    // #1400 — the orchestrator pulls this on every hello once its minimum-version
+    // table covers the command; a mock advertising a current version but answering
+    // "unknown command" is the harness lie #1384 exists to catch. The real reply
+    // shape with the honest content for this mock: its registry proves nothing
+    // virtual.
+    graph_get_virtual_types: () => ({ ok: true, virtual_types: [], virtual_type_count: 0 }),
     set_todo: ({ items }) => ({ ok: true, count: (items || []).length }),
     ask_user: (m) => (m.options && m.options[0] && m.options[0].label) || "yes",
   };

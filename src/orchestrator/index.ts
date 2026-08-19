@@ -29,9 +29,16 @@ import {
   startUiBridge,
   isLoopbackBindHost,
   isMirrorSafeFrameType,
+  isUnknownCommandReply,
+  isPanelCmdUnsupportedError,
   SESSION_EPOCH,
   type UiBridge,
 } from "../services/ui-bridge.js";
+import { canonicalOrigin } from "../utils/origin.js";
+import {
+  publishFrontendVirtualTypes,
+  type FrontendVirtualTypesEntry,
+} from "../services/frontend-virtual-types.js";
 import { setupSecureBridge, resolveComfyuiPathForTarget, type SecureBridge } from "../services/secure-bridge.js";
 import { judgeHelloRetarget, canonComfyuiTargetUrl } from "../services/hello-retarget.js";
 import { startQuickTunnel } from "../services/tunnel.js";
@@ -1974,6 +1981,59 @@ export async function runPanelOrchestrator(): Promise<void> {
   // mirror-image lie: claiming to be a build we are not running.
   const mcpVersionRunning = MCP_VERSION_RUNNING;
   let latestPanelVersion: string | undefined;
+
+  // #1400 — the frontend VIRTUAL-node registry each connected canvas-owning tab
+  // has PROVEN (its `graph_get_virtual_types` answer: the registered classes that
+  // set `isVirtualNode === true`, the flag ComfyUI's own serializer reads to keep
+  // a node out of the prompt). The headless `check_runtime` in the spawned tool
+  // servers cannot see a browser registry, so each hello pulls this and the poll
+  // tick republishes it through the progress-dir channel the children read
+  // (services/frontend-virtual-types.ts).
+  //
+  // Keyed by the tab's SERVER-OBSERVED handshake origin (bridge.tabServerOrigin),
+  // NEVER the hello's client-supplied comfyui_url claim — page JS can write the
+  // claim but cannot forge the browser's Origin header (the #756 trust model), so
+  // a tab can only annotate the server it provably fronts. A failed or refused
+  // pull keeps the PREVIOUS answer for the origin; only an ok:true reply
+  // replaces it, so a transient error never erases known-good proof.
+  const frontendVirtualTypesByOrigin = new Map<string, string[]>();
+  // Panel versions that PROVED they lack the command (an Unknown-command reply or
+  // the proactive too-old refusal), so an old panel is asked once per process,
+  // not once per hello. Keyed by version, not tab: a panel UPDATE keeps the tab
+  // but moves the version, and must be asked again.
+  const virtualTypesUnsupportedPanelVersions = new Set<string>();
+
+  async function pullFrontendVirtualTypes(tabId: string, panelVersion?: string): Promise<void> {
+    // A headless (mobile/mirror) client fronts no canvas registry.
+    if (bridge.isCurrentHeadless(tabId)) return;
+    if (panelVersion && virtualTypesUnsupportedPanelVersions.has(panelVersion)) return;
+    const origin = bridge.tabServerOrigin(tabId);
+    // No proven handshake origin → the answer would be keyed on a claim. Skip:
+    // an unkeyed registry is not evidence about any server.
+    if (!origin) return;
+    try {
+      const reply = (await bridge.send({ cmd: "graph_get_virtual_types" }, { tabId })) as
+        | { ok?: boolean; virtual_types?: unknown }
+        | undefined;
+      // ok:false (the panel could not read its own registry) or a malformed
+      // answer keeps the previous entry rather than replacing it with nothing.
+      if (reply?.ok !== true || !Array.isArray(reply.virtual_types)) return;
+      const types = reply.virtual_types.filter(
+        (t): t is string => typeof t === "string" && t !== "",
+      );
+      frontendVirtualTypesByOrigin.set(canonicalOrigin(origin) ?? origin, types);
+    } catch (err) {
+      // A panel that predates the command is a STABLE fact for this process —
+      // remember the version and stop re-asking on every hello. Any other
+      // failure (timeout, mid-restart socket drop) is transient: the previous
+      // answer stands and the next hello retries.
+      if (isPanelCmdUnsupportedError(err, "graph_get_virtual_types") ||
+          isUnknownCommandReply(err instanceof Error ? err.message : String(err))) {
+        if (panelVersion) virtualTypesUnsupportedPanelVersions.add(panelVersion);
+      }
+    }
+  }
+
   let panelSystemAppend = resolvePanelPersona();
   // Set once the manager exists so a later refresh (after a ComfyUI restart) feeds
   // the freshly-gathered env into newly-spawned agents too — Claude reads
@@ -3715,6 +3775,13 @@ export async function runPanelOrchestrator(): Promise<void> {
         latestPanelVersion = helloPanelVer;
         void refreshEnvCapabilities();
       }
+      // #1400 — pull this tab's proven frontend-virtual registry for the
+      // check_runtime channel. On EVERY hello, not just the first: a page reload
+      // is how a pack's frontend JS arrives or leaves, and the reload re-hellos.
+      void pullFrontendVirtualTypes(
+        panelTab,
+        typeof helloPanelVer === "string" && helloPanelVer ? helloPanelVer : undefined,
+      );
       // #236 — THE VOCABULARY HANDSHAKE, at the handshake.
       //
       // `describeVocabularySkew` and the hash it compares have existed, fully
@@ -5817,6 +5884,22 @@ export async function runPanelOrchestrator(): Promise<void> {
     // the child must never quote a panel that has since disconnected. Writes only
     // when the set changed.
     publishConnectedPanelOrigins(progressDir, bridge.connectedServerOrigins());
+    // #1400 — the same level-triggered discipline for the frontend-virtual
+    // registry: republish the CURRENT map, scoped to origins a connected tab
+    // actually fronts, so a disconnected tab's entry drops out of the channel
+    // within one tick rather than exempting types for a page that is gone.
+    {
+      const fronted = new Set(
+        bridge
+          .connectedServerOrigins()
+          .map((o) => canonicalOrigin(o) ?? o),
+      );
+      const virtualEntries: FrontendVirtualTypesEntry[] = [];
+      for (const [origin, types] of frontendVirtualTypesByOrigin) {
+        if (fronted.has(origin)) virtualEntries.push({ origin, types });
+      }
+      publishFrontendVirtualTypes(progressDir, virtualEntries);
+    }
     let files: string[] = [];
     try {
       files = readdirSync(progressDir).filter((f) => f.endsWith(".json"));
