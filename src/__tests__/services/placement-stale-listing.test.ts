@@ -25,6 +25,11 @@ describe("a file inside the server's own models root is not called misplaced", (
     ...BASE,
     verifiedPath: "C:\\ComfyUI\\models\\loras\\example.safetensors",
     liveModelsDir: "C:/ComfyUI/models",
+    // #369 (0.52.1) — the provenance is now REQUIRED for this branch, and this is
+    // #1131's actual setup: the reporter wrote into the connected ComfyUI's own
+    // models root, i.e. one the running server named. Containment against a root
+    // nobody vouched for gets the third verdict instead (below).
+    liveModelsDirNamedByServer: true,
   });
 
   it("never prints the impossible instruction", () => {
@@ -97,6 +102,93 @@ describe("a file inside via a junction keeps the refresh remedy (#369/#870)", ()
 
   it("still reports not-visible — the verdict did not weaken", () => {
     expect(junctioned.liveVisible).toBe("not-visible");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #369, the 0.52.1 recurrence — CONTAINMENT IN A ROOT WE PICKED IS NOT READERSHIP.
+//
+// macOS, two installs under ~/ComfyUI-Installs, the live one a Comfy Desktop
+// server reached through --extra-model-paths-config. Four downloads landed in the
+// install-local models/ tree while the connected server's /models/<category>
+// answered EMPTY; the tool told the user the directory was one the connected
+// server reads and not to move the file. ~25 GB.
+//
+// The containment test ran against whatever resolveModelsDir() returned — which
+// includes a `configured-base`/`observed-root` value the server never named. That
+// is the very root the download resolved to, so the landed file is inside it BY
+// CONSTRUCTION: the comparison answers "inside" for a correct destination and for
+// a stale second install alike (taxonomy #1 — two states, one answer, no way to
+// say unknown).
+// ---------------------------------------------------------------------------
+describe("a root the server never NAMED cannot vouch for the placement (#369)", () => {
+  const unvouched = notVisibleVerdict({
+    ...BASE,
+    verifiedPath: "/Users/u/ComfyUI-Installs/ComfyUI/ComfyUI/models/loras/example.safetensors",
+    liveModelsDir: "/Users/u/ComfyUI-Installs/ComfyUI/ComfyUI/models",
+    // Omitted provenance = unknown provenance. Local config / an inference.
+  });
+
+  it("never claims the connected ComfyUI reads that directory", () => {
+    expect(unvouched.note).not.toMatch(/INSIDE the models directory the connected ComfyUI reads/);
+    expect(unvouched.note).not.toMatch(/it is in the right place/);
+    expect(unvouched.note).toMatch(/UNCONFIRMED/);
+  });
+
+  it("does not hand out either remedy as if it were established", () => {
+    // Not the #1131 harm (an unfollowable move instruction)…
+    expect(unvouched.note).not.toMatch(/Move the file into the running server's models tree/);
+    // …and not the #369 harm (a reassurance that the bytes are placed).
+    expect(unvouched.note).not.toMatch(/Do NOT move the file/);
+  });
+
+  it("states BOTH candidate causes and the check that separates them", () => {
+    expect(unvouched.note).toMatch(/STALE LISTING/);
+    expect(unvouched.note).toMatch(/DIFFERENT INSTALL/);
+    expect(unvouched.note).toMatch(/refresh_nodes/);
+    expect(unvouched.note).toMatch(/list_paths/);
+  });
+
+  it("still reports not-visible — the verdict did not weaken", () => {
+    expect(unvouched.liveVisible).toBe("not-visible");
+  });
+
+  it("takes the CONFIDENT branch for the same paths once the server named the root", () => {
+    // Same two paths, one fact different. If this and the case above ever produce
+    // the same note, the provenance stopped being read.
+    const vouched = notVisibleVerdict({
+      ...BASE,
+      verifiedPath: "/Users/u/ComfyUI-Installs/ComfyUI/ComfyUI/models/loras/example.safetensors",
+      liveModelsDir: "/Users/u/ComfyUI-Installs/ComfyUI/ComfyUI/models",
+      liveModelsDirNamedByServer: true,
+    });
+    expect(vouched.note).toMatch(/it is in the right place/);
+    expect(vouched.note).not.toBe(unvouched.note);
+  });
+
+  it("keeps the junction/extra-root vouching, which carries its own narrowing", () => {
+    // knownInsideLiveRoots comes from isUnderLiveModelRoots, which already refuses
+    // to answer for a root the server did not name — so it stays sufficient, and a
+    // #870 junction must not regress into the unverified branch.
+    const junctioned = notVisibleVerdict({
+      ...BASE,
+      verifiedPath: "E:/StabilityMatrix/models/VAE/example.safetensors",
+      liveModelsDir: "C:/ComfyUI/models",
+      knownInsideLiveRoots: true,
+    });
+    expect(junctioned.note).toMatch(/Do NOT move the file/);
+    expect(junctioned.note).not.toMatch(/UNCONFIRMED/);
+  });
+
+  it("does not present an unvouched root as what the server reads in the MOVE branch", () => {
+    const outside = notVisibleVerdict({
+      ...BASE,
+      verifiedPath: "/home/u/Downloads/example.safetensors",
+      liveModelsDir: "/opt/guessed/models",
+    });
+    expect(outside.note).not.toMatch(/models directory that server reads/);
+    // …but it still names the root, because that is where the bytes are.
+    expect(outside.note).toMatch(/\/opt\/guessed\/models/);
   });
 });
 
