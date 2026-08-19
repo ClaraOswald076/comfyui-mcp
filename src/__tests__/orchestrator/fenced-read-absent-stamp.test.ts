@@ -176,6 +176,20 @@ describe("a fenced graph READ is diagnosed, and a missing stamp is not a wrong o
     expect(adopted).toEqual([]);
   });
 
+  it("NO IDENTITY, but the session HAS a stamp: the verdict does not claim the session lacks one", async () => {
+    // The same probe result reached from the other shape. "carries no workflow
+    // identity EITHER" would be false here — this session is fenced to STALE — and a
+    // verdict that describes the caller's state wrongly is the class of claim this
+    // whole issue is about.
+    fence = { known: true, uuid: STALE };
+    const text = await outline({ issuedFor: STALE, liveUuid: null });
+
+    expect(text).toMatch(/no workflow identity of its own/);
+    expect(text).not.toMatch(/no workflow identity either/);
+    expect(text).toMatch(/will NOT clear this/);
+    expect(adopted).toEqual([]);
+  });
+
   it("PINNED: naming mode:\"current\" also discloses that it releases the pin", async () => {
     // mode:"current" is the right remedy for a missing stamp AND it silently drops a
     // pin. A caller who followed it to fix a read would lose their target and find

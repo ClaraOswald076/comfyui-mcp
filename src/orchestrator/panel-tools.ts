@@ -7633,8 +7633,12 @@ export function makePanelToolCtx(
           const live = "uuid" in probe ? probe.uuid : null;
           verdict =
             probe.status === "no_identity"
+              // Worded without reference to the session's own side, because this
+              // state is reachable from BOTH shapes: an unstamped session and a
+              // stamped one can each face a canvas with no readable identity, and
+              // "no identity EITHER" would be false for the second.
               ? `\n\nCHECKED, so this is not a guess: the live canvas was re-read and it carries ` +
-                `no workflow identity either (${probe.why}). ` +
+                `no workflow identity of its own (${probe.why}). ` +
                 `panel_set_workflow_target({mode:"current"}) will NOT clear this — it chooses ` +
                 `WHICH workflow to fence against and cannot mint an identity for one that has ` +
                 `none, so it reports success while this read keeps being refused. RECOVERY: ` +
