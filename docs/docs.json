@@ -401,8 +401,29 @@
                 "pages": [
                   "ru/index",
                   "ru/quickstart",
+                  "ru/using-tools",
+                  "ru/local-vs-comfy-cloud",
                   "ru/installation",
+                  "ru/roadmap"
+                ]
+              },
+              {
+                "group": "Настройки",
+                "pages": [
+                  "ru/configuration",
+                  "ru/remote-connector",
+                  "ru/cloud-deployment",
+                  "ru/docker",
+                  "ru/self-hosted-relay",
+                  "ru/concepts",
+                  "ru/plugin",
                   "ru/panel",
+                  "ru/apps",
+                  "ru/mobile",
+                  "ru/third-party-hosts",
+                  "ru/backends",
+                  "ru/local-llms",
+                  "ru/arena",
                   "ru/troubleshooting"
                 ]
               }
