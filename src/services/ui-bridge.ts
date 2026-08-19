@@ -292,6 +292,13 @@ export const BRIDGE_CMD_MIN_PANEL_VERSION: Readonly<Record<string, string>> = {
   // "graph_resize_node" (detected 0.11.21) — update … to ≥0.11.4`. Tabled, it quotes
   // the true minimum and the #392 proactive gate rejects the first call pre-dispatch.
   graph_resize_node: "0.11.25",
+  // #1400 — the panel serving its frontend's VIRTUAL-type registry ships in the
+  // panel release carrying the `graph_get_virtual_types` executor. The entry is
+  // deliberately on the LOW side of whatever that release turns out to be: the
+  // only caller (the orchestrator's hello-time pull) degrades silently on an
+  // unknown-command reply, so a too-low floor can never produce a wrong verdict —
+  // it just lets an old panel answer "Unknown command", which the pull swallows.
+  graph_get_virtual_types: "0.15.10",
 };
 
 /**
@@ -843,6 +850,10 @@ export const BRIDGE_READONLY_CMDS: ReadonlySet<string> = new Set<string>([
   "graph_serialize",
   // Reads the tab's own /object_info and returns it. Touches nothing.
   "graph_get_object_info",
+  // #1400: reads the tab's LiteGraph class registry and probe-constructs
+  // provenance-clean classes off-graph. Touches no canvas; idempotent — safe to
+  // re-dispatch after a socket drop (the orchestrator pulls it on every hello).
+  "graph_get_virtual_types",
   "graph_outline",
   "graph_get_errors",
   "graph_get_state",
@@ -907,6 +918,9 @@ export const GRAPH_CMD_EFFECT: Readonly<Record<string, GraphCmdEffect>> = {
   // ---- inert: reads -------------------------------------------------------
   graph_serialize: "inert",
   graph_get_object_info: "inert",
+  // #1400 — a registry query, not a canvas one: it describes the page's node
+  // CLASSES, and no workflow's content or identity rides on it.
+  graph_get_virtual_types: "inert",
   graph_outline: "inert",
   graph_get_errors: "inert",
   graph_get_state: "inert",
@@ -1087,6 +1101,10 @@ const STAMP_TARGET_CANVAS_INDEPENDENT = new Set<string>([
   "nodes_install",
   "nodes_queue_status",
   "graph_update_node",
+  // #1400 — reads the GLOBAL LiteGraph registry, never a canvas, and the
+  // orchestrator pulls it at hello, where no workflow stamp exists to agree
+  // with. Mirrors the panel's CANVAS_INDEPENDENT_COMMANDS entry.
+  "graph_get_virtual_types",
   "comfy_reboot",
   "free_vram",
 ]);

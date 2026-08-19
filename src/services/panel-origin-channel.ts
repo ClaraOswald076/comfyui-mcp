@@ -153,6 +153,59 @@ function tempPathFor(file: string): string {
   return `${file}.${process.pid}-${publishSeq++}-${entropy}.tmp`;
 }
 
+/**
+ * Write `payload` to `file` atomically; returns whether it LANDED.
+ *
+ * Write-then-rename, NOT an in-place rewrite. `writeFileSync(file, …)`
+ * truncates and refills, so a child reading during that window sees a
+ * partial record, fails to parse, and answers [] — dropping every live
+ * origin at exactly the moment it is formatting the error those origins
+ * explain (review r2). A rename makes readers see the old record or the new
+ * one, never a torn one.
+ *
+ * Same shape as persistDownloadJob (download-progress.ts), including its
+ * reason for retrying: on Windows a reader briefly holding the target open
+ * makes rename fail transiently. On persistent failure the PRIOR complete
+ * record is left untouched and the temp dropped — the next tick retries, so
+ * this self-heals rather than degrading to a torn write.
+ *
+ * Exported for the sibling control channel (frontend-virtual-types.ts, #1400):
+ * one atomic-write implementation, so the two cannot drift apart.
+ */
+export function writeChannelPayload(dir: string, file: string, payload: string): boolean {
+  try {
+    mkdirSync(dir, { recursive: true });
+    const tmp = tempPathFor(file);
+    let renamed = false;
+    try {
+      writeFileSync(tmp, payload);
+      for (let attempt = 0; attempt < 5 && !renamed; attempt++) {
+        try {
+          renameSync(tmp, file);
+          renamed = true;
+        } catch {
+          /* transient (e.g. Windows sharing violation) — retry */
+        }
+      }
+    } finally {
+      // In a `finally`, so a THROWING write is cleaned up too. With the removal
+      // sitting after the loop instead, a `writeFileSync` that failed partway —
+      // a full disk is the ordinary cause — left its partial temp behind and
+      // added another on every tick thereafter (review r3).
+      if (!renamed) {
+        try {
+          rmSync(tmp, { force: true });
+        } catch {
+          /* ignore — a stray .tmp is not the channel file and is never read */
+        }
+      }
+    }
+    return renamed;
+  } catch {
+    return false; // retried on the next tick
+  }
+}
+
 /** Refresh the record at least this often even when the set is UNCHANGED, so a
  *  reader can tell "still true" from "nobody has touched this since the
  *  orchestrator died". 30s against a 700ms tick is ~2 writes a minute — the
@@ -183,8 +236,11 @@ const MAX_CHANNEL_BYTES = 64 * 1024;
  * already parked, inside the error path, forever. (Written the other way first,
  * with a comment claiming the fstat covered it. It did not.) Undefined on
  * Windows, where the case does not arise, so it falls back to 0.
+ *
+ * Exported for the sibling control channel (frontend-virtual-types.ts, #1400):
+ * one bounded-read implementation, so the two cannot drift apart.
  */
-function readChannelFile(file: string): string {
+export function readChannelFile(file: string): string {
   const fd = openSync(file, readFlags());
   try {
     const stat = fstatSync(fd);
@@ -213,8 +269,9 @@ function readChannelFile(file: string): string {
  *  `process.kill(pid, 0)` sends no signal — it only asks. EPERM means the pid
  *  exists but belongs to another user, which still answers "alive". Anything
  *  unreadable answers false, because this gates a claim and an unanswerable
- *  question must not grant it. */
-function publisherAlive(pid: unknown): boolean {
+ *  question must not grant it. Exported for the sibling control channel
+ *  (frontend-virtual-types.ts, #1400). */
+export function publisherAlive(pid: unknown): boolean {
   if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
@@ -265,51 +322,13 @@ export function publishConnectedPanelOrigins(
     updated: now,
     pid: process.pid,
   });
-  try {
-    mkdirSync(dir, { recursive: true });
-    // Write-then-rename, NOT an in-place rewrite. `writeFileSync(file, …)`
-    // truncates and refills, so a child reading during that window sees a
-    // partial record, fails to parse, and answers [] — dropping every live
-    // origin at exactly the moment it is formatting the error those origins
-    // explain (review r2). A rename makes readers see the old record or the new
-    // one, never a torn one.
-    //
-    // Same shape as persistDownloadJob (download-progress.ts), including its
-    // reason for retrying: on Windows a reader briefly holding the target open
-    // makes rename fail transiently. On persistent failure the PRIOR complete
-    // record is left untouched and the temp dropped — the next tick retries, so
-    // this self-heals rather than degrading to a torn write.
-    const tmp = tempPathFor(file);
-    let renamed = false;
-    try {
-      writeFileSync(tmp, payload);
-      for (let attempt = 0; attempt < 5 && !renamed; attempt++) {
-        try {
-          renameSync(tmp, file);
-          renamed = true;
-        } catch {
-          /* transient (e.g. Windows sharing violation) — retry */
-        }
-      }
-    } finally {
-      // In a `finally`, so a THROWING write is cleaned up too. With the removal
-      // sitting after the loop instead, a `writeFileSync` that failed partway —
-      // a full disk is the ordinary cause — left its partial temp behind and
-      // added another on every tick thereafter (review r3).
-      if (!renamed) {
-        try {
-          rmSync(tmp, { force: true });
-        } catch {
-          /* ignore — a stray .tmp is not the channel file and is never read */
-        }
-      }
-    }
-    if (!renamed) return; // do NOT record it as published; the next tick retries
-    lastPublished = key;
-    lastWriteAt = now;
-  } catch {
-    // ignore — retried on the next tick
-  }
+  // The atomic write lives in writeChannelPayload (shared with the sibling
+  // frontend-virtual-types channel, #1400); a false return means the PRIOR
+  // complete record was left in place, so do NOT record this as published —
+  // the next tick retries.
+  if (!writeChannelPayload(dir, file, payload)) return;
+  lastPublished = key;
+  lastWriteAt = now;
 }
 
 /** Test/shutdown hook: forget what this process last published, so the next

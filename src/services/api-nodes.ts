@@ -5,9 +5,10 @@ import type {
   WorkflowJSON,
 } from "../comfyui/types.js";
 import { FRONTEND_ONLY_NODE_TYPES } from "./workflow-converter.js";
+import { frontendVirtualTypesFor } from "./frontend-virtual-types.js";
 import { getObjectInfo } from "../comfyui/client.js";
 import { enqueueWorkflow } from "./workflow-executor.js";
-import { config } from "../config.js";
+import { config, getComfyUIBaseUrl } from "../config.js";
 import { ValidationError } from "../utils/errors.js";
 
 /**
@@ -46,11 +47,21 @@ export interface ApiNodesDeps {
       extra_data?: Record<string, unknown>;
     },
   ) => Promise<{ prompt_id: string; queue_remaining?: number; rejectedOutputs?: string }>;
+  /** #1400 — the node types a connected panel has PROVEN frontend-virtual on the
+   *  ComfyUI this process targets (its registered classes set `isVirtualNode ===
+   *  true`, the flag ComfyUI's own serializer reads to keep a node out of the
+   *  prompt). The headless classifier cannot see the frontend's registry, so the
+   *  orchestrator pulls it over the panel bridge and republishes it through the
+   *  progress-dir channel (services/frontend-virtual-types.ts). Optional: absent
+   *  (a plain MCP server with no panel, a stale record) means "no proof", and
+   *  the classification keeps its cautious pre-#1400 "unknown" for those types. */
+  getFrontendVirtualTypes?: () => ReadonlySet<string>;
 }
 
 const defaultDeps: ApiNodesDeps = {
   getObjectInfo,
   enqueue: enqueueWorkflow,
+  getFrontendVirtualTypes: () => frontendVirtualTypesFor(getComfyUIBaseUrl()),
 };
 
 /** True if a node definition is a hosted partner/API node. */
@@ -392,6 +403,22 @@ export async function checkWorkflowRuntime(
 ): Promise<WorkflowRuntime> {
   const classTypes = extractWorkflowClassTypes(graph);
   const objectInfo = await deps.getObjectInfo();
+  // #1400 — the SECOND source of frontend-only proof, alongside the static
+  // FRONTEND_ONLY_NODE_TYPES: the types a connected panel observed this
+  // frontend's registry prove virtual (`isVirtualNode === true` on the
+  // registered class — covering third-party virtual nodes like rgthree's Label /
+  // Fast Groups toggles that no static list may name). Read ONCE per call; an
+  // absent/unreadable channel is an empty set, and a type it names is still
+  // classified from its /object_info def whenever the server registers one (the
+  // def-first rule below applies to both sources identically).
+  let frontendVirtual: ReadonlySet<string>;
+  try {
+    frontendVirtual = deps.getFrontendVirtualTypes?.() ?? new Set();
+  } catch {
+    // A broken source is "no proof", never a failure of the classification it
+    // was only narrowing.
+    frontendVirtual = new Set();
+  }
   const apiNodes: string[] = [];
   const externalApiNodes: string[] = [];
   const externalProviders: string[] = [];
@@ -423,8 +450,9 @@ export async function checkWorkflowRuntime(
     //
     // Absence from /object_info is not a heuristic for "virtual", it is the definition:
     // the frontend registers these, the backend does not. So a REGISTERED node of the same
-    // name is a real node and is classified as one.
-    if (!def && FRONTEND_ONLY_NODE_TYPES.has(ct)) continue;
+    // name is a real node and is classified as one. The #1400 panel-observed set is
+    // consulted under the SAME rule: it exempts only what the server does not register.
+    if (!def && (FRONTEND_ONLY_NODE_TYPES.has(ct) || frontendVirtual.has(ct))) continue;
     if (!def) {
       unknownNodes.push(ct);
       continue;
@@ -445,7 +473,7 @@ export async function checkWorkflowRuntime(
   // otherwise a workflow of one KSampler plus three Notes reads as 1-of-4 API and reports
   // "mixed" when it is entirely local.
   const virtualCount = classTypes.filter(
-    (ct) => !objectInfo[ct] && FRONTEND_ONLY_NODE_TYPES.has(ct),
+    (ct) => !objectInfo[ct] && (FRONTEND_ONLY_NODE_TYPES.has(ct) || frontendVirtual.has(ct)),
   ).length;
   const classifiable = classTypes.length - unknownNodes.length - virtualCount;
   let runtime: "local" | "api" | "mixed" | "unknown";
