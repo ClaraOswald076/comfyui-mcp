@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -58,6 +59,49 @@ const CAN_SYMLINK = (() => {
     return true;
   } catch {
     return false;
+  }
+})();
+
+/**
+ * The 8.3 short spelling of a path, or undefined when this volume does not generate one.
+ * `Scripting.FileSystemObject.ShortPath` is the only reliable way to ask Windows for it;
+ * when 8.3 generation is disabled (`fsutil 8dot3name`, the default on some volumes) it
+ * answers with the LONG path, which is the signal to skip rather than assert nothing.
+ */
+function shortPathOf(target: string, kind: "GetFile" | "GetFolder"): string | undefined {
+  if (process.platform !== "win32") return undefined;
+  try {
+    const quoted = target.replace(/'/g, "''");
+    const out = execFileSync(
+      "powershell",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `(New-Object -ComObject Scripting.FileSystemObject).${kind}('${quoted}').ShortPath`,
+      ],
+      { encoding: "utf-8", windowsHide: true, timeout: 30_000 },
+    ).trim();
+    if (!out || out.toLowerCase() === target.toLowerCase()) return undefined;
+    return out;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Does this machine generate 8.3 aliases in tmpdir at all? Probed once, like CAN_SYMLINK,
+ *  so the tests below SKIP on a volume with 8dot3name disabled instead of passing
+ *  vacuously against a path that was never short. */
+const CAN_SHORT_PATH = (() => {
+  if (process.platform !== "win32") return false;
+  let dir: string | undefined;
+  try {
+    dir = mkdtempSync(join(tmpdir(), "comfyui-1788-a-very-long-install-name-"));
+    return shortPathOf(dir, "GetFolder") !== undefined;
+  } catch {
+    return false;
+  } finally {
+    if (dir) rmSync(dir, { recursive: true, force: true });
   }
 })();
 
@@ -1016,6 +1060,386 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
 
     // No local root is usable in remote mode → explicit UNRESOLVED, never the remote path.
     await expect(listExtraPaths()).rejects.toThrow(/UNRESOLVED/);
+  });
+});
+
+describe("#1788 — a PINNED target discloses that the running server reads elsewhere", () => {
+  // The report: on ComfyUI Desktop, `list_local_models action:"add_path" target:"desktop"`
+  // wrote %APPDATA%/ComfyUI/extra_models_config.yaml and answered "Added … Restart
+  // ComfyUI to apply it", while `action:"list_paths"` on the same tool had already named
+  // the DIFFERENT file the running server was launched with. The write target is the
+  // documented escape hatch and stays where the caller pinned it — what changes is that
+  // the answer stops promising an effect the running server will never see.
+
+  /** A reachable server launched from `root`/main.py with the given config flags. */
+  async function liveServer(root: string, ...flags: string[]): Promise<void> {
+    await writeFile(join(root, "main.py"), "# comfyui\n", "utf-8");
+    const argv = ["python", join(root, "main.py")];
+    for (const f of flags) argv.push("--extra-model-paths-config", f);
+    mockGetSystemStats.mockResolvedValue({ system: { argv } });
+  }
+
+  async function liveConfigAt(dir: string, name: string): Promise<string> {
+    const cfg = join(dir, name);
+    await writeFile(cfg, "live:\n  ipadapter: D:/ComfyUI-Shared/models/ipadapter\n", "utf-8");
+    return cfg;
+  }
+
+  it('add_path target:"desktop" still writes the pinned file but refuses to promise a restart applies it', async () => {
+    const appData = await trackTmp();
+    process.env.APPDATA = appData;
+    const liveRoot = await trackTmp();
+    const serverCfg = await liveConfigAt(liveRoot, "instance-model-paths.yaml");
+    await liveServer(liveRoot, serverCfg);
+
+    const added = await addExtraPath({
+      target: "desktop",
+      category: "ipadapter",
+      path: "D:/ComfyUI-Shared/models/ipadapter",
+    });
+
+    // The escape hatch is intact: the bytes landed exactly where the caller pinned.
+    expect(added.path).toBe(join(appData, "ComfyUI", "extra_models_config.yaml"));
+    expect(added.changed).toBe(true);
+    expect(existsSync(added.path)).toBe(true);
+    // …and the answer says the running server does not read it.
+    expect(added.notes.some((n) => /RUNNING ComfyUI does not read this file/.test(n))).toBe(true);
+    expect(added.notes.join(" ")).toContain(serverCfg);
+    expect(added.message).not.toMatch(/Restart ComfyUI to apply it/);
+    expect(added.message).toMatch(/does NOT read/);
+    expect(added.message).toContain(serverCfg);
+  });
+
+  it('list_paths target:"desktop" carries the same disclosure (the READ was never wrong, only silent)', async () => {
+    const appData = await trackTmp();
+    process.env.APPDATA = appData;
+    const liveRoot = await trackTmp();
+    const serverCfg = await liveConfigAt(liveRoot, "instance-model-paths.yaml");
+    await liveServer(liveRoot, serverCfg);
+
+    const listed = await listExtraPaths({ target: "desktop" });
+    expect(listed.path).toBe(join(appData, "ComfyUI", "extra_models_config.yaml"));
+    expect(listed.notes.some((n) => /RUNNING ComfyUI does not read this file/.test(n))).toBe(true);
+  });
+
+  it("says NOTHING when the pinned file IS the one the server was launched with", async () => {
+    const liveRoot = await trackTmp();
+    const serverCfg = await liveConfigAt(liveRoot, "instance-model-paths.yaml");
+    await liveServer(liveRoot, serverCfg);
+
+    const added = await addExtraPath({
+      configPath: serverCfg,
+      category: "loras",
+      path: "D:/loras",
+    });
+    expect(added.notes.some((n) => /does not read this file/.test(n))).toBe(false);
+    expect(added.message).toMatch(/Restart ComfyUI to apply it/);
+  });
+
+  it("says NOTHING when the pinned file is the SECOND --extra-model-paths-config (not just the first)", async () => {
+    // The guard must compare the pinned path against EVERY config the server loads.
+    // Comparing only the primary resolution — the first flag — would call a live file
+    // inert, which is the same wrong-pair defect one level out.
+    const liveRoot = await trackTmp();
+    const first = await liveConfigAt(liveRoot, "first.yaml");
+    const second = await liveConfigAt(liveRoot, "second.yaml");
+    await liveServer(liveRoot, first, second);
+
+    const added = await addExtraPath({ configPath: second, category: "vae", path: "D:/vae" });
+    expect(added.notes.some((n) => /does not read this file/.test(n))).toBe(false);
+    expect(added.message).toMatch(/Restart ComfyUI to apply it/);
+  });
+
+  it("says NOTHING for the second value of ONE nargs='+' flag occurrence", async () => {
+    // `--extra-model-paths-config` is argparse `nargs="+"`, so ONE occurrence can carry
+    // SEVERAL files and ComfyUI loads them all. The sibling test above spells the flag
+    // twice; this spells it once with two values, which is a different argv shape and a
+    // different parser path. Both must count as configs the server reads.
+    const liveRoot = await trackTmp();
+    await writeFile(join(liveRoot, "main.py"), "# comfyui\n", "utf-8");
+    const first = await liveConfigAt(liveRoot, "first.yaml");
+    const second = await liveConfigAt(liveRoot, "second.yaml");
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: ["python", join(liveRoot, "main.py"), "--extra-model-paths-config", first, second],
+      },
+    });
+
+    const added = await addExtraPath({ configPath: second, category: "vae", path: "D:/vae" });
+    expect(added.notes.some((n) => /does not read this file/.test(n))).toBe(false);
+    expect(added.message).toMatch(/Restart ComfyUI to apply it/);
+  });
+
+  it("says NOTHING about the implicit <root>/extra_model_paths.yaml that does not exist YET", async () => {
+    // Pinning it is how a user CREATES it; the next restart then loads it. Calling that
+    // edit inert would be exactly backwards.
+    const liveRoot = await trackTmp();
+    const serverCfg = await liveConfigAt(liveRoot, "instance-model-paths.yaml");
+    await liveServer(liveRoot, serverCfg);
+    const implicit = join(liveRoot, "extra_model_paths.yaml");
+    expect(existsSync(implicit)).toBe(false);
+
+    const added = await addExtraPath({ configPath: implicit, category: "vae", path: "D:/vae" });
+    expect(added.notes.some((n) => /does not read this file/.test(n))).toBe(false);
+    expect(added.message).toMatch(/Restart ComfyUI to apply it/);
+  });
+
+  it("says NOTHING when a RELATIVE flag leaves the server's config set INCOMPLETE", async () => {
+    // The server names a config this process cannot locate, so the pinned file's absence
+    // from what we CAN name is not evidence the server does not read it. Unknown stays
+    // unknown — never a confident "it does not read this".
+    const appData = await trackTmp();
+    process.env.APPDATA = appData;
+    const liveRoot = await trackTmp();
+    await liveServer(liveRoot, "relative-cfg.yaml");
+
+    const added = await addExtraPath({
+      target: "desktop",
+      category: "ipadapter",
+      path: "D:/ipadapter",
+    });
+    expect(added.notes.some((n) => /does not read this file/.test(n))).toBe(false);
+    expect(added.message).toMatch(/Restart ComfyUI to apply it/);
+  });
+
+  // Gate round 2 test gap: the test above exercises the SINGLE-flag arm, where an
+  // unresolvable relative value means there is no server config at all. The
+  // multi-flag arm computes completeness differently — `unlocatable` is filled from
+  // flags 2..n — and forcing `complete: true` there killed no test. That is the shape
+  // that matters most: a FIRST flag we can resolve makes everything downstream look
+  // proven, while the second names a file we cannot see and may well be the pinned one.
+  it("says NOTHING when a LATER relative flag is unlocatable, even though the FIRST resolved", async () => {
+    const appData = await trackTmp();
+    process.env.APPDATA = appData;
+    const liveRoot = await trackTmp();
+    const serverCfg = await liveConfigAt(liveRoot, "instance-model-paths.yaml");
+    // Absolute first (resolves), relative second (does not — no server cwd reported).
+    await liveServer(liveRoot, serverCfg, "relative-second.yaml");
+
+    const added = await addExtraPath({
+      target: "desktop",
+      category: "ipadapter",
+      path: "D:/ipadapter",
+    });
+    expect(added.notes.some((n) => /does not read this file/.test(n))).toBe(false);
+    expect(added.message).toMatch(/Restart ComfyUI to apply it/);
+  });
+
+  it("DOES speak when every one of several flags resolved (the control for the gap above)", async () => {
+    // Same multi-flag shape, but nothing is unlocatable — the set is complete, so the
+    // pinned file's absence from it really is evidence. Without this, a disclosure that
+    // had simply stopped firing for multi-flag servers would pass the test above.
+    const appData = await trackTmp();
+    process.env.APPDATA = appData;
+    const liveRoot = await trackTmp();
+    const first = await liveConfigAt(liveRoot, "first.yaml");
+    const second = await liveConfigAt(liveRoot, "second.yaml");
+    await liveServer(liveRoot, first, second);
+
+    const added = await addExtraPath({
+      target: "desktop",
+      category: "ipadapter",
+      path: "D:/ipadapter",
+    });
+    expect(added.notes.some((n) => /RUNNING ComfyUI does not read this file/.test(n))).toBe(true);
+    expect(added.message).not.toMatch(/Restart ComfyUI to apply it/);
+    expect(added.message).toContain(second);
+  });
+
+  it("says NOTHING when the server is UNREACHABLE (the pin is all there is)", async () => {
+    const appData = await trackTmp();
+    process.env.APPDATA = appData;
+    mockGetSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+
+    const added = await addExtraPath({
+      target: "desktop",
+      category: "ipadapter",
+      path: "D:/ipadapter",
+    });
+    expect(added.path).toBe(join(appData, "ComfyUI", "extra_models_config.yaml"));
+    expect(added.notes.some((n) => /does not read this file/.test(n))).toBe(false);
+    expect(added.message).toMatch(/Restart ComfyUI to apply it/);
+  });
+
+  it("says NOTHING when the server's tree is not proven to be this machine's", async () => {
+    // Reachable, but its main.py does not resolve here (container/WSL/another host). The
+    // absolute flag value would name a same-spelled file on ITS disk; nothing is proven.
+    const appData = await trackTmp();
+    process.env.APPDATA = appData;
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: [
+          "python",
+          join(await trackTmp(), "not-mounted", "main.py"),
+          "--extra-model-paths-config",
+          "/srv/comfy/extra.yaml",
+        ],
+      },
+    });
+
+    const added = await addExtraPath({
+      target: "desktop",
+      category: "ipadapter",
+      path: "D:/ipadapter",
+    });
+    expect(added.notes.some((n) => /does not read this file/.test(n))).toBe(false);
+    expect(added.message).toMatch(/Restart ComfyUI to apply it/);
+  });
+
+  // Real symlinks need privileges/Developer Mode on Windows; skipped rather than
+  // silently passing, so it can never read as a vacuous confirmation.
+  it.skipIf(!CAN_SYMLINK)(
+    "says NOTHING when the pinned path is a SYMLINK to a config the server loads",
+    async () => {
+      // The harmful direction for THIS comparison is the false negative: telling a user
+      // their edit is inert when it lands in the very file the server reads. A lexical
+      // compare says these two spellings differ; they are one file.
+      const liveRoot = await trackTmp();
+      const serverCfg = await liveConfigAt(liveRoot, "instance-model-paths.yaml");
+      await liveServer(liveRoot, serverCfg);
+      const alias = join(await trackTmp(), "alias.yaml");
+      symlinkSync(serverCfg, alias, "file");
+
+      const added = await addExtraPath({ configPath: alias, category: "vae", path: "D:/vae" });
+      expect(added.notes.some((n) => /does not read this file/.test(n))).toBe(false);
+      expect(added.message).toMatch(/Restart ComfyUI to apply it/);
+    },
+  );
+
+  // #1788 gate round 1, P1. Removing the promise from the headline `message` was not
+  // enough: `summarize` appends "Restart ComfyUI after editing this file so startup path
+  // registration is rebuilt." to EVERY answer. That is the same promise in different
+  // words — different enough that the `/Restart ComfyUI to apply it/` assertions above
+  // never saw it — and an agent reads `notes` and acts on it. So the payload contained
+  // both "restarting will not apply this" and "restart to apply this".
+  it("withdraws the generic restart INSTRUCTION from notes too, not just the message", async () => {
+    const appData = await trackTmp();
+    process.env.APPDATA = appData;
+    const liveRoot = await trackTmp();
+    const serverCfg = await liveConfigAt(liveRoot, "instance-model-paths.yaml");
+    await liveServer(liveRoot, serverCfg);
+
+    const added = await addExtraPath({
+      target: "desktop",
+      category: "ipadapter",
+      path: "D:/ComfyUI-Shared/models/ipadapter",
+    });
+
+    // Nothing in the whole payload may still instruct a restart to apply this edit.
+    expect(added.notes.some((n) => /Restart ComfyUI after editing this file/.test(n))).toBe(
+      false,
+    );
+    expect(JSON.stringify(added)).not.toMatch(/Restart ComfyUI after editing/);
+    // …and the disclosure that replaces it is still there.
+    expect(added.notes.some((n) => /RUNNING ComfyUI does not read this file/.test(n))).toBe(true);
+  });
+
+  it("KEEPS the generic restart instruction when the pin is not inert", async () => {
+    // The control: the note is withdrawn for divergence specifically, not deleted.
+    const liveRoot = await trackTmp();
+    const serverCfg = await liveConfigAt(liveRoot, "instance-model-paths.yaml");
+    await liveServer(liveRoot, serverCfg);
+
+    const added = await addExtraPath({ configPath: serverCfg, category: "vae", path: "D:/vae" });
+    expect(added.notes.some((n) => /Restart ComfyUI after editing this file/.test(n))).toBe(true);
+  });
+
+  it("list_paths withdraws it too (a READ of an inert file must not instruct a restart)", async () => {
+    const appData = await trackTmp();
+    process.env.APPDATA = appData;
+    const liveRoot = await trackTmp();
+    const serverCfg = await liveConfigAt(liveRoot, "instance-model-paths.yaml");
+    await liveServer(liveRoot, serverCfg);
+
+    const listed = await listExtraPaths({ target: "desktop" });
+    expect(listed.notes.some((n) => /Restart ComfyUI after editing this file/.test(n))).toBe(
+      false,
+    );
+  });
+
+  // GATE ROUND 2, P1 — `fs.realpathSync` collapses junctions but does NOT expand a
+  // Windows 8.3 short name; only `.native` asks the OS (this repo already uses `.native`
+  // for exactly that in panel-installer.ts and node-dev.ts). With the JS binding, pinning
+  // the server's OWN config by its short spelling emitted "the running ComfyUI does NOT
+  // read …\AVERYL~1\instance.yaml" for a file it demonstrably reads — a confident wrong
+  // negative replacing harmless silence, on the platform this was reported from.
+  describe.runIf(process.platform === "win32")("Windows 8.3 short names", () => {
+    it.skipIf(!CAN_SHORT_PATH)(
+      "says NOTHING when the server's own config is pinned by its 8.3 short spelling",
+      async () => {
+        const liveRoot = await trackTmp();
+        const serverCfg = await liveConfigAt(liveRoot, "instance-model-paths.yaml");
+        await liveServer(liveRoot, serverCfg);
+        const short = shortPathOf(serverCfg, "GetFile");
+        expect(short).toBeDefined();
+        expect(short!.toLowerCase()).not.toBe(serverCfg.toLowerCase());
+
+        const added = await addExtraPath({
+          configPath: short!,
+          category: "ipadapter",
+          path: "D:/ipadapter",
+        });
+        expect(added.notes.some((n) => /does not read this file/.test(n))).toBe(false);
+        expect(added.message).toMatch(/Restart ComfyUI to apply it/);
+      },
+    );
+
+    it.skipIf(!CAN_SHORT_PATH)(
+      "says NOTHING for the not-yet-created implicit yaml under an 8.3 directory",
+      async () => {
+        // Both failing channels at once: the leaf does not exist (so the collapse falls
+        // to the PARENT) and the parent is spelled 8.3 (so only `.native` expands it).
+        const liveRoot = await trackTmp();
+        const serverCfg = await liveConfigAt(liveRoot, "instance-model-paths.yaml");
+        await liveServer(liveRoot, serverCfg);
+        const shortDir = shortPathOf(liveRoot, "GetFolder");
+        expect(shortDir).toBeDefined();
+        const pinned = join(shortDir!, "extra_model_paths.yaml");
+        expect(existsSync(join(liveRoot, "extra_model_paths.yaml"))).toBe(false);
+
+        const added = await addExtraPath({ configPath: pinned, category: "vae", path: "D:/vae" });
+        expect(added.notes.some((n) => /does not read this file/.test(n))).toBe(false);
+        expect(added.message).toMatch(/Restart ComfyUI to apply it/);
+      },
+    );
+
+    it.skipIf(!CAN_SHORT_PATH)(
+      "still DOES flag an unrelated file under the same 8.3 directory (no over-collapsing)",
+      async () => {
+        // The control. Without it, a disclosure that had stopped firing entirely would
+        // pass both tests above — expanding short names must not collapse two distinct
+        // files in one directory into each other.
+        const liveRoot = await trackTmp();
+        const serverCfg = await liveConfigAt(liveRoot, "instance-model-paths.yaml");
+        await liveServer(liveRoot, serverCfg);
+        const shortDir = shortPathOf(liveRoot, "GetFolder");
+        expect(shortDir).toBeDefined();
+
+        const added = await addExtraPath({
+          configPath: join(shortDir!, "unrelated.yaml"),
+          category: "vae",
+          path: "D:/vae",
+        });
+        expect(added.notes.some((n) => /RUNNING ComfyUI does not read this file/.test(n))).toBe(
+          true,
+        );
+        expect(added.message).not.toMatch(/Restart ComfyUI to apply it/);
+      },
+    );
+  });
+
+  it("remove_path carries the disclosure too (an inert removal is equally a no-op)", async () => {
+    const appData = await trackTmp();
+    process.env.APPDATA = appData;
+    const liveRoot = await trackTmp();
+    const serverCfg = await liveConfigAt(liveRoot, "instance-model-paths.yaml");
+    await liveServer(liveRoot, serverCfg);
+    await addExtraPath({ target: "desktop", category: "vae", path: "D:/vae" });
+
+    const removed = await removeExtraPath({ target: "desktop", category: "vae", path: "D:/vae" });
+    expect(removed.changed).toBe(true);
+    expect(removed.message).not.toMatch(/Restart ComfyUI to apply it/);
+    expect(removed.message).toMatch(/does NOT read/);
   });
 });
 

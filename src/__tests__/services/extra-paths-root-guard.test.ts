@@ -286,6 +286,106 @@ describe("inferred root revalidation at the point of use", () => {
     expect(script.consumed).toBe(4);
   });
 
+  // #1788 — the divergence disclosure compares a PINNED config path against every file
+  // the running server loads. That comparison is realpath-collapsed on purpose: here the
+  // harmful direction is the false NEGATIVE, i.e. telling a user their edit is inert when
+  // it lands in the very file the server reads. Scripted realpathSync so it is proven on
+  // every platform (a real file symlink needs privileges on Windows).
+  it("pinned config: a realpath ALIAS of the server's own config is not called inert", async () => {
+    const liveRoot = await trackTmp();
+    await writeFile(join(liveRoot, "main.py"), "# comfyui\n", "utf-8");
+    const serverCfg = join(liveRoot, "instance-model-paths.yaml");
+    await writeFile(serverCfg, "live:\n  ipadapter: D:/shared/ipadapter\n", "utf-8");
+    const aliasDir = await trackTmp();
+    const alias = join(aliasDir, "alias.yaml");
+    await writeFile(alias, "live:\n  ipadapter: D:/shared/ipadapter\n", "utf-8");
+    script.realpath[alias] = serverCfg;
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: ["python", join(liveRoot, "main.py"), "--extra-model-paths-config", serverCfg],
+      },
+    });
+
+    const added = await addExtraPath({ configPath: alias, category: "vae", path: "D:/vae" });
+    expect(added.notes.some((n) => /does not read this file/.test(n))).toBe(false);
+    expect(added.message).toMatch(/Restart ComfyUI to apply it/);
+  });
+
+  it("pinned config: a path that is NOT an alias of any server config IS called inert", async () => {
+    // The control for the test above: without it, a disclosure that never fires at all
+    // would pass it just as well.
+    const liveRoot = await trackTmp();
+    await writeFile(join(liveRoot, "main.py"), "# comfyui\n", "utf-8");
+    const serverCfg = join(liveRoot, "instance-model-paths.yaml");
+    await writeFile(serverCfg, "live:\n  ipadapter: D:/shared/ipadapter\n", "utf-8");
+    const other = join(await trackTmp(), "unrelated.yaml");
+    await writeFile(other, "local:\n  vae: D:/vae\n", "utf-8");
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: ["python", join(liveRoot, "main.py"), "--extra-model-paths-config", serverCfg],
+      },
+    });
+
+    const added = await addExtraPath({ configPath: other, category: "vae", path: "D:/vae2" });
+    expect(added.notes.some((n) => /RUNNING ComfyUI does not read this file/.test(n))).toBe(true);
+    expect(added.message).not.toMatch(/Restart ComfyUI to apply it/);
+    expect(added.message).toContain(serverCfg);
+  });
+
+  // #1788 gate round 1, P1. The realpath collapse above is DEAD exactly when the pinned
+  // file does not exist yet — `realpathSync` throws on an absent path, so the comparison
+  // silently degraded to the lexical one it was added to fix. And "does not exist yet" is
+  // the ORDINARY state here: pinning a config is how a caller creates it. A junctioned
+  // ComfyUI root therefore had the very file the server reads declared inert. The
+  // aliasing lives in the PARENT, so the parent is what must be resolved.
+  it("pinned config: a not-yet-created file under a JUNCTIONED root is not called inert", async () => {
+    const realRoot = await trackTmp();
+    await writeFile(join(realRoot, "main.py"), "# comfyui\n", "utf-8");
+    const aliasRoot = await trackTmp();
+    // A junction: two spellings of ONE directory. Scripted so it runs without the
+    // privileges a real Windows junction needs; identity-mapping the real root keeps
+    // both sides of the comparison in the same spelling the argv resolution produced.
+    script.realpath[aliasRoot] = realRoot;
+    script.realpath[realRoot] = realRoot;
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["python", join(realRoot, "main.py")] },
+    });
+
+    const pinned = join(aliasRoot, "extra_model_paths.yaml");
+    expect(existsSync(pinned)).toBe(false); // the case that used to break it
+    const added = await addExtraPath({ configPath: pinned, category: "vae", path: "D:/vae" });
+
+    // It IS the server's implicit config, under another name for the same directory.
+    expect(added.notes.some((n) => /RUNNING ComfyUI does not read this file/.test(n))).toBe(
+      false,
+    );
+    expect(added.message).toMatch(/Restart ComfyUI to apply it/);
+    // The pin is still honoured — the write went to the spelling the caller gave. (With
+    // a REAL junction that pathname and the server's are one file; the scripted alias
+    // here models only the realpath answer, so the two directories stay distinct on
+    // disk and the assertion is about the pin, not about the junction.)
+    expect(existsSync(pinned)).toBe(true);
+  });
+
+  it("pinned config: a not-yet-created file under an UNRELATED root still IS called inert", async () => {
+    // The control. Without it, a comparison that had simply stopped firing would pass
+    // the junction case above just as well.
+    const realRoot = await trackTmp();
+    await writeFile(join(realRoot, "main.py"), "# comfyui\n", "utf-8");
+    const elsewhere = await trackTmp();
+    script.realpath[realRoot] = realRoot;
+    script.realpath[elsewhere] = elsewhere;
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["python", join(realRoot, "main.py")] },
+    });
+
+    const pinned = join(elsewhere, "extra_model_paths.yaml");
+    expect(existsSync(pinned)).toBe(false);
+    const added = await addExtraPath({ configPath: pinned, category: "vae", path: "D:/vae" });
+    expect(added.notes.some((n) => /RUNNING ComfyUI does not read this file/.test(n))).toBe(true);
+    expect(added.message).not.toMatch(/Restart ComfyUI to apply it/);
+  });
+
   it("live root: a SYMLINKED main.py resolves to the real install root (platform-independent)", async () => {
     // ComfyUI reads the implicit config next to os.path.realpath(__file__). Scripted
     // realpathSync stands in for a symlink so this runs everywhere, including on a
