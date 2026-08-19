@@ -192,6 +192,42 @@ describe("civitai request error surfacing (distinct failure modes)", () => {
     );
   });
 
+  it("a non-ASCII CIVITAI_API_TOKEN is a credential fault, not a network outage (#1702)", async () => {
+    // Node's fetch rejects a non-ASCII Authorization header with TypeError
+    // *before* any socket opens. The suite-wide fetch stub would hide that
+    // throw, so this case drives the real platform fetch — the same path
+    // download_model action:"download_civitai" hits.
+    vi.unstubAllGlobals();
+    const nonAsciiToken = "token日本語";
+    try {
+      const probe = await fetch("https://example.invalid", {
+        headers: { Authorization: `Bearer ${nonAsciiToken}` },
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      expect(probe).toBeInstanceOf(TypeError);
+      expect((probe as TypeError).message).toMatch(/ByteString|greater than 255/i);
+
+      config.civitaiApiToken = nonAsciiToken;
+      let err: unknown;
+      try {
+        await resolveCivitaiModelVersion(3223074);
+      } catch (e) {
+        err = e;
+      }
+
+      expect(err).toBeInstanceOf(ModelError);
+      const me = err as ModelError;
+      expect(me.message).not.toMatch(/unreachable|check connectivity/i);
+      expect(me.message).toMatch(/credential|CIVITAI_API_TOKEN/i);
+      expect((me.details as { network?: boolean } | undefined)?.network).not.toBe(true);
+      expect((me.details as { credential?: boolean } | undefined)?.credential).toBe(true);
+    } finally {
+      vi.stubGlobal("fetch", fetchMock);
+    }
+  });
+
   it("2xx that is NOT JSON (bot-gate/interstitial) → distinct non-JSON error, not a garbage empty", async () => {
     fetchMock.mockResolvedValueOnce({
       ok: true,
