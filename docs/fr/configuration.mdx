@@ -58,11 +58,10 @@ définissez `COMFYUI_PATH` explicitement si vous voulez mélanger.
   nœuds, supprimer des modèles, lire les logs, lister les fichiers de sortie).
 </ParamField>
 <ParamField path="COMFYUI_CODE_PATH" type="string" default="COMFYUI_PATH">
-  Racine optionnelle du checkout de code pour les installations séparées, où `main.py`,
-  `.venv` et `custom_nodes` sont distincts des données et modèles. Les mutations comfy-cli,
-  la provenance des verrous et les anciens snapshots Manager l'utilisent ; les mises à jour
-  du cœur préfèrent le checkout observé du serveur local. Ignoré pour les mutations du
-  système de fichiers en mode distant.
+  Racine optionnelle du checkout de code pour les installations séparées, où `main.py`
+  et `.venv` sont distincts des données et modèles. Pip, venv et les mises à jour du
+  cœur utilisent ce checkout. Les lectures/écritures de packs (`custom_nodes`) restent
+  sur `--base-directory` / `COMFYUI_PATH`. Ignoré en mode distant.
 </ParamField>
 <ParamField path="COMFYUI_RESTART_COMMAND" type="string">
   Commande shell qui redémarre un ComfyUI **géré de l'extérieur** — p. ex.

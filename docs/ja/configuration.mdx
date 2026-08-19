@@ -49,10 +49,10 @@ icon: "gear"
   モデル削除、ログ読み取り、出力ファイル一覧）が必要とします。
 </ParamField>
 <ParamField path="COMFYUI_CODE_PATH" type="string" default="COMFYUI_PATH">
-  `main.py`、`.venv`、`custom_nodes` がデータやモデルとは別の場所にある分離構成で、
-  コード checkout のルートを指定する任意設定です。comfy-cli の変更、ワークフローロックの
-  pack 情報、旧 Manager snapshot がこのパスを使います。コア更新は接続中のローカルサーバーから
-  観測した checkout を優先し、このパスを fallback にします。リモートモードでは無視されます。
+  `main.py` と `.venv` がデータやモデルとは別の場所にある分離構成で、コード checkout
+  のルートを指定する任意設定です。pip / venv / コア更新がこのパスを使います。
+  `custom_nodes` の読み書きは `--base-directory` / `COMFYUI_PATH` に残ります。
+  リモートモードでは無視されます。
 </ParamField>
 <ParamField path="COMFYUI_RESTART_COMMAND" type="string">
   **外部管理** の ComfyUI を再起動するシェルコマンド — 例: `docker restart comfyui`

@@ -92,9 +92,9 @@ Set in the `env` block above. None are required for the local-default flow.
 - `COMFYUI_PATH` — explicit ComfyUI data/base path (also the checkout for a
   conventional install; auto-detected on Mac / Linux / Windows when unset)
 - `COMFYUI_CODE_PATH` — optional checkout path for split installs whose
-  `main.py`, `.venv`, and `custom_nodes` are separate from data/model/user state;
-  code-facing mutations and `apply_manifest` pip/node dependencies use it while
-  model and user-state tools keep their component-specific roots
+  `main.py` and `.venv` are separate from data/model/user state; pip/venv/core
+  updates use it while pack reads/writes stay on the live `--base-directory` /
+  `COMFYUI_PATH` data root
 - `COMFYUI_DOWNLOAD_CACHE_DIR` — model download cache (default
   `~/.comfyui-mcp/cache`)
 - `COMFYUI_LRU_CACHE_SIZE_GB` — cap the cache; `0` disables eviction

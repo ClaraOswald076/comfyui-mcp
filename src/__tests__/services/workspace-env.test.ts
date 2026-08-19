@@ -708,6 +708,23 @@ describe("split code-root resolution", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("still adopts the live main.py checkout when --base-directory is unresolvable", async () => {
+    // DATA resolver fail-closes here (#1715). CODE operations still want the
+    // checkout: main.py is the right tree for pip/venv/core git even when the
+    // pack root cannot be named.
+    const root = await tmpDir();
+    try {
+      await writeFile(join(root, "main.py"), "", "utf-8");
+      mockConfig.comfyuiCodePath = "/offline-code";
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: ["python", join(root, "main.py"), "--base-directory", "data"] },
+      });
+      await expect(resolveEffectiveComfyUICodeBaseLive()).resolves.toBe(root);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("getEnvironment", () => {
@@ -718,9 +735,9 @@ describe("getEnvironment", () => {
     try {
       await mkdir(dataRoot, { recursive: true });
       await mkdir(join(codeRoot, ".git"), { recursive: true });
-      await mkdir(join(codeRoot, "custom_nodes", "ComfyUI-Manager"), { recursive: true });
+      await mkdir(join(dataRoot, "custom_nodes", "ComfyUI-Manager"), { recursive: true });
       await writeFile(
-        join(codeRoot, "custom_nodes", "ComfyUI-Manager", "pyproject.toml"),
+        join(dataRoot, "custom_nodes", "ComfyUI-Manager", "pyproject.toml"),
         'version = "3.41"\n',
         "utf-8",
       );
@@ -742,6 +759,33 @@ describe("getEnvironment", () => {
       expect(env.local.git).toEqual({ rev: "abc123", branch: "main" });
       expect(env.local.comfyui_manager_version).toBe("3.41");
       expect(env.local.note).toMatch(/Split install/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not label COMFYUI_CODE_PATH as local.workspace_path when no data root is set", async () => {
+    const dir = await tmpDir();
+    const codeRoot = join(dir, "code");
+    try {
+      await mkdir(join(codeRoot, ".git"), { recursive: true });
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      mockConfig.comfyuiPath = undefined;
+      mockConfig.comfyuiCodePath = codeRoot;
+      mockGetSystemStats.mockRejectedValueOnce(new Error("offline"));
+      setExecFileResponder((cmd, args) => {
+        if (cmd === "git" && args.includes("--short")) return { stdout: "def456\n" };
+        if (cmd === "git" && args.includes("--abbrev-ref")) return { stdout: "main\n" };
+        return new Error("not configured");
+      });
+
+      const env = await getEnvironment();
+
+      expect(env.local.workspace_path).toBeUndefined();
+      expect(env.local.code_path).toBe(codeRoot);
+      expect(env.local.code_path_source).toBe("env");
+      expect(env.local.git).toEqual({ rev: "def456", branch: "main" });
+      expect(env.local.note).toMatch(/no data\/base workspace/i);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

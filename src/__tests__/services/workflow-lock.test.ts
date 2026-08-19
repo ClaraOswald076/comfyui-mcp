@@ -48,10 +48,10 @@ afterEach(async () => {
 describe("generateLock", () => {
   it("throws when COMFYUI_PATH is not configured", async () => {
     config.comfyuiPath = undefined;
-    await expect(generateLock({} as never)).rejects.toThrow(/local ComfyUI code checkout/);
+    await expect(generateLock({} as never)).rejects.toThrow(/local ComfyUI install/);
   });
 
-  it("hashes models from the data root and pack commits from the split code root", async () => {
+  it("hashes models and pack commits from the data/base root even when a code checkout is set", async () => {
     const codeRoot = join(tempDir, "separate-code-root");
     config.comfyuiCodePath = codeRoot;
     await mkdir(join(tempDir, "models", "checkpoints"), { recursive: true });
@@ -59,9 +59,9 @@ describe("generateLock", () => {
       join(tempDir, "models", "checkpoints", "split.safetensors"),
       "split-model-bytes",
     );
-    await mkdir(join(codeRoot, "custom_nodes", "SplitPack", ".git"), { recursive: true });
+    await mkdir(join(tempDir, "custom_nodes", "SplitPack", ".git"), { recursive: true });
     await writeFile(
-      join(codeRoot, "custom_nodes", "SplitPack", ".git", "HEAD"),
+      join(tempDir, "custom_nodes", "SplitPack", ".git", "HEAD"),
       "cafebabe00000000000000000000000000000000\n",
     );
     getObjectInfo.mockResolvedValue({
@@ -83,7 +83,7 @@ describe("generateLock", () => {
   it("refuses local lock reads in remote mode even when split roots are configured", async () => {
     cfg.remote = true;
     config.comfyuiCodePath = join(tempDir, "code");
-    await expect(generateLock({} as never)).rejects.toThrow(/local ComfyUI code checkout/);
+    await expect(generateLock({} as never)).rejects.toThrow(/local ComfyUI install/);
   });
 
   it("captures models with SHA-256 + custom pack git HEAD + ComfyUI version", async () => {

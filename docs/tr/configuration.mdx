@@ -54,11 +54,10 @@ ayarlayın.
   dosyalarını listele).
 </ParamField>
 <ParamField path="COMFYUI_CODE_PATH" type="string" default="COMFYUI_PATH">
-  `main.py`, `.venv` ve `custom_nodes` dizinlerinin veri ve modellerden ayrı olduğu
-  bölünmüş kurulumlar için isteğe bağlı kod checkout köküdür. comfy-cli değişiklikleri,
-  workflow lock paket kaynağı ve eski Manager snapshot düzeni bu yolu kullanır; çekirdek
-  güncellemeleri yerel sunucuda gözlenen checkout'u tercih eder. Uzak kipte yerel dosya
-  sistemi değişiklikleri için yok sayılır.
+  `main.py` ve `.venv` dizinlerinin veri ve modellerden ayrı olduğu bölünmüş
+  kurulumlar için isteğe bağlı kod checkout köküdür. Pip, venv ve çekirdek
+  güncellemeleri bu yolu kullanır. Paket okuma/yazmaları (`custom_nodes`)
+  `--base-directory` / `COMFYUI_PATH` üzerinde kalır. Uzak kipte yok sayılır.
 </ParamField>
 <ParamField path="COMFYUI_RESTART_COMMAND" type="string">
   **Harici yönetilen** bir ComfyUI'yi yeniden başlatan kabuk komutu — örn.

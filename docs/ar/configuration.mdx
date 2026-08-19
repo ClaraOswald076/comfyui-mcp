@@ -51,9 +51,9 @@ icon: "gear"
 </ParamField>
 <ParamField path="COMFYUI_CODE_PATH" type="string" default="COMFYUI_PATH">
   جذر اختياري لمستودع الكود في التثبيتات المنقسمة، حيث تكون `main.py` و`.venv`
-  و`custom_nodes` منفصلة عن بيانات المستخدم والنماذج. تستخدمه عمليات comfy-cli
-  وقفل سير العمل ولقطات Manager القديمة؛ أما تحديث النواة فيفضّل المستودع المرصود
-  من الخادم المحلي ويستخدم هذا المسار كخيار احتياطي. يُتجاهل في الوضع البعيد.
+  منفصلة عن بيانات المستخدم والنماذج. يستخدمه pip وvenv وتحديث النواة.
+  تبقى قراءة/كتابة الحزم (`custom_nodes`) على `--base-directory` / `COMFYUI_PATH`.
+  يُتجاهل في الوضع البعيد.
 </ParamField>
 <ParamField path="COMFYUI_RESTART_COMMAND" type="string">
   أمر shell يُعيد تشغيل ComfyUI **المُدار خارجيًا** — مثل `docker restart comfyui`

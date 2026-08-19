@@ -1266,7 +1266,7 @@ describe("node-management service", () => {
       ]);
     });
 
-    it("routes forced cm-cli and its git checkout through COMFYUI_CODE_PATH in a split install", async () => {
+    it("routes forced cm-cli and its git checkout through the data/base root in a split install", async () => {
       config.comfyuiPath = "/split/data";
       config.comfyuiCodePath = "/split/code";
       mockedExec.mockReturnValue(cliEnvelope({ message: "installed ok" }) as never);
@@ -1278,11 +1278,11 @@ describe("node-management service", () => {
       });
 
       expect(res.mechanism).toBe("comfy-cli");
-      expect(mockedExec.mock.calls[0][1]).toContain("/split/code");
-      expect(mockedExec.mock.calls[0][1]).not.toContain("/split/data");
+      expect(mockedExec.mock.calls[0][1]).toContain("/split/data");
+      expect(mockedExec.mock.calls[0][1]).not.toContain("/split/code");
       expect(mockedExec.mock.calls[2][1]).toEqual([
         "-C",
-        resolve("/split/code", "custom_nodes", "bar"),
+        resolve("/split/data", "custom_nodes", "bar"),
         "checkout",
         "--detach",
         "--end-of-options",
@@ -1528,8 +1528,8 @@ describe("node-management service", () => {
       const [, args] = mockedExec.mock.calls[0];
       expect(args).toContain("fix");
       expect(args).toContain("all");
-      expect(args).toContain("/split/code");
-      expect(args).not.toContain("/split/data");
+      expect(args).toContain("/split/data");
+      expect(args).not.toContain("/split/code");
     });
   });
 

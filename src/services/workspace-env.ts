@@ -160,10 +160,12 @@ export function resolveEffectiveComfyUIBase(): string | undefined {
 }
 
 /**
- * The checkout/code root for synchronous code-facing operations.
+ * The checkout/code root for synchronous code-facing operations (pip, .venv,
+ * core git). Pack reads/writes stay on the data/base root (#1715/#1770).
  *
- * Split deployments may keep input/output/user/models under COMFYUI_PATH while
- * running main.py, .venv and custom_nodes from a separate checkout. An explicit
+ * Split deployments may keep input/output/user/models — and, on
+ * `--base-directory` runtimes, `custom_nodes` — under COMFYUI_PATH while
+ * running main.py and .venv from a separate checkout. An explicit
  * COMFYUI_CODE_PATH names that checkout. When it is absent, this intentionally
  * preserves the historical COMFYUI_PATH/default-workspace behavior.
  */
@@ -176,9 +178,18 @@ export function resolveEffectiveComfyUICodeBase(): string | undefined {
  * Live-aware code-root resolver for asynchronous filesystem operations.
  *
  * A reachable local server's observed main.py root is strongest evidence of
- * the checkout actually serving this session. COMFYUI_CODE_PATH is the
- * explicit offline/unresolvable fallback, followed by the legacy effective
- * base for backward compatibility. No directory-layout guessing is performed.
+ * the checkout actually serving this session (pip/venv/core git). This is NOT
+ * the pack root: on `--base-directory` deployments ComfyUI scans custom_nodes/
+ * from the data/base directory, which `resolveEffectiveComfyUIBaseLive` answers.
+ *
+ * Deliberately does NOT apply `hasUnresolvableRelativeBaseDirFlag`. That gate
+ * fail-closes the DATA resolver so we never treat main.py as the pack root
+ * when `--base-directory` cannot be resolved. For CODE operations, main.py IS
+ * the right tree even then.
+ *
+ * COMFYUI_CODE_PATH is the explicit offline/unresolvable fallback, followed
+ * by the legacy effective base for backward compatibility. No directory-layout
+ * guessing is performed.
  */
 export async function resolveEffectiveComfyUICodeBaseLive(): Promise<string | undefined> {
   if (isRemoteMode()) return undefined;
@@ -1550,10 +1561,11 @@ export interface EnvironmentInfo {
   };
   // Local workspace probes (omitted/degraded when no local path)
   local: {
-    /** Data/base workspace (models, input/output and user state in a split install). */
+    /** Data/base workspace (models, input/output, user state, and — on
+     *  `--base-directory` runtimes — custom_nodes). */
     workspace_path?: string;
-    /** Checkout used for main.py, .venv and custom_nodes. Equal to workspace_path
-     *  for conventional installs. */
+    /** Checkout used for main.py, .venv and core git. Equal to workspace_path
+     *  for conventional installs. Pack reads/writes stay on workspace_path (#1770). */
     code_path?: string;
     code_path_source?: "live-server" | "env" | "workspace";
     python?: { executable: string; version: string };
@@ -1669,11 +1681,12 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
   const codeRoot = remote
     ? undefined
     : resolved.liveRoot ?? config.comfyuiCodePath ?? workspacePath;
-  // Preserve the existing remote diagnostic shape: an argv-derived root may be
-  // shown as an explicitly untrusted reference even though it can never become
-  // a local mutation/code root in remote mode.
-  const localRoot = workspacePath ?? resolved.liveRoot ?? codeRoot;
-  if (!localRoot) {
+  // workspace_path is the DATA/base root. Never label COMFYUI_CODE_PATH as
+  // workspace_path — that field means the data root everywhere else. An
+  // argv-derived live root may still be shown (including as a remote diagnostic)
+  // because that is the server's self-report, not the configured code override.
+  const localRoot = workspacePath ?? resolved.liveRoot;
+  if (!localRoot && !codeRoot) {
     local.note =
       "No local ComfyUI path configured (COMFYUI_PATH unset, none auto-detected, " +
       "and no saved default workspace) and no live server main.py to locate one. " +
@@ -1681,7 +1694,7 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
     return { running_instance: running, local };
   }
 
-  local.workspace_path = localRoot;
+  if (localRoot) local.workspace_path = localRoot;
   if (codeRoot) {
     local.code_path = codeRoot;
     local.code_path_source = resolved.liveRoot
@@ -1693,10 +1706,17 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
   if (!config.comfyuiPath && cfg.defaultWorkspace) {
     local.note = `Using saved default workspace "${cfg.defaultWorkspace}" (COMFYUI_PATH not set).`;
   }
-  if (codeRoot && codeRoot !== localRoot) {
+  if (codeRoot && localRoot && codeRoot !== localRoot) {
     local.note = [
       local.note,
       `Split install: data/base workspace is "${localRoot}"; code checkout is "${codeRoot}" (${local.code_path_source}).`,
+    ]
+      .filter(Boolean)
+      .join(" ");
+  } else if (codeRoot && !localRoot) {
+    local.note = [
+      local.note,
+      `Using code checkout "${codeRoot}" (${local.code_path_source}); no data/base workspace (COMFYUI_PATH) is configured.`,
     ]
       .filter(Boolean)
       .join(" ");
@@ -1869,12 +1889,20 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
       .join(" ");
   }
 
-  const codeProbeRoot = codeRoot ?? localRoot;
-  const git = await probeGitRev(codeProbeRoot);
-  if (git) local.git = git;
+  const gitRoot = codeRoot ?? localRoot;
+  if (gitRoot) {
+    const git = await probeGitRev(gitRoot);
+    if (git) local.git = git;
+  }
 
-  const managerVersion = await readManagerVersion(codeProbeRoot);
-  if (managerVersion) local.comfyui_manager_version = managerVersion;
+  // Manager lives under custom_nodes/, which --base-directory runtimes scan
+  // from the data/base root (#1770). Fall back to the checkout only when no
+  // data root is known (legacy layout next to main.py).
+  const managerRoot = localRoot ?? codeRoot;
+  if (managerRoot) {
+    const managerVersion = await readManagerVersion(managerRoot);
+    if (managerVersion) local.comfyui_manager_version = managerVersion;
+  }
 
   return { running_instance: running, local };
 }

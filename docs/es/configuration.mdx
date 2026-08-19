@@ -60,11 +60,10 @@ mezclar.
   nodos, eliminar modelos, leer registros, listar archivos de salida).
 </ParamField>
 <ParamField path="COMFYUI_CODE_PATH" type="string" default="COMFYUI_PATH">
-  Raíz opcional del checkout de código para instalaciones divididas, donde `main.py`,
-  `.venv` y `custom_nodes` están separados de los datos y modelos. La usan las
-  mutaciones de comfy-cli, la procedencia de locks y los snapshots heredados de Manager;
-  las actualizaciones del núcleo prefieren el checkout observado del servidor local.
-  Se ignora para mutaciones del sistema de archivos en modo remoto.
+  Raíz opcional del checkout de código para instalaciones divididas, donde `main.py`
+  y `.venv` están separados de los datos y modelos. Pip, venv y las actualizaciones
+  del núcleo usan este checkout. Las lecturas/escrituras de packs (`custom_nodes`)
+  permanecen en `--base-directory` / `COMFYUI_PATH`. Se ignora en modo remoto.
 </ParamField>
 <ParamField path="COMFYUI_RESTART_COMMAND" type="string">
   Comando de shell que reinicia un ComfyUI **gestionado externamente** — p. ej.

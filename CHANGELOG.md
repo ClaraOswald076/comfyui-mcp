@@ -759,6 +759,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### MCP
+
+#### Added
+- split ComfyUI code and data roots via `COMFYUI_CODE_PATH` so pip/venv/core git can target the checkout while pack reads/writes stay on the live `--base-directory` / `COMFYUI_PATH` data root (#1765, thanks @woodenriver05; rebase of #1766)
+
 ## [0.52.10] - 2026-08-19
 
 ### MCP

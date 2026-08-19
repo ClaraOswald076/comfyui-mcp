@@ -20,6 +20,7 @@ import {
 } from "./manager-api-cache.js";
 export type { ManagerApi } from "./manager-api-cache.js";
 import {
+  resolveEffectiveComfyUIBase,
   resolveEffectiveComfyUICodeBase,
   resolveInstallInterpreter,
 } from "./workspace-env.js";
@@ -1579,13 +1580,13 @@ function runCmCli(args: string[], workspace?: string): string {
   // mode by four other routes. Every comfy-cli invocation passes through HERE, so
   // this is where the refusal belongs. Nothing has run yet at this point, which is
   // what makes refusing the right shape.
-  const resolvedWorkspace = workspace ?? resolveEffectiveComfyUICodeBase();
+  const resolvedWorkspace = workspace ?? resolveEffectiveComfyUIBase();
   if (isRemoteMode()) {
     throw new ProcessControlError(
       "This session targets a REMOTE ComfyUI (--comfyui-url), and comfy-cli only acts on a " +
         "LOCAL install" +
-        (workspace ?? config.comfyuiCodePath ?? config.comfyuiPath
-          ? ` — running it would modify ${workspace ?? config.comfyuiCodePath ?? config.comfyuiPath}, which is NOT the ` +
+        (workspace ?? config.comfyuiPath ?? config.comfyuiCodePath
+          ? ` — running it would modify ${workspace ?? config.comfyuiPath ?? config.comfyuiCodePath}, which is NOT the ` +
             `server you are connected to`
           : "") +
         ". Nothing was run. Use the ComfyUI-Manager HTTP path, which addresses the server you " +
@@ -1595,9 +1596,10 @@ function runCmCli(args: string[], workspace?: string): string {
   const ws = resolvedWorkspace;
   if (!ws) {
     throw new ProcessControlError(
-      "This operation requires a local ComfyUI code checkout. Set COMFYUI_CODE_PATH, " +
-        "COMFYUI_PATH for a conventional install, or a " +
-        "default workspace (workspace action 'set_default'), or use the Manager HTTP API.",
+      "This operation requires a local ComfyUI install. Set COMFYUI_PATH, " +
+        "a default workspace (workspace action 'set_default'), or use the Manager HTTP API. " +
+        "On --base-directory deployments this is the data/base directory the runtime scans, " +
+        "not COMFYUI_CODE_PATH.",
     );
   }
   logger.info("Running comfy-cli", { args: ["node", ...args].join(" ") });
@@ -1919,8 +1921,8 @@ function gitCheckoutDir(baseUrl: string): string {
 function runGitCheckout(baseUrl: string, ref: string, basePath?: string): void {
   // basePath is the CALL-SCOPED local ComfyUI root (apply_manifest threads an
   // adopted saved-default/live root WITHOUT mutating global config); fall back to
-  // the shared code-root resolver. Either may be unset in remote mode → clear error.
-  const comfyuiBase = basePath ?? resolveEffectiveComfyUICodeBase();
+  // the shared data/base resolver. Either may be unset in remote mode → clear error.
+  const comfyuiBase = basePath ?? resolveEffectiveComfyUIBase();
   if (!comfyuiBase) {
     throw new ProcessControlError(
       "Checking out a custom-node git ref requires a local ComfyUI install, " +
@@ -2127,7 +2129,7 @@ export function capturePackPresenceContext(diskRoot?: string): PackPresenceConte
   const remote = isRemoteMode();
   return {
     remote,
-    diskRoot: remote ? undefined : (diskRoot ?? resolveEffectiveComfyUICodeBase()),
+    diskRoot: remote ? undefined : (diskRoot ?? resolveEffectiveComfyUIBase()),
   };
 }
 
@@ -2211,13 +2213,15 @@ export async function resolvePackPresence(
  * the install's own `.venv` (Windows Scripts/ or POSIX bin/), falling back to a
  * bare "python" on PATH. `basePath` is the CALL-SCOPED install root (apply_manifest
  * threads an adopted saved-default/live root without mutating global config); when
- * omitted it falls back to the shared code-root resolver. Passing it matters: otherwise a
- * cloned node's requirements.txt / install.py would run under a BARE system python
- * for an adopted workspace, corrupting/ missing the real ComfyUI environment while
- * the node is still reported installed (#463 codex review).
+ * omitted it falls back to the code checkout (pip/venv live under main.py), then
+ * the pack/data root for a conventional single-root install. Passing the pack
+ * root still matters as that last fallback: otherwise a cloned node's
+ * requirements.txt / install.py would run under a BARE system python for an
+ * adopted workspace (#463). The code root wins on a split install so Desktop
+ * `--base-directory` pack writes do not pick the data tree's missing .venv.
  */
 async function resolveVenvPython(basePath?: string) {
-  return resolveInstallInterpreter(basePath ?? resolveEffectiveComfyUICodeBase());
+  return resolveInstallInterpreter(resolveEffectiveComfyUICodeBase() ?? basePath);
 }
 
 /**
@@ -2426,8 +2430,8 @@ async function cloneCustomNodeFallback(
   // basePath is the CALL-SCOPED local ComfyUI root (apply_manifest threads an
   // adopted saved-default/live root here WITHOUT mutating global config, so a
   // panel-connected local session with no COMFYUI_PATH can still clone an
-  // unregistered git pack); fall back to the shared code-root resolver.
-  const comfyuiBase = basePath ?? resolveEffectiveComfyUICodeBase();
+  // unregistered git pack); fall back to the shared data/base resolver.
+  const comfyuiBase = basePath ?? resolveEffectiveComfyUIBase();
   // Same hazard as the CLI paths (codex gate P0): the guard below catches "no
   // path", but the dangerous case is HAVING one while connected elsewhere. A
   // clone into a stale local tree would report a successful install of a pack the
@@ -2651,10 +2655,10 @@ export interface InstallOptions {
   channel?: string;
   /** Force the official comfy-cli subprocess instead of the HTTP API. */
   useCmCli?: boolean;
-  /** CALL-SCOPED local ComfyUI root for the git-clone / ref-checkout fallback,
-   *  threaded by callers (e.g. apply_manifest) that resolve an adopted
-   *  saved-default/live root WITHOUT mutating global config. Falls back to the
-   *  shared code-root resolver when omitted. */
+  /** CALL-SCOPED local ComfyUI data/base root for the git-clone / ref-checkout
+   *  fallback, threaded by callers (e.g. apply_manifest) that resolve an adopted
+   *  saved-default/live `--base-directory` WITHOUT mutating global config. Falls
+   *  back to the shared data/base resolver when omitted. */
   comfyuiPath?: string;
 }
 
@@ -2697,9 +2701,9 @@ export async function installCustomNode(opts: InstallOptions): Promise<NodeOpRes
  * undefined when it can. Probed BEFORE anything is submitted (#808): an
  * explicit useCmCli on a host without a usable CLI must fall back to Manager
  * HTTP, not die with NODE_MANAGEMENT_ERROR after the tool description promised
- * a fallback. `workspace` is the caller's captured local code root — an
- * explicit COMFYUI_CODE_PATH, legacy COMFYUI_PATH, an adopted root, or the
- * saved default workspace, which the CLI layer supports natively.
+ * a fallback. `workspace` is the caller's captured local pack/data root —
+ * COMFYUI_PATH, an adopted live `--base-directory`, or the saved default
+ * workspace, which the CLI layer supports natively.
  */
 function comfyCliUnavailableReason(workspace: string | undefined): string | undefined {
   // REMOTE MODE FIRST (codex gate P0). comfy-cli runs against a LOCAL install,
@@ -2722,7 +2726,7 @@ function comfyCliUnavailableReason(workspace: string | undefined): string | unde
     );
   }
   if (!workspace) {
-    return "no local ComfyUI code checkout is available (COMFYUI_CODE_PATH/COMFYUI_PATH unset and no saved default workspace), which the comfy-cli subprocess needs";
+    return "no local ComfyUI install is available (COMFYUI_PATH unset and no saved default workspace), which the comfy-cli subprocess needs";
   }
   const executable = resolveComfyCliExecutable({ workspace });
   if (!executable) {
@@ -2772,13 +2776,13 @@ async function installCustomNodeImpl(
   // Keep the mutation, its post-queue verification, AND any local filesystem
   // work on the target selected for this invocation — captured NOW, before the
   // first await: a panel retarget in between must not split them across two
-  // installs. cliWorkspace covers COMFYUI_CODE_PATH, legacy COMFYUI_PATH, an
-  // adopted root, and the saved default workspace; the CLI probe, the
+  // installs. cliWorkspace is the pack/data root (COMFYUI_PATH, an adopted
+  // live `--base-directory`, or the saved default); the CLI --workspace, the
   // ref checkout, and the clone fallback all take this ONE root, so a git
   // install with a ref can never install into the workspace and then fail the
   // checkout for want of a path (codex gate rounds 5-6).
   const managerBase = managerBaseUrl();
-  const cliWorkspace = opts.comfyuiPath ?? resolveEffectiveComfyUICodeBase();
+  const cliWorkspace = opts.comfyuiPath ?? resolveEffectiveComfyUIBase();
   const presenceCtx = capturePackPresenceContext(cliWorkspace);
   // THE PRE-STATE, OBSERVED BEFORE THE OPERATION (codex gate P0). The "already
   // installed" verdict below used to be inferred from POST-op disk state alone:
@@ -3727,7 +3731,7 @@ async function setCustomNodeEnabled(
   // Pinned with the target: the CLI must run against the SAME local install
   // the pre/post checks describe, even if the configured workspace is retargeted
   // during an await below (codex gate round 5).
-  const cliWorkspace = resolveEffectiveComfyUICodeBase();
+  const cliWorkspace = resolveEffectiveComfyUIBase();
   const presenceCtx = capturePackPresenceContext(cliWorkspace);
 
   // CLI availability probe FIRST (#808 fallback discipline), but NO subprocess
@@ -3950,7 +3954,7 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
   const { id } = opts;
   const base = managerBaseUrl();
   // Pinned with the target, same as in setCustomNodeEnabled (codex gate round 5).
-  const cliWorkspace = resolveEffectiveComfyUICodeBase();
+  const cliWorkspace = resolveEffectiveComfyUIBase();
   const presenceCtx = capturePackPresenceContext(cliWorkspace);
 
   // CLI availability probe FIRST (#808 fallback discipline) — but nothing runs

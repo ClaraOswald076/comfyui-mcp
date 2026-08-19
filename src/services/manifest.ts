@@ -38,10 +38,9 @@ import {
 import { startDownloadJob, describePlacement, type DownloadJob } from "./download-jobs.js";
 import { resolveModelsDir } from "./output-dir.js";
 import {
-  getSavedDefaultWorkspaceSync,
+  resolveEffectiveComfyUIBaseLive,
   resolveEffectiveComfyUICodeBaseLive,
   resolveInstallInterpreter,
-  resolveLiveComfyUIBase,
   type InstallInterpreterResolution,
 } from "./workspace-env.js";
 import { ValidationError } from "../utils/errors.js";
@@ -906,28 +905,6 @@ function remoteModelTarget(model: ComfyManifest["models"][number]): {
   return { name: filename, type, save_path, filename, category };
 }
 
-/**
- * #390: resolve a saved default workspace to adopt as the local FS target for
- * THIS apply_manifest call, WITHOUT persisting it process-wide. Returns a path
- * only when: we are in local mode (a loopback/local ComfyUI, not remote/cloud),
- * COMFYUI_PATH is unset, and the saved default (what install_comfyui (action:"environment") resolves)
- * both exists and looks like a ComfyUI install (has models/ or custom_nodes/).
- * The connected server is local (isRemoteMode() === false), so the saved default
- * is a valid local mirror of it. Returns undefined otherwise.
- */
-function adoptableLocalWorkspace(): string | undefined {
-  if (config.comfyuiPath || isRemoteMode()) return undefined;
-  const saved = getSavedDefaultWorkspaceSync();
-  if (
-    saved &&
-    existsSync(saved) &&
-    (existsSync(join(saved, "models")) || existsSync(join(saved, "custom_nodes")))
-  ) {
-    return saved;
-  }
-  return undefined;
-}
-
 async function installedNodesOrEmpty(): Promise<InstalledNode[]> {
   try {
     return await listInstalledNodes();
@@ -949,22 +926,16 @@ export async function applyManifest(
   // every concurrent tab/tool and could be clobbered by an interleaved restore —
   // #490/#463 codex review). We thread it explicitly to applyManifestSections
   // instead. Precedence, local mode only:
-  //   1. config.comfyuiPath (COMFYUI_PATH / auto-detect) — unchanged, wins.
-  //   2. saved default workspace (#390).
-  //   3. the LIVE connected server's own install root from /system_stats argv
-  //      (#463) — a panel-connected local session with no COMFYUI_PATH still has
-  //      a real FS target, so models/pip aren't skipped as "no local filesystem".
+  // Both roots are live-first so one apply_manifest cannot split mutations
+  // across two unrelated installs when config and the connected server differ:
+  //   dataBase — live --base-directory, then configuration, then main.py
+  //              (same as node_pack, #1715/#1770). Pack clone/checkout land here.
+  //   codeBase — live main.py, then COMFYUI_CODE_PATH, then the data base.
+  //              Pip/venv land here.
   // The actual on-disk model DESTINATION is always re-derived live-first by the
-  // downloader (resolveModelsDir), so this base only governs data-filesystem
-  // availability, never where a model lands. Code-facing work is resolved
-  // independently below.
+  // downloader (resolveModelsDir), so dataBase only governs data-filesystem
+  // availability, never where a model lands.
   const localDataBase = await resolveLocalManifestBase();
-  // A split install can serve models/user/output from COMFYUI_PATH while its
-  // Python environment and custom_nodes checkout live elsewhere. Resolve that
-  // code root independently, once for this composite operation, so pip and the
-  // node install fallback cannot accidentally mutate the data-only tree. The
-  // live server's observed main.py root wins; COMFYUI_CODE_PATH and then the
-  // legacy data/workspace base are fallbacks in workspace-env.
   const localCodeBase = isRemoteMode()
     ? undefined
     : (await resolveEffectiveComfyUICodeBaseLive()) ?? localDataBase;
@@ -981,27 +952,11 @@ export async function applyManifest(
  * can be found (COMFYUI_PATH unset, no saved default, no reachable live server).
  */
 async function resolveLocalManifestBase(): Promise<string | undefined> {
-  if (config.comfyuiPath) return config.comfyuiPath;
-  if (isRemoteMode()) return undefined;
-  const saved = adoptableLocalWorkspace();
-  if (saved) return saved;
-  // #463: a live LOCAL ComfyUI is connected but COMFYUI_PATH/default are unset.
-  // Adopt its own install root (from /system_stats argv) only when it exists and
-  // looks like a ComfyUI install.
-  const liveBase = await resolveLiveComfyUIBase();
-  if (
-    liveBase &&
-    existsSync(liveBase) &&
-    (existsSync(join(liveBase, "models")) ||
-      existsSync(join(liveBase, "custom_nodes")))
-  ) {
-    logger.info(
-      "apply_manifest: targeting the live connected ComfyUI root for this call (COMFYUI_PATH unset)",
-      { path: liveBase },
-    );
-    return liveBase;
-  }
-  return undefined;
+  // Same precedence as node_pack: live --base-directory, then configuration,
+  // then the main.py root when it looks like an install. Config-first here
+  // used to let one apply_manifest write packs to COMFYUI_PATH while pip
+  // targeted the live checkout of a different install.
+  return resolveEffectiveComfyUIBaseLive();
 }
 
 async function applyManifestSections(
@@ -1015,8 +970,8 @@ async function applyManifestSections(
   const results: ManifestItemReport[] = [];
 
   // Per-section mode handling. Data and code filesystem availability are
-  // independent: COMFYUI_PATH can name shared models/user/output while
-  // COMFYUI_CODE_PATH (or the live main.py root) names .venv/custom_nodes.
+  // independent: COMFYUI_PATH / live --base-directory name models/user/output
+  // and custom_nodes, while COMFYUI_CODE_PATH (or the live main.py root) names .venv.
   // Neither local path is usable in remote mode. Keying off isRemoteMode()
   // (rather than mere path presence) matters because a remote target can coexist
   // with unrelated local paths on this machine — in that case we must still
@@ -1128,13 +1083,12 @@ async function applyManifestSections(
 
     // Never REJECTS: fold success/failure into a tagged value so the un-awaited
     // promise (when the deadline wins) can't surface as an unhandled rejection.
-    // Thread the call-scoped code base (no global config mutation) so the
-    // git-clone / ref-checkout fallback works for an adopted saved-default/live
-    // workspace when COMFYUI_PATH is unset (#463), and for split installs where
-    // COMFYUI_PATH is a data root rather than the serving checkout.
+    // Thread the call-scoped DATA/base (no global config mutation) so the
+    // git-clone / ref-checkout fallback writes into the tree the runtime scans
+    // (#1715/#1770). Pip uses codeBase independently above.
     const installOutcome = installCustomNode({
       id,
-      ...(codeBase ? { comfyuiPath: codeBase } : {}),
+      ...(dataBase ? { comfyuiPath: dataBase } : {}),
     })
       .then((res) => ({ kind: "settled" as const, res }))
       .catch((err) => ({ kind: "error" as const, err }));

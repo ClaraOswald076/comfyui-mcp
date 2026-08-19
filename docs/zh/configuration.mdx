@@ -47,10 +47,9 @@ CLI 标志完成。ComfyUI 目标的优先级：
   仅本地工具需要它（安装 / 管理节点、删除模型、读日志、列出输出文件）。
 </ParamField>
 <ParamField path="COMFYUI_CODE_PATH" type="string" default="COMFYUI_PATH">
-  用于分离式安装的可选代码 checkout 根目录；此时 `main.py`、`.venv` 和 `custom_nodes`
-  与数据及模型分开存放。comfy-cli 变更、工作流锁的节点包来源以及旧版 Manager 快照
-  使用此路径；核心更新优先采用从已连接本地服务器观测到的 checkout，并以此路径作为
-  后备。远程模式下不会用它修改本地文件系统。
+  用于分离式安装的可选代码 checkout 根目录；此时 `main.py` 和 `.venv` 与数据及模型
+  分开存放。pip / venv / 核心更新使用此路径。节点包读写（`custom_nodes`）仍落在
+  `--base-directory` / `COMFYUI_PATH`。远程模式下不会用它修改本地文件系统。
 </ParamField>
 <ParamField path="COMFYUI_RESTART_COMMAND" type="string">
   用于重启**外部托管** ComfyUI 的 shell 命令 — 例如 `docker restart comfyui` 或

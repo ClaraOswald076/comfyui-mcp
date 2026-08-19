@@ -86,6 +86,9 @@ const liveComfyBaseMock = vi.hoisted(() =>
 const effectiveCodeBaseLiveMock = vi.hoisted(() =>
   vi.fn(async () => undefined as string | undefined),
 );
+const effectiveBaseLiveMock = vi.hoisted(() =>
+  vi.fn(async () => mockConfig.comfyuiPath as string | undefined),
+);
 // Overridable per-test: default mirrors a VERIFIED install-root interpreter (the
 // fail-closed resolver only returns a python it can account for, #651).
 const installInterpreterMock = vi.hoisted(() =>
@@ -213,6 +216,8 @@ vi.mock("../../services/workspace-env.js", () => ({
   resolveLiveComfyUIBase: (...a: unknown[]) => liveComfyBaseMock(...(a as [])),
   resolveEffectiveComfyUICodeBaseLive: (...a: unknown[]) =>
     effectiveCodeBaseLiveMock(...(a as [])),
+  resolveEffectiveComfyUIBaseLive: (...a: unknown[]) =>
+    effectiveBaseLiveMock(...(a as [])),
   // Mirrors the real resolver enough for the pip tests: an install-root python.
   resolveRootInterpreter: (root: string | undefined) =>
     root ? `${root}/python` : "python",
@@ -271,6 +276,12 @@ beforeEach(() => {
   effectiveCodeBaseLiveMock
     .mockReset()
     .mockImplementation(async () => mockConfig.comfyuiCodePath ?? mockConfig.comfyuiPath);
+  effectiveBaseLiveMock
+    .mockReset()
+    .mockImplementation(
+      async () =>
+        mockConfig.comfyuiPath ?? savedWorkspaceMock() ?? (await liveComfyBaseMock()),
+    );
   installInterpreterMock.mockReset().mockImplementation(
     async (root: string | undefined) => ({
       python: root ? `${root}/python` : "python",
@@ -913,12 +924,13 @@ describe("applyManifest", () => {
     );
   });
 
-  it("routes manifest pip and custom-node fallbacks to the serving code root", async () => {
+  it("routes manifest pip to the serving code root and custom-node fallbacks to the data/base root", async () => {
     const dataRoot = "/shared/ComfyUI-data";
     const codeRoot = "/runtime/ComfyUI-code";
     mockConfig.comfyuiPath = dataRoot;
     mockConfig.comfyuiCodePath = codeRoot;
     effectiveCodeBaseLiveMock.mockResolvedValue(codeRoot);
+    effectiveBaseLiveMock.mockResolvedValue(dataRoot);
     listInstalledNodesMock
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([{ module: "split-root-pack", enabled: true }]);
@@ -939,7 +951,7 @@ describe("applyManifest", () => {
     );
     expect(installCustomNodeMock).toHaveBeenCalledWith({
       id: "split-root-pack",
-      comfyuiPath: codeRoot,
+      comfyuiPath: dataRoot,
     });
     expect(installInterpreterMock).not.toHaveBeenCalledWith(dataRoot);
   });

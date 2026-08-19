@@ -22,7 +22,7 @@ import { ModelError, ProcessControlError, ValidationError } from "../utils/error
 import { logger } from "../utils/logger.js";
 
 import { MODEL_SUBDIRS, resolveExistingModelFile } from "./model-resolver.js";
-import { resolveEffectiveComfyUICodeBase } from "./workspace-env.js";
+import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
 import { isUiFormat, looksLikeAssetFilename } from "./workflow-converter.js";
 
 export interface LockedModel {
@@ -93,14 +93,14 @@ const KNOWN_LOADERS: Array<{
 ];
 
 
-async function requireLocalCodeRoot(op: string): Promise<string> {
-  const codeRoot = resolveEffectiveComfyUICodeBase();
-  if (!codeRoot) {
+async function requireLocalPackRoot(op: string): Promise<string> {
+  const packRoot = resolveEffectiveComfyUIBase();
+  if (!packRoot) {
     throw new ProcessControlError(
-      `${op} requires a local ComfyUI code checkout. Lock generation needs to inspect custom_nodes/*/.git/HEAD; set COMFYUI_CODE_PATH for a split install (or COMFYUI_PATH for a conventional install).`,
+      `${op} requires a local ComfyUI install. Lock generation needs to inspect custom_nodes/*/.git/HEAD; set COMFYUI_PATH (or a default workspace). On --base-directory deployments this is the data/base directory the runtime scans, not COMFYUI_CODE_PATH.`,
     );
   }
-  return codeRoot;
+  return packRoot;
 }
 
 /**
@@ -309,7 +309,7 @@ async function packsReferencedByWorkflow(
 }
 
 export async function generateLock(workflow: WorkflowJSON): Promise<WorkflowLock> {
-  const codeRoot = await requireLocalCodeRoot("generateLock");
+  const packRoot = await requireLocalPackRoot("generateLock");
   const stats = (await getSystemStats()) as unknown as { system?: { comfyui_version?: string } };
   const comfyuiVersion = stats.system?.comfyui_version ?? "unknown";
 
@@ -342,7 +342,7 @@ export async function generateLock(workflow: WorkflowJSON): Promise<WorkflowLock
   const packIds = await packsReferencedByWorkflow(workflow, origins);
   const lockedPacks: LockedNodePack[] = [];
   for (const id of packIds) {
-    const packPath = join(codeRoot, "custom_nodes", id);
+    const packPath = join(packRoot, "custom_nodes", id);
     const commit = await readGitHeadCommit(packPath);
     lockedPacks.push(commit ? { id, commit_sha: commit } : { id });
   }

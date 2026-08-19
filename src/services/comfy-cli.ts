@@ -2,14 +2,17 @@ import * as childProcess from "node:child_process";
 import { existsSync } from "node:fs";
 import { delimiter, dirname, extname, join } from "node:path";
 import { config, isRemoteMode } from "../config.js";
-import { resolveEffectiveComfyUICodeBase } from "./workspace-env.js";
+import {
+  resolveEffectiveComfyUIBase,
+  resolveEffectiveComfyUICodeBase,
+} from "./workspace-env.js";
 
 /**
  * The ComfyUI install a comfy-cli invocation TARGETS when the caller passed no explicit
- * `workspace`. That is a CODE-root question: split installs can keep data under
- * COMFYUI_PATH while the checkout/.venv/custom_nodes live under
- * COMFYUI_CODE_PATH. `resolveEffectiveComfyUICodeBase` answers it while retaining
- * the legacy effective-base behavior when no code override is configured.
+ * `workspace`. That is a DATA/base-root question: `--workspace` is where comfy-cli
+ * looks for custom_nodes/ and models/. On `--base-directory` runtimes that is the
+ * data root, not the main.py checkout (#1715/#1770). `resolveEffectiveComfyUIBase`
+ * answers it. The CLI *executable* may still live in the code checkout's .venv.
  *
  * This used to read `config.comfyuiPath ?? resolveEffectiveComfyUIBase()`, which failed
  * twice over (#490): the resolver did not yet enforce the mode check this comment
@@ -27,7 +30,7 @@ import { resolveEffectiveComfyUICodeBase } from "./workspace-env.js";
  * guess. Do not reintroduce a fallback here; a `??` at this seam is the bug.
  */
 function defaultWorkspace(): string | null {
-  return resolveEffectiveComfyUICodeBase() ?? null;
+  return resolveEffectiveComfyUIBase() ?? null;
 }
 
 export interface ComfyCliError {
@@ -143,9 +146,17 @@ function executableNames(): string[] {
   return process.platform === "win32" ? ["comfy.exe", "comfy"] : ["comfy"];
 }
 
-function workspaceCandidates(workspace?: string | null): string[] {
-  if (!workspace) return [];
-  const roots = [workspace, dirname(workspace)];
+function workspaceCandidates(...workspaces: Array<string | null | undefined>): string[] {
+  const roots: string[] = [];
+  const seen = new Set<string>();
+  for (const workspace of workspaces) {
+    if (!workspace) continue;
+    for (const root of [workspace, dirname(workspace)]) {
+      if (seen.has(root)) continue;
+      seen.add(root);
+      roots.push(root);
+    }
+  }
   const dirs = roots.flatMap((root) => [
     join(root, ".venv", process.platform === "win32" ? "Scripts" : "bin"),
     join(root, "venv", process.platform === "win32" ? "Scripts" : "bin"),
@@ -164,7 +175,9 @@ export function resolveComfyCliExecutable(options: { refresh?: boolean; workspac
   }
 
   const workspace = options.workspace ?? defaultWorkspace();
-  for (const candidate of workspaceCandidates(workspace)) {
+  // --workspace is the pack/data root; the executable often lives in the
+  // checkout's .venv on a split install. Search both.
+  for (const candidate of workspaceCandidates(workspace, resolveEffectiveComfyUICodeBase())) {
     if (existsSync(candidate)) {
       return candidate;
     }
@@ -415,8 +428,8 @@ function requireExecutable(options: ComfyCliRunOptions): string {
   if (!executable) {
     throw new Error(
       "comfy-cli was not found. Install comfy-cli>=1.11.1 and ensure `comfy` is on PATH, " +
-        "set COMFY_CLI_PATH, or install it in the selected ComfyUI code workspace's .venv " +
-        "(COMFYUI_CODE_PATH for split installs).",
+        "set COMFY_CLI_PATH, or install it in the selected ComfyUI workspace's .venv " +
+        "(the COMFYUI_CODE_PATH checkout on split installs).",
     );
   }
   return executable;
