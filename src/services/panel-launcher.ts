@@ -51,7 +51,10 @@ export type LauncherPaths = {
   linuxAutostart: string;
 };
 
-export function panelLauncherPaths(home: string = homedir()): LauncherPaths {
+export function panelLauncherPaths(
+  home: string = homedir(),
+  appData: string = roamingAppData({}),
+): LauncherPaths {
   const root = join(home, ".comfyui-mcp");
   const launcherDir = join(root, "launcher");
   return {
@@ -61,9 +64,7 @@ export function panelLauncherPaths(home: string = homedir()): LauncherPaths {
     broker: join(launcherDir, "broker.mjs"),
     windowsScript: join(launcherDir, "start-launcher.cmd"),
     windowsStartup: join(
-      home,
-      "AppData",
-      "Roaming",
+      appData,
       "Microsoft",
       "Windows",
       "Start Menu",
@@ -145,16 +146,41 @@ export type InstallLauncherOptions = {
   /** Injected for the tests, so a fallback case can assert the broker was
    *  started without actually starting one. */
   spawnImpl?: typeof spawn;
+  /**
+   * Roaming AppData root. Defaults to `%APPDATA%` in production and to a path
+   * under `home` whenever the caller overrode `home` (tests, and any call that
+   * is deliberately not talking about the real profile).
+   *
+   * NOT derived from `home` unconditionally: Group Policy "Redirect the Roaming
+   * AppData folder" points `%APPDATA%` at a share while `USERPROFILE` stays
+   * local, so `<home>/AppData/Roaming` is then a directory Explorer never scans.
+   * `mkdirSync(…, {recursive:true})` would happily manufacture it and the
+   * install would report success for an autostart that can never fire — on
+   * precisely the managed domain accounts whose policy denies `schtasks` in the
+   * first place, i.e. the whole population this fallback exists for.
+   */
+  appData?: string;
 };
 
-export function installPanelLauncher(options: InstallLauncherOptions = {}): LauncherPaths {
+/** Roaming AppData for a call: explicit wins, then an overridden home, then the
+ *  real `%APPDATA%`, then the conventional layout. */
+function roamingAppData(opts: { home?: string; appData?: string }): string {
+  if (opts.appData) return opts.appData;
+  if (opts.home) return join(opts.home, "AppData", "Roaming");
+  const env = process.env.APPDATA?.trim();
+  return env || join(homedir(), "AppData", "Roaming");
+}
+
+export async function installPanelLauncher(
+  options: InstallLauncherOptions = {},
+): Promise<LauncherPaths> {
   const home = options.home ?? homedir();
   const platform = options.platform ?? process.platform;
   const nodePath = options.nodePath ?? process.execPath;
   const source = options.brokerSource ?? fileURLToPath(import.meta.url);
   const run = options.exec ?? execFileSync;
   const spawnBroker = options.spawnImpl ?? spawn;
-  const paths = panelLauncherPaths(home);
+  const paths = panelLauncherPaths(home, roamingAppData(options));
   mkdirSync(paths.launcherDir, { recursive: true });
   copyFileSync(source, paths.broker);
 
@@ -168,14 +194,18 @@ export function installPanelLauncher(options: InstallLauncherOptions = {}): Laun
    * nothing to talk to until the next logon. Shared by the Windows and Linux
    * fallbacks rather than duplicated — they answer the identical question.
    */
-  const startBrokerIfIdle = (): void => {
-    if (previous?.pid) {
-      try {
-        process.kill(previous.pid, 0);
-        return; // still running — a second broker would fight it for the port
-      } catch {
-        // Dead pid: fall through and start a replacement.
-      }
+  const startBrokerIfIdle = async (): Promise<void> => {
+    // POSITIVE EVIDENCE, not a pid. `process.kill(pid, 0)` only proves SOME
+    // process holds that number, and Windows recycles pids aggressively across a
+    // reboot — so an unrelated process wearing our old pid made this skip the
+    // spawn, leaving a dead port in the config and the panel telling the user to
+    // re-run the install they had just run: the #1798 loop, re-entered through
+    // its own fix. `queryPanelLauncher` asks the recorded port, with the recorded
+    // token, whether a broker is actually answering. Anything short of a live
+    // answer means start one (merge-gate P1).
+    if (previous?.pid && previous.port) {
+      const live = (await queryPanelLauncher(home)) as { running?: boolean };
+      if (live.running) return; // a real broker answered — leave it alone
     }
     const child = spawnBroker(nodePath, [paths.broker, "run"], {
       detached: true,
@@ -213,6 +243,16 @@ export function installPanelLauncher(options: InstallLauncherOptions = {}): Laun
     // and start the broker directly. The Startup folder is user-writable and
     // needs no elevation, which is exactly the constraint the scheduled task
     // could not satisfy.
+    // /Create and /Run get SEPARATE try blocks, because they fail for different
+    // reasons and only one of them means "this account cannot register an
+    // autostart". A created task whose /Run is refused right now — an /IT task
+    // invoked over a non-interactive session (OpenSSH, WinRM, a CI service),
+    // SCHED_E_TASK_NOT_READY — is REGISTERED and will fire at the next logon.
+    // Treating that as a refusal wrote a Startup entry beside the live task, so
+    // every later logon started two brokers, both rewriting launcher.json
+    // (merge-gate P1). It also printed "scheduled task refused" about a task
+    // that plainly exists.
+    let taskRegistered = false;
     try {
       run(
         "schtasks.exe",
@@ -235,7 +275,7 @@ export function installPanelLauncher(options: InstallLauncherOptions = {}): Laun
         // bad argument, or a denial, which is the one that actually happens.
         { stdio: ["ignore", "ignore", "pipe"] },
       );
-      run("schtasks.exe", ["/Run", "/TN", PANEL_LAUNCHER_TASK], { stdio: "ignore" });
+      taskRegistered = true;
     } catch (err) {
       mkdirSync(dirname(paths.windowsStartup), { recursive: true });
       writeFileSync(
@@ -243,7 +283,6 @@ export function installPanelLauncher(options: InstallLauncherOptions = {}): Laun
         `@echo off\r\nstart "" /min "${paths.windowsScript}"\r\n`,
         "utf8",
       );
-      startBrokerIfIdle();
       // Not silent: the user asked for a launcher and got a different mechanism
       // than the one this tool normally installs, which changes how they would
       // later remove or debug it.
@@ -252,6 +291,17 @@ export function installPanelLauncher(options: InstallLauncherOptions = {}): Laun
           `registered a Startup-folder autostart instead: ${paths.windowsStartup}\n`,
       );
     }
+    if (taskRegistered) {
+      try {
+        run("schtasks.exe", ["/Run", "/TN", PANEL_LAUNCHER_TASK], { stdio: "ignore" });
+        return paths; // the task is registered AND running it worked
+      } catch {
+        // Registered but not startable right now (non-interactive session). The
+        // autostart is in place for the next logon, so do NOT add a second one —
+        // just get a broker up for THIS session.
+      }
+    }
+    await startBrokerIfIdle();
     return paths;
   }
 
@@ -300,18 +350,23 @@ export function installPanelLauncher(options: InstallLauncherOptions = {}): Laun
         `Exec="${nodePath}" "${paths.broker}" run\nTerminal=false\nX-GNOME-Autostart-enabled=true\n`,
       "utf8",
     );
-    startBrokerIfIdle();
+    await startBrokerIfIdle();
   }
   return paths;
 }
 
-export type UninstallLauncherOptions = Pick<InstallLauncherOptions, "home" | "platform" | "exec">;
+export type UninstallLauncherOptions = Pick<
+  InstallLauncherOptions,
+  "home" | "platform" | "exec" | "appData"
+>;
 
 export function uninstallPanelLauncher(options: UninstallLauncherOptions = {}): void {
   const home = options.home ?? homedir();
   const platform = options.platform ?? process.platform;
   const run = options.exec ?? execFileSync;
-  const paths = panelLauncherPaths(home);
+  // Same resolution as install, or uninstall deletes a path the install never
+  // wrote and leaves the real autostart in place.
+  const paths = panelLauncherPaths(home, roamingAppData(options));
   if (platform === "win32") {
     try {
       run("schtasks.exe", ["/End", "/TN", PANEL_LAUNCHER_TASK], { stdio: "ignore" });

@@ -1,6 +1,7 @@
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   installPanelLauncher,
@@ -28,10 +29,10 @@ function fixture(): { home: string; source: string } {
 }
 
 describe("panel launcher install", () => {
-  it("installs a stable broker, private token config, and per-user Windows task", () => {
+  it("installs a stable broker, private token config, and per-user Windows task", async () => {
     const { home, source } = fixture();
     const calls: Array<{ file: string; args: readonly string[] }> = [];
-    const paths = installPanelLauncher({
+    const paths = await installPanelLauncher({
       home,
       platform: "win32",
       nodePath: "C:\\Node\\node.exe",
@@ -50,16 +51,16 @@ describe("panel launcher install", () => {
     expect(calls.map((call) => call.args[0])).toEqual(["/Create", "/Run"]);
   });
 
-  it("preserves the authentication token across reinstalls", () => {
+  it("preserves the authentication token across reinstalls", async () => {
     const { home, source } = fixture();
     const exec = (() => undefined) as never;
-    installPanelLauncher({ home, platform: "win32", brokerSource: source, exec });
+    await installPanelLauncher({ home, platform: "win32", brokerSource: source, exec });
     const first = readPanelLauncherConfig(home)?.token;
-    installPanelLauncher({ home, platform: "win32", brokerSource: source, exec });
+    await installPanelLauncher({ home, platform: "win32", brokerSource: source, exec });
     expect(readPanelLauncherConfig(home)?.token).toBe(first);
   });
 
-  it("falls back to a Startup autostart when the scheduled task is DENIED", () => {
+  it("falls back to a Startup autostart when the scheduled task is DENIED", async () => {
     // The failure this covers is not hypothetical: on a machine whose policy or
     // task-store ACL refuses task creation to the user, `schtasks /Create` fails
     // with "ERROR: Access is denied." for ANY task name — a throwaway probe is
@@ -77,7 +78,7 @@ describe("panel launcher install", () => {
     }) as typeof process.stderr.write;
     let paths;
     try {
-      paths = installPanelLauncher({
+      paths = await installPanelLauncher({
       home,
       platform: "win32",
       nodePath: "C:\\Node\\node.exe",
@@ -119,20 +120,73 @@ describe("panel launcher install", () => {
     expect(readPanelLauncherConfig(home)?.token.length).toBeGreaterThanOrEqual(32);
   });
 
-  it("does not start a second broker when the previous one is alive", () => {
+  it("does not start a second broker when one ANSWERS on the recorded port", async () => {
     const { home, source } = fixture();
     const spawned: Array<readonly string[]> = [];
-    installPanelLauncher({ home, platform: "win32", brokerSource: source, exec: (() => undefined) as never });
-    // Claim a live broker by writing OUR pid into the config — process.kill(pid, 0)
-    // succeeds for it, so the fallback must leave it alone rather than start a
-    // rival that fights it for the port.
+    await installPanelLauncher({
+      home,
+      platform: "win32",
+      brokerSource: source,
+      exec: (() => undefined) as never,
+    });
+    const cfg = JSON.parse(readFileSync(panelLauncherPaths(home).config, "utf8"));
+
+    // A broker that actually answers — the only evidence that justifies skipping
+    // the spawn. Started on a real port with the config's own token.
+    const server = createServer((req, res) => {
+      const ok = req.headers.authorization === `Bearer ${cfg.token}`;
+      res.writeHead(ok ? 200 : 401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok, protocol: 1, orchestrator_running: false }));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const port = (server.address() as { port: number }).port;
+    writeFileSync(
+      panelLauncherPaths(home).config,
+      JSON.stringify({ ...cfg, port, pid: process.pid }),
+      "utf8",
+    );
+
+    try {
+      await installPanelLauncher({
+        home,
+        platform: "win32",
+        brokerSource: source,
+        exec: (() => {
+          throw new Error("denied");
+        }) as never,
+        spawnImpl: ((_file: string, args: readonly string[]) => {
+          spawned.push(args);
+          return { unref() {} };
+        }) as never,
+      });
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+    expect(spawned).toEqual([]);
+  });
+
+  it("DOES start one when the pid is alive but nothing answers (recycled pid)", async () => {
+    const { home, source } = fixture();
+    const spawned: Array<readonly string[]> = [];
+    await installPanelLauncher({
+      home,
+      platform: "win32",
+      brokerSource: source,
+      exec: (() => undefined) as never,
+    });
+    // Windows recycles pids aggressively across a reboot, so an unrelated
+    // process can be wearing the pid we recorded. Trusting `process.kill(pid, 0)`
+    // meant spawning NOTHING while the config still advertised a dead port — the
+    // panel then reports the launcher as not running and sends the user back to
+    // the install they just ran: #1798's loop, re-entered through its own fix.
     const cfg = JSON.parse(readFileSync(panelLauncherPaths(home).config, "utf8"));
     writeFileSync(
       panelLauncherPaths(home).config,
-      JSON.stringify({ ...cfg, pid: process.pid }),
+      // OUR pid (certainly alive) + a port with no listener.
+      JSON.stringify({ ...cfg, pid: process.pid, port: 9 }),
       "utf8",
     );
-    installPanelLauncher({
+    await installPanelLauncher({
       home,
       platform: "win32",
       brokerSource: source,
@@ -144,12 +198,70 @@ describe("panel launcher install", () => {
         return { unref() {} };
       }) as never,
     });
-    expect(spawned).toEqual([]);
+    expect(spawned).toEqual([[panelLauncherPaths(home).broker, "run"]]);
   });
 
-  it("uninstall removes the Startup fallback, not just the task", () => {
+  it("puts the Startup entry under %APPDATA%, not a manufactured profile path", async () => {
+    // Group Policy "Redirect the Roaming AppData folder" points %APPDATA% at a
+    // share while USERPROFILE stays local — the same managed-domain population
+    // whose policy denies schtasks. Deriving the path from home would create a
+    // folder Explorer never scans and still report success.
     const { home, source } = fixture();
-    const paths = installPanelLauncher({
+    const redirected = join(home, "redirected-appdata");
+    const paths = await installPanelLauncher({
+      home,
+      appData: redirected,
+      platform: "win32",
+      brokerSource: source,
+      exec: (() => {
+        throw new Error("denied");
+      }) as never,
+      spawnImpl: (() => ({ unref() {} })) as never,
+    });
+    expect(paths.windowsStartup.startsWith(redirected)).toBe(true);
+    expect(existsSync(paths.windowsStartup)).toBe(true);
+    // …and uninstall resolves the SAME root, or it deletes a path the install
+    // never wrote and leaves the real autostart running.
+    uninstallPanelLauncher({
+      home,
+      appData: redirected,
+      platform: "win32",
+      exec: (() => undefined) as never,
+    });
+    expect(existsSync(paths.windowsStartup)).toBe(false);
+  });
+
+  it("a task that registers but cannot RUN right now gets no second autostart", async () => {
+    // /Create and /Run fail for different reasons. An /IT task invoked over a
+    // non-interactive session (OpenSSH, WinRM, a CI service) is created fine and
+    // refuses to run right now — SCHED_E_TASK_NOT_READY. Treating that as "the
+    // account cannot register an autostart" wrote a Startup entry beside the live
+    // task, so every later logon started TWO brokers, both rewriting
+    // launcher.json.
+    const { home, source } = fixture();
+    const spawned: Array<readonly string[]> = [];
+    const paths = await installPanelLauncher({
+      home,
+      platform: "win32",
+      brokerSource: source,
+      exec: ((_file: string, args: readonly string[]) => {
+        if (args[0] === "/Run") throw new Error("The task cannot be run…");
+        return undefined;
+      }) as never,
+      spawnImpl: ((_file: string, args: readonly string[]) => {
+        spawned.push(args);
+        return { unref() {} };
+      }) as never,
+    });
+    // The task IS registered — no duplicate autostart.
+    expect(existsSync(paths.windowsStartup)).toBe(false);
+    // …but this session still needs a broker, since /Run did not give it one.
+    expect(spawned).toEqual([[paths.broker, "run"]]);
+  });
+
+  it("uninstall removes the Startup fallback, not just the task", async () => {
+    const { home, source } = fixture();
+    const paths = await installPanelLauncher({
       home,
       platform: "win32",
       brokerSource: source,
@@ -165,9 +277,9 @@ describe("panel launcher install", () => {
     expect(existsSync(paths.windowsStartup)).toBe(false);
   });
 
-  it("writes a Linux user service and falls back to XDG autostart", () => {
+  it("writes a Linux user service and falls back to XDG autostart", async () => {
     const { home, source } = fixture();
-    const paths = installPanelLauncher({
+    const paths = await installPanelLauncher({
       home,
       platform: "linux",
       nodePath: process.execPath,
@@ -184,7 +296,7 @@ describe("panel launcher install", () => {
 describe("panel launcher broker", () => {
   it("binds loopback and rejects requests without the private bearer token", async () => {
     const { home, source } = fixture();
-    installPanelLauncher({
+    await installPanelLauncher({
       home,
       platform: "win32",
       brokerSource: source,
@@ -210,7 +322,7 @@ describe("panel launcher broker", () => {
 });
 
 describe("native terminal command", () => {
-  it("is fixed and always resolves the latest MCP package", () => {
+  it("is fixed and always resolves the latest MCP package", async () => {
     expect(terminalCommandForPlatform("win32", { ComSpec: "cmd.exe" })).toEqual({
       executable: "cmd.exe",
       args: ["/d", "/k", "npx.cmd -y comfyui-mcp@latest connect"],
@@ -226,7 +338,7 @@ describe("native terminal command", () => {
     });
   });
 
-  it("fails clearly when Linux has no supported graphical terminal", () => {
+  it("fails clearly when Linux has no supported graphical terminal", async () => {
     expect(() => terminalCommandForPlatform("linux", { PATH: "/empty" }, () => false)).toThrow(
       "No supported graphical terminal",
     );
@@ -234,7 +346,7 @@ describe("native terminal command", () => {
 });
 
 describe("launcher paths", () => {
-  it("keeps every mutable launcher artifact under the selected user home", () => {
+  it("keeps every mutable launcher artifact under the selected user home", async () => {
     const { home } = fixture();
     const paths = panelLauncherPaths(home);
     expect(paths.config.startsWith(home)).toBe(true);
