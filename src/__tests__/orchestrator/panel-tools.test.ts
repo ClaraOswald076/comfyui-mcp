@@ -22,6 +22,7 @@ import {
   buildPanelToolDefs,
   makePanelToolCtx,
   registerPanelTools,
+  setApplyMcpReload,
   __openWorkflowTestHooks,
   __panelToolsTestHooks,
   __panelRunTestHooks,
@@ -1806,6 +1807,41 @@ describe("panel-tools: post-reconnect retry-once (#278/#310/#332/#481)", () => {
     expect(res.isError).toBeUndefined();
     const text = (res.content[0] as { text: string }).text;
     expect(text).not.toMatch(/does NOT reload/i);
+  });
+
+  it("panel_reload (orchestrator scope) schedules the in-process MCP respawn (#1700)", async () => {
+    // The frontend soft_reload only drops the websocket; without this hook the
+    // live agent keeps the MCP set it was spawned with. Drive the REAL tool.
+    const keys: string[] = [];
+    setApplyMcpReload((key) => {
+      keys.push(key);
+    });
+    try {
+      const store = new WorkflowTargetStore();
+      const { bridge } = methodIsHeadlessBridge(["only-live-tab"]);
+      const ctx = makePanelToolCtx(bridge, "orphaned-tab", store);
+      const res = await defByName("panel_reload").handler({}, ctx);
+      expect(res.isError).toBeUndefined();
+      expect(keys).toEqual([ctx.tabId]);
+    } finally {
+      setApplyMcpReload(undefined);
+    }
+  });
+
+  it("panel_reload (frontend scope) does NOT schedule an MCP respawn (#1700)", async () => {
+    const keys: string[] = [];
+    setApplyMcpReload((key) => {
+      keys.push(key);
+    });
+    try {
+      const store = new WorkflowTargetStore();
+      const { bridge } = methodIsHeadlessBridge(["only-live-tab"]);
+      const ctx = makePanelToolCtx(bridge, "orphaned-tab", store);
+      await defByName("panel_reload").handler({ scope: "frontend" }, ctx);
+      expect(keys).toEqual([]);
+    } finally {
+      setApplyMcpReload(undefined);
+    }
   });
 
   it("panel_set_workflow_target recovery filters isHeadless bound, not detached (#478 sibling site)", async () => {

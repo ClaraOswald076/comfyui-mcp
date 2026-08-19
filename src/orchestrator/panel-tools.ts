@@ -186,6 +186,15 @@ import { sliceWorkflow } from "../services/workflow-slicer.js";
 import { validateA2UISpecServer } from "../services/a2ui-spec.js";
 import type { UiWorkflow } from "../comfyui/types.js";
 
+/** #1700 — orchestrator wires this so panel_reload can fork-respawn the agent
+ *  with a freshly-read MCP set. Unset in tests that only exercise the tool. */
+let applyMcpReload: ((agentKey: string) => void) | undefined;
+
+/** Bind (or clear) the in-process MCP-config respawn used by panel_reload. */
+export function setApplyMcpReload(fn: ((agentKey: string) => void) | undefined): void {
+  applyMcpReload = fn;
+}
+
 /** Treat these as an affirmative answer to a yes/no confirm card (destructive-op
  *  gate). Deliberately BROAD/lenient — a false "no" only SKIPS a destructive op, so
  *  erring toward "not yes" is safe. NEVER use this for the adult-consent gate: a
@@ -11724,6 +11733,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           }
         }
         const scope = (args.scope as string) ?? "orchestrator";
+        // #1700 — the frontend soft_reload only drops the websocket (this pack's
+        // /reload is a 503). The live agent keeps the MCP set it was spawned
+        // with, and a plain resume restores the session-recorded set anyway.
+        // Schedule a forked in-process respawn so makeMcpServers() re-reads
+        // ~/.claude.json and the replacement session is NOT the old MCP set.
+        if (scope === "orchestrator") applyMcpReload?.(ctx.tabId);
         const res = await ctx.call({ cmd: "soft_reload", scope }, 15000);
         // #765 — the agent reads this result as its last context before the
         // reload, and again after the resume, so it is the place to state what

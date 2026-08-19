@@ -630,9 +630,17 @@ export class ClaudeBackend implements AgentBackend {
     // Rewind: fork the conversation at the anchor (resume up to that message, then
     // branch into a new session id) so everything after it is dropped. A null
     // anchor means "fresh session" (handled by clearing resume below).
+    //
+    // #1700 — a plain `resume` restores the MCP server set recorded WITH that
+    // session, so a panel_remove_mcp that re-read ~/.claude.json still launched
+    // the deleted server (and kept reporting it as failed). `forkSession`
+    // without an anchor keeps history but applies THIS run's mcpServers.
+    const resumeTarget = opts.sessionId ?? resume;
     const rewindOpts = rewindAnchor
-      ? { resume: opts.sessionId ?? resume, resumeSessionAt: rewindAnchor, forkSession: true }
-      : null;
+      ? { resume: resumeTarget, resumeSessionAt: rewindAnchor, forkSession: true }
+      : opts.forkSession && resumeTarget
+        ? { resume: resumeTarget, forkSession: true }
+        : null;
     return {
       model,
       permissionMode: "bypassPermissions",

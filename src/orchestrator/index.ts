@@ -127,6 +127,7 @@ import {
   makePanelToolCtx,
   resolvePinTarget,
   secretSavedReply,
+  setApplyMcpReload,
   RETRY_TOKEN_CMDS,
 } from "./panel-tools.js";
 import {
@@ -2640,6 +2641,13 @@ export async function runPanelOrchestrator(): Promise<void> {
   // Let refreshEnvCapabilities() feed a freshly-gathered env block into agents
   // spawned after a ComfyUI restart/reconnect.
   liveManager = manager;
+  // #1700 — panel_reload({scope:"orchestrator"}) must fork-respawn so a
+  // panel_remove_mcp / panel_add_mcp is not lost to the resumed session's
+  // recorded MCP set. The tool itself lives in the panel MCP and cannot
+  // reach the manager except through this hook.
+  setApplyMcpReload((key) => {
+    manager.restartForMcpConfig(key);
+  });
 
   // #468 — let the journal pull a still-unread completion back off an agent's
   // queue when it has to WEAKEN that completion's correlation (a reused prompt
@@ -6380,6 +6388,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     }
     unsubscribeSecrets();
     unsubscribeAgentSecrets();
+    setApplyMcpReload(undefined);
     await manager.stopAll();
     // Dispose the readiness-probe backends (kills each Codex/Gemini CLI child).
     for (const pb of probeBackends.values()) {
