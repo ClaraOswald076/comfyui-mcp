@@ -59,9 +59,10 @@ describe("the minimax-h3-video skill is the #1155 official-guide pilot (#1167)",
     expect(SKILL).not.toMatch(/integrated_multimodal_description/);
   });
 
-  it("does not teach run_template as the Comfy-Org template load path (#1801 review)", () => {
-    // Core templates are invisible to list_templates / run_template and are not
-    // a panel_load_workflow pack/path/graph. The old sentence claimed they were.
+  it('does not teach enqueue_workflow (action:"run_template") as the Comfy-Org template load path (#1801 review)', () => {
+    // Core templates are invisible to list_templates /
+    // enqueue_workflow (action:"run_template") and are not a
+    // panel_load_workflow pack/path/graph. The old sentence claimed they were.
     expect(SKILL).not.toMatch(
       /Load with `panel_load_workflow` or `enqueue_workflow` `action:"run_template"`/,
     );
@@ -71,7 +72,7 @@ describe("the minimax-h3-video skill is the #1155 official-guide pilot (#1167)",
     );
     expect(SKILL).toMatch(/list_templates/);
     expect(SKILL).toMatch(/will \*\*not\*\* list them/);
-    const mentions = [...SKILL.matchAll(/run_template/g)];
+    const mentions = [...SKILL.matchAll(/action:"run_template"/g)];
     expect(mentions.length).toBeGreaterThan(0);
     for (const m of mentions) {
       const at = m.index ?? 0;
