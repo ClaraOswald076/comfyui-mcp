@@ -759,6 +759,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### MCP
+
+#### Fixed
+- `validate_workflow` reports serialized action-button skips and preserves declared COMBO values that use button spellings (#1869)
+- origin-less download completion turns inherit the routed tab after a workflow switch (#1292)
+- a stale-schema node add takes its own retry after a lost refresh acknowledgement (#1518)
+
 ## [0.52.30] - 2026-08-20
 
 ### MCP
