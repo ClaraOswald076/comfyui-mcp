@@ -759,11 +759,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.35] - 2026-08-20
+
 ### MCP
 
 #### Fixed
 - **`panel_graph_outline` after `panel_restart_comfyui` waits out a 26–28s Desktop recover (panel#654).**
   The post-restart tab wait defaulted to 20s (`COMFYUI_PANEL_RECONNECT_WAIT_S`). ComfyUI Desktop recoveries of 26–28s after the server was already healthy expired that budget, so `panel_graph_outline` reported still reconnecting / `Connected: none` and only a hard browser refresh restored the tab. The default is now 35s (still capped at 60s).
+- **`panel_get_workflow_target` discloses when a live turn pin routes graph commands elsewhere (#1924).** The read and set tools now share the same machine-readable routing verdict so an agent is not told that `mode:"current"` governs graph commands when the live turn pin still holds another tab.
+- **`panel_create_group` preserves requested preview-node membership after SaveImage rehydration (#1925).** Auto-bounds now account for the stable full-height center of requested DOM-preview nodes before persisting the group, while preserving collapsed-node and failed-repair behavior.
 
 ## [0.52.34] - 2026-08-20
 
