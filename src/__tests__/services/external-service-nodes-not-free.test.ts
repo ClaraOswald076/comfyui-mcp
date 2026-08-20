@@ -62,6 +62,16 @@ const IMPACT = def({
   input: { required: { image1: ["IMAGE", {}] } },
 });
 
+/** #1855 — PoYo's official pack. Note what is NOT here: no api_key input (the pack keeps
+ *  the credential out of the workflow) and api_node is absent/false. Every generic signal
+ *  this module has says "free"; only the named entry knows better. */
+const POYO_GENERATE = def({
+  name: "PoYo_GenerateImage",
+  category: "PoYo AI/Generate",
+  python_module: "custom_nodes.poyo-comfyui",
+  input: { required: { prompt: ["STRING", {}] } },
+});
+
 const CORE_SAMPLER = def({ name: "KSampler", category: "sampling", python_module: "nodes" });
 const CORE_PREVIEW = def({ name: "PreviewImage", category: "image", python_module: "nodes" });
 const CORE_LOAD = def({ name: "LoadImage", category: "image", python_module: "nodes" });
@@ -209,5 +219,71 @@ describe("a paid external-service node is never reported as local/free (#1483)",
     expect(isExternalServiceNode(hasher)).toBe(false);
     const out = await runtimeOf(["HMACSign", "KSampler"], { HMACSign: hasher, KSampler: CORE_SAMPLER });
     expect(out.runtime).toBe("local");
+  });
+
+  it("#1855 THE REPORTED GRAPH: PoYo_GenerateImage is no longer local/free", async () => {
+    // The exact verdict from the report: {"runtime":"local","usesApiNodes":false}.
+    const out = await runtimeOf(["PoYo_GenerateImage"], { PoYo_GenerateImage: POYO_GENERATE });
+
+    expect(out.runtime).toBe("api");
+    expect(out.usesApiNodes).toBe(true);
+    expect(out.externalApiNodes).toEqual(["PoYo_GenerateImage"]);
+    // NAMED, so a reader knows whose balance to check.
+    expect(out.externalProviders).toEqual(["PoYo"]);
+    // Not a Comfy partner node, and must not be described as one.
+    expect(out.apiNodes).toEqual([]);
+    // It IS installed — being known is what made it confidently misclassified.
+    expect(out.unknownNodes).toEqual([]);
+  });
+
+  it("#1855: the category prefix matches even when the pack directory is renamed", async () => {
+    // A user who clones the pack elsewhere changes python_module and nothing else; the
+    // category is baked into the pack's own source. Same reasoning as the fal entries.
+    const renamed = def({
+      name: "PoYo_GenerateImage",
+      category: "PoYo AI/Generate",
+      python_module: "custom_nodes.my-poyo-fork",
+      input: { required: { prompt: ["STRING", {}] } },
+    });
+    const out = await runtimeOf(["PoYo_GenerateImage"], { PoYo_GenerateImage: renamed });
+    expect(out.externalProviders).toEqual(["PoYo"]);
+  });
+
+  it("#1855: a REGISTRY install is caught too, where the module string alone would miss", async () => {
+    // The Comfy Registry id is `poyo-nodes` (pyproject name), not the GitHub repo name
+    // `poyo-comfyui`, so a registry install reports python_module
+    // "custom_nodes.poyo-nodes" — which does not contain the module substring at all.
+    // The category prefix is the only thing that catches that path.
+    const registryInstalled = def({
+      name: "PoYo_GenerateImage",
+      category: "PoYo AI/Generate",
+      python_module: "custom_nodes.poyo-nodes",
+      input: { required: { prompt: ["STRING", {}] } },
+    });
+    const out = await runtimeOf(["PoYo_GenerateImage"], {
+      PoYo_GenerateImage: registryInstalled,
+    });
+    expect(out.usesApiNodes).toBe(true);
+    expect(out.externalProviders).toEqual(["PoYo"]);
+  });
+
+  it("#1855: a merely SIMILAR category is not swept in", async () => {
+    // "poyo ai" must not match a different pack that happens to start with the same
+    // letters — the prefix rule is exact-or-followed-by-slash, and this asserts it.
+    // "PoYoAlpha/Mask" would NOT have tested this: it diverges from "poyo ai" at the
+    // space, so even a naive startsWith(prefix) passes it. "PoYo AI Extras/Mask" shares
+    // the whole prefix and differs only after it, which is the boundary the rule is.
+    const other = def({
+      name: "PoyoExtrasMasker",
+      category: "PoYo AI Extras/Mask",
+      python_module: "custom_nodes.poyo-ai-extras",
+      input: { required: { image: ["IMAGE", {}] } },
+    });
+    const out = await runtimeOf(["PoyoExtrasMasker"], { PoyoExtrasMasker: other });
+    expect(out.runtime).toBe("local");
+    expect(out.usesApiNodes).toBe(false);
+    // The field is OMITTED when there is nothing to name, not emitted empty — asserting
+    // [] here passed nothing and only proved I had guessed the shape.
+    expect(out.externalProviders).toBeUndefined();
   });
 });
