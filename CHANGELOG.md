@@ -759,6 +759,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.23] - 2026-08-19
+
+### MCP
+
+#### Fixed
+- panel_open_workflow succeeds after placeholder definition rehydration (#1849)
+
+
 ## [0.52.22] - 2026-08-19
 
 ### MCP
