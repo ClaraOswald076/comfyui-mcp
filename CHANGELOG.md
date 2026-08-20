@@ -759,6 +759,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.28] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- panel_update_node reports the Manager update-git error, not a stale generation traceback (#1879)
+- panel_free_vram no longer reports VRAM freed when a device stays pinned (#1878)
+
+
 ## [0.52.27] - 2026-08-20
 
 ### MCP
