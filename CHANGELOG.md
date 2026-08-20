@@ -759,12 +759,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.31] - 2026-08-20
+
 ### MCP
 
 #### Fixed
-- `validate_workflow` reports serialized action-button skips and preserves declared COMBO values that use button spellings (#1869)
-- origin-less download completion turns inherit the routed tab after a workflow switch (#1292)
-- a stale-schema node add takes its own retry after a lost refresh acknowledgement (#1518)
+- report every skipped action-button token, and stop double-reporting unknown nodes (#1908)
+- an origin-less download turn after a workflow switch inherits the routed tab, not the retired id (#1906)
+- validate_workflow no longer flags action-button tokens as widget values (#1880)
+- an add refused for a stale schema takes its own retry after a lost refresh ack (#1902)
+
+#### Changed
+- restart tests no longer depend on a live ComfyUI port (#1907)
+
 
 ## [0.52.30] - 2026-08-20
 
