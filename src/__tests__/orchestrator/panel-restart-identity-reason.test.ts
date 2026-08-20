@@ -25,9 +25,12 @@ vi.mock("../../comfyui/client.js", () => ({
   resetObjectInfoCache: () => resetObjectInfoCache(),
 }));
 
-const { buildPanelToolDefs, restartIdentityBlockerNote, __panelToolsTestHooks } = await import(
-  "../../orchestrator/panel-tools.js"
-);
+const {
+  buildPanelToolDefs,
+  restartIdentityBlockerNote,
+  classifyOriginBlocker,
+  __panelToolsTestHooks,
+} = await import("../../orchestrator/panel-tools.js");
 import { getBootLocalComfyUIBaseUrl } from "../../config.js";
 import { __processControlTestHooks } from "../../services/process-control.js";
 import type { PanelToolCtx, ToolResult } from "../../orchestrator/panel-tools.js";
@@ -43,16 +46,28 @@ function makeCtx(opts: {
   isLocal?: boolean;
   /** The SERVER-OBSERVED handshake Origin (undefined = the handshake carried none). */
   serverOrigin?: string;
-}): { ctx: PanelToolCtx; sends: Array<Record<string, unknown>> } {
+  /** The origin the tab reports AFTER the confirmation card is answered — a binding
+   *  lost during the confirm wait. This is the ONLY way to reach the SECOND refusal
+   *  site: the first gate runs before the card and would refuse there otherwise. */
+  originAfterConfirm?: string;
+}): {
+  ctx: PanelToolCtx;
+  sends: Array<Record<string, unknown>>;
+  /** How many times the confirmation card was put to the user. Non-zero proves the
+   *  FIRST identity gate (which runs before the card) let the call through. */
+  confirms: { count: number };
+} {
   const sends: Array<Record<string, unknown>> = [];
+  const confirms = { count: 0 };
+  const origin = { current: opts.serverOrigin };
   const bridge = {
     send: async (cmd: Record<string, unknown>) => {
       sends.push(cmd);
       if (cmd.cmd === "comfy_reboot") return { rebooting: true };
       return {};
     },
-    tabOrigin: () => opts.serverOrigin,
-    tabServerOrigin: () => opts.serverOrigin,
+    tabOrigin: () => origin.current,
+    tabServerOrigin: () => origin.current,
     tabIsLocal: () => opts.isLocal !== false,
     canReach: () => true,
   } as unknown as PanelToolCtx["bridge"];
@@ -60,7 +75,11 @@ function makeCtx(opts: {
     call: async () => {
       throw new Error("ctx.call must not be used by the restart handler");
     },
-    confirm: async () => "yes",
+    confirm: async () => {
+      confirms.count++;
+      if (opts.originAfterConfirm !== undefined) origin.current = opts.originAfterConfirm;
+      return "yes";
+    },
     ensureReachable: () => {},
     bridge,
     tabId: "bound-tab",
@@ -68,7 +87,7 @@ function makeCtx(opts: {
     awaitPostRestartReachable: async () => true,
     tabCanMutateGraph: () => true,
   } as unknown as PanelToolCtx;
-  return { ctx, sends };
+  return { ctx, sends, confirms };
 }
 
 function restartTool() {
@@ -130,12 +149,14 @@ describe("panel#1546 — the identity refusal names the missing proof", () => {
     const note = await refusalNote({ serverOrigin: "http://localhost:8188" });
 
     expect(note).toMatch(/WHY I could not confirm it:/);
-    expect(note).toMatch(/http:\/\/localhost:8188/);
+    expect(note).toMatch(/this panel is open at http:\/\/localhost:8188/);
     // It must say WHY localhost is not proof — not merely that it differs.
     expect(note).toMatch(/127\.0\.0\.1 or ::1/);
     // And the remedy must name the concrete literal to open the panel at.
     expect(note).toMatch(/FIX: open the panel at http:\/\/127\.0\.0\.1:8188/);
-    expect(note).toMatch(/COMFYUI_URL/);
+    // NOT the reverse remedy: this user's browser is the ambiguous side, so
+    // telling them to repoint COMFYUI_URL at `localhost` would re-create it.
+    expect(note).not.toMatch(/set COMFYUI_URL to http:\/\/localhost/);
   });
 
   it("an ABSENT handshake Origin gets its own reason and its own remedy", async () => {
@@ -175,6 +196,42 @@ describe("panel#1546 — the identity refusal names the missing proof", () => {
     expect(new Set(notes).size).toBe(3);
   });
 
+  // THE SECOND REFUSAL SITE. #1593 shipped a fix that only reached the first one
+  // and needed a follow-up commit to cover this branch; a mutation run confirmed
+  // the same gap here — dropping the blocker at THIS call site left every test
+  // green. Wiring is asserted at both sites, not at the helper.
+  it("a binding lost during the confirm wait explains itself too", async () => {
+    const { ctx, sends, confirms } = makeCtx({
+      serverOrigin: BOOT_BASE, // proven before the card...
+      originAfterConfirm: "http://localhost:8188", // ...gone by the preflight
+    });
+    const body = parse(await restartTool().handler({}, ctx));
+
+    // The card WAS put to the user, so the pre-card identity gate passed and this
+    // refusal is the LATER one. Without this the test would silently re-cover the
+    // first site and the second would stay unpinned (the surviving mutation).
+    expect(confirms.count).toBe(1);
+    expect(body.refused).toBe(true);
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
+    expect(String(body.note)).toMatch(/WHY I could not confirm it:/);
+    expect(String(body.note)).toMatch(/127\.0\.0\.1 or ::1/);
+    expect(String(body.note)).toMatch(/FIX: open the panel at http:\/\/127\.0\.0\.1:8188/);
+  });
+
+  it("the second refusal distinguishes its causes as well as the first", async () => {
+    const lost = async (after: string) => {
+      const { ctx, confirms } = makeCtx({ serverOrigin: BOOT_BASE, originAfterConfirm: after });
+      const note = String(parse(await restartTool().handler({}, ctx)).note);
+      expect(confirms.count).toBe(1); // again: the SECOND site, not the first
+      return note;
+    };
+    const ambiguous = await lost("http://localhost:8188");
+    const different = await lost("http://127.0.0.1:8189");
+    expect(ambiguous).not.toBe(different);
+    expect(different).toMatch(/http:\/\/127\.0\.0\.1:8189/);
+    expect(different).not.toMatch(/127\.0\.0\.1 or ::1/);
+  });
+
   it("a PROVEN binding still dispatches — the refactor did not move the gate", async () => {
     const { ctx, sends } = makeCtx({ serverOrigin: BOOT_BASE });
     const body = parse(await restartTool().handler({}, ctx));
@@ -190,13 +247,56 @@ describe("panel#1546 — the identity refusal names the missing proof", () => {
 // this process was not started with. Pinned at the helper so the switch stays
 // TOTAL — a new blocker kind that falls through would return "" and silently
 // restore the undiagnosable refusal this issue is about.
+// The DNS ambiguity must only be blamed for what it actually causes. These are
+// pure-function tests because the boot base is fixed at process start, so the
+// boot-side-ambiguous direction has no handler fixture at all.
+describe("panel#1546 — `localhost` is blamed only when resolving it would settle it", () => {
+  it("same port, no mount, panel side ambiguous → the DNS verdict, panel remedy", () => {
+    const b = classifyOriginBlocker("http://localhost:8188", "http://127.0.0.1:8188");
+    expect(b.kind).toBe("origin-dns-ambiguous");
+    expect(b).toMatchObject({ ambiguousSide: "panel", concrete: "http://127.0.0.1:8188" });
+    expect(restartIdentityBlockerNote(b)).toMatch(/FIX: open the panel at http:\/\/127\.0\.0\.1:8188/);
+  });
+
+  it("BOOT side ambiguous → the remedy is COMFYUI_URL, not 'open the panel at localhost'", () => {
+    const b = classifyOriginBlocker("http://127.0.0.1:8188", "http://localhost:8188");
+    expect(b.kind).toBe("origin-dns-ambiguous");
+    expect(b).toMatchObject({ ambiguousSide: "boot", concrete: "http://127.0.0.1:8188" });
+    const note = restartIdentityBlockerNote(b);
+    expect(note).toMatch(/this server booted against http:\/\/localhost:8188/);
+    expect(note).toMatch(/FIX: set COMFYUI_URL to http:\/\/127\.0\.0\.1:8188/);
+    expect(note).not.toMatch(/FIX: open the panel at/);
+  });
+
+  it("a DIFFERENT PORT is a different server even when one side says localhost", () => {
+    // Resolving the hostname never reconciles :8188 with :8189, so calling this
+    // a DNS ambiguity would send the reader to fix the wrong thing.
+    expect(classifyOriginBlocker("http://localhost:8189", "http://127.0.0.1:8188").kind).toBe(
+      "origin-different",
+    );
+  });
+
+  it("a basePath mount stays the PATH verdict — the pathless Origin cannot prove it", () => {
+    expect(classifyOriginBlocker("http://localhost:8188", "http://127.0.0.1:8188/comfy").kind).toBe(
+      "origin-different",
+    );
+    expect(classifyOriginBlocker("http://127.0.0.1:8188", "http://127.0.0.1:8188/comfy").kind).toBe(
+      "origin-path-ambiguous",
+    );
+  });
+
+  it("localhost on BOTH sides is not this branch — those canonicalize equal", () => {
+    expect(classifyOriginBlocker("http://localhost:8189", "http://localhost:8188").kind).toBe(
+      "origin-different",
+    );
+  });
+});
+
 describe("panel#1546 — blocker branches with no handler-reachable fixture", () => {
   it("a basePath mount says the Origin cannot prove the mount", () => {
-    const note = restartIdentityBlockerNote({
-      kind: "origin-path-ambiguous",
-      bootBase: "http://127.0.0.1:8188/comfy",
-      origin: "http://127.0.0.1:8188",
-    });
+    const note = restartIdentityBlockerNote(
+      classifyOriginBlocker("http://127.0.0.1:8188", "http://127.0.0.1:8188/comfy"),
+    );
     expect(note).toMatch(/mounted under a path/);
     expect(note).toMatch(/http:\/\/127\.0\.0\.1:8188\/comfy/);
     expect(note).toMatch(/same host and port/);
