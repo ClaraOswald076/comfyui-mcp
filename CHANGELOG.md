@@ -759,6 +759,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.24] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- check_runtime knows PoYo's pack is a paid service, not a local node (#1858)
+- a dropped panel completion still arrives with the history output filenames (#1856)
+
+
 ## [0.52.23] - 2026-08-19
 
 ### MCP
