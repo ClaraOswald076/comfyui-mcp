@@ -759,10 +759,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.19] - 2026-08-19
+
 ### MCP
 
 #### Fixed
 - Panel auto-sync reclaims a provably-abandoned operation lock instead of failing for days; panel_add_node names version skew (pack update + hard tab refresh) when an allowlisted frontend-only type is refused as a missing backend node (#1828)
+
+### MCP
+
+#### Fixed
+- auto-sync reclaims abandoned panel locks; frontend-only add-node errors name version skew (#1830)
+
 
 ## [0.52.18] - 2026-08-19
 
