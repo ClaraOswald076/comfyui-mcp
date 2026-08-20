@@ -759,6 +759,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.29] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- a successful free is no longer reported as failure from another server's GPU (#1890)
+- a post-restart graph READ waits out the reconnect instead of losing the race (#1886)
+- panel_create_group includes requested collapsed nodes (#1885)
+- restart_comfyui relaunches the venv python, not the trampoline's base child (#1884)
+
+
 ## [0.52.28] - 2026-08-20
 
 ### MCP
