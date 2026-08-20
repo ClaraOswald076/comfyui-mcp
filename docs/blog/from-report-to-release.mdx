@@ -1,0 +1,248 @@
+---
+title: "From bug report to published release, autonomously"
+description: "How comfyui-mcp turns a bug report into a shipped fix: an MCP intake tool, a Cloudflare Worker that triages with an AI agent, a swarm of coding agents, an adversarial merge gate, and a tagged release."
+---
+
+_by [artokun](https://github.com/artokun) · August 19, 2026 · autopilot · Cloudflare · agents_
+
+Most of the fixes in [comfyui-mcp](https://github.com/artokun/comfyui-mcp) are filed, triaged,
+written, reviewed, tested and released without anyone opening a text editor. Not because the
+agents are trusted — precisely because they aren't. Every stage in this pipeline exists to catch
+the stage before it.
+
+Here's the whole thing, then each piece in detail.
+
+```mermaid
+flowchart TD
+  A["Agent hits a defect<br/>(or a user reports one)"] --> B["report_issue<br/>MCP tool"]
+  B --> C["Cloudflare Worker<br/>intake + AI triage"]
+  C -->|new / related| D["GitHub issue<br/>severity + labels"]
+  C -->|duplicate| E["Comment on the<br/>existing issue"]
+  C -->|already fixed| F["advised_upgrade<br/>no issue written"]
+  D --> G["Autopilot swarm<br/>one agent per issue"]
+  G --> H{"Terminal state"}
+  H -->|CLOSED-NO-CODE| I["Closed with evidence"]
+  H -->|PARKED| J["Labelled, left alone"]
+  H -->|fix written| K["Merge gate<br/>adversarial review"]
+  K -->|NO-SHIP| G
+  K -->|SHIP| L["CI: build + 10k tests<br/>on 3 platforms"]
+  L --> M["Merge to protected main"]
+  M --> N["Tag → npm publish"]
+  M --> O["pyproject bump →<br/>Comfy Registry"]
+```
+
+## Stage 1 — intake, and the honesty problem
+
+Reports arrive through an MCP tool, `report_issue`, which any agent driving ComfyUI can call. The
+governing instruction is **fix-then-file**: when an agent hits a defect in our own code it patches
+it locally so the user is unblocked, *then* files the report with the diff attached. Reports arrive
+as near-PRs rather than tickets.
+
+The bias is deliberately toward over-reporting. You do not need to be blocked, and it does not need
+to be fatal — a workaround you had to invent is itself the signal. Server-side dedup makes a
+duplicate a no-op, so under-reporting is the expensive failure mode.
+
+Two things in a report are not written by the reporting model, because a model is a poor witness
+about itself:
+
+- **Versions** are read from the running process, not asked for. The version named first is the one
+  *executing*, which is not always the one installed on disk — an upgrade that lands while the
+  orchestrator is up would otherwise pin every issue to code nobody ran.
+- **Which model is filing** is stamped by the orchestrator from the panel's provider/model
+  selection. Ask a model to name itself and it guesses; the agent's environment block never carried
+  the model at all. So the orchestrator publishes it and the tool reads it back:
+
+```
+Filed from the ComfyUI panel by **ollama** · model `gemma3:4b` — stamped by comfyui-mcp
+from the panel's provider/model selection, not self-reported.
+<!-- reporter-agent: backend=ollama model=gemma3:4b -->
+```
+
+That matters more than it sounds. The panel can be driven by a frontier model or a local 4B, and
+report quality tracks that choice closely. Without the stamp, a thin report from a small local
+model is indistinguishable from a thin report from a large hosted one.
+
+## Stage 2 — the Cloudflare Worker that triages
+
+Intake is a Cloudflare Worker. Each report gets its own Durable Object running an agentic loop
+(Agents SDK → GitHub's remote MCP → a reasoning model), so triage is a real investigation rather
+than a template.
+
+```mermaid
+stateDiagram-v2
+  [*] --> PENDING: POST /report
+  PENDING --> INVESTIGATING: search open + closed issues
+  INVESTIGATING --> CLOSED: exactly ONE write
+  CLOSED --> [*]
+
+  note right of PENDING
+    Returns instantly with a job id
+    and a mechanical version check
+  end note
+
+  note right of INVESTIGATING
+    Semantic dedup, version match,
+    severity assessment P0-P3
+  end note
+
+  note right of CLOSED
+    create | comment | reopen
+    or advised_upgrade (zero writes)
+  end note
+```
+
+The submit returns immediately with a job id and a **mechanical** version acknowledgement — a plain
+comparison against the latest published versions, computed without the model. The client then polls
+until the job closes. The design rules that matter:
+
+- **One write per job.** The agent gets a budget of exactly one create, comment, or reopen. That
+  budget is reserved *before* the call executes, so a write whose response is lost still counts.
+- **Severity is never caller-supplied.** The triage model assesses P0–P3 and the issue is *born*
+  with the label; a caller-supplied `severity:*` label is stripped at intake so a reporter cannot
+  spoof a P0.
+- **The body is pinned.** A created issue carries the reporter's body verbatim, not the model's
+  paraphrase. This is also why the model stamp rides in the body rather than a payload field —
+  unknown top-level fields are dropped, but the body always survives.
+- **The best outcome writes nothing.** If triage matches the report to an issue already fixed in a
+  version newer than the reporter's, it answers with the fixing PR and a recommendation to upgrade.
+  No issue is created. The most common real resolution is "you are four versions behind."
+- **Idempotency by HMAC.** Every body carries an unforgeable content marker, so a retry after an
+  uncertain write adopts the existing issue instead of filing a twin.
+
+## Stage 3 — the swarm
+
+Filed issues are picked up by an autopilot: one agent per issue, each in its own git worktree so
+they cannot collide. An agent owns its issue until it reaches a **terminal state**, and there are
+only three:
+
+```mermaid
+flowchart LR
+  I["Issue"] --> Q1{"Already fixed<br/>on main?"}
+  Q1 -->|yes| C1["CLOSED-NO-CODE<br/>with tag/PR evidence"]
+  Q1 -->|no| Q2{"In scope<br/>right now?"}
+  Q2 -->|no| P["PARKED<br/>autopilot:parked label"]
+  Q2 -->|yes| W["Write the fix"]
+  W --> G["Merge gate"]
+  G --> M["MERGED"]
+```
+
+The counter-intuitive rule is the important one: **manufacturing a change for an issue that needs
+none is the most damaging thing an agent can do here.** On the last backlog sweep, 28 of 34
+closures needed no code at all — the report was against an old version, or described a fix that
+already existed. So the first task is always "is this already fixed?", answered with
+`git tag --contains` against the reporter's stated version, in *both* repos, because the server and
+the panel ship separately.
+
+Terminal states are declared with labels, not prose. A supervisor reads labels; a beautifully
+argued comment saying "parked" that lacks the label reads as unfinished work and gets resumed
+forever.
+
+## Stage 4 — the gate that says no
+
+No fix merges on its author's own judgement. The diff goes to a **separate model in a fresh
+session** that has never seen the implementation, is given only the diff, and is told to refute it.
+
+```mermaid
+flowchart TD
+  D["Diff"] --> R["Fresh adversarial reviewer<br/>works a fixed taxonomy"]
+  R --> V{"Verdict"}
+  V -->|"exit 0 — SHIP"| M["Merge allowed"]
+  V -->|"exit 1 — NO-SHIP"| F["Fix the findings"]
+  V -->|"exit 2 — INDETERMINATE"| H["HOLD<br/>never a pass"]
+  F --> D
+  H --> D
+```
+
+Three exit codes, and the third is the one that earns its keep: a reviewer that ran out of quota,
+died mid-run, or produced empty output is **INDETERMINATE**, which holds the merge. Treating
+"couldn't check" as "checked and fine" is the failure this contract exists to prevent.
+
+The reviewer works a fixed taxonomy of defect classes. The most productive by far:
+
+1. **Two states collapse.** A check that cannot distinguish the case you care about from one you
+   don't.
+2. **A guard comparing the wrong pair.** Present, correct-looking, and asking about the wrong two
+   values.
+3. **A test that cannot fail.** Green because it manufactures the state production destroys.
+
+That last one is not theoretical. In a single day of work on one feature, three separate tests of
+mine were blind by construction — including one that hand-wrote a field into a config file
+immediately before calling the function whose own first act is to erase that field. Thirteen
+passing tests proved nothing about the bug they were written for.
+
+The gate rounds are not ceremony either. On one small change — a fallback for Windows accounts that
+cannot create scheduled tasks — successive rounds found six P1 defects, and two of them were
+introduced by the fixes for the previous round's findings. Every one of them would have hit exactly
+the users the feature was written for.
+
+## Stage 5 — evidence, not green checks
+
+A passing suite is necessary and nowhere near sufficient. Two habits do the real work:
+
+**Mutation testing at the call site.** Before believing a test protects a fix, break the fix and
+confirm the suite goes red. A test that passes with the code deleted is decoration. This regularly
+catches wiring that no test actually reaches — the helper is covered, the *call* to it is not.
+
+**Live verification on real hardware.** Unit tests cannot tell you whether a spawned subprocess
+actually receives the environment variable you passed it. So the pipeline runs the built artifact:
+a real orchestrator on a real bridge port, driven over the real panel protocol, with a real agent
+turn. For releases, the *published tarball* is unpacked and grepped for the symbols that were
+supposed to ship — verifying the artifact, not the CI run that produced it.
+
+## Stage 6 — release
+
+Two packages ship on two different mechanisms, and both mainlines are protected.
+
+```mermaid
+flowchart TD
+  subgraph npm["comfyui-mcp → npm"]
+    A1["Bump on release/x.y.z"] --> A2["PR → CI → merge commit"]
+    A2 --> A3["Tag the MERGED sha"]
+    A3 --> A4["release.yml publishes"]
+  end
+  subgraph reg["comfyui-mcp-panel → Comfy Registry"]
+    B1["Bump pyproject.toml<br/>+ PANEL_VERSION"] --> B2["Merge to main"]
+    B2 --> B3["YARA + bandit parity gates"]
+    B3 --> B4["comfy node publish"]
+    B4 --> B5["Registry scan → Active"]
+  end
+```
+
+**The tag is the publish trigger**, which produces a trap worth naming: tag the wrong commit and
+you publish something nobody reviewed. The rule is to tag the *merged* SHA read back from the
+remote — never local `HEAD`, which can carry an uncommitted bump or a conflicted merge. A stale
+local tag pointing at an unmerged commit is silent until the day it publishes.
+
+The panel's gates mirror the registry's own scanner rather than guessing at it: bandit with the
+registry's exact exclusions and **no severity floor** — a `-ll` filter hides exactly the LOW
+findings their scan reports — plus a YARA-parity pass over the shipped archive. Those rules match
+call-shaped literals in *prose*, so the changelog is excluded from the package: a file documenting
+a removed `subprocess` call trips the same rule as the call did.
+
+## An honest footnote about our download numbers
+
+npm currently reports about **123,000 weekly downloads**, on a curve that bends up and to the right
+in a way that would look excellent on a slide. Before anyone gets excited, here is the mechanism
+behind the graph:
+
+- The pipeline published **11 versions on the day this post was written** — and 11 more on a single
+  day the week before. There are 327 in total.
+- Every install runs a self-updater that checks npm hourly
+  (`[self-restart] npx install — checking npm for updates every 60m`). So a release doesn't trickle
+  out over a week; the entire fleet pulls it at roughly the same moment.
+- A gratifying number of MCP directories, mirrors and aggregators track our version and re-fetch
+  whenever it changes, which — see the first bullet — is frequently.
+
+So a healthy slice of that curve is our own release cadence, multiplied by our own auto-updater,
+admiring itself in a mirror. The counter is measuring how often the swarm has a productive
+afternoon, not how many humans showed up. We're leaving it on the dashboard anyway.
+
+## What this does not do
+
+It does not remove judgement; it relocates it. A human still decides what is in scope, what is
+parked, and when a "fix" is really a product decision. The pipeline's job is narrower: make sure
+nothing is silently dropped, nothing merges unreviewed, and nothing ships unverified.
+
+And it fails in instructive ways. The same day this post describes, a fix merged while its gate was
+still running — landing three P1s in a published release that the gate had already found. The
+pipeline was right; the sequencing wasn't. The gate is only a gate if you wait for it.
