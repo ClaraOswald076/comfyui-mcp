@@ -26,7 +26,14 @@ export interface ConversionResult {
    * to validate as `valid: true` just because it arrived in the other format
    * (#1869).
    */
-  missingNodeTypes: Array<{ nodeId: string; classType: string }>;
+  missingNodeTypes: Array<{
+    nodeId: string;
+    classType: string;
+    /** The exact warning text ALSO present in `warnings`, so a caller that
+     *  promotes this to an error can drop the duplicate by identity instead of
+     *  re-matching the prose. */
+    warning: string;
+  }>;
 }
 
 interface LinkInfo {
@@ -632,6 +639,23 @@ function valueFitsNumericOrBoolean(value: unknown, parts: string[]): boolean {
 }
 
 /**
+ * A known action-button spelling is still a legitimate value when the declared
+ * widget explicitly offers it as a combo option. STRING/file-path collisions
+ * remain ambiguous and are handled by the warning attached to a skip; combo
+ * membership is evidence we can safely use without guessing.
+ */
+function declaredSpecAcceptsValue(spec: unknown, value: unknown): boolean {
+  if (!Array.isArray(spec)) return false;
+  const type = spec[0];
+  if (Array.isArray(type)) return type.some((option) => option === value);
+  if (type !== "COMBO") return false;
+  const cfg = spec[1];
+  if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) return false;
+  const values = (cfg as { values?: unknown }).values;
+  return Array.isArray(values) && values.some((option) => option === value);
+}
+
+/**
  * Saved-row length vs remaining schema slots. Undefined when a later
  * dynamic combo makes nested arity unknowable — extras-skipping must then
  * stay off (a guess would be the same silent shift this exists to prevent).
@@ -693,9 +717,11 @@ function skipSerializedActionWidgets(opts: {
   def: ComfyUINodeDef;
   widgetNames: string[];
   nameIdx: number;
+  /** Every value advanced past is appended here so the caller can REPORT it. */
+  skipped: unknown[];
 }): number {
   let widgetIdx = opts.widgetIdx;
-  const { values, spec, def, widgetNames, nameIdx } = opts;
+  const { values, spec, def, widgetNames, nameIdx, skipped } = opts;
   const nbParts = numericOrBooleanParts(spec);
 
   while (widgetIdx < values.length) {
@@ -713,8 +739,11 @@ function skipSerializedActionWidgets(opts: {
     const candidate = values[widgetIdx];
     const typeRefutes = nbParts !== undefined && !valueFitsNumericOrBoolean(candidate, nbParts);
     const knownButton =
-      typeof candidate === "string" && KNOWN_ACTION_BUTTON_TOKENS.has(candidate);
+      typeof candidate === "string" &&
+      KNOWN_ACTION_BUTTON_TOKENS.has(candidate) &&
+      !declaredSpecAcceptsValue(spec, candidate);
     if (!typeRefutes && !knownButton) break;
+    skipped.push(candidate);
     widgetIdx++;
   }
   return widgetIdx;
@@ -2466,7 +2495,7 @@ export function convertUiToApi(
   // real links, then expand component/subgraph nodes. Every step reports what it
   // could NOT preserve into the same warnings list (#361).
   const warnings: string[] = [];
-  const missingNodeTypes: Array<{ nodeId: string; classType: string }> = [];
+  const missingNodeTypes: Array<{ nodeId: string; classType: string; warning: string }> = [];
   const cleaned = structuredClone(ui);
   // Only definitions this workflow actually instantiates can affect the result;
   // an unused one's wiring problems are not this graph's losses.
@@ -2653,10 +2682,9 @@ export function convertUiToApi(
 
     const def = objectInfo[classType];
     if (!def) {
-      warnings.push(
-        `Node ${nodeId} (${classType}): not found in object_info — custom node may not be installed. Skipping.`,
-      );
-      missingNodeTypes.push({ nodeId: String(nodeId), classType });
+      const warning = `Node ${nodeId} (${classType}): not found in object_info — custom node may not be installed. Skipping.`;
+      warnings.push(warning);
+      missingNodeTypes.push({ nodeId: String(nodeId), classType, warning });
       continue;
     }
 
@@ -2872,6 +2900,7 @@ export function convertUiToApi(
       // #1869 — frontend-only action buttons serialize into widgets_values but
       // are absent from object_info. Skip them before pairing this schema widget
       // so `browse`/`detect_range` cannot land on file_path/first_frame.
+      const skippedHere: unknown[] = [];
       widgetIdx = skipSerializedActionWidgets({
         values: widgetValues,
         widgetIdx,
@@ -2879,7 +2908,21 @@ export function convertUiToApi(
         def,
         widgetNames,
         nameIdx,
+        skipped: skippedHere,
       });
+      // Never skip SILENTLY. Which entry in a run is the button is not always
+      // decidable — `["browse", "detect_range", 12]` against {path, first_frame}
+      // has one extra and two candidates that both look like buttons, so the
+      // first-wins rule can put the wrong one on `path`. Reporting it is what
+      // makes that recoverable, and matches the #361 rule that every place the
+      // converted graph differs from the source is named.
+      for (const v of skippedHere) {
+        warnings.push(
+          `Node ${nodeId} (${classType}): skipped serialized value ${JSON.stringify(v)} ` +
+            `before widget "${name}" — it is a frontend-only action button that /object_info ` +
+            `does not describe. If that value was real, this node's inputs may be shifted.`,
+        );
+      }
       if (widgetIdx >= widgetValues.length) break;
       // A widget mapped AFTER a still-valid dynamic combo is positionally
       // downstream of its (unverifiable) nested arity — record it for the
