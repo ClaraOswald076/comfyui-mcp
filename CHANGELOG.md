@@ -759,6 +759,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.34] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- mode:"current" may not claim a routing target the turn pin holds elsewhere (#1919)
+
+
 ## [0.52.33] - 2026-08-20
 
 ### MCP
