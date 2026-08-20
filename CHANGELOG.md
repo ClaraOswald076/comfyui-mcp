@@ -759,6 +759,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.27] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- panel_run takes the node id its own tools printed (#1874)
+- a stale tab advertisement stops being reported as a restored graph binding (#1868)
+- panel_get_errors waits as long as the panel is allowed to take (#1867)
+
+
 ## [0.52.26] - 2026-08-20
 
 ### MCP
