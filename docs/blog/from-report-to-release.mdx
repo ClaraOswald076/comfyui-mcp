@@ -103,7 +103,7 @@ flowchart TD
   H -->|PARKED| J["Labelled, left alone"]
   H -->|fix written| K["Merge gate<br/>adversarial review"]
   K -->|NO-SHIP| G
-  K -->|SHIP| L["CI: build + 10k tests<br/>on 3 platforms"]
+  K -->|SHIP| L["CI: build +<br/>~10k tests"]
   L --> M["Merge to protected main"]
   M --> N["Tag → npm publish"]
   M --> O["pyproject bump →<br/>Comfy Registry"]
@@ -173,7 +173,8 @@ The submit returns immediately with a job id and a **mechanical** version acknow
 comparison against the latest published versions, computed without the model. The client then polls
 until the job closes. The design rules that matter:
 
-- **One write per job.** The agent gets a budget of exactly one create, comment, or reopen. That
+- **One write per job.** The agent gets a budget of exactly one triage action — create, comment,
+  or reopen, and a reopen plus its explanatory comment counts as one. That
   budget is reserved *before* the call executes, so a write whose response is lost still counts.
 - **Severity is never caller-supplied.** The triage model assesses P0–P3 and the issue is *born*
   with the label; a caller-supplied `severity:*` label is stripped at intake so a reporter cannot
@@ -183,7 +184,7 @@ until the job closes. The design rules that matter:
   unknown top-level fields are dropped, but the body always survives.
 - **The best outcome writes nothing.** If triage matches the report to an issue already fixed in a
   version newer than the reporter's, it answers with the fixing PR and a recommendation to upgrade.
-  No issue is created. The most common real resolution is "you are four versions behind."
+  No issue is created. The most common real resolution is "you are several versions behind."
 - **Idempotency by HMAC.** Every body carries an unforgeable content marker, so a retry after an
   uncertain write adopts the existing issue instead of filing a twin.
 
@@ -211,7 +212,8 @@ already existed. So the first task is always "is this already fixed?", answered 
 `git tag --contains` against the reporter's stated version, in *both* repos, because the server and
 the panel ship separately.
 
-Terminal states are declared with labels, not prose. A supervisor reads labels; a beautifully
+Parked is declared with a label, not prose — closed and merged are the GitHub states themselves.
+A supervisor reads labels; a beautifully
 argued comment saying "parked" that lacks the label reads as unfinished work and gets resumed
 forever.
 
@@ -249,7 +251,7 @@ immediately before calling the function whose own first act is to erase that fie
 passing tests proved nothing about the bug they were written for.
 
 The gate rounds are not ceremony either. On one small change — a fallback for Windows accounts that
-cannot create scheduled tasks — successive rounds found six P1 defects, and two of them were
+cannot create scheduled tasks — three successive rounds found six P1 defects, and two of them were
 introduced by the fixes for the previous round's findings. Every one of them would have hit exactly
 the users the feature was written for.
 
@@ -588,7 +590,8 @@ diff had to survive.
 Here's what it has to survive, and the receipts are all in this post:
 
 - A reviewer that **says no a lot.** Not a rubber stamp: on one small Windows fix, successive rounds
-  turned up six P1 defects — and two of those were introduced by the fixes for the previous round's
+  turned up six P1 defects across three rounds — and two of those were introduced by the fixes for
+  the previous round's
   findings. The system's most-used output is "not yet".
 - **Mutation checks**, because a passing test is not evidence. Break the fix; if the suite stays
   green, the test was decoration. This routinely catches wiring that no test actually reaches.
