@@ -319,6 +319,30 @@ That cuts both ways, and it is the strongest argument for the paranoia. A pipeli
 weaker gate would not be an achievement; it would be a very efficient way to push a bug to every
 install on the same afternoon.
 
+## Why an independent project builds this at all
+
+comfyui-mcp shipped its first npm version on **15 February 2026**. The official `comfy-mcp` package
+was first published on **31 July 2026** — five and a half months later. You can check both with
+`npm view <package> time.created`; I'd rather cite something verifiable than claim a head start.
+
+That gap is the whole context for this post. An independent project that arrives first does not get
+to compete on domain authority, a marketing budget, or a place in the official docs. There has been
+no ad spend here — not as a strategy, just as a fact; the traffic in the section above is search
+results, GitHub, and people telling each other. That advantage is not durable and I don't pretend
+otherwise: authority accrues to whoever owns the domain, eventually.
+
+What an independent project *can* compete on is the thing this whole post describes. Nobody with a
+larger budget is going to out-care you about whether a Windows account with a locked-down Task
+Scheduler can start a background process. The pipeline is the answer to being outgunned everywhere
+else: if the fix for the bug you filed can be triaged, written, adversarially reviewed, verified on
+real hardware and published while you are still reading the issue thread, that is a form of
+competition that headcount doesn't straightforwardly beat.
+
+None of this is paid work. It exists because people use it and it helps them, and because a bug
+report answered by a shipped release the same day is a genuinely satisfying thing to build. The
+metrics section above is careful about what it can and cannot claim. This part isn't a metric at
+all — it's just the reason the rest of it gets maintained.
+
 ## What this does not do
 
 It does not remove judgement; it relocates it. A human still decides what is in scope, what is
