@@ -759,10 +759,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.33] - 2026-08-20
+
 ### MCP
 
 #### Fixed
-- a PINNED session's graph reads recover their missing instance stamp after reconnect without releasing the pin (#1913)
+- pinned graph reads recover their instance stamp after reconnect without releasing the pin (#1916 / #1913)
+- panel_restart_comfyui accounts for a loopback instance on a non-default port (#1914)
+
 
 ## [0.52.32] - 2026-08-20
 
