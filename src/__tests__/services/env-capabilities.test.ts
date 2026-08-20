@@ -603,6 +603,53 @@ describe("readInstalledPanelVersion (disk fallback)", () => {
     expect(readInstalledPanelVersion(dir)).toBe("0.12.0");
   });
 
+  // panel #1515 — TWO copies installed, the documented #1269/#641 two-panels state
+  // (a git clone at comfyui-mcp-panel beside a Registry install at
+  // comfyui-agent-panel). Both carry the same authoritative [project].name, so the
+  // name screen passes for both and the scan used to return whichever dir the
+  // hardcoded list named first. On the reporter's rig that stamped an abandoned
+  // 0.7.3 clone onto the agent's ENVIRONMENT line while the live pack was 0.15.24.
+  it("prefers the NEWEST copy when the pack is installed twice (stale clone first in the list)", async () => {
+    await writePanel(
+      "comfyui-mcp-panel",
+      `[project]\nname = "comfyui-agent-panel"\nversion = "0.7.3"\n`,
+    );
+    await writePanel(
+      "comfyui-agent-panel",
+      `[project]\nname = "comfyui-agent-panel"\nversion = "0.15.24"\n`,
+    );
+    expect(readInstalledPanelVersion(dir)).toBe("0.15.24");
+  });
+
+  // The SAME rule with the directories swapped. Without this, reordering
+  // PANEL_DIR_NAMES alone would satisfy the test above while leaving the defect —
+  // a list's order still deciding the answer — fully intact.
+  it("prefers the NEWEST copy irrespective of which dir name holds it", async () => {
+    await writePanel(
+      "comfyui-agent-panel",
+      `[project]\nname = "comfyui-agent-panel"\nversion = "0.7.3"\n`,
+    );
+    await writePanel(
+      "comfyui-mcp-panel",
+      `[project]\nname = "comfyui-agent-panel"\nversion = "0.15.24"\n`,
+    );
+    expect(readInstalledPanelVersion(dir)).toBe("0.15.24");
+  });
+
+  it("ignores a squatted copy and still reports the real panel's version", async () => {
+    // The name screen and the newest-wins scan compose: 9.9.9 is the highest
+    // version present but is not the panel, so it must not win.
+    await writePanel(
+      "comfyui-mcp-panel",
+      `[project]\nname = "some-other-node"\nversion = "9.9.9"\n`,
+    );
+    await writePanel(
+      "comfyui-agent-panel",
+      `[project]\nname = "comfyui-agent-panel"\nversion = "0.15.24"\n`,
+    );
+    expect(readInstalledPanelVersion(dir)).toBe("0.15.24");
+  });
+
   it("returns undefined for a non-panel pyproject squatting a known dir (wrong project name)", async () => {
     // Authoritative guard: only [project].name == comfyui-agent-panel is trusted,
     // so a different node at the same dir name never yields a WRONG version.

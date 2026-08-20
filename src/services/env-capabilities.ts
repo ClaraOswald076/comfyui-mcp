@@ -24,7 +24,7 @@ import { isForceRemoteFlagSet } from "../config.js";
 import { resolveComfyuiPython, pythonVersionsAgree, torchVersionsAgree } from "./workspace-env.js";
 import { resolveLiveInterpreter } from "./live-interpreter.js";
 import { parsePyproject } from "./node-authoring.js";
-import { detectInstallMode } from "./self-update.js";
+import { compareSemver, detectInstallMode } from "./self-update.js";
 import { logger } from "../utils/logger.js";
 
 // The interpreter resolver lives in workspace-env (which owns ComfyUI-base
@@ -740,7 +740,13 @@ export interface GatherOptions {
 
 // The panel's known custom_nodes dir names (registry unpack vs repo name), kept
 // in sync with panel-installer's FAST_PATH_DIRS.
-const PANEL_DIR_NAMES = ["comfyui-mcp-panel", "comfyui-agent-panel"] as const;
+//
+// Canonical Registry name FIRST (panel #1515). The order is no longer the thing
+// that decides the answer — `readInstalledPanelVersion` now picks the NEWEST of
+// the copies it finds — but it is still the tie-break when two copies carry
+// versions that cannot be compared, and the Registry install is the one the
+// installer manages.
+const PANEL_DIR_NAMES = ["comfyui-agent-panel", "comfyui-mcp-panel"] as const;
 // pyproject `[project].name` — the AUTHORITATIVE panel identity (a dir may be
 // squatted; the project name is not). Mirrors panel-installer's PANEL_REGISTRY_ID.
 const PANEL_PROJECT_NAME = "comfyui-agent-panel";
@@ -758,9 +764,35 @@ const PANEL_PROJECT_NAME = "comfyui-agent-panel";
  * panel's — a non-panel pyproject squatting a known dir name yields undefined,
  * never a wrong version. Best-effort: returns undefined on any failure, never
  * throws.
+ *
+ * NEWEST WINS, NOT FIRST-LISTED (panel #1515).
+ *
+ * The pack can be installed TWICE — a git clone at `custom_nodes/comfyui-mcp-panel`
+ * alongside a Manager/Registry install at `custom_nodes/comfyui-agent-panel`. That
+ * is not hypothetical: it is the documented #1269 / #641 two-panels state, and
+ * panel-recovery's own PANEL_DIR_NAMES comment exists to stop this module's advice
+ * from manufacturing it. Both dirs carry the same authoritative `[project].name`,
+ * so the name screen passes for BOTH and the loop returned whichever the hardcoded
+ * list happened to name first.
+ *
+ * In panel #1515 that read `0.7.3` off an abandoned clone while the live pack was
+ * `0.15.24`, and stamped 0.7.3 onto the agent's ENVIRONMENT line — the surface bug
+ * reports version-match against. A list's order is not evidence about which copy
+ * ComfyUI serves, so it may not decide the answer.
+ *
+ * The tie-break is NEWEST, and it is the panel's own rule rather than a guess: the
+ * bundle guard added for #1269 arbitrates the page so the newer copy runs and the
+ * older stands down ("A stale copy must never win just because its directory sorts
+ * first" — web/js/lib/duplicate-panel-guard.js). Reporting the newest install
+ * therefore names the bundle the browser will actually run.
+ *
+ * Two versions that cannot be compared (compareSemver answers 0 for anything that
+ * is not `major.minor.patch`) keep the first-found copy, which is the pre-existing
+ * behaviour and PANEL_DIR_NAMES' remaining job.
  */
 export function readInstalledPanelVersion(comfyuiPath?: string): string | undefined {
   if (!comfyuiPath) return undefined;
+  let best: string | undefined;
   for (const name of PANEL_DIR_NAMES) {
     try {
       const toml = readFileSync(
@@ -768,12 +800,15 @@ export function readInstalledPanelVersion(comfyuiPath?: string): string | undefi
         "utf8",
       );
       const parsed = parsePyproject(toml);
-      if (parsed.projectName === PANEL_PROJECT_NAME && parsed.version) return parsed.version;
+      if (parsed.projectName !== PANEL_PROJECT_NAME || !parsed.version) continue;
+      // Keep scanning after a hit: the FIRST readable copy is not evidence that
+      // it is the live one.
+      if (best === undefined || compareSemver(parsed.version, best) > 0) best = parsed.version;
     } catch {
       /* try the next known dir name */
     }
   }
-  return undefined;
+  return best;
 }
 
 /**

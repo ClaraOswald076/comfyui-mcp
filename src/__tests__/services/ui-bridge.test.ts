@@ -2540,7 +2540,11 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
         .send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "stale-bundle" })
         .catch((e: Error) => e);
       expect((err as Error).message).toMatch(/Do NOT update the panel/);
-      expect((err as Error).message).toMatch(/HARD-REFRESH/);
+      // panel #1515 — the remedy now leads with a plain reload (ComfyUI answers
+      // no-store on /extensions/, so one is normally enough) and keeps the
+      // cache-bypassing reload as the escalation.
+      expect((err as Error).message).toMatch(/RELOAD THIS COMFYUI TAB/);
+      expect((err as Error).message).toMatch(/Ctrl\+Shift\+R/);
       expect((err as Error).message).toMatch(/0\.11\.38/);
       // It must NOT send them back to the tool that will report nothing to do.
       expect((err as Error).message).not.toMatch(/Run install_comfyui\(action:'panel', panel_action:'update'\)/);
@@ -2711,12 +2715,17 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       expect(msg).toMatch(/Updating the panel will not fix this/);
       expect(msg).toMatch(/already 0\.11\.38/);
       expect(msg).not.toMatch(/Run install_comfyui\(action:'panel', panel_action:'update'\)/);
-      // The UNPROVEN part is not asserted...
-      expect(msg).not.toMatch(/This BROWSER TAB is running an older cached copy/);
-      // ...it is ranked, actionable case first, the other named rather than hidden.
-      expect(msg).toMatch(/\(1\) It is a ComfyUI browser tab/);
-      expect(msg).toMatch(/HARD-REFRESH/);
-      expect(msg).toMatch(/\(2\) It is NOT a panel tab/);
+      // The UNPROVEN part is not asserted... (re-anchored for panel #1515: the
+      // definite branch now says "an OLDER copy", so the pre-#1515 wording would
+      // have made this negative assertion pass vacuously.)
+      expect(msg).not.toMatch(/This BROWSER TAB is running an OLDER copy/);
+      // ...it is ranked, actionable case first, the others named rather than
+      // hidden. #1515 puts the in-place pack update at the top, because that is
+      // the one that actually applied in the session that reported it.
+      expect(msg).toMatch(/\(1\) THE PACK WAS UPDATED IN PLACE WHILE THIS TAB WAS OPEN/);
+      expect(msg).toMatch(/RELOAD THIS COMFYUI TAB/);
+      expect(msg).toMatch(/\(2\) The pack is INSTALLED TWICE/);
+      expect(msg).toMatch(/\(3\) It is NOT a panel tab/);
       expect(msg).not.toMatch(/[A-Za-z)"']\.\./);
       sock.close();
     } finally {
@@ -3199,8 +3208,9 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       expect(msg).toMatch(/already 0\.11\.38/);
       expect(msg).not.toMatch(/Run install_comfyui\(action:'panel', panel_action:'update'\)/);
       // Still no fabricated cause — the causes are ranked, as for no version.
-      expect(msg).not.toMatch(/This BROWSER TAB is running an older cached copy/);
-      expect(msg).toMatch(/\(1\) It is a ComfyUI browser tab/);
+      // (Re-anchored for panel #1515, same reason as the no-version case above.)
+      expect(msg).not.toMatch(/This BROWSER TAB is running an OLDER copy/);
+      expect(msg).toMatch(/\(1\) THE PACK WAS UPDATED IN PLACE WHILE THIS TAB WAS OPEN/);
       sock.close();
     } finally {
       clearPanelDiskObservation();
