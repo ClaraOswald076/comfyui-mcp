@@ -182,3 +182,90 @@ describe("validateWorkflow — graph-health merge", () => {
     expect(r.issues.some((i) => i.kind)).toBe(false);
   });
 });
+
+// #1869 — create_workflow (action:"validate") on a saved UI graph used to report
+// false type/enum errors because action-button tokens serialized into
+// widgets_values were paired against /object_info from slot 0.
+describe("validateWorkflow — UI graph with serialized action buttons (#1869)", () => {
+  const AM_OBJECT_INFO = {
+    AMVideoRead: {
+      input: {
+        required: {
+          file_path: ["STRING", { default: "" }],
+          frame_mode: [["single", "range", "all"], { default: "all" }],
+          first_frame: ["INT", { default: 1 }],
+          last_frame: ["INT", { default: -1 }],
+        },
+      },
+      output: ["IMAGE"],
+      output_node: true,
+    },
+  } as const;
+
+  const FILE_PATH = "D:/shots/plate.mov";
+  const uiWorkflow = {
+    nodes: [
+      {
+        id: 1,
+        type: "AMVideoRead",
+        mode: 0,
+        inputs: [],
+        outputs: [{ name: "IMAGE", type: "IMAGE", links: null }],
+        widgets_values: [
+          "browse",
+          "open_in_explorer",
+          "copy_path",
+          FILE_PATH,
+          "range",
+          "detect_range",
+          12,
+          48,
+        ],
+      },
+    ],
+    links: [],
+  } as unknown as WorkflowJSON;
+
+  it("does not report action-button tokens as combo/enum errors", async () => {
+    getObjectInfoMock.mockResolvedValue(AM_OBJECT_INFO);
+    const r = await validateWorkflow(uiWorkflow, { health: false });
+    const text = r.issues.map((i) => i.message).join("\n");
+    expect(text).not.toMatch(/open_in_explorer/);
+    expect(text).not.toMatch(/copy_path/);
+    expect(text).not.toMatch(/detect_range/);
+    expect(r.issues.filter((i) => i.kind === "value_not_in_list")).toHaveLength(0);
+    expect(r.issues.filter((i) => i.severity === "error")).toHaveLength(0);
+    expect(r.valid).toBe(true);
+  });
+
+  // The converter DROPS a node whose type object_info doesn't know, so the
+  // per-node check never sees it. Reporting only a conversion warning made the
+  // SAME uninstalled custom node an error in API format and a `valid: true`
+  // workflow in UI format — a false green on the one thing validation is for.
+  it("still reports an uninstalled custom node as an ERROR, not a warning", async () => {
+    getObjectInfoMock.mockResolvedValue({
+      SaveImage: { input: { required: { images: ["IMAGE"] } }, output: [] },
+    });
+    const ui = {
+      nodes: [
+        {
+          id: 1,
+          type: "TotallyNotInstalled",
+          mode: 0,
+          inputs: [],
+          outputs: [],
+          widgets_values: [],
+        },
+      ],
+      links: [],
+    } as unknown as WorkflowJSON;
+
+    const r = await validateWorkflow(ui, { health: false });
+    const missing = r.issues.filter((i) => i.kind === "missing_node_type");
+    expect(missing).toHaveLength(1);
+    expect(missing[0].severity).toBe("error");
+    expect(missing[0].node_id).toBe("1");
+    expect(missing[0].node_type).toBe("TotallyNotInstalled");
+    expect(r.valid).toBe(false);
+  });
+});

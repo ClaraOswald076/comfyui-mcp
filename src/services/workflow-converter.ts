@@ -18,6 +18,15 @@ import { isSelfProducingUeSender, isUeSender } from "./flatten-workflow.js";
 export interface ConversionResult {
   workflow: WorkflowJSON;
   warnings: string[];
+  /**
+   * Nodes DROPPED because their class_type is absent from object_info. Reported
+   * structurally so a caller can raise the same authoritative "unknown node type"
+   * error the API-format path raises, instead of parsing it back out of the
+   * warning prose — a UI export with an uninstalled custom node must not be able
+   * to validate as `valid: true` just because it arrived in the other format
+   * (#1869).
+   */
+  missingNodeTypes: Array<{ nodeId: string; classType: string }>;
 }
 
 interface LinkInfo {
@@ -573,6 +582,142 @@ function getOrderedInputNames(def: ComfyUINodeDef): string[] {
     if (def.input.optional) names.push(...Object.keys(def.input.optional));
   }
   return names;
+}
+
+/**
+ * INT / FLOAT / BOOLEAN (including a combined "FLOAT,INT"). A serialized action
+ * button can never legitimately occupy one of these, so a value that cannot be
+ * the declared type is the one skip signal that needs no vocabulary at all —
+ * and it is what recovers an INTERSPERSED button (`detect_range` sitting
+ * between a combo and an INT), which no prefix rule can see.
+ */
+function numericOrBooleanParts(spec: unknown): string[] | undefined {
+  if (!Array.isArray(spec)) return undefined;
+  const type = spec[0];
+  const cfg = spec[1] as { widgetType?: unknown } | undefined;
+  const t = typeof cfg?.widgetType === "string" ? cfg.widgetType : type;
+  if (typeof t !== "string") return undefined;
+  const parts = t.split(",").map((s) => s.trim()).filter(Boolean);
+  if (parts.length === 0) return undefined;
+  if (!parts.every((p) => p === "INT" || p === "FLOAT" || p === "BOOLEAN")) {
+    return undefined;
+  }
+  return parts;
+}
+
+/**
+ * Deliberately PERMISSIVE: this decides whether a value could belong to a
+ * numeric/boolean widget, and a false "no" SKIPS a real value. ComfyUI itself
+ * coerces `"1024"` to an INT and `0`/`1` to a BOOLEAN, and frontends serialize
+ * both shapes, so accepting them is what the runtime does — treating them as
+ * mismatches would drop a legitimate widget value (#1869 review).
+ */
+function valueFitsNumericOrBoolean(value: unknown, parts: string[]): boolean {
+  const numeric = (v: unknown): number | undefined => {
+    if (typeof v === "number") return Number.isFinite(v) ? v : undefined;
+    if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) {
+      return Number(v);
+    }
+    return undefined;
+  };
+  if (parts.length === 1 && parts[0] === "BOOLEAN") {
+    if (typeof value === "boolean") return true;
+    if (value === 0 || value === 1) return true;
+    return value === "true" || value === "false";
+  }
+  const n = numeric(value);
+  if (n === undefined) return false;
+  if (parts.includes("INT") && !parts.includes("FLOAT")) return Number.isInteger(n);
+  return true;
+}
+
+/**
+ * Saved-row length vs remaining schema slots. Undefined when a later
+ * dynamic combo makes nested arity unknowable — extras-skipping must then
+ * stay off (a guess would be the same silent shift this exists to prevent).
+ */
+function remainingPositionalSlots(
+  widgetNames: string[],
+  fromIdx: number,
+  def: ComfyUINodeDef,
+): number | undefined {
+  let n = 0;
+  for (let i = fromIdx; i < widgetNames.length; i++) {
+    const spec =
+      (def.input?.required as Record<string, unknown> | undefined)?.[widgetNames[i]] ??
+      (def.input?.optional as Record<string, unknown> | undefined)?.[widgetNames[i]];
+    const type = Array.isArray(spec) ? spec[0] : undefined;
+    if (type === "COMFY_DYNAMICCOMBO_V3") return undefined;
+    n += 1;
+    if (hasControlAfterGenerate(widgetNames[i], def)) n += 1;
+  }
+  return n;
+}
+
+/**
+ * Button tokens observed serialized into a real `widgets_values` row (#1869,
+ * comfyui-am-vfx-tools AMVideoRead/AMVideoWrite).
+ *
+ * This is a CLOSED vocabulary on purpose. The first cut matched the general
+ * shape of an identifier (`/^[a-z][a-z0-9_]*$/`) and tried to corroborate the
+ * skip by finding a later value that fits a strict widget. Independent review
+ * broke that three ways, because most ordinary values match that shape too:
+ * `["my_path", "label", "detect_range", 12]` skipped `my_path`, and
+ * `["my_model", "detect_range", 12]` skipped a stale checkpoint name that #361
+ * requires be preserved. The corroboration could tell that SOMETHING in the gap
+ * did not belong; it could not tell WHICH — and it always dropped the first.
+ *
+ * Guessing wrong here writes a silently wrong graph, which is worse than the
+ * misalignment being fixed. So an unrecognised token is left alone.
+ */
+const KNOWN_ACTION_BUTTON_TOKENS = new Set([
+  "browse",
+  "open_in_explorer",
+  "copy_path",
+  "detect_range",
+]);
+
+/**
+ * Advance past serialized frontend-only extras that cannot belong to this
+ * schema widget. Returns the index of the first value that should be paired.
+ *
+ * Two signals only, both requiring the saved row to have MORE values left than
+ * the schema has slots left:
+ *   1. the value cannot be the declared numeric/boolean type, or
+ *   2. the value is a known serialized button token.
+ */
+function skipSerializedActionWidgets(opts: {
+  values: unknown[];
+  widgetIdx: number;
+  spec: unknown;
+  def: ComfyUINodeDef;
+  widgetNames: string[];
+  nameIdx: number;
+}): number {
+  let widgetIdx = opts.widgetIdx;
+  const { values, spec, def, widgetNames, nameIdx } = opts;
+  const nbParts = numericOrBooleanParts(spec);
+
+  while (widgetIdx < values.length) {
+    // Skipping is only ever safe when the row has more values left than the
+    // schema has slots left. Otherwise every remaining value still has a home
+    // and dropping one is the same silent shift this exists to prevent — a
+    // REORDERED widget (#959) is dropped rather than merely misassigned.
+    const remainingSlots = remainingPositionalSlots(widgetNames, nameIdx, def);
+    const extras =
+      remainingSlots === undefined
+        ? 0
+        : Math.max(0, values.length - widgetIdx - remainingSlots);
+    if (extras <= 0) break;
+
+    const candidate = values[widgetIdx];
+    const typeRefutes = nbParts !== undefined && !valueFitsNumericOrBoolean(candidate, nbParts);
+    const knownButton =
+      typeof candidate === "string" && KNOWN_ACTION_BUTTON_TOKENS.has(candidate);
+    if (!typeRefutes && !knownButton) break;
+    widgetIdx++;
+  }
+  return widgetIdx;
 }
 
 // ── De-virtualization (Get/Set/Reroute) pre-pass ────────────────────────────
@@ -2321,6 +2466,7 @@ export function convertUiToApi(
   // real links, then expand component/subgraph nodes. Every step reports what it
   // could NOT preserve into the same warnings list (#361).
   const warnings: string[] = [];
+  const missingNodeTypes: Array<{ nodeId: string; classType: string }> = [];
   const cleaned = structuredClone(ui);
   // Only definitions this workflow actually instantiates can affect the result;
   // an unused one's wiring problems are not this graph's losses.
@@ -2510,6 +2656,7 @@ export function convertUiToApi(
       warnings.push(
         `Node ${nodeId} (${classType}): not found in object_info — custom node may not be installed. Skipping.`,
       );
+      missingNodeTypes.push({ nodeId: String(nodeId), classType });
       continue;
     }
 
@@ -2719,6 +2866,20 @@ export function convertUiToApi(
     const nestedKeysFromDynamic: string[] = [];
     for (let nameIdx = 0; nameIdx < widgetNames.length; nameIdx++) {
       const name = widgetNames[nameIdx];
+      const spec =
+        (def.input?.required as Record<string, unknown>)?.[name] ??
+        (def.input?.optional as Record<string, unknown>)?.[name];
+      // #1869 — frontend-only action buttons serialize into widgets_values but
+      // are absent from object_info. Skip them before pairing this schema widget
+      // so `browse`/`detect_range` cannot land on file_path/first_frame.
+      widgetIdx = skipSerializedActionWidgets({
+        values: widgetValues,
+        widgetIdx,
+        spec,
+        def,
+        widgetNames,
+        nameIdx,
+      });
       if (widgetIdx >= widgetValues.length) break;
       // A widget mapped AFTER a still-valid dynamic combo is positionally
       // downstream of its (unverifiable) nested arity — record it for the
@@ -2739,9 +2900,6 @@ export function convertUiToApi(
 
       // V3 dynamic combo: the selected option adds nested required inputs whose
       // values follow in widgets_values (e.g. method="rcas" -> strength=0.55).
-      const spec =
-        (def.input?.required as Record<string, unknown>)?.[name] ??
-        (def.input?.optional as Record<string, unknown>)?.[name];
 
       // Classic combo widget: if the saved value isn't one of the valid options
       // (a stale UI-helper combo like Impact's "Select to add Wildcard", or a
@@ -3477,5 +3635,5 @@ export function convertUiToApi(
   // duplicates are pure noise. Distinct nodes/inputs keep their own warnings.
   const dedupedWarnings = [...new Set(warnings)];
 
-  return { workflow, warnings: dedupedWarnings };
+  return { workflow, warnings: dedupedWarnings, missingNodeTypes };
 }

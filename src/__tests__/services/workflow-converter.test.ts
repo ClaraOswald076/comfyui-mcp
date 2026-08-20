@@ -443,9 +443,17 @@ describe("convertUiToApi — serialized-widget nodes (has_serialized_properties)
   it("without the flag the positional mapping is untouched (stale property copies can't hijack normal nodes)", () => {
     const { workflow } = convertUiToApi(directorGraph(false), DIRECTOR_INFO);
     const inputs = (workflow["1316"] as { inputs: Record<string, unknown> }).inputs;
-    // positional (mis)mapping proceeds as before — the point is only that
-    // properties did NOT override it: frame_rate keeps whatever slot landed there.
-    expect(inputs.frame_rate).not.toBe(24);
+    // The point of this test is that `properties` did NOT override the
+    // positional pass. `frame_rate !== 24` used to stand in for that, but it no
+    // longer can: the three BOOLEAN widgets refuse the STRING values sitting on
+    // them, so #1869's extras-skipping realigns the TAIL and it now arrives at
+    // 24 positionally — the same answer properties would have given. Assert the
+    // HEAD instead, which nothing can realign and which properties would have
+    // corrected if it were being consulted.
+    expect(inputs.timeline_data).toBe("15"); // properties say '{"mainTrackEnabled":true}'
+    expect(inputs.epsilon).toBe("360"); // properties say 0.001
+    expect(inputs.start_second).toBe("0"); // properties say the NUMBER 0
+    expect(inputs["Node name for S&R"]).toBeUndefined();
   });
 });
 
@@ -3451,5 +3459,271 @@ describe("convertUiToApi — option-bearing / dynamic nested combo validation (P
         (w) => w.includes("1") && w.includes("AUDIO") && /substituting/.test(w),
       ),
     ).toBe(true);
+  });
+});
+
+// #1869 — AMVideoRead/AMVideoWrite serialize frontend action buttons into
+// widgets_values (`browse`, `open_in_explorer`, `copy_path` above file_path,
+// and interspersed `detect_range` before first_frame). Those buttons are
+// absent from /object_info, so pairing from slot 0 used to land them on
+// real inputs (`frame_mode='open_in_explorer'`, `first_frame='copy_path'`).
+describe("convertUiToApi — serialized action buttons must not shift widget values (#1869)", () => {
+  const AM_VIDEO_READ = {
+    input: {
+      required: {
+        file_path: ["STRING", { default: "" }],
+        frame_mode: [["single", "range", "all"], { default: "all" }],
+        first_frame: ["INT", { default: 1 }],
+        last_frame: ["INT", { default: -1 }],
+      },
+    },
+    output: ["IMAGE"],
+    output_node: true,
+  };
+
+  const FILE_PATH = "D:/shots/plate.mov";
+  const FRAME_MODE = "range";
+  const FIRST_FRAME = 12;
+  const LAST_FRAME = 48;
+
+  it("skips prefix and interspersed action-button tokens on AMVideoRead", () => {
+    const ui = {
+      nodes: [
+        {
+          id: 1,
+          type: "AMVideoRead",
+          mode: 0,
+          inputs: [],
+          outputs: [],
+          widgets_values: [
+            "browse",
+            "open_in_explorer",
+            "copy_path",
+            FILE_PATH,
+            FRAME_MODE,
+            "detect_range",
+            FIRST_FRAME,
+            LAST_FRAME,
+          ],
+        },
+      ],
+      links: [],
+    } as never;
+    const { workflow } = convertUiToApi(ui, { AMVideoRead: AM_VIDEO_READ } as never);
+    expect(workflow["1"].inputs.file_path).toBe(FILE_PATH);
+    expect(workflow["1"].inputs.frame_mode).toBe(FRAME_MODE);
+    expect(workflow["1"].inputs.first_frame).toBe(FIRST_FRAME);
+    expect(workflow["1"].inputs.last_frame).toBe(LAST_FRAME);
+    expect(workflow["1"].inputs.file_path).not.toBe("browse");
+    expect(workflow["1"].inputs.frame_mode).not.toBe("open_in_explorer");
+    expect(workflow["1"].inputs.first_frame).not.toBe("copy_path");
+    expect(workflow["1"].inputs.first_frame).not.toBe("detect_range");
+  });
+
+  it("skips prefix action-button tokens on AMVideoWrite (no detect_range)", () => {
+    const codec = "h264";
+    const outPath = "D:/out/shot.mov";
+    const ui = {
+      nodes: [
+        {
+          id: 2,
+          type: "AMVideoWrite",
+          mode: 0,
+          inputs: [],
+          outputs: [],
+          widgets_values: [
+            "browse",
+            "open_in_explorer",
+            "copy_path",
+            outPath,
+            codec,
+          ],
+        },
+      ],
+      links: [],
+    } as never;
+    const { workflow } = convertUiToApi(ui, {
+      AMVideoWrite: {
+        input: {
+          required: {
+            file_path: ["STRING", { default: "" }],
+            codec: [["h264", "prores", "dnxhr"], { default: "h264" }],
+          },
+        },
+        output: [],
+        output_node: true,
+      },
+    } as never);
+    expect(workflow["2"].inputs.file_path).toBe(outPath);
+    expect(workflow["2"].inputs.codec).toBe(codec);
+    expect(workflow["2"].inputs.file_path).not.toBe("browse");
+    expect(workflow["2"].inputs.codec).not.toBe("open_in_explorer");
+  });
+
+  // The two cases below are the SAME SHAPE to a positional pass — one loose
+  // STRING slot, one extra value, a lowercase-identifier candidate. Only the
+  // token itself distinguishes them, so the uncorroborated path is allowed to
+  // skip a button we have actually seen serialized and nothing else.
+  it("skips an action prefix when no downstream widget can corroborate it", () => {
+    const ui = {
+      nodes: [
+        {
+          id: 3,
+          type: "AMPathOnly",
+          mode: 0,
+          inputs: [],
+          outputs: [],
+          widgets_values: ["browse", "D:/out.mov", "final take"],
+        },
+      ],
+      links: [],
+    } as never;
+    const { workflow } = convertUiToApi(ui, {
+      AMPathOnly: {
+        input: {
+          required: { file_path: ["STRING", {}], note: ["STRING", {}] },
+        },
+        output: [],
+      },
+    } as never);
+    expect(workflow["3"].inputs.file_path).toBe("D:/out.mov");
+    expect(workflow["3"].inputs.note).toBe("final take");
+  });
+
+  it("leaves an ordinary lowercase STRING alone when nothing corroborates a skip", () => {
+    const ui = {
+      nodes: [
+        {
+          id: 4,
+          type: "PlainText",
+          mode: 0,
+          inputs: [],
+          outputs: [],
+          widgets_values: ["hello", "Extra Thing"],
+        },
+      ],
+      links: [],
+    } as never;
+    const { workflow } = convertUiToApi(ui, {
+      PlainText: { input: { required: { text: ["STRING", {}] } }, output: [] },
+    } as never);
+    // `hello` is a plain value, not a button token — the extra trailing entry
+    // must NOT promote it out of its own slot.
+    expect(workflow["4"].inputs.text).toBe("hello");
+  });
+});
+
+// Independent review of the first cut broke it four ways. Every case below is a
+// SILENT WRONG VALUE — the converter emitted a plausible graph carrying someone
+// else's data — which is strictly worse than the misalignment being fixed. The
+// common cause was matching the general SHAPE of an identifier and then trying
+// to corroborate the skip positionally: that can tell something in the gap does
+// not belong, but not WHICH, and it always dropped the first.
+describe("convertUiToApi — extras-skipping must never eat a legitimate value (#1869 review)", () => {
+  const oneNode = (type: string, widgets_values: unknown[]) =>
+    ({
+      nodes: [{ id: 1, type, mode: 0, inputs: [], outputs: [], widgets_values }],
+      links: [],
+    }) as never;
+
+  it("keeps a snake_case STRING that merely LOOKS like a button token", () => {
+    const { workflow } = convertUiToApi(
+      oneNode("N", ["my_path", "label", "detect_range", 12]),
+      {
+        N: {
+          input: {
+            required: {
+              path: ["STRING", {}],
+              label: ["STRING", {}],
+              first_frame: ["INT", {}],
+            },
+          },
+          output: [],
+        },
+      } as never,
+    );
+    expect(workflow["1"].inputs.path).toBe("my_path");
+    expect(workflow["1"].inputs.label).toBe("label");
+    expect(workflow["1"].inputs.first_frame).toBe(12);
+  });
+
+  // #361: a stale asset value must be PRESERVED so it surfaces as a missing-asset
+  // error. Skipping it replaced the checkpoint name with a button token, and the
+  // resulting warning then named the WRONG value as the one the user declared.
+  it("preserves a stale asset value instead of skipping it (#361)", () => {
+    const { workflow } = convertUiToApi(
+      oneNode("N", ["my_model", "detect_range", 12]),
+      {
+        N: {
+          input: {
+            required: {
+              ckpt_name: [["a.safetensors"], {}],
+              first_frame: ["INT", {}],
+            },
+          },
+          output: [],
+        },
+      } as never,
+    );
+    expect(workflow["1"].inputs.ckpt_name).toBe("my_model");
+    expect(workflow["1"].inputs.first_frame).toBe(12);
+  });
+
+  // ComfyUI coerces these itself, and frontends serialize both shapes. Treating
+  // them as type mismatches DROPPED a real widget value.
+  it("accepts a BOOLEAN serialized as 0/1", () => {
+    const { workflow } = convertUiToApi(oneNode("N", [0, "browse"]), {
+      N: { input: { required: { enabled: ["BOOLEAN", {}] } }, output: [] },
+    } as never);
+    expect(workflow["1"].inputs.enabled).toBe(0);
+  });
+
+  it("accepts an INT serialized as a numeric STRING", () => {
+    const { workflow } = convertUiToApi(oneNode("N", ["1024", "browse"]), {
+      N: { input: { required: { width: ["INT", {}] } }, output: [] },
+    } as never);
+    expect(workflow["1"].inputs.width).toBe("1024");
+  });
+
+  // The known-token list cannot cover every pack's buttons, so the type signal
+  // has to carry the ones it has never seen. It is the ONLY thing that can
+  // recover a button sitting mid-row on a numeric widget — a prefix rule cannot
+  // see it, and the vocabulary does not know it.
+  it("skips an UNKNOWN button token that lands on a numeric widget", () => {
+    const { workflow } = convertUiToApi(
+      oneNode("N", ["D:/x.mov", "recalculate_everything", 12]),
+      {
+        N: {
+          input: { required: { file_path: ["STRING", {}], frames: ["INT", {}] } },
+          output: [],
+        },
+      } as never,
+    );
+    expect(workflow["1"].inputs.file_path).toBe("D:/x.mov");
+    expect(workflow["1"].inputs.frames).toBe(12);
+  });
+
+  // Three BOOLEANs in a row refusing three STRINGs is what realigns the TAIL of
+  // a badly-shifted custom node (LTXDirector, above) even though its head is
+  // unrecoverable. Pin it directly rather than leaning on that test.
+  it("realigns a run of BOOLEANs that STRING values had shifted", () => {
+    const { workflow } = convertUiToApi(
+      oneNode("N", ["a", "b", "c", true, false, 7]),
+      {
+        N: {
+          input: {
+            required: {
+              flag_a: ["BOOLEAN", {}],
+              flag_b: ["BOOLEAN", {}],
+              count: ["INT", {}],
+            },
+          },
+          output: [],
+        },
+      } as never,
+    );
+    expect(workflow["1"].inputs.flag_a).toBe(true);
+    expect(workflow["1"].inputs.flag_b).toBe(false);
+    expect(workflow["1"].inputs.count).toBe(7);
   });
 });
