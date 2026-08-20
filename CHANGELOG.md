@@ -759,6 +759,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.21] - 2026-08-19
+
+### MCP
+
+#### Fixed
+- a departed Blind tab stops blinding the whole conversation, and the strip says it happened (#1842)
+- a dev-symlink panel below the floor reports behind:true (#1840)
+
+#### Changed
+- bump the actions-all group with 6 updates (#1836)
+- bump typescript from 5.9.3 to 7.0.2 (#1838)
+
+
 ## [0.52.20] - 2026-08-19
 
 ### MCP
