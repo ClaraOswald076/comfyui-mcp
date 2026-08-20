@@ -759,6 +759,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.30] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- panel_run returns queued:true after a mid-command drop if the prompt is already in the queue (#1901)
+- a rejected node id says what it wanted and what it got (#1897)
+- an occupied GPU after free is named instead of a silent freed:true (#1898)
+- the ENV line reports the panel ComfyUI will run, and the refusal names the cause that applied
+
+
 ## [0.52.29] - 2026-08-20
 
 ### MCP
