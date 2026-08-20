@@ -493,3 +493,49 @@ nothing is silently dropped, nothing merges unreviewed, and nothing ships unveri
 And it fails in instructive ways. The same day this post describes, a fix merged while its gate was
 still running — landing three P1s in a published release that the gate had already found. The
 pipeline was right; the sequencing wasn't. The gate is only a gate if you wait for it.
+
+## "This is just AI slop"
+
+Someone is going to say that, so let's take it seriously rather than get defensive about it.
+
+The literal claim is true and there's no point pretending otherwise: this code is largely written by
+agents. Vibe-coded, if you like. Conceded — including the parts of this post you're reading.
+
+But "slop" isn't really a claim about *authorship*, it's a claim about *attention*. The failure mode
+people have in mind is generated code that nobody checked: plausible-looking, superficially
+reviewed, accumulating in a codebase until it can't be reasoned about. That is a real thing and it
+happens constantly. The interesting question isn't whether a model wrote the diff. It's what the
+diff had to survive.
+
+Here's what it has to survive, and the receipts are all in this post:
+
+- A reviewer that **says no a lot.** Not a rubber stamp: on one small Windows fix, successive rounds
+  turned up six P1 defects — and two of those were introduced by the fixes for the previous round's
+  findings. The system's most-used output is "not yet".
+- **Mutation checks**, because a passing test is not evidence. Break the fix; if the suite stays
+  green, the test was decoration. This routinely catches wiring that no test actually reaches.
+- **Live verification** against real hardware, and for releases, against the *published tarball* —
+  not the CI run that produced it.
+- **Terminal states**, so nothing is quietly abandoned. 957 PRs merged and zero left open is not a
+  boast about volume; it's the absence of a junk drawer.
+- And the thing that produced this very post's security section: writing the system down caused
+  three real gaps to be found and closed before publication.
+
+The fair version of the criticism still lands, though, and it's worth stating in its strongest form.
+The gate is *also* an AI — models reviewing models, which is not the independent check a human
+reviewer would be. What keeps it from being pure theatre is structural rather than magical: it's a
+fresh session with no memory of having written the thing, handed only the diff, told to refute. And
+empirically it refuses, often, on grounds the author had already convinced themselves were fine.
+That is weaker than a good human reviewer. It is enormously stronger than nothing, which is the
+actual alternative on a project with one unpaid maintainer.
+
+The other fair hit: **volume is not virtue.** 406,599 additions in a month is a number the graphs
+love and it proves nothing at all. A pipeline like this makes it trivially easy to produce more
+code than anyone can hold in their head, and most of the machinery described above exists precisely
+because that's dangerous, not because it's impressive.
+
+So: slop, sure — but slop that scoops itself up. Left unattended it leaks everywhere; that's the
+whole reason for the gate, the mutations, the terminal states and the paranoia about the publish
+path. Tidiness here isn't a personality trait, it's a build step. And when it slips — when a merge
+beats its own gate and three P1s reach a release — you get to read about that too, four paragraphs
+up, in the same post.
