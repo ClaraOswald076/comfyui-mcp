@@ -285,6 +285,15 @@ describe("panel#1546 — `localhost` is blamed only when resolving it would sett
     );
   });
 
+  it("a DEFAULT port on one side only is still the same spot", () => {
+    // normalizeHandshakeOrigin fills 80/443 in explicitly, so the Origin says
+    // ":80" while a default-port boot base has port "". Comparing raw ports read
+    // that as a port mismatch and misfiled it as a different server.
+    const b = classifyOriginBlocker("http://localhost:80", "http://127.0.0.1");
+    expect(b.kind).toBe("origin-dns-ambiguous");
+    expect(b).toMatchObject({ ambiguousSide: "panel" });
+  });
+
   it("localhost on BOTH sides is not this branch — those canonicalize equal", () => {
     expect(classifyOriginBlocker("http://localhost:8189", "http://localhost:8188").kind).toBe(
       "origin-different",

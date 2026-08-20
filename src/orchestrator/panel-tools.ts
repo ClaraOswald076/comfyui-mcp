@@ -2519,10 +2519,18 @@ export function classifyOriginBlocker(
     try {
       const o = new URL(origin);
       const b = new URL(bootBase);
-      // A handshake Origin is pathless, so the DNS answer can only settle a boot
-      // base that is not under a mount. Ports must already agree — resolving a
-      // hostname never reconciles :8188 with :8189.
-      sameSpot = o.port === b.port && o.protocol === b.protocol && b.pathname.replace(/\/+$/, "") === "";
+      // A handshake Origin is pathless BY CONSTRUCTION — normalizeHandshakeOrigin
+      // rebuilds it from protocol/hostname/port and relayIdentityOrigin uses
+      // URL.origin — so only the BOOT base can carry a mount, and the DNS answer
+      // can never settle one. Ports must already agree; resolving a hostname never
+      // reconciles :8188 with :8189. Compare EFFECTIVE ports: the same normalizer
+      // fills in 80/443 explicitly, so a default-port boot base ("") would
+      // otherwise read as a port mismatch against an origin that says "80".
+      const port = (u: URL) => u.port || (u.protocol === "https:" ? "443" : "80");
+      sameSpot =
+        o.protocol === b.protocol &&
+        port(o) === port(b) &&
+        b.pathname.replace(/\/+$/, "") === "";
     } catch {
       sameSpot = false;
     }
