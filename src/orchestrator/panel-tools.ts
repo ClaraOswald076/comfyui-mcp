@@ -79,6 +79,7 @@ import {
   NODE_ID_PATTERN,
   normalizeNodeId,
   PLAIN_NODE_ID_PATTERN,
+  unionErrorFor,
 } from "./node-id.js";
 import {
   parseContradictoryPromotedWidgetRefusal,
@@ -10880,10 +10881,12 @@ function validatePanelEditNodeArgs(args: Record<string, unknown>): string | null
  */
 const nodeId = () =>
   z
-    .union([
-      z.number().int(),
-      z.string().regex(NODE_ID_PATTERN, NODE_ID_MESSAGE),
-    ])
+    // #1889 — the union-level `error` is what a caller actually reads. Without it
+    // zod names the failed union `"Invalid input"` and buries NODE_ID_MESSAGE in a
+    // nested `errors` array that no renderer prints. See unionErrorFor.
+    .union([z.number().int(), z.string().regex(NODE_ID_PATTERN, NODE_ID_MESSAGE)], {
+      error: unionErrorFor(NODE_ID_MESSAGE),
+    })
     .transform(normalizeNodeId);
 
 /**
@@ -10916,10 +10919,13 @@ const RUN_TO_NODE_ID_MESSAGE =
 
 const runToNodeId = () =>
   z
-    .union([
-      z.number().int(),
-      z.string().regex(PLAIN_NODE_ID_PATTERN, RUN_TO_NODE_ID_MESSAGE),
-    ])
+    // #1889, same as nodeId(): #1497 wrote RUN_TO_NODE_ID_MESSAGE so a qualified id
+    // would be "refused now by name, with a reason" — and for the shapes that fail
+    // BOTH members the name and the reason were dropped on the floor.
+    .union(
+      [z.number().int(), z.string().regex(PLAIN_NODE_ID_PATTERN, RUN_TO_NODE_ID_MESSAGE)],
+      { error: unionErrorFor(RUN_TO_NODE_ID_MESSAGE) },
+    )
     .transform((v) => (typeof v === "number" ? v : Number.parseInt(v, 10)));
 
 /**
