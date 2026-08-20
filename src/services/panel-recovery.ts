@@ -243,9 +243,18 @@ export function manualPanelUpdateCommands(comfyuiPath?: string): string {
  *
  * Told to "run install_comfyui(action:'panel', panel_action:'update')", such a user gets "nothing to
  * update" — true, and completely useless, because nothing is wrong with their
- * install. The fix is a cache-bypassing reload of the tab, and saying so is the
- * whole remedy. (The cache-busting itself is #584 / panel #596 and is not
- * addressed here; this only makes the diagnosis and the guidance correct.)
+ * install. The fix is a reload of the tab, and saying so is the whole remedy.
+ * (The cache-busting itself is #584 / panel #596 and is not addressed here; this
+ * only makes the diagnosis and the guidance correct.)
+ *
+ * WHY THE TAB IS OLD is a separate question from the fact that it is, and panel
+ * #1515 is the correction: this text used to answer it "the HTTP cache", which
+ * the panel repo has since measured to be untrue on any current host (ComfyUI
+ * 0.31.1+ answers `Cache-Control: no-store` on /extensions/, and the pack adds
+ * the same backstop where a host sets none). The ordinary reason is duller and
+ * needs no cache at all — the pack was updated in place and the tab has been
+ * open since before it moved. A cache-bypassing reload stays in the text as the
+ * escalation, not the opening diagnosis.
  */
 export interface PanelBundleSkew {
   /** Version READ FROM DISK, already proven to satisfy the requirement. */
@@ -323,34 +332,68 @@ export function describePanelUpdateRecovery(
     //  - the client advertised a version BELOW the floor → the served pack and
     //    the announced build genuinely disagree. Both the version and the
     //    capability are built by the same served file, so a client running the
-    //    installed bundle would have announced the installed version. A stale
-    //    cached bundle is then a conclusion, not a guess.
+    //    installed bundle would have announced the installed version. An OLDER
+    //    bundle in the tab is then a conclusion, not a guess — though WHY it is
+    //    older stays open, so the text names the ordinary reason (the pack moved
+    //    under an open tab) without asserting a mechanism it did not observe.
     //  - the client advertised NO version → nothing was observed. A browser tab
-    //    on a cached bundle looks exactly like a relay or other non-panel client
-    //    that never implemented the fence at all, and "hard-refresh your tab" is
-    //    unactionable for the latter. Asserting the cache is the fabrication
-    //    this cluster exists to remove, so that variant RANKS the possibilities
-    //    instead — the actionable one first, the other named rather than hidden.
-    const HARD_REFRESH =
-      `The panel's module URLs carry no cache-busting key, so an ordinary reload can ` +
-      `serve the stale file again: HARD-REFRESH this ComfyUI tab with a cache-bypassing ` +
-      `reload (Ctrl+Shift+R, or Cmd+Shift+R on macOS; if that does not take, open ` +
-      `DevTools and use right-click reload → "Empty Cache and Hard Reload"). `;
+    //    on an old bundle looks exactly like a relay or other non-panel client
+    //    that never implemented the fence at all, and "reload your tab" is
+    //    unactionable for the latter. Asserting a cause is the fabrication this
+    //    cluster exists to remove, so that variant RANKS the possibilities
+    //    instead — the actionable ones first, the others named rather than
+    //    hidden. The second rank (panel #1515) is the two-panels install, which
+    //    is the one possibility here that a reload provably CANNOT fix, so it
+    //    must be named rather than left to be discovered after the reload fails.
+    // RELOAD FIRST, HARD-REFRESH AS THE ESCALATION (panel #1515).
+    //
+    // This used to open by asserting the HTTP cache as the mechanism ("the module
+    // URLs carry no cache-busting key, so an ordinary reload can serve the stale
+    // file again") and send the user straight to Ctrl+Shift+R. The panel repo has
+    // since MEASURED that claim and recorded the opposite in its own __init__.py:
+    // "ComfyUI 0.31.1 already answers `Cache-Control: no-store` on every
+    // /extensions/ path — ours and other packs' alike — so the HTTP cache is not
+    // the mechanism there", and the pack installs a no-store backstop for hosts
+    // that set none. On any current host an ordinary reload DOES pick up new JS.
+    //
+    // Leading with the cache therefore named a cause that no longer applies and
+    // buried the one that does — a tab that has simply been open since before the
+    // pack changed. #1515's reporter had an in-place ComfyUI-Manager update at
+    // 11:37 on a tab opened at 11:11, with no restart and no reload; they were
+    // sent to diagnose a cache they did not have. The remedy survives (a reload
+    // fixes both), so this is a change of CAUSE and of ORDER, not of action.
+    const RELOAD_TAB =
+      `RELOAD THIS COMFYUI TAB. An ordinary reload is normally enough — ComfyUI ` +
+      `answers Cache-Control: no-store on /extensions/ assets (and the pack sets it ` +
+      `as a backstop where the host does not), so the tab picks up the new JS. If the ` +
+      `refusal survives a reload, escalate to a cache-bypassing one (Ctrl+Shift+R, or ` +
+      `Cmd+Shift+R on macOS; if that does not take, open DevTools and use right-click ` +
+      `reload → "Empty Cache and Hard Reload"). `;
     return (
       (skew.handshakeVersion
         ? `Do NOT update the panel — the pack ON DISK is already ${skew.diskVersion}, which ` +
           `meets the ${skew.requiredVersion}+ a graph write needs. This BROWSER TAB is running ` +
-          `an older cached copy of the panel's JavaScript (it advertised ` +
+          `an OLDER copy of the panel's JavaScript (it advertised ` +
           `${skew.handshakeVersion}), and the capability check reads what the TAB ` +
-          `announced. ${HARD_REFRESH}`
+          `announced — most often because the pack was updated in place while this tab ` +
+          `stayed open. ${RELOAD_TAB}`
         : `Updating the panel will not fix this — the pack ON DISK is already ` +
           `${skew.diskVersion}, which meets the ${skew.requiredVersion}+ a graph write needs, ` +
           `so the SERVED panel is already capable. What connected advertised no version and ` +
-          `no workflow fence, which does not by itself say why, so here are both ` +
-          `possibilities. (1) It is a ComfyUI browser tab — much the more common case — ` +
-          `running a cached older copy of the panel's JavaScript. ${HARD_REFRESH}` +
-          `(2) It is NOT a panel tab (a relay or other client): then it does not implement ` +
-          `the fence at all and there is nothing to refresh — issue graph WRITES from a ` +
+          `no workflow fence, which does not by itself say why, so here are the ` +
+          `possibilities, likeliest first. (1) THE PACK WAS UPDATED IN PLACE WHILE THIS TAB ` +
+          `WAS OPEN, and the tab is still running the JavaScript it loaded before the ` +
+          `update — ComfyUI-Manager says as much after every update ("After restarting ` +
+          `ComfyUI, please refresh the browser"), and a tab opened before the update never ` +
+          `did. ${RELOAD_TAB}` +
+          `(2) The pack is INSTALLED TWICE — a git clone at custom_nodes/comfyui-mcp-panel ` +
+          `beside a Registry install at custom_nodes/comfyui-agent-panel. ComfyUI loads ` +
+          `both bundles into the page, and an old enough copy hellos without a version at ` +
+          `all; reloading cannot fix that, because the stale copy is served from its own ` +
+          `directory and re-registers on every load. Check custom_nodes for both names and ` +
+          `remove the one you do not use. ` +
+          `(3) It is NOT a panel tab (a relay or other client): then it does not implement ` +
+          `the fence at all and there is nothing to reload — issue graph WRITES from a ` +
           `ComfyUI tab running the panel. `) +
       // Only name the tool where naming it is useful. In a remote/cloud session
       // it is not callable at all, so mentioning it is a pointless mention of an

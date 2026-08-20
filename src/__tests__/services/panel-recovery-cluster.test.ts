@@ -493,13 +493,15 @@ describe("recovery guidance depends on the session, not on a hardcoded string", 
 describe("disk-current but handshake-old is diagnosed as a stale tab, not a stale install", () => {
   const SKEW = { diskVersion: "0.11.38", requiredVersion: "0.11.35" };
 
-  it("tells the user to hard-refresh, and NOT to update anything", () => {
+  it("tells the user to reload the tab, and NOT to update anything", () => {
     const text = describePanelUpdateRecovery(undefined, {
       ...SKEW,
       handshakeVersion: "0.11.34",
     });
     expect(text).toMatch(/Do NOT update the panel/);
-    expect(text).toMatch(/HARD-REFRESH/);
+    expect(text).toMatch(/RELOAD THIS COMFYUI TAB/);
+    // The cache-bypassing reload survives as the ESCALATION (panel #1515), so
+    // the keystroke a user needs when a plain reload does not take is still here.
     expect(text).toMatch(/Ctrl\+Shift\+R/);
     expect(text).toMatch(/0\.11\.38/); // what is really on disk
     expect(text).toMatch(/0\.11\.34/); // what the tab announced
@@ -540,12 +542,49 @@ describe("disk-current but handshake-old is diagnosed as a stale tab, not a stal
     const text = describePanelUpdateRecovery(undefined, SKEW);
     expect(text).toMatch(/advertised no version/);
     expect(text).toMatch(/Updating the panel will not fix this/); // the proven part
-    expect(text).not.toMatch(/This BROWSER TAB is running an older cached copy/); // the unproven part
+    expect(text).not.toMatch(/This BROWSER TAB is running an OLDER copy/); // the unproven part
     expect(text).toMatch(/does not by itself say why/);
-    expect(text).toMatch(/\(1\) It is a ComfyUI browser tab/);
-    expect(text).toMatch(/HARD-REFRESH/); // still leads with the actionable fix
-    expect(text).toMatch(/\(2\) It is NOT a panel tab/);
-    expect(text).toMatch(/nothing to refresh/);
+    expect(text).toMatch(/\(1\) THE PACK WAS UPDATED IN PLACE WHILE THIS TAB WAS OPEN/);
+    expect(text).toMatch(/RELOAD THIS COMFYUI TAB/); // still leads with the actionable fix
+    expect(text).toMatch(/\(3\) It is NOT a panel tab/);
+    expect(text).toMatch(/nothing to reload/);
+  });
+
+  // panel #1515 — the reporter's session had an in-place ComfyUI-Manager update
+  // at 11:37 on a tab opened at 11:11, with no restart and no reload. The text
+  // led with the HTTP cache and sent them to Cmd+Shift+R, naming a cause that
+  // did not apply; ComfyUI-Manager's own post-update line already tells users to
+  // refresh the browser.
+  it("leads with the in-place pack update, and does not assert the HTTP cache as the cause", () => {
+    const text = describePanelUpdateRecovery(undefined, SKEW);
+    const updatedInPlace = text.indexOf("THE PACK WAS UPDATED IN PLACE");
+    const notAPanelTab = text.indexOf("It is NOT a panel tab");
+    expect(updatedInPlace).toBeGreaterThan(-1);
+    // ORDER is the ask, not mere presence: the leading cause must be the one
+    // that actually applied.
+    expect(updatedInPlace).toBeLessThan(notAPanelTab);
+    // ComfyUI-Manager's own wording, so the user recognises the line they saw.
+    expect(text).toMatch(/After restarting ComfyUI, please refresh the browser/);
+    // The stale mechanism claim is GONE. The panel repo measured the opposite
+    // (ComfyUI 0.31.1+ answers Cache-Control: no-store on /extensions/), so this
+    // sentence asserted a cause that cannot apply on a current host.
+    expect(text).not.toMatch(/carry no cache-busting key/);
+    expect(text).not.toMatch(/an ordinary reload can serve the stale file again/);
+    // And it says the plain reload is normally enough rather than opening on the
+    // cache-bypassing one.
+    expect(text).toMatch(/An ordinary reload is normally enough/);
+  });
+
+  // The one possibility in this list that a reload provably CANNOT fix. Leaving
+  // it unnamed means the user reloads, stays broken, and has no next step —
+  // exactly the dead end this module exists to remove.
+  it("names the two-panels install, and says a reload cannot fix it", () => {
+    const text = describePanelUpdateRecovery(undefined, SKEW);
+    expect(text).toMatch(/\(2\) The pack is INSTALLED TWICE/);
+    expect(text).toContain("custom_nodes/comfyui-mcp-panel");
+    expect(text).toContain("custom_nodes/comfyui-agent-panel");
+    expect(text).toMatch(/reloading cannot fix that/);
+    expect(text).toMatch(/remove the one you do not use/);
   });
 
   it("an ADVERTISED old version is still a definite diagnosis", () => {
@@ -554,8 +593,11 @@ describe("disk-current but handshake-old is diagnosed as a stale tab, not a stal
     // the same served file), so hedging there would be its own failure.
     const text = describePanelUpdateRecovery(undefined, { ...SKEW, handshakeVersion: "0.11.34" });
     expect(text).toMatch(/Do NOT update the panel/);
-    expect(text).toMatch(/This BROWSER TAB is running an older cached copy/);
+    expect(text).toMatch(/This BROWSER TAB is running an OLDER copy/);
     expect(text).not.toMatch(/does not by itself say why/);
+    // panel #1515 — the skew is proven, but WHY the tab is old is not, so the
+    // definite branch names the ordinary reason without asserting a mechanism.
+    expect(text).toMatch(/updated in place while this tab\s+stayed open/);
   });
 
   it("the skew branch outranks remote mode — and still never names an uncallable tool", () => {
