@@ -424,33 +424,40 @@ The payload doesn't have to be dramatic. "Your version detection is wrong, the f
 - **A reviewer's diff can be truncated.** Both gates cap the diff they embed (default 1,000 lines)
   and tell the reviewer to read the rest directly. A payload deliberately placed past that cutoff
   is, at minimum, less likely to be read.
-- **There is no gate specific to dependency changes.** A lockfile edit is reviewed exactly as
-  carefully as a comment fix — which is to say, as carefully as one reviewer happened to be that
-  round.
-- **Nothing is watching our dependencies for known CVEs.** Writing this post is what surfaced it:
-  neither repository has Dependabot, CodeQL or an `npm audit` step, and the scanning described
-  above looks for *malicious patterns in our own code*, not for a published advisory against
-  something we already depend on. The npm package — the one with the hourly auto-updater and the
-  widest blast radius — has the least of this. That gap is being closed, and it should have been
-  closed before the pipeline got fast.
+- The **blast radius is the feature**, and no amount of review changes that arithmetic.
 - **The blast radius is the feature.** Same-day fixes and an hourly auto-updater are the same
   mechanism, and it does not distinguish a good commit from a bad one. The thing that makes a fix
   reach everyone by dinner makes a compromise reach everyone by dinner.
 
-I don't think this is fully solvable at this scale, and I'd rather state the residual risk than
-imply a guarantee I can't back. What is tractable is narrowing it, and writing this section
-produced the list:
+### What writing this section changed
 
-1. Treat report bodies explicitly as **data, not instruction**, in the fixing agent's context.
-2. Require a human on any diff touching **dependencies, lockfiles, CI, or the publish path**.
-3. Never let a **truncated diff** count as a reviewed one.
-4. Add **Dependabot / CVE tracking** to both repositories, npm side first.
+Documenting a system turns out to be an efficient way to audit one. Drafting the paragraphs above
+surfaced three gaps that were real, and they were closed before this post went up rather than
+described as future work:
 
-None of those existed when this post was drafted. That is the honest state of it: the pipeline was
-built to make fixes fast and correct, and its supply-chain surface got less attention than its
-correctness surface. Documenting a system is an underrated way to audit one.
+- **A SHIP verdict is no longer unconditional.** Both gates now refuse to pass a diff that touches
+  the supply chain — `package.json`, any lockfile, `pyproject.toml`, anything under `.github/`, or
+  the publish scripts — unless a human explicitly acknowledges it. Those paths were previously
+  reviewed exactly as carefully as a comment fix.
+- **A truncated diff no longer counts as a reviewed one.** Both gates cap the diff they embed. A
+  pass over a diff we *know* was clipped now downgrades to the hold state, because "the reviewer
+  was told to go read the rest itself" is not evidence that it did.
+- **Dependency advisories are now tracked.** Neither repository had Dependabot, CodeQL or an
+  `npm audit` step. The existing scans look for malicious patterns in *our own* code; nothing was
+  watching for an advisory filed against something we already depend on. Both repos now run weekly
+  grouped updates across every ecosystem that reaches a user — including GitHub Actions, since a
+  compromised action runs with the credentials of the one job here that can publish.
 
-If you are building something similar, inherit the paranoia along with the pipeline. The autonomy
+Bumps are also explicitly out of scope for the swarm, and that needed enforcing rather than
+assuming. The finisher extracts an issue number from a PR's body, falling back to digits in the
+branch name — and a dependency bump quoting an upstream `#1524` in its changelog resolves to a real
+issue number in this repo. It now skips bot-authored PRs outright, because the author field is the
+one thing a crafted body cannot spoof.
+
+What remains unfixed is the hardest one: the fixing agent still reads attacker-controlled text,
+because that is what a bug report *is*. Separating instruction from data inside one context window
+is not a solved problem, and I'd rather name the residual risk than imply a guarantee I can't back.
+If you are building something similar, inherit the paranoia along with the pipeline — the autonomy
 is the easy part.
 
 ## Why an independent project builds this at all
