@@ -759,6 +759,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.32] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- a workflow pin may not claim a graph target it did not establish (#1912)
+
+
 ## [0.52.31] - 2026-08-20
 
 ### MCP
