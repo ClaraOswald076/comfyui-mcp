@@ -759,6 +759,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.25] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- launch-server tests collect on a Windows checkout (#1860)
+
+
 ## [0.52.24] - 2026-08-20
 
 ### MCP
