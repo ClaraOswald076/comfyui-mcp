@@ -759,6 +759,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.22] - 2026-08-19
+
+### MCP
+
+#### Changed
+- bump the npm-minor-patch group across 1 directory with 10 updates (#1837)
+- from bug report to published release, autonomously (#1831)
+
+
 ## [0.52.21] - 2026-08-19
 
 ### MCP
