@@ -759,6 +759,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.20] - 2026-08-19
+
+### MCP
+
+#### Changed
+- watch dependencies for advisories, weekly and grouped (#1833)
+
+
 ## [0.52.19] - 2026-08-19
 
 ### MCP
