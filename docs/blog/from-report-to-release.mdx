@@ -219,6 +219,40 @@ findings their scan reports — plus a YARA-parity pass over the shipped archive
 call-shaped literals in *prose*, so the changelog is excluded from the package: a file documenting
 a removed `subprocess` call trips the same rule as the call did.
 
+## The numbers, and what they actually measure
+
+Here is a month of that pipeline running, as GitHub sees it.
+
+<img src="/images/insights-pulse-month.png" alt="GitHub pulse for artokun/comfyui-mcp, July 19 to August 19 2026: 957 active pull requests, 957 merged, 0 open; 581 active issues, 581 closed, 0 new; 18 authors, 1247 commits to main and 2829 to all branches; 1552 files changed with 406,599 additions and 17,451 deletions; 239 releases published by 1 person" />
+
+**957 pull requests merged. Zero open. 581 issues closed. Zero new.**
+
+The zeros are the interesting part, and they do *not* mean "no bugs". They mean nothing is sitting
+in limbo. That is the terminal-state rule from stage 3 showing up as a statistic: every issue lands
+in MERGED, CLOSED-NO-CODE or PARKED, and a swarm that is not allowed to leave things half-finished
+produces an empty queue as a side effect. A backlog is what accumulates when work can stop
+somewhere other than a terminal state.
+
+Two more from that panel, read carefully:
+
+- **2,829 commits across all branches, but 1,247 on main.** The gap is not lost work. Main
+  squash-merges — 130 of its last 200 commits end in `(#N)` — so a PR that took three gate rounds
+  arrives as one commit. The branch total is where the rework lives: round two, round three, and
+  the fixes for the fixes.
+- **406,599 additions against 17,451 deletions**, a 23:1 ratio that would be alarming in a product
+  codebase. It mostly isn't product code. The docs ship in **11 translated locales**, and
+  translations are **71% of all documentation lines** — so a single docs change lands twelve times.
+
+<img src="/images/insights-commits-year.png" alt="Commits per week for artokun/comfyui-mcp over the last year: near zero until roughly May 2026, then a steep ramp through June and July to a peak above 400 commits in a single week in August" />
+
+<img src="/images/insights-code-frequency.png" alt="Additions and deletions per week for artokun/comfyui-mcp: a spike near 290,000 additions in June 2026, then sustained weekly bars between 50,000 and 150,000 additions through August, with deletions between 10,000 and 50,000" />
+
+The weekly commit chart goes from roughly flat to 400-a-week over one summer. That shape is what
+this whole post is about — but it is a measure of *activity*, not of value, and it would look
+identical if the swarm spent August writing elaborate nonsense. Which is precisely why the gate,
+the mutation checks and the live verification exist: they are the part of the system that has an
+opinion about whether any of those commits should have happened.
+
 ## An honest footnote about our download numbers
 
 npm currently reports about **123,000 weekly downloads**, on a curve that bends up and to the right
@@ -236,6 +270,54 @@ behind the graph:
 So a healthy slice of that curve is our own release cadence, multiplied by our own auto-updater,
 admiring itself in a mirror. The counter is measuring how often the swarm has a productive
 afternoon, not how many humans showed up. We're leaving it on the dashboard anyway.
+
+The same discount applies to everything else GitHub reports:
+
+<img src="/images/insights-clones.png" alt="Git clone traffic for artokun/comfyui-mcp over 14 days: 21,890 clones from 3,010 unique cloners" />
+
+<img src="/images/insights-visitors.png" alt="Visitor traffic for artokun/comfyui-mcp over 14 days: 6,281 total views from 2,752 unique visitors" />
+
+21,890 clones in two weeks from 3,010 unique cloners — and CI runners, mirrors and package
+aggregators clone too. 6,281 views from 2,752 unique visitors is the more human-shaped number,
+and the referrer table is the genuinely interesting one:
+
+<img src="/images/insights-referrers.png" alt="Referring sites for artokun/comfyui-mcp: Google 1646 views, github.com 1203, chatgpt.com 157, Bing 98, youtube.com 85, search.brave.com 76, DuckDuckGo 60, reddit.com 50, comfyui-mcp.artokun.io 34, huggingface.co 12. Popular content: Overview 4270 views, releases 144, issues 129, pulls 100" />
+
+Search, then GitHub itself, then **chatgpt.com** ahead of Bing, Brave, DuckDuckGo and Reddit.
+People are asking a model how to drive ComfyUI with an agent and arriving here on its
+recommendation. For a project whose entire premise is agents using tools, being *discovered* by an
+agent is a pleasing kind of circular.
+
+## The numbers I don't have
+
+Every figure above is collected by someone else — GitHub, npm — because the software itself
+collects nothing. There is no Google Analytics on the docs, no telemetry in the panel, no
+phone-home in the MCP server. Not one analytics SDK in either repository.
+
+That is a deliberate choice, and an ambivalent one. I would genuinely like to know which panel
+features get used and where people give up. But doing that properly under GDPR is real work for a
+project this size, doing it improperly is worse than not doing it, and — honestly — the curiosity
+isn't strong enough to outweigh either. So the instrumentation stays out.
+
+Which is the actual reason this section is full of caveats. When you refuse to measure your users,
+the only numbers left are proxies someone else happened to collect for a different purpose. Bad
+proxies, cheerfully reported, beat good telemetry nobody consented to.
+
+## Distribution is king
+
+Three times now, someone has offered to pay to put an advertisement or their product inside the
+panel. There are no ads in the panel, and there won't be.
+
+But the offers say something the graphs don't. Nobody made those offers because of the code
+quality, the test count, or the gate rounds this post spends most of its length on. They made them
+because the thing is *installed* — sitting in a sidebar, opening every time someone launches
+ComfyUI. Distribution is the asset. Everything upstream of it — the triage worker, the swarm, the
+adversarial review — exists to make sure that what gets distributed, at eleven releases a day into
+an auto-updating fleet, is worth having there.
+
+That cuts both ways, and it is the strongest argument for the paranoia. A pipeline this fast with a
+weaker gate would not be an achievement; it would be a very efficient way to push a bug to every
+install on the same afternoon.
 
 ## What this does not do
 
