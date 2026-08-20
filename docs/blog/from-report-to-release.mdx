@@ -326,6 +326,51 @@ That cuts both ways, and it is the strongest argument for the paranoia. A pipeli
 weaker gate would not be an achievement; it would be a very efficient way to push a bug to every
 install on the same afternoon.
 
+## The economics: intake is free, fixing isn't
+
+The unusual property of this pipeline is that **the reports cost us nothing to produce.** They are
+written by the user's own agent, running on the user's machine, spending the user's tokens, at the
+moment the defect happened. Nobody staffs a support inbox. Nobody translates a screenshot into a
+reproduction.
+
+And the reports are better than the ones a human would file, for a reason that has nothing to do
+with the model being clever: the reporter was *present at the crime*. It has the stack trace, the
+exact tool call, the version of everything, and — under the fix-then-file rule — often a working
+patch it already applied to unblock the user. A human filing the same bug three hours later has
+none of that and is reconstructing from memory.
+
+**Fixing is where the money goes.** Agent time, gate rounds, re-runs, and the tokens behind all of
+them. That asymmetry is the whole design: make intake free and abundant so nothing goes unreported,
+then spend the real budget on the part that requires judgement.
+
+### Why this is hard to copy
+
+It is not a clever trick, and I don't think it generalises easily. It needs two things at once, and
+most products have neither:
+
+1. **An agent already running on the user's machine**, with enough access to see what actually
+   happened. Telemetry can't do this — telemetry gives you counters and a stack trace at best, not
+   a diagnosis.
+2. **That agent instructed to report**, with a tool to do it and a bias toward filing. The
+   instruction is the load-bearing half. An agent that *can* file bugs but is never told that a
+   workaround it invented is itself a signal will simply route around every defect silently, and
+   you will never hear about any of it.
+
+If you ship an agentic product that runs locally, you are already sitting on this and probably not
+using it. If you ship a hosted service, you can't do it at all.
+
+### The honest bound on turnaround
+
+Reports usually reach a terminal state inside a day. That is a description, not a service level
+agreement, and the constraint is not technical: this is unpaid work that runs on whatever capacity
+is left over from paid client work — implementing AI generative workflows for large consumer and
+enterprise brands ([LinkedIn](https://www.linkedin.com/in/alongbottom/), if you want the specifics).
+
+Some weeks that leftover is generous and the queue empties overnight. Some weeks it isn't. The
+pipeline is what makes a spare evening productive enough to clear a day's reports — but nobody
+should read "same-day fix" as a promise, and I would rather say so than let the graphs imply an
+availability that isn't being sold.
+
 ## Why an independent project builds this at all
 
 comfyui-mcp shipped its first npm version on **15 February 2026**. The official `comfy-mcp` package
